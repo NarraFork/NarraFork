@@ -57,6 +57,8 @@
 	"status_interrupted": "Interrupted",
 	"narratorError": "Narrator Error",
 	"contextTooLongCompactFailed": "Context too long and auto-compact failed. Try starting a new conversation or manually compacting.",
+	"emptyResponseError": "{{provider}} returned an empty response. This usually means the API is misconfigured (base URL, model, or credentials).",
+	"emptyResponseErrorGeneric": "The provider returned an empty response. This usually means the API is misconfigured (base URL, model, or credentials).",
 	"bufferPreservedNotice": "Queued messages have been preserved. They will be sent automatically after a successful retry.",
 	"narratorRetrying": "Temporarily Unavailable — Retrying",
 	"retryingCountdown": "Retry {{count}}/{{max}} — {{seconds}}s",

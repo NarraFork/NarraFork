@@ -1704,6 +1704,12 @@ function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): Par
 					message: "Response blocked by content filter.",
 				};
 				break;
+			case "model_context_window_exceeded":
+				result.invalidState = {
+					reason: "model_context_window_exceeded",
+					message: "The model has reached its context window limit.",
+				};
+				break;
 			default:
 				logger.warn("Unknown OpenAI finish reason", { finishReason: choice.finish_reason });
 		}

@@ -18,6 +18,7 @@ export interface ExecuteLoopOptions {
 export interface ExecuteLoopResult {
 	finalText: string;
 	hasError: boolean;
+	errorCode?: string;
 	shouldUpdateTitle: boolean;
 	/** Set when the API rejected the request because the context was too long. */
 	contextLengthExceeded?: boolean;
@@ -43,6 +44,23 @@ interface ExecuteLoopSourceOptions {
 	processEventFn?: typeof processEvent;
 }
 
+function isMeaningfulAssistantOutputEvent(event: AgentEvent): boolean {
+	switch (event.type) {
+		case "assistant_message":
+			return Boolean(event.text.trim() || event.toolUses.length > 0);
+		case "stream_text":
+			return Boolean(event.text.trim());
+		case "tool_use_chunk":
+		case "block_complete":
+		case "web_search":
+			return true;
+		case "stream_reasoning":
+			return Boolean(event.text.trim() || event.providerMetadata);
+		default:
+			return false;
+	}
+}
+
 /**
  * Run a single pass of the agent loop, consuming all events through the
  * unified event handler. Used by both main narrators and subagents.
@@ -62,6 +80,7 @@ export async function executeAgentLoop(
 	let finalText = "";
 	let hasError = false;
 	let shouldUpdateTitle = false;
+	let errorCode: string | undefined;
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
 	let lastToolNames: string[] = [];
@@ -70,9 +89,14 @@ export async function executeAgentLoop(
 	let aborted = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
+	let sawMeaningfulAssistantOutput = false;
 	let lastAssistantHadToolUses = false;
 
 	for await (const event of eventSource) {
+		if (isMeaningfulAssistantOutputEvent(event)) {
+			sawMeaningfulAssistantOutput = true;
+		}
+
 		const drainingAfterAbort = config.signal.aborted;
 		// When aborted, still drain tool_result and error events so:
 		// - tool_result: status is persisted to the DB (running → success/fail)
@@ -139,6 +163,7 @@ export async function executeAgentLoop(
 		if (event.type === "invalid_state") {
 			finalText = `Error: ${event.message}`;
 			hasError = true;
+			errorCode = event.reason;
 			break;
 		}
 	}
@@ -164,7 +189,8 @@ export async function executeAgentLoop(
 		!contextLengthExceeded &&
 		!retryableError &&
 		!config.signal.aborted &&
-		!skipInterruptionCheck
+		!skipInterruptionCheck &&
+		sawMeaningfulAssistantOutput
 	) {
 		interrupted = await checkOutputInterruption(finalText, config.narratorId, config.signal);
 	}
@@ -172,6 +198,7 @@ export async function executeAgentLoop(
 	return {
 		finalText,
 		hasError,
+		errorCode,
 		shouldUpdateTitle,
 		contextLengthExceeded,
 		retryableError,

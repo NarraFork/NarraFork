@@ -713,6 +713,12 @@ export class ClineProvider implements ProviderAdapter {
 									message: "Response blocked by content filter.",
 								};
 								break;
+							case "model_context_window_exceeded":
+								result.invalidState = {
+									reason: "model_context_window_exceeded",
+									message: "The model has reached its context window limit.",
+								};
+								break;
 						}
 					}
 

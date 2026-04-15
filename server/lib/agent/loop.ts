@@ -186,6 +186,10 @@ const RETRYABLE_INVALID_STATE_REASONS = new Set([
 	"temporarily_unavailable",
 ]);
 
+const EMPTY_RESPONSE_MESSAGE =
+	"Provider returned an empty response. This often indicates an API configuration error " +
+	"(base URL, model, or credentials).";
+
 function isRetryableInvalidStateReason(reason: string, message?: string): boolean {
 	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
 	// Also check the message for retryable patterns (e.g. "Too many requests",
@@ -629,6 +633,7 @@ export async function* agentLoop(
 		let requestContextPercent: number | undefined;
 		let requestMeterUsage: number | undefined;
 		let requestMeterUnit: string | undefined;
+		let sawMeaningfulResponse = false;
 		let requestDump: ApiRequestDumpCollector | undefined;
 
 		// ── Transient-error retry loop ──
@@ -666,6 +671,7 @@ export async function* agentLoop(
 			toolUseAccum.clear();
 			webSearchAccum.clear();
 			receivedUsage = false;
+			sawMeaningfulResponse = false;
 
 			// Generate unique request ID for this API call (reset on each retry)
 			requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -718,6 +724,16 @@ export async function* agentLoop(
 						(parsed.text || parsed.toolUseChunk || parsed.reasoning)
 					) {
 						requestTtftMs = Date.now() - requestStartTime;
+					}
+
+					if (
+						parsed.text ||
+						parsed.toolUses ||
+						parsed.toolUseChunk ||
+						parsed.reasoning ||
+						parsed.webSearch
+					) {
+						sawMeaningfulResponse = true;
 					}
 
 					if (parsed.text) {
@@ -1322,6 +1338,21 @@ export async function* agentLoop(
 			meterUnit: requestMeterUnit,
 			rawDump: requestDump?.snapshot(),
 		};
+
+		if (!sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+			logger.warn("Provider returned empty response without error", {
+				narratorId: config.narratorId,
+				provider: effectiveProvider,
+				model: effectiveModel,
+				requestId,
+			});
+			yield {
+				type: "invalid_state",
+				reason: "empty_response",
+				message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
+			};
+			return;
+		}
 
 		// Reset retry counter after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.

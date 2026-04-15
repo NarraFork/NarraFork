@@ -21,6 +21,58 @@ async function* makeEventSource(events: AgentEvent[]): AsyncIterable<AgentEvent>
 	}
 }
 
+describe("executeAgentLoop smart interruption check", () => {
+	test("does not treat an empty assistant turn as interrupted", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{ type: "assistant_message", text: "", toolUses: [] },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.interrupted).toBe(false);
+		expect(result.hasError).toBe(false);
+	});
+
+	test("treats empty-response invalid state as an error instead of interruption", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "invalid_state",
+						reason: "empty_response",
+						message: "openai: Provider returned an empty response.",
+					},
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.hasError).toBe(true);
+		expect(result.interrupted).toBe(false);
+		expect(result.finalText).toContain("Provider returned an empty response");
+	});
+});
+
 describe("executeAgentLoop abort draining", () => {
 	test("marks silent disconnect without running interruption recovery", async () => {
 		const ac = new AbortController();

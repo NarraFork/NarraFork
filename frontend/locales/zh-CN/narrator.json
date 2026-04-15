@@ -57,6 +57,8 @@
 	"status_interrupted": "已中断",
 	"narratorError": "叙述者错误",
 	"contextTooLongCompactFailed": "上下文过长且自动压缩失败，请尝试开始新对话或手动压缩。",
+	"emptyResponseError": "{{provider}} 返回了空响应。这通常意味着 API 配置错误（base URL、模型或凭证）。",
+	"emptyResponseErrorGeneric": "上游返回了空响应。这通常意味着 API 配置错误（base URL、模型或凭证）。",
 	"bufferPreservedNotice": "排队消息已保留，重试成功后将自动继续发送。",
 	"narratorRetrying": "服务暂时不可用 — 正在重试",
 	"retryingCountdown": "重试 {{count}}/{{max}} — {{seconds}}秒后重试",

@@ -41,6 +41,7 @@ import type {
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 import { UserAvatar } from "../UserAvatar";
+import { localizeNarratorError } from "./error-localization";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
 interface NarratorDetailsPanelProps {
@@ -136,6 +137,10 @@ export function NarratorDetailsPanel({
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const localizedErrorMessage = localizeNarratorError(
+		typeof narrator?.errorMessage === "string" ? narrator.errorMessage : null,
+		t,
+	);
 
 	const chapterId = narrator?.chapterId ? String(narrator.chapterId) : "";
 	const parentNarratorId = narrator?.parentNarratorId ? String(narrator.parentNarratorId) : "";
@@ -381,12 +386,12 @@ export function NarratorDetailsPanel({
 						value={<Code>{String(narrator.apiConversationId)}</Code>}
 					/>
 				) : null}
-				{narrator?.errorMessage ? (
+				{localizedErrorMessage ? (
 					<DetailRow
 						label={t("details.errorMessage")}
 						value={
 							<Text size="sm" c="red" ta="left">
-								{String(narrator.errorMessage)}
+								{localizedErrorMessage}
 							</Text>
 						}
 					/>

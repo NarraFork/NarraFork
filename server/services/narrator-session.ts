@@ -3408,6 +3408,21 @@ async function runAgentLoop(
 				break;
 			}
 
+			if (result.hasError && active.alive && !loopHadError) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
+				await narratorService.updateStatus(narratorId, "error", result.finalText, result.errorCode);
+				active.events.emit("event", {
+					type: "error",
+					data: { message: result.finalText },
+				});
+				loopHadError = true;
+				break;
+			}
+
 			// Reset transient retry counter on success
 			transientRetries = 0;
 

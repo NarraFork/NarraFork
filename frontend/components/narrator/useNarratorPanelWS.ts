@@ -6,6 +6,7 @@ import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { api, type BufferMessageSummary } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { localizeNarratorError } from "./error-localization";
 import { clearToolBlockCache, type StreamingBlock } from "./message-segments";
 import {
 	evictOldestPages,
@@ -1476,17 +1477,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				streamingBlocksRef.current = [];
 				clearStreamingState();
-				// Update narrator cache with error message
+				const localizedError = localizeNarratorError(error, t, errorCode) ?? error;
+				// Update narrator cache with localized error message
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status: "error", errorMessage: error } : old,
+					old ? { ...old, status: "error", errorMessage: localizedError } : old,
 				);
-				const errorI18nMap: Record<string, string> = {
-					context_too_long_compact_failed: "contextTooLongCompactFailed",
-				};
-				const i18nKey = errorCode ? errorI18nMap[errorCode] : undefined;
 				notifications.show({
 					title: t("narratorError"),
-					message: i18nKey ? t(i18nKey) : error,
+					message: localizedError,
 					color: "red",
 					autoClose: 8000,
 				});
