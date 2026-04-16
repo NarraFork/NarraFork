@@ -603,14 +603,17 @@ export function useNarratorWS(
 		narratorWSManager.reconnect();
 	}, []);
 
-	return {
-		connected,
-		disconnected,
-		sendPermissionDecision,
-		sendBufferMessage,
-		cancelBuffer,
-		reconnect,
-	};
+	return useMemo(
+		() => ({
+			connected,
+			disconnected,
+			sendPermissionDecision,
+			sendBufferMessage,
+			cancelBuffer,
+			reconnect,
+		}),
+		[connected, disconnected, sendPermissionDecision, sendBufferMessage, cancelBuffer, reconnect],
+	);
 }
 
 /**
@@ -739,5 +742,8 @@ export function useNarratorsListWS(
 		narratorWSManager.reconnect();
 	}, []);
 
-	return { connected, disconnected, reconnect };
+	return useMemo(
+		() => ({ connected, disconnected, reconnect }),
+		[connected, disconnected, reconnect],
+	);
 }

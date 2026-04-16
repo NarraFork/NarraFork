@@ -51,6 +51,12 @@ export const commandSchema = z.object({
 		)
 		.max(20)
 		.optional(),
+	modelOverride: z
+		.object({
+			model: z.string().min(1).max(100),
+			mode: z.enum(["temporary", "permanent"]),
+		})
+		.optional(),
 });
 
 export const createProjectSchema = z.object({
@@ -121,7 +127,7 @@ export const updateChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
 	status: z.enum(["active", "dormant", "merged", "abandoned", "frozen"]).optional(),
-	role: z.enum(["trunk", "branch", "exploration"]).optional(),
+	role: z.enum(["trunk", "branch", "exploration", "review"]).optional(),
 	color: z.string().max(20).nullable().optional(),
 	groupLabel: z.string().max(100).nullable().optional(),
 	containerConfig: containerConfigSchema.nullable().optional(),

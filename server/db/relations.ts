@@ -9,6 +9,7 @@ import {
 	mergeSessions,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
+	narratorBufferedMessages,
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
@@ -127,6 +128,14 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	overseer: one(overseers, {
 		fields: [narrators.id],
 		references: [overseers.narratorId],
+	}),
+	bufferedMessages: many(narratorBufferedMessages),
+}));
+
+export const narratorBufferedMessagesRelations = relations(narratorBufferedMessages, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorBufferedMessages.narratorId],
+		references: [narrators.id],
 	}),
 }));
 

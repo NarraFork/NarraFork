@@ -241,6 +241,10 @@ export function useNarrator(id: string) {
 		queryKey: ["narrators", id],
 		queryFn: () => api.getNarrator(id),
 		enabled: !!id,
+		// Narrator data is kept fresh via WS invalidation (useNarratorPanelWS).
+		// A 30s staleTime avoids redundant refetches when multiple components
+		// subscribe to the same narrator (e.g. route + NarratorPanel).
+		staleTime: 30_000,
 	});
 }
 
@@ -315,6 +319,9 @@ export function useCreateNarrator() {
 			model?: string;
 			systemPrompt?: string;
 			permissionMode?: string;
+			reasoningEffort?: string | null;
+			fastMode?: boolean;
+			relaxedPlan?: boolean;
 			cwd?: string;
 		}) => api.createNarrator(data),
 		onSuccess: () => {

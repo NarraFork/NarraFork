@@ -95,6 +95,7 @@ function hasEncryptedReasoningMetadata(block: unknown): boolean {
 }
 
 let nextRbInstanceId = 0;
+let nextWsInstanceId = 0;
 
 interface MessageBubbleProps {
 	narratorId?: string;
@@ -141,6 +142,249 @@ interface MessageBubbleProps {
 	isLastUserMessage?: boolean;
 	/** Whether the narrator is bound to a chapter (has git support) */
 	hasChapter?: boolean;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+function WebSearchBlock({
+	block,
+	blockIndex,
+	messageId,
+}: {
+	block: any;
+	blockIndex?: number;
+	messageId?: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
+
+	const query = block.query ?? (block.queries as string[] | undefined)?.join(", ");
+	const isSearching = block.status && block.status !== "completed";
+
+	// --- Block ID, selection, swipe & context menu state ---
+	const wsInstanceId = useRef(nextWsInstanceId++);
+	const blockIdStr = `ws-${wsInstanceId.current}`;
+	const rootRef = useRef<HTMLDivElement>(null);
+	const selection = useMessageSelection();
+	const msgCtx = useMessageContextMenu();
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+
+	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
+
+	const handleDeselect = useCallback(() => {
+		selection.deselectBlock(blockIdStr);
+	}, [selection.deselectBlock, blockIdStr]);
+
+	const swipe = useSwipeMenu({
+		enabled: true,
+		externalBoxRef: rootRef,
+		excludeSelectors: [".mantine-Menu-dropdown"],
+		blockId: blockIdStr,
+		onSwipeRight: isSelected ? handleDeselect : undefined,
+	});
+
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 200);
+			const flipY = e.clientY > window.innerHeight - 300;
+			swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
+			swipe.setCtxMenuOpened(true);
+		},
+		[isMobile, swipe],
+	);
+
+	const handleBlockClick = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const isModKey = e.metaKey || e.ctrlKey;
+			const isShift = e.shiftKey;
+			if (!isModKey && !isShift) return;
+			if (!selection.selectionMode) {
+				const sel = window.getSelection();
+				if (sel && sel.toString().trim().length > 0) return;
+			}
+			e.preventDefault();
+			if (isShift) {
+				window.getSelection()?.removeAllRanges();
+				selection.rangeSelectTo(blockIdStr);
+			} else {
+				selection.toggleBlock(blockIdStr);
+			}
+		},
+		[isMobile, blockIdStr, selection],
+	);
+
+	const SWIPE_REVEAL_WIDTH = 180;
+
+	const hasMenuActions = !!(
+		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
+		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onDeleteBlock
+	);
+	const menuItemsNode = (
+		<>
+			{hasMenuActions && (
+				<>
+					{msgCtx.onForkFromMessage && (
+						<Menu.Item
+							leftSection={<IconGitFork size={14} />}
+							onClick={() => {
+								msgCtx.onForkFromMessage?.();
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_fork")}
+						</Menu.Item>
+					)}
+					{msgCtx.onAskInPassing && (
+						<Menu.Item
+							leftSection={<IconMessageQuestion size={14} />}
+							onClick={() => {
+								msgCtx.onAskInPassing?.();
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_askInPassing")}
+						</Menu.Item>
+					)}
+					{msgCtx.onCompactBeforeMessage && (
+						<Menu.Item
+							leftSection={<IconArrowsMinimize size={14} />}
+							onClick={() => {
+								msgCtx.onCompactBeforeMessage?.();
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_compactBefore")}
+						</Menu.Item>
+					)}
+					{msgCtx.onDeleteBlock && blockIndex != null && (
+						<Menu.Item
+							color="red"
+							leftSection={<IconTrash size={14} />}
+							onClick={() => {
+								msgCtx.onDeleteBlock?.(blockIndex);
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_delete")}
+						</Menu.Item>
+					)}
+				</>
+			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+				{tc("cancel")}
+			</Menu.Item>
+		</>
+	);
+
+	const ctxMenu = (
+		<Menu
+			opened={swipe.ctxMenuOpened}
+			onChange={swipe.setCtxMenuOpened}
+			position="bottom-start"
+			withinPortal
+			styles={{
+				dropdown: {
+					position: "fixed",
+					left: swipe.ctxMenuPos.x,
+					...(swipe.ctxMenuPos.flipY
+						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+						: { top: swipe.ctxMenuPos.y }),
+				},
+			}}
+		>
+			<Menu.Target>
+				<div
+					style={{
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						top: swipe.ctxMenuPos.y,
+						pointerEvents: "none",
+					}}
+				/>
+			</Menu.Target>
+			<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
+		</Menu>
+	);
+
+	const swipeMenu =
+		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+		(() => {
+			const menuEl = swipe.swipeMenuRef.current;
+			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+			return createPortal(
+				<Box
+					ref={swipe.swipeMenuRef}
+					style={{
+						position: "fixed",
+						left: pos.left,
+						top: pos.top,
+						transform: "translateY(-50%)",
+						zIndex: 1000,
+						transition: swipe.swipeMenuTransition,
+						pointerEvents: swipe.swipeClosing ? "none" : "auto",
+					}}
+				>
+					<Menu opened withinPortal={false} position="bottom-start">
+						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+							{menuItemsNode}
+						</Menu.Dropdown>
+					</Menu>
+				</Box>,
+				document.body,
+			);
+		})();
+
+	return (
+		<>
+			<Box
+				ref={rootRef}
+				data-content-block
+				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+				onContextMenu={handleContextMenu}
+				onClick={handleBlockClick}
+				style={{
+					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+					outlineOffset: isSelected ? -2 : undefined,
+					borderRadius: isSelected ? 4 : undefined,
+					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+					transition: swipe.swipeTransition,
+				}}
+			>
+				<Paper withBorder radius="sm" p="xs">
+					<Group gap={6} wrap="nowrap" align="center">
+						<ThemeIcon size={18} variant="light" color="teal" radius="sm">
+							<IconWorldSearch size={12} />
+						</ThemeIcon>
+						{isSearching && <Loader size={12} color="teal" type="dots" />}
+						<Text size="xs" c="dimmed">
+							{isSearching
+								? block.status === "searching"
+									? t("webSearching")
+									: t("webSearchPreparing")
+								: t("webSearched")}
+							{query && (
+								<Text span fw={500} c="teal" ml={4}>
+									{query}
+								</Text>
+							)}
+						</Text>
+					</Group>
+				</Paper>
+			</Box>
+			{swipeMenu}
+			{ctxMenu}
+		</>
+	);
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -2316,29 +2560,13 @@ export const MessageBubble = memo(function MessageBubble({
 						);
 					}
 					if (block.type === "web_search") {
-						const query = block.query ?? (block.queries as string[] | undefined)?.join(", ");
-						const isSearching = block.status && block.status !== "completed";
 						return (
-							<Paper key={key} withBorder radius="sm" p="xs">
-								<Group gap={6} wrap="nowrap" align="center">
-									<ThemeIcon size={18} variant="light" color="teal" radius="sm">
-										<IconWorldSearch size={12} />
-									</ThemeIcon>
-									{isSearching && <Loader size={12} color="teal" type="dots" />}
-									<Text size="xs" c="dimmed">
-										{isSearching
-											? block.status === "searching"
-												? t("webSearching")
-												: t("webSearchPreparing")
-											: t("webSearched")}
-										{query && (
-											<Text span fw={500} c="teal" ml={4}>
-												{query}
-											</Text>
-										)}
-									</Text>
-								</Group>
-							</Paper>
+							<WebSearchBlock
+								key={key}
+								block={block}
+								blockIndex={realIndex}
+								messageId={message.id}
+							/>
 						);
 					}
 					if (block.type === "tool_use") {

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { formatFileSize } from "@shared/text-file-types";
 import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
@@ -9,6 +9,7 @@ import {
 	chapters,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
+	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -235,6 +236,13 @@ export interface BufferCreator {
 	avatarImageId?: string | null;
 }
 
+/** Shape stored in DB for text files that were saved to a temp directory. */
+interface SavedBufferedFile {
+	filename: string;
+	path: string;
+	size: number;
+}
+
 interface BufferedMessage {
 	id: string;
 	text: string;
@@ -244,6 +252,8 @@ interface BufferedMessage {
 	commandText?: string | null;
 	createdBy?: string | null;
 	creator?: BufferCreator | null;
+	/** Paths of text files persisted to disk (for DB recovery). */
+	_savedFiles?: SavedBufferedFile[];
 }
 const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 	"narrafork.bufferedMessages",
@@ -681,17 +691,41 @@ function resolveCommandBlacklistMatch(
 }
 
 /**
+ * Filter out "pipe to X" dangerous patterns where X is covered by the command whitelist.
+ * Returns the remaining dangerous patterns that are NOT covered.
+ */
+function filterWhitelistedPipePatterns(
+	dangerousPatterns: string[],
+	commandWhitelist: CommandWhitelistEntry[],
+): string[] {
+	if (commandWhitelist.length === 0) return dangerousPatterns;
+	return dangerousPatterns.filter((pattern) => {
+		const match = pattern.match(/^pipe to (.+)$/);
+		if (!match) return true; // non-pipe patterns are always kept
+		const pipedCmd = match[1];
+		// Check if the piped command is covered by any whitelist entry
+		return !commandWhitelist.some((entry) => matchCommandPattern([pipedCmd], entry.pattern));
+	});
+}
+
+/**
  * Check if all non-whitelisted commands are covered by the command whitelist.
  * Returns true if the command whitelist fully covers all nonWhitelisted commands
- * (and there are no dangerous patterns / env injection).
+ * (and there are no uncovered dangerous patterns / env injection).
  */
 function isCommandWhitelistCovered(
 	bashAnalysis: BashAnalysis,
 	commandWhitelist: CommandWhitelistEntry[],
 ): boolean {
 	if (bashAnalysis.allWhitelisted) return false; // already whitelisted, no need
-	if (bashAnalysis.dangerousPatterns.length > 0) return false;
 	if (bashAnalysis.hasEnvInjection) return false;
+
+	// Filter out pipe-to-X patterns where X is whitelisted — those are safe.
+	const remainingDangerous = filterWhitelistedPipePatterns(
+		bashAnalysis.dangerousPatterns,
+		commandWhitelist,
+	);
+	if (remainingDangerous.length > 0) return false;
 
 	// 如果没有 nonWhitelisted 命令，说明所有命令都是内置安全的
 	if (bashAnalysis.nonWhitelisted.length === 0) return true;
@@ -978,10 +1012,15 @@ export function resolvePermissionDecision(
 	) {
 		// All nonWhitelisted commands are covered by command whitelist.
 		// Create a patched analysis so downstream logic sees them as whitelisted.
+		// Also filter out pipe-to-X patterns where X is whitelisted.
 		effectiveBashAnalysis = {
 			...bashAnalysis,
 			allWhitelisted: true,
 			nonWhitelisted: [],
+			dangerousPatterns: filterWhitelistedPipePatterns(
+				bashAnalysis.dangerousPatterns,
+				commandWhitelist,
+			),
 		};
 	}
 
@@ -3669,6 +3708,8 @@ async function runAgentLoop(
 				if (buffered) {
 					queue?.shift();
 					if (queue?.length === 0) bufferedMessages.delete(narratorId);
+					// Remove consumed message from DB + cleanup persisted text files
+					dbConsumeBuffered(buffered.id);
 					// Broadcast which message was consumed + remaining queue snapshot
 					const remaining = toBufferSummary(getBufferedMessages(narratorId));
 					broadcastToNarrator(narratorId, {
@@ -3875,6 +3916,9 @@ async function runAgentLoop(
 		// When the loop ended with an error, preserve buffered messages so the
 		// user can retry and the queue will resume automatically.  Notify the
 		// frontend so it keeps showing the queued messages.
+		// In both cases the DB rows are kept in sync:
+		// - error: rows stay (will be recovered on next startup or consumed on retry)
+		// - normal: rows are deleted (queue fully consumed)
 		if (loopHadError) {
 			const preserved = bufferedMessages.get(narratorId);
 			if (preserved?.length) {
@@ -3886,6 +3930,7 @@ async function runAgentLoop(
 			}
 		} else {
 			bufferedMessages.delete(narratorId);
+			dbClearAllBuffered(narratorId);
 		}
 
 		// Drain any remaining overseer queue items — notify source narrators
@@ -5241,8 +5286,92 @@ export async function updateNarratorPermissionMode(
 
 // === Buffered message queue API ===
 
+/** Maximum number of messages that can be queued per narrator. */
+const MAX_BUFFERED_MESSAGES = 50;
+
+/** Directory under ~/.narrafork where buffered text files are persisted. */
+function getBufferedFilesDir(): string {
+	return join(getHome(), ".narrafork", "buffered-files");
+}
+
+/** Save text files to a temp directory so they survive restarts. Returns metadata for DB. */
+async function persistBufferedTextFiles(
+	messageId: string,
+	files: File[],
+): Promise<SavedBufferedFile[]> {
+	if (files.length === 0) return [];
+	const dir = join(getBufferedFilesDir(), messageId);
+	mkdirSync(dir, { recursive: true });
+	const result: SavedBufferedFile[] = [];
+	for (const file of files) {
+		const safeName = basename(file.name) || "unnamed";
+		const filePath = join(dir, safeName);
+		await Bun.write(filePath, file);
+		result.push({ filename: safeName, path: filePath, size: file.size });
+	}
+	return result;
+}
+
+/** Remove persisted text files for a buffered message. */
+function cleanupBufferedTextFiles(messageId: string): void {
+	const dir = join(getBufferedFilesDir(), messageId);
+	rmSync(dir, { recursive: true, force: true });
+}
+
+/** Reconstruct File objects from persisted paths. */
+function loadBufferedTextFiles(saved: SavedBufferedFile[]): File[] {
+	const files: File[] = [];
+	for (const s of saved) {
+		if (!existsSync(s.path)) continue;
+		const buf = readFileSync(s.path);
+		files.push(new File([buf], s.filename, { type: "text/plain" }));
+	}
+	return files;
+}
+
+/** Write a single buffered message row to DB. */
+function dbInsertBuffered(
+	id: string,
+	narratorId: string,
+	text: string,
+	seq: number,
+	bufferedAt: string,
+	images?: ImageRef[],
+	commandText?: string | null,
+	createdBy?: string | null,
+	creator?: BufferCreator | null,
+	savedFiles?: SavedBufferedFile[],
+): void {
+	db.insert(narratorBufferedMessages)
+		.values({
+			id,
+			narratorId,
+			text,
+			seq,
+			bufferedAt,
+			imagesJson: images?.length ? JSON.stringify(images) : null,
+			commandText: commandText ?? null,
+			createdBy: createdBy ?? null,
+			creatorJson: creator ? JSON.stringify(creator) : null,
+			textFilePathsJson: savedFiles?.length ? JSON.stringify(savedFiles) : null,
+		})
+		.run();
+}
+
+/** Rewrite seq values for all rows of a narrator to match the in-memory order. */
+function dbRewriteSeqs(narratorId: string, orderedIds: string[]): void {
+	sqlite.transaction(() => {
+		const stmt = sqlite.prepare(
+			"UPDATE narrator_buffered_messages SET seq = ? WHERE id = ? AND narrator_id = ?",
+		);
+		for (let i = 0; i < orderedIds.length; i++) {
+			stmt.run(i, orderedIds[i], narratorId);
+		}
+	})();
+}
+
 /** Push a message onto the queue (or unshift to front when position is "front"). */
-export function pushBufferedMessage(
+export async function pushBufferedMessage(
 	narratorId: string,
 	text: string,
 	images?: ImageRef[],
@@ -5251,18 +5380,71 @@ export function pushBufferedMessage(
 	creator?: BufferCreator | null,
 	textFiles?: File[],
 	position: "back" | "front" = "back",
-): { ok: boolean; bufferedAt: string; id: string } {
+): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
 	}
+	const queue = bufferedMessages.get(narratorId) ?? [];
+	if (queue.length >= MAX_BUFFERED_MESSAGES) {
+		return { ok: false, bufferedAt: "", id: "", full: true };
+	}
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
-	const queue = bufferedMessages.get(narratorId) ?? [];
-	const entry = { id, text, images, textFiles, bufferedAt, commandText, createdBy, creator };
+
+	// Persist text files to disk before storing in queue
+	let savedFiles: SavedBufferedFile[] | undefined;
+	if (textFiles?.length) {
+		savedFiles = await persistBufferedTextFiles(id, textFiles);
+	}
+
+	const entry: BufferedMessage = {
+		id,
+		text,
+		images,
+		textFiles,
+		bufferedAt,
+		commandText,
+		createdBy,
+		creator,
+		_savedFiles: savedFiles,
+	};
 	if (position === "front") {
 		queue.unshift(entry);
+		// Rewrite all seq values + insert new row atomically
+		sqlite.transaction(() => {
+			const stmt = sqlite.prepare(
+				"UPDATE narrator_buffered_messages SET seq = ? WHERE id = ? AND narrator_id = ?",
+			);
+			for (let i = 0; i < queue.length; i++) {
+				stmt.run(i, queue[i].id, narratorId);
+			}
+			dbInsertBuffered(
+				id,
+				narratorId,
+				text,
+				0,
+				bufferedAt,
+				images,
+				commandText,
+				createdBy,
+				creator,
+				savedFiles,
+			);
+		})();
 	} else {
 		queue.push(entry);
+		dbInsertBuffered(
+			id,
+			narratorId,
+			text,
+			queue.length - 1,
+			bufferedAt,
+			images,
+			commandText,
+			createdBy,
+			creator,
+			savedFiles,
+		);
 	}
 	bufferedMessages.set(narratorId, queue);
 	return { ok: true, bufferedAt, id };
@@ -5282,6 +5464,17 @@ export function updateBufferedMessage(
 	msg.text = text;
 	if (images !== undefined) msg.images = images;
 	msg.bufferedAt = new Date().toISOString();
+	// Write-through to DB
+	db.update(narratorBufferedMessages)
+		.set({
+			text,
+			bufferedAt: msg.bufferedAt,
+			...(images !== undefined
+				? { imagesJson: images.length ? JSON.stringify(images) : null }
+				: {}),
+		})
+		.where(eq(narratorBufferedMessages.id, messageId))
+		.run();
 	return true;
 }
 
@@ -5293,6 +5486,9 @@ export function removeBufferedMessage(narratorId: string, messageId: string): bo
 	if (idx === -1) return false;
 	queue.splice(idx, 1);
 	if (queue.length === 0) bufferedMessages.delete(narratorId);
+	// Write-through to DB + cleanup files
+	db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.id, messageId)).run();
+	cleanupBufferedTextFiles(messageId);
 	return true;
 }
 
@@ -5309,12 +5505,42 @@ export function reorderBufferedMessages(narratorId: string, orderedIds: string[]
 		reordered.push(msg);
 	}
 	bufferedMessages.set(narratorId, reordered);
+	// Write-through: update seq values in DB
+	dbRewriteSeqs(narratorId, orderedIds);
 	return true;
 }
 
 /** Clear the entire queue. */
 export function clearBufferedMessages(narratorId: string): void {
+	const queue = bufferedMessages.get(narratorId);
+	if (queue) {
+		for (const msg of queue) cleanupBufferedTextFiles(msg.id);
+	}
 	bufferedMessages.delete(narratorId);
+	db.delete(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
+		.run();
+}
+
+/** Delete a single consumed message from DB + cleanup its files. */
+function dbConsumeBuffered(messageId: string): void {
+	db.delete(narratorBufferedMessages).where(eq(narratorBufferedMessages.id, messageId)).run();
+	cleanupBufferedTextFiles(messageId);
+}
+
+/** Delete all buffered messages for a narrator from DB + cleanup files. */
+function dbClearAllBuffered(narratorId: string): void {
+	// Fetch ids first so we can clean up files
+	const rows = db
+		.select({ id: narratorBufferedMessages.id })
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
+		.all();
+	if (rows.length === 0) return;
+	for (const row of rows) cleanupBufferedTextFiles(row.id);
+	db.delete(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.narratorId, narratorId))
+		.run();
 }
 
 /** Get the full queue (for REST hydration). */
@@ -5459,6 +5685,48 @@ export async function recoverOnStartup(): Promise<void> {
 	if (staleCompacting.length > 0) {
 		logger.info("Stale compacting messages cleaned up on startup", {
 			count: staleCompacting.length,
+		});
+	}
+
+	// Recover persisted buffered messages into the in-memory Map.
+	// These survive server restarts so users don't lose queued messages.
+	const bufferedRows = db
+		.select()
+		.from(narratorBufferedMessages)
+		.orderBy(narratorBufferedMessages.narratorId, narratorBufferedMessages.seq)
+		.all();
+	if (bufferedRows.length > 0) {
+		const grouped = new Map<string, BufferedMessage[]>();
+		for (const row of bufferedRows) {
+			const images: ImageRef[] | undefined = row.imagesJson
+				? JSON.parse(row.imagesJson)
+				: undefined;
+			const creator: BufferCreator | null = row.creatorJson ? JSON.parse(row.creatorJson) : null;
+			const savedFiles: SavedBufferedFile[] | undefined = row.textFilePathsJson
+				? JSON.parse(row.textFilePathsJson)
+				: undefined;
+			const textFiles = savedFiles?.length ? loadBufferedTextFiles(savedFiles) : undefined;
+			const entry: BufferedMessage = {
+				id: row.id,
+				text: row.text,
+				images,
+				textFiles: textFiles?.length ? textFiles : undefined,
+				bufferedAt: row.bufferedAt,
+				commandText: row.commandText,
+				createdBy: row.createdBy,
+				creator,
+				_savedFiles: savedFiles,
+			};
+			const list = grouped.get(row.narratorId) ?? [];
+			list.push(entry);
+			grouped.set(row.narratorId, list);
+		}
+		for (const [nid, msgs] of grouped) {
+			bufferedMessages.set(nid, msgs);
+		}
+		logger.info("Recovered buffered messages from DB on startup", {
+			narrators: grouped.size,
+			messages: bufferedRows.length,
 		});
 	}
 }

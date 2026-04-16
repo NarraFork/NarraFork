@@ -1366,6 +1366,7 @@ export function NarratorPanel({
 		queuedMessages,
 		setQueuedMessages,
 		isCompacting,
+		setIsCompacting,
 		isCheckingInterrupt,
 		contextPercent,
 		promptTokens,
@@ -1403,13 +1404,13 @@ export function NarratorPanel({
 
 	const handleCompactBefore = useCallback(
 		(messageId: string) => {
-			wsState.setIsCompacting(true);
+			setIsCompacting(true);
 			api.triggerCompact(narratorId, messageId).catch((err) => {
-				wsState.setIsCompacting(false);
+				setIsCompacting(false);
 				handleCompactError(err);
 			});
 		},
-		[narratorId, handleCompactError, wsState.setIsCompacting],
+		[narratorId, handleCompactError, setIsCompacting],
 	);
 
 	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
@@ -1589,12 +1590,14 @@ export function NarratorPanel({
 			setButtonCount: handlePermSetButtonCount,
 			setHasFeedback: handlePermFeedbackChange,
 			registerActions: handlePermRegisterActions,
+			activePermissionId: renderPermCb.pendingPermission?.id ?? null,
 		}),
 		[
 			effectiveFocusIndex,
 			handlePermSetButtonCount,
 			handlePermFeedbackChange,
 			handlePermRegisterActions,
+			renderPermCb.pendingPermission?.id,
 		],
 	);
 
@@ -1896,7 +1899,10 @@ export function NarratorPanel({
 	);
 	// Chapter-bound: use onForkFromMessage (direct fork with auto-generated name)
 	// Standalone: use handleStandaloneFork (direct narrator fork)
-	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleStandaloneFork;
+	const forkHandler = useMemo(
+		() => (narrator?.chapterId ? onForkFromMessage : handleStandaloneFork),
+		[narrator?.chapterId, onForkFromMessage, handleStandaloneFork],
+	);
 
 	// --- Ask in passing handler ---
 	const startAskInPassingMutation = useStartAskInPassing();
@@ -2319,10 +2325,10 @@ export function NarratorPanel({
 		if (!window.confirm(t("segmentCompactConfirm", { count: messageIds.length }))) return;
 		exitSelection();
 		try {
-			wsState.setIsCompacting(true);
+			setIsCompacting(true);
 			await api.triggerSegmentCompact(narratorId, messageIds);
 		} catch (err) {
-			wsState.setIsCompacting(false);
+			setIsCompacting(false);
 			const isInProgress = err instanceof ApiError && err.status === 409;
 			notifications.show({
 				title: isInProgress ? t("compactInProgress") : t("segmentCompactFailed"),
@@ -2331,7 +2337,7 @@ export function NarratorPanel({
 				autoClose: 5000,
 			});
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, t, wsState]);
+	}, [selectedBlockIds, exitSelection, narratorId, t, setIsCompacting]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -3192,16 +3198,16 @@ export function NarratorPanel({
 		setAttachedImages([]);
 		setAttachedTextFiles([]);
 		try {
-			const result = await api.sendNarratorMessage(
+			await api.sendNarratorMessage(
 				narratorId,
 				msg,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
 			);
-			if (result?.buffered) {
-				scrollToBottom(true);
-			}
+			// Whether the message was buffered (202) or the backend fell through
+			// to a direct send (201), scroll so the new content is visible.
+			scrollToBottom(true);
 		} catch (err) {
 			// Restore input and attachments on error
 			setInput(msg);
@@ -3790,9 +3796,9 @@ export function NarratorPanel({
 				<Menu.Item
 					leftSection={<IconArrowsMinimize size={14} />}
 					onClick={() => {
-						wsState.setIsCompacting(true);
+						setIsCompacting(true);
 						api.triggerCompact(narratorId).catch((err) => {
-							wsState.setIsCompacting(false);
+							setIsCompacting(false);
 							handleCompactError(err);
 						});
 					}}

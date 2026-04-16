@@ -9,6 +9,7 @@ export interface OpenAIProviderState {
 	defaultModel: string;
 	apiMode: "responses" | "completions" | "codex";
 	codexAccountId: string;
+	codexWebSocket?: boolean;
 	disabled?: boolean;
 }
 

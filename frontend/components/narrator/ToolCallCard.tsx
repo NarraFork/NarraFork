@@ -86,10 +86,13 @@ export const FileModDrawerCtx = createContext<{
 	openForApproval: () => void;
 }>({ openForApproval: () => {} });
 
+const noop = () => {};
+
 /**
  * Context for keyboard-driven permission button navigation.
  * `focusIndex` is the 0-based index of the currently focused button (null = inactive).
  * `setFocusIndex` lets the parent shift focus via arrow keys.
+ *
  * `setButtonCount` lets the child report how many navigable buttons it has.
  * `setHasFeedback` lets the child report whether feedback text is present.
  * `registerActions` lets the child register onClick handlers so the parent can invoke them.
@@ -100,12 +103,15 @@ export const PermEnterHintCtx = createContext<{
 	setButtonCount: (n: number) => void;
 	setHasFeedback: (has: boolean) => void;
 	registerActions: (actions: (() => void)[]) => void;
+	/** The permission ID that Enter key should bind to (earliest pending). */
+	activePermissionId: string | null;
 }>({
 	focusIndex: null,
 	setFocusIndex: () => {},
 	setButtonCount: () => {},
 	setHasFeedback: () => {},
 	registerActions: () => {},
+	activePermissionId: null,
 });
 
 // --- Types ---
@@ -2711,8 +2717,9 @@ export function InlinePermission({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { focusIndex, setButtonCount, setHasFeedback, registerActions } =
+	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
+	const isActivePermission = permission.id === activePermissionId;
 	const draftKey = `narrafork_perm_draft_${permission.id}`;
 	const [feedback, setFeedback] = useState(() => {
 		try {
@@ -2757,9 +2764,10 @@ export function InlinePermission({
 	}, [draftKey, feedback, editedPlan]);
 
 	// Notify parent when feedback presence changes so the Enter hint can auto-switch
+	// Only the active (earliest) permission should drive the global Enter key behavior.
 	useEffect(() => {
-		setHasFeedback(!!feedback);
-	}, [feedback, setHasFeedback]);
+		if (isActivePermission) setHasFeedback(!!feedback);
+	}, [feedback, setHasFeedback, isActivePermission]);
 
 	// AskUserQuestion: render the full question form inline
 	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
@@ -2873,7 +2881,7 @@ export function InlinePermission({
 				mb="xs"
 			/>
 			<PermButtonBar
-				focusIndex={focusIndex}
+				focusIndex={isActivePermission ? focusIndex : null}
 				buttons={(() => {
 					const btns: PermButton[] = [];
 					if (!editing) {
@@ -2926,8 +2934,8 @@ export function InlinePermission({
 					}
 					return btns;
 				})()}
-				setButtonCount={setButtonCount}
-				registerActions={registerActions}
+				setButtonCount={isActivePermission ? setButtonCount : noop}
+				registerActions={isActivePermission ? registerActions : noop}
 				suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
 			/>
 		</Box>

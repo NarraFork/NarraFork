@@ -477,6 +477,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				priority ? "front" : "back",
 			);
 			if (!result.ok) {
+				if (result.full) throw new ValidationError("Message queue is full");
 				throw new ValidationError("Subagent is not running in foreground");
 			}
 			const messages = toBufferSummary(getSubagentBufferedMessages(id));
@@ -507,7 +508,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					avatarImageId: user.avatarImageId,
 				}
 			: null;
-		const result = pushBufferedMessage(
+		const result = await pushBufferedMessage(
 			id,
 			finalMessage,
 			images.length > 0 ? images : undefined,
@@ -539,6 +540,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				}
 			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
+		}
+		if (result.full) {
+			throw new ValidationError("Message queue is full");
 		}
 		// Narrator not active in memory — fall through to normal send
 	}

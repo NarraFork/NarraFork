@@ -741,20 +741,23 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 /**
  * Push a user message onto the subagent buffer queue.
- * Returns false if the subagent is not currently running.
+ * Returns false if the subagent is not currently running or the queue is full.
  */
 export function pushSubagentBufferedMessage(
 	subagentId: string,
 	text: string,
 	images?: ImageRef[],
 	position: "front" | "back" = "back",
-): { ok: boolean; bufferedAt: string; id: string } {
+): { ok: boolean; bufferedAt: string; id: string; full?: boolean } {
 	if (!getForegroundAbortControllers().has(subagentId)) {
 		return { ok: false, bufferedAt: "", id: "" };
 	}
+	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
+	if (queue.length >= 50) {
+		return { ok: false, bufferedAt: "", id: "", full: true };
+	}
 	const id = generateShortId();
 	const bufferedAt = new Date().toISOString();
-	const queue = getSubagentBufferedMessagesMap().get(subagentId) ?? [];
 	const entry = { id, text, images, bufferedAt };
 	if (position === "front") {
 		queue.unshift(entry);

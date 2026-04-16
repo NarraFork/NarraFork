@@ -108,6 +108,8 @@
 	"openaiCodexAccountId": "ChatGPT 账户 ID",
 	"openaiCodexAccountIdDesc": "可选。作为 ChatGPT-Account-Id 请求头发送，用于组织订阅。",
 	"openaiCodexAccountIdPlaceholder": "account-id...",
+	"openaiCodexWebSocket": "使用 Responses WebSocket",
+	"openaiCodexWebSocketDesc": "使用 Responses WebSocket 而非 HTTP 连接到 Codex（实验性功能，不可用时会自动回退 HTTP）",
 	"openaiRefreshModels": "获取模型列表",
 	"openaiRefreshModelsLoading": "获取中...",
 	"openaiRefreshModelsSuccess": "已获取 {{count}} 个模型",

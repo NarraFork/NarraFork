@@ -898,3 +898,23 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_created").on(table.createdAt),
 	],
 );
+
+// === narrator_buffered_messages ===
+// Persisted queue of user messages waiting to be processed by a running narrator.
+// Acts as the durable backing store for the in-memory bufferedMessages Map.
+export const narratorBufferedMessages = sqliteTable(
+	"narrator_buffered_messages",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id").notNull(),
+		text: text("text").notNull(),
+		imagesJson: text("images_json"), // JSON: ImageRef[] | null
+		commandText: text("command_text"),
+		createdBy: text("created_by"),
+		creatorJson: text("creator_json"), // JSON: BufferCreator | null
+		textFilePathsJson: text("text_file_paths_json"), // JSON: SavedBufferedFile[] | null
+		seq: integer("seq").notNull(),
+		bufferedAt: text("buffered_at").notNull(),
+	},
+	(table) => [index("idx_nbm_narrator_seq").on(table.narratorId, table.seq)],
+);

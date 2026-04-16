@@ -927,7 +927,7 @@ export const handleNarratorWS = {
 						narratorId: msg.narratorId,
 					});
 				}
-				let bufResult = pushBufferedMessage(
+				let bufResult = await pushBufferedMessage(
 					msg.narratorId,
 					bufferText,
 					undefined,

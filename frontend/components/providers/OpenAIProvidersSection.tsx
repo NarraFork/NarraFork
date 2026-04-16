@@ -68,7 +68,7 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 	);
 
 	const updateProvider = useCallback(
-		(id: string, field: keyof OpenAIProviderState, value: string) => {
+		(id: string, field: keyof OpenAIProviderState, value: string | boolean) => {
 			onProvidersChange((prev) => prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
 		},
 		[onProvidersChange],
@@ -210,6 +210,15 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 									value={p.codexAccountId}
 									size="xs"
 									onChange={(e) => updateProvider(p.id, "codexAccountId", e.currentTarget.value)}
+								/>
+							)}
+							{p.apiMode === "codex" && (
+								<Switch
+									label={t("openaiCodexWebSocket")}
+									description={t("openaiCodexWebSocketDesc")}
+									size="xs"
+									checked={!!p.codexWebSocket}
+									onChange={(e) => updateProvider(p.id, "codexWebSocket", e.currentTarget.checked)}
 								/>
 							)}
 							<Group gap="xs">

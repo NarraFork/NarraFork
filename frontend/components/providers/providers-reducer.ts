@@ -88,6 +88,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				defaultModel: p.defaultModel ?? "",
 				apiMode: p.apiMode ?? "responses",
 				codexAccountId: p.codexAccountId ?? "",
+				codexWebSocket: p.codexWebSocket ?? false,
 				disabled: p.disabled ?? false,
 			}));
 

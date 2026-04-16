@@ -278,7 +278,7 @@ export const chapterService = {
 			title: string;
 			description: string;
 			status: "active" | "dormant" | "merged" | "abandoned" | "frozen";
-			role: "trunk" | "branch" | "exploration";
+			role: "trunk" | "branch" | "exploration" | "review";
 			color: string | null;
 			groupLabel: string | null;
 			containerConfig: Record<string, unknown> | null;

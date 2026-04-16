@@ -108,6 +108,8 @@
 	"openaiCodexAccountId": "ChatGPT Account ID",
 	"openaiCodexAccountIdDesc": "Optional. Sent as ChatGPT-Account-Id header for organization subscriptions.",
 	"openaiCodexAccountIdPlaceholder": "account-id...",
+	"openaiCodexWebSocket": "Use Responses WebSocket",
+	"openaiCodexWebSocketDesc": "Use Responses WebSocket instead of HTTP for Codex requests (experimental; falls back to HTTP when unavailable)",
 	"openaiRefreshModels": "Fetch Models",
 	"openaiRefreshModelsLoading": "Fetching...",
 	"openaiRefreshModelsSuccess": "Fetched {{count}} models",

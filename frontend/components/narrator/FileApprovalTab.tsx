@@ -21,8 +21,9 @@ export function FileApprovalTab({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const { focusIndex, setButtonCount, setHasFeedback, registerActions } =
+	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
+	const isActivePermission = permission.id === activePermissionId;
 	const toolUseId = permission.toolUseId ?? null;
 	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
 
@@ -47,8 +48,8 @@ export function FileApprovalTab({
 
 	// Notify parent when feedback presence changes so the Enter hint can auto-switch
 	useEffect(() => {
-		setHasFeedback(!!feedback);
-	}, [feedback, setHasFeedback]);
+		if (isActivePermission) setHasFeedback(!!feedback);
+	}, [feedback, setHasFeedback, isActivePermission]);
 
 	const handleAllow = useCallback(() => {
 		sessionStorage.removeItem(draftKey);
@@ -60,11 +61,12 @@ export function FileApprovalTab({
 		onDecision?.(permission.id, "deny", feedback || undefined);
 	}, [draftKey, onDecision, permission.id, feedback]);
 
-	// Report button count and register actions
+	// Report button count and register actions — only for the active (earliest) permission
 	useEffect(() => {
+		if (!isActivePermission) return;
 		setButtonCount(2);
 		registerActions([handleAllow, handleDeny]);
-	}, [setButtonCount, registerActions, handleAllow, handleDeny]);
+	}, [isActivePermission, setButtonCount, registerActions, handleAllow, handleDeny]);
 
 	if (isLoading) {
 		return (
@@ -179,10 +181,10 @@ export function FileApprovalTab({
 						size="sm"
 						color="green"
 						onClick={handleAllow}
-						className={focusIndex === 0 ? "perm-btn-pulse" : undefined}
+						className={isActivePermission && focusIndex === 0 ? "perm-btn-pulse" : undefined}
 					>
 						{tc("allow")}
-						{focusIndex === 0 && (
+						{isActivePermission && focusIndex === 0 && (
 							<Text span size="xs" ml={4} opacity={0.7}>
 								⏎
 							</Text>
@@ -193,10 +195,10 @@ export function FileApprovalTab({
 						color="red"
 						variant="light"
 						onClick={handleDeny}
-						className={focusIndex === 1 ? "perm-btn-pulse" : undefined}
+						className={isActivePermission && focusIndex === 1 ? "perm-btn-pulse" : undefined}
 					>
 						{tc("deny")}
-						{focusIndex === 1 && (
+						{isActivePermission && focusIndex === 1 && (
 							<Text span size="xs" ml={4} opacity={0.7}>
 								⏎
 							</Text>

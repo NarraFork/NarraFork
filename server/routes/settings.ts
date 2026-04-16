@@ -49,6 +49,8 @@ const openaiProviderSchema = z.object({
 	responsesApi: z.boolean().optional(),
 	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
 	codexAccountId: z.string().optional(),
+	codexWebSocket: z.boolean().optional(),
+	defaultContextWindow: z.number().int().min(1).optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -95,6 +97,7 @@ const clineProviderSchema = z.object({
 	accessToken: z.string().optional(),
 	defaultModel: z.string(),
 	defaultContextWindow: z.number().int().min(1).optional(),
+	enabledModels: z.array(z.string()).optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -150,6 +153,7 @@ const updateSettingsSchema = z
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				smartInterruptionCheck: z.boolean(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
+				retryBackoffCeilMs: z.number().int().min(1000).max(300000),
 				customRetryRules: z
 					.array(
 						z.object({
@@ -270,6 +274,7 @@ const updateSettingsSchema = z
 		routines: z
 			.object({
 				disabledRoutines: z.array(z.string()),
+				enabledRoutines: z.array(z.string()),
 			})
 			.partial()
 			.optional(),
@@ -280,6 +285,13 @@ const updateSettingsSchema = z
 				channel: z.enum(["stable", "beta"]).optional(),
 				checkIntervalMinutes: z.number().int().min(0).optional(),
 				autoDownload: z.boolean().optional(),
+			})
+			.partial()
+			.optional(),
+		shares: z
+			.object({
+				defaultExpiryHours: z.number().int().min(1),
+				maxFileSizeMb: z.number().int().min(1),
 			})
 			.partial()
 			.optional(),

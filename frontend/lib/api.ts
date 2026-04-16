@@ -683,6 +683,7 @@ export const api = {
 		permissionMode?: string;
 		reasoningEffort?: string | null;
 		fastMode?: boolean;
+		relaxedPlan?: boolean;
 		cwd?: string;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) =>
@@ -1259,15 +1260,31 @@ export const api = {
 			notifyFeishuWebhook: string;
 			notifyFeishuSecret: string;
 			recentTabs: Array<{
-				type: "chapter" | "narrator";
+				type: "chapter" | "narrator" | "project" | "workspace";
 				id: string;
 				narratorId?: string;
+				workspaceId?: string | null;
 				title: string;
 				subtitle?: string;
 				status?: string;
 				lastVisitedAt: number;
+				pinned?: boolean;
 			}>;
-			commands: Array<{ name: string; prompt: string; description?: string }>;
+			commands: Array<{
+				name: string;
+				prompt: string;
+				description?: string;
+				params?: Array<{
+					name: string;
+					description?: string;
+					required?: boolean;
+					defaultValue?: string;
+				}>;
+				modelOverride?: {
+					model: string;
+					mode: "temporary" | "permanent";
+				};
+			}>;
 			sendMode: "enter" | "ctrl+enter";
 			setupWizardCompleted: boolean;
 		}>("/user-preferences"),
@@ -1297,7 +1314,21 @@ export const api = {
 		notifyFeishuWebhook?: string;
 		notifyFeishuSecret?: string;
 		// Slash commands
-		commands?: Array<{ name: string; prompt: string; description?: string }>;
+		commands?: Array<{
+			name: string;
+			prompt: string;
+			description?: string;
+			params?: Array<{
+				name: string;
+				description?: string;
+				required?: boolean;
+				defaultValue?: string;
+			}>;
+			modelOverride?: {
+				model: string;
+				mode: "temporary" | "permanent";
+			};
+		}>;
 		// Send mode
 		sendMode?: "enter" | "ctrl+enter";
 		// Setup wizard

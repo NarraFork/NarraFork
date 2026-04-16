@@ -5,6 +5,11 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { getHttpUserAgent } from "../user-agent";
+import {
+	type CodexResponsesRequestBody,
+	CodexWebSocketFallbackError,
+	streamCodexResponsesWebSocket,
+} from "./codex-websocket";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -270,10 +275,14 @@ export class OpenAIProvider implements ProviderAdapter {
 	/** Optional proxy URL for all requests (used by Codex). */
 	private proxy?: string;
 
+	/** Whether to use Responses WebSocket for codex mode (experimental). */
+	private useWebSocket: boolean;
+
 	constructor(config: OpenAIProviderConfig, proxy?: string) {
 		this.config = config;
 		this.apiMode = resolveApiMode(config);
 		this.proxy = proxy;
+		this.useWebSocket = !!(config.codexWebSocket && this.apiMode === "codex");
 	}
 
 	/** Convenience: does the current mode use Responses API message format? */
@@ -353,6 +362,12 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		// Use WebSocket mode for codex if enabled
+		if (this.useWebSocket) {
+			yield* this.chatCodexWebSocket(params);
+			return;
+		}
+
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
@@ -884,6 +899,155 @@ export class OpenAIProvider implements ProviderAdapter {
 		} catch {
 			return false;
 		}
+	}
+
+	/**
+	 * WebSocket-based chat for codex apiMode.
+	 * Falls back to HTTP if WebSocket is unavailable.
+	 */
+	private async *chatCodexWebSocket(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		const apiKey = await this.getEffectiveApiKey();
+		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
+
+		if (!apiKey) {
+			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
+		}
+
+		const request = this.buildCodexWebSocketRequest(params);
+		params.requestDump?.setRequest({
+			transport: "websocket",
+			url: `${baseUrl}/responses`,
+			headers: {
+				Authorization: "Bearer [REDACTED]",
+				originator: "narrafork",
+				OpenAI_Beta: "responses_websockets=2026-02-06",
+			},
+			body: { type: "response.create", ...request },
+		});
+
+		try {
+			for await (const event of streamCodexResponsesWebSocket({
+				baseUrl,
+				apiKey,
+				accountId: this.config.codexAccountId,
+				proxy: this.proxy,
+				sessionKey: params.stickySessionKey ?? params.conversationId,
+				narratorId: params.stickySessionKey,
+				credentialId: this.config.id,
+				model: params.model,
+				request,
+				signal: params.signal,
+			})) {
+				yield event;
+			}
+		} catch (err) {
+			if (params.signal.aborted) throw err;
+			if (err instanceof CodexWebSocketFallbackError) {
+				logger.warn("OpenAI codex WebSocket unavailable, falling back to HTTP", {
+					provider: this.config.name,
+					status: err.status,
+					error: err.message,
+				});
+				// Disable WebSocket for subsequent calls on this instance
+				this.useWebSocket = false;
+				yield* this.chat(params);
+				return;
+			}
+			throw err;
+		}
+	}
+
+	/** Build a Responses WebSocket request body from chat params (codex mode). */
+	private buildCodexWebSocketRequest(params: ChatParams): CodexResponsesRequestBody {
+		const model = parseModelId(params.model).model;
+		const messages: OAIMessage[] = [...(params.history as OAIMessage[])];
+		for (const tr of params.toolResults as Array<{
+			type: string;
+			call_id: string;
+			output: string;
+			_images?: Array<{ format: string; base64: string }>;
+		}>) {
+			messages.push({
+				type: "function_call_output",
+				call_id: tr.call_id,
+				output: tr.output,
+			} as unknown as OAIMessage);
+			if (tr._images?.length) {
+				messages.push({
+					role: "user",
+					content: tr._images.map((img) => ({
+						type: "input_image",
+						image_url: `data:image/${img.format};base64,${img.base64}`,
+					})),
+				} as unknown as OAIMessage);
+			}
+		}
+		if (params.content && params.content !== ".") {
+			if (params.images?.length) {
+				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
+				for (const img of params.images) {
+					parts.push({
+						type: "image_url",
+						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
+					});
+				}
+				messages.push({ role: "user", content: parts });
+			} else {
+				messages.push({ role: "user", content: params.content });
+			}
+		} else if (params.toolResults.length === 0) {
+			messages.push({ role: "user", content: params.content });
+		}
+
+		let instructions = "";
+		const inputMessages: OAIMessage[] = [];
+		for (const msg of messages) {
+			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
+			const role = (msg as any).role;
+			if (role === "system" || role === "developer") {
+				if (typeof msg.content === "string") {
+					instructions += (instructions ? "\n\n" : "") + msg.content;
+				}
+				continue;
+			}
+			inputMessages.push(msg);
+		}
+
+		const sanitizedInputMessages = inputMessages.filter((msg) => {
+			if (msg.role !== "assistant") return true;
+			const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+			if (hasToolCalls) return true;
+			if (typeof msg.content === "string") return msg.content.length > 0;
+			if (Array.isArray(msg.content)) return msg.content.length > 0;
+			return false;
+		});
+
+		const request: CodexResponsesRequestBody = {
+			model,
+			input: convertHistoryToResponsesApi(sanitizedInputMessages),
+			stream: true,
+			store: false,
+			prompt_cache_key: params.conversationId,
+			parallel_tool_calls: true,
+		};
+		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
+		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
+		tools.push({ type: "web_search" });
+		request.tools = tools;
+
+		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
+		if (reasoningEffort) {
+			request.reasoning = {
+				effort: reasoningEffort,
+				summary: "auto",
+			};
+			request.include = ["reasoning.encrypted_content"];
+		}
+		if (params.serviceTier) {
+			request.service_tier = params.serviceTier;
+		}
+
+		return request;
 	}
 
 	/**
@@ -1905,15 +2069,17 @@ function buildResponsesPreludeItems(
 	}
 	for (const block of webSearchBlocks ?? []) {
 		// Use the stored action if available; fall back to building a search action from query/queries.
-		const action = block.action ?? (block.query || block.queries?.length
-			? {
-				type: "search",
-				...(block.query ? { query: block.query } : {}),
-				...(Array.isArray(block.queries) && block.queries.length > 0
-					? { queries: block.queries }
-					: {}),
-			}
-			: undefined);
+		const action =
+			block.action ??
+			(block.query || block.queries?.length
+				? {
+						type: "search",
+						...(block.query ? { query: block.query } : {}),
+						...(Array.isArray(block.queries) && block.queries.length > 0
+							? { queries: block.queries }
+							: {}),
+					}
+				: undefined);
 		if (!action) continue;
 		entries.push({
 			item: {
@@ -2054,15 +2220,18 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 			flushTextBuffer();
 			const webSearchBlock = block as Extract<StoredAssistantBlock, { type: "web_search" }>;
 			// Use stored action if available; fall back to building a search action from query/queries.
-			const action = webSearchBlock.action ?? (webSearchBlock.query || (Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
-				? {
-					type: "search",
-					...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
-					...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
-						? { queries: webSearchBlock.queries }
-						: {}),
-				}
-				: undefined);
+			const action =
+				webSearchBlock.action ??
+				(webSearchBlock.query ||
+				(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
+					? {
+							type: "search",
+							...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
+							...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
+								? { queries: webSearchBlock.queries }
+								: {}),
+						}
+					: undefined);
 			if (!action) continue;
 			items.push({
 				type: "web_search_call",
@@ -2232,18 +2401,31 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// Replay them as user context so the model knows it searched previously.
 			const webSearchBlocks = content.filter(
 				(b: { type: string }) => b.type === "web_search",
-			) as Array<{ type: "web_search"; id: string; query?: string; queries?: string[];
-				action?: import("./provider").WebSearchAction }>;
+			) as Array<{
+				type: "web_search";
+				id: string;
+				query?: string;
+				queries?: string[];
+				action?: import("./provider").WebSearchAction;
+			}>;
 			if (webSearchBlocks.length > 0) {
 				const searchSummary = webSearchBlocks
 					.map((ws) => {
 						const action = ws.action;
-						if (action?.type === "open_page" && action.url) return `[Web search: opened ${action.url}]`;
+						if (action?.type === "open_page" && action.url)
+							return `[Web search: opened ${action.url}]`;
 						if (action?.type === "find_in_page") {
-							const parts = [action.pattern ? `'${action.pattern}'` : null, action.url].filter(Boolean);
+							const parts = [action.pattern ? `'${action.pattern}'` : null, action.url].filter(
+								Boolean,
+							);
 							return `[Web search: find ${parts.join(" in ")}]`;
 						}
-						const q = ws.query || action?.query || ws.queries?.join(", ") || action?.queries?.join(", ") || "unknown";
+						const q =
+							ws.query ||
+							action?.query ||
+							ws.queries?.join(", ") ||
+							action?.queries?.join(", ") ||
+							"unknown";
 						return `[Web search: ${q}]`;
 					})
 					.join("\n");
@@ -2479,8 +2661,12 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			if (Array.isArray(content) && content.length > 0) {
 				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
-		} else if (m.type === "function_call_output" || m.type === "function_call"
-			|| m.type === "web_search_call" || m.type === "reasoning") {
+		} else if (
+			m.type === "function_call_output" ||
+			m.type === "function_call" ||
+			m.type === "web_search_call" ||
+			m.type === "reasoning"
+		) {
 			// Already in Responses API format — pass through
 			result.push(msg);
 		} else {

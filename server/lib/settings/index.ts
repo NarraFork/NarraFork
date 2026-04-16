@@ -40,6 +40,8 @@ export interface OpenAIProviderConfig {
 	apiMode?: "responses" | "completions" | "codex";
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header (for org subscriptions). */
 	codexAccountId?: string;
+	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
+	codexWebSocket?: boolean;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 }
