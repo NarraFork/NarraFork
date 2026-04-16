@@ -429,7 +429,9 @@ export class CodexProvider implements ProviderAdapter {
 		let instructions = "";
 		const inputMessages: OAIMessage[] = [];
 		for (const msg of messages) {
-			if (msg.role === "system") {
+			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
+			const role = (msg as any).role;
+			if (role === "system" || role === "developer") {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}
@@ -502,6 +504,7 @@ export class CodexProvider implements ProviderAdapter {
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
 		}>,
 		messageId?: string,
 	): void {

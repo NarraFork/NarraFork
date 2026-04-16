@@ -198,6 +198,7 @@ type ResponsesWebSearchBlock = {
 	query?: string;
 	queries?: string[];
 	outputIndex?: number;
+	action?: import("./provider").WebSearchAction;
 };
 
 // === SSE delta types ===
@@ -646,6 +647,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
 		}>,
 		messageId?: string,
 	): void {
@@ -1182,6 +1184,7 @@ export function parseResponsesAPIEvent(
 				queries: action?.queries,
 				outputIndex: chunk.output_index,
 				final: true,
+				action: action ?? undefined,
 			},
 		});
 		return results;
@@ -1901,19 +1904,23 @@ function buildResponsesPreludeItems(
 		}
 	}
 	for (const block of webSearchBlocks ?? []) {
-		if (!block.query && !block.queries?.length) continue;
+		// Use the stored action if available; fall back to building a search action from query/queries.
+		const action = block.action ?? (block.query || block.queries?.length
+			? {
+				type: "search",
+				...(block.query ? { query: block.query } : {}),
+				...(Array.isArray(block.queries) && block.queries.length > 0
+					? { queries: block.queries }
+					: {}),
+			}
+			: undefined);
+		if (!action) continue;
 		entries.push({
 			item: {
 				type: "web_search_call",
 				id: block.id,
 				status: "completed",
-				action: {
-					type: "search",
-					...(block.query ? { query: block.query } : {}),
-					...(Array.isArray(block.queries) && block.queries.length > 0
-						? { queries: block.queries }
-						: {}),
-				},
+				action,
 			} as unknown as OAIMessage,
 			outputIndex: block.outputIndex,
 			sourceIndex: sourceIndex++,
@@ -1986,6 +1993,7 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 				query?: string;
 				queries?: string[];
 				outputIndex?: number;
+				action?: import("./provider").WebSearchAction;
 		  }
 		| { type: "tool_use"; id: string; name?: string; input?: Record<string, unknown> }
 		| { type: string; [key: string]: unknown };
@@ -2045,23 +2053,22 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 		if (block.type === "web_search") {
 			flushTextBuffer();
 			const webSearchBlock = block as Extract<StoredAssistantBlock, { type: "web_search" }>;
-			if (
-				!webSearchBlock.query &&
-				!(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
-			) {
-				continue;
-			}
-			items.push({
-				type: "web_search_call",
-				id: webSearchBlock.id,
-				status: "completed",
-				action: {
+			// Use stored action if available; fall back to building a search action from query/queries.
+			const action = webSearchBlock.action ?? (webSearchBlock.query || (Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0)
+				? {
 					type: "search",
 					...(webSearchBlock.query ? { query: webSearchBlock.query } : {}),
 					...(Array.isArray(webSearchBlock.queries) && webSearchBlock.queries.length > 0
 						? { queries: webSearchBlock.queries }
 						: {}),
-				},
+				}
+				: undefined);
+			if (!action) continue;
+			items.push({
+				type: "web_search_call",
+				id: webSearchBlock.id,
+				status: "completed",
+				action,
 			} as unknown as OAIMessage);
 			continue;
 		}
@@ -2225,11 +2232,18 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			// Replay them as user context so the model knows it searched previously.
 			const webSearchBlocks = content.filter(
 				(b: { type: string }) => b.type === "web_search",
-			) as Array<{ type: "web_search"; id: string; query?: string; queries?: string[] }>;
+			) as Array<{ type: "web_search"; id: string; query?: string; queries?: string[];
+				action?: import("./provider").WebSearchAction }>;
 			if (webSearchBlocks.length > 0) {
 				const searchSummary = webSearchBlocks
 					.map((ws) => {
-						const q = ws.query || ws.queries?.join(", ") || "unknown";
+						const action = ws.action;
+						if (action?.type === "open_page" && action.url) return `[Web search: opened ${action.url}]`;
+						if (action?.type === "find_in_page") {
+							const parts = [action.pattern ? `'${action.pattern}'` : null, action.url].filter(Boolean);
+							return `[Web search: find ${parts.join(" in ")}]`;
+						}
+						const q = ws.query || action?.query || ws.queries?.join(", ") || action?.queries?.join(", ") || "unknown";
 						return `[Web search: ${q}]`;
 					})
 					.join("\n");
@@ -2465,7 +2479,8 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			if (Array.isArray(content) && content.length > 0) {
 				result.push({ role: "assistant", content } as unknown as OAIMessage);
 			}
-		} else if (m.type === "function_call_output" || m.type === "function_call") {
+		} else if (m.type === "function_call_output" || m.type === "function_call"
+			|| m.type === "web_search_call" || m.type === "reasoning") {
 			// Already in Responses API format — pass through
 			result.push(msg);
 		} else {

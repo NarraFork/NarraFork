@@ -256,6 +256,7 @@ export type ContentBlock =
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
 	  };
 
 // === Plan mode constants ===

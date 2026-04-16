@@ -418,17 +418,20 @@ function collectReasoningBlocks(
 }
 
 function collectCompletedWebSearches(
-	map: Map<string, { query?: string; queries?: string[]; emitted: boolean; outputIndex?: number }>,
-): Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }> | undefined {
-	const blocks: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }> =
-		[];
+	map: Map<string, { query?: string; queries?: string[]; emitted: boolean; outputIndex?: number;
+	  action?: import("./provider").WebSearchAction }>,
+): Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number;
+    action?: import("./provider").WebSearchAction }> | undefined {
+	const blocks: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number;
+	    action?: import("./provider").WebSearchAction }> = [];
 	for (const [id, entry] of map.entries()) {
-		if (!entry.query && !entry.queries?.length) continue;
+		if (!entry.query && !entry.queries?.length && !entry.action) continue;
 		blocks.push({
 			id,
 			query: entry.query,
 			queries: entry.queries,
 			outputIndex: entry.outputIndex,
+			action: entry.action,
 		});
 	}
 	return blocks.length > 0 ? blocks : undefined;
@@ -609,7 +612,8 @@ export async function* agentLoop(
 		// Accumulator for native web search calls (Codex web_search tool)
 		const webSearchAccum = new Map<
 			string,
-			{ query?: string; queries?: string[]; emitted: boolean; outputIndex?: number }
+			{ query?: string; queries?: string[]; emitted: boolean; outputIndex?: number;
+			  action?: import("./provider").WebSearchAction }
 		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
@@ -1155,9 +1159,10 @@ export async function* agentLoop(
 						if (ws.query) acc.query = ws.query;
 						if (ws.queries) acc.queries = ws.queries;
 						if (ws.outputIndex != null) acc.outputIndex = ws.outputIndex;
+						if (ws.action) acc.action = ws.action;
 						// Emit block_complete only from the final output_item.done payload so
 						// the persisted block keeps the search query and stable output order.
-						if (ws.final && (acc.query || acc.queries) && !acc.emitted) {
+						if (ws.final && (acc.query || acc.queries || acc.action) && !acc.emitted) {
 							acc.emitted = true;
 							yield {
 								type: "block_complete",
@@ -1167,6 +1172,7 @@ export async function* agentLoop(
 									query: acc.query,
 									queries: acc.queries,
 									outputIndex: acc.outputIndex,
+									action: acc.action,
 								},
 							};
 						}
