@@ -36,10 +36,10 @@ export function NarratorDragGhost() {
 				px="xs"
 				py={4}
 				style={{
-					backgroundColor: "var(--mantine-color-dark-6)",
+					backgroundColor: "var(--mantine-color-body)",
 					border: "1px solid var(--mantine-color-indigo-7)",
 					borderRadius: 4,
-					boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+					boxShadow: "0 4px 12px rgba(0,0,0,0.25)",
 				}}
 			>
 				<Text size="xs" truncate>

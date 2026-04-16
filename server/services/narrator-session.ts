@@ -2783,6 +2783,8 @@ async function runAgentLoop(
 	let currentText = text;
 	let currentImages = images;
 	let loopHadError = false;
+	/** Whether the loop was interrupted by the user (abort signal). */
+	let loopWasInterrupted = false;
 	/** How many times we've retried after emergency compact in this runAgentLoop call. */
 	let contextOverflowRetries = 0;
 
@@ -3337,6 +3339,7 @@ async function runAgentLoop(
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
 				await finalizeInterruptedRun(active, narratorId, partialId);
+				loopWasInterrupted = true;
 				break;
 			}
 
@@ -3587,6 +3590,7 @@ async function runAgentLoop(
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
 				await finalizeInterruptedRun(active, narratorId, partialId);
+				loopWasInterrupted = true;
 				break;
 			}
 
@@ -3913,20 +3917,27 @@ async function runAgentLoop(
 		pendingPlanCompact.delete(narratorId);
 		pendingPlanApprover.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
-		// When the loop ended with an error, preserve buffered messages so the
-		// user can retry and the queue will resume automatically.  Notify the
-		// frontend so it keeps showing the queued messages.
-		// In both cases the DB rows are kept in sync:
-		// - error: rows stay (will be recovered on next startup or consumed on retry)
+		// When the loop ended with an error or was interrupted while buffered
+		// messages exist, preserve those messages so the user can retry / the
+		// next activation consumes them automatically.  Notify the frontend so
+		// it keeps showing the queued messages.
+		// DB rows are kept in sync:
+		// - error/interrupted-with-queue: rows stay (recovered on next startup or consumed on retry)
 		// - normal: rows are deleted (queue fully consumed)
-		if (loopHadError) {
-			const preserved = bufferedMessages.get(narratorId);
-			if (preserved?.length) {
-				broadcastToNarrator(narratorId, {
-					type: "buffer_preserved",
-					narratorId,
-					messages: toBufferSummary(preserved),
-				});
+		const hasBuffered = (bufferedMessages.get(narratorId)?.length ?? 0) > 0;
+		if (loopHadError || (loopWasInterrupted && hasBuffered)) {
+			// Only broadcast buffer_preserved on error — when interrupted the
+			// auto-resume below will immediately consume the first message, so
+			// showing a "preserved" notification would be misleading.
+			if (loopHadError) {
+				const preserved = bufferedMessages.get(narratorId);
+				if (preserved?.length) {
+					broadcastToNarrator(narratorId, {
+						type: "buffer_preserved",
+						narratorId,
+						messages: toBufferSummary(preserved),
+					});
+				}
 			}
 		} else {
 			bufferedMessages.delete(narratorId);
@@ -3959,6 +3970,60 @@ async function runAgentLoop(
 
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
+		}
+
+		// Auto-resume: when the loop was interrupted and buffered messages remain,
+		// schedule a new agent loop to consume them.  This makes "long-press cut in
+		// line" work end-to-end — the priority message is preserved in the buffer
+		// and a fresh loop picks it up immediately instead of waiting for the user
+		// to manually send another message.
+		if (
+			loopWasInterrupted &&
+			!loopHadError &&
+			(bufferedMessages.get(narratorId)?.length ?? 0) > 0
+		) {
+			const queue = bufferedMessages.get(narratorId)!;
+			const first = queue.shift()!;
+			if (queue.length === 0) bufferedMessages.delete(narratorId);
+			dbConsumeBuffered(first.id);
+			broadcastToNarrator(narratorId, {
+				type: "buffer_consumed",
+				narratorId,
+				messageId: first.id,
+				remaining: toBufferSummary(getBufferedMessages(narratorId)),
+			});
+
+			// Fire-and-forget: start a new session with the first buffered message.
+			// feedMessage handles ensureNarrator + persistUserMessage + runAgentLoop.
+			feedMessage(
+				narratorId,
+				first.text,
+				first.images,
+				locale,
+				active._replyInUserLanguage ?? false,
+				first.commandText,
+				first.createdBy,
+				first.textFiles,
+			)
+				.then(({ userMsg }) => {
+					broadcastToNarrator(narratorId, {
+						type: "user_message",
+						narratorId,
+						message: userMsg,
+					});
+				})
+				.catch(async (err) => {
+					logger.error("Auto-resume after interrupt failed", {
+						narratorId,
+						error: String(err),
+					});
+					await narratorService.updateStatus(narratorId, "error", String(err)).catch(() => {});
+					broadcastToNarrator(narratorId, {
+						type: "narrator_error",
+						narratorId,
+						error: String(err),
+					});
+				});
 		}
 	}
 }

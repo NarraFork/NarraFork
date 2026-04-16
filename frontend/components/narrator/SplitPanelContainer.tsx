@@ -1,4 +1,5 @@
 import { Box } from "@mantine/core";
+import { useQueryClient } from "@tanstack/react-query";
 import { createContext, memo, useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
 	type NarratorDragState,
@@ -139,18 +140,21 @@ function useLeafHeaderPointerDown(leaf: SplitLeaf) {
 	const { resolveNarratorView } = useContext(SplitPanelCtx);
 	const panelType = leafPanelType(leaf);
 	const { narratorId: currentNarratorId } = resolveNarratorView(leaf);
+	const qc = useQueryClient();
 
 	return useCallback(
 		(e: React.PointerEvent) => {
 			if (panelType === "narrator" && currentNarratorId) {
-				startNarratorDrag(currentNarratorId, "", e.clientX, e.clientY, leaf.id);
+				const cached = qc.getQueryData<{ title?: string }>(["narrators", currentNarratorId]);
+				const title = cached?.title ?? "";
+				startNarratorDrag(currentNarratorId, title, e.clientX, e.clientY, leaf.id);
 			} else if (panelType === "terminal") {
 				startNarratorDrag("__terminal__", "Terminal", e.clientX, e.clientY, leaf.id);
 			} else if (panelType === "webview") {
 				startNarratorDrag("__webview__", "Webview", e.clientX, e.clientY, leaf.id);
 			}
 		},
-		[currentNarratorId, leaf.id, panelType],
+		[currentNarratorId, leaf.id, panelType, qc.getQueryData],
 	);
 }
 

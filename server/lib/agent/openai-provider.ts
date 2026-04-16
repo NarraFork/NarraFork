@@ -2084,7 +2084,8 @@ function buildResponsesPreludeItems(
 		entries.push({
 			item: {
 				type: "web_search_call",
-				id: block.id,
+				// NOTE: `id` is intentionally omitted — the upstream Responses API
+				// does not accept it on input items (codex-rs skips serializing it).
 				status: "completed",
 				action,
 			} as unknown as OAIMessage,
@@ -2235,7 +2236,8 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 			if (!action) continue;
 			items.push({
 				type: "web_search_call",
-				id: webSearchBlock.id,
+				// NOTE: `id` is intentionally omitted — the upstream Responses API
+				// does not accept it on input items (codex-rs skips serializing it).
 				status: "completed",
 				action,
 			} as unknown as OAIMessage);
@@ -2667,8 +2669,15 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			m.type === "web_search_call" ||
 			m.type === "reasoning"
 		) {
-			// Already in Responses API format — pass through
-			result.push(msg);
+			// Already in Responses API format — pass through.
+			// Strip `id` from web_search_call: the upstream Responses API does not
+			// accept it on input items (codex-rs skips serializing it).
+			if (m.type === "web_search_call" && m.id != null) {
+				const { id: _stripped, ...rest } = m;
+				result.push(rest as unknown as OAIMessage);
+			} else {
+				result.push(msg);
+			}
 		} else {
 			result.push(msg);
 		}

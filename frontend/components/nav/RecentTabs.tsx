@@ -920,12 +920,10 @@ export function RecentTabList({
 				<DragOverlay dropAnimation={dropAnimation}>
 					{draggingTab && activeGroup === group ? (
 						draggingTab.type === "workspace" ? (
-							<Box style={{ opacity: 0.9 }}>
-								<DragOverlayWorkspaceItem
-									tab={draggingTab}
-									wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
-								/>
-							</Box>
+							<DragOverlayWorkspaceItem
+								tab={draggingTab}
+								wsChildren={childrenByWorkspace.get(draggingTab.id) ?? []}
+							/>
 						) : (
 							<DragOverlayTabItem tab={draggingTab} active={isTabActive(draggingTab, pathname)} />
 						)
@@ -1157,15 +1155,23 @@ function DragOverlayWorkspaceItem({
 	wsChildren: RecentTab[];
 }) {
 	return (
-		<Box style={{ boxShadow: "0 8px 24px rgba(0,0,0,0.4)", borderRadius: 8 }}>
+		<div style={{ overflow: "hidden" }}>
 			<NavLink
 				active={false}
-				label={<Text size="sm">{tab.title}</Text>}
-				leftSection={<IconColumns size={16} />}
+				label={
+					<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
+						{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
+						<Text size="sm">{tab.title}</Text>
+					</Group>
+				}
+				leftSection={
+					<span>
+						<IconColumns size={16} />
+					</span>
+				}
 				styles={{
 					root: {
 						cursor: "grabbing",
-						background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
 					},
 				}}
 			/>
@@ -1177,7 +1183,7 @@ function DragOverlayWorkspaceItem({
 					onContextMenu={() => {}}
 				/>
 			))}
-		</Box>
+		</div>
 	);
 }
 
@@ -1190,13 +1196,16 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
 
 	return (
-		<Box style={{ opacity: 0.9, boxShadow: "0 8px 24px rgba(0,0,0,0.4)", borderRadius: 8 }}>
+		<div style={{ overflow: "hidden" }}>
 			<NavLink
 				active={active}
 				label={
-					<Text size="sm" truncate>
-						{tab.title}
-					</Text>
+					<Group gap={4} wrap="nowrap" style={{ overflow: "hidden" }}>
+						{tab.pinned && <IconPin size={12} style={{ flexShrink: 0, opacity: 0.5 }} />}
+						<Text size="sm" truncate>
+							{tab.title}
+						</Text>
+					</Group>
 				}
 				description={
 					<>
@@ -1217,31 +1226,32 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 					</>
 				}
 				leftSection={
-					tab.type === "project" ? (
-						<IconFolder size={16} />
-					) : tab.type === "chapter" ? (
-						<IconGitBranch
-							size={16}
-							color={iconColor}
-							fill={filledStatus ? "currentColor" : "none"}
-						/>
-					) : filledStatus ? (
-						<IconMessageCircleFilled size={16} color={iconColor} />
-					) : (
-						<IconMessageCircle size={16} color={iconColor} />
-					)
+					<span>
+						{tab.type === "project" ? (
+							<IconFolder size={16} />
+						) : tab.type === "workspace" ? (
+							<IconColumns size={16} />
+						) : tab.type === "chapter" ? (
+							<IconGitBranch
+								size={16}
+								color={iconColor}
+								fill={filledStatus ? "currentColor" : "none"}
+							/>
+						) : filledStatus ? (
+							<IconMessageCircleFilled size={16} color={iconColor} />
+						) : (
+							<IconMessageCircle size={16} color={iconColor} />
+						)}
+					</span>
 				}
 				styles={{
 					root: {
 						cursor: "grabbing",
-						...(!active && {
-							background: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-						}),
 					},
 					label: { overflow: "hidden" },
 				}}
 			/>
-		</Box>
+		</div>
 	);
 }
 

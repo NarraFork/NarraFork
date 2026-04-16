@@ -30,7 +30,11 @@ import {
 import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { LoadSkillResult, LoadToolNotFound, LoadToolResult } from "./command-service";
-import { revertPatchesForMessages, revertPatchForToolUse } from "./snapshot-revert";
+import {
+	revertPatchesForMessages,
+	revertPatchForToolUse,
+	revertPatchForToolUses,
+} from "./snapshot-revert";
 
 /**
  * For child messages belonging to subagent narrators, attach the subagent's
@@ -2062,7 +2066,12 @@ export const narratorService = {
 	 * (without cascading to subsequent messages).
 	 * Handles copy-on-write when the message is shared by multiple narrators.
 	 */
-	async deleteMessageBlock(narratorId: string, messageId: string, blockIndex: number) {
+	async deleteMessageBlock(
+		narratorId: string,
+		messageId: string,
+		blockIndex: number,
+		opts?: { skipRevert?: boolean; skipNarratorUpdate?: boolean },
+	) {
 		// Verify the message belongs to this narrator
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -2088,7 +2097,7 @@ export const narratorService = {
 		const remaining = blocks.filter((_, i) => i !== blockIndex);
 
 		// Auto-revert file changes if the removed block is a tool_use
-		if (removedBlock.type === "tool_use" && removedBlock.id) {
+		if (!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id) {
 			await revertPatchForToolUse(narratorId, removedBlock.id);
 		}
 
@@ -2255,16 +2264,18 @@ export const narratorService = {
 			}
 
 			// Reset conversation state since history changed
-			await tx
-				.update(narrators)
-				.set({
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId));
+			if (!opts?.skipNarratorUpdate) {
+				await tx
+					.update(narrators)
+					.set({
+						apiConversationId: null,
+						pruneBoundaryMessageId: null,
+						prunedPercent: null,
+						messageVersion: sql`${narrators.messageVersion} + 1`,
+						updatedAt: new Date().toISOString(),
+					})
+					.where(eq(narrators.id, narratorId));
+			}
 		});
 
 		return { messageDeleted };
@@ -2273,7 +2284,11 @@ export const narratorService = {
 	/**
 	 * Delete multiple content blocks across one or more messages in a single operation.
 	 * Blocks are processed in reverse blockIndex order per message to avoid index shifting.
-	 * Delegates to `deleteMessageBlock` for each block to reuse COW / cascade / revert logic.
+	 *
+	 * Optimized: collects all tool_use toolUseIds upfront and performs a single batch
+	 * revert (one cwd lookup, one queryOrderedToolCalls, one rebuild, one disk write),
+	 * then delegates per-block DB cleanup to `deleteMessageBlock` with revert skipped.
+	 * Narrator state (messageVersion etc.) is updated once at the end instead of per-block.
 	 */
 	async deleteMessageBlocks(
 		narratorId: string,
@@ -2290,12 +2305,47 @@ export const narratorService = {
 			arr.sort((a, b) => b - a); // descending so earlier deletes don't shift later indices
 		}
 
+		// --- Phase 1: Collect all tool_use IDs that will be removed ---
+		const toolUseIdsToRevert: string[] = [];
+		const uniqueMessageIds = [...grouped.keys()];
+		const messages =
+			uniqueMessageIds.length > 0
+				? await db.query.narratorMessages.findMany({
+						where: inArray(narratorMessages.id, uniqueMessageIds),
+						columns: { id: true, contentJson: true },
+					})
+				: [];
+		const messageMap = new Map(messages.map((m) => [m.id, m]));
+
+		for (const [messageId, indices] of grouped) {
+			const msg = messageMap.get(messageId);
+			if (!msg) continue;
+			const contentBlocks = Array.isArray(msg.contentJson)
+				? (msg.contentJson as { type: string; id?: string }[])
+				: [];
+			for (const idx of indices) {
+				const block = contentBlocks[idx];
+				if (block?.type === "tool_use" && block.id) {
+					toolUseIdsToRevert.push(block.id);
+				}
+			}
+		}
+
+		// --- Phase 2: Batch revert all affected files in one pass ---
+		if (toolUseIdsToRevert.length > 0) {
+			await revertPatchForToolUses(narratorId, toolUseIdsToRevert);
+		}
+
+		// --- Phase 3: Per-block DB cleanup (revert + narrator update skipped) ---
 		const results: Array<{ messageId: string; blockIndex: number; messageDeleted: boolean }> = [];
 		const failed: Array<{ messageId: string; blockIndex: number; error: string }> = [];
 		for (const [messageId, indices] of grouped) {
 			for (const blockIndex of indices) {
 				try {
-					const r = await this.deleteMessageBlock(narratorId, messageId, blockIndex);
+					const r = await this.deleteMessageBlock(narratorId, messageId, blockIndex, {
+						skipRevert: true,
+						skipNarratorUpdate: true,
+					});
 					results.push({ messageId, blockIndex, messageDeleted: r.messageDeleted });
 					// If the whole message was deleted, skip remaining blocks for this message
 					if (r.messageDeleted) break;
@@ -2308,6 +2358,21 @@ export const narratorService = {
 				}
 			}
 		}
+
+		// --- Phase 4: Single narrator state update ---
+		if (results.length > 0) {
+			await db
+				.update(narrators)
+				.set({
+					apiConversationId: null,
+					pruneBoundaryMessageId: null,
+					prunedPercent: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		}
+
 		return { deleted: results.length, failed: failed.length, results };
 	},
 

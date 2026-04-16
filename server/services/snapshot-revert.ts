@@ -158,11 +158,12 @@ export async function revertPatchForToolUse(
 		const cwd = await resolveNarratorCwd(narratorId);
 		if (!cwd) return EMPTY_RESULT;
 
-		// Find the tool call being deleted
+		// Find the tool call being deleted (only successful ones affect files)
 		const toolCall = await db.query.narratorToolCalls.findFirst({
 			where: and(
 				eq(narratorToolCalls.narratorId, narratorId),
 				eq(narratorToolCalls.toolUseId, toolUseId),
+				eq(narratorToolCalls.status, "success"),
 			),
 			columns: { toolName: true, inputJson: true },
 		});
@@ -198,6 +199,67 @@ export async function revertPatchForToolUse(
 		logger.warn("Snapshot auto-revert (block) failed, continuing", {
 			narratorId,
 			toolUseId,
+			error: String(err),
+		});
+		return EMPTY_RESULT;
+	}
+}
+
+/**
+ * Batch revert file changes for multiple tool_use blocks at once.
+ * Used by deleteMessageBlocks to avoid redundant queries and disk writes.
+ *
+ * Resolves cwd once, queries affected tool calls once, rebuilds file states
+ * once (excluding all given toolUseIds), and writes to disk once.
+ */
+export async function revertPatchForToolUses(
+	narratorId: string,
+	toolUseIds: string[],
+): Promise<RevertResult> {
+	if (toolUseIds.length === 0) return EMPTY_RESULT;
+
+	try {
+		const cwd = await resolveNarratorCwd(narratorId);
+		if (!cwd) return EMPTY_RESULT;
+
+		// Find all tool calls being deleted (only successful ones affect files)
+		const toolCalls = await db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.toolUseId, toolUseIds),
+				eq(narratorToolCalls.status, "success"),
+			),
+			columns: { toolUseId: true, toolName: true, inputJson: true },
+		});
+
+		if (toolCalls.length === 0) return EMPTY_RESULT;
+
+		const affectedFiles = getAffectedFiles(toolCalls);
+		if (affectedFiles.length === 0) return EMPTY_RESULT;
+
+		// Rebuild file states excluding ALL deleted tool calls at once
+		const excludeIds = new Set(toolCalls.map((tc) => tc.toolUseId));
+		const fileStates = await rebuildFileStatesExcluding(narratorId, affectedFiles, excludeIds);
+
+		// Write to disk once
+		const writtenFiles = await writeFilesToDisk(cwd, fileStates);
+
+		logger.info("Auto-reverted file changes for deleted blocks (batch)", {
+			narratorId,
+			toolUseIdCount: toolUseIds.length,
+			fileCount: writtenFiles.length,
+			files: writtenFiles,
+		});
+
+		return {
+			reverted: writtenFiles.length > 0,
+			fileCount: writtenFiles.length,
+			files: writtenFiles,
+		};
+	} catch (err) {
+		logger.warn("Snapshot auto-revert (batch) failed, continuing", {
+			narratorId,
+			toolUseIds,
 			error: String(err),
 		});
 		return EMPTY_RESULT;
