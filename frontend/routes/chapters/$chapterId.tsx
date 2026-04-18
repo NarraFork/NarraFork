@@ -1,6 +1,6 @@
 import { Center, Loader } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
+import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { api } from "../../lib/api";
 
@@ -13,6 +13,7 @@ function ChapterRedirect() {
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
 	const from = search?.from as string | undefined;
+	const location = useLocation();
 	const navigate = useNavigate();
 
 	// 查询 chapter 的 narrators，找到 primary narrator
@@ -32,12 +33,13 @@ function ChapterRedirect() {
 				to: "/narrators/$narratorId",
 				params: { narratorId: primary.id },
 				search: from ? { from } : {},
+				hash: location.hash || undefined,
 				replace: true,
 			});
 		}
 		// 如果没有 primary narrator，可能需要创建一个
 		// 暂时先导航回项目页面
-	}, [narrators, navigate, from]);
+	}, [narrators, navigate, from, location.hash]);
 
 	return (
 		<Center h="100vh">

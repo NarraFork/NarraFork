@@ -33,11 +33,12 @@ function getResultLink(
 	}
 	if (result.type === "message") {
 		const hash = `msg-${result.id}`;
-		if (result.chapterId) {
-			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId }, hash };
-		}
+		// Prefer direct narrator link — the /chapters/ route is a redirect that loses the hash
 		if (result.narratorId) {
 			return { to: "/narrators/$narratorId", params: { narratorId: result.narratorId }, hash };
+		}
+		if (result.chapterId) {
+			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId }, hash };
 		}
 	}
 	if (result.type === "narrator") {
