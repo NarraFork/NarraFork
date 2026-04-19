@@ -19,3 +19,14 @@ export function useCloseBrowserSession() {
 		},
 	});
 }
+
+export function useStopBrowserTracing() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ narratorId, sessionId }: { narratorId: string; sessionId: string }) =>
+			api.stopBrowserTracing(narratorId, sessionId),
+		onSuccess: (_, { narratorId }) => {
+			qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
+		},
+	});
+}

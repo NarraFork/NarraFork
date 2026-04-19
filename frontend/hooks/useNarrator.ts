@@ -201,6 +201,19 @@ export function useCancelAskInPassing() {
 	});
 }
 
+export function usePromoteNarrator() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (narratorId: string) => api.promoteNarrator(narratorId),
+		onSuccess: (_data, narratorId) => {
+			qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["chapters"] });
+			qc.invalidateQueries({ queryKey: ["graph"] });
+		},
+	});
+}
+
 export const DEFAULT_MESSAGES_AROUND_BEFORE = 5;
 export const DEFAULT_MESSAGES_AROUND_AFTER = 20;
 

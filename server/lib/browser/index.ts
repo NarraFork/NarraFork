@@ -10,5 +10,6 @@ export {
 	createSession,
 	getSession,
 	listSessions,
+	stopTracing,
 	touchSession,
 } from "./session";

@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { computeFingerprint } from "../fingerprint";
+import { generateId } from "../id";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
@@ -17,10 +19,14 @@ const WEB_SEARCH_MAX_USES = 8;
 
 /**
  * Beta flags matching Claude Code CLI protocol exactly.
- * All flags are always included — no conditional logic.
+ * Matches getMergedBetas() output for firstParty agentic queries.
+ * Synced with Claude Code CLI v2.1.88.
  */
 const ANTHROPIC_BETA_FLAGS =
-	"claude-code-20250219,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24";
+	"claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24,redact-thinking-2026-02-12,context-management-2025-06-27";
+
+/** Claude Code CLI version used for billing header fingerprint. */
+const CC_CLI_VERSION = "2.1.88";
 
 /** Base beta flag for non-chat requests (model listing, generate). */
 const ANTHROPIC_BASE_BETA = "claude-code-20250219";
@@ -28,15 +34,53 @@ const ANTHROPIC_BASE_BETA = "claude-code-20250219";
 /** Cache control marker for ephemeral prompt caching. */
 const CACHE_CONTROL = { cache_control: { type: "ephemeral" as const } };
 
+/** Cache control marker with global scope (for system prompt prefix blocks). */
+const CACHE_CONTROL_GLOBAL = {
+	cache_control: { type: "ephemeral" as const, scope: "global" as const },
+};
+
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
 
 /**
+ * Stable device ID — generated once per process lifetime.
+ * Real Claude Code CLI persists this to disk; we keep it per-process which is
+ * sufficient for rate-limit / session-tracking purposes.
+ */
+const DEVICE_ID = generateId();
+
+/** xxHash64 seed for cch attestation (from Bun's Attestation.zig). */
+const CCH_SEED = 0x6e52736ac806831en;
+
+/** Placeholder for cch in billing header — replaced after body serialization. */
+const CCH_PLACEHOLDER = "cch=00000";
+
+/**
+ * Compute cch attestation hash from serialized request body.
+ * Algorithm: xxHash64(body, seed=0x6E52736AC806831E) & 0xFFFFF → 5-char hex.
+ *
+ * The body must contain the "cch=00000" placeholder when hashed — the hash is
+ * computed over the body bytes including the placeholder, then the placeholder
+ * is replaced with the computed value (same-length replacement).
+ */
+function computeCch(bodyStr: string): string {
+	// Bun.hash supports a 3-arg overload (algo, data, seed) at runtime but
+	// the TypeScript declarations don't expose it — cast via unknown to bypass.
+	// biome-ignore lint/suspicious/noExplicitAny: Bun runtime API not fully typed
+	const h = (Bun.hash as any)("xxhash64", bodyStr, CCH_SEED);
+	if (typeof h !== "bigint") return "00000";
+	return (h & 0xfffffn).toString(16).padStart(5, "0");
+}
+
+/**
  * Build billing header with dynamic fingerprint computation.
- * Format: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch={hash};
+ * Format: cc_version={version}.{fingerprint}; cc_entrypoint=cli; cch=00000; cc_workload=interactive;
+ *
+ * The cch=00000 is a placeholder that gets replaced after body serialization
+ * with the actual xxHash64-based attestation value.
  *
  * @param messages - Message history to compute fingerprint from
- * @returns Billing header string
+ * @returns Billing header string with cch placeholder
  */
 function buildBillingHeader(messages: AnthropicMessage[]): string {
 	// Extract first user message text for fingerprint computation
@@ -54,9 +98,9 @@ function buildBillingHeader(messages: AnthropicMessage[]): string {
 		}
 	}
 
-	// Compute fingerprint using Claude CLI version (2.1.88)
-	const fingerprint = computeFingerprint(firstUserMessageText, "2.1.88");
-	return `x-anthropic-billing-header: cc_version=2.1.88.${fingerprint}; cc_entrypoint=cli; cch=9a771;`;
+	// Compute fingerprint using Claude CLI version
+	const fingerprint = computeFingerprint(firstUserMessageText, CC_CLI_VERSION);
+	return `x-anthropic-billing-header: cc_version=${CC_CLI_VERSION}.${fingerprint}; cc_entrypoint=cli; ${CCH_PLACEHOLDER}; cc_workload=interactive;`;
 }
 
 /** Identity block injected as the second system block (matches Claude Code). */
@@ -364,6 +408,8 @@ export class AnthropicProvider implements ProviderAdapter {
 	private tlsRejectUnauthorized: boolean;
 	/** Cached base URL after successful /v1 fallback resolution. */
 	private resolvedBaseUrl?: string;
+	/** Stable session ID — one per provider instance (≈ per narrator session). */
+	private readonly sessionId = generateId();
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
@@ -594,8 +640,8 @@ export class AnthropicProvider implements ProviderAdapter {
 		const systemBlocks: Array<Record<string, unknown>> = [];
 		if (isOfficial) {
 			systemBlocks.push(
-				{ type: "text", text: buildBillingHeader(messages) },
-				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL },
+				{ type: "text", text: buildBillingHeader(messages), ...CACHE_CONTROL_GLOBAL },
+				{ type: "text", text: IDENTITY_BLOCK, ...CACHE_CONTROL_GLOBAL },
 			);
 			if (systemPrompt) {
 				systemBlocks.push({ type: "text", text: systemPrompt, ...CACHE_CONTROL });
@@ -639,20 +685,32 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		body.system = systemBlocks;
 
-		// Tools: official API injects server-side web_search; proxy mode uses function tools only.
+		// Tools: official API appends server-side web_search after user tools;
+		// proxy mode uses function tools only.
 		if (isOfficial) {
 			const serverTools: Record<string, unknown>[] = [
 				{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
 			];
 			body.tools = cachedTools ? [...cachedTools, ...serverTools] : serverTools;
+			body.tool_choice = { type: "auto" };
 		} else {
 			if (cachedTools) {
 				body.tools = cachedTools;
 			}
 		}
 
-		// Add metadata if provided
-		if (params.metadata) {
+		// Add metadata — official API always sends user_id for attribution;
+		// proxy mode only sends if explicitly provided.
+		if (isOfficial) {
+			body.metadata = {
+				user_id: JSON.stringify({
+					device_id: DEVICE_ID,
+					account_uuid: "",
+					session_id: this.sessionId,
+				}),
+				...(params.metadata ?? {}),
+			};
+		} else if (params.metadata) {
 			body.metadata = params.metadata;
 		}
 
@@ -671,6 +729,8 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
 			reqHeaders["user-agent"] = getHttpClaudeCliUserAgent();
 			reqHeaders["x-app"] = "cli";
+			reqHeaders["X-Claude-Code-Session-Id"] = this.sessionId;
+			reqHeaders["x-client-request-id"] = randomUUID();
 			reqHeaders["X-Stainless-Arch"] = "x64";
 			reqHeaders["X-Stainless-Lang"] = "js";
 			reqHeaders["X-Stainless-OS"] = "Linux";
@@ -702,12 +762,28 @@ export class AnthropicProvider implements ProviderAdapter {
 			reasoningEffort: params.reasoningEffort,
 		});
 
+		// Serialize body, then compute cch attestation and replace placeholder.
+		// The hash is computed over the body bytes including the "cch=00000" placeholder,
+		// then the placeholder is replaced with the computed 5-char hex value.
+		// We use indexOf on the billing header (always the first system block text)
+		// to avoid accidentally replacing a user-message that happens to contain
+		// the same literal.
+		let bodyStr = JSON.stringify(body);
+		if (isOfficial) {
+			const cch = computeCch(bodyStr);
+			const idx = bodyStr.indexOf(CCH_PLACEHOLDER);
+			if (idx !== -1) {
+				const replacement = `cch=${cch}`;
+				bodyStr = bodyStr.slice(0, idx) + replacement + bodyStr.slice(idx + CCH_PLACEHOLDER.length);
+			}
+		}
+
 		const response = await this.fetchWithV1Fallback(
 			reqPath,
 			{
 				method: "POST",
 				headers: reqHeaders,
-				body: JSON.stringify(body),
+				body: bodyStr,
 				signal: params.signal,
 			},
 			true,

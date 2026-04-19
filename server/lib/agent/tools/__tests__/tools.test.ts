@@ -1041,10 +1041,9 @@ describe("Agent tool rawJsonSchema", () => {
 		const rawKeys = Object.keys(
 			(agentTool.rawJsonSchema!.properties as Record<string, unknown>) ?? {},
 		);
-		// Zod "background" maps to rawJsonSchema "run_in_background" (CC naming alignment)
-		const keyMap: Record<string, string> = { background: "run_in_background" };
+		// Zod and rawJsonSchema now use the same parameter names
 		for (const key of zodKeys) {
-			expect(rawKeys).toContain(keyMap[key] ?? key);
+			expect(rawKeys).toContain(key);
 		}
 	});
 });

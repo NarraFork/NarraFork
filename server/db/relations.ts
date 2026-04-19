@@ -6,6 +6,7 @@ import {
 	chapters,
 	containerInstances,
 	explorationGroups,
+	hooks,
 	mergeSessions,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
@@ -38,6 +39,7 @@ export const projectsRelations = relations(projects, ({ many }) => ({
 	explorationGroups: many(explorationGroups),
 	overseers: many(overseers),
 	volumeSnapshots: many(volumeSnapshots),
+	hooks: many(hooks),
 }));
 
 export const chaptersRelations = relations(chapters, ({ one, many }) => ({
@@ -357,5 +359,12 @@ export const apiRequestsRelations = relations(apiRequests, ({ one }) => ({
 	message: one(narratorMessages, {
 		fields: [apiRequests.messageId],
 		references: [narratorMessages.id],
+	}),
+}));
+
+export const hooksRelations = relations(hooks, ({ one }) => ({
+	project: one(projects, {
+		fields: [hooks.projectId],
+		references: [projects.id],
 	}),
 }));

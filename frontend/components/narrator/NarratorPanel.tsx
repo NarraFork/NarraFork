@@ -96,6 +96,7 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorMessages,
+	usePromoteNarrator,
 	useStartAskInPassing,
 	useUpdateBlacklistDir,
 	useUpdateCmdBlacklist,
@@ -991,6 +992,7 @@ export function NarratorPanel({
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
+	const promoteMutation = usePromoteNarrator();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
@@ -1021,6 +1023,36 @@ export function NarratorPanel({
 	const { t: tt } = useTranslation("terminal");
 	const { t: tn } = useTranslation("nav");
 	const qc = useQueryClient();
+	const handlePromote = useCallback(() => {
+		promoteMutation.mutate(narratorId, {
+			onSuccess: (data) => {
+				if (data.type === "forked" && data.chapter) {
+					notifications.show({
+						message: t("promote_success_forked"),
+						color: "teal",
+					});
+					navigate({
+						to: "/projects/$projectId",
+						params: {
+							projectId: (data.chapter as Record<string, string>).projectId,
+						},
+					});
+				} else {
+					notifications.show({
+						message: t("promote_success_unlocked"),
+						color: "teal",
+					});
+				}
+			},
+			onError: (error: Error) => {
+				notifications.show({
+					message: error.message,
+					color: "red",
+					autoClose: 5000,
+				});
+			},
+		});
+	}, [promoteMutation, narratorId, t, navigate]);
 
 	// Overseer title: if this narrator is the global overseer's narrator, show i18n title + #id
 	const { data: globalOverseer } = useGlobalOverseer();
@@ -4691,37 +4723,74 @@ export function NarratorPanel({
 													</Menu.Dropdown>
 												</Menu>
 											</Tooltip>
-											<Tooltip label={t("permissionMode")}>
-												<Menu position="top-end">
-													<Menu.Target>
-														<NativeSelect
-															size="xs"
-															leftSection={
-																PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-																	<IconShield size={14} />
-																)
-															}
-															data={PERM_MODE_DATA.map((d) => ({
-																value: d.value,
-																label: t(d.label),
-															}))}
-															value={narrator.permissionMode ?? "default"}
-															onChange={() => {}}
-															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-															style={{ pointerEvents: "auto" }}
-														/>
-													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-														<PermModeMenuItems
-															currentMode={narrator.permissionMode ?? "default"}
-															onSelect={(m) =>
-																permModeMutation.mutate({ id: narratorId, permissionMode: m })
-															}
-															t={t}
-														/>
-													</Menu.Dropdown>
-												</Menu>
+											<Tooltip
+												label={
+													narrator.isAskInPassing
+														? t("askInPassing_readOnlyHint")
+														: t("permissionMode")
+												}
+											>
+												{narrator.isAskInPassing ? (
+													<NativeSelect
+														size="xs"
+														leftSection={PERM_MODE_ICONS.readOnly ?? <IconShield size={14} />}
+														data={[{ value: "readOnly", label: t("perm_readOnly") }]}
+														value="readOnly"
+														onChange={() => {}}
+														disabled
+														style={{ pointerEvents: "auto", opacity: 0.6 }}
+													/>
+												) : (
+													<Menu position="top-end">
+														<Menu.Target>
+															<NativeSelect
+																size="xs"
+																leftSection={
+																	PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+																		<IconShield size={14} />
+																	)
+																}
+																data={PERM_MODE_DATA.map((d) => ({
+																	value: d.value,
+																	label: t(d.label),
+																}))}
+																value={narrator.permissionMode ?? "default"}
+																onChange={() => {}}
+																onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+																style={{ pointerEvents: "auto" }}
+															/>
+														</Menu.Target>
+														<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+															<PermModeMenuItems
+																currentMode={narrator.permissionMode ?? "default"}
+																onSelect={(m) =>
+																	permModeMutation.mutate({ id: narratorId, permissionMode: m })
+																}
+																t={t}
+															/>
+														</Menu.Dropdown>
+													</Menu>
+												)}
 											</Tooltip>
+											{narrator.isAskInPassing && (
+												<Tooltip
+													label={
+														narrator.chapterId
+															? t("promote_chapter_hint")
+															: t("promote_standalone_hint")
+													}
+												>
+													<Button
+														size="xs"
+														variant="light"
+														color="teal"
+														loading={promoteMutation.isPending}
+														onClick={handlePromote}
+													>
+														{t("promote")}
+													</Button>
+												</Tooltip>
+											)}
 											<PathRulesPopover narratorId={narratorId} t={t} />
 											{/* Reasoning Effort (Codex + Anthropic providers) */}
 											{supportsReasoningEffort && (
@@ -4854,27 +4923,64 @@ export function NarratorPanel({
 												</Menu.Dropdown>
 											</Menu>
 										</Tooltip>
-										<Tooltip label={t("permissionMode")}>
-											<Menu position="bottom-end" withinPortal>
-												<Menu.Target>
-													<ActionIcon variant="subtle" color="gray" size="sm">
-														{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
-															<IconShield size={16} />
-														)}
-													</ActionIcon>
-												</Menu.Target>
-												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-													<Menu.Label>{t("permissionMode")}</Menu.Label>
-													<PermModeMenuItems
-														currentMode={narrator.permissionMode ?? "default"}
-														onSelect={(m) =>
-															permModeMutation.mutate({ id: narratorId, permissionMode: m })
-														}
-														t={t}
-													/>
-												</Menu.Dropdown>
-											</Menu>
+										<Tooltip
+											label={
+												narrator.isAskInPassing
+													? t("askInPassing_readOnlyHint")
+													: t("permissionMode")
+											}
+										>
+											{narrator.isAskInPassing ? (
+												<ActionIcon
+													variant="subtle"
+													color="gray"
+													size="sm"
+													disabled
+													style={{ opacity: 0.6 }}
+												>
+													{PERM_MODE_ICONS.readOnly ?? <IconShield size={16} />}
+												</ActionIcon>
+											) : (
+												<Menu position="bottom-end" withinPortal>
+													<Menu.Target>
+														<ActionIcon variant="subtle" color="gray" size="sm">
+															{PERM_MODE_ICONS[narrator.permissionMode ?? "default"] ?? (
+																<IconShield size={16} />
+															)}
+														</ActionIcon>
+													</Menu.Target>
+													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+														<Menu.Label>{t("permissionMode")}</Menu.Label>
+														<PermModeMenuItems
+															currentMode={narrator.permissionMode ?? "default"}
+															onSelect={(m) =>
+																permModeMutation.mutate({ id: narratorId, permissionMode: m })
+															}
+															t={t}
+														/>
+													</Menu.Dropdown>
+												</Menu>
+											)}
 										</Tooltip>
+										{narrator.isAskInPassing && (
+											<Tooltip
+												label={
+													narrator.chapterId
+														? t("promote_chapter_hint")
+														: t("promote_standalone_hint")
+												}
+											>
+												<Button
+													size="compact-xs"
+													variant="light"
+													color="teal"
+													loading={promoteMutation.isPending}
+													onClick={handlePromote}
+												>
+													{t("promote")}
+												</Button>
+											</Tooltip>
+										)}
 										<PathRulesPopover narratorId={narratorId} t={t} />
 										{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 										{supportsReasoningEffort && (

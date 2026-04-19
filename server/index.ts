@@ -54,6 +54,7 @@ ensureRootlessEnv();
 // Instead of process.exit(1), we set a global flag so the frontend can show a user-friendly dialog
 // (especially important on Windows where console output is invisible).
 import { setGitStatus } from "./lib/git-status";
+import { refreshWindowsPath } from "./lib/win-env";
 
 {
 	let _gitAvailable = false;
@@ -69,6 +70,25 @@ import { setGitStatus } from "./lib/git-status";
 		}
 	} catch {
 		// ENOENT — git binary not found
+	}
+	// On Windows the inherited PATH may be stale (parent shell / Explorer
+	// hasn't picked up registry changes from a recent git install).
+	// Refresh PATH from the registry and retry.
+	if (!_gitAvailable) {
+		if (refreshWindowsPath()) {
+			try {
+				const retry = Bun.spawnSync(["git", "--version"], {
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				if (retry.exitCode === 0) {
+					_gitAvailable = true;
+					_gitVersion = new TextDecoder().decode(retry.stdout).trim();
+				}
+			} catch {
+				// still not found
+			}
+		}
 	}
 	setGitStatus(_gitAvailable, _gitVersion);
 	if (!_gitAvailable) {

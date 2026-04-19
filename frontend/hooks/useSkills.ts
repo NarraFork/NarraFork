@@ -72,6 +72,17 @@ export function useDeleteGlobalSkill() {
 	});
 }
 
+export function useToggleGlobalSkill() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ name, enabled }: { name: string; enabled: boolean }) =>
+			api.toggleGlobalSkill(name, enabled),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["global-skills"] });
+		},
+	});
+}
+
 export function useGlobalSkillsRefresh() {
 	const qc = useQueryClient();
 	return useMutation({

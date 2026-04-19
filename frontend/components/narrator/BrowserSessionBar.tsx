@@ -13,13 +13,18 @@ import {
 	IconCamera,
 	IconChevronDown,
 	IconChevronRight,
+	IconPlayerStop,
 	IconRefresh,
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useBrowserSessions, useCloseBrowserSession } from "../../hooks/useBrowserSessions";
+import {
+	useBrowserSessions,
+	useCloseBrowserSession,
+	useStopBrowserTracing,
+} from "../../hooks/useBrowserSessions";
 import { getToken } from "../../lib/api";
 
 export function BrowserSessionBar({
@@ -65,7 +70,7 @@ export function BrowserSessionBar({
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</UnstyledButton>
 			<Collapse in={opened}>
-				<Box px="md" pb="xs">
+				<Box px="md" pb="xs" style={{ maxHeight: 300, overflowY: "auto" }}>
 					{sessions?.map((session) => (
 						<SessionCard key={session.id} narratorId={narratorId} session={session} />
 					))}
@@ -75,21 +80,53 @@ export function BrowserSessionBar({
 	);
 }
 
+/** Format bytes into a human-readable string. */
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Estimated trace growth rate: ~2 MB/s (typical Chrome trace with default categories). */
+const TRACE_RATE_BYTES_PER_MS = 2000;
+
 function SessionCard({
 	narratorId,
 	session,
 }: {
 	narratorId: string;
-	session: { id: string; url: string; lastActivity: number };
+	session: {
+		id: string;
+		url: string;
+		lastActivity: number;
+		tracing: { active: boolean; startedAt: number } | null;
+	};
 }) {
 	const { t } = useTranslation("narrator");
 	const closeMutation = useCloseBrowserSession();
+	const stopTracingMutation = useStopBrowserTracing();
 	const [showScreenshot, setShowScreenshot] = useState(false);
 	const [screenshotKey, setScreenshotKey] = useState(0);
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(false);
 	const revokedRef = useRef<string | null>(null);
+
+	// Live estimated trace size — ticks every second while tracing is active
+	const [estimatedSize, setEstimatedSize] = useState(0);
+	useEffect(() => {
+		if (!session.tracing?.active) {
+			setEstimatedSize(0);
+			return;
+		}
+		const update = () => {
+			const elapsed = Date.now() - (session.tracing?.startedAt ?? Date.now());
+			setEstimatedSize(elapsed * TRACE_RATE_BYTES_PER_MS);
+		};
+		update();
+		const timer = setInterval(update, 1000);
+		return () => clearInterval(timer);
+	}, [session.tracing?.active, session.tracing?.startedAt]);
 
 	const fetchScreenshot = useCallback(async () => {
 		const token = getToken();
@@ -154,13 +191,15 @@ function SessionCard({
 				? `${Math.floor(elapsed / 60_000)}m`
 				: `${Math.floor(elapsed / 3600_000)}h`;
 
+	const isTracing = session.tracing?.active ?? false;
+
 	return (
 		<Box
 			mt={4}
 			p="xs"
 			style={{
 				borderRadius: "var(--mantine-radius-sm)",
-				border: "1px solid var(--mantine-color-default-border)",
+				border: `1px solid var(--mantine-color-${isTracing ? "red-7" : "default-border"})`,
 			}}
 		>
 			<Group justify="space-between" wrap="nowrap" gap={6}>
@@ -175,9 +214,47 @@ function SessionCard({
 						<Text size="xs" c="dimmed">
 							{t("browser.lastActive", { time: elapsedLabel })}
 						</Text>
+						{isTracing && (
+							<>
+								<Badge
+									size="xs"
+									variant="filled"
+									color="red"
+									leftSection={
+										<Box
+											style={{
+												width: 6,
+												height: 6,
+												borderRadius: "50%",
+												background: "white",
+												animation: "pulse-dot 1.2s ease-in-out infinite",
+											}}
+										/>
+									}
+								>
+									{t("browser.tracingActive")}
+								</Badge>
+								<Text size="xs" c="red" ff="monospace">
+									~{formatSize(estimatedSize)}
+								</Text>
+							</>
+						)}
 					</Group>
 				</Box>
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{isTracing && (
+						<Tooltip label={t("browser.stopTracing")} fz="xs">
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								color="red"
+								loading={stopTracingMutation.isPending}
+								onClick={() => stopTracingMutation.mutate({ narratorId, sessionId: session.id })}
+							>
+								<IconPlayerStop size={14} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 					<Tooltip
 						label={showScreenshot ? t("browser.hideScreenshot") : t("browser.screenshotAlt")}
 						fz="xs"

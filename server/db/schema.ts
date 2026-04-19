@@ -263,6 +263,8 @@ export const narrators = sqliteTable(
 		}),
 		backgroundResult: text("background_result"),
 		backgroundCompletedAt: text("background_completed_at"),
+		/** Whether this narrator was created via "ask in passing" (locked to readOnly until promoted) */
+		isAskInPassing: integer("is_ask_in_passing", { mode: "boolean" }).notNull().default(false),
 		/** ISO timestamp when the current (or last) turn started */
 		turnStartedAt: text("turn_started_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
@@ -917,4 +919,36 @@ export const narratorBufferedMessages = sqliteTable(
 		bufferedAt: text("buffered_at").notNull(),
 	},
 	(table) => [index("idx_nbm_narrator_seq").on(table.narratorId, table.seq)],
+);
+
+// === hooks ===
+export const hooks = sqliteTable(
+	"hooks",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
+		event: text("event", {
+			enum: ["PreToolUse", "PostToolUse"],
+		}).notNull(),
+		matcher: text("matcher").notNull().default(""),
+		type: text("type", { enum: ["command", "http"] }).notNull(),
+		// command type
+		command: text("command"),
+		// http type
+		url: text("url"),
+		headers: text("headers", { mode: "json" }).$type<Record<string, string>>(),
+		// reserved for future prompt hook type
+		prompt: text("prompt"),
+		model: text("model"),
+		// common
+		timeout: integer("timeout").notNull().default(30),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		sortOrder: integer("sort_order").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_hooks_project").on(table.projectId),
+		index("idx_hooks_event").on(table.event, table.enabled),
+	],
 );

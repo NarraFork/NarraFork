@@ -44,6 +44,18 @@ function buildParameters() {
 			.describe(
 				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
 			),
+		resume: z
+			.string()
+			.optional()
+			.describe(
+				"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
+			),
+		run_in_background: z
+			.boolean()
+			.optional()
+			.describe(
+				"Set to true to run this agent in the background. You will be notified when it completes.",
+			),
 		model: z
 			.string()
 			.optional()
@@ -55,12 +67,6 @@ function buildParameters() {
 			.optional()
 			.describe(
 				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
-			),
-		background: z
-			.boolean()
-			.optional()
-			.describe(
-				"If true, run the task in the background without blocking the parent narrator. Returns a task ID immediately that can be checked later with TaskOutput. The background task runs independently and its results can be retrieved when complete. Best for long-running exploration or analysis tasks that don't need to block the current conversation.",
 			),
 		prompt: z.string().describe("The task for the agent to perform"),
 	});
@@ -116,12 +122,6 @@ export const agentTool: ToolDefinition = {
 						"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
 					type: "string",
 				},
-				isolation: {
-					description:
-						'Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo.',
-					type: "string",
-					enum: ["worktree"],
-				},
 				prompt: {
 					description: "The task for the agent to perform",
 					type: "string",
@@ -132,25 +132,52 @@ export const agentTool: ToolDefinition = {
 		};
 	},
 	async execute(args, ctx): Promise<ToolResult> {
-		const { prompt, description, subagent_type, model, workdir, background } = args as {
+		const raw = args as {
 			prompt: string;
 			description?: string;
 			subagent_type: string;
+			resume?: string;
+			run_in_background?: boolean;
 			model?: string;
 			workdir?: string;
+			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
+		const { prompt, description, subagent_type, resume, model, workdir } = raw;
+		// Prefer new name, fall back to legacy name for in-flight conversations
+		const run_in_background = raw.run_in_background ?? raw.background;
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
 		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;
-
-		// Lazy import to avoid circular dependency at module load time
-		const { runSubagent } = await import("@server/services/narrator-subagent");
 
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {
 			return { output: "Internal error: missing toolUseId", isError: true };
 		}
+
+		// Resume an existing subagent (ContinueTask semantics via Agent tool)
+		if (resume) {
+			const { continueSubagent } = await import("@server/services/narrator-subagent");
+			try {
+				const result = await continueSubagent({
+					subagentId: resume,
+					parentNarratorId: ctx.narratorId,
+					toolUseId,
+					prompt,
+					signal: ctx.signal,
+					locale: ctx.locale,
+				});
+				return { output: result };
+			} catch (err) {
+				return {
+					output: `Agent resume error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		// Lazy import to avoid circular dependency at module load time
+		const { runSubagent } = await import("@server/services/narrator-subagent");
 
 		try {
 			const result = await runSubagent({
@@ -163,7 +190,7 @@ export const agentTool: ToolDefinition = {
 				signal: ctx.signal,
 				locale: ctx.locale,
 				model: model || undefined,
-				background: background || false,
+				background: run_in_background || false,
 			});
 			return { output: result };
 		} catch (err) {

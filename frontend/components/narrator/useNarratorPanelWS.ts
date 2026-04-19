@@ -321,6 +321,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	) => MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] };
 	const pendingCacheUpdatesRef = useRef<CacheUpdater[]>([]);
 	const cacheUpdateRafRef = useRef(0);
+	// Flush all pending cache updaters synchronously in a single setQueryData call.
+	const flushCacheUpdatesSync = useCallback(() => {
+		if (cacheUpdateRafRef.current) {
+			cancelAnimationFrame(cacheUpdateRafRef.current);
+			cacheUpdateRafRef.current = 0;
+		}
+		const fns = pendingCacheUpdatesRef.current;
+		if (fns.length === 0) return;
+		pendingCacheUpdatesRef.current = [];
+		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+			let result: MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] } =
+				old;
+			for (const updater of fns) {
+				result = updater(result as MessagesQueryData | undefined);
+			}
+			return result;
+		});
+	}, [qc, messagesQueryKey]);
 	const scheduleCacheUpdate = useCallback(
 		(fn: CacheUpdater) => {
 			pendingCacheUpdatesRef.current.push(fn);
@@ -885,6 +903,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
+				let needsStreamingVersionBump = false;
 				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
 				const compactBlock = blocks.find(
 					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
@@ -915,14 +934,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						// streaming text, tool chunks, or streaming version — the parent
 						// may still be actively streaming while subagents complete.
 						if (!newMsg.parentToolUseId) {
+							// Clear streaming refs without bumping version yet — we want
+							// the cache update (remove synthetic + insert real) and the
+							// version bumps to land in the same React batch so there is
+							// no intermediate frame where the message list is empty.
 							streamingBlocksRef.current = [];
-							clearStreamingState();
-							// Clear pending RAF chunks — real message supersedes synthetic state.
-							// Notify (bump version) so topLevelStreamingChunks memo recomputes
-							// to null immediately, since onToolStarted/onToolCompleted no longer
-							// remove individual entries from the streaming ref.
-							cancelPendingToolChunks(true);
-							removeStreamingChunksMsg(qc, messagesQueryKey);
+							// clearStreamingState without version bump:
+							if (streamingRafRef.current) {
+								cancelAnimationFrame(streamingRafRef.current);
+								streamingRafRef.current = 0;
+							}
+							clearToolBlockCache();
+							// cancelPendingToolChunks without notify:
+							cancelPendingToolChunks(false);
+							// Mark that we need to bump versions after the sync flush
+							needsStreamingVersionBump = true;
 						}
 					}
 					if (newMsg.parentToolUseId && wsData.message?.role === "assistant") {
@@ -966,6 +992,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							if (!old?.pages?.length) return old;
 							const pages = [...old.pages];
 							const firstPage = { ...pages[0] };
+							// Atomically strip the synthetic streaming-chunks message
+							// in the same updater that inserts the real message, so
+							// there is never an intermediate frame without either.
+							if (needsStreamingVersionBump) {
+								firstPage.messages = firstPage.messages.filter(
+									(m: NarratorMsg) => m.id !== STREAMING_CHUNKS_MSG_ID,
+								);
+							}
 							const existingIdx = firstPage.messages.findIndex(
 								(m: NarratorMsg) => m.id === newMsg.id,
 							);
@@ -976,7 +1010,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								pages[0] = firstPage;
 								return { ...old, pages };
 							}
-							if (needsMiddleInsertReload) return old;
+							if (needsMiddleInsertReload) {
+								pages[0] = firstPage;
+								return { ...old, pages };
+							}
 							if (!isAtBottomRef.current && newMsg.role === "assistant") {
 								setUnreadCount((c) => c + 1);
 							}
@@ -1013,6 +1050,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						if (needsMiddleInsertReload) {
 							qc.invalidateQueries({ queryKey: messagesQueryKey });
 						}
+					}
+					// When streaming state was cleared for a top-level assistant message,
+					// synchronously flush the cache update and bump versions in the same
+					// JS turn so React batches everything into a single render — no
+					// intermediate frame where the message list is empty (no flicker).
+					if (needsStreamingVersionBump) {
+						flushCacheUpdatesSync();
+						setStreamingVersion((v) => v + 1);
+						bumpTopLevelStreamingChunksVersion((v) => v + 1);
 					}
 				} else {
 					qc.invalidateQueries({ queryKey: messagesQueryKey });

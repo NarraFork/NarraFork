@@ -37,6 +37,23 @@ import {
 } from "./snapshot-revert";
 
 /**
+ * SQLite has a max variable number limit (~32766 in bun:sqlite).
+ * Each narratorMessageRefs row has ~6 columns, so we batch at 500 rows
+ * (3000 variables) to stay well within the limit.
+ */
+const REFS_INSERT_BATCH = 500;
+
+/** Batch-insert narratorMessageRefs rows, chunking to stay within SQLite's variable limit. */
+async function insertRefsBatched(
+	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+	values: (typeof narratorMessageRefs.$inferInsert)[],
+) {
+	for (let i = 0; i < values.length; i += REFS_INSERT_BATCH) {
+		await tx.insert(narratorMessageRefs).values(values.slice(i, i + REFS_INSERT_BATCH));
+	}
+}
+
+/**
  * For child messages belonging to subagent narrators, attach the subagent's
  * resolved model as `subagentModel` on each message. This avoids extra API
  * calls from the frontend.
@@ -591,7 +608,8 @@ export async function handleLoadSkillCommand(
 		}
 	}
 
-	const skills = await loadAllSkills(gitPath);
+	const allSkills = await loadAllSkills(gitPath);
+	const skills = allSkills.filter((s) => !s.disabled);
 	const found = skills.find((s) => s.name === cmdResult.loadSkill);
 
 	if (!found) {
@@ -845,16 +863,15 @@ export const narratorService = {
 				.returning();
 
 			if (prefixRows.length > 0) {
-				await tx.insert(narratorMessageRefs).values(
-					prefixRows.map((row) => ({
-						id: generateId(),
-						narratorId: id,
-						messageId: row.messageId,
-						seq: row.seq,
-						isCompact: row.isCompact,
-						prunedPercent: row.prunedPercent,
-					})),
-				);
+				const refValues = prefixRows.map((row) => ({
+					id: generateId(),
+					narratorId: id,
+					messageId: row.messageId,
+					seq: row.seq,
+					isCompact: row.isCompact,
+					prunedPercent: row.prunedPercent,
+				}));
+				await insertRefsBatched(tx, refValues);
 			}
 
 			return created;
@@ -3531,15 +3548,14 @@ export const narratorService = {
 				.returning();
 
 			// Re-sequence refs starting from 1
-			await tx.insert(narratorMessageRefs).values(
-				parentRefs.map((row, i) => ({
-					id: generateId(),
-					narratorId: id,
-					messageId: row.messageId,
-					seq: i + 1,
-					isCompact: 0,
-				})),
-			);
+			const dupRefValues = parentRefs.map((row, i) => ({
+				id: generateId(),
+				narratorId: id,
+				messageId: row.messageId,
+				seq: i + 1,
+				isCompact: 0,
+			}));
+			await insertRefsBatched(tx, dupRefValues);
 
 			return created;
 		});
@@ -3690,16 +3706,15 @@ export const narratorService = {
 
 			// Batch insert refs (preserve prunedPercent from parent)
 			if (prefixRows.length > 0) {
-				await tx.insert(narratorMessageRefs).values(
-					prefixRows.map((row) => ({
-						id: generateId(),
-						narratorId: id,
-						messageId: row.messageId,
-						seq: row.seq,
-						isCompact: row.isCompact,
-						prunedPercent: row.prunedPercent,
-					})),
-				);
+				const refValues = prefixRows.map((row) => ({
+					id: generateId(),
+					narratorId: id,
+					messageId: row.messageId,
+					seq: row.seq,
+					isCompact: row.isCompact,
+					prunedPercent: row.prunedPercent,
+				}));
+				await insertRefsBatched(tx, refValues);
 
 				// Inherit prune state from parent if the boundary falls within the copied prefix.
 				// This prevents fork from resetting prunedPercent to 0, which would cause the

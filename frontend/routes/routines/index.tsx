@@ -6,6 +6,7 @@ import {
 	Container,
 	Group,
 	Modal,
+	NumberInput,
 	Paper,
 	SegmentedControl,
 	Select,
@@ -40,6 +41,13 @@ import {
 	useUpdateCustomSubagent,
 } from "../../hooks/useCustomSubagents";
 import {
+	type HookRecord,
+	useCreateHook,
+	useDeleteHook,
+	useHooks,
+	useUpdateHook,
+} from "../../hooks/useHooks";
+import {
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
@@ -62,6 +70,7 @@ import {
 	useGlobalSkills,
 	useGlobalSkillsRefresh,
 	useSkills,
+	useToggleGlobalSkill,
 	useUpdateGlobalSkill,
 } from "../../hooks/useSkills";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
@@ -93,6 +102,7 @@ interface SkillSummary {
 	description: string;
 	location: string;
 	files: string[];
+	disabled?: boolean;
 }
 
 // === Main Page ===
@@ -120,6 +130,7 @@ function RoutinesPage() {
 					<Tabs.Tab value="global-prompt">{t("tabGlobalPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="default-system-prompt">{t("tabDefaultSystemPrompt")}</Tabs.Tab>
 					<Tabs.Tab value="mcp-tools">{t("tabMcpTools")}</Tabs.Tab>
+					<Tabs.Tab value="hooks">{t("tabHooks")}</Tabs.Tab>
 				</Tabs.List>
 
 				<Tabs.Panel value="commands">
@@ -148,6 +159,9 @@ function RoutinesPage() {
 				</Tabs.Panel>
 				<Tabs.Panel value="mcp-tools">
 					<McpToolsTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="hooks">
+					<HooksTab />
 				</Tabs.Panel>
 			</Tabs>
 		</Container>
@@ -227,6 +241,328 @@ function CommandsTab() {
 	);
 }
 
+// === Tab: Hooks ===
+
+const HOOK_EVENTS = ["PreToolUse", "PostToolUse"];
+const HOOK_TYPES = ["command", "http"];
+
+interface HookDraft {
+	event: string;
+	matcher: string;
+	type: string;
+	command: string;
+	url: string;
+	headers: string;
+	timeout: number;
+	enabled: boolean;
+}
+
+const emptyHookDraft: HookDraft = {
+	event: "PreToolUse",
+	matcher: "",
+	type: "command",
+	command: "",
+	url: "",
+	headers: "",
+	timeout: 30,
+	enabled: true,
+};
+
+function HooksTab() {
+	const { t } = useTranslation("routines");
+	const { data: hooksList, isLoading } = useHooks();
+	const createMutation = useCreateHook();
+	const updateMutation = useUpdateHook();
+	const deleteMutation = useDeleteHook();
+
+	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
+	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
+	const [editingId, setEditingId] = useState<string | null>(null);
+	const [draft, setDraft] = useState<HookDraft>(emptyHookDraft);
+	const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+	const [headersError, setHeadersError] = useState<string | null>(null);
+
+	const handleCreate = useCallback(() => {
+		setEditingId(null);
+		setDraft(emptyHookDraft);
+		setHeadersError(null);
+		openEdit();
+	}, [openEdit]);
+
+	const handleEdit = useCallback(
+		(hook: HookRecord) => {
+			setEditingId(hook.id);
+			setDraft({
+				event: hook.event,
+				matcher: hook.matcher ?? "",
+				type: hook.type,
+				command: hook.command ?? "",
+				url: hook.url ?? "",
+				headers: hook.headers ? JSON.stringify(hook.headers, null, 2) : "",
+				timeout: hook.timeout ?? 30,
+				enabled: hook.enabled ?? true,
+			});
+			setHeadersError(null);
+			openEdit();
+		},
+		[openEdit],
+	);
+
+	const handleSave = useCallback(() => {
+		const payload: Record<string, unknown> = {
+			event: draft.event,
+			matcher: draft.matcher,
+			type: draft.type,
+			timeout: draft.timeout,
+			enabled: draft.enabled,
+		};
+		if (draft.type === "command") payload.command = draft.command;
+		if (draft.type === "http") {
+			payload.url = draft.url;
+			if (draft.headers.trim()) {
+				try {
+					payload.headers = JSON.parse(draft.headers);
+					setHeadersError(null);
+				} catch (e) {
+					setHeadersError(e instanceof Error ? e.message : "Invalid JSON");
+					return;
+				}
+			}
+		}
+
+		if (editingId) {
+			updateMutation.mutate({ id: editingId, ...payload }, { onSuccess: () => closeEdit() });
+		} else {
+			createMutation.mutate(payload, { onSuccess: () => closeEdit() });
+		}
+	}, [draft, editingId, createMutation, updateMutation, closeEdit]);
+
+	const handleDelete = useCallback(
+		(id: string) => {
+			setDeleteTarget(id);
+			openDelete();
+		},
+		[openDelete],
+	);
+
+	const confirmDelete = useCallback(() => {
+		if (deleteTarget) {
+			deleteMutation.mutate(deleteTarget, { onSuccess: () => closeDelete() });
+		}
+	}, [deleteTarget, deleteMutation, closeDelete]);
+
+	const eventLabel = (event: string) => t(`hookEvent${event}` as "hookEventPreToolUse");
+
+	const isValid =
+		draft.event &&
+		draft.type &&
+		((draft.type === "command" && draft.command.trim()) ||
+			(draft.type === "http" && draft.url.trim()));
+
+	return (
+		<Stack>
+			<Group justify="space-between">
+				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
+					{t("hooksDesc")}
+				</Text>
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconPlus size={14} />}
+					onClick={handleCreate}
+				>
+					{t("createHook")}
+				</Button>
+			</Group>
+
+			{isLoading && (
+				<Text size="sm" c="dimmed">
+					Loading...
+				</Text>
+			)}
+
+			{!isLoading && (!hooksList || hooksList.length === 0) && (
+				<Text size="sm" c="dimmed">
+					{t("noHooks")}
+				</Text>
+			)}
+
+			{hooksList?.map((hook: HookRecord) => (
+				<Paper key={hook.id} withBorder p="sm">
+					<Group justify="space-between" wrap="nowrap">
+						<div style={{ flex: 1, minWidth: 0 }}>
+							<Group gap="xs">
+								<Badge size="xs" variant="light" color="indigo">
+									{eventLabel(hook.event)}
+								</Badge>
+								<Badge size="xs" variant="outline">
+									{hook.type}
+								</Badge>
+								{hook.matcher && (
+									<Badge size="xs" variant="dot">
+										{hook.matcher}
+									</Badge>
+								)}
+								{!hook.enabled && (
+									<Badge size="xs" variant="outline" color="gray">
+										disabled
+									</Badge>
+								)}
+							</Group>
+							<Text size="xs" c="dimmed" truncate="end" mt={4}>
+								{hook.type === "command" ? hook.command : hook.url}
+							</Text>
+						</div>
+						<Group gap={4}>
+							<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(hook)}>
+								{t("editHook")}
+							</Button>
+							<ActionIcon
+								variant="subtle"
+								color="red"
+								size="sm"
+								onClick={() => handleDelete(hook.id)}
+							>
+								<IconTrash size={14} />
+							</ActionIcon>
+						</Group>
+					</Group>
+				</Paper>
+			))}
+
+			{/* Create / Edit Modal */}
+			<Modal
+				opened={editOpened}
+				onClose={closeEdit}
+				title={editingId ? t("editHook") : t("createHook")}
+				size="lg"
+			>
+				<Stack>
+					<Select
+						label={t("hookEvent")}
+						data={HOOK_EVENTS.map((e) => ({
+							value: e,
+							label: eventLabel(e),
+						}))}
+						value={draft.event}
+						onChange={(v) => setDraft((d) => ({ ...d, event: v ?? "PreToolUse" }))}
+					/>
+					<TextInput
+						label={t("hookMatcher")}
+						placeholder={t("hookMatcherPlaceholder")}
+						value={draft.matcher}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, matcher: val }));
+						}}
+					/>
+					<Select
+						label={t("hookType")}
+						data={HOOK_TYPES.map((tp) => ({
+							value: tp,
+							label: tp,
+						}))}
+						value={draft.type}
+						onChange={(v) => setDraft((d) => ({ ...d, type: v ?? "command" }))}
+					/>
+
+					{draft.type === "command" && (
+						<TextInput
+							label={t("hookCommand")}
+							placeholder={t("hookCommandPlaceholder")}
+							value={draft.command}
+							onChange={(e) => {
+								const val = e.currentTarget.value;
+								setDraft((d) => ({ ...d, command: val }));
+							}}
+						/>
+					)}
+
+					{draft.type === "http" && (
+						<>
+							<TextInput
+								label={t("hookUrl")}
+								placeholder={t("hookUrlPlaceholder")}
+								value={draft.url}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, url: val }));
+								}}
+							/>
+							<Textarea
+								label={t("hookHeaders")}
+								placeholder={t("hookHeadersPlaceholder")}
+								value={draft.headers}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, headers: val }));
+									if (headersError) setHeadersError(null);
+								}}
+								error={headersError}
+								autosize
+								minRows={2}
+								maxRows={6}
+								styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
+							/>
+						</>
+					)}
+
+					<NumberInput
+						label={t("hookTimeout")}
+						value={draft.timeout}
+						onChange={(v) => setDraft((d) => ({ ...d, timeout: typeof v === "number" ? v : 30 }))}
+						min={1}
+						max={600}
+					/>
+
+					<Switch
+						label={t("hookEnabled")}
+						checked={draft.enabled}
+						onChange={(e) => {
+							const val = e.currentTarget.checked;
+							setDraft((d) => ({ ...d, enabled: val }));
+						}}
+					/>
+
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeEdit}>
+							{t("cancel")}
+						</Button>
+						<Button
+							onClick={handleSave}
+							disabled={!isValid}
+							loading={createMutation.isPending || updateMutation.isPending}
+						>
+							{t("save")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+
+			{/* Delete Confirm Modal */}
+			<Modal
+				opened={deleteOpened}
+				onClose={closeDelete}
+				title={t("hookDeleteConfirmTitle")}
+				size="sm"
+				centered
+			>
+				<Stack>
+					<Text size="sm">{t("hookDeleteConfirm")}</Text>
+					<Group justify="flex-end" gap="xs">
+						<Button variant="subtle" onClick={closeDelete}>
+							{t("cancel")}
+						</Button>
+						<Button color="red" onClick={confirmDelete} loading={deleteMutation.isPending}>
+							{t("deleteHook")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		</Stack>
+	);
+}
+
 // === Tab: Tool Permissions (link to detail page) ===
 
 function ToolPermissionsTab() {
@@ -260,6 +596,7 @@ function GlobalSkillsTab() {
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
 	const refreshMutation = useGlobalSkillsRefresh();
+	const toggleMutation = useToggleGlobalSkill();
 
 	const [editOpened, { open: openEdit, close: closeEdit }] = useDisclosure(false);
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
@@ -368,8 +705,14 @@ function GlobalSkillsTab() {
 
 			{skills?.map((skill) => {
 				const source = getSourceLabel(skill.location);
+				const isDisabled = !!skill.disabled;
 				return (
-					<Paper key={skill.name} withBorder p="sm">
+					<Paper
+						key={skill.name}
+						withBorder
+						p="sm"
+						style={isDisabled ? { opacity: 0.55 } : undefined}
+					>
 						<Group justify="space-between" wrap="nowrap">
 							<div style={{ flex: 1, minWidth: 0 }}>
 								<Group gap="xs">
@@ -379,12 +722,27 @@ function GlobalSkillsTab() {
 									<Badge size="xs" variant="light" color={getSourceColor(source)}>
 										{source}
 									</Badge>
+									{isDisabled && (
+										<Badge size="xs" variant="outline" color="gray">
+											{t("skillDisabled")}
+										</Badge>
+									)}
 								</Group>
 								<Text size="xs" c="dimmed" truncate="end">
 									{skill.description}
 								</Text>
 							</div>
 							<Group gap={4}>
+								<Switch
+									checked={!isDisabled}
+									onChange={(e) =>
+										toggleMutation.mutate({
+											name: skill.name,
+											enabled: e.currentTarget.checked,
+										})
+									}
+									size="sm"
+								/>
 								<Button variant="subtle" size="compact-xs" onClick={() => handleView(skill)}>
 									{t("viewSkill")}
 								</Button>

@@ -358,6 +358,14 @@ export interface AgentConfig {
 	 * Exponential backoff is capped at this value.  Defaults to 20_000 (20s).
 	 */
 	retryBackoffCeilMs?: number;
+	/**
+	 * Hook handler — called before/after tool execution and at other lifecycle points.
+	 * Returns a HookResult; if outcome is "blocked", the tool call is denied.
+	 */
+	hookHandler?: (
+		event: string,
+		payload: Record<string, unknown>,
+	) => Promise<{ outcome: "success" | "blocked" | "error"; reason?: string }>;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

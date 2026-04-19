@@ -23,9 +23,10 @@ const skillSummaryCache = new Map<string, Array<{ name: string; description: str
 export async function warmSkillCache(skillRoot: string): Promise<void> {
 	try {
 		const skills = await loadAllSkills(skillRoot);
+		const enabled = skills.filter((s) => !s.disabled);
 		skillSummaryCache.set(
 			skillRoot,
-			skills.map((s) => ({ name: s.name, description: s.description })),
+			enabled.map((s) => ({ name: s.name, description: s.description })),
 		);
 	} catch {
 		// Non-fatal — cache will be populated on first tool execution
@@ -91,7 +92,8 @@ export const skillTool: ToolDefinition = {
 		}
 
 		try {
-			const skills = await loadAllSkills(ctx.skillRoot);
+			const allSkills = await loadAllSkills(ctx.skillRoot);
+			const skills = allSkills.filter((s) => !s.disabled);
 
 			// Refresh cache
 			skillSummaryCache.set(

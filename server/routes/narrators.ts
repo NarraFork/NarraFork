@@ -41,6 +41,7 @@ import {
 	closeSession as closeBrowserSession,
 	getSession as getBrowserSession,
 	listSessions as listBrowserSessions,
+	stopTracing as stopBrowserTracing,
 } from "../lib/browser/session";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
@@ -77,6 +78,7 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
+import { chapterFork } from "../services/chapter-fork";
 import type {
 	LoadSkillResult,
 	LoadToolNotFound,
@@ -1001,6 +1003,14 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
 	}
 	const narrator = await narratorService.getById(id);
+
+	// Ask-in-passing narrators are locked to readOnly until promoted
+	if (narrator.isAskInPassing) {
+		throw new ValidationError(
+			"Cannot change permission mode of an ask-in-passing narrator. Use promote to unlock.",
+		);
+	}
+
 	const currentMode = narrator.permissionMode;
 	await narratorService.updatePermissionMode(id, permissionMode);
 	await updateNarratorPermissionMode(id, permissionMode);
@@ -1416,10 +1426,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		title,
 	});
 
-	// Override permission mode to "default" (auto-approve read-only, manual for others)
+	// Lock to readOnly + mark as ask-in-passing (user can "promote" later to unlock)
 	await db
 		.update(narrators)
-		.set({ permissionMode: "default" })
+		.set({ permissionMode: "readOnly", isAskInPassing: true })
 		.where(eq(narrators.id, newNarrator.id));
 
 	// Send the user's question to the new narrator
@@ -1511,6 +1521,59 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 	});
 
 	return c.json({ ok: true });
+});
+
+// === Promote ask-in-passing narrator ===
+// Standalone: unlock permission mode (readOnly → default)
+// Chapter-bound: fork a new chapter from the parent chapter
+narratorRoutes.post("/:id/promote", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+
+	if (!narrator.isAskInPassing) {
+		throw new ValidationError("Only ask-in-passing narrators can be promoted");
+	}
+
+	if (!narrator.chapterId) {
+		// Standalone narrator: just unlock
+		await db
+			.update(narrators)
+			.set({
+				isAskInPassing: false,
+				permissionMode: "default",
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, id));
+
+		await updateNarratorPermissionMode(id, "default");
+
+		const updated = await narratorService.getById(id);
+		broadcastToNarrator(id, {
+			type: "permission_mode_changed",
+			narratorId: id,
+			permissionMode: "default",
+		});
+
+		return c.json({ type: "unlocked", narrator: updated });
+	}
+
+	// Chapter-bound narrator: fork a new chapter
+	const chapter = await chapterFork.fork(narrator.chapterId, {
+		inheritMode: "full",
+	});
+
+	// Mark the original ask-in-passing narrator as promoted so the UI
+	// no longer shows it as locked.  We keep permissionMode as readOnly
+	// since the original narrator stays as a read-only question record.
+	await db
+		.update(narrators)
+		.set({
+			isAskInPassing: false,
+			updatedAt: new Date().toISOString(),
+		})
+		.where(eq(narrators.id, id));
+
+	return c.json({ type: "forked", chapter });
 });
 
 // Get pending permissions
@@ -2342,8 +2405,34 @@ narratorRoutes.get("/:id/browser-sessions", (c) => {
 narratorRoutes.delete("/:id/browser-sessions/:sessionId", async (c) => {
 	const narratorId = c.req.param("id");
 	const sessionId = c.req.param("sessionId");
+
+	// Check if tracing was active before closing — we need to notify the model
+	const session = getBrowserSession(narratorId, sessionId);
+	const hadTracing = session?.tracing?.active ?? false;
+
 	const closed = await closeBrowserSession(narratorId, sessionId);
 	if (!closed) throw new NotFoundError("BrowserSession", sessionId);
+
+	if (hadTracing) {
+		const text =
+			`[System] Browser session ${sessionId} was closed by the user while performance tracing was active. ` +
+			`The trace data was discarded. If you need a trace, start a new session and recording.`;
+		const msg = await narratorService.persistSystemMessage(narratorId, text);
+		broadcastToNarrator(narratorId, {
+			type: "message",
+			narratorId,
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "sys",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
+		});
+	}
+
 	return c.json({ ok: true });
 });
 
@@ -2360,4 +2449,32 @@ narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
 			"Cache-Control": "no-store",
 		},
 	});
+});
+
+narratorRoutes.post("/:id/browser-sessions/:sessionId/stop-tracing", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const stopped = await stopBrowserTracing(narratorId, sessionId);
+	if (!stopped) throw new NotFoundError("BrowserSession", sessionId);
+
+	// Inject a system message so the model knows tracing was stopped externally
+	const text =
+		`[System] Performance tracing on browser session ${sessionId} was stopped by the user from the management panel. ` +
+		`The trace data was discarded. If you need a trace, start a new recording with perf_start.`;
+	const msg = await narratorService.persistSystemMessage(narratorId, text);
+	broadcastToNarrator(narratorId, {
+		type: "message",
+		narratorId,
+		message: {
+			id: msg.id,
+			narratorId,
+			role: "sys",
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			children: [],
+		},
+	});
+
+	return c.json({ ok: true });
 });

@@ -1,4 +1,14 @@
-import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import {
+	access,
+	mkdir,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import matter from "gray-matter";
@@ -14,6 +24,8 @@ export interface SkillInfo {
 	content: string;
 	/** Additional files in the skill directory (relative paths) */
 	files: string[];
+	/** Whether this skill is disabled (SKILL.md.disabled) */
+	disabled?: boolean;
 }
 
 // === mtime-based cache ===
@@ -63,9 +75,13 @@ async function resolveEntryType(
 }
 
 /**
- * Load and parse a single SKILL.md, using cache if mtime hasn't changed.
+ * Load and parse a single SKILL.md (or SKILL.md.disabled), using cache if mtime hasn't changed.
  */
-async function loadSkillCached(skillFile: string, skillDir: string): Promise<SkillInfo | null> {
+async function loadSkillCached(
+	skillFile: string,
+	skillDir: string,
+	disabled = false,
+): Promise<SkillInfo | null> {
 	const mtimeMs = await getMtimeMs(skillFile);
 	if (mtimeMs === null) return null;
 
@@ -83,7 +99,7 @@ async function loadSkillCached(skillFile: string, skillDir: string): Promise<Ski
 	}
 
 	const files = await collectSkillFiles(skillDir);
-	const skill: SkillInfo = { ...parsed, files };
+	const skill: SkillInfo = { ...parsed, files, disabled };
 	skillCache.set(skillFile, { mtimeMs, skill });
 	return skill;
 }
@@ -120,8 +136,15 @@ async function walkForSkills(dir: string, skills: SkillInfo[], depth: number): P
 			skills.push(skill);
 			// Don't recurse into a skill directory — sub-dirs are companion files
 		} else {
-			// No SKILL.md here — keep looking deeper
-			await walkForSkills(childDir, skills, depth + 1);
+			// Check for disabled skill (SKILL.md.disabled)
+			const disabledFile = join(childDir, "SKILL.md.disabled");
+			const disabledSkill = await loadSkillCached(disabledFile, childDir, true);
+			if (disabledSkill) {
+				skills.push(disabledSkill);
+			} else {
+				// No SKILL.md here — keep looking deeper
+				await walkForSkills(childDir, skills, depth + 1);
+			}
 		}
 	}
 }
@@ -177,7 +200,7 @@ async function collectSkillFiles(skillDir: string, depth = 0): Promise<string[]>
 		for (const entry of entries) {
 			const fullPath = join(skillDir, entry.name);
 			const kind = await resolveEntryType(skillDir, entry);
-			if (kind === "file" && entry.name !== "SKILL.md") {
+			if (kind === "file" && entry.name !== "SKILL.md" && entry.name !== "SKILL.md.disabled") {
 				files.push(relative(skillDir, fullPath));
 			} else if (kind === "dir" && depth < 2) {
 				const sub = await collectSkillFiles(fullPath, depth + 1);
@@ -380,6 +403,36 @@ export async function deleteGlobalSkill(name: string): Promise<void> {
 	await rm(skillDir, { recursive: true, force: true });
 }
 
+export async function toggleGlobalSkill(name: string, enabled: boolean): Promise<SkillInfo> {
+	const globals = await loadGlobalSkills();
+	const existing = globals.find((s) => s.name === name);
+	if (!existing) throw new NotFoundError("Global skill", name);
+
+	const skillDir = dirname(existing.location);
+	const enabledPath = join(skillDir, "SKILL.md");
+	const disabledPath = join(skillDir, "SKILL.md.disabled");
+
+	if (enabled && existing.disabled) {
+		// Re-enable: SKILL.md.disabled → SKILL.md
+		await rename(disabledPath, enabledPath);
+		skillCache.delete(disabledPath);
+		const skill = await loadSkillCached(enabledPath, skillDir, false);
+		if (!skill) throw new AppError("Failed to toggle skill", 500);
+		return skill;
+	}
+	if (!enabled && !existing.disabled) {
+		// Disable: SKILL.md → SKILL.md.disabled
+		await rename(enabledPath, disabledPath);
+		skillCache.delete(enabledPath);
+		const skill = await loadSkillCached(disabledPath, skillDir, true);
+		if (!skill) throw new AppError("Failed to toggle skill", 500);
+		return skill;
+	}
+
+	// Already in the desired state
+	return existing;
+}
+
 export const skillService = {
 	loadProjectSkills,
 	loadGlobalSkills,
@@ -389,4 +442,5 @@ export const skillService = {
 	createGlobalSkill,
 	updateGlobalSkill,
 	deleteGlobalSkill,
+	toggleGlobalSkill,
 };

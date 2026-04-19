@@ -9,6 +9,7 @@
 import { execSync } from "node:child_process";
 import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
+import { refreshWindowsPath } from "../lib/win-env";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -158,8 +159,32 @@ function getPlatform(): "windows" | "macos" | "linux" {
 	return "linux";
 }
 
+function checkByName(name: string): DependencyInfo {
+	const checkers: Record<string, () => DependencyInfo> = {
+		git: checkGit,
+		rg: checkRg,
+		dtach: checkDtach,
+	};
+	return (
+		checkers[name]?.() ?? {
+			name,
+			required: false,
+			installed: false,
+			platformSupported: false,
+			installCommands: {},
+		}
+	);
+}
+
 function checkAll(): DependencyCheckResult {
-	const deps = [checkGit(), checkRg(), checkDtach()];
+	let deps = [checkGit(), checkRg(), checkDtach()];
+	// On Windows the inherited PATH may be stale — if any tool is missing,
+	// refresh PATH from the registry and re-check the missing ones.
+	if (IS_WINDOWS && deps.some((d) => !d.installed)) {
+		if (refreshWindowsPath()) {
+			deps = deps.map((d) => (d.installed ? d : checkByName(d.name)));
+		}
+	}
 	return {
 		platform: getPlatform(),
 		packageManager: detectPackageManager(),

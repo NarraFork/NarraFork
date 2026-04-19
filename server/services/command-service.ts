@@ -323,12 +323,14 @@ export async function getSlashMenuItems(
 	let skills: SkillSummary[] = [];
 	try {
 		const allSkills = await loadAllSkills(gitPath);
-		skills = allSkills.map((s) => ({
-			name: s.name,
-			description: s.description,
-			source:
-				gitPath && s.location.startsWith(gitPath) ? ("project" as const) : ("global" as const),
-		}));
+		skills = allSkills
+			.filter((s) => !s.disabled)
+			.map((s) => ({
+				name: s.name,
+				description: s.description,
+				source:
+					gitPath && s.location.startsWith(gitPath) ? ("project" as const) : ("global" as const),
+			}));
 	} catch {
 		// Non-fatal — skills unavailable
 	}

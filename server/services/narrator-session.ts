@@ -123,6 +123,8 @@ interface ActiveNarrator {
 	_pruneBoundaryMessageId?: string | null;
 	/** Cached chapter ID (set when narrator is bound to an active chapter) */
 	_chapterId?: string;
+	/** Cached project ID (set when narrator is bound to a chapter with a project) */
+	_projectId?: string;
 	/** Cached chapter role (trunk/branch/exploration/review) */
 	_chapterRole?: string;
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
@@ -185,6 +187,9 @@ interface PendingPermission {
 	toolUseId: string;
 	/** For subagent permissions: broadcast to parent narrator's WS channel instead of own. */
 	broadcastTargetId: string;
+	/** When true, this ask was promoted from a plan-mode soft deny.
+	 *  If the user allows, relaxedPlan is automatically enabled. */
+	planModeSoftDeny?: boolean;
 }
 
 const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
@@ -209,6 +214,11 @@ const pendingPlanApprover = hotSafe<Map<string, string>>(
 
 // Tracks the diff text when user edits the plan before approving — keyed by narratorId
 const pendingPlanDiff = hotSafe<Map<string, string>>("narrafork.pendingPlanDiff", () => new Map());
+
+// Tracks narrators that have already been asked once about plan-mode soft deny.
+// After the first ask, subsequent soft denies are auto-denied as before.
+// Cleared when the narrator exits plan mode or the session ends.
+const planModeAskedOnce = hotSafe<Set<string>>("narrafork.planModeAskedOnce", () => new Set());
 
 // Overseer permission request queue — keyed by overseer narratorId.
 // When the overseer's agent loop is already running, new permission requests
@@ -606,6 +616,9 @@ export interface PermissionDecisionMeta {
 	commandBlacklistReason?: string;
 	/** The denyPrompt from the matched command blacklist entry. */
 	commandBlacklistDenyPrompt?: string;
+	/** When true, the deny was caused by plan mode restrictions (not hard security rules).
+	 *  Used to convert the first such deny into an ask so the user can enable relaxed plan. */
+	planModeSoftDeny?: boolean;
 }
 
 export interface PermissionDecisionOpts {
@@ -912,6 +925,7 @@ export function resolvePermissionDecision(
 					`Plan mode: Write/Edit is only allowed to the plan file "${planFile}". ` +
 					`Write your plan to that file, then call ExitPlanMode. ` +
 					`Only after the user approves your plan can you implement changes.`;
+				meta.planModeSoftDeny = true;
 			}
 			return "deny";
 		}
@@ -1422,7 +1436,7 @@ export async function handlePermission(
 
 	const permMeta: PermissionDecisionMeta = {};
 	const conclusionFileId = getConclusionFileId(narratorId);
-	const decision = resolvePermissionDecision({
+	let decision = resolvePermissionDecision({
 		toolName,
 		input: effectiveInput,
 		permMode,
@@ -1507,6 +1521,28 @@ export async function handlePermission(
 					? { notice: conclusionRedirectNotice }
 					: {}),
 		};
+	}
+	// Plan mode soft deny → ask the user once before falling back to auto-deny.
+	// A "soft deny" is one caused by plan-mode restrictions (not hard security rules
+	// like blacklists, protected paths, or branch violations).
+	// On the first occurrence we promote it to an ask so the user can choose to
+	// enable relaxed plan mode. Subsequent soft denies are auto-denied as usual.
+	let promotedPlanSoftDeny = false;
+	if (decision === "deny") {
+		const isPlanModeSoftDeny =
+			isPlanMode &&
+			!isRelaxedPlan &&
+			!permMeta.commandBlacklistReason &&
+			!(isChapter && bashAnalysis?.gitBranchViolations?.length) &&
+			// planModeSoftDeny: explicit Write/Edit non-plan-file deny
+			// no blacklistReason: readOnly-mode deny (not a real blacklist/protected path)
+			(permMeta.planModeSoftDeny || !permMeta.blacklistReason);
+		if (isPlanModeSoftDeny && !planModeAskedOnce.has(narratorId)) {
+			planModeAskedOnce.add(narratorId);
+			promotedPlanSoftDeny = true;
+			// Fall through to the ask flow below instead of auto-denying
+			decision = "ask";
+		}
 	}
 	if (decision === "deny") {
 		// Blacklist-triggered deny — use the specific reason from the blacklist check
@@ -1667,6 +1703,11 @@ export async function handlePermission(
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
 
+	// Plan mode soft deny promoted to ask — set a descriptive reason
+	if (promotedPlanSoftDeny) {
+		decisionReason = getToolMessage("planModeSoftDenyAskReason", locale);
+	}
+
 	await db
 		.update(narratorToolCalls)
 		.set({
@@ -1767,6 +1808,7 @@ export async function handlePermission(
 			toolName,
 			toolUseId,
 			broadcastTargetId: wsTarget,
+			planModeSoftDeny: promotedPlanSoftDeny || undefined,
 		});
 	});
 }
@@ -1913,6 +1955,23 @@ export async function resolvePermission(
 				if (diff) {
 					pendingPlanDiff.set(pending.narratorId, diff);
 				}
+			}
+		}
+
+		// Plan mode soft deny → user allowed → auto-enable relaxed plan
+		if (pending.planModeSoftDeny) {
+			try {
+				await narratorService.updateRelaxedPlan(pending.narratorId, true);
+				broadcastToNarrator(pending.broadcastTargetId, {
+					type: "relaxed_plan_changed",
+					narratorId: pending.narratorId,
+					relaxedPlan: true,
+				});
+			} catch (err) {
+				logger.warn("Failed to auto-enable relaxedPlan", {
+					narratorId: pending.narratorId,
+					error: String(err),
+				});
 			}
 		}
 
@@ -2188,6 +2247,7 @@ async function createNarrator(
 	if (existing) {
 		existing.abortController.abort();
 		activeNarrators.delete(narratorId);
+		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
 	}
 
@@ -2200,6 +2260,7 @@ async function createNarrator(
 	// Resolve CWD and cache chapter info for git tracking
 	let narratorCwd: string;
 	let narratorChapterId: string | undefined;
+	let narratorProjectId: string | undefined;
 	let narratorChapterRole: string | undefined;
 	let narratorWorktreePath: string | undefined;
 	let narratorBaseBranch: string | undefined;
@@ -2214,6 +2275,7 @@ async function createNarrator(
 			where: eq(projects.id, ch.projectId),
 		});
 		projectGitPath = project?.gitPath ?? null;
+		narratorProjectId = ch.projectId;
 		if (ch.worktreePath) {
 			narratorCwd = ch.worktreePath;
 			narratorChapterId = ch.id;
@@ -2297,6 +2359,7 @@ async function createNarrator(
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
 		_chapterId: narratorChapterId,
+		_projectId: narratorProjectId,
 		_chapterRole: narratorChapterRole,
 		_worktreePath: narratorWorktreePath,
 		_baseBranch: narratorBaseBranch,
@@ -2962,6 +3025,7 @@ async function runAgentLoop(
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
+					planModeAskedOnce.delete(narratorId);
 					// Guard: if not currently in plan mode, the model called ExitPlanMode
 					// without a matching EnterPlanMode — skip permission mode restoration
 					// and plan-continuation logic to avoid accidentally resetting the
@@ -3258,6 +3322,22 @@ async function runAgentLoop(
 						return active.model;
 					}
 					return null;
+				},
+				hookHandler: async (event, payload) => {
+					const { hookService } = await import("./hook-service");
+					return hookService.runHooks(
+						event as import("./hook-service").HookEvent,
+						{
+							hook_event_name: event as import("./hook-service").HookEvent,
+							narrator_id: narratorId,
+							chapter_id: active._chapterId,
+							project_id: active._projectId,
+							cwd: active.cwd,
+							...payload,
+						},
+						active._projectId,
+						typeof payload.tool_name === "string" ? payload.tool_name : undefined,
+					);
 				},
 				shouldStop: () => {
 					if (active._feedbackSoftStop) {
@@ -3888,6 +3968,7 @@ async function runAgentLoop(
 			});
 		});
 		activeNarrators.delete(narratorId);
+		planModeAskedOnce.delete(narratorId);
 		clearStreamingSnapshot(narratorId);
 		active.abortController.abort();
 		active.events.emit("event", { type: "done", data: null });
@@ -5346,6 +5427,7 @@ export async function updateNarratorPermissionMode(
 	} else {
 		active._planFileId = undefined;
 		active._previousPermissionMode = undefined;
+		planModeAskedOnce.delete(narratorId);
 	}
 }
 

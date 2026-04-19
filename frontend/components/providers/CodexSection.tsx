@@ -328,7 +328,9 @@ export const CodexSection = React.memo(function CodexSection({
 			}, 60_000);
 
 			// Monitor for new credentials
+			let detected = false;
 			browserAuthIntervalRef.current = setInterval(() => {
+				if (detected) return;
 				qc.invalidateQueries({ queryKey: ["codex", "status"] });
 				// Check total from any cached codex status query
 				const queries = qc.getQueriesData<{ total?: number }>({
@@ -337,6 +339,7 @@ export const CodexSection = React.memo(function CodexSection({
 				const currentTotal = queries[0]?.[1]?.total ?? 0;
 
 				if (currentTotal > initialTotal) {
+					detected = true;
 					cleanupBrowserAuth();
 					setBrowserAuthPending(false);
 					setBrowserAuthLoading(false);
@@ -388,10 +391,14 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const pollDeviceAuth = async () => {
+		let polling = true;
 		deviceAuthIntervalRef.current = setInterval(async () => {
+			if (!polling) return;
 			try {
 				const result = await api.codexDeviceAuthPoll();
+				if (!polling) return;
 				if (!result.pending) {
+					polling = false;
 					if (deviceAuthIntervalRef.current) clearInterval(deviceAuthIntervalRef.current);
 					deviceAuthIntervalRef.current = null;
 					setDeviceAuthModal(false);
@@ -403,6 +410,7 @@ export const CodexSection = React.memo(function CodexSection({
 					});
 				}
 			} catch {
+				polling = false;
 				if (deviceAuthIntervalRef.current) clearInterval(deviceAuthIntervalRef.current);
 				deviceAuthIntervalRef.current = null;
 			}

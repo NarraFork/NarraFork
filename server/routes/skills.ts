@@ -24,6 +24,7 @@ skillRoutes.get("/global", async (c) => {
 			description: s.description,
 			location: s.location,
 			files: s.files,
+			disabled: s.disabled ?? false,
 		})),
 	);
 });
@@ -80,6 +81,25 @@ skillRoutes.delete("/global/:name", async (c) => {
 	const name = c.req.param("name");
 	await skillService.deleteGlobalSkill(name);
 	return c.json({ ok: true });
+});
+
+/**
+ * POST /api/skills/global/:name/toggle
+ * Enable or disable a global skill by renaming SKILL.md <-> SKILL.md.disabled.
+ */
+skillRoutes.post("/global/:name/toggle", async (c) => {
+	const name = c.req.param("name");
+	const body = await c.req.json<{ enabled?: boolean }>();
+	if (typeof body.enabled !== "boolean") throw new ValidationError("enabled (boolean) is required");
+
+	const skill = await skillService.toggleGlobalSkill(name, body.enabled);
+	return c.json({
+		name: skill.name,
+		description: skill.description,
+		location: skill.location,
+		files: skill.files,
+		disabled: skill.disabled ?? false,
+	});
 });
 
 // === Project-level skill routes ===

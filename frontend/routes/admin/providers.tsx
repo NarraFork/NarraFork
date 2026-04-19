@@ -411,7 +411,7 @@ function ProvidersPage() {
 
 		return [...byPrefix].map(([prefix, models]) => {
 			const isPlatform = platformPrefixes.has(prefix);
-			let disabled = state.disabledProviders.has(prefix);
+			const disabled = state.disabledProviders.has(prefix);
 
 			// Find provider ID for multi-instance providers
 			let providerId: string | undefined;
@@ -421,16 +421,6 @@ function ProvidersPage() {
 					state.anthropicProviders.find((p) => p.prefix === prefix) ??
 					state.nugProviders.find((p) => p.prefix === prefix);
 				providerId = match?.id;
-				if (match) {
-					const allDisabled = [
-						...state.openaiProviders.filter((p) => p.prefix === prefix),
-						...state.anthropicProviders.filter((p) => p.prefix === prefix),
-						...state.nugProviders.filter((p) => p.prefix === prefix),
-					];
-					if (allDisabled.length > 0 && allDisabled.every((p) => p.disabled)) {
-						disabled = true;
-					}
-				}
 			}
 			return {
 				prefix,

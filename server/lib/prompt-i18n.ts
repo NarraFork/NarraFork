@@ -646,6 +646,12 @@ const toolMessages = {
 		"zh-CN":
 			"错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
 	},
+	// Plan mode soft deny — used as decisionReason when asking user to enable relaxed plan
+	planModeSoftDenyAskReason: {
+		en: "[Plan Mode] This operation is blocked by plan mode restrictions. Allow to enable relaxed plan mode (tools remain available during planning).",
+		"zh-CN":
+			"[计划模式] 此操作被计划模式限制阻止。允许将开启宽松规划模式（规划期间工具保持可用）。",
+	},
 	// Plan mode disabled tool description (injected in loop.ts)
 	planModeToolDisabled: {
 		en: "[PLAN MODE] This tool is disabled during plan mode. Focus on reading and analyzing code, then call ExitPlanMode with your plan.",

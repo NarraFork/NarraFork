@@ -17,16 +17,8 @@ export const taskOutputTool: ToolDefinition = {
 			.describe(
 				"The background task ID returned by a previous Agent call with background=true (from <background_task_id>)",
 			),
-		wait: z
-			.boolean()
-			.optional()
-			.describe(
-				"If true, wait for the task to complete before returning (with timeout). Default: false",
-			),
-		timeout_ms: z
-			.number()
-			.optional()
-			.describe("Maximum time to wait in milliseconds when wait=true. Default: 30000"),
+		block: z.boolean().optional().describe("Whether to wait for completion. Default: true"),
+		timeout: z.number().optional().describe("Max wait time in ms. Default: 30000"),
 	}),
 	rawJsonSchema: {
 		type: "object",
@@ -49,19 +41,29 @@ export const taskOutputTool: ToolDefinition = {
 		additionalProperties: false,
 	},
 	async execute(args, _ctx): Promise<ToolResult> {
-		const { task_id, wait, timeout_ms } = args as {
+		const raw = args as {
 			task_id: string;
+			block?: boolean;
+			timeout?: number;
+			// Legacy parameter names (pre-rename compat)
 			wait?: boolean;
 			timeout_ms?: number;
 		};
+		const task_id = raw.task_id;
+		// Prefer new names, fall back to legacy names for in-flight conversations
+		const block = raw.block ?? raw.wait;
+		const timeout = raw.timeout ?? raw.timeout_ms;
 
 		const { getBackgroundTaskStatus, waitForBackgroundTask } = await import(
 			"@server/services/narrator-subagent"
 		);
 
+		// block defaults to true (matching rawJsonSchema default)
+		const shouldWait = block !== false;
+
 		try {
-			if (wait) {
-				const result = await waitForBackgroundTask(task_id, timeout_ms ?? 30000);
+			if (shouldWait) {
+				const result = await waitForBackgroundTask(task_id, timeout ?? 30000);
 				return { output: formatResult(task_id, result.status, result.result) };
 			}
 

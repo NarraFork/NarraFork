@@ -303,6 +303,24 @@ export interface BlacklistCmd {
 // biome-ignore lint/suspicious/noExplicitAny: API entity with dynamic fields
 export type ApiEntity = any;
 
+export interface HookApiRecord {
+	id: string;
+	projectId: string | null;
+	event: string;
+	matcher: string;
+	type: "command" | "http";
+	command: string | null;
+	url: string | null;
+	headers: Record<string, string> | null;
+	prompt: string | null;
+	model: string | null;
+	timeout: number;
+	enabled: boolean;
+	sortOrder: number;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface CustomSubagentData {
 	name: string;
 	description: string;
@@ -1108,6 +1126,11 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/ask-in-passing/${messageId}`, {
 			method: "DELETE",
 		}),
+	promoteNarrator: (narratorId: string) =>
+		request<{ type: "unlocked" | "forked"; narrator?: ApiEntity; chapter?: ApiEntity }>(
+			`/narrators/${narratorId}/promote`,
+			{ method: "POST" },
+		),
 	forkFromMessages: (narratorId: string, messageIds: string[], title?: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/fork-messages`, {
 			method: "POST",
@@ -1126,11 +1149,20 @@ export const api = {
 
 	// Browser sessions
 	listBrowserSessions: (narratorId: string) =>
-		request<{ id: string; url: string; lastActivity: number }[]>(
-			`/narrators/${narratorId}/browser-sessions`,
-		),
+		request<
+			{
+				id: string;
+				url: string;
+				lastActivity: number;
+				tracing: { active: boolean; startedAt: number } | null;
+			}[]
+		>(`/narrators/${narratorId}/browser-sessions`),
 	closeBrowserSession: (narratorId: string, sessionId: string) =>
 		request(`/narrators/${narratorId}/browser-sessions/${sessionId}`, { method: "DELETE" }),
+	stopBrowserTracing: (narratorId: string, sessionId: string) =>
+		request(`/narrators/${narratorId}/browser-sessions/${sessionId}/stop-tracing`, {
+			method: "POST",
+		}),
 	createTerminal: (data: {
 		chapterId?: string;
 		narratorId?: string;
@@ -2031,6 +2063,7 @@ export const api = {
 				description: string;
 				location: string;
 				files: string[];
+				disabled: boolean;
 			}>
 		>("/skills/global"),
 	getGlobalSkill: (name: string) =>
@@ -2040,6 +2073,7 @@ export const api = {
 			location: string;
 			content: string;
 			files: string[];
+			disabled?: boolean;
 		}>(`/skills/global/${encodeURIComponent(name)}`),
 	createGlobalSkill: (data: { name: string; description: string; content: string }) =>
 		request<{
@@ -2066,6 +2100,17 @@ export const api = {
 	deleteGlobalSkill: (name: string) =>
 		request<{ ok: boolean }>(`/skills/global/${encodeURIComponent(name)}`, {
 			method: "DELETE",
+		}),
+	toggleGlobalSkill: (name: string, enabled: boolean) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			files: string[];
+			disabled: boolean;
+		}>(`/skills/global/${encodeURIComponent(name)}/toggle`, {
+			method: "POST",
+			body: JSON.stringify({ enabled }),
 		}),
 
 	// Custom Subagents
@@ -2613,6 +2658,15 @@ export const api = {
 			closedSessions?: number;
 			browserClosed?: boolean;
 		}>("/runtime/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
+
+	// Hooks
+	listHooks: (projectId?: string) =>
+		request<HookApiRecord[]>(projectId ? `/hooks?projectId=${projectId}` : "/hooks"),
+	createHook: (data: Record<string, unknown>) =>
+		request<HookApiRecord>("/hooks", { method: "POST", body: JSON.stringify(data) }),
+	updateHook: (id: string, data: Record<string, unknown>) =>
+		request<HookApiRecord>(`/hooks/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+	deleteHook: (id: string) => request<{ ok: boolean }>(`/hooks/${id}`, { method: "DELETE" }),
 };
 
 	text: string,

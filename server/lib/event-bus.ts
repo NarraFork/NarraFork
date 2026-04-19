@@ -203,7 +203,17 @@ export type NarraForkEvent =
 	| { type: "volume-snapshot:applying"; snapshotId: string; targetChapterId: string }
 	| { type: "volume-snapshot:applied"; snapshotId: string; targetChapterId: string }
 	| { type: "volume-snapshot:deleted"; projectId: string; snapshotId: string }
-	| { type: "volume-snapshot:error"; projectId: string; error: string };
+	| { type: "volume-snapshot:error"; projectId: string; error: string }
+	// Hooks
+	| {
+			type: "hook:executed";
+			hookId: string;
+			event: string;
+			hookType: string;
+			outcome: "success" | "blocked" | "error";
+			narratorId?: string;
+			durationMs: number;
+	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

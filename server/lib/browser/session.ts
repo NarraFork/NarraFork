@@ -23,6 +23,8 @@ export interface BrowserSession {
 	lastActivity: number;
 	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
 	headless: boolean;
+	/** Performance tracing state. */
+	tracing?: { active: boolean; startedAt: number };
 }
 
 /**
@@ -41,6 +43,10 @@ function ensureCleanupTimer(): void {
 			for (const [sessionId, session] of map) {
 				if (now - session.lastActivity > SESSION_TTL_MS) {
 					logger.info("Browser session expired", { narratorId, sessionId });
+					if (session.tracing?.active) {
+						void session.page.tracing.stop().catch(() => {});
+						session.tracing = undefined;
+					}
 					void session.context.close().catch(() => {});
 					map.delete(sessionId);
 					eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
@@ -130,6 +136,10 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	const session = map.get(sessionId);
 	if (!session) return false;
 
+	if (session.tracing?.active) {
+		await session.page.tracing.stop().catch(() => {});
+		session.tracing = undefined;
+	}
 	await session.context.close().catch(() => {});
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
@@ -147,6 +157,15 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 	const sessionIds = Array.from(map.keys());
 	const promises: Promise<void>[] = [];
 	for (const session of map.values()) {
+		if (session.tracing?.active) {
+			promises.push(
+				session.page.tracing
+					.stop()
+					.then(() => {})
+					.catch(() => {}),
+			);
+			session.tracing = undefined;
+		}
 		promises.push(session.context.close().catch(() => {}));
 	}
 	await Promise.all(promises);
@@ -162,9 +181,13 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 }
 
 /** List active sessions for a narrator. */
-export function listSessions(
-	narratorId: string,
-): Array<{ id: string; url: string; lastActivity: number; headless: boolean }> {
+export function listSessions(narratorId: string): Array<{
+	id: string;
+	url: string;
+	lastActivity: number;
+	headless: boolean;
+	tracing: { active: boolean; startedAt: number } | null;
+}> {
 	const map = sessions.get(narratorId);
 	if (!map) return [];
 	return Array.from(map.values()).map((s) => ({
@@ -172,7 +195,17 @@ export function listSessions(
 		url: s.page.url(),
 		lastActivity: s.lastActivity,
 		headless: s.headless,
+		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
 	}));
+}
+
+/** Stop active tracing on a session (discards trace data). Returns false if no active tracing. */
+export async function stopTracing(narratorId: string, sessionId: string): Promise<boolean> {
+	const session = getSession(narratorId, sessionId);
+	if (!session?.tracing?.active) return false;
+	await session.page.tracing.stop().catch(() => {});
+	session.tracing = undefined;
+	return true;
 }
 
 /** Get stats for all active browser sessions across all narrators. */

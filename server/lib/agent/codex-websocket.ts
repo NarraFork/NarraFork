@@ -484,7 +484,7 @@ class ReusableWebSocketConnection {
 				this.open = true;
 				finishResolve();
 			});
-			ws.once("error", (error) => {
+			ws.on("error", (error) => {
 				if (!settled) {
 					const match = error.message.match(/Unexpected server response:\s*(\d+)/);
 					const status = match?.[1] ? Number.parseInt(match[1], 10) : undefined;

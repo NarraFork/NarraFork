@@ -154,6 +154,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const providerOrder: string[] = (agent.providerOrder as string[]) ?? [];
 			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
 
+			// Sync: multi-instance providers with disabled=true → disabledProviders
+				if (p.disabled && p.prefix) disabledProviders.add(p.prefix);
+			}
+
 			return {
 				openaiProviders: openai,
 				anthropicProviders: anthropic,
@@ -229,9 +233,28 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 
 		case "TOGGLE_PROVIDER_DISABLED": {
 			const next = new Set(state.disabledProviders);
-			if (next.has(action.prefix)) next.delete(action.prefix);
-			else next.add(action.prefix);
-			return { ...state, disabledProviders: next };
+			const willDisable = !next.has(action.prefix);
+			if (willDisable) next.add(action.prefix);
+			else next.delete(action.prefix);
+
+			// Sync disabled field on multi-instance providers sharing this prefix
+			const syncDisabled = <T extends { prefix: string; disabled?: boolean }>(
+				providers: T[],
+			): T[] => {
+				const touched = providers.some((p) => p.prefix === action.prefix);
+				if (!touched) return providers;
+				return providers.map((p) =>
+					p.prefix === action.prefix ? { ...p, disabled: willDisable } : p,
+				);
+			};
+
+			return {
+				...state,
+				disabledProviders: next,
+				openaiProviders: syncDisabled(state.openaiProviders),
+				anthropicProviders: syncDisabled(state.anthropicProviders),
+				nugProviders: syncDisabled(state.nugProviders),
+			};
 		}
 
 		case "RESTORE_FROM_SNAPSHOT": {

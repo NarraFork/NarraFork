@@ -1,6 +1,7 @@
 // High-level browser actions for the Browser tool.
 // Each action operates on a BrowserSession and returns a ToolResult-compatible output.
 
+import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
 import type { BrowserSession } from "./session";
@@ -50,11 +51,23 @@ export async function click(
 	touchSession(session);
 	const { page } = session;
 
+	// Set up a navigation listener BEFORE clicking — if the click triggers a
+	// navigation (form submit, link follow, SPA route change) we want to wait
+	// for it to settle instead of returning stale state.
+	const navPromise = page
+		.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 1500 })
+		.catch(() => null);
+
 	if (opts?.coordinate && !selector) {
 		await page.mouse.click(opts.coordinate.x, opts.coordinate.y);
 	} else {
 		await page.click(selector, { delay: 50 });
 	}
+
+	// Give the page a moment: either navigation completes or we move on after
+	// a short grace period (covers SPA state updates that don't trigger
+	// full navigation).
+	await Promise.race([navPromise, new Promise((r) => setTimeout(r, 500))]);
 
 	return { snapshot: await snapshot(page) };
 }
@@ -246,6 +259,57 @@ export async function scroll(
 	}
 
 	return { snapshot: await snapshot(page) };
+}
+
+// ── Performance tracing ──
+
+/** Default trace categories for performance profiling. */
+const DEFAULT_PERF_CATEGORIES = [
+	"devtools.timeline",
+	"v8.execute",
+	"disabled-by-default-devtools.timeline",
+	"disabled-by-default-devtools.timeline.frame",
+	"toplevel",
+	"blink.console",
+	"blink.user_timing",
+	"loading",
+];
+
+/** Start performance tracing on the session's page. */
+export async function perfStart(
+	session: BrowserSession,
+	opts?: { categories?: string[]; screenshots?: boolean },
+): Promise<void> {
+	touchSession(session);
+	if (session.tracing?.active) {
+		throw new Error("Tracing is already active on this session");
+	}
+	const categories = opts?.categories?.length ? opts.categories : DEFAULT_PERF_CATEGORIES;
+	await session.page.tracing.start({
+		categories,
+		screenshots: opts?.screenshots ?? false,
+	});
+	session.tracing = { active: true, startedAt: Date.now() };
+}
+
+/** Stop performance tracing and write the trace buffer to `savePath`. */
+export async function perfStop(
+	session: BrowserSession,
+	savePath: string,
+): Promise<{ fileSize: number; durationMs: number }> {
+	touchSession(session);
+	if (!session.tracing?.active) {
+		throw new Error("No active tracing on this session");
+	}
+	const durationMs = Date.now() - session.tracing.startedAt;
+	const buffer = await session.page.tracing.stop();
+	if (!buffer) {
+		session.tracing = undefined;
+		throw new Error("Tracing returned empty buffer");
+	}
+	await writeFile(savePath, buffer);
+	session.tracing = undefined;
+	return { fileSize: buffer.byteLength, durationMs };
 }
 
 /** Get cleaned DOM of the current page or a selector. */
