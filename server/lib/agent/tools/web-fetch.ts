@@ -92,11 +92,16 @@ export const webFetchTool: ToolDefinition = {
 			purpose?: string;
 		};
 
-		// Basic URL validation
+		// Basic URL validation — file:// is intentionally excluded to prevent
+		// bypassing the Read tool's path whitelist/blacklist checks.
+		const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
 		try {
 			const parsed = new URL(url);
-			if (!parsed.protocol.startsWith("http")) {
-				return { output: "Only http:// and https:// URLs are supported.", isError: true };
+			if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+				return {
+					output: `Unsupported protocol: ${parsed.protocol} — only http://, https://, and data: URLs are supported. Use the Read tool for local files.`,
+					isError: true,
+				};
 			}
 		} catch {
 			return { output: `Invalid URL: ${url}`, isError: true };

@@ -24,6 +24,8 @@ const ACTIONS = [
 	"dom",
 	"close",
 	"list_sessions",
+	"perf_start",
+	"perf_stop",
 ] as const;
 
 type Action = (typeof ACTIONS)[number];
@@ -32,7 +34,7 @@ export const browserTool: ToolDefinition = {
 	name: "Browser",
 	description:
 		"Control a browser for multi-step web interactions. Supports navigation, clicking, " +
-		"form filling, screenshots, DOM inspection, and JavaScript execution.\n\n" +
+		"form filling, screenshots, DOM inspection, JavaScript execution, and performance profiling.\n\n" +
 		"Workflow:\n" +
 		'1. Use action "launch" with a URL to start a session (returns session_id)\n' +
 		"2. Use the session_id for subsequent actions (click, fill, type, etc.)\n" +
@@ -53,7 +55,13 @@ export const browserTool: ToolDefinition = {
 		'- "scroll": Scroll the page up or down\n' +
 		'- "dom": Get cleaned HTML of the page or a specific selector\n' +
 		'- "close": Close a browser session\n' +
-		'- "list_sessions": List all active browser sessions\n\n' +
+		'- "list_sessions": List all active browser sessions\n' +
+		'- "perf_start": Start performance tracing (records CPU profile, layout, scripting, etc.). ' +
+		"Note: the user can stop tracing or close the session from the browser management panel — " +
+		"if that happens, a system message will notify you\n" +
+		'- "perf_stop": Stop tracing and save trace data to a JSON file (returns file path). ' +
+		"The trace file is in Chrome DevTools Trace Event format — " +
+		"use grep/bash/python to analyze it, or open it in Chrome DevTools\n\n" +
 		"Parameters:\n" +
 		"- action (required): The action to perform\n" +
 		"- url (optional): URL for launch/navigate actions\n" +
@@ -66,7 +74,8 @@ export const browserTool: ToolDefinition = {
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
 		"- max_length (optional): Max output length for dom/get_text/evaluate (default: 20000)\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
-		"Useful for debugging, visual inspection, or interacting with pages that require a display.",
+		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
+		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -124,6 +133,13 @@ export const browserTool: ToolDefinition = {
 					"Only applies to the launch action.",
 				type: "boolean",
 			},
+			categories: {
+				description:
+					"Array of Chrome trace categories for perf_start " +
+					"(uses sensible defaults if omitted)",
+				type: "array",
+				items: { type: "string" },
+			},
 		},
 		required: ["action"],
 		additionalProperties: false,
@@ -149,6 +165,7 @@ export const browserTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe("Launch visible browser GUI (default: true = headless)"),
+		categories: z.array(z.string()).optional().describe("Chrome trace categories for perf_start"),
 	}),
 
 	async execute(args, ctx): Promise<ToolResult> {
@@ -164,6 +181,7 @@ export const browserTool: ToolDefinition = {
 			coordinate,
 			max_length,
 			headless,
+			categories,
 		} = args as {
 			action: Action;
 			url?: string;
@@ -176,6 +194,7 @@ export const browserTool: ToolDefinition = {
 			coordinate?: { x: number; y: number };
 			max_length?: number;
 			headless?: boolean;
+			categories?: string[];
 		};
 
 		logger.info("Browser tool executing", {
@@ -204,6 +223,7 @@ export const browserTool: ToolDefinition = {
 						coordinate,
 						max_length,
 						url,
+						categories,
 					});
 			}
 		} catch (err) {
@@ -225,11 +245,12 @@ async function handleLaunch(
 		return { output: "url is required for launch action", isError: true };
 	}
 
+	const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "data:"]);
 	try {
 		const parsed = new URL(url);
-		if (!parsed.protocol.startsWith("http")) {
+		if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
 			return {
-				output: "Only http:// and https:// URLs are supported.",
+				output: `Unsupported protocol: ${parsed.protocol} — only http://, https://, and data: URLs are supported. Use the Read tool for local files.`,
 				isError: true,
 			};
 		}
@@ -294,6 +315,7 @@ async function handleSessionAction(
 		coordinate?: { x: number; y: number };
 		max_length?: number;
 		url?: string;
+		categories?: string[];
 	},
 ): Promise<ToolResult> {
 	if (!opts.session_id) {
@@ -549,6 +571,48 @@ async function handleSessionAction(
 				output: result.dom,
 				title: opts.selector ? `${result.snapshot.url} [${opts.selector}]` : result.snapshot.url,
 				metadata: { sessionId: session.id },
+			};
+		}
+
+		case "perf_start": {
+			await actions.perfStart(session, { categories: opts.categories });
+			return {
+				output: "Performance tracing started. Perform your actions, then use perf_stop.",
+				metadata: { sessionId: session.id },
+			};
+		}
+
+		case "perf_stop": {
+			const shareId = generateShortId();
+			const shareDir = getShareDir(shareId);
+			const filename = `trace-${session.id}-${Date.now()}.json`;
+			const filePath = resolve(shareDir, filename);
+
+			const result = await actions.perfStop(session, filePath);
+
+			createShare({
+				id: shareId,
+				originalName: filename,
+				storagePath: filePath,
+				size: result.fileSize,
+				createdBy: "browser",
+				expiryHours: 24,
+			});
+
+			return {
+				output:
+					`Performance tracing stopped.\n` +
+					`Duration: ${(result.durationMs / 1000).toFixed(1)}s\n` +
+					`Trace file: ${filePath}\n` +
+					`Size: ${(result.fileSize / 1024).toFixed(1)} KB\n` +
+					`Share URL: /api/shares/${shareId}/download\n` +
+					`The trace file is in Chrome DevTools Trace Event format (JSON with traceEvents array).`,
+				metadata: {
+					sessionId: session.id,
+					tracePath: filePath,
+					shareId,
+					shareUrl: `/api/shares/${shareId}/download`,
+				},
 			};
 		}
 

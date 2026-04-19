@@ -51,22 +51,32 @@ describe("WebFetch — URL validation", () => {
 		expect(result.output).toContain("Invalid URL");
 	});
 
-	test("rejects non-http protocol", async () => {
+	test("rejects non-supported protocol", async () => {
 		const result = await webFetchTool.execute(
 			{ url: "ftp://example.com", mode: "readability" },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("http");
+		expect(result.output).toContain("Unsupported protocol");
 	});
 
-	test("rejects file:// protocol", async () => {
+	test("accepts data: URL", async () => {
 		const result = await webFetchTool.execute(
-			{ url: "file:///etc/passwd", mode: "dom" },
+			{ url: "data:text/html,<h1>hello</h1>", mode: "dom" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("hello");
+	}, 10_000);
+
+	test("rejects file:// URL (bypasses path security checks)", async () => {
+		const result = await webFetchTool.execute(
+			{ url: "file:///etc/passwd", mode: "readability" },
 			makeCtx(),
 		);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("http");
+		expect(result.output).toContain("Unsupported protocol");
+		expect(result.output).toContain("Read tool");
 	});
 });
 
@@ -148,6 +158,54 @@ describe("WebFetch — cleanHtml", () => {
 		const html = "<script>x</script><style>y</style>";
 		const result = cleanHtml(html);
 		expect(result.trim()).toBe("");
+	});
+
+	test("preserves form elements (input, button, textarea, select, label)", () => {
+		const html =
+			'<form action="/submit" method="post">' +
+			'<label for="user">Username</label>' +
+			'<input type="text" id="user" name="username" placeholder="Enter name" required />' +
+			'<textarea name="bio"></textarea>' +
+			'<select name="role"><option value="admin" selected>Admin</option></select>' +
+			'<button type="submit" disabled>Submit</button>' +
+			"</form>";
+		const result = cleanHtml(html);
+		expect(result).toContain("<form");
+		expect(result).toContain("<input");
+		expect(result).toContain("<button");
+		expect(result).toContain("<textarea");
+		expect(result).toContain("<select");
+		expect(result).toContain("<option");
+		expect(result).toContain("<label");
+		expect(result).toContain('action="/submit"');
+		expect(result).toContain('method="post"');
+		expect(result).toContain('type="text"');
+		expect(result).toContain('placeholder="Enter name"');
+		expect(result).toContain("required");
+		expect(result).toContain("disabled");
+		expect(result).toContain("selected");
+	});
+
+	test("preserves img tags", () => {
+		const html = '<img src="/photo.jpg" alt="A photo" title="Photo" />';
+		const result = cleanHtml(html);
+		expect(result).toContain("<img");
+		expect(result).toContain('src="/photo.jpg"');
+		expect(result).toContain('alt="A photo"');
+	});
+
+	test("strips style attributes", () => {
+		const html = '<div style="color:red" class="box">text</div>';
+		const result = cleanHtml(html);
+		expect(result).not.toContain("style=");
+		expect(result).toContain('class="box"');
+	});
+
+	test("keeps aria-* attributes", () => {
+		const html = '<button aria-label="Close" aria-describedby="desc">X</button>';
+		const result = cleanHtml(html);
+		expect(result).toContain('aria-label="Close"');
+		expect(result).toContain('aria-describedby="desc"');
 	});
 });
 

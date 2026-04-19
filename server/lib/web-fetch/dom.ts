@@ -9,19 +9,72 @@ const DEFAULT_MAX_LENGTH = 20_000;
 /** Tags whose content should be completely discarded. */
 const DISCARD_TAGS = ["script", "style", "noscript", "svg", "iframe", "link", "meta", "head"];
 
-/** Attributes worth keeping for content extraction. */
-const KEEP_ATTRS: sanitizeHtml.AllowedAttribute[] = [
+/**
+ * All tags we want to preserve in the cleaned output.
+ * Starts from sanitize-html defaults and adds semantic, form, and media tags.
+ */
+const ALLOWED_TAGS = [
+	// sanitize-html defaults (structural)
+	...sanitizeHtml.defaults.allowedTags,
+	// Semantic HTML5
+	"main",
+	"section",
+	"article",
+	"nav",
+	"header",
+	"footer",
+	"figure",
+	"figcaption",
+	"aside",
+	"details",
+	"summary",
+	// Form elements
+	"form",
+	"input",
+	"button",
+	"textarea",
+	"select",
+	"option",
+	"optgroup",
+	"label",
+	"fieldset",
+	"legend",
+	"datalist",
+	"output",
+	// Media
+	"img",
+	"video",
+	"audio",
+	"source",
+	"picture",
+].filter((tag) => !DISCARD_TAGS.includes(tag));
+
+/** Attributes worth keeping for content extraction — everything else is stripped. */
+const KEEP_ATTRS: string[] = [
+	// Links & media
 	"href",
 	"src",
 	"alt",
 	"title",
+	// Identity & semantics
 	"class",
 	"id",
+	"role",
+	// Form elements
 	"type",
 	"name",
 	"value",
 	"placeholder",
-	"role",
+	"for",
+	"action",
+	"method",
+	"disabled",
+	"checked",
+	"selected",
+	"readonly",
+	"required",
+	// Accessibility (wildcard for all aria-* attributes)
+	"aria-*",
 ];
 
 export async function fetchDom(
@@ -71,14 +124,17 @@ export async function fetchDom(
 	return cleaned;
 }
 
-/** Clean HTML: remove dangerous/noisy tags, strip non-essential attributes, collapse whitespace. */
+/**
+ * Clean HTML: remove dangerous/noisy tags, strip non-essential attributes,
+ * collapse whitespace. Uses sanitize-html for robust HTML parsing.
+ * Preserves structural tags including form elements, images, and semantic HTML5.
+ */
 export function cleanHtml(html: string): string {
 	const result = sanitizeHtml(html, {
-		// Allow all tags except the ones we want to discard
-		allowedTags: sanitizeHtml.defaults.allowedTags
-			.concat(["main", "section", "article", "nav", "header", "footer", "figure", "figcaption"])
-			.filter((tag) => !DISCARD_TAGS.includes(tag)),
-		allowedAttributes: { "*": KEEP_ATTRS },
+		allowedTags: ALLOWED_TAGS,
+		allowedAttributes: {
+			"*": KEEP_ATTRS,
+		},
 		// Completely remove discard tags and their children
 		exclusiveFilter: (frame) => DISCARD_TAGS.includes(frame.tag),
 		disallowedTagsMode: "discard",

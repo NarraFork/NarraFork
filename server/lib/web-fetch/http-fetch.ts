@@ -30,12 +30,26 @@ function isBrowserUnavailableError(msg: string): boolean {
 /**
  * Fetch a URL via HTTP and return the raw HTML body.
  * Works without a browser — suitable for static pages, APIs, raw files.
+ * Also handles data: URLs via native fetch (no proxy/headers needed).
+ * Note: file: URLs are intentionally NOT supported here — local file access
+ * should go through the Read tool which enforces path whitelist/blacklist checks.
  */
 export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): Promise<string> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeout);
 
 	try {
+		const protocol = new URL(url).protocol;
+
+		// data: URLs — use native fetch directly (no proxy, no HTTP headers)
+		if (protocol === "data:") {
+			const res = await fetch(url, { signal: controller.signal });
+			if (!res.ok) {
+				throw new Error(`Fetch ${protocol} failed: ${res.status} ${res.statusText}`);
+			}
+			return await res.text();
+		}
+
 		const proxy = getWebFetchProxy();
 		const res = await fetch(url, {
 			headers: {

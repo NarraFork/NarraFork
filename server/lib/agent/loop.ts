@@ -190,6 +190,22 @@ const EMPTY_RESPONSE_MESSAGE =
 	"Provider returned an empty response. This often indicates an API configuration error " +
 	"(base URL, model, or credentials).";
 
+/** Max retries specifically for empty responses (request succeeded but no content). */
+const MAX_EMPTY_RESPONSE_RETRIES = 3;
+
+/** Extract a human-readable message from any thrown value, including ErrorEvent objects. */
+function extractErrorMessage(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	// Handle ErrorEvent (Bun/browser WebSocket errors) which aren't Error instances
+	if (err && typeof err === "object") {
+		const obj = err as Record<string, unknown>;
+		if (typeof obj.message === "string" && obj.message) return obj.message;
+		if (typeof obj.error === "object" && obj.error instanceof Error) return obj.error.message;
+		if (typeof obj.error === "string" && obj.error) return obj.error;
+	}
+	return String(err);
+}
+
 function isRetryableInvalidStateReason(reason: string, message?: string): boolean {
 	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
 	// Also check the message for retryable patterns (e.g. "Too many requests",
@@ -650,6 +666,7 @@ export async function* agentLoop(
 			: (config.maxTransientRetries ?? 0);
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 		let chatRetryCount = 0;
+		let emptyResponseRetries = 0;
 
 		for (;;) {
 			// Reset per-attempt accumulators so a retry starts with a clean slate.
@@ -1248,7 +1265,7 @@ export async function* agentLoop(
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
-				const msg = err instanceof Error ? err.message : String(err);
+				const msg = extractErrorMessage(err);
 				if (
 					err &&
 					typeof err === "object" &&
@@ -1306,6 +1323,53 @@ export async function* agentLoop(
 				return;
 			}
 
+			// Empty response check — request succeeded but returned no content.
+			// Use a dedicated counter (max 3 retries) separate from transient error retries.
+			if (!sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+				emptyResponseRetries++;
+				if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
+					const delayMs = Math.min(
+						TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
+						backoffCeil,
+					);
+					const message = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+					logger.warn("Provider returned empty response, retrying", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						attempt: emptyResponseRetries,
+						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+					});
+					yield {
+						type: "retrying",
+						message,
+						attempt: emptyResponseRetries,
+						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+						delayMs,
+					};
+					await abortableSleep(delayMs, config.signal);
+					if (config.signal.aborted) {
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+					continue; // retry provider.chat()
+				}
+				// Exhausted empty-response retries — surface as invalid_state
+				logger.warn("Provider returned empty response, retries exhausted", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+				});
+				yield {
+					type: "invalid_state",
+					reason: "empty_response",
+					message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
+				};
+				return;
+			}
+
 			// Chat call succeeded — break out of the retry loop
 			break;
 		} // end for (;;) retry loop
@@ -1344,21 +1408,6 @@ export async function* agentLoop(
 			meterUnit: requestMeterUnit,
 			rawDump: requestDump?.snapshot(),
 		};
-
-		if (!sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
-			logger.warn("Provider returned empty response without error", {
-				narratorId: config.narratorId,
-				provider: effectiveProvider,
-				model: effectiveModel,
-				requestId,
-			});
-			yield {
-				type: "invalid_state",
-				reason: "empty_response",
-				message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
-			};
-			return;
-		}
 
 		// Reset retry counter after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.
@@ -1821,6 +1870,31 @@ interface ToolExecResult {
 	updatedInput?: Record<string, unknown>;
 }
 
+/** Max serialized size of tool_input passed to hooks (bytes). */
+const MAX_HOOK_INPUT_SIZE = 8_000;
+
+/** Truncate tool_input for hook payloads to avoid sending huge content blobs. */
+function truncateToolInput(input: Record<string, unknown>): Record<string, unknown> {
+	const serialized = JSON.stringify(input);
+	if (serialized.length <= MAX_HOOK_INPUT_SIZE) return input;
+	// Recursively truncate large string values
+	const truncateValue = (val: unknown): unknown => {
+		if (typeof val === "string" && val.length > 500) {
+			return `${val.slice(0, 500)}… [truncated, ${val.length} chars total]`;
+		}
+		if (Array.isArray(val)) return val.map(truncateValue);
+		if (val && typeof val === "object" && !Array.isArray(val)) {
+			const obj: Record<string, unknown> = {};
+			for (const [k, v] of Object.entries(val)) {
+				obj[k] = truncateValue(v);
+			}
+			return obj;
+		}
+		return val;
+	};
+	return truncateValue(input) as Record<string, unknown>;
+}
+
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
 	const tool = toolRegistry.get(tu.name);
 	const locale = (config.locale as Locale) ?? "en";
@@ -1871,6 +1945,31 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			durationMs: 0,
 			fatal: permission.fatal,
 		};
+	}
+
+	// PreToolUse hook check — fail-open: if the hook itself errors (timeout,
+	// crash, network failure), we log a warning and let the tool execute.
+	// Only an explicit "blocked" outcome prevents execution.
+	if (config.hookHandler) {
+		try {
+			const hookResult = await config.hookHandler("PreToolUse", {
+				tool_name: tu.name,
+				tool_input: truncateToolInput(tu.input),
+				tool_use_id: tu.toolUseId,
+			});
+			if (hookResult.outcome === "blocked") {
+				return {
+					output: hookResult.reason ?? "Blocked by hook",
+					isError: true,
+					durationMs: 0,
+				};
+			}
+		} catch (err) {
+			logger.warn("PreToolUse hook error (non-blocking)", {
+				error: err instanceof Error ? err.message : String(err),
+				toolName: tu.name,
+			});
+		}
 	}
 
 	// Start timing after permission is granted
@@ -1996,6 +2095,25 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 		const result = await tool.execute(effectiveInput, ctx);
 		// Append permission notice (e.g. plan-mode file redirect) to non-error output
 		const appendNotice = permissionNotice && !result.isError ? `\n\n${permissionNotice}` : "";
+
+		// PostToolUse hook (fire-and-forget, non-blocking)
+		if (config.hookHandler) {
+			config
+				.hookHandler("PostToolUse", {
+					tool_name: tu.name,
+					tool_input: truncateToolInput(tu.input),
+					tool_use_id: tu.toolUseId,
+					tool_output: result.output.slice(0, 2000),
+					tool_is_error: result.isError ?? false,
+				})
+				.catch((err) => {
+					logger.warn("PostToolUse hook error", {
+						error: err instanceof Error ? err.message : String(err),
+						toolName: tu.name,
+					});
+				});
+		}
+
 		// If the tool already truncated its output, pass through as-is.
 		if (result.truncated) {
 			return {
