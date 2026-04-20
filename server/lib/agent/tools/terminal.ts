@@ -70,7 +70,7 @@ async function assertTerminalAccess(
 	narratorId: string,
 	cachedChapterId?: string,
 ): Promise<
-	| { allowed: true; terminal: { id: string; name: string | null; status: string | null } }
+	| { allowed: true; terminal: { id: string; name: string; status: string | null } }
 	| { allowed: false; error: string }
 > {
 	const terminal = await db.query.terminals.findFirst({
@@ -108,10 +108,72 @@ async function assertTerminalAccess(
 	};
 }
 
+/**
+ * Resolve a terminal identifier (ID or name) to a real terminal ID.
+ * First tries an exact ID lookup, then falls back to matching by name
+ * among terminals accessible to the given narrator.
+ */
+async function resolveTerminalId(
+	idOrName: string,
+	narratorId: string,
+	cachedChapterId?: string,
+): Promise<{ id: string } | { error: string }> {
+	// 1. Try exact ID match
+	const byId = await db.query.terminals.findFirst({
+		where: eq(terminals.id, idOrName),
+		columns: { id: true },
+	});
+	if (byId) return { id: byId.id };
+
+	// 2. Fallback: search by name among accessible terminals
+	const narratorTerminals = await db.query.terminals.findMany({
+		where: eq(terminals.narratorId, narratorId),
+		columns: { id: true, name: true },
+	});
+
+	const chapterId =
+		cachedChapterId ??
+		(
+			await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { chapterId: true },
+			})
+		)?.chapterId;
+
+	let chapterTerminals: { id: string; name: string }[] = [];
+	if (chapterId) {
+		chapterTerminals = await db.query.terminals.findMany({
+			where: eq(terminals.chapterId, chapterId),
+			columns: { id: true, name: true },
+		});
+	}
+
+	// Deduplicate
+	const seen = new Set<string>();
+	const all: { id: string; name: string }[] = [];
+	for (const t of [...narratorTerminals, ...chapterTerminals]) {
+		if (!seen.has(t.id)) {
+			seen.add(t.id);
+			all.push(t);
+		}
+	}
+
+	// Exact name match (case-insensitive)
+	const nameLower = idOrName.toLowerCase();
+	const match = all.find((t) => t.name.toLowerCase() === nameLower);
+	if (match) return { id: match.id };
+
+	return {
+		error: `Terminal not found: "${idOrName}". Use action 'list' to see available terminals.`,
+	};
+}
+
 export const terminalTool: ToolDefinition = {
 	name: "Terminal",
 	description:
-		"Interact with a running interactive terminal (PTY). " +
+		"Interact with interactive terminals (PTY). " +
+		"Use action 'create' to create a new terminal. " +
+		"Use action 'rename' to rename an existing terminal. " +
 		"Use action 'read' to get new terminal output since the last read (incremental). " +
 		"On the first read (or after a buffer reset), the full buffer is returned. " +
 		"Pass 'last_n_lines' to override incremental mode and always get the last N lines. " +
@@ -119,22 +181,35 @@ export const terminalTool: ToolDefinition = {
 		"build completion, server ready messages, prompts, etc.; times out after 30s). " +
 		"Use action 'write' to send input to the terminal (keystrokes, commands, Ctrl-C, etc.). " +
 		"Use action 'list' to list available terminals for the current narrator. " +
+		"The 'terminal_id' parameter accepts either a terminal ID or a terminal name. " +
 		"This tool is for interacting with persistent interactive terminals (e.g. dev servers, REPLs, TUIs), " +
 		"NOT for running one-off commands — use Bash for that.",
 	parameters: z.object({
 		action: z
-			.enum(["read", "write", "list"])
-			.describe("The action to perform: 'read' buffer, 'write' input, or 'list' terminals"),
+			.enum(["read", "write", "list", "create", "rename"])
+			.describe(
+				"The action to perform: 'read' buffer, 'write' input, 'list' terminals, " +
+					"'create' a new terminal, or 'rename' an existing terminal",
+			),
 		terminal_id: z
 			.string()
 			.optional()
-			.describe("Terminal ID to interact with. Required for 'read' and 'write' actions."),
+			.describe(
+				"Terminal ID or name to interact with. Required for 'read', 'write', and 'rename' actions.",
+			),
 		input: z
 			.string()
 			.optional()
 			.describe(
 				"Input to send to the terminal (for 'write' action). " +
 					"Send '\\n' for Enter, '\\x03' for Ctrl-C, '\\x04' for Ctrl-D, etc.",
+			),
+		name: z
+			.string()
+			.optional()
+			.describe(
+				"For 'create' action: the name for the new terminal (defaults to 'Terminal'). " +
+					"For 'rename' action: the new name for the terminal.",
 			),
 		last_n_lines: z
 			.number()
@@ -155,10 +230,11 @@ export const terminalTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, terminal_id, input, last_n_lines, wait_for } = args as {
-			action: "read" | "write" | "list";
+		const { action, terminal_id, input, name, last_n_lines, wait_for } = args as {
+			action: "read" | "write" | "list" | "create" | "rename";
 			terminal_id?: string;
 			input?: string;
+			name?: string;
 			last_n_lines?: number;
 			wait_for?: string;
 		};
@@ -166,12 +242,30 @@ export const terminalTool: ToolDefinition = {
 		switch (action) {
 			case "list":
 				return await listTerminals(ctx.narratorId);
+			case "create":
+				return await createTerminal(ctx.narratorId, ctx.chapterId, name);
+			case "rename": {
+				if (!terminal_id) {
+					return {
+						output: "terminal_id is required for 'rename' action",
+						isError: true,
+					};
+				}
+				if (!name) {
+					return { output: "name is required for 'rename' action", isError: true };
+				}
+				return await renameTerminal(terminal_id, name, ctx.narratorId, ctx.chapterId);
+			}
 			case "read": {
 				if (!terminal_id) {
 					return { output: "terminal_id is required for 'read' action", isError: true };
 				}
+				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId, ctx.chapterId);
+				if ("error" in resolved) {
+					return { output: resolved.error, isError: true };
+				}
 				return await readBuffer(
-					terminal_id,
+					resolved.id,
 					ctx.narratorId,
 					ctx.chapterId,
 					ctx.signal,
@@ -186,7 +280,11 @@ export const terminalTool: ToolDefinition = {
 				if (input === undefined || input === null) {
 					return { output: "input is required for 'write' action", isError: true };
 				}
-				return await writeInput(terminal_id, ctx.narratorId, ctx.chapterId, ctx.signal, input);
+				const resolved = await resolveTerminalId(terminal_id, ctx.narratorId, ctx.chapterId);
+				if ("error" in resolved) {
+					return { output: resolved.error, isError: true };
+				}
+				return await writeInput(resolved.id, ctx.narratorId, ctx.chapterId, ctx.signal, input);
 			}
 
 			default:
@@ -238,6 +336,55 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 		output: `Found ${all.length} terminal(s):\n${lines.join("\n")}`,
 		title: `${all.length} terminal(s)`,
 	};
+}
+
+async function createTerminal(
+	narratorId: string,
+	cachedChapterId?: string,
+	name?: string,
+): Promise<ToolResult> {
+	try {
+		const terminal = cachedChapterId
+			? await terminalService.create({ chapterId: cachedChapterId, name })
+			: await terminalService.create({ narratorId, name });
+		return {
+			output:
+				`Terminal created successfully.\n` +
+				`- ID: ${terminal.id}\n` +
+				`- Name: ${terminal.name}\n` +
+				`- CWD: ${terminal.cwd ?? "unknown"}`,
+			title: terminal.name,
+		};
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { output: `Failed to create terminal: ${msg}`, isError: true };
+	}
+}
+
+async function renameTerminal(
+	idOrName: string,
+	newName: string,
+	narratorId: string,
+	cachedChapterId?: string,
+): Promise<ToolResult> {
+	const resolved = await resolveTerminalId(idOrName, narratorId, cachedChapterId);
+	if ("error" in resolved) {
+		return { output: resolved.error, isError: true };
+	}
+	const access = await assertTerminalAccess(resolved.id, narratorId, cachedChapterId);
+	if (!access.allowed) {
+		return { output: access.error, isError: true };
+	}
+	try {
+		await terminalService.rename(resolved.id, newName);
+		return {
+			output: `Terminal renamed to "${newName}".`,
+			title: newName,
+		};
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { output: `Failed to rename terminal: ${msg}`, isError: true };
+	}
 }
 
 const TERMINAL_ABORTED_MESSAGE = "Terminal operation aborted by user.";
