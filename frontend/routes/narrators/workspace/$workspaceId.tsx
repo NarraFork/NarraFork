@@ -561,7 +561,6 @@ function WorkspacePage() {
 				gap="xs"
 				style={{
 					flexShrink: 0,
-					borderBottom: "1px solid var(--mantine-color-dark-4)",
 				}}
 			>
 				<Tooltip label={t("listView")}>

@@ -258,7 +258,12 @@ function LeafPanel({ leaf }: { leaf: SplitLeaf }) {
 		<Box
 			ref={boxRef}
 			h="100%"
-			style={{ position: "relative", overflow: "hidden", borderRadius: 4 }}
+			style={{
+				position: "relative",
+				overflow: "hidden",
+				borderRadius: 4,
+				border: "1px solid var(--mantine-color-default-border)",
+			}}
 		>
 			<LeafPanelContent
 				leaf={leaf}
@@ -387,7 +392,6 @@ const DIRECTOR_SECONDARY_TARGET_PORTRAIT_WIDTH = 140;
 const DIRECTOR_PREVIEW_SCALE = 0.82;
 const DIRECTOR_DIVIDER_HIT_SIZE = 28;
 const DIRECTOR_DIVIDER_LINE_SIZE = 2;
-const DIRECTOR_PREVIEW_DIVIDER_SIZE = 1;
 
 function clamp(value: number, min: number, max: number): number {
 	return Math.min(Math.max(value, min), max);
@@ -501,6 +505,8 @@ function DirectorLeafHost({
 				height: frame.height,
 				overflow: "hidden",
 				zIndex,
+				borderRadius: 4,
+				border: "1px solid var(--mantine-color-default-border)",
 				transition:
 					"left 140ms ease, top 140ms ease, width 140ms ease, height 140ms ease, opacity 140ms ease",
 				willChange: "left, top, width, height",
@@ -601,19 +607,18 @@ export function DirectorPanelLayout({
 	const railThickness = hasSecondary ? projectedRailThickness : 0;
 	const primaryFrame: DirectorFrame = isLandscape
 		? {
-				left: 0,
-				top: 0,
-				width: Math.max(0, width - railThickness),
-				height: Math.max(0, height),
+				left: DIRECTOR_PADDING,
+				top: DIRECTOR_PADDING,
+				width: Math.max(0, width - railThickness - DIRECTOR_PADDING * 2),
+				height: Math.max(0, height - DIRECTOR_PADDING * 2),
 			}
 		: {
-				left: 0,
-				top: railThickness,
-				width: Math.max(0, width),
-				height: Math.max(0, height - railThickness),
+				left: DIRECTOR_PADDING,
+				top: railThickness + DIRECTOR_PADDING,
+				width: Math.max(0, width - DIRECTOR_PADDING * 2),
+				height: Math.max(0, height - railThickness - DIRECTOR_PADDING * 2),
 			};
 	const dropEdgeFrame = getDirectorEdgeFrame(width, height, isLandscape, projectedRailThickness);
-	const portraitColumns = Math.min(secondaryLeaves.length, 3);
 
 	const secondaryFrames = secondaryLeaves.map((_, index) => {
 		const secondaryCount = secondaryLeaves.length;
@@ -659,57 +664,6 @@ export function DirectorPanelLayout({
 			height: itemHeight,
 		};
 	});
-	const previewDividers: React.CSSProperties[] = [];
-	if (hasSecondary) {
-		if (isLandscape) {
-			for (let index = 1; index < secondaryFrames.length; index++) {
-				const frame = secondaryFrames[index];
-				previewDividers.push({
-					position: "absolute",
-					left: frame.left,
-					top: frame.top - DIRECTOR_GAP / 2 - DIRECTOR_PREVIEW_DIVIDER_SIZE / 2,
-					width: frame.width,
-					height: DIRECTOR_PREVIEW_DIVIDER_SIZE,
-					background: "var(--mantine-color-dark-4)",
-					opacity: 0.85,
-					zIndex: 2,
-					pointerEvents: "none",
-				});
-			}
-		} else {
-			for (let index = 0; index < secondaryFrames.length; index++) {
-				const frame = secondaryFrames[index];
-				const column = portraitColumns > 0 ? index % portraitColumns : 0;
-				const row = portraitColumns > 0 ? Math.floor(index / portraitColumns) : 0;
-				if (column > 0) {
-					previewDividers.push({
-						position: "absolute",
-						left: frame.left - DIRECTOR_GAP / 2 - DIRECTOR_PREVIEW_DIVIDER_SIZE / 2,
-						top: frame.top,
-						width: DIRECTOR_PREVIEW_DIVIDER_SIZE,
-						height: frame.height,
-						background: "var(--mantine-color-dark-4)",
-						opacity: 0.85,
-						zIndex: 2,
-						pointerEvents: "none",
-					});
-				}
-				if (row > 0 && column === 0) {
-					previewDividers.push({
-						position: "absolute",
-						left: DIRECTOR_PADDING,
-						top: frame.top - DIRECTOR_GAP / 2 - DIRECTOR_PREVIEW_DIVIDER_SIZE / 2,
-						width: Math.max(0, width - DIRECTOR_PADDING * 2),
-						height: DIRECTOR_PREVIEW_DIVIDER_SIZE,
-						background: "var(--mantine-color-dark-4)",
-						opacity: 0.85,
-						zIndex: 2,
-						pointerEvents: "none",
-					});
-				}
-			}
-		}
-	}
 
 	useEffect(() => {
 		const unsubMove = onNarratorDragMove((state: NarratorDragState) => {
@@ -848,7 +802,11 @@ export function DirectorPanelLayout({
 		? isLandscape
 			? {
 					position: "absolute",
-					left: primaryFrame.width - DIRECTOR_DIVIDER_HIT_SIZE / 2,
+					left:
+						primaryFrame.left +
+						primaryFrame.width +
+						DIRECTOR_PADDING -
+						DIRECTOR_DIVIDER_HIT_SIZE / 2,
 					top: 0,
 					width: DIRECTOR_DIVIDER_HIT_SIZE,
 					height: height,
@@ -860,7 +818,7 @@ export function DirectorPanelLayout({
 			: {
 					position: "absolute",
 					left: 0,
-					top: primaryFrame.top - DIRECTOR_DIVIDER_HIT_SIZE / 2,
+					top: primaryFrame.top - DIRECTOR_PADDING - DIRECTOR_DIVIDER_HIT_SIZE / 2,
 					width: width,
 					height: DIRECTOR_DIVIDER_HIT_SIZE,
 					cursor: "row-resize",
@@ -881,12 +839,6 @@ export function DirectorPanelLayout({
 				minHeight: 0,
 			}}
 		>
-			{previewDividers.map((style) => (
-				<Box
-					key={`preview-divider-${style.left}-${style.top}-${style.width}-${style.height}`}
-					style={style}
-				/>
-			))}
 			{leaves.map((leaf) => {
 				const isPrimary = leaf.id === primaryLeaf.id;
 				const secondaryIndex = secondaryLeaves.findIndex((item) => item.id === leaf.id);
@@ -929,7 +881,7 @@ export function DirectorPanelLayout({
 							top: isLandscape ? 0 : (DIRECTOR_DIVIDER_HIT_SIZE - DIRECTOR_DIVIDER_LINE_SIZE) / 2,
 							width: isLandscape ? DIRECTOR_DIVIDER_LINE_SIZE : "100%",
 							height: isLandscape ? "100%" : DIRECTOR_DIVIDER_LINE_SIZE,
-							background: "var(--mantine-color-dark-4)",
+							background: "var(--mantine-color-default-border)",
 							opacity: 0.7,
 						}}
 					/>
@@ -1197,7 +1149,7 @@ function ResizeHandle({
 			onPointerDown={onPointerDown}
 			style={{
 				flexShrink: 0,
-				[isHorizontal ? "width" : "height"]: 6,
+				[isHorizontal ? "width" : "height"]: 4,
 				cursor: isHorizontal ? "col-resize" : "row-resize",
 				backgroundColor: "transparent",
 				transition: "background-color 150ms ease",
@@ -1212,17 +1164,6 @@ function ResizeHandle({
 			onMouseLeave={(e) => {
 				(e.currentTarget as HTMLElement).style.backgroundColor = "transparent";
 			}}
-		>
-			{/* Always-visible thin line indicator */}
-			<Box
-				style={{
-					position: "absolute",
-					[isHorizontal ? "width" : "height"]: 1,
-					[isHorizontal ? "height" : "width"]: "100%",
-					backgroundColor: "var(--mantine-color-dark-4)",
-					pointerEvents: "none",
-				}}
-			/>
-		</Box>
+		/>
 	);
 }

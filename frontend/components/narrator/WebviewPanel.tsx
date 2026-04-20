@@ -69,7 +69,7 @@ export function WebviewPanel({
 				onPointerDown={editing ? undefined : onHeaderPointerDown}
 				style={{
 					flexShrink: 0,
-					borderBottom: "1px solid var(--mantine-color-dark-4)",
+					borderBottom: "1px solid var(--mantine-color-default-border)",
 					backgroundColor: "var(--mantine-color-dark-7)",
 					cursor: editing ? undefined : onHeaderPointerDown ? "grab" : undefined,
 				}}

@@ -568,16 +568,20 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const edgeEnd = cam.edge === "end";
 			const shaOffset = edgeEnd ? trackH - fontSize - 4 : 4;
 			const shaCrossSize = isH ? 0 : fontSize + 2;
+			// edge="start": SHA at top (near screen edge), message below SHA, ticks at bottom
+			// edge="end":   SHA at bottom (near screen edge), message near top (after ticks), ticks at top
 			const msgCrossOffset = isH
 				? edgeEnd
-					? shaOffset - (isExpanded ? 14 : 12)
+					? isExpanded ? 22 : 20
 					: isExpanded
 						? 18
 						: 16
 				: shaOffset;
 
 			// Available space for commit message (cross-axis)
-			const msgAvailH = edgeEnd ? msgCrossOffset - 4 : trackH - msgCrossOffset - 4;
+			const msgAvailH = edgeEnd
+				? shaOffset - msgCrossOffset - 2
+				: trackH - msgCrossOffset - 4;
 			const msgLineH = 13;
 
 			// Label width grows with zoom. slotWidth = stride * COLLAPSED_GAP * scale.
