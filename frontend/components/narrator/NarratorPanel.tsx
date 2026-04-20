@@ -107,6 +107,7 @@ import {
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
 	useUpdateRelaxedPlan,
+	useUpdateSubagentConclusion,
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
@@ -967,6 +968,7 @@ export function NarratorPanel({
 	const chapterStatus = (chapterData as any)?.status as string | undefined;
 	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
+	const updateConclusionMutation = useUpdateSubagentConclusion();
 
 	const aroundOptions = useMemo(
 		() =>
@@ -2659,30 +2661,65 @@ export function NarratorPanel({
 	// Prepend a manual "load older" button when auto-load is disabled and more pages exist.
 	const showManualLoadOlder = !autoLoadEnabled && hasNextPage;
 	const loadOlderBtnRef = useRef<() => void>(undefined);
+	const showConclusionBtn =
+		isSubagent &&
+		narrator &&
+		(narrator.status === "done" || narrator.status === "error") &&
+		!isActive;
 	const finalElements = useMemo(() => {
-		if (!showManualLoadOlder) return flatElements;
-		const btn = (
-			<Box ta="center" py={4}>
-				<Button
-					size="compact-xs"
-					variant="light"
-					onClick={() => loadOlderBtnRef.current?.()}
-					loading={isFetchingNextPage}
-				>
-					{t("loadOlderMessages")}
-				</Button>
-			</Box>
-		);
-		return [btn, ...flatElements];
-	}, [showManualLoadOlder, flatElements, isFetchingNextPage, t]);
-	const finalKeys = useMemo(
-		() => (showManualLoadOlder ? ["__load-older-btn__", ...flatKeys] : flatKeys),
-		[showManualLoadOlder, flatKeys],
-	);
-	const finalTargets = useMemo(
-		() => (showManualLoadOlder ? [[], ...flatTargets] : flatTargets),
-		[showManualLoadOlder, flatTargets],
-	);
+		const elements = showManualLoadOlder
+			? [
+					<Box ta="center" py={4} key="__load-older-btn__">
+						<Button
+							size="compact-xs"
+							variant="light"
+							onClick={() => loadOlderBtnRef.current?.()}
+							loading={isFetchingNextPage}
+						>
+							{t("loadOlderMessages")}
+						</Button>
+					</Box>,
+					...flatElements,
+				]
+			: [...flatElements];
+
+		// Append "Update Conclusion" button for completed subagents
+		if (showConclusionBtn) {
+			elements.push(
+				<Box ta="center" py="sm" key="__update-conclusion-btn__">
+					<Button
+						size="compact-sm"
+						variant="light"
+						color="indigo"
+						onClick={() => updateConclusionMutation.mutate(narratorId)}
+						loading={updateConclusionMutation.isPending}
+					>
+						{t("updateConclusion")}
+					</Button>
+				</Box>,
+			);
+		}
+
+		return elements;
+	}, [
+		showManualLoadOlder,
+		flatElements,
+		isFetchingNextPage,
+		t,
+		showConclusionBtn,
+		narratorId,
+		updateConclusionMutation,
+	]);
+	const finalKeys = useMemo(() => {
+		const keys = showManualLoadOlder ? ["__load-older-btn__", ...flatKeys] : [...flatKeys];
+		if (showConclusionBtn) keys.push("__update-conclusion-btn__");
+		return keys;
+	}, [showManualLoadOlder, flatKeys, showConclusionBtn]);
+	const finalTargets = useMemo(() => {
+		const targets = showManualLoadOlder ? [[], ...flatTargets] : [...flatTargets];
+		if (showConclusionBtn) targets.push([]);
+		return targets;
+	}, [showManualLoadOlder, flatTargets, showConclusionBtn]);
 	const previewMessageCount = 5;
 	const renderedElements = useMemo(
 		() =>

@@ -165,6 +165,7 @@
 		"narratorArchived": "已归档",
 		"narratorError": "错误",
 		"narratorInterrupted": "已中断",
+		"narratorSuspended": "已暂停",
 		"containerCreated": "已创建",
 		"containerRunning": "运行中",
 		"containerPaused": "已暂停",

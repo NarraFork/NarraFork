@@ -417,5 +417,9 @@
 	"details.stats.viewers": "Viewers",
 	"details.stats.terminals": "Terminals",
 	"details.stats.browserSessions": "Browser",
-	"details.stats.pendingPermissions": "Pending perms"
+	"details.stats.pendingPermissions": "Pending perms",
+	"updateConclusion": "Update conclusion",
+	"conclusionUpdated": "Conclusion updated",
+	"subagentSuspended": "Suspended — waiting for user",
+	"subagentSuspendedHint": "Open the subagent session to continue"
 }

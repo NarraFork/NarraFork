@@ -239,7 +239,16 @@ export const narrators = sqliteTable(
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
 		status: text("status", {
-			enum: ["idle", "thinking", "waiting", "done", "archived", "error", "interrupted"],
+			enum: [
+				"idle",
+				"thinking",
+				"waiting",
+				"done",
+				"archived",
+				"error",
+				"interrupted",
+				"suspended",
+			],
 		})
 			.notNull()
 			.default("idle"),

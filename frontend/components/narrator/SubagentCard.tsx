@@ -26,7 +26,7 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { useToolCallDetail } from "../../hooks/useNarrator";
+import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
@@ -375,6 +375,10 @@ export const SubagentCard = memo(
 			return null;
 		}, [childMessages, narratorId]);
 
+		// Query the subagent narrator's status to detect "suspended" state
+		const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
+		const isSuspended = (subagentNarrator as Record<string, unknown>)?.status === "suspended";
+
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId) {
 				if (onViewSubagentSession) {
@@ -492,16 +496,22 @@ export const SubagentCard = memo(
 								</Group>
 							</Group>
 							{/* Line 2: description (truncated when collapsed) */}
-							<Text
-								size="xs"
-								c="dimmed"
-								mt={2}
-								ml={21}
-								truncate={!expanded}
-								style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
-							>
-								{description}
-							</Text>
+							{isSuspended ? (
+								<Text size="xs" c="yellow" mt={2} ml={21}>
+									{t("subagentSuspended")}
+								</Text>
+							) : (
+								<Text
+									size="xs"
+									c="dimmed"
+									mt={2}
+									ml={21}
+									truncate={!expanded}
+									style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
+								>
+									{description}
+								</Text>
+							)}
 							{prompt && !input.description && !promptHasLineBreak && (
 								<Text
 									ref={promptSummaryRef}

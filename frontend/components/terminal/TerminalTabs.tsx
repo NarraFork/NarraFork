@@ -20,10 +20,9 @@ interface TerminalTabsProps {
 
 /** Extract saved tab order from panelAssignments JSON */
 function getSavedOrder(
-	panelAssignments: Record<string, string> | null | undefined,
+	panelAssignments: Record<string, string | string[]> | null | undefined,
 ): string[] | null {
-	// biome-ignore lint/suspicious/noExplicitAny: stored as generic JSON
-	const pa = panelAssignments as any;
+	const pa = panelAssignments;
 	if (pa?.tabOrder && Array.isArray(pa.tabOrder)) return pa.tabOrder;
 	return null;
 }
@@ -141,7 +140,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	const handleReorder = useCallback(
 		(ids: string[]) => {
 			viewState.update({
-				panelAssignments: { tabOrder: ids } as unknown as Record<string, string>,
+				panelAssignments: { tabOrder: ids },
 			});
 		},
 		[viewState],

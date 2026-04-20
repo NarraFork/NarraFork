@@ -973,6 +973,73 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	return c.json({ interrupted });
 });
 
+// Update the conclusion of an already-completed subagent.
+// The user continued operating the subagent from its page and wants to
+// push the new result back to the parent narrator's tool_call outputJson.
+narratorRoutes.post("/:id/update-conclusion", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+
+	if (narrator.type !== "subagent") {
+		return c.json({ error: "Not a subagent" }, 400);
+	}
+	if (!narrator.parentNarratorId) {
+		return c.json({ error: "No parent narrator" }, 400);
+	}
+
+	// Find the tool_use that spawned this subagent by looking at the subagent's
+	// first user message's parentToolUseId
+	const firstMsg = await db.query.narratorMessages.findFirst({
+		where: and(
+			eq(narratorMessages.narratorId, id),
+			eq(narratorMessages.role, "user"),
+			isNotNull(narratorMessages.parentToolUseId),
+		),
+		columns: { parentToolUseId: true },
+		orderBy: narratorMessages.createdAt,
+	});
+	if (!firstMsg?.parentToolUseId) {
+		return c.json({ error: "Cannot find parent tool_use" }, 400);
+	}
+	const toolUseId = firstMsg.parentToolUseId;
+
+	// Find the tool_call record
+	const tc = await narratorService.getToolCallByToolUseId(toolUseId);
+	if (!tc?.messageId) {
+		return c.json({ error: "Tool call not found" }, 400);
+	}
+
+	// Fork detection: check if the parent's assistant message is shared.
+	// After copy-on-write, track the new messageId so updateToolCallResult
+	// only updates the private copy (not the original shared record).
+	const isShared = await narratorService.isMessageSharedByMultipleNarrators(tc.messageId);
+	let privateMessageId: string | undefined;
+	if (isShared) {
+		privateMessageId = await narratorService.copyOnWriteToolCallMessage(
+			narrator.parentNarratorId,
+			tc.messageId,
+			toolUseId,
+		);
+	}
+
+	const { updateToolCallConclusion, getSubagentFinalText } = await import(
+		"../services/narrator-session"
+	);
+	const finalText = await getSubagentFinalText(id);
+
+	const hasError = narrator.status === "error";
+	await updateToolCallConclusion(
+		id,
+		narrator.parentNarratorId,
+		toolUseId,
+		finalText,
+		hasError,
+		privateMessageId,
+	);
+
+	return c.json({ ok: true, toolUseId });
+});
+
 // User left the narrator page — reset interrupted status to idle
 narratorRoutes.post("/:id/leave", async (c) => {
 	const id = c.req.param("id");

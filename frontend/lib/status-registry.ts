@@ -58,7 +58,8 @@ export type NarratorStatus =
 	| "done"
 	| "archived"
 	| "error"
-	| "interrupted";
+	| "interrupted"
+	| "suspended";
 
 const narratorStatusMap: StatusMap<NarratorStatus> = {
 	idle: { color: "gray", icon: "○", i18nKey: "status.narratorIdle" },
@@ -69,6 +70,7 @@ const narratorStatusMap: StatusMap<NarratorStatus> = {
 	archived: { color: "dark", icon: "◌", i18nKey: "status.narratorArchived" },
 	error: { color: "red", icon: "✗", i18nKey: "status.narratorError" },
 	interrupted: { color: "orange", icon: "⊘", i18nKey: "status.narratorInterrupted" },
+	suspended: { color: "yellow", icon: "◔", i18nKey: "status.narratorSuspended" },
 };
 
 // ---------------------------------------------------------------------------

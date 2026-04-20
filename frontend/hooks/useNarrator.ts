@@ -396,6 +396,12 @@ export function useInterruptNarrator() {
 	});
 }
 
+export function useUpdateSubagentConclusion() {
+	return useMutation({
+		mutationFn: (id: string) => api.updateSubagentConclusion(id),
+	});
+}
+
 export function useUpdatePermissionMode() {
 	const qc = useQueryClient();
 	return useMutation({

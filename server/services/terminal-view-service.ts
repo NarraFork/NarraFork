@@ -26,7 +26,7 @@ export const terminalViewService = {
 			narratorId?: string;
 			layout?: string;
 			activeTabId?: string | null;
-			panelAssignments?: Record<string, string> | null;
+			panelAssignments?: Record<string, string | string[]> | null;
 		},
 	) {
 		const existing = await this.get(userId, opts);

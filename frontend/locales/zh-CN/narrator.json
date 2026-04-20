@@ -417,5 +417,9 @@
 	"details.stats.viewers": "查看者",
 	"details.stats.terminals": "终端",
 	"details.stats.browserSessions": "浏览器",
-	"details.stats.pendingPermissions": "待批权限"
+	"details.stats.pendingPermissions": "待批权限",
+	"updateConclusion": "更新结论",
+	"conclusionUpdated": "结论已更新",
+	"subagentSuspended": "已暂停 — 等待用户继续",
+	"subagentSuspendedHint": "打开子代理会话继续操作"
 }

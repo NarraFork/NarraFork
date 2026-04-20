@@ -3198,7 +3198,15 @@ export const narratorService = {
 
 	async updateStatus(
 		narratorId: string,
-		status: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
+		status:
+			| "idle"
+			| "thinking"
+			| "waiting"
+			| "done"
+			| "archived"
+			| "error"
+			| "interrupted"
+			| "suspended",
 		errorMessage?: string,
 		errorCode?: string,
 		/** Set to true only at the real turn entry points (sendMessage, retry, continue, etc.)
@@ -3294,7 +3302,15 @@ export const narratorService = {
 	async compareAndSetStatus(
 		narratorId: string,
 		expectedStatus: string | string[],
-		newStatus: "idle" | "thinking" | "waiting" | "done" | "archived" | "error" | "interrupted",
+		newStatus:
+			| "idle"
+			| "thinking"
+			| "waiting"
+			| "done"
+			| "archived"
+			| "error"
+			| "interrupted"
+			| "suspended",
 		errorMessage?: string,
 	): Promise<boolean> {
 		const now = new Date().toISOString();
@@ -3344,7 +3360,13 @@ export const narratorService = {
 			errorMessage?: string;
 			durationMs?: number;
 		},
+		/** When provided, restricts the update to the tool_call belonging to this
+		 *  specific message. Required after copy-on-write to avoid updating the
+		 *  original (shared) record in addition to the private copy. */
+		messageId?: string,
 	) {
+		const conditions = [eq(narratorToolCalls.toolUseId, toolUseId)];
+		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		await db
 			.update(narratorToolCalls)
 			.set({
@@ -3353,7 +3375,89 @@ export const narratorService = {
 				errorMessage: result.errorMessage ?? null,
 				durationMs: result.durationMs ?? null,
 			})
-			.where(eq(narratorToolCalls.toolUseId, toolUseId));
+			.where(and(...conditions));
+	},
+
+	/**
+	 * Check if a message is shared by multiple narrators (via narrator_message_refs).
+	 * Used for fork detection before modifying tool call results.
+	 */
+	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
+		const result = await db
+			.select({ count: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, messageId));
+		return (result[0]?.count ?? 0) > 1;
+	},
+
+	/**
+	 * Find the tool call record for a given toolUseId.
+	 */
+	async getToolCallByToolUseId(toolUseId: string) {
+		return db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+		});
+	},
+
+	/**
+	 * Copy-on-write for a message containing a tool_use block.
+	 * When a narrator's message is shared with other narrators (via fork),
+	 * we need to create a private copy before modifying the tool call result.
+	 *
+	 * This copies the message, updates the narrator's ref to point to the copy,
+	 * and duplicates the associated tool_call records for the specified toolUseId.
+	 *
+	 * Returns the new message ID.
+	 */
+	async copyOnWriteToolCallMessage(
+		narratorId: string,
+		messageId: string,
+		toolUseId: string,
+	): Promise<string> {
+		const newMessageId = generateId();
+		const now = new Date().toISOString();
+
+		await db.transaction(async (tx) => {
+			// 1. Copy the message
+			const original = await tx.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+			});
+			if (!original) throw new NotFoundError("Message", messageId);
+
+			await tx.insert(narratorMessages).values({
+				...original,
+				id: newMessageId,
+				createdAt: now,
+			});
+
+			// 2. Update the narrator's ref to point to the new message
+			await tx
+				.update(narratorMessageRefs)
+				.set({ messageId: newMessageId })
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				);
+
+			// 3. Copy the tool_call record for this toolUseId, pointing to the new message
+			const originalTc = await tx.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.messageId, messageId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			});
+			if (originalTc) {
+				await tx.insert(narratorToolCalls).values({
+					...originalTc,
+					id: generateId(),
+					messageId: newMessageId,
+				});
+			}
+		});
+
+		return newMessageId;
 	},
 
 	/** Overwrite the persisted inputJson for a tool call (used for broken/truncated calls).

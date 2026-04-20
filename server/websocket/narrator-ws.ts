@@ -299,6 +299,20 @@ export type NarratorServerMessage =
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
 	| { type: "model_switched"; narratorId: string; model: string; provider: string }
+	| {
+			type: "subagent_suspended";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId: string;
+	  }
+	| {
+			type: "subagent_conclusion_updated";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId: string;
+			output: string;
+			hasError: boolean;
+	  }
 	| { type: "sync_ok"; narratorId: string; version: number };
 
 // Client → Server messages

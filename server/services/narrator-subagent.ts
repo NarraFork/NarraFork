@@ -76,6 +76,46 @@ function getSubagentBufferedMessagesMap() {
 	return _subagentBufferedMessages;
 }
 
+// === Suspended subagent state ===
+// When a foreground subagent is interrupted by the user, instead of immediately
+// returning an error to the parent narrator, we suspend the Promise and wait
+// for the user to continue operating the subagent from its dedicated page.
+
+interface SuspendedSubagentEntry {
+	/** Resolve the parent narrator's runSubagent Promise with the final result. */
+	resolve: (result: { finalText: string; hasError: boolean }) => void;
+	/** Reject the parent narrator's runSubagent Promise (e.g. parent interrupted). */
+	reject: (err: Error) => void;
+	/** Parent narrator's abort signal — if parent is interrupted, we reject. */
+	parentSignal: AbortSignal;
+	parentNarratorId: string;
+	toolUseId: string;
+}
+
+let _suspendedSubagents: Map<string, SuspendedSubagentEntry> | undefined;
+function getSuspendedSubagentsMap() {
+	if (!_suspendedSubagents) _suspendedSubagents = new Map();
+	return _suspendedSubagents;
+}
+
+/**
+ * Conclusion watchers: for subagents that have already completed (done/error)
+ * and whose result was already returned to the parent narrator. When the user
+ * later continues operating the subagent and clicks "Update Conclusion",
+ * we register a watcher that will update the parent's tool_call outputJson
+ * when the subagent next completes.
+ */
+interface ConclusionWatcher {
+	parentNarratorId: string;
+	toolUseId: string;
+}
+
+let _conclusionWatchers: Map<string, ConclusionWatcher> | undefined;
+function getConclusionWatchersMap() {
+	if (!_conclusionWatchers) _conclusionWatchers = new Map();
+	return _conclusionWatchers;
+}
+
 // === Subagent type definitions ===
 
 /** Tools available to explore/plan subagents (read-only + Shell/Bash + Write/Edit for conclusion file) */
@@ -780,8 +820,67 @@ export function interruptForegroundSubagent(subagentId: string): boolean {
 	return true;
 }
 
+// === Suspended subagent public API ===
+
+/** Check if a subagent is currently suspended (waiting for user to continue). */
+export function isSubagentSuspended(subagentId: string): boolean {
+	return getSuspendedSubagentsMap().has(subagentId);
+}
+
+/**
+ * Resolve a suspended subagent's Promise with the final result.
+ * Called when the subagent completes after the user continued operating it.
+ */
+export function resolveSuspendedSubagent(
+	subagentId: string,
+	finalText: string,
+	hasError: boolean,
+): boolean {
+	const entry = getSuspendedSubagentsMap().get(subagentId);
+	if (!entry) return false;
+	getSuspendedSubagentsMap().delete(subagentId);
+	entry.resolve({ finalText, hasError });
+	return true;
+}
+
+/**
+ * Abandon a suspended subagent — resolve its Promise as an error.
+ * Called when the parent narrator is interrupted or the user explicitly abandons.
+ */
+export function abandonSuspendedSubagent(subagentId: string): boolean {
+	const entry = getSuspendedSubagentsMap().get(subagentId);
+	if (!entry) return false;
+	getSuspendedSubagentsMap().delete(subagentId);
+	entry.resolve({ finalText: "Subagent abandoned by user", hasError: true });
+	return true;
+}
+
+// === Conclusion watcher public API ===
+
+/** Register a watcher for an already-completed subagent's next conclusion. */
+export function registerConclusionWatcher(
+	subagentId: string,
+	parentNarratorId: string,
+	toolUseId: string,
+): void {
+	getConclusionWatchersMap().set(subagentId, { parentNarratorId, toolUseId });
+}
+
+/** Remove a conclusion watcher. */
+export function removeConclusionWatcher(subagentId: string): boolean {
+	return getConclusionWatchersMap().delete(subagentId);
+}
+
+/** Get the conclusion watcher for a subagent (if any). */
+export function getConclusionWatcher(subagentId: string): ConclusionWatcher | undefined {
+	return getConclusionWatchersMap().get(subagentId);
+}
+
 /** Maximum background task execution time (30 minutes). */
 const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Maximum time a suspended subagent can wait for the user to continue (30 minutes). */
+const SUSPENDED_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
  * Execute a background task (fire-and-forget).
@@ -1237,12 +1336,79 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			}
 			// Detect subagent-only interrupt (not parent abort)
 			if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-				hasError = true;
-				finalText = "Subagent interrupted by user";
+				// --- Suspend: wait for user to continue operating the subagent ---
+				await narratorService.updateStatus(subagentId, "suspended");
+				broadcastToNarrator(parentNarratorId, {
+					type: "subagent_suspended",
+					narratorId: parentNarratorId,
+					subagentNarratorId: subagentId,
+					toolUseId,
+				});
+				broadcastToNarrator(subagentId, {
+					type: "status_change",
+					narratorId: subagentId,
+					status: "suspended",
+				});
+
+				// Create a Promise that will be resolved when the subagent
+				// completes again (after user continues from the subagent page).
+				// Includes a timeout to prevent indefinite memory leaks.
+				const suspendResult = await new Promise<{
+					finalText: string;
+					hasError: boolean;
+				}>((resolve, reject) => {
+					const timeoutId = setTimeout(() => {
+						const entry = getSuspendedSubagentsMap().get(subagentId);
+						if (entry) {
+							getSuspendedSubagentsMap().delete(subagentId);
+							resolve({
+								finalText: "Suspended subagent timed out after 30 minutes",
+								hasError: true,
+							});
+						}
+					}, SUSPENDED_SUBAGENT_TIMEOUT_MS);
+
+					getSuspendedSubagentsMap().set(subagentId, {
+						resolve: (result) => {
+							clearTimeout(timeoutId);
+							resolve(result);
+						},
+						reject: (err) => {
+							clearTimeout(timeoutId);
+							reject(err);
+						},
+						parentSignal: signal,
+						parentNarratorId,
+						toolUseId,
+					});
+
+					// If parent narrator is interrupted, abandon the suspended subagent
+					const onParentAbort = () => {
+						clearTimeout(timeoutId);
+						const entry = getSuspendedSubagentsMap().get(subagentId);
+						if (entry) {
+							getSuspendedSubagentsMap().delete(subagentId);
+							resolve({
+								finalText: "Parent narrator interrupted",
+								hasError: true,
+							});
+						}
+					};
+					if (signal.aborted) {
+						onParentAbort();
+					} else {
+						signal.addEventListener("abort", onParentAbort, { once: true });
+					}
+				});
+
+				finalText = suspendResult.finalText;
+				hasError = suspendResult.hasError;
 			}
 			break;
 		}
 	} finally {
+		// Clean up suspended state if still present
+		getSuspendedSubagentsMap().delete(subagentId);
 		getForegroundAbortControllers().delete(subagentId);
 		await finalizeSubagent(
 			subagentId,

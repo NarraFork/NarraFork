@@ -737,6 +737,10 @@ export const api = {
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	updateSubagentConclusion: (id: string) =>
+		request<{ ok: boolean; toolUseId: string }>(`/narrators/${id}/update-conclusion`, {
+			method: "POST",
+		}),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
 	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
@@ -1228,7 +1232,7 @@ export const api = {
 		narratorId?: string;
 		layout?: string;
 		activeTabId?: string | null;
-		panelAssignments?: Record<string, string> | null;
+		panelAssignments?: Record<string, string | string[]> | null;
 	}) =>
 		request<ApiEntity>("/terminals/view-state", {
 			method: "PUT",

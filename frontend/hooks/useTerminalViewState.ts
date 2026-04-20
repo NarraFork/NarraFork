@@ -5,7 +5,7 @@ import { api } from "../lib/api";
 interface ViewState {
 	layout: string;
 	activeTabId: string | null;
-	panelAssignments: Record<string, string> | null;
+	panelAssignments: Record<string, string | string[]> | null;
 }
 
 export function useTerminalViewState(opts: { chapterId?: string; narratorId?: string }) {

@@ -165,6 +165,7 @@
 		"narratorArchived": "Archived",
 		"narratorError": "Error",
 		"narratorInterrupted": "Interrupted",
+		"narratorSuspended": "Suspended",
 		"containerCreated": "Created",
 		"containerRunning": "Running",
 		"containerPaused": "Paused",

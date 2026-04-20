@@ -110,6 +110,13 @@ interface NarratorWSCallbacks {
 		subagentType: string,
 	) => void;
 	onSubagentStarted?: (toolUseId: string, model?: string) => void;
+	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
+	onSubagentConclusionUpdated?: (
+		subagentNarratorId: string,
+		toolUseId: string,
+		output: string,
+		hasError: boolean,
+	) => void;
 	onBackgroundTaskCompleted?: (
 		taskNarratorId: string,
 		toolUseId: string,
@@ -477,6 +484,20 @@ export function useNarratorWS(
 						callbacksRef.current.onSubagentStarted?.(
 							data.toolUseId as string,
 							data.model as string | undefined,
+						);
+						break;
+					case "subagent_suspended":
+						callbacksRef.current.onSubagentSuspended?.(
+							data.subagentNarratorId as string,
+							data.toolUseId as string,
+						);
+						break;
+					case "subagent_conclusion_updated":
+						callbacksRef.current.onSubagentConclusionUpdated?.(
+							data.subagentNarratorId as string,
+							data.toolUseId as string,
+							data.output as string,
+							data.hasError as boolean,
 						);
 						break;
 					case "background_task_completed":

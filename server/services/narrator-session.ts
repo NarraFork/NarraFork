@@ -3924,6 +3924,48 @@ async function runAgentLoop(
 		active._loopRunning = false;
 		active.alive = false;
 
+		// --- Resolve suspended subagent or conclusion watcher ---
+		// When a subagent narrator completes (from the subagent page), check if
+		// the parent narrator's runSubagent Promise is suspended waiting for it,
+		// or if there's a conclusion watcher registered for post-completion updates.
+		try {
+			const narr = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { type: true, parentNarratorId: true },
+			});
+			if (narr?.type === "subagent") {
+				const {
+					isSubagentSuspended: isSuspended,
+					resolveSuspendedSubagent,
+					getConclusionWatcher,
+					removeConclusionWatcher,
+				} = await import("./narrator-subagent");
+
+				const lastFinalText = await getSubagentFinalText(narratorId);
+
+				if (isSuspended(narratorId)) {
+					// Scenario 1: parent narrator's Promise is still hanging
+					resolveSuspendedSubagent(narratorId, lastFinalText, loopHadError);
+				} else if (getConclusionWatcher(narratorId)) {
+					// Scenario 2: subagent already completed before, user updated conclusion
+					const watcher = getConclusionWatcher(narratorId)!;
+					removeConclusionWatcher(narratorId);
+					await updateToolCallConclusion(
+						narratorId,
+						watcher.parentNarratorId,
+						watcher.toolUseId,
+						lastFinalText,
+						loopHadError,
+					);
+				}
+			}
+		} catch (err) {
+			logger.error("Failed to resolve suspended subagent / conclusion watcher", {
+				narratorId,
+				error: String(err),
+			});
+		}
+
 		// Restore model after temporary override (slash command with modelOverride.mode="temporary")
 		// Read from DB so this survives server restarts.
 		try {
@@ -4649,6 +4691,66 @@ async function feedMessage(
 	});
 
 	return { active, userMsg };
+}
+
+// === Subagent conclusion helpers ===
+
+/**
+ * Extract the final text from a subagent's last assistant message.
+ * Used when resolving suspended subagents or updating conclusions.
+ */
+export async function getSubagentFinalText(narratorId: string): Promise<string> {
+	const messages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	// Walk backwards to find the last assistant message with text content
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "assistant") continue;
+		const blocks = msg.contentJson as Array<{ type: string; text?: string }>;
+		if (!blocks || !Array.isArray(blocks)) continue;
+		const textParts = blocks
+			.filter((b) => b.type === "text" && b.text)
+			.map((b) => b.text ?? "")
+			.join("\n");
+		if (textParts.trim()) return textParts;
+	}
+	return "(no output)";
+}
+
+/**
+ * Update the parent narrator's tool_call outputJson with a new conclusion.
+ * Used for scenario 2 (conclusion watcher) and the update-conclusion API.
+ */
+export async function updateToolCallConclusion(
+	subagentId: string,
+	parentNarratorId: string,
+	toolUseId: string,
+	finalText: string,
+	hasError: boolean,
+	/** Pass after copy-on-write to scope the update to the private message copy. */
+	messageId?: string,
+): Promise<void> {
+	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	const output = resultPrefix + (finalText || "(no output)");
+
+	await narratorService.updateToolCallResult(
+		toolUseId,
+		{
+			output,
+			status: hasError ? "fail" : "success",
+			errorMessage: hasError ? finalText : undefined,
+		},
+		messageId,
+	);
+
+	// Broadcast to parent narrator so the frontend can update the SubagentCard
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_conclusion_updated",
+		narratorId: parentNarratorId,
+		subagentNarratorId: subagentId,
+		toolUseId,
+		output,
+		hasError,
+	});
 }
 
 // === Public API ===

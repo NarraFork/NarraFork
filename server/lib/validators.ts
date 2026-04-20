@@ -313,7 +313,10 @@ export const updateTerminalViewStateSchema = z
 		narratorId: z.string().min(1).optional(),
 		layout: z.enum(["single", "split-h", "split-v", "triple", "quad"]).optional(),
 		activeTabId: z.string().nullable().optional(),
-		panelAssignments: z.record(z.string(), z.string()).nullable().optional(),
+		panelAssignments: z
+			.record(z.string(), z.union([z.string(), z.array(z.string())]))
+			.nullable()
+			.optional(),
 	})
 	.refine((d) => d.chapterId || d.narratorId, {
 		message: "Either chapterId or narratorId is required",
