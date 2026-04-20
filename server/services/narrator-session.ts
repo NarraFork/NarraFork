@@ -5162,14 +5162,15 @@ export async function cleanupPartialMessage(partialId: string, narratorId: strin
 /**
  * Finalize or clean up a partial message before retry.
  *
- * If the partial message has tool calls with real execution results
- * (status is success, fail, or running), keep the message — those tools
- * produced side effects that cannot be undone.  Unexecuted tool_calls
- * (initializing / pending) are removed, and the message's contentJson is
- * trimmed to match.  Running tool_calls are marked as fail (interrupted).
- *
- * If no tool call was actually executed, the entire partial message is
- * deleted via {@link cleanupPartialMessage}.
+ * Three-way decision:
+ * 1. **No executed tools AND no meaningful content** — the entire partial
+ *    message is deleted via {@link cleanupPartialMessage}.
+ * 2. **No executed tools BUT has streamed text/reasoning** — the message is
+ *    preserved; any unexecuted tool_call records and their tool_use blocks
+ *    are stripped from contentJson.
+ * 3. **Some tools executed** — the message is kept. Unexecuted tool_calls
+ *    (initializing / pending) are removed, running ones are marked as fail
+ *    (interrupted), and contentJson is trimmed to match.
  *
  * @returns `true` if the message was kept (finalized), `false` if deleted.
  */
@@ -5188,9 +5189,61 @@ export async function finalizeOrCleanupPartialMessage(
 		const executed = toolCalls.filter((tc) => executedStatuses.has(tc.status));
 
 		if (executed.length === 0) {
-			// No tool was actually executed — safe to delete everything
-			await cleanupPartialMessage(partialId, narratorId);
-			return false;
+			// No tool was actually executed — but check if the message has
+			// meaningful text/reasoning content that should be preserved
+			// (e.g. user interrupted while the model was streaming a long text block).
+			const hasContent = await db.transaction(async (tx) => {
+				const msg = await tx.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, partialId),
+					columns: { contentJson: true },
+				});
+				const blocks = Array.isArray(msg?.contentJson)
+					? (msg.contentJson as Array<Record<string, unknown>>)
+					: [];
+				const meaningful = blocks.some(
+					(b) =>
+						(b.type === "text" && typeof b.text === "string" && b.text.length > 0) ||
+						(b.type === "reasoning" && typeof b.text === "string" && b.text.length > 0),
+				);
+
+				if (!meaningful) return false;
+
+				// Has streamed content worth keeping — remove any unexecuted tool_call
+				// records and their corresponding tool_use blocks from contentJson,
+				// but preserve the message itself.
+				// Note: since executed.length === 0, toolCalls here are all unexecuted.
+				if (toolCalls.length > 0) {
+					const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
+					await tx.delete(narratorToolCalls).where(
+						inArray(
+							narratorToolCalls.id,
+							toolCalls.map((tc) => tc.id),
+						),
+					);
+					const filtered = blocks.filter(
+						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
+					);
+					await tx
+						.update(narratorMessages)
+						.set({ contentJson: filtered })
+						.where(eq(narratorMessages.id, partialId));
+				}
+
+				logger.info("Preserved partial message with streamed content (no tool execution)", {
+					narratorId,
+					partialId,
+					blockCount: blocks.length,
+					removedToolCalls: toolCalls.length,
+				});
+				return true;
+			});
+
+			if (!hasContent) {
+				// Truly empty — safe to delete
+				await cleanupPartialMessage(partialId, narratorId);
+				return false;
+			}
+			return true;
 		}
 
 		// Some tools were executed — keep the message, clean up the rest
