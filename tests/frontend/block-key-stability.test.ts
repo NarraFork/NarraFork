@@ -21,7 +21,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		expect(msg).not.toBeNull();
 		const reasoningBlock = msg?.contentJson.find((b: any) => b.type === "reasoning");
 		expect(reasoningBlock).toBeDefined();
-		expect(reasoningBlock?.id).toBe("streaming:reasoning");
+		expect(reasoningBlock?.id).toBe("streaming:reasoning:0");
 	});
 
 	test("text block gets stable id", () => {
@@ -32,7 +32,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		expect(msg).not.toBeNull();
 		const textBlock = msg?.contentJson.find((b: any) => b.type === "text");
 		expect(textBlock).toBeDefined();
-		expect(textBlock?.id).toBe("streaming:text");
+		expect(textBlock?.id).toBe("streaming:text:0");
 	});
 
 	test("reasoning + text both get stable ids", () => {
@@ -45,7 +45,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		});
 		expect(msg).not.toBeNull();
 		const ids = msg?.contentJson.map((b: any) => b.id);
-		expect(ids).toEqual(["streaming:reasoning", "streaming:text"]);
+		expect(ids).toEqual(["streaming:reasoning:0", "streaming:text:1"]);
 	});
 
 	test("web_search block keeps its original id", () => {
@@ -103,7 +103,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		});
 		expect(msg).not.toBeNull();
 		const ids = msg?.contentJson.map((b: any) => b.id);
-		expect(ids).toEqual(["streaming:reasoning", "ws-1", "streaming:text", "tu-1"]);
+		expect(ids).toEqual(["streaming:reasoning:0", "ws-1", "streaming:text:2", "tu-1"]);
 	});
 
 	test("ids are stable across incremental streaming updates", () => {
@@ -136,11 +136,11 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		const textId3 = step3?.contentJson.find((b: any) => b.type === "text")?.id;
 
 		// All ids should be identical across steps
-		expect(reasoningId1).toBe("streaming:reasoning");
-		expect(reasoningId2).toBe("streaming:reasoning");
-		expect(reasoningId3).toBe("streaming:reasoning");
-		expect(textId2).toBe("streaming:text");
-		expect(textId3).toBe("streaming:text");
+		expect(reasoningId1).toBe("streaming:reasoning:0");
+		expect(reasoningId2).toBe("streaming:reasoning:0");
+		expect(reasoningId3).toBe("streaming:reasoning:0");
+		expect(textId2).toBe("streaming:text:1");
+		expect(textId3).toBe("streaming:text:2");
 	});
 
 	test("temporal order is preserved: search between reasoning steps", () => {

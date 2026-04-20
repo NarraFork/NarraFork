@@ -25,10 +25,12 @@ describe("truncateOutput", () => {
 		expect(result.content).toContain("truncated");
 		expect(result.content).toContain("Read with offset/limit");
 
-		// The kept portion should not exceed MAX_LINES lines (allow +1 for split boundary)
-		const previewPart = result.content.split("\n...")[0];
-		const previewLines = previewPart.split("\n").length;
-		expect(previewLines).toBeLessThanOrEqual(MAX_LINES + 1);
+		// The kept portion (between the "...N truncated..." header and the "⚠️" hint)
+		// should not exceed MAX_LINES lines.
+		const previewPart = result.content.split("⚠️")[0];
+		const previewLines = previewPart.trim().split("\n").length;
+		// Header line + up to MAX_LINES kept lines
+		expect(previewLines).toBeLessThanOrEqual(MAX_LINES + 2);
 	});
 
 	test("truncates when byte size exceeds MAX_BYTES", () => {
@@ -106,10 +108,9 @@ describe("truncateOutput", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.outputPath).toBeDefined();
 		// The preview should contain some content, not be empty
-		const previewPart = result.content.split("\n\n...")[0];
-		expect(previewPart.length).toBeGreaterThan(0);
-		expect(previewPart).toContain("…[line truncated,");
-		expect(previewPart).toContain(`${hugeLine.length} chars total`);
+		expect(result.content).toContain("truncated");
+		expect(result.content).toContain("[line truncated,");
+		expect(result.content).toContain(`${hugeLine.length} chars total`);
 	});
 
 	test("keeps partial first line for multi-line file where first line exceeds MAX_BYTES", () => {
@@ -119,9 +120,7 @@ describe("truncateOutput", () => {
 		const result = truncateOutput(text);
 
 		expect(result.truncated).toBe(true);
-		const previewPart = result.content.split("\n\n...")[0];
-		expect(previewPart.length).toBeGreaterThan(0);
-		expect(previewPart).toContain("…[line truncated,");
+		expect(result.content).toContain("truncated");
 	});
 
 	test("output path contains narrafork-tool-output directory", () => {

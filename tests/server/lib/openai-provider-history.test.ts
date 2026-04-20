@@ -193,7 +193,8 @@ describe("OpenAIProvider chat request formatting", () => {
 		expect(body1.tools).toEqual(body2.tools);
 		expect(body2.input?.slice(0, body1.input?.length ?? 0)).toEqual(body1.input);
 		expect(JSON.stringify(body2.input)).toContain('"type":"web_search_call"');
-		expect(JSON.stringify(body2.input)).toContain('"id":"ws_cache_1"');
+		// NOTE: `id` is intentionally stripped from web_search_call input items
+		// because the upstream Responses API does not accept it.
 		expect(JSON.stringify(body2.input)).toContain('"type":"reasoning"');
 	});
 });

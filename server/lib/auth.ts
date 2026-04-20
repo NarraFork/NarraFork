@@ -6,7 +6,12 @@ import { AppError } from "./errors";
 import { generateId } from "./id";
 import { settings } from "./settings";
 
-const JWT_SECRET = settings.auth.jwtSecret;
+/** Read JWT secret lazily so it picks up the auto-generated value even when
+ *  the module is imported before settings finishes initialization. */
+function getJwtSecret(): string {
+	return settings.auth.jwtSecret;
+}
+
 const TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 // Mantine-friendly avatar color palette
@@ -38,11 +43,11 @@ export interface JwtPayload {
 
 export async function createToken(userId: string, role: string): Promise<string> {
 	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub: userId, role, iat: now, exp: now + TOKEN_EXPIRY_SECONDS }, JWT_SECRET);
+	return sign({ sub: userId, role, iat: now, exp: now + TOKEN_EXPIRY_SECONDS }, getJwtSecret());
 }
 
 export async function verifyToken(token: string): Promise<JwtPayload> {
-	return verify(token, JWT_SECRET, "HS256") as unknown as Promise<JwtPayload>;
+	return verify(token, getJwtSecret(), "HS256") as unknown as Promise<JwtPayload>;
 }
 
 export async function registerUser(username: string, password: string, language?: string) {
