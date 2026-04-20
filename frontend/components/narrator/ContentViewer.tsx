@@ -1,6 +1,7 @@
 import { ActionIcon, Box, Code, CopyButton, Group, Menu, Modal, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+	IconArrowBackUp,
 	IconArrowsMaximize,
 	IconArrowsMinimize,
 	IconCode,
@@ -11,7 +12,6 @@ import {
 	IconGitFork,
 	IconMarkdown,
 	IconMessageQuestion,
-	IconRefresh,
 	IconTextWrap,
 	IconTextWrapDisabled,
 	IconTrash,
@@ -604,7 +604,7 @@ export const ContentViewer = memo(
 											msgCtx.onAskInPassing ||
 											msgCtx.onCompactBeforeMessage ||
 											msgCtx.onDeleteBlock ||
-											msgCtx.onRegenerateFromMessage ||
+											msgCtx.onRollbackToBlock ||
 											msgCtx.onEditMessage ||
 											msgCtx.onJumpToSource) && <Menu.Divider />}
 										{msgCtx.onJumpToSource && (
@@ -629,15 +629,15 @@ export const ContentViewer = memo(
 												{tNarrator("contextMenu_edit")}
 											</Menu.Item>
 										)}
-										{msgCtx.onRegenerateFromMessage && (
+										{msgCtx.onRollbackToBlock && blockIndex != null && (
 											<Menu.Item
-												leftSection={<IconRefresh size={14} />}
+												leftSection={<IconArrowBackUp size={14} />}
 												onClick={() => {
-													msgCtx.onRegenerateFromMessage?.();
+													msgCtx.onRollbackToBlock?.(blockIndex);
 													swipe.closeSwipe();
 												}}
 											>
-												{tNarrator("contextMenu_regenerate")}
+												{tNarrator("contextMenu_rollback")}
 											</Menu.Item>
 										)}
 										{msgCtx.onForkFromMessage && (
@@ -834,7 +834,7 @@ export const ContentViewer = memo(
 							msgCtx.onAskInPassing ||
 							msgCtx.onCompactBeforeMessage ||
 							msgCtx.onDeleteBlock ||
-							msgCtx.onRegenerateFromMessage ||
+							msgCtx.onRollbackToBlock ||
 							msgCtx.onEditMessage ||
 							msgCtx.onJumpToSource) && <Menu.Divider />}
 						{msgCtx.onJumpToSource && (
@@ -850,12 +850,12 @@ export const ContentViewer = memo(
 								{tNarrator("contextMenu_edit")}
 							</Menu.Item>
 						)}
-						{msgCtx.onRegenerateFromMessage && (
+						{msgCtx.onRollbackToBlock && blockIndex != null && (
 							<Menu.Item
-								leftSection={<IconRefresh size={14} />}
-								onClick={msgCtx.onRegenerateFromMessage}
+								leftSection={<IconArrowBackUp size={14} />}
+								onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
 							>
-								{tNarrator("contextMenu_regenerate")}
+								{tNarrator("contextMenu_rollback")}
 							</Menu.Item>
 						)}
 						{msgCtx.onForkFromMessage && (

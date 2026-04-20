@@ -97,6 +97,8 @@ const SUMMARY_RETRY_MAX_MS = 15_000;
 
 /** Timestamp of the last `summary_model_unavailable` broadcast. */
 let lastSummaryUnavailableBroadcast = 0;
+/** Timestamp of the last `summary_model_error` broadcast. */
+let lastSummaryErrorBroadcast = 0;
 const SUMMARY_UNAVAILABLE_DEBOUNCE_MS = 30_000;
 
 /**
@@ -115,7 +117,7 @@ function isSummaryProviderError(err: unknown): boolean {
  * Broadcast a `summary_model_unavailable` event to all WS clients (debounced).
  * Lazy-imports narrator-ws to avoid circular dependency.
  */
-async function broadcastSummaryUnavailable(): Promise<void> {
+async function broadcastSummaryUnavailable(error?: string): Promise<void> {
 	const now = Date.now();
 	if (now - lastSummaryUnavailableBroadcast < SUMMARY_UNAVAILABLE_DEBOUNCE_MS) return;
 	lastSummaryUnavailableBroadcast = now;
@@ -124,6 +126,27 @@ async function broadcastSummaryUnavailable(): Promise<void> {
 		broadcastToAll({
 			type: "summary_model_unavailable",
 			model: settings.agent.summaryModel,
+			error: error ?? "Provider not available",
+		});
+	} catch {
+		// WS module not loaded yet — ignore
+	}
+}
+
+/**
+ * Broadcast a `summary_model_error` event to all WS clients (debounced).
+ * Used for non-provider errors (API failures, auth errors, etc.) after retries are exhausted.
+ */
+async function broadcastSummaryError(error: string): Promise<void> {
+	const now = Date.now();
+	if (now - lastSummaryErrorBroadcast < SUMMARY_UNAVAILABLE_DEBOUNCE_MS) return;
+	lastSummaryErrorBroadcast = now;
+	try {
+		const { broadcastToAll } = await import("../../websocket/narrator-ws");
+		broadcastToAll({
+			type: "summary_model_error",
+			model: settings.agent.summaryModel,
+			error,
 		});
 	} catch {
 		// WS module not loaded yet — ignore
@@ -142,12 +165,13 @@ async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
 			return await fn();
 		} catch (err) {
 			lastErr = err;
+			const errMsg = err instanceof Error ? err.message : String(err);
 			if (isSummaryProviderError(err)) {
 				logger.warn("Summary model unavailable, broadcasting to clients", {
 					model: settings.agent.summaryModel,
-					error: String(err),
+					error: errMsg,
 				});
-				broadcastSummaryUnavailable();
+				broadcastSummaryUnavailable(errMsg);
 				throw err;
 			}
 			if (attempt < SUMMARY_MAX_TRANSIENT_RETRIES && isRetryableError(err)) {
@@ -157,14 +181,21 @@ async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
 					attempt: attempt + 1,
 					maxRetries: SUMMARY_MAX_TRANSIENT_RETRIES,
 					delayMs,
-					error: String(err),
+					error: errMsg,
 				});
 				await new Promise((r) => setTimeout(r, delayMs));
 				continue;
 			}
+			// Non-provider, non-retryable (or retries exhausted) — broadcast error
+			logger.warn("Summary model error, broadcasting to clients", {
+				model: settings.agent.summaryModel,
+				error: errMsg,
+			});
+			broadcastSummaryError(errMsg);
 			throw err;
 		}
 	}
+	/* istanbul ignore next — unreachable: every iteration ends with return/throw/continue */
 	throw lastErr;
 }
 

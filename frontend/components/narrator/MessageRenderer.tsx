@@ -196,7 +196,7 @@ export function renderTreeMessages(
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
-	onRegenerateFromMessage?: (messageId: string) => void,
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void,
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
 	lastUserMessageId?: string,
 	hasChapter?: boolean,
@@ -270,7 +270,7 @@ export function renderTreeMessages(
 					onQuestionDeny={permCb.onQuestionDeny}
 					onCompactBeforeMessage={onCompactBeforeMessage}
 					onDeleteBlock={onDeleteBlock}
-					onRegenerateFromMessage={onRegenerateFromMessage}
+					onRollbackToBlock={onRollbackToBlock}
 					onEditAndRegenerate={onEditAndRegenerate}
 					isLastUserMessage={targetMsg.id === lastUserMessageId}
 					hasChapter={hasChapter}

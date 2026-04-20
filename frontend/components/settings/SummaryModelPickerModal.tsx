@@ -1,4 +1,4 @@
-import { Button, Group, Modal, Select, Stack, Text } from "@mantine/core";
+import { Button, Code, Group, Modal, Select, Stack, Text } from "@mantine/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -6,10 +6,12 @@ import { useAllModels } from "../../hooks/useModels";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 
+type ErrorKind = "unavailable" | "error";
+
 /**
  * Global modal that opens when the backend broadcasts a
- * `summary_model_unavailable` WebSocket event, prompting the user
- * to pick a new summary model.
+ * `summary_model_unavailable` or `summary_model_error` WebSocket event,
+ * prompting the user to pick a new summary model.
  *
  * Also checks `summaryModelAvailable` from the settings API on mount
  * so the modal appears even without a WS trigger (e.g. after page reload).
@@ -21,6 +23,8 @@ export function SummaryModelPickerModal() {
 	const { data: prefs } = useUserPreferences();
 	const [opened, setOpened] = useState(false);
 	const [unavailableModel, setUnavailableModel] = useState("");
+	const [errorMessage, setErrorMessage] = useState("");
+	const [errorKind, setErrorKind] = useState<ErrorKind>("unavailable");
 	const [selected, setSelected] = useState<string | null>(null);
 	const dismissedRef = useRef(false);
 
@@ -45,23 +49,44 @@ export function SummaryModelPickerModal() {
 			!wizardIncomplete
 		) {
 			setUnavailableModel(settingsData.agent.summaryModel);
+			setErrorMessage("");
+			setErrorKind("unavailable");
 			setOpened(true);
 		}
 	}, [settingsData, wizardIncomplete]);
 
-	// Listen for WS-triggered DOM event
+	// Listen for WS-triggered DOM events
 	useEffect(() => {
-		const handler = (e: Event) => {
+		const handleUnavailable = (e: Event) => {
 			if (wizardIncomplete) return;
-			const model = (e as CustomEvent).detail?.model as string | undefined;
+			const detail = (e as CustomEvent).detail;
+			const model = detail?.model as string | undefined;
 			if (model) {
 				dismissedRef.current = false;
 				setUnavailableModel(model);
+				setErrorMessage(detail?.error ?? "");
+				setErrorKind("unavailable");
 				setOpened(true);
 			}
 		};
-		window.addEventListener("narrafork:summary-model-unavailable", handler);
-		return () => window.removeEventListener("narrafork:summary-model-unavailable", handler);
+		const handleError = (e: Event) => {
+			if (wizardIncomplete) return;
+			const detail = (e as CustomEvent).detail;
+			const model = detail?.model as string | undefined;
+			if (model) {
+				dismissedRef.current = false;
+				setUnavailableModel(model);
+				setErrorMessage(detail?.error ?? "");
+				setErrorKind("error");
+				setOpened(true);
+			}
+		};
+		window.addEventListener("narrafork:summary-model-unavailable", handleUnavailable);
+		window.addEventListener("narrafork:summary-model-error", handleError);
+		return () => {
+			window.removeEventListener("narrafork:summary-model-unavailable", handleUnavailable);
+			window.removeEventListener("narrafork:summary-model-error", handleError);
+		};
 	}, [wizardIncomplete]);
 
 	const save = useMutation({
@@ -79,6 +104,9 @@ export function SummaryModelPickerModal() {
 		}
 	}, [selected, save]);
 
+	const title =
+		errorKind === "unavailable" ? t("summaryModelUnavailableTitle") : t("summaryModelErrorTitle");
+
 	return (
 		<Modal
 			opened={opened}
@@ -86,14 +114,27 @@ export function SummaryModelPickerModal() {
 				dismissedRef.current = true;
 				setOpened(false);
 			}}
-			title={t("summaryModelUnavailableTitle")}
+			title={title}
 			centered
 			size="md"
 		>
 			<Stack gap="md">
-				<Text size="sm" c="dimmed">
-					{t("summaryModelUnavailableDesc", { model: unavailableModel })}
-				</Text>
+				<Stack gap="xs">
+					<Text size="sm" c="dimmed">
+						{errorKind === "unavailable"
+							? t("summaryModelUnavailableDesc")
+							: t("summaryModelErrorDescIntro")}
+					</Text>
+					<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+						{unavailableModel}
+						{errorMessage ? `\n${errorMessage}` : ""}
+					</Code>
+					{errorKind === "unavailable" && (
+						<Text size="sm" c="dimmed">
+							{t("summaryModelUnavailableHint")}
+						</Text>
+					)}
+				</Stack>
 				<Select
 					label={t("summaryModel")}
 					data={groupedModels}

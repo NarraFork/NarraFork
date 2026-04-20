@@ -4923,16 +4923,15 @@ export async function continueNarrator(
 }
 
 /**
- * Regenerate from a specific message.
- * - If the target is a user message: delete everything after it, re-run agent loop with its text.
- * - If the target is an assistant message: find the preceding user message,
- *   delete the assistant message and everything after it, re-run agent loop.
+ * Rollback to a specific block within a message.
+ * Deletes all blocks after the given blockIndex in the target message,
+ * plus all subsequent messages. Does NOT re-run the agent loop.
+ * File changes are automatically reverted via snapshot system.
  */
-export async function regenerateFromMessage(
+export async function rollbackToBlock(
 	narratorId: string,
 	messageId: string,
-	locale: Locale = "en",
-	replyInUserLanguage = false,
+	blockIndex: number,
 ): Promise<{ ok: boolean }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
@@ -4947,85 +4946,48 @@ export async function regenerateFromMessage(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 
-	let userMsg: typeof targetMsg;
+	const blocks = Array.isArray(targetMsg.contentJson)
+		? (targetMsg.contentJson as { type: string; id?: string }[])
+		: [];
 
-	if (targetMsg.role === "user") {
-		// Delete everything after this user message, then re-run
-		userMsg = targetMsg;
-		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
-		if (deletedMessageIds.length > 0) {
-			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
-				narratorId,
-				deletedMessageIds,
-			});
-		}
-	} else {
-		// Find the user message before this assistant message
-		const prevUserRef = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					isNull(narratorMessages.parentToolUseId),
-					eq(narratorMessages.role, "user"),
-					sql`${narratorMessageRefs.seq} < ${targetRef.seq}`,
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
-
-		if (!prevUserRef.length) {
-			throw new NotFoundError("No preceding user message found", messageId);
-		}
-
-		const prevUser = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, prevUserRef[0].messageId),
-		});
-		if (!prevUser) throw new NotFoundError("User message", prevUserRef[0].messageId);
-
-		userMsg = prevUser;
-
-		// Delete the target assistant message and everything after it
-		const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
-			narratorId,
-			prevUser.id,
+	if (blockIndex < 0 || blockIndex >= blocks.length) {
+		throw new NotFoundError(
+			`Block index ${blockIndex} out of range (0..${blocks.length - 1})`,
+			messageId,
 		);
-		if (deletedMessageIds.length > 0) {
+	}
+
+	// Step 1: Delete all messages after the target message (includes file revert)
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+	if (deletedMessageIds.length > 0) {
+		broadcastToNarrator(narratorId, {
+			type: "messages_deleted",
+			narratorId,
+			deletedMessageIds,
+		});
+	}
+
+	// Step 2: Delete blocks after blockIndex in the target message
+	const blocksToDelete: Array<{ messageId: string; blockIndex: number }> = [];
+	for (let i = blocks.length - 1; i > blockIndex; i--) {
+		blocksToDelete.push({ messageId, blockIndex: i });
+	}
+
+	if (blocksToDelete.length > 0) {
+		await narratorService.deleteMessageBlocks(narratorId, blocksToDelete);
+
+		// Broadcast the updated message
+		const updatedMsg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+		});
+		if (updatedMsg) {
 			broadcastToNarrator(narratorId, {
-				type: "messages_deleted",
+				type: "message_updated",
 				narratorId,
-				deletedMessageIds,
+				message: updatedMsg,
 			});
 		}
 	}
-
-	const prompt = userMsg.contentText ?? "";
-	if (!prompt.trim()) {
-		throw new NotFoundError("User message has no text", narratorId);
-	}
-
-	const imageRefs = extractImageRefs(userMsg.contentJson);
-
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	active._lastTokenUsage = undefined;
-	active._ttftMs = undefined;
-	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
-
-	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
-		logger.error("runAgentLoop unhandled error (regenerate)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "error", String(err));
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
-	});
 
 	return { ok: true };
 }

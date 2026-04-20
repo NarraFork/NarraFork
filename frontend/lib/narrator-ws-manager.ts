@@ -503,7 +503,15 @@ class NarratorWSManager {
 				if (data.type === "summary_model_unavailable") {
 					window.dispatchEvent(
 						new CustomEvent("narrafork:summary-model-unavailable", {
-							detail: { model: data.model },
+							detail: { model: data.model, error: data.error },
+						}),
+					);
+					return;
+				}
+				if (data.type === "summary_model_error") {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:summary-model-error", {
+							detail: { model: data.model, error: data.error },
 						}),
 					);
 					return;

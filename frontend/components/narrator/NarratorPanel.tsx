@@ -1171,13 +1171,13 @@ export function NarratorPanel({
 		[qc, messagesQueryKey, narratorId, t],
 	);
 
-	const handleRegenerate = useCallback(
-		async (messageId: string) => {
+	const handleRollback = useCallback(
+		async (messageId: string, blockIndex: number) => {
 			try {
-				await api.regenerateFromMessage(narratorId, messageId);
+				await api.rollbackToBlock(narratorId, messageId, blockIndex);
 			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to regenerate";
-				notifications.show({ title: t("regenerateFailed"), message, color: "red" });
+				const message = err instanceof Error ? err.message : "Failed to rollback";
+				notifications.show({ title: t("rollbackFailed"), message, color: "red" });
 			}
 		},
 		[narratorId, t],
@@ -2514,7 +2514,7 @@ export function NarratorPanel({
 					pruneDividerLabel,
 					handleCompactBefore,
 					handleDeleteBlock,
-					handleRegenerate,
+					handleRollback,
 					handleEditAndRegenerate,
 					lastUserMessageId,
 					hasChapter,
@@ -2645,7 +2645,7 @@ export function NarratorPanel({
 		getStableRenderElementKey,
 		handleDeleteBlock,
 		handleCompactBefore,
-		handleRegenerate,
+		handleRollback,
 		handleEditAndRegenerate,
 		pruneBoundaryMessageId,
 		pruneDividerLabel,

@@ -136,7 +136,7 @@ interface MessageBubbleProps {
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
-	onRegenerateFromMessage?: (messageId: string) => void;
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
 	/** Whether this is the last user message in the conversation */
 	isLastUserMessage?: boolean;
@@ -1921,7 +1921,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onQuestionDeny,
 	onCompactBeforeMessage,
 	onDeleteBlock,
-	onRegenerateFromMessage,
+	onRollbackToBlock,
 	onEditAndRegenerate,
 	isLastUserMessage,
 	hasChapter,
@@ -2062,8 +2062,8 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onDeleteBlock) {
 			actions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
-		if (msgId && onRegenerateFromMessage) {
-			actions.onRegenerateFromMessage = () => onRegenerateFromMessage(msgId);
+		if (msgId && onRollbackToBlock) {
+			actions.onRollbackToBlock = (blockIndex: number) => onRollbackToBlock(msgId, blockIndex);
 		}
 		if (isUser && msgId && onEditAndRegenerate) {
 			actions.onEditMessage = startEditing;
@@ -2080,7 +2080,7 @@ export const MessageBubble = memo(function MessageBubble({
 		onAskInPassing,
 		onCompactBeforeMessage,
 		onDeleteBlock,
-		onRegenerateFromMessage,
+		onRollbackToBlock,
 		onEditAndRegenerate,
 		startEditing,
 	]);

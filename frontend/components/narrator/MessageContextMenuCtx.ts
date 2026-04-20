@@ -7,7 +7,7 @@ export interface MessageContextMenuActions {
 	onAskInPassing?: () => void;
 	onCompactBeforeMessage?: () => void;
 	onDeleteBlock?: (blockIndex: number) => void;
-	onRegenerateFromMessage?: () => void;
+	onRollbackToBlock?: (blockIndex: number) => void;
 	onEditMessage?: () => void;
 	onJumpToSource?: () => void;
 	onRetryCompact?: () => void;

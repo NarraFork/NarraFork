@@ -938,9 +938,10 @@ export const api = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	continueNarrator: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/continue`, { method: "POST" }),
-	regenerateFromMessage: (narratorId: string, messageId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/regenerate/${messageId}`, {
+	rollbackToBlock: (narratorId: string, messageId: string, blockIndex: number) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/rollback/${messageId}`, {
 			method: "POST",
+			body: JSON.stringify({ blockIndex }),
 		}),
 	editAndRegenerate: (narratorId: string, messageId: string, content: string, rollback: boolean) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
