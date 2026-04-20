@@ -72,8 +72,7 @@ export function TerminalGrid({
 				const terminalId = panelTerminalIds[idx];
 				return (
 					<Box
-						// biome-ignore lint/suspicious/noArrayIndexKey: panels are fixed layout slots, order never changes
-						key={`${effectiveLayout}-${idx}`}
+						key={`${effectiveLayout}-${terminalId ?? `empty-${idx}`}`}
 						style={{
 							gridArea: panel.gridArea,
 							minHeight: 0,

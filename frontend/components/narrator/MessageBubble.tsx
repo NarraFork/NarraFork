@@ -464,7 +464,7 @@ function TextFileBlock({ block }: { block: any }) {
 	);
 }
 
-const ReasoningBlock = memo(
+export const ReasoningBlock = memo(
 	function ReasoningBlock({
 		block,
 		streaming,

@@ -44,6 +44,7 @@ import { ReviewEdge } from "./ReviewEdge";
 import { ReviewNode } from "./ReviewNode";
 import type { TerminalBubble } from "./SelectionToolbar";
 import { SelectionToolbar } from "./SelectionToolbar";
+import { TerminalContextMenu } from "./TerminalContextMenu";
 import { TerminalEdge } from "./TerminalEdge";
 import { TerminalNode } from "./TerminalNode";
 
@@ -74,6 +75,14 @@ interface ContextMenuState {
 		worktreePath?: string | null;
 		reviewStatus?: string | null;
 	};
+}
+
+interface TerminalContextMenuState {
+	x: number;
+	y: number;
+	nodeId: string;
+	terminalId: string;
+	terminalName: string;
 }
 
 const PAN_SPEED = 1.5;
@@ -225,6 +234,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const { removeTab } = useRecentTabs();
 
 	const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+	const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(
+		null,
+	);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
 	const [computedEdges, setComputedEdges] = useState<Edge[]>([]);
@@ -922,8 +934,22 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const onNodeContextMenu: NodeMouseHandler = useCallback((event, node) => {
 		if (node.type === "draftNode") return;
 		event.preventDefault();
+		if (node.type === "terminalNode") {
+			// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
+			const d = node.data as any;
+			setContextMenu(null);
+			setTerminalContextMenu({
+				x: event.clientX,
+				y: event.clientY,
+				nodeId: node.id,
+				terminalId: d.terminalId ?? "",
+				terminalName: d.terminalName ?? "",
+			});
+			return;
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: graph node data is dynamic
 		const d = node.data as any;
+		setTerminalContextMenu(null);
 		setContextMenu({
 			x: event.clientX,
 			y: event.clientY,
@@ -954,6 +980,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const onPaneClick = useCallback(() => {
 		setContextMenu(null);
+		setTerminalContextMenu(null);
 		// Clear lasso selection when clicking blank canvas
 		setNodes((nds) => {
 			if (nds.every((n) => !n.selected)) return nds;
@@ -1552,6 +1579,37 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[nodes],
 	);
 
+	const handleTerminalRename = useCallback((nodeId: string) => {
+		setTerminalContextMenu(null);
+		// Trigger inline edit mode on the TerminalNode by bumping requestEdit
+		setNodes((nds) =>
+			nds.map((n) => {
+				if (n.id !== nodeId || n.type !== "terminalNode") return n;
+				const prev = (n.data as { requestEdit?: number }).requestEdit ?? 0;
+				return { ...n, data: { ...n.data, requestEdit: prev + 1 } };
+			}),
+		);
+	}, []);
+
+	const handleTerminalMinimize = useCallback(
+		(nodeId: string) => {
+			setTerminalContextMenu(null);
+			minimizeTerminalNode(nodeId);
+		},
+		[minimizeTerminalNode],
+	);
+
+	const handleTerminalClose = useCallback(
+		(nodeId: string) => {
+			setTerminalContextMenu(null);
+			const node = nodesRef.current.find((n) => n.id === nodeId);
+			if (!node || node.type !== "terminalNode") return;
+			const d = node.data as { terminalId?: string };
+			closeTerminalNode(nodeId, d.terminalId ?? "");
+		},
+		[closeTerminalNode],
+	);
+
 	const confirmDelete = useCallback(() => {
 		if (!deleteTarget) return;
 		deleteChapter.mutate(deleteTarget.id, {
@@ -1681,6 +1739,18 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						onConvertToSubagent={handleConvertToSubagent}
 						onPromoteReview={handlePromoteReview}
 						onDismissReview={handleDismissReview}
+					/>
+				)}
+				{terminalContextMenu && (
+					<TerminalContextMenu
+						x={terminalContextMenu.x}
+						y={terminalContextMenu.y}
+						nodeId={terminalContextMenu.nodeId}
+						terminalName={terminalContextMenu.terminalName}
+						onClose={() => setTerminalContextMenu(null)}
+						onRename={handleTerminalRename}
+						onMinimize={handleTerminalMinimize}
+						onCloseTerminal={handleTerminalClose}
 					/>
 				)}
 			</Box>

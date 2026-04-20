@@ -69,6 +69,11 @@
 		"cancel": "Cancel",
 		"confirmClose": "Close"
 	},
+	"terminalContextMenu": {
+		"rename": "Rename",
+		"minimize": "Minimize",
+		"close": "Close Terminal"
+	},
 	"sidePanel": {
 		"upstreamUpdates": "Upstream updates",
 		"recentCommits": "Recent Commits",

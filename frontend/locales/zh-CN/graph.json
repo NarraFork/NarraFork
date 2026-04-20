@@ -69,6 +69,11 @@
 		"cancel": "取消",
 		"confirmClose": "关闭"
 	},
+	"terminalContextMenu": {
+		"rename": "重命名",
+		"minimize": "最小化",
+		"close": "关闭终端"
+	},
 	"sidePanel": {
 		"upstreamUpdates": "上游有更新",
 		"recentCommits": "最近提交",

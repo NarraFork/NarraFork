@@ -95,23 +95,14 @@ const READONLY_TOOLS = new Set([
  * to avoid circular imports with narrator-session.ts.
  */
 
-/** Tools excluded from general subagents (no nesting, no plan mode, no forking) */
-const GENERAL_EXCLUDED = new Set([
-	"Agent",
-	"ContinueTask",
-	"TaskOutput",
-	"TaskStop",
-	"EnterPlanMode",
-	"ExitPlanMode",
-	"TaskCreate",
-	"ForkNarrator",
-]);
+/** Tools available to general subagents (READONLY_TOOLS + interactive tools, no nesting/plan/forking) */
+const GENERAL_TOOLS = new Set([...READONLY_TOOLS, "AskUserQuestion", "Skill"]);
 
 /** Tool filter factories per built-in subagent type */
 const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
 	explore: (tool) => READONLY_TOOLS.has(tool.name),
 	plan: (tool) => READONLY_TOOLS.has(tool.name),
-	general: (tool) => !GENERAL_EXCLUDED.has(tool.name),
+	general: (tool) => GENERAL_TOOLS.has(tool.name),
 };
 
 /**

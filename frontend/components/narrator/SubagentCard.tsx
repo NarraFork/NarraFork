@@ -32,6 +32,7 @@ import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
+import { ReasoningBlock } from "./MessageBubble";
 import {
 	type MessageContextMenuActions,
 	MessageContextMenuCtx,
@@ -242,6 +243,22 @@ export const SubagentCard = memo(
 				childToolCalls.push({ tc, toolUseId: tc.toolUseId ?? null, msgId: cm.id, childMsg: cm });
 			}
 		}
+
+		// Collect reasoning/thinking blocks from child messages for display
+		const childReasoningBlocks = useMemo(() => {
+			const blocks: { block: ContentBlock; msgId: string; blockIndex: number }[] = [];
+			for (const cm of childMessages) {
+				if (cm.role !== "assistant") continue;
+				const content = Array.isArray(cm.contentJson) ? cm.contentJson : [];
+				for (let bi = 0; bi < content.length; bi++) {
+					const b = content[bi];
+					if (b.type === "reasoning" || b.type === "thinking") {
+						blocks.push({ block: b, msgId: cm.id, blockIndex: bi });
+					}
+				}
+			}
+			return blocks;
+		}, [childMessages]);
 
 		const totalMs = toolCall.durationMs ?? 0;
 
@@ -572,6 +589,19 @@ export const SubagentCard = memo(
 												/>
 											</Box>
 										</LazyCollapse>
+									</Box>
+								)}
+								{/* Reasoning/thinking blocks from child messages */}
+								{childReasoningBlocks.length > 0 && (
+									<Box px="xs" pb={4}>
+										{childReasoningBlocks.map((rb) => (
+											<ReasoningBlock
+												key={`${rb.msgId}-${rb.blockIndex}`}
+												block={rb.block}
+												narratorId={subagentNarratorId ?? narratorId}
+												blockIndex={rb.blockIndex}
+											/>
+										))}
 									</Box>
 								)}
 								{/* Child tool calls — in the middle */}

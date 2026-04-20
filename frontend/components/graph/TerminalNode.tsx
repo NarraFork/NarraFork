@@ -11,7 +11,7 @@ import {
 } from "@mantine/core";
 import { IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { TerminalPanel } from "../terminal/TerminalPanel";
@@ -23,6 +23,8 @@ export interface TerminalNodeData {
 	onMinimize?: (nodeId: string) => void;
 	onClose?: (nodeId: string, terminalId: string) => void;
 	onRename?: (terminalId: string, name: string) => void;
+	/** When set to a truthy value, the node enters inline-edit mode automatically. */
+	requestEdit?: number;
 	[key: string]: unknown;
 }
 
@@ -87,6 +89,15 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 		setEditing(false);
 		setEditValue(d.terminalName);
 	}, [d.terminalName]);
+
+	// Trigger inline edit when requestEdit changes (from context menu rename)
+	const lastRequestEdit = useRef(d.requestEdit);
+	useEffect(() => {
+		if (d.requestEdit && d.requestEdit !== lastRequestEdit.current) {
+			startEditing();
+		}
+		lastRequestEdit.current = d.requestEdit;
+	}, [d.requestEdit, startEditing]);
 
 	// Allow Ctrl+wheel to pass through to ReactFlow for zoom
 	// (handled by NowheelPassthrough in NarraFlow — no per-node listener needed)
@@ -279,6 +290,7 @@ function areTerminalNodePropsEqual(prev: NodeProps, next: NodeProps) {
 		prev.id === next.id &&
 		prevData.terminalId === nextData.terminalId &&
 		prevData.terminalName === nextData.terminalName &&
+		prevData.requestEdit === nextData.requestEdit &&
 		prevData.onMinimize === nextData.onMinimize &&
 		prevData.onClose === nextData.onClose &&
 		prevData.onRename === nextData.onRename

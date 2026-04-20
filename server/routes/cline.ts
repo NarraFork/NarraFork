@@ -633,7 +633,10 @@ clineRoutes.get("/balance", async (c) => {
 	try {
 		const balance = await fetchBalance();
 		if (!balance) {
-			return c.json({ error: "Not authenticated or balance unavailable" }, 401);
+			// Use 422 instead of 401 — this is a Cline auth issue, not a NarraFork auth issue.
+			// Returning 401 causes the frontend global handler to clear the NarraFork JWT token
+			// and redirect to the login page.
+			return c.json({ error: "Not authenticated or balance unavailable" }, 422);
 		}
 		return c.json(balance);
 	} catch (err) {
