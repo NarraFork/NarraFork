@@ -159,16 +159,26 @@ async function request<T>(
 		headers.Authorization = `Bearer ${token}`;
 	}
 	const response = await fetch(`${BASE}${path}`, { ...options, headers });
+	const text = await response.text();
+	const tryParseJson = (raw: string) => {
+		try {
+			return JSON.parse(raw);
+		} catch {
+			return null;
+		}
+	};
 	if (response.status === 401) {
 		clearToken();
-		const error = await response.json().catch(() => ({ error: "Unauthorized" }));
+		const error = tryParseJson(text) ?? { error: text || "Unauthorized" };
 		throw new ApiError(error.error ?? "Unauthorized", 401, error);
 	}
 	if (!response.ok) {
-		const error = await response.json().catch(() => ({ error: response.statusText }));
+		const error = tryParseJson(text) ?? { error: text || response.statusText };
 		throw new ApiError(error.error ?? "Request failed", response.status, error);
 	}
-	return response.json();
+	const parsed = tryParseJson(text);
+	if (parsed !== null) return parsed as T;
+	throw new ApiError(text || "Invalid response", response.status, { error: text });
 }
 
 // --- Codex shared types ---
