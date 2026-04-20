@@ -568,20 +568,28 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const edgeEnd = cam.edge === "end";
 			const shaOffset = edgeEnd ? trackH - fontSize - 4 : 4;
 			const shaCrossSize = isH ? 0 : fontSize + 2;
-			// edge="start": SHA at top (near screen edge), message below SHA, ticks at bottom
-			// edge="end":   SHA at bottom (near screen edge), message near top (after ticks), ticks at top
+			// Horizontal:
+			//   edge="start": SHA at top (near screen edge), message below SHA, ticks at bottom
+			//   edge="end":   SHA at bottom (near screen edge), message near top (after ticks), ticks at top
+			// Vertical:
+			//   edge="start": SHA at left (near screen edge), message at same X, stacked below SHA in main-axis
+			//   edge="end":   SHA at right (near screen edge), message after ticks (left side)
 			const msgCrossOffset = isH
 				? edgeEnd
-					? isExpanded ? 22 : 20
+					? isExpanded
+						? 22
+						: 20
 					: isExpanded
 						? 18
 						: 16
-				: shaOffset;
+				: edgeEnd
+					? isExpanded
+						? 22
+						: 20
+					: shaOffset;
 
 			// Available space for commit message (cross-axis)
-			const msgAvailH = edgeEnd
-				? shaOffset - msgCrossOffset - 2
-				: trackH - msgCrossOffset - 4;
+			const msgAvailH = edgeEnd ? shaOffset - msgCrossOffset - 2 : trackH - msgCrossOffset - 4;
 			const msgLineH = 13;
 
 			// Label width grows with zoom. slotWidth = stride * COLLAPSED_GAP * scale.
@@ -590,17 +598,23 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 
 			// --- Pre-compute message layout (constant across all ticks in this frame) ---
 			const msgAvailMain = labelWidth;
-			const msgAvailVert = Math.max(0, slot - shaCrossSize - 8);
+			// Vertical mode: when edge="end", msg is in a separate column from SHA,
+			// so it gets the full slot height (no shaCrossSize deduction).
+			const msgAvailVert =
+				edgeEnd && !isH ? Math.max(0, slot - 8) : Math.max(0, slot - shaCrossSize - 8);
 			const showMsg = isH
 				? (showMessages || isExpanded) && msgAvailH > msgLineH * 0.5 && msgAvailMain > 40
 				: msgAvailVert > msgLineH * 0.8;
 
-			const msgWrapWidth = isH ? msgAvailMain : labelAvailCross;
+			// Vertical mode: when edge="end", msg column width is limited to the
+			// space between the tick area and the SHA column.
+			const msgCrossAvail = !isH && edgeEnd ? shaOffset - msgCrossOffset - 2 : labelAvailCross;
+			const msgWrapWidth = isH ? msgAvailMain : msgCrossAvail;
 			const maxMsgLines = isH
 				? Math.max(1, Math.floor(msgAvailH / msgLineH))
 				: Math.max(1, Math.floor(msgAvailVert / msgLineH));
 			const mainCharsPerLine = Math.max(4, Math.floor(msgAvailMain / 6));
-			const crossCharsPerLine = Math.max(4, Math.floor(labelAvailCross / 6));
+			const crossCharsPerLine = Math.max(4, Math.floor(msgCrossAvail / 6));
 			const maxChars = isH ? mainCharsPerLine * maxMsgLines : crossCharsPerLine * maxMsgLines;
 
 			if (showMsg) {
@@ -659,7 +673,12 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 							msgLabel.position.set(screenX + 4, msgCrossOffset);
 						} else {
 							msgLabel.scale.set(1, squeeze);
-							msgLabel.position.set(msgCrossOffset, screenX + shaCrossSize + 4);
+							// edge="end" vertical: msg is in a separate column from SHA,
+							// so it starts at the tick's Y position without shaCrossSize offset.
+							// edge="start" vertical: msg shares the same column as SHA,
+							// so it starts below SHA with shaCrossSize offset.
+							const msgMainOffset = edgeEnd ? 4 : shaCrossSize + 4;
+							msgLabel.position.set(msgCrossOffset, screenX + msgMainOffset);
 						}
 					}
 				}

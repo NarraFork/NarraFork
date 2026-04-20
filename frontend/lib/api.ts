@@ -1086,6 +1086,18 @@ export const api = {
 			}>;
 			toolCallCount: number;
 		}>(`/narrators/${narratorId}/delete-preview?messageId=${encodeURIComponent(messageId)}`),
+	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
+		request<{
+			affectedFiles: Array<{
+				filePath: string;
+				willBeDeleted: boolean;
+			}>;
+			toolCallCount: number;
+			deletedBlockCount: number;
+			deletedMessageCount: number;
+		}>(
+			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
+		),
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
 			filePath: string;

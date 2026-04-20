@@ -104,6 +104,19 @@ export function useDeletePreview(narratorId: string, messageId: string | null, e
 	});
 }
 
+export function useRollbackPreview(
+	narratorId: string,
+	messageId: string | null,
+	blockIndex: number | null,
+	enabled = false,
+) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "rollback-preview", messageId, blockIndex],
+		queryFn: () => api.getRollbackPreview(narratorId, messageId as string, blockIndex as number),
+		enabled: enabled && !!messageId && blockIndex != null,
+	});
+}
+
 export function usePermissionFilePreview(
 	narratorId: string,
 	toolUseId: string | null,

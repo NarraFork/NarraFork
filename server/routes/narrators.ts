@@ -10,6 +10,7 @@ import {
 	eq,
 	gt,
 	gte,
+	inArray,
 	isNotNull,
 	isNull,
 	lt,
@@ -2076,6 +2077,135 @@ narratorRoutes.post("/:id/revert-file", async (c) => {
 			500,
 		);
 	}
+});
+
+/** Preview file changes that would be reverted by a rollback-to-block operation */
+narratorRoutes.get("/:id/rollback-preview", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.query("messageId");
+	const blockIndexStr = c.req.query("blockIndex");
+	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
+	if (!blockIndexStr) return c.json({ error: "blockIndex query param is required" }, 400);
+	const blockIndex = Number.parseInt(blockIndexStr, 10);
+	if (Number.isNaN(blockIndex) || blockIndex < 0) {
+		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
+	}
+
+	// Verify narrator exists
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { id: true },
+	});
+	if (!narrator) return c.json({ error: "Narrator not found" }, 404);
+
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+		columns: { seq: true },
+	});
+	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+		columns: { contentJson: true },
+	});
+	if (!targetMsg) return c.json({ error: "Message not found" }, 404);
+
+	const blocks = Array.isArray(targetMsg.contentJson)
+		? (targetMsg.contentJson as { type: string; id?: string }[])
+		: [];
+
+	// Collect tool_use IDs from blocks after blockIndex in the target message
+	const truncatedToolUseIds: string[] = [];
+	for (let i = blockIndex + 1; i < blocks.length; i++) {
+		const b = blocks[i];
+		if (b.type === "tool_use" && b.id) {
+			truncatedToolUseIds.push(b.id);
+		}
+	}
+
+	const deletedBlockCount = blocks.length - blockIndex - 1;
+
+	// Find tool calls from subsequent messages (seq > targetRef.seq)
+	const subsequentToolCalls = await db
+		.select({
+			toolUseId: narratorToolCalls.toolUseId,
+			toolName: narratorToolCalls.toolName,
+			inputJson: narratorToolCalls.inputJson,
+		})
+		.from(narratorToolCalls)
+		.innerJoin(
+			narratorMessageRefs,
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+			),
+		)
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.status, "success"),
+				gt(narratorMessageRefs.seq, targetRef.seq),
+			),
+		);
+
+	// Count subsequent messages
+	const subsequentMsgCount = await db
+		.select({ cnt: sql<number>`count(*)` })
+		.from(narratorMessageRefs)
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				gt(narratorMessageRefs.seq, targetRef.seq),
+			),
+		);
+	const deletedMessageCount = subsequentMsgCount[0]?.cnt ?? 0;
+
+	// Find tool calls from truncated blocks in the target message
+	const truncatedToolCalls =
+		truncatedToolUseIds.length > 0
+			? await db.query.narratorToolCalls.findMany({
+					where: and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.status, "success"),
+						inArray(narratorToolCalls.toolUseId, truncatedToolUseIds),
+					),
+					columns: { toolUseId: true, toolName: true, inputJson: true },
+				})
+			: [];
+
+	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
+	const affectedFilePaths = getAffectedFiles(allToolCalls);
+
+	if (affectedFilePaths.length === 0) {
+		return c.json({
+			affectedFiles: [],
+			toolCallCount: 0,
+			deletedBlockCount,
+			deletedMessageCount,
+		});
+	}
+
+	// Only compute willBeDeleted (skip expensive content rebuild for the modal)
+	const revertedStates = await rebuildFileStatesExcluding(
+		narratorId,
+		affectedFilePaths,
+		new Set(allToolCalls.map((tc) => tc.toolUseId)),
+	);
+
+	const affectedFiles = affectedFilePaths.map((filePath) => ({
+		filePath,
+		willBeDeleted: revertedStates.get(filePath) === null,
+	}));
+
+	return c.json({
+		affectedFiles,
+		toolCallCount: allToolCalls.length,
+		deletedBlockCount,
+		deletedMessageCount,
+	});
 });
 
 /** Preview file changes that would be reverted if a message is deleted */

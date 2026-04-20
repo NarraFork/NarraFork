@@ -15,6 +15,7 @@ import {
 	Badge,
 	Box,
 	Button,
+	Center,
 	CloseButton,
 	Group,
 	Image,
@@ -97,6 +98,7 @@ import {
 	useNarrator,
 	useNarratorMessages,
 	usePromoteNarrator,
+	useRollbackPreview,
 	useStartAskInPassing,
 	useUpdateBlacklistDir,
 	useUpdateCmdBlacklist,
@@ -123,6 +125,7 @@ import {
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
+import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BlurInOnAppearProvider } from "./BlurInOnAppear";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
@@ -935,6 +938,97 @@ function SortableQueuedMessageItem({
 	);
 }
 
+/** Confirmation modal for rollback-to-block with file revert preview */
+function RollbackConfirmModal({
+	narratorId,
+	pendingRollback,
+	onConfirm,
+	onCancel,
+}: {
+	narratorId: string;
+	pendingRollback: { messageId: string; blockIndex: number } | null;
+	onConfirm: () => void;
+	onCancel: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const { data, isLoading } = useRollbackPreview(
+		narratorId,
+		pendingRollback?.messageId ?? null,
+		pendingRollback?.blockIndex ?? null,
+		!!pendingRollback,
+	);
+
+	const blockCount = data?.deletedBlockCount ?? 0;
+	const messageCount = data?.deletedMessageCount ?? 0;
+	const affectedFiles = data?.affectedFiles ?? [];
+
+	let description: string;
+	if (blockCount > 0 && messageCount > 0) {
+		description = t("rollbackConfirmDesc", { blockCount, messageCount });
+	} else if (blockCount > 0) {
+		description = t("rollbackConfirmDescBlocksOnly", { blockCount });
+	} else {
+		description = t("rollbackConfirmDescMessagesOnly", { messageCount });
+	}
+
+	return (
+		<Modal
+			opened={!!pendingRollback}
+			onClose={onCancel}
+			title={t("rollbackConfirmTitle")}
+			centered
+			size="sm"
+		>
+			<Stack gap="md">
+				{isLoading ? (
+					<Center py="md">
+						<Loader size="sm" />
+					</Center>
+				) : (
+					<>
+						<Text size="sm">{description}</Text>
+						{affectedFiles.length > 0 ? (
+							<>
+								<Text size="sm" fw={500}>
+									{t("rollbackConfirmFiles")}
+								</Text>
+								<Stack gap={4}>
+									{affectedFiles.map((file) => (
+										<Group key={file.filePath} gap="xs" wrap="nowrap">
+											<TruncatedPath path={file.filePath} />
+											<Badge
+												size="xs"
+												variant="light"
+												color={file.willBeDeleted ? "red" : "orange"}
+											>
+												{file.willBeDeleted
+													? t("fileMod_willBeDeleted")
+													: t("fileMod_willBeReverted")}
+											</Badge>
+										</Group>
+									))}
+								</Stack>
+							</>
+						) : (
+							<Text size="sm" c="dimmed">
+								{t("rollbackConfirmNoFiles")}
+							</Text>
+						)}
+					</>
+				)}
+				<Group gap="xs" justify="flex-end">
+					<Button size="xs" variant="subtle" onClick={onCancel}>
+						{t("cancel")}
+					</Button>
+					<Button size="xs" color="red" onClick={onConfirm} loading={isLoading}>
+						{t("rollbackConfirm")}
+					</Button>
+				</Group>
+			</Stack>
+		</Modal>
+	);
+}
+
 export function NarratorPanel({
 	narratorId,
 	narrator: narratorProp,
@@ -1171,17 +1265,25 @@ export function NarratorPanel({
 		[qc, messagesQueryKey, narratorId, t],
 	);
 
-	const handleRollback = useCallback(
-		async (messageId: string, blockIndex: number) => {
-			try {
-				await api.rollbackToBlock(narratorId, messageId, blockIndex);
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to rollback";
-				notifications.show({ title: t("rollbackFailed"), message, color: "red" });
-			}
-		},
-		[narratorId, t],
-	);
+	const [pendingRollback, setPendingRollback] = useState<{
+		messageId: string;
+		blockIndex: number;
+	} | null>(null);
+
+	const handleRollback = useCallback((messageId: string, blockIndex: number) => {
+		setPendingRollback({ messageId, blockIndex });
+	}, []);
+
+	const confirmRollback = useCallback(async () => {
+		if (!pendingRollback) return;
+		try {
+			await api.rollbackToBlock(narratorId, pendingRollback.messageId, pendingRollback.blockIndex);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : "Failed to rollback";
+			notifications.show({ title: t("rollbackFailed"), message, color: "red" });
+		}
+		setPendingRollback(null);
+	}, [narratorId, pendingRollback, t]);
 
 	const handleEditAndRegenerate = useCallback(
 		async (messageId: string, newContent: string, rollback: boolean) => {
@@ -5354,6 +5456,12 @@ export function NarratorPanel({
 					)}
 				</Stack>
 			</ContentViewerEnvironmentProvider>
+			<RollbackConfirmModal
+				narratorId={narratorId}
+				pendingRollback={pendingRollback}
+				onConfirm={confirmRollback}
+				onCancel={() => setPendingRollback(null)}
+			/>
 		</PermEnterHintCtx.Provider>
 	);
 }
