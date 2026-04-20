@@ -8,7 +8,9 @@ import {
 	List,
 	Menu,
 	Modal,
+	NumberInput,
 	Paper,
+	Popover,
 	Stack,
 	Text,
 	Textarea,
@@ -61,6 +63,7 @@ import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { getToken } from "../../lib/api";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
@@ -141,6 +144,8 @@ export interface ToolCallData {
 	_streamingOutput?: string;
 	/** Resolved model name for subagent tool calls (set via WS subagent_started event) */
 	_resolvedModel?: string;
+	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
+	_timeoutMs?: number;
 }
 
 export interface PendingPermission {
@@ -190,6 +195,7 @@ interface ToolCallCardProps {
 export const TOOL_CARD_BG = "color-mix(in srgb, var(--mantine-color-body) 50%, transparent)";
 
 import { TOOL_CALL_STATUS_COLORS as STATUS_COLORS } from "@frontend/lib/status-registry";
+
 export { STATUS_COLORS };
 
 const READ_TOOLS = new Set(["Read"]);
@@ -702,7 +708,110 @@ function formatElapsed(s: number): string {
 	return `${m}m${sec.toString().padStart(2, "0")}s`;
 }
 
-export function ElapsedTimer({ startedAt }: { startedAt: number }) {
+function formatTimeoutShort(ms: number): string {
+	if (ms >= 60_000) {
+		const m = Math.round(ms / 60_000);
+		return `${m}m`;
+	}
+	return `${Math.round(ms / 1000)}s`;
+}
+
+const DEFAULT_BASH_TIMEOUT_MS = 120_000;
+
+/**
+ * Popover for viewing/editing timeout on a running tool call.
+ * Clicking the elapsed/timeout text opens it.
+ */
+function TimeoutPopover({
+	timeoutMs,
+	narratorId,
+	toolUseId,
+	isRunning,
+	children,
+}: {
+	timeoutMs: number;
+	narratorId?: string;
+	toolUseId?: string;
+	isRunning: boolean;
+	children: React.ReactNode;
+}) {
+	const { t } = useTranslation("narrator");
+	const [opened, setOpened] = useState(false);
+	const [value, setValue] = useState<number | string>(Math.round(timeoutMs / 1000));
+
+	// Sync value when timeoutMs changes externally
+	useEffect(() => {
+		if (!opened) setValue(Math.round(timeoutMs / 1000));
+	}, [timeoutMs, opened]);
+
+	const handleUpdate = useCallback(() => {
+		const seconds = typeof value === "string" ? Number.parseFloat(value) : value;
+		if (!seconds || seconds <= 0 || !narratorId || !toolUseId) return;
+		narratorWSManager.send({
+			type: "update_timeout",
+			narratorId,
+			toolUseId,
+			timeoutMs: Math.round(seconds * 1000),
+		});
+		setOpened(false);
+	}, [value, narratorId, toolUseId]);
+
+	return (
+		<Popover opened={opened} onChange={setOpened} position="top" withArrow shadow="md" trapFocus>
+			<Popover.Target>
+				<UnstyledButton
+					onClick={(e: React.MouseEvent) => {
+						e.stopPropagation();
+						setOpened((o) => !o);
+					}}
+					style={{ cursor: "pointer" }}
+				>
+					{children}
+				</UnstyledButton>
+			</Popover.Target>
+			<Popover.Dropdown p="xs" style={{ minWidth: 180 }}>
+				<Stack gap={6}>
+					<Text size="xs" fw={600}>
+						{t("timeoutSeconds")}
+					</Text>
+					<Group gap={4} wrap="nowrap">
+						<NumberInput
+							size="xs"
+							value={value}
+							onChange={setValue}
+							min={1}
+							max={86400}
+							step={10}
+							style={{ flex: 1 }}
+							disabled={!isRunning}
+							onKeyDown={(e: React.KeyboardEvent) => {
+								if (e.key === "Enter") {
+									e.preventDefault();
+									handleUpdate();
+								}
+							}}
+						/>
+						<Button size="xs" variant="light" onClick={handleUpdate} disabled={!isRunning}>
+							{t("timeoutUpdate")}
+						</Button>
+					</Group>
+				</Stack>
+			</Popover.Dropdown>
+		</Popover>
+	);
+}
+
+export function ElapsedTimer({
+	startedAt,
+	timeoutMs,
+	narratorId,
+	toolUseId,
+}: {
+	startedAt: number;
+	timeoutMs?: number;
+	narratorId?: string;
+	toolUseId?: string;
+}) {
 	const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
 	const rafRef = useRef(0);
 
@@ -719,11 +828,31 @@ export function ElapsedTimer({ startedAt }: { startedAt: number }) {
 		return () => cancelAnimationFrame(rafRef.current);
 	}, [startedAt]);
 
-	return (
+	const showTimeout = timeoutMs != null;
+	const effectiveTimeout = timeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
+	const timeoutStr = showTimeout ? formatTimeoutShort(effectiveTimeout) : null;
+
+	const timerContent = (
 		<Text size="xs" c="dimmed" ff="monospace">
 			{formatElapsed(elapsed)}
+			{timeoutStr && <span style={{ opacity: 0.5 }}> / {timeoutStr}</span>}
 		</Text>
 	);
+
+	if (narratorId && toolUseId && showTimeout) {
+		return (
+			<TimeoutPopover
+				timeoutMs={effectiveTimeout}
+				narratorId={narratorId}
+				toolUseId={toolUseId}
+				isRunning
+			>
+				{timerContent}
+			</TimeoutPopover>
+		);
+	}
+
+	return timerContent;
 }
 
 // --- Helper: status indicator icon ---
@@ -748,10 +877,12 @@ const ToolHeader = memo(
 		toolCall,
 		opened,
 		onToggle,
+		narratorId,
 	}: {
 		toolCall: ToolCallData;
 		opened: boolean;
 		onToggle?: () => void;
+		narratorId?: string;
 	}) {
 		const cat = getCategory(toolCall.toolName);
 		const Icon = getCategoryIcon(cat);
@@ -785,17 +916,13 @@ const ToolHeader = memo(
 			return toolCall.toolName;
 		}, [cat, toolCall.toolName, toolCall.inputJson]);
 
-		// For Bash tools, show a badge when a custom timeout is specified (default is 120000ms)
-		const customTimeout = useMemo(() => {
+		// For Bash tools, resolve the effective timeout (from _timeoutMs, inputJson, or default)
+		const effectiveTimeoutMs = useMemo(() => {
 			if (cat !== "bash") return null;
+			if (toolCall._timeoutMs != null) return toolCall._timeoutMs;
 			const ms = extractNumericField(toolCall.inputJson, "timeout");
-			if (ms == null || ms === 120_000) return null;
-			if (ms >= 60_000) {
-				const m = Math.round(ms / 60_000);
-				return `${m}m`;
-			}
-			return `${Math.round(ms / 1000)}s`;
-		}, [cat, toolCall.inputJson]);
+			return ms ?? DEFAULT_BASH_TIMEOUT_MS;
+		}, [cat, toolCall._timeoutMs, toolCall.inputJson]);
 
 		// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)
 		const displayDurationMs = useMemo(() => {
@@ -858,13 +985,34 @@ const ToolHeader = memo(
 							(toolCall.status === "running" ||
 								toolCall.status === "pending" ||
 								toolCall.status === "initializing") ? (
-								<ElapsedTimer startedAt={toolCall.startedAt} />
+								<ElapsedTimer
+									startedAt={toolCall.startedAt}
+									timeoutMs={effectiveTimeoutMs ?? undefined}
+									narratorId={narratorId}
+									toolUseId={toolCall.toolUseId}
+								/>
 							) : (
-								displayDurationMs != null && (
+								displayDurationMs != null &&
+								(effectiveTimeoutMs != null ? (
+									<TimeoutPopover
+										timeoutMs={effectiveTimeoutMs}
+										narratorId={narratorId}
+										toolUseId={toolCall.toolUseId}
+										isRunning={false}
+									>
+										<Text size="xs" c="dimmed" ff="monospace">
+											{(displayDurationMs / 1000).toFixed(1)}s
+											<span style={{ opacity: 0.5 }}>
+												{" "}
+												/ {formatTimeoutShort(effectiveTimeoutMs)}
+											</span>
+										</Text>
+									</TimeoutPopover>
+								) : (
 									<Text size="xs" c="dimmed" ff="monospace">
-										{(displayDurationMs / 1000).toFixed(1)}s{customTimeout && `/${customTimeout}`}
+										{(displayDurationMs / 1000).toFixed(1)}s
 									</Text>
-								)
+								))
 							)}
 						</Group>
 					</Tooltip>
@@ -910,8 +1058,10 @@ const ToolHeader = memo(
 			p.inputJson === n.inputJson &&
 			p._metadata === n._metadata &&
 			p.startedAt === n.startedAt &&
+			p._timeoutMs === n._timeoutMs &&
 			prev.opened === next.opened &&
-			prev.onToggle === next.onToggle
+			prev.onToggle === next.onToggle &&
+			prev.narratorId === next.narratorId
 		);
 	},
 );
@@ -3316,7 +3466,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const cardContent = (
 		<NestedBlockCtx.Provider value={tcBlockId ?? null}>
-			<ToolHeader toolCall={toolCall} opened={opened} onToggle={handleToggle} />
+			<ToolHeader
+				toolCall={toolCall}
+				opened={opened}
+				onToggle={handleToggle}
+				narratorId={narratorId}
+			/>
 			{!isStreaming && (
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />

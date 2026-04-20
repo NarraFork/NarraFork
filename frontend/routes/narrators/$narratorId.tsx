@@ -637,7 +637,7 @@ function NarratorDetailPage() {
 							width: 6,
 							cursor: "col-resize",
 							flexShrink: 0,
-							borderRight: "1px solid var(--mantine-color-dark-4)",
+							borderLeft: "1px solid var(--mantine-color-default-border)",
 						}}
 					/>
 
@@ -648,6 +648,7 @@ function NarratorDetailPage() {
 							minWidth: MIN_PANEL_WIDTH,
 							flexShrink: 0,
 							overflow: "hidden",
+							paddingLeft: 4,
 						}}
 					>
 						<Suspense
@@ -679,7 +680,7 @@ function NarratorDetailPage() {
 							width: 6,
 							cursor: "col-resize",
 							flexShrink: 0,
-							borderRight: "1px solid var(--mantine-color-dark-4)",
+							borderLeft: "1px solid var(--mantine-color-default-border)",
 						}}
 					/>
 
@@ -690,6 +691,7 @@ function NarratorDetailPage() {
 							minWidth: MIN_PANEL_WIDTH,
 							flexShrink: 0,
 							overflow: "hidden",
+							paddingLeft: 4,
 						}}
 					>
 						<Suspense

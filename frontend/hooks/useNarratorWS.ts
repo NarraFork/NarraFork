@@ -46,6 +46,7 @@ interface NarratorWSCallbacks {
 		parentToolUseId?: string,
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
+	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (
@@ -287,6 +288,12 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.elapsed as number,
 							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "timeout_updated":
+						callbacksRef.current.onTimeoutUpdated?.(
+							data.toolUseId as string,
+							data.timeoutMs as number,
 						);
 						break;
 					case "tool_output":

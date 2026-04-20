@@ -1263,6 +1263,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (parentToolUseId && input) {
 						fields.inputJson = input;
 					}
+					// Extract timeout for bash tools so the timer can show elapsed/timeout
+					if (input?.timeout != null && typeof input.timeout === "number") {
+						fields._timeoutMs = input.timeout;
+					}
 					// For Agent tools with an explicit model in input, eagerly set
 					// _resolvedModel so the badge renders immediately instead of
 					// waiting for the subagent_started WS event.
@@ -1304,6 +1308,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							outputJson: output,
 							status: hasError ? "fail" : "success",
 						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onTimeoutUpdated: (toolUseId: string, timeoutMs: number) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{ _timeoutMs: timeoutMs },
 						toolUseIndexRef.current,
 					);
 				});

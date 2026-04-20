@@ -13,6 +13,44 @@ const MAX_TIMEOUT_MS = 86_400_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
+export { DEFAULT_TIMEOUT_MS };
+
+// --- Live timeout management ---
+// Tracks running bash processes so the UI can update their timeout mid-execution.
+
+interface RunningBashEntry {
+	timer: ReturnType<typeof setTimeout>;
+	startedAt: number;
+	timeoutMs: number;
+	kill: () => void;
+	setTimedOut: () => void;
+}
+
+const runningBashProcesses = new Map<string, RunningBashEntry>();
+
+/**
+ * Update the timeout of a running bash process.
+ * Returns the new effective timeoutMs, or null if the toolUseId is not found.
+ */
+export function updateBashTimeout(toolUseId: string, newTimeoutMs: number): number | null {
+	const entry = runningBashProcesses.get(toolUseId);
+	if (!entry) return null;
+
+	const clamped = Math.min(Math.max(newTimeoutMs, 1000), MAX_TIMEOUT_MS);
+	clearTimeout(entry.timer);
+
+	const elapsed = Date.now() - entry.startedAt;
+	const remaining = Math.max(clamped - elapsed, 0);
+
+	entry.timeoutMs = clamped;
+	entry.timer = setTimeout(() => {
+		entry.setTimedOut();
+		entry.kill();
+	}, remaining);
+
+	return clamped;
+}
+
 /** Tool name: "Bash" when using bash (including Git Bash on Windows), "Shell" for PowerShell/cmd. */
 export const SHELL_TOOL_NAME = detectShell().type === "bash" ? "Bash" : "Shell";
 
@@ -229,6 +267,20 @@ export const bashTool: ToolDefinition = {
 				void kill();
 			}, timeoutMs);
 
+			// Register in the running map so the UI can update timeout mid-execution
+			const toolUseId = ctx.currentToolUseId;
+			if (toolUseId) {
+				runningBashProcesses.set(toolUseId, {
+					timer,
+					startedAt: Date.now(),
+					timeoutMs,
+					kill: () => void kill(),
+					setTimedOut: () => {
+						timedOut = true;
+					},
+				});
+			}
+
 			// Watchdog: periodically check process health (Redisson-style renew/kill).
 			// If the process has been running ≥60s, emit a long-running notification
 			// so the UI can show a terminate button.
@@ -284,9 +336,15 @@ export const bashTool: ToolDefinition = {
 				ctx.signal.removeEventListener("abort", abortHandler);
 			}
 
+			// Capture the effective timeout (may have been updated mid-execution)
+			const effectiveTimeout = toolUseId
+				? (runningBashProcesses.get(toolUseId)?.timeoutMs ?? timeoutMs)
+				: timeoutMs;
+			if (toolUseId) runningBashProcesses.delete(toolUseId);
+
 			// Append metadata about abnormal termination so the LLM knows what happened
 			const meta: string[] = [];
-			if (timedOut) meta.push(`Command timed out after ${timeoutMs}ms`);
+			if (timedOut) meta.push(`Command timed out after ${effectiveTimeout}ms`);
 			if (watchdogKilled)
 				meta.push("Process was terminated by watchdog (process exited unexpectedly)");
 			if (aborted) meta.push("Command was aborted by user");

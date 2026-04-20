@@ -264,7 +264,7 @@ mcpRoutes.post("/servers", async (c) => {
 		...parsed.data,
 	};
 
-	const servers = [...(settings.mcpServers ?? []), config];
+	const servers = [...(Array.isArray(settings.mcpServers) ? settings.mcpServers : []), config];
 	settings.mcpServers = servers;
 	saveSettings(settings);
 
@@ -279,7 +279,7 @@ mcpRoutes.post("/servers", async (c) => {
 /** Update an existing MCP server. */
 mcpRoutes.patch("/servers/:id", async (c) => {
 	const { id } = c.req.param();
-	const servers = settings.mcpServers ?? [];
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const idx = servers.findIndex((s) => s.id === id);
 	if (idx === -1) return c.json({ error: "Not found" }, 404);
 
@@ -302,7 +302,7 @@ mcpRoutes.patch("/servers/:id", async (c) => {
 /** Delete an MCP server. */
 mcpRoutes.delete("/servers/:id", async (c) => {
 	const { id } = c.req.param();
-	const servers = settings.mcpServers ?? [];
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const idx = servers.findIndex((s) => s.id === id);
 	if (idx === -1) return c.json({ error: "Not found" }, 404);
 
@@ -318,7 +318,7 @@ mcpRoutes.delete("/servers/:id", async (c) => {
 /** Manually connect a server. */
 mcpRoutes.post("/servers/:id/connect", async (c) => {
 	const { id } = c.req.param();
-	const servers = settings.mcpServers ?? [];
+	const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const config = servers.find((s) => s.id === id);
 	if (!config) return c.json({ error: "Not found" }, 404);
 
@@ -401,7 +401,7 @@ mcpRoutes.post("/servers/import", async (c) => {
 		}
 	}
 
-	const existing = settings.mcpServers ?? [];
+	const existing = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 	const existingNames = new Set(existing.map((s) => s.name.toLowerCase()));
 	const added: McpServerConfig[] = [];
 	let skipped = 0;

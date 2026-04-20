@@ -961,3 +961,34 @@ export const hooks = sqliteTable(
 		index("idx_hooks_event").on(table.event, table.enabled),
 	],
 );
+
+// === IM gateway ===
+
+export const gatewaySessionMappings = sqliteTable(
+	"gateway_session_mappings",
+	{
+		id: text("id").primaryKey(),
+		platform: text("platform").notNull(),
+		/** Platform-specific chat / channel ID */
+		chatId: text("chat_id").notNull(),
+		/** Platform-specific user ID */
+		userId: text("user_id").notNull(),
+		/** Display name of the IM user */
+		username: text("username"),
+		/** The narrator this IM session is bound to */
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** Optional project binding */
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		/** Optional chapter binding */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "set null" }),
+		lastMessageAt: text("last_message_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_gsm_platform_chat_user").on(table.platform, table.chatId, table.userId),
+		index("idx_gsm_narrator").on(table.narratorId),
+	],
+);

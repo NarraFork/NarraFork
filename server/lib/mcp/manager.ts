@@ -56,7 +56,7 @@ class McpManager {
 
 	/** Initialize: connect all enabled servers from settings. */
 	async initialize(): Promise<void> {
-		const servers = settings.mcpServers ?? [];
+		const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 		const enabled = servers.filter((s) => s.enabled);
 		if (enabled.length === 0) return;
 
@@ -192,7 +192,7 @@ class McpManager {
 
 	/** Reload: reconcile running clients with current settings. */
 	async reload(): Promise<void> {
-		const servers = settings.mcpServers ?? [];
+		const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 		const configMap = new Map(servers.map((s) => [s.id, s]));
 
 		// Disconnect removed or disabled servers
@@ -269,7 +269,7 @@ class McpManager {
 
 	/** Get status of all configured servers. */
 	getServerStatuses(): McpServerStatus[] {
-		const servers = settings.mcpServers ?? [];
+		const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
 		return servers.map((cfg) => {
 			const entry = this.clients.get(cfg.id);
 			return {

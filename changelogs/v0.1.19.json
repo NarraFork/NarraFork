@@ -1,6 +1,6 @@
 {
-  "version": "0.1.19",
-  "date": "2026-04-20",
-  "en": "## New Features\n\n- Terminal tool now supports create and rename actions, and can resolve terminals by name (case-insensitive)\n\n## Bug Fixes\n\n- Improved handling of partial messages on narrator interruption: fixed content reading timing, removed redundant variables, and enhanced debug logging",
-  "zh-CN": "## 新功能\n\n- 终端工具新增创建和重命名操作，支持按名称（不区分大小写）解析终端\n\n## 修复\n\n- 优化叙述者中断时的部分消息处理逻辑：修正内容读取时序，消除冗余变量，增强调试日志"
+	"version": "0.1.19",
+	"date": "2026-04-20",
+	"en": "## New Features\n\n- Terminal tool now supports create and rename actions, and can resolve terminals by name (case-insensitive)\n\n## Bug Fixes\n\n- Improved handling of partial messages on narrator interruption: fixed content reading timing, removed redundant variables, and enhanced debug logging",
+	"zh-CN": "## 新功能\n\n- 终端工具新增创建和重命名操作，支持按名称（不区分大小写）解析终端\n\n## 修复\n\n- 优化叙述者中断时的部分消息处理逻辑：修正内容读取时序，消除冗余变量，增强调试日志"
 }

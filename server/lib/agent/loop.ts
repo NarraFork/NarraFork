@@ -434,12 +434,32 @@ function collectReasoningBlocks(
 }
 
 function collectCompletedWebSearches(
-	map: Map<string, { query?: string; queries?: string[]; emitted: boolean; outputIndex?: number;
-	  action?: import("./provider").WebSearchAction }>,
-): Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number;
-    action?: import("./provider").WebSearchAction }> | undefined {
-	const blocks: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number;
-	    action?: import("./provider").WebSearchAction }> = [];
+	map: Map<
+		string,
+		{
+			query?: string;
+			queries?: string[];
+			emitted: boolean;
+			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
+		}
+	>,
+):
+	| Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
+	  }>
+	| undefined {
+	const blocks: Array<{
+		id: string;
+		query?: string;
+		queries?: string[];
+		outputIndex?: number;
+		action?: import("./provider").WebSearchAction;
+	}> = [];
 	for (const [id, entry] of map.entries()) {
 		if (!entry.query && !entry.queries?.length && !entry.action) continue;
 		blocks.push({
@@ -628,8 +648,13 @@ export async function* agentLoop(
 		// Accumulator for native web search calls (Codex web_search tool)
 		const webSearchAccum = new Map<
 			string,
-			{ query?: string; queries?: string[]; emitted: boolean; outputIndex?: number;
-			  action?: import("./provider").WebSearchAction }
+			{
+				query?: string;
+				queries?: string[];
+				emitted: boolean;
+				outputIndex?: number;
+				action?: import("./provider").WebSearchAction;
+			}
 		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;

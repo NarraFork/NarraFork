@@ -2,6 +2,7 @@ import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { containerInstances, narrators, overseers, terminals, userPreferences } from "../db/schema";
+import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
@@ -233,6 +234,12 @@ export type NarratorServerMessage =
 	| { type: "interrupt_checking"; narratorId: string }
 	| { type: "interrupt_check_done"; narratorId: string }
 	| { type: "full_reload"; narratorId: string }
+	| {
+			type: "timeout_updated";
+			narratorId: string;
+			toolUseId: string;
+			timeoutMs: number;
+	  }
 	| { type: "commits_updated"; narratorId: string; chapterId: string; newCount: number }
 	| {
 			type: "presence_update";
@@ -342,7 +349,8 @@ export type NarratorClientMessage =
 	| { type: "presence_leave"; narratorId: string }
 	| { type: "subscribe_stats" }
 	| { type: "unsubscribe_stats" }
-	| { type: "sync_check"; narratorId: string; version: number; lastMessageId?: string };
+	| { type: "sync_check"; narratorId: string; version: number; lastMessageId?: string }
+	| { type: "update_timeout"; narratorId: string; toolUseId: string; timeoutMs: number };
 
 // === Connection registry ===
 
@@ -763,7 +771,17 @@ export const handleNarratorWS = {
 				// Heartbeat response — lastPongAt already updated above
 				break;
 			case "subscribe": {
+				// Determine which narrator needs async catch-up so we can defer
+				// its subscription until after the catch-up is sent.  This prevents
+				// real-time broadcasts (permission_request, message, etc.) from
+				// arriving before the historical catch-up messages, which would
+				// cause the frontend to display messages out of order.
+				const catchUpLastMessageId =
+					msg.lastMessageId && msg.narratorIds.length === 1 ? msg.lastMessageId : undefined;
+				const catchUpNarratorId = catchUpLastMessageId ? msg.narratorIds[0] : undefined;
+
 				for (const id of msg.narratorIds) {
+					if (id === catchUpNarratorId) continue; // deferred — added after catch-up
 					ws.data.subscribedNarrators.add(id);
 				}
 				// Send streaming snapshot: restore in-progress tool chunks + text
@@ -794,18 +812,22 @@ export const handleNarratorWS = {
 						connections.delete(ws);
 					}
 				}
-				// Catch-up: send messages the client missed while disconnected
-				if (msg.lastMessageId && msg.narratorIds.length === 1) {
-					const narratorId = msg.narratorIds[0];
+				// Catch-up: send messages the client missed while disconnected.
+				// The narrator is NOT yet in subscribedNarrators, so broadcastToNarrator
+				// won't send real-time events to this ws until catch-up completes.
+				if (catchUpNarratorId && catchUpLastMessageId) {
+					const narratorId = catchUpNarratorId;
+					const lastMsgId = catchUpLastMessageId;
 					Promise.all([
-						narratorService.getMessagesAfter(narratorId, msg.lastMessageId),
+						narratorService.getMessagesAfter(narratorId, lastMsgId),
 						narratorService.getMessageVersion(narratorId),
 					])
-						.then(([{ topLevel, orphanChildren, hitLimit }, version]) => {
+						.then(async ([{ topLevel, orphanChildren, hitLimit }, version]) => {
 							// Connection may have been removed while the async query ran
 							if (!connections.has(ws)) return;
 							// Too many missed messages or reference not found — tell client to reload
 							if (hitLimit) {
+								ws.data.subscribedNarrators.add(narratorId);
 								try {
 									ws.send(JSON.stringify({ type: "full_reload", narratorId }));
 								} catch {
@@ -815,6 +837,7 @@ export const handleNarratorWS = {
 							}
 							if (topLevel.length === 0 && orphanChildren.length === 0) {
 								// No new messages — send sync_ok with current version
+								ws.data.subscribedNarrators.add(narratorId);
 								try {
 									ws.send(
 										JSON.stringify({
@@ -840,13 +863,56 @@ export const handleNarratorWS = {
 								);
 							} catch {
 								connections.delete(ws);
+								return;
+							}
+
+							// Now subscribe to real-time broadcasts.
+							ws.data.subscribedNarrators.add(narratorId);
+
+							// Check if new messages arrived while the catch-up query ran.
+							// If the version changed, send an incremental catch-up so the
+							// client doesn't miss the messages produced in that window.
+							try {
+								const latestVersion = await narratorService.getMessageVersion(narratorId);
+								if (!connections.has(ws)) return;
+								if (latestVersion !== version) {
+									const lastCatchUpId = topLevel[topLevel.length - 1]?.id;
+									if (lastCatchUpId) {
+										const delta = await narratorService.getMessagesAfter(narratorId, lastCatchUpId);
+										if (!connections.has(ws)) return;
+										if (delta.hitLimit) {
+											ws.send(
+												JSON.stringify({
+													type: "full_reload",
+													narratorId,
+												}),
+											);
+										} else if (delta.topLevel.length > 0 || delta.orphanChildren.length > 0) {
+											ws.send(
+												JSON.stringify({
+													type: "catch_up",
+													narratorId,
+													orphanChildren: delta.orphanChildren,
+													topLevel: delta.topLevel,
+													messageVersion: latestVersion,
+												}),
+											);
+										}
+									}
+								}
+							} catch {
+								// Non-critical — real-time broadcasts are now active,
+								// and the existing sync_check mechanism will reconcile.
 							}
 						})
-						.catch((err: unknown) =>
+						.catch((err: unknown) => {
+							// Ensure the narrator is subscribed even on failure so
+							// subsequent real-time events are not silently dropped.
+							ws.data.subscribedNarrators.add(narratorId);
 							logger.warn("Failed to send catch-up messages", {
 								error: String(err),
-							}),
-						);
+							});
+						});
 				}
 				break;
 			}
@@ -1118,6 +1184,18 @@ export const handleNarratorWS = {
 						}
 					})
 					.catch((err: unknown) => logger.warn("sync_check failed", { error: String(err) }));
+				break;
+			}
+			case "update_timeout": {
+				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
+				if (newMs != null) {
+					broadcastToNarrator(msg.narratorId, {
+						type: "timeout_updated",
+						narratorId: msg.narratorId,
+						toolUseId: msg.toolUseId,
+						timeoutMs: newMs,
+					});
+				}
 				break;
 			}
 		}

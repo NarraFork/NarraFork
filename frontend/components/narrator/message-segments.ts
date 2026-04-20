@@ -127,6 +127,8 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			_longRunning: block._longRunning ?? (tc as any)?._longRunning,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
+			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
+			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
 		});
 	}
 	return results;

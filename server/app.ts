@@ -23,6 +23,7 @@ import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dependencyRoutes } from "./routes/dependencies";
 import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
+import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
@@ -97,6 +98,11 @@ app.route("/api/shares", shareRoutes);
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
 
+// Public: gateway webhook endpoint (HMAC-verified, no JWT needed)
+app.post("/api/gateway/webhook", async (c) => {
+	return handleWebhookRequest(c);
+});
+
 // All routes below require authentication
 app.use("/api/*", requireAuth);
 
@@ -120,6 +126,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/cline",
 	"/api/anthropic",
 	"/api/nug",
+	"/api/gateway",
 ];
 app.use("/api/*", async (c, next) => {
 	if (gitAvailable) return next();
@@ -161,6 +168,9 @@ app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
 app.route("/api/usage-history", usageHistoryRoutes);
 app.route("/api/workspaces", workspaceRoutes);
+
+// IM Gateway management routes (status, sessions, etc.)
+app.route("/api/gateway", gatewayRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

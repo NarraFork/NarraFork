@@ -6,6 +6,7 @@ import {
 	chapters,
 	containerInstances,
 	explorationGroups,
+	gatewaySessionMappings,
 	hooks,
 	mergeSessions,
 	narratorBlacklistCmds,
@@ -366,5 +367,22 @@ export const hooksRelations = relations(hooks, ({ one }) => ({
 	project: one(projects, {
 		fields: [hooks.projectId],
 		references: [projects.id],
+	}),
+}));
+
+// === IM Gateway ===
+
+export const gatewaySessionMappingsRelations = relations(gatewaySessionMappings, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [gatewaySessionMappings.narratorId],
+		references: [narrators.id],
+	}),
+	project: one(projects, {
+		fields: [gatewaySessionMappings.projectId],
+		references: [projects.id],
+	}),
+	chapter: one(chapters, {
+		fields: [gatewaySessionMappings.chapterId],
+		references: [chapters.id],
 	}),
 }));

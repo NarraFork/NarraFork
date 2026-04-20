@@ -29,10 +29,12 @@ if (typeof document !== "undefined") {
 			100% { transform: translateX(433%) }
 		}
 		@keyframes perm-btn-pulse {
-			0%, 100% { box-shadow: 0 0 0 0 currentColor }
-			50% { box-shadow: 0 0 0 3px currentColor }
+			0%, 100% { outline-color: transparent }
+			50% { outline-color: currentColor }
 		}
 		.perm-btn-pulse {
+			outline: 2px solid transparent;
+			outline-offset: 1px;
 			animation: perm-btn-pulse 1.5s ease-in-out infinite;
 		}
 		@media (max-width: 768px) {

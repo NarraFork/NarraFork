@@ -689,6 +689,12 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		version: z.number().int().min(0),
 		lastMessageId: z.string().min(1).optional(),
 	}),
+	z.object({
+		type: z.literal("update_timeout"),
+		narratorId: z.string().min(1),
+		toolUseId: z.string().min(1),
+		timeoutMs: z.number().int().min(1000).max(86_400_000),
+	}),
 ]);
 
 // Terminal client → server

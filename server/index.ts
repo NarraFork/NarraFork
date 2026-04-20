@@ -611,6 +611,13 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
+import { gateway } from "./gateway/gateway";
+
+gateway.start().catch((err) => {
+	logger.error("IM Gateway startup failed", { error: String(err) });
+});
+
 // Clean up orphan workspace records not referenced in any user's recentTabs
 import { dissolveOrphanWorkspaces } from "./routes/workspaces";
 
