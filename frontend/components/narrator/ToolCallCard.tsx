@@ -23,6 +23,7 @@ import {
 	IconArrowsMinimize,
 	IconCheck,
 	IconChevronDown,
+	IconCopy,
 	IconChevronRight,
 	IconClock,
 	IconCode,
@@ -2827,6 +2828,13 @@ function PermButtonBar({
 						variant={btn.variant as "light" | "subtle" | undefined}
 						onClick={btn.onClick}
 						className={focused ? "perm-btn-pulse" : undefined}
+						style={
+							focused
+								? ({
+										"--perm-pulse-color": `var(--mantine-color-${btn.color}-filled)`,
+									} as React.CSSProperties)
+								: undefined
+						}
 					>
 						{btn.label}
 						{focused && (

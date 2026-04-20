@@ -1,5 +1,11 @@
 {
 	"title": "Settings",
+	"personalGroup": "Personal",
+	"instanceGroup": "Instance",
+	"providersSection": "Providers",
+	"usersSection": "Users",
+	"terminalsSection": "Terminals",
+	"usageSection": "Usage History",
 	"expandAll": "Expand All",
 	"collapseAll": "Collapse All",
 	"profileSection": "Profile",

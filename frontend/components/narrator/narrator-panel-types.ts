@@ -30,7 +30,7 @@ if (typeof document !== "undefined") {
 		}
 		@keyframes perm-btn-pulse {
 			0%, 100% { outline-color: transparent }
-			50% { outline-color: currentColor }
+			50% { outline-color: var(--perm-pulse-color, currentColor) }
 		}
 		.perm-btn-pulse {
 			outline: 2px solid transparent;

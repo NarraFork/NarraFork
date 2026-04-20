@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
+import { hotSafe } from "../../hot-safe";
 import { getHome } from "../../platform";
 import { loadSettings } from "../../settings";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
@@ -17,6 +18,8 @@ export { DEFAULT_TIMEOUT_MS };
 
 // --- Live timeout management ---
 // Tracks running bash processes so the UI can update their timeout mid-execution.
+// Pinned to globalThis via hotSafe so hot reloads don't lose references to
+// running child processes (which would leave them as unkillable ghosts).
 
 interface RunningBashEntry {
 	timer: ReturnType<typeof setTimeout>;
@@ -26,7 +29,29 @@ interface RunningBashEntry {
 	setTimedOut: () => void;
 }
 
-const runningBashProcesses = new Map<string, RunningBashEntry>();
+const runningBashProcesses = hotSafe(
+	"narrafork:runningBashProcesses",
+	() => new Map<string, RunningBashEntry>(),
+);
+
+/**
+ * Kill all running bash processes spawned by the Bash tool.
+ * Called during graceful shutdown to prevent ghost processes holding ports
+ * (especially on Windows where child processes can outlive the parent).
+ */
+export async function killAllBashProcesses(): Promise<void> {
+	const entries = [...runningBashProcesses.entries()];
+	for (const [id, entry] of entries) {
+		try {
+			clearTimeout(entry.timer);
+			entry.setTimedOut();
+			entry.kill();
+		} catch {
+			// best effort — process may already be gone
+		}
+		runningBashProcesses.delete(id);
+	}
+}
 
 /**
  * Update the timeout of a running bash process.

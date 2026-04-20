@@ -1,0 +1,728 @@
+import { Affix, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { createFileRoute } from "@tanstack/react-router";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
+import { ClineSection } from "../../components/providers/ClineSection";
+import { CodexSection } from "../../components/providers/CodexSection";
+import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
+import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
+import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
+import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
+import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
+import {
+	createSnapshot,
+	initialProvidersState,
+	type ProvidersState,
+	providersReducer,
+	type SavedSnapshot,
+	useIsDirty,
+	useProvidersDispatch,
+} from "../../components/providers/providers-reducer";
+import { useCurrentUser } from "../../hooks/useAuth";
+import { useAllModels } from "../../hooks/useModels";
+import { api } from "../../lib/api";
+import type { ModelOption } from "../../lib/constants";
+
+export const Route = createFileRoute("/settings/providers")({
+	component: SettingsProvidersPage,
+});
+
+function SettingsProvidersPage() {
+	const { data: user } = useCurrentUser();
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+
+	const { data: settings, isLoading } = useQuery({
+		queryKey: ["admin", "settings"],
+		queryFn: api.getSettings,
+		enabled: user?.role === "admin",
+	});
+
+	// ── Single reducer ──
+	const [state, dispatch] = useReducer(providersReducer, initialProvidersState);
+	const dispatchers = useProvidersDispatch(dispatch);
+
+	const savedSnapshot = useRef(createSnapshot(initialProvidersState));
+	const pendingSnapshot = useRef<SavedSnapshot | null>(null);
+
+	useEffect(() => {
+		if (settings && !state.initialized) {
+			dispatch({ type: "INIT_FROM_SETTINGS", settings: settings as Record<string, unknown> });
+		}
+	}, [settings, state.initialized]);
+
+	const prevInitialized = useRef(false);
+	useEffect(() => {
+		if (state.initialized && !prevInitialized.current) {
+			savedSnapshot.current = createSnapshot(state);
+			prevInitialized.current = true;
+		}
+	}, [state.initialized, state]);
+
+	const isDirty = useIsDirty(state, savedSnapshot.current);
+
+	// Per-provider dirty checkers
+	const isOpenaiProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = state.openaiProviders.find((p) => p.id === providerId);
+			const saved = savedSnapshot.current.openaiProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[state.openaiProviders],
+	);
+	const isAnthropicProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = state.anthropicProviders.find((p) => p.id === providerId);
+			const saved = savedSnapshot.current.anthropicProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[state.anthropicProviders],
+	);
+		(providerId: string) => {
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+	);
+	const isNugProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = state.nugProviders.find((p) => p.id === providerId);
+			const saved = savedSnapshot.current.nugProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[state.nugProviders],
+	);
+
+	// ── Prefix conflict detection ──
+	const clineProviderPrefixes = useMemo(() => {
+		const cps = (settings?.clineProviders ?? []) as Array<{ id: string; prefix?: string }>;
+		return cps
+			.filter((p): p is { id: string; prefix: string } => !!p.prefix)
+			.map((p) => ({ id: p.id, prefix: p.prefix }));
+	}, [settings]);
+	const allPrefixToId = useMemo(() => {
+		const map = new Map<string, string>();
+		for (const p of [
+			...state.openaiProviders,
+			...state.anthropicProviders,
+			...state.nugProviders,
+			...clineProviderPrefixes,
+		]) {
+			if (p.prefix) map.set(p.prefix, p.id);
+		}
+		return map;
+	}, [
+		state.openaiProviders,
+		state.anthropicProviders,
+		state.nugProviders,
+		clineProviderPrefixes,
+	]);
+	const getPrefixError = useCallback(
+		(prefix: string, currentProviderId: string): string | undefined => {
+			if (!prefix) return undefined;
+			if (RESERVED_PREFIXES.has(prefix)) return t("prefixReserved", { prefix });
+			const dupId = allPrefixToId.get(prefix);
+			if (dupId && dupId !== currentProviderId) return t("prefixDuplicate", { prefix });
+			return undefined;
+		},
+		[RESERVED_PREFIXES, allPrefixToId, t],
+	);
+
+	// ── Save / Discard ──
+	const updateMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: () => {
+			savedSnapshot.current = pendingSnapshot.current ?? createSnapshot(state);
+			pendingSnapshot.current = null;
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			qc.invalidateQueries({ queryKey: ["settings"] });
+		},
+		onError: () => {
+			pendingSnapshot.current = null;
+		},
+	});
+	const handleDiscard = useCallback(() => {
+		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
+	}, []);
+	const handleSave = useCallback(() => {
+		const migratedWindows = { ...state.modelContextWindows };
+		const snap = savedSnapshot.current;
+		for (const providers of [
+			{ cur: state.openaiProviders, saved: snap.openaiProviders },
+			{ cur: state.anthropicProviders, saved: snap.anthropicProviders },
+			{ cur: state.nugProviders, saved: snap.nugProviders },
+		]) {
+			for (const provider of providers.cur) {
+				const original = providers.saved.find(
+					(p: { id: string; prefix: string }) => p.id === provider.id,
+				);
+				if (original && original.prefix !== provider.prefix) {
+					for (const key of Object.keys(migratedWindows)) {
+						if (key.startsWith(`${original.prefix}:`)) {
+							const model = key.slice(original.prefix.length + 1);
+							migratedWindows[`${provider.prefix}:${model}`] = migratedWindows[key];
+							delete migratedWindows[key];
+						}
+					}
+				}
+			}
+		}
+		pendingSnapshot.current = createSnapshot(state);
+		updateMutation.mutate({
+			openaiProviders: state.openaiProviders,
+			anthropicProviders: state.anthropicProviders,
+			nugProviders: state.nugProviders,
+			agent: {
+				hiddenModels: [...state.hiddenModels],
+				customModels: state.customModels,
+				modelContextWindows: migratedWindows,
+				providerOrder: state.providerOrder,
+				disabledProviders: [...state.disabledProviders],
+			},
+		});
+	}, [updateMutation, state]);
+
+	// ── UI state ──
+	const [highlight, setHighlight] = useState(false);
+	const [testingModel, setTestingModel] = useState<string | null>(null);
+	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+
+	useEffect(() => {
+		if (isDirty) {
+			setHighlight(true);
+			const timer = setTimeout(() => setHighlight(false), 1500);
+			return () => clearTimeout(timer);
+		}
+	}, [isDirty]);
+
+	// ── Add provider ──
+	const handleAddProvider = useCallback(
+			const id = Math.random().toString(36).slice(2, 10);
+			switch (type) {
+						...prev,
+					]);
+					break;
+				case "openai":
+					dispatchers.setOpenaiProviders((prev) => [
+						...prev,
+						{
+							id,
+							name: "",
+							prefix: "",
+							apiKey: "",
+							baseUrl: "",
+							defaultModel: "",
+							apiMode: "completions" as const,
+							codexAccountId: "",
+						},
+					]);
+					break;
+				case "anthropic":
+					dispatchers.setAnthropicProviders((prev) => [
+						...prev,
+						{
+							id,
+							name: "Anthropic",
+							prefix: "",
+							apiKey: "",
+							baseUrl: "",
+							defaultModel: "",
+							proxy: "",
+						},
+					]);
+					break;
+				case "nug":
+					dispatchers.setNugProviders((prev) => [
+						...prev,
+						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
+					]);
+					break;
+			}
+			// Route to new provider by its immutable ID
+			setSelectedProvider(id);
+		},
+		[dispatchers],
+	);
+
+	// ── Models maps (memoized) ──
+	const {
+		providerLabels,
+		codexModels,
+		openaiByProvider,
+		anthropicByProvider,
+		clineByProvider,
+	} = useAllModels();
+
+	const providerModelsMap = useMemo(() => {
+		const map: Record<string, ModelOption[]> = {};
+		const prefixMap: Record<string, string> = {};
+		const groups = (settings?.openaiModelsGrouped ?? []) as Array<{
+			providerId: string;
+			models: Array<{ id: string }>;
+		}>;
+		for (const p of (settings?.openaiProviders ?? []) as Array<{
+			id: string;
+			prefix?: string;
+		}>) {
+			prefixMap[p.id] = p.prefix ?? "openai";
+		}
+		for (const group of groups) {
+			const prefix = prefixMap[group.providerId] ?? "openai";
+			map[group.providerId] = group.models.map((m) => ({
+				value: `${prefix}:${m.id}`,
+				label: m.id,
+				provider: prefix,
+			}));
+		}
+		return map;
+	}, [settings?.openaiProviders, settings?.openaiModelsGrouped]);
+
+	const anthropicModelsMap = useMemo(() => {
+		const map: Record<string, ModelOption[]> = {};
+		const prefixMap: Record<string, string> = {};
+		const groups = (settings?.anthropicModelsGrouped ?? []) as Array<{
+			providerId: string;
+			models: Array<{ id: string }>;
+		}>;
+		for (const p of (settings?.anthropicProviders ?? []) as Array<{
+			id: string;
+			prefix?: string;
+		}>) {
+			prefixMap[p.id] = p.prefix ?? "anthropic";
+		}
+		for (const group of groups) {
+			const prefix = prefixMap[group.providerId] ?? "anthropic";
+			map[group.providerId] = group.models.map((m) => ({
+				value: `${prefix}:${m.id}`,
+				label: m.id,
+				provider: prefix,
+			}));
+		}
+		return map;
+	}, [settings?.anthropicProviders, settings?.anthropicModelsGrouped]);
+
+		const map: Record<string, ModelOption[]> = {};
+		const prefixMap: Record<string, string> = {};
+			providerId: string;
+			models: Array<Record<string, unknown>>;
+		}>;
+			id: string;
+			prefix?: string;
+		}>) {
+		}
+		for (const group of groups) {
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const id = String(m.model_id ?? m.modelId ?? "");
+				if (!id) continue;
+				models.push({
+					value: `${prefix}:${id}`,
+					label: String(
+						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
+					),
+					provider: prefix,
+				});
+			}
+			map[group.providerId] = models;
+		}
+		return map;
+
+	const nugModelsMap = useMemo(() => {
+		const map: Record<string, ModelOption[]> = {};
+		const prefixMap: Record<string, string> = {};
+		const groups = (settings?.nugModelsGrouped ?? []) as Array<{
+			providerId: string;
+			models: Array<Record<string, unknown>>;
+		}>;
+		for (const p of (settings?.nugProviders ?? []) as Array<{
+			id: string;
+			prefix?: string;
+		}>) {
+			prefixMap[p.id] = p.prefix ?? "nug";
+		}
+		for (const group of groups) {
+			const prefix = prefixMap[group.providerId] ?? "nug";
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const id = String(m.model_id ?? m.modelId ?? m.id ?? "");
+				if (!id) continue;
+				models.push({
+					value: `${prefix}:${id}`,
+					label: String(
+						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? m.name ?? id,
+					),
+					provider: prefix,
+				});
+			}
+			map[group.providerId] = models;
+		}
+		return map;
+	}, [settings?.nugProviders, settings?.nugModelsGrouped]);
+
+	// ── Build provider groups for overview ──
+	const providerGroups = useMemo(() => {
+		const byPrefix = new Map<string, ModelOption[]>();
+
+		const getBadgeLabel = (prefix: string): string | undefined => {
+			const openaiProvider = state.openaiProviders.find((p) => p.prefix === prefix);
+			if (openaiProvider) return openaiProvider.apiMode ?? "responses";
+			if (state.anthropicProviders.some((p) => p.prefix === prefix)) return "anthropic";
+			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
+			return undefined;
+		};
+
+		const addModel = (prefix: string, m: ModelOption) => {
+			let arr = byPrefix.get(prefix);
+			if (!arr) {
+				arr = [];
+				byPrefix.set(prefix, arr);
+			}
+			arr.push(m);
+		};
+		const ensureEmpty = (prefix: string) => {
+			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+		};
+
+		for (const m of codexModels) addModel("codex", m);
+		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
+
+		// Add custom models to their respective prefixes
+		for (const m of state.customModels) {
+			const prefix = m.value.split(":")[0];
+			if (prefix) addModel(prefix, m);
+		}
+
+		// Ensure platform providers always present
+		for (const p of platformPrefixes) ensureEmpty(p);
+		// Ensure multi-instance providers always present (even disabled)
+		for (const p of state.openaiProviders) ensureEmpty(p.prefix);
+		for (const p of state.anthropicProviders) ensureEmpty(p.prefix);
+		for (const p of state.nugProviders) ensureEmpty(p.prefix);
+
+		return [...byPrefix].map(([prefix, models]) => {
+			const isPlatform = platformPrefixes.has(prefix);
+			const disabled = state.disabledProviders.has(prefix);
+
+			// Find provider ID for multi-instance providers
+			let providerId: string | undefined;
+			if (!isPlatform) {
+				const match =
+					state.openaiProviders.find((p) => p.prefix === prefix) ??
+					state.anthropicProviders.find((p) => p.prefix === prefix) ??
+					state.nugProviders.find((p) => p.prefix === prefix);
+				providerId = match?.id;
+			}
+			return {
+				prefix,
+				providerId,
+				label: providerLabels[prefix] ?? prefix,
+				badgeLabel: isPlatform ? undefined : getBadgeLabel(prefix),
+				models,
+				disabled,
+				isPlatform,
+			};
+		});
+	}, [
+		codexModels,
+		openaiByProvider,
+		anthropicByProvider,
+		clineByProvider,
+		state.customModels,
+		providerLabels,
+		state.disabledProviders,
+		state.openaiProviders,
+		state.anthropicProviders,
+		state.nugProviders,
+	]);
+
+	// ── Provider label for detail panel ──
+	const selectedProviderLabel = useMemo(() => {
+		if (!selectedProvider) return "";
+		// Platform providers: selectedProvider is the prefix
+			return providerLabels[selectedProvider] ?? selectedProvider;
+		}
+		// Multi-instance providers: selectedProvider is the provider ID
+		const p =
+			state.openaiProviders.find((p) => p.id === selectedProvider) ??
+			state.anthropicProviders.find((p) => p.id === selectedProvider) ??
+			state.nugProviders.find((p) => p.id === selectedProvider);
+		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
+		return "";
+	}, [
+		selectedProvider,
+		state.openaiProviders,
+		state.anthropicProviders,
+		state.nugProviders,
+		providerLabels,
+	]);
+
+	if (isLoading) return <Loader />;
+
+	// ── Render overview or config view ──
+	const renderContent = () => {
+		if (selectedProvider) {
+			return (
+				<ProviderConfigView
+					providerLabel={selectedProviderLabel}
+					onClose={() => setSelectedProvider(null)}
+				>
+					<ProviderSectionContent
+						providerKey={selectedProvider}
+						settings={settings}
+						state={state}
+						dispatchers={dispatchers}
+						providerModelsMap={providerModelsMap}
+						anthropicModelsMap={anthropicModelsMap}
+						nugModelsMap={nugModelsMap}
+						isOpenaiProviderDirty={isOpenaiProviderDirty}
+						isAnthropicProviderDirty={isAnthropicProviderDirty}
+						isNugProviderDirty={isNugProviderDirty}
+						getPrefixError={getPrefixError}
+						onTestModel={setTestingModel}
+					/>
+				</ProviderConfigView>
+			);
+		}
+
+		return (
+			<ProviderOverviewView
+				groups={providerGroups}
+				hiddenModels={state.hiddenModels}
+				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
+				onOpenProviderConfig={setSelectedProvider}
+				onAddProvider={handleAddProvider}
+				selectedProvider={selectedProvider}
+			/>
+		);
+	};
+
+	return (
+		<>
+			<Box
+				style={{
+					height: isMobile ? undefined : "calc(100vh - 80px)",
+					display: "flex",
+					flexDirection: "column",
+					overflow: "hidden",
+				}}
+			>
+				<Stack
+					gap="md"
+					style={{
+						flex: 1,
+						padding: "var(--mantine-spacing-md)",
+						minHeight: 0,
+						overflow: "hidden",
+					}}
+				>
+					<Group gap="xs">
+						<Title order={2}>{t("providersTitle")}</Title>
+					</Group>
+
+					<Box style={{ flex: 1, overflowY: "auto", overflowX: "hidden", minHeight: 0 }}>
+						{renderContent()}
+					</Box>
+				</Stack>
+			</Box>
+
+			<Affix position={{ bottom: 24, right: 24 }}>
+				<Transition transition="slide-up" mounted={isDirty}>
+					{(styles) => (
+						<Group
+							gap="xs"
+							style={{
+								...styles,
+								boxShadow: "0 4px 14px rgba(0, 0, 0, 0.25)",
+								borderRadius: 8,
+							}}
+						>
+							<Button variant="subtle" size="md" onClick={handleDiscard}>
+								{t("unsavedDiscard")}
+							</Button>
+							<Button
+								onClick={handleSave}
+								loading={updateMutation.isPending}
+								size="md"
+								style={{
+									animation: highlight ? "providersPulse 1.5s ease" : undefined,
+								}}
+							>
+								{t("unsavedSave")}
+							</Button>
+						</Group>
+					)}
+				</Transition>
+			</Affix>
+
+			<style>{`
+				@keyframes providersPulse {
+					0% { box-shadow: 0 0 0 0 var(--mantine-color-indigo-5); }
+					40% { box-shadow: 0 0 0 10px transparent; }
+					100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+				}
+			`}</style>
+			<ModelTestDialog
+				opened={testingModel !== null}
+				onClose={() => setTestingModel(null)}
+				modelValue={testingModel ?? ""}
+			/>
+		</>
+	);
+}
+
+// ── Provider Section Content ──
+
+interface ProviderSectionContentProps {
+	providerKey: string;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
+	settings: any;
+	state: ProvidersState;
+	dispatchers: ReturnType<typeof useProvidersDispatch>;
+	providerModelsMap: Record<string, ModelOption[]>;
+	anthropicModelsMap: Record<string, ModelOption[]>;
+	nugModelsMap: Record<string, ModelOption[]>;
+	isOpenaiProviderDirty: (id: string) => boolean;
+	isAnthropicProviderDirty: (id: string) => boolean;
+	isNugProviderDirty: (id: string) => boolean;
+	getPrefixError: (prefix: string, id: string) => string | undefined;
+	onTestModel: (model: string) => void;
+}
+
+function ProviderSectionContent({
+	providerKey,
+	settings,
+	state,
+	dispatchers,
+	providerModelsMap,
+	anthropicModelsMap,
+	nugModelsMap,
+	isOpenaiProviderDirty,
+	isAnthropicProviderDirty,
+	isNugProviderDirty,
+	getPrefixError,
+	onTestModel,
+}: ProviderSectionContentProps) {
+	// Platform providers: matched by prefix
+		return (
+				settings={settings}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	if (providerKey === "codex") {
+		return (
+			<CodexSection
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	if (providerKey === "cline") {
+		return (
+			<ClineSection
+				settings={settings}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+
+	// Multi-instance providers: matched by ID (immutable, survives prefix edits)
+	const openaiMatch = state.openaiProviders.find((p) => p.id === providerKey);
+	if (openaiMatch) {
+		return (
+			<OpenAIProvidersSection
+				providers={[openaiMatch]}
+				onProvidersChange={dispatchers.setOpenaiProviders}
+				providerModelsMap={providerModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				onBatchToggleHidden={dispatchers.batchToggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isOpenaiProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	const anthropicMatch = state.anthropicProviders.find((p) => p.id === providerKey);
+	if (anthropicMatch) {
+		return (
+			<AnthropicProvidersSection
+				providers={[anthropicMatch]}
+				onProvidersChange={dispatchers.setAnthropicProviders}
+				providerModelsMap={anthropicModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				onBatchToggleHidden={dispatchers.batchToggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isAnthropicProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+		return (
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	const nugMatch = state.nugProviders.find((p) => p.id === providerKey);
+	if (nugMatch) {
+		return (
+			<NUGProvidersSection
+				providers={[nugMatch]}
+				onProvidersChange={dispatchers.setNugProviders}
+				providerModelsMap={nugModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isNugProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+
+	return null;
+}

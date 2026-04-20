@@ -213,7 +213,7 @@ export function ModelsSection({
 				value={codexDefaultReasoningEffort || "auto"}
 				onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
 			/>
-			<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
+			<Button variant="light" onClick={() => navigate({ to: "/settings/providers" })}>
 				{t("customModels")} →
 			</Button>
 		</Stack>

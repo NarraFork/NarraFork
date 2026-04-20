@@ -1,5 +1,11 @@
 {
 	"title": "设置",
+	"personalGroup": "个人设置",
+	"instanceGroup": "实例管理",
+	"providersSection": "提供商",
+	"usersSection": "用户管理",
+	"terminalsSection": "终端管理",
+	"usageSection": "使用历史",
 	"expandAll": "展开全部",
 	"collapseAll": "折叠全部",
 	"profileSection": "个人资料",

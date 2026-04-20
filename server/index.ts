@@ -34,6 +34,7 @@ import {
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { initReviewEventHandler } from "./services/review-event-handler";
@@ -676,6 +677,7 @@ const shutdown = async () => {
 	stopHeartbeat();
 	stopContainerProxy();
 	await terminalService.shutdownAll();
+	await killAllBashProcesses();
 	chapterCleanup.clearAllTimers();
 	worktreeWatcher.shutdown();
 	projectDbManager.closeAll();

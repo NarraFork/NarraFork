@@ -29,7 +29,6 @@ import {
 	IconPlus,
 	IconSearch,
 	IconSettings,
-	IconShieldCog,
 	IconWand,
 	IconX,
 } from "@tabler/icons-react";
@@ -609,17 +608,6 @@ function AuthenticatedLayout() {
 					</Box>
 				)}
 				<Box>
-					{user?.role === "admin" && (
-						<Tooltip label={t("admin")} position="right" disabled={!navCollapsed}>
-							<NavLink
-								component={Link}
-								to="/admin"
-								label={navCollapsed ? undefined : t("admin")}
-								leftSection={<IconShieldCog size={16} />}
-								onClick={closeNavForLink}
-							/>
-						</Tooltip>
-					)}
 					<Tooltip label={t("routines")} position="right" disabled={!navCollapsed}>
 						<NavLink
 							component={Link}

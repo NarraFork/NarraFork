@@ -182,6 +182,13 @@ export function FileApprovalTab({
 						color="green"
 						onClick={handleAllow}
 						className={isActivePermission && focusIndex === 0 ? "perm-btn-pulse" : undefined}
+						style={
+							isActivePermission && focusIndex === 0
+								? ({
+										"--perm-pulse-color": "var(--mantine-color-green-filled)",
+									} as React.CSSProperties)
+								: undefined
+						}
 					>
 						{tc("allow")}
 						{isActivePermission && focusIndex === 0 && (
@@ -196,6 +203,13 @@ export function FileApprovalTab({
 						variant="light"
 						onClick={handleDeny}
 						className={isActivePermission && focusIndex === 1 ? "perm-btn-pulse" : undefined}
+						style={
+							isActivePermission && focusIndex === 1
+								? ({
+										"--perm-pulse-color": "var(--mantine-color-red-filled)",
+									} as React.CSSProperties)
+								: undefined
+						}
 					>
 						{tc("deny")}
 						{isActivePermission && focusIndex === 1 && (
