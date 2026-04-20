@@ -18,15 +18,15 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
+import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowsMinimize,
 	IconCheck,
 	IconChevronDown,
-	IconCopy,
 	IconChevronRight,
 	IconClock,
 	IconCode,
+	IconCopy,
 	IconDownload,
 	IconEye,
 	IconFileCode,
@@ -1935,6 +1935,7 @@ function ShareFilePreview({
 
 function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
+	const clipboard = useClipboard({ timeout: 2000 });
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 
 	const filename = (meta?.filename as string) ?? "file";
@@ -2036,6 +2037,20 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					>
 						{t("shareFile.download")}
 					</Button>
+					<Tooltip
+						label={clipboard.copied ? t("shareFile.linkCopied") : t("shareFile.copyLink")}
+						withArrow
+					>
+						<Button
+							size="compact-sm"
+							variant="light"
+							color={clipboard.copied ? "teal" : "gray"}
+							leftSection={clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+							onClick={() => clipboard.copy(downloadUrl)}
+						>
+							{clipboard.copied ? t("shareFile.linkCopied") : t("shareFile.copyLink")}
+						</Button>
+					</Tooltip>
 				</Group>
 				{preview && previewUrl && previewType && (
 					<ShareFilePreview previewUrl={previewUrl} previewType={previewType} filename={filename} />

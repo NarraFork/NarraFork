@@ -5,6 +5,7 @@ import {
 	Button,
 	Divider,
 	Group,
+	Loader,
 	Menu,
 	Paper,
 	Text,
@@ -55,6 +56,19 @@ import {
 	ToolCallCard,
 } from "./ToolCallCard";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
+
+/** Lightweight shape of the subagent narrator data from query cache */
+interface SubagentNarratorData {
+	status?: string;
+	todosJson?: { id?: string; content?: string; status?: string; activeForm?: string }[] | null;
+	/** Client-only field injected by onSubagentWarning, cleared by onSubagentConclusionUpdated */
+	_retryInfo?: {
+		message: string;
+		retryCount?: number;
+		maxRetries?: number;
+		retryAt?: number;
+	};
+}
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
 const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
@@ -379,6 +393,70 @@ export const SubagentCard = memo(
 		const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
 		const isSuspended = (subagentNarrator as Record<string, unknown>)?.status === "suspended";
 
+		// --- Subagent status bar data ---
+		const saNarrator = subagentNarrator as SubagentNarratorData | undefined;
+		const saStatus = saNarrator?.status;
+		const saIsWorking = saStatus === "thinking";
+		const saIsWaiting = saStatus === "waiting";
+		const saTodos = saNarrator?.todosJson;
+		const saActiveTodo = useMemo(() => {
+			if (!Array.isArray(saTodos) || !saTodos.length) return null;
+			return saTodos.find((td) => td.status === "in_progress") ?? null;
+		}, [saTodos]);
+		const saRetryInfo = saNarrator?._retryInfo;
+		const saIsRetrying = !!saRetryInfo;
+
+		// Retry countdown timer for subagent
+		const [saRetryCountdown, setSaRetryCountdown] = useState(0);
+		useEffect(() => {
+			const retryAt = saRetryInfo?.retryAt;
+			if (!retryAt) {
+				setSaRetryCountdown(0);
+				return;
+			}
+			let id: ReturnType<typeof setInterval> | undefined;
+			const tick = () => {
+				const remaining = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
+				setSaRetryCountdown(remaining);
+				if (remaining <= 0 && id != null) {
+					clearInterval(id);
+					id = undefined;
+				}
+			};
+			tick();
+			id = setInterval(tick, 1000);
+			return () => {
+				if (id != null) clearInterval(id);
+			};
+		}, [saRetryInfo]);
+
+		// Derive the status text to show next to the spinner
+		const saStatusText = useMemo(() => {
+			if (!isTerminal && !isInitializing) {
+				if (saIsRetrying) {
+					const count = saRetryInfo?.retryCount ?? 0;
+					const max = saRetryInfo?.maxRetries === -1 ? "∞" : (saRetryInfo?.maxRetries ?? "?");
+					return saRetryCountdown > 0
+						? t("retryingCountdown", { count, max, seconds: saRetryCountdown })
+						: t("retryingNow", { count, max });
+				}
+				if (saActiveTodo) {
+					return saActiveTodo.content || saActiveTodo.activeForm || null;
+				}
+				if (saIsWaiting) return t("status_waiting");
+			}
+			return null;
+		}, [
+			isTerminal,
+			isInitializing,
+			saIsRetrying,
+			saRetryInfo,
+			saRetryCountdown,
+			saActiveTodo,
+			saIsWaiting,
+			t,
+		]);
+
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId) {
 				if (onViewSubagentSession) {
@@ -473,16 +551,40 @@ export const SubagentCard = memo(
 										{resolvedModel}
 									</Badge>
 								)}
-								<Box style={{ flex: 1 }} />
-								<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+								<Box style={{ flex: 1, minWidth: 0 }} />
+								<Group
+									gap={4}
+									wrap="nowrap"
+									style={{ flexShrink: 1, minWidth: 0, overflow: "hidden" }}
+								>
+									{saStatusText && !isTerminal && (
+										<Text
+											size="xs"
+											c={saIsRetrying ? "yellow" : "blue"}
+											truncate
+											style={{ flexShrink: 1, minWidth: 0 }}
+										>
+											{saStatusText}
+										</Text>
+									)}
 									{childToolCalls.length > 0 && (
-										<Text size="xs" c="dimmed">
+										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 											{childToolCalls.length} calls
 										</Text>
 									)}
-									<Box c={statusColor}>
-										<StatusIcon status={toolCall.status} />
-									</Box>
+									{!isTerminal &&
+									!isInitializing &&
+									(saIsWorking || saIsWaiting || saIsRetrying) ? (
+										<Loader
+											size={12}
+											color={saIsRetrying ? "yellow" : saIsWaiting ? "yellow" : "blue"}
+											style={{ flexShrink: 0 }}
+										/>
+									) : (
+										<Box c={statusColor} style={{ flexShrink: 0 }}>
+											<StatusIcon status={toolCall.status} />
+										</Box>
+									)}
 									{toolCall.startedAt != null && !isTerminal ? (
 										<ElapsedTimer startedAt={toolCall.startedAt} />
 									) : (

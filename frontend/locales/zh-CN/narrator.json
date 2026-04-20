@@ -288,6 +288,8 @@
 	"toolLoaded": "工具已加载",
 	"toolAlreadyLoaded": "工具已加载过",
 	"shareFile.download": "下载",
+	"shareFile.copyLink": "复制链接",
+	"shareFile.linkCopied": "已复制",
 	"shareFile.directory": "目录",
 	"shareFile.compressed": "已压缩",
 	"shareFile.zip": "zip",

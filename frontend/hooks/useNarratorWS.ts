@@ -112,6 +112,20 @@ interface NarratorWSCallbacks {
 	) => void;
 	onSubagentStarted?: (toolUseId: string, model?: string) => void;
 	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
+	onSubagentTodosUpdated?: (
+		subagentNarratorId: string,
+		todos: { id?: string; content?: string; status?: string }[],
+		toolUseId?: string,
+	) => void;
+	onSubagentWarning?: (
+		subagentNarratorId: string,
+		info: {
+			message: string;
+			retryCount?: number;
+			maxRetries?: number;
+			delayMs?: number;
+		},
+	) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
 		toolUseId: string,
@@ -498,6 +512,21 @@ export function useNarratorWS(
 							data.subagentNarratorId as string,
 							data.toolUseId as string,
 						);
+						break;
+					case "subagent_todos_updated":
+						callbacksRef.current.onSubagentTodosUpdated?.(
+							data.subagentNarratorId as string,
+							data.todos as { id?: string; content?: string; status?: string }[],
+							data.toolUseId as string | undefined,
+						);
+						break;
+					case "subagent_warning":
+						callbacksRef.current.onSubagentWarning?.(data.subagentNarratorId as string, {
+							message: data.message as string,
+							retryCount: data.retryCount as number | undefined,
+							maxRetries: data.maxRetries as number | undefined,
+							delayMs: data.delayMs as number | undefined,
+						});
 						break;
 					case "subagent_conclusion_updated":
 						callbacksRef.current.onSubagentConclusionUpdated?.(

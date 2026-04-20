@@ -313,6 +313,22 @@ export type NarratorServerMessage =
 			toolUseId: string;
 	  }
 	| {
+			type: "subagent_todos_updated";
+			narratorId: string;
+			subagentNarratorId: string;
+			todos: unknown[];
+			toolUseId?: string;
+	  }
+	| {
+			type: "subagent_warning";
+			narratorId: string;
+			subagentNarratorId: string;
+			message: string;
+			retryCount?: number;
+			maxRetries?: number;
+			delayMs?: number;
+	  }
+	| {
 			type: "subagent_conclusion_updated";
 			narratorId: string;
 			subagentNarratorId: string;

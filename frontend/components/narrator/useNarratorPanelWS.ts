@@ -1292,12 +1292,57 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Invalidate the subagent narrator query so SubagentCard picks up "suspended" status
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
+			onSubagentTodosUpdated: (
+				subagentNarratorId: string,
+				todos: unknown[],
+				_toolUseId?: string,
+			) => {
+				// Update the subagent narrator query cache with new todos
+				qc.setQueryData(
+					["narrators", subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) => (old ? { ...old, todosJson: todos } : old),
+				);
+			},
+			onSubagentWarning: (
+				subagentNarratorId: string,
+				info: {
+					message: string;
+					retryCount?: number;
+					maxRetries?: number;
+					delayMs?: number;
+				},
+			) => {
+				// Store retry info on the subagent narrator cache so SubagentCard can display it
+				qc.setQueryData(
+					["narrators", subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) =>
+						old
+							? {
+									...old,
+									_retryInfo: {
+										message: info.message,
+										retryCount: info.retryCount,
+										maxRetries: info.maxRetries,
+										retryAt: info.delayMs != null ? Date.now() + info.delayMs : undefined,
+									},
+								}
+							: old,
+				);
+			},
 			onSubagentConclusionUpdated: (
 				_subagentNarratorId: string,
 				toolUseId: string,
 				output: unknown,
 				hasError: boolean,
 			) => {
+				// Clean up client-only _retryInfo from the subagent narrator cache
+				qc.setQueryData(
+					["narrators", _subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) => (old ? { ...old, _retryInfo: undefined } : old),
+				);
 				// Update the tool call's outputJson in the messages cache
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;

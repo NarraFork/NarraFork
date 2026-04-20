@@ -7,6 +7,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { narrators } from "../db/schema";
 import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -224,6 +227,28 @@ export async function handleTransientError(opts: {
 	};
 	eventBus.emit({ type: "narrator:warning", narratorId, message: error });
 	broadcastToNarrator(narratorId, warningPayload);
+
+	// If this is a subagent, also notify the parent narrator so SubagentCard
+	// can display the retry status inline.
+	try {
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { type: true, parentNarratorId: true },
+		});
+		if (narrator?.type === "subagent" && narrator.parentNarratorId) {
+			broadcastToNarrator(narrator.parentNarratorId, {
+				type: "subagent_warning",
+				narratorId: narrator.parentNarratorId,
+				subagentNarratorId: narratorId,
+				message: error,
+				retryCount,
+				maxRetries,
+				delayMs,
+			});
+		}
+	} catch {
+		// Non-critical — don't let lookup failure break retry flow
+	}
 
 	// Abort-aware backoff
 	await abortableSleep(delayMs, signal);

@@ -118,8 +118,8 @@ function getConclusionWatchersMap() {
 
 // === Subagent type definitions ===
 
-/** Tools available to explore/plan subagents (read-only + Shell/Bash + Write/Edit for conclusion file) */
-const READONLY_TOOLS = new Set([
+/** Tools available to explore/plan subagents (read + search + shell + conclusion file write + todos) */
+const EXPLORE_PLAN_TOOLS = new Set([
 	"Read",
 	"Glob",
 	"Grep",
@@ -128,6 +128,7 @@ const READONLY_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 	"Write",
 	"Edit",
+	"TaskCreate",
 ]);
 
 /**
@@ -135,13 +136,13 @@ const READONLY_TOOLS = new Set([
  * to avoid circular imports with narrator-session.ts.
  */
 
-/** Tools available to general subagents (READONLY_TOOLS + interactive tools, no nesting/plan/forking) */
-const GENERAL_TOOLS = new Set([...READONLY_TOOLS, "AskUserQuestion", "Skill"]);
+/** Tools available to general subagents (EXPLORE_PLAN_TOOLS + interactive tools, no nesting/plan/forking) */
+const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "AskUserQuestion", "Skill"]);
 
 /** Tool filter factories per built-in subagent type */
 const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
-	explore: (tool) => READONLY_TOOLS.has(tool.name),
-	plan: (tool) => READONLY_TOOLS.has(tool.name),
+	explore: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name),
+	plan: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name),
 	general: (tool) => GENERAL_TOOLS.has(tool.name),
 };
 
@@ -497,7 +498,30 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			model,
 		);
 
-		const hooks: EventHooks = { onContextUsage: ctxMgmt.onContextUsage };
+		const hooks: EventHooks = {
+			onContextUsage: ctxMgmt.onContextUsage,
+			onTodoWrite: async (todos, todoToolUseId) => {
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+				await narratorService.updateTodos(narratorId, todos as any[], todoToolUseId);
+				// Broadcast to subagent's own subscribers
+				broadcastToNarrator(narratorId, {
+					type: "todos_updated",
+					narratorId,
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					todos: todos as any[],
+					toolUseId: todoToolUseId,
+				});
+				// Also notify parent narrator so SubagentCard can update
+				broadcastToNarrator(parentNarratorId, {
+					type: "subagent_todos_updated",
+					narratorId: parentNarratorId,
+					subagentNarratorId: narratorId,
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+					todos: todos as any[],
+					toolUseId: todoToolUseId,
+				});
+			},
+		};
 
 		const resolvedProvider = resolveProvider(model);
 		const resolvedServiceTier =

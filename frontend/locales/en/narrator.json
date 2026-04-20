@@ -288,6 +288,8 @@
 	"toolLoaded": "Tool loaded",
 	"toolAlreadyLoaded": "Tool already loaded",
 	"shareFile.download": "Download",
+	"shareFile.copyLink": "Copy link",
+	"shareFile.linkCopied": "Copied",
 	"shareFile.directory": "directory",
 	"shareFile.compressed": "compressed",
 	"shareFile.zip": "zip",
