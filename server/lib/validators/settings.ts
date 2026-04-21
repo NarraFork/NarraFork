@@ -1,6 +1,38 @@
 import { z } from "zod";
 import { commandSchema } from "./common";
 
+// === Gateway per-user configuration ===
+
+const gatewayPlatformConfigSchema = z.object({
+	platform: z.enum(["telegram", "discord", "slack", "feishu", "webhook", "weixin"]),
+	enabled: z.boolean(),
+	// Telegram / Discord
+	token: z.string().max(500).optional(),
+	// Slack
+	botToken: z.string().max(500).optional(),
+	appToken: z.string().max(500).optional(),
+	// Feishu
+	appId: z.string().max(200).optional(),
+	appSecret: z.string().max(500).optional(),
+	// Webhook
+	secret: z.string().max(500).optional(),
+	// Common
+	allowedUsers: z.array(z.string().max(100)).max(50).optional(),
+});
+
+const gatewayConfigSchema = z.object({
+	enabled: z.boolean().optional(),
+	defaultProjectId: z.string().max(50).optional(),
+	defaultChapterId: z.string().max(50).optional(),
+	defaultPermissionMode: z
+		.enum(["bypassPermissions", "allowByDefault", "denyByDefault"])
+		.optional(),
+	sessionIdleMinutes: z.number().int().min(0).max(43200).optional(),
+	rateLimitPerMinute: z.number().int().min(0).max(1000).optional(),
+	streaming: z.boolean().optional(),
+	platforms: z.array(gatewayPlatformConfigSchema).max(10).optional(),
+});
+
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
 	language: z.enum(["en", "zh-CN"]).optional(),
@@ -44,6 +76,8 @@ export const updateUserPreferencesSchema = z.object({
 	sendMode: z.enum(["enter", "ctrl+enter"]).optional(),
 	// Setup wizard
 	setupWizardCompleted: z.boolean().optional(),
+	// Gateway configuration (per-user IM gateway settings)
+	gatewayConfig: gatewayConfigSchema.optional(),
 });
 
 export const recentTabSchema = z.object({

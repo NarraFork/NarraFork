@@ -18,6 +18,41 @@ export type ModelOption = {
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
+/** Prefix for model aggregation values. */
+export const AGG_MODEL_PREFIX = "__agg__:";
+
+export interface ModelAggregation {
+	id: string;
+	name: string;
+	models: string[];
+	routingMode: "priority" | "balanced";
+}
+
+/**
+ * Parse an aggregation model value.
+ * Returns null if the value is not an aggregation.
+ */
+export function parseAggModelValue(raw?: string | null): {
+	aggId: string;
+	pinnedModel?: string;
+} | null {
+	if (!raw?.startsWith(AGG_MODEL_PREFIX)) return null;
+	const rest = raw.slice(AGG_MODEL_PREFIX.length);
+	const firstColon = rest.indexOf(":");
+	if (firstColon < 0) return { aggId: rest };
+	const aggId = rest.slice(0, firstColon);
+	const pinnedModel = rest.slice(firstColon + 1);
+	return { aggId, pinnedModel: pinnedModel || undefined };
+}
+
+/**
+ * Build an aggregation model value string.
+ */
+export function buildAggModelValue(aggId: string, pinnedModel?: string): string {
+	if (pinnedModel) return `${AGG_MODEL_PREFIX}${aggId}:${pinnedModel}`;
+	return `${AGG_MODEL_PREFIX}${aggId}`;
+}
+
 /**
  * Build a "provider:model" composite value.
  * This allows the same model ID to appear under different providers.

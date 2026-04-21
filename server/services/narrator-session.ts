@@ -661,7 +661,7 @@ export async function runAgentLoop(
 				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
 			}
 
-			const resolved = resolveProviderAndModel(active.model);
+			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
 			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
@@ -724,8 +724,8 @@ export async function runAgentLoop(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
-				getModel: () => resolveProviderAndModel(active.model).model,
-				getProvider: () => resolveProviderAndModel(active.model).provider,
+				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
+				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
 				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
 				setPruneBoundary: (id) => {
 					active._pruneBoundaryMessageId = id;
@@ -1508,7 +1508,7 @@ export async function runAgentLoop(
 			// This is a fallback — the mid-turn compact in the context_usage handler
 			// may have already started a background compact.
 			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
-			const { model: postModel, provider: postProvider } = resolveProviderAndModel(active.model);
+			const { model: postModel, provider: postProvider } = resolveProviderAndModel(active.model, active.provider);
 			const postTurnThresholds = getContextThresholds(postModel, postProvider);
 			if (
 				active._contextUsagePct != null &&

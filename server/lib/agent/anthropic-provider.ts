@@ -7,6 +7,7 @@ import type { AnthropicProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
+import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1078,6 +1079,8 @@ async function* parseAnthropicSSEStream(
 	// Stream integrity tracking
 	let receivedMessageStart = false;
 	let receivedAnyContentBlock = false;
+	// Track SSE event: type for gateway-injected events
+	let currentEventType = "";
 
 	const reader = body.getReader();
 	try {
@@ -1091,7 +1094,12 @@ async function* parseAnthropicSSEStream(
 
 			for (const line of lines) {
 				const trimmed = line.trim();
-				if (!trimmed || trimmed.startsWith("event:")) continue;
+				if (!trimmed) continue;
+				// Track SSE event: lines for gateway-injected events
+				if (trimmed.startsWith("event:")) {
+					currentEventType = trimmed.slice(6).trim();
+					continue;
+				}
 				// Support both "data: {...}" (standard SSE) and "data:{...}" (no space)
 				if (!trimmed.startsWith("data:")) continue;
 
@@ -1106,12 +1114,31 @@ async function* parseAnthropicSSEStream(
 				// Extract JSON payload: skip "data: " or "data:"
 				const jsonStr = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed.slice(5);
 
-				let event: AnthropicStreamEvent;
+				let data: Record<string, unknown>;
 				try {
-					event = JSON.parse(jsonStr);
+					data = JSON.parse(jsonStr);
 				} catch {
+					currentEventType = "";
 					continue;
 				}
+
+				// Gateway-injected events: check SSE event: type first, then data-embedded type
+				if (currentEventType && isGatewayEventType(currentEventType)) {
+					const gwEvt = parseGatewaySSEEvent(currentEventType, data);
+					currentEventType = "";
+					if (gwEvt) {
+						yield gwEvt;
+						continue;
+					}
+				}
+				currentEventType = "";
+				const gwEvt = parseGatewayDataEvent(data);
+				if (gwEvt) {
+					yield gwEvt;
+					continue;
+				}
+
+				const event = data as unknown as AnthropicStreamEvent;
 
 				// Track stream integrity
 				if (event.type === "message_start") receivedMessageStart = true;

@@ -118,9 +118,13 @@ import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, type TreeMessage } from "../../lib/api";
 import {
+	AGG_MODEL_PREFIX,
+	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
+	type ModelAggregation,
 	type ModelOption,
 	NARRATOR_STATUS_COLORS,
+	parseAggModelValue,
 } from "../../lib/constants";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
@@ -255,8 +259,11 @@ function ModelMenuItems({
 	const provLabels: Record<string, string> = {
 		openai: "OpenAI",
 		__default__: "Default",
+		__agg__: "Aggregations",
 	};
 	const entries = [...groups.entries()];
+	// For aggregation selection check: parse current model to see if it's an aggregation
+	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
 	return (
 		<>
 			{totalCostUsd != null && totalCostUsd > 0 && (
@@ -271,7 +278,10 @@ function ModelMenuItems({
 					{gi > 0 && <Menu.Divider />}
 					<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
 					{models.map((m) => {
-						const selected = currentModel === m.value;
+						// For aggregation items, check if the current model's aggId matches
+						const isAggItem = m.provider === "__agg__";
+						const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
+						const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
 						return (
 							<Menu.Item
 								key={m.value}
@@ -295,6 +305,59 @@ function ModelMenuItems({
 				</span>
 			))}
 		</>
+	);
+}
+
+/**
+ * Inline provider switcher for aggregation models.
+ * Shows a SegmentedControl with "Auto" + each member provider.
+ */
+function AggProviderSwitcher({
+	currentModel,
+	aggregations,
+	providerLabels,
+	onSelect,
+}: {
+	currentModel: string | null | undefined;
+	aggregations: ModelAggregation[];
+	providerLabels: Record<string, string>;
+	onSelect: (model: string) => void;
+}) {
+	const { t } = useTranslation("settings");
+	const parsed = parseAggModelValue(currentModel);
+	if (!parsed) return null;
+
+	const agg = aggregations.find((a) => a.id === parsed.aggId);
+	if (!agg || agg.models.length === 0) return null;
+
+	// Build segments: "auto" + each member model
+	const segments: Array<{ value: string; label: string }> = [
+		{ value: "auto", label: t("aggAutoLabel") },
+	];
+	for (const memberModel of agg.models) {
+		const colonIdx = memberModel.indexOf(":");
+		const prefix = colonIdx > 0 ? memberModel.slice(0, colonIdx) : memberModel;
+		const displayName = providerLabels[prefix] ?? prefix;
+		segments.push({ value: memberModel, label: displayName });
+	}
+
+	// Determine current value
+	const currentValue = parsed.pinnedModel ?? "auto";
+
+	return (
+		<SegmentedControl
+			size="xs"
+			data={segments}
+			value={currentValue}
+			onChange={(v) => {
+				if (v === "auto") {
+					onSelect(buildAggModelValue(parsed.aggId));
+				} else {
+					onSelect(buildAggModelValue(parsed.aggId, v));
+				}
+			}}
+			style={{ flexShrink: 0 }}
+		/>
 	);
 }
 
@@ -1094,7 +1157,13 @@ export function NarratorPanel({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const modelMutation = useUpdateModel();
 	const pruneEnabledMutation = useUpdatePruneEnabled();
-	const { visibleWithDefault: allModels, defaultModelValue, settingsData } = useAllModels();
+	const {
+		visibleWithDefault: allModels,
+		defaultModelValue,
+		settingsData,
+		aggregations,
+		providerLabels,
+	} = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
@@ -4842,11 +4911,19 @@ export function NarratorPanel({
 																label:
 																	m.value === FOLLOW_DEFAULT_MODEL
 																		? t("followDefault", { model: defaultModelValue })
-																		: m.provider
-																			? `${m.provider}:${m.label}`
-																			: m.label,
+																		: m.provider === "__agg__"
+																			? `⚡ ${m.label}`
+																			: m.provider
+																				? `${m.provider}:${m.label}`
+																				: m.label,
 															}))}
-															value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
+															value={(() => {
+																const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																const agg = parseAggModelValue(raw);
+																// For pinned aggregation, map back to the base agg value
+																if (agg) return `${AGG_MODEL_PREFIX}${agg.aggId}`;
+																return raw;
+															})()}
 															onChange={() => {}}
 															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 															style={{ pointerEvents: "auto" }}
@@ -4862,6 +4939,14 @@ export function NarratorPanel({
 													</Menu.Dropdown>
 												</Menu>
 											</Tooltip>
+											{parseAggModelValue(narrator.model) && (
+												<AggProviderSwitcher
+													currentModel={narrator.model}
+													aggregations={aggregations}
+													providerLabels={providerLabels}
+													onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+												/>
+											)}
 											<Tooltip
 												label={
 													narrator.isAskInPassing
@@ -5062,6 +5147,14 @@ export function NarratorPanel({
 												</Menu.Dropdown>
 											</Menu>
 										</Tooltip>
+										{parseAggModelValue(narrator.model) && (
+											<AggProviderSwitcher
+												currentModel={narrator.model}
+												aggregations={aggregations}
+												providerLabels={providerLabels}
+												onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+											/>
+										)}
 										<Tooltip
 											label={
 												narrator.isAskInPassing

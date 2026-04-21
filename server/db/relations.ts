@@ -377,6 +377,10 @@ export const gatewaySessionMappingsRelations = relations(gatewaySessionMappings,
 		fields: [gatewaySessionMappings.narratorId],
 		references: [narrators.id],
 	}),
+	appUser: one(users, {
+		fields: [gatewaySessionMappings.appUserId],
+		references: [users.id],
+	}),
 	project: one(projects, {
 		fields: [gatewaySessionMappings.projectId],
 		references: [projects.id],

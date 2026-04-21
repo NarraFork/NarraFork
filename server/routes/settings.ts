@@ -215,6 +215,17 @@ const updateSettingsSchema = z
 					})
 					.optional(),
 				defaultSystemPrompt: z.string().max(50000).optional(),
+				modelAggregations: z
+					.array(
+						z.object({
+							id: z.string().min(1).max(20),
+							name: z.string().min(1).max(100),
+							models: z.array(z.string().min(1)).min(1).max(20),
+							routingMode: z.enum(["priority", "balanced"]),
+						}),
+					)
+					.max(50)
+					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
 				disabledProviders: z.array(z.string()).max(20).optional(),
 			})

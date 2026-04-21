@@ -873,6 +873,17 @@ export async function* agentLoop(
 						yield {
 						};
 					}
+					// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway)
+					if (parsed.queueStatus) {
+						yield {
+							type: "queue_status",
+							position: parsed.queueStatus.position,
+							queueDepth: parsed.queueStatus.queueDepth,
+						};
+					}
+					if (parsed.quotaBalance !== undefined) {
+						yield { type: "quota_balance", quotaBalance: parsed.quotaBalance };
+					}
 					// Convert OpenAI/Anthropic usage to context_usage percentage
 					if (parsed.usage && parsed.usage.promptTokens != null) {
 						receivedUsage = true;

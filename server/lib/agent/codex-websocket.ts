@@ -6,6 +6,7 @@ import { db } from "../../db";
 import { narratorMessageRefs, narratorMessages } from "../../db/schema";
 import { logger } from "../logger";
 import { getHttpUserAgent } from "../user-agent";
+import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
 	parseResponsesAPIEvent,
@@ -799,6 +800,13 @@ export async function* streamCodexResponsesWebSocket(
 			try {
 				chunk = JSON.parse(frame.text) as ResponsesAPIChunk;
 			} catch {
+				continue;
+			}
+
+			// Gateway-injected events via WebSocket (data-embedded type field)
+			const gwEvt = parseGatewayDataEvent(chunk as Record<string, unknown>);
+			if (gwEvt) {
+				yield gwEvt;
 				continue;
 			}
 

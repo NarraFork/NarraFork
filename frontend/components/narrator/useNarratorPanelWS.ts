@@ -1630,6 +1630,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					type: "patch",
 				});
 			},
+			onQuotaBalance: (_balance) => {
+				// Generic gateway quota balance — currently a no-op.
+			},
+			onQueueStatus: (position, _queueDepth) => {
+				// since the display logic is identical (show position badge).
+				dispatchStatus({
+					type: "patch",
+				});
+			},
 			onBrowserSessionCount: (count) => {
 				setBrowserSessionCount(count);
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });

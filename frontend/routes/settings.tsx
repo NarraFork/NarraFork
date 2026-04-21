@@ -8,6 +8,7 @@ import {
 	IconCpu,
 	IconDatabase,
 	IconInfoCircle,
+	IconMessageCircle,
 	IconPalette,
 	IconPlayerPlay,
 	IconReceipt2,
@@ -61,6 +62,11 @@ function SettingsLayout() {
 			icon: <IconBell size={18} />,
 		},
 		{ to: "/settings/appearance", label: t("appearanceSection"), icon: <IconPalette size={18} /> },
+		{
+			to: "/settings/gateway",
+			label: t("gatewaySection"),
+			icon: <IconMessageCircle size={18} />,
+		},
 	];
 
 	const instanceItems: NavItem[] = [

@@ -85,6 +85,8 @@ interface NarratorWSCallbacks {
 		linesRemoved: number;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
+	onQuotaBalance?: (quotaBalance: string | null) => void;
+	onQueueStatus?: (position: number, queueDepth: number) => void;
 	onWebSearch?: (
 		id: string,
 		status: "in_progress" | "searching" | "completed",
@@ -411,6 +413,15 @@ export function useNarratorWS(
 						}
 						break;
 						break;
+							data.position as number,
+							data.queueDepth as number,
+						);
+						break;
+					case "quota_balance":
+						callbacksRef.current.onQuotaBalance?.((data.quotaBalance as string) ?? null);
+						break;
+					case "queue_status":
+						callbacksRef.current.onQueueStatus?.(
 							data.position as number,
 							data.queueDepth as number,
 						);

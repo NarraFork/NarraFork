@@ -2,15 +2,17 @@
  * Discord platform adapter.
  *
  * Uses discord.js with Gateway Intents (WebSocket, no public URL required).
+ * Supports message editing for progressive streaming.
  */
 
 import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
-import type { DiscordConfig, GatewayPlatform, InboundMessage } from "../types";
+import type { DiscordConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
 export class DiscordAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "discord";
 	readonly maxMessageLength = 2000;
+	override readonly supportsEdit = true;
 
 	private client: any = null;
 	private config: DiscordConfig;
@@ -72,6 +74,52 @@ export class DiscordAdapter extends BaseAdapter {
 		const chunks = this.splitMessage(text);
 		for (const chunk of chunks) {
 			await channel.send(chunk);
+		}
+	}
+
+	override async sendAndGetId(chatId: string, text: string): Promise<SendResult> {
+		if (!this.client) return { success: false, error: "Client not connected" };
+
+		try {
+			const channel = await this.client.channels.fetch(chatId).catch(() => null);
+			if (!channel?.isTextBased?.()) {
+				return { success: false, error: "Channel not found or not text-based" };
+			}
+
+			const sent = await channel.send(text);
+			return {
+				success: true,
+				messageId: sent?.id ?? null,
+			};
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	override async editMessage(chatId: string, messageId: string, text: string): Promise<SendResult> {
+		if (!this.client) return { success: false, error: "Client not connected" };
+
+		try {
+			const channel = await this.client.channels.fetch(chatId).catch(() => null);
+			if (!channel?.isTextBased?.()) {
+				return { success: false, error: "Channel not found" };
+			}
+
+			const msg = await channel.messages.fetch(messageId).catch(() => null);
+			if (!msg) {
+				return { success: false, error: "Message not found" };
+			}
+
+			await msg.edit(text);
+			return { success: true, messageId };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
 		}
 	}
 

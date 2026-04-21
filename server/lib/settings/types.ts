@@ -135,6 +135,17 @@ export interface ClineProviderConfig {
 	enabledModels?: string[];
 }
 
+export interface ModelAggregation {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** Display name, e.g. "Claude Opus 4.6". */
+	name: string;
+	/** Member model values (provider:modelId format), ordered by priority. */
+	models: string[];
+	/** Routing mode when auto is selected: "priority" uses first available, "balanced" round-robins. */
+	routingMode: "priority" | "balanced";
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -263,6 +274,11 @@ export interface NarraForkSettings {
 		}>;
 		/** Default system prompt — used as base prompt for all narrators when their own systemPrompt is null. */
 		defaultSystemPrompt?: string;
+		/**
+		 * Model aggregations — group models from different providers under a single virtual entry.
+		 * Users can select an aggregation and route to a specific provider or use auto mode.
+		 */
+		modelAggregations?: ModelAggregation[];
 		/**
 		 * Ordered list of provider prefixes controlling display & merge order.
 		 * Providers not listed are appended at the end in their default order.

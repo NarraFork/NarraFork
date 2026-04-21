@@ -2,15 +2,17 @@
  * Feishu (Lark) platform adapter.
  *
  * Uses @larksuiteoapi/node-sdk with WebSocket event subscription.
+ * Supports message editing for progressive streaming via PATCH API.
  */
 
 import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
-import type { FeishuConfig, GatewayPlatform, InboundMessage } from "../types";
+import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
 export class FeishuAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "feishu";
 	readonly maxMessageLength = 8000;
+	override readonly supportsEdit = true;
 
 	private client: any = null;
 	private wsClient: any = null;
@@ -100,7 +102,54 @@ export class FeishuAdapter extends BaseAdapter {
 		}
 	}
 
-	async sendTyping(chatId: string): Promise<void> {
+	override async sendAndGetId(chatId: string, text: string): Promise<SendResult> {
+		if (!this.client) return { success: false, error: "Client not connected" };
+
+		try {
+			const result = await this.client.im.message.create({
+				params: { receive_id_type: "chat_id" },
+				data: {
+					receive_id: chatId,
+					msg_type: "text",
+					content: JSON.stringify({ text }),
+				},
+			});
+
+			const messageId = result?.data?.message_id ?? null;
+			return { success: true, messageId };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	override async editMessage(
+		_chatId: string,
+		messageId: string,
+		text: string,
+	): Promise<SendResult> {
+		if (!this.client) return { success: false, error: "Client not connected" };
+
+		try {
+			await this.client.im.message.patch({
+				path: { message_id: messageId },
+				data: {
+					content: JSON.stringify({ text }),
+				},
+			});
+
+			return { success: true, messageId };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	async sendTyping(_chatId: string): Promise<void> {
 		// Feishu doesn't have a public typing indicator API
 	}
 

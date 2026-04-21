@@ -10,6 +10,7 @@ import {
 	CodexWebSocketFallbackError,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
+import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1138,6 +1139,8 @@ async function* _parseResponsesAPIStream(
 	const toolAccum = new Map<number, ResponsesToolAccum>();
 	// Reasoning item accumulators keyed by output_index
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
+	// Track SSE event: type for gateway-injected events
+	let currentEventType = "";
 
 	const reader = body.getReader();
 	try {
@@ -1151,7 +1154,12 @@ async function* _parseResponsesAPIStream(
 
 			for (const line of lines) {
 				const trimmed = line.trim();
-				if (!trimmed || trimmed.startsWith("event:")) continue;
+				if (!trimmed) continue;
+				// Track SSE event: lines for gateway-injected events
+				if (trimmed.startsWith("event:")) {
+					currentEventType = trimmed.slice(6).trim();
+					continue;
+				}
 				if (!trimmed.startsWith("data: ")) continue;
 
 				if (lineCount < 5) {
@@ -1162,14 +1170,31 @@ async function* _parseResponsesAPIStream(
 				}
 				lineCount++;
 
-				let chunk: ResponsesAPIChunk;
+				let data: Record<string, unknown>;
 				try {
-					chunk = JSON.parse(trimmed.slice(6));
+					data = JSON.parse(trimmed.slice(6));
 				} catch {
+					currentEventType = "";
 					continue;
 				}
 
-				const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+				// Gateway-injected events: check SSE event: type first, then data-embedded type
+				if (currentEventType && isGatewayEventType(currentEventType)) {
+					const gwEvt = parseGatewaySSEEvent(currentEventType, data);
+					currentEventType = "";
+					if (gwEvt) {
+						yield gwEvt;
+						continue;
+					}
+				}
+				currentEventType = "";
+				const gwEvt = parseGatewayDataEvent(data);
+				if (gwEvt) {
+					yield gwEvt;
+					continue;
+				}
+
+				const events = parseResponsesAPIEvent(data as ResponsesAPIChunk, toolAccum, reasoningAccum);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -1566,6 +1591,8 @@ async function* parseSSEStream(
 	// Accumulate tool call chunks by index
 	const toolAccum = new Map<number, ToolAccumEntry>();
 	let lineCount = 0;
+	// Track SSE event: type for gateway-injected events
+	let currentEventType = "";
 
 	const reader = body.getReader();
 	try {
@@ -1578,6 +1605,11 @@ async function* parseSSEStream(
 			buffer = lines.pop() ?? "";
 
 			for (const line of lines) {
+				// Track SSE event: lines for gateway-injected events
+				if (line.startsWith("event:")) {
+					currentEventType = line.slice(6).trim();
+					continue;
+				}
 				// Log first few SSE lines for debugging
 				if (lineCount < 5 && line.trim() && line.startsWith("data: ")) {
 					logger.debug("OpenAI SSE line", {
@@ -1586,7 +1618,8 @@ async function* parseSSEStream(
 					});
 				}
 				lineCount++;
-				const events = parseSSELine(line, toolAccum);
+				const events = parseSSELine(line, toolAccum, currentEventType);
+				currentEventType = "";
 				for (const evt of events) {
 					yield evt;
 				}
@@ -1594,7 +1627,7 @@ async function* parseSSEStream(
 		}
 		// Process any remaining data in the buffer after stream ends
 		if (buffer.trim()) {
-			const events = parseSSELine(buffer, toolAccum);
+			const events = parseSSELine(buffer, toolAccum, "");
 			for (const evt of events) {
 				yield evt;
 			}
@@ -1637,17 +1670,31 @@ function flushToolAccum(toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEve
 	return toolUses.length > 0 ? { toolUses } : null;
 }
 
-function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): ParsedStreamEvent[] {
+function parseSSELine(
+	line: string,
+	toolAccum: Map<number, ToolAccumEntry>,
+	eventType?: string,
+): ParsedStreamEvent[] {
 	const trimmed = line.trim();
 	if (!trimmed || trimmed === "data: [DONE]") return [];
 	if (!trimmed.startsWith("data: ")) return [];
 
-	let chunk: OAIStreamChunk;
+	let data: Record<string, unknown>;
 	try {
-		chunk = JSON.parse(trimmed.slice(6));
+		data = JSON.parse(trimmed.slice(6));
 	} catch {
 		return [];
 	}
+
+	// Gateway-injected events: check SSE event: type first, then data-embedded type
+	if (eventType && isGatewayEventType(eventType)) {
+		const gwEvt = parseGatewaySSEEvent(eventType, data);
+		return gwEvt ? [gwEvt] : [];
+	}
+	const gwEvt = parseGatewayDataEvent(data);
+	if (gwEvt) return [gwEvt];
+
+	const chunk = data as OAIStreamChunk;
 
 	// Handle error objects embedded in stream chunks
 	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)

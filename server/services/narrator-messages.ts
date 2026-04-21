@@ -13,6 +13,34 @@ import {
 // ── Internal helpers ───────────────────────────────────────────────────────
 
 /**
+ * Delete orphaned messages and their associated refs/tool-calls within a
+ * transaction. Also clears narrator FK references (forkMessageId,
+ * pruneBoundaryMessageId) that point to the orphaned messages.
+ *
+ * Shared by deleteMessagesFromSeq and deleteMessagesFromSeqInclusive.
+ */
+async function deleteOrphanedMessages(
+	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+	orphanIds: string[],
+): Promise<void> {
+	if (orphanIds.length === 0) return;
+
+	await tx
+		.update(narrators)
+		.set({ forkMessageId: null })
+		.where(inArray(narrators.forkMessageId, orphanIds));
+	await tx
+		.update(narrators)
+		.set({ pruneBoundaryMessageId: null })
+		.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
+
+	// Delete refs held by subagent narrators pointing to orphaned messages
+	await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.messageId, orphanIds));
+	await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
+	await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+}
+
+/**
  * For child messages belonging to subagent narrators, attach the subagent's
  * resolved model as `subagentModel` on each message.
  */
@@ -1107,17 +1135,7 @@ export const narratorMessageQueries = {
 					for (const c of childRows) orphanIds.push(c.id);
 				}
 
-				await tx
-					.update(narrators)
-					.set({ forkMessageId: null })
-					.where(inArray(narrators.forkMessageId, orphanIds));
-				await tx
-					.update(narrators)
-					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+				await deleteOrphanedMessages(tx, orphanIds);
 			}
 
 			const now = new Date().toISOString();
@@ -1264,17 +1282,7 @@ export const narratorMessageQueries = {
 					for (const c of childRows) orphanIds.push(c.id);
 				}
 
-				await tx
-					.update(narrators)
-					.set({ forkMessageId: null })
-					.where(inArray(narrators.forkMessageId, orphanIds));
-				await tx
-					.update(narrators)
-					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+				await deleteOrphanedMessages(tx, orphanIds);
 			}
 
 			const now = new Date().toISOString();

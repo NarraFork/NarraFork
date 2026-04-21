@@ -143,3 +143,84 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 
 	return c.json({ ok: true, chatId: msg.chatId });
 }
+
+// ---------------------------------------------------------------------------
+// Weixin QR Login — stateful sessions held in memory, keyed by JWT userId
+// ---------------------------------------------------------------------------
+
+import type { QrLoginSession } from "../gateway/platforms/weixin-qr-login";
+
+const activeQrSessions = new Map<string, QrLoginSession>();
+
+/**
+ * POST /weixin/qr-start — Begin a new QR login flow.
+ * Returns the QR URL for the user to scan.
+ */
+gatewayRoutes.post("/weixin/qr-start", async (c) => {
+	const userId = c.get("user").sub;
+	try {
+		const { startQrLogin } = await import("../gateway/platforms/weixin-qr-login");
+		const session = await startQrLogin();
+		activeQrSessions.set(userId, session);
+		return c.json({
+			qrcodeUrl: session.qrcodeUrl,
+			qrcodeToken: session.qrcodeToken,
+		});
+	} catch (err) {
+		return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+	}
+});
+
+/**
+ * GET /weixin/qr-poll — Poll the QR login status.
+ * Frontend should call this every 1-2 seconds after qr-start.
+ */
+gatewayRoutes.get("/weixin/qr-poll", async (c) => {
+	const userId = c.get("user").sub;
+	const session = activeQrSessions.get(userId);
+
+	if (!session) {
+		return c.json({ error: "No active QR session. Call POST /weixin/qr-start first." }, 400);
+	}
+
+	// Auto-expire after 8 minutes
+	if (Date.now() - session.createdAt > 480_000) {
+		activeQrSessions.delete(userId);
+		return c.json({ status: "error", message: "QR login timed out" });
+	}
+
+	try {
+		const { pollQrStatus } = await import("../gateway/platforms/weixin-qr-login");
+		const result = await pollQrStatus(session);
+
+		if (result.status === "confirmed") {
+			// Return credentials and clear session
+			activeQrSessions.delete(userId);
+			return c.json(result);
+		}
+
+		if (result.status === "expired" && !result.canRefresh) {
+			activeQrSessions.delete(userId);
+			return c.json({ status: "expired", canRefresh: false });
+		}
+
+		// For expired-with-refresh, return the refreshed QR URL
+		if (result.status === "expired") {
+			const refreshed = activeQrSessions.get(userId);
+			if (refreshed) {
+				return c.json({
+					...result,
+					qrcodeUrl: refreshed.qrcodeUrl,
+					qrcodeToken: refreshed.qrcodeToken,
+				});
+			}
+		}
+
+		return c.json(result);
+	} catch (err) {
+		return c.json(
+			{ status: "error", message: err instanceof Error ? err.message : String(err) },
+			500,
+		);
+	}
+});

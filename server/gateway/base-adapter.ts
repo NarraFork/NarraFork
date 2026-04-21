@@ -2,15 +2,24 @@
  * Abstract base class for IM platform adapters.
  *
  * Provides common utilities: message truncation, reconnection with
- * exponential back-off, and a typed message callback.
+ * exponential back-off, rate limiting, and a typed message callback.
  */
 
 import { logger } from "../lib/logger";
-import type { GatewayPlatform, InboundMessage, PlatformAdapter, PlatformAdapterEvents } from "./types";
+import type {
+	GatewayPlatform,
+	InboundMessage,
+	PlatformAdapter,
+	PlatformAdapterEvents,
+	SendResult,
+} from "./types";
 
 export abstract class BaseAdapter implements PlatformAdapter {
 	abstract readonly platform: GatewayPlatform;
 	abstract readonly maxMessageLength: number;
+
+	/** Override in subclass to enable streaming (progressive edits). */
+	readonly supportsEdit: boolean = false;
 
 	protected messageHandler: PlatformAdapterEvents["message"] | null = null;
 	protected connected = false;
@@ -29,6 +38,27 @@ export abstract class BaseAdapter implements PlatformAdapter {
 	abstract disconnect(): Promise<void>;
 	abstract send(chatId: string, text: string): Promise<void>;
 	abstract sendTyping(chatId: string): Promise<void>;
+
+	// -----------------------------------------------------------------------
+	// Edit support — default no-op implementations
+	// Subclasses that support editing override these.
+	// -----------------------------------------------------------------------
+
+	async sendAndGetId(chatId: string, text: string): Promise<SendResult> {
+		try {
+			await this.send(chatId, text);
+			return { success: true, messageId: null };
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	async editMessage(_chatId: string, _messageId: string, _text: string): Promise<SendResult> {
+		return { success: false, error: "Edit not supported" };
+	}
 
 	// -----------------------------------------------------------------------
 	// Message handler registration
@@ -107,7 +137,9 @@ export abstract class BaseAdapter implements PlatformAdapter {
 		// Add ±25 % jitter
 		const jitter = delay * (0.75 + Math.random() * 0.5);
 
-		logger.info(`[${this.platform}] Reconnecting in ${Math.round(jitter)}ms (attempt ${this.reconnectAttempt})`);
+		logger.info(
+			`[${this.platform}] Reconnecting in ${Math.round(jitter)}ms (attempt ${this.reconnectAttempt})`,
+		);
 
 		this.reconnectTimer = setTimeout(async () => {
 			this.reconnectTimer = null;
@@ -134,5 +166,57 @@ export abstract class BaseAdapter implements PlatformAdapter {
 			this.reconnectTimer = null;
 		}
 		this.reconnectAttempt = 0;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Simple in-memory rate limiter (per-user sliding window)
+// ---------------------------------------------------------------------------
+
+export class RateLimiter {
+	private windows = new Map<string, number[]>();
+	private readonly maxPerMinute: number;
+
+	constructor(maxPerMinute: number) {
+		this.maxPerMinute = maxPerMinute;
+	}
+
+	/** Returns true if the request is allowed, false if rate-limited. */
+	allow(key: string): boolean {
+		if (this.maxPerMinute <= 0) return true;
+
+		const now = Date.now();
+		const cutoff = now - 60_000;
+
+		let timestamps = this.windows.get(key);
+		if (!timestamps) {
+			timestamps = [];
+			this.windows.set(key, timestamps);
+		}
+
+		// Prune old entries
+		while (timestamps.length > 0 && timestamps[0] < cutoff) {
+			timestamps.shift();
+		}
+
+		if (timestamps.length >= this.maxPerMinute) {
+			return false;
+		}
+
+		timestamps.push(now);
+		return true;
+	}
+
+	/** Periodic cleanup of stale entries. */
+	cleanup(): void {
+		const cutoff = Date.now() - 60_000;
+		for (const [key, timestamps] of this.windows) {
+			while (timestamps.length > 0 && timestamps[0] < cutoff) {
+				timestamps.shift();
+			}
+			if (timestamps.length === 0) {
+				this.windows.delete(key);
+			}
+		}
 	}
 }

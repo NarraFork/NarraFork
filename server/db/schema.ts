@@ -566,6 +566,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	setupWizardCompleted: integer("setup_wizard_completed", { mode: "boolean" })
 		.notNull()
 		.default(false),
+	// Gateway configuration (JSON: per-user IM gateway settings)
+	gatewayConfig: text("gateway_config").notNull().default("{}"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -979,6 +981,8 @@ export const gatewaySessionMappings = sqliteTable(
 		narratorId: text("narrator_id")
 			.notNull()
 			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** NarraFork user this IM session belongs to (for recentTabs / notifications) */
+		appUserId: text("app_user_id").references(() => users.id, { onDelete: "set null" }),
 		/** Optional project binding */
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
 		/** Optional chapter binding */
@@ -990,5 +994,6 @@ export const gatewaySessionMappings = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_gsm_platform_chat_user").on(table.platform, table.chatId, table.userId),
 		index("idx_gsm_narrator").on(table.narratorId),
+		index("idx_gsm_app_user").on(table.appUserId),
 	],
 );

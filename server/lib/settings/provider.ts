@@ -6,6 +6,7 @@ import { getCodexManager } from "../codex-manager";
 import type {
 	AnthropicProviderConfig,
 	ClineProviderConfig,
+	ModelAggregation,
 	NarraForkSettings,
 	NUGProviderConfig,
 	OpenAIProviderConfig,
@@ -115,11 +116,100 @@ export function registerClineModelLister(lister: () => string[]): void {
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
 /**
+ * Prefix for model aggregation values stored in narrators.model.
+ * Format: "__agg__:{aggId}" for auto mode, "__agg__:{aggId}:{provider:model}" for pinned provider.
+ */
+export const AGG_MODEL_PREFIX = "__agg__:";
+
+/**
+ * Parse an aggregation model value.
+ * Returns null if the value is not an aggregation.
+ */
+export function parseAggModelValue(raw?: string | null): {
+	aggId: string;
+	pinnedModel?: string;
+} | null {
+	if (!raw?.startsWith(AGG_MODEL_PREFIX)) return null;
+	const rest = raw.slice(AGG_MODEL_PREFIX.length);
+	// rest is either "aggId" or "aggId:provider:model"
+	const firstColon = rest.indexOf(":");
+	if (firstColon < 0) return { aggId: rest };
+	const aggId = rest.slice(0, firstColon);
+	const pinnedModel = rest.slice(firstColon + 1);
+	return { aggId, pinnedModel: pinnedModel || undefined };
+}
+
+/**
+ * Build an aggregation model value string.
+ */
+export function buildAggModelValue(aggId: string, pinnedModel?: string): string {
+	if (pinnedModel) return `${AGG_MODEL_PREFIX}${aggId}:${pinnedModel}`;
+	return `${AGG_MODEL_PREFIX}${aggId}`;
+}
+
+/**
+ * Get an aggregation config by ID.
+ */
+export function getAggregation(aggId: string): ModelAggregation | undefined {
+	return (s().agent.modelAggregations ?? []).find((a) => a.id === aggId);
+}
+
+/** Round-robin counter for balanced aggregation routing. */
+const aggRoundRobin = new Map<string, number>();
+
+/**
+ * Resolve an aggregation to a concrete model value.
+ * @param aggId - The aggregation ID
+ * @param stickyProvider - Provider prefix from the last successful call in this session
+ * @returns The concrete "provider:model" value, or null if no member is available
+ */
+export function resolveAggregation(aggId: string, stickyProvider?: string): string | null {
+	const agg = getAggregation(aggId);
+	if (!agg || agg.models.length === 0) return null;
+
+	// If sticky provider matches a member, prefer it
+	if (stickyProvider) {
+		const stickyMatch = agg.models.find((m) => {
+			const parsed = parseModelId(m);
+			return parsed.provider === stickyProvider;
+		});
+		if (stickyMatch) return stickyMatch;
+	}
+
+	if (agg.routingMode === "balanced") {
+		const idx = aggRoundRobin.get(aggId) ?? 0;
+		const model = agg.models[idx % agg.models.length];
+		aggRoundRobin.set(aggId, idx + 1);
+		return model;
+	}
+
+	// Priority mode: return first member
+	return agg.models[0];
+}
+
+/**
  * Resolve the effective model string. If the stored value is null, undefined,
  * or the `__default__` sentinel, fall back to `settings.agent.defaultModel`.
+ * If the value is an aggregation (`__agg__:id` or `__agg__:id:provider:model`),
+ * resolve to the pinned model or delegate to aggregation routing.
  */
-export function resolveEffectiveModel(model: string | null | undefined): string {
+export function resolveEffectiveModel(
+	model: string | null | undefined,
+	stickyProvider?: string,
+): string {
 	if (!model || model === FOLLOW_DEFAULT_MODEL) return s().agent.defaultModel;
+
+	const agg = parseAggModelValue(model);
+	if (agg) {
+		// Pinned to a specific provider within the aggregation
+		if (agg.pinnedModel) return agg.pinnedModel;
+		// Auto mode — resolve via aggregation routing
+		const resolved = resolveAggregation(agg.aggId, stickyProvider);
+		if (resolved) return resolved;
+		// Fallback to default if aggregation has no members
+		return s().agent.defaultModel;
+	}
+
 	return model;
 }
 

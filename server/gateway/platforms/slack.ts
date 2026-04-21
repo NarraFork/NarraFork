@@ -2,15 +2,17 @@
  * Slack platform adapter.
  *
  * Uses @slack/bolt in Socket Mode (WebSocket, no public URL required).
+ * Supports message editing for progressive streaming via chat.update.
  */
 
 import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
-import type { GatewayPlatform, InboundMessage, SlackConfig } from "../types";
+import type { GatewayPlatform, InboundMessage, SendResult, SlackConfig } from "../types";
 
 export class SlackAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "slack";
 	readonly maxMessageLength = 39000;
+	override readonly supportsEdit = true;
 
 	private app: any = null;
 	private config: SlackConfig;
@@ -31,7 +33,7 @@ export class SlackAdapter extends BaseAdapter {
 			});
 
 			// Listen for messages
-			this.app.message(async ({ message, say }: any) => {
+			this.app.message(async ({ message }: any) => {
 				await this.handleSlackMessage(message);
 			});
 
@@ -74,9 +76,51 @@ export class SlackAdapter extends BaseAdapter {
 		}
 	}
 
-	async sendTyping(chatId: string): Promise<void> {
+	override async sendAndGetId(chatId: string, text: string): Promise<SendResult> {
+		if (!this.app) return { success: false, error: "App not connected" };
+
+		try {
+			const result = await this.app.client.chat.postMessage({
+				channel: chatId,
+				text,
+			});
+
+			return {
+				success: result.ok === true,
+				messageId: result.ts ?? null, // Slack uses `ts` as message ID
+			};
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	override async editMessage(chatId: string, messageId: string, text: string): Promise<SendResult> {
+		if (!this.app) return { success: false, error: "App not connected" };
+
+		try {
+			const result = await this.app.client.chat.update({
+				channel: chatId,
+				ts: messageId, // Slack uses `ts` as message ID
+				text,
+			});
+
+			return {
+				success: result.ok === true,
+				messageId,
+			};
+		} catch (err) {
+			return {
+				success: false,
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}
+
+	async sendTyping(_chatId: string): Promise<void> {
 		// Slack doesn't have a direct typing indicator API for bots.
-		// We can't do much here.
 	}
 
 	// -----------------------------------------------------------------------

@@ -49,7 +49,10 @@ const DEFAULTS = {
 	notifyFeishuEnabled: false,
 	notifyFeishuWebhook: "",
 	notifyFeishuSecret: "",
+	// Slash commands
 	sendMode: "enter" as const,
+	// Gateway
+	gatewayConfig: "{}",
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -165,7 +168,7 @@ userPreferencesRoutes.get("/", async (c) => {
 	const pref = await db.query.userPreferences.findFirst({
 		where: eq(userPreferences.userId, userId),
 	});
-	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [], commands: [] });
+	if (!pref) return c.json({ ...DEFAULTS, recentTabs: [], commands: [], gatewayConfig: {} });
 	// Parse recentTabs JSON string to array for the response
 	let recentTabs: Record<string, unknown>[] = [];
 	try {
@@ -186,6 +189,25 @@ userPreferencesRoutes.get("/", async (c) => {
 	// Enrich tabs with live runtime data
 	recentTabs = await enrichTabs(recentTabs);
 
+	// Parse and mask gateway config
+	let gatewayConfig: Record<string, unknown> = {};
+	try {
+		gatewayConfig = JSON.parse(typeof pref.gatewayConfig === "string" ? pref.gatewayConfig : "{}");
+	} catch {
+		// corrupted data, reset
+	}
+	// Mask secrets in platform configs
+	if (Array.isArray(gatewayConfig.platforms)) {
+		gatewayConfig.platforms = (gatewayConfig.platforms as Record<string, unknown>[]).map((p) => ({
+			...p,
+			token: maskSecret(p.token as string),
+			botToken: maskSecret(p.botToken as string),
+			appToken: maskSecret(p.appToken as string),
+			appSecret: maskSecret(p.appSecret as string),
+			secret: maskSecret(p.secret as string),
+		}));
+	}
+
 	return c.json({
 		...pref,
 		recentTabs,
@@ -195,6 +217,7 @@ userPreferencesRoutes.get("/", async (c) => {
 		notifyDingtalkSecret: maskSecret(pref.notifyDingtalkSecret),
 		notifyFeishuWebhook: maskSecret(pref.notifyFeishuWebhook),
 		notifyFeishuSecret: maskSecret(pref.notifyFeishuSecret),
+		gatewayConfig,
 	});
 });
 
@@ -234,6 +257,51 @@ userPreferencesRoutes.patch("/", async (c) => {
 	// Atomic upsert — avoids read-then-write race condition
 	const commandsJson = d.commands != null ? JSON.stringify(d.commands) : null;
 
+	// Handle gateway config: merge secrets from existing record when masked
+	let gatewayConfigJson: string | null = null;
+	if (d.gatewayConfig != null) {
+		const gwCfg = { ...d.gatewayConfig } as Record<string, unknown>;
+		if (Array.isArray(gwCfg.platforms)) {
+			// Check if any platform secrets are masked — need to preserve originals
+			const hasMasked = (gwCfg.platforms as Record<string, unknown>[]).some(
+				(p) =>
+					(typeof p.token === "string" && p.token.startsWith("*")) ||
+					(typeof p.botToken === "string" && p.botToken.startsWith("*")) ||
+					(typeof p.appToken === "string" && p.appToken.startsWith("*")) ||
+					(typeof p.appSecret === "string" && p.appSecret.startsWith("*")) ||
+					(typeof p.secret === "string" && p.secret.startsWith("*")),
+			);
+			if (hasMasked) {
+				const existing = await db.query.userPreferences.findFirst({
+					where: eq(userPreferences.userId, userId),
+					columns: { gatewayConfig: true },
+				});
+				let existingPlatforms: Record<string, unknown>[] = [];
+				try {
+					const parsed = JSON.parse(existing?.gatewayConfig ?? "{}");
+					existingPlatforms = Array.isArray(parsed.platforms) ? parsed.platforms : [];
+				} catch {
+					/* ignore */
+				}
+
+				const existingByPlatform = new Map(existingPlatforms.map((p) => [p.platform, p]));
+
+				gwCfg.platforms = (gwCfg.platforms as Record<string, unknown>[]).map((p) => {
+					const orig = existingByPlatform.get(p.platform) ?? {};
+					const secretFields = ["token", "botToken", "appToken", "appSecret", "secret"];
+					const merged = { ...p };
+					for (const f of secretFields) {
+						if (typeof merged[f] === "string" && (merged[f] as string).startsWith("*")) {
+							merged[f] = (orig as Record<string, unknown>)[f] ?? "";
+						}
+					}
+					return merged;
+				});
+			}
+		}
+		gatewayConfigJson = JSON.stringify(gwCfg);
+	}
+
 	sqlite.run(
 		`INSERT INTO user_preferences (
 			id, user_id,
@@ -243,9 +311,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
-			commands, send_mode, setup_wizard_completed,
+			commands, send_mode, setup_wizard_completed, gateway_config,
 			created_at, updated_at
-		) VALUES (${Array(30).fill("?").join(", ")})
+		) VALUES (${Array(31).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -273,6 +341,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   commands = COALESCE(?, commands),
 		   send_mode = COALESCE(?, send_mode),
 		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
+		   gateway_config = COALESCE(?, gateway_config),
 		   updated_at = ?`,
 		[
 			// INSERT values
@@ -304,6 +373,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			commandsJson ?? "[]",
 			d.sendMode ?? DEFAULTS.sendMode,
 			d.setupWizardCompleted ? 1 : 0,
+			gatewayConfigJson ?? DEFAULTS.gatewayConfig,
 			now,
 			now,
 			// ON CONFLICT UPDATE values (null = keep existing)
@@ -333,6 +403,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			commandsJson,
 			d.sendMode ?? null,
 			d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
+			gatewayConfigJson,
 			now,
 		],
 	);

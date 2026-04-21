@@ -3,6 +3,7 @@ import {
 	getClineProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
+	parseAggModelValue,
 	parseModelId,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -66,6 +67,9 @@ export interface ParsedStreamEvent {
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
 	credentialId?: string;
+	queueStatus?: { position: number; queueDepth: number };
+	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
+	quotaBalance?: string | null;
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;
@@ -328,8 +332,13 @@ function buildResolution(
 	};
 }
 
-export function resolveProviderAndModel(model?: string): ProviderResolution {
-	const requestedModel = resolveEffectiveModel(model);
+export function resolveProviderAndModel(
+	model?: string,
+	stickyProvider?: string,
+): ProviderResolution {
+	// For aggregation models, pass stickyProvider to enable session affinity
+	const isAgg = model ? !!parseAggModelValue(model) : false;
+	const requestedModel = resolveEffectiveModel(model, isAgg ? stickyProvider : undefined);
 	const requestedProvider = resolveProvider(requestedModel);
 
 			throw new Error(
