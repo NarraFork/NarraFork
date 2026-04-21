@@ -39,6 +39,7 @@ import type {
 	InboundMessage,
 	PlatformAdapter,
 	PlatformConfigUnion,
+	QQBotConfig,
 	SlackConfig,
 	TelegramConfig,
 	WeixinConfig,
@@ -57,6 +58,10 @@ class Gateway {
 
 	// Active stream consumers keyed by narratorId
 	private streamConsumers = new Map<string, GatewayStreamConsumer>();
+
+	// Narrators whose assistant messages were already delivered via message_broadcast
+	// (non-streaming platforms). Cleared when deliverToIM runs or narrator goes idle.
+	private deliveredNarrators = new Set<string>();
 
 	// Cache: appUserId → { narratorIds in recentTabs, timestamp }
 	// Avoids parsing JSON on every status change event.
@@ -166,6 +171,83 @@ class Gateway {
 		return this.adapters.get(platform);
 	}
 
+	/**
+	 * Reload the gateway — optionally only the specified platforms.
+	 * If `platforms` is empty/undefined, does a full stop → start cycle.
+	 * Otherwise, only the listed platforms are disconnected and reconnected
+	 * with the latest config (new platforms are added, removed ones are cleaned up).
+	 */
+	async reload(platforms?: GatewayPlatform[]): Promise<{ reloaded: GatewayPlatform[] }> {
+		const newConfig = await loadGatewayConfig();
+
+		// Full reload
+		if (!platforms || platforms.length === 0) {
+			await this.stop();
+			// Reset started so start() can proceed
+			this.config = null;
+			await this.start();
+			return { reloaded: Array.from(this.adapters.keys()) };
+		}
+
+		// Partial reload — only the specified platforms
+		const reloaded: GatewayPlatform[] = [];
+
+		for (const p of platforms) {
+			// Disconnect existing adapter if any
+			const existing = this.adapters.get(p);
+			if (existing) {
+				try {
+					await existing.disconnect();
+					logger.info(`[gateway] ${p} disconnected for reload`);
+				} catch (err) {
+					logger.error(`[gateway] ${p} disconnect error during reload`, {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+				this.adapters.delete(p);
+			}
+
+			// Find the new config for this platform
+			const pConfig = newConfig.platforms.find((c) => c.platform === p);
+			if (!pConfig || !pConfig.enabled) {
+				// Platform removed or disabled — already disconnected above
+				reloaded.push(p);
+				continue;
+			}
+
+			// Create and connect new adapter
+			try {
+				const adapter = await this.createAdapter(pConfig);
+				if (adapter) {
+					adapter.onMessage((msg) => this.handleInboundMessage(msg));
+					const ok = await adapter.connect();
+					if (ok) {
+						this.adapters.set(p, adapter);
+						logger.info(`[gateway] ${p} reconnected after reload`);
+					} else {
+						logger.warn(`[gateway] ${p} failed to reconnect after reload`);
+					}
+				}
+			} catch (err) {
+				logger.error(`[gateway] ${p} reload error`, {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+			reloaded.push(p);
+		}
+
+		// Update stored config
+		this.config = newConfig;
+
+		// If gateway wasn't started yet but now has enabled config, do a full start
+		if (!this.started && newConfig.enabled) {
+			await this.start();
+			return { reloaded: Array.from(this.adapters.keys()) };
+		}
+
+		return { reloaded };
+	}
+
 	// -----------------------------------------------------------------------
 	// Adapter factory
 	// -----------------------------------------------------------------------
@@ -195,6 +277,10 @@ class Gateway {
 			case "weixin": {
 				const { WeixinAdapter } = await import("./platforms/weixin");
 				return new WeixinAdapter(config as WeixinConfig);
+			}
+			case "qqbot": {
+				const { QQBotAdapter } = await import("./platforms/qqbot");
+				return new QQBotAdapter(config as QQBotConfig);
 			}
 			default:
 				logger.warn(`[gateway] Unknown platform: ${(config as any).platform}`);
@@ -654,17 +740,37 @@ class Gateway {
 			const it = item as Record<string, unknown>;
 			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
 			if (!refMsg) continue;
-			// ref_msg.title often contains the quoted text summary
-			const title = String(refMsg.title ?? "");
-			const match = Gateway.PERM_TAG_RE.exec(title);
-			if (match) return match[1];
-			// Also check message_item text
+
+			// Collect all text from ref_msg to search for the perm tag
+			const candidates: string[] = [];
+
+			// ref_msg.title — summary of the quoted message
+			if (refMsg.title) candidates.push(String(refMsg.title));
+
+			// ref_msg.message_item.text_item.text — full text of quoted message
 			const refItem = refMsg.message_item as Record<string, unknown> | undefined;
 			if (refItem?.type === 1) {
 				const textItem = refItem.text_item as Record<string, unknown> | undefined;
-				const refText = String(textItem?.text ?? "");
-				const m2 = Gateway.PERM_TAG_RE.exec(refText);
-				if (m2) return m2[1];
+				if (textItem?.text) candidates.push(String(textItem.text));
+			}
+
+			// ref_msg.desc / ref_msg.content — some platforms put text here
+			if (refMsg.desc) candidates.push(String(refMsg.desc));
+			if (refMsg.content) candidates.push(String(refMsg.content));
+
+			// Search all candidates
+			for (const text of candidates) {
+				const match = Gateway.PERM_TAG_RE.exec(text);
+				if (match) return match[1];
+			}
+
+			// Fallback: stringify the entire ref_msg and search
+			try {
+				const refStr = JSON.stringify(refMsg);
+				const match = Gateway.PERM_TAG_RE.exec(refStr);
+				if (match) return match[1];
+			} catch {
+				/* ignore */
 			}
 		}
 		return null;
@@ -686,7 +792,8 @@ class Gateway {
 		if (!adapter) return false;
 		const locale = await this.resolveLocale(msg);
 
-		const replyText = msg.text.trim().toLowerCase();
+		// Extract the user's own reply text (without the [引用: ...] prefix)
+		const replyText = this.extractPureReplyText(msg).toLowerCase();
 		const isApprove = Gateway.APPROVE_KEYWORDS.has(replyText);
 		const isDeny = Gateway.DENY_KEYWORDS.has(replyText);
 
@@ -700,11 +807,32 @@ class Gateway {
 			await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
 		} else {
 			await resolvePermission(requestId, "deny", {
-				denyMessage: msg.text.trim() || undefined,
+				denyMessage: replyText || undefined,
 			});
 			await adapter.send(msg.chatId, t("gateway.permissionDenied", locale));
 		}
 		return true;
+	}
+
+	/**
+	 * Extract the user's own text from a reply message, ignoring the quoted part.
+	 * Falls back to msg.text if raw parsing fails.
+	 */
+	private extractPureReplyText(msg: InboundMessage): string {
+		if (msg.raw && typeof msg.raw === "object") {
+			const raw = msg.raw as Record<string, unknown>;
+			const itemList = (raw.item_list as unknown[]) ?? [];
+			for (const item of itemList) {
+				if (!item || typeof item !== "object") continue;
+				const it = item as Record<string, unknown>;
+				if (it.type === 1 && it.ref_msg) {
+					// This is a text item with a quote — extract just the user's text
+					const textItem = it.text_item as Record<string, unknown> | undefined;
+					return String(textItem?.text ?? "").trim();
+				}
+			}
+		}
+		return msg.text.trim();
 	}
 
 	private subscribeToEvents(): void {
@@ -732,9 +860,8 @@ class Gateway {
 			await this.notifyRecentTabStatusChange(event.narratorId, event.status);
 		});
 
-		// Listen for streaming events — feed deltas to stream consumer
-		// Also handle tool call display and permission requests for IM
-		eventBus.on("narrator:ws_broadcast", async (event) => {
+		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
+		eventBus.on("narrator:message_broadcast", async (event) => {
 			const msg = event.message;
 
 			// --- Stream consumer: text deltas ---
@@ -813,6 +940,28 @@ class Gateway {
 					await adapter.send(mapping.chatId, text).catch(() => {});
 				}
 			}
+
+			// --- Assistant message delivery for non-streaming platforms ---
+			// When there's no stream consumer (platform doesn't support editing),
+			// deliver each assistant message as it's saved, so mid-turn text
+			// (before tool calls) isn't lost.
+			if (msg.type === "message" && !this.streamConsumers.has(event.narratorId)) {
+				const payload = msg.message as Record<string, unknown> | undefined;
+				if (payload?.role === "assistant") {
+					const contentText = typeof payload.contentText === "string" ? payload.contentText : "";
+					if (contentText.trim()) {
+						const mapping = await this.findMappingByNarrator(event.narratorId);
+						if (mapping) {
+							const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
+							if (adapter) {
+								// Track that we already delivered this turn's messages
+								this.deliveredNarrators.add(event.narratorId);
+								await adapter.send(mapping.chatId, contentText).catch(() => {});
+							}
+						}
+					}
+				}
+			}
 		});
 
 		// Listen for errors
@@ -828,10 +977,17 @@ class Gateway {
 
 			const locale = await this.resolveLocaleForAppUser(mapping.appUserId);
 			await adapter.send(mapping.chatId, t("gateway.error", locale, { error: event.error }));
+
+			// Clean up deliveredNarrators to prevent leaks when narrator never reaches idle
+			this.deliveredNarrators.delete(event.narratorId);
 		});
 	}
 
 	private async deliverToIM(narratorId: string): Promise<void> {
+		// If messages were already delivered via message_broadcast (non-streaming),
+		// skip the final delivery to avoid duplicates.
+		if (this.deliveredNarrators.delete(narratorId)) return;
+
 		const mapping = await this.findMappingByNarrator(narratorId);
 		if (!mapping) return; // Not an IM-bound narrator
 
@@ -985,7 +1141,17 @@ class Gateway {
 		const title = narrator.title || "(untitled)";
 		const statusEmoji =
 			status === "idle" ? "✅" : status === "error" ? "❌" : status === "waiting" ? "⏳" : "ℹ️";
-		const message = `${statusEmoji} ${title} (${shortId}…) → ${status}`;
+		let message = `${statusEmoji} ${title} (${shortId}…) → ${status}`;
+
+		// When waiting, append the pending permission request details so the user
+		// can quote-reply to approve/deny from any IM session.
+		if (status === "waiting") {
+			const pending = this.findPendingPermissionForNarrator(narratorId);
+			if (pending) {
+				const summary = this.formatToolSummary(pending.toolName, pending.input);
+				message += `\n🔐 ${pending.toolName}: ${summary}\n[perm:${pending.requestId}]`;
+			}
+		}
 
 		for (const mapping of mappings) {
 			if (!mapping.appUserId) continue;

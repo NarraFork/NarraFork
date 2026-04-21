@@ -808,6 +808,11 @@ export const miscApi = {
 			qrcodeUrl?: string;
 			qrcodeToken?: string;
 		}>("/gateway/weixin/qr-poll"),
+	gatewayReload: (platforms?: string[]) =>
+		request<{ ok: boolean; reloaded: string[]; status: { started: boolean; platforms: string[] } }>(
+			"/gateway/reload",
+			{ method: "POST", body: JSON.stringify({ platforms }) },
+		),
 
 	// Hooks
 	listHooks: (projectId?: string) =>

@@ -190,6 +190,8 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			}
 		}
 	}
+	// Mirror to eventBus so non-WS consumers (e.g. IM gateway) can react.
+	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
 
 /** Broadcast a message to all WS connections belonging to a specific user. */

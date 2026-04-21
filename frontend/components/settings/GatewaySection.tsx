@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Anchor,
 	Badge,
 	Button,
 	Group,
@@ -14,14 +15,16 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Transition,
 } from "@mantine/core";
-import { IconPlus, IconQrcode, IconTrash } from "@tabler/icons-react";
+import { notifications } from "@mantine/notifications";
+import { IconDeviceFloppy, IconPlus, IconQrcode, IconTrash } from "@tabler/icons-react";
 import type { UseMutationResult } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { miscApi } from "../../lib/api/misc";
 
-type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin";
+type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin" | "qqbot";
 
 interface PlatformConfig {
 	platform: Platform;
@@ -35,6 +38,18 @@ interface PlatformConfig {
 	accountId?: string;
 	baseUrl?: string;
 	allowedUsers?: string[];
+	// QQ Bot specific
+	clientSecret?: string;
+	allowedGroups?: string[];
+	dmPolicy?: string;
+	groupPolicy?: string;
+	markdownSupport?: boolean;
+	sandbox?: boolean;
+	stt?: {
+		apiKey: string;
+		baseUrl?: string;
+		model?: string;
+	};
 }
 
 interface GatewayConfig {
@@ -60,58 +75,108 @@ const PLATFORM_LABELS: Record<Platform, string> = {
 	feishu: "Feishu / Lark",
 	webhook: "Webhook",
 	weixin: "WeChat",
+	qqbot: "QQ Bot",
 };
 
-const ALL_PLATFORMS: Platform[] = ["telegram", "discord", "slack", "feishu", "webhook", "weixin"];
+const ALL_PLATFORMS: Platform[] = [
+	"telegram",
+	"discord",
+	"slack",
+	"feishu",
+	"webhook",
+	"weixin",
+	"qqbot",
+];
 
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
 	const [config, setConfig] = useState<GatewayConfig>({});
 	const [inited, setInited] = useState(false);
+	const [saving, setSaving] = useState(false);
+	const serverSnapshot = useRef<GatewayConfig>({});
 
 	useEffect(() => {
 		if (userPrefs && !inited) {
 			const raw = userPrefs.gatewayConfig;
 			if (raw && typeof raw === "object") {
-				setConfig(raw as GatewayConfig);
+				const parsed = raw as GatewayConfig;
+				setConfig(parsed);
+				serverSnapshot.current = parsed;
 			}
 			setInited(true);
 		}
 	}, [userPrefs, inited]);
 
-	const save = useCallback(
-		(updated: GatewayConfig) => {
-			setConfig(updated);
-			updateUserPref.mutate({ gatewayConfig: updated });
-		},
-		[updateUserPref],
-	);
+	const isDirty = useMemo(() => {
+		if (!inited) return false;
+		return JSON.stringify(config) !== JSON.stringify(serverSnapshot.current);
+	}, [inited, config]);
 
-	// Debounced save for NumberInput fields (avoids rapid API calls while typing/dragging)
-	const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const debouncedSave = useCallback(
-		(updated: GatewayConfig) => {
-			setConfig(updated);
-			if (debounceTimer.current) clearTimeout(debounceTimer.current);
-			debounceTimer.current = setTimeout(() => {
-				updateUserPref.mutate({ gatewayConfig: updated });
-			}, 500);
-		},
-		[updateUserPref],
-	);
+	// Compute which platforms changed (for targeted reload)
+	const getChangedPlatforms = useCallback((): Platform[] => {
+		const oldPlatforms = serverSnapshot.current.platforms ?? [];
+		const newPlatforms = config.platforms ?? [];
+		const changed = new Set<Platform>();
+
+		// Platforms that were added or modified
+		for (const np of newPlatforms) {
+			const op = oldPlatforms.find((p) => p.platform === np.platform);
+			if (!op || JSON.stringify(op) !== JSON.stringify(np)) {
+				changed.add(np.platform);
+			}
+		}
+		// Platforms that were removed
+		for (const op of oldPlatforms) {
+			if (!newPlatforms.find((p) => p.platform === op.platform)) {
+				changed.add(op.platform);
+			}
+		}
+		return Array.from(changed);
+	}, [config]);
+
+	const handleSave = useCallback(async () => {
+		setSaving(true);
+		try {
+			await new Promise<void>((resolve, reject) => {
+				updateUserPref.mutate(
+					{ gatewayConfig: config },
+					{ onSuccess: () => resolve(), onError: (err) => reject(err) },
+				);
+			});
+
+			// Determine which platforms need reload
+			const changedPlatforms = getChangedPlatforms();
+
+			// Also check if global gateway settings changed (enabled, streaming, etc.)
+			const globalChanged =
+				serverSnapshot.current.enabled !== config.enabled ||
+				serverSnapshot.current.streaming !== config.streaming ||
+				serverSnapshot.current.rateLimitPerMinute !== config.rateLimitPerMinute;
+
+			if (globalChanged && changedPlatforms.length === 0) {
+				// Global settings changed but no specific platform — full reload
+				await miscApi.gatewayReload();
+			} else if (changedPlatforms.length > 0) {
+				await miscApi.gatewayReload(changedPlatforms);
+			}
+
+			serverSnapshot.current = config;
+			notifications.show({ message: t("gatewaySaveSuccess"), color: "green" });
+		} catch (err) {
+			notifications.show({
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
+		} finally {
+			setSaving(false);
+		}
+	}, [config, updateUserPref, getChangedPlatforms, t]);
 
 	const updateField = useCallback(
 		<K extends keyof GatewayConfig>(key: K, value: GatewayConfig[K]) => {
-			save({ ...config, [key]: value });
+			setConfig((prev) => ({ ...prev, [key]: value }));
 		},
-		[config, save],
-	);
-
-	const updateFieldDebounced = useCallback(
-		<K extends keyof GatewayConfig>(key: K, value: GatewayConfig[K]) => {
-			debouncedSave({ ...config, [key]: value });
-		},
-		[config, debouncedSave],
+		[],
 	);
 
 	const platforms = config.platforms ?? [];
@@ -120,31 +185,29 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 		(platform: Platform) => {
 			const existing = platforms.find((p) => p.platform === platform);
 			if (existing) return;
-			save({
-				...config,
-				platforms: [...platforms, { platform, enabled: true }],
-			});
+			setConfig((prev) => ({
+				...prev,
+				platforms: [...(prev.platforms ?? []), { platform, enabled: true }],
+			}));
 		},
-		[config, platforms, save],
+		[platforms],
 	);
 
-	const removePlatform = useCallback(
-		(index: number) => {
-			const updated = [...platforms];
+	const removePlatform = useCallback((index: number) => {
+		setConfig((prev) => {
+			const updated = [...(prev.platforms ?? [])];
 			updated.splice(index, 1);
-			save({ ...config, platforms: updated });
-		},
-		[config, platforms, save],
-	);
+			return { ...prev, platforms: updated };
+		});
+	}, []);
 
-	const updatePlatform = useCallback(
-		(index: number, patch: Partial<PlatformConfig>) => {
-			const updated = [...platforms];
+	const updatePlatform = useCallback((index: number, patch: Partial<PlatformConfig>) => {
+		setConfig((prev) => {
+			const updated = [...(prev.platforms ?? [])];
 			updated[index] = { ...updated[index], ...patch };
-			save({ ...config, platforms: updated });
-		},
-		[config, platforms, save],
-	);
+			return { ...prev, platforms: updated };
+		});
+	}, []);
 
 	const availablePlatforms = ALL_PLATFORMS.filter(
 		(p) => !platforms.some((existing) => existing.platform === p),
@@ -191,9 +254,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 							value={config.sessionIdleMinutes ?? 0}
 							min={0}
 							max={43200}
-							onChange={(v) =>
-								updateFieldDebounced("sessionIdleMinutes", typeof v === "number" ? v : 0)
-							}
+							onChange={(v) => updateField("sessionIdleMinutes", typeof v === "number" ? v : 0)}
 						/>
 						<NumberInput
 							label={t("gatewayRateLimit")}
@@ -201,9 +262,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 							value={config.rateLimitPerMinute ?? 20}
 							min={0}
 							max={1000}
-							onChange={(v) =>
-								updateFieldDebounced("rateLimitPerMinute", typeof v === "number" ? v : 20)
-							}
+							onChange={(v) => updateField("rateLimitPerMinute", typeof v === "number" ? v : 20)}
 						/>
 					</Group>
 
@@ -259,6 +318,20 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 					))}
 				</>
 			)}
+
+			<Transition transition="slide-up" mounted={isDirty}>
+				{(styles) => (
+					<Group justify="flex-end" style={styles}>
+						<Button
+							leftSection={<IconDeviceFloppy size={16} />}
+							onClick={handleSave}
+							loading={saving}
+						>
+							{t("gatewaySave")}
+						</Button>
+					</Group>
+				)}
+			</Transition>
 		</Stack>
 	);
 }
@@ -451,6 +524,9 @@ function PlatformFields({
 					saveAllowedUsers={saveAllowedUsers}
 				/>
 			);
+
+		case "qqbot":
+			return <QQBotFields platform={platform} index={index} onUpdate={onUpdate} />;
 
 		default:
 			return null;
@@ -655,6 +731,181 @@ function WeixinFields({
 				onChange={(e) => setAllowedUsers(e.currentTarget.value)}
 				onBlur={() => saveAllowedUsers(allowedUsers)}
 			/>
+		</Stack>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// QQ Bot fields
+// ---------------------------------------------------------------------------
+
+const QQ_POLICY_OPTIONS = (t: (key: string) => string) => [
+	{ value: "open", label: t("gatewayQQBotPolicyOpen") },
+	{ value: "allowlist", label: t("gatewayQQBotPolicyAllowlist") },
+	{ value: "disabled", label: t("gatewayQQBotPolicyDisabled") },
+];
+
+function QQBotFields({
+	platform,
+	index,
+	onUpdate,
+}: {
+	platform: PlatformConfig;
+	index: number;
+	onUpdate: (index: number, patch: Partial<PlatformConfig>) => void;
+}) {
+	const { t } = useTranslation("settings");
+
+	const [appId, setAppId] = useState(platform.appId ?? "");
+	const [clientSecret, setClientSecret] = useState(platform.clientSecret ?? "");
+	const [allowedUsers, setAllowedUsers] = useState((platform.allowedUsers ?? []).join(", "));
+	const [allowedGroups, setAllowedGroups] = useState((platform.allowedGroups ?? []).join(", "));
+	const [sttApiKey, setSttApiKey] = useState(platform.stt?.apiKey ?? "");
+	const [sttBaseUrl, setSttBaseUrl] = useState(platform.stt?.baseUrl ?? "");
+	const [sttModel, setSttModel] = useState(platform.stt?.model ?? "");
+
+	useEffect(() => {
+		setAppId(platform.appId ?? "");
+		setClientSecret(platform.clientSecret ?? "");
+		setAllowedUsers((platform.allowedUsers ?? []).join(", "));
+		setAllowedGroups((platform.allowedGroups ?? []).join(", "));
+		setSttApiKey(platform.stt?.apiKey ?? "");
+		setSttBaseUrl(platform.stt?.baseUrl ?? "");
+		setSttModel(platform.stt?.model ?? "");
+	}, [platform]);
+
+	const saveField = (field: string, value: string) => {
+		if (value.startsWith("*")) return;
+		onUpdate(index, { [field]: value });
+	};
+
+	const saveCommaSeparated = (field: string, value: string) => {
+		const items = value
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+		onUpdate(index, { [field]: items.length > 0 ? items : undefined });
+	};
+
+	const saveStt = (patch: Partial<NonNullable<PlatformConfig["stt"]>>) => {
+		const current = platform.stt ?? { apiKey: "" };
+		const updated = { ...current, ...patch };
+		// If apiKey is empty, remove the whole stt config
+		if (!updated.apiKey) {
+			onUpdate(index, { stt: undefined });
+		} else {
+			onUpdate(index, { stt: updated });
+		}
+	};
+
+	const policyOptions = QQ_POLICY_OPTIONS(t);
+
+	return (
+		<Stack gap="xs">
+			<Text size="xs" c="dimmed">
+				{t("gatewayQQBotDesc")}
+			</Text>
+			<Anchor href="https://q.qq.com" target="_blank" rel="noopener noreferrer" size="xs">
+				{t("gatewayQQBotApplyLink")} ↗
+			</Anchor>
+
+			<TextInput
+				label={t("gatewayQQBotAppId")}
+				description={t("gatewayQQBotAppIdDesc")}
+				value={appId}
+				onChange={(e) => setAppId(e.currentTarget.value)}
+				onBlur={() => saveField("appId", appId)}
+			/>
+			<PasswordInput
+				label={t("gatewayQQBotClientSecret")}
+				description={t("gatewayQQBotClientSecretDesc")}
+				value={clientSecret}
+				onChange={(e) => setClientSecret(e.currentTarget.value)}
+				onBlur={() => saveField("clientSecret", clientSecret)}
+			/>
+
+			<Group grow>
+				<Select
+					label={t("gatewayQQBotDmPolicy")}
+					description={t("gatewayQQBotDmPolicyDesc")}
+					value={platform.dmPolicy ?? "open"}
+					onChange={(v) => onUpdate(index, { dmPolicy: v ?? "open" })}
+					data={policyOptions}
+				/>
+				<Select
+					label={t("gatewayQQBotGroupPolicy")}
+					description={t("gatewayQQBotGroupPolicyDesc")}
+					value={platform.groupPolicy ?? "open"}
+					onChange={(v) => onUpdate(index, { groupPolicy: v ?? "open" })}
+					data={policyOptions}
+				/>
+			</Group>
+
+			{platform.dmPolicy === "allowlist" && (
+				<TextInput
+					label={t("gatewayQQBotAllowedUsers")}
+					description={t("gatewayQQBotAllowedUsersDesc")}
+					value={allowedUsers}
+					onChange={(e) => setAllowedUsers(e.currentTarget.value)}
+					onBlur={() => saveCommaSeparated("allowedUsers", allowedUsers)}
+				/>
+			)}
+
+			{platform.groupPolicy === "allowlist" && (
+				<TextInput
+					label={t("gatewayQQBotAllowedGroups")}
+					description={t("gatewayQQBotAllowedGroupsDesc")}
+					value={allowedGroups}
+					onChange={(e) => setAllowedGroups(e.currentTarget.value)}
+					onBlur={() => saveCommaSeparated("allowedGroups", allowedGroups)}
+				/>
+			)}
+
+			<Group grow>
+				<Switch
+					label={t("gatewayQQBotMarkdown")}
+					description={t("gatewayQQBotMarkdownDesc")}
+					checked={platform.markdownSupport ?? false}
+					onChange={(e) => onUpdate(index, { markdownSupport: e.currentTarget.checked })}
+				/>
+				<Switch
+					label={t("gatewayQQBotSandbox")}
+					description={t("gatewayQQBotSandboxDesc")}
+					checked={platform.sandbox ?? false}
+					onChange={(e) => onUpdate(index, { sandbox: e.currentTarget.checked })}
+				/>
+			</Group>
+
+			<Text size="sm" fw={500} mt="xs">
+				{t("gatewayQQBotSttSection")}
+			</Text>
+			<PasswordInput
+				label={t("gatewayQQBotSttApiKey")}
+				description={t("gatewayQQBotSttApiKeyDesc")}
+				value={sttApiKey}
+				onChange={(e) => setSttApiKey(e.currentTarget.value)}
+				onBlur={() => saveStt({ apiKey: sttApiKey })}
+			/>
+			{sttApiKey && (
+				<Group grow>
+					<TextInput
+						label={t("gatewayQQBotSttBaseUrl")}
+						description={t("gatewayQQBotSttBaseUrlDesc")}
+						value={sttBaseUrl}
+						placeholder="https://open.bigmodel.cn/api/coding/paas/v4"
+						onChange={(e) => setSttBaseUrl(e.currentTarget.value)}
+						onBlur={() => saveStt({ baseUrl: sttBaseUrl || undefined })}
+					/>
+					<TextInput
+						label={t("gatewayQQBotSttModel")}
+						description={t("gatewayQQBotSttModelDesc")}
+						value={sttModel}
+						placeholder="glm-asr"
+						onChange={(e) => setSttModel(e.currentTarget.value)}
+						onBlur={() => saveStt({ model: sttModel || undefined })}
+					/>
+				</Group>
+			)}
 		</Stack>
 	);
 }

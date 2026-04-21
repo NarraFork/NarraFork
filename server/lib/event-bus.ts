@@ -220,6 +220,12 @@ export type NarraForkEvent =
 			type: "narrator:ws_broadcast";
 			narratorId: string;
 			message: NarratorServerMessage;
+	  }
+	// Mirror of every broadcastToNarrator call — for non-WS consumers (e.g. IM gateway)
+	| {
+			type: "narrator:message_broadcast";
+			narratorId: string;
+			message: NarratorServerMessage;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];
@@ -237,7 +243,10 @@ class NarraForkEventBus {
 		this.emitter.setMaxListeners(100);
 	}
 
-	private static SILENT_EVENTS: Set<string> = new Set([]);
+	private static SILENT_EVENTS: Set<string> = new Set([
+		"narrator:message_broadcast",
+		"narrator:ws_broadcast",
+	]);
 
 	emit(event: NarraForkEvent): void {
 		if (!NarraForkEventBus.SILENT_EVENTS.has(event.type)) {

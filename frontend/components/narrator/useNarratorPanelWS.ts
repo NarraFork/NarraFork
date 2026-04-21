@@ -254,10 +254,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
+				inputRaw?: string;
 			}
 		>
 	>(new Map());
 	const topLevelStreamingCreatedAtRef = useRef<string | null>(null);
+	/** Accumulated raw JSON input per tool (persists across RAF frames, cleared on tool completion) */
+	const toolInputRawRef = useRef<Map<string, string>>(new Map());
 	const toolChunkRafRef = useRef(0);
 
 	// Cancel pending RAF handles on unmount
@@ -287,12 +290,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const cancelPendingToolChunks = useCallback((notify = true, includeSubagent = false) => {
 		if (includeSubagent) {
 			pendingToolChunkRef.current.clear();
+			toolInputRawRef.current.clear();
 		} else {
 			// Only remove top-level entries; keep subagent chunks intact.
 			// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
 			for (const [key, chunk] of pendingToolChunkRef.current) {
 				if (!chunk.parentToolUseId) {
 					pendingToolChunkRef.current.delete(key);
+					toolInputRawRef.current.delete(key);
 				}
 			}
 		}
@@ -587,6 +592,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						_streamingContentChars: chunk.contentCharsReceived,
 					}),
 					...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
+					...(chunk.inputRaw && { _streamingInputRaw: chunk.inputRaw }),
 				});
 				blocks = next.blocks;
 				toolCalls = next.toolCalls;
@@ -1124,8 +1130,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				metadata?: Record<string, unknown>,
 				parentToolUseId?: string,
 			) => {
-				// Discard any pending RAF chunk for this tool — real state takes precedence
+				// Discard any pending RAF chunk and accumulated raw input for this tool
 				pendingToolChunkRef.current.delete(toolUseId);
+				toolInputRawRef.current.delete(toolUseId);
 
 				// Update the streaming chunk entry if it still exists (top-level only)
 				if (!parentToolUseId) {
@@ -1376,7 +1383,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string,
 				contentCharsReceived?: number,
 				extractedFields?: Record<string, string>,
+				inputDelta?: string,
 			) => {
+				// Accumulate raw JSON input across frames (not cleared per RAF)
+				if (inputDelta) {
+					const prev = toolInputRawRef.current.get(toolUseId) ?? "";
+					toolInputRawRef.current.set(toolUseId, prev + inputDelta);
+				}
 				// Accumulate the latest state for each toolUseId; flush once per frame
 				pendingToolChunkRef.current.set(toolUseId, {
 					toolUseId,
@@ -1430,6 +1443,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								extractedFilePath: chunk.extractedFilePath,
 								contentCharsReceived: chunk.contentCharsReceived,
 								extractedFields: chunk.extractedFields,
+								inputRaw: toolInputRawRef.current.get(chunk.toolUseId),
 							});
 							topLevelChanged = true;
 						}

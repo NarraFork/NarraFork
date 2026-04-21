@@ -477,10 +477,6 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		if (filePath) {
 			const base = basename(filePath);
 			const displayChars = contentChars ?? chars;
-			// Don't show tiny char counts during the initial streaming phase —
-			// the API may be validating output completeness and only a few bytes
-			// (JSON delimiters) have arrived. The ToolHeader renders a dedicated
-			// streaming indicator instead.
 			return displayChars > 10 ? `${base} (${displayChars} chars)` : base;
 		}
 		return chars > 0 ? `${chars} chars` : "";
@@ -2732,6 +2728,189 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+// --- Streaming input detail: renders live content from incomplete JSON ---
+
+/** Unescape common JSON string escapes */
+function unescapeJson(s: string): string {
+	return s
+		.replace(/\\n/g, "\n")
+		.replace(/\\t/g, "\t")
+		.replace(/\\r/g, "\r")
+		.replace(/\\"/g, '"')
+		.replace(/\\\\/g, "\\");
+}
+
+/**
+ * Find the unescaped closing quote in a JSON string value.
+ * Skips over escaped characters (e.g. `\"`, `\\`).
+ * Returns the index of the closing `"`, or -1 if not found.
+ */
+function findClosingQuote(s: string): number {
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] === "\\") {
+			i++; // skip escaped character
+			continue;
+		}
+		if (s[i] === '"') return i;
+	}
+	return -1;
+}
+
+/**
+ * Extract a string field value from incomplete streaming JSON.
+ * The value may not have a closing quote (still being written).
+ */
+function extractRawField(raw: string, fieldName: string): string | null {
+	const re = new RegExp(`"${fieldName}"\\s*:\\s*"`);
+	const m = raw.match(re);
+	if (!m || m.index == null) return null;
+	const start = m.index + m[0].length;
+	const val = raw.slice(start);
+	// Find the real closing quote (skipping escaped quotes)
+	const closeQuote = findClosingQuote(val);
+	if (closeQuote !== -1) {
+		return unescapeJson(val.slice(0, closeQuote));
+	}
+	// No closing quote yet — value is still streaming, return what we have
+	return unescapeJson(val);
+}
+
+/**
+ * Renders a live preview of tool input as it streams in.
+ *
+ * Strategy: wait until the header-relevant fields have been extracted by the
+ * backend (signalled via `_streamingFilePath` / `_streamingFields`) before
+ * rendering the main content body.  This ensures the ToolHeader summary is
+ * already populated when the detail area first appears.
+ */
+const StreamingInputDetail = memo(function StreamingInputDetail({
+	toolCall,
+}: {
+	toolCall: ToolCallData;
+}) {
+	const raw = toolCall.inputJson?._streamingInputRaw as string | undefined;
+	const boxRef = useRef<HTMLDivElement>(null);
+	const cat = getCategory(toolCall.toolName);
+	const filePath = toolCall.inputJson?._streamingFilePath as string | undefined;
+	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
+	const lang = filePath ? getShikiLang(filePath) : undefined;
+
+	// Auto-scroll to bottom as content streams in
+	useEffect(() => {
+		if (!raw || !boxRef.current) return;
+		const raf = requestAnimationFrame(() => {
+			const el = boxRef.current;
+			if (!el) return;
+			const scrollable = el.querySelector<HTMLElement>("pre");
+			if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
+				scrollable.scrollTop = scrollable.scrollHeight;
+			}
+		});
+		return () => cancelAnimationFrame(raf);
+	}, [raw]);
+
+	if (!raw || raw.length < 3) return null;
+
+	// Write/Edit tools: wait for backend to extract file_path before showing content
+	if (cat === "file") {
+		if (!filePath) return null;
+		const content = extractRawField(raw, "content") ?? extractRawField(raw, "new_string") ?? null;
+		if (!content) return null;
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
+					{filePath}
+				</Text>
+				<ContentViewer
+					content={content}
+					style={codeStyle}
+					title={basename(filePath)}
+					language={lang}
+					streaming
+				/>
+			</Box>
+		);
+	}
+
+	// Bash tools: command is the header summary itself — show once extractable
+	if (cat === "bash") {
+		const cmd = extractRawField(raw, "command");
+		if (!cmd) return null;
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<Code
+					block
+					style={{
+						...termStyle,
+						maxHeight: 120,
+						whiteSpace: "pre-wrap",
+						wordBreak: "break-all",
+						overflowX: "hidden",
+					}}
+				>
+					{`$ ${cmd}`}
+				</Code>
+			</Box>
+		);
+	}
+
+	// Search tools: pattern is the header summary — show once extractable
+	if (cat === "search") {
+		const pattern = extractRawField(raw, "pattern");
+		if (!pattern) return null;
+		const path = extractRawField(raw, "path");
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<Code block style={{ ...codeStyle, maxHeight: 60 }}>
+					{pattern}
+					{path ? ` in ${path}` : ""}
+				</Code>
+			</Box>
+		);
+	}
+
+	// Agent/Task tools: wait for description field (header summary) before showing prompt
+	if (cat === "agent") {
+		if (!fields?.description) return null;
+		const prompt = extractRawField(raw, "prompt");
+		if (!prompt) return null;
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<ContentViewer
+					content={prompt}
+					style={codeStyle}
+					title={toolCall.toolName}
+					markdown
+					streaming
+				/>
+			</Box>
+		);
+	}
+
+	// Read tools: file_path is the header summary — show once extractable
+	if (cat === "read") {
+		const fp = extractRawField(raw, "file_path");
+		if (!fp) return null;
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<Text size="xs" c="dimmed" ff="monospace">
+					{fp}
+				</Text>
+			</Box>
+		);
+	}
+
+	// Generic fallback: wait for enough data to be meaningful
+	if (raw.length < 50) return null;
+	return (
+		<Box mt="xs" ref={boxRef}>
+			<Code block style={{ ...codeStyle, maxHeight: 120 }}>
+				{raw}
+			</Code>
+		</Box>
+	);
+});
+
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 	const cat = getCategory(toolCall.toolName);
 	switch (cat) {
@@ -3481,6 +3660,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				? "tool-running-shimmer"
 				: undefined;
 
+	const hasStreamingRaw = isStreaming && !!toolCall.inputJson?._streamingInputRaw;
+
 	const cardContent = (
 		<NestedBlockCtx.Provider value={tcBlockId ?? null}>
 			<ToolHeader
@@ -3489,7 +3670,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onToggle={handleToggle}
 				narratorId={narratorId}
 			/>
-			{!isStreaming && (
+			{isStreaming ? (
+				hasStreamingRaw && <StreamingInputDetail toolCall={toolCall} />
+			) : (
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
 					<LazyCollapse in={opened}>

@@ -16,6 +16,7 @@ import { loadGatewayConfig } from "../gateway/config";
 import { gateway } from "../gateway/gateway";
 import { WebhookAdapter } from "../gateway/platforms/webhook";
 import type { WebhookConfig } from "../gateway/types";
+import { GATEWAY_PLATFORMS } from "../gateway/types";
 import { generateId } from "../lib/id";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
@@ -28,6 +29,20 @@ export const gatewayRoutes = new Hono();
 
 gatewayRoutes.get("/status", (c) => {
 	return c.json(gateway.getStatus());
+});
+
+// ---------------------------------------------------------------------------
+// POST /reload — Reload gateway (optionally specific platforms)
+// ---------------------------------------------------------------------------
+
+gatewayRoutes.post("/reload", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const validSet = new Set<string>(GATEWAY_PLATFORMS);
+	const platforms = Array.isArray(body.platforms)
+		? body.platforms.filter((p: unknown) => typeof p === "string" && validSet.has(p))
+		: undefined;
+	const result = await gateway.reload(platforms);
+	return c.json({ ok: true, ...result, status: gateway.getStatus() });
 });
 
 // ---------------------------------------------------------------------------

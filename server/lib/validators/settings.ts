@@ -4,14 +4,14 @@ import { commandSchema } from "./common";
 // === Gateway per-user configuration ===
 
 const gatewayPlatformConfigSchema = z.object({
-	platform: z.enum(["telegram", "discord", "slack", "feishu", "webhook", "weixin"]),
+	platform: z.enum(["telegram", "discord", "slack", "feishu", "webhook", "weixin", "qqbot"]),
 	enabled: z.boolean(),
 	// Telegram / Discord
 	token: z.string().max(500).optional(),
 	// Slack
 	botToken: z.string().max(500).optional(),
 	appToken: z.string().max(500).optional(),
-	// Feishu
+	// Feishu / QQ Bot
 	appId: z.string().max(200).optional(),
 	appSecret: z.string().max(500).optional(),
 	// Webhook
@@ -19,6 +19,20 @@ const gatewayPlatformConfigSchema = z.object({
 	// Weixin
 	accountId: z.string().max(200).optional(),
 	baseUrl: z.string().max(500).optional(),
+	// QQ Bot
+	clientSecret: z.string().max(500).optional(),
+	allowedGroups: z.array(z.string().max(100)).max(50).optional(),
+	dmPolicy: z.enum(["open", "allowlist", "disabled"]).optional(),
+	groupPolicy: z.enum(["open", "allowlist", "disabled"]).optional(),
+	markdownSupport: z.boolean().optional(),
+	sandbox: z.boolean().optional(),
+	stt: z
+		.object({
+			apiKey: z.string().max(500),
+			baseUrl: z.string().max(500).optional(),
+			model: z.string().max(100).optional(),
+		})
+		.optional(),
 	// Common
 	allowedUsers: z.array(z.string().max(100)).max(50).optional(),
 });

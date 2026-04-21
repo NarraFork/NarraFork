@@ -13,6 +13,7 @@ export const GATEWAY_PLATFORMS = [
 	"feishu",
 	"webhook",
 	"weixin",
+	"qqbot",
 ] as const;
 
 export type GatewayPlatform = (typeof GATEWAY_PLATFORMS)[number];
@@ -171,13 +172,40 @@ export interface WeixinConfig extends GatewayPlatformConfig {
 	sendChunkRetries?: number;
 }
 
+export interface QQBotConfig extends GatewayPlatformConfig {
+	platform: "qqbot";
+	/** QQ Bot App ID (required) */
+	appId: string;
+	/** QQ Bot App Secret (required) */
+	clientSecret: string;
+	/** Allowlisted user OpenIDs for DM access (empty = allow all) */
+	allowedUsers?: string[];
+	/** Allowlisted group OpenIDs (empty = allow all) */
+	allowedGroups?: string[];
+	/** DM access policy: "open" | "allowlist" | "disabled" */
+	dmPolicy?: string;
+	/** Group access policy: "open" | "allowlist" | "disabled" */
+	groupPolicy?: string;
+	/** Enable QQ markdown message format (msg_type 2) */
+	markdownSupport?: boolean;
+	/** Route requests to QQ sandbox gateway */
+	sandbox?: boolean;
+	/** STT (speech-to-text) configuration for voice messages */
+	stt?: {
+		apiKey: string;
+		baseUrl?: string;
+		model?: string;
+	};
+}
+
 export type PlatformConfigUnion =
 	| TelegramConfig
 	| DiscordConfig
 	| SlackConfig
 	| FeishuConfig
 	| WebhookConfig
-	| WeixinConfig;
+	| WeixinConfig
+	| QQBotConfig;
 
 export interface GatewayConfig {
 	/** Whether the gateway is enabled at all */

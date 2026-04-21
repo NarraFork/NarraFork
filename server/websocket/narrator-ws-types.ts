@@ -133,6 +133,8 @@ export type NarratorServerMessage =
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
+			/** Incremental JSON fragment for live preview (like text_delta) */
+			inputDelta?: string;
 	  }
 	| {
 			type: "subagent_started";

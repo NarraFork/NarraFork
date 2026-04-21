@@ -14,6 +14,7 @@ import type {
 	FeishuConfig,
 	GatewayConfig,
 	PlatformConfigUnion,
+	QQBotConfig,
 	SlackConfig,
 	TelegramConfig,
 	WebhookConfig,
@@ -141,6 +142,33 @@ function buildWeixinConfig(): WeixinConfig | null {
 	};
 }
 
+function buildQQBotConfig(): QQBotConfig | null {
+	const appId = process.env.QQ_APP_ID;
+	const clientSecret = process.env.QQ_CLIENT_SECRET;
+	if (!appId || !clientSecret) return null;
+
+	const sttApiKey = process.env.QQ_STT_API_KEY;
+	return {
+		platform: "qqbot",
+		enabled: true,
+		appId,
+		clientSecret,
+		allowedUsers: parseCommaSeparated(process.env.QQ_ALLOWED_USERS),
+		allowedGroups: parseCommaSeparated(process.env.QQ_ALLOWED_GROUPS),
+		dmPolicy: process.env.QQ_DM_POLICY,
+		groupPolicy: process.env.QQ_GROUP_POLICY,
+		markdownSupport: process.env.QQ_MARKDOWN_SUPPORT === "true",
+		sandbox: process.env.QQ_SANDBOX === "true",
+		stt: sttApiKey
+			? {
+					apiKey: sttApiKey,
+					baseUrl: process.env.QQ_STT_BASE_URL,
+					model: process.env.QQ_STT_MODEL,
+				}
+			: undefined,
+	};
+}
+
 /**
  * Load the full gateway configuration by merging database config with env vars.
  * Env vars always win.
@@ -162,6 +190,8 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
 	if (wh) envPlatforms.push(wh);
 	const wx = buildWeixinConfig();
 	if (wx) envPlatforms.push(wx);
+	const qq = buildQQBotConfig();
+	if (qq) envPlatforms.push(qq);
 
 	// Merge: env platforms override db platforms by platform key
 	const dbPlatforms = (dbCfg.platforms ?? []) as PlatformConfigUnion[];
