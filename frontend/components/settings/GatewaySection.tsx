@@ -1,7 +1,9 @@
 import {
 	ActionIcon,
+	Badge,
 	Button,
 	Group,
+	Loader,
 	Menu,
 	NumberInput,
 	Paper,
@@ -13,12 +15,13 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconPlus, IconQrcode, IconTrash } from "@tabler/icons-react";
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { miscApi } from "../../lib/api/misc";
 
-type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook";
+type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin";
 
 interface PlatformConfig {
 	platform: Platform;
@@ -29,6 +32,8 @@ interface PlatformConfig {
 	appId?: string;
 	appSecret?: string;
 	secret?: string;
+	accountId?: string;
+	baseUrl?: string;
 	allowedUsers?: string[];
 }
 
@@ -54,9 +59,10 @@ const PLATFORM_LABELS: Record<Platform, string> = {
 	slack: "Slack",
 	feishu: "Feishu / Lark",
 	webhook: "Webhook",
+	weixin: "WeChat",
 };
 
-const ALL_PLATFORMS: Platform[] = ["telegram", "discord", "slack", "feishu", "webhook"];
+const ALL_PLATFORMS: Platform[] = ["telegram", "discord", "slack", "feishu", "webhook", "weixin"];
 
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
@@ -433,7 +439,222 @@ function PlatformFields({
 				</Stack>
 			);
 
+		case "weixin":
+			return (
+				<WeixinFields
+					platform={platform}
+					index={index}
+					onUpdate={onUpdate}
+					token={token}
+					allowedUsers={allowedUsers}
+					setAllowedUsers={setAllowedUsers}
+					saveAllowedUsers={saveAllowedUsers}
+				/>
+			);
+
 		default:
 			return null;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// WeChat QR login + fields
+// ---------------------------------------------------------------------------
+
+type QrStatus = "idle" | "wait" | "scaned" | "confirmed" | "expired" | "error";
+
+function WeixinFields({
+	platform,
+	index,
+	onUpdate,
+	token,
+	allowedUsers,
+	setAllowedUsers,
+	saveAllowedUsers,
+}: {
+	platform: PlatformConfig;
+	index: number;
+	onUpdate: (index: number, patch: Partial<PlatformConfig>) => void;
+	token: string;
+	allowedUsers: string;
+	setAllowedUsers: (v: string) => void;
+	saveAllowedUsers: (v: string) => void;
+}) {
+	const { t } = useTranslation("settings");
+	const [qrStatus, setQrStatus] = useState<QrStatus>("idle");
+	const [qrUrl, setQrUrl] = useState<string | null>(null);
+	const [qrError, setQrError] = useState<string | null>(null);
+	const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+	// Cleanup polling on unmount
+	useEffect(() => {
+		return () => {
+			if (pollRef.current) clearInterval(pollRef.current);
+		};
+	}, []);
+
+	const stopPolling = useCallback(() => {
+		if (pollRef.current) {
+			clearInterval(pollRef.current);
+			pollRef.current = null;
+		}
+	}, []);
+
+	const startQrLogin = useCallback(async () => {
+		setQrStatus("wait");
+		setQrError(null);
+		setQrUrl(null);
+		stopPolling();
+
+		try {
+			const res = await miscApi.gatewayWeixinQrStart();
+			setQrUrl(res.qrcodeUrl);
+
+			// Start polling
+			pollRef.current = setInterval(async () => {
+				try {
+					const poll = await miscApi.gatewayWeixinQrPoll();
+
+					if (poll.status === "scaned") {
+						setQrStatus("scaned");
+					} else if (poll.status === "confirmed") {
+						stopPolling();
+						setQrStatus("confirmed");
+						setQrUrl(null);
+						// Auto-fill credentials
+						onUpdate(index, {
+							token: poll.token,
+							accountId: poll.accountId,
+							baseUrl: poll.baseUrl,
+						});
+					} else if (poll.status === "expired") {
+						if (poll.canRefresh && poll.qrcodeUrl) {
+							// QR refreshed, update URL
+							setQrUrl(poll.qrcodeUrl);
+							setQrStatus("wait");
+						} else {
+							stopPolling();
+							setQrStatus("expired");
+							setQrUrl(null);
+						}
+					} else if (poll.status === "error") {
+						stopPolling();
+						setQrStatus("error");
+						setQrError(poll.message ?? "Unknown error");
+						setQrUrl(null);
+					}
+					// "wait" → keep polling
+				} catch {
+					stopPolling();
+					setQrStatus("error");
+					setQrError("Polling failed");
+					setQrUrl(null);
+				}
+			}, 2000);
+		} catch (err) {
+			setQrStatus("error");
+			setQrError(err instanceof Error ? err.message : String(err));
+		}
+	}, [index, onUpdate, stopPolling]);
+
+	const statusBadge = () => {
+		switch (qrStatus) {
+			case "wait":
+				return (
+					<Badge color="blue" variant="light" leftSection={<Loader size={10} />}>
+						{t("gatewayWeixinQrScanning")}
+					</Badge>
+				);
+			case "scaned":
+				return (
+					<Badge color="yellow" variant="light" leftSection={<Loader size={10} />}>
+						{t("gatewayWeixinQrScaned")}
+					</Badge>
+				);
+			case "confirmed":
+				return (
+					<Badge color="green" variant="light">
+						{t("gatewayWeixinQrConfirmed")}
+					</Badge>
+				);
+			case "expired":
+				return (
+					<Badge color="orange" variant="light">
+						{t("gatewayWeixinQrExpired")}
+					</Badge>
+				);
+			case "error":
+				return (
+					<Badge color="red" variant="light">
+						{qrError ?? "Error"}
+					</Badge>
+				);
+			default:
+				return null;
+		}
+	};
+
+	const hasCredentials = !!(platform.accountId && platform.token);
+
+	return (
+		<Stack gap="xs">
+			<Text size="xs" c="dimmed">
+				{t("gatewayWeixinDesc")}
+			</Text>
+
+			{/* QR login section */}
+			<Group gap="sm">
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconQrcode size={14} />}
+					onClick={startQrLogin}
+					loading={qrStatus === "wait" || qrStatus === "scaned"}
+				>
+					{t("gatewayWeixinQrStart")}
+				</Button>
+				{statusBadge()}
+			</Group>
+
+			{qrUrl && (
+				<Button
+					component="a"
+					href={qrUrl}
+					target="_blank"
+					rel="noopener noreferrer"
+					size="xs"
+					variant="outline"
+					leftSection={<IconQrcode size={14} />}
+				>
+					{t("gatewayWeixinQrScanning")}
+				</Button>
+			)}
+
+			{/* Credentials (read-only, filled by QR login) */}
+			{hasCredentials && (
+				<>
+					<TextInput
+						label={t("gatewayWeixinAccountId")}
+						value={platform.accountId ?? ""}
+						readOnly
+						variant="filled"
+					/>
+					<PasswordInput
+						label={t("gatewayWeixinToken")}
+						value={token || platform.token || ""}
+						readOnly
+						variant="filled"
+					/>
+				</>
+			)}
+
+			<TextInput
+				label={t("gatewayWeixinAllowedUsers")}
+				description={t("gatewayWeixinAllowedUsersDesc")}
+				value={allowedUsers}
+				onChange={(e) => setAllowedUsers(e.currentTarget.value)}
+				onBlur={() => saveAllowedUsers(allowedUsers)}
+			/>
+		</Stack>
+	);
 }

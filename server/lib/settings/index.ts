@@ -32,6 +32,7 @@ export {
 	getModelMaxCompletionTokens,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
+	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,
 	hasConfiguredNugProvider,

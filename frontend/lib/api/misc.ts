@@ -791,6 +791,24 @@ export const miscApi = {
 			browserClosed?: boolean;
 		}>("/runtime/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
 
+	// Gateway — WeChat QR login
+	gatewayWeixinQrStart: () =>
+		request<{ qrcodeUrl: string; qrcodeToken: string }>("/gateway/weixin/qr-start", {
+			method: "POST",
+		}),
+	gatewayWeixinQrPoll: () =>
+		request<{
+			status: "wait" | "scaned" | "expired" | "confirmed" | "error";
+			canRefresh?: boolean;
+			accountId?: string;
+			token?: string;
+			baseUrl?: string;
+			userId?: string;
+			message?: string;
+			qrcodeUrl?: string;
+			qrcodeToken?: string;
+		}>("/gateway/weixin/qr-poll"),
+
 	// Hooks
 	listHooks: (projectId?: string) =>
 		request<HookApiRecord[]>(projectId ? `/hooks?projectId=${projectId}` : "/hooks"),

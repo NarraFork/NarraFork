@@ -55,7 +55,7 @@ gatewayRoutes.delete("/sessions/:id", async (c) => {
 // ---------------------------------------------------------------------------
 
 export async function handleWebhookRequest(c: Context): Promise<Response> {
-	const config = loadGatewayConfig();
+	const config = await loadGatewayConfig();
 	const whConfig = config.platforms.find((p) => p.platform === "webhook") as
 		| WebhookConfig
 		| undefined;

@@ -2,7 +2,7 @@ import { summaryGenerate } from "../lib/agent";
 import { estimateTokens } from "../lib/agent/estimate-tokens";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
-import { getModelContextWindow, parseModelId, settings } from "../lib/settings";
+import { getSummaryModelContextWindow } from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
 
 export { estimateTokens };
@@ -19,25 +19,16 @@ const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
  */
 const COMPACT_TARGET_RATIO = 0.8;
 
-/**
- * Get the effective context window (in tokens) for the summary model.
- *   reliable context window metadata)
- * - Other providers: use getModelContextWindow() which checks user overrides,
- *   provider config, and built-in table (falls back to 128K)
- */
-function getSummaryModelContextWindow(): number {
-	const model = settings.agent.summaryModel;
-	const parsed = parseModelId(model);
-
-		return 200_000;
-	}
-
-	return getModelContextWindow(parsed.model, provider) ?? 128_000;
-}
-
 // ── Message → text conversion ─────────────────────────────────────────────────
 
 type CompactMessage = Awaited<ReturnType<typeof narratorService.getMessagesSinceLastCompact>>[0];
+
+interface CompactEntry {
+	message: CompactMessage;
+	text: string;
+	pruned: boolean;
+	dropped: boolean;
+}
 
 /**
  * Convert a single message to its compact text representation.
@@ -140,11 +131,14 @@ export const narratorContext = {
 	 * Generate a thorough compact summary for session rotation.
 	 * More detailed than fork summary — preserves file paths, modifications, and working state.
 	 *
-	 * Uses progressive input fitting to ensure the conversation text fits within
-	 * the summary model's context window (target: 80% of capacity). When the raw
-	 * input exceeds the budget, it alternates between:
-	 *   1. Pruning tool calls from the earliest unpruned messages (cheaper)
-	 *   2. Dropping the earliest messages entirely (more aggressive)
+	 * When the conversation exceeds the summary model's context window, uses
+	 * **cascading summarization**: splits messages into chunks that each fit the
+	 * summary model, summarizes them sequentially, and feeds each chunk's summary
+	 * as the "previous context summary" into the next chunk. The final chunk
+	 * produces the overall summary.
+	 *
+	 * Within each chunk, progressive fitting (prune tool calls → drop oldest
+	 * messages) is still applied as a safety net.
 	 *
 	 * @param pruneBoundaryMessageId  The main session's current prune boundary.
 	 *   Messages at or before this ID start with tool calls already stripped.
@@ -166,18 +160,11 @@ export const narratorContext = {
 		}
 
 		// ── Build per-message compact text entries ──
-		// Track prune state per message: initially, messages at or before the
-		// main session's prune boundary are already "pruned" (tool calls stripped).
 		const pruneBoundaryIdx = pruneBoundaryMessageId
 			? messages.findIndex((m) => m.id === pruneBoundaryMessageId)
 			: -1;
 
-		const entries: Array<{
-			message: CompactMessage;
-			text: string;
-			pruned: boolean;
-			dropped: boolean;
-		}> = [];
+		const entries: CompactEntry[] = [];
 
 		for (let i = 0; i < messages.length; i++) {
 			const m = messages[i];
@@ -187,7 +174,7 @@ export const narratorContext = {
 			entries.push({ message: m, text, pruned: shouldPrune, dropped: false });
 		}
 
-		// ── Compute fixed overhead (system prompt, previous summary, wrapper) ──
+		// ── Compute fixed overhead ──
 		const compactPrompt = getPrompt("compact", locale);
 		const todos = Array.isArray(narrator.todosJson) ? narrator.todosJson : [];
 		const hasPendingTodos = todos.some((t: { status?: string }) => t.status !== "completed");
@@ -195,36 +182,120 @@ export const narratorContext = {
 		const compactSuffix = getPrompt("compactSuffix", locale);
 		const compactSystemPrompt = `${compactPrompt}${todoSkipHint}`;
 
-		const previousSummaryPrefix = narrator.contextSummary
-			? `[Previous context summary]:\n${narrator.contextSummary}\n\n---\n\n`
-			: "";
+		const summaryCtxWindow = getSummaryModelContextWindow();
+		const tokenBudget = Math.floor(summaryCtxWindow * COMPACT_TARGET_RATIO);
 
-		// Wrapper tokens: <conversation>\n ... \n</conversation>\n\n{suffix}
-		const wrapperText = `<conversation>\n\n</conversation>\n\n${compactSuffix}`;
-		const fixedTokens =
+		// Fixed tokens that are always present (system prompt + wrapper).
+		// The previous-summary prefix is variable per chunk, computed below.
+		const baseFixedTokens =
 			estimateTokens(compactSystemPrompt) +
-			estimateTokens(previousSummaryPrefix) +
-			estimateTokens(wrapperText);
+			estimateTokens(`<conversation>\n\n</conversation>\n\n${compactSuffix}`);
 
-		const tokenBudget = Math.floor(getSummaryModelContextWindow() * COMPACT_TARGET_RATIO);
+		// ── Determine whether cascading is needed ──
+		const totalTokens = entries.reduce((sum, e) => sum + estimateTokens(e.text), 0);
+		const previousSummary = narrator.contextSummary ?? "";
+		const previousSummaryTokens = previousSummary
+			? estimateTokens(`[Previous context summary]:\n${previousSummary}\n\n---\n\n`)
+			: 0;
+		const contentBudget = tokenBudget - baseFixedTokens - previousSummaryTokens;
+
+		if (totalTokens <= contentBudget) {
+			// Single-pass: everything fits in one call
+			return this._summarizeChunk(
+				narratorId,
+				entries,
+				previousSummary,
+				compactSystemPrompt,
+				compactSuffix,
+				baseFixedTokens,
+				tokenBudget,
+			);
+		}
+
+		// ── Cascading summarization ──
+		// Split entries into chunks that each fit the summary model's budget.
+		// Each chunk's summary becomes the next chunk's "previous summary".
+		const chunks = splitIntoChunks(entries, tokenBudget, baseFixedTokens, previousSummary);
+
+		logger.info("Cascading compact: splitting conversation into chunks", {
+			narratorId,
+			totalEntries: entries.length,
+			totalTokens,
+			summaryModelCtx: summaryCtxWindow,
+			chunks: chunks.length,
+		});
+
+		let rollingSummary = previousSummary;
+		let lastContextPercent: number | undefined;
+
+		for (let i = 0; i < chunks.length; i++) {
+			const chunk = chunks[i];
+			const isLast = i === chunks.length - 1;
+
+			logger.info("Cascading compact: processing chunk", {
+				narratorId,
+				chunk: i + 1,
+				totalChunks: chunks.length,
+				chunkEntries: chunk.length,
+				isLast,
+			});
+
+			const result = await this._summarizeChunk(
+				narratorId,
+				chunk,
+				rollingSummary,
+				compactSystemPrompt,
+				compactSuffix,
+				baseFixedTokens,
+				tokenBudget,
+			);
+
+			rollingSummary = result.summary;
+			lastContextPercent = result.contextPercent;
+
+			if (!isLast) {
+				// Intermediate summaries don't need to be perfect — just preserve
+				// enough context for the next chunk. Log progress.
+				logger.info("Cascading compact: intermediate summary generated", {
+					narratorId,
+					chunk: i + 1,
+					summaryLength: rollingSummary.length,
+				});
+			}
+		}
+
+		return { summary: rollingSummary, contextPercent: lastContextPercent };
+	},
+
+	/**
+	 * Summarize a single chunk of entries with progressive fitting + LLM call.
+	 * Shared by both single-pass and cascading paths.
+	 */
+	async _summarizeChunk(
+		narratorId: string,
+		entries: CompactEntry[],
+		previousSummary: string,
+		compactSystemPrompt: string,
+		compactSuffix: string,
+		baseFixedTokens: number,
+		tokenBudget: number,
+	): Promise<{ summary: string; contextPercent?: number }> {
+		const previousSummaryPrefix = previousSummary
+			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
+			: "";
+		const fixedTokens = baseFixedTokens + estimateTokens(previousSummaryPrefix);
 		const contentBudget = tokenBudget - fixedTokens;
 
 		// ── Progressive fitting: alternate prune ↔ drop until within budget ──
-		// Phase tracking: alternate between pruning tool calls from the earliest
-		// unpruned message and dropping the earliest non-dropped message.
 		let totalTokens = entries.reduce(
 			(sum, e) => (e.dropped ? sum : sum + estimateTokens(e.text)),
 			0,
 		);
 
-		// Pointer for the next message to prune (scan from start)
 		let prunePtr = 0;
-		// Pointer for the next message to drop (scan from start)
 		let dropPtr = 0;
-		// Alternate: true = try prune first, false = try drop first
 		let preferPrune = true;
-
-		const MAX_ITERATIONS = entries.length * 3; // safety cap
+		const MAX_ITERATIONS = entries.length * 3;
 		let iterations = 0;
 
 		while (totalTokens > contentBudget && iterations < MAX_ITERATIONS) {
@@ -232,7 +303,6 @@ export const narratorContext = {
 			let madeProgress = false;
 
 			if (preferPrune) {
-				// Try to prune tool calls from the earliest unpruned, non-dropped message
 				while (prunePtr < entries.length) {
 					const e = entries[prunePtr];
 					if (!e.dropped && !e.pruned) break;
@@ -249,7 +319,6 @@ export const narratorContext = {
 						totalTokens += estimateTokens(newText);
 						madeProgress = true;
 					} else {
-						// Pruning didn't help (no tool calls or text-only), mark as pruned
 						e.pruned = true;
 					}
 					prunePtr++;
@@ -257,7 +326,6 @@ export const narratorContext = {
 			}
 
 			if (!preferPrune || !madeProgress) {
-				// Drop the earliest non-dropped message
 				while (dropPtr < entries.length) {
 					if (!entries[dropPtr].dropped) break;
 					dropPtr++;
@@ -271,8 +339,8 @@ export const narratorContext = {
 				}
 			}
 
-			if (!madeProgress) break; // nothing left to trim
-			preferPrune = !preferPrune; // alternate strategy
+			if (!madeProgress) break;
+			preferPrune = !preferPrune;
 		}
 
 		// ── Assemble final conversation text ──
@@ -325,6 +393,66 @@ export const narratorContext = {
 		throw lastError instanceof Error ? lastError : new Error(String(lastError));
 	},
 };
+
+// ── Chunking helper for cascading compact ──────────────────────────────────────
+
+/**
+ * Split entries into sequential chunks where each chunk's total tokens fits
+ * within the summary model's content budget.
+ *
+ * The first chunk accounts for the original previousSummary overhead.
+ * Subsequent chunks reserve space for an intermediate summary prefix
+ * (estimated at a fixed size since we don't know the actual summary yet).
+ *
+ * Each chunk gets its own copy of entries (with fresh dropped/pruned state)
+ * so that `_summarizeChunk` can mutate them independently.
+ */
+function splitIntoChunks(
+	entries: CompactEntry[],
+	tokenBudget: number,
+	baseFixedTokens: number,
+	previousSummary: string,
+): CompactEntry[][] {
+	// Estimate how much space an intermediate summary prefix will take.
+	// A typical compact summary is ~1500-3000 tokens. Reserve a generous
+	// estimate so the chunk doesn't overflow.
+	const INTERMEDIATE_SUMMARY_RESERVE = 4_000;
+
+	const chunks: CompactEntry[][] = [];
+	let cursor = 0;
+
+	while (cursor < entries.length) {
+		// For the first chunk, use the actual previousSummary overhead.
+		// For subsequent chunks, reserve space for the intermediate summary.
+		const summaryOverhead =
+			chunks.length === 0 && previousSummary
+				? estimateTokens(`[Previous context summary]:\n${previousSummary}\n\n---\n\n`)
+				: chunks.length > 0
+					? INTERMEDIATE_SUMMARY_RESERVE
+					: 0;
+
+		const contentBudget = tokenBudget - baseFixedTokens - summaryOverhead;
+		const chunk: CompactEntry[] = [];
+		let chunkTokens = 0;
+
+		while (cursor < entries.length) {
+			const entryTokens = estimateTokens(entries[cursor].text);
+			if (chunk.length > 0 && chunkTokens + entryTokens > contentBudget) {
+				break;
+			}
+			// Clone entry so _summarizeChunk can mutate pruned/dropped independently
+			chunk.push({ ...entries[cursor] });
+			chunkTokens += entryTokens;
+			cursor++;
+		}
+
+		if (chunk.length > 0) {
+			chunks.push(chunk);
+		}
+	}
+
+	return chunks;
+}
 
 /** Truncate a JSON value to a readable preview string. */
 function summarizeJson(val: unknown, maxLen: number): string {

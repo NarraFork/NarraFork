@@ -696,6 +696,11 @@ function buildFileItem(media: UploadedMedia, filename: string) {
 // Inbound message parsing helpers
 // ---------------------------------------------------------------------------
 
+/** Strip internal gateway markers (e.g. [perm:xxx]) from text. */
+function stripGatewayTags(text: string): string {
+	return text.replace(/\[perm:[a-zA-Z0-9_-]+\]/g, "").trim();
+}
+
 function extractText(itemList: unknown[]): string {
 	const parts: string[] = [];
 	for (const item of itemList) {
@@ -704,7 +709,36 @@ function extractText(itemList: unknown[]): string {
 		if (it.type === ITEM_TEXT) {
 			const textItem = it.text_item as Record<string, unknown> | undefined;
 			const text = String(textItem?.text ?? "").trim();
-			if (text) parts.push(text);
+
+			// Handle quoted/referenced message
+			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
+			if (refMsg) {
+				const refItem = refMsg.message_item as Record<string, unknown> | undefined;
+				const refType = refItem?.type as number | undefined;
+				const title = String(refMsg.title ?? "").trim();
+
+				if (refType === ITEM_IMAGE || refType === ITEM_FILE || refType === 3 || refType === 5) {
+					// Referenced media — add a hint prefix
+					const prefix = title ? `[引用媒体: ${title}]` : "[引用媒体]";
+					if (text) parts.push(`${prefix}\n${text}`);
+					else parts.push(prefix);
+				} else if (refItem) {
+					// Referenced text — recursively extract
+					const refText = stripGatewayTags(extractText([refItem]));
+					const quoteParts: string[] = [];
+					if (title) quoteParts.push(stripGatewayTags(title));
+					if (refText) quoteParts.push(refText);
+					if (quoteParts.length > 0) {
+						parts.push(`[引用: ${quoteParts.join(" | ")}]\n${text}`);
+					} else if (text) {
+						parts.push(text);
+					}
+				} else if (text) {
+					parts.push(text);
+				}
+			} else if (text) {
+				parts.push(text);
+			}
 		}
 		// Voice items may have transcribed text
 		if (it.type === 3) {
@@ -733,7 +767,7 @@ async function downloadInboundImage(
 	let aesKeyB64 = String(media.aes_key ?? "").trim() || null;
 	const hexKey = String(imageItem.aeskey ?? "").trim();
 	if (!aesKeyB64 && hexKey) {
-		aesKeyB64 = Buffer.from(Buffer.from(hexKey, "hex")).toString("base64");
+		aesKeyB64 = Buffer.from(hexKey, "hex").toString("base64");
 	}
 
 	try {
@@ -747,6 +781,78 @@ async function downloadInboundImage(
 		return { data, filename: `image_${Date.now()}.jpg` };
 	} catch (err) {
 		logger.warn("[weixin] Image download failed", {
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return null;
+	}
+}
+
+/** Download and decrypt an inbound file attachment. */
+async function downloadInboundFile(
+	cdnBase: string,
+	item: Record<string, unknown>,
+): Promise<{ data: Buffer; filename: string; mediaType: string } | null> {
+	const fileItem = item.file_item as Record<string, unknown> | undefined;
+	if (!fileItem) return null;
+	const media = mediaReference(item, "file_item");
+
+	const filename = String(fileItem.file_name ?? `file_${Date.now()}.bin`).trim();
+
+	// aeskey in file_item may be hex string; convert to base64 for the decrypt helper
+	let aesKeyB64 = String(media.aes_key ?? "").trim() || null;
+	const hexKey = String(fileItem.aeskey ?? "").trim();
+	if (!aesKeyB64 && hexKey) {
+		aesKeyB64 = Buffer.from(hexKey, "hex").toString("base64");
+	}
+
+	try {
+		const data = await downloadAndDecryptMedia(
+			cdnBase,
+			String(media.encrypt_query_param ?? "") || null,
+			aesKeyB64,
+			String(media.full_url ?? "") || null,
+			60, // longer timeout for files
+		);
+
+		// Guess MIME type from filename extension
+		const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+		const mimeMap: Record<string, string> = {
+			txt: "text/plain",
+			md: "text/markdown",
+			csv: "text/csv",
+			json: "application/json",
+			xml: "application/xml",
+			html: "text/html",
+			js: "text/javascript",
+			ts: "text/typescript",
+			py: "text/x-python",
+			java: "text/x-java",
+			c: "text/x-c",
+			cpp: "text/x-c++",
+			h: "text/x-c",
+			rs: "text/x-rust",
+			go: "text/x-go",
+			rb: "text/x-ruby",
+			sh: "text/x-shellscript",
+			yaml: "text/yaml",
+			yml: "text/yaml",
+			toml: "text/toml",
+			ini: "text/plain",
+			cfg: "text/plain",
+			log: "text/plain",
+			pdf: "application/pdf",
+			doc: "application/msword",
+			docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			xls: "application/vnd.ms-excel",
+			xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			zip: "application/zip",
+		};
+		const mediaType = mimeMap[ext] ?? "application/octet-stream";
+
+		return { data, filename, mediaType };
+	} catch (err) {
+		logger.warn("[weixin] File download failed", {
+			filename,
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return null;
@@ -1009,7 +1115,37 @@ export class WeixinAdapter extends BaseAdapter {
 			}
 		}
 
-		if (!text && images.length === 0) return;
+		// Extract files
+		const files: InboundMessage["files"] = [];
+		for (const item of itemList) {
+			if (!item || typeof item !== "object") continue;
+			const it = item as Record<string, unknown>;
+			if (it.type === ITEM_FILE) {
+				const result = await downloadInboundFile(this.cdnBaseUrl, it);
+				if (result) {
+					files.push({
+						data: result.data,
+						filename: result.filename,
+						mediaType: result.mediaType,
+					});
+				}
+			}
+			// Also check ref_msg for quoted files
+			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
+			const refItem = refMsg?.message_item as Record<string, unknown> | undefined;
+			if (refItem?.type === ITEM_FILE) {
+				const result = await downloadInboundFile(this.cdnBaseUrl, refItem);
+				if (result) {
+					files.push({
+						data: result.data,
+						filename: result.filename,
+						mediaType: result.mediaType,
+					});
+				}
+			}
+		}
+
+		if (!text && images.length === 0 && files.length === 0) return;
 
 		const inbound: InboundMessage = {
 			platform: "weixin",
@@ -1018,6 +1154,7 @@ export class WeixinAdapter extends BaseAdapter {
 			username: senderId,
 			text,
 			images: images.length > 0 ? images : undefined,
+			files: files.length > 0 ? files : undefined,
 			raw: message,
 		};
 

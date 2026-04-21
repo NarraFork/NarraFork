@@ -39,6 +39,12 @@ export interface InboundMessage {
 		mediaType: string;
 		filename: string;
 	}>;
+	/** Optional file attachments (documents, text files, etc.) */
+	files?: Array<{
+		data: Buffer;
+		filename: string;
+		mediaType: string;
+	}>;
 	/** Platform-specific raw event (for debugging) */
 	raw?: unknown;
 }
@@ -204,6 +210,8 @@ export const IM_COMMANDS = [
 	"/list",
 	"/search",
 	"/switch",
+	"/approve",
+	"/deny",
 	"/help",
 ] as const;
 

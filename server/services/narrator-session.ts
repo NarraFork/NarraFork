@@ -1508,7 +1508,10 @@ export async function runAgentLoop(
 			// This is a fallback — the mid-turn compact in the context_usage handler
 			// may have already started a background compact.
 			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
-			const { model: postModel, provider: postProvider } = resolveProviderAndModel(active.model, active.provider);
+			const { model: postModel, provider: postProvider } = resolveProviderAndModel(
+				active.model,
+				active.provider,
+			);
 			const postTurnThresholds = getContextThresholds(postModel, postProvider);
 			if (
 				active._contextUsagePct != null &&
@@ -2010,8 +2013,12 @@ async function feedMessage(
 	//   - contentText → FTS search index + AI prompt, includes file references
 	persistBlocks.push({ type: "text", text: prompt });
 
+	// When the user sends images without text, inject a placeholder so that
+	// providers that gate on non-empty content still include the image blocks.
+	const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
+
 	// Build the effective prompt with attached file hints
-	const effectivePrompt = prompt + buildAttachedFilesHint(savedTextFiles);
+	const effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
 
 	const userMsg = await narratorService.persistUserMessage(
 		narratorId,

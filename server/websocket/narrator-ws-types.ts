@@ -25,6 +25,7 @@ export type NarratorServerMessage =
 			type: "tool_completed";
 			narratorId: string;
 			toolUseId: string;
+			toolName?: string;
 			status: string;
 			output?: unknown;
 			durationMs?: number;

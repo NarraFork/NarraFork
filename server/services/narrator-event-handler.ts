@@ -900,6 +900,7 @@ export async function processEvent(
 				type: "tool_completed",
 				narratorId: broadcastTargetId,
 				toolUseId: event.toolUseId,
+				toolName: event.toolName,
 				status,
 				output: truncateJson(event.output, 2000),
 				durationMs: event.durationMs,

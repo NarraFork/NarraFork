@@ -1,13 +1,13 @@
 /**
  * Gateway configuration loader.
  *
- * Reads from ~/.narrafork/gateway.json and merges with environment variables.
- * Environment variables take precedence.
+ * Reads from the database (user_preferences.gateway_config of the admin user)
+ * and merges with environment variables. Environment variables take precedence.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { eq } from "drizzle-orm";
+import { db } from "../db";
+import { userPreferences, users } from "../db/schema";
 import { logger } from "../lib/logger";
 import type {
 	DiscordConfig,
@@ -20,9 +20,6 @@ import type {
 	WeixinConfig,
 } from "./types";
 
-const NARRAFORK_HOME = process.env.NARRAFORK_HOME ?? join(homedir(), ".narrafork");
-const CONFIG_PATH = join(NARRAFORK_HOME, "gateway.json");
-
 function parseCommaSeparated(value: string | undefined): string[] | undefined {
 	if (!value) return undefined;
 	return value
@@ -31,13 +28,33 @@ function parseCommaSeparated(value: string | undefined): string[] | undefined {
 		.filter(Boolean);
 }
 
-function loadFileConfig(): Partial<GatewayConfig> {
-	if (!existsSync(CONFIG_PATH)) return {};
+/**
+ * Load gateway config from the database.
+ * Uses the admin user's preferences (or the first user if no admin).
+ */
+async function loadDbConfig(): Promise<Partial<GatewayConfig>> {
 	try {
-		const raw = readFileSync(CONFIG_PATH, "utf-8");
-		return JSON.parse(raw) as Partial<GatewayConfig>;
+		// Find admin user (or first user)
+		const allUsers = await db
+			.select({ id: users.id, role: users.role })
+			.from(users)
+			.orderBy(users.createdAt)
+			.limit(5);
+		if (allUsers.length === 0) return {};
+
+		const admin = allUsers.find((u) => u.role === "admin");
+		const userId = admin?.id ?? allUsers[0].id;
+
+		const pref = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { gatewayConfig: true },
+		});
+		if (!pref?.gatewayConfig) return {};
+
+		const parsed = JSON.parse(typeof pref.gatewayConfig === "string" ? pref.gatewayConfig : "{}");
+		return parsed as Partial<GatewayConfig>;
 	} catch (err) {
-		logger.warn("Failed to parse gateway.json", {
+		logger.warn("[gateway] Failed to load config from database", {
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return {};
@@ -125,11 +142,11 @@ function buildWeixinConfig(): WeixinConfig | null {
 }
 
 /**
- * Load the full gateway configuration by merging file config with env vars.
+ * Load the full gateway configuration by merging database config with env vars.
  * Env vars always win.
  */
-export function loadGatewayConfig(): GatewayConfig {
-	const file = loadFileConfig();
+export async function loadGatewayConfig(): Promise<GatewayConfig> {
+	const dbCfg = await loadDbConfig();
 
 	// Build platform configs from env vars
 	const envPlatforms: PlatformConfigUnion[] = [];
@@ -146,15 +163,15 @@ export function loadGatewayConfig(): GatewayConfig {
 	const wx = buildWeixinConfig();
 	if (wx) envPlatforms.push(wx);
 
-	// Merge: env platforms override file platforms by platform key
-	const filePlatforms = (file.platforms ?? []) as PlatformConfigUnion[];
+	// Merge: env platforms override db platforms by platform key
+	const dbPlatforms = (dbCfg.platforms ?? []) as PlatformConfigUnion[];
 	const envKeys = new Set(envPlatforms.map((p) => p.platform));
-	const merged = [...envPlatforms, ...filePlatforms.filter((p) => !envKeys.has(p.platform))];
+	const merged = [...envPlatforms, ...dbPlatforms.filter((p) => !envKeys.has(p.platform))];
 
 	const enabled =
 		process.env.GATEWAY_ENABLED !== undefined
 			? process.env.GATEWAY_ENABLED === "true"
-			: (file.enabled ?? merged.some((p) => p.enabled));
+			: (dbCfg.enabled ?? merged.some((p) => p.enabled));
 
 	const sessionIdleMinutesEnv = process.env.GATEWAY_SESSION_IDLE_MINUTES;
 	const rateLimitEnv = process.env.GATEWAY_RATE_LIMIT_PER_MINUTE;
@@ -162,17 +179,17 @@ export function loadGatewayConfig(): GatewayConfig {
 
 	return {
 		enabled,
-		defaultProjectId: process.env.GATEWAY_DEFAULT_PROJECT_ID ?? file.defaultProjectId,
-		defaultChapterId: process.env.GATEWAY_DEFAULT_CHAPTER_ID ?? file.defaultChapterId,
+		defaultProjectId: process.env.GATEWAY_DEFAULT_PROJECT_ID ?? dbCfg.defaultProjectId,
+		defaultChapterId: process.env.GATEWAY_DEFAULT_CHAPTER_ID ?? dbCfg.defaultChapterId,
 		defaultPermissionMode:
 			process.env.GATEWAY_DEFAULT_PERMISSION_MODE ??
-			file.defaultPermissionMode ??
+			dbCfg.defaultPermissionMode ??
 			"bypassPermissions",
 		sessionIdleMinutes: sessionIdleMinutesEnv
 			? Number(sessionIdleMinutesEnv)
-			: (file.sessionIdleMinutes ?? 0),
-		rateLimitPerMinute: rateLimitEnv ? Number(rateLimitEnv) : (file.rateLimitPerMinute ?? 20),
-		streaming: streamingEnv !== undefined ? streamingEnv === "true" : (file.streaming ?? true),
+			: (dbCfg.sessionIdleMinutes ?? 0),
+		rateLimitPerMinute: rateLimitEnv ? Number(rateLimitEnv) : (dbCfg.rateLimitPerMinute ?? 20),
+		streaming: streamingEnv !== undefined ? streamingEnv === "true" : (dbCfg.streaming ?? true),
 		platforms: merged,
 	};
 }

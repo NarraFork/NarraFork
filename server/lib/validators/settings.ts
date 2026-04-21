@@ -16,6 +16,9 @@ const gatewayPlatformConfigSchema = z.object({
 	appSecret: z.string().max(500).optional(),
 	// Webhook
 	secret: z.string().max(500).optional(),
+	// Weixin
+	accountId: z.string().max(200).optional(),
+	baseUrl: z.string().max(500).optional(),
 	// Common
 	allowedUsers: z.array(z.string().max(100)).max(50).optional(),
 });

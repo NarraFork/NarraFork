@@ -570,6 +570,15 @@ export const DEFAULT_CONTEXT_THRESHOLDS = {
 	large: { pruneStart: 95, compactStart: 99 },
 };
 
+/**
+ * Resolve the summary model's effective context window (tokens).
+ */
+export function getSummaryModelContextWindow(): number {
+	const summaryModel = s().agent.summaryModel;
+	const parsed = parseModelId(summaryModel);
+	return getModelContextWindow(parsed.model, prov) ?? 128_000;
+}
+
 export function getContextThresholds(
 	model: string,
 	provider: string,

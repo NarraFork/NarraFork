@@ -6,6 +6,7 @@
  *   - Outbound: eventBus narrator events → stream / send back to IM platform
  */
 
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { and, desc, eq, inArray, isNotNull, like, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -19,11 +20,14 @@ import {
 	users,
 } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
+import type { Locale } from "../lib/i18n";
+import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
+import { pendingPermissions } from "../services/narrator-session-state";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
 import { GatewayStreamConsumer } from "./stream-consumer";
@@ -59,6 +63,10 @@ class Gateway {
 	private recentTabsCache = new Map<string, { ids: Set<string>; ts: number }>();
 	private static readonly RECENT_TABS_CACHE_TTL = 60_000; // 60 seconds
 
+	// Cache: platform:chatId:userId → { locale, timestamp }
+	private localeCache = new Map<string, { locale: Locale; ts: number }>();
+	private static readonly LOCALE_CACHE_TTL = 60_000; // 60 seconds
+
 	// -----------------------------------------------------------------------
 	// Lifecycle
 	// -----------------------------------------------------------------------
@@ -66,7 +74,7 @@ class Gateway {
 	async start(): Promise<void> {
 		if (this.started) return;
 
-		this.config = loadGatewayConfig();
+		this.config = await loadGatewayConfig();
 		if (!this.config.enabled) {
 			logger.info("[gateway] Gateway disabled by configuration");
 			return;
@@ -211,7 +219,8 @@ class Gateway {
 				logger.warn(`[gateway] Rate limited: ${key}`);
 				const adapter = this.adapters.get(msg.platform);
 				if (adapter) {
-					await adapter.send(msg.chatId, "⏳ Rate limited. Please wait a moment.").catch(() => {});
+					const locale = await this.resolveLocale(msg);
+					await adapter.send(msg.chatId, t("gateway.rateLimited", locale)).catch(() => {});
 				}
 				return;
 			}
@@ -221,6 +230,11 @@ class Gateway {
 		const command = this.parseCommand(msg.text);
 		if (command) {
 			await this.handleCommand(command, msg);
+			return;
+		}
+
+		// Handle permission approval/denial via quoted message
+		if (await this.handlePermissionByQuote(msg)) {
 			return;
 		}
 
@@ -249,7 +263,19 @@ class Gateway {
 			// Convert IM images to ImageRef (download URL → save to uploads)
 			const imageRefs = await this.convertImages(mapping.narratorId, msg.images);
 
-			await sendMessage(mapping.narratorId, msg.text, imageRefs.length > 0 ? imageRefs : undefined);
+			// Convert IM files to File objects for textFiles parameter
+			const textFiles = this.convertFiles(msg.files);
+
+			await sendMessage(
+				mapping.narratorId,
+				msg.text,
+				imageRefs.length > 0 ? imageRefs : undefined,
+				/* locale */ undefined,
+				/* replyInUserLanguage */ false,
+				/* commandText */ undefined,
+				/* userId */ undefined,
+				textFiles.length > 0 ? textFiles : undefined,
+			);
 		} catch (err) {
 			logger.error("[gateway] sendMessage failed", {
 				narratorId: mapping.narratorId,
@@ -258,9 +284,12 @@ class Gateway {
 			// Clean up stream consumer on error
 			this.cleanupStreamConsumer(mapping.narratorId);
 			if (adapter) {
+				const locale = await this.resolveLocale(msg);
 				await adapter.send(
 					msg.chatId,
-					`❌ Error: ${err instanceof Error ? err.message : "Unknown error"}`,
+					t("gateway.error", locale, {
+						error: err instanceof Error ? err.message : "Unknown error",
+					}),
 				);
 			}
 		}
@@ -328,9 +357,8 @@ class Gateway {
 
 					const adapter = this.adapters.get(msg.platform);
 					if (adapter) {
-						await adapter
-							.send(msg.chatId, "🔄 Session expired due to inactivity. Starting fresh.")
-							.catch(() => {});
+						const locale = await this.resolveLocaleForAppUser(existing.appUserId);
+						await adapter.send(msg.chatId, t("gateway.sessionExpired", locale)).catch(() => {});
 					}
 
 					return this.createNewMapping(msg, now);
@@ -368,15 +396,34 @@ class Gateway {
 				if (img.base64) {
 					buffer = Buffer.from(img.base64, "base64").buffer as ArrayBuffer;
 				} else if (img.url) {
-					const resp = await fetch(img.url);
-					if (!resp.ok) {
-						logger.warn("[gateway] Failed to download image", {
-							url: img.url,
-							status: resp.status,
-						});
-						continue;
+					// Local file path (e.g. from weixin temp dir) or remote URL
+					if (img.url.startsWith("/") || img.url.startsWith("~")) {
+						if (!existsSync(img.url)) {
+							logger.warn("[gateway] Local image file not found", { path: img.url });
+							continue;
+						}
+						const fileData = readFileSync(img.url);
+						buffer = fileData.buffer.slice(
+							fileData.byteOffset,
+							fileData.byteOffset + fileData.byteLength,
+						) as ArrayBuffer;
+						// Clean up temp file after reading
+						try {
+							unlinkSync(img.url);
+						} catch {
+							/* non-fatal */
+						}
+					} else {
+						const resp = await fetch(img.url);
+						if (!resp.ok) {
+							logger.warn("[gateway] Failed to download image", {
+								url: img.url,
+								status: resp.status,
+							});
+							continue;
+						}
+						buffer = await resp.arrayBuffer();
 					}
-					buffer = await resp.arrayBuffer();
 				} else {
 					continue;
 				}
@@ -395,6 +442,28 @@ class Gateway {
 		}
 
 		return refs;
+	}
+
+	/** Convert inbound file attachments to File objects for the narrator textFiles parameter. */
+	private convertFiles(files?: InboundMessage["files"]): File[] {
+		if (!files || files.length === 0) return [];
+		return files
+			.map((f) => {
+				try {
+					const ab = f.data.buffer.slice(
+						f.data.byteOffset,
+						f.data.byteOffset + f.data.byteLength,
+					) as ArrayBuffer;
+					return new File([ab], f.filename, { type: f.mediaType });
+				} catch (err) {
+					logger.warn("[gateway] File conversion failed", {
+						filename: f.filename,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					return null;
+				}
+			})
+			.filter((f): f is File => f !== null);
 	}
 
 	// -----------------------------------------------------------------------
@@ -493,6 +562,151 @@ class Gateway {
 	// Outbound: Narrator events → IM
 	// -----------------------------------------------------------------------
 
+	/** Format tool input into a short summary for IM display. */
+	private formatToolSummary(toolName: string, input: unknown): string {
+		const inp = input as Record<string, unknown> | null;
+		if (!inp) return "";
+		let summary = "";
+		switch (toolName) {
+			case "Bash":
+				summary = typeof inp.command === "string" ? inp.command : "";
+				break;
+			case "Read":
+			case "Write":
+			case "Edit":
+				summary = typeof inp.file_path === "string" ? inp.file_path : "";
+				break;
+			case "Glob":
+				summary = typeof inp.pattern === "string" ? inp.pattern : "";
+				break;
+			case "Grep":
+				summary = typeof inp.pattern === "string" ? inp.pattern : "";
+				break;
+			case "WebSearch":
+				summary = typeof inp.query === "string" ? inp.query : "";
+				break;
+			case "Agent":
+				summary = typeof inp.description === "string" ? inp.description : "";
+				break;
+			default:
+				summary = JSON.stringify(inp).slice(0, 120);
+				break;
+		}
+		if (summary.length > 200) summary = `${summary.slice(0, 197)}…`;
+		return summary;
+	}
+
+	/** Find the first pending permission request for a narrator. */
+	private findPendingPermissionForNarrator(
+		narratorId: string,
+	): { requestId: string; toolName: string; input: Record<string, unknown> } | null {
+		for (const [requestId, pending] of pendingPermissions) {
+			if (pending.narratorId === narratorId) {
+				return { requestId, toolName: pending.toolName, input: pending.input };
+			}
+		}
+		return null;
+	}
+
+	// -----------------------------------------------------------------------
+	// Permission approval via quoted message
+	// -----------------------------------------------------------------------
+
+	private static readonly PERM_TAG_RE = /\[perm:([a-zA-Z0-9_-]+)\]/;
+	private static readonly APPROVE_KEYWORDS = new Set([
+		"y",
+		"yes",
+		"ok",
+		"approve",
+		"allow",
+		"同意",
+		"允许",
+		"批准",
+		"通过",
+		"是",
+		"好",
+		"行",
+		"可以",
+	]);
+	private static readonly DENY_KEYWORDS = new Set([
+		"n",
+		"no",
+		"deny",
+		"reject",
+		"refuse",
+		"拒绝",
+		"不行",
+		"不可以",
+		"否",
+		"不",
+	]);
+
+	/**
+	 * Extract a permission requestId from the quoted (ref_msg) text in the raw message.
+	 * Returns the requestId if found, null otherwise.
+	 */
+	private extractRefPermissionId(msg: InboundMessage): string | null {
+		if (!msg.raw || typeof msg.raw !== "object") return null;
+		const raw = msg.raw as Record<string, unknown>;
+		const itemList = (raw.item_list as unknown[]) ?? [];
+		for (const item of itemList) {
+			if (!item || typeof item !== "object") continue;
+			const it = item as Record<string, unknown>;
+			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
+			if (!refMsg) continue;
+			// ref_msg.title often contains the quoted text summary
+			const title = String(refMsg.title ?? "");
+			const match = Gateway.PERM_TAG_RE.exec(title);
+			if (match) return match[1];
+			// Also check message_item text
+			const refItem = refMsg.message_item as Record<string, unknown> | undefined;
+			if (refItem?.type === 1) {
+				const textItem = refItem.text_item as Record<string, unknown> | undefined;
+				const refText = String(textItem?.text ?? "");
+				const m2 = Gateway.PERM_TAG_RE.exec(refText);
+				if (m2) return m2[1];
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * If the user quoted a permission request message, handle approve/deny.
+	 * Returns true if handled, false if not a permission quote.
+	 */
+	private async handlePermissionByQuote(msg: InboundMessage): Promise<boolean> {
+		const requestId = this.extractRefPermissionId(msg);
+		if (!requestId) return false;
+
+		// Check if this permission is still pending
+		const pending = pendingPermissions.get(requestId);
+		if (!pending) return false;
+
+		const adapter = this.adapters.get(msg.platform);
+		if (!adapter) return false;
+		const locale = await this.resolveLocale(msg);
+
+		const replyText = msg.text.trim().toLowerCase();
+		const isApprove = Gateway.APPROVE_KEYWORDS.has(replyText);
+		const isDeny = Gateway.DENY_KEYWORDS.has(replyText);
+
+		// If the reply doesn't match any known keyword, don't intercept —
+		// let the message flow through to the narrator as normal input.
+		if (!isApprove && !isDeny) return false;
+
+		const { resolvePermission } = await import("../services/narrator-permission");
+		if (isApprove) {
+			await resolvePermission(requestId, "allow");
+			await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
+		} else {
+			await resolvePermission(requestId, "deny", {
+				denyMessage: msg.text.trim() || undefined,
+			});
+			await adapter.send(msg.chatId, t("gateway.permissionDenied", locale));
+		}
+		return true;
+	}
+
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
@@ -519,33 +733,85 @@ class Gateway {
 		});
 
 		// Listen for streaming events — feed deltas to stream consumer
-		eventBus.on("narrator:ws_broadcast", (event) => {
-			const consumer = this.streamConsumers.get(event.narratorId);
-			if (!consumer) return;
-
+		// Also handle tool call display and permission requests for IM
+		eventBus.on("narrator:ws_broadcast", async (event) => {
 			const msg = event.message;
-			if (msg.type === "stream_event") {
-				const streamEvent = msg.event;
-				if (
-					streamEvent &&
-					typeof streamEvent === "object" &&
-					(streamEvent as Record<string, unknown>).type === "content_block_delta"
-				) {
-					const delta = (streamEvent as Record<string, unknown>).delta;
+
+			// --- Stream consumer: text deltas ---
+			const consumer = this.streamConsumers.get(event.narratorId);
+			if (consumer) {
+				if (msg.type === "stream_event") {
+					const streamEvent = msg.event;
 					if (
-						delta &&
-						typeof delta === "object" &&
-						(delta as Record<string, unknown>).type === "text_delta"
+						streamEvent &&
+						typeof streamEvent === "object" &&
+						(streamEvent as Record<string, unknown>).type === "content_block_delta"
 					) {
-						const text = (delta as Record<string, unknown>).text;
-						if (typeof text === "string") {
-							consumer.onDelta(text);
+						const delta = (streamEvent as Record<string, unknown>).delta;
+						if (
+							delta &&
+							typeof delta === "object" &&
+							(delta as Record<string, unknown>).type === "text_delta"
+						) {
+							const text = (delta as Record<string, unknown>).text;
+							if (typeof text === "string") {
+								consumer.onDelta(text);
+							}
 						}
 					}
+				} else if (msg.type === "tool_started") {
+					// Tool boundary — finalize current message segment
+					consumer.onSegmentBreak();
 				}
-			} else if (msg.type === "tool_started") {
-				// Tool boundary — finalize current message segment
-				consumer.onSegmentBreak();
+			}
+
+			// --- Tool call notifications to IM ---
+			if (
+				msg.type === "tool_started" ||
+				msg.type === "tool_completed" ||
+				msg.type === "permission_request"
+			) {
+				const mapping = await this.findMappingByNarrator(event.narratorId);
+				if (!mapping) return;
+				const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
+				if (!adapter) return;
+				const locale = await this.resolveLocaleForAppUser(mapping.appUserId);
+
+				if (msg.type === "tool_started") {
+					const summary = this.formatToolSummary(msg.toolName, msg.input);
+					await adapter
+						.send(
+							mapping.chatId,
+							t("gateway.toolStarted", locale, {
+								toolName: msg.toolName,
+								summary,
+							}),
+						)
+						.catch(() => {});
+				} else if (msg.type === "tool_completed") {
+					const duration = msg.durationMs != null ? `${(msg.durationMs / 1000).toFixed(1)}s` : "?";
+					const toolName = msg.toolName ?? msg.toolUseId.slice(0, 8);
+					if (msg.status === "fail" || msg.status === "error") {
+						const error =
+							typeof msg.output === "string" ? msg.output.slice(0, 100) : "execution failed";
+						await adapter
+							.send(mapping.chatId, t("gateway.toolFailed", locale, { toolName, error }))
+							.catch(() => {});
+					} else {
+						await adapter
+							.send(mapping.chatId, t("gateway.toolCompleted", locale, { toolName, duration }))
+							.catch(() => {});
+					}
+				} else if (msg.type === "permission_request") {
+					const req = msg.request as Record<string, unknown>;
+					const requestId = typeof req.id === "string" ? req.id : "";
+					const toolName = typeof req.toolName === "string" ? req.toolName : "unknown";
+					const inputJson = req.inputJson as Record<string, unknown> | undefined;
+					const summary = this.formatToolSummary(toolName, inputJson);
+					const text =
+						t("gateway.permissionRequest", locale, { toolName, summary }) + `\n[perm:${requestId}]`;
+					await adapter.send(mapping.chatId, text).catch(() => {});
+				}
 			}
 		});
 
@@ -560,7 +826,8 @@ class Gateway {
 			const adapter = this.adapters.get(mapping.platform as GatewayPlatform);
 			if (!adapter) return;
 
-			await adapter.send(mapping.chatId, `❌ Error: ${event.error}`);
+			const locale = await this.resolveLocaleForAppUser(mapping.appUserId);
+			await adapter.send(mapping.chatId, t("gateway.error", locale, { error: event.error }));
 		});
 	}
 
@@ -733,6 +1000,51 @@ class Gateway {
 	}
 
 	// -----------------------------------------------------------------------
+	// Locale resolution
+	// -----------------------------------------------------------------------
+
+	private async resolveLocale(msg: InboundMessage): Promise<Locale> {
+		const cacheKey = `${msg.platform}:${msg.chatId}:${msg.userId}`;
+		const cached = this.localeCache.get(cacheKey);
+		if (cached && Date.now() - cached.ts < Gateway.LOCALE_CACHE_TTL) {
+			return cached.locale;
+		}
+
+		let locale: Locale = "en";
+		try {
+			// Try to find appUserId from existing mapping
+			const mapping = await db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+				columns: { appUserId: true },
+			});
+
+			const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
+			if (appUserId) {
+				locale = await getUserLanguage(appUserId);
+			}
+		} catch {
+			// Non-fatal — default to "en"
+		}
+
+		this.localeCache.set(cacheKey, { locale, ts: Date.now() });
+		return locale;
+	}
+
+	/** Resolve locale from a known appUserId (avoids extra mapping lookup). */
+	private async resolveLocaleForAppUser(appUserId: string | null): Promise<Locale> {
+		if (!appUserId) return "en";
+		try {
+			return await getUserLanguage(appUserId);
+		} catch {
+			return "en";
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// Chat commands
 	// -----------------------------------------------------------------------
 
@@ -757,6 +1069,8 @@ class Gateway {
 		const adapter = this.adapters.get(msg.platform);
 		if (!adapter) return;
 
+		const locale = await this.resolveLocale(msg);
+
 		switch (command.cmd) {
 			case "/new":
 			case "/reset": {
@@ -770,10 +1084,7 @@ class Gateway {
 							eq(gatewaySessionMappings.userId, msg.userId),
 						),
 					);
-				await adapter.send(
-					msg.chatId,
-					"🔄 Session reset. Send a message to start a new conversation.",
-				);
+				await adapter.send(msg.chatId, t("gateway.sessionReset", locale));
 				break;
 			}
 
@@ -787,7 +1098,7 @@ class Gateway {
 				});
 
 				if (!mapping) {
-					await adapter.send(msg.chatId, "No active session. Send a message to start one.");
+					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
 				}
 
@@ -797,7 +1108,10 @@ class Gateway {
 						where: eq(narrators.id, mapping.narratorId),
 						columns: { model: true },
 					});
-					await adapter.send(msg.chatId, `🤖 Current model: ${narrator?.model ?? "default"}`);
+					await adapter.send(
+						msg.chatId,
+						t("gateway.currentModel", locale, { model: narrator?.model ?? "default" }),
+					);
 				} else {
 					// Switch model
 					const newModel = command.args;
@@ -805,7 +1119,7 @@ class Gateway {
 						.update(narrators)
 						.set({ model: newModel, updatedAt: new Date().toISOString() })
 						.where(eq(narrators.id, mapping.narratorId));
-					await adapter.send(msg.chatId, `🤖 Model switched to: ${newModel}`);
+					await adapter.send(msg.chatId, t("gateway.modelSwitched", locale, { model: newModel }));
 				}
 				break;
 			}
@@ -819,7 +1133,7 @@ class Gateway {
 					),
 				});
 				if (!mapping) {
-					await adapter.send(msg.chatId, "No active session. Send a message to start one.");
+					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 				} else {
 					const narrator = await db.query.narrators.findFirst({
 						where: eq(narrators.id, mapping.narratorId),
@@ -832,12 +1146,22 @@ class Gateway {
 						},
 					});
 					const lines = [
-						"📊 Session Status",
-						`Narrator: ${mapping.narratorId.slice(0, 8)}…`,
-						`Status: ${narrator?.status ?? "unknown"}`,
-						`Model: ${narrator?.model ?? "default"}`,
-						`Messages: ${narrator?.messageCount ?? 0}`,
-						`Cost: $${(narrator?.totalCostUsd ?? 0).toFixed(4)}`,
+						t("gateway.sessionStatusHeader", locale),
+						t("gateway.statusNarrator", locale, {
+							id: `${mapping.narratorId.slice(0, 8)}…`,
+						}),
+						t("gateway.statusStatus", locale, {
+							status: narrator?.status ?? "unknown",
+						}),
+						t("gateway.statusModel", locale, {
+							model: narrator?.model ?? "default",
+						}),
+						t("gateway.statusMessages", locale, {
+							count: narrator?.messageCount ?? 0,
+						}),
+						t("gateway.statusCost", locale, {
+							costDisplay: `$${(narrator?.totalCostUsd ?? 0).toFixed(4)}`,
+						}),
 					];
 					await adapter.send(msg.chatId, lines.join("\n"));
 				}
@@ -858,40 +1182,91 @@ class Gateway {
 					// Import interruptNarrator dynamically to avoid circular deps
 					const { interruptNarrator } = await import("../services/narrator-session");
 					await interruptNarrator(mapping.narratorId);
-					await adapter.send(msg.chatId, "⏹ Agent stopped.");
+					await adapter.send(msg.chatId, t("gateway.agentStopped", locale));
 				} else {
-					await adapter.send(msg.chatId, "No active session.");
+					await adapter.send(msg.chatId, t("gateway.noActiveSessionShort", locale));
 				}
 				break;
 			}
 
 			case "/list": {
-				await this.handleListCommand(msg, adapter);
+				await this.handleListCommand(msg, adapter, locale);
 				break;
 			}
 
 			case "/search": {
-				await this.handleSearchCommand(command.args, msg, adapter);
+				await this.handleSearchCommand(command.args, msg, adapter, locale);
 				break;
 			}
 
 			case "/switch": {
-				await this.handleSwitchCommand(command.args, msg, adapter);
+				await this.handleSwitchCommand(command.args, msg, adapter, locale);
+				break;
+			}
+
+			case "/approve": {
+				const mapping = await db.query.gatewaySessionMappings.findFirst({
+					where: and(
+						eq(gatewaySessionMappings.platform, msg.platform),
+						eq(gatewaySessionMappings.chatId, msg.chatId),
+						eq(gatewaySessionMappings.userId, msg.userId),
+					),
+				});
+				if (!mapping) {
+					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
+					break;
+				}
+				const pending = this.findPendingPermissionForNarrator(mapping.narratorId);
+				if (!pending) {
+					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
+					break;
+				}
+				const { resolvePermission } = await import("../services/narrator-permission");
+				await resolvePermission(pending.requestId, "allow");
+				await adapter.send(msg.chatId, t("gateway.permissionApproved", locale));
+				break;
+			}
+
+			case "/deny": {
+				const mapping = await db.query.gatewaySessionMappings.findFirst({
+					where: and(
+						eq(gatewaySessionMappings.platform, msg.platform),
+						eq(gatewaySessionMappings.chatId, msg.chatId),
+						eq(gatewaySessionMappings.userId, msg.userId),
+					),
+				});
+				if (!mapping) {
+					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
+					break;
+				}
+				const pendingReq = this.findPendingPermissionForNarrator(mapping.narratorId);
+				if (!pendingReq) {
+					await adapter.send(msg.chatId, t("gateway.noPermissionPending", locale));
+					break;
+				}
+				const { resolvePermission: resolveP } = await import("../services/narrator-permission");
+				const denyReason = command.args || undefined;
+				await resolveP(pendingReq.requestId, "deny", {
+					denyMessage: denyReason,
+				});
+				await adapter.send(msg.chatId, t("gateway.permissionDenied", locale));
 				break;
 			}
 
 			case "/help": {
 				const help = [
-					"📖 Available commands:",
-					"/new — Start a fresh conversation",
-					"/stop — Interrupt the running agent",
-					"/model — Show current model",
-					"/model <name> — Switch to a different model",
-					"/list — List recent narrators",
-					"/search <query> — Search narrators by title",
-					"/switch <id> — Switch to an existing narrator",
-					"/status — Show session info",
-					"/help — Show this message",
+					t("gateway.helpHeader", locale),
+					t("gateway.helpNew", locale),
+					t("gateway.helpStop", locale),
+					t("gateway.helpModel", locale),
+					t("gateway.helpModelSwitch", locale),
+					t("gateway.helpList", locale),
+					t("gateway.helpSearch", locale),
+					t("gateway.helpSwitch", locale),
+					t("gateway.helpApprove", locale),
+					t("gateway.helpDeny", locale),
+					t("gateway.helpStatus", locale),
+					t("gateway.helpHelp", locale),
 				];
 				await adapter.send(msg.chatId, help.join("\n"));
 				break;
@@ -908,7 +1283,11 @@ class Gateway {
 	// /list — List narrators from the user's recentTabs
 	// -----------------------------------------------------------------------
 
-	private async handleListCommand(msg: InboundMessage, adapter: PlatformAdapter): Promise<void> {
+	private async handleListCommand(
+		msg: InboundMessage,
+		adapter: PlatformAdapter,
+		locale: Locale,
+	): Promise<void> {
 		// Get the current mapping to find appUserId and active narrator
 		const mapping = await db.query.gatewaySessionMappings.findFirst({
 			where: and(
@@ -921,7 +1300,7 @@ class Gateway {
 		const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
 
 		if (!appUserId) {
-			await adapter.send(msg.chatId, "No NarraFork user linked. Cannot list tabs.");
+			await adapter.send(msg.chatId, t("gateway.noUserLinked", locale));
 			return;
 		}
 
@@ -939,7 +1318,7 @@ class Gateway {
 		}
 
 		if (tabs.length === 0) {
-			await adapter.send(msg.chatId, "No recent tabs found.");
+			await adapter.send(msg.chatId, t("gateway.noRecentTabs", locale));
 			return;
 		}
 
@@ -962,7 +1341,7 @@ class Gateway {
 		}
 
 		// Format output: group by workspace, show narrator/chapter tabs
-		const lines: string[] = ["📋 Recent tabs:"];
+		const lines: string[] = [t("gateway.recentTabs", locale)];
 
 		for (const tab of tabs) {
 			const type = typeof tab.type === "string" ? tab.type : "";
@@ -999,12 +1378,12 @@ class Gateway {
 			const title = typeof tab.title === "string" && tab.title ? tab.title : "(untitled)";
 			const status =
 				statusMap.get(narratorId) ?? (typeof tab.status === "string" ? tab.status : "?");
-			const suffix = isActive ? " ← current" : "";
+			const suffix = isActive ? t("gateway.currentSuffix", locale) : "";
 
 			lines.push(`${indent}${marker} ${shortId} — ${title} (${status})${suffix}`);
 		}
 
-		lines.push("", "Use /switch <id> to switch.");
+		lines.push("", t("gateway.useSwitchHint", locale));
 		await adapter.send(msg.chatId, lines.join("\n"));
 	}
 
@@ -1016,9 +1395,10 @@ class Gateway {
 		query: string,
 		msg: InboundMessage,
 		adapter: PlatformAdapter,
+		locale: Locale,
 	): Promise<void> {
 		if (!query) {
-			await adapter.send(msg.chatId, "Usage: /search <query>");
+			await adapter.send(msg.chatId, t("gateway.searchUsage", locale));
 			return;
 		}
 
@@ -1030,17 +1410,17 @@ class Gateway {
 		});
 
 		if (results.length === 0) {
-			await adapter.send(msg.chatId, `No narrators found for "${query}".`);
+			await adapter.send(msg.chatId, t("gateway.searchNoResults", locale, { query }));
 			return;
 		}
 
-		const lines = [`🔍 Search results for "${query}":`];
+		const lines = [t("gateway.searchResults", locale, { query })];
 		for (const r of results) {
 			const shortId = r.id.slice(0, 8);
 			const title = r.title || "(untitled)";
 			lines.push(` ${shortId} — ${title}`);
 		}
-		lines.push("", "Use /switch <id> to switch.");
+		lines.push("", t("gateway.useSwitchHint", locale));
 
 		await adapter.send(msg.chatId, lines.join("\n"));
 	}
@@ -1053,12 +1433,10 @@ class Gateway {
 		idPrefix: string,
 		msg: InboundMessage,
 		adapter: PlatformAdapter,
+		locale: Locale,
 	): Promise<void> {
 		if (!idPrefix) {
-			await adapter.send(
-				msg.chatId,
-				"Usage: /switch <narrator-id>\nUse /list or /search to find IDs.",
-			);
+			await adapter.send(msg.chatId, t("gateway.switchUsage", locale));
 			return;
 		}
 
@@ -1092,10 +1470,7 @@ class Gateway {
 		}
 
 		if (!narrator) {
-			await adapter.send(
-				msg.chatId,
-				`❌ Narrator not found: ${trimmed}\nUse /list or /search to find valid IDs.`,
-			);
+			await adapter.send(msg.chatId, t("gateway.narratorNotFound", locale, { id: trimmed }));
 			return;
 		}
 
@@ -1108,10 +1483,7 @@ class Gateway {
 				columns: { projectId: true },
 			});
 			if (chapter && chapter.projectId !== defaultProjectId) {
-				await adapter.send(
-					msg.chatId,
-					`❌ Narrator belongs to a different project.\nUse /list or /search to find narrators in the current project.`,
-				);
+				await adapter.send(msg.chatId, t("gateway.narratorWrongProject", locale));
 				return;
 			}
 		}
@@ -1152,7 +1524,12 @@ class Gateway {
 		const title = narrator.title || "(untitled)";
 		await adapter.send(
 			msg.chatId,
-			`🔗 Switched to: ${title}\nID: ${narrator.id.slice(0, 8)}… | Status: ${narrator.status} | Model: ${narrator.model ?? "default"}`,
+			t("gateway.switchedTo", locale, {
+				title,
+				id: `${narrator.id.slice(0, 8)}…`,
+				status: narrator.status,
+				model: narrator.model ?? "default",
+			}),
 		);
 	}
 }
