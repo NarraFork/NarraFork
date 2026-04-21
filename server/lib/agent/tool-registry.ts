@@ -2,10 +2,26 @@ import { z } from "zod/v4";
 import type { ToolDefinition } from "./types";
 
 /**
+ * Interface for tool providers that supply tools to the registry.
+ * Enables plugin-style registration of tool groups.
+ */
+export interface ToolProvider {
+	/** Unique provider name (e.g. "core", "optional", "overseer", "review", "mcp"). */
+	name: string;
+	/** Tools provided by this provider. */
+	tools(): ToolDefinition[];
+	/** Called when the provider is registered. */
+	initialize?(): void;
+	/** Called when the provider is unregistered. */
+	dispose?(): void;
+}
+
+/**
  * Registry for agent tools.
  */
 export class ToolRegistry {
 	private tools = new Map<string, ToolDefinition>();
+	private providers = new Map<string, ToolProvider>();
 
 	register(tool: ToolDefinition): void {
 		this.tools.set(tool.name, tool);
@@ -21,6 +37,27 @@ export class ToolRegistry {
 
 	all(): ToolDefinition[] {
 		return [...this.tools.values()];
+	}
+
+	registerProvider(provider: ToolProvider): void {
+		if (this.providers.has(provider.name)) {
+			this.unregisterProvider(provider.name);
+		}
+		this.providers.set(provider.name, provider);
+		provider.initialize?.();
+		for (const tool of provider.tools()) {
+			this.tools.set(tool.name, tool);
+		}
+	}
+
+	unregisterProvider(name: string): void {
+		const provider = this.providers.get(name);
+		if (!provider) return;
+		for (const tool of provider.tools()) {
+			this.tools.delete(tool.name);
+		}
+		provider.dispose?.();
+		this.providers.delete(name);
 	}
 }
 

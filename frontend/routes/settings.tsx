@@ -1,5 +1,16 @@
-import { Affix, Box, Button, Group, NavLink, ScrollArea, Text, Transition } from "@mantine/core";
 import {
+	Affix,
+	Box,
+	Button,
+	Group,
+	NavLink,
+	ScrollArea,
+	Text,
+	Transition,
+	UnstyledButton,
+} from "@mantine/core";
+import {
+	IconArrowLeft,
 	IconBell,
 	IconBox,
 	IconBrain,
@@ -84,6 +95,9 @@ function SettingsLayout() {
 
 	const allVisibleItems = isAdmin ? [...personalItems, ...instanceItems] : personalItems;
 
+	// Find current page label for mobile back header
+	const currentItem = allVisibleItems.find((item) => pathname === item.to);
+
 	// Redirect non-admin users away from admin-only settings pages
 	if (user && !isAdmin && ADMIN_PATHS.has(pathname)) {
 		return <Navigate to="/settings/profile" replace />;
@@ -144,34 +158,28 @@ function SettingsLayout() {
 
 				{/* Main content column */}
 				<Box style={{ flex: 1, minWidth: 0 }}>
-					{/* Mobile: horizontal scrollable nav */}
-					<Box
-						hiddenFrom="sm"
-						style={{
-							borderBottom: "1px solid var(--mantine-color-default-border)",
-						}}
-					>
-						<ScrollArea type="never" offsetScrollbars={false}>
-							<Group gap={0} wrap="nowrap" px="xs" py={4}>
-								{allVisibleItems.map((item) => (
-									<NavLink
-										key={item.to}
-										component={Link}
-										to={item.to}
-										label={item.label}
-										leftSection={item.icon}
-										active={pathname === item.to}
-										variant="light"
-										style={{
-											whiteSpace: "nowrap",
-											flexShrink: 0,
-											borderRadius: "var(--mantine-radius-sm)",
-										}}
-									/>
-								))}
-							</Group>
-						</ScrollArea>
-					</Box>
+					{/* Mobile: back button header (only on sub-pages, not on index) */}
+					{currentItem && (
+						<Box
+							hiddenFrom="sm"
+							px="xs"
+							py={8}
+							style={{
+								borderBottom: "1px solid var(--mantine-color-default-border)",
+							}}
+						>
+							<UnstyledButton
+								component={Link}
+								to="/settings"
+								style={{ display: "flex", alignItems: "center", gap: 6 }}
+							>
+								<IconArrowLeft size={18} />
+								<Text size="sm" fw={500}>
+									{currentItem.label}
+								</Text>
+							</UnstyledButton>
+						</Box>
+					)}
 
 					<Box p="md" pb={80}>
 						<Outlet />

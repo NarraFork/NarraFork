@@ -1,5 +1,5 @@
-import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, sql } from "drizzle-orm";
-import { db, sqlite } from "../db";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { db } from "../db";
 import {
 	chapters,
 	narratorMessageRefs,
@@ -30,11 +30,16 @@ import {
 import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type { LoadSkillResult, LoadToolNotFound, LoadToolResult } from "./command-service";
-import {
-	revertPatchesForMessages,
-	revertPatchForToolUse,
-	revertPatchForToolUses,
-} from "./snapshot-revert";
+import { narratorMessageQueries } from "./narrator-messages";
+import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
+
+export {
+	enrichToolUseBlocks,
+	narratorMessageQueries,
+	truncateJson,
+	truncateToolIO,
+} from "./narrator-messages";
+export { narratorPersistence } from "./narrator-persistence";
 
 /**
  * SQLite has a max variable number limit (~32766 in bun:sqlite).
@@ -53,27 +58,6 @@ async function insertRefsBatched(
 	}
 }
 
-/**
- * For child messages belonging to subagent narrators, attach the subagent's
- * resolved model as `subagentModel` on each message. This avoids extra API
- * calls from the frontend.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-async function attachSubagentModels(childMessages: any[]): Promise<void> {
-	if (childMessages.length === 0) return;
-	const narratorIds = [...new Set(childMessages.map((m) => m.narratorId as string))];
-	if (narratorIds.length === 0) return;
-	const subagentRows = await db.query.narrators.findMany({
-		where: and(inArray(narrators.id, narratorIds), eq(narrators.type, "subagent")),
-		columns: { id: true, model: true },
-	});
-	const modelMap = new Map(subagentRows.map((r) => [r.id, r.model]));
-	for (const msg of childMessages) {
-		const model = modelMap.get(msg.narratorId);
-		if (model) msg.subagentModel = model;
-	}
-}
-
 async function narratorStillOwnsImageMessages(narratorId: string): Promise<boolean> {
 	const remainingOwnedMessages = await db
 		.select({ contentJson: narratorMessages.contentJson })
@@ -81,380 +65,6 @@ async function narratorStillOwnsImageMessages(narratorId: string): Promise<boole
 		.where(eq(narratorMessages.narratorId, narratorId));
 	return remainingOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
-
-/**
- * Build a tree from a flat array of messages.
- * Messages with parentToolUseId are nested under the message whose
- * toolCalls contains the matching toolUseId.
- * Returns only top-level messages (parentToolUseId is null).
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function buildMessageTree(flatMessages: any[]): any[] {
-	// Shallow clone each message to avoid mutating drizzle results
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const cloned = flatMessages.map((msg) => ({ ...msg, children: [] as any[] }));
-
-	// Map: toolUseId → cloned message that CONTAINS that tool_use block
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const toolUseIdToMsg = new Map<string, any>();
-	for (const msg of cloned) {
-		if (msg.toolCalls) {
-			for (const tc of msg.toolCalls) {
-				toolUseIdToMsg.set(tc.toolUseId, msg);
-			}
-		}
-	}
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const topLevel: any[] = [];
-	for (const msg of cloned) {
-		if (msg.parentToolUseId && toolUseIdToMsg.has(msg.parentToolUseId)) {
-			toolUseIdToMsg.get(msg.parentToolUseId).children.push(msg);
-		} else if (!msg.parentToolUseId) {
-			topLevel.push(msg);
-		}
-		// Child messages whose parent isn't in the set are silently dropped
-		// (they belong to a different page)
-	}
-
-	return topLevel;
-}
-
-/** Truncate a JSON value to a preview string if it exceeds maxLen characters */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateJson(val: any, maxLen: number): any {
-	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	return { _truncated: true, preview: str.slice(0, maxLen), fullLength: str.length };
-}
-
-/** Tool names whose inputJson/outputJson should never be truncated in message lists
- *  (their content IS the primary display payload, e.g. plan text). */
-const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
-
-/** Tool names whose inputJson should not be truncated (prompt is the primary display),
- *  but outputJson can still be truncated. */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
-
-/**
- * Extract short header-relevant fields from a tool's inputJson before truncation.
- * These hints are attached to the truncated object so the frontend can display
- * file names, line numbers, commands, etc. without relying on regex parsing.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function extractHeaderHints(toolName: string, input: any): Record<string, unknown> | undefined {
-	if (!input || typeof input !== "object") return undefined;
-	const h: Record<string, unknown> = {};
-	const str = (k: string) => (typeof input[k] === "string" ? input[k] : undefined);
-	const num = (k: string) => (typeof input[k] === "number" ? input[k] : undefined);
-
-	switch (toolName) {
-		case "Write":
-		case "Edit":
-		case "MultiEdit":
-		case "Read": {
-			const fp = str("file_path") ?? str("filePath") ?? str("path");
-			if (fp) h.file_path = fp;
-			const offset = num("offset");
-			if (offset != null) h.offset = offset;
-			const limit = num("limit");
-			if (limit != null) h.limit = limit;
-			break;
-		}
-		case "Bash": {
-			const cmd = str("command");
-			if (cmd) h.command = cmd.length > 100 ? cmd.slice(0, 100) : cmd;
-			const timeout = num("timeout");
-			if (timeout != null) h.timeout = timeout;
-			break;
-		}
-		case "Glob":
-		case "Grep": {
-			const pat = str("pattern") ?? str("glob");
-			if (pat) h.pattern = pat;
-			const p = str("path");
-			if (p) h.path = p;
-			const g = str("glob");
-			if (g) h.glob = g;
-			break;
-		}
-		case "WebSearch": {
-			const q = str("query");
-			if (q) h.query = q;
-			break;
-		}
-		case "WebFetch": {
-			const url = str("url");
-			if (url) h.url = url;
-			const mode = str("mode");
-			if (mode) h.mode = mode;
-			break;
-		}
-		case "Terminal": {
-			const action = str("action");
-			if (action) h.action = action;
-			const tid = str("terminal_id");
-			if (tid) h.terminal_id = tid;
-			const inp = str("input");
-			if (inp) h.input = inp.length > 60 ? inp.slice(0, 60) : inp;
-			break;
-		}
-		case "ShareFile": {
-			const fp = str("path");
-			if (fp) h.path = fp;
-			break;
-		}
-		case "AskUserQuestion": {
-			const qs = input.questions;
-			if (Array.isArray(qs) && qs.length > 0 && typeof qs[0]?.header === "string") {
-				h._firstHeader = qs[0].header;
-			}
-			break;
-		}
-		case "TaskOutput":
-		case "TaskStop": {
-			const tid = str("task_id");
-			if (tid) h.task_id = tid;
-			break;
-		}
-		case "Recall": {
-			const action = str("action");
-			if (action) h.action = action;
-			const q = str("query");
-			if (q) h.query = q;
-			const nid = str("narrator_id");
-			if (nid) h.narrator_id = nid;
-			const tcId = str("tool_call_id");
-			if (tcId) h.tool_call_id = tcId;
-			break;
-		}
-		case "ApprovePermission":
-		case "DenyPermission":
-		case "GetNarratorContext":
-		case "ListManagedNarrators": {
-			const rid = str("requestId");
-			if (rid) h.requestId = rid;
-			const nid = str("narratorId");
-			if (nid) h.narratorId = nid;
-			break;
-		}
-		default:
-			return undefined;
-	}
-	return Object.keys(h).length > 0 ? h : undefined;
-}
-
-/**
- * Truncate inputJson with header hints attached.
- * If the input exceeds maxLen, the truncated object includes a `_hints` field
- * containing short header-relevant fields extracted before truncation.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function truncateInputWithHints(toolName: string, val: any, maxLen: number): any {
-	if (val === null || val === undefined) return val;
-	const str = typeof val === "string" ? val : JSON.stringify(val);
-	if (str.length <= maxLen) return val;
-	const hints = extractHeaderHints(toolName, val);
-	return {
-		_truncated: true,
-		preview: str.slice(0, maxLen),
-		fullLength: str.length,
-		...(hints && { _hints: hints }),
-	};
-}
-
-/** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
-	return tree.map((msg) => ({
-		...msg,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		toolCalls: msg.toolCalls?.map((tc: any) => {
-			if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return tc;
-			const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
-			return {
-				...tc,
-				inputJson: skipInput
-					? tc.inputJson
-					: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
-				outputJson: truncateJson(tc.outputJson, maxLen),
-			};
-		}),
-		children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
-	}));
-}
-
-/**
- * Enrich tool_use blocks in contentJson with fields from the toolCalls relation.
- * This merges status, outputJson, durationMs, etc. directly into the content block
- * so the frontend can read all tool call data from a single source (contentJson)
- * without cross-referencing the separate toolCalls array.
- *
- * The original toolCalls array is preserved for backward compatibility.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function enrichToolUseBlocks(tree: any[]): any[] {
-	return tree.map((msg) => {
-		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) return msg;
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const tcMap = new Map<string, any>(msg.toolCalls.map((tc: any) => [tc.toolUseId, tc]));
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const enrichedContent = msg.contentJson.map((block: any) => {
-			if (block.type !== "tool_use") return block;
-			const tc = tcMap.get(block.id);
-			if (!tc) return block;
-			// Extract _metadata from structured outputJson (Edit tool stores { _text, _metadata })
-			const outputJson = tc.outputJson;
-			const _metadata =
-				outputJson && typeof outputJson === "object" && !Array.isArray(outputJson)
-					? outputJson._metadata
-					: undefined;
-			return {
-				...block,
-				// Prefer toolCalls table values (may have been overwritten post-persist)
-				inputJson: tc.inputJson ?? block.input,
-				outputJson: tc.outputJson,
-				status: tc.status,
-				durationMs: tc.durationMs,
-				errorMessage: tc.errorMessage,
-				permissionDecisionReason: tc.permissionDecisionReason,
-				permissionDenyMessage: tc.permissionDenyMessage,
-				permissionSuggestions: tc.permissionSuggestions,
-				permissionDecidedAt: tc.permissionDecidedAt,
-				tcId: tc.id,
-				tcCreatedAt: tc.createdAt,
-				...(_metadata && { _metadata }),
-			};
-		});
-		return {
-			...msg,
-			contentJson: enrichedContent,
-			children: msg.children?.length ? enrichToolUseBlocks(msg.children) : msg.children,
-		};
-	});
-}
-
-/**
- * Remove assistant messages that only contain ExitPlanMode tool_use
- * when immediately followed by a plan compact system message.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function filterExitPlanBeforePlanCompact(tree: any[]): any[] {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const result: any[] = [];
-	for (let i = 0; i < tree.length; i++) {
-		const msg = tree[i];
-		const next = tree[i + 1];
-		// Check if next message is a plan compact
-		if (
-			next?.role === "system" &&
-			Array.isArray(next.contentJson) &&
-			next.contentJson.some(
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				(b: any) => b.type === "compact" && b.subtype === "plan",
-			)
-		) {
-			// Check if current message only has ExitPlanMode tool_use (+ optional empty text)
-			if (msg.role === "assistant" && Array.isArray(msg.contentJson)) {
-				const blocks = msg.contentJson;
-				const onlyExitPlan =
-					blocks.length > 0 &&
-					blocks.every(
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-						(b: any) =>
-							(b.type === "tool_use" && b.name === "ExitPlanMode") ||
-							(b.type === "text" && !b.text?.trim()),
-					) &&
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					blocks.some((b: any) => b.type === "tool_use");
-				if (onlyExitPlan) continue; // skip this message
-			}
-		}
-		result.push(msg);
-	}
-	return result;
-}
-
-/** Collect all toolUseIds from a set of messages (for iterative child fetching) */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function collectToolUseIds(messages: any[]): string[] {
-	const ids: string[] = [];
-	for (const msg of messages) {
-		if (msg.toolCalls) {
-			for (const tc of msg.toolCalls) {
-				ids.push(tc.toolUseId);
-			}
-		}
-	}
-	return ids;
-}
-
-/** Insert a message into narrator_message_refs junction table */
-async function insertMessageRef(
-	narratorId: string,
-	messageId: string,
-	seq: number,
-	isCompact = 0,
-	prunedPercent?: number | null,
-): Promise<void> {
-	await db.insert(narratorMessageRefs).values({
-		id: generateId(),
-		narratorId,
-		messageId,
-		seq,
-		isCompact,
-		prunedPercent: prunedPercent ?? null,
-	});
-}
-
-/** Atomically get next seq and insert into narrator_message_refs (prevents race conditions) */
-async function appendMessageRef(
-	narratorId: string,
-	messageId: string,
-	isCompact = 0,
-	prunedPercent?: number | null,
-): Promise<number> {
-	return db.transaction(async (tx) => {
-		const result = await tx
-			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId));
-		const seq = (result[0]?.maxSeq ?? -1) + 1;
-
-		// Auto-fetch current prunedPercent from narrator if not explicitly provided
-		let resolvedPrunedPercent = prunedPercent ?? null;
-		if (resolvedPrunedPercent == null) {
-			const narrator = await tx.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { prunedPercent: true },
-			});
-			resolvedPrunedPercent = narrator?.prunedPercent ?? null;
-		}
-
-		await tx.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId,
-			messageId,
-			seq,
-			isCompact,
-			prunedPercent: resolvedPrunedPercent,
-		});
-
-		// Bump messageVersion so clients can detect out-of-sync state cheaply
-		await tx
-			.update(narrators)
-			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, narratorId));
-
-		return seq;
-	});
-}
-
-/**
- * Clear or set contextSummary + apiConversationId on the narrator.
- * Pass `summary = null` to clear, or a string to set.
- */
 
 interface CreateNarratorInput {
 	chapterId?: string | null;
@@ -481,10 +91,6 @@ interface CreateSubagentInput {
 
 /**
  * Shared handler for `/load <tool>` commands.
- * Called from both the HTTP route and the WebSocket buffer_message handler.
- *
- * When a tool is newly loaded (not already_loaded), persists an additional
- * role="user" message so the model knows the tool was just made available.
  */
 export async function handleLoadToolCommand(
 	narratorId: string,
@@ -576,8 +182,6 @@ export async function handleLoadToolCommand(
 
 /**
  * Handle `/skill <name>` slash command.
- * Loads the skill content and returns it so the caller can inject it into the user message.
- * Also persists an info message for the UI timeline.
  */
 export async function handleLoadSkillCommand(
 	narratorId: string,
@@ -588,7 +192,6 @@ export async function handleLoadSkillCommand(
 	const { join } = await import("node:path");
 	const { loadAllSkills } = await import("./skill-service");
 
-	// Resolve project gitPath for this narrator
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { chapterId: true },
@@ -619,7 +222,6 @@ export async function handleLoadSkillCommand(
 		return { found: false, skillName: cmdResult.loadSkill };
 	}
 
-	// Build skill content (same format as skill.ts execute)
 	const skillDir = join(found.location, "..");
 	const lines = [`<skill_content name="${escapeXmlAttr(found.name)}">`];
 	lines.push(`# Skill: ${found.name}`);
@@ -654,6 +256,8 @@ function escapeXmlAttr(s: string): string {
 }
 
 export const narratorService = {
+	// ── Core CRUD ──────────────────────────────────────────────────────────────
+
 	async create(input: CreateNarratorInput) {
 		if (input.chapterId) {
 			const chapter = await db.query.chapters.findFirst({
@@ -667,7 +271,6 @@ export const narratorService = {
 
 		const type = input.type ?? "primary";
 
-		// Enforce single primary narrator per chapter (only for chapter-bound narrators)
 		if (type === "primary" && input.chapterId) {
 			const existing = await db.query.narrators.findFirst({
 				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.type, "primary")),
@@ -722,7 +325,6 @@ export const narratorService = {
 	async createSubagent(input: CreateSubagentInput) {
 		const parent = await this.getById(input.parentNarratorId);
 
-		// Prevent nested subagents
 		if (parent.type === "subagent") {
 			throw new ValidationError("Subagents cannot spawn nested subagents");
 		}
@@ -730,12 +332,6 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		// Resolve effective permission mode for the subagent.
-		// When the parent is in plan mode, subagents should NOT inherit "plan" —
-		// plan mode semantics (Write/Edit restricted to plan file) are meaningless
-		// for subagents. Instead, resolve to the effective mode:
-		// - relaxedPlan → inherit previousPermissionMode (the mode before entering plan)
-		// - strict plan → readOnly
 		let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
 		if (basePermMode === "plan") {
 			basePermMode = parent.relaxedPlan ? (parent.previousPermissionMode ?? "default") : "readOnly";
@@ -783,11 +379,6 @@ export const narratorService = {
 		return narrator;
 	},
 
-	/**
-	 * Fork a subagent: create a new subagent narrator that shares the original's
-	 * message history (via copied narrator_message_refs), then continue from there.
-	 * The original subagent remains untouched.
-	 */
 	async forkSubagent(input: {
 		originalSubagentId: string;
 		parentNarratorId: string;
@@ -796,7 +387,6 @@ export const narratorService = {
 		systemPrompt?: string;
 		model?: string;
 		permissionMode?: string;
-		/** Pre-fetched original narrator to avoid redundant DB query */
 		_original?: typeof narrators.$inferSelect;
 	}) {
 		const original = input._original ?? (await this.getById(input.originalSubagentId));
@@ -806,8 +396,6 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		// Subagents should never have "plan" permission mode — resolve it
-		// the same way as createSubagent (see comment there).
 		let basePermMode = input.permissionMode ?? "default";
 		if (basePermMode === "plan") {
 			basePermMode = original.relaxedPlan
@@ -821,7 +409,6 @@ export const narratorService = {
 			| "plan"
 			| "dontAsk";
 
-		// Copy all message refs from the original subagent
 		const prefixRows = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -886,9 +473,6 @@ export const narratorService = {
 		return narrator;
 	},
 
-	/**
-	 * Persist a user message for a subagent, linked to the parent's tool_use via parentToolUseId.
-	 */
 	async persistSubagentUserMessage(
 		narratorId: string,
 		text: string,
@@ -944,2572 +528,7 @@ export const narratorService = {
 		});
 	},
 
-	async getMessages(narratorId: string, limit = 100, offset = 0) {
-		return db.query.narratorMessages.findMany({
-			where: eq(narratorMessages.narratorId, narratorId),
-			with: { toolCalls: true },
-			orderBy: (m, { asc }) => [asc(m.createdAt)],
-			limit,
-			offset,
-		});
-	},
-
-	/**
-	 * Fetch all messages after the most recent compact marker.
-	 * If no compact marker exists, returns all messages.
-	 * Uses narrator_message_refs junction table.
-	 */
-	async getMessagesSinceLastCompact(narratorId: string) {
-		// Find the last compact marker's seq
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
-
-		const compactSeq = lastCompactRow[0]?.seq;
-
-		// Fetch message IDs from narrator_message_refs (exclude segment-compacted refs)
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refRows.length === 0) return [];
-
-		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
-
-		// Sort by seq order from refs (not createdAt)
-		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		return messages;
-	},
-
-	/**
-	 * Fetch messages between the last compact marker and a given message (exclusive).
-	 * Used for partial compact — compress only messages before the target.
-	 */
-	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
-		// Find the target message's seq
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, beforeMessageId),
-			),
-		});
-		if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
-
-		// Find the last compact marker before the target
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.isCompact, 1),
-					lt(narratorMessageRefs.seq, targetRef.seq),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
-
-		const compactSeq = lastCompactRow[0]?.seq;
-
-		const lowerBound = compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : sql`1=1`;
-
-		// Get message IDs in range (compactSeq, targetSeq), exclude segment-compacted
-		const refRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					lowerBound,
-					lt(narratorMessageRefs.seq, targetRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refRows.length === 0) return [];
-
-		const messageIds = refRows.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
-		});
-
-		// Sort by seq order from refs (not createdAt)
-		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		return messages;
-	},
-
-	/** Fetch the N earliest top-level user/assistant messages with text content. */
-	async getEarliestMessages(narratorId: string, limit = 2) {
-		// Query via refs so forked narrators see inherited messages too
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
-				contentText: narratorMessages.contentText,
-				createdAt: narratorMessages.createdAt,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNotNull(narratorMessages.contentText),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq)
-			.limit(limit);
-		return rows;
-	},
-
-	/**
-	 * Shared helper: fetch post-last-compact user/assistant message refs used by
-	 * prune/compact boundary calculations.
-	 *
-	 * For primary narrators, only top-level messages are included.
-	 * For subagent narrators, all messages are treated as top-level-equivalent
-	 * (they are stored with parentToolUseId set).
-	 */
-	async _getPostCompactTopLevelRefs(
-		narratorId: string,
-		options?: { includeChildMessages?: boolean },
-	) {
-		const includeChildMessages = options?.includeChildMessages ?? false;
-
-		const lastCompactRow = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
-
-		const compactSeq = lastCompactRow[0]?.seq;
-
-		return db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNull(narratorMessageRefs.segmentCompactId),
-					...(includeChildMessages ? [] : [isNull(narratorMessages.parentToolUseId)]),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-	},
-
-	/**
-	 * Find the message ID that should serve as the compact boundary for auto-compact.
-	 * Returns the ID of the message at the start of the "keep" window — all messages
-	 * from this point onward will be preserved (not compacted).
-	 *
-	 * `keepPairs` controls how many recent user-assistant pairs to keep (default 2).
-	 * Returns null if there aren't enough messages to make compacting worthwhile.
-	 */
-	async getCompactBoundaryMessage(narratorId: string, keepPairs = 2): Promise<string | null> {
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
-
-		// Count how many messages to keep: keepPairs * 2 (user + assistant each)
-		const keepCount = keepPairs * 2;
-
-		// Need at least keepCount + 2 messages to make compact worthwhile
-		// (at least one pair to compress + keepCount to preserve)
-		if (refs.length < keepCount + 2) return null;
-
-		// The boundary is the message at position (length - keepCount)
-		const boundaryRef = refs[refs.length - keepCount];
-		return boundaryRef.messageId;
-	},
-
-	/** Fetch the N most recent top-level user/assistant messages with text content (chronological order). */
-	async getRecentMessages(narratorId: string, limit = 4) {
-		// Query via refs so forked narrators see inherited messages too
-		const rows = await db
-			.select({
-				id: narratorMessages.id,
-				narratorId: narratorMessages.narratorId,
-				role: narratorMessages.role,
-				contentJson: narratorMessages.contentJson,
-				contentText: narratorMessages.contentText,
-				createdAt: narratorMessages.createdAt,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessages.role, ["user", "assistant"]),
-					isNotNull(narratorMessages.contentText),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(limit);
-		return rows.reverse();
-	},
-
-	/**
-	 * Check if a narrator is a subagent.
-	 * Subagent messages all have parentToolUseId set, so query logic differs.
-	 */
-	async isSubagentNarrator(narratorId: string): Promise<boolean> {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { type: true },
-		});
-		return narrator?.type === "subagent";
-	},
-
-	async getMessagesCursor(
-		narratorId: string,
-		limit = 50,
-		cursor?: string,
-		direction: "older" | "newer" = "older",
-	) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// Build cursor condition on seq.
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const cursorConditions: any[] = [eq(narratorMessageRefs.narratorId, narratorId)];
-		if (cursor) {
-			const cursorSeq = Number.parseInt(cursor, 10);
-			if (!Number.isNaN(cursorSeq)) {
-				cursorConditions.push(
-					direction === "newer"
-						? gt(narratorMessageRefs.seq, cursorSeq)
-						: lt(narratorMessageRefs.seq, cursorSeq),
-				);
-			}
-		}
-
-		// Query messages via junction table. Older paging walks backward from the
-		// current oldest row; newer paging walks forward from the current newest row.
-		// Exclude refs hidden by segment-compact.
-		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					...cursorConditions,
-					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(
-				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
-			)
-			.limit(limit + 1);
-
-		const hasMoreInDirection = refRows.length > limit;
-		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
-		if (direction === "older") {
-			pageRows.reverse();
-		}
-
-		if (pageRows.length === 0) {
-			return {
-				messages: [],
-				hasMore: false,
-				nextCursor: null,
-				hasMoreAfter: false,
-				prevCursor: null,
-			};
-		}
-
-		const messageIds = pageRows.map((r) => r.messageId);
-		const topMessages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true, creator: true },
-		});
-
-		// Sort by seq order from refs (not createdAt).
-		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
-		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-
-		// For subagent narrators, clear parentToolUseId so buildMessageTree
-		// treats them as top-level messages. Also fetch their child messages
-		// (nested subagent tool calls within this subagent).
-		if (isSubagent) {
-			for (const msg of topMessages) {
-				msg.parentToolUseId = null;
-			}
-		}
-
-		// Fetch child messages (don't filter by narratorId — forked narrators
-		// share messages whose narratorId points to the original creator).
-		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childMessages =
-			parentToolUseIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, creator: true },
-						orderBy: (m, { asc }) => [asc(m.createdAt)],
-						limit: 500,
-					})
-				: [];
-
-		await attachSubagentModels(childMessages);
-
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(
-				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
-			),
-		);
-
-		return {
-			messages: tree,
-			hasMore: direction === "older" ? hasMoreInDirection : false,
-			nextCursor: direction === "older" && hasMoreInDirection ? String(pageRows[0].seq) : null,
-			hasMoreAfter: direction === "newer" ? hasMoreInDirection : false,
-			prevCursor:
-				direction === "newer" && hasMoreInDirection
-					? String(pageRows[pageRows.length - 1].seq)
-					: null,
-		};
-	},
-
-	/**
-	 * Return the current messageVersion for a narrator.
-	 * Used by the sync_check WS flow — a single indexed SELECT, O(1).
-	 */
-	async getMessageVersion(narratorId: string): Promise<number> {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { messageVersion: true },
-		});
-		return row?.messageVersion ?? 0;
-	},
-
-	/**
-	 * Fetch messages added after a given message ID (for WS catch-up).
-	 * Returns:
-	 * - `topLevel`: new top-level messages (tree-structured, chronological)
-	 * - `orphanChildren`: child messages whose parent top-level message was
-	 *    already sent before the catch-up point (e.g. subagent messages that
-	 *    arrived while the client was disconnected). These should be sent as
-	 *    individual `{ type: "message" }` events so the frontend's
-	 *    `insertChildIntoCache` can place them correctly.
-	 */
-	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 40) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// Find the seq of the reference message
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, afterMessageId),
-			),
-			columns: { seq: true },
-		});
-		if (!ref) return { topLevel: [], orphanChildren: [], hitLimit: true };
-
-		// Cheap COUNT to decide catch-up vs full-reload before fetching payloads.
-		// For subagent narrators, count all messages (they all have parentToolUseId).
-		const countConditions = [
-			eq(narratorMessageRefs.narratorId, narratorId),
-			gt(narratorMessageRefs.seq, ref.seq),
-			isNull(narratorMessageRefs.segmentCompactId),
-		];
-		if (!isSubagent) {
-			countConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);
-		}
-		const [{ cnt }] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(and(...countConditions));
-		if (cnt > limit) return { topLevel: [], orphanChildren: [], hitLimit: true };
-
-		// Fetch ALL messages with seq > ref.seq (exclude segment-compacted refs).
-		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, ref.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-			.limit(10_000);
-
-		if (refRows.length === 0) return { topLevel: [], orphanChildren: [], hitLimit: false };
-
-		const messageIds = refRows.map((r) => r.messageId);
-		const allMessages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true, creator: true },
-		});
-
-		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
-		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-
-		// Separate top-level vs child messages.
-		// For subagent narrators, treat all messages as top-level (clear parentToolUseId).
-		const topMsgs = [] as typeof allMessages;
-		const childMsgs = [] as typeof allMessages;
-		for (const msg of allMessages) {
-			if (isSubagent) {
-				msg.parentToolUseId = null;
-				topMsgs.push(msg);
-			} else if (msg.parentToolUseId) {
-				childMsgs.push(msg);
-			} else {
-				topMsgs.push(msg);
-			}
-		}
-
-		// For new top-level messages, also fetch their children that might
-		// NOT be in the refRows (children created before the catch-up point
-		// but belonging to new top-level messages — unlikely but safe)
-		const newTopToolUseIds = collectToolUseIds(topMsgs);
-		const existingChildIds = new Set(childMsgs.map((m) => m.id));
-		if (newTopToolUseIds.length > 0) {
-			const extraChildren = await db.query.narratorMessages.findMany({
-				where: and(
-					inArray(narratorMessages.parentToolUseId, newTopToolUseIds),
-					// Exclude children we already have
-					childMsgs.length > 0
-						? sql`${narratorMessages.id} NOT IN (${sql.join(
-								childMsgs.map((m) => sql`${m.id}`),
-								sql`, `,
-							)})`
-						: undefined,
-				),
-				with: { toolCalls: true, creator: true },
-				orderBy: (m, { asc }) => [asc(m.createdAt)],
-				limit: 500,
-			});
-			for (const c of extraChildren) {
-				if (!existingChildIds.has(c.id)) {
-					childMsgs.push(c);
-				}
-			}
-		}
-
-		await attachSubagentModels(childMsgs);
-
-		// Build tree for new top-level messages
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
-		);
-
-		// Orphan children: child messages whose parentToolUseId does NOT belong
-		// to any new top-level message (they belong to an older message already
-		// in the client's cache). Skip children of completed subagents — those
-		// are already embedded in the parent's tree when the client loads messages.
-		const newTopToolUseIdSet = new Set(newTopToolUseIds);
-		const candidateOrphans = [] as typeof childMsgs;
-		const orphanToolUseIds: string[] = [];
-		for (const child of childMsgs) {
-			if (!child.parentToolUseId) continue;
-			if (!newTopToolUseIdSet.has(child.parentToolUseId)) {
-				candidateOrphans.push(child);
-				orphanToolUseIds.push(child.parentToolUseId);
-			}
-		}
-
-		let orphanChildren = [] as Array<(typeof childMsgs)[number] & { children: never[] }>;
-		if (candidateOrphans.length > 0) {
-			// Check which parent tool calls are truly finished (success/fail).
-			// The status column is NOT NULL with default "initializing", so
-			// isNotNull() would match every row — including in-progress ones —
-			// which incorrectly filtered out ALL orphan children.
-			const uniqueToolUseIds = [...new Set(orphanToolUseIds)];
-			const completedTcs = await db.query.narratorToolCalls.findMany({
-				where: and(
-					inArray(narratorToolCalls.toolUseId, uniqueToolUseIds),
-					inArray(narratorToolCalls.status, ["success", "fail"]),
-				),
-				columns: { toolUseId: true },
-			});
-			const completedSet = new Set(completedTcs.map((tc) => tc.toolUseId));
-			orphanChildren = candidateOrphans
-				.filter((c) => c.parentToolUseId && !completedSet.has(c.parentToolUseId))
-				.map((c) => ({ ...c, children: [] }));
-		}
-
-		return {
-			topLevel: tree,
-			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-			hitLimit: false,
-		};
-	},
-
-	/**
-	 * Fetch a bounded top-level message window around a target message ID.
-	 * If the target is a child message, resolve its top-level ancestor first.
-	 * Older pagination remains cursor-based via `hasMore` / `nextCursor`; newer
-	 * messages are intentionally bounded to keep permalink/search hydration light.
-	 */
-	async getMessagesAround(
-		narratorId: string,
-		messageId: string,
-		opts: { before?: number; after?: number } = {},
-	) {
-		const before = Math.max(0, opts.before ?? 5);
-		const after = Math.max(0, opts.after ?? 20);
-		const fallbackLimit = Math.max(before + after + 1, 10);
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// Resolve the target via narrator_message_refs so shared prefix messages in
-		// forked narrators can still be located by permalink/search result.
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { seq: true },
-		});
-		if (!targetRef) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-
-		const target = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-		});
-		if (!target) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-
-		// If target is a child message, walk up to find the top-level ancestor.
-		// (Skip for subagent narrators — all their messages have parentToolUseId.)
-		let anchorMessageId = target.id;
-		if (!isSubagent && target.parentToolUseId) {
-			const [parentTc] = await db
-				.select({ messageId: narratorToolCalls.messageId })
-				.from(narratorToolCalls)
-				.innerJoin(
-					narratorMessageRefs,
-					eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
-				)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorToolCalls.toolUseId, target.parentToolUseId),
-					),
-				)
-				.limit(1);
-			if (parentTc) anchorMessageId = parentTc.messageId;
-		}
-
-		const anchorRef =
-			anchorMessageId === target.id
-				? targetRef
-				: await db.query.narratorMessageRefs.findFirst({
-						where: and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, anchorMessageId),
-						),
-						columns: { seq: true },
-					});
-		if (!anchorRef) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-
-		const topLevelFilter = isSubagent ? undefined : isNull(narratorMessages.parentToolUseId);
-
-		// Fetch older top-level messages (seq < anchorSeq).
-		const olderRefRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					lt(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-					...(topLevelFilter ? [topLevelFilter] : []),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(before + 1);
-
-		const hasMore = olderRefRows.length > before;
-		const olderRows = hasMore ? olderRefRows.slice(0, before) : olderRefRows;
-		olderRows.reverse();
-
-		// Fetch a bounded number of newer top-level messages (seq > anchorSeq).
-		const newerRefRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-					...(topLevelFilter ? [topLevelFilter] : []),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq)
-			.limit(after + 1);
-		const hasMoreAfter = newerRefRows.length > after;
-		const newerRows = hasMoreAfter ? newerRefRows.slice(0, after) : newerRefRows;
-
-		const allRows = [
-			...olderRows,
-			{ messageId: anchorMessageId, seq: anchorRef.seq },
-			...newerRows,
-		];
-		const allIds = allRows.map((r) => r.messageId);
-
-		// Build seq map for ordering.
-		const seqMap = new Map<string, number>(allRows.map((r) => [r.messageId, r.seq]));
-
-		const topMessages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, allIds),
-			with: { toolCalls: true, creator: true },
-		});
-
-		// Sort by seq order.
-		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-
-		// For subagent narrators, clear parentToolUseId so buildMessageTree treats
-		// them as top-level messages.
-		if (isSubagent) {
-			for (const msg of topMessages) {
-				msg.parentToolUseId = null;
-			}
-		}
-
-		// Fetch child messages (don't filter by narratorId — shared messages).
-		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childMessages =
-			parentToolUseIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, creator: true },
-						orderBy: (m, { asc }) => [asc(m.createdAt)],
-						limit: 500,
-					})
-				: [];
-
-		await attachSubagentModels(childMessages);
-
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(
-				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
-			),
-		);
-		return {
-			messages: tree,
-			hasMore,
-			nextCursor: hasMore ? String(olderRows[0]?.seq ?? anchorRef.seq) : null,
-			hasMoreAfter,
-			prevCursor: hasMoreAfter
-				? String(newerRows[newerRows.length - 1]?.seq ?? anchorRef.seq)
-				: null,
-		};
-	},
-
-	async getToolCallDetail(narratorId: string, toolUseId: string) {
-		// 1. Direct match — tool call belongs to this narrator
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-		});
-		if (tc) return tc;
-
-		// 2. Fallback — look up by toolUseId alone, then verify the caller
-		//    narrator can see it. This covers:
-		//    - Forked narrators (shared message refs, tool call under original narrator)
-		//    - Subagent tool calls viewed inline in the parent narrator
-		//    - Combination of both (fork + subagent)
-		const candidate = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-		});
-		if (!candidate) throw new NotFoundError("ToolCall", toolUseId);
-
-		// Verify: the tool call's message (or an ancestor via parentToolUseId)
-		// must be reachable from this narrator's message refs.
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, candidate.messageId),
-			columns: { id: true, parentToolUseId: true },
-		});
-		if (msg) {
-			// Check if the message itself is in this narrator's refs
-			const directRef = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, msg.id),
-				),
-			});
-			if (directRef) return candidate;
-
-			// For subagent messages: the message has parentToolUseId pointing to
-			// a tool_use block in the parent narrator's message. Find that parent
-			// message and check if it's in our refs.
-			if (msg.parentToolUseId) {
-				const parentTc = await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.toolUseId, msg.parentToolUseId),
-					columns: { messageId: true },
-				});
-				if (parentTc) {
-					const parentRef = await db.query.narratorMessageRefs.findFirst({
-						where: and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, parentTc.messageId),
-						),
-					});
-					if (parentRef) return candidate;
-				}
-			}
-		}
-
-		throw new NotFoundError("ToolCall", toolUseId);
-	},
-
-	/** Extract the full compact summary from a compact system message. */
-	async getCompactSummary(narratorId: string, messageId: string): Promise<string> {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
-		if (!compactBlock) {
-			throw new NotFoundError("CompactSummary", messageId);
-		}
-		return typeof compactBlock.summary === "string" ? compactBlock.summary : "";
-	},
-
-	/**
-	 * Delete a compact message and clear the narrator's contextSummary.
-	 * Returns metadata about the deletion so callers can assess impact.
-	 */
-	async deleteCompactMessage(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact");
-		if (!compactBlock) throw new ValidationError("Message is not a compact message");
-
-		// Check if there's an older compact point that will take over
-		const currentRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		const prevCompact = currentRef
-			? await db
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.isCompact, 1),
-							lt(narratorMessageRefs.seq, currentRef.seq),
-						),
-					)
-					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-					.limit(1)
-			: [];
-
-		// Delete atomically
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
-			await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
-
-			// Both regular and plan compacts set contextSummary, so both need to clear it.
-			// Also clear prune boundary — compact deletion invalidates the pruning context.
-			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
-				.set({
-					contextSummary: null,
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId));
-		});
-
-		return { previousCompactExists: prevCompact.length > 0 };
-	},
-
-	/**
-	 * Delete a message and all subsequent messages from a narrator's conversation.
-	 * Removes refs for the target message and everything after it (by seq).
-	 * Messages not referenced by any other narrator are fully deleted.
-	 * Resets apiConversationId since conversation history changed.
-	 */
-	async deleteMessage(narratorId: string, messageId: string) {
-		// Verify the message belongs to this narrator via refs
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!targetRef) throw new NotFoundError("Message", messageId);
-
-		// Find all refs at or after this seq (the target + everything after it)
-		const refsToRemove = await db
-			.select({
-				id: narratorMessageRefs.id,
-				messageId: narratorMessageRefs.messageId,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gte(narratorMessageRefs.seq, targetRef.seq),
-				),
-			);
-
-		if (refsToRemove.length === 0) return { deletedCount: 0 };
-
-		const refIds = refsToRemove.map((r) => r.id);
-		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
-
-		// Auto-revert file changes before deleting messages
-		await revertPatchesForMessages(narratorId, messageIds);
-
-		await db.transaction(async (tx) => {
-			// Remove refs for this narrator
-			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
-
-			// Find messages that are now orphaned (not referenced by any narrator)
-			// Also include child messages (sub-agent messages via parentToolUseId)
-			const orphanRows = await tx
-				.select({ id: narratorMessages.id })
-				.from(narratorMessages)
-				.where(
-					and(
-						inArray(narratorMessages.id, messageIds),
-						sql`NOT EXISTS (
-							SELECT 1 FROM narrator_message_refs nmr
-							WHERE nmr.message_id = ${narratorMessages.id}
-						)`,
-					),
-				);
-
-			// Also find child messages (sub-agent) of orphaned top-level messages
-			const orphanIds = orphanRows.map((r) => r.id);
-			if (orphanIds.length > 0) {
-				// Get tool_use IDs from orphaned messages to find sub-agent children
-				const orphanMsgs = await tx
-					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds));
-
-				const toolUseIds: string[] = [];
-				for (const msg of orphanMsgs) {
-					const blocks = Array.isArray(msg.contentJson)
-						? (msg.contentJson as { type: string; id?: string }[])
-						: [];
-					for (const b of blocks) {
-						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
-					}
-				}
-
-				// Find child messages that reference these tool_use IDs
-				if (toolUseIds.length > 0) {
-					const childRows = await tx
-						.select({ id: narratorMessages.id })
-						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
-					for (const c of childRows) orphanIds.push(c.id);
-				}
-
-				// Delete tool calls, then messages
-				// Clear narrator FK references to messages about to be deleted
-				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
-				await tx
-					.update(narrators)
-					.set({ forkMessageId: null })
-					.where(inArray(narrators.forkMessageId, orphanIds));
-				await tx
-					.update(narrators)
-					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
-			}
-
-			// Reset conversation state since history changed
-			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
-				.set({
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId));
-		});
-
-		return { deletedCount: refsToRemove.length };
-	},
-
-	/**
-	 * Dismiss a single system error message (type="error") without affecting
-	 * surrounding messages or resetting conversation state.
-	 */
-	async dismissErrorMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!ref) throw new NotFoundError("Message", messageId);
-
-		// Verify it's actually an error system message
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { role: true, contentJson: true },
-		});
-		if (
-			!msg ||
-			msg.role !== "system" ||
-			!Array.isArray(msg.contentJson) ||
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			!(msg.contentJson as any[]).some((b: any) => b.type === "error")
-		) {
-			throw new ValidationError("Message is not an error notice");
-		}
-
-		await db.transaction(async (tx) => {
-			await tx
-				.delete(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				);
-			// Delete the message itself only if no other narrator references it
-			const otherRef = await tx.query.narratorMessageRefs.findFirst({
-				where: eq(narratorMessageRefs.messageId, messageId),
-			});
-			if (!otherRef) {
-				await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
-			}
-			// Clear the narrator's errorMessage field when dismissing the error
-			await tx
-				.update(narrators)
-				.set({
-					errorMessage: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-				})
-				.where(eq(narrators.id, narratorId));
-		});
-
-		// Broadcast the dismissal to update frontend cache
-		broadcastToNarrator(narratorId, {
-			type: "status_change",
-			narratorId,
-			status: (await this.getById(narratorId)).status,
-		});
-	},
-
-	/**
-	 * Delete all messages strictly AFTER the given message (by seq order).
-	 * The target message itself is preserved.
-	 * Returns the list of deleted message IDs for WS broadcast.
-	 */
-	async deleteMessagesAfter(narratorId: string, messageId: string) {
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!targetRef) throw new NotFoundError("Message", messageId);
-
-		const refsToRemove = await db
-			.select({
-				id: narratorMessageRefs.id,
-				messageId: narratorMessageRefs.messageId,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, targetRef.seq),
-				),
-			);
-
-		if (refsToRemove.length === 0) return { deletedCount: 0, deletedMessageIds: [] };
-
-		const refIds = refsToRemove.map((r) => r.id);
-		const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
-
-		// Auto-revert file changes before deleting messages
-		await revertPatchesForMessages(narratorId, messageIds);
-
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
-
-			const orphanRows = await tx
-				.select({ id: narratorMessages.id })
-				.from(narratorMessages)
-				.where(
-					and(
-						inArray(narratorMessages.id, messageIds),
-						sql`NOT EXISTS (
-							SELECT 1 FROM narrator_message_refs nmr
-							WHERE nmr.message_id = ${narratorMessages.id}
-						)`,
-					),
-				);
-
-			const orphanIds = orphanRows.map((r) => r.id);
-			if (orphanIds.length > 0) {
-				const orphanMsgs = await tx
-					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds));
-
-				const toolUseIds: string[] = [];
-				for (const msg of orphanMsgs) {
-					const blocks = Array.isArray(msg.contentJson)
-						? (msg.contentJson as { type: string; id?: string }[])
-						: [];
-					for (const b of blocks) {
-						if (b.type === "tool_use" && b.id) toolUseIds.push(b.id);
-					}
-				}
-
-				if (toolUseIds.length > 0) {
-					const childRows = await tx
-						.select({ id: narratorMessages.id })
-						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
-					for (const c of childRows) orphanIds.push(c.id);
-				}
-
-				// Clear narrator FK references to messages about to be deleted
-				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
-				await tx
-					.update(narrators)
-					.set({ forkMessageId: null })
-					.where(inArray(narrators.forkMessageId, orphanIds));
-				await tx
-					.update(narrators)
-					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
-			}
-
-			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
-				.set({
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId));
-		});
-
-		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
-	},
-
-	/**
-	 * Delete a single content block from a message by index.
-	 * If the message becomes empty after removal, the entire message is deleted
-	 * (without cascading to subsequent messages).
-	 * Handles copy-on-write when the message is shared by multiple narrators.
-	 */
-	async deleteMessageBlock(
-		narratorId: string,
-		messageId: string,
-		blockIndex: number,
-		opts?: { skipRevert?: boolean; skipNarratorUpdate?: boolean },
-	) {
-		// Verify the message belongs to this narrator
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!targetRef) throw new NotFoundError("Message", messageId);
-
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-		});
-		if (!message) throw new NotFoundError("Message", messageId);
-
-		const blocks = Array.isArray(message.contentJson)
-			? (message.contentJson as { type: string; id?: string; text?: string }[])
-			: [];
-		if (blockIndex < 0 || blockIndex >= blocks.length) {
-			throw new ValidationError(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
-		}
-
-		const removedBlock = blocks[blockIndex];
-		const remaining = blocks.filter((_, i) => i !== blockIndex);
-
-		// Auto-revert file changes if the removed block is a tool_use
-		if (!opts?.skipRevert && removedBlock.type === "tool_use" && removedBlock.id) {
-			await revertPatchForToolUse(narratorId, removedBlock.id);
-		}
-
-		// Check if this message is shared by multiple narrators
-		const refCount = await db
-			.select({ count: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId));
-		const isShared = (refCount[0]?.count ?? 0) > 1;
-
-		let messageDeleted = false;
-
-		await db.transaction(async (tx) => {
-			// Helper: clean up a tool_use block's associated records
-			const cleanToolUseBlock = async (block: { type: string; id?: string }, msgId: string) => {
-				if (block.type !== "tool_use" || !block.id) return;
-				// Delete tool call record for THIS message only
-				await tx
-					.delete(narratorToolCalls)
-					.where(
-						and(eq(narratorToolCalls.messageId, msgId), eq(narratorToolCalls.toolUseId, block.id)),
-					);
-				// Delete sub-agent child messages ONLY if no other narrator refs them
-				const children = await tx
-					.select({ id: narratorMessages.id })
-					.from(narratorMessages)
-					.where(eq(narratorMessages.parentToolUseId, block.id));
-				if (children.length > 0) {
-					const childIds = children.map((c) => c.id);
-					// Check if any other narrator still references these children
-					const otherRefs = await tx
-						.select({ messageId: narratorMessageRefs.messageId })
-						.from(narratorMessageRefs)
-						.where(
-							and(
-								inArray(narratorMessageRefs.messageId, childIds),
-								ne(narratorMessageRefs.narratorId, narratorId),
-							),
-						)
-						.limit(1);
-					if (otherRefs.length === 0) {
-						// No other narrator references — safe to delete
-						await tx
-							.delete(narratorToolCalls)
-							.where(inArray(narratorToolCalls.messageId, childIds));
-						await tx
-							.delete(narratorMessageRefs)
-							.where(inArray(narratorMessageRefs.messageId, childIds));
-						await tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds));
-					} else {
-						// Other narrators still reference — only remove THIS narrator's refs
-						await tx
-							.delete(narratorMessageRefs)
-							.where(
-								and(
-									eq(narratorMessageRefs.narratorId, narratorId),
-									inArray(narratorMessageRefs.messageId, childIds),
-								),
-							);
-					}
-				}
-			};
-
-			if (remaining.length === 0) {
-				// No blocks left — delete the entire message (this one only, no cascade)
-				messageDeleted = true;
-
-				// Clean up tool_use associations from the removed block
-				await cleanToolUseBlock(removedBlock, messageId);
-
-				// Remove ref for this narrator
-				await tx
-					.delete(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, messageId),
-						),
-					);
-
-				// If message is now orphaned, delete it
-				if (!isShared) {
-					await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId));
-					await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
-				}
-			} else if (isShared) {
-				// Copy-on-write: create a new message for this narrator
-				const newId = generateId();
-				const contentText = remaining
-					.filter((b) => b.type === "text")
-					.map((b) => b.text ?? "")
-					.join("\n");
-
-				await tx.insert(narratorMessages).values({
-					id: newId,
-					narratorId: message.narratorId,
-					messageUuid: message.messageUuid,
-					parentToolUseId: message.parentToolUseId,
-					role: message.role,
-					contentJson: remaining,
-					contentText: contentText || null,
-					tokensIn: message.tokensIn,
-					costUsd: message.costUsd,
-					turnUsageJson: message.turnUsageJson,
-					contextPercent: message.contextPercent,
-					meterUsage: message.meterUsage,
-					meterUnit: message.meterUnit,
-					commitSha: message.commitSha,
-					createdAt: message.createdAt,
-				});
-
-				// Update ref to point to new message
-				await tx
-					.update(narratorMessageRefs)
-					.set({ messageId: newId })
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, messageId),
-						),
-					);
-
-				// Copy retained tool_use blocks' tool_calls to new messageId
-				const remainingToolUseIds = remaining
-					.filter((b): b is typeof b & { id: string } => b.type === "tool_use" && !!b.id)
-					.map((b) => b.id);
-				if (remainingToolUseIds.length > 0) {
-					const existingCalls = await tx
-						.select()
-						.from(narratorToolCalls)
-						.where(
-							and(
-								eq(narratorToolCalls.messageId, messageId),
-								inArray(narratorToolCalls.toolUseId, remainingToolUseIds),
-							),
-						);
-					if (existingCalls.length > 0) {
-						await tx.insert(narratorToolCalls).values(
-							existingCalls.map((tc) => ({
-								...tc,
-								id: generateId(),
-								messageId: newId,
-							})),
-						);
-					}
-				}
-
-				// Clean up tool_use associations from the removed block (on new message)
-				await cleanToolUseBlock(removedBlock, newId);
-			} else {
-				// Not shared — update in place
-				const contentText = remaining
-					.filter((b) => b.type === "text")
-					.map((b) => b.text ?? "")
-					.join("\n");
-
-				await tx
-					.update(narratorMessages)
-					.set({ contentJson: remaining, contentText: contentText || null })
-					.where(eq(narratorMessages.id, messageId));
-
-				// Clean up tool_use associations from the removed block
-				await cleanToolUseBlock(removedBlock, messageId);
-			}
-
-			// Reset conversation state since history changed
-			if (!opts?.skipNarratorUpdate) {
-				await tx
-					.update(narrators)
-					.set({
-						apiConversationId: null,
-						pruneBoundaryMessageId: null,
-						prunedPercent: null,
-						messageVersion: sql`${narrators.messageVersion} + 1`,
-						updatedAt: new Date().toISOString(),
-					})
-					.where(eq(narrators.id, narratorId));
-			}
-		});
-
-		return { messageDeleted };
-	},
-
-	/**
-	 * Delete multiple content blocks across one or more messages in a single operation.
-	 * Blocks are processed in reverse blockIndex order per message to avoid index shifting.
-	 *
-	 * Optimized: collects all tool_use toolUseIds upfront and performs a single batch
-	 * revert (one cwd lookup, one queryOrderedToolCalls, one rebuild, one disk write),
-	 * then delegates per-block DB cleanup to `deleteMessageBlock` with revert skipped.
-	 * Narrator state (messageVersion etc.) is updated once at the end instead of per-block.
-	 */
-	async deleteMessageBlocks(
-		narratorId: string,
-		blocks: Array<{ messageId: string; blockIndex: number }>,
-	) {
-		// Group by messageId and sort blockIndex descending within each group
-		const grouped = new Map<string, number[]>();
-		for (const b of blocks) {
-			const arr = grouped.get(b.messageId) ?? [];
-			arr.push(b.blockIndex);
-			grouped.set(b.messageId, arr);
-		}
-		for (const arr of grouped.values()) {
-			arr.sort((a, b) => b - a); // descending so earlier deletes don't shift later indices
-		}
-
-		// --- Phase 1: Collect all tool_use IDs that will be removed ---
-		const toolUseIdsToRevert: string[] = [];
-		const uniqueMessageIds = [...grouped.keys()];
-		const messages =
-			uniqueMessageIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.id, uniqueMessageIds),
-						columns: { id: true, contentJson: true },
-					})
-				: [];
-		const messageMap = new Map(messages.map((m) => [m.id, m]));
-
-		for (const [messageId, indices] of grouped) {
-			const msg = messageMap.get(messageId);
-			if (!msg) continue;
-			const contentBlocks = Array.isArray(msg.contentJson)
-				? (msg.contentJson as { type: string; id?: string }[])
-				: [];
-			for (const idx of indices) {
-				const block = contentBlocks[idx];
-				if (block?.type === "tool_use" && block.id) {
-					toolUseIdsToRevert.push(block.id);
-				}
-			}
-		}
-
-		// --- Phase 2: Batch revert all affected files in one pass ---
-		if (toolUseIdsToRevert.length > 0) {
-			await revertPatchForToolUses(narratorId, toolUseIdsToRevert);
-		}
-
-		// --- Phase 3: Per-block DB cleanup (revert + narrator update skipped) ---
-		const results: Array<{ messageId: string; blockIndex: number; messageDeleted: boolean }> = [];
-		const failed: Array<{ messageId: string; blockIndex: number; error: string }> = [];
-		for (const [messageId, indices] of grouped) {
-			for (const blockIndex of indices) {
-				try {
-					const r = await this.deleteMessageBlock(narratorId, messageId, blockIndex, {
-						skipRevert: true,
-						skipNarratorUpdate: true,
-					});
-					results.push({ messageId, blockIndex, messageDeleted: r.messageDeleted });
-					// If the whole message was deleted, skip remaining blocks for this message
-					if (r.messageDeleted) break;
-				} catch (err) {
-					failed.push({
-						messageId,
-						blockIndex,
-						error: err instanceof Error ? err.message : String(err),
-					});
-				}
-			}
-		}
-
-		// --- Phase 4: Single narrator state update ---
-		if (results.length > 0) {
-			await db
-				.update(narrators)
-				.set({
-					apiConversationId: null,
-					pruneBoundaryMessageId: null,
-					prunedPercent: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(narrators.id, narratorId));
-		}
-
-		return { deleted: results.length, failed: failed.length, results };
-	},
-
-	/**
-	 * Remove a compacting/compact message by ID without touching narrator's contextSummary.
-	 * Used for rollback when compact generation fails mid-way.
-	 */
-	async removeCompactingMessage(narratorId: string, messageId: string) {
-		await db.transaction(async (tx) => {
-			await tx
-				.delete(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-				);
-			await tx
-				.delete(narratorMessages)
-				.where(
-					and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-				);
-		});
-	},
-
-	/**
-	 * Update the summary text of a compact message and sync to narrator's contextSummary.
-	 * Both updates happen atomically in a transaction.
-	 */
-	async updateCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-			),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const compactBlock = blocks.find((b: any) => b.type === "compact" && b.status === "compacted");
-		if (!compactBlock) throw new ValidationError("Message is not a compacted message");
-
-		const isPlan = compactBlock.subtype === "plan";
-		const newBlock: Record<string, unknown> = {
-			type: "compact",
-			status: "compacted",
-			summary,
-		};
-		if (isPlan) newBlock.subtype = "plan";
-
-		const prefix = isPlan ? "[Plan]" : "[Compact]";
-		const now = new Date().toISOString();
-
-		await db.transaction(async (tx) => {
-			await tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [newBlock],
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-				})
-				.where(eq(narratorMessages.id, messageId));
-
-			// Both regular and plan compacts sync contextSummary
-			await tx
-				.update(narrators)
-				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		});
-	},
-
-	async getPendingPermissions(narratorId: string) {
-		const tcs = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "pending"),
-			),
-			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
-		});
-		return tcs.map((tc) => ({
-			id: tc.id,
-			toolName: tc.toolName,
-			toolUseId: tc.toolUseId,
-			inputJson: tc.inputJson,
-			decisionReason: tc.permissionDecisionReason,
-			suggestions: tc.permissionSuggestions,
-		}));
-	},
-
-	async persistUserMessage(
-		narratorId: string,
-		text: string,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		contentBlocks?: any[],
-		commandText?: string | null,
-		createdBy?: string | null,
-	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: contentBlocks ?? [{ type: "text", text }],
-				contentText: text,
-				commandText: commandText ?? null,
-				createdBy: createdBy ?? null,
-				createdAt: now,
-			})
-			.returning();
-
-		// Insert into narrator_message_refs junction table
-		await appendMessageRef(narratorId, id);
-
-		// Attach creator info for WS broadcast
-		if (createdBy) {
-			const user = await db.query.users.findFirst({
-				where: eq(users.id, createdBy),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			});
-			return { ...msg, creator: user ?? null };
-		}
-		return { ...msg, creator: null };
-	},
-
-	/**
-	 * Persist a system-injected message into the narrator's chat history.
-	 * Uses role="sys" so the model can see it in conversation history.
-	 * The `contentBlocks` carry structured metadata for the UI; a text block
-	 * is always prepended so the model can read the plain-text content.
-	 */
-	async persistSystemMessage(
-		narratorId: string,
-		text: string,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		contentBlocks?: any[],
-		createdBy?: string,
-	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		// Always lead with a text block so the SDK sees the message content,
-		// then append structured metadata blocks for the UI.
-		const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "sys",
-				contentJson: blocks,
-				contentText: text,
-				createdBy: createdBy ?? null,
-				createdAt: now,
-			})
-			.returning();
-
-		await appendMessageRef(narratorId, id);
-		return msg;
-	},
-
-	/**
-	 * Persist a lightweight display message (role="disp", type="info").
-	 * Excluded from model history — purely a UI notification in the chat timeline.
-	 * Returns the created message row and broadcasts it via WebSocket.
-	 */
-	async persistDisplayMessage(narratorId: string, text: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "disp",
-				contentJson: [{ type: "info", message: text }],
-				contentText: `[Info] ${text}`,
-				createdAt: now,
-			})
-			.returning();
-		await appendMessageRef(narratorId, id);
-		broadcastToNarrator(narratorId, {
-			type: "message",
-			narratorId,
-			message: {
-				id: msg.id,
-				narratorId,
-				role: "disp",
-				contentJson: msg.contentJson,
-				contentText: msg.contentText,
-				createdAt: msg.createdAt,
-				children: [],
-			},
-		});
-		return msg;
-	},
-
-	async persistCompactingMessage(narratorId: string, beforeMessageId?: string) {
-		const id = generateId();
-
-		let seq: number;
-		if (beforeMessageId) {
-			// Atomically shift seq values and compute insertion point
-			seq = await db.transaction(async (tx) => {
-				const targetRef = await tx.query.narratorMessageRefs.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, beforeMessageId),
-					),
-				});
-				if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
-				await tx
-					.update(narratorMessageRefs)
-					.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							gte(narratorMessageRefs.seq, targetRef.seq),
-						),
-					);
-				return targetRef.seq;
-			});
-		} else {
-			seq = await db.transaction(async (tx) => {
-				const result = await tx
-					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-					.from(narratorMessageRefs)
-					.where(eq(narratorMessageRefs.narratorId, narratorId));
-				return (result[0]?.maxSeq ?? -1) + 1;
-			});
-		}
-
-		const createdAt = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacting" }],
-				contentText: "[Compacting]",
-				createdAt,
-			})
-			.returning();
-
-		await insertMessageRef(narratorId, id, seq);
-
-		return msg;
-	},
-
-	/**
-	 * Insert a plan compact message — a compact marker with subtype "plan"
-	 * that displays its content as a card rather than a collapsible indicator.
-	 * Atomically inserts the message, sets isCompact=1, and updates contextSummary.
-	 */
-	async persistPlanMessage(narratorId: string, content: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacted", subtype: "plan", summary: content }],
-				contentText: `[Plan] ${content.slice(0, 200)}...`,
-				createdAt: now,
-			})
-			.returning();
-
-		// Atomically: append ref with isCompact=1 and update narrator's contextSummary
-		await db.transaction(async (tx) => {
-			const result = await tx
-				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.narratorId, narratorId));
-			const seq = (result[0]?.maxSeq ?? -1) + 1;
-			await tx.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId,
-				messageId: id,
-				seq,
-				isCompact: 1,
-			});
-			await tx
-				.update(narrators)
-				.set({ contextSummary: content, apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		});
-
-		return msg;
-	},
-
-	/**
-	 * Insert a compact marker with empty summary to clear the context.
-	 * Subsequent queries will start loading from after this point,
-	 * effectively discarding all prior messages from the AI's context window.
-	 */
-	async clearContext(narratorId: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
-				contentText: "[Context cleared]",
-				createdAt: now,
-			})
-			.returning();
-
-		await db.transaction(async (tx) => {
-			const result = await tx
-				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.narratorId, narratorId));
-			const seq = (result[0]?.maxSeq ?? -1) + 1;
-			await tx.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId,
-				messageId: id,
-				seq,
-				isCompact: 1,
-			});
-			await tx
-				.update(narrators)
-				.set({ contextSummary: null, apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		});
-
-		return msg;
-	},
-
-	/**
-	 * Finalize a "compacting" system message to "compacted" with the full summary.
-	 * Atomically updates the message content, sets isCompact=1 on the ref,
-	 * and stores the summary on the narrator — all in one transaction.
-	 */
-	async finalizeCompactingMessage(
-		messageId: string,
-		narratorId: string,
-		summary: string,
-		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
-	) {
-		const now = new Date().toISOString();
-		const status = options?.status ?? "compacted";
-		const compactBlock: Record<string, unknown> = { type: "compact", status, summary };
-		if (status === "failed" && options?.error) {
-			compactBlock.error = options.error;
-		}
-		const prefix = status === "failed" ? "[Compact Failed]" : "[Compact]";
-
-		return db.transaction(async (tx) => {
-			const [updated] = await tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [compactBlock],
-					contentText: `${prefix} ${summary.slice(0, 200)}...`,
-					contextPercent: contextPercent ?? null,
-				})
-				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
-				.returning();
-			if (!updated) return null;
-
-			await tx
-				.update(narratorMessageRefs)
-				.set({ isCompact: status === "compacted" ? 1 : 0 })
-				.where(
-					and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-				);
-
-			// Only successful compact should reset context summary/API conversation.
-			if (status === "compacted") {
-				await tx
-					.update(narrators)
-					.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			}
-
-			return updated;
-		});
-	},
-
-	async persistAssistantMessage(
-		narratorId: string,
-		sdkMessage: {
-			uuid: string;
-			session_id: string;
-			parent_tool_use_id?: string | null;
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			message: { content: any[]; usage?: any };
-			contextPercent?: number;
-			meterUsage?: number;
-			meterUnit?: string;
-			provider?: string;
-			credentialId?: string;
-			model?: string;
-			outputTokens?: number;
-			cachedInputTokens?: number;
-			cacheCreationInputTokens?: number;
-			cacheCreation5mTokens?: number;
-			cacheCreation1hTokens?: number;
-			reasoningTokens?: number;
-			ttftMs?: number;
-			durationMs?: number;
-		},
-	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const content = sdkMessage.message.content;
-
-		// Extract plain text for search
-		const contentText = content
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.filter((b: any) => b.type === "text")
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.map((b: any) => b.text)
-			.join("\n");
-
-		const usage = sdkMessage.message.usage;
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				messageUuid: sdkMessage.uuid,
-				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-				role: "assistant",
-				contentJson: content,
-				contentText: contentText || null,
-				tokensIn: usage?.input_tokens,
-				provider: sdkMessage.provider ?? null,
-				credentialId: sdkMessage.credentialId ?? null,
-				model: sdkMessage.model ?? null,
-				outputTokens: sdkMessage.outputTokens ?? null,
-				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-				reasoningTokens: sdkMessage.reasoningTokens ?? null,
-				ttftMs: sdkMessage.ttftMs ?? null,
-				durationMs: sdkMessage.durationMs ?? null,
-				contextPercent: sdkMessage.contextPercent ?? null,
-				meterUsage: sdkMessage.meterUsage ?? null,
-				meterUnit: sdkMessage.meterUnit ?? null,
-				createdAt: now,
-			})
-			.returning();
-
-		// Insert into narrator_message_refs junction table
-		await appendMessageRef(narratorId, id);
-
-		// Extract tool_use blocks and create tool call records
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
-		for (const block of toolUseBlocks) {
-			await db.insert(narratorToolCalls).values({
-				id: generateId(),
-				narratorId,
-				messageId: id,
-				toolUseId: block.id,
-				toolName: block.name,
-				inputJson: block.input,
-				status: "initializing",
-				createdAt: now,
-			});
-		}
-
-		return msg;
-	},
-
-	/**
-	 * Create a partial assistant message with no content blocks yet.
-	 * Blocks will be appended incrementally via appendBlockToMessage().
-	 */
-	async createPartialAssistantMessage(
-		narratorId: string,
-		sdkMessage: {
-			uuid: string;
-			session_id: string;
-			parent_tool_use_id?: string | null;
-			contextPercent?: number;
-			meterUsage?: number;
-			meterUnit?: string;
-			tokensIn?: number;
-			turnUsage?: Record<string, unknown>;
-			provider?: string;
-			credentialId?: string;
-			model?: string;
-			outputTokens?: number;
-			cachedInputTokens?: number;
-			cacheCreationInputTokens?: number;
-			cacheCreation5mTokens?: number;
-			cacheCreation1hTokens?: number;
-			reasoningTokens?: number;
-			ttftMs?: number;
-			durationMs?: number;
-		},
-	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				messageUuid: sdkMessage.uuid,
-				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-				role: "assistant",
-				contentJson: [],
-				contentText: null,
-				tokensIn: sdkMessage.tokensIn ?? null,
-				turnUsageJson: sdkMessage.turnUsage ?? null,
-				provider: sdkMessage.provider ?? null,
-				credentialId: sdkMessage.credentialId ?? null,
-				model: sdkMessage.model ?? null,
-				outputTokens: sdkMessage.outputTokens ?? null,
-				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-				reasoningTokens: sdkMessage.reasoningTokens ?? null,
-				ttftMs: sdkMessage.ttftMs ?? null,
-				durationMs: sdkMessage.durationMs ?? null,
-				contextPercent: sdkMessage.contextPercent ?? null,
-				meterUsage: sdkMessage.meterUsage ?? null,
-				meterUnit: sdkMessage.meterUnit ?? null,
-				createdAt: now,
-			})
-			.returning();
-
-		await appendMessageRef(narratorId, id);
-		return msg;
-	},
-
-	/**
-	 * Append a completed content block to an existing assistant message
-	 * and optionally create a tool_call record for tool_use blocks.
-	 */
-	async appendBlockToMessage(
-		messageId: string,
-		narratorId: string,
-		block:
-			| { type: "text"; text: string }
-			| {
-					type: "reasoning";
-					text: string;
-					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-					outputIndex?: number;
-			  }
-			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-			| {
-					type: "web_search";
-					id: string;
-					query?: string;
-					queries?: string[];
-					outputIndex?: number;
-			  },
-	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
-		});
-		if (!existing) return;
-
-		// Preserve provider block order when available (e.g. Codex reasoning/search interleaving).
-		type StoredAssistantBlock =
-			| { type: "text"; text: string }
-			| {
-					type: "reasoning";
-					text: string;
-					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-					outputIndex?: number;
-			  }
-			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-			| {
-					type: "web_search";
-					id: string;
-					query?: string;
-					queries?: string[];
-					outputIndex?: number;
-			  }
-			| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-		const current = (
-			Array.isArray(existing.contentJson) ? existing.contentJson : []
-		) as StoredAssistantBlock[];
-		let content: StoredAssistantBlock[];
-		if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-			const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-				const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-				return typeof outputIndex === "number" ? outputIndex : undefined;
-			};
-			const next = [...current, block as StoredAssistantBlock];
-			const indexed = next.map((entry, index) => ({ entry, index }));
-			indexed.sort((a, b) => {
-				const aOrder = getOutputIndex(a.entry) ?? Number.POSITIVE_INFINITY;
-				const bOrder = getOutputIndex(b.entry) ?? Number.POSITIVE_INFINITY;
-				return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
-			});
-			content = indexed.map(({ entry }) => entry);
-		} else if (block.type === "reasoning") {
-			const idx = current.findIndex((b) => b.type !== "reasoning");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
-		} else if (block.type === "text") {
-			const idx = current.findIndex((b) => b.type === "tool_use");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
-		} else {
-			content = [...current, block];
-		}
-		const contentText = content
-			.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
-			.join("\n");
-
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: content, contentText: contentText || null })
-			.where(eq(narratorMessages.id, messageId));
-
-		// Create tool_call record for tool_use blocks
-		if (block.type === "tool_use") {
-			const now = new Date().toISOString();
-			await db.insert(narratorToolCalls).values({
-				id: generateId(),
-				narratorId,
-				messageId,
-				toolUseId: block.id,
-				toolName: block.name,
-				inputJson: block.input,
-				status: "initializing",
-				createdAt: now,
-			});
-		}
-	},
-
-	/**
-	 * Patch a reasoning block's translatedText within an existing message.
-	 * Finds the reasoning block at the given index and sets its translatedText field.
-	 */
-	async patchReasoningTranslation(
-		messageId: string,
-		reasoningIndex: number,
-		translatedText: string,
-	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
-		});
-		if (!existing) return;
-
-		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
-		const block = content[reasoningIndex] as any;
-		if (!block || block.type !== "reasoning") return;
-
-		block.translatedText = translatedText;
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: content })
-			.where(eq(narratorMessages.id, messageId));
-	},
-
-	async updateConversationId(narratorId: string, apiConversationId: string) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ apiConversationId, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateStats(narratorId: string, costUsd: number) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({
-				messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
-				totalCostUsd: sql`COALESCE(${narrators.totalCostUsd}, 0) + ${costUsd}`,
-				lastMessageAt: now,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateMessageCost(messageId: string, costUsd: number, turnUsage?: Record<string, unknown>) {
-		await db
-			.update(narratorMessages)
-			.set({
-				costUsd,
-				...(turnUsage ? { turnUsageJson: turnUsage } : {}),
-			})
-			.where(eq(narratorMessages.id, messageId));
-	},
-
-	async updateTitle(narratorId: string, title: string) {
-		const now = new Date().toISOString();
-		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
-	},
-
-	async updateCwd(narratorId: string, cwd: string) {
-		const now = new Date().toISOString();
-		await db.update(narrators).set({ cwd, updatedAt: now }).where(eq(narrators.id, narratorId));
-	},
-
-	async updateModel(narratorId: string, model: string) {
-		const now = new Date().toISOString();
-		await db.update(narrators).set({ model, updatedAt: now }).where(eq(narrators.id, narratorId));
-	},
-
-	async updatePermissionMode(
-		narratorId: string,
-		permissionMode:
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "readOnly"
-			| "plan"
-			| "dontAsk",
-	) {
-		const now = new Date().toISOString();
-
-		// When manually switching to plan mode, save the current mode so it can be restored on exit
-		if (permissionMode === "plan") {
-			const current = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { permissionMode: true },
-			});
-			const prevMode = current?.permissionMode ?? "default";
-			if (prevMode !== "plan") {
-				await db
-					.update(narrators)
-					.set({ permissionMode, previousPermissionMode: prevMode, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			} else {
-				await db
-					.update(narrators)
-					.set({ permissionMode, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			}
-		} else {
-			await db
-				.update(narrators)
-				.set({ permissionMode, previousPermissionMode: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		}
-
-		// 同步权限模式到所有活跃的 subagent
-		await db
-			.update(narrators)
-			.set({ permissionMode, updatedAt: now })
-			.where(
-				and(
-					eq(narrators.parentNarratorId, narratorId),
-					eq(narrators.type, "subagent"),
-					inArray(narrators.status, ["thinking", "waiting", "idle"]),
-				),
-			);
-	},
-
-	async updateReasoningEffort(
-		narratorId: string,
-		reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null,
-	) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ reasoningEffort, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateFastMode(narratorId: string, fastMode: boolean) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ fastMode, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ relaxedPlan, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updatePruneEnabled(narratorId: string, pruneEnabled: boolean) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneEnabled, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateStatus(
-		narratorId: string,
-		status:
-			| "idle"
-			| "thinking"
-			| "waiting"
-			| "done"
-			| "archived"
-			| "error"
-			| "interrupted"
-			| "suspended",
-		errorMessage?: string,
-		errorCode?: string,
-		/** Set to true only at the real turn entry points (sendMessage, retry, continue, etc.)
-		 *  to avoid resetting the timer on loop-internal thinking transitions. */
-		setTurnStart?: boolean,
-	) {
-		const now = new Date().toISOString();
-		// Keep error message only when status is explicitly "error".
-		// Any non-error status transition clears stale error text.
-		const normalizedErrorMessage = status === "error" ? (errorMessage ?? null) : null;
-		// Record turn start time only when explicitly requested (turn entry points).
-		// Loop-internal thinking transitions (permission resume, buffered messages, etc.)
-		// must NOT reset this — the timer should reflect the entire turn duration.
-		const turnStartedAt = setTurnStart ? now : undefined;
-		await db
-			.update(narrators)
-			.set({
-				status,
-				errorMessage: normalizedErrorMessage,
-				updatedAt: now,
-				...(turnStartedAt !== undefined && { turnStartedAt }),
-			})
-			.where(eq(narrators.id, narratorId));
-
-		eventBus.emit(
-			status === "error"
-				? {
-						type: "narrator:error",
-						narratorId,
-						error: normalizedErrorMessage ?? "Unknown error",
-					}
-				: { type: "narrator:status_changed", narratorId, status },
-		);
-
-		// Direct WS broadcast (canonical push path)
-		if (status === "error") {
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: normalizedErrorMessage ?? "Unknown error",
-				errorCode,
-			});
-
-			// Persist a system-level error message visible in the UI but excluded
-			try {
-				const errText = normalizedErrorMessage ?? "Unknown error";
-				const msgId = generateId();
-				await db.insert(narratorMessages).values({
-					id: msgId,
-					narratorId,
-					role: "system",
-					contentJson: [{ type: "error", message: errText }],
-					contentText: `[Error] ${errText}`,
-					createdAt: now,
-				});
-				await appendMessageRef(narratorId, msgId);
-				broadcastToNarrator(narratorId, {
-					type: "message",
-					narratorId,
-					message: {
-						id: msgId,
-						narratorId,
-						role: "system",
-						contentJson: [{ type: "error", message: errText }],
-						contentText: `[Error] ${errText}`,
-						createdAt: now,
-						children: [],
-					},
-				});
-			} catch (e) {
-				logger.warn("Failed to persist error system message", {
-					narratorId,
-					error: String(e),
-				});
-			}
-		}
-		broadcastToNarrator(narratorId, {
-			type: "status_change",
-			narratorId,
-			status,
-			turnStartedAt: turnStartedAt ?? undefined,
-		});
-	},
-
-	/**
-	 * Atomically update narrator status only if the current DB status matches one
-	 * of the expected values.  Uses a single SQL UPDATE … WHERE to avoid the
-	 * TOCTOU race that exists in the read-then-write pattern.
-	 *
-	 * Returns `true` when the row was actually updated, `false` when the status
-	 * had already moved on (no-op).
-	 */
-	async compareAndSetStatus(
-		narratorId: string,
-		expectedStatus: string | string[],
-		newStatus:
-			| "idle"
-			| "thinking"
-			| "waiting"
-			| "done"
-			| "archived"
-			| "error"
-			| "interrupted"
-			| "suspended",
-		errorMessage?: string,
-	): Promise<boolean> {
-		const now = new Date().toISOString();
-		const normalizedErrorMessage = newStatus === "error" ? (errorMessage ?? null) : null;
-		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
-		const placeholders = expected.map(() => "?").join(",");
-		const result = sqlite
-			.prepare(
-				`UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
-			)
-			.run(newStatus, normalizedErrorMessage, now, narratorId, ...expected);
-
-		if (result.changes === 0) return false;
-
-		eventBus.emit(
-			newStatus === "error"
-				? {
-						type: "narrator:error",
-						narratorId,
-						error: normalizedErrorMessage ?? "Unknown error",
-					}
-				: { type: "narrator:status_changed", narratorId, status: newStatus },
-		);
-		broadcastToNarrator(narratorId, {
-			type: "status_change",
-			narratorId,
-			status: newStatus,
-		});
-		return true;
-	},
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	async updateTodos(narratorId: string, todos: any[], toolUseId?: string) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ todosJson: todos, todosToolUseId: toolUseId ?? null, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	async updateToolCallResult(
-		toolUseId: string,
-		result: {
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			output?: any;
-			status: "success" | "fail";
-			errorMessage?: string;
-			durationMs?: number;
-		},
-		/** When provided, restricts the update to the tool_call belonging to this
-		 *  specific message. Required after copy-on-write to avoid updating the
-		 *  original (shared) record in addition to the private copy. */
-		messageId?: string,
-	) {
-		const conditions = [eq(narratorToolCalls.toolUseId, toolUseId)];
-		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
-		await db
-			.update(narratorToolCalls)
-			.set({
-				outputJson: result.output ?? null,
-				status: result.status,
-				errorMessage: result.errorMessage ?? null,
-				durationMs: result.durationMs ?? null,
-			})
-			.where(and(...conditions));
-	},
-
-	/**
-	 * Check if a message is shared by multiple narrators (via narrator_message_refs).
-	 * Used for fork detection before modifying tool call results.
-	 */
-	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
-		const result = await db
-			.select({ count: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId));
-		return (result[0]?.count ?? 0) > 1;
-	},
-
-	/**
-	 * Find the tool call record for a given toolUseId.
-	 */
-	async getToolCallByToolUseId(toolUseId: string) {
-		return db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-		});
-	},
-
-	/**
-	 * Copy-on-write for a message containing a tool_use block.
-	 * When a narrator's message is shared with other narrators (via fork),
-	 * we need to create a private copy before modifying the tool call result.
-	 *
-	 * This copies the message, updates the narrator's ref to point to the copy,
-	 * and duplicates the associated tool_call records for the specified toolUseId.
-	 *
-	 * Returns the new message ID.
-	 */
-	async copyOnWriteToolCallMessage(
-		narratorId: string,
-		messageId: string,
-		toolUseId: string,
-	): Promise<string> {
-		const newMessageId = generateId();
-		const now = new Date().toISOString();
-
-		await db.transaction(async (tx) => {
-			// 1. Copy the message
-			const original = await tx.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
-			if (!original) throw new NotFoundError("Message", messageId);
-
-			await tx.insert(narratorMessages).values({
-				...original,
-				id: newMessageId,
-				createdAt: now,
-			});
-
-			// 2. Update the narrator's ref to point to the new message
-			await tx
-				.update(narratorMessageRefs)
-				.set({ messageId: newMessageId })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-				);
-
-			// 3. Copy the tool_call record for this toolUseId, pointing to the new message
-			const originalTc = await tx.query.narratorToolCalls.findFirst({
-				where: and(
-					eq(narratorToolCalls.messageId, messageId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
-			});
-			if (originalTc) {
-				await tx.insert(narratorToolCalls).values({
-					...originalTc,
-					id: generateId(),
-					messageId: newMessageId,
-				});
-			}
-		});
-
-		return newMessageId;
-	},
-
-	/** Overwrite the persisted inputJson for a tool call (used for broken/truncated calls).
-	 *  Also patches the corresponding tool_use block in the parent message's contentJson. */
-	async overwriteToolCallInput(toolUseId: string, input: Record<string, unknown>) {
-		logger.info("Overwriting broken tool call input", { toolUseId, inputKeys: Object.keys(input) });
-		// Update the tool_calls table
-		await db
-			.update(narratorToolCalls)
-			.set({ inputJson: input })
-			.where(eq(narratorToolCalls.toolUseId, toolUseId));
-
-		// Also patch the contentJson in the parent message so the UI shows
-		// the sanitized input instead of the truncated garbage.
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { messageId: true },
-		});
-		if (tc?.messageId) {
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, tc.messageId),
-				columns: { contentJson: true },
-			});
-			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const patched = (msg.contentJson as any[]).map((block: any) =>
-					block.type === "tool_use" && block.id === toolUseId ? { ...block, input } : block,
-				);
-				await db
-					.update(narratorMessages)
-					.set({ contentJson: patched })
-					.where(eq(narratorMessages.id, tc.messageId));
-			}
-		}
-	},
-
-	/**
-	 * Retrieve the plan text from an ExitPlanMode tool call's inputJson.
-	 * The plan content is stored in inputJson.plan by handlePermission (which
-	 * resolves planFile → inline plan content before persisting).
-	 */
-	async getToolCallPlanText(toolUseId: string): Promise<string | null> {
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { inputJson: true },
-		});
-		const plan = (tc?.inputJson as Record<string, unknown> | null)?.plan;
-		return typeof plan === "string" && plan.trim() ? plan : null;
-	},
-
 	async remove(narratorId: string) {
-		// Recursively remove child narrators (subagents, forks) first
 		const children = await db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, narratorId),
 			columns: { id: true },
@@ -3518,27 +537,18 @@ export const narratorService = {
 			await this.remove(child.id);
 		}
 
-		// Delete in dependency order within a transaction
 		await db.transaction(async (tx) => {
-			// Clean up overseers (unique constraint, no cascade)
 			await tx.delete(overseers).where(eq(overseers.narratorId, narratorId));
-
-			// Nullify dangling overseer references in other narrators' tool calls
 			await tx
 				.update(narratorToolCalls)
 				.set({ permissionOverseerNarratorId: null })
 				.where(eq(narratorToolCalls.permissionOverseerNarratorId, narratorId));
-
-			// Clean up terminal-related records that reference this narrator
 			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
 			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));
 			await tx.delete(terminals).where(eq(terminals.narratorId, narratorId));
-
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
-			// Delete narrator_message_refs for this narrator
 			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
 
-			// Find messages that are ONLY owned by this narrator (not referenced by other narrators)
 			const orphanRows = await tx
 				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
@@ -3555,8 +565,6 @@ export const narratorService = {
 			const orphanIds = orphanRows.map((r) => r.id);
 
 			if (orphanIds.length > 0) {
-				// Clear narrator FK references to messages about to be deleted
-				// (narrators.forkMessageId and pruneBoundaryMessageId have RESTRICT delete)
 				await tx
 					.update(narrators)
 					.set({ forkMessageId: null })
@@ -3565,7 +573,6 @@ export const narratorService = {
 					.update(narrators)
 					.set({ pruneBoundaryMessageId: null })
 					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-
 				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
 			}
 
@@ -3583,12 +590,8 @@ export const narratorService = {
 		logger.info("Narrator removed", { narratorId });
 	},
 
-	// === Fork ===
+	// ── Fork ──────────────────────────────────────────────────────────────────
 
-	/**
-	 * Create a new standalone narrator containing only the specified messages
-	 * (by message ID) from the parent narrator, preserving their original order.
-	 */
 	async forkFromMessages(
 		parentNarratorId: string,
 		messageIds: string[],
@@ -3599,7 +602,6 @@ export const narratorService = {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
-		// Fetch the parent's refs for the requested messages, ordered by seq
 		const parentRefs = await db
 			.select({
 				messageId: narratorMessageRefs.messageId,
@@ -3633,7 +635,7 @@ export const narratorService = {
 				.insert(narrators)
 				.values({
 					id,
-					chapterId: null, // always standalone
+					chapterId: null,
 					type: "primary",
 					model: storedModel,
 					systemPrompt: parent.systemPrompt,
@@ -3651,7 +653,6 @@ export const narratorService = {
 				})
 				.returning();
 
-			// Re-sequence refs starting from 1
 			const dupRefValues = parentRefs.map((row, i) => ({
 				id: generateId(),
 				narratorId: id,
@@ -3675,7 +676,6 @@ export const narratorService = {
 			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
 			locale?: string;
-			/** Direct message ID lookup (for messages without messageUuid, e.g. user messages) */
 			forkMessageId?: string;
 		},
 	) {
@@ -3685,7 +685,6 @@ export const narratorService = {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
-		// Chapter-bound narrators must fork via chapter fork (newChapterId required)
 		if (parent.chapterId && !opts?.newChapterId) {
 			throw new ValidationError(
 				"Chapter-bound narrators can only be forked together with a chapter",
@@ -3702,10 +701,8 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "dontAsk";
 
-		// For chapter forks: new chapter ID; for standalone forks: null (stays standalone)
 		const targetChapterId = opts?.newChapterId ?? null;
 
-		// Handle context inheritance
 		let contextSummary: string | null = null;
 		let apiConversationId: string | null = null;
 		let systemPrompt = parent.systemPrompt;
@@ -3718,13 +715,10 @@ export const narratorService = {
 				systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
 			}
 		} else if (inheritMode === "full") {
-			// Store parent session ID so we can fork on first message
 			apiConversationId = parent.apiConversationId ?? null;
-			// Inherit compact summary so context before the last compact point isn't lost
 			contextSummary = parent.contextSummary ?? null;
 		}
 
-		// Copy message refs if forkMessageUuid is provided AND inheritance is not fresh
 		let prefixRows: Array<{
 			messageId: string;
 			seq: number;
@@ -3735,7 +729,6 @@ export const narratorService = {
 
 		const directMessageId = opts?.forkMessageId;
 		if ((forkMessageUuid || directMessageId) && inheritMode !== "fresh") {
-			// Resolve to message ID: either via messageUuid or direct messageId
 			let msgId: string;
 			if (forkMessageUuid) {
 				const msg = await db.query.narratorMessages.findFirst({
@@ -3773,9 +766,6 @@ export const narratorService = {
 				.orderBy(narratorMessageRefs.seq);
 		}
 
-		// Create narrator + copy refs atomically
-		// Preserve the parent's stored model value (including __default__ sentinel)
-		// so forked narrators continue to follow the default model setting.
 		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
 		const effectiveModel = resolveEffectiveModel(storedModel);
 		const resolvedProvider = resolveProvider(effectiveModel);
@@ -3808,7 +798,6 @@ export const narratorService = {
 				})
 				.returning();
 
-			// Batch insert refs (preserve prunedPercent from parent)
 			if (prefixRows.length > 0) {
 				const refValues = prefixRows.map((row) => ({
 					id: generateId(),
@@ -3820,15 +809,11 @@ export const narratorService = {
 				}));
 				await insertRefsBatched(tx, refValues);
 
-				// Inherit prune state from parent if the boundary falls within the copied prefix.
-				// This prevents fork from resetting prunedPercent to 0, which would cause the
-				// new narrator to skip pruning and jump straight to compact.
 				if (parent.pruneBoundaryMessageId) {
 					const boundaryInPrefix = prefixRows.find(
 						(r) => r.messageId === parent.pruneBoundaryMessageId,
 					);
 					if (boundaryInPrefix) {
-						// Recompute prunedPercent relative to the new narrator's ref count
 						const boundaryIdx = prefixRows.indexOf(boundaryInPrefix);
 						const inheritedPrunedPercent = Math.round(
 							((boundaryIdx + 1) / prefixRows.length) * 100,
@@ -3844,7 +829,6 @@ export const narratorService = {
 				}
 			}
 
-			// Insert a compact marker for compressed inheritance so the UI shows the summary
 			if (inheritMode === "compressed" && contextSummary) {
 				const compactMsgId = generateId();
 				const compactNow = new Date().toISOString();
@@ -3870,7 +854,6 @@ export const narratorService = {
 				});
 			}
 
-			// Inherit whitelist directories from parent narrator
 			const parentWhitelistDirs = await tx
 				.select()
 				.from(narratorWhitelistDirs)
@@ -3902,10 +885,6 @@ export const narratorService = {
 		return newNarrator;
 	},
 
-	/**
-	 * Get the messageUuid of the latest top-level message for a narrator.
-	 * Returns null if the narrator has no messages.
-	 */
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
 		const latestRef = await db
 			.select({ messageId: narratorMessageRefs.messageId })
@@ -3923,11 +902,6 @@ export const narratorService = {
 		return msg?.messageUuid ?? null;
 	},
 
-	/**
-	 * Fork a standalone narrator from a tool call.
-	 * For chapter-bound narrators, use chapterFork.fork() instead (handled by the tool).
-	 * This handles standalone narrators only.
-	 */
 	async forkStandaloneFromTool(
 		parentNarratorId: string,
 		mode: "fresh" | "fork",
@@ -3950,7 +924,6 @@ export const narratorService = {
 		}
 
 		if (mode === "fresh") {
-			// Create a brand-new standalone narrator inheriting parent's config
 			const newNarrator = await this.create({
 				chapterId: null,
 				model: opts?.model ?? parent.model ?? undefined,
@@ -3982,7 +955,6 @@ export const narratorService = {
 			return newNarrator;
 		}
 
-		// mode === "fork": find latest message UUID and delegate to forkNarrator
 		const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);
 
 		return this.forkNarrator(parentNarratorId, latestMsgUuid, {
@@ -3992,459 +964,86 @@ export const narratorService = {
 		});
 	},
 
-	// === Dynamic pruning boundary ===
+	// ── Delegated methods (from narratorMessages) ─────────────────────────────
 
-	/**
-	 * Compute and persist the prune boundary based on current context usage.
-	 *
-	 * Uses a quadratic ramp: `pruneRatio = t²` where `t = (pct - 90) / 5`.
-	 * At minimum, one message is always pruned once the threshold is reached.
-	 * A single prune pass is capped at 50% of the currently remaining prunable range.
-	 * The boundary never exceeds the compact-keep position (the message returned
-	 * by `getCompactBoundaryMessage`), so compact always has something to work with.
-	 *
-	 * Returns the boundary message ID and pruned percentage, or null if no pruning is needed.
-	 */
-	async computeAndUpdatePruneBoundary(
-		narratorId: string,
-		contextPct: number,
-		thresholds: { pruneStart: number; compactStart: number },
-	): Promise<{ boundaryMessageId: string; prunedPercent: number } | null> {
-		const PRUNE_START = thresholds.pruneStart;
-		const PRUNE_END = thresholds.compactStart;
+	getMessages: narratorMessageQueries.getMessages.bind(narratorMessageQueries),
+	getMessagesSinceLastCompact:
+		narratorMessageQueries.getMessagesSinceLastCompact.bind(narratorMessageQueries),
+	getMessagesBefore: narratorMessageQueries.getMessagesBefore.bind(narratorMessageQueries),
+	getEarliestMessages: narratorMessageQueries.getEarliestMessages.bind(narratorMessageQueries),
+	_getPostCompactTopLevelRefs:
+		narratorMessageQueries._getPostCompactTopLevelRefs.bind(narratorMessageQueries),
+	getCompactBoundaryMessage:
+		narratorMessageQueries.getCompactBoundaryMessage.bind(narratorMessageQueries),
+	getRecentMessages: narratorMessageQueries.getRecentMessages.bind(narratorMessageQueries),
+	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
+	getMessagesCursor: narratorMessageQueries.getMessagesCursor.bind(narratorMessageQueries),
+	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
+	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
+	getMessagesAround: narratorMessageQueries.getMessagesAround.bind(narratorMessageQueries),
+	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
+	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
+	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
+	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
+	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
+	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
+	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
+	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),
+	removeCompactingMessage:
+		narratorMessageQueries.removeCompactingMessage.bind(narratorMessageQueries),
+	updateCompactSummary: narratorMessageQueries.updateCompactSummary.bind(narratorMessageQueries),
+	getPendingPermissions: narratorMessageQueries.getPendingPermissions.bind(narratorMessageQueries),
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { pruneBoundaryMessageId: true, pruneEnabled: true },
-		});
+	// ── Delegated methods (from narratorPersistence) ───────────────────────────
 
-		// If pruning is disabled for this narrator, skip entirely.
-		if (narrator && !narrator.pruneEnabled) return null;
-
-		if (contextPct < PRUNE_START) {
-			if (narrator?.pruneBoundaryMessageId) {
-				await this.clearPruneBoundary(narratorId);
-			}
-			return null;
-		}
-
-		const t = Math.min((contextPct - PRUNE_START) / (PRUNE_END - PRUNE_START), 1);
-		const pruneRatio = t * t;
-
-		// Reuse the shared helper — same data that getCompactBoundaryMessage uses
-		const includeChildMessages = await this.isSubagentNarrator(narratorId);
-		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
-			includeChildMessages,
-		});
-
-		// Compact keeps the last 4 messages (2 pairs). Need at least 6 to have
-		// something prunable (4 kept + at least 2 to prune/compact).
-		const compactKeepCount = 4;
-		if (refs.length < compactKeepCount + 2) return null;
-
-		// Prunable range: everything except the compact-keep tail
-		const prunableRefs = refs.slice(0, refs.length - compactKeepCount);
-
-		// Find current boundary position to compute remaining (unpruned) messages
-		const currentBoundaryIdx = narrator?.pruneBoundaryMessageId
-			? prunableRefs.findIndex((r) => r.messageId === narrator.pruneBoundaryMessageId)
-			: -1;
-
-		// Remaining = messages after the current boundary (or all if no boundary yet)
-		const alreadyPruned = currentBoundaryIdx + 1; // 0 if no boundary
-		const remaining = prunableRefs.length - alreadyPruned;
-		if (remaining <= 0) {
-			const bid = narrator?.pruneBoundaryMessageId ?? null;
-			if (!bid) return null;
-			const prunedPercent = Math.round((alreadyPruned / refs.length) * 100);
-			return { boundaryMessageId: bid, prunedPercent };
-		}
-
-		// Apply ratio to remaining messages — more aggressive as context grows,
-		// and each call prunes further into what's left.
-		// Safety cap: a single prune pass cannot remove more than 50% of what's remaining.
-		const maxPruneThisPass = Math.max(1, Math.floor(remaining * 0.5));
-		const additionalPrune = Math.min(
-			maxPruneThisPass,
-			Math.max(1, Math.floor(pruneRatio * remaining)),
-		);
-		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
-
-		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;
-		const prunedPercent = Math.round(((newBoundaryIdx + 1) / refs.length) * 100);
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneBoundaryMessageId: boundaryMessageId, prunedPercent, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-
-		logger.debug("Updated prune boundary", {
-			narratorId,
-			contextPct,
-			pruneRatio: Math.round(pruneRatio * 100),
-			additionalPrune,
-			remaining,
-			prunableTotal: prunableRefs.length,
-			boundaryMessageId,
-			prunedPercent,
-		});
-
-		return { boundaryMessageId, prunedPercent };
-	},
-
-	/** Clear the prune boundary (e.g. after compact completes). */
-	async clearPruneBoundary(narratorId: string): Promise<void> {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ pruneBoundaryMessageId: null, prunedPercent: null, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-	},
-
-	// ── Segment compact ──────────────────────────────────────────────────────
-
-	/**
-	 * Create a segment-compact marker and hide the specified messages.
-	 * The marker is inserted at the seq of the earliest hidden message.
-	 * Returns the marker message (status="compacting").
-	 */
-	async persistSegmentCompactMarker(narratorId: string, messageIds: string[]) {
-		if (messageIds.length === 0) throw new ValidationError("No messages to compact");
-
-		const id = generateId();
-		const now = new Date().toISOString();
-
-		// Find refs for the specified messages, ordered by seq
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refs.length === 0) throw new ValidationError("No matching messages found");
-
-		const insertSeq = refs[0].seq;
-
-		// Atomically: shift seqs, insert marker, mark refs as hidden
-		await db.transaction(async (tx) => {
-			// Shift all refs at or after insertSeq to make room
-			await tx
-				.update(narratorMessageRefs)
-				.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						gte(narratorMessageRefs.seq, insertSeq),
-					),
-				);
-
-			// Insert the marker message
-			// Use role="user" so buildHistory includes the summary in the AI's
-			// conversation context. The contentText carries the summary text which
-			// providers pick up as a normal user message.
-			await tx.insert(narratorMessages).values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: [
-					{
-						type: "segment_compact",
-						status: "compacting",
-						messageCount: refs.length,
-					},
-				],
-				contentText: "[Segment compacting]",
-				createdAt: now,
-			});
-
-			// Insert ref for the marker at the insertion point
-			await tx.insert(narratorMessageRefs).values({
-				id: generateId(),
-				narratorId,
-				messageId: id,
-				seq: insertSeq,
-				isCompact: 0,
-			});
-
-			// Mark the target refs as hidden by this segment compact
-			const targetMessageIds = refs.map((r) => r.messageId);
-			await tx
-				.update(narratorMessageRefs)
-				.set({ segmentCompactId: id })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						inArray(narratorMessageRefs.messageId, targetMessageIds),
-					),
-				);
-		});
-
-		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
-
-		const hiddenMessageIds = refs.map((r) => r.messageId);
-		return { message: msg, hiddenMessageIds };
-	},
-
-	/**
-	 * Fetch the specified messages for generating a segment-compact summary.
-	 */
-	async getMessagesForSegmentCompact(narratorId: string, messageIds: string[]) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refs.length === 0) return [];
-
-		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
-
-		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		return messages;
-	},
-
-	/**
-	 * Finalize a segment-compact marker with the generated summary.
-	 */
-	async finalizeSegmentCompact(
-		messageId: string,
-		narratorId: string,
-		summary: string,
-		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
-	) {
-		const now = new Date().toISOString();
-		const status = options?.status ?? "compacted";
-
-		// Count hidden messages
-		const [countRow] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, messageId),
-				),
-			);
-		const messageCount = countRow?.cnt ?? 0;
-
-		const block: Record<string, unknown> = {
-			type: "segment_compact",
-			status,
-			summary,
-			messageCount,
-		};
-		if (status === "failed" && options?.error) {
-			block.error = options.error;
-		}
-
-		const prefix = status === "failed" ? "[Segment Compact Failed]" : "[Segment Compact]";
-
-		return db.transaction(async (tx) => {
-			const [updated] = await tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [block],
-					contentText: `${prefix}\n${summary}`,
-					contextPercent: contextPercent ?? null,
-				})
-				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
-				.returning();
-
-			if (!updated) return null;
-
-			// If failed, unhide the messages so they remain visible
-			if (status === "failed") {
-				await tx
-					.update(narratorMessageRefs)
-					.set({ segmentCompactId: null })
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.segmentCompactId, messageId),
-						),
-					);
-			}
-
-			// Bump messageVersion so WS sync detects the change
-			await tx
-				.update(narrators)
-				.set({
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					apiConversationId: null,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId));
-
-			return updated;
-		});
-	},
-
-	/**
-	 * Fetch messages hidden by a specific segment compact marker.
-	 * Returns full message objects ordered by their original seq.
-	 */
-	async getSegmentCompactHiddenMessages(narratorId: string, segmentCompactId: string) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
-
-		if (refs.length === 0) return [];
-
-		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
-
-		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
-		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		return messages;
-	},
-
-	/**
-	 * Delete a segment-compact marker and restore hidden messages.
-	 */
-	async deleteSegmentCompact(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const scBlock = blocks.find((b: any) => b.type === "segment_compact");
-		if (!scBlock) throw new ValidationError("Message is not a segment compact message");
-
-		const now = new Date().toISOString();
-
-		await db.transaction(async (tx) => {
-			// Restore hidden refs
-			await tx
-				.update(narratorMessageRefs)
-				.set({ segmentCompactId: null })
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.segmentCompactId, messageId),
-					),
-				);
-
-			// Delete the marker ref and message
-			await tx
-				.delete(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.messageId, messageId),
-						eq(narratorMessageRefs.narratorId, narratorId),
-					),
-				);
-			await tx
-				.delete(narratorMessages)
-				.where(
-					and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-				);
-
-			// Bump messageVersion and clear API conversation cache
-			await tx
-				.update(narrators)
-				.set({
-					apiConversationId: null,
-					messageVersion: sql`${narrators.messageVersion} + 1`,
-					updatedAt: now,
-				})
-				.where(eq(narrators.id, narratorId));
-		});
-	},
-
-	/**
-	 * Get the summary of a segment-compact message.
-	 */
-	async getSegmentCompactSummary(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const scBlock = blocks.find((b: any) => b.type === "segment_compact");
-		if (!scBlock) throw new ValidationError("Message is not a segment compact message");
-
-		return scBlock.summary ?? "";
-	},
-
-	/**
-	 * Update the summary of a segment-compact message.
-	 */
-	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
-		if (!msg) throw new NotFoundError("Message", messageId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const blocks = Array.isArray(msg.contentJson) ? (msg.contentJson as any[]) : [];
-		const scBlock = blocks.find(
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			(b: any) => b.type === "segment_compact" && b.status === "compacted",
-		);
-		if (!scBlock) throw new ValidationError("Message is not a compacted segment compact message");
-
-		const newBlock = {
-			type: "segment_compact" as const,
-			status: "compacted" as const,
-			summary,
-			messageCount: scBlock.messageCount ?? 0,
-		};
-
-		const now = new Date().toISOString();
-		await db.transaction(async (tx) => {
-			await tx
-				.update(narratorMessages)
-				.set({
-					contentJson: [newBlock],
-					contentText: `[Segment Compact]\n${summary}`,
-				})
-				.where(eq(narratorMessages.id, messageId));
-
-			await tx
-				.update(narrators)
-				.set({ apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		});
-	},
+	persistUserMessage: narratorPersistence.persistUserMessage.bind(narratorPersistence),
+	persistSystemMessage: narratorPersistence.persistSystemMessage.bind(narratorPersistence),
+	persistDisplayMessage: narratorPersistence.persistDisplayMessage.bind(narratorPersistence),
+	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
+	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
+	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
+	finalizeCompactingMessage:
+		narratorPersistence.finalizeCompactingMessage.bind(narratorPersistence),
+	persistAssistantMessage: narratorPersistence.persistAssistantMessage.bind(narratorPersistence),
+	createPartialAssistantMessage:
+		narratorPersistence.createPartialAssistantMessage.bind(narratorPersistence),
+	appendBlockToMessage: narratorPersistence.appendBlockToMessage.bind(narratorPersistence),
+	patchReasoningTranslation:
+		narratorPersistence.patchReasoningTranslation.bind(narratorPersistence),
+	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
+	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
+	updateMessageCost: narratorPersistence.updateMessageCost.bind(narratorPersistence),
+	updateTitle: narratorPersistence.updateTitle.bind(narratorPersistence),
+	updateCwd: narratorPersistence.updateCwd.bind(narratorPersistence),
+	updateModel: narratorPersistence.updateModel.bind(narratorPersistence),
+	updatePermissionMode: narratorPersistence.updatePermissionMode.bind(narratorPersistence),
+	updateReasoningEffort: narratorPersistence.updateReasoningEffort.bind(narratorPersistence),
+	updateFastMode: narratorPersistence.updateFastMode.bind(narratorPersistence),
+	updateRelaxedPlan: narratorPersistence.updateRelaxedPlan.bind(narratorPersistence),
+	updatePruneEnabled: narratorPersistence.updatePruneEnabled.bind(narratorPersistence),
+	updateStatus: narratorPersistence.updateStatus.bind(narratorPersistence),
+	compareAndSetStatus: narratorPersistence.compareAndSetStatus.bind(narratorPersistence),
+	updateTodos: narratorPersistence.updateTodos.bind(narratorPersistence),
+	updateToolCallResult: narratorPersistence.updateToolCallResult.bind(narratorPersistence),
+	isMessageSharedByMultipleNarrators:
+		narratorPersistence.isMessageSharedByMultipleNarrators.bind(narratorPersistence),
+	getToolCallByToolUseId: narratorPersistence.getToolCallByToolUseId.bind(narratorPersistence),
+	copyOnWriteToolCallMessage:
+		narratorPersistence.copyOnWriteToolCallMessage.bind(narratorPersistence),
+	overwriteToolCallInput: narratorPersistence.overwriteToolCallInput.bind(narratorPersistence),
+	getToolCallPlanText: narratorPersistence.getToolCallPlanText.bind(narratorPersistence),
+	persistSegmentCompactMarker:
+		narratorPersistence.persistSegmentCompactMarker.bind(narratorPersistence),
+	getMessagesForSegmentCompact:
+		narratorPersistence.getMessagesForSegmentCompact.bind(narratorPersistence),
+	finalizeSegmentCompact: narratorPersistence.finalizeSegmentCompact.bind(narratorPersistence),
+	getSegmentCompactHiddenMessages:
+		narratorPersistence.getSegmentCompactHiddenMessages.bind(narratorPersistence),
+	deleteSegmentCompact: narratorPersistence.deleteSegmentCompact.bind(narratorPersistence),
+	getSegmentCompactSummary: narratorPersistence.getSegmentCompactSummary.bind(narratorPersistence),
+	updateSegmentCompactSummary:
+		narratorPersistence.updateSegmentCompactSummary.bind(narratorPersistence),
+	computeAndUpdatePruneBoundary:
+		narratorPersistence.computeAndUpdatePruneBoundary.bind(narratorPersistence),
+	clearPruneBoundary: narratorPersistence.clearPruneBoundary.bind(narratorPersistence),
 };

@@ -285,7 +285,7 @@ console.log(
 	`✓ Generated ${relative(ROOT, GENERATED_CHANGELOG_FILE)} (${changelogEntries.length} entries)`,
 );
 
-// Step 6: Compile for each platform
+// Step 6: Compile for each platform (serial — shared build-info.ts requires sequential writes)
 if (!existsSync(DIST_DIR)) {
 	mkdirSync(DIST_DIR, { recursive: true });
 }
@@ -326,8 +326,10 @@ function findRcodesign(): string | null {
 /**
  * Ad-hoc sign a macOS Mach-O binary.
  * Tries rcodesign first (works on any OS), falls back to native codesign on macOS.
+ * Returns log lines instead of printing directly (for parallel-safe output).
  */
-function adHocSign(filePath: string): boolean {
+function adHocSign(filePath: string): { signed: boolean; logs: string[] } {
+	const logs: string[] = [];
 	const rcodesign = findRcodesign();
 	if (rcodesign) {
 		const result = Bun.spawnSync([rcodesign, "sign", filePath], {
@@ -335,11 +337,11 @@ function adHocSign(filePath: string): boolean {
 			stderr: "pipe",
 		});
 		if (result.exitCode === 0) {
-			console.log(`✓ Ad-hoc signed (rcodesign): ${relative(ROOT, filePath)}`);
-			return true;
+			logs.push(`✓ Ad-hoc signed (rcodesign): ${relative(ROOT, filePath)}`);
+			return { signed: true, logs };
 		}
 		const stderr = new TextDecoder().decode(result.stderr);
-		console.warn(`⚠ rcodesign failed: ${stderr.trim()}`);
+		logs.push(`⚠ rcodesign failed: ${stderr.trim()}`);
 	}
 
 	// Fallback: native codesign on macOS
@@ -349,14 +351,16 @@ function adHocSign(filePath: string): boolean {
 			stdio: ["inherit", "inherit", "inherit"],
 		});
 		if (result.exitCode === 0) {
-			console.log(`✓ Ad-hoc signed (codesign): ${relative(ROOT, filePath)}`);
-			return true;
+			logs.push(`✓ Ad-hoc signed (codesign): ${relative(ROOT, filePath)}`);
+			return { signed: true, logs };
 		}
 	}
 
-	return false;
+	return { signed: false, logs };
 }
 
+// Phase 1: Serial compilation (each platform needs its own buildPlatform in build-info.ts)
+const compileStart = performance.now();
 for (const platform of selectedPlatforms) {
 	console.log(`\n→ Compiling for ${platform.target}...`);
 
@@ -398,29 +402,48 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 		process.exit(1);
 	}
 
+	console.log(`✓ Built: ${relative(ROOT, outfile)}`);
+}
+const compileMs = (performance.now() - compileStart).toFixed(0);
+console.log(`\n✓ All ${selectedPlatforms.length} platforms compiled in ${compileMs}ms`);
+
+// Phase 2: Post-processing (signing, SHA-512, zstd patch, latest.yml metadata)
+// NOTE: adHocSign uses Bun.spawnSync and all I/O is synchronous (readFileSync, createHash),
+// so Promise.all does not yield true parallelism here. The async structure is kept for
+// future migration to async spawn and to collect logs per-platform without interleaving.
+interface PostProcessResult {
+	platform: (typeof selectedPlatforms)[number];
+	logs: string[];
+	latestYml: { name: string; content: string } | null;
+}
+
+async function postProcess(
+	platform: (typeof selectedPlatforms)[number],
+): Promise<PostProcessResult> {
+	const logs: string[] = [];
+	const outfile = join(DIST_DIR, platform.name);
+
 	// Ad-hoc codesign for macOS targets (required to bypass Gatekeeper "damaged" error)
-	// Uses rcodesign (cross-platform) with fallback to native codesign (macOS only).
 	// Signing MUST happen before SHA512 computation and patch generation so that
 	// delta patches are based on the signed binary (matching what users actually run).
 	if (platform.target.includes("darwin")) {
-		const signed = adHocSign(outfile);
+		const { signed, logs: signLogs } = adHocSign(outfile);
+		logs.push(...signLogs);
 		if (!signed) {
-			console.warn(
+			logs.push(
 				`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(ROOT, outfile)}`,
 			);
 		}
 	}
 
-	console.log(`✓ Built: ${relative(ROOT, outfile)}`);
-
 	// Compute SHA-512 and file size for latest.yml
 	const fileSha512 = createHash("sha512").update(readFileSync(outfile)).digest("base64");
 	const fileSize = statSync(outfile).size;
 
-	// Step 7: Generate zstd dictionary patch against previous version
+	// Generate zstd dictionary patch against previous version
 	const prevBinary = findPreviousVersionBinary(platform.name, VERSION);
 	if (prevBinary) {
-		console.log(`→ Generating zstd patch from ${relative(ROOT, prevBinary.path)}...`);
+		logs.push(`→ Generating zstd patch from ${relative(ROOT, prevBinary.path)}...`);
 		try {
 			const oldBuf = readFileSync(prevBinary.path);
 			const newBuf = readFileSync(outfile);
@@ -436,27 +459,51 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 			writeFileSync(metaPath, JSON.stringify(meta, null, 2));
 
 			const savings = ((1 - patch.length / newBuf.length) * 100).toFixed(1);
-			console.log(
+			logs.push(
 				`✓ Zstd patch: ${relative(ROOT, patchPath)} (${(patch.length / 1024).toFixed(0)}KB, ${savings}% savings)`,
 			);
 		} catch (err) {
-			console.warn(`⚠ Zstd patch generation failed: ${err}`);
+			logs.push(`⚠ Zstd patch generation failed: ${err}`);
 		}
 	} else {
-		console.log("ℹ No previous version found for zstd patch generation");
+		logs.push("ℹ No previous version found for zstd patch generation");
 	}
 
-	// Write latest.yml for this platform
-	const latestYmlPath = join(DIST_DIR, getLatestYmlName(platform.target));
-	const latestYml = generateLatestYml({
-		version: VERSION,
-		path: platform.name,
-		sha512: fileSha512,
-		fileSize: fileSize,
-	});
-	writeFileSync(latestYmlPath, latestYml);
-	console.log(`✓ Generated: ${relative(ROOT, latestYmlPath)}`);
+	// Prepare latest.yml content (written later to avoid parallel write conflicts)
+	const latestYml = {
+		name: getLatestYmlName(platform.target),
+		content: generateLatestYml({
+			version: VERSION,
+			path: platform.name,
+			sha512: fileSha512,
+			fileSize,
+		}),
+	};
+
+	return { platform, logs, latestYml };
 }
+
+console.log(`\n→ Post-processing ${selectedPlatforms.length} platforms...`);
+const postStart = performance.now();
+const results = await Promise.all(selectedPlatforms.map(postProcess));
+const postMs = (performance.now() - postStart).toFixed(0);
+
+// Print collected logs per platform (avoids interleaved output)
+for (const result of results) {
+	console.log(`\n[${result.platform.platformId}]`);
+	for (const line of result.logs) {
+		console.log(`  ${line}`);
+	}
+}
+
+// Write latest.yml files (serial — same OS family shares one file, last writer wins)
+for (const result of results) {
+	if (result.latestYml) {
+		const ymlPath = join(DIST_DIR, result.latestYml.name);
+		writeFileSync(ymlPath, result.latestYml.content);
+	}
+}
+console.log(`\n✓ Post-processing completed in ${postMs}ms`);
 
 console.log("\n✅ All builds completed!");
 console.log("\nBuilt executables:");

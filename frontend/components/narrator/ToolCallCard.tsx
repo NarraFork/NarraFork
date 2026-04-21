@@ -1,3 +1,4 @@
+import type { PendingPermission } from "@frontend/types/narrator";
 import {
 	Badge,
 	Box,
@@ -149,17 +150,7 @@ export interface ToolCallData {
 	_timeoutMs?: number;
 }
 
-export interface PendingPermission {
-	id: string;
-	toolName: string;
-	toolUseId?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	inputJson: any;
-	decisionReason?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	suggestions?: any[];
-	overseerStatus?: "reviewing" | "queued";
-}
+export type { PendingPermission } from "@frontend/types/narrator";
 
 interface ToolCallCardProps {
 	toolCall: ToolCallData;

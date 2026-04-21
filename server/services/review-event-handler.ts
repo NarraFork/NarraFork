@@ -8,7 +8,6 @@ import { db } from "../db";
 import { narrators, reviewConclusions } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
 // === Finding type (mirrors schema) ===
@@ -97,10 +96,14 @@ export function initReviewEventHandler(): void {
 			]);
 
 			// 5. Broadcast to connected clients
-			broadcastToNarrator(sourceNarrator.id, {
-				type: "message",
+			eventBus.emit({
+				type: "narrator:ws_broadcast",
 				narratorId: sourceNarrator.id,
-				message: { ...msg, creator: null },
+				message: {
+					type: "message",
+					narratorId: sourceNarrator.id,
+					message: { ...msg, creator: null },
+				},
 			});
 
 			logger.info("Review feedback injected into source narrator", {

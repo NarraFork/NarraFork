@@ -1,5 +1,5 @@
+import type { PendingPermission } from "@frontend/types/narrator";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { PendingPermission } from "../components/narrator/ToolCallCard";
 import type { BufferMessageSummary, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,

@@ -72,15 +72,9 @@ export type ContentBlock = BaseContentBlock;
 export type ToolCallRow = ToolCallRecord;
 export type ToolUseBlock = ToolUseContentBlock;
 
-export interface PendingPermission {
-	id: string;
-	toolName: string;
-	toolUseId?: string;
-	inputJson: unknown;
-	decisionReason?: string;
-	suggestions?: unknown[];
-	overseerStatus?: "reviewing" | "queued";
-}
+import type { PendingPermission } from "@frontend/types/narrator";
+
+export type { PendingPermission } from "@frontend/types/narrator";
 
 export interface PermissionCallbacks {
 	pendingPermission: PendingPermission | null;

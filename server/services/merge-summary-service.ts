@@ -9,11 +9,10 @@ import {
 	users,
 } from "../db/schema";
 import { summaryGenerate } from "../lib/agent";
+import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { getMergeSummaryLabel, getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
-import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 
 /** Maximum number of commits to include in the summary input. */
@@ -282,10 +281,14 @@ export const mergeSummaryService = {
 							}
 						: null,
 			};
-			broadcastToNarrator(primaryNarrator.id, {
-				type: "message",
+			eventBus.emit({
+				type: "narrator:ws_broadcast",
 				narratorId: primaryNarrator.id,
-				message: broadcastMsg,
+				message: {
+					type: "message",
+					narratorId: primaryNarrator.id,
+					message: broadcastMsg,
+				},
 			});
 		} catch (err) {
 			logger.error("Merge summary generation failed (non-fatal)", {

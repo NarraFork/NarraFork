@@ -1,4 +1,4 @@
-import { toolRegistry } from "../tool-registry";
+import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
 import { bashTool } from "./bash";
@@ -63,38 +63,60 @@ export const REVIEW_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["ConcludeReview", concludeReviewTool],
 ]);
 
+/** Core tools provider — always-available tools. */
+const coreProvider: ToolProvider = {
+	name: "core",
+	tools() {
+		return [
+			bashTool,
+			readTool,
+			writeTool,
+			editTool,
+			globTool,
+			grepTool,
+			webSearchTool,
+			webFetchTool,
+			taskCreateTool,
+			enterPlanModeTool,
+			exitPlanModeTool,
+			agentTool,
+			continueTaskTool,
+			taskOutputTool,
+			taskStopTool,
+			askUserQuestionTool,
+			skillTool,
+		];
+	},
+};
+
+/** Optional tools provider — hidden by default, loaded on demand. */
+const optionalProvider: ToolProvider = {
+	name: "optional",
+	tools() {
+		return [...OPTIONAL_TOOLS.values()];
+	},
+};
+
+/** Overseer tools provider — injected for overseer narrators. */
+const overseerProvider: ToolProvider = {
+	name: "overseer",
+	tools() {
+		return [...OVERSEER_TOOLS.values()];
+	},
+};
+
+/** Review tools provider — injected for review narrators. */
+const reviewProvider: ToolProvider = {
+	name: "review",
+	tools() {
+		return [...REVIEW_TOOLS.values()];
+	},
+};
+
 /** Register all core tools into the singleton registry */
 export function registerCoreTools(): void {
-	toolRegistry.register(bashTool);
-	toolRegistry.register(readTool);
-	toolRegistry.register(writeTool);
-	toolRegistry.register(editTool);
-	toolRegistry.register(globTool);
-	toolRegistry.register(grepTool);
-	toolRegistry.register(webSearchTool);
-	toolRegistry.register(webFetchTool);
-	toolRegistry.register(taskCreateTool);
-	toolRegistry.register(enterPlanModeTool);
-	toolRegistry.register(exitPlanModeTool);
-	toolRegistry.register(agentTool);
-	toolRegistry.register(continueTaskTool);
-	toolRegistry.register(taskOutputTool);
-	toolRegistry.register(taskStopTool);
-	toolRegistry.register(askUserQuestionTool);
-	toolRegistry.register(skillTool);
-
-	// Register optional tools (they use isAvailable to stay hidden by default)
-	for (const tool of OPTIONAL_TOOLS.values()) {
-		toolRegistry.register(tool);
-	}
-
-	// Register overseer tools (hidden by default, injected for overseer narrators)
-	for (const tool of OVERSEER_TOOLS.values()) {
-		toolRegistry.register(tool);
-	}
-
-	// Register review tools (hidden by default, injected for review narrators)
-	for (const tool of REVIEW_TOOLS.values()) {
-		toolRegistry.register(tool);
-	}
+	toolRegistry.registerProvider(coreProvider);
+	toolRegistry.registerProvider(optionalProvider);
+	toolRegistry.registerProvider(overseerProvider);
+	toolRegistry.registerProvider(reviewProvider);
 }

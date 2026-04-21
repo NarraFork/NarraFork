@@ -8,7 +8,6 @@ import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getPrompt, type Locale } from "../lib/prompt-i18n";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { chapterEdgeService } from "./chapter-edge-service";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
@@ -680,7 +679,11 @@ export const chapterMerge = {
 			if (deletedCount > 0) {
 				// Notify all affected narrators to reload messages
 				for (const nid of narratorIds) {
-					broadcastToNarrator(nid, { type: "full_reload", narratorId: nid });
+					eventBus.emit({
+						type: "narrator:ws_broadcast",
+						narratorId: nid,
+						message: { type: "full_reload", narratorId: nid },
+					});
 				}
 			}
 		} catch (err) {

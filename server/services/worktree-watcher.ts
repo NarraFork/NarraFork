@@ -21,7 +21,6 @@ import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
-import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 
@@ -244,14 +243,18 @@ export const worktreeWatcher = {
 
 		// Broadcast git status to all subscribed narrators
 		for (const narratorId of narratorIds) {
-			broadcastToNarrator(narratorId, {
-				type: "git_status",
+			eventBus.emit({
+				type: "narrator:ws_broadcast",
 				narratorId,
-				chapterId,
-				toolUseId: "",
-				status: statusWithoutFiles as typeof statusSummary,
-				linesAdded: statusSummary.linesAdded,
-				linesRemoved: statusSummary.linesRemoved,
+				message: {
+					type: "git_status",
+					narratorId,
+					chapterId,
+					toolUseId: "",
+					status: statusWithoutFiles as typeof statusSummary,
+					linesAdded: statusSummary.linesAdded,
+					linesRemoved: statusSummary.linesRemoved,
+				},
 			});
 		}
 
@@ -265,11 +268,15 @@ export const worktreeWatcher = {
 				if (newCount > 0) {
 					eventBus.emit({ type: "chapter:commits_updated", chapterId, newCount });
 					for (const narratorId of narratorIds) {
-						broadcastToNarrator(narratorId, {
-							type: "commits_updated",
+						eventBus.emit({
+							type: "narrator:ws_broadcast",
 							narratorId,
-							chapterId,
-							newCount,
+							message: {
+								type: "commits_updated",
+								narratorId,
+								chapterId,
+								newCount,
+							},
 						});
 					}
 				}

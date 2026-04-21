@@ -29,7 +29,7 @@ import { chapterService } from "../services/chapter-service";
 import { refreshCache as refreshContainerProxyCache } from "../services/container-proxy";
 import { gitService } from "../services/git-service";
 import { ensureGitignoreEntry } from "../services/project-db-sync";
-import { removeTabFromAllUsers } from "./user-preferences";
+import { removeTabFromAllUsers } from "../services/user-preferences-service";
 
 export const projectRoutes = new Hono();
 

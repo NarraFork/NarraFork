@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import { logger } from "./logger";
 
 // === Event type definitions ===
@@ -213,6 +214,12 @@ export type NarraForkEvent =
 			outcome: "success" | "blocked" | "error";
 			narratorId?: string;
 			durationMs: number;
+	  }
+	// Narrator WebSocket broadcast (used by peripheral services to decouple from narrator-ws)
+	| {
+			type: "narrator:ws_broadcast";
+			narratorId: string;
+			message: NarratorServerMessage;
 	  };
 
 export type NarraForkEventType = NarraForkEvent["type"];

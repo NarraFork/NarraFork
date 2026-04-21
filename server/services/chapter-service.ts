@@ -18,7 +18,6 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import { slugify } from "../lib/slug";
-import { removeTabFromAllUsers } from "../routes/user-preferences";
 import { chapterCleanup } from "./chapter-cleanup";
 import { commitSyncService } from "./commit-sync-service";
 import { containerService } from "./container-service";
@@ -26,6 +25,7 @@ import { gitService } from "./git-service";
 import { narratorService } from "./narrator-service";
 import { interruptNarrator } from "./narrator-session";
 import { terminalService } from "./terminal-service";
+import { removeTabFromAllUsers } from "./user-preferences-service";
 
 /** Slash command definition stored in user preferences or project chapterSettings. */
 export interface CommandParam {
