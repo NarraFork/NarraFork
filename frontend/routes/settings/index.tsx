@@ -26,7 +26,9 @@ export const Route = createFileRoute("/settings/")({
 });
 
 function SettingsIndex() {
-	const isMobile = useMediaQuery("(max-width: 48em)", false);
+	const isMobile = useMediaQuery("(max-width: 48em)", undefined, {
+		getInitialValueInEffect: false,
+	});
 
 	// Desktop: redirect to profile as before
 	if (!isMobile) return <Navigate to="/settings/profile" replace />;

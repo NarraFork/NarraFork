@@ -105,6 +105,7 @@ async function runPowerShell(
 export class ProcessSnapshot {
 	private infoByPid = new Map<number, ProcessInfo>();
 	private childrenByPid = new Map<number, number[]>();
+	private argsByPid = new Map<number, string>();
 
 	private constructor() {}
 
@@ -124,7 +125,7 @@ export class ProcessSnapshot {
 
 	private async _buildFromUnix(): Promise<void> {
 		const result = await runCommand(
-			["ps", "-ax", "-o", "pid=,ppid=,comm=,stat=,rss=,%cpu=,etime="],
+			["ps", "-ax", "-o", "pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=,args="],
 			{ timeout: 5000 },
 		);
 		if (result) this._parseUnixPs(result);
@@ -137,7 +138,7 @@ export class ProcessSnapshot {
 		if (runner.type === "gitbash") {
 			const result = await runGitBash(
 				runner.bash,
-				"ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=",
+				"ps -ax -o pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=,args=",
 			);
 			if (result) {
 				this._parseUnixPs(result);
@@ -147,7 +148,7 @@ export class ProcessSnapshot {
 
 		const result = await runPowerShell(
 			runner.pwsh,
-			'Get-Process | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }',
+			'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)|$($_.WorkingSetSize)|$($_.CommandLine)" }',
 		);
 		if (!result) return;
 		for (const line of result.trim().split(/\r?\n/)) {
@@ -162,16 +163,18 @@ export class ProcessSnapshot {
 				command: parts[2] || "",
 				state: "running",
 				rss: Math.round((Number.parseInt(parts[3], 10) || 0) / 1024),
-				cpu: Number.parseFloat(parts[4]) || 0,
+				cpu: 0,
 				elapsed: "",
 			});
+			if (parts[4]) this.argsByPid.set(pid, parts[4]);
 			if (!Number.isNaN(ppid)) this._addChild(ppid, pid);
 		}
 	}
 
 	private _parseUnixPs(output: string): void {
 		for (const line of output.trim().split(/\r?\n/)) {
-			const parts = line.trim().split(/\s+/);
+			const trimmed = line.trim();
+			const parts = trimmed.split(/\s+/);
 			if (parts.length < 7) continue;
 			const pid = Number.parseInt(parts[0], 10);
 			const ppid = Number.parseInt(parts[1], 10);
@@ -185,6 +188,14 @@ export class ProcessSnapshot {
 				cpu: Number.parseFloat(parts[5]),
 				elapsed: parts[6],
 			});
+			// Extract the full args preserving original whitespace by locating
+			// the 8th token's position in the raw line.
+			if (parts.length > 7) {
+				const argsStart = trimmed.indexOf(parts[7], trimmed.indexOf(parts[6]) + parts[6].length);
+				if (argsStart !== -1) {
+					this.argsByPid.set(pid, trimmed.substring(argsStart));
+				}
+			}
 			this._addChild(ppid, pid);
 		}
 	}
@@ -217,6 +228,15 @@ export class ProcessSnapshot {
 
 	getChildren(pid: number): number[] {
 		return this.childrenByPid.get(pid) ?? [];
+	}
+
+	/** Find PIDs whose command line contains `searchArg` (in-memory, no subprocess). */
+	findByArg(searchArg: string): number[] {
+		const pids: number[] = [];
+		for (const [pid, args] of this.argsByPid) {
+			if (args.includes(searchArg)) pids.push(pid);
+		}
+		return pids;
 	}
 }
 

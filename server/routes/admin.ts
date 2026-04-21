@@ -8,6 +8,7 @@ import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validat
 import { requireAdmin, requireAuth } from "../middleware/auth";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
+import { ProcessSnapshot } from "../terminal/dtach-service";
 
 export const adminRoutes = new Hono();
 
@@ -133,11 +134,13 @@ adminRoutes.patch("/settings", async (c) => {
 
 adminRoutes.get("/terminals", async (c) => {
 	const terminals = await terminalService.listAll();
-	const orphanSockets = await terminalService.listOrphanSockets();
+	// Single process snapshot shared across orphan detection and process info
+	const snapshot = await ProcessSnapshot.create();
+	const orphanSockets = await terminalService.listOrphanSockets(snapshot);
 	const attachedSet = terminalService.getAttachedSet();
 	// Batch-fetch process info with a single ps snapshot
 	const runningIds = terminals.filter((t) => t.status === "running").map((t) => t.id);
-	const processMap = await terminalService.getProcessesBatch(runningIds);
+	const processMap = await terminalService.getProcessesBatch(runningIds, snapshot);
 	const annotated = terminals.map((t) => ({
 		...t,
 		attached: attachedSet.has(t.id),

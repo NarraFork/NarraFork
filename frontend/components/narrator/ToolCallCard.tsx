@@ -3169,6 +3169,9 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.outputJson !== n.outputJson ||
 		p._longRunning !== n._longRunning ||
 		p._streamingOutput !== n._streamingOutput ||
+		p._timeoutMs !== n._timeoutMs ||
+		p._metadata !== n._metadata ||
+		p._resolvedModel !== n._resolvedModel ||
 		p.startedAt !== n.startedAt ||
 		p.errorMessage !== n.errorMessage
 	) {

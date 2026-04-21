@@ -2,7 +2,8 @@ import { Box, useComputedColorScheme } from "@mantine/core";
 import type { Change } from "diff";
 import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
 import { memo, useEffect, useMemo, useState } from "react";
-import { type BundledLanguage, bundledLanguages, codeToTokens, type ThemedToken } from "shiki";
+import type { BundledLanguage, ThemedToken } from "shiki";
+import { loadShiki } from "../../lib/shiki-loader";
 
 // --- Types ---
 
@@ -182,44 +183,50 @@ function useTokenMap(
 ): TokenMap | null {
 	const [tokenMap, setTokenMap] = useState<TokenMap | null>(null);
 
-	const effectiveLang =
-		language && language !== "text" && language in bundledLanguages ? language : null;
-
 	// Build the full source text for tokenisation (all unique lines)
 	const sourceText = useMemo(() => {
-		if (!effectiveLang) return null;
+		if (!language || language === "text") return null;
 		// Reconstruct a plausible source from all lines so shiki gets proper context
 		return lines.map((l) => l.content).join("\n");
-	}, [effectiveLang, lines]);
+	}, [language, lines]);
 
 	useEffect(() => {
-		if (!effectiveLang || !sourceText) {
+		if (!language || language === "text" || !sourceText) {
 			setTokenMap(null);
 			return;
 		}
 
 		let cancelled = false;
-		codeToTokens(sourceText, {
-			lang: effectiveLang as BundledLanguage,
-			theme,
-		})
-			.then((result) => {
-				if (cancelled) return;
-				const map: TokenMap = new Map();
-				for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
-					// Key by index to handle duplicate lines correctly
-					map.set(String(i), result.tokens[i]);
-				}
-				setTokenMap(map);
-			})
-			.catch(() => {
-				if (!cancelled) setTokenMap(null);
-			});
+		loadShiki().then((shiki) => {
+			if (cancelled || !shiki) return;
+			const effectiveLang = language in shiki.bundledLanguages ? language : null;
+			if (!effectiveLang) {
+				setTokenMap(null);
+				return;
+			}
+			shiki
+				.codeToTokens(sourceText, {
+					lang: effectiveLang as BundledLanguage,
+					theme,
+				})
+				.then((result) => {
+					if (cancelled) return;
+					const map: TokenMap = new Map();
+					for (let i = 0; i < result.tokens.length && i < lines.length; i++) {
+						// Key by index to handle duplicate lines correctly
+						map.set(String(i), result.tokens[i]);
+					}
+					setTokenMap(map);
+				})
+				.catch(() => {
+					if (!cancelled) setTokenMap(null);
+				});
+		});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [effectiveLang, sourceText, lines, theme]);
+	}, [language, sourceText, lines, theme]);
 
 	return tokenMap;
 }

@@ -456,7 +456,9 @@ export const terminalService = {
 	},
 
 	/** Find orphan dtach sockets — sockets on disk with no matching running terminal in DB */
-	async listOrphanSockets(): Promise<{ socketPath: string; terminalId: string }[]> {
+	async listOrphanSockets(
+		snapshot?: ProcessSnapshot,
+	): Promise<{ socketPath: string; terminalId: string }[]> {
 		if (!(await dtachService.isAvailable())) return [];
 		const orphans: { socketPath: string; terminalId: string }[] = [];
 		try {
@@ -467,7 +469,10 @@ export const terminalService = {
 				const terminalId = match[1];
 				const socketPath = dtachService.getSocketPath(terminalId);
 				// Check if the socket is alive but terminal is not in activeTerminals
-				if ((await dtachService.isSocketAlive(terminalId)) && !activeTerminals.has(terminalId)) {
+				const alive = snapshot
+					? snapshot.findByArg(socketPath).length > 0
+					: await dtachService.isSocketAlive(terminalId);
+				if (alive && !activeTerminals.has(terminalId)) {
 					orphans.push({ socketPath, terminalId });
 				}
 			}
@@ -832,21 +837,24 @@ export const terminalService = {
 	 * Batch-get process info for multiple terminals using a single ps snapshot.
 	 * Returns a Map from terminalId to its process list.
 	 */
-	async getProcessesBatch(terminalIds: string[]): Promise<Map<string, TerminalProcessInfo[]>> {
+	async getProcessesBatch(
+		terminalIds: string[],
+		snapshot?: ProcessSnapshot,
+	): Promise<Map<string, TerminalProcessInfo[]>> {
 		const result = new Map<string, TerminalProcessInfo[]>();
 		if (terminalIds.length === 0) return result;
 
-		const snapshot = await ProcessSnapshot.create();
+		const snap = snapshot ?? (await ProcessSnapshot.create());
 
 		for (const terminalId of terminalIds) {
-			const shellPid = await this._getShellPidWithSnapshot(terminalId, snapshot);
+			const shellPid = await this._getShellPidWithSnapshot(terminalId, snap);
 			if (!shellPid) {
 				result.set(terminalId, []);
 				continue;
 			}
-			const allPids = [shellPid, ...snapshot.getDescendants(shellPid)];
+			const allPids = [shellPid, ...snap.getDescendants(shellPid)];
 			const processes = allPids
-				.map((pid) => snapshot.getInfo(pid))
+				.map((pid) => snap.getInfo(pid))
 				.filter((info): info is TerminalProcessInfo => info !== null);
 			result.set(terminalId, processes);
 		}
@@ -864,7 +872,7 @@ export const terminalService = {
 		if (active) {
 			if (active.useDtach) {
 				const socketPath = dtachService.getSocketPath(terminalId);
-				const dtachPids = await findProcessesByArg(socketPath);
+				const dtachPids = snapshot.findByArg(socketPath);
 				for (const pid of dtachPids) {
 					const children = snapshot.getChildren(pid);
 					if (children.length > 0) return children[0];
@@ -873,9 +881,9 @@ export const terminalService = {
 			}
 			return active.runtime.pid ?? null;
 		}
-		if ((await dtachService.isAvailable()) && (await dtachService.isSocketAlive(terminalId))) {
+		if (await dtachService.isAvailable()) {
 			const socketPath = dtachService.getSocketPath(terminalId);
-			const dtachPids = await findProcessesByArg(socketPath);
+			const dtachPids = snapshot.findByArg(socketPath);
 			for (const pid of dtachPids) {
 				const children = snapshot.getChildren(pid);
 				if (children.length > 0) return children[0];

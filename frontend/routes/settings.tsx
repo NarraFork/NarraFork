@@ -1,14 +1,4 @@
-import {
-	Affix,
-	Box,
-	Button,
-	Group,
-	NavLink,
-	ScrollArea,
-	Text,
-	Transition,
-	UnstyledButton,
-} from "@mantine/core";
+import { Affix, Box, Button, Group, NavLink, ScrollArea, Text, Transition } from "@mantine/core";
 import {
 	IconArrowLeft,
 	IconBell,
@@ -168,16 +158,21 @@ function SettingsLayout() {
 								borderBottom: "1px solid var(--mantine-color-default-border)",
 							}}
 						>
-							<UnstyledButton
-								component={Link}
+							<Link
 								to="/settings"
-								style={{ display: "flex", alignItems: "center", gap: 6 }}
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: 6,
+									textDecoration: "none",
+									color: "inherit",
+								}}
 							>
 								<IconArrowLeft size={18} />
 								<Text size="sm" fw={500}>
 									{currentItem.label}
 								</Text>
-							</UnstyledButton>
+							</Link>
 						</Box>
 					)}
 

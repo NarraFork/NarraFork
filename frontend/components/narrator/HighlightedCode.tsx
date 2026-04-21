@@ -1,5 +1,7 @@
 import { Code, useComputedColorScheme } from "@mantine/core";
 import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
+import type { BundledLanguage } from "shiki";
+import { loadShiki } from "../../lib/shiki-loader";
 import classes from "./HighlightedCode.module.css";
 import {
 	cacheKey,
@@ -19,22 +21,6 @@ interface HighlightedCodeProps {
 	lang?: string;
 	/** Extra inline styles applied to the wrapper */
 	style?: CSSProperties;
-}
-
-// Lazy-loaded shiki helpers — resolved once on first use.
-let shikiReady: Promise<{
-	bundledLanguages: Record<string, unknown>;
-	codeToHtml: typeof import("shiki").codeToHtml;
-}> | null = null;
-
-function getShiki() {
-	if (!shikiReady) {
-		shikiReady = import("shiki").then((m) => ({
-			bundledLanguages: m.bundledLanguages,
-			codeToHtml: m.codeToHtml,
-		}));
-	}
-	return shikiReady;
 }
 
 /**
@@ -69,11 +55,11 @@ export const HighlightedCode = memo(function HighlightedCode({
 		const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
 		let cancelled = false;
 
-		getShiki().then(({ bundledLanguages, codeToHtml }) => {
-			if (cancelled) return;
-			bundledLangsRef.current = bundledLanguages;
+		loadShiki().then((shiki) => {
+			if (cancelled || !shiki) return;
+			bundledLangsRef.current = shiki.bundledLanguages;
 
-			const effectiveLang = lang in bundledLanguages ? lang : "text";
+			const effectiveLang = lang in shiki.bundledLanguages ? lang : "text";
 			if (effectiveLang === "text") {
 				setHtml(null);
 				return;
@@ -86,7 +72,8 @@ export const HighlightedCode = memo(function HighlightedCode({
 				return;
 			}
 
-			codeToHtml(code, { lang: effectiveLang, theme })
+			shiki
+				.codeToHtml(code, { lang: effectiveLang as BundledLanguage, theme })
 				.then((result) => {
 					if (cancelled) return;
 					if (shouldCache) {

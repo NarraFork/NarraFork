@@ -1,7 +1,14 @@
 import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { containerInstances, narrators, overseers, terminals, userPreferences } from "../db/schema";
+import {
+	containerInstances,
+	narrators,
+	narratorToolCalls,
+	overseers,
+	terminals,
+	userPreferences,
+} from "../db/schema";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
@@ -922,6 +929,27 @@ export const handleNarratorWS = {
 						toolUseId: msg.toolUseId,
 						timeoutMs: newMs,
 					});
+					// Persist the updated timeout into the tool call's inputJson
+					// so it survives page refresh.
+					try {
+						const row = db
+							.select({ id: narratorToolCalls.id, inputJson: narratorToolCalls.inputJson })
+							.from(narratorToolCalls)
+							.where(eq(narratorToolCalls.toolUseId, msg.toolUseId))
+							.get();
+						if (row) {
+							const input = row.inputJson && typeof row.inputJson === "object" ? row.inputJson : {};
+							db.update(narratorToolCalls)
+								.set({ inputJson: { ...input, timeout: newMs } })
+								.where(eq(narratorToolCalls.id, row.id))
+								.run();
+						}
+					} catch (err) {
+						logger.warn("Failed to persist updated timeout", {
+							toolUseId: msg.toolUseId,
+							error: String(err),
+						});
+					}
 				}
 				break;
 			}
