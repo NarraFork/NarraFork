@@ -314,11 +314,11 @@ async function listTerminals(narratorId: string): Promise<ToolResult> {
 		});
 	}
 
-	// Deduplicate by ID
+	// Deduplicate by ID and exclude exited terminals
 	const seen = new Set<string>();
 	const all = [];
 	for (const t of [...narratorTerminals, ...chapterTerminals]) {
-		if (!seen.has(t.id)) {
+		if (!seen.has(t.id) && t.status !== "exited") {
 			seen.add(t.id);
 			all.push(t);
 		}

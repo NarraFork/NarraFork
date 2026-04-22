@@ -548,6 +548,23 @@ export const handleNarratorWS = {
 						connections.delete(ws);
 					}
 				}
+				// Send initial browser session count so the bar shows after page refresh
+				for (const id of msg.narratorIds) {
+					const browserCount = listBrowserSessions(id).length;
+					if (browserCount > 0) {
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "browser_session_count",
+									narratorId: id,
+									activeBrowserSessions: browserCount,
+								}),
+							);
+						} catch {
+							connections.delete(ws);
+						}
+					}
+				}
 				// Catch-up: send messages the client missed while disconnected.
 				// The narrator is NOT yet in subscribedNarrators, so broadcastToNarrator
 				// won't send real-time events to this ws until catch-up completes.
