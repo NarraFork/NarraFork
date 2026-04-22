@@ -74,6 +74,8 @@ export interface ActiveNarrator {
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
 	_loopRunning?: boolean;
+	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
+	_substatus: Set<string>;
 }
 
 // === PendingPermission interface ===

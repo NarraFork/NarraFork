@@ -239,19 +239,12 @@ export const narrators = sqliteTable(
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
 		status: text("status", {
-			enum: [
-				"idle",
-				"thinking",
-				"waiting",
-				"done",
-				"archived",
-				"error",
-				"interrupted",
-				"suspended",
-			],
+			enum: ["idle", "working", "waiting", "archived"],
 		})
 			.notNull()
 			.default("idle"),
+		/** JSON array of substatus tags (e.g. ["reasoning","compacting"]) */
+		substatus: text("substatus").notNull().default("[]"),
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
@@ -265,6 +258,17 @@ export const narrators = sqliteTable(
 		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
 		/** JSON array of optional tool names explicitly enabled for this narrator */
 		enabledTools: text("enabled_tools", { mode: "json" }).$type<string[]>(),
+		/**
+		 * Mutually exclusive narrator identity (immutable after creation).
+		 * - "primary"           — regular narrator
+		 * - "subagent:<type>"   — subagent (explore/plan/general/review/<custom>)
+		 */
+		variant: text("variant").notNull().default("primary"),
+		/**
+		 * Stackable permanent attribute tags (JSON string[]).
+		 * Possible values: "standalone", "ask-in-passing", "background"
+		 */
+		traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
 		// Background task fields
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		backgroundStatus: text("background_status", {

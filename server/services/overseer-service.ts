@@ -338,7 +338,7 @@ function isOverseerUsable(
 	if (overseer.narratorId === sourceNarratorId) return false;
 
 	// Narrator must be in a usable state
-	const usableStatuses = new Set(["idle", "thinking", "waiting", "done"]);
+	const usableStatuses = new Set(["idle", "working", "waiting"]);
 	if (!usableStatuses.has(overseer.narrator.status)) return false;
 
 	return true;
@@ -374,7 +374,7 @@ export async function listManagedNarrators(overseerId: string) {
 		if (chapterIds.length === 0) return [];
 
 		const result = await db.query.narrators.findMany({
-			where: eq(narrators.type, "primary"),
+			where: eq(narrators.variant, "primary"),
 			columns: {
 				id: true,
 				title: true,
@@ -393,7 +393,7 @@ export async function listManagedNarrators(overseerId: string) {
 
 	// Global: all primary narrators except the overseer's own
 	const result = await db.query.narrators.findMany({
-		where: eq(narrators.type, "primary"),
+		where: eq(narrators.variant, "primary"),
 		columns: {
 			id: true,
 			title: true,

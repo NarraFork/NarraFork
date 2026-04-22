@@ -121,7 +121,7 @@ export const forkNarratorTool: ToolDefinition = {
 
 				// Find the new chapter's primary narrator
 				const newNarrator = await db.query.narrators.findFirst({
-					where: and(eq(narrators.chapterId, newChapter.id), eq(narrators.type, "primary")),
+					where: and(eq(narrators.chapterId, newChapter.id), eq(narrators.variant, "primary")),
 				});
 				if (!newNarrator) {
 					return {

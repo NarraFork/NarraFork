@@ -78,6 +78,14 @@ export interface EventHandlerContext {
 	setTokenUsage: (usage: TokenUsageSnapshot | undefined) => void;
 	setTtftMs?: (ttftMs: number | undefined) => void;
 
+	// --- Substatus management ---
+	/** Get current substatus tags for this narrator */
+	getSubstatus?: () => Set<string>;
+	/** Add a substatus tag and persist+broadcast the change */
+	addSubstatus?: (tag: string) => Promise<void>;
+	/** Remove a substatus tag and persist+broadcast the change */
+	removeSubstatus?: (tag: string) => Promise<void>;
+
 	// --- Subagent-specific ---
 	/** Parent tool_use ID that spawned this subagent */
 	parentToolUseId?: string;
@@ -410,6 +418,10 @@ export async function processEvent(
 
 	switch (event.type) {
 		case "stream_text": {
+			// Clear "reasoning" substatus when text starts (reasoning phase ended)
+			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
+				ctx.removeSubstatus("reasoning").catch(() => {});
+			}
 			// First text token latency (TTFT)
 			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
 				const startedAt = ctx.getTurnStartedAt?.();
@@ -490,6 +502,10 @@ export async function processEvent(
 		}
 
 		case "tool_use_chunk": {
+			// Clear "reasoning" substatus when tool use starts
+			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
+				ctx.removeSubstatus("reasoning").catch(() => {});
+			}
 			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
 				const startedAt = ctx.getTurnStartedAt?.();
 				if (startedAt) {
@@ -537,7 +553,7 @@ export async function processEvent(
 				}),
 				...(event.extractedFields && { extractedFields: event.extractedFields }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
-				...(event.inputDelta && { inputDelta: event.inputDelta }),
+				...(event.streamingField && { streamingField: event.streamingField }),
 			});
 			return null;
 		}
@@ -1008,6 +1024,10 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
+			// Add "reasoning" substatus on first reasoning chunk
+			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
+				ctx.addSubstatus("reasoning").catch(() => {});
+			}
 			// First visible token latency (reasoning may arrive before text)
 			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
 				const startedAt = ctx.getTurnStartedAt?.();

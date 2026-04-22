@@ -1,8 +1,9 @@
-import { and, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, sql } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, isNotNull, isNull, like, lt, ne, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	revertPatchesForMessages,
@@ -50,7 +51,7 @@ async function attachSubagentModels(childMessages: any[]): Promise<void> {
 	const narratorIds = [...new Set(childMessages.map((m) => m.narratorId as string))];
 	if (narratorIds.length === 0) return;
 	const subagentRows = await db.query.narrators.findMany({
-		where: and(inArray(narrators.id, narratorIds), eq(narrators.type, "subagent")),
+		where: and(inArray(narrators.id, narratorIds), like(narrators.variant, "subagent:%")),
 		columns: { id: true, model: true },
 	});
 	const modelMap = new Map(subagentRows.map((r) => [r.id, r.model]));
@@ -546,9 +547,9 @@ export const narratorMessageQueries = {
 	async isSubagentNarrator(narratorId: string): Promise<boolean> {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { type: true },
+			columns: { variant: true },
 		});
-		return narrator?.type === "subagent";
+		return narrator != null && isSubagentVariant(narrator.variant);
 	},
 
 	async getMessagesCursor(

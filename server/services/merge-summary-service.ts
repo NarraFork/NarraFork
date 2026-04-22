@@ -111,7 +111,7 @@ export const mergeSummaryService = {
 
 			// Find target chapter's primary narrator
 			const primaryNarrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.type, "primary")),
+				where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
 			});
 			if (!primaryNarrator) {
 				logger.debug("Merge summary: no primary narrator on target, skipping", {

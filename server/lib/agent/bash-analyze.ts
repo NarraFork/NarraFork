@@ -108,6 +108,7 @@ const SAFE_COMMANDS = new Set([
 	"yes",
 	// 类型检查工具
 	"tsc",
+	"tsgo",
 	"eslint",
 	"prettier",
 	"biome",
@@ -261,7 +262,9 @@ const ALWAYS_ASK_COMMANDS = new Set([
 const SAFE_PACKAGE_RUNNERS = new Set([
 	// 类型检查 / 编译
 	"tsc",
+	"tsgo",
 	"typescript",
+	"@typescript/native-preview",
 	// Lint / 格式化
 	"biome",
 	"@biomejs/biome",
@@ -479,7 +482,11 @@ function classifyPackageRunner(tokens: string[], runner: string): PackageRunnerC
 	}
 
 	const isBiome = packageName === "biome" || packageName === "@biomejs/biome";
-	const isTsc = packageName === "tsc" || packageName === "typescript";
+	const isTsc =
+		packageName === "tsc" ||
+		packageName === "tsgo" ||
+		packageName === "typescript" ||
+		packageName === "@typescript/native-preview";
 
 	let hasWriteOperation = false;
 

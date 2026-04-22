@@ -6,7 +6,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAskInPassing, useCancelAskInPassing } from "../../hooks/useNarrator";
 
-const CARD_BG = "var(--mantine-color-dark-6)";
+const CARD_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
 
 export function AskInPassingPendingCard({
 	messageId,

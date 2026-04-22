@@ -16,9 +16,8 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join, relative } from "node:path";
-import { generateZstdPatch } from "../server/lib/zstd-patch";
+import { Worker } from "node:worker_threads";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -36,32 +35,6 @@ const GENERATED_MIGRATIONS_DATA_FILE = join(
 const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.ts");
 const GENERATED_CHANGELOG_FILE = join(ROOT, "server", "generated", "embedded-changelog.ts");
 const DIST_DIR = join(ROOT, "dist");
-
-function getLatestYmlName(target: string): string {
-	if (target.includes("darwin")) return "latest-mac.yml";
-	if (target.includes("windows")) return "latest.yml";
-	return "latest-linux.yml";
-}
-
-interface LatestYmlOptions {
-	version: string;
-	path: string;
-	sha512: string;
-	fileSize: number;
-}
-
-function generateLatestYml(opts: LatestYmlOptions): string {
-	const releaseDate = new Date().toISOString();
-	return `version: ${opts.version}
-releaseDate: "${releaseDate}"
-path: ${opts.path}
-sha512: ${opts.sha512}
-files:
-  - url: ${opts.path}
-    size: ${opts.fileSize}
-    sha512: ${opts.sha512}
-`;
-}
 
 // ============================================================================
 // Main build script
@@ -290,75 +263,6 @@ if (!existsSync(DIST_DIR)) {
 	mkdirSync(DIST_DIR, { recursive: true });
 }
 
-/**
- * Find rcodesign binary for cross-platform ad-hoc signing of macOS binaries.
- * Search order: system PATH → ~/.narrafork/bin/rcodesign
- */
-function findRcodesign(): string | null {
-	// Check system PATH
-	try {
-		const check = Bun.spawnSync(["rcodesign", "--version"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (check.exitCode === 0) return "rcodesign";
-	} catch {
-		// rcodesign not in PATH
-	}
-
-	// Check ~/.narrafork/bin/
-	const localPath = join(homedir(), ".narrafork", "bin", "rcodesign");
-	if (existsSync(localPath)) {
-		try {
-			const localCheck = Bun.spawnSync([localPath, "--version"], {
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			if (localCheck.exitCode === 0) return localPath;
-		} catch {
-			// local binary exists but failed to execute
-		}
-	}
-
-	return null;
-}
-
-/**
- * Ad-hoc sign a macOS Mach-O binary.
- * Tries rcodesign first (works on any OS), falls back to native codesign on macOS.
- * Returns log lines instead of printing directly (for parallel-safe output).
- */
-function adHocSign(filePath: string): { signed: boolean; logs: string[] } {
-	const logs: string[] = [];
-	const rcodesign = findRcodesign();
-	if (rcodesign) {
-		const result = Bun.spawnSync([rcodesign, "sign", filePath], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (result.exitCode === 0) {
-			logs.push(`✓ Ad-hoc signed (rcodesign): ${relative(ROOT, filePath)}`);
-			return { signed: true, logs };
-		}
-		const stderr = new TextDecoder().decode(result.stderr);
-		logs.push(`⚠ rcodesign failed: ${stderr.trim()}`);
-	}
-
-	// Fallback: native codesign on macOS
-	if (process.platform === "darwin") {
-		const result = Bun.spawnSync(["codesign", "--force", "--sign", "-", filePath], {
-			cwd: ROOT,
-			stdio: ["inherit", "inherit", "inherit"],
-		});
-		if (result.exitCode === 0) {
-			logs.push(`✓ Ad-hoc signed (codesign): ${relative(ROOT, filePath)}`);
-			return { signed: true, logs };
-		}
-	}
-
-	return { signed: false, logs };
-}
-
 // Phase 1: Serial compilation (each platform needs its own buildPlatform in build-info.ts)
 const compileStart = performance.now();
 for (const platform of selectedPlatforms) {
@@ -408,93 +312,45 @@ const compileMs = (performance.now() - compileStart).toFixed(0);
 console.log(`\n✓ All ${selectedPlatforms.length} platforms compiled in ${compileMs}ms`);
 
 // Phase 2: Post-processing (signing, SHA-512, zstd patch, latest.yml metadata)
-// NOTE: adHocSign uses Bun.spawnSync and all I/O is synchronous (readFileSync, createHash),
-// so Promise.all does not yield true parallelism here. The async structure is kept for
-// future migration to async spawn and to collect logs per-platform without interleaving.
-interface PostProcessResult {
-	platform: (typeof selectedPlatforms)[number];
-	logs: string[];
-	latestYml: { name: string; content: string } | null;
+// Each platform runs in its own worker thread for true parallelism.
+// Workers send log messages back immediately for real-time output.
+
+interface WorkerResult {
+	latestYml: { name: string; content: string };
 }
 
-async function postProcess(
+function runPostProcessWorker(
 	platform: (typeof selectedPlatforms)[number],
-): Promise<PostProcessResult> {
-	const logs: string[] = [];
-	const outfile = join(DIST_DIR, platform.name);
+): Promise<WorkerResult> {
+	return new Promise((resolve, reject) => {
+		const worker = new Worker(join(import.meta.dir, "post-process-worker.ts"), {
+			workerData: {
+				platform,
+				distDir: DIST_DIR,
+				root: ROOT,
+				version: VERSION,
+			},
+		});
 
-	// Ad-hoc codesign for macOS targets (required to bypass Gatekeeper "damaged" error)
-	// Signing MUST happen before SHA512 computation and patch generation so that
-	// delta patches are based on the signed binary (matching what users actually run).
-	if (platform.target.includes("darwin")) {
-		const { signed, logs: signLogs } = adHocSign(outfile);
-		logs.push(...signLogs);
-		if (!signed) {
-			logs.push(
-				`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(ROOT, outfile)}`,
-			);
-		}
-	}
+		worker.on("message", (msg: { type: string; message?: string; latestYml?: WorkerResult["latestYml"] }) => {
+			if (msg.type === "log") {
+				console.log(`  [${platform.platformId}] ${msg.message}`);
+			} else if (msg.type === "done") {
+				resolve({ latestYml: msg.latestYml! });
+			}
+		});
 
-	// Compute SHA-512 and file size for latest.yml
-	const fileSha512 = createHash("sha512").update(readFileSync(outfile)).digest("base64");
-	const fileSize = statSync(outfile).size;
-
-	// Generate zstd dictionary patch against previous version
-	const prevBinary = findPreviousVersionBinary(platform.name, VERSION);
-	if (prevBinary) {
-		logs.push(`→ Generating zstd patch from ${relative(ROOT, prevBinary.path)}...`);
-		try {
-			const oldBuf = readFileSync(prevBinary.path);
-			const newBuf = readFileSync(outfile);
-
-			const { patch, meta } = generateZstdPatch(oldBuf, newBuf, {
-				fromVersion: prevBinary.version,
-				toVersion: VERSION,
-			});
-
-			const patchPath = `${outfile}.zstd-patch`;
-			const metaPath = `${outfile}.zstd-patch.meta.json`;
-			writeFileSync(patchPath, patch);
-			writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-
-			const savings = ((1 - patch.length / newBuf.length) * 100).toFixed(1);
-			logs.push(
-				`✓ Zstd patch: ${relative(ROOT, patchPath)} (${(patch.length / 1024).toFixed(0)}KB, ${savings}% savings)`,
-			);
-		} catch (err) {
-			logs.push(`⚠ Zstd patch generation failed: ${err}`);
-		}
-	} else {
-		logs.push("ℹ No previous version found for zstd patch generation");
-	}
-
-	// Prepare latest.yml content (written later to avoid parallel write conflicts)
-	const latestYml = {
-		name: getLatestYmlName(platform.target),
-		content: generateLatestYml({
-			version: VERSION,
-			path: platform.name,
-			sha512: fileSha512,
-			fileSize,
-		}),
-	};
-
-	return { platform, logs, latestYml };
+		worker.on("error", reject);
+		worker.on("exit", (code) => {
+			if (code !== 0) reject(new Error(`Worker for ${platform.platformId} exited with code ${code}`));
+		});
+	});
 }
 
-console.log(`\n→ Post-processing ${selectedPlatforms.length} platforms...`);
+console.log(`\n→ Post-processing ${selectedPlatforms.length} platforms in parallel...`);
 const postStart = performance.now();
-const results = await Promise.all(selectedPlatforms.map(postProcess));
+const results = await Promise.all(selectedPlatforms.map(runPostProcessWorker));
 const postMs = (performance.now() - postStart).toFixed(0);
-
-// Print collected logs per platform (avoids interleaved output)
-for (const result of results) {
-	console.log(`\n[${result.platform.platformId}]`);
-	for (const line of result.logs) {
-		console.log(`  ${line}`);
-	}
-}
 
 // Write latest.yml files (serial — same OS family shares one file, last writer wins)
 for (const result of results) {
@@ -509,64 +365,4 @@ console.log("\n✅ All builds completed!");
 console.log("\nBuilt executables:");
 for (const platform of selectedPlatforms) {
 	console.log(`  - dist/${platform.name}`);
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/**
- * Find the most recent previous version binary for the same platform in dist/.
- * Returns null if no previous version exists.
- */
-function findPreviousVersionBinary(
-	currentName: string,
-	currentVersion: string,
-): { path: string; version: string } | null {
-	// Extract platform suffix from name: "narrafork-0.0.17-linux-x64" → "linux-x64"
-	const versionedPrefix = `narrafork-${currentVersion}-`;
-	if (!currentName.startsWith(versionedPrefix)) return null;
-	const platformSuffix = currentName.slice(versionedPrefix.length);
-
-	// Scan dist/ for same-platform binaries with different versions
-	const candidates: { version: string; path: string }[] = [];
-	const pattern = new RegExp(
-		`^narrafork-(\\d+\\.\\d+\\.\\d+)-${platformSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-	);
-
-	for (const name of readdirSync(DIST_DIR)) {
-		const m = name.match(pattern);
-		if (m && m[1] !== currentVersion) {
-			candidates.push({ version: m[1], path: join(DIST_DIR, name) });
-		}
-	}
-
-	if (candidates.length === 0) return null;
-
-	// Sort by version descending, pick the latest one before current
-	candidates.sort((a, b) => {
-		const pa = a.version.split(".").map(Number);
-		const pb = b.version.split(".").map(Number);
-		for (let i = 0; i < 3; i++) {
-			if (pa[i] !== pb[i]) return pb[i] - pa[i]; // descending
-		}
-		return 0;
-	});
-
-	// Pick the highest version that is less than current
-	const currentParts = currentVersion.split(".").map(Number);
-	for (const c of candidates) {
-		const parts = c.version.split(".").map(Number);
-		let isLess = false;
-		for (let i = 0; i < 3; i++) {
-			if (parts[i] < currentParts[i]) {
-				isLess = true;
-				break;
-			}
-			if (parts[i] > currentParts[i]) break;
-		}
-		if (isLess) return c;
-	}
-
-	return null;
 }

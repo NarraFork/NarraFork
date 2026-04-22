@@ -319,11 +319,22 @@ function countQuery(fromClause: string): number {
 }
 
 function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorCleanupRecord {
+	let traits: string[] | null = null;
+	if (row.traits != null) {
+		try {
+			const parsed = typeof row.traits === "string" ? JSON.parse(row.traits) : row.traits;
+			traits = Array.isArray(parsed) ? parsed : null;
+		} catch {
+			traits = null;
+		}
+	}
 	return {
 		id: String(row.id ?? ""),
 		parentNarratorId: row.parentNarratorId ? String(row.parentNarratorId) : null,
 		chapterId: row.chapterId ? String(row.chapterId) : null,
 		type: String(row.type ?? "primary"),
+		variant: String(row.variant ?? "primary"),
+		traits,
 		title: row.title ? String(row.title) : null,
 		status: String(row.status ?? "idle"),
 		messageCount: numberFromRow(row.messageCount),
@@ -343,6 +354,8 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 				parent_narrator_id AS parentNarratorId,
 				chapter_id AS chapterId,
 				type,
+				variant,
+				traits,
 				title,
 				status,
 				COALESCE(message_count, 0) AS messageCount,

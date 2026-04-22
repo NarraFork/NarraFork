@@ -98,7 +98,7 @@ export function initContainerEventHandler(): void {
 		try {
 			// 1. Find the chapter's primary narrator
 			const narrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, event.chapterId), eq(narrators.type, "primary")),
+				where: and(eq(narrators.chapterId, event.chapterId), eq(narrators.variant, "primary")),
 				columns: { id: true },
 			});
 			if (!narrator) {

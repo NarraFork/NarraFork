@@ -47,6 +47,14 @@ import {
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	addTrait,
+	hasTrait,
+	isSubagentVariant,
+	parseSubstatus,
+	parseTraits,
+	removeTrait,
+} from "../lib/narrator-utils";
 import { pathsEqual, resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
@@ -205,7 +213,7 @@ narratorRoutes.get("/", async (c) => {
 		const hasViewers = c.req.query("hasViewers") === "true";
 
 		// Build base where conditions
-		const conditions = [ne(narrators.type, "subagent")];
+		const conditions = [eq(narrators.variant, "primary")];
 
 		if (status === "archived") {
 			conditions.push(eq(narrators.status, "archived"));
@@ -381,6 +389,7 @@ narratorRoutes.get("/", async (c) => {
 
 		const items = rawItems.map((n) => ({
 			...n,
+			substatus: parseSubstatus(n.substatus),
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
@@ -393,7 +402,7 @@ narratorRoutes.get("/", async (c) => {
 
 	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
 	const list = await narratorService.listByChapter(chapterId);
-	return c.json(list);
+	return c.json(list.map((n) => ({ ...n, substatus: parseSubstatus(n.substatus) })));
 });
 
 // Create narrator
@@ -402,13 +411,13 @@ narratorRoutes.post("/", async (c) => {
 	const parsed = createNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const narrator = await narratorService.create(parsed.data);
-	return c.json(narrator, 201);
+	return c.json({ ...narrator, substatus: parseSubstatus(narrator.substatus) }, 201);
 });
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
 	const narrator = await narratorService.getById(c.req.param("id"));
-	return c.json(narrator);
+	return c.json({ ...narrator, substatus: parseSubstatus(narrator.substatus) });
 });
 
 // Get available commands + skills for the slash menu
@@ -466,8 +475,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
 
 	// Running narrator: buffer the message for execution after the current turn
-	if (narrator.status === "thinking" || narrator.status === "waiting") {
-		if (narrator.type === "subagent") {
+	if (narrator.status === "working" || narrator.status === "waiting") {
+		if (isSubagentVariant(narrator.variant)) {
 			const {
 				pushSubagentBufferedMessage,
 				getSubagentBufferedMessages,
@@ -491,8 +500,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			});
 			if (priority) {
 				const interrupted = interruptForegroundSubagent(id);
-				if (!interrupted && (narrator.status === "thinking" || narrator.status === "waiting")) {
-					await narratorService.updateStatus(id, "interrupted");
+				if (!interrupted && (narrator.status === "working" || narrator.status === "waiting")) {
+					await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 				}
 			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
@@ -536,10 +545,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
 					interrupted = interruptForegroundSubagent(id);
 				}
-				// Fallback: if no active loop found but DB status is still thinking/waiting,
+				// Fallback: if no active loop found but DB status is still working/waiting,
 				// force-reset to interrupted
-				if (!interrupted && (narrator.status === "thinking" || narrator.status === "waiting")) {
-					await narratorService.updateStatus(id, "interrupted");
+				if (!interrupted && (narrator.status === "working" || narrator.status === "waiting")) {
+					await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 				}
 			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
@@ -590,8 +599,8 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (
-		narrator.type === "subagent" &&
-		(narrator.status === "thinking" || narrator.status === "waiting")
+		isSubagentVariant(narrator.variant) &&
+		(narrator.status === "working" || narrator.status === "waiting")
 	) {
 		throw new ValidationError("Cannot retry on a running subagent");
 	}
@@ -613,7 +622,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 
-	if (narrator.status === "thinking" || narrator.status === "waiting") {
+	if (narrator.status === "working" || narrator.status === "waiting") {
 		throw new ValidationError("Cannot continue while narrator is already running");
 	}
 
@@ -642,8 +651,8 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (
-		narrator.type === "subagent" &&
-		(narrator.status === "thinking" || narrator.status === "waiting")
+		isSubagentVariant(narrator.variant) &&
+		(narrator.status === "working" || narrator.status === "waiting")
 	) {
 		throw new ValidationError("Cannot rollback on a running subagent");
 	}
@@ -669,8 +678,8 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	if (
-		narrator.type === "subagent" &&
-		(narrator.status === "thinking" || narrator.status === "waiting")
+		isSubagentVariant(narrator.variant) &&
+		(narrator.status === "working" || narrator.status === "waiting")
 	) {
 		throw new ValidationError("Cannot edit on a running subagent");
 	}
@@ -963,13 +972,13 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
 		interrupted = interruptForegroundSubagent(id);
 	}
-	// Fallback: if no active loop found but DB status is still thinking/waiting,
+	// Fallback: if no active loop found but DB status is still working/waiting,
 	// the narrator is a zombie (loop ended without updating status, e.g. after
 	// hot reload or unhandled error). Force-reset to interrupted.
 	if (!interrupted) {
 		const narrator = await narratorService.getById(id);
-		if (narrator.status === "thinking" || narrator.status === "waiting") {
-			await narratorService.updateStatus(id, "interrupted");
+		if (narrator.status === "working" || narrator.status === "waiting") {
+			await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
 			interrupted = true;
 		}
 	}
@@ -983,7 +992,7 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 
-	if (narrator.type !== "subagent") {
+	if (!isSubagentVariant(narrator.variant)) {
 		return c.json({ error: "Not a subagent" }, 400);
 	}
 	if (!narrator.parentNarratorId) {
@@ -1030,7 +1039,7 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	);
 	const finalText = await getSubagentFinalText(id);
 
-	const hasError = narrator.status === "error";
+	const hasError = narrator.substatus?.includes("error") ?? false;
 	await updateToolCallConclusion(
 		id,
 		narrator.parentNarratorId,
@@ -1047,8 +1056,8 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 narratorRoutes.post("/:id/leave", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (narrator?.status === "interrupted") {
-		await narratorService.updateStatus(id, "idle");
+	if (narrator?.substatus?.includes("interrupted")) {
+		await narratorService.updateStatus(id, "idle", { substatus: [] });
 	}
 	return c.json({ ok: true });
 });
@@ -1075,7 +1084,7 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const narrator = await narratorService.getById(id);
 
 	// Ask-in-passing narrators are locked to readOnly until promoted
-	if (narrator.isAskInPassing) {
+	if (hasTrait(parseTraits(narrator.traits), "ask-in-passing")) {
 		throw new ValidationError(
 			"Cannot change permission mode of an ask-in-passing narrator. Use promote to unlock.",
 		);
@@ -1311,17 +1320,21 @@ narratorRoutes.delete("/:id", async (c) => {
 	return c.json({ ok: true });
 });
 
-// Mark narrator as read (done → idle)
-// Error sessions are preserved because only status=done can transition.
+// Mark narrator as read (clear unread substatus)
+// Error sessions are preserved because only unread substatus can transition.
 // Subagents are skipped — their done/error status must be preserved for ContinueTask.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
-	if (narrator.type === "subagent") return c.json({ ok: true });
-	if (narrator.status === "done" && !narrator.errorMessage) {
-		// Atomic CAS: only transition done→idle if status is still "done".
-		// Avoids clobbering a "thinking" state set by a concurrent sendMessage.
-		await narratorService.compareAndSetStatus(id, "done", "idle");
+	if (isSubagentVariant(narrator.variant)) return c.json({ ok: true });
+	if (
+		narrator.status === "idle" &&
+		narrator.substatus?.includes("unread") &&
+		!narrator.errorMessage
+	) {
+		// Atomic CAS: only clear unread substatus if status is still "idle".
+		// Avoids clobbering a "working" state set by a concurrent sendMessage.
+		await narratorService.compareAndSetStatus(id, "idle", "idle", { substatus: [] });
 	}
 	return c.json({ ok: true });
 });
@@ -1497,9 +1510,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	});
 
 	// Lock to readOnly + mark as ask-in-passing (user can "promote" later to unlock)
+	const aipTraits = addTrait(parseTraits(newNarrator.traits), "ask-in-passing");
 	await db
 		.update(narrators)
-		.set({ permissionMode: "readOnly", isAskInPassing: true })
+		.set({ permissionMode: "readOnly", isAskInPassing: true, traits: aipTraits })
 		.where(eq(narrators.id, newNarrator.id));
 
 	// Send the user's question to the new narrator
@@ -1600,16 +1614,20 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 
-	if (!narrator.isAskInPassing) {
+	const narratorTraits = parseTraits(narrator.traits);
+
+	if (!hasTrait(narratorTraits, "ask-in-passing")) {
 		throw new ValidationError("Only ask-in-passing narrators can be promoted");
 	}
 
 	if (!narrator.chapterId) {
 		// Standalone narrator: just unlock
+		const unlockedTraits = removeTrait(narratorTraits, "ask-in-passing");
 		await db
 			.update(narrators)
 			.set({
 				isAskInPassing: false,
+				traits: unlockedTraits,
 				permissionMode: "default",
 				updatedAt: new Date().toISOString(),
 			})
@@ -1635,10 +1653,12 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	// Mark the original ask-in-passing narrator as promoted so the UI
 	// no longer shows it as locked.  We keep permissionMode as readOnly
 	// since the original narrator stays as a read-only question record.
+	const promotedTraits = removeTrait(narratorTraits, "ask-in-passing");
 	await db
 		.update(narrators)
 		.set({
 			isAskInPassing: false,
+			traits: promotedTraits,
 			updatedAt: new Date().toISOString(),
 		})
 		.where(eq(narrators.id, id));
@@ -2335,6 +2355,8 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 			title: narrators.title,
 		})
 		.from(narrators)
+		// NOTE: uses legacy isBackground column for efficient SQL filtering;
+		// kept in sync with traits["background"] on write.
 		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
 		.orderBy(desc(narrators.createdAt));
 

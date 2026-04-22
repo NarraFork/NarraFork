@@ -27,7 +27,7 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 | `bun run db:generate` | 生成 Drizzle 迁移 SQL 文件 |
 | `bun run db:migrate` | 执行 `./drizzle/` 中的迁移 |
 | `bunx @biomejs/biome check .` | Biome 代码检查 + 格式检查（白名单命令，无需用户批准） |
-| `bunx tsc --noEmit` | TypeScript 类型检查（白名单命令，无需用户批准） |
+| `bunx tsgo --noEmit` | TypeScript 类型检查（白名单命令，无需用户批准） |
 | `bunx @biomejs/biome check --write <file>` | Biome 代码检查 + 格式化（白名单命令，无需用户批准，建议单文件执行） |
 
 **开发需要两个进程：** `bun run dev`（后端）和 `bun run dev:frontend`（前端）。
@@ -203,7 +203,7 @@ frontend/
 ## 代码风格
 
 - **Biome** 强制格式化和代码检查 — 优先使用 `bunx @biomejs/biome check .`（白名单命令，无需用户批准）而非 `bun run check`
-- **TypeScript 类型检查** — 使用 `bunx tsc --noEmit`（白名单命令，无需用户批准）
+- **TypeScript 类型检查** — 使用 `bunx tsgo --noEmit`（白名单命令，无需用户批准）
 - 使用 **tab** 缩进，最大行宽 **100** 字符
 - 路径别名：`@server/*` → `./server/*`，`@frontend/*` → `./frontend/*`
 - 全局使用 ESM（`"type": "module"`）

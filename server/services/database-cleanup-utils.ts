@@ -15,6 +15,8 @@ export interface NarratorCleanupRecord {
 	parentNarratorId: string | null;
 	chapterId: string | null;
 	type: string;
+	variant: string;
+	traits: string[] | null;
 	title: string | null;
 	status: string;
 	messageCount: number;
@@ -143,7 +145,7 @@ function isRootCandidate(
 	target: Exclude<DatabaseCleanupTarget, "apiRequestDumps">,
 	narrator: NarratorCleanupRecord,
 ): boolean {
-	if (narrator.type !== "primary") return false;
+	if (narrator.variant !== "primary") return false;
 	if (narrator.chapterId !== null) return false;
 	if (target === "archivedSessions") {
 		return narrator.status === "archived";

@@ -330,6 +330,9 @@ describe("prompt injection: interpreter code execution", () => {
 		expectAllowed("npx tsc --outDir /tmp/out"));
 	test("npx tsc --incremental → allow (tsc write args gated by permission mode)", () =>
 		expectAllowed("npx tsc --incremental"));
+	test("bunx tsgo --noEmit → allow (tsgo allowlist)", () => expectAllowed("bunx tsgo --noEmit"));
+	test("bunx @typescript/native-preview --noEmit → allow", () =>
+		expectAllowed("bunx @typescript/native-preview --noEmit"));
 	test("npx vitest → ask (not in strict safe args)", () => expectBlocked("npx vitest"));
 	test("npx -p vitest vitest → ask (dynamic package source)", () =>
 		expectBlocked("npx -p vitest vitest"));

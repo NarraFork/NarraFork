@@ -322,8 +322,8 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN": "没有找到最近的标签页。",
 	},
 	"gateway.useSwitchHint": {
-		en: "Use /switch <id> to switch.",
-		"zh-CN": "使用 /switch <id> 切换。",
+		en: "Use /switch <number> or /switch <id> to switch.",
+		"zh-CN": "使用 /switch <序号> 或 /switch <id> 切换。",
 	},
 	"gateway.searchResults": {
 		en: '🔍 Search results for "{query}":',
@@ -338,8 +338,8 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN": "用法：/search <关键词>",
 	},
 	"gateway.switchUsage": {
-		en: "Usage: /switch <narrator-id>\nUse /list or /search to find IDs.",
-		"zh-CN": "用法：/switch <叙述者ID>\n使用 /list 或 /search 查找 ID。",
+		en: "Usage: /switch <number> or /switch <id>\nUse /list or /search to find narrators.",
+		"zh-CN": "用法：/switch <序号> 或 /switch <id>\n使用 /list 或 /search 查找叙述者。",
 	},
 	"gateway.switchedTo": {
 		en: "🔗 Switched to: {title}\nID: {id} | Status: {status} | Model: {model}",
@@ -348,6 +348,14 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	"gateway.narratorNotFound": {
 		en: "❌ Narrator not found: {id}\nUse /list or /search to find valid IDs.",
 		"zh-CN": "❌ 未找到叙述者：{id}\n使用 /list 或 /search 查找有效 ID。",
+	},
+	"gateway.switchIndexOutOfRange": {
+		en: "❌ Invalid number. Valid range: 1–{max}.\nUse /list or /search to refresh.",
+		"zh-CN": "❌ 序号无效，有效范围：1–{max}。\n使用 /list 或 /search 刷新列表。",
+	},
+	"gateway.switchNoListCache": {
+		en: "❌ No recent list. Use /list or /search first, then /switch <number>.",
+		"zh-CN": "❌ 没有最近的列表。请先使用 /list 或 /search，再用 /switch <序号>。",
 	},
 	"gateway.narratorWrongProject": {
 		en: "❌ Narrator belongs to a different project.\nUse /list or /search to find narrators in the current project.",
@@ -382,8 +390,8 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN": "/search <关键词> — 按标题搜索叙述者",
 	},
 	"gateway.helpSwitch": {
-		en: "/switch <id> — Switch to an existing narrator",
-		"zh-CN": "/switch <id> — 切换到已有叙述者",
+		en: "/switch <number|id> — Switch to an existing narrator",
+		"zh-CN": "/switch <序号|id> — 切换到已有叙述者",
 	},
 	"gateway.helpStatus": {
 		en: "/status — Show session info",

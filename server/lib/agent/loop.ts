@@ -38,6 +38,99 @@ import {
 
 export { isRetryableError } from "./error-handling";
 
+// ── Incomplete JSON field extractor ─────────────────────────────
+// Parses streaming JSON fragments to extract field values without
+// requiring a complete JSON object. Used to provide structured
+// field data to the frontend instead of raw JSON.
+
+/** Find the unescaped closing quote in a JSON string value. Returns -1 if not found. */
+function findClosingQuote(s: string, start: number): number {
+	for (let i = start; i < s.length; i++) {
+		if (s.charCodeAt(i) === 0x5c /* \ */) {
+			i++; // skip escaped char
+			continue;
+		}
+		if (s.charCodeAt(i) === 0x22 /* " */) return i;
+	}
+	return -1;
+}
+
+/** Unescape JSON string escapes (\\n, \\t, \\r, \\", \\\\) */
+function unescapeJsonString(s: string): string {
+	return s
+		.replace(/\\n/g, "\n")
+		.replace(/\\t/g, "\t")
+		.replace(/\\r/g, "\r")
+		.replace(/\\"/g, '"')
+		.replace(/\\\\/g, "\\");
+}
+
+interface ExtractedFieldsResult {
+	/** Completed short fields (key → unescaped value) */
+	fields: Record<string, string>;
+	/** The field currently being written (no closing quote yet), or null */
+	activeField: { name: string; rawStart: number } | null;
+}
+
+/**
+ * Extract all string fields from an incomplete JSON object.
+ * Scans for `"key": "value"` patterns, handling escaped quotes correctly.
+ * Returns completed fields and identifies the currently-streaming field.
+ */
+function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): ExtractedFieldsResult {
+	const fields: Record<string, string> = {};
+	let activeField: ExtractedFieldsResult["activeField"] = null;
+
+	// Match `"key" :` patterns
+	const keyRe = /"(\w+)"\s*:\s*/g;
+	for (;;) {
+		const m = keyRe.exec(raw);
+		if (m === null) break;
+		const key = m[1];
+		if (!wantedKeys.has(key)) continue;
+		const afterColon = m.index + m[0].length;
+		// Expect a string value starting with "
+		if (afterColon >= raw.length || raw.charCodeAt(afterColon) !== 0x22 /* " */) continue;
+		const valueStart = afterColon + 1;
+		const closeQuote = findClosingQuote(raw, valueStart);
+		if (closeQuote !== -1) {
+			// Complete field
+			fields[key] = unescapeJsonString(raw.slice(valueStart, closeQuote));
+			// Advance past this field so we don't re-match inside the value
+			keyRe.lastIndex = closeQuote + 1;
+		} else {
+			// No closing quote — this field is still being written
+			activeField = { name: key, rawStart: valueStart };
+			break; // Nothing meaningful after an incomplete string value
+		}
+	}
+	return { fields, activeField };
+}
+
+/** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
+const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
+	Write: { short: ["file_path"], large: ["content"] },
+	Edit: { short: ["file_path"], large: ["old_string", "new_string"] },
+	Bash: { short: ["description"], large: ["command"] },
+	Grep: { short: ["pattern", "path", "glob", "output_mode", "type"], large: [] },
+	Glob: { short: ["pattern", "path"], large: [] },
+	Read: { short: ["file_path", "offset", "limit"], large: [] },
+	Agent: { short: ["description", "subagent_type", "model"], large: ["prompt"] },
+	Task: { short: ["description", "subagent_type", "model"], large: ["prompt"] },
+	ContinueTask: { short: ["subagent_id"], large: ["prompt"] },
+	WebSearch: { short: ["query"], large: [] },
+	WebFetch: { short: ["url", "mode"], large: [] },
+	Skill: { short: ["skill"], large: [] },
+	ExitPlanMode: { short: [], large: ["plan"] },
+	AskUserQuestion: { short: [], large: [] },
+};
+
+function getToolWantedKeys(toolName: string): Set<string> {
+	const config = TOOL_FIELD_CONFIG[toolName];
+	if (!config) return new Set();
+	return new Set([...config.short, ...config.large]);
+}
+
 const EMPTY_RESPONSE_MESSAGE =
 	"Provider returned an empty response. This often indicates an API configuration error " +
 	"(base URL, model, or credentials).";
@@ -355,11 +448,13 @@ export async function* agentLoop(
 				name: string;
 				inputChunks: string[];
 				totalChars: number;
-				/** Accumulated input delta since last yield (flushed on each yield) */
-				pendingDelta: string;
 				startedAt: number;
 				extractedFilePath?: string;
 				extractedFields?: Record<string, string>;
+				/** Name of the large field currently being streamed */
+				activeStreamingField?: string;
+				/** How many raw chars of the active field have been yielded so far */
+				streamingFieldYielded: number;
 				lastYieldedAt: number;
 			}
 		>();
@@ -588,7 +683,7 @@ export async function* agentLoop(
 										name,
 										inputChunks: [],
 										totalChars: 0,
-										pendingDelta: "",
+										streamingFieldYielded: 0,
 										startedAt: Date.now(),
 										lastYieldedAt: Date.now(),
 									});
@@ -606,59 +701,73 @@ export async function* agentLoop(
 								if (typeof input === "string") {
 									acc.inputChunks.push(input);
 									acc.totalChars += input.length;
-									acc.pendingDelta += input;
 
-									// For Write/Edit tools, try to extract file_path from first chunk
-									let filePathJustExtracted = false;
-									if (!acc.extractedFilePath && (acc.name === "Write" || acc.name === "Edit")) {
-										const raw = acc.inputChunks.join("");
-										const filePathMatch = raw.match(/"file_path"\s*:\s*"([^"]+)"/);
-										if (filePathMatch) {
-											acc.extractedFilePath = filePathMatch[1];
-											filePathJustExtracted = true;
-										}
-									}
+									// Extract structured fields from the incomplete JSON
+									const raw = acc.inputChunks.join("");
+									const wantedKeys = getToolWantedKeys(acc.name);
+									let fieldsChanged = false;
 
-									// For Agent tool, extract description/subagent_type/model from early chunks
-									let fieldsJustExtracted = false;
-									if (acc.name === "Agent" || acc.name === "Task") {
-										const raw = acc.inputChunks.join("");
-										const wantedKeys = ["description", "subagent_type", "model"] as const;
-										for (const key of wantedKeys) {
-											if (acc.extractedFields?.[key]) continue;
-											const re = new RegExp(`"${key}"\\s*:\\s*"([^"]*?)"`);
-											const m = raw.match(re);
-											if (m) {
-												if (!acc.extractedFields) acc.extractedFields = {};
-												acc.extractedFields[key] = m[1];
-												fieldsJustExtracted = true;
+									if (wantedKeys.size > 0) {
+										const result = extractJsonFields(raw, wantedKeys);
+
+										// Update completed short fields
+										for (const [key, value] of Object.entries(result.fields)) {
+											if (!acc.extractedFields) acc.extractedFields = {};
+											if (acc.extractedFields[key] !== value) {
+												acc.extractedFields[key] = value;
+												fieldsChanged = true;
 											}
 										}
+
+										// Update file_path shortcut (used by header summary)
+										if (result.fields.file_path && !acc.extractedFilePath) {
+											acc.extractedFilePath = result.fields.file_path;
+											fieldsChanged = true;
+										}
+
+										// Track the active streaming field
+										if (result.activeField) {
+											acc.activeStreamingField = result.activeField.name;
+										}
 									}
 
-									// Throttle: yield at most once per 50ms per tool to reduce WS pressure.
-									// Bypass throttle when file_path or fields are first extracted so the
-									// frontend can display them immediately instead of waiting for the next
-									// content chunk.
+									// Throttle: yield at most once per 50ms per tool.
+									// Bypass throttle when fields change so the frontend
+									// can display them immediately.
 									const now = Date.now();
-									if (
-										filePathJustExtracted ||
-										fieldsJustExtracted ||
-										now - acc.lastYieldedAt >= 50
-									) {
+									if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
 										acc.lastYieldedAt = now;
 
 										// Calculate content chars (total minus file_path JSON overhead)
 										let contentChars = acc.totalChars;
 										if (acc.extractedFilePath) {
-											// Rough estimate: subtract the file_path field size
 											const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
 											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 										}
 
-										// Flush accumulated delta since last yield
-										const inputDelta = acc.pendingDelta;
-										acc.pendingDelta = "";
+										// Compute streaming field delta
+										let streamingField: { name: string; delta: string } | undefined;
+										if (acc.activeStreamingField && wantedKeys.size > 0) {
+											const sfResult = extractJsonFields(raw, wantedKeys);
+											if (
+												sfResult.activeField &&
+												sfResult.activeField.name === acc.activeStreamingField
+											) {
+												const fullRaw = raw.slice(sfResult.activeField.rawStart);
+												if (fullRaw.length > acc.streamingFieldYielded) {
+													const delta = unescapeJsonString(
+														fullRaw.slice(acc.streamingFieldYielded),
+													);
+													if (delta) {
+														streamingField = {
+															name: acc.activeStreamingField,
+															delta,
+														};
+														acc.streamingFieldYielded = fullRaw.length;
+													}
+												}
+											}
+										}
 
 										yield {
 											type: "tool_use_chunk",
@@ -674,19 +783,39 @@ export async function* agentLoop(
 											...(acc.extractedFields && {
 												extractedFields: acc.extractedFields,
 											}),
-											...(inputDelta && { inputDelta }),
+											...(streamingField && { streamingField }),
 										};
 									}
 								}
 								if (stop) {
-									// Yield final chunk with latest totals before completing
+									// Final yield: flush any remaining streaming field delta
+									const stopRaw = acc.inputChunks.join("");
+									const stopWantedKeys = getToolWantedKeys(acc.name);
+									let streamingField: { name: string; delta: string } | undefined;
+									if (acc.activeStreamingField && stopWantedKeys.size > 0) {
+										const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
+										if (
+											sfResult.activeField &&
+											sfResult.activeField.name === acc.activeStreamingField
+										) {
+											const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
+											if (fullRaw.length > acc.streamingFieldYielded) {
+												const delta = unescapeJsonString(fullRaw.slice(acc.streamingFieldYielded));
+												if (delta) {
+													streamingField = {
+														name: acc.activeStreamingField,
+														delta,
+													};
+												}
+											}
+										}
+									}
+
 									let contentChars = acc.totalChars;
 									if (acc.extractedFilePath) {
 										const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
 										contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 									}
-									const inputDelta = acc.pendingDelta;
-									acc.pendingDelta = "";
 									yield {
 										type: "tool_use_chunk",
 										toolUseId: id,
@@ -701,16 +830,15 @@ export async function* agentLoop(
 										...(acc.extractedFields && {
 											extractedFields: acc.extractedFields,
 										}),
-										...(inputDelta && { inputDelta }),
+										...(streamingField && { streamingField }),
 									};
 
-									const raw = acc.inputChunks.join("");
 									let parsedInput: Record<string, unknown> = {};
-									if (raw) {
+									if (stopRaw) {
 										try {
-											parsedInput = JSON.parse(raw);
+											parsedInput = JSON.parse(stopRaw);
 										} catch {
-											parsedInput = { _raw: raw };
+											parsedInput = { _raw: stopRaw };
 										}
 									}
 									const tu: AgentToolUse = {

@@ -259,7 +259,7 @@ export const chapterFork = {
 
 			// Step 4: Fork the chapter's primary narrator
 			const primaryNarrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, parentChapterId), eq(narrators.type, "primary")),
+				where: and(eq(narrators.chapterId, parentChapterId), eq(narrators.variant, "primary")),
 			});
 			if (primaryNarrator) {
 				const forked = await narratorService.forkNarrator(
@@ -375,7 +375,7 @@ export const chapterFork = {
 	): Promise<string> {
 		// Find the primary narrator for this chapter
 		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 		});
 		if (!primaryNarrator) {
 			logger.warn("No primary narrator found for commit resolution, using HEAD", { chapterId });
@@ -457,7 +457,7 @@ export const chapterFork = {
 		messageUuid: string,
 	): Promise<Map<string, string | null>> {
 		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 		});
 		if (!primaryNarrator) return new Map();
 

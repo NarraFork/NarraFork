@@ -1,4 +1,4 @@
-import { and, eq, gte, inArray, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, like, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorMessageRefs,
@@ -11,6 +11,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -701,8 +702,8 @@ export const narratorPersistence = {
 			.where(
 				and(
 					eq(narrators.parentNarratorId, narratorId),
-					eq(narrators.type, "subagent"),
-					inArray(narrators.status, ["thinking", "waiting", "idle"]),
+					like(narrators.variant, "subagent:%"),
+					inArray(narrators.status, ["working", "waiting", "idle"]),
 				),
 			);
 	},
@@ -744,21 +745,24 @@ export const narratorPersistence = {
 
 	async updateStatus(
 		narratorId: string,
-		status:
-			| "idle"
-			| "thinking"
-			| "waiting"
-			| "done"
-			| "archived"
-			| "error"
-			| "interrupted"
-			| "suspended",
-		errorMessage?: string,
-		errorCode?: string,
-		setTurnStart?: boolean,
+		status: "idle" | "working" | "waiting" | "archived",
+		options?: {
+			substatus?: string[];
+			errorMessage?: string;
+			errorCode?: string;
+			setTurnStart?: boolean;
+		},
 	) {
+		const errorMessage = options?.errorMessage;
+		const errorCode = options?.errorCode;
+		const setTurnStart = options?.setTurnStart;
+		// When transitioning to an active status without explicit substatus,
+		// auto-clear stale tags (e.g. leftover "unread"/"error"/"interrupted").
+		const substatus =
+			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
+		const isError = substatus?.includes("error");
 		const now = new Date().toISOString();
-		const normalizedErrorMessage = status === "error" ? (errorMessage ?? null) : null;
+		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const turnStartedAt = setTurnStart ? now : undefined;
 		await db
 			.update(narrators)
@@ -767,20 +771,22 @@ export const narratorPersistence = {
 				errorMessage: normalizedErrorMessage,
 				updatedAt: now,
 				...(turnStartedAt !== undefined && { turnStartedAt }),
+				...(substatus !== undefined && { substatus: JSON.stringify(substatus) }),
 			})
 			.where(eq(narrators.id, narratorId));
 
-		eventBus.emit(
-			status === "error"
-				? {
-						type: "narrator:error",
-						narratorId,
-						error: normalizedErrorMessage ?? "Unknown error",
-					}
-				: { type: "narrator:status_changed", narratorId, status },
-		);
+		// Always emit status_changed so downstream listeners (gateway, notifications)
+		// are notified. For errors, also emit the dedicated narrator:error event.
+		eventBus.emit({ type: "narrator:status_changed", narratorId, status, substatus });
+		if (isError) {
+			eventBus.emit({
+				type: "narrator:error",
+				narratorId,
+				error: normalizedErrorMessage ?? "Unknown error",
+			});
+		}
 
-		if (status === "error") {
+		if (isError) {
 			broadcastToNarrator(narratorId, {
 				type: "narrator_error",
 				narratorId,
@@ -824,6 +830,7 @@ export const narratorPersistence = {
 			type: "status_change",
 			narratorId,
 			status,
+			substatus,
 			turnStartedAt: turnStartedAt ?? undefined,
 		});
 	},
@@ -831,44 +838,109 @@ export const narratorPersistence = {
 	async compareAndSetStatus(
 		narratorId: string,
 		expectedStatus: string | string[],
-		newStatus:
-			| "idle"
-			| "thinking"
-			| "waiting"
-			| "done"
-			| "archived"
-			| "error"
-			| "interrupted"
-			| "suspended",
-		errorMessage?: string,
+		newStatus: "idle" | "working" | "waiting" | "archived",
+		options?: {
+			substatus?: string[];
+			errorMessage?: string;
+		},
 	): Promise<boolean> {
+		// When transitioning to an active status without explicit substatus,
+		// auto-clear stale tags.
+		const substatus =
+			options?.substatus ?? (newStatus === "working" || newStatus === "waiting" ? [] : undefined);
+		const errorMessage = options?.errorMessage;
+		const isError = substatus?.includes("error");
 		const now = new Date().toISOString();
-		const normalizedErrorMessage = newStatus === "error" ? (errorMessage ?? null) : null;
+		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+		const substatusJson = substatus !== undefined ? JSON.stringify(substatus) : undefined;
 		const placeholders = expected.map(() => "?").join(",");
 		const result = sqlite
 			.prepare(
-				`UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+				substatusJson !== undefined
+					? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
+					: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
 			)
-			.run(newStatus, normalizedErrorMessage, now, narratorId, ...expected);
+			.run(
+				...(substatusJson !== undefined
+					? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
+					: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
+			);
 
 		if (result.changes === 0) return false;
 
-		eventBus.emit(
-			newStatus === "error"
-				? {
-						type: "narrator:error",
-						narratorId,
-						error: normalizedErrorMessage ?? "Unknown error",
-					}
-				: { type: "narrator:status_changed", narratorId, status: newStatus },
-		);
+		// Always emit status_changed; for errors also emit narrator:error.
+		eventBus.emit({ type: "narrator:status_changed", narratorId, status: newStatus, substatus });
+		if (isError) {
+			eventBus.emit({
+				type: "narrator:error",
+				narratorId,
+				error: normalizedErrorMessage ?? "Unknown error",
+			});
+		}
 		broadcastToNarrator(narratorId, {
 			type: "status_change",
 			narratorId,
 			status: newStatus,
+			substatus,
 		});
 		return true;
+	},
+
+	/**
+	 * Update only the substatus tags without changing the main status.
+	 * Broadcasts a substatus_change event to all subscribers.
+	 */
+	async updateSubstatus(narratorId: string, substatus: string[]) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ substatus: JSON.stringify(substatus), updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+
+		broadcastToNarrator(narratorId, {
+			type: "substatus_change",
+			narratorId,
+			substatus,
+		});
+	},
+
+	/**
+	 * Add a single substatus tag. No-op if already present.
+	 * Returns the new substatus array.
+	 *
+	 * @internal Only call through narrator-session.ts's in-memory Set which
+	 * serializes access via the single-threaded event loop. Direct calls from
+	 * routes or other services will cause read-modify-write race conditions.
+	 */
+	async addSubstatus(narratorId: string, tag: string): Promise<string[]> {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { substatus: true },
+		});
+		const current = parseSubstatus(row?.substatus);
+		if (current.includes(tag)) return current;
+		const updated = [...current, tag];
+		await this.updateSubstatus(narratorId, updated);
+		return updated;
+	},
+
+	/**
+	 * Remove a single substatus tag. No-op if not present.
+	 * Returns the new substatus array.
+	 *
+	 * @internal Same serialization requirement as addSubstatus — see above.
+	 */
+	async removeSubstatus(narratorId: string, tag: string): Promise<string[]> {
+		const row = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { substatus: true },
+		});
+		const current = parseSubstatus(row?.substatus);
+		if (!current.includes(tag)) return current;
+		const updated = current.filter((t) => t !== tag);
+		await this.updateSubstatus(narratorId, updated);
+		return updated;
 	},
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

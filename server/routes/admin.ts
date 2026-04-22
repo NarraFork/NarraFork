@@ -205,9 +205,9 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const cpuUsage = process.cpuUsage();
 	const memUsage = process.memoryUsage();
 
-	// Active narrators (thinking/waiting status)
+	// Active narrators (working/waiting status)
 	const activeNarratorRows = await db.query.narrators.findMany({
-		where: eq(narrators.status, "thinking"),
+		where: eq(narrators.status, "working"),
 		columns: { id: true, status: true, chapterId: true },
 	});
 	const waitingNarratorRows = await db.query.narrators.findMany({

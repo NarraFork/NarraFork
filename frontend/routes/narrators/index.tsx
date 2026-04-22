@@ -42,8 +42,33 @@ import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrat
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
-import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { formatSmartTime } from "../../lib/format";
+import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
+
+const ATTENTION_TAGS = ["unread", "error", "interrupted", "suspended"] as const;
+
+/** Compute the status badge display for a narrator in the list view. */
+function getNarratorBadgeInfo(
+	status: string,
+	substatus?: string[],
+): { color: string; labelKey: string } | null {
+	const display = getEffectiveNarratorDisplay(status, substatus);
+	const activeSubstatus = substatus?.find((s: string) =>
+		(ATTENTION_TAGS as readonly string[]).includes(s),
+	);
+	const showBadge =
+		(status !== "idle" && status !== "working") ||
+		(status === "working" && substatus?.includes("planning")) ||
+		(status === "idle" && !!activeSubstatus);
+	if (!showBadge) return null;
+	const labelKey = activeSubstatus
+		? `status_${activeSubstatus}`
+		: substatus?.includes("planning")
+			? "status_planning"
+			: `status_${status}`;
+	return { color: display.color, labelKey };
+}
 
 interface NarratorSearchParams {
 	create?: boolean;
@@ -188,6 +213,7 @@ function NarratorsPage() {
 						return {
 							...item,
 							...(event.status !== undefined ? { status: event.status } : {}),
+							...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
 							...(event.title !== undefined ? { title: event.title } : {}),
 							...(event.permissionMode !== undefined
 								? { permissionMode: event.permissionMode }
@@ -505,27 +531,21 @@ function NarratorsPage() {
 								<Stack gap={4} visibleFrom="sm">
 									<Group justify="space-between" wrap="nowrap">
 										<Group gap="xs" style={{ minWidth: 0 }}>
-											{narrator.status === "thinking" && (
+											{narrator.status === "working" && (
 												<Loader
 													size={14}
-													color={narrator.permissionMode === "plan" ? "green" : undefined}
+													color={narrator.substatus?.includes("planning") ? "green" : undefined}
 												/>
 											)}
-											{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
-												<Badge size="xs" color="green">
-													{tn("status_planning")}
-												</Badge>
-											)}
-											{narrator.status &&
-												narrator.status !== "idle" &&
-												narrator.status !== "thinking" && (
-													<Badge
-														size="xs"
-														color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}
-													>
-														{tn(`status_${narrator.status}`)}
+											{(() => {
+												const badge = getNarratorBadgeInfo(narrator.status, narrator.substatus);
+												if (!badge) return null;
+												return (
+													<Badge size="xs" color={badge.color}>
+														{tn(badge.labelKey)}
 													</Badge>
-												)}
+												);
+											})()}
 											<Text fw={500} truncate>
 												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 											</Text>
@@ -627,24 +647,21 @@ function NarratorsPage() {
 								{/* ── Mobile card layout ── */}
 								<Stack gap={4} hiddenFrom="sm">
 									<Group gap={6} wrap="nowrap">
-										{narrator.status === "thinking" && (
+										{narrator.status === "working" && (
 											<Loader
 												size={12}
-												color={narrator.permissionMode === "plan" ? "green" : undefined}
+												color={narrator.substatus?.includes("planning") ? "green" : undefined}
 											/>
 										)}
-										{narrator.status === "thinking" && narrator.permissionMode === "plan" && (
-											<Badge size="xs" color="green">
-												{tn("status_planning")}
-											</Badge>
-										)}
-										{narrator.status &&
-											narrator.status !== "idle" &&
-											narrator.status !== "thinking" && (
-												<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator.status] ?? "gray"}>
-													{tn(`status_${narrator.status}`)}
+										{(() => {
+											const badge = getNarratorBadgeInfo(narrator.status, narrator.substatus);
+											if (!badge) return null;
+											return (
+												<Badge size="xs" color={badge.color}>
+													{tn(badge.labelKey)}
 												</Badge>
-											)}
+											);
+										})()}
 										<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
 											{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
 										</Text>

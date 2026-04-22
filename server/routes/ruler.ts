@@ -3,7 +3,31 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { chapterEdges, chapters, narrators, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { parseSubstatus } from "../lib/narrator-utils";
 import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
+
+/**
+ * Resolve a narrator's effective display status for the Ruler view.
+ * Merges status + substatus into a single string that Pixi can color-map directly.
+ * e.g. idle + ["unread"] → "unread", idle + ["error"] → "error", working → "working"
+ *
+ * NOTE: This only maps persistent substatus tags (error/suspended/interrupted/unread).
+ * Transient tags (reasoning/compacting/queued etc.) are irrelevant for the Ruler's
+ * coarse-grained Pixi rendering. The frontend status-registry.ts handles the full
+ * priority list for the detailed narrator panel view.
+ */
+function resolveNarratorDisplayStatus(status: string, substatusRaw?: string | null): string {
+	if (status === "working" || status === "waiting") return status;
+	if (status !== "idle" || !substatusRaw) return status;
+	const sub = parseSubstatus(substatusRaw);
+	// Priority: error > suspended > interrupted > unread
+	if (sub.includes("error")) return "error";
+	if (sub.includes("suspended")) return "suspended";
+	if (sub.includes("interrupted")) return "interrupted";
+	if (sub.includes("unread")) return "unread";
+	return status;
+}
+
 import {
 	forkChapterSchema,
 	rulerAbandonSchema,
@@ -121,13 +145,16 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	let narratorMap = new Map<string, { id: string; status: string }>();
 	if (activeChapterIds.length > 0) {
 		const chapterNarrators = await db.query.narrators.findMany({
-			where: and(inArray(narrators.chapterId, activeChapterIds), eq(narrators.type, "primary")),
-			columns: { id: true, chapterId: true, status: true },
+			where: and(inArray(narrators.chapterId, activeChapterIds), eq(narrators.variant, "primary")),
+			columns: { id: true, chapterId: true, status: true, substatus: true },
 		});
 		narratorMap = new Map(
 			chapterNarrators
 				.filter((n) => n.chapterId)
-				.map((n) => [n.chapterId!, { id: n.id, status: n.status }]),
+				.map((n) => [
+					n.chapterId!,
+					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
+				]),
 		);
 	}
 
@@ -283,11 +310,13 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		let narratorMap = new Map<string, string>();
 		if (chapterIds.length > 0) {
 			const chapterNarrators = await db.query.narrators.findMany({
-				where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.type, "primary")),
-				columns: { chapterId: true, status: true },
+				where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
+				columns: { chapterId: true, status: true, substatus: true },
 			});
 			narratorMap = new Map(
-				chapterNarrators.filter((n) => n.chapterId).map((n) => [n.chapterId!, n.status]),
+				chapterNarrators
+					.filter((n) => n.chapterId)
+					.map((n) => [n.chapterId!, resolveNarratorDisplayStatus(n.status, n.substatus)]),
 			);
 		}
 
@@ -343,13 +372,16 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	let narratorMap = new Map<string, { id: string; status: string }>();
 	if (chapterIds.length > 0) {
 		const chapterNarrators = await db.query.narrators.findMany({
-			where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.type, "primary")),
-			columns: { id: true, chapterId: true, status: true },
+			where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
+			columns: { id: true, chapterId: true, status: true, substatus: true },
 		});
 		narratorMap = new Map(
 			chapterNarrators
 				.filter((n) => n.chapterId)
-				.map((n) => [n.chapterId!, { id: n.id, status: n.status }]),
+				.map((n) => [
+					n.chapterId!,
+					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
+				]),
 		);
 	}
 
@@ -676,7 +708,7 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 
 	// Get or create primary narrator for this chapter
 	let narrator = await db.query.narrators.findFirst({
-		where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+		where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 	});
 	if (!narrator) {
 		narrator = await narratorService.create({

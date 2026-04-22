@@ -19,7 +19,8 @@ interface NarratorWSCallbacks {
 		decision?: "allow" | "deny",
 		feedbackText?: string,
 	) => void;
-	onStatusChange?: (status: string, turnStartedAt?: string) => void;
+	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
+	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
 		toolUseId: string,
 		toolName: string,
@@ -35,7 +36,7 @@ interface NarratorWSCallbacks {
 		extractedFilePath?: string,
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
-		inputDelta?: string,
+		streamingField?: { name: string; delta: string },
 	) => void;
 	onToolCompleted?: (
 		toolUseId: string,
@@ -267,7 +268,11 @@ export function useNarratorWS(
 						callbacksRef.current.onStatusChange?.(
 							data.status as string,
 							data.turnStartedAt as string | undefined,
+							data.substatus as string[] | undefined,
 						);
+						break;
+					case "substatus_change":
+						callbacksRef.current.onSubstatusChange?.(data.substatus as string[]);
 						break;
 					case "tool_started":
 						callbacksRef.current.onToolStarted?.(
@@ -287,7 +292,7 @@ export function useNarratorWS(
 							data.extractedFilePath as string | undefined,
 							data.contentCharsReceived as number | undefined,
 							data.extractedFields as Record<string, string> | undefined,
-							data.inputDelta as string | undefined,
+							data.streamingField as { name: string; delta: string } | undefined,
 						);
 						break;
 					case "tool_completed":
@@ -693,6 +698,7 @@ export function useNarratorWS(
 export interface NarratorListWSEvent {
 	type: "status" | "title" | "permissionMode" | "presence" | "terminalCount" | "containerStatus";
 	status?: string;
+	substatus?: string[];
 	title?: string;
 	permissionMode?: string;
 	viewers?: Array<{
@@ -749,12 +755,29 @@ export function useNarratorsListWS(
 		listenerHandleRef.current = narratorWSManager.addListener(
 			{
 				narratorIds: narratorIds.length > 0 ? narratorIds : "*",
-				types: ["status_change", "title_updated", "permission_mode_changed", "presence_update"],
+				types: [
+					"status_change",
+					"substatus_change",
+					"title_updated",
+					"permission_mode_changed",
+					"presence_update",
+				],
 			},
 			(data) => {
 				const nId = data.narratorId as string | undefined;
 				if (data.type === "status_change") {
-					if (nId) onUpdateRef.current(nId, { type: "status", status: data.status as string });
+					if (nId)
+						onUpdateRef.current(nId, {
+							type: "status",
+							status: data.status as string,
+							substatus: data.substatus as string[] | undefined,
+						});
+				} else if (data.type === "substatus_change") {
+					if (nId)
+						onUpdateRef.current(nId, {
+							type: "status",
+							substatus: data.substatus as string[],
+						});
 				} else if (data.type === "title_updated") {
 					if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
 				} else if (data.type === "permission_mode_changed") {

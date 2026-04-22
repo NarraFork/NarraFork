@@ -72,6 +72,17 @@ class Gateway {
 	private localeCache = new Map<string, { locale: Locale; ts: number }>();
 	private static readonly LOCALE_CACHE_TTL = 60_000; // 60 seconds
 
+	// Map: platform message ID → { permission request ID, timestamp }.
+	// Used by platforms (e.g. QQ Bot) where quoted messages carry only the
+	// original message ID, not the full text containing [perm:xxx].
+	private permMessageIdMap = new Map<string, { requestId: string; ts: number }>();
+	private static readonly PERM_MSG_MAP_TTL = 600_000; // 10 minutes
+
+	// Cache: chatKey (platform:chatId:userId) → ordered narrator IDs from last /list or /search.
+	// Allows /switch <number> to pick by index instead of typing the full ID.
+	private listResultCache = new Map<string, { ids: string[]; ts: number }>();
+	private static readonly LIST_RESULT_CACHE_TTL = 300_000; // 5 minutes
+
 	// -----------------------------------------------------------------------
 	// Lifecycle
 	// -----------------------------------------------------------------------
@@ -596,6 +607,8 @@ class Gateway {
 			planMode: false,
 			isBackground: false,
 			isAskInPassing: false,
+			variant: "primary",
+			traits: chapterId ? [] : ["standalone"],
 			messageVersion: 0,
 			createdAt: now,
 			updatedAt: now,
@@ -695,6 +708,24 @@ class Gateway {
 	}
 
 	// -----------------------------------------------------------------------
+	// Permission message ID tracking (for platforms without text in quotes)
+	// -----------------------------------------------------------------------
+
+	private trackPermMessageId(platformMsgId: string, requestId: string): void {
+		this.permMessageIdMap.set(platformMsgId, { requestId, ts: Date.now() });
+
+		// Prune expired entries
+		if (this.permMessageIdMap.size > 200) {
+			const cutoff = Date.now() - Gateway.PERM_MSG_MAP_TTL;
+			for (const [id, entry] of this.permMessageIdMap) {
+				if (entry.ts < cutoff) {
+					this.permMessageIdMap.delete(id);
+				}
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
 	// Permission approval via quoted message
 	// -----------------------------------------------------------------------
 
@@ -729,11 +760,27 @@ class Gateway {
 
 	/**
 	 * Extract a permission requestId from the quoted (ref_msg) text in the raw message.
+	 * Supports:
+	 *   - WeChat: item_list[].ref_msg containing [perm:xxx] in text fields
+	 *   - QQ Bot: message_reference.message_id mapped via permMessageIdMap
+	 *   - Generic: [perm:xxx] tag in msg.text itself (fallback)
 	 * Returns the requestId if found, null otherwise.
 	 */
 	private extractRefPermissionId(msg: InboundMessage): string | null {
 		if (!msg.raw || typeof msg.raw !== "object") return null;
 		const raw = msg.raw as Record<string, unknown>;
+
+		// --- QQ Bot: message_reference.message_id lookup ---
+		const msgRef = raw.message_reference as Record<string, unknown> | undefined;
+		if (msgRef) {
+			const refMsgId = typeof msgRef.message_id === "string" ? msgRef.message_id : null;
+			if (refMsgId) {
+				const entry = this.permMessageIdMap.get(refMsgId);
+				if (entry) return entry.requestId;
+			}
+		}
+
+		// --- WeChat: item_list[].ref_msg text parsing ---
 		const itemList = (raw.item_list as unknown[]) ?? [];
 		for (const item of itemList) {
 			if (!item || typeof item !== "object") continue;
@@ -857,7 +904,7 @@ class Gateway {
 
 			// 2. Notify IM users whose recentTabs contain this narrator
 			//    (but it's NOT their currently-bound narrator)
-			await this.notifyRecentTabStatusChange(event.narratorId, event.status);
+			await this.notifyRecentTabStatusChange(event.narratorId, event.status, event.substatus);
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
@@ -937,7 +984,11 @@ class Gateway {
 					const summary = this.formatToolSummary(toolName, inputJson);
 					const text =
 						t("gateway.permissionRequest", locale, { toolName, summary }) + `\n[perm:${requestId}]`;
-					await adapter.send(mapping.chatId, text).catch(() => {});
+					// Use sendAndGetId to track the message ID for quote-reply approval
+					const result = await adapter.sendAndGetId(mapping.chatId, text).catch(() => null);
+					if (result?.messageId && requestId) {
+						this.trackPermMessageId(result.messageId, requestId);
+					}
 				}
 			}
 
@@ -1038,16 +1089,22 @@ class Gateway {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * Only notify for "interesting" transitions (idle = done, error, waiting).
+	 * Only notify for "interesting" transitions (idle+unread = done, idle+error, waiting).
 	 * Skip if the narrator is the user's currently-bound one (already handled
 	 * by deliverToIM / stream consumer).
 	 *
 	 * Optimized: uses an in-memory cache of recentTabs narrator IDs (TTL 60s)
 	 * to avoid repeated JSON parsing and DB queries on every status change.
 	 */
-	private async notifyRecentTabStatusChange(narratorId: string, status: string): Promise<void> {
+	private async notifyRecentTabStatusChange(
+		narratorId: string,
+		status: string,
+		substatus?: string[],
+	): Promise<void> {
 		// Only notify for meaningful status changes
-		if (status !== "idle" && status !== "error" && status !== "waiting") return;
+		const isUnread = status === "idle" && substatus?.includes("unread");
+		const isError = status === "idle" && substatus?.includes("error");
+		if (!isUnread && !isError && status !== "waiting") return;
 
 		// No adapters → nothing to send
 		if (this.adapters.size === 0) return;
@@ -1139,9 +1196,9 @@ class Gateway {
 		// Send notifications
 		const shortId = narratorId.slice(0, 8);
 		const title = narrator.title || "(untitled)";
-		const statusEmoji =
-			status === "idle" ? "✅" : status === "error" ? "❌" : status === "waiting" ? "⏳" : "ℹ️";
-		let message = `${statusEmoji} ${title} (${shortId}…) → ${status}`;
+		const statusEmoji = isUnread ? "✅" : isError ? "❌" : status === "waiting" ? "⏳" : "ℹ️";
+		const displayStatus = isUnread ? "done" : isError ? "error" : status;
+		let message = `${statusEmoji} ${title} (${shortId}…) → ${displayStatus}`;
 
 		// When waiting, append the pending permission request details so the user
 		// can quote-reply to approve/deny from any IM session.
@@ -1508,6 +1565,8 @@ class Gateway {
 
 		// Format output: group by workspace, show narrator/chapter tabs
 		const lines: string[] = [t("gateway.recentTabs", locale)];
+		const orderedNarratorIds: string[] = [];
+		let idx = 0;
 
 		for (const tab of tabs) {
 			const type = typeof tab.type === "string" ? tab.type : "";
@@ -1538,16 +1597,21 @@ class Gateway {
 				continue;
 			}
 
+			idx++;
+			orderedNarratorIds.push(narratorId);
 			const isActive = narratorId === activeNarratorId;
 			const marker = isActive ? "▸" : " ";
-			const shortId = narratorId.slice(0, 8);
 			const title = typeof tab.title === "string" && tab.title ? tab.title : "(untitled)";
 			const status =
 				statusMap.get(narratorId) ?? (typeof tab.status === "string" ? tab.status : "?");
 			const suffix = isActive ? t("gateway.currentSuffix", locale) : "";
 
-			lines.push(`${indent}${marker} ${shortId} — ${title} (${status})${suffix}`);
+			lines.push(`${indent}${marker} [${idx}] ${title} (${status})${suffix}`);
 		}
+
+		// Cache the ordered narrator IDs so /switch <number> works
+		const chatKey = `${msg.platform}:${msg.chatId}:${msg.userId}`;
+		this.listResultCache.set(chatKey, { ids: orderedNarratorIds, ts: Date.now() });
 
 		lines.push("", t("gateway.useSwitchHint", locale));
 		await adapter.send(msg.chatId, lines.join("\n"));
@@ -1581,11 +1645,18 @@ class Gateway {
 		}
 
 		const lines = [t("gateway.searchResults", locale, { query })];
-		for (const r of results) {
-			const shortId = r.id.slice(0, 8);
+		const orderedNarratorIds: string[] = [];
+		for (let i = 0; i < results.length; i++) {
+			const r = results[i];
 			const title = r.title || "(untitled)";
-			lines.push(` ${shortId} — ${title}`);
+			orderedNarratorIds.push(r.id);
+			lines.push(` [${i + 1}] ${title}`);
 		}
+
+		// Cache the ordered narrator IDs so /switch <number> works
+		const chatKey = `${msg.platform}:${msg.chatId}:${msg.userId}`;
+		this.listResultCache.set(chatKey, { ids: orderedNarratorIds, ts: Date.now() });
+
 		lines.push("", t("gateway.useSwitchHint", locale));
 
 		await adapter.send(msg.chatId, lines.join("\n"));
@@ -1606,7 +1677,28 @@ class Gateway {
 			return;
 		}
 
-		const trimmed = idPrefix.trim();
+		let trimmed = idPrefix.trim();
+
+		// Support numeric index from last /list or /search result
+		if (/^\d+$/.test(trimmed)) {
+			const idx = Number.parseInt(trimmed, 10);
+			const chatKey = `${msg.platform}:${msg.chatId}:${msg.userId}`;
+			const cached = this.listResultCache.get(chatKey);
+			if (cached && Date.now() - cached.ts < Gateway.LIST_RESULT_CACHE_TTL) {
+				if (idx >= 1 && idx <= cached.ids.length) {
+					trimmed = cached.ids[idx - 1];
+				} else {
+					await adapter.send(
+						msg.chatId,
+						t("gateway.switchIndexOutOfRange", locale, { max: cached.ids.length }),
+					);
+					return;
+				}
+			} else {
+				await adapter.send(msg.chatId, t("gateway.switchNoListCache", locale));
+				return;
+			}
+		}
 
 		// Support both full ID and short prefix (≥4 chars)
 		let narrator:

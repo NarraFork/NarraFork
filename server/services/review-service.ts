@@ -460,7 +460,7 @@ export const reviewService = {
 
 		// Get review's primary narrator
 		const reviewNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
 		});
 		if (!reviewNarrator) throw new ValidationError("Review has no narrator");
 
@@ -468,7 +468,7 @@ export const reviewService = {
 		const sourceNarrator = await db.query.narrators.findFirst({
 			where: and(
 				eq(narrators.chapterId, chapter.reviewSourceChapterId),
-				eq(narrators.type, "primary"),
+				eq(narrators.variant, "primary"),
 			),
 		});
 		if (!sourceNarrator) throw new ValidationError("Source chapter has no narrator");
@@ -485,14 +485,19 @@ export const reviewService = {
 			.update(narrators)
 			.set({
 				type: "subagent",
+				variant: "subagent:review",
 				subagentType: "review",
 				parentNarratorId: sourceNarrator.id,
 				chapterId: chapter.reviewSourceChapterId,
 				cwd: sourceChapter?.worktreePath ?? sourceNarrator.cwd,
-				status: "done",
 				updatedAt: now,
 			})
 			.where(eq(narrators.id, reviewNarrator.id));
+
+		// Use updateStatus to ensure event bus + WS broadcast
+		await narratorService.updateStatus(reviewNarrator.id, "idle", {
+			substatus: ["unread"],
+		});
 
 		// Clean up review chapter's git resources
 		const project = await db.query.projects.findFirst({
@@ -577,7 +582,7 @@ export const reviewService = {
 
 		// Sync in-memory narrator cache so the agent loop stops treating this as a review
 		const reviewNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
 			columns: { id: true },
 		});
 		if (reviewNarrator) {

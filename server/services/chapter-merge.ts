@@ -289,7 +289,7 @@ export const chapterMerge = {
 		}
 
 		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.variant, "primary")),
 		});
 		if (!primaryNarrator) {
 			return { resolved: false, error: "Target chapter has no primary narrator" };

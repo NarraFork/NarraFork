@@ -504,6 +504,8 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			return basename(fp);
 		}
 		case "bash": {
+			const desc = extractField(input, "description");
+			if (desc) return desc.length > 80 ? `${desc.slice(0, 77)}...` : desc;
 			const cmd = extractField(input, "command");
 			if (!cmd) return toolName;
 			return cmd.length > 80 ? `${cmd.slice(0, 77)}...` : cmd;
@@ -2033,7 +2035,7 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 							variant="light"
 							color={clipboard.copied ? "teal" : "gray"}
 							leftSection={clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-							onClick={() => clipboard.copy(downloadUrl)}
+							onClick={() => clipboard.copy(`${window.location.origin}${downloadUrl}`)}
 						>
 							{clipboard.copied ? t("shareFile.linkCopied") : t("shareFile.copyLink")}
 						</Button>
@@ -2728,76 +2730,29 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-// --- Streaming input detail: renders live content from incomplete JSON ---
-
-/** Unescape common JSON string escapes */
-function unescapeJson(s: string): string {
-	return s
-		.replace(/\\n/g, "\n")
-		.replace(/\\t/g, "\t")
-		.replace(/\\r/g, "\r")
-		.replace(/\\"/g, '"')
-		.replace(/\\\\/g, "\\");
-}
-
-/**
- * Find the unescaped closing quote in a JSON string value.
- * Skips over escaped characters (e.g. `\"`, `\\`).
- * Returns the index of the closing `"`, or -1 if not found.
- */
-function findClosingQuote(s: string): number {
-	for (let i = 0; i < s.length; i++) {
-		if (s[i] === "\\") {
-			i++; // skip escaped character
-			continue;
-		}
-		if (s[i] === '"') return i;
-	}
-	return -1;
-}
-
-/**
- * Extract a string field value from incomplete streaming JSON.
- * The value may not have a closing quote (still being written).
- */
-function extractRawField(raw: string, fieldName: string): string | null {
-	const re = new RegExp(`"${fieldName}"\\s*:\\s*"`);
-	const m = raw.match(re);
-	if (!m || m.index == null) return null;
-	const start = m.index + m[0].length;
-	const val = raw.slice(start);
-	// Find the real closing quote (skipping escaped quotes)
-	const closeQuote = findClosingQuote(val);
-	if (closeQuote !== -1) {
-		return unescapeJson(val.slice(0, closeQuote));
-	}
-	// No closing quote yet — value is still streaming, return what we have
-	return unescapeJson(val);
-}
+// --- Streaming input detail: renders live content from structured fields ---
 
 /**
  * Renders a live preview of tool input as it streams in.
- *
- * Strategy: wait until the header-relevant fields have been extracted by the
- * backend (signalled via `_streamingFilePath` / `_streamingFields`) before
- * rendering the main content body.  This ensures the ToolHeader summary is
- * already populated when the detail area first appears.
+ * Uses structured fields extracted by the backend — no raw JSON parsing.
  */
 const StreamingInputDetail = memo(function StreamingInputDetail({
 	toolCall,
 }: {
 	toolCall: ToolCallData;
 }) {
-	const raw = toolCall.inputJson?._streamingInputRaw as string | undefined;
+	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
+	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
+	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
 	const boxRef = useRef<HTMLDivElement>(null);
 	const cat = getCategory(toolCall.toolName);
-	const filePath = toolCall.inputJson?._streamingFilePath as string | undefined;
-	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
+	const filePath =
+		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
 
 	// Auto-scroll to bottom as content streams in
 	useEffect(() => {
-		if (!raw || !boxRef.current) return;
+		if (!sfValue || !boxRef.current) return;
 		const raf = requestAnimationFrame(() => {
 			const el = boxRef.current;
 			if (!el) return;
@@ -2807,22 +2762,20 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 			}
 		});
 		return () => cancelAnimationFrame(raf);
-	}, [raw]);
+	}, [sfValue]);
 
-	if (!raw || raw.length < 3) return null;
-
-	// Write/Edit tools: wait for backend to extract file_path before showing content
+	// Write/Edit tools: show content/new_string with syntax highlighting
 	if (cat === "file") {
 		if (!filePath) return null;
-		const content = extractRawField(raw, "content") ?? extractRawField(raw, "new_string") ?? null;
-		if (!content) return null;
+		const isContentField = sfName === "content" || sfName === "new_string";
+		if (!isContentField || !sfValue) return null;
 		return (
 			<Box mt="xs" ref={boxRef}>
 				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
 					{filePath}
 				</Text>
 				<ContentViewer
-					content={content}
+					content={sfValue}
 					style={codeStyle}
 					title={basename(filePath)}
 					language={lang}
@@ -2832,9 +2785,9 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Bash tools: command is the header summary itself — show once extractable
+	// Bash tools: show command with terminal styling
 	if (cat === "bash") {
-		const cmd = extractRawField(raw, "command");
+		const cmd = sfName === "command" ? sfValue : fields?.command;
 		if (!cmd) return null;
 		return (
 			<Box mt="xs" ref={boxRef}>
@@ -2854,25 +2807,25 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Search tools: pattern is the header summary — show once extractable
+	// Search tools: show pattern
 	if (cat === "search") {
-		const pattern = extractRawField(raw, "pattern");
+		const pattern = fields?.pattern;
 		if (!pattern) return null;
-		const path = extractRawField(raw, "path");
+		const searchPath = fields?.path ?? fields?.glob;
 		return (
 			<Box mt="xs" ref={boxRef}>
 				<Code block style={{ ...codeStyle, maxHeight: 60 }}>
 					{pattern}
-					{path ? ` in ${path}` : ""}
+					{searchPath ? ` in ${searchPath}` : ""}
 				</Code>
 			</Box>
 		);
 	}
 
-	// Agent/Task tools: wait for description field (header summary) before showing prompt
+	// Agent/Task tools: show prompt
 	if (cat === "agent") {
 		if (!fields?.description) return null;
-		const prompt = extractRawField(raw, "prompt");
+		const prompt = sfName === "prompt" ? sfValue : null;
 		if (!prompt) return null;
 		return (
 			<Box mt="xs" ref={boxRef}>
@@ -2887,9 +2840,9 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Read tools: file_path is the header summary — show once extractable
+	// Read tools: show file_path
 	if (cat === "read") {
-		const fp = extractRawField(raw, "file_path");
+		const fp = filePath ?? fields?.file_path;
 		if (!fp) return null;
 		return (
 			<Box mt="xs" ref={boxRef}>
@@ -2900,15 +2853,18 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Generic fallback: wait for enough data to be meaningful
-	if (raw.length < 50) return null;
-	return (
-		<Box mt="xs" ref={boxRef}>
-			<Code block style={{ ...codeStyle, maxHeight: 120 }}>
-				{raw}
-			</Code>
-		</Box>
-	);
+	// Plan mode: show plan content
+	if (cat === "plan") {
+		const plan = sfName === "plan" ? sfValue : null;
+		if (!plan) return null;
+		return (
+			<Box mt="xs" ref={boxRef}>
+				<ContentViewer content={plan} style={codeStyle} title="Plan" markdown streaming />
+			</Box>
+		);
+	}
+
+	return null;
 });
 
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
@@ -3660,7 +3616,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 				? "tool-running-shimmer"
 				: undefined;
 
-	const hasStreamingRaw = isStreaming && !!toolCall.inputJson?._streamingInputRaw;
+	const hasStreamingDetail =
+		isStreaming &&
+		!!(toolCall.inputJson?._streamingFieldValue || toolCall.inputJson?._streamingFields);
 
 	const cardContent = (
 		<NestedBlockCtx.Provider value={tcBlockId ?? null}>
@@ -3671,7 +3629,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				narratorId={narratorId}
 			/>
 			{isStreaming ? (
-				hasStreamingRaw && <StreamingInputDetail toolCall={toolCall} />
+				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} />
 			) : (
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />

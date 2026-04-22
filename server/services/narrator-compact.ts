@@ -162,7 +162,9 @@ async function doRunCustomCompact(
 		}
 		await narratorService.clearPruneBoundary(narratorId);
 
-		const transitioned = await narratorService.compareAndSetStatus(narratorId, "done", "idle");
+		const transitioned = await narratorService.compareAndSetStatus(narratorId, "idle", "idle", {
+			substatus: [],
+		});
 		if (!transitioned) {
 			logger.info("Skipping idle transition after compact — narrator already moved on", {
 				narratorId,
@@ -203,7 +205,10 @@ async function doRunCustomCompact(
 		}
 
 		await narratorService.clearPruneBoundary(narratorId).catch(() => {});
-		await narratorService.updateStatus(narratorId, "error", `Compact failed: ${errorMsg}`);
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: `Compact failed: ${errorMsg}`,
+		});
 		const active = activeNarrators.get(narratorId);
 		if (active?.alive) {
 			active.abortController.abort();

@@ -19,6 +19,7 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -772,7 +773,7 @@ export async function handlePermission(
 			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
-			type: true,
+			variant: true,
 			parentNarratorId: true,
 		},
 	});
@@ -884,7 +885,7 @@ export async function handlePermission(
 
 	// Load enabled whitelist/blacklist directories — three-layer merge
 	const dirOwnerId =
-		narrator?.type === "subagent" && narrator.parentNarratorId
+		narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId
 			? narrator.parentNarratorId
 			: narratorId;
 
@@ -1366,7 +1367,7 @@ export async function handlePermission(
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
 			if (broadcastTargetId && broadcastTargetId !== narratorId) {
-				await narratorService.updateStatus(broadcastTargetId, "thinking");
+				await narratorService.updateStatus(broadcastTargetId, "working");
 			}
 			resolve({ behavior: "deny", message: "Narrator aborted" });
 		};
@@ -1455,9 +1456,9 @@ export async function resolvePermission(
 	});
 
 	try {
-		await narratorService.updateStatus(pending.narratorId, "thinking");
+		await narratorService.updateStatus(pending.narratorId, "working");
 		if (pending.broadcastTargetId !== pending.narratorId) {
-			await narratorService.updateStatus(pending.broadcastTargetId, "thinking");
+			await narratorService.updateStatus(pending.broadcastTargetId, "working");
 		}
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
@@ -1701,7 +1702,7 @@ async function routePermissionToOverseer(
 			message: userMsg,
 		});
 
-		await narratorService.updateStatus(overseer.narratorId, "thinking");
+		await narratorService.updateStatus(overseer.narratorId, "working");
 
 		broadcastToNarrator(broadcastTargetId, {
 			type: "overseer_reviewing",
@@ -1717,7 +1718,10 @@ async function routePermissionToOverseer(
 				overseerId: overseer.id,
 				error: String(err),
 			});
-			await narratorService.updateStatus(overseer.narratorId, "error", String(err));
+			await narratorService.updateStatus(overseer.narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
 		});
 	} catch (err) {
 		logger.warn("Failed to route permission to overseer", {

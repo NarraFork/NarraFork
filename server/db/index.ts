@@ -60,6 +60,28 @@ try {
 // Patch missing columns for databases created by older versions
 ensureColumns(sqlite);
 
+// Migrate old narrator status values to new status + substatus model
+{
+	const migrations: [string, string, string][] = [
+		// [oldStatus, newStatus, substatusJson]
+		["thinking", "working", "[]"],
+		["done", "idle", '["unread"]'],
+		["error", "idle", '["error"]'],
+		["interrupted", "idle", '["interrupted"]'],
+		["suspended", "idle", '["suspended"]'],
+	];
+	for (const [oldStatus, newStatus, substatusJson] of migrations) {
+		const result = sqlite
+			.prepare("UPDATE narrators SET status = ?, substatus = ? WHERE status = ?")
+			.run(newStatus, substatusJson, oldStatus);
+		if (result.changes > 0) {
+			logger.info(
+				`Migrated ${result.changes} narrators from status "${oldStatus}" to "${newStatus}" + substatus ${substatusJson}`,
+			);
+		}
+	}
+}
+
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite);
 

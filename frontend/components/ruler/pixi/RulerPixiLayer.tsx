@@ -147,10 +147,10 @@ const CARD_TOP_OFFSET = 2;
 
 function narratorStatusColor(theme: PixiTheme, status: string): number {
 	switch (status) {
-		case "running":
-			return theme.narratorRunning;
-		case "done":
-			return theme.narratorDone;
+		case "working":
+			return theme.narratorWorking;
+		case "unread":
+			return theme.narratorUnread;
 		case "error":
 			return theme.narratorError;
 		case "waiting":

@@ -54,28 +54,47 @@ export const taskOutputTool: ToolDefinition = {
 		const block = raw.block ?? raw.wait;
 		const timeout = raw.timeout ?? raw.timeout_ms;
 
-		const { getBackgroundTaskStatus, waitForBackgroundTask } = await import(
-			"@server/services/narrator-subagent"
-		);
-
 		// block defaults to true (matching rawJsonSchema default)
 		const shouldWait = block !== false;
 
 		try {
+			// Try narrator-subagent background tasks first
+			const { getBackgroundTaskStatus, waitForBackgroundTask } = await import(
+				"@server/services/narrator-subagent"
+			);
+
 			if (shouldWait) {
 				const result = await waitForBackgroundTask(task_id, timeout ?? 30000);
-				return { output: formatResult(task_id, result.status, result.result) };
+				// If the narrator-subagent system returned a real status, use it
+				if (result.status !== "unknown") {
+					return { output: formatResult(task_id, result.status, result.result) };
+				}
+			} else {
+				const status = await getBackgroundTaskStatus(task_id);
+				if (status) {
+					return { output: formatResult(task_id, status.status, status.result) };
+				}
 			}
 
-			const status = await getBackgroundTaskStatus(task_id);
-			if (!status) {
-				return {
-					output: `Error: "${task_id}" is not a valid background task ID.`,
-					isError: true,
-				};
+			// Fall back to bash background tasks
+			const { getBashBackgroundStatus, waitForBashBackground } = await import("./bash");
+
+			if (shouldWait) {
+				const result = await waitForBashBackground(task_id, timeout ?? 30000);
+				if (result.status !== "unknown") {
+					return { output: formatResult(task_id, result.status, result.result) };
+				}
+			} else {
+				const status = getBashBackgroundStatus(task_id);
+				if (status) {
+					return { output: formatResult(task_id, status.status, status.result) };
+				}
 			}
 
-			return { output: formatResult(task_id, status.status, status.result) };
+			return {
+				output: `Error: "${task_id}" is not a valid background task ID.`,
+				isError: true,
+			};
 		} catch (err) {
 			return {
 				output: `TaskOutput error: ${err instanceof Error ? err.message : String(err)}`,

@@ -9,6 +9,13 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	getSubagentType,
+	hasTrait,
+	isSubagentVariant,
+	parseSubstatus,
+	parseTraits,
+} from "../lib/narrator-utils";
 import { getSubagentPrompt, type Locale, type SubagentType } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
@@ -275,7 +282,8 @@ async function finalizeSubagent(
 	await db
 		.update(narrators)
 		.set({
-			status: hasError ? "error" : "done",
+			status: "idle",
+			substatus: JSON.stringify(hasError ? ["error"] : ["unread"]),
 			errorMessage: hasError ? errorText : null,
 			updatedAt: now,
 		})
@@ -1036,7 +1044,8 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 		.set({
 			backgroundStatus: "cancelled",
 			backgroundCompletedAt: now,
-			status: "interrupted",
+			status: "idle",
+			substatus: JSON.stringify(["interrupted"]),
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, taskNarratorId));
@@ -1072,7 +1081,7 @@ export async function getBackgroundTaskStatus(taskNarratorId: string): Promise<{
 	isRunning: boolean;
 } | null> {
 	const narrator = await narratorService.getById(taskNarratorId);
-	if (!narrator.isBackground) return null;
+	if (!hasTrait(parseTraits(narrator.traits), "background")) return null;
 
 	return {
 		status: narrator.backgroundStatus ?? "unknown",
@@ -1249,9 +1258,16 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 
 		// Mark narrator and tool_call as background
 		const now = new Date().toISOString();
+		const subNarrator = await narratorService.getById(subagentId);
+		const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
 		await db
 			.update(narrators)
-			.set({ isBackground: true, backgroundStatus: "running", updatedAt: now })
+			.set({
+				isBackground: true,
+				backgroundStatus: "running",
+				traits: updatedTraits,
+				updatedAt: now,
+			})
 			.where(eq(narrators.id, subagentId));
 		eventBus.emit({
 			type: "narrator:background_task_started",
@@ -1361,7 +1377,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			// Detect subagent-only interrupt (not parent abort)
 			if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
 				// --- Suspend: wait for user to continue operating the subagent ---
-				await narratorService.updateStatus(subagentId, "suspended");
+				await narratorService.updateStatus(subagentId, "idle", { substatus: ["suspended"] });
 				broadcastToNarrator(parentNarratorId, {
 					type: "subagent_suspended",
 					narratorId: parentNarratorId,
@@ -1371,7 +1387,8 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 				broadcastToNarrator(subagentId, {
 					type: "status_change",
 					narratorId: subagentId,
-					status: "suspended",
+					status: "idle",
+					substatus: ["suspended"],
 				});
 
 				// Create a Promise that will be resolved when the subagent
@@ -1472,17 +1489,23 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 
 	// 1. Validate original subagent
 	const original = await narratorService.getById(subagentId);
-	if (original.type !== "subagent") {
+	if (!isSubagentVariant(original.variant)) {
 		throw new ValidationError("Target narrator is not a subagent");
 	}
 	if (original.parentNarratorId !== parentNarratorId) {
 		throw new ValidationError("Subagent does not belong to the calling narrator");
 	}
-	if (original.status !== "done" && original.status !== "error") {
+	const origSubstatus = parseSubstatus(original.substatus);
+	if (
+		!(
+			original.status === "idle" &&
+			(origSubstatus.includes("unread") || origSubstatus.includes("error"))
+		)
+	) {
 		throw new ValidationError(`Cannot continue subagent in status "${original.status}"`);
 	}
 
-	const subagentType = original.subagentType ?? "general";
+	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
 	const model = original.model ?? settings.agent.defaultModel;
 	const provider = resolveProvider(model);
 	const cwd = original.cwd ?? ".";

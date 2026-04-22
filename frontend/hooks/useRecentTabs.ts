@@ -22,6 +22,7 @@ export interface RecentTab {
 	title: string;
 	subtitle?: string;
 	status?: string;
+	substatus?: string[];
 	lastVisitedAt: number;
 	/** Whether this tab is pinned to the top */
 	pinned?: boolean;
@@ -258,7 +259,14 @@ export function useRecentTabs() {
 			} else {
 				// inactive_narrators — keep projects + active tabs + kept tab
 				// Workspace-aware: keep entire workspace if any child is active
-				const ACTIVE = new Set(["thinking", "waiting", "done"]);
+				const ACTIVE_STATUSES = new Set(["working", "waiting"]);
+				const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
+				const isTabActive = (tab: RecentTab) => {
+					if (ACTIVE_STATUSES.has(tab.status ?? "")) return true;
+					if (tab.status === "idle" && tab.substatus?.some((s) => ATTENTION_SUBSTATUS.has(s)))
+						return true;
+					return false;
+				};
 
 				// Group children by workspaceId
 				const childrenByWs = new Map<string, RecentTab[]>();
@@ -275,7 +283,7 @@ export function useRecentTabs() {
 				for (const tab of prev) {
 					if (tab.type === "workspace") {
 						const children = childrenByWs.get(tab.id) ?? [];
-						if (children.some((c) => ACTIVE.has(c.status ?? ""))) {
+						if (children.some(isTabActive)) {
 							activeWorkspaces.add(tab.id);
 						}
 					}
@@ -291,7 +299,7 @@ export function useRecentTabs() {
 					} else if (tab.workspaceId) {
 						if (activeWorkspaces.has(tab.workspaceId)) kept.push(tab);
 						else evictTabCache(qc, tab);
-					} else if (ACTIVE.has(tab.status ?? "")) {
+					} else if (isTabActive(tab)) {
 						kept.push(tab);
 					} else {
 						evictTabCache(qc, tab);

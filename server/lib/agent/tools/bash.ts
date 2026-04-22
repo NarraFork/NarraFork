@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
+import { generateShortId } from "../../id";
 import { getHome } from "../../platform";
 import { loadSettings } from "../../settings";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
@@ -11,6 +12,8 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 86_400_000;
+const BACKGROUND_TIMEOUT_MS = 1_800_000; // 30 minutes max for background tasks
+const BACKGROUND_MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10 MB max output for background tasks
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
@@ -40,6 +43,7 @@ const runningBashProcesses = hotSafe(
  * (especially on Windows where child processes can outlive the parent).
  */
 export async function killAllBashProcesses(): Promise<void> {
+	// Kill foreground bash processes
 	const entries = [...runningBashProcesses.entries()];
 	for (const [id, entry] of entries) {
 		try {
@@ -51,6 +55,121 @@ export async function killAllBashProcesses(): Promise<void> {
 		}
 		runningBashProcesses.delete(id);
 	}
+	// Kill background bash tasks
+	for (const [id, task] of backgroundBashTasks) {
+		if (task.status === "running") {
+			try {
+				task.abort.abort("Server shutdown");
+				task.kill?.();
+				task.status = "cancelled";
+				task.completedAt = Date.now();
+			} catch {
+				// best effort
+			}
+		}
+		backgroundBashTasks.delete(id);
+	}
+}
+
+// --- Background bash tasks ---
+// Lightweight in-memory store for background bash tasks.
+// Unlike subagent background tasks (which use the narrators table), bash background
+// tasks are ephemeral — they only live as long as the server process.
+// Completed tasks are auto-cleaned after BACKGROUND_TASK_RETAIN_MS.
+
+const BACKGROUND_TASK_RETAIN_MS = 30 * 60_000; // 30 minutes after completion
+
+interface BackgroundBashTask {
+	id: string;
+	command: string;
+	status: "running" | "completed" | "failed" | "cancelled";
+	output: string;
+	/** Tracks output byte length to enforce BACKGROUND_MAX_OUTPUT_BYTES */
+	outputBytes: number;
+	outputTruncated: boolean;
+	exitCode: number | null;
+	startedAt: number;
+	completedAt: number | null;
+	abort: AbortController;
+	kill: (() => void) | null;
+}
+
+const backgroundBashTasks = hotSafe(
+	"narrafork:backgroundBashTasks",
+	() => new Map<string, BackgroundBashTask>(),
+);
+
+/** Prune completed background tasks older than BACKGROUND_TASK_RETAIN_MS. */
+function pruneCompletedBashTasks(): void {
+	if (backgroundBashTasks.size < 10) return;
+	const cutoff = Date.now() - BACKGROUND_TASK_RETAIN_MS;
+	for (const [id, task] of backgroundBashTasks) {
+		if (task.status !== "running" && task.completedAt && task.completedAt < cutoff) {
+			backgroundBashTasks.delete(id);
+		}
+	}
+}
+
+/** Get the status of a background bash task. Returns null if not found. */
+export function getBashBackgroundStatus(taskId: string): {
+	status: string;
+	result: string | null;
+	completedAt: string | null;
+	isRunning: boolean;
+} | null {
+	pruneCompletedBashTasks();
+	const task = backgroundBashTasks.get(taskId);
+	if (!task) return null;
+	return {
+		status: task.status,
+		result: task.output || null,
+		completedAt: task.completedAt ? new Date(task.completedAt).toISOString() : null,
+		isRunning: task.status === "running",
+	};
+}
+
+/** Wait for a background bash task to complete (with timeout). */
+export function waitForBashBackground(
+	taskId: string,
+	timeoutMs = 30000,
+): Promise<{ status: string; result: string | null }> {
+	return new Promise((resolve) => {
+		const task = backgroundBashTasks.get(taskId);
+		if (!task) {
+			resolve({ status: "unknown", result: null });
+			return;
+		}
+		if (task.status !== "running") {
+			resolve({ status: task.status, result: task.output || null });
+			return;
+		}
+
+		const pollInterval = 500;
+		let elapsed = 0;
+		const timer = setInterval(() => {
+			elapsed += pollInterval;
+			const t = backgroundBashTasks.get(taskId);
+			if (!t || t.status !== "running" || elapsed >= timeoutMs) {
+				clearInterval(timer);
+				resolve({
+					status: t?.status ?? "unknown",
+					result: t?.output || null,
+				});
+			}
+		}, pollInterval);
+	});
+}
+
+/** Cancel a running background bash task. Returns true if cancelled. */
+export function cancelBashBackground(taskId: string): boolean {
+	const task = backgroundBashTasks.get(taskId);
+	if (!task || task.status !== "running") return false;
+
+	task.abort.abort("Cancelled by user");
+	task.kill?.();
+	task.status = "cancelled";
+	task.completedAt = Date.now();
+	return true;
 }
 
 /**
@@ -92,6 +211,12 @@ export const bashTool: ToolDefinition = {
 			timeout: {
 				description: "Optional timeout in milliseconds (max 600000)",
 				type: "number",
+			},
+			workdir: {
+				description:
+					"Working directory for the command. Defaults to the Current Working Directory from the system prompt — " +
+					"do NOT cd to it manually. Use this parameter only when you need a *different* directory.",
+				type: "string",
 			},
 			description: {
 				description:
@@ -142,11 +267,14 @@ export const bashTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { command, timeout, workdir, description } = args as {
+		const { command, timeout, workdir, description, run_in_background } = args as {
 			command: string;
 			timeout?: number;
 			workdir?: string;
 			description?: string;
+			run_in_background?: boolean;
+			dangerouslyDisableSandbox?: boolean;
+			// dangerouslyDisableSandbox: accepted for schema compat but no sandbox to disable
 		};
 		const timeoutMs = Math.min(Math.max(timeout ?? DEFAULT_TIMEOUT_MS, 0), MAX_TIMEOUT_MS);
 		const cwd = workdir ? path.resolve(ctx.cwd, workdir) : ctx.cwd;
@@ -159,6 +287,17 @@ export const bashTool: ToolDefinition = {
 				fatal: true,
 				title,
 			};
+		}
+
+		// --- Background mode ---
+		if (run_in_background) {
+			// For background tasks, use BACKGROUND_TIMEOUT_MS unless the user explicitly
+			// provided a shorter timeout. The `timeout` arg being undefined means "use default".
+			const bgTimeout =
+				timeout != null
+					? Math.min(Math.max(timeout, 0), BACKGROUND_TIMEOUT_MS)
+					: BACKGROUND_TIMEOUT_MS;
+			return runInBackground(command, cwd, bgTimeout, title, ctx);
 		}
 
 		try {
@@ -396,3 +535,172 @@ export const bashTool: ToolDefinition = {
 		}
 	},
 };
+
+// --- Background execution helper ---
+
+import type { ToolContext } from "../types";
+
+async function runInBackground(
+	command: string,
+	cwd: string,
+	timeoutMs: number,
+	title: string,
+	_ctx: ToolContext,
+): Promise<ToolResult> {
+	const taskId = `bash_${generateShortId()}`;
+	const bgAbort = new AbortController();
+	const task: BackgroundBashTask = {
+		id: taskId,
+		command,
+		status: "running",
+		output: "",
+		outputBytes: 0,
+		outputTruncated: false,
+		exitCode: null,
+		startedAt: Date.now(),
+		completedAt: null,
+		abort: bgAbort,
+		kill: null,
+	};
+	backgroundBashTasks.set(taskId, task);
+
+	// Fire-and-forget: spawn the process and collect output asynchronously
+	(async () => {
+		try {
+			const shellInfo = detectShell();
+			const isWin = process.platform === "win32";
+			const freshEnv = loadSettings().agent.freshShellEnv;
+
+			let env: Record<string, string | undefined>;
+			if (freshEnv) {
+				env = buildMinimalEnv(shellInfo.extraEnv);
+			} else {
+				env = {
+					...process.env,
+					HOME: getHome(),
+					...shellInfo.extraEnv,
+				};
+				if (isWin && !env.PATH && process.env.PATH) {
+					env.PATH = process.env.PATH;
+				}
+			}
+
+			let spawnArgs: [string, string[], object];
+			if (shellInfo.loginWrap) {
+				spawnArgs = [
+					shellInfo.path,
+					["--login", "-c", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				];
+			} else if (shellInfo.type === "powershell") {
+				const psArgs = freshEnv
+					? ["-NonInteractive", "-Command", command]
+					: ["-NoProfile", "-NonInteractive", "-Command", command];
+				spawnArgs = [
+					shellInfo.path,
+					psArgs,
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
+				];
+			} else if (freshEnv) {
+				spawnArgs = [
+					shellInfo.path,
+					["-l", "-c", command],
+					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
+				];
+			} else {
+				spawnArgs = [
+					command,
+					[],
+					{
+						shell: shellInfo.path,
+						cwd,
+						env,
+						stdio: ["ignore", "pipe", "pipe"],
+						detached: !isWin,
+					},
+				];
+			}
+
+			const proc = spawn(...spawnArgs);
+			let exited = false;
+			const exitedFn = () => exited;
+			const killFn = () => killTree(proc, { exited: exitedFn });
+			task.kill = () => void killFn();
+
+			const appendOutput = (chunk: Buffer) => {
+				if (task.outputTruncated) return;
+				const str = chunk.toString();
+				task.outputBytes += chunk.byteLength;
+				if (task.outputBytes > BACKGROUND_MAX_OUTPUT_BYTES) {
+					task.output += str.slice(0, 200);
+					task.output += `\n\n<bash_metadata>\nOutput truncated at ${(BACKGROUND_MAX_OUTPUT_BYTES / 1024 / 1024).toFixed(0)}MB limit\n</bash_metadata>`;
+					task.outputTruncated = true;
+					return;
+				}
+				task.output += str;
+			};
+			proc.stdout?.on("data", appendOutput);
+			proc.stderr?.on("data", appendOutput);
+
+			const exitPromise = new Promise<void>((resolve, reject) => {
+				if (proc.exitCode !== null) {
+					exited = true;
+					resolve();
+					return;
+				}
+				proc.once("exit", () => {
+					exited = true;
+					resolve();
+				});
+				proc.once("error", (err) => {
+					exited = true;
+					reject(err);
+				});
+			});
+
+			// Abort handler (from cancelBashBackground)
+			const onAbort = () => {
+				void killFn();
+			};
+			bgAbort.signal.addEventListener("abort", onAbort, { once: true });
+
+			// Timeout
+			const timer = setTimeout(() => {
+				task.output += "\n\n<bash_metadata>\nBackground command timed out\n</bash_metadata>";
+				void killFn();
+			}, timeoutMs);
+
+			try {
+				await exitPromise;
+			} finally {
+				clearTimeout(timer);
+				bgAbort.signal.removeEventListener("abort", onAbort);
+			}
+
+			task.exitCode = proc.exitCode ?? 1;
+			// Don't overwrite status if already cancelled by cancelBashBackground()
+			if (task.status === "running") {
+				task.status = task.exitCode === 0 ? "completed" : "failed";
+			}
+			task.completedAt ??= Date.now();
+
+			if (task.exitCode !== 0) {
+				task.output += `\n[exit code: ${task.exitCode}]`;
+			}
+		} catch (err) {
+			if (task.status === "running") {
+				task.status = "failed";
+			}
+			task.output += `\nError: ${err instanceof Error ? err.message : String(err)}`;
+			task.completedAt ??= Date.now();
+		}
+	})();
+
+	return {
+		output:
+			`<background_task_id>${taskId}</background_task_id>\n\n` +
+			`Background bash task started: ${title}\n` +
+			"Use TaskOutput with this ID to check status or get results.",
+		title,
+	};
+}

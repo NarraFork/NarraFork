@@ -4,6 +4,7 @@ import { db, sqlite } from "../db";
 import { narrators, userPreferences, workspaces } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { parseSubstatus } from "../lib/narrator-utils";
 import {
 	clearRecentTabsSchema,
 	moveRecentTabSchema,
@@ -632,7 +633,10 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 		}
 		migrateTabTypes(tabs);
 
-		const ACTIVE_STATUSES = new Set(["thinking", "waiting", "done"]);
+		const ACTIVE_STATUSES = new Set(["working", "waiting"]);
+		// Substatus tags that indicate the narrator still needs attention
+		// (even though its main status is "idle")
+		const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
 
 		if (scope === "projects") {
 			filtered = tabs.filter((t) => t.type !== "project" || isKept(t));
@@ -646,14 +650,33 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 				.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
 				.filter(Boolean);
 
-			const statusMap = new Map<string, string>();
+			const statusMap = new Map<string, { status: string; substatus: string[] }>();
 			if (narratorIds.length > 0) {
 				const rows = await db
-					.select({ id: narrators.id, status: narrators.status })
+					.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
 					.from(narrators)
 					.where(inArray(narrators.id, narratorIds));
-				for (const r of rows) statusMap.set(r.id, r.status);
+				for (const r of rows) {
+					const sub = parseSubstatus(r.substatus);
+					statusMap.set(r.id, { status: r.status, substatus: sub });
+				}
 			}
+
+			/** Check if a narrator should be considered "active" (not cleaned up). */
+			const isNarratorActive = (nId: string | undefined): boolean => {
+				if (!nId) return false;
+				const info = statusMap.get(nId);
+				if (!info) return false;
+				if (ACTIVE_STATUSES.has(info.status)) return true;
+				// idle + unread/error → still needs attention
+				if (
+					info.status === "idle" &&
+					info.substatus.some((s: string) => ATTENTION_SUBSTATUS.has(s))
+				) {
+					return true;
+				}
+				return false;
+			};
 
 			// Group children by workspaceId
 			const childrenByWs = new Map<string, Record<string, unknown>[]>();
@@ -677,8 +700,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 				const hasActive = children.some((child) => {
 					const nId =
 						child.type === "narrator" ? (child.id as string) : (child.narratorId as string);
-					const status = nId ? statusMap.get(nId) : undefined;
-					return status != null && ACTIVE_STATUSES.has(status);
+					return isNarratorActive(nId);
 				});
 				if (hasActive) activeWorkspaces.add(wsId);
 			}
@@ -703,10 +725,9 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 				if (wsId) {
 					return activeWorkspaces.has(wsId);
 				}
-				// Non-workspace tab — keep if active
+				// Non-workspace tab — keep if active or needs attention
 				const nId = t.type === "narrator" ? (t.id as string) : (t.narratorId as string);
-				const status = nId ? statusMap.get(nId) : undefined;
-				return status != null && ACTIVE_STATUSES.has(status);
+				return isNarratorActive(nId);
 			});
 
 			// Dissolve workspace DB records for fully-idle workspaces

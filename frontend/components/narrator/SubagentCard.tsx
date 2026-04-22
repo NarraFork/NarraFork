@@ -33,7 +33,7 @@ import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
-import { ReasoningBlock } from "./MessageBubble";
+
 import {
 	type MessageContextMenuActions,
 	MessageContextMenuCtx,
@@ -60,6 +60,7 @@ import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeig
 /** Lightweight shape of the subagent narrator data from query cache */
 interface SubagentNarratorData {
 	status?: string;
+	substatus?: string | string[];
 	todosJson?: { id?: string; content?: string; status?: string; activeForm?: string }[] | null;
 	/** Client-only field injected by onSubagentWarning, cleared by onSubagentConclusionUpdated */
 	_retryInfo?: {
@@ -258,22 +259,6 @@ export const SubagentCard = memo(
 			}
 		}
 
-		// Collect reasoning/thinking blocks from child messages for display
-		const childReasoningBlocks = useMemo(() => {
-			const blocks: { block: ContentBlock; msgId: string; blockIndex: number }[] = [];
-			for (const cm of childMessages) {
-				if (cm.role !== "assistant") continue;
-				const content = Array.isArray(cm.contentJson) ? cm.contentJson : [];
-				for (let bi = 0; bi < content.length; bi++) {
-					const b = content[bi];
-					if (b.type === "reasoning" || b.type === "thinking") {
-						blocks.push({ block: b, msgId: cm.id, blockIndex: bi });
-					}
-				}
-			}
-			return blocks;
-		}, [childMessages]);
-
 		const totalMs = toolCall.durationMs ?? 0;
 
 		// Check if the Task tool call itself has a pending permission (e.g. custom workdir)
@@ -391,12 +376,23 @@ export const SubagentCard = memo(
 
 		// Query the subagent narrator's status to detect "suspended" state
 		const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
-		const isSuspended = (subagentNarrator as Record<string, unknown>)?.status === "suspended";
+		const saNarrator = subagentNarrator as SubagentNarratorData | undefined;
+		const saSubstatus: string[] = useMemo(() => {
+			if (!saNarrator?.substatus) return [];
+			if (Array.isArray(saNarrator.substatus)) return saNarrator.substatus;
+			try {
+				const parsed = JSON.parse(saNarrator.substatus);
+				return Array.isArray(parsed) ? parsed : [];
+			} catch {
+				return [];
+			}
+		}, [saNarrator?.substatus]);
+		const saIsReasoning = saSubstatus.includes("reasoning");
+		const isSuspended = saSubstatus.includes("suspended");
 
 		// --- Subagent status bar data ---
-		const saNarrator = subagentNarrator as SubagentNarratorData | undefined;
 		const saStatus = saNarrator?.status;
-		const saIsWorking = saStatus === "thinking";
+		const saIsWorking = saStatus === "working";
 		const saIsWaiting = saStatus === "waiting";
 		const saTodos = saNarrator?.todosJson;
 		const saActiveTodo = useMemo(() => {
@@ -560,7 +556,7 @@ export const SubagentCard = memo(
 									{saStatusText && !isTerminal && (
 										<Text
 											size="xs"
-											c={saIsRetrying ? "yellow" : "blue"}
+											c={saIsRetrying ? "yellow" : saIsReasoning ? "grape" : "blue"}
 											truncate
 											style={{ flexShrink: 1, minWidth: 0 }}
 										>
@@ -574,10 +570,18 @@ export const SubagentCard = memo(
 									)}
 									{!isTerminal &&
 									!isInitializing &&
-									(saIsWorking || saIsWaiting || saIsRetrying) ? (
+									(saIsWorking || saIsWaiting || saIsRetrying || saIsReasoning) ? (
 										<Loader
 											size={12}
-											color={saIsRetrying ? "yellow" : saIsWaiting ? "yellow" : "blue"}
+											color={
+												saIsRetrying
+													? "yellow"
+													: saIsReasoning
+														? "grape"
+														: saIsWaiting
+															? "yellow"
+															: "blue"
+											}
 											style={{ flexShrink: 0 }}
 										/>
 									) : (
@@ -701,19 +705,6 @@ export const SubagentCard = memo(
 												/>
 											</Box>
 										</LazyCollapse>
-									</Box>
-								)}
-								{/* Reasoning/thinking blocks from child messages */}
-								{childReasoningBlocks.length > 0 && (
-									<Box px="xs" pb={4}>
-										{childReasoningBlocks.map((rb) => (
-											<ReasoningBlock
-												key={`${rb.msgId}-${rb.blockIndex}`}
-												block={rb.block}
-												narratorId={subagentNarratorId ?? narratorId}
-												blockIndex={rb.blockIndex}
-											/>
-										))}
 									</Box>
 								)}
 								{/* Child tool calls — in the middle */}

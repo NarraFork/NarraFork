@@ -50,28 +50,76 @@ const chapterRoleMap: StatusMap<ChapterRole> = {
 // Narrator Status
 // ---------------------------------------------------------------------------
 
-export type NarratorStatus =
-	| "idle"
-	| "thinking"
-	| "planning"
-	| "waiting"
-	| "done"
-	| "archived"
-	| "error"
-	| "interrupted"
-	| "suspended";
+export type NarratorStatus = "idle" | "working" | "waiting" | "archived";
 
 const narratorStatusMap: StatusMap<NarratorStatus> = {
 	idle: { color: "gray", icon: "○", i18nKey: "status.narratorIdle" },
-	thinking: { color: "blue", icon: "◉", i18nKey: "status.narratorThinking" },
-	planning: { color: "blue", icon: "◉", i18nKey: "status.narratorPlanning" },
+	working: { color: "blue", icon: "◉", i18nKey: "status.narratorWorking" },
 	waiting: { color: "yellow", icon: "◔", i18nKey: "status.narratorWaiting" },
-	done: { color: "green", icon: "●", i18nKey: "status.narratorDone" },
 	archived: { color: "dark", icon: "◌", i18nKey: "status.narratorArchived" },
+};
+
+// ---------------------------------------------------------------------------
+// Narrator Substatus
+// ---------------------------------------------------------------------------
+
+export type NarratorSubstatus =
+	| "unread"
+	| "error"
+	| "interrupted"
+	| "suspended"
+	| "reasoning"
+	| "compacting"
+	| "checking_interrupt"
+	| "planning"
+	| "retrying"
+	| "queued";
+
+const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
+	unread: { color: "green", icon: "●", i18nKey: "status.narratorUnread" },
 	error: { color: "red", icon: "✗", i18nKey: "status.narratorError" },
 	interrupted: { color: "orange", icon: "⊘", i18nKey: "status.narratorInterrupted" },
 	suspended: { color: "yellow", icon: "◔", i18nKey: "status.narratorSuspended" },
+	reasoning: { color: "grape", icon: "◉", i18nKey: "status.narratorReasoning" },
+	compacting: { color: "orange", icon: "◉", i18nKey: "status.narratorCompacting" },
+	checking_interrupt: { color: "cyan", icon: "◉", i18nKey: "status.narratorCheckingInterrupt" },
+	planning: { color: "green", icon: "◉", i18nKey: "status.narratorPlanning" },
+	retrying: { color: "yellow", icon: "◔", i18nKey: "status.narratorRetrying" },
+	queued: { color: "yellow", icon: "◔", i18nKey: "status.narratorQueued" },
 };
+
+/**
+ * Resolve the effective display color/icon for a narrator given its status + substatus tags.
+ * Substatus tags override the base status color when present, with a defined priority order.
+ *
+ * NOTE: This handles the full set of substatus tags (including transient ones like
+ * reasoning/compacting/queued) for the detailed narrator panel. The Ruler view
+ * (server/routes/ruler.ts resolveNarratorDisplayStatus) uses a smaller subset of
+ * persistent tags only, since Pixi rendering doesn't need transient state granularity.
+ */
+export function getEffectiveNarratorDisplay(status: string, substatus?: string[]): StatusEntry {
+	if (substatus?.length) {
+		// Priority order (highest first)
+		const priority: NarratorSubstatus[] = [
+			"error",
+			"retrying",
+			"checking_interrupt",
+			"compacting",
+			"suspended",
+			"reasoning",
+			"planning",
+			"queued",
+			"interrupted",
+			"unread",
+		];
+		for (const tag of priority) {
+			if (substatus.includes(tag)) {
+				return narratorSubstatusMap[tag];
+			}
+		}
+	}
+	return lookup(narratorStatusMap, status);
+}
 
 // ---------------------------------------------------------------------------
 // Container Status
@@ -175,6 +223,9 @@ export const statusRegistry = {
 	chapterStatus: (s: string) => lookup(chapterStatusMap, s),
 	chapterRole: (s: string) => lookup(chapterRoleMap, s),
 	narratorStatus: (s: string) => lookup(narratorStatusMap, s),
+	narratorSubstatus: (s: string) => lookup(narratorSubstatusMap, s),
+	/** Resolve effective display for a narrator given status + substatus tags */
+	narratorEffective: getEffectiveNarratorDisplay,
 	containerStatus: (s: string) => lookup(containerStatusMap, s),
 	toolCallStatus: (s: string) => lookup(toolCallStatusMap, s),
 	projectStatus: (s: string) => lookup(projectStatusMap, s),
@@ -186,6 +237,7 @@ export const statusRegistry = {
 		chapterStatus: chapterStatusMap,
 		chapterRole: chapterRoleMap,
 		narratorStatus: narratorStatusMap,
+		narratorSubstatus: narratorSubstatusMap,
 		containerStatus: containerStatusMap,
 		toolCallStatus: toolCallStatusMap,
 		projectStatus: projectStatusMap,
@@ -214,6 +266,7 @@ export const CHAPTER_ROLE_ICONS: Record<string, string> = {
 	review: chapterRoleMap.review.icon,
 };
 export const NARRATOR_STATUS_COLORS = colorOnly(narratorStatusMap);
+export const NARRATOR_SUBSTATUS_COLORS = colorOnly(narratorSubstatusMap);
 export const CONTAINER_STATUS_COLORS = colorOnly(containerStatusMap);
 export const EDGE_TYPE_COLORS = colorOnly(edgeTypeMap);
 export const TOOL_CALL_STATUS_COLORS = colorOnly(toolCallStatusMap);

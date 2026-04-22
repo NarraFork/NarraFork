@@ -13,6 +13,7 @@ import { narrators } from "../db/schema";
 import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import { getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -233,9 +234,9 @@ export async function handleTransientError(opts: {
 	try {
 		const narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
-			columns: { type: true, parentNarratorId: true },
+			columns: { variant: true, parentNarratorId: true },
 		});
-		if (narrator?.type === "subagent" && narrator.parentNarratorId) {
+		if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 			broadcastToNarrator(narrator.parentNarratorId, {
 				type: "subagent_warning",
 				narratorId: narrator.parentNarratorId,

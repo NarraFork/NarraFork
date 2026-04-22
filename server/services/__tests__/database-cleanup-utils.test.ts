@@ -9,6 +9,8 @@ function narrator(
 		parentNarratorId: overrides.parentNarratorId ?? null,
 		chapterId: overrides.chapterId ?? null,
 		type: overrides.type ?? "primary",
+		variant: overrides.variant ?? "primary",
+		traits: overrides.traits ?? null,
 		title: overrides.title ?? overrides.id,
 		status: overrides.status ?? "idle",
 		messageCount: overrides.messageCount ?? 0,

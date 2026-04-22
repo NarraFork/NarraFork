@@ -19,11 +19,11 @@ export interface NotificationPrefs extends NotificationSoundPrefs {
 export function triggerNotification(
 	_narratorId: string,
 	narratorTitle: string,
-	status: "done" | "waiting",
+	status: "unread" | "waiting",
 	prefs: NotificationPrefs,
 ): void {
 	// Check per-status toggle
-	if (status === "done" && !prefs.notifyOnDone) return;
+	if (status === "unread" && !prefs.notifyOnDone) return;
 	if (status === "waiting" && !prefs.notifyOnWaiting) return;
 
 	// PWA browser notification — only when page is not focused
@@ -34,7 +34,7 @@ export function triggerNotification(
 		Notification.permission === "granted"
 	) {
 		const body =
-			status === "done"
+			status === "unread"
 				? `${narratorTitle} has finished`
 				: `${narratorTitle} is waiting for permission`;
 		try {

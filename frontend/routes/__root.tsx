@@ -573,7 +573,8 @@ function AuthenticatedLayout() {
 										{tabs.some(
 											(t) =>
 												t.type !== "project" &&
-												!["thinking", "waiting", "done"].includes(t.status ?? ""),
+												!["working", "waiting"].includes(t.status ?? "") &&
+												!t.substatus?.includes("unread"),
 										) && (
 											<Tooltip label={t("clearNarrators")} position="right" withArrow>
 												<ActionIcon

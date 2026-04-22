@@ -91,7 +91,7 @@ export type NarraForkEvent =
 	  }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
-	| { type: "narrator:status_changed"; narratorId: string; status: string }
+	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
 	| { type: "narrator:error"; narratorId: string; error: string }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }

@@ -10,7 +10,14 @@ export type NarratorServerMessage =
 	| { type: "message"; narratorId: string; message: unknown }
 	| { type: "stream_event"; narratorId: string; event: unknown }
 	| { type: "permission_request"; narratorId: string; request: unknown }
-	| { type: "status_change"; narratorId: string; status: string; turnStartedAt?: string }
+	| {
+			type: "status_change";
+			narratorId: string;
+			status: string;
+			substatus?: string[];
+			turnStartedAt?: string;
+	  }
+	| { type: "substatus_change"; narratorId: string; substatus: string[] }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_output";
@@ -133,8 +140,8 @@ export type NarratorServerMessage =
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
-			/** Incremental JSON fragment for live preview (like text_delta) */
-			inputDelta?: string;
+			/** Incremental delta of the large streaming field */
+			streamingField?: { name: string; delta: string };
 	  }
 	| {
 			type: "subagent_started";

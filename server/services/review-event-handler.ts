@@ -72,7 +72,10 @@ export function initReviewEventHandler(): void {
 
 			// 2. Find the source chapter's primary narrator
 			const sourceNarrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, event.sourceChapterId), eq(narrators.type, "primary")),
+				where: and(
+					eq(narrators.chapterId, event.sourceChapterId),
+					eq(narrators.variant, "primary"),
+				),
 			});
 			if (!sourceNarrator) {
 				logger.debug("No primary narrator for source chapter, skipping feedback injection", {

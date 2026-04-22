@@ -23,8 +23,8 @@ export interface PixiTheme {
 	cardActiveBorder: number;
 	cardText: number;
 	cardReviewBorder: number;
-	narratorRunning: number;
-	narratorDone: number;
+	narratorWorking: number;
+	narratorUnread: number;
 	narratorError: number;
 	narratorWaiting: number;
 }
@@ -111,8 +111,8 @@ export function resolvePixiTheme(): PixiTheme {
 			scheme === "dark" ? 0xc1c2c5 : 0x212529,
 		),
 		cardReviewBorder: varToHex("--mantine-color-yellow-6", 0xca8a04),
-		narratorRunning: varToHex("--mantine-color-blue-5", 0x3b82f6),
-		narratorDone: varToHex("--mantine-color-green-5", 0x22c55e),
+		narratorWorking: varToHex("--mantine-color-blue-5", 0x3b82f6),
+		narratorUnread: varToHex("--mantine-color-green-5", 0x22c55e),
 		narratorError: varToHex("--mantine-color-red-5", 0xef4444),
 		narratorWaiting: varToHex("--mantine-color-yellow-5", 0xeab308),
 	};

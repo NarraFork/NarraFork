@@ -103,8 +103,13 @@ interface RecentTab {
 
 // --- Core notification logic ---
 
-async function handleStatusChanged(narratorId: string, status: string): Promise<void> {
-	if (status !== "done" && status !== "waiting") return;
+async function handleStatusChanged(
+	narratorId: string,
+	status: string,
+	substatus?: string[],
+): Promise<void> {
+	const isUnread = status === "idle" && substatus?.includes("unread");
+	if (!isUnread && status !== "waiting") return;
 
 	// Fetch narrator + optional chapter info
 	const narrator = await db.query.narrators.findFirst({
@@ -122,7 +127,8 @@ async function handleStatusChanged(narratorId: string, status: string): Promise<
 	}
 
 	const chapterLine = chapterName ? `\n\n> Chapter: ${chapterName}` : "";
-	const markdownText = `**${narratorTitle}** status: **${status}**${chapterLine}`;
+	const displayStatus = isUnread ? "done" : status;
+	const markdownText = `**${narratorTitle}** status: **${displayStatus}**${chapterLine}`;
 
 	// Query all user preferences
 	const allPrefs = await db.select().from(userPreferences);
@@ -142,7 +148,7 @@ async function handleStatusChanged(narratorId: string, status: string): Promise<
 		if (!isRelevant) continue;
 
 		// Check per-status preference
-		if (status === "done" && !pref.notifyOnDone) continue;
+		if (isUnread && !pref.notifyOnDone) continue;
 		if (status === "waiting" && !pref.notifyOnWaiting) continue;
 
 		const promises: Promise<void>[] = [];
@@ -187,7 +193,7 @@ async function handleStatusChanged(narratorId: string, status: string): Promise<
 // --- Register event listener (side-effect on import) ---
 
 eventBus.on("narrator:status_changed", (event) => {
-	handleStatusChanged(event.narratorId, event.status).catch((err) => {
+	handleStatusChanged(event.narratorId, event.status, event.substatus).catch((err) => {
 		logger.error("Notification handler error", {
 			narratorId: event.narratorId,
 			error: err instanceof Error ? err.message : String(err),

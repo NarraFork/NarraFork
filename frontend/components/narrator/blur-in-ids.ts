@@ -39,7 +39,7 @@ function collectToolCallIds(msg: NarratorMsg, acc: Set<string>) {
 	}
 
 	for (const [idx, tc] of (
-		((msg.toolCalls ?? []) as Array<{ toolUseId?: string | null; id?: string | null }>) ?? []
+		(msg.toolCalls ?? []) as Array<{ toolUseId?: string | null; id?: string | null }>
 	).entries()) {
 		if (tc.toolUseId && blockIds.has(tc.toolUseId)) continue;
 		const animationId = getToolCallBlurAnimationId({

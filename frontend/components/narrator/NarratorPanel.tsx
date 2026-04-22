@@ -1570,9 +1570,7 @@ export function NarratorPanel({
 		renderPermCb,
 		queuedMessages,
 		setQueuedMessages,
-		isCompacting,
-		setIsCompacting,
-		isCheckingInterrupt,
+		substatus,
 		contextPercent,
 		promptTokens,
 		contextWindow,
@@ -1609,13 +1607,12 @@ export function NarratorPanel({
 
 	const handleCompactBefore = useCallback(
 		(messageId: string) => {
-			setIsCompacting(true);
+			// Compacting state will arrive via substatus_change WS event
 			api.triggerCompact(narratorId, messageId).catch((err) => {
-				setIsCompacting(false);
 				handleCompactError(err);
 			});
 		},
-		[narratorId, handleCompactError, setIsCompacting],
+		[narratorId, handleCompactError],
 	);
 
 	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
@@ -1697,11 +1694,14 @@ export function NarratorPanel({
 		pendingDeleteCallback,
 	]);
 
-	const isWorking = narrator?.status === "thinking";
-	const isActive = narrator?.status === "thinking" || narrator?.status === "waiting";
+	const isWorking = narrator?.status === "working";
+	const isActive = narrator?.status === "working" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
-	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "thinking";
+	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
+	// Derive legacy boolean flags from substatus
+	const isCompacting = substatus.includes("compacting");
+	const isCheckingInterrupt = substatus.includes("checking_interrupt");
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
 	// --- Turn elapsed timer ---
@@ -2051,11 +2051,7 @@ export function NarratorPanel({
 		return null;
 	}, [hydrated, messagesData]);
 
-	const narratorIsIdle =
-		narrator?.status === "idle" ||
-		narrator?.status === "done" ||
-		narrator?.status === "error" ||
-		narrator?.status === "interrupted";
+	const narratorIsIdle = narrator?.status === "idle";
 
 	const canRetryLastUserMessage =
 		!!lastMessage &&
@@ -2530,10 +2526,9 @@ export function NarratorPanel({
 		if (!window.confirm(t("segmentCompactConfirm", { count: messageIds.length }))) return;
 		exitSelection();
 		try {
-			setIsCompacting(true);
+			// Compacting state will arrive via substatus_change WS event
 			await api.triggerSegmentCompact(narratorId, messageIds);
 		} catch (err) {
-			setIsCompacting(false);
 			const isInProgress = err instanceof ApiError && err.status === 409;
 			notifications.show({
 				title: isInProgress ? t("compactInProgress") : t("segmentCompactFailed"),
@@ -2542,7 +2537,7 @@ export function NarratorPanel({
 				autoClose: 5000,
 			});
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, t, setIsCompacting]);
+	}, [selectedBlockIds, exitSelection, narratorId, t]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -2835,7 +2830,8 @@ export function NarratorPanel({
 	const showConclusionBtn =
 		isSubagent &&
 		narrator &&
-		(narrator.status === "done" || narrator.status === "error") &&
+		narrator.status === "idle" &&
+		(substatus.includes("unread") || substatus.includes("error")) &&
 		!isActive;
 	const finalElements = useMemo(() => {
 		const elements = showManualLoadOlder
@@ -3390,15 +3386,15 @@ export function NarratorPanel({
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
-				// Optimistically set narrator status to "thinking" so the UI shows
+				// Optimistically set narrator status to "working" so the UI shows
 				// the work indicator immediately.  This guards against the race where
 				// the WS subscribe message hasn't been processed by the server yet
 				// when the backend broadcasts the status_change event — without this,
 				// the frontend stays stuck on "idle" until the user navigates away
 				// and back.
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old && old.status !== "thinking"
-						? { ...old, status: "thinking", turnStartedAt: new Date().toISOString() }
+					old && old.status !== "working"
+						? { ...old, status: "working", turnStartedAt: new Date().toISOString() }
 						: old,
 				);
 				// Safety net: trigger a sync_check shortly after sending so that
@@ -3421,7 +3417,7 @@ export function NarratorPanel({
 			});
 			// Roll back the optimistic narrator status set above
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-				old?.status === "thinking" ? { ...old, status: "idle" } : old,
+				old?.status === "working" ? { ...old, status: "idle" } : old,
 			);
 			const message = err instanceof Error ? err.message : "Failed to send message";
 			notifications.show({ title: "Error", message, color: "red" });
@@ -4036,9 +4032,8 @@ export function NarratorPanel({
 				<Menu.Item
 					leftSection={<IconArrowsMinimize size={14} />}
 					onClick={() => {
-						setIsCompacting(true);
+						// Compacting state will arrive via substatus_change WS event
 						api.triggerCompact(narratorId).catch((err) => {
-							setIsCompacting(false);
 							handleCompactError(err);
 						});
 					}}
@@ -4827,6 +4822,8 @@ export function NarratorPanel({
 																: t("thinking")}
 									</Text>
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
+											·{" "}
+											})}
 										</Text>
 									)}
 									{turnElapsedText && (

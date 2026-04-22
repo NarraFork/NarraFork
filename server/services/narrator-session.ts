@@ -19,6 +19,7 @@ import { OPTIONAL_TOOLS, OVERSEER_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { isSubagentVariant, parseSubstatus } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
@@ -129,7 +130,7 @@ export async function ensureNarrator(
 	replyInUserLanguage = false,
 ): Promise<ActiveNarrator> {
 	const existing = activeNarrators.get(narratorId);
-	if (existing?.alive) return existing;
+	if (existing?.alive && !existing.abortController.signal.aborted) return existing;
 
 	const pending = narratorCreationLocks.get(narratorId);
 	if (pending) return pending;
@@ -301,6 +302,7 @@ async function createNarrator(
 		_enabledOptionalTools: new Set(),
 		_isOverseer: false,
 		_interruptCleanupDone: false,
+		_substatus: new Set(),
 	};
 
 	// Check if this narrator is bound to an overseer
@@ -364,10 +366,13 @@ async function finalizeInterruptedRun(
 	const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
 	const current = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { status: true },
+		columns: { status: true, substatus: true },
 	});
-	if (current?.status !== "error") {
-		cleanupTasks.push(narratorService.updateStatus(narratorId, "interrupted"));
+	const currentSubstatus = parseSubstatus(current?.substatus);
+	if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
+		cleanupTasks.push(
+			narratorService.updateStatus(narratorId, "idle", { substatus: ["interrupted"] }),
+		);
 	}
 	if (partialId) {
 		cleanupTasks.push(finalizeOrCleanupPartialMessage(partialId, narratorId).then(() => {}));
@@ -717,6 +722,17 @@ export async function runAgentLoop(
 				setTtftMs: (ttftMs) => {
 					active._ttftMs = ttftMs;
 				},
+				getSubstatus: () => active._substatus,
+				addSubstatus: async (tag) => {
+					if (active._substatus.has(tag)) return;
+					active._substatus.add(tag);
+					await narratorService.updateSubstatus(narratorId, [...active._substatus]);
+				},
+				removeSubstatus: async (tag) => {
+					if (!active._substatus.has(tag)) return;
+					active._substatus.delete(tag);
+					await narratorService.updateSubstatus(narratorId, [...active._substatus]);
+				},
 			};
 
 			// Build shared context management hooks (prune + compact)
@@ -1040,7 +1056,10 @@ export async function runAgentLoop(
 						await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					}
 					logger.error("Agent loop error", { narratorId, error: message });
-					await narratorService.updateStatus(narratorId, "error", message);
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: message,
+					});
 					loopHadError = true;
 					active.events.emit("event", { type: "error", data: { message } });
 				},
@@ -1246,12 +1265,11 @@ export async function runAgentLoop(
 
 				// All attempts failed
 				logger.error("Context length exceeded after max retries", { narratorId });
-				await narratorService.updateStatus(
-					narratorId,
-					"error",
-					"Context too long, compact failed",
-					"context_too_long_compact_failed",
-				);
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["error"],
+					errorMessage: "Context too long, compact failed",
+					errorCode: "context_too_long_compact_failed",
+				});
 				active.events.emit("event", {
 					type: "error",
 					data: { message: "Context too long, compact failed" },
@@ -1273,7 +1291,10 @@ export async function runAgentLoop(
 					if (partialId) {
 						await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					}
-					await narratorService.updateStatus(narratorId, "error", result.retryableError);
+					await narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: result.retryableError,
+					});
 					active.events.emit("event", {
 						type: "error",
 						data: { message: result.retryableError },
@@ -1307,7 +1328,10 @@ export async function runAgentLoop(
 				if (!active.alive) {
 					break;
 				}
-				await narratorService.updateStatus(narratorId, "error", result.retryableError);
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["error"],
+					errorMessage: result.retryableError,
+				});
 				active.events.emit("event", {
 					type: "error",
 					data: { message: result.retryableError },
@@ -1322,7 +1346,11 @@ export async function runAgentLoop(
 				if (partialId) {
 					await finalizeOrCleanupPartialMessage(partialId, narratorId);
 				}
-				await narratorService.updateStatus(narratorId, "error", result.finalText, result.errorCode);
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["error"],
+					errorMessage: result.finalText,
+					errorCode: result.errorCode,
+				});
 				active.events.emit("event", {
 					type: "error",
 					data: { message: result.finalText },
@@ -1376,7 +1404,7 @@ export async function runAgentLoop(
 						message: userMsg,
 					});
 					active.events.emit("event", { type: "user_message", data: userMsg });
-					await narratorService.updateStatus(narratorId, "thinking");
+					await narratorService.updateStatus(narratorId, "working");
 					currentText = continueText;
 					currentImages = undefined;
 					continue;
@@ -1442,7 +1470,7 @@ export async function runAgentLoop(
 					message: userMsg,
 				});
 				active.events.emit("event", { type: "user_message", data: userMsg });
-				await narratorService.updateStatus(narratorId, "thinking");
+				await narratorService.updateStatus(narratorId, "working");
 				currentText = promptText;
 				currentImages = undefined;
 				continue;
@@ -1460,7 +1488,7 @@ export async function runAgentLoop(
 				break;
 			}
 
-			// Check for chained feedback BEFORE marking "done" — when the user
+			// Check for chained feedback BEFORE marking idle/unread — when the user
 			// approves a permission with attached text, the loop is aborted right
 			// after the tool completes so the feedback is injected immediately
 			// instead of waiting for the entire turn to finish.
@@ -1472,7 +1500,7 @@ export async function runAgentLoop(
 				]);
 				broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 				active.events.emit("event", { type: "user_message", data: userMsg });
-				await narratorService.updateStatus(narratorId, "thinking");
+				await narratorService.updateStatus(narratorId, "working");
 				currentText = fb.feedbackText;
 				continue;
 			}
@@ -1491,7 +1519,7 @@ export async function runAgentLoop(
 						message: userMsg,
 					});
 					active.events.emit("event", { type: "user_message", data: userMsg });
-					await narratorService.updateStatus(narratorId, "thinking");
+					await narratorService.updateStatus(narratorId, "working");
 					currentText = gitCheck.message;
 					continue;
 				}
@@ -1571,7 +1599,7 @@ export async function runAgentLoop(
 				}
 			}
 
-			// Check for buffered messages BEFORE transitioning to "done" —
+			// Check for buffered messages BEFORE transitioning to idle/unread —
 			// this prevents spurious notifications when there are queued messages.
 			// When the loop had an error, skip consumption entirely so queued
 			// messages are preserved for the user to retry or dismiss.
@@ -1641,7 +1669,7 @@ export async function runAgentLoop(
 					);
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					active.events.emit("event", { type: "user_message", data: userMsg });
-					await narratorService.updateStatus(narratorId, "thinking");
+					await narratorService.updateStatus(narratorId, "working");
 					currentText = effectiveBufferedText;
 					currentImages = buffered.images;
 					continue;
@@ -1685,19 +1713,21 @@ export async function runAgentLoop(
 						toolUseId: nextValid.toolUseId,
 						status: "reviewing",
 					});
-					await narratorService.updateStatus(narratorId, "thinking");
+					await narratorService.updateStatus(narratorId, "working");
 					currentText = nextValid.textForModel;
 					currentImages = undefined;
 					continue;
 				}
 			}
 
-			// No buffered messages — now transition to "done" (triggers notifications)
+			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!loopHadError) {
-				// Atomically transition thinking/waiting → done.
+				// Atomically transition working/waiting → idle with unread substatus.
 				// If status has already moved (e.g. another loop took over after
 				// hot reload, or user interrupted), the CAS is a no-op.
-				await narratorService.compareAndSetStatus(narratorId, ["thinking", "waiting"], "done");
+				await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+					substatus: ["unread"],
+				});
 			}
 
 			active.events.emit("event", { type: "done", data: null });
@@ -1706,7 +1736,10 @@ export async function runAgentLoop(
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Narrator loop error", { narratorId, error: errorMsg });
-		await narratorService.updateStatus(narratorId, "error", errorMsg);
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: errorMsg,
+		});
 		loopHadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
@@ -1720,9 +1753,9 @@ export async function runAgentLoop(
 		try {
 			const narr = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
-				columns: { type: true, parentNarratorId: true },
+				columns: { variant: true, parentNarratorId: true },
 			});
-			if (narr?.type === "subagent") {
+			if (narr && isSubagentVariant(narr.variant)) {
 				const {
 					isSubagentSuspended: isSuspended,
 					resolveSuspendedSubagent,
@@ -1929,7 +1962,9 @@ export async function runAgentLoop(
 						narratorId,
 						error: String(err),
 					});
-					await narratorService.updateStatus(narratorId, "error", String(err)).catch(() => {});
+					await narratorService
+						.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(err) })
+						.catch(() => {});
 					broadcastToNarrator(narratorId, {
 						type: "narrator_error",
 						narratorId,
@@ -2031,7 +2066,7 @@ async function feedMessage(
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	const narrator = await narratorService.getById(narratorId);
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
@@ -2041,7 +2076,10 @@ async function feedMessage(
 	// Start agent loop in background
 	runAgentLoop(active, effectivePrompt, images).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "error", String(err));
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: String(err),
+		});
 		broadcastToNarrator(narratorId, {
 			type: "narrator_error",
 			narratorId,
@@ -2205,11 +2243,14 @@ export async function retryLastMessage(
 	const imageRefs = extractImageRefs(lastMsg.contentJson);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "error", String(err));
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: String(err),
+		});
 		broadcastToNarrator(narratorId, {
 			type: "narrator_error",
 			narratorId,
@@ -2264,13 +2305,16 @@ export async function continueNarrator(
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	// Pass empty text — buildHistory will reconstruct the trailing tool-result
 	// packet so the provider sees the same follow-up turn again.
 	runAgentLoop(active, "", undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "error", String(err));
+		await narratorService.updateStatus(narratorId, "idle", {
+			substatus: ["error"],
+			errorMessage: String(err),
+		});
 		broadcastToNarrator(narratorId, {
 			type: "narrator_error",
 			narratorId,
@@ -2464,7 +2508,7 @@ export async function editAndRegenerate(
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "thinking", undefined, undefined, true);
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch(
 		async (err) => {
@@ -2472,7 +2516,10 @@ export async function editAndRegenerate(
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "error", String(err));
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
 			broadcastToNarrator(narratorId, {
 				type: "narrator_error",
 				narratorId,
@@ -2937,18 +2984,34 @@ export async function recoverOnStartup(): Promise<void> {
 	worktreeWatcher.shutdown();
 
 	const now = new Date().toISOString();
-	const migrations = [
-		["active", "idle"],
-		["paused", "idle"],
-		["completed", "archived"],
-		["thinking", "idle"],
-		["waiting", "idle"],
+	// Legacy status migrations (from older DB versions).
+	// Note: "thinking" is already migrated to "working" by db/index.ts at startup,
+	// so it is not included here. These handle even older status values.
+	const legacyMigrations = [
+		["active", "idle", "[]"],
+		["paused", "idle", "[]"],
+		["completed", "archived", "[]"],
 	] as const;
-	const stmt = sqlite.prepare("UPDATE narrators SET status = ?, updated_at = ? WHERE status = ?");
-	for (const [from, to] of migrations) {
-		const result = stmt.run(to, now, from);
+	const legacyStmt = sqlite.prepare(
+		"UPDATE narrators SET status = ?, substatus = ?, updated_at = ? WHERE status = ?",
+	);
+	for (const [from, to, sub] of legacyMigrations) {
+		const result = legacyStmt.run(to, sub, now, from);
 		if (result.changes > 0) {
 			logger.info(`Narrator status migrated: ${from} → ${to}`, { count: result.changes });
+		}
+	}
+	// Active narrators interrupted by server restart — mark with interrupted substatus
+	// so users can see which narrators were mid-run.
+	const interruptStmt = sqlite.prepare(
+		"UPDATE narrators SET status = ?, substatus = ?, updated_at = ? WHERE status = ?",
+	);
+	for (const activeStatus of ["working", "waiting"] as const) {
+		const result = interruptStmt.run("idle", '["interrupted"]', now, activeStatus);
+		if (result.changes > 0) {
+			logger.info(`Narrator status migrated: ${activeStatus} → idle [interrupted]`, {
+				count: result.changes,
+			});
 		}
 	}
 

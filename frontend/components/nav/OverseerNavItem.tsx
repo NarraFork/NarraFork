@@ -24,7 +24,7 @@ export function OverseerNavItem({ onNavigate, collapsed }: OverseerNavItemProps)
 
 	const narratorStatus = overseer?.narrator?.status as string | undefined;
 	const isEnabled = overseer?.enabled === true;
-	const isActive = narratorStatus === "thinking" || narratorStatus === "waiting";
+	const isActive = narratorStatus === "working" || narratorStatus === "waiting";
 	const isCurrentPage = !!overseer?.narratorId && pathname === `/narrators/${overseer.narratorId}`;
 
 	const statusColor = narratorStatus

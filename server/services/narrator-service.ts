@@ -19,6 +19,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { isSubagentVariant, subagentVariant } from "../lib/narrator-utils";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -273,7 +274,7 @@ export const narratorService = {
 
 		if (type === "primary" && input.chapterId) {
 			const existing = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.type, "primary")),
+				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
 			});
 			if (existing) {
 				throw new ValidationError("Chapter already has a primary narrator");
@@ -297,12 +298,17 @@ export const narratorService = {
 				? (resolveDefaultReasoningEffort(resolvedProvider) ?? null)
 				: input.reasoningEffort;
 
+		const chapterId = input.chapterId ?? null;
+		const traits: string[] = chapterId === null ? ["standalone"] : [];
+
 		const [narrator] = await db
 			.insert(narrators)
 			.values({
 				id,
-				chapterId: input.chapterId ?? null,
+				chapterId,
 				type,
+				variant: "primary",
+				traits,
 				model: storedModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
@@ -318,14 +324,14 @@ export const narratorService = {
 			})
 			.returning();
 
-		logger.info("Narrator created", { id, chapterId: input.chapterId, type });
+		logger.info("Narrator created", { id, chapterId, type });
 		return narrator;
 	},
 
 	async createSubagent(input: CreateSubagentInput) {
 		const parent = await this.getById(input.parentNarratorId);
 
-		if (parent.type === "subagent") {
+		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Subagents cannot spawn nested subagents");
 		}
 
@@ -348,13 +354,18 @@ export const narratorService = {
 		const resolvedReasoningEffort =
 			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
+		const subChapterId = parent.chapterId ?? null;
+		const subTraits: string[] = subChapterId === null ? ["standalone"] : [];
+
 		const [narrator] = await db
 			.insert(narrators)
 			.values({
 				id,
-				chapterId: parent.chapterId ?? null,
+				chapterId: subChapterId,
 				type: "subagent",
 				subagentType: input.subagentType,
+				variant: subagentVariant(input.subagentType),
+				traits: subTraits,
 				title: input.title ?? null,
 				model: resolvedModel,
 				systemPrompt: input.systemPrompt ?? null,
@@ -365,7 +376,7 @@ export const narratorService = {
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
-				status: "thinking",
+				status: "working",
 				createdAt: now,
 				updatedAt: now,
 			})
@@ -390,7 +401,7 @@ export const narratorService = {
 		_original?: typeof narrators.$inferSelect;
 	}) {
 		const original = input._original ?? (await this.getById(input.originalSubagentId));
-		if (original.type !== "subagent") {
+		if (!isSubagentVariant(original.variant)) {
 			throw new ValidationError("Can only fork subagent narrators");
 		}
 		const now = new Date().toISOString();
@@ -425,14 +436,19 @@ export const narratorService = {
 		const resolvedReasoningEffort =
 			original.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
+		const forkChapterId = original.chapterId ?? null;
+		const forkTraits: string[] = forkChapterId === null ? ["standalone"] : [];
+
 		const narrator = await db.transaction(async (tx) => {
 			const [created] = await tx
 				.insert(narrators)
 				.values({
 					id,
-					chapterId: original.chapterId ?? null,
+					chapterId: forkChapterId,
 					type: "subagent",
 					subagentType: input.subagentType,
+					variant: subagentVariant(input.subagentType),
+					traits: forkTraits,
 					model: resolvedModel,
 					systemPrompt: input.systemPrompt ?? null,
 					permissionMode: resolvedPermMode,
@@ -443,7 +459,7 @@ export const narratorService = {
 					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
 					cwd: input.cwd,
 					inheritMode: "fresh",
-					status: "thinking",
+					status: "working",
 					createdAt: now,
 					updatedAt: now,
 				})
@@ -523,7 +539,7 @@ export const narratorService = {
 
 	async listByChapter(chapterId: string) {
 		return db.query.narrators.findMany({
-			where: and(eq(narrators.chapterId, chapterId), ne(narrators.type, "subagent")),
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
 	},
@@ -598,7 +614,7 @@ export const narratorService = {
 		opts?: { title?: string },
 	) {
 		const parent = await this.getById(parentNarratorId);
-		if (parent.type === "subagent") {
+		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
@@ -637,6 +653,8 @@ export const narratorService = {
 					id,
 					chapterId: null,
 					type: "primary",
+					variant: "primary",
+					traits: ["standalone"],
 					model: storedModel,
 					systemPrompt: parent.systemPrompt,
 					permissionMode: resolvedPermMode,
@@ -681,7 +699,7 @@ export const narratorService = {
 	) {
 		const parent = await this.getById(parentNarratorId);
 
-		if (parent.type === "subagent") {
+		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
@@ -772,6 +790,8 @@ export const narratorService = {
 		const resolvedReasoningEffort =
 			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
 
+		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
+
 		const newNarrator = await db.transaction(async (tx) => {
 			const [created] = await tx
 				.insert(narrators)
@@ -779,6 +799,8 @@ export const narratorService = {
 					id,
 					chapterId: targetChapterId,
 					type: "primary",
+					variant: "primary",
+					traits: forkTraits2,
 					model: storedModel,
 					systemPrompt,
 					permissionMode: resolvedPermMode,
@@ -914,7 +936,7 @@ export const narratorService = {
 	) {
 		const parent = await this.getById(parentNarratorId);
 
-		if (parent.type === "subagent") {
+		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 		if (parent.chapterId) {
@@ -1023,6 +1045,9 @@ export const narratorService = {
 	updatePruneEnabled: narratorPersistence.updatePruneEnabled.bind(narratorPersistence),
 	updateStatus: narratorPersistence.updateStatus.bind(narratorPersistence),
 	compareAndSetStatus: narratorPersistence.compareAndSetStatus.bind(narratorPersistence),
+	updateSubstatus: narratorPersistence.updateSubstatus.bind(narratorPersistence),
+	addSubstatus: narratorPersistence.addSubstatus.bind(narratorPersistence),
+	removeSubstatus: narratorPersistence.removeSubstatus.bind(narratorPersistence),
 	updateTodos: narratorPersistence.updateTodos.bind(narratorPersistence),
 	updateToolCallResult: narratorPersistence.updateToolCallResult.bind(narratorPersistence),
 	isMessageSharedByMultipleNarrators:

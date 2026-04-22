@@ -132,8 +132,8 @@ export type AgentEvent =
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
-			/** Incremental JSON fragment for this chunk (like text_delta for tool input) */
-			inputDelta?: string;
+			/** Incremental delta of the large streaming field (content, command, prompt, etc.) */
+			streamingField?: { name: string; delta: string };
 	  }
 	| {
 			type: "block_complete";

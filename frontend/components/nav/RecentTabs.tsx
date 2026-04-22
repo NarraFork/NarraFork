@@ -15,7 +15,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { statusRegistry } from "@frontend/lib/status-registry";
+import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
 import {
 	ActionIcon,
 	Avatar,
@@ -146,39 +146,44 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
 			const patch: Partial<
-				Pick<RecentTab, "title" | "status" | "viewers" | "activeTerminalCount" | "containerStatus">
+				Pick<
+					RecentTab,
+					"title" | "status" | "substatus" | "viewers" | "activeTerminalCount" | "containerStatus"
+				>
 			> = {};
 			if (event.type === "title" && event.title) patch.title = event.title;
-			else if (event.type === "status" && event.status) patch.status = event.status;
-			else if (event.type === "presence" && event.viewers) patch.viewers = event.viewers;
+			else if (event.type === "status") {
+				if (event.status) patch.status = event.status;
+				if (event.substatus !== undefined) patch.substatus = event.substatus;
+				if (!patch.status && !patch.substatus) return;
+			} else if (event.type === "presence" && event.viewers) patch.viewers = event.viewers;
 			else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined)
 				patch.activeTerminalCount = event.activeTerminalCount;
 			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else return;
 
-			// Trigger client-side notifications for done/waiting
-			if (
-				event.type === "status" &&
-				(event.status === "done" || event.status === "waiting") &&
-				userPrefsRef.current
-			) {
-				const tab = tabsRef.current.find(
-					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-				);
-				if (tab) {
-					triggerNotification(
-						narratorId,
-						tab.title,
-						event.status as "done" | "waiting",
-						userPrefsRef.current,
+			// Trigger client-side notifications for done(unread)/waiting
+			if (event.type === "status" && userPrefsRef.current) {
+				const shouldNotify = event.status === "waiting" || event.substatus?.includes("unread");
+				if (shouldNotify) {
+					const tab = tabsRef.current.find(
+						(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 					);
+					if (tab) {
+						triggerNotification(
+							narratorId,
+							tab.title,
+							event.status === "waiting" ? "waiting" : "unread",
+							userPrefsRef.current,
+						);
+					}
 				}
 			}
 
-			// When a narrator starts thinking, ask server to promote it above idle tabs.
+			// When a narrator starts working, ask server to promote it above idle tabs.
 			// If the tab belongs to a workspace, promote the workspace header instead
 			// so the entire group moves together.
-			if (event.type === "status" && event.status === "thinking") {
+			if (event.type === "status" && event.status === "working") {
 				const tab = tabsRef.current.find(
 					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 				);
@@ -1002,9 +1007,12 @@ function WorkspaceChildTab({
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
 	const iconColor = tab.status
-		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
 		: undefined;
-	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+	const filledStatus =
+		tab.status === "working" ||
+		!!tab.substatus?.includes("error") ||
+		!!tab.substatus?.includes("unread");
 
 	return (
 		<NavLink
@@ -1076,9 +1084,12 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
 	const iconColor = tab.status
-		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
 		: undefined;
-	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+	const filledStatus =
+		tab.status === "working" ||
+		!!tab.substatus?.includes("error") ||
+		!!tab.substatus?.includes("unread");
 
 	// When the parent workspace header is being dragged, collapse children to
 	// zero height so dnd-kit measures the gap as header-only and the full group
@@ -1191,9 +1202,12 @@ function DragOverlayWorkspaceItem({
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
 	const iconColor = tab.status
-		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
 		: undefined;
-	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+	const filledStatus =
+		tab.status === "working" ||
+		!!tab.substatus?.includes("error") ||
+		!!tab.substatus?.includes("unread");
 
 	return (
 		<div style={{ overflow: "hidden" }}>
@@ -1293,9 +1307,12 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					? `/narrators/workspace/${tab.id}`
 					: `/narrators/${tab.id}`;
 	const iconColor = tab.status
-		? mantineVar(statusRegistry.narratorStatus(tab.status).color)
+		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
 		: undefined;
-	const filledStatus = tab.status === "thinking" || tab.status === "error" || tab.status === "done";
+	const filledStatus =
+		tab.status === "working" ||
+		!!tab.substatus?.includes("error") ||
+		!!tab.substatus?.includes("unread");
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),

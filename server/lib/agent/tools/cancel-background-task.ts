@@ -32,13 +32,20 @@ export const taskStopTool: ToolDefinition = {
 	async execute(args, _ctx): Promise<ToolResult> {
 		const { task_id } = args as { task_id: string };
 
-		const { cancelBackgroundTask } = await import("@server/services/narrator-subagent");
-
 		try {
+			// Try narrator-subagent background tasks first
+			const { cancelBackgroundTask } = await import("@server/services/narrator-subagent");
 			const cancelled = await cancelBackgroundTask(task_id);
 			if (cancelled) {
 				return { output: `Background task ${task_id} has been cancelled.` };
 			}
+
+			// Fall back to bash background tasks
+			const { cancelBashBackground } = await import("./bash");
+			if (cancelBashBackground(task_id)) {
+				return { output: `Background bash task ${task_id} has been cancelled.` };
+			}
+
 			return {
 				output: `Background task ${task_id} is not running (may have already completed or does not exist).`,
 				isError: true,

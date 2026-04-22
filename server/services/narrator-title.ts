@@ -73,7 +73,7 @@ async function syncTitleToChapter(narratorId: string, title: string): Promise<vo
 export async function syncTitleToNarrator(chapterId: string, title: string): Promise<void> {
 	try {
 		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.type, "primary")),
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
 			columns: { id: true, title: true },
 		});
 		if (!primaryNarrator) return;
