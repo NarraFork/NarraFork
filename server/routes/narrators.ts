@@ -988,6 +988,8 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 // Update the conclusion of an already-completed subagent.
 // The user continued operating the subagent from its page and wants to
 // push the new result back to the parent narrator's tool_call outputJson.
+// If the subagent is in manual_override state (parent blocked waiting),
+// this resolves the blocked Promise so the parent narrator resumes.
 narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
@@ -1015,6 +1017,21 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 	}
 	const toolUseId = firstMsg.parentToolUseId;
 
+	const { getSubagentFinalText } = await import("../services/narrator-session");
+	const finalText = await getSubagentFinalText(id);
+	const hasError = narrator.substatus?.includes("error") ?? false;
+
+	// Check if the parent is blocked in manual_override — if so, resolve
+	// the Promise directly. The parent's runSubagent/continueSubagent will
+	// handle finalizeSubagent and tool_call updates when it resumes.
+	const { isManualOverride, resolveManualOverride } = await import("../services/narrator-subagent");
+	if (isManualOverride(id)) {
+		resolveManualOverride(id, finalText, hasError);
+		return c.json({ ok: true, toolUseId });
+	}
+
+	// Not in manual_override — update the tool_call outputJson directly
+	// (existing behavior for already-completed subagents).
 	// Find the tool_call record
 	const tc = await narratorService.getToolCallByToolUseId(toolUseId);
 	if (!tc?.messageId) {
@@ -1034,20 +1051,15 @@ narratorRoutes.post("/:id/update-conclusion", async (c) => {
 		);
 	}
 
-	const { updateToolCallConclusion, getSubagentFinalText } = await import(
-		"../services/narrator-session"
-	);
-	const finalText = await getSubagentFinalText(id);
-
-	const hasError = narrator.substatus?.includes("error") ?? false;
-	await updateToolCallConclusion(
-		id,
-		narrator.parentNarratorId,
+	const { updateToolCallConclusion } = await import("../services/narrator-session");
+	await updateToolCallConclusion({
+		subagentId: id,
+		parentNarratorId: narrator.parentNarratorId,
 		toolUseId,
 		finalText,
 		hasError,
-		privateMessageId,
-	);
+		messageId: privateMessageId,
+	});
 
 	return c.json({ ok: true, toolUseId });
 });

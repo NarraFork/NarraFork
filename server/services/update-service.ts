@@ -249,7 +249,143 @@ function getServerBaseUrl(): string {
 }
 
 /**
+ * Parse a semver string into comparable parts.
+ * Pre-release versions (e.g. 0.2.0-beta.1) sort lower than the same version without pre-release.
+ */
+function parseSemver(v: string): { major: number; minor: number; patch: number; pre: string } {
+	const [core, ...rest] = v.split("-");
+	const [major = 0, minor = 0, patch = 0] = core.split(".").map(Number);
+	return { major, minor, patch, pre: rest.join("-") };
+}
+
+/**
+ * Compare two semver strings. Returns >0 if a > b, <0 if a < b, 0 if equal.
+ * Pre-release identifiers are compared segment-by-segment with numeric awareness
+ * (e.g. beta.9 < beta.10).
+ */
+function compareSemver(a: string, b: string): number {
+	const va = parseSemver(a);
+	const vb = parseSemver(b);
+	if (va.major !== vb.major) return va.major - vb.major;
+	if (va.minor !== vb.minor) return va.minor - vb.minor;
+	if (va.patch !== vb.patch) return va.patch - vb.patch;
+	// No pre-release > has pre-release (e.g. 0.2.0 > 0.2.0-beta.1)
+	if (!va.pre && vb.pre) return 1;
+	if (va.pre && !vb.pre) return -1;
+	// Compare pre-release segment-by-segment (semver §11)
+	const aParts = va.pre.split(".");
+	const bParts = vb.pre.split(".");
+	for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
+		if (i >= aParts.length) return -1; // fewer segments = lower precedence
+		if (i >= bParts.length) return 1;
+		const aNum = Number(aParts[i]);
+		const bNum = Number(bParts[i]);
+		const aIsNum = !Number.isNaN(aNum);
+		const bIsNum = !Number.isNaN(bNum);
+		if (aIsNum && bIsNum) {
+			if (aNum !== bNum) return aNum - bNum;
+		} else if (aIsNum !== bIsNum) {
+			return aIsNum ? -1 : 1; // numeric < string per semver spec
+		} else {
+			const cmp = aParts[i].localeCompare(bParts[i]);
+			if (cmp !== 0) return cmp;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Fetch a single channel from the update server and build an UpdateCheckResult.
+ */
+async function checkChannel(
+	serverUrl: string,
+	product: string,
+	channel: string,
+	platform: string,
+): Promise<UpdateCheckResult> {
+	const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
+	logger.debug("Checking for updates", { url: checkUrl, channel });
+
+	const response = await fetch(checkUrl);
+	if (!response.ok) {
+		logger.warn("Update check failed", { status: response.status, channel });
+		return { updateAvailable: false, currentVersion: APP_VERSION };
+	}
+
+	const data = (await response.json()) as V2CheckResponse;
+
+	if (!data.updateAvailable || !data.version || !data.file) {
+		return {
+			updateAvailable: false,
+			currentVersion: APP_VERSION,
+			latestVersion: data.version,
+		};
+	}
+
+	const releaseInfo: ReleaseInfo = {
+		version: data.version,
+		releaseDate: data.releaseDate ?? new Date().toISOString(),
+		releaseNotes: data.releaseNotes,
+		path: data.file.filename,
+		sha512: data.file.sha512,
+		files: [
+			{
+				url: data.file.filename,
+				size: data.file.size,
+				sha512: data.file.sha512,
+			},
+		],
+		_v2: {
+			zstdPatchUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.url}` : undefined,
+			zstdPatchMetaUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.metaUrl}` : undefined,
+			patchChain: data.patchChain?.map((step) => ({
+				...step,
+				url: `${serverUrl}${step.url}`,
+				metaUrl: `${serverUrl}${step.metaUrl}`,
+			})),
+		},
+		releaseNotesPerVersion: data.releaseNotesPerVersion,
+	};
+
+	let downloadSize: number | undefined;
+	let zstdPatchSize: number | undefined;
+	let strategy: "zstd" | undefined;
+	let patchChain: UpdateCheckResult["patchChain"];
+
+	if (data.zstdPatch && data.zstdPatch.fromVersion === APP_VERSION) {
+		zstdPatchSize = data.zstdPatch.patchSize;
+		strategy = "zstd";
+		downloadSize = zstdPatchSize;
+	} else if (data.patchChain && data.patchChain.length > 0) {
+		patchChain = data.patchChain.map((step) => ({
+			...step,
+			url: `${serverUrl}${step.url}`,
+			metaUrl: `${serverUrl}${step.metaUrl}`,
+		}));
+		strategy = "zstd";
+		downloadSize = patchChain.reduce((sum, s) => sum + s.patchSize, 0);
+	}
+
+	const totalSize = data.file.size;
+	if (!downloadSize) downloadSize = totalSize;
+
+	return {
+		updateAvailable: true,
+		currentVersion: APP_VERSION,
+		latestVersion: data.version,
+		releaseInfo,
+		downloadSize,
+		totalSize,
+		zstdPatchSize,
+		strategy,
+		patchChain,
+	};
+}
+
+/**
  * Check for updates from the update server (v2 API).
+ * When on the beta channel, also checks stable — if a newer stable version exists,
+ * it takes priority so beta users can upgrade to the next stable release.
  */
 export async function checkForUpdate(): Promise<UpdateCheckResult> {
 	const serverUrl = getServerBaseUrl();
@@ -262,86 +398,25 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 	const product = settings.update?.product ?? "narrafork";
 
 	try {
-		const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
-		logger.debug("Checking for updates", { url: checkUrl });
+		if (channel === "beta") {
+			// Check both channels in parallel
+			const [betaResult, stableResult] = await Promise.all([
+				checkChannel(serverUrl, product, "beta", platform),
+				checkChannel(serverUrl, product, "stable", platform),
+			]);
 
-		const response = await fetch(checkUrl);
-		if (!response.ok) {
-			logger.warn("Update check failed", { status: response.status });
-			return { updateAvailable: false, currentVersion: APP_VERSION };
+			// Pick the higher version between the two channels
+			if (stableResult.updateAvailable && betaResult.updateAvailable) {
+				const sv = stableResult.latestVersion ?? "0.0.0";
+				const bv = betaResult.latestVersion ?? "0.0.0";
+				return compareSemver(sv, bv) >= 0 ? stableResult : betaResult;
+			}
+			if (stableResult.updateAvailable) return stableResult;
+			if (betaResult.updateAvailable) return betaResult;
+			return betaResult; // neither has update — return beta result for latestVersion info
 		}
 
-		const data = (await response.json()) as V2CheckResponse;
-
-		if (!data.updateAvailable || !data.version || !data.file) {
-			return {
-				updateAvailable: false,
-				currentVersion: APP_VERSION,
-				latestVersion: data.version,
-			};
-		}
-
-		// Build ReleaseInfo from v2 response for downstream compatibility
-		const releaseInfo: ReleaseInfo = {
-			version: data.version,
-			releaseDate: data.releaseDate ?? new Date().toISOString(),
-			releaseNotes: data.releaseNotes,
-			path: data.file.filename,
-			sha512: data.file.sha512,
-			files: [
-				{
-					url: data.file.filename,
-					size: data.file.size,
-					sha512: data.file.sha512,
-				},
-			],
-			_v2: {
-				zstdPatchUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.url}` : undefined,
-				zstdPatchMetaUrl: data.zstdPatch ? `${serverUrl}${data.zstdPatch.metaUrl}` : undefined,
-				patchChain: data.patchChain?.map((step) => ({
-					...step,
-					url: `${serverUrl}${step.url}`,
-					metaUrl: `${serverUrl}${step.metaUrl}`,
-				})),
-			},
-			releaseNotesPerVersion: data.releaseNotesPerVersion,
-		};
-
-		let downloadSize: number | undefined;
-		let zstdPatchSize: number | undefined;
-		let strategy: "zstd" | undefined;
-		let patchChain: UpdateCheckResult["patchChain"];
-
-		// Check zstd patch availability
-		if (data.zstdPatch && data.zstdPatch.fromVersion === APP_VERSION) {
-			zstdPatchSize = data.zstdPatch.patchSize;
-			strategy = "zstd";
-			downloadSize = zstdPatchSize;
-		} else if (data.patchChain && data.patchChain.length > 0) {
-			// No direct patch — use chain
-			patchChain = data.patchChain.map((step) => ({
-				...step,
-				url: `${serverUrl}${step.url}`,
-				metaUrl: `${serverUrl}${step.metaUrl}`,
-			}));
-			strategy = "zstd";
-			downloadSize = patchChain.reduce((sum, s) => sum + s.patchSize, 0);
-		}
-
-		const totalSize = data.file.size;
-		if (!downloadSize) downloadSize = totalSize;
-
-		return {
-			updateAvailable: true,
-			currentVersion: APP_VERSION,
-			latestVersion: data.version,
-			releaseInfo,
-			downloadSize,
-			totalSize,
-			zstdPatchSize,
-			strategy,
-			patchChain,
-		};
+		return await checkChannel(serverUrl, product, channel, platform);
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
 		return { updateAvailable: false, currentVersion: APP_VERSION };

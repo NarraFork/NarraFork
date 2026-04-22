@@ -960,6 +960,7 @@ export const narratorPersistence = {
 			status: "success" | "fail";
 			errorMessage?: string;
 			durationMs?: number;
+			resultMessageId?: string;
 		},
 		messageId?: string,
 	) {
@@ -972,6 +973,7 @@ export const narratorPersistence = {
 				status: result.status,
 				errorMessage: result.errorMessage ?? null,
 				durationMs: result.durationMs ?? null,
+				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
 			.where(and(...conditions));
 	},

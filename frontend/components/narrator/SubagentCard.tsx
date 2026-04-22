@@ -458,10 +458,13 @@ export const SubagentCard = memo(
 				if (onViewSubagentSession) {
 					onViewSubagentSession(subagentNarratorId);
 				} else {
+					const search: Record<string, string> = {};
+					if (fromParam) search.from = fromParam;
+					if (toolCall.resultMessageId) search.scrollTo = toolCall.resultMessageId;
 					navigate({
 						to: "/narrators/$narratorId",
 						params: { narratorId: subagentNarratorId },
-						search: fromParam ? { from: fromParam } : undefined,
+						search: Object.keys(search).length > 0 ? search : undefined,
 					});
 				}
 				swipe.closeSwipe();
@@ -475,7 +478,14 @@ export const SubagentCard = memo(
 					if (el) el.scrollTop = el.scrollHeight;
 				}, 300);
 			}
-		}, [subagentNarratorId, onViewSubagentSession, swipe.closeSwipe, navigate, fromParam]);
+		}, [
+			subagentNarratorId,
+			onViewSubagentSession,
+			swipe.closeSwipe,
+			navigate,
+			fromParam,
+			toolCall.resultMessageId,
+		]);
 
 		const cardMenuItems = (
 			<>

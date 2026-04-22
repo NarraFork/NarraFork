@@ -654,10 +654,17 @@ export async function runAgentLoop(
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
-			const dbMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+			const rawMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
 
 			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
 			const freshNarrator = await narratorService.getById(narratorId);
+
+			// Subagent messages all have parentToolUseId set — clear it so
+			// buildHistory treats them as top-level (same as loadSubagentHistory).
+			const isSubagentNarrator = isSubagentVariant(freshNarrator.variant);
+			const dbMessages = isSubagentNarrator
+				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
+				: rawMessages;
 
 			// Apply dynamic pruning — strip tool calls from messages at or
 			// before the persisted boundary so the context stays within budget.
@@ -740,6 +747,7 @@ export async function runAgentLoop(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
+				isSubagent: isSubagentNarrator,
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
 				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
@@ -1746,39 +1754,34 @@ export async function runAgentLoop(
 		active._loopRunning = false;
 		active.alive = false;
 
-		// --- Resolve suspended subagent or conclusion watcher ---
+		// --- Resolve conclusion watcher ---
 		// When a subagent narrator completes (from the subagent page), check if
-		// the parent narrator's runSubagent Promise is suspended waiting for it,
-		// or if there's a conclusion watcher registered for post-completion updates.
+		// there's a conclusion watcher registered for post-completion updates.
 		try {
 			const narr = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
 				columns: { variant: true, parentNarratorId: true },
 			});
 			if (narr && isSubagentVariant(narr.variant)) {
-				const {
-					isSubagentSuspended: isSuspended,
-					resolveSuspendedSubagent,
-					getConclusionWatcher,
-					removeConclusionWatcher,
-				} = await import("./narrator-subagent");
+				const { getConclusionWatcher, removeConclusionWatcher } = await import(
+					"./narrator-subagent"
+				);
 
 				const lastFinalText = await getSubagentFinalText(narratorId);
 
-				if (isSuspended(narratorId)) {
-					// Scenario 1: parent narrator's Promise is still hanging
-					resolveSuspendedSubagent(narratorId, lastFinalText, loopHadError);
-				} else if (getConclusionWatcher(narratorId)) {
-					// Scenario 2: subagent already completed before, user updated conclusion
+				if (getConclusionWatcher(narratorId)) {
 					const watcher = getConclusionWatcher(narratorId)!;
 					removeConclusionWatcher(narratorId);
-					await updateToolCallConclusion(
-						narratorId,
-						watcher.parentNarratorId,
-						watcher.toolUseId,
-						lastFinalText,
-						loopHadError,
-					);
+					// Resolve the last assistant message ID for result binding
+					const resultMsgId = await getSubagentResultMessageId(narratorId);
+					await updateToolCallConclusion({
+						subagentId: narratorId,
+						parentNarratorId: watcher.parentNarratorId,
+						toolUseId: watcher.toolUseId,
+						finalText: lastFinalText,
+						hasError: loopHadError,
+						resultMessageId: resultMsgId,
+					});
 				}
 			}
 		} catch (err) {
@@ -2114,18 +2117,41 @@ export async function getSubagentFinalText(narratorId: string): Promise<string> 
 }
 
 /**
+ * Get the ID of the subagent's last assistant message.
+ * Used to bind tool call results to a specific subagent message.
+ */
+export async function getSubagentResultMessageId(narratorId: string): Promise<string | undefined> {
+	const messages = await narratorService.getMessagesSinceLastCompact(narratorId);
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "assistant") return messages[i].id;
+	}
+	return undefined;
+}
+
+/**
  * Update the parent narrator's tool_call outputJson with a new conclusion.
  * Used for scenario 2 (conclusion watcher) and the update-conclusion API.
  */
-export async function updateToolCallConclusion(
-	subagentId: string,
-	parentNarratorId: string,
-	toolUseId: string,
-	finalText: string,
-	hasError: boolean,
+export async function updateToolCallConclusion(opts: {
+	subagentId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	finalText: string;
+	hasError: boolean;
 	/** Pass after copy-on-write to scope the update to the private message copy. */
-	messageId?: string,
-): Promise<void> {
+	messageId?: string;
+	/** The subagent assistant message that produced this result. */
+	resultMessageId?: string;
+}): Promise<void> {
+	const {
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		finalText,
+		hasError,
+		messageId,
+		resultMessageId,
+	} = opts;
 	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 	const output = resultPrefix + (finalText || "(no output)");
 
@@ -2135,6 +2161,7 @@ export async function updateToolCallConclusion(
 			output,
 			status: hasError ? "fail" : "success",
 			errorMessage: hasError ? finalText : undefined,
+			resultMessageId,
 		},
 		messageId,
 	);

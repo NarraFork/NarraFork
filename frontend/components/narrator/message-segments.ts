@@ -121,6 +121,8 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
 			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
 			startedAt,
+			resultMessageId:
+				(block.resultMessageId as string) ?? (tc?.resultMessageId as string) ?? undefined,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_metadata: block._metadata ?? (tc as any)?._metadata,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields

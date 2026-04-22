@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { narrators } from "../db/schema";
+import { narrators, narratorToolCalls } from "../db/schema";
 import { type AgentConfig, buildHistory, type ToolDefinition } from "../lib/agent";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { ValidationError } from "../lib/errors";
@@ -43,6 +43,7 @@ import { narratorService } from "./narrator-service";
 import {
 	buildContextManagementHooks,
 	finalizeOrCleanupPartialMessage,
+	getSubagentResultMessageId,
 	handlePermission,
 	pruneToolCalls,
 	toBufferSummary,
@@ -83,27 +84,29 @@ function getSubagentBufferedMessagesMap() {
 	return _subagentBufferedMessages;
 }
 
-// === Suspended subagent state ===
-// When a foreground subagent is interrupted by the user, instead of immediately
-// returning an error to the parent narrator, we suspend the Promise and wait
-// for the user to continue operating the subagent from its dedicated page.
+// === Manual override state ===
+// When a foreground subagent is interrupted, the parent narrator blocks until
+// the user explicitly clicks "Update Conclusion" from the subagent page.
+// This map is ONLY resolved by the update-conclusion API endpoint, giving
+// the user full control over when to return results.
 
-interface SuspendedSubagentEntry {
-	/** Resolve the parent narrator's runSubagent Promise with the final result. */
+interface ManualOverrideEntry {
 	resolve: (result: { finalText: string; hasError: boolean }) => void;
-	/** Reject the parent narrator's runSubagent Promise (e.g. parent interrupted). */
-	reject: (err: Error) => void;
-	/** Parent narrator's abort signal — if parent is interrupted, we reject. */
 	parentSignal: AbortSignal;
 	parentNarratorId: string;
 	toolUseId: string;
+	/** The subagent ID that was active when manual override started. */
+	subagentId: string;
 }
 
-let _suspendedSubagents: Map<string, SuspendedSubagentEntry> | undefined;
-function getSuspendedSubagentsMap() {
-	if (!_suspendedSubagents) _suspendedSubagents = new Map();
-	return _suspendedSubagents;
+let _manualOverrides: Map<string, ManualOverrideEntry> | undefined;
+function getManualOverrideMap() {
+	if (!_manualOverrides) _manualOverrides = new Map();
+	return _manualOverrides;
 }
+
+/** Maximum time to wait for manual override before timing out (2 hours). */
+const MANUAL_OVERRIDE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 /**
  * Conclusion watchers: for subagents that have already completed (done/error)
@@ -852,41 +855,6 @@ export function interruptForegroundSubagent(subagentId: string): boolean {
 	return true;
 }
 
-// === Suspended subagent public API ===
-
-/** Check if a subagent is currently suspended (waiting for user to continue). */
-export function isSubagentSuspended(subagentId: string): boolean {
-	return getSuspendedSubagentsMap().has(subagentId);
-}
-
-/**
- * Resolve a suspended subagent's Promise with the final result.
- * Called when the subagent completes after the user continued operating it.
- */
-export function resolveSuspendedSubagent(
-	subagentId: string,
-	finalText: string,
-	hasError: boolean,
-): boolean {
-	const entry = getSuspendedSubagentsMap().get(subagentId);
-	if (!entry) return false;
-	getSuspendedSubagentsMap().delete(subagentId);
-	entry.resolve({ finalText, hasError });
-	return true;
-}
-
-/**
- * Abandon a suspended subagent — resolve its Promise as an error.
- * Called when the parent narrator is interrupted or the user explicitly abandons.
- */
-export function abandonSuspendedSubagent(subagentId: string): boolean {
-	const entry = getSuspendedSubagentsMap().get(subagentId);
-	if (!entry) return false;
-	getSuspendedSubagentsMap().delete(subagentId);
-	entry.resolve({ finalText: "Subagent abandoned by user", hasError: true });
-	return true;
-}
-
 // === Conclusion watcher public API ===
 
 /** Register a watcher for an already-completed subagent's next conclusion. */
@@ -908,11 +876,100 @@ export function getConclusionWatcher(subagentId: string): ConclusionWatcher | un
 	return getConclusionWatchersMap().get(subagentId);
 }
 
+// === Manual override public API ===
+
+/** Check if a subagent is in manual override (parent blocked, waiting for update-conclusion). */
+export function isManualOverride(subagentId: string): boolean {
+	return getManualOverrideMap().has(subagentId);
+}
+
+/**
+ * Resolve a manual-override subagent's blocked Promise.
+ * Called from the update-conclusion API when the user clicks "Update Conclusion".
+ */
+export function resolveManualOverride(
+	subagentId: string,
+	finalText: string,
+	hasError: boolean,
+): boolean {
+	const entry = getManualOverrideMap().get(subagentId);
+	if (!entry) return false;
+	getManualOverrideMap().delete(subagentId);
+	entry.resolve({ finalText, hasError });
+	return true;
+}
+
+/** Abandon a manual-override subagent (e.g. parent interrupted). */
+export function abandonManualOverride(subagentId: string): boolean {
+	const entry = getManualOverrideMap().get(subagentId);
+	if (!entry) return false;
+	getManualOverrideMap().delete(subagentId);
+	entry.resolve({ finalText: "Manual override abandoned", hasError: true });
+	return true;
+}
+
 /** Maximum background task execution time (30 minutes). */
 const BACKGROUND_TASK_TIMEOUT_MS = 30 * 60 * 1000;
 
-/** Maximum time a suspended subagent can wait for the user to continue (30 minutes). */
-const SUSPENDED_SUBAGENT_TIMEOUT_MS = 30 * 60 * 1000;
+/**
+ * Block until the user clicks "Update Conclusion" (or parent is interrupted / timeout).
+ * Used by both runSubagent and continueSubagent when the subagent is interrupted.
+ */
+function waitForManualOverride(
+	subagentId: string,
+	parentSignal: AbortSignal,
+	parentNarratorId: string,
+	toolUseId: string,
+): Promise<{ finalText: string; hasError: boolean }> {
+	return new Promise<{ finalText: string; hasError: boolean }>((resolve) => {
+		// Shared cleanup: clear timeout and remove the abort listener to avoid leaks.
+		const cleanup = () => {
+			clearTimeout(timeoutId);
+			parentSignal.removeEventListener("abort", onParentAbort);
+		};
+
+		const timeoutId = setTimeout(() => {
+			const entry = getManualOverrideMap().get(subagentId);
+			if (entry) {
+				getManualOverrideMap().delete(subagentId);
+				cleanup();
+				resolve({
+					finalText: "Manual override timed out after 2 hours",
+					hasError: true,
+				});
+			}
+		}, MANUAL_OVERRIDE_TIMEOUT_MS);
+
+		getManualOverrideMap().set(subagentId, {
+			resolve: (result) => {
+				cleanup();
+				resolve(result);
+			},
+			parentSignal,
+			parentNarratorId,
+			toolUseId,
+			subagentId,
+		});
+
+		// If parent narrator is interrupted, abandon the manual override
+		const onParentAbort = () => {
+			const entry = getManualOverrideMap().get(subagentId);
+			if (entry) {
+				getManualOverrideMap().delete(subagentId);
+				cleanup();
+				resolve({
+					finalText: "Parent narrator interrupted",
+					hasError: true,
+				});
+			}
+		};
+		if (parentSignal.aborted) {
+			onParentAbort();
+		} else {
+			parentSignal.addEventListener("abort", onParentAbort, { once: true });
+		}
+	});
+}
 
 /**
  * Execute a background task (fire-and-forget).
@@ -1137,6 +1194,155 @@ export function waitForBackgroundTask(
 	});
 }
 
+// === Foreground subagent execution loop ===
+
+interface ForegroundLoopInput {
+	subagentId: string;
+	parentNarratorId: string;
+	toolUseId: string;
+	subagentType: string;
+	prompt: string;
+	cwd: string;
+	model: string;
+	provider: string;
+	locale: string;
+	signal: AbortSignal;
+	systemPrompt: string;
+	initialHistory: unknown[];
+	initialTrailingToolResults?: unknown[];
+	customDef: Awaited<ReturnType<typeof customSubagentService.loadByName>> | null;
+}
+
+/**
+ * Shared foreground execution loop for both runSubagent and continueSubagent.
+ * Handles the while-loop, buffered message consumption, and manual override.
+ * Returns the subagent_id-prefixed result string.
+ */
+async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
+	const {
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		subagentType,
+		cwd,
+		model,
+		provider,
+		locale,
+		signal,
+		systemPrompt,
+		customDef,
+	} = input;
+
+	let finalText = "";
+	let hasError = false;
+	let currentPrompt = input.prompt;
+	let currentHistory: unknown[] = input.initialHistory;
+	let currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
+
+	try {
+		while (true) {
+			const fgAbort = new AbortController();
+			getForegroundAbortControllers().set(subagentId, fgAbort);
+			const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
+			const result = await executeSubagent({
+				narratorId: subagentId,
+				parentNarratorId,
+				toolUseId,
+				subagentType,
+				prompt: currentPrompt,
+				cwd,
+				model,
+				provider,
+				locale,
+				signal: combinedSignal,
+				systemPrompt,
+				initialHistory: currentHistory,
+				initialTrailingToolResults: currentTrailingToolResults,
+				customDef,
+			});
+			finalText = result.contextLengthExceeded
+				? "Error: context length exceeded"
+				: result.finalText;
+			hasError = result.hasError || !!result.contextLengthExceeded;
+			getForegroundAbortControllers().delete(subagentId);
+			const continueAfterInterrupt =
+				!hasError &&
+				fgAbort.signal.aborted &&
+				!signal.aborted &&
+				(await consumeNextBufferedSubagentMessage({
+					narratorId: subagentId,
+					parentNarratorId,
+					toolUseId,
+					model,
+					provider: resolveProvider(model),
+				}));
+			if (continueAfterInterrupt) {
+				currentPrompt = continueAfterInterrupt.prompt;
+				currentHistory = continueAfterInterrupt.history;
+				currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
+				finalText = "";
+				continue;
+			}
+			// Detect subagent-only interrupt (not parent abort)
+			if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
+				// --- Manual override: block until user clicks "Update Conclusion" ---
+				await narratorService.updateStatus(subagentId, "idle", {
+					substatus: ["manual_override"],
+				});
+				broadcastToNarrator(parentNarratorId, {
+					type: "subagent_suspended",
+					narratorId: parentNarratorId,
+					subagentNarratorId: subagentId,
+					toolUseId,
+				});
+				broadcastToNarrator(subagentId, {
+					type: "status_change",
+					narratorId: subagentId,
+					status: "idle",
+					substatus: ["manual_override"],
+				});
+
+				const overrideResult = await waitForManualOverride(
+					subagentId,
+					signal,
+					parentNarratorId,
+					toolUseId,
+				);
+
+				finalText = overrideResult.finalText;
+				hasError = overrideResult.hasError;
+			}
+			break;
+		}
+	} finally {
+		getManualOverrideMap().delete(subagentId);
+		getForegroundAbortControllers().delete(subagentId);
+		await finalizeSubagent(
+			subagentId,
+			parentNarratorId,
+			toolUseId,
+			hasError,
+			hasError ? finalText : null,
+		);
+
+		// Bind the result to the subagent's last assistant message
+		try {
+			const resultMsgId = await getSubagentResultMessageId(subagentId);
+			if (resultMsgId) {
+				await db
+					.update(narratorToolCalls)
+					.set({ resultMessageId: resultMsgId })
+					.where(eq(narratorToolCalls.toolUseId, toolUseId));
+			}
+		} catch {
+			// Non-critical — don't fail the whole flow
+		}
+	}
+
+	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	return resultPrefix + (finalText || "(no output)");
+}
+
 // === Subagent runner ===
 
 export interface RunSubagentInput {
@@ -1321,147 +1527,23 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		);
 	}
 
-	// --- Foreground mode (existing behavior) ---
+	// --- Foreground mode ---
 
-	// 4. Run via unified executor (with compact/prune for general)
-	let finalText = "";
-	let hasError = false;
-	let currentPrompt = prompt;
-	let currentHistory: unknown[] = [];
-	let currentTrailingToolResults: unknown[] | undefined;
-
-	try {
-		while (true) {
-			const fgAbort = new AbortController();
-			getForegroundAbortControllers().set(subagentId, fgAbort);
-			const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
-			const result = await executeSubagent({
-				narratorId: subagentId,
-				parentNarratorId,
-				toolUseId,
-				subagentType,
-				prompt: currentPrompt,
-				cwd,
-				model,
-				provider,
-				locale,
-				signal: combinedSignal,
-				systemPrompt,
-				initialHistory: currentHistory,
-				initialTrailingToolResults: currentTrailingToolResults,
-				customDef,
-			});
-			finalText = result.contextLengthExceeded
-				? "Error: context length exceeded"
-				: result.finalText;
-			hasError = result.hasError || !!result.contextLengthExceeded;
-			getForegroundAbortControllers().delete(subagentId);
-			const continueAfterInterrupt =
-				!hasError &&
-				fgAbort.signal.aborted &&
-				!signal.aborted &&
-				(await consumeNextBufferedSubagentMessage({
-					narratorId: subagentId,
-					parentNarratorId,
-					toolUseId,
-					model,
-					provider: resolveProvider(model),
-				}));
-			if (continueAfterInterrupt) {
-				currentPrompt = continueAfterInterrupt.prompt;
-				currentHistory = continueAfterInterrupt.history;
-				currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
-				finalText = "";
-				continue;
-			}
-			// Detect subagent-only interrupt (not parent abort)
-			if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-				// --- Suspend: wait for user to continue operating the subagent ---
-				await narratorService.updateStatus(subagentId, "idle", { substatus: ["suspended"] });
-				broadcastToNarrator(parentNarratorId, {
-					type: "subagent_suspended",
-					narratorId: parentNarratorId,
-					subagentNarratorId: subagentId,
-					toolUseId,
-				});
-				broadcastToNarrator(subagentId, {
-					type: "status_change",
-					narratorId: subagentId,
-					status: "idle",
-					substatus: ["suspended"],
-				});
-
-				// Create a Promise that will be resolved when the subagent
-				// completes again (after user continues from the subagent page).
-				// Includes a timeout to prevent indefinite memory leaks.
-				const suspendResult = await new Promise<{
-					finalText: string;
-					hasError: boolean;
-				}>((resolve, reject) => {
-					const timeoutId = setTimeout(() => {
-						const entry = getSuspendedSubagentsMap().get(subagentId);
-						if (entry) {
-							getSuspendedSubagentsMap().delete(subagentId);
-							resolve({
-								finalText: "Suspended subagent timed out after 30 minutes",
-								hasError: true,
-							});
-						}
-					}, SUSPENDED_SUBAGENT_TIMEOUT_MS);
-
-					getSuspendedSubagentsMap().set(subagentId, {
-						resolve: (result) => {
-							clearTimeout(timeoutId);
-							resolve(result);
-						},
-						reject: (err) => {
-							clearTimeout(timeoutId);
-							reject(err);
-						},
-						parentSignal: signal,
-						parentNarratorId,
-						toolUseId,
-					});
-
-					// If parent narrator is interrupted, abandon the suspended subagent
-					const onParentAbort = () => {
-						clearTimeout(timeoutId);
-						const entry = getSuspendedSubagentsMap().get(subagentId);
-						if (entry) {
-							getSuspendedSubagentsMap().delete(subagentId);
-							resolve({
-								finalText: "Parent narrator interrupted",
-								hasError: true,
-							});
-						}
-					};
-					if (signal.aborted) {
-						onParentAbort();
-					} else {
-						signal.addEventListener("abort", onParentAbort, { once: true });
-					}
-				});
-
-				finalText = suspendResult.finalText;
-				hasError = suspendResult.hasError;
-			}
-			break;
-		}
-	} finally {
-		// Clean up suspended state if still present
-		getSuspendedSubagentsMap().delete(subagentId);
-		getForegroundAbortControllers().delete(subagentId);
-		await finalizeSubagent(
-			subagentId,
-			parentNarratorId,
-			toolUseId,
-			hasError,
-			hasError ? finalText : null,
-		);
-	}
-
-	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
-	return resultPrefix + (finalText || "(no output)");
+	return runForegroundLoop({
+		subagentId,
+		parentNarratorId,
+		toolUseId,
+		subagentType,
+		prompt,
+		cwd,
+		model,
+		provider,
+		locale,
+		signal,
+		systemPrompt,
+		initialHistory: [],
+		customDef,
+	});
 }
 
 // === Continue subagent ===
@@ -1476,13 +1558,13 @@ export interface ContinueSubagentInput {
 }
 
 /**
- * Continue a previously completed/errored subagent by forking it.
+ * Continue a previously completed/errored subagent in-place.
  *
- * Instead of mutating the original subagent, we create a new subagent narrator
- * that shares the original's message history (via narrator_message_refs) and
- * then runs a fresh agent loop with the follow-up prompt. This keeps the
- * original subagent's message tree intact for fork-from-middle support and
- * avoids parentToolUseId complications.
+ * Instead of forking, we directly resume the original subagent narrator:
+ * persist a new user message (with the ContinueTask's toolUseId as
+ * parentToolUseId), reload the full history, and run the agent loop.
+ * The subagent keeps its single narrator record and accumulates a
+ * continuous conversation visible on the subagent page.
  */
 export async function continueSubagent(input: ContinueSubagentInput): Promise<string> {
 	const { subagentId, parentNarratorId, toolUseId, prompt, signal, locale } = input;
@@ -1515,72 +1597,37 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 		subagentType === "explore" || subagentType === "plan" || subagentType === "general";
 	const customDef = isBuiltinContinue ? null : await customSubagentService.loadByName(subagentType);
 
-	// 2. Fork: create new subagent narrator and copy message refs from original
-	const forked = await narratorService.forkSubagent({
-		originalSubagentId: subagentId,
+	// 2. Mark subagent as working (in-place, no fork)
+	const now = new Date().toISOString();
+	await db
+		.update(narrators)
+		.set({ status: "working", substatus: "[]", errorMessage: null, updatedAt: now })
+		.where(eq(narrators.id, subagentId));
+
+	// 3. Broadcast subagent_started (same subagentId)
+	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
+
+	// 4. Persist new user message with ContinueTask's toolUseId
+	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
+
+	// 5. Load full subagent history (all previous rounds included)
+	const { history, trailingToolResults } = await loadSubagentHistory(subagentId, model, provider);
+
+	// 6. Run via shared foreground loop (same subagentId)
+	return runForegroundLoop({
+		subagentId,
 		parentNarratorId,
+		toolUseId,
 		subagentType,
+		prompt,
 		cwd,
-		systemPrompt: original.systemPrompt ?? undefined,
 		model,
-		permissionMode: original.permissionMode ?? undefined,
-		_original: original,
+		provider,
+		locale,
+		signal,
+		systemPrompt: original.systemPrompt ?? "",
+		initialHistory: history,
+		initialTrailingToolResults: trailingToolResults,
+		customDef,
 	});
-	const forkedId = forked.id;
-
-	// 3. Broadcast subagent_started
-	broadcastSubagentStarted(forkedId, parentNarratorId, toolUseId, subagentType, model);
-
-	// 4. Persist new user message under the forked subagent
-	await narratorService.persistSubagentUserMessage(forkedId, prompt, toolUseId);
-
-	// 5. Load forked subagent's history
-	const { history, trailingToolResults } = await loadSubagentHistory(forkedId, model, provider);
-
-	// Create an independent AbortController for interrupt support
-	const fgAbort = new AbortController();
-	getForegroundAbortControllers().set(forkedId, fgAbort);
-	const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
-
-	// 6. Run via unified executor (with compact/prune for general)
-	let finalText = "";
-	let hasError = false;
-
-	try {
-		const result = await executeSubagent({
-			narratorId: forkedId,
-			parentNarratorId,
-			toolUseId,
-			subagentType,
-			prompt,
-			cwd,
-			model,
-			provider,
-			locale,
-			signal: combinedSignal,
-			systemPrompt: original.systemPrompt ?? "",
-			initialHistory: history,
-			initialTrailingToolResults: trailingToolResults,
-			customDef,
-		});
-		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
-		hasError = result.hasError || !!result.contextLengthExceeded;
-		// Detect subagent-only interrupt (not parent abort)
-		if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-			hasError = true;
-			finalText = "Subagent interrupted by user";
-		}
-	} finally {
-		getForegroundAbortControllers().delete(forkedId);
-		await finalizeSubagent(
-			forkedId,
-			parentNarratorId,
-			toolUseId,
-			hasError,
-			hasError ? finalText : null,
-		);
-	}
-
-	const resultPrefix = `<subagent_id>${forkedId}</subagent_id>\n\n`;
-	return resultPrefix + (finalText || "(no output)");
 }

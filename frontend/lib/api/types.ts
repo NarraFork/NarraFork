@@ -168,6 +168,7 @@ export interface ToolCallRecord {
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
 	permissionSuggestions?: unknown[] | null;
+	resultMessageId?: string | null;
 	createdAt?: string;
 }
 

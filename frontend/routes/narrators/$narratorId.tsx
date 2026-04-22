@@ -63,8 +63,11 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: loose search params
 	const search = useSearch({ strict: false }) as any;
 	const from = search?.from as string | undefined;
+	const scrollToMessageId = search?.scrollTo as string | undefined;
 	const location = useLocation();
-	const highlightMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
+	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
+	// scrollTo search param takes precedence over hash-based highlight
+	const highlightMessageId = scrollToMessageId ?? hashMessageId;
 	const isMobile = useMediaQuery("(max-width: 768px)");
 	const { t } = useTranslation("narrators");
 

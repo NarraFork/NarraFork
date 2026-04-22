@@ -148,6 +148,8 @@ export interface ToolCallData {
 	_resolvedModel?: string;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
 	_timeoutMs?: number;
+	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
+	resultMessageId?: string;
 }
 
 export type { PendingPermission } from "@frontend/types/narrator";
