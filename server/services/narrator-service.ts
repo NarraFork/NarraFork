@@ -1,4 +1,4 @@
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	chapters,
@@ -390,103 +390,14 @@ export const narratorService = {
 		return narrator;
 	},
 
-	async forkSubagent(input: {
-		originalSubagentId: string;
-		parentNarratorId: string;
-		subagentType: string;
-		cwd: string;
-		systemPrompt?: string;
-		model?: string;
-		permissionMode?: string;
-		_original?: typeof narrators.$inferSelect;
-	}) {
-		const original = input._original ?? (await this.getById(input.originalSubagentId));
-		if (!isSubagentVariant(original.variant)) {
-			throw new ValidationError("Can only fork subagent narrators");
-		}
-		const now = new Date().toISOString();
-		const id = generateId();
-
-		let basePermMode = input.permissionMode ?? "default";
-		if (basePermMode === "plan") {
-			basePermMode = original.relaxedPlan
-				? (original.previousPermissionMode ?? "default")
-				: "readOnly";
-		}
-		const resolvedPermMode = basePermMode as
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "plan"
-			| "dontAsk";
-
-		const prefixRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-				isCompact: narratorMessageRefs.isCompact,
-				prunedPercent: narratorMessageRefs.prunedPercent,
-			})
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, input.originalSubagentId))
-			.orderBy(narratorMessageRefs.seq);
-
-		const resolvedModel = resolveEffectiveModel(input.model);
-		const resolvedProvider = resolveProvider(resolvedModel);
-		const resolvedReasoningEffort =
-			original.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
-
-		const forkChapterId = original.chapterId ?? null;
-		const forkTraits: string[] = forkChapterId === null ? ["standalone"] : [];
-
-		const narrator = await db.transaction(async (tx) => {
-			const [created] = await tx
-				.insert(narrators)
-				.values({
-					id,
-					chapterId: forkChapterId,
-					type: "subagent",
-					subagentType: input.subagentType,
-					variant: subagentVariant(input.subagentType),
-					traits: forkTraits,
-					model: resolvedModel,
-					systemPrompt: input.systemPrompt ?? null,
-					permissionMode: resolvedPermMode,
-					reasoningEffort: resolvedReasoningEffort,
-					fastMode: original.fastMode ?? false,
-					relaxedPlan: original.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
-					parentNarratorId: input.parentNarratorId,
-					forkMessageId: prefixRows.length > 0 ? prefixRows[prefixRows.length - 1].messageId : null,
-					cwd: input.cwd,
-					inheritMode: "fresh",
-					status: "working",
-					createdAt: now,
-					updatedAt: now,
-				})
-				.returning();
-
-			if (prefixRows.length > 0) {
-				const refValues = prefixRows.map((row) => ({
-					id: generateId(),
-					narratorId: id,
-					messageId: row.messageId,
-					seq: row.seq,
-					isCompact: row.isCompact,
-					prunedPercent: row.prunedPercent,
-				}));
-				await insertRefsBatched(tx, refValues);
-			}
-
-			return created;
+	/**
+	 * List all subagents belonging to a parent narrator.
+	 */
+	async listSubagentsByParent(parentNarratorId: string) {
+		return db.query.narrators.findMany({
+			where: eq(narrators.parentNarratorId, parentNarratorId),
+			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
-
-		logger.info("Subagent forked", {
-			id,
-			originalSubagentId: input.originalSubagentId,
-			parentNarratorId: input.parentNarratorId,
-			subagentType: input.subagentType,
-		});
-		return narrator;
 	},
 
 	async persistSubagentUserMessage(

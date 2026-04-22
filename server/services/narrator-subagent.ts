@@ -126,7 +126,308 @@ function getConclusionWatchersMap() {
 	return _conclusionWatchers;
 }
 
+// === ProxyAbortController for detach/attach ===
+
+/**
+ * A proxy AbortController that forwards abort signals from one or more sources.
+ * The key feature: sources can be swapped at runtime (detach removes parent signal,
+ * adds independent background signal) without the consumer (agent loop) noticing.
+ */
+class ProxyAbortController {
+	private _ctrl = new AbortController();
+	private _listeners: Array<[AbortSignal, () => void]> = [];
+
+	get signal(): AbortSignal {
+		return this._ctrl.signal;
+	}
+
+	get aborted(): boolean {
+		return this._ctrl.signal.aborted;
+	}
+
+	/** Listen to one or more abort signal sources. */
+	listenTo(...signals: AbortSignal[]): void {
+		for (const s of signals) {
+			if (s.aborted) {
+				this._ctrl.abort(s.reason);
+				return;
+			}
+			const handler = () => this._ctrl.abort(s.reason);
+			s.addEventListener("abort", handler, { once: true });
+			this._listeners.push([s, handler]);
+		}
+	}
+
+	/** Remove listener for a specific signal source. */
+	unlisten(signal: AbortSignal): void {
+		this._listeners = this._listeners.filter(([s, h]) => {
+			if (s === signal) {
+				s.removeEventListener("abort", h);
+				return false;
+			}
+			return true;
+		});
+	}
+
+	/** Replace one signal source with another (used during detach). */
+	replaceSource(oldSignal: AbortSignal, newSignal: AbortSignal): void {
+		this.unlisten(oldSignal);
+		this.listenTo(newSignal);
+	}
+
+	abort(reason?: string): void {
+		this._ctrl.abort(reason);
+	}
+
+	/** Clean up all listeners and reset the internal AbortController. */
+	dispose(): void {
+		for (const [s, h] of this._listeners) {
+			s.removeEventListener("abort", h);
+		}
+		this._listeners = [];
+		// Reset the internal controller so the proxy can be reused after an abort.
+		// Without this, once _ctrl is aborted it stays aborted forever and
+		// subsequent listenTo() calls hand out a permanently-aborted signal.
+		if (this._ctrl.signal.aborted) {
+			this._ctrl = new AbortController();
+		}
+	}
+}
+
+// === Detach infrastructure ===
+
+interface DetachEntry {
+	/** Called to set the detached flag inside runLoop. */
+	markDetached: () => void;
+	/** Resolve the foreground Promise (unblocks parent narrator immediately). */
+	foregroundResolve: (result: string) => void;
+	proxy: ProxyAbortController;
+	parentSignal: AbortSignal;
+	fgAbort: AbortController;
+	toolUseId: string;
+	parentNarratorId: string;
+	subagentId: string;
+}
+
+let _detachableSubagents: Map<string, DetachEntry> | undefined;
+function getDetachableMap() {
+	if (!_detachableSubagents) _detachableSubagents = new Map();
+	return _detachableSubagents;
+}
+
+// === Attach infrastructure ===
+// When a background task is attached (pulled to foreground), we store a Promise
+// that the caller (continueSubagent) can await.
+
+interface AttachEntry {
+	promise: Promise<{ finalText: string; hasError: boolean }>;
+	resolve: (result: { finalText: string; hasError: boolean }) => void;
+}
+
+let _attachWaiters: Map<string, AttachEntry> | undefined;
+function getAttachWaitersMap() {
+	if (!_attachWaiters) _attachWaiters = new Map();
+	return _attachWaiters;
+}
+
+// === Background task alias registry ===
+// Provides human-readable aliases for background tasks (both Agent and Bash).
+// Scoped per parent narrator — aliases are unique within a narrator's session.
+// Maps: narratorId → Map<alias, realId> and realId → alias (bidirectional).
+
+interface AliasRegistry {
+	aliasToId: Map<string, string>;
+	idToAlias: Map<string, string>;
+}
+
+let _aliasRegistries: Map<string, AliasRegistry> | undefined;
+function getAliasRegistryMap() {
+	if (!_aliasRegistries) _aliasRegistries = new Map();
+	return _aliasRegistries;
+}
+
+function getOrCreateRegistry(narratorId: string): AliasRegistry {
+	const map = getAliasRegistryMap();
+	let reg = map.get(narratorId);
+	if (!reg) {
+		reg = { aliasToId: new Map(), idToAlias: new Map() };
+		map.set(narratorId, reg);
+	}
+	return reg;
+}
+
+/** Slugify a string for use as an alias. */
+function slugify(text: string): string {
+	return text
+		.toLowerCase()
+		.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-")
+		.replace(/^-|-$/g, "")
+		.slice(0, 40);
+}
+
+/**
+ * Register a background task alias. If the desired alias is taken,
+ * appends an incrementing suffix (-2, -3, ...).
+ * Returns the final unique alias and whether a conflict occurred.
+ */
+export function registerTaskAlias(
+	narratorId: string,
+	realId: string,
+	desiredAlias?: string,
+): { alias: string; conflicted: boolean } {
+	const reg = getOrCreateRegistry(narratorId);
+
+	// Already registered
+	const existing = reg.idToAlias.get(realId);
+	if (existing) return { alias: existing, conflicted: false };
+
+	let base = desiredAlias ? slugify(desiredAlias) : slugify(realId);
+	if (!base) base = "task";
+
+	let alias = base;
+	let suffix = 2;
+	let conflicted = false;
+	while (reg.aliasToId.has(alias)) {
+		alias = `${base}-${suffix}`;
+		suffix++;
+		conflicted = true;
+	}
+
+	reg.aliasToId.set(alias, realId);
+	reg.idToAlias.set(realId, alias);
+	return { alias, conflicted };
+}
+
+/**
+ * Resolve an alias or real ID to the actual task/subagent ID.
+ * Checks alias registry first, then returns the input as-is (assumed to be a real ID).
+ */
+export function resolveTaskAlias(narratorId: string, aliasOrId: string): string {
+	const reg = getAliasRegistryMap().get(narratorId);
+	if (!reg) return aliasOrId;
+	return reg.aliasToId.get(aliasOrId) ?? aliasOrId;
+}
+
+/** Get the alias for a real ID (if registered). */
+export function getTaskAlias(narratorId: string, realId: string): string | undefined {
+	return getAliasRegistryMap().get(narratorId)?.idToAlias.get(realId);
+}
+
+/** Clean up alias registry for a narrator. */
+export function clearAliasRegistry(narratorId: string): void {
+	getAliasRegistryMap().delete(narratorId);
+}
+
 // === Subagent type definitions ===
+
+// === Team file-change tracking ===
+// parentNarratorId → Map<subagentId, Set<filePath>>
+
+let _teamFileChanges: Map<string, Map<string, Set<string>>> | undefined;
+function getTeamFileChangesMap() {
+	if (!_teamFileChanges) _teamFileChanges = new Map();
+	return _teamFileChanges;
+}
+
+/** Record a file change made by a subagent (called from Write/Edit tools). */
+export function recordTeamFileChange(
+	parentNarratorId: string,
+	subagentId: string,
+	filePath: string,
+): void {
+	const team = getTeamFileChangesMap();
+	let members = team.get(parentNarratorId);
+	if (!members) {
+		members = new Map();
+		team.set(parentNarratorId, members);
+	}
+	let files = members.get(subagentId);
+	if (!files) {
+		files = new Set();
+		members.set(subagentId, files);
+	}
+	files.add(filePath);
+}
+
+/** Get all file changes for a team (all subagents under a parent narrator). */
+export function getTeamFileChanges(parentNarratorId: string): Map<string, Set<string>> {
+	return getTeamFileChangesMap().get(parentNarratorId) ?? new Map();
+}
+
+/** Clear file change tracking for a team. */
+export function clearTeamFileChanges(parentNarratorId: string): void {
+	getTeamFileChangesMap().delete(parentNarratorId);
+}
+
+// === Team messaging ===
+
+export interface TeamMessage {
+	fromId: string;
+	fromTitle: string | null;
+	fromType: string;
+	text: string;
+	timestamp: string;
+	isBroadcast: boolean;
+}
+
+// In-memory only — intentionally not persisted. Subagent lifetimes are short
+// (bounded by the parent narrator session) so messages don't need to survive
+// server restarts. This avoids DB overhead for ephemeral coordination data.
+let _teamInbox: Map<string, TeamMessage[]> | undefined;
+function getTeamInboxMap() {
+	if (!_teamInbox) _teamInbox = new Map();
+	return _teamInbox;
+}
+
+/** Deliver a message to a subagent's team inbox, emit event, and broadcast to WebSocket. */
+export function deliverTeamMessage(
+	targetId: string,
+	message: TeamMessage,
+	parentNarratorId?: string,
+): void {
+	const inbox = getTeamInboxMap();
+	if (!inbox.has(targetId)) inbox.set(targetId, []);
+	inbox.get(targetId)?.push(message);
+	if (parentNarratorId) {
+		eventBus.emit({
+			type: "narrator:team_message",
+			narratorId: targetId,
+			fromId: message.fromId,
+			parentNarratorId,
+			text: message.text,
+			isBroadcast: message.isBroadcast,
+		});
+		broadcastToNarrator(targetId, {
+			type: "team_message",
+			narratorId: targetId,
+			fromId: message.fromId,
+			fromTitle: message.fromTitle,
+			fromType: message.fromType,
+			text: message.text,
+			isBroadcast: message.isBroadcast,
+		});
+	}
+}
+
+/** Drain all pending team messages for a subagent. */
+export function drainTeamInbox(subagentId: string): TeamMessage[] {
+	const inbox = getTeamInboxMap();
+	const messages = inbox.get(subagentId);
+	if (!messages?.length) return [];
+	inbox.delete(subagentId);
+	return messages;
+}
+
+/** Check if a subagent has pending team messages (non-destructive). */
+export function hasTeamMessages(subagentId: string): boolean {
+	const messages = getTeamInboxMap().get(subagentId);
+	return !!messages?.length;
+}
+
+/** Clear team inbox for a subagent. */
+export function clearTeamInbox(subagentId: string): void {
+	getTeamInboxMap().delete(subagentId);
+}
 
 /** Tools available to explore/plan subagents (read + search + shell + conclusion file write + todos) */
 const EXPLORE_PLAN_TOOLS = new Set([
@@ -139,6 +440,7 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"Write",
 	"Edit",
 	"TaskCreate",
+	"TeamStatus",
 ]);
 
 /**
@@ -278,8 +580,16 @@ async function finalizeSubagent(
 	hasError: boolean,
 	errorText: string | null,
 ): Promise<void> {
-	// Clean up any remaining buffered messages
+	// Clean up any remaining buffered messages and team inbox
 	getSubagentBufferedMessagesMap().delete(subagentId);
+	clearTeamInbox(subagentId);
+
+	// Remove this subagent's file changes from team tracking
+	const teamChanges = getTeamFileChangesMap().get(parentNarratorId);
+	if (teamChanges) {
+		teamChanges.delete(subagentId);
+		if (teamChanges.size === 0) getTeamFileChangesMap().delete(parentNarratorId);
+	}
 
 	const now = new Date().toISOString();
 	await db
@@ -546,6 +856,7 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			systemPrompt,
 			locale,
 			signal,
+			parentNarratorId,
 			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
@@ -567,47 +878,64 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
 			getInjectedUserText: () => {
+				// 1. Check for buffered user messages
 				const queue = getSubagentBufferedMessagesMap().get(narratorId);
 				const buf = queue?.[0];
-				if (!buf) return null;
-				queue?.shift();
-				if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
-				// Persist user message in the background (fire-and-forget).
-				// The text is injected into the next turn immediately.
-				narratorService
-					.persistSubagentUserMessage(narratorId, buf.text, toolUseId, buf.images)
-					.then((userMsg) => {
-						broadcastToNarrator(parentNarratorId, {
-							type: "user_message",
-							narratorId: parentNarratorId,
-							message: userMsg,
+				let userText: string | null = null;
+				if (buf) {
+					queue?.shift();
+					if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
+					// Persist user message in the background (fire-and-forget).
+					// The text is injected into the next turn immediately.
+					narratorService
+						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, buf.images)
+						.then((userMsg) => {
+							broadcastToNarrator(parentNarratorId, {
+								type: "user_message",
+								narratorId: parentNarratorId,
+								message: userMsg,
+							});
+							broadcastToNarrator(narratorId, {
+								type: "user_message",
+								narratorId,
+								message: { ...userMsg, parentToolUseId: null },
+							});
+						})
+						.catch((err) => {
+							logger.error("Failed to persist injected subagent user message", {
+								narratorId,
+								error: String(err),
+							});
 						});
-						broadcastToNarrator(narratorId, {
-							type: "user_message",
-							narratorId,
-							message: { ...userMsg, parentToolUseId: null },
-						});
-					})
-					.catch((err) => {
-						logger.error("Failed to persist injected subagent user message", {
-							narratorId,
-							error: String(err),
-						});
+					const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
+					broadcastToNarrator(parentNarratorId, {
+						type: "buffer_consumed",
+						narratorId: parentNarratorId,
+						messageId: buf.id,
+						remaining,
 					});
-				const remaining = toBufferSummary(getSubagentBufferedMessagesMap().get(narratorId) ?? []);
-				broadcastToNarrator(parentNarratorId, {
-					type: "buffer_consumed",
-					narratorId: parentNarratorId,
-					messageId: buf.id,
-					remaining,
-				});
-				broadcastToNarrator(narratorId, {
-					type: "buffer_consumed",
-					narratorId,
-					messageId: buf.id,
-					remaining,
-				});
-				return buf.text;
+					broadcastToNarrator(narratorId, {
+						type: "buffer_consumed",
+						narratorId,
+						messageId: buf.id,
+						remaining,
+					});
+					userText = buf.text;
+				}
+
+				// 2. Drain team inbox and append as notifications
+				const teamMessages = drainTeamInbox(narratorId);
+				if (teamMessages.length > 0) {
+					const teamBlock = teamMessages
+						.map(
+							(m) =>
+								`[Team ${m.isBroadcast ? "broadcast" : "message"} from ${m.fromTitle ?? m.fromId} (${m.fromType})]: ${m.text}`,
+						)
+						.join("\n");
+					userText = userText ? `${userText}\n\n${teamBlock}` : teamBlock;
+				}
+
+				return userText;
 			},
 		};
 
@@ -855,6 +1183,149 @@ export function interruptForegroundSubagent(subagentId: string): boolean {
 	return true;
 }
 
+// === Detach / Attach ===
+
+/**
+ * Detach a foreground subagent to background mode (zero-interrupt).
+ * The agent loop continues running; the parent narrator's blocking Promise resolves immediately.
+ */
+export async function detachSubagent(subagentId: string): Promise<boolean> {
+	const entry = getDetachableMap().get(subagentId);
+	if (!entry) return false;
+
+	const { proxy, parentSignal, toolUseId, parentNarratorId } = entry;
+
+	// 1. Create independent background AbortController
+	const bgAbort = new AbortController();
+	getBackgroundAbortControllers().set(subagentId, bgAbort);
+
+	// 2. Swap signal source: remove parent signal, add background signal
+	proxy.replaceSource(parentSignal, bgAbort.signal);
+
+	// Also remove the fgAbort listener (it's no longer relevant)
+	const fgCtrl = getForegroundAbortControllers().get(subagentId);
+	if (fgCtrl) {
+		proxy.unlisten(fgCtrl.signal);
+		getForegroundAbortControllers().delete(subagentId);
+	}
+
+	// 3. Update DB
+	const now = new Date().toISOString();
+	const subNarrator = await narratorService.getById(subagentId);
+	const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
+	await db
+		.update(narrators)
+		.set({
+			isBackground: true,
+			backgroundStatus: "running",
+			traits: updatedTraits,
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, subagentId));
+
+	// 4. Register alias if not already registered (foreground tasks may not have one yet)
+	const { alias: detachAlias } = registerTaskAlias(
+		entry.parentNarratorId,
+		subagentId,
+		subNarrator.title ?? undefined,
+	);
+
+	// 5. Mark as detached (signals to runForegroundLoop)
+	entry.markDetached();
+	getDetachableMap().delete(subagentId);
+
+	// 6. Immediately resolve the foreground Promise (unblocks parent narrator)
+	// Use raw subagentId in the tag — the Agent tool will replace it with the alias
+	const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
+	entry.foregroundResolve(
+		resultPrefix +
+			`Subagent detached to background. Use Agent(resume: "${detachAlias}") to attach and get results.`,
+	);
+
+	// 7. Broadcast events
+	eventBus.emit({
+		type: "narrator:background_task_started",
+		narratorId: parentNarratorId,
+		parentNarratorId,
+		taskNarratorId: subagentId,
+		toolUseId,
+		subagentType: subNarrator.subagentType ?? "general",
+	});
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_detached",
+		narratorId: parentNarratorId,
+		subagentNarratorId: subagentId,
+		toolUseId,
+	});
+
+	return true;
+}
+
+/**
+ * Attach a running background subagent to foreground (blocks until completion).
+ * Called from continueSubagent when the target is a running background task.
+ * Returns the subagent result string.
+ */
+export async function attachSubagent(
+	subagentId: string,
+	parentNarratorId: string,
+	_toolUseId: string,
+	signal: AbortSignal,
+): Promise<string> {
+	// 1. Migrate abort controller: background → foreground
+	const bgAbort = getBackgroundAbortControllers().get(subagentId);
+	if (!bgAbort) {
+		throw new ValidationError("Background task abort controller not found");
+	}
+	getBackgroundAbortControllers().delete(subagentId);
+	getForegroundAbortControllers().set(subagentId, bgAbort);
+
+	// 2. Update DB
+	const now = new Date().toISOString();
+	const subNarrator = await narratorService.getById(subagentId);
+	const updatedTraits = parseTraits(subNarrator.traits).filter((t) => t !== "background");
+	await db
+		.update(narrators)
+		.set({
+			isBackground: false,
+			backgroundStatus: null,
+			traits: updatedTraits,
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, subagentId));
+
+	// 3. Create attach waiter — the running loop will resolve this when it completes
+	const { promise, resolve } = Promise.withResolvers<{ finalText: string; hasError: boolean }>();
+	getAttachWaitersMap().set(subagentId, { promise, resolve });
+
+	// 4. Broadcast
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_attached",
+		narratorId: parentNarratorId,
+		subagentNarratorId: subagentId,
+	});
+
+	// 5. Wait for the loop to complete (or parent abort)
+	const abortPromise = new Promise<{ finalText: string; hasError: boolean }>((res) => {
+		if (signal.aborted) {
+			res({ finalText: "Aborted", hasError: true });
+			return;
+		}
+		const handler = () => res({ finalText: "Aborted", hasError: true });
+		signal.addEventListener("abort", handler, { once: true });
+		promise.then((result) => {
+			signal.removeEventListener("abort", handler);
+			res(result);
+		});
+	});
+
+	const result = await abortPromise;
+	getAttachWaitersMap().delete(subagentId);
+
+	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	return resultPrefix + (result.finalText || "(no output)");
+}
+
 // === Conclusion watcher public API ===
 
 /** Register a watcher for an already-completed subagent's next conclusion. */
@@ -1081,6 +1552,21 @@ async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 	} finally {
 		clearTimeout(timeoutId);
 		getBackgroundAbortControllers().delete(narratorId);
+
+		// Resolve attach waiter if any (Agent(resume) on a run_in_background task)
+		const attachWaiter = getAttachWaitersMap().get(narratorId);
+		if (attachWaiter) {
+			// Determine final result — on success path use the outer scope vars,
+			// on catch path the DB was already updated so read from there.
+			const nar = await narratorService.getById(narratorId).catch(() => null);
+			const status = nar?.backgroundStatus ?? "failed";
+			const result = nar?.backgroundResult ?? "(no output)";
+			attachWaiter.resolve({
+				finalText: result,
+				hasError: status === "failed",
+			});
+			getAttachWaitersMap().delete(narratorId);
+		}
 	}
 }
 
@@ -1239,108 +1725,229 @@ async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
 	let currentHistory: unknown[] = input.initialHistory;
 	let currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
 
-	try {
-		while (true) {
-			const fgAbort = new AbortController();
-			getForegroundAbortControllers().set(subagentId, fgAbort);
-			const combinedSignal = AbortSignal.any([signal, fgAbort.signal]);
-			const result = await executeSubagent({
-				narratorId: subagentId,
-				parentNarratorId,
-				toolUseId,
-				subagentType,
-				prompt: currentPrompt,
-				cwd,
-				model,
-				provider,
-				locale,
-				signal: combinedSignal,
-				systemPrompt,
-				initialHistory: currentHistory,
-				initialTrailingToolResults: currentTrailingToolResults,
-				customDef,
-			});
-			finalText = result.contextLengthExceeded
-				? "Error: context length exceeded"
-				: result.finalText;
-			hasError = result.hasError || !!result.contextLengthExceeded;
-			getForegroundAbortControllers().delete(subagentId);
-			const continueAfterInterrupt =
-				!hasError &&
-				fgAbort.signal.aborted &&
-				!signal.aborted &&
-				(await consumeNextBufferedSubagentMessage({
-					narratorId: subagentId,
-					parentNarratorId,
-					toolUseId,
-					model,
-					provider: resolveProvider(model),
-				}));
-			if (continueAfterInterrupt) {
-				currentPrompt = continueAfterInterrupt.prompt;
-				currentHistory = continueAfterInterrupt.history;
-				currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
-				finalText = "";
-				continue;
-			}
-			// Detect subagent-only interrupt (not parent abort)
-			if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-				// --- Manual override: block until user clicks "Update Conclusion" ---
-				await narratorService.updateStatus(subagentId, "idle", {
-					substatus: ["manual_override"],
-				});
-				broadcastToNarrator(parentNarratorId, {
-					type: "subagent_suspended",
-					narratorId: parentNarratorId,
-					subagentNarratorId: subagentId,
-					toolUseId,
-				});
-				broadcastToNarrator(subagentId, {
-					type: "status_change",
-					narratorId: subagentId,
-					status: "idle",
-					substatus: ["manual_override"],
-				});
+	// Wrap in a Promise so detach can resolve it early
+	const { promise: foregroundPromise, resolve: foregroundResolve } =
+		Promise.withResolvers<string>();
 
-				const overrideResult = await waitForManualOverride(
-					subagentId,
-					signal,
+	// Track whether we've been detached (set by detachSubagent)
+	let detached = false;
+
+	const runLoop = async () => {
+		const proxy = new ProxyAbortController();
+
+		try {
+			// Register detach entry so the API can detach this subagent
+			getDetachableMap().set(subagentId, {
+				markDetached: () => {
+					detached = true;
+				},
+				foregroundResolve,
+				proxy,
+				parentSignal: signal,
+				fgAbort: new AbortController(), // placeholder, updated in loop
+				toolUseId,
+				parentNarratorId,
+				subagentId,
+			});
+
+			while (true) {
+				const fgAbort = new AbortController();
+				getForegroundAbortControllers().set(subagentId, fgAbort);
+
+				// Update detach entry's fgAbort reference
+				const detachEntry = getDetachableMap().get(subagentId);
+				if (detachEntry) detachEntry.fgAbort = fgAbort;
+
+				// Use proxy instead of AbortSignal.any
+				proxy.dispose();
+				proxy.listenTo(signal, fgAbort.signal);
+
+				const result = await executeSubagent({
+					narratorId: subagentId,
 					parentNarratorId,
 					toolUseId,
+					subagentType,
+					prompt: currentPrompt,
+					cwd,
+					model,
+					provider,
+					locale,
+					signal: proxy.signal,
+					systemPrompt,
+					initialHistory: currentHistory,
+					initialTrailingToolResults: currentTrailingToolResults,
+					customDef,
+				});
+				finalText = result.contextLengthExceeded
+					? "Error: context length exceeded"
+					: result.finalText;
+				hasError = result.hasError || !!result.contextLengthExceeded;
+				getForegroundAbortControllers().delete(subagentId);
+
+				// Check if we were detached during execution
+				if (detached) {
+					// Loop continues running in background mode.
+					// foregroundResolve was already called by detachSubagent().
+					// Continue to finally block for background completion.
+					break;
+				}
+
+				const continueAfterInterrupt =
+					!hasError &&
+					fgAbort.signal.aborted &&
+					!signal.aborted &&
+					!proxy.aborted &&
+					(await consumeNextBufferedSubagentMessage({
+						narratorId: subagentId,
+						parentNarratorId,
+						toolUseId,
+						model,
+						provider: resolveProvider(model),
+					}));
+				if (continueAfterInterrupt) {
+					currentPrompt = continueAfterInterrupt.prompt;
+					currentHistory = continueAfterInterrupt.history;
+					currentTrailingToolResults = continueAfterInterrupt.trailingToolResults;
+					finalText = "";
+					continue;
+				}
+				// Detect subagent-only interrupt (not parent abort)
+				if (!hasError && fgAbort.signal.aborted && !signal.aborted && !proxy.aborted) {
+					// --- Manual override: block until user clicks "Update Conclusion" ---
+					await narratorService.updateStatus(subagentId, "idle", {
+						substatus: ["manual_override"],
+					});
+					broadcastToNarrator(parentNarratorId, {
+						type: "subagent_suspended",
+						narratorId: parentNarratorId,
+						subagentNarratorId: subagentId,
+						toolUseId,
+					});
+					broadcastToNarrator(subagentId, {
+						type: "status_change",
+						narratorId: subagentId,
+						status: "idle",
+						substatus: ["manual_override"],
+					});
+
+					const overrideResult = await waitForManualOverride(
+						subagentId,
+						signal,
+						parentNarratorId,
+						toolUseId,
+					);
+
+					finalText = overrideResult.finalText;
+					hasError = overrideResult.hasError;
+				}
+				break;
+			}
+		} finally {
+			getDetachableMap().delete(subagentId);
+			proxy.dispose();
+			getManualOverrideMap().delete(subagentId);
+			getForegroundAbortControllers().delete(subagentId);
+
+			try {
+				await finalizeSubagent(
+					subagentId,
+					parentNarratorId,
+					toolUseId,
+					hasError,
+					hasError ? finalText : null,
 				);
 
-				finalText = overrideResult.finalText;
-				hasError = overrideResult.hasError;
+				// Bind the result to the subagent's last assistant message
+				const resultMsgId = await getSubagentResultMessageId(subagentId);
+				if (resultMsgId) {
+					await db
+						.update(narratorToolCalls)
+						.set({ resultMessageId: resultMsgId })
+						.where(eq(narratorToolCalls.toolUseId, toolUseId));
+				}
+			} catch {
+				// Non-critical — don't fail the whole flow
 			}
-			break;
+
+			if (detached) {
+				// Background completion path: update backgroundStatus/backgroundResult
+				// and broadcast completion event (mirrors executeBackgroundTask behavior)
+				const now = new Date().toISOString();
+				try {
+					await db
+						.update(narrators)
+						.set({
+							backgroundStatus: hasError ? "failed" : "completed",
+							backgroundResult: finalText || "(no output)",
+							backgroundCompletedAt: now,
+							updatedAt: now,
+						})
+						.where(eq(narrators.id, subagentId));
+
+					if (hasError) {
+						eventBus.emit({
+							type: "narrator:background_task_failed",
+							narratorId: parentNarratorId,
+							parentNarratorId,
+							taskNarratorId: subagentId,
+							toolUseId,
+							error: finalText,
+						});
+						broadcastToNarrator(parentNarratorId, {
+							type: "background_task_failed",
+							narratorId: parentNarratorId,
+							taskNarratorId: subagentId,
+							toolUseId,
+							error: finalText,
+						});
+					} else {
+						eventBus.emit({
+							type: "narrator:background_task_completed",
+							narratorId: parentNarratorId,
+							parentNarratorId,
+							taskNarratorId: subagentId,
+							toolUseId,
+							resultPreview: (finalText || "").slice(0, 500),
+						});
+						broadcastToNarrator(parentNarratorId, {
+							type: "background_task_completed",
+							narratorId: parentNarratorId,
+							taskNarratorId: subagentId,
+							toolUseId,
+							resultPreview: (finalText || "").slice(0, 500),
+						});
+					}
+				} catch {
+					// Non-critical
+				}
+
+				// Notify attach waiter if any (background → foreground transition)
+				const attachWaiter = getAttachWaitersMap().get(subagentId);
+				if (attachWaiter) {
+					attachWaiter.resolve({ finalText, hasError });
+					getAttachWaitersMap().delete(subagentId);
+				}
+
+				// Clean up team tracking
+				clearTeamInbox(subagentId);
+			} else {
+				// Normal foreground completion
+				const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+				foregroundResolve(resultPrefix + (finalText || "(no output)"));
+			}
 		}
-	} finally {
-		getManualOverrideMap().delete(subagentId);
-		getForegroundAbortControllers().delete(subagentId);
-		await finalizeSubagent(
-			subagentId,
-			parentNarratorId,
-			toolUseId,
-			hasError,
-			hasError ? finalText : null,
+	};
+
+	// Start the loop (don't await — foregroundPromise is resolved when done or detached).
+	// Note: foregroundResolve may be called from multiple paths (detach, normal completion,
+	// error catch below), but Promise.resolve is idempotent — only the first call takes effect.
+	runLoop().catch((err) => {
+		foregroundResolve(
+			`<subagent_id>${subagentId}</subagent_id>\n\nSubagent error: ${err instanceof Error ? err.message : String(err)}`,
 		);
+	});
 
-		// Bind the result to the subagent's last assistant message
-		try {
-			const resultMsgId = await getSubagentResultMessageId(subagentId);
-			if (resultMsgId) {
-				await db
-					.update(narratorToolCalls)
-					.set({ resultMessageId: resultMsgId })
-					.where(eq(narratorToolCalls.toolUseId, toolUseId));
-			}
-		} catch {
-			// Non-critical — don't fail the whole flow
-		}
-	}
-
-	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
-	return resultPrefix + (finalText || "(no output)");
+	return foregroundPromise;
 }
 
 // === Subagent runner ===
@@ -1523,7 +2130,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
 		return (
 			resultPrefix +
-			"Background task started. Use TaskOutput with this ID to check status or get results."
+			"Background task started. Use Agent(resume) with this ID to attach and get results."
 		);
 	}
 
@@ -1577,6 +2184,22 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	if (original.parentNarratorId !== parentNarratorId) {
 		throw new ValidationError("Subagent does not belong to the calling narrator");
 	}
+
+	// --- Attach path: resume a RUNNING background task (pull to foreground) ---
+	if (original.isBackground && original.backgroundStatus === "running") {
+		return attachSubagent(subagentId, parentNarratorId, toolUseId, signal);
+	}
+
+	// --- Return completed background task result directly ---
+	if (
+		original.isBackground &&
+		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
+	) {
+		const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+		return resultPrefix + (original.backgroundResult ?? "(no output)");
+	}
+
+	// --- Standard continue path: idle subagent ---
 	const origSubstatus = parseSubstatus(original.substatus);
 	if (
 		!(

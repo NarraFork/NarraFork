@@ -28,6 +28,7 @@ import { notifications } from "@mantine/notifications";
 import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
+	IconArrowBackUp,
 	IconArrowsMinimize,
 	IconBrain,
 	IconChevronDown,
@@ -224,12 +225,24 @@ function WebSearchBlock({
 		msgCtx.onForkFromMessage ||
 		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onRollbackToBlock ||
 		msgCtx.onDeleteBlock
 	);
 	const menuItemsNode = (
 		<>
 			{hasMenuActions && (
 				<>
+					{msgCtx.onRollbackToBlock && blockIndex != null && (
+						<Menu.Item
+							leftSection={<IconArrowBackUp size={14} />}
+							onClick={() => {
+								msgCtx.onRollbackToBlock?.(blockIndex);
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_rollback")}
+						</Menu.Item>
+					)}
 					{msgCtx.onForkFromMessage && (
 						<Menu.Item
 							leftSection={<IconGitFork size={14} />}
@@ -383,6 +396,125 @@ function WebSearchBlock({
 			</Box>
 			{swipeMenu}
 			{ctxMenu}
+		</>
+	);
+}
+
+/**
+ * Lightweight wrapper that provides a right-click context menu (with rollback,
+ * fork, compact, delete, etc.) for block types that don't have their own menu
+ * (e.g. ImageBlock, TextFileBlock).
+ */
+function BlockMenuWrapper({
+	blockIndex,
+	children,
+}: {
+	blockIndex?: number;
+	children: React.ReactNode;
+}) {
+	const msgCtx = useMessageContextMenu();
+	const { t } = useTranslation("narrator");
+	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
+	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+
+	const hasActions = !!(
+		msgCtx.onRollbackToBlock ||
+		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
+		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onDeleteBlock
+	);
+
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile || !hasActions) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 200);
+			const flipY = e.clientY > window.innerHeight - 300;
+			setCtxMenuPos({ x, y: e.clientY, flipY });
+			setCtxMenuOpened(true);
+		},
+		[isMobile, hasActions],
+	);
+
+	if (!hasActions) return <>{children}</>;
+
+	return (
+		<>
+			<Box onContextMenu={handleContextMenu}>{children}</Box>
+			<Menu
+				opened={ctxMenuOpened}
+				onChange={setCtxMenuOpened}
+				position="bottom-start"
+				withinPortal
+				styles={{
+					dropdown: {
+						position: "fixed",
+						left: ctxMenuPos.x,
+						...(ctxMenuPos.flipY
+							? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
+							: { top: ctxMenuPos.y }),
+					},
+				}}
+			>
+				<Menu.Target>
+					<div
+						style={{
+							position: "fixed",
+							left: ctxMenuPos.x,
+							top: ctxMenuPos.y,
+							pointerEvents: "none",
+						}}
+					/>
+				</Menu.Target>
+				<Menu.Dropdown>
+					{msgCtx.onRollbackToBlock && blockIndex != null && (
+						<Menu.Item
+							leftSection={<IconArrowBackUp size={14} />}
+							onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
+						>
+							{t("contextMenu_rollback")}
+						</Menu.Item>
+					)}
+					{msgCtx.onForkFromMessage && (
+						<Menu.Item
+							leftSection={<IconGitFork size={14} />}
+							onClick={() => msgCtx.onForkFromMessage?.()}
+						>
+							{t("contextMenu_fork")}
+						</Menu.Item>
+					)}
+					{msgCtx.onAskInPassing && (
+						<Menu.Item
+							leftSection={<IconMessageQuestion size={14} />}
+							onClick={() => msgCtx.onAskInPassing?.()}
+						>
+							{t("contextMenu_askInPassing")}
+						</Menu.Item>
+					)}
+					{msgCtx.onCompactBeforeMessage && (
+						<Menu.Item
+							leftSection={<IconArrowsMinimize size={14} />}
+							onClick={() => msgCtx.onCompactBeforeMessage?.()}
+						>
+							{t("contextMenu_compactBefore")}
+						</Menu.Item>
+					)}
+					{msgCtx.onDeleteBlock && blockIndex != null && (
+						<Menu.Item
+							color="red"
+							leftSection={<IconTrash size={14} />}
+							onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
+						>
+							{t("contextMenu_delete")}
+						</Menu.Item>
+					)}
+				</Menu.Dropdown>
+			</Menu>
 		</>
 	);
 }
@@ -675,6 +807,7 @@ export const ReasoningBlock = memo(
 			msgCtx.onForkFromMessage ||
 			msgCtx.onAskInPassing ||
 			msgCtx.onCompactBeforeMessage ||
+			msgCtx.onRollbackToBlock ||
 			msgCtx.onDeleteBlock
 		);
 		const menuItemsNode = (
@@ -689,6 +822,17 @@ export const ReasoningBlock = memo(
 					{tc("copy")}
 				</Menu.Item>
 				{hasMenuActions && <Menu.Divider />}
+				{msgCtx.onRollbackToBlock && blockIndex != null && (
+					<Menu.Item
+						leftSection={<IconArrowBackUp size={14} />}
+						onClick={() => {
+							msgCtx.onRollbackToBlock?.(blockIndex);
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_rollback")}
+					</Menu.Item>
+				)}
 				{msgCtx.onForkFromMessage && (
 					<Menu.Item
 						leftSection={<IconGitFork size={14} />}
@@ -2537,15 +2681,17 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "image") {
 						return (
-							<ImageBlock
-								key={key}
-								block={block}
-								imageNarratorId={message.narratorId ?? narratorId}
-							/>
+							<BlockMenuWrapper key={key} blockIndex={realIndex}>
+								<ImageBlock block={block} imageNarratorId={message.narratorId ?? narratorId} />
+							</BlockMenuWrapper>
 						);
 					}
 					if (block.type === "text_file") {
-						return <TextFileBlock key={key} block={block} />;
+						return (
+							<BlockMenuWrapper key={key} blockIndex={realIndex}>
+								<TextFileBlock block={block} />
+							</BlockMenuWrapper>
+						);
 					}
 					if (block.type === "reasoning" || block.type === "thinking") {
 						return (
