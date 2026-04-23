@@ -27,6 +27,7 @@ export interface RenderToolRunOptions {
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
 	containerStyle?: React.CSSProperties;
 	containerClassName?: string;
@@ -57,6 +58,7 @@ export function renderToolRun(
 		onAskInPassing,
 		onCompactBeforeMessage,
 		onDeleteBlock,
+		onRollbackToBlock,
 		onViewSubagentSession,
 		containerStyle,
 		containerClassName,
@@ -95,6 +97,9 @@ export function renderToolRun(
 		}
 		if (msgId && onDeleteBlock) {
 			ctxActions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
+		}
+		if (msgId && onRollbackToBlock) {
+			ctxActions.onRollbackToBlock = (blockIndex: number) => onRollbackToBlock(msgId, blockIndex);
 		}
 
 		const toolAnimationId = getToolCallBlurAnimationId({
@@ -353,6 +358,7 @@ export function renderTreeMessages(
 			onAskInPassing,
 			onCompactBeforeMessage,
 			onDeleteBlock,
+			onRollbackToBlock,
 			onViewSubagentSession,
 		});
 		if (el) {

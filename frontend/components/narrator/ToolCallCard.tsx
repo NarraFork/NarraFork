@@ -74,6 +74,7 @@ import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import { StreamingCode } from "./StreamingCode";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
@@ -2777,25 +2778,10 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
-	const boxRef = useRef<HTMLDivElement>(null);
 	const cat = getCategory(toolCall.toolName);
 	const filePath =
 		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
-
-	// Auto-scroll to bottom as content streams in
-	useEffect(() => {
-		if (!sfValue || !boxRef.current) return;
-		const raf = requestAnimationFrame(() => {
-			const el = boxRef.current;
-			if (!el) return;
-			const scrollable = el.querySelector<HTMLElement>("pre");
-			if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
-				scrollable.scrollTop = scrollable.scrollHeight;
-			}
-		});
-		return () => cancelAnimationFrame(raf);
-	}, [sfValue]);
 
 	// Write/Edit tools: show content/new_string with syntax highlighting
 	if (cat === "file") {
@@ -2803,17 +2789,11 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const isContentField = sfName === "content" || sfName === "new_string";
 		if (!isContentField || !sfValue) return null;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
 					{filePath}
 				</Text>
-				<ContentViewer
-					content={sfValue}
-					style={codeStyle}
-					title={basename(filePath)}
-					language={lang}
-					streaming
-				/>
+				<StreamingCode code={sfValue} lang={lang} style={codeStyle} />
 			</Box>
 		);
 	}
@@ -2823,7 +2803,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const cmd = sfName === "command" ? sfValue : fields?.command;
 		if (!cmd) return null;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<Code
 					block
 					style={{
@@ -2846,7 +2826,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		if (!pattern) return null;
 		const searchPath = fields?.path ?? fields?.glob;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<Code block style={{ ...codeStyle, maxHeight: 60 }}>
 					{pattern}
 					{searchPath ? ` in ${searchPath}` : ""}
@@ -2861,7 +2841,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const prompt = sfName === "prompt" ? sfValue : null;
 		if (!prompt) return null;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<ContentViewer
 					content={prompt}
 					style={codeStyle}
@@ -2878,7 +2858,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const fp = filePath ?? fields?.file_path;
 		if (!fp) return null;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<Text size="xs" c="dimmed" ff="monospace">
 					{fp}
 				</Text>
@@ -2891,7 +2871,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const plan = sfName === "plan" ? sfValue : null;
 		if (!plan) return null;
 		return (
-			<Box mt="xs" ref={boxRef}>
+			<Box mt="xs">
 				<ContentViewer content={plan} style={codeStyle} title="Plan" markdown streaming />
 			</Box>
 		);
@@ -3441,7 +3421,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			cat === "todo" ||
 			cat === "share" ||
 			cat === "recall" ||
-			(cat === "bash" && toolCall.outputJson != null) ||
+			(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isFailedEdit && !isTruncated) ||
 			(isFailed && !isEdit && !isDeniedPlan && !isTruncated));
@@ -3473,10 +3453,38 @@ export const ToolCallCard = memo(function ToolCallCard({
 		}
 	}, [cat, toolCall._streamingOutput]);
 
-	// Auto-expand todo/plan cards once streaming finishes (skip truncated history data)
+	// Auto-expand cards once streaming finishes — keeps the card open continuously
+	// instead of collapsing briefly between the streaming and running/completed phases.
+	// Covers edit tools (show diff), bash (show command/output), todo, plan, share, etc.
+	const wasStreamingRef = useRef(isStreaming);
 	useEffect(() => {
-		if (!isStreaming && !isTruncated && (cat === "todo" || cat === "plan")) setOpened(true);
-	}, [isStreaming, isTruncated, cat]);
+		const wasStreaming = wasStreamingRef.current;
+		wasStreamingRef.current = isStreaming;
+		if (wasStreaming && !isStreaming && !isTruncated) {
+			// Re-evaluate defaultOpen criteria now that isStreaming is false
+			const shouldOpen =
+				!!pendingPermission ||
+				toolCall.status === "pending" ||
+				cat === "todo" ||
+				cat === "share" ||
+				cat === "recall" ||
+				cat === "plan" ||
+				cat === "bash" ||
+				(isEdit && !isFailedEdit) ||
+				(isFailed && !isEdit && !isDeniedPlan);
+			if (shouldOpen) setOpened(true);
+		}
+	}, [
+		isStreaming,
+		isTruncated,
+		pendingPermission,
+		toolCall.status,
+		cat,
+		isEdit,
+		isFailedEdit,
+		isFailed,
+		isDeniedPlan,
+	]);
 
 	// Force expand from outside (e.g. navigating to this card)
 	useEffect(() => {

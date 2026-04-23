@@ -18,6 +18,7 @@ import {
 	IconArrowsMinimize,
 	IconChevronDown,
 	IconChevronRight,
+	IconCloudOff,
 	IconEye,
 	IconMessageQuestion,
 	IconRobot,
@@ -29,6 +30,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { api } from "../../lib/api";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
@@ -487,11 +489,33 @@ export const SubagentCard = memo(
 			toolCall.resultMessageId,
 		]);
 
+		const isForegroundWorking = !isTerminal && !isBackground && !isInitializing;
+
+		const handleDetach = useCallback(async () => {
+			if (!subagentNarratorId) return;
+			try {
+				await api.detachSubagent(subagentNarratorId);
+			} catch {
+				// Ignore — the subagent may have already finished
+			}
+		}, [subagentNarratorId]);
+
 		const cardMenuItems = (
 			<>
 				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
 					{t("viewSubagentSession")}
 				</Menu.Item>
+				{isForegroundWorking && subagentNarratorId && (
+					<Menu.Item
+						leftSection={<IconCloudOff size={14} />}
+						onClick={() => {
+							handleDetach();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("detachToBackground")}
+					</Menu.Item>
+				)}
 				{parentMsgCtx.onAskInPassing && (
 					<Menu.Item
 						leftSection={<IconMessageQuestion size={14} />}

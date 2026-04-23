@@ -44,6 +44,8 @@ import {
 	IconArrowsMinimize,
 	IconBolt,
 	IconCheck,
+	IconChevronDown,
+	IconChevronUp,
 	IconCode,
 	IconCodeOff,
 	IconCopy,
@@ -194,6 +196,9 @@ import { useNarratorPanelWS } from "./useNarratorPanelWS";
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
+
+/** Number of queued messages before the queue collapses into a summary bar. */
+const QUEUE_COLLAPSE_THRESHOLD = 2;
 
 type PageRenderCacheEntry = {
 	messageRefs: readonly NarratorMsg[];
@@ -3648,6 +3653,12 @@ export function NarratorPanel({
 
 	const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
 	const [editingQueuedText, setEditingQueuedText] = useState("");
+	const [queueExpanded, setQueueExpanded] = useState(false);
+
+	// Auto-reset expanded state when queue shrinks to ≤2
+	useEffect(() => {
+		if (queuedMessages.length <= QUEUE_COLLAPSE_THRESHOLD) setQueueExpanded(false);
+	}, [queuedMessages.length]);
 
 	const handleStartEditQueued = (msg: { id: string; text: string }) => {
 		setEditingQueuedId(msg.id);
@@ -4565,7 +4576,7 @@ export function NarratorPanel({
 						<Group
 							pt="xs"
 							px="md"
-							pb={0}
+							pb={6}
 							gap="xs"
 							style={{ borderTop: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 						>
@@ -4604,7 +4615,7 @@ export function NarratorPanel({
 						<Group
 							pt="xs"
 							px="md"
-							pb={0}
+							pb={6}
 							gap={6}
 							wrap="wrap"
 							style={{
@@ -4624,7 +4635,8 @@ export function NarratorPanel({
 									wrap="nowrap"
 									style={{
 										borderRadius: "var(--mantine-radius-sm)",
-										backgroundColor: "var(--mantine-color-dark-6)",
+										backgroundColor:
+											"light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
 										fontSize: "var(--mantine-font-size-xs)",
 									}}
 								>
@@ -4659,49 +4671,99 @@ export function NarratorPanel({
 								flexShrink: 0,
 							}}
 						>
-							<DndContext
-								sensors={sensors}
-								collisionDetection={closestCenter}
-								onDragEnd={handleDragEndQueued}
-							>
-								<SortableContext
-									items={queuedMessages.map((m) => m.id)}
-									strategy={verticalListSortingStrategy}
-								>
-									{queuedMessages.map((msg, index) => (
-										<SortableQueuedMessageItem
-											key={msg.id}
-											msg={msg}
-											index={index}
-											isEditing={editingQueuedId === msg.id}
-											editingText={editingQueuedText}
-											onEditTextChange={setEditingQueuedText}
-											onSaveEdit={handleSaveEditQueued}
-											onCancelEdit={handleCancelEditQueued}
-											onStartEdit={handleStartEditQueued}
-											onRemove={handleRemoveQueued}
-											cancelBufferLabel={t("cancelBuffer")}
-											editLabel={tc("edit")}
-										/>
-									))}
-								</SortableContext>
-							</DndContext>
-							{queuedMessages.length > 1 && (
+							{queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && !queueExpanded ? (
+								/* Collapsed summary bar */
 								<Group
+									component="button"
 									px="md"
-									py={2}
-									justify="flex-end"
-									style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
+									py={4}
+									gap="xs"
+									wrap="nowrap"
+									bg="var(--mantine-color-blue-light)"
+									style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
+									onClick={() => setQueueExpanded(true)}
+									aria-expanded={false}
+									aria-label={t("queuedCount", { count: queuedMessages.length })}
 								>
+									<IconChevronUp size={14} color="var(--mantine-color-blue-5)" />
+									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
+										{t("queuedCount", { count: queuedMessages.length })}
+									</Text>
+									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
+										{queuedMessages[0].text}
+									</Text>
 									<Button
 										size="compact-xs"
 										variant="subtle"
 										color="red"
-										onClick={handleCancelAllQueued}
+										onClick={(e) => {
+											e.stopPropagation();
+											handleCancelAllQueued();
+										}}
 									>
 										{t("clearAllQueued")}
 									</Button>
 								</Group>
+							) : (
+								/* Expanded full list */
+								<>
+									<DndContext
+										sensors={sensors}
+										collisionDetection={closestCenter}
+										onDragEnd={handleDragEndQueued}
+									>
+										<SortableContext
+											items={queuedMessages.map((m) => m.id)}
+											strategy={verticalListSortingStrategy}
+										>
+											{queuedMessages.map((msg, index) => (
+												<SortableQueuedMessageItem
+													key={msg.id}
+													msg={msg}
+													index={index}
+													isEditing={editingQueuedId === msg.id}
+													editingText={editingQueuedText}
+													onEditTextChange={setEditingQueuedText}
+													onSaveEdit={handleSaveEditQueued}
+													onCancelEdit={handleCancelEditQueued}
+													onStartEdit={handleStartEditQueued}
+													onRemove={handleRemoveQueued}
+													cancelBufferLabel={t("cancelBuffer")}
+													editLabel={tc("edit")}
+												/>
+											))}
+										</SortableContext>
+									</DndContext>
+									{queuedMessages.length > 1 && (
+										<Group
+											px="md"
+											py={2}
+											justify="flex-end"
+											gap="xs"
+											style={{ backgroundColor: "var(--mantine-color-blue-light)" }}
+										>
+											{queuedMessages.length > QUEUE_COLLAPSE_THRESHOLD && (
+												<Button
+													size="compact-xs"
+													variant="subtle"
+													color="blue"
+													onClick={() => setQueueExpanded(false)}
+													leftSection={<IconChevronDown size={12} />}
+												>
+													{t("collapseQueue")}
+												</Button>
+											)}
+											<Button
+												size="compact-xs"
+												variant="subtle"
+												color="red"
+												onClick={handleCancelAllQueued}
+											>
+												{t("clearAllQueued")}
+											</Button>
+										</Group>
+									)}
+								</>
 							)}
 						</Stack>
 					)}
@@ -5326,7 +5388,8 @@ export function NarratorPanel({
 							py="sm"
 							style={{
 								flexShrink: 0,
-								backgroundColor: "var(--mantine-color-dark-6)",
+								backgroundColor:
+									"light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
 								opacity: 0.7,
 							}}
 						>

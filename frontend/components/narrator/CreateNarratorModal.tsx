@@ -2,6 +2,7 @@ import {
 	closestCenter,
 	DndContext,
 	type DragEndEvent,
+	DragOverlay,
 	type DragStartEvent,
 	PointerSensor,
 	useSensor,
@@ -21,7 +22,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -123,66 +124,6 @@ function SortableFavoriteItem({
 				<IconX size={14} />
 			</ActionIcon>
 		</Group>
-	);
-}
-
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-function DragOverlayPortal({ activeFav, isActive }: { activeFav: any; isActive: boolean }) {
-	const [pos, setPos] = useState({ x: 0, y: 0 });
-	const offsetRef = useRef({ x: 0, y: 0 });
-	const rafRef = useRef(0);
-
-	const handlePointerMove = useCallback((e: PointerEvent) => {
-		if (rafRef.current) return;
-		rafRef.current = requestAnimationFrame(() => {
-			setPos({
-				x: e.clientX - offsetRef.current.x,
-				y: e.clientY - offsetRef.current.y,
-			});
-			rafRef.current = 0;
-		});
-	}, []);
-
-	const handlePointerUp = useCallback(() => {
-		if (rafRef.current) cancelAnimationFrame(rafRef.current);
-		document.removeEventListener("pointermove", handlePointerMove);
-		document.removeEventListener("pointerup", handlePointerUp);
-	}, [handlePointerMove]);
-
-	// Use mousedown-like offset: start from the active node rect when overlay first renders
-	const ref = useCallback(
-		(node: HTMLDivElement | null) => {
-			if (node) {
-				const rect = node.getBoundingClientRect();
-				// Use top-left offset so the overlay follows the cursor naturally
-				offsetRef.current = { x: rect.width / 2, y: rect.height / 2 };
-				// Start listening for pointer events
-				document.addEventListener("pointermove", handlePointerMove);
-				document.addEventListener("pointerup", handlePointerUp);
-			}
-		},
-		[handlePointerMove, handlePointerUp],
-	);
-
-	return createPortal(
-		<div
-			ref={ref}
-			style={{
-				position: "fixed",
-				left: pos.x || -9999,
-				top: pos.y || -9999,
-				zIndex: 9999,
-				pointerEvents: "none",
-				borderRadius: 4,
-				backgroundColor: "var(--mantine-color-dark-6)",
-				boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-				opacity: pos.x ? 1 : 0,
-				width: "fit-content",
-			}}
-		>
-			<FavoriteItemContent fav={activeFav} isActive={isActive} />
-		</div>,
-		document.body,
 	);
 }
 
@@ -337,8 +278,21 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 										/>
 									))}
 								</SortableContext>
-								{activeFav && (
-									<DragOverlayPortal activeFav={activeFav} isActive={cwd === activeFav.path} />
+								{createPortal(
+									<DragOverlay dropAnimation={null}>
+										{activeFav && (
+											<div
+												style={{
+													backgroundColor: "var(--mantine-color-body)",
+													boxShadow: "var(--mantine-shadow-md)",
+													borderRadius: 4,
+												}}
+											>
+												<FavoriteItemContent fav={activeFav} isActive={cwd === activeFav.path} />
+											</div>
+										)}
+									</DragOverlay>,
+									document.body,
 								)}
 							</DndContext>
 						</div>
