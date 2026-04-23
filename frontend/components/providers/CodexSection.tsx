@@ -841,7 +841,7 @@ export const CodexSection = React.memo(function CodexSection({
 						modelContextWindows={modelContextWindows}
 						onContextWindowChange={onContextWindowChange}
 						onTestModel={onTestModel}
-						showContextWindow={false}
+						showContextWindow
 					/>
 				)}
 				<InlineCustomModels

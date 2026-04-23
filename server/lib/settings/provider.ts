@@ -37,6 +37,7 @@ function s(): NarraForkSettings {
 	"claude-opus",
 ];
 const BUILTIN_CODEX_MODELS = [
+	"gpt-5.5",
 	"gpt-5.4",
 	"gpt-5.4-mini",
 	"gpt-5.3-codex",
@@ -492,6 +493,7 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"gpt-5.1-codex-mini": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.2-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.2": { contextLength: 272_000, maxCompletionTokens: 128_000 },
+	"gpt-5.5": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.4": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.4-mini": { contextLength: 400_000, maxCompletionTokens: 128_000 },
 	"gpt-5.3-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
