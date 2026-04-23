@@ -46,6 +46,10 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { GitMissingAlert } from "../components/GitMissingAlert";
+import {
+	CreateNarratorModal,
+	type CreateNarratorResult,
+} from "../components/narrator/CreateNarratorModal";
 import { OverseerNavItem } from "../components/nav/OverseerNavItem";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
@@ -58,7 +62,8 @@ import { useLocalPref } from "../hooks/useLocalPref";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useGlobalOverseer } from "../hooks/useOverseers";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
-import { useRecentTabs } from "../hooks/useRecentTabs";
+import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
+import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, clearToken, getToken } from "../lib/api";
@@ -193,6 +198,27 @@ function AuthenticatedLayout() {
 	// --- Setup wizard ---
 	const [wizardOpen, setWizardOpen] = useState(false);
 	const [wizardMinimized, setWizardMinimized] = useState(false);
+
+	// --- Create narrator modal (triggered from nav) ---
+	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
+	const requireSetup = useSetupWizardGuard();
+	const openCreateNarrator = useCallback(() => {
+		if (!requireSetup()) return;
+		setCreateNarratorOpened(true);
+	}, [requireSetup]);
+	const handleNarratorCreated = useCallback(
+		(data: CreateNarratorResult) => {
+			addRecentTab({
+				type: "narrator",
+				id: data.id,
+				title: data.title,
+				subtitle: data.cwd,
+				status: data.status,
+			});
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: data.id } });
+		},
+		[navigate],
+	);
 	useEffect(() => {
 		if (user?.role === "admin" && prefs && prefs.setupWizardCompleted === false) {
 			setWizardOpen(true);
@@ -562,7 +588,7 @@ function AuthenticatedLayout() {
 												onClick={(e: React.MouseEvent) => {
 													e.preventDefault();
 													e.stopPropagation();
-													navigate({ to: "/narrators", search: { create: true } });
+													openCreateNarrator();
 													closeNavForLink();
 												}}
 												aria-label={t("newNarrator")}
@@ -698,6 +724,12 @@ function AuthenticatedLayout() {
 			/>
 
 			<SummaryModelPickerModal />
+
+			<CreateNarratorModal
+				opened={createNarratorOpened}
+				onClose={() => setCreateNarratorOpened(false)}
+				onCreated={handleNarratorCreated}
+			/>
 		</AppShell>
 	);
 }

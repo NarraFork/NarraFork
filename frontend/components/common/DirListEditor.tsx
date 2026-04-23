@@ -1,15 +1,9 @@
-import {
-	ActionIcon,
-	Button,
-	Group,
-	SegmentedControl,
-	Stack,
-	Switch,
-	Text,
-	TextInput,
-} from "@mantine/core";
-import { IconTrash } from "@tabler/icons-react";
-import { useState } from "react";
+import { ActionIcon, Group, Modal, SegmentedControl, Stack, Switch, Text } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
+import { IconFolderOpen, IconTrash } from "@tabler/icons-react";
+import { useTranslation } from "react-i18next";
+import { DirectoryBrowser } from "./DirectoryPicker";
+import { PathInput } from "./PathInput";
 
 export interface WhitelistEntry {
 	path: string;
@@ -48,19 +42,17 @@ function isWhitelist(props: DirListEditorProps): props is WhitelistEditorProps {
 
 export function DirListEditor(props: DirListEditorProps) {
 	const { dirs, labels } = props;
-	const [newPath, setNewPath] = useState("");
+	const { t } = useTranslation("common");
 	const levels = isWhitelist(props) ? WL_LEVELS : BL_LEVELS;
+	const [opened, { open, close }] = useDisclosure(false);
 
-	const addDir = () => {
-		const path = newPath.trim();
-		if (!path) return;
+	const addDir = (path: string) => {
 		if (dirs.some((d) => d.path === path)) return;
 		if (isWhitelist(props)) {
 			props.onChange([...props.dirs, { path, accessLevel: "readOnly", enabled: true }]);
 		} else {
 			props.onChange([...props.dirs, { path, denyLevel: "denyAll", enabled: true }]);
 		}
-		setNewPath("");
 	};
 
 	const removeDir = (idx: number) => {
@@ -134,27 +126,30 @@ export function DirListEditor(props: DirListEditorProps) {
 					</ActionIcon>
 				</Group>
 			))}
-			<Group gap={4} wrap="nowrap">
-				<TextInput
-					size="xs"
-					placeholder={labels.placeholder}
-					value={newPath}
-					onChange={(e) => setNewPath(e.currentTarget.value)}
-					onKeyDown={(e) => {
-						if (e.key === "Enter") addDir();
+			<PathInput
+				placeholder={labels.placeholder}
+				onConfirm={addDir}
+				rightSection={
+					<ActionIcon variant="subtle" onClick={open} aria-label={t("browse")}>
+						<IconFolderOpen size={18} />
+					</ActionIcon>
+				}
+			/>
+			<Modal
+				opened={opened}
+				onClose={close}
+				title={t("selectDirectory")}
+				size="lg"
+				styles={{ body: { padding: 0 } }}
+			>
+				<DirectoryBrowser
+					onSelect={(path) => {
+						addDir(path);
+						close();
 					}}
-					style={{ flex: 1 }}
+					onCancel={close}
 				/>
-				<Button
-					size="xs"
-					variant="light"
-					color={!isWhitelist(props) ? "red" : undefined}
-					disabled={!newPath.trim()}
-					onClick={addDir}
-				>
-					{labels.add}
-				</Button>
-			</Group>
+			</Modal>
 		</Stack>
 	);
 }

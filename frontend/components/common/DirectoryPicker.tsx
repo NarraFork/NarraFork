@@ -2,6 +2,7 @@ import {
 	closestCenter,
 	DndContext,
 	type DragEndEvent,
+	DragOverlay,
 	type DragStartEvent,
 	PointerSensor,
 	useSensor,
@@ -222,76 +223,6 @@ function SortableFavoriteNav({
 				dragHandleProps={{ ...attributes, ...listeners }}
 			/>
 		</div>
-	);
-}
-
-function FavDragOverlay({
-	activeFav,
-	label,
-	isActive,
-}: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	activeFav: any;
-	label: string;
-	isActive: boolean;
-}) {
-	const [pos, setPos] = useState({ x: 0, y: 0 });
-	const offsetRef = useRef({ x: 0, y: 0 });
-	const rafRef = useRef(0);
-
-	const handlePointerMove = useCallback((e: PointerEvent) => {
-		if (rafRef.current) return;
-		rafRef.current = requestAnimationFrame(() => {
-			setPos({
-				x: e.clientX - offsetRef.current.x,
-				y: e.clientY - offsetRef.current.y,
-			});
-			rafRef.current = 0;
-		});
-	}, []);
-
-	const handlePointerUp = useCallback(() => {
-		if (rafRef.current) cancelAnimationFrame(rafRef.current);
-		document.removeEventListener("pointermove", handlePointerMove);
-		document.removeEventListener("pointerup", handlePointerUp);
-	}, [handlePointerMove]);
-
-	const ref = useCallback(
-		(node: HTMLDivElement | null) => {
-			if (node) {
-				const rect = node.getBoundingClientRect();
-				offsetRef.current = { x: rect.width / 2, y: rect.height / 2 };
-				document.addEventListener("pointermove", handlePointerMove);
-				document.addEventListener("pointerup", handlePointerUp);
-			}
-		},
-		[handlePointerMove, handlePointerUp],
-	);
-
-	return createPortal(
-		<div
-			ref={ref}
-			style={{
-				position: "fixed",
-				left: pos.x || -9999,
-				top: pos.y || -9999,
-				zIndex: 9999,
-				pointerEvents: "none",
-				backgroundColor: "var(--mantine-color-dark-6)",
-				boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-				opacity: pos.x ? 1 : 0,
-				width: "fit-content",
-			}}
-		>
-			<FavoriteNavContent
-				fav={activeFav}
-				label={label}
-				isActive={isActive}
-				onNavigate={() => {}}
-				onRemove={() => {}}
-			/>
-		</div>,
-		document.body,
 	);
 }
 
@@ -551,7 +482,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 							fontSize: 12,
 							padding: "4px 8px",
 							borderRadius: 4,
-							border: "1px solid var(--mantine-color-dark-4)",
+							border: "1px solid var(--mantine-color-default-border)",
 							overflow: "hidden",
 							textOverflow: "ellipsis",
 							whiteSpace: "nowrap",
@@ -591,71 +522,71 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 			<Divider />
 
 			{/* ── Main content: sidebar + directory listing ── */}
-			<Group gap={0} wrap="nowrap" align="stretch" style={{ minHeight: 350 }}>
-				{/* Sidebar: shortcuts + favorites */}
-				<ScrollArea
-					style={{
-						width: 150,
-						flexShrink: 0,
-						borderRight: "1px solid var(--mantine-color-dark-4)",
-					}}
-					h={350}
-					type="auto"
-				>
-					{/* System shortcuts */}
-					<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
-						{t("quickAccess")}
-					</Text>
-					<Stack gap={0}>
-						{shortcutsData?.shortcuts.map((s) => (
-							<NavLink
-								key={s.key}
-								label={shortcutLabel(s.key)}
-								leftSection={shortcutIcon(s.key)}
-								active={data?.path === s.path}
-								onClick={() => navigateTo(s.path)}
-								py={4}
-								styles={{
-									label: { fontSize: 12 },
-									root: { borderRadius: 0 },
-								}}
-							/>
-						))}
-						{/* Windows drives */}
-						{shortcutsData?.drives?.map((drive) => (
-							<NavLink
-								key={drive.path}
-								label={drive.name}
-								leftSection={<IconDeviceDesktop size={16} />}
-								active={data?.path?.startsWith(drive.path)}
-								onClick={() => navigateTo(drive.path)}
-								py={4}
-								styles={{
-									label: { fontSize: 12 },
-									root: { borderRadius: 0 },
-								}}
-							/>
-						))}
-					</Stack>
+			<DndContext
+				sensors={sensors}
+				collisionDetection={closestCenter}
+				onDragStart={handleFavDragStart}
+				onDragEnd={handleFavDragEnd}
+				onDragCancel={handleFavDragCancel}
+			>
+				<Group gap={0} wrap="nowrap" align="stretch" style={{ minHeight: 350 }}>
+					{/* Sidebar: shortcuts + favorites */}
+					<ScrollArea
+						style={{
+							width: 150,
+							flexShrink: 0,
+							borderRight: "1px solid var(--mantine-color-default-border)",
+						}}
+						h={350}
+						type="auto"
+					>
+						{/* System shortcuts */}
+						<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
+							{t("quickAccess")}
+						</Text>
+						<Stack gap={0}>
+							{shortcutsData?.shortcuts.map((s) => (
+								<NavLink
+									key={s.key}
+									label={shortcutLabel(s.key)}
+									leftSection={shortcutIcon(s.key)}
+									active={data?.path === s.path}
+									onClick={() => navigateTo(s.path)}
+									py={4}
+									styles={{
+										label: { fontSize: 12 },
+										root: { borderRadius: 0 },
+									}}
+								/>
+							))}
+							{/* Windows drives */}
+							{shortcutsData?.drives?.map((drive) => (
+								<NavLink
+									key={drive.path}
+									label={drive.name}
+									leftSection={<IconDeviceDesktop size={16} />}
+									active={data?.path?.startsWith(drive.path)}
+									onClick={() => navigateTo(drive.path)}
+									py={4}
+									styles={{
+										label: { fontSize: 12 },
+										root: { borderRadius: 0 },
+									}}
+								/>
+							))}
+						</Stack>
 
-					{/* Favorites */}
-					<Divider my={4} />
-					<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
-						{t("favorites")}
-					</Text>
-					<Stack gap={0}>
-						{favorites.length === 0 && (
-							<Text size="xs" c="dimmed" px="xs" py={4}>
-								{t("noFavorites")}
-							</Text>
-						)}
-						<DndContext
-							sensors={sensors}
-							collisionDetection={closestCenter}
-							onDragStart={handleFavDragStart}
-							onDragEnd={handleFavDragEnd}
-							onDragCancel={handleFavDragCancel}
-						>
+						{/* Favorites */}
+						<Divider my={4} />
+						<Text size="xs" fw={600} c="dimmed" px="xs" py={6}>
+							{t("favorites")}
+						</Text>
+						<Stack gap={0}>
+							{favorites.length === 0 && (
+								<Text size="xs" c="dimmed" px="xs" py={4}>
+									{t("noFavorites")}
+								</Text>
+							)}
 							<SortableContext
 								items={favorites.map((f) => f.id)}
 								strategy={verticalListSortingStrategy}
@@ -675,115 +606,134 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 									);
 								})}
 							</SortableContext>
-							{activeFav && (
-								<FavDragOverlay
-									activeFav={activeFav}
+						</Stack>
+					</ScrollArea>
+
+					{/* Directory listing */}
+					<ScrollArea style={{ flex: 1 }} h={350} type="auto" offsetScrollbars>
+						{isLoading && <Loader size="sm" m="auto" display="block" mt="xl" />}
+						{error && (
+							<Text c="red" size="sm" ta="center" mt="xl" px="sm">
+								{(error as Error).message}
+							</Text>
+						)}
+						{data && (
+							<Stack gap={0}>
+								{/* Drive letters (Windows) — shown in main area when at drive root */}
+								{isAtDriveRoot && hasDrives && (
+									<>
+										<Group gap="xs" px="sm" py={4} wrap="wrap">
+											{data.drives?.map((drive) => (
+												<Button
+													key={drive.path}
+													variant="subtle"
+													size="compact-sm"
+													leftSection={<IconDeviceDesktop size={14} />}
+													onClick={() => navigateTo(drive.path)}
+												>
+													{drive.name}
+												</Button>
+											))}
+										</Group>
+										<Divider />
+									</>
+								)}
+								{/* Subdirectories */}
+								{data.entries.map((entry) => (
+									<UnstyledButton
+										key={entry.path}
+										onClick={() => navigateTo(entry.path)}
+										onDoubleClick={() => handleEntryDoubleClick(entry.path)}
+										px="sm"
+										py={5}
+										className="dir-entry"
+										style={{ borderRadius: 0 }}
+									>
+										<Group gap="xs" wrap="nowrap">
+											<IconFolder
+												size={16}
+												style={{
+													flexShrink: 0,
+													opacity: entry.name.startsWith(".") ? 0.5 : 0.8,
+												}}
+											/>
+											<Text
+												size="sm"
+												truncate
+												c={entry.name.startsWith(".") ? "dimmed" : undefined}
+											>
+												{entry.name}
+											</Text>
+										</Group>
+									</UnstyledButton>
+								))}
+								{/* Inline new folder input */}
+								{creatingFolder && data.path && (
+									<Group gap="xs" px="sm" py={4} wrap="nowrap">
+										<IconFolder size={16} style={{ flexShrink: 0 }} />
+										<TextInput
+											ref={newFolderInputRef}
+											size="xs"
+											placeholder={t("newFolderPlaceholder")}
+											value={newFolderName}
+											onChange={(e) => {
+												setNewFolderName(e.currentTarget.value);
+												mkdirMutation.reset();
+											}}
+											onKeyDown={(e) => {
+												if (e.key === "Enter") submitNewFolder();
+												if (e.key === "Escape") setCreatingFolder(false);
+											}}
+											error={mkdirMutation.error?.message}
+											style={{ flex: 1 }}
+											disabled={mkdirMutation.isPending}
+										/>
+										<Button
+											size="compact-xs"
+											onClick={submitNewFolder}
+											disabled={!newFolderName.trim()}
+											loading={mkdirMutation.isPending}
+										>
+											{t("create")}
+										</Button>
+									</Group>
+								)}
+								{data.path && !data.entries.length && !creatingFolder && (
+									<Text c="dimmed" size="sm" ta="center" mt="xl">
+										{t("emptyDirectory")}
+									</Text>
+								)}
+							</Stack>
+						)}
+					</ScrollArea>
+				</Group>
+				{createPortal(
+					<DragOverlay dropAnimation={null}>
+						{activeFav && (
+							<div
+								style={{
+									backgroundColor: "var(--mantine-color-body)",
+									boxShadow: "var(--mantine-shadow-md)",
+									width: 150,
+								}}
+							>
+								<FavoriteNavContent
+									fav={activeFav}
 									label={
 										activeFav.label ||
 										activeFav.path.split(/[/\\]/).filter(Boolean).pop() ||
 										activeFav.path
 									}
 									isActive={data?.path === activeFav.path}
+									onNavigate={() => {}}
+									onRemove={() => {}}
 								/>
-							)}
-						</DndContext>
-					</Stack>
-				</ScrollArea>
-
-				{/* Directory listing */}
-				<ScrollArea style={{ flex: 1 }} h={350} type="auto" offsetScrollbars>
-					{isLoading && <Loader size="sm" m="auto" display="block" mt="xl" />}
-					{error && (
-						<Text c="red" size="sm" ta="center" mt="xl" px="sm">
-							{(error as Error).message}
-						</Text>
-					)}
-					{data && (
-						<Stack gap={0}>
-							{/* Drive letters (Windows) — shown in main area when at drive root */}
-							{isAtDriveRoot && hasDrives && (
-								<>
-									<Group gap="xs" px="sm" py={4} wrap="wrap">
-										{data.drives?.map((drive) => (
-											<Button
-												key={drive.path}
-												variant="subtle"
-												size="compact-sm"
-												leftSection={<IconDeviceDesktop size={14} />}
-												onClick={() => navigateTo(drive.path)}
-											>
-												{drive.name}
-											</Button>
-										))}
-									</Group>
-									<Divider />
-								</>
-							)}
-							{/* Subdirectories */}
-							{data.entries.map((entry) => (
-								<UnstyledButton
-									key={entry.path}
-									onClick={() => navigateTo(entry.path)}
-									onDoubleClick={() => handleEntryDoubleClick(entry.path)}
-									px="sm"
-									py={5}
-									className="dir-entry"
-									style={{ borderRadius: 0 }}
-								>
-									<Group gap="xs" wrap="nowrap">
-										<IconFolder
-											size={16}
-											style={{
-												flexShrink: 0,
-												opacity: entry.name.startsWith(".") ? 0.5 : 0.8,
-											}}
-										/>
-										<Text size="sm" truncate c={entry.name.startsWith(".") ? "dimmed" : undefined}>
-											{entry.name}
-										</Text>
-									</Group>
-								</UnstyledButton>
-							))}
-							{/* Inline new folder input */}
-							{creatingFolder && data.path && (
-								<Group gap="xs" px="sm" py={4} wrap="nowrap">
-									<IconFolder size={16} style={{ flexShrink: 0 }} />
-									<TextInput
-										ref={newFolderInputRef}
-										size="xs"
-										placeholder={t("newFolderPlaceholder")}
-										value={newFolderName}
-										onChange={(e) => {
-											setNewFolderName(e.currentTarget.value);
-											mkdirMutation.reset();
-										}}
-										onKeyDown={(e) => {
-											if (e.key === "Enter") submitNewFolder();
-											if (e.key === "Escape") setCreatingFolder(false);
-										}}
-										error={mkdirMutation.error?.message}
-										style={{ flex: 1 }}
-										disabled={mkdirMutation.isPending}
-									/>
-									<Button
-										size="compact-xs"
-										onClick={submitNewFolder}
-										disabled={!newFolderName.trim()}
-										loading={mkdirMutation.isPending}
-									>
-										{t("create")}
-									</Button>
-								</Group>
-							)}
-							{data.path && !data.entries.length && !creatingFolder && (
-								<Text c="dimmed" size="sm" ta="center" mt="xl">
-									{t("emptyDirectory")}
-								</Text>
-							)}
-						</Stack>
-					)}
-				</ScrollArea>
-			</Group>
+							</div>
+						)}
+					</DragOverlay>,
+					document.body,
+				)}
+			</DndContext>
 
 			<Divider />
 

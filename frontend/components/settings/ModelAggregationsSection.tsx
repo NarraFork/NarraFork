@@ -4,14 +4,17 @@ import {
 	Button,
 	Card,
 	Group,
+	Modal,
 	MultiSelect,
 	SegmentedControl,
 	Stack,
 	Text,
 	TextInput,
+	Tooltip,
 } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { IconPlus, IconTrash } from "@tabler/icons-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ModelAggregation, ModelOption } from "../../lib/constants";
 
@@ -26,6 +29,25 @@ export interface ModelAggregationsSectionProps {
 	generateId: () => string;
 }
 
+/** Build grouped MultiSelect data from flat model list. */
+function buildModelSelectData(
+	allModels: ModelOption[],
+	providerLabels: Record<string, string>,
+): Array<{ group: string; items: Array<{ value: string; label: string }> }> {
+	const groups = new Map<string, Array<{ value: string; label: string }>>();
+	for (const m of allModels) {
+		if (m.provider === "__default__" || m.provider === "__agg__") continue;
+		const groupName = providerLabels[m.provider ?? ""] ?? m.provider ?? "";
+		let items = groups.get(groupName);
+		if (!items) {
+			items = [];
+			groups.set(groupName, items);
+		}
+		items.push({ value: m.value, label: `${groupName}:${m.label}` });
+	}
+	return Array.from(groups.entries()).map(([group, items]) => ({ group, items }));
+}
+
 export function ModelAggregationsSection({
 	aggregations,
 	onChange,
@@ -34,44 +56,49 @@ export function ModelAggregationsSection({
 	generateId,
 }: ModelAggregationsSectionProps) {
 	const { t } = useTranslation("settings");
-	const [newName, setNewName] = useState("");
+	const [addOpened, { open: openAdd, close: closeAdd }] = useDisclosure(false);
 
-	// Build MultiSelect data from allModels (exclude __default__ and __agg__ entries)
-	const modelSelectData = allModels
-		.filter((m) => m.provider !== "__default__" && m.provider !== "__agg__")
-		.map((m) => ({
-			value: m.value,
-			label: `${providerLabels[m.provider ?? ""] ?? m.provider ?? ""}:${m.label}`,
-		}));
+	const modelSelectData = useMemo(
+		() => buildModelSelectData(allModels, providerLabels),
+		[allModels, providerLabels],
+	);
 
-	const handleAdd = () => {
-		if (!newName.trim()) return;
-		const newAgg: ModelAggregation = {
-			id: generateId(),
-			name: newName.trim(),
-			models: [],
-			routingMode: "priority",
-		};
-		onChange([...aggregations, newAgg]);
-		setNewName("");
-	};
+	const handleAdd = useCallback(
+		(agg: ModelAggregation) => {
+			onChange([...aggregations, agg]);
+		},
+		[aggregations, onChange],
+	);
 
-	const handleDelete = (id: string) => {
-		onChange(aggregations.filter((a) => a.id !== id));
-	};
+	const handleDelete = useCallback(
+		(id: string) => {
+			onChange(aggregations.filter((a) => a.id !== id));
+		},
+		[aggregations, onChange],
+	);
 
-	const handleUpdate = (id: string, patch: Partial<ModelAggregation>) => {
-		onChange(aggregations.map((a) => (a.id === id ? { ...a, ...patch } : a)));
-	};
+	const handleUpdate = useCallback(
+		(id: string, patch: Partial<ModelAggregation>) => {
+			onChange(aggregations.map((a) => (a.id === id ? { ...a, ...patch } : a)));
+		},
+		[aggregations, onChange],
+	);
 
 	return (
 		<Stack gap="xs">
-			<Text size="sm" fw={500}>
-				{t("modelAggregationsSection")}
-			</Text>
-			<Text size="xs" c="dimmed">
-				{t("modelAggregationsSectionDesc")}
-			</Text>
+			<Group justify="space-between" align="center">
+				<div>
+					<Text size="sm" fw={500}>
+						{t("modelAggregationsSection")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{t("modelAggregationsSectionDesc")}
+					</Text>
+				</div>
+				<Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={openAdd}>
+					{t("aggAdd")}
+				</Button>
+			</Group>
 
 			{aggregations.length === 0 && (
 				<Text size="xs" c="dimmed" fs="italic">
@@ -89,26 +116,116 @@ export function ModelAggregationsSection({
 				/>
 			))}
 
-			<Group gap="xs">
-				<TextInput
-					size="xs"
-					placeholder={t("aggNamePlaceholder")}
-					value={newName}
-					onChange={(e) => setNewName(e.currentTarget.value)}
-					onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-					style={{ flex: 1 }}
-				/>
-				<Button
-					size="xs"
-					variant="light"
-					leftSection={<IconPlus size={14} />}
-					onClick={handleAdd}
-					disabled={!newName.trim()}
-				>
-					{t("aggAdd")}
-				</Button>
-			</Group>
+			<AddAggregationModal
+				opened={addOpened}
+				onClose={closeAdd}
+				modelSelectData={modelSelectData}
+				generateId={generateId}
+				onAdd={handleAdd}
+			/>
 		</Stack>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Add Aggregation Modal
+// ---------------------------------------------------------------------------
+
+function AddAggregationModal({
+	opened,
+	onClose,
+	modelSelectData,
+	generateId,
+	onAdd,
+}: {
+	opened: boolean;
+	onClose: () => void;
+	modelSelectData: Array<{
+		group: string;
+		items: Array<{ value: string; label: string }>;
+	}>;
+	generateId: () => string;
+	onAdd: (agg: ModelAggregation) => void;
+}) {
+	const { t } = useTranslation("settings");
+	const [name, setName] = useState("");
+	const [models, setModels] = useState<string[]>([]);
+	const [routingMode, setRoutingMode] = useState<"priority" | "balanced">("priority");
+
+	// Reset form when modal opens
+	useEffect(() => {
+		if (opened) {
+			setName("");
+			setModels([]);
+			setRoutingMode("priority");
+		}
+	}, [opened]);
+
+	const canSubmit = name.trim().length > 0 && models.length > 0;
+
+	const handleSubmit = () => {
+		if (!canSubmit) return;
+		onAdd({
+			id: generateId(),
+			name: name.trim(),
+			models,
+			routingMode,
+		});
+		onClose();
+	};
+
+	return (
+		<Modal opened={opened} onClose={onClose} title={t("aggAdd")} size="md">
+			<Stack gap="sm">
+				<TextInput
+					label={t("aggName")}
+					placeholder={t("aggNamePlaceholder")}
+					value={name}
+					onChange={(e) => setName(e.currentTarget.value)}
+					data-autofocus
+				/>
+
+				<MultiSelect
+					label={t("aggModels")}
+					data={modelSelectData}
+					value={models}
+					onChange={setModels}
+					searchable
+					placeholder={t("aggModelsPlaceholder")}
+					maxDropdownHeight={240}
+				/>
+
+				<div>
+					<Text size="sm" fw={500} mb={4}>
+						{t("aggRoutingMode")}
+					</Text>
+					<SegmentedControl
+						size="xs"
+						fullWidth
+						data={[
+							{ value: "priority", label: t("aggRoutingPriority") },
+							{ value: "balanced", label: t("aggRoutingBalanced") },
+						]}
+						value={routingMode}
+						onChange={(v) => setRoutingMode(v as "priority" | "balanced")}
+					/>
+					<Text size="xs" c="dimmed" mt={4}>
+						{routingMode === "priority" ? t("aggRoutingPriorityDesc") : t("aggRoutingBalancedDesc")}
+					</Text>
+				</div>
+
+				<Group justify="flex-end" mt="xs">
+					<Button variant="default" size="xs" onClick={onClose}>
+						{t("aggCancel")}
+					</Button>
+					<Tooltip label={t("aggSubmitHint")} disabled={canSubmit} position="top">
+						<Button size="xs" onClick={handleSubmit} disabled={!canSubmit}>
+							{t("aggConfirm")}
+						</Button>
+					</Tooltip>
+				</Group>
+			</Stack>
+		</Modal>
 	);
 }
 
@@ -123,7 +240,10 @@ const AggregationCard = memo(function AggregationCard({
 	onDelete,
 }: {
 	agg: ModelAggregation;
-	modelSelectData: Array<{ value: string; label: string }>;
+	modelSelectData: Array<{
+		group: string;
+		items: Array<{ value: string; label: string }>;
+	}>;
 	onUpdate: (id: string, patch: Partial<ModelAggregation>) => void;
 	onDelete: (id: string) => void;
 }) {
@@ -197,7 +317,7 @@ const AggregationCard = memo(function AggregationCard({
 						}
 					/>
 					<Badge size="xs" variant="light" color="gray">
-						{agg.models.length} models
+						{t("aggModelCount", { count: agg.models.length })}
 					</Badge>
 				</Group>
 			</Stack>
