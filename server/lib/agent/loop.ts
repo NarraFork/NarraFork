@@ -131,6 +131,16 @@ function getToolWantedKeys(toolName: string): Set<string> {
 	return new Set([...config.short, ...config.large]);
 }
 
+/** Tools whose input is short enough that streaming JSON parsing adds no value.
+ *  We still emit tool_use_chunk events (so the frontend shows the shimmer),
+ *  but skip extractJsonFields / streaming field extraction entirely.
+ *  Tools with short fields (e.g. Grep.pattern, Read.file_path) still need extraction. */
+function isShortInputTool(name: string): boolean {
+	const config = TOOL_FIELD_CONFIG[name];
+	if (!config) return true; // not in config → short by default
+	return config.large.length === 0 && config.short.length === 0;
+}
+
 const EMPTY_RESPONSE_MESSAGE =
 	"Provider returned an empty response. This often indicates an API configuration error " +
 	"(base URL, model, or credentials).";
@@ -492,6 +502,16 @@ export async function* agentLoop(
 		let requestMeterUsage: number | undefined;
 		let requestMeterUnit: string | undefined;
 		let sawMeaningfulResponse = false;
+		/** Tracks the most recent error message from a retried attempt.  When a
+		 *  transient error (e.g. 429) triggers a retry and the subsequent attempt
+		 *  returns an empty response, we surface this stored message instead of the
+		 *  misleading "Provider returned an empty response" text.  Reset to
+		 *  undefined only when a retry produces meaningful content. */
+		let lastRetryErrorMessage: string | undefined;
+		/** Set to true when the current attempt already yielded a terminal
+		 *  error/invalid_state event.  Prevents the empty-response check from
+		 *  running on the same iteration. */
+		let sawErrorEvent = false;
 		let requestDump: ApiRequestDumpCollector | undefined;
 
 		// ── Transient-error retry loop ──
@@ -531,6 +551,12 @@ export async function* agentLoop(
 			webSearchAccum.clear();
 			receivedUsage = false;
 			sawMeaningfulResponse = false;
+			sawErrorEvent = false;
+			// NOTE: lastRetryErrorMessage is intentionally NOT reset here.
+			// It persists across retries so that if a retry produces an empty
+			// response, we can surface the original error instead of the
+			// misleading "empty response" message.  It is cleared below when
+			// the attempt produces meaningful content.
 
 			// Generate unique request ID for this API call (reset on each retry)
 			requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -593,6 +619,9 @@ export async function* agentLoop(
 						parsed.webSearch
 					) {
 						sawMeaningfulResponse = true;
+						// A successful response clears any prior retry error so the
+						// empty-response guard won't resurface a stale message.
+						lastRetryErrorMessage = undefined;
 					}
 
 					if (parsed.text) {
@@ -698,62 +727,132 @@ export async function* agentLoop(
 							}
 							const acc = toolUseAccum.get(id);
 							if (acc) {
+								const shortInput = isShortInputTool(acc.name);
 								if (typeof input === "string") {
 									acc.inputChunks.push(input);
 									acc.totalChars += input.length;
 
-									// Extract structured fields from the incomplete JSON
-									const raw = acc.inputChunks.join("");
-									const wantedKeys = getToolWantedKeys(acc.name);
-									let fieldsChanged = false;
+									// Short-input tools: skip field extraction, just throttle the chunk event
+									if (shortInput) {
+										const now = Date.now();
+										if (now - acc.lastYieldedAt >= 50) {
+											acc.lastYieldedAt = now;
+											yield {
+												type: "tool_use_chunk",
+												toolUseId: id,
+												toolName: acc.name,
+												inputCharsTotal: acc.totalChars,
+											};
+										}
+									} else {
+										// Extract structured fields from the incomplete JSON
+										const raw = acc.inputChunks.join("");
+										const wantedKeys = getToolWantedKeys(acc.name);
+										let fieldsChanged = false;
 
-									if (wantedKeys.size > 0) {
-										const result = extractJsonFields(raw, wantedKeys);
+										if (wantedKeys.size > 0) {
+											const result = extractJsonFields(raw, wantedKeys);
 
-										// Update completed short fields
-										for (const [key, value] of Object.entries(result.fields)) {
-											if (!acc.extractedFields) acc.extractedFields = {};
-											if (acc.extractedFields[key] !== value) {
-												acc.extractedFields[key] = value;
+											// Update completed short fields
+											for (const [key, value] of Object.entries(result.fields)) {
+												if (!acc.extractedFields) acc.extractedFields = {};
+												if (acc.extractedFields[key] !== value) {
+													acc.extractedFields[key] = value;
+													fieldsChanged = true;
+												}
+											}
+
+											// Update file_path shortcut (used by header summary)
+											if (result.fields.file_path && !acc.extractedFilePath) {
+												acc.extractedFilePath = result.fields.file_path;
 												fieldsChanged = true;
+											}
+
+											// Track the active streaming field
+											if (result.activeField) {
+												acc.activeStreamingField = result.activeField.name;
 											}
 										}
 
-										// Update file_path shortcut (used by header summary)
-										if (result.fields.file_path && !acc.extractedFilePath) {
-											acc.extractedFilePath = result.fields.file_path;
-											fieldsChanged = true;
-										}
+										// Throttle: yield at most once per 50ms per tool.
+										// Bypass throttle when fields change so the frontend
+										// can display them immediately.
+										const now = Date.now();
+										if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
+											acc.lastYieldedAt = now;
 
-										// Track the active streaming field
-										if (result.activeField) {
-											acc.activeStreamingField = result.activeField.name;
+											// Calculate content chars (total minus file_path JSON overhead)
+											let contentChars = acc.totalChars;
+											if (acc.extractedFilePath) {
+												const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+												contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+											}
+
+											// Compute streaming field delta
+											let streamingField: { name: string; delta: string } | undefined;
+											if (acc.activeStreamingField && wantedKeys.size > 0) {
+												const sfResult = extractJsonFields(raw, wantedKeys);
+												if (
+													sfResult.activeField &&
+													sfResult.activeField.name === acc.activeStreamingField
+												) {
+													const fullRaw = raw.slice(sfResult.activeField.rawStart);
+													if (fullRaw.length > acc.streamingFieldYielded) {
+														const delta = unescapeJsonString(
+															fullRaw.slice(acc.streamingFieldYielded),
+														);
+														if (delta) {
+															streamingField = {
+																name: acc.activeStreamingField,
+																delta,
+															};
+															acc.streamingFieldYielded = fullRaw.length;
+														}
+													}
+												}
+											}
+
+											yield {
+												type: "tool_use_chunk",
+												toolUseId: id,
+												toolName: acc.name,
+												inputCharsTotal: acc.totalChars,
+												...(acc.extractedFilePath && {
+													extractedFilePath: acc.extractedFilePath,
+												}),
+												...(acc.extractedFilePath && {
+													contentCharsReceived: contentChars,
+												}),
+												...(acc.extractedFields && {
+													extractedFields: acc.extractedFields,
+												}),
+												...(streamingField && { streamingField }),
+											};
 										}
 									}
+								}
+								if (stop) {
+									const stopRaw = acc.inputChunks.join("");
 
-									// Throttle: yield at most once per 50ms per tool.
-									// Bypass throttle when fields change so the frontend
-									// can display them immediately.
-									const now = Date.now();
-									if (fieldsChanged || now - acc.lastYieldedAt >= 50) {
-										acc.lastYieldedAt = now;
-
-										// Calculate content chars (total minus file_path JSON overhead)
-										let contentChars = acc.totalChars;
-										if (acc.extractedFilePath) {
-											const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-										}
-
-										// Compute streaming field delta
+									// Short-input tools: skip field extraction on stop too
+									if (shortInput) {
+										yield {
+											type: "tool_use_chunk",
+											toolUseId: id,
+											toolName: acc.name,
+											inputCharsTotal: acc.totalChars,
+										};
+									} else {
+										// Final yield: flush any remaining streaming field delta
+										const stopWantedKeys = getToolWantedKeys(acc.name);
 										let streamingField: { name: string; delta: string } | undefined;
-										if (acc.activeStreamingField && wantedKeys.size > 0) {
-											const sfResult = extractJsonFields(raw, wantedKeys);
+										if (acc.activeStreamingField && stopWantedKeys.size > 0) {
+											const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
 											if (
 												sfResult.activeField &&
 												sfResult.activeField.name === acc.activeStreamingField
 											) {
-												const fullRaw = raw.slice(sfResult.activeField.rawStart);
+												const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
 												if (fullRaw.length > acc.streamingFieldYielded) {
 													const delta = unescapeJsonString(
 														fullRaw.slice(acc.streamingFieldYielded),
@@ -763,12 +862,16 @@ export async function* agentLoop(
 															name: acc.activeStreamingField,
 															delta,
 														};
-														acc.streamingFieldYielded = fullRaw.length;
 													}
 												}
 											}
 										}
 
+										let contentChars = acc.totalChars;
+										if (acc.extractedFilePath) {
+											const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
+											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
+										}
 										yield {
 											type: "tool_use_chunk",
 											toolUseId: id,
@@ -786,52 +889,6 @@ export async function* agentLoop(
 											...(streamingField && { streamingField }),
 										};
 									}
-								}
-								if (stop) {
-									// Final yield: flush any remaining streaming field delta
-									const stopRaw = acc.inputChunks.join("");
-									const stopWantedKeys = getToolWantedKeys(acc.name);
-									let streamingField: { name: string; delta: string } | undefined;
-									if (acc.activeStreamingField && stopWantedKeys.size > 0) {
-										const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
-										if (
-											sfResult.activeField &&
-											sfResult.activeField.name === acc.activeStreamingField
-										) {
-											const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
-											if (fullRaw.length > acc.streamingFieldYielded) {
-												const delta = unescapeJsonString(fullRaw.slice(acc.streamingFieldYielded));
-												if (delta) {
-													streamingField = {
-														name: acc.activeStreamingField,
-														delta,
-													};
-												}
-											}
-										}
-									}
-
-									let contentChars = acc.totalChars;
-									if (acc.extractedFilePath) {
-										const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
-										contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
-									}
-									yield {
-										type: "tool_use_chunk",
-										toolUseId: id,
-										toolName: acc.name,
-										inputCharsTotal: acc.totalChars,
-										...(acc.extractedFilePath && {
-											extractedFilePath: acc.extractedFilePath,
-										}),
-										...(acc.extractedFilePath && {
-											contentCharsReceived: contentChars,
-										}),
-										...(acc.extractedFields && {
-											extractedFields: acc.extractedFields,
-										}),
-										...(streamingField && { streamingField }),
-									};
 
 									let parsedInput: Record<string, unknown> = {};
 									if (stopRaw) {
@@ -1111,6 +1168,7 @@ export async function* agentLoop(
 								!config.signal.aborted
 							) {
 								chatRetryCount++;
+								lastRetryErrorMessage = message;
 								const delayMs = Math.min(
 									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 									backoffCeil,
@@ -1142,11 +1200,20 @@ export async function* agentLoop(
 							// Don't return — fall through to yield assistant_message
 							// so the truncated content is persisted normally.
 						} else {
+							// Non-retryable, non-truncation invalidState — treat as a
+							// terminal error.  Flush any partial content and return
+							// immediately so the original error surfaces to the user
+							// instead of being masked by the downstream empty-response
+							// check (which would retry and eventually report a misleading
+							// "Provider returned an empty response" message).
+							sawErrorEvent = true;
+							yield* flushPartialContent(reasoningBlockMap, assistantText);
 							yield {
 								type: "invalid_state",
 								reason,
 								message,
 							};
+							return;
 						}
 					}
 				}
@@ -1186,6 +1253,7 @@ export async function* agentLoop(
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
+						lastRetryErrorMessage = msg;
 						const delayMs = Math.min(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 							backoffCeil,
@@ -1217,7 +1285,30 @@ export async function* agentLoop(
 
 			// Empty response check — request succeeded but returned no content.
 			// Use a dedicated counter (max 3 retries) separate from transient error retries.
-			if (!sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+			// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
+			// during this attempt — otherwise the empty-response message masks the real error.
+			if (!sawErrorEvent && !sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+				// If a previous retry recorded a real error (e.g. 429) and this
+				// follow-up attempt returned nothing, surface the original error
+				// instead of the misleading "empty response" message.
+				if (lastRetryErrorMessage) {
+					logger.warn(
+						"Provider returned empty response after prior error, surfacing original error",
+						{
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							originalError: lastRetryErrorMessage,
+						},
+					);
+					yield {
+						type: "retryable_error",
+						message: lastRetryErrorMessage,
+					};
+					return;
+				}
+
 				emptyResponseRetries++;
 				if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
 					const delayMs = Math.min(
@@ -1259,6 +1350,13 @@ export async function* agentLoop(
 					reason: "empty_response",
 					message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
 				};
+				return;
+			}
+
+			// Safety net: if an error was already yielded during this attempt but
+			// execution somehow continued (e.g. future code changes removed a return),
+			// stop here instead of proceeding with normal post-chat logic.
+			if (sawErrorEvent) {
 				return;
 			}
 
