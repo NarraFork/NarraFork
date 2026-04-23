@@ -1,7 +1,8 @@
 import { Affix, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
@@ -35,6 +36,10 @@ function SettingsProvidersPage() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+	const search = useSearch({ strict: false }) as {
+		oauth_success?: string;
+		oauth_error?: string;
+	};
 
 	const { data: settings, isLoading } = useQuery({
 		queryKey: ["admin", "settings"],
@@ -64,6 +69,35 @@ function SettingsProvidersPage() {
 	}, [state.initialized, state]);
 
 	const isDirty = useIsDirty(state, savedSnapshot.current);
+
+	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
+	const oauthHandledRef = useRef(false);
+	useEffect(() => {
+		if (oauthHandledRef.current) return;
+		if (search.oauth_success) {
+			oauthHandledRef.current = true;
+			// Force re-fetch settings so the reducer picks up the new OAuth credentials
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Reset reducer so INIT_FROM_SETTINGS re-runs with fresh server data
+			prevInitialized.current = false;
+			dispatch({ type: "RESET_FOR_REINIT" });
+			// Clean URL
+			window.history.replaceState({}, "", window.location.pathname);
+		} else if (search.oauth_error) {
+			oauthHandledRef.current = true;
+			const errorCode = decodeURIComponent(search.oauth_error);
+			const errorKey = `nugOAuthError_${errorCode}`;
+			// Use specific i18n key if available, otherwise show raw error
+			const message = t(errorKey, { defaultValue: "" }) || errorCode;
+			notifications.show({
+				title: t("nugOAuthError"),
+				message,
+				color: "red",
+			});
+			window.history.replaceState({}, "", window.location.pathname);
+		}
+	}, [search.oauth_success, search.oauth_error, qc, t]);
 
 	// Per-provider dirty checkers
 	const isOpenaiProviderDirty = useCallback(
@@ -246,6 +280,21 @@ function SettingsProvidersPage() {
 			}
 			// Route to new provider by its immutable ID
 			setSelectedProvider(id);
+		},
+		[dispatchers],
+	);
+
+	// ── Server-side context window merge (e.g. after Cline model add) ──
+	const handleServerContextWindowsMerge = useCallback(
+		(windows: Record<string, number>) => {
+			dispatchers.mergeContextWindows(windows);
+			// Also update the saved snapshot so dirty detection doesn't falsely trigger
+			const snap = savedSnapshot.current;
+			for (const [key, value] of Object.entries(windows)) {
+				if (!(key in snap.modelContextWindows)) {
+					snap.modelContextWindows[key] = value;
+				}
+			}
 		},
 		[dispatchers],
 	);
@@ -487,6 +536,7 @@ function SettingsProvidersPage() {
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
 						onTestModel={setTestingModel}
+						onServerContextWindowsMerge={handleServerContextWindowsMerge}
 					/>
 				</ProviderConfigView>
 			);
@@ -594,6 +644,7 @@ interface ProviderSectionContentProps {
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	onTestModel: (model: string) => void;
+	onServerContextWindowsMerge?: (windows: Record<string, number>) => void;
 }
 
 function ProviderSectionContent({
@@ -609,6 +660,7 @@ function ProviderSectionContent({
 	isNugProviderDirty,
 	getPrefixError,
 	onTestModel,
+	onServerContextWindowsMerge,
 }: ProviderSectionContentProps) {
 	// Platform providers: matched by prefix
 		return (
@@ -646,6 +698,7 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onMergeContextWindows={onServerContextWindowsMerge}
 				onTestModel={onTestModel}
 			/>
 		);

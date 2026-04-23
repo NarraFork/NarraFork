@@ -490,6 +490,8 @@ export const miscApi = {
 			models: Array<{ id: string; owned_by?: string }>;
 			fromCache: boolean;
 		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
+	nugOAuthStart: (providerId: string) =>
+		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),
 
 	// Cline
 	clineStatus: () =>
@@ -561,10 +563,13 @@ export const miscApi = {
 		}>(`/cline/pool/search?q=${encodeURIComponent(q)}&limit=${limit}`),
 	clinePoolCount: () => request<{ count: number }>("/cline/pool/count"),
 	clineSetEnabledModels: (models: string[]) =>
-		request<{ ok: boolean; count: number }>("/cline/enabled-models", {
-			method: "POST",
-			body: JSON.stringify({ models }),
-		}),
+		request<{ ok: boolean; count: number; modelContextWindows?: Record<string, number> }>(
+			"/cline/enabled-models",
+			{
+				method: "POST",
+				body: JSON.stringify({ models }),
+			},
+		),
 
 	// Health / platform
 	health: () =>

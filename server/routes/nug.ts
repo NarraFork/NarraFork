@@ -9,6 +9,7 @@ import {
 	nugProviderPrefix,
 	registerNugModelChecker,
 	registerNugModelLister,
+	saveSettings,
 	settings,
 } from "../lib/settings";
 
@@ -470,3 +471,146 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 nugRoutes.get("/quotas", (c) => {
 	return c.json(getAllNugCachedQuotas());
 });
+
+// ─── OAuth Flow ───
+
+/** In-memory store for pending OAuth states (TTL: 10 minutes). */
+const pendingOAuthStates = new Map<
+	string,
+	{ providerId: string; callbackUrl: string; expiresAt: number }
+>();
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+function cleanExpiredOAuthStates() {
+	const now = Date.now();
+	for (const [key, val] of pendingOAuthStates) {
+		if (val.expiresAt <= now) pendingOAuthStates.delete(key);
+	}
+}
+
+/** Generate OAuth authorization URL for a NUG provider. */
+nugRoutes.get("/providers/:id/oauth/start", (c) => {
+	const id = c.req.param("id");
+	const providers = settings.nugProviders ?? [];
+	const config = providers.find((p) => p.id === id);
+	if (!config) return c.json({ error: `Provider "${id}" not found` }, 404);
+
+	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	if (!baseUrl) return c.json({ error: "Provider base URL not configured" }, 400);
+	if (!config.oauthClientId) return c.json({ error: "OAuth client ID not configured" }, 400);
+
+	// Build the callback URL for this narrafork instance.
+	// Priority: manual config > x-forwarded-host > host header > fallback
+	let callbackUrl: string;
+	if (config.oauthCallbackUrl) {
+		callbackUrl = config.oauthCallbackUrl;
+	} else {
+		const host = c.req.header("x-forwarded-host") ?? c.req.header("host") ?? "localhost:7779";
+		const proto = c.req.header("x-forwarded-proto") ?? "http";
+		callbackUrl = `${proto}://${host}/api/nug/oauth/callback`;
+	}
+
+	// Generate a random state parameter and store it server-side
+	const state = `${id}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+	cleanExpiredOAuthStates();
+	pendingOAuthStates.set(state, {
+		providerId: id,
+		callbackUrl,
+		expiresAt: Date.now() + OAUTH_STATE_TTL_MS,
+	});
+
+	// Build NUG authorization URL
+	const authorizeUrl = new URL(`${baseUrl}/oauth/authorize`);
+	authorizeUrl.searchParams.set("client_id", config.oauthClientId);
+	authorizeUrl.searchParams.set("redirect_uri", callbackUrl);
+	authorizeUrl.searchParams.set("state", state);
+
+	return c.json({
+		authorizeUrl: authorizeUrl.toString(),
+		state,
+	});
+});
+
+/** OAuth callback handler — exported so app.ts can mount it before requireAuth. */
+export async function handleNugOAuthCallback(c: import("hono").Context) {
+	const code = c.req.query("code");
+	const state = c.req.query("state");
+	const error = c.req.query("error");
+
+	if (error) {
+		// User denied or error occurred — redirect to settings with error
+		return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(error)}`);
+	}
+
+	if (!code || !state) {
+		return c.redirect("/settings/providers?oauth_error=missing_params");
+	}
+
+	// Validate state against server-side store (consume on use)
+	const pending = pendingOAuthStates.get(state);
+	if (!pending || pending.expiresAt <= Date.now()) {
+		pendingOAuthStates.delete(state ?? "");
+		return c.redirect("/settings/providers?oauth_error=state_expired");
+	}
+	pendingOAuthStates.delete(state);
+
+	const providerId = pending.providerId;
+	const providers = settings.nugProviders ?? [];
+	const config = providers.find((p) => p.id === providerId);
+	if (!config) {
+		return c.redirect(`/settings/providers?oauth_error=invalid_provider`);
+	}
+
+	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	if (!config.oauthClientId || !config.oauthClientSecret) {
+		return c.redirect(`/settings/providers?oauth_error=oauth_not_configured`);
+	}
+
+	// Reuse the exact callbackUrl that was sent in /oauth/start to guarantee
+	// redirect_uri matches, even if host/proto headers differ between requests.
+	const callbackUrl = pending.callbackUrl;
+
+	try {
+		// Exchange code for API key
+		const tokenResponse = await fetch(`${baseUrl}/api/oauth/token`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				code,
+				client_id: config.oauthClientId,
+				client_secret: config.oauthClientSecret,
+				redirect_uri: callbackUrl,
+			}),
+		});
+
+		if (!tokenResponse.ok) {
+			const errText = await tokenResponse.text().catch(() => "");
+			logger.error("NUG OAuth token exchange failed", { error: errText, provider: config.name });
+			return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(errText)}`);
+		}
+
+		const tokenData = (await tokenResponse.json()) as {
+			api_key: string;
+			device_id: string;
+			device_name: string;
+			username?: string;
+			user_id?: string;
+		};
+
+		// Update provider config with the new API key and device info
+		config.apiKey = tokenData.api_key;
+		config.oauthDeviceId = tokenData.device_id;
+		if (tokenData.username) config.nugUsername = tokenData.username;
+		if (tokenData.user_id) config.nugUserId = tokenData.user_id;
+
+		// Persist settings
+		saveSettings(settings);
+
+		// Redirect to settings page with success
+		return c.redirect(`/settings/providers?oauth_success=${providerId}`);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NUG OAuth callback failed", { error: msg, provider: config.name });
+		return c.redirect(`/settings/providers?oauth_error=${encodeURIComponent(msg)}`);
+	}
+}

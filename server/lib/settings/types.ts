@@ -112,6 +112,14 @@ export interface NUGProviderConfig {
 	nugUsername?: string;
 	/** NUG account user ID (auto-filled after login). */
 	nugUserId?: string;
+	/** OAuth client ID (registered on NUG admin). */
+	oauthClientId?: string;
+	/** OAuth client secret. */
+	oauthClientSecret?: string;
+	/** OAuth device ID (auto-filled after OAuth authorization). */
+	oauthDeviceId?: string;
+	/** Override OAuth callback URL (auto-detected from request headers by default). */
+	oauthCallbackUrl?: string;
 }
 
 export interface ClineProviderConfig {

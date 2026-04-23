@@ -48,6 +48,9 @@ export interface NUGProviderState {
 	disabled?: boolean;
 	nugUsername?: string;
 	nugUserId?: string;
+	oauthClientId?: string;
+	oauthClientSecret?: string;
+	oauthDeviceId?: string;
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
@@ -657,7 +660,66 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 										{t("nugLoginBtn")}
 									</Button>
 								</Tooltip>
+								{p.oauthClientId && (
+									<Tooltip label={t("nugOAuthTooltip")}>
+										<Button
+											size="xs"
+											variant="light"
+											color="grape"
+											disabled={!p.baseUrl || !p.oauthClientId || isProviderDirty?.(p.id)}
+											onClick={async () => {
+												if (isProviderDirty?.(p.id)) {
+													notifications.show({
+														color: "yellow",
+														title: t("refreshModelsSaveFirst"),
+														message: "",
+													});
+													return;
+												}
+												try {
+													const result = await api.nugOAuthStart(p.id);
+													window.location.href = result.authorizeUrl;
+												} catch (err) {
+													notifications.show({
+														title: t("nugOAuthError"),
+														message: err instanceof Error ? err.message : "OAuth failed",
+														color: "red",
+													});
+												}
+											}}
+										>
+											{t("nugOAuthBtn")}
+										</Button>
+									</Tooltip>
+								)}
 							</Group>
+
+							{/* OAuth config (collapsible) */}
+							<Group gap="xs">
+								<TextInput
+									size="xs"
+									label={t("nugOAuthClientId")}
+									placeholder="OAuth Client ID"
+									value={p.oauthClientId ?? ""}
+									onChange={(e) => updateProvider(p.id, { oauthClientId: e.currentTarget.value })}
+									style={{ flex: 1 }}
+								/>
+								<PasswordInput
+									size="xs"
+									label={t("nugOAuthClientSecret")}
+									placeholder="OAuth Client Secret"
+									value={p.oauthClientSecret ?? ""}
+									onChange={(e) =>
+										updateProvider(p.id, { oauthClientSecret: e.currentTarget.value })
+									}
+									style={{ flex: 1 }}
+								/>
+							</Group>
+							{p.oauthDeviceId && (
+								<Text size="xs" c="dimmed">
+									{t("nugOAuthDeviceId")}: {p.oauthDeviceId}
+								</Text>
+							)}
 
 							{/* Account info */}
 							{p.apiKey && p.baseUrl && (

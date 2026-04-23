@@ -42,6 +42,7 @@ interface ClineSectionProps {
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onMergeContextWindows?: (windows: Record<string, number>) => void;
 	onTestModel?: (model: string) => void;
 }
 
@@ -53,6 +54,7 @@ export const ClineSection = React.memo(function ClineSection({
 	onCustomModelsChange,
 	modelContextWindows,
 	onContextWindowChange,
+	onMergeContextWindows,
 	onTestModel,
 }: ClineSectionProps) {
 	const { t } = useTranslation("settings");
@@ -146,7 +148,11 @@ export const ClineSection = React.memo(function ClineSection({
 	// Set enabled models mutation
 	const setEnabledModelsMutation = useMutation({
 		mutationFn: (models: string[]) => api.clineSetEnabledModels(models),
-		onSuccess: () => {
+		onSuccess: (data) => {
+			// Merge server-filled context windows into local reducer state
+			if (data.modelContextWindows && onMergeContextWindows) {
+				onMergeContextWindows(data.modelContextWindows);
+			}
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		},

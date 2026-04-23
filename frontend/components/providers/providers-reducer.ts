@@ -46,8 +46,10 @@ export type ProvidersAction =
 	| { type: "SET_CONTEXT_WINDOW"; modelVal: string; size: number | null }
 	| { type: "SET_PROVIDER_ORDER"; order: string[] }
 	| { type: "TOGGLE_PROVIDER_DISABLED"; prefix: string }
+	| { type: "MERGE_CONTEXT_WINDOWS"; windows: Record<string, number> }
 	| { type: "MARK_SAVED" }
-	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot };
+	| { type: "RESTORE_FROM_SNAPSHOT"; snapshot: SavedSnapshot }
+	| { type: "RESET_FOR_REINIT" };
 
 // ── Helpers ────────────────────────────────────────────
 
@@ -126,6 +128,9 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				disabled: p.disabled ?? false,
 				nugUsername: p.nugUsername,
 				nugUserId: p.nugUserId,
+				oauthClientId: p.oauthClientId,
+				oauthClientSecret: p.oauthClientSecret,
+				oauthDeviceId: p.oauthDeviceId,
 			}));
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -231,6 +236,19 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 		case "SET_PROVIDER_ORDER":
 			return { ...state, providerOrder: action.order };
 
+		case "MERGE_CONTEXT_WINDOWS": {
+			// Merge server-side context windows into local state without overwriting user edits
+			const merged = { ...state.modelContextWindows };
+			let changed = false;
+			for (const [key, value] of Object.entries(action.windows)) {
+				if (!(key in merged)) {
+					merged[key] = value;
+					changed = true;
+				}
+			}
+			return changed ? { ...state, modelContextWindows: merged } : state;
+		}
+
 		case "TOGGLE_PROVIDER_DISABLED": {
 			const next = new Set(state.disabledProviders);
 			const willDisable = !next.has(action.prefix);
@@ -271,6 +289,9 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				disabledProviders: new Set(snap.disabledProviders),
 			};
 		}
+
+		case "RESET_FOR_REINIT":
+			return initialProvidersState;
 
 		default:
 			return state;
@@ -402,6 +423,11 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 		[dispatch],
 	);
 
+	const mergeContextWindows = useCallback(
+		(windows: Record<string, number>) => dispatch({ type: "MERGE_CONTEXT_WINDOWS", windows }),
+		[dispatch],
+	);
+
 	return useMemo(
 		() => ({
 			setOpenaiProviders,
@@ -413,6 +439,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,
+			mergeContextWindows,
 		}),
 		[
 			setOpenaiProviders,
@@ -424,6 +451,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			handleContextWindowChange,
 			setProviderOrder,
 			toggleProviderDisabled,
+			mergeContextWindows,
 		],
 	);
 }

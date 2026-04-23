@@ -161,7 +161,21 @@ async function fillContextWindows(
 		cachedModelsByProvider.set(provider.id, cached);
 		saveCachedModels();
 	}
-	const contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
+	let contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
+
+	// If any new model is missing from cache, refresh from OpenRouter API
+	const missing = newModels.filter((id) => !contextMap.has(id));
+	if (missing.length > 0) {
+		try {
+			cached = await fetchOpenRouterModels(provider);
+			cachedModelsByProvider.set(provider.id, cached);
+			saveCachedModels();
+			contextMap = new Map(cached.map((m) => [m.id, m.contextLength]));
+		} catch {
+			// Non-critical — proceed with whatever we have
+		}
+	}
+
 	let changed = false;
 	const windows = settings.agent.modelContextWindows ?? {};
 	settings.agent.modelContextWindows = windows;
@@ -622,7 +636,11 @@ clineRoutes.post("/enabled-models", async (c) => {
 		await fillContextWindows(newModels, provider);
 	}
 
-	return c.json({ ok: true, count: body.models.length });
+	return c.json({
+		ok: true,
+		count: body.models.length,
+		modelContextWindows: settings.agent.modelContextWindows ?? {},
+	});
 });
 
 /**

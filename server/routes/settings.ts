@@ -86,6 +86,10 @@ const nugProviderSchema = z.object({
 	defaultModel: z.string(),
 	nugUsername: z.string().optional(),
 	nugUserId: z.string().optional(),
+	oauthClientId: z.string().optional(),
+	oauthClientSecret: z.string().optional(),
+	oauthDeviceId: z.string().optional(),
+	oauthCallbackUrl: z.string().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -455,6 +459,7 @@ settingsRoutes.get("/", (c) => {
 		nugProviders: (s.nugProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
 		})),
 		clineProviders: (s.clineProviders ?? []).map((p) => ({
 			...p,
@@ -622,13 +627,18 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
-	// Preserve real API keys for NUG providers
+	// Preserve real API keys and OAuth secrets for NUG providers
 	if (validated.nugProviders) {
 		const currentProviders = current.nugProviders ?? [];
 		for (const p of validated.nugProviders) {
 			if (p.apiKey?.startsWith("*")) {
 				const existing = currentProviders.find((cp) => cp.id === p.id);
 				p.apiKey = existing?.apiKey ?? "";
+			}
+			// Preserve OAuth client secret when masked
+			if (p.oauthClientSecret?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.oauthClientSecret = existing?.oauthClientSecret ?? "";
 			}
 		}
 	}
@@ -733,6 +743,7 @@ settingsRoutes.patch("/", async (c) => {
 		nugProviders: (merged.nugProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
 		})),
 		clineProviders: (merged.clineProviders ?? []).map((p) => ({
 			...p,
