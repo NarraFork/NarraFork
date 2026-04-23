@@ -819,6 +819,7 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 	"gpt-5.1-codex": ["none", "low", "medium", "high"],
 	"gpt-5.1-codex-mini": ["none", "medium", "high"],
 	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
 };

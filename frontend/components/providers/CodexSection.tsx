@@ -118,6 +118,8 @@ export const CodexSection = React.memo(function CodexSection({
 	});
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];
+	const builtinContextWindows: Record<string, number> =
+		settingsData?.builtinModelContextWindows ?? {};
 	const entries = status?.entries ?? [];
 	const availableEntries = status?.availableEntries ?? [];
 	const unavailableEntries = status?.unavailableEntries ?? [];
@@ -839,6 +841,7 @@ export const CodexSection = React.memo(function CodexSection({
 						hiddenModels={hiddenModels}
 						onToggleHidden={onToggleHidden}
 						modelContextWindows={modelContextWindows}
+						defaultContextWindows={builtinContextWindows}
 						onContextWindowChange={onContextWindowChange}
 						onTestModel={onTestModel}
 						showContextWindow

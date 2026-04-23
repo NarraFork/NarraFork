@@ -519,6 +519,44 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"claude-3-opus-20240229": 200_000,
 };
 
+function getBuiltinModelContextWindow(model: string): number | null {
+	const bareModel = parseModelId(model).model;
+
+	// Check built-in table (exact match)
+	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
+	if (builtinConfig !== undefined) {
+		return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
+	}
+
+	// Fuzzy match
+	const normalizedBare = bareModel.toLowerCase();
+	const sortedEntries = Object.entries(BUILTIN_CONTEXT_WINDOWS).sort(
+		(a, b) => b[0].length - a[0].length,
+	);
+	for (const [pattern, config] of sortedEntries) {
+		if (normalizedBare.startsWith(pattern)) {
+			return typeof config === "number" ? config : config.contextLength;
+		}
+	}
+
+	return null;
+}
+
+export function getBuiltinModelContextWindows(
+	models: string[],
+	provider: string,
+): Record<string, number> {
+	const result: Record<string, number> = {};
+	for (const model of models) {
+		const contextWindow = getBuiltinModelContextWindow(model);
+		if (contextWindow) {
+			const bareModel = parseModelId(model).model;
+			result[provider ? `${provider}:${bareModel}` : model] = contextWindow;
+		}
+	}
+	return result;
+}
+
 export function getModelContextWindow(model: string, provider: string): number | null {
 	const bareModel = parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
@@ -543,25 +581,8 @@ export function getModelContextWindow(model: string, provider: string): number |
 		}
 	}
 
-	// 2. Check built-in table (exact match)
-	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
-	if (builtinConfig) {
-		return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
-	}
-
-	// 3. Fuzzy match
-	const normalizedBare = bareModel.toLowerCase();
-	const sortedEntries = Object.entries(BUILTIN_CONTEXT_WINDOWS).sort(
-		(a, b) => b[0].length - a[0].length,
-	);
-	for (const [pattern, config] of sortedEntries) {
-		if (normalizedBare.startsWith(pattern)) {
-			return typeof config === "number" ? config : config.contextLength;
-		}
-	}
-
-	// 4. Unknown model — return default 128k
-	return 128_000;
+	// 2. Check built-in table and fuzzy matches
+	return getBuiltinModelContextWindow(model) ?? 128_000;
 }
 
 /** Threshold above which a model is considered "large context". */

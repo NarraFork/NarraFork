@@ -25,6 +25,7 @@ export {
 	getAggregation,
 	getAnthropicProviderConfig,
 	getBuiltinCodexModels,
+	getBuiltinModelContextWindows,
 	getClineProviderConfig,
 	getContextThresholds,
 	getFirstNugProvider,

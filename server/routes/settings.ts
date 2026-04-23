@@ -11,6 +11,7 @@ import { logger } from "../lib/logger";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
+	getBuiltinModelContextWindows,
 	getContextThresholds,
 	type NarraForkSettings,
 	purgeStaleAgentModelRefs,
@@ -472,6 +473,7 @@ settingsRoutes.get("/", (c) => {
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
+		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
 		summaryModelAvailable: checkSummaryModelAvailable(s.agent.summaryModel),
 	};

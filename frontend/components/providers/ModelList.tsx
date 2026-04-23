@@ -15,6 +15,7 @@ export interface ModelListProps {
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden?: (modelValues: string[], hidden: boolean) => void;
 	modelContextWindows: Record<string, number>;
+	defaultContextWindows?: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	onTestModel?: (model: string) => void;
 	showContextWindow?: boolean;
@@ -26,6 +27,7 @@ export const ModelList = React.memo(function ModelList({
 	onToggleHidden,
 	onBatchToggleHidden,
 	modelContextWindows,
+	defaultContextWindows,
 	onContextWindowChange,
 	onTestModel,
 	showContextWindow = true,
@@ -63,7 +65,7 @@ export const ModelList = React.memo(function ModelList({
 					modelLabel={m.label}
 					isHidden={hiddenModels.has(m.value)}
 					onToggleHidden={() => onToggleHidden(m.value)}
-					contextWindow={modelContextWindows[m.value]}
+					contextWindow={modelContextWindows[m.value] ?? defaultContextWindows?.[m.value]}
 					onContextWindowChange={(size) => onContextWindowChange(m.value, size)}
 					onTestModel={onTestModel ? () => onTestModel(m.value) : undefined}
 					showContextWindow={showContextWindow}

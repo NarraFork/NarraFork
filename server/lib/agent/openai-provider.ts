@@ -55,6 +55,7 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 	"gpt-5.1-codex": ["low", "medium", "high"],
 	"gpt-5.1-codex-mini": ["medium", "high"],
 	"gpt-5.2": ["low", "medium", "high", "xhigh"],
+	"gpt-5.5": ["low", "medium", "high", "xhigh"],
 	"gpt-5.4": ["low", "medium", "high", "xhigh"],
 	"gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
 };
