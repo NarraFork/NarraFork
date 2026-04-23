@@ -31,7 +31,7 @@ import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
-import { nugRoutes } from "./routes/nug";
+import { handleNugOAuthCallback, nugRoutes } from "./routes/nug";
 import { openaiRoutes } from "./routes/openai";
 import { overseerRoutes } from "./routes/overseers";
 import { projectDbRoutes } from "./routes/project-db";
@@ -49,6 +49,7 @@ import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
+import { benchmarkRoutes } from "./routes/benchmarks";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
@@ -103,6 +104,9 @@ app.post("/api/gateway/webhook", async (c) => {
 	return handleWebhookRequest(c);
 });
 
+// Public: NUG OAuth callback (state-verified, no JWT — browser redirect from external provider)
+app.get("/api/nug/oauth/callback", handleNugOAuthCallback);
+
 // All routes below require authentication
 app.use("/api/*", requireAuth);
 
@@ -127,6 +131,8 @@ const GIT_FREE_PREFIXES = [
 	"/api/anthropic",
 	"/api/nug",
 	"/api/gateway",
+	"/api/dependencies",
+	"/api/terminals",
 ];
 app.use("/api/*", async (c, next) => {
 	if (gitAvailable) return next();
@@ -168,6 +174,7 @@ app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
 app.route("/api/usage-history", usageHistoryRoutes);
 app.route("/api/workspaces", workspaceRoutes);
+app.route("/api/benchmarks", benchmarkRoutes);
 
 // IM Gateway management routes (status, sessions, etc.)
 app.route("/api/gateway", gatewayRoutes);

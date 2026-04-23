@@ -1,6 +1,9 @@
 import { relations } from "drizzle-orm";
 import {
 	apiRequests,
+	benchmarkRuns,
+	benchmarkSuites,
+	benchmarkTaskResults,
 	chapterCommits,
 	chapterEdges,
 	chapters,
@@ -388,5 +391,30 @@ export const gatewaySessionMappingsRelations = relations(gatewaySessionMappings,
 	chapter: one(chapters, {
 		fields: [gatewaySessionMappings.chapterId],
 		references: [chapters.id],
+	}),
+}));
+
+// === Benchmark relations ===
+
+export const benchmarkSuitesRelations = relations(benchmarkSuites, ({ many }) => ({
+	runs: many(benchmarkRuns),
+}));
+
+export const benchmarkRunsRelations = relations(benchmarkRuns, ({ one, many }) => ({
+	suite: one(benchmarkSuites, {
+		fields: [benchmarkRuns.suiteId],
+		references: [benchmarkSuites.id],
+	}),
+	taskResults: many(benchmarkTaskResults),
+}));
+
+export const benchmarkTaskResultsRelations = relations(benchmarkTaskResults, ({ one }) => ({
+	run: one(benchmarkRuns, {
+		fields: [benchmarkTaskResults.runId],
+		references: [benchmarkRuns.id],
+	}),
+	narrator: one(narrators, {
+		fields: [benchmarkTaskResults.narratorId],
+		references: [narrators.id],
 	}),
 }));

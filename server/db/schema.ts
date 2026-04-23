@@ -1003,3 +1003,76 @@ export const gatewaySessionMappings = sqliteTable(
 		index("idx_gsm_app_user").on(table.appUserId),
 	],
 );
+
+// === benchmarks ===
+
+export const benchmarkSuites = sqliteTable("benchmark_suites", {
+	id: text("id").primaryKey(),
+	name: text("name").notNull(),
+	version: text("version"),
+	description: text("description"),
+	tasksJson: text("tasks_json", { mode: "json" }),
+	createdAt: text("created_at").notNull(),
+});
+
+export const benchmarkRuns = sqliteTable("benchmark_runs", {
+	id: text("id").primaryKey(),
+	suiteId: text("suite_id")
+		.notNull()
+		.references(() => benchmarkSuites.id),
+	name: text("name").notNull(),
+	model: text("model").notNull(),
+	systemPrompt: text("system_prompt"),
+	permissionMode: text("permission_mode").default("bypassPermissions"),
+	status: text("status", {
+		enum: ["pending", "running", "completed", "failed", "cancelled"],
+	})
+		.notNull()
+		.default("pending"),
+	config: text("config", { mode: "json" }),
+	totalTasks: integer("total_tasks").default(0),
+	completedTasks: integer("completed_tasks").default(0),
+	passedTasks: integer("passed_tasks").default(0),
+	failedTasks: integer("failed_tasks").default(0),
+	totalCostUsd: real("total_cost_usd").default(0),
+	totalTokensIn: integer("total_tokens_in").default(0),
+	totalTokensOut: integer("total_tokens_out").default(0),
+	totalDurationMs: integer("total_duration_ms").default(0),
+	startedAt: text("started_at"),
+	completedAt: text("completed_at"),
+	createdAt: text("created_at").notNull(),
+});
+
+export const benchmarkTaskResults = sqliteTable(
+	"benchmark_task_results",
+	{
+		id: text("id").primaryKey(),
+		runId: text("run_id")
+			.notNull()
+			.references(() => benchmarkRuns.id, { onDelete: "cascade" }),
+		taskId: text("task_id").notNull(),
+		taskName: text("task_name").notNull(),
+		narratorId: text("narrator_id").references(() => narrators.id),
+		status: text("status", {
+			enum: ["pending", "running", "passed", "failed", "error", "timeout"],
+		})
+			.notNull()
+			.default("pending"),
+		score: real("score"),
+		maxScore: real("max_score"),
+		output: text("output"),
+		evalOutput: text("eval_output"),
+		errorMessage: text("error_message"),
+		tokensIn: integer("tokens_in").default(0),
+		tokensOut: integer("tokens_out").default(0),
+		costUsd: real("cost_usd").default(0),
+		durationMs: integer("duration_ms").default(0),
+		toolCallCount: integer("tool_call_count").default(0),
+		messageCount: integer("message_count").default(0),
+		metadata: text("metadata", { mode: "json" }),
+		startedAt: text("started_at"),
+		completedAt: text("completed_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_task_results_run").on(table.runId, table.status)],
+);
