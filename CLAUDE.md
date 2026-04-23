@@ -136,7 +136,7 @@ server/
 - **技能系统**（`server/services/skill-service.ts`）：项目级技能库，为叙述者提供领域特定指令和知识。
 - **例程系统**（`server/services/routine-service.ts`）：内置和自定义的自动化例程。
 - **通知系统**（`server/services/notification-service.ts`）：通知管理和声音提醒。
-- **后台任务**：叙述者支持后台运行模式（`isBackground`/`backgroundStatus`/`backgroundResult` 字段），配合 check-background-task、cancel-background-task、continue-task 工具管理。
+- **后台任务**：叙述者支持后台运行模式（`isBackground`/`backgroundStatus`/`backgroundResult` 字段），配合 task（stop 参数）、continue-task 工具管理。
 - **叙述者服务拆分**：叙述者逻辑拆分为多个子服务 — narrator-service（核心 CRUD）、narrator-session（会话管理）、narrator-executor（执行器）、narrator-subagent（子代理管理）、narrator-context（上下文管理）、narrator-prompt（提示词生成）、narrator-title（标题生成）、narrator-recovery（恢复机制）、narrator-event-handler（事件处理）。
 - **项目数据库同步**（`server/services/project-db-sync.ts`）：项目数据库同步和导入功能。
 - **Worktree 监视器**（`server/services/worktree-watcher.ts`）：监视 worktree 文件变化。
