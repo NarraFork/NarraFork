@@ -1,7 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { api } from "../lib/api";
+import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 export function useTerminals(chapterId: string) {
+	const qc = useQueryClient();
+
+	// Invalidate when any narrator in this chapter reports terminal_count_changed
+	useEffect(() => {
+		if (!chapterId) return;
+		const handle = narratorWSManager.addListener(
+			{ narratorIds: "*", types: ["terminal_count_changed"] },
+			() => {
+				qc.invalidateQueries({ queryKey: ["terminals", { chapterId }] });
+			},
+		);
+		return () => narratorWSManager.removeListener(handle);
+	}, [chapterId, qc]);
+
 	return useQuery({
 		queryKey: ["terminals", { chapterId }],
 		queryFn: () => api.listTerminals(chapterId),
@@ -10,6 +26,20 @@ export function useTerminals(chapterId: string) {
 }
 
 export function useNarratorTerminals(narratorId: string) {
+	const qc = useQueryClient();
+
+	// Invalidate when this narrator's terminal count changes
+	useEffect(() => {
+		if (!narratorId) return;
+		const handle = narratorWSManager.addListener(
+			{ narratorIds: [narratorId], types: ["terminal_count_changed"] },
+			() => {
+				qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
+			},
+		);
+		return () => narratorWSManager.removeListener(handle);
+	}, [narratorId, qc]);
+
 	return useQuery({
 		queryKey: ["terminals", { narratorId }],
 		queryFn: () => api.listTerminalsByNarrator(narratorId),

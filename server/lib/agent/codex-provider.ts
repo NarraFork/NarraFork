@@ -460,6 +460,7 @@ export class CodexProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		tools.push({ type: "web_search" });
+		tools.push({ type: "image_generation", output_format: "png" });
 		request.tools = tools;
 
 		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
@@ -507,6 +508,12 @@ export class CodexProvider implements ProviderAdapter {
 			action?: import("./provider").WebSearchAction;
 		}>,
 		messageId?: string,
+		imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
 	): void {
 		this.dummyProvider.pushAssistantTurn(
 			history,
@@ -515,6 +522,7 @@ export class CodexProvider implements ProviderAdapter {
 			reasoningBlocks,
 			webSearches,
 			messageId,
+			imageGenerations,
 		);
 	}
 

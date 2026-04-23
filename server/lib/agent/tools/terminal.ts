@@ -345,7 +345,7 @@ async function createTerminal(
 ): Promise<ToolResult> {
 	try {
 		const terminal = cachedChapterId
-			? await terminalService.create({ chapterId: cachedChapterId, name })
+			? await terminalService.create({ chapterId: cachedChapterId, narratorId, name })
 			: await terminalService.create({ narratorId, name });
 		return {
 			output:

@@ -107,6 +107,19 @@ export interface ParsedStreamEvent {
 		/** Full action object from the API (search/open_page/find_in_page). */
 		action?: WebSearchAction;
 	};
+	/** Image generation lifecycle event from Responses API (Codex native image_generation tool) */
+	imageGeneration?: {
+		id: string;
+		status: "in_progress" | "generating" | "completed";
+		/** Revised prompt used by the model (available on completion) */
+		revisedPrompt?: string;
+		/** Base64-encoded image data (available on completion) */
+		result?: string;
+		/** Provider-native ordering index for this image generation block. */
+		outputIndex?: number;
+		/** True when this event is the final output_item.done payload. */
+		final?: boolean;
+	};
 	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
 	responseId?: string;
 	/** Internal: set when Responses API format is detected from the gateway */
@@ -198,6 +211,12 @@ export interface ProviderAdapter {
 			action?: WebSearchAction;
 		}>,
 		messageId?: string,
+		imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

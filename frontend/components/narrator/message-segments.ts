@@ -63,6 +63,7 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 	if (b.type === "image") return true;
 	if (b.type === "text_file") return true;
 	if (b.type === "web_search") return true;
+	if (b.type === "image_generation") return true;
 	if (b.type === "reasoning" || b.type === "thinking") return true;
 	return false;
 }
@@ -369,6 +370,14 @@ export type StreamingBlock =
 			queries?: string[];
 			outputIndex?: number;
 	  }
+	| {
+			type: "image_generation";
+			id: string;
+			status: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+	  }
 	| { type: "text"; text: string };
 
 export function buildStreamingMsg(opts: {
@@ -404,6 +413,14 @@ export function buildStreamingMsg(opts: {
 					status: sb.status,
 					query: sb.query,
 					queries: sb.queries,
+				} as ContentBlock);
+			} else if (sb.type === "image_generation") {
+				blocks.push({
+					type: "image_generation",
+					id: sb.id,
+					status: sb.status,
+					revisedPrompt: sb.revisedPrompt,
+					result: sb.result,
 				} as ContentBlock);
 			} else if (sb.type === "text") {
 				blocks.push({
@@ -460,6 +477,7 @@ export function generateBlockKeys(blocks: any[]): string[] {
 			t === "reasoning" ||
 			t === "thinking" ||
 			t === "web_search" ||
+			t === "image_generation" ||
 			t === "image" ||
 			t === "text_file"
 		) {

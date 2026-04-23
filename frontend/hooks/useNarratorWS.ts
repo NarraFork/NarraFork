@@ -18,6 +18,7 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 		decision?: "allow" | "deny",
 		feedbackText?: string,
+		subagentNarratorId?: string,
 	) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
@@ -96,6 +97,11 @@ interface NarratorWSCallbacks {
 		queries?: string[],
 		outputIndex?: number,
 	) => void;
+	onImageGeneration?: (
+		id: string,
+		status: "in_progress" | "generating" | "completed",
+		revisedPrompt?: string,
+	) => void;
 	onNarratorError?: (error: string, errorCode?: string) => void;
 	onNarratorWarning?: (info: {
 		message: string;
@@ -162,6 +168,14 @@ interface NarratorWSCallbacks {
 					status: string;
 					query?: string;
 					queries?: string[];
+					outputIndex?: number;
+			  }
+			| {
+					type: "image_generation";
+					id: string;
+					status: string;
+					revisedPrompt?: string;
+					result?: string;
 					outputIndex?: number;
 			  }
 			| { type: "text"; text: string }
@@ -262,6 +276,7 @@ export function useNarratorWS(
 							data.updatedInput as Record<string, unknown> | undefined,
 							data.decision as "allow" | "deny" | undefined,
 							data.feedbackText as string | undefined,
+							data.subagentNarratorId as string | undefined,
 						);
 						break;
 					case "status_change":
@@ -442,6 +457,13 @@ export function useNarratorWS(
 							data.outputIndex as number | undefined,
 						);
 						break;
+					case "image_generation":
+						callbacksRef.current.onImageGeneration?.(
+							data.id as string,
+							data.status as "in_progress" | "generating" | "completed",
+							data.revisedPrompt as string | undefined,
+						);
+						break;
 					case "narrator_error":
 						callbacksRef.current.onNarratorError?.(
 							data.error as string,
@@ -594,6 +616,14 @@ export function useNarratorWS(
 										status: string;
 										query?: string;
 										queries?: string[];
+										outputIndex?: number;
+								  }
+								| {
+										type: "image_generation";
+										id: string;
+										status: string;
+										revisedPrompt?: string;
+										result?: string;
 										outputIndex?: number;
 								  }
 								| { type: "text"; text: string }

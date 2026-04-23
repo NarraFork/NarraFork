@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
+import { mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { apiRequests, narratorMessages } from "../db/schema";
@@ -170,6 +173,14 @@ export type SnapshotStreamingBlock =
 			queries?: string[];
 			outputIndex?: number;
 			action?: import("../lib/agent/provider").WebSearchAction;
+	  }
+	| {
+			type: "image_generation";
+			id: string;
+			status: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
 	  }
 	| { type: "text"; text: string };
 
@@ -578,6 +589,11 @@ export async function processEvent(
 					} else if (block.type === "reasoning") {
 						const idx = snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
 						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
+					} else if (block.type === "image_generation") {
+						const idx = snap.streamingBlocks.findIndex(
+							(b) => b.type === "image_generation" && b.id === block.id,
+						);
+						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					}
 				}
 			}
@@ -674,6 +690,33 @@ export async function processEvent(
 					queries: block.queries,
 					outputIndex: block.outputIndex,
 					...(block.action ? { action: block.action } : {}),
+				});
+			} else if (block.type === "image_generation") {
+				// Save base64 image to filesystem
+				let savedPath: string | undefined;
+				if (block.result) {
+					try {
+						const dir = join(
+							homedir(),
+							".narrafork",
+							"generated_images",
+							ctx.conversationId ?? "unknown",
+						);
+						await mkdir(dir, { recursive: true });
+						const filename = `${block.id}.png`;
+						const filePath = join(dir, filename);
+						await writeFile(filePath, Buffer.from(block.result, "base64"));
+						savedPath = filePath;
+					} catch (err) {
+						logger.warn("Failed to save generated image to disk", { error: err });
+					}
+				}
+				await narratorService.appendBlockToMessage(partialId, narratorId, {
+					type: "image_generation",
+					id: block.id,
+					revisedPrompt: block.revisedPrompt,
+					outputIndex: block.outputIndex,
+					...(savedPath ? { savedPath } : {}),
 				});
 			}
 			return null;
@@ -1311,6 +1354,49 @@ export async function processEvent(
 				query: event.query,
 				queries: event.queries,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
+			});
+			return null;
+		}
+
+		case "image_generation": {
+			// Snapshot: track image_generation in provider order (top-level only)
+			if (!ctx.parentToolUseId) {
+				const snap = getOrCreateSnapshot(broadcastTargetId);
+				const existingIdx = snap.streamingBlocks.findIndex(
+					(b) => b.type === "image_generation" && b.id === event.id,
+				);
+
+				if (existingIdx !== -1) {
+					const existing = snap.streamingBlocks[existingIdx];
+					if (existing.type === "image_generation") {
+						existing.status = event.status;
+						if (event.revisedPrompt) existing.revisedPrompt = event.revisedPrompt;
+						if (event.outputIndex != null) existing.outputIndex = event.outputIndex;
+					}
+				} else {
+					snap.streamingBlocks.splice(
+						findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
+						0,
+						{
+							type: "image_generation",
+							id: event.id,
+							status: event.status,
+							revisedPrompt: event.revisedPrompt,
+							...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
+						},
+					);
+				}
+			}
+			// Omit `result` (base64 image data, potentially several MB) from WS
+			// broadcast to avoid oversized WebSocket frames.  The frontend loads
+			// the image via /api/fs/preview using the savedPath persisted in the
+			// block_complete handler above.
+			dualBroadcast(ctx, {
+				type: "image_generation",
+				narratorId: broadcastTargetId,
+				id: event.id,
+				status: event.status as "in_progress" | "generating" | "completed",
+				revisedPrompt: event.revisedPrompt,
 			});
 			return null;
 		}

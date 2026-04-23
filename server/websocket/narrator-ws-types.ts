@@ -123,6 +123,13 @@ export type NarratorServerMessage =
 			queries?: string[];
 	  }
 	| {
+			type: "image_generation";
+			narratorId: string;
+			id: string;
+			status: "in_progress" | "generating" | "completed";
+			revisedPrompt?: string;
+	  }
+	| {
 			type: "tool_started";
 			narratorId: string;
 			toolUseId: string;
@@ -272,6 +279,14 @@ export type NarratorServerMessage =
 						status: string;
 						query?: string;
 						queries?: string[];
+						outputIndex?: number;
+				  }
+				| {
+						type: "image_generation";
+						id: string;
+						status: string;
+						revisedPrompt?: string;
+						result?: string;
 						outputIndex?: number;
 				  }
 				| { type: "text"; text: string }

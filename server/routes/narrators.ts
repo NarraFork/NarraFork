@@ -89,6 +89,7 @@ import {
 } from "../lib/validators";
 import { chapterFork } from "../services/chapter-fork";
 import type {
+	BashCommandResult,
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
@@ -104,6 +105,7 @@ import {
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import {
+	handleBashCommand,
 	handleLoadSkillCommand,
 	handleLoadToolCommand,
 	narratorService,
@@ -464,6 +466,15 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		const userInput = (cmdResult as LoadSkillResult).skillInput;
 		finalMessage = `<command-name>${skillResult.skillName}</command-name>\n${skillResult.content}${userInput ? `\n\n${userInput}` : ""}`;
 		commandText = cmdResult.rawCommand;
+	}
+	if (cmdResult.resolved && "bashCommand" in cmdResult) {
+		const bashResult = await handleBashCommand(
+			id,
+			(cmdResult as BashCommandResult).bashCommand,
+			cmdResult.rawCommand,
+			userId,
+		);
+		return c.json(bashResult, 201);
 	}
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 		finalMessage = cmdResult.expandedPrompt;

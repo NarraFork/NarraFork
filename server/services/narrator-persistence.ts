@@ -514,6 +514,13 @@ export const narratorPersistence = {
 					query?: string;
 					queries?: string[];
 					outputIndex?: number;
+			  }
+			| {
+					type: "image_generation";
+					id: string;
+					revisedPrompt?: string;
+					outputIndex?: number;
+					savedPath?: string;
 			  },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({

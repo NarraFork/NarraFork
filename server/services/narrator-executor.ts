@@ -53,6 +53,7 @@ function isMeaningfulAssistantOutputEvent(event: AgentEvent): boolean {
 		case "tool_use_chunk":
 		case "block_complete":
 		case "web_search":
+		case "image_generation":
 			return true;
 		case "stream_reasoning":
 			return Boolean(event.text.trim() || event.providerMetadata);

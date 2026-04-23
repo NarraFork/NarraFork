@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { OpenAIProviderConfig } from "../settings";
@@ -205,6 +206,13 @@ type ResponsesWebSearchBlock = {
 	queries?: string[];
 	outputIndex?: number;
 	action?: import("./provider").WebSearchAction;
+};
+
+type ResponsesImageGenerationBlock = {
+	id: string;
+	revisedPrompt?: string;
+	result?: string;
+	outputIndex?: number;
 };
 
 // === SSE delta types ===
@@ -481,10 +489,11 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			if (tools.length > 0) body.tools = tools;
 
-			// Codex: inject native web_search tool (server-side search, not a function tool)
+			// Codex: inject native web_search and image_generation tools (server-side, not function tools)
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
 				toolsArr.push({ type: "web_search" });
+				toolsArr.push({ type: "image_generation", output_format: "png" });
 				body.tools = toolsArr;
 			}
 
@@ -666,6 +675,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			action?: import("./provider").WebSearchAction;
 		}>,
 		messageId?: string,
+		imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
 	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
@@ -675,6 +690,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				reasoningBlocks,
 				webSearches,
 				messageId,
+				imageGenerations,
 			);
 			for (const item of items) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
@@ -1374,6 +1390,68 @@ export function parseResponsesAPIEvent(
 				outputIndex: chunk.output_index,
 				final: true,
 				action: action ?? undefined,
+			},
+		});
+		return results;
+	}
+
+	// ── Image generation: output_item.added (type=image_generation_call) ──
+	if (type === "response.output_item.added" && chunk.item?.type === "image_generation_call") {
+		const id = chunk.item.id ?? "";
+		logger.debug("Responses API image generation started", { id, outputIndex: chunk.output_index });
+		results.push({
+			imageGeneration: {
+				id,
+				status: "in_progress",
+				outputIndex: chunk.output_index,
+			},
+		});
+		return results;
+	}
+
+	// ── Image generation: lifecycle events ──
+	if (type === "response.image_generation_call.generating") {
+		results.push({
+			imageGeneration: {
+				id: chunk.item_id ?? "",
+				status: "generating",
+				outputIndex: chunk.output_index,
+			},
+		});
+		return results;
+	}
+	if (type === "response.image_generation_call.partial_image") {
+		// Partial image events — treat as still generating
+		results.push({
+			imageGeneration: {
+				id: chunk.item_id ?? "",
+				status: "generating",
+				outputIndex: chunk.output_index,
+			},
+		});
+		return results;
+	}
+	if (type === "response.image_generation_call.completed") {
+		results.push({
+			imageGeneration: {
+				id: chunk.item_id ?? "",
+				status: "completed",
+				outputIndex: chunk.output_index,
+			},
+		});
+		return results;
+	}
+
+	// ── Image generation: output_item.done (type=image_generation_call) — final result ──
+	if (type === "response.output_item.done" && chunk.item?.type === "image_generation_call") {
+		results.push({
+			imageGeneration: {
+				id: chunk.item.id ?? "",
+				status: chunk.item.status ?? "completed",
+				revisedPrompt: chunk.item.revised_prompt ?? undefined,
+				result: chunk.item.result ?? "",
+				outputIndex: chunk.output_index,
+				final: true,
 			},
 		});
 		return results;
@@ -2092,6 +2170,7 @@ async function buildResponsesUserMessageFromDbMessage(
 function buildResponsesPreludeItems(
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearchBlocks?: ResponsesWebSearchBlock[],
+	imageGenerationBlocks?: ResponsesImageGenerationBlock[],
 ): { items: OAIMessage[]; fallbackText: string } {
 	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
 	const fallbackParts: string[] = [];
@@ -2140,6 +2219,18 @@ function buildResponsesPreludeItems(
 			sourceIndex: sourceIndex++,
 		});
 	}
+	for (const block of imageGenerationBlocks ?? []) {
+		entries.push({
+			item: {
+				type: "image_generation_call",
+				status: "completed",
+				result: block.result ?? "",
+				...(block.revisedPrompt ? { revised_prompt: block.revisedPrompt } : {}),
+			} as unknown as OAIMessage,
+			outputIndex: block.outputIndex,
+			sourceIndex: sourceIndex++,
+		});
+	}
 	entries.sort((a, b) =>
 		compareOptionalOutputIndex(a.outputIndex, b.outputIndex, a.sourceIndex, b.sourceIndex),
 	);
@@ -2159,9 +2250,10 @@ function buildResponsesAssistantTurnItems(
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearches?: ResponsesWebSearchBlock[],
 	messageId?: string,
+	imageGenerations?: ResponsesImageGenerationBlock[],
 ): OAIMessage[] {
 	const items: OAIMessage[] = [];
-	const prelude = buildResponsesPreludeItems(reasoningBlocks, webSearches);
+	const prelude = buildResponsesPreludeItems(reasoningBlocks, webSearches, imageGenerations);
 	items.push(...prelude.items);
 	const assistantText = mergeAssistantText(text, prelude.fallbackText);
 	if (assistantText) {
@@ -2208,6 +2300,14 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 				queries?: string[];
 				outputIndex?: number;
 				action?: import("./provider").WebSearchAction;
+		  }
+		| {
+				type: "image_generation";
+				id: string;
+				revisedPrompt?: string;
+				result?: string;
+				savedPath?: string;
+				outputIndex?: number;
 		  }
 		| { type: "tool_use"; id: string; name?: string; input?: Record<string, unknown> }
 		| { type: string; [key: string]: unknown };
@@ -2287,6 +2387,32 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 				// does not accept it on input items (codex-rs skips serializing it).
 				status: "completed",
 				action,
+			} as unknown as OAIMessage);
+			continue;
+		}
+
+		if (block.type === "image_generation") {
+			flushTextBuffer();
+			const igBlock = block as Extract<StoredAssistantBlock, { type: "image_generation" }>;
+			let result = igBlock.result ?? "";
+			// If result is empty but savedPath exists, read from file
+			// TODO: readFileSync blocks the event loop; refactor
+			// buildResponsesAssistantItemsFromStoredContent to async to use
+			// fs.promises.readFile instead.
+			if (!result && igBlock.savedPath) {
+				try {
+					const fileData = readFileSync(igBlock.savedPath);
+					result = fileData.toString("base64");
+				} catch {
+					// File may have been deleted — skip this block
+				}
+			}
+			if (!result) continue;
+			items.push({
+				type: "image_generation_call",
+				status: "completed",
+				result,
+				...(igBlock.revisedPrompt ? { revised_prompt: igBlock.revisedPrompt } : {}),
 			} as unknown as OAIMessage);
 			continue;
 		}
@@ -2714,6 +2840,7 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 			m.type === "function_call_output" ||
 			m.type === "function_call" ||
 			m.type === "web_search_call" ||
+			m.type === "image_generation_call" ||
 			m.type === "reasoning"
 		) {
 			// Already in Responses API format — pass through.

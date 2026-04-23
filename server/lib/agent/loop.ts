@@ -292,6 +292,43 @@ function collectCompletedWebSearches(
 	return blocks.length > 0 ? blocks : undefined;
 }
 
+function collectCompletedImageGenerations(
+	map: Map<
+		string,
+		{
+			revisedPrompt?: string;
+			result?: string;
+			emitted: boolean;
+			outputIndex?: number;
+		}
+	>,
+):
+	| Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+	  }>
+	| undefined {
+	const blocks: Array<{
+		id: string;
+		revisedPrompt?: string;
+		result?: string;
+		outputIndex?: number;
+	}> = [];
+	for (const [id, entry] of map.entries()) {
+		// Skip entries with no meaningful data (e.g. generation started but never completed)
+		if (!entry.revisedPrompt && !entry.result) continue;
+		blocks.push({
+			id,
+			revisedPrompt: entry.revisedPrompt,
+			result: entry.result,
+			outputIndex: entry.outputIndex,
+		});
+	}
+	return blocks.length > 0 ? blocks : undefined;
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -479,6 +516,16 @@ export async function* agentLoop(
 				action?: import("./provider").WebSearchAction;
 			}
 		>();
+		// Accumulator for native image generation calls (Codex image_generation tool)
+		const imageGenAccum = new Map<
+			string,
+			{
+				revisedPrompt?: string;
+				result?: string;
+				emitted: boolean;
+				outputIndex?: number;
+			}
+		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
 
@@ -549,6 +596,7 @@ export async function* agentLoop(
 			brokenToolUseIds.clear();
 			toolUseAccum.clear();
 			webSearchAccum.clear();
+			imageGenAccum.clear();
 			receivedUsage = false;
 			sawMeaningfulResponse = false;
 			sawErrorEvent = false;
@@ -616,7 +664,8 @@ export async function* agentLoop(
 						parsed.toolUses ||
 						parsed.toolUseChunk ||
 						parsed.reasoning ||
-						parsed.webSearch
+						parsed.webSearch ||
+						parsed.imageGeneration
 					) {
 						sawMeaningfulResponse = true;
 						// A successful response clears any prior retry error so the
@@ -1151,6 +1200,38 @@ export async function* agentLoop(
 							outputIndex: acc.outputIndex,
 						};
 					}
+					if (parsed.imageGeneration) {
+						const ig = parsed.imageGeneration;
+						if (!imageGenAccum.has(ig.id)) {
+							imageGenAccum.set(ig.id, { emitted: false, outputIndex: ig.outputIndex });
+						}
+						// biome-ignore lint/style/noNonNullAssertion: just set above
+						const acc = imageGenAccum.get(ig.id)!;
+						if (ig.revisedPrompt) acc.revisedPrompt = ig.revisedPrompt;
+						if (ig.result) acc.result = ig.result;
+						if (ig.outputIndex != null) acc.outputIndex = ig.outputIndex;
+						if (ig.final && !acc.emitted) {
+							acc.emitted = true;
+							yield {
+								type: "block_complete",
+								block: {
+									type: "image_generation",
+									id: ig.id,
+									revisedPrompt: acc.revisedPrompt,
+									result: acc.result,
+									outputIndex: acc.outputIndex,
+								},
+							};
+						}
+						yield {
+							type: "image_generation",
+							id: ig.id,
+							status: ig.status,
+							revisedPrompt: ig.revisedPrompt,
+							result: ig.result,
+							outputIndex: acc.outputIndex,
+						};
+					}
 					if (parsed.invalidState) {
 						const reason = String(parsed.invalidState.reason ?? "api_error");
 						const message = String(parsed.invalidState.message ?? "Unknown provider error");
@@ -1284,31 +1365,58 @@ export async function* agentLoop(
 			}
 
 			// Empty response check — request succeeded but returned no content.
-			// Use a dedicated counter (max 3 retries) separate from transient error retries.
 			// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
 			// during this attempt — otherwise the empty-response message masks the real error.
 			if (!sawErrorEvent && !sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
-				// If a previous retry recorded a real error (e.g. 429) and this
-				// follow-up attempt returned nothing, surface the original error
-				// instead of the misleading "empty response" message.
+				// When a previous retry recorded a real error (e.g. 429) treat
+				// the empty response as a continuation of that transient failure
+				// and feed it back into the *chat* retry counter (not the
+				// separate empty-response counter).  This keeps infinite-retry
+				// mode working and avoids surfacing the misleading "empty
+				// response" message.
 				if (lastRetryErrorMessage) {
-					logger.warn(
-						"Provider returned empty response after prior error, surfacing original error",
-						{
-							narratorId: config.narratorId,
-							provider: effectiveProvider,
-							model: effectiveModel,
-							requestId,
-							originalError: lastRetryErrorMessage,
-						},
-					);
-					yield {
-						type: "retryable_error",
-						message: lastRetryErrorMessage,
-					};
+					if (
+						(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+						!config.signal.aborted
+					) {
+						chatRetryCount++;
+						const delayMs = Math.min(
+							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+							backoffCeil,
+						);
+						logger.warn(
+							"Provider returned empty response after prior error, retrying with original error",
+							{
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								originalError: lastRetryErrorMessage,
+								attempt: chatRetryCount,
+								maxRetries: maxChatRetries,
+							},
+						);
+						yield {
+							type: "retrying",
+							message: lastRetryErrorMessage,
+							attempt: chatRetryCount,
+							maxRetries: maxChatRetries,
+							delayMs,
+						};
+						await abortableSleep(delayMs, config.signal);
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						continue; // retry provider.chat()
+					}
+					// Chat retries exhausted — surface the original error
+					yield { type: "retryable_error", message: lastRetryErrorMessage };
 					return;
 				}
 
+				// Genuine empty response (no prior error).  Use a dedicated
+				// counter (max 3 retries) separate from transient error retries.
 				emptyResponseRetries++;
 				if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
 					const delayMs = Math.min(
@@ -1483,6 +1591,8 @@ export async function* agentLoop(
 					[],
 					collectReasoningBlocks(reasoningBlockMap),
 					collectCompletedWebSearches(webSearchAccum),
+					undefined,
+					collectCompletedImageGenerations(imageGenAccum),
 				);
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
 					toolNames: orphanedNames,
@@ -1775,6 +1885,7 @@ export async function* agentLoop(
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
+				collectCompletedImageGenerations(imageGenAccum),
 			);
 			yield { type: "turn_complete", turnIndex };
 			return;
@@ -1800,6 +1911,7 @@ export async function* agentLoop(
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
+				collectCompletedImageGenerations(imageGenAccum),
 			);
 
 			// Inject a user-side reminder so the model knows what happened and
@@ -1819,6 +1931,7 @@ export async function* agentLoop(
 				collectReasoningBlocks(reasoningBlockMap),
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
+				collectCompletedImageGenerations(imageGenAccum),
 			);
 		}
 

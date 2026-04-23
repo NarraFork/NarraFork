@@ -42,6 +42,7 @@ import {
 	IconLanguage,
 	IconListCheck,
 	IconMessageQuestion,
+	IconPhoto,
 	IconRepeat,
 	IconTrash,
 	IconWorldSearch,
@@ -397,6 +398,89 @@ function WebSearchBlock({
 			{swipeMenu}
 			{ctxMenu}
 		</>
+	);
+}
+
+interface ImageGenerationBlockData {
+	type: "image_generation";
+	id: string;
+	status?: string;
+	revisedPrompt?: string;
+	result?: string;
+	savedPath?: string;
+	outputIndex?: number;
+}
+
+function ImageGenerationBlock({ block }: { block: ImageGenerationBlockData }) {
+	const { t } = useTranslation("narrator");
+	const isGenerating = block.status && block.status !== "completed";
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const [loadError, setLoadError] = useState(false);
+
+	// Fetch image from savedPath via /api/fs/preview (blob URL)
+	useEffect(() => {
+		if (!block.savedPath) return;
+		let cancelled = false;
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+		fetch(`/api/fs/preview?path=${encodeURIComponent(block.savedPath)}`, { headers })
+			.then((r) => {
+				if (!r.ok) throw new Error(r.statusText);
+				return r.blob();
+			})
+			.then((blob) => {
+				if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+			})
+			.catch(() => {
+				if (!cancelled) setLoadError(true);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [block.savedPath]);
+
+	// Cleanup blob URL on unmount
+	useEffect(() => {
+		return () => {
+			if (blobUrl) URL.revokeObjectURL(blobUrl);
+		};
+	}, [blobUrl]);
+
+	// Determine image source: savedPath blob > inline base64 > none
+	const imageSrc = blobUrl ?? (block.result ? `data:image/png;base64,${block.result}` : null);
+	const hasImage = !!imageSrc && !loadError;
+
+	return (
+		<Paper withBorder radius="sm" p="xs">
+			<Group gap={6} wrap="nowrap" align="center" mb={hasImage ? "xs" : 0}>
+				<ThemeIcon size={18} variant="light" color="violet" radius="sm">
+					<IconPhoto size={12} />
+				</ThemeIcon>
+				{isGenerating && <Loader size={12} color="violet" type="dots" />}
+				<Text size="xs" c="dimmed">
+					{isGenerating
+						? block.status === "generating"
+							? t("imageGenerating")
+							: t("imageGenerationPreparing")
+						: t("imageGenerated")}
+					{block.revisedPrompt && (
+						<Text span fw={500} c="violet" ml={4}>
+							{block.revisedPrompt}
+						</Text>
+					)}
+				</Text>
+			</Group>
+			{hasImage && (
+				<Image
+					src={imageSrc}
+					alt={block.revisedPrompt ?? "Generated image"}
+					radius="sm"
+					maw={512}
+					fit="contain"
+				/>
+			)}
+		</Paper>
 	);
 }
 
@@ -2439,6 +2523,19 @@ export const MessageBubble = memo(function MessageBubble({
 			);
 		}
 
+		// /bash command — render as a compact command indicator
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const bashCommandBlock = blocks.find((b: any) => b.type === "bash_command");
+		if (bashCommandBlock) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+					<Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
+						$ {bashCommandBlock.command}
+					</Text>
+				</Paper>
+			);
+		}
+
 		const fullText = blocks
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			.filter((b: any) => b.type === "text" && b.text)
@@ -2714,6 +2811,9 @@ export const MessageBubble = memo(function MessageBubble({
 								messageId={message.id}
 							/>
 						);
+					}
+					if (block.type === "image_generation") {
+						return <ImageGenerationBlock key={key} block={block as ImageGenerationBlockData} />;
 					}
 					if (block.type === "tool_use") {
 						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

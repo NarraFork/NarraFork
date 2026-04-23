@@ -185,6 +185,14 @@ export type AgentEvent =
 			queries?: string[];
 			outputIndex?: number;
 	  }
+	| {
+			type: "image_generation";
+			id: string;
+			status: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+	  }
 	| { type: "model_switched"; model: string; provider: string }
 	| {
 			type: "api_request_start";
@@ -263,6 +271,13 @@ export type ContentBlock =
 			queries?: string[];
 			outputIndex?: number;
 			action?: import("./provider").WebSearchAction;
+	  }
+	| {
+			type: "image_generation";
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
 	  };
 
 // === Plan mode constants ===

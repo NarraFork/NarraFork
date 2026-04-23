@@ -247,6 +247,137 @@ export async function handleLoadSkillCommand(
 	return { found: true, skillName: found.name, content: lines.join("\n") };
 }
 
+/**
+ * Handle `/bash <command>` slash command.
+ * Directly executes a bash command without AI involvement.
+ * Persists user message + assistant message (with tool_use/tool_result) + tool call record.
+ */
+export async function handleBashCommand(
+	narratorId: string,
+	command: string,
+	rawCommand: string,
+	userId?: string,
+): Promise<{ type: "bash"; id: string; output: string; isError: boolean }> {
+	const narrator = await narratorService.getById(narratorId);
+	const cwd = narrator.cwd ?? process.cwd();
+
+	// 1. Persist user message with bash_command content block
+	const userMsg = await narratorService.persistUserMessage(
+		narratorId,
+		rawCommand,
+		[{ type: "bash_command", command }],
+		rawCommand,
+		userId,
+	);
+	broadcastToNarrator(narratorId, {
+		type: "user_message",
+		narratorId,
+		message: {
+			id: userMsg.id,
+			narratorId,
+			role: "user",
+			contentJson: userMsg.contentJson,
+			contentText: userMsg.contentText,
+			commandText: rawCommand,
+			createdAt: userMsg.createdAt,
+			children: [],
+			creator: userMsg.creator ?? null,
+		},
+	});
+
+	// 2. Execute bash command using the tool directly
+	const { bashTool } = await import("../lib/agent/tools/bash");
+	const toolUseId = `toolu_bash_${generateId()}`;
+	const startTime = Date.now();
+
+	const result = await bashTool.execute(
+		{ command, description: command },
+		{
+			narratorId,
+			cwd,
+			signal: new AbortController().signal,
+			locale: "en",
+			requestPermission: async () => ({ behavior: "allow" as const }),
+		},
+	);
+	const durationMs = Date.now() - startTime;
+
+	// 3. Persist assistant message with tool_use + tool_result blocks
+	const toolUseBlock = {
+		type: "tool_use",
+		id: toolUseId,
+		name: "Bash",
+		input: { command, description: command },
+	};
+	const toolResultBlock = {
+		type: "tool_result",
+		tool_use_id: toolUseId,
+		content: result.output,
+		is_error: result.isError ?? false,
+	};
+	const assistantMsgId = generateId();
+	const now = new Date().toISOString();
+	const [assistantMsg] = await db
+		.insert(narratorMessages)
+		.values({
+			id: assistantMsgId,
+			narratorId,
+			role: "assistant",
+			contentJson: [toolUseBlock, toolResultBlock],
+			contentText: null,
+			createdAt: now,
+		})
+		.returning();
+	await appendMessageRef(narratorId, assistantMsgId);
+
+	// 4. Persist tool call record
+	await db.insert(narratorToolCalls).values({
+		id: generateId(),
+		narratorId,
+		messageId: assistantMsgId,
+		toolUseId,
+		toolName: "Bash",
+		inputJson: { command, description: command },
+		outputJson: result.output,
+		status: result.isError ? "fail" : "success",
+		durationMs,
+		createdAt: now,
+	});
+
+	// 5. Broadcast assistant message
+	broadcastToNarrator(narratorId, {
+		type: "message",
+		narratorId,
+		message: {
+			id: assistantMsg.id,
+			narratorId,
+			role: "assistant",
+			contentJson: assistantMsg.contentJson,
+			contentText: assistantMsg.contentText,
+			createdAt: assistantMsg.createdAt,
+			children: [],
+			toolCalls: [
+				{
+					id: toolUseId,
+					toolUseId,
+					toolName: "Bash",
+					inputJson: { command, description: command },
+					outputJson: result.output,
+					status: result.isError ? "fail" : "success",
+					durationMs,
+				},
+			],
+		},
+	});
+
+	return {
+		type: "bash" as const,
+		id: userMsg.id,
+		output: result.output,
+		isError: result.isError ?? false,
+	};
+}
+
 /** Escape characters that would break XML attribute values. */
 function escapeXmlAttr(s: string): string {
 	return s

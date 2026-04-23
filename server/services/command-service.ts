@@ -55,12 +55,19 @@ export interface LoadSkillResult {
 	rawCommand: string;
 }
 
+export interface BashCommandResult {
+	resolved: true;
+	bashCommand: string;
+	rawCommand: string;
+}
+
 export type ResolveResult =
 	| CommandResolveResult
 	| CommandNotResolved
 	| LoadToolResult
 	| LoadToolNotFound
-	| LoadSkillResult;
+	| LoadSkillResult
+	| BashCommandResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -230,6 +237,13 @@ export async function resolveCommand(
 		if (!skillName) return { resolved: false };
 		const skillInput = parts.slice(1).join(" ").trim();
 		return { resolved: true, loadSkill: skillName, skillInput, rawCommand: prompt };
+	}
+
+	// Handle /bash <command> — directly execute a bash command without AI
+	if (parsed.name.toLowerCase() === "bash") {
+		const bashCommand = parsed.input.trim();
+		if (!bashCommand) return { resolved: false };
+		return { resolved: true, bashCommand, rawCommand: prompt };
 	}
 
 	const commands = await getAvailableCommands(narratorId, userId);

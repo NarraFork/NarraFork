@@ -1441,6 +1441,9 @@ export async function resolvePermission(
 		requestId,
 		toolUseId: pending.toolUseId,
 		decision,
+		...(pending.narratorId !== pending.broadcastTargetId
+			? { subagentNarratorId: pending.narratorId }
+			: {}),
 		...(updatedInput ? { updatedInput } : {}),
 		...(decision === "deny" && (denyMessage || feedbackText?.trim())
 			? { feedbackText: denyMessage || feedbackText?.trim() }

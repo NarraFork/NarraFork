@@ -1793,7 +1793,6 @@ async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
 					!hasError &&
 					fgAbort.signal.aborted &&
 					!signal.aborted &&
-					!proxy.aborted &&
 					(await consumeNextBufferedSubagentMessage({
 						narratorId: subagentId,
 						parentNarratorId,
@@ -1809,7 +1808,7 @@ async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
 					continue;
 				}
 				// Detect subagent-only interrupt (not parent abort)
-				if (!hasError && fgAbort.signal.aborted && !signal.aborted && !proxy.aborted) {
+				if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
 					// --- Manual override: block until user clicks "Update Conclusion" ---
 					await narratorService.updateStatus(subagentId, "idle", {
 						substatus: ["manual_override"],

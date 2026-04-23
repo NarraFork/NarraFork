@@ -248,7 +248,36 @@ function debouncedTerminalCount(narratorId: string | null) {
 		narratorId,
 		setTimeout(() => {
 			pendingTerminalBroadcasts.delete(narratorId);
-			broadcastTerminalCount(narratorId);
+			broadcastTerminalCount(narratorId).catch(() => {});
+		}, 100),
+	);
+}
+
+/**
+ * When a terminal is created/exited via chapterId (without narratorId),
+ * broadcast terminal_count_changed to all narrators bound to that chapter.
+ */
+async function broadcastTerminalCountByChapter(chapterId: string) {
+	const chapterNarrators = await db.query.narrators.findMany({
+		where: eq(narrators.chapterId, chapterId),
+		columns: { id: true },
+	});
+	for (const n of chapterNarrators) {
+		broadcastTerminalCount(n.id);
+	}
+}
+
+const pendingChapterTerminalBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
+
+function debouncedChapterTerminalCount(chapterId: string | null) {
+	if (!chapterId) return;
+	const existing = pendingChapterTerminalBroadcasts.get(chapterId);
+	if (existing) clearTimeout(existing);
+	pendingChapterTerminalBroadcasts.set(
+		chapterId,
+		setTimeout(() => {
+			pendingChapterTerminalBroadcasts.delete(chapterId);
+			broadcastTerminalCountByChapter(chapterId).catch(() => {});
 		}, 100),
 	);
 }
@@ -324,7 +353,7 @@ function debouncedContainerStatus(chapterId: string) {
 		chapterId,
 		setTimeout(() => {
 			pendingContainerBroadcasts.delete(chapterId);
-			broadcastContainerStatus(chapterId);
+			broadcastContainerStatus(chapterId).catch(() => {});
 		}, 100),
 	);
 }
@@ -338,10 +367,12 @@ function debouncedContainerStatus(chapterId: string) {
 if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	eventBus.on("terminal:created", (event) => {
 		debouncedTerminalCount(event.narratorId);
+		debouncedChapterTerminalCount(event.chapterId);
 	});
 
 	eventBus.on("terminal:exited", (event) => {
 		debouncedTerminalCount(event.narratorId);
+		debouncedChapterTerminalCount(event.chapterId);
 	});
 
 	eventBus.on("browser:session_created", (event) => {

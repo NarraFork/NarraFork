@@ -1,11 +1,13 @@
 /**
- * HumanEval+ evaluator.
+ * HumanEval evaluator.
  *
- * Strategy: the agent is asked to write a Python function.
- * We extract the function from the agent's output (or read the file it wrote),
- * concatenate it with the test harness, and execute via `python3`.
+ * The agent writes solution.py. We concatenate it with the original test harness
+ * from openai/human-eval and execute via python3.
+ *
+ * The testCode field contains the original `check(candidate)` function definition
+ * followed by `check(<entry_point>)` call.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { BenchmarkEvaluator, BenchmarkTask, EvalResult } from "./types";
@@ -19,6 +21,16 @@ async function extractSolution(agentOutput: string, workDir: string): Promise<st
 	const solutionPath = join(workDir, "solution.py");
 	if (existsSync(solutionPath)) {
 		return readFile(solutionPath, "utf-8");
+	}
+
+	// Also check for any .py file the agent may have created
+	try {
+		const pyFiles = readdirSync(workDir).filter((f) => f.endsWith(".py") && !f.startsWith("_"));
+		if (pyFiles.length === 1) {
+			return readFile(join(workDir, pyFiles[0]), "utf-8");
+		}
+	} catch {
+		// ignore
 	}
 
 	// Extract from markdown code fence
@@ -45,18 +57,20 @@ export const humanevalEvaluator: BenchmarkEvaluator = {
 
 		const testCode = task.testCode ?? "";
 		if (!testCode) {
-			return { passed: false, score: 0, maxScore: 1, details: "No test code available for this task" };
+			return {
+				passed: false,
+				score: 0,
+				maxScore: 1,
+				details: "No test code available for this task",
+			};
 		}
 
-		// Build combined script: solution + tests + runner
-		const script = [
-			solution,
-			"",
-			testCode,
-			"",
-			"# Run tests",
-			"check(candidate)",
-		].join("\n");
+		// Build combined script: solution + original test harness
+		// testCode already includes:
+		//   1. METADATA dict (harmless)
+		//   2. def check(candidate): ... (the test function)
+		//   3. check(<entry_point>)  (the call added by prepare script)
+		const script = [solution, "", testCode].join("\n");
 
 		const scriptPath = join(workDir, "_eval_test.py");
 		await writeFile(scriptPath, script, "utf-8");

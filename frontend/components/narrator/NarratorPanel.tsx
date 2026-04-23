@@ -3353,6 +3353,17 @@ export function NarratorPanel({
 					message: toolName,
 					color: result.alreadyLoaded ? "yellow" : "green",
 				});
+			} else if (result?.type === "bash" && result?.id) {
+				// /bash command — remove optimistic message, WS broadcasts will provide real messages
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					firstPage.messages = firstPage.messages.filter((m: NarratorMsg) => m.id !== optimisticId);
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
+				scrollToBottom(true);
 			} else if (result?.buffered) {
 				// Message was buffered — remove optimistic message,
 				// WS buffer_set broadcast will sync the queue state.
