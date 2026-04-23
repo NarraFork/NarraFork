@@ -169,8 +169,6 @@
 	"tpToolDescAskUserQuestion": "Ask the user a question during execution.",
 	"tpToolDescSkill": "Invoke a skill within the conversation.",
 	"tpToolDescContinueTask": "Continue a previously launched subagent.",
-	"tpToolDescTaskOutput": "Retrieve output from a background task.",
-	"tpToolDescTaskStop": "Stop a running background task.",
 	"tpToolDescShareFile": "Share a file by generating a temporary download link.",
 	"tpToolDescTerminal": "Interactive terminal tool for long-running processes.",
 	"tpToolDescRecall": "Search past conversations for relevant context.",

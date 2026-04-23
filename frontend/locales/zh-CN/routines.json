@@ -169,8 +169,6 @@
 	"tpToolDescAskUserQuestion": "在执行过程中向用户提问。",
 	"tpToolDescSkill": "在对话中调用技能。",
 	"tpToolDescContinueTask": "继续之前启动的子代理。",
-	"tpToolDescTaskOutput": "获取后台任务的输出。",
-	"tpToolDescTaskStop": "停止正在运行的后台任务。",
 	"tpToolDescShareFile": "生成临时下载链接分享文件。",
 	"tpToolDescTerminal": "用于长时间运行进程的交互式终端工具。",
 	"tpToolDescRecall": "搜索过去的对话获取相关上下文。",

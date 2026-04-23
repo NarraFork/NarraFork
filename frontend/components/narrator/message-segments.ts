@@ -15,7 +15,8 @@ const LEGACY_TOOL_NAMES: Record<string, string> = {
 	Task: "Agent",
 	TodoWrite: "TaskCreate",
 	CheckBackgroundTask: "TaskOutput",
-	CancelBackgroundTask: "TaskStop",
+	CancelBackgroundTask: "Agent",
+	TaskStop: "Agent",
 };
 
 function normalizeToolName(name: string): string {

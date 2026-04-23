@@ -69,6 +69,12 @@ function buildParameters() {
 				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
 			),
 		prompt: z.string().describe("The task for the agent to perform"),
+		stop: z
+			.string()
+			.optional()
+			.describe(
+				"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
+			),
 	});
 }
 
@@ -105,7 +111,8 @@ export const agentTool: ToolDefinition = {
 				},
 				resume: {
 					description:
-						"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
+						"Optional agent ID to resume from. If the agent is idle, it continues from the previous execution transcript. " +
+						"If the agent is running in the background, it attaches to foreground and blocks until completion.",
 					type: "string",
 				},
 				run_in_background: {
@@ -120,6 +127,18 @@ export const agentTool: ToolDefinition = {
 				workdir: {
 					description:
 						"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+					type: "string",
+				},
+				alias: {
+					description:
+						'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
+						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
+						"Use this alias in resume to refer to the task later.",
+					type: "string",
+				},
+				stop: {
+					description:
+						"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
 					type: "string",
 				},
 				prompt: {
@@ -140,10 +159,36 @@ export const agentTool: ToolDefinition = {
 			run_in_background?: boolean;
 			model?: string;
 			workdir?: string;
+			alias?: string;
+			stop?: string;
 			// Legacy parameter name (pre-rename compat)
 			background?: boolean;
 		};
-		const { prompt, description, subagent_type, resume, model, workdir } = raw;
+
+		// --- Stop mode: cancel a running background agent task ---
+		if (raw.stop) {
+			try {
+				const { resolveTaskAlias, cancelBackgroundTask } = await import(
+					"@server/services/narrator-subagent"
+				);
+				const taskId = resolveTaskAlias(ctx.narratorId, raw.stop);
+				const cancelled = await cancelBackgroundTask(taskId);
+				if (cancelled) {
+					return { output: `Background agent task ${raw.stop} has been cancelled.` };
+				}
+				return {
+					output: `Background agent task ${raw.stop} is not running (may have already completed or does not exist).`,
+					isError: true,
+				};
+			} catch (err) {
+				return {
+					output: `Agent stop error: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		const { prompt, description, subagent_type, resume, model, workdir, alias } = raw;
 		// Prefer new name, fall back to legacy name for in-flight conversations
 		const run_in_background = raw.run_in_background ?? raw.background;
 
@@ -157,10 +202,13 @@ export const agentTool: ToolDefinition = {
 
 		// Resume an existing subagent (ContinueTask semantics via Agent tool)
 		if (resume) {
-			const { continueSubagent } = await import("@server/services/narrator-subagent");
+			const { continueSubagent, resolveTaskAlias } = await import(
+				"@server/services/narrator-subagent"
+			);
+			const resolvedId = resolveTaskAlias(ctx.narratorId, resume);
 			try {
 				const result = await continueSubagent({
-					subagentId: resume,
+					subagentId: resolvedId,
 					parentNarratorId: ctx.narratorId,
 					toolUseId,
 					prompt,
@@ -177,7 +225,7 @@ export const agentTool: ToolDefinition = {
 		}
 
 		// Lazy import to avoid circular dependency at module load time
-		const { runSubagent } = await import("@server/services/narrator-subagent");
+		const { runSubagent, registerTaskAlias } = await import("@server/services/narrator-subagent");
 
 		try {
 			const result = await runSubagent({
@@ -192,6 +240,45 @@ export const agentTool: ToolDefinition = {
 				model: model || undefined,
 				background: run_in_background || false,
 			});
+
+			// Register alias for ALL subagents (foreground and background)
+			// Extract the real subagent ID from the result
+			const bgMatch = result.match(/<background_task_id>([^<]+)<\/background_task_id>/);
+			const fgMatch = result.match(/<subagent_id>([^<]+)<\/subagent_id>/);
+			const realId = bgMatch?.[1] ?? fgMatch?.[1];
+
+			if (realId) {
+				const { alias: registeredAlias, conflicted } = registerTaskAlias(
+					ctx.narratorId,
+					realId,
+					alias || description,
+				);
+
+				// Replace the raw ID with the alias in the output
+				let output = result;
+				if (bgMatch) {
+					output = output.replace(
+						`<background_task_id>${realId}</background_task_id>`,
+						`<background_task_id>${registeredAlias}</background_task_id>`,
+					);
+				}
+				if (fgMatch) {
+					output = output.replace(
+						`<subagent_id>${realId}</subagent_id>`,
+						`<subagent_id>${registeredAlias}</subagent_id>`,
+					);
+				}
+
+				if (conflicted) {
+					output +=
+						`\n\nNote: The requested alias "${alias || description}" was already taken. ` +
+						`This agent was assigned "${registeredAlias}" instead. ` +
+						`Use this alias to resume or reference this agent.`;
+				}
+
+				return { output };
+			}
+
 			return { output: result };
 		} catch (err) {
 			return {

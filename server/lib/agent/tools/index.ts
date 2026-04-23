@@ -3,8 +3,6 @@ import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
-import { taskStopTool } from "./cancel-background-task";
-import { taskOutputTool } from "./check-background-task";
 import { concludeReviewTool } from "./conclude-review";
 import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
@@ -24,6 +22,7 @@ import { recallTool } from "./recall";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
 import { agentTool } from "./task";
+import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
 import { taskCreateTool } from "./todo";
 import { webFetchTool } from "./web-fetch";
@@ -81,8 +80,7 @@ const coreProvider: ToolProvider = {
 			exitPlanModeTool,
 			agentTool,
 			continueTaskTool,
-			taskOutputTool,
-			taskStopTool,
+			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,
 		];

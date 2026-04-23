@@ -234,12 +234,6 @@ function extractHeaderHints(toolName: string, input: any): Record<string, unknow
 			}
 			break;
 		}
-		case "TaskOutput":
-		case "TaskStop": {
-			const tid = str("task_id");
-			if (tid) h.task_id = tid;
-			break;
-		}
 		case "Recall": {
 			const action = str("action");
 			if (action) h.action = action;

@@ -49,8 +49,6 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "AskUserQuestion", descKey: "tpToolDescAskUserQuestion", category: "always-ask" },
 	{ name: "Skill", descKey: "tpToolDescSkill", category: "always-allow" },
 	{ name: "ContinueTask", descKey: "tpToolDescContinueTask", category: "always-allow" },
-	{ name: "TaskOutput", descKey: "tpToolDescTaskOutput", category: "always-allow" },
-	{ name: "TaskStop", descKey: "tpToolDescTaskStop", category: "always-allow" },
 	{ name: "ShareFile", descKey: "tpToolDescShareFile", category: "optional" },
 	{ name: "Terminal", descKey: "tpToolDescTerminal", category: "optional" },
 	{ name: "Recall", descKey: "tpToolDescRecall", category: "optional" },

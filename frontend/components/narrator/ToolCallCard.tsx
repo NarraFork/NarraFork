@@ -21,6 +21,7 @@ import {
 } from "@mantine/core";
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
+	IconArrowBackUp,
 	IconArrowsMinimize,
 	IconCheck,
 	IconChevronDown,
@@ -200,7 +201,7 @@ const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const TODO_TOOLS = new Set(["TaskCreate"]);
-const TASK_OUTPUT_TOOLS = new Set(["TaskOutput", "TaskStop"]);
+const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
 const AGENT_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
@@ -506,6 +507,12 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			return basename(fp);
 		}
 		case "bash": {
+			// Await mode: Bash(await: {task_id: "xxx"})
+			const awaitParam = !isTruncated(input) ? input?.await : undefined;
+			if (awaitParam && typeof awaitParam === "object") {
+				const awaitTaskId = awaitParam.task_id ?? awaitParam.taskId;
+				return awaitTaskId ? `Await ${awaitTaskId}` : "Await background task";
+			}
 			const desc = extractField(input, "description");
 			if (desc) return desc.length > 80 ? `${desc.slice(0, 77)}...` : desc;
 			const cmd = extractField(input, "command");
@@ -536,7 +543,6 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			return "Update todos";
 		case "taskOutput": {
 			const taskId = extractField(input, "task_id");
-			if (toolName === "TaskStop") return taskId ? `Stop ${taskId}` : "Stop task";
 			return taskId ? `Check ${taskId}` : "Check task output";
 		}
 		case "agent": {
@@ -1481,11 +1487,18 @@ const LongRunningTerminateButton = memo(
 
 function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
-	const cmd = extractField(toolCall.inputJson, "command");
+	const awaitParam = !isTruncated(toolCall.inputJson) ? toolCall.inputJson?.await : undefined;
+	const isAwaitMode = awaitParam && typeof awaitParam === "object";
+	const cmd = isAwaitMode ? null : extractField(toolCall.inputJson, "command");
 	const outputText = resolveDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const isRunning = toolCall.status === "running" && !toolCall.outputJson;
 	const streamingOutput = toolCall._streamingOutput;
+
+	// Await mode metadata
+	const awaitTaskId = isAwaitMode ? (awaitParam.task_id ?? awaitParam.taskId) : null;
+	const awaitTimeout = isAwaitMode ? awaitParam.timeout : null;
+	const awaitWaitForText = isAwaitMode ? awaitParam.wait_for_text : null;
 
 	// Auto-scroll streaming output to bottom.
 	// The scrollable container is Mantine's <pre class="mantine-Code-root"> inside ContentViewer.
@@ -1506,6 +1519,24 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	return (
 		<Box mt="xs">
+			{isAwaitMode && (
+				<Group gap={6} mb={4}>
+					<Badge size="xs" variant="light" color="blue">
+						await
+					</Badge>
+					{awaitTaskId && <Code style={{ fontSize: 11 }}>{awaitTaskId}</Code>}
+					{awaitTimeout != null && (
+						<Text size="xs" c="dimmed">
+							timeout: {(awaitTimeout / 1000).toFixed(0)}s
+						</Text>
+					)}
+					{awaitWaitForText && (
+						<Text size="xs" c="dimmed" truncate>
+							wait_for: "{awaitWaitForText}"
+						</Text>
+					)}
+				</Group>
+			)}
 			{cmd && (
 				<ContentViewer
 					content={cmd}
@@ -3496,6 +3527,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		msgCtx.onForkFromMessage ||
 		msgCtx.onAskInPassing ||
 		msgCtx.onCompactBeforeMessage ||
+		(msgCtx.onRollbackToBlock && blockIndex != null) ||
 		(msgCtx.onDeleteBlock && blockIndex != null)
 	);
 
@@ -3552,7 +3584,19 @@ export const ToolCallCard = memo(function ToolCallCard({
 				(msgCtx.onForkFromMessage ||
 					msgCtx.onAskInPassing ||
 					msgCtx.onCompactBeforeMessage ||
+					(msgCtx.onRollbackToBlock && blockIndex != null) ||
 					(msgCtx.onDeleteBlock && blockIndex != null)) && <Menu.Divider />}
+			{msgCtx.onRollbackToBlock && blockIndex != null && (
+				<Menu.Item
+					leftSection={<IconArrowBackUp size={14} />}
+					onClick={() => {
+						msgCtx.onRollbackToBlock?.(blockIndex);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("contextMenu_rollback")}
+				</Menu.Item>
+			)}
 			{msgCtx.onForkFromMessage && (
 				<Menu.Item
 					leftSection={<IconGitFork size={14} />}

@@ -30,6 +30,8 @@ export interface ToolContext {
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
+	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
+	parentNarratorId?: string;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -281,8 +283,6 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Shell",
 	"Agent",
 	"ContinueTask",
-	"TaskOutput",
-	"TaskStop",
 	"AskUserQuestion",
 	"Skill",
 ]);
@@ -300,6 +300,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
 	chapterId?: string;
+	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
+	parentNarratorId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */

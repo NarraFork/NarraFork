@@ -520,15 +520,7 @@ function resolveBlacklistDecision(
 	return reason ? { decision: "deny", reason } : null;
 }
 
-const ALWAYS_ALLOW_TOOLS = [
-	"TaskCreate",
-	"EnterPlanMode",
-	"WebSearch",
-	"ContinueTask",
-	"TaskOutput",
-	"TaskStop",
-	"Skill",
-];
+const ALWAYS_ALLOW_TOOLS = ["TaskCreate", "EnterPlanMode", "WebSearch", "ContinueTask", "Skill"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
