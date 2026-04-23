@@ -6,13 +6,12 @@
  * (only changes on zoom). Fisheye only affects rendering positions, not selection.
  *
  * The algorithm computes a stride from `COLLAPSED_GAP * scale` vs `MIN_TICK_WIDTH`,
- * then selects every Nth tick, with priority overrides for segment/fork/merge ticks.
+ * then selects every Nth tick. No ticks are force-retained — chapter node positions
+ * are indicated by connector lines, not by tick presence on the ruler.
  */
 
 import type { RulerSegment } from "../../hooks/useRuler";
 import { COLLAPSED_GAP, type TickPosition } from "./elastic-layout";
-
-export type TickPriority = "segment" | "fork_merge" | "normal";
 
 export interface DecimatedTick {
 	/** Index in the original ticks array */
@@ -21,7 +20,8 @@ export interface DecimatedTick {
 	/** World-space X position */
 	x: number;
 	segment?: RulerSegment;
-	priority: TickPriority;
+	/** Whether this tick is a segment boundary (used for visual emphasis) */
+	isSegment: boolean;
 	/** Number of original ticks between this and the next retained tick (0 = adjacent) */
 	skippedCount: number;
 }
@@ -37,9 +37,6 @@ export const MIN_TICK_WIDTH = 60;
 /**
  * Compute the decimation stride from camera scale.
  * stride = ceil(MIN_TICK_WIDTH / (COLLAPSED_GAP * scale)), clamped to ≥ 1.
- * At scale=1 with COLLAPSED_GAP=240: stride=1 (every tick kept, slot=240px).
- * At scale=0.25: stride=1 (slot=60px, just at MIN_TICK_WIDTH).
- * At scale=0.1: stride=3 (every 3rd tick, slot=72px).
  */
 export function computeStride(scale: number): number {
 	const screenGap = COLLAPSED_GAP * scale;
@@ -60,23 +57,17 @@ export function slotWidth(scale: number): number {
 /**
  * Decimate ticks based on global camera scale.
  *
- * The stride is computed from scale alone — pan and fisheye do not affect
- * which ticks are retained, eliminating jitter during panning.
- *
- * Priority rules:
- *   1. Segment ticks (chapter fork points) — always retained
- *   2. Fork/merge commit ticks — always retained
- *   3. Normal ticks — retained if `tick.index % stride === 0`
+ * Pure stride-based selection: a tick is retained iff `tick.index % stride === 0`.
+ * No force-retention of any kind. Segment boundaries are tagged for visual
+ * emphasis but do not affect selection.
  *
  * @param ticks         Full tick array from elastic layout
- * @param forkMergeShas Set of commit SHAs that are fork or merge points
  * @param scale         Global camera scale (no fisheye)
  * @param visStartIdx   First visible tick index (from viewport culling)
  * @param visEndIdx     Last visible tick index (from viewport culling)
  */
 export function decimateTicks(
 	ticks: TickPosition[],
-	forkMergeShas: Set<string>,
 	scale: number,
 	visStartIdx: number,
 	visEndIdx: number,
@@ -85,26 +76,18 @@ export function decimateTicks(
 
 	const stride = computeStride(scale);
 
-	// Pass 1: select retained ticks
+	// Pass 1: select retained ticks (pure stride, no force-retention)
 	const retained: Array<{
 		tick: TickPosition;
-		priority: TickPriority;
-		candidateIdx: number; // sequential index among visible ticks
+		isSegment: boolean;
+		candidateIdx: number;
 	}> = [];
 
 	let candidateIdx = 0;
 	for (let i = visStartIdx; i <= visEndIdx; i++) {
 		const tick = ticks[i];
-		let priority: TickPriority = "normal";
-		if (tick.segment) {
-			priority = "segment";
-		} else if (forkMergeShas.has(tick.sha)) {
-			priority = "fork_merge";
-		}
-
-		const keep = priority !== "normal" || tick.index % stride === 0;
-		if (keep) {
-			retained.push({ tick, priority, candidateIdx });
+		if (tick.index % stride === 0) {
+			retained.push({ tick, isSegment: !!tick.segment, candidateIdx });
 		}
 		candidateIdx++;
 	}
@@ -121,7 +104,7 @@ export function decimateTicks(
 			sha: r.tick.sha,
 			x: r.tick.x,
 			segment: r.tick.segment,
-			priority: r.priority,
+			isSegment: r.isSegment,
 			skippedCount,
 		});
 	}

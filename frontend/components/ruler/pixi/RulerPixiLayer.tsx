@@ -4,6 +4,7 @@
  * connector lines, and chapter node morph elements (dot → pill → card).
  * React DOM is only used for interactive NarratorPanel overlays above this layer.
  */
+import { layoutWithLines, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
 import { Application, CanvasTextMetrics, Container, Graphics, TextStyle } from "pixi.js";
 import { memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RulerSegment } from "../../../hooks/useRuler";
@@ -508,25 +509,13 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		const visStartIdx = Math.max(0, findTickAtX(allTicks, worldCullStart) - 1);
 		const visEndIdx = Math.min(allTicks.length - 1, findTickAtX(allTicks, worldCullEnd) + 1);
 
-		// --- Collect fork/merge SHAs for priority retention ---
-		const forkMergeShas = new Set<string>();
-		const chaptersToScan = chaptersOverrideRef.current ?? d.chapters;
-		for (const ch of chaptersToScan) {
-			if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
-			if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
-		}
-		for (const ch of d.alwaysVisibleChapters) {
-			if (ch.startCommitSha) forkMergeShas.add(ch.startCommitSha);
-			if (ch.mergeCommitSha) forkMergeShas.add(ch.mergeCommitSha);
-		}
-
 		// --- Decimate ticks based on global scale (pan-stable) ---
-		const decimated = decimateTicks(allTicks, forkMergeShas, cam.scale, visStartIdx, visEndIdx);
+		const decimated = decimateTicks(allTicks, cam.scale, visStartIdx, visEndIdx);
 
 		// --- Draw ticks ---
 		for (const dt of decimated) {
 			const screenX = toScreen(dt.x);
-			drawTick(tickGfx, theme, screenX, trackH, dt.priority !== "normal", cam.scale, isH, cam.edge);
+			drawTick(tickGfx, theme, screenX, trackH, dt.isSegment, cam.scale, isH, cam.edge);
 		}
 
 		// --- Draw density bar (replaces heatmap + cluster blocks) ---
@@ -613,9 +602,6 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 			const maxMsgLines = isH
 				? Math.max(1, Math.floor(msgAvailH / msgLineH))
 				: Math.max(1, Math.floor(msgAvailVert / msgLineH));
-			const mainCharsPerLine = Math.max(4, Math.floor(msgAvailMain / 6));
-			const crossCharsPerLine = Math.max(4, Math.floor(msgCrossAvail / 6));
-			const maxChars = isH ? mainCharsPerLine * maxMsgLines : crossCharsPerLine * maxMsgLines;
 
 			if (showMsg) {
 				const msgKey = `${theme.dimmed}:${Math.round(msgWrapWidth)}:${maxMsgLines}:${isH}`;
@@ -624,61 +610,147 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 						fontSize: 10,
 						fill: theme.dimmed,
 						fontFamily: "sans-serif",
-						wordWrap: true,
-						wordWrapWidth: Math.max(40, msgWrapWidth),
-						breakWords: true,
+						// No wordWrap — pretext handles line breaking,
+						// we feed pre-broken text with \n to PixiJS.
 					});
 					sc.msgKey = msgKey;
 				}
 			}
 
-			// SHA truncation length (constant for all ticks at this zoom level)
-			const shaCharsH = Math.max(4, Math.min(7, Math.floor(labelWidth / (fontSize * 0.6))));
+			// SHA: use pretext to determine how many chars fit in labelWidth.
+			// Monospace font — measure one char, then divide available width.
+			const shaFont = `${fontSize}px monospace`;
+			const shaCharPrepared = prepareWithSegments("a", shaFont);
+			const shaCharW = measureNaturalWidth(shaCharPrepared);
+			const shaCharsH = Math.max(
+				4,
+				Math.min(7, shaCharW > 0 ? Math.floor(labelWidth / shaCharW) : 7),
+			);
+			const shaTextWidth = shaCharsH * shaCharW;
+
+			// Pre-measure font for commit messages (sans-serif 10px)
+			const msgFont = "10px sans-serif";
 
 			for (let di = 0; di < decimated.length; di++) {
 				const dt = decimated[di];
 				const screenX = toScreen(dt.x);
 
-				// Fisheye squeeze: ratio of actual screen gap to the expected slot width.
-				// At viewport center actualGap ≈ slot, squeeze ≈ 1.
-				// At edges fisheye compresses actualGap < slot, squeeze < 1.
+				// Fisheye: compute the actual screen gap to the next tick.
 				const nextDt = decimated[di + 1];
 				const nextScreenX = nextDt ? toScreen(nextDt.x) : screenX + slot;
 				const actualGap = nextScreenX - screenX;
-				const squeeze = slot > 0 ? Math.min(1, actualGap / slot) : 1;
+				// Available pixel width after padding
+				const availPx = actualGap - 8;
 
 				// SHA label
 				const label = tickPool.acquire(labelStyle);
 				label.rotation = 0;
 				if (isH) {
 					label.text = dt.sha.slice(0, shaCharsH);
-					label.scale.set(squeeze, 1);
+					// Squeeze based on text's actual width: only compress when
+					// the gap is smaller than the text, not the full slot.
+					const shaSqueeze =
+						shaTextWidth > 0 ? Math.max(0, Math.min(1, availPx / shaTextWidth)) : 1;
+					label.scale.set(shaSqueeze, 1);
 					label.position.set(screenX + 4, shaOffset);
-				} else {
-					const shaCharsV = Math.max(4, Math.floor(labelAvailCross / (fontSize * 0.6)));
-					label.text = dt.sha.slice(0, Math.min(7, shaCharsV));
-					label.scale.set(1, squeeze);
-					label.position.set(shaOffset, screenX + 4);
-				}
 
-				// Commit message
-				if (showMsg) {
-					const msg = d.commitMessages.get(dt.sha);
-					if (msg && sc.msgStyle) {
-						const msgLabel = tickPool.acquire(sc.msgStyle);
-						msgLabel.text = msg.length > maxChars ? `${msg.slice(0, maxChars)}…` : msg;
-						msgLabel.rotation = 0;
-						if (isH) {
-							msgLabel.scale.set(squeeze, 1);
-							msgLabel.position.set(screenX + 4, msgCrossOffset);
-						} else {
+					// Commit message (horizontal)
+					if (showMsg) {
+						const msg = d.commitMessages.get(dt.sha);
+						if (msg && sc.msgStyle) {
+							// Let pretext handle wrapping and truncation.
+							const msgPrepared = prepareWithSegments(msg, msgFont);
+							const msgResult = layoutWithLines(msgPrepared, msgWrapWidth, msgLineH);
+							const allLines = msgResult.lines;
+							const truncated = allLines.length > maxMsgLines;
+							const lines = allLines.slice(0, maxMsgLines);
+							if (lines.length > 0) {
+								const lineTexts = lines.map((l) => l.text);
+								if (truncated) {
+									const last = lineTexts.length - 1;
+									lineTexts[last] = `${lineTexts[last].trimEnd()}…`;
+								}
+								const msgLabel = tickPool.acquire(sc.msgStyle);
+								msgLabel.text = lineTexts.join("\n");
+								msgLabel.rotation = 0;
+								// Use laid-out dimensions: width = widest line, height from pretext.
+								// Squeeze X based on laid-out width.
+								let laidOutW = 0;
+								for (const l of lines) {
+									if (l.width > laidOutW) laidOutW = l.width;
+								}
+								const msgSqueeze = laidOutW > 0 ? Math.max(0, Math.min(1, availPx / laidOutW)) : 1;
+								msgLabel.scale.set(msgSqueeze, 1);
+								msgLabel.position.set(screenX + 4, msgCrossOffset);
+							}
+						}
+					}
+				} else {
+					// Vertical mode: main axis = Y, squeeze compresses Y scale.
+					// Use pretext to measure everything, then compute a single
+					// unified squeeze for the entire tick content.
+					const shaCharsV = Math.max(
+						4,
+						Math.min(7, shaCharW > 0 ? Math.floor(labelAvailCross / shaCharW) : 7),
+					);
+					const shaTextV = dt.sha.slice(0, shaCharsV);
+
+					// Measure commit message if visible
+					let msgLaidOutH = 0;
+					let msgLineTexts: string[] | null = null;
+					if (showMsg) {
+						const msg = d.commitMessages.get(dt.sha);
+						if (msg && sc.msgStyle) {
+							const msgPrepared = prepareWithSegments(msg, msgFont);
+							const wrapW = Math.max(1, msgCrossAvail);
+							const msgResult = layoutWithLines(msgPrepared, wrapW, msgLineH);
+							const allLines = msgResult.lines;
+							const truncated = allLines.length > maxMsgLines;
+							const lines = allLines.slice(0, maxMsgLines);
+							if (lines.length > 0) {
+								msgLineTexts = lines.map((l) => l.text);
+								if (truncated) {
+									const last = msgLineTexts.length - 1;
+									msgLineTexts[last] = `${msgLineTexts[last].trimEnd()}…`;
+								}
+								msgLaidOutH = lines.length * msgLineH;
+							}
+						}
+					}
+
+					if (edgeEnd) {
+						// edge="end": SHA and msg in separate cross-axis columns.
+						const shaSqueeze = fontSize > 0 ? Math.max(0, Math.min(1, availPx / fontSize)) : 1;
+						label.text = shaTextV;
+						label.scale.set(1, shaSqueeze);
+						label.position.set(shaOffset, screenX + 4);
+
+						if (msgLineTexts && sc.msgStyle) {
+							const msgLabel = tickPool.acquire(sc.msgStyle);
+							msgLabel.text = msgLineTexts.join("\n");
+							msgLabel.rotation = 0;
+							const msgSqueeze =
+								msgLaidOutH > 0 ? Math.max(0, Math.min(1, availPx / msgLaidOutH)) : 1;
+							msgLabel.scale.set(1, msgSqueeze);
+							msgLabel.position.set(msgCrossOffset, screenX + 4);
+						}
+					} else {
+						// edge="start": SHA and msg stacked in same column along main axis.
+						// Compute total laid-out height, then apply one unified squeeze.
+						const gap = 4;
+						const totalH = msgLineTexts ? fontSize + gap + msgLaidOutH : fontSize;
+						const squeeze = totalH > 0 ? Math.max(0, Math.min(1, availPx / totalH)) : 1;
+
+						label.text = shaTextV;
+						label.scale.set(1, squeeze);
+						label.position.set(shaOffset, screenX + 4);
+
+						if (msgLineTexts && sc.msgStyle) {
+							const msgLabel = tickPool.acquire(sc.msgStyle);
+							msgLabel.text = msgLineTexts.join("\n");
+							msgLabel.rotation = 0;
 							msgLabel.scale.set(1, squeeze);
-							// edge="end" vertical: msg is in a separate column from SHA,
-							// so it starts at the tick's Y position without shaCrossSize offset.
-							// edge="start" vertical: msg shares the same column as SHA,
-							// so it starts below SHA with shaCrossSize offset.
-							const msgMainOffset = edgeEnd ? 4 : shaCrossSize + 4;
-							msgLabel.position.set(msgCrossOffset, screenX + msgMainOffset);
+							msgLabel.position.set(msgCrossOffset, screenX + 4 + (fontSize + gap) * squeeze);
 						}
 					}
 				}
