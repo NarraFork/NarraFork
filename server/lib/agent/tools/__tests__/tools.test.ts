@@ -1046,4 +1046,85 @@ describe("Agent tool rawJsonSchema", () => {
 			expect(rawKeys).toContain(key);
 		}
 	});
+
+	test("rawJsonSchema.required matches Zod required fields", () => {
+		const zodSchema = zodToJsonSchema(agentTool.parameters);
+		const zodRequired = new Set((zodSchema.required as string[]) ?? []);
+		const rawRequired = new Set((agentTool.rawJsonSchema!.required as string[]) ?? []);
+		// Every field required in rawJsonSchema must also be required in Zod
+		for (const key of rawRequired) {
+			expect(zodRequired).toContain(key);
+		}
+		// Every field required in Zod must also be required in rawJsonSchema
+		for (const key of zodRequired) {
+			expect(rawRequired).toContain(key);
+		}
+	});
+});
+
+// ============================================================
+// All tools with rawJsonSchema — parity with Zod schema
+// ============================================================
+
+import { askUserQuestionTool } from "../ask-user-question";
+import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
+import { skillTool } from "../skill";
+import { teamStatusTool } from "../team-status";
+import { webFetchTool } from "../web-fetch";
+import { webSearchTool } from "../web-search";
+
+// Tools with known pre-existing schema mismatches (not introduced by recent changes).
+// These are tracked here so the parity test doesn't mask new regressions.
+// TODO: fix these tools' rawJsonSchema to match their Zod parameters:
+//   - WebFetch: rawJsonSchema has extra/missing properties vs Zod
+//   - EnterPlanMode: rawJsonSchema required fields differ from Zod
+//   - Skill: rawJsonSchema properties differ from Zod
+const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "EnterPlanMode", "Skill"]);
+
+const toolsWithRawJsonSchema = [
+	agentTool,
+	bashTool,
+	readTool,
+	writeTool,
+	editTool,
+	globTool,
+	grepTool,
+	webSearchTool,
+	webFetchTool,
+	askUserQuestionTool,
+	enterPlanModeTool,
+	exitPlanModeTool,
+	skillTool,
+	teamStatusTool,
+].filter((t) => t.rawJsonSchema);
+
+describe("rawJsonSchema parity for all tools", () => {
+	for (const tool of toolsWithRawJsonSchema) {
+		const skip = KNOWN_SCHEMA_MISMATCHES.has(tool.name);
+
+		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema keys cover Zod keys`, () => {
+			const zodSchema = zodToJsonSchema(tool.parameters);
+			const zodKeys = Object.keys((zodSchema.properties as Record<string, unknown>) ?? {});
+			const rawKeys = Object.keys(
+				(tool.rawJsonSchema!.properties as Record<string, unknown>) ?? {},
+			);
+			for (const key of zodKeys) {
+				expect(rawKeys).toContain(key);
+			}
+		});
+
+		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema.required matches Zod required`, () => {
+			const zodSchema = zodToJsonSchema(tool.parameters);
+			const zodRequired = new Set((zodSchema.required as string[]) ?? []);
+			const rawRequired = new Set((tool.rawJsonSchema!.required as string[]) ?? []);
+			// rawJsonSchema must not require fields that Zod considers optional
+			for (const key of rawRequired) {
+				expect(zodRequired).toContain(key);
+			}
+			// Zod required fields must also be required in rawJsonSchema
+			for (const key of zodRequired) {
+				expect(rawRequired).toContain(key);
+			}
+		});
+	}
 });

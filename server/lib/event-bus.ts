@@ -145,6 +145,14 @@ export type NarraForkEvent =
 			taskNarratorId: string;
 			toolUseId: string;
 	  }
+	| {
+			type: "narrator:team_message";
+			narratorId: string;
+			fromId: string;
+			parentNarratorId: string;
+			text: string;
+			isBroadcast: boolean;
+	  }
 	// Container lifecycle
 	| { type: "container:started"; chapterId: string }
 	| { type: "container:stopped"; chapterId: string }

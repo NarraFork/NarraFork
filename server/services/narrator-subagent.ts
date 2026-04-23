@@ -584,12 +584,9 @@ async function finalizeSubagent(
 	getSubagentBufferedMessagesMap().delete(subagentId);
 	clearTeamInbox(subagentId);
 
-	// Remove this subagent's file changes from team tracking
-	const teamChanges = getTeamFileChangesMap().get(parentNarratorId);
-	if (teamChanges) {
-		teamChanges.delete(subagentId);
-		if (teamChanges.size === 0) getTeamFileChangesMap().delete(parentNarratorId);
-	}
+	// NOTE: file change records are intentionally NOT cleared here.
+	// They remain available for sibling subagents to query via TeamStatus.file_changes
+	// until the parent narrator session ends (clearTeamFileChanges is called then).
 
 	const now = new Date().toISOString();
 	await db
@@ -2159,7 +2156,7 @@ export interface ContinueSubagentInput {
 	subagentId: string;
 	parentNarratorId: string;
 	toolUseId: string;
-	prompt: string;
+	prompt?: string;
 	signal: AbortSignal;
 	locale: string;
 }
@@ -2200,6 +2197,9 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	}
 
 	// --- Standard continue path: idle subagent ---
+	if (!prompt) {
+		throw new ValidationError("prompt is required to continue an idle subagent");
+	}
 	const origSubstatus = parseSubstatus(original.substatus);
 	if (
 		!(

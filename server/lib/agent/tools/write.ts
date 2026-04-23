@@ -4,6 +4,7 @@ import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
+import { trackFileChange } from "./track-file-change";
 
 export const writeTool: ToolDefinition = {
 	name: "Write",
@@ -58,6 +59,7 @@ export const writeTool: ToolDefinition = {
 
 			mkdirSync(dirname(resolvedPath), { recursive: true });
 			await writeFileText(resolvedPath, content, existingEncoding);
+			await trackFileChange(ctx, resolvedPath);
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

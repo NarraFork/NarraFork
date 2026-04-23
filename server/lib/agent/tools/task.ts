@@ -37,10 +37,14 @@ function getSubagentPoolNote(): string {
 
 function buildParameters() {
 	return z.object({
-		description: z.string().optional().describe("A short (3-5 word) description of the task"),
+		description: z
+			.string()
+			.optional()
+			.describe("A short (3-5 word) description of the task (required when launching a new agent)"),
 		subagent_type: z
 			.string()
 			.min(1)
+			.optional()
 			.describe(
 				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
 			),
@@ -68,7 +72,10 @@ function buildParameters() {
 			.describe(
 				"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
 			),
-		prompt: z.string().describe("The task for the agent to perform"),
+		prompt: z
+			.string()
+			.optional()
+			.describe("The task for the agent to perform (required when launching a new agent)"),
 		stop: z
 			.string()
 			.optional()
@@ -101,7 +108,8 @@ export const agentTool: ToolDefinition = {
 			type: "object" as const,
 			properties: {
 				description: {
-					description: "A short (3-5 word) description of the task",
+					description:
+						"A short (3-5 word) description of the task (required when launching a new agent)",
 					type: "string",
 				},
 				subagent_type: {
@@ -142,19 +150,19 @@ export const agentTool: ToolDefinition = {
 					type: "string",
 				},
 				prompt: {
-					description: "The task for the agent to perform",
+					description: "The task for the agent to perform (required when launching a new agent)",
 					type: "string",
 				},
 			},
-			required: ["description", "prompt"],
+			required: [] as string[],
 			additionalProperties: false,
 		};
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {
-			prompt: string;
+			prompt?: string;
 			description?: string;
-			subagent_type: string;
+			subagent_type?: string;
 			resume?: string;
 			run_in_background?: boolean;
 			model?: string;
@@ -226,6 +234,13 @@ export const agentTool: ToolDefinition = {
 
 		// Lazy import to avoid circular dependency at module load time
 		const { runSubagent, registerTaskAlias } = await import("@server/services/narrator-subagent");
+
+		if (!prompt) {
+			return {
+				output: "Missing required parameter: prompt (the task for the agent to perform)",
+				isError: true,
+			};
+		}
 
 		try {
 			const result = await runSubagent({

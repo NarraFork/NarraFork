@@ -124,6 +124,8 @@ export const narratorsApi = {
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	detachSubagent: (id: string) =>
+		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
 	updateSubagentConclusion: (id: string) =>
 		request<{ ok: boolean; toolUseId: string }>(`/narrators/${id}/update-conclusion`, {
 			method: "POST",

@@ -20,7 +20,10 @@ export const continueTaskTool: ToolDefinition = {
 			prompt: string;
 		};
 
-		const { continueSubagent } = await import("@server/services/narrator-subagent");
+		const { continueSubagent, resolveTaskAlias } = await import(
+			"@server/services/narrator-subagent"
+		);
+		const resolvedId = resolveTaskAlias(ctx.narratorId, subagent_id);
 
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {
@@ -29,7 +32,7 @@ export const continueTaskTool: ToolDefinition = {
 
 		try {
 			const result = await continueSubagent({
-				subagentId: subagent_id,
+				subagentId: resolvedId,
 				parentNarratorId: ctx.narratorId,
 				toolUseId,
 				prompt,

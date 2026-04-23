@@ -53,6 +53,7 @@ import {
 	MAX_CONTEXT_OVERFLOW_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
+import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
 import { worktreeWatcher } from "./worktree-watcher";
@@ -1865,6 +1866,9 @@ export async function runAgentLoop(
 		pendingPlanCompact.delete(narratorId);
 		pendingPlanApprover.delete(narratorId);
 		pendingPlanDiff.delete(narratorId);
+		// 6. Subagent team tracking — alias registry and file change records
+		clearAliasRegistry(narratorId);
+		clearTeamFileChanges(narratorId);
 		// When the loop ended with an error or was interrupted while buffered
 		// messages exist, preserve those messages so the user can retry / the
 		// next activation consumes them automatically.  Notify the frontend so

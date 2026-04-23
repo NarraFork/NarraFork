@@ -3,6 +3,7 @@ import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
+import { trackFileChange } from "./track-file-change";
 
 // ── Replacer types & implementations ────────────────────────────
 // Sourced from opencode's cascading replacer approach:
@@ -449,6 +450,7 @@ export const editTool: ToolDefinition = {
 			// Create-new-file mode: old_string is empty
 			if (old_string === "") {
 				await writeFileText(resolvedPath, new_string);
+				await trackFileChange(ctx, resolvedPath);
 				return {
 					output: `Created/overwritten ${file_path}`,
 					title: file_path,
@@ -471,6 +473,7 @@ export const editTool: ToolDefinition = {
 
 			const result = replace(content, normalizedOld, normalizedNew, replace_all);
 			await writeFileText(resolvedPath, result.content, encoding);
+			await trackFileChange(ctx, resolvedPath);
 			const oldLines = normalizedOld.split("\n").length;
 			const newLines = normalizedNew.split("\n").length;
 			return {

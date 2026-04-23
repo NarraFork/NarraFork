@@ -321,4 +321,24 @@ export type NarratorServerMessage =
 			output: string;
 			hasError: boolean;
 	  }
-	| { type: "sync_ok"; narratorId: string; version: number };
+	| { type: "sync_ok"; narratorId: string; version: number }
+	| {
+			type: "team_message";
+			narratorId: string;
+			fromId: string;
+			fromTitle: string | null;
+			fromType: string;
+			text: string;
+			isBroadcast: boolean;
+	  }
+	| {
+			type: "subagent_detached";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId: string;
+	  }
+	| {
+			type: "subagent_attached";
+			narratorId: string;
+			subagentNarratorId: string;
+	  };

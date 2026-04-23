@@ -985,6 +985,17 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	return c.json({ interrupted });
 });
 
+// Detach a foreground subagent to background mode (zero-interrupt)
+narratorRoutes.post("/:id/detach", async (c) => {
+	const id = c.req.param("id");
+	const { detachSubagent } = await import("../services/narrator-subagent");
+	const detached = await detachSubagent(id);
+	if (!detached) {
+		return c.json({ error: "Subagent is not running in foreground mode" }, 400);
+	}
+	return c.json({ detached: true });
+});
+
 // Update the conclusion of an already-completed subagent.
 // The user continued operating the subagent from its page and wants to
 // push the new result back to the parent narrator's tool_call outputJson.
