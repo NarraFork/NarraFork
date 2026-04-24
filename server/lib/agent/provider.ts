@@ -55,6 +55,8 @@ export interface DbToolCall {
 
 export interface ParsedStreamEvent {
 	text?: string;
+	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
+	textOutputIndex?: number;
 	toolUses?: AgentToolUse[];
 	messageId?: string;
 	conversationId?: string;
@@ -76,6 +78,8 @@ export interface ParsedStreamEvent {
 		name?: string;
 		input?: string;
 		stop?: boolean;
+		/** Provider-native content block index (e.g. Anthropic SSE event.index). */
+		outputIndex?: number;
 	};
 	/** Token usage info from OpenAI-compatible APIs (used to compute context usage %) */
 	usage?: {
@@ -217,6 +221,8 @@ export interface ProviderAdapter {
 			result?: string;
 			outputIndex?: number;
 		}>,
+		/** Provider-native content block index for the text block (for interleaved ordering). */
+		textOutputIndex?: number,
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

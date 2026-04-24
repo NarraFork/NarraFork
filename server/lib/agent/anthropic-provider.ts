@@ -886,6 +886,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
 		}>,
 		_webSearches?: Array<{
 			id: string;
@@ -894,30 +895,58 @@ export class AnthropicProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		_messageId?: string,
+		_imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
+		textOutputIndex?: number,
 	): void {
 		const h = history as AnthropicMessage[];
-		const parts: AnthropicContentPart[] = [];
 
-		// Thinking blocks go first (matching Claude Code ordering)
+		// Collect all blocks with their outputIndex and sort by position.
+		// When no block has an explicit outputIndex (legacy messages), fall back
+		// to the fixed ordering: reasoning → text → tool_use.
+		const indexed: Array<{ part: AnthropicContentPart; outputIndex: number }> = [];
+
 		if (reasoningBlocks) {
-			for (const rb of reasoningBlocks) {
+			for (let i = 0; i < reasoningBlocks.length; i++) {
+				const rb = reasoningBlocks[i];
 				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
-				parts.push({ type: "thinking", thinking: rb.text, signature: sig });
+				indexed.push({
+					part: { type: "thinking", thinking: rb.text, signature: sig },
+					outputIndex: rb.outputIndex ?? i,
+				});
 			}
 		}
 
 		if (text) {
-			parts.push({ type: "text", text });
-		}
-
-		for (const tu of toolUses) {
-			parts.push({
-				type: "tool_use",
-				id: tu.toolUseId,
-				name: tu.name,
-				input: tu.input,
+			// Use the real textOutputIndex when available; otherwise place text
+			// after reasoning blocks but before tool_use blocks.
+			const fallbackIdx = reasoningBlocks?.length ?? 0;
+			indexed.push({
+				part: { type: "text", text },
+				outputIndex: textOutputIndex ?? fallbackIdx,
 			});
 		}
+
+		for (let i = 0; i < toolUses.length; i++) {
+			const tu = toolUses[i];
+			const fallbackIdx = (reasoningBlocks?.length ?? 0) + (text ? 1 : 0) + i;
+			indexed.push({
+				part: {
+					type: "tool_use",
+					id: tu.toolUseId,
+					name: tu.name,
+					input: tu.input,
+				},
+				outputIndex: tu.outputIndex ?? fallbackIdx,
+			});
+		}
+
+		indexed.sort((a, b) => a.outputIndex - b.outputIndex);
+		const parts = indexed.map((e) => e.part);
 
 		if (parts.length > 0) {
 			ensureTextOrToolBlock(parts);
@@ -1200,7 +1229,7 @@ function isParsableJson(s: string): boolean {
 }
 
 /** Accumulator for thinking block signature (keyed by content_block index). */
-type ThinkingAccumEntry = { signature: string };
+type ThinkingAccumEntry = { signature: string; blockIndex: number };
 
 function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
@@ -1258,6 +1287,7 @@ function parseAnthropicEvent(
 						name: block.name,
 						input: undefined,
 						stop: false,
+						outputIndex: idx,
 					},
 				},
 			];
@@ -1293,7 +1323,7 @@ function parseAnthropicEvent(
 		}
 		// Thinking block start — initialize signature accumulator
 		if (block.type === "thinking") {
-			thinkingAccum.set(idx, { signature: "" });
+			thinkingAccum.set(idx, { signature: "", blockIndex: idx });
 			return [];
 		}
 		return [];
@@ -1305,12 +1335,12 @@ function parseAnthropicEvent(
 
 		// Text delta
 		if (event.delta.type === "text_delta" && event.delta.text != null) {
-			return [{ text: event.delta.text }];
+			return [{ text: event.delta.text, textOutputIndex: idx }];
 		}
 
 		// Thinking delta (extended thinking)
 		if (event.delta.type === "thinking_delta" && event.delta.thinking != null) {
-			return [{ reasoning: event.delta.thinking }];
+			return [{ reasoning: event.delta.thinking, reasoningOutputIndex: idx }];
 		}
 
 		// Signature delta — assign (Anthropic sends one per thinking block)
@@ -1391,6 +1421,7 @@ function parseAnthropicEvent(
 						reasoningMetadata: {
 							anthropic: { signature: thinkAcc.signature },
 						},
+						reasoningOutputIndex: thinkAcc.blockIndex,
 					},
 				];
 			}
@@ -1531,7 +1562,31 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 				history.push({ role: "user", content: searchSummary });
 			}
 
-			// Thinking / redacted_thinking blocks go first (matching Claude Code ordering)
+			// Build a set of completed tool call IDs for filtering
+			const completedToolUseIds = new Set(
+				msg.toolCalls
+					?.filter((tc) => tc.status === "success" || tc.status === "fail")
+					.map((tc) => tc.toolUseId) ?? [],
+			);
+
+			// Build a map of tool call data for quick lookup
+			const toolCallMap = new Map<
+				string,
+				{ toolName: string; toolUseId: string; inputJson: unknown }
+			>();
+			if (msg.toolCalls) {
+				for (const tc of msg.toolCalls) {
+					if (tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId)) {
+						toolCallMap.set(tc.toolUseId, tc);
+					}
+				}
+			}
+
+			// Track which tool_use IDs have been emitted via contentJson blocks
+			const emittedToolUseIds = new Set<string>();
+
+			// Single-pass: iterate contentJson in original order to preserve
+			// interleaved thinking block positions (required by interleaved-thinking beta).
 			for (const b of content) {
 				const block = b as {
 					type: string;
@@ -1539,6 +1594,9 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					text?: string;
 					signature?: string;
 					data?: string;
+					id?: string;
+					name?: string;
+					input?: Record<string, unknown>;
 					providerMetadata?: { anthropic?: { signature?: string } };
 				};
 				if (block.type === "thinking" && block.thinking) {
@@ -1557,28 +1615,13 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					});
 				} else if (block.type === "redacted_thinking" && block.data) {
 					parts.push({ type: "redacted_thinking", data: block.data });
-				}
-			}
-
-			// Text blocks
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
-			if (text) {
-				parts.push({ type: "text", text });
-			}
-
-			// Tool use blocks
-			const completedToolUseIds = new Set(
-				msg.toolCalls
-					?.filter((tc) => tc.status === "success" || tc.status === "fail")
-					.map((tc) => tc.toolUseId) ?? [],
-			);
-
-			if (msg.toolCalls) {
-				for (const tc of msg.toolCalls) {
-					if (tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId)) {
+				} else if (block.type === "text" && block.text) {
+					parts.push({ type: "text", text: block.text });
+				} else if (block.type === "tool_use" && block.id) {
+					// contentJson may store tool_use blocks directly; use them if
+					// the tool call is completed, otherwise look up from toolCalls.
+					const tc = toolCallMap.get(block.id);
+					if (tc) {
 						let input: Record<string, unknown> = {};
 						try {
 							input =
@@ -1594,7 +1637,43 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 							name: tc.toolName,
 							input,
 						});
+						emittedToolUseIds.add(tc.toolUseId);
 					}
+				}
+				// Skip web_search, image_generation, and other non-API block types
+			}
+
+			// Append any completed tool calls not already emitted via contentJson
+			// (backward compat: older messages may not have tool_use in contentJson)
+			for (const [toolUseId, tc] of toolCallMap) {
+				if (!emittedToolUseIds.has(toolUseId)) {
+					let input: Record<string, unknown> = {};
+					try {
+						input =
+							typeof tc.inputJson === "string"
+								? JSON.parse(tc.inputJson)
+								: ((tc.inputJson as Record<string, unknown>) ?? {});
+					} catch {
+						input = {};
+					}
+					parts.push({
+						type: "tool_use",
+						id: tc.toolUseId,
+						name: tc.toolName,
+						input,
+					});
+				}
+			}
+
+			// If no text block was found in contentJson, fall back to contentText
+			if (!parts.some((p) => p.type === "text") && msg.contentText) {
+				// Insert text before the first tool_use block
+				const firstToolIdx = parts.findIndex((p) => p.type === "tool_use");
+				const textPart: AnthropicContentPart = { type: "text", text: msg.contentText };
+				if (firstToolIdx >= 0) {
+					parts.splice(firstToolIdx, 0, textPart);
+				} else {
+					parts.push(textPart);
 				}
 			}
 

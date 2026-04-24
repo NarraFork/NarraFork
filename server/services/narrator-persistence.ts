@@ -507,7 +507,13 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
-			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+			| {
+					type: "tool_use";
+					id: string;
+					name: string;
+					input: Record<string, unknown>;
+					outputIndex?: number;
+			  }
 			| {
 					type: "web_search";
 					id: string;
@@ -537,7 +543,13 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
-			| { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+			| {
+					type: "tool_use";
+					id: string;
+					name: string;
+					input: Record<string, unknown>;
+					outputIndex?: number;
+			  }
 			| {
 					type: "web_search";
 					id: string;

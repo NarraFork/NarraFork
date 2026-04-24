@@ -231,6 +231,8 @@ export interface AgentToolUse {
 	input: Record<string, unknown>;
 	/** Timestamp (ms) when the first streaming chunk for this tool use arrived */
 	streamStartedAt?: number;
+	/** Provider-native content block index for interleaved ordering. */
+	outputIndex?: number;
 }
 
 /** Provider-specific metadata attached to reasoning blocks for continuation support. */
@@ -263,6 +265,7 @@ export type ContentBlock =
 			name: string;
 			input: Record<string, unknown>;
 			streamStartedAt?: number;
+			outputIndex?: number;
 	  }
 	| {
 			type: "web_search";

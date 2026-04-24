@@ -681,6 +681,7 @@ export async function processEvent(
 					id: block.toolUseId,
 					name: block.name,
 					input: block.input,
+					outputIndex: block.outputIndex,
 				});
 			} else if (block.type === "web_search") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
