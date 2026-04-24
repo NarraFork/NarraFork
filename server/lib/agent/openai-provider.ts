@@ -175,6 +175,12 @@ export interface OAIMessage {
 	content?: string | OAIContentPart[] | null;
 	tool_calls?: OAIToolCall[];
 	tool_call_id?: string;
+	/**
+	 * reasoning_content field for Chat Completions API.
+	 * Some models (e.g. DeepSeek, QwQ) return reasoning_content in their responses
+	 * and require it to be passed back in subsequent requests.
+	 */
+	reasoning_content?: string | null;
 	/** Reasoning blocks from the assistant message (used for Responses API replay/fallback). */
 	_reasoningBlocks?: Array<{
 		text: string;
@@ -343,13 +349,24 @@ export class OpenAIProvider implements ProviderAdapter {
 			return await buildResponsesHistory(dbMessages, narratorId);
 		}
 		const result = buildOAIHistory(dbMessages);
-		// Chat Completions path: strip _reasoningBlocks from assistant messages
-		// to avoid sending unknown fields to strict OpenAI-compatible backends.
+		// Chat Completions path: convert _reasoningBlocks to reasoning_content
+		// for models that require reasoning_content to be passed back (e.g. DeepSeek, QwQ).
 		for (const msg of result.history) {
 			// biome-ignore lint/suspicious/noExplicitAny: OAIMessage has _reasoningBlocks
 			const m = msg as any;
 			if (m._reasoningBlocks) {
+				if (!m.reasoning_content) {
+					const reasoningText = m._reasoningBlocks
+						.map((b: { text: string }) => b.text)
+						.join("\n\n");
+					if (reasoningText) {
+						m.reasoning_content = reasoningText;
+					}
+				}
 				delete m._reasoningBlocks;
+			}
+			if (m._reasoningTextFallback !== undefined) {
+				delete m._reasoningTextFallback;
 			}
 		}
 		return result;
@@ -705,6 +722,13 @@ export class OpenAIProvider implements ProviderAdapter {
 					type: "function" as const,
 					function: { name: tu.name, arguments: JSON.stringify(tu.input) },
 				}));
+			}
+			// Pass reasoning_content back for models that require it (e.g. DeepSeek, QwQ)
+			if (reasoningBlocks?.length) {
+				const reasoningText = reasoningBlocks.map((b) => b.text).join("\n\n");
+				if (reasoningText) {
+					msg.reasoning_content = reasoningText;
+				}
 			}
 			h.push(msg);
 		}
