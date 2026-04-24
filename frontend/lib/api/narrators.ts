@@ -126,6 +126,31 @@ export const narratorsApi = {
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	detachSubagent: (id: string) =>
 		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
+	cancelBackgroundTask: (narratorId: string, taskId: string) =>
+		request<{ success: boolean }>(`/narrators/${narratorId}/background-tasks/${taskId}/cancel`, {
+			method: "POST",
+		}),
+	listBackgroundTasks: (narratorId: string) =>
+		request<{
+			subagentTasks: {
+				id: string;
+				subagentType: string | null;
+				backgroundStatus: string | null;
+				backgroundResult: string | null;
+				backgroundCompletedAt: string | null;
+				status: string;
+				createdAt: string;
+				title: string | null;
+			}[];
+			bashTasks: {
+				id: string;
+				command: string;
+				status: string;
+				startedAt: string;
+				completedAt: string | null;
+				exitCode: number | null;
+			}[];
+		}>(`/narrators/${narratorId}/background-tasks`),
 	updateSubagentConclusion: (id: string) =>
 		request<{ ok: boolean; toolUseId: string }>(`/narrators/${id}/update-conclusion`, {
 			method: "POST",

@@ -449,5 +449,13 @@
 	"updateConclusion": "更新结论",
 	"conclusionUpdated": "结论已更新",
 	"subagentSuspended": "已暂停 — 等待用户继续",
-	"subagentSuspendedHint": "打开子代理会话继续操作"
+	"subagentSuspendedHint": "打开子代理会话继续操作",
+	"resolveOverride": "继续",
+	"backgroundTasks": {
+		"title": "后台任务",
+		"cancel": "取消任务",
+		"empty": "暂无后台任务",
+		"completed": "后台任务已完成",
+		"failed": "后台任务失败"
+	}
 }

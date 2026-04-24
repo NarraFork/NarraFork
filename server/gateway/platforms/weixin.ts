@@ -1060,8 +1060,18 @@ export class WeixinAdapter extends BaseAdapter {
 		// Skip own messages
 		if (senderId === this.accountId) return;
 
-		const messageId = String(message.message_id ?? "").trim();
-		if (messageId && this.dedup.isDuplicate(messageId)) return;
+		// iLink API uses msg_id (consistent with from_user_id, to_user_id, etc.)
+		const messageId = String(message.msg_id ?? message.message_id ?? "").trim();
+		if (messageId) {
+			if (this.dedup.isDuplicate(messageId)) {
+				logger.debug(`[weixin] Dedup: skipping duplicate message ${messageId}`);
+				return;
+			}
+		} else {
+			logger.warn("[weixin] Message has no msg_id — dedup disabled for this message", {
+				fromUser: senderId.slice(0, 8),
+			});
+		}
 
 		// Allowlist check
 		if (this.config.allowedUsers?.length) {

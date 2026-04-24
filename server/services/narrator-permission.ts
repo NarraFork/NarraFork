@@ -822,6 +822,9 @@ export async function handlePermission(
 
 	// Shell command pre-analysis
 	let bashAnalysis: BashAnalysis | undefined;
+	// Bash await/stop are control operations (no command execution) — always allow
+	const isBashControlOp =
+		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
 	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
 		try {
 			const shellType = detectShell().type;
@@ -1022,6 +1025,25 @@ export async function handlePermission(
 
 	const permMeta: PermissionDecisionMeta = {};
 	const conclusionFileId = getConclusionFileId(narratorId);
+
+	// Bash await/stop are pure control operations — skip full permission analysis
+	if (isBashControlOp) {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "running",
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		return { behavior: "allow", updatedInput: effectiveInput };
+	}
+
 	let decision = resolvePermissionDecision({
 		toolName,
 		input: effectiveInput,

@@ -21,6 +21,7 @@ import {
 	IconCloudOff,
 	IconEye,
 	IconMessageQuestion,
+	IconPlayerStop,
 	IconRobot,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -169,7 +170,7 @@ export const SubagentCard = memo(
 		const dismissed =
 			(toolCall.toolUseId && permCb?.bgRetryDismissedIds?.has(toolCall.toolUseId)) ?? false;
 		const showBgWarning = isBgWarning && !dismissed && !!onBgAgentRetry;
-		const isTerminal = /^(success|completed|denied|error|fail)$/.test(toolCall.status);
+		const isTerminal = /^(success|completed|denied|error|fail|cancelled)$/.test(toolCall.status);
 		const isInitializing = toolCall.status === "initializing";
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
@@ -313,12 +314,13 @@ export const SubagentCard = memo(
 			}
 		}, [selfPerm]);
 
-		// When subagent finishes: collapse tool calls list
+		// When subagent finishes successfully: collapse tool calls list.
+		// Keep expanded on failure/cancel for easier debugging.
 		useEffect(() => {
-			if (isTerminal) {
+			if (isTerminal && toolCall.status === "success") {
 				setShowCalls(false);
 			}
-		}, [isTerminal]);
+		}, [isTerminal, toolCall.status]);
 
 		// --- Block ID & multi-select ---
 		const saBlockId = toolCall.toolUseId ? `sa-${toolCall.toolUseId}` : undefined;
@@ -390,7 +392,8 @@ export const SubagentCard = memo(
 			}
 		}, [saNarrator?.substatus]);
 		const saIsReasoning = saSubstatus.includes("reasoning");
-		const isSuspended = saSubstatus.includes("suspended");
+		const isSuspended =
+			saSubstatus.includes("suspended") || saSubstatus.includes("manual_override");
 
 		// --- Subagent status bar data ---
 		const saStatus = saNarrator?.status;
@@ -500,6 +503,15 @@ export const SubagentCard = memo(
 			}
 		}, [subagentNarratorId]);
 
+		const handleCancelBackground = useCallback(async () => {
+			if (!subagentNarratorId) return;
+			try {
+				await api.cancelBackgroundTask(narratorId, subagentNarratorId);
+			} catch {
+				// Ignore — task may have already finished
+			}
+		}, [narratorId, subagentNarratorId]);
+
 		const cardMenuItems = (
 			<>
 				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
@@ -514,6 +526,18 @@ export const SubagentCard = memo(
 						}}
 					>
 						{t("detachToBackground")}
+					</Menu.Item>
+				)}
+				{isBackground && !isTerminal && subagentNarratorId && (
+					<Menu.Item
+						color="red"
+						leftSection={<IconPlayerStop size={14} />}
+						onClick={() => {
+							handleCancelBackground();
+							swipe.closeSwipe();
+						}}
+					>
+						{t("backgroundTasks.cancel")}
 					</Menu.Item>
 				)}
 				{parentMsgCtx.onAskInPassing && (
@@ -637,9 +661,24 @@ export const SubagentCard = memo(
 							</Group>
 							{/* Line 2: description (truncated when collapsed) */}
 							{isSuspended ? (
-								<Text size="xs" c="yellow" mt={2} ml={21}>
-									{t("subagentSuspended")}
-								</Text>
+								<Group gap={6} mt={2} ml={21}>
+									<Text size="xs" c="yellow">
+										{t("subagentSuspended")}
+									</Text>
+									{subagentNarratorId && (
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="yellow"
+											onClick={(e: React.MouseEvent) => {
+												e.stopPropagation();
+												api.updateSubagentConclusion(subagentNarratorId);
+											}}
+										>
+											{t("resolveOverride")}
+										</Button>
+									)}
+								</Group>
 							) : (
 								<Text
 									size="xs"
@@ -650,6 +689,12 @@ export const SubagentCard = memo(
 									style={expanded ? { whiteSpace: "pre-wrap" } : undefined}
 								>
 									{description}
+								</Text>
+							)}
+							{/* Collapsed result preview */}
+							{!expanded && isTerminal && resultText && (
+								<Text size="xs" c="dimmed" mt={2} ml={21} truncate opacity={0.7}>
+									→ {resultText.slice(0, 120)}
 								</Text>
 							)}
 							{prompt && !input.description && !promptHasLineBreak && (

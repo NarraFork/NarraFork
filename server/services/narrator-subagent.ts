@@ -128,6 +128,44 @@ function getConclusionWatchersMap() {
 
 // === ProxyAbortController for detach/attach ===
 
+// === Background task completion notifications for parent agent ===
+interface CompletedBgSubagentNotification {
+	id: string;
+	title: string;
+	status: string;
+	resultPreview: string;
+}
+
+let _bgCompletionQueue: Map<string, CompletedBgSubagentNotification[]> | undefined;
+function getBgCompletionQueue() {
+	if (!_bgCompletionQueue) _bgCompletionQueue = new Map();
+	return _bgCompletionQueue;
+}
+
+function pushBgCompletionNotification(
+	parentNarratorId: string,
+	notification: CompletedBgSubagentNotification,
+) {
+	const queue = getBgCompletionQueue();
+	const list = queue.get(parentNarratorId) ?? [];
+	list.push(notification);
+	queue.set(parentNarratorId, list);
+}
+
+/**
+ * Drain completed background subagent notifications for a parent narrator.
+ * Used by getInjectedUserText to inform the agent about completed background tasks.
+ */
+export function drainCompletedBackgroundSubagents(
+	parentNarratorId: string,
+): CompletedBgSubagentNotification[] {
+	const queue = getBgCompletionQueue();
+	const list = queue.get(parentNarratorId);
+	if (!list || list.length === 0) return [];
+	queue.delete(parentNarratorId);
+	return list;
+}
+
 /**
  * A proxy AbortController that forwards abort signals from one or more sources.
  * The key feature: sources can be swapped at runtime (detach removes parent signal,
@@ -932,6 +970,8 @@ async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					userText = userText ? `${userText}\n\n${teamBlock}` : teamBlock;
 				}
 
+				// 3. Background bash tasks are temporarily disabled (circuit breaker)
+
 				return userText;
 			},
 		};
@@ -1497,6 +1537,12 @@ async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
 				toolUseId,
 				error: finalText,
 			});
+			pushBgCompletionNotification(parentNarratorId, {
+				id: narratorId,
+				title: (await narratorService.getById(narratorId).catch(() => null))?.title ?? narratorId,
+				status: "failed",
+				resultPreview: (finalText || "").slice(0, 500),
+			});
 		} else {
 			eventBus.emit({
 				type: "narrator:background_task_completed",
@@ -1896,6 +1942,13 @@ async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
 							toolUseId,
 							error: finalText,
 						});
+						pushBgCompletionNotification(parentNarratorId, {
+							id: subagentId,
+							title:
+								(await narratorService.getById(subagentId).catch(() => null))?.title ?? subagentId,
+							status: "failed",
+							resultPreview: (finalText || "").slice(0, 500),
+						});
 					} else {
 						eventBus.emit({
 							type: "narrator:background_task_completed",
@@ -1910,6 +1963,13 @@ async function runForegroundLoop(input: ForegroundLoopInput): Promise<string> {
 							narratorId: parentNarratorId,
 							taskNarratorId: subagentId,
 							toolUseId,
+							resultPreview: (finalText || "").slice(0, 500),
+						});
+						pushBgCompletionNotification(parentNarratorId, {
+							id: subagentId,
+							title:
+								(await narratorService.getById(subagentId).catch(() => null))?.title ?? subagentId,
+							status: "completed",
 							resultPreview: (finalText || "").slice(0, 500),
 						});
 					}

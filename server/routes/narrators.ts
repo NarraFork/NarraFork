@@ -2394,7 +2394,11 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
 		.orderBy(desc(narrators.createdAt));
 
-	return c.json(tasks);
+	// Also include in-memory background bash tasks
+	const { listBashBackgroundTasks } = await import("../lib/agent/tools/bash");
+	const bashTasks = listBashBackgroundTasks(parentNarratorId);
+
+	return c.json({ subagentTasks: tasks, bashTasks });
 });
 
 /**
@@ -2404,14 +2408,17 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	const taskId = c.req.param("taskId");
 
+	// Try subagent background task first
 	const { cancelBackgroundTask } = await import("../services/narrator-subagent");
 	const cancelled = await cancelBackgroundTask(taskId);
+	if (cancelled) return c.json({ success: true });
 
-	if (!cancelled) {
-		return c.json({ error: "Task is not running or does not exist" }, 404);
-	}
+	// Try bash background task
+	const { cancelBashBackground } = await import("../lib/agent/tools/bash");
+	const bashCancelled = cancelBashBackground(taskId);
+	if (bashCancelled) return c.json({ success: true });
 
-	return c.json({ success: true });
+	return c.json({ error: "Task is not running or does not exist" }, 404);
 });
 
 // ── Whitelist directories ──────────────────────────────────

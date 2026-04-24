@@ -181,6 +181,7 @@
 		"toolRunning": "Running",
 		"toolSuccess": "Success",
 		"toolFail": "Failed",
+		"toolCancelled": "Cancelled",
 		"projectActive": "Active",
 		"projectArchived": "Archived",
 		"edgeFork": "Fork",

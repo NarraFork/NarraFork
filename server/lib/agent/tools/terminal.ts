@@ -214,11 +214,10 @@ export const terminalTool: ToolDefinition = {
 		last_n_lines: z
 			.number()
 			.int()
-			.min(1)
 			.optional()
 			.describe(
 				"For 'read' action: only return the last N lines of the buffer (overrides incremental mode). " +
-					"When omitted, read returns only new output since the last read/write call.",
+					"Must be >= 1. When omitted, read returns only new output since the last read/write call.",
 			),
 		wait_for: z
 			.string()
@@ -264,12 +263,15 @@ export const terminalTool: ToolDefinition = {
 				if ("error" in resolved) {
 					return { output: resolved.error, isError: true };
 				}
+				// Treat last_n_lines < 1 as unset (AI models sometimes pass 0)
+				const effectiveLastN =
+					last_n_lines !== undefined && last_n_lines >= 1 ? last_n_lines : undefined;
 				return await readBuffer(
 					resolved.id,
 					ctx.narratorId,
 					ctx.chapterId,
 					ctx.signal,
-					last_n_lines,
+					effectiveLastN,
 					wait_for,
 				);
 			}

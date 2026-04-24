@@ -139,7 +139,13 @@ const containerStatusMap: StatusMap<ContainerStatus> = {
 // Tool Call Status
 // ---------------------------------------------------------------------------
 
-export type ToolCallStatus = "initializing" | "pending" | "running" | "success" | "fail";
+export type ToolCallStatus =
+	| "initializing"
+	| "pending"
+	| "running"
+	| "success"
+	| "fail"
+	| "cancelled";
 
 const toolCallStatusMap: StatusMap<ToolCallStatus> = {
 	initializing: { color: "gray", icon: "○", i18nKey: "status.toolInitializing" },
@@ -147,6 +153,7 @@ const toolCallStatusMap: StatusMap<ToolCallStatus> = {
 	running: { color: "blue", icon: "◉", i18nKey: "status.toolRunning" },
 	success: { color: "green", icon: "✓", i18nKey: "status.toolSuccess" },
 	fail: { color: "red", icon: "✗", i18nKey: "status.toolFail" },
+	cancelled: { color: "orange", icon: "⊘", i18nKey: "status.toolCancelled" },
 };
 
 // ---------------------------------------------------------------------------

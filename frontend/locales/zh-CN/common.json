@@ -181,6 +181,7 @@
 		"toolRunning": "运行中",
 		"toolSuccess": "成功",
 		"toolFail": "失败",
+		"toolCancelled": "已取消",
 		"projectActive": "活跃",
 		"projectArchived": "已归档",
 		"edgeFork": "分叉",

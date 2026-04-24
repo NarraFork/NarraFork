@@ -449,5 +449,13 @@
 	"updateConclusion": "Update conclusion",
 	"conclusionUpdated": "Conclusion updated",
 	"subagentSuspended": "Suspended — waiting for user",
-	"subagentSuspendedHint": "Open the subagent session to continue"
+	"subagentSuspendedHint": "Open the subagent session to continue",
+	"resolveOverride": "Resume",
+	"backgroundTasks": {
+		"title": "Background Tasks",
+		"cancel": "Cancel task",
+		"empty": "No background tasks",
+		"completed": "Background task completed",
+		"failed": "Background task failed"
+	}
 }

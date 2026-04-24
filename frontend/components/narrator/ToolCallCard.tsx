@@ -23,6 +23,7 @@ import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconArrowsMinimize,
+	IconBan,
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
@@ -68,7 +69,7 @@ import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { getToken } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
-import { AskUserQuestionBanner } from "./AskUserQuestionBanner";
+import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
@@ -556,11 +557,11 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			return toolName;
 		}
 		case "ask": {
-			const questions = isTruncated(input) ? undefined : input?.questions;
+			const questions = isTruncated(input) ? undefined : coerceQuestions(input?.questions);
 			const answers = isTruncated(input)
 				? undefined
 				: (input?.answers as Record<string, string> | undefined);
-			if (Array.isArray(questions) && questions.length > 0) {
+			if (questions && questions.length > 0) {
 				const header = questions[0].header ?? "Question";
 				if (answers && Object.keys(answers).length > 0) {
 					const vals = Object.values(answers);
@@ -865,6 +866,9 @@ export function StatusIcon({ status }: { status: string }) {
 	}
 	if (status === "fail") {
 		return <IconX size={12} />;
+	}
+	if (status === "cancelled") {
+		return <IconBan size={12} />;
 	}
 	return null;
 }
@@ -1526,6 +1530,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 						await
 					</Badge>
 					{awaitTaskId && <Code style={{ fontSize: 11 }}>{awaitTaskId}</Code>}
+					{isRunning && <IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />}
 					{awaitTimeout != null && (
 						<Text size="xs" c="dimmed">
 							timeout: {(awaitTimeout / 1000).toFixed(0)}s
@@ -1533,7 +1538,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					)}
 					{awaitWaitForText && (
 						<Text size="xs" c="dimmed" truncate>
-							wait_for: "{awaitWaitForText}"
+							wait_for: &quot;{awaitWaitForText}&quot;
 						</Text>
 					)}
 				</Group>
@@ -2739,8 +2744,9 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 }
 
 function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const raw = isTruncated(toolCall.inputJson) ? [] : (toolCall.inputJson?.questions ?? []);
-	const questions = Array.isArray(raw) ? raw : [];
+	const questions = isTruncated(toolCall.inputJson)
+		? []
+		: coerceQuestions(toolCall.inputJson?.questions);
 	const answers: Record<string, string> = isTruncated(toolCall.inputJson)
 		? {}
 		: (toolCall.inputJson?.answers ?? {});
@@ -2880,9 +2886,117 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	return null;
 });
 
+function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const fp = getFilePath(toolCall.inputJson);
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+	const isImage = meta?.isImage === true;
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+
+	// Image preview: fetch via /api/fs/preview (same pattern as Codex image generation)
+	const filePath = isImage ? ((meta?.filePath as string) ?? fp) : undefined;
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const [loadError, setLoadError] = useState(false);
+
+	useEffect(() => {
+		if (!filePath) return;
+		let cancelled = false;
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+		fetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, { headers })
+			.then((r) => {
+				if (!r.ok) throw new Error(r.statusText);
+				return r.blob();
+			})
+			.then((blob) => {
+				if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+			})
+			.catch(() => {
+				if (!cancelled) setLoadError(true);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [filePath]);
+
+	// Cleanup blob URL on unmount
+	useEffect(() => {
+		return () => {
+			if (blobUrl) URL.revokeObjectURL(blobUrl);
+		};
+	}, [blobUrl]);
+
+	if (isImage) {
+		const sizeKB = meta?.sizeKB as number | undefined;
+		const imageFormat = meta?.imageFormat as string | undefined;
+		return (
+			<Box mt="xs">
+				{fp && (
+					<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={fp}>
+						{fp}
+						{sizeKB != null && imageFormat && (
+							<Text span c="dimmed" ml={4}>
+								({sizeKB} KB, {imageFormat})
+							</Text>
+						)}
+					</Text>
+				)}
+				{blobUrl && !loadError && (
+					<img
+						src={blobUrl}
+						alt={fp || "image"}
+						style={{
+							maxWidth: "100%",
+							maxHeight: 400,
+							borderRadius: "var(--mantine-radius-sm)",
+							objectFit: "contain",
+							display: "block",
+						}}
+					/>
+				)}
+				{loadError && (
+					<Text size="xs" c="dimmed">
+						{outputText}
+					</Text>
+				)}
+			</Box>
+		);
+	}
+
+	// Non-image Read: show file content
+	return (
+		<Box mt="xs">
+			{fp && (
+				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={fp}>
+					{fp}
+				</Text>
+			)}
+			{toolCall.outputJson && (
+				<>
+					<ContentViewer
+						content={outputText}
+						style={codeStyle}
+						title={fp || "Read"}
+						language={fp ? getShikiLang(fp) : undefined}
+					/>
+					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+				</>
+			)}
+			{toolCall.errorMessage && !toolCall.outputJson && (
+				<Text size="xs" c="red" mt={4}>
+					{toolCall.errorMessage}
+				</Text>
+			)}
+		</Box>
+	);
+}
+
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 	const cat = getCategory(toolCall.toolName);
 	switch (cat) {
+		case "read":
+			return <ReadDetail toolCall={toolCall} />;
 		case "file":
 			return <FileDetail toolCall={toolCall} />;
 		case "bash":
@@ -3082,13 +3196,17 @@ export function InlinePermission({
 	}, [feedback, setHasFeedback, isActivePermission]);
 
 	// AskUserQuestion: render the full question form inline
-	if (permission.toolName === "AskUserQuestion" && Array.isArray(permission.inputJson?.questions)) {
+	const askQuestions =
+		permission.toolName === "AskUserQuestion"
+			? coerceQuestions(permission.inputJson?.questions)
+			: [];
+	if (permission.toolName === "AskUserQuestion" && askQuestions.length > 0) {
 		return (
 			<Box mt="xs">
 				<AskUserQuestionBanner
 					requestId={permission.id}
 					narratorId={narratorId ?? ""}
-					questions={permission.inputJson.questions}
+					questions={askQuestions}
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}
 				/>
@@ -3505,9 +3623,11 @@ export const ToolCallCard = memo(function ToolCallCard({
 		? "var(--mantine-color-yellow-6)"
 		: toolCall.status === "fail"
 			? "var(--mantine-color-red-7)"
-			: toolCall.status === "running"
-				? "var(--mantine-color-blue-7)"
-				: undefined;
+			: toolCall.status === "cancelled"
+				? "var(--mantine-color-orange-7)"
+				: toolCall.status === "running"
+					? "var(--mantine-color-blue-7)"
+					: undefined;
 
 	const permissionUI = pendingPermission ? (
 		<InlinePermission

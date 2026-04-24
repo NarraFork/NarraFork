@@ -13,6 +13,23 @@ interface Question {
 	options: { label: string; description: string }[];
 }
 
+/**
+ * Coerce a possibly-stringified questions value into a Question[].
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON from various providers
+export function coerceQuestions(raw: any): Question[] {
+	if (Array.isArray(raw)) return raw;
+	if (typeof raw === "string") {
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) return parsed;
+		} catch {
+			// not valid JSON — fall through
+		}
+	}
+	return [];
+}
+
 interface AskUserQuestionBannerProps {
 	requestId: string;
 	narratorId: string;
@@ -35,8 +52,8 @@ export function AskUserQuestionBanner({
 	onDeny,
 }: AskUserQuestionBannerProps) {
 	const { t } = useTranslation("narrator");
-	// Defensive: questions may come from untyped JSON — ensure it's always an array
-	const questions = Array.isArray(rawQuestions) ? rawQuestions : [];
+	// Defensive: questions may come from untyped JSON or as a stringified array
+	const questions = coerceQuestions(rawQuestions);
 	const draftKey = `${DRAFT_KEY_PREFIX}${requestId}`;
 	const [selections, setSelections] = useState<Record<string, string>>(() => {
 		if (readOnly) return {};

@@ -148,6 +148,12 @@ export const readTool: ToolDefinition = {
 					output: `[Image: ${file_path} (${(size / 1024).toFixed(1)} KB, ${actualFormat})]`,
 					title: file_path,
 					images: [{ format: actualFormat, base64 }],
+					metadata: {
+						isImage: true,
+						imageFormat: actualFormat,
+						filePath: resolvedPath,
+						sizeKB: Number.parseFloat((size / 1024).toFixed(1)),
+					},
 				};
 			} catch (err) {
 				return {

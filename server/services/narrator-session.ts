@@ -1128,7 +1128,27 @@ export async function runAgentLoop(
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				getInjectedUserText: () => {
-					return null;
+					let text: string | null = null;
+
+					// Background bash tasks are temporarily disabled (circuit breaker)
+
+					// Drain completed background subagent tasks
+					const { drainCompletedBackgroundSubagents } = require("./narrator-subagent");
+					const subDone = drainCompletedBackgroundSubagents(narratorId) as {
+						id: string;
+						title: string;
+						status: string;
+						resultPreview: string;
+					}[];
+					if (subDone.length > 0) {
+						const lines = subDone.map(
+							(t) =>
+								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Agent(resume: "${t.id}") to see full result or continue.`,
+						);
+						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
+					}
+
+					return text;
 				},
 				getModelOverride: () => {
 					// active.model is updated in real-time by updateNarratorModel()
