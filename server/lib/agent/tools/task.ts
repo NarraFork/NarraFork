@@ -43,7 +43,6 @@ function buildParameters() {
 			.describe("A short (3-5 word) description of the task (required when launching a new agent)"),
 		subagent_type: z
 			.string()
-			.min(1)
 			.optional()
 			.describe(
 				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
@@ -76,6 +75,13 @@ function buildParameters() {
 			.string()
 			.optional()
 			.describe("The task for the agent to perform (required when launching a new agent)"),
+		alias: z
+			.string()
+			.optional()
+			.describe(
+				'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
+					"Must be unique within the current session. If omitted, an alias is auto-generated from the description.",
+			),
 		stop: z
 			.string()
 			.optional()

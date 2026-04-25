@@ -155,6 +155,17 @@ export const exitPlanModeTool: ToolDefinition = {
 					"Omit this parameter if you already wrote the plan to the designated plan file — " +
 					"the system will read the file automatically.",
 			),
+		allowedPrompts: z
+			.array(
+				z.object({
+					tool: z.string().describe("The tool this prompt applies to"),
+					prompt: z.string().describe("Semantic description of the action"),
+				}),
+			)
+			.optional()
+			.describe(
+				"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		// The session layer (narrator-session.ts handlePermission) resolves the plan

@@ -72,16 +72,12 @@ export const readTool: ToolDefinition = {
 		file_path: z.string().describe("The absolute path to the file to read"),
 		offset: z
 			.number()
-			.int()
-			.min(1)
 			.optional()
 			.describe(
 				"The line number to start reading from. Only provide if the file is too large to read at once",
 			),
 		limit: z
 			.number()
-			.int()
-			.refine((v) => v === -1 || v >= 1, { message: "limit must be -1 or a positive integer" })
 			.optional()
 			.describe(
 				"The number of lines to read. Set to -1 to read the entire file bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
@@ -94,11 +90,23 @@ export const readTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { file_path, offset, limit } = args as {
+		const { file_path } = args as {
 			file_path: string;
 			offset?: number;
 			limit?: number;
 		};
+
+		// Coerce offset/limit to integers and clamp to sane values so that
+		// slightly-off model outputs (floats, 0, negative) don't cause hard errors.
+		const rawOffset = (args as { offset?: number }).offset;
+		const rawLimit = (args as { limit?: number }).limit;
+		const offset = rawOffset != null ? Math.max(1, Math.round(rawOffset)) : undefined;
+		const limit =
+			rawLimit != null
+				? Math.round(rawLimit) <= 0 && Math.round(rawLimit) !== -1
+					? undefined // treat 0 or negative (except -1) as "no limit"
+					: Math.round(rawLimit)
+				: undefined;
 
 		const readAll = limit === -1;
 		if (readAll && offset !== undefined) {

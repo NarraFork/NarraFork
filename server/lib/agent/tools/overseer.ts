@@ -247,17 +247,16 @@ export const getNarratorContextTool: ToolDefinition = {
 		narratorId: z.string().describe("The ID of the narrator to inspect."),
 		messageCount: z
 			.number()
-			.int()
-			.min(1)
-			.max(20)
 			.optional()
 			.describe("Number of recent messages to retrieve (default: 5, max: 20)."),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { narratorId, messageCount = 5 } = args as {
+		const { narratorId, messageCount: rawCount } = args as {
 			narratorId: string;
 			messageCount?: number;
 		};
+		// Coerce to integer, clamp to [1, 20], default 5
+		const messageCount = rawCount != null ? Math.max(1, Math.min(20, Math.round(rawCount))) : 5;
 		const locale = (ctx.locale ?? "en") as Locale;
 
 		try {

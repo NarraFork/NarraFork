@@ -72,9 +72,18 @@ export const skillTool: ToolDefinition = {
 	parameters: z.object({
 		name: z.string().optional().describe("The name of the skill to load"),
 		skill: z.string().optional().describe("The skill name (alias for name)"),
+		args: z.string().optional().describe("Optional arguments for the skill"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { name, skill } = args as { name?: string; skill?: string };
+		const {
+			name,
+			skill,
+			args: skillArgs,
+		} = args as {
+			name?: string;
+			skill?: string;
+			args?: string;
+		};
 		const skillName = skill ?? name;
 
 		if (!skillName) {
@@ -121,6 +130,11 @@ export const skillTool: ToolDefinition = {
 			}
 
 			lines.push(`Base directory for this skill: ${skillDir}`);
+
+			if (skillArgs) {
+				lines.push("");
+				lines.push(`<skill_args>${escapeXml(skillArgs)}</skill_args>`);
+			}
 
 			if (found.files.length > 0) {
 				lines.push("");
