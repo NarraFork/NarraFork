@@ -53,6 +53,7 @@ import {
 	MAX_CONTEXT_OVERFLOW_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
+import { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
@@ -1133,13 +1134,7 @@ export async function runAgentLoop(
 					// Background bash tasks are temporarily disabled (circuit breaker)
 
 					// Drain completed background subagent tasks
-					const { drainCompletedBackgroundSubagents } = require("./narrator-subagent");
-					const subDone = drainCompletedBackgroundSubagents(narratorId) as {
-						id: string;
-						title: string;
-						status: string;
-						resultPreview: string;
-					}[];
+					const subDone = drainCompletedBackgroundSubagents(narratorId);
 					if (subDone.length > 0) {
 						const lines = subDone.map(
 							(t) =>

@@ -128,43 +128,9 @@ function getConclusionWatchersMap() {
 
 // === ProxyAbortController for detach/attach ===
 
-// === Background task completion notifications for parent agent ===
-interface CompletedBgSubagentNotification {
-	id: string;
-	title: string;
-	status: string;
-	resultPreview: string;
-}
-
-let _bgCompletionQueue: Map<string, CompletedBgSubagentNotification[]> | undefined;
-function getBgCompletionQueue() {
-	if (!_bgCompletionQueue) _bgCompletionQueue = new Map();
-	return _bgCompletionQueue;
-}
-
-function pushBgCompletionNotification(
-	parentNarratorId: string,
-	notification: CompletedBgSubagentNotification,
-) {
-	const queue = getBgCompletionQueue();
-	const list = queue.get(parentNarratorId) ?? [];
-	list.push(notification);
-	queue.set(parentNarratorId, list);
-}
-
-/**
- * Drain completed background subagent notifications for a parent narrator.
- * Used by getInjectedUserText to inform the agent about completed background tasks.
- */
-export function drainCompletedBackgroundSubagents(
-	parentNarratorId: string,
-): CompletedBgSubagentNotification[] {
-	const queue = getBgCompletionQueue();
-	const list = queue.get(parentNarratorId);
-	if (!list || list.length === 0) return [];
-	queue.delete(parentNarratorId);
-	return list;
-}
+// Re-export from extracted module (no db dependency → safe to import from narrator-session)
+export { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
+import { pushBgCompletionNotification } from "./bg-completion-queue";
 
 /**
  * A proxy AbortController that forwards abort signals from one or more sources.
