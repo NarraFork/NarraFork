@@ -105,7 +105,10 @@ export function isRetryableInvalidStateReason(reason: string, message?: string):
 		// Check for HTTP status codes embedded in the message
 		if (/\b(429|500|502|503|529)\b/.test(m)) return true;
 	}
-	return false;
+	// Check user-defined custom retry rules against the invalidState reason/message
+	const obj: Record<string, unknown> = { reason, message };
+	const msgCandidates = [reason, message ?? ""].filter(Boolean);
+	return matchesCustomRetryRules(obj, msgCandidates);
 }
 
 export function isContextOverflowReason(reason: string): boolean {

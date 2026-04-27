@@ -36,6 +36,8 @@ import type { ImageRef, TextFileRef } from "../lib/uploads";
 import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundTaskService } from "./background-task-service";
+import { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
 import { gitService } from "./git-service";
 import {
 	clearStreamingSnapshot,
@@ -53,7 +55,6 @@ import {
 	MAX_CONTEXT_OVERFLOW_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
-import { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
@@ -1131,14 +1132,23 @@ export async function runAgentLoop(
 				getInjectedUserText: () => {
 					let text: string | null = null;
 
-					// Background bash tasks are temporarily disabled (circuit breaker)
-
-					// Drain completed background subagent tasks
+					// Drain completed background subagent tasks (existing mechanism)
 					const subDone = drainCompletedBackgroundSubagents(narratorId);
 					if (subDone.length > 0) {
 						const lines = subDone.map(
 							(t) =>
 								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Agent(resume: "${t.id}") to see full result or continue.`,
+						);
+						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
+					}
+
+					// Drain completed background bash tasks from unified service
+					const bashDone = backgroundTaskService.drainBashNotificationsSync(narratorId);
+					if (bashDone.length > 0) {
+						const lines = bashDone.map(
+							(t) =>
+								`[System] Background bash "${t.title || t.id}" (ID: ${t.alias ?? t.id}) ${t.status}.` +
+								`\nResult preview: ${t.outputPreview || "(empty)"}`,
 						);
 						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
 					}
@@ -2088,9 +2098,45 @@ async function feedMessage(
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
-	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
+	// --- Resolve manual_override if active ---
+	// When the user sends a message directly on a subagent page while the parent
+	// narrator is blocked in waitForManualOverride, we must resolve that Promise
+	// first. Otherwise the parent stays blocked forever while the subagent runs
+	// independently via narrator-session. We also register a ConclusionWatcher so
+	// the parent's tool_call result is updated when this independent run finishes.
 	const narrator = await narratorService.getById(narratorId);
+	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
+		const currentSubstatus = parseSubstatus(narrator.substatus);
+		if (currentSubstatus.includes("manual_override")) {
+			const { isManualOverride, resolveManualOverride, registerConclusionWatcher } = await import(
+				"./narrator-subagent"
+			);
+			if (isManualOverride(narratorId)) {
+				const currentFinalText = await getSubagentFinalText(narratorId);
+				resolveManualOverride(narratorId, currentFinalText, false);
+				// Find the parentToolUseId to register a conclusion watcher
+				const firstSubMsg = await db.query.narratorMessages.findFirst({
+					where: and(
+						eq(narratorMessages.narratorId, narratorId),
+						eq(narratorMessages.role, "user"),
+						isNotNull(narratorMessages.parentToolUseId),
+					),
+					columns: { parentToolUseId: true },
+					orderBy: narratorMessages.createdAt,
+				});
+				if (firstSubMsg?.parentToolUseId) {
+					registerConclusionWatcher(
+						narratorId,
+						narrator.parentNarratorId,
+						firstSubMsg.parentToolUseId,
+					);
+				}
+			}
+		}
+	}
+
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 	}
@@ -2242,6 +2288,11 @@ export async function retryLastMessage(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ ok: boolean }> {
+	// Check if this is a subagent — subagent messages all have parentToolUseId
+	// set, so we must not filter on isNull(parentToolUseId) for them.
+	const narrator = await narratorService.getById(narratorId);
+	const isSubagent = isSubagentVariant(narrator.variant);
+
 	// Find the last top-level message via refs
 	const lastRef = await db
 		.select({
@@ -2253,7 +2304,7 @@ export async function retryLastMessage(
 		.where(
 			and(
 				eq(narratorMessageRefs.narratorId, narratorId),
-				isNull(narratorMessages.parentToolUseId),
+				isSubagent ? undefined : isNull(narratorMessages.parentToolUseId),
 				inArray(narratorMessages.role, ["user", "assistant"]),
 			),
 		)
@@ -2325,7 +2376,15 @@ export async function continueNarrator(
 ): Promise<{ ok: boolean }> {
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
-	const msgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+	const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+
+	// Subagent messages all have parentToolUseId set — clear it so
+	// getLastContinuableTopLevelMessage can find them (same as runAgentLoop).
+	const narrator = await narratorService.getById(narratorId);
+	const msgs = isSubagentVariant(narrator.variant)
+		? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
+		: rawMsgs;
+
 	const lastTopLevelMessage = getLastContinuableTopLevelMessage(msgs);
 	const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
 

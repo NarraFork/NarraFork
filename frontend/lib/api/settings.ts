@@ -137,7 +137,7 @@ export const settingsApi = {
 
 	// Recent Tabs
 	upsertRecentTab: (tab: {
-		type: "chapter" | "narrator" | "project" | "workspace";
+		type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
 		id: string;
 		narratorId?: string;
 		workspaceId?: string | null;
@@ -151,7 +151,10 @@ export const settingsApi = {
 			method: "PUT",
 			body: JSON.stringify(tab),
 		}),
-	removeRecentTab: (type: "chapter" | "narrator" | "project" | "workspace", id: string) =>
+	removeRecentTab: (
+		type: "chapter" | "narrator" | "project" | "workspace" | "subagent",
+		id: string,
+	) =>
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
 			method: "DELETE",
 		}),

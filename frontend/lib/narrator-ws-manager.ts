@@ -117,6 +117,13 @@ class NarratorWSManager {
 	// --- Connection change callbacks ---
 	private connectionChangeCallbacks = new Set<ConnectionChangeCallback>();
 
+	// --- Microtask dispatch batching ---
+	// Non-latency-sensitive messages are queued and flushed in a single
+	// microtask so that multiple WS frames arriving in the same event-loop
+	// turn only trigger one round of listener callbacks.
+	private pendingDispatchQueue: Record<string, unknown>[] = [];
+	private dispatchScheduled = false;
+
 	// -----------------------------------------------------------------------
 	// ID allocation (for presence handles etc.)
 	// -----------------------------------------------------------------------
@@ -231,6 +238,8 @@ class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
+				this.pendingSubscribeIds.delete(nId);
+				this.messageVersions.delete(nId);
 				// Keep lastMessageId so that re-subscribe (page navigation back)
 				// can still trigger server-side catch-up.
 				removedIds.push(nId);
@@ -260,7 +269,9 @@ class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
+				this.pendingSubscribeIds.delete(nId);
 				this.lastMessageIds.delete(nId);
+				this.messageVersions.delete(nId);
 				actuallyRemoved.push(nId);
 			}
 		}
@@ -708,7 +719,43 @@ class NarratorWSManager {
 		}
 	}
 
+	// Message types that are latency-sensitive and must be dispatched immediately
+	// (they already have their own RAF-based batching in consumers).
+	private static IMMEDIATE_TYPES = new Set([
+		"stream_event",
+		"tool_use_chunk",
+		"message",
+		"user_message",
+	]);
+
 	private _dispatch(data: Record<string, unknown>): void {
+		const msgType = data.type as string | undefined;
+
+		// Latency-sensitive messages (streaming) are dispatched immediately —
+		// their consumers already have RAF-based batching.
+		if (msgType && NarratorWSManager.IMMEDIATE_TYPES.has(msgType)) {
+			this._dispatchImmediate(data);
+			return;
+		}
+
+		// Non-latency-sensitive messages are queued and flushed together
+		// in a microtask, so multiple WS frames in the same event-loop turn
+		// only trigger one round of listener callbacks.
+		this.pendingDispatchQueue.push(data);
+		if (!this.dispatchScheduled) {
+			this.dispatchScheduled = true;
+			queueMicrotask(() => {
+				this.dispatchScheduled = false;
+				const queue = this.pendingDispatchQueue;
+				this.pendingDispatchQueue = [];
+				for (const msg of queue) {
+					this._dispatchImmediate(msg);
+				}
+			});
+		}
+	}
+
+	private _dispatchImmediate(data: Record<string, unknown>): void {
 		const msgType = data.type as string | undefined;
 		const narratorId = data.narratorId as string | undefined;
 

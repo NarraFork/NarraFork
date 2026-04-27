@@ -910,7 +910,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				if (data?.id) {
 					const narrators = await api.listNarrators({ chapterId: data.id });
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-					const primary = narrators?.find((n: any) => n.type === "primary");
+					const primary = narrators?.find((n: any) => n.variant === "primary");
 					if (primary?.id) {
 						addRecentTab({
 							type: "chapter",

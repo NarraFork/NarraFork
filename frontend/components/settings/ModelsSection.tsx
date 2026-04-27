@@ -97,17 +97,15 @@ export function ModelsSection({
 		if (subagentPlanModel && !validValues.has(subagentPlanModel)) {
 			setSubagentPlanModel("");
 		}
-		if (summaryModel && !validValues.has(summaryModel)) {
-			setSummaryModel("");
-		}
+		// Don't clear summaryModel when it's not in the available list —
+		// the provider may not be loaded yet, or the user hasn't configured credentials.
+		// Clearing it causes a validation error on save (empty string).
 	}, [
 		validValues,
 		subagentExploreModel,
 		setSubagentExploreModel,
 		subagentPlanModel,
 		setSubagentPlanModel,
-		summaryModel,
-		setSummaryModel,
 	]);
 
 	return (

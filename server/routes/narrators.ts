@@ -2377,7 +2377,12 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
  */
 narratorRoutes.get("/:id/background-tasks", async (c) => {
 	const parentNarratorId = c.req.param("id");
-	const tasks = await db
+	const { backgroundTaskService } = await import("../services/background-task-service");
+	const tasks = await backgroundTaskService.listByParent(parentNarratorId);
+
+	// Also include legacy agent background tasks from narrators table
+	// (for tasks created before the migration)
+	const legacyTasks = await db
 		.select({
 			id: narrators.id,
 			subagentType: narrators.subagentType,
@@ -2389,16 +2394,14 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 			title: narrators.title,
 		})
 		.from(narrators)
-		// NOTE: uses legacy isBackground column for efficient SQL filtering;
-		// kept in sync with traits["background"] on write.
 		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
 		.orderBy(desc(narrators.createdAt));
 
-	// Also include in-memory background bash tasks
-	const { listBashBackgroundTasks } = await import("../lib/agent/tools/bash");
-	const bashTasks = listBashBackgroundTasks(parentNarratorId);
+	// Filter out legacy tasks that already exist in the unified table
+	const unifiedIds = new Set(tasks.map((t) => t.id));
+	const filteredLegacy = legacyTasks.filter((t) => !unifiedIds.has(t.id));
 
-	return c.json({ subagentTasks: tasks, bashTasks });
+	return c.json({ tasks, legacySubagentTasks: filteredLegacy });
 });
 
 /**
@@ -2408,17 +2411,35 @@ narratorRoutes.get("/:id/background-tasks", async (c) => {
 narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	const taskId = c.req.param("taskId");
 
-	// Try subagent background task first
-	const { cancelBackgroundTask } = await import("../services/narrator-subagent");
-	const cancelled = await cancelBackgroundTask(taskId);
+	// Try unified background task service first
+	const { backgroundTaskService } = await import("../services/background-task-service");
+	const cancelled = await backgroundTaskService.cancel(taskId);
 	if (cancelled) return c.json({ success: true });
 
-	// Try bash background task
-	const { cancelBashBackground } = await import("../lib/agent/tools/bash");
-	const bashCancelled = cancelBashBackground(taskId);
-	if (bashCancelled) return c.json({ success: true });
+	// Fall back to legacy agent background task
+	const { cancelBackgroundTask } = await import("../services/narrator-subagent");
+	const legacyCancelled = await cancelBackgroundTask(taskId);
+	if (legacyCancelled) return c.json({ success: true });
 
 	return c.json({ error: "Task is not running or does not exist" }, 404);
+});
+
+/**
+ * GET /api/narrators/:id/background-tasks/:taskId/output
+ * Get full output of a background bash task.
+ */
+narratorRoutes.get("/:id/background-tasks/:taskId/output", async (c) => {
+	const narratorId = c.req.param("id");
+	const taskId = c.req.param("taskId");
+	const { backgroundTaskService } = await import("../services/background-task-service");
+	const task = await backgroundTaskService.getById(taskId);
+	if (!task) {
+		return c.json({ error: "Task not found" }, 404);
+	}
+	if (task.parentNarratorId !== narratorId) {
+		return c.json({ error: "Task does not belong to this narrator" }, 403);
+	}
+	return c.json({ output: task.output, status: task.status });
 });
 
 // ── Whitelist directories ──────────────────────────────────

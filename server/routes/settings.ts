@@ -134,7 +134,7 @@ const updateSettingsSchema = z
 			.object({
 				defaultModel: z.string().min(1),
 				defaultPermissionMode: z.string().min(1),
-				summaryModel: z.string().min(1),
+				summaryModel: z.string(),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
 				maxTurns: z.number().int().min(1).max(1000),

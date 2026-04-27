@@ -20,6 +20,12 @@ import {
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	createContainer,
+	destroyContainer,
+	ensureImage,
+	execInContainer,
+} from "./benchmark-container";
 import { agencybenchEvaluator } from "./benchmark-evaluators/agencybench";
 import { humanevalEvaluator } from "./benchmark-evaluators/humaneval";
 import { swebenchEvaluator } from "./benchmark-evaluators/swe-bench";
@@ -231,6 +237,12 @@ async function executeTask(
 
 	// Create temp working directory
 	const workDir = await mkdtemp(join(tmpdir(), `nf-bench-${task.id}-`));
+	let containerId: string | undefined;
+
+	// Determine if this is a SWE-bench task that needs container isolation
+	const suite = run.suiteId ? await getSuite(run.suiteId) : null;
+	const isSWEBench = suite?.name === "swe-bench";
+	const meta = (task.metadata ?? {}) as Record<string, unknown>;
 
 	try {
 		// Update status to running
@@ -238,6 +250,64 @@ async function executeTask(
 			.update(benchmarkTaskResults)
 			.set({ status: "running", startedAt: now })
 			.where(eq(benchmarkTaskResults.id, taskResultId));
+
+		// === SWE-bench container setup ===
+		if (isSWEBench && meta.repo && meta.baseCommit) {
+			const dockerImage = (meta.dockerImage as string) ?? "python:3.9-slim";
+			const repo = meta.repo as string;
+			const baseCommit = meta.baseCommit as string;
+			const installCmd = (meta.installCmd as string) ?? "python -m pip install -e .";
+			const preInstall = (meta.preInstall as string[]) ?? [];
+			const pipPackages = (meta.pipPackages as string[]) ?? [];
+
+			logger.info("Setting up SWE-bench container", { taskId: task.id, repo, image: dockerImage });
+
+			// Ensure image is available
+			await ensureImage(dockerImage);
+
+			// Create container with workDir bind-mounted
+			containerId = await createContainer({
+				image: dockerImage,
+				hostDir: workDir,
+				containerDir: "/testbed",
+				name: `nf-swe-${task.id.replace(/[^a-zA-Z0-9_-]/g, "-")}-${Date.now()}`,
+				memoryLimit: "4g",
+			});
+
+			// Install git and clone repo inside container
+			const setupScript = [
+				"set -e",
+				"apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1",
+				...preInstall,
+				`git clone https://github.com/${repo}.git /testbed_repo`,
+				`cd /testbed_repo && git reset --hard ${baseCommit}`,
+				// Copy repo contents to /testbed (the bind-mounted dir)
+				"cp -a /testbed_repo/. /testbed/",
+				"rm -rf /testbed_repo",
+				"cd /testbed",
+				...(pipPackages.length > 0 ? [`pip install ${pipPackages.join(" ")} 2>&1 | tail -3`] : []),
+				`${installCmd} 2>&1 | tail -5`,
+			].join("\n");
+
+			const setupResult = await execInContainer(
+				containerId,
+				`bash -c '${setupScript.replace(/'/g, "'\\''")}'`,
+				300_000,
+			);
+			if (setupResult.exitCode !== 0) {
+				logger.warn("SWE-bench container setup had errors", {
+					taskId: task.id,
+					exitCode: setupResult.exitCode,
+					stderr: setupResult.stderr.slice(0, 500),
+				});
+				// Don't fail — some install warnings are non-fatal
+			}
+
+			// Inject containerId into task metadata so evaluator can use it
+			(task.metadata as Record<string, unknown>).containerId = containerId;
+
+			logger.info("SWE-bench container ready", { taskId: task.id, containerId });
+		}
 
 		// Create a standalone narrator for this task
 		const narrator = await narratorService.create({
@@ -304,10 +374,11 @@ async function executeTask(
 		}
 
 		// Run evaluator — check suite name, then task metadata, then fallback
-		const suite = await getSuite(run.suiteId);
-		const evaluatorName = evaluators.has(suite?.name ?? "")
-			? suite!.name
-			: ((task.metadata as { evaluator?: string })?.evaluator ?? "humaneval");
+		const suiteName = suite?.name;
+		const evaluatorName =
+			suiteName && evaluators.has(suiteName)
+				? suiteName
+				: ((task.metadata as { evaluator?: string })?.evaluator ?? "humaneval");
 		const evaluator = evaluators.get(evaluatorName);
 
 		let evalResult: EvalResult = {
@@ -359,6 +430,14 @@ async function executeTask(
 			})
 			.where(eq(benchmarkTaskResults.id, taskResultId));
 	} finally {
+		// Cleanup container (best-effort)
+		if (containerId) {
+			try {
+				await destroyContainer(containerId);
+			} catch {
+				// ignore
+			}
+		}
 		// Cleanup temp dir (best-effort)
 		try {
 			rmSync(workDir, { recursive: true, force: true });

@@ -35,7 +35,11 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
-import { getConclusionFileId, resolveConclusionFilePath } from "./subagent-conclusion";
+import {
+	getConclusionEntry,
+	getConclusionFileId,
+	resolveConclusionFilePath,
+} from "./subagent-conclusion";
 
 // === Permission handling ===
 
@@ -408,6 +412,18 @@ export function resolvePermissionDecision(
 	if (effectiveMode === "bypassPermissions") return "allow";
 	if (effectiveMode === "dontAsk") return "deny";
 
+	// Conclusion file: always allow Write/Edit targeting the designated conclusion file,
+	// regardless of permission mode. This handles the fallback case where the conclusion
+	// file lives outside cwd (e.g. ~/.narrafork/conclusions/) because cwd is read-only.
+	if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
+		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		if (filePath) {
+			const absPath = resolvePath(cwd, filePath);
+			const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
+			if (pathsEqual(absPath, conclusionPath)) return "allow";
+		}
+	}
+
 	// readOnly mode
 	if (effectiveMode === "readOnly") {
 		if (READ_ONLY_TOOLS.includes(toolName)) {
@@ -428,14 +444,6 @@ export function resolvePermissionDecision(
 			);
 			if (externalBashPaths.length > 0) return "deny";
 			return "allow";
-		}
-		if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
-			const filePath = typeof input.file_path === "string" ? input.file_path : "";
-			if (filePath) {
-				const absPath = resolvePath(cwd, filePath);
-				const conclusionPath = resolveConclusionFilePath(cwd, conclusionFileId);
-				if (pathsEqual(absPath, conclusionPath)) return "allow";
-			}
 		}
 		return "deny";
 	}
@@ -520,7 +528,14 @@ function resolveBlacklistDecision(
 	return reason ? { decision: "deny", reason } : null;
 }
 
-const ALWAYS_ALLOW_TOOLS = ["TaskCreate", "EnterPlanMode", "WebSearch", "ContinueTask", "Skill"];
+const ALWAYS_ALLOW_TOOLS = [
+	"TaskCreate",
+	"EnterPlanMode",
+	"WebSearch",
+	"ContinueTask",
+	"AwaitBackgroundTask",
+	"Skill",
+];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -533,7 +548,7 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 ];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
-const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile"];
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile", "AwaitBackgroundTask"];
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
@@ -860,14 +875,13 @@ export async function handlePermission(
 
 	// Conclusion file redirect
 	let conclusionRedirectNotice: string | undefined;
-	const subagentConcFileId = getConclusionFileId(narratorId);
-	if (subagentConcFileId && (toolName === "Write" || toolName === "Edit")) {
+	const subagentConcEntry = getConclusionEntry(narratorId);
+	if (subagentConcEntry && (toolName === "Write" || toolName === "Edit")) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-		const conclusionRelPath = `.narrafork/conclusion-${subagentConcFileId}.md`;
+		const conclusionRelPath = subagentConcEntry.relPath;
 		if (filePath) {
 			const absPath = resolvePath(cwd, filePath);
-			const conclusionAbsPath = resolveConclusionFilePath(cwd, subagentConcFileId);
-			if (!pathsEqual(absPath, conclusionAbsPath)) {
+			if (!pathsEqual(absPath, subagentConcEntry.absPath)) {
 				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
 				conclusionRedirectNotice =
 					`File path redirected: "${filePath}" → "${conclusionRelPath}". ` +

@@ -66,10 +66,26 @@ const INSTALL_COMMANDS: Record<string, Record<string, string>> = {
 
 // ── Package-manager detection ────────────────────────────────────────────────
 
+/**
+ * Check if a command exists on Windows.
+ * `Bun.which()` can fail for UWP app execution aliases (e.g. winget) because
+ * they are zero-byte reparse-point files in WindowsApps. Fall back to `where`
+ * which resolves them correctly.
+ */
+function winWhich(name: string): boolean {
+	if (Bun.which(name)) return true;
+	try {
+		const result = execSync(`where ${name}`, { encoding: "utf-8", stdio: "pipe", timeout: 5000 });
+		return result.trim().length > 0;
+	} catch {
+		return false;
+	}
+}
+
 function detectPackageManager(): string | undefined {
 	if (IS_WINDOWS) {
 		for (const pm of ["winget", "scoop", "choco"]) {
-			if (Bun.which(pm)) return pm;
+			if (winWhich(pm)) return pm;
 		}
 		return undefined;
 	}
@@ -178,16 +194,18 @@ function checkByName(name: string): DependencyInfo {
 
 function checkAll(): DependencyCheckResult {
 	let deps = [checkGit(), checkRg(), checkDtach()];
-	// On Windows the inherited PATH may be stale — if any tool is missing,
-	// refresh PATH from the registry and re-check the missing ones.
-	if (IS_WINDOWS && deps.some((d) => !d.installed)) {
+	let pm = detectPackageManager();
+	// On Windows the inherited PATH may be stale — if any tool or the package
+	// manager is missing, refresh PATH from the registry and re-detect.
+	if (IS_WINDOWS && (deps.some((d) => !d.installed) || !pm)) {
 		if (refreshWindowsPath()) {
 			deps = deps.map((d) => (d.installed ? d : checkByName(d.name)));
+			if (!pm) pm = detectPackageManager();
 		}
 	}
 	return {
 		platform: getPlatform(),
-		packageManager: detectPackageManager(),
+		packageManager: pm,
 		dependencies: deps,
 		allRequiredMet: deps.filter((d) => d.required).every((d) => d.installed),
 	};
@@ -201,7 +219,12 @@ async function install(
 		return { ok: false, error: `Unknown dependency: ${name}` };
 	}
 
-	const pm = detectPackageManager();
+	let pm = detectPackageManager();
+	// On Windows, try refreshing PATH if no package manager found
+	if (!pm && IS_WINDOWS) {
+		refreshWindowsPath();
+		pm = detectPackageManager();
+	}
 	if (!pm || !commands[pm]) {
 		return {
 			ok: false,

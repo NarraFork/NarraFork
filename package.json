@@ -108,7 +108,7 @@
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
 		"format": "bunx @biomejs/biome check --write .",
 		"start": "NODE_ENV=production bun run db:migrate && NODE_ENV=production bun server/index.ts",
-		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts",
+		"start:dev": "NODE_ENV=production bun run db:migrate && (NODE_ENV=production bun server/index.ts &) && VITE_PORT=41221 BACKEND_PORT=7778 bunx vite --config frontend/vite.config.ts --mode production",
 		"test": "bun test",
 		"typecheck": "tsgo --noEmit",
 		"test:watch": "bun test --watch"

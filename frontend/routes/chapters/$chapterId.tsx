@@ -27,7 +27,7 @@ function ChapterRedirect() {
 
 		// 找到 primary narrator
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const primary = narrators.find((n: any) => n.type === "primary");
+		const primary = narrators.find((n: any) => n.variant === "primary");
 		if (primary) {
 			navigate({
 				to: "/narrators/$narratorId",

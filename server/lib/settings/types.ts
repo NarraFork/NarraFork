@@ -355,6 +355,7 @@ export interface NarraForkSettings {
 		credentialsPath: string;
 		configPath: string;
 		defaultModel?: string;
+		proxy?: string;
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.

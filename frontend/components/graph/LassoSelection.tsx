@@ -128,6 +128,8 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 			onSelectRef.current(selectedIds);
 		};
 
+		let clickBlockerCleanup: (() => void) | null = null;
+
 		const doStop = () => {
 			if (!drawingRef.current) return;
 			drawingRef.current = false;
@@ -138,13 +140,22 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 
 			// After lasso ends, mouseup triggers a click on the pane which
 			// causes React Flow to deselect all nodes. Block that click.
+			clickBlockerCleanup?.();
 			const blocker = (e: Event) => {
 				e.stopPropagation();
 				e.preventDefault();
 			};
 			el.addEventListener("click", blocker, { capture: true, once: true });
 			// Safety: remove if it didn't fire (e.g. touch path)
-			setTimeout(() => el.removeEventListener("click", blocker, { capture: true }), 100);
+			const timer = setTimeout(() => {
+				el.removeEventListener("click", blocker, { capture: true });
+				clickBlockerCleanup = null;
+			}, 100);
+			clickBlockerCleanup = () => {
+				clearTimeout(timer);
+				el.removeEventListener("click", blocker, { capture: true });
+				clickBlockerCleanup = null;
+			};
 		};
 
 		const beginLasso = (x: number, y: number) => {
@@ -229,6 +240,7 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 		return () => {
 			el.removeEventListener("mousedown", onMouseDown);
 			document.removeEventListener("contextmenu", onContextMenu, { capture: true });
+			clickBlockerCleanup?.();
 			// Safety: remove drawing listeners in case unmount happens mid-draw
 			removeDrawingListeners();
 		};

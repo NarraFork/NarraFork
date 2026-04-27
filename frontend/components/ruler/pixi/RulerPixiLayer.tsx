@@ -35,6 +35,17 @@ import {
 import type { PixiTheme } from "./pixi-theme";
 import { invalidatePixiThemeCache, resolvePixiTheme, themeStatusColor } from "./pixi-theme";
 
+function destroyPixiApplication(app: Application): void {
+	// Workaround for PixiJS v8 ResizePlugin bug: destroy() calls
+	// _cancelResize() which may not exist when resizeTo is undefined.
+	// biome-ignore lint/suspicious/noExplicitAny: PixiJS ResizePlugin internal
+	const pixiApp = app as any;
+	if (typeof pixiApp._cancelResize !== "function") {
+		pixiApp._cancelResize = () => {};
+	}
+	app.destroy(true, { children: true });
+}
+
 // Reusable buffers to avoid per-frame allocations in redraw.
 // Module-level is safe because only one RulerPixiLayer instance exists at a time
 // and redraw() is synchronous.
@@ -312,7 +323,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		});
 
 		initPromise.then(() => {
-			if (destroyed) return; // Component unmounted before init finished — skip setup
+			if (destroyed) {
+				destroyPixiApplication(app);
+				return;
+			}
 			appRef.current = app;
 
 			// Use latest dimensions from dataRef (init closure may have stale values)
@@ -389,17 +403,10 @@ export const RulerPixiLayer = memo(function RulerPixiLayer({
 		return () => {
 			destroyed = true;
 			cancelAnimationFrame(panelAnimRafRef.current);
-			// Only destroy if init completed and app was fully set up
+			// Only destroy if init completed and app was fully set up. If init is
+			// still pending, the then() handler above will destroy the late app.
 			if (appRef.current) {
-				// Workaround for PixiJS v8 ResizePlugin bug: destroy() calls
-				// _cancelResize() which may not exist when resizeTo is undefined.
-				// See: https://github.com/pixijs/pixijs/issues/10pointer (v8.x)
-				// biome-ignore lint/suspicious/noExplicitAny: PixiJS ResizePlugin internal
-				const app = appRef.current as any;
-				if (typeof app._cancelResize !== "function") {
-					app._cancelResize = () => {};
-				}
-				appRef.current.destroy(true, { children: true });
+				destroyPixiApplication(appRef.current);
 			}
 			appRef.current = null;
 		};

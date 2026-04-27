@@ -82,6 +82,9 @@ export interface UseNarratorPanelWSOptions {
 	narratorTodosToolUseId?: string | null;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for ContinueTask */
 	isSubagent?: boolean;
+	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
+	 *  substatus survives page navigation (the WS-only path starts from []). */
+	narratorSubstatus?: string[];
 }
 
 export interface UseNarratorPanelWSReturn {
@@ -214,6 +217,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorTodosJson,
 		narratorTodosToolUseId,
 		isSubagent,
+		narratorSubstatus,
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -274,12 +278,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const toolStreamingFieldRef = useRef<Map<string, { name: string; value: string }>>(new Map());
 	const toolChunkRafRef = useRef(0);
 
-	// Cancel pending RAF handles on unmount
+	// Cancel pending RAF handles and clear module-level streaming caches on unmount.
 	useEffect(() => {
 		return () => {
 			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
 			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
 			if (cacheUpdateRafRef.current) cancelAnimationFrame(cacheUpdateRafRef.current);
+			streamingBlocksRef.current = [];
+			pendingToolChunkRef.current.clear();
+			toolStreamingFieldRef.current.clear();
+			clearToolBlockCache();
 		};
 	}, []);
 
@@ -418,6 +426,28 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId,
 		prunedPercent,
 	} = statusState;
+
+	// --- Seed substatus from persisted narrator data ---
+	// The reducer starts with substatus=[] and is normally updated via WS events.
+	// When the user navigates away and back, the WS may not re-emit a status_change
+	// for an idle narrator, so the substatus stays []. Seed it from the server data
+	// once on mount so that "Update Conclusion" and other substatus-dependent UI
+	// survives page navigation.
+	const substatusSeededRef = useRef(false);
+	useEffect(() => {
+		if (substatusSeededRef.current) return;
+		if (!narratorSubstatus?.length) return;
+		// Only seed for non-active states — active states get real-time WS updates
+		if (narratorStatus === "working" || narratorStatus === "waiting") return;
+		dispatchStatus({ type: "patch", payload: { substatus: narratorSubstatus } });
+		substatusSeededRef.current = true;
+	}, [narratorSubstatus, narratorStatus]);
+	// Reset seed flag when narrator changes so the next narrator's substatus is seeded.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	useEffect(() => {
+		substatusSeededRef.current = false;
+	}, [narratorId]);
+
 	const setContextPercent = useCallback(
 		(v: React.SetStateAction<number | null>) => {
 			dispatchStatus({
@@ -1096,8 +1126,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							(m.contentText === newMsg.contentText ||
 								(m.commandText && newMsg.commandText && m.commandText === newMsg.commandText) ||
 								(m.contentText &&
-									newMsg.contentText &&
-									newMsg.contentText.startsWith(m.contentText) &&
+									newMsg.contentText?.startsWith(m.contentText) &&
 									newMsg.contentText.includes("<attached_files>"))),
 					);
 					if (optimisticIdx !== -1) {
@@ -1853,6 +1882,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Clean up any residual streaming chunks from before the disconnect
 				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
+				// When catch-up brings persisted top-level messages, clear stale streaming
+				// text blocks that were restored from streaming_snapshot — the same content
+				// is now in the persisted messages.  If the narrator is still streaming,
+				// new stream_event frames will repopulate streamingBlocksRef immediately.
+				if (topLevel.length > 0) {
+					streamingBlocksRef.current = [];
+					clearStreamingState();
+				}
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					let result: MessagesQueryData = old;
@@ -1937,6 +1974,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 					return result;
 				});
+				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 				notifications.show({
 					title: t("backgroundTasks.completed"),
 					message: resultPreview?.slice(0, 100) || "",
@@ -1964,6 +2002,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 					return result;
 				});
+				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 				notifications.show({
 					title: t("backgroundTasks.failed"),
 					message: error?.slice(0, 100) || "",
@@ -1982,6 +2021,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						toolUseIndexRef.current,
 					);
 				});
+				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+			},
+			onBackgroundTaskStatusChanged: () => {
+				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
+			},
+			onBackgroundTaskOutput: () => {
+				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
 			},
 			onPresenceUpdate: (v) => {
 				setViewers(v);
@@ -2127,6 +2173,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		// Skip this for bounded around-windows, where refetching would still keep a
 		// truncated view and only add network churn.
 		if (isReconnect && narratorStatus !== "working" && !firstPageHasMoreAfter) {
+			// Clear stale streaming state — the narrator is no longer working so any
+			// leftover streamingBlocksRef content from a previous streaming_snapshot
+			// would duplicate text that is now in the persisted messages.
+			streamingBlocksRef.current = [];
+			cancelPendingToolChunks(true, true);
+			clearStreamingState();
 			qc.invalidateQueries({ queryKey: messagesQueryKey });
 		}
 

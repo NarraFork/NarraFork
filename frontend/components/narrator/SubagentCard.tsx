@@ -176,10 +176,7 @@ export const SubagentCard = memo(
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
 		const prompt = input.prompt ?? "";
 		const promptHasLineBreak = prompt.includes("\n");
-		const [promptFitsOneLine, setPromptFitsOneLine] = useState(false);
-		const promptSummaryRef = useRef<HTMLParagraphElement | null>(null);
-		const promptShownInHeader =
-			!input.description && !!prompt && !promptHasLineBreak && promptFitsOneLine;
+		const promptShownInHeader = !input.description && !!prompt && !promptHasLineBreak;
 		const description =
 			input.description ??
 			(promptShownInHeader ? prompt : input.prompt?.slice(0, 80)) ??
@@ -194,25 +191,6 @@ export const SubagentCard = memo(
 		const scrollBoxRef = useRef<HTMLDivElement>(null);
 		const vpHeight = useNearestScrollContainerHeight(cardRef, 0.7);
 		const prevChildCount = useRef(childMessages.length);
-		useEffect(() => {
-			if (!prompt || promptHasLineBreak) {
-				setPromptFitsOneLine(false);
-				return;
-			}
-			const node = promptSummaryRef.current;
-			if (!node) return;
-			const parent = node.offsetParent as HTMLElement | null;
-			if (!parent) return;
-			const evaluate = () => {
-				const availableWidth = Math.max(parent.clientWidth - 24, 0);
-				const isSingleLine = node.scrollWidth <= availableWidth + 1;
-				setPromptFitsOneLine(isSingleLine);
-			};
-			evaluate();
-			const resizeObserver = new ResizeObserver(evaluate);
-			resizeObserver.observe(parent);
-			return () => resizeObserver.disconnect();
-		}, [prompt, promptHasLineBreak]);
 		useEffect(() => {
 			const el = scrollBoxRef.current;
 			if (!el) return;
@@ -695,24 +673,6 @@ export const SubagentCard = memo(
 							{!expanded && isTerminal && resultText && (
 								<Text size="xs" c="dimmed" mt={2} ml={21} truncate opacity={0.7}>
 									→ {resultText.slice(0, 120)}
-								</Text>
-							)}
-							{prompt && !input.description && !promptHasLineBreak && (
-								<Text
-									ref={promptSummaryRef}
-									size="xs"
-									c="dimmed"
-									mt={2}
-									ml={21}
-									lineClamp={1}
-									style={{
-										opacity: 0,
-										position: "absolute",
-										pointerEvents: "none",
-										maxWidth: "calc(100% - 21px)",
-									}}
-								>
-									{prompt}
 								</Text>
 							)}
 						</UnstyledButton>

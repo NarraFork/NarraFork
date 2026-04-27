@@ -83,26 +83,22 @@ function collectLicenses() {
 
 const licenseData = collectLicenses();
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
 	const isDev = mode === "development";
+	const isServe = command === "serve";
 	const appName = isDev ? "NarraFork Dev" : "NarraFork";
 	const shortName = isDev ? "NarraFork Dev" : "NarraFork";
 
 	return {
 		root: resolve(__dirname),
-		define: isDev
-			? {
-					__DEV_VITE_PORT__: JSON.stringify(vitePort),
-					__DEV_BACKEND_PORT__: JSON.stringify(backendPort),
-					__APP_VERSION__: JSON.stringify(appVersion),
-					__LICENSE_DATA__: JSON.stringify(licenseData),
-				}
-			: {
-					__DEV_VITE_PORT__: "undefined",
-					__DEV_BACKEND_PORT__: "undefined",
-					__APP_VERSION__: JSON.stringify(appVersion),
-					__LICENSE_DATA__: JSON.stringify(licenseData),
-				},
+		define: {
+			// Inject dev ports whenever running the dev server (regardless of mode)
+			// so that WS URL rewriting works in start:dev (production mode + vite serve)
+			__DEV_VITE_PORT__: isServe ? JSON.stringify(vitePort) : "undefined",
+			__DEV_BACKEND_PORT__: isServe ? JSON.stringify(backendPort) : "undefined",
+			__APP_VERSION__: JSON.stringify(appVersion),
+			__LICENSE_DATA__: JSON.stringify(licenseData),
+		},
 		plugins: [
 			TanStackRouterVite({
 				target: "react",

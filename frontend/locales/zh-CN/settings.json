@@ -939,5 +939,21 @@
 	"gatewaySave": "保存并应用",
 	"gatewaySaving": "保存中…",
 	"gatewaySaveSuccess": "Gateway 配置已保存",
-	"gatewayReloading": "正在重启受影响的平台…"
+	"gatewayReloading": "正在重启受影响的平台…",
+	"proxyManagementSection": "代理管理",
+	"proxyManagementDesc": "集中管理所有供应商和服务的代理配置",
+	"proxyCodexTitle": "Codex",
+	"proxyAnthropicTitle": "Anthropic",
+	"proxyWebFetchTitle": "WebFetch",
+	"proxyNotConfigured": "未配置",
+	"proxyConfigured": "已配置",
+	"proxySaved": "代理已保存",
+	"proxySave": "保存",
+	"proxyPlaceholder": "例如 http://127.0.0.1:7890、socks5://proxy:1080",
+	"proxyDirectConnection": "直连（不使用代理）",
+	"proxyProviderDesc_codex": "用于所有 Codex OAuth 认证和 API 请求的代理。",
+	"proxyProviderDesc_anthropic": "按实例配置的代理，在供应商设置中管理。",
+	"proxyProviderDesc_webfetch": "用于 WebFetch HTTP 请求和浏览器页面抓取的代理。",
+	"proxyGoToProviderSettings": "前往供应商设置",
+	"proxyGoToAgentSettings": "前往代理设置"
 }

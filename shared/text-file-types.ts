@@ -102,8 +102,8 @@ export const TEXT_FILE_EXTENSIONS = new Set([
 	"diff",
 ]);
 
-/** Max text file upload size in bytes (10 MB). */
-export const MAX_TEXT_FILE_SIZE = 10 * 1024 * 1024;
+/** Max text file upload size in bytes (100 MB). */
+export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024;
 
 /**
  * Check whether a filename is an allowed text/code file.

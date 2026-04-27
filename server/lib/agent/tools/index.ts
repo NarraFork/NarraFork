@@ -1,6 +1,7 @@
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
+import { awaitBackgroundTaskTool } from "./await-background-task";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
@@ -80,6 +81,7 @@ const coreProvider: ToolProvider = {
 			exitPlanModeTool,
 			agentTool,
 			continueTaskTool,
+			awaitBackgroundTaskTool,
 			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,

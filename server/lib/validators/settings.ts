@@ -98,9 +98,10 @@ export const updateUserPreferencesSchema = z.object({
 });
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "project", "workspace"]),
+	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
+	parentNarratorId: z.string().min(1).max(50).optional(),
 	workspaceId: z.string().min(1).max(50).nullish(),
 	title: z.string().max(200),
 	subtitle: z.string().max(200).optional(),
@@ -115,7 +116,7 @@ export const upsertRecentTabSchema = recentTabSchema.extend({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "session", "project", "workspace"]),
+	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent"]),
 	id: z.string().min(1).max(50),
 });
 

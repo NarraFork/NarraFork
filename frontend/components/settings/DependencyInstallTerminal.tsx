@@ -28,8 +28,17 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 	const commandSentRef = useRef(false);
 	const doneRef = useRef(false);
 	const writingRef = useRef(false);
+	const doneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const onDoneRef = useRef(onDone);
 	onDoneRef.current = onDone;
+
+	const scheduleDone = () => {
+		if (doneTimerRef.current) clearTimeout(doneTimerRef.current);
+		doneTimerRef.current = setTimeout(() => {
+			doneTimerRef.current = null;
+			onDoneRef.current();
+		}, 800);
+	};
 
 	// Create terminal on mount
 	useEffect(() => {
@@ -37,7 +46,11 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		api
 			.createTerminal({ name: "dep-install" })
 			.then((t) => {
-				if (!cancelled) setTerminalId(t.id);
+				if (cancelled) {
+					api.deleteTerminal(t.id).catch(() => {});
+					return;
+				}
+				setTerminalId(t.id);
 			})
 			.catch(() => {});
 		return () => {
@@ -73,7 +86,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 					if (PROMPT_RE.test(text)) {
 						doneRef.current = true;
 						// Small delay so user can see the final output
-						setTimeout(() => onDoneRef.current(), 800);
+						scheduleDone();
 					}
 				}
 			}
@@ -81,7 +94,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		onExit: () => {
 			if (!doneRef.current) {
 				doneRef.current = true;
-				setTimeout(() => onDoneRef.current(), 800);
+				scheduleDone();
 			}
 		},
 	});
@@ -109,7 +122,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		fitAddonRef.current = fitAddon;
 
 		// Forward user input to terminal
-		term.onData((data) => {
+		const dataDisposable = term.onData((data) => {
 			if (writingRef.current) return;
 			write(data);
 		});
@@ -122,11 +135,19 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 
 		return () => {
 			observer.disconnect();
+			dataDisposable.dispose();
 			term.dispose();
 			termRef.current = null;
 			fitAddonRef.current = null;
 		};
 	}, [write]);
+
+	// Cleanup: cancel delayed completion callback on unmount
+	useEffect(() => {
+		return () => {
+			if (doneTimerRef.current) clearTimeout(doneTimerRef.current);
+		};
+	}, []);
 
 	// Cleanup: delete terminal on unmount
 	useEffect(() => {

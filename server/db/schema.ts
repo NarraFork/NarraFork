@@ -1076,3 +1076,46 @@ export const benchmarkTaskResults = sqliteTable(
 	},
 	(table) => [index("idx_task_results_run").on(table.runId, table.status)],
 );
+
+// === background_tasks ===
+// Unified background task tracking for both bash commands and agent subagents.
+// Replaces the in-memory-only bash background task map and provides a single
+// source of truth alongside the narrators table's background fields.
+export const backgroundTasks = sqliteTable(
+	"background_tasks",
+	{
+		id: text("id").primaryKey(),
+		parentNarratorId: text("parent_narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		type: text("type", { enum: ["bash", "agent"] }).notNull(),
+		status: text("status", {
+			enum: ["running", "completed", "failed", "cancelled", "timeout"],
+		}).notNull(),
+		// Bash-specific
+		command: text("command"),
+		exitCode: integer("exit_code"),
+		// Agent-specific
+		subagentNarratorId: text("subagent_narrator_id").references(() => narrators.id, {
+			onDelete: "cascade",
+		}),
+		subagentType: text("subagent_type"),
+		// Common
+		toolUseId: text("tool_use_id"),
+		alias: text("alias"),
+		title: text("title"),
+		output: text("output"),
+		outputBytes: integer("output_bytes").notNull().default(0),
+		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),
+		/** Whether the parent narrator has been notified about this task's completion */
+		notified: integer("notified", { mode: "boolean" }).notNull().default(false),
+		startedAt: text("started_at").notNull(),
+		completedAt: text("completed_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
+	],
+);

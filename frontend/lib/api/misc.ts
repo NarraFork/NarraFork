@@ -189,6 +189,10 @@ export const miscApi = {
 			method: "POST",
 		}),
 
+			method: "POST",
+			body: JSON.stringify({ proxy }),
+		}),
+
 	// OpenAI-compatible models
 	openaiListModels: () =>
 		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(

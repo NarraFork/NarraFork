@@ -229,6 +229,7 @@ const PARALLEL_TOOLS = new Set([
 	"Grep",
 	"WebSearch",
 	"WebFetch",
+	"AwaitBackgroundTask",
 	SHELL_TOOL_NAME,
 ]);
 

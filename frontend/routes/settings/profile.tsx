@@ -1,6 +1,6 @@
 import { Loader, Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
 import { ProfileSection } from "../../components/settings/ProfileSection";
@@ -22,6 +22,7 @@ function SettingsProfilePage() {
 	const deleteAvatar = useDeleteAvatar();
 	const updateProfile = useUpdateProfile();
 	const [cropSrc, setCropSrc] = useState<string | null>(null);
+	const cropSrcRef = useRef<string | null>(null);
 	const [gitUsername, setGitUsername] = useState("");
 	const [gitEmail, setGitEmail] = useState("");
 	const [gitDirty, setGitDirty] = useState(false);
@@ -33,9 +34,19 @@ function SettingsProfilePage() {
 		}
 	}, [currentUser]);
 
+	useEffect(() => {
+		return () => {
+			if (cropSrcRef.current) {
+				URL.revokeObjectURL(cropSrcRef.current);
+				cropSrcRef.current = null;
+			}
+		};
+	}, []);
+
 	const clearCropSrc = () => {
 		setCropSrc((prev) => {
 			if (prev) URL.revokeObjectURL(prev);
+			cropSrcRef.current = null;
 			return null;
 		});
 	};
@@ -45,6 +56,7 @@ function SettingsProfilePage() {
 		const url = URL.createObjectURL(file);
 		setCropSrc((prev) => {
 			if (prev) URL.revokeObjectURL(prev);
+			cropSrcRef.current = url;
 			return url;
 		});
 	};

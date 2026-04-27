@@ -77,7 +77,7 @@ function NarratorDetailPage() {
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = (narrator as any)?.type === "subagent";
+	const isSubagent = !!(narrator as any)?.variant?.startsWith("subagent:");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const parentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -105,7 +105,19 @@ function NarratorDetailPage() {
 
 	// First visit: register the tab on the server (once per narratorId)
 	useEffect(() => {
-		if (!narrator || isSubagent) return;
+		if (!narrator) return;
+		if (isSubagent) {
+			// Subagent: register as subagent tab with robot icon
+			addRecentTab({
+				type: "subagent",
+				id: narratorId,
+				parentNarratorId: parentNarratorId ?? undefined,
+				title: narratorTitle || "Subagent",
+				subtitle: narratorCwd,
+				status: narratorStatus,
+			});
+			return;
+		}
 		if (chapterId) {
 			// Chapter-bound narrator: record as chapter tab
 			const displayTitle = narratorTitle || chapterTitle || "Chapter";
@@ -135,6 +147,7 @@ function NarratorDetailPage() {
 		narratorStatus,
 		chapterTitle,
 		isSubagent,
+		parentNarratorId,
 	]);
 
 	const qc = useQueryClient();
@@ -311,7 +324,7 @@ function NarratorDetailPage() {
 			if (data?.id) {
 				const narrators = await api.listNarrators({ chapterId: data.id });
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-				const primary = narrators?.find((n: any) => n.type === "primary");
+				const primary = narrators?.find((n: any) => n.variant === "primary");
 
 				// Add the forked chapter to recent tabs immediately
 				if (primary?.id) {

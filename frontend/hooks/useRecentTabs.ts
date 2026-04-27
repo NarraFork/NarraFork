@@ -13,10 +13,12 @@ export interface RecentTabViewer {
 }
 
 export interface RecentTab {
-	type: "chapter" | "narrator" | "project" | "workspace";
+	type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
 	id: string;
 	/** Primary narrator ID — used for WS subscriptions */
 	narratorId?: string;
+	/** Parent narrator ID — used for subagent back navigation */
+	parentNarratorId?: string;
 	/** If this tab belongs to a workspace, the workspace ID */
 	workspaceId?: string | null;
 	title: string;

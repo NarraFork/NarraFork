@@ -149,6 +149,8 @@ interface NarratorWSCallbacks {
 	) => void;
 	onBackgroundTaskFailed?: (taskNarratorId: string, toolUseId: string, error: string) => void;
 	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
+	onBackgroundTaskStatusChanged?: (taskId: string, status: string, narratorId: string) => void;
+	onBackgroundTaskOutput?: (taskId: string, narratorId: string) => void;
 	onMessagesDeleted?: (deletedMessageIds: string[]) => void;
 	onMessageUpdated?: (message: TreeMessage) => void;
 	onPresenceUpdate?: (
@@ -596,6 +598,19 @@ export function useNarratorWS(
 							data.toolUseId as string,
 						);
 						break;
+					case "background_task_status_changed":
+						callbacksRef.current.onBackgroundTaskStatusChanged?.(
+							data.taskId as string,
+							data.status as string,
+							data.narratorId as string,
+						);
+						break;
+					case "background_task_output":
+						callbacksRef.current.onBackgroundTaskOutput?.(
+							data.taskId as string,
+							data.narratorId as string,
+						);
+						break;
 					case "presence_update":
 						callbacksRef.current.onPresenceUpdate?.(
 							(data.viewers ?? []) as Array<{
@@ -762,11 +777,15 @@ export function useNarratorsListWS(
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds
 	useEffect(() => {
-		if (!narratorIds.length && !onGlobalEventRef.current) {
-			// No narrators to watch — clean up any stale listener from a previous run
+		if (!narratorIds.length) {
+			// No narrators to watch — release any stale subscription/listener from a previous run.
 			if (listenerHandleRef.current) {
 				narratorWSManager.removeListener(listenerHandleRef.current);
 				listenerHandleRef.current = null;
+			}
+			if (subHandleRef.current) {
+				narratorWSManager.unsubscribe(subHandleRef.current);
+				subHandleRef.current = null;
 			}
 			return;
 		}
@@ -784,7 +803,7 @@ export function useNarratorsListWS(
 		}
 		listenerHandleRef.current = narratorWSManager.addListener(
 			{
-				narratorIds: narratorIds.length > 0 ? narratorIds : "*",
+				narratorIds,
 				types: [
 					"status_change",
 					"substatus_change",

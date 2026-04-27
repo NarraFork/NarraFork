@@ -18,16 +18,22 @@ const listeners = new Set<() => void>();
 // --- Singleton storage listener ---
 // One global "storage" listener dispatches to all subscribers,
 // instead of each useLocalPref instance registering its own.
-let storageListenerInstalled = false;
+let storageListener: ((e: StorageEvent) => void) | null = null;
 
 function ensureStorageListener() {
-	if (storageListenerInstalled) return;
-	storageListenerInstalled = true;
-	window.addEventListener("storage", (e: StorageEvent) => {
+	if (storageListener) return;
+	storageListener = (e: StorageEvent) => {
 		if (e.key?.startsWith("narrafork_")) {
 			for (const cb of listeners) cb();
 		}
-	});
+	};
+	window.addEventListener("storage", storageListener);
+}
+
+function removeStorageListenerIfIdle() {
+	if (listeners.size > 0 || !storageListener) return;
+	window.removeEventListener("storage", storageListener);
+	storageListener = null;
 }
 
 function subscribe(cb: () => void) {
@@ -35,6 +41,7 @@ function subscribe(cb: () => void) {
 	ensureStorageListener();
 	return () => {
 		listeners.delete(cb);
+		removeStorageListenerIfIdle();
 	};
 }
 

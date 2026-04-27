@@ -82,7 +82,7 @@ export function ChapterForkModal({
 			if (data?.id) {
 				const narrators = await api.listNarrators({ chapterId: data.id });
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-				const primary = narrators?.find((n: any) => n.type === "primary");
+				const primary = narrators?.find((n: any) => n.variant === "primary");
 				if (primary?.id) {
 					addRecentTab({
 						type: "chapter",
@@ -123,7 +123,7 @@ export function ChapterForkModal({
 		const narrators = await api.listNarrators({ chapterId: forkedChapter.id });
 		const primary = narrators?.find(
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
-			(n: any) => n.type === "primary",
+			(n: any) => n.variant === "primary",
 		);
 		handleClose();
 		if (primary?.id) {

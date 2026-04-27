@@ -14,12 +14,50 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { IconRobot, IconTerminal2, IconX } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
 interface BackgroundTasksDrawerProps {
 	narratorId: string;
+}
+
+interface UnifiedTask {
+	id: string;
+	kind: "bash" | "agent";
+	status: string;
+	label: string;
+	command: string | null;
+	output: string | null;
+	exitCode: number | null;
+}
+
+function statusColor(status: string): string {
+	switch (status) {
+		case "running":
+			return "blue";
+		case "completed":
+			return "green";
+		case "cancelled":
+			return "orange";
+		default:
+			return "red";
+	}
+}
+
+function statusLabel(status: string, t: (key: string) => string): string {
+	switch (status) {
+		case "running":
+			return t("backgroundTasks.statusRunning");
+		case "completed":
+			return t("backgroundTasks.statusCompleted");
+		case "cancelled":
+			return t("backgroundTasks.statusCancelled");
+		case "failed":
+			return t("backgroundTasks.statusFailed");
+		default:
+			return status;
+	}
 }
 
 export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps) {
@@ -33,9 +71,42 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 		refetchInterval: opened ? 3000 : 10000,
 	});
 
-	const runningCount =
-		(data?.subagentTasks?.filter((t) => t.backgroundStatus === "running").length ?? 0) +
-		(data?.bashTasks?.filter((t) => t.status === "running").length ?? 0);
+	// Merge unified tasks and legacy subagent tasks into a single list
+	const allTasks: UnifiedTask[] = useMemo(() => {
+		const result: UnifiedTask[] = [];
+
+		// New unified tasks
+		for (const task of data?.tasks ?? []) {
+			result.push({
+				id: task.id,
+				kind: task.type,
+				status: task.status,
+				label: task.title || task.alias || task.command || task.subagentType || "Task",
+				command: task.command,
+				output: task.output,
+				exitCode: task.exitCode,
+			});
+		}
+
+		// Legacy subagent tasks (not already in unified list)
+		const unifiedIds = new Set(result.map((t) => t.id));
+		for (const task of data?.legacySubagentTasks ?? []) {
+			if (unifiedIds.has(task.id)) continue;
+			result.push({
+				id: task.id,
+				kind: "agent",
+				status: task.backgroundStatus ?? task.status,
+				label: task.title || task.subagentType || "Agent",
+				command: null,
+				output: task.backgroundResult,
+				exitCode: null,
+			});
+		}
+
+		return result;
+	}, [data]);
+
+	const runningCount = allTasks.filter((t) => t.status === "running").length;
 
 	const handleCancel = useCallback(
 		async (taskId: string) => {
@@ -49,9 +120,7 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 		[narratorId, qc],
 	);
 
-	const hasAnyTasks = (data?.subagentTasks?.length ?? 0) > 0 || (data?.bashTasks?.length ?? 0) > 0;
-
-	if (!hasAnyTasks && !isLoading) return null;
+	if (allTasks.length === 0 && !isLoading) return null;
 
 	return (
 		<>
@@ -88,16 +157,9 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				padding="md"
 			>
 				<Stack gap="sm">
-					{/* Subagent background tasks */}
-					{data?.subagentTasks?.map((task) => {
-						const isRunning = task.backgroundStatus === "running";
-						const statusColor = isRunning
-							? "blue"
-							: task.backgroundStatus === "completed"
-								? "green"
-								: task.backgroundStatus === "cancelled"
-									? "orange"
-									: "red";
+					{allTasks.map((task) => {
+						const isRunning = task.status === "running";
+						const Icon = task.kind === "bash" ? IconTerminal2 : IconRobot;
 						return (
 							<Box
 								key={task.id}
@@ -109,14 +171,29 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 							>
 								<Group justify="space-between" wrap="nowrap" gap="xs">
 									<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-										<IconRobot size={14} />
-										<Text size="xs" fw={500} truncate>
-											{task.title || task.subagentType || "Agent"}
-										</Text>
+										<Icon size={14} />
+										{task.kind === "bash" && task.command ? (
+											<Code
+												style={{
+													fontSize: 11,
+													maxWidth: 180,
+													overflow: "hidden",
+													textOverflow: "ellipsis",
+													whiteSpace: "nowrap",
+													display: "inline-block",
+												}}
+											>
+												{task.command}
+											</Code>
+										) : (
+											<Text size="xs" fw={500} truncate>
+												{task.label}
+											</Text>
+										)}
 									</Group>
 									<Group gap={4} wrap="nowrap">
-										<Badge size="xs" variant="light" color={statusColor}>
-											{task.backgroundStatus ?? task.status}
+										<Badge size="xs" variant="light" color={statusColor(task.status)}>
+											{statusLabel(task.status, t)}
 										</Badge>
 										{isRunning && (
 											<ActionIcon
@@ -131,68 +208,12 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 										)}
 									</Group>
 								</Group>
-								{task.backgroundResult && !isRunning && (
+								{!isRunning && task.output && (
 									<Text size="xs" c="dimmed" mt={4} lineClamp={2}>
-										{task.backgroundResult.slice(0, 200)}
+										{task.output.slice(0, 200)}
 									</Text>
 								)}
-							</Box>
-						);
-					})}
-
-					{/* Bash background tasks */}
-					{data?.bashTasks?.map((task) => {
-						const isRunning = task.status === "running";
-						const statusColor = isRunning
-							? "blue"
-							: task.status === "completed"
-								? "green"
-								: task.status === "cancelled"
-									? "orange"
-									: "red";
-						return (
-							<Box
-								key={task.id}
-								p="xs"
-								style={{
-									border: "1px solid var(--mantine-color-default-border)",
-									borderRadius: "var(--mantine-radius-sm)",
-								}}
-							>
-								<Group justify="space-between" wrap="nowrap" gap="xs">
-									<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-										<IconTerminal2 size={14} />
-										<Code
-											style={{
-												fontSize: 11,
-												maxWidth: 180,
-												overflow: "hidden",
-												textOverflow: "ellipsis",
-												whiteSpace: "nowrap",
-												display: "inline-block",
-											}}
-										>
-											{task.command}
-										</Code>
-									</Group>
-									<Group gap={4} wrap="nowrap">
-										<Badge size="xs" variant="light" color={statusColor}>
-											{task.status}
-										</Badge>
-										{isRunning && (
-											<ActionIcon
-												size="xs"
-												variant="subtle"
-												color="red"
-												onClick={() => handleCancel(task.id)}
-												title={t("backgroundTasks.cancel")}
-											>
-												<IconX size={12} />
-											</ActionIcon>
-										)}
-									</Group>
-								</Group>
-								{task.exitCode != null && (
+								{!isRunning && task.exitCode != null && (
 									<Text size="xs" c="dimmed" mt={4}>
 										exit {task.exitCode}
 									</Text>
@@ -207,7 +228,7 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 						</Group>
 					)}
 
-					{!isLoading && !hasAnyTasks && (
+					{!isLoading && allTasks.length === 0 && (
 						<Text size="sm" c="dimmed" ta="center" py="md">
 							{t("backgroundTasks.empty")}
 						</Text>

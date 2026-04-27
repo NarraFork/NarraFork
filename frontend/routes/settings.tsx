@@ -13,6 +13,7 @@ import {
 	IconPlayerPlay,
 	IconReceipt2,
 	IconServer,
+	IconShield,
 	IconTerminal2,
 	IconUser,
 	IconUsers,
@@ -35,6 +36,7 @@ interface NavItem {
 /** Paths that require admin role */
 const ADMIN_PATHS = new Set([
 	"/settings/providers",
+	"/settings/proxy",
 	"/settings/chapters",
 	"/settings/server",
 	"/settings/users",
@@ -71,6 +73,11 @@ function SettingsLayout() {
 
 	const instanceItems: NavItem[] = [
 		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={18} /> },
+		{
+			to: "/settings/proxy",
+			label: t("proxyManagementSection"),
+			icon: <IconShield size={18} />,
+		},
 		{
 			to: "/settings/chapters",
 			label: t("chaptersAndContainersSection"),

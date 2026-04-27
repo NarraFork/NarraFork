@@ -133,6 +133,7 @@ import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
+import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BlurInOnAppearProvider } from "./BlurInOnAppear";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserSessionBar } from "./BrowserSessionBar";
@@ -141,7 +142,6 @@ import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
-import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	type RenderedTreeElementMeta,
@@ -1543,7 +1543,22 @@ export function NarratorPanel({
 
 	// --- WebSocket + real-time state ---
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const isSubagent = (fetchedNarrator as any)?.type === "subagent";
+	const isSubagent = !!(fetchedNarrator as any)?.variant?.startsWith("subagent:");
+
+	// Parse persisted substatus from narrator data to seed the WS hook's reducer
+	const narratorSubstatus = useMemo(() => {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const raw = (fetchedNarrator as any)?.substatus;
+		if (!raw) return [];
+		if (Array.isArray(raw)) return raw as string[];
+		try {
+			const parsed = JSON.parse(raw);
+			return Array.isArray(parsed) ? (parsed as string[]) : [];
+		} catch {
+			return [];
+		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	}, [(fetchedNarrator as any)?.substatus]);
 
 		const prefix = resolvedModel?.split(":")[0];
 		if (!prefix) return null;
@@ -1566,6 +1581,7 @@ export function NarratorPanel({
 		narratorTodosJson: narrator?.todosJson,
 		narratorTodosToolUseId: narrator?.todosToolUseId,
 		isSubagent,
+		narratorSubstatus,
 	});
 	const {
 		disconnected,

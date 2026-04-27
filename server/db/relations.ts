@@ -1,6 +1,7 @@
 import { relations } from "drizzle-orm";
 import {
 	apiRequests,
+	backgroundTasks,
 	benchmarkRuns,
 	benchmarkSuites,
 	benchmarkTaskResults,
@@ -416,5 +417,20 @@ export const benchmarkTaskResultsRelations = relations(benchmarkTaskResults, ({ 
 	narrator: one(narrators, {
 		fields: [benchmarkTaskResults.narratorId],
 		references: [narrators.id],
+	}),
+}));
+
+// === Background tasks ===
+
+export const backgroundTasksRelations = relations(backgroundTasks, ({ one }) => ({
+	parentNarrator: one(narrators, {
+		fields: [backgroundTasks.parentNarratorId],
+		references: [narrators.id],
+		relationName: "bgTaskParent",
+	}),
+	subagentNarrator: one(narrators, {
+		fields: [backgroundTasks.subagentNarratorId],
+		references: [narrators.id],
+		relationName: "bgTaskSubagent",
 	}),
 }));

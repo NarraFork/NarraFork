@@ -1,6 +1,8 @@
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const MAX_RULER_PAGES = 20;
+
 export interface RulerCommit {
 	sha: string;
 	shortSha: string;
@@ -76,6 +78,7 @@ export function useRulerInfinite(projectId: string) {
 					}
 				: undefined,
 		staleTime: 5 * 60 * 1000,
+		maxPages: MAX_RULER_PAGES,
 		enabled: !!projectId,
 	});
 }

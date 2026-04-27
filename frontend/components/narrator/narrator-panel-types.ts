@@ -160,11 +160,11 @@ export interface FileModPanelExternalProps {
 	onCancelDelete: () => void;
 }
 
-export const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 export const MAX_IMAGE_LONG_EDGE = 1568;
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-export const MAX_TEXT_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
 export { formatFileSize, isTextFile } from "@shared/text-file-types";
 

@@ -17,6 +17,17 @@ export function migrateTabTypes(tabs: Record<string, unknown>[]): void {
 	}
 }
 
+/** Resolve the narrator ID represented by a recent-tab entry. */
+export function getTabNarratorId(tab: Record<string, unknown>): string | undefined {
+	if (tab.type === "narrator" || tab.type === "subagent") {
+		return typeof tab.id === "string" ? tab.id : undefined;
+	}
+	if (tab.type === "chapter") {
+		return typeof tab.narratorId === "string" ? tab.narratorId : undefined;
+	}
+	return undefined;
+}
+
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
 export async function enrichTabs(
 	tabs: Record<string, unknown>[],
@@ -25,10 +36,7 @@ export async function enrichTabs(
 
 	migrateTabTypes(tabs);
 
-	const narratorIds = tabs
-		.filter((t) => t.type !== "project")
-		.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
-		.filter(Boolean);
+	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
 		// Narrator status
@@ -38,7 +46,7 @@ export async function enrichTabs(
 			.where(inArray(narrators.id, narratorIds));
 		const statusMap = new Map(rows.map((r) => [r.id, r.status]));
 		for (const tab of tabs) {
-			const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
+			const nId = getTabNarratorId(tab);
 			if (nId && statusMap.has(nId)) {
 				tab.status = statusMap.get(nId);
 			}
@@ -55,7 +63,7 @@ export async function enrichTabs(
 			.groupBy(terminals.narratorId);
 		const termCountMap = new Map(termRows.map((r) => [r.narratorId, r.count]));
 		for (const tab of tabs) {
-			const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
+			const nId = getTabNarratorId(tab);
 			if (nId && termCountMap.has(nId)) {
 				tab.activeTerminalCount = termCountMap.get(nId);
 			}
@@ -64,7 +72,7 @@ export async function enrichTabs(
 		// Presence (from in-memory map)
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 		for (const tab of tabs) {
-			const nId = tab.type === "narrator" ? (tab.id as string) : (tab.narratorId as string);
+			const nId = getTabNarratorId(tab);
 			if (nId) {
 				const viewers = presenceMap.get(nId);
 				if (viewers && viewers.length > 0) {

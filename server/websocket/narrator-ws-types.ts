@@ -186,6 +186,20 @@ export type NarratorServerMessage =
 			toolUseId: string;
 	  }
 	| {
+			type: "background_task_status_changed";
+			narratorId: string;
+			taskId: string;
+			status: string;
+			output: string | null;
+	  }
+	| {
+			type: "background_task_output";
+			narratorId: string;
+			taskId: string;
+			/** Byte length of the accumulated output so far */
+			outputBytes: number;
+	  }
+	| {
 			type: "git_status";
 			narratorId: string;
 			chapterId: string;

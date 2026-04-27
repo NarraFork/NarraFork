@@ -201,7 +201,8 @@ type AnthropicContentPart =
 function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
 	const hasTextOrTool = parts.some((p) => p.type === "text" || p.type === "tool_use");
 	if (!hasTextOrTool) {
-		parts.push({ type: "text", text: "" });
+		// Use "…" instead of "" — the API requires non-whitespace text content.
+		parts.push({ type: "text", text: "…" });
 	}
 }
 
@@ -633,6 +634,27 @@ export class AnthropicProvider implements ProviderAdapter {
 		// Build thinking configuration
 		const thinkingConfig = buildThinkingConfig(model, params.reasoningEffort);
 		const thinkingEnabled = !!thinkingConfig && thinkingConfig.type !== "disabled";
+
+		// When thinking is not enabled, strip thinking/redacted_thinking blocks from
+		// history messages. Third-party Anthropic-compatible APIs (e.g. DeepSeek) may
+		// return thinking blocks in their responses, which get persisted and replayed
+		// in subsequent turns. If the model isn't recognized as supporting thinking,
+		// sending these blocks back without a `thinking` config triggers a 400 error.
+		if (!thinkingEnabled) {
+			stripThinkingBlocks(messages);
+		}
+
+		// Even when thinking IS enabled, we must sanitize the history:
+		// 1. Remove assistant messages that contain ONLY thinking blocks (orphaned
+		//    from interrupted streaming). These cause "thinking blocks cannot be
+		//    modified" API errors.
+		// 2. Strip trailing thinking blocks from the last assistant message — the
+		//    API requires assistant messages to end with text or tool_use, not
+		//    thinking/redacted_thinking.
+		if (thinkingEnabled) {
+			filterThinkingOnlyAssistantMessages(messages);
+			stripTrailingThinkingFromLastAssistant(messages);
+		}
 
 		const isOfficial = !!this.config.officialApi;
 
@@ -1780,7 +1802,7 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 
 	// Anthropic requires the first message to be from user
 	if (filtered.length > 0 && filtered[0].role === "assistant") {
-		filtered.unshift({ role: "user", content: [{ type: "text", text: "." }] });
+		filtered.unshift({ role: "user", content: [{ type: "text", text: "…" }] });
 	}
 
 	return filtered;
@@ -1791,4 +1813,95 @@ function toContentParts(content: string | AnthropicContentPart[]): AnthropicCont
 		return [{ type: "text", text: content }];
 	}
 	return content;
+}
+
+/**
+ * Remove thinking / redacted_thinking content blocks from all assistant messages.
+ * Mutates the messages array in place. This is needed when sending history to
+ * Anthropic-compatible APIs that don't support thinking mode — if thinking blocks
+ * are present in the history but the request doesn't enable thinking, the API
+ * returns a 400 error.
+ */
+function stripThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const filtered = (msg.content as AnthropicContentPart[]).filter(
+			(b) => b.type !== "thinking" && b.type !== "redacted_thinking",
+		);
+		if (filtered.length !== (msg.content as AnthropicContentPart[]).length) {
+			// Ensure at least one text block remains (API requires non-empty content)
+			if (!filtered.some((b) => b.type === "text" || b.type === "tool_use")) {
+				filtered.push({ type: "text", text: "…" });
+			}
+			msg.content = filtered;
+		}
+	}
+}
+
+function isThinkingBlock(block: AnthropicContentPart): boolean {
+	return block.type === "thinking" || block.type === "redacted_thinking";
+}
+
+/**
+ * Strip trailing thinking/redacted_thinking blocks from the last assistant message.
+ * The Anthropic API doesn't allow assistant messages to end with thinking blocks —
+ * they must end with text or tool_use. This typically happens when a streaming
+ * response is interrupted after emitting thinking but before emitting text/tool_use.
+ *
+ * Ref: Claude Code (un) filterTrailingThinkingFromLastAssistant
+ */
+function stripTrailingThinkingFromLastAssistant(messages: AnthropicMessage[]): void {
+	if (messages.length === 0) return;
+	const last = messages[messages.length - 1];
+	if (last.role !== "assistant" || !Array.isArray(last.content)) return;
+
+	const content = last.content as AnthropicContentPart[];
+	if (content.length === 0) return;
+
+	const lastBlock = content[content.length - 1];
+	if (!isThinkingBlock(lastBlock)) return;
+
+	// Find last non-thinking block
+	let lastValidIndex = content.length - 1;
+	while (lastValidIndex >= 0 && isThinkingBlock(content[lastValidIndex])) {
+		lastValidIndex--;
+	}
+
+	if (lastValidIndex < 0) {
+		// All blocks were thinking — replace with placeholder
+		last.content = [{ type: "text", text: "…" }];
+	} else {
+		last.content = content.slice(0, lastValidIndex + 1);
+	}
+}
+
+/**
+ * Filter out assistant messages that contain ONLY thinking/redacted_thinking blocks
+ * (no text, tool_use, or other content). These "orphaned" thinking-only messages
+ * can appear when:
+ * - A streaming response is interrupted after emitting thinking but before text/tool_use
+ * - Messages are compacted and intervening messages are removed
+ *
+ * Such messages cause "thinking blocks cannot be modified" API errors when replayed.
+ * When removed, we must ensure the remaining messages still alternate user/assistant.
+ *
+ * Ref: Claude Code (un) filterOrphanedThinkingOnlyMessages
+ */
+function filterThinkingOnlyAssistantMessages(messages: AnthropicMessage[]): void {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+
+		const content = msg.content as AnthropicContentPart[];
+		if (content.length === 0) continue;
+
+		const allThinking = content.every((b) => isThinkingBlock(b));
+		if (allThinking) {
+			logger.warn("Dropping thinking-only assistant message before API call", {
+				index: i,
+				blockCount: content.length,
+			});
+			messages.splice(i, 1);
+		}
+	}
 }

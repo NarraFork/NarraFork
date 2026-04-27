@@ -111,6 +111,7 @@ function SessionCard({
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(false);
 	const revokedRef = useRef<string | null>(null);
+	const screenshotAbortRef = useRef<AbortController | null>(null);
 
 	// Live estimated trace size — ticks every second while tracing is active
 	const [estimatedSize, setEstimatedSize] = useState(0);
@@ -131,16 +132,23 @@ function SessionCard({
 	const fetchScreenshot = useCallback(async () => {
 		const token = getToken();
 		if (!token) return;
+		screenshotAbortRef.current?.abort();
+		const controller = new AbortController();
+		screenshotAbortRef.current = controller;
 		setLoading(true);
 		setError(false);
 		try {
 			const res = await fetch(
 				`/api/narrators/${narratorId}/browser-sessions/${session.id}/screenshot`,
-				{ headers: { Authorization: `Bearer ${token}` } },
+				{ headers: { Authorization: `Bearer ${token}` }, signal: controller.signal },
 			);
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
 			const blob = await res.blob();
 			const url = URL.createObjectURL(blob);
+			if (controller.signal.aborted) {
+				URL.revokeObjectURL(url);
+				return;
+			}
 			// Revoke previous blob URL to avoid memory leak
 			if (revokedRef.current) {
 				URL.revokeObjectURL(revokedRef.current);
@@ -148,9 +156,10 @@ function SessionCard({
 			revokedRef.current = url;
 			setBlobUrl(url);
 		} catch {
-			setError(true);
+			if (!controller.signal.aborted) setError(true);
 		} finally {
-			setLoading(false);
+			if (screenshotAbortRef.current === controller) screenshotAbortRef.current = null;
+			if (!controller.signal.aborted) setLoading(false);
 		}
 	}, [narratorId, session.id]);
 
@@ -161,11 +170,24 @@ function SessionCard({
 		}
 	}, [showScreenshot, screenshotKey, fetchScreenshot]);
 
-	// Cleanup blob URL on unmount
+	useEffect(() => {
+		if (showScreenshot) return;
+		screenshotAbortRef.current?.abort();
+		screenshotAbortRef.current = null;
+		if (revokedRef.current) {
+			URL.revokeObjectURL(revokedRef.current);
+			revokedRef.current = null;
+			setBlobUrl(null);
+		}
+	}, [showScreenshot]);
+
+	// Cleanup in-flight screenshot request and blob URL on unmount
 	useEffect(() => {
 		return () => {
+			screenshotAbortRef.current?.abort();
 			if (revokedRef.current) {
 				URL.revokeObjectURL(revokedRef.current);
+				revokedRef.current = null;
 			}
 		};
 	}, []);

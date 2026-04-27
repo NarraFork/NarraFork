@@ -1191,14 +1191,14 @@ function FilePreviewModal({
 	const lang = getShikiLang(filePath);
 	const fileName = filePath.split("/").pop() || filePath;
 
-	// Reset state when modal opens with a new file
+	// Reset state when modal opens, closes, or switches files.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: filePath changes must clear stale preview state before the next fetch completes
 	useEffect(() => {
-		if (opened) {
-			setError(false);
-			setTextContent(null);
-			setBlobUrl(null);
-		}
-	}, [opened]);
+		setError(false);
+		setTextContent(null);
+		setBlobUrl(null);
+		if (!opened) setLoading(false);
+	}, [opened, filePath]);
 
 	// Cleanup blob URL on unmount
 	useEffect(() => {
@@ -1211,6 +1211,7 @@ function FilePreviewModal({
 	useEffect(() => {
 		if (!opened) return;
 		let cancelled = false;
+		const controller = new AbortController();
 		setLoading(true);
 		const headers: Record<string, string> = {};
 		const token = getToken();
@@ -1218,7 +1219,7 @@ function FilePreviewModal({
 		const url = `/api/fs/preview?path=${encodeURIComponent(filePath)}`;
 
 		if (previewType === "text") {
-			fetch(url, { headers })
+			fetch(url, { headers, signal: controller.signal })
 				.then((r) => {
 					if (!r.ok) throw new Error(r.statusText);
 					return r.text();
@@ -1234,13 +1235,18 @@ function FilePreviewModal({
 				});
 		} else {
 			// Image or PDF: fetch as blob and create object URL
-			fetch(url, { headers })
+			fetch(url, { headers, signal: controller.signal })
 				.then((r) => {
 					if (!r.ok) throw new Error(r.statusText);
 					return r.blob();
 				})
 				.then((blob) => {
-					if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+					const nextUrl = URL.createObjectURL(blob);
+					if (cancelled) {
+						URL.revokeObjectURL(nextUrl);
+						return;
+					}
+					setBlobUrl(nextUrl);
 				})
 				.catch(() => {
 					if (!cancelled) setError(true);
@@ -1251,6 +1257,7 @@ function FilePreviewModal({
 		}
 		return () => {
 			cancelled = true;
+			controller.abort();
 		};
 	}, [opened, previewType, filePath]);
 
@@ -3195,6 +3202,10 @@ export function InlinePermission({
 		if (isActivePermission) setHasFeedback(!!feedback);
 	}, [feedback, setHasFeedback, isActivePermission]);
 
+	// Feedback confirmation dialog state (must be before early returns)
+	const [feedbackConfirmOpen, setFeedbackConfirmOpen] = useState(false);
+	const [pendingCompactAfter, setPendingCompactAfter] = useState<boolean | undefined>();
+
 	// AskUserQuestion: render the full question form inline
 	const askQuestions =
 		permission.toolName === "AskUserQuestion"
@@ -3224,6 +3235,12 @@ export function InlinePermission({
 	const planEdited = editedPlan !== null && editedPlan !== planText;
 
 	const handleAllow = (compactAfter?: boolean) => {
+		// If ExitPlanMode and user has feedback text, show confirmation dialog
+		if (isExitPlan && feedback.trim()) {
+			setPendingCompactAfter(compactAfter);
+			setFeedbackConfirmOpen(true);
+			return;
+		}
 		sessionStorage.removeItem(draftKey);
 		onDecision?.(
 			permission.id,
@@ -3232,6 +3249,24 @@ export function InlinePermission({
 			compactAfter,
 			planEdited ? (editedPlan ?? undefined) : undefined,
 		);
+	};
+
+	const handleConfirmExecute = () => {
+		setFeedbackConfirmOpen(false);
+		sessionStorage.removeItem(draftKey);
+		onDecision?.(
+			permission.id,
+			"allow",
+			feedback || undefined,
+			pendingCompactAfter,
+			planEdited ? (editedPlan ?? undefined) : undefined,
+		);
+	};
+
+	const handleConfirmRevise = () => {
+		setFeedbackConfirmOpen(false);
+		sessionStorage.removeItem(draftKey);
+		onDecision?.(permission.id, "deny", feedback || undefined);
 	};
 
 	const handleStartEdit = () => {
@@ -3316,7 +3351,7 @@ export function InlinePermission({
 					const btns: PermButton[] = [];
 					if (!editing) {
 						btns.push({
-							label: tc("allow"),
+							label: isExitPlan ? t("planExecute") : tc("allow"),
 							color: "green",
 							onClick: () => handleAllow(),
 						});
@@ -3353,7 +3388,7 @@ export function InlinePermission({
 					}
 					if (!editing) {
 						btns.push({
-							label: tc("deny"),
+							label: isExitPlan && feedback.trim() ? t("planRevise") : tc("deny"),
 							color: "red",
 							variant: "light",
 							onClick: () => {
@@ -3368,6 +3403,27 @@ export function InlinePermission({
 				registerActions={isActivePermission ? registerActions : noop}
 				suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
 			/>
+			{isExitPlan && (
+				<Modal
+					opened={feedbackConfirmOpen}
+					onClose={() => setFeedbackConfirmOpen(false)}
+					title={t("planFeedbackConfirmTitle")}
+					centered
+					size="sm"
+				>
+					<Text size="sm" mb="lg">
+						{t("planFeedbackConfirmMessage")}
+					</Text>
+					<Group justify="flex-end" gap="sm">
+						<Button variant="light" color="red" onClick={handleConfirmRevise}>
+							{t("planRevise")}
+						</Button>
+						<Button color="green" onClick={handleConfirmExecute}>
+							{t("planExecuteWithoutRevision")}
+						</Button>
+					</Group>
+				</Modal>
+			)}
 		</Box>
 	);
 }

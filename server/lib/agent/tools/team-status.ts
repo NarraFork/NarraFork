@@ -71,14 +71,10 @@ export const teamStatusTool: ToolDefinition = {
 					return { output: "No sibling subagents found." };
 				}
 				const lines = siblings.map(
-					(s: {
-						id: string;
-						subagentType: string | null;
-						status: string;
-						title: string | null;
-					}) => {
+					(s: { id: string; variant: string; status: string; title: string | null }) => {
 						const isSelf = s.id === ctx.narratorId ? " (you)" : "";
-						return `- ${s.id}${isSelf} | type=${s.subagentType ?? "unknown"} | status=${s.status} | title=${s.title ?? "(untitled)"}`;
+						const sType = s.variant.startsWith("subagent:") ? s.variant.slice(9) : "unknown";
+						return `- ${s.id}${isSelf} | type=${sType} | status=${s.status} | title=${s.title ?? "(untitled)"}`;
 					},
 				);
 				return { output: `Team members (${siblings.length}):\n${lines.join("\n")}` };
@@ -119,11 +115,14 @@ export const teamStatusTool: ToolDefinition = {
 				if (targets.length === 0) {
 					return { output: "No sibling subagents to broadcast to." };
 				}
+				const senderType = sender.variant?.startsWith("subagent:")
+					? sender.variant.slice(9)
+					: "unknown";
 				const now = new Date().toISOString();
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
-					fromType: sender.subagentType ?? "unknown",
+					fromType: senderType,
 					text: message,
 					timestamp: now,
 					isBroadcast: true,
@@ -158,11 +157,14 @@ export const teamStatusTool: ToolDefinition = {
 						isError: true,
 					};
 				}
+				const sendSenderType = sender.variant?.startsWith("subagent:")
+					? sender.variant.slice(9)
+					: "unknown";
 				const now = new Date().toISOString();
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
-					fromType: sender.subagentType ?? "unknown",
+					fromType: sendSenderType,
 					text: message,
 					timestamp: now,
 					isBroadcast: false,

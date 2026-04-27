@@ -44,7 +44,7 @@ const MIME_TO_EXT: Record<string, string> = {
 	"image/webp": ".webp",
 };
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB — images are loaded into memory for processing
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
 
 export interface ImageRef {
@@ -59,9 +59,9 @@ export async function saveUploadedImage(narratorId: string, file: File): Promise
 			`Unsupported image type: ${file.type}. Supported: PNG, JPEG, GIF, WebP`,
 		);
 	}
-	if (file.size > MAX_FILE_SIZE) {
+	if (file.size > MAX_IMAGE_SIZE) {
 		throw new ValidationError(
-			`Image too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 10MB`,
+			`Image too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 20MB`,
 		);
 	}
 
@@ -193,7 +193,7 @@ export function validateTextFile(file: File): void {
 	}
 	if (file.size > MAX_TEXT_FILE_SIZE) {
 		throw new ValidationError(
-			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 10MB`,
+			`Text file too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Max: 100MB`,
 		);
 	}
 }

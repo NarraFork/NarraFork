@@ -40,6 +40,7 @@ import {
 	IconPin,
 	IconPinnedOff,
 	IconPlus,
+	IconRobot,
 	IconTerminal2,
 	IconX,
 } from "@tabler/icons-react";
@@ -134,7 +135,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const narratorIds = useMemo(() => {
 		const ids: string[] = [];
 		for (const tab of tabs) {
-			if (tab.type === "narrator") {
+			if (tab.type === "narrator" || tab.type === "subagent") {
 				ids.push(tab.id);
 			} else if (tab.type === "chapter" && tab.narratorId) {
 				ids.push(tab.narratorId);
@@ -142,6 +143,40 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		}
 		return ids;
 	}, [tabs]);
+
+	// RAF-batched tab updates: accumulate patches from rapid WS events and
+	// flush them as a single setQueryData call per animation frame.
+	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
+	const tabPatchRafRef = useRef(0);
+
+	const flushTabPatches = useCallback(() => {
+		tabPatchRafRef.current = 0;
+		const patches = pendingTabPatchesRef.current;
+		if (patches.size === 0) return;
+		pendingTabPatchesRef.current = new Map();
+
+		qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
+			if (!prev) return prev;
+			let changed = false;
+			const next = prev.map((t) => {
+				const narratorId = t.type === "narrator" || t.type === "subagent" ? t.id : t.narratorId;
+				const patch = narratorId ? patches.get(narratorId) : undefined;
+				if (patch) {
+					changed = true;
+					return { ...t, ...patch };
+				}
+				return t;
+			});
+			return changed ? next : prev;
+		});
+	}, [qc]);
+
+	// Cleanup RAF on unmount
+	useEffect(() => {
+		return () => {
+			if (tabPatchRafRef.current) cancelAnimationFrame(tabPatchRafRef.current);
+		};
+	}, []);
 
 	const handleWSUpdate = useCallback(
 		(narratorId: string, event: NarratorListWSEvent) => {
@@ -195,22 +230,14 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
-			qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
-				if (!prev) return prev;
-				let changed = false;
-				const next = prev.map((t) => {
-					const match =
-						(t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId;
-					if (match) {
-						changed = true;
-						return { ...t, ...patch };
-					}
-					return t;
-				});
-				return changed ? next : prev;
-			});
+			// Merge patch into pending map and schedule a single RAF flush
+			const existing = pendingTabPatchesRef.current.get(narratorId);
+			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
+			if (!tabPatchRafRef.current) {
+				tabPatchRafRef.current = requestAnimationFrame(flushTabPatches);
+			}
 		},
-		[qc],
+		[flushTabPatches],
 	);
 
 	const handleGlobalEvent = useCallback(
@@ -334,6 +361,13 @@ export function RecentTabList({
 	const { t } = useTranslation("nav");
 	const requireSetup = useSetupWizardGuard();
 	const pendingKey = usePendingTabKey();
+
+	// Stable refs for values used in callbacks — avoids putting `tabs`/`pathname`
+	// in useCallback deps which would invalidate React.memo on every WS update.
+	const tabsRef = useRef(tabs);
+	tabsRef.current = tabs;
+	const pathnameRef = useRef(pathname);
+	pathnameRef.current = pathname;
 
 	const [ctxMenu, setCtxMenu] = useState<{
 		x: number;
@@ -711,14 +745,14 @@ export function RecentTabList({
 	/** Remove a tab and navigate to dashboard if it was the active page. */
 	const handleRemove = useCallback(
 		(type: RecentTab["type"], id: string) => {
-			const tab = tabs.find((t) => t.type === type && t.id === id);
-			if (tab && isTabActive(tab, pathname)) {
+			const tab = tabsRef.current.find((t) => t.type === type && t.id === id);
+			if (tab && isTabActive(tab, pathnameRef.current)) {
 				navigate({ to: "/" });
 			}
 			if (type === "workspace") releaseWorkspace(id);
 			removeTab(type, id);
 		},
-		[removeTab, tabs, pathname, navigate, releaseWorkspace],
+		[removeTab, navigate, releaseWorkspace],
 	);
 
 	const handleContextMenu = useCallback((e: React.MouseEvent, tab: RecentTab) => {
@@ -744,13 +778,13 @@ export function RecentTabList({
 	const handleCtxClose = useCallback(() => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
-		if (isTabActive(tab, pathname)) {
+		if (isTabActive(tab, pathnameRef.current)) {
 			navigate({ to: "/" });
 		}
 		if (tab.type === "workspace") releaseWorkspace(tab.id);
 		removeTab(tab.type, tab.id);
 		setCtxMenu(null);
-	}, [ctxMenu, removeTab, pathname, navigate, releaseWorkspace]);
+	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
 	const platform = usePlatform();
 
@@ -976,6 +1010,33 @@ export function RecentTabList({
 	);
 }
 
+/** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
+function TabIcon({
+	tab,
+	size,
+	iconColor,
+	filledStatus,
+}: {
+	tab: RecentTab;
+	size: number;
+	iconColor?: string;
+	filledStatus: boolean;
+}) {
+	if (tab.type === "project") return <IconFolder size={size} />;
+	if (tab.type === "workspace") return <IconColumns size={size} />;
+	if (tab.type === "chapter")
+		return (
+			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
+		);
+	if (tab.type === "subagent") return <IconRobot size={size} color={iconColor} />;
+	// narrator
+	return filledStatus ? (
+		<IconMessageCircleFilled size={size} color={iconColor} />
+	) : (
+		<IconMessageCircle size={size} color={iconColor} />
+	);
+}
+
 export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") {
 		return pathname === `/projects/${tab.id}`;
@@ -986,6 +1047,7 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "workspace") {
 		return pathname === `/narrators/workspace/${tab.id}`;
 	}
+	// narrator and subagent both route to /narrators/:id
 	return pathname === `/narrators/${tab.id}`;
 }
 
@@ -1019,17 +1081,7 @@ function WorkspaceChildTab({
 			active={active}
 			label={<Text size="xs">{tab.title}</Text>}
 			leftSection={
-				tab.type === "chapter" ? (
-					<IconGitBranch
-						size={14}
-						color={iconColor}
-						fill={filledStatus ? "currentColor" : "none"}
-					/>
-				) : filledStatus ? (
-					<IconMessageCircleFilled size={14} color={iconColor} />
-				) : (
-					<IconMessageCircle size={14} color={iconColor} />
-				)
+				<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
 			}
 			onClick={() => {
 				onNavigate?.();
@@ -1117,17 +1169,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 				active={active}
 				label={<Text size="xs">{tab.title}</Text>}
 				leftSection={
-					tab.type === "chapter" ? (
-						<IconGitBranch
-							size={14}
-							color={iconColor}
-							fill={filledStatus ? "currentColor" : "none"}
-						/>
-					) : filledStatus ? (
-						<IconMessageCircleFilled size={14} color={iconColor} />
-					) : (
-						<IconMessageCircle size={14} color={iconColor} />
-					)
+					<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
 				}
 				onClick={() => {
 					onNavigate?.();
@@ -1241,21 +1283,7 @@ function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }
 				}
 				leftSection={
 					<span>
-						{tab.type === "project" ? (
-							<IconFolder size={16} />
-						) : tab.type === "workspace" ? (
-							<IconColumns size={16} />
-						) : tab.type === "chapter" ? (
-							<IconGitBranch
-								size={16}
-								color={iconColor}
-								fill={filledStatus ? "currentColor" : "none"}
-							/>
-						) : filledStatus ? (
-							<IconMessageCircleFilled size={16} color={iconColor} />
-						) : (
-							<IconMessageCircle size={16} color={iconColor} />
-						)}
+						<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
 					</span>
 				}
 				styles={{
@@ -1432,7 +1460,11 @@ const SortableTabItem = React.memo(function SortableTabItem({
 	// We use onPointerDown + stopPropagation so @dnd-kit's PointerSensor
 	// on the outer div doesn't capture it (pointer events fire before mouse events).
 	const dragNarratorId =
-		tab.type === "narrator" ? tab.id : tab.type === "chapter" ? tab.narratorId : null;
+		tab.type === "narrator" || tab.type === "subagent"
+			? tab.id
+			: tab.type === "chapter"
+				? tab.narratorId
+				: null;
 
 	const handleIconPointerDown = useCallback(
 		(e: React.PointerEvent) => {
@@ -1493,21 +1525,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 							onPointerDown={handleIconPointerDown}
 							style={{ cursor: dragNarratorId ? "grab" : undefined }}
 						>
-							{tab.type === "project" ? (
-								<IconFolder size={16} />
-							) : tab.type === "workspace" ? (
-								<IconColumns size={16} />
-							) : tab.type === "chapter" ? (
-								<IconGitBranch
-									size={16}
-									color={iconColor}
-									fill={filledStatus ? "currentColor" : "none"}
-								/>
-							) : filledStatus ? (
-								<IconMessageCircleFilled size={16} color={iconColor} />
-							) : (
-								<IconMessageCircle size={16} color={iconColor} />
-							)}
+							<TabIcon tab={tab} size={16} iconColor={iconColor} filledStatus={filledStatus} />
 						</span>
 					}
 					rightSection={

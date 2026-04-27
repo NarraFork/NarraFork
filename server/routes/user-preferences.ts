@@ -16,6 +16,7 @@ import {
 import {
 	broadcastTabsSnapshot,
 	enrichTabs,
+	getTabNarratorId,
 	migrateTabTypes,
 } from "../services/user-preferences-service";
 import { broadcastToUser } from "../websocket/narrator-ws";
@@ -645,10 +646,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			// Workspace-aware: if ANY child in a workspace is active, keep the
 			// entire workspace (header + all children). If ALL children are idle,
 			// remove the workspace + children and dissolve the workspace DB record.
-			const narratorIds = tabs
-				.filter((t) => t.type !== "project" && t.type !== "workspace")
-				.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
-				.filter(Boolean);
+			const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 			const statusMap = new Map<string, { status: string; substatus: string[] }>();
 			if (narratorIds.length > 0) {
@@ -697,11 +695,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			}
 			for (const wsId of allWorkspaceIds) {
 				const children = childrenByWs.get(wsId) ?? [];
-				const hasActive = children.some((child) => {
-					const nId =
-						child.type === "narrator" ? (child.id as string) : (child.narratorId as string);
-					return isNarratorActive(nId);
-				});
+				const hasActive = children.some((child) => isNarratorActive(getTabNarratorId(child)));
 				if (hasActive) activeWorkspaces.add(wsId);
 			}
 
@@ -726,8 +720,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 					return activeWorkspaces.has(wsId);
 				}
 				// Non-workspace tab — keep if active or needs attention
-				const nId = t.type === "narrator" ? (t.id as string) : (t.narratorId as string);
-				return isNarratorActive(nId);
+				return isNarratorActive(getTabNarratorId(t));
 			});
 
 			// Dissolve workspace DB records for fully-idle workspaces
@@ -823,9 +816,9 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 
 				// Need live status from DB
 				const narratorIds = tabs
-					.filter((t) => t.type !== "project" && t.type !== "workspace" && !t.workspaceId)
-					.map((t) => (t.type === "narrator" ? (t.id as string) : (t.narratorId as string)))
-					.filter(Boolean);
+					.filter((t) => t.type !== "project" && t.type !== "workspace")
+					.map(getTabNarratorId)
+					.filter((id): id is string => !!id);
 				const statusMap = new Map<string, string>();
 				if (narratorIds.length > 0) {
 					const rows = await db
@@ -850,7 +843,7 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 							wsChildren.push(tabs[k]);
 						}
 						const allIdle = wsChildren.every((c) => {
-							const nId = c.type === "narrator" ? (c.id as string) : (c.narratorId as string);
+							const nId = getTabNarratorId(c);
 							const st = nId ? statusMap.get(nId) : undefined;
 							return st != null && IDLE_STATUSES.has(st);
 						});
@@ -860,8 +853,7 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 						}
 						continue;
 					}
-					const nId =
-						tabs[i].type === "narrator" ? (tabs[i].id as string) : (tabs[i].narratorId as string);
+					const nId = getTabNarratorId(tabs[i]);
 					const status = nId ? statusMap.get(nId) : undefined;
 					if (status && IDLE_STATUSES.has(status)) {
 						firstIdleIdx = i;

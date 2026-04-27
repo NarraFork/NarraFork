@@ -229,6 +229,33 @@ export type NarraForkEvent =
 			narratorId: string;
 			message: NarratorServerMessage;
 	  }
+	// Unified background task lifecycle (covers both bash and agent tasks)
+	| {
+			type: "background_task:completed";
+			taskId: string;
+			parentNarratorId: string;
+			taskType: "bash" | "agent";
+			output: string | null;
+	  }
+	| {
+			type: "background_task:failed";
+			taskId: string;
+			parentNarratorId: string;
+			taskType: "bash" | "agent";
+			error: string | null;
+	  }
+	| {
+			type: "background_task:cancelled";
+			taskId: string;
+			parentNarratorId: string;
+			taskType: "bash" | "agent";
+	  }
+	| {
+			type: "background_task:output";
+			taskId: string;
+			parentNarratorId: string;
+			chunk: string;
+	  }
 	// Mirror of every broadcastToNarrator call — for non-WS consumers (e.g. IM gateway)
 	| {
 			type: "narrator:message_broadcast";

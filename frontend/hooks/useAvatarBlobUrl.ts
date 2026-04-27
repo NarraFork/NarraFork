@@ -15,6 +15,16 @@ function cacheKey(userId: string, avatarImageId: string): string {
 	return `${userId}:${avatarImageId}`;
 }
 
+function scheduleUnreferencedCleanup(key: string) {
+	setTimeout(() => {
+		const entry = cache.get(key);
+		if (entry && entry.refCount <= 0) {
+			URL.revokeObjectURL(entry.blobUrl);
+			cache.delete(key);
+		}
+	}, 0);
+}
+
 function fetchAvatar(userId: string, avatarImageId: string): Promise<string | null> {
 	const key = cacheKey(userId, avatarImageId);
 
@@ -30,12 +40,18 @@ function fetchAvatar(userId: string, avatarImageId: string): Promise<string | nu
 		.then((blob) => {
 			pending.delete(key);
 			if (!blob) return null;
+
+			// Race guard: another fetch may have populated the cache while this
+			// request was in flight. Reuse that URL and do not create an orphan URL.
+			const cached = cache.get(key);
+			if (cached) return cached.blobUrl;
+
 			const url = URL.createObjectURL(blob);
-			// Only store if not already cached (race guard)
-			if (!cache.has(key)) {
-				cache.set(key, { blobUrl: url, refCount: 0 });
-			}
-			return cache.get(key)?.blobUrl ?? null;
+			cache.set(key, { blobUrl: url, refCount: 0 });
+			// If every component unmounted before the fetch completed, nobody will
+			// acquire the zero-ref entry. Drop it on the next macrotask.
+			scheduleUnreferencedCleanup(key);
+			return url;
 		})
 		.catch(() => {
 			pending.delete(key);

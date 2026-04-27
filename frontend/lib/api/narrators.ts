@@ -132,7 +132,21 @@ export const narratorsApi = {
 		}),
 	listBackgroundTasks: (narratorId: string) =>
 		request<{
-			subagentTasks: {
+			tasks: {
+				id: string;
+				type: "bash" | "agent";
+				status: string;
+				command: string | null;
+				exitCode: number | null;
+				subagentNarratorId: string | null;
+				subagentType: string | null;
+				alias: string | null;
+				title: string | null;
+				output: string | null;
+				startedAt: string;
+				completedAt: string | null;
+			}[];
+			legacySubagentTasks: {
 				id: string;
 				subagentType: string | null;
 				backgroundStatus: string | null;
@@ -142,15 +156,11 @@ export const narratorsApi = {
 				createdAt: string;
 				title: string | null;
 			}[];
-			bashTasks: {
-				id: string;
-				command: string;
-				status: string;
-				startedAt: string;
-				completedAt: string | null;
-				exitCode: number | null;
-			}[];
 		}>(`/narrators/${narratorId}/background-tasks`),
+	getBackgroundTaskOutput: (narratorId: string, taskId: string) =>
+		request<{ output: string | null; status: string }>(
+			`/narrators/${narratorId}/background-tasks/${taskId}/output`,
+		),
 	updateSubagentConclusion: (id: string) =>
 		request<{ ok: boolean; toolUseId: string }>(`/narrators/${id}/update-conclusion`, {
 			method: "POST",

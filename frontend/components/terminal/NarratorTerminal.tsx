@@ -101,6 +101,10 @@ export function NarratorTerminal({
 		}
 	}, [runningTerminals]);
 
+	useEffect(() => {
+		return () => writeRef.current?.(null);
+	}, []);
+
 	// Sync active tab from view state on load
 	// biome-ignore lint/correctness/useExhaustiveDependencies: only sync once when view state loads
 	useEffect(() => {

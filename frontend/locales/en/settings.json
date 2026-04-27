@@ -939,5 +939,21 @@
 	"gatewaySave": "Save & Apply",
 	"gatewaySaving": "Saving…",
 	"gatewaySaveSuccess": "Gateway config saved",
-	"gatewayReloading": "Restarting affected platforms…"
+	"gatewayReloading": "Restarting affected platforms…",
+	"proxyManagementSection": "Proxy Management",
+	"proxyManagementDesc": "Centralized proxy configuration for all providers and services",
+	"proxyCodexTitle": "Codex",
+	"proxyAnthropicTitle": "Anthropic",
+	"proxyWebFetchTitle": "WebFetch",
+	"proxyNotConfigured": "Not configured",
+	"proxyConfigured": "Configured",
+	"proxySaved": "Proxy saved",
+	"proxySave": "Save",
+	"proxyPlaceholder": "e.g. http://127.0.0.1:7890, socks5://proxy:1080",
+	"proxyDirectConnection": "Direct connection (no proxy)",
+	"proxyProviderDesc_codex": "Proxy for all Codex OAuth and API requests.",
+	"proxyProviderDesc_anthropic": "Per-instance proxy configured in provider settings.",
+	"proxyProviderDesc_webfetch": "Proxy for WebFetch HTTP requests and browser page fetching.",
+	"proxyGoToProviderSettings": "Go to provider settings",
+	"proxyGoToAgentSettings": "Go to agent settings"
 }
