@@ -539,8 +539,8 @@ export async function* agentLoop(
 		let receivedUsage = false;
 
 		// API request tracking variables (moved outside retry loop)
-		let requestId: string | undefined;
-		let requestStartTime: number | undefined;
+		let requestId = "";
+		let requestStartTime = 0;
 		let requestTtftMs: number | undefined;
 		let requestUsage:
 			| {
@@ -569,6 +569,21 @@ export async function* agentLoop(
 		 *  running on the same iteration. */
 		let sawErrorEvent = false;
 		let requestDump: ApiRequestDumpCollector | undefined;
+
+		/** Build an api_request_end event from current request tracking state. */
+		const buildRequestEnd = (errorMessage?: string): AgentEvent => ({
+			type: "api_request_end",
+			requestId,
+			credentialId,
+			usage: requestUsage,
+			ttftMs: requestTtftMs,
+			durationMs: Date.now() - requestStartTime,
+			contextPercent: requestContextPercent,
+			meterUsage: requestMeterUsage,
+			meterUnit: requestMeterUnit,
+			rawDump: requestDump?.snapshot(),
+			errorMessage,
+		});
 
 		// ── Transient-error retry loop ──
 		// we can safely retry the exact same provider.chat() call with identical
@@ -1043,6 +1058,7 @@ export async function* agentLoop(
 											metadata: sr.metadata,
 										};
 										if (sr.fatal) {
+											yield buildRequestEnd(sr.output);
 											yield { type: "error", message: sr.output };
 											return;
 										}
@@ -1053,6 +1069,7 @@ export async function* agentLoop(
 					}
 
 					if (parsed.silentDisconnect) {
+						yield buildRequestEnd("Silent disconnect");
 						yield { type: "silent_disconnect" };
 						return;
 					}
@@ -1267,6 +1284,7 @@ export async function* agentLoop(
 						const message = String(parsed.invalidState.message ?? "Unknown provider error");
 						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
 							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield buildRequestEnd(message);
 							yield { type: "context_length_exceeded", message };
 							return;
 						}
@@ -1291,6 +1309,7 @@ export async function* agentLoop(
 									maxRetries: maxChatRetries,
 									delayMs,
 								};
+								yield buildRequestEnd(message);
 								await abortableSleep(delayMs, config.signal);
 								if (config.signal.aborted) {
 									yield { type: "error", message: "Aborted" };
@@ -1301,6 +1320,7 @@ export async function* agentLoop(
 							// Exhausted retries — yield block_complete for partial content
 							// then signal retryable_error to the caller.
 							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield buildRequestEnd(message);
 							yield { type: "retryable_error", message };
 							return;
 						}
@@ -1319,6 +1339,7 @@ export async function* agentLoop(
 							// "Provider returned an empty response" message).
 							sawErrorEvent = true;
 							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield buildRequestEnd(message);
 							yield {
 								type: "invalid_state",
 								reason,
@@ -1332,6 +1353,7 @@ export async function* agentLoop(
 				if (config.signal.aborted) {
 					// Even on abort, yield block_complete for accumulated content so it can be persisted
 					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield buildRequestEnd("Aborted");
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
@@ -1344,6 +1366,7 @@ export async function* agentLoop(
 				) {
 					// Persist partial content before signalling overflow
 					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield buildRequestEnd(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
 				}
@@ -1351,6 +1374,7 @@ export async function* agentLoop(
 				// Treat as context_length_exceeded so caller can prune/compact+retry.
 				if (isContextWindowExceededError(err)) {
 					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield buildRequestEnd(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
 				}
@@ -1376,6 +1400,7 @@ export async function* agentLoop(
 							maxRetries: maxChatRetries,
 							delayMs,
 						};
+						yield buildRequestEnd(msg);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -1385,11 +1410,13 @@ export async function* agentLoop(
 					}
 					// Exhausted retries — persist partial content and signal caller
 					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield buildRequestEnd(msg);
 					yield { type: "retryable_error", message: msg };
 					return;
 				}
 				// Non-retryable error — persist partial content and signal caller
 				yield* flushPartialContent(reasoningBlockMap, assistantText);
+				yield buildRequestEnd(msg);
 				yield { type: "error", message: msg };
 				return;
 			}
@@ -1433,6 +1460,7 @@ export async function* agentLoop(
 							maxRetries: maxChatRetries,
 							delayMs,
 						};
+						yield buildRequestEnd(lastRetryErrorMessage);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -1441,6 +1469,7 @@ export async function* agentLoop(
 						continue; // retry provider.chat()
 					}
 					// Chat retries exhausted — surface the original error
+					yield buildRequestEnd(lastRetryErrorMessage);
 					yield { type: "retryable_error", message: lastRetryErrorMessage };
 					return;
 				}
@@ -1469,6 +1498,7 @@ export async function* agentLoop(
 						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 						delayMs,
 					};
+					yield buildRequestEnd(message);
 					await abortableSleep(delayMs, config.signal);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
@@ -1483,6 +1513,7 @@ export async function* agentLoop(
 					model: effectiveModel,
 					requestId,
 				});
+				yield buildRequestEnd(`${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`);
 				yield {
 					type: "invalid_state",
 					reason: "empty_response",
@@ -1523,19 +1554,7 @@ export async function* agentLoop(
 		}
 
 		// Emit API request end event
-		const requestDurationMs = Date.now() - requestStartTime;
-		yield {
-			type: "api_request_end",
-			requestId,
-			credentialId,
-			usage: requestUsage,
-			ttftMs: requestTtftMs,
-			durationMs: requestDurationMs,
-			contextPercent: requestContextPercent,
-			meterUsage: requestMeterUsage,
-			meterUnit: requestMeterUnit,
-			rawDump: requestDump?.snapshot(),
-		};
+		yield buildRequestEnd();
 
 		// Reset retry counter after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.

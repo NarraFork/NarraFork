@@ -309,5 +309,6 @@
 	"usageHistoryViewRawDump": "View raw data",
 	"usageHistoryRawDumpTitle": "Raw request data",
 	"usageHistoryRawDumpLoading": "Loading raw request data...",
-	"usageHistoryRawDumpEmpty": "No raw dump is available for this request yet."
+	"usageHistoryRawDumpEmpty": "No raw dump is available for this request yet.",
+	"usageHistoryError": "Error"
 }

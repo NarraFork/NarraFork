@@ -905,6 +905,8 @@ export const apiRequests = sqliteTable(
 		contextPercent: real("context_percent"),
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
+		// 错误信息（请求失败时记录）
+		errorMessage: text("error_message"),
 		// 原始请求/响应 dump（调试用）
 		rawDumpJson: text("raw_dump_json"),
 		// 时间戳

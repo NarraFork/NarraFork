@@ -809,6 +809,13 @@ const DEFAULT_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"high",
 ];
 
+/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
+const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+	"none",
+	"high",
+	"xhigh",
+];
+
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
 	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
 	// Includes "none" for UI display (disables reasoning). The backend counterpart
@@ -828,6 +835,20 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 function getCodexReasoningEffortOptions(model?: string): readonly ReasoningEffortValue[] {
 	const bareModel = model?.split(":").slice(1).join(":") ?? "";
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
+}
+
+function isDeepSeekModel(model?: string): boolean {
+	if (!model) return false;
+	return model.toLowerCase().includes("deepseek");
+}
+
+function normalizeReasoningEffortForModel(
+	model: string | undefined,
+	effort: string | null | undefined,
+): string {
+	if (!effort) return "";
+	if (isDeepSeekModel(model) && (effort === "low" || effort === "medium")) return "high";
+	return effort;
 }
 
 function ReasoningEffortMenuItems({
@@ -1275,23 +1296,43 @@ export function NarratorPanel({
 		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
 	}, [codexCapableProviders, resolvedModel]);
 
-	// Reasoning effort is supported by both Codex and Anthropic providers
+	// Reasoning effort is supported by Codex, Anthropic, and OpenAI providers
+	// (DeepSeek models via completions mode also support it)
 	const supportsReasoningEffort = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
 		if (codexCapableProviders.has(providerPrefix)) return true;
 		// Check Anthropic providers
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
-		return anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
-	}, [codexCapableProviders, settingsData?.anthropicProviders, resolvedModel]);
+		if (anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
+			return true;
+		}
+		// Check OpenAI providers (completions mode) — DeepSeek models support thinking
+		if (isDeepSeekModel(resolvedModel)) {
+			const openaiProviders = settingsData?.openaiProviders ?? [];
+			return openaiProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix);
+		}
+		return false;
+	}, [
+		codexCapableProviders,
+		settingsData?.anthropicProviders,
+		settingsData?.openaiProviders,
+		resolvedModel,
+	]);
 	const reasoningEffortOptions = useMemo(() => {
 		if (!resolvedModel) return DEFAULT_REASONING_EFFORT_OPTIONS;
+		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
+		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && codexCapableProviders.has(providerPrefix)) {
 			return getCodexReasoningEffortOptions(resolvedModel);
 		}
 		return DEFAULT_REASONING_EFFORT_OPTIONS;
 	}, [codexCapableProviders, resolvedModel]);
+	const displayedReasoningEffort = useMemo(
+		() => normalizeReasoningEffortForModel(resolvedModel, narrator?.reasoningEffort),
+		[resolvedModel, narrator?.reasoningEffort],
+	);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -5120,7 +5161,7 @@ export function NarratorPanel({
 																	label: t(`reasoning_${effort}`),
 																})),
 															]}
-															value={narrator.reasoningEffort ?? ""}
+															value={displayedReasoningEffort}
 															onChange={() => {}}
 															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 															style={{ pointerEvents: "auto" }}
@@ -5128,7 +5169,7 @@ export function NarratorPanel({
 													</Menu.Target>
 													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 														<ReasoningEffortMenuItems
-															currentEffort={narrator.reasoningEffort}
+															currentEffort={displayedReasoningEffort}
 															options={reasoningEffortOptions}
 															onSelect={(e) =>
 																reasoningEffortMutation.mutate({
@@ -5320,7 +5361,7 @@ export function NarratorPanel({
 																	xhigh: "X",
 																};
 																return (
-																	effortMap[narrator.reasoningEffort as keyof typeof effortMap] ??
+																	effortMap[displayedReasoningEffort as keyof typeof effortMap] ??
 																	"A"
 																);
 															})()}
@@ -5329,7 +5370,7 @@ export function NarratorPanel({
 												</Menu.Target>
 												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 													<ReasoningEffortMenuItems
-														currentEffort={narrator.reasoningEffort}
+														currentEffort={displayedReasoningEffort}
 														options={reasoningEffortOptions}
 														onSelect={(e) =>
 															reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })

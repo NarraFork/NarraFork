@@ -37,6 +37,7 @@ export interface UsageHistoryRecord {
 	meterUsage: number | null;
 	meterUnit: string | null;
 	createdAt: string;
+	errorMessage?: string | null;
 	narratorTitle?: string | null;
 	chapterTitle?: string | null;
 	chapterId?: string | null;

@@ -11,7 +11,13 @@ import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from 
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import {
+	type AgentToolUse,
+	ApiError,
+	isDeepSeekModel,
+	mapDeepSeekEffort,
+	type ResolvedToolDefinition,
+} from "./types";
 
 // === Claude Code protocol constants ===
 
@@ -220,9 +226,11 @@ interface AnthropicTool {
 
 // === Model capability detection ===
 
-/** Whether a model supports extended thinking (Claude 3.7 Sonnet, Haiku 4.5+, Opus 4+, Sonnet 4+). */
+/** Whether a model supports extended thinking (Claude 3.7 Sonnet, Haiku 4.5+, Opus 4+, Sonnet 4+, DeepSeek). */
 function supportsThinking(model: string): boolean {
 	const lower = model.toLowerCase();
+	// DeepSeek models support thinking mode via Anthropic-compatible API
+	if (lower.includes("deepseek")) return true;
 	// Claude 3.7 Sonnet
 	if (lower.includes("3-7") || lower.includes("3.7")) return true;
 	// Claude 4+ families (opus-4, sonnet-4, haiku-4)
@@ -275,16 +283,31 @@ function getTokenLimits(model: string): { default: number; upperLimit: number } 
  *
  * The old `{ type: "enabled", budget_tokens: N }` is deprecated by Anthropic
  * in favor of adaptive thinking for all models.
+ *
+ * DeepSeek (via Anthropic-compatible API) does not support `adaptive` —
+ * use `{ type: "enabled", budget_tokens: N }` instead (budget_tokens is
+ * ignored by DeepSeek but required by the schema). Effort is controlled
+ * via `output_config.effort` (see chat method).
  */
 function buildThinkingConfig(
 	model: string,
 	reasoningEffort: string | undefined,
-): { type: "adaptive" } | { type: "disabled" } | undefined {
+):
+	| { type: "adaptive" }
+	| { type: "enabled"; budget_tokens: number }
+	| { type: "disabled" }
+	| undefined {
 	if (!supportsThinking(model)) return undefined;
 
 	// "none" explicitly disables thinking
 	if (reasoningEffort === "none") {
 		return { type: "disabled" };
+	}
+
+	// DeepSeek doesn't support adaptive thinking — use enabled with a
+	// placeholder budget_tokens (DeepSeek ignores the value).
+	if (isDeepSeekModel(model)) {
+		return { type: "enabled", budget_tokens: 10000 };
 	}
 
 	// All supported models use adaptive thinking (matching Claude Code)
@@ -626,6 +649,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		const model = parseModelId(params.model).model;
+		const isDeepSeek = isDeepSeekModel(model);
 
 		// Determine max_tokens based on model capabilities
 		const tokenLimits = getTokenLimits(model);
@@ -654,6 +678,13 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (thinkingEnabled) {
 			filterThinkingOnlyAssistantMessages(messages);
 			stripTrailingThinkingFromLastAssistant(messages);
+
+			// DeepSeek Anthropic-compatible API doesn't support redacted_thinking,
+			// and thinking mode requires thinking blocks on assistant messages.
+			// Sanitize replayed Claude/Anthropic history before sending it.
+			if (isDeepSeek) {
+				sanitizeDeepSeekThinkingBlocks(messages);
+			}
 		}
 
 		const isOfficial = !!this.config.officialApi;
@@ -704,6 +735,15 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial && supportsEffort(model) && thinkingEnabled) {
 			const effort = mapEffortParam(params.reasoningEffort);
 			body.output_config = { effort: effort ?? "medium" };
+		}
+
+		// DeepSeek effort: output_config.effort controls thinking intensity
+		// (DeepSeek supports "high" and "max"; low/medium map to high)
+		if (isDeepSeek && thinkingEnabled) {
+			const effort = mapDeepSeekEffort(params.reasoningEffort);
+			if (effort) {
+				body.output_config = { effort };
+			}
 		}
 
 		body.system = systemBlocks;
@@ -1835,6 +1875,47 @@ function stripThinkingBlocks(messages: AnthropicMessage[]): void {
 			}
 			msg.content = filtered;
 		}
+	}
+}
+
+/**
+ * DeepSeek's Anthropic-compatible API doesn't support redacted_thinking blocks.
+ * Remove them before replay, then patch assistant messages with a regular
+ * thinking block if needed.
+ */
+function sanitizeDeepSeekThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const parts = msg.content as AnthropicContentPart[];
+		const filtered = parts.filter((b) => b.type !== "redacted_thinking");
+		if (filtered.length !== parts.length) {
+			// Preserve a non-empty assistant message if this was not already filtered out.
+			if (
+				!filtered.some((b) => b.type === "thinking" || b.type === "text" || b.type === "tool_use")
+			) {
+				filtered.push({ type: "text", text: "…" });
+			}
+			msg.content = filtered;
+		}
+	}
+	patchMissingThinkingBlocks(messages);
+}
+
+/**
+ * Patch assistant messages that lack a thinking block.
+ * DeepSeek thinking mode (via Anthropic-compatible API) requires a thinking
+ * block on ALL assistant messages, not just those with tool_use. When switching
+ * from a non-thinking model, historical messages lack this — prepend an
+ * empty thinking block so the API doesn't reject the request.
+ */
+function patchMissingThinkingBlocks(messages: AnthropicMessage[]): void {
+	for (const msg of messages) {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		const parts = msg.content as AnthropicContentPart[];
+		const hasThinking = parts.some((b) => b.type === "thinking");
+		if (hasThinking) continue;
+		// Prepend an empty thinking block
+		parts.unshift({ type: "thinking", thinking: "", signature: "" });
 	}
 }
 

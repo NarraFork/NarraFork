@@ -309,5 +309,6 @@
 	"usageHistoryViewRawDump": "查看原始数据",
 	"usageHistoryRawDumpTitle": "原始请求数据",
 	"usageHistoryRawDumpLoading": "正在加载原始请求数据...",
-	"usageHistoryRawDumpEmpty": "这条请求暂时没有可查看的原始 dump。"
+	"usageHistoryRawDumpEmpty": "这条请求暂时没有可查看的原始 dump。",
+	"usageHistoryError": "错误"
 }

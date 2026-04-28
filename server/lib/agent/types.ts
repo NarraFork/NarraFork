@@ -221,6 +221,7 @@ export type AgentEvent =
 			meterUsage?: number;
 			meterUnit?: string;
 			rawDump?: unknown;
+			errorMessage?: string;
 	  }
 	| { type: "silent_disconnect" }
 	| { type: "done" };
@@ -390,6 +391,23 @@ export interface AgentConfig {
 		event: string,
 		payload: Record<string, unknown>,
 	) => Promise<{ outcome: "success" | "blocked" | "error"; reason?: string }>;
+}
+
+// ── Model detection helpers ──────────────────────────────────────────────────
+
+/** Whether a model name refers to a DeepSeek model. */
+export function isDeepSeekModel(model: string): boolean {
+	return model.toLowerCase().includes("deepseek");
+}
+
+/**
+ * Map reasoning effort to DeepSeek effort value.
+ * DeepSeek supports "high" and "max" — low/medium map to high, xhigh maps to max.
+ */
+export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
+	if (!reasoningEffort || reasoningEffort === "none") return undefined;
+	if (reasoningEffort === "xhigh") return "max";
+	return "high";
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

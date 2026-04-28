@@ -26,6 +26,7 @@ import {
 	IconClock,
 	IconCodeDots,
 	IconDeviceFloppy,
+	IconExclamationCircle,
 	IconToggleLeft,
 	IconToggleRight,
 } from "@tabler/icons-react";
@@ -217,10 +218,23 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											</Text>
 										) : null}
 									</Stack>
-									<Badge color={getProviderColor(record.provider)} variant="light" size="sm">
-										{record.provider ?? "-"}
-									</Badge>
+									<Group gap={4} wrap="nowrap">
+										{record.errorMessage ? (
+											<Badge color="red" variant="light" size="sm">
+												{t("usageHistoryError")}
+											</Badge>
+										) : null}
+										<Badge color={getProviderColor(record.provider)} variant="light" size="sm">
+											{record.provider ?? "-"}
+										</Badge>
+									</Group>
 								</Group>
+
+								{record.errorMessage ? (
+									<Text size="xs" c="red" lineClamp={2}>
+										{record.errorMessage}
+									</Text>
+								) : null}
 
 								<SimpleGrid cols={1} spacing="xs">
 									<DetailField
@@ -354,7 +368,21 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 								<Table.Tr key={record.id}>
 									<Table.Td>
 										<Stack gap={2}>
-											<Text size="sm">{new Date(record.createdAt).toLocaleString()}</Text>
+											<Group gap={6} wrap="nowrap">
+												<Text size="sm">{new Date(record.createdAt).toLocaleString()}</Text>
+												{record.errorMessage ? (
+													<Tooltip label={record.errorMessage} multiline maw={400}>
+														<Badge
+															color="red"
+															variant="light"
+															size="xs"
+															leftSection={<IconExclamationCircle size={10} />}
+														>
+															{t("usageHistoryError")}
+														</Badge>
+													</Tooltip>
+												) : null}
+											</Group>
 											{record.chapterTitle ? (
 												<Text size="xs" c="dimmed">
 													{record.chapterTitle}

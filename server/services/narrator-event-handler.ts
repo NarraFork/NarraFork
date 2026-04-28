@@ -1451,6 +1451,9 @@ export async function processEvent(
 			const apiRequestId = generateId();
 
 			try {
+				// Persist raw dump if available (controlled by agent.requestDumpEnabled setting).
+				const rawDump = event.rawDump ? JSON.stringify(event.rawDump) : null;
+
 				await db.insert(apiRequests).values({
 					id: apiRequestId,
 					narratorId,
@@ -1471,11 +1474,14 @@ export async function processEvent(
 					contextPercent: event.contextPercent ?? null,
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
-					rawDumpJson: event.rawDump ? JSON.stringify(event.rawDump) : null,
+					errorMessage: event.errorMessage ?? null,
+					rawDumpJson: rawDump,
 					createdAt: new Date().toISOString(),
 				});
-				if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
-				ctx.pendingApiRequestIds.push(apiRequestId);
+				if (!event.errorMessage) {
+					if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
+					ctx.pendingApiRequestIds.push(apiRequestId);
+				}
 			} catch (error) {
 				logger.error("Failed to create API request record", {
 					narratorId,

@@ -15,7 +15,13 @@ import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from 
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import {
+	type AgentToolUse,
+	ApiError,
+	isDeepSeekModel,
+	mapDeepSeekEffort,
+	type ResolvedToolDefinition,
+} from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -342,7 +348,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	async buildHistory(
 		dbMessages: DbMessage[],
-		_model: string,
+		model: string,
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
 		if (this.responsesFormat) {
@@ -351,6 +357,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const result = buildOAIHistory(dbMessages);
 		// Chat Completions path: convert _reasoningBlocks to reasoning_content
 		// for models that require reasoning_content to be passed back (e.g. DeepSeek, QwQ).
+		const isDeepSeek = isDeepSeekModel(model);
 		for (const msg of result.history) {
 			// biome-ignore lint/suspicious/noExplicitAny: OAIMessage has _reasoningBlocks
 			const m = msg as any;
@@ -367,6 +374,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			if (m._reasoningTextFallback !== undefined) {
 				delete m._reasoningTextFallback;
+			}
+			// DeepSeek thinking mode requires reasoning_content on ALL assistant
+			// messages (not just those with tool_calls). When switching from a
+			// non-thinking model, historical messages lack this field — patch
+			// with empty string so the API doesn't reject the request.
+			if (isDeepSeek && m.role === "assistant" && m.reasoning_content == null) {
+				m.reasoning_content = "";
 			}
 		}
 		return result;
@@ -552,6 +566,19 @@ export class OpenAIProvider implements ProviderAdapter {
 				stream_options: { include_usage: true },
 			};
 			if (tools.length > 0) body.tools = tools;
+
+			// DeepSeek thinking mode: pass reasoning_effort and thinking config.
+			if (isDeepSeekModel(model)) {
+				if (params.reasoningEffort === "none") {
+					body.thinking = { type: "disabled" };
+				} else {
+					body.thinking = { type: "enabled" };
+					const effort = mapDeepSeekEffort(params.reasoningEffort);
+					if (effort) {
+						body.reasoning_effort = effort;
+					}
+				}
+			}
 		}
 
 		const requestHeaders = this.buildHeaders(apiKey);
