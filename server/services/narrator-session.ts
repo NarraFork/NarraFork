@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { formatFileSize } from "@shared/text-file-types";
-import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	chapters,
@@ -19,7 +20,11 @@ import { OPTIONAL_TOOLS, OVERSEER_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { isSubagentVariant, parseSubstatus } from "../lib/narrator-utils";
+import {
+	isReadOnlySubagentVariant,
+	isSubagentVariant,
+	parseSubstatus,
+} from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
@@ -58,6 +63,18 @@ import { narratorService } from "./narrator-service";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 import { reviewService } from "./review-service";
+import {
+	deleteConclusionFileId,
+	getConclusionEntry,
+	setConclusionFileId,
+} from "./subagent-conclusion";
+import {
+	getConclusionWatcher,
+	getManualOverrideMap,
+	registerConclusionWatcher,
+	removeConclusionWatcher,
+	resolveManualOverride,
+} from "./subagent-manual-override";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
@@ -438,6 +455,19 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 	);
 }
 
+async function getLatestSubagentParentToolUseId(narratorId: string): Promise<string | undefined> {
+	const latestSubMsg = await db.query.narratorMessages.findFirst({
+		where: and(
+			eq(narratorMessages.narratorId, narratorId),
+			eq(narratorMessages.role, "user"),
+			isNotNull(narratorMessages.parentToolUseId),
+		),
+		columns: { parentToolUseId: true },
+		orderBy: [desc(narratorMessages.createdAt)],
+	});
+	return latestSubMsg?.parentToolUseId ?? undefined;
+}
+
 // === Shared context management hooks ===
 
 export interface ContextManagementOptions {
@@ -652,6 +682,25 @@ export async function runAgentLoop(
 	let interruptionRetries = 0;
 	const MAX_INTERRUPTION_RETRIES = 3;
 
+	// --- Subagent dual-broadcast setup ---
+	// When runAgentLoop runs for a taken-over subagent, we need to broadcast
+	// events to the parent narrator so the SubagentCard updates in real time.
+	// Resolve parentNarratorId + parentToolUseId once before the loop.
+	let saParentNarratorId: string | undefined;
+	let saParentToolUseId: string | undefined;
+	{
+		const initNarrator = await narratorService.getById(narratorId);
+		if (isSubagentVariant(initNarrator.variant) && initNarrator.parentNarratorId) {
+			const watcher = getConclusionWatcher(narratorId);
+			const parentToolUseId =
+				watcher?.toolUseId ?? (await getLatestSubagentParentToolUseId(narratorId));
+			if (parentToolUseId) {
+				saParentNarratorId = watcher?.parentNarratorId ?? initNarrator.parentNarratorId;
+				saParentToolUseId = parentToolUseId;
+			}
+		}
+	}
+
 	try {
 		while (active.alive) {
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
@@ -702,13 +751,17 @@ export async function runAgentLoop(
 
 			const eventContext: EventHandlerContext = {
 				narratorId,
-				broadcastTargetId: narratorId,
+				broadcastTargetId: saParentNarratorId ?? narratorId,
 				sseEmitter: active.events,
 				conversationId: active.conversationId,
 				locale: active.locale,
 				providerPrefix: resolved.provider,
 				provider: resolved.provider,
 				model: resolved.model,
+				// Subagent dual-broadcast fields — when set, dualBroadcast sends
+				// events to both the parent narrator and the subagent's own page.
+				parentToolUseId: saParentToolUseId,
+				subagentModel: saParentNarratorId ? resolved.model : undefined,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
@@ -1716,7 +1769,8 @@ export async function runAgentLoop(
 				const overseerQueue = pendingOverseerMessages.get(narratorId);
 				let nextValid: OverseerQueuedMessage | undefined;
 				while (overseerQueue && overseerQueue.length > 0) {
-					const candidate = overseerQueue.shift()!;
+					const candidate = overseerQueue.shift();
+					if (!candidate) break;
 					if (overseerQueue.length === 0) pendingOverseerMessages.delete(narratorId);
 					if (pendingPermissions.has(candidate.requestId)) {
 						nextValid = candidate;
@@ -1789,14 +1843,34 @@ export async function runAgentLoop(
 				columns: { variant: true, parentNarratorId: true },
 			});
 			if (narr && isSubagentVariant(narr.variant)) {
-				const { getConclusionWatcher, removeConclusionWatcher } = await import(
-					"./narrator-subagent"
-				);
+				// For explore/plan subagents with a conclusion file, prefer reading
+				// the file content over extracting from the last assistant message.
+				let lastFinalText: string | undefined;
+				const concEntry = getConclusionEntry(narratorId);
+				if (concEntry) {
+					try {
+						if (existsSync(concEntry.absPath)) {
+							const content = readFileSync(concEntry.absPath, "utf-8").trim();
+							if (content && !loopHadError) {
+								lastFinalText = content;
+							}
+							rmSync(concEntry.absPath, { force: true });
+						}
+					} catch (err) {
+						logger.warn("Failed to read/cleanup takeover conclusion file", {
+							narratorId,
+							path: concEntry.absPath,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+					deleteConclusionFileId(narratorId);
+				}
+				if (!lastFinalText) {
+					lastFinalText = await getSubagentFinalText(narratorId);
+				}
 
-				const lastFinalText = await getSubagentFinalText(narratorId);
-
-				if (getConclusionWatcher(narratorId)) {
-					const watcher = getConclusionWatcher(narratorId)!;
+				const watcher = getConclusionWatcher(narratorId);
+				if (watcher) {
 					removeConclusionWatcher(narratorId);
 					// Resolve the last assistant message ID for result binding
 					const resultMsgId = await getSubagentResultMessageId(narratorId);
@@ -1959,50 +2033,52 @@ export async function runAgentLoop(
 			!loopHadError &&
 			(bufferedMessages.get(narratorId)?.length ?? 0) > 0
 		) {
-			const queue = bufferedMessages.get(narratorId)!;
-			const first = queue.shift()!;
-			if (queue.length === 0) bufferedMessages.delete(narratorId);
-			dbConsumeBuffered(first.id);
-			broadcastToNarrator(narratorId, {
-				type: "buffer_consumed",
-				narratorId,
-				messageId: first.id,
-				remaining: toBufferSummary(getBufferedMessages(narratorId)),
-			});
-
-			// Fire-and-forget: start a new session with the first buffered message.
-			// feedMessage handles ensureNarrator + persistUserMessage + runAgentLoop.
-			feedMessage(
-				narratorId,
-				first.text,
-				first.images,
-				locale,
-				active._replyInUserLanguage ?? false,
-				first.commandText,
-				first.createdBy,
-				first.textFiles,
-			)
-				.then(({ userMsg }) => {
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: userMsg,
-					});
-				})
-				.catch(async (err) => {
-					logger.error("Auto-resume after interrupt failed", {
-						narratorId,
-						error: String(err),
-					});
-					await narratorService
-						.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(err) })
-						.catch(() => {});
-					broadcastToNarrator(narratorId, {
-						type: "narrator_error",
-						narratorId,
-						error: String(err),
-					});
+			const queue = bufferedMessages.get(narratorId);
+			const first = queue?.shift();
+			if (queue && first) {
+				if (queue.length === 0) bufferedMessages.delete(narratorId);
+				dbConsumeBuffered(first.id);
+				broadcastToNarrator(narratorId, {
+					type: "buffer_consumed",
+					narratorId,
+					messageId: first.id,
+					remaining: toBufferSummary(getBufferedMessages(narratorId)),
 				});
+
+				// Fire-and-forget: start a new session with the first buffered message.
+				// feedMessage handles ensureNarrator + persistUserMessage + runAgentLoop.
+				feedMessage(
+					narratorId,
+					first.text,
+					first.images,
+					locale,
+					active._replyInUserLanguage ?? false,
+					first.commandText,
+					first.createdBy,
+					first.textFiles,
+				)
+					.then(({ userMsg }) => {
+						broadcastToNarrator(narratorId, {
+							type: "user_message",
+							narratorId,
+							message: userMsg,
+						});
+					})
+					.catch(async (err) => {
+						logger.error("Auto-resume after interrupt failed", {
+							narratorId,
+							error: String(err),
+						});
+						await narratorService
+							.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(err) })
+							.catch(() => {});
+						broadcastToNarrator(narratorId, {
+							type: "narrator_error",
+							narratorId,
+							error: String(err),
+						});
+					});
+			}
 		}
 	}
 }
@@ -2109,29 +2185,22 @@ async function feedMessage(
 	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		const currentSubstatus = parseSubstatus(narrator.substatus);
 		if (currentSubstatus.includes("manual_override")) {
-			const { isManualOverride, resolveManualOverride, registerConclusionWatcher } = await import(
-				"./narrator-subagent"
-			);
-			if (isManualOverride(narratorId)) {
+			const overrideEntry = getManualOverrideMap().get(narratorId);
+			if (overrideEntry) {
 				const currentFinalText = await getSubagentFinalText(narratorId);
-				resolveManualOverride(narratorId, currentFinalText, false);
-				// Find the parentToolUseId to register a conclusion watcher
-				const firstSubMsg = await db.query.narratorMessages.findFirst({
-					where: and(
-						eq(narratorMessages.narratorId, narratorId),
-						eq(narratorMessages.role, "user"),
-						isNotNull(narratorMessages.parentToolUseId),
-					),
-					columns: { parentToolUseId: true },
-					orderBy: narratorMessages.createdAt,
-				});
-				if (firstSubMsg?.parentToolUseId) {
-					registerConclusionWatcher(
-						narratorId,
-						narrator.parentNarratorId,
-						firstSubMsg.parentToolUseId,
-					);
+
+				// Set up conclusion file for explore/plan subagents so that
+				// Write/Edit are properly redirected during the takeover run.
+				if (isReadOnlySubagentVariant(narrator.variant)) {
+					setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
 				}
+
+				registerConclusionWatcher(
+					narratorId,
+					overrideEntry.parentNarratorId,
+					overrideEntry.toolUseId,
+				);
+				resolveManualOverride(narratorId, currentFinalText, false);
 			}
 		}
 	}

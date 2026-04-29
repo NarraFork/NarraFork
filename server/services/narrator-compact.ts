@@ -138,9 +138,10 @@ async function doRunCustomCompact(
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { pruneBoundaryMessageId: true },
+		columns: { pruneBoundaryMessageId: true, variant: true },
 	});
 	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
+	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 
 	try {
 		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
@@ -162,13 +163,19 @@ async function doRunCustomCompact(
 		}
 		await narratorService.clearPruneBoundary(narratorId);
 
-		const transitioned = await narratorService.compareAndSetStatus(narratorId, "idle", "idle", {
-			substatus: [],
-		});
-		if (!transitioned) {
-			logger.info("Skipping idle transition after compact — narrator already moved on", {
-				narratorId,
+		// Only transition status for primary narrators.
+		// Subagents manage their own lifecycle via finalizeSubagent — touching
+		// their status/substatus here creates a race that can clear substatus=["unread"]
+		// after the subagent has already been finalized.
+		if (!isSubagent) {
+			const transitioned = await narratorService.compareAndSetStatus(narratorId, "idle", "idle", {
+				substatus: [],
 			});
+			if (!transitioned) {
+				logger.info("Skipping idle transition after compact — narrator already moved on", {
+					narratorId,
+				});
+			}
 		}
 
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
@@ -205,10 +212,17 @@ async function doRunCustomCompact(
 		}
 
 		await narratorService.clearPruneBoundary(narratorId).catch(() => {});
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: `Compact failed: ${errorMsg}`,
-		});
+		// Only override status for primary narrators — subagent status is
+		// managed by finalizeSubagent; overwriting it here would race.
+		if (!isSubagent) {
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: `Compact failed: ${errorMsg}`,
+			});
+		}
+		// activeNarrators only tracks primary narrators; subagents are not
+		// registered there, so this abort is a no-op for them (which is fine —
+		// the subagent's own signal is managed by executeSubagent).
 		const active = activeNarrators.get(narratorId);
 		if (active?.alive) {
 			active.abortController.abort();

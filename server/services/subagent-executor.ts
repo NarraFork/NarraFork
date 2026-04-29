@@ -351,6 +351,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		setConclusionFileId(narratorId, conclusionFileId, cwd);
 	}
 
+	// Compact-done flag: set by onCompactDone, consumed by onBeforeTurn to
+	// rebuild history/systemPrompt within the same agent loop (inner path).
+	// The outer needsRestart flag is a fallback for when compact finishes
+	// after the agent loop has already returned.
+	let compactDoneFlag = false;
+	let compactConsumedInLoop = false;
+
 	// Build context management hooks (prune + compact) for all subagent types
 	const ctxMgmt = buildContextManagementHooks({
 		narratorId,
@@ -365,6 +372,19 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		onCompactDone: () => {
 			needsRestart = true;
 			currentConversationId = randomUUID();
+			compactDoneFlag = true;
+		},
+		isCompactDone: () => compactDoneFlag,
+		clearCompactDone: () => {
+			compactDoneFlag = false;
+			compactConsumedInLoop = true;
+		},
+		rebuildSystemPrompt: async () => {
+			const freshNarrator = await narratorService.getById(narratorId);
+			if (opts.rebuildSystemPrompt) {
+				return opts.rebuildSystemPrompt(freshNarrator.contextSummary);
+			}
+			return null;
 		},
 	});
 
@@ -507,6 +527,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		};
 
 		needsRestart = false;
+		compactConsumedInLoop = false;
 
 		const result = await executeAgentLoop({
 			config,
@@ -652,6 +673,21 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		}
 
 		if (!needsRestart || signal.aborted || hasError) break;
+
+		// If onBeforeTurn already handled the compact (inner path), the flag
+		// was cleared and needsRestart is stale. Skip the outer restart.
+		// Do not key this on finalText: explore/plan subagents may write their
+		// actual result to the conclusion file, which is read after the loop.
+		if (compactConsumedInLoop && !compactDoneFlag && !result.contextLengthExceeded) {
+			logger.info("Subagent compact already handled by onBeforeTurn, skipping outer restart", {
+				narratorId,
+				parentNarratorId,
+				finalTextLength: finalText.length,
+			});
+			needsRestart = false;
+			break;
+		}
+		compactDoneFlag = false;
 
 		// Compact completed mid-turn — restart with fresh history
 		logger.info("Subagent restarting after compact", { narratorId, parentNarratorId });
