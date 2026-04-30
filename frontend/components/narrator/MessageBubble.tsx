@@ -50,7 +50,16 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	createContext,
+	memo,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -76,6 +85,25 @@ import {
 	type PendingPermission,
 	ToolCallCard,
 } from "./ToolCallCard";
+
+// --- Editing message context ---
+// Allows MessageBubble to register its active editing state so that the
+// parent NarratorPanel can wire the bottom send/retry button to trigger
+// the edit-and-regenerate flow instead of the default action.
+export interface EditingMessageState {
+	/** Submit the current edit (equivalent to clicking "Save & Retry") */
+	submit: () => void;
+	/** Whether the edit content is non-empty and submittable */
+	canSubmit: boolean;
+}
+
+export const EditingMessageCtx = createContext<{
+	register: (state: EditingMessageState) => void;
+	unregister: () => void;
+}>({
+	register: () => {},
+	unregister: () => {},
+});
 
 // Module-level map that persists reasoning expand/collapse state across
 // component remounts (e.g. when streaming __streaming__ → real message).
@@ -2245,6 +2273,21 @@ export const MessageBubble = memo(function MessageBubble({
 		},
 		[userPrefs?.sendMode, editContent, handleConfirmClick],
 	);
+
+	// Register/unregister editing state with parent NarratorPanel so the
+	// bottom send/retry button can trigger the edit submit.
+	const editingCtx = useContext(EditingMessageCtx);
+	const handleConfirmClickRef = useRef(handleConfirmClick);
+	handleConfirmClickRef.current = handleConfirmClick;
+	useEffect(() => {
+		if (isEditing) {
+			editingCtx.register({
+				submit: () => handleConfirmClickRef.current(),
+				canSubmit: !!editContent.trim(),
+			});
+			return () => editingCtx.unregister();
+		}
+	}, [isEditing, editContent, editingCtx]);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages

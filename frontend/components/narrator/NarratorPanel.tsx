@@ -143,6 +143,7 @@ import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
+import { EditingMessageCtx, type EditingMessageState } from "./MessageBubble";
 import {
 	type RenderedTreeElementMeta,
 	RenderProgress,
@@ -1412,6 +1413,18 @@ export function NarratorPanel({
 			}
 		},
 		[narratorId, t],
+	);
+
+	// --- Editing message state ---
+	// Tracks when a MessageBubble is in edit mode so the bottom send/retry
+	// button can trigger the edit submit instead of the default action.
+	const [editingMessageState, setEditingMessageState] = useState<EditingMessageState | null>(null);
+	const editingMessageCtxValue = useMemo(
+		() => ({
+			register: (state: EditingMessageState) => setEditingMessageState(state),
+			unregister: () => setEditingMessageState(null),
+		}),
+		[],
 	);
 
 	// --- Input management ---
@@ -4477,37 +4490,48 @@ export function NarratorPanel({
 							<MessageSelectionCtx.Provider value={selectionCtxValue}>
 								<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
 									<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-										{isWorkspacePreview ? (
-											<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
-												<Box
-													px="md"
-													pt="md"
-													style={{
-														position: "absolute",
-														left: 0,
-														right: 0,
-														bottom: 0,
-														display: "flex",
-														flexDirection: "column",
-														gap: 12,
-													}}
-												>
-													{renderedElements.map((element, index) => (
-														<Box
-															key={renderedKeys[index] ?? `preview-${index}`}
-															style={{ flex: "0 0 auto", minWidth: 0 }}
-														>
-															{element}
-														</Box>
-													))}
+										<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+											{isWorkspacePreview ? (
+												<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
+													<Box
+														px="md"
+														pt="md"
+														style={{
+															position: "absolute",
+															left: 0,
+															right: 0,
+															bottom: 0,
+															display: "flex",
+															flexDirection: "column",
+															gap: 12,
+														}}
+													>
+														{renderedElements.map((element, index) => (
+															<Box
+																key={renderedKeys[index] ?? `preview-${index}`}
+																style={{ flex: "0 0 auto", minWidth: 0 }}
+															>
+																{element}
+															</Box>
+														))}
+													</Box>
 												</Box>
-											</Box>
-										) : advancedAnim ? (
-											<BlurInOnAppearProvider
-												scopeKey={narratorId}
-												suppress={suppressBlurIn}
-												seedIds={blurInSeedIds}
-											>
+											) : advancedAnim ? (
+												<BlurInOnAppearProvider
+													scopeKey={narratorId}
+													suppress={suppressBlurIn}
+													seedIds={blurInSeedIds}
+												>
+													<BroadMessageList
+														ref={virtualListRef}
+														elements={renderedElements}
+														elementKeys={renderedKeys}
+														scrollRef={viewportCallbackRef}
+														contentRef={contentRef}
+														shift={shifting}
+													/>
+												</BlurInOnAppearProvider>
+											) : (
 												<BroadMessageList
 													ref={virtualListRef}
 													elements={renderedElements}
@@ -4516,17 +4540,8 @@ export function NarratorPanel({
 													contentRef={contentRef}
 													shift={shifting}
 												/>
-											</BlurInOnAppearProvider>
-										) : (
-											<BroadMessageList
-												ref={virtualListRef}
-												elements={renderedElements}
-												elementKeys={renderedKeys}
-												scrollRef={viewportCallbackRef}
-												contentRef={contentRef}
-												shift={shifting}
-											/>
-										)}
+											)}
+										</EditingMessageCtx.Provider>
 									</LatestTodosToolUseIdCtx.Provider>
 								</FileModDrawerCtx.Provider>
 							</MessageSelectionCtx.Provider>
@@ -5554,6 +5569,19 @@ export function NarratorPanel({
 										!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
 									const showContinue =
 										!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
+									// When a message is being edited, the send/retry button
+									// should trigger the edit submit instead.
+									if (editingMessageState && !showInterrupt) {
+										return (
+											<Button
+												key="edit-submit"
+												onClick={editingMessageState.submit}
+												disabled={!editingMessageState.canSubmit}
+											>
+												{t("editSubmit")}
+											</Button>
+										);
+									}
 									if (showInterrupt) {
 										return (
 											<Button

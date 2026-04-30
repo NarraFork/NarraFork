@@ -222,9 +222,7 @@ export function parseModelId(raw?: string): { provider?: string; model: string }
 	const idx = raw.indexOf(":");
 	if (idx > 0) {
 		const prefix = raw.slice(0, idx);
-		if (/^[a-zA-Z0-9_-]+$/.test(prefix)) {
-			return { provider: prefix, model: raw.slice(idx + 1) };
-		}
+		return { provider: prefix, model: raw.slice(idx + 1) };
 	}
 	return { model: raw };
 }

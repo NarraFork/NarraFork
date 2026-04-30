@@ -28,7 +28,7 @@ export interface McpServerStatus {
 	env?: Record<string, string>;
 	headers?: Record<string, string>;
 	enabled: boolean;
-	defaultBehavior?: "allow" | "ask" | "deny";
+	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
 	toolPermissions?: Array<{ toolName: string; behavior: string; enabled?: boolean }>;
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;

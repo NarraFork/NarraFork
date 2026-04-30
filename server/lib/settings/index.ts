@@ -223,6 +223,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		}
 	}
 
+	if (migrateLegacyMcpBehaviors(merged)) {
+		needsSave = true;
+	}
+
 	// Clean up agent fields that reference models from providers no longer in settings
 	const activePrefixes = new Set<string>();
 	for (const prov of merged.openaiProviders ?? []) {
@@ -252,6 +256,32 @@ function loadSettingsFromDisk(): NarraForkSettings {
 /** Simple 8-char random ID for migration (avoids importing nanoid at this level). */
 function generateMigrationId(): string {
 	return randomBytes(6).toString("base64url").slice(0, 8);
+}
+
+type LegacyMcpServerConfig = {
+	defaultBehavior?: string;
+	toolPermissions?: Array<{ behavior?: string }>;
+};
+
+/** Migrate pre readOnly/readWrite MCP behavior values. */
+export function migrateLegacyMcpBehaviors(settings: NarraForkSettings): boolean {
+	let dirty = false;
+	const servers = Array.isArray(settings.mcpServers)
+		? (settings.mcpServers as LegacyMcpServerConfig[])
+		: [];
+	for (const server of servers) {
+		if (server.defaultBehavior === "allow") {
+			server.defaultBehavior = "readWrite";
+			dirty = true;
+		}
+		for (const rule of server.toolPermissions ?? []) {
+			if (rule.behavior === "allow") {
+				rule.behavior = "readWrite";
+				dirty = true;
+			}
+		}
+	}
+	return dirty;
 }
 
 /**

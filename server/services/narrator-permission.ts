@@ -593,21 +593,49 @@ export interface PermissionDecisionMeta {
 }
 
 /**
+ * Map a four-level MCP behavior to a final permission decision based on the
+ * narrator's effective permission mode.
+ *
+ *   readOnly  → allow in all interactive modes (including readOnly), deny in dontAsk
+ *   readWrite → allow in acceptEdits/bypassPermissions, ask in default, deny in readOnly/dontAsk
+ *   allow     → legacy auto-allow, denied in readOnly/dontAsk
+ *   ask       → ask in interactive modes, deny in dontAsk
+ *   deny      → always deny
+ */
+function mapMcpBehaviorToDecision(
+	behavior: string,
+	effectiveMode: string,
+): "allow" | "deny" | "ask" {
+	switch (behavior) {
+		case "readOnly":
+			return effectiveMode === "dontAsk" ? "deny" : "allow";
+		case "readWrite":
+			if (effectiveMode === "bypassPermissions" || effectiveMode === "acceptEdits") return "allow";
+			if (effectiveMode === "readOnly" || effectiveMode === "dontAsk") return "deny";
+			return "ask"; // default mode
+		case "allow": // legacy value from pre readOnly/readWrite MCP settings
+			return effectiveMode === "readOnly" || effectiveMode === "dontAsk" ? "deny" : "allow";
+		case "ask":
+			return effectiveMode === "dontAsk" ? "deny" : "ask";
+		case "deny":
+			return "deny";
+		default:
+			return "ask";
+	}
+}
+
+/**
  * Resolve MCP tool permission from server-level config.
  * Checks per-tool overrides first, then server defaultBehavior.
  * Returns null when no MCP-specific config applies (fall through to normal logic).
- *
- * Only applies when effectiveMode is "default" or "acceptEdits" — modes like
- * bypassPermissions/dontAsk/readOnly are already handled before this is called.
  */
 function resolveMcpToolPermission(
 	toolName: string,
 	effectiveMode: string,
 ): "allow" | "deny" | "ask" | null {
 	if (!toolName.startsWith("mcp__")) return null;
-	// Only override in interactive modes — bypassPermissions/dontAsk/readOnly
-	// are handled earlier in the decision chain.
-	if (effectiveMode !== "default" && effectiveMode !== "acceptEdits") return null;
+	// bypassPermissions is handled upstream — everything is auto-allowed.
+	if (effectiveMode === "bypassPermissions") return null;
 
 	// Look up tool metadata from the registry
 	const toolDef = toolRegistry.get(toolName);
@@ -624,11 +652,13 @@ function resolveMcpToolPermission(
 		const toolPerm = serverConfig.toolPermissions.find(
 			(tp) => tp.toolName === meta.mcpToolName && tp.enabled !== false,
 		);
-		if (toolPerm) return toolPerm.behavior;
+		if (toolPerm) return mapMcpBehaviorToDecision(toolPerm.behavior, effectiveMode);
 	}
 
 	// Server-level default
-	if (serverConfig.defaultBehavior) return serverConfig.defaultBehavior;
+	if (serverConfig.defaultBehavior) {
+		return mapMcpBehaviorToDecision(serverConfig.defaultBehavior, effectiveMode);
+	}
 
 	return null;
 }

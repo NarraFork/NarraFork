@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod/v4";
 import type { BashAnalysis } from "../../../server/lib/agent/bash-analyze";
+import { toolRegistry } from "../../../server/lib/agent/tool-registry";
+import { getDefaults, migrateLegacyMcpBehaviors, settings } from "../../../server/lib/settings";
 import {
 	extractToolPaths,
 	isInsideWorktree,
@@ -9,6 +12,45 @@ import {
 } from "../../../server/services/narrator-session";
 
 const TRUNCATE_DIR = join(tmpdir(), "narrafork-tool-output");
+
+type PermissionDecision = ReturnType<typeof resolvePermissionDecision>;
+
+function resolveMockMcpDecision(behavior: string, permMode: string): PermissionDecision {
+	const previousServers = settings.mcpServers;
+	const serverId = "mock-mcp";
+	const toolName = "mcp__mock__tool";
+	settings.mcpServers = [
+		{
+			id: serverId,
+			name: "mock",
+			transport: "stdio",
+			enabled: true,
+			defaultBehavior: behavior as "readWrite",
+		},
+	];
+	toolRegistry.register({
+		name: toolName,
+		description: "Mock MCP tool",
+		parameters: z.object({}),
+		metadata: {
+			mcpServerId: serverId,
+			mcpServerName: "mock",
+			mcpToolName: "tool",
+		},
+		execute: async () => ({ output: "ok" }),
+	});
+	try {
+		return resolvePermissionDecision({
+			toolName,
+			input: {},
+			permMode,
+			cwd: "/home/user/project",
+		});
+	} finally {
+		toolRegistry.unregister(toolName);
+		settings.mcpServers = previousServers;
+	}
+}
 
 function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 	return {
@@ -25,6 +67,30 @@ function makeBashAnalysis(partial: Partial<BashAnalysis> = {}): BashAnalysis {
 		...partial,
 	};
 }
+
+// ============================================================
+// Settings migrations
+// ============================================================
+
+describe("migrateLegacyMcpBehaviors", () => {
+	test("maps legacy MCP allow behavior to readWrite", () => {
+		const draft = getDefaults();
+		draft.mcpServers = [
+			{
+				id: "legacy",
+				name: "legacy",
+				transport: "stdio",
+				enabled: true,
+				defaultBehavior: "allow" as "readWrite",
+				toolPermissions: [{ toolName: "tool", behavior: "allow" as "readWrite" }],
+			},
+		];
+
+		expect(migrateLegacyMcpBehaviors(draft)).toBe(true);
+		expect(draft.mcpServers[0].defaultBehavior).toBe("readWrite");
+		expect(draft.mcpServers[0].toolPermissions?.[0]?.behavior).toBe("readWrite");
+	});
+});
 
 // ============================================================
 // isInsideWorktree
@@ -285,6 +351,16 @@ describe("resolvePermissionDecision", () => {
 				cwd: CWD,
 			}),
 		).toBe("deny");
+	});
+
+	test("MCP ask behavior respects dontAsk mode", () => {
+		expect(resolveMockMcpDecision("ask", "default")).toBe("ask");
+		expect(resolveMockMcpDecision("ask", "dontAsk")).toBe("deny");
+	});
+
+	test("legacy MCP allow behavior is denied in dontAsk mode", () => {
+		expect(resolveMockMcpDecision("allow", "default")).toBe("allow");
+		expect(resolveMockMcpDecision("allow", "dontAsk")).toBe("deny");
 	});
 
 	// --- default mode: internal paths ---

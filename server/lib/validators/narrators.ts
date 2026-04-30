@@ -157,14 +157,7 @@ export const askInPassingStartSchema = z.object({
 });
 
 export const updateNarratorModelSchema = z.object({
-	model: z.union([
-		z.literal("__default__"),
-		z
-			.string()
-			.min(1)
-			.max(200)
-			.regex(/^[a-zA-Z0-9._:/-]+$/, "Invalid model identifier"),
-	]),
+	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
 });
 
 // === Narrator suggest answers ===

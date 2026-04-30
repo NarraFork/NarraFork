@@ -75,6 +75,7 @@ import {
 	removeConclusionWatcher,
 	resolveManualOverride,
 } from "./subagent-manual-override";
+import { isMcpToolAllowedForNarrator } from "./subagent-tools";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
@@ -1168,6 +1169,10 @@ export async function runAgentLoop(
 					// Review tools: only available for review chapter narrators
 					if (REVIEW_TOOLS.has(tool.name)) {
 						return active._chapterRole === "review";
+					}
+					// MCP tools: exclude tools with "deny" behavior
+					if (tool.name.startsWith("mcp__")) {
+						return isMcpToolAllowedForNarrator(tool);
 					}
 					return true;
 				},

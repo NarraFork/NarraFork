@@ -235,7 +235,9 @@ mcpRoutes.post("/", async (c) => {
 
 // === External MCP server management ===
 
-const mcpBehaviorSchema = z.enum(["allow", "ask", "deny"]);
+const mcpBehaviorSchema = z
+	.enum(["allow", "readOnly", "readWrite", "ask", "deny"])
+	.transform((behavior) => (behavior === "allow" ? "readWrite" : behavior));
 const mcpToolPermissionInputSchema = z.object({
 	toolName: z.string().min(1).max(200),
 	behavior: mcpBehaviorSchema,
