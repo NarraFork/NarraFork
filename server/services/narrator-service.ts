@@ -737,6 +737,8 @@ export const narratorService = {
 			inheritMode?: "full" | "compressed" | "fresh";
 			locale?: string;
 			forkMessageId?: string;
+			/** Allow forking a chapter-bound narrator into a standalone narrator (no chapter). */
+			standalone?: boolean;
 		},
 	) {
 		const parent = await this.getById(parentNarratorId);
@@ -745,7 +747,7 @@ export const narratorService = {
 			throw new ValidationError("Cannot fork from a subagent narrator");
 		}
 
-		if (parent.chapterId && !opts?.newChapterId) {
+		if (parent.chapterId && !opts?.newChapterId && !opts?.standalone) {
 			throw new ValidationError(
 				"Chapter-bound narrators can only be forked together with a chapter",
 			);

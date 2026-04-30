@@ -12,6 +12,7 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
+import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -726,6 +727,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			result?: string;
 			outputIndex?: number;
 		}>,
+		textOutputIndex?: number,
 	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
@@ -736,6 +738,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				webSearches,
 				messageId,
 				imageGenerations,
+				textOutputIndex,
 			);
 			for (const item of items) {
 				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
@@ -1366,7 +1369,7 @@ export function parseResponsesAPIEvent(
 
 	// ── Text streaming ──
 	if (type === "response.output_text.delta" && typeof chunk.delta === "string") {
-		results.push({ text: chunk.delta });
+		results.push({ text: chunk.delta, textOutputIndex: chunk.output_index });
 		return results;
 	}
 
@@ -2223,7 +2226,10 @@ function buildResponsesPreludeItems(
 	reasoningBlocks?: ResponsesReasoningBlock[],
 	webSearchBlocks?: ResponsesWebSearchBlock[],
 	imageGenerationBlocks?: ResponsesImageGenerationBlock[],
-): { items: OAIMessage[]; fallbackText: string } {
+	text?: string,
+	messageId?: string,
+	textOutputIndex?: number,
+): { items: OAIMessage[] } {
 	const entries: Array<{ item: OAIMessage; outputIndex?: number; sourceIndex: number }> = [];
 	const fallbackParts: string[] = [];
 	let sourceIndex = 0;
@@ -2275,6 +2281,7 @@ function buildResponsesPreludeItems(
 		entries.push({
 			item: {
 				type: "image_generation_call",
+				id: block.id,
 				status: "completed",
 				result: block.result ?? "",
 				...(block.revisedPrompt ? { revised_prompt: block.revisedPrompt } : {}),
@@ -2283,10 +2290,22 @@ function buildResponsesPreludeItems(
 			sourceIndex: sourceIndex++,
 		});
 	}
+	const assistantText = mergeAssistantText(text ?? "", fallbackParts.join("\n"));
+	if (assistantText) {
+		entries.push({
+			item: {
+				...(messageId ? { id: messageId } : {}),
+				role: "assistant",
+				content: [{ type: "output_text", text: assistantText }],
+			} as unknown as OAIMessage,
+			outputIndex: textOutputIndex,
+			sourceIndex: sourceIndex++,
+		});
+	}
 	entries.sort((a, b) =>
 		compareOptionalOutputIndex(a.outputIndex, b.outputIndex, a.sourceIndex, b.sourceIndex),
 	);
-	return { items: entries.map((entry) => entry.item), fallbackText: fallbackParts.join("\n") };
+	return { items: entries.map((entry) => entry.item) };
 }
 
 function mergeAssistantText(text: string, reasoningFallbackText: string): string {
@@ -2303,18 +2322,18 @@ function buildResponsesAssistantTurnItems(
 	webSearches?: ResponsesWebSearchBlock[],
 	messageId?: string,
 	imageGenerations?: ResponsesImageGenerationBlock[],
+	textOutputIndex?: number,
 ): OAIMessage[] {
 	const items: OAIMessage[] = [];
-	const prelude = buildResponsesPreludeItems(reasoningBlocks, webSearches, imageGenerations);
+	const prelude = buildResponsesPreludeItems(
+		reasoningBlocks,
+		webSearches,
+		imageGenerations,
+		text,
+		messageId,
+		textOutputIndex,
+	);
 	items.push(...prelude.items);
-	const assistantText = mergeAssistantText(text, prelude.fallbackText);
-	if (assistantText) {
-		items.push({
-			...(messageId ? { id: messageId } : {}),
-			role: "assistant",
-			content: [{ type: "output_text", text: assistantText }],
-		} as unknown as OAIMessage);
-	}
 	for (const tu of toolUses) {
 		items.push({
 			type: "function_call",
@@ -2338,7 +2357,7 @@ function buildResponsesAssistantMessageItem(text: string, messageId?: string): O
 
 function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessage[] {
 	type StoredAssistantBlock =
-		| { type: "text"; text?: string }
+		| { type: "text"; text?: string; outputIndex?: number }
 		| {
 				type: "reasoning";
 				text?: string;
@@ -2460,8 +2479,15 @@ function buildResponsesAssistantItemsFromStoredContent(msg: DbMessage): OAIMessa
 				}
 			}
 			if (!result) continue;
+			if (igBlock.savedPath) {
+				items.push({
+					role: "developer",
+					content: buildImageGenerationSavedPathInstruction(igBlock.savedPath),
+				} as unknown as OAIMessage);
+			}
 			items.push({
 				type: "image_generation_call",
+				id: igBlock.id,
 				status: "completed",
 				result,
 				...(igBlock.revisedPrompt ? { revised_prompt: igBlock.revisedPrompt } : {}),

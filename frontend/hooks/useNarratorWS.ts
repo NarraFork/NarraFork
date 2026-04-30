@@ -101,6 +101,7 @@ interface NarratorWSCallbacks {
 		id: string,
 		status: "in_progress" | "generating" | "completed",
 		revisedPrompt?: string,
+		outputIndex?: number,
 	) => void;
 	onNarratorError?: (error: string, errorCode?: string) => void;
 	onNarratorWarning?: (info: {
@@ -180,7 +181,7 @@ interface NarratorWSCallbacks {
 					result?: string;
 					outputIndex?: number;
 			  }
-			| { type: "text"; text: string }
+			| { type: "text"; text: string; outputIndex?: number }
 		>;
 		toolChunks: Array<{
 			toolUseId: string;
@@ -464,6 +465,7 @@ export function useNarratorWS(
 							data.id as string,
 							data.status as "in_progress" | "generating" | "completed",
 							data.revisedPrompt as string | undefined,
+							data.outputIndex as number | undefined,
 						);
 						break;
 					case "narrator_error":
@@ -641,7 +643,7 @@ export function useNarratorWS(
 										result?: string;
 										outputIndex?: number;
 								  }
-								| { type: "text"; text: string }
+								| { type: "text"; text: string; outputIndex?: number }
 							>,
 							toolChunks: (data.toolChunks ?? []) as Array<{
 								toolUseId: string;

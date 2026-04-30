@@ -115,10 +115,16 @@ registerAnthropicModelLister(() => {
 	return result;
 });
 
+interface FetchAnthropicModelsResult {
+	models: AnthropicModelInfo[];
+	/** The base URL that actually succeeded (may differ from config if fallback was used). */
+	resolvedBaseUrl?: string;
+}
+
 /** Fetch models from Anthropic API. */
 async function fetchAnthropicModels(
 	config: AnthropicProviderConfig,
-): Promise<AnthropicModelInfo[]> {
+): Promise<FetchAnthropicModelsResult> {
 	const baseUrl = (config.baseUrl || "https://api.anthropic.com/v1").replace(/\/+$/, "");
 
 	if (!config.apiKey) {
@@ -136,6 +142,7 @@ async function fetchAnthropicModels(
 	}
 
 	let response = await fetch(`${baseUrl}/models`, { headers });
+	let resolvedBaseUrl: string | undefined;
 
 	// If failed and baseUrl doesn't already end with /v1, retry with /v1 appended
 	if (!response.ok && !/\/v1\/?$/i.test(baseUrl)) {
@@ -144,6 +151,33 @@ async function fetchAnthropicModels(
 			status: response.status,
 		});
 		response = await fetch(`${baseUrl}/v1/models`, { headers });
+		if (response.ok) {
+			resolvedBaseUrl = `${baseUrl}/v1`;
+		}
+	}
+
+	// If still failed and baseUrl ends with a known gateway suffix (e.g. /anthropic),
+	// retry with the suffix stripped. Common for third-party proxies like
+	// https://api.deepseek.com/anthropic or https://token-plan-cn.xiaomimimo.com/anthropic
+	if (!response.ok && /\/[a-z][\w-]*$/i.test(baseUrl)) {
+		const strippedUrl = baseUrl.replace(/\/[a-z][\w-]*$/i, "");
+		if (strippedUrl !== baseUrl && strippedUrl.length > 0) {
+			logger.debug("Anthropic models fetch failed, retrying with suffix stripped", {
+				originalUrl: `${baseUrl}/models`,
+				strippedUrl: `${strippedUrl}/models`,
+				status: response.status,
+			});
+			response = await fetch(`${strippedUrl}/models`, { headers });
+			if (response.ok) {
+				resolvedBaseUrl = strippedUrl;
+			} else if (!/\/v1\/?$/i.test(strippedUrl)) {
+				// Also try stripped + /v1
+				response = await fetch(`${strippedUrl}/v1/models`, { headers });
+				if (response.ok) {
+					resolvedBaseUrl = `${strippedUrl}/v1`;
+				}
+			}
+		}
 	}
 
 	if (!response.ok) {
@@ -160,7 +194,7 @@ async function fetchAnthropicModels(
 		return true;
 	});
 	unique.sort((a, b) => a.id.localeCompare(b.id));
-	return unique;
+	return { models: unique, resolvedBaseUrl };
 }
 
 /** Remove cached models for providers that no longer exist in settings. */
@@ -179,12 +213,23 @@ anthropicRoutes.get("/models", (c) => {
 
 anthropicRoutes.post("/models/refresh", async (c) => {
 	const providers = settings.anthropicProviders ?? [];
-	const results: Array<{ providerId: string; name: string; count: number; error?: string }> = [];
+	const results: Array<{
+		providerId: string;
+		name: string;
+		count: number;
+		error?: string;
+		resolvedBaseUrl?: string;
+	}> = [];
 	for (const p of providers) {
 		try {
-			const models = await fetchAnthropicModels(p);
+			const { models, resolvedBaseUrl } = await fetchAnthropicModels(p);
 			cachedModelsByProvider.set(p.id, models);
-			results.push({ providerId: p.id, name: p.name, count: models.length });
+			results.push({
+				providerId: p.id,
+				name: p.name,
+				count: models.length,
+				resolvedBaseUrl,
+			});
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
 			logger.error("Anthropic listModels refresh failed", { error: msg, provider: p.name });
@@ -208,10 +253,10 @@ anthropicRoutes.post("/providers/:id/models/refresh", async (c) => {
 		return c.json({ error: `Provider "${id}" not found` }, 404);
 	}
 	try {
-		const models = await fetchAnthropicModels(config);
+		const { models, resolvedBaseUrl } = await fetchAnthropicModels(config);
 		cachedModelsByProvider.set(id, models);
 		saveAllCachedModels();
-		return c.json({ models, fromCache: false });
+		return c.json({ models, fromCache: false, resolvedBaseUrl });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("Anthropic listModels refresh failed", { error: msg, provider: config.name });

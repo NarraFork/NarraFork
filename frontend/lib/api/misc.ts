@@ -436,6 +436,7 @@ export const miscApi = {
 		request<{
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
+			resolvedBaseUrl?: string;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
 
 		request<{

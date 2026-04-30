@@ -236,6 +236,78 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(JSON.stringify(result.history)).not.toContain("[Web search:");
 	});
 
+	test("pushAssistantTurn replays image_generation as native responses item with id", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+
+		provider.pushAssistantTurn(history, "", [], undefined, undefined, undefined, [
+			{
+				id: "ig_live",
+				revisedPrompt: "a tiny blue square",
+				result: SAMPLE_PNG_BASE64,
+				outputIndex: 0,
+			},
+		]);
+
+		expect(history).toHaveLength(1);
+		expect(JSON.stringify(history[0])).toContain('"type":"image_generation_call"');
+		expect(JSON.stringify(history[0])).toContain('"id":"ig_live"');
+		expect(JSON.stringify(history[0])).toContain('"revised_prompt":"a tiny blue square"');
+		expect(JSON.stringify(history[0])).toContain(SAMPLE_PNG_BASE64);
+	});
+
+	test("buildHistory replays saved image_generation with id and saved-path instruction", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const savedPath = join(testUploadsRoot, "generated-image.png");
+		writeFileSync(savedPath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				contentJson: [
+					{
+						type: "image_generation",
+						id: "ig_saved",
+						revisedPrompt: "a saved blue square",
+						savedPath,
+						outputIndex: 0,
+					},
+				],
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).toContain('"role":"developer"');
+		expect(historyJson).toContain(savedPath);
+		expect(historyJson).toContain('"type":"image_generation_call"');
+		expect(historyJson).toContain('"id":"ig_saved"');
+		expect(historyJson).toContain('"revised_prompt":"a saved blue square"');
+		expect(historyJson).toContain(SAMPLE_PNG_BASE64);
+	});
+
+	test("buildHistory replays inline image_generation result when saved file is unavailable", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			makeAssistantMessage({
+				contentJson: [
+					{
+						type: "image_generation",
+						id: "ig_inline",
+						revisedPrompt: "inline fallback",
+						result: SAMPLE_PNG_BASE64,
+						outputIndex: 0,
+					},
+				],
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const historyJson = JSON.stringify(result.history);
+		expect(historyJson).toContain('"type":"image_generation_call"');
+		expect(historyJson).toContain('"id":"ig_inline"');
+		expect(historyJson).toContain('"revised_prompt":"inline fallback"');
+		expect(historyJson).toContain(SAMPLE_PNG_BASE64);
+	});
+
 	test("buildHistory preserves stored assistant item ordering and official message id", async () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [

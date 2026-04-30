@@ -91,11 +91,24 @@ export async function executeAgentLoop(
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let sawMeaningfulAssistantOutput = false;
+	let sawCompletedImageGeneration = false;
 	let lastAssistantHadToolUses = false;
 
 	for await (const event of eventSource) {
 		if (isMeaningfulAssistantOutputEvent(event)) {
 			sawMeaningfulAssistantOutput = true;
+		}
+		// Only count image generation as "completed" when the final block_complete
+		// event arrives with an actual result payload. The lifecycle event
+		// (type === "image_generation", status === "completed") fires before the
+		// output_item.done that carries the base64 data, so relying on it would
+		// skip the interruption check even when the image was never persisted.
+		if (
+			event.type === "block_complete" &&
+			event.block.type === "image_generation" &&
+			event.block.result
+		) {
+			sawCompletedImageGeneration = true;
 		}
 
 		const drainingAfterAbort = config.signal.aborted;
@@ -191,6 +204,7 @@ export async function executeAgentLoop(
 		!retryableError &&
 		!config.signal.aborted &&
 		!skipInterruptionCheck &&
+		!(sawCompletedImageGeneration && !finalText.trim()) &&
 		sawMeaningfulAssistantOutput
 	) {
 		interrupted = await checkOutputInterruption(finalText, config.narratorId, config.signal);

@@ -147,6 +147,7 @@
 	"anthropicRefreshModels": "Fetch Models",
 	"anthropicRefreshModelsLoading": "Fetching...",
 	"anthropicRefreshModelsError": "Failed to fetch models",
+	"anthropicRefreshModelsResolvedUrl": "Models fetched using a different URL",
 	"anthropicModelsCount": "{{count}} models available",
 	"hideAllModels": "Hide All",
 	"showAllModels": "Show All",

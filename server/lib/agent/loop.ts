@@ -202,6 +202,7 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 function* flushPartialContent(
 	reasoningBlockMap: Map<string, ReasoningBlockEntry>,
 	assistantText: string,
+	textOutputIndex?: number,
 ): Generator<AgentEvent> {
 	for (const entry of reasoningBlockMap.values()) {
 		if (entry.text || entry.providerMetadata) {
@@ -217,7 +218,10 @@ function* flushPartialContent(
 		}
 	}
 	if (assistantText) {
-		yield { type: "block_complete", block: { type: "text", text: assistantText } };
+		yield {
+			type: "block_complete",
+			block: { type: "text", text: assistantText, outputIndex: textOutputIndex },
+		};
 	}
 }
 
@@ -703,7 +707,7 @@ export async function* agentLoop(
 						if (parsed.textOutputIndex != null) {
 							textOutputIndex = parsed.textOutputIndex;
 						}
-						yield { type: "stream_text", text: parsed.text };
+						yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
 					}
 					if (parsed.toolUses) {
 						// ── Tool use dedup ──
@@ -1283,7 +1287,7 @@ export async function* agentLoop(
 						const reason = String(parsed.invalidState.reason ?? "api_error");
 						const message = String(parsed.invalidState.message ?? "Unknown provider error");
 						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
-							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield buildRequestEnd(message);
 							yield { type: "context_length_exceeded", message };
 							return;
@@ -1319,7 +1323,7 @@ export async function* agentLoop(
 							}
 							// Exhausted retries — yield block_complete for partial content
 							// then signal retryable_error to the caller.
-							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield buildRequestEnd(message);
 							yield { type: "retryable_error", message };
 							return;
@@ -1338,7 +1342,7 @@ export async function* agentLoop(
 							// check (which would retry and eventually report a misleading
 							// "Provider returned an empty response" message).
 							sawErrorEvent = true;
-							yield* flushPartialContent(reasoningBlockMap, assistantText);
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield buildRequestEnd(message);
 							yield {
 								type: "invalid_state",
@@ -1352,7 +1356,7 @@ export async function* agentLoop(
 			} catch (err) {
 				if (config.signal.aborted) {
 					// Even on abort, yield block_complete for accumulated content so it can be persisted
-					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield buildRequestEnd("Aborted");
 					yield { type: "error", message: "Aborted" };
 					return;
@@ -1365,7 +1369,7 @@ export async function* agentLoop(
 					(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 				) {
 					// Persist partial content before signalling overflow
-					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield buildRequestEnd(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
@@ -1373,7 +1377,7 @@ export async function* agentLoop(
 				// Detect context overflow errors from OpenAI/Codex-compatible providers.
 				// Treat as context_length_exceeded so caller can prune/compact+retry.
 				if (isContextWindowExceededError(err)) {
-					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield buildRequestEnd(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
@@ -1409,13 +1413,13 @@ export async function* agentLoop(
 						continue; // retry provider.chat()
 					}
 					// Exhausted retries — persist partial content and signal caller
-					yield* flushPartialContent(reasoningBlockMap, assistantText);
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield buildRequestEnd(msg);
 					yield { type: "retryable_error", message: msg };
 					return;
 				}
 				// Non-retryable error — persist partial content and signal caller
-				yield* flushPartialContent(reasoningBlockMap, assistantText);
+				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 				yield buildRequestEnd(msg);
 				yield { type: "error", message: msg };
 				return;
@@ -1592,7 +1596,7 @@ export async function* agentLoop(
 			toolUseAccum.clear();
 
 			// Yield accumulated content before truncation
-			yield* flushPartialContent(reasoningBlockMap, assistantText);
+			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.
@@ -1661,7 +1665,7 @@ export async function* agentLoop(
 
 		if (!hasOrphanedToolUses) {
 			// Yield block_complete for accumulated content now that streaming is done
-			yield* flushPartialContent(reasoningBlockMap, assistantText);
+			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.

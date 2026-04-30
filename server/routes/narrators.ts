@@ -1541,6 +1541,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		inheritMode: "full",
 		forkMessageId: sourceMessageId,
 		title,
+		standalone: true,
 	});
 
 	// Lock to readOnly + mark as ask-in-passing (user can "promote" later to unlock)

@@ -378,7 +378,7 @@ export type StreamingBlock =
 			result?: string;
 			outputIndex?: number;
 	  }
-	| { type: "text"; text: string };
+	| { type: "text"; text: string; outputIndex?: number };
 
 export function buildStreamingMsg(opts: {
 	streamingBlocks?: StreamingBlock[] | null;
@@ -427,6 +427,7 @@ export function buildStreamingMsg(opts: {
 					type: "text",
 					id: `streaming:text:${index}`,
 					text: sb.text,
+					outputIndex: sb.outputIndex,
 				} as ContentBlock);
 			}
 		}

@@ -192,6 +192,7 @@ export function ServerSystemSection({
 						value={tlsPassphrase}
 						onChange={(e) => setTlsPassphrase(e.currentTarget.value)}
 						type="password"
+						autoComplete="off"
 						placeholder={t("tlsPassphrasePlaceholder")}
 					/>
 					<PathInput

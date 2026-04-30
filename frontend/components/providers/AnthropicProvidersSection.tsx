@@ -101,9 +101,17 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 			}
 			setRefreshingProvider(providerId);
 			try {
-				await api.anthropicRefreshProviderModels(providerId);
+				const result = await api.anthropicRefreshProviderModels(providerId);
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
+				if (result.resolvedBaseUrl) {
+					notifications.show({
+						color: "yellow",
+						title: t("anthropicRefreshModelsResolvedUrl"),
+						message: result.resolvedBaseUrl,
+						autoClose: 8000,
+					});
+				}
 			} catch {
 				notifications.show({
 					color: "red",
@@ -189,6 +197,7 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 								placeholder={t("anthropicApiKeyPlaceholder")}
 								value={p.apiKey}
 								size="xs"
+								autoComplete="off"
 								onChange={(e) => updateProvider(p.id, "apiKey", e.currentTarget.value)}
 							/>
 							<TextInput

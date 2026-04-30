@@ -437,6 +437,7 @@ function PlatformFields({
 					<PasswordInput
 						label={t("gatewayPlatformToken")}
 						value={token}
+						autoComplete="off"
 						onChange={(e) => setToken(e.currentTarget.value)}
 						onBlur={() => saveField("token", token)}
 					/>
@@ -456,12 +457,14 @@ function PlatformFields({
 					<PasswordInput
 						label={t("gatewayPlatformBotToken")}
 						value={botToken}
+						autoComplete="off"
 						onChange={(e) => setBotToken(e.currentTarget.value)}
 						onBlur={() => saveField("botToken", botToken)}
 					/>
 					<PasswordInput
 						label={t("gatewayPlatformAppToken")}
 						value={appToken}
+						autoComplete="off"
 						onChange={(e) => setAppToken(e.currentTarget.value)}
 						onBlur={() => saveField("appToken", appToken)}
 					/>
@@ -487,6 +490,7 @@ function PlatformFields({
 					<PasswordInput
 						label={t("gatewayPlatformAppSecret")}
 						value={appSecret}
+						autoComplete="off"
 						onChange={(e) => setAppSecret(e.currentTarget.value)}
 						onBlur={() => saveField("appSecret", appSecret)}
 					/>
@@ -506,6 +510,7 @@ function PlatformFields({
 					<PasswordInput
 						label={t("gatewayPlatformSecret")}
 						value={secret}
+						autoComplete="off"
 						onChange={(e) => setSecret(e.currentTarget.value)}
 						onBlur={() => saveField("secret", secret)}
 					/>
@@ -718,6 +723,7 @@ function WeixinFields({
 					<PasswordInput
 						label={t("gatewayWeixinToken")}
 						value={token || platform.token || ""}
+						autoComplete="off"
 						readOnly
 						variant="filled"
 					/>
@@ -820,6 +826,7 @@ function QQBotFields({
 				label={t("gatewayQQBotClientSecret")}
 				description={t("gatewayQQBotClientSecretDesc")}
 				value={clientSecret}
+				autoComplete="off"
 				onChange={(e) => setClientSecret(e.currentTarget.value)}
 				onBlur={() => saveField("clientSecret", clientSecret)}
 			/>
@@ -883,6 +890,7 @@ function QQBotFields({
 				label={t("gatewayQQBotSttApiKey")}
 				description={t("gatewayQQBotSttApiKeyDesc")}
 				value={sttApiKey}
+				autoComplete="off"
 				onChange={(e) => setSttApiKey(e.currentTarget.value)}
 				onBlur={() => saveStt({ apiKey: sttApiKey })}
 			/>

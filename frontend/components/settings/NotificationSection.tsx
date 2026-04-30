@@ -284,6 +284,7 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 							description={t("notifyDingtalkSecretDesc")}
 							placeholder="SEC..."
 							value={dingtalkSecret}
+							autoComplete="off"
 							onChange={(e) => setDingtalkSecret(e.currentTarget.value)}
 							onBlur={() => saveWebhookField("notifyDingtalkSecret", dingtalkSecret)}
 							size="xs"
@@ -338,6 +339,7 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 							label={t("notifyFeishuSecret")}
 							description={t("notifyFeishuSecretDesc")}
 							value={feishuSecret}
+							autoComplete="off"
 							onChange={(e) => setFeishuSecret(e.currentTarget.value)}
 							onBlur={() => saveWebhookField("notifyFeishuSecret", feishuSecret)}
 							size="xs"

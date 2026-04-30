@@ -181,6 +181,7 @@ function NUGLoginModal({
 					label={t("nugPassword")}
 					placeholder={t("nugPasswordPlaceholder")}
 					value={password}
+					autoComplete="off"
 					onChange={(e) => setPassword(e.currentTarget.value)}
 					onKeyDown={(e) => e.key === "Enter" && handleLogin()}
 				/>
@@ -646,6 +647,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									label={t("nugApiKey")}
 									placeholder={t("nugApiKeyPlaceholder")}
 									value={p.apiKey}
+									autoComplete="off"
 									onChange={(e) => updateProvider(p.id, { apiKey: e.currentTarget.value })}
 									style={{ flex: 1 }}
 								/>
@@ -709,6 +711,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									label={t("nugOAuthClientSecret")}
 									placeholder="OAuth Client Secret"
 									value={p.oauthClientSecret ?? ""}
+									autoComplete="off"
 									onChange={(e) =>
 										updateProvider(p.id, { oauthClientSecret: e.currentTarget.value })
 									}

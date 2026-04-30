@@ -114,7 +114,7 @@ export interface ParsedStreamEvent {
 	/** Image generation lifecycle event from Responses API (Codex native image_generation tool) */
 	imageGeneration?: {
 		id: string;
-		status: "in_progress" | "generating" | "completed";
+		status: string;
 		/** Revised prompt used by the model (available on completion) */
 		revisedPrompt?: string;
 		/** Base64-encoded image data (available on completion) */

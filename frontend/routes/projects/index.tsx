@@ -331,6 +331,7 @@ function ProjectListPage() {
 									label={t("authPassword")}
 									placeholder={t("authPasswordPlaceholder")}
 									value={clonePassword}
+									autoComplete="off"
 									onChange={(e) => setClonePassword(e.currentTarget.value)}
 									size="sm"
 								/>

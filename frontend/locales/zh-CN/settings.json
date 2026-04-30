@@ -147,6 +147,7 @@
 	"anthropicRefreshModels": "获取模型列表",
 	"anthropicRefreshModelsLoading": "获取中...",
 	"anthropicRefreshModelsError": "获取模型列表失败",
+	"anthropicRefreshModelsResolvedUrl": "通过备用地址获取成功",
 	"anthropicModelsCount": "{{count}} 个模型可用",
 	"hideAllModels": "全部隐藏",
 	"showAllModels": "全部显示",

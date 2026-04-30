@@ -514,6 +514,7 @@ export class CodexProvider implements ProviderAdapter {
 			result?: string;
 			outputIndex?: number;
 		}>,
+		textOutputIndex?: number,
 	): void {
 		this.dummyProvider.pushAssistantTurn(
 			history,
@@ -523,6 +524,7 @@ export class CodexProvider implements ProviderAdapter {
 			webSearches,
 			messageId,
 			imageGenerations,
+			textOutputIndex,
 		);
 	}
 

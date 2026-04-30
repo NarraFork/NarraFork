@@ -175,6 +175,7 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 								placeholder={t("openaiApiKeyPlaceholder")}
 								value={p.apiKey}
 								size="xs"
+								autoComplete="off"
 								onChange={(e) => updateProvider(p.id, "apiKey", e.currentTarget.value)}
 							/>
 							<TextInput

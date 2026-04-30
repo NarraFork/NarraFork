@@ -500,7 +500,7 @@ export const narratorPersistence = {
 		messageId: string,
 		narratorId: string,
 		block:
-			| { type: "text"; text: string }
+			| { type: "text"; text: string; outputIndex?: number }
 			| {
 					type: "reasoning";
 					text: string;
@@ -527,6 +527,7 @@ export const narratorPersistence = {
 					revisedPrompt?: string;
 					outputIndex?: number;
 					savedPath?: string;
+					result?: string;
 			  },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
@@ -536,7 +537,7 @@ export const narratorPersistence = {
 		if (!existing) return;
 
 		type StoredAssistantBlock =
-			| { type: "text"; text: string }
+			| { type: "text"; text: string; outputIndex?: number }
 			| {
 					type: "reasoning";
 					text: string;

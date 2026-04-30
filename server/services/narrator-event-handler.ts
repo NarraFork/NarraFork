@@ -1,13 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
-import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { apiRequests, narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
+import { saveImageGenerationResult } from "../lib/agent/image-generation";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -182,7 +180,7 @@ export type SnapshotStreamingBlock =
 			result?: string;
 			outputIndex?: number;
 	  }
-	| { type: "text"; text: string };
+	| { type: "text"; text: string; outputIndex?: number };
 
 export interface StreamingSnapshot {
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
@@ -444,22 +442,38 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 
-			// Snapshot: accumulate streaming text (top-level only)
-			// Append to the last text block if it exists, otherwise create a new one.
-			// This allows text blocks to be interleaved with web_search blocks.
+			// Snapshot: accumulate streaming text (top-level only). When the provider
+			// exposes outputIndex, keep the text block ordered relative to native
+			// web_search/image_generation blocks.
 			if (!ctx.parentToolUseId) {
 				const snap = getOrCreateSnapshot(broadcastTargetId);
-				const lastBlock = snap.streamingBlocks[snap.streamingBlocks.length - 1];
-				if (lastBlock?.type === "text") {
-					lastBlock.text += event.text;
+				const existingIdx =
+					event.outputIndex != null
+						? snap.streamingBlocks.findIndex(
+								(b) => b.type === "text" && b.outputIndex === event.outputIndex,
+							)
+						: -1;
+				if (existingIdx !== -1) {
+					const existing = snap.streamingBlocks[existingIdx];
+					if (existing.type === "text") existing.text += event.text;
 				} else {
-					snap.streamingBlocks.push({ type: "text", text: event.text });
+					const lastBlock = snap.streamingBlocks[snap.streamingBlocks.length - 1];
+					if (lastBlock?.type === "text" && event.outputIndex == null) {
+						lastBlock.text += event.text;
+					} else {
+						snap.streamingBlocks.splice(
+							findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
+							0,
+							{ type: "text", text: event.text, outputIndex: event.outputIndex },
+						);
+					}
 				}
 			}
 
 			const streamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
 				delta: { type: "text_delta", text: event.text },
+				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 			};
 			// Subagent: attach linking info so frontend knows which tool_use this belongs to
 			if (ctx.parentToolUseId) {
@@ -476,6 +490,7 @@ export async function processEvent(
 				data: {
 					type: "content_block_delta",
 					delta: { type: "text_delta", text: event.text },
+					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 				},
 			});
 			return null;
@@ -579,13 +594,19 @@ export async function processEvent(
 				const snap = streamingSnapshots.get(broadcastTargetId);
 				if (snap) {
 					if (block.type === "text") {
-						// Remove the last text block (the one being streamed)
-						for (let i = snap.streamingBlocks.length - 1; i >= 0; i--) {
-							if (snap.streamingBlocks[i].type === "text") {
-								snap.streamingBlocks.splice(i, 1);
-								break;
-							}
-						}
+						// Remove the completed text block (prefer exact provider outputIndex).
+						const idx =
+							block.outputIndex != null
+								? snap.streamingBlocks.findIndex(
+										(b) => b.type === "text" && b.outputIndex === block.outputIndex,
+									)
+								: (() => {
+										for (let i = snap.streamingBlocks.length - 1; i >= 0; i--) {
+											if (snap.streamingBlocks[i].type === "text") return i;
+										}
+										return -1;
+									})();
+						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					} else if (block.type === "reasoning") {
 						const idx = snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
 						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
@@ -660,6 +681,7 @@ export async function processEvent(
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "text",
 					text: block.text,
+					outputIndex: block.outputIndex,
 				});
 			} else if (block.type === "reasoning") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -693,23 +715,23 @@ export async function processEvent(
 					...(block.action ? { action: block.action } : {}),
 				});
 			} else if (block.type === "image_generation") {
-				// Save base64 image to filesystem
+				// Save base64 image to filesystem. If saving fails, keep the raw result
+				// in the persisted block so the UI/history replay can still recover it.
 				let savedPath: string | undefined;
+				let shouldPersistInlineResult = false;
 				if (block.result) {
 					try {
-						const dir = join(
-							homedir(),
-							".narrafork",
-							"generated_images",
+						savedPath = await saveImageGenerationResult(
 							ctx.conversationId ?? "unknown",
+							block.id,
+							block.result,
 						);
-						await mkdir(dir, { recursive: true });
-						const filename = `${block.id}.png`;
-						const filePath = join(dir, filename);
-						await writeFile(filePath, Buffer.from(block.result, "base64"));
-						savedPath = filePath;
 					} catch (err) {
-						logger.warn("Failed to save generated image to disk", { error: err });
+						shouldPersistInlineResult = true;
+						logger.warn("Failed to save generated image to disk", {
+							error: err,
+							imageId: block.id,
+						});
 					}
 				}
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -718,6 +740,7 @@ export async function processEvent(
 					revisedPrompt: block.revisedPrompt,
 					outputIndex: block.outputIndex,
 					...(savedPath ? { savedPath } : {}),
+					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
 				});
 			}
 			return null;
@@ -1398,6 +1421,7 @@ export async function processEvent(
 				id: event.id,
 				status: event.status as "in_progress" | "generating" | "completed",
 				revisedPrompt: event.revisedPrompt,
+				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 			});
 			return null;
 		}

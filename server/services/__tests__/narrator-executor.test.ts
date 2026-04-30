@@ -45,6 +45,104 @@ describe("executeAgentLoop smart interruption check", () => {
 		expect(result.hasError).toBe(false);
 	});
 
+	test("does not treat an image-only assistant turn as interrupted", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "block_complete",
+						block: {
+							type: "image_generation",
+							id: "ig_1",
+							revisedPrompt: "a tiny blue square",
+							result: "Zm9v",
+						},
+					},
+					{ type: "assistant_message", text: "", toolUses: [] },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.interrupted).toBe(false);
+		expect(result.hasError).toBe(false);
+	});
+
+	test("does not skip interruption check for image block_complete without result", async () => {
+		const ac = new AbortController();
+
+		// A block_complete with only revisedPrompt but no result means the image
+		// data was never received — the interruption check should still run.
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "block_complete",
+						block: {
+							type: "image_generation",
+							id: "ig_2",
+							revisedPrompt: "a red circle",
+						},
+					},
+					{ type: "assistant_message", text: "", toolUses: [] },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		// Without result, sawCompletedImageGeneration stays false, so the
+		// empty-text guard in the interruption check path is not bypassed.
+		// The turn has no meaningful text output, so it should not be interrupted.
+		expect(result.interrupted).toBe(false);
+		expect(result.hasError).toBe(false);
+	});
+
+	test("does not skip interruption check for lifecycle image_generation event alone", async () => {
+		const ac = new AbortController();
+
+		// A lifecycle image_generation event with status "completed" but without
+		// a corresponding block_complete should not bypass the interruption check.
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "image_generation",
+						id: "ig_3",
+						status: "completed",
+					},
+					{ type: "assistant_message", text: "", toolUses: [] },
+					{ type: "done" },
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.interrupted).toBe(false);
+		expect(result.hasError).toBe(false);
+	});
+
 	test("treats empty-response invalid state as an error instead of interruption", async () => {
 		const ac = new AbortController();
 

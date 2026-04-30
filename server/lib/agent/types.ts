@@ -112,7 +112,7 @@ export type AgentEvent =
 			messageId?: string;
 			credentialId?: string;
 	  }
-	| { type: "stream_text"; text: string }
+	| { type: "stream_text"; text: string; outputIndex?: number }
 	| {
 			type: "tool_call";
 			toolUseId: string;
@@ -261,7 +261,7 @@ export interface ReasoningProviderMetadata {
 
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
-	| { type: "text"; text: string }
+	| { type: "text"; text: string; outputIndex?: number }
 	| {
 			type: "reasoning";
 			text: string;

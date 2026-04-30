@@ -897,14 +897,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// avoids a no-op setState on every delta that still increments
 					// React's nested-update counter inside useLayoutEffect chains.
 					clearRetryIfActive();
-					// Maintain ordered blocks: append to the last text block or create new one.
-					// This allows text blocks to be interleaved with web_search blocks.
+					// Maintain ordered blocks using provider outputIndex when available.
 					const blocks = streamingBlocksRef.current;
-					const lastBlock = blocks[blocks.length - 1];
-					if (lastBlock?.type === "text") {
-						lastBlock.text += ev.delta.text;
+					const outputIndex = typeof ev.outputIndex === "number" ? ev.outputIndex : undefined;
+					const existingIdx =
+						outputIndex != null
+							? blocks.findIndex((b) => b.type === "text" && b.outputIndex === outputIndex)
+							: -1;
+					if (existingIdx !== -1) {
+						const existing = blocks[existingIdx];
+						if (existing.type === "text") existing.text += ev.delta.text;
 					} else {
-						blocks.push({ type: "text", text: ev.delta.text });
+						const lastBlock = blocks[blocks.length - 1];
+						if (lastBlock?.type === "text" && outputIndex == null) {
+							lastBlock.text += ev.delta.text;
+						} else {
+							blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
+								type: "text",
+								text: ev.delta.text,
+								...(outputIndex != null ? { outputIndex } : {}),
+							});
+						}
 					}
 					flushStreamingVersion();
 					return;
@@ -1737,7 +1750,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				flushStreamingVersion();
 			},
-			onImageGeneration: (id, status, revisedPrompt) => {
+			onImageGeneration: (id, status, revisedPrompt, outputIndex) => {
 				const blocks = streamingBlocksRef.current;
 				const existingIdx = blocks.findIndex((b) => b.type === "image_generation" && b.id === id);
 				if (existingIdx !== -1) {
@@ -1745,13 +1758,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (existing.type === "image_generation") {
 						existing.status = status;
 						if (revisedPrompt) existing.revisedPrompt = revisedPrompt;
+						if (outputIndex != null) existing.outputIndex = outputIndex;
 					}
 				} else {
-					blocks.splice(findStreamingInsertIndex(blocks, undefined), 0, {
+					blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
 						type: "image_generation",
 						id,
 						status,
 						revisedPrompt,
+						...(outputIndex != null ? { outputIndex } : {}),
 					});
 				}
 				flushStreamingVersion();
