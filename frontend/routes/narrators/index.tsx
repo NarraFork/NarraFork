@@ -646,32 +646,53 @@ function NarratorsPage() {
 
 								{/* ── Mobile card layout ── */}
 								<Stack gap={4} hiddenFrom="sm">
-									<Group gap={6} wrap="nowrap">
-										{narrator.status === "working" && (
-											<Loader
-												size={12}
-												color={narrator.substatus?.includes("planning") ? "green" : undefined}
-											/>
-										)}
-										{(() => {
-											const badge = getNarratorBadgeInfo(narrator.status, narrator.substatus);
-											if (!badge) return null;
-											return (
-												<Badge size="xs" color={badge.color}>
-													{tn(badge.labelKey)}
-												</Badge>
-											);
-										})()}
-										<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
-											{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
-										</Text>
+									<Group gap={6} wrap="nowrap" justify="space-between">
+										<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+											{narrator.status === "working" && (
+												<Loader
+													size={12}
+													color={narrator.substatus?.includes("planning") ? "green" : undefined}
+												/>
+											)}
+											{(() => {
+												const badge = getNarratorBadgeInfo(narrator.status, narrator.substatus);
+												if (!badge) return null;
+												return (
+													<Badge size="xs" color={badge.color}>
+														{tn(badge.labelKey)}
+													</Badge>
+												);
+											})()}
+											<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
+												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
+											</Text>
+										</Group>
+										<Tooltip label={t("archive")}>
+											<ActionIcon
+												size="sm"
+												color="orange"
+												variant="subtle"
+												style={{ flexShrink: 0 }}
+												onPointerDown={(e: React.PointerEvent) => {
+													e.stopPropagation();
+												}}
+												onClick={(e: React.MouseEvent) => {
+													e.stopPropagation();
+													setConfirmArchiveId(narrator.id);
+												}}
+											>
+												<IconArchive size={16} />
+											</ActionIcon>
+										</Tooltip>
 									</Group>
-									<Group gap="xs" wrap="nowrap">
-										<Text size="xs" c="dimmed" truncate>
+									<Group gap="xs" wrap="nowrap" style={{ overflow: "hidden" }}>
+										<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0 }}>
 											{t("narratorMeta", {
 												model:
 													narrator.model === FOLLOW_DEFAULT_MODEL
-														? t("followDefault", { model: defaultModelValue })
+														? t("followDefault", {
+																model: defaultModelValue,
+															})
 														: narrator.model,
 												count: narrator.messageCount ?? 0,
 											})}
@@ -682,6 +703,7 @@ function NarratorsPage() {
 												variant="light"
 												color="teal"
 												leftSection={<IconTerminal2 size={10} />}
+												style={{ flexShrink: 0 }}
 											>
 												{activeTerminals}
 											</Badge>
@@ -692,6 +714,7 @@ function NarratorsPage() {
 												variant="light"
 												color={runningContainers > 0 ? "green" : "gray"}
 												leftSection={<IconBox size={10} />}
+												style={{ flexShrink: 0 }}
 											>
 												{runningContainers}/{containers}
 											</Badge>
@@ -710,55 +733,44 @@ function NarratorsPage() {
 												.join(" · ")}
 										</Text>
 									)}
-									<Group justify="space-between" wrap="nowrap" mt={2}>
-										<Group gap="xs" wrap="nowrap">
-											{viewers.length > 0 && (
-												<Tooltip
-													label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
-												>
-													<Avatar.Group spacing="xs">
-														{viewers.slice(0, 3).map((v) => (
-															<UserAvatar
-																key={v.userId}
-																username={v.username}
-																avatarColor={v.avatarColor}
-																avatarImageId={v.avatarImageId}
-																userId={v.userId}
-																size="sm"
-																showTooltip={false}
-															/>
-														))}
-														{viewers.length > 3 && (
-															<Avatar size="sm" radius="xl">
-																+{viewers.length - 3}
-															</Avatar>
-														)}
-													</Avatar.Group>
-												</Tooltip>
-											)}
-											<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
-												{t("createdAtLabel", { time: formatSmartTime(narrator.createdAt) })}
-												{narrator.lastMessageAt &&
-													` · ${t("lastMessageAtLabel", { time: formatSmartTime(narrator.lastMessageAt) })}`}
-											</Text>
-										</Group>
-										<Tooltip label={t("archive")}>
-											<ActionIcon
-												size="sm"
-												color="orange"
-												variant="subtle"
-												onPointerDown={(e: React.PointerEvent) => {
-													e.stopPropagation();
-												}}
-												onClick={(e: React.MouseEvent) => {
-													e.stopPropagation();
-													setConfirmArchiveId(narrator.id);
-												}}
+									<Group gap="xs" wrap="nowrap" mt={2}>
+										{viewers.length > 0 && (
+											<Tooltip
+												label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}
 											>
-												<IconArchive size={16} />
-											</ActionIcon>
-										</Tooltip>
+												<Avatar.Group spacing="xs">
+													{viewers.slice(0, 3).map((v) => (
+														<UserAvatar
+															key={v.userId}
+															username={v.username}
+															avatarColor={v.avatarColor}
+															avatarImageId={v.avatarImageId}
+															userId={v.userId}
+															size="sm"
+															showTooltip={false}
+														/>
+													))}
+													{viewers.length > 3 && (
+														<Avatar size="sm" radius="xl">
+															+{viewers.length - 3}
+														</Avatar>
+													)}
+												</Avatar.Group>
+											</Tooltip>
+										)}
+										<Text size="xs" c="dimmed">
+											{t("createdAtLabel", {
+												time: formatSmartTime(narrator.createdAt),
+											})}
+										</Text>
 									</Group>
+									{narrator.lastMessageAt && (
+										<Text size="xs" c="dimmed">
+											{t("lastMessageAtLabel", {
+												time: formatSmartTime(narrator.lastMessageAt),
+											})}
+										</Text>
+									)}
 								</Stack>
 							</Card>
 						);

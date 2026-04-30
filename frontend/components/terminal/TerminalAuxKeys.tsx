@@ -1,6 +1,6 @@
 import { ActionIcon, Menu } from "@mantine/core";
 import { IconDotsVertical, IconSwitchHorizontal } from "@tabler/icons-react";
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 export interface Modifiers {
 	ctrl: boolean;
@@ -16,7 +16,7 @@ interface TerminalAuxKeysProps {
 const ESC = "\x1b";
 
 type AuxKey =
-	| { kind: "key"; label: string; seq: string }
+	| { kind: "key"; label: string; seq: string; repeat?: boolean }
 	| { kind: "mod"; label: string; mod: "ctrl" | "alt" };
 
 const COLS = 7;
@@ -26,7 +26,7 @@ const ROW1: AuxKey[] = [
 	{ kind: "key", label: "Tab", seq: "\t" },
 	{ kind: "key", label: "PgUp", seq: `${ESC}[5~` },
 	{ kind: "key", label: "Home", seq: `${ESC}[H` },
-	{ kind: "key", label: "↑", seq: `${ESC}[A` },
+	{ kind: "key", label: "↑", seq: `${ESC}[A`, repeat: true },
 	{ kind: "key", label: "End", seq: `${ESC}[F` },
 ];
 
@@ -34,9 +34,9 @@ const ROW2: AuxKey[] = [
 	{ kind: "mod", label: "Ctrl", mod: "ctrl" },
 	{ kind: "mod", label: "Alt", mod: "alt" },
 	{ kind: "key", label: "PgDn", seq: `${ESC}[6~` },
-	{ kind: "key", label: "←", seq: `${ESC}[D` },
-	{ kind: "key", label: "↓", seq: `${ESC}[B` },
-	{ kind: "key", label: "→", seq: `${ESC}[C` },
+	{ kind: "key", label: "←", seq: `${ESC}[D`, repeat: true },
+	{ kind: "key", label: "↓", seq: `${ESC}[B`, repeat: true },
+	{ kind: "key", label: "→", seq: `${ESC}[C`, repeat: true },
 ];
 
 const gridRow: React.CSSProperties = {
@@ -53,10 +53,37 @@ const cell: React.CSSProperties = {
 	fontFamily: "monospace",
 };
 
+/** ms before repeat starts / between repeats */
+const REPEAT_DELAY = 400;
+const REPEAT_INTERVAL = 80;
+
 export function TerminalAuxKeys({ onKey, mods, onToggleMod }: TerminalAuxKeysProps) {
-	const preventFocus = useCallback((e: React.MouseEvent) => {
+	const repeatTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	const clearRepeat = useCallback(() => {
+		if (repeatTimer.current != null) {
+			clearTimeout(repeatTimer.current);
+			repeatTimer.current = null;
+		}
+	}, []);
+
+	useEffect(() => clearRepeat, [clearRepeat]);
+
+	const preventFocus = useCallback((e: React.MouseEvent | React.PointerEvent) => {
 		e.preventDefault();
 	}, []);
+
+	const startRepeat = useCallback(
+		(seq: string) => {
+			clearRepeat();
+			onKey(seq);
+			repeatTimer.current = setTimeout(function tick() {
+				onKey(seq);
+				repeatTimer.current = setTimeout(tick, REPEAT_INTERVAL);
+			}, REPEAT_DELAY);
+		},
+		[onKey, clearRepeat],
+	);
 
 	const renderKey = (k: AuxKey) => {
 		if (k.kind === "mod") {
@@ -69,6 +96,26 @@ export function TerminalAuxKeys({ onKey, mods, onToggleMod }: TerminalAuxKeysPro
 					size="sm"
 					style={{ ...cell, fontWeight: active ? 700 : 400 }}
 					onClick={() => onToggleMod(k.mod)}
+				>
+					{k.label}
+				</ActionIcon>
+			);
+		}
+		if (k.repeat) {
+			return (
+				<ActionIcon
+					key={k.label}
+					variant="subtle"
+					color="gray"
+					size="sm"
+					style={cell}
+					onPointerDown={(e) => {
+						e.preventDefault();
+						startRepeat(k.seq);
+					}}
+					onPointerUp={clearRepeat}
+					onPointerLeave={clearRepeat}
+					onPointerCancel={clearRepeat}
 				>
 					{k.label}
 				</ActionIcon>

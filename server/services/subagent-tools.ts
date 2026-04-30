@@ -22,11 +22,16 @@ const EXPLORE_PLAN_TOOLS = new Set([
 /** Tools available to general subagents (EXPLORE_PLAN_TOOLS + interactive tools, no nesting/plan/forking) */
 const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "AskUserQuestion", "Skill"]);
 
+/** MCP tools use the naming convention `mcp__<server>__<tool>` */
+function isMcpTool(tool: ToolDefinition): boolean {
+	return tool.name.startsWith("mcp__");
+}
+
 /** Tool filter factories per built-in subagent type */
 const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
-	explore: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name),
-	plan: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name),
-	general: (tool) => GENERAL_TOOLS.has(tool.name),
+	explore: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name) || isMcpTool(tool),
+	plan: (tool) => EXPLORE_PLAN_TOOLS.has(tool.name) || isMcpTool(tool),
+	general: (tool) => GENERAL_TOOLS.has(tool.name) || isMcpTool(tool),
 };
 
 /**
@@ -51,7 +56,7 @@ export function resolveToolFilter(
 			return BUILTIN_TOOL_FILTERS.general;
 		case "custom": {
 			const allowed = new Set(customDef.customTools);
-			return (tool) => allowed.has(tool.name);
+			return (tool) => allowed.has(tool.name) || isMcpTool(tool);
 		}
 		default:
 			return BUILTIN_TOOL_FILTERS.explore;
