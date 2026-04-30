@@ -61,6 +61,7 @@
 	"status_planning": "计划中",
 	"status_retrying": "重试中",
 	"status_queued": "排队中",
+	"status_manual_override": "手动接管",
 	"narratorError": "叙述者错误",
 	"contextTooLongCompactFailed": "上下文过长且自动压缩失败，请尝试开始新对话或手动压缩。",
 	"emptyResponseError": "{{provider}} 返回了空响应。这通常意味着 API 配置错误（base URL、模型或凭证）。",

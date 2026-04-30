@@ -27,6 +27,9 @@ export interface PixiTheme {
 	narratorUnread: number;
 	narratorError: number;
 	narratorWaiting: number;
+	narratorManualOverride: number;
+	narratorInterrupted: number;
+	narratorSuspended: number;
 }
 
 /** Parse a CSS color string (rgb, hex, etc.) into a 0xRRGGBB number. */
@@ -115,6 +118,9 @@ export function resolvePixiTheme(): PixiTheme {
 		narratorUnread: varToHex("--mantine-color-green-5", 0x22c55e),
 		narratorError: varToHex("--mantine-color-red-5", 0xef4444),
 		narratorWaiting: varToHex("--mantine-color-yellow-5", 0xeab308),
+		narratorManualOverride: varToHex("--mantine-color-orange-5", 0xf97316),
+		narratorInterrupted: varToHex("--mantine-color-orange-5", 0xf97316),
+		narratorSuspended: varToHex("--mantine-color-yellow-5", 0xeab308),
 	};
 
 	cached = { scheme, theme };

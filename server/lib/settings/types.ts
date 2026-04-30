@@ -154,6 +154,16 @@ export interface ModelAggregation {
 	routingMode: "priority" | "balanced";
 }
 
+/** Per-tool permission behavior override for an MCP server. */
+export interface McpToolPermission {
+	/** Tool name as reported by the MCP server (original name, NOT the mcp__prefix__name format). */
+	toolName: string;
+	/** Permission behavior: "allow" auto-approves, "ask" requires user approval, "deny" auto-rejects. */
+	behavior: "allow" | "ask" | "deny";
+	/** Whether this rule is active. Defaults to true. */
+	enabled?: boolean;
+}
+
 export interface McpServerConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -175,6 +185,10 @@ export interface McpServerConfig {
 	headers?: Record<string, string>;
 	/** Whether this server is enabled. */
 	enabled: boolean;
+	/** Default permission behavior for all tools from this server. When unset, follows the narrator's permission mode. */
+	defaultBehavior?: "allow" | "ask" | "deny";
+	/** Per-tool permission behavior overrides. Takes priority over defaultBehavior. */
+	toolPermissions?: McpToolPermission[];
 }
 
 export interface TlsConfig {

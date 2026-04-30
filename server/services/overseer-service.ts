@@ -105,6 +105,8 @@ export async function createOverseer(input: {
 		permissionMode: "bypassPermissions",
 		status: "idle",
 		inheritMode: "fresh",
+		variant: "primary",
+		traits: ["standalone"],
 		createdAt: now,
 		updatedAt: now,
 	});

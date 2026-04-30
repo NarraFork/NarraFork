@@ -46,7 +46,7 @@ import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { formatSmartTime } from "../../lib/format";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 
-const ATTENTION_TAGS = ["unread", "error", "interrupted", "suspended"] as const;
+const ATTENTION_TAGS = ["unread", "error", "interrupted", "suspended", "manual_override"] as const;
 
 /** Compute the status badge display for a narrator in the list view. */
 function getNarratorBadgeInfo(

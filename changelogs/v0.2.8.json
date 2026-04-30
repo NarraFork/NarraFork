@@ -1,0 +1,6 @@
+{
+	"version": "0.2.8",
+	"date": "2026-04-29",
+	"en": "## Bug Fixes\n\n- Fixed a race condition between subagent takeover and context compaction that could cause the compact process to overwrite the subagent's finalized status\n- Fixed subagent takeover not properly broadcasting events to the parent narrator's SubagentCard in real time\n- Fixed conclusion file not being set up for explore/plan subagents during manual override takeover, causing results to be lost\n- Fixed subagent compact restart loop where the outer restart was triggered even after onBeforeTurn had already handled the compact internally\n- Improved null-safety for buffered message queue and overseer queue processing",
+	"zh-CN": "## 修复\n\n- 修复子代理接管与上下文压缩之间的竞态条件，该问题可能导致压缩流程覆盖子代理已完成的状态\n- 修复子代理接管后事件未正确广播到父叙述者的 SubagentCard，导致实时更新缺失\n- 修复手动接管 explore/plan 子代理时未正确设置结论文件，导致子代理结果丢失\n- 修复子代理压缩后的重启循环问题：当 onBeforeTurn 已在内部处理压缩时，外层仍触发不必要的重启\n- 改进缓冲消息队列和 overseer 队列处理的空值安全性"
+}

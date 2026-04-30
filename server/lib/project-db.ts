@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const PROJECT_DB_DIR = ".narrafork";
 const PROJECT_DB_FILE = "project.db";
 
@@ -33,6 +33,26 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "reasoning_tokens", type: "INTEGER" },
 			{ name: "ttft_ms", type: "INTEGER" },
 			{ name: "duration_ms", type: "INTEGER" },
+		],
+	},
+	{
+		table: "narrators",
+		columns: [
+			{ name: "substatus", type: "TEXT NOT NULL DEFAULT '[]'" },
+			{ name: "variant", type: "TEXT NOT NULL DEFAULT 'primary'" },
+			{ name: "traits", type: "TEXT NOT NULL DEFAULT '[]'" },
+			{ name: "is_background", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "background_status", type: "TEXT" },
+			{ name: "background_result", type: "TEXT" },
+			{ name: "background_completed_at", type: "TEXT" },
+			{ name: "is_ask_in_passing", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "turn_started_at", type: "TEXT" },
+			{ name: "message_version", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "prune_enabled", type: "INTEGER NOT NULL DEFAULT 1" },
+			{ name: "fast_mode", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "relaxed_plan", type: "INTEGER NOT NULL DEFAULT 0" },
+			{ name: "reasoning_effort", type: "TEXT" },
+			{ name: "previous_permission_mode", type: "TEXT" },
 		],
 	},
 ];
@@ -151,6 +171,21 @@ CREATE TABLE IF NOT EXISTS narrators (
 	prune_boundary_message_id TEXT,
 	pruned_percent INTEGER,
 	created_at TEXT NOT NULL,
+	substatus TEXT NOT NULL DEFAULT '[]',
+	variant TEXT NOT NULL DEFAULT 'primary',
+	traits TEXT NOT NULL DEFAULT '[]',
+	is_background INTEGER NOT NULL DEFAULT 0,
+	background_status TEXT,
+	background_result TEXT,
+	background_completed_at TEXT,
+	is_ask_in_passing INTEGER NOT NULL DEFAULT 0,
+	turn_started_at TEXT,
+	message_version INTEGER NOT NULL DEFAULT 0,
+	prune_enabled INTEGER NOT NULL DEFAULT 1,
+	fast_mode INTEGER NOT NULL DEFAULT 0,
+	relaxed_plan INTEGER NOT NULL DEFAULT 0,
+	reasoning_effort TEXT,
+	previous_permission_mode TEXT,
 	updated_at TEXT NOT NULL
 );
 

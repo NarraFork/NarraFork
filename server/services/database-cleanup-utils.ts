@@ -1,3 +1,5 @@
+// Includes legacy status values ("done", "error", "interrupted") that may still exist
+// in databases not yet migrated to the new status+substatus model.
 export const STALE_SESSION_STATUSES = new Set(["idle", "done", "error", "interrupted"]);
 
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";

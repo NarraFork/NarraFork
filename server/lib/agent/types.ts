@@ -71,6 +71,15 @@ export interface ToolDefinition {
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
+	/** Optional metadata for tool provenance (e.g. MCP server origin). */
+	metadata?: {
+		/** MCP server ID from settings. */
+		mcpServerId?: string;
+		/** MCP server display name. */
+		mcpServerName?: string;
+		/** Original MCP tool name (before prefixing). */
+		mcpToolName?: string;
+	};
 }
 
 /** ToolDefinition with description resolved to a plain string (after dynamic evaluation) */

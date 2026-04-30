@@ -770,6 +770,7 @@ export const narratorPersistence = {
 			errorMessage?: string;
 			errorCode?: string;
 			setTurnStart?: boolean;
+			skipErrorMessage?: boolean;
 		},
 	) {
 		const errorMessage = options?.errorMessage;
@@ -813,36 +814,38 @@ export const narratorPersistence = {
 				errorCode,
 			});
 
-			try {
-				const errText = normalizedErrorMessage ?? "Unknown error";
-				const msgId = generateId();
-				await db.insert(narratorMessages).values({
-					id: msgId,
-					narratorId,
-					role: "system",
-					contentJson: [{ type: "error", message: errText }],
-					contentText: `[Error] ${errText}`,
-					createdAt: now,
-				});
-				await appendMessageRef(narratorId, msgId);
-				broadcastToNarrator(narratorId, {
-					type: "message",
-					narratorId,
-					message: {
+			if (!options?.skipErrorMessage) {
+				try {
+					const errText = normalizedErrorMessage ?? "Unknown error";
+					const msgId = generateId();
+					await db.insert(narratorMessages).values({
 						id: msgId,
 						narratorId,
 						role: "system",
 						contentJson: [{ type: "error", message: errText }],
 						contentText: `[Error] ${errText}`,
 						createdAt: now,
-						children: [],
-					},
-				});
-			} catch (e) {
-				logger.warn("Failed to persist error system message", {
-					narratorId,
-					error: String(e),
-				});
+					});
+					await appendMessageRef(narratorId, msgId);
+					broadcastToNarrator(narratorId, {
+						type: "message",
+						narratorId,
+						message: {
+							id: msgId,
+							narratorId,
+							role: "system",
+							contentJson: [{ type: "error", message: errText }],
+							contentText: `[Error] ${errText}`,
+							createdAt: now,
+							children: [],
+						},
+					});
+				} catch (e) {
+					logger.warn("Failed to persist error system message", {
+						narratorId,
+						error: String(e),
+					});
+				}
 			}
 		}
 		broadcastToNarrator(narratorId, {

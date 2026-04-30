@@ -479,6 +479,31 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			if (fields.description) parts.push(fields.description);
 			if (parts.length > 0) return parts.join(": ");
 		}
+		// Search tools: show pattern + path from extracted fields
+		if (fields && SEARCH_TOOLS.has(toolName)) {
+			const pat = fields.pattern ?? fields.glob;
+			const searchPath = fields.path;
+			if (pat || searchPath) {
+				const pathLabel = searchPath ? ` in ${basename(searchPath) || searchPath}` : "";
+				const raw = `${pat || toolName}${pathLabel}`;
+				return raw.length > 60 ? `${raw.slice(0, 57)}...` : raw;
+			}
+		}
+		// WebSearch: show query
+		if (fields && WEB_SEARCH_TOOLS.has(toolName)) {
+			const q = fields.query;
+			if (q) return q.length > 60 ? `${q.slice(0, 57)}...` : q;
+		}
+		// WebFetch: show url + mode
+		if (fields && WEB_FETCH_TOOLS.has(toolName)) {
+			const fetchUrl = fields.url;
+			const fetchMode = fields.mode;
+			if (fetchUrl) {
+				const short = fetchUrl.length > 50 ? `${fetchUrl.slice(0, 47)}...` : fetchUrl;
+				return fetchMode ? `${fetchMode}: ${short}` : short;
+			}
+			if (fetchMode) return fetchMode;
+		}
 		if (filePath) {
 			const base = basename(filePath);
 			const displayChars = contentChars ?? chars;
@@ -2833,19 +2858,9 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Search tools: show pattern
+	// Search tools: header already shows pattern + path — no extra streaming detail needed.
 	if (cat === "search") {
-		const pattern = fields?.pattern;
-		if (!pattern) return null;
-		const searchPath = fields?.path ?? fields?.glob;
-		return (
-			<Box mt="xs">
-				<Code block style={{ ...codeStyle, maxHeight: 60 }}>
-					{pattern}
-					{searchPath ? ` in ${searchPath}` : ""}
-				</Code>
-			</Box>
-		);
+		return null;
 	}
 
 	// Agent/Task tools: show prompt
@@ -2866,17 +2881,11 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
-	// Read tools: show file_path
+	// Read tools: header already shows basename — no extra streaming detail needed.
+	// Showing the full path here caused a brief flash (visible during streaming,
+	// then hidden when the card collapses after streaming ends).
 	if (cat === "read") {
-		const fp = filePath ?? fields?.file_path;
-		if (!fp) return null;
-		return (
-			<Box mt="xs">
-				<Text size="xs" c="dimmed" ff="monospace">
-					{fp}
-				</Text>
-			</Box>
-		);
+		return null;
 	}
 
 	// Plan mode: show plan content

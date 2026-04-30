@@ -259,11 +259,13 @@ export async function cancelBackgroundTask(taskNarratorId: string): Promise<bool
 		.set({
 			backgroundStatus: "cancelled",
 			backgroundCompletedAt: now,
-			status: "idle",
-			substatus: JSON.stringify(["interrupted"]),
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, taskNarratorId));
+	await narratorService.updateStatus(taskNarratorId, "idle", {
+		substatus: ["interrupted"],
+		skipErrorMessage: true,
+	});
 
 	const parentNarratorId = narrator.parentNarratorId;
 	if (parentNarratorId) {
@@ -875,11 +877,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
 	// 2. Mark subagent as working (in-place, no fork)
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({ status: "working", substatus: "[]", errorMessage: null, updatedAt: now })
-		.where(eq(narrators.id, subagentId));
+	await narratorService.updateStatus(subagentId, "working");
 
 	// 3. Broadcast subagent_started (same subagentId)
 	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);

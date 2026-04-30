@@ -1468,6 +1468,13 @@ interface McpServerDraft {
 	env: Array<{ key: string; value: string }>;
 	headers: Array<{ key: string; value: string }>;
 	enabled: boolean;
+	defaultBehavior: "" | "allow" | "ask" | "deny";
+}
+
+interface McpToolPermissionDraft {
+	toolName: string;
+	behavior: string;
+	enabled?: boolean;
 }
 
 const EMPTY_DRAFT: McpServerDraft = {
@@ -1480,6 +1487,7 @@ const EMPTY_DRAFT: McpServerDraft = {
 	env: [],
 	headers: [],
 	enabled: true,
+	defaultBehavior: "",
 };
 
 function statusColor(status: string): string {
@@ -1563,6 +1571,7 @@ function McpToolsTab() {
 			env?: Record<string, string>;
 			headers?: Record<string, string>;
 			enabled?: boolean;
+			defaultBehavior?: string;
 		}) => {
 			setEditingId(server.id);
 			setDraft({
@@ -1585,6 +1594,7 @@ function McpToolsTab() {
 						}))
 					: [],
 				enabled: server.enabled ?? true,
+				defaultBehavior: (server.defaultBehavior as McpServerDraft["defaultBehavior"]) ?? "",
 			});
 			testMutation.reset();
 			openEdit();
@@ -1592,7 +1602,7 @@ function McpToolsTab() {
 		[openEdit, testMutation],
 	);
 
-	const draftToPayload = useCallback((d: McpServerDraft) => {
+	const draftToPayload = useCallback((d: McpServerDraft, includeClears = false) => {
 		const payload: Record<string, unknown> = {
 			name: d.name.trim(),
 			transport: d.transport,
@@ -1616,11 +1626,16 @@ function McpToolsTab() {
 		if (envEntries.length > 0) {
 			payload.env = Object.fromEntries(envEntries.map((e) => [e.key.trim(), e.value]));
 		}
+		if (d.defaultBehavior) {
+			payload.defaultBehavior = d.defaultBehavior;
+		} else if (includeClears) {
+			payload.defaultBehavior = null;
+		}
 		return payload;
 	}, []);
 
 	const handleSave = useCallback(() => {
-		const payload = draftToPayload(draft);
+		const payload = draftToPayload(draft, Boolean(editingId));
 		if (!payload.name) return;
 
 		if (editingId) {
@@ -1773,18 +1788,57 @@ function McpToolsTab() {
 											{t("noMcpTools")}
 										</Text>
 									)}
-									{server.tools.map((tool) => (
-										<Paper key={tool.name} p="xs" withBorder>
-											<Text size="xs" fw={600}>
-												{tool.name}
-											</Text>
-											{tool.description && (
-												<Text size="xs" c="dimmed">
-													{tool.description}
-												</Text>
-											)}
-										</Paper>
-									))}
+									{server.tools.length > 0 && (
+										<Text size="xs" c="dimmed" mb={2}>
+											{t("mcpToolPermissions")}
+										</Text>
+									)}
+									{server.tools.map((tool) => {
+										const toolPerms: McpToolPermissionDraft[] = server.toolPermissions ?? [];
+										const perm = toolPerms.find((tp) => tp.toolName === tool.name);
+										const currentBehavior = perm?.behavior ?? "";
+										return (
+											<Paper key={tool.name} p="xs" withBorder>
+												<Group justify="space-between" wrap="nowrap" gap="xs">
+													<div style={{ flex: 1, minWidth: 0 }}>
+														<Text size="xs" fw={600}>
+															{tool.name}
+														</Text>
+														{tool.description && (
+															<Text size="xs" c="dimmed" lineClamp={1}>
+																{tool.description}
+															</Text>
+														)}
+													</div>
+													<Select
+														value={currentBehavior}
+														onChange={(v) => {
+															const newBehavior = v ?? "";
+															updateMutation.mutate({
+																id: server.id,
+																toolPermissionPatch: {
+																	toolName: tool.name,
+																	behavior: newBehavior || null,
+																},
+															});
+														}}
+														data={[
+															{ value: "", label: t("mcpBehaviorFollow") },
+															{ value: "allow", label: t("mcpBehaviorAllow") },
+															{ value: "ask", label: t("mcpBehaviorAsk") },
+															{ value: "deny", label: t("mcpBehaviorDeny") },
+														]}
+														clearable={false}
+														size="xs"
+														w={130}
+														styles={{
+															input: { minHeight: 28, height: 28 },
+														}}
+													/>
+												</Group>
+											</Paper>
+										);
+									})}
 								</Stack>
 							</Collapse>
 						</Stack>
@@ -2026,6 +2080,26 @@ function McpToolsTab() {
 							const val = e.currentTarget.checked;
 							setDraft((d) => ({ ...d, enabled: val }));
 						}}
+					/>
+
+					<Select
+						label={t("mcpDefaultBehavior")}
+						description={t("mcpDefaultBehaviorDesc")}
+						value={draft.defaultBehavior}
+						onChange={(v) =>
+							setDraft((d) => ({
+								...d,
+								defaultBehavior: (v ?? "") as McpServerDraft["defaultBehavior"],
+							}))
+						}
+						data={[
+							{ value: "", label: t("mcpBehaviorFollow") },
+							{ value: "allow", label: t("mcpBehaviorAllow") },
+							{ value: "ask", label: t("mcpBehaviorAsk") },
+							{ value: "deny", label: t("mcpBehaviorDeny") },
+						]}
+						clearable={false}
+						size="sm"
 					/>
 
 					{/* Test result */}

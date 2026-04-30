@@ -50,7 +50,7 @@ const TOP_BADGE_HEIGHT = 32;
 const MERGE_DISTANCE = 40;
 
 /** Only show offscreen bubbles for cards whose narrator needs attention */
-const BUBBLE_NARRATOR_STATUSES = new Set(["waiting", "unread", "error"]);
+const BUBBLE_NARRATOR_STATUSES = new Set(["waiting", "unread", "error", "manual_override"]);
 
 const BUBBLE_STATUS_COLORS: Record<string, { bg: string; border: string }> = {
 	unread: {
@@ -60,6 +60,10 @@ const BUBBLE_STATUS_COLORS: Record<string, { bg: string; border: string }> = {
 	error: {
 		bg: "var(--mantine-color-red-7)",
 		border: "var(--mantine-color-red-4)",
+	},
+	manual_override: {
+		bg: "var(--mantine-color-orange-7)",
+		border: "var(--mantine-color-orange-4)",
 	},
 	waiting: {
 		bg: "var(--mantine-color-yellow-7)",
@@ -192,8 +196,14 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 			const avgWX = group.reduce((s, b) => s + b.worldX, 0) / group.length;
 			const avgWY = group.reduce((s, b) => s + b.worldY, 0) / group.length;
 
-			// Pick the most severe narrator status in the group: error > waiting > unread
-			const statusPriority: Record<string, number> = { error: 2, waiting: 1, unread: 0 };
+			// Pick the most severe narrator status in the group:
+			// error > manual_override > waiting > unread
+			const statusPriority: Record<string, number> = {
+				error: 3,
+				manual_override: 2,
+				waiting: 1,
+				unread: 0,
+			};
 			let dominant = group[0].narratorStatus;
 			for (const b of group) {
 				if ((statusPriority[b.narratorStatus] ?? -1) > (statusPriority[dominant] ?? -1)) {

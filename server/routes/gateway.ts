@@ -136,6 +136,8 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			planMode: false,
 			isBackground: false,
 			isAskInPassing: false,
+			variant: "primary",
+			traits: ["standalone"],
 			messageVersion: 0,
 			createdAt: now,
 			updatedAt: now,

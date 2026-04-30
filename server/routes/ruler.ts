@@ -11,7 +11,7 @@ import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
  * Merges status + substatus into a single string that Pixi can color-map directly.
  * e.g. idle + ["unread"] → "unread", idle + ["error"] → "error", working → "working"
  *
- * NOTE: This only maps persistent substatus tags (error/suspended/interrupted/unread).
+ * NOTE: This only maps persistent substatus tags (error/suspended/manual_override/interrupted/unread).
  * Transient tags (reasoning/compacting/queued etc.) are irrelevant for the Ruler's
  * coarse-grained Pixi rendering. The frontend status-registry.ts handles the full
  * priority list for the detailed narrator panel view.
@@ -20,12 +20,19 @@ function resolveNarratorDisplayStatus(status: string, substatusRaw?: string | nu
 	if (status === "working" || status === "waiting") return status;
 	if (status !== "idle" || !substatusRaw) return status;
 	const sub = parseSubstatus(substatusRaw);
-	// Priority: error > suspended > interrupted > unread
+	// Priority: error > suspended > manual_override > interrupted > unread
 	if (sub.includes("error")) return "error";
 	if (sub.includes("suspended")) return "suspended";
+	if (sub.includes("manual_override")) return "manual_override";
 	if (sub.includes("interrupted")) return "interrupted";
 	if (sub.includes("unread")) return "unread";
 	return status;
+}
+
+function hasChapterId<T extends { chapterId: string | null }>(
+	narrator: T,
+): narrator is T & { chapterId: string } {
+	return Boolean(narrator.chapterId);
 }
 
 import {
@@ -150,9 +157,9 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		});
 		narratorMap = new Map(
 			chapterNarrators
-				.filter((n) => n.chapterId)
+				.filter(hasChapterId)
 				.map((n) => [
-					n.chapterId!,
+					n.chapterId,
 					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
 				]),
 		);
@@ -315,8 +322,8 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 			});
 			narratorMap = new Map(
 				chapterNarrators
-					.filter((n) => n.chapterId)
-					.map((n) => [n.chapterId!, resolveNarratorDisplayStatus(n.status, n.substatus)]),
+					.filter(hasChapterId)
+					.map((n) => [n.chapterId, resolveNarratorDisplayStatus(n.status, n.substatus)]),
 			);
 		}
 
@@ -377,9 +384,9 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		});
 		narratorMap = new Map(
 			chapterNarrators
-				.filter((n) => n.chapterId)
+				.filter(hasChapterId)
 				.map((n) => [
-					n.chapterId!,
+					n.chapterId,
 					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
 				]),
 		);

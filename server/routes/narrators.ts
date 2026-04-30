@@ -1382,7 +1382,7 @@ narratorRoutes.post("/:id/fork-messages", async (c) => {
 	const newNarrator = await narratorService.forkFromMessages(id, parsed.messageIds, {
 		title: parsed.title,
 	});
-	return c.json(newNarrator, 201);
+	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
 });
 
 // Fork standalone narrator (chapter-bound narrators must fork via chapter fork)
@@ -1395,7 +1395,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		title: parsed.data.title,
 		inheritMode: parsed.data.inheritMode ?? "full",
 	});
-	return c.json(newNarrator, 201);
+	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
 });
 
 // === Ask in passing ===
@@ -1592,7 +1592,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		message: updatedMsg,
 	});
 
-	return c.json(newNarrator, 201);
+	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
 });
 
 // Cancel: delete a pending message

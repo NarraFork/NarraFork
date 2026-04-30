@@ -235,7 +235,20 @@ mcpRoutes.post("/", async (c) => {
 
 // === External MCP server management ===
 
-const mcpServerInputSchema = z.object({
+const mcpBehaviorSchema = z.enum(["allow", "ask", "deny"]);
+const mcpToolPermissionInputSchema = z.object({
+	toolName: z.string().min(1).max(200),
+	behavior: mcpBehaviorSchema,
+	enabled: z.boolean().optional(),
+});
+const mcpToolPermissionPatchSchema = z.object({
+	toolName: z.string().min(1).max(200),
+	// null clears the per-tool override; undefined leaves the existing behavior unchanged.
+	behavior: mcpBehaviorSchema.nullable().optional(),
+	enabled: z.boolean().optional(),
+});
+
+const mcpServerCreateSchema = z.object({
 	name: z.string().min(1).max(200).optional().default("Untitled"),
 	transport: z.enum(["stdio", "streamable-http", "sse"]).optional().default("stdio"),
 	command: z.string().max(500).optional(),
@@ -245,7 +258,69 @@ const mcpServerInputSchema = z.object({
 	url: z.string().url().max(2000).optional(),
 	headers: z.record(z.string().max(200), z.string().max(2000)).optional(),
 	enabled: z.boolean().optional().default(true),
+	defaultBehavior: mcpBehaviorSchema.optional(),
+	toolPermissions: z.array(mcpToolPermissionInputSchema).optional(),
 });
+
+const mcpServerPatchSchema = z.object({
+	name: z.string().min(1).max(200).optional(),
+	transport: z.enum(["stdio", "streamable-http", "sse"]).optional(),
+	command: z.string().max(500).optional(),
+	args: z.array(z.string().max(500)).max(50).optional(),
+	cwd: z.string().max(500).optional(),
+	env: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	url: z.string().url().max(2000).optional(),
+	headers: z.record(z.string().max(200), z.string().max(2000)).optional(),
+	enabled: z.boolean().optional(),
+	// null explicitly clears the server-level override; undefined leaves it unchanged.
+	defaultBehavior: mcpBehaviorSchema.nullable().optional(),
+	toolPermissions: z.array(mcpToolPermissionInputSchema).optional(),
+	toolPermissionPatch: mcpToolPermissionPatchSchema.optional(),
+});
+
+function applyMcpServerPatch(
+	server: McpServerConfig,
+	patch: z.infer<typeof mcpServerPatchSchema>,
+): McpServerConfig {
+	const { defaultBehavior, toolPermissionPatch, ...rest } = patch;
+	const updated: McpServerConfig = { ...server, ...rest };
+	if ("defaultBehavior" in patch) {
+		if (defaultBehavior == null) {
+			delete updated.defaultBehavior;
+		} else {
+			updated.defaultBehavior = defaultBehavior;
+		}
+	}
+	if (toolPermissionPatch) {
+		const existing = [...(updated.toolPermissions ?? [])];
+		const idx = existing.findIndex((tp) => tp.toolName === toolPermissionPatch.toolName);
+		if (toolPermissionPatch.behavior === null) {
+			if (idx >= 0) existing.splice(idx, 1);
+		} else if (toolPermissionPatch.behavior === undefined) {
+			if (idx >= 0 && toolPermissionPatch.enabled !== undefined) {
+				existing[idx] = { ...existing[idx], enabled: toolPermissionPatch.enabled };
+			}
+		} else {
+			const nextRule = {
+				...(idx >= 0 ? existing[idx] : {}),
+				toolName: toolPermissionPatch.toolName,
+				behavior: toolPermissionPatch.behavior,
+				...(toolPermissionPatch.enabled !== undefined && { enabled: toolPermissionPatch.enabled }),
+			};
+			if (idx >= 0) {
+				existing[idx] = nextRule;
+			} else {
+				existing.push(nextRule);
+			}
+		}
+		if (existing.length > 0) {
+			updated.toolPermissions = existing;
+		} else {
+			delete updated.toolPermissions;
+		}
+	}
+	return updated;
+}
 
 /** List all configured MCP servers with runtime status. */
 mcpRoutes.get("/servers", (c) => {
@@ -255,7 +330,7 @@ mcpRoutes.get("/servers", (c) => {
 /** Add a new MCP server. */
 mcpRoutes.post("/servers", async (c) => {
 	const body = await c.req.json();
-	const parsed = mcpServerInputSchema.safeParse(body);
+	const parsed = mcpServerCreateSchema.safeParse(body);
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
@@ -284,11 +359,11 @@ mcpRoutes.patch("/servers/:id", async (c) => {
 	if (idx === -1) return c.json({ error: "Not found" }, 404);
 
 	const body = await c.req.json();
-	const parsed = mcpServerInputSchema.partial().safeParse(body);
+	const parsed = mcpServerPatchSchema.safeParse(body);
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
-	const updated = { ...servers[idx], ...parsed.data, id }; // prevent id override
+	const updated = applyMcpServerPatch(servers[idx], parsed.data);
 	servers[idx] = updated;
 	settings.mcpServers = servers;
 	saveSettings(settings);
@@ -341,7 +416,7 @@ mcpRoutes.post("/servers/:id/disconnect", async (c) => {
 /** Test connection without persisting. */
 mcpRoutes.post("/servers/test", async (c) => {
 	const body = await c.req.json();
-	const parsed = mcpServerInputSchema.safeParse(body);
+	const parsed = mcpServerCreateSchema.safeParse(body);
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}

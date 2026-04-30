@@ -149,6 +149,11 @@ export function syncMcpTools(): void {
 			description: `[MCP: ${serverName}] ${tool.description ?? tool.name}`,
 			parameters: createPassthroughSchema(tool.inputSchema),
 			rawJsonSchema: cleanMcpSchema(tool.inputSchema),
+			metadata: {
+				mcpServerId: serverId,
+				mcpServerName: serverName,
+				mcpToolName: tool.name,
+			},
 			isAvailable: () => {
 				// Check if the server is still connected
 				const statuses = mcpManager.getServerStatuses();

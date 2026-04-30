@@ -61,6 +61,7 @@
 	"status_planning": "Planning",
 	"status_retrying": "Retrying",
 	"status_queued": "Queued",
+	"status_manual_override": "Manual Override",
 	"narratorError": "Narrator Error",
 	"contextTooLongCompactFailed": "Context too long and auto-compact failed. Try starting a new conversation or manually compacting.",
 	"emptyResponseError": "{{provider}} returned an empty response. This usually means the API is misconfigured (base URL, model, or credentials).",

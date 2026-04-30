@@ -759,11 +759,14 @@ class BackgroundTaskService {
 			.set({
 				backgroundStatus: "cancelled",
 				backgroundCompletedAt: now,
-				status: "idle",
-				substatus: JSON.stringify(["interrupted"]),
 				updatedAt: now,
 			})
 			.where(eq(narrators.id, subagentNarratorId));
+		const { narratorService } = await import("./narrator-service");
+		await narratorService.updateStatus(subagentNarratorId, "idle", {
+			substatus: ["interrupted"],
+			skipErrorMessage: true,
+		});
 
 		eventBus.emit({
 			type: "narrator:background_task_cancelled",

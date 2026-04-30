@@ -28,6 +28,8 @@ export interface McpServerStatus {
 	env?: Record<string, string>;
 	headers?: Record<string, string>;
 	enabled: boolean;
+	defaultBehavior?: "allow" | "ask" | "deny";
+	toolPermissions?: Array<{ toolName: string; behavior: string; enabled?: boolean }>;
 	status: "connected" | "disconnected" | "connecting" | "error";
 	error?: string;
 	tools: Tool[];
@@ -283,6 +285,8 @@ class McpManager {
 				env: cfg.env,
 				headers: cfg.headers,
 				enabled: cfg.enabled,
+				defaultBehavior: cfg.defaultBehavior,
+				toolPermissions: cfg.toolPermissions,
 				status: entry?.status ?? "disconnected",
 				error: entry?.error,
 				tools: entry?.tools ?? [],

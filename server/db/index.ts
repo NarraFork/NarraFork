@@ -82,6 +82,102 @@ ensureColumns(sqlite);
 	}
 }
 
+// Idempotent backfill: ensure variant/traits are consistent with legacy fields.
+// Handles databases where ensureColumns added the columns with defaults but
+// the 0025 migration's data backfill never ran.
+{
+	// Normalize invalid traits values to valid JSON arrays.
+	// ensureColumns may have added the column with DEFAULT '' instead of '[]'.
+	const fixTraitsJson = sqlite
+		.prepare(
+			`UPDATE narrators SET traits = '[]'
+			 WHERE traits IS NULL OR traits = '' OR json_valid(traits) = 0`,
+		)
+		.run();
+	if (fixTraitsJson.changes > 0) {
+		logger.info("Normalized invalid traits JSON to empty array", {
+			count: fixTraitsJson.changes,
+		});
+	}
+
+	const fixSubstatusJson = sqlite
+		.prepare(
+			`UPDATE narrators SET substatus = '[]'
+			 WHERE substatus IS NULL OR substatus = '' OR json_valid(substatus) = 0`,
+		)
+		.run();
+	if (fixSubstatusJson.changes > 0) {
+		logger.info("Normalized invalid substatus JSON to empty array", {
+			count: fixSubstatusJson.changes,
+		});
+	}
+
+	// 1. Fix subagent variant: type='subagent' but variant still 'primary'
+	const fixVariant = sqlite
+		.prepare(
+			`UPDATE narrators SET variant = 'subagent:' || COALESCE(subagent_type, 'general')
+			 WHERE type = 'subagent' AND (variant = 'primary' OR variant = '' OR variant IS NULL)`,
+		)
+		.run();
+	if (fixVariant.changes > 0) {
+		logger.info("Backfilled subagent variant from legacy type+subagent_type", {
+			count: fixVariant.changes,
+		});
+	}
+
+	// 2. Ensure standalone trait for narrators without a chapter
+	const fixStandalone = sqlite
+		.prepare(
+			`UPDATE narrators SET traits = CASE
+				WHEN traits = '[]' THEN '["standalone"]'
+				WHEN traits LIKE '%]' THEN SUBSTR(traits, 1, LENGTH(traits) - 1) || ',"standalone"]'
+				ELSE '["standalone"]'
+			 END
+			 WHERE chapter_id IS NULL
+			   AND traits NOT LIKE '%"standalone"%'`,
+		)
+		.run();
+	if (fixStandalone.changes > 0) {
+		logger.info("Backfilled standalone trait for chapter-less narrators", {
+			count: fixStandalone.changes,
+		});
+	}
+
+	// 3. Ensure background trait for narrators with is_background=1
+	const fixBg = sqlite
+		.prepare(
+			`UPDATE narrators SET traits = CASE
+				WHEN traits = '[]' THEN '["background"]'
+				WHEN traits LIKE '%]' THEN SUBSTR(traits, 1, LENGTH(traits) - 1) || ',"background"]'
+				ELSE '["background"]'
+			 END
+			 WHERE is_background = 1 AND traits NOT LIKE '%"background"%'`,
+		)
+		.run();
+	if (fixBg.changes > 0) {
+		logger.info("Backfilled background trait from is_background flag", {
+			count: fixBg.changes,
+		});
+	}
+
+	// 4. Ensure ask-in-passing trait for narrators with is_ask_in_passing=1
+	const fixAip = sqlite
+		.prepare(
+			`UPDATE narrators SET traits = CASE
+				WHEN traits = '[]' THEN '["ask-in-passing"]'
+				WHEN traits LIKE '%]' THEN SUBSTR(traits, 1, LENGTH(traits) - 1) || ',"ask-in-passing"]'
+				ELSE '["ask-in-passing"]'
+			 END
+			 WHERE is_ask_in_passing = 1 AND traits NOT LIKE '%"ask-in-passing"%'`,
+		)
+		.run();
+	if (fixAip.changes > 0) {
+		logger.info("Backfilled ask-in-passing trait from is_ask_in_passing flag", {
+			count: fixAip.changes,
+		});
+	}
+}
+
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite);
 

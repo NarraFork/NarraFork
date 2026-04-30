@@ -1,8 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { eq } from "drizzle-orm";
-import { db } from "../db";
-import { narrators } from "../db/schema";
 import { type AgentConfig, buildHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
@@ -192,16 +189,11 @@ export async function finalizeSubagent(
 	// They remain available for sibling subagents to query via TeamStatus.file_changes
 	// until the parent narrator session ends (clearTeamFileChanges is called then).
 
-	const now = new Date().toISOString();
-	await db
-		.update(narrators)
-		.set({
-			status: "idle",
-			substatus: JSON.stringify(hasError ? ["error"] : ["unread"]),
-			errorMessage: hasError ? errorText : null,
-			updatedAt: now,
-		})
-		.where(eq(narrators.id, subagentId));
+	await narratorService.updateStatus(subagentId, "idle", {
+		substatus: hasError ? ["error"] : ["unread"],
+		errorMessage: hasError ? (errorText ?? undefined) : undefined,
+		skipErrorMessage: true,
+	});
 
 	eventBus.emit({
 		type: "narrator:subagent_completed",

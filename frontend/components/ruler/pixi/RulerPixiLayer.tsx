@@ -167,6 +167,12 @@ function narratorStatusColor(theme: PixiTheme, status: string): number {
 			return theme.narratorError;
 		case "waiting":
 			return theme.narratorWaiting;
+		case "manual_override":
+			return theme.narratorManualOverride;
+		case "interrupted":
+			return theme.narratorInterrupted;
+		case "suspended":
+			return theme.narratorSuspended;
 		default:
 			return theme.dimmed;
 	}

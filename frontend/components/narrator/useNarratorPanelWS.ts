@@ -1846,7 +1846,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				const localizedError = localizeNarratorError(error, t, errorCode) ?? error;
 				// Update narrator cache with localized error message
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status: "error", errorMessage: localizedError } : old,
+					old
+						? { ...old, status: "idle", substatus: ["error"], errorMessage: localizedError }
+						: old,
 				);
 				notifications.show({
 					title: t("narratorError"),

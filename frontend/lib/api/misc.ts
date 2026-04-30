@@ -223,6 +223,12 @@ export const miscApi = {
 				env?: Record<string, string>;
 				headers?: Record<string, string>;
 				enabled: boolean;
+				defaultBehavior?: string;
+				toolPermissions?: Array<{
+					toolName: string;
+					behavior: string;
+					enabled?: boolean;
+				}>;
 				status: string;
 				error?: string;
 				tools: Array<{ name: string; description?: string; inputSchema?: unknown }>;

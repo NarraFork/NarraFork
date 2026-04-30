@@ -15,6 +15,7 @@ import {
 import type { PermissionResult } from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { eventBus } from "../lib/event-bus";
@@ -369,6 +370,10 @@ export function resolvePermissionDecision(
 	);
 	if (whitelistDecision) return whitelistDecision;
 
+	// MCP tool permission: check server-level defaultBehavior and per-tool overrides
+	const mcpDecision = resolveMcpToolPermission(toolName, effectiveMode);
+	if (mcpDecision) return mcpDecision;
+
 	// Command whitelist
 	let effectiveBashAnalysis = bashAnalysis;
 	if (
@@ -585,6 +590,47 @@ export interface PermissionDecisionMeta {
 	commandBlacklistReason?: string;
 	commandBlacklistDenyPrompt?: string;
 	planModeSoftDeny?: boolean;
+}
+
+/**
+ * Resolve MCP tool permission from server-level config.
+ * Checks per-tool overrides first, then server defaultBehavior.
+ * Returns null when no MCP-specific config applies (fall through to normal logic).
+ *
+ * Only applies when effectiveMode is "default" or "acceptEdits" — modes like
+ * bypassPermissions/dontAsk/readOnly are already handled before this is called.
+ */
+function resolveMcpToolPermission(
+	toolName: string,
+	effectiveMode: string,
+): "allow" | "deny" | "ask" | null {
+	if (!toolName.startsWith("mcp__")) return null;
+	// Only override in interactive modes — bypassPermissions/dontAsk/readOnly
+	// are handled earlier in the decision chain.
+	if (effectiveMode !== "default" && effectiveMode !== "acceptEdits") return null;
+
+	// Look up tool metadata from the registry
+	const toolDef = toolRegistry.get(toolName);
+	const meta = toolDef?.metadata;
+	if (!meta?.mcpServerId) return null;
+
+	const servers = settings.mcpServers;
+	if (!servers) return null;
+	const serverConfig = servers.find((s) => s.id === meta.mcpServerId);
+	if (!serverConfig) return null;
+
+	// Per-tool override takes priority
+	if (serverConfig.toolPermissions) {
+		const toolPerm = serverConfig.toolPermissions.find(
+			(tp) => tp.toolName === meta.mcpToolName && tp.enabled !== false,
+		);
+		if (toolPerm) return toolPerm.behavior;
+	}
+
+	// Server-level default
+	if (serverConfig.defaultBehavior) return serverConfig.defaultBehavior;
+
+	return null;
 }
 
 export interface PermissionDecisionOpts {
