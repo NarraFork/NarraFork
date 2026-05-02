@@ -2558,11 +2558,15 @@ export const MessageBubble = memo(function MessageBubble({
 		const toolLoadedBlock = blocks.find((b: any) => b.type === "tool_loaded");
 		if (toolLoadedBlock) {
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
-					<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-						{toolLoadedBlock.text}
-					</Text>
-				</Paper>
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<BlockMenuWrapper blockIndex={0}>
+						<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+							<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+								{toolLoadedBlock.text}
+							</Text>
+						</Paper>
+					</BlockMenuWrapper>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 
@@ -2571,11 +2575,15 @@ export const MessageBubble = memo(function MessageBubble({
 		const bashCommandBlock = blocks.find((b: any) => b.type === "bash_command");
 		if (bashCommandBlock) {
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
-					<Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
-						$ {bashCommandBlock.command}
-					</Text>
-				</Paper>
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<BlockMenuWrapper blockIndex={0}>
+						<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+							<Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
+								$ {bashCommandBlock.command}
+							</Text>
+						</Paper>
+					</BlockMenuWrapper>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 
@@ -2856,7 +2864,11 @@ export const MessageBubble = memo(function MessageBubble({
 						);
 					}
 					if (block.type === "image_generation") {
-						return <ImageGenerationBlock key={key} block={block as ImageGenerationBlockData} />;
+						return (
+							<BlockMenuWrapper key={key} blockIndex={realIndex}>
+								<ImageGenerationBlock block={block as ImageGenerationBlockData} />
+							</BlockMenuWrapper>
+						);
 					}
 					if (block.type === "tool_use") {
 						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

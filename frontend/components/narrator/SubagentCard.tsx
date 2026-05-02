@@ -15,6 +15,7 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
+	IconArrowBackUp,
 	IconArrowsMinimize,
 	IconChevronDown,
 	IconChevronRight,
@@ -317,7 +318,8 @@ export const SubagentCard = memo(
 		const hasCardActions = !!(
 			parentMsgCtx.onDeleteBlock ||
 			parentMsgCtx.onCompactBeforeMessage ||
-			parentMsgCtx.onAskInPassing
+			parentMsgCtx.onAskInPassing ||
+			parentMsgCtx.onRollbackToBlock
 		);
 
 		const swipe = useSwipeMenu({
@@ -516,6 +518,17 @@ export const SubagentCard = memo(
 						}}
 					>
 						{t("backgroundTasks.cancel")}
+					</Menu.Item>
+				)}
+				{parentMsgCtx.onRollbackToBlock && blockIndex != null && (
+					<Menu.Item
+						leftSection={<IconArrowBackUp size={14} />}
+						onClick={() => {
+							parentMsgCtx.onRollbackToBlock?.(blockIndex);
+							swipe.closeSwipe();
+						}}
+					>
+						{t("contextMenu_rollback")}
 					</Menu.Item>
 				)}
 				{parentMsgCtx.onAskInPassing && (
