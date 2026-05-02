@@ -736,27 +736,6 @@ export const miscApi = {
 			method: "POST",
 		}),
 
-	// Overseers
-	listOverseers: (params?: { scope?: string; projectId?: string }) => {
-		const p = new URLSearchParams();
-		if (params?.scope) p.set("scope", params.scope);
-		if (params?.projectId) p.set("projectId", params.projectId);
-		const qs = p.toString();
-		return request<ApiEntity[]>(`/overseers${qs ? `?${qs}` : ""}`);
-	},
-	createOverseer: (data: { scope: string; projectId?: string; model?: string }) =>
-		request<ApiEntity>("/overseers", {
-			method: "POST",
-			body: JSON.stringify(data),
-		}),
-	updateOverseer: (id: string, data: { enabled?: boolean }) =>
-		request<ApiEntity>(`/overseers/${id}`, {
-			method: "PATCH",
-			body: JSON.stringify(data),
-		}),
-	deleteOverseer: (id: string) =>
-		request<{ ok: boolean }>(`/overseers/${id}`, { method: "DELETE" }),
-
 	// Workspaces
 	listWorkspaces: () => request<ApiEntity[]>("/workspaces"),
 	getWorkspace: (id: string) => request<ApiEntity>(`/workspaces/${id}`),

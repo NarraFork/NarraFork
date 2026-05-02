@@ -8,6 +8,14 @@ import {
 } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
+const REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh"] as const;
+const REASONING_EFFORT_DESCRIPTION =
+	'Reasoning/thinking effort for this subagent. Use "none" to disable thinking where supported. ' +
+	'Valid values: "none", "low", "medium", "high", "xhigh". ' +
+	"If the selected model/provider does not support configurable thinking intensity, this option is ignored.";
+
 // Use text import so the bundler inlines the file content at build time
 import baseDescription from "./task.txt" with { type: "text" };
 
@@ -59,6 +67,10 @@ function buildParameters() {
 			.describe(
 				`Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
 			),
+		reasoning_effort: z
+			.enum(REASONING_EFFORT_VALUES)
+			.optional()
+			.describe(REASONING_EFFORT_DESCRIPTION),
 		workdir: z
 			.string()
 			.optional()
@@ -127,6 +139,11 @@ export const agentTool: ToolDefinition = {
 					description: `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
 					type: "string",
 				},
+				reasoning_effort: {
+					description: REASONING_EFFORT_DESCRIPTION,
+					type: "string",
+					enum: REASONING_EFFORT_VALUES,
+				},
 				workdir: {
 					description:
 						"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
@@ -160,6 +177,7 @@ export const agentTool: ToolDefinition = {
 			subagent_type?: string;
 			run_in_background?: boolean;
 			model?: string;
+			reasoning_effort?: ReasoningEffort;
 			workdir?: string;
 			alias?: string;
 			stop?: string;
@@ -200,7 +218,7 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		const { prompt, description, subagent_type, model, workdir, alias } = raw;
+		const { prompt, description, subagent_type, model, reasoning_effort, workdir, alias } = raw;
 		// Prefer new name, fall back to legacy name for in-flight conversations
 		const run_in_background = raw.run_in_background ?? raw.background;
 
@@ -233,6 +251,7 @@ export const agentTool: ToolDefinition = {
 				signal: ctx.signal,
 				locale: ctx.locale,
 				model: model || undefined,
+				reasoningEffort: reasoning_effort,
 				background: run_in_background || false,
 				alias: alias || description || undefined,
 			});

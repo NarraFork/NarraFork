@@ -1015,6 +1015,19 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(props.workdir.type).toBe("string");
 	});
 
+	test("rawJsonSchema includes reasoning_effort parameter", () => {
+		const schema = agentTool.rawJsonSchema;
+		if (!schema) throw new Error("Agent tool rawJsonSchema is missing");
+		const props = schema.properties as Record<
+			string,
+			{ type?: string; enum?: unknown; description?: string } | undefined
+		>;
+		expect(props.reasoning_effort).toBeDefined();
+		expect(props.reasoning_effort?.type).toBe("string");
+		expect(props.reasoning_effort?.enum).toEqual(["none", "low", "medium", "high", "xhigh"]);
+		expect(props.reasoning_effort?.description).toContain("ignored");
+	});
+
 	test("model description includes available models list", () => {
 		const schema = agentTool.rawJsonSchema!;
 		const props = schema.properties as Record<string, any>;

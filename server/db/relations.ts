@@ -23,7 +23,6 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
-	overseers,
 	portAllocations,
 	projects,
 	reviewConclusions,
@@ -42,7 +41,6 @@ export const projectsRelations = relations(projects, ({ many }) => ({
 	chapters: many(chapters),
 	chapterEdges: many(chapterEdges),
 	explorationGroups: many(explorationGroups),
-	overseers: many(overseers),
 	volumeSnapshots: many(volumeSnapshots),
 	hooks: many(hooks),
 }));
@@ -132,10 +130,6 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	blacklistDirs: many(narratorBlacklistDirs),
 	whitelistCmds: many(narratorWhitelistCmds),
 	blacklistCmds: many(narratorBlacklistCmds),
-	overseer: one(overseers, {
-		fields: [narrators.id],
-		references: [overseers.narratorId],
-	}),
 	bufferedMessages: many(narratorBufferedMessages),
 }));
 
@@ -288,17 +282,6 @@ export const narratorBlacklistCmdsRelations = relations(narratorBlacklistCmds, (
 	narrator: one(narrators, {
 		fields: [narratorBlacklistCmds.narratorId],
 		references: [narrators.id],
-	}),
-}));
-
-export const overseersRelations = relations(overseers, ({ one }) => ({
-	narrator: one(narrators, {
-		fields: [overseers.narratorId],
-		references: [narrators.id],
-	}),
-	project: one(projects, {
-		fields: [overseers.projectId],
-		references: [projects.id],
 	}),
 }));
 

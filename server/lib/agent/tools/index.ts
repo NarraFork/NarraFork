@@ -11,12 +11,6 @@ import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { grepTool } from "./grep";
 import { narraforkAdminTool } from "./narrafork-admin";
-import {
-	approvePermissionTool,
-	denyPermissionTool,
-	getNarratorContextTool,
-	listManagedNarratorsTool,
-} from "./overseer";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
@@ -45,16 +39,6 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
 	["NarraForkAdmin", narraforkAdminTool],
-]);
-
-/**
- * Overseer-only tools — only injected for narrators bound to an overseer.
- */
-export const OVERSEER_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
-	["ApprovePermission", approvePermissionTool],
-	["DenyPermission", denyPermissionTool],
-	["ListManagedNarrators", listManagedNarratorsTool],
-	["GetNarratorContext", getNarratorContextTool],
 ]);
 
 /**
@@ -101,14 +85,6 @@ const optionalProvider: ToolProvider = {
 	},
 };
 
-/** Overseer tools provider — injected for overseer narrators. */
-const overseerProvider: ToolProvider = {
-	name: "overseer",
-	tools() {
-		return [...OVERSEER_TOOLS.values()];
-	},
-};
-
 /** Review tools provider — injected for review narrators. */
 const reviewProvider: ToolProvider = {
 	name: "review",
@@ -121,6 +97,5 @@ const reviewProvider: ToolProvider = {
 export function registerCoreTools(): void {
 	toolRegistry.registerProvider(coreProvider);
 	toolRegistry.registerProvider(optionalProvider);
-	toolRegistry.registerProvider(overseerProvider);
 	toolRegistry.registerProvider(reviewProvider);
 }

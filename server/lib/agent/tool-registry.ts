@@ -6,7 +6,7 @@ import type { ToolDefinition } from "./types";
  * Enables plugin-style registration of tool groups.
  */
 export interface ToolProvider {
-	/** Unique provider name (e.g. "core", "optional", "overseer", "review", "mcp"). */
+	/** Unique provider name (e.g. "core", "optional", "review", "mcp"). */
 	name: string;
 	/** Tools provided by this provider. */
 	tools(): ToolDefinition[];

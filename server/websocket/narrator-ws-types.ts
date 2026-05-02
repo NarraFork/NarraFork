@@ -77,14 +77,6 @@ export type NarratorServerMessage =
 	  }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
-	| {
-			type: "overseer_reviewing";
-			narratorId: string;
-			requestId: string;
-			toolUseId: string;
-			status: "reviewing" | "queued" | "cleared";
-			overseerId?: string;
-	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| {

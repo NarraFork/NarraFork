@@ -65,8 +65,6 @@ export interface ActiveNarrator {
 	_skillRoot?: string | null;
 	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
 	_enabledOptionalTools: Set<string>;
-	/** Whether this narrator is bound to an overseer */
-	_isOverseer: boolean;
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;
@@ -79,9 +77,10 @@ export interface ActiveNarrator {
 	/** Goal accounting baseline at the start of the current turn. */
 	_goalTurnStartedAtMs?: number;
 	_goalTokenUsageBaseline?: TokenUsageSnapshot;
-	/** Guard against infinite goal continuation when a continuation turn makes no progress. */
+	/** Guard against infinite goal continuation when continuation turns make no tool progress. */
 	_goalContinuationSuppressed?: boolean;
 	_goalContinuationTurn?: boolean;
+	_goalContinuationNoToolCount?: number;
 }
 
 // === PendingPermission interface ===
@@ -95,19 +94,6 @@ export interface PendingPermission {
 	toolUseId: string;
 	broadcastTargetId: string;
 	planModeSoftDeny?: boolean;
-}
-
-// === OverseerQueuedMessage interface ===
-
-export interface OverseerQueuedMessage {
-	requestId: string;
-	narratorId: string;
-	toolName: string;
-	toolUseId: string;
-	input: Record<string, unknown>;
-	textForModel: string;
-	contentBlocks: unknown[];
-	broadcastTargetId: string;
 }
 
 // === BufferCreator interface ===
@@ -181,6 +167,18 @@ export const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
 	() => new Map(),
 );
 
+export interface PendingYoloDangerConfirmation {
+	narratorId: string;
+	fingerprint: string;
+	expiresAt: number;
+	summary: string;
+}
+
+export const pendingYoloDangerConfirmations = hotSafe<Map<string, PendingYoloDangerConfirmation>>(
+	"narrafork.pendingYoloDangerConfirmations",
+	() => new Map(),
+);
+
 export const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: string }>>(
 	"narrafork.pendingFeedback",
 	() => new Map(),
@@ -204,11 +202,6 @@ export const pendingPlanDiff = hotSafe<Map<string, string>>(
 export const planModeAskedOnce = hotSafe<Set<string>>(
 	"narrafork.planModeAskedOnce",
 	() => new Set(),
-);
-
-export const pendingOverseerMessages = hotSafe<Map<string, OverseerQueuedMessage[]>>(
-	"narrafork.pendingOverseerMessages",
-	() => new Map(),
 );
 
 export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(

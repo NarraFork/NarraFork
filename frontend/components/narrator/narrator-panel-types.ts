@@ -90,7 +90,6 @@ export interface PermissionCallbacks {
 	onQuestionDeny: (requestId: string) => void;
 	onBgAgentRetry?: (toolUseId: string) => void;
 	bgRetryDismissedIds: Set<string>;
-	overseerReviewMap: Map<string, "reviewing" | "queued">;
 }
 
 export interface NarratorPanelSnapshot {

@@ -116,12 +116,7 @@ export function renderToolRun(
 	if (items.length === 0) return null;
 
 	const matchPermission = (tc: ToolCallData) =>
-		resolvePendingPerm(
-			tc,
-			permCb.pendingPermission,
-			permCb.pendingPermsMap,
-			permCb.overseerReviewMap,
-		);
+		resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap);
 
 	const taskCount = items.filter((it) => it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
@@ -314,13 +309,7 @@ export function renderTreeMessages(
 					onAskInPassing={onAskInPassing}
 					resolvePerm={
 						resolvePerm ??
-						((tc) =>
-							resolvePendingPerm(
-								tc,
-								permCb.pendingPermission,
-								permCb.pendingPermsMap,
-								permCb.overseerReviewMap,
-							))
+						((tc) => resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermsMap))
 					}
 					onPermissionDecision={permCb.onPermissionDecision}
 					onQuestionSubmit={permCb.onQuestionSubmit}

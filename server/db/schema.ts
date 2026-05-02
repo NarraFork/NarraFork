@@ -412,15 +412,16 @@ export const narratorToolCalls = sqliteTable(
 			.notNull()
 			.default("initializing"),
 		durationMs: integer("duration_ms"),
+		streamStartedAt: text("stream_started_at"),
+		permissionStartedAt: text("permission_started_at"),
+		executionStartedAt: text("execution_started_at"),
+		completedAt: text("completed_at"),
 		errorMessage: text("error_message"),
 		permissionDecidedBy: text("permission_decided_by"),
 		permissionDecidedAt: text("permission_decided_at"),
 		permissionDenyMessage: text("permission_deny_message"),
 		permissionDecisionReason: text("permission_decision_reason"),
 		permissionSuggestions: text("permission_suggestions", { mode: "json" }),
-		permissionOverseerNarratorId: text("permission_overseer_narrator_id").references(
-			() => narrators.id,
-		),
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		// Token usage fields
 		inputTokens: integer("input_tokens").notNull().default(0),
@@ -767,29 +768,6 @@ export const narratorWhitelistCmds = sqliteTable(
 	(table) => [
 		index("idx_whitelist_cmds_narrator").on(table.narratorId),
 		uniqueIndex("idx_whitelist_cmds_narrator_pattern").on(table.narratorId, table.pattern),
-	],
-);
-
-// === overseers ===
-export const overseers = sqliteTable(
-	"overseers",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.unique()
-			.references(() => narrators.id),
-		scope: text("scope", { enum: ["global", "project"] }).notNull(),
-		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
-		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
-		policyJson: text("policy_json", { mode: "json" }),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_overseers_narrator").on(table.narratorId),
-		index("idx_overseers_project").on(table.projectId),
-		index("idx_overseers_scope").on(table.scope),
 	],
 );
 

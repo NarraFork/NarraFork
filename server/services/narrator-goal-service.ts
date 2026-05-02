@@ -258,15 +258,20 @@ export async function reorderGoals(
 	const ids = orderedIds.filter((id) => existingIds.has(id));
 	const remaining = goals.map((goal) => goal.id).filter((id) => !ids.includes(id));
 	const finalOrder = [...ids, ...remaining];
+	const hadActiveOrPaused = goals.some(
+		(goal) => goal.status === "active" || goal.status === "paused",
+	);
 	const now = new Date().toISOString();
 	await db.transaction(async (tx) => {
 		for (let i = 0; i < finalOrder.length; i++) {
+			const id = finalOrder[i];
 			await tx
 				.update(narratorGoals)
 				.set({ sortOrder: i + 1, updatedAt: now })
-				.where(and(eq(narratorGoals.id, finalOrder[i]), eq(narratorGoals.narratorId, narratorId)));
+				.where(and(eq(narratorGoals.id, id), eq(narratorGoals.narratorId, narratorId)));
 		}
 	});
+	if (!hadActiveOrPaused) await activateNextPendingGoal(narratorId);
 	return { ok: true, goals: await broadcastGoals(narratorId) };
 }
 

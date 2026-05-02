@@ -64,12 +64,6 @@ interface NarratorWSCallbacks {
 	onGoalContinuation?: (goal: NarratorGoal) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
-	onOverseerReviewing?: (
-		requestId: string,
-		toolUseId: string,
-		status: "reviewing" | "queued" | "cleared",
-		overseerId?: string,
-	) => void;
 	onCompacting?: () => void;
 	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
 	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
@@ -385,14 +379,6 @@ export function useNarratorWS(
 						break;
 					case "relaxed_plan_changed":
 						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
-						break;
-					case "overseer_reviewing":
-						callbacksRef.current.onOverseerReviewing?.(
-							data.requestId as string,
-							data.toolUseId as string,
-							data.status as "reviewing" | "queued" | "cleared",
-							data.overseerId as string | undefined,
-						);
 						break;
 					case "compacting":
 						callbacksRef.current.onCompacting?.();

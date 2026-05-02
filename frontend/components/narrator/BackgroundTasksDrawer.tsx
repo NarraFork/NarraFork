@@ -12,11 +12,19 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconRobot, IconTerminal2, IconX } from "@tabler/icons-react";
+import {
+	IconExternalLink,
+	IconInfoCircle,
+	IconRobot,
+	IconTerminal2,
+	IconX,
+} from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useMemo } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { ToolCallInspector } from "./ToolCallInspector";
 
 interface BackgroundTasksDrawerProps {
 	narratorId: string;
@@ -30,6 +38,8 @@ interface UnifiedTask {
 	command: string | null;
 	output: string | null;
 	exitCode: number | null;
+	toolUseId: string | null;
+	subagentNarratorId: string | null;
 }
 
 function statusColor(status: string): string {
@@ -63,7 +73,9 @@ function statusLabel(status: string, t: (key: string) => string): string {
 export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
+	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
 	const qc = useQueryClient();
+	const navigate = useNavigate();
 
 	const { data, isLoading } = useQuery({
 		queryKey: ["background-tasks", narratorId],
@@ -85,6 +97,8 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				command: task.command,
 				output: task.output,
 				exitCode: task.exitCode,
+				toolUseId: task.toolUseId,
+				subagentNarratorId: task.subagentNarratorId,
 			});
 		}
 
@@ -100,6 +114,8 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				command: null,
 				output: task.backgroundResult,
 				exitCode: null,
+				toolUseId: null,
+				subagentNarratorId: task.id,
 			});
 		}
 
@@ -107,6 +123,14 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 	}, [data]);
 
 	const runningCount = allTasks.filter((t) => t.status === "running").length;
+
+	const handleOpenSubagent = useCallback(
+		(subagentNarratorId: string) => {
+			close();
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+		},
+		[close, navigate],
+	);
 
 	const handleCancel = useCallback(
 		async (taskId: string) => {
@@ -125,7 +149,15 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 	return (
 		<>
 			<Tooltip label={t("backgroundTasks.title")}>
-				<Indicator size={8} color="blue" processing disabled={runningCount === 0} offset={3}>
+				<Indicator
+					inline
+					size={8}
+					color="blue"
+					processing
+					disabled={runningCount === 0}
+					offset={3}
+					style={{ height: "var(--ai-size-sm)", display: "flex", alignItems: "center" }}
+				>
 					<ActionIcon
 						size="sm"
 						variant={opened ? "light" : "subtle"}
@@ -159,14 +191,22 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				<Stack gap="sm">
 					{allTasks.map((task) => {
 						const isRunning = task.status === "running";
+						const canOpenSubagent = task.kind === "agent" && !!task.subagentNarratorId;
+						const canInspect = task.kind === "bash" && !!task.toolUseId;
 						const Icon = task.kind === "bash" ? IconTerminal2 : IconRobot;
 						return (
 							<Box
 								key={task.id}
 								p="xs"
+								onClick={() => {
+									if (canOpenSubagent && task.subagentNarratorId) {
+										handleOpenSubagent(task.subagentNarratorId);
+									}
+								}}
 								style={{
 									border: "1px solid var(--mantine-color-default-border)",
 									borderRadius: "var(--mantine-radius-sm)",
+									cursor: canOpenSubagent ? "pointer" : "default",
 								}}
 							>
 								<Group justify="space-between" wrap="nowrap" gap="xs">
@@ -192,6 +232,36 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 										)}
 									</Group>
 									<Group gap={4} wrap="nowrap">
+										{canInspect && (
+											<Tooltip label={t("toolCallInspector.inspect")}>
+												<ActionIcon
+													size="xs"
+													variant="subtle"
+													color="gray"
+													onClick={(event) => {
+														event.stopPropagation();
+														setInspectedToolUseId(task.toolUseId);
+													}}
+												>
+													<IconInfoCircle size={12} />
+												</ActionIcon>
+											</Tooltip>
+										)}
+										{canOpenSubagent && task.subagentNarratorId && (
+											<Tooltip label={t("backgroundTasks.openAgent")}>
+												<ActionIcon
+													size="xs"
+													variant="subtle"
+													color="indigo"
+													onClick={(event) => {
+														event.stopPropagation();
+														handleOpenSubagent(task.subagentNarratorId as string);
+													}}
+												>
+													<IconExternalLink size={12} />
+												</ActionIcon>
+											</Tooltip>
+										)}
 										<Badge size="xs" variant="light" color={statusColor(task.status)}>
 											{statusLabel(task.status, t)}
 										</Badge>
@@ -200,7 +270,10 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 												size="xs"
 												variant="subtle"
 												color="red"
-												onClick={() => handleCancel(task.id)}
+												onClick={(event) => {
+													event.stopPropagation();
+													handleCancel(task.id);
+												}}
 												title={t("backgroundTasks.cancel")}
 											>
 												<IconX size={12} />
@@ -235,6 +308,12 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 					)}
 				</Stack>
 			</Drawer>
+			<ToolCallInspector
+				narratorId={narratorId}
+				toolUseId={inspectedToolUseId}
+				opened={!!inspectedToolUseId}
+				onClose={() => setInspectedToolUseId(null)}
+			/>
 		</>
 	);
 }

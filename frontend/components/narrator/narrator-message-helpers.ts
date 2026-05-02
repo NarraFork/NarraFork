@@ -16,7 +16,6 @@ export function resolvePendingPerm(
 	tc: ToolCallData,
 	wsPerm: PendingPermission | null | undefined,
 	wsPermsMap?: Map<string, PendingPermission>,
-	overseerReviewMap?: Map<string, "reviewing" | "queued">,
 ): PendingPermission | null {
 	// Prefer WS-sourced permissions — they carry the full (untruncated) inputJson.
 	// The message-list API truncates large inputJson, so building from tc.inputJson
@@ -40,10 +39,6 @@ export function resolvePendingPerm(
 			decisionReason: tc.permissionDecisionReason ?? undefined,
 			suggestions: tc.permissionSuggestions ?? undefined,
 		};
-	}
-	// Attach overseer review status if available
-	if (perm && tc.toolUseId && overseerReviewMap?.has(tc.toolUseId)) {
-		return { ...perm, overseerStatus: overseerReviewMap.get(tc.toolUseId) };
 	}
 	return perm;
 }

@@ -439,6 +439,10 @@ export const narratorPersistence = {
 				toolName: block.name,
 				inputJson: block.input,
 				status: "initializing",
+				streamStartedAt:
+					"streamStartedAt" in block && typeof block.streamStartedAt === "number"
+						? new Date(block.streamStartedAt).toISOString()
+						: null,
 				createdAt: now,
 			});
 		}
@@ -524,6 +528,7 @@ export const narratorPersistence = {
 					id: string;
 					name: string;
 					input: Record<string, unknown>;
+					streamStartedAt?: number;
 					outputIndex?: number;
 			  }
 			| {
@@ -562,6 +567,7 @@ export const narratorPersistence = {
 					id: string;
 					name: string;
 					input: Record<string, unknown>;
+					streamStartedAt?: number;
 					outputIndex?: number;
 			  }
 			| {
@@ -619,6 +625,10 @@ export const narratorPersistence = {
 				toolName: block.name,
 				inputJson: block.input,
 				status: "initializing",
+				streamStartedAt:
+					typeof block.streamStartedAt === "number"
+						? new Date(block.streamStartedAt).toISOString()
+						: null,
 				createdAt: now,
 			});
 		}
@@ -996,6 +1006,9 @@ export const narratorPersistence = {
 			status: "success" | "fail";
 			errorMessage?: string;
 			durationMs?: number;
+			permissionStartedAt?: number;
+			executionStartedAt?: number;
+			completedAt?: number;
 			resultMessageId?: string;
 		},
 		messageId?: string,
@@ -1009,6 +1022,18 @@ export const narratorPersistence = {
 				status: result.status,
 				errorMessage: result.errorMessage ?? null,
 				durationMs: result.durationMs ?? null,
+				permissionStartedAt:
+					typeof result.permissionStartedAt === "number"
+						? new Date(result.permissionStartedAt).toISOString()
+						: undefined,
+				executionStartedAt:
+					typeof result.executionStartedAt === "number"
+						? new Date(result.executionStartedAt).toISOString()
+						: undefined,
+				completedAt:
+					typeof result.completedAt === "number"
+						? new Date(result.completedAt).toISOString()
+						: new Date().toISOString(),
 				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
 			.where(and(...conditions));

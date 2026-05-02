@@ -183,47 +183,6 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN":
 			'[可选工具 "{toolName}" 刚刚被加载到本次会话中。{toolDescription}。你现在可以在合适的时候使用这个工具。]',
 	},
-	"tool.overseerPermissionRequestText": {
-		en: "A Narrator under your jurisdiction needs a permission decision.\n\nRequest ID: {requestId}\nNarrator: {narratorTitle} (id: {narratorId})\nTool: {toolName}\nTool Use ID: {toolUseId}\nInput:\n```json\n{inputSummary}\n```\n\nPlease review this request and use ApprovePermission or DenyPermission to make your decision.",
-		"zh-CN":
-			"你管辖范围内的一个叙述者需要权限决策。\n\nRequest ID: {requestId}\n叙述者: {narratorTitle} (id: {narratorId})\n工具: {toolName}\nTool Use ID: {toolUseId}\n输入:\n```json\n{inputSummary}\n```\n\n请审查此请求，并使用 ApprovePermission 或 DenyPermission 做出决定。",
-	},
-	"tool.overseerNotAnOverseer": {
-		en: "Error: This narrator is not an overseer.",
-		"zh-CN": "错误：此叙述者不是监察者。",
-	},
-	"tool.overseerPermissionApproved": {
-		en: "Permission request {requestId} approved.{feedback}",
-		"zh-CN": "权限请求 {requestId} 已批准。{feedback}",
-	},
-	"tool.overseerPermissionDenied": {
-		en: "Permission request {requestId} denied.{reason}",
-		"zh-CN": "权限请求 {requestId} 已拒绝。{reason}",
-	},
-	"tool.overseerPermissionAlreadyResolved": {
-		en: "Permission request {requestId} was already resolved (likely by the user).",
-		"zh-CN": "权限请求 {requestId} 已被解决（可能由用户处理）。",
-	},
-	"tool.overseerDefaultDenyMessage": {
-		en: "Denied by Overseer",
-		"zh-CN": "被监察者拒绝",
-	},
-	"tool.overseerNoManagedNarrators": {
-		en: "No narrators currently under your jurisdiction.",
-		"zh-CN": "当前你的管辖范围内没有叙述者。",
-	},
-	"tool.overseerManagedNarratorsHeader": {
-		en: "Managed narrators ({count}):",
-		"zh-CN": "被管理的叙述者（{count}）：",
-	},
-	"tool.overseerNoMessages": {
-		en: "No messages found for this narrator.",
-		"zh-CN": "未找到该叙述者的消息。",
-	},
-	"tool.overseerRecentMessagesHeader": {
-		en: "Recent messages from narrator {narratorId} ({count}):",
-		"zh-CN": "叙述者 {narratorId} 的近期消息（{count}）：",
-	},
 	"tool.forkNarratorSuccess": {
 		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n{chapterInfo}\nThe new narrator is now running independently with your message.",
 		"zh-CN":
@@ -534,16 +493,6 @@ export type ToolMessageKey =
 	| "interruptionContinue"
 	| "userContinue"
 	| "toolLoaded"
-	| "overseerPermissionRequestText"
-	| "overseerNotAnOverseer"
-	| "overseerPermissionApproved"
-	| "overseerPermissionDenied"
-	| "overseerPermissionAlreadyResolved"
-	| "overseerDefaultDenyMessage"
-	| "overseerNoManagedNarrators"
-	| "overseerManagedNarratorsHeader"
-	| "overseerNoMessages"
-	| "overseerRecentMessagesHeader"
 	| "forkNarratorSuccess"
 	| "forkNarratorChapterInfo"
 	| "forkNarratorError";

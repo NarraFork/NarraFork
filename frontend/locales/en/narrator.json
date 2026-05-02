@@ -203,12 +203,6 @@
 	"segmentCompactFailedDesc": "Failed to compact selected messages. Please try again.",
 	"expandHiddenMessages": "Show original",
 	"collapseHiddenMessages": "Hide",
-	"overseer_permissionRequest": "Permission Request",
-	"overseer_narrator": "Narrator",
-	"overseer_tool": "Tool",
-	"overseer_request": "Request",
-	"overseerReviewing": "Overseer reviewing",
-	"overseerQueued": "Queued for overseer",
 	"rollbackFailed": "Rollback failed",
 	"rollbackConfirmTitle": "Confirm Rollback",
 	"rollbackConfirmDesc": "This will delete {{blockCount}} block(s) and {{messageCount}} subsequent message(s).",
@@ -484,6 +478,32 @@
 		"statusCancelled": "cancelled",
 		"statusFailed": "failed",
 		"agentTask": "Agent",
-		"bashTask": "Command"
+		"bashTask": "Command",
+		"openAgent": "Open agent"
+	},
+	"toolCallInspector": {
+		"title": "Tool Call Inspector",
+		"inspect": "Inspect tool call",
+		"unknownTool": "Unknown tool",
+		"input": "Input",
+		"output": "Output",
+		"error": "Error",
+		"empty": "No content",
+		"copy": "Copy",
+		"copied": "Copied",
+		"copyInput": "Copy input",
+		"copyOutput": "Copy output",
+		"loadFailed": "Failed to load tool call details",
+		"duration": "Duration {{ms}}ms",
+		"timing": {
+			"title": "Timing",
+			"streamStarted": "Tool streaming started",
+			"permissionStarted": "Permission wait started",
+			"executionStarted": "Execution started",
+			"completed": "Execution completed",
+			"total": "Total {{duration}}",
+			"permissionWait": "Permission wait {{duration}}",
+			"execution": "Execution {{duration}}"
+		}
 	}
 }

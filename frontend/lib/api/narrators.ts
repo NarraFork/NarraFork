@@ -142,6 +142,7 @@ export const narratorsApi = {
 				status: string;
 				command: string | null;
 				exitCode: number | null;
+				toolUseId: string | null;
 				subagentNarratorId: string | null;
 				subagentType: string | null;
 				alias: string | null;

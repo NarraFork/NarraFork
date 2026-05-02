@@ -41,5 +41,6 @@ Usage notes:
 - When the agent is run in foreground, it will return a single message back to you with its findings/results
 - When the agent is run in background, use `Await({ type: "agent", id })` to get results and `Send({ id, message })` to send follow-up instructions
 - Each agent invocation starts with a fresh context. Provide a highly detailed task description so the agent can work autonomously
+- Use `reasoning_effort` to request subagent thinking intensity (`none`, `low`, `medium`, `high`, `xhigh`); models/providers without a configurable thinking option will ignore it
 - The agent's outputs should generally be trusted
 - Clearly tell the agent whether you expect it to write code or just to do research

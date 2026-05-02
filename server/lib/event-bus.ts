@@ -181,31 +181,6 @@ export type NarraForkEvent =
 	| { type: "mcp:server_connected"; serverId: string; name: string; toolCount: number }
 	| { type: "mcp:server_disconnected"; serverId: string; name: string; reason?: string }
 	| { type: "mcp:server_error"; serverId: string; name: string; error: string }
-	// Overseer lifecycle
-	| {
-			type: "overseer:event_routed";
-			overseerId: string;
-			narratorId: string;
-			eventType: string;
-	  }
-	| {
-			type: "overseer:decision_made";
-			overseerId: string;
-			narratorId: string;
-			requestId: string;
-			decision: "allow" | "deny";
-	  }
-	| { type: "overseer:created"; overseerId: string; scope: string; projectId?: string }
-	| { type: "overseer:deleted"; overseerId: string }
-	| { type: "overseer:enabled"; overseerId: string }
-	| { type: "overseer:disabled"; overseerId: string }
-	| {
-			type: "overseer:replaced";
-			oldOverseerId: string;
-			newOverseerId: string;
-			scope: string;
-			projectId?: string | null;
-	  }
 	// Volume snapshots
 	| { type: "volume-snapshot:creating"; projectId: string; chapterId: string }
 	| { type: "volume-snapshot:created"; projectId: string; snapshotId: string }

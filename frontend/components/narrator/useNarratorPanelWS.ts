@@ -428,11 +428,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		return pendingPermsMap.values().next().value ?? null;
 	}, [pendingPermsMap]);
 
-	// Overseer review status for pending permissions — keyed by toolUseId
-	const [overseerReviewMap, setOverseerReviewMap] = useState<Map<string, "reviewing" | "queued">>(
-		() => new Map(),
-	);
-
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
@@ -851,7 +846,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onQuestionDeny: handleQuestionDeny,
 		onBgAgentRetry: handleBgAgentRetry,
 		bgRetryDismissedIds,
-		overseerReviewMap,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -862,7 +856,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onBgAgentRetry: (...args) => permCbRef.current?.onBgAgentRetry?.(...args),
 			bgRetryDismissedIds: new Set(),
-			overseerReviewMap: new Map(),
 		}),
 		[],
 	);
@@ -872,9 +865,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pendingPermission,
 			pendingPermsMap,
 			bgRetryDismissedIds,
-			overseerReviewMap,
 		}),
-		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds, overseerReviewMap],
+		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds],
 	);
 
 	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
@@ -1565,13 +1557,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						next.delete(toolUseId);
 						return next;
 					});
-					// Clear overseer review status for this permission
-					setOverseerReviewMap((prev) => {
-						if (!prev.has(toolUseId)) return prev;
-						const next = new Map(prev);
-						next.delete(toolUseId);
-						return next;
-					});
 					scheduleCacheUpdate((old) => {
 						if (!old?.pages?.length) return old;
 						if (decision === "deny") {
@@ -1600,24 +1585,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// Invalidate subagent narrator query so SubagentCard picks up "working" status
 					if (subagentNarratorId) {
 						qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
-					}
-				}
-			},
-			onOverseerReviewing: (_requestId, toolUseId, status) => {
-				if (toolUseId) {
-					if (status === "cleared") {
-						setOverseerReviewMap((prev) => {
-							if (!prev.has(toolUseId)) return prev;
-							const next = new Map(prev);
-							next.delete(toolUseId);
-							return next;
-						});
-					} else {
-						setOverseerReviewMap((prev) => {
-							const next = new Map(prev);
-							next.set(toolUseId, status);
-							return next;
-						});
 					}
 				}
 			},

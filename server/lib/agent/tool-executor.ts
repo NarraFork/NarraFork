@@ -17,6 +17,9 @@ export interface ToolExecResult {
 	output: string;
 	isError?: boolean;
 	durationMs: number;
+	permissionStartedAt?: number;
+	executionStartedAt?: number;
+	completedAt?: number;
 	fatal?: boolean;
 	/** Set when the tool call was rejected because the model's output was
 	 *  cut off mid-stream (malformed JSON, suspiciously large content, etc.).
@@ -91,6 +94,7 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 	}
 
 	// Permission check
+	const permissionStartedAt = Date.now();
 	const permission = await config.permissionHandler(tu.name, tu.input, tu.toolUseId);
 	if (permission.behavior === "deny") {
 		const userMessage =
@@ -105,6 +109,8 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 			output: userMessage,
 			isError: true,
 			durationMs: 0,
+			permissionStartedAt,
+			completedAt: Date.now(),
 			fatal: permission.fatal,
 		};
 	}
@@ -136,6 +142,7 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 
 	// Start timing after permission is granted
 	const start = Date.now();
+	const executionStartedAt = start;
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
 	const permissionNotice = permission.behavior === "allow" ? permission.notice : undefined;
@@ -157,6 +164,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 				"then Edit to fill each marker with real content.",
 			isError: true,
 			durationMs: Date.now() - start,
+			permissionStartedAt,
+			executionStartedAt,
+			completedAt: Date.now(),
 			broken: true,
 		};
 	}
@@ -174,6 +184,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 				"then Edit to fill each marker with real content.",
 			isError: true,
 			durationMs: Date.now() - start,
+			permissionStartedAt,
+			executionStartedAt,
+			completedAt: Date.now(),
 			broken: true,
 		};
 	}
@@ -185,6 +198,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 			output: `Invalid parameters: ${parsed.error.message}`,
 			isError: true,
 			durationMs: Date.now() - start,
+			permissionStartedAt,
+			executionStartedAt,
+			completedAt: Date.now(),
 		};
 	}
 
@@ -284,6 +300,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
+				permissionStartedAt,
+				executionStartedAt,
+				completedAt: Date.now(),
 				metadata: result.metadata,
 				images: result.images,
 				updatedInput: redirectedInput,
@@ -295,6 +314,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 			isError: result.isError,
 			fatal: result.fatal,
 			durationMs: Date.now() - start,
+			permissionStartedAt,
+			executionStartedAt,
+			completedAt: Date.now(),
 			metadata: result.metadata,
 			images: result.images,
 			updatedInput: redirectedInput,
@@ -304,6 +326,9 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 			output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
 			isError: true,
 			durationMs: Date.now() - start,
+			permissionStartedAt,
+			executionStartedAt,
+			completedAt: Date.now(),
 			updatedInput: redirectedInput,
 		};
 	} finally {

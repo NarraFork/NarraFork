@@ -723,6 +723,7 @@ export async function processEvent(
 					id: block.toolUseId,
 					name: block.name,
 					input: block.input,
+					streamStartedAt: block.streamStartedAt,
 					outputIndex: block.outputIndex,
 				});
 			} else if (block.type === "web_search") {
@@ -964,6 +965,9 @@ export async function processEvent(
 					status,
 					errorMessage: event.isError ? event.output : undefined,
 					durationMs: event.durationMs,
+					permissionStartedAt: event.permissionStartedAt,
+					executionStartedAt: event.executionStartedAt,
+					completedAt: event.completedAt,
 				});
 				// Broken tool call: overwrite the persisted inputJson with a sanitized
 				// version (large content fields replaced with a short placeholder).

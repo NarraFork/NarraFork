@@ -133,6 +133,7 @@ import {
 	runSegmentCompact,
 	sendMessage,
 	setTemporaryModelRestore,
+	startGoalContinuationIfPossible,
 	toBufferSummary,
 	updateBufferedMessage,
 	updateNarratorModel,
@@ -440,6 +441,18 @@ function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {
 	throw new ValidationError("Invalid goal status");
 }
 
+async function persistGoalUserMessage(narratorId: string, text: string, userId: string) {
+	const userMsg = await narratorService.persistUserMessage(
+		narratorId,
+		text,
+		[{ type: "text", text }],
+		null,
+		userId,
+	);
+	broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+	return userMsg;
+}
+
 async function handleGoalCommand(narratorId: string, cmd: GoalCommandResult, userId: string) {
 	switch (cmd.action) {
 		case "list":
@@ -508,7 +521,12 @@ narratorRoutes.post("/:id/goals", async (c) => {
 	const body = (await c.req.json()) as { objective?: string };
 	if (!body.objective) throw new ValidationError("objective is required");
 	const userId = c.get("user").sub;
-	return c.json(await narratorGoalService.createGoal(id, body.objective, userId), 201);
+	const result = await narratorGoalService.createGoal(id, body.objective, userId);
+	await persistGoalUserMessage(id, body.objective, userId);
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
+	return c.json(result, 201);
 });
 
 narratorRoutes.patch("/:id/goals/:goalId", async (c) => {
@@ -517,9 +535,17 @@ narratorRoutes.patch("/:id/goals/:goalId", async (c) => {
 	await narratorService.getById(id);
 	const body = (await c.req.json()) as { objective?: string; status?: string };
 	const status = parseGoalStatus(body.status);
-	return c.json(
-		await narratorGoalService.updateGoal(id, goalId, { objective: body.objective, status }),
-	);
+	const result = await narratorGoalService.updateGoal(id, goalId, {
+		objective: body.objective,
+		status,
+	});
+	if (status === "active") {
+		const userId = c.get("user").sub;
+		const locale = await getUserLanguage(userId);
+		const replyInUserLanguage = await getUserReplyInLanguage(userId);
+		await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
+	}
+	return c.json(result);
 });
 
 narratorRoutes.delete("/:id/goals/:goalId", async (c) => {
@@ -534,7 +560,12 @@ narratorRoutes.put("/:id/goals/reorder", async (c) => {
 	await narratorService.getById(id);
 	const body = (await c.req.json()) as { orderedIds?: string[] };
 	if (!Array.isArray(body.orderedIds)) throw new ValidationError("orderedIds is required");
-	return c.json(await narratorGoalService.reorderGoals(id, body.orderedIds));
+	const result = await narratorGoalService.reorderGoals(id, body.orderedIds);
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const replyInUserLanguage = await getUserReplyInLanguage(userId);
+	await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
+	return c.json(result);
 });
 
 narratorRoutes.delete("/:id/goals", async (c) => {
@@ -590,7 +621,15 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		return c.json(bashResult, 201);
 	}
 	if (cmdResult.resolved && "goalCommand" in cmdResult) {
-		return c.json(await handleGoalCommand(id, cmdResult as GoalCommandResult, userId), 200);
+		const goalCommand = cmdResult as GoalCommandResult;
+		const result = await handleGoalCommand(id, goalCommand, userId);
+		await persistGoalUserMessage(id, goalCommand.rawCommand, userId);
+		if (["add", "resume", "complete"].includes(goalCommand.action)) {
+			const locale = await getUserLanguage(userId);
+			const replyInUserLanguage = await getUserReplyInLanguage(userId);
+			await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
+		}
+		return c.json(result, 200);
 	}
 	let prePromptBashCommand: string | undefined;
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {

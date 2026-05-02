@@ -11,12 +11,12 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
-	overseers,
 	projects,
 } from "../db/schema";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
-import { OPTIONAL_TOOLS, OVERSEER_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
+import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
+import { AsyncMutex } from "../lib/async-mutex";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -87,7 +87,6 @@ import type {
 	BufferCreator,
 	BufferedMessage,
 	NarratorEvent,
-	OverseerQueuedMessage,
 	SavedBufferedFile,
 } from "./narrator-session-state";
 import {
@@ -96,7 +95,6 @@ import {
 	compactLocks,
 	narratorCreationLocks,
 	pendingFeedback,
-	pendingOverseerMessages,
 	pendingPermissions,
 	pendingPlanApprover,
 	pendingPlanCompact,
@@ -126,6 +124,8 @@ import { handlePermission } from "./narrator-permission";
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
+const MAX_GOAL_CONTINUATION_NO_TOOL_TURNS = 3;
+const goalContinuationStartLock = new AsyncMutex();
 
 /** Parse `git status --porcelain` output into a set of file paths. */
 function parsePorcelainFiles(output: string): Set<string> {
@@ -323,21 +323,9 @@ async function createNarrator(
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
 		_enabledOptionalTools: new Set(),
-		_isOverseer: false,
 		_interruptCleanupDone: false,
 		_substatus: new Set(),
 	};
-
-	// Check if this narrator is bound to an overseer
-	{
-		const overseerRecord = await db.query.overseers.findFirst({
-			where: eq(overseers.narratorId, narratorId),
-			columns: { id: true },
-		});
-		if (overseerRecord) {
-			active._isOverseer = true;
-		}
-	}
 
 	// Auto-load optional tools whose routines are globally enabled
 	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
@@ -1224,10 +1212,6 @@ export async function runAgentLoop(
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return active._enabledOptionalTools.has(tool.name);
 					}
-					// Overseer tools: only available if this narrator is an overseer
-					if (OVERSEER_TOOLS.has(tool.name)) {
-						return active._isOverseer;
-					}
 					// Review tools: only available for review chapter narrators
 					if (REVIEW_TOOLS.has(tool.name)) {
 						return active._chapterRole === "review";
@@ -1374,9 +1358,17 @@ export async function runAgentLoop(
 				logger.warn("Failed to account goal usage", { narratorId, error: String(err) });
 			});
 			if (active._goalContinuationTurn) {
-				active._goalContinuationSuppressed = !result.hadToolUses;
+				if (result.hadToolUses) {
+					active._goalContinuationNoToolCount = 0;
+					active._goalContinuationSuppressed = false;
+				} else {
+					active._goalContinuationNoToolCount = (active._goalContinuationNoToolCount ?? 0) + 1;
+					active._goalContinuationSuppressed =
+						active._goalContinuationNoToolCount >= MAX_GOAL_CONTINUATION_NO_TOOL_TURNS;
+				}
 				active._goalContinuationTurn = false;
 			} else {
+				active._goalContinuationNoToolCount = 0;
 				active._goalContinuationSuppressed = false;
 			}
 
@@ -1842,51 +1834,6 @@ export async function runAgentLoop(
 				}
 			}
 
-			// Check for queued overseer permission requests before transitioning to done.
-			// This only applies to overseer narrators — regular narrators have no entries.
-			if (!loopHadError) {
-				const overseerQueue = pendingOverseerMessages.get(narratorId);
-				let nextValid: OverseerQueuedMessage | undefined;
-				while (overseerQueue && overseerQueue.length > 0) {
-					const candidate = overseerQueue.shift();
-					if (!candidate) break;
-					if (overseerQueue.length === 0) pendingOverseerMessages.delete(narratorId);
-					if (pendingPermissions.has(candidate.requestId)) {
-						nextValid = candidate;
-						break;
-					}
-					// Permission was already resolved — skip to next
-					logger.debug("Overseer queue: skipping already-resolved request", {
-						narratorId,
-						requestId: candidate.requestId,
-					});
-				}
-				if (nextValid) {
-					const userMsg = await narratorService.persistUserMessage(
-						narratorId,
-						nextValid.textForModel,
-						nextValid.contentBlocks,
-					);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: userMsg,
-					});
-					// Notify the source narrator that the overseer is now actively reviewing
-					broadcastToNarrator(nextValid.broadcastTargetId, {
-						type: "overseer_reviewing",
-						narratorId: nextValid.broadcastTargetId,
-						requestId: nextValid.requestId,
-						toolUseId: nextValid.toolUseId,
-						status: "reviewing",
-					});
-					await narratorService.updateStatus(narratorId, "working");
-					currentText = nextValid.textForModel;
-					currentImages = undefined;
-					continue;
-				}
-			}
-
 			const goalContinuationPrompt = await maybeStartGoalContinuation(
 				active,
 				freshNarrator,
@@ -2088,27 +2035,6 @@ export async function runAgentLoop(
 			dbClearAllBuffered(narratorId);
 		}
 
-		// Drain any remaining overseer queue items — notify source narrators
-		// that the overseer is no longer reviewing so the UI clears the
-		// "queued for overseer" badge.
-		const remainingOverseerQueue = pendingOverseerMessages.get(narratorId);
-		if (remainingOverseerQueue && remainingOverseerQueue.length > 0) {
-			for (const queued of remainingOverseerQueue) {
-				broadcastToNarrator(queued.broadcastTargetId, {
-					type: "overseer_reviewing",
-					narratorId: queued.broadcastTargetId,
-					requestId: queued.requestId,
-					toolUseId: queued.toolUseId,
-					status: "cleared",
-				});
-			}
-			logger.debug("Overseer loop ended with queued items, cleared UI state", {
-				narratorId,
-				droppedCount: remainingOverseerQueue.length,
-			});
-		}
-		pendingOverseerMessages.delete(narratorId);
-
 		// 6. Per-narrator git status Promise cache (Bash before-status snapshots)
 		active._bashBeforeStatus?.clear();
 
@@ -2208,6 +2134,8 @@ async function feedMessage(
 	rawTextFiles?: File[],
 ): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	active._goalContinuationSuppressed = false;
+	active._goalContinuationNoToolCount = 0;
 
 	// Save text files to worktree (now that we have active.cwd)
 	const savedTextFiles: TextFileRef[] = [];
@@ -2438,6 +2366,48 @@ export async function sendMessage(
 		message: userMsg,
 	});
 	return userMsg;
+}
+
+export async function startGoalContinuationIfPossible(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ started: boolean }> {
+	return goalContinuationStartLock.acquire(narratorId, async () => {
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.status === "working" || narrator.status === "waiting") return { started: false };
+		if (narrator.permissionMode === "plan") return { started: false };
+		const goals = await narratorGoalService.listGoals(narratorId);
+		if (!goals.some((goal) => goal.status === "active")) return { started: false };
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { started: false };
+		active._goalContinuationSuppressed = false;
+		active._goalContinuationNoToolCount = 0;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = new Date().toISOString();
+
+		const prompt = await maybeStartGoalContinuation(active, narrator, false);
+		if (!prompt) return { started: false };
+		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+		runAgentLoop(active, "").catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (goal continuation)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { started: true };
+	});
 }
 
 /**
@@ -3480,6 +3450,8 @@ export type {
 	WhitelistDir,
 } from "./narrator-permission";
 export {
+	classifyYoloDanger,
+	createYoloDangerFingerprint,
 	extractToolPaths,
 	handlePermission,
 	isInsideWorktree,

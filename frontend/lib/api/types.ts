@@ -130,6 +130,10 @@ export interface BaseContentBlock {
 	outputJson?: unknown;
 	status?: string;
 	durationMs?: number;
+	streamStartedAt?: string | null;
+	permissionStartedAt?: string | null;
+	executionStartedAt?: string | null;
+	completedAt?: string | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
@@ -162,6 +166,10 @@ export interface ToolCallRecord {
 	outputJson?: unknown;
 	status?: string;
 	durationMs?: number;
+	streamStartedAt?: string | null;
+	permissionStartedAt?: string | null;
+	executionStartedAt?: string | null;
+	completedAt?: string | null;
 	errorMessage?: string;
 	permissionDecidedBy?: string | null;
 	permissionDecidedAt?: string | null;

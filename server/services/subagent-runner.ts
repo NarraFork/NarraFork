@@ -592,6 +592,7 @@ export interface RunSubagentInput {
 	signal: AbortSignal;
 	locale: string;
 	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 	background?: boolean;
 	alias?: string;
 }
@@ -614,6 +615,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		signal,
 		locale,
 		model: explicitModel,
+		reasoningEffort,
 		background,
 		alias,
 	} = input;
@@ -683,6 +685,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		cwd,
 		systemPrompt,
 		model: resolvedModelInput,
+		reasoningEffort,
 	});
 
 	const subagentId = subagent.id;

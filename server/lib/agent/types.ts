@@ -127,6 +127,9 @@ export type AgentEvent =
 			output: string;
 			isError: boolean;
 			durationMs?: number;
+			permissionStartedAt?: number;
+			executionStartedAt?: number;
+			completedAt?: number;
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;

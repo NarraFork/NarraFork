@@ -95,7 +95,6 @@ const TOOL_CALL_BYTES_EXPR = [
 	"length(CAST(coalesce(tc.permission_deny_message, '') AS BLOB))",
 	"length(CAST(coalesce(tc.permission_decision_reason, '') AS BLOB))",
 	"length(CAST(coalesce(tc.permission_suggestions, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_overseer_narrator_id, '') AS BLOB))",
 	"length(CAST(coalesce(tc.created_at, '') AS BLOB))",
 ].join(" + ");
 

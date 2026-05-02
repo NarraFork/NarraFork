@@ -5,7 +5,6 @@ import {
 	containerInstances,
 	narrators,
 	narratorToolCalls,
-	overseers,
 	terminals,
 	userPreferences,
 } from "../db/schema";
@@ -423,38 +422,6 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	// === Narrator WS broadcast (peripheral services emit this to decouple) ===
 	eventBus.on("narrator:ws_broadcast", (event) => {
 		broadcastToNarrator(event.narratorId, event.message);
-	});
-
-	// === Overseer replaced ===
-	// When an overseer's narrator is archived and a replacement is created,
-	// broadcast to all clients so they can refresh their overseer state.
-
-	eventBus.on("overseer:replaced", (event) => {
-		broadcastToAll({
-			type: "overseer:replaced",
-			oldOverseerId: event.oldOverseerId,
-			newOverseerId: event.newOverseerId,
-			scope: event.scope,
-			projectId: event.projectId,
-		});
-	});
-
-	// === Overseer narrator status sync ===
-	// When an overseer's narrator status changes (thinking/waiting/idle/etc.),
-	// broadcast to ALL clients so the nav item updates in real-time without
-	// requiring the nav to have an active subscription to the overseer narrator.
-
-	eventBus.on("narrator:status_changed", async (event) => {
-		const overseer = await db.query.overseers.findFirst({
-			where: eq(overseers.narratorId, event.narratorId),
-		});
-		if (!overseer) return;
-		broadcastToAll({
-			type: "overseer:status_changed",
-			overseerId: overseer.id,
-			narratorId: event.narratorId,
-			status: event.status,
-		});
 	});
 
 	// === Recent tabs title sync ===

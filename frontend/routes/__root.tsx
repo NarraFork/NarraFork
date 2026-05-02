@@ -50,7 +50,6 @@ import {
 	CreateNarratorModal,
 	type CreateNarratorResult,
 } from "../components/narrator/CreateNarratorModal";
-import { OverseerNavItem } from "../components/nav/OverseerNavItem";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
 import { SetupWizard } from "../components/settings/SetupWizard";
 import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
@@ -60,7 +59,6 @@ import { WSConnectionAlert } from "../components/WSConnectionAlert";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useLocalPref } from "../hooks/useLocalPref";
 import { useOutputStats } from "../hooks/useOutputStats";
-import { useGlobalOverseer } from "../hooks/useOverseers";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
 import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
@@ -185,9 +183,6 @@ function AuthenticatedLayout() {
 		toggleCollapsed: toggleNavCollapsed,
 	} = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
-	const { data: globalOverseer } = useGlobalOverseer();
-	const isOverseerPage =
-		!!globalOverseer?.narratorId && pathname === `/narrators/${globalOverseer.narratorId}`;
 
 	// --- Global narrator WebSocket connection ---
 	useEffect(() => {
@@ -356,10 +351,7 @@ function AuthenticatedLayout() {
 	const projectTabs = tabs.filter((t) => t.type === "project");
 	const narratorTabs = tabs.filter((t) => t.type !== "project");
 	const firstProjectTabActive = projectTabs.length > 0 && isTabActive(projectTabs[0], pathname);
-	const firstNarratorTabActive =
-		narratorTabs.length > 0 &&
-		isTabActive(narratorTabs[0], pathname) &&
-		narratorTabs[0].id !== globalOverseer?.narratorId;
+	const firstNarratorTabActive = narratorTabs.length > 0 && isTabActive(narratorTabs[0], pathname);
 
 	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
 		if (e.key === "Enter") handleSearch();
@@ -512,7 +504,6 @@ function AuthenticatedLayout() {
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>
-					<OverseerNavItem onNavigate={closeNavForLink} collapsed={navCollapsed} />
 					<Tooltip label={t("projects")} position="right" disabled={!navCollapsed}>
 						<NavLink
 							component={Link}
@@ -561,7 +552,7 @@ function AuthenticatedLayout() {
 					<Tooltip label={t("narrators")} position="right" disabled={!navCollapsed}>
 						<NavLink
 							label={navCollapsed ? undefined : t("narrators")}
-							active={!isOverseerPage && pathname.startsWith("/narrators")}
+							active={pathname.startsWith("/narrators")}
 							leftSection={<IconMessageChatbot size={16} />}
 							onClick={() => {
 								navigate({ to: "/narrators" });
@@ -626,12 +617,7 @@ function AuthenticatedLayout() {
 				</Box>
 				{!navCollapsed && (
 					<Box style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-						<RecentTabList
-							filter="narrator"
-							onNavigate={closeNavForLink}
-							firstTabConnected
-							excludeActiveNarratorId={globalOverseer?.narratorId}
-						/>
+						<RecentTabList filter="narrator" onNavigate={closeNavForLink} firstTabConnected />
 					</Box>
 				)}
 				<Box>

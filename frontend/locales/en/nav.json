@@ -30,8 +30,5 @@
 	"revealInExplorer": "Reveal in File Manager",
 	"totalOutputChars": "Total AI output chars",
 	"feedback": "Feedback",
-	"licenses": "Licenses",
-	"overseer": "Overseer",
-	"enableOverseer": "Enable",
-	"disableOverseer": "Disable"
+	"licenses": "Licenses"
 }

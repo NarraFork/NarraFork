@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -30,11 +31,11 @@ import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
 	pendingFeedback,
-	pendingOverseerMessages,
 	pendingPermissions,
 	pendingPlanApprover,
 	pendingPlanCompact,
 	pendingPlanDiff,
+	pendingYoloDangerConfirmations,
 	planModeAskedOnce,
 } from "./narrator-session-state";
 import { resolveTaskAlias } from "./subagent-alias";
@@ -535,7 +536,15 @@ function resolveBlacklistDecision(
 	return reason ? { decision: "deny", reason } : null;
 }
 
-const ALWAYS_ALLOW_TOOLS = ["TaskCreate", "EnterPlanMode", "WebSearch", "Await", "Skill"];
+const ALWAYS_ALLOW_TOOLS = [
+	"TaskCreate",
+	"EnterPlanMode",
+	"WebSearch",
+	"Await",
+	"Skill",
+	"GetGoals",
+	"UpdateGoal",
+];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -833,6 +842,485 @@ function resolveProtectedPathDeny(
 	return null;
 }
 
+const YOLO_DANGER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
+
+export interface YoloDangerInfo {
+	summary: string;
+	consequences: string[];
+	saferAlternatives: string[];
+	details?: string[];
+}
+
+function stableJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>)
+		.filter(([, v]) => v !== undefined)
+		.sort(([a], [b]) => a.localeCompare(b));
+	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
+}
+
+function getYoloFingerprintScope(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd?: string,
+	bashAnalysis?: BashAnalysis,
+): { cwd?: string; resolvedPaths?: string[] } {
+	if (!cwd) return {};
+	const normalizedCwd = resolvePath(cwd);
+	let paths: string[] = [];
+	if (toolName === SHELL_TOOL_NAME) {
+		paths = getShellScopePaths(normalizedCwd, input, bashAnalysis);
+	} else if (toolName === "Agent") {
+		const workdir = typeof input.workdir === "string" ? input.workdir : "";
+		paths = workdir ? [workdir] : [];
+	} else {
+		paths = extractToolPaths(toolName, input);
+	}
+	const resolvedPaths = [...new Set(paths.map((p) => resolvePath(normalizedCwd, p)))].sort();
+	return { cwd: normalizedCwd, resolvedPaths };
+}
+
+export function createYoloDangerFingerprint(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd?: string,
+	bashAnalysis?: BashAnalysis,
+): string {
+	return createHash("sha256")
+		.update(
+			stableJson({
+				input,
+				scope: getYoloFingerprintScope(toolName, input, cwd, bashAnalysis),
+				toolName,
+			}),
+		)
+		.digest("hex");
+}
+
+function pruneExpiredYoloConfirmations(now = Date.now()): void {
+	for (const [key, entry] of pendingYoloDangerConfirmations) {
+		if (entry.expiresAt < now) pendingYoloDangerConfirmations.delete(key);
+	}
+}
+
+function yoloConfirmationKey(narratorId: string, fingerprint: string): string {
+	return `${narratorId}:${fingerprint}`;
+}
+
+function consumeYoloConfirmation(narratorId: string, fingerprint: string): boolean {
+	pruneExpiredYoloConfirmations();
+	const key = yoloConfirmationKey(narratorId, fingerprint);
+	const entry = pendingYoloDangerConfirmations.get(key);
+	if (!entry) return false;
+	pendingYoloDangerConfirmations.delete(key);
+	return true;
+}
+
+function rememberYoloConfirmation(
+	narratorId: string,
+	fingerprint: string,
+	danger: YoloDangerInfo,
+): void {
+	const now = Date.now();
+	pruneExpiredYoloConfirmations(now);
+	pendingYoloDangerConfirmations.set(yoloConfirmationKey(narratorId, fingerprint), {
+		narratorId,
+		fingerprint,
+		expiresAt: now + YOLO_DANGER_CONFIRMATION_TTL_MS,
+		summary: danger.summary,
+	});
+}
+
+function getEffectivePermissionMode(
+	permMode: string,
+	relaxedPlan: boolean,
+	previousPermissionMode?: string | null,
+): string {
+	return permMode === "plan"
+		? relaxedPlan
+			? (previousPermissionMode ?? "default")
+			: "readOnly"
+		: permMode;
+}
+
+function danger(
+	summary: string,
+	consequences: string[],
+	saferAlternatives: string[],
+	details?: string[],
+): YoloDangerInfo {
+	return { summary, consequences, saferAlternatives, details };
+}
+
+function getGitSubcommand(tokens: string[]): { sub?: string; args: string[] } {
+	let idx = 1;
+	while (idx < tokens.length) {
+		const token = tokens[idx];
+		if ((token === "-C" || token === "-c") && idx + 1 < tokens.length) {
+			idx += 2;
+			continue;
+		}
+		if (
+			(token === "--git-dir" || token === "--work-tree" || token === "--namespace") &&
+			idx + 1 < tokens.length
+		) {
+			idx += 2;
+			continue;
+		}
+		if (token.startsWith("--git-dir=") || token.startsWith("--work-tree=")) {
+			idx++;
+			continue;
+		}
+		if (token.startsWith("-")) {
+			idx++;
+			continue;
+		}
+		return { sub: token, args: tokens.slice(idx + 1) };
+	}
+	return { args: [] };
+}
+
+function describeExternalPaths(cwd: string, paths: string[]): string[] {
+	const seen = new Set<string>();
+	return paths
+		.map((p) => resolvePath(cwd, p))
+		.filter((p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p))
+		.filter((p) => {
+			if (seen.has(p)) return false;
+			seen.add(p);
+			return true;
+		});
+}
+
+function isLikelyCheckoutPathspec(arg: string): boolean {
+	if (!arg || arg.startsWith("-")) return false;
+	return (
+		arg === "." ||
+		arg === ".." ||
+		arg.startsWith("./") ||
+		arg.startsWith("../") ||
+		arg.includes("/") ||
+		arg.includes("\\") ||
+		/\.[^/\\]+$/.test(arg)
+	);
+}
+
+function checkoutRestoresPath(args: string[]): boolean {
+	if (args.includes("--")) return true;
+	if (args.includes(".")) return true;
+	if (args.some((arg) => arg === "-b" || arg === "-B" || arg === "--orphan")) return false;
+	if (args.some((arg) => arg.startsWith("--pathspec-from-file"))) return true;
+	const positional = args.filter((arg) => !arg.startsWith("-"));
+	return positional.some(isLikelyCheckoutPathspec);
+}
+
+function classifyGitDanger(cmdText: string, tokens: string[]): YoloDangerInfo | null {
+	const { sub, args } = getGitSubcommand(tokens);
+	if (!sub) return null;
+	const detail = [`Command: ${cmdText}`];
+	const hasAny = (flags: string[]) => args.some((arg) => flags.includes(arg));
+	const hasFlagPrefix = (prefixes: string[]) =>
+		args.some((arg) => prefixes.some((p) => arg.startsWith(p)));
+
+	if (sub === "reset" && (hasAny(["--hard", "--merge", "--keep"]) || args.length > 0)) {
+		return danger(
+			"Git reset may rewrite the current worktree/index state.",
+			[
+				"Uncommitted work can be discarded or unstaged.",
+				"HEAD/index changes can be hard to reconstruct without reflog or backups.",
+			],
+			["Run git status and git diff first.", "Create a backup branch or stash before resetting."],
+			detail,
+		);
+	}
+	if (sub === "clean") {
+		return danger(
+			"Git clean removes untracked files from the worktree.",
+			[
+				"Untracked files are often not recoverable from git.",
+				"Generated artifacts, local notes, or new source files may be deleted.",
+			],
+			["Run git clean -nd first to preview.", "Delete only specific paths if possible."],
+			detail,
+		);
+	}
+	if (sub === "checkout" && checkoutRestoresPath(args)) {
+		return danger(
+			"Git checkout is being used to restore paths and may discard local changes.",
+			["Modified files can be reverted without preserving the previous content."],
+			["Inspect git diff first.", "Restore only the specific files that must be reverted."],
+			detail,
+		);
+	}
+	if (sub === "restore") {
+		return danger(
+			"Git restore may discard local file changes.",
+			["Affected files can be reverted without preserving the previous content."],
+			["Inspect git diff first.", "Restore only specific files rather than the whole tree."],
+			detail,
+		);
+	}
+	if (
+		sub === "push" &&
+		(hasAny(["--force", "-f", "--force-with-lease", "--delete", "-d"]) ||
+			hasFlagPrefix(["--force-with-lease="]))
+	) {
+		return danger(
+			"Git push may rewrite or delete remote history.",
+			[
+				"Remote commits or branches can be overwritten or removed for collaborators.",
+				"Recovery may require remote reflogs or manual intervention.",
+			],
+			[
+				"Prefer a normal push.",
+				"If force is necessary, verify the remote branch and use --force-with-lease.",
+			],
+			detail,
+		);
+	}
+	if (sub === "branch" && hasAny(["-d", "-D", "--delete"])) {
+		return danger(
+			"Git branch deletion removes a local branch reference.",
+			["Commits reachable only from that branch can become difficult to find."],
+			["Check git branch --merged and note the commit hash before deleting."],
+			detail,
+		);
+	}
+	if (sub === "worktree" && args.includes("remove")) {
+		return danger(
+			"Git worktree remove deletes a worktree checkout.",
+			["Uncommitted files in that worktree may be lost."],
+			[
+				"Run git -C <worktree> status first.",
+				"Commit, stash, or copy important files before removal.",
+			],
+			detail,
+		);
+	}
+	if (sub === "filter-branch" || sub === "filter-repo" || sub === "rebase") {
+		return danger(
+			`Git ${sub} rewrites commit history.`,
+			["Commit hashes change and collaborators may need manual recovery steps."],
+			[
+				"Create a backup branch first.",
+				"Prefer a new commit if history rewriting is not required.",
+			],
+			detail,
+		);
+	}
+	if (sub === "rm") {
+		return danger(
+			"Git rm deletes tracked files from the worktree and index.",
+			["Files will be removed and staged for deletion."],
+			["Use git status first.", "Remove only specific intended files."],
+			detail,
+		);
+	}
+	if (sub === "reflog" && args.includes("expire")) {
+		return danger(
+			"Git reflog expire can destroy recovery points.",
+			["Future recovery from accidental resets or rebases may become impossible."],
+			["Avoid expiring reflogs during agent work unless explicitly required."],
+			detail,
+		);
+	}
+	if (sub === "gc" && hasFlagPrefix(["--prune"])) {
+		return danger(
+			"Git gc --prune can permanently remove unreachable objects.",
+			["Commits/files recoverable only via dangling objects may be deleted."],
+			[
+				"Avoid aggressive pruning during agent work.",
+				"Create a backup ref first if pruning is required.",
+			],
+			detail,
+		);
+	}
+	return null;
+}
+
+function classifyShellDanger(
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis: BashAnalysis | undefined,
+): YoloDangerInfo | null {
+	if (!bashAnalysis) return null;
+	for (const cmd of bashAnalysis.commands) {
+		const [name, ...args] = cmd.tokens;
+		if (name === "git") {
+			const gitDanger = classifyGitDanger(cmd.text, cmd.tokens);
+			if (gitDanger) return gitDanger;
+		}
+		if (name === "rm" || name === "rmdir" || name === "shred") {
+			const recursive = args.some((a) => a.includes("r") || a === "--recursive");
+			return danger(
+				`${name} deletes files${recursive ? " recursively" : ""}.`,
+				[
+					"Deleted files may not be recoverable from git if they are untracked or ignored.",
+					"The operation can remove user work that the agent did not create.",
+				],
+				["List the target paths first.", "Prefer moving files to a temporary trash directory."],
+				[`Command: ${cmd.text}`],
+			);
+		}
+		if (name === "find" && (args.includes("-delete") || args.includes("-exec"))) {
+			return danger(
+				"Find is being used with deletion or command execution.",
+				["It can affect many matching files at once, including files the agent did not inspect."],
+				[
+					"Run the same find command without -delete/-exec first.",
+					"Apply changes to explicit paths.",
+				],
+				[`Command: ${cmd.text}`],
+			);
+		}
+	}
+	if (bashAnalysis.dangerousPatterns.length > 0 || bashAnalysis.hasEnvInjection) {
+		return danger(
+			"Shell command contains dangerous execution patterns.",
+			[
+				"The command may execute downloaded, nested, or environment-injected code.",
+				"Side effects may be broader than the visible command line suggests.",
+			],
+			[
+				"Inspect the command source first.",
+				"Break the command into read-only inspection and explicit execution steps.",
+			],
+			[
+				...bashAnalysis.dangerousPatterns,
+				...(bashAnalysis.hasEnvInjection ? ["Environment variable injection detected"] : []),
+			],
+		);
+	}
+	const externalPaths = describeExternalPaths(cwd, getShellScopePaths(cwd, input, bashAnalysis));
+	if (externalPaths.length > 0) {
+		return danger(
+			"Shell command accesses paths outside the current working directory.",
+			[
+				"The command may read or modify files outside this chapter/worktree boundary.",
+				"Those files may not be covered by NarraFork snapshots or git recovery.",
+			],
+			[
+				"Copy needed data into the worktree first.",
+				"Use a narrower command scoped to explicit paths.",
+			],
+			[`External paths: ${externalPaths.join(", ")}`],
+		);
+	}
+	return null;
+}
+
+export function classifyYoloDanger(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis?: BashAnalysis,
+): YoloDangerInfo | null {
+	if (toolName === SHELL_TOOL_NAME) return classifyShellDanger(input, cwd, bashAnalysis);
+
+	if (toolName === "Agent") {
+		const workdir = typeof input.workdir === "string" ? input.workdir : "";
+		if (workdir) {
+			const resolvedWorkdir = resolvePath(cwd, workdir);
+			if (!pathsEqual(resolvedWorkdir, resolvePath(cwd))) {
+				return danger(
+					"Subagent requests a custom working directory.",
+					[
+						"The subagent may operate outside the parent narrator's current workspace.",
+						"A write-capable subagent can modify files the parent did not inspect.",
+					],
+					[
+						"Use the inherited working directory when possible.",
+						"Use an explore/plan subagent for read-only investigation first.",
+					],
+					[`Requested workdir: ${resolvedWorkdir}`],
+				);
+			}
+		}
+		return null;
+	}
+
+	const toolPaths = extractToolPaths(toolName, input);
+	const externalPaths = describeExternalPaths(cwd, toolPaths);
+	if (externalPaths.length > 0) {
+		return danger(
+			`${toolName} targets paths outside the current working directory.`,
+			[
+				"The operation crosses the chapter/worktree boundary.",
+				"External files may not be covered by project git history or NarraFork snapshots.",
+			],
+			[
+				"Operate inside the worktree when possible.",
+				"Use explicit user approval for external files.",
+			],
+			[`External paths: ${externalPaths.join(", ")}`],
+		);
+	}
+
+	if (toolName === "Write") {
+		const filePath = typeof input.file_path === "string" ? input.file_path : "";
+		if (filePath && existsSync(resolvePath(cwd, filePath))) {
+			return danger(
+				"Write will overwrite an existing file.",
+				[
+					"Existing content can be replaced in one operation.",
+					"If the file contains user changes, they may be difficult to reconstruct.",
+				],
+				[
+					"Read the file and use Edit for a smaller diff.",
+					"Create a backup or inspect git diff first.",
+				],
+				[`File: ${resolvePath(cwd, filePath)}`],
+			);
+		}
+	}
+
+	if (toolName === "Edit" || toolName === "MultiEdit") {
+		const newString = typeof input.new_string === "string" ? input.new_string : undefined;
+		const replaceAll = input.replace_all === true;
+		if (newString === "" || replaceAll) {
+			return danger(
+				replaceAll
+					? "Edit will replace all matching occurrences."
+					: "Edit will remove matched content.",
+				[
+					"The change may delete or alter more code than intended.",
+					"A broad match can affect user work outside the agent's intended scope.",
+				],
+				["Use a unique, narrow old_string.", "Inspect the target file before applying the edit."],
+				[
+					`File: ${typeof input.file_path === "string" ? resolvePath(cwd, input.file_path) : "(unknown)"}`,
+				],
+			);
+		}
+	}
+
+	return null;
+}
+
+function buildYoloDangerMessage(danger: YoloDangerInfo): string {
+	const lines = [
+		"YOLO safety pause: this operation was NOT executed.",
+		"",
+		"Detected high-risk operation:",
+		`- ${danger.summary}`,
+	];
+	if (danger.details?.length) {
+		lines.push("", "Details:", ...danger.details.map((d) => `- ${d}`));
+	}
+	lines.push("", "Possible consequences:", ...danger.consequences.map((c) => `- ${c}`));
+	lines.push(
+		"",
+		"Safer alternatives to consider:",
+		...danger.saferAlternatives.map((a) => `- ${a}`),
+	);
+	lines.push(
+		"",
+		"If you have considered the risk and still need this exact operation, call the exact same tool with the exact same input again within 5 minutes. Any changed input will trigger a new safety pause.",
+	);
+	return lines.join("\n");
+}
+
 type PermissionScopeNarrator = {
 	id?: string | null;
 	variant?: string | null;
@@ -1126,12 +1614,33 @@ export async function handlePermission(
 				columns: { chapterSettings: true, gitPath: true },
 			});
 			if (project?.gitPath) resolvedProjectGitPath = project.gitPath;
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
-			const cs = project?.chapterSettings as any;
+			const cs = project?.chapterSettings as
+				| {
+						whitelistDirs?: Array<{
+							path: string;
+							accessLevel?: WhitelistDir["accessLevel"];
+							enabled?: boolean;
+						}>;
+						blacklistDirs?: Array<{
+							path: string;
+							denyLevel?: BlacklistDir["denyLevel"];
+							enabled?: boolean;
+						}>;
+						commandWhitelist?: Array<{
+							pattern: string;
+							enabled?: boolean;
+						}>;
+						commandBlacklist?: Array<{
+							pattern: string;
+							denyPrompt?: string | null;
+							enabled?: boolean;
+						}>;
+				  }
+				| undefined;
 			if (cs?.whitelistDirs) {
 				projectWl = cs.whitelistDirs
-					.filter((d: any) => d.enabled !== false)
-					.map((d: any) => ({
+					.filter((d) => d.enabled !== false)
+					.map((d) => ({
 						path: d.path,
 						accessLevel: d.accessLevel ?? "readOnly",
 						enabled: true,
@@ -1139,8 +1648,8 @@ export async function handlePermission(
 			}
 			if (cs?.blacklistDirs) {
 				projectBl = cs.blacklistDirs
-					.filter((d: any) => d.enabled !== false)
-					.map((d: any) => ({
+					.filter((d) => d.enabled !== false)
+					.map((d) => ({
 						path: d.path,
 						denyLevel: d.denyLevel ?? "denyAll",
 						enabled: true,
@@ -1149,8 +1658,8 @@ export async function handlePermission(
 			}
 			if (cs?.commandWhitelist) {
 				projectCmdWl = cs.commandWhitelist
-					.filter((d: any) => d.enabled !== false)
-					.map((d: any) => ({
+					.filter((d) => d.enabled !== false)
+					.map((d) => ({
 						pattern: d.pattern,
 						enabled: true,
 						source: "project" as const,
@@ -1158,8 +1667,8 @@ export async function handlePermission(
 			}
 			if (cs?.commandBlacklist) {
 				projectCmdBl = cs.commandBlacklist
-					.filter((d: any) => d.enabled !== false)
-					.map((d: any) => ({
+					.filter((d) => d.enabled !== false)
+					.map((d) => ({
 						pattern: d.pattern,
 						denyPrompt: d.denyPrompt,
 						enabled: true,
@@ -1294,6 +1803,47 @@ export async function handlePermission(
 		bashNonWhitelisted: bashAnalysis?.nonWhitelisted,
 		bashHasWrite: bashAnalysis?.hasWriteOperation,
 	});
+
+	const effectiveMode = getEffectivePermissionMode(
+		permMode,
+		isRelaxedPlan,
+		narrator?.previousPermissionMode,
+	);
+	if (decision === "allow" && effectiveMode === "bypassPermissions") {
+		const danger = classifyYoloDanger(toolName, effectiveInput, cwd, bashAnalysis);
+		if (danger) {
+			const fingerprint = createYoloDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
+			if (!consumeYoloConfirmation(narratorId, fingerprint)) {
+				rememberYoloConfirmation(narratorId, fingerprint, danger);
+				const warning = buildYoloDangerMessage(danger);
+				logger.warn("YOLO high-risk operation paused", {
+					narratorId,
+					toolName,
+					toolUseId,
+					fingerprint,
+					summary: danger.summary,
+				});
+				await db
+					.update(narratorToolCalls)
+					.set({
+						status: "fail",
+						errorMessage: warning,
+						inputJson: effectiveInput,
+						permissionDecidedBy: "auto",
+						permissionDecidedAt: new Date().toISOString(),
+						permissionDecisionReason: `YOLO safety pause: ${danger.summary}`,
+					})
+					.where(
+						and(
+							eq(narratorToolCalls.narratorId, narratorId),
+							eq(narratorToolCalls.toolUseId, toolUseId),
+						),
+					);
+				return { behavior: "deny", message: warning, rawMessage: true };
+			}
+		}
+	}
+
 	if (decision === "fatal") {
 		const reason = bashAnalysis?.catastrophicReason ?? "catastrophic command detected";
 		const fatalMsg = `FATAL: ${reason}. Narrator terminated for safety.`;
@@ -1521,6 +2071,7 @@ export async function handlePermission(
 		.set({
 			status: "pending",
 			inputJson: effectiveInput,
+			permissionStartedAt: new Date().toISOString(),
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
@@ -1535,18 +2086,6 @@ export async function handlePermission(
 	if (broadcastTargetId && broadcastTargetId !== narratorId) {
 		await narratorService.updateStatus(broadcastTargetId, "waiting");
 	}
-
-	// Route to overseer (async, non-blocking)
-	routePermissionToOverseer(
-		narratorId,
-		toolCallId,
-		toolName,
-		toolUseId,
-		effectiveInput,
-		wsTarget,
-	).catch((err) => {
-		logger.debug("Overseer routing skipped or failed", { narratorId, error: String(err) });
-	});
 
 	if (signal.aborted) {
 		broadcastToNarrator(wsTarget, {
@@ -1651,20 +2190,6 @@ export async function resolvePermission(
 	});
 
 	pending.cleanup();
-
-	// Remove this request from any overseer queue
-	for (const [overseerNarratorId, queue] of pendingOverseerMessages) {
-		const idx = queue.findIndex((m) => m.requestId === requestId);
-		if (idx !== -1) {
-			queue.splice(idx, 1);
-			if (queue.length === 0) pendingOverseerMessages.delete(overseerNarratorId);
-			logger.debug("Removed resolved permission from overseer queue", {
-				requestId,
-				overseerNarratorId,
-			});
-			break;
-		}
-	}
 
 	let updatedInput: Record<string, unknown> | undefined;
 	if (answers) {
@@ -1814,153 +2339,4 @@ export async function resolveAllPendingPermissions(narratorId: string): Promise<
 		await resolvePermission(requestId, "allow");
 	}
 	return toResolve.length;
-}
-
-// === Overseer permission routing ===
-
-async function routePermissionToOverseer(
-	narratorId: string,
-	toolCallId: string,
-	toolName: string,
-	toolUseId: string,
-	input: Record<string, unknown>,
-	broadcastTargetId: string,
-): Promise<void> {
-	const { findResponsibleOverseer, getOverseerPolicy } = await import("./overseer-service");
-
-	const overseer = await findResponsibleOverseer(narratorId);
-	if (!overseer) return;
-
-	const policy = getOverseerPolicy(overseer);
-	if (!policy.handleEvents.permissionRequests) return;
-
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, title: true, chapterId: true },
-	});
-
-	const narratorTitle = narrator?.title ?? "Untitled";
-	const inputSummary = JSON.stringify(input, null, 2).slice(0, 2000);
-
-	const contentBlocks = [
-		{
-			type: "overseer_permission_request" as const,
-			requestId: toolCallId,
-			narratorId,
-			narratorTitle,
-			toolName,
-			toolUseId,
-			inputJson: input,
-		},
-	];
-
-	const { getUserLanguage } = await import("../lib/prompt-i18n");
-	let overseerLocale: import("../lib/prompt-i18n").Locale = "en";
-	try {
-		const { users } = await import("../db/schema");
-		const admin = await db.query.users.findFirst({
-			where: eq(users.role, "admin"),
-			columns: { id: true },
-		});
-		if (admin) {
-			overseerLocale = await getUserLanguage(admin.id);
-		}
-	} catch {
-		// fallback to "en"
-	}
-
-	const textForModel = getToolMessageWithParams("overseerPermissionRequestText", overseerLocale, {
-		requestId: toolCallId,
-		narratorTitle,
-		narratorId,
-		toolName,
-		toolUseId,
-		inputSummary,
-	});
-
-	eventBus.emit({
-		type: "overseer:event_routed",
-		overseerId: overseer.id,
-		narratorId,
-		eventType: "permission_request",
-	});
-
-	const existingActive = activeNarrators.get(overseer.narratorId);
-	if (existingActive?.alive && existingActive._loopRunning) {
-		const queue = pendingOverseerMessages.get(overseer.narratorId) ?? [];
-		queue.push({
-			requestId: toolCallId,
-			narratorId,
-			toolName,
-			toolUseId,
-			input,
-			textForModel,
-			contentBlocks,
-			broadcastTargetId,
-		});
-		pendingOverseerMessages.set(overseer.narratorId, queue);
-
-		broadcastToNarrator(broadcastTargetId, {
-			type: "overseer_reviewing",
-			narratorId: broadcastTargetId,
-			requestId: toolCallId,
-			toolUseId,
-			status: "queued",
-			overseerId: overseer.id,
-		});
-
-		logger.debug("Overseer busy, queued permission request", {
-			overseerId: overseer.id,
-			requestId: toolCallId,
-			queueLength: queue.length,
-		});
-		return;
-	}
-
-	try {
-		// Import ensureNarrator dynamically to avoid circular dependency
-		const { ensureNarrator, runAgentLoop } = await import("./narrator-session");
-
-		const active = await ensureNarrator(overseer.narratorId, overseerLocale);
-
-		const userMsg = await narratorService.persistUserMessage(
-			overseer.narratorId,
-			textForModel,
-			contentBlocks,
-		);
-
-		broadcastToNarrator(overseer.narratorId, {
-			type: "user_message",
-			narratorId: overseer.narratorId,
-			message: userMsg,
-		});
-
-		await narratorService.updateStatus(overseer.narratorId, "working");
-
-		broadcastToNarrator(broadcastTargetId, {
-			type: "overseer_reviewing",
-			narratorId: broadcastTargetId,
-			requestId: toolCallId,
-			toolUseId,
-			status: "reviewing",
-			overseerId: overseer.id,
-		});
-
-		runAgentLoop(active, textForModel).catch(async (err: unknown) => {
-			logger.warn("Overseer agent loop failed", {
-				overseerId: overseer.id,
-				error: String(err),
-			});
-			await narratorService.updateStatus(overseer.narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-		});
-	} catch (err) {
-		logger.warn("Failed to route permission to overseer", {
-			overseerId: overseer.id,
-			narratorId,
-			error: String(err),
-		});
-	}
 }

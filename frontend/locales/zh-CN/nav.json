@@ -30,8 +30,5 @@
 	"revealInExplorer": "在资源管理器中打开",
 	"totalOutputChars": "AI 输出总字符数",
 	"feedback": "反馈问题",
-	"licenses": "开源协议",
-	"overseer": "监察者",
-	"enableOverseer": "启用",
-	"disableOverseer": "禁用"
+	"licenses": "开源协议"
 }

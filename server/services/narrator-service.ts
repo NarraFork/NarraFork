@@ -7,7 +7,6 @@ import {
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistDirs,
-	overseers,
 	projects,
 	terminals,
 	terminalTabs,
@@ -87,6 +86,7 @@ interface CreateSubagentInput {
 	title?: string;
 	permissionMode?: string;
 	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	systemPrompt?: string;
 }
 
@@ -483,7 +483,9 @@ export const narratorService = {
 		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
-			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
+			input.reasoningEffort === undefined
+				? parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null)
+				: input.reasoningEffort;
 
 		const subChapterId = parent.chapterId ?? null;
 		const subTraits: string[] = subChapterId === null ? ["standalone"] : [];
@@ -596,11 +598,6 @@ export const narratorService = {
 		}
 
 		await db.transaction(async (tx) => {
-			await tx.delete(overseers).where(eq(overseers.narratorId, narratorId));
-			await tx
-				.update(narratorToolCalls)
-				.set({ permissionOverseerNarratorId: null })
-				.where(eq(narratorToolCalls.permissionOverseerNarratorId, narratorId));
 			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
 			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));
 			await tx.delete(terminals).where(eq(terminals.narratorId, narratorId));

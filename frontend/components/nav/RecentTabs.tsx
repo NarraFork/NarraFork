@@ -299,7 +299,7 @@ interface RecentTabListProps {
 	onNavigate?: () => void;
 	/** When true, the first tab (if active) removes its top border-radius */
 	firstTabConnected?: boolean;
-	/** Narrator ID to exclude from active highlighting (used for overseer) */
+	/** Narrator ID to exclude from active highlighting. */
 	excludeActiveNarratorId?: string;
 }
 

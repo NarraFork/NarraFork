@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { isInsideWorktree, resolvePermissionDecision } from "../../../services/narrator-session";
+import {
+	classifyYoloDanger,
+	createYoloDangerFingerprint,
+	isInsideWorktree,
+	resolvePermissionDecision,
+} from "../../../services/narrator-permission";
 import { analyzeBashCommand, type BashAnalysis } from "../bash-analyze";
 
 const CWD = "/home/user/project";
@@ -818,7 +823,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBe("ask");
 	});
 
-	test("bypassPermissions → allow regardless", () => {
+	test("bypassPermissions → allow at decision layer", () => {
 		expect(
 			resolvePermissionDecision({
 				toolName: "Bash",
@@ -828,6 +833,82 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				bashAnalysis: withNonWhitelisted,
 			}),
 		).toBe("allow");
+	});
+
+	test("YOLO danger classifier ignores safe shell command", () => {
+		expect(classifyYoloDanger("Bash", { command: "git status" }, cwd, allSafe)).toBeNull();
+	});
+
+	test("YOLO danger classifier catches rm deletion", () => {
+		const result = classifyYoloDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted);
+		expect(result?.summary).toContain("rm deletes files");
+	});
+
+	test("YOLO danger classifier catches git reset --hard", async () => {
+		const analysis = await analyzeBashCommand("git reset --hard HEAD~1", cwd, false);
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "git reset --hard HEAD~1" },
+			cwd,
+			analysis,
+		);
+		expect(result?.summary).toContain("Git reset");
+	});
+
+	test("YOLO danger classifier catches git clean", async () => {
+		const analysis = await analyzeBashCommand("git clean -fd", cwd, false);
+		const result = classifyYoloDanger("Bash", { command: "git clean -fd" }, cwd, analysis);
+		expect(result?.summary).toContain("Git clean");
+	});
+
+	test("YOLO danger classifier catches git checkout path restore", async () => {
+		const analysis = await analyzeBashCommand("git checkout src/index.ts", cwd, false);
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "git checkout src/index.ts" },
+			cwd,
+			analysis,
+		);
+		expect(result?.summary).toContain("Git checkout");
+	});
+
+	test("YOLO danger classifier catches git checkout revision path restore", async () => {
+		const analysis = await analyzeBashCommand("git checkout HEAD src/index.ts", cwd, false);
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "git checkout HEAD src/index.ts" },
+			cwd,
+			analysis,
+		);
+		expect(result?.summary).toContain("Git checkout");
+	});
+
+	test("YOLO danger classifier does not treat plain branch checkout as path restore", async () => {
+		const analysis = await analyzeBashCommand("git checkout main", cwd, false);
+		const result = classifyYoloDanger("Bash", { command: "git checkout main" }, cwd, analysis);
+		expect(result).toBeNull();
+	});
+
+	test("YOLO danger classifier catches external path access", () => {
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "cat /etc/passwd" },
+			cwd,
+			withExternalPath,
+		);
+		expect(result?.summary).toContain("outside the current working directory");
+	});
+
+	test("YOLO danger fingerprint is stable across object key order", () => {
+		expect(createYoloDangerFingerprint("Bash", { command: "rm foo", timeout: 1 }, cwd)).toBe(
+			createYoloDangerFingerprint("Bash", { timeout: 1, command: "rm foo" }, cwd),
+		);
+	});
+
+	test("YOLO danger fingerprint changes with cwd", () => {
+		expect(createYoloDangerFingerprint("Bash", { command: "rm foo" }, cwd)).not.toBe(
+			createYoloDangerFingerprint("Bash", { command: "rm foo" }, "/home/user/other"),
+		);
 	});
 
 	test("dontAsk → deny regardless", () => {

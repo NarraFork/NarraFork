@@ -203,12 +203,6 @@
 	"segmentCompactFailedDesc": "压缩选中消息失败，请重试。",
 	"expandHiddenMessages": "查看原文",
 	"collapseHiddenMessages": "收起",
-	"overseer_permissionRequest": "权限请求",
-	"overseer_narrator": "叙述者",
-	"overseer_tool": "工具",
-	"overseer_request": "请求",
-	"overseerReviewing": "监察者审查中",
-	"overseerQueued": "等待监察者审查",
 	"rollbackFailed": "回退失败",
 	"rollbackConfirmTitle": "确认回退",
 	"rollbackConfirmDesc": "将删除 {{blockCount}} 个块和 {{messageCount}} 条后续消息。",
@@ -484,6 +478,32 @@
 		"statusCancelled": "已取消",
 		"statusFailed": "失败",
 		"agentTask": "代理",
-		"bashTask": "命令"
+		"bashTask": "命令",
+		"openAgent": "打开 agent"
+	},
+	"toolCallInspector": {
+		"title": "Tool Call 检查器",
+		"inspect": "检查 Tool Call",
+		"unknownTool": "未知工具",
+		"input": "输入",
+		"output": "输出",
+		"error": "错误",
+		"empty": "无内容",
+		"copy": "复制",
+		"copied": "已复制",
+		"copyInput": "复制输入",
+		"copyOutput": "复制输出",
+		"loadFailed": "加载 Tool Call 详情失败",
+		"duration": "耗时 {{ms}}ms",
+		"timing": {
+			"title": "时间线",
+			"streamStarted": "工具开始流式输出",
+			"permissionStarted": "开始等待权限批准",
+			"executionStarted": "开始执行",
+			"completed": "执行完毕",
+			"total": "总耗时 {{duration}}",
+			"permissionWait": "权限等待 {{duration}}",
+			"execution": "执行 {{duration}}"
+		}
 	}
 }

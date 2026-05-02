@@ -35,6 +35,7 @@ import {
 	IconFileCode,
 	IconGitFork,
 	IconHistory,
+	IconInfoCircle,
 	IconListCheck,
 	IconLoader2,
 	IconMap,
@@ -45,6 +46,7 @@ import {
 	IconRobot,
 	IconSearch,
 	IconShare,
+	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
 	IconWand,
@@ -76,6 +78,7 @@ import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
 import { StreamingCode } from "./StreamingCode";
+import { ToolCallInspector } from "./ToolCallInspector";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 /**
@@ -134,6 +137,10 @@ export interface ToolCallData {
 	outputJson?: any;
 	status: string;
 	durationMs?: number;
+	streamStartedAt?: string | null;
+	permissionStartedAt?: string | null;
+	executionStartedAt?: string | null;
+	completedAt?: string | null;
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
@@ -203,6 +210,7 @@ const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const TODO_TOOLS = new Set(["TaskCreate"]);
+const GOAL_TOOLS = new Set(["GetGoals", "AddGoal", "UpdateGoal"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 const AWAIT_TOOLS = new Set(["Await"]);
@@ -214,12 +222,6 @@ const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
-const OVERSEER_TOOLS = new Set([
-	"ApprovePermission",
-	"DenyPermission",
-	"ListManagedNarrators",
-	"GetNarratorContext",
-]);
 
 export type ToolCategory =
 	| "read"
@@ -229,6 +231,7 @@ export type ToolCategory =
 	| "webSearch"
 	| "webFetch"
 	| "todo"
+	| "goal"
 	| "taskOutput"
 	| "agent"
 	| "await"
@@ -239,7 +242,6 @@ export type ToolCategory =
 	| "share"
 	| "recall"
 	| "skill"
-	| "overseer"
 	| "browser"
 	| "generic";
 
@@ -255,6 +257,7 @@ export function getCategory(name: string): ToolCategory {
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
 	if (TODO_TOOLS.has(name)) return "todo";
+	if (GOAL_TOOLS.has(name)) return "goal";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
@@ -265,7 +268,6 @@ export function getCategory(name: string): ToolCategory {
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (RECALL_TOOLS.has(name)) return "recall";
 	if (SKILL_TOOLS.has(name)) return "skill";
-	if (OVERSEER_TOOLS.has(name)) return "overseer";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	return "generic";
 }
@@ -286,6 +288,8 @@ export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 			return IconWorldWww;
 		case "todo":
 			return IconListCheck;
+		case "goal":
+			return IconTargetArrow;
 		case "taskOutput":
 			return IconRobot;
 		case "agent":
@@ -306,8 +310,6 @@ export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 			return IconHistory;
 		case "skill":
 			return IconWand;
-		case "overseer":
-			return IconEye;
 		case "browser":
 			return IconWorldWww;
 		default:
@@ -331,6 +333,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "teal";
 		case "todo":
 			return "teal";
+		case "goal":
+			return "green";
 		case "taskOutput":
 			return "indigo";
 		case "agent":
@@ -351,8 +355,6 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "cyan";
 		case "skill":
 			return "grape";
-		case "overseer":
-			return "indigo";
 		case "browser":
 			return "teal";
 		default:
@@ -600,6 +602,13 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		}
 		case "todo":
 			return "Update todos";
+		case "goal": {
+			if (toolName === "GetGoals") return "List goals";
+			if (toolName === "UpdateGoal") return "Complete active goal";
+			const objective = extractField(input, "objective");
+			if (objective) return objective.length > 80 ? `${objective.slice(0, 77)}...` : objective;
+			return toolName;
+		}
 		case "taskOutput": {
 			const taskId = extractField(input, "task_id");
 			return taskId ? `Check ${taskId}` : "Check task output";
@@ -702,18 +711,6 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			}
 			return "Recall";
 		}
-		case "overseer": {
-			const reqId = extractField(input, "requestId");
-			const short = reqId ? reqId.slice(0, 8) : "";
-			if (toolName === "ApprovePermission") return short ? `✓ Approve ${short}…` : "Approve";
-			if (toolName === "DenyPermission") return short ? `✗ Deny ${short}…` : "Deny";
-			if (toolName === "ListManagedNarrators") return "List managed narrators";
-			if (toolName === "GetNarratorContext") {
-				const nid = extractField(input, "narratorId");
-				return nid ? `Context: ${nid.slice(0, 8)}…` : "Get context";
-			}
-			return toolName;
-		}
 		case "browser": {
 			const action = extractField(input, "action");
 			const bUrl = extractField(input, "url");
@@ -775,10 +772,120 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 // --- Helper: live elapsed timer for running tools ---
 
 function formatElapsed(s: number): string {
-	if (s < 60) return `${s}s`;
-	const m = Math.floor(s / 60);
-	const sec = s % 60;
+	const totalSeconds = Math.max(0, Math.floor(s));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const h = Math.floor(totalSeconds / 3600);
+	const m = Math.floor((totalSeconds % 3600) / 60);
+	const sec = totalSeconds % 60;
+	if (h > 0) {
+		return `${h}h${m.toString().padStart(2, "0")}m${sec.toString().padStart(2, "0")}s`;
+	}
 	return `${m}m${sec.toString().padStart(2, "0")}s`;
+}
+
+function formatCompletedDuration(ms: number): string {
+	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+	return formatElapsed(Math.round(ms / 1000));
+}
+
+function formatSegmentDuration(ms: number): string {
+	if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+	if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+	const minutes = Math.floor(ms / 60_000);
+	const seconds = Math.round((ms % 60_000) / 1000);
+	return `${minutes}min${seconds}s`;
+}
+
+function parseIsoTime(value: string | null | undefined): number | null {
+	if (!value) return null;
+	const time = new Date(value).getTime();
+	return Number.isFinite(time) ? time : null;
+}
+
+function formatTimeOnly(time: number): string {
+	return new Date(time).toLocaleTimeString();
+}
+
+function ToolTimingTooltipLabel({
+	toolCall,
+	displayDurationMs,
+}: {
+	toolCall: ToolCallData;
+	displayDurationMs: number | null;
+}) {
+	const { t } = useTranslation("narrator");
+	const streamStarted = parseIsoTime(toolCall.streamStartedAt) ?? toolCall.startedAt ?? null;
+	const permissionStarted = parseIsoTime(toolCall.permissionStartedAt);
+	const executionStarted = parseIsoTime(toolCall.executionStartedAt);
+	const completed =
+		parseIsoTime(toolCall.completedAt) ??
+		(executionStarted != null && displayDurationMs != null
+			? executionStarted + displayDurationMs
+			: null);
+	const steps = [
+		{ key: "stream", label: t("toolCallInspector.timing.streamStarted"), time: streamStarted },
+		{
+			key: "permission",
+			label: t("toolCallInspector.timing.permissionStarted"),
+			time: permissionStarted,
+		},
+		{
+			key: "execution",
+			label: t("toolCallInspector.timing.executionStarted"),
+			time: executionStarted,
+		},
+		{ key: "completed", label: t("toolCallInspector.timing.completed"), time: completed },
+	].filter((step) => step.time != null) as Array<{ key: string; label: string; time: number }>;
+
+	if (steps.length === 0) return null;
+
+	return (
+		<Stack gap={4} maw={320}>
+			<Text size="xs" fw={600}>
+				{t("toolCallInspector.timing.title")}
+			</Text>
+			{steps.map((step, index) => {
+				const previous = steps[index - 1]?.time;
+				const delta = previous == null ? null : Math.max(0, step.time - previous);
+				return (
+					<Group key={step.key} gap={6} wrap="nowrap" justify="space-between">
+						<Text size="xs" style={{ flex: 1 }}>
+							{step.label}
+						</Text>
+						<Text size="xs" ff="monospace" c="dimmed">
+							{formatTimeOnly(step.time)}
+						</Text>
+						{delta != null && (
+							<Text size="xs" ff="monospace" c="dimmed" style={{ width: 54, textAlign: "right" }}>
+								+{formatSegmentDuration(delta)}
+							</Text>
+						)}
+					</Group>
+				);
+			})}
+			{streamStarted != null && completed != null && (
+				<Text size="xs" c="dimmed">
+					{t("toolCallInspector.timing.total", {
+						duration: formatSegmentDuration(completed - streamStarted),
+					})}
+				</Text>
+			)}
+			{permissionStarted != null && executionStarted != null && (
+				<Text size="xs" c="dimmed">
+					{t("toolCallInspector.timing.permissionWait", {
+						duration: formatSegmentDuration(executionStarted - permissionStarted),
+					})}
+				</Text>
+			)}
+			{executionStarted != null && completed != null && (
+				<Text size="xs" c="dimmed">
+					{t("toolCallInspector.timing.execution", {
+						duration: formatSegmentDuration(completed - executionStarted),
+					})}
+				</Text>
+			)}
+		</Stack>
+	);
 }
 
 function formatTimeoutShort(ms: number): string {
@@ -1012,6 +1119,15 @@ const ToolHeader = memo(
 			}
 			return toolCall.durationMs;
 		}, [cat, toolCall.durationMs, toolCall._metadata]);
+		const timingTooltipLabel =
+			toolCall.streamStartedAt ||
+			toolCall.permissionStartedAt ||
+			toolCall.executionStartedAt ||
+			toolCall.completedAt ? (
+				<ToolTimingTooltipLabel toolCall={toolCall} displayDurationMs={displayDurationMs} />
+			) : (
+				startedAtLabel
+			);
 
 		const content = (
 			<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
@@ -1047,8 +1163,8 @@ const ToolHeader = memo(
 				)}
 				<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
 					<Tooltip
-						label={startedAtLabel}
-						disabled={!startedAtLabel}
+						label={timingTooltipLabel}
+						disabled={!timingTooltipLabel}
 						position="top"
 						withArrow
 						fz="xs"
@@ -1077,7 +1193,7 @@ const ToolHeader = memo(
 										isRunning={false}
 									>
 										<Text size="xs" c="dimmed" ff="monospace">
-											{(displayDurationMs / 1000).toFixed(1)}s
+											{formatCompletedDuration(displayDurationMs)}
 											<span style={{ opacity: 0.5 }}>
 												{" "}
 												/ {formatTimeoutShort(effectiveTimeoutMs)}
@@ -1086,7 +1202,7 @@ const ToolHeader = memo(
 									</TimeoutPopover>
 								) : (
 									<Text size="xs" c="dimmed" ff="monospace">
-										{(displayDurationMs / 1000).toFixed(1)}s
+										{formatCompletedDuration(displayDurationMs)}
 									</Text>
 								))
 							)}
@@ -2343,80 +2459,6 @@ function formatRecallTime(iso: string): string {
 	}
 }
 
-// --- Overseer tool detail ---
-
-function OverseerDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const input = toolCall.inputJson as Record<string, unknown> | undefined;
-	const output =
-		typeof toolCall.outputJson === "string"
-			? toolCall.outputJson
-			: typeof (toolCall.outputJson as { output?: string })?.output === "string"
-				? (toolCall.outputJson as { output: string }).output
-				: resolveDisplayText(toolCall.outputJson);
-
-	if (toolCall.toolName === "ApprovePermission" || toolCall.toolName === "DenyPermission") {
-		const isApprove = toolCall.toolName === "ApprovePermission";
-		const reqId = (input?.requestId as string) ?? "";
-		const feedback = (input?.feedbackText as string) ?? (input?.denyMessage as string) ?? "";
-
-		return (
-			<Box mt="xs">
-				<Group gap="xs" mb="xs">
-					<Badge color={isApprove ? "green" : "red"} variant="filled" size="sm">
-						{isApprove ? "Approved" : "Denied"}
-					</Badge>
-					{reqId && <Code style={{ fontSize: 11 }}>{reqId}</Code>}
-				</Group>
-				{feedback && (
-					<Text size="xs" c="dimmed" mb="xs">
-						{feedback}
-					</Text>
-				)}
-				{output && (
-					<Code block style={{ fontSize: 11, maxHeight: 120, overflow: "auto" }}>
-						{output}
-					</Code>
-				)}
-			</Box>
-		);
-	}
-
-	if (toolCall.toolName === "GetNarratorContext") {
-		const nid = (input?.narratorId as string) ?? "";
-		return (
-			<Box mt="xs">
-				{nid && (
-					<Text size="xs" c="dimmed" mb="xs">
-						Narrator: <Code style={{ fontSize: 11 }}>{nid}</Code>
-					</Text>
-				)}
-				{output && (
-					<Code
-						block
-						style={{ fontSize: 11, maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap" }}
-					>
-						{output}
-					</Code>
-				)}
-			</Box>
-		);
-	}
-
-	// ListManagedNarrators and fallback
-	return (
-		<Box mt="xs">
-			{output && (
-				<Code
-					block
-					style={{ fontSize: 11, maxHeight: 300, overflow: "auto", whiteSpace: "pre-wrap" }}
-				>
-					{output}
-				</Code>
-			)}
-		</Box>
-	);
-}
-
 function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
 	const output = resolveDisplayText(toolCall.outputJson);
@@ -2749,6 +2791,156 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<ContentViewer content={rawOutput} style={codeStyle} title="Send result" markdown />
 				</>
 			)}
+		</Box>
+	);
+}
+
+interface GoalView {
+	id?: string;
+	objective?: string;
+	status?: string;
+	tokensUsed?: number;
+	timeUsedSeconds?: number;
+}
+
+function parseGoalToolPayload(value: unknown): Record<string, unknown> | null {
+	if (!value) return null;
+	let raw = "";
+	if (typeof value === "string") raw = value;
+	else if (Array.isArray(value)) {
+		raw = value
+			.map((block) =>
+				typeof block === "object" && block && "text" in block
+					? String((block as { text?: unknown }).text ?? "")
+					: "",
+			)
+			.join("\n");
+	} else if (typeof value === "object" && "_text" in value) {
+		raw = String((value as { _text?: unknown })._text ?? "");
+	} else if (typeof value === "object") {
+		return value as Record<string, unknown>;
+	}
+	if (!raw.trim()) return null;
+	try {
+		return JSON.parse(raw) as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
+function coerceGoal(value: unknown): GoalView | null {
+	if (!value || typeof value !== "object") return null;
+	const goal = value as Record<string, unknown>;
+	return {
+		id: typeof goal.id === "string" ? goal.id : undefined,
+		objective: typeof goal.objective === "string" ? goal.objective : undefined,
+		status: typeof goal.status === "string" ? goal.status : undefined,
+		tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : undefined,
+		timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : undefined,
+	};
+}
+
+function goalStatusColor(status?: string): string {
+	switch (status) {
+		case "active":
+			return "green";
+		case "pending":
+			return "yellow";
+		case "paused":
+			return "orange";
+		case "complete":
+			return "blue";
+		case "cancelled":
+			return "gray";
+		default:
+			return "gray";
+	}
+}
+
+function GoalRow({ goal, index }: { goal: GoalView; index?: number }) {
+	return (
+		<Group gap="xs" wrap="nowrap" align="flex-start">
+			{index != null && (
+				<Text size="xs" c="dimmed" ff="monospace" style={{ width: 18, flexShrink: 0 }}>
+					{index + 1}.
+				</Text>
+			)}
+			<Badge
+				size="xs"
+				variant="light"
+				color={goalStatusColor(goal.status)}
+				style={{ flexShrink: 0 }}
+			>
+				{goal.status ?? "goal"}
+			</Badge>
+			<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+				<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
+					{goal.objective ?? "—"}
+				</Text>
+				{(goal.timeUsedSeconds != null || goal.tokensUsed != null) && (
+					<Text size="xs" c="dimmed">
+						{goal.timeUsedSeconds ?? 0}s · {goal.tokensUsed ?? 0} tokens
+					</Text>
+				)}
+			</Stack>
+		</Group>
+	);
+}
+
+function GoalDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const payload = parseGoalToolPayload(toolCall.outputJson);
+	const goals = Array.isArray(payload?.goals)
+		? payload.goals.map(coerceGoal).filter((goal): goal is GoalView => Boolean(goal))
+		: [];
+	const active = coerceGoal(payload?.active);
+	const added = coerceGoal(payload?.added);
+	const completed = coerceGoal(payload?.completed);
+
+	if (!payload && goals.length === 0 && !active && !added && !completed) {
+		return <GenericDetail toolCall={toolCall} />;
+	}
+
+	return (
+		<Box mt="xs">
+			<Stack gap="xs">
+				{toolCall.toolName === "AddGoal" && (
+					<GoalRow goal={added ?? { objective: extractField(toolCall.inputJson, "objective") }} />
+				)}
+				{toolCall.toolName === "UpdateGoal" && completed && (
+					<>
+						<Text size="xs" fw={600} c="dimmed">
+							Completed
+						</Text>
+						<GoalRow goal={completed} />
+					</>
+				)}
+				{toolCall.toolName === "GetGoals" && active && (
+					<>
+						<Text size="xs" fw={600} c="dimmed">
+							Active
+						</Text>
+						<GoalRow goal={active} />
+					</>
+				)}
+				{goals.length > 0 ? (
+					<>
+						<Text size="xs" fw={600} c="dimmed">
+							Goal list
+						</Text>
+						<Stack gap={6}>
+							{goals.map((goal, index) => (
+								<GoalRow key={goal.id ?? index} goal={goal} index={index} />
+							))}
+						</Stack>
+					</>
+				) : (
+					toolCall.toolName === "GetGoals" && (
+						<Text size="xs" c="dimmed">
+							No open goals.
+						</Text>
+					)
+				)}
+			</Stack>
 		</Box>
 	);
 }
@@ -3264,6 +3456,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <WebFetchDetail toolCall={toolCall} />;
 		case "todo":
 			return <TodoDetail toolCall={toolCall} />;
+		case "goal":
+			return <GoalDetail toolCall={toolCall} />;
 		case "taskOutput":
 			return <TaskOutputDetail toolCall={toolCall} />;
 		case "agent":
@@ -3284,8 +3478,6 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <SkillDetail toolCall={toolCall} />;
 		case "recall":
 			return <RecallDetail toolCall={toolCall} />;
-		case "overseer":
-			return <OverseerDetail toolCall={toolCall} />;
 		case "browser":
 			return <BrowserDetail toolCall={toolCall} />;
 		default:
@@ -3561,23 +3753,6 @@ export function InlinePermission({
 				<Text size="xs" c="dimmed" mb={4}>
 					{permission.decisionReason}
 				</Text>
-			)}
-			{permission.overseerStatus && (
-				<Badge
-					size="xs"
-					variant="light"
-					color={permission.overseerStatus === "reviewing" ? "blue" : "gray"}
-					leftSection={
-						permission.overseerStatus === "reviewing" ? (
-							<IconEye size={10} />
-						) : (
-							<IconClock size={10} />
-						)
-					}
-					mb={4}
-				>
-					{permission.overseerStatus === "reviewing" ? t("overseerReviewing") : t("overseerQueued")}
-				</Badge>
 			)}
 			<Textarea
 				size="xs"
@@ -3955,12 +4130,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// --- File preview modal state ---
 	const readFilePath = toolCall.toolName === "Read" ? getFilePath(toolCall.inputJson) : "";
 	const [previewOpened, setPreviewOpened] = useState(false);
+	const [inspectorOpened, setInspectorOpened] = useState(false);
 
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const hasActions = !!(
+		toolCall.toolUseId ||
 		readFilePath ||
 		msgCtx.onForkFromMessage ||
 		msgCtx.onAskInPassing ||
@@ -4007,6 +4184,18 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const menuItemsNode = hasActions ? (
 		<>
+			{toolCall.toolUseId && (
+				<Menu.Item
+					leftSection={<IconInfoCircle size={14} />}
+					onClick={() => {
+						setInspectorOpened(true);
+						swipe.closeSwipe();
+					}}
+				>
+					{tNarrator("toolCallInspector.inspect")}
+				</Menu.Item>
+			)}
+			{toolCall.toolUseId && readFilePath && <Menu.Divider />}
 			{readFilePath && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
@@ -4195,6 +4384,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onClose={() => setPreviewOpened(false)}
 			/>
 		) : null;
+	const inspectorModal = toolCall.toolUseId ? (
+		<ToolCallInspector
+			narratorId={narratorId ?? ""}
+			toolUseId={toolCall.toolUseId}
+			opened={inspectorOpened}
+			onClose={() => setInspectorOpened(false)}
+			initialToolCall={toolCall}
+		/>
+	) : null;
 
 	// Shared selection-aware style computation for both inRun and standalone layouts
 	const buildSelectionStyle = (): React.CSSProperties => {
@@ -4233,6 +4431,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				{swipeMenu}
 				{ctxMenu}
 				{previewModal}
+				{inspectorModal}
 			</>
 		);
 	}
@@ -4265,6 +4464,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			{swipeMenu}
 			{ctxMenu}
 			{previewModal}
+			{inspectorModal}
 		</>
 	);
 }, toolCallCardAreEqual);
