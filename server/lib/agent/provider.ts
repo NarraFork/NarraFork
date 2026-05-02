@@ -65,6 +65,8 @@ export interface ParsedStreamEvent {
 	reasoningMetadata?: import("./types").ReasoningProviderMetadata;
 	/** Provider-native ordering index for a reasoning block (e.g. OpenAI Responses output_index). */
 	reasoningOutputIndex?: number;
+	/** Redacted Anthropic thinking block that must be echoed back with the assistant turn. */
+	redactedThinking?: { data: string; outputIndex?: number };
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
@@ -96,6 +98,8 @@ export interface ParsedStreamEvent {
 		cacheCreationInputTokens?: number;
 		cacheCreation5mTokens?: number;
 		cacheCreation1hTokens?: number;
+		/** Provider-specific effective context window used for this usage snapshot. */
+		contextWindow?: number;
 	};
 	/** Web search lifecycle event from Responses API (Codex native web_search tool) */
 	webSearch?: {
@@ -230,6 +234,8 @@ export interface ProviderAdapter {
 		}>,
 		/** Provider-native content block index for the text block (for interleaved ordering). */
 		textOutputIndex?: number,
+		/** Anthropic redacted thinking blocks to preserve during a tool-use trajectory. */
+		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

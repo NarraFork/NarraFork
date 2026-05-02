@@ -93,6 +93,7 @@ export type NarratorServerMessage =
 			isSubagent?: boolean;
 			promptTokens?: number;
 			contextWindow?: number;
+			isEstimated?: boolean;
 			pruneStart?: number;
 			compactStart?: number;
 	  }

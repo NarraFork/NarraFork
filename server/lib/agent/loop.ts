@@ -237,6 +237,11 @@ const PARALLEL_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 ]);
 
+/** Whether a tool use should skip parallel grouping and early execution. */
+function isStrictSerial(tu: AgentToolUse): boolean {
+	return tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true;
+}
+
 type ReasoningBlockEntry = {
 	text: string;
 	providerMetadata?: ReasoningProviderMetadata;
@@ -244,6 +249,19 @@ type ReasoningBlockEntry = {
 	/** When true, the next reasoning delta should be preceded by a separator. */
 	_needsSeparator?: boolean;
 };
+
+function reasoningBlockKey(event: {
+	reasoningMetadata?: ReasoningProviderMetadata;
+	reasoningOutputIndex?: number;
+}): string {
+	const openaiItemId = event.reasoningMetadata?.openai?.itemId;
+	if (openaiItemId) return `openai:${openaiItemId}`;
+
+	const anthropicBlockIndex = event.reasoningMetadata?.anthropic?.blockIndex;
+	if (anthropicBlockIndex != null) return `anthropic:${anthropicBlockIndex}`;
+
+	return "__default";
+}
 
 /** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
 function collectReasoningBlocks(
@@ -488,6 +506,7 @@ export async function* agentLoop(
 		 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
 		 */
 		const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
+		const redactedThinkingBlocks: Array<{ data: string; outputIndex?: number }> = [];
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 		let credentialId: string | undefined;
@@ -495,6 +514,9 @@ export async function* agentLoop(
 		const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 		// Synchronously queryable map of settled early-exec results (populated via .then())
 		const settledResults = new Map<string, ToolExecResult>();
+		// Once a strict-serial tool appears, no later tool may start eager execution.
+		// This mirrors the final group execution order and preserves serial side effects.
+		let eagerExecutionBlocked = false;
 		// Track which tool_results have already been yielded during streaming
 		const yieldedToolResults = new Set<string>();
 		// Track tool calls whose input was broken (output cut off mid-stream)
@@ -775,8 +797,14 @@ export async function* agentLoop(
 								} satisfies ContentBlock,
 							};
 
-							// Start eager execution (same as the streaming stop path)
-							if (!earlyExecMap.has(tu.toolUseId)) {
+							// Start eager execution (same as the streaming stop path).
+							// Skip after a strict-serial barrier — those tools must execute
+							// in final group order after preceding tools complete.
+							if (
+								!earlyExecMap.has(tu.toolUseId) &&
+								!isStrictSerial(tu) &&
+								!eagerExecutionBlocked
+							) {
 								const execPromise = executeTool(tu, config).catch(
 									(err): ToolExecResult => ({
 										output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
@@ -787,6 +815,7 @@ export async function* agentLoop(
 								execPromise.then((r) => settledResults.set(tu.toolUseId, r));
 								earlyExecMap.set(tu.toolUseId, execPromise);
 							}
+							if (isStrictSerial(tu)) eagerExecutionBlocked = true;
 
 							yield {
 								type: "tool_call",
@@ -1041,15 +1070,20 @@ export async function* agentLoop(
 									// create an unhandled rejection; the error surfaces as isError.
 									// The .then() populates settledResults synchronously so the
 									// streaming loop can drain completed results without awaiting.
-									const execPromise = executeTool(tu, config).catch(
-										(err): ToolExecResult => ({
-											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-											isError: true,
-											durationMs: 0,
-										}),
-									);
-									execPromise.then((r) => settledResults.set(id, r));
-									earlyExecMap.set(id, execPromise);
+									// Skip after a strict-serial barrier — those tools must execute
+									// in final group order after preceding tools complete.
+									if (!isStrictSerial(tu) && !eagerExecutionBlocked) {
+										const execPromise = executeTool(tu, config).catch(
+											(err): ToolExecResult => ({
+												output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+												isError: true,
+												durationMs: 0,
+											}),
+										);
+										execPromise.then((r) => settledResults.set(id, r));
+										earlyExecMap.set(id, execPromise);
+									}
+									if (isStrictSerial(tu)) eagerExecutionBlocked = true;
 
 									// Notify frontend the tool has started
 									yield {
@@ -1106,10 +1140,9 @@ export async function* agentLoop(
 					if (parsed.credentialId) credentialId = parsed.credentialId;
 
 					if (parsed.reasoning) {
-						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+						const itemKey = reasoningBlockKey(parsed);
 						const existing = reasoningBlockMap.get(itemKey);
-						// Separator prefix for merged reasoning segments
-						// (e.g. interleaved thinking blocks from Anthropic).
+						// Separator prefix for multiple delimited reasoning segments that share a provider item.
 						let prefix = "";
 						if (existing) {
 							if (existing._needsSeparator && existing.text) {
@@ -1141,7 +1174,7 @@ export async function* agentLoop(
 						// or Anthropic thinking block stop with signature).
 						// Update the stored metadata without emitting a streaming event.
 						// Mark the entry so the next reasoning delta inserts a separator.
-						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
+						const itemKey = reasoningBlockKey(parsed);
 						const existing = reasoningBlockMap.get(itemKey);
 						if (existing) {
 							existing.providerMetadata = parsed.reasoningMetadata;
@@ -1161,6 +1194,20 @@ export async function* agentLoop(
 								outputIndex: parsed.reasoningOutputIndex,
 							});
 						}
+					}
+					if (parsed.redactedThinking) {
+						redactedThinkingBlocks.push({
+							data: parsed.redactedThinking.data,
+							outputIndex: parsed.redactedThinking.outputIndex,
+						});
+						yield {
+							type: "block_complete",
+							block: {
+								type: "redacted_thinking",
+								data: parsed.redactedThinking.data,
+								outputIndex: parsed.redactedThinking.outputIndex,
+							},
+						};
 					}
 					if (parsed.contextUsagePercentage != null) {
 						receivedUsage = true;
@@ -1219,7 +1266,9 @@ export async function* agentLoop(
 							cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
 							cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
 						};
-						const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+						const contextWindow =
+							parsed.usage.contextWindow ??
+							getModelContextWindow(effectiveModel, effectiveProvider);
 						if (contextWindow) {
 							const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
 							requestContextPercent = Math.min(percentage, 100);
@@ -1686,6 +1735,7 @@ export async function* agentLoop(
 					undefined,
 					collectCompletedImageGenerations(imageGenAccum),
 					textOutputIndex,
+					redactedThinkingBlocks,
 				);
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
 					toolNames: orphanedNames,
@@ -1773,11 +1823,17 @@ export async function* agentLoop(
 
 		// Group tool calls into runs: consecutive parallel-safe tools form a batch,
 		// everything else executes serially (one tool per group).
+		// strict-serial tools always form their own group.
 		const groups: AgentToolUse[][] = [];
 		for (const tu of toolUses) {
-			const isParallel = PARALLEL_TOOLS.has(tu.name);
+			const isParallel = PARALLEL_TOOLS.has(tu.name) && !isStrictSerial(tu);
 			const lastGroup = groups[groups.length - 1];
-			if (isParallel && lastGroup && PARALLEL_TOOLS.has(lastGroup[0].name)) {
+			if (
+				isParallel &&
+				lastGroup &&
+				PARALLEL_TOOLS.has(lastGroup[0].name) &&
+				!isStrictSerial(lastGroup[0])
+			) {
 				lastGroup.push(tu);
 			} else {
 				groups.push([tu]);
@@ -1980,6 +2036,7 @@ export async function* agentLoop(
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
 				textOutputIndex,
+				redactedThinkingBlocks,
 			);
 			yield { type: "turn_complete", turnIndex };
 			return;
@@ -2007,6 +2064,7 @@ export async function* agentLoop(
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
 				textOutputIndex,
+				redactedThinkingBlocks,
 			);
 
 			// Inject a user-side reminder so the model knows what happened and
@@ -2028,6 +2086,7 @@ export async function* agentLoop(
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
 				textOutputIndex,
+				redactedThinkingBlocks,
 			);
 		}
 

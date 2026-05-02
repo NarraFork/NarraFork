@@ -264,8 +264,16 @@ export interface TreeMessage {
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	turnUsageJson?: {
+		prompt_tokens?: number;
 		input_tokens?: number;
 		output_tokens?: number;
+		cached_input_tokens?: number;
+		cache_creation_input_tokens?: number;
+		cache_creation_5m_tokens?: number;
+		cache_creation_1h_tokens?: number;
+		reasoning_tokens?: number;
+		context_window?: number;
+		is_estimated?: boolean;
 		[key: string]: unknown;
 	} | null;
 	contextPercent?: number | null;

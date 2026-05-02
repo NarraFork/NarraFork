@@ -68,6 +68,22 @@ function findStreamingInsertIndex(
 	return blocks.length;
 }
 
+function numericUsageField(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number | undefined {
+	const promptTokens = numericUsageField(turnUsage.prompt_tokens);
+	if (promptTokens != null) return promptTokens;
+	const inputTokens = numericUsageField(turnUsage.input_tokens);
+	if (inputTokens == null) return undefined;
+	return (
+		inputTokens +
+		(numericUsageField(turnUsage.cached_input_tokens) ?? 0) +
+		(numericUsageField(turnUsage.cache_creation_input_tokens) ?? 0)
+	);
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -532,7 +548,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Restore promptTokens / contextWindow / isEstimated from turnUsageJson
 				const tu = m.turnUsageJson as Record<string, unknown> | null | undefined;
 				if (tu) {
-					if (tu.input_tokens != null) patch.promptTokens = tu.input_tokens as number;
+					const restoredPromptTokens = promptTokensFromTurnUsage(tu);
+					if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
 					if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
 					patch.isEstimated = !!tu.is_estimated;
 				} else if (m.tokensIn != null) {

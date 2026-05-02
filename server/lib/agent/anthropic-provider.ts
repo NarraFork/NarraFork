@@ -4,7 +4,7 @@ import { generateId } from "../id";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
-import { parseModelId, settings } from "../settings";
+import { getModelContextWindow, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
@@ -337,22 +337,24 @@ function mapEffortParam(
 
 // === SSE event types ===
 
+type AnthropicUsagePayload = {
+	input_tokens?: number | null;
+	output_tokens?: number | null;
+	cache_read_input_tokens?: number | null;
+	cache_creation_input_tokens?: number | null;
+	cache_creation?: {
+		ephemeral_5m_input_tokens?: number | null;
+		ephemeral_1h_input_tokens?: number | null;
+	};
+};
+
 interface AnthropicStreamEvent {
 	type: string;
 	index?: number;
 	message?: {
 		id?: string;
 		model?: string;
-		usage?: {
-			input_tokens?: number;
-			output_tokens?: number;
-			cache_read_input_tokens?: number;
-			cache_creation_input_tokens?: number;
-			cache_creation?: {
-				ephemeral_5m_input_tokens?: number;
-				ephemeral_1h_input_tokens?: number;
-			};
-		};
+		usage?: AnthropicUsagePayload;
 	};
 	content_block?: {
 		type?: string;
@@ -362,6 +364,7 @@ interface AnthropicStreamEvent {
 		input?: Record<string, unknown>;
 		thinking?: string;
 		signature?: string;
+		data?: string;
 		// server_tool_use / web_search_tool_result fields
 		tool_use_id?: string;
 		content?:
@@ -382,16 +385,7 @@ interface AnthropicStreamEvent {
 		thinking?: string;
 		signature?: string;
 	};
-	usage?: {
-		input_tokens?: number;
-		output_tokens?: number;
-		cache_read_input_tokens?: number;
-		cache_creation_input_tokens?: number;
-		cache_creation?: {
-			ephemeral_5m_input_tokens?: number;
-			ephemeral_1h_input_tokens?: number;
-		};
-	};
+	usage?: AnthropicUsagePayload;
 	error?: { type?: string; message?: string };
 }
 
@@ -411,6 +405,134 @@ interface ServerToolAccumEntry {
 	args: string;
 	/** Extracted query from accumulated JSON */
 	query?: string;
+}
+
+/** Cumulative Anthropic usage snapshot, mirroring Claude Code's updateUsage semantics. */
+interface AnthropicUsageAccum {
+	inputTokens: number;
+	outputTokens: number;
+	cachedInputTokens: number;
+	cacheCreationInputTokens: number;
+	cacheCreation5mTokens: number;
+	cacheCreation1hTokens: number;
+}
+
+function createAnthropicUsageAccum(): AnthropicUsageAccum {
+	return {
+		inputTokens: 0,
+		outputTokens: 0,
+		cachedInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		cacheCreation5mTokens: 0,
+		cacheCreation1hTokens: 0,
+	};
+}
+
+function isPositiveTokenCount(value: number | null | undefined): value is number {
+	return value != null && value > 0;
+}
+
+/**
+ * Update cumulative usage from Anthropic streaming events.
+ *
+ * Anthropic sends cumulative totals, not deltas. Claude Code also guards input/cache
+ * fields with `> 0` because `message_delta` may explicitly send zeroes for those
+ * fields; those zeroes must not erase the real values from `message_start`.
+ */
+function updateAnthropicUsageAccum(
+	usage: AnthropicUsageAccum,
+	partUsage: AnthropicUsagePayload | undefined,
+): void {
+	if (!partUsage) return;
+	if (isPositiveTokenCount(partUsage.input_tokens)) usage.inputTokens = partUsage.input_tokens;
+	if (isPositiveTokenCount(partUsage.cache_read_input_tokens)) {
+		usage.cachedInputTokens = partUsage.cache_read_input_tokens;
+	}
+	if (isPositiveTokenCount(partUsage.cache_creation_input_tokens)) {
+		usage.cacheCreationInputTokens = partUsage.cache_creation_input_tokens;
+	}
+	if (partUsage.output_tokens != null) usage.outputTokens = partUsage.output_tokens;
+
+	const cacheCreation = partUsage.cache_creation;
+	if (cacheCreation?.ephemeral_5m_input_tokens != null) {
+		usage.cacheCreation5mTokens = cacheCreation.ephemeral_5m_input_tokens;
+	}
+	if (cacheCreation?.ephemeral_1h_input_tokens != null) {
+		usage.cacheCreation1hTokens = cacheCreation.ephemeral_1h_input_tokens;
+	}
+	if (
+		partUsage.cache_creation_input_tokens == null &&
+		(cacheCreation?.ephemeral_5m_input_tokens != null ||
+			cacheCreation?.ephemeral_1h_input_tokens != null)
+	) {
+		usage.cacheCreationInputTokens = usage.cacheCreation5mTokens + usage.cacheCreation1hTokens;
+	}
+}
+
+function anthropicPromptFootprintTokens(usage: AnthropicUsageAccum): number {
+	return usage.inputTokens + usage.cachedInputTokens + usage.cacheCreationInputTokens;
+}
+
+function parsedUsageFromAnthropicAccum(
+	usage: AnthropicUsageAccum,
+	contextWindow?: number | null,
+): ParsedStreamEvent {
+	return {
+		usage: {
+			promptTokens: anthropicPromptFootprintTokens(usage),
+			inputTokens: usage.inputTokens,
+			completionTokens: usage.outputTokens,
+			cachedInputTokens: usage.cachedInputTokens,
+			cacheCreationInputTokens: usage.cacheCreationInputTokens,
+			cacheCreation5mTokens: usage.cacheCreation5mTokens,
+			cacheCreation1hTokens: usage.cacheCreation1hTokens,
+			...(contextWindow != null && { contextWindow }),
+		},
+	};
+}
+
+function promptTokensFromAnthropicPayload(
+	usage: AnthropicUsagePayload | undefined,
+): number | undefined {
+	if (!usage) return undefined;
+	const inputTokens = usage.input_tokens ?? 0;
+	const cacheRead = usage.cache_read_input_tokens ?? 0;
+	const cacheCreation =
+		usage.cache_creation_input_tokens ??
+		(usage.cache_creation?.ephemeral_5m_input_tokens ?? 0) +
+			(usage.cache_creation?.ephemeral_1h_input_tokens ?? 0);
+	const total = inputTokens + cacheRead + cacheCreation;
+	return total > 0 ? total : undefined;
+}
+
+function supportsOfficialAnthropic1mContext(model: string): boolean {
+	const lower = parseModelId(model).model.toLowerCase();
+	return (
+		lower.includes("claude-sonnet-4") || lower.includes("opus-4-6") || lower.includes("opus-4.6")
+	);
+}
+
+function getAnthropicEffectiveContextWindow(
+	model: string,
+	config: AnthropicProviderConfig,
+): number | null {
+	const configuredWindow = getModelContextWindow(model, config.prefix);
+	if (config.officialApi && supportsOfficialAnthropic1mContext(model)) {
+		return Math.max(configuredWindow ?? 0, 1_000_000);
+	}
+	return configuredWindow;
+}
+
+function calculateAnthropicContextPercent(
+	usage: AnthropicUsagePayload | undefined,
+	model: string,
+	config: AnthropicProviderConfig,
+): number | undefined {
+	const promptTokens = promptTokensFromAnthropicPayload(usage);
+	if (promptTokens == null) return undefined;
+	const contextWindow = getAnthropicEffectiveContextWindow(model, config);
+	if (!contextWindow) return undefined;
+	return Math.min((promptTokens / contextWindow) * 100, 100);
 }
 
 /**
@@ -876,7 +998,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error("Anthropic API returned no body");
 		}
 
-		yield* parseAnthropicSSEStream(response.body);
+		yield* parseAnthropicSSEStream(
+			response.body,
+			getAnthropicEffectiveContextWindow(model, this.config),
+		);
 		if (responseTextPromise) {
 			const bodyText = await responseTextPromise;
 			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
@@ -965,6 +1090,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
+		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
 	): void {
 		const h = history as AnthropicMessage[];
 
@@ -984,10 +1110,19 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
+		if (redactedThinkingBlocks) {
+			for (const rb of redactedThinkingBlocks) {
+				indexed.push({
+					part: { type: "redacted_thinking", data: rb.data },
+					outputIndex: rb.outputIndex ?? indexed.length,
+				});
+			}
+		}
+
 		if (text) {
 			// Use the real textOutputIndex when available; otherwise place text
 			// after reasoning blocks but before tool_use blocks.
-			const fallbackIdx = reasoningBlocks?.length ?? 0;
+			const fallbackIdx = indexed.length;
 			indexed.push({
 				part: { type: "text", text },
 				outputIndex: textOutputIndex ?? fallbackIdx,
@@ -996,7 +1131,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		for (let i = 0; i < toolUses.length; i++) {
 			const tu = toolUses[i];
-			const fallbackIdx = (reasoningBlocks?.length ?? 0) + (text ? 1 : 0) + i;
+			const fallbackIdx = indexed.length;
 			indexed.push({
 				part: {
 					type: "tool_use",
@@ -1077,12 +1212,7 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const json = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
-			usage?: {
-				input_tokens?: number;
-				output_tokens?: number;
-				cache_read_input_tokens?: number;
-				cache_creation_input_tokens?: number;
-			};
+			usage?: AnthropicUsagePayload;
 		};
 
 		const resultText =
@@ -1091,7 +1221,10 @@ export class AnthropicProvider implements ProviderAdapter {
 				.map((c) => c.text ?? "")
 				.join("") ?? "";
 
-		return { text: resultText, contextPercent: undefined };
+		return {
+			text: resultText,
+			contextPercent: calculateAnthropicContextPercent(json.usage, bareModel, this.config),
+		};
 	}
 
 	async generateWithHistory(
@@ -1156,8 +1289,9 @@ export class AnthropicProvider implements ProviderAdapter {
 
 // === SSE stream parser ===
 
-async function* parseAnthropicSSEStream(
+export async function* parseAnthropicSSEStream(
 	body: ReadableStream<Uint8Array>,
+	contextWindow?: number | null,
 ): AsyncGenerator<ParsedStreamEvent> {
 	const decoder = new TextDecoder();
 	let buffer = "";
@@ -1166,7 +1300,9 @@ async function* parseAnthropicSSEStream(
 	// Tool call accumulators keyed by content block index
 	const toolAccum = new Map<number, ToolAccumEntry>();
 	const thinkingAccum = new Map<number, ThinkingAccumEntry>();
+	const redactedThinkingAccum = new Map<number, string>();
 	const serverToolAccum = new Map<number, ServerToolAccumEntry>();
+	const usageAccum = createAnthropicUsageAccum();
 
 	// Stream integrity tracking
 	let receivedMessageStart = false;
@@ -1236,7 +1372,15 @@ async function* parseAnthropicSSEStream(
 				if (event.type === "message_start") receivedMessageStart = true;
 				if (event.type === "content_block_start") receivedAnyContentBlock = true;
 
-				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
+				const events = parseAnthropicEvent(
+					event,
+					toolAccum,
+					thinkingAccum,
+					redactedThinkingAccum,
+					serverToolAccum,
+					usageAccum,
+					contextWindow,
+				);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -1253,7 +1397,15 @@ async function* parseAnthropicSSEStream(
 				if (event.type === "message_start") receivedMessageStart = true;
 				if (event.type === "content_block_start") receivedAnyContentBlock = true;
 
-				const events = parseAnthropicEvent(event, toolAccum, thinkingAccum, serverToolAccum);
+				const events = parseAnthropicEvent(
+					event,
+					toolAccum,
+					thinkingAccum,
+					redactedThinkingAccum,
+					serverToolAccum,
+					usageAccum,
+					contextWindow,
+				);
 				for (const evt of events) {
 					yield evt;
 				}
@@ -1298,7 +1450,10 @@ function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
 	toolAccum: Map<number, ToolAccumEntry>,
 	thinkingAccum: Map<number, ThinkingAccumEntry>,
+	redactedThinkingAccum: Map<number, string>,
 	serverToolAccum: Map<number, ServerToolAccumEntry>,
+	usageAccum: AnthropicUsageAccum,
+	contextWindow?: number | null,
 ): ParsedStreamEvent[] {
 	const type = event.type;
 	if (!type) return [];
@@ -1309,24 +1464,9 @@ function parseAnthropicEvent(
 		if (event.message.id) {
 			results.push({ messageId: event.message.id });
 		}
-		if (event.message.usage?.input_tokens != null) {
-			const cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
-			const cacheCreation = event.message.usage.cache_creation_input_tokens ?? 0;
-			const cacheCreation5m = event.message.usage.cache_creation?.ephemeral_5m_input_tokens ?? 0;
-			const cacheCreation1h = event.message.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-			results.push({
-				usage: {
-					// Total prompt footprint in context window (uncached + cache read + cache write)
-					promptTokens: event.message.usage.input_tokens + cacheRead + cacheCreation,
-					// Raw billed non-cache input tokens
-					inputTokens: event.message.usage.input_tokens,
-					completionTokens: event.message.usage.output_tokens,
-					cachedInputTokens: cacheRead,
-					cacheCreationInputTokens: cacheCreation,
-					cacheCreation5mTokens: cacheCreation5m,
-					cacheCreation1hTokens: cacheCreation1h,
-				},
-			});
+		if (event.message.usage) {
+			updateAnthropicUsageAccum(usageAccum, event.message.usage);
+			results.push(parsedUsageFromAnthropicAccum(usageAccum, contextWindow));
 		}
 		return results;
 	}
@@ -1389,6 +1529,13 @@ function parseAnthropicEvent(
 			thinkingAccum.set(idx, { signature: "", blockIndex: idx });
 			return [];
 		}
+		// Redacted thinking arrives as a complete content block. Match Claude Code's
+		// contentBlocks[index] flow by waiting for content_block_stop before emitting
+		// the completed block for persistence/replay.
+		if (block.type === "redacted_thinking" && block.data) {
+			redactedThinkingAccum.set(idx, block.data);
+			return [];
+		}
 		return [];
 	}
 
@@ -1403,7 +1550,13 @@ function parseAnthropicEvent(
 
 		// Thinking delta (extended thinking)
 		if (event.delta.type === "thinking_delta" && event.delta.thinking != null) {
-			return [{ reasoning: event.delta.thinking, reasoningOutputIndex: idx }];
+			return [
+				{
+					reasoning: event.delta.thinking,
+					reasoningMetadata: { anthropic: { blockIndex: idx } },
+					reasoningOutputIndex: idx,
+				},
+			];
 		}
 
 		// Signature delta — assign (Anthropic sends one per thinking block)
@@ -1482,12 +1635,18 @@ function parseAnthropicEvent(
 				return [
 					{
 						reasoningMetadata: {
-							anthropic: { signature: thinkAcc.signature },
+							anthropic: { blockIndex: thinkAcc.blockIndex, signature: thinkAcc.signature },
 						},
 						reasoningOutputIndex: thinkAcc.blockIndex,
 					},
 				];
 			}
+		}
+
+		const redactedData = redactedThinkingAccum.get(idx);
+		if (redactedData) {
+			redactedThinkingAccum.delete(idx);
+			return [{ redactedThinking: { data: redactedData, outputIndex: idx } }];
 		}
 		return [];
 	}
@@ -1504,29 +1663,11 @@ function parseAnthropicEvent(
 			}
 		}
 
-		// Usage update
-		if (event.usage?.output_tokens != null) {
-			const cacheRead = event.usage.cache_read_input_tokens ?? 0;
-			const cacheCreation = event.usage.cache_creation_input_tokens ?? 0;
-			const cacheCreation5m = event.usage.cache_creation?.ephemeral_5m_input_tokens ?? 0;
-			const cacheCreation1h = event.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-			// message_delta typically only carries output_tokens — input_tokens is absent.
-			// Only include prompt/input/cache figures when input_tokens is actually present
-			// to avoid overwriting the accurate value from message_start with 0.
-			const inputTokens = event.usage.input_tokens;
-			results.push({
-				usage: {
-					...(inputTokens != null && {
-						promptTokens: inputTokens + cacheRead + cacheCreation,
-						inputTokens,
-						cachedInputTokens: cacheRead,
-						cacheCreationInputTokens: cacheCreation,
-						cacheCreation5mTokens: cacheCreation5m,
-						cacheCreation1hTokens: cacheCreation1h,
-					}),
-					completionTokens: event.usage.output_tokens,
-				},
-			});
+		// Usage update. Anthropic streaming usage is cumulative; preserve input/cache
+		// values from message_start while applying the final output_tokens from delta.
+		if (event.usage) {
+			updateAnthropicUsageAccum(usageAccum, event.usage);
+			results.push(parsedUsageFromAnthropicAccum(usageAccum, contextWindow));
 		}
 
 		// Stop reason — always propagate to loop layer

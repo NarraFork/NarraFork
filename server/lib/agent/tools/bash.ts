@@ -117,6 +117,11 @@ export const bashTool: ToolDefinition = {
 					"Set to true to run this command in the background. Returns immediately with a task ID. Use AwaitBackgroundTask to check status or get results.",
 				type: "boolean",
 			},
+			strict_serial: {
+				description:
+					"Set to true to execute this command strictly serially — it will wait for the previous tool to complete before starting. Default is false.",
+				type: "boolean",
+			},
 		},
 		required: ["command"],
 		additionalProperties: false,
@@ -143,6 +148,12 @@ export const bashTool: ToolDefinition = {
 			.describe(
 				"Set to true to run this command in the background. Returns immediately with a task ID. Use AwaitBackgroundTask to check status or get results.",
 			),
+		strict_serial: z
+			.boolean()
+			.optional()
+			.describe(
+				"Set to true to execute this command strictly serially — it will wait for the previous tool to complete before starting. Default is false.",
+			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { command, timeout, workdir, description, run_in_background } = args as {
@@ -151,6 +162,7 @@ export const bashTool: ToolDefinition = {
 			workdir?: string;
 			description?: string;
 			run_in_background?: boolean;
+			strict_serial?: boolean;
 		};
 
 		if (!command) {

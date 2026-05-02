@@ -43,6 +43,55 @@ const HIGHLIGHT_STYLE: React.CSSProperties = {
 	borderRadius: "var(--mantine-radius-sm)",
 };
 
+function usageNumber(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function usageNumberOrNull(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function getPromptTokenFootprint(turnUsageJson: NarratorMsg["turnUsageJson"]): number | null {
+	const tu = turnUsageJson as Record<string, unknown> | null | undefined;
+	if (!tu) return null;
+	const promptTokens = usageNumberOrNull(tu.prompt_tokens);
+	if (promptTokens != null) return promptTokens;
+	const inputTokens = usageNumberOrNull(tu.input_tokens);
+	if (inputTokens == null) return null;
+	return (
+		inputTokens + usageNumber(tu.cached_input_tokens) + usageNumber(tu.cache_creation_input_tokens)
+	);
+}
+
+function formatTurnUsage(turnUsageJson: NarratorMsg["turnUsageJson"]): string | null {
+	const tu = turnUsageJson as Record<string, unknown> | null | undefined;
+	if (!tu) return null;
+	const inputTokens = usageNumber(tu.input_tokens);
+	const outputTokens = usageNumber(tu.output_tokens);
+	const promptTokens = getPromptTokenFootprint(turnUsageJson) ?? inputTokens;
+	const cachedTokens = usageNumber(tu.cached_input_tokens);
+	const cacheCreationTokens = usageNumber(tu.cache_creation_input_tokens);
+	const cache5mTokens = usageNumber(tu.cache_creation_5m_tokens);
+	const cache1hTokens = usageNumber(tu.cache_creation_1h_tokens);
+	const reasoningTokens = usageNumber(tu.reasoning_tokens);
+
+	const parts = [
+		`Σ ${promptTokens.toLocaleString()} ctx`,
+		`${inputTokens.toLocaleString()} in`,
+		`${outputTokens.toLocaleString()} out`,
+	];
+	if (cachedTokens > 0) parts.push(`${cachedTokens.toLocaleString()} cache hit`);
+	if (cacheCreationTokens > 0) {
+		const detail =
+			cache5mTokens > 0 || cache1hTokens > 0
+				? ` (${cache5mTokens.toLocaleString()} 5m / ${cache1hTokens.toLocaleString()} 1h)`
+				: "";
+		parts.push(`${cacheCreationTokens.toLocaleString()} cache write${detail}`);
+	}
+	if (reasoningTokens > 0) parts.push(`${reasoningTokens.toLocaleString()} reasoning`);
+	return parts.join(" · ");
+}
+
 export function renderToolRun(
 	items: ToolRunItem[],
 	runKey: string,
@@ -235,6 +284,9 @@ export function renderTreeMessages(
 						_blockOriginalIndices: visibleBlockIndices,
 					}
 				: targetMsg;
+		const promptTokenFootprint =
+			getPromptTokenFootprint(targetMsg.turnUsageJson) ?? targetMsg.tokensIn ?? null;
+		const turnUsageSummary = formatTurnUsage(targetMsg.turnUsageJson);
 
 		const content = (
 			<Box
@@ -248,10 +300,10 @@ export function renderTreeMessages(
 			>
 				{showTokenUsage &&
 					targetMsg.role === "assistant" &&
-					(targetMsg.tokensIn != null || targetMsg.meterUsage != null) && (
+					(promptTokenFootprint != null || targetMsg.meterUsage != null) && (
 						<Text size="xs" c="dimmed" ta="right" pr="sm" mb={2}>
-							{targetMsg.tokensIn != null
-								? `↑ ${(targetMsg.tokensIn as number).toLocaleString()}`
+							{promptTokenFootprint != null
+								? `↑ ${promptTokenFootprint.toLocaleString()}`
 								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
 						</Text>
 					)}
@@ -281,27 +333,16 @@ export function renderTreeMessages(
 					hasChapter={hasChapter}
 				/>
 				{showTokenUsage &&
-					(targetMsg.turnUsageJson != null ||
-						(targetMsg.meterUsage != null && targetMsg.tokensIn == null)) && (
+					(turnUsageSummary != null ||
+						(targetMsg.meterUsage != null && promptTokenFootprint == null)) && (
 						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
-							{targetMsg.turnUsageJson != null ? (
-								<>
-									Σ{" "}
-									{(
-										(targetMsg.turnUsageJson as Record<string, number>).input_tokens ?? 0
-									).toLocaleString()}{" "}
-									in ·{" "}
-									{(
-										(targetMsg.turnUsageJson as Record<string, number>).output_tokens ?? 0
-									).toLocaleString()}{" "}
-									out
-									{targetMsg.costUsd != null &&
-										(targetMsg.costUsd as number) > 0 &&
-										` · $${(targetMsg.costUsd as number).toFixed(4)}`}
-								</>
-							) : (
-								`${(targetMsg.meterUsage as number).toFixed(2)} credits`
-							)}
+							{turnUsageSummary != null
+								? `${turnUsageSummary}${
+										targetMsg.costUsd != null && (targetMsg.costUsd as number) > 0
+											? ` · $${(targetMsg.costUsd as number).toFixed(4)}`
+											: ""
+									}`
+								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
 						</Text>
 					)}
 			</Box>

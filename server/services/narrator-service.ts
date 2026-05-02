@@ -799,7 +799,8 @@ export const narratorService = {
 				if (!msg) throw new ValidationError("Fork message not found");
 				msgId = msg.id;
 			} else {
-				msgId = directMessageId!;
+				if (!directMessageId) throw new ValidationError("Fork message not found");
+				msgId = directMessageId;
 			}
 
 			const forkRef = await db.query.narratorMessageRefs.findFirst({
@@ -1097,6 +1098,7 @@ export const narratorService = {
 	isMessageSharedByMultipleNarrators:
 		narratorPersistence.isMessageSharedByMultipleNarrators.bind(narratorPersistence),
 	getToolCallByToolUseId: narratorPersistence.getToolCallByToolUseId.bind(narratorPersistence),
+	copyOnWriteMessage: narratorPersistence.copyOnWriteMessage.bind(narratorPersistence),
 	copyOnWriteToolCallMessage:
 		narratorPersistence.copyOnWriteToolCallMessage.bind(narratorPersistence),
 	overwriteToolCallInput: narratorPersistence.overwriteToolCallInput.bind(narratorPersistence),

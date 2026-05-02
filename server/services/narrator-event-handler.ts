@@ -608,7 +608,12 @@ export async function processEvent(
 									})();
 						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					} else if (block.type === "reasoning") {
-						const idx = snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
+						const idx =
+							block.outputIndex != null
+								? snap.streamingBlocks.findIndex(
+										(b) => b.type === "reasoning" && b.outputIndex === block.outputIndex,
+									)
+								: snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
 						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					} else if (block.type === "image_generation") {
 						const idx = snap.streamingBlocks.findIndex(
@@ -697,6 +702,12 @@ export async function processEvent(
 						outputIndex: block.outputIndex,
 					});
 				}
+			} else if (block.type === "redacted_thinking") {
+				await narratorService.appendBlockToMessage(partialId, narratorId, {
+					type: "redacted_thinking",
+					data: block.data,
+					outputIndex: block.outputIndex,
+				});
 			} else if (block.type === "tool_use") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
 					type: "tool_use",

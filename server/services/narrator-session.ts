@@ -2651,17 +2651,15 @@ export async function editAndRegenerate(
 		});
 	}
 
-	await db
-		.update(narratorMessages)
-		.set({
-			contentText: newContent,
-			contentJson: newContentJson,
-		})
-		.where(eq(narratorMessages.id, messageId));
+	const privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
+		contentText: newContent,
+		contentJson: newContentJson,
+	});
 
-	// Broadcast the updated message
+	// Broadcast the updated message.  If copy-on-write changed the message ID,
+	// force a reload so the client replaces the old shared row with the private copy.
 	const updatedMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
+		where: eq(narratorMessages.id, privateMessageId),
 	});
 	if (updatedMsg) {
 		broadcastToNarrator(narratorId, {
@@ -2669,10 +2667,16 @@ export async function editAndRegenerate(
 			narratorId,
 			message: updatedMsg,
 		});
+		if (privateMessageId !== messageId) {
+			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+		}
 	}
 
 	// Delete everything after this message
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
+		narratorId,
+		privateMessageId,
+	);
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",

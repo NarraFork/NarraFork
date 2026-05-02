@@ -507,6 +507,7 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
+			| { type: "redacted_thinking"; data: string; outputIndex?: number }
 			| {
 					type: "tool_use";
 					id: string;
@@ -544,6 +545,7 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
+			| { type: "redacted_thinking"; data: string; outputIndex?: number }
 			| {
 					type: "tool_use";
 					id: string;
@@ -1015,11 +1017,43 @@ export const narratorPersistence = {
 		});
 	},
 
-	async copyOnWriteToolCallMessage(
+	async copyOnWriteMessage(
 		narratorId: string,
 		messageId: string,
-		toolUseId: string,
+		overrides?: Partial<typeof narratorMessages.$inferInsert>,
 	): Promise<string> {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) throw new NotFoundError("Message", messageId);
+
+		const [refCount] = await db
+			.select({ count: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.messageId, messageId));
+		const isShared = (refCount?.count ?? 0) > 1;
+		if (!isShared) {
+			if (overrides && Object.keys(overrides).length > 0) {
+				await db.transaction(async (tx) => {
+					await tx
+						.update(narratorMessages)
+						.set(overrides)
+						.where(eq(narratorMessages.id, messageId));
+					await tx
+						.update(narrators)
+						.set({
+							messageVersion: sql`${narrators.messageVersion} + 1`,
+							updatedAt: new Date().toISOString(),
+						})
+						.where(eq(narrators.id, narratorId));
+				});
+			}
+			return messageId;
+		}
+
 		const newMessageId = generateId();
 		const now = new Date().toISOString();
 
@@ -1031,8 +1065,10 @@ export const narratorPersistence = {
 
 			await tx.insert(narratorMessages).values({
 				...original,
+				...overrides,
 				id: newMessageId,
-				createdAt: now,
+				narratorId,
+				createdAt: original.createdAt,
 			});
 
 			await tx
@@ -1045,22 +1081,49 @@ export const narratorPersistence = {
 					),
 				);
 
-			const originalTc = await tx.query.narratorToolCalls.findFirst({
-				where: and(
-					eq(narratorToolCalls.messageId, messageId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-				),
+			const originalToolCalls = await tx.query.narratorToolCalls.findMany({
+				where: eq(narratorToolCalls.messageId, messageId),
 			});
-			if (originalTc) {
-				await tx.insert(narratorToolCalls).values({
-					...originalTc,
-					id: generateId(),
-					messageId: newMessageId,
-				});
+			if (originalToolCalls.length > 0) {
+				await tx.insert(narratorToolCalls).values(
+					originalToolCalls.map((tc) => ({
+						...tc,
+						id: generateId(),
+						narratorId,
+						messageId: newMessageId,
+						createdAt: now,
+					})),
+				);
 			}
+
+			const narrator = await tx.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { forkMessageId: true, pruneBoundaryMessageId: true },
+			});
+			const narratorUpdates: Partial<typeof narrators.$inferInsert> = {};
+			if (narrator?.forkMessageId === messageId) narratorUpdates.forkMessageId = newMessageId;
+			if (narrator?.pruneBoundaryMessageId === messageId) {
+				narratorUpdates.pruneBoundaryMessageId = newMessageId;
+			}
+			await tx
+				.update(narrators)
+				.set({
+					...narratorUpdates,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
 		});
 
 		return newMessageId;
+	},
+
+	async copyOnWriteToolCallMessage(
+		narratorId: string,
+		messageId: string,
+		_toolUseId: string,
+	): Promise<string> {
+		return this.copyOnWriteMessage(narratorId, messageId);
 	},
 
 	async overwriteToolCallInput(toolUseId: string, input: Record<string, unknown>) {

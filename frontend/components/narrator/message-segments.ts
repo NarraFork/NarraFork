@@ -85,6 +85,7 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 				b.type === "tool_use" ||
 				b.type === "reasoning" ||
 				b.type === "thinking" ||
+				b.type === "redacted_thinking" ||
 				(b.type === "text" && !b.text?.trim()),
 		)
 	);
