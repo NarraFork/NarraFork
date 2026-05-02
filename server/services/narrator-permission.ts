@@ -20,13 +20,12 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
+import { isSubagentVariant } from "../lib/narrator-utils";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
-import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -851,26 +850,20 @@ function permissionModeRank(narrator: PermissionScopeNarrator | null | undefined
 				? (narrator.previousPermissionMode ?? "default")
 				: "readOnly"
 			: permMode;
-	if (effectiveMode === "dontAsk") return 0;
-	if (effectiveMode === "readOnly") return 1;
-	return 2;
-}
-
-async function variantScopeRank(variant: string | null | undefined): Promise<number> {
-	const subagentType = variant ? getSubagentType(variant) : null;
-	if (!subagentType) return 2;
-	if (subagentType === "explore" || subagentType === "plan" || subagentType === "review") return 1;
-	if (subagentType === "general") return 2;
-
-	const customDef = await customSubagentService.loadByName(subagentType).catch(() => null);
-	if (!customDef || customDef.toolAccess === "readOnly") return 1;
-	return 2;
-}
-
-async function narratorScopeRank(
-	narrator: PermissionScopeNarrator | null | undefined,
-): Promise<number> {
-	return Math.min(permissionModeRank(narrator), await variantScopeRank(narrator?.variant));
+	switch (effectiveMode) {
+		case "dontAsk":
+			return 0;
+		case "readOnly":
+			return 1;
+		case "default":
+			return 2;
+		case "acceptEdits":
+			return 3;
+		case "bypassPermissions":
+			return 4;
+		default:
+			return 2;
+	}
 }
 
 function sendSelectors(input: Record<string, unknown>): string[] {
@@ -960,9 +953,8 @@ async function shouldAutoAllowSendWithinScope(
 		if (!caller) return false;
 		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
 		if (targets.length === 0) return false;
-		const callerRank = await narratorScopeRank(caller);
-		const targetRanks = await Promise.all(targets.map((target) => narratorScopeRank(target)));
-		return targetRanks.every((rank) => rank <= callerRank);
+		const callerRank = permissionModeRank(caller);
+		return targets.every((target) => permissionModeRank(target) <= callerRank);
 	} catch {
 		return false;
 	}
