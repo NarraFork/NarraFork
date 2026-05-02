@@ -160,6 +160,13 @@ export interface ChatParams {
 	metadata?: { user_id: string };
 	/** Optional collector for persisting raw provider request/response dumps. */
 	requestDump?: ApiRequestDumpCollector;
+	/**
+	 * Called after the provider has successfully assembled a concrete request and is
+	 * about to hand it to the upstream transport.  The agent loop uses this marker
+	 * to distinguish a real empty upstream response from local request preparation
+	 * paths that completed without ever contacting the API.
+	 */
+	onRequestStart?: (info?: { credentialId?: string }) => void;
 }
 
 // === The adapter interface ===

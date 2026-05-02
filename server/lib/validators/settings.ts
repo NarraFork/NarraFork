@@ -61,6 +61,7 @@ export const updateUserPreferencesSchema = z.object({
 	showOutputStats: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
+	addSubagentToRecentTabs: z.boolean().optional(),
 	// Notification preferences
 	notifyOnDone: z.boolean().optional(),
 	notifyOnWaiting: z.boolean().optional(),

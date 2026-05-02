@@ -3,8 +3,10 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { logger } from "../lib/logger";
 import { getSubagentType, parseTraits } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { registerTaskAlias } from "./subagent-alias";
 import { isManualOverride, resolveManualOverride } from "./subagent-manual-override";
@@ -168,6 +170,7 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 	// 1. Create independent background AbortController
 	const bgAbort = new AbortController();
 	getBackgroundAbortControllers().set(subagentId, bgAbort);
+	backgroundTaskService.registerAbortController(subagentId, bgAbort);
 
 	// 2. Swap signal source: remove parent signal, add background signal
 	proxy.replaceSource(parentSignal, bgAbort.signal);
@@ -199,6 +202,22 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 		subagentId,
 		subNarrator.title ?? undefined,
 	);
+	await backgroundTaskService
+		.createAgentTask({
+			id: subagentId,
+			parentNarratorId: entry.parentNarratorId,
+			subagentNarratorId: subagentId,
+			subagentType: getSubagentType(subNarrator.variant) ?? "general",
+			toolUseId,
+			alias: detachAlias,
+			title: subNarrator.title ?? undefined,
+		})
+		.catch((err) => {
+			logger.warn("Failed to register detached background task in DB", {
+				subagentId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
 
 	// 5. Mark as detached (signals to runForegroundLoop)
 	entry.markDetached();

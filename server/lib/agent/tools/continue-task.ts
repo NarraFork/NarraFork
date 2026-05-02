@@ -23,7 +23,14 @@ export const continueTaskTool: ToolDefinition = {
 		const { continueSubagent, resolveTaskAlias } = await import(
 			"@server/services/narrator-subagent"
 		);
-		const resolvedId = resolveTaskAlias(ctx.narratorId, subagent_id);
+		let resolvedId = resolveTaskAlias(ctx.narratorId, subagent_id);
+
+		// If alias registry didn't resolve (returned raw input), try DB lookup
+		if (resolvedId === subagent_id) {
+			const { backgroundTaskService } = await import("@server/services/background-task-service");
+			const task = await backgroundTaskService.getByAlias(subagent_id, ctx.narratorId);
+			if (task) resolvedId = task.id;
+		}
 
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {

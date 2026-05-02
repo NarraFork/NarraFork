@@ -476,14 +476,26 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		);
 		return c.json(bashResult, 201);
 	}
+	let prePromptBashCommand: string | undefined;
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 		finalMessage = cmdResult.expandedPrompt;
 		commandText = cmdResult.rawCommand;
+		prePromptBashCommand = cmdResult.bashCommand;
 	}
 
 	// Extract model override from resolved command (if any)
 	const modelOverride =
 		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
+
+	// Running narrator: buffer the message for execution after the current turn.
+	// Commands that execute Bash before the prompt are intentionally not queued: the Bash
+	// command may have side effects, and executing it now would break the expected order
+	// if the prompt only runs after the current turn.
+	if (prePromptBashCommand && (narrator.status === "working" || narrator.status === "waiting")) {
+		throw new ValidationError(
+			"Commands with Run Bash first cannot be queued while the narrator is working. Please wait for the current turn to finish and run the command again.",
+		);
+	}
 
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "working" || narrator.status === "waiting") {
@@ -568,6 +580,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			throw new ValidationError("Message queue is full");
 		}
 		// Narrator not active in memory — fall through to normal send
+	}
+
+	if (prePromptBashCommand) {
+		await handleBashCommand(id, prePromptBashCommand, `/bash ${prePromptBashCommand}`, userId);
 	}
 
 	const locale = await getUserLanguage(userId);

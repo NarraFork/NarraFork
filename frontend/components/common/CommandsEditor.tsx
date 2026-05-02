@@ -33,6 +33,8 @@ export interface CommandDef {
 	name: string;
 	prompt: string;
 	description?: string;
+	runBashFirst?: boolean;
+	bashCommand?: string;
 	params?: CommandParamDef[];
 	modelOverride?: CommandModelOverrideDef;
 }
@@ -93,10 +95,12 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 
 		const updated = [...commands];
 		const cleanParams = (draft.params ?? []).filter((p) => p.name.trim());
+		const bashCommand = draft.bashCommand?.trim();
 		const entry: CommandDef = {
 			name,
 			prompt,
 			...(draft.description?.trim() ? { description: draft.description.trim() } : {}),
+			...(draft.runBashFirst && bashCommand ? { runBashFirst: true, bashCommand } : {}),
 			...(cleanParams.length > 0
 				? {
 						params: cleanParams.map((p) => ({
@@ -161,9 +165,15 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 									{cmd.prompt.slice(0, 100)}
 									{cmd.prompt.length > 100 ? "…" : ""}
 								</Text>
-								{cmd.params && cmd.params.length > 0 && (
+								{((cmd.params && cmd.params.length > 0) ||
+									(cmd.runBashFirst && cmd.bashCommand)) && (
 									<Group gap={4} mt={4}>
-										{cmd.params.map((p) => (
+										{cmd.runBashFirst && cmd.bashCommand && (
+											<Badge size="xs" variant="light" color="yellow">
+												{t("commandRunBashFirstBadge")}
+											</Badge>
+										)}
+										{cmd.params?.map((p) => (
 											<Badge key={p.name} size="xs" variant="light" color="indigo">
 												{p.name}
 											</Badge>
@@ -235,6 +245,35 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 							}}
 							size="xs"
 						/>
+
+						<Stack gap={4}>
+							<Switch
+								label={t("commandRunBashFirst")}
+								description={t("commandRunBashFirstDesc")}
+								size="xs"
+								checked={!!draft.runBashFirst}
+								onChange={(e) => {
+									const checked = e.currentTarget.checked;
+									setDraft((d) => ({ ...d, runBashFirst: checked }));
+								}}
+							/>
+							{draft.runBashFirst && (
+								<Textarea
+									label={t("commandBashCommand")}
+									placeholder={t("commandBashCommandPlaceholder")}
+									value={draft.bashCommand ?? ""}
+									onChange={(e) => {
+										const val = e.currentTarget.value;
+										setDraft((d) => ({ ...d, bashCommand: val }));
+									}}
+									autosize
+									minRows={2}
+									maxRows={8}
+									size="xs"
+									styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
+								/>
+							)}
+						</Stack>
 
 						{/* Parameters editor */}
 						<Stack gap={4}>
@@ -383,7 +422,11 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 							<Button
 								size="xs"
 								onClick={handleSave}
-								disabled={!draft.name.trim() || !draft.prompt.trim()}
+								disabled={
+									!draft.name.trim() ||
+									!draft.prompt.trim() ||
+									(!!draft.runBashFirst && !draft.bashCommand?.trim())
+								}
 							>
 								{t("commandSave")}
 							</Button>

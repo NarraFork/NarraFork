@@ -272,6 +272,8 @@
 	"commandSourceProject": "Project",
 	"commandSourceGlobalSkill": "Global Skill",
 	"commandSourceProjectSkill": "Project Skill",
+	"commandRunBashFirstBadge": "Bash first",
+	"commandBashPreview": "Bash command to run first",
 	"commandPreview": "Preview",
 	"showExpandedPrompt": "Show expanded prompt",
 	"hideExpandedPrompt": "Hide expanded prompt",

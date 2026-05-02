@@ -841,6 +841,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			}
 		}
 
+		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(
 			reqPath,
 			{

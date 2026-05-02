@@ -41,6 +41,7 @@ export const settingsApi = {
 			showOutputStats: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
+			addSubagentToRecentTabs: boolean;
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -95,6 +96,7 @@ export const settingsApi = {
 		showOutputStats?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
+		addSubagentToRecentTabs?: boolean;
 		// Notification preferences
 		notifyOnDone?: boolean;
 		notifyOnWaiting?: boolean;

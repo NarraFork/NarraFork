@@ -21,6 +21,8 @@ export interface ResolvedCommand {
 	prompt: string;
 	description?: string;
 	source: "user" | "project";
+	runBashFirst?: boolean;
+	bashCommand?: string;
 	params?: CommandParam[];
 	modelOverride?: CommandModelOverride;
 }
@@ -28,6 +30,7 @@ export interface ResolvedCommand {
 interface CommandResolveResult {
 	resolved: true;
 	expandedPrompt: string;
+	bashCommand?: string;
 	command: ResolvedCommand;
 	rawCommand: string;
 }
@@ -205,6 +208,14 @@ function parseCommandArgs(input: string, params: CommandParam[]): Record<string,
 	return result;
 }
 
+function replaceCommandPlaceholders(template: string, values: Record<string, string>): string {
+	let result = template;
+	for (const [key, value] of Object.entries(values)) {
+		result = result.replaceAll(`{{${key}}}`, value);
+	}
+	return result;
+}
+
 /**
  * Check if a prompt is a slash command and resolve it.
  * Returns the expanded prompt text if matched, or null.
@@ -251,20 +262,28 @@ export async function resolveCommand(
 	if (!cmd) return { resolved: false };
 
 	let expandedPrompt = cmd.prompt;
+	let expandedBashCommand = cmd.runBashFirst ? cmd.bashCommand : undefined;
 
 	if (cmd.params?.length) {
-		// Multi-param mode: parse positional args and substitute {{paramName}}
+		// Multi-param mode: parse positional args and substitute {{paramName}} / {{input}}
 		const args = parseCommandArgs(parsed.input, cmd.params);
 		if (args) {
-			for (const [key, value] of Object.entries(args)) {
-				expandedPrompt = expandedPrompt.replaceAll(`{{${key}}}`, value);
+			const values = { input: parsed.input, ...args };
+			expandedPrompt = replaceCommandPlaceholders(expandedPrompt, values);
+			if (expandedBashCommand) {
+				expandedBashCommand = replaceCommandPlaceholders(expandedBashCommand, values);
 			}
 		}
-	} else if (expandedPrompt.includes("{{input}}")) {
-		expandedPrompt = expandedPrompt.replaceAll("{{input}}", parsed.input);
-	} else if (parsed.input) {
-		// If no placeholder but user provided input, append it
-		expandedPrompt = `${expandedPrompt}\n\n${parsed.input}`;
+	} else {
+		if (expandedPrompt.includes("{{input}}")) {
+			expandedPrompt = expandedPrompt.replaceAll("{{input}}", parsed.input);
+		} else if (parsed.input) {
+			// If no placeholder but user provided input, append it
+			expandedPrompt = `${expandedPrompt}\n\n${parsed.input}`;
+		}
+		if (expandedBashCommand) {
+			expandedBashCommand = expandedBashCommand.replaceAll("{{input}}", parsed.input);
+		}
 	}
 
 	logger.debug("Resolved slash command", {
@@ -276,6 +295,7 @@ export async function resolveCommand(
 	return {
 		resolved: true,
 		expandedPrompt: expandedPrompt.trim(),
+		...(expandedBashCommand?.trim() ? { bashCommand: expandedBashCommand.trim() } : {}),
 		command: cmd,
 		rawCommand: prompt,
 	};

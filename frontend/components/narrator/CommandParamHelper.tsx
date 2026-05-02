@@ -62,10 +62,13 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 
 	const params = command.params ?? [];
 	const hasParams = params.length > 0;
-	const hasInputPlaceholder = !hasParams && command.prompt.includes("{{input}}");
+	const hasBashFirst = !!(command.runBashFirst && command.bashCommand);
+	const hasInputPlaceholder =
+		!hasParams &&
+		(command.prompt.includes("{{input}}") || command.bashCommand?.includes("{{input}}"));
 
-	// For commands with no params and no {{input}}, show nothing
-	const shouldShow = visible && (hasParams || hasInputPlaceholder);
+	// For commands with no params, no {{input}}, and no Bash pre-step, show nothing
+	const shouldShow = visible && (hasParams || hasInputPlaceholder || hasBashFirst);
 
 	const { args, currentIndex } = useMemo(
 		() => parseArgs(input, hasParams ? params : hasInputPlaceholder ? [{ name: "input" }] : []),
@@ -75,6 +78,13 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 	const preview = useMemo(
 		() => buildPreview(command.prompt, hasParams ? params : undefined, args),
 		[command.prompt, hasParams, params, args],
+	);
+	const bashPreview = useMemo(
+		() =>
+			command.bashCommand
+				? buildPreview(command.bashCommand, hasParams ? params : undefined, args)
+				: undefined,
+		[command.bashCommand, hasParams, params, args],
 	);
 
 	if (!shouldShow) return null;
@@ -100,8 +110,31 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 			}}
 		>
 			<Stack gap={0}>
+				{hasBashFirst && bashPreview && (
+					<ScrollArea.Autosize mah={80} p="xs">
+						<Group gap={6} mb={4}>
+							<Badge size="xs" variant="light" color="yellow">
+								{t("commandRunBashFirstBadge")}
+							</Badge>
+							<Text size="xs" c="dimmed" fw={600}>
+								{t("commandBashPreview")}
+							</Text>
+						</Group>
+						<Text
+							size="xs"
+							style={{ whiteSpace: "pre-wrap", fontFamily: "monospace", lineHeight: 1.5 }}
+						>
+							{bashPreview}
+						</Text>
+					</ScrollArea.Autosize>
+				)}
+
 				{/* Prompt preview */}
-				<ScrollArea.Autosize mah={120} p="xs">
+				<ScrollArea.Autosize
+					mah={120}
+					p="xs"
+					style={hasBashFirst ? { borderTop: "1px solid var(--mantine-color-dark-4)" } : undefined}
+				>
 					<Text size="xs" c="dimmed" fw={600} mb={4}>
 						{t("commandPreview")}
 					</Text>

@@ -573,21 +573,48 @@ export async function* agentLoop(
 		 *  running on the same iteration. */
 		let sawErrorEvent = false;
 		let requestDump: ApiRequestDumpCollector | undefined;
+		let requestStarted = false;
+		let requestStartPending = false;
 
-		/** Build an api_request_end event from current request tracking state. */
-		const buildRequestEnd = (errorMessage?: string): AgentEvent => ({
-			type: "api_request_end",
-			requestId,
-			credentialId,
-			usage: requestUsage,
-			ttftMs: requestTtftMs,
-			durationMs: Date.now() - requestStartTime,
-			contextPercent: requestContextPercent,
-			meterUsage: requestMeterUsage,
-			meterUnit: requestMeterUnit,
-			rawDump: requestDump?.snapshot(),
-			errorMessage,
-		});
+		const markRequestStarted = (info?: { credentialId?: string }) => {
+			if (info?.credentialId) {
+				credentialId = info.credentialId;
+			}
+			if (requestStarted) return;
+			requestStarted = true;
+			requestStartPending = true;
+			requestStartTime = Date.now();
+		};
+
+		function* flushRequestStart(): Generator<AgentEvent> {
+			if (!requestStartPending) return;
+			requestStartPending = false;
+			yield {
+				type: "api_request_start",
+				requestId,
+				provider: effectiveProvider,
+				model: effectiveModel,
+				credentialId,
+			};
+		}
+
+		function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+			if (!requestStarted) return;
+			yield* flushRequestStart();
+			yield {
+				type: "api_request_end",
+				requestId,
+				credentialId,
+				usage: requestUsage,
+				ttftMs: requestTtftMs,
+				durationMs: Date.now() - requestStartTime,
+				contextPercent: requestContextPercent,
+				meterUsage: requestMeterUsage,
+				meterUnit: requestMeterUnit,
+				rawDump: requestDump?.snapshot(),
+				errorMessage,
+			};
+		}
 
 		// ── Transient-error retry loop ──
 		// we can safely retry the exact same provider.chat() call with identical
@@ -635,9 +662,13 @@ export async function* agentLoop(
 			// misleading "empty response" message.  It is cleared below when
 			// the attempt produces meaningful content.
 
-			// Generate unique request ID for this API call (reset on each retry)
+			// Generate unique request ID for this provider attempt (reset on each retry).
+			// The actual request start time is set by markRequestStarted() after the
+			// provider has assembled a concrete request and is about to send it.
 			requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-			requestStartTime = Date.now();
+			requestStartTime = 0;
+			requestStarted = false;
+			requestStartPending = false;
 			requestTtftMs = undefined;
 			requestUsage = undefined;
 			requestContextPercent = undefined;
@@ -651,15 +682,6 @@ export async function* agentLoop(
 						model: effectiveModel,
 					})
 				: undefined;
-
-			// Emit API request start event
-			yield {
-				type: "api_request_start",
-				requestId,
-				provider: effectiveProvider,
-				model: effectiveModel,
-				credentialId,
-			};
 
 			try {
 				const stream = provider.chat({
@@ -676,10 +698,12 @@ export async function* agentLoop(
 					serviceTier: config.serviceTier,
 					metadata: config.metadata,
 					requestDump,
+					onRequestStart: markRequestStarted,
 					...(isFirstTurn && images?.length ? { images } : {}),
 				});
 
 				for await (const parsed of stream) {
+					yield* flushRequestStart();
 					// Record TTFT (time to first token) for this request
 					if (
 						requestTtftMs === undefined &&
@@ -1062,7 +1086,7 @@ export async function* agentLoop(
 											metadata: sr.metadata,
 										};
 										if (sr.fatal) {
-											yield buildRequestEnd(sr.output);
+											yield* finishRequest(sr.output);
 											yield { type: "error", message: sr.output };
 											return;
 										}
@@ -1073,7 +1097,7 @@ export async function* agentLoop(
 					}
 
 					if (parsed.silentDisconnect) {
-						yield buildRequestEnd("Silent disconnect");
+						yield* finishRequest("Silent disconnect");
 						yield { type: "silent_disconnect" };
 						return;
 					}
@@ -1288,7 +1312,7 @@ export async function* agentLoop(
 						const message = String(parsed.invalidState.message ?? "Unknown provider error");
 						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield buildRequestEnd(message);
+							yield* finishRequest(message);
 							yield { type: "context_length_exceeded", message };
 							return;
 						}
@@ -1313,7 +1337,7 @@ export async function* agentLoop(
 									maxRetries: maxChatRetries,
 									delayMs,
 								};
-								yield buildRequestEnd(message);
+								yield* finishRequest(message);
 								await abortableSleep(delayMs, config.signal);
 								if (config.signal.aborted) {
 									yield { type: "error", message: "Aborted" };
@@ -1324,7 +1348,7 @@ export async function* agentLoop(
 							// Exhausted retries — yield block_complete for partial content
 							// then signal retryable_error to the caller.
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield buildRequestEnd(message);
+							yield* finishRequest(message);
 							yield { type: "retryable_error", message };
 							return;
 						}
@@ -1343,7 +1367,7 @@ export async function* agentLoop(
 							// "Provider returned an empty response" message).
 							sawErrorEvent = true;
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield buildRequestEnd(message);
+							yield* finishRequest(message);
 							yield {
 								type: "invalid_state",
 								reason,
@@ -1353,11 +1377,12 @@ export async function* agentLoop(
 						}
 					}
 				}
+				yield* flushRequestStart();
 			} catch (err) {
 				if (config.signal.aborted) {
 					// Even on abort, yield block_complete for accumulated content so it can be persisted
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield buildRequestEnd("Aborted");
+					yield* finishRequest("Aborted");
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
@@ -1370,7 +1395,7 @@ export async function* agentLoop(
 				) {
 					// Persist partial content before signalling overflow
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield buildRequestEnd(msg);
+					yield* finishRequest(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
 				}
@@ -1378,7 +1403,7 @@ export async function* agentLoop(
 				// Treat as context_length_exceeded so caller can prune/compact+retry.
 				if (isContextWindowExceededError(err)) {
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield buildRequestEnd(msg);
+					yield* finishRequest(msg);
 					yield { type: "context_length_exceeded", message: msg };
 					return;
 				}
@@ -1404,7 +1429,7 @@ export async function* agentLoop(
 							maxRetries: maxChatRetries,
 							delayMs,
 						};
-						yield buildRequestEnd(msg);
+						yield* finishRequest(msg);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -1414,13 +1439,13 @@ export async function* agentLoop(
 					}
 					// Exhausted retries — persist partial content and signal caller
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-					yield buildRequestEnd(msg);
+					yield* finishRequest(msg);
 					yield { type: "retryable_error", message: msg };
 					return;
 				}
 				// Non-retryable error — persist partial content and signal caller
 				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-				yield buildRequestEnd(msg);
+				yield* finishRequest(msg);
 				yield { type: "error", message: msg };
 				return;
 			}
@@ -1429,6 +1454,20 @@ export async function* agentLoop(
 			// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
 			// during this attempt — otherwise the empty-response message masks the real error.
 			if (!sawErrorEvent && !sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+				if (!requestStarted) {
+					const message =
+						`${effectiveProvider}: Provider finished without starting an API request. ` +
+						"This indicates the request was not assembled or dispatched; check provider setup and local request-building errors.";
+					logger.warn("Provider produced no events before starting a request", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+					});
+					yield { type: "error", message };
+					return;
+				}
+
 				// When a previous retry recorded a real error (e.g. 429) treat
 				// the empty response as a continuation of that transient failure
 				// and feed it back into the *chat* retry counter (not the
@@ -1464,7 +1503,7 @@ export async function* agentLoop(
 							maxRetries: maxChatRetries,
 							delayMs,
 						};
-						yield buildRequestEnd(lastRetryErrorMessage);
+						yield* finishRequest(lastRetryErrorMessage);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -1473,7 +1512,7 @@ export async function* agentLoop(
 						continue; // retry provider.chat()
 					}
 					// Chat retries exhausted — surface the original error
-					yield buildRequestEnd(lastRetryErrorMessage);
+					yield* finishRequest(lastRetryErrorMessage);
 					yield { type: "retryable_error", message: lastRetryErrorMessage };
 					return;
 				}
@@ -1502,7 +1541,7 @@ export async function* agentLoop(
 						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 						delayMs,
 					};
-					yield buildRequestEnd(message);
+					yield* finishRequest(message);
 					await abortableSleep(delayMs, config.signal);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
@@ -1517,7 +1556,7 @@ export async function* agentLoop(
 					model: effectiveModel,
 					requestId,
 				});
-				yield buildRequestEnd(`${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`);
+				yield* finishRequest(`${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`);
 				yield {
 					type: "invalid_state",
 					reason: "empty_response",
@@ -1558,7 +1597,7 @@ export async function* agentLoop(
 		}
 
 		// Emit API request end event
-		yield buildRequestEnd();
+		yield* finishRequest();
 
 		// Reset retry counter after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.

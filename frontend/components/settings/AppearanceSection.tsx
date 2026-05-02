@@ -107,6 +107,19 @@ export function AppearanceSection({
 				onChange={(e) => updateUserPref.mutate({ wordWrapDiff: e.currentTarget.checked })}
 			/>
 
+			{/* Recent Tabs */}
+			<Title order={5} mt="sm">
+				{t("recentTabsSubSection")}
+			</Title>
+			<Switch
+				label={t("addSubagentToRecentTabs")}
+				description={t("addSubagentToRecentTabsDesc")}
+				checked={userPrefs?.addSubagentToRecentTabs ?? true}
+				onChange={(e) =>
+					updateUserPref.mutate({ addSubagentToRecentTabs: e.currentTarget.checked })
+				}
+			/>
+
 			{/* Terminal */}
 			<Title order={5} mt="sm">
 				{t("terminalSubSection")}

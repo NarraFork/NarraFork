@@ -62,7 +62,14 @@ export const awaitBackgroundTaskTool: ToolDefinition = {
 		const timeoutMs = timeout ?? DEFAULT_TIMEOUT_MS;
 
 		// Check if task exists in background_tasks table
-		const task = await backgroundTaskService.getById(taskId);
+		let task = await backgroundTaskService.getById(taskId);
+
+		// If not found by ID, the in-memory alias registry may have been cleared
+		// (e.g. after agent loop ended). Fall back to DB alias lookup.
+		if (!task && taskId === rawId) {
+			task = await backgroundTaskService.getByAlias(rawId, ctx.narratorId);
+		}
+
 		if (!task) {
 			// Legacy fallback: check narrators table directly
 			try {
@@ -90,24 +97,34 @@ export const awaitBackgroundTaskTool: ToolDefinition = {
 				}
 			}
 			return {
-				output: `Error: "${taskId}" is not a valid background task ID.`,
+				output: `Error: "${rawId}" is not a valid background task ID.`,
 				isError: true,
 			};
+		}
+
+		// Use the real task ID from DB (important when resolved via alias fallback)
+		const resolvedId = task.id;
+
+		// Re-populate the in-memory alias registry so subsequent lookups in the
+		// same agent loop don't need another DB round-trip.
+		if (task.alias && resolvedId !== rawId) {
+			const { registerTaskAlias } = await import("@server/services/subagent-alias");
+			registerTaskAlias(ctx.narratorId, resolvedId, task.alias);
 		}
 
 		// Use backgroundTaskService for unified waiting
 		if (wait_for_text) {
 			const result = await backgroundTaskService.waitForText(
-				taskId,
+				resolvedId,
 				wait_for_text,
 				timeoutMs,
 				ctx.signal,
 			);
-			return { output: formatResult(taskId, result.status, result.output) };
+			return { output: formatResult(resolvedId, result.status, result.output) };
 		}
 
-		const result = await backgroundTaskService.waitForCompletion(taskId, timeoutMs, ctx.signal);
-		return { output: formatResult(taskId, result.status, result.output) };
+		const result = await backgroundTaskService.waitForCompletion(resolvedId, timeoutMs, ctx.signal);
+		return { output: formatResult(resolvedId, result.status, result.output) };
 	},
 };
 

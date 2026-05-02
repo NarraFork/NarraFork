@@ -23,6 +23,8 @@ export interface CommandItem {
 	description?: string;
 	source: string;
 	type: "command" | "skill" | "tool";
+	runBashFirst?: boolean;
+	bashCommand?: string;
 	params?: CommandParam[];
 }
 
@@ -208,6 +210,11 @@ export function CommandPopover({
 							<Text size="xs" c="dimmed" truncate="end" style={{ flex: 1 }}>
 								{cmd.description || cmd.prompt}
 							</Text>
+						)}
+						{cmd.type === "command" && cmd.runBashFirst && cmd.bashCommand && (
+							<Badge size="xs" variant="light" color="yellow" title={cmd.bashCommand}>
+								{t("commandRunBashFirstBadge")}
+							</Badge>
 						)}
 						{getSourceBadge(cmd, t)}
 					</Group>

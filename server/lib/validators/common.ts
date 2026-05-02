@@ -38,6 +38,8 @@ export const commandSchema = z.object({
 		.regex(/^[a-zA-Z0-9_-]+$/),
 	prompt: z.string().min(1).max(400000),
 	description: z.string().max(500).optional(),
+	runBashFirst: z.boolean().optional(),
+	bashCommand: z.string().max(400000).optional(),
 	params: z
 		.array(
 			z.object({

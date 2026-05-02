@@ -32,6 +32,7 @@ import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
 	type NarratorDragState,
@@ -102,12 +103,16 @@ function NarratorDetailPage() {
 	const narratorStatus = narrator?.status;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterTitle = (chapter as any)?.title as string | undefined;
+	const { data: userPrefs, isLoading: userPrefsLoading } = useUserPreferences();
 
 	// First visit: register the tab on the server (once per narratorId)
 	useEffect(() => {
 		if (!narrator) return;
 		if (isSubagent) {
-			// Subagent: register as subagent tab with robot icon
+			// Subagent: wait for preferences before deciding, otherwise the default
+			// undefined value can briefly add a tab even when the user disabled it.
+			if (userPrefsLoading) return;
+			if (userPrefs?.addSubagentToRecentTabs === false) return;
 			addRecentTab({
 				type: "subagent",
 				id: narratorId,
@@ -148,6 +153,8 @@ function NarratorDetailPage() {
 		chapterTitle,
 		isSubagent,
 		parentNarratorId,
+		userPrefs?.addSubagentToRecentTabs,
+		userPrefsLoading,
 	]);
 
 	const qc = useQueryClient();

@@ -45,6 +45,8 @@ export interface Command {
 	name: string;
 	prompt: string;
 	description?: string;
+	runBashFirst?: boolean;
+	bashCommand?: string;
 	params?: CommandParam[];
 	modelOverride?: CommandModelOverride;
 }

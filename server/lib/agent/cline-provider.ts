@@ -227,10 +227,12 @@ export class ClineProvider implements ProviderAdapter {
 			authPrefix: headers.Authorization?.slice(0, 20),
 		});
 
+		const bodyText = JSON.stringify(body);
+		params.onRequestStart?.();
 		const response = await fetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: bodyText,
 			signal: params.signal,
 		});
 		const responseTextPromise = params.requestDump

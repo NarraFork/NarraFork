@@ -540,6 +540,9 @@ export const userPreferences = sqliteTable("user_preferences", {
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
+		.notNull()
+		.default(true),
 	// Notification preferences
 	notifyOnDone: integer("notify_on_done", { mode: "boolean" }).notNull().default(true),
 	notifyOnWaiting: integer("notify_on_waiting", { mode: "boolean" }).notNull().default(true),

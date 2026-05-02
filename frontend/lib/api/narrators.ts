@@ -65,6 +65,8 @@ export const narratorsApi = {
 				prompt: string;
 				description?: string;
 				source: string;
+				runBashFirst?: boolean;
+				bashCommand?: string;
 				params?: Array<{
 					name: string;
 					description?: string;

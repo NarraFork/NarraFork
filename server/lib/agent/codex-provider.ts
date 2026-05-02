@@ -255,10 +255,15 @@ export class CodexProvider implements ProviderAdapter {
 			const ctx = await this.getContext(params.stickySessionKey);
 			this.refreshUsageOnUse(ctx.id);
 			const provider = this.createProvider(ctx);
+			const chatParams: ChatParams = {
+				...params,
+				onRequestStart: (info) =>
+					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+			};
 			let hasStreamedEvents = false;
 
 			try {
-				for await (const event of provider.chat(params)) {
+				for await (const event of provider.chat(chatParams)) {
 					hasStreamedEvents = true;
 					// Inject credentialId into the event
 					yield { ...event, credentialId: ctx.id };
@@ -307,6 +312,11 @@ export class CodexProvider implements ProviderAdapter {
 			const ctx = await this.getContext(params.stickySessionKey);
 			this.refreshUsageOnUse(ctx.id);
 			const provider = this.createProvider(ctx);
+			const chatParams: ChatParams = {
+				...params,
+				onRequestStart: (info) =>
+					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+			};
 			let hasStreamedEvents = false;
 
 			try {
@@ -322,6 +332,7 @@ export class CodexProvider implements ProviderAdapter {
 					body: { type: "response.create", ...request },
 				});
 
+				params.onRequestStart?.({ credentialId: ctx.id });
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
@@ -349,7 +360,7 @@ export class CodexProvider implements ProviderAdapter {
 						status: err.status,
 						error: err.message,
 					});
-					for await (const event of provider.chat(params)) {
+					for await (const event of provider.chat(chatParams)) {
 						hasStreamedEvents = true;
 						yield { ...event, credentialId: ctx.id };
 					}

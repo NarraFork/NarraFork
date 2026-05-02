@@ -19,6 +19,7 @@ import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentResultMessageId } from "./narrator-session";
+import { registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
 	getAttachWaitersMap,
@@ -170,22 +171,6 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 		const ctrl = getBackgroundAbortControllers().get(narratorId);
 		if (ctrl) ctrl.abort("Background task timeout");
 	}, BACKGROUND_TASK_TIMEOUT_MS);
-
-	// Register in unified background_tasks table
-	await backgroundTaskService
-		.createAgentTask({
-			id: narratorId,
-			parentNarratorId,
-			subagentNarratorId: narratorId,
-			subagentType: opts.subagentType,
-			toolUseId,
-		})
-		.catch((err) => {
-			logger.warn("Failed to register background task in DB", {
-				narratorId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
 
 	try {
 		const result = await executeSubagent(opts);
@@ -602,6 +587,7 @@ export interface RunSubagentInput {
 	locale: string;
 	model?: string;
 	background?: boolean;
+	alias?: string;
 }
 
 /**
@@ -623,6 +609,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		locale,
 		model: explicitModel,
 		background,
+		alias,
 	} = input;
 
 	// Load custom subagent definition once for non-builtin types
@@ -747,6 +734,24 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		getBackgroundAbortControllers().set(subagentId, bgAbort);
 		backgroundTaskService.registerAbortController(subagentId, bgAbort);
 
+		const aliasRegistration = registerTaskAlias(parentNarratorId, subagentId, alias || title);
+		await backgroundTaskService
+			.createAgentTask({
+				id: subagentId,
+				parentNarratorId,
+				subagentNarratorId: subagentId,
+				subagentType,
+				toolUseId,
+				alias: aliasRegistration.alias,
+				title,
+			})
+			.catch((err) => {
+				logger.warn("Failed to register background task in DB", {
+					narratorId: subagentId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+
 		// Fire-and-forget execution
 		executeBackgroundTask({
 			narratorId: subagentId,
@@ -771,10 +776,15 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		});
 
 		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
-		return (
+		let output =
 			resultPrefix +
-			"Background task started. Use Agent(resume) with this ID to attach and get results."
-		);
+			"Background task started. Use Agent(resume) with this ID to attach and get results.";
+		if (aliasRegistration.conflicted) {
+			output +=
+				`\n\nNote: The requested alias "${alias || title}" was already taken. ` +
+				`This agent was assigned "${aliasRegistration.alias}" instead.`;
+		}
+		return output;
 	}
 
 	// --- Foreground mode ---

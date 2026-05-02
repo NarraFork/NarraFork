@@ -333,6 +333,36 @@ class BackgroundTaskService {
 		return row ?? null;
 	}
 
+	/**
+	 * Look up a background task by its alias within a specific parent narrator scope.
+	 * Falls back to a global alias search if parentNarratorId is not provided.
+	 * Used when the in-memory alias registry has been cleared (e.g. after agent loop ends).
+	 */
+	async getByAlias(alias: string, parentNarratorId?: string): Promise<BackgroundTaskRecord | null> {
+		const conditions = [eq(backgroundTasks.alias, alias)];
+		if (parentNarratorId) {
+			conditions.push(eq(backgroundTasks.parentNarratorId, parentNarratorId));
+		}
+		const row = await db
+			.select()
+			.from(backgroundTasks)
+			.where(and(...conditions))
+			.orderBy(desc(backgroundTasks.createdAt))
+			.get();
+		return row ?? null;
+	}
+
+	/**
+	 * Persist an alias to the background_tasks table so it survives
+	 * in-memory registry cleanup across agent loop restarts.
+	 */
+	async updateAlias(taskId: string, alias: string): Promise<void> {
+		await db
+			.update(backgroundTasks)
+			.set({ alias, updatedAt: new Date().toISOString() })
+			.where(eq(backgroundTasks.id, taskId));
+	}
+
 	async listByParent(parentNarratorId: string): Promise<BackgroundTaskRecord[]> {
 		return db
 			.select()

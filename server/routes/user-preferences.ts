@@ -37,6 +37,7 @@ const DEFAULTS = {
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	recentTabs: "[]",
+	addSubagentToRecentTabs: true,
 	// Notification defaults
 	notifyOnDone: true,
 	notifyOnWaiting: true,
@@ -309,13 +310,14 @@ userPreferencesRoutes.patch("/", async (c) => {
 			id, user_id,
 			auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff,
 			reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
+			add_subagent_to_recent_tabs,
 			notify_on_done, notify_on_waiting, notify_pwa_enabled,
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
 			commands, send_mode, setup_wizard_completed, gateway_config,
 			created_at, updated_at
-		) VALUES (${Array(31).fill("?").join(", ")})
+		) VALUES (${Array(32).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   language = COALESCE(?, language),
@@ -327,6 +329,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   show_output_stats = COALESCE(?, show_output_stats),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
+		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
 		   notify_on_done = COALESCE(?, notify_on_done),
 		   notify_on_waiting = COALESCE(?, notify_on_waiting),
 		   notify_pwa_enabled = COALESCE(?, notify_pwa_enabled),
@@ -359,6 +362,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
 			d.terminalTheme ?? DEFAULTS.terminalTheme,
 			d.terminalFontSize ?? DEFAULTS.terminalFontSize,
+			(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
 			(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
 			(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
 			(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
@@ -389,6 +393,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
 			d.terminalTheme ?? null,
 			d.terminalFontSize ?? null,
+			d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
 			d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
 			d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
 			d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,

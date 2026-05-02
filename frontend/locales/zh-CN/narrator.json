@@ -272,6 +272,8 @@
 	"commandSourceProject": "项目",
 	"commandSourceGlobalSkill": "全局技能",
 	"commandSourceProjectSkill": "项目技能",
+	"commandRunBashFirstBadge": "先 Bash",
+	"commandBashPreview": "将先执行的 Bash 指令",
 	"commandPreview": "预览",
 	"showExpandedPrompt": "显示展开后的提示词",
 	"hideExpandedPrompt": "收起展开后的提示词",

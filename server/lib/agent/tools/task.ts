@@ -185,7 +185,17 @@ export const agentTool: ToolDefinition = {
 				const { resolveTaskAlias, cancelBackgroundTask } = await import(
 					"@server/services/narrator-subagent"
 				);
-				const taskId = resolveTaskAlias(ctx.narratorId, raw.stop);
+				let taskId = resolveTaskAlias(ctx.narratorId, raw.stop);
+
+				// If alias registry didn't resolve (returned raw input), try DB lookup
+				if (taskId === raw.stop) {
+					const { backgroundTaskService } = await import(
+						"@server/services/background-task-service"
+					);
+					const task = await backgroundTaskService.getByAlias(raw.stop, ctx.narratorId);
+					if (task) taskId = task.id;
+				}
+
 				const cancelled = await cancelBackgroundTask(taskId);
 				if (cancelled) {
 					return { output: `Background agent task ${raw.stop} has been cancelled.` };
@@ -219,7 +229,15 @@ export const agentTool: ToolDefinition = {
 			const { continueSubagent, resolveTaskAlias } = await import(
 				"@server/services/narrator-subagent"
 			);
-			const resolvedId = resolveTaskAlias(ctx.narratorId, resume);
+			let resolvedId = resolveTaskAlias(ctx.narratorId, resume);
+
+			// If alias registry didn't resolve (returned raw input), try DB lookup
+			if (resolvedId === resume) {
+				const { backgroundTaskService } = await import("@server/services/background-task-service");
+				const task = await backgroundTaskService.getByAlias(resume, ctx.narratorId);
+				if (task) resolvedId = task.id;
+			}
+
 			try {
 				const result = await continueSubagent({
 					subagentId: resolvedId,
@@ -260,6 +278,7 @@ export const agentTool: ToolDefinition = {
 				locale: ctx.locale,
 				model: model || undefined,
 				background: run_in_background || false,
+				alias: alias || description || undefined,
 			});
 
 			// Register alias for ALL subagents (foreground and background)

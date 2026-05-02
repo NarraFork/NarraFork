@@ -613,10 +613,12 @@ export class OpenAIProvider implements ProviderAdapter {
 			}),
 		});
 
+		const bodyText = JSON.stringify(body);
+		params.onRequestStart?.();
 		const response = await this.pfetch(endpoint, {
 			method: "POST",
 			headers: requestHeaders,
-			body: JSON.stringify(body),
+			body: bodyText,
 			signal: params.signal,
 		});
 		const responseTextPromise = params.requestDump
@@ -998,6 +1000,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 
 		try {
+			params.onRequestStart?.({ credentialId: this.config.id });
 			for await (const event of streamCodexResponsesWebSocket({
 				baseUrl,
 				apiKey,
