@@ -1,9 +1,9 @@
 import {
+	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
 	getClineProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
-	parseAggModelValue,
 	parseModelId,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -293,44 +293,56 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	return null;
 }
 
+function isDefaultSentinel(model: string | undefined): boolean {
+	if (!model) return false;
+	const trimmed = model.trim();
+	if (trimmed === FOLLOW_DEFAULT_MODEL) return true;
+	const parsed = parseModelId(trimmed);
+	return !!parsed.provider && parsed.model === FOLLOW_DEFAULT_MODEL;
+}
+
+function prefixProviderModel(provider: string, model: string | undefined): string | null {
+	const trimmed = model?.trim();
+	if (!trimmed || isDefaultSentinel(trimmed)) return null;
+	return trimmed.includes(":") ? trimmed : `${provider}:${trimmed}`;
+}
+
 function defaultModelForProvider(provider: string): string | null {
 	if (provider === "codex") {
 		const custom = settings.agent.customModels ?? [];
 		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
-		if (codexCustom) {
-			return codexCustom.includes(":") ? codexCustom : `codex:${codexCustom}`;
-		}
-		return "codex:gpt-5.3-codex";
+		const normalized = prefixProviderModel("codex", codexCustom);
+		return normalized ?? "codex:gpt-5.3-codex";
 	}
 
 	}
 
-	const openai = getOpenaiProviderConfig(provider);
-	if (openai?.defaultModel) {
-		return `${provider}:${openai.defaultModel}`;
-	}
+	const openaiDefault = prefixProviderModel(
+		provider,
+		getOpenaiProviderConfig(provider)?.defaultModel,
+	);
+	if (openaiDefault) return openaiDefault;
 
-	const anthropic = getAnthropicProviderConfig(provider);
-	if (anthropic?.defaultModel) {
-		return `${provider}:${anthropic.defaultModel}`;
-	}
+	const anthropicDefault = prefixProviderModel(
+		provider,
+		getAnthropicProviderConfig(provider)?.defaultModel,
+	);
+	if (anthropicDefault) return anthropicDefault;
 
-	}
 
-	const nug = getNugProviderConfig(provider);
-	if (nug?.defaultModel) {
-		return `${provider}:${nug.defaultModel}`;
-	}
+	const nugDefault = prefixProviderModel(provider, getNugProviderConfig(provider)?.defaultModel);
+	if (nugDefault) return nugDefault;
 
-	const cline = getClineProviderConfig(provider);
-	if (cline?.defaultModel) {
-		return `${provider}:${cline.defaultModel}`;
-	}
+	const clineDefault = prefixProviderModel(
+		provider,
+		getClineProviderConfig(provider)?.defaultModel,
+	);
+	if (clineDefault) return clineDefault;
 
 	const custom = settings.agent.customModels ?? [];
 	const providerCustom = custom.find((m) => m.provider === provider)?.value;
 	if (providerCustom) {
-		return providerCustom.includes(":") ? providerCustom : `${provider}:${providerCustom}`;
+		return prefixProviderModel(provider, providerCustom);
 	}
 
 	return null;
@@ -368,9 +380,7 @@ export function resolveProviderAndModel(
 	model?: string,
 	stickyProvider?: string,
 ): ProviderResolution {
-	// For aggregation models, pass stickyProvider to enable session affinity
-	const isAgg = model ? !!parseAggModelValue(model) : false;
-	const requestedModel = resolveEffectiveModel(model, isAgg ? stickyProvider : undefined);
+	const requestedModel = resolveEffectiveModel(model, stickyProvider);
 	const requestedProvider = resolveProvider(requestedModel);
 
 			throw new Error(

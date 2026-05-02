@@ -11,7 +11,7 @@ import {
 	type Locale,
 	type OverseerScope as OverseerScopeI18n,
 } from "../lib/prompt-i18n";
-import { resolveEffectiveModel, settings } from "../lib/settings";
+import { resolveEffectiveModel } from "../lib/settings";
 
 // === Types ===
 
@@ -79,7 +79,7 @@ export async function createOverseer(input: {
 	const narratorId = generateId();
 	const overseerId = generateId();
 
-	const effectiveModel = input.model ?? resolveEffectiveModel(settings.agent?.defaultModel);
+	const effectiveModel = resolveEffectiveModel(input.model);
 
 	// Resolve project name for prompt
 	let projectName: string | undefined;

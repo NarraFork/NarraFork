@@ -12,9 +12,18 @@ interface ExecResult {
 	exitCode: number;
 }
 
+interface ExecOptions {
+	silent?: boolean;
+	optionalLocks?: boolean;
+}
+
 /**
  * Per-worktree mutex to prevent concurrent git write operations.
- * Read-only operations (status, diff, log) don't need locking.
+ *
+ * Read-only operations (status, diff, log, etc.) usually don't need this
+ * application-level mutex, but Git may still refresh the index and briefly
+ * create `.git/index.lock`. Use execRead() for those commands so Git disables
+ * optional index writes via `--no-optional-locks`.
  */
 const worktreeLocks = new Map<string, Promise<unknown>>();
 
@@ -69,9 +78,23 @@ function stripTrailingLineBreaks(text: string): string {
 	return text.replace(/[\r\n]+$/, "");
 }
 
-async function exec(args: string[], cwd: string, silent = false): Promise<ExecResult> {
+function normalizeExecOptions(options: boolean | ExecOptions = {}): Required<ExecOptions> {
+	if (typeof options === "boolean") return { silent: options, optionalLocks: true };
+	return {
+		silent: options.silent ?? false,
+		optionalLocks: options.optionalLocks ?? true,
+	};
+}
+
+async function exec(
+	args: string[],
+	cwd: string,
+	options: boolean | ExecOptions = {},
+): Promise<ExecResult> {
+	const { silent, optionalLocks } = normalizeExecOptions(options);
+	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
 	try {
-		const result = await safeSpawn({ cmd: ["git", ...args], cwd });
+		const result = await safeSpawn({ cmd, cwd });
 		const trimmedStdout = stripTrailingLineBreaks(result.stdout);
 		const trimmedStderr = stripTrailingLineBreaks(result.stderr);
 		if (result.exitCode !== 0 && !silent) {
@@ -80,6 +103,7 @@ async function exec(args: string[], cwd: string, silent = false): Promise<ExecRe
 				cwd,
 				stderr: trimmedStderr,
 				exitCode: result.exitCode,
+				optionalLocks,
 			});
 		}
 		return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
@@ -88,11 +112,20 @@ async function exec(args: string[], cwd: string, silent = false): Promise<ExecRe
 		// synthetic failure result so callers that check exitCode still work.
 		if (silent) {
 			const msg = err instanceof Error ? err.message : String(err);
-			logger.debug("git command spawn failed (silent)", { args: args.join(" "), cwd, error: msg });
+			logger.debug("git command spawn failed (silent)", {
+				args: args.join(" "),
+				cwd,
+				error: msg,
+				optionalLocks,
+			});
 			return { stdout: "", stderr: msg, exitCode: -1 };
 		}
 		throw err;
 	}
+}
+
+function execRead(args: string[], cwd: string, silent = false): Promise<ExecResult> {
+	return exec(args, cwd, { silent, optionalLocks: false });
 }
 
 interface LineStats {
@@ -253,12 +286,12 @@ function parsePorcelainStatusZ(
 
 export const gitService = {
 	async getCurrentBranch(repoPath: string): Promise<string> {
-		const result = await exec(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
+		const result = await execRead(["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
 		return result.stdout;
 	},
 
 	async branchExists(repoPath: string, branchName: string): Promise<boolean> {
-		const result = await exec(["rev-parse", "--verify", branchName], repoPath);
+		const result = await execRead(["rev-parse", "--verify", branchName], repoPath);
 		return result.exitCode === 0;
 	},
 
@@ -299,12 +332,12 @@ export const gitService = {
 	},
 
 	async isShallowRepository(repoPath: string): Promise<boolean> {
-		const result = await exec(["rev-parse", "--is-shallow-repository"], repoPath, true);
+		const result = await execRead(["rev-parse", "--is-shallow-repository"], repoPath, true);
 		return result.exitCode === 0 && result.stdout.trim() === "true";
 	},
 
 	async isGitRepo(path: string): Promise<boolean> {
-		const result = await exec(["rev-parse", "--is-inside-work-tree"], path);
+		const result = await execRead(["rev-parse", "--is-inside-work-tree"], path);
 		return result.exitCode === 0;
 	},
 
@@ -313,13 +346,13 @@ export const gitService = {
 	 * Returns null if the file is not tracked or HEAD doesn't exist.
 	 */
 	async getFileAtHead(cwd: string, filePath: string): Promise<string | null> {
-		const result = await exec(["show", `HEAD:${filePath}`], cwd, true);
+		const result = await execRead(["show", `HEAD:${filePath}`], cwd, true);
 		if (result.exitCode !== 0) return null;
 		return result.stdout;
 	},
 
 	async getHeadCommit(repoPath: string): Promise<string> {
-		const result = await exec(["rev-parse", "HEAD"], repoPath);
+		const result = await execRead(["rev-parse", "HEAD"], repoPath);
 		if (result.exitCode !== 0) throw new GitError(`Failed to get HEAD commit: ${result.stderr}`);
 		return result.stdout;
 	},
@@ -328,7 +361,11 @@ export const gitService = {
 		worktreePath: string,
 		baseBranch: string,
 	): Promise<{ count: number; baseBranch: string }> {
-		const result = await exec(["rev-list", "--count", `${baseBranch}..HEAD`], worktreePath, true);
+		const result = await execRead(
+			["rev-list", "--count", `${baseBranch}..HEAD`],
+			worktreePath,
+			true,
+		);
 		return {
 			count: result.exitCode === 0 ? Number.parseInt(result.stdout, 10) || 0 : 0,
 			baseBranch,
@@ -337,9 +374,9 @@ export const gitService = {
 
 	async getUncommittedLineStats(worktreePath: string): Promise<{ added: number; removed: number }> {
 		// staged + unstaged diff against HEAD
-		const tracked = await exec(["diff", "HEAD", "--numstat", "-z"], worktreePath, true);
+		const tracked = await execRead(["diff", "HEAD", "--numstat", "-z"], worktreePath, true);
 		// untracked files
-		const untracked = await exec(
+		const untracked = await execRead(
 			["ls-files", "--others", "--exclude-standard", "-z"],
 			worktreePath,
 			true,
@@ -370,14 +407,18 @@ export const gitService = {
 	},
 
 	async getMergeBase(repoPath: string, branchA: string, branchB: string): Promise<string> {
-		const result = await exec(["merge-base", branchA, branchB], repoPath);
+		const result = await execRead(["merge-base", branchA, branchB], repoPath);
 		if (result.exitCode !== 0) throw new GitError(`Failed to get merge base: ${result.stderr}`);
 		return result.stdout;
 	},
 
 	/** Check if commitA is an ancestor of commitB (i.e. commitB contains commitA) */
 	async isAncestor(repoPath: string, commitA: string, commitB: string): Promise<boolean> {
-		const result = await exec(["merge-base", "--is-ancestor", commitA, commitB], repoPath, true);
+		const result = await execRead(
+			["merge-base", "--is-ancestor", commitA, commitB],
+			repoPath,
+			true,
+		);
 		return result.exitCode === 0;
 	},
 
@@ -388,7 +429,7 @@ export const gitService = {
 		ourBranch: string,
 		theirBranch: string,
 	): Promise<{ hasConflicts: boolean; conflictFiles: string[] }> {
-		const result = await exec(["merge-tree", baseSha, ourBranch, theirBranch], repoPath);
+		const result = await execRead(["merge-tree", baseSha, ourBranch, theirBranch], repoPath);
 		const conflictFiles: string[] = [];
 		const lines = result.stdout.split("\n");
 		for (const line of lines) {
@@ -438,7 +479,7 @@ export const gitService = {
 						fallbackResult.stdout.includes("CONFLICT") ||
 						fallbackResult.stderr.includes("CONFLICT")
 					) {
-						const statusResult = await exec(
+						const statusResult = await execRead(
 							["diff", "--name-only", "--diff-filter=U"],
 							worktreePath,
 						);
@@ -456,7 +497,10 @@ export const gitService = {
 				return { success: true, commitSha: sha, isFastForward: false };
 			}
 			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
-				const statusResult = await exec(["diff", "--name-only", "--diff-filter=U"], worktreePath);
+				const statusResult = await execRead(
+					["diff", "--name-only", "--diff-filter=U"],
+					worktreePath,
+				);
 				const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
 				return { success: false, conflictFiles };
 			}
@@ -480,7 +524,7 @@ export const gitService = {
 		sourceBranch: string,
 		baseSha: string,
 	): Promise<{ success: boolean; commitSha?: string; conflictFiles?: string[] }> {
-		const logResult = await exec(
+		const logResult = await execRead(
 			["rev-list", "--reverse", `${baseSha}..${sourceBranch}`],
 			repoPath,
 		);
@@ -493,7 +537,10 @@ export const gitService = {
 			const result = await exec(["cherry-pick", commit], worktreePath);
 			if (result.exitCode !== 0) {
 				if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
-					const statusResult = await exec(["diff", "--name-only", "--diff-filter=U"], worktreePath);
+					const statusResult = await execRead(
+						["diff", "--name-only", "--diff-filter=U"],
+						worktreePath,
+					);
 					const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
 					await exec(["cherry-pick", "--abort"], worktreePath);
 					return { success: false, conflictFiles };
@@ -604,12 +651,12 @@ export const gitService = {
 
 	/** Get list of files with unresolved merge conflicts */
 	async getConflictFiles(worktreePath: string): Promise<string[]> {
-		const result = await exec(["diff", "--name-only", "--diff-filter=U"], worktreePath);
+		const result = await execRead(["diff", "--name-only", "--diff-filter=U"], worktreePath);
 		return result.stdout.split("\n").filter(Boolean);
 	},
 
 	async getStatus(worktreePath: string): Promise<string> {
-		const result = await exec(["status", "--porcelain"], worktreePath);
+		const result = await execRead(["status", "--porcelain"], worktreePath);
 		return result.stdout;
 	},
 
@@ -638,12 +685,12 @@ export const gitService = {
 			unstagedNumstat,
 			untrackedResult,
 		] = await Promise.all([
-			exec(["status", "--porcelain", "-z"], worktreePath),
-			exec(["rev-parse", "HEAD"], worktreePath),
-			exec(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
-			exec(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
-			exec(["diff", "--numstat", "-z"], worktreePath, true),
-			exec(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, true),
+			execRead(["status", "--porcelain", "-z"], worktreePath),
+			execRead(["rev-parse", "HEAD"], worktreePath),
+			execRead(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
+			execRead(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
+			execRead(["diff", "--numstat", "-z"], worktreePath, true),
+			execRead(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, true),
 		]);
 
 		const stagedLineStats =
@@ -728,7 +775,7 @@ export const gitService = {
 		// Diff of tracked files (staged + unstaged combined against HEAD).
 		// --no-binary: suppress binary file content in diff output.
 		// -D/--irreversible-delete: omit full content of deleted files.
-		const diffResult = await exec(
+		const diffResult = await execRead(
 			["diff", "HEAD", "--no-binary", "-D", "--no-color"],
 			worktreePath,
 			true,
@@ -753,7 +800,7 @@ export const gitService = {
 		}
 
 		// List untracked files and show their content (skip binary files)
-		const untrackedResult = await exec(
+		const untrackedResult = await execRead(
 			["ls-files", "--others", "--exclude-standard"],
 			worktreePath,
 			true,
@@ -765,7 +812,7 @@ export const gitService = {
 		for (const file of filesToDiff) {
 			// --no-index always exits 1 when diff is found — silence the expected error log.
 			// --no-binary: skip binary file content.
-			const showResult = await exec(
+			const showResult = await execRead(
 				["diff", "--no-index", "--no-binary", "--no-color", DEV_NULL, file],
 				worktreePath,
 				true,
@@ -793,7 +840,7 @@ export const gitService = {
 		headRef: string,
 		maxBytes = 100_000,
 	): Promise<string> {
-		const result = await exec(
+		const result = await execRead(
 			["diff", "--no-binary", "--no-color", `${baseRef}..${headRef}`],
 			repoPath,
 			true,
@@ -822,9 +869,12 @@ export const gitService = {
 		}>
 	> {
 		// Get numstat for per-file stats
-		const numstat = await exec(["diff-tree", "--no-commit-id", "-r", "--numstat", sha], repoPath);
+		const numstat = await execRead(
+			["diff-tree", "--no-commit-id", "-r", "--numstat", sha],
+			repoPath,
+		);
 		// Get name-status for file status (A/M/D/R)
-		const nameStatus = await exec(
+		const nameStatus = await execRead(
 			["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", sha],
 			repoPath,
 		);
@@ -877,7 +927,7 @@ export const gitService = {
 		filePath: string,
 		maxBytes = 200_000,
 	): Promise<{ diff: string; truncated: boolean }> {
-		const result = await exec(
+		const result = await execRead(
 			["diff-tree", "--no-commit-id", "-p", sha, "--", filePath],
 			repoPath,
 			true,
@@ -927,7 +977,7 @@ export const gitService = {
 	},
 
 	async commitGitignoreIfDirty(repoPath: string): Promise<void> {
-		const statusResult = await exec(["status", "--porcelain", ".gitignore"], repoPath);
+		const statusResult = await execRead(["status", "--porcelain", ".gitignore"], repoPath);
 		if (statusResult.stdout.trim()) {
 			await this.stageAndCommit(repoPath, [".gitignore"], "Update .gitignore for NarraFork");
 		}
@@ -1100,7 +1150,7 @@ export const gitService = {
 	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
 		return withWorktreeLock(worktreePath, async () => {
-			const statusResult = await exec(["status", "--porcelain", "--", ...files], worktreePath);
+			const statusResult = await execRead(["status", "--porcelain", "--", ...files], worktreePath);
 			const tracked: string[] = [];
 			const untracked: string[] = [];
 			for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
@@ -1148,7 +1198,7 @@ export const gitService = {
 				if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
 					return { hasConflicts: true };
 				}
-				const statusResult = await exec(["status", "--porcelain"], worktreePath, true);
+				const statusResult = await execRead(["status", "--porcelain"], worktreePath, true);
 				const hasUnmerged = statusResult.stdout
 					.split("\n")
 					.some((l) => l.startsWith("UU") || l.startsWith("AA") || l.startsWith("DD"));
@@ -1164,7 +1214,11 @@ export const gitService = {
 	async stashList(
 		worktreePath: string,
 	): Promise<Array<{ index: number; message: string; date: string }>> {
-		const result = await exec(["stash", "list", "--format=%gd%x00%gs%x00%ai"], worktreePath, true);
+		const result = await execRead(
+			["stash", "list", "--format=%gd%x00%gs%x00%ai"],
+			worktreePath,
+			true,
+		);
 		if (!result.stdout.trim()) return [];
 		return result.stdout
 			.trim()
@@ -1192,19 +1246,23 @@ export const gitService = {
 		maxBytes = 200_000,
 	): Promise<{ diff: string; truncated: boolean }> {
 		// Check if file is untracked
-		const statusResult = await exec(["status", "--porcelain", "--", filePath], worktreePath, true);
+		const statusResult = await execRead(
+			["status", "--porcelain", "--", filePath],
+			worktreePath,
+			true,
+		);
 		const statusLine = statusResult.stdout.trim();
 
 		let diff: string;
 		if (statusLine.startsWith("??")) {
 			// Untracked file — show full content as "new file" diff
-			const r = await exec(["diff", "--no-index", DEV_NULL, filePath], worktreePath, true);
+			const r = await execRead(["diff", "--no-index", DEV_NULL, filePath], worktreePath, true);
 			diff = r.stdout;
 		} else if (staged) {
-			const r = await exec(["diff", "--cached", "--", filePath], worktreePath, true);
+			const r = await execRead(["diff", "--cached", "--", filePath], worktreePath, true);
 			diff = r.stdout;
 		} else {
-			const r = await exec(["diff", "--", filePath], worktreePath, true);
+			const r = await execRead(["diff", "--", filePath], worktreePath, true);
 			diff = r.stdout;
 		}
 
@@ -1237,7 +1295,7 @@ export const gitService = {
 			"--format=%H%x00%h%x00%s%x00%an%x00%aI",
 		];
 		if (opts.branch) args.push(opts.branch);
-		const result = await exec(args, worktreePath, true);
+		const result = await execRead(args, worktreePath, true);
 		if (!result.stdout.trim()) return [];
 		return result.stdout
 			.trim()
@@ -1256,7 +1314,7 @@ export const gitService = {
 
 	async getCommitCount(worktreePath: string, branch?: string): Promise<number> {
 		const args = ["rev-list", "--count", branch ?? "HEAD"];
-		const result = await exec(args, worktreePath, true);
+		const result = await execRead(args, worktreePath, true);
 		return Number.parseInt(result.stdout.trim(), 10) || 0;
 	},
 
@@ -1280,7 +1338,7 @@ export const gitService = {
 
 	/** Check if a commit is a merge commit (has more than one parent) */
 	async isMergeCommit(worktreePath: string, commitSha: string): Promise<boolean> {
-		const result = await exec(["cat-file", "-p", commitSha], worktreePath);
+		const result = await execRead(["cat-file", "-p", commitSha], worktreePath);
 		if (result.exitCode !== 0) return false;
 		const parentLines = result.stdout.split("\n").filter((l) => l.startsWith("parent "));
 		return parentLines.length > 1;
@@ -1298,7 +1356,7 @@ export const gitService = {
 						`Resolve manually with: git revert -m 1 ${commitSha}`,
 				);
 			}
-			const head = await exec(["rev-parse", "HEAD"], worktreePath);
+			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
 			return head.stdout.trim();
 		});
 	},
@@ -1314,7 +1372,7 @@ export const gitService = {
 						`Resolve manually with: git revert ${commitSha}`,
 				);
 			}
-			const head = await exec(["rev-parse", "HEAD"], worktreePath);
+			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
 			return head.stdout.trim();
 		});
 	},

@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getProvider, resolveProviderAndModel } from "../../../server/lib/agent/provider";
 import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/codex-manager";
-import { resolveProvider, settings } from "../../../server/lib/settings";
+import {
+	resolveAllowedModelCandidate,
+	resolveEffectiveModel,
+	resolveProvider,
+	settings,
+} from "../../../server/lib/settings";
 
 const settingsKeys = Object.keys(settings) as Array<keyof typeof settings>;
 const tempDirs: string[] = [];
@@ -208,5 +213,81 @@ describe("resolveProviderAndModel behavior", () => {
 		const resolved = resolveProviderAndModel("deepseek:deepseek-chat");
 		expect(resolved.provider).toBe("deepseek");
 		expect(resolved.model).toBe("deepseek:deepseek-chat");
+	});
+
+	test("follow-default sentinel 在 provider 解析前替换为真实默认模型", () => {
+		addOpenaiProvider("deepseek");
+		settings.agent.defaultModel = "deepseek:gpt-4o";
+
+		const resolved = resolveProviderAndModel("__default__");
+
+		expect(resolved.provider).toBe("deepseek");
+		expect(resolved.model).toBe("deepseek:gpt-4o");
+	});
+
+	test("prefixed follow-default sentinel 不会作为模型名泄漏", () => {
+		addOpenaiProvider("deepseek");
+		settings.agent.defaultModel = "deepseek:gpt-4o";
+
+		const resolved = resolveProviderAndModel("deepseek:__default__");
+
+		expect(resolved.provider).toBe("deepseek");
+		expect(resolved.model).toBe("deepseek:gpt-4o");
+		expect(resolved.model).not.toContain("__default__");
+	});
+
+	test("follow-default 支持聚合默认模型并解析到成员模型", () => {
+		addOpenaiProvider("deepseek");
+		settings.agent.modelAggregations = [
+			{
+				id: "aggtest",
+				name: "Test Aggregation",
+				models: ["deepseek:gpt-4o"],
+				routingMode: "priority",
+			},
+		];
+		settings.agent.defaultModel = "__agg__:aggtest";
+
+		const resolved = resolveProviderAndModel("__default__");
+
+		expect(resolved.provider).toBe("deepseek");
+		expect(resolved.model).toBe("deepseek:gpt-4o");
+	});
+
+	test("self-referential defaultModel 使用硬 fallback，避免递归返回占位符", () => {
+		settings.agent.defaultModel = "__default__";
+
+	});
+
+	test("allowed pool 匹配 follow-default 不推进 balanced 聚合轮询", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "balanced-default-match",
+				name: "Balanced Default Match",
+				models: ["deepseek:model-a", "deepseek:model-b"],
+				routingMode: "balanced",
+			},
+		];
+		settings.agent.defaultModel = "__agg__:balanced-default-match";
+
+		expect(resolveAllowedModelCandidate("__default__", ["__default__"])).toBe("__default__");
+		expect(resolveEffectiveModel("__default__")).toBe("deepseek:model-a");
+	});
+
+	test("allowed pool 可将 follow-default 聚合限制到具体成员且不推进轮询", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "balanced-default-concrete",
+				name: "Balanced Default Concrete",
+				models: ["deepseek:model-a", "deepseek:model-b"],
+				routingMode: "balanced",
+			},
+		];
+		settings.agent.defaultModel = "__agg__:balanced-default-concrete";
+
+		expect(resolveAllowedModelCandidate("__default__", ["deepseek:model-b"])).toBe(
+			"deepseek:model-b",
+		);
+		expect(resolveEffectiveModel("__default__")).toBe("deepseek:model-a");
 	});
 });

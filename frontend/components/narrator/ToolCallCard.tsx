@@ -1381,6 +1381,9 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 			? (toolCall._metadata.startLine as number)
 			: undefined;
 
+	const isFailed = toolCall.status === "fail";
+	const localizedError = useLocalizedToolError(toolCall.errorMessage);
+
 	return (
 		<Box mt="xs">
 			{fp && (
@@ -1453,6 +1456,11 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					title={fp ? basename(fp) : "Edit"}
 					language="json"
 				/>
+			)}
+			{isFailed && localizedError && (
+				<Text size="xs" c="red" mt={4} style={{ whiteSpace: "pre-wrap" }}>
+					{localizedError}
+				</Text>
 			)}
 		</Box>
 	);
@@ -3588,10 +3596,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 		}
 	}, [toolCall.status, toolCall.startedAt, toolCall.durationMs, isTruncated]);
 	// Auto-expand: permission pending, todo tools, or edit tools.
-	// Failed Edit (not Write) defaults to collapsed (usually just a "read first" error).
+	// Failed Edit cards auto-expand so the user can see the failure reason.
 	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.
 	const isFailed = toolCall.status === "fail";
-	const isFailedEdit = isFailed && toolCall.toolName === "Edit";
 	const isDeniedPlan = isFailed && toolCall.toolName === "ExitPlanMode";
 	// When data is truncated (loaded from history), default to collapsed to avoid
 	// triggering expensive detail-fetch API calls. The card will expand if the user
@@ -3606,7 +3613,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			cat === "recall" ||
 			(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 			(cat === "plan" && !isDeniedPlan) ||
-			(isEdit && !isFailedEdit && !isTruncated) ||
+			(isEdit && !isTruncated) ||
 			(isFailed && !isEdit && !isDeniedPlan && !isTruncated));
 	const [opened, setOpened] = useState(defaultOpen);
 
@@ -3653,8 +3660,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				cat === "recall" ||
 				cat === "plan" ||
 				cat === "bash" ||
-				(isEdit && !isFailedEdit) ||
-				(isFailed && !isEdit && !isDeniedPlan);
+				isEdit ||
+				(isFailed && !isDeniedPlan);
 			if (shouldOpen) setOpened(true);
 		}
 	}, [
@@ -3664,7 +3671,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 		toolCall.status,
 		cat,
 		isEdit,
-		isFailedEdit,
 		isFailed,
 		isDeniedPlan,
 	]);

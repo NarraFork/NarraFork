@@ -8,6 +8,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
+	resolveEffectiveModel,
 	resolveProvider,
 	usesCodexApiMode,
 } from "../lib/settings";
@@ -318,6 +319,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		locale,
 		signal,
 	} = opts;
+	model = resolveEffectiveModel(model);
+	provider = resolveProvider(model);
 
 	let {
 		systemPrompt,

@@ -116,11 +116,26 @@ export function registerClineModelLister(lister: () => string[]): void {
  */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
+/** Hard fallback used if the configured default model is accidentally self-referential. */
+
 /**
  * Prefix for model aggregation values stored in narrators.model.
  * Format: "__agg__:{aggId}" for auto mode, "__agg__:{aggId}:{provider:model}" for pinned provider.
  */
 export const AGG_MODEL_PREFIX = "__agg__:";
+
+/**
+ * Parse a model string that may contain a "provider:" prefix.
+ */
+export function parseModelId(raw?: string): { provider?: string; model: string } {
+	if (!raw) return { model: "" };
+	const idx = raw.indexOf(":");
+	if (idx > 0) {
+		const prefix = raw.slice(0, idx);
+		return { provider: prefix, model: raw.slice(idx + 1) };
+	}
+	return { model: raw };
+}
 
 /**
  * Parse an aggregation model value.
@@ -190,41 +205,149 @@ export function resolveAggregation(aggId: string, stickyProvider?: string): stri
 
 /**
  * Resolve the effective model string. If the stored value is null, undefined,
- * or the `__default__` sentinel, fall back to `settings.agent.defaultModel`.
+ * or the `__default__` sentinel (including accidental `provider:__default__` values),
+ * fall back to the configured default model. If that default is itself a sentinel,
+ * use a hard fallback so the placeholder is never sent upstream.
  * If the value is an aggregation (`__agg__:id` or `__agg__:id:provider:model`),
  * resolve to the pinned model or delegate to aggregation routing.
  */
+function isFollowDefaultModelValue(model: string): boolean {
+	if (model === FOLLOW_DEFAULT_MODEL) return true;
+	const parsed = parseModelId(model);
+	return !!parsed.provider && parsed.model === FOLLOW_DEFAULT_MODEL;
+}
+
+function sanitizeResolvedModelCandidate(model: string | null | undefined): string | null {
+	const trimmed = model?.trim();
+	if (!trimmed) return null;
+	if (isFollowDefaultModelValue(trimmed)) return FALLBACK_DEFAULT_MODEL;
+	return trimmed;
+}
+
+function resolveConfiguredDefaultModel(stickyProvider?: string): string {
+	const configured = s().agent.defaultModel?.trim();
+	if (!configured || isFollowDefaultModelValue(configured)) return FALLBACK_DEFAULT_MODEL;
+
+	const agg = parseAggModelValue(configured);
+	if (agg) {
+		if (agg.pinnedModel) {
+			return sanitizeResolvedModelCandidate(agg.pinnedModel) ?? FALLBACK_DEFAULT_MODEL;
+		}
+		return (
+			sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider)) ??
+			FALLBACK_DEFAULT_MODEL
+		);
+	}
+
+	return configured;
+}
+
+function normalizeModelReference(model: string | null | undefined): string | null {
+	const trimmed = model?.trim();
+	if (!trimmed) return null;
+	return trimmed === "default" ? FOLLOW_DEFAULT_MODEL : trimmed;
+}
+
+function isMetaModelReference(model: string): boolean {
+	return isFollowDefaultModelValue(model) || !!parseAggModelValue(model);
+}
+
+function expandModelReferenceForMatching(
+	model: string | null | undefined,
+	seen = new Set<string>(),
+): Set<string> {
+	const normalized = normalizeModelReference(model);
+	const values = new Set<string>();
+	if (!normalized) return values;
+
+	values.add(normalized);
+	if (seen.has(normalized)) return values;
+	seen.add(normalized);
+
+	if (isFollowDefaultModelValue(normalized)) {
+		for (const value of expandModelReferenceForMatching(s().agent.defaultModel, seen)) {
+			values.add(value);
+		}
+		return values;
+	}
+
+	const agg = parseAggModelValue(normalized);
+	if (!agg) return values;
+
+	if (agg.pinnedModel) {
+		for (const value of expandModelReferenceForMatching(agg.pinnedModel, seen)) {
+			values.add(value);
+		}
+		return values;
+	}
+
+	for (const member of getAggregation(agg.aggId)?.models ?? []) {
+		for (const value of expandModelReferenceForMatching(member, seen)) {
+			values.add(value);
+		}
+	}
+	return values;
+}
+
+function findConcreteIntersection(left: Set<string>, right: Set<string>): string | null {
+	for (const value of left) {
+		if (right.has(value) && !isMetaModelReference(value)) return value;
+	}
+	return null;
+}
+
+/**
+ * Resolve a candidate model against an allowed-model pool without triggering
+ * aggregation routing. This is important for balanced aggregations: validation
+ * should not advance round-robin state before the model is actually selected.
+ */
+export function resolveAllowedModelCandidate(
+	candidate: string | null | undefined,
+	allowedPool: string[],
+): string | null {
+	const raw = normalizeModelReference(candidate);
+	if (!raw) return null;
+	if (allowedPool.length === 0) return raw;
+
+	const candidateValues = expandModelReferenceForMatching(raw);
+	for (const allowedRaw of allowedPool) {
+		const allowed = normalizeModelReference(allowedRaw);
+		if (!allowed) continue;
+
+		const allowedValues = expandModelReferenceForMatching(allowed);
+		if (allowedValues.has(raw)) return raw;
+
+		const concrete = findConcreteIntersection(candidateValues, allowedValues);
+		if (concrete) return concrete;
+	}
+
+	return null;
+}
+
 export function resolveEffectiveModel(
 	model: string | null | undefined,
 	stickyProvider?: string,
 ): string {
-	if (!model || model === FOLLOW_DEFAULT_MODEL) return s().agent.defaultModel;
+	const raw = model?.trim();
+	if (!raw || isFollowDefaultModelValue(raw)) return resolveConfiguredDefaultModel(stickyProvider);
 
-	const agg = parseAggModelValue(model);
+	const agg = parseAggModelValue(raw);
 	if (agg) {
 		// Pinned to a specific provider within the aggregation
-		if (agg.pinnedModel) return agg.pinnedModel;
+		if (agg.pinnedModel) {
+			return (
+				sanitizeResolvedModelCandidate(agg.pinnedModel) ??
+				resolveConfiguredDefaultModel(stickyProvider)
+			);
+		}
 		// Auto mode — resolve via aggregation routing
-		const resolved = resolveAggregation(agg.aggId, stickyProvider);
+		const resolved = sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider));
 		if (resolved) return resolved;
 		// Fallback to default if aggregation has no members
-		return s().agent.defaultModel;
+		return resolveConfiguredDefaultModel(stickyProvider);
 	}
 
-	return model;
-}
-
-/**
- * Parse a model string that may contain a "provider:" prefix.
- */
-export function parseModelId(raw?: string): { provider?: string; model: string } {
-	if (!raw) return { model: "" };
-	const idx = raw.indexOf(":");
-	if (idx > 0) {
-		const prefix = raw.slice(0, idx);
-		return { provider: prefix, model: raw.slice(idx + 1) };
-	}
-	return { model: raw };
+	return raw;
 }
 
 /**

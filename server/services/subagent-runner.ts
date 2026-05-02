@@ -12,7 +12,13 @@ import {
 	parseTraits,
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { resolveEffectiveModel, resolveProvider, settings } from "../lib/settings";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	resolveAllowedModelCandidate,
+	resolveEffectiveModel,
+	resolveProvider,
+	settings,
+} from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
@@ -647,25 +653,21 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	const allowedPool = settings.agent.subagentAllowedModels?.[poolKey] ?? [];
 	let resolvedModelInput: string | undefined;
 	if (allowedPool.length > 0) {
-		// Resolve sentinel values in the pool (e.g. "__default__" or bare "default")
-		// to the actual default model so they can match real candidate model IDs.
-		const poolSet = new Set(
-			allowedPool.map((m) => resolveEffectiveModel(m === "default" ? null : m)),
-		);
 		const parent = await narratorService.getById(parentNarratorId);
-		// Resolve __default__ sentinel to the actual default model so it can match the pool.
-		const parentModel = parent.model ? resolveEffectiveModel(parent.model) : undefined;
 		const candidates = [
 			explicitModel,
 			subagentPref,
-			parentModel,
+			parent.model ?? FOLLOW_DEFAULT_MODEL,
 			settings.agent.defaultModel,
 		].filter((m): m is string => !!m);
-		resolvedModelInput = candidates.find((m) => poolSet.has(m));
+		resolvedModelInput =
+			candidates
+				.map((candidate) => resolveAllowedModelCandidate(candidate, allowedPool))
+				.find((candidate): candidate is string => !!candidate) ?? undefined;
 		if (!resolvedModelInput) {
 			throw new ValidationError(
 				`No candidate model is in the allowed pool for "${poolKey}" subagents. ` +
-					`Allowed models: ${[...poolSet].join(", ")}. ` +
+					`Allowed models: ${allowedPool.join(", ")}. ` +
 					`Please specify one of these models explicitly.`,
 			);
 		}
@@ -684,7 +686,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	});
 
 	const subagentId = subagent.id;
-	const model = subagent.model ?? settings.agent.defaultModel;
+	const model = resolveEffectiveModel(subagent.model);
 	const provider = resolveProvider(model);
 
 	// 2. Persist subagent's user message (linked to parent's tool_use)
@@ -868,7 +870,7 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	}
 
 	const subagentType = getSubagentType(original.variant) ?? original.subagentType ?? "general";
-	const model = original.model ?? settings.agent.defaultModel;
+	const model = resolveEffectiveModel(original.model);
 	const provider = resolveProvider(model);
 	const cwd = original.cwd ?? ".";
 
