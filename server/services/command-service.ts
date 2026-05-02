@@ -64,13 +64,24 @@ export interface BashCommandResult {
 	rawCommand: string;
 }
 
+export type GoalCommandAction = "list" | "add" | "pause" | "resume" | "complete" | "clear";
+
+export interface GoalCommandResult {
+	resolved: true;
+	goalCommand: true;
+	action: GoalCommandAction;
+	objective?: string;
+	rawCommand: string;
+}
+
 export type ResolveResult =
 	| CommandResolveResult
 	| CommandNotResolved
 	| LoadToolResult
 	| LoadToolNotFound
 	| LoadSkillResult
-	| BashCommandResult;
+	| BashCommandResult
+	| GoalCommandResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -257,6 +268,32 @@ export async function resolveCommand(
 		return { resolved: true, bashCommand, rawCommand: prompt };
 	}
 
+	// Handle /goal — manage narrator goal backlog without sending a model turn.
+	if (parsed.name.toLowerCase() === "goal") {
+		const input = parsed.input.trim();
+		const lower = input.toLowerCase();
+		if (!input) return { resolved: true, goalCommand: true, action: "list", rawCommand: prompt };
+		if (lower === "pause") {
+			return { resolved: true, goalCommand: true, action: "pause", rawCommand: prompt };
+		}
+		if (lower === "resume") {
+			return { resolved: true, goalCommand: true, action: "resume", rawCommand: prompt };
+		}
+		if (lower === "done" || lower === "complete") {
+			return { resolved: true, goalCommand: true, action: "complete", rawCommand: prompt };
+		}
+		if (lower === "clear") {
+			return { resolved: true, goalCommand: true, action: "clear", rawCommand: prompt };
+		}
+		return {
+			resolved: true,
+			goalCommand: true,
+			action: "add",
+			objective: input,
+			rawCommand: prompt,
+		};
+	}
+
 	const commands = await getAvailableCommands(narratorId, userId);
 	const cmd = commands.find((c) => c.name.toLowerCase() === parsed.name.toLowerCase());
 	if (!cmd) return { resolved: false };
@@ -348,10 +385,19 @@ export async function getSlashMenuItems(
 	narratorId: string,
 	userId: string,
 ): Promise<{ commands: ResolvedCommand[]; skills: SkillSummary[]; tools: OptionalToolMenuItem[] }> {
-	const [commands, gitPath] = await Promise.all([
+	const [customCommands, gitPath] = await Promise.all([
 		getAvailableCommands(narratorId, userId),
 		getProjectGitPathForNarrator(narratorId),
 	]);
+	const commands: ResolvedCommand[] = [
+		{
+			name: "goal",
+			prompt: "/goal <objective>",
+			description: "Add or manage long-running goals",
+			source: "user",
+		},
+		...customCommands,
+	];
 
 	// Load global skills + project skills (merged), then tag source
 	let skills: SkillSummary[] = [];

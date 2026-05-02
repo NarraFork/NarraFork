@@ -252,6 +252,23 @@ export interface BufferMessageSummary {
 	creator?: BufferCreator | null;
 }
 
+export type NarratorGoalStatus = "pending" | "active" | "paused" | "complete" | "cancelled";
+
+export interface NarratorGoal {
+	id: string;
+	narratorId: string;
+	objective: string;
+	status: NarratorGoalStatus;
+	sortOrder: number;
+	tokensUsed: number;
+	timeUsedSeconds: number;
+	createdBy: string | null;
+	creator?: BufferCreator | null;
+	completedAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface TreeMessage {
 	id: string;
 	narratorId: string;

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
-import { api, type BufferMessageSummary } from "../../lib/api";
+import { api, type BufferMessageSummary, type NarratorGoal } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
 import { clearToolBlockCache, type StreamingBlock } from "./message-segments";
@@ -1703,6 +1703,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 6000,
 				});
 			},
+			onGoalsSet: (goals: NarratorGoal[]) => {
+				qc.setQueryData(["narrators", narratorId, "goals"], { goals });
+			},
 			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, permissionMode } : old,
@@ -1759,7 +1762,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setBrowserSessionCount(count);
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
 			},
-			onWebSearch: (id, status, query, queries, outputIndex) => {
+			onWebSearch: (id, status, query, queries, outputIndex, parentToolUseId) => {
+				// Subagent native searches are delivered to the parent for bookkeeping,
+				// but must not populate the parent's top-level streaming message.
+				if (parentToolUseId) return;
 				const blocks = streamingBlocksRef.current;
 				const existingIdx = blocks.findIndex((b) => b.type === "web_search" && b.id === id);
 				if (existingIdx !== -1) {
@@ -1782,7 +1788,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				flushStreamingVersion();
 			},
-			onImageGeneration: (id, status, revisedPrompt, outputIndex) => {
+			onImageGeneration: (id, status, revisedPrompt, outputIndex, parentToolUseId) => {
+				// Subagent native image generation events should stay out of the parent's
+				// top-level streaming message; the subagent page receives an unlinked copy.
+				if (parentToolUseId) return;
 				const blocks = streamingBlocksRef.current;
 				const existingIdx = blocks.findIndex((b) => b.type === "image_generation" && b.id === id);
 				if (existingIdx !== -1) {

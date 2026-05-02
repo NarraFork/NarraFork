@@ -49,6 +49,7 @@ import {
 	type EventHandlerContext,
 	type EventHooks,
 	processEvent,
+	type TokenUsageSnapshot,
 } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
@@ -80,6 +81,7 @@ import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
 
+import { narratorGoalService } from "./narrator-goal-service";
 import type {
 	ActiveNarrator,
 	BufferCreator,
@@ -407,6 +409,66 @@ async function finalizeInterruptedRun(
 }
 
 // === Agent loop execution ===
+
+/** Append pending todos to the user message text so the model has context. */
+function tokenUsageValue(usage?: TokenUsageSnapshot): number {
+	return narratorGoalService.goalTokenDeltaForUsage(usage);
+}
+
+async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
+	const startedAt = active._goalTurnStartedAtMs;
+	if (!startedAt) return;
+	const secondsDelta = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+	const tokenDelta = Math.max(
+		0,
+		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._goalTokenUsageBaseline),
+	);
+	await narratorGoalService.accountActiveGoalUsage(active.narratorId, tokenDelta, secondsDelta);
+	active._goalTurnStartedAtMs = Date.now();
+	active._goalTokenUsageBaseline = active._lastTokenUsage;
+}
+
+async function maybeStartGoalContinuation(
+	active: ActiveNarrator,
+	freshNarrator: { permissionMode?: string | null },
+	loopHadError: boolean,
+): Promise<string | null> {
+	if (
+		loopHadError ||
+		freshNarrator.permissionMode === "plan" ||
+		active._goalContinuationSuppressed
+	) {
+		return null;
+	}
+	const goals = await narratorGoalService.listGoals(active.narratorId);
+	const activeGoal = goals.find((goal) => goal.status === "active");
+	if (!activeGoal) return null;
+	const prompt = narratorGoalService.buildGoalContinuationPrompt(activeGoal, goals);
+	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
+		{ type: "goal_continuation", goalId: activeGoal.id, objective: activeGoal.objective },
+	]);
+	broadcastToNarrator(active.narratorId, {
+		type: "message",
+		narratorId: active.narratorId,
+		message: {
+			id: msg.id,
+			narratorId: active.narratorId,
+			role: msg.role,
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			seq: msg.seq,
+			children: [],
+		},
+	});
+	broadcastToNarrator(active.narratorId, {
+		type: "goal_continuation",
+		narratorId: active.narratorId,
+		goal: activeGoal,
+	});
+	active._goalContinuationTurn = true;
+	return prompt;
+}
 
 /** Append pending todos to the user message text so the model has context. */
 function appendTodosContext(text: string, todosJson: unknown): string {
@@ -1295,6 +1357,8 @@ export async function runAgentLoop(
 				? ""
 				: appendTodosContext(currentText, freshNarrator.todosJson);
 
+			active._goalTurnStartedAtMs = Date.now();
+			active._goalTokenUsageBaseline = active._lastTokenUsage;
 			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
 				config,
@@ -1305,6 +1369,16 @@ export async function runAgentLoop(
 				eventContext,
 				hooks,
 			});
+
+			await accountGoalUsageForTurn(active).catch((err) => {
+				logger.warn("Failed to account goal usage", { narratorId, error: String(err) });
+			});
+			if (active._goalContinuationTurn) {
+				active._goalContinuationSuppressed = !result.hadToolUses;
+				active._goalContinuationTurn = false;
+			} else {
+				active._goalContinuationSuppressed = false;
+			}
 
 			if (
 				shouldFinalizeAbortBeforeRecovery(
@@ -1811,6 +1885,20 @@ export async function runAgentLoop(
 					currentImages = undefined;
 					continue;
 				}
+			}
+
+			const goalContinuationPrompt = await maybeStartGoalContinuation(
+				active,
+				freshNarrator,
+				loopHadError,
+			);
+			if (goalContinuationPrompt) {
+				await narratorService.updateStatus(narratorId, "working");
+				// The continuation prompt was persisted as a system message; the next
+				// provider call only needs an empty turn to advance the conversation.
+				currentText = "";
+				currentImages = undefined;
+				continue;
 			}
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)

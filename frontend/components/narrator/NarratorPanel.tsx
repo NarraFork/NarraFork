@@ -85,6 +85,7 @@ import {
 	getNarratorMessagesQueryKey,
 	useArchiveNarrator,
 	useBlacklistDirs,
+	useClearNarratorGoals,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useCreateBlacklistDir,
@@ -98,8 +99,11 @@ import {
 	useForkNarrator,
 	useInterruptNarrator,
 	useNarrator,
+	useNarratorGoals,
 	useNarratorMessages,
 	usePromoteNarrator,
+	useRemoveNarratorGoal,
+	useReorderNarratorGoals,
 	useRollbackPreview,
 	useStartAskInPassing,
 	useUpdateBlacklistDir,
@@ -107,6 +111,7 @@ import {
 	useUpdateCmdWhitelist,
 	useUpdateFastMode,
 	useUpdateModel,
+	useUpdateNarratorGoal,
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
@@ -118,7 +123,14 @@ import {
 import { useGlobalOverseer } from "../../hooks/useOverseers";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { ApiError, api, type BufferMessageSummary, type TreeMessage } from "../../lib/api";
+import {
+	ApiError,
+	api,
+	type BufferMessageSummary,
+	type NarratorGoal,
+	type NarratorGoalStatus,
+	type TreeMessage,
+} from "../../lib/api";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
@@ -886,6 +898,140 @@ function ReasoningEffortMenuItems({
 	);
 }
 
+function formatGoalUsage(goal: NarratorGoal): string {
+	const seconds = Math.max(0, goal.timeUsedSeconds);
+	const time =
+		seconds < 60
+			? `${seconds}s`
+			: seconds < 3600
+				? `${Math.floor(seconds / 60)}m`
+				: `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+	const tokens =
+		goal.tokensUsed >= 1000 ? `${(goal.tokensUsed / 1000).toFixed(1)}K` : String(goal.tokensUsed);
+	return `${time} · ${tokens} tok`;
+}
+
+function goalStatusColor(status: NarratorGoalStatus): string {
+	if (status === "active") return "green";
+	if (status === "paused") return "yellow";
+	if (status === "complete") return "gray";
+	if (status === "cancelled") return "red";
+	return "teal";
+}
+
+function SortableGoalItem({
+	goal,
+	index,
+	onStatus,
+	onRemove,
+	t,
+}: {
+	goal: NarratorGoal;
+	index: number;
+	onStatus: (goalId: string, status: NarratorGoalStatus) => void;
+	onRemove: (goalId: string) => void;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: goal.id,
+	});
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0.5 : 1,
+	};
+	return (
+		<Group
+			ref={setNodeRef}
+			style={style}
+			px="md"
+			py={4}
+			gap="xs"
+			wrap="nowrap"
+			bg="var(--mantine-color-teal-light)"
+		>
+			<div
+				{...attributes}
+				{...listeners}
+				style={{
+					cursor: "grab",
+					display: "flex",
+					alignItems: "center",
+					flexShrink: 0,
+					touchAction: "none",
+					minWidth: 24,
+					minHeight: 24,
+					justifyContent: "center",
+				}}
+			>
+				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
+			</div>
+			{goal.creator ? (
+				<UserAvatar
+					username={goal.creator.username}
+					avatarColor={goal.creator.avatarColor}
+					avatarImageId={goal.creator.avatarImageId}
+					userId={goal.creator.id}
+					size={16}
+					showTooltip={false}
+				/>
+			) : (
+				<Text size="xs" c="dimmed" w={16} ta="center" style={{ flexShrink: 0 }}>
+					{index + 1}
+				</Text>
+			)}
+			<Badge
+				size="xs"
+				color={goalStatusColor(goal.status)}
+				variant="light"
+				style={{ flexShrink: 0 }}
+			>
+				{t(`goalStatus_${goal.status}`)}
+			</Badge>
+			<Text size="xs" c="teal" truncate style={{ flex: 1 }}>
+				{goal.objective}
+			</Text>
+			<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+				{formatGoalUsage(goal)}
+			</Text>
+			{goal.status === "active" && (
+				<ActionIcon
+					size="xs"
+					variant="subtle"
+					color="yellow"
+					onClick={() => onStatus(goal.id, "paused")}
+					title={t("pauseGoal")}
+				>
+					<IconBolt size={12} />
+				</ActionIcon>
+			)}
+			{goal.status === "paused" && (
+				<ActionIcon
+					size="xs"
+					variant="subtle"
+					color="green"
+					onClick={() => onStatus(goal.id, "active")}
+					title={t("resumeGoal")}
+				>
+					<IconCheck size={12} />
+				</ActionIcon>
+			)}
+			{goal.status !== "complete" && (
+				<ActionIcon
+					size="xs"
+					variant="subtle"
+					color="green"
+					onClick={() => onStatus(goal.id, "complete")}
+					title={t("completeGoal")}
+				>
+					<IconCheck size={12} />
+				</ActionIcon>
+			)}
+			<CloseButton size="xs" onClick={() => onRemove(goal.id)} title={t("removeGoal")} />
+		</Group>
+	);
+}
+
 function SortableQueuedMessageItem({
 	msg,
 	index,
@@ -1156,6 +1302,12 @@ export function NarratorPanel({
 	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
 	const updateConclusionMutation = useUpdateSubagentConclusion();
+	const { data: goalsData } = useNarratorGoals(narratorId);
+	const goals = goalsData?.goals ?? [];
+	const updateGoalMutation = useUpdateNarratorGoal(narratorId);
+	const removeGoalMutation = useRemoveNarratorGoal(narratorId);
+	const clearGoalsMutation = useClearNarratorGoals(narratorId);
+	const reorderGoalsMutation = useReorderNarratorGoals(narratorId);
 
 	const aroundOptions = useMemo(
 		() =>
@@ -3689,6 +3841,35 @@ export function NarratorPanel({
 		}
 	};
 
+	const [goalsExpanded, setGoalsExpanded] = useState(false);
+	useEffect(() => {
+		if (goals.length <= QUEUE_COLLAPSE_THRESHOLD) setGoalsExpanded(false);
+	}, [goals.length]);
+
+	const handleGoalStatus = (goalId: string, status: NarratorGoalStatus) => {
+		updateGoalMutation.mutate({ goalId, status });
+	};
+	const handleRemoveGoal = (goalId: string) => {
+		removeGoalMutation.mutate(goalId);
+	};
+	const handleClearGoals = () => {
+		clearGoalsMutation.mutate();
+	};
+	const handleDragEndGoals = useCallback(
+		(event: DragEndEvent) => {
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const oldIndex = goals.findIndex((goal) => goal.id === active.id);
+			const newIndex = goals.findIndex((goal) => goal.id === over.id);
+			if (oldIndex === -1 || newIndex === -1) return;
+			const newOrder = [...goals];
+			const [moved] = newOrder.splice(oldIndex, 1);
+			newOrder.splice(newIndex, 0, moved);
+			reorderGoalsMutation.mutate(newOrder.map((goal) => goal.id));
+		},
+		[goals, reorderGoalsMutation],
+	);
+
 	const handleCancelAllQueued = () => {
 		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
@@ -4755,6 +4936,107 @@ export function NarratorPanel({
 						</Group>
 					)}
 
+					{/* Goal list indicator */}
+					{goals.length > 0 && (
+						<Stack
+							gap={0}
+							style={{
+								borderTop:
+									attachedImages.length > 0
+										? undefined
+										: "1px solid var(--mantine-color-default-border)",
+								flexShrink: 0,
+							}}
+						>
+							{goals.length > QUEUE_COLLAPSE_THRESHOLD && !goalsExpanded ? (
+								<Group
+									component="button"
+									px="md"
+									py={4}
+									gap="xs"
+									wrap="nowrap"
+									bg="var(--mantine-color-teal-light)"
+									style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
+									onClick={() => setGoalsExpanded(true)}
+									aria-expanded={false}
+									aria-label={t("goalsCount", { count: goals.length })}
+								>
+									<IconChevronUp size={14} color="var(--mantine-color-teal-5)" />
+									<Text size="xs" c="teal" fw={500} style={{ flexShrink: 0 }}>
+										{t("goalsCount", { count: goals.length })}
+									</Text>
+									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
+										{goals[0].objective}
+									</Text>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										color="red"
+										onClick={(e) => {
+											e.stopPropagation();
+											handleClearGoals();
+										}}
+									>
+										{t("clearAllGoals")}
+									</Button>
+								</Group>
+							) : (
+								<>
+									<DndContext
+										sensors={sensors}
+										collisionDetection={closestCenter}
+										onDragEnd={handleDragEndGoals}
+									>
+										<SortableContext
+											items={goals.map((goal) => goal.id)}
+											strategy={verticalListSortingStrategy}
+										>
+											{goals.map((goal, index) => (
+												<SortableGoalItem
+													key={goal.id}
+													goal={goal}
+													index={index}
+													onStatus={handleGoalStatus}
+													onRemove={handleRemoveGoal}
+													t={t}
+												/>
+											))}
+										</SortableContext>
+									</DndContext>
+									{goals.length > 1 && (
+										<Group
+											px="md"
+											py={2}
+											justify="flex-end"
+											gap="xs"
+											style={{ backgroundColor: "var(--mantine-color-teal-light)" }}
+										>
+											{goals.length > QUEUE_COLLAPSE_THRESHOLD && (
+												<Button
+													size="compact-xs"
+													variant="subtle"
+													color="teal"
+													onClick={() => setGoalsExpanded(false)}
+													leftSection={<IconChevronDown size={12} />}
+												>
+													{t("collapseGoals")}
+												</Button>
+											)}
+											<Button
+												size="compact-xs"
+												variant="subtle"
+												color="red"
+												onClick={handleClearGoals}
+											>
+												{t("clearAllGoals")}
+											</Button>
+										</Group>
+									)}
+								</>
+							)}
+						</Stack>
+					)}
+
 					{/* Queued messages indicator */}
 					{queuedMessages.length > 0 && (
 						<Stack
@@ -4880,7 +5162,7 @@ export function NarratorPanel({
 						wrap="nowrap"
 						style={{
 							borderTop:
-								attachedImages.length > 0 || queuedMessages.length > 0
+								attachedImages.length > 0 || goals.length > 0 || queuedMessages.length > 0
 									? undefined
 									: "1px solid var(--mantine-color-default-border)",
 							flexShrink: 0,

@@ -50,6 +50,8 @@ export type {
 	DatabaseStorageBreakdown,
 	HookApiRecord,
 	MessagesAroundOptions,
+	NarratorGoal,
+	NarratorGoalStatus,
 	PaginatedMessages,
 	PaginatedNarrators,
 	RuntimeScanResult,

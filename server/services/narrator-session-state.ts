@@ -76,6 +76,12 @@ export interface ActiveNarrator {
 	_loopRunning?: boolean;
 	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
 	_substatus: Set<string>;
+	/** Goal accounting baseline at the start of the current turn. */
+	_goalTurnStartedAtMs?: number;
+	_goalTokenUsageBaseline?: TokenUsageSnapshot;
+	/** Guard against infinite goal continuation when a continuation turn makes no progress. */
+	_goalContinuationSuppressed?: boolean;
+	_goalContinuationTurn?: boolean;
 }
 
 // === PendingPermission interface ===

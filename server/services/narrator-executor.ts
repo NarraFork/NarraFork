@@ -30,6 +30,8 @@ export interface ExecuteLoopResult {
 	silentDisconnect?: boolean;
 	/** Set when the agent loop was aborted before the turn completed normally. */
 	aborted?: boolean;
+	/** Whether the completed turn included any tool call. */
+	hadToolUses?: boolean;
 
 	/**
 	 * When true, the interrupted turn should be resumed by replaying the
@@ -93,6 +95,7 @@ export async function executeAgentLoop(
 	let sawMeaningfulAssistantOutput = false;
 	let sawCompletedImageGeneration = false;
 	let lastAssistantHadToolUses = false;
+	let hadToolUses = false;
 
 	for await (const event of eventSource) {
 		if (isMeaningfulAssistantOutputEvent(event)) {
@@ -147,6 +150,7 @@ export async function executeAgentLoop(
 			finalText = event.text || "";
 			lastToolNames = event.toolUses.map((tu) => tu.name);
 			lastAssistantHadToolUses = event.toolUses.length > 0;
+			hadToolUses = hadToolUses || event.toolUses.length > 0;
 		}
 		if (event.type === "context_length_exceeded") {
 			contextLengthExceeded = true;
@@ -220,6 +224,7 @@ export async function executeAgentLoop(
 		interrupted,
 		silentDisconnect,
 		aborted,
+		hadToolUses,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),
 	};

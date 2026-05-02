@@ -2447,7 +2447,7 @@ export const MessageBubble = memo(function MessageBubble({
 	}
 
 	// System / display messages (compact indicators / plan cards / error notices / info notices)
-	if (message.role === "system" || message.role === "disp") {
+	if (message.role === "system" || message.role === "sys" || message.role === "disp") {
 		// Regular compact indicators / plan cards
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const compactBlock = blocks.find((b: any) => b.type === "compact");
@@ -2523,6 +2523,22 @@ export const MessageBubble = memo(function MessageBubble({
 					messageId={canNavigate ? message.id : undefined}
 					onDelete={canNavigate ? invalidateMessages : undefined}
 				/>
+			);
+		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const goalBlock = blocks.find((b: any) => b.type === "goal_continuation");
+		if (goalBlock) {
+			return (
+				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-teal-light)" }}>
+					<Group gap="xs" wrap="nowrap">
+						<Badge size="xs" color="teal" variant="light">
+							{t("goalContinuation")}
+						</Badge>
+						<Text size="xs" c="teal" truncate>
+							{goalBlock.objective ?? message.contentText}
+						</Text>
+					</Group>
+				</Paper>
 			);
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

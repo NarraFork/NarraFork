@@ -8,6 +8,7 @@ import { concludeReviewTool } from "./conclude-review";
 import { editTool } from "./edit";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
+import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { grepTool } from "./grep";
 import { narraforkAdminTool } from "./narrafork-admin";
 import {
@@ -76,6 +77,9 @@ const coreProvider: ToolProvider = {
 			grepTool,
 			webSearchTool,
 			webFetchTool,
+			getGoalsTool,
+			addGoalTool,
+			updateGoalTool,
 			taskCreateTool,
 			enterPlanModeTool,
 			exitPlanModeTool,

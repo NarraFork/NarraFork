@@ -1,6 +1,6 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { BufferMessageSummary, TreeMessage } from "../lib/api";
+import type { BufferMessageSummary, NarratorGoal, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,
 	narratorWSManager,
@@ -60,6 +60,8 @@ interface NarratorWSCallbacks {
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onBufferPreserved?: (messages: BufferMessageSummary[]) => void;
+	onGoalsSet?: (goals: NarratorGoal[]) => void;
+	onGoalContinuation?: (goal: NarratorGoal) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onOverseerReviewing?: (
@@ -96,12 +98,14 @@ interface NarratorWSCallbacks {
 		query?: string,
 		queries?: string[],
 		outputIndex?: number,
+		parentToolUseId?: string,
 	) => void;
 	onImageGeneration?: (
 		id: string,
 		status: "in_progress" | "generating" | "completed",
 		revisedPrompt?: string,
 		outputIndex?: number,
+		parentToolUseId?: string,
 	) => void;
 	onNarratorError?: (error: string, errorCode?: string) => void;
 	onNarratorWarning?: (info: {
@@ -370,6 +374,12 @@ export function useNarratorWS(
 					case "buffer_preserved":
 						callbacksRef.current.onBufferPreserved?.(data.messages as BufferMessageSummary[]);
 						break;
+					case "goals_set":
+						callbacksRef.current.onGoalsSet?.(data.goals as NarratorGoal[]);
+						break;
+					case "goal_continuation":
+						callbacksRef.current.onGoalContinuation?.(data.goal as NarratorGoal);
+						break;
 					case "permission_mode_changed":
 						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
 						break;
@@ -458,6 +468,7 @@ export function useNarratorWS(
 							data.query as string | undefined,
 							data.queries as string[] | undefined,
 							data.outputIndex as number | undefined,
+							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "image_generation":
@@ -466,6 +477,7 @@ export function useNarratorWS(
 							data.status as "in_progress" | "generating" | "completed",
 							data.revisedPrompt as string | undefined,
 							data.outputIndex as number | undefined,
+							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "narrator_error":

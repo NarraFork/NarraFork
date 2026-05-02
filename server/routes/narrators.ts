@@ -90,6 +90,7 @@ import {
 import { chapterFork } from "../services/chapter-fork";
 import type {
 	BashCommandResult,
+	GoalCommandResult,
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
@@ -104,6 +105,7 @@ import {
 	rebuildFileStatesExcluding,
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
+import { type NarratorGoalStatus, narratorGoalService } from "../services/narrator-goal-service";
 import {
 	handleBashCommand,
 	handleLoadSkillCommand,
@@ -430,6 +432,117 @@ narratorRoutes.get("/:id/commands", async (c) => {
 	return c.json(result);
 });
 
+function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {
+	if (value == null) return undefined;
+	if (["pending", "active", "paused", "complete", "cancelled"].includes(String(value))) {
+		return String(value) as NarratorGoalStatus;
+	}
+	throw new ValidationError("Invalid goal status");
+}
+
+async function handleGoalCommand(narratorId: string, cmd: GoalCommandResult, userId: string) {
+	switch (cmd.action) {
+		case "list":
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				goals: await narratorGoalService.listGoals(narratorId),
+			};
+		case "add":
+			if (!cmd.objective) throw new ValidationError("Goal objective is required");
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				...(await narratorGoalService.createGoal(narratorId, cmd.objective, userId)),
+			};
+		case "pause": {
+			const active = await narratorGoalService.getActiveGoal(narratorId);
+			if (!active) return { goalCommand: true, action: cmd.action, goal: null, goals: [] };
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				...(await narratorGoalService.updateGoal(narratorId, active.id, { status: "paused" })),
+			};
+		}
+		case "resume": {
+			const goals = await narratorGoalService.listGoals(narratorId);
+			const paused = goals.find((goal) => goal.status === "paused");
+			if (paused) {
+				return {
+					goalCommand: true,
+					action: cmd.action,
+					...(await narratorGoalService.updateGoal(narratorId, paused.id, { status: "active" })),
+				};
+			}
+			await narratorGoalService.activateNextPendingGoal(narratorId);
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				goals: await narratorGoalService.listGoals(narratorId),
+			};
+		}
+		case "complete":
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				...(await narratorGoalService.completeActiveGoal(narratorId)),
+			};
+		case "clear":
+			return {
+				goalCommand: true,
+				action: cmd.action,
+				...(await narratorGoalService.clearOpenGoals(narratorId)),
+			};
+	}
+}
+
+narratorRoutes.get("/:id/goals", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	return c.json({ goals: await narratorGoalService.listGoals(id) });
+});
+
+narratorRoutes.post("/:id/goals", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = (await c.req.json()) as { objective?: string };
+	if (!body.objective) throw new ValidationError("objective is required");
+	const userId = c.get("user").sub;
+	return c.json(await narratorGoalService.createGoal(id, body.objective, userId), 201);
+});
+
+narratorRoutes.patch("/:id/goals/:goalId", async (c) => {
+	const id = c.req.param("id");
+	const goalId = c.req.param("goalId");
+	await narratorService.getById(id);
+	const body = (await c.req.json()) as { objective?: string; status?: string };
+	const status = parseGoalStatus(body.status);
+	return c.json(
+		await narratorGoalService.updateGoal(id, goalId, { objective: body.objective, status }),
+	);
+});
+
+narratorRoutes.delete("/:id/goals/:goalId", async (c) => {
+	const id = c.req.param("id");
+	const goalId = c.req.param("goalId");
+	await narratorService.getById(id);
+	return c.json(await narratorGoalService.removeGoal(id, goalId));
+});
+
+narratorRoutes.put("/:id/goals/reorder", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const body = (await c.req.json()) as { orderedIds?: string[] };
+	if (!Array.isArray(body.orderedIds)) throw new ValidationError("orderedIds is required");
+	return c.json(await narratorGoalService.reorderGoals(id, body.orderedIds));
+});
+
+narratorRoutes.delete("/:id/goals", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	return c.json(await narratorGoalService.clearOpenGoals(id));
+});
+
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
@@ -475,6 +588,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			userId,
 		);
 		return c.json(bashResult, 201);
+	}
+	if (cmdResult.resolved && "goalCommand" in cmdResult) {
+		return c.json(await handleGoalCommand(id, cmdResult as GoalCommandResult, userId), 200);
 	}
 	let prePromptBashCommand: string | undefined;
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {

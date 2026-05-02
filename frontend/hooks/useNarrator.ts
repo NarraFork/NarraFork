@@ -5,6 +5,7 @@ import {
 	type BlacklistCmd,
 	type BlacklistDir,
 	type MessagesAroundOptions,
+	type NarratorGoalStatus,
 	type PaginatedNarrators,
 	type WhitelistCmd,
 	type WhitelistDir,
@@ -260,6 +261,61 @@ export function getNarratorMessagesQueryKey(
 				}
 			: { around: undefined },
 	] as const;
+}
+
+export function useNarratorGoals(narratorId: string) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "goals"],
+		queryFn: () => api.getGoals(narratorId),
+		enabled: !!narratorId,
+	});
+}
+
+export function useAddNarratorGoal(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (objective: string) => api.addGoal(narratorId, objective),
+		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
+	});
+}
+
+export function useUpdateNarratorGoal(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			goalId,
+			...data
+		}: {
+			goalId: string;
+			objective?: string;
+			status?: NarratorGoalStatus;
+		}) => api.updateGoal(narratorId, goalId, data),
+		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
+	});
+}
+
+export function useRemoveNarratorGoal(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (goalId: string) => api.removeGoal(narratorId, goalId),
+		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
+	});
+}
+
+export function useClearNarratorGoals(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.clearGoals(narratorId),
+		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
+	});
+}
+
+export function useReorderNarratorGoals(narratorId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (orderedIds: string[]) => api.reorderGoals(narratorId, orderedIds),
+		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
+	});
 }
 
 export function useNarrator(id: string) {

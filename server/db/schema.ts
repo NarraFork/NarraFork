@@ -291,6 +291,34 @@ export const narrators = sqliteTable(
 	],
 );
 
+// === narrator_goals ===
+export const narratorGoals = sqliteTable(
+	"narrator_goals",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		objective: text("objective").notNull(),
+		status: text("status", {
+			enum: ["pending", "active", "paused", "complete", "cancelled"],
+		})
+			.notNull()
+			.default("pending"),
+		sortOrder: integer("sort_order").notNull().default(0),
+		tokensUsed: integer("tokens_used").notNull().default(0),
+		timeUsedSeconds: integer("time_used_seconds").notNull().default(0),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		completedAt: text("completed_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_narrator_goals_narrator_order").on(table.narratorId, table.sortOrder),
+		index("idx_narrator_goals_status").on(table.narratorId, table.status),
+	],
+);
+
 // === narrator_messages ===
 export const narratorMessages = sqliteTable(
 	"narrator_messages",

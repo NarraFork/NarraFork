@@ -27,7 +27,13 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 	  }
 	// 看门狗检测到 bash/shell 进程运行 ≥60s 时推送，前端据此显示终止按钮
-	| { type: "tool_long_running"; narratorId: string; toolUseId: string; elapsed: number }
+	| {
+			type: "tool_long_running";
+			narratorId: string;
+			toolUseId: string;
+			elapsed: number;
+			parentToolUseId?: string;
+	  }
 	| {
 			type: "tool_completed";
 			narratorId: string;
@@ -37,6 +43,7 @@ export type NarratorServerMessage =
 			output?: unknown;
 			durationMs?: number;
 			updatedInput?: Record<string, unknown>;
+			parentToolUseId?: string;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| {
@@ -49,6 +56,8 @@ export type NarratorServerMessage =
 			feedbackText?: string;
 	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
+	| { type: "goals_set"; narratorId: string; goals: unknown[] }
+	| { type: "goal_continuation"; narratorId: string; goal: unknown }
 	| {
 			type: "buffer_set";
 			narratorId: string;
@@ -122,6 +131,8 @@ export type NarratorServerMessage =
 			status: "in_progress" | "searching" | "completed";
 			query?: string;
 			queries?: string[];
+			outputIndex?: number;
+			parentToolUseId?: string;
 	  }
 	| {
 			type: "image_generation";
@@ -130,6 +141,7 @@ export type NarratorServerMessage =
 			status: "in_progress" | "generating" | "completed";
 			revisedPrompt?: string;
 			outputIndex?: number;
+			parentToolUseId?: string;
 	  }
 	| {
 			type: "tool_started";
@@ -138,6 +150,7 @@ export type NarratorServerMessage =
 			toolName: string;
 			input: unknown;
 			streamStartedAt?: number;
+			parentToolUseId?: string;
 	  }
 	| {
 			type: "tool_use_chunk";
