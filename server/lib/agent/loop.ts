@@ -654,6 +654,8 @@ export async function* agentLoop(
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 		let chatRetryCount = 0;
 		let emptyResponseRetries = 0;
+		/** Set when a mimo model returns "..." as reasoning — triggers a retry. */
+		let mimoEllipsisRetry = false;
 
 		for (;;) {
 			// Reset per-attempt accumulators so a retry starts with a clean slate.
@@ -683,6 +685,7 @@ export async function* agentLoop(
 			receivedUsage = false;
 			sawMeaningfulResponse = false;
 			sawErrorEvent = false;
+			mimoEllipsisRetry = false;
 			// NOTE: lastRetryErrorMessage is intentionally NOT reset here.
 			// It persists across retries so that if a retry produces an empty
 			// response, we can surface the original error instead of the
@@ -1200,6 +1203,26 @@ export async function* agentLoop(
 							});
 						}
 					}
+
+					// ── Mimo ellipsis reasoning detection ──
+					// Some mimo models (via Anthropic protocol) emit "..." as the
+					// entire reasoning content, which is a degenerate response.
+					// When detected, discard the reasoning block and retry the request.
+					if (parsed.reasoningMetadata && effectiveModel.toLowerCase().includes("mimo")) {
+						const itemKey = reasoningBlockKey(parsed);
+						const entry = reasoningBlockMap.get(itemKey);
+						if (entry && entry.text.trim() === "...") {
+							logger.warn("Mimo model returned ellipsis-only reasoning, discarding and retrying", {
+								narratorId: config.narratorId,
+								model: effectiveModel,
+								provider: effectiveProvider,
+							});
+							reasoningBlockMap.delete(itemKey);
+							mimoEllipsisRetry = true;
+							break; // break out of for-await stream loop to trigger retry
+						}
+					}
+
 					if (parsed.redactedThinking) {
 						redactedThinkingBlocks.push({
 							data: parsed.redactedThinking.data,
@@ -1502,6 +1525,27 @@ export async function* agentLoop(
 				yield* finishRequest(msg);
 				yield { type: "error", message: msg };
 				return;
+			}
+
+			// ── Mimo ellipsis retry ──
+			// If a mimo model returned "..." as reasoning, discard and retry.
+			if (mimoEllipsisRetry) {
+				chatRetryCount++;
+				const delayMs = Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1), backoffCeil);
+				yield {
+					type: "retrying",
+					message: "Mimo model returned ellipsis-only reasoning, retrying",
+					attempt: chatRetryCount,
+					maxRetries: maxChatRetries,
+					delayMs,
+				};
+				yield* finishRequest("mimo ellipsis reasoning");
+				await abortableSleep(delayMs, config.signal);
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+				continue; // retry provider.chat()
 			}
 
 			// Empty response check — request succeeded but returned no content.

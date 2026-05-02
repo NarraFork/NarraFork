@@ -1406,6 +1406,7 @@ export async function processEvent(
 				query: event.query,
 				queries: event.queries,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}
@@ -1449,7 +1450,8 @@ export async function processEvent(
 				id: event.id,
 				status: event.status as "in_progress" | "generating" | "completed",
 				revisedPrompt: event.revisedPrompt,
-				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
+				outputIndex: event.outputIndex,
+				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;
 		}
