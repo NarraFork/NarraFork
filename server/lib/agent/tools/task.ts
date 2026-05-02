@@ -47,12 +47,6 @@ function buildParameters() {
 			.describe(
 				'The type of specialized agent to use for this task. Built-in types: "explore" (read-only codebase exploration), "plan" (architecture planning, only in plan mode), "general" (full write access). You can also use any custom subagent type name defined by the user.',
 			),
-		resume: z
-			.string()
-			.optional()
-			.describe(
-				"Optional agent ID to resume from. If provided, the agent will continue from the previous execution transcript.",
-			),
 		run_in_background: z
 			.boolean()
 			.optional()
@@ -80,7 +74,8 @@ function buildParameters() {
 			.optional()
 			.describe(
 				'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
-					"Must be unique within the current session. If omitted, an alias is auto-generated from the description.",
+					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
+					"Use this alias with Await or Send to reference the task later.",
 			),
 		stop: z
 			.string()
@@ -123,12 +118,6 @@ export const agentTool: ToolDefinition = {
 						'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "general". Custom types are also supported.',
 					type: "string",
 				},
-				resume: {
-					description:
-						"Optional agent ID to resume from. If the agent is idle, it continues from the previous execution transcript. " +
-						"If the agent is running in the background, it attaches to foreground and blocks until completion.",
-					type: "string",
-				},
 				run_in_background: {
 					description:
 						"Set to true to run this agent in the background. You will be notified when it completes.",
@@ -147,7 +136,7 @@ export const agentTool: ToolDefinition = {
 					description:
 						'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
 						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-						"Use this alias in resume to refer to the task later.",
+						"Use this alias with Await or Send to reference the task later.",
 					type: "string",
 				},
 				stop: {
@@ -169,7 +158,6 @@ export const agentTool: ToolDefinition = {
 			prompt?: string;
 			description?: string;
 			subagent_type?: string;
-			resume?: string;
 			run_in_background?: boolean;
 			model?: string;
 			workdir?: string;
@@ -212,7 +200,7 @@ export const agentTool: ToolDefinition = {
 			}
 		}
 
-		const { prompt, description, subagent_type, resume, model, workdir, alias } = raw;
+		const { prompt, description, subagent_type, model, workdir, alias } = raw;
 		// Prefer new name, fall back to legacy name for in-flight conversations
 		const run_in_background = raw.run_in_background ?? raw.background;
 
@@ -222,38 +210,6 @@ export const agentTool: ToolDefinition = {
 		const toolUseId = ctx.currentToolUseId;
 		if (!toolUseId) {
 			return { output: "Internal error: missing toolUseId", isError: true };
-		}
-
-		// Resume an existing subagent (ContinueTask semantics via Agent tool)
-		if (resume) {
-			const { continueSubagent, resolveTaskAlias } = await import(
-				"@server/services/narrator-subagent"
-			);
-			let resolvedId = resolveTaskAlias(ctx.narratorId, resume);
-
-			// If alias registry didn't resolve (returned raw input), try DB lookup
-			if (resolvedId === resume) {
-				const { backgroundTaskService } = await import("@server/services/background-task-service");
-				const task = await backgroundTaskService.getByAlias(resume, ctx.narratorId);
-				if (task) resolvedId = task.id;
-			}
-
-			try {
-				const result = await continueSubagent({
-					subagentId: resolvedId,
-					parentNarratorId: ctx.narratorId,
-					toolUseId,
-					prompt,
-					signal: ctx.signal,
-					locale: ctx.locale,
-				});
-				return { output: result };
-			} catch (err) {
-				return {
-					output: `Agent resume error: ${err instanceof Error ? err.message : String(err)}`,
-					isError: true,
-				};
-			}
 		}
 
 		// Lazy import to avoid circular dependency at module load time
@@ -313,7 +269,7 @@ export const agentTool: ToolDefinition = {
 					output +=
 						`\n\nNote: The requested alias "${alias || description}" was already taken. ` +
 						`This agent was assigned "${registeredAlias}" instead. ` +
-						`Use this alias to resume or reference this agent.`;
+						`Use this alias with Await or Send to reference this agent.`;
 				}
 
 				return { output };

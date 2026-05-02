@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { apiRequests, narratorMessages } from "../db/schema";
+import { apiRequests, narratorMessageRefs, narratorMessages } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { saveImageGenerationResult } from "../lib/agent/image-generation";
@@ -393,7 +393,16 @@ function translateReasoningBlock(
 				with: { toolCalls: true },
 			});
 			if (fullMessage) {
-				const processed = enrichToolUseBlocks(truncateToolIO([fullMessage]))[0];
+				const ref = await db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				});
+				const processed = enrichToolUseBlocks(
+					truncateToolIO([{ ...fullMessage, seq: ref?.seq }]),
+				)[0];
 				dualBroadcast(ctx, {
 					type: "message",
 					narratorId: broadcastTargetId,
@@ -882,10 +891,18 @@ export async function processEvent(
 				with: { toolCalls: true },
 			});
 
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, savedId),
+				),
+				columns: { seq: true },
+			});
+
 			// Apply the same truncation and enrichment as the HTTP API so WS and REST
 			// clients receive identically shaped messages.
 			const processed = fullMessage
-				? enrichToolUseBlocks(truncateToolIO([fullMessage]))[0]
+				? enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0]
 				: fullMessage;
 
 			// Subagent: attach model info

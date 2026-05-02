@@ -84,6 +84,21 @@ function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number |
 	);
 }
 
+function insertTopLevelMessageBySeq(messages: NarratorMsg[], newMsg: NarratorMsg): NarratorMsg[] {
+	const seq =
+		typeof newMsg.seq === "number" && Number.isFinite(newMsg.seq) ? newMsg.seq : undefined;
+	if (seq == null) return [...messages, newMsg];
+
+	const insertIdx = messages.findIndex(
+		(msg) => typeof msg.seq === "number" && Number.isFinite(msg.seq) && msg.seq > seq,
+	);
+	if (insertIdx === -1) return [...messages, newMsg];
+
+	const updated = [...messages];
+	updated.splice(insertIdx, 0, newMsg);
+	return updated;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -96,7 +111,7 @@ export interface UseNarratorPanelWSOptions {
 	/** Narrator prop for initial todos */
 	narratorTodosJson?: TodoItem[] | null;
 	narratorTodosToolUseId?: string | null;
-	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for ContinueTask */
+	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
 	 *  substatus survives page navigation (the WS-only path starts from []). */
@@ -1100,7 +1115,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								updated[optimisticIdx] = newMsg;
 								firstPage.messages = updated;
 							} else {
-								firstPage.messages = [...firstPage.messages, newMsg];
+								firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
 							}
 							pages[0] = firstPage;
 							// Evict oldest pages in the same callback to avoid an
@@ -1167,7 +1182,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						updated[optimisticIdx] = newMsg;
 						firstPage.messages = updated;
 					} else {
-						firstPage.messages = [...firstPage.messages, newMsg];
+						firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
 					}
 					pages[0] = firstPage;
 					// Evict oldest pages in the same callback to avoid double render
@@ -1947,7 +1962,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							.filter((m: NarratorMsg) => m?.id && m?.createdAt && !existingIds.has(m.id))
 							.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
 						if (newMsgs.length > 0) {
-							firstPage.messages = [...firstPage.messages, ...newMsgs];
+							firstPage.messages = newMsgs.reduce(
+								(messages, msg) => insertTopLevelMessageBySeq(messages, msg),
+								firstPage.messages,
+							);
 							pages[0] = firstPage;
 							result = { ...result, pages };
 						}
@@ -2275,7 +2293,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// With substatus refactor, "done" is now idle + substatus includes "unread".
 	const hasUnreadSubstatus = substatus.includes("unread");
 	useEffect(() => {
-		// Subagents must stay in done/error so ContinueTask can pick them up.
+		// Subagents must stay in done/error so follow-up Send can pick them up.
 		if (isSubagent) return;
 		// Preserve error sessions: do not auto-clear when an error exists.
 		if (narratorStatus === "idle" && hasUnreadSubstatus && !narratorErrorMessage) {

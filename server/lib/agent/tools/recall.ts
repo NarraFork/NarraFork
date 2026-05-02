@@ -306,8 +306,8 @@ function getToolCallSummary(toolName: string, inputJson: any): string {
 		const short = url.length > 50 ? `${url.slice(0, 47)}...` : url;
 		return mode ? `${mode}: ${short}` : short;
 	}
-	if (toolName === "Agent" || toolName === "ContinueTask") {
-		return extractStr(inputJson, "description", "prompt").slice(0, 60) || toolName;
+	if (toolName === "Agent" || toolName === "Send") {
+		return extractStr(inputJson, "description", "prompt", "message").slice(0, 60) || toolName;
 	}
 	if (toolName === "Terminal") {
 		const action = extractStr(inputJson, "action");

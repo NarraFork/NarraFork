@@ -105,16 +105,16 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id);
+		const seq = await appendMessageRef(narratorId, id);
 
 		if (createdBy) {
 			const user = await db.query.users.findFirst({
 				where: eq(users.id, createdBy),
 				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
 			});
-			return { ...msg, creator: user ?? null };
+			return { ...msg, seq, creator: user ?? null };
 		}
-		return { ...msg, creator: null };
+		return { ...msg, seq, creator: null };
 	},
 
 	async persistSystemMessage(
@@ -140,8 +140,8 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id);
-		return msg;
+		const seq = await appendMessageRef(narratorId, id);
+		return { ...msg, seq };
 	},
 
 	async persistDisplayMessage(narratorId: string, text: string) {
@@ -158,7 +158,7 @@ export const narratorPersistence = {
 				createdAt: now,
 			})
 			.returning();
-		await appendMessageRef(narratorId, id);
+		const seq = await appendMessageRef(narratorId, id);
 		broadcastToNarrator(narratorId, {
 			type: "message",
 			narratorId,
@@ -169,10 +169,11 @@ export const narratorPersistence = {
 				contentJson: msg.contentJson,
 				contentText: msg.contentText,
 				createdAt: msg.createdAt,
+				seq,
 				children: [],
 			},
 		});
-		return msg;
+		return { ...msg, seq };
 	},
 
 	async persistCompactingMessage(narratorId: string, beforeMessageId?: string) {
@@ -223,7 +224,7 @@ export const narratorPersistence = {
 			.returning();
 
 		await insertMessageRef(narratorId, id, seq);
-		return msg;
+		return { ...msg, seq };
 	},
 
 	async persistPlanMessage(narratorId: string, content: string) {
@@ -242,7 +243,7 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await db.transaction(async (tx) => {
+		const seq = await db.transaction(async (tx) => {
 			const result = await tx
 				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
 				.from(narratorMessageRefs)
@@ -259,9 +260,10 @@ export const narratorPersistence = {
 				.update(narrators)
 				.set({ contextSummary: content, apiConversationId: null, updatedAt: now })
 				.where(eq(narrators.id, narratorId));
+			return seq;
 		});
 
-		return msg;
+		return { ...msg, seq };
 	},
 
 	async clearContext(narratorId: string) {
@@ -280,7 +282,7 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await db.transaction(async (tx) => {
+		const seq = await db.transaction(async (tx) => {
 			const result = await tx
 				.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
 				.from(narratorMessageRefs)
@@ -297,9 +299,10 @@ export const narratorPersistence = {
 				.update(narrators)
 				.set({ contextSummary: null, apiConversationId: null, updatedAt: now })
 				.where(eq(narrators.id, narratorId));
+			return seq;
 		});
 
-		return msg;
+		return { ...msg, seq };
 	},
 
 	async finalizeCompactingMessage(
@@ -346,7 +349,15 @@ export const narratorPersistence = {
 					.where(eq(narrators.id, narratorId));
 			}
 
-			return updated;
+			const ref = await tx.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.messageId, messageId),
+					eq(narratorMessageRefs.narratorId, narratorId),
+				),
+				columns: { seq: true },
+			});
+
+			return { ...updated, seq: ref?.seq };
 		});
 	},
 
@@ -415,7 +426,7 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id);
+		const seq = await appendMessageRef(narratorId, id);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
@@ -432,7 +443,7 @@ export const narratorPersistence = {
 			});
 		}
 
-		return msg;
+		return { ...msg, seq };
 	},
 
 	async createPartialAssistantMessage(
@@ -492,8 +503,8 @@ export const narratorPersistence = {
 			})
 			.returning();
 
-		await appendMessageRef(narratorId, id);
-		return msg;
+		const seq = await appendMessageRef(narratorId, id);
+		return { ...msg, seq };
 	},
 
 	async appendBlockToMessage(
@@ -1239,7 +1250,7 @@ export const narratorPersistence = {
 		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
 
 		const hiddenMessageIds = refs.map((r) => r.messageId);
-		return { message: msg, hiddenMessageIds };
+		return { message: { ...msg, seq: insertSeq }, hiddenMessageIds };
 	},
 
 	async getMessagesForSegmentCompact(narratorId: string, messageIds: string[]) {
@@ -1337,7 +1348,15 @@ export const narratorPersistence = {
 				})
 				.where(eq(narrators.id, narratorId));
 
-			return updated;
+			const ref = await tx.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.messageId, messageId),
+					eq(narratorMessageRefs.narratorId, narratorId),
+				),
+				columns: { seq: true },
+			});
+
+			return { ...updated, seq: ref?.seq };
 		});
 	},
 

@@ -204,7 +204,9 @@ const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
 const TODO_TOOLS = new Set(["TaskCreate"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
-const AGENT_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
+const AGENT_TOOLS = new Set(["Agent", "Task"]);
+const AWAIT_TOOLS = new Set(["Await"]);
+const SEND_TOOLS = new Set(["Send"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
@@ -229,6 +231,8 @@ export type ToolCategory =
 	| "todo"
 	| "taskOutput"
 	| "agent"
+	| "await"
+	| "send"
 	| "ask"
 	| "plan"
 	| "terminal"
@@ -253,6 +257,8 @@ export function getCategory(name: string): ToolCategory {
 	if (TODO_TOOLS.has(name)) return "todo";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
+	if (AWAIT_TOOLS.has(name)) return "await";
+	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
@@ -284,6 +290,10 @@ export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 			return IconRobot;
 		case "agent":
 			return IconGitFork;
+		case "await":
+			return IconClock;
+		case "send":
+			return IconMessageQuestion;
 		case "ask":
 			return IconPlayerPlay;
 		case "plan":
@@ -325,6 +335,10 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "indigo";
 		case "agent":
 			return "pink";
+		case "await":
+			return "indigo";
+		case "send":
+			return "blue";
 		case "ask":
 			return "blue";
 		case "plan":
@@ -465,6 +479,20 @@ function basename(p: string): string {
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function getSendTargetLabels(input: any): string[] {
+	if (isTruncated(input)) return [];
+	const labels: string[] = [];
+	const push = (value: unknown) => {
+		if (typeof value === "string" && value.trim()) labels.push(value.trim());
+	};
+	push(input?.id);
+	push(input?.name);
+	if (Array.isArray(input?.ids)) input.ids.forEach(push);
+	if (Array.isArray(input?.names)) input.names.forEach(push);
+	return [...new Set(labels)];
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getSummary(toolName: string, input: any, metadata?: Record<string, unknown>): string {
 	// Synthetic streaming tool call — show file path + content chars
 	if (input?._streamingChars != null) {
@@ -473,11 +501,15 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		const contentChars = input._streamingContentChars as number | undefined;
 		const fields = input._streamingFields as Record<string, string> | undefined;
 		// Agent tool: show subagent_type + description while prompt is still streaming
-		if (fields && (toolName === "Agent" || toolName === "Task" || toolName === "ContinueTask")) {
+		if (fields && (toolName === "Agent" || toolName === "Task")) {
 			const parts: string[] = [];
 			if (fields.subagent_type) parts.push(fields.subagent_type);
 			if (fields.description) parts.push(fields.description);
 			if (parts.length > 0) return parts.join(": ");
+		}
+		if (fields && toolName === "Send") {
+			const target = fields.id ?? fields.name ?? fields.ids ?? fields.names ?? "subagent";
+			return `to ${target}`;
 		}
 		// Search tools: show pattern + path from extracted fields
 		if (fields && SEARCH_TOOLS.has(toolName)) {
@@ -580,6 +612,22 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			if (desc) parts.push(desc);
 			if (parts.length > 0) return parts.join(": ");
 			return toolName;
+		}
+		case "await": {
+			const awaitType = extractField(input, "type") || "task";
+			const id = extractField(input, "id") || "unknown";
+			const waitForText = extractField(input, "wait_for_text");
+			const base = `${awaitType}: ${id}`;
+			return waitForText ? `${base} · wait "${waitForText.slice(0, 24)}"` : base;
+		}
+		case "send": {
+			const targets = getSendTargetLabels(input);
+			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
+			const flags = [];
+			if (!isTruncated(input) && input?.doInterrupt) flags.push("interrupt");
+			if (!isTruncated(input) && input?.await) flags.push("await");
+			const base = `to ${targetLabel || "subagent"}`;
+			return flags.length > 0 ? `${base} · ${flags.join(" · ")}` : base;
 		}
 		case "ask": {
 			const questions = isTruncated(input) ? undefined : coerceQuestions(input?.questions);
@@ -2539,6 +2587,172 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+const SUBAGENT_ID_TAG_RE = /<subagent_id>([^<]+)<\/subagent_id>/;
+
+function stripSubagentIdTag(text: string): { subagentId?: string; text: string } {
+	const match = text.match(SUBAGENT_ID_TAG_RE);
+	return {
+		subagentId: match?.[1],
+		text: text.replace(SUBAGENT_ID_TAG_RE, "").trim(),
+	};
+}
+
+function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const input = toolCall.inputJson;
+	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
+		| Record<string, unknown>
+		| undefined;
+	const awaitType =
+		extractField(input, "type") || (metadata?.awaitType as string | undefined) || "task";
+	const targetId = extractField(input, "id") || (metadata?.targetId as string | undefined) || "";
+	const resolvedId = metadata?.resolvedId as string | undefined;
+	const status = (metadata?.status as string | undefined) ?? toolCall.status;
+	const waitForText =
+		extractField(input, "wait_for_text") || (metadata?.waitForText as string | undefined);
+	const timeout = !isTruncated(input) ? input?.timeout : undefined;
+	const rawOutput = resolveDisplayText(toolCall.outputJson);
+	const { subagentId, text: strippedOutput } = stripSubagentIdTag(rawOutput);
+	const effectiveSubagentId = (metadata?.subagentId as string | undefined) ?? subagentId;
+
+	return (
+		<Box mt="xs">
+			<Group gap={6} mb={6} wrap="wrap">
+				<Badge size="xs" color={awaitType === "bash" ? "orange" : "indigo"} variant="light">
+					{awaitType}
+				</Badge>
+				{targetId && (
+					<Badge size="xs" color="gray" variant="outline">
+						{targetId}
+					</Badge>
+				)}
+				{resolvedId && resolvedId !== targetId && (
+					<Badge size="xs" color="gray" variant="outline">
+						→ {resolvedId}
+					</Badge>
+				)}
+				<Badge size="xs" color={STATUS_COLORS[status] ?? "gray"} variant="light">
+					{status}
+				</Badge>
+				{typeof timeout === "number" && (
+					<Badge size="xs" color="gray" variant="light">
+						{formatTimeoutShort(timeout)}
+					</Badge>
+				)}
+			</Group>
+			{waitForText && (
+				<Text size="xs" c="dimmed" mb={4}>
+					Waiting for text: <Code>{waitForText}</Code>
+				</Text>
+			)}
+			{effectiveSubagentId && awaitType === "agent" && (
+				<Text size="xs" c="dimmed" mb={4} ff="monospace">
+					Subagent: {effectiveSubagentId}
+				</Text>
+			)}
+			{toolCall.outputJson && (
+				<>
+					<Text size="xs" fw={500} mt={4} mb={2}>
+						{awaitType === "bash" ? "Output" : "Result"}
+					</Text>
+					{awaitType === "bash" ? (
+						<ContentViewer content={strippedOutput} style={termStyle} title="Await output" />
+					) : (
+						<ContentViewer
+							content={strippedOutput}
+							style={codeStyle}
+							title="Await result"
+							markdown
+						/>
+					)}
+				</>
+			)}
+		</Box>
+	);
+}
+
+interface SendTargetMeta {
+	id?: string;
+	title?: string | null;
+	status?: string;
+	interrupted?: boolean;
+	awaited?: boolean;
+	error?: string;
+}
+
+function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const input = toolCall.inputJson;
+	const metadata = (toolCall.outputJson?._metadata ?? toolCall._metadata) as
+		| { targets?: SendTargetMeta[]; doInterrupt?: boolean; await?: boolean }
+		| undefined;
+	const targets = getSendTargetLabels(input);
+	const message = isTruncated(input) ? input.preview : (input?.message ?? "");
+	const rawOutput = resolveDisplayText(toolCall.outputJson);
+	const isAwait = !isTruncated(input) ? !!input?.await : !!metadata?.await;
+	const doInterrupt = !isTruncated(input) ? !!input?.doInterrupt : !!metadata?.doInterrupt;
+	const targetMeta = Array.isArray(metadata?.targets) ? metadata.targets : [];
+
+	return (
+		<Box mt="xs">
+			<Group gap={6} mb={6} wrap="wrap">
+				{targets.length > 0 ? (
+					targets.map((target) => (
+						<Badge key={target} size="xs" color="blue" variant="light">
+							→ {target}
+						</Badge>
+					))
+				) : (
+					<Badge size="xs" color="blue" variant="light">
+						Subagent message
+					</Badge>
+				)}
+				<Badge size="xs" color={isAwait ? "indigo" : "gray"} variant="light">
+					{isAwait ? "await" : "async"}
+				</Badge>
+				{doInterrupt && (
+					<Badge size="xs" color="orange" variant="light">
+						interrupt
+					</Badge>
+				)}
+			</Group>
+			{message && (
+				<>
+					<Text size="xs" fw={500} mb={2}>
+						Message
+					</Text>
+					<ContentViewer content={message} style={codeStyle} title="Send message" markdown />
+				</>
+			)}
+			{targetMeta.length > 0 && (
+				<Stack gap={4} mt="xs">
+					<Text size="xs" fw={500}>
+						Delivery
+					</Text>
+					{targetMeta.map((target) => (
+						<Group key={target.id ?? target.title ?? target.error} gap={6} wrap="nowrap">
+							<Badge size="xs" color={STATUS_COLORS[target.status ?? ""] ?? "gray"} variant="light">
+								{target.status ?? "sent"}
+							</Badge>
+							<Text size="xs" truncate title={target.error ?? target.id ?? target.title ?? ""}>
+								{target.title || target.id || "target"}
+								{target.interrupted ? " · interrupted" : ""}
+								{target.error ? ` · ${target.error}` : ""}
+							</Text>
+						</Group>
+					))}
+				</Stack>
+			)}
+			{toolCall.outputJson && (
+				<>
+					<Text size="xs" fw={500} mt="xs" mb={2}>
+						{isAwait ? "Reply" : "Result"}
+					</Text>
+					<ContentViewer content={rawOutput} style={codeStyle} title="Send result" markdown />
+				</>
+			)}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -2889,6 +3103,23 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		);
 	}
 
+	// Send tool: show message as it streams in.
+	if (cat === "send") {
+		const message = sfName === "message" ? sfValue : null;
+		if (!message) return null;
+		return (
+			<Box mt="xs">
+				<ContentViewer
+					content={message}
+					style={codeStyle}
+					title="Send message"
+					markdown
+					streaming
+				/>
+			</Box>
+		);
+	}
+
 	// Read tools: header already shows basename — no extra streaming detail needed.
 	// Showing the full path here caused a brief flash (visible during streaming,
 	// then hidden when the card collapses after streaming ends).
@@ -3037,6 +3268,10 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <TaskOutputDetail toolCall={toolCall} />;
 		case "agent":
 			return <GenericDetail toolCall={toolCall} />;
+		case "await":
+			return <AwaitDetail toolCall={toolCall} />;
+		case "send":
+			return <SendDetail toolCall={toolCall} />;
 		case "ask":
 			return <AskDetail toolCall={toolCall} />;
 		case "plan":
@@ -3611,6 +3846,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 			cat === "todo" ||
 			cat === "share" ||
 			cat === "recall" ||
+			cat === "send" ||
+			(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 			(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 			(cat === "plan" && !isDeniedPlan) ||
 			(isEdit && !isTruncated) ||
@@ -3658,6 +3895,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				cat === "todo" ||
 				cat === "share" ||
 				cat === "recall" ||
+				cat === "send" ||
+				cat === "await" ||
 				cat === "plan" ||
 				cat === "bash" ||
 				isEdit ||

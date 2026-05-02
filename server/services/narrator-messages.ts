@@ -61,6 +61,19 @@ async function attachSubagentModels(childMessages: any[]): Promise<void> {
 	}
 }
 
+/** Attach narrator_message_refs.seq so clients can sort across paginated pages. */
+function attachMessageSeqs<T extends { id: string }>(
+	messages: T[],
+	seqMap: Map<string, number>,
+): void {
+	for (const msg of messages) {
+		const seq = seqMap.get(msg.id);
+		if (seq != null) {
+			(msg as T & { seq?: number }).seq = seq;
+		}
+	}
+}
+
 /**
  * Build a tree from a flat array of messages.
  * Messages with parentToolUseId are nested under the message whose
@@ -159,7 +172,7 @@ export function truncateJson(val: any, maxLen: number): any {
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
 /** Tool names whose inputJson should not be truncated */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "ContinueTask"]);
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
 
 /**
  * Extract short header-relevant fields from a tool's inputJson before truncation.
@@ -610,6 +623,7 @@ export const narratorMessageQueries = {
 
 		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		attachMessageSeqs(topMessages, seqMap);
 
 		if (isSubagent) {
 			for (const msg of topMessages) {
@@ -709,6 +723,7 @@ export const narratorMessageQueries = {
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		allMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		attachMessageSeqs(allMessages, seqMap);
 
 		const topMsgs = [] as typeof allMessages;
 		const childMsgs = [] as typeof allMessages;
@@ -899,6 +914,7 @@ export const narratorMessageQueries = {
 			with: { toolCalls: true, creator: true },
 		});
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		attachMessageSeqs(topMessages, seqMap);
 
 		if (isSubagent) {
 			for (const msg of topMessages) {

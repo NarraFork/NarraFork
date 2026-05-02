@@ -114,7 +114,7 @@ export const bashTool: ToolDefinition = {
 			},
 			run_in_background: {
 				description:
-					"Set to true to run this command in the background. Returns immediately with a task ID. Use AwaitBackgroundTask to check status or get results.",
+					'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
 				type: "boolean",
 			},
 			strict_serial: {
@@ -146,7 +146,7 @@ export const bashTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe(
-				"Set to true to run this command in the background. Returns immediately with a task ID. Use AwaitBackgroundTask to check status or get results.",
+				'Set to true to run this command in the background. Returns immediately with a task ID. Use Await({ type: "bash", id }) to check status or get results.',
 			),
 		strict_serial: z
 			.boolean()
@@ -613,7 +613,7 @@ async function _runInBackground(
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Background bash task started: ${title}\n` +
-		`Use AwaitBackgroundTask({ task_id: "${alias}" }) to check status or get results.`;
+		`Use Await({ type: "bash", id: "${alias}" }) to check status or get results.`;
 
 	if (conflicted) {
 		output +=

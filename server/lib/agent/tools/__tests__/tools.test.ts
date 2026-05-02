@@ -1021,6 +1021,12 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(props.model.description).toContain("Available models:");
 	});
 
+	test("rawJsonSchema no longer includes resume parameter", () => {
+		const schema = agentTool.rawJsonSchema!;
+		const props = schema.properties as Record<string, any>;
+		expect(props.resume).toBeUndefined();
+	});
+
 	test("rawJsonSchema is dynamic (getter, not static)", () => {
 		// Accessing rawJsonSchema twice should return equal but not identical objects
 		const a = agentTool.rawJsonSchema;
@@ -1067,7 +1073,9 @@ describe("Agent tool rawJsonSchema", () => {
 // ============================================================
 
 import { askUserQuestionTool } from "../ask-user-question";
+import { awaitTool } from "../await";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
+import { sendTool } from "../send";
 import { skillTool } from "../skill";
 import { teamStatusTool } from "../team-status";
 import { webFetchTool } from "../web-fetch";
@@ -1092,8 +1100,10 @@ const toolsWithRawJsonSchema = [
 	webSearchTool,
 	webFetchTool,
 	askUserQuestionTool,
+	awaitTool,
 	enterPlanModeTool,
 	exitPlanModeTool,
+	sendTool,
 	skillTool,
 	teamStatusTool,
 ].filter((t) => t.rawJsonSchema);

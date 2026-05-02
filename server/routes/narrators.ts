@@ -1184,7 +1184,11 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 			with: { toolCalls: true },
 		});
 		if (fullMsg) {
-			broadcastToNarrator(id, { type: "message", narratorId: id, message: fullMsg });
+			broadcastToNarrator(id, {
+				type: "message",
+				narratorId: id,
+				message: { ...fullMsg, seq: msg.seq },
+			});
 		}
 	} else if (isPlanLike(currentMode) && !isPlanLike(permissionMode)) {
 		// Leaving plan mode — synthetic ExitPlanMode
@@ -1213,7 +1217,11 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 			with: { toolCalls: true },
 		});
 		if (fullMsg) {
-			broadcastToNarrator(id, { type: "message", narratorId: id, message: fullMsg });
+			broadcastToNarrator(id, {
+				type: "message",
+				narratorId: id,
+				message: { ...fullMsg, seq: msg.seq },
+			});
 		}
 	}
 
@@ -1372,7 +1380,7 @@ narratorRoutes.delete("/:id", async (c) => {
 
 // Mark narrator as read (clear unread substatus)
 // Error sessions are preserved because only unread substatus can transition.
-// Subagents are skipped — their done/error status must be preserved for ContinueTask.
+// Subagents are skipped — their done/error status must be preserved for follow-up Send.
 narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
@@ -1511,7 +1519,7 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
 			.where(eq(narrators.id, id));
 
-		return insertedMsg;
+		return { ...insertedMsg, seq: insertSeq };
 	});
 
 	// Broadcast so the UI updates in real-time

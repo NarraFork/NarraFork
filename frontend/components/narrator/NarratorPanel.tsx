@@ -158,6 +158,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
+import { getRenderableMessageOrder } from "./message-order-utils";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorDetailsPanel } from "./NarratorDetailsPanel";
@@ -2110,10 +2111,9 @@ export function NarratorPanel({
 
 	const lastMessage = useMemo<NarratorMsg | null>(() => {
 		if (!hydrated || !messagesData?.pages?.length) return null;
-		const firstPage = messagesData.pages[0]; // newest page
-		if (!firstPage?.messages?.length) return null;
-		for (let i = firstPage.messages.length - 1; i >= 0; i--) {
-			const msg = firstPage.messages[i];
+		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		for (let i = orderedMessages.length - 1; i >= 0; i--) {
+			const msg = orderedMessages[i];
 			if (!msg || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
 			// Skip error system messages so they don't hide the retry button
 			if (
@@ -2145,14 +2145,11 @@ export function NarratorPanel({
 	// Find the last user message ID for edit confirmation logic
 	const lastUserMessageId = useMemo(() => {
 		if (!hydrated || !messagesData?.pages) return undefined;
-		for (const page of messagesData.pages) {
-			const msgs = page.messages;
-			if (!msgs) continue;
-			for (let i = msgs.length - 1; i >= 0; i--) {
-				const msg = msgs[i];
-				if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
-					return msg.id;
-				}
+		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		for (let i = orderedMessages.length - 1; i >= 0; i--) {
+			const msg = orderedMessages[i];
+			if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
+				return msg.id;
 			}
 		}
 		return undefined;
@@ -2697,9 +2694,20 @@ export function NarratorPanel({
 		}
 		const pages = messagesData.pages;
 		const pageParams = messagesData.pageParams ?? [];
-		const reversed = pages
-			.map((page, originalIndex) => ({ page, pageParam: pageParams[originalIndex] }))
-			.reverse();
+		const ordered = getRenderableMessageOrder(pages);
+		const reversed = ordered.normalized
+			? [
+					{
+						page: {
+							...(pages[0] ?? { hasMore: false, nextCursor: null }),
+							messages: ordered.messages,
+						},
+						pageParam: { direction: "normalized", cursor: ordered.messages.at(0)?.seq ?? "none" },
+					},
+				]
+			: pages
+					.map((page, originalIndex) => ({ page, pageParam: pageParams[originalIndex] }))
+					.reverse();
 		const cache = pageCacheRef.current;
 		const activePageKeys = new Set<string>();
 		const allElements: React.ReactNode[] = [];

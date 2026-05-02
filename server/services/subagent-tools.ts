@@ -17,7 +17,8 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"Edit",
 	"TaskCreate",
 	"TeamStatus",
-	"AwaitBackgroundTask",
+	"Await",
+	"Send",
 ]);
 
 /** Tools available to general subagents (EXPLORE_PLAN_TOOLS + interactive tools, no nesting/plan/forking) */

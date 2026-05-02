@@ -216,7 +216,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 		clearTimeout(timeoutId);
 		getBackgroundAbortControllers().delete(narratorId);
 
-		// Resolve attach waiter if any (Agent(resume) on a run_in_background task)
+		// Resolve attach waiter if any (legacy attach path for a run_in_background task)
 		const attachWaiter = getAttachWaitersMap().get(narratorId);
 		if (attachWaiter) {
 			// Determine final result — on success path use the outer scope vars,
@@ -780,7 +780,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
 		let output =
 			resultPrefix +
-			"Background task started. Use Agent(resume) with this ID to attach and get results.";
+			'Background task started. Use Await({ type: "agent", id }) with this ID to get results, or Send({ id, message }) to continue.';
 		if (aliasRegistration.conflicted) {
 			output +=
 				`\n\nNote: The requested alias "${alias || title}" was already taken. ` +
@@ -823,9 +823,9 @@ export interface ContinueSubagentInput {
 /**
  * Continue a previously completed/errored subagent in-place.
  *
- * Instead of forking, we directly resume the original subagent narrator:
- * persist a new user message (with the ContinueTask's toolUseId as
- * parentToolUseId), reload the full history, and run the agent loop.
+ * Instead of forking, we directly continue the original subagent narrator:
+ * persist a new user message (with the caller toolUseId as parentToolUseId),
+ * reload the full history, and run the agent loop.
  * The subagent keeps its single narrator record and accumulates a
  * continuous conversation visible on the subagent page.
  */
@@ -841,13 +841,14 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 		throw new ValidationError("Subagent does not belong to the calling narrator");
 	}
 
-	// --- Attach path: resume a RUNNING background task (pull to foreground) ---
+	// --- Attach path for a RUNNING background task (legacy pull-to-foreground path) ---
 	if (original.isBackground && original.backgroundStatus === "running") {
 		return attachSubagent(subagentId, parentNarratorId, toolUseId, signal);
 	}
 
-	// --- Return completed background task result directly ---
+	// --- Return completed background task result directly when Await requests status only ---
 	if (
+		!prompt &&
 		original.isBackground &&
 		(original.backgroundStatus === "completed" || original.backgroundStatus === "failed")
 	) {
@@ -889,12 +890,27 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 
 	// 2. Mark subagent as working (in-place, no fork)
+	if (original.isBackground) {
+		const now = new Date().toISOString();
+		const updatedTraits = parseTraits(original.traits).filter((trait) => trait !== "background");
+		await db
+			.update(narrators)
+			.set({
+				isBackground: false,
+				backgroundStatus: null,
+				backgroundResult: null,
+				backgroundCompletedAt: null,
+				traits: updatedTraits,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, subagentId));
+	}
 	await narratorService.updateStatus(subagentId, "working");
 
 	// 3. Broadcast subagent_started (same subagentId)
 	broadcastSubagentStarted(subagentId, parentNarratorId, toolUseId, subagentType, model);
 
-	// 4. Persist new user message with ContinueTask's toolUseId
+	// 4. Persist new user message with the caller toolUseId
 	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
 
 	// 5. Load full subagent history (all previous rounds included)

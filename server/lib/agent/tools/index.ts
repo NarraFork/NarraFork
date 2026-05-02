@@ -1,11 +1,10 @@
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
-import { awaitBackgroundTaskTool } from "./await-background-task";
+import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
-import { continueTaskTool } from "./continue-task";
 import { editTool } from "./edit";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
@@ -20,6 +19,7 @@ import {
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
+import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
 import { agentTool } from "./task";
@@ -80,8 +80,8 @@ const coreProvider: ToolProvider = {
 			enterPlanModeTool,
 			exitPlanModeTool,
 			agentTool,
-			continueTaskTool,
-			awaitBackgroundTaskTool,
+			awaitTool,
+			sendTool,
 			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,

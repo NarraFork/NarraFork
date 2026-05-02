@@ -228,7 +228,7 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 	const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
 	entry.foregroundResolve(
 		resultPrefix +
-			`Subagent detached to background. Use Agent(resume: "${detachAlias}") to attach and get results.`,
+			`Subagent detached to background. Use Await({ type: "agent", id: "${detachAlias}" }) to get results, or Send({ id: "${detachAlias}", message }) to continue.`,
 	);
 
 	// 7. Broadcast events

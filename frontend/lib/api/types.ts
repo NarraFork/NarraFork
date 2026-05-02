@@ -287,6 +287,8 @@ export interface TreeMessage {
 		avatarColor?: string | null;
 		avatarImageId?: string | null;
 	} | null;
+	/** Stable top-level ordering from narrator_message_refs.seq. */
+	seq?: number;
 	createdAt: string;
 	children: TreeMessage[];
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */

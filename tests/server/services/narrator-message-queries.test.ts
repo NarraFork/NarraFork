@@ -265,6 +265,7 @@ describe("narratorService message query regressions", () => {
 		expect(result.hasMore).toBe(false);
 		expect(result.nextCursor).toBeNull();
 		expect(result.messages.map((m: { id: string }) => m.id)).toEqual(["m-plan", "m-read"]);
+		expect(result.messages.map((m: { seq?: number }) => m.seq)).toEqual([1, 2]);
 
 		const readMsg = result.messages.find((m: { id: string }) => m.id === "m-read");
 		expect(readMsg?.children?.map((c: { id: string }) => c.id)).toEqual(["c-read"]);
@@ -325,6 +326,7 @@ describe("narratorService message query regressions", () => {
 		const first = await narratorService.getMessagesAfter("n1", "m-old", 40);
 		expect(first.hitLimit).toBe(false);
 		expect(first.topLevel.map((m: { id: string }) => m.id)).toEqual(["m-new"]);
+		expect(first.topLevel.map((m: { seq?: number }) => m.seq)).toEqual([2]);
 		expect(first.topLevel[0]?.children?.map((c: { id: string }) => c.id)).toEqual(["c-new"]);
 		expect(first.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-orphan"]);
 
@@ -390,6 +392,7 @@ describe("narratorService message query regressions", () => {
 			"m-parent",
 			"m-newer-0",
 		]);
+		expect(around.messages.map((m: { seq?: number }) => m.seq)).toEqual([1, 2, 4]);
 		expect(around.messages[1]?.children?.map((c: { id: string }) => c.id)).toEqual(["c-target"]);
 	});
 

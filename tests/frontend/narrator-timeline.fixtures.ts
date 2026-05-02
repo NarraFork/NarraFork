@@ -21,6 +21,7 @@ export function makeMessage(
 		meterUsage: partial.meterUsage ?? null,
 		meterUnit: partial.meterUnit ?? null,
 		subagentModel: partial.subagentModel ?? null,
+		seq: partial.seq,
 		createdAt: partial.createdAt ?? NOW,
 		children: partial.children ?? [],
 	};

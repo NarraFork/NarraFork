@@ -117,7 +117,11 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	Read: { short: ["file_path", "offset", "limit"], large: [] },
 	Agent: { short: ["description", "subagent_type", "model"], large: ["prompt"] },
 	Task: { short: ["description", "subagent_type", "model"], large: ["prompt"] },
-	ContinueTask: { short: ["subagent_id"], large: ["prompt"] },
+	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
+	Send: {
+		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
+		large: ["message"],
+	},
 	WebSearch: { short: ["query"], large: [] },
 	WebFetch: { short: ["url", "mode"], large: [] },
 	Skill: { short: ["skill"], large: [] },
@@ -233,7 +237,8 @@ const PARALLEL_TOOLS = new Set([
 	"Grep",
 	"WebSearch",
 	"WebFetch",
-	"AwaitBackgroundTask",
+	"Await",
+	"Send",
 	SHELL_TOOL_NAME,
 ]);
 

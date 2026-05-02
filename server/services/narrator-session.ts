@@ -1195,7 +1195,7 @@ export async function runAgentLoop(
 					if (subDone.length > 0) {
 						const lines = subDone.map(
 							(t) =>
-								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Agent(resume: "${t.id}") to see full result or continue.`,
+								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Await({ type: "agent", id: "${t.id}" }) to see the full result, or Send({ id: "${t.id}", message }) to continue.`,
 						);
 						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
 					}

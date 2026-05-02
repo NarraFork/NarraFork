@@ -533,14 +533,7 @@ function resolveBlacklistDecision(
 	return reason ? { decision: "deny", reason } : null;
 }
 
-const ALWAYS_ALLOW_TOOLS = [
-	"TaskCreate",
-	"EnterPlanMode",
-	"WebSearch",
-	"ContinueTask",
-	"AwaitBackgroundTask",
-	"Skill",
-];
+const ALWAYS_ALLOW_TOOLS = ["TaskCreate", "EnterPlanMode", "WebSearch", "Await", "Skill"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -553,7 +546,7 @@ const ACCEPT_EDITS_AUTO_ALLOW = [
 ];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
-const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile", "AwaitBackgroundTask"];
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile", "Await"];
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
