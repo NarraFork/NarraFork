@@ -20,11 +20,13 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
+import { getSubagentType, isSubagentVariant } from "../lib/narrator-utils";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { backgroundTaskService } from "./background-task-service";
+import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
@@ -36,6 +38,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import { resolveTaskAlias } from "./subagent-alias";
 import {
 	getConclusionEntry,
 	getConclusionFileId,
@@ -831,6 +834,140 @@ function resolveProtectedPathDeny(
 	return null;
 }
 
+type PermissionScopeNarrator = {
+	id?: string | null;
+	variant?: string | null;
+	parentNarratorId?: string | null;
+	permissionMode?: string | null;
+	relaxedPlan?: boolean | null;
+	previousPermissionMode?: string | null;
+};
+
+function permissionModeRank(narrator: PermissionScopeNarrator | null | undefined): number {
+	const permMode = narrator?.permissionMode ?? "default";
+	const effectiveMode =
+		permMode === "plan"
+			? narrator?.relaxedPlan
+				? (narrator.previousPermissionMode ?? "default")
+				: "readOnly"
+			: permMode;
+	if (effectiveMode === "dontAsk") return 0;
+	if (effectiveMode === "readOnly") return 1;
+	return 2;
+}
+
+async function variantScopeRank(variant: string | null | undefined): Promise<number> {
+	const subagentType = variant ? getSubagentType(variant) : null;
+	if (!subagentType) return 2;
+	if (subagentType === "explore" || subagentType === "plan" || subagentType === "review") return 1;
+	if (subagentType === "general") return 2;
+
+	const customDef = await customSubagentService.loadByName(subagentType).catch(() => null);
+	if (!customDef || customDef.toolAccess === "readOnly") return 1;
+	return 2;
+}
+
+async function narratorScopeRank(
+	narrator: PermissionScopeNarrator | null | undefined,
+): Promise<number> {
+	return Math.min(permissionModeRank(narrator), await variantScopeRank(narrator?.variant));
+}
+
+function sendSelectors(input: Record<string, unknown>): string[] {
+	const raw = [
+		typeof input.id === "string" ? input.id : undefined,
+		...(Array.isArray(input.ids) ? input.ids.filter((id) => typeof id === "string") : []),
+		typeof input.name === "string" ? input.name : undefined,
+		...(Array.isArray(input.names) ? input.names.filter((name) => typeof name === "string") : []),
+	];
+	const seen = new Set<string>();
+	return raw.flatMap((value) => {
+		const trimmed = value?.trim();
+		if (!trimmed || seen.has(trimmed)) return [];
+		seen.add(trimmed);
+		return [trimmed];
+	});
+}
+
+async function resolveSendAliasCandidate(
+	selector: string,
+	callerId: string,
+	teamParentId: string,
+): Promise<string> {
+	for (const ownerId of [callerId, teamParentId]) {
+		const inMemory = resolveTaskAlias(ownerId, selector);
+		if (inMemory !== selector) return inMemory;
+		const task = await backgroundTaskService.getByAlias(selector, ownerId);
+		if (task?.subagentNarratorId) return task.subagentNarratorId;
+		if (task?.type === "agent") return task.id;
+	}
+	return selector;
+}
+
+async function resolveSendTargetsForPermission(
+	callerId: string,
+	caller: PermissionScopeNarrator,
+	input: Record<string, unknown>,
+): Promise<PermissionScopeNarrator[]> {
+	const selectors = sendSelectors(input);
+	if (selectors.length === 0) return [];
+	const callerIsSubagent = !!caller.variant && isSubagentVariant(caller.variant);
+	const teamParentId = callerIsSubagent ? caller.parentNarratorId : callerId;
+	if (!teamParentId) return [];
+
+	const resolved: PermissionScopeNarrator[] = [];
+	const seen = new Set<string>();
+	for (const selector of selectors) {
+		const aliasCandidate = await resolveSendAliasCandidate(selector, callerId, teamParentId);
+		const direct = await narratorService.getById(aliasCandidate).catch(() => null);
+		if (direct) {
+			if (
+				!isSubagentVariant(direct.variant) ||
+				direct.parentNarratorId !== teamParentId ||
+				(callerIsSubagent && direct.id === callerId)
+			) {
+				return [];
+			}
+			if (!seen.has(direct.id)) {
+				seen.add(direct.id);
+				resolved.push(direct);
+			}
+			continue;
+		}
+
+		const siblings = await narratorService.listSubagentsByParent(teamParentId);
+		const candidates = siblings.filter((s) => {
+			if (callerIsSubagent && s.id === callerId) return false;
+			return s.id === selector || s.id.startsWith(selector) || s.title === selector;
+		});
+		if (candidates.length !== 1) return [];
+		const target = await narratorService.getById(candidates[0].id);
+		if (!isSubagentVariant(target.variant) || target.parentNarratorId !== teamParentId) return [];
+		if (!seen.has(target.id)) {
+			seen.add(target.id);
+			resolved.push(target);
+		}
+	}
+	return resolved;
+}
+
+async function shouldAutoAllowSendWithinScope(
+	narratorId: string,
+	caller: PermissionScopeNarrator | null | undefined,
+	input: Record<string, unknown>,
+): Promise<boolean> {
+	try {
+		if (!caller) return false;
+		const targets = await resolveSendTargetsForPermission(narratorId, caller, input);
+		if (targets.length === 0) return false;
+		const callerRank = await narratorScopeRank(caller);
+		const targetRanks = await Promise.all(targets.map((target) => narratorScopeRank(target)));
+		return targetRanks.every((rank) => rank <= callerRank);
+	} catch {
+		return false;
+	}
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -1127,25 +1264,29 @@ export async function handlePermission(
 		return { behavior: "allow", updatedInput: effectiveInput };
 	}
 
-	let decision = resolvePermissionDecision({
-		toolName,
-		input: effectiveInput,
-		permMode,
-		cwd,
-		bashAnalysis,
-		isChapter,
-		planFileId,
-		conclusionFileId,
-		whitelistDirs: mergedWhitelist,
-		blacklistDirs: mergedBlacklist,
-		commandWhitelist: mergedCmdWhitelist,
-		commandBlacklist: mergedCmdBlacklist,
-		relaxedPlan: isRelaxedPlan,
-		previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
-		meta: permMeta,
-		projectGitPath: resolvedProjectGitPath,
-		webFetchPolicy: settings.agent.webFetchPolicy,
-	});
+	let decision =
+		toolName === "Send" &&
+		(await shouldAutoAllowSendWithinScope(narratorId, narrator, effectiveInput))
+			? "allow"
+			: resolvePermissionDecision({
+					toolName,
+					input: effectiveInput,
+					permMode,
+					cwd,
+					bashAnalysis,
+					isChapter,
+					planFileId,
+					conclusionFileId,
+					whitelistDirs: mergedWhitelist,
+					blacklistDirs: mergedBlacklist,
+					commandWhitelist: mergedCmdWhitelist,
+					commandBlacklist: mergedCmdBlacklist,
+					relaxedPlan: isRelaxedPlan,
+					previousPermissionMode: narrator?.previousPermissionMode ?? undefined,
+					meta: permMeta,
+					projectGitPath: resolvedProjectGitPath,
+					webFetchPolicy: settings.agent.webFetchPolicy,
+				});
 	logger.debug("Permission decision", {
 		narratorId,
 		toolName,
