@@ -1,0 +1,6 @@
+{
+	"version": "0.3.2",
+	"date": "2026-05-03",
+	"en": "## Bug Fixes\n\n- Make YOLO danger confirmations more reliable for repeated Bash commands and add warnings for destructive stash operations.",
+	"zh-CN": "## 修复\n\n- 提升 Bash 命令 YOLO 危险确认的重试匹配稳定性，并为破坏性 stash 操作增加风险提示。"
+}
