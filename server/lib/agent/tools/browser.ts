@@ -17,6 +17,7 @@ const ACTIONS = [
 	"screenshot",
 	"get_text",
 	"get_attribute",
+	"get_console",
 	"evaluate",
 	"wait",
 	"navigate",
@@ -49,6 +50,7 @@ export const browserTool: ToolDefinition = {
 		'- "screenshot": Capture the current page as an image\n' +
 		'- "get_text": Get text content of an element\n' +
 		'- "get_attribute": Get an attribute value of an element\n' +
+		'- "get_console": Get captured console output and page errors\n' +
 		'- "evaluate": Execute JavaScript in the page context\n' +
 		'- "wait": Wait for an element to appear or become visible\n' +
 		'- "navigate": Go to a new URL, or go back/forward\n' +
@@ -72,7 +74,8 @@ export const browserTool: ToolDefinition = {
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
 		"- timeout (optional): Timeout in ms for wait/element actions (default: 10000)\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
-		"- max_length (optional): Max output length for dom/get_text/evaluate (default: 20000)\n" +
+		"- max_length (optional): Max output length for dom/get_text/evaluate/get_console (default: 20000)\n" +
+		"- clear (optional): For get_console, clear captured console output after reading (default: false)\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
 		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
@@ -124,8 +127,12 @@ export const browserTool: ToolDefinition = {
 				required: ["x", "y"],
 			},
 			max_length: {
-				description: "Max output length for dom/get_text/evaluate (default: 20000)",
+				description: "Max output length for dom/get_text/evaluate/get_console (default: 20000)",
 				type: "number",
+			},
+			clear: {
+				description: "For get_console, clear captured console output after reading",
+				type: "boolean",
 			},
 			headless: {
 				description:
@@ -161,6 +168,10 @@ export const browserTool: ToolDefinition = {
 			.optional()
 			.describe("Coordinates for positional actions"),
 		max_length: z.number().optional().describe("Max output length"),
+		clear: z
+			.boolean()
+			.optional()
+			.describe("For get_console, clear captured console output after reading"),
 		headless: z
 			.boolean()
 			.optional()
@@ -180,6 +191,7 @@ export const browserTool: ToolDefinition = {
 			timeout,
 			coordinate,
 			max_length,
+			clear,
 			headless,
 			categories,
 		} = args as {
@@ -193,6 +205,7 @@ export const browserTool: ToolDefinition = {
 			timeout?: number;
 			coordinate?: { x: number; y: number };
 			max_length?: number;
+			clear?: boolean;
 			headless?: boolean;
 			categories?: string[];
 		};
@@ -222,6 +235,7 @@ export const browserTool: ToolDefinition = {
 						timeout,
 						coordinate,
 						max_length,
+						clear,
 						url,
 						categories,
 					});
@@ -314,6 +328,7 @@ async function handleSessionAction(
 		timeout?: number;
 		coordinate?: { x: number; y: number };
 		max_length?: number;
+		clear?: boolean;
 		url?: string;
 		categories?: string[];
 	},
@@ -478,6 +493,20 @@ async function handleSessionAction(
 			return {
 				output: result.text || "(empty)",
 				metadata: { sessionId: session.id },
+			};
+		}
+
+		case "get_console": {
+			const result = await actions.getConsole(session, {
+				maxLength: opts.max_length,
+				clear: opts.clear,
+			});
+			return {
+				output:
+					`${result.output}\n\n` +
+					`Captured messages: ${result.count}${opts.clear ? " (cleared)" : ""}\n` +
+					`URL: ${result.snapshot.url}`,
+				metadata: { sessionId: session.id, consoleMessageCount: result.count },
 			};
 		}
 

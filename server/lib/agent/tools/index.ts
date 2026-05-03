@@ -11,6 +11,7 @@ import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { grepTool } from "./grep";
 import { narraforkAdminTool } from "./narrafork-admin";
+import { endPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
 import { recallTool } from "./recall";
@@ -67,6 +68,8 @@ const coreProvider: ToolProvider = {
 			taskCreateTool,
 			enterPlanModeTool,
 			exitPlanModeTool,
+			startPipelineTool,
+			endPipelineTool,
 			agentTool,
 			awaitTool,
 			sendTool,

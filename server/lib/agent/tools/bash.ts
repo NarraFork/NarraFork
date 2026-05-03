@@ -431,6 +431,7 @@ export const bashTool: ToolDefinition = {
 				output: truncated.content,
 				isError: exitCode !== 0,
 				title,
+				metadata: truncated.outputPath ? { fullOutputPath: truncated.outputPath } : undefined,
 				truncated: truncated.truncated,
 			};
 		} catch (err) {

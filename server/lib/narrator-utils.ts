@@ -4,8 +4,9 @@
  * - **variant** (mutually exclusive identity, immutable after creation):
  *   `"primary"` | `"subagent:explore"` | `"subagent:plan"` | `"subagent:general"` | `"subagent:review"` | `"subagent:<custom>"`
  *
- * - **traits** (stackable permanent tags, JSON string[] column):
- *   `"standalone"` | `"ask-in-passing"` | `"background"`
+ * - **traits** (stackable tags, JSON string[] column):
+ *   `"standalone"` | `"ask-in-passing"` | `"background"` plus dynamic state tags
+ *   such as `"pipeline:<base64url-json>"`.
  */
 
 // ---------------------------------------------------------------------------

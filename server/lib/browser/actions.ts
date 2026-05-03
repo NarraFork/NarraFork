@@ -4,7 +4,7 @@
 import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
-import type { BrowserSession } from "./session";
+import type { BrowserConsoleMessage, BrowserSession } from "./session";
 import { touchSession } from "./session";
 
 const DEFAULT_MAX_LENGTH = 20_000;
@@ -21,6 +21,14 @@ async function snapshot(page: Page): Promise<PageSnapshot> {
 		url: page.url(),
 		title: await page.title(),
 	};
+}
+
+function formatConsoleLocation(message: BrowserConsoleMessage): string {
+	const { location } = message;
+	if (!location?.url) return "";
+	const line = location.lineNumber !== undefined ? `:${location.lineNumber}` : "";
+	const column = location.columnNumber !== undefined ? `:${location.columnNumber}` : "";
+	return ` (${location.url}${line}${column})`;
 }
 
 /** Navigate to a URL or go back/forward. */
@@ -189,6 +197,34 @@ export async function getAttribute(
 		.$eval(selector, (el, attr) => el.getAttribute(attr), attribute)
 		.catch(() => null);
 	return { value, snapshot: await snapshot(session.page) };
+}
+
+/** Get captured console output and page errors. */
+export async function getConsole(
+	session: BrowserSession,
+	opts?: { maxLength?: number; clear?: boolean },
+): Promise<{ output: string; count: number; snapshot: PageSnapshot }> {
+	touchSession(session);
+	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
+	const messages = session.consoleMessages;
+	const count = messages.length;
+	const lines = messages.map((message) => {
+		const time = new Date(message.timestamp).toISOString();
+		return `[${time}] ${message.type.toUpperCase()}${formatConsoleLocation(message)} ${message.text}`;
+	});
+	let output = lines.join("\n");
+	if (!output) output = "No console messages captured.";
+	if (output.length > maxLength) {
+		output = `${output.slice(0, maxLength)}\n\n[Console output truncated at ${maxLength} characters]`;
+	}
+	if (opts?.clear) {
+		session.consoleMessages.length = 0;
+	}
+	return {
+		output,
+		count,
+		snapshot: await snapshot(session.page),
+	};
 }
 
 /** Execute JavaScript in the page context. */

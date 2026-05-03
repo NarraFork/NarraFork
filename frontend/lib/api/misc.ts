@@ -732,7 +732,13 @@ export const miscApi = {
 	getUpdateStatus: () =>
 		request<{ ready: boolean; updateFile?: string; canAutoRestart: boolean }>("/update/status"),
 	applyUpdate: () =>
-		request<{ success: boolean; error?: string; newBinaryPath?: string }>("/update/apply", {
+		request<{
+			success: boolean;
+			error?: string;
+			newBinaryPath?: string;
+			restarting?: boolean;
+			replacementPid?: number;
+		}>("/update/apply", {
 			method: "POST",
 		}),
 

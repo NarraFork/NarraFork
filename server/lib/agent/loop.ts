@@ -129,6 +129,8 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	WebFetch: { short: ["url", "mode"], large: [] },
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
+	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
+	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
 };
 
@@ -247,7 +249,11 @@ const PARALLEL_TOOLS = new Set([
 
 /** Whether a tool use should skip parallel grouping and early execution. */
 function isStrictSerial(tu: AgentToolUse): boolean {
-	return tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true;
+	return (
+		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
+		tu.name === "StartPipeline" ||
+		tu.name === "EndPipeline"
+	);
 }
 
 type ReasoningBlockEntry = {

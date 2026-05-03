@@ -108,7 +108,7 @@ function ensureDir(): void {
 	}
 }
 
-function persistOutput(text: string): string {
+export function persistOutput(text: string): string {
 	ensureDir();
 	const filename = `tool_${Date.now()}_${randomUUID().slice(0, 8)}`;
 	const filepath = join(OUTPUT_DIR, filename);

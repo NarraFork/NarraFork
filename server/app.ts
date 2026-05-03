@@ -8,6 +8,7 @@ import { users } from "./db/schema";
 import { AppError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
+import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
 import { requireAuth } from "./middleware/auth";
@@ -82,6 +83,22 @@ app.get("/api/health", (c) => {
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
 		gitAvailable: gitOk,
 	});
+});
+
+app.post("/api/gracefully_shutdown", async (c) => {
+	let body: { token?: string; pid?: number; version?: string } = {};
+	try {
+		body = await c.req.json();
+	} catch {
+		// Empty or invalid JSON falls through to token validation below.
+	}
+
+	const result = await handleGracefullyShutdownRequest({
+		token: body.token ?? "",
+		pid: body.pid,
+		version: body.version,
+	});
+	return c.json(result.body, result.status);
 });
 
 app.get("/api/auth/status", async (c) => {

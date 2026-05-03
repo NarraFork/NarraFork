@@ -863,6 +863,8 @@ describe("Bash", () => {
 		const result = await bashTool.execute({ command: "seq 1 3000" }, makeCtx());
 		expect(result.truncated).toBe(true);
 		expect(result.output).toContain("truncated");
+		expect(typeof result.metadata?.fullOutputPath).toBe("string");
+		expect(await Bun.file(result.metadata?.fullOutputPath as string).text()).toContain("3000");
 	});
 
 	test("workdir changes the working directory", async () => {
@@ -987,7 +989,16 @@ describe("zodToJsonSchema", () => {
 	});
 
 	test("converts all tool schemas without error", () => {
-		const tools = [readTool, writeTool, editTool, globTool, grepTool, bashTool];
+		const tools = [
+			readTool,
+			writeTool,
+			editTool,
+			globTool,
+			grepTool,
+			bashTool,
+			startPipelineTool,
+			endPipelineTool,
+		];
 		for (const tool of tools) {
 			const json = zodToJsonSchema(tool.parameters);
 			expect(json.type).toBe("object");
@@ -1087,6 +1098,7 @@ describe("Agent tool rawJsonSchema", () => {
 
 import { askUserQuestionTool } from "../ask-user-question";
 import { awaitTool } from "../await";
+import { endPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";
 import { sendTool } from "../send";
 import { skillTool } from "../skill";
@@ -1119,6 +1131,8 @@ const toolsWithRawJsonSchema = [
 	sendTool,
 	skillTool,
 	teamStatusTool,
+	startPipelineTool,
+	endPipelineTool,
 ].filter((t) => t.rawJsonSchema);
 
 describe("rawJsonSchema parity for all tools", () => {

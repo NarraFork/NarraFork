@@ -1,7 +1,7 @@
 // Browser session management for the Browser tool.
 // Each narrator can hold multiple named sessions with automatic TTL cleanup.
 
-import type { BrowserContext, Page } from "puppeteer-core";
+import type { BrowserContext, ConsoleMessage, Page } from "puppeteer-core";
 import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
@@ -11,6 +11,19 @@ import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
 const SESSION_TTL_MS = 10 * 60 * 1000;
 /** Cleanup check interval. */
 const CLEANUP_INTERVAL_MS = 60 * 1000;
+/** Maximum console messages kept per session. */
+const MAX_CONSOLE_MESSAGES = 200;
+
+export interface BrowserConsoleMessage {
+	type: string;
+	text: string;
+	timestamp: number;
+	location?: {
+		url?: string;
+		lineNumber?: number;
+		columnNumber?: number;
+	};
+}
 
 export interface BrowserSession {
 	id: string;
@@ -23,6 +36,8 @@ export interface BrowserSession {
 	lastActivity: number;
 	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
 	headless: boolean;
+	/** Recent console output and page errors captured from the page. */
+	consoleMessages: BrowserConsoleMessage[];
 	/** Performance tracing state. */
 	tracing?: { active: boolean; startedAt: number };
 }
@@ -65,6 +80,39 @@ function ensureCleanupTimer(): void {
 	}
 }
 
+function pushConsoleMessage(
+	session: BrowserSession,
+	message: Omit<BrowserConsoleMessage, "timestamp">,
+): void {
+	session.consoleMessages.push({ ...message, timestamp: Date.now() });
+	if (session.consoleMessages.length > MAX_CONSOLE_MESSAGES) {
+		session.consoleMessages.splice(0, session.consoleMessages.length - MAX_CONSOLE_MESSAGES);
+	}
+}
+
+function attachConsoleListeners(page: Page, session: BrowserSession): void {
+	page.on("console", (msg: ConsoleMessage) => {
+		const location = msg.location();
+		pushConsoleMessage(session, {
+			type: msg.type(),
+			text: msg.text(),
+			location: {
+				url: location.url,
+				lineNumber: location.lineNumber,
+				columnNumber: location.columnNumber,
+			},
+		});
+	});
+
+	page.on("pageerror", (err: unknown) => {
+		const text = err instanceof Error ? err.stack || err.message : String(err);
+		pushConsoleMessage(session, {
+			type: "pageerror",
+			text,
+		});
+	});
+}
+
 /** Touch a session to reset its TTL. */
 export function touchSession(session: BrowserSession): void {
 	session.lastActivity = Date.now();
@@ -84,8 +132,6 @@ export async function createSession(
 	await page.setViewport(DEFAULT_VIEWPORT);
 	await page.setUserAgent(USER_AGENT);
 
-	await page.goto(url, { waitUntil: "domcontentloaded" });
-
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
 		id: sessionId,
@@ -94,7 +140,11 @@ export async function createSession(
 		url,
 		lastActivity: Date.now(),
 		headless,
+		consoleMessages: [],
 	};
+	attachConsoleListeners(page, session);
+
+	await page.goto(url, { waitUntil: "domcontentloaded" });
 
 	let map = sessions.get(narratorId);
 	if (!map) {

@@ -113,7 +113,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
 
 	const canApply = result?.success && result.instructions && !result.instructions.manual;
-	const serverStopped = applyResult?.success;
+	const restartStarted = applyResult?.success && applyResult.restarting;
+	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
 	const isZstdMissing = rawDownloadError === "ZSTD_CLI_MISSING";
 	const downloadError = isZstdMissing ? null : rawDownloadError;
@@ -267,7 +268,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				)}
 
 				{/* Download complete — apply section */}
-				{canApply && !serverStopped && (
+				{canApply && !applyResult?.success && (
 					<Stack gap="sm">
 						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
 							{t("updateDownloadComplete")}
@@ -292,6 +293,16 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
 						<Text size="sm">{applyError}</Text>
 					</Alert>
+				)}
+
+				{/* Replacement process started — it will ask the old server to exit, then bind the port. */}
+				{restartStarted && (
+					<Stack gap="sm">
+						<Alert color="blue" variant="light" icon={<IconPower size={16} />}>
+							{t("updateRestarting")}
+						</Alert>
+						<Text size="sm">{t("updateRestartingDescription")}</Text>
+					</Stack>
 				)}
 
 				{/* Server stopped — show new binary path */}

@@ -14,6 +14,7 @@ import {
 	projects,
 } from "../db/schema";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
+import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
@@ -1873,6 +1874,18 @@ export async function runAgentLoop(
 	} finally {
 		active._loopRunning = false;
 		active.alive = false;
+
+		try {
+			const cleared = await clearPipelineStateIfActive(narratorId);
+			if (cleared) {
+				logger.info("Cleared stale pipeline state after narrator loop", { narratorId });
+			}
+		} catch (err) {
+			logger.warn("Failed to clear stale pipeline state after narrator loop", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 
 		// --- Resolve conclusion watcher ---
 		// When a subagent narrator completes (from the subagent page), check if

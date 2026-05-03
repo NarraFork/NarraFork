@@ -189,6 +189,8 @@ export function useUpdateApply() {
 		success: boolean;
 		error?: string;
 		newBinaryPath?: string;
+		restarting?: boolean;
+		replacementPid?: number;
 	} | null>(null);
 
 	const apply = useCallback(async () => {

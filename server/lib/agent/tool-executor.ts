@@ -1,6 +1,12 @@
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { getAnthropicProviderConfig, isAnthropicProvider, usesCodexApiMode } from "../settings";
+import {
+	capturePipelineOutput,
+	clipText,
+	getPipelineState,
+	isPipelineControlTool,
+} from "./pipeline-state";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentToolUse, ToolContext } from "./types";
@@ -58,6 +64,25 @@ export function truncateToolInput(input: Record<string, unknown>): Record<string
 		return val;
 	};
 	return truncateValue(input) as Record<string, unknown>;
+}
+
+async function getPipelineCaptureText(
+	result: { output: string; metadata?: Record<string, unknown> },
+	finalOutput: string,
+	appendNotice: string,
+): Promise<string> {
+	const fullOutputPath = result.metadata?.fullOutputPath;
+	if (typeof fullOutputPath !== "string") return finalOutput;
+
+	try {
+		return `${await Bun.file(fullOutputPath).text()}${appendNotice}`;
+	} catch (err) {
+		logger.warn("Failed to read full tool output for pipeline capture", {
+			fullOutputPath,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return finalOutput;
+	}
 }
 
 export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -215,6 +240,11 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 		}, PROGRESS_INTERVAL_MS);
 	}
 
+	const pipelineState = !isPipelineControlTool(tu.name)
+		? await getPipelineState(config.narratorId)
+		: null;
+	const pipelinePreviewChars = pipelineState?.maxPreviewChars ?? 100;
+
 	const ctx: ToolContext = {
 		narratorId: config.narratorId,
 		cwd: config.cwd,
@@ -249,10 +279,14 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 		};
 
 		ctx.emitOutput = (output: string) => {
-			latestOutput =
-				output.length > MAX_STREAM_OUTPUT_LENGTH
-					? `...\n\n${output.slice(-MAX_STREAM_OUTPUT_LENGTH)}`
-					: output;
+			if (pipelineState) {
+				latestOutput = `Pipeline live output preview (${tu.name}):\n${clipText(output, pipelinePreviewChars)}`;
+			} else {
+				latestOutput =
+					output.length > MAX_STREAM_OUTPUT_LENGTH
+						? `...\n\n${output.slice(-MAX_STREAM_OUTPUT_LENGTH)}`
+						: output;
+			}
 
 			const elapsed = Date.now() - lastEmitTime;
 			if (elapsed >= OUTPUT_THROTTLE_MS) {
@@ -293,10 +327,43 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 				});
 		}
 
+		const finalOutput = result.output + appendNotice;
+		if (pipelineState && !isPipelineControlTool(tu.name)) {
+			const pipelineOutput = await getPipelineCaptureText(result, finalOutput, appendNotice);
+			const captured = await capturePipelineOutput({
+				narratorId: config.narratorId,
+				toolUseId: tu.toolUseId,
+				toolName: tu.name,
+				input: effectiveInput,
+				output: pipelineOutput,
+				isError: result.isError,
+				metadata: result.metadata,
+			});
+			if (captured) {
+				return {
+					output: captured.previewOutput,
+					isError: result.isError,
+					fatal: result.fatal,
+					durationMs: Date.now() - start,
+					permissionStartedAt,
+					executionStartedAt,
+					completedAt: Date.now(),
+					metadata: {
+						...result.metadata,
+						pipelineAlias: captured.capture.alias,
+						pipelineOutputPath: captured.capture.outputPath,
+						pipelineCapturedBytes: captured.capture.bytes,
+					},
+					images: result.images,
+					updatedInput: redirectedInput,
+				};
+			}
+		}
+
 		// If the tool already truncated its output, pass through as-is.
 		if (result.truncated) {
 			return {
-				output: result.output + appendNotice,
+				output: finalOutput,
 				isError: result.isError,
 				fatal: result.fatal,
 				durationMs: Date.now() - start,

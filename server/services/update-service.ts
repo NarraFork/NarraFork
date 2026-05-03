@@ -19,6 +19,7 @@ import {
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { logger } from "../lib/logger";
+import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
@@ -817,20 +818,19 @@ function moveFileSync(src: string, dst: string): void {
 }
 
 /**
- * Apply a downloaded update: place the new binary next to the current one and spawn it.
- *
- * Flow:
- * 1. Locate the downloaded update file (e.g. narrafork-0.1.1-linux-x64)
- * 2. Move it to the same directory as the current executable, keeping the new filename
- * 3. Spawn the new binary as a detached process with --replace-pid=<our PID>
- * 4. The new process will kill us after it starts successfully
- */
-/**
  * Apply a downloaded update:
  * 1. Move the update file to the same directory as the current executable
- * 2. Exit the process so the user can start the new binary
+ * 2. Mark a one-time graceful restart handoff session as pending
+ * 3. Spawn the new binary as a detached replacement process
+ * 4. The new process calls /api/gracefully_shutdown and waits for us to release the port
  */
-export function applyUpdate(): { success: boolean; error?: string; newBinaryPath?: string } {
+export function applyUpdate(): {
+	success: boolean;
+	error?: string;
+	newBinaryPath?: string;
+	restarting?: boolean;
+	replacementPid?: number;
+} {
 	const execPath = getCurrentExecutablePath();
 	if (!execPath) {
 		return { success: false, error: "Not running as compiled binary" };
@@ -861,15 +861,50 @@ export function applyUpdate(): { success: boolean; error?: string; newBinaryPath
 		return { success: false, error: `Failed to place new binary: ${err}` };
 	}
 
-	logger.info("Update applied, shutting down", {
-		oldExecPath: execPath,
-		newExecPath,
-	});
+	let session: ReturnType<typeof beginGracefulRestartSession>;
+	try {
+		session = beginGracefulRestartSession();
+	} catch (err) {
+		return {
+			success: false,
+			error: `Failed to prepare graceful restart handoff: ${err}`,
+			newBinaryPath: newExecPath,
+		};
+	}
 
-	// Exit after a short delay to allow the response to be sent
-	setTimeout(() => {
-		process.exit(0);
-	}, 500);
+	try {
+		const env = {
+			...process.env,
+			NARRAFORK_GRACEFUL_RESTART_URL: session.url,
+			NARRAFORK_GRACEFUL_RESTART_TOKEN: session.token,
+		};
+		const proc = Bun.spawn([newExecPath, ...process.argv.slice(2)], {
+			cwd: process.cwd(),
+			env,
+			detached: true,
+			stdio: ["ignore", "ignore", "ignore"],
+		});
+		(proc as { unref?: () => void }).unref?.();
 
-	return { success: true, newBinaryPath: newExecPath };
+		logger.info("Update applied, replacement server spawned", {
+			oldExecPath: execPath,
+			newExecPath,
+			replacementPid: proc.pid,
+			handoffUrl: session.url,
+		});
+
+		return {
+			success: true,
+			newBinaryPath: newExecPath,
+			restarting: true,
+			replacementPid: proc.pid,
+		};
+	} catch (err) {
+		cancelGracefulRestartSession();
+		return {
+			success: false,
+			error: `Failed to start replacement server: ${err}`,
+			newBinaryPath: newExecPath,
+		};
+	}
 }
