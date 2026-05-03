@@ -37,6 +37,8 @@ function SettingsAgentPage() {
 				setExpandReasoning={setExpandReasoning}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
+				yoloSkipReadOnlyConfirmations={is.yoloSkipReadOnlyConfirmations}
+				setYoloSkipReadOnlyConfirmations={is.setYoloSkipReadOnlyConfirmations}
 				smartInterruptionCheck={is.smartInterruptionCheck}
 				setSmartInterruptionCheck={is.setSmartInterruptionCheck}
 				maxTransientRetries={is.maxTransientRetries}

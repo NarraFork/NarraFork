@@ -241,6 +241,8 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Skip YOLO secondary confirmations for operations that are classified as read-only. */
+		yoloSkipReadOnlyConfirmations: boolean;
 		/**
 		 * Global default reasoning effort — lowest priority fallback.
 		 * Fallback chain: narrator.reasoningEffort → provider.defaultReasoningEffort → agent.defaultReasoningEffort.

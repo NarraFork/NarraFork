@@ -766,6 +766,27 @@ function isCommandWhitelistCovered(
 	});
 }
 
+function isCommandWhitelisted(
+	cmd: BashAnalysis["commands"][number],
+	commandWhitelist: CommandWhitelistEntry[],
+): boolean {
+	return commandWhitelist.some(
+		(entry) => entry.enabled && matchCommandPattern(cmd.tokens, entry.pattern),
+	);
+}
+
+function areUnsafeCommandsWhitelistedForYolo(
+	bashAnalysis: BashAnalysis,
+	commandWhitelist: CommandWhitelistEntry[],
+): boolean {
+	if (commandWhitelist.length === 0 || bashAnalysis.hasEnvInjection) return false;
+	if (bashAnalysis.nonWhitelisted.length === 0) return false;
+	return bashAnalysis.nonWhitelisted.every((cmdName) => {
+		const cmd = bashAnalysis.commands.find((c) => c.tokens[0] === cmdName);
+		return !!cmd && isCommandWhitelisted(cmd, commandWhitelist);
+	});
+}
+
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
 const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "MultiEdit"]);
@@ -981,11 +1002,17 @@ function getGitSubcommand(tokens: string[]): { sub?: string; args: string[] } {
 	return { args: [] };
 }
 
-function describeExternalPaths(cwd: string, paths: string[]): string[] {
+function describeExternalPaths(
+	cwd: string,
+	paths: string[],
+	whitelistDirs: WhitelistDir[] = [],
+	requiredLevel: "readOnly" | "readWrite" | "full" = "readOnly",
+): string[] {
 	const seen = new Set<string>();
 	return paths
 		.map((p) => resolvePath(cwd, p))
 		.filter((p) => !isInsideWorktree(cwd, p) && !isInsideTruncateDir(cwd, p))
+		.filter((p) => !allPathsWhitelisted(cwd, [p], whitelistDirs, requiredLevel))
 		.filter((p) => {
 			if (seen.has(p)) return false;
 			seen.add(p);
@@ -1139,19 +1166,51 @@ function classifyGitDanger(cmdText: string, tokens: string[]): YoloDangerInfo | 
 	return null;
 }
 
+function isYoloReadOnlyOperation(
+	toolName: string,
+	input: Record<string, unknown>,
+	bashAnalysis?: BashAnalysis,
+): boolean {
+	if (toolName === SHELL_TOOL_NAME) {
+		return !!(
+			bashAnalysis &&
+			!bashAnalysis.hasWriteOperation &&
+			!bashAnalysis.hasEnvInjection &&
+			bashAnalysis.dangerousPatterns.length === 0 &&
+			bashAnalysis.nonWhitelisted.length === 0
+		);
+	}
+
+	if (toolName === "Agent") {
+		return input.subagent_type === "explore" || input.subagent_type === "plan";
+	}
+
+	return READ_ONLY_TOOLS.includes(toolName);
+}
+
 function classifyShellDanger(
 	input: Record<string, unknown>,
 	cwd: string,
 	bashAnalysis: BashAnalysis | undefined,
+	whitelistDirs: WhitelistDir[] = [],
+	commandWhitelist: CommandWhitelistEntry[] = [],
 ): YoloDangerInfo | null {
 	if (!bashAnalysis) return null;
+	const unsafeCommandsWhitelisted = areUnsafeCommandsWhitelistedForYolo(
+		bashAnalysis,
+		commandWhitelist,
+	);
 	for (const cmd of bashAnalysis.commands) {
 		const [name, ...args] = cmd.tokens;
 		if (name === "git") {
 			const gitDanger = classifyGitDanger(cmd.text, cmd.tokens);
-			if (gitDanger) return gitDanger;
+			if (gitDanger) {
+				if (isCommandWhitelisted(cmd, commandWhitelist)) continue;
+				return gitDanger;
+			}
 		}
 		if (name === "rm" || name === "rmdir" || name === "shred") {
+			if (isCommandWhitelisted(cmd, commandWhitelist)) continue;
 			const recursive = args.some((a) => a.includes("r") || a === "--recursive");
 			return danger(
 				`${name} deletes files${recursive ? " recursively" : ""}.`,
@@ -1164,6 +1223,7 @@ function classifyShellDanger(
 			);
 		}
 		if (name === "find" && (args.includes("-delete") || args.includes("-exec"))) {
+			if (isCommandWhitelisted(cmd, commandWhitelist)) continue;
 			return danger(
 				"Find is being used with deletion or command execution.",
 				["It can affect many matching files at once, including files the agent did not inspect."],
@@ -1175,7 +1235,7 @@ function classifyShellDanger(
 			);
 		}
 	}
-	if (bashAnalysis.dangerousPatterns.length > 0 || bashAnalysis.hasEnvInjection) {
+	if (bashAnalysis.hasEnvInjection) {
 		return danger(
 			"Shell command contains dangerous execution patterns.",
 			[
@@ -1186,13 +1246,29 @@ function classifyShellDanger(
 				"Inspect the command source first.",
 				"Break the command into read-only inspection and explicit execution steps.",
 			],
-			[
-				...bashAnalysis.dangerousPatterns,
-				...(bashAnalysis.hasEnvInjection ? ["Environment variable injection detected"] : []),
-			],
+			[...bashAnalysis.dangerousPatterns, "Environment variable injection detected"],
 		);
 	}
-	const externalPaths = describeExternalPaths(cwd, getShellScopePaths(cwd, input, bashAnalysis));
+	if (bashAnalysis.dangerousPatterns.length > 0 && !unsafeCommandsWhitelisted) {
+		return danger(
+			"Shell command contains dangerous execution patterns.",
+			[
+				"The command may execute downloaded, nested, or environment-injected code.",
+				"Side effects may be broader than the visible command line suggests.",
+			],
+			[
+				"Inspect the command source first.",
+				"Break the command into read-only inspection and explicit execution steps.",
+			],
+			bashAnalysis.dangerousPatterns,
+		);
+	}
+	const externalPaths = describeExternalPaths(
+		cwd,
+		getShellScopePaths(cwd, input, bashAnalysis),
+		whitelistDirs,
+		bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly",
+	);
 	if (externalPaths.length > 0) {
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
@@ -1215,14 +1291,27 @@ export function classifyYoloDanger(
 	input: Record<string, unknown>,
 	cwd: string,
 	bashAnalysis?: BashAnalysis,
+	whitelistDirs: WhitelistDir[] = [],
+	commandWhitelist: CommandWhitelistEntry[] = [],
+	skipReadOnlyConfirmations = false,
 ): YoloDangerInfo | null {
-	if (toolName === SHELL_TOOL_NAME) return classifyShellDanger(input, cwd, bashAnalysis);
+	if (skipReadOnlyConfirmations && isYoloReadOnlyOperation(toolName, input, bashAnalysis)) {
+		return null;
+	}
+
+	if (toolName === SHELL_TOOL_NAME)
+		return classifyShellDanger(input, cwd, bashAnalysis, whitelistDirs, commandWhitelist);
 
 	if (toolName === "Agent") {
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
 		if (workdir) {
 			const resolvedWorkdir = resolvePath(cwd, workdir);
 			if (!pathsEqual(resolvedWorkdir, resolvePath(cwd))) {
+				const requiredLevel =
+					input.subagent_type !== "explore" && input.subagent_type !== "plan" ? "full" : "readOnly";
+				if (allPathsWhitelisted(cwd, [resolvedWorkdir], whitelistDirs, requiredLevel)) {
+					return null;
+				}
 				return danger(
 					"Subagent requests a custom working directory.",
 					[
@@ -1241,7 +1330,8 @@ export function classifyYoloDanger(
 	}
 
 	const toolPaths = extractToolPaths(toolName, input);
-	const externalPaths = describeExternalPaths(cwd, toolPaths);
+	const requiredLevel = READ_ONLY_TOOLS.includes(toolName) ? "readOnly" : "readWrite";
+	const externalPaths = describeExternalPaths(cwd, toolPaths, whitelistDirs, requiredLevel);
 	if (externalPaths.length > 0) {
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
@@ -1810,7 +1900,15 @@ export async function handlePermission(
 		narrator?.previousPermissionMode,
 	);
 	if (decision === "allow" && effectiveMode === "bypassPermissions") {
-		const danger = classifyYoloDanger(toolName, effectiveInput, cwd, bashAnalysis);
+		const danger = classifyYoloDanger(
+			toolName,
+			effectiveInput,
+			cwd,
+			bashAnalysis,
+			mergedWhitelist,
+			mergedCmdWhitelist,
+			settings.agent.yoloSkipReadOnlyConfirmations,
+		);
 		if (danger) {
 			const fingerprint = createYoloDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
 			if (!consumeYoloConfirmation(narratorId, fingerprint)) {

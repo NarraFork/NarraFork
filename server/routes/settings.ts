@@ -156,6 +156,7 @@ const updateSettingsSchema = z
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
+				yoloSkipReadOnlyConfirmations: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				smartInterruptionCheck: z.boolean(),
 				maxTransientRetries: z.number().int().min(-1).max(100),

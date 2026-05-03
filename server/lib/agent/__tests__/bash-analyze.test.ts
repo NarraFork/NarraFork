@@ -899,6 +899,217 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(result?.summary).toContain("outside the current working directory");
 	});
 
+	test("YOLO danger classifier can skip read-only external path confirmations", () => {
+		expect(
+			classifyYoloDanger(
+				"Bash",
+				{ command: "cat /etc/passwd" },
+				cwd,
+				withExternalPath,
+				[],
+				[],
+				true,
+			),
+		).toBeNull();
+		expect(
+			classifyYoloDanger("Read", { file_path: "/etc/passwd" }, cwd, undefined, [], [], true),
+		).toBeNull();
+		expect(
+			classifyYoloDanger(
+				"Agent",
+				{ subagent_type: "explore", workdir: "/mnt/shared" },
+				cwd,
+				undefined,
+				[],
+				[],
+				true,
+			),
+		).toBeNull();
+	});
+
+	test("YOLO read-only skip still catches write and dangerous operations", () => {
+		const writeAnalysis: BashAnalysis = {
+			...withExternalPath,
+			commands: [
+				{
+					tokens: ["touch", "/mnt/shared/out.txt"],
+					text: "touch /mnt/shared/out.txt",
+					fullText: "touch /mnt/shared/out.txt",
+				},
+			],
+			filePaths: ["/mnt/shared/out.txt"],
+			hasWriteOperation: true,
+		};
+		expect(
+			classifyYoloDanger(
+				"Bash",
+				{ command: "touch /mnt/shared/out.txt" },
+				cwd,
+				writeAnalysis,
+				[],
+				[],
+				true,
+			)?.summary,
+		).toContain("outside the current working directory");
+		expect(
+			classifyYoloDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted, [], [], true)
+				?.summary,
+		).toContain("rm deletes files");
+		expect(
+			classifyYoloDanger(
+				"Write",
+				{ file_path: "/mnt/shared/new.txt", content: "ok" },
+				cwd,
+				undefined,
+				[],
+				[],
+				true,
+			)?.summary,
+		).toContain("outside the current working directory");
+	});
+
+	test("YOLO danger classifier ignores read access in whitelisted external dir", () => {
+		const analysis: BashAnalysis = {
+			...withExternalPath,
+			commands: [
+				{
+					tokens: ["cat", "/mnt/shared/info.txt"],
+					text: "cat /mnt/shared/info.txt",
+					fullText: "cat /mnt/shared/info.txt",
+				},
+			],
+			filePaths: ["/mnt/shared/info.txt"],
+		};
+		expect(
+			classifyYoloDanger("Bash", { command: "cat /mnt/shared/info.txt" }, cwd, analysis, [
+				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
+			]),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier ignores write access in readWrite whitelisted external dir", () => {
+		const analysis: BashAnalysis = {
+			...withExternalPath,
+			commands: [
+				{
+					tokens: ["touch", "/mnt/shared/out.txt"],
+					text: "touch /mnt/shared/out.txt",
+					fullText: "touch /mnt/shared/out.txt",
+				},
+			],
+			filePaths: ["/mnt/shared/out.txt"],
+			hasWriteOperation: true,
+		};
+		expect(
+			classifyYoloDanger("Bash", { command: "touch /mnt/shared/out.txt" }, cwd, analysis, [
+				{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true },
+			]),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier still catches write access with only readOnly whitelist", () => {
+		const analysis: BashAnalysis = {
+			...withExternalPath,
+			commands: [
+				{
+					tokens: ["touch", "/mnt/shared/out.txt"],
+					text: "touch /mnt/shared/out.txt",
+					fullText: "touch /mnt/shared/out.txt",
+				},
+			],
+			filePaths: ["/mnt/shared/out.txt"],
+			hasWriteOperation: true,
+		};
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "touch /mnt/shared/out.txt" },
+			cwd,
+			analysis,
+			[{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true }],
+		);
+		expect(result?.summary).toContain("outside the current working directory");
+	});
+
+	test("YOLO danger classifier ignores direct tool access in whitelisted external dir", () => {
+		expect(
+			classifyYoloDanger("Read", { file_path: "/mnt/shared/info.txt" }, cwd, undefined, [
+				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
+			]),
+		).toBeNull();
+		expect(
+			classifyYoloDanger(
+				"Write",
+				{ file_path: "/mnt/shared/new.txt", content: "ok" },
+				cwd,
+				undefined,
+				[{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
+			),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier ignores general subagent in full-whitelisted workdir", () => {
+		expect(
+			classifyYoloDanger(
+				"Agent",
+				{ subagent_type: "general", workdir: "/mnt/shared" },
+				cwd,
+				undefined,
+				[{ path: "/mnt/shared", accessLevel: "full", enabled: true }],
+			),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier ignores whitelisted rm command", () => {
+		expect(
+			classifyYoloDanger(
+				"Bash",
+				{ command: "rm -rf build-cache" },
+				cwd,
+				withNonWhitelisted,
+				[],
+				[{ pattern: "rm *", enabled: true }],
+			),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier ignores whitelisted destructive git command", async () => {
+		const analysis = await analyzeBashCommand("git reset --hard HEAD~1", cwd, false);
+		expect(
+			classifyYoloDanger(
+				"Bash",
+				{ command: "git reset --hard HEAD~1" },
+				cwd,
+				analysis,
+				[],
+				[{ pattern: "git reset *", enabled: true }],
+			),
+		).toBeNull();
+	});
+
+	test("YOLO danger classifier still catches external shell path when command is whitelisted", () => {
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "cat /etc/passwd" },
+			cwd,
+			withExternalPath,
+			[],
+			[{ pattern: "cat /etc/passwd", enabled: true }],
+		);
+		expect(result?.summary).toContain("outside the current working directory");
+	});
+
+	test("YOLO danger classifier does not ignore env injection even when command is whitelisted", () => {
+		const result = classifyYoloDanger(
+			"Bash",
+			{ command: "LD_PRELOAD=/tmp/evil.so ls" },
+			cwd,
+			withEnvInjection,
+			[],
+			[{ pattern: "ls", enabled: true }],
+		);
+		expect(result?.summary).toContain("dangerous execution patterns");
+	});
+
 	test("YOLO danger fingerprint is stable across object key order", () => {
 		expect(createYoloDangerFingerprint("Bash", { command: "rm foo", timeout: 1 }, cwd)).toBe(
 			createYoloDangerFingerprint("Bash", { timeout: 1, command: "rm foo" }, cwd),

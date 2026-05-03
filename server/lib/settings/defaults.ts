@@ -30,6 +30,7 @@ export const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
+		yoloSkipReadOnlyConfirmations: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20_000,
@@ -198,6 +199,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.defaultRelaxedPlan": {
 		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
+		type: "boolean",
+	},
+	"agent.yoloSkipReadOnlyConfirmations": {
+		desc: "YOLO 模式下跳过只读操作的二次确认；写入、删除、危险执行模式和环境注入仍会保留安全暂停。",
 		type: "boolean",
 	},
 	"agent.smartInterruptionCheck": {

@@ -49,6 +49,8 @@ export interface AgentSectionProps {
 	setExpandReasoning: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
+	yoloSkipReadOnlyConfirmations: boolean;
+	setYoloSkipReadOnlyConfirmations: (v: boolean) => void;
 	smartInterruptionCheck: boolean;
 	setSmartInterruptionCheck: (v: boolean) => void;
 	maxTransientRetries: number;
@@ -205,6 +207,12 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("yoloSkipReadOnlyConfirmations")}
+				description={t("yoloSkipReadOnlyConfirmationsDesc")}
+				checked={props.yoloSkipReadOnlyConfirmations}
+				onChange={(e) => props.setYoloSkipReadOnlyConfirmations(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("smartInterruptionCheck")}
