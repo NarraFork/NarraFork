@@ -79,6 +79,8 @@
 	"textFileTooLarge": "Text file too large (max 100MB)",
 	"unsupportedFileType": "Unsupported file type",
 	"loadOlderMessages": "Load older messages",
+	"switchToPixiRenderer": "Switch to experimental PixiJS renderer (read-only)",
+	"switchToReactRenderer": "Switch to React renderer",
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"modelTooltip": "Model for next message",

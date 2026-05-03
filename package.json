@@ -26,6 +26,7 @@
 		"@xterm/xterm": "5.5.0",
 		"@xyflow/react": "^12.10.2",
 		"archiver": "^7.0.1",
+		"broad-infinite-list": "^1.4.1",
 		"bun-pty": "^0.4.8",
 		"chardet": "^2.1.1",
 		"diff": "^8.0.4",

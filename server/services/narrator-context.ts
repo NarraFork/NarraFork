@@ -115,7 +115,10 @@ export const narratorContext = {
 		try {
 			const summarySuffix = getPrompt("compactSuffix", locale);
 			const summaryUserText = `<conversation>\n${conversationText}\n</conversation>\n\n${summarySuffix}`;
-			const result = await summaryGenerate(summaryUserText, summaryPrompt);
+			const result = await summaryGenerate(summaryUserText, summaryPrompt, {
+				narratorId,
+				kind: "fork_summary",
+			});
 
 			return result.text || "Failed to generate summary.";
 		} catch (err) {
@@ -371,7 +374,10 @@ export const narratorContext = {
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= COMPACT_MAX_RETRIES; attempt++) {
 			try {
-				const result = await summaryGenerate(compactUserText, compactSystemPrompt);
+				const result = await summaryGenerate(compactUserText, compactSystemPrompt, {
+					narratorId,
+					kind: "compact",
+				});
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
 				}

@@ -151,6 +151,7 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 		titlePrompt.replace(/<conversation>\s*$/, "").trim(),
 		`<conversation>\n${conversationText}\n</conversation>`,
 		locale,
+		{ narratorId, kind: "title" },
 	);
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -202,6 +203,7 @@ export async function generateQuickTitle(
 			titlePrompt.replace(/<user_message>\s*$/, "").trim(),
 			`<user_message>\n${truncated}\n</user_message>`,
 			locale,
+			{ narratorId, kind: "title" },
 		);
 
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

@@ -33,6 +33,7 @@ export const usageHistoryApi = {
 		if (filters.projectId) params.append("projectId", filters.projectId);
 		if (filters.provider) params.append("provider", filters.provider);
 		if (filters.model) params.append("model", filters.model);
+		if (filters.kind) params.append("kind", filters.kind);
 		if (filters.startDate) params.append("startDate", filters.startDate);
 		if (filters.endDate) params.append("endDate", filters.endDate);
 		if (filters.page) params.append("page", filters.page.toString());
@@ -52,6 +53,7 @@ export const usageHistoryApi = {
 		if (filters.projectId) params.append("projectId", filters.projectId);
 		if (filters.provider) params.append("provider", filters.provider);
 		if (filters.model) params.append("model", filters.model);
+		if (filters.kind) params.append("kind", filters.kind);
 		if (filters.startDate) params.append("startDate", filters.startDate);
 		if (filters.endDate) params.append("endDate", filters.endDate);
 

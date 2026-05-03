@@ -18,7 +18,8 @@ export interface UsageHistoryRawDump {
 
 export interface UsageHistoryRecord {
 	id: string;
-	narratorId: string;
+	narratorId: string | null;
+	kind: string;
 	provider: string | null;
 	credentialId: string | null;
 	credentialName: string | null;
@@ -67,6 +68,7 @@ export interface UsageHistoryFilters {
 	projectId?: string;
 	provider?: string;
 	model?: string;
+	kind?: string;
 	startDate?: string;
 	endDate?: string;
 }

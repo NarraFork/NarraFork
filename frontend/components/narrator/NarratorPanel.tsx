@@ -148,6 +148,7 @@ import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BlurInOnAppearProvider } from "./BlurInOnAppear";
+import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserSessionBar } from "./BrowserSessionBar";
 import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
@@ -171,6 +172,7 @@ import {
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
 import { getRenderableMessageOrder } from "./message-order-utils";
+import { useNarratorMessageRendererMode } from "./message-renderer-mode";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorDetailsPanel } from "./NarratorDetailsPanel";
@@ -195,13 +197,8 @@ import {
 	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { NarratorPixiMessageList } from "./pixi/NarratorPixiMessageList";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
-import {
-	getSlidingWindowDistanceFromBottom,
-	getSlidingWindowScrollBottom,
-	SlidingWindowList,
-	type SlidingWindowListHandle,
-} from "./SlidingWindowList";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
 	getGlobalCloseSwipe,
@@ -220,6 +217,14 @@ const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }))
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
+
+function getMessageViewportScrollBottom(scroller: HTMLElement) {
+	return Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+}
+
+function getMessageViewportDistanceFromBottom(scroller: HTMLElement) {
+	return getMessageViewportScrollBottom(scroller) - scroller.scrollTop;
+}
 
 type PageRenderCacheEntry = {
 	messageRefs: readonly NarratorMsg[];
@@ -1693,9 +1698,6 @@ export function NarratorPanel({
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
-	// Whether older messages are currently being prepended. When true, the
-	// virtual list adjusts scrollTop to compensate for prepended content.
-	const [shifting, setShifting] = useState(false);
 	const contentRef = useRef<HTMLDivElement>(null);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
@@ -1729,7 +1731,7 @@ export function NarratorPanel({
 				followingRef.current = false;
 				return;
 			}
-			const target = getSlidingWindowScrollBottom(vp);
+			const target = getMessageViewportScrollBottom(vp);
 			const gap = target - vp.scrollTop;
 			if (gap < 1.5) {
 				programmaticScrollRef.current = true;
@@ -1767,7 +1769,7 @@ export function NarratorPanel({
 			setUnreadCountRef.current?.(0);
 			if (instant) {
 				programmaticScrollRef.current = true;
-				vp.scrollTop = getSlidingWindowScrollBottom(vp);
+				vp.scrollTop = getMessageViewportScrollBottom(vp);
 			} else {
 				startFollowing();
 			}
@@ -2396,14 +2398,14 @@ export function NarratorPanel({
 		},
 		[narratorId, startAskInPassingMutation],
 	);
-	// --- Virtualization setup ---
+	// --- Message rendering setup ---
 	const highlightScrolledRef = useRef(false);
 	const highlightStartTimerRef = useRef<number | null>(null);
 	const highlightClearTimerRef = useRef<number | null>(null);
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-	const virtualListRef = useRef<SlidingWindowListHandle>(null);
+	const virtualListRef = useRef<BroadMessageListHandle>(null);
 
 	const clearHighlightTimers = useCallback(() => {
 		if (highlightStartTimerRef.current != null) {
@@ -2502,7 +2504,7 @@ export function NarratorPanel({
 		}
 	}
 
-	// With virtualization there is no progressive rendering phase — always done.
+	// The list component handles rendering; no extra progressive phase here.
 	const renderDone = true;
 
 	// Trim message cache on unmount / narrator switch
@@ -2829,11 +2831,17 @@ export function NarratorPanel({
 		],
 	);
 
-	// --- Flat elements for virtualization ---
+	// --- Flat message elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
+	const [messageRendererMode, setMessageRendererMode] = useNarratorMessageRendererMode();
+	const usePixiRenderer = messageRendererMode === "pixi" && !isWorkspacePreview;
 	const suppressBlurIn =
-		!advancedAnim || isResizing || !initialScrollDone || shifting || isFetchingPreviousPage;
+		!advancedAnim ||
+		isResizing ||
+		!initialScrollDone ||
+		isFetchingNextPage ||
+		isFetchingPreviousPage;
 	const blurInSeedIds = useMemo(() => {
 		if (!advancedAnim || !suppressBlurIn || !messagesData?.pages?.length) return [];
 		const ids = new Set<string>();
@@ -3218,15 +3226,9 @@ export function NarratorPanel({
 	}, []);
 
 	// --- Load older / newer ---
-	const handleLoadOlder = useCallback(async () => {
+	const handleLoadOlder = useCallback(() => {
 		if (isFetchingNextPage) return;
-		// Enable shift mode so the virtual list adjusts scrollTop to compensate
-		// for prepended content height.
-		setShifting(true);
-		await fetchNextPage();
-		requestAnimationFrame(() => {
-			setShifting(false);
-		});
+		fetchNextPage();
 	}, [fetchNextPage, isFetchingNextPage]);
 	loadOlderBtnRef.current = handleLoadOlder;
 
@@ -3246,16 +3248,28 @@ export function NarratorPanel({
 
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
+	const loadOlderArmedRef = useRef(false);
+	const loadOlderNearTopRef = useRef(false);
 	useEffect(() => {
 		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || isFetchingNextPage) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
 		const check = () => {
 			// Normal scroll direction: scrollTop near 0 = near visual top (older messages).
-			// Trigger load-older when within 2x viewport height from the top.
-			if (vp.scrollTop < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight) {
-				handleLoadOlderRef.current();
+			// Trigger only once per deliberate upward entry into the top band. After a page
+			// is prepended, browser anchoring may briefly report a near-top scrollTop again;
+			// keep the gate closed until the viewport clearly leaves the top band.
+			const nearTop = vp.scrollTop < vp.clientHeight * 2 && vp.scrollHeight > vp.clientHeight;
+			if (!nearTop) {
+				if (vp.scrollTop > vp.clientHeight * 3 || vp.scrollHeight <= vp.clientHeight) {
+					loadOlderNearTopRef.current = false;
+				}
+				return;
 			}
+			if (loadOlderNearTopRef.current || !loadOlderArmedRef.current) return;
+			loadOlderNearTopRef.current = true;
+			loadOlderArmedRef.current = false;
+			handleLoadOlderRef.current();
 		};
 		check();
 		vp.addEventListener("scroll", check, { passive: true });
@@ -3272,7 +3286,7 @@ export function NarratorPanel({
 		const check = () => {
 			// Normal scroll direction: scrollTop near max = at visual bottom (newest messages).
 			// Trigger load-newer when near the bottom.
-			const distFromBottom = getSlidingWindowDistanceFromBottom(vp);
+			const distFromBottom = getMessageViewportDistanceFromBottom(vp);
 			if (distFromBottom <= 24) {
 				handleLoadNewerRef.current();
 			}
@@ -3296,6 +3310,7 @@ export function NarratorPanel({
 		const markUserScrollIntent = (direction: "up" | "down") => {
 			userScrollIntentRef.current = direction;
 			userScrollIntentExpiresAtRef.current = performance.now() + 500;
+			loadOlderArmedRef.current = direction === "up";
 		};
 		const hasRecentUpwardUserIntent = () => {
 			if (scrollbarDragRef.current) return true;
@@ -3305,7 +3320,7 @@ export function NarratorPanel({
 			return false;
 		};
 		const checkAtBottom = () => {
-			const atBottom = getSlidingWindowDistanceFromBottom(node) < 30;
+			const atBottom = getMessageViewportDistanceFromBottom(node) < 30;
 			if (atBottom && !isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
@@ -3348,6 +3363,7 @@ export function NarratorPanel({
 			const rect = node.getBoundingClientRect();
 			if (e.clientX >= rect.right - verticalScrollbarWidth) {
 				scrollbarDragRef.current = true;
+				loadOlderArmedRef.current = true;
 			}
 		};
 		const onPointerUp = () => {
@@ -3379,8 +3395,8 @@ export function NarratorPanel({
 				lastScrollTop = cur;
 				return;
 			}
-			// A negative scrollTop delta can also be produced by virtualization clamps,
-			// scroll anchoring, or content re-measurement. Only treat it as leaving the
+			// A negative scrollTop delta can also be produced by scroll anchoring or
+			// content re-measurement. Only treat it as leaving the
 			// bottom-following mode when it is tied to explicit upward user input.
 			if (!followingRef.current && cur < lastScrollTop && hasRecentUpwardUserIntent()) {
 				detachFromBottom();
@@ -3467,14 +3483,14 @@ export function NarratorPanel({
 				if (resizingRef.current) {
 					if (isAtBottomRef.current && !highlightMessageId) {
 						programmaticScrollRef.current = true;
-						vp.scrollTop = getSlidingWindowScrollBottom(vp);
+						vp.scrollTop = getMessageViewportScrollBottom(vp);
 					}
 					return;
 				}
 				if (isAtBottomRef.current && !highlightMessageId) {
 					startFollowing();
 				} else if (!isAtBottomRef.current && !highlightMessageId) {
-					if (getSlidingWindowDistanceFromBottom(vp) < 30) {
+					if (getMessageViewportDistanceFromBottom(vp) < 30) {
 						isAtBottomRef.current = true;
 						setIsAtBottom(true);
 					}
@@ -3495,7 +3511,7 @@ export function NarratorPanel({
 				if (resizingRef.current) {
 					if (isAtBottomRef.current && !highlightMessageId) {
 						programmaticScrollRef.current = true;
-						vp.scrollTop = getSlidingWindowScrollBottom(vp);
+						vp.scrollTop = getMessageViewportScrollBottom(vp);
 					}
 					return;
 				}
@@ -3523,7 +3539,7 @@ export function NarratorPanel({
 
 			if (isAtBottomRef.current && !highlightMessageId) {
 				programmaticScrollRef.current = true;
-				vp.scrollTop = getSlidingWindowScrollBottom(vp);
+				vp.scrollTop = getMessageViewportScrollBottom(vp);
 			}
 		});
 		vpObserver.observe(vp);
@@ -3552,7 +3568,7 @@ export function NarratorPanel({
 		};
 	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing]);
 
-	const scrollToVirtualTarget = useCallback(
+	const scrollToMessageTarget = useCallback(
 		({
 			domIds,
 			targetIds,
@@ -3603,12 +3619,12 @@ export function NarratorPanel({
 	// --- Scroll to highlighted message ---
 	useEffect(() => {
 		if (!highlightMessageId || totalMessageCount === 0 || highlightScrolledRef.current) return;
-		highlightScrolledRef.current = scrollToVirtualTarget({
+		highlightScrolledRef.current = scrollToMessageTarget({
 			domIds: [`msg-${highlightMessageId}`],
 			targetIds: [highlightMessageId],
 			highlightId: highlightMessageId,
 		});
-	}, [highlightMessageId, totalMessageCount, scrollToVirtualTarget]);
+	}, [highlightMessageId, totalMessageCount, scrollToMessageTarget]);
 
 	// --- Send / retry message ---
 	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
@@ -4616,6 +4632,18 @@ export function NarratorPanel({
 									</ActionIcon>
 								</Tooltip>
 								<BackgroundTasksDrawer narratorId={narratorId} />
+								<Tooltip
+									label={usePixiRenderer ? t("switchToReactRenderer") : t("switchToPixiRenderer")}
+								>
+									<ActionIcon
+										size="sm"
+										variant={usePixiRenderer ? "light" : "subtle"}
+										color={usePixiRenderer ? "indigo" : "gray"}
+										onClick={() => setMessageRendererMode(usePixiRenderer ? "react" : "pixi")}
+									>
+										<IconPhoto size={16} />
+									</ActionIcon>
+								</Tooltip>
 								<Tooltip label={t("fileMod_title")}>
 									<ActionIcon
 										size="sm"
@@ -4804,29 +4832,45 @@ export function NarratorPanel({
 														))}
 													</Box>
 												</Box>
+											) : usePixiRenderer ? (
+												<NarratorPixiMessageList
+													ref={virtualListRef}
+													messagesData={messagesData}
+													narratorId={narratorId}
+													streamingMsg={streamingMsg}
+													pruneBoundaryMessageId={pruneBoundaryMessageId}
+													pruneDividerLabel={pruneDividerLabel}
+													showManualLoadOlder={showManualLoadOlder}
+													showConclusionButton={showConclusionBtn}
+													showTokenUsage={showTokenUsage}
+													highlightedId={highlightedId}
+													scrollRef={viewportCallbackRef}
+													contentRef={contentRef}
+													shift={isFetchingNextPage}
+												/>
 											) : advancedAnim ? (
 												<BlurInOnAppearProvider
 													scopeKey={narratorId}
 													suppress={suppressBlurIn}
 													seedIds={blurInSeedIds}
 												>
-													<SlidingWindowList
+													<BroadMessageList
 														ref={virtualListRef}
 														elements={renderedElements}
 														elementKeys={renderedKeys}
 														scrollRef={viewportCallbackRef}
 														contentRef={contentRef}
-														shift={shifting}
+														shift={isFetchingNextPage}
 													/>
 												</BlurInOnAppearProvider>
 											) : (
-												<SlidingWindowList
+												<BroadMessageList
 													ref={virtualListRef}
 													elements={renderedElements}
 													elementKeys={renderedKeys}
 													scrollRef={viewportCallbackRef}
 													contentRef={contentRef}
-													shift={shifting}
+													shift={isFetchingNextPage}
 												/>
 											)}
 										</EditingMessageCtx.Provider>
@@ -5292,7 +5336,7 @@ export function NarratorPanel({
 									}
 									if (!msg) return;
 									setExpandedToolUseId(todosToolUseId);
-									scrollToVirtualTarget({
+									scrollToMessageTarget({
 										domIds: [`tool-use-${todosToolUseId}`, `msg-${msg.id}`],
 										targetIds: [todosToolUseId, msg.id],
 										highlightId: msg.id,

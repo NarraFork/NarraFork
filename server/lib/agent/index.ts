@@ -1,7 +1,8 @@
+import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import { isRetryableError } from "./loop";
-import { resolveProviderAndModel } from "./provider";
+import { type GenerateOptions, resolveProviderAndModel } from "./provider";
 import { registerCoreTools } from "./tools";
 import { initTruncateCleanup } from "./truncate";
 
@@ -12,7 +13,13 @@ registerCoreTools();
 initTruncateCleanup();
 
 export { agentLoop } from "./loop";
-export type { DbMessage, DbToolCall, ParsedStreamEvent, ProviderAdapter } from "./provider";
+export type {
+	DbMessage,
+	DbToolCall,
+	GenerateOptions,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 export { getProvider, resolveProviderAndModel } from "./provider";
 export { resolveModel } from "./resolve-model";
 export { toolRegistry } from "./tool-registry";
@@ -59,10 +66,22 @@ export async function agentGenerateWithMeta(
 	text: string,
 	model?: string,
 	systemInstruction?: string,
+	options?: GenerateOptions,
+	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<{ text: string; contextPercent?: number }> {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const resolved = resolveProviderAndModel(requestedModel);
-	return resolved.adapter.generateWithMeta(text, resolved.model, systemInstruction);
+	const generate = () =>
+		resolved.adapter.generateWithMeta(text, resolved.model, systemInstruction, options);
+	if (!tracking) return generate();
+	return trackApiRequest(
+		{
+			...tracking,
+			provider: resolved.provider,
+			model: resolved.model,
+		},
+		generate,
+	);
 }
 
 /**
@@ -74,10 +93,17 @@ export async function agentGenerateWithHistory(
 	content: string,
 	model?: string,
 	locale?: string,
+	options?: GenerateOptions,
 ): Promise<string> {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const resolved = resolveProviderAndModel(requestedModel);
-	return resolved.adapter.generateWithHistory(systemInstruction, content, resolved.model, locale);
+	return resolved.adapter.generateWithHistory(
+		systemInstruction,
+		content,
+		resolved.model,
+		locale,
+		options,
+	);
 }
 
 // === Summary model wrappers ===
@@ -100,6 +126,7 @@ let lastSummaryUnavailableBroadcast = 0;
 /** Timestamp of the last `summary_model_error` broadcast. */
 let lastSummaryErrorBroadcast = 0;
 const SUMMARY_UNAVAILABLE_DEBOUNCE_MS = 30_000;
+const SUMMARY_GENERATE_OPTIONS: GenerateOptions = { reasoningEffort: "none" };
 
 /**
  * Check whether an error indicates the summary model's provider is unavailable
@@ -207,9 +234,16 @@ async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
 export async function summaryGenerate(
 	text: string,
 	systemInstruction?: string,
+	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<{ text: string; contextPercent?: number }> {
 	return withSummaryRetry(() =>
-		agentGenerateWithMeta(text, settings.agent.summaryModel, systemInstruction),
+		agentGenerateWithMeta(
+			text,
+			settings.agent.summaryModel,
+			systemInstruction,
+			SUMMARY_GENERATE_OPTIONS,
+			tracking,
+		),
 	);
 }
 
@@ -222,8 +256,28 @@ export async function summaryGenerateWithHistory(
 	systemInstruction: string,
 	content: string,
 	locale?: string,
+	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<string> {
-	return withSummaryRetry(() =>
-		agentGenerateWithHistory(systemInstruction, content, settings.agent.summaryModel, locale),
-	);
+	const generate = async () => ({
+		text: await agentGenerateWithHistory(
+			systemInstruction,
+			content,
+			settings.agent.summaryModel,
+			locale,
+			SUMMARY_GENERATE_OPTIONS,
+		),
+	});
+	const result = await withSummaryRetry(async () => {
+		if (!tracking) return generate();
+		const resolved = resolveProviderAndModel(settings.agent.summaryModel);
+		return trackApiRequest(
+			{
+				...tracking,
+				provider: resolved.provider,
+				model: resolved.model,
+			},
+			generate,
+		);
+	});
+	return result.text;
 }

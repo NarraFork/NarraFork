@@ -37,6 +37,11 @@ export const ModelList = React.memo(function ModelList({
 	if (models.length === 0) return null;
 
 	const allHidden = models.every((m) => hiddenModels.has(m.value));
+	const sortedModels = [...models].sort((a, b) => {
+		const aHidden = hiddenModels.has(a.value);
+		const bHidden = hiddenModels.has(b.value);
+		return Number(aHidden) - Number(bHidden);
+	});
 
 	return (
 		<Stack gap="xs" mt="xs">
@@ -58,7 +63,7 @@ export const ModelList = React.memo(function ModelList({
 					</Tooltip>
 				</Group>
 			)}
-			{models.map((m) => (
+			{sortedModels.map((m) => (
 				<ModelRow
 					key={m.value}
 					modelValue={m.value}

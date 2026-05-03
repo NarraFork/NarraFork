@@ -10,6 +10,7 @@ export interface UsageHistoryFilters {
 	projectId?: string;
 	provider?: string;
 	model?: string;
+	kind?: string;
 	startDate?: string;
 	endDate?: string;
 }
@@ -31,7 +32,8 @@ export interface UsageHistoryStats {
 
 export interface UsageHistoryRecord {
 	id: string;
-	narratorId: string;
+	narratorId: string | null;
+	kind: string;
 	provider: string | null;
 	credentialId: string | null;
 	credentialName: string | null;
@@ -127,6 +129,7 @@ export class UsageHistoryService {
 			.select({
 				id: apiRequests.id,
 				narratorId: apiRequests.narratorId,
+				kind: apiRequests.kind,
 				provider: apiRequests.provider,
 				credentialId: apiRequests.credentialId,
 				model: apiRequests.model,
@@ -227,6 +230,7 @@ export class UsageHistoryService {
 			.select({
 				id: apiRequests.id,
 				narratorId: apiRequests.narratorId,
+				kind: apiRequests.kind,
 				provider: apiRequests.provider,
 				credentialId: apiRequests.credentialId,
 				model: apiRequests.model,
@@ -278,11 +282,13 @@ export class UsageHistoryService {
 		const conditions = [];
 		const provider = filters.provider?.trim();
 		const model = filters.model?.trim();
+		const kind = filters.kind?.trim();
 
 		if (filters.narratorId) conditions.push(eq(apiRequests.narratorId, filters.narratorId));
 		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
 		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
 		if (provider) conditions.push(eq(apiRequests.provider, provider));
+		if (kind) conditions.push(eq(apiRequests.kind, kind));
 		if (model) conditions.push(like(apiRequests.model, `%${model}%`));
 		if (filters.startDate) conditions.push(gte(apiRequests.createdAt, filters.startDate));
 		if (filters.endDate) conditions.push(lte(apiRequests.createdAt, filters.endDate));

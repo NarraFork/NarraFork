@@ -44,7 +44,7 @@ export async function fetchSmart(
 		? `${SYSTEM_PROMPT}\n\nThe user is looking for specific information: "${purpose}". Prioritize extracting content relevant to this goal.`
 		: SYSTEM_PROMPT;
 
-	const result = await summaryGenerate(prompt, systemPrompt);
+	const result = await summaryGenerate(prompt, systemPrompt, { kind: "web_fetch_smart" });
 	let summary = result.text.trim();
 
 	if (summary.length > maxLength) {

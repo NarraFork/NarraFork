@@ -511,7 +511,9 @@ settingsRoutes.post("/test-model", async (c) => {
 	}
 
 	try {
-		const result = await agentGenerateWithMeta(prompt, model);
+		const result = await agentGenerateWithMeta(prompt, model, undefined, undefined, {
+			kind: "settings_test",
+		});
 		return c.json({ text: result.text });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

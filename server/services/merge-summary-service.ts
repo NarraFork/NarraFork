@@ -223,7 +223,10 @@ export const mergeSummaryService = {
 			const systemPrompt = getPrompt("mergeSummary", locale);
 
 			// Call the summary model (Haiku)
-			const result = await summaryGenerate(userText, systemPrompt);
+			const result = await summaryGenerate(userText, systemPrompt, {
+				narratorId: primaryNarrator.id,
+				kind: "merge_summary",
+			});
 
 			const summary = result.text?.trim();
 			if (!summary) {

@@ -217,6 +217,7 @@ Rules:
 		systemPrompt,
 		`<diff>\n${diff}\n</diff>`,
 		"en",
+		{ kind: "git_summary" },
 	);
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

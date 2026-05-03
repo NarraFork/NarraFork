@@ -60,6 +60,13 @@ function getProviderColor(provider: string | null) {
 	}
 }
 
+function getKindLabel(
+	t: (key: string, options: { defaultValue: string }) => string,
+	kind: string,
+): string {
+	return t(`usageHistoryKind_${kind}`, { defaultValue: kind });
+}
+
 function formatTokenCount(count: number): string {
 	if (count >= 1000) {
 		return `${(count / 1000).toFixed(1)}K`;
@@ -216,9 +223,16 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											<Text size="10px" c="dimmed" lineClamp={2}>
 												{record.chapterTitle}
 											</Text>
-										) : null}
+										) : (
+											<Text size="10px" c="dimmed">
+												{t("usageHistorySystemRequest")}
+											</Text>
+										)}
 									</Stack>
 									<Group gap={4} wrap="nowrap">
+										<Badge color="gray" variant="outline" size="sm">
+											{getKindLabel(t, record.kind)}
+										</Badge>
 										{record.errorMessage ? (
 											<Badge color="red" variant="light" size="sm">
 												{t("usageHistoryError")}
@@ -241,8 +255,10 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										label={t("usageHistoryTableNarrator")}
 										value={
 											showNarratorId
-												? record.narratorId
-												: (record.narratorTitle ?? record.narratorId)
+												? (record.narratorId ?? "-")
+												: (record.narratorTitle ??
+													record.narratorId ??
+													t("usageHistorySystemRequest"))
 										}
 										monospace={showNarratorId}
 										compact
@@ -335,6 +351,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										</Tooltip>
 									</Group>
 								</Table.Th>
+								<Table.Th>{t("usageHistoryTableKind")}</Table.Th>
 								<Table.Th>{t("usageHistoryTableProvider")}</Table.Th>
 								<Table.Th>
 									<Group gap={8} wrap="nowrap">
@@ -387,15 +404,26 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 												<Text size="xs" c="dimmed">
 													{record.chapterTitle}
 												</Text>
-											) : null}
+											) : (
+												<Text size="xs" c="dimmed">
+													{t("usageHistorySystemRequest")}
+												</Text>
+											)}
 										</Stack>
 									</Table.Td>
 									<Table.Td>
 										<Text size="sm" ff={showNarratorId ? "monospace" : undefined}>
 											{showNarratorId
-												? record.narratorId
-												: (record.narratorTitle ?? record.narratorId)}
+												? (record.narratorId ?? "-")
+												: (record.narratorTitle ??
+													record.narratorId ??
+													t("usageHistorySystemRequest"))}
 										</Text>
+									</Table.Td>
+									<Table.Td>
+										<Badge color="gray" variant="outline">
+											{getKindLabel(t, record.kind)}
+										</Badge>
 									</Table.Td>
 									<Table.Td>
 										<Badge color={getProviderColor(record.provider)} variant="light">

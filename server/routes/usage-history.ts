@@ -14,6 +14,7 @@ const listQuerySchema = z.object({
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	model: z.string().optional(),
+	kind: z.string().optional(),
 	startDate: z.string().optional(),
 	endDate: z.string().optional(),
 	page: z.coerce.number().int().positive().default(1),
@@ -26,6 +27,7 @@ const statsQuerySchema = z.object({
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	model: z.string().optional(),
+	kind: z.string().optional(),
 	startDate: z.string().optional(),
 	endDate: z.string().optional(),
 });

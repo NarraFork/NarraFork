@@ -6,16 +6,16 @@ import { apiRequests, narratorMessageRefs, narratorMessages } from "../db/schema
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { saveImageGenerationResult } from "../lib/agent/image-generation";
+import {
+	type ApiRequestHandle,
+	finishApiRequest,
+	startApiRequest,
+} from "../lib/api-request-tracker";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
-import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
-import {
-	buildUsageDataFromSnapshot,
-	calculateCost,
-	updateMessageUsage,
-} from "../lib/usage-tracking";
+import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
@@ -97,16 +97,7 @@ export interface EventHandlerContext {
 	/** Tracks cumulative inputCharsTotal per tool_use for delta computation */
 	toolUseCharsMap?: Map<string, number>;
 	/** Tracks API requests in progress (requestId → request info) */
-	apiRequestsMap?: Map<
-		string,
-		{
-			requestId: string;
-			provider: string;
-			model: string;
-			credentialId?: string;
-			startTime: number;
-		}
-	>;
+	apiRequestsMap?: Map<string, ApiRequestHandle>;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
 }
@@ -365,6 +356,7 @@ function translateReasoningBlock(
 			const result = await summaryGenerate(
 				reasoningText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
+				{ narratorId, kind: "reasoning_translation" },
 			);
 			const translated = result.text?.trim();
 			if (!translated) return;
@@ -1473,13 +1465,16 @@ export async function processEvent(
 		case "api_request_start": {
 			// Store request start info in context for later use
 			if (!ctx.apiRequestsMap) ctx.apiRequestsMap = new Map();
-			ctx.apiRequestsMap.set(event.requestId, {
-				requestId: event.requestId,
-				provider: event.provider,
-				model: event.model,
-				credentialId: event.credentialId,
-				startTime: Date.now(),
-			});
+			ctx.apiRequestsMap.set(
+				event.requestId,
+				startApiRequest({
+					narratorId,
+					provider: event.provider,
+					model: event.model,
+					credentialId: event.credentialId,
+					kind: "narrator",
+				}),
+			);
 			return null;
 		}
 
@@ -1503,38 +1498,17 @@ export async function processEvent(
 					}
 				: null;
 
-			const cost = usageData
-				? calculateCost(usageData, requestInfo.provider, requestInfo.model)
-				: null;
-			const apiRequestId = generateId();
-
 			try {
-				// Persist raw dump if available (controlled by agent.requestDumpEnabled setting).
-				const rawDump = event.rawDump ? JSON.stringify(event.rawDump) : null;
-
-				await db.insert(apiRequests).values({
-					id: apiRequestId,
-					narratorId,
-					messageId: null, // Will be updated later when message is created
-					provider: requestInfo.provider,
-					credentialId: event.credentialId ?? requestInfo.credentialId ?? null,
-					model: requestInfo.model,
-					inputTokens: usageData?.inputTokens ?? 0,
-					outputTokens: usageData?.outputTokens ?? 0,
-					cachedInputTokens: usageData?.cachedInputTokens ?? 0,
-					cacheCreationInputTokens: usageData?.cacheCreationInputTokens ?? 0,
-					cacheCreation5mTokens: usageData?.cacheCreation5mInputTokens ?? 0,
-					cacheCreation1hTokens: usageData?.cacheCreation1hInputTokens ?? 0,
-					reasoningTokens: usageData?.reasoningTokens ?? 0,
+				const apiRequestId = await finishApiRequest(requestInfo, {
+					usage: usageData,
+					credentialId: event.credentialId,
 					ttftMs: event.ttftMs ?? null,
 					durationMs: event.durationMs ?? null,
-					costUsd: cost?.totalCost ?? null,
 					contextPercent: event.contextPercent ?? null,
 					meterUsage: event.meterUsage ?? null,
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,
-					rawDumpJson: rawDump,
-					createdAt: new Date().toISOString(),
+					rawDump: event.rawDump,
 				});
 				if (!event.errorMessage) {
 					if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
@@ -1544,7 +1518,7 @@ export async function processEvent(
 				logger.error("Failed to create API request record", {
 					narratorId,
 					requestId: event.requestId,
-					apiRequestId,
+					apiRequestId: requestInfo.id,
 					error,
 				});
 			} finally {

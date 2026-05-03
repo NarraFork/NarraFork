@@ -8,7 +8,13 @@ import { getModelContextWindow, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import type {
+	ChatParams,
+	DbMessage,
+	GenerateOptions,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
@@ -1161,6 +1167,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: GenerateOptions,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const apiKey = this.config.apiKey;
 
@@ -1175,6 +1182,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			max_tokens: number;
 			messages: Array<{ role: "user"; content: string }>;
 			system?: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+			thinking?: ReturnType<typeof buildThinkingConfig>;
 		} = {
 			model: bareModel,
 			max_tokens: 4096,
@@ -1184,6 +1192,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.system = isOfficial
 				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
 				: [{ type: "text", text: systemInstruction }];
+		}
+		if (options?.reasoningEffort !== undefined) {
+			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
+			if (thinkingConfig) body.thinking = thinkingConfig;
 		}
 
 		const headers: Record<string, string> = {
@@ -1232,6 +1244,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<string> {
 		const apiKey = this.config.apiKey;
 
@@ -1256,17 +1269,29 @@ export class AnthropicProvider implements ProviderAdapter {
 			genHeaders["user-agent"] = getHttpUserAgent();
 		}
 
+		const body: {
+			model: string;
+			max_tokens: number;
+			system: Array<{ type: "text"; text: string; cache_control?: { type: "ephemeral" } }>;
+			messages: Array<{ role: "user"; content: string }>;
+			thinking?: ReturnType<typeof buildThinkingConfig>;
+		} = {
+			model: bareModel,
+			max_tokens: 4096,
+			system: isOfficial
+				? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
+				: [{ type: "text", text: systemInstruction }],
+			messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
+		};
+		if (options?.reasoningEffort !== undefined) {
+			const thinkingConfig = buildThinkingConfig(bareModel, options.reasoningEffort);
+			if (thinkingConfig) body.thinking = thinkingConfig;
+		}
+
 		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
 			headers: genHeaders,
-			body: JSON.stringify({
-				model: bareModel,
-				max_tokens: 4096,
-				system: isOfficial
-					? [{ type: "text", text: systemInstruction, ...CACHE_CONTROL }]
-					: [{ type: "text", text: systemInstruction }],
-				messages: [{ role: "user", content: `${reminder}\n\n${content}` }],
-			}),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {

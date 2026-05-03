@@ -173,6 +173,11 @@ export interface ChatParams {
 	onRequestStart?: (info?: { credentialId?: string }) => void;
 }
 
+export interface GenerateOptions {
+	/** Optional reasoning/thinking effort for lightweight generation helpers. */
+	reasoningEffort?: ChatParams["reasoningEffort"];
+}
+
 // === The adapter interface ===
 
 export interface ProviderAdapter {
@@ -250,6 +255,7 @@ export interface ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: GenerateOptions,
 	): Promise<{ text: string; contextPercent?: number }>;
 
 	/**
@@ -261,6 +267,7 @@ export interface ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<string>;
 }
 

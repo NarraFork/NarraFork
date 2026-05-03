@@ -79,6 +79,8 @@
 	"textFileTooLarge": "文本文件过大（最大 100MB）",
 	"unsupportedFileType": "不支持的文件类型",
 	"loadOlderMessages": "加载更早的消息",
+	"switchToPixiRenderer": "切换到实验性 PixiJS 渲染器（只读）",
+	"switchToReactRenderer": "切换到 React 渲染器",
 	"archiveNarrator": "归档",
 	"permissionMode": "权限模式",
 	"modelTooltip": "下次发言使用的模型",

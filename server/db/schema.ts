@@ -888,11 +888,11 @@ export const apiRequests = sqliteTable(
 	"api_requests",
 	{
 		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		// 关联的 assistant message ID（一个请求可能产生一个 assistant message）
 		messageId: text("message_id").references(() => narratorMessages.id, { onDelete: "set null" }),
+		// 请求用途：narrator / compact / title / internal 等
+		kind: text("kind").notNull().default("narrator"),
 		// 提供商和模型信息
 		provider: text("provider"),
 		credentialId: text("credential_id"),
@@ -925,6 +925,7 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_narrator").on(table.narratorId, table.createdAt),
 		index("idx_api_requests_message").on(table.messageId),
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
+		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt),
 	],
 );

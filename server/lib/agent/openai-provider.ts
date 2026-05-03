@@ -13,7 +13,13 @@ import {
 } from "./codex-websocket";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import type {
+	ChatParams,
+	DbMessage,
+	GenerateOptions,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
@@ -121,6 +127,35 @@ export function normalizeCodexReasoningEffort(
 	// Fallback: requested level not supported and no degradation rule matched.
 	// Clamp to the lowest supported level to avoid sending an unsupported value.
 	return supported[0] ?? reasoningEffort;
+}
+
+function applyGenerateReasoningOptions(
+	body: Record<string, unknown>,
+	apiMode: OpenAIApiMode,
+	model: string,
+	options?: GenerateOptions,
+): void {
+	const reasoningEffort = options?.reasoningEffort;
+	if (reasoningEffort === undefined) return;
+
+	if (apiMode === "codex") {
+		const normalized = normalizeCodexReasoningEffort(model, reasoningEffort);
+		if (normalized) {
+			body.reasoning = { effort: normalized, summary: "auto" };
+			body.include = ["reasoning.encrypted_content"];
+		}
+		return;
+	}
+
+	if (!usesResponsesEndpoint(apiMode) && isDeepSeekModel(model)) {
+		if (reasoningEffort === "none") {
+			body.thinking = { type: "disabled" };
+			return;
+		}
+		body.thinking = { type: "enabled" };
+		const effort = mapDeepSeekEffort(reasoningEffort);
+		if (effort) body.reasoning_effort = effort;
+	}
 }
 
 // === OpenAI identity prompt ===
@@ -814,6 +849,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: GenerateOptions,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
@@ -840,6 +876,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				// Codex gateway requires stream=true on /responses.
 				body.stream = true;
 			}
+			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
 			const resultText = await this.requestResponsesText(baseUrl, apiKey, body);
 			return { text: resultText, contextPercent: undefined };
 		}
@@ -850,13 +887,15 @@ export class OpenAIProvider implements ProviderAdapter {
 			messages.push({ role: "system", content: systemInstruction });
 		}
 		messages.push({ role: "user", content: text });
+		const body: Record<string, unknown> = {
+			model: bareModel,
+			messages,
+		};
+		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify({
-				model: bareModel,
-				messages,
-			}),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {
@@ -881,6 +920,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<string> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
@@ -903,20 +943,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				// Codex gateway requires stream=true on /responses.
 				body.stream = true;
 			}
+			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
 			return this.requestResponsesText(baseUrl, apiKey, body);
 		}
 
 		// Completions
+		const body: Record<string, unknown> = {
+			model: bareModel,
+			messages: [
+				{ role: "system", content: systemInstruction },
+				{ role: "user", content: `${reminder}\n\n${content}` },
+			],
+		};
+		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify({
-				model: bareModel,
-				messages: [
-					{ role: "system", content: systemInstruction },
-					{ role: "user", content: `${reminder}\n\n${content}` },
-				],
-			}),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {

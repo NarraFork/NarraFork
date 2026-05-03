@@ -2547,8 +2547,11 @@ export async function confirmYoloPause(requestId: string, _reflection?: string):
 }
 
 export async function cancelYoloPause(requestId: string, reason?: string): Promise<boolean> {
-	const pause = pendingYoloPauses.get(requestId);
-	if (!pause) return false;
+	// Prefer the YOLO pause side table, but allow cancellation to resolve the underlying
+	// pending permission as a last line of defense. If the side table was cleaned up or
+	// lost while the permission is still pending, returning false would leave the
+	// original tool call waiting forever.
+	if (!pendingYoloPauses.has(requestId) && !pendingPermissions.has(requestId)) return false;
 	return resolvePermission(requestId, "deny", {
 		denyMessage: reason?.trim() || "YOLO safety pause cancelled by reflection loop",
 	});

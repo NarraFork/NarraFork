@@ -294,7 +294,10 @@ async function checkOutputInterruption(
 		// neither send messages nor interrupt.
 		const CHECK_TIMEOUT_MS = 15_000;
 
-		const summaryPromise = summaryGenerate(snippet, systemPrompt);
+		const summaryPromise = summaryGenerate(snippet, systemPrompt, {
+			narratorId,
+			kind: "internal",
+		});
 		const cancelPromise = new Promise<null>((resolve) => {
 			const onAbort = () => resolve(null);
 			signal.addEventListener("abort", onAbort, { once: true });

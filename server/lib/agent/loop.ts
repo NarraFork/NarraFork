@@ -471,12 +471,21 @@ async function resolveYoloPauseDecision(
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async () => {
+			const fallbackMessage =
+				"YOLO reflection loop did not call YoloConfirm or YoloCancel in its single allowed response";
 			const { cancelYoloPause } = await import("@server/services/narrator-permission");
-			await cancelYoloPause(
-				pause.requestId,
-				"YOLO reflection loop did not call YoloConfirm or YoloCancel in its single allowed response",
-			);
-			return pause.decision;
+			const cancelled = await cancelYoloPause(pause.requestId, fallbackMessage);
+			if (cancelled) return pause.decision;
+
+			// If the cancellation path could not find the pending request, do not leave the
+			// parent narrator waiting on an unresolved decision. Prefer an already-settled
+			// decision (e.g. the user resolved it at the same time); otherwise fail closed.
+			const alreadySettled = await Promise.race<PermissionResult | null>([
+				pause.decision,
+				Promise.resolve(null),
+			]);
+			const fallbackDecision: PermissionResult = { behavior: "deny", message: fallbackMessage };
+			return alreadySettled ?? fallbackDecision;
 		}),
 	]);
 	if (!reflectionDone) {
@@ -512,7 +521,14 @@ export async function* agentLoop(
 	config.permissionHandler = async (toolName, input, toolUseId) => {
 		const run = permissionTail.then(() => originalPermissionHandler(toolName, input, toolUseId));
 		permissionTail = run.then(
-			() => undefined,
+			async (result) => {
+				// A YOLO pause returns immediately with a deferred decision. Keep subsequent
+				// permission checks queued until that pause is confirmed/cancelled, otherwise
+				// later tool calls can open new prompts while the original call is still pending.
+				if (result.behavior === "yoloPause") {
+					await result.decision.catch(() => undefined);
+				}
+			},
 			() => undefined,
 		);
 		return run;

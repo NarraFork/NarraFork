@@ -19,7 +19,13 @@ import {
 	type OAIMessage,
 	OpenAIProvider,
 } from "./openai-provider";
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import type {
+	ChatParams,
+	DbMessage,
+	GenerateOptions,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 function classifyCodexError(
@@ -547,9 +553,10 @@ export class CodexProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: GenerateOptions,
 	): Promise<{ text: string; contextPercent?: number }> {
 		return this.runWithFailover("generateWithMeta", (provider) =>
-			provider.generateWithMeta(text, model, systemInstruction),
+			provider.generateWithMeta(text, model, systemInstruction, options),
 		);
 	}
 
@@ -558,9 +565,10 @@ export class CodexProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<string> {
 		return this.runWithFailover("generateWithHistory", (provider) =>
-			provider.generateWithHistory(systemInstruction, content, model, locale),
+			provider.generateWithHistory(systemInstruction, content, model, locale, options),
 		);
 	}
 }

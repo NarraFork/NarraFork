@@ -7,6 +7,7 @@ import {
 	Button,
 	Group,
 	Pagination,
+	Select,
 	SimpleGrid,
 	Stack,
 	TextInput,
@@ -52,10 +53,24 @@ function SettingsUsagePage() {
 		queryFn: () => usageHistoryApi.listProviders(),
 	});
 
+	const kindOptions = [
+		"narrator",
+		"compact",
+		"fork_summary",
+		"title",
+		"merge_summary",
+		"web_fetch_smart",
+		"reasoning_translation",
+		"settings_test",
+		"git_summary",
+		"internal",
+	].map((kind) => ({ value: kind, label: t(`usageHistoryKind_${kind}`, kind) }));
+
 	const applyFilters = () => {
 		setFilters({
 			provider: tempFilters.provider?.trim() || undefined,
 			model: tempFilters.model?.trim() || undefined,
+			kind: tempFilters.kind || undefined,
 			startDate: startDate ? new Date(`${startDate}T00:00:00.000Z`).toISOString() : undefined,
 			endDate: endDate ? new Date(`${endDate}T23:59:59.999Z`).toISOString() : undefined,
 		});
@@ -115,7 +130,7 @@ function SettingsUsagePage() {
 
 				<Stack gap={isMobile ? "xs" : "md"}>
 					<SimpleGrid
-						cols={{ base: 1, sm: 2, lg: 4 }}
+						cols={{ base: 1, sm: 2, lg: 5 }}
 						spacing={isMobile ? "xs" : "md"}
 						verticalSpacing={isMobile ? "xs" : "md"}
 					>
@@ -139,6 +154,17 @@ function SettingsUsagePage() {
 							value={tempFilters.model ?? ""}
 							onChange={(e) =>
 								setTempFilters((prev) => ({ ...prev, model: e.currentTarget.value || undefined }))
+							}
+						/>
+						<Select
+							size={isMobile ? "xs" : "sm"}
+							label={t("usageHistoryKind")}
+							placeholder={t("usageHistoryAllKinds")}
+							data={kindOptions}
+							clearable
+							value={tempFilters.kind ?? null}
+							onChange={(value) =>
+								setTempFilters((prev) => ({ ...prev, kind: value || undefined }))
 							}
 						/>
 						<TextInput
