@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.3.3",
+	"version": "0.3.4",
 	"private": true,
 	"dependencies": {
 		"@chenglou/pretext": "^0.0.6",
