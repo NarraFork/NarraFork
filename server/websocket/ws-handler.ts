@@ -123,23 +123,30 @@ export function stopHeartbeat() {
 }
 
 /**
- * Explicitly close every active WebSocket connection with a 1001 "Going Away"
- * close frame.  Called during server shutdown so that clients receive a proper
- * TCP FIN and don't leave connections stuck in CLOSE_WAIT / FIN_WAIT_2
- * (especially problematic on Windows where Bun's `server.stop(true)` alone
- * may not send close frames to each peer).
+ * Forcefully terminate every active WebSocket connection during shutdown.
+ *
+ * Previously this sent a graceful 1001 close frame via `ws.close()`, but that
+ * only initiates the TCP four-way handshake and relies on the *client* sending
+ * FIN back.  If the browser tab is still open (or the network is slow), the
+ * connection gets stuck in FIN_WAIT_2 / CLOSE_WAIT and the OS keeps the port
+ * occupied — even after the server process exits.  On Windows this is
+ * especially problematic because those orphaned TCP entries survive the process
+ * and block the port for up to 2–4 minutes.
+ *
+ * `ws.terminate()` sends a TCP RST, immediately destroying the socket at the
+ * OS level so no lingering TIME_WAIT / FIN_WAIT_2 / CLOSE_WAIT states remain.
  */
 export function closeAllConnections() {
 	for (const ws of getNarratorConnections()) {
 		try {
-			ws.close(1001, "server shutting down");
+			ws.terminate();
 		} catch {
 			// already dead — ignore
 		}
 	}
 	for (const ws of getTerminalConnections()) {
 		try {
-			ws.close(1001, "server shutting down");
+			ws.terminate();
 		} catch {
 			// already dead — ignore
 		}

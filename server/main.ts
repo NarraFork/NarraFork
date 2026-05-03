@@ -704,22 +704,43 @@ async function performGracefulShutdown(
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
 		stopContainerProxy();
-		await terminalService.shutdownAll();
-		await killAllBashProcesses();
-		chapterCleanup.clearAllTimers();
-		worktreeWatcher.shutdown();
-		projectDbManager.closeAll();
-		await mcpManager.shutdown().catch(() => {});
-		// Close browser pool if it was started
-		await import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()).catch(() => {});
-		// Explicitly stop the HTTP server so the port is released immediately.
-		// On Windows, process.exit() alone may not close the socket in time,
-		// leaving a zombie process holding the port.
+
+		// Terminate all WebSocket connections first — this sends TCP RST so the
+		// OS releases the sockets immediately instead of lingering in FIN_WAIT_2
+		// / CLOSE_WAIT.  Must happen before _server.stop() which may wait for
+		// graceful close on active connections.
+		closeAllConnections();
+
+		// Run remaining cleanup with a hard timeout so we never hang forever.
+		// On Windows, async cleanup may stall if child processes don't respond.
+		const SHUTDOWN_TIMEOUT_MS = 8_000;
+		await Promise.race([
+			(async () => {
+				await terminalService.shutdownAll();
+				await killAllBashProcesses();
+				chapterCleanup.clearAllTimers();
+				worktreeWatcher.shutdown();
+				projectDbManager.closeAll();
+				await mcpManager.shutdown().catch(() => {});
+				// Close browser pool if it was started
+				await import("./lib/browser/pool")
+					.then(({ closeBrowser }) => closeBrowser())
+					.catch(() => {});
+				// Close Codex WebSocket session cache — active outbound WS
+				// connections keep the event loop alive and delay exit.
+				await import("./lib/agent/codex-websocket")
+					.then(({ clearCodexResponsesWebSocketSessions }) =>
+						clearCodexResponsesWebSocketSessions(),
+					)
+					.catch(() => {});
+			})(),
+			new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS)),
+		]);
+
+		// Stop the HTTP server — force-close any remaining connections so the
+		// listening socket is released immediately.
 		try {
-			// Send close frames to all WS clients first — on Windows, server.stop()
-			// alone may not deliver them, leaving TCP connections in CLOSE_WAIT.
-			closeAllConnections();
-			_server?.stop(options.closeActiveConnections);
+			_server?.stop(true);
 		} catch {
 			// best effort
 		}
