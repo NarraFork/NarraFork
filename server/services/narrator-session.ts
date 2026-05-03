@@ -2611,7 +2611,9 @@ export async function rollbackToBlock(
 	}
 
 	// Step 1: Delete all messages after the target message (includes file revert)
-	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId);
+	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
+		preserveConversationId: true,
+	});
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {
 			type: "messages_deleted",
@@ -2627,7 +2629,9 @@ export async function rollbackToBlock(
 	}
 
 	if (blocksToDelete.length > 0) {
-		await narratorService.deleteMessageBlocks(narratorId, blocksToDelete);
+		await narratorService.deleteMessageBlocks(narratorId, blocksToDelete, {
+			preserveConversationId: true,
+		});
 
 		// Broadcast the updated message
 		const updatedMsg = await db.query.narratorMessages.findFirst({
@@ -2743,10 +2747,11 @@ export async function editAndRegenerate(
 		}
 	}
 
-	// Delete everything after this message
+	// Delete everything after this message while preserving the API cache key.
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(
 		narratorId,
 		privateMessageId,
+		{ preserveConversationId: true },
 	);
 	if (deletedMessageIds.length > 0) {
 		broadcastToNarrator(narratorId, {

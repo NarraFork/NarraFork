@@ -42,6 +42,7 @@ import {
 	type StorageScanResult,
 	scanStorageStream,
 } from "../../lib/api";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 function formatBytes(bytes: number): string {
 	if (bytes === 0) return "0 B";
@@ -129,6 +130,7 @@ const CLEANUP_TARGETS: CleanupTarget[] = [
 
 export function StorageSection() {
 	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [progressMsg, setProgressMsg] = useState("");
@@ -241,7 +243,7 @@ export function StorageSection() {
 	};
 
 	const handleCleanup = async (target: CleanupTarget) => {
-		if (!window.confirm(t("storageCleanupConfirm"))) return;
+		if (!(await confirm({ message: t("storageCleanupConfirm") }))) return;
 		setCleaningTarget(target.key);
 		try {
 			const res = await api.cleanupStorage(target.target);

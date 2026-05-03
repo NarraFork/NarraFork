@@ -26,6 +26,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { TerminalPanel } from "../../components/terminal/TerminalPanel";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
@@ -37,6 +38,7 @@ export const Route = createFileRoute("/settings/terminals")({
 function SettingsTerminalsPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("common");
+	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 
 	const [openTerminalId, setOpenTerminalId] = useState<string | null>(null);
@@ -203,8 +205,8 @@ function SettingsTerminalsPage() {
 													<ActionIcon
 														color="red"
 														variant="subtle"
-														onClick={() => {
-															if (confirm(t("confirmKillOrphan"))) {
+														onClick={async () => {
+															if (await confirm({ message: t("confirmKillOrphan") })) {
 																killOrphan.mutate(s.terminalId);
 															}
 														}}
@@ -237,8 +239,8 @@ function SettingsTerminalsPage() {
 								variant="light"
 								leftSection={<IconTrash size={14} />}
 								loading={batchKill.isPending}
-								onClick={() => {
-									if (confirm(t("confirmBatchKill", { count: selected.size }))) {
+								onClick={async () => {
+									if (await confirm({ message: t("confirmBatchKill", { count: selected.size }) })) {
 										batchKill.mutate([...selected]);
 									}
 								}}
@@ -269,8 +271,8 @@ function SettingsTerminalsPage() {
 								}
 							}}
 							reattachPending={reattachTerminal.isPending}
-							onKill={(id) => {
-								if (confirm(t("confirmKillTerminal"))) {
+							onKill={async (id) => {
+								if (await confirm({ message: t("confirmKillTerminal") })) {
 									killTerminal.mutate(id);
 								}
 							}}
@@ -320,7 +322,7 @@ function TerminalTable({
 	onToggleSelectAll?: () => void;
 	onConnect?: (id: string, attached: boolean) => void;
 	reattachPending?: boolean;
-	onKill?: (id: string) => void;
+	onKill?: (id: string) => void | Promise<void>;
 	killPending?: boolean;
 }) {
 	const selectable = !!onToggleSelect;

@@ -11,6 +11,7 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
+	appendCodexNativeTools,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
 	normalizeCodexReasoningEffort,
@@ -470,8 +471,7 @@ export class CodexProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		tools.push({ type: "web_search" });
-		tools.push({ type: "image_generation", output_format: "png" });
+		appendCodexNativeTools(tools, model);
 		request.tools = tools;
 
 		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);

@@ -220,6 +220,15 @@ function statusReducer(state: StatusState, action: StatusAction): StatusState {
 	return state;
 }
 
+function withQueueSubstatus(substatus: string[], position: number, queueDepth: number): string[] {
+	const withoutQueue = substatus.filter(
+		(s) => !s.startsWith("queue_position:") && !s.startsWith("queue_depth:"),
+	);
+	if (!Number.isFinite(position) || position <= 0) return withoutQueue;
+	const safeDepth = Number.isFinite(queueDepth) ? Math.max(0, queueDepth) : 0;
+	return [...withoutQueue, `queue_position:${position}`, `queue_depth:${safeDepth}`];
+}
+
 function applyPendingPermissionsToCache(
 	old: MessagesQueryData | undefined,
 	perms: PendingPermission[],
@@ -892,6 +901,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 		return undefined;
 	}, [firstPageHasMoreAfter, messagesData]);
+
+	const applyQueueStatus = useCallback(
+		(position: number, queueDepth: number) => {
+			const substatusWithQueue = withQueueSubstatus(statusState.substatus, position, queueDepth);
+			dispatchStatus({ type: "patch", payload: { substatus: substatusWithQueue } });
+			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+				old ? { ...old, substatus: substatusWithQueue } : old,
+			);
+		},
+		[narratorId, qc, statusState.substatus],
+	);
 
 	// --- WebSocket ---
 	const {
@@ -1717,13 +1737,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-				// Queue position now comes via substatus_change — no-op here.
+				applyQueueStatus(position, queueDepth);
 			},
 			onQuotaBalance: (_balance) => {
 				// Generic gateway quota balance — currently a no-op.
 			},
-			onQueueStatus: (_position, _queueDepth) => {
-				// Queue position now comes via substatus_change — no-op here.
+			onQueueStatus: (position, queueDepth) => {
+				applyQueueStatus(position, queueDepth);
 			},
 			onBrowserSessionCount: (count) => {
 				setBrowserSessionCount(count);

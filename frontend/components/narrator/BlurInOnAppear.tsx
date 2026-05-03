@@ -39,26 +39,30 @@ export function BlurInOnAppearProvider({
 	seedIds?: string[];
 	children: ReactNode;
 }) {
+	const scopeKeyRef = useRef(scopeKey);
 	const seenRef = useRef<Set<string>>(new Set());
 	const pendingRef = useRef<Map<string, symbol>>(new Map());
 	const completedRef = useRef<Set<string>>(new Set());
+	const seededRef = useRef<Set<string>>(new Set());
 
-	useEffect(() => {
-		void scopeKey;
+	if (scopeKeyRef.current !== scopeKey) {
+		scopeKeyRef.current = scopeKey;
 		seenRef.current.clear();
 		pendingRef.current.clear();
 		completedRef.current.clear();
-	}, [scopeKey]);
+		seededRef.current.clear();
+	}
 
-	useEffect(() => {
-		void scopeKey;
-		for (const animationId of seedIds) {
-			if (!animationId) continue;
-			seenRef.current.add(animationId);
-			completedRef.current.add(animationId);
-			pendingRef.current.delete(animationId);
-		}
-	}, [scopeKey, seedIds]);
+	// Seed historical IDs synchronously during provider render. Child
+	// BlurInOnAppear effects run after this render, so virtualized historical
+	// items cannot briefly register themselves as fresh appearances.
+	for (const animationId of seedIds) {
+		if (!animationId || seededRef.current.has(animationId)) continue;
+		seededRef.current.add(animationId);
+		seenRef.current.add(animationId);
+		completedRef.current.add(animationId);
+		pendingRef.current.delete(animationId);
+	}
 
 	const registerAppearance = useCallback(
 		(animationId: string): BlurInRegistration => {

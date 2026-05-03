@@ -844,6 +844,44 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(result?.summary).toContain("rm deletes files");
 	});
 
+	test("YOLO danger classifier ignores recoverable edit operations", () => {
+		expect(
+			classifyYoloDanger(
+				"Edit",
+				{
+					file_path: "src/index.ts",
+					old_string: "remove me",
+					new_string: "",
+				},
+				cwd,
+			),
+		).toBeNull();
+		expect(
+			classifyYoloDanger(
+				"Edit",
+				{
+					file_path: "/mnt/shared/index.ts",
+					old_string: "foo",
+					new_string: "bar",
+					replace_all: true,
+				},
+				cwd,
+			),
+		).toBeNull();
+		expect(
+			classifyYoloDanger(
+				"MultiEdit",
+				{
+					file_path: "src/index.ts",
+					old_string: "foo",
+					new_string: "bar",
+					replace_all: true,
+				},
+				cwd,
+			),
+		).toBeNull();
+	});
+
 	test("YOLO danger classifier catches git reset --hard", async () => {
 		const analysis = await analyzeBashCommand("git reset --hard HEAD~1", cwd, false);
 		const result = classifyYoloDanger(

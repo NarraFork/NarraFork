@@ -1,11 +1,23 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	apiRequests,
+	backgroundTasks,
+	benchmarkTaskResults,
+	chapterCommits,
 	chapters,
+	gatewaySessionMappings,
+	narratorBlacklistCmds,
+	narratorBlacklistDirs,
+	narratorBufferedMessages,
+	narratorFileSnapshots,
+	narratorGoals,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorPatches,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 	projects,
 	terminals,
@@ -58,12 +70,42 @@ async function insertRefsBatched(
 	}
 }
 
-async function narratorStillOwnsImageMessages(narratorId: string): Promise<boolean> {
-	const remainingOwnedMessages = await db
+function annotateImageBlocksWithUploadOwner(contentJson: unknown, narratorId: string): unknown {
+	if (!Array.isArray(contentJson)) return contentJson;
+
+	let changed = false;
+	const next = contentJson.map((block) => {
+		if (!block || typeof block !== "object") return block;
+		const candidate = block as { type?: unknown; imageId?: unknown; uploadNarratorId?: unknown };
+		if (
+			candidate.type !== "image" ||
+			typeof candidate.imageId !== "string" ||
+			typeof candidate.uploadNarratorId === "string"
+		) {
+			return block;
+		}
+		changed = true;
+		return { ...candidate, uploadNarratorId: narratorId };
+	});
+
+	return changed ? next : contentJson;
+}
+
+async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean> {
+	const sharedOwnedMessages = await db
 		.select({ contentJson: narratorMessages.contentJson })
 		.from(narratorMessages)
-		.where(eq(narratorMessages.narratorId, narratorId));
-	return remainingOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
+		.where(
+			and(
+				eq(narratorMessages.narratorId, narratorId),
+				sql`EXISTS (
+					SELECT 1 FROM narrator_message_refs nmr
+					WHERE nmr.message_id = ${narratorMessages.id}
+					AND nmr.narrator_id != ${narratorId}
+				)`,
+			),
+		);
+	return sharedOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
 interface CreateNarratorInput {
@@ -597,12 +639,78 @@ export const narratorService = {
 			await this.remove(child.id);
 		}
 
+		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
+
 		await db.transaction(async (tx) => {
 			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
 			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));
 			await tx.delete(terminals).where(eq(terminals.narratorId, narratorId));
+			await tx
+				.delete(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId));
+			await tx.delete(narratorGoals).where(eq(narratorGoals.narratorId, narratorId));
+			await tx
+				.delete(narratorFileSnapshots)
+				.where(eq(narratorFileSnapshots.narratorId, narratorId));
+			await tx.delete(narratorPatches).where(eq(narratorPatches.narratorId, narratorId));
+			await tx
+				.delete(narratorWhitelistDirs)
+				.where(eq(narratorWhitelistDirs.narratorId, narratorId));
+			await tx
+				.delete(narratorBlacklistDirs)
+				.where(eq(narratorBlacklistDirs.narratorId, narratorId));
+			await tx
+				.delete(narratorWhitelistCmds)
+				.where(eq(narratorWhitelistCmds.narratorId, narratorId));
+			await tx
+				.delete(narratorBlacklistCmds)
+				.where(eq(narratorBlacklistCmds.narratorId, narratorId));
+			await tx.delete(apiRequests).where(eq(apiRequests.narratorId, narratorId));
+			await tx
+				.update(chapterCommits)
+				.set({ narratorId: null })
+				.where(eq(chapterCommits.narratorId, narratorId));
+			await tx
+				.update(benchmarkTaskResults)
+				.set({ narratorId: null })
+				.where(eq(benchmarkTaskResults.narratorId, narratorId));
+			await tx
+				.delete(gatewaySessionMappings)
+				.where(eq(gatewaySessionMappings.narratorId, narratorId));
+			await tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId));
+			await tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId));
 			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
 			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
+
+			const sharedRows = await tx
+				.select({
+					id: narratorMessages.id,
+					contentJson: narratorMessages.contentJson,
+					newOwnerId: sql<string>`(
+						SELECT nmr.narrator_id FROM narrator_message_refs nmr
+						WHERE nmr.message_id = ${narratorMessages.id}
+						ORDER BY nmr.seq ASC
+						LIMIT 1
+					)`,
+				})
+				.from(narratorMessages)
+				.where(
+					and(
+						eq(narratorMessages.narratorId, narratorId),
+						sql`EXISTS (
+							SELECT 1 FROM narrator_message_refs nmr
+							WHERE nmr.message_id = ${narratorMessages.id}
+						)`,
+					),
+				);
+
+			for (const row of sharedRows) {
+				const contentJson = annotateImageBlocksWithUploadOwner(row.contentJson, narratorId);
+				await tx
+					.update(narratorMessages)
+					.set({ narratorId: row.newOwnerId, contentJson })
+					.where(eq(narratorMessages.id, row.id));
+			}
 
 			const orphanRows = await tx
 				.select({ id: narratorMessages.id })
@@ -613,7 +721,6 @@ export const narratorService = {
 						sql`NOT EXISTS (
 							SELECT 1 FROM narrator_message_refs nmr
 							WHERE nmr.message_id = ${narratorMessages.id}
-							AND nmr.narrator_id != ${narratorId}
 						)`,
 					),
 				);
@@ -628,13 +735,23 @@ export const narratorService = {
 					.update(narrators)
 					.set({ pruneBoundaryMessageId: null })
 					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
+				await tx
+					.update(chapterCommits)
+					.set({ narratorMessageId: null })
+					.where(inArray(chapterCommits.narratorMessageId, orphanIds));
+				await tx
+					.update(apiRequests)
+					.set({ messageId: null })
+					.where(inArray(apiRequests.messageId, orphanIds));
+				await tx.delete(narratorPatches).where(inArray(narratorPatches.messageId, orphanIds));
+				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
 				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
 			}
 
 			await tx.delete(narrators).where(eq(narrators.id, narratorId));
 		});
 
-		if (await narratorStillOwnsImageMessages(narratorId)) {
+		if (preserveUploads) {
 			logger.info("Preserving narrator uploads because shared image messages still exist", {
 				narratorId,
 			});

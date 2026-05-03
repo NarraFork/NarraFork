@@ -132,6 +132,8 @@
 	"selectDrive": "Select a drive",
 	"computer": "Computer",
 	"cancel": "Cancel",
+	"confirm": "Confirm",
+	"confirmTitle": "Confirm action",
 	"close": "Close",
 	"download": "Download",
 	"back": "Back",

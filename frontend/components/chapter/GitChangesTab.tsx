@@ -22,6 +22,7 @@ import {
 	useGitStatus,
 	useGitUnstage,
 } from "../../hooks/useGit";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { GitFileDiff } from "./GitFileDiff";
 
 /** Max files to render per section to avoid UI freeze. */
@@ -29,6 +30,7 @@ const MAX_DISPLAY_FILES = 80;
 
 export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
+	const confirm = useConfirmDialog();
 	const { data: status, isLoading } = useGitStatus(chapterId);
 	const stage = useGitStage(chapterId);
 	const unstage = useGitUnstage(chapterId);
@@ -44,7 +46,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		return <Loader size="sm" />;
 	}
 
-	if (!status || !status.hasChanges) {
+	if (!status?.hasChanges) {
 		return (
 			<Text size="sm" c="dimmed" py="md" ta="center">
 				{t("noChanges")}
@@ -105,8 +107,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 		});
 	}
 
-	function handleDiscardAll() {
-		if (window.confirm(t("discardConfirm"))) {
+	async function handleDiscardAll() {
+		if (await confirm({ message: t("discardConfirm") })) {
 			discard.mutate({ all: true });
 		}
 	}

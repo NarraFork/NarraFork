@@ -25,6 +25,7 @@ import { taskCreateTool } from "./todo";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
+import { yoloCancelTool, yoloConfirmTool } from "./yolo-pause";
 
 /**
  * Optional tools — registered in the registry but excluded by default.
@@ -76,6 +77,8 @@ const coreProvider: ToolProvider = {
 			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,
+			yoloConfirmTool,
+			yoloCancelTool,
 		];
 	},
 };

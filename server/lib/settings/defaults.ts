@@ -202,7 +202,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.yoloSkipReadOnlyConfirmations": {
-		desc: "YOLO 模式下跳过只读操作的二次确认；写入、删除、危险执行模式和环境注入仍会保留安全暂停。",
+		desc: "YOLO 模式下跳过只读操作的二次确认；Edit/MultiEdit 视为可恢复操作，不触发安全暂停；Write 覆盖、删除、危险执行模式和环境注入仍会保留安全暂停。",
 		type: "boolean",
 	},
 	"agent.smartInterruptionCheck": {

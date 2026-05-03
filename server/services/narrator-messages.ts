@@ -1227,7 +1227,11 @@ export const narratorMessageQueries = {
 		});
 	},
 
-	async deleteMessagesAfter(narratorId: string, messageId: string) {
+	async deleteMessagesAfter(
+		narratorId: string,
+		messageId: string,
+		opts?: { preserveConversationId?: boolean },
+	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -1304,7 +1308,7 @@ export const narratorMessageQueries = {
 			await tx
 				.update(narrators)
 				.set({
-					apiConversationId: null,
+					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -1320,7 +1324,7 @@ export const narratorMessageQueries = {
 		narratorId: string,
 		messageId: string,
 		blockIndex: number,
-		opts?: { skipRevert?: boolean; skipNarratorUpdate?: boolean },
+		opts?: { skipRevert?: boolean; skipNarratorUpdate?: boolean; preserveConversationId?: boolean },
 	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
@@ -1495,7 +1499,7 @@ export const narratorMessageQueries = {
 				await tx
 					.update(narrators)
 					.set({
-						apiConversationId: null,
+						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
 						messageVersion: sql`${narrators.messageVersion} + 1`,
@@ -1511,6 +1515,7 @@ export const narratorMessageQueries = {
 	async deleteMessageBlocks(
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
+		opts?: { preserveConversationId?: boolean },
 	) {
 		const grouped = new Map<string, number[]>();
 		for (const b of blocks) {
@@ -1576,7 +1581,7 @@ export const narratorMessageQueries = {
 			await db
 				.update(narrators)
 				.set({
-					apiConversationId: null,
+					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 					pruneBoundaryMessageId: null,
 					prunedPercent: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,

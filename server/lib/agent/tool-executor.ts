@@ -9,7 +9,13 @@ import {
 } from "./pipeline-state";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
-import type { AgentConfig, AgentToolUse, ToolContext } from "./types";
+import type {
+	AgentConfig,
+	AgentToolUse,
+	PermissionResult,
+	ToolContext,
+	YoloDangerInfo,
+} from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
@@ -39,6 +45,19 @@ export interface ToolExecResult {
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
+	/** Internal YOLO safety pause result consumed by agentLoop before tool execution. */
+	yoloPause?: {
+		requestId: string;
+		toolCallId: string;
+		warning: string;
+		danger: YoloDangerInfo;
+		fingerprint: string;
+		decision: Promise<PermissionResult>;
+	};
+}
+
+interface ExecuteToolOptions {
+	preGrantedPermission?: Extract<PermissionResult, { behavior: "allow" }>;
 }
 
 /** Max serialized size of tool_input passed to hooks (bytes). */
@@ -85,7 +104,11 @@ async function getPipelineCaptureText(
 	}
 }
 
-export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
+export async function executeTool(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	options: ExecuteToolOptions = {},
+): Promise<ToolExecResult> {
 	const tool = toolRegistry.get(tu.name);
 	const locale = (config.locale as Locale) ?? "en";
 
@@ -120,7 +143,26 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 
 	// Permission check
 	const permissionStartedAt = Date.now();
-	const permission = await config.permissionHandler(tu.name, tu.input, tu.toolUseId);
+	const permission =
+		options.preGrantedPermission ??
+		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId));
+	if (permission.behavior === "yoloPause") {
+		return {
+			output: permission.message,
+			isError: false,
+			durationMs: 0,
+			permissionStartedAt,
+			completedAt: Date.now(),
+			yoloPause: {
+				requestId: permission.requestId,
+				toolCallId: permission.toolCallId,
+				warning: permission.message,
+				danger: permission.danger,
+				fingerprint: permission.fingerprint,
+				decision: permission.decision,
+			},
+		};
+	}
 	if (permission.behavior === "deny") {
 		const userMessage =
 			permission.rawMessage && permission.message
@@ -256,6 +298,8 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 		parentNarratorId: config.parentNarratorId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
+		yoloPauseRequestId: config.yoloReflection?.requestId,
+		yoloPauseToolUseId: config.yoloReflection?.toolUseId,
 	};
 
 	// Wire up emitLongRunning: notify UI when a process exceeds 60s

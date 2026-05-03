@@ -132,6 +132,8 @@
 	"selectDrive": "选择磁盘",
 	"computer": "此电脑",
 	"cancel": "取消",
+	"confirm": "确认",
+	"confirmTitle": "确认操作",
 	"close": "关闭",
 	"download": "下载",
 	"back": "返回",

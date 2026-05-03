@@ -39,6 +39,7 @@ import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import { useRenderLod } from "./RenderLodCtx";
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -121,12 +122,6 @@ const actionBarPos: CSSProperties = {
 	pointerEvents: "none",
 };
 
-const actionBarHidden: CSSProperties = {
-	...actionBarPos,
-	opacity: 0,
-	transition: "opacity 150ms ease",
-};
-
 const actionBarVisible: CSSProperties = {
 	...actionBarPos,
 	opacity: 1,
@@ -184,6 +179,8 @@ export const ContentViewer = memo(
 		const { t } = useTranslation("common");
 		const { t: tNarrator } = useTranslation("narrator");
 		const msgCtx = useMessageContextMenu();
+		const lod = useRenderLod();
+		const isPreviewLod = lod === "preview";
 		const contentViewerEnv = useContext(ContentViewerEnvironmentContext);
 		const defaultWrap = contentViewerEnv.defaultWraps[contentType] ?? true;
 		const [fullscreen, { open, close }] = useDisclosure(false);
@@ -308,8 +305,11 @@ export const ContentViewer = memo(
 			if (effectiveSelectionId) selection.deselectBlock(effectiveSelectionId);
 		}, [selection.deselectBlock, effectiveSelectionId]);
 
+		const interactionEnabled = !isPreviewLod;
 		const swipe = useSwipeMenu({
-			enabled: true,
+			enabled: interactionEnabled,
+			touchEnabled: interactionEnabled && isMobile,
+
 			externalBoxRef: boxRef,
 			excludeSelectors: [".mantine-Menu-dropdown"],
 			// In selection mode, nested ContentViewers act on behalf of the parent
@@ -335,7 +335,7 @@ export const ContentViewer = memo(
 		// Desktop: right-click opens context menu (override hook's handler to gate on !isMobile)
 		const handleContextMenu = useCallback(
 			(e: React.MouseEvent) => {
-				if (isMobile) return;
+				if (!interactionEnabled || isMobile) return;
 				const selection = window.getSelection();
 				if (selection && selection.toString().trim().length > 0) return;
 				e.preventDefault();
@@ -345,13 +345,14 @@ export const ContentViewer = memo(
 				swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
 				swipe.setCtxMenuOpened(true);
 			},
-			[isMobile, swipe.setCtxMenuPos, swipe.setCtxMenuOpened],
+			[interactionEnabled, isMobile, swipe.setCtxMenuPos, swipe.setCtxMenuOpened],
 		);
 
 		// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
 		// Mobile: double-tap to fullscreen (falls through to handleDoubleTap)
 		const handleBlockClick = useCallback(
 			(e: React.MouseEvent) => {
+				if (!interactionEnabled) return;
 				if (isMobile) {
 					handleDoubleTap();
 					return;
@@ -376,6 +377,7 @@ export const ContentViewer = memo(
 				}
 			},
 			[
+				interactionEnabled,
 				isMobile,
 				nested,
 				handleDoubleTap,
@@ -505,15 +507,16 @@ export const ContentViewer = memo(
 						outlineOffset: showSelectedVisual ? -2 : undefined,
 						borderRadius: showSelectedVisual ? 4 : undefined,
 					}}
-					onMouseEnter={isMobile ? undefined : () => setHovered(true)}
-					onMouseLeave={isMobile ? undefined : () => setHovered(false)}
-					onContextMenu={handleContextMenu}
-					onClick={handleBlockClick}
+					onMouseEnter={interactionEnabled && !isMobile ? () => setHovered(true) : undefined}
+					onMouseLeave={interactionEnabled && !isMobile ? () => setHovered(false) : undefined}
+					onContextMenu={interactionEnabled ? handleContextMenu : undefined}
+					onClick={interactionEnabled ? handleBlockClick : undefined}
 				>
-					{/* Sticky bar: desktop hover only */}
-					{!isMobile && (
+					{/* Sticky bar: desktop hover only. Mount lazily so hidden action controls
+					    do not add Tooltip/CopyButton effects for every visible block. */}
+					{interactionEnabled && !isMobile && hovered && (
 						<div style={actionStickyWrapper} ref={actionBarRef}>
-							<Group gap={2} style={hovered ? actionBarVisible : actionBarHidden} wrap="nowrap">
+							<Group gap={2} style={actionBarVisible} wrap="nowrap">
 								{sourceToggle}
 								{wrapToggle}
 								{copyBtn}
@@ -546,7 +549,8 @@ export const ContentViewer = memo(
 				</Box>
 
 				{/* Swipe-reveal action menu — portal to body, position:fixed to bypass containing blocks */}
-				{(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+				{interactionEnabled &&
+					(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
 					(() => {
 						const menuEl = swipe.swipeMenuRef.current;
 						const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight ?? 200);
@@ -697,199 +701,206 @@ export const ContentViewer = memo(
 					})()}
 
 				{/* Fullscreen modal */}
-				<Modal
-					opened={fullscreen}
-					onClose={close}
-					title={title}
-					fullScreen
-					styles={{
-						body: {
-							height: "calc(100vh - 60px)",
-							overflow: "auto",
-							padding: isMobile ? 8 : undefined,
-							display: "flex",
-							flexDirection: "column",
-						},
-					}}
-				>
-					<div ref={modalBodyRef} style={modalToolbarStyle}>
-						{sourceToggle}
-						{wrapToggle}
-						{modalCopyBtn}
-						{isMobile && (
-							<Tooltip label={t("landscape")} withArrow position="top">
-								<ActionIcon
-									size="lg"
-									variant="filled"
-									color="gray"
-									onClick={toggleLandscape}
-									aria-label={t("landscape")}
-								>
-									<IconDeviceMobileRotated size={18} />
-								</ActionIcon>
-							</Tooltip>
-						)}
-					</div>
-
-					{diff ? (
-						<Box
-							style={{
-								flex: 1,
-								minHeight: 0,
-								overflow: "hidden",
+				{interactionEnabled && fullscreen && (
+					<Modal
+						opened={fullscreen}
+						onClose={close}
+						title={title}
+						fullScreen
+						styles={{
+							body: {
+								height: "calc(100vh - 60px)",
+								overflow: "auto",
+								padding: isMobile ? 8 : undefined,
 								display: "flex",
 								flexDirection: "column",
-							}}
-						>
-							<DiffView
-								oldStr={diff.oldStr}
-								newStr={diff.newStr}
-								maxHeight={undefined}
-								wordWrap={wordWrap}
-								language={language}
+							},
+						}}
+					>
+						<div ref={modalBodyRef} style={modalToolbarStyle}>
+							{sourceToggle}
+							{wrapToggle}
+							{modalCopyBtn}
+							{isMobile && (
+								<Tooltip label={t("landscape")} withArrow position="top">
+									<ActionIcon
+										size="lg"
+										variant="filled"
+										color="gray"
+										onClick={toggleLandscape}
+										aria-label={t("landscape")}
+									>
+										<IconDeviceMobileRotated size={18} />
+									</ActionIcon>
+								</Tooltip>
+							)}
+						</div>
+
+						{diff ? (
+							<Box
+								style={{
+									flex: 1,
+									minHeight: 0,
+									overflow: "hidden",
+									display: "flex",
+									flexDirection: "column",
+								}}
+							>
+								<DiffView
+									oldStr={diff.oldStr}
+									newStr={diff.newStr}
+									maxHeight={undefined}
+									wordWrap={wordWrap}
+									language={language}
+								/>
+							</Box>
+						) : markdown ? (
+							renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
+						) : language && language !== "text" ? (
+							<HighlightedCode
+								code={modalContent}
+								lang={language}
+								style={{
+									...style,
+									...wrapStyle,
+									maxHeight: undefined,
+									overflow: "auto",
+									fontSize: isMobile ? 11 : 12,
+									flex: 1,
+									minHeight: 0,
+								}}
 							/>
-						</Box>
-					) : markdown ? (
-						renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
-					) : language && language !== "text" ? (
-						<HighlightedCode
-							code={modalContent}
-							lang={language}
-							style={{
-								...style,
-								...wrapStyle,
-								maxHeight: undefined,
-								overflow: "auto",
-								fontSize: isMobile ? 11 : 12,
-								flex: 1,
-								minHeight: 0,
-							}}
-						/>
-					) : (
-						<Code
-							block
-							style={{
-								...style,
-								...wrapStyle,
-								maxHeight: undefined,
-								overflow: "auto",
-								fontSize: isMobile ? 11 : 12,
-								flex: 1,
-								minHeight: 0,
-							}}
-						>
-							{modalContent}
-						</Code>
-					)}
-				</Modal>
+						) : (
+							<Code
+								block
+								style={{
+									...style,
+									...wrapStyle,
+									maxHeight: undefined,
+									overflow: "auto",
+									fontSize: isMobile ? 11 : 12,
+									flex: 1,
+									minHeight: 0,
+								}}
+							>
+								{modalContent}
+							</Code>
+						)}
+					</Modal>
+				)}
 
 				{/* Context menu */}
-				<Menu
-					opened={swipe.ctxMenuOpened}
-					onChange={swipe.setCtxMenuOpened}
-					position="bottom-start"
-					withinPortal
-					styles={{
-						dropdown: {
-							position: "fixed",
-							left: swipe.ctxMenuPos.x,
-							...(swipe.ctxMenuPos.flipY
-								? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
-								: { top: swipe.ctxMenuPos.y }),
-						},
-					}}
-				>
-					<Menu.Target>
-						<div
-							style={{
+				{interactionEnabled && swipe.ctxMenuOpened && (
+					<Menu
+						opened={swipe.ctxMenuOpened}
+						onChange={swipe.setCtxMenuOpened}
+						position="bottom-start"
+						withinPortal
+						styles={{
+							dropdown: {
 								position: "fixed",
 								left: swipe.ctxMenuPos.x,
-								top: swipe.ctxMenuPos.y,
-								pointerEvents: "none",
-							}}
-						/>
-					</Menu.Target>
-					<Menu.Dropdown>
-						<Menu.Item leftSection={<IconArrowsMaximize size={14} />} onClick={open}>
-							{t("fullscreen")}
-						</Menu.Item>
-						<Menu.Item
-							leftSection={
-								wordWrap ? <IconTextWrap size={14} /> : <IconTextWrapDisabled size={14} />
-							}
-							onClick={() => {
-								userToggled.current = true;
-								setWordWrap((v) => !v);
-							}}
-						>
-							{wordWrap ? t("noWrap") : t("wordWrap")}
-						</Menu.Item>
-						<Menu.Item
-							leftSection={<IconCopy size={14} />}
-							onClick={() => navigator.clipboard.writeText(content)}
-						>
-							{t("copy")}
-						</Menu.Item>
-						{(msgCtx.onForkFromMessage ||
-							msgCtx.onAskInPassing ||
-							msgCtx.onCompactBeforeMessage ||
-							msgCtx.onDeleteBlock ||
-							msgCtx.onRollbackToBlock ||
-							msgCtx.onEditMessage ||
-							msgCtx.onJumpToSource) && <Menu.Divider />}
-						{msgCtx.onJumpToSource && (
+								...(swipe.ctxMenuPos.flipY
+									? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+									: { top: swipe.ctxMenuPos.y }),
+							},
+						}}
+					>
+						<Menu.Target>
+							<div
+								style={{
+									position: "fixed",
+									left: swipe.ctxMenuPos.x,
+									top: swipe.ctxMenuPos.y,
+									pointerEvents: "none",
+								}}
+							/>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Item leftSection={<IconArrowsMaximize size={14} />} onClick={open}>
+								{t("fullscreen")}
+							</Menu.Item>
 							<Menu.Item
-								leftSection={<IconExternalLink size={14} />}
-								onClick={msgCtx.onJumpToSource}
+								leftSection={
+									wordWrap ? <IconTextWrap size={14} /> : <IconTextWrapDisabled size={14} />
+								}
+								onClick={() => {
+									userToggled.current = true;
+									setWordWrap((v) => !v);
+								}}
 							>
-								{tNarrator("contextMenu_jumpToSource")}
+								{wordWrap ? t("noWrap") : t("wordWrap")}
 							</Menu.Item>
-						)}
-						{msgCtx.onEditMessage && (
-							<Menu.Item leftSection={<IconEdit size={14} />} onClick={msgCtx.onEditMessage}>
-								{tNarrator("contextMenu_edit")}
-							</Menu.Item>
-						)}
-						{msgCtx.onRollbackToBlock && blockIndex != null && (
 							<Menu.Item
-								leftSection={<IconArrowBackUp size={14} />}
-								onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
+								leftSection={<IconCopy size={14} />}
+								onClick={() => navigator.clipboard.writeText(content)}
 							>
-								{tNarrator("contextMenu_rollback")}
+								{t("copy")}
 							</Menu.Item>
-						)}
-						{msgCtx.onForkFromMessage && (
-							<Menu.Item leftSection={<IconGitFork size={14} />} onClick={msgCtx.onForkFromMessage}>
-								{tNarrator("contextMenu_fork")}
-							</Menu.Item>
-						)}
-						{msgCtx.onAskInPassing && (
-							<Menu.Item
-								leftSection={<IconMessageQuestion size={14} />}
-								onClick={msgCtx.onAskInPassing}
-							>
-								{tNarrator("contextMenu_askInPassing")}
-							</Menu.Item>
-						)}
-						{msgCtx.onCompactBeforeMessage && (
-							<Menu.Item
-								leftSection={<IconArrowsMinimize size={14} />}
-								onClick={msgCtx.onCompactBeforeMessage}
-							>
-								{tNarrator("contextMenu_compactBefore")}
-							</Menu.Item>
-						)}
-						{msgCtx.onDeleteBlock && blockIndex != null && (
-							<Menu.Item
-								color="red"
-								leftSection={<IconTrash size={14} />}
-								onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
-							>
-								{tNarrator("contextMenu_delete")}
-							</Menu.Item>
-						)}
-					</Menu.Dropdown>
-				</Menu>
+							{(msgCtx.onForkFromMessage ||
+								msgCtx.onAskInPassing ||
+								msgCtx.onCompactBeforeMessage ||
+								msgCtx.onDeleteBlock ||
+								msgCtx.onRollbackToBlock ||
+								msgCtx.onEditMessage ||
+								msgCtx.onJumpToSource) && <Menu.Divider />}
+							{msgCtx.onJumpToSource && (
+								<Menu.Item
+									leftSection={<IconExternalLink size={14} />}
+									onClick={msgCtx.onJumpToSource}
+								>
+									{tNarrator("contextMenu_jumpToSource")}
+								</Menu.Item>
+							)}
+							{msgCtx.onEditMessage && (
+								<Menu.Item leftSection={<IconEdit size={14} />} onClick={msgCtx.onEditMessage}>
+									{tNarrator("contextMenu_edit")}
+								</Menu.Item>
+							)}
+							{msgCtx.onRollbackToBlock && blockIndex != null && (
+								<Menu.Item
+									leftSection={<IconArrowBackUp size={14} />}
+									onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
+								>
+									{tNarrator("contextMenu_rollback")}
+								</Menu.Item>
+							)}
+							{msgCtx.onForkFromMessage && (
+								<Menu.Item
+									leftSection={<IconGitFork size={14} />}
+									onClick={msgCtx.onForkFromMessage}
+								>
+									{tNarrator("contextMenu_fork")}
+								</Menu.Item>
+							)}
+							{msgCtx.onAskInPassing && (
+								<Menu.Item
+									leftSection={<IconMessageQuestion size={14} />}
+									onClick={msgCtx.onAskInPassing}
+								>
+									{tNarrator("contextMenu_askInPassing")}
+								</Menu.Item>
+							)}
+							{msgCtx.onCompactBeforeMessage && (
+								<Menu.Item
+									leftSection={<IconArrowsMinimize size={14} />}
+									onClick={msgCtx.onCompactBeforeMessage}
+								>
+									{tNarrator("contextMenu_compactBefore")}
+								</Menu.Item>
+							)}
+							{msgCtx.onDeleteBlock && blockIndex != null && (
+								<Menu.Item
+									color="red"
+									leftSection={<IconTrash size={14} />}
+									onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
+								>
+									{tNarrator("contextMenu_delete")}
+								</Menu.Item>
+							)}
+						</Menu.Dropdown>
+					</Menu>
+				)}
 			</>
 		);
 	}),

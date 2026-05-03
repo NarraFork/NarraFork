@@ -16,6 +16,8 @@ const DEFAULT_CLOSE_DURATION = 220;
 interface UseSwipeMenuOptions {
 	/** Whether swipe/context-menu interactions are enabled. */
 	enabled: boolean;
+	/** Whether touch swipe gestures are enabled. Defaults to `enabled`. */
+	touchEnabled?: boolean;
 	/** Minimum swipe distance to reveal the menu. Default: 60 */
 	swipeThreshold?: number;
 	/** Width of the revealed menu area. Default: 180 */
@@ -70,6 +72,7 @@ export interface SwipeMenuState {
 export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	const {
 		enabled,
+		touchEnabled = enabled,
 		swipeThreshold = DEFAULT_THRESHOLD,
 		swipeRevealWidth = DEFAULT_REVEAL_WIDTH,
 		excludeSelectors = ["[data-content-block]", ".mantine-Menu-dropdown"],
@@ -140,7 +143,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	// --- Touch handlers ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: ref.current is intentionally not a dependency
 	useEffect(() => {
-		if (!enabled) return;
+		if (!enabled || !touchEnabled) return;
 		const node = swipeBoxRef.current;
 		if (!node) return;
 
@@ -364,6 +367,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 		};
 	}, [
 		enabled,
+		touchEnabled,
 		swipeRevealed,
 		closeSwipe,
 		swipeThreshold,
@@ -464,7 +468,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 				rafId = 0;
 				const box = swipeBoxRef.current;
 				// DOM node removed (e.g. virtualised list recycled it) — dismiss
-				if (!box || !box.isConnected) {
+				if (!box?.isConnected) {
 					offScreenRef.current = null;
 					getGlobalOnSwipeAnchorInfo()?.(null);
 					closeSwipe();
@@ -534,6 +538,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
 			if (!enabled) return;
+
 			const el = e.target as HTMLElement;
 			if (excludeSelectors.some((sel) => el.closest?.(sel))) return;
 			const sel = window.getSelection();

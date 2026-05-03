@@ -19,7 +19,8 @@ export type PromptKey =
 	| "conflictResolution"
 	| "conflictResolutionEnhanced"
 	| "rebaseConflictResolution"
-	| "mergeSummary";
+	| "mergeSummary"
+	| "yoloReflection";
 export type BuiltinSubagentType = "explore" | "plan" | "general";
 export type SubagentType = string;
 
@@ -227,6 +228,52 @@ Keep it under 300 words. Be factual and specific. Output ONLY the summary text. 
 - 任何值得注意的技术决策
 
 控制在 300 字以内。保持客观和具体。只输出摘要文本。始终使用简体中文回复。`,
+	},
+	yoloReflection: {
+		en: `YOLO safety pause: a high-risk tool call is pending and has NOT executed yet.
+
+Pending request ID: {requestId}
+Original tool: {toolName}
+Original input:
+{inputJson}
+
+Detected high-risk operation:
+- {summary}
+{detailsSection}
+
+Possible consequences:
+{consequencesList}
+
+Safer alternatives to consider:
+{alternativesList}
+
+Reflect briefly. You have exactly one response, and you MUST call exactly one tool:
+- YoloConfirm if this exact operation is still necessary and the risk is acceptable.
+- YoloCancel if a safer alternative should be used or the risk is not justified.
+If you do not call either tool in this one response, the operation will be treated as cancelled.
+Do not call the original tool from this reflection loop.`,
+		"zh-CN": `YOLO 安全暂停：一个高风险工具调用正在等待确认，尚未执行。
+
+待确认请求 ID：{requestId}
+原始工具：{toolName}
+原始输入：
+{inputJson}
+
+检测到的高风险操作：
+- {summary}
+{detailsSection}
+
+可能后果：
+{consequencesList}
+
+可考虑的更安全替代方案：
+{alternativesList}
+
+请简短反思。你只有一次回复机会，并且必须且只能调用一个工具：
+- 如果这个精确操作仍然必要且风险可以接受，调用 YoloConfirm。
+- 如果应该采用更安全替代方案，或风险不值得承担，调用 YoloCancel。
+如果你在这一次回复中没有调用任一工具，该操作将被视为已取消。
+不要在这个反思 loop 中调用原始工具。`,
 	},
 };
 

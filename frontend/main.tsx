@@ -4,6 +4,7 @@ import { createTheme, MantineProvider } from "@mantine/core";
 import "@mantine/core/styles.css";
 import { Notifications } from "@mantine/notifications";
 import "@mantine/notifications/styles.css";
+import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
@@ -46,10 +47,12 @@ declare module "@tanstack/react-router" {
 ReactDOM.createRoot(document.getElementById("root")!).render(
 	<React.StrictMode>
 		<MantineProvider theme={theme} defaultColorScheme="auto">
-			<Notifications position="top-right" />
-			<QueryClientProvider client={queryClient}>
-				<RouterProvider router={router} />
-			</QueryClientProvider>
+			<ConfirmDialogProvider>
+				<Notifications position="top-right" />
+				<QueryClientProvider client={queryClient}>
+					<RouterProvider router={router} />
+				</QueryClientProvider>
+			</ConfirmDialogProvider>
 		</MantineProvider>
 	</React.StrictMode>,
 );

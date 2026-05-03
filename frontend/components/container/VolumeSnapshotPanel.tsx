@@ -7,6 +7,7 @@ import {
 	useDeleteVolumeSnapshot,
 	useVolumeSnapshots,
 } from "../../hooks/useVolumeSnapshots";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { CreateSnapshotModal } from "./CreateSnapshotModal";
 
 interface VolumeSnapshotPanelProps {
@@ -32,19 +33,20 @@ export function VolumeSnapshotPanel({
 	hasRunningContainers,
 }: VolumeSnapshotPanelProps) {
 	const { t } = useTranslation("containers");
+	const confirm = useConfirmDialog();
 	const { data: snapshots } = useVolumeSnapshots(projectId);
 	const applySnapshot = useApplyVolumeSnapshot();
 	const deleteSnapshot = useDeleteVolumeSnapshot();
 	const [createOpen, setCreateOpen] = useState(false);
 
-	const handleApply = (snapshotId: string) => {
-		if (confirm(t("snapshots.applyConfirm"))) {
+	const handleApply = async (snapshotId: string) => {
+		if (await confirm({ message: t("snapshots.applyConfirm") })) {
 			applySnapshot.mutate({ snapshotId, targetChapterId: chapterId, projectId });
 		}
 	};
 
-	const handleDelete = (snapshotId: string) => {
-		if (confirm(t("snapshots.deleteConfirm"))) {
+	const handleDelete = async (snapshotId: string) => {
+		if (await confirm({ message: t("snapshots.deleteConfirm") })) {
 			deleteSnapshot.mutate({ snapshotId, projectId });
 		}
 	};

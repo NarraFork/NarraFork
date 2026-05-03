@@ -76,6 +76,7 @@ import {
 } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
+import { useRenderLod } from "./RenderLodCtx";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 // --- Editing message context ---
@@ -517,6 +518,7 @@ function BlockMenuWrapper({
 	children: React.ReactNode;
 }) {
 	const msgCtx = useMessageContextMenu();
+	const lod = useRenderLod();
 	const { t } = useTranslation("narrator");
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
@@ -545,80 +547,82 @@ function BlockMenuWrapper({
 		[isMobile, hasActions],
 	);
 
-	if (!hasActions) return <>{children}</>;
+	if (!hasActions || lod === "preview") return <>{children}</>;
 
 	return (
 		<>
 			<Box onContextMenu={handleContextMenu}>{children}</Box>
-			<Menu
-				opened={ctxMenuOpened}
-				onChange={setCtxMenuOpened}
-				position="bottom-start"
-				withinPortal
-				styles={{
-					dropdown: {
-						position: "fixed",
-						left: ctxMenuPos.x,
-						...(ctxMenuPos.flipY
-							? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
-							: { top: ctxMenuPos.y }),
-					},
-				}}
-			>
-				<Menu.Target>
-					<div
-						style={{
+			{ctxMenuOpened && (
+				<Menu
+					opened={ctxMenuOpened}
+					onChange={setCtxMenuOpened}
+					position="bottom-start"
+					withinPortal
+					styles={{
+						dropdown: {
 							position: "fixed",
 							left: ctxMenuPos.x,
-							top: ctxMenuPos.y,
-							pointerEvents: "none",
-						}}
-					/>
-				</Menu.Target>
-				<Menu.Dropdown>
-					{msgCtx.onRollbackToBlock && blockIndex != null && (
-						<Menu.Item
-							leftSection={<IconArrowBackUp size={14} />}
-							onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
-						>
-							{t("contextMenu_rollback")}
-						</Menu.Item>
-					)}
-					{msgCtx.onForkFromMessage && (
-						<Menu.Item
-							leftSection={<IconGitFork size={14} />}
-							onClick={() => msgCtx.onForkFromMessage?.()}
-						>
-							{t("contextMenu_fork")}
-						</Menu.Item>
-					)}
-					{msgCtx.onAskInPassing && (
-						<Menu.Item
-							leftSection={<IconMessageQuestion size={14} />}
-							onClick={() => msgCtx.onAskInPassing?.()}
-						>
-							{t("contextMenu_askInPassing")}
-						</Menu.Item>
-					)}
-					{msgCtx.onCompactBeforeMessage && (
-						<Menu.Item
-							leftSection={<IconArrowsMinimize size={14} />}
-							onClick={() => msgCtx.onCompactBeforeMessage?.()}
-						>
-							{t("contextMenu_compactBefore")}
-						</Menu.Item>
-					)}
-					{msgCtx.onDeleteBlock && blockIndex != null && (
-						<Menu.Item
-							color="red"
-							leftSection={<IconTrash size={14} />}
-							onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
-						>
-							{t("contextMenu_delete")}
-						</Menu.Item>
-					)}
-				</Menu.Dropdown>
-			</Menu>
+							...(ctxMenuPos.flipY
+								? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
+								: { top: ctxMenuPos.y }),
+						},
+					}}
+				>
+					<Menu.Target>
+						<div
+							style={{
+								position: "fixed",
+								left: ctxMenuPos.x,
+								top: ctxMenuPos.y,
+								pointerEvents: "none",
+							}}
+						/>
+					</Menu.Target>
+					<Menu.Dropdown>
+						{msgCtx.onRollbackToBlock && blockIndex != null && (
+							<Menu.Item
+								leftSection={<IconArrowBackUp size={14} />}
+								onClick={() => msgCtx.onRollbackToBlock?.(blockIndex)}
+							>
+								{t("contextMenu_rollback")}
+							</Menu.Item>
+						)}
+						{msgCtx.onForkFromMessage && (
+							<Menu.Item
+								leftSection={<IconGitFork size={14} />}
+								onClick={() => msgCtx.onForkFromMessage?.()}
+							>
+								{t("contextMenu_fork")}
+							</Menu.Item>
+						)}
+						{msgCtx.onAskInPassing && (
+							<Menu.Item
+								leftSection={<IconMessageQuestion size={14} />}
+								onClick={() => msgCtx.onAskInPassing?.()}
+							>
+								{t("contextMenu_askInPassing")}
+							</Menu.Item>
+						)}
+						{msgCtx.onCompactBeforeMessage && (
+							<Menu.Item
+								leftSection={<IconArrowsMinimize size={14} />}
+								onClick={() => msgCtx.onCompactBeforeMessage?.()}
+							>
+								{t("contextMenu_compactBefore")}
+							</Menu.Item>
+						)}
+						{msgCtx.onDeleteBlock && blockIndex != null && (
+							<Menu.Item
+								color="red"
+								leftSection={<IconTrash size={14} />}
+								onClick={() => msgCtx.onDeleteBlock?.(blockIndex)}
+							>
+								{t("contextMenu_delete")}
+							</Menu.Item>
+						)}
+					</Menu.Dropdown>
+				</Menu>
+			)}
 		</>
 	);
 }
@@ -626,9 +630,11 @@ function BlockMenuWrapper({
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const uploadNarratorId =
+		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
 
 	useEffect(() => {
-		if (block.previewUrl || !imageNarratorId || !block.imageId) return;
+		if (block.previewUrl || !uploadNarratorId || !block.imageId) return;
 
 		const token = getToken();
 		const headers: Record<string, string> = {};
@@ -636,7 +642,7 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 
 		let cancelled = false;
 		let objectUrl: string | null = null;
-		fetch(`/api/uploads/${imageNarratorId}/${block.imageId}`, { headers })
+		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
 			.then((res) => (res.ok ? res.blob() : null))
 			.then((blob) => {
 				if (blob && !cancelled) {
@@ -650,7 +656,7 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [imageNarratorId, block.imageId, block.previewUrl]);
+	}, [uploadNarratorId, block.imageId, block.previewUrl]);
 
 	const src = block.previewUrl ?? blobUrl;
 

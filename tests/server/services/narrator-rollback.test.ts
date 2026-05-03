@@ -42,11 +42,16 @@ function seedProject() {
 		.run();
 }
 
-function seedNarrator(id = "n1", chapterId: string | null = "ch1") {
+function seedNarrator(
+	id = "n1",
+	chapterId: string | null = "ch1",
+	apiConversationId?: string | null,
+) {
 	db.insert(narrators)
 		.values({
 			id,
 			chapterId,
+			apiConversationId,
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: now,
@@ -114,7 +119,11 @@ function seedToolCall(
  * Simulate the core logic of narratorService.deleteMessagesAfter.
  * Removes refs with seq > target's seq, then deletes orphan messages.
  */
-async function simulateDeleteMessagesAfter(narratorId: string, messageId: string) {
+async function simulateDeleteMessagesAfter(
+	narratorId: string,
+	messageId: string,
+	opts?: { preserveConversationId?: boolean },
+) {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -135,6 +144,15 @@ async function simulateDeleteMessagesAfter(narratorId: string, messageId: string
 		.all();
 
 	if (refsToRemove.length === 0) return { deletedMessageIds: [] as string[] };
+
+	db.update(narrators)
+		.set({
+			...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
+			pruneBoundaryMessageId: null,
+			prunedPercent: null,
+		})
+		.where(eq(narrators.id, narratorId))
+		.run();
 
 	const refIds = refsToRemove.map((r) => r.id);
 	const messageIds = [...new Set(refsToRemove.map((r) => r.messageId))];
@@ -171,8 +189,10 @@ async function simulateRollbackToBlock(narratorId: string, messageId: string, bl
 		throw new Error(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
 	}
 
-	// Step 1: delete subsequent messages
-	const { deletedMessageIds } = await simulateDeleteMessagesAfter(narratorId, messageId);
+	// Step 1: delete subsequent messages while preserving the API cache key.
+	const { deletedMessageIds } = await simulateDeleteMessagesAfter(narratorId, messageId, {
+		preserveConversationId: true,
+	});
 
 	// Step 2: truncate blocks after blockIndex
 	if (blockIndex < blocks.length - 1) {
@@ -302,6 +322,25 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 // === rollbackToBlock tests ===
 
 describe("rollbackToBlock", () => {
+	it("preserves apiConversationId so rollback keeps the provider cache key", async () => {
+		seedProject();
+		seedNarrator("n1", "ch1", "cache-conv-1");
+		seedMessage("m0", "n1", "assistant", "first", [
+			{ type: "text", text: "first" },
+			{ type: "text", text: "discard" },
+		]);
+		seedMessage("m1", "n1", "user", "after");
+		seedRef("n1", "m0", 0);
+		seedRef("n1", "m1", 1);
+
+		await simulateRollbackToBlock("n1", "m0", 0);
+
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, "n1"),
+		});
+		expect(narrator?.apiConversationId).toBe("cache-conv-1");
+	});
+
 	it("deletes subsequent messages and preserves the target", async () => {
 		seedProject();
 		seedNarrator();

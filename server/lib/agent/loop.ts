@@ -1,5 +1,5 @@
 import { logger } from "../logger";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import {
 	getAnthropicProviderConfig,
 	getModelContextWindow,
@@ -23,11 +23,13 @@ import { ApiRequestDumpCollector } from "./request-dump";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
+import { YOLO_REFLECTION_TOOLS } from "./tools/yolo-pause";
 import type {
 	AgentConfig,
 	AgentEvent,
 	AgentToolUse,
 	ContentBlock,
+	PermissionResult,
 	ResolvedToolDefinition,
 } from "./types";
 import {
@@ -370,6 +372,121 @@ function collectCompletedImageGenerations(
 	return blocks.length > 0 ? blocks : undefined;
 }
 
+function bulletList(items: string[]): string {
+	return items.map((item) => `- ${item}`).join("\n");
+}
+
+function formatYoloDetails(details: string[] | undefined, locale: Locale): string {
+	if (!details?.length) return "";
+	return locale === "zh-CN"
+		? `\n详情：\n${bulletList(details)}`
+		: `\nDetails:\n${bulletList(details)}`;
+}
+
+function buildYoloReflectionPrompt(
+	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	toolName: string,
+	input: Record<string, unknown>,
+	locale: Locale,
+): string {
+	return getPrompt("yoloReflection", locale)
+		.replaceAll("{requestId}", pause.requestId)
+		.replaceAll("{toolName}", toolName)
+		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
+		.replaceAll("{summary}", pause.danger.summary)
+		.replaceAll("{detailsSection}", formatYoloDetails(pause.danger.details, locale))
+		.replaceAll("{consequencesList}", bulletList(pause.danger.consequences))
+		.replaceAll("{alternativesList}", bulletList(pause.danger.saferAlternatives));
+}
+
+async function runYoloReflectionLoop(
+	parentConfig: AgentConfig,
+	history: unknown[],
+	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	toolUse: AgentToolUse,
+	reflectionAbort: AbortController,
+): Promise<void> {
+	const onParentAbort = () => reflectionAbort.abort();
+	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
+	try {
+		const reflectionConfig: AgentConfig = {
+			...parentConfig,
+			signal: reflectionAbort.signal,
+			maxTurns: 1,
+			yoloReflection: { requestId: pause.requestId, toolUseId: toolUse.toolUseId },
+			onEvent: undefined,
+			onBeforeTurn: undefined,
+			getInjectedUserText: undefined,
+			shouldStop: undefined,
+			toolFilter: undefined,
+			permissionHandler: async (toolName, input, toolUseId) => {
+				if (YOLO_REFLECTION_TOOLS.has(toolName)) return { behavior: "allow" };
+				return parentConfig.permissionHandler(toolName, input, toolUseId);
+			},
+		};
+		const locale = (parentConfig.locale as Locale) ?? "en";
+		for await (const event of agentLoop(
+			reflectionConfig,
+			buildYoloReflectionPrompt(pause, toolUse.name, toolUse.input, locale),
+			[...history],
+		)) {
+			if (event.type === "error") {
+				logger.warn("YOLO reflection loop ended with error", {
+					narratorId: parentConfig.narratorId,
+					requestId: pause.requestId,
+					message: event.message,
+				});
+			}
+		}
+	} finally {
+		parentConfig.signal.removeEventListener("abort", onParentAbort);
+	}
+}
+
+function formatYoloDeniedForModel(decision: PermissionResult, locale: Locale): string {
+	const reason =
+		decision.behavior === "deny" && decision.message?.trim()
+			? decision.message.trim()
+			: "YOLO safety pause cancelled. The operation was not executed.";
+	return getToolMessageWithParams("permissionDeniedWithMessage", locale, { message: reason });
+}
+
+async function resolveYoloPauseDecision(
+	config: AgentConfig,
+	history: unknown[],
+	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	toolUse: AgentToolUse,
+): Promise<PermissionResult> {
+	const reflectionAbort = new AbortController();
+	let reflectionDone = false;
+	const reflectionPromise = runYoloReflectionLoop(
+		config,
+		history,
+		pause,
+		toolUse,
+		reflectionAbort,
+	).finally(() => {
+		reflectionDone = true;
+	});
+	const decision = await Promise.race([
+		pause.decision.finally(() => reflectionAbort.abort()),
+		reflectionPromise.then(async () => {
+			const { cancelYoloPause } = await import("@server/services/narrator-permission");
+			await cancelYoloPause(
+				pause.requestId,
+				"YOLO reflection loop did not call YoloConfirm or YoloCancel in its single allowed response",
+			);
+			return pause.decision;
+		}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("YOLO reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	return decision;
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -387,6 +504,20 @@ export async function* agentLoop(
 	let effectiveProvider = resolvedProvider.provider;
 	const maxTurns = config.maxTurns ?? settings.agent.maxTurns;
 	const locale = (config.locale as Locale) ?? "en";
+
+	// Permission checks must be serialized even when tools themselves are parallel-safe.
+	// This prevents concurrent permission prompts / YOLO pauses from racing each other.
+	const originalPermissionHandler = config.permissionHandler;
+	let permissionTail: Promise<void> = Promise.resolve();
+	config.permissionHandler = async (toolName, input, toolUseId) => {
+		const run = permissionTail.then(() => originalPermissionHandler(toolName, input, toolUseId));
+		permissionTail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	};
+
 	let allTools: ResolvedToolDefinition[] = toolRegistry
 		.all()
 		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
@@ -394,6 +525,12 @@ export async function* agentLoop(
 			...t,
 			description: typeof t.description === "function" ? t.description(config) : t.description,
 		}));
+
+	if (config.yoloReflection) {
+		allTools = allTools.filter((tool) => YOLO_REFLECTION_TOOLS.has(tool.name));
+	} else {
+		allTools = allTools.filter((tool) => !YOLO_REFLECTION_TOOLS.has(tool.name));
+	}
 
 	// Apply toolFilter if provided (used by subagents to restrict available tools)
 	if (config.toolFilter) {
@@ -1117,6 +1254,9 @@ export async function* agentLoop(
 									for (const prevTu of toolUses) {
 										const sr = settledResults.get(prevTu.toolUseId);
 										if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
+										// YOLO pause is not a real result for the original tool call.
+										// Keep the original call pending until the reflection loop or user resolves it.
+										if (sr.yoloPause) continue;
 										yieldedToolResults.add(prevTu.toolUseId);
 										if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
 										if (sr.updatedInput) prevTu.input = sr.updatedInput;
@@ -1921,7 +2061,25 @@ export async function* agentLoop(
 				// Serial execution (single tool)
 				const tu = group[0];
 				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				const result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
+				let result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
+				if (result.yoloPause) {
+					const yoloDecision = await resolveYoloPauseDecision(
+						config,
+						history,
+						result.yoloPause,
+						tu,
+					);
+					if (yoloDecision.behavior === "allow") {
+						result = await executeTool(tu, config, { preGrantedPermission: yoloDecision });
+					} else {
+						result = {
+							output: formatYoloDeniedForModel(yoloDecision, locale),
+							isError: true,
+							durationMs: 0,
+							completedAt: Date.now(),
+						};
+					}
+				}
 				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 				// When the permission handler redirected the input (e.g. conclusion file),
 				// update the in-memory tool_use so pushAssistantTurn writes the correct
@@ -2040,48 +2198,71 @@ export async function* agentLoop(
 					remaining = new Set([...remaining].filter((p) => p !== indexed[i]));
 
 					const tu = group[i];
-					if (result.broken) brokenToolUseIds.add(tu.toolUseId);
-					if (result.updatedInput) tu.input = result.updatedInput;
+					let effectiveResult = result;
+					if (effectiveResult.yoloPause) {
+						const yoloDecision = await resolveYoloPauseDecision(
+							config,
+							history,
+							effectiveResult.yoloPause,
+							tu,
+						);
+						if (yoloDecision.behavior === "allow") {
+							effectiveResult = await executeTool(tu, config, {
+								preGrantedPermission: yoloDecision,
+							});
+						} else {
+							effectiveResult = {
+								output: formatYoloDeniedForModel(yoloDecision, locale),
+								isError: true,
+								durationMs: 0,
+								completedAt: Date.now(),
+							};
+						}
+						settled[i] = effectiveResult;
+					}
+					if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
+					if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
 					const isLastTool = toolIndex === toolUses.length - 1 && remaining.size === 0;
 					const outputForModel =
-						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
+						isLastTool && shouldNudge ? effectiveResult.output + nudgeText : effectiveResult.output;
 
 					pendingToolResults.push(
 						provider.formatToolResult(
 							tu.toolUseId,
 							outputForModel,
-							result.isError ?? false,
-							result.images,
+							effectiveResult.isError ?? false,
+							effectiveResult.images,
 						),
 					);
 
 					if (!yieldedToolResults.has(tu.toolUseId)) {
-						const brokenInputOverride = result.broken
+						const brokenInputOverride = effectiveResult.broken
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
-						const displayOutput = result.broken
+						const displayOutput = effectiveResult.broken
 							? getToolMessage("brokenToolCallResult", locale)
-							: result.output;
+							: effectiveResult.output;
 
 						yield {
 							type: "tool_result",
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
 							output: displayOutput,
-							isError: result.isError ?? false,
-							durationMs: result.durationMs,
-							permissionStartedAt: result.permissionStartedAt,
-							executionStartedAt: result.executionStartedAt,
-							completedAt: result.completedAt,
+							isError: effectiveResult.isError ?? false,
+							durationMs: effectiveResult.durationMs,
+							permissionStartedAt: effectiveResult.permissionStartedAt,
+							executionStartedAt: effectiveResult.executionStartedAt,
+							completedAt: effectiveResult.completedAt,
 							brokenInputOverride,
-							updatedInput: brokenInputOverride ?? result.updatedInput,
-							metadata: result.metadata,
+							updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
+							metadata: effectiveResult.metadata,
 						};
 					}
 					toolIndex++;
-					if (result.durationMs > maxParallelMs) maxParallelMs = result.durationMs;
+					if (effectiveResult.durationMs > maxParallelMs)
+						maxParallelMs = effectiveResult.durationMs;
 
-					if (result.fatal) hasFatal = true;
+					if (effectiveResult.fatal) hasFatal = true;
 				}
 				prevToolsExecMs += maxParallelMs;
 

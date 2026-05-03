@@ -179,6 +179,27 @@ export const pendingYoloDangerConfirmations = hotSafe<Map<string, PendingYoloDan
 	() => new Map(),
 );
 
+export interface PendingYoloPause {
+	narratorId: string;
+	requestId: string;
+	toolUseId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	fingerprint: string;
+	danger: {
+		summary: string;
+		consequences: string[];
+		saferAlternatives: string[];
+		details?: string[];
+	};
+	startedAt: number;
+}
+
+export const pendingYoloPauses = hotSafe<Map<string, PendingYoloPause>>(
+	"narrafork.pendingYoloPauses",
+	() => new Map(),
+);
+
 export const pendingFeedback = hotSafe<Map<string, { toolUseId: string; feedbackText: string }>>(
 	"narrafork.pendingFeedback",
 	() => new Map(),

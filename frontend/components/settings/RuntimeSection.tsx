@@ -14,9 +14,11 @@ import { IconBox, IconBrowser, IconRefresh, IconTerminal2, IconTrash } from "@ta
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type RuntimeScanResult } from "../../lib/api";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 export function RuntimeSection() {
 	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const [scanResult, setScanResult] = useState<RuntimeScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [cleaningTarget, setCleaningTarget] = useState<string | null>(null);
@@ -55,7 +57,7 @@ export function RuntimeSection() {
 	};
 
 	const handleCleanup = async (target: "terminals" | "containers" | "browsers") => {
-		if (!window.confirm(t("runtimeCleanupConfirm"))) return;
+		if (!(await confirm({ message: t("runtimeCleanupConfirm") }))) return;
 		setCleaningTarget(target);
 		try {
 			const res = await api.cleanupRuntime(target);

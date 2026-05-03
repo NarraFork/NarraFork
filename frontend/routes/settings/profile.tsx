@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
+import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import {
 	useCurrentUser,
@@ -17,6 +18,7 @@ export const Route = createFileRoute("/settings/profile")({
 
 function SettingsProfilePage() {
 	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const { data: currentUser, isLoading } = useCurrentUser();
 	const uploadAvatar = useUploadAvatar();
 	const deleteAvatar = useDeleteAvatar();
@@ -66,8 +68,8 @@ function SettingsProfilePage() {
 		uploadAvatar.mutate(file, { onSuccess: () => clearCropSrc() });
 	};
 
-	const handleDeleteAvatar = () => {
-		if (window.confirm(t("avatarDeleteConfirm"))) {
+	const handleDeleteAvatar = async () => {
+		if (await confirm({ message: t("avatarDeleteConfirm") })) {
 			deleteAvatar.mutate();
 		}
 	};

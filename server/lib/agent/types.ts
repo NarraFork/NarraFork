@@ -46,6 +46,10 @@ export interface ToolContext {
 	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
+	/** YOLO reflection permission request ID, set only inside the safety reflection loop. */
+	yoloPauseRequestId?: string;
+	/** Original high-risk toolUseId, set only inside the safety reflection loop. */
+	yoloPauseToolUseId?: string;
 }
 
 export interface ToolResult {
@@ -87,6 +91,13 @@ export type ResolvedToolDefinition = ToolDefinition & { description: string };
 
 // === Permission ===
 
+export interface YoloDangerInfo {
+	summary: string;
+	consequences: string[];
+	saferAlternatives: string[];
+	details?: string[];
+}
+
 export type PermissionResult =
 	| {
 			behavior: "allow";
@@ -100,6 +111,15 @@ export type PermissionResult =
 			fatal?: boolean;
 			/** When true, `message` is already a complete user-facing string — skip wrapping. */
 			rawMessage?: boolean;
+	  }
+	| {
+			behavior: "yoloPause";
+			requestId: string;
+			toolCallId: string;
+			message: string;
+			danger: YoloDangerInfo;
+			fingerprint: string;
+			decision: Promise<PermissionResult>;
 	  };
 
 // === Agent events (yielded by the loop) ===
@@ -355,6 +375,8 @@ export interface AgentConfig {
 	metadata?: { user_id: string };
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
+	/** Internal YOLO safety reflection loop context. */
+	yoloReflection?: { requestId: string; toolUseId: string };
 	permissionHandler: (
 		toolName: string,
 		input: Record<string, unknown>,

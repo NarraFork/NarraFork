@@ -29,6 +29,7 @@ export const LazyCollapse = memo(function LazyCollapse({
 	const [reveal, setReveal] = useState(opened);
 	const isFirstMount = useRef(true);
 	const mountedRef = useRef(opened);
+	const [hasToggled, setHasToggled] = useState(false);
 
 	useEffect(() => {
 		// On initial mount, mounted and reveal are already set correctly by
@@ -39,6 +40,8 @@ export const LazyCollapse = memo(function LazyCollapse({
 			isFirstMount.current = false;
 			return;
 		}
+
+		setHasToggled(true);
 
 		// Use mountedRef to track mounted state WITHOUT including `mounted` in deps.
 		// When `opened` toggles true, the old code ran setMounted(true) then re-ran
@@ -84,6 +87,8 @@ export const LazyCollapse = memo(function LazyCollapse({
 	}, [opened]);
 
 	if (!mounted) return null;
+
+	if (opened && !hasToggled) return <>{children}</>;
 
 	return (
 		<Collapse in={reveal} onTransitionEnd={handleTransitionEnd}>

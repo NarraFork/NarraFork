@@ -56,6 +56,7 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 	// early-return in normalizeCodexReasoningEffort before this table is consulted.
 	// The frontend counterpart (NarratorPanel CODEX_REASONING_OPTIONS_BY_MODEL)
 	// includes "none" because it drives UI dropdown options.
+	"gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"],
 	"gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
 	"gpt-5.2-codex": ["low", "medium", "high", "xhigh"],
 	"gpt-5.1-codex-max": ["low", "medium", "high", "xhigh"],
@@ -66,6 +67,45 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 	"gpt-5.4": ["low", "medium", "high", "xhigh"],
 	"gpt-5.4-mini": ["low", "medium", "high", "xhigh"],
 };
+
+type CodexInputModality = "text" | "image";
+
+const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
+
+const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
+	"gpt-5.5": ["text", "image"],
+	"gpt-5.4": ["text", "image"],
+	"gpt-5.4-mini": ["text", "image"],
+	"gpt-5.3-codex-spark": ["text"],
+	"gpt-5.3-codex": ["text", "image"],
+	"gpt-5.2-codex": ["text", "image"],
+	"gpt-5.2": ["text", "image"],
+	"gpt-5.1-codex-max": ["text", "image"],
+	"gpt-5.1-codex": ["text", "image"],
+	"gpt-5.1-codex-mini": ["text", "image"],
+};
+
+function hasNativeTool(tools: unknown[], type: string): boolean {
+	return tools.some((tool) => {
+		if (!tool || typeof tool !== "object") return false;
+		return (tool as { type?: unknown }).type === type;
+	});
+}
+
+export function supportsCodexImageGeneration(model: string): boolean {
+	const bareModel = parseModelId(model).model;
+	const inputModalities = CODEX_MODEL_INPUT_MODALITIES[bareModel] ?? DEFAULT_CODEX_INPUT_MODALITIES;
+	return inputModalities.includes("image");
+}
+
+export function appendCodexNativeTools(tools: unknown[], model: string): void {
+	if (!hasNativeTool(tools, "web_search")) {
+		tools.push({ type: "web_search" });
+	}
+	if (supportsCodexImageGeneration(model) && !hasNativeTool(tools, "image_generation")) {
+		tools.push({ type: "image_generation", output_format: "png" });
+	}
+}
 
 export function normalizeCodexReasoningEffort(
 	model: string,
@@ -522,11 +562,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			if (tools.length > 0) body.tools = tools;
 
-			// Codex: inject native web_search and image_generation tools (server-side, not function tools)
+			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
-				toolsArr.push({ type: "web_search" });
-				toolsArr.push({ type: "image_generation", output_format: "png" });
+				appendCodexNativeTools(toolsArr, model);
 				body.tools = toolsArr;
 			}
 
@@ -1107,7 +1146,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		tools.push({ type: "web_search" });
+		appendCodexNativeTools(tools, model);
 		request.tools = tools;
 
 		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
@@ -2177,12 +2216,15 @@ async function buildResponsesUserMessageFromDbMessage(
 			continue;
 		}
 		if (block.type === "image" && typeof block.imageId === "string" && ownerNarratorId) {
-			const filePath = getImagePath(ownerNarratorId, block.imageId);
+			const uploadNarratorId =
+				typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : ownerNarratorId;
+			const filePath = getImagePath(uploadNarratorId, block.imageId);
 			if (!filePath) {
 				logger.warn("Responses history image missing on disk; skipping replay", {
 					narratorId,
 					messageNarratorId: msg.narratorId ?? null,
 					effectiveNarratorId: ownerNarratorId,
+					uploadNarratorId,
 					messageId: msg.id,
 					imageId: block.imageId,
 				});
@@ -2208,6 +2250,7 @@ async function buildResponsesUserMessageFromDbMessage(
 					narratorId,
 					messageNarratorId: msg.narratorId ?? null,
 					effectiveNarratorId: ownerNarratorId,
+					uploadNarratorId,
 					messageId: msg.id,
 					imageId: block.imageId,
 					error: error instanceof Error ? error.message : String(error),

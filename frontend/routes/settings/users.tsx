@@ -18,6 +18,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 
@@ -28,6 +29,7 @@ export const Route = createFileRoute("/settings/users")({
 function SettingsUsersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("common");
+	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 
 	const [editingUser, setEditingUser] = useState<{ id: string; username: string } | null>(null);
@@ -136,13 +138,13 @@ function SettingsUsersPage() {
 												<Badge
 													color={u.role === "admin" ? "indigo" : "gray"}
 													style={{ cursor: "pointer" }}
-													onClick={() => {
+													onClick={async () => {
 														const newRole = u.role === "admin" ? "user" : "admin";
 														const msg =
 															newRole === "admin"
 																? t("confirmPromoteAdmin", { username: u.username })
 																: t("confirmDemoteAdmin", { username: u.username });
-														if (window.confirm(msg)) {
+														if (await confirm({ message: msg })) {
 															updateUser.mutate({ id: u.id, data: { role: newRole } });
 														}
 													}}
@@ -163,9 +165,11 @@ function SettingsUsersPage() {
 													<ActionIcon
 														color="red"
 														variant="subtle"
-														onClick={() => {
+														onClick={async () => {
 															if (
-																window.confirm(t("confirmDeleteUser", { username: u.username }))
+																await confirm({
+																	message: t("confirmDeleteUser", { username: u.username }),
+																})
 															) {
 																deleteUser.mutate(u.id);
 															}

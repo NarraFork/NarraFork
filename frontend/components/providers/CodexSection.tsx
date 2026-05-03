@@ -33,6 +33,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { relativeTime } from "../../lib/relative-time";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -58,6 +59,7 @@ export const CodexSection = React.memo(function CodexSection({
 }: CodexSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
@@ -292,9 +294,9 @@ export const CodexSection = React.memo(function CodexSection({
 		});
 	};
 
-	const handleBatchDelete = () => {
+	const handleBatchDelete = async () => {
 		if (selectedIds.size === 0) return;
-		if (confirm(t("codexBatchDeleteConfirm", { count: selectedIds.size }))) {
+		if (await confirm({ message: t("codexBatchDeleteConfirm", { count: selectedIds.size }) })) {
 			batchDeleteMut.mutate([...selectedIds]);
 		}
 	};
@@ -962,6 +964,7 @@ function CredentialList(props: {
 	} = props;
 	const isMobile = useMediaQuery("(max-width: 768px)");
 	const { t: tSettings } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
 
 	if (isMobile) {
@@ -1138,8 +1141,8 @@ function CredentialList(props: {
 													<ActionIcon
 														size="sm"
 														color="red"
-														onClick={() => {
-															if (confirm(t("codexDeleteConfirm"))) {
+														onClick={async () => {
+															if (await confirm({ message: t("codexDeleteConfirm") })) {
 																deleteMut.mutate(entry.id);
 															}
 														}}
@@ -1240,6 +1243,7 @@ function CredentialCards(props: {
 	} = props;
 
 	const { t: tSettings } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const totalPages = Math.max(1, Math.ceil(totalEntries / pageSize));
 
 	return (
@@ -1425,8 +1429,8 @@ function CredentialCards(props: {
 											variant="subtle"
 											color="red"
 											size="sm"
-											onClick={() => {
-												if (confirm(t("codexDeleteConfirm"))) {
+											onClick={async () => {
+												if (await confirm({ message: t("codexDeleteConfirm") })) {
 													deleteMut.mutate(entry.id);
 												}
 											}}

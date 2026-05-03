@@ -36,6 +36,7 @@ import {
 	pendingPlanCompact,
 	pendingPlanDiff,
 	pendingYoloDangerConfirmations,
+	pendingYoloPauses,
 	planModeAskedOnce,
 } from "./narrator-session-state";
 import { resolveTaskAlias } from "./subagent-alias";
@@ -1209,28 +1210,6 @@ function classifyGitDanger(cmdText: string, tokens: string[]): YoloDangerInfo | 
 	return null;
 }
 
-function isYoloReadOnlyOperation(
-	toolName: string,
-	input: Record<string, unknown>,
-	bashAnalysis?: BashAnalysis,
-): boolean {
-	if (toolName === SHELL_TOOL_NAME) {
-		return !!(
-			bashAnalysis &&
-			!bashAnalysis.hasWriteOperation &&
-			!bashAnalysis.hasEnvInjection &&
-			bashAnalysis.dangerousPatterns.length === 0 &&
-			bashAnalysis.nonWhitelisted.length === 0
-		);
-	}
-
-	if (toolName === "Agent") {
-		return input.subagent_type === "explore" || input.subagent_type === "plan";
-	}
-
-	return READ_ONLY_TOOLS.includes(toolName);
-}
-
 function classifyShellDanger(
 	input: Record<string, unknown>,
 	cwd: string,
@@ -1306,11 +1285,12 @@ function classifyShellDanger(
 			bashAnalysis.dangerousPatterns,
 		);
 	}
+	if (!bashAnalysis.hasWriteOperation) return null;
 	const externalPaths = describeExternalPaths(
 		cwd,
 		getShellScopePaths(cwd, input, bashAnalysis),
 		whitelistDirs,
-		bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly",
+		"readWrite",
 	);
 	if (externalPaths.length > 0) {
 		return danger(
@@ -1336,27 +1316,22 @@ export function classifyYoloDanger(
 	bashAnalysis?: BashAnalysis,
 	whitelistDirs: WhitelistDir[] = [],
 	commandWhitelist: CommandWhitelistEntry[] = [],
-	skipReadOnlyConfirmations = false,
+	_skipReadOnlyConfirmations = false,
 ): YoloDangerInfo | null {
-	if (skipReadOnlyConfirmations && isYoloReadOnlyOperation(toolName, input, bashAnalysis)) {
-		return null;
-	}
-
 	if (toolName === SHELL_TOOL_NAME)
 		return classifyShellDanger(input, cwd, bashAnalysis, whitelistDirs, commandWhitelist);
 
 	if (toolName === "Agent") {
+		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
 		if (workdir) {
 			const resolvedWorkdir = resolvePath(cwd, workdir);
 			if (!pathsEqual(resolvedWorkdir, resolvePath(cwd))) {
-				const requiredLevel =
-					input.subagent_type !== "explore" && input.subagent_type !== "plan" ? "full" : "readOnly";
-				if (allPathsWhitelisted(cwd, [resolvedWorkdir], whitelistDirs, requiredLevel)) {
+				if (allPathsWhitelisted(cwd, [resolvedWorkdir], whitelistDirs, "full")) {
 					return null;
 				}
 				return danger(
-					"Subagent requests a custom working directory.",
+					"Write-capable subagent requests a custom working directory.",
 					[
 						"The subagent may operate outside the parent narrator's current workspace.",
 						"A write-capable subagent can modify files the parent did not inspect.",
@@ -1372,9 +1347,16 @@ export function classifyYoloDanger(
 		return null;
 	}
 
+	if (toolName === "Edit") {
+		return null;
+	}
+
+	if (READ_ONLY_TOOLS.includes(toolName)) {
+		return null;
+	}
+
 	const toolPaths = extractToolPaths(toolName, input);
-	const requiredLevel = READ_ONLY_TOOLS.includes(toolName) ? "readOnly" : "readWrite";
-	const externalPaths = describeExternalPaths(cwd, toolPaths, whitelistDirs, requiredLevel);
+	const externalPaths = describeExternalPaths(cwd, toolPaths, whitelistDirs, "readWrite");
 	if (externalPaths.length > 0) {
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
@@ -1408,26 +1390,6 @@ export function classifyYoloDanger(
 		}
 	}
 
-	if (toolName === "Edit" || toolName === "MultiEdit") {
-		const newString = typeof input.new_string === "string" ? input.new_string : undefined;
-		const replaceAll = input.replace_all === true;
-		if (newString === "" || replaceAll) {
-			return danger(
-				replaceAll
-					? "Edit will replace all matching occurrences."
-					: "Edit will remove matched content.",
-				[
-					"The change may delete or alter more code than intended.",
-					"A broad match can affect user work outside the agent's intended scope.",
-				],
-				["Use a unique, narrow old_string.", "Inspect the target file before applying the edit."],
-				[
-					`File: ${typeof input.file_path === "string" ? resolvePath(cwd, input.file_path) : "(unknown)"}`,
-				],
-			);
-		}
-	}
-
 	return null;
 }
 
@@ -1449,7 +1411,7 @@ function buildYoloDangerMessage(danger: YoloDangerInfo): string {
 	);
 	lines.push(
 		"",
-		"If you have considered the risk and still need this exact operation, call the exact same tool with the exact same input again within 5 minutes. Any changed input will trigger a new safety pause.",
+		"This operation is paused and still pending. A separate safety reflection loop must call YoloConfirm to proceed or YoloCancel to cancel. The user may also approve or deny the pending permission from the UI.",
 	);
 	return lines.join("\n");
 }
@@ -1955,8 +1917,26 @@ export async function handlePermission(
 		if (danger) {
 			const fingerprint = createYoloDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
 			if (!consumeYoloConfirmation(narratorId, fingerprint)) {
-				rememberYoloConfirmation(narratorId, fingerprint, danger);
 				const warning = buildYoloDangerMessage(danger);
+				const toolCallRecord = await db.query.narratorToolCalls.findFirst({
+					where: and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+					),
+				});
+				if (!toolCallRecord) {
+					logger.error("Tool call record not found for YOLO pause", { narratorId, toolUseId });
+					return { behavior: "deny", message: "Internal error: tool call record not found" };
+				}
+				const toolCallId = toolCallRecord.id;
+				const yoloReflectionSuggestion = {
+					type: "yolo_reflection",
+					status: "running",
+					message:
+						"AI safety reflection loop is running. It has one chance to call YoloConfirm or YoloCancel.",
+					requestId: toolCallId,
+					startedAt: new Date().toISOString(),
+				};
 				logger.warn("YOLO high-risk operation paused", {
 					narratorId,
 					toolName,
@@ -1967,20 +1947,106 @@ export async function handlePermission(
 				await db
 					.update(narratorToolCalls)
 					.set({
-						status: "fail",
-						errorMessage: warning,
+						status: "pending",
 						inputJson: effectiveInput,
-						permissionDecidedBy: "auto",
-						permissionDecidedAt: new Date().toISOString(),
+						permissionStartedAt: new Date().toISOString(),
 						permissionDecisionReason: `YOLO safety pause: ${danger.summary}`,
+						permissionSuggestions: [yoloReflectionSuggestion],
 					})
-					.where(
-						and(
-							eq(narratorToolCalls.narratorId, narratorId),
-							eq(narratorToolCalls.toolUseId, toolUseId),
-						),
-					);
-				return { behavior: "deny", message: warning, rawMessage: true };
+					.where(eq(narratorToolCalls.id, toolCallId));
+
+				broadcastToNarrator(wsTarget, {
+					type: "permission_request",
+					narratorId: wsTarget,
+					request: {
+						id: toolCallId,
+						toolName,
+						toolUseId,
+						inputJson: effectiveInput,
+						decisionReason: `YOLO safety pause: ${danger.summary}`,
+						suggestions: [yoloReflectionSuggestion],
+					},
+				});
+				eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
+				await narratorService.updateStatus(narratorId, "waiting");
+				if (broadcastTargetId && broadcastTargetId !== narratorId) {
+					await narratorService.updateStatus(broadcastTargetId, "waiting");
+				}
+
+				if (signal.aborted) {
+					broadcastToNarrator(wsTarget, {
+						type: "permission_resolved",
+						narratorId: wsTarget,
+						requestId: toolCallId,
+						toolUseId,
+					});
+					await db
+						.update(narratorToolCalls)
+						.set({
+							status: "fail",
+							errorMessage: "Narrator aborted",
+							permissionDecidedBy: "aborted",
+							permissionDecidedAt: new Date().toISOString(),
+						})
+						.where(eq(narratorToolCalls.id, toolCallId));
+					return { behavior: "deny", message: "Narrator aborted" };
+				}
+
+				const decisionPromise = new Promise<PermissionResult>((resolve) => {
+					const cleanup = () => {
+						signal.removeEventListener("abort", onAbort);
+						pendingPermissions.delete(toolCallId);
+						pendingYoloPauses.delete(toolCallId);
+					};
+					const onAbort = async () => {
+						cleanup();
+						broadcastToNarrator(wsTarget, {
+							type: "permission_resolved",
+							narratorId: wsTarget,
+							requestId: toolCallId,
+							toolUseId,
+						});
+						await db
+							.update(narratorToolCalls)
+							.set({
+								status: "fail",
+								errorMessage: "Narrator aborted",
+								permissionDecidedBy: "aborted",
+								permissionDecidedAt: new Date().toISOString(),
+							})
+							.where(eq(narratorToolCalls.id, toolCallId));
+						resolve({ behavior: "deny", message: "Narrator aborted" });
+					};
+					signal.addEventListener("abort", onAbort, { once: true });
+					pendingPermissions.set(toolCallId, {
+						resolve,
+						cleanup,
+						input: effectiveInput,
+						narratorId,
+						toolName,
+						toolUseId,
+						broadcastTargetId: wsTarget,
+					});
+				});
+				pendingYoloPauses.set(toolCallId, {
+					narratorId,
+					requestId: toolCallId,
+					toolUseId,
+					toolName,
+					input: effectiveInput,
+					fingerprint,
+					danger,
+					startedAt: Date.now(),
+				});
+				return {
+					behavior: "yoloPause",
+					requestId: toolCallId,
+					toolCallId,
+					message: warning,
+					danger,
+					fingerprint,
+					decision: decisionPromise,
+				};
 			}
 		}
 	}
@@ -2330,6 +2396,7 @@ export async function resolvePermission(
 		toolUseId: pending.toolUseId,
 	});
 
+	const yoloPause = pendingYoloPauses.get(requestId);
 	pending.cleanup();
 
 	let updatedInput: Record<string, unknown> | undefined;
@@ -2381,6 +2448,10 @@ export async function resolvePermission(
 	}
 
 	if (decision === "allow") {
+		if (yoloPause) {
+			rememberYoloConfirmation(yoloPause.narratorId, yoloPause.fingerprint, yoloPause.danger);
+			pendingYoloPauses.delete(requestId);
+		}
 		if (feedbackText?.trim()) {
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
@@ -2449,6 +2520,9 @@ export async function resolvePermission(
 			}
 		}
 	} else {
+		if (yoloPause) {
+			pendingYoloPauses.delete(requestId);
+		}
 		const userFeedback = denyMessage || feedbackText?.trim();
 		if (pending.toolName === "ExitPlanMode") {
 			const locale = activeNarrators.get(pending.narratorId)?.locale ?? "en";
@@ -2464,6 +2538,20 @@ export async function resolvePermission(
 		}
 	}
 	return true;
+}
+
+export async function confirmYoloPause(requestId: string, _reflection?: string): Promise<boolean> {
+	const pause = pendingYoloPauses.get(requestId);
+	if (!pause) return false;
+	return resolvePermission(requestId, "allow");
+}
+
+export async function cancelYoloPause(requestId: string, reason?: string): Promise<boolean> {
+	const pause = pendingYoloPauses.get(requestId);
+	if (!pause) return false;
+	return resolvePermission(requestId, "deny", {
+		denyMessage: reason?.trim() || "YOLO safety pause cancelled by reflection loop",
+	});
 }
 
 /**

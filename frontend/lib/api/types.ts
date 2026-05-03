@@ -147,6 +147,7 @@ export interface BaseContentBlock {
 	imageId?: string;
 	filename?: string;
 	mediaType?: string;
+	uploadNarratorId?: string;
 	[key: string]: unknown;
 }
 

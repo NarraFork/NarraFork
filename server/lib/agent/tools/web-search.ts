@@ -2,6 +2,15 @@ import { z } from "zod/v4";
 import { logger } from "../../logger";
 import type { ToolDefinition, ToolResult } from "../types";
 
+function isAbortError(err: unknown): boolean {
+	return (
+		(err instanceof Error && (err.name === "AbortError" || err.message === "Aborted")) ||
+		(typeof DOMException !== "undefined" &&
+			err instanceof DOMException &&
+			err.name === "AbortError")
+	);
+}
+
 
 	const baseUrl = config.baseUrl.replace(/\/+$/, "");
 	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
@@ -11,6 +20,7 @@ import type { ToolDefinition, ToolResult } from "../types";
 			Authorization: `Bearer ${config.apiKey}`,
 		},
 		body: JSON.stringify({ query }),
+		signal,
 	});
 
 	if (!response.ok) {
@@ -72,7 +82,7 @@ export const webSearchTool: ToolDefinition = {
 	parameters: z.object({
 		query: z.string().describe("Search query string"),
 	}),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
 
@@ -83,6 +93,10 @@ export const webSearchTool: ToolDefinition = {
 		}
 
 		try {
+			if (ctx.signal.aborted) throw new Error("Aborted");
+
+			// Do not fall back when the failure was caused by narrator interruption;
+			// that must unwind immediately so the agent loop can clean up.
 			let response: McpResponse | undefined;
 				try {
 						});
@@ -114,6 +128,12 @@ export const webSearchTool: ToolDefinition = {
 				title: query.slice(0, 80),
 			};
 		} catch (err) {
+			if (ctx.signal.aborted || isAbortError(err)) {
+				return {
+					output: "Web search aborted by user",
+					isError: true,
+				};
+			}
 			return {
 				output: `Web search failed: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,

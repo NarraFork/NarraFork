@@ -13,17 +13,19 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitLog, useGitReset } from "../../hooks/useGit";
 import { formatRelativeTime } from "../../lib/format";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 const LIMIT = 50;
 
 export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
+	const confirm = useConfirmDialog();
 	const [skip, setSkip] = useState(0);
 	const { data: commits, isLoading } = useGitLog(chapterId, LIMIT, skip);
 	const reset = useGitReset(chapterId);
 
-	function handleReset(sha: string, mode: "soft" | "hard") {
-		if (mode === "hard" && !window.confirm(t("resetConfirm"))) return;
+	async function handleReset(sha: string, mode: "soft" | "hard") {
+		if (mode === "hard" && !(await confirm({ message: t("resetConfirm") }))) return;
 		reset.mutate({ target: sha, mode });
 	}
 

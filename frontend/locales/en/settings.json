@@ -291,7 +291,7 @@
 	"defaultRelaxedPlan": "Default Relaxed Plan",
 	"defaultRelaxedPlanDesc": "Enable relaxed plan mode by default for new narrators. In relaxed plan mode, tools remain available while planning instead of being disabled.",
 	"yoloSkipReadOnlyConfirmations": "Skip read-only YOLO confirmations",
-	"yoloSkipReadOnlyConfirmationsDesc": "When enabled, read-only operations in Bypass All mode no longer trigger an extra safety pause. Writes, deletions, dangerous execution patterns, and environment injection still require confirmation.",
+	"yoloSkipReadOnlyConfirmationsDesc": "When enabled, read-only operations in Bypass All mode no longer trigger an extra safety pause. Edit/MultiEdit are treated as recoverable and won't pause; Write overwrites, deletions, dangerous execution patterns, and environment injection still require confirmation.",
 	"smartInterruptionCheck": "Smart Output Interruption Check",
 	"smartInterruptionCheckDesc": "Automatically detect when model output is cut off and send a continue message. Empty responses are retried immediately; non-empty responses are checked by the summary model.",
 	"maxTransientRetries": "Max Retries for Recoverable Errors",

@@ -77,6 +77,7 @@ import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import { useRenderLod } from "./RenderLodCtx";
 import { StreamingCode } from "./StreamingCode";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
@@ -1128,6 +1129,47 @@ const ToolHeader = memo(
 			) : (
 				startedAtLabel
 			);
+		const startedAt = toolCall.startedAt;
+		const showElapsedTimer =
+			startedAt != null &&
+			(toolCall.status === "running" ||
+				toolCall.status === "pending" ||
+				toolCall.status === "initializing");
+
+		const statusNode = (
+			<Group gap={4} wrap="nowrap" align="center">
+				<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
+					<StatusIcon status={toolCall.status} />
+				</Box>
+				{showElapsedTimer ? (
+					<ElapsedTimer
+						startedAt={startedAt}
+						timeoutMs={effectiveTimeoutMs ?? undefined}
+						narratorId={narratorId}
+						toolUseId={toolCall.toolUseId}
+					/>
+				) : (
+					displayDurationMs != null &&
+					(effectiveTimeoutMs != null ? (
+						<TimeoutPopover
+							timeoutMs={effectiveTimeoutMs}
+							narratorId={narratorId}
+							toolUseId={toolCall.toolUseId}
+							isRunning={false}
+						>
+							<Text size="xs" c="dimmed" ff="monospace">
+								{formatCompletedDuration(displayDurationMs)}
+								<span style={{ opacity: 0.5 }}> / {formatTimeoutShort(effectiveTimeoutMs)}</span>
+							</Text>
+						</TimeoutPopover>
+					) : (
+						<Text size="xs" c="dimmed" ff="monospace">
+							{formatCompletedDuration(displayDurationMs)}
+						</Text>
+					))
+				)}
+			</Group>
+		);
 
 		const content = (
 			<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
@@ -1162,52 +1204,13 @@ const ToolHeader = memo(
 					</Text>
 				)}
 				<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
-					<Tooltip
-						label={timingTooltipLabel}
-						disabled={!timingTooltipLabel}
-						position="top"
-						withArrow
-						fz="xs"
-					>
-						<Group gap={4} wrap="nowrap" align="center">
-							<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
-								<StatusIcon status={toolCall.status} />
-							</Box>
-							{toolCall.startedAt != null &&
-							(toolCall.status === "running" ||
-								toolCall.status === "pending" ||
-								toolCall.status === "initializing") ? (
-								<ElapsedTimer
-									startedAt={toolCall.startedAt}
-									timeoutMs={effectiveTimeoutMs ?? undefined}
-									narratorId={narratorId}
-									toolUseId={toolCall.toolUseId}
-								/>
-							) : (
-								displayDurationMs != null &&
-								(effectiveTimeoutMs != null ? (
-									<TimeoutPopover
-										timeoutMs={effectiveTimeoutMs}
-										narratorId={narratorId}
-										toolUseId={toolCall.toolUseId}
-										isRunning={false}
-									>
-										<Text size="xs" c="dimmed" ff="monospace">
-											{formatCompletedDuration(displayDurationMs)}
-											<span style={{ opacity: 0.5 }}>
-												{" "}
-												/ {formatTimeoutShort(effectiveTimeoutMs)}
-											</span>
-										</Text>
-									</TimeoutPopover>
-								) : (
-									<Text size="xs" c="dimmed" ff="monospace">
-										{formatCompletedDuration(displayDurationMs)}
-									</Text>
-								))
-							)}
-						</Group>
-					</Tooltip>
+					{timingTooltipLabel ? (
+						<Tooltip label={timingTooltipLabel} position="top" withArrow fz="xs">
+							{statusNode}
+						</Tooltip>
+					) : (
+						statusNode
+					)}
 					<Box style={{ display: "flex", alignItems: "center" }}>
 						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 					</Box>
@@ -3669,6 +3672,13 @@ export function InlinePermission({
 		);
 	}
 
+	const yoloReflectionSuggestion = permission.suggestions?.find(
+		(suggestion) =>
+			suggestion &&
+			typeof suggestion === "object" &&
+			(suggestion as { type?: string }).type === "yolo_reflection",
+	) as { status?: string; message?: string } | undefined;
+
 	// ExitPlanMode: show plan content above the allow/deny buttons
 	const planText =
 		permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
@@ -3753,6 +3763,24 @@ export function InlinePermission({
 				<Text size="xs" c="dimmed" mb={4}>
 					{permission.decisionReason}
 				</Text>
+			)}
+			{yoloReflectionSuggestion && (
+				<Paper withBorder radius="sm" p="xs" mb="xs" bg="yellow.9">
+					<Group gap="xs" wrap="nowrap" align="center">
+						<ThemeIcon size="sm" radius="xl" color="yellow" variant="light">
+							<IconLoader2 size={14} />
+						</ThemeIcon>
+						<Box>
+							<Text size="xs" fw={600} c="yellow.1">
+								YOLO safety reflection running
+							</Text>
+							<Text size="xs" c="yellow.2">
+								{yoloReflectionSuggestion.message ??
+									"AI is reflecting on this pending high-risk operation."}
+							</Text>
+						</Box>
+					</Group>
+				</Paper>
 			)}
 			<Textarea
 				size="xs"
@@ -4114,6 +4142,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 					? "var(--mantine-color-blue-7)"
 					: undefined;
 
+	const lod = useRenderLod();
+	const isPreviewLod = lod === "preview";
+	const interactionEnabled = !isPreviewLod;
+
 	const permissionUI = pendingPermission ? (
 		<InlinePermission
 			permission={pendingPermission}
@@ -4125,7 +4157,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		/>
 	) : null;
 
-	const handleToggle = isStreaming ? undefined : () => setOpened((o) => !o);
+	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
 
 	// --- File preview modal state ---
 	const readFilePath = toolCall.toolName === "Read" ? getFilePath(toolCall.inputJson) : "";
@@ -4136,15 +4168,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
-	const hasActions = !!(
-		toolCall.toolUseId ||
-		readFilePath ||
-		msgCtx.onForkFromMessage ||
-		msgCtx.onAskInPassing ||
-		msgCtx.onCompactBeforeMessage ||
-		(msgCtx.onRollbackToBlock && blockIndex != null) ||
-		(msgCtx.onDeleteBlock && blockIndex != null)
-	);
+	const hasActions =
+		interactionEnabled &&
+		!!(
+			toolCall.toolUseId ||
+			readFilePath ||
+			msgCtx.onForkFromMessage ||
+			msgCtx.onAskInPassing ||
+			msgCtx.onCompactBeforeMessage ||
+			(msgCtx.onRollbackToBlock && blockIndex != null) ||
+			(msgCtx.onDeleteBlock && blockIndex != null)
+		);
 
 	// --- Swipe & context-menu state ---
 	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
@@ -4157,17 +4191,18 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const handleDeselectTc = useCallback(() => {
 		if (tcBlockId) selection.deselectBlock(tcBlockId);
 	}, [selection.deselectBlock, tcBlockId]);
+	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
+	const isMobileTc = useMediaQuery("(max-width: 768px)") ?? false;
 	const swipe = useSwipeMenu({
 		enabled: hasActions,
+		touchEnabled: interactionEnabled && isMobileTc,
 		blockId: tcBlockId,
 		onSwipeRight: isTcSelected ? handleDeselectTc : undefined,
 	});
 
-	// Desktop: Ctrl/Cmd+Click toggles block, Shift+Click range-selects
-	const isMobileTc = useMediaQuery("(max-width: 768px)") ?? false;
 	const handleTcBlockClick = useCallback(
 		(e: React.MouseEvent) => {
-			if (isMobileTc || !tcBlockId) return;
+			if (!interactionEnabled || isMobileTc || !tcBlockId) return;
 			const isModKey = e.metaKey || e.ctrlKey;
 			const isShift = e.shiftKey;
 			if (!isModKey && !isShift) return;
@@ -4179,7 +4214,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				selection.toggleBlock(tcBlockId);
 			}
 		},
-		[isMobileTc, tcBlockId, selection.toggleBlock, selection.rangeSelectTo],
+		[interactionEnabled, isMobileTc, tcBlockId, selection.toggleBlock, selection.rangeSelectTo],
 	);
 
 	const menuItemsNode = hasActions ? (
@@ -4346,7 +4381,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			);
 		})();
 
-	const ctxMenu = hasActions && (
+	const ctxMenu = hasActions && swipe.ctxMenuOpened && (
 		<Menu
 			opened={swipe.ctxMenuOpened}
 			onChange={swipe.setCtxMenuOpened}
@@ -4384,15 +4419,16 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onClose={() => setPreviewOpened(false)}
 			/>
 		) : null;
-	const inspectorModal = toolCall.toolUseId ? (
-		<ToolCallInspector
-			narratorId={narratorId ?? ""}
-			toolUseId={toolCall.toolUseId}
-			opened={inspectorOpened}
-			onClose={() => setInspectorOpened(false)}
-			initialToolCall={toolCall}
-		/>
-	) : null;
+	const inspectorModal =
+		toolCall.toolUseId && inspectorOpened ? (
+			<ToolCallInspector
+				narratorId={narratorId ?? ""}
+				toolUseId={toolCall.toolUseId}
+				opened={inspectorOpened}
+				onClose={() => setInspectorOpened(false)}
+				initialToolCall={toolCall}
+			/>
+		) : null;
 
 	// Shared selection-aware style computation for both inRun and standalone layouts
 	const buildSelectionStyle = (): React.CSSProperties => {
@@ -4414,8 +4450,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 			<>
 				<Box
 					ref={swipe.swipeBoxRef}
-					onContextMenu={swipe.handleContextMenu}
-					onClick={handleTcBlockClick}
+					onContextMenu={interactionEnabled ? swipe.handleContextMenu : undefined}
+					onClick={interactionEnabled ? handleTcBlockClick : undefined}
 					style={buildSelectionStyle()}
 					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 					{...(msgCtx.messageId ? { "data-message-id": msgCtx.messageId } : {})}
@@ -4440,8 +4476,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 		<>
 			<Box
 				ref={swipe.swipeBoxRef}
-				onContextMenu={swipe.handleContextMenu}
-				onClick={handleTcBlockClick}
+				onContextMenu={interactionEnabled ? swipe.handleContextMenu : undefined}
+				onClick={interactionEnabled ? handleTcBlockClick : undefined}
 				style={buildSelectionStyle()}
 				{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
 				{...(msgCtx.messageId ? { "data-message-id": msgCtx.messageId } : {})}

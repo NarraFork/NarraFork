@@ -933,6 +933,24 @@ describe("Terminal", () => {
 	});
 });
 
+	test("pre-aborted signal stops before request", async () => {
+		let acquiredContext = false;
+		const fakeTokenManager = {
+			maxRetries: 1,
+			acquireContext: async () => {
+				acquiredContext = true;
+				throw new Error("should not acquire context after abort");
+			},
+		const ac = new AbortController();
+		ac.abort();
+
+		await expect(client.callTool("web_search", { query: "hello" }, ac.signal)).rejects.toThrow(
+			"Aborted",
+		);
+		expect(acquiredContext).toBe(false);
+	});
+});
+
 // ============================================================
 // zodToJsonSchema (tool-registry)
 // ============================================================
