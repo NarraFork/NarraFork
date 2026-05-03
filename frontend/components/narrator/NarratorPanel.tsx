@@ -62,6 +62,7 @@ import {
 	IconPaperclip,
 	IconPencil,
 	IconPhoto,
+	IconSearch,
 	IconSettings,
 	IconShield,
 	IconSparkles,
@@ -276,6 +277,8 @@ function ModelMenuItems({
 	onSelect: (model: string) => void;
 	label?: string;
 }) {
+	const { t } = useTranslation("narrator");
+	const [filter, setFilter] = useState("");
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {
 		if (!groups.has(prov)) groups.set(prov, []);
@@ -287,6 +290,27 @@ function ModelMenuItems({
 		__agg__: "Aggregations",
 	};
 	const entries = [...groups.entries()];
+	const normalizedFilter = filter.trim().toLowerCase();
+	const filteredEntries = normalizedFilter
+		? entries
+				.map(([prov, models]) => {
+					const providerLabel = provLabels[prov] ?? prov;
+					const filteredModels = models.filter((m) => {
+						const haystack = [
+							m.label,
+							m.value,
+							m.provider ?? "",
+							providerLabel,
+							m.rateMultiplier != null ? String(m.rateMultiplier) : "",
+						]
+							.join(" ")
+							.toLowerCase();
+						return haystack.includes(normalizedFilter);
+					});
+					return [prov, filteredModels] as const;
+				})
+				.filter(([, models]) => models.length > 0)
+		: entries;
 	// For aggregation selection check: parse current model to see if it's an aggregation
 	const currentAgg = currentModel ? parseAggModelValue(currentModel) : null;
 	return (
@@ -298,37 +322,79 @@ function ModelMenuItems({
 				</>
 			)}
 			{label && <Menu.Label>{label}</Menu.Label>}
-			{entries.map(([prov, models], gi) => (
-				<span key={prov}>
-					{gi > 0 && <Menu.Divider />}
-					<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-					{models.map((m) => {
-						// For aggregation items, check if the current model's aggId matches
-						const isAggItem = m.provider === "__agg__";
-						const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
-						const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
-						return (
-							<Menu.Item
-								key={m.value}
-								onClick={() => onSelect(m.value)}
-								rightSection={
-									<Group gap={4} wrap="nowrap">
-										{m.rateMultiplier != null && (
-											<Badge size="xs" variant="outline" color="gray">
-												×{m.rateMultiplier}
-											</Badge>
-										)}
-										<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
-									</Group>
-								}
-								fw={selected ? 600 : 400}
-							>
-								{m.label}
-							</Menu.Item>
-						);
-					})}
-				</span>
-			))}
+			<Box
+				p={4}
+				style={{
+					position: "sticky",
+					top: 0,
+					zIndex: 2,
+					background: "var(--mantine-color-body)",
+				}}
+				onClick={(e) => e.stopPropagation()}
+			>
+				<TextInput
+					autoFocus
+					leftSection={<IconSearch size={14} />}
+					onChange={(e) => setFilter(e.currentTarget.value)}
+					onKeyDown={(e) => e.stopPropagation()}
+					placeholder={t("modelFilterPlaceholder")}
+					rightSection={
+						filter ? (
+							<CloseButton
+								aria-label={t("clearModelFilter")}
+								onClick={(e) => {
+									e.stopPropagation();
+									setFilter("");
+								}}
+								size="xs"
+							/>
+						) : undefined
+					}
+					size="xs"
+					value={filter}
+				/>
+			</Box>
+			<Menu.Divider />
+			{filteredEntries.length === 0 ? (
+				<Text c="dimmed" p="xs" size="xs">
+					{t("noModelMatches")}
+				</Text>
+			) : (
+				filteredEntries.map(([prov, models], gi) => (
+					<span key={prov}>
+						{gi > 0 && <Menu.Divider />}
+						<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
+						{models.map((m) => {
+							// For aggregation items, check if the current model's aggId matches
+							const isAggItem = m.provider === "__agg__";
+							const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
+							const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
+							return (
+								<Menu.Item
+									key={m.value}
+									onClick={() => onSelect(m.value)}
+									rightSection={
+										<Group gap={4} wrap="nowrap">
+											{m.rateMultiplier != null && (
+												<Badge size="xs" variant="outline" color="gray">
+													×{m.rateMultiplier}
+												</Badge>
+											)}
+											<IconCheck
+												size={14}
+												style={{ visibility: selected ? "visible" : "hidden" }}
+											/>
+										</Group>
+									}
+									fw={selected ? 600 : 400}
+								>
+									{m.label}
+								</Menu.Item>
+							);
+						})}
+					</span>
+				))
+			)}
 		</>
 	);
 }

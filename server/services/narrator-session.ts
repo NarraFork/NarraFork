@@ -961,9 +961,17 @@ export async function runAgentLoop(
 					if (!restoreMode) {
 						restoreMode = currentRow.previousPermissionMode ?? undefined;
 					}
-					// If the previous mode would block plan execution, fall back to default
+					// If the previous mode would block plan execution, fall back to the user's
+					// configured default permission mode. This also covers narrators that were
+					// created directly in plan mode before previousPermissionMode was persisted.
 					const BLOCKED_MODES = new Set(["readOnly", "plan", "dontAsk"]);
-					const resolved = restoreMode && !BLOCKED_MODES.has(restoreMode) ? restoreMode : "default";
+					const defaultRestoreMode = settings.agent.defaultPermissionMode;
+					const resolved =
+						restoreMode && !BLOCKED_MODES.has(restoreMode)
+							? restoreMode
+							: !BLOCKED_MODES.has(defaultRestoreMode)
+								? defaultRestoreMode
+								: "default";
 					const finalMode = resolved as
 						| "default"
 						| "acceptEdits"

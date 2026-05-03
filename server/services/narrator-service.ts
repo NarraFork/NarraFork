@@ -462,6 +462,8 @@ export const narratorService = {
 			| "bypassPermissions"
 			| "plan"
 			| "dontAsk";
+		const previousPermissionMode =
+			resolvedPermMode === "plan" ? settings.agent.defaultPermissionMode : null;
 
 		const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
 		const actualModel = resolveEffectiveModel(storedModel);
@@ -485,6 +487,7 @@ export const narratorService = {
 				model: storedModel,
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
+				previousPermissionMode,
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: input.fastMode ?? false,
 				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
