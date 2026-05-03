@@ -1,0 +1,6 @@
+{
+	"version": "0.3.1",
+	"date": "2026-05-03",
+	"en": "## New Features\n\n- Added pipeline capture support for agent tool flows, making structured intermediate results available across tools.\n- Added a setting to skip read-only YOLO confirmations while keeping safeguards for writes, dangerous commands, environment injection, and unapproved external paths.\n- Improved update restart handling so the app can recover more gracefully after update-related server restarts.",
+	"zh-CN": "## 新功能\n\n- 新增 Agent 工具流程的 pipeline capture 支持，便于在工具之间传递结构化的中间结果。\n- 新增 YOLO 只读确认跳过开关；写入、危险命令、环境注入和未授权外部路径仍保留安全保护。\n- 优化更新后的重启处理，让应用在更新相关的服务重启后恢复更平滑。"
+}
