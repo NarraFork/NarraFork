@@ -902,6 +902,24 @@ function getYoloFingerprintScope(
 	return { cwd: normalizedCwd, resolvedPaths };
 }
 
+/**
+ * 从 input 中提取影响 fingerprint 的核心字段，剔除 description 等不影响执行语义的字段。
+ * 这确保 AI 模型重试相同命令时（即使 description 措辞不同）能匹配到之前的 YOLO 确认。
+ */
+function getYoloFingerprintInput(
+	toolName: string,
+	input: Record<string, unknown>,
+): Record<string, unknown> {
+	if (toolName === SHELL_TOOL_NAME) {
+		// 只保留影响执行语义的字段：command 和 workdir
+		const result: Record<string, unknown> = {};
+		if (input.command !== undefined) result.command = input.command;
+		if (input.workdir !== undefined) result.workdir = input.workdir;
+		return result;
+	}
+	return input;
+}
+
 export function createYoloDangerFingerprint(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -911,7 +929,7 @@ export function createYoloDangerFingerprint(
 	return createHash("sha256")
 		.update(
 			stableJson({
-				input,
+				input: getYoloFingerprintInput(toolName, input),
 				scope: getYoloFingerprintScope(toolName, input, cwd, bashAnalysis),
 				toolName,
 			}),
@@ -1151,6 +1169,31 @@ function classifyGitDanger(cmdText: string, tokens: string[]): YoloDangerInfo | 
 			["Avoid expiring reflogs during agent work unless explicitly required."],
 			detail,
 		);
+	}
+	if (sub === "stash") {
+		const stashSub = args[0];
+		if (stashSub === "drop") {
+			return danger(
+				"Git stash drop permanently removes a stash entry.",
+				[
+					"The stashed changes cannot be recovered after dropping.",
+					"If the stash contains important uncommitted work, it will be lost.",
+				],
+				["Run git stash list first to inspect.", "Apply the stash before dropping it."],
+				detail,
+			);
+		}
+		if (stashSub === "clear") {
+			return danger(
+				"Git stash clear removes all stash entries.",
+				[
+					"All stashed changes will be permanently lost.",
+					"Recovery is not possible after clearing the stash.",
+				],
+				["Run git stash list first to inspect.", "Apply or pop important stashes before clearing."],
+				detail,
+			);
+		}
 	}
 	if (sub === "gc" && hasFlagPrefix(["--prune"])) {
 		return danger(

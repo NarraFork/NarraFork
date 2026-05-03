@@ -1116,10 +1116,54 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		);
 	});
 
+	test("YOLO danger fingerprint ignores description for Bash tool", () => {
+		expect(
+			createYoloDangerFingerprint(
+				"Bash",
+				{ command: "rm -rf build", description: "Delete build directory" },
+				cwd,
+			),
+		).toBe(
+			createYoloDangerFingerprint(
+				"Bash",
+				{ command: "rm -rf build", description: "Retry: delete build directory" },
+				cwd,
+			),
+		);
+		// Also matches when description is absent
+		expect(createYoloDangerFingerprint("Bash", { command: "rm -rf build" }, cwd)).toBe(
+			createYoloDangerFingerprint(
+				"Bash",
+				{ command: "rm -rf build", description: "Delete build directory" },
+				cwd,
+			),
+		);
+	});
+
 	test("YOLO danger fingerprint changes with cwd", () => {
 		expect(createYoloDangerFingerprint("Bash", { command: "rm foo" }, cwd)).not.toBe(
 			createYoloDangerFingerprint("Bash", { command: "rm foo" }, "/home/user/other"),
 		);
+	});
+
+	test("YOLO danger classifier catches git stash drop", async () => {
+		const analysis = await analyzeBashCommand("git stash drop", cwd, false);
+		const result = classifyYoloDanger("Bash", { command: "git stash drop" }, cwd, analysis);
+		expect(result?.summary).toContain("stash drop");
+	});
+
+	test("YOLO danger classifier catches git stash clear", async () => {
+		const analysis = await analyzeBashCommand("git stash clear", cwd, false);
+		const result = classifyYoloDanger("Bash", { command: "git stash clear" }, cwd, analysis);
+		expect(result?.summary).toContain("stash clear");
+	});
+
+	test("YOLO danger classifier allows git stash push/pop/apply/list", async () => {
+		for (const sub of ["push", "pop", "apply", "list", "show"]) {
+			const analysis = await analyzeBashCommand(`git stash ${sub}`, cwd, false);
+			const result = classifyYoloDanger("Bash", { command: `git stash ${sub}` }, cwd, analysis);
+			expect(result).toBeNull();
+		}
 	});
 
 	test("dontAsk → deny regardless", () => {
