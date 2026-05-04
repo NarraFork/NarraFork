@@ -443,12 +443,17 @@ async function runYoloReflectionLoop(
 	}
 }
 
-function formatYoloDeniedForModel(decision: PermissionResult, locale: Locale): string {
+function buildYoloDeniedToolResult(decision: PermissionResult, locale: Locale): ToolExecResult {
 	const reason =
 		decision.behavior === "deny" && decision.message?.trim()
 			? decision.message.trim()
 			: "YOLO safety pause cancelled. The operation was not executed.";
-	return getToolMessageWithParams("permissionDeniedWithMessage", locale, { message: reason });
+	return {
+		output: getToolMessageWithParams("permissionDeniedWithMessage", locale, { message: reason }),
+		isError: true,
+		durationMs: 0,
+		completedAt: Date.now(),
+	};
 }
 
 async function resolveYoloPauseDecision(
@@ -2088,12 +2093,7 @@ export async function* agentLoop(
 					if (yoloDecision.behavior === "allow") {
 						result = await executeTool(tu, config, { preGrantedPermission: yoloDecision });
 					} else {
-						result = {
-							output: formatYoloDeniedForModel(yoloDecision, locale),
-							isError: true,
-							durationMs: 0,
-							completedAt: Date.now(),
-						};
+						result = buildYoloDeniedToolResult(yoloDecision, locale);
 					}
 				}
 				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
@@ -2227,12 +2227,7 @@ export async function* agentLoop(
 								preGrantedPermission: yoloDecision,
 							});
 						} else {
-							effectiveResult = {
-								output: formatYoloDeniedForModel(yoloDecision, locale),
-								isError: true,
-								durationMs: 0,
-								completedAt: Date.now(),
-							};
+							effectiveResult = buildYoloDeniedToolResult(yoloDecision, locale);
 						}
 						settled[i] = effectiveResult;
 					}

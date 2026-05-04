@@ -30,6 +30,7 @@ import {
 
 export interface NarratorPixiMessageListHandle {
 	scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" }) => void;
+	scrollToOffset: (offset: number) => void;
 	getTotalSize: () => number;
 	findIndexByKey: (key: string) => number;
 	readonly scrollOffset: number;
@@ -118,6 +119,7 @@ export const NarratorPixiMessageList = forwardRef<
 	const prevTotalHeightRef = useRef(0);
 	const prevFirstKeyRef = useRef<string | null>(null);
 	const appliedRestoreVersionRef = useRef(0);
+	const lastRendererSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
 
 	const orderedMessages = useMemo(() => {
 		if (!messagesData?.pages?.length) return [];
@@ -281,7 +283,8 @@ export const NarratorPixiMessageList = forwardRef<
 		const viewport = viewportRef.current;
 		if (!viewport) return;
 		const updateSize = () => {
-			setSize({ width: viewport.clientWidth, height: viewport.clientHeight });
+			const next = { width: viewport.clientWidth, height: viewport.clientHeight };
+			setSize((prev) => (prev.width === next.width && prev.height === next.height ? prev : next));
 		};
 		updateSize();
 		const ro = new ResizeObserver(updateSize);
@@ -425,7 +428,10 @@ export const NarratorPixiMessageList = forwardRef<
 	const refreshAfterResume = useCallback((options?: { resetTextures?: boolean }) => {
 		const viewport = viewportRef.current;
 		if (viewport) {
-			setSize({ width: viewport.clientWidth, height: viewport.clientHeight });
+			const nextSize = { width: viewport.clientWidth, height: viewport.clientHeight };
+			setSize((prev) =>
+				prev.width === nextSize.width && prev.height === nextSize.height ? prev : nextSize,
+			);
 			viewport.scrollTop = clamp(viewport.scrollTop, 0, getMaxScrollTop(viewport));
 			virtualScrollTopRef.current = viewport.scrollTop;
 			isAtBottomRef.current = isViewportAtBottom(viewport);
@@ -524,8 +530,12 @@ export const NarratorPixiMessageList = forwardRef<
 					width: Math.max(1, viewport?.clientWidth ?? 1),
 					height: Math.max(1, viewport?.clientHeight ?? 1),
 				};
-				app.renderer.resize(nextSize.width, nextSize.height, window.devicePixelRatio || 1);
-				setSize(nextSize);
+				const nextDpr = window.devicePixelRatio || 1;
+				app.renderer.resize(nextSize.width, nextSize.height, nextDpr);
+				lastRendererSizeRef.current = { ...nextSize, dpr: nextDpr };
+				setSize((prev) =>
+					prev.width === nextSize.width && prev.height === nextSize.height ? prev : nextSize,
+				);
 				setReady(true);
 				setRestoreVersion((version) => version + 1);
 			});
@@ -543,6 +553,7 @@ export const NarratorPixiMessageList = forwardRef<
 			textPoolRef.current = null;
 			iconPoolRef.current = null;
 			imagePoolRef.current = null;
+			lastRendererSizeRef.current = { width: 0, height: 0, dpr: 0 };
 		};
 		// init once; resize is handled below
 	}, [refreshAfterResume]);
@@ -551,11 +562,19 @@ export const NarratorPixiMessageList = forwardRef<
 		void dprVersion;
 		const app = appRef.current;
 		if (!ready || !app?.renderer) return;
-		app.renderer.resize(
-			Math.max(1, size.width),
-			Math.max(1, size.height),
-			window.devicePixelRatio || 1,
-		);
+		const nextWidth = Math.max(1, size.width);
+		const nextHeight = Math.max(1, size.height);
+		const nextDpr = window.devicePixelRatio || 1;
+		const previous = lastRendererSizeRef.current;
+		if (
+			previous.width === nextWidth &&
+			previous.height === nextHeight &&
+			previous.dpr === nextDpr
+		) {
+			return;
+		}
+		app.renderer.resize(nextWidth, nextHeight, nextDpr);
+		lastRendererSizeRef.current = { width: nextWidth, height: nextHeight, dpr: nextDpr };
 	}, [ready, size, dprVersion]);
 
 	useEffect(() => {
@@ -588,6 +607,9 @@ export const NarratorPixiMessageList = forwardRef<
 				if (align === "center") top = target.y - viewport.clientHeight / 2 + target.height / 2;
 				else if (align === "end") top = target.y - viewport.clientHeight + target.height;
 				setNativeScrollTop(top, { behavior: "smooth" });
+			},
+			scrollToOffset: (offset) => {
+				setNativeScrollTop(offset, { bufferPx: 0 });
 			},
 			getTotalSize: () => layout.totalHeight,
 			findIndexByKey: (key: string) => items.findIndex((item) => item.key === key),

@@ -1,5 +1,10 @@
-import { type LayoutLine, layoutWithLines, prepareWithSegments } from "@chenglou/pretext";
-import { type MdBlock, parseMarkdownBlocks } from "./pixi-markdown";
+import {
+	type LayoutLine,
+	layoutWithLines,
+	measureNaturalWidth,
+	prepareWithSegments,
+} from "@chenglou/pretext";
+import { type MdBlock, type MdInlineToken, parseMarkdownBlocks } from "./pixi-markdown";
 import {
 	PIXI_MESSAGE_FONT,
 	PIXI_MESSAGE_METRICS,
@@ -25,8 +30,12 @@ export interface PixiLaidOutMarkdownBlock {
 	lineHeight: number;
 	level?: number;
 	lang?: string;
+	inlineTokens?: MdInlineToken[];
 	ordered?: boolean;
 	index?: number;
+	depth?: number;
+	checked?: boolean;
+	table?: { headers: string[]; rows: string[][]; columnWidths: number[] };
 }
 
 export interface PixiLaidOutToolDetailLine extends PixiToolDetailLineModel {
@@ -137,7 +146,11 @@ export interface PixiMessageLayoutResult {
 const GAP = 12;
 const PADDING_X = 16;
 const PADDING_Y = 12;
+const USER_PADDING_X = 12;
+const USER_PADDING_Y = 12;
 const BLOCK_GAP = 8;
+const USER_HEADER_H = 20;
+const USER_HEADER_CONTENT_GAP = 4;
 const HEADER_H = 20;
 const TOKEN_H = 18;
 const TOOL_SEPARATOR_H = 1;
@@ -147,6 +160,12 @@ const TOOL_DETAIL_LINE_H = 18;
 const TOOL_DETAIL_GAP = 6;
 const MIN_ITEM_H = 34;
 const FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.body, PIXI_MESSAGE_FONT.sansFamily);
+const BODY_STRONG_FONT = pixiCssFont(
+	PIXI_MESSAGE_FONT.sizes.body,
+	PIXI_MESSAGE_FONT.sansFamily,
+	PIXI_MESSAGE_FONT.weights.bold,
+);
+const BODY_EM_FONT = `italic ${PIXI_MESSAGE_FONT.sizes.body}px ${PIXI_MESSAGE_FONT.sansFamily}`;
 const SMALL_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.small, PIXI_MESSAGE_FONT.sansFamily);
 const CODE_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.code, PIXI_MESSAGE_FONT.monoFamily);
 const HEADING_FONTS: Record<PixiMessageHeadingLevel, string> = {
@@ -196,10 +215,17 @@ const CODE_PADDING_X = PIXI_MESSAGE_METRICS.codePaddingX;
 const CODE_PADDING_Y = PIXI_MESSAGE_METRICS.codePaddingY;
 const BLOCKQUOTE_INDENT = PIXI_MESSAGE_METRICS.blockquoteIndent;
 const LIST_INDENT = PIXI_MESSAGE_METRICS.listIndent;
+const LIST_DEPTH_INDENT = 16;
+const TABLE_ROW_H = 26;
+const TABLE_MAX_ROWS = 12;
 const MAX_BLOCK_LINES = 120;
 
 const preparedCache = new Map<string, ReturnType<typeof prepareWithSegments>>();
+const itemLayoutCache = new Map<string, CachedItemLayout>();
 const MAX_CACHE = 1200;
+const MAX_ITEM_LAYOUT_CACHE = 800;
+
+type CachedItemLayout = Pick<PixiLaidOutItem, "width" | "height" | "contentWidth" | "blocks">;
 
 function getPrepared(text: string, font: string) {
 	const key = `${font}\u0000${text}`;
@@ -218,6 +244,26 @@ function getPrepared(text: string, font: string) {
 	return prepared;
 }
 
+function getCachedItemLayout(key: string): CachedItemLayout | undefined {
+	const cached = itemLayoutCache.get(key);
+	if (!cached) return undefined;
+	itemLayoutCache.delete(key);
+	itemLayoutCache.set(key, cached);
+	return cached;
+}
+
+function setCachedItemLayout(key: string, layout: CachedItemLayout): void {
+	itemLayoutCache.set(key, layout);
+	if (itemLayoutCache.size > MAX_ITEM_LAYOUT_CACHE) {
+		const first = itemLayoutCache.keys().next().value;
+		if (first !== undefined) itemLayoutCache.delete(first);
+	}
+}
+
+function itemLayoutCacheKey(item: PixiMessageItem, itemWidth: number): string {
+	return `${itemWidth}\u0000${JSON.stringify(item)}`;
+}
+
 function layoutText(text: string, width: number, font = FONT, lineHeight = LINE_H) {
 	const prepared = getPrepared(text || " ", font);
 	const result = layoutWithLines(prepared, Math.max(24, width), lineHeight);
@@ -232,6 +278,103 @@ function layoutText(text: string, width: number, font = FONT, lineHeight = LINE_
 		};
 	}
 	return result;
+}
+
+function hasStyledInlineTokens(tokens: MdInlineToken[] | undefined): boolean {
+	return !!tokens?.some((token) => token.kind !== "text");
+}
+
+function fontForInlineToken(token: MdInlineToken, baseFont: string): string {
+	if (token.kind === "code") return CODE_FONT;
+	if (baseFont === FONT && token.kind === "strong") return BODY_STRONG_FONT;
+	if (baseFont === FONT && token.kind === "em") return BODY_EM_FONT;
+	return baseFont;
+}
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+	if (measureCtx) return measureCtx;
+	if (typeof document === "undefined") return null;
+	const canvas = document.createElement("canvas");
+	measureCtx = canvas.getContext("2d");
+	return measureCtx;
+}
+
+function measureCanvasTextWidth(text: string, font: string): number {
+	const ctx = getMeasureCtx();
+	if (!ctx) return measureNaturalWidth(getPrepared(text || " ", font));
+	ctx.font = font;
+	return ctx.measureText(text).width;
+}
+
+function measureInlineText(text: string, font: string): number {
+	if (font === CODE_FONT) return measureCanvasTextWidth(text, font);
+	return measureNaturalWidth(getPrepared(text || " ", font));
+}
+
+function makeInlineLine(text: string, width: number): LayoutLine {
+	return {
+		text,
+		width,
+		start: { segmentIndex: 0, graphemeIndex: 0 },
+		end: { segmentIndex: 0, graphemeIndex: text.length },
+	};
+}
+
+function layoutInlineText(
+	text: string,
+	tokens: MdInlineToken[] | undefined,
+	width: number,
+	baseFont = FONT,
+	lineHeight = LINE_H,
+) {
+	if (!hasStyledInlineTokens(tokens)) return layoutText(text, width, baseFont, lineHeight);
+
+	const maxWidth = Math.max(24, width);
+	const lines: LayoutLine[] = [];
+	let line = "";
+	let lineWidth = 0;
+	let truncated = false;
+
+	const pushLine = () => {
+		if (lines.length >= MAX_BLOCK_LINES) {
+			truncated = true;
+			return;
+		}
+		lines.push(makeInlineLine(line || " ", lineWidth));
+		line = "";
+		lineWidth = 0;
+	};
+
+	for (const token of tokens ?? [{ kind: "text" as const, text }]) {
+		const font = fontForInlineToken(token, baseFont);
+		for (const char of Array.from(token.text)) {
+			if (truncated) break;
+			if (char === "\n") {
+				pushLine();
+				continue;
+			}
+			const charWidth = measureInlineText(char, font);
+			if (line && lineWidth + charWidth > maxWidth) {
+				pushLine();
+			}
+			line += char;
+			lineWidth += charWidth;
+		}
+		if (truncated) break;
+	}
+	if (!truncated && (line || lines.length === 0)) pushLine();
+	if (truncated && lines.length > 0) {
+		const last = lines[lines.length - 1];
+		lines[lines.length - 1] = makeInlineLine("…", Math.min(last.width, maxWidth));
+	}
+
+	return {
+		lineCount: lines.length,
+		height: Math.max(lineHeight, lines.length * lineHeight),
+		lines,
+	};
 }
 
 function capLines(lines: LayoutLine[], max: number): LayoutLine[] {
@@ -308,6 +451,8 @@ function markdownGapAfter(kind: MdBlock["kind"]): number {
 			return 8;
 		case "hr":
 			return 4;
+		case "table":
+			return 10;
 		default:
 			return 4;
 	}
@@ -330,7 +475,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 			case "heading": {
 				const font = headingFont(block.level);
 				const lineHeight = headingLineHeight(block.level);
-				const result = layoutText(block.text, width, font, lineHeight);
+				const result = layoutInlineText(block.text, block.inlineTokens, width, font, lineHeight);
 				add({
 					kind: block.kind,
 					text: block.text,
@@ -342,11 +487,12 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					font,
 					lineHeight,
 					level: block.level,
+					inlineTokens: block.inlineTokens,
 				});
 				break;
 			}
 			case "paragraph": {
-				const result = layoutText(block.text, width, FONT, LINE_H);
+				const result = layoutInlineText(block.text, block.inlineTokens, width, FONT, LINE_H);
 				add({
 					kind: block.kind,
 					text: block.text,
@@ -357,6 +503,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
+					inlineTokens: block.inlineTokens,
 				});
 				break;
 			}
@@ -379,7 +526,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 			}
 			case "blockquote": {
 				const textWidth = Math.max(24, width - BLOCKQUOTE_INDENT);
-				const result = layoutText(block.text, textWidth, FONT, LINE_H);
+				const result = layoutInlineText(block.text, block.inlineTokens, textWidth, FONT, LINE_H);
 				add({
 					kind: block.kind,
 					text: block.text,
@@ -390,24 +537,50 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
+					inlineTokens: block.inlineTokens,
 				});
 				break;
 			}
 			case "list-item": {
-				const textWidth = Math.max(24, width - LIST_INDENT);
-				const result = layoutText(block.text, textWidth, FONT, LINE_H);
+				const nestedX = Math.min(width - 80, block.depth * LIST_DEPTH_INDENT);
+				const textWidth = Math.max(24, width - nestedX - LIST_INDENT);
+				const result = layoutInlineText(block.text, block.inlineTokens, textWidth, FONT, LINE_H);
 				add({
 					kind: block.kind,
 					text: block.text,
 					lines: result.lines,
-					x: 0,
+					x: nestedX,
 					y,
-					width,
+					width: width - nestedX,
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
+					inlineTokens: block.inlineTokens,
 					ordered: block.ordered,
 					index: block.index,
+					depth: block.depth,
+					checked: block.checked,
+				});
+				break;
+			}
+			case "table": {
+				const columnCount = Math.max(1, block.headers.length);
+				const columnWidth = Math.floor(width / columnCount);
+				const columnWidths = Array.from({ length: columnCount }, (_, index) =>
+					index === columnCount - 1 ? width - columnWidth * (columnCount - 1) : columnWidth,
+				);
+				const rows = block.rows.slice(0, TABLE_MAX_ROWS);
+				add({
+					kind: block.kind,
+					text: "",
+					lines: [],
+					x: 0,
+					y,
+					width,
+					height: (1 + rows.length) * TABLE_ROW_H + 1,
+					font: SMALL_FONT,
+					lineHeight: SMALL_LINE_H,
+					table: { headers: block.headers, rows, columnWidths },
 				});
 				break;
 			}
@@ -709,147 +882,164 @@ function layoutToolUseBlock(
 
 export function clearPixiMessageLayoutCache(): void {
 	preparedCache.clear();
+	itemLayoutCache.clear();
+}
+
+function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): CachedItemLayout {
+	const contentMaxWidth = Math.max(260, viewportWidth - 32);
+	const itemWidth = contentMaxWidth;
+	const cacheKey = itemLayoutCacheKey(item, itemWidth);
+	const cached = getCachedItemLayout(cacheKey);
+	if (cached) return cached;
+
+	const isUser = item.role === "user";
+	const isAssistant = item.role === "assistant";
+	const isToolRun = item.kind === "tool-run";
+	const paddingX = isUser ? USER_PADDING_X : PADDING_X;
+	const paddingY = isUser ? USER_PADDING_Y : PADDING_Y;
+	const innerWidth = Math.max(80, isToolRun ? itemWidth : itemWidth - paddingX * 2);
+	const blocks: PixiLaidOutBlock[] = [];
+
+	if (item.kind === "divider") {
+		const layout = {
+			width: itemWidth,
+			height: 28,
+			contentWidth: innerWidth,
+			blocks,
+		};
+		setCachedItemLayout(cacheKey, layout);
+		return layout;
+	}
+
+	let innerY = isToolRun ? 0 : paddingY;
+	const isPlainAssistant = isAssistant && item.kind !== "tool-run";
+	if (!isPlainAssistant && !isToolRun) {
+		innerY += isUser ? USER_HEADER_H + USER_HEADER_CONTENT_GAP : HEADER_H;
+	}
+	const hasToolSeparators = isToolRun && item.blocks.length >= 2;
+	for (let blockIndex = 0; blockIndex < item.blocks.length; blockIndex++) {
+		const block = item.blocks[blockIndex];
+		const separatorBefore = hasToolSeparators && blockIndex > 0;
+		if (separatorBefore) innerY += TOOL_SEPARATOR_H;
+		const isToolUse = block.type === "tool_use" && !!block.toolName;
+		const labelHeight = block.label && !isToolUse ? SMALL_LINE_H : 0;
+		const blockText = block.text || " ";
+		const shouldRenderMarkdown = isAssistant && block.type === "text";
+		const font = block.type === "bash_command" || block.type === "tool_use" ? CODE_FONT : FONT;
+		const toolLayout = isToolUse ? layoutToolUseBlock(block, innerWidth) : null;
+		const specialLayout = !toolLayout ? layoutSpecialBlock(block, blockText, innerWidth) : null;
+		const mdLayout =
+			!toolLayout && !specialLayout && shouldRenderMarkdown
+				? layoutMarkdownBlocks(blockText, innerWidth)
+				: null;
+		const linesResult =
+			toolLayout || specialLayout || mdLayout
+				? null
+				: layoutText(blockText, innerWidth, font, LINE_H);
+		const textHeight = toolLayout
+			? toolLayout.height
+			: specialLayout
+				? specialLayout.height
+				: mdLayout
+					? mdLayout.height
+					: Math.max(LINE_H, linesResult?.height ?? LINE_H);
+		const height = textHeight + labelHeight;
+		blocks.push({
+			type: block.type,
+			label: block.label,
+			color: block.color,
+			text: blockText,
+			lines: toolLayout?.lines ?? specialLayout?.lines ?? linesResult?.lines ?? [],
+			x: isToolRun ? 0 : paddingX,
+			y: innerY,
+			width: innerWidth,
+			height,
+			separatorBefore,
+			mdBlocks: mdLayout?.mdBlocks,
+			toolName: block.toolName,
+			toolCategory: block.toolCategory,
+			toolSummary: block.toolSummary,
+			toolStatus: block.toolStatus,
+			toolDuration: block.toolDuration,
+			toolStatusColor: block.toolStatusColor,
+			toolCategoryColor: block.toolCategoryColor,
+			toolIsSubagent: block.toolIsSubagent,
+			toolChildCount: block.toolChildCount,
+			toolInRun: block.toolInRun,
+			toolIsLast: block.toolIsLast,
+			toolDefaultOpen: block.toolDefaultOpen,
+			reasoningExpanded: block.reasoningExpanded,
+			reasoningCharCount: block.reasoningCharCount,
+			reasoningEncrypted: block.reasoningEncrypted,
+			reasoningStreaming: block.reasoningStreaming,
+			reasoningLabel: block.reasoningLabel,
+			reasoningCharsLabel: block.reasoningCharsLabel,
+			reasoningThinkingLabel: block.reasoningThinkingLabel,
+			imageSrc: block.imageSrc,
+			imageId: block.imageId,
+			imageUploadNarratorId: block.imageUploadNarratorId,
+			imageFilename: block.imageFilename,
+			imageMediaType: block.imageMediaType,
+			imageSavedPath: block.imageSavedPath,
+			imageAlt: block.imageAlt,
+			imageStatus: block.imageStatus,
+			toolHeader: toolLayout?.toolHeader,
+			toolDetailLines: toolLayout?.toolDetailLines,
+			toolDetailBlocks: toolLayout?.toolDetailBlocks,
+		});
+		innerY += height + (isToolRun ? 0 : BLOCK_GAP);
+	}
+	if (item.blocks.length === 0) innerY += LINE_H;
+	if (item.tokenUsage) {
+		const token = layoutText(item.tokenUsage, innerWidth, SMALL_FONT, SMALL_LINE_H);
+		blocks.push({
+			type: "token_usage",
+			text: item.tokenUsage,
+			lines: token.lines,
+			x: paddingX,
+			y: innerY,
+			width: innerWidth,
+			height: TOKEN_H,
+		});
+		innerY += TOKEN_H;
+	}
+
+	const height = Math.max(MIN_ITEM_H, isToolRun ? innerY : innerY + paddingY - BLOCK_GAP);
+	const layout = {
+		width: itemWidth,
+		height,
+		contentWidth: innerWidth,
+		blocks,
+	};
+	setCachedItemLayout(cacheKey, layout);
+	if (!isAssistant && !isUser) {
+		// no-op; retained to make role-based layout explicit
+	}
+	return layout;
 }
 
 export function layoutPixiMessageItems(
 	items: PixiMessageItem[],
 	viewportWidth: number,
 ): PixiMessageLayoutResult {
-	const contentMaxWidth = Math.max(260, viewportWidth - 32);
 	const laidOut: PixiLaidOutItem[] = [];
 	let y = 12;
 
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
-		const isUser = item.role === "user";
-		const isAssistant = item.role === "assistant";
-		const itemWidth = contentMaxWidth;
-		const x = Math.max(16, (viewportWidth - itemWidth) / 2);
-		const isToolRun = item.kind === "tool-run";
-		const innerWidth = Math.max(80, isToolRun ? itemWidth : itemWidth - PADDING_X * 2);
-		let innerY = isToolRun ? 0 : PADDING_Y;
-		const blocks: PixiLaidOutBlock[] = [];
-
-		if (item.kind === "divider") {
-			laidOut.push({
-				item,
-				index: i,
-				x,
-				y,
-				width: itemWidth,
-				height: 28,
-				contentWidth: innerWidth,
-				blocks,
-			});
-			y += 28 + GAP;
-			continue;
-		}
-
-		const isPlainAssistant = isAssistant && item.kind !== "tool-run";
-		if (!isPlainAssistant && !isToolRun) innerY += HEADER_H;
-		const hasToolSeparators = isToolRun && item.blocks.length >= 2;
-		for (let blockIndex = 0; blockIndex < item.blocks.length; blockIndex++) {
-			const block = item.blocks[blockIndex];
-			const separatorBefore = hasToolSeparators && blockIndex > 0;
-			if (separatorBefore) innerY += TOOL_SEPARATOR_H;
-			const isToolUse = block.type === "tool_use" && !!block.toolName;
-			const labelHeight = block.label && !isToolUse ? SMALL_LINE_H : 0;
-			const blockText = block.text || " ";
-			const shouldRenderMarkdown = isAssistant && block.type === "text";
-			const font = block.type === "bash_command" || block.type === "tool_use" ? CODE_FONT : FONT;
-			const toolLayout = isToolUse ? layoutToolUseBlock(block, innerWidth) : null;
-			const specialLayout = !toolLayout ? layoutSpecialBlock(block, blockText, innerWidth) : null;
-			const mdLayout =
-				!toolLayout && !specialLayout && shouldRenderMarkdown
-					? layoutMarkdownBlocks(blockText, innerWidth)
-					: null;
-			const linesResult =
-				toolLayout || specialLayout || mdLayout
-					? null
-					: layoutText(blockText, innerWidth, font, LINE_H);
-			const textHeight = toolLayout
-				? toolLayout.height
-				: specialLayout
-					? specialLayout.height
-					: mdLayout
-						? mdLayout.height
-						: Math.max(LINE_H, linesResult?.height ?? LINE_H);
-			const height = textHeight + labelHeight;
-			blocks.push({
-				type: block.type,
-				label: block.label,
-				color: block.color,
-				text: blockText,
-				lines: toolLayout?.lines ?? specialLayout?.lines ?? linesResult?.lines ?? [],
-				x: isToolRun ? 0 : PADDING_X,
-				y: innerY,
-				width: innerWidth,
-				height,
-				separatorBefore,
-				mdBlocks: mdLayout?.mdBlocks,
-				toolName: block.toolName,
-				toolCategory: block.toolCategory,
-				toolSummary: block.toolSummary,
-				toolStatus: block.toolStatus,
-				toolDuration: block.toolDuration,
-				toolStatusColor: block.toolStatusColor,
-				toolCategoryColor: block.toolCategoryColor,
-				toolIsSubagent: block.toolIsSubagent,
-				toolChildCount: block.toolChildCount,
-				toolInRun: block.toolInRun,
-				toolIsLast: block.toolIsLast,
-				toolDefaultOpen: block.toolDefaultOpen,
-				reasoningExpanded: block.reasoningExpanded,
-				reasoningCharCount: block.reasoningCharCount,
-				reasoningEncrypted: block.reasoningEncrypted,
-				reasoningStreaming: block.reasoningStreaming,
-				reasoningLabel: block.reasoningLabel,
-				reasoningCharsLabel: block.reasoningCharsLabel,
-				reasoningThinkingLabel: block.reasoningThinkingLabel,
-				imageSrc: block.imageSrc,
-				imageId: block.imageId,
-				imageUploadNarratorId: block.imageUploadNarratorId,
-				imageFilename: block.imageFilename,
-				imageMediaType: block.imageMediaType,
-				imageSavedPath: block.imageSavedPath,
-				imageAlt: block.imageAlt,
-				imageStatus: block.imageStatus,
-				toolHeader: toolLayout?.toolHeader,
-				toolDetailLines: toolLayout?.toolDetailLines,
-				toolDetailBlocks: toolLayout?.toolDetailBlocks,
-			});
-			innerY += height + (isToolRun ? 0 : BLOCK_GAP);
-		}
-		if (item.blocks.length === 0) innerY += LINE_H;
-		if (item.tokenUsage) {
-			const token = layoutText(item.tokenUsage, innerWidth, SMALL_FONT, SMALL_LINE_H);
-			blocks.push({
-				type: "token_usage",
-				text: item.tokenUsage,
-				lines: token.lines,
-				x: PADDING_X,
-				y: innerY,
-				width: innerWidth,
-				height: TOKEN_H,
-			});
-			innerY += TOKEN_H;
-		}
-
-		const height = Math.max(MIN_ITEM_H, isToolRun ? innerY : innerY + PADDING_Y - BLOCK_GAP);
+		const cached = layoutPixiMessageItem(item, viewportWidth);
+		const x = Math.max(16, (viewportWidth - cached.width) / 2);
 		laidOut.push({
 			item,
 			index: i,
 			x,
 			y,
-			width: itemWidth,
-			height,
-			contentWidth: innerWidth,
-			blocks,
+			width: cached.width,
+			height: cached.height,
+			contentWidth: cached.contentWidth,
+			blocks: cached.blocks,
 		});
-		y += height + GAP;
-		if (!isAssistant && !isUser) {
-			// no-op; retained to make role-based layout explicit
-		}
+		y += cached.height + GAP;
 	}
 
 	return { items: laidOut, totalHeight: Math.max(0, y) };

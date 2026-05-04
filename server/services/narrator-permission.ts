@@ -2370,15 +2370,24 @@ export interface ResolvePermissionOpts {
 	compactAfter?: boolean;
 	updatedPlan?: string;
 	userId?: string;
+	decidedBy?: "user" | "auto";
 }
 
-/** Called from WebSocket when user makes a permission decision */
+/** Called when a pending permission receives a user or automatic decision. */
 export async function resolvePermission(
 	requestId: string,
 	decision: "allow" | "deny",
 	opts: ResolvePermissionOpts = {},
 ): Promise<boolean> {
-	const { denyMessage, answers, feedbackText, compactAfter, updatedPlan, userId } = opts;
+	const {
+		denyMessage,
+		answers,
+		feedbackText,
+		compactAfter,
+		updatedPlan,
+		userId,
+		decidedBy = "user",
+	} = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
 		logger.warn("Permission resolution for unknown request", {
@@ -2428,15 +2437,22 @@ export async function resolvePermission(
 		}
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
+		const yoloAutoDenyReason =
+			decision === "deny" && yoloPause && decidedBy === "auto"
+				? `YOLO safety pause cancelled: ${effectiveDenyMessage || "permission denied"}`
+				: undefined;
 		await db
 			.update(narratorToolCalls)
 			.set({
 				status: decision === "allow" ? "running" : "fail",
-				permissionDecidedBy: "user",
+				permissionDecidedBy: decidedBy,
 				permissionDecidedAt: now,
 				permissionDenyMessage: effectiveDenyMessage ?? null,
 				...(decision === "deny"
-					? { errorMessage: effectiveDenyMessage || "Permission denied by user" }
+					? {
+							errorMessage: effectiveDenyMessage || "Permission denied by user",
+							...(yoloAutoDenyReason ? { permissionDecisionReason: yoloAutoDenyReason } : {}),
+						}
 					: {}),
 			})
 			.where(eq(narratorToolCalls.id, requestId));
@@ -2543,7 +2559,7 @@ export async function resolvePermission(
 export async function confirmYoloPause(requestId: string, _reflection?: string): Promise<boolean> {
 	const pause = pendingYoloPauses.get(requestId);
 	if (!pause) return false;
-	return resolvePermission(requestId, "allow");
+	return resolvePermission(requestId, "allow", { decidedBy: "auto" });
 }
 
 export async function cancelYoloPause(requestId: string, reason?: string): Promise<boolean> {
@@ -2554,6 +2570,7 @@ export async function cancelYoloPause(requestId: string, reason?: string): Promi
 	if (!pendingYoloPauses.has(requestId) && !pendingPermissions.has(requestId)) return false;
 	return resolvePermission(requestId, "deny", {
 		denyMessage: reason?.trim() || "YOLO safety pause cancelled by reflection loop",
+		decidedBy: "auto",
 	});
 }
 

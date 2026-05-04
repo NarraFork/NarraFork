@@ -73,7 +73,15 @@ import {
 } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	startTransition,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
@@ -2836,6 +2844,55 @@ export function NarratorPanel({
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [messageRendererMode, setMessageRendererMode] = useNarratorMessageRendererMode();
 	const usePixiRenderer = messageRendererMode === "pixi" && !isWorkspacePreview;
+	const rendererScrollSnapshotRef = useRef<{
+		mode: typeof messageRendererMode;
+		distanceFromBottom: number;
+		ratio: number;
+		atBottom: boolean;
+	} | null>(null);
+	const captureRendererScrollSnapshot = useCallback(() => {
+		const vp = viewportRef.current;
+		if (!vp) return;
+		const maxScrollTop = getMessageViewportScrollBottom(vp);
+		const distanceFromBottom = Math.max(0, maxScrollTop - vp.scrollTop);
+		rendererScrollSnapshotRef.current = {
+			mode: messageRendererMode,
+			distanceFromBottom,
+			ratio: maxScrollTop > 0 ? vp.scrollTop / maxScrollTop : 1,
+			atBottom: distanceFromBottom < 30,
+		};
+	}, [messageRendererMode]);
+
+	useLayoutEffect(() => {
+		const snapshot = rendererScrollSnapshotRef.current;
+		if (!snapshot || snapshot.mode === messageRendererMode) return;
+		let cancelled = false;
+		const restore = () => {
+			if (cancelled) return;
+			const vp = viewportRef.current;
+			if (!vp) {
+				requestAnimationFrame(restore);
+				return;
+			}
+			const maxScrollTop = getMessageViewportScrollBottom(vp);
+			const target = snapshot.atBottom
+				? maxScrollTop
+				: Math.min(maxScrollTop, Math.max(0, maxScrollTop - snapshot.distanceFromBottom));
+			const fallbackTarget = Math.min(maxScrollTop, Math.max(0, maxScrollTop * snapshot.ratio));
+			programmaticScrollRef.current = true;
+			vp.scrollTop = Number.isFinite(target) ? target : fallbackTarget;
+			if (virtualListRef.current?.scrollToOffset) {
+				virtualListRef.current.scrollToOffset(vp.scrollTop);
+			}
+			isAtBottomRef.current = snapshot.atBottom;
+			setIsAtBottom(snapshot.atBottom);
+			rendererScrollSnapshotRef.current = null;
+		};
+		requestAnimationFrame(() => requestAnimationFrame(restore));
+		return () => {
+			cancelled = true;
+		};
+	}, [messageRendererMode]);
 	const suppressBlurIn =
 		!advancedAnim ||
 		isResizing ||
@@ -4639,7 +4696,10 @@ export function NarratorPanel({
 										size="sm"
 										variant={usePixiRenderer ? "light" : "subtle"}
 										color={usePixiRenderer ? "indigo" : "gray"}
-										onClick={() => setMessageRendererMode(usePixiRenderer ? "react" : "pixi")}
+										onClick={() => {
+											captureRendererScrollSnapshot();
+											setMessageRendererMode(usePixiRenderer ? "react" : "pixi");
+										}}
 									>
 										<IconPhoto size={16} />
 									</ActionIcon>

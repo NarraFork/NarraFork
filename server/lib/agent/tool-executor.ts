@@ -148,7 +148,10 @@ export async function executeTool(
 		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId));
 	if (permission.behavior === "yoloPause") {
 		return {
-			output: permission.message,
+			// A YOLO pause is not a result for the original tool call: the tool has not
+			// executed yet, and permission may still be denied. Keep the warning only in
+			// yoloPause metadata so callers cannot accidentally persist it as tool output.
+			output: "",
 			isError: false,
 			durationMs: 0,
 			permissionStartedAt,

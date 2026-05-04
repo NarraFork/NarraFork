@@ -5,6 +5,7 @@ export interface PixiMessageTheme {
 	text: number;
 	dimmed: number;
 	userBg: number;
+	userBgAlpha: number;
 	userBorder: number;
 	assistantBg: number;
 	assistantBorder: number;
@@ -28,22 +29,26 @@ export interface PixiMessageTheme {
 	gray: number;
 }
 
-function cssColorToHex(css: string): number {
-	if (!cssColorToHex._ctx) {
+function cssColorToRgba(css: string): { hex: number; alpha: number } {
+	if (!cssColorToRgba._ctx) {
 		const c = document.createElement("canvas");
 		c.width = 1;
 		c.height = 1;
-		cssColorToHex._ctx = c.getContext("2d", { willReadFrequently: true });
+		cssColorToRgba._ctx = c.getContext("2d", { willReadFrequently: true });
 	}
-	const ctx = cssColorToHex._ctx;
-	if (!ctx) return 0xffffff;
+	const ctx = cssColorToRgba._ctx;
+	if (!ctx) return { hex: 0xffffff, alpha: 1 };
 	ctx.clearRect(0, 0, 1, 1);
 	ctx.fillStyle = css.trim();
 	ctx.fillRect(0, 0, 1, 1);
-	const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
-	return (r << 16) | (g << 8) | b;
+	const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+	return { hex: (r << 16) | (g << 8) | b, alpha: a / 255 };
 }
-cssColorToHex._ctx = null as CanvasRenderingContext2D | null;
+cssColorToRgba._ctx = null as CanvasRenderingContext2D | null;
+
+function cssColorToHex(css: string): number {
+	return cssColorToRgba(css).hex;
+}
 
 function getVar(name: string): string {
 	return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -52,6 +57,14 @@ function getVar(name: string): string {
 function varToHex(name: string, fallback: number): number {
 	const val = getVar(name);
 	return val ? cssColorToHex(val) : fallback;
+}
+
+function varToRgba(
+	name: string,
+	fallback: { hex: number; alpha: number },
+): { hex: number; alpha: number } {
+	const val = getVar(name);
+	return val ? cssColorToRgba(val) : fallback;
 }
 
 function isOledEnabled(): boolean {
@@ -69,6 +82,11 @@ export function resolvePixiMessageTheme(): PixiMessageTheme {
 	const dark = scheme === "dark";
 	const oled = isOledEnabled();
 	if (cached && cached.scheme === scheme && cached.oled === oled) return cached.theme;
+
+	const userBg = varToRgba("--mantine-color-indigo-light", {
+		hex: dark ? 0x2b2d42 : 0xe7f0ff,
+		alpha: 1,
+	});
 
 	let theme: PixiMessageTheme = {
 		bodyBg: varToHex(
@@ -88,7 +106,8 @@ export function resolvePixiMessageTheme(): PixiMessageTheme {
 			dark ? 0xc1c2c5 : 0x212529,
 		),
 		dimmed: varToHex("--mantine-color-dimmed", 0x909296),
-		userBg: varToHex("--mantine-color-indigo-light", dark ? 0x2b2d42 : 0xe7f0ff),
+		userBg: userBg.hex,
+		userBgAlpha: userBg.alpha,
 		userBorder: varToHex("--mantine-color-indigo-5", 0x5c7cfa),
 		assistantBg: varToHex(
 			dark ? "--mantine-color-dark-7" : "--mantine-color-white",

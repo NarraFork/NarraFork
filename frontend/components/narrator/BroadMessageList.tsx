@@ -32,6 +32,8 @@ export interface BroadMessageListHandle {
 	getTotalSize: () => number;
 	/** Find the index of an element by its key */
 	findIndexByKey: (key: string) => number;
+	/** Scroll to a raw scrollTop offset */
+	scrollToOffset: (offset: number) => void;
 	/** Get current scroll offset */
 	readonly scrollOffset: number;
 	/** Get current viewport size */
@@ -173,6 +175,10 @@ export const BroadMessageList = forwardRef<BroadMessageListHandle, BroadMessageL
 				getTotalSize: () => {
 					const el = listRef.current?.scrollViewRef?.current;
 					return el?.scrollHeight ?? 0;
+				},
+				scrollToOffset: (offset) => {
+					const el = listRef.current?.scrollViewRef?.current;
+					if (el) el.scrollTop = offset;
 				},
 				findIndexByKey: (key: string) => {
 					return elementKeys.indexOf(key);

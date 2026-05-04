@@ -7,6 +7,7 @@ import {
 	getPixiUploadImageTexture,
 	type PixiImageTextureResult,
 } from "./pixi-image-textures";
+import type { MdInlineToken } from "./pixi-markdown";
 import { PIXI_MESSAGE_FONT, PIXI_MESSAGE_METRICS, pixiCssFont } from "./pixi-message-constants";
 import type {
 	PixiLaidOutBlock,
@@ -35,6 +36,24 @@ const SUBTITLE_STYLE = new TextStyle({
 const BODY_STYLE = new TextStyle({
 	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
 	fontSize: PIXI_MESSAGE_FONT.sizes.body,
+});
+const BODY_STRONG_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.body,
+	fontWeight: PIXI_MESSAGE_FONT.weights.bold,
+});
+const BODY_EM_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.body,
+	fontStyle: "italic",
+});
+const BODY_STRIKE_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.body,
+});
+const INLINE_CODE_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.code,
 });
 const MONO_STYLE = new TextStyle({
 	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
@@ -137,12 +156,14 @@ function drawRoundRect(
 	h: number,
 	r: number,
 	fill: number,
-	stroke: number,
+	stroke: number | null,
 	alpha = 1,
 ) {
 	gfx.roundRect(x, y, w, h, r);
 	gfx.fill({ color: fill, alpha });
-	gfx.stroke({ color: stroke, alpha: 0.9, width: 1 });
+	if (stroke !== null) {
+		gfx.stroke({ color: stroke, alpha: 0.9, width: 1 });
+	}
 }
 
 export class ImageSpritePool {
@@ -319,17 +340,206 @@ function styleForHeading(level?: number): TextStyle {
 	}
 }
 
-function drawMarkdownTextLines(
+function splitInlineTokensByPretextLines(
+	tokens: MdInlineToken[] | undefined,
+	visualLines: Array<{ text: string }>,
+): MdInlineToken[][] | null {
+	if (!tokens?.length) return null;
+	const result: MdInlineToken[][] = [];
+	let tokenIndex = 0;
+	let tokenOffset = 0;
+
+	const peekChar = () => tokens[tokenIndex]?.text[tokenOffset];
+	const consumeChars = (count: number): MdInlineToken[] => {
+		const chunks: MdInlineToken[] = [];
+		let remaining = count;
+		while (remaining > 0 && tokenIndex < tokens.length) {
+			const token = tokens[tokenIndex];
+			const available = token.text.length - tokenOffset;
+			const take = Math.min(remaining, available);
+			const text = token.text.slice(tokenOffset, tokenOffset + take);
+			if (text) chunks.push({ ...token, text });
+			tokenOffset += take;
+			remaining -= take;
+			if (tokenOffset >= token.text.length) {
+				tokenIndex++;
+				tokenOffset = 0;
+			}
+		}
+		return chunks;
+	};
+
+	for (const visualLine of visualLines) {
+		while (peekChar() === "\n") consumeChars(1);
+		result.push(consumeChars(visualLine.text.length));
+	}
+	return result;
+}
+
+function inlineStyleForToken(token: MdInlineToken, baseStyle: TextStyle): TextStyle {
+	if (token.kind === "code") return INLINE_CODE_STYLE;
+	if (token.kind === "strong" && baseStyle === BODY_STYLE) return BODY_STRONG_STYLE;
+	if (token.kind === "em" && baseStyle === BODY_STYLE) return BODY_EM_STYLE;
+	if (token.kind === "delete") return BODY_STRIKE_STYLE;
+	return baseStyle;
+}
+
+function inlineColorForToken(
+	token: MdInlineToken,
+	theme: PixiMessageTheme,
+	baseColor: number,
+): number {
+	if (token.kind === "link") return theme.blue;
+	if (token.kind === "code") return theme.text;
+	if (token.kind === "delete") return theme.dimmed;
+	return baseColor;
+}
+
+function drawInlineMarkdownTextLines(
 	textPool: TextPool,
+	gfx: Graphics,
+	theme: PixiMessageTheme,
 	mdBlock: PixiLaidOutMarkdownBlock,
 	x: number,
 	y: number,
 	style: TextStyle,
 	color: number,
 ) {
+	const tokenLines = splitInlineTokensByPretextLines(mdBlock.inlineTokens, mdBlock.lines);
 	for (let i = 0; i < mdBlock.lines.length; i++) {
-		textPool.acquire(mdBlock.lines[i].text, x, y + i * mdBlock.lineHeight, style, color);
+		const lineY = y + i * mdBlock.lineHeight;
+		const lineTokens = tokenLines?.[i];
+		if (!lineTokens?.length) {
+			textPool.acquire(mdBlock.lines[i].text, x, lineY, style, color);
+			continue;
+		}
+		let tokenX = x;
+		for (const token of lineTokens) {
+			if (!token.text) continue;
+			const tokenStyle = inlineStyleForToken(token, style);
+			const tokenColor = inlineColorForToken(token, theme, color);
+			const advance =
+				token.kind === "code"
+					? measureMonoAdvance(token.text, tokenStyle)
+					: textWidth(token.text, tokenStyle);
+			if (token.kind === "code") {
+				gfx.roundRect(tokenX - 3, lineY + 1, advance + 6, Math.max(14, mdBlock.lineHeight - 4), 4);
+				gfx.fill({ color: theme.toolBg, alpha: 0.9 });
+				gfx.stroke({ color: theme.toolBorder, alpha: 0.42, width: 1 });
+			}
+			textPool.acquire(token.text, tokenX, lineY, tokenStyle, tokenColor);
+			if (token.kind === "link") {
+				const underlineY = lineY + mdBlock.lineHeight - 4;
+				gfx.moveTo(tokenX, underlineY);
+				gfx.lineTo(tokenX + advance, underlineY);
+				gfx.stroke({ color: tokenColor, alpha: 0.55, width: 1 });
+			} else if (token.kind === "delete") {
+				const strikeY = lineY + mdBlock.lineHeight / 2;
+				gfx.moveTo(tokenX, strikeY);
+				gfx.lineTo(tokenX + advance, strikeY);
+				gfx.stroke({ color: tokenColor, alpha: 0.7, width: 1 });
+			}
+			tokenX += advance;
+		}
 	}
+}
+
+function drawMarkdownTextLines(
+	textPool: TextPool,
+	gfx: Graphics,
+	theme: PixiMessageTheme,
+	mdBlock: PixiLaidOutMarkdownBlock,
+	x: number,
+	y: number,
+	style: TextStyle,
+	color: number,
+) {
+	drawInlineMarkdownTextLines(textPool, gfx, theme, mdBlock, x, y, style, color);
+}
+
+function drawMarkdownCodeBlock(
+	textPool: TextPool,
+	theme: PixiMessageTheme,
+	mdBlock: PixiLaidOutMarkdownBlock,
+	x: number,
+	y: number,
+): void {
+	const highlighted = getPixiHighlightedTokens(mdBlock.text || " ", mdBlock.lang, shikiThemeName());
+	const highlightedVisualLines = splitTokensByPretextLines(highlighted, mdBlock.lines);
+	for (let i = 0; i < mdBlock.lines.length; i++) {
+		drawTokenLine(
+			textPool,
+			mdBlock.lines[i].text || " ",
+			highlightedVisualLines?.[i],
+			x + CODE_PADDING_X,
+			y + CODE_PADDING_Y + i * CODE_LINE_H,
+			theme.text,
+		);
+	}
+}
+
+function truncateCell(text: string, maxChars: number): string {
+	const singleLine = text.replace(/\s+/g, " ").trim();
+	return singleLine.length > maxChars
+		? `${singleLine.slice(0, Math.max(1, maxChars - 1))}…`
+		: singleLine;
+}
+
+function drawMarkdownTable(
+	textPool: TextPool,
+	gfx: Graphics,
+	theme: PixiMessageTheme,
+	mdBlock: PixiLaidOutMarkdownBlock,
+	x: number,
+	y: number,
+): void {
+	if (!mdBlock.table) return;
+	const rowH = 26;
+	const cellPadX = 8;
+	const headers = mdBlock.table.headers;
+	const rows = mdBlock.table.rows;
+	const columnWidths = mdBlock.table.columnWidths;
+
+	gfx.roundRect(x, y, mdBlock.width, mdBlock.height, 6);
+	gfx.fill({ color: theme.panelBg, alpha: 0.42 });
+	gfx.stroke({ color: theme.toolBorder, alpha: 0.58, width: 1 });
+	gfx.rect(x, y, mdBlock.width, rowH);
+	gfx.fill({ color: theme.toolBg, alpha: 0.82 });
+
+	const drawRow = (cells: string[], rowIndex: number, header = false) => {
+		const rowY = y + rowIndex * rowH;
+		if (!header && rowIndex % 2 === 0) {
+			gfx.rect(x + 1, rowY, mdBlock.width - 2, rowH);
+			gfx.fill({ color: theme.toolBg, alpha: 0.22 });
+		}
+		let cellX = x;
+		for (let i = 0; i < columnWidths.length; i++) {
+			const cellW = columnWidths[i];
+			if (i > 0) {
+				gfx.moveTo(cellX, rowY);
+				gfx.lineTo(cellX, rowY + rowH);
+				gfx.stroke({ color: theme.toolBorder, alpha: 0.35, width: 1 });
+			}
+			const text = truncateCell(
+				cells[i] ?? "",
+				Math.max(4, Math.floor((cellW - cellPadX * 2) / 7)),
+			);
+			textPool.acquire(
+				text,
+				cellX + cellPadX,
+				rowY + 5,
+				header ? TOOL_NAME_STYLE : SMALL_STYLE,
+				header ? theme.text : theme.dimmed,
+			);
+			cellX += cellW;
+		}
+		gfx.moveTo(x, rowY + rowH);
+		gfx.lineTo(x + mdBlock.width, rowY + rowH);
+		gfx.stroke({ color: theme.toolBorder, alpha: 0.35, width: 1 });
+	};
+
+	drawRow(headers, 0, true);
+	for (let i = 0; i < rows.length; i++) drawRow(rows[i], i + 1);
 }
 
 function drawMarkdownBlock(
@@ -344,36 +554,86 @@ function drawMarkdownBlock(
 	const y = blockY + mdBlock.y;
 
 	switch (mdBlock.kind) {
-		case "heading":
-			drawMarkdownTextLines(textPool, mdBlock, x, y, styleForHeading(mdBlock.level), theme.text);
+		case "heading": {
+			if ((mdBlock.level ?? 6) <= 2) {
+				gfx.roundRect(x, y + 4, 3, Math.max(12, mdBlock.height - 8), 2);
+				gfx.fill({ color: theme.accent, alpha: 0.85 });
+				drawMarkdownTextLines(
+					textPool,
+					gfx,
+					theme,
+					mdBlock,
+					x + 10,
+					y,
+					styleForHeading(mdBlock.level),
+					theme.text,
+				);
+			} else {
+				drawMarkdownTextLines(
+					textPool,
+					gfx,
+					theme,
+					mdBlock,
+					x,
+					y,
+					styleForHeading(mdBlock.level),
+					theme.text,
+				);
+			}
 			break;
+		}
 		case "paragraph":
-			drawMarkdownTextLines(textPool, mdBlock, x, y, BODY_STYLE, theme.text);
+			drawMarkdownTextLines(textPool, gfx, theme, mdBlock, x, y, BODY_STYLE, theme.text);
 			break;
 		case "code":
 			gfx.roundRect(x, y, mdBlock.width, mdBlock.height, 6);
 			gfx.fill({ color: theme.toolBg, alpha: 0.88 });
 			gfx.stroke({ color: theme.toolBorder, alpha: 0.58, width: 1 });
-			drawMarkdownTextLines(
-				textPool,
-				mdBlock,
-				x + CODE_PADDING_X,
-				y + CODE_PADDING_Y,
-				MONO_STYLE,
-				theme.text,
-			);
+			drawMarkdownCodeBlock(textPool, theme, mdBlock, x, y);
 			break;
 		case "blockquote":
 			gfx.roundRect(x, y + 1, 3, Math.max(1, mdBlock.height - 2), 2);
 			gfx.fill({ color: theme.dimmed, alpha: 0.72 });
-			drawMarkdownTextLines(textPool, mdBlock, x + BLOCKQUOTE_INDENT, y, BODY_STYLE, theme.dimmed);
+			drawMarkdownTextLines(
+				textPool,
+				gfx,
+				theme,
+				mdBlock,
+				x + BLOCKQUOTE_INDENT,
+				y,
+				BODY_STYLE,
+				theme.dimmed,
+			);
 			break;
 		case "list-item": {
 			const marker = mdBlock.ordered ? `${mdBlock.index ?? 1}.` : "•";
-			textPool.acquire(marker, x, y, BODY_STYLE, theme.dimmed);
-			drawMarkdownTextLines(textPool, mdBlock, x + LIST_INDENT, y, BODY_STYLE, theme.text);
+			if (mdBlock.checked !== undefined) {
+				gfx.roundRect(x + 1, y + 4, 12, 12, 3);
+				gfx.stroke({ color: mdBlock.checked ? theme.green : theme.dimmed, alpha: 0.75, width: 1 });
+				if (mdBlock.checked) {
+					gfx.moveTo(x + 4, y + 10);
+					gfx.lineTo(x + 7, y + 13);
+					gfx.lineTo(x + 13, y + 6);
+					gfx.stroke({ color: theme.green, alpha: 0.95, width: 1.5 });
+				}
+			} else {
+				textPool.acquire(marker, x, y, BODY_STYLE, theme.dimmed);
+			}
+			drawMarkdownTextLines(
+				textPool,
+				gfx,
+				theme,
+				mdBlock,
+				x + LIST_INDENT,
+				y,
+				BODY_STYLE,
+				theme.text,
+			);
 			break;
 		}
+		case "table":
+			drawMarkdownTable(textPool, gfx, theme, mdBlock, x, y);
+			break;
 		case "hr": {
 			const lineY = y + 8;
 			gfx.moveTo(x, lineY);
@@ -438,8 +698,9 @@ function measureMonoAdvance(text: string, style: TextStyle): number {
 function textWidth(text: string, style: TextStyle): number {
 	const fontSize = typeof style.fontSize === "number" ? style.fontSize : 12;
 	const family = Array.isArray(style.fontFamily) ? style.fontFamily[0] : style.fontFamily;
+	const fontStyle = style.fontStyle ? `${style.fontStyle} ` : "";
 	const fontWeight = style.fontWeight ? `${style.fontWeight} ` : "";
-	return measureTextWidth(text, `${fontWeight}${fontSize}px ${family ?? "sans-serif"}`);
+	return measureTextWidth(text, `${fontStyle}${fontWeight}${fontSize}px ${family ?? "sans-serif"}`);
 }
 
 function centeredTextX(text: string, x: number, width: number, style: TextStyle): number {
@@ -774,6 +1035,12 @@ function shikiThemeName(): string {
 		: "github-dark-default";
 }
 
+const splitTokenLineCache = new WeakMap<
+	PixiHighlightToken[][],
+	Map<string, PixiHighlightToken[][]>
+>();
+const MAX_SPLIT_TOKEN_LINE_CACHE = 80;
+
 function flattenHighlightedTokens(lines: PixiHighlightToken[][]): PixiHighlightToken[] {
 	const out: PixiHighlightToken[] = [];
 	for (let i = 0; i < lines.length; i++) {
@@ -781,6 +1048,10 @@ function flattenHighlightedTokens(lines: PixiHighlightToken[][]): PixiHighlightT
 		out.push(...lines[i]);
 	}
 	return out;
+}
+
+function visualLinesCacheKey(visualLines: Array<{ text: string }>): string {
+	return visualLines.map((line) => line.text).join("\u0000");
 }
 
 function tokenTextLength(tokens: PixiHighlightToken[]): number {
@@ -794,6 +1065,11 @@ function splitTokensByPretextLines(
 	visualLines: Array<{ text: string }>,
 ): PixiHighlightToken[][] | null {
 	if (!highlighted) return null;
+	const cacheKey = visualLinesCacheKey(visualLines);
+	const tokenCache = splitTokenLineCache.get(highlighted);
+	const cached = tokenCache?.get(cacheKey);
+	if (cached) return cached;
+
 	const tokens = flattenHighlightedTokens(highlighted);
 	const result: PixiHighlightToken[][] = [];
 	let tokenIndex = 0;
@@ -827,6 +1103,17 @@ function splitTokensByPretextLines(
 		const wanted = visualLine.text.length;
 		const chunks = consumeChars(wanted);
 		result.push(tokenTextLength(chunks) === wanted ? chunks : []);
+	}
+
+	let nextTokenCache = tokenCache;
+	if (!nextTokenCache) {
+		nextTokenCache = new Map<string, PixiHighlightToken[][]>();
+		splitTokenLineCache.set(highlighted, nextTokenCache);
+	}
+	nextTokenCache.set(cacheKey, result);
+	if (nextTokenCache.size > MAX_SPLIT_TOKEN_LINE_CACHE) {
+		const first = nextTokenCache.keys().next().value;
+		if (first !== undefined) nextTokenCache.delete(first);
 	}
 	return result;
 }
@@ -1229,6 +1516,18 @@ function drawSpecialBlock(opts: DrawSpecialBlockOptions): boolean {
 	}
 }
 
+function firstVisibleItemIndex(items: PixiLaidOutItem[], minY: number): number {
+	let lo = 0;
+	let hi = items.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >> 1;
+		const item = items[mid];
+		if (item.y + item.height < minY) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo;
+}
+
 export function drawPixiMessages(opts: {
 	textPool: TextPool;
 	iconPool: IconSpritePool;
@@ -1257,8 +1556,9 @@ export function drawPixiMessages(opts: {
 	const minY = scrollTop - bufferPx;
 	const maxY = scrollTop + viewportHeight + bufferPx;
 
-	for (const laid of items) {
-		if (laid.y + laid.height < minY || laid.y > maxY) continue;
+	for (let itemIndex = firstVisibleItemIndex(items, minY); itemIndex < items.length; itemIndex++) {
+		const laid = items[itemIndex];
+		if (laid.y > maxY) break;
 		const y = laid.y - scrollTop;
 		const item = laid.item;
 		if (item.kind === "divider") {
@@ -1302,7 +1602,17 @@ export function drawPixiMessages(opts: {
 					? theme.systemBorder
 					: theme.assistantBorder;
 		if (hasBubble) {
-			drawRoundRect(gfx, laid.x, y, laid.width, laid.height, 8, bg, border, isUser ? 0.95 : 0.82);
+			drawRoundRect(
+				gfx,
+				laid.x,
+				y,
+				laid.width,
+				laid.height,
+				8,
+				bg,
+				isUser ? null : border,
+				isUser ? theme.userBgAlpha : 0.82,
+			);
 		} else if (isMultiToolRun) {
 			drawRoundRect(
 				gfx,
@@ -1322,21 +1632,28 @@ export function drawPixiMessages(opts: {
 		}
 
 		if (!isPlainAssistant && !isTool) {
+			const headerX = isUser ? laid.x + 12 : laid.x + 16;
+			const headerY = y + 12;
+			const titleX = isUser ? headerX + 26 : headerX;
 			if (isUser) {
-				drawUserAvatar(textPool, imagePool, gfx, theme, item, laid.x + 16, y + 8);
+				drawUserAvatar(textPool, imagePool, gfx, theme, item, headerX, headerY);
 			}
 			textPool.acquire(
 				item.title,
-				isUser ? laid.x + 44 : laid.x + 16,
-				y + 10,
+				titleX,
+				headerY + 2,
 				TITLE_STYLE,
 				isUser ? theme.indigo : theme.text,
 			);
 			if (item.subtitle) {
+				const subtitleText = item.subtitle;
+				const subtitleWidth = measureNaturalWidth(
+					prepareWithSegments(subtitleText, DIVIDER_FONT, { whiteSpace: "pre-wrap" }),
+				);
 				const subtitle = textPool.acquire(
-					item.subtitle,
-					laid.x + laid.width - 134,
-					y + 10,
+					subtitleText,
+					laid.x + laid.width - subtitleWidth - 12,
+					headerY + 2,
 					SUBTITLE_STYLE,
 					theme.dimmed,
 				);
