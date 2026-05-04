@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import {
@@ -23,6 +24,8 @@ import { ApiRequestDumpCollector } from "./request-dump";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
+import { findReplaceMatch } from "./tools/edit";
+import { readFileText } from "./tools/encoding";
 import { YOLO_REFLECTION_TOOLS } from "./tools/yolo-pause";
 import type {
 	AgentConfig,
@@ -75,9 +78,10 @@ interface ExtractedFieldsResult {
 }
 
 /**
- * Extract all string fields from an incomplete JSON object.
- * Scans for `"key": "value"` patterns, handling escaped quotes correctly.
- * Returns completed fields and identifies the currently-streaming field.
+ * Extract selected fields from an incomplete JSON object.
+ * Scans for `"key": "value"` patterns, handling escaped quotes correctly, and also
+ * captures completed primitive values such as booleans for short fields.
+ * Returns completed fields and identifies the currently-streaming string field.
  */
 function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): ExtractedFieldsResult {
 	const fields: Record<string, string> = {};
@@ -91,8 +95,17 @@ function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): Extrac
 		const key = m[1];
 		if (!wantedKeys.has(key)) continue;
 		const afterColon = m.index + m[0].length;
-		// Expect a string value starting with "
-		if (afterColon >= raw.length || raw.charCodeAt(afterColon) !== 0x22 /* " */) continue;
+		if (afterColon >= raw.length) continue;
+		if (raw.charCodeAt(afterColon) !== 0x22 /* " */) {
+			const primitiveMatch = raw
+				.slice(afterColon)
+				.match(/^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/);
+			if (primitiveMatch) {
+				fields[key] = primitiveMatch[1];
+				keyRe.lastIndex = afterColon + primitiveMatch[0].length;
+			}
+			continue;
+		}
 		const valueStart = afterColon + 1;
 		const closeQuote = findClosingQuote(raw, valueStart);
 		if (closeQuote !== -1) {
@@ -112,7 +125,7 @@ function extractJsonFields(raw: string, wantedKeys: ReadonlySet<string>): Extrac
 /** Per-tool mapping: which fields to extract, and which are "large" (streamed incrementally) */
 const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = {
 	Write: { short: ["file_path"], large: ["content"] },
-	Edit: { short: ["file_path"], large: ["old_string", "new_string"] },
+	Edit: { short: ["file_path", "replace_all"], large: ["old_string", "new_string"] },
 	Bash: { short: ["description"], large: ["command"] },
 	Grep: { short: ["pattern", "path", "glob", "output_mode", "type"], large: [] },
 	Glob: { short: ["pattern", "path"], large: [] },
@@ -150,6 +163,40 @@ function isShortInputTool(name: string): boolean {
 	const config = TOOL_FIELD_CONFIG[name];
 	if (!config) return true; // not in config → short by default
 	return config.large.length === 0 && config.short.length === 0;
+}
+
+function normalizeLineEndings(text: string): string {
+	return text.replaceAll("\r\n", "\n");
+}
+
+async function resolveStreamingEditMetadata(
+	acc: { name: string; extractedFilePath?: string; extractedFields?: Record<string, string> },
+	cwd: string,
+): Promise<Record<string, unknown> | undefined> {
+	if (acc.name !== "Edit") return undefined;
+	const filePath = acc.extractedFilePath ?? acc.extractedFields?.file_path;
+	const oldString = acc.extractedFields?.old_string;
+	if (!filePath || oldString == null || oldString === "") return undefined;
+
+	try {
+		const resolvedPath = resolve(cwd, filePath);
+		const { text } = await readFileText(resolvedPath);
+		const content = normalizeLineEndings(text);
+		const normalizedOld = normalizeLineEndings(oldString);
+		const replaceAll = acc.extractedFields?.replace_all === "true";
+		const match = findReplaceMatch(content, normalizedOld, replaceAll);
+		const lineCount = normalizedOld.split("\n").length;
+		return {
+			startLine: match.startLine,
+			endLine: match.startLine + lineCount - 1,
+			matchStatus: "matched",
+		};
+	} catch (err) {
+		return {
+			matchStatus: "unmatched",
+			matchError: err instanceof Error ? err.message : String(err),
+		};
+	}
 }
 
 const EMPTY_RESPONSE_MESSAGE =
@@ -703,6 +750,8 @@ export async function* agentLoop(
 				startedAt: number;
 				extractedFilePath?: string;
 				extractedFields?: Record<string, string>;
+				/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
+				streamingMetadata?: Record<string, unknown>;
 				/** Name of the large field currently being streamed */
 				activeStreamingField?: string;
 				/** How many raw chars of the active field have been yielded so far */
@@ -1080,11 +1129,25 @@ export async function* agentLoop(
 
 											// Track the active streaming field
 											if (result.activeField) {
+												if (acc.activeStreamingField !== result.activeField.name) {
+													acc.streamingFieldYielded = 0;
+												}
 												acc.activeStreamingField = result.activeField.name;
 											}
 										}
 
+										if (
+											!acc.streamingMetadata &&
+											acc.name === "Edit" &&
+											acc.extractedFields?.old_string != null &&
+											(acc.extractedFilePath || acc.extractedFields.file_path)
+										) {
+											acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
+											fieldsChanged = true;
+										}
+
 										// Throttle: yield at most once per 50ms per tool.
+
 										// Bypass throttle when fields change so the frontend
 										// can display them immediately.
 										const now = Date.now();
@@ -1136,6 +1199,7 @@ export async function* agentLoop(
 												...(acc.extractedFields && {
 													extractedFields: acc.extractedFields,
 												}),
+												...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
 												...(streamingField && { streamingField }),
 											};
 										}
@@ -1155,7 +1219,16 @@ export async function* agentLoop(
 									} else {
 										// Final yield: flush any remaining streaming field delta
 										const stopWantedKeys = getToolWantedKeys(acc.name);
+										if (
+											!acc.streamingMetadata &&
+											acc.name === "Edit" &&
+											acc.extractedFields?.old_string != null &&
+											(acc.extractedFilePath || acc.extractedFields.file_path)
+										) {
+											acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
+										}
 										let streamingField: { name: string; delta: string } | undefined;
+
 										if (acc.activeStreamingField && stopWantedKeys.size > 0) {
 											const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
 											if (
@@ -1196,6 +1269,7 @@ export async function* agentLoop(
 											...(acc.extractedFields && {
 												extractedFields: acc.extractedFields,
 											}),
+											...(acc.streamingMetadata && { metadata: acc.streamingMetadata }),
 											...(streamingField && { streamingField }),
 										};
 									}

@@ -4904,6 +4904,9 @@ export function NarratorPanel({
 													showConclusionButton={showConclusionBtn}
 													showTokenUsage={showTokenUsage}
 													highlightedId={highlightedId}
+													pendingPermission={renderPermCb.pendingPermission}
+													pendingPermsMap={renderPermCb.pendingPermsMap}
+													onPermissionDecision={renderPermCb.onPermissionDecision}
 													scrollRef={viewportCallbackRef}
 													contentRef={contentRef}
 													shift={isFetchingNextPage}

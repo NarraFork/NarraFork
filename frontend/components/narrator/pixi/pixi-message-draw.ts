@@ -14,6 +14,7 @@ import type {
 	PixiLaidOutItem,
 	PixiLaidOutMarkdownBlock,
 } from "./pixi-message-layout";
+import type { PixiPermissionAction } from "./pixi-message-model";
 import type { PixiMessageTheme } from "./pixi-message-theme";
 import { getPixiHighlightedTokens, type PixiHighlightToken } from "./pixi-shiki-highlight";
 import {
@@ -994,6 +995,17 @@ function drawGoalContinuationBlock(opts: DrawSpecialBlockOptions) {
 	textPool.acquire(label, bx + 11, by + 5, SMALL_STYLE, theme.teal);
 }
 
+export interface PixiMessageHitTarget {
+	id: string;
+	kind: "permission-action";
+	permissionId: string;
+	action: PixiPermissionAction;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
 interface DrawSpecialBlockOptions {
 	textPool: TextPool;
 	iconPool: IconSpritePool;
@@ -1027,6 +1039,28 @@ function drawBadge(
 	} else {
 		textPool.acquire(text, x + 7, y, SMALL_STYLE, color);
 	}
+}
+
+function drawPermissionButton(
+	textPool: TextPool,
+	gfx: Graphics,
+	theme: PixiMessageTheme,
+	label: string,
+	x: number,
+	y: number,
+	width: number,
+	height: number,
+	colorName: string | undefined,
+	variant: string | undefined,
+	hovered: boolean,
+): void {
+	const color = colorForName(theme, colorName);
+	const filled = variant !== "light";
+	gfx.roundRect(x, y, width, height, 5);
+	gfx.fill({ color, alpha: filled ? (hovered ? 0.32 : 0.24) : hovered ? 0.16 : 0.08 });
+	gfx.stroke({ color, alpha: hovered ? 0.92 : 0.48, width: hovered ? 1.5 : 1 });
+	const textW = textWidth(label, SMALL_STYLE);
+	textPool.acquire(label, x + Math.max(8, (width - textW) / 2), y + 4, SMALL_STYLE, color);
 }
 
 function shikiThemeName(): string {
@@ -1287,6 +1321,8 @@ function drawToolDetailBlock(
 	block: NonNullable<PixiLaidOutBlock["toolDetailBlocks"]>[number],
 	bx: number,
 	by: number,
+	hitTargets?: PixiMessageHitTarget[],
+	hoveredHitTargetId?: string | null,
 ): void {
 	if (block.kind === "badge-row") {
 		for (const badge of block.badges ?? []) {
@@ -1323,6 +1359,72 @@ function drawToolDetailBlock(
 				style,
 				color,
 			);
+		}
+		return;
+	}
+	if (block.kind === "permission-panel") {
+		const x = bx + block.x;
+		const y = by + block.y;
+		gfx.roundRect(x, y, block.width, block.height, 7);
+		gfx.fill({ color: theme.yellow, alpha: 0.08 });
+		gfx.stroke({ color: theme.yellow, alpha: 0.55, width: 1 });
+		textPool.acquire("Awaiting approval", x + 8, y + 7, TOOL_NAME_STYLE, theme.yellow);
+		const toolLabel = block.permissionToolName ? ` ${block.permissionToolName}` : "";
+		textPool.acquire(toolLabel, x + 128, y + 7, SMALL_STYLE, theme.dimmed);
+		const lines = block.lines ?? [];
+		const planLineCount = block.permissionPlanLineCount ?? 0;
+		const reasonLineCount = Math.max(0, lines.length - planLineCount);
+		let textY = y + 28;
+		for (const line of lines.slice(0, reasonLineCount)) {
+			textPool.acquire(line.text, x + 8, textY, SMALL_STYLE, theme.dimmed);
+			textY += 17;
+		}
+		if (planLineCount > 0) {
+			const planLines = lines.slice(reasonLineCount);
+			const panelY = textY + 2;
+			const panelH = CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, planLines.length * CODE_LINE_H);
+			gfx.roundRect(x + 8, panelY, block.width - 16, panelH, 5);
+			gfx.fill({ color: theme.panelBg, alpha: 0.42 });
+			gfx.stroke({ color: theme.yellow, alpha: 0.2, width: 1 });
+			for (let i = 0; i < planLines.length; i++) {
+				textPool.acquire(
+					planLines[i].text,
+					x + 8 + CODE_PADDING_X,
+					panelY + CODE_PADDING_Y + i * CODE_LINE_H,
+					MONO_STYLE,
+					theme.text,
+				);
+			}
+		}
+		for (const action of block.permissionActions ?? []) {
+			const targetId = `${block.permissionId}:${action.action}`;
+			const ax = bx + action.x;
+			const ay = by + action.y;
+			drawPermissionButton(
+				textPool,
+				gfx,
+				theme,
+				action.label,
+				ax,
+				ay,
+				action.width,
+				action.height,
+				action.color,
+				action.variant,
+				hoveredHitTargetId === targetId,
+			);
+			if (block.permissionId) {
+				hitTargets?.push({
+					id: targetId,
+					kind: "permission-action",
+					permissionId: block.permissionId,
+					action: action.action,
+					x: ax,
+					y: ay,
+					width: action.width,
+					height: action.height,
+				});
+			}
 		}
 		return;
 	}
@@ -1384,8 +1486,14 @@ function drawToolDetailBlock(
 	}
 }
 
-function drawToolUseBlock(opts: DrawSpecialBlockOptions & { iconPool: IconSpritePool }): boolean {
-	const { textPool, iconPool, gfx, block, bx, by, theme } = opts;
+function drawToolUseBlock(
+	opts: DrawSpecialBlockOptions & {
+		iconPool: IconSpritePool;
+		hitTargets?: PixiMessageHitTarget[];
+		hoveredHitTargetId?: string | null;
+	},
+): boolean {
+	const { textPool, iconPool, gfx, block, bx, by, theme, hitTargets, hoveredHitTargetId } = opts;
 	if (block.type !== "tool_use" || !block.toolName || !block.toolHeader) return false;
 	const categoryColor = colorForName(theme, block.toolCategoryColor);
 	const statusColor = colorForName(theme, block.toolStatusColor);
@@ -1450,7 +1558,7 @@ function drawToolUseBlock(opts: DrawSpecialBlockOptions & { iconPool: IconSprite
 	}
 
 	for (const detailBlock of block.toolDetailBlocks ?? []) {
-		drawToolDetailBlock(textPool, gfx, theme, detailBlock, bx, by);
+		drawToolDetailBlock(textPool, gfx, theme, detailBlock, bx, by, hitTargets, hoveredHitTargetId);
 	}
 
 	for (const line of block.toolDetailBlocks?.length ? [] : (block.toolDetailLines ?? [])) {
@@ -1539,6 +1647,8 @@ export function drawPixiMessages(opts: {
 	viewportHeight: number;
 	highlightedId?: string | null;
 	bufferPx?: number;
+	hitTargets?: PixiMessageHitTarget[];
+	hoveredHitTargetId?: string | null;
 }) {
 	const {
 		textPool,
@@ -1551,8 +1661,11 @@ export function drawPixiMessages(opts: {
 		viewportHeight,
 		highlightedId,
 		bufferPx = 240,
+		hitTargets,
+		hoveredHitTargetId,
 	} = opts;
 	gfx.clear();
+	if (hitTargets) hitTargets.length = 0;
 	const minY = scrollTop - bufferPx;
 	const maxY = scrollTop + viewportHeight + bufferPx;
 
@@ -1670,7 +1783,20 @@ export function drawPixiMessages(opts: {
 				gfx.lineTo(bx + block.width, separatorY);
 				gfx.stroke({ color: theme.toolBorder, alpha: 0.55, width: 1 });
 			}
-			if (drawToolUseBlock({ textPool, iconPool, imagePool, gfx, block, bx, by, theme })) {
+			if (
+				drawToolUseBlock({
+					textPool,
+					iconPool,
+					imagePool,
+					gfx,
+					block,
+					bx,
+					by,
+					theme,
+					hitTargets,
+					hoveredHitTargetId,
+				})
+			) {
 				continue;
 			}
 			if (drawSpecialBlock({ textPool, iconPool, imagePool, gfx, block, bx, by, theme })) {

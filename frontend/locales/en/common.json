@@ -237,7 +237,7 @@
 	"updateApplyDescription": "This will start the new server process. It will wait for the old server to shut down gracefully before binding the port.",
 	"updateStopAndApply": "Apply & Restart",
 	"updateRestarting": "Server is restarting...",
-	"updateRestartingDescription": "The new server has started and is waiting for the old server to release the port. The page will reconnect automatically when ready.",
+	"updateRestartingDescription": "Waiting for the updated server to become ready. The page will clear offline caches and refresh automatically.",
 	"updateServerStopped": "Server is shutting down...",
 	"updateRunNewBinary": "If automatic restart fails, start the new binary manually:",
 	"updateZstdMissingTitle": "zstd tool not found",

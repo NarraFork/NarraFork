@@ -15,9 +15,15 @@ import {
 } from "react";
 import { useLocalPref } from "../../../hooks/useLocalPref";
 import { getRenderableMessageOrder } from "../message-order-utils";
-import type { MessagesQueryData, NarratorMsg } from "../narrator-panel-types";
+import { resolvePendingPerm } from "../narrator-message-helpers";
+import type { MessagesQueryData, NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import { invalidatePixiImageTextures, subscribePixiImageTextureLoads } from "./pixi-image-textures";
-import { drawPixiMessages, ImageSpritePool, TextPool } from "./pixi-message-draw";
+import {
+	drawPixiMessages,
+	ImageSpritePool,
+	type PixiMessageHitTarget,
+	TextPool,
+} from "./pixi-message-draw";
 import { clearPixiMessageLayoutCache, layoutPixiMessageItems } from "./pixi-message-layout";
 import { buildPixiMessageItems } from "./pixi-message-model";
 import { invalidatePixiMessageThemeCache, resolvePixiMessageTheme } from "./pixi-message-theme";
@@ -47,6 +53,15 @@ interface NarratorPixiMessageListProps {
 	showConclusionButton?: boolean;
 	showTokenUsage?: boolean;
 	highlightedId?: string | null;
+	pendingPermission?: PendingPermission | null;
+	pendingPermsMap?: Map<string, PendingPermission>;
+	onPermissionDecision?: (
+		requestId: string,
+		decision: "allow" | "deny",
+		feedbackText?: string,
+		compactAfter?: boolean,
+		updatedPlan?: string,
+	) => void;
 	scrollRef: RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 	contentRef: RefObject<HTMLDivElement | null>;
 	shift?: boolean;
@@ -56,6 +71,29 @@ function destroyPixiApplication(app: Application): void {
 	const pixiApp = app as unknown as { _cancelResize?: () => void; destroy: Application["destroy"] };
 	if (typeof pixiApp._cancelResize !== "function") pixiApp._cancelResize = () => {};
 	app.destroy(true, { children: true });
+}
+
+type RenderableContainer = Container & { destroyed?: boolean; children?: unknown[] | null };
+type RenderableApplication = Application & {
+	destroyed?: boolean;
+	renderer?: unknown;
+	stage?: RenderableContainer | null;
+};
+
+function isRenderableContainer(container: Container | null): container is RenderableContainer {
+	if (!container) return false;
+	const renderable = container as RenderableContainer;
+	return renderable.destroyed !== true && Array.isArray(renderable.children);
+}
+
+function isRenderableApplication(app: Application | null): app is RenderableApplication {
+	if (!app) return false;
+	const renderable = app as RenderableApplication;
+	return (
+		renderable.destroyed !== true &&
+		!!renderable.renderer &&
+		isRenderableContainer(renderable.stage ?? null)
+	);
 }
 
 function isViewportAtBottom(viewport: HTMLElement): boolean {
@@ -68,6 +106,25 @@ function clamp(value: number, min: number, max: number): number {
 
 function getMaxScrollTop(viewport: HTMLElement): number {
 	return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+}
+
+function hitTestPixiTarget(
+	targets: PixiMessageHitTarget[],
+	x: number,
+	y: number,
+): PixiMessageHitTarget | null {
+	for (let i = targets.length - 1; i >= 0; i--) {
+		const target = targets[i];
+		if (
+			x >= target.x &&
+			x <= target.x + target.width &&
+			y >= target.y &&
+			y <= target.y + target.height
+		) {
+			return target;
+		}
+	}
+	return null;
 }
 
 export const NarratorPixiMessageList = forwardRef<
@@ -84,6 +141,9 @@ export const NarratorPixiMessageList = forwardRef<
 		showConclusionButton,
 		showTokenUsage,
 		highlightedId,
+		pendingPermission,
+		pendingPermsMap,
+		onPermissionDecision,
 		scrollRef,
 		contentRef,
 		shift,
@@ -95,6 +155,7 @@ export const NarratorPixiMessageList = forwardRef<
 	const spacerRef = useRef<HTMLDivElement | null>(null);
 	const appRef = useRef<Application | null>(null);
 	const stageContainerRef = useRef<Container | null>(null);
+	const imageContainerRef = useRef<Container | null>(null);
 	const gfxRef = useRef<Graphics | null>(null);
 	const textPoolRef = useRef<TextPool | null>(null);
 	const iconPoolRef = useRef<IconSpritePool | null>(null);
@@ -108,7 +169,12 @@ export const NarratorPixiMessageList = forwardRef<
 	const [imageVersion, setImageVersion] = useState(0);
 	const [highlightVersion, setHighlightVersion] = useState(0);
 	const [restoreVersion, setRestoreVersion] = useState(0);
+	const [hoveredHitTargetId, setHoveredHitTargetId] = useState<string | null>(null);
 	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
+	const hitTargetsRef = useRef<PixiMessageHitTarget[]>([]);
+	const hoveredHitTargetIdRef = useRef<string | null>(null);
+	const onPermissionDecisionRef = useRef(onPermissionDecision);
+	onPermissionDecisionRef.current = onPermissionDecision;
 	const virtualScrollTopRef = useRef(0);
 	const scrollEndTimerRef = useRef(0);
 	const lastLightResumeAtRef = useRef(0);
@@ -120,11 +186,30 @@ export const NarratorPixiMessageList = forwardRef<
 	const prevFirstKeyRef = useRef<string | null>(null);
 	const appliedRestoreVersionRef = useRef(0);
 	const lastRendererSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
+	const pixiDestroyedRef = useRef(true);
+
+	useEffect(() => {
+		hoveredHitTargetIdRef.current = hoveredHitTargetId;
+	}, [hoveredHitTargetId]);
 
 	const orderedMessages = useMemo(() => {
 		if (!messagesData?.pages?.length) return [];
 		return getRenderableMessageOrder(messagesData.pages).messages;
 	}, [messagesData]);
+
+	const resolvePixiPermission = useCallback(
+		(
+			tc: Parameters<
+				NonNullable<Parameters<typeof buildPixiMessageItems>[0]["resolvePermission"]>
+			>[0],
+		) =>
+			resolvePendingPerm(
+				tc as Parameters<typeof resolvePendingPerm>[0],
+				pendingPermission,
+				pendingPermsMap,
+			),
+		[pendingPermission, pendingPermsMap],
+	);
 
 	const items = useMemo(() => {
 		void layoutVersion;
@@ -140,6 +225,7 @@ export const NarratorPixiMessageList = forwardRef<
 			showConclusionButton,
 			showTokenUsage,
 			expandReasoning,
+			resolvePermission: resolvePixiPermission,
 		});
 	}, [
 		messagesData?.pages,
@@ -153,6 +239,7 @@ export const NarratorPixiMessageList = forwardRef<
 		showConclusionButton,
 		showTokenUsage,
 		expandReasoning,
+		resolvePixiPermission,
 		layoutVersion,
 	]);
 
@@ -182,10 +269,13 @@ export const NarratorPixiMessageList = forwardRef<
 			void imageVersion;
 			void highlightVersion;
 			void restoreVersion;
+			void hoveredHitTargetId;
 			if (
 				!ready ||
-				!appRef.current ||
-				!stageContainerRef.current ||
+				pixiDestroyedRef.current ||
+				!isRenderableApplication(appRef.current) ||
+				!isRenderableContainer(stageContainerRef.current) ||
+				!isRenderableContainer(imageContainerRef.current) ||
 				!gfxRef.current ||
 				!textPoolRef.current ||
 				!iconPoolRef.current ||
@@ -219,6 +309,8 @@ export const NarratorPixiMessageList = forwardRef<
 				scrollTop: currentScrollTop,
 				viewportHeight: size.height,
 				highlightedId,
+				hitTargets: hitTargetsRef.current,
+				hoveredHitTargetId,
 				...(options?.bufferPx != null ? { bufferPx: options.bufferPx } : {}),
 			});
 			imagePool.releaseUnused();
@@ -238,6 +330,7 @@ export const NarratorPixiMessageList = forwardRef<
 			imageVersion,
 			highlightVersion,
 			restoreVersion,
+			hoveredHitTargetId,
 		],
 	);
 
@@ -480,8 +573,56 @@ export const NarratorPixiMessageList = forwardRef<
 		const host = canvasHostRef.current;
 		if (!host) return;
 		const app = new Application();
+		pixiDestroyedRef.current = true;
 		const handleContextLost = (event: Event) => event.preventDefault();
 		const handleContextRestored = () => refreshAfterResume({ resetTextures: true });
+		const hitTargetAtEvent = (event: PointerEvent | MouseEvent) => {
+			const canvas = event.currentTarget as HTMLCanvasElement;
+			const rect = canvas.getBoundingClientRect();
+			return hitTestPixiTarget(
+				hitTargetsRef.current,
+				event.clientX - rect.left,
+				event.clientY - rect.top,
+			);
+		};
+		const handlePointerMove = (event: PointerEvent) => {
+			const target = hitTargetAtEvent(event);
+			const nextId = target?.id ?? null;
+			if (hoveredHitTargetIdRef.current !== nextId) {
+				hoveredHitTargetIdRef.current = nextId;
+				setHoveredHitTargetId(nextId);
+			}
+			(event.currentTarget as HTMLCanvasElement).style.cursor = target ? "pointer" : "default";
+		};
+		const handlePointerLeave = (event: PointerEvent) => {
+			if (hoveredHitTargetIdRef.current !== null) {
+				hoveredHitTargetIdRef.current = null;
+				setHoveredHitTargetId(null);
+			}
+			(event.currentTarget as HTMLCanvasElement).style.cursor = "default";
+		};
+		const handlePointerDown = (event: PointerEvent) => {
+			const target = hitTargetAtEvent(event);
+			if (!target) return;
+			event.preventDefault();
+			event.stopPropagation();
+			if (target.action === "deny") {
+				onPermissionDecisionRef.current?.(target.permissionId, "deny");
+			} else {
+				onPermissionDecisionRef.current?.(
+					target.permissionId,
+					"allow",
+					undefined,
+					target.action === "allow_compact" ? true : undefined,
+				);
+			}
+		};
+		const handleWheel = (event: WheelEvent) => {
+			const viewport = viewportRef.current;
+			if (!viewport) return;
+			event.preventDefault();
+			viewport.scrollTop = clamp(viewport.scrollTop + event.deltaY, 0, getMaxScrollTop(viewport));
+		};
 		let destroyed = false;
 		app
 			.init({
@@ -501,14 +642,19 @@ export const NarratorPixiMessageList = forwardRef<
 					return;
 				}
 				appRef.current = app;
+				pixiDestroyedRef.current = false;
 				const canvas = app.canvas as HTMLCanvasElement;
 				canvas.style.position = "absolute";
 				canvas.style.inset = "0";
 				canvas.style.width = "100%";
 				canvas.style.height = "100%";
-				canvas.style.pointerEvents = "none";
+				canvas.style.pointerEvents = "auto";
 				canvas.addEventListener("webglcontextlost", handleContextLost);
 				canvas.addEventListener("webglcontextrestored", handleContextRestored);
+				canvas.addEventListener("pointermove", handlePointerMove);
+				canvas.addEventListener("pointerleave", handlePointerLeave);
+				canvas.addEventListener("pointerdown", handlePointerDown);
+				canvas.addEventListener("wheel", handleWheel, { passive: false });
 				host.appendChild(canvas);
 				const container = new Container();
 				const imageContainer = new Container();
@@ -517,6 +663,7 @@ export const NarratorPixiMessageList = forwardRef<
 				app.stage.addChild(imageContainer);
 				app.stage.addChild(container);
 				stageContainerRef.current = container;
+				imageContainerRef.current = imageContainer;
 				gfxRef.current = gfx;
 				textPoolRef.current = new TextPool(container);
 				iconPoolRef.current = new IconSpritePool(container);
@@ -541,19 +688,26 @@ export const NarratorPixiMessageList = forwardRef<
 			});
 		return () => {
 			destroyed = true;
-			if (appRef.current) {
-				const canvas = appRef.current.canvas as HTMLCanvasElement;
-				canvas.removeEventListener("webglcontextlost", handleContextLost);
-				canvas.removeEventListener("webglcontextrestored", handleContextRestored);
-				destroyPixiApplication(appRef.current);
-			}
+			pixiDestroyedRef.current = true;
+			const app = appRef.current;
 			appRef.current = null;
 			stageContainerRef.current = null;
+			imageContainerRef.current = null;
 			gfxRef.current = null;
 			textPoolRef.current = null;
 			iconPoolRef.current = null;
 			imagePoolRef.current = null;
 			lastRendererSizeRef.current = { width: 0, height: 0, dpr: 0 };
+			if (app) {
+				const canvas = app.canvas as HTMLCanvasElement;
+				canvas.removeEventListener("webglcontextlost", handleContextLost);
+				canvas.removeEventListener("webglcontextrestored", handleContextRestored);
+				canvas.removeEventListener("pointermove", handlePointerMove);
+				canvas.removeEventListener("pointerleave", handlePointerLeave);
+				canvas.removeEventListener("pointerdown", handlePointerDown);
+				canvas.removeEventListener("wheel", handleWheel);
+				destroyPixiApplication(app);
+			}
 		};
 		// init once; resize is handled below
 	}, [refreshAfterResume]);
@@ -659,7 +813,7 @@ export const NarratorPixiMessageList = forwardRef<
 				style={{
 					height: size.height || "100%",
 					left: 0,
-					pointerEvents: "none",
+					pointerEvents: "auto",
 					position: "absolute",
 					top: 0,
 					width: size.width || "100%",

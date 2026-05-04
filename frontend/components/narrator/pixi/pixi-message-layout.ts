@@ -13,6 +13,7 @@ import {
 } from "./pixi-message-constants";
 import type {
 	PixiMessageItem,
+	PixiPermissionActionModel,
 	PixiToolBadgeModel,
 	PixiToolDetailBlockModel,
 	PixiToolDetailLineModel,
@@ -53,6 +54,13 @@ export interface PixiLaidOutToolBadge extends PixiToolBadgeModel {
 	height: number;
 }
 
+export interface PixiLaidOutPermissionAction extends PixiPermissionActionModel {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
 export interface PixiLaidOutToolDetailBlock {
 	kind: PixiToolDetailBlockModel["kind"];
 	x: number;
@@ -65,6 +73,12 @@ export interface PixiLaidOutToolDetailBlock {
 	color?: string;
 	muted?: boolean;
 	mono?: boolean;
+	permissionId?: string;
+	permissionToolName?: string;
+	permissionReason?: string;
+	permissionSummary?: string;
+	permissionPlanLineCount?: number;
+	permissionActions?: PixiLaidOutPermissionAction[];
 	badges?: PixiLaidOutToolBadge[];
 	lines?: LayoutLine[];
 	diffLines?: Array<{
@@ -96,6 +110,11 @@ export interface PixiLaidOutBlock {
 	separatorBefore?: boolean;
 	mdBlocks?: PixiLaidOutMarkdownBlock[];
 	toolName?: string;
+	toolCallId?: string;
+	toolUseId?: string;
+	pendingPermissionId?: string;
+	pendingPermissionToolName?: string;
+	pendingPermissionReason?: string;
 	toolCategory?: PixiMessageItem["blocks"][number]["toolCategory"];
 	toolSummary?: string;
 	toolStatus?: string;
@@ -643,6 +662,26 @@ function layoutBadges(
 	return laid;
 }
 
+function layoutPermissionActions(
+	actions: PixiPermissionActionModel[],
+	contentWidth: number,
+	startY: number,
+): PixiLaidOutPermissionAction[] {
+	const laid: PixiLaidOutPermissionAction[] = [];
+	let x = TOOL_CARD_PADDING;
+	let y = startY;
+	for (const action of actions) {
+		const width = Math.min(contentWidth, Math.max(62, action.label.length * 7 + 24));
+		if (x > TOOL_CARD_PADDING && x + width > TOOL_CARD_PADDING + contentWidth) {
+			x = TOOL_CARD_PADDING;
+			y += 28;
+		}
+		laid.push({ ...action, x, y, width, height: 24 });
+		x += width + 6;
+	}
+	return laid;
+}
+
 function layoutToolDetailBlocks(
 	blocks: PixiToolDetailBlockModel[],
 	innerWidth: number,
@@ -696,6 +735,50 @@ function layoutToolDetailBlocks(
 				lines: result.lines.slice(0, 2),
 			});
 			y += height + 3;
+			continue;
+		}
+		if (detail.kind === "permission-panel") {
+			const reasonText = detail.decisionReason || detail.summary || "Awaiting permission";
+			const reasonLines = layoutText(
+				reasonText,
+				contentWidth - 16,
+				SMALL_FONT,
+				SMALL_LINE_H,
+			).lines.slice(0, 2);
+			const planText = detail.planPreview?.trim() ?? "";
+			const planLines = planText
+				? layoutText(
+						planText,
+						contentWidth - CODE_PADDING_X * 2,
+						CODE_FONT,
+						CODE_LINE_H,
+					).lines.slice(0, 6)
+				: [];
+			const planHeight = planLines.length
+				? CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, planLines.length * CODE_LINE_H) + 8
+				: 0;
+			const actionsY = y + 34 + reasonLines.length * SMALL_LINE_H + planHeight;
+			const actions = layoutPermissionActions(detail.actions, contentWidth - 16, actionsY);
+			const actionsHeight = actions.length
+				? Math.max(...actions.map((action) => action.y + action.height - actionsY))
+				: 18;
+			const height = 42 + reasonLines.length * SMALL_LINE_H + planHeight + actionsHeight;
+			laid.push({
+				kind: "permission-panel",
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				permissionId: detail.permissionId,
+				permissionToolName: detail.toolName,
+				permissionReason: detail.decisionReason,
+				permissionSummary: detail.summary,
+				permissionPlanLineCount: planLines.length,
+				text: planText,
+				lines: [...reasonLines, ...planLines],
+				permissionActions: actions,
+			});
+			y += height + 6;
 			continue;
 		}
 		if (detail.kind === "code-panel" || detail.kind === "terminal-panel") {
@@ -957,6 +1040,11 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 			separatorBefore,
 			mdBlocks: mdLayout?.mdBlocks,
 			toolName: block.toolName,
+			toolCallId: block.toolCallId,
+			toolUseId: block.toolUseId,
+			pendingPermissionId: block.pendingPermissionId,
+			pendingPermissionToolName: block.pendingPermissionToolName,
+			pendingPermissionReason: block.pendingPermissionReason,
 			toolCategory: block.toolCategory,
 			toolSummary: block.toolSummary,
 			toolStatus: block.toolStatus,

@@ -237,7 +237,7 @@
 	"updateApplyDescription": "这将启动新的服务器进程；新进程会先等待旧服务器优雅退出，然后再绑定端口。",
 	"updateStopAndApply": "应用并重启",
 	"updateRestarting": "服务器正在重启...",
-	"updateRestartingDescription": "新服务器已启动并正在等待旧服务器释放端口。完成后页面会自动重新连接。",
+	"updateRestartingDescription": "正在等待新版服务器就绪。就绪后页面会自动清空离线缓存并刷新。",
 	"updateServerStopped": "服务器正在关闭...",
 	"updateRunNewBinary": "如自动重启失败，可手动启动新的二进制文件：",
 	"updateZstdMissingTitle": "未找到 zstd 工具",

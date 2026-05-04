@@ -315,10 +315,49 @@ const REPLACERS: Replacer[] = [
 
 // ── Core replace function ───────────────────────────────────────
 
+export interface ReplaceMatch {
+	/** Matched text chosen by the replacer chain */
+	search: string;
+	/** 0-based character index where the first replacement would occur */
+	index: number;
+	/** 1-based line number where the first replacement would occur */
+	startLine: number;
+}
+
 export interface ReplaceResult {
 	content: string;
 	/** 1-based line number where the first replacement occurred */
 	startLine: number;
+}
+
+export function findReplaceMatch(
+	content: string,
+	oldString: string,
+	replaceAll = false,
+): ReplaceMatch {
+	let notFound = true;
+
+	for (const replacer of REPLACERS) {
+		for (const search of replacer(content, oldString)) {
+			const index = content.indexOf(search);
+			if (index === -1) continue;
+			notFound = false;
+			const startLine = content.substring(0, index).split("\n").length;
+			if (replaceAll) return { search, index, startLine };
+			const lastIndex = content.lastIndexOf(search);
+			if (index !== lastIndex) continue; // not unique via this replacer, try next
+			return { search, index, startLine };
+		}
+	}
+
+	if (notFound) {
+		throw new Error(
+			"old_string not found in the file. It must match exactly, including whitespace, indentation, and line endings.",
+		);
+	}
+	throw new Error(
+		"Found multiple matches for old_string. Provide more surrounding context to make the match unique, or use replace_all.",
+	);
 }
 
 export function replace(
@@ -331,34 +370,17 @@ export function replace(
 		throw new Error("No changes to apply: old_string and new_string are identical.");
 	}
 
-	let notFound = true;
-
-	for (const replacer of REPLACERS) {
-		for (const search of replacer(content, oldString)) {
-			const index = content.indexOf(search);
-			if (index === -1) continue;
-			notFound = false;
-			const startLine = content.substring(0, index).split("\n").length;
-			if (replaceAll) {
-				return { content: content.replaceAll(search, newString), startLine };
-			}
-			const lastIndex = content.lastIndexOf(search);
-			if (index !== lastIndex) continue; // not unique via this replacer, try next
-			return {
-				content: content.substring(0, index) + newString + content.substring(index + search.length),
-				startLine,
-			};
-		}
+	const match = findReplaceMatch(content, oldString, replaceAll);
+	if (replaceAll) {
+		return { content: content.replaceAll(match.search, newString), startLine: match.startLine };
 	}
-
-	if (notFound) {
-		throw new Error(
-			"old_string not found in the file. It must match exactly, including whitespace, indentation, and line endings.",
-		);
-	}
-	throw new Error(
-		"Found multiple matches for old_string. Provide more surrounding context to make the match unique, or use replace_all.",
-	);
+	return {
+		content:
+			content.substring(0, match.index) +
+			newString +
+			content.substring(match.index + match.search.length),
+		startLine: match.startLine,
+	};
 }
 
 // ── Normalize CRLF ─────────────────────────────────────────────

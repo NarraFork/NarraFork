@@ -506,6 +506,7 @@ export function upsertSubagentStreamingChunk(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	metadata?: Record<string, unknown>,
 	streamingField?: { name: string; value: string },
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
@@ -528,6 +529,7 @@ export function upsertSubagentStreamingChunk(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				metadata,
 				streamingField,
 			);
 			if (changed) {
@@ -553,6 +555,7 @@ export function upsertSubagentStreamingChunk(
 			extractedFilePath,
 			contentCharsReceived,
 			extractedFields,
+			metadata,
 			streamingField,
 		);
 		if (changed) anyChanged = true;
@@ -574,6 +577,7 @@ function upsertStreamingChildAtPath(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	metadata?: Record<string, unknown>,
 	streamingField?: { name: string; value: string },
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (path.length === 0) return { messages, changed: false };
@@ -596,6 +600,7 @@ function upsertStreamingChildAtPath(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				metadata,
 				streamingField,
 			),
 			changed: true,
@@ -615,6 +620,7 @@ function upsertStreamingChildAtPath(
 		extractedFilePath,
 		contentCharsReceived,
 		extractedFields,
+		metadata,
 		streamingField,
 	);
 	if (!childResult.changed) return { messages, changed: false };
@@ -636,6 +642,7 @@ function upsertStreamingChildOnMsg(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	metadata?: Record<string, unknown>,
 	streamingField?: { name: string; value: string },
 ): TreeMessage[] {
 	const msg = messages[msgIdx];
@@ -647,6 +654,7 @@ function upsertStreamingChildOnMsg(
 	if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
 	if (contentCharsReceived != null) streamingInput._streamingContentChars = contentCharsReceived;
 	if (extractedFields) streamingInput._streamingFields = extractedFields;
+	if (metadata) streamingInput._streamingMetadata = metadata;
 	if (streamingField) {
 		streamingInput._streamingFieldName = streamingField.name;
 		streamingInput._streamingFieldValue = streamingField.value;
@@ -659,6 +667,9 @@ function upsertStreamingChildOnMsg(
 		toolName,
 		streamingInput,
 	);
+	const patchedToolCalls = metadata
+		? toolCalls.map((tc) => (tc.toolUseId === toolUseId ? { ...tc, _metadata: metadata } : tc))
+		: toolCalls;
 
 	const syntheticChild: TreeMessage = {
 		id: syntheticId,
@@ -667,7 +678,7 @@ function upsertStreamingChildOnMsg(
 		role: "assistant",
 		contentJson: blocks,
 		contentText: null,
-		toolCalls: toolCalls,
+		toolCalls: patchedToolCalls,
 		createdAt: existing?.createdAt ?? new Date().toISOString(),
 		children: [],
 	};
@@ -693,6 +704,7 @@ function upsertStreamingChildInMessages(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	metadata?: Record<string, unknown>,
 	streamingField?: { name: string; value: string },
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
@@ -713,6 +725,7 @@ function upsertStreamingChildInMessages(
 			if (contentCharsReceived != null)
 				streamingInput._streamingContentChars = contentCharsReceived;
 			if (extractedFields) streamingInput._streamingFields = extractedFields;
+			if (metadata) streamingInput._streamingMetadata = metadata;
 			if (streamingField) {
 				streamingInput._streamingFieldName = streamingField.name;
 				streamingInput._streamingFieldValue = streamingField.value;
@@ -725,6 +738,9 @@ function upsertStreamingChildInMessages(
 				toolName,
 				streamingInput,
 			);
+			const patchedToolCalls = metadata
+				? toolCalls.map((tc) => (tc.toolUseId === toolUseId ? { ...tc, _metadata: metadata } : tc))
+				: toolCalls;
 
 			const syntheticChild: TreeMessage = {
 				id: syntheticId,
@@ -733,7 +749,7 @@ function upsertStreamingChildInMessages(
 				role: "assistant",
 				contentJson: blocks,
 				contentText: null,
-				toolCalls: toolCalls,
+				toolCalls: patchedToolCalls,
 				createdAt: existing?.createdAt ?? new Date().toISOString(),
 				children: [],
 			};
@@ -759,6 +775,7 @@ function upsertStreamingChildInMessages(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				metadata,
 				streamingField,
 			);
 			if (childResult.changed) {

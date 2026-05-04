@@ -37,6 +37,7 @@ interface NarratorWSCallbacks {
 		extractedFilePath?: string,
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
+		metadata?: Record<string, unknown>,
 		streamingField?: { name: string; delta: string },
 	) => void;
 	onToolCompleted?: (
@@ -188,6 +189,8 @@ interface NarratorWSCallbacks {
 			parentToolUseId?: string;
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
+			extractedFields?: Record<string, string>;
+			metadata?: Record<string, unknown>;
 			started?: boolean;
 			input?: unknown;
 			streamStartedAt?: number;
@@ -308,6 +311,7 @@ export function useNarratorWS(
 							data.extractedFilePath as string | undefined,
 							data.contentCharsReceived as number | undefined,
 							data.extractedFields as Record<string, string> | undefined,
+							data.metadata as Record<string, unknown> | undefined,
 							data.streamingField as { name: string; delta: string } | undefined,
 						);
 						break;
@@ -650,6 +654,8 @@ export function useNarratorWS(
 								parentToolUseId?: string;
 								extractedFilePath?: string;
 								contentCharsReceived?: number;
+								extractedFields?: Record<string, string>;
+								metadata?: Record<string, unknown>;
 								started?: boolean;
 								input?: unknown;
 								streamStartedAt?: number;

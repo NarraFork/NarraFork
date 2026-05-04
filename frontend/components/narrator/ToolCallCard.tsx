@@ -1634,10 +1634,18 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const newString = inputIsTruncated ? undefined : toolCall.inputJson?.new_string;
 
 	// Extract startLine from metadata (set by Edit tool on completion)
+	const streamingMetadata =
+		!inputIsTruncated &&
+		toolCall.inputJson?._streamingMetadata &&
+		typeof toolCall.inputJson._streamingMetadata === "object"
+			? (toolCall.inputJson._streamingMetadata as Record<string, unknown>)
+			: undefined;
 	const startLine =
 		typeof toolCall._metadata?.startLine === "number"
 			? (toolCall._metadata.startLine as number)
-			: undefined;
+			: typeof streamingMetadata?.startLine === "number"
+				? streamingMetadata.startLine
+				: undefined;
 
 	const isFailed = toolCall.status === "fail";
 	const localizedError = useLocalizedToolError(toolCall.errorMessage);
@@ -3346,10 +3354,17 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 			const preview = getStreamingEditPreview(toolCall.inputJson);
 			if (preview) {
 				const previewFilePath = filePath || "Edit";
+				const streamingMetadata =
+					toolCall.inputJson?._streamingMetadata &&
+					typeof toolCall.inputJson._streamingMetadata === "object"
+						? (toolCall.inputJson._streamingMetadata as Record<string, unknown>)
+						: undefined;
 				const startLine =
 					typeof toolCall._metadata?.startLine === "number"
 						? (toolCall._metadata.startLine as number)
-						: undefined;
+						: typeof streamingMetadata?.startLine === "number"
+							? streamingMetadata.startLine
+							: undefined;
 				return (
 					<Box mt="xs">
 						<EditStreamingPreview

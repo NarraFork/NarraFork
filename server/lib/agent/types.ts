@@ -166,6 +166,8 @@ export type AgentEvent =
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
+			/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
+			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field (content, command, prompt, etc.) */
 			streamingField?: { name: string; delta: string };
 	  }

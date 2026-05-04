@@ -154,6 +154,7 @@ export type NarratorServerMessage =
 			extractedFilePath?: string;
 			contentCharsReceived?: number;
 			extractedFields?: Record<string, string>;
+			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
 			streamingField?: { name: string; delta: string };
 	  }
@@ -320,9 +321,11 @@ export type NarratorServerMessage =
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
+				metadata?: Record<string, unknown>;
 				started?: boolean;
 				input?: unknown;
 				streamStartedAt?: number;
+				streamingOutput?: string;
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }

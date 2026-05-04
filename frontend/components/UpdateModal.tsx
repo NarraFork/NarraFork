@@ -96,9 +96,17 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	};
 
 	const handleApply = async () => {
-		const { clearPwaCache } = await import("@frontend/lib/pwa");
+		const { clearPwaCache, waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
+		const applyResponse = await apply();
+		if (!applyResponse.success) return;
+		if ("restarting" in applyResponse && applyResponse.restarting) {
+			void waitForUpdatedServerAndReload({
+				targetVersion: releaseInfo?.version ?? latestVersion,
+				requestTimeoutMs: 3000,
+			});
+			return;
+		}
 		await clearPwaCache();
-		await apply();
 	};
 
 	const handleClose = () => {

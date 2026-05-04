@@ -295,6 +295,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
+				metadata?: Record<string, unknown>;
 			}
 		>
 	>(new Map());
@@ -308,6 +309,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
+				metadata?: Record<string, unknown>;
 				streamingFieldName?: string;
 				streamingFieldValue?: string;
 			}
@@ -644,7 +646,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._output !== undefined && { outputJson: ext._output }),
 						...(ext._durationMs != null && { durationMs: ext._durationMs }),
 						...(ext._metadata && { _metadata: ext._metadata }),
+						...(chunk.metadata && { _metadata: chunk.metadata }),
 						...(ext._longRunning && { _longRunning: true }),
+
 						...(ext._streamingOutput && { _streamingOutput: ext._streamingOutput }),
 					};
 				}
@@ -656,6 +660,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						_streamingContentChars: chunk.contentCharsReceived,
 					}),
 					...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
+					...(chunk.metadata && { _streamingMetadata: chunk.metadata }),
 					...(chunk.streamingFieldName && {
 						_streamingFieldName: chunk.streamingFieldName,
 					}),
@@ -665,6 +670,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 				blocks = next.blocks;
 				toolCalls = next.toolCalls;
+				const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+				if (tcIdx !== -1 && chunk.metadata) {
+					toolCalls[tcIdx] = {
+						...toolCalls[tcIdx],
+						_metadata: chunk.metadata,
+					} as (typeof toolCalls)[number];
+				}
 			}
 		}
 
@@ -1467,6 +1479,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string,
 				contentCharsReceived?: number,
 				extractedFields?: Record<string, string>,
+				metadata?: Record<string, unknown>,
 				streamingField?: { name: string; delta: string },
 			) => {
 				// Accumulate streaming field value across frames (not cleared per RAF)
@@ -1490,6 +1503,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					extractedFilePath,
 					contentCharsReceived,
 					extractedFields,
+					metadata,
 				});
 				if (!toolChunkRafRef.current) {
 					toolChunkRafRef.current = requestAnimationFrame(() => {
@@ -1518,6 +1532,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 										chunk.extractedFilePath,
 										chunk.contentCharsReceived,
 										chunk.extractedFields,
+										chunk.metadata,
 										sf ? { name: sf.name, value: sf.value } : undefined,
 									) as MessagesQueryData;
 								}
@@ -1537,6 +1552,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								extractedFilePath: chunk.extractedFilePath,
 								contentCharsReceived: chunk.contentCharsReceived,
 								extractedFields: chunk.extractedFields,
+								metadata: chunk.metadata,
 								streamingFieldName: sf?.name,
 								streamingFieldValue: sf?.value,
 							});
@@ -2107,6 +2123,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 									toolUseIndexRef.current,
 									chunk.extractedFilePath,
 									chunk.contentCharsReceived,
+									chunk.extractedFields,
+									chunk.metadata,
 								) as MessagesQueryData;
 							});
 						} else if (chunk.started) {
@@ -2122,6 +2140,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								_input: chunk.input,
 								_startedAt: chunk.streamStartedAt,
 								_streamingOutput: chunk.streamingOutput,
+								_metadata: chunk.metadata,
 								// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 							} as any);
 							topLevelChanged = true;
@@ -2136,7 +2155,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								inputCharsTotal: chunk.inputCharsTotal,
 								extractedFilePath: chunk.extractedFilePath,
 								contentCharsReceived: chunk.contentCharsReceived,
+								extractedFields: chunk.extractedFields,
+								metadata: chunk.metadata,
 							});
+
 							topLevelChanged = true;
 						}
 					}

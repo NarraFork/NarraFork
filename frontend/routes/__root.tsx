@@ -80,6 +80,8 @@ function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 	const router = useRouter();
 	const { t } = useTranslation("common");
 	const isDev = import.meta.env.DEV;
+	const computedScheme = useComputedColorScheme("dark");
+	const isDark = computedScheme === "dark";
 
 	return (
 		<Center h="100vh">
@@ -96,13 +98,23 @@ function RootErrorBoundary({ error, reset }: ErrorComponentProps) {
 						p="sm"
 						ta="left"
 						style={{
-							background: "var(--mantine-color-dark-7)",
+							background: isDark ? "var(--mantine-color-dark-7)" : "var(--mantine-color-gray-0)",
+							border: `1px solid ${
+								isDark ? "var(--mantine-color-dark-4)" : "var(--mantine-color-gray-3)"
+							}`,
 							borderRadius: "var(--mantine-radius-sm)",
 							overflow: "auto",
 							maxHeight: 400,
 						}}
 					>
-						<Text size="xs" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
+						<Text
+							size="xs"
+							ff="monospace"
+							style={{
+								color: isDark ? "var(--mantine-color-gray-2)" : "var(--mantine-color-dark-8)",
+								whiteSpace: "pre-wrap",
+							}}
+						>
 							{error.stack}
 						</Text>
 					</Box>

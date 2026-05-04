@@ -1,7 +1,7 @@
 import i18n from "@frontend/lib/i18n";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { collectSegmentTargetIds, segmentMessages } from "../message-segments";
-import type { MessagesPage, NarratorMsg } from "../narrator-panel-types";
+import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import {
 	extractField,
 	formatCompletedDuration,
@@ -28,10 +28,28 @@ export interface PixiToolBadgeModel {
 	variant?: "light" | "outline" | "dot";
 }
 
+export type PixiPermissionAction = "allow" | "deny" | "allow_compact";
+
+export interface PixiPermissionActionModel {
+	action: PixiPermissionAction;
+	label: string;
+	color: ToolDisplayColor;
+	variant?: "filled" | "light";
+}
+
 export type PixiToolDetailBlockModel =
 	| { kind: "badge-row"; badges: PixiToolBadgeModel[] }
 	| { kind: "section-title"; text: string }
 	| { kind: "text-line"; text: string; color?: ToolDisplayColor; muted?: boolean; mono?: boolean }
+	| {
+			kind: "permission-panel";
+			permissionId: string;
+			toolName: string;
+			decisionReason?: string;
+			summary?: string;
+			planPreview?: string;
+			actions: PixiPermissionActionModel[];
+	  }
 	| {
 			kind: "code-panel" | "terminal-panel";
 			text: string;
@@ -72,6 +90,11 @@ export interface PixiMessageBlockModel {
 	imageAlt?: string;
 	imageStatus?: string;
 	toolName?: string;
+	toolCallId?: string;
+	toolUseId?: string;
+	pendingPermissionId?: string;
+	pendingPermissionToolName?: string;
+	pendingPermissionReason?: string;
 	toolCategory?: ToolCategory;
 	toolSummary?: string;
 	toolStatus?: string;
@@ -126,6 +149,15 @@ export interface BuildPixiMessageItemsOptions {
 	showConclusionButton?: boolean;
 	showTokenUsage?: boolean;
 	expandReasoning?: boolean;
+	resolvePermission?: (toolCall: {
+		id?: string;
+		toolName: string;
+		toolUseId?: string;
+		inputJson: unknown;
+		status?: string;
+		permissionDecisionReason?: string | null;
+		permissionSuggestions?: unknown[] | null;
+	}) => PendingPermission | null;
 }
 
 function usageNumber(value: unknown): number {
@@ -213,6 +245,11 @@ function blockText(block: Record<string, unknown>): string {
 
 function tNarrator(key: string, fallback: string, options?: Record<string, unknown>): string {
 	const value = i18n.t(key, { ns: "narrator", ...options });
+	return typeof value === "string" && value !== key ? value : fallback;
+}
+
+function tCommon(key: string, fallback: string, options?: Record<string, unknown>): string {
+	const value = i18n.t(key, { ns: "common", ...options });
 	return typeof value === "string" && value !== key ? value : fallback;
 }
 
@@ -641,6 +678,59 @@ function badge(
 	return { text, color, variant } satisfies PixiToolBadgeModel;
 }
 
+function permissionPanel(
+	permission: PendingPermission,
+	toolName: string,
+	summary: string,
+): PixiToolDetailBlockModel {
+	const isExitPlan = toolName === "ExitPlanMode";
+	const planPreview =
+		isExitPlan && typeof permission.inputJson?.plan === "string"
+			? permission.inputJson.plan
+			: undefined;
+	const actions: PixiPermissionActionModel[] =
+		permission.toolName === "AskUserQuestion"
+			? []
+			: isExitPlan
+				? [
+						{
+							action: "allow",
+							label: tNarrator("planExecute", "Execute"),
+							color: "green",
+						},
+						{
+							action: "allow_compact",
+							label: tNarrator("acceptAndResetContext", "Accept and reset context"),
+							color: "teal",
+							variant: "light",
+						},
+						{
+							action: "deny",
+							label: tNarrator("planRevise", "Revise"),
+							color: "red",
+							variant: "light",
+						},
+					]
+				: [
+						{ action: "allow", label: tCommon("allow", "Allow"), color: "green" },
+						{
+							action: "deny",
+							label: tCommon("deny", "Deny"),
+							color: "red",
+							variant: "light",
+						},
+					];
+	return {
+		kind: "permission-panel",
+		permissionId: permission.id,
+		toolName,
+		decisionReason: permission.decisionReason,
+		summary,
+		planPreview,
+		actions,
+	};
+}
+
 function getStreamingFileInput(
 	inputJson: unknown,
 ): { filePath: string; fieldName: string; value: string } | null {
@@ -660,11 +750,15 @@ function getStreamingFileInput(
 	return { filePath, fieldName, value };
 }
 
-function getStreamingEditInput(inputJson: unknown): {
+function getStreamingEditInput(
+	inputJson: unknown,
+	metadata?: Record<string, unknown>,
+): {
 	filePath: string;
 	phase: "matching" | "replacing";
 	oldString: string;
 	newString: string;
+	startLine?: number;
 } | null {
 	const input = asRecord(inputJson);
 	if (!input || input._streamingChars == null) return null;
@@ -682,8 +776,15 @@ function getStreamingEditInput(inputJson: unknown): {
 	const newString =
 		(typeof fields.new_string === "string" ? fields.new_string : "") ||
 		(fieldName === "new_string" ? fieldValue : "");
+	const streamingMetadata = asRecord(input._streamingMetadata);
+	const startLine =
+		typeof metadata?.startLine === "number"
+			? metadata.startLine
+			: typeof streamingMetadata?.startLine === "number"
+				? streamingMetadata.startLine
+				: undefined;
 	const phase = fieldName === "new_string" || newString ? "replacing" : "matching";
-	return { filePath: filePath || "Edit", phase, oldString, newString };
+	return { filePath: filePath || "Edit", phase, oldString, newString, startLine };
 }
 
 function buildToolDetailBlocks(
@@ -736,7 +837,9 @@ function buildToolDetailBlocks(
 		}
 		case "file": {
 			const streamingEdit =
-				toolName === "Edit" || toolName === "MultiEdit" ? getStreamingEditInput(inputJson) : null;
+				toolName === "Edit" || toolName === "MultiEdit"
+					? getStreamingEditInput(inputJson, metadata)
+					: null;
 			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
 			if (streamingEdit) {
 				blocks.push({
@@ -755,8 +858,11 @@ function buildToolDetailBlocks(
 							: streamingEdit.oldString || " ",
 					maxLines: 8,
 					lang: streamingEdit.filePath ? getShikiLang(streamingEdit.filePath) : "diff",
-					startLine: 1,
-					lineNumberPrefix: streamingEdit.phase === "matching" ? "xx" : undefined,
+					startLine: streamingEdit.startLine,
+					lineNumberPrefix:
+						streamingEdit.phase === "matching" && streamingEdit.startLine == null
+							? "xx"
+							: undefined,
 				});
 			} else if (streamingFile) {
 				blocks.push({ kind: "badge-row", badges: [badge("streaming", "blue", "dot")] });
@@ -1133,7 +1239,7 @@ function buildToolDetailLines(
 		case "file": {
 			if (filePath) lines.push({ label: "file", text: filePath, kind: "muted" });
 			if (toolName === "Edit" || toolName === "MultiEdit") {
-				const streamingEdit = getStreamingEditInput(inputJson);
+				const streamingEdit = getStreamingEditInput(inputJson, metadataFrom(outputJson));
 				if (streamingEdit) {
 					lines.push({ label: "phase", text: streamingEdit.phase, kind: "muted" });
 					if (streamingEdit.oldString)
@@ -1230,12 +1336,16 @@ function buildToolDetailLines(
 function buildToolUseBlock(
 	item: {
 		tc: {
+			id?: string;
 			toolName: string;
+			toolUseId?: string;
 			status?: string;
 			durationMs?: number;
 			errorMessage?: string;
 			inputJson: unknown;
 			outputJson?: unknown;
+			permissionDecisionReason?: string | null;
+			permissionSuggestions?: unknown[] | null;
 			_metadata?: Record<string, unknown>;
 		};
 		children: unknown[];
@@ -1243,6 +1353,7 @@ function buildToolUseBlock(
 	},
 	inRun: boolean,
 	isLast: boolean,
+	resolvePermission?: BuildPixiMessageItemsOptions["resolvePermission"],
 ): PixiMessageBlockModel {
 	const status = item.tc.status ?? "running";
 	const category = getCategory(item.tc.toolName);
@@ -1269,12 +1380,29 @@ function buildToolUseBlock(
 		});
 	}
 	const summary = getSummary(item.tc.toolName, item.tc.inputJson, item.tc._metadata);
+	const pendingPermission = resolvePermission?.({
+		id: item.tc.id,
+		toolName: item.tc.toolName,
+		toolUseId: item.tc.toolUseId,
+		inputJson: item.tc.inputJson,
+		status: item.tc.status,
+		permissionDecisionReason: item.tc.permissionDecisionReason,
+		permissionSuggestions: item.tc.permissionSuggestions,
+	});
+	if (pendingPermission) {
+		detailBlocks.push(permissionPanel(pendingPermission, item.tc.toolName, summary || status));
+	}
 	return {
 		type: "tool_use",
 		label: item.isSubagent ? "Agent" : item.tc.toolName,
 		text: summary || status,
-		color: statusColor(status),
+		color: pendingPermission ? "yellow" : statusColor(status),
 		toolName: item.tc.toolName,
+		toolCallId: item.tc.id,
+		toolUseId: item.tc.toolUseId,
+		pendingPermissionId: pendingPermission?.id,
+		pendingPermissionToolName: pendingPermission?.toolName,
+		pendingPermissionReason: pendingPermission?.decisionReason,
 		toolCategory: item.isSubagent ? "agent" : category,
 		toolSummary: summary,
 		toolStatus: status,
@@ -1370,7 +1498,7 @@ export function buildPixiMessageItems(opts: BuildPixiMessageItemsOptions): PixiM
 			role: "assistant",
 			title: "",
 			blocks: seg.items.map((item, index) =>
-				buildToolUseBlock(item, inRun, index === seg.items.length - 1),
+				buildToolUseBlock(item, inRun, index === seg.items.length - 1, opts.resolvePermission),
 			),
 		});
 	}

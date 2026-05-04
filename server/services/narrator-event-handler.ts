@@ -141,6 +141,7 @@ export interface ToolChunkSnapshot {
 	extractedFilePath?: string;
 	contentCharsReceived?: number;
 	extractedFields?: Record<string, string>;
+	metadata?: Record<string, unknown>;
 	/** Whether tool_started has fired (tool is executing) */
 	started?: boolean;
 	/** Input payload from tool_started */
@@ -507,6 +508,7 @@ export async function processEvent(
 				const snap = getOrCreateSnapshot(broadcastTargetId);
 				const existing = snap.toolChunks.get(event.toolUseId);
 				snap.toolChunks.set(event.toolUseId, {
+					...existing,
 					toolUseId: event.toolUseId,
 					toolName: event.toolName,
 					inputCharsTotal: existing?.inputCharsTotal ?? 0,
@@ -565,6 +567,7 @@ export async function processEvent(
 						contentCharsReceived: event.contentCharsReceived,
 					}),
 					...(event.extractedFields && { extractedFields: event.extractedFields }),
+					...(event.metadata && { metadata: event.metadata }),
 					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				});
 			}
@@ -579,6 +582,7 @@ export async function processEvent(
 					contentCharsReceived: event.contentCharsReceived,
 				}),
 				...(event.extractedFields && { extractedFields: event.extractedFields }),
+				...(event.metadata && { metadata: event.metadata }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				...(event.streamingField && { streamingField: event.streamingField }),
 			});
