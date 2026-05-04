@@ -32,7 +32,7 @@ export const readTool: ToolDefinition = {
 		"- The file_path parameter must be an absolute path, not a relative path\n" +
 		"- By default, it reads the entire file from the beginning\n" +
 		"- You can optionally specify a line offset and limit (especially handy for long files)\n" +
-		"- Set limit to -1 to force reading the entire file, bypassing output truncation (up to ~100k chars)\n" +
+		"- Set limit to -1 to force reading from the offset (or start) to EOF, bypassing output truncation (up to ~100k chars)\n" +
 		"- Any lines longer than 2000 characters will be truncated\n" +
 		"- Results are returned using cat -n format, with line numbers starting at 1\n" +
 		"- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.\n" +
@@ -56,7 +56,7 @@ export const readTool: ToolDefinition = {
 			},
 			limit: {
 				description:
-					"The number of lines to read. Set to -1 to read the entire file bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+					"The number of lines to read. Set to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 				type: "number",
 			},
 			pages: {
@@ -80,7 +80,7 @@ export const readTool: ToolDefinition = {
 			.number()
 			.optional()
 			.describe(
-				"The number of lines to read. Set to -1 to read the entire file bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+				"The number of lines to read. Set to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 			),
 		pages: z
 			.string()
@@ -109,12 +109,6 @@ export const readTool: ToolDefinition = {
 				: undefined;
 
 		const readAll = limit === -1;
-		if (readAll && offset !== undefined) {
-			return {
-				output: "Error: limit=-1 (read-all) cannot be combined with offset",
-				isError: true,
-			};
-		}
 
 		const resolvedPath = resolve(ctx.cwd, file_path);
 

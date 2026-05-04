@@ -7,4 +7,5 @@ export interface PendingPermission {
 	decisionReason?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	suggestions?: any[];
+	suppressNotifications?: boolean;
 }

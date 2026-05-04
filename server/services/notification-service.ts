@@ -108,6 +108,7 @@ async function handleStatusChanged(
 	status: string,
 	substatus?: string[],
 ): Promise<void> {
+	if (substatus?.includes("silent_notification")) return;
 	const isUnread = status === "idle" && substatus?.includes("unread");
 	if (!isUnread && status !== "waiting") return;
 

@@ -43,7 +43,12 @@ export function useRecentTabsWS(
 			(data) => {
 				const nId = data.narratorId as string | undefined;
 				if (data.type === "status_change" || data.type === "narrator:status_changed") {
-					if (nId) onUpdateRef.current(nId, { type: "status", status: data.status as string });
+					if (nId)
+						onUpdateRef.current(nId, {
+							type: "status",
+							status: data.status as string,
+							substatus: data.substatus as string[] | undefined,
+						});
 				} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
 					if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
 				} else if (data.type === "permission_mode_changed") {

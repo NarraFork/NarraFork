@@ -978,12 +978,15 @@ class Gateway {
 					}
 				} else if (msg.type === "permission_request") {
 					const req = msg.request as Record<string, unknown>;
+					if (req.suppressNotifications === true) return;
 					const requestId = typeof req.id === "string" ? req.id : "";
 					const toolName = typeof req.toolName === "string" ? req.toolName : "unknown";
 					const inputJson = req.inputJson as Record<string, unknown> | undefined;
 					const summary = this.formatToolSummary(toolName, inputJson);
-					const text =
-						t("gateway.permissionRequest", locale, { toolName, summary }) + `\n[perm:${requestId}]`;
+					const text = `${t("gateway.permissionRequest", locale, {
+						toolName,
+						summary,
+					})}\n[perm:${requestId}]`;
 					// Use sendAndGetId to track the message ID for quote-reply approval
 					const result = await adapter.sendAndGetId(mapping.chatId, text).catch(() => null);
 					if (result?.messageId && requestId) {

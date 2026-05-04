@@ -199,7 +199,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 			// Trigger client-side notifications for done(unread)/waiting
 			if (event.type === "status" && userPrefsRef.current) {
-				const shouldNotify = event.status === "waiting" || event.substatus?.includes("unread");
+				const shouldNotify =
+					!event.substatus?.includes("silent_notification") &&
+					(event.status === "waiting" || event.substatus?.includes("unread"));
 				if (shouldNotify) {
 					const tab = tabsRef.current.find(
 						(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,

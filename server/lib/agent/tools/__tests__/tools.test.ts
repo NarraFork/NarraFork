@@ -133,13 +133,18 @@ describe("Read", () => {
 		expect(result.output).toContain("Use offset/limit to read the rest");
 	});
 
-	test("returns error when mixing limit=-1 with offset", async () => {
+	test("limit=-1 reads from offset to EOF", async () => {
 		const result = await readTool.execute(
-			{ file_path: "sample.txt", offset: 1, limit: -1 },
+			{ file_path: "sample.txt", offset: 2, limit: -1 },
 			makeCtx(),
 		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("cannot be combined");
+		expect(result.isError).toBeFalsy();
+		expect(result.output).toContain("line two");
+		expect(result.output).toContain("line three");
+		expect(result.output).toContain("line four");
+		expect(result.output).not.toContain("line one");
+		expect(result.truncated).toBe(true);
+		expect(result.metadata).toMatchObject({ readAll: true, readLines: 5 });
 	});
 });
 

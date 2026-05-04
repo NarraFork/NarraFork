@@ -411,8 +411,12 @@ function ToolPermissionsPage() {
 										<Paper
 											key={tool.name}
 											p="xs"
-											bg="var(--mantine-color-dark-7)"
-											style={{ cursor: "pointer" }}
+											withBorder
+											style={{
+												cursor: "pointer",
+												background:
+													"light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
+											}}
 											onClick={() => setSelectedTool(`mcp:${server.name}:${tool.name}`)}
 										>
 											<Group justify="space-between" wrap="nowrap">

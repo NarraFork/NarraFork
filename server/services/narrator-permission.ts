@@ -1965,12 +1965,16 @@ export async function handlePermission(
 						inputJson: effectiveInput,
 						decisionReason: `YOLO safety pause: ${danger.summary}`,
 						suggestions: [yoloReflectionSuggestion],
+						suppressNotifications: true,
 					},
 				});
-				eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
-				await narratorService.updateStatus(narratorId, "waiting");
+				await narratorService.updateStatus(narratorId, "waiting", {
+					substatus: ["silent_notification"],
+				});
 				if (broadcastTargetId && broadcastTargetId !== narratorId) {
-					await narratorService.updateStatus(broadcastTargetId, "waiting");
+					await narratorService.updateStatus(broadcastTargetId, "waiting", {
+						substatus: ["silent_notification"],
+					});
 				}
 
 				if (signal.aborted) {
