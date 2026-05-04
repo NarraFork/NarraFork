@@ -18,6 +18,8 @@ interface DiffViewProps {
 	language?: string;
 	/** 1-based line number where the old text starts in the original file */
 	startLine?: number;
+	/** Optional prefix for provisional line numbers while the real match location is unknown. */
+	lineNumberPrefix?: string;
 }
 
 type DiffLine = {
@@ -255,14 +257,21 @@ const lineNoGutterStyle = {
 } as const;
 
 /** Build the fixed-width gutter string: " oldNo newNo±" with padStart alignment */
+function formatLineNumber(no: number | undefined, w: number, lineNumberPrefix?: string): string {
+	if (no == null) return " ".repeat(w);
+	const label = lineNumberPrefix ? `${lineNumberPrefix}${no}` : String(no);
+	return label.padStart(w);
+}
+
 function formatGutter(
 	oldNo: number | undefined,
 	newNo: number | undefined,
 	prefix: string,
 	w: number,
+	lineNumberPrefix?: string,
 ): string {
-	const old = oldNo != null ? String(oldNo).padStart(w) : " ".repeat(w);
-	const nw = newNo != null ? String(newNo).padStart(w) : " ".repeat(w);
+	const old = formatLineNumber(oldNo, w, lineNumberPrefix);
+	const nw = formatLineNumber(newNo, w, lineNumberPrefix);
 	return `${old} ${nw}${prefix}`;
 }
 
@@ -271,11 +280,13 @@ const DiffLineRow = memo(function DiffLineRow({
 	tokens,
 	diffStyles,
 	lineNoWidth,
+	lineNumberPrefix,
 }: {
 	line: DiffLine;
 	tokens?: ThemedToken[];
 	diffStyles: ReturnType<typeof getDiffStyles>;
 	lineNoWidth?: number;
+	lineNumberPrefix?: string;
 }) {
 	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 	const lineStyle =
@@ -295,7 +306,7 @@ const DiffLineRow = memo(function DiffLineRow({
 		<div style={lineStyle}>
 			{lineNoWidth != null ? (
 				<span style={{ ...lineNoGutterStyle, color: gutterColor }}>
-					{formatGutter(line.oldLineNo, line.newLineNo, prefix, lineNoWidth)}
+					{formatGutter(line.oldLineNo, line.newLineNo, prefix, lineNoWidth, lineNumberPrefix)}
 				</span>
 			) : (
 				<span style={{ ...gutterStyle, color: gutterColor }}>{prefix}</span>
@@ -343,6 +354,7 @@ export const DiffView = memo(function DiffView({
 	wordWrap,
 	language,
 	startLine,
+	lineNumberPrefix,
 }: DiffViewProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const isDark = computedScheme === "dark";
@@ -357,8 +369,8 @@ export const DiffView = memo(function DiffView({
 			if (l.oldLineNo != null && l.oldLineNo > maxNo) maxNo = l.oldLineNo;
 			if (l.newLineNo != null && l.newLineNo > maxNo) maxNo = l.newLineNo;
 		}
-		return Math.max(3, String(maxNo).length);
-	}, [startLine, lines]);
+		return Math.max(3, `${lineNumberPrefix ?? ""}${maxNo}`.length);
+	}, [startLine, lineNumberPrefix, lines]);
 
 	if (lines.length === 0) return null;
 
@@ -397,6 +409,7 @@ export const DiffView = memo(function DiffView({
 							tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
 							diffStyles={diffStyles}
 							lineNoWidth={lineNoWidth}
+							lineNumberPrefix={lineNumberPrefix}
 						/>
 					);
 				})}

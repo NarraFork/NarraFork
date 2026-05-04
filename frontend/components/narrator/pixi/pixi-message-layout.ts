@@ -1,5 +1,11 @@
 import { type LayoutLine, layoutWithLines, prepareWithSegments } from "@chenglou/pretext";
 import { type MdBlock, parseMarkdownBlocks } from "./pixi-markdown";
+import {
+	PIXI_MESSAGE_FONT,
+	PIXI_MESSAGE_METRICS,
+	type PixiMessageHeadingLevel,
+	pixiCssFont,
+} from "./pixi-message-constants";
 import type {
 	PixiMessageItem,
 	PixiToolBadgeModel,
@@ -59,6 +65,7 @@ export interface PixiLaidOutToolDetailBlock {
 		newNo?: number;
 		lines: LayoutLine[];
 	}>;
+	lineNumberPrefix?: string;
 	oldLines?: LayoutLine[];
 	newLines?: LayoutLine[];
 	filename?: string;
@@ -91,6 +98,21 @@ export interface PixiLaidOutBlock {
 	toolInRun?: boolean;
 	toolIsLast?: boolean;
 	toolDefaultOpen?: boolean;
+	reasoningExpanded?: boolean;
+	reasoningCharCount?: number;
+	reasoningEncrypted?: boolean;
+	reasoningStreaming?: boolean;
+	reasoningLabel?: string;
+	reasoningCharsLabel?: string;
+	reasoningThinkingLabel?: string;
+	imageSrc?: string;
+	imageId?: string;
+	imageUploadNarratorId?: string;
+	imageFilename?: string;
+	imageMediaType?: string;
+	imageSavedPath?: string;
+	imageAlt?: string;
+	imageStatus?: string;
 	toolHeader?: { x: number; y: number; width: number; height: number };
 	toolDetailLines?: PixiLaidOutToolDetailLine[];
 	toolDetailBlocks?: PixiLaidOutToolDetailBlock[];
@@ -124,16 +146,40 @@ const TOOL_HEADER_H = 18;
 const TOOL_DETAIL_LINE_H = 18;
 const TOOL_DETAIL_GAP = 6;
 const MIN_ITEM_H = 34;
-const FONT = "14px sans-serif";
-const SMALL_FONT = "12px sans-serif";
-const CODE_FONT = "13px monospace";
-const HEADING_FONTS: Record<1 | 2 | 3 | 4 | 5 | 6, string> = {
-	1: "700 22px sans-serif",
-	2: "700 19px sans-serif",
-	3: "700 17px sans-serif",
-	4: "700 15px sans-serif",
-	5: "700 15px sans-serif",
-	6: "700 15px sans-serif",
+const FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.body, PIXI_MESSAGE_FONT.sansFamily);
+const SMALL_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.small, PIXI_MESSAGE_FONT.sansFamily);
+const CODE_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.code, PIXI_MESSAGE_FONT.monoFamily);
+const HEADING_FONTS: Record<PixiMessageHeadingLevel, string> = {
+	1: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[1],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
+	2: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[2],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
+	3: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[3],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
+	4: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[4],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
+	5: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[5],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
+	6: pixiCssFont(
+		PIXI_MESSAGE_FONT.headingSizes[6],
+		PIXI_MESSAGE_FONT.sansFamily,
+		PIXI_MESSAGE_FONT.weights.bold,
+	),
 };
 const HEADING_LINE_HEIGHTS: Record<1 | 2 | 3 | 4 | 5 | 6, number> = {
 	1: 30,
@@ -144,12 +190,12 @@ const HEADING_LINE_HEIGHTS: Record<1 | 2 | 3 | 4 | 5 | 6, number> = {
 	6: 22,
 };
 const LINE_H = 20;
-const CODE_LINE_H = 16;
+const CODE_LINE_H = PIXI_MESSAGE_METRICS.codeLineHeight;
 const SMALL_LINE_H = 17;
-const CODE_PADDING_X = 10;
-const CODE_PADDING_Y = 7;
-const BLOCKQUOTE_INDENT = 16;
-const LIST_INDENT = 24;
+const CODE_PADDING_X = PIXI_MESSAGE_METRICS.codePaddingX;
+const CODE_PADDING_Y = PIXI_MESSAGE_METRICS.codePaddingY;
+const BLOCKQUOTE_INDENT = PIXI_MESSAGE_METRICS.blockquoteIndent;
+const LIST_INDENT = PIXI_MESSAGE_METRICS.listIndent;
 const MAX_BLOCK_LINES = 120;
 
 const preparedCache = new Map<string, ReturnType<typeof prepareWithSegments>>();
@@ -196,21 +242,24 @@ function capLines(lines: LayoutLine[], max: number): LayoutLine[] {
 }
 
 function layoutSpecialBlock(
-	type: string,
+	block: PixiMessageItem["blocks"][number],
 	text: string,
 	width: number,
 ): { lines: LayoutLine[]; height: number } | null {
-	switch (type) {
+	switch (block.type) {
 		case "reasoning":
 		case "thinking": {
+			if (block.reasoningStreaming && !text.trim()) return { lines: [], height: 22 };
 			const result = layoutText(text, Math.max(24, width - 24), SMALL_FONT, SMALL_LINE_H);
-			return { lines: capLines(result.lines, 4), height: 92 };
+			if (!block.reasoningExpanded) return { lines: capLines(result.lines, 1), height: 22 };
+			const lines = capLines(result.lines, MAX_BLOCK_LINES);
+			return { lines, height: Math.max(48, 30 + lines.length * SMALL_LINE_H) };
 		}
 		case "web_search":
 			return { lines: [], height: 28 };
 		case "image":
 		case "image_generation":
-			return { lines: [], height: 120 };
+			return { lines: [], height: 200 };
 		case "compact":
 		case "segment_compact":
 			return { lines: [], height: 28 };
@@ -478,17 +527,10 @@ function layoutToolDetailBlocks(
 		}
 		if (detail.kind === "code-panel" || detail.kind === "terminal-panel") {
 			const maxLines = detail.maxLines ?? 8;
-			const result = layoutText(
-				detail.text,
-				contentWidth - CODE_PADDING_X * 2,
-				CODE_FONT,
-				CODE_LINE_H,
-			);
+			const panelTextWidth = Math.max(24, contentWidth - CODE_PADDING_X * 2);
+			const result = layoutText(detail.text, panelTextWidth, CODE_FONT, CODE_LINE_H);
 			const lineCount = Math.min(result.lines.length, maxLines);
-			const height =
-				CODE_PADDING_Y * 2 +
-				Math.max(CODE_LINE_H, lineCount * CODE_LINE_H) +
-				(detail.title ? 17 : 0);
+			const height = CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, lineCount * CODE_LINE_H);
 			laid.push({
 				...detail,
 				x: TOOL_CARD_PADDING,
@@ -540,7 +582,6 @@ function layoutToolDetailBlocks(
 			}
 			const height =
 				CODE_PADDING_Y * 2 +
-				23 +
 				diffLines.reduce((sum, line) => sum + Math.max(1, line.lines.length) * CODE_LINE_H, 0);
 			laid.push({
 				...detail,
@@ -674,7 +715,7 @@ export function layoutPixiMessageItems(
 	items: PixiMessageItem[],
 	viewportWidth: number,
 ): PixiMessageLayoutResult {
-	const contentMaxWidth = Math.max(260, viewportWidth - 56);
+	const contentMaxWidth = Math.max(260, viewportWidth - 32);
 	const laidOut: PixiLaidOutItem[] = [];
 	let y = 12;
 
@@ -682,13 +723,8 @@ export function layoutPixiMessageItems(
 		const item = items[i];
 		const isUser = item.role === "user";
 		const isAssistant = item.role === "assistant";
-		const itemWidth =
-			item.kind === "divider"
-				? contentMaxWidth
-				: isUser
-					? Math.min(720, contentMaxWidth * 0.82)
-					: contentMaxWidth;
-		const x = isUser ? Math.max(16, viewportWidth - itemWidth - 16) : 16;
+		const itemWidth = contentMaxWidth;
+		const x = Math.max(16, (viewportWidth - itemWidth) / 2);
 		const isToolRun = item.kind === "tool-run";
 		const innerWidth = Math.max(80, isToolRun ? itemWidth : itemWidth - PADDING_X * 2);
 		let innerY = isToolRun ? 0 : PADDING_Y;
@@ -722,9 +758,7 @@ export function layoutPixiMessageItems(
 			const shouldRenderMarkdown = isAssistant && block.type === "text";
 			const font = block.type === "bash_command" || block.type === "tool_use" ? CODE_FONT : FONT;
 			const toolLayout = isToolUse ? layoutToolUseBlock(block, innerWidth) : null;
-			const specialLayout = !toolLayout
-				? layoutSpecialBlock(block.type, blockText, innerWidth)
-				: null;
+			const specialLayout = !toolLayout ? layoutSpecialBlock(block, blockText, innerWidth) : null;
 			const mdLayout =
 				!toolLayout && !specialLayout && shouldRenderMarkdown
 					? layoutMarkdownBlocks(blockText, innerWidth)
@@ -765,6 +799,21 @@ export function layoutPixiMessageItems(
 				toolInRun: block.toolInRun,
 				toolIsLast: block.toolIsLast,
 				toolDefaultOpen: block.toolDefaultOpen,
+				reasoningExpanded: block.reasoningExpanded,
+				reasoningCharCount: block.reasoningCharCount,
+				reasoningEncrypted: block.reasoningEncrypted,
+				reasoningStreaming: block.reasoningStreaming,
+				reasoningLabel: block.reasoningLabel,
+				reasoningCharsLabel: block.reasoningCharsLabel,
+				reasoningThinkingLabel: block.reasoningThinkingLabel,
+				imageSrc: block.imageSrc,
+				imageId: block.imageId,
+				imageUploadNarratorId: block.imageUploadNarratorId,
+				imageFilename: block.imageFilename,
+				imageMediaType: block.imageMediaType,
+				imageSavedPath: block.imageSavedPath,
+				imageAlt: block.imageAlt,
+				imageStatus: block.imageStatus,
 				toolHeader: toolLayout?.toolHeader,
 				toolDetailLines: toolLayout?.toolDetailLines,
 				toolDetailBlocks: toolLayout?.toolDetailBlocks,

@@ -1,3 +1,4 @@
+import i18n from "@frontend/lib/i18n";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { collectSegmentTargetIds, segmentMessages } from "../message-segments";
 import type { MessagesPage, NarratorMsg } from "../narrator-panel-types";
@@ -33,19 +34,18 @@ export type PixiToolDetailBlockModel =
 	| { kind: "text-line"; text: string; color?: ToolDisplayColor; muted?: boolean; mono?: boolean }
 	| {
 			kind: "code-panel" | "terminal-panel";
-			title?: string;
 			text: string;
 			maxLines?: number;
 			lang?: string;
 	  }
 	| {
 			kind: "diff-panel";
-			title?: string;
 			oldText: string;
 			newText: string;
 			maxLines?: number;
 			lang?: string;
 			startLine?: number;
+			lineNumberPrefix?: string;
 	  }
 	| { kind: "todo-row"; text: string; status?: string }
 	| {
@@ -63,6 +63,14 @@ export interface PixiMessageBlockModel {
 	text: string;
 	label?: string;
 	color?: ToolDisplayColor;
+	imageSrc?: string;
+	imageId?: string;
+	imageUploadNarratorId?: string;
+	imageFilename?: string;
+	imageMediaType?: string;
+	imageSavedPath?: string;
+	imageAlt?: string;
+	imageStatus?: string;
 	toolName?: string;
 	toolCategory?: ToolCategory;
 	toolSummary?: string;
@@ -77,6 +85,20 @@ export interface PixiMessageBlockModel {
 	toolInRun?: boolean;
 	toolIsLast?: boolean;
 	toolDefaultOpen?: boolean;
+	reasoningExpanded?: boolean;
+	reasoningCharCount?: number;
+	reasoningEncrypted?: boolean;
+	reasoningStreaming?: boolean;
+	reasoningLabel?: string;
+	reasoningCharsLabel?: string;
+	reasoningThinkingLabel?: string;
+}
+
+export interface PixiMessageCreatorModel {
+	id: string;
+	username: string;
+	avatarColor?: string | null;
+	avatarImageId?: string | null;
 }
 
 export interface PixiMessageItem {
@@ -86,6 +108,7 @@ export interface PixiMessageItem {
 	role?: string;
 	title: string;
 	subtitle?: string;
+	creator?: PixiMessageCreatorModel | null;
 	blocks: PixiMessageBlockModel[];
 	createdAt?: string | null;
 	tokenUsage?: string | null;
@@ -102,6 +125,7 @@ export interface BuildPixiMessageItemsOptions {
 	showManualLoadOlder?: boolean;
 	showConclusionButton?: boolean;
 	showTokenUsage?: boolean;
+	expandReasoning?: boolean;
 }
 
 function usageNumber(value: unknown): number {
@@ -187,6 +211,37 @@ function blockText(block: Record<string, unknown>): string {
 	return safeJsonSummary(block, 500);
 }
 
+function tNarrator(key: string, fallback: string, options?: Record<string, unknown>): string {
+	const value = i18n.t(key, { ns: "narrator", ...options });
+	return typeof value === "string" && value !== key ? value : fallback;
+}
+
+function hasEncryptedReasoningMetadata(block: Record<string, unknown>): boolean {
+	const providerMetadata = block.providerMetadata;
+	if (!providerMetadata || typeof providerMetadata !== "object") return false;
+	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
+		if (!metadata || typeof metadata !== "object") return false;
+		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
+		return typeof encrypted === "string" && encrypted.length > 0;
+	});
+}
+
+function reasoningDisplayText(block: Record<string, unknown>): string {
+	const rawText =
+		typeof block.text === "string"
+			? block.text
+			: typeof block.thinking === "string"
+				? block.thinking
+				: "";
+	const translatedText =
+		typeof block.translatedText === "string" ? block.translatedText : undefined;
+	if (translatedText) return translatedText;
+	if (rawText) return rawText;
+	return hasEncryptedReasoningMetadata(block)
+		? tNarrator("reasoningEncryptedPlaceholder", "Reasoning content is encrypted")
+		: "";
+}
+
 function specialLabel(type: string): string {
 	switch (type) {
 		case "reasoning":
@@ -234,16 +289,21 @@ function colorForBlock(type: string): PixiMessageBlockModel["color"] {
 	if (type === "merge_summary") return "indigo";
 	if (type === "review_feedback") return "green";
 	if (type === "web_search") return "blue";
-	if (type === "reasoning" || type === "thinking") return "yellow";
+	if (type === "reasoning" || type === "thinking") return "grape";
 	return "gray";
 }
 
-function messageBlocks(msg: NarratorMsg, visibleBlockIndices?: number[]): PixiMessageBlockModel[] {
+function messageBlocks(
+	msg: NarratorMsg,
+	visibleBlockIndices?: number[],
+	expandReasoning?: boolean,
+): PixiMessageBlockModel[] {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	const chosen = visibleBlockIndices
 		? visibleBlockIndices.map((i) => blocks[i]).filter(Boolean)
 		: blocks;
 	const result: PixiMessageBlockModel[] = [];
+	const isStreaming = msg.id === "__streaming__";
 	for (const raw of chosen) {
 		const block = raw as Record<string, unknown>;
 		const type = String(block.type ?? "unknown");
@@ -258,6 +318,31 @@ function messageBlocks(msg: NarratorMsg, visibleBlockIndices?: number[]): PixiMe
 				label: "Image",
 				text: String(block.filename ?? block.mediaType ?? "Attached image"),
 				color: "blue",
+				imageSrc: typeof block.previewUrl === "string" ? block.previewUrl : undefined,
+				imageId: typeof block.imageId === "string" ? block.imageId : undefined,
+				imageUploadNarratorId:
+					typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : msg.narratorId,
+				imageFilename: typeof block.filename === "string" ? block.filename : undefined,
+				imageMediaType: typeof block.mediaType === "string" ? block.mediaType : undefined,
+				imageAlt: typeof block.filename === "string" ? block.filename : "image",
+			});
+			continue;
+		}
+		if (type === "image_generation") {
+			const revisedPrompt =
+				typeof block.revisedPrompt === "string" ? block.revisedPrompt : undefined;
+			const status = typeof block.status === "string" ? block.status : undefined;
+			const savedPath = typeof block.savedPath === "string" ? block.savedPath : undefined;
+			const resultBase64 = typeof block.result === "string" ? block.result : undefined;
+			result.push({
+				type,
+				label: "Image generation",
+				text: revisedPrompt ?? status ?? "Generated image",
+				color: "grape",
+				imageSrc: resultBase64,
+				imageSavedPath: savedPath,
+				imageAlt: revisedPrompt ?? "Generated image",
+				imageStatus: status,
 			});
 			continue;
 		}
@@ -273,6 +358,26 @@ function messageBlocks(msg: NarratorMsg, visibleBlockIndices?: number[]): PixiMe
 		}
 		if (type === "bash_command") {
 			result.push({ type, label: "Bash", text: `$ ${String(block.command ?? "")}`, color: "gray" });
+			continue;
+		}
+		if (type === "reasoning" || type === "thinking") {
+			const text = reasoningDisplayText(block);
+			const isEncrypted = hasEncryptedReasoningMetadata(block) && !block.text && !block.thinking;
+			if (!text && !isStreaming) continue;
+			const formatted = text.length.toLocaleString();
+			result.push({
+				type,
+				label: tNarrator("reasoning", "Reasoning"),
+				text,
+				color: "grape",
+				reasoningExpanded: expandReasoning === true && !!text,
+				reasoningCharCount: text.length,
+				reasoningEncrypted: isEncrypted,
+				reasoningStreaming: isStreaming,
+				reasoningLabel: tNarrator("reasoning", "Reasoning"),
+				reasoningCharsLabel: tNarrator("reasoningChars", `${formatted} chars`, { formatted }),
+				reasoningThinkingLabel: tNarrator("thinking", "Thinking"),
+			});
 			continue;
 		}
 		const text = blockText(block);
@@ -319,8 +424,96 @@ function statusColor(status: string): ToolDisplayColor {
 	return "blue";
 }
 
+function isToolOutputEnvelope(value: unknown): boolean {
+	const record = asRecord(value);
+	return !!(
+		record &&
+		(typeof record._text === "string" ||
+			typeof record._metadata === "object" ||
+			record._truncated === true)
+	);
+}
+
+function extractJsonObjectAt(text: string, start: number): string | null {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{") depth++;
+		else if (ch === "}") {
+			depth--;
+			if (depth === 0) return text.slice(start, i + 1);
+		}
+	}
+	return null;
+}
+
+function parseEmbeddedToolOutputEnvelope(text: string): unknown {
+	const trimmed = text.trim();
+	const candidates = [trimmed, ...trimmed.split(/\r?\n/).map((line) => line.trim())];
+	for (const candidate of candidates) {
+		const start = candidate.search(/\{\s*"_(text|metadata|truncated)"/);
+		if (start < 0) continue;
+		const jsonText = extractJsonObjectAt(candidate, start);
+		if (!jsonText) continue;
+		try {
+			const parsed = JSON.parse(jsonText);
+			if (isToolOutputEnvelope(parsed)) return parsed;
+		} catch {
+			// Try the next physical line/candidate.
+		}
+	}
+	return text;
+}
+
+function parsePossiblyStringifiedJson(value: unknown, onlyEnvelope = false): unknown {
+	let current = value;
+	for (let i = 0; i < 3; i++) {
+		if (typeof current !== "string") break;
+		const trimmed = current.trim();
+		if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith('"')) {
+			break;
+		}
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (typeof parsed === "string") {
+				current = parsed;
+				continue;
+			}
+			if (onlyEnvelope && !isToolOutputEnvelope(parsed)) break;
+			current = parsed;
+		} catch {
+			break;
+		}
+	}
+	return onlyEnvelope && typeof current === "string"
+		? parseEmbeddedToolOutputEnvelope(current)
+		: current;
+}
+
+function pixiResolveDisplayText(value: unknown): string {
+	const truncatedText = extractField(value, "_text");
+	if (truncatedText) return truncatedText;
+	return resolveDisplayText(parsePossiblyStringifiedJson(value, true));
+}
+
 function addOutputLines(lines: PixiToolDetailLineModel[], outputJson: unknown): void {
-	const output = resolveDisplayText(outputJson);
+	const output = pixiResolveDisplayText(outputJson);
 	if (!output.trim()) return;
 	lines.push(...firstLines(output, Math.max(1, 4 - lines.length)));
 }
@@ -335,13 +528,17 @@ function metadataFrom(
 	outputJson: unknown,
 	metadata?: Record<string, unknown>,
 ): Record<string, unknown> {
-	return (asRecord(outputJson)?._metadata as Record<string, unknown> | undefined) ?? metadata ?? {};
+	const normalizedOutput = parsePossiblyStringifiedJson(outputJson, true);
+	return (
+		(asRecord(normalizedOutput)?._metadata as Record<string, unknown> | undefined) ?? metadata ?? {}
+	);
 }
 
 function parseJsonRecord(value: unknown): Record<string, unknown> | null {
-	const record = asRecord(value);
+	const normalized = parsePossiblyStringifiedJson(value);
+	const record = asRecord(normalized);
 	if (record) return record;
-	const raw = resolveDisplayText(value).trim();
+	const raw = pixiResolveDisplayText(normalized).trim();
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw);
@@ -352,7 +549,17 @@ function parseJsonRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function parseJsonArray(value: unknown): Array<Record<string, unknown>> {
-	const raw = resolveDisplayText(value).trim();
+	const normalized = parsePossiblyStringifiedJson(value);
+	if (Array.isArray(normalized)) {
+		return normalized.filter((v): v is Record<string, unknown> => Boolean(asRecord(v)));
+	}
+	const normalizedRecord = asRecord(normalized);
+	if (Array.isArray(normalizedRecord?.results)) {
+		return normalizedRecord.results.filter((v: unknown): v is Record<string, unknown> =>
+			Boolean(asRecord(v)),
+		);
+	}
+	const raw = pixiResolveDisplayText(normalized).trim();
 	if (!raw) return [];
 	try {
 		const parsed = JSON.parse(raw);
@@ -373,15 +580,14 @@ function outputPanel(
 	blocks: PixiToolDetailBlockModel[],
 	outputJson: unknown,
 	kind: "code-panel" | "terminal-panel" = "code-panel",
-	title = "Output",
+	_title = "Output",
 	maxLines = 8,
 ): void {
-	const output = resolveDisplayText(outputJson);
+	const output = pixiResolveDisplayText(outputJson);
 	if (!output.trim()) return;
 	blocks.push({
 		kind,
 		text: output,
-		title,
 		maxLines,
 	});
 }
@@ -389,13 +595,12 @@ function outputPanel(
 function inputPanel(
 	blocks: PixiToolDetailBlockModel[],
 	inputJson: unknown,
-	title = "Input",
+	_title = "Input",
 	maxLines = 8,
 ): void {
-	const input = resolveDisplayText(inputJson);
+	const input = pixiResolveDisplayText(inputJson);
 	if (!input.trim()) return;
-	blocks.push({ kind: "section-title", text: title });
-	blocks.push({ kind: "code-panel", text: input, title, maxLines, lang: "json" });
+	blocks.push({ kind: "code-panel", text: input, maxLines, lang: "json" });
 }
 
 function parseTaskOutputXml(raw: string): Record<string, string> {
@@ -455,6 +660,32 @@ function getStreamingFileInput(
 	return { filePath, fieldName, value };
 }
 
+function getStreamingEditInput(inputJson: unknown): {
+	filePath: string;
+	phase: "matching" | "replacing";
+	oldString: string;
+	newString: string;
+} | null {
+	const input = asRecord(inputJson);
+	if (!input || input._streamingChars == null) return null;
+	const fields = asRecord(input._streamingFields) ?? {};
+	const fieldName = typeof input._streamingFieldName === "string" ? input._streamingFieldName : "";
+	const fieldValue =
+		typeof input._streamingFieldValue === "string" ? input._streamingFieldValue : "";
+	const filePath =
+		(typeof input._streamingFilePath === "string" ? input._streamingFilePath : undefined) ??
+		(typeof fields.file_path === "string" ? fields.file_path : undefined) ??
+		getFilePath(inputJson);
+	const oldString =
+		(typeof fields.old_string === "string" ? fields.old_string : "") ||
+		(fieldName === "old_string" ? fieldValue : "");
+	const newString =
+		(typeof fields.new_string === "string" ? fields.new_string : "") ||
+		(fieldName === "new_string" ? fieldValue : "");
+	const phase = fieldName === "new_string" || newString ? "replacing" : "matching";
+	return { filePath: filePath || "Edit", phase, oldString, newString };
+}
+
 function buildToolDetailBlocks(
 	toolName: string,
 	inputJson: unknown,
@@ -467,14 +698,13 @@ function buildToolDetailBlocks(
 	const streamingFile = category === "file" ? getStreamingFileInput(inputJson) : null;
 	const filePath = streamingFile?.filePath ?? getFilePath(inputJson);
 	const meta = metadataFrom(outputJson, metadata);
-	const output = resolveDisplayText(outputJson);
+	const output = pixiResolveDisplayText(outputJson);
 	switch (category) {
 		case "bash": {
 			const command = extractField(inputJson, "command");
 			if (command)
 				blocks.push({
 					kind: "terminal-panel",
-					title: "Command",
 					text: `$ ${command}`,
 					maxLines: 3,
 				});
@@ -497,7 +727,6 @@ function buildToolDetailBlocks(
 			} else if (output.trim()) {
 				blocks.push({
 					kind: "code-panel",
-					title: filePath || "Read",
 					text: output,
 					maxLines: 8,
 					lang: filePath ? getShikiLang(filePath) : "text",
@@ -506,12 +735,33 @@ function buildToolDetailBlocks(
 			break;
 		}
 		case "file": {
+			const streamingEdit =
+				toolName === "Edit" || toolName === "MultiEdit" ? getStreamingEditInput(inputJson) : null;
 			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
-			if (streamingFile) {
+			if (streamingEdit) {
+				blocks.push({
+					kind: "badge-row",
+					badges: [
+						badge(streamingEdit.phase, streamingEdit.phase === "replacing" ? "violet" : "blue"),
+						badge("streaming", "blue", "dot"),
+					],
+				});
+				blocks.push({
+					kind: "diff-panel",
+					oldText: streamingEdit.oldString || " ",
+					newText:
+						streamingEdit.phase === "replacing"
+							? streamingEdit.newString
+							: streamingEdit.oldString || " ",
+					maxLines: 8,
+					lang: streamingEdit.filePath ? getShikiLang(streamingEdit.filePath) : "diff",
+					startLine: 1,
+					lineNumberPrefix: streamingEdit.phase === "matching" ? "xx" : undefined,
+				});
+			} else if (streamingFile) {
 				blocks.push({ kind: "badge-row", badges: [badge("streaming", "blue", "dot")] });
 				blocks.push({
 					kind: "code-panel",
-					title: filePath ? filePath.split("/").pop() : `Streaming ${streamingFile.fieldName}`,
 					text: streamingFile.value,
 					maxLines: 10,
 					lang: filePath ? getShikiLang(filePath) : "text",
@@ -523,7 +773,6 @@ function buildToolDetailBlocks(
 				if (oldString || newString) {
 					blocks.push({
 						kind: "diff-panel",
-						title: filePath || "Diff",
 						oldText: oldString,
 						newText: newString,
 						maxLines: 8,
@@ -533,8 +782,7 @@ function buildToolDetailBlocks(
 				} else if (Object.keys(asRecord(inputJson) ?? {}).length > 0) {
 					blocks.push({
 						kind: "code-panel",
-						title: filePath || toolName,
-						text: resolveDisplayText(inputJson),
+						text: pixiResolveDisplayText(inputJson),
 						maxLines: 8,
 						lang: "json",
 					});
@@ -544,7 +792,6 @@ function buildToolDetailBlocks(
 				if (content)
 					blocks.push({
 						kind: "code-panel",
-						title: filePath || "Write",
 						text: content,
 						maxLines: 8,
 						lang: filePath ? getShikiLang(filePath) : "text",
@@ -556,12 +803,16 @@ function buildToolDetailBlocks(
 		case "search": {
 			const pattern = extractField(inputJson, "pattern", "glob");
 			const path = extractField(inputJson, "path");
-			const badges = [pattern ? badge(pattern, "gray", "outline") : null].filter(
-				Boolean,
-			) as PixiToolBadgeModel[];
-			if (badges.length) blocks.push({ kind: "badge-row", badges });
-			if (path) blocks.push({ kind: "text-line", text: `in ${path}`, muted: true });
-			outputPanel(blocks, outputJson, "code-panel", "Output");
+			if (pattern) blocks.push({ kind: "text-line", text: pattern, muted: true, mono: true });
+			if (path) blocks.push({ kind: "text-line", text: `in ${path}`, muted: true, mono: true });
+			if (output.trim()) {
+				blocks.push({
+					kind: "code-panel",
+					text: output,
+					maxLines: 12,
+					lang: "grep-output",
+				});
+			}
 			break;
 		}
 		case "webSearch": {
@@ -618,7 +869,7 @@ function buildToolDetailBlocks(
 				});
 			const input = extractField(inputJson, "input");
 			if (action === "write" && input)
-				blocks.push({ kind: "terminal-panel", title: "Terminal Input", text: input, maxLines: 3 });
+				blocks.push({ kind: "terminal-panel", text: input, maxLines: 3 });
 			outputPanel(
 				blocks,
 				outputJson,
@@ -722,8 +973,7 @@ function buildToolDetailBlocks(
 			});
 			const message = extractField(inputJson, "message");
 			if (message) {
-				blocks.push({ kind: "section-title", text: "Message" });
-				blocks.push({ kind: "code-panel", title: "Send message", text: message, maxLines: 6 });
+				blocks.push({ kind: "code-panel", text: message, maxLines: 6 });
 			}
 			outputPanel(
 				blocks,
@@ -754,7 +1004,6 @@ function buildToolDetailBlocks(
 			if (skillContent.trim()) {
 				blocks.push({
 					kind: "code-panel",
-					title: name ? `Skill: ${name}` : "Skill",
 					text: skillContent,
 					maxLines: 10,
 				});
@@ -812,7 +1061,6 @@ function buildToolDetailBlocks(
 			if (parsed.output)
 				blocks.push({
 					kind: "code-panel",
-					title: taskId ? `TaskOutput ${taskId}` : "TaskOutput",
 					text: parsed.output,
 					maxLines: 10,
 				});
@@ -831,7 +1079,7 @@ function buildToolDetailBlocks(
 			if (badges.length) blocks.push({ kind: "badge-row", badges });
 			if (description)
 				blocks.push({ kind: "result-card", title: "Task", text: description, color: "indigo" });
-			if (prompt) blocks.push({ kind: "code-panel", title: "Prompt", text: prompt, maxLines: 8 });
+			if (prompt) blocks.push({ kind: "code-panel", text: prompt, maxLines: 8 });
 			outputPanel(blocks, outputJson, "code-panel", "Result");
 			break;
 		}
@@ -839,8 +1087,7 @@ function buildToolDetailBlocks(
 			const plan = extractField(inputJson, "plan");
 			const denied = String(meta.permissionDenyMessage ?? "");
 			if (denied) blocks.push({ kind: "text-line", text: denied, color: "yellow" });
-			if (plan)
-				blocks.push({ kind: "code-panel", title: `Plan — ${toolName}`, text: plan, maxLines: 14 });
+			if (plan) blocks.push({ kind: "code-panel", text: plan, maxLines: 14 });
 			else outputPanel(blocks, outputJson, "code-panel", "Output");
 			break;
 		}
@@ -886,12 +1133,29 @@ function buildToolDetailLines(
 		case "file": {
 			if (filePath) lines.push({ label: "file", text: filePath, kind: "muted" });
 			if (toolName === "Edit" || toolName === "MultiEdit") {
-				const oldString = extractField(inputJson, "old_string");
-				const newString = extractField(inputJson, "new_string");
-				if (oldString)
-					lines.push({ label: "old", text: truncateLine(oldString, 120), kind: "code" });
-				if (newString)
-					lines.push({ label: "new", text: truncateLine(newString, 120), kind: "code" });
+				const streamingEdit = getStreamingEditInput(inputJson);
+				if (streamingEdit) {
+					lines.push({ label: "phase", text: streamingEdit.phase, kind: "muted" });
+					if (streamingEdit.oldString)
+						lines.push({
+							label: "match",
+							text: truncateLine(streamingEdit.oldString, 120),
+							kind: "code",
+						});
+					if (streamingEdit.newString)
+						lines.push({
+							label: "replace",
+							text: truncateLine(streamingEdit.newString, 120),
+							kind: "code",
+						});
+				} else {
+					const oldString = extractField(inputJson, "old_string");
+					const newString = extractField(inputJson, "new_string");
+					if (oldString)
+						lines.push({ label: "old", text: truncateLine(oldString, 120), kind: "code" });
+					if (newString)
+						lines.push({ label: "new", text: truncateLine(newString, 120), kind: "code" });
+				}
 			} else if (toolName === "Write") {
 				const content = extractField(inputJson, "content");
 				if (content)
@@ -1033,6 +1297,7 @@ function messageItem(
 	key: string,
 	visibleBlockIndices: number[] | undefined,
 	showTokenUsage: boolean | undefined,
+	expandReasoning: boolean | undefined,
 ): PixiMessageItem {
 	return {
 		key,
@@ -1041,7 +1306,8 @@ function messageItem(
 		role: msg.role,
 		title: titleForMessage(msg),
 		subtitle: displayTime(msg.createdAt),
-		blocks: messageBlocks(msg, visibleBlockIndices),
+		creator: msg.creator ?? null,
+		blocks: messageBlocks(msg, visibleBlockIndices, expandReasoning),
 		createdAt: msg.createdAt,
 		tokenUsage: showTokenUsage && msg.role === "assistant" ? formatTurnUsage(msg) : null,
 	};
@@ -1084,7 +1350,15 @@ export function buildPixiMessageItems(opts: BuildPixiMessageItemsOptions): PixiM
 		}
 		if (seg.kind === "message") {
 			const key = uniqueKey(seg.visibleBlockIndices ? `${seg.msg.id}-leading` : seg.msg.id);
-			items.push(messageItem(seg.msg, key, seg.visibleBlockIndices, opts.showTokenUsage));
+			items.push(
+				messageItem(
+					seg.msg,
+					key,
+					seg.visibleBlockIndices,
+					opts.showTokenUsage,
+					opts.expandReasoning,
+				),
+			);
 			continue;
 		}
 		const first = seg.sourceMessages[0];

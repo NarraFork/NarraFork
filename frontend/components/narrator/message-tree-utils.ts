@@ -506,6 +506,7 @@ export function upsertSubagentStreamingChunk(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	streamingField?: { name: string; value: string },
 ): InfiniteCache {
 	const syntheticId = subagentStreamingId(parentToolUseId);
 
@@ -527,6 +528,7 @@ export function upsertSubagentStreamingChunk(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				streamingField,
 			);
 			if (changed) {
 				page.messages = messages;
@@ -551,6 +553,7 @@ export function upsertSubagentStreamingChunk(
 			extractedFilePath,
 			contentCharsReceived,
 			extractedFields,
+			streamingField,
 		);
 		if (changed) anyChanged = true;
 		return changed ? { ...page, messages } : page;
@@ -571,6 +574,7 @@ function upsertStreamingChildAtPath(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	streamingField?: { name: string; value: string },
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (path.length === 0) return { messages, changed: false };
 	const [idx, ...rest] = path;
@@ -592,6 +596,7 @@ function upsertStreamingChildAtPath(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				streamingField,
 			),
 			changed: true,
 		};
@@ -610,6 +615,7 @@ function upsertStreamingChildAtPath(
 		extractedFilePath,
 		contentCharsReceived,
 		extractedFields,
+		streamingField,
 	);
 	if (!childResult.changed) return { messages, changed: false };
 	const updated = [...messages];
@@ -630,6 +636,7 @@ function upsertStreamingChildOnMsg(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	streamingField?: { name: string; value: string },
 ): TreeMessage[] {
 	const msg = messages[msgIdx];
 	const children = [...(msg.children || [])];
@@ -640,6 +647,10 @@ function upsertStreamingChildOnMsg(
 	if (extractedFilePath) streamingInput._streamingFilePath = extractedFilePath;
 	if (contentCharsReceived != null) streamingInput._streamingContentChars = contentCharsReceived;
 	if (extractedFields) streamingInput._streamingFields = extractedFields;
+	if (streamingField) {
+		streamingInput._streamingFieldName = streamingField.name;
+		streamingInput._streamingFieldValue = streamingField.value;
+	}
 
 	const { blocks, toolCalls } = upsertStreamingToolBlock(
 		existing ? [...existing.contentJson] : [],
@@ -682,6 +693,7 @@ function upsertStreamingChildInMessages(
 	extractedFilePath?: string,
 	contentCharsReceived?: number,
 	extractedFields?: Record<string, string>,
+	streamingField?: { name: string; value: string },
 ): { messages: TreeMessage[]; changed: boolean } {
 	if (!Array.isArray(messages)) return { messages: messages ?? [], changed: false };
 	let anyChanged = false;
@@ -701,6 +713,10 @@ function upsertStreamingChildInMessages(
 			if (contentCharsReceived != null)
 				streamingInput._streamingContentChars = contentCharsReceived;
 			if (extractedFields) streamingInput._streamingFields = extractedFields;
+			if (streamingField) {
+				streamingInput._streamingFieldName = streamingField.name;
+				streamingInput._streamingFieldValue = streamingField.value;
+			}
 
 			const { blocks, toolCalls } = upsertStreamingToolBlock(
 				existing ? [...existing.contentJson] : [],
@@ -743,6 +759,7 @@ function upsertStreamingChildInMessages(
 				extractedFilePath,
 				contentCharsReceived,
 				extractedFields,
+				streamingField,
 			);
 			if (childResult.changed) {
 				anyChanged = true;

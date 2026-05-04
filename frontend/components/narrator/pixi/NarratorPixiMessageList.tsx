@@ -13,14 +13,20 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useLocalPref } from "../../../hooks/useLocalPref";
 import { getRenderableMessageOrder } from "../message-order-utils";
 import type { MessagesQueryData, NarratorMsg } from "../narrator-panel-types";
-import { drawPixiMessages, TextPool } from "./pixi-message-draw";
+import { invalidatePixiImageTextures, subscribePixiImageTextureLoads } from "./pixi-image-textures";
+import { drawPixiMessages, ImageSpritePool, TextPool } from "./pixi-message-draw";
 import { clearPixiMessageLayoutCache, layoutPixiMessageItems } from "./pixi-message-layout";
 import { buildPixiMessageItems } from "./pixi-message-model";
 import { invalidatePixiMessageThemeCache, resolvePixiMessageTheme } from "./pixi-message-theme";
 import { subscribePixiShikiHighlights } from "./pixi-shiki-highlight";
-import { IconSpritePool, subscribePixiTablerIconLoads } from "./pixi-tabler-icons";
+import {
+	IconSpritePool,
+	invalidatePixiTablerIconTextures,
+	subscribePixiTablerIconLoads,
+} from "./pixi-tabler-icons";
 
 export interface NarratorPixiMessageListHandle {
 	scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" }) => void;
@@ -55,6 +61,14 @@ function isViewportAtBottom(viewport: HTMLElement): boolean {
 	return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 30;
 }
 
+function clamp(value: number, min: number, max: number): number {
+	return Math.min(max, Math.max(min, value));
+}
+
+function getMaxScrollTop(viewport: HTMLElement): number {
+	return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+}
+
 export const NarratorPixiMessageList = forwardRef<
 	NarratorPixiMessageListHandle,
 	NarratorPixiMessageListProps
@@ -83,40 +97,38 @@ export const NarratorPixiMessageList = forwardRef<
 	const gfxRef = useRef<Graphics | null>(null);
 	const textPoolRef = useRef<TextPool | null>(null);
 	const iconPoolRef = useRef<IconSpritePool | null>(null);
+	const imagePoolRef = useRef<ImageSpritePool | null>(null);
 	const [ready, setReady] = useState(false);
 	const [size, setSize] = useState({ width: 0, height: 0 });
-	const [scrollTop, setScrollTop] = useState(0);
 	const [themeVersion, setThemeVersion] = useState(0);
 	const [layoutVersion, setLayoutVersion] = useState(0);
 	const [dprVersion, setDprVersion] = useState(0);
 	const [iconVersion, setIconVersion] = useState(0);
+	const [imageVersion, setImageVersion] = useState(0);
 	const [highlightVersion, setHighlightVersion] = useState(0);
+	const [restoreVersion, setRestoreVersion] = useState(0);
+	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
+	const virtualScrollTopRef = useRef(0);
+	const scrollEndTimerRef = useRef(0);
+	const lastLightResumeAtRef = useRef(0);
+	const lastVisibilityStateRef = useRef(
+		typeof document !== "undefined" ? document.visibilityState : "visible",
+	);
 	const isAtBottomRef = useRef(true);
 	const prevTotalHeightRef = useRef(0);
 	const prevFirstKeyRef = useRef<string | null>(null);
+	const appliedRestoreVersionRef = useRef(0);
 
 	const orderedMessages = useMemo(() => {
 		if (!messagesData?.pages?.length) return [];
 		return getRenderableMessageOrder(messagesData.pages).messages;
 	}, [messagesData]);
 
-	const items = useMemo(
-		() =>
-			buildPixiMessageItems({
-				pages: messagesData?.pages ?? [],
-				pageParams: messagesData?.pageParams,
-				orderedMessages,
-				narratorId,
-				streamingMsg,
-				pruneBoundaryMessageId,
-				pruneDividerLabel,
-				showManualLoadOlder,
-				showConclusionButton,
-				showTokenUsage,
-			}),
-		[
-			messagesData?.pages,
-			messagesData?.pageParams,
+	const items = useMemo(() => {
+		void layoutVersion;
+		return buildPixiMessageItems({
+			pages: messagesData?.pages ?? [],
+			pageParams: messagesData?.pageParams,
 			orderedMessages,
 			narratorId,
 			streamingMsg,
@@ -125,8 +137,22 @@ export const NarratorPixiMessageList = forwardRef<
 			showManualLoadOlder,
 			showConclusionButton,
 			showTokenUsage,
-		],
-	);
+			expandReasoning,
+		});
+	}, [
+		messagesData?.pages,
+		messagesData?.pageParams,
+		orderedMessages,
+		narratorId,
+		streamingMsg,
+		pruneBoundaryMessageId,
+		pruneDividerLabel,
+		showManualLoadOlder,
+		showConclusionButton,
+		showTokenUsage,
+		expandReasoning,
+		layoutVersion,
+	]);
 
 	const refreshTheme = useCallback(() => {
 		invalidatePixiMessageThemeCache();
@@ -144,6 +170,92 @@ export const NarratorPixiMessageList = forwardRef<
 		void layoutVersion;
 		return layoutPixiMessageItems(items, Math.max(1, size.width));
 	}, [items, size.width, layoutVersion]);
+	const virtualScrollHeight = Math.max(size.height, layout.totalHeight);
+
+	const renderPixiViewport = useCallback(
+		(nextScrollTop?: number, options?: { bufferPx?: number }) => {
+			void themeVersion;
+			void dprVersion;
+			void iconVersion;
+			void imageVersion;
+			void highlightVersion;
+			void restoreVersion;
+			if (
+				!ready ||
+				!appRef.current ||
+				!stageContainerRef.current ||
+				!gfxRef.current ||
+				!textPoolRef.current ||
+				!iconPoolRef.current ||
+				!imagePoolRef.current
+			) {
+				return false;
+			}
+
+			const currentScrollTop = Math.max(
+				0,
+				nextScrollTop ?? viewportRef.current?.scrollTop ?? virtualScrollTopRef.current,
+			);
+			virtualScrollTopRef.current = currentScrollTop;
+
+			const app = appRef.current;
+			const gfx = gfxRef.current;
+			const textPool = textPoolRef.current;
+			const iconPool = iconPoolRef.current;
+			const imagePool = imagePoolRef.current;
+			const theme = resolvePixiMessageTheme();
+			textPool.reset();
+			iconPool.reset();
+			imagePool.reset();
+			drawPixiMessages({
+				textPool,
+				iconPool,
+				imagePool,
+				gfx,
+				items: layout.items,
+				theme,
+				scrollTop: currentScrollTop,
+				viewportHeight: size.height,
+				highlightedId,
+				...(options?.bufferPx != null ? { bufferPx: options.bufferPx } : {}),
+			});
+			imagePool.releaseUnused();
+			textPool.releaseUnused();
+			iconPool.releaseUnused();
+			app.render();
+			return true;
+		},
+		[
+			ready,
+			layout.items,
+			size.height,
+			highlightedId,
+			themeVersion,
+			dprVersion,
+			iconVersion,
+			imageVersion,
+			highlightVersion,
+			restoreVersion,
+		],
+	);
+
+	const setNativeScrollTop = useCallback(
+		(targetScrollTop: number, options?: { behavior?: ScrollBehavior; bufferPx?: number }) => {
+			const viewport = viewportRef.current;
+			if (!viewport) return 0;
+			const target = clamp(targetScrollTop, 0, getMaxScrollTop(viewport));
+			if (options?.behavior === "smooth") {
+				viewport.scrollTo({ top: target, behavior: "smooth" });
+				return target;
+			}
+			viewport.scrollTop = target;
+			virtualScrollTopRef.current = viewport.scrollTop;
+			isAtBottomRef.current = isViewportAtBottom(viewport);
+			renderPixiViewport(viewport.scrollTop, { bufferPx: options?.bufferPx });
+			return viewport.scrollTop;
+		},
+		[renderPixiViewport],
+	);
 
 	const setViewportNode = useCallback(
 		(node: HTMLDivElement | null) => {
@@ -180,14 +292,30 @@ export const NarratorPixiMessageList = forwardRef<
 	useEffect(() => {
 		const viewport = viewportRef.current;
 		if (!viewport) return;
-		const onScroll = () => {
-			setScrollTop(viewport.scrollTop);
+
+		let renderRaf = 0;
+		const renderFromNativeScroll = (bufferPx?: number) => {
+			virtualScrollTopRef.current = viewport.scrollTop;
 			isAtBottomRef.current = isViewportAtBottom(viewport);
+			renderPixiViewport(viewport.scrollTop, bufferPx == null ? undefined : { bufferPx });
 		};
-		onScroll();
+		const onScroll = () => {
+			cancelAnimationFrame(renderRaf);
+			renderRaf = requestAnimationFrame(() => renderFromNativeScroll());
+			clearTimeout(scrollEndTimerRef.current);
+			scrollEndTimerRef.current = window.setTimeout(() => {
+				viewport.dispatchEvent(new Event("scrollend"));
+			}, 120);
+		};
+
+		renderFromNativeScroll(0);
 		viewport.addEventListener("scroll", onScroll, { passive: true });
-		return () => viewport.removeEventListener("scroll", onScroll);
-	}, []);
+		return () => {
+			cancelAnimationFrame(renderRaf);
+			clearTimeout(scrollEndTimerRef.current);
+			viewport.removeEventListener("scroll", onScroll);
+		};
+	}, [renderPixiViewport]);
 
 	useLayoutEffect(() => {
 		const previousTotalHeight = prevTotalHeightRef.current;
@@ -205,19 +333,19 @@ export const NarratorPixiMessageList = forwardRef<
 				heightDelta > 0;
 
 			if (prependedItems) {
-				viewport.scrollTop += heightDelta;
-				setScrollTop(viewport.scrollTop);
+				setNativeScrollTop(viewport.scrollTop + heightDelta);
 				isAtBottomRef.current = isViewportAtBottom(viewport);
 			} else if (isAtBottomRef.current) {
-				viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-				setScrollTop(viewport.scrollTop);
+				setNativeScrollTop(getMaxScrollTop(viewport));
 				isAtBottomRef.current = true;
+			} else {
+				setNativeScrollTop(viewport.scrollTop, { bufferPx: 0 });
 			}
 		}
 
 		prevTotalHeightRef.current = nextTotalHeight;
 		prevFirstKeyRef.current = nextFirstKey;
-	}, [layout, shift]);
+	}, [layout, shift, setNativeScrollTop]);
 
 	useEffect(() => {
 		const observer = new MutationObserver((mutations) => {
@@ -270,6 +398,10 @@ export const NarratorPixiMessageList = forwardRef<
 	}, []);
 
 	useEffect(() => {
+		return subscribePixiImageTextureLoads(() => setImageVersion((version) => version + 1));
+	}, []);
+
+	useEffect(() => {
 		return subscribePixiShikiHighlights(() => setHighlightVersion((version) => version + 1));
 	}, []);
 
@@ -290,10 +422,60 @@ export const NarratorPixiMessageList = forwardRef<
 		return () => removeCurrentListener?.();
 	}, []);
 
+	const refreshAfterResume = useCallback((options?: { resetTextures?: boolean }) => {
+		const viewport = viewportRef.current;
+		if (viewport) {
+			setSize({ width: viewport.clientWidth, height: viewport.clientHeight });
+			viewport.scrollTop = clamp(viewport.scrollTop, 0, getMaxScrollTop(viewport));
+			virtualScrollTopRef.current = viewport.scrollTop;
+			isAtBottomRef.current = isViewportAtBottom(viewport);
+		}
+
+		if (options?.resetTextures !== false) {
+			invalidatePixiTablerIconTextures();
+			invalidatePixiImageTextures();
+			setIconVersion((version) => version + 1);
+			setImageVersion((version) => version + 1);
+		}
+		setDprVersion((version) => version + 1);
+		setHighlightVersion((version) => version + 1);
+		setRestoreVersion((version) => version + 1);
+	}, []);
+
+	useEffect(() => {
+		const refreshLightly = () => {
+			const now = Date.now();
+			if (now - lastLightResumeAtRef.current < 500) return;
+			lastLightResumeAtRef.current = now;
+			refreshAfterResume({ resetTextures: false });
+		};
+		const onVisibilityChange = () => {
+			const previous = lastVisibilityStateRef.current;
+			const next = document.visibilityState;
+			lastVisibilityStateRef.current = next;
+			if (next === "visible" && previous === "hidden") refreshAfterResume({ resetTextures: true });
+		};
+		const onPageShow = (event: PageTransitionEvent) => {
+			if (event.persisted) refreshAfterResume({ resetTextures: true });
+			else refreshLightly();
+		};
+		const onFocus = () => refreshLightly();
+		document.addEventListener("visibilitychange", onVisibilityChange);
+		window.addEventListener("pageshow", onPageShow);
+		window.addEventListener("focus", onFocus);
+		return () => {
+			document.removeEventListener("visibilitychange", onVisibilityChange);
+			window.removeEventListener("pageshow", onPageShow);
+			window.removeEventListener("focus", onFocus);
+		};
+	}, [refreshAfterResume]);
+
 	useEffect(() => {
 		const host = canvasHostRef.current;
 		if (!host) return;
 		const app = new Application();
+		const handleContextLost = (event: Event) => event.preventDefault();
+		const handleContextRestored = () => refreshAfterResume({ resetTextures: true });
 		let destroyed = false;
 		app
 			.init({
@@ -319,28 +501,51 @@ export const NarratorPixiMessageList = forwardRef<
 				canvas.style.width = "100%";
 				canvas.style.height = "100%";
 				canvas.style.pointerEvents = "none";
+				canvas.addEventListener("webglcontextlost", handleContextLost);
+				canvas.addEventListener("webglcontextrestored", handleContextRestored);
 				host.appendChild(canvas);
 				const container = new Container();
+				const imageContainer = new Container();
 				const gfx = new Graphics();
 				app.stage.addChild(gfx);
+				app.stage.addChild(imageContainer);
 				app.stage.addChild(container);
 				stageContainerRef.current = container;
 				gfxRef.current = gfx;
 				textPoolRef.current = new TextPool(container);
 				iconPoolRef.current = new IconSpritePool(container);
+				imagePoolRef.current = new ImageSpritePool(imageContainer);
+
+				// Fast Refresh preserves React state, so `ready` may already be true when a
+				// new Pixi application is mounted. Size and render explicitly here instead of
+				// relying on effects that may not re-run after HMR.
+				const viewport = viewportRef.current;
+				const nextSize = {
+					width: Math.max(1, viewport?.clientWidth ?? 1),
+					height: Math.max(1, viewport?.clientHeight ?? 1),
+				};
+				app.renderer.resize(nextSize.width, nextSize.height, window.devicePixelRatio || 1);
+				setSize(nextSize);
 				setReady(true);
+				setRestoreVersion((version) => version + 1);
 			});
 		return () => {
 			destroyed = true;
-			if (appRef.current) destroyPixiApplication(appRef.current);
+			if (appRef.current) {
+				const canvas = appRef.current.canvas as HTMLCanvasElement;
+				canvas.removeEventListener("webglcontextlost", handleContextLost);
+				canvas.removeEventListener("webglcontextrestored", handleContextRestored);
+				destroyPixiApplication(appRef.current);
+			}
 			appRef.current = null;
 			stageContainerRef.current = null;
 			gfxRef.current = null;
 			textPoolRef.current = null;
 			iconPoolRef.current = null;
+			imagePoolRef.current = null;
 		};
 		// init once; resize is handled below
-	}, []);
+	}, [refreshAfterResume]);
 
 	useEffect(() => {
 		void dprVersion;
@@ -354,48 +559,22 @@ export const NarratorPixiMessageList = forwardRef<
 	}, [ready, size, dprVersion]);
 
 	useEffect(() => {
-		void themeVersion;
-		void dprVersion;
-		void iconVersion;
-		void highlightVersion;
-		if (
-			!ready ||
-			!appRef.current ||
-			!stageContainerRef.current ||
-			!gfxRef.current ||
-			!textPoolRef.current ||
-			!iconPoolRef.current
-		) {
-			return;
+		if (!ready || !textPoolRef.current || !iconPoolRef.current || !imagePoolRef.current) return;
+		const isRestorePass = restoreVersion !== appliedRestoreVersionRef.current;
+		if (isRestorePass) {
+			textPoolRef.current.refreshTextures();
+			iconPoolRef.current.refreshTextures();
+			imagePoolRef.current.refreshTextures();
+			appliedRestoreVersionRef.current = restoreVersion;
+
+			// After returning from the background, browser/Pixi texture caches may be
+			// cold or invalid. Draw and render the exact viewport first so visible text
+			// and icons get their textures requested/generated before buffered content.
+			renderPixiViewport(undefined, { bufferPx: 0 });
 		}
-		const textPool = textPoolRef.current;
-		const iconPool = iconPoolRef.current;
-		textPool.reset();
-		iconPool.reset();
-		drawPixiMessages({
-			textPool,
-			iconPool,
-			gfx: gfxRef.current,
-			items: layout.items,
-			theme: resolvePixiMessageTheme(),
-			scrollTop,
-			viewportHeight: size.height,
-			highlightedId,
-		});
-		textPool.releaseUnused();
-		iconPool.releaseUnused();
-		appRef.current.render();
-	}, [
-		ready,
-		layout,
-		scrollTop,
-		size.height,
-		highlightedId,
-		themeVersion,
-		dprVersion,
-		iconVersion,
-		highlightVersion,
-	]);
+
+		renderPixiViewport();
+	}, [ready, restoreVersion, renderPixiViewport]);
 
 	useImperativeHandle(
 		ref,
@@ -408,49 +587,61 @@ export const NarratorPixiMessageList = forwardRef<
 				let top = target.y;
 				if (align === "center") top = target.y - viewport.clientHeight / 2 + target.height / 2;
 				else if (align === "end") top = target.y - viewport.clientHeight + target.height;
-				viewport.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+				setNativeScrollTop(top, { behavior: "smooth" });
 			},
 			getTotalSize: () => layout.totalHeight,
 			findIndexByKey: (key: string) => items.findIndex((item) => item.key === key),
 			get scrollOffset() {
-				return viewportRef.current?.scrollTop ?? 0;
+				return viewportRef.current?.scrollTop ?? virtualScrollTopRef.current;
 			},
+
 			get viewportSize() {
 				return viewportRef.current?.clientHeight ?? 0;
 			},
 		}),
-		[layout, items],
+		[layout, items, setNativeScrollTop],
 	);
 
 	return (
 		<div
-			ref={setViewportNode}
 			className="narrator-pixi-message-list"
 			style={{
 				height: "100%",
-				overflow: "auto",
-				overscrollBehavior: "contain",
+				overflow: "hidden",
 				position: "relative",
 			}}
 		>
 			<div
+				ref={setViewportNode}
+				style={{
+					height: "100%",
+					outline: "none",
+					overflowX: "hidden",
+					overflowY: "auto",
+					overscrollBehavior: "contain",
+					position: "relative",
+				}}
+			>
+				<div
+					ref={setSpacerNode}
+					style={{
+						height: virtualScrollHeight,
+						minHeight: "100%",
+						pointerEvents: "none",
+						width: 1,
+					}}
+				/>
+			</div>
+			<div
 				ref={canvasHostRef}
 				style={{
-					position: "sticky",
-					top: 0,
-					left: 0,
-					width: "100%",
 					height: size.height || "100%",
+					left: 0,
 					pointerEvents: "none",
+					position: "absolute",
+					top: 0,
+					width: size.width || "100%",
 					zIndex: 0,
-				}}
-			/>
-			<div
-				ref={setSpacerNode}
-				style={{
-					height: Math.max(size.height, layout.totalHeight),
-					marginTop: -(size.height || 0),
-					pointerEvents: "none",
 				}}
 			/>
 		</div>

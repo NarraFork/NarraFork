@@ -1,5 +1,12 @@
 import { measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
-import { type Container, type Graphics, Text, TextStyle } from "pixi.js";
+import { type Container, Graphics, Sprite, Text, TextStyle, Texture } from "pixi.js";
+import {
+	getPixiAvatarTexture,
+	getPixiGeneratedImageTexture,
+	getPixiPreviewImageTexture,
+	getPixiUploadImageTexture,
+} from "./pixi-image-textures";
+import { PIXI_MESSAGE_FONT, PIXI_MESSAGE_METRICS, pixiCssFont } from "./pixi-message-constants";
 import type {
 	PixiLaidOutBlock,
 	PixiLaidOutItem,
@@ -8,49 +15,87 @@ import type {
 import type { PixiMessageTheme } from "./pixi-message-theme";
 import { getPixiHighlightedTokens, type PixiHighlightToken } from "./pixi-shiki-highlight";
 import {
+	getPixiReasoningIcon,
 	getPixiToolCategoryIcon,
 	getPixiToolChevronIcon,
 	getPixiToolStatusIcon,
 	type IconSpritePool,
 } from "./pixi-tabler-icons";
 
-const TITLE_STYLE = new TextStyle({ fontFamily: "sans-serif", fontSize: 12, fontWeight: "600" });
-const SUBTITLE_STYLE = new TextStyle({ fontFamily: "sans-serif", fontSize: 11 });
-const BODY_STYLE = new TextStyle({ fontFamily: "sans-serif", fontSize: 14 });
-const MONO_STYLE = new TextStyle({ fontFamily: "monospace", fontSize: 11 });
-const TOOL_NAME_STYLE = new TextStyle({ fontFamily: "monospace", fontSize: 12, fontWeight: "600" });
-const SMALL_STYLE = new TextStyle({ fontFamily: "sans-serif", fontSize: 12 });
+const TITLE_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.title,
+	fontWeight: PIXI_MESSAGE_FONT.weights.semibold,
+});
+const SUBTITLE_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.subtitle,
+});
+const BODY_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.body,
+});
+const MONO_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.code,
+});
+const TOOL_NAME_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.toolName,
+	fontWeight: PIXI_MESSAGE_FONT.weights.semibold,
+});
+const SMALL_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.small,
+});
+const SMALL_ITALIC_STYLE = new TextStyle({
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.small,
+	fontStyle: "italic",
+});
 const HEADING_1_STYLE = new TextStyle({
-	fontFamily: "sans-serif",
-	fontSize: 22,
-	fontWeight: "700",
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.headingSizes[1],
+	fontWeight: PIXI_MESSAGE_FONT.weights.bold,
 });
 const HEADING_2_STYLE = new TextStyle({
-	fontFamily: "sans-serif",
-	fontSize: 19,
-	fontWeight: "700",
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.headingSizes[2],
+	fontWeight: PIXI_MESSAGE_FONT.weights.bold,
 });
 const HEADING_3_STYLE = new TextStyle({
-	fontFamily: "sans-serif",
-	fontSize: 17,
-	fontWeight: "700",
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.headingSizes[3],
+	fontWeight: PIXI_MESSAGE_FONT.weights.bold,
 });
 const HEADING_4_STYLE = new TextStyle({
-	fontFamily: "sans-serif",
-	fontSize: 15,
-	fontWeight: "700",
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.headingSizes[4],
+	fontWeight: PIXI_MESSAGE_FONT.weights.bold,
 });
-const CODE_PADDING_X = 10;
-const CODE_PADDING_Y = 7;
-const BLOCKQUOTE_INDENT = 16;
-const LIST_INDENT = 24;
+const CODE_PADDING_X = PIXI_MESSAGE_METRICS.codePaddingX;
+const CODE_PADDING_Y = PIXI_MESSAGE_METRICS.codePaddingY;
+const CODE_LINE_H = PIXI_MESSAGE_METRICS.codeLineHeight;
+const BLOCKQUOTE_INDENT = PIXI_MESSAGE_METRICS.blockquoteIndent;
+const LIST_INDENT = PIXI_MESSAGE_METRICS.listIndent;
 const AVATAR_INITIAL_STYLE = new TextStyle({
-	fontFamily: "sans-serif",
-	fontSize: 10,
-	fontWeight: "600",
+	fontFamily: PIXI_MESSAGE_FONT.sansFamily,
+	fontSize: PIXI_MESSAGE_FONT.sizes.avatarInitial,
+	fontWeight: PIXI_MESSAGE_FONT.weights.semibold,
 });
-const AVATAR_INITIAL_FONT = "600 10px sans-serif";
-const DIVIDER_FONT = "12px sans-serif";
+const AVATAR_INITIAL_FONT = pixiCssFont(
+	PIXI_MESSAGE_FONT.sizes.avatarInitial,
+	PIXI_MESSAGE_FONT.sansFamily,
+	PIXI_MESSAGE_FONT.weights.semibold,
+);
+const DIVIDER_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.small, PIXI_MESSAGE_FONT.sansFamily);
+
+function parseHexColor(color?: string | null): number | null {
+	if (!color) return null;
+	const match = color.trim().match(/^#?([0-9a-f]{6})$/i);
+	if (!match) return null;
+	return Number.parseInt(match[1], 16);
+}
 
 function colorForName(theme: PixiMessageTheme, color?: string): number {
 	switch (color) {
@@ -99,6 +144,86 @@ function drawRoundRect(
 	gfx.stroke({ color: stroke, alpha: 0.9, width: 1 });
 }
 
+export class ImageSpritePool {
+	private pool: Sprite[] = [];
+	private maskPool: Graphics[] = [];
+	private cursor = 0;
+
+	constructor(private container: Container) {}
+
+	reset(): void {
+		this.cursor = 0;
+	}
+
+	acquire(
+		texture: Texture,
+		x: number,
+		y: number,
+		width: number,
+		height: number,
+		alpha = 1,
+		mask?: { kind: "circle" | "roundRect"; radius: number },
+	): Sprite {
+		let sprite: Sprite;
+		const index = this.cursor;
+		if (index < this.pool.length) {
+			sprite = this.pool[index];
+		} else {
+			sprite = new Sprite(texture);
+			this.pool.push(sprite);
+			this.container.addChild(sprite);
+		}
+		this.cursor++;
+		sprite.texture = texture;
+		sprite.visible = true;
+		sprite.alpha = alpha;
+		sprite.position.set(x, y);
+		sprite.width = width;
+		sprite.height = height;
+		if (mask) {
+			const maskGfx = this.maskForIndex(index);
+			maskGfx.clear();
+			if (mask.kind === "circle") {
+				maskGfx.circle(x + width / 2, y + height / 2, Math.min(width, height) / 2);
+			} else {
+				maskGfx.roundRect(x, y, width, height, mask.radius);
+			}
+			maskGfx.fill({ color: 0xffffff, alpha: 1 });
+			maskGfx.renderable = false;
+			sprite.mask = maskGfx;
+		} else {
+			sprite.mask = null;
+		}
+		return sprite;
+	}
+
+	releaseUnused(): void {
+		for (let i = this.cursor; i < this.pool.length; i++) {
+			this.pool[i].visible = false;
+			this.pool[i].mask = null;
+		}
+		for (let i = this.cursor; i < this.maskPool.length; i++) {
+			this.maskPool[i].clear();
+		}
+	}
+
+	refreshTextures(): void {
+		for (const sprite of this.pool) {
+			sprite.texture = Texture.EMPTY;
+		}
+	}
+
+	private maskForIndex(index: number): Graphics {
+		let mask = this.maskPool[index];
+		if (!mask) {
+			mask = new Graphics();
+			this.maskPool[index] = mask;
+			this.container.addChild(mask);
+		}
+		return mask;
+	}
+}
+
 export class TextPool {
 	private pool: Text[] = [];
 	private cursor = 0;
@@ -134,6 +259,16 @@ export class TextPool {
 	releaseUnused(): void {
 		for (let i = this.cursor; i < this.pool.length; i++) {
 			this.pool[i].visible = false;
+		}
+	}
+
+	refreshTextures(): void {
+		const resolution = window.devicePixelRatio || 1;
+		for (const node of this.pool) {
+			// Reassigning resolution marks Pixi text dirty even when the string/style is
+			// unchanged. This recovers text textures after mobile browsers suspend or
+			// restore the WebGL context while the app is in the background.
+			node.resolution = resolution;
 		}
 	}
 
@@ -251,15 +386,24 @@ function drawMarkdownBlock(
 
 function drawUserAvatar(
 	textPool: TextPool,
+	imagePool: ImageSpritePool,
 	gfx: Graphics,
 	theme: PixiMessageTheme,
-	title: string,
+	item: PixiLaidOutItem["item"],
 	x: number,
 	y: number,
 ) {
+	const bg = parseHexColor(item.creator?.avatarColor) ?? theme.indigo;
 	gfx.circle(x + 10, y + 10, 10);
-	gfx.fill({ color: theme.indigo, alpha: 1 });
-	const initial = title.trim().charAt(0).toUpperCase() || "U";
+	gfx.fill({ color: bg, alpha: 1 });
+
+	const texture = getPixiAvatarTexture(item.creator?.id, item.creator?.avatarImageId);
+	if (texture && texture !== Texture.EMPTY) {
+		imagePool.acquire(texture, x, y, 20, 20, 1, { kind: "circle", radius: 10 });
+		return;
+	}
+
+	const initial = (item.creator?.username ?? item.title).trim().charAt(0).toUpperCase() || "U";
 	const initialWidth = measureTextWidth(initial, AVATAR_INITIAL_FONT);
 	textPool.acquire(initial, x + (20 - initialWidth) / 2, y + 3, AVATAR_INITIAL_STYLE, 0xffffff);
 }
@@ -330,27 +474,70 @@ function drawDashedRect(
 }
 
 function drawReasoningBlock(opts: DrawSpecialBlockOptions) {
-	const { textPool, gfx, block, bx, by, theme } = opts;
-	const height = block.height;
-	gfx.roundRect(bx, by, block.width, height, 6);
-	gfx.fill({ color: theme.systemBg, alpha: 0.55 });
-	gfx.rect(bx, by, 3, height);
-	gfx.fill({ color: theme.yellow, alpha: 0.9 });
-	textPool.acquire(
-		`Reasoning · ${block.text.length.toLocaleString()} chars`,
-		bx + 12,
-		by + 8,
-		SMALL_STYLE,
-		theme.yellow,
+	const { textPool, iconPool, gfx, block, bx, by, theme } = opts;
+	const opened = block.reasoningExpanded === true && !!block.text.trim();
+	const thinking = block.reasoningStreaming === true && !block.text.trim();
+	const label = thinking
+		? `${block.reasoningThinkingLabel ?? "Thinking"}…`
+		: (block.reasoningLabel ?? "Reasoning");
+	const headerY = by + 2;
+
+	iconPool.acquire(
+		getPixiToolChevronIcon(opened, theme.dimmed, 12),
+		bx,
+		by + 4,
+		12,
+		thinking ? 0.5 : 1,
 	);
-	const visibleLines = block.lines.slice(0, 3).map((line) => line.text);
-	if (block.lines.length > 3 && visibleLines.length > 0) {
-		visibleLines[visibleLines.length - 1] =
-			`${compactText(visibleLines[visibleLines.length - 1], 96)} …`;
+
+	gfx.roundRect(bx + 11, headerY, 16, 16, 4);
+	gfx.fill({ color: theme.grape, alpha: 0.16 });
+	iconPool.acquire(getPixiReasoningIcon(theme.grape, 10), bx + 14, by + 5, 10);
+
+	const labelStyle = thinking ? SMALL_ITALIC_STYLE : SMALL_STYLE;
+	textPool.acquire(label, bx + 31, headerY, labelStyle, theme.dimmed);
+	let nextX = bx + 31 + textWidth(label, labelStyle);
+
+	if (!thinking && !block.reasoningEncrypted && block.reasoningCharsLabel) {
+		nextX += 6;
+		const charsNode = textPool.acquire(
+			block.reasoningCharsLabel,
+			nextX,
+			headerY,
+			SMALL_STYLE,
+			theme.dimmed,
+		);
+		charsNode.alpha = 0.5;
+		nextX += textWidth(block.reasoningCharsLabel, SMALL_STYLE);
 	}
-	while (visibleLines.length < 3) visibleLines.push("");
-	for (let i = 0; i < 3; i++) {
-		textPool.acquire(visibleLines[i], bx + 12, by + 30 + i * 18, SMALL_STYLE, theme.dimmed);
+
+	if (!opened && !thinking) {
+		const previewX = nextX + 8;
+		const available = Math.max(0, bx + block.width - previewX);
+		const maxChars = Math.max(0, Math.floor(available / 6.5));
+		if (maxChars > 8) {
+			const preview = `— ${compactText(block.text, Math.min(80, maxChars))}`;
+			const previewNode = textPool.acquire(preview, previewX, headerY, SMALL_STYLE, theme.dimmed);
+			previewNode.alpha = 0.6;
+		}
+		return;
+	}
+
+	if (!opened) return;
+
+	const contentY = by + 25;
+	const contentH = Math.max(1, block.height - 29);
+	gfx.roundRect(bx, contentY, 2, contentH, 1);
+	gfx.fill({ color: theme.grape, alpha: 0.68 });
+	for (let i = 0; i < block.lines.length; i++) {
+		const node = textPool.acquire(
+			block.lines[i].text,
+			bx + 16,
+			contentY + 4 + i * 17,
+			SMALL_STYLE,
+			theme.dimmed,
+		);
+		node.alpha = 0.75;
 	}
 }
 
@@ -370,18 +557,51 @@ function drawWebSearchBlock(opts: DrawSpecialBlockOptions) {
 	);
 }
 
+function textureForImageBlock(block: PixiLaidOutBlock): Texture | null {
+	if (block.type === "image_generation") {
+		return getPixiGeneratedImageTexture({
+			result: block.imageSrc,
+			savedPath: block.imageSavedPath,
+		});
+	}
+	return (
+		getPixiPreviewImageTexture(block.imageSrc) ??
+		getPixiUploadImageTexture(block.imageUploadNarratorId, block.imageId)
+	);
+}
+
 function drawImageBlock(opts: DrawSpecialBlockOptions) {
-	const { textPool, gfx, block, bx, by, theme } = opts;
-	const width = Math.min(200, block.width);
-	const height = block.height;
-	gfx.roundRect(bx, by, width, height, 6);
+	const { textPool, imagePool, gfx, block, bx, by, theme } = opts;
+	const texture = textureForImageBlock(block);
+	const maxWidth = Math.min(block.width, 512);
+	const maxHeight = block.height;
+	const label = block.type === "image_generation" ? "Generated image" : "Attached image";
+
+	if (texture && texture !== Texture.EMPTY && texture.width > 0 && texture.height > 0) {
+		const scale = Math.min(maxWidth / texture.width, maxHeight / texture.height, 1);
+		const drawWidth = Math.max(1, texture.width * scale);
+		const drawHeight = Math.max(1, texture.height * scale);
+		const x = bx + Math.max(0, (block.width - drawWidth) / 2);
+		const y = by + Math.max(0, (block.height - drawHeight) / 2);
+		gfx.roundRect(x, y, drawWidth, drawHeight, 6);
+		gfx.fill({ color: theme.systemBg, alpha: 0.3 });
+		gfx.stroke({ color: theme.systemBorder, alpha: 0.55, width: 1 });
+		imagePool.acquire(texture, x, y, drawWidth, drawHeight, 1, { kind: "roundRect", radius: 6 });
+		return;
+	}
+
+	const width = Math.min(240, block.width);
+	const height = Math.min(140, block.height);
+	const x = bx + Math.max(0, (block.width - width) / 2);
+	const y = by + Math.max(0, (block.height - height) / 2);
+	gfx.roundRect(x, y, width, height, 6);
 	gfx.fill({ color: theme.systemBg, alpha: 0.35 });
-	drawDashedRect(gfx, bx, by, width, height, theme.dimmed);
-	const label = `📷 ${compactText(block.text || "Attached image", 32)}`;
+	drawDashedRect(gfx, x, y, width, height, theme.dimmed);
+	const text = `📷 ${compactText(block.imageFilename || block.text || label, 32)}`;
 	textPool.acquire(
-		label,
-		centeredTextX(label, bx, width, SMALL_STYLE),
-		by + 50,
+		text,
+		centeredTextX(text, x, width, SMALL_STYLE),
+		y + height / 2 - 8,
 		SMALL_STYLE,
 		theme.dimmed,
 	);
@@ -500,6 +720,8 @@ function drawGoalContinuationBlock(opts: DrawSpecialBlockOptions) {
 
 interface DrawSpecialBlockOptions {
 	textPool: TextPool;
+	iconPool: IconSpritePool;
+	imagePool: ImageSpritePool;
 	gfx: Graphics;
 	block: PixiLaidOutBlock;
 	bx: number;
@@ -616,6 +838,30 @@ function drawTokenLine(
 	}
 }
 
+function getGrepOutputTokens(text: string, theme: PixiMessageTheme): PixiHighlightToken[][] {
+	return text
+		.replace(/\r\n?/g, "\n")
+		.split("\n")
+		.map((line) => {
+			if (line === "--") return [{ content: line, color: theme.dimmed }];
+
+			const match = line.match(/^(.*?)([:-])(\d+)([:-])(.*)$/);
+			if (!match) {
+				return [{ content: line, color: line.startsWith("(") ? theme.dimmed : theme.text }];
+			}
+
+			const [, filePath, firstSep, lineNo, secondSep, content] = match;
+			const isMatchLine = firstSep === ":" || secondSep === ":";
+			return [
+				{ content: filePath, color: theme.cyan },
+				{ content: firstSep, color: theme.dimmed },
+				{ content: lineNo, color: theme.yellow },
+				{ content: secondSep, color: theme.dimmed },
+				{ content, color: isMatchLine ? theme.text : theme.dimmed },
+			];
+		});
+}
+
 function drawCodePanel(
 	textPool: TextPool,
 	gfx: Graphics,
@@ -633,11 +879,10 @@ function drawCodePanel(
 	gfx.fill({ color: bg, alpha: terminal ? 0.92 : 0.42 });
 	gfx.stroke({ color: terminal ? theme.panelBorder : theme.toolBorder, alpha: 0.55, width: 1 });
 	let textY = y + CODE_PADDING_Y;
-	if (block.title) {
-		textPool.acquire(block.title, x + CODE_PADDING_X, textY - 1, SMALL_STYLE, theme.dimmed);
-		textY += 17;
-	}
-	const highlighted = getPixiHighlightedTokens(block.text ?? "", block.lang, shikiThemeName());
+	const isGrepOutput = block.lang === "grep-output";
+	const highlighted = isGrepOutput
+		? getGrepOutputTokens(block.text ?? "", theme)
+		: getPixiHighlightedTokens(block.text ?? "", block.lang, shikiThemeName());
 	const highlightedVisualLines = splitTokensByPretextLines(highlighted, block.lines ?? []);
 	for (let lineIndex = 0; lineIndex < (block.lines ?? []).length; lineIndex++) {
 		const line = block.lines?.[lineIndex];
@@ -653,7 +898,7 @@ function drawCodePanel(
 			textY,
 			fg,
 		);
-		textY += 18;
+		textY += CODE_LINE_H;
 	}
 }
 
@@ -670,19 +915,19 @@ function drawDiffPanel(
 	gfx.roundRect(x, y, block.width, block.height, 4);
 	gfx.fill({ color: theme.panelBg, alpha: 0.38 });
 	gfx.stroke({ color: theme.toolBorder, alpha: 0.5, width: 1 });
-	textPool.acquire(block.title ?? "Diff", x + CODE_PADDING_X, y + 7, SMALL_STYLE, theme.dimmed);
-	y += 25;
+	y += CODE_PADDING_Y;
 	for (const line of block.diffLines ?? []) {
 		const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 		const color =
 			line.type === "removed" ? theme.red : line.type === "added" ? theme.green : theme.dimmed;
-		const rowHeight = Math.max(1, line.lines.length) * 18;
+		const rowHeight = Math.max(1, line.lines.length) * CODE_LINE_H;
 		if (line.type === "removed" || line.type === "added") {
 			gfx.rect(x + 1, y - 1, block.width - 2, rowHeight);
 			gfx.fill({ color, alpha: 0.08 });
 		}
-		const oldNo = line.oldNo != null ? String(line.oldNo).padStart(3) : "   ";
-		const newNo = line.newNo != null ? String(line.newNo).padStart(3) : "   ";
+		const linePrefix = block.lineNumberPrefix ?? "";
+		const oldNo = line.oldNo != null ? `${linePrefix}${line.oldNo}`.padStart(3) : "   ";
+		const newNo = line.newNo != null ? `${linePrefix}${line.newNo}`.padStart(3) : "   ";
 		textPool.acquire(`${oldNo} ${newNo}${prefix}`, x + 8, y, MONO_STYLE, color);
 		const highlighted = getPixiHighlightedTokens(line.text, block.lang, shikiThemeName());
 		const highlightedVisualLines = splitTokensByPretextLines(highlighted, line.lines);
@@ -697,9 +942,9 @@ function drawDiffPanel(
 				lineY,
 				line.type === "context" ? theme.text : color,
 			);
-			lineY += 18;
+			lineY += CODE_LINE_H;
 		}
-		y += Math.max(1, line.lines.length) * 18;
+		y += Math.max(1, line.lines.length) * CODE_LINE_H;
 	}
 }
 
@@ -972,17 +1217,30 @@ function drawSpecialBlock(opts: DrawSpecialBlockOptions): boolean {
 export function drawPixiMessages(opts: {
 	textPool: TextPool;
 	iconPool: IconSpritePool;
+	imagePool: ImageSpritePool;
 	gfx: Graphics;
 	items: PixiLaidOutItem[];
 	theme: PixiMessageTheme;
 	scrollTop: number;
 	viewportHeight: number;
 	highlightedId?: string | null;
+	bufferPx?: number;
 }) {
-	const { textPool, iconPool, gfx, items, theme, scrollTop, viewportHeight, highlightedId } = opts;
+	const {
+		textPool,
+		iconPool,
+		imagePool,
+		gfx,
+		items,
+		theme,
+		scrollTop,
+		viewportHeight,
+		highlightedId,
+		bufferPx = 240,
+	} = opts;
 	gfx.clear();
-	const minY = scrollTop - 240;
-	const maxY = scrollTop + viewportHeight + 240;
+	const minY = scrollTop - bufferPx;
+	const maxY = scrollTop + viewportHeight + bufferPx;
 
 	for (const laid of items) {
 		if (laid.y + laid.height < minY || laid.y > maxY) continue;
@@ -1050,7 +1308,7 @@ export function drawPixiMessages(opts: {
 
 		if (!isPlainAssistant && !isTool) {
 			if (isUser) {
-				drawUserAvatar(textPool, gfx, theme, item.title, laid.x + 16, y + 8);
+				drawUserAvatar(textPool, imagePool, gfx, theme, item, laid.x + 16, y + 8);
 			}
 			textPool.acquire(
 				item.title,
@@ -1080,10 +1338,10 @@ export function drawPixiMessages(opts: {
 				gfx.lineTo(bx + block.width, separatorY);
 				gfx.stroke({ color: theme.toolBorder, alpha: 0.55, width: 1 });
 			}
-			if (drawToolUseBlock({ textPool, iconPool, gfx, block, bx, by, theme })) {
+			if (drawToolUseBlock({ textPool, iconPool, imagePool, gfx, block, bx, by, theme })) {
 				continue;
 			}
-			if (drawSpecialBlock({ textPool, gfx, block, bx, by, theme })) {
+			if (drawSpecialBlock({ textPool, iconPool, imagePool, gfx, block, bx, by, theme })) {
 				continue;
 			}
 			if (block.label) {

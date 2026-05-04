@@ -1506,6 +1506,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								let result = old;
 								for (const chunk of subagentChunks) {
 									if (!chunk.parentToolUseId || !result) continue;
+									const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
 									result = upsertSubagentStreamingChunk(
 										result,
 										chunk.parentToolUseId,
@@ -1517,6 +1518,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 										chunk.extractedFilePath,
 										chunk.contentCharsReceived,
 										chunk.extractedFields,
+										sf ? { name: sf.name, value: sf.value } : undefined,
 									) as MessagesQueryData;
 								}
 								return result;

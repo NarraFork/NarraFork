@@ -514,6 +514,12 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const target = fields.id ?? fields.name ?? fields.ids ?? fields.names ?? "subagent";
 			return `to ${target}`;
 		}
+		if (toolName === "Edit") {
+			const phase =
+				input._streamingFieldName === "new_string" || fields?.new_string ? "replacing" : "matching";
+			const target = filePath ? basename(filePath) : "Edit";
+			return `${phase} ${target}`;
+		}
 		// Search tools: show pattern + path from extracted fields
 		if (fields && SEARCH_TOOLS.has(toolName)) {
 			const pat = fields.pattern ?? fields.glob;
@@ -1521,6 +1527,90 @@ function FilePreviewModal({
 	);
 }
 
+type EditStreamingPhase = "matching" | "replacing";
+
+function getStreamingEditPreview(input: unknown): {
+	phase: EditStreamingPhase;
+	oldString: string;
+	newString: string;
+	chars: number;
+} | null {
+	if (!input || typeof input !== "object" || isTruncated(input)) return null;
+	const obj = input as Record<string, unknown>;
+	if (obj._streamingChars == null) return null;
+	const fields =
+		obj._streamingFields && typeof obj._streamingFields === "object"
+			? (obj._streamingFields as Record<string, unknown>)
+			: {};
+	const fieldName = typeof obj._streamingFieldName === "string" ? obj._streamingFieldName : "";
+	const fieldValue = typeof obj._streamingFieldValue === "string" ? obj._streamingFieldValue : "";
+	const oldString =
+		(typeof fields.old_string === "string" ? fields.old_string : "") ||
+		(fieldName === "old_string" ? fieldValue : "");
+	const newString =
+		(typeof fields.new_string === "string" ? fields.new_string : "") ||
+		(fieldName === "new_string" ? fieldValue : "");
+	const phase: EditStreamingPhase =
+		fieldName === "new_string" || newString ? "replacing" : "matching";
+	return {
+		phase,
+		oldString,
+		newString,
+		chars: typeof obj._streamingChars === "number" ? obj._streamingChars : 0,
+	};
+}
+
+function EditStreamingPreview({
+	preview,
+	filePath,
+	language,
+	startLine,
+}: {
+	preview: NonNullable<ReturnType<typeof getStreamingEditPreview>>;
+	filePath: string;
+	language?: string;
+	startLine?: number;
+}) {
+	const title = preview.phase === "matching" ? "matching" : "replacing";
+	const hasReplacement = preview.phase === "replacing";
+	const displayStartLine = startLine ?? 1;
+	return (
+		<Paper
+			p="xs"
+			radius="sm"
+			withBorder
+			style={{
+				borderColor: "color-mix(in srgb, var(--mantine-color-violet-5) 45%, transparent)",
+				background: "color-mix(in srgb, var(--mantine-color-violet-light) 24%, transparent)",
+			}}
+		>
+			<Group gap={6} mb={6} wrap="nowrap">
+				<Badge size="xs" variant="light" color={hasReplacement ? "violet" : "blue"}>
+					{title}
+				</Badge>
+				<IconLoader2 size={12} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
+				<Text size="xs" c="dimmed" ff="monospace" truncate style={{ flex: 1 }}>
+					{filePath}
+				</Text>
+				{preview.chars > 0 && (
+					<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+						{preview.chars} chars
+					</Text>
+				)}
+			</Group>
+			<DiffView
+				oldStr={preview.oldString || " "}
+				newStr={hasReplacement ? preview.newString : preview.oldString || " "}
+				maxHeight={200}
+				wordWrap
+				language={language}
+				startLine={displayStartLine}
+				lineNumberPrefix={hasReplacement ? undefined : "xx"}
+			/>
+		</Paper>
+	);
+}
+
 function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const fp = getFilePath(toolCall.inputJson);
@@ -1539,6 +1629,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 			: (toolCall.inputJson?.content ?? "")
 		: "";
 
+	const editStreamingPreview = isEdit ? getStreamingEditPreview(toolCall.inputJson) : null;
 	const oldString = inputIsTruncated ? undefined : toolCall.inputJson?.old_string;
 	const newString = inputIsTruncated ? undefined : toolCall.inputJson?.new_string;
 
@@ -1558,7 +1649,15 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{fp}
 				</Text>
 			)}
-			{isEdit && oldString != null && (
+			{isEdit && editStreamingPreview && (
+				<EditStreamingPreview
+					preview={editStreamingPreview}
+					filePath={fp || "Edit"}
+					language={lang}
+					startLine={startLine}
+				/>
+			)}
+			{isEdit && !editStreamingPreview && oldString != null && (
 				<ContentViewer
 					content={`--- old\n${oldString}\n+++ new\n${newString ?? ""}`}
 					title={fp ? basename(fp) : "Diff"}
@@ -1580,7 +1679,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					)}
 				/>
 			)}
-			{isEdit && inputIsTruncated && !oldString && (
+			{isEdit && !editStreamingPreview && inputIsTruncated && !oldString && (
 				<>
 					<ContentViewer
 						content={toolCall.inputJson.preview}
@@ -1616,7 +1715,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
-			{isEdit && !inputIsTruncated && !toolCall.inputJson?.old_string && (
+			{isEdit && !editStreamingPreview && !inputIsTruncated && !toolCall.inputJson?.old_string && (
 				<ContentViewer
 					content={JSON.stringify(toolCall.inputJson, null, 2)}
 					style={codeStyle}
@@ -3238,8 +3337,32 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
 
-	// Write/Edit tools: show content/new_string with syntax highlighting
+	// Write/Edit tools: show content/new_string with syntax highlighting.
+	// Edit streams old_string first (matching) and new_string later (replacing), so render
+	// the same provisional diff preview used by the full detail view instead of hiding
+	// the matching phase while only old_string is available.
 	if (cat === "file") {
+		if (toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit") {
+			const preview = getStreamingEditPreview(toolCall.inputJson);
+			if (preview) {
+				const previewFilePath = filePath || "Edit";
+				const startLine =
+					typeof toolCall._metadata?.startLine === "number"
+						? (toolCall._metadata.startLine as number)
+						: undefined;
+				return (
+					<Box mt="xs">
+						<EditStreamingPreview
+							preview={preview}
+							filePath={previewFilePath}
+							language={previewFilePath ? getShikiLang(previewFilePath) : undefined}
+							startLine={startLine}
+						/>
+					</Box>
+				);
+			}
+		}
+
 		if (!filePath) return null;
 		const isContentField = sfName === "content" || sfName === "new_string";
 		if (!isContentField || !sfValue) return null;

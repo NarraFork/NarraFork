@@ -1,6 +1,7 @@
 import {
 	type Icon,
 	IconBan,
+	IconBrain,
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
@@ -112,6 +113,14 @@ export function subscribePixiTablerIconLoads(listener: () => void): () => void {
 	return () => loadListeners.delete(listener);
 }
 
+export function invalidatePixiTablerIconTextures(): void {
+	for (const texture of textureCache.values()) {
+		texture.destroy(true);
+	}
+	textureCache.clear();
+	loadingCache.clear();
+}
+
 function textureForIcon(
 	IconComponent: Icon,
 	cacheName: string,
@@ -175,6 +184,10 @@ export function getPixiToolChevronIcon(opened: boolean, color: number, size: num
 	);
 }
 
+export function getPixiReasoningIcon(color: number, size: number): Texture {
+	return textureForIcon(IconBrain, "reasoning:brain", color, size);
+}
+
 export class IconSpritePool {
 	private pool: Sprite[] = [];
 	private cursor = 0;
@@ -209,12 +222,14 @@ export class IconSpritePool {
 			this.pool[i].visible = false;
 		}
 	}
+
+	refreshTextures(): void {
+		for (const sprite of this.pool) {
+			sprite.texture = Texture.EMPTY;
+		}
+	}
 }
 
 export function destroyPixiTablerIconCache(): void {
-	for (const texture of textureCache.values()) {
-		texture.destroy(true);
-	}
-	textureCache.clear();
-	loadingCache.clear();
+	invalidatePixiTablerIconTextures();
 }

@@ -258,6 +258,12 @@ export function getSummary(
 			const parts = [fields.subagent_type, fields.description].filter(Boolean);
 			if (parts.length > 0) return parts.join(": ");
 		}
+		if (toolName === "Edit") {
+			const streamingFieldName = (input as Record<string, unknown>)._streamingFieldName;
+			const phase =
+				streamingFieldName === "new_string" || fields?.new_string ? "replacing" : "matching";
+			return `${phase} ${filePath ? basename(filePath) : "Edit"}`;
+		}
 		if (filePath) return `${basename(filePath)} (${chars} chars)`;
 		return chars > 0 ? `${chars} chars` : "";
 	}
