@@ -5,6 +5,7 @@
  * React DOM is only used for interactive NarratorPanel overlays above this layer.
  */
 import { layoutWithLines, measureNaturalWidth, prepareWithSegments } from "@chenglou/pretext";
+import { installPixiCanvasPoolHmrGuard } from "@frontend/lib/pixi-hmr";
 import { Application, CanvasTextMetrics, Container, Graphics, TextStyle } from "pixi.js";
 import { memo, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RulerSegment } from "../../../hooks/useRuler";
@@ -34,6 +35,8 @@ import {
 } from "../zoom-tiers";
 import type { PixiTheme } from "./pixi-theme";
 import { invalidatePixiThemeCache, resolvePixiTheme, themeStatusColor } from "./pixi-theme";
+
+installPixiCanvasPoolHmrGuard();
 
 function destroyPixiApplication(app: Application): void {
 	// Workaround for PixiJS v8 ResizePlugin bug: destroy() calls

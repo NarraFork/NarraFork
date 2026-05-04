@@ -57,6 +57,8 @@ export interface AgentSectionProps {
 	setMaxTransientRetries: (v: number) => void;
 	retryBackoffCeilMs: number;
 	setRetryBackoffCeilMs: (v: number) => void;
+	firstTokenTimeoutMs: number;
+	setFirstTokenTimeoutMs: (v: number) => void;
 	customRetryRules: Array<{
 		id: string;
 		domain?: string;
@@ -237,6 +239,19 @@ export function AgentSection(props: AgentSectionProps) {
 				}
 				min={1}
 				max={300}
+				step={1}
+				decimalScale={0}
+				suffix="s"
+			/>
+			<NumberInput
+				label={t("firstTokenTimeout")}
+				description={t("firstTokenTimeoutDesc")}
+				value={props.firstTokenTimeoutMs / 1000}
+				onChange={(v) =>
+					props.setFirstTokenTimeoutMs(typeof v === "number" ? Math.round(v * 1000) : 60000)
+				}
+				min={0}
+				max={600}
 				step={1}
 				decimalScale={0}
 				suffix="s"

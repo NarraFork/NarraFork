@@ -264,4 +264,39 @@ describe("segmentMessages", () => {
 		expect(segs).toHaveLength(1);
 		expect(segs[0].kind).toBe("message"); // text only, reasoning ignored
 	});
+
+	test("native web_search stays content by default for React renderer", () => {
+		const msg = makeMessage({
+			id: "a1",
+			role: "assistant",
+			contentJson: [{ type: "web_search", id: "ws1", status: "completed", query: "weather" }],
+		});
+		const segs = segmentMessages([msg]);
+		expect(segs).toHaveLength(1);
+		expect(segs[0].kind).toBe("message");
+	});
+
+	test("native web_search can merge into tool-run for Pixi renderer", () => {
+		const msg = makeMessage({
+			id: "a1",
+			role: "assistant",
+			contentJson: [
+				{ type: "tool_use", id: "tu1", name: "Read", input: {} },
+				{ type: "web_search", id: "ws1", status: "searching", query: "weather" },
+				{ type: "tool_use", id: "tu2", name: "Bash", input: {} },
+			],
+			toolCalls: [
+				{ toolUseId: "tu1", toolName: "Read", status: "success", createdAt: "2025-01-01" },
+				{ toolUseId: "tu2", toolName: "Bash", status: "running", createdAt: "2025-01-01" },
+			],
+		});
+		const segs = segmentMessages([msg], { nativeWebSearchAsTool: true });
+		expect(segs).toHaveLength(1);
+		expect(segs[0].kind).toBe("tool-run");
+		if (segs[0].kind === "tool-run") {
+			expect(segs[0].items.map((item) => item.tc.toolName)).toEqual(["Read", "WebSearch", "Bash"]);
+			expect(segs[0].items[1].tc.status).toBe("running");
+			expect(segs[0].items[1].tc.inputJson.query).toBe("weather");
+		}
+	});
 });

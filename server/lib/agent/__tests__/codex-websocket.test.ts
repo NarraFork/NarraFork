@@ -8,6 +8,7 @@ import {
 	decidePrematureCodexReconnect,
 	hasRecentNarratorMessage,
 	isCodexResponsesWebSocketSessionExpired,
+	isCodexWebSocketConnectionLimitError,
 	isCodexWebSocketIdleTimeoutError,
 	shouldTreatCodexStreamEventAsYielded,
 } from "../codex-websocket";
@@ -112,6 +113,30 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(isCodexWebSocketIdleTimeoutError(new Error("other error"))).toBe(false);
 		expect(
 			isCodexWebSocketIdleTimeoutError("Codex WebSocket idle timeout waiting for response event"),
+		).toBe(false);
+	});
+
+	test("detects websocket connection lifetime limit errors", () => {
+		expect(
+			isCodexWebSocketConnectionLimitError({
+				type: "error",
+				status: 400,
+				error: { code: "websocket_connection_limit_reached" },
+			}),
+		).toBe(true);
+		expect(
+			isCodexWebSocketConnectionLimitError({
+				type: "error",
+				status: 400,
+				error: { type: "websocket_connection_limit_reached" },
+			}),
+		).toBe(true);
+		expect(
+			isCodexWebSocketConnectionLimitError({
+				type: "error",
+				status: 400,
+				error: { code: "rate_limit_exceeded" },
+			}),
 		).toBe(false);
 	});
 

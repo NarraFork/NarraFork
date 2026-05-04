@@ -113,9 +113,14 @@ export function subscribePixiTablerIconLoads(listener: () => void): () => void {
 	return () => loadListeners.delete(listener);
 }
 
+function disposeTexture(texture: Texture): void {
+	texture.source?.unload();
+	texture.destroy(false);
+}
+
 export function invalidatePixiTablerIconTextures(): void {
 	for (const texture of textureCache.values()) {
-		texture.destroy(true);
+		disposeTexture(texture);
 	}
 	textureCache.clear();
 	loadingCache.clear();
@@ -220,6 +225,7 @@ export class IconSpritePool {
 	releaseUnused(): void {
 		for (let i = this.cursor; i < this.pool.length; i++) {
 			this.pool[i].visible = false;
+			this.pool[i].texture = Texture.EMPTY;
 		}
 	}
 

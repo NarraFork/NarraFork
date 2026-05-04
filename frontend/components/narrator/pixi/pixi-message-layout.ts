@@ -110,6 +110,7 @@ export interface PixiLaidOutBlock {
 	separatorBefore?: boolean;
 	mdBlocks?: PixiLaidOutMarkdownBlock[];
 	toolName?: string;
+	toolKey?: string;
 	toolCallId?: string;
 	toolUseId?: string;
 	pendingPermissionId?: string;
@@ -126,13 +127,21 @@ export interface PixiLaidOutBlock {
 	toolInRun?: boolean;
 	toolIsLast?: boolean;
 	toolDefaultOpen?: boolean;
+	toolExpanded?: boolean;
+	toolToggleKey?: string;
+	reasoningKey?: string;
 	reasoningExpanded?: boolean;
+	reasoningToggleKey?: string;
 	reasoningCharCount?: number;
 	reasoningEncrypted?: boolean;
 	reasoningStreaming?: boolean;
 	reasoningLabel?: string;
 	reasoningCharsLabel?: string;
 	reasoningThinkingLabel?: string;
+	messageId?: string;
+	messageUuid?: string | null;
+	blockIndex?: number;
+	copyText?: string;
 	imageSrc?: string;
 	imageId?: string;
 	imageUploadNarratorId?: string;
@@ -403,6 +412,37 @@ function capLines(lines: LayoutLine[], max: number): LayoutLine[] {
 	return capped;
 }
 
+function ellipsizeLineToWidth(text: string, width: number): LayoutLine {
+	const source = text || " ";
+	const sourceWidth = measureInlineText(source, CODE_FONT);
+	if (sourceWidth <= width) return makeInlineLine(source, sourceWidth);
+
+	const ellipsis = "…";
+	const ellipsisWidth = measureInlineText(ellipsis, CODE_FONT);
+	if (ellipsisWidth >= width) return makeInlineLine(ellipsis, Math.min(ellipsisWidth, width));
+
+	const chars = Array.from(source);
+	let low = 0;
+	let high = chars.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		const candidate = `${chars.slice(0, mid).join("")}${ellipsis}`;
+		if (measureInlineText(candidate, CODE_FONT) <= width) low = mid;
+		else high = mid - 1;
+	}
+
+	const textValue = `${chars.slice(0, low).join("")}${ellipsis}`;
+	return makeInlineLine(textValue, Math.min(width, measureInlineText(textValue, CODE_FONT)));
+}
+
+function layoutPhysicalCodeLines(text: string, width: number, maxLines: number): LayoutLine[] {
+	return text
+		.replace(/\r\n?/g, "\n")
+		.split("\n")
+		.slice(0, maxLines)
+		.map((line) => ellipsizeLineToWidth(line, width));
+}
+
 function layoutSpecialBlock(
 	block: PixiMessageItem["blocks"][number],
 	text: string,
@@ -638,8 +678,20 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 	};
 }
 
-function measureBadge(text: string): number {
-	return Math.max(28, text.length * 7 + 14);
+const BADGE_HEIGHT = 16;
+const BADGE_GAP = 4;
+const BADGE_MIN_WIDTH = 24;
+const BADGE_TEXT_PADDING_X = 7;
+const BADGE_DOT_LEFT = 14;
+const BADGE_DOT_RIGHT_PADDING = 7;
+
+function measureBadge(badge: PixiToolBadgeModel): number {
+	const horizontalPadding =
+		badge.variant === "dot" ? BADGE_DOT_LEFT + BADGE_DOT_RIGHT_PADDING : BADGE_TEXT_PADDING_X * 2;
+	return Math.max(
+		BADGE_MIN_WIDTH,
+		Math.ceil(measureInlineText(badge.text || " ", SMALL_FONT) + horizontalPadding),
+	);
 }
 
 function layoutBadges(
@@ -651,13 +703,13 @@ function layoutBadges(
 	let x = TOOL_CARD_PADDING;
 	let y = startY;
 	for (const badge of badges) {
-		const badgeWidth = Math.min(width - TOOL_CARD_PADDING * 2, measureBadge(badge.text));
+		const badgeWidth = Math.min(width - TOOL_CARD_PADDING * 2, measureBadge(badge));
 		if (x > TOOL_CARD_PADDING && x + badgeWidth > width - TOOL_CARD_PADDING) {
 			x = TOOL_CARD_PADDING;
-			y += 20;
+			y += BADGE_HEIGHT + BADGE_GAP;
 		}
-		laid.push({ ...badge, x, y, width: badgeWidth, height: 16 });
-		x += badgeWidth + 4;
+		laid.push({ ...badge, x, y, width: badgeWidth, height: BADGE_HEIGHT });
+		x += badgeWidth + BADGE_GAP;
 	}
 	return laid;
 }
@@ -784,16 +836,21 @@ function layoutToolDetailBlocks(
 		if (detail.kind === "code-panel" || detail.kind === "terminal-panel") {
 			const maxLines = detail.maxLines ?? 8;
 			const panelTextWidth = Math.max(24, contentWidth - CODE_PADDING_X * 2);
-			const result = layoutText(detail.text, panelTextWidth, CODE_FONT, CODE_LINE_H);
-			const lineCount = Math.min(result.lines.length, maxLines);
-			const height = CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, lineCount * CODE_LINE_H);
+			const lines =
+				detail.lang === "grep-output"
+					? layoutPhysicalCodeLines(detail.text, panelTextWidth, maxLines)
+					: layoutText(detail.text, panelTextWidth, CODE_FONT, CODE_LINE_H).lines.slice(
+							0,
+							maxLines,
+						);
+			const height = CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, lines.length * CODE_LINE_H);
 			laid.push({
 				...detail,
 				x: TOOL_CARD_PADDING,
 				y,
 				width: contentWidth,
 				height,
-				lines: result.lines.slice(0, maxLines),
+				lines,
 			});
 			y += height + 6;
 			continue;
@@ -919,7 +976,8 @@ function layoutToolUseBlock(
 	toolDetailLines: PixiLaidOutToolDetailLine[];
 	toolDetailBlocks: PixiLaidOutToolDetailBlock[];
 } {
-	const blocksLayout = block.toolDefaultOpen
+	const toolOpen = block.toolExpanded ?? block.toolDefaultOpen;
+	const blocksLayout = toolOpen
 		? layoutToolDetailBlocks(
 				block.toolDetailBlocks ?? [],
 				innerWidth,
@@ -928,7 +986,7 @@ function layoutToolUseBlock(
 		: { blocks: [], height: 0 };
 	const detailLines: PixiLaidOutToolDetailLine[] = [];
 	let y = TOOL_CARD_PADDING + TOOL_HEADER_H + TOOL_DETAIL_GAP + blocksLayout.height;
-	for (const detail of block.toolDefaultOpen && blocksLayout.blocks.length === 0
+	for (const detail of toolOpen && blocksLayout.blocks.length === 0
 		? (block.toolDetailLines ?? [])
 		: []) {
 		const labelPrefix = detail.label ? `${detail.label}: ` : "";
@@ -1039,6 +1097,10 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 			height,
 			separatorBefore,
 			mdBlocks: mdLayout?.mdBlocks,
+			messageId: block.messageId,
+			messageUuid: block.messageUuid,
+			blockIndex: block.blockIndex,
+			copyText: block.copyText,
 			toolName: block.toolName,
 			toolCallId: block.toolCallId,
 			toolUseId: block.toolUseId,
@@ -1055,8 +1117,12 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 			toolChildCount: block.toolChildCount,
 			toolInRun: block.toolInRun,
 			toolIsLast: block.toolIsLast,
+			toolKey: block.toolKey,
+			toolExpanded: block.toolExpanded,
 			toolDefaultOpen: block.toolDefaultOpen,
+			reasoningKey: block.reasoningKey,
 			reasoningExpanded: block.reasoningExpanded,
+			reasoningToggleKey: block.reasoningToggleKey,
 			reasoningCharCount: block.reasoningCharCount,
 			reasoningEncrypted: block.reasoningEncrypted,
 			reasoningStreaming: block.reasoningStreaming,

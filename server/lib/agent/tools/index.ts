@@ -6,6 +6,7 @@ import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
 import { editTool } from "./edit";
+import { exitPlanConfirmTool, exitPlanReviseTool } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
@@ -79,6 +80,8 @@ const coreProvider: ToolProvider = {
 			skillTool,
 			yoloConfirmTool,
 			yoloCancelTool,
+			exitPlanConfirmTool,
+			exitPlanReviseTool,
 		];
 	},
 };

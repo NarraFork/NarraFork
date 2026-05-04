@@ -224,6 +224,7 @@ export class ImageSpritePool {
 	releaseUnused(): void {
 		for (let i = this.cursor; i < this.pool.length; i++) {
 			this.pool[i].visible = false;
+			this.pool[i].texture = Texture.EMPTY;
 			this.pool[i].mask = null;
 		}
 		for (let i = this.cursor; i < this.maskPool.length; i++) {
@@ -274,9 +275,10 @@ export class TextPool {
 		node.visible = true;
 		node.alpha = 1;
 		node.scale.set(1);
+		node.roundPixels = true;
 		if (node.style !== resolvedStyle) node.style = resolvedStyle;
 		node.text = text;
-		node.position.set(x, y);
+		node.position.set(Math.round(x), Math.round(y));
 		return node;
 	}
 
@@ -745,29 +747,54 @@ function drawDashedRect(
 }
 
 function drawReasoningBlock(opts: DrawSpecialBlockOptions) {
-	const { textPool, iconPool, gfx, block, bx, by, theme } = opts;
+	const { textPool, iconPool, gfx, block, bx, by, theme, hitTargets, hoveredHitTargetId } = opts;
 	const opened = block.reasoningExpanded === true && !!block.text.trim();
 	const thinking = block.reasoningStreaming === true && !block.text.trim();
 	const label = thinking
 		? `${block.reasoningThinkingLabel ?? "Thinking"}…`
 		: (block.reasoningLabel ?? "Reasoning");
 	const headerY = by + 2;
+	const reasoningKey =
+		block.reasoningKey ??
+		`${block.type}:${block.reasoningCharCount ?? block.text.length}:${block.text.slice(0, 48) || `${block.x}:${block.y}`}`;
+	const targetId = `reasoning-toggle:${reasoningKey}`;
+	const headerHeight = 20;
+	const iconBoxX = bx + 8;
+	const iconBoxY = headerY;
+	const chevronX = iconBoxX - 11;
+	const labelX = iconBoxX + 20;
+	const hitX = Math.min(chevronX, bx) - 2;
+	if (!thinking) {
+		if (hoveredHitTargetId === targetId) {
+			gfx.roundRect(hitX, by, bx + block.width + 2 - hitX, headerHeight, 5);
+			gfx.fill({ color: theme.grape, alpha: 0.08 });
+		}
+		hitTargets?.push({
+			id: targetId,
+			kind: "reasoning-toggle",
+			reasoningKey,
+			x: hitX,
+			y: by,
+			width: bx + block.width + 2 - hitX,
+			height: headerHeight,
+		});
+	}
 
 	iconPool.acquire(
 		getPixiToolChevronIcon(opened, theme.dimmed, 12),
-		bx,
+		chevronX,
 		by + 4,
 		12,
 		thinking ? 0.5 : 1,
 	);
 
-	gfx.roundRect(bx + 11, headerY, 16, 16, 4);
+	gfx.roundRect(iconBoxX, iconBoxY, 16, 16, 4);
 	gfx.fill({ color: theme.grape, alpha: 0.16 });
-	iconPool.acquire(getPixiReasoningIcon(theme.grape, 10), bx + 14, by + 5, 10);
+	iconPool.acquire(getPixiReasoningIcon(theme.grape, 10), iconBoxX + 3, by + 5, 10);
 
 	const labelStyle = thinking ? SMALL_ITALIC_STYLE : SMALL_STYLE;
-	textPool.acquire(label, bx + 31, headerY, labelStyle, theme.dimmed);
-	let nextX = bx + 31 + textWidth(label, labelStyle);
+	textPool.acquire(label, labelX, headerY, labelStyle, theme.dimmed);
+	let nextX = labelX + textWidth(label, labelStyle);
 
 	if (!thinking && !block.reasoningEncrypted && block.reasoningCharsLabel) {
 		nextX += 6;
@@ -995,16 +1022,41 @@ function drawGoalContinuationBlock(opts: DrawSpecialBlockOptions) {
 	textPool.acquire(label, bx + 11, by + 5, SMALL_STYLE, theme.teal);
 }
 
-export interface PixiMessageHitTarget {
+interface PixiMessageHitTargetBase {
 	id: string;
-	kind: "permission-action";
-	permissionId: string;
-	action: PixiPermissionAction;
 	x: number;
 	y: number;
 	width: number;
 	height: number;
+	excludeRects?: Array<{ x: number; y: number; width: number; height: number }>;
 }
+
+export type PixiMessageHitTarget =
+	| (PixiMessageHitTargetBase & {
+			kind: "permission" | "permission-action";
+			permissionId: string;
+			action: PixiPermissionAction;
+	  })
+	| (PixiMessageHitTargetBase & {
+			kind: "tool-toggle";
+			toolKey: string;
+			toolCallId?: string;
+			toolUseId?: string;
+	  })
+	| (PixiMessageHitTargetBase & {
+			kind: "reasoning-toggle";
+			reasoningKey: string;
+	  })
+	| (PixiMessageHitTargetBase & {
+			kind: "message-menu";
+			blockId: string;
+			messageId?: string;
+			messageUuid?: string | null;
+			blockIndex?: number;
+			copyText?: string;
+			/** Right edge of the element that visually moves during swipe. */
+			swipeInitialRight?: number;
+	  });
 
 interface DrawSpecialBlockOptions {
 	textPool: TextPool;
@@ -1015,6 +1067,29 @@ interface DrawSpecialBlockOptions {
 	bx: number;
 	by: number;
 	theme: PixiMessageTheme;
+	hitTargets?: PixiMessageHitTarget[];
+	hoveredHitTargetId?: string | null;
+}
+
+function compactBadgeText(text: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
+	if (textWidth(text, SMALL_STYLE) <= maxWidth) return text;
+	if (textWidth("…", SMALL_STYLE) > maxWidth) return "";
+	const chars = Array.from(text);
+	let low = 0;
+	let high = chars.length;
+	let best = "…";
+	while (low <= high) {
+		const mid = Math.floor((low + high) / 2);
+		const candidate = `${chars.slice(0, mid).join("")}…`;
+		if (textWidth(candidate, SMALL_STYLE) <= maxWidth) {
+			best = candidate;
+			low = mid + 1;
+		} else {
+			high = mid - 1;
+		}
+	}
+	return best;
 }
 
 function drawBadge(
@@ -1029,16 +1104,23 @@ function drawBadge(
 	variant?: string,
 ): void {
 	const color = colorForName(theme, colorName);
-	gfx.roundRect(x, y, w, 16, 8);
+	const height = 16;
+	const paddingX = 7;
+	const dotTextX = 14;
+	const textX = variant === "dot" ? x + dotTextX : x + paddingX;
+	const availableTextWidth = Math.max(
+		0,
+		w - (variant === "dot" ? dotTextX + paddingX : paddingX * 2),
+	);
+	const label = compactBadgeText(text, availableTextWidth);
+	gfx.roundRect(x, y, w, height, height / 2);
 	gfx.fill({ color, alpha: variant === "outline" ? 0.03 : 0.13 });
 	gfx.stroke({ color, alpha: variant === "outline" ? 0.6 : 0.25, width: 1 });
 	if (variant === "dot") {
 		gfx.circle(x + 8, y + 8, 2);
 		gfx.fill({ color, alpha: 0.95 });
-		textPool.acquire(text, x + 14, y, SMALL_STYLE, color);
-	} else {
-		textPool.acquire(text, x + 7, y, SMALL_STYLE, color);
 	}
+	textPool.acquire(label, textX, y, SMALL_STYLE, color);
 }
 
 function drawPermissionButton(
@@ -1174,28 +1256,21 @@ function drawTokenLine(
 	}
 }
 
-function getGrepOutputTokens(text: string, theme: PixiMessageTheme): PixiHighlightToken[][] {
-	return text
-		.replace(/\r\n?/g, "\n")
-		.split("\n")
-		.map((line) => {
-			if (line === "--") return [{ content: line, color: theme.dimmed }];
+function getGrepOutputLineTokens(line: string, theme: PixiMessageTheme): PixiHighlightToken[] {
+	if (line === "--") return [{ content: line, color: theme.dimmed }];
 
-			const match = line.match(/^(.*?)([:-])(\d+)([:-])(.*)$/);
-			if (!match) {
-				return [{ content: line, color: line.startsWith("(") ? theme.dimmed : theme.text }];
-			}
+	const match = line.match(/^(.*?)([:-])(\d+)([:-])(.*)$/);
+	if (!match) return [{ content: line, color: line.startsWith("(") ? theme.dimmed : theme.text }];
 
-			const [, filePath, firstSep, lineNo, secondSep, content] = match;
-			const isMatchLine = firstSep === ":" || secondSep === ":";
-			return [
-				{ content: filePath, color: theme.cyan },
-				{ content: firstSep, color: theme.dimmed },
-				{ content: lineNo, color: theme.yellow },
-				{ content: secondSep, color: theme.dimmed },
-				{ content, color: isMatchLine ? theme.text : theme.dimmed },
-			];
-		});
+	const [, filePath, firstSep, lineNo, secondSep, content] = match;
+	const isMatchLine = firstSep === ":" || secondSep === ":";
+	return [
+		{ content: filePath, color: theme.cyan },
+		{ content: firstSep, color: theme.dimmed },
+		{ content: lineNo, color: theme.yellow },
+		{ content: secondSep, color: theme.dimmed },
+		{ content, color: isMatchLine ? theme.text : theme.dimmed },
+	];
 }
 
 function drawCodePanel(
@@ -1216,10 +1291,12 @@ function drawCodePanel(
 	gfx.stroke({ color: terminal ? theme.panelBorder : theme.toolBorder, alpha: 0.55, width: 1 });
 	let textY = y + CODE_PADDING_Y;
 	const isGrepOutput = block.lang === "grep-output";
-	const highlighted = isGrepOutput
-		? getGrepOutputTokens(block.text ?? "", theme)
-		: getPixiHighlightedTokens(block.text ?? "", block.lang, shikiThemeName());
-	const highlightedVisualLines = splitTokensByPretextLines(highlighted, block.lines ?? []);
+	const highlightedVisualLines = isGrepOutput
+		? (block.lines ?? []).map((line) => getGrepOutputLineTokens(line.text, theme))
+		: splitTokensByPretextLines(
+				getPixiHighlightedTokens(block.text ?? "", block.lang, shikiThemeName()),
+				block.lines ?? [],
+			);
 	for (let lineIndex = 0; lineIndex < (block.lines ?? []).length; lineIndex++) {
 		const line = block.lines?.[lineIndex];
 		if (!line) continue;
@@ -1502,10 +1579,44 @@ function drawToolUseBlock(
 	const cardY = by;
 	const cardW = block.width;
 	const inRun = block.toolInRun === true;
+	const toolKey = block.toolKey ?? block.toolUseId ?? block.toolCallId;
+	const targetId = toolKey ? `tool-toggle:${toolKey}` : null;
+	const contentExcludeRects = [
+		...(block.toolDetailBlocks ?? []).map((detail) => ({
+			x: bx + detail.x - 4,
+			y: by + detail.y - 2,
+			width: detail.width + 8,
+			height: detail.height + 4,
+		})),
+		...(block.toolDetailBlocks?.length ? [] : (block.toolDetailLines ?? [])).map((line) => ({
+			x: bx + line.x - 4,
+			y: by + line.y - 2,
+			width: line.width + 8,
+			height: line.height + 4,
+		})),
+	];
 	if (!inRun) {
 		gfx.roundRect(cardX, cardY, cardW, block.height, 4);
 		gfx.fill({ color: theme.toolBg, alpha: 0.42 });
 		gfx.stroke({ color: theme.toolBorder, alpha: 0.85, width: 1 });
+	}
+	if (targetId && hoveredHitTargetId === targetId) {
+		gfx.roundRect(cardX, cardY, cardW, block.height, inRun ? 0 : 4);
+		gfx.fill({ color: theme.toolBorder, alpha: 0.1 });
+	}
+	if (targetId && toolKey) {
+		hitTargets?.push({
+			id: targetId,
+			kind: "tool-toggle",
+			toolKey,
+			toolCallId: block.toolCallId,
+			toolUseId: block.toolUseId,
+			x: cardX,
+			y: cardY,
+			width: cardW,
+			height: block.height,
+			excludeRects: contentExcludeRects,
+		});
 	}
 
 	const iconBoxX = bx + header.x;
@@ -1537,8 +1648,9 @@ function drawToolUseBlock(
 	if (block.toolDuration) {
 		textPool.acquire(block.toolDuration, durationX, by + header.y + 2, SMALL_STYLE, theme.dimmed);
 	}
+	const toolExpanded = block.toolExpanded ?? block.toolDefaultOpen === true;
 	iconPool.acquire(
-		getPixiToolChevronIcon(block.toolDefaultOpen === true, theme.dimmed, chevronSize),
+		getPixiToolChevronIcon(toolExpanded, theme.dimmed, chevronSize),
 		chevronX,
 		by + header.y + 3,
 		chevronSize,
@@ -1649,6 +1761,8 @@ export function drawPixiMessages(opts: {
 	bufferPx?: number;
 	hitTargets?: PixiMessageHitTarget[];
 	hoveredHitTargetId?: string | null;
+	swipedMessage?: { targetId: string; offset: number; offscreen?: "top" | "bottom" | null } | null;
+	selectedBlockIds?: ReadonlySet<string>;
 }) {
 	const {
 		textPool,
@@ -1663,6 +1777,8 @@ export function drawPixiMessages(opts: {
 		bufferPx = 240,
 		hitTargets,
 		hoveredHitTargetId,
+		swipedMessage,
+		selectedBlockIds,
 	} = opts;
 	gfx.clear();
 	if (hitTargets) hitTargets.length = 0;
@@ -1692,6 +1808,14 @@ export function drawPixiMessages(opts: {
 
 		const isUser = item.role === "user";
 		const isTool = item.kind === "tool-run";
+		const swipedBlock =
+			swipedMessage && !swipedMessage.offscreen
+				? laid.blocks.find((block) => {
+						const id = `message-menu:${block.messageId ?? item.key}:${block.blockIndex ?? block.type}`;
+						return id === swipedMessage.targetId;
+					})
+				: undefined;
+		const itemSwipeDx = swipedBlock && !isTool ? -(swipedMessage?.offset ?? 0) : 0;
 		const isMultiToolRun = isTool && item.blocks.length >= 2;
 		const isPlainAssistant = item.role === "assistant" && item.kind !== "tool-run";
 		const hasBubble = !isPlainAssistant && !isTool;
@@ -1717,7 +1841,7 @@ export function drawPixiMessages(opts: {
 		if (hasBubble) {
 			drawRoundRect(
 				gfx,
-				laid.x,
+				laid.x + itemSwipeDx,
 				y,
 				laid.width,
 				laid.height,
@@ -1740,12 +1864,12 @@ export function drawPixiMessages(opts: {
 			);
 		}
 		if (highlightedId && item.targetIds.includes(highlightedId)) {
-			gfx.roundRect(laid.x - 2, y - 2, laid.width + 4, laid.height + 4, 10);
+			gfx.roundRect(laid.x + itemSwipeDx - 2, y - 2, laid.width + 4, laid.height + 4, 10);
 			gfx.stroke({ color: theme.yellow, alpha: 0.95, width: 2 });
 		}
 
 		if (!isPlainAssistant && !isTool) {
-			const headerX = isUser ? laid.x + 12 : laid.x + 16;
+			const headerX = isUser ? laid.x + itemSwipeDx + 12 : laid.x + itemSwipeDx + 16;
 			const headerY = y + 12;
 			const titleX = isUser ? headerX + 26 : headerX;
 			if (isUser) {
@@ -1765,7 +1889,7 @@ export function drawPixiMessages(opts: {
 				);
 				const subtitle = textPool.acquire(
 					subtitleText,
-					laid.x + laid.width - subtitleWidth - 12,
+					laid.x + itemSwipeDx + laid.width - subtitleWidth - 12,
 					headerY + 2,
 					SUBTITLE_STYLE,
 					theme.dimmed,
@@ -1775,8 +1899,36 @@ export function drawPixiMessages(opts: {
 		}
 
 		for (const block of laid.blocks) {
-			const bx = laid.x + block.x;
+			const messageMenuId = `message-menu:${block.messageId ?? item.key}:${block.blockIndex ?? block.type}`;
+			const blockId = `px-${block.messageId ?? item.key}-${block.blockIndex ?? block.type}`;
+			const blockSwipeDx =
+				swipedMessage?.targetId === messageMenuId && !swipedMessage.offscreen
+					? -swipedMessage.offset
+					: 0;
+			const bx = laid.x + block.x + itemSwipeDx + (isTool ? blockSwipeDx : 0);
+			const swipeInitialRight = isTool ? laid.x + block.x + block.width : laid.x + laid.width;
+			const isSelected = selectedBlockIds?.has(blockId) ?? false;
 			let by = y + block.y;
+			if (hitTargets && (block.messageId || block.copyText)) {
+				hitTargets.push({
+					id: messageMenuId,
+					kind: "message-menu",
+					blockId,
+					messageId: block.messageId ?? item.messageId,
+					messageUuid: block.messageUuid ?? item.messageUuid,
+					blockIndex: block.blockIndex,
+					copyText: block.copyText || block.text,
+					swipeInitialRight,
+					x: bx,
+					y: by,
+					width: block.width,
+					height: block.height,
+				});
+			}
+			if (isSelected) {
+				gfx.roundRect(bx - 3, by - 3, block.width + 6, block.height + 6, 8);
+				gfx.stroke({ color: theme.indigo, alpha: 0.95, width: 2 });
+			}
 			if (block.separatorBefore) {
 				const separatorY = by - 1;
 				gfx.moveTo(bx, separatorY);
@@ -1799,7 +1951,20 @@ export function drawPixiMessages(opts: {
 			) {
 				continue;
 			}
-			if (drawSpecialBlock({ textPool, iconPool, imagePool, gfx, block, bx, by, theme })) {
+			if (
+				drawSpecialBlock({
+					textPool,
+					iconPool,
+					imagePool,
+					gfx,
+					block,
+					bx,
+					by,
+					theme,
+					hitTargets,
+					hoveredHitTargetId,
+				})
+			) {
 				continue;
 			}
 			if (block.label) {

@@ -19,6 +19,7 @@ import type { CustomSubagentDef } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import {
+	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
 	handleContextOverflow,
@@ -443,6 +444,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
 			retryBackoffCeilMs: getRetryBackoffCeilMs(),
+			firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,

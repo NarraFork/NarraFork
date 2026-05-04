@@ -301,8 +301,7 @@ export async function executeTool(
 		parentNarratorId: config.parentNarratorId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
-		yoloPauseRequestId: config.yoloReflection?.requestId,
-		yoloPauseToolUseId: config.yoloReflection?.toolUseId,
+		reflectionLoop: config.reflectionLoop?.context,
 	};
 
 	// Wire up emitLongRunning: notify UI when a process exceeds 60s

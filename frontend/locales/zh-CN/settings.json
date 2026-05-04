@@ -298,6 +298,8 @@
 	"maxTransientRetriesDesc": "遇到临时性 API 错误（限流、服务器错误）时的最大重试次数。设为 -1 表示无限重试。",
 	"retryBackoffCeil": "重试退避时间上限",
 	"retryBackoffCeilDesc": "指数退避的最大等待时间（秒）。重试间隔不会超过此值。",
+	"firstTokenTimeout": "首 token 超时时间",
+	"firstTokenTimeoutDesc": "AI API 请求发起后，若在此秒数内没有收到文本、工具、推理、网页搜索、图像生成等实质事件，则中断并重试。设为 0 表示禁用。",
 	"customRetryRules": "自定义可重试错误规则",
 	"customRetryRulesDesc": "定义自定义规则，将特定 API 错误标记为可重试。匹配的错误将自动重试而非直接失败。",
 	"retryRuleDomain": "域名",

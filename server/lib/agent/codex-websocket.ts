@@ -39,7 +39,7 @@ type PendingFrame =
 	| { type: "close"; code: number; reason: string }
 	| { type: "error"; error: Error };
 
-interface CodexWrappedErrorEvent {
+export interface CodexWrappedErrorEvent {
 	type?: string;
 	status?: number;
 	status_code?: number;
@@ -187,6 +187,11 @@ export function isCodexWebSocketIdleTimeoutError(error: unknown): boolean {
 		error instanceof Error &&
 		error.message === "Codex WebSocket idle timeout waiting for response event"
 	);
+}
+
+export function isCodexWebSocketConnectionLimitError(error: CodexWrappedErrorEvent): boolean {
+	const code = error.error?.code ?? error.error?.type;
+	return code === "websocket_connection_limit_reached";
 }
 
 export function decidePrematureCodexReconnect(
@@ -789,6 +794,42 @@ export async function* streamCodexResponsesWebSocket(
 			if (wrappedError) {
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
+				if (isCodexWebSocketConnectionLimitError(wrappedError)) {
+					const shouldReconnect =
+						!hasYieldedEvents && reconnectCount < MAX_PREMATURE_CLOSE_RECONNECTS;
+					const shouldFallback = !hasYieldedEvents;
+					logger.warn("Codex WebSocket reached connection lifetime limit", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						status,
+						shouldReconnect,
+						shouldFallback,
+						hasYieldedEvents,
+						reconnectCount,
+					});
+					if (shouldReconnect) {
+						await closeSessionConnection(session);
+						connection = null;
+						reconnectCount++;
+						touchSession(session);
+						connection = await ensureConnection(session, options);
+						if (options.signal.aborted) {
+							await resetSession(session, false);
+							yield { silentDisconnect: true };
+							return;
+						}
+						await connection.send(requestText);
+						continue;
+					}
+					await resetSession(session, false);
+					connection = null;
+					if (shouldFallback) {
+						throw new CodexWebSocketFallbackError(error.message, status);
+					}
+					throw error;
+				}
 				if (shouldDisableWebSocketForStatus(status)) {
 					await resetSession(session, true);
 					throw new CodexWebSocketFallbackError(error.message, status);

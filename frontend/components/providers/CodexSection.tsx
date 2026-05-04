@@ -1535,13 +1535,16 @@ function UsageDisplay({
 
 	const formatResetTime = (resetAt: number) => {
 		const date = new Date(resetAt * 1000);
-		const now = Date.now();
-		const diff = date.getTime() - now;
+		const diff = date.getTime() - Date.now();
 
 		if (diff < 0) return t("codexUsageExpired");
-		if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m`;
-		if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h`;
-		return `${Math.floor(diff / 86400_000)}d`;
+		const totalMinutes = Math.floor(diff / 60_000);
+		const days = Math.floor(totalMinutes / 1440);
+		const hours = Math.floor((totalMinutes % 1440) / 60);
+		const minutes = totalMinutes % 60;
+		if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+		if (hours > 0) return `${hours}h ${minutes}m`;
+		return `${minutes}m`;
 	};
 
 	const getWindowLabel = (windowType: string) => {

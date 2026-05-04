@@ -34,6 +34,7 @@ export const DEFAULTS: NarraForkSettings = {
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20_000,
+		firstTokenTimeoutMs: 60_000,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -218,6 +219,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "可恢复错误重试退避时间上限（毫秒）。指数退避不会超过此值。默认 20000（20 秒）。",
 		type: "number",
 		valid: "正整数，默认 20000",
+	},
+	"agent.firstTokenTimeoutMs": {
+		desc: "首 token 超时时间（毫秒）。AI API 请求发起后，若在此时间内未收到 text/tool/reasoning/web_search/image_generation 等实质事件，则中断本次请求并按可恢复错误规则重试。0 表示禁用。默认 60000（60 秒）。",
+		type: "number",
+		valid: "0-600000，0 = 禁用，默认 60000",
 	},
 	"agent.customRetryRules": {
 		desc: "用户自定义可重试错误规则。匹配到的错误视为 transient 进行重试。每项含 id、domain(域名关键字)、statusCode、keyword、enabled、note。",

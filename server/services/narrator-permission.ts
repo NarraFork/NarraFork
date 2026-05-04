@@ -1543,6 +1543,59 @@ async function shouldAutoAllowSendWithinScope(
 	}
 }
 
+export function resolveExitPlanModeInput(
+	narratorId: string,
+	cwd: string,
+	input: Record<string, unknown>,
+	locale: Locale = "en",
+):
+	| { ok: true; input: Record<string, unknown> }
+	| { ok: false; message: string; input: Record<string, unknown> } {
+	const active = activeNarrators.get(narratorId);
+	const planFileId = active?._planFileId;
+	let effectiveInput = input;
+	let resolvedFromFile = false;
+	if (planFileId) {
+		const planFileName = `.narrafork/plan-${planFileId}.md`;
+		const absPath = resolve(cwd, planFileName);
+		try {
+			if (existsSync(absPath)) {
+				const content = readFileSync(absPath, "utf-8");
+				if (content.trim()) {
+					effectiveInput = { ...effectiveInput, plan: content };
+					resolvedFromFile = true;
+				}
+			}
+		} catch {
+			// Ignore read errors
+		}
+	}
+	if (!resolvedFromFile) {
+		const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
+		if (inlinePlan) {
+			effectiveInput = { ...effectiveInput, plan: inlinePlan };
+		}
+	}
+
+	const planValue = effectiveInput.plan;
+	const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
+	if (!hasPlanContent) {
+		const activePfId = activeNarrators.get(narratorId)?._planFileId;
+		const planFilePath = activePfId
+			? `.narrafork/plan-${activePfId}.md`
+			: ".narrafork/plan-<id>.md";
+		return {
+			ok: false,
+			input: effectiveInput,
+			message: getToolMessageWithParams("exitPlanModeEmptyPlan", locale, {
+				planFile: planFilePath,
+			}),
+		};
+	}
+
+	return { ok: true, input: effectiveInput };
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -1574,43 +1627,12 @@ export async function handlePermission(
 
 	// ExitPlanMode: resolve plan content from the designated plan file
 	if (toolName === "ExitPlanMode") {
-		const active = activeNarrators.get(narratorId);
-		const planFileId = active?._planFileId;
-		let resolvedFromFile = false;
-		if (planFileId) {
-			const planFileName = `.narrafork/plan-${planFileId}.md`;
-			const absPath = resolve(cwd, planFileName);
-			try {
-				if (existsSync(absPath)) {
-					const content = readFileSync(absPath, "utf-8");
-					if (content.trim()) {
-						effectiveInput = { ...effectiveInput, plan: content };
-						resolvedFromFile = true;
-					}
-				}
-			} catch {
-				// Ignore read errors
-			}
-		}
-		if (!resolvedFromFile) {
-			const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
-			if (inlinePlan) {
-				effectiveInput = { ...effectiveInput, plan: inlinePlan };
-			}
-		}
-
-		const planValue = effectiveInput.plan;
-		const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
-		if (!hasPlanContent) {
-			const activePfId = activeNarrators.get(narratorId)?._planFileId;
-			const planFilePath = activePfId
-				? `.narrafork/plan-${activePfId}.md`
-				: ".narrafork/plan-<id>.md";
+		const resolved = resolveExitPlanModeInput(narratorId, cwd, input, locale);
+		effectiveInput = resolved.input;
+		if (!resolved.ok) {
 			return {
 				behavior: "deny",
-				message: getToolMessageWithParams("exitPlanModeEmptyPlan", locale, {
-					planFile: planFilePath,
-				}),
+				message: resolved.message,
 				rawMessage: true,
 			};
 		}

@@ -37,6 +37,7 @@ export interface InstanceSettingsState {
 	smartInterruptionCheck: boolean;
 	maxTransientRetries: number;
 	retryBackoffCeilMs: number;
+	firstTokenTimeoutMs: number;
 	customRetryRules: Array<{
 		id: string;
 		domain?: string;
@@ -114,6 +115,7 @@ function makeDefaults(): InstanceSettingsState {
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20000,
+		firstTokenTimeoutMs: 60000,
 		customRetryRules: [],
 		contextThresholds: {
 			standard: { pruneStart: 95, compactStart: 99 },
@@ -189,6 +191,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
+				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 60000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
 				contextThresholds: settings.agent?.contextThresholds ?? {
 					standard: { pruneStart: 95, compactStart: 99 },
@@ -272,6 +275,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					smartInterruptionCheck: state.smartInterruptionCheck,
 					maxTransientRetries: state.maxTransientRetries,
 					retryBackoffCeilMs: state.retryBackoffCeilMs,
+					firstTokenTimeoutMs: state.firstTokenTimeoutMs,
 					customRetryRules: state.customRetryRules,
 					contextThresholds: state.contextThresholds,
 					whitelistDirs: state.globalWhitelistDirs,

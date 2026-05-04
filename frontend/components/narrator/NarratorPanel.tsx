@@ -4907,6 +4907,11 @@ export function NarratorPanel({
 													pendingPermission={renderPermCb.pendingPermission}
 													pendingPermsMap={renderPermCb.pendingPermsMap}
 													onPermissionDecision={renderPermCb.onPermissionDecision}
+													onForkFromMessage={forkHandler}
+													onAskInPassing={handleAskInPassing}
+													onCompactBeforeMessage={handleCompactBefore}
+													onDeleteBlock={handleDeleteBlock}
+													onRollbackToBlock={handleRollback}
 													scrollRef={viewportCallbackRef}
 													contentRef={contentRef}
 													shift={isFetchingNextPage}

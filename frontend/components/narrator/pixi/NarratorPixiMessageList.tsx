@@ -1,6 +1,16 @@
 import { clearCache as clearPretextCache, setLocale as setPretextLocale } from "@chenglou/pretext";
 import i18n from "@frontend/lib/i18n";
-import { Application, Container, Graphics } from "pixi.js";
+import { Box, Menu } from "@mantine/core";
+import {
+	IconArrowBackUp,
+	IconArrowsMinimize,
+	IconCopy,
+	IconGitFork,
+	IconMessageQuestion,
+	IconTrash,
+	IconX,
+} from "@tabler/icons-react";
+import { Application, Container, Graphics, type Ticker } from "pixi.js";
 import {
 	forwardRef,
 	type MutableRefObject,
@@ -13,10 +23,21 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../../hooks/useLocalPref";
+import { BLOCK_ID_ATTR, useMessageSelection } from "../MessageSelectionCtx";
 import { getRenderableMessageOrder } from "../message-order-utils";
 import { resolvePendingPerm } from "../narrator-message-helpers";
 import type { MessagesQueryData, NarratorMsg, PendingPermission } from "../narrator-panel-types";
+import {
+	getGlobalCloseSwipe,
+	getGlobalOnSelectionRange,
+	getGlobalSwipeAnchor,
+	getGlobalToggleBlock,
+	setGlobalCloseSwipe,
+	setGlobalSwipeAnchor,
+} from "../swipeState";
 import { invalidatePixiImageTextures, subscribePixiImageTextureLoads } from "./pixi-image-textures";
 import {
 	drawPixiMessages,
@@ -62,6 +83,11 @@ interface NarratorPixiMessageListProps {
 		compactAfter?: boolean,
 		updatedPlan?: string,
 	) => void;
+	onForkFromMessage?: (uuid: string) => void;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
+	onCompactBeforeMessage?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	scrollRef: RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
 	contentRef: RefObject<HTMLDivElement | null>;
 	shift?: boolean;
@@ -108,6 +134,62 @@ function getMaxScrollTop(viewport: HTMLElement): number {
 	return Math.max(0, viewport.scrollHeight - viewport.clientHeight);
 }
 
+const SWIPE_DIRECTION_THRESHOLD = 10;
+const SWIPE_THRESHOLD = 60;
+const SWIPE_REVEAL_WIDTH = 180;
+const SWIPE_CLOSE_DURATION = 220;
+const TOUCH_MOMENTUM_TIME_CONSTANT_MS = 325;
+const TOUCH_MOMENTUM_MIN_VELOCITY_PX_PER_MS = 0.02;
+
+type MessageMenuTarget = Extract<PixiMessageHitTarget, { kind: "message-menu" }>;
+
+type PixiSwipeGeometry = {
+	initialRight: number;
+	targetLayoutTop: number;
+	targetLayoutBottom: number;
+	targetTop: number;
+	targetBottom: number;
+	visibleTop: number;
+	visibleBottom: number;
+};
+
+type PixiMessageMenuState = {
+	x: number;
+	y: number;
+	mode: "context" | "swipe";
+	offset: number;
+	dragging?: boolean;
+	closing?: boolean;
+	offscreen?: "top" | "bottom" | null;
+	swipeGeometry?: PixiSwipeGeometry;
+	target: MessageMenuTarget;
+};
+
+type TouchScrollState = {
+	moved: boolean;
+	pointerId: number;
+	startX: number;
+	startY: number;
+	lastY: number;
+	lastTime: number;
+	direction: "horizontal" | "vertical" | null;
+	rangeCandidate: boolean;
+	target: PixiMessageHitTarget | null;
+	swipeTarget: MessageMenuTarget | null;
+	swipeOffset: number;
+	swipeGeometry: PixiSwipeGeometry | null;
+	velocity: number;
+};
+
+function targetContainsPoint(target: PixiMessageHitTarget, x: number, y: number): boolean {
+	if (x < target.x || x > target.x + target.width || y < target.y || y > target.y + target.height) {
+		return false;
+	}
+	return !target.excludeRects?.some(
+		(rect) => x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height,
+	);
+}
+
 function hitTestPixiTarget(
 	targets: PixiMessageHitTarget[],
 	x: number,
@@ -115,16 +197,45 @@ function hitTestPixiTarget(
 ): PixiMessageHitTarget | null {
 	for (let i = targets.length - 1; i >= 0; i--) {
 		const target = targets[i];
-		if (
-			x >= target.x &&
-			x <= target.x + target.width &&
-			y >= target.y &&
-			y <= target.y + target.height
-		) {
-			return target;
-		}
+		if (targetContainsPoint(target, x, y)) return target;
 	}
 	return null;
+}
+
+function hitTestPixiMessageMenuTarget(
+	targets: PixiMessageHitTarget[],
+	x: number,
+	y: number,
+): MessageMenuTarget | null {
+	for (let i = targets.length - 1; i >= 0; i--) {
+		const target = targets[i];
+		if (target.kind === "message-menu" && targetContainsPoint(target, x, y)) return target;
+	}
+	return null;
+}
+
+function computePixiSwipeMenuPosition(
+	menu: Pick<PixiMessageMenuState, "x" | "y" | "offset" | "swipeGeometry">,
+	menuHeight = 120,
+): { x: number; y: number } {
+	const geometry = menu.swipeGeometry;
+	if (!geometry) return { x: menu.x, y: menu.y };
+
+	const menuLeft = geometry.initialRight - menu.offset;
+	const half = menuHeight / 2;
+
+	const center = (geometry.visibleTop + geometry.visibleBottom) / 2;
+	let menuTop = center;
+	const minTop = geometry.targetTop + half;
+	const maxTop = geometry.targetBottom - half;
+	if (minTop <= maxTop) {
+		menuTop = Math.max(minTop, Math.min(center, maxTop));
+	} else {
+		menuTop = (geometry.targetTop + geometry.targetBottom) / 2;
+	}
+	menuTop = Math.max(geometry.visibleTop + half, Math.min(menuTop, geometry.visibleBottom - half));
+
+	return { x: menuLeft, y: menuTop };
 }
 
 export const NarratorPixiMessageList = forwardRef<
@@ -144,12 +255,20 @@ export const NarratorPixiMessageList = forwardRef<
 		pendingPermission,
 		pendingPermsMap,
 		onPermissionDecision,
+		onForkFromMessage,
+		onAskInPassing,
+		onCompactBeforeMessage,
+		onDeleteBlock,
+		onRollbackToBlock,
 		scrollRef,
 		contentRef,
 		shift,
 	},
 	ref,
 ) {
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
+	const selection = useMessageSelection();
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	const canvasHostRef = useRef<HTMLDivElement | null>(null);
 	const spacerRef = useRef<HTMLDivElement | null>(null);
@@ -169,14 +288,45 @@ export const NarratorPixiMessageList = forwardRef<
 	const [imageVersion, setImageVersion] = useState(0);
 	const [highlightVersion, setHighlightVersion] = useState(0);
 	const [restoreVersion, setRestoreVersion] = useState(0);
+	const [fpsText, setFpsText] = useState("-- fps");
 	const [hoveredHitTargetId, setHoveredHitTargetId] = useState<string | null>(null);
 	const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
 	const hitTargetsRef = useRef<PixiMessageHitTarget[]>([]);
 	const hoveredHitTargetIdRef = useRef<string | null>(null);
+	const [messageMenu, setMessageMenu] = useState<PixiMessageMenuState | null>(null);
+	const [expandedStateVersion, setExpandedStateVersion] = useState(0);
+	const toolExpandedMapRef = useRef(new Map<string, boolean>());
+	const userToggledToolKeysRef = useRef(new Set<string>());
+	const forcedToolExpandedKeysRef = useRef(new Set<string>());
+	const resolvedToolExpandedRef = useRef(new Map<string, boolean>());
+	const reasoningExpandedMapRef = useRef(new Map<string, boolean>());
+	const userToggledReasoningKeysRef = useRef(new Set<string>());
+	const reasoningSlotExpandedRef = useRef(new Map<string, boolean>());
+	const reasoningKeySlotRef = useRef(new Map<string, string>());
+	const seenReasoningKeysRef = useRef(new Set<string>());
+	const resolvedReasoningExpandedRef = useRef(new Map<string, boolean>());
+	const swipedMessageRef = useRef<{
+		targetId: string;
+		offset: number;
+		offscreen?: "top" | "bottom" | null;
+	} | null>(null);
+	const swipeCloseTimerRef = useRef(0);
+	const messageMenuRef = useRef<HTMLDivElement | null>(null);
+	const selectionRef = useRef(selection);
+	selectionRef.current = selection;
 	const onPermissionDecisionRef = useRef(onPermissionDecision);
 	onPermissionDecisionRef.current = onPermissionDecision;
+	const renderPixiViewportRef = useRef<
+		(nextScrollTop?: number, options?: { bufferPx?: number }) => boolean
+	>(() => false);
+	const refreshAfterResumeRef = useRef<(options?: { resetTextures?: boolean }) => void>(() => {});
+	const sizeRef = useRef(size);
+	sizeRef.current = size;
 	const virtualScrollTopRef = useRef(0);
+	const pixiScrollOffsetRef = useRef(0);
+	const touchDrivingScrollRef = useRef(false);
 	const scrollEndTimerRef = useRef(0);
+	const pixiDrivenScrollTopRef = useRef<number | null>(null);
 	const lastLightResumeAtRef = useRef(0);
 	const lastVisibilityStateRef = useRef(
 		typeof document !== "undefined" ? document.visibilityState : "visible",
@@ -184,9 +334,27 @@ export const NarratorPixiMessageList = forwardRef<
 	const isAtBottomRef = useRef(true);
 	const prevTotalHeightRef = useRef(0);
 	const prevFirstKeyRef = useRef<string | null>(null);
+	const fpsLastCommitAtRef = useRef(0);
+	const fpsFrameCountRef = useRef(0);
 	const appliedRestoreVersionRef = useRef(0);
 	const lastRendererSizeRef = useRef({ width: 0, height: 0, dpr: 0 });
 	const pixiDestroyedRef = useRef(true);
+
+	const recordPixiFrame = useCallback(() => {
+		const now = performance.now();
+		if (fpsLastCommitAtRef.current === 0) {
+			fpsLastCommitAtRef.current = now;
+			fpsFrameCountRef.current = 0;
+			return;
+		}
+		fpsFrameCountRef.current += 1;
+		const elapsed = now - fpsLastCommitAtRef.current;
+		if (elapsed < 500) return;
+		const fps = (fpsFrameCountRef.current * 1000) / elapsed;
+		fpsLastCommitAtRef.current = now;
+		fpsFrameCountRef.current = 0;
+		setFpsText(`${Math.round(fps)} fps`);
+	}, []);
 
 	useEffect(() => {
 		hoveredHitTargetIdRef.current = hoveredHitTargetId;
@@ -211,8 +379,63 @@ export const NarratorPixiMessageList = forwardRef<
 		[pendingPermission, pendingPermsMap],
 	);
 
+	const resolveToolExpanded = useCallback(
+		(
+			tool: Parameters<
+				NonNullable<Parameters<typeof buildPixiMessageItems>[0]["resolveToolExpanded"]>
+			>[0],
+		) => {
+			const forced = !!tool.pendingPermission || tool.status === "pending";
+			if (forced) {
+				forcedToolExpandedKeysRef.current.add(tool.toolKey);
+				resolvedToolExpandedRef.current.set(tool.toolKey, true);
+				return true;
+			}
+			forcedToolExpandedKeysRef.current.delete(tool.toolKey);
+			const value = userToggledToolKeysRef.current.has(tool.toolKey)
+				? (toolExpandedMapRef.current.get(tool.toolKey) ?? tool.defaultOpen)
+				: tool.defaultOpen;
+			resolvedToolExpandedRef.current.set(tool.toolKey, value);
+			return value;
+		},
+		[],
+	);
+
+	const resolveReasoningExpanded = useCallback(
+		(
+			reasoning: Parameters<
+				NonNullable<Parameters<typeof buildPixiMessageItems>[0]["resolveReasoningExpanded"]>
+			>[0],
+		) => {
+			reasoningKeySlotRef.current.set(reasoning.reasoningKey, reasoning.reasoningSlotKey);
+			const manualKey = [reasoning.reasoningKey, ...(reasoning.reasoningAliasKeys ?? [])].find(
+				(key) => userToggledReasoningKeysRef.current.has(key),
+			);
+			if (manualKey) {
+				const value = reasoningExpandedMapRef.current.get(manualKey) ?? reasoning.defaultExpanded;
+				resolvedReasoningExpandedRef.current.set(reasoning.reasoningKey, value);
+				seenReasoningKeysRef.current.add(reasoning.reasoningKey);
+				return value;
+			}
+			if (seenReasoningKeysRef.current.has(reasoning.reasoningKey)) {
+				return (
+					resolvedReasoningExpandedRef.current.get(reasoning.reasoningKey) ??
+					reasoning.defaultExpanded
+				);
+			}
+			const value =
+				reasoningSlotExpandedRef.current.get(reasoning.reasoningSlotKey) ??
+				reasoning.defaultExpanded;
+			resolvedReasoningExpandedRef.current.set(reasoning.reasoningKey, value);
+			seenReasoningKeysRef.current.add(reasoning.reasoningKey);
+			return value;
+		},
+		[],
+	);
+
 	const items = useMemo(() => {
 		void layoutVersion;
+		void expandedStateVersion;
 		return buildPixiMessageItems({
 			pages: messagesData?.pages ?? [],
 			pageParams: messagesData?.pageParams,
@@ -226,6 +449,8 @@ export const NarratorPixiMessageList = forwardRef<
 			showTokenUsage,
 			expandReasoning,
 			resolvePermission: resolvePixiPermission,
+			resolveToolExpanded,
+			resolveReasoningExpanded,
 		});
 	}, [
 		messagesData?.pages,
@@ -240,7 +465,10 @@ export const NarratorPixiMessageList = forwardRef<
 		showTokenUsage,
 		expandReasoning,
 		resolvePixiPermission,
+		resolveToolExpanded,
+		resolveReasoningExpanded,
 		layoutVersion,
+		expandedStateVersion,
 	]);
 
 	const refreshTheme = useCallback(() => {
@@ -260,6 +488,97 @@ export const NarratorPixiMessageList = forwardRef<
 		return layoutPixiMessageItems(items, Math.max(1, size.width));
 	}, [items, size.width, layoutVersion]);
 	const virtualScrollHeight = Math.max(size.height, layout.totalHeight);
+	const selectionMarkers = useMemo(() => {
+		const markers: Array<{
+			blockId: string;
+			messageId?: string;
+			blockIndex?: number;
+			text: string;
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+		}> = [];
+		for (const laid of layout.items) {
+			if (laid.item.kind === "divider") continue;
+			for (const block of laid.blocks) {
+				if (!block.messageId && !block.copyText) continue;
+				const blockId = `px-${block.messageId ?? laid.item.key}-${block.blockIndex ?? block.type}`;
+				markers.push({
+					blockId,
+					messageId: block.messageId ?? laid.item.messageId,
+					blockIndex: block.blockIndex,
+					text:
+						block.copyText || block.text || block.lines?.map((line) => line.text).join("\n") || "",
+					x: laid.x + block.x,
+					y: laid.y + block.y,
+					width: block.width,
+					height: block.height,
+				});
+			}
+		}
+		return markers;
+	}, [layout.items]);
+
+	const closePixiMessageMenu = useCallback((animate = true) => {
+		window.clearTimeout(swipeCloseTimerRef.current);
+		if (animate && swipedMessageRef.current) {
+			swipedMessageRef.current = { ...swipedMessageRef.current, offset: 0 };
+			setMessageMenu((menu) =>
+				menu ? { ...menu, x: menu.x + menu.offset, offset: 0, closing: true } : menu,
+			);
+			renderPixiViewportRef.current();
+			swipeCloseTimerRef.current = window.setTimeout(() => {
+				swipedMessageRef.current = null;
+				setMessageMenu(null);
+				renderPixiViewportRef.current();
+			}, SWIPE_CLOSE_DURATION);
+		} else {
+			swipedMessageRef.current = null;
+			setMessageMenu(null);
+			renderPixiViewportRef.current();
+		}
+		if (getGlobalCloseSwipe() === closePixiMessageMenu) setGlobalCloseSwipe(null);
+		setGlobalSwipeAnchor(null);
+	}, []);
+
+	const openPixiMessageMenu = useCallback(
+		(menu: PixiMessageMenuState) => {
+			window.clearTimeout(swipeCloseTimerRef.current);
+			const currentClose = getGlobalCloseSwipe();
+			if (currentClose && currentClose !== closePixiMessageMenu) currentClose();
+			setGlobalCloseSwipe(closePixiMessageMenu);
+			if (menu.mode === "swipe") setGlobalSwipeAnchor(menu.target.blockId);
+			setMessageMenu(menu);
+		},
+		[closePixiMessageMenu],
+	);
+
+	useEffect(() => {
+		return () => {
+			window.clearTimeout(swipeCloseTimerRef.current);
+			if (getGlobalCloseSwipe() === closePixiMessageMenu) setGlobalCloseSwipe(null);
+		};
+	}, [closePixiMessageMenu]);
+
+	const toggleTool = useCallback((toolKey: string) => {
+		if (forcedToolExpandedKeysRef.current.has(toolKey)) return;
+		const current = resolvedToolExpandedRef.current.get(toolKey) ?? false;
+		toolExpandedMapRef.current.set(toolKey, !current);
+		userToggledToolKeysRef.current.add(toolKey);
+		setExpandedStateVersion((version) => version + 1);
+	}, []);
+
+	const toggleReasoning = useCallback((reasoningKey: string) => {
+		const current = resolvedReasoningExpandedRef.current.get(reasoningKey) ?? false;
+		const next = !current;
+		reasoningExpandedMapRef.current.set(reasoningKey, next);
+		userToggledReasoningKeysRef.current.add(reasoningKey);
+		resolvedReasoningExpandedRef.current.set(reasoningKey, next);
+		const slotKey = reasoningKeySlotRef.current.get(reasoningKey);
+		if (slotKey) reasoningSlotExpandedRef.current.set(slotKey, next);
+		setExpandedStateVersion((version) => version + 1);
+	}, []);
 
 	const renderPixiViewport = useCallback(
 		(nextScrollTop?: number, options?: { bufferPx?: number }) => {
@@ -284,11 +603,9 @@ export const NarratorPixiMessageList = forwardRef<
 				return false;
 			}
 
-			const currentScrollTop = Math.max(
-				0,
-				nextScrollTop ?? viewportRef.current?.scrollTop ?? virtualScrollTopRef.current,
-			);
+			const currentScrollTop = Math.max(0, nextScrollTop ?? pixiScrollOffsetRef.current);
 			virtualScrollTopRef.current = currentScrollTop;
+			pixiScrollOffsetRef.current = currentScrollTop;
 
 			const app = appRef.current;
 			const gfx = gfxRef.current;
@@ -311,12 +628,17 @@ export const NarratorPixiMessageList = forwardRef<
 				highlightedId,
 				hitTargets: hitTargetsRef.current,
 				hoveredHitTargetId,
+				swipedMessage: swipedMessageRef.current,
+				selectedBlockIds: selectionRef.current.selectionMode
+					? selectionRef.current.selectedBlockIds
+					: undefined,
 				...(options?.bufferPx != null ? { bufferPx: options.bufferPx } : {}),
 			});
 			imagePool.releaseUnused();
 			textPool.releaseUnused();
 			iconPool.releaseUnused();
 			app.render();
+			recordPixiFrame();
 			return true;
 		},
 		[
@@ -331,8 +653,17 @@ export const NarratorPixiMessageList = forwardRef<
 			highlightVersion,
 			restoreVersion,
 			hoveredHitTargetId,
+			recordPixiFrame,
 		],
 	);
+
+	renderPixiViewportRef.current = renderPixiViewport;
+
+	useEffect(() => {
+		void selection.selectionMode;
+		void selection.selectedBlockIds;
+		renderPixiViewportRef.current();
+	}, [selection.selectionMode, selection.selectedBlockIds]);
 
 	const setNativeScrollTop = useCallback(
 		(targetScrollTop: number, options?: { behavior?: ScrollBehavior; bufferPx?: number }) => {
@@ -344,10 +675,11 @@ export const NarratorPixiMessageList = forwardRef<
 				return target;
 			}
 			viewport.scrollTop = target;
-			virtualScrollTopRef.current = viewport.scrollTop;
+			pixiScrollOffsetRef.current = target;
+			virtualScrollTopRef.current = target;
 			isAtBottomRef.current = isViewportAtBottom(viewport);
-			renderPixiViewport(viewport.scrollTop, { bufferPx: options?.bufferPx });
-			return viewport.scrollTop;
+			renderPixiViewport(target, { bufferPx: options?.bufferPx });
+			return target;
 		},
 		[renderPixiViewport],
 	);
@@ -391,13 +723,22 @@ export const NarratorPixiMessageList = forwardRef<
 
 		let renderRaf = 0;
 		const renderFromNativeScroll = (bufferPx?: number) => {
+			pixiScrollOffsetRef.current = viewport.scrollTop;
 			virtualScrollTopRef.current = viewport.scrollTop;
 			isAtBottomRef.current = isViewportAtBottom(viewport);
 			renderPixiViewport(viewport.scrollTop, bufferPx == null ? undefined : { bufferPx });
 		};
 		const onScroll = () => {
-			cancelAnimationFrame(renderRaf);
-			renderRaf = requestAnimationFrame(() => renderFromNativeScroll());
+			const pixiDrivenScrollTop = pixiDrivenScrollTopRef.current;
+			const isPixiDrivenScroll =
+				touchDrivingScrollRef.current ||
+				(pixiDrivenScrollTop !== null && Math.abs(viewport.scrollTop - pixiDrivenScrollTop) < 0.5);
+			if (isPixiDrivenScroll) {
+				pixiDrivenScrollTopRef.current = null;
+			} else {
+				cancelAnimationFrame(renderRaf);
+				renderRaf = requestAnimationFrame(() => renderFromNativeScroll());
+			}
 			clearTimeout(scrollEndTimerRef.current);
 			scrollEndTimerRef.current = window.setTimeout(() => {
 				viewport.dispatchEvent(new Event("scrollend"));
@@ -429,13 +770,13 @@ export const NarratorPixiMessageList = forwardRef<
 				heightDelta > 0;
 
 			if (prependedItems) {
-				setNativeScrollTop(viewport.scrollTop + heightDelta);
+				setNativeScrollTop(pixiScrollOffsetRef.current + heightDelta);
 				isAtBottomRef.current = isViewportAtBottom(viewport);
 			} else if (isAtBottomRef.current) {
 				setNativeScrollTop(getMaxScrollTop(viewport));
 				isAtBottomRef.current = true;
 			} else {
-				setNativeScrollTop(viewport.scrollTop, { bufferPx: 0 });
+				setNativeScrollTop(pixiScrollOffsetRef.current, { bufferPx: 0 });
 			}
 		}
 
@@ -526,6 +867,7 @@ export const NarratorPixiMessageList = forwardRef<
 				prev.width === nextSize.width && prev.height === nextSize.height ? prev : nextSize,
 			);
 			viewport.scrollTop = clamp(viewport.scrollTop, 0, getMaxScrollTop(viewport));
+			pixiScrollOffsetRef.current = viewport.scrollTop;
 			virtualScrollTopRef.current = viewport.scrollTop;
 			isAtBottomRef.current = isViewportAtBottom(viewport);
 		}
@@ -540,6 +882,7 @@ export const NarratorPixiMessageList = forwardRef<
 		setHighlightVersion((version) => version + 1);
 		setRestoreVersion((version) => version + 1);
 	}, []);
+	refreshAfterResumeRef.current = refreshAfterResume;
 
 	useEffect(() => {
 		const refreshLightly = () => {
@@ -574,38 +917,94 @@ export const NarratorPixiMessageList = forwardRef<
 		if (!host) return;
 		const app = new Application();
 		pixiDestroyedRef.current = true;
-		const handleContextLost = (event: Event) => event.preventDefault();
-		const handleContextRestored = () => refreshAfterResume({ resetTextures: true });
-		const hitTargetAtEvent = (event: PointerEvent | MouseEvent) => {
+		let touchScrollState: TouchScrollState | null = null;
+		let momentumVelocity = 0;
+		let momentumTickerAttached = false;
+		let momentumTick: ((ticker: Ticker) => void) | null = null;
+		const syncNativeScrollFromPixi = () => {
+			const viewport = viewportRef.current;
+			if (!viewport) return;
+			const offset = clamp(pixiScrollOffsetRef.current, 0, getMaxScrollTop(viewport));
+			pixiScrollOffsetRef.current = offset;
+			virtualScrollTopRef.current = offset;
+			pixiDrivenScrollTopRef.current = offset;
+			viewport.scrollTop = offset;
+			isAtBottomRef.current = isViewportAtBottom(viewport);
+		};
+		const cancelTouchMomentum = () => {
+			if (momentumTickerAttached && momentumTick) {
+				app.ticker.remove(momentumTick);
+				momentumTickerAttached = false;
+				if (app.ticker.count === 0) app.ticker.stop();
+			}
+			momentumVelocity = 0;
+			touchDrivingScrollRef.current = false;
+			syncNativeScrollFromPixi();
+		};
+		const handleContextLost = (event: Event) => {
+			cancelTouchMomentum();
+			event.preventDefault();
+		};
+		const handleContextRestored = () => refreshAfterResumeRef.current({ resetTextures: true });
+		const eventLocalPoint = (event: PointerEvent | MouseEvent) => {
 			const canvas = event.currentTarget as HTMLCanvasElement;
 			const rect = canvas.getBoundingClientRect();
-			return hitTestPixiTarget(
-				hitTargetsRef.current,
-				event.clientX - rect.left,
-				event.clientY - rect.top,
-			);
+			return { rect, x: event.clientX - rect.left, y: event.clientY - rect.top };
 		};
-		const handlePointerMove = (event: PointerEvent) => {
-			const target = hitTargetAtEvent(event);
-			const nextId = target?.id ?? null;
-			if (hoveredHitTargetIdRef.current !== nextId) {
-				hoveredHitTargetIdRef.current = nextId;
-				setHoveredHitTargetId(nextId);
+		const hitTargetAtEvent = (event: PointerEvent | MouseEvent) => {
+			const point = eventLocalPoint(event);
+			return hitTestPixiTarget(hitTargetsRef.current, point.x, point.y);
+		};
+		const messageMenuTargetAtEvent = (event: PointerEvent | MouseEvent) => {
+			const point = eventLocalPoint(event);
+			return hitTestPixiMessageMenuTarget(hitTargetsRef.current, point.x, point.y);
+		};
+		const swipeGeometryForTarget = (
+			target: MessageMenuTarget,
+			canvasRect: DOMRect,
+		): PixiSwipeGeometry => {
+			let visibleTop = 0;
+			let visibleBottom = window.innerHeight;
+			const viewport = viewportRef.current;
+			if (viewport) {
+				const viewportRect = viewport.getBoundingClientRect();
+				visibleTop = Math.max(visibleTop, viewportRect.top);
+				visibleBottom = Math.min(visibleBottom, viewportRect.bottom);
 			}
-			(event.currentTarget as HTMLCanvasElement).style.cursor = target ? "pointer" : "default";
+			const targetLayoutTop = pixiScrollOffsetRef.current + target.y;
+			const targetLayoutBottom = targetLayoutTop + target.height;
+			return {
+				initialRight: canvasRect.left + (target.swipeInitialRight ?? target.x + target.width),
+				targetLayoutTop,
+				targetLayoutBottom,
+				targetTop: canvasRect.top + target.y,
+				targetBottom: canvasRect.top + target.y + target.height,
+				visibleTop,
+				visibleBottom,
+			};
 		};
-		const handlePointerLeave = (event: PointerEvent) => {
+		const swipePositionForGeometry = (geometry: PixiSwipeGeometry, offset: number) =>
+			computePixiSwipeMenuPosition(
+				{ x: geometry.initialRight - offset, y: 0, offset, swipeGeometry: geometry },
+				messageMenuRef.current?.offsetHeight,
+			);
+		const clearHoveredTarget = (canvas: HTMLCanvasElement) => {
 			if (hoveredHitTargetIdRef.current !== null) {
 				hoveredHitTargetIdRef.current = null;
 				setHoveredHitTargetId(null);
 			}
-			(event.currentTarget as HTMLCanvasElement).style.cursor = "default";
+			canvas.style.cursor = "default";
 		};
-		const handlePointerDown = (event: PointerEvent) => {
-			const target = hitTargetAtEvent(event);
-			if (!target) return;
-			event.preventDefault();
-			event.stopPropagation();
+		const triggerHitTarget = (target: PixiMessageHitTarget) => {
+			if (target.kind === "tool-toggle") {
+				toggleTool(target.toolKey);
+				return;
+			}
+			if (target.kind === "reasoning-toggle") {
+				toggleReasoning(target.reasoningKey);
+				return;
+			}
+			if (target.kind !== "permission-action" && target.kind !== "permission") return;
 			if (target.action === "deny") {
 				onPermissionDecisionRef.current?.(target.permissionId, "deny");
 			} else {
@@ -617,11 +1016,264 @@ export const NarratorPixiMessageList = forwardRef<
 				);
 			}
 		};
-		const handleWheel = (event: WheelEvent) => {
+		const dispatchScrollIntent = (viewport: HTMLElement, deltaY: number) => {
+			viewport.dispatchEvent(new WheelEvent("wheel", { deltaY }));
+		};
+		const scrollViewportBy = (deltaY: number, options?: { renderNow?: boolean }) => {
 			const viewport = viewportRef.current;
-			if (!viewport) return;
+			if (!viewport) return false;
+			const previous = pixiScrollOffsetRef.current;
+			const next = clamp(previous + deltaY, 0, getMaxScrollTop(viewport));
+			const actualDelta = next - previous;
+			if (actualDelta === 0) return false;
+			pixiScrollOffsetRef.current = next;
+			virtualScrollTopRef.current = next;
+			isAtBottomRef.current = next >= getMaxScrollTop(viewport) - 30;
+			dispatchScrollIntent(viewport, actualDelta);
+			pixiDrivenScrollTopRef.current = next;
+			viewport.scrollTop = next;
+			if (options?.renderNow) renderPixiViewportRef.current(next);
+			return true;
+		};
+		momentumTick = (ticker: Ticker) => {
+			const dt = Math.max(Number.EPSILON, ticker.elapsedMS);
+			const deltaY = momentumVelocity * dt;
+			if (!scrollViewportBy(deltaY, { renderNow: true })) {
+				cancelTouchMomentum();
+				return;
+			}
+			momentumVelocity *= Math.exp(-dt / TOUCH_MOMENTUM_TIME_CONSTANT_MS);
+			if (Math.abs(momentumVelocity) < TOUCH_MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+				cancelTouchMomentum();
+			}
+		};
+		const startTouchMomentum = (velocity: number) => {
+			cancelTouchMomentum();
+			if (Math.abs(velocity) < TOUCH_MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
+				touchDrivingScrollRef.current = false;
+				syncNativeScrollFromPixi();
+				return;
+			}
+			touchDrivingScrollRef.current = true;
+			const viewport = viewportRef.current;
+			pixiScrollOffsetRef.current = viewport
+				? clamp(pixiScrollOffsetRef.current, 0, getMaxScrollTop(viewport))
+				: pixiScrollOffsetRef.current;
+			momentumVelocity = velocity;
+			if (!momentumTickerAttached && momentumTick) {
+				app.ticker.add(momentumTick);
+				momentumTickerAttached = true;
+			}
+			app.ticker.start();
+		};
+		const handlePointerMove = (event: PointerEvent) => {
+			const canvas = event.currentTarget as HTMLCanvasElement;
+			if (touchScrollState?.pointerId === event.pointerId) {
+				event.stopPropagation();
+				const now = event.timeStamp || performance.now();
+				const dx = touchScrollState.startX - event.clientX;
+				const dy = event.clientY - touchScrollState.startY;
+				const absDx = Math.abs(dx);
+				const absDy = Math.abs(dy);
+				if (!touchScrollState.direction && Math.max(absDx, absDy) >= SWIPE_DIRECTION_THRESHOLD) {
+					touchScrollState.direction =
+						touchScrollState.swipeTarget && absDx > absDy ? "horizontal" : "vertical";
+					touchScrollState.moved = true;
+					clearHoveredTarget(canvas);
+				}
+				const deltaY = touchScrollState.lastY - event.clientY;
+				const dt = Math.max(1, now - touchScrollState.lastTime);
+				touchScrollState.lastY = event.clientY;
+				touchScrollState.lastTime = now;
+				if (touchScrollState.direction === "horizontal" && touchScrollState.swipeTarget) {
+					event.preventDefault();
+					const offset = clamp(dx, 0, SWIPE_REVEAL_WIDTH);
+					touchScrollState.swipeOffset = offset;
+					swipedMessageRef.current = { targetId: touchScrollState.swipeTarget.id, offset };
+					if (touchScrollState.rangeCandidate) {
+						renderPixiViewportRef.current();
+						return;
+					}
+					const swipeGeometry = touchScrollState.swipeGeometry;
+					if (!swipeGeometry) return;
+					const position = swipePositionForGeometry(swipeGeometry, offset);
+					openPixiMessageMenu({
+						x: position.x,
+						y: position.y,
+						mode: "swipe",
+						offset,
+						dragging: true,
+						swipeGeometry,
+						target: touchScrollState.swipeTarget,
+					});
+					renderPixiViewportRef.current();
+					return;
+				}
+				if (touchScrollState.direction === "vertical") {
+					event.preventDefault();
+					const instantVelocity = deltaY / dt;
+					touchScrollState.velocity =
+						touchScrollState.velocity === 0
+							? instantVelocity
+							: touchScrollState.velocity * 0.6 + instantVelocity * 0.4;
+					scrollViewportBy(deltaY, { renderNow: true });
+				}
+				return;
+			}
+			if (event.pointerType === "touch") return;
+			const target = hitTargetAtEvent(event);
+			const nextId = target?.id ?? null;
+			if (hoveredHitTargetIdRef.current !== nextId) {
+				hoveredHitTargetIdRef.current = nextId;
+				setHoveredHitTargetId(nextId);
+			}
+			canvas.style.cursor = target ? "pointer" : "default";
+		};
+		const handlePointerLeave = (event: PointerEvent) => {
+			if (touchScrollState?.pointerId === event.pointerId) return;
+			clearHoveredTarget(event.currentTarget as HTMLCanvasElement);
+		};
+		const handlePointerDown = (event: PointerEvent) => {
+			const canvas = event.currentTarget as HTMLCanvasElement;
+			const target = hitTargetAtEvent(event);
+			const menuTarget = messageMenuTargetAtEvent(event);
+			if (event.pointerType === "touch") {
+				cancelTouchMomentum();
+				touchDrivingScrollRef.current = true;
+				const currentClose = getGlobalCloseSwipe();
+				const currentAnchor = getGlobalSwipeAnchor();
+				const rangeCandidate = !!(
+					currentClose &&
+					menuTarget?.blockId &&
+					currentAnchor &&
+					currentAnchor !== menuTarget.blockId
+				);
+				const now = event.timeStamp || performance.now();
+				const point = eventLocalPoint(event);
+				const swipeGeometry = menuTarget ? swipeGeometryForTarget(menuTarget, point.rect) : null;
+				touchScrollState = {
+					moved: false,
+					pointerId: event.pointerId,
+					startX: event.clientX,
+					startY: event.clientY,
+					lastY: event.clientY,
+					lastTime: now,
+					direction: null,
+					rangeCandidate,
+					target,
+					swipeTarget: menuTarget,
+					swipeOffset: 0,
+					swipeGeometry,
+					velocity: 0,
+				};
+				canvas.setPointerCapture?.(event.pointerId);
+				event.preventDefault();
+				event.stopPropagation();
+				return;
+			}
+			const isModKey = event.metaKey || event.ctrlKey;
+			const isShift = event.shiftKey;
+			if ((isModKey || isShift) && menuTarget) {
+				event.preventDefault();
+				event.stopPropagation();
+				if (isShift) selectionRef.current.rangeSelectTo(menuTarget.blockId);
+				else selectionRef.current.toggleBlock(menuTarget.blockId);
+				return;
+			}
+			if (!target) {
+				closePixiMessageMenu();
+				return;
+			}
 			event.preventDefault();
-			viewport.scrollTop = clamp(viewport.scrollTop + event.deltaY, 0, getMaxScrollTop(viewport));
+			event.stopPropagation();
+			triggerHitTarget(target);
+		};
+		const handlePointerUp = (event: PointerEvent) => {
+			if (touchScrollState?.pointerId !== event.pointerId) return;
+			const state = touchScrollState;
+			touchScrollState = null;
+			const canvas = event.currentTarget as HTMLCanvasElement;
+			if (canvas.hasPointerCapture?.(event.pointerId))
+				canvas.releasePointerCapture(event.pointerId);
+			event.preventDefault();
+			event.stopPropagation();
+			if (state.direction === "horizontal" && state.swipeTarget) {
+				touchDrivingScrollRef.current = false;
+				syncNativeScrollFromPixi();
+				const finalOffset = state.swipeOffset >= SWIPE_THRESHOLD ? SWIPE_REVEAL_WIDTH : 0;
+				if (state.rangeCandidate) {
+					if (finalOffset > 0) {
+						const anchor = getGlobalSwipeAnchor();
+						if (anchor) getGlobalOnSelectionRange()?.(anchor, state.swipeTarget.blockId);
+						getGlobalCloseSwipe()?.();
+					} else {
+						swipedMessageRef.current = null;
+						renderPixiViewportRef.current();
+					}
+					return;
+				}
+				const toggleFn = getGlobalToggleBlock();
+				if (toggleFn && finalOffset > 0) {
+					toggleFn(state.swipeTarget.blockId);
+					swipedMessageRef.current = null;
+					renderPixiViewportRef.current();
+					return;
+				}
+				if (finalOffset === 0) {
+					closePixiMessageMenu();
+				} else if (state.swipeGeometry) {
+					swipedMessageRef.current = { targetId: state.swipeTarget.id, offset: finalOffset };
+					const position = swipePositionForGeometry(state.swipeGeometry, finalOffset);
+					openPixiMessageMenu({
+						x: position.x,
+						y: position.y,
+						mode: "swipe",
+						offset: finalOffset,
+						dragging: false,
+						swipeGeometry: state.swipeGeometry,
+						target: state.swipeTarget,
+					});
+					renderPixiViewportRef.current();
+				}
+				return;
+			}
+			if (!state.moved && state.target) {
+				touchDrivingScrollRef.current = false;
+				syncNativeScrollFromPixi();
+				triggerHitTarget(state.target);
+			} else if (state.moved) startTouchMomentum(state.velocity);
+		};
+		const handlePointerCancel = (event: PointerEvent) => {
+			if (touchScrollState?.pointerId !== event.pointerId) return;
+			touchScrollState = null;
+			touchDrivingScrollRef.current = false;
+			closePixiMessageMenu();
+			syncNativeScrollFromPixi();
+			const canvas = event.currentTarget as HTMLCanvasElement;
+			if (canvas.hasPointerCapture?.(event.pointerId))
+				canvas.releasePointerCapture(event.pointerId);
+			event.stopPropagation();
+		};
+		const handleContextMenu = (event: MouseEvent) => {
+			const target = messageMenuTargetAtEvent(event);
+			if (!target) return;
+			event.preventDefault();
+			event.stopPropagation();
+			openPixiMessageMenu({
+				x: Math.min(event.clientX, window.innerWidth - 200),
+				y: event.clientY,
+				mode: "context",
+				offset: 0,
+				target,
+			});
+		};
+		const handleWheel = (event: WheelEvent) => {
+			closePixiMessageMenu();
+			cancelTouchMomentum();
+			touchDrivingScrollRef.current = true;
+			event.preventDefault();
+			scrollViewportBy(event.deltaY, { renderNow: true });
+			touchDrivingScrollRef.current = false;
 		};
 		let destroyed = false;
 		app
@@ -629,9 +1281,10 @@ export const NarratorPixiMessageList = forwardRef<
 				width: 1,
 				height: 1,
 				backgroundAlpha: 0,
-				antialias: true,
+				antialias: false,
 				autoDensity: true,
 				resolution: window.devicePixelRatio || 1,
+				roundPixels: true,
 				autoStart: false,
 				resizeTo: undefined,
 				preference: "webgl",
@@ -648,17 +1301,22 @@ export const NarratorPixiMessageList = forwardRef<
 				canvas.style.inset = "0";
 				canvas.style.width = "100%";
 				canvas.style.height = "100%";
+				canvas.style.imageRendering = "pixelated";
 				canvas.style.pointerEvents = "auto";
+				canvas.style.touchAction = "none";
 				canvas.addEventListener("webglcontextlost", handleContextLost);
 				canvas.addEventListener("webglcontextrestored", handleContextRestored);
-				canvas.addEventListener("pointermove", handlePointerMove);
+				canvas.addEventListener("pointermove", handlePointerMove, { passive: false });
 				canvas.addEventListener("pointerleave", handlePointerLeave);
-				canvas.addEventListener("pointerdown", handlePointerDown);
+				canvas.addEventListener("pointerdown", handlePointerDown, { passive: false });
+				canvas.addEventListener("pointerup", handlePointerUp, { passive: false });
+				canvas.addEventListener("pointercancel", handlePointerCancel);
+				canvas.addEventListener("contextmenu", handleContextMenu);
 				canvas.addEventListener("wheel", handleWheel, { passive: false });
 				host.appendChild(canvas);
 				const container = new Container();
 				const imageContainer = new Container();
-				const gfx = new Graphics();
+				const gfx = new Graphics({ roundPixels: true });
 				app.stage.addChild(gfx);
 				app.stage.addChild(imageContainer);
 				app.stage.addChild(container);
@@ -688,6 +1346,7 @@ export const NarratorPixiMessageList = forwardRef<
 			});
 		return () => {
 			destroyed = true;
+			cancelTouchMomentum();
 			pixiDestroyedRef.current = true;
 			const app = appRef.current;
 			appRef.current = null;
@@ -705,12 +1364,15 @@ export const NarratorPixiMessageList = forwardRef<
 				canvas.removeEventListener("pointermove", handlePointerMove);
 				canvas.removeEventListener("pointerleave", handlePointerLeave);
 				canvas.removeEventListener("pointerdown", handlePointerDown);
+				canvas.removeEventListener("pointerup", handlePointerUp);
+				canvas.removeEventListener("pointercancel", handlePointerCancel);
+				canvas.removeEventListener("contextmenu", handleContextMenu);
 				canvas.removeEventListener("wheel", handleWheel);
 				destroyPixiApplication(app);
 			}
 		};
 		// init once; resize is handled below
-	}, [refreshAfterResume]);
+	}, [closePixiMessageMenu, openPixiMessageMenu, toggleReasoning, toggleTool]);
 
 	useEffect(() => {
 		void dprVersion;
@@ -749,6 +1411,185 @@ export const NarratorPixiMessageList = forwardRef<
 		renderPixiViewport();
 	}, [ready, restoreVersion, renderPixiViewport]);
 
+	const renderMenuItems = useCallback(
+		(target: MessageMenuTarget, close: () => void) => {
+			const messageId = target.messageId;
+			const blockIndex = target.blockIndex;
+			const canUseBlock = !!messageId && blockIndex != null;
+			return (
+				<>
+					<Menu.Item
+						leftSection={<IconCopy size={14} />}
+						onClick={() => {
+							void navigator.clipboard?.writeText(target.copyText ?? "");
+							close();
+						}}
+					>
+						{t("contextMenu_copyBlock")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconArrowBackUp size={14} />}
+						disabled={!canUseBlock || !onRollbackToBlock}
+						onClick={() => {
+							if (messageId && blockIndex != null) onRollbackToBlock?.(messageId, blockIndex);
+							close();
+						}}
+					>
+						{t("contextMenu_rollback")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconGitFork size={14} />}
+						disabled={!target.messageUuid || !onForkFromMessage}
+						onClick={() => {
+							if (target.messageUuid) onForkFromMessage?.(target.messageUuid);
+							close();
+						}}
+					>
+						{t("contextMenu_fork")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconMessageQuestion size={14} />}
+						disabled={!messageId || !onAskInPassing}
+						onClick={() => {
+							if (messageId) onAskInPassing?.(target.messageUuid ?? null, messageId);
+							close();
+						}}
+					>
+						{t("contextMenu_askInPassing")}
+					</Menu.Item>
+					<Menu.Item
+						leftSection={<IconArrowsMinimize size={14} />}
+						disabled={!messageId || !onCompactBeforeMessage}
+						onClick={() => {
+							if (messageId) onCompactBeforeMessage?.(messageId);
+							close();
+						}}
+					>
+						{t("contextMenu_compactBefore")}
+					</Menu.Item>
+					<Menu.Divider />
+					<Menu.Item
+						color="red"
+						leftSection={<IconTrash size={14} />}
+						disabled={!canUseBlock || !onDeleteBlock}
+						onClick={() => {
+							if (messageId && blockIndex != null) onDeleteBlock?.(messageId, blockIndex);
+							close();
+						}}
+					>
+						{t("contextMenu_delete")}
+					</Menu.Item>
+					<Menu.Item leftSection={<IconX size={14} />} onClick={close}>
+						{tc("cancel")}
+					</Menu.Item>
+				</>
+			);
+		},
+		[
+			onAskInPassing,
+			onCompactBeforeMessage,
+			onDeleteBlock,
+			onForkFromMessage,
+			onRollbackToBlock,
+			t,
+			tc,
+		],
+	);
+
+	useLayoutEffect(() => {
+		if (!messageMenu || messageMenu.mode !== "swipe") return;
+		const menuHeight = messageMenuRef.current?.offsetHeight;
+		if (!menuHeight) return;
+		const position = computePixiSwipeMenuPosition(messageMenu, menuHeight);
+		if (Math.abs(position.x - messageMenu.x) < 0.5 && Math.abs(position.y - messageMenu.y) < 0.5) {
+			return;
+		}
+		setMessageMenu((current) =>
+			current === messageMenu ? { ...current, x: position.x, y: position.y } : current,
+		);
+	}, [messageMenu]);
+
+	const messageMenuPosition = messageMenu
+		? messageMenu.mode === "swipe"
+			? computePixiSwipeMenuPosition(messageMenu, messageMenuRef.current?.offsetHeight)
+			: { x: messageMenu.x, y: messageMenu.y }
+		: null;
+
+	const resolveCurrentSwipeGeometry = useCallback((geometry: PixiSwipeGeometry) => {
+		const viewport = viewportRef.current;
+		const canvasHost = canvasHostRef.current;
+		let visibleTop = 0;
+		let visibleBottom = window.innerHeight;
+		if (viewport) {
+			const viewportRect = viewport.getBoundingClientRect();
+			visibleTop = Math.max(visibleTop, viewportRect.top);
+			visibleBottom = Math.min(visibleBottom, viewportRect.bottom);
+		}
+		const canvasRect = canvasHost?.getBoundingClientRect();
+		const canvasTop = canvasRect?.top ?? 0;
+		const scrollTop = pixiScrollOffsetRef.current;
+		return {
+			...geometry,
+			targetTop: canvasTop + geometry.targetLayoutTop - scrollTop,
+			targetBottom: canvasTop + geometry.targetLayoutBottom - scrollTop,
+			visibleTop,
+			visibleBottom,
+		};
+	}, []);
+
+	const updateOpenSwipeMenuPosition = useCallback(() => {
+		setMessageMenu((current) => {
+			if (!current || current.mode !== "swipe" || !current.swipeGeometry) return current;
+			const swipeGeometry = resolveCurrentSwipeGeometry(current.swipeGeometry);
+			const offscreen =
+				swipeGeometry.targetBottom < swipeGeometry.visibleTop
+					? "top"
+					: swipeGeometry.targetTop > swipeGeometry.visibleBottom
+						? "bottom"
+						: null;
+			const position = computePixiSwipeMenuPosition(
+				{ ...current, swipeGeometry },
+				messageMenuRef.current?.offsetHeight,
+			);
+			if (swipedMessageRef.current) {
+				swipedMessageRef.current = { ...swipedMessageRef.current, offscreen };
+			}
+			return { ...current, ...position, offscreen, swipeGeometry };
+		});
+	}, [resolveCurrentSwipeGeometry]);
+
+	useEffect(() => {
+		if (!messageMenu || messageMenu.mode !== "swipe") return;
+		const viewport = viewportRef.current;
+		let rafId = 0;
+		const scheduleUpdate = () => {
+			if (rafId) return;
+			rafId = requestAnimationFrame(() => {
+				rafId = 0;
+				updateOpenSwipeMenuPosition();
+			});
+		};
+		viewport?.addEventListener("scroll", scheduleUpdate, { passive: true });
+		window.addEventListener("resize", scheduleUpdate, { passive: true });
+		return () => {
+			cancelAnimationFrame(rafId);
+			viewport?.removeEventListener("scroll", scheduleUpdate);
+			window.removeEventListener("resize", scheduleUpdate);
+		};
+	}, [messageMenu, updateOpenSwipeMenuPosition]);
+
+	const swipeAnchorPreview =
+		messageMenu?.mode === "swipe" && messageMenu.offscreen && messageMenu.swipeGeometry
+			? {
+					direction: messageMenu.offscreen,
+					previewText:
+						(messageMenu.target.copyText ?? "").slice(0, 120).replace(/\s+/g, " ").trim() ||
+						messageMenu.target.messageId ||
+						"…",
+					geometry: messageMenu.swipeGeometry,
+				}
+			: null;
+
 	useImperativeHandle(
 		ref,
 		() => ({
@@ -768,7 +1609,7 @@ export const NarratorPixiMessageList = forwardRef<
 			getTotalSize: () => layout.totalHeight,
 			findIndexByKey: (key: string) => items.findIndex((item) => item.key === key),
 			get scrollOffset() {
-				return viewportRef.current?.scrollTop ?? virtualScrollTopRef.current;
+				return pixiScrollOffsetRef.current;
 			},
 
 			get viewportSize() {
@@ -804,9 +1645,33 @@ export const NarratorPixiMessageList = forwardRef<
 						height: virtualScrollHeight,
 						minHeight: "100%",
 						pointerEvents: "none",
-						width: 1,
+						position: "relative",
+						width: Math.max(1, size.width),
 					}}
-				/>
+				>
+					{selectionMarkers.map((marker) => (
+						<div
+							key={marker.blockId}
+							{...{ [BLOCK_ID_ATTR]: marker.blockId }}
+							{...(marker.messageId ? { "data-message-id": marker.messageId } : {})}
+							{...(marker.blockIndex != null
+								? { "data-block-index": String(marker.blockIndex) }
+								: {})}
+							style={{
+								color: "transparent",
+								height: marker.height,
+								left: marker.x,
+								overflow: "hidden",
+								position: "absolute",
+								top: marker.y,
+								whiteSpace: "pre-wrap",
+								width: marker.width,
+							}}
+						>
+							{marker.text}
+						</div>
+					))}
+				</div>
 			</div>
 			<div
 				ref={canvasHostRef}
@@ -820,6 +1685,106 @@ export const NarratorPixiMessageList = forwardRef<
 					zIndex: 0,
 				}}
 			/>
+			<div
+				style={{
+					background: "rgba(0, 0, 0, 0.65)",
+					border: "1px solid rgba(255, 255, 255, 0.18)",
+					borderRadius: 4,
+					color: "#d7fdd7",
+					fontFamily: "monospace",
+					fontSize: 11,
+					left: 6,
+					lineHeight: 1.3,
+					padding: "2px 5px",
+					pointerEvents: "none",
+					position: "absolute",
+					top: 6,
+					zIndex: 2,
+				}}
+			>
+				{fpsText}
+			</div>
+			{swipeAnchorPreview && (
+				<Box
+					style={{
+						...(swipeAnchorPreview.direction === "top" ? { top: 0 } : { bottom: 0 }),
+						cursor: "pointer",
+						left: 0,
+						maxHeight: 72,
+						overflow: "hidden",
+						pointerEvents: "auto",
+						position: "absolute",
+						right: 0,
+						zIndex: 2,
+						maskImage:
+							swipeAnchorPreview.direction === "top"
+								? "linear-gradient(to bottom, black 40%, transparent 100%)"
+								: "linear-gradient(to top, black 40%, transparent 100%)",
+						WebkitMaskImage:
+							swipeAnchorPreview.direction === "top"
+								? "linear-gradient(to bottom, black 40%, transparent 100%)"
+								: "linear-gradient(to top, black 40%, transparent 100%)",
+					}}
+					onClick={() => {
+						const geometry = swipeAnchorPreview.geometry;
+						const blockCenter = (geometry.targetLayoutTop + geometry.targetLayoutBottom) / 2;
+						setNativeScrollTop(blockCenter - (viewportRef.current?.clientHeight ?? 0) / 2, {
+							behavior: "smooth",
+						});
+					}}
+				>
+					<Box
+						style={{
+							background: "rgba(20, 21, 28, 0.72)",
+							border: "1px solid rgba(255, 255, 255, 0.14)",
+							borderRadius: 8,
+							color: "var(--mantine-color-dimmed)",
+							fontSize: 12,
+							lineHeight: 1.45,
+							margin: "0 var(--mantine-spacing-md)",
+							opacity: 0.72,
+							padding: "8px 10px",
+							transform: `translateX(-${messageMenu?.offset ?? 0}px)`,
+						}}
+					>
+						{swipeAnchorPreview.previewText}
+					</Box>
+				</Box>
+			)}
+			{messageMenu &&
+				messageMenuPosition &&
+				createPortal(
+					<Box
+						ref={messageMenuRef}
+						style={{
+							left: messageMenuPosition.x,
+							pointerEvents: messageMenu.closing ? "none" : "auto",
+							position: "fixed",
+							top: messageMenuPosition.y,
+							transform: messageMenu.mode === "swipe" ? "translateY(-50%)" : undefined,
+							transition: messageMenu.dragging ? "none" : "left 200ms ease, transform 200ms ease",
+							zIndex: 10000,
+						}}
+					>
+						{messageMenu.mode === "swipe" ? (
+							<Menu opened withinPortal={false} position="bottom-start" shadow="md">
+								<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+									{renderMenuItems(messageMenu.target, () => closePixiMessageMenu())}
+								</Menu.Dropdown>
+							</Menu>
+						) : (
+							<Menu opened withinPortal={false} onClose={() => closePixiMessageMenu()} shadow="md">
+								<Menu.Target>
+									<Box w={1} h={1} />
+								</Menu.Target>
+								<Menu.Dropdown w={190}>
+									{renderMenuItems(messageMenu.target, () => closePixiMessageMenu())}
+								</Menu.Dropdown>
+							</Menu>
+						)}
+					</Box>,
+					document.body,
+				)}
 		</div>
 	);
 });

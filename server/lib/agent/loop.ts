@@ -19,13 +19,20 @@ import {
 	isRetryableInvalidStateReason,
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
-import { resolveProviderAndModel } from "./provider";
+import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
+import {
+	cancelExitPlanReflection,
+	cleanupExitPlanReflection,
+	createExitPlanReflectionDecision,
+	EXIT_PLAN_REFLECTION_TOOLS,
+	type ExitPlanReflectionDecision,
+} from "./tools/exit-plan-reflection";
 import { YOLO_REFLECTION_TOOLS } from "./tools/yolo-pause";
 import type {
 	AgentConfig,
@@ -255,6 +262,17 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
 	});
 }
 
+function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
+	return !!(
+		parsed.text ||
+		(parsed.toolUses?.length ?? 0) > 0 ||
+		parsed.toolUseChunk ||
+		parsed.reasoning ||
+		parsed.webSearch ||
+		parsed.imageGeneration
+	);
+}
+
 /** Yield block_complete events for accumulated reasoning blocks and assistant text.
  *  Used in every early-return / error path to persist partial progress. */
 function* flushPartialContent(
@@ -301,7 +319,8 @@ function isStrictSerial(tu: AgentToolUse): boolean {
 	return (
 		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
 		tu.name === "StartPipeline" ||
-		tu.name === "EndPipeline"
+		tu.name === "EndPipeline" ||
+		tu.name === "ExitPlanMode"
 	);
 }
 
@@ -446,41 +465,81 @@ function buildYoloReflectionPrompt(
 		.replaceAll("{alternativesList}", bulletList(pause.danger.saferAlternatives));
 }
 
-async function runYoloReflectionLoop(
-	parentConfig: AgentConfig,
-	history: unknown[],
-	pause: NonNullable<ToolExecResult["yoloPause"]>,
-	toolUse: AgentToolUse,
-	reflectionAbort: AbortController,
-): Promise<void> {
-	const onParentAbort = () => reflectionAbort.abort();
+function formatAllowedPrompts(value: unknown): string {
+	if (!Array.isArray(value) || value.length === 0) return "- (none)";
+	const items = value.flatMap((entry) => {
+		if (!entry || typeof entry !== "object") return [];
+		const tool = (entry as { tool?: unknown }).tool;
+		const prompt = (entry as { prompt?: unknown }).prompt;
+		if (typeof prompt !== "string" || !prompt.trim()) return [];
+		return [`- ${typeof tool === "string" && tool ? `${tool}: ` : ""}${prompt.trim()}`];
+	});
+	return items.length > 0 ? items.join("\n") : "- (none)";
+}
+
+function buildExitPlanReflectionPrompt(
+	requestId: string,
+	input: Record<string, unknown>,
+	locale: Locale,
+): string {
+	const planText = typeof input.plan === "string" ? input.plan : "";
+	return getPrompt("exitPlanReflection", locale)
+		.replaceAll("{requestId}", requestId)
+		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
+		.replaceAll("{planText}", planText)
+		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
+}
+
+export interface ReflectionLoopRunOptions {
+	parentConfig: AgentConfig;
+	history: unknown[];
+	prompt: string;
+	reflectionLoop: NonNullable<AgentConfig["reflectionLoop"]>;
+	abortController?: AbortController;
+	maxTurns?: number;
+	label?: string;
+}
+
+/**
+ * Run a bounded nested agent loop for model self-checks or small decision gates.
+ * The nested loop gets an isolated tool allowlist and no parent event/prompt hooks,
+ * so callers can reuse the pattern without hand-rolling another agentLoop wrapper.
+ */
+export async function runReflectionLoop(options: ReflectionLoopRunOptions): Promise<void> {
+	const {
+		parentConfig,
+		history,
+		prompt,
+		reflectionLoop,
+		abortController = new AbortController(),
+		maxTurns = 1,
+		label = "reflection loop",
+	} = options;
+	const allowedTools = new Set(reflectionLoop.allowedTools);
+	const onParentAbort = () => abortController.abort();
 	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
-			signal: reflectionAbort.signal,
-			maxTurns: 1,
-			yoloReflection: { requestId: pause.requestId, toolUseId: toolUse.toolUseId },
+			signal: abortController.signal,
+			maxTurns,
+			reflectionLoop,
 			onEvent: undefined,
 			onBeforeTurn: undefined,
 			getInjectedUserText: undefined,
 			shouldStop: undefined,
 			toolFilter: undefined,
 			permissionHandler: async (toolName, input, toolUseId) => {
-				if (YOLO_REFLECTION_TOOLS.has(toolName)) return { behavior: "allow" };
+				if (allowedTools.has(toolName)) return { behavior: "allow" };
 				return parentConfig.permissionHandler(toolName, input, toolUseId);
 			},
 		};
-		const locale = (parentConfig.locale as Locale) ?? "en";
-		for await (const event of agentLoop(
-			reflectionConfig,
-			buildYoloReflectionPrompt(pause, toolUse.name, toolUse.input, locale),
-			[...history],
-		)) {
+		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
 			if (event.type === "error") {
-				logger.warn("YOLO reflection loop ended with error", {
+				logger.warn(`${label} ended with error`, {
 					narratorId: parentConfig.narratorId,
-					requestId: pause.requestId,
+					kind: reflectionLoop.context.kind,
+					requestId: reflectionLoop.context.requestId,
 					message: event.message,
 				});
 			}
@@ -488,6 +547,66 @@ async function runYoloReflectionLoop(
 	} finally {
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
 	}
+}
+
+async function runYoloReflectionLoop(
+	parentConfig: AgentConfig,
+	history: unknown[],
+	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	toolUse: AgentToolUse,
+	reflectionAbort: AbortController,
+): Promise<void> {
+	const locale = (parentConfig.locale as Locale) ?? "en";
+	await runReflectionLoop({
+		parentConfig,
+		history,
+		prompt: buildYoloReflectionPrompt(pause, toolUse.name, toolUse.input, locale),
+		reflectionLoop: {
+			allowedTools: [...YOLO_REFLECTION_TOOLS],
+			context: {
+				kind: "yoloPause",
+				requestId: pause.requestId,
+				toolUseId: toolUse.toolUseId,
+				data: {
+					toolName: toolUse.name,
+					fingerprint: pause.fingerprint,
+				},
+			},
+		},
+		abortController: reflectionAbort,
+		maxTurns: 1,
+		label: "YOLO reflection loop",
+	});
+}
+
+async function runExitPlanModeReflectionLoop(
+	parentConfig: AgentConfig,
+	history: unknown[],
+	requestId: string,
+	toolUse: AgentToolUse,
+	input: Record<string, unknown>,
+	reflectionAbort: AbortController,
+): Promise<void> {
+	const locale = (parentConfig.locale as Locale) ?? "en";
+	await runReflectionLoop({
+		parentConfig,
+		history,
+		prompt: buildExitPlanReflectionPrompt(requestId, input, locale),
+		reflectionLoop: {
+			allowedTools: [...EXIT_PLAN_REFLECTION_TOOLS],
+			context: {
+				kind: "exitPlanMode",
+				requestId,
+				toolUseId: toolUse.toolUseId,
+				data: {
+					toolName: toolUse.name,
+				},
+			},
+		},
+		abortController: reflectionAbort,
+		maxTurns: 1,
+		label: "ExitPlanMode reflection loop",
+	});
 }
 
 function buildYoloDeniedToolResult(decision: PermissionResult, locale: Locale): ToolExecResult {
@@ -548,6 +667,111 @@ async function resolveYoloPauseDecision(
 	return decision;
 }
 
+interface ExitPlanReflectionGateResult {
+	decision: ExitPlanReflectionDecision;
+	input: Record<string, unknown>;
+}
+
+async function resolveExitPlanModeReflection(
+	config: AgentConfig,
+	history: unknown[],
+	toolUse: AgentToolUse,
+): Promise<ExitPlanReflectionGateResult> {
+	const locale = (config.locale as Locale) ?? "en";
+	const { resolveExitPlanModeInput } = await import("@server/services/narrator-permission");
+	const resolvedInput = resolveExitPlanModeInput(
+		config.narratorId,
+		config.cwd,
+		toolUse.input,
+		locale,
+	);
+	if (!resolvedInput.ok) {
+		return {
+			decision: { action: "revise", feedback: resolvedInput.message },
+			input: resolvedInput.input,
+		};
+	}
+
+	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const decisionPromise = createExitPlanReflectionDecision(requestId);
+	const reflectionAbort = new AbortController();
+	let reflectionDone = false;
+	const reflectionPromise = runExitPlanModeReflectionLoop(
+		config,
+		history,
+		requestId,
+		toolUse,
+		resolvedInput.input,
+		reflectionAbort,
+	).finally(() => {
+		reflectionDone = true;
+	});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise.then(async () => {
+			const fallbackMessage =
+				"ExitPlanMode reflection loop did not call ExitPlanConfirm or ExitPlanRevise in its single allowed response";
+			const cancelled = cancelExitPlanReflection(requestId, fallbackMessage);
+			if (cancelled) return decisionPromise;
+
+			// Prefer an already-settled decision if the tool resolved concurrently;
+			// otherwise fail closed and ask the model to revise before user approval.
+			const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
+				decisionPromise,
+				Promise.resolve(null),
+			]);
+			const fallbackDecision: ExitPlanReflectionDecision = {
+				action: "revise",
+				feedback: fallbackMessage,
+			};
+			return alreadySettled ?? fallbackDecision;
+		}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("ExitPlanMode reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	cleanupExitPlanReflection(requestId);
+	return { decision, input: resolvedInput.input };
+}
+
+function buildExitPlanReflectionDeniedToolResult(
+	decision: ExitPlanReflectionDecision,
+	locale: Locale,
+): ToolExecResult {
+	const feedback =
+		decision.action === "revise" && decision.feedback.trim()
+			? decision.feedback.trim()
+			: "ExitPlanMode reflection requested plan revision before user approval.";
+	const output =
+		locale === "zh-CN"
+			? `ExitPlanMode 反思认为计划还不应提交给用户审批。请先修改计划。\n\n反馈：${feedback}`
+			: `ExitPlanMode reflection decided the plan should not be submitted for user approval yet. Revise the plan first.\n\nFeedback: ${feedback}`;
+	return {
+		output,
+		isError: true,
+		durationMs: 0,
+		completedAt: Date.now(),
+	};
+}
+
+async function executeToolAfterReflections(
+	tu: AgentToolUse,
+	config: AgentConfig,
+	history: unknown[],
+	locale: Locale,
+): Promise<ToolExecResult> {
+	if (tu.name === "ExitPlanMode" && config.planMode && !config.reflectionLoop) {
+		const reflected = await resolveExitPlanModeReflection(config, history, tu);
+		tu.input = reflected.input;
+		if (reflected.decision.action !== "confirm") {
+			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
+		}
+	}
+	return executeTool(tu, config);
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -594,10 +818,11 @@ export async function* agentLoop(
 			description: typeof t.description === "function" ? t.description(config) : t.description,
 		}));
 
-	if (config.yoloReflection) {
-		allTools = allTools.filter((tool) => YOLO_REFLECTION_TOOLS.has(tool.name));
+	if (config.reflectionLoop) {
+		const allowedTools = new Set(config.reflectionLoop.allowedTools);
+		allTools = allTools.filter((tool) => allowedTools.has(tool.name));
 	} else {
-		allTools = allTools.filter((tool) => !YOLO_REFLECTION_TOOLS.has(tool.name));
+		allTools = allTools.filter((tool) => !tool.reflectionOnly);
 	}
 
 	// Apply toolFilter if provided (used by subagents to restrict available tools)
@@ -818,6 +1043,7 @@ export async function* agentLoop(
 		let requestDump: ApiRequestDumpCollector | undefined;
 		let requestStarted = false;
 		let requestStartPending = false;
+		let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
 		const markRequestStarted = (info?: { credentialId?: string }) => {
 			if (info?.credentialId) {
@@ -827,6 +1053,7 @@ export async function* agentLoop(
 			requestStarted = true;
 			requestStartPending = true;
 			requestStartTime = Date.now();
+			startFirstTokenTimerForAttempt?.();
 		};
 
 		function* flushRequestStart(): Generator<AgentEvent> {
@@ -864,10 +1091,11 @@ export async function* agentLoop(
 		// history, content, and toolResults — no server-side state was mutated.
 		// Stateful providers (responses/codex) cannot retry here because the
 		// server already consumed the request.
-		const maxChatRetries = usesStatefulApi(effectiveProvider)
-			? 0
-			: (config.maxTransientRetries ?? 0);
+		const maxConfiguredRetries = config.maxTransientRetries ?? 0;
+		const maxChatRetries = usesStatefulApi(effectiveProvider) ? 0 : maxConfiguredRetries;
+		const maxFirstTokenRetries = maxConfiguredRetries;
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
+		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 60_000);
 		let chatRetryCount = 0;
 		let emptyResponseRetries = 0;
 		/** Set when a mimo model returns "..." as reasoning — triggers a retry. */
@@ -929,6 +1157,35 @@ export async function* agentLoop(
 					})
 				: undefined;
 
+			const attemptAbort = new AbortController();
+			let firstTokenTimeoutTriggered = false;
+			let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+			const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
+				firstTokenTimeoutMs / 1000,
+			)}s without a meaningful AI API event`;
+			const clearFirstTokenTimer = () => {
+				if (firstTokenTimer) {
+					clearTimeout(firstTokenTimer);
+					firstTokenTimer = undefined;
+				}
+			};
+			startFirstTokenTimerForAttempt = () => {
+				if (firstTokenTimeoutMs <= 0 || sawMeaningfulResponse || firstTokenTimer) return;
+				firstTokenTimer = setTimeout(() => {
+					if (config.signal.aborted || sawMeaningfulResponse) return;
+					firstTokenTimeoutTriggered = true;
+					attemptAbort.abort(new Error(firstTokenTimeoutMessage));
+				}, firstTokenTimeoutMs);
+			};
+			const onParentAbort = () => {
+				attemptAbort.abort(config.signal.reason ?? new Error("Aborted"));
+			};
+			if (config.signal.aborted) {
+				onParentAbort();
+			} else {
+				config.signal.addEventListener("abort", onParentAbort, { once: true });
+			}
+
 			try {
 				const stream = provider.chat({
 					conversationId: config.conversationId,
@@ -938,7 +1195,7 @@ export async function* agentLoop(
 					history,
 					tools,
 					toolResults: pendingToolResults,
-					signal: config.signal,
+					signal: attemptAbort.signal,
 					stickySessionKey: config.narratorId,
 					reasoningEffort: config.reasoningEffort,
 					serviceTier: config.serviceTier,
@@ -950,23 +1207,15 @@ export async function* agentLoop(
 
 				for await (const parsed of stream) {
 					yield* flushRequestStart();
+					const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
 					// Record TTFT (time to first token) for this request
-					if (
-						requestTtftMs === undefined &&
-						(parsed.text || parsed.toolUseChunk || parsed.reasoning)
-					) {
+					if (requestTtftMs === undefined && hasMeaningfulEvent) {
 						requestTtftMs = Date.now() - requestStartTime;
 					}
 
-					if (
-						parsed.text ||
-						parsed.toolUses ||
-						parsed.toolUseChunk ||
-						parsed.reasoning ||
-						parsed.webSearch ||
-						parsed.imageGeneration
-					) {
+					if (hasMeaningfulEvent) {
 						sawMeaningfulResponse = true;
+						clearFirstTokenTimer();
 						// A successful response clears any prior retry error so the
 						// empty-response guard won't resurface a stale message.
 						lastRetryErrorMessage = undefined;
@@ -1710,6 +1959,45 @@ export async function* agentLoop(
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
+				if (firstTokenTimeoutTriggered) {
+					if (
+						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+						!config.signal.aborted
+					) {
+						chatRetryCount++;
+						lastRetryErrorMessage = firstTokenTimeoutMessage;
+						const delayMs = Math.min(
+							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+							backoffCeil,
+						);
+						logger.warn("Provider first token timeout, retrying", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							requestId,
+							attempt: chatRetryCount,
+							maxRetries: maxFirstTokenRetries,
+							firstTokenTimeoutMs,
+						});
+						yield {
+							type: "retrying",
+							message: firstTokenTimeoutMessage,
+							attempt: chatRetryCount,
+							maxRetries: maxFirstTokenRetries,
+							delayMs,
+						};
+						yield* finishRequest(firstTokenTimeoutMessage);
+						await abortableSleep(delayMs, config.signal);
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						continue; // retry provider.chat()
+					}
+					yield* finishRequest(firstTokenTimeoutMessage);
+					yield { type: "retryable_error", message: firstTokenTimeoutMessage };
+					return;
+				}
 				const msg = extractErrorMessage(err);
 				if (
 					err &&
@@ -1771,6 +2059,41 @@ export async function* agentLoop(
 				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 				yield* finishRequest(msg);
 				yield { type: "error", message: msg };
+				return;
+			} finally {
+				clearFirstTokenTimer();
+				config.signal.removeEventListener("abort", onParentAbort);
+				startFirstTokenTimerForAttempt = undefined;
+			}
+
+			if (firstTokenTimeoutTriggered) {
+				if (
+					(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
+					!config.signal.aborted
+				) {
+					chatRetryCount++;
+					lastRetryErrorMessage = firstTokenTimeoutMessage;
+					const delayMs = Math.min(
+						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
+						backoffCeil,
+					);
+					yield {
+						type: "retrying",
+						message: firstTokenTimeoutMessage,
+						attempt: chatRetryCount,
+						maxRetries: maxFirstTokenRetries,
+						delayMs,
+					};
+					yield* finishRequest(firstTokenTimeoutMessage);
+					await abortableSleep(delayMs, config.signal);
+					if (config.signal.aborted) {
+						yield { type: "error", message: "Aborted" };
+						return;
+					}
+					continue; // retry provider.chat()
+				}
+				yield* finishRequest(firstTokenTimeoutMessage);
+				yield { type: "retryable_error", message: firstTokenTimeoutMessage };
 				return;
 			}
 
@@ -2156,7 +2479,9 @@ export async function* agentLoop(
 				// Serial execution (single tool)
 				const tu = group[0];
 				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				let result = earlyPromise ? await earlyPromise : await executeTool(tu, config);
+				let result = earlyPromise
+					? await earlyPromise
+					: await executeToolAfterReflections(tu, config, history, locale);
 				if (result.yoloPause) {
 					const yoloDecision = await resolveYoloPauseDecision(
 						config,
@@ -2268,7 +2593,9 @@ export async function* agentLoop(
 				// individual tool cards immediately.
 				const execEntries = group.map((tu) => ({
 					tu,
-					promise: earlyExecMap.get(tu.toolUseId) ?? executeTool(tu, config),
+					promise:
+						earlyExecMap.get(tu.toolUseId) ??
+						executeToolAfterReflections(tu, config, history, locale),
 				}));
 
 				// Wrap each promise to carry its index so we know which resolved

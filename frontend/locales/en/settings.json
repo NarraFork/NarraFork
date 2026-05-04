@@ -298,6 +298,8 @@
 	"maxTransientRetriesDesc": "Maximum retry attempts for transient API errors (rate limits, server errors). Set to -1 for infinite retries.",
 	"retryBackoffCeil": "Retry Backoff Ceiling",
 	"retryBackoffCeilDesc": "Maximum wait time (seconds) for exponential backoff. Retry delay will not exceed this value.",
+	"firstTokenTimeout": "First Token Timeout",
+	"firstTokenTimeoutDesc": "Abort and retry if no meaningful AI API event (text, tool, reasoning, web search, image generation) arrives within this many seconds after request dispatch. Set to 0 to disable.",
 	"customRetryRules": "Custom Retryable Error Rules",
 	"customRetryRulesDesc": "Define custom rules to treat specific API errors as retryable. Matching errors will be automatically retried instead of failing immediately.",
 	"retryRuleDomain": "Domain",

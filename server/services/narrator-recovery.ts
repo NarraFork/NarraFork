@@ -36,6 +36,11 @@ export function getRetryBackoffCeilMs(): number {
 	return settings.agent.retryBackoffCeilMs;
 }
 
+/** Read the user-configured first-token timeout (ms) from settings. */
+export function getFirstTokenTimeoutMs(): number {
+	return settings.agent.firstTokenTimeoutMs;
+}
+
 // ── Context overflow recovery ────────────────────────────────────────────────
 
 interface OverflowResultBase {

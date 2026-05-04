@@ -44,6 +44,11 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error || "unknown error");
 }
 
+function disposeTexture(texture: Texture): void {
+	texture.source?.unload();
+	texture.destroy(false);
+}
+
 async function textureFromImageSource(source: string): Promise<Texture> {
 	const image = new Image();
 	image.decoding = "async";
@@ -91,12 +96,12 @@ async function loadTextureFromSource(
 
 		const texture = await textureFromImageSource(loadUrl);
 		if (generation !== textureGeneration) {
-			texture.destroy(true);
+			disposeTexture(texture);
 			if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl);
 			return;
 		}
 		const previous = textureCache.get(key);
-		if (previous && previous !== texture) previous.destroy(true);
+		if (previous && previous !== texture) disposeTexture(previous);
 		textureCache.set(key, texture);
 		failedCache.delete(key);
 		notifyTextureLoaded();
@@ -187,7 +192,7 @@ export function getPixiGeneratedImageTexture(opts: {
 export function invalidatePixiImageTextures(): void {
 	textureGeneration++;
 	for (const texture of textureCache.values()) {
-		texture.destroy(true);
+		disposeTexture(texture);
 	}
 	textureCache.clear();
 	loadingCache.clear();

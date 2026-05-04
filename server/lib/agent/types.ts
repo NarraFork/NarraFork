@@ -18,6 +18,24 @@ export class ApiError extends Error {
 
 // === Tool system ===
 
+export interface ReflectionLoopContext {
+	/** Kind of reflection loop, e.g. "yoloPause". */
+	kind: string;
+	/** Optional request/domain ID for the loop. */
+	requestId?: string;
+	/** Optional source toolUseId or target toolUseId that triggered the loop. */
+	toolUseId?: string;
+	/** Extra loop-specific data for reflection tools. */
+	data?: Record<string, unknown>;
+}
+
+export interface ReflectionLoopConfig {
+	/** Tools available inside this bounded reflection loop. */
+	allowedTools: readonly string[];
+	/** Context passed through to tools as ToolContext.reflectionLoop. */
+	context: ReflectionLoopContext;
+}
+
 export interface ToolContext {
 	narratorId: string;
 	cwd: string;
@@ -46,10 +64,8 @@ export interface ToolContext {
 	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
-	/** YOLO reflection permission request ID, set only inside the safety reflection loop. */
-	yoloPauseRequestId?: string;
-	/** Original high-risk toolUseId, set only inside the safety reflection loop. */
-	yoloPauseToolUseId?: string;
+	/** Context for bounded reflection loops, such as YOLO pause review. */
+	reflectionLoop?: ReflectionLoopContext;
 }
 
 export interface ToolResult {
@@ -75,6 +91,8 @@ export interface ToolDefinition {
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
+	/** Hide this tool from normal sessions; reflection loops may opt in via allowedTools. */
+	reflectionOnly?: boolean;
 	/** Optional metadata for tool provenance (e.g. MCP server origin). */
 	metadata?: {
 		/** MCP server ID from settings. */
@@ -377,8 +395,8 @@ export interface AgentConfig {
 	metadata?: { user_id: string };
 	/** Filter tools available to this agent (subagent tool restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
-	/** Internal YOLO safety reflection loop context. */
-	yoloReflection?: { requestId: string; toolUseId: string };
+	/** Internal bounded reflection loop context. */
+	reflectionLoop?: ReflectionLoopConfig;
 	permissionHandler: (
 		toolName: string,
 		input: Record<string, unknown>,
@@ -425,6 +443,11 @@ export interface AgentConfig {
 	 * Exponential backoff is capped at this value.  Defaults to 20_000 (20s).
 	 */
 	retryBackoffCeilMs?: number;
+	/**
+	 * Time to wait after request dispatch for the first meaningful stream event.
+	 * 0 disables this timeout. Defaults to 60_000 (60s).
+	 */
+	firstTokenTimeoutMs?: number;
 	/**
 	 * Hook handler — called before/after tool execution and at other lifecycle points.
 	 * Returns a HookResult; if outcome is "blocked", the tool call is denied.

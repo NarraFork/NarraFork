@@ -55,6 +55,7 @@ import {
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
+	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
 	handleContextOverflow,
@@ -1213,6 +1214,7 @@ export async function runAgentLoop(
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
+				firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 				metadata: isAnthropicProvider(resolved.provider)
 					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,

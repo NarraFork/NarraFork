@@ -63,7 +63,7 @@ function getPromptTokenFootprint(turnUsageJson: NarratorMsg["turnUsageJson"]): n
 	);
 }
 
-function formatTurnUsage(turnUsageJson: NarratorMsg["turnUsageJson"]): string | null {
+function formatTurnUsageParts(turnUsageJson: NarratorMsg["turnUsageJson"]): string[] | null {
 	const tu = turnUsageJson as Record<string, unknown> | null | undefined;
 	if (!tu) return null;
 	const inputTokens = usageNumber(tu.input_tokens);
@@ -89,7 +89,7 @@ function formatTurnUsage(turnUsageJson: NarratorMsg["turnUsageJson"]): string | 
 		parts.push(`${cacheCreationTokens.toLocaleString()} cache write${detail}`);
 	}
 	if (reasoningTokens > 0) parts.push(`${reasoningTokens.toLocaleString()} reasoning`);
-	return parts.join(" · ");
+	return parts;
 }
 
 export function renderToolRun(
@@ -281,7 +281,16 @@ export function renderTreeMessages(
 				: targetMsg;
 		const promptTokenFootprint =
 			getPromptTokenFootprint(targetMsg.turnUsageJson) ?? targetMsg.tokensIn ?? null;
-		const turnUsageSummary = formatTurnUsage(targetMsg.turnUsageJson);
+		const turnUsageParts = formatTurnUsageParts(targetMsg.turnUsageJson);
+		const turnUsageSummary = turnUsageParts?.join(" · ") ?? null;
+		const turnUsageCost =
+			targetMsg.costUsd != null && (targetMsg.costUsd as number) > 0
+				? `$${(targetMsg.costUsd as number).toFixed(4)}`
+				: null;
+		const mobileTurnUsageLine1 = turnUsageParts?.slice(0, 3).join(" · ") ?? null;
+		const mobileTurnUsageLine2Parts = [...(turnUsageParts?.slice(3) ?? [])];
+		if (turnUsageCost != null) mobileTurnUsageLine2Parts.push(turnUsageCost);
+		const mobileTurnUsageLine2 = mobileTurnUsageLine2Parts.join(" · ");
 
 		const content = (
 			<Box
@@ -324,15 +333,31 @@ export function renderTreeMessages(
 				{showTokenUsage &&
 					(turnUsageSummary != null ||
 						(targetMsg.meterUsage != null && promptTokenFootprint == null)) && (
-						<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2}>
-							{turnUsageSummary != null
-								? `${turnUsageSummary}${
-										targetMsg.costUsd != null && (targetMsg.costUsd as number) > 0
-											? ` · $${(targetMsg.costUsd as number).toFixed(4)}`
-											: ""
-									}`
-								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
-						</Text>
+						<>
+							<Text size="xs" c="dimmed" ta="right" pr="sm" mt={2} visibleFrom="sm">
+								{turnUsageSummary != null
+									? `${turnUsageSummary}${turnUsageCost != null ? ` · ${turnUsageCost}` : ""}`
+									: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
+							</Text>
+							<Box hiddenFrom="sm" pr="sm" mt={2}>
+								{turnUsageSummary != null ? (
+									<>
+										<Text size="xs" c="dimmed" ta="right" lh={1.35}>
+											{mobileTurnUsageLine1}
+										</Text>
+										{mobileTurnUsageLine2 ? (
+											<Text size="xs" c="dimmed" ta="right" lh={1.35}>
+												{mobileTurnUsageLine2}
+											</Text>
+										) : null}
+									</>
+								) : (
+									<Text size="xs" c="dimmed" ta="right" lh={1.35}>
+										{(targetMsg.meterUsage as number).toFixed(2)} credits
+									</Text>
+								)}
+							</Box>
+						</>
 					)}
 			</Box>
 		);

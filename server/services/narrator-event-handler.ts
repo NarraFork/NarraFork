@@ -620,6 +620,11 @@ export async function processEvent(
 									)
 								: snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
 						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
+					} else if (block.type === "web_search") {
+						const idx = snap.streamingBlocks.findIndex(
+							(b) => b.type === "web_search" && b.id === block.id,
+						);
+						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
 					} else if (block.type === "image_generation") {
 						const idx = snap.streamingBlocks.findIndex(
 							(b) => b.type === "image_generation" && b.id === block.id,

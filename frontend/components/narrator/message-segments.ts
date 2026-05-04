@@ -95,10 +95,69 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 // Tool call resolution (from contentJson blocks → ToolCallData)
 // ---------------------------------------------------------------------------
 
-export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function nativeWebSearchInput(block: ContentBlock): Record<string, unknown> {
+	const action = asRecord(block.action);
+	const query = typeof block.query === "string" ? block.query : action?.query;
+	const queries = Array.isArray(block.queries) ? block.queries : action?.queries;
+	const url = typeof action?.url === "string" ? action.url : undefined;
+	const pattern = typeof action?.pattern === "string" ? action.pattern : undefined;
+	const actionType = typeof action?.type === "string" ? action.type : "search";
+	const summary =
+		(typeof query === "string" && query) ||
+		(Array.isArray(queries) && queries.length > 0 ? queries.map(String).join(", ") : "") ||
+		(actionType === "find_in_page"
+			? [pattern ? `'${pattern}'` : null, url].filter(Boolean).join(" in ")
+			: url) ||
+		"Web search";
+
+	return {
+		query: summary,
+		...(typeof query === "string" && query ? { originalQuery: query } : {}),
+		...(Array.isArray(queries) && queries.length > 0 ? { queries } : {}),
+		...(actionType ? { action: actionType } : {}),
+		...(url ? { url } : {}),
+		...(pattern ? { pattern } : {}),
+	};
+}
+
+function nativeWebSearchStatus(block: ContentBlock): string {
+	const status = typeof block.status === "string" ? block.status : "completed";
+	return status === "completed" ? "completed" : "running";
+}
+
+function nativeWebSearchToolCall(block: ContentBlock): ToolCallData | null {
+	if (typeof block.id !== "string" || !block.id) return null;
+	return {
+		id: `native:${block.id}`,
+		toolName: "WebSearch",
+		toolUseId: block.id,
+		inputJson: nativeWebSearchInput(block),
+		status: nativeWebSearchStatus(block),
+		_metadata: {
+			native: true,
+			nativeStatus: typeof block.status === "string" ? block.status : "completed",
+		},
+	};
+}
+
+export function resolveAllToolCallsFromMsg(
+	msg: NarratorMsg,
+	opts: Pick<SegmentOptions, "nativeWebSearchAsTool"> = {},
+): ToolCallData[] {
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	const results: ToolCallData[] = [];
 	for (const block of blocks) {
+		if (opts.nativeWebSearchAsTool && block.type === "web_search") {
+			const tc = nativeWebSearchToolCall(block);
+			if (tc) results.push(tc);
+			continue;
+		}
 		if (block.type !== "tool_use") continue;
 		const isEnriched = block.status !== undefined;
 		const tc = isEnriched
@@ -155,12 +214,17 @@ export interface SegmentOptions {
 	pruneBoundaryMessageId?: string | null;
 	pruneDividerLabel?: string;
 	streamingMsg?: NarratorMsg | null;
+	/** Pixi-only: render provider-native web_search blocks as tool-run items. */
+	nativeWebSearchAsTool?: boolean;
 }
 
 type VisualLane = "content" | "tool";
 
-function classifyBlock(b: ContentBlock): VisualLane | null {
+function classifyBlock(b: ContentBlock, opts: SegmentOptions): VisualLane | null {
 	if (b.type === "tool_use") return "tool";
+	if (opts.nativeWebSearchAsTool && b.type === "web_search" && typeof b.id === "string") {
+		return "tool";
+	}
 	if (isVisibleContentBlock(b)) return "content";
 	return null;
 }
@@ -190,7 +254,7 @@ export function segmentMessages(
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 
 			for (let bi = 0; bi < blocks.length; bi++) {
-				const lane = classifyBlock(blocks[bi]);
+				const lane = classifyBlock(blocks[bi], opts);
 				if (lane === "content") atoms.push({ lane: "content", msg, blockIndex: bi });
 				else if (lane === "tool") atoms.push({ lane: "tool", msg, blockIndex: bi });
 			}
@@ -252,7 +316,7 @@ export function segmentMessages(
 		const getTcs = (msg: NarratorMsg) => {
 			let tcs = allTcsCache.get(msg);
 			if (!tcs) {
-				tcs = resolveAllToolCallsFromMsg(msg);
+				tcs = resolveAllToolCallsFromMsg(msg, opts);
 				allTcsCache.set(msg, tcs);
 			}
 			return tcs;

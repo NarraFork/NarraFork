@@ -45,6 +45,8 @@ function SettingsAgentPage() {
 				setMaxTransientRetries={is.setMaxTransientRetries}
 				retryBackoffCeilMs={is.retryBackoffCeilMs}
 				setRetryBackoffCeilMs={is.setRetryBackoffCeilMs}
+				firstTokenTimeoutMs={is.firstTokenTimeoutMs}
+				setFirstTokenTimeoutMs={is.setFirstTokenTimeoutMs}
 				customRetryRules={is.customRetryRules}
 				setCustomRetryRules={is.setCustomRetryRules}
 				contextThresholds={is.contextThresholds}

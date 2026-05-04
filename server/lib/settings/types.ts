@@ -260,6 +260,8 @@ export interface NarraForkSettings {
 		maxTransientRetries: number;
 		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */
 		retryBackoffCeilMs: number;
+		/** Time to wait for the first meaningful AI API event before aborting and retrying. 0 = disabled. */
+		firstTokenTimeoutMs: number;
 		/** User-defined retryable error rules. Matched errors are treated as transient. */
 		customRetryRules?: Array<{
 			id: string;
