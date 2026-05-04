@@ -232,9 +232,22 @@ export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 
 // === Compact/Prune locks ===
 
+export type CompactLockKind = "history" | "history_probe" | "segment";
+
+export interface CompactLockResult {
+	kind: CompactLockKind;
+	/** True only when this lock actually produced or waited for a history compact. */
+	compacted: boolean;
+}
+
+export interface CompactLock {
+	kind: CompactLockKind;
+	promise: Promise<CompactLockResult>;
+}
+
 /** Per-narrator lock to prevent concurrent compact operations. */
-export const compactLocks = hotSafe<Map<string, Promise<void>>>(
-	"narrafork.compactLocks",
+export const compactLocks = hotSafe<Map<string, CompactLock>>(
+	"narrafork.compactLocks.v2",
 	() => new Map(),
 );
 

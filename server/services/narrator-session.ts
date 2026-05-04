@@ -1746,7 +1746,8 @@ export async function runAgentLoop(
 						// On completion it resets the narrator's conversationId so the next
 						// agent loop iteration starts a fresh API conversation.
 						runCustomCompact(narratorId, locale, boundaryMessageId)
-							.then(() => {
+							.then((compacted) => {
+								if (!compacted) return;
 								const current = activeNarrators.get(narratorId);
 								if (current?.alive) {
 									current.conversationId = randomUUID();

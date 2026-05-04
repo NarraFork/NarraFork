@@ -6,6 +6,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
 import { narratorService } from "./narrator-service";
+import type { CompactLock, CompactLockResult } from "./narrator-session-state";
 import { activeNarrators, compactLocks, pruneLocks } from "./narrator-session-state";
 
 /** Compact operation timeout in milliseconds (5 minutes). */
@@ -34,41 +35,48 @@ export function triggerMidTurnCompact(
 	locale: Locale,
 	onCompactDone?: () => void,
 ): void {
-	const placeholder = Promise.resolve();
-	compactLocks.set(narratorId, placeholder);
+	if (compactLocks.has(narratorId)) {
+		logger.debug("Compact already in progress, skipping mid-turn trigger", { narratorId });
+		return;
+	}
 
 	logger.info("Context usage high, triggering compact (mid-turn)", { narratorId });
-	narratorService
-		.getCompactBoundaryMessage(narratorId)
-		.then((boundaryMessageId) => {
-			if (!boundaryMessageId) {
-				logger.debug("No compact boundary found, aborting mid-turn compact", { narratorId });
-				if (compactLocks.get(narratorId) === placeholder) {
-					compactLocks.delete(narratorId);
-				}
-				return;
-			}
-			if (compactLocks.get(narratorId) === placeholder) {
-				compactLocks.delete(narratorId);
-			}
-			logger.info("Starting runCustomCompact", {
+	let compactLock!: CompactLock;
+	const compactPromise: Promise<CompactLockResult> = (async () => {
+		const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+		if (!boundaryMessageId) {
+			logger.debug("No compact boundary found, aborting mid-turn compact", { narratorId });
+			return { kind: "history_probe", compacted: false };
+		}
+
+		// Release this wrapper lock before delegating to runCustomCompact(), which
+		// installs the real history-compact lock. Existing waiters still await this
+		// wrapper, and new waiters will see runCustomCompact()'s lock.
+		if (compactLocks.get(narratorId) === compactLock) {
+			compactLocks.delete(narratorId);
+		}
+		logger.info("Starting runCustomCompact", {
+			narratorId,
+			boundaryMessageId,
+			hasLock: compactLocks.has(narratorId),
+		});
+		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId);
+		if (compacted) {
+			onCompactDone?.();
+		}
+		return { kind: "history_probe", compacted };
+	})();
+	compactLock = { kind: "history_probe", promise: compactPromise };
+	compactLocks.set(narratorId, compactLock);
+	compactPromise
+		.catch((err) => {
+			logger.error("Auto-compact failed (mid-turn)", {
 				narratorId,
-				boundaryMessageId,
-				hasLock: compactLocks.has(narratorId),
+				error: String(err),
 			});
-			runCustomCompact(narratorId, locale, boundaryMessageId)
-				.then(() => {
-					onCompactDone?.();
-				})
-				.catch((err) => {
-					logger.error("Auto-compact failed (mid-turn)", {
-						narratorId,
-						error: String(err),
-					});
-				});
 		})
-		.catch(() => {
-			if (compactLocks.get(narratorId) === placeholder) {
+		.finally(() => {
+			if (compactLocks.get(narratorId) === compactLock) {
 				compactLocks.delete(narratorId);
 			}
 		});
@@ -81,28 +89,60 @@ export async function runCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
-): Promise<void> {
-	const existing = compactLocks.get(narratorId);
-	if (existing) {
-		logger.info("Compact already in progress, waiting for it to finish", { narratorId });
-		await existing.catch(() => {});
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-		return;
+): Promise<boolean> {
+	while (true) {
+		const existing = compactLocks.get(narratorId);
+		if (!existing) break;
+
+		logger.info("Compact already in progress, waiting for it to finish", {
+			narratorId,
+			kind: existing.kind,
+		});
+		let result: CompactLockResult;
+		try {
+			result = await existing.promise;
+		} catch (err) {
+			if (existing.kind !== "segment") {
+				throw err;
+			}
+			logger.warn("Existing segment compact lock failed, continuing history compact", {
+				narratorId,
+				kind: existing.kind,
+				error: String(err),
+			});
+			continue;
+		}
+
+		if (existing.kind !== "segment" && result.compacted) {
+			broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+			return true;
+		}
+
+		logger.info("Existing compact lock did not satisfy history compact request, continuing", {
+			narratorId,
+			kind: existing.kind,
+			compacted: result.compacted,
+		});
 	}
 
 	let compactTimer: ReturnType<typeof setTimeout>;
-	const compactPromise = Promise.race([
-		doRunCustomCompact(narratorId, locale, beforeMessageId),
-		new Promise<void>((_, reject) => {
+	const compactPromise: Promise<CompactLockResult> = Promise.race([
+		doRunCustomCompact(narratorId, locale, beforeMessageId).then((compacted) => ({
+			kind: "history" as const,
+			compacted,
+		})),
+		new Promise<CompactLockResult>((_, reject) => {
 			compactTimer = setTimeout(
 				() => reject(new Error("Compact operation timed out after 5 minutes")),
 				COMPACT_TIMEOUT_MS,
 			);
 		}),
 	]);
-	compactLocks.set(narratorId, compactPromise);
+	const compactLock: CompactLock = { kind: "history", promise: compactPromise };
+	compactLocks.set(narratorId, compactLock);
 	try {
-		await compactPromise;
+		const result = await compactPromise;
+		return result.compacted;
 	} catch (err) {
 		logger.error("Compact operation failed or timed out", {
 			narratorId,
@@ -112,7 +152,9 @@ export async function runCustomCompact(
 	} finally {
 		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
 		clearTimeout(compactTimer!);
-		compactLocks.delete(narratorId);
+		if (compactLocks.get(narratorId) === compactLock) {
+			compactLocks.delete(narratorId);
+		}
 	}
 }
 
@@ -120,7 +162,7 @@ async function doRunCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
-): Promise<void> {
+): Promise<boolean> {
 	logger.info("Starting custom compact", { narratorId, beforeMessageId });
 
 	const messages = beforeMessageId
@@ -129,7 +171,7 @@ async function doRunCustomCompact(
 
 	if (beforeMessageId && (!messages || messages.length === 0)) {
 		logger.info("No messages to compact before target", { narratorId, beforeMessageId });
-		return;
+		return false;
 	}
 
 	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
@@ -184,6 +226,7 @@ async function doRunCustomCompact(
 			narratorId,
 			contextPercentAfter: contextPercent,
 		});
+		return true;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Custom compact failed after retries", {
@@ -245,22 +288,26 @@ export async function runSegmentCompact(
 ): Promise<void> {
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
-		await existing.catch(() => {});
+		await existing.promise.catch(() => {});
 		broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
 		return;
 	}
 
 	let timer: ReturnType<typeof setTimeout>;
-	const promise = Promise.race([
-		doRunSegmentCompact(narratorId, locale, messageIds),
-		new Promise<void>((_, reject) => {
+	const promise: Promise<CompactLockResult> = Promise.race([
+		doRunSegmentCompact(narratorId, locale, messageIds).then((compacted) => ({
+			kind: "segment" as const,
+			compacted,
+		})),
+		new Promise<CompactLockResult>((_, reject) => {
 			timer = setTimeout(
 				() => reject(new Error("Segment compact timed out after 5 minutes")),
 				COMPACT_TIMEOUT_MS,
 			);
 		}),
 	]);
-	compactLocks.set(narratorId, promise);
+	const lock: CompactLock = { kind: "segment", promise };
+	compactLocks.set(narratorId, lock);
 	try {
 		await promise;
 	} catch (err) {
@@ -272,7 +319,9 @@ export async function runSegmentCompact(
 	} finally {
 		// biome-ignore lint/style/noNonNullAssertion: timer is always assigned before race settles
 		clearTimeout(timer!);
-		compactLocks.delete(narratorId);
+		if (compactLocks.get(narratorId) === lock) {
+			compactLocks.delete(narratorId);
+		}
 	}
 }
 
@@ -280,7 +329,7 @@ async function doRunSegmentCompact(
 	narratorId: string,
 	locale: Locale,
 	messageIds: string[],
-): Promise<void> {
+): Promise<boolean> {
 	logger.info("Starting segment compact", { narratorId, messageCount: messageIds.length });
 
 	const { message: markerMsg, hiddenMessageIds } =
@@ -299,7 +348,7 @@ async function doRunSegmentCompact(
 		if (messages.length === 0) {
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
 			broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
-			return;
+			return false;
 		}
 
 		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
@@ -330,6 +379,7 @@ async function doRunSegmentCompact(
 			narratorId,
 			isSegment: true,
 		});
+		return true;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Segment compact failed", {

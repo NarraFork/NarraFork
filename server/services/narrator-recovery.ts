@@ -19,6 +19,7 @@ import { getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { runCustomCompact } from "./narrator-session";
+import { compactLocks } from "./narrator-session-state";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -94,6 +95,41 @@ export async function handleContextOverflow(opts: {
 
 	onBroadcast?.({ type: "context_length_exceeded", narratorId });
 
+	// If auto-compact was already triggered while the failed request was in flight,
+	// wait for it. Only a completed history compact is enough to retry directly;
+	// segment compacts and no-op probes do not reduce the overflow recovery history.
+	const existingCompact = compactLocks.get(narratorId);
+	if (existingCompact) {
+		logger.warn("Context overflow detected while compact is in progress, waiting", {
+			narratorId,
+			attempt: overflowRetries,
+			kind: existingCompact.kind,
+		});
+		try {
+			const compactResult = await existingCompact.promise;
+			if (existingCompact.kind !== "segment" && compactResult.compacted) {
+				const newConversationId = randomUUID();
+				onBroadcast?.({ type: "compact_done", narratorId });
+				logger.info("Existing history compact finished after context overflow, retrying", {
+					narratorId,
+					kind: existingCompact.kind,
+				});
+				return { action: "retry_compacted", newConversationId, overflowRetries };
+			}
+			logger.info("Existing compact did not satisfy overflow recovery, continuing", {
+				narratorId,
+				kind: existingCompact.kind,
+				compacted: compactResult.compacted,
+			});
+		} catch (compactErr) {
+			logger.error("Existing compact failed during context overflow recovery", {
+				narratorId,
+				kind: existingCompact.kind,
+				error: String(compactErr),
+			});
+		}
+	}
+
 	// ── Step 1: Codex aggressive prune (first attempt only) ──────────────
 	if (provider === "codex" && overflowRetries === 1) {
 		try {
@@ -147,11 +183,17 @@ export async function handleContextOverflow(opts: {
 	}
 
 	try {
-		await runCustomCompact(narratorId, locale, boundaryMessageId);
-		const newConversationId = randomUUID();
-		onBroadcast?.({ type: "compact_done", narratorId });
-		logger.info("Emergency compact succeeded, retrying", { narratorId });
-		return { action: "retry_compacted", newConversationId, overflowRetries };
+		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId);
+		if (compacted) {
+			const newConversationId = randomUUID();
+			onBroadcast?.({ type: "compact_done", narratorId });
+			logger.info("Emergency compact succeeded, retrying", { narratorId });
+			return { action: "retry_compacted", newConversationId, overflowRetries };
+		}
+		logger.warn("Emergency compact completed without compacting", {
+			narratorId,
+			boundaryMessageId,
+		});
 	} catch (compactErr) {
 		logger.error("Emergency compact failed", {
 			narratorId,
