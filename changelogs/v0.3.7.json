@@ -1,0 +1,6 @@
+{
+	"version": "0.3.7",
+	"date": "2026-05-04",
+	"en": "## Bug Fixes\n\n- Keep streaming Edit previews accurate by carrying matched line metadata through narrator events, including replace-all edits.\n- Wait for the updated server before refreshing after an automatic restart, while still clearing stale PWA caches for manual restart flows.\n- Suppress noisy YOLO safety reflection pause notifications while preserving the permission UI and stale Windows socket cleanup.",
+	"zh-CN": "## 修复\n\n- 通过叙述者事件传递匹配行号元数据，让流式 Edit 预览更准确，并支持 replace_all 编辑场景。\n- 自动重启更新时等待新版服务器就绪后再刷新，同时保留手动重启流程中的 PWA 缓存清理。\n- 抑制 YOLO 安全反思暂停产生的多余通知，同时保留权限界面与 Windows 旧 socket 清理能力。"
+}
