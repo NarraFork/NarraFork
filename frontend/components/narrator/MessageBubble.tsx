@@ -2488,9 +2488,11 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// User messages — wrap entire bubble in ContentViewer for context menu / swipe
 	if (isUser) {
-		// Tool-loaded notification — render like an info message, not a user bubble
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const toolLoadedBlock = blocks.find((b: any) => b.type === "tool_loaded");
+		// Tool load/unload notifications — render like info messages, not user bubbles
+		const toolLoadedBlock = blocks.find(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "tool_loaded" || b.type === "tool_unloaded",
+		);
 		if (toolLoadedBlock) {
 			return (
 				<MessageContextMenuCtx.Provider value={ctxActions}>

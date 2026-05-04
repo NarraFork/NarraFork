@@ -41,7 +41,14 @@ import {
 } from "../lib/settings";
 import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import type { LoadSkillResult, LoadToolNotFound, LoadToolResult } from "./command-service";
+import type {
+	LoadSkillResult,
+	LoadToolNotFound,
+	LoadToolResult,
+	UnloadToolNotFound,
+	UnloadToolResult,
+} from "./command-service";
+import { getAvailableOptionalToolIds } from "./command-service";
 import { narratorMessageQueries } from "./narrator-messages";
 import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
 
@@ -132,6 +139,10 @@ interface CreateSubagentInput {
 	systemPrompt?: string;
 }
 
+function formatAvailableOptionalToolIds(): string {
+	return getAvailableOptionalToolIds().join(", ");
+}
+
 /**
  * Shared handler for `/load <tool>` commands.
  */
@@ -143,10 +154,11 @@ export async function handleLoadToolCommand(
 ): Promise<{ toolName: string; loaded: boolean; alreadyLoaded: boolean }> {
 	if ("loadToolNotFound" in cmdResult) {
 		const toolId = cmdResult.loadToolNotFound;
+		const available = formatAvailableOptionalToolIds();
 		const infoText =
 			locale === "zh-CN"
-				? `⚠️ 未知工具：${toolId}。可用：terminal, share_file, narrafork_admin`
-				: `⚠️ Unknown tool: ${toolId}. Available: terminal, share_file, narrafork_admin`;
+				? `⚠️ 未知工具：${toolId}。可用：${available}`
+				: `⚠️ Unknown tool: ${toolId}. Available: ${available}`;
 		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { toolName: toolId, loaded: false, alreadyLoaded: false };
 	}
@@ -221,6 +233,72 @@ export async function handleLoadToolCommand(
 	}
 
 	return { toolName, loaded: true, alreadyLoaded };
+}
+
+/**
+ * Shared handler for `/unload <tool>` commands.
+ */
+export async function handleUnloadToolCommand(
+	narratorId: string,
+	cmdResult: UnloadToolResult | UnloadToolNotFound,
+	locale: Locale = "en",
+): Promise<{ toolName: string; unloaded: boolean; notLoaded: boolean }> {
+	if ("unloadToolNotFound" in cmdResult) {
+		const toolId = cmdResult.unloadToolNotFound;
+		const available = formatAvailableOptionalToolIds();
+		const infoText =
+			locale === "zh-CN"
+				? `⚠️ 未知工具：${toolId}。可用：${available}`
+				: `⚠️ Unknown tool: ${toolId}. Available: ${available}`;
+		await narratorService.persistDisplayMessage(narratorId, infoText);
+		return { toolName: toolId, unloaded: false, notLoaded: false };
+	}
+
+	const toolName = cmdResult.unloadTool;
+	const { unloadOptionalTool } = await import("./narrator-session");
+	const result = await unloadOptionalTool(narratorId, toolName);
+	const notLoaded = result === "not_loaded";
+	const unknownTool = result === "unknown_tool";
+	const infoText = unknownTool
+		? `⚠️ Unknown tool: ${toolName}`
+		: notLoaded
+			? `🔧 Tool not loaded: ${toolName}`
+			: `🔧 Tool unloaded: ${toolName}`;
+	await narratorService.persistDisplayMessage(narratorId, infoText);
+
+	// Persist a user-role message so the model is aware the tool is no longer available.
+	if (!notLoaded && !unknownTool) {
+		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName });
+		const id = generateId();
+		const now = new Date().toISOString();
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "user",
+				contentJson: [{ type: "tool_unloaded", toolName, text }],
+				contentText: text,
+				createdAt: now,
+			})
+			.returning();
+		await appendMessageRef(narratorId, id);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: {
+				id: msg.id,
+				narratorId,
+				role: "user",
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				children: [],
+			},
+		});
+	}
+
+	return { toolName, unloaded: !notLoaded && !unknownTool, notLoaded };
 }
 
 /**

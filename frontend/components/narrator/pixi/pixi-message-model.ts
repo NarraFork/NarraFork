@@ -1,13 +1,82 @@
+import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { collectSegmentTargetIds, segmentMessages } from "../message-segments";
 import type { MessagesPage, NarratorMsg } from "../narrator-panel-types";
+import {
+	extractField,
+	formatCompletedDuration,
+	getCategory,
+	getCategoryColor,
+	getFilePath,
+	getSummary,
+	resolveDisplayText,
+	type ToolCategory,
+	type ToolDisplayColor,
+} from "../tool-display";
 
 export type PixiMessageItemKind = "message" | "tool-run" | "divider" | "action";
+
+export interface PixiToolDetailLineModel {
+	label?: string;
+	text: string;
+	kind?: "code" | "text" | "error" | "muted";
+}
+
+export interface PixiToolBadgeModel {
+	text: string;
+	color?: ToolDisplayColor;
+	variant?: "light" | "outline" | "dot";
+}
+
+export type PixiToolDetailBlockModel =
+	| { kind: "badge-row"; badges: PixiToolBadgeModel[] }
+	| { kind: "section-title"; text: string }
+	| { kind: "text-line"; text: string; color?: ToolDisplayColor; muted?: boolean; mono?: boolean }
+	| {
+			kind: "code-panel" | "terminal-panel";
+			title?: string;
+			text: string;
+			maxLines?: number;
+			lang?: string;
+	  }
+	| {
+			kind: "diff-panel";
+			title?: string;
+			oldText: string;
+			newText: string;
+			maxLines?: number;
+			lang?: string;
+			startLine?: number;
+	  }
+	| { kind: "todo-row"; text: string; status?: string }
+	| {
+			kind: "result-card";
+			title?: string;
+			subtitle?: string;
+			text?: string;
+			color?: ToolDisplayColor;
+			badges?: PixiToolBadgeModel[];
+	  }
+	| { kind: "share-card"; filename: string; badges: PixiToolBadgeModel[]; note?: string };
 
 export interface PixiMessageBlockModel {
 	type: string;
 	text: string;
 	label?: string;
-	color?: "gray" | "green" | "yellow" | "red" | "blue" | "teal" | "indigo";
+	color?: ToolDisplayColor;
+	toolName?: string;
+	toolCategory?: ToolCategory;
+	toolSummary?: string;
+	toolStatus?: string;
+	toolDuration?: string;
+	toolStatusColor?: ToolDisplayColor;
+	toolCategoryColor?: ToolDisplayColor;
+	toolDetailLines?: PixiToolDetailLineModel[];
+	toolDetailBlocks?: PixiToolDetailBlockModel[];
+	toolChildCount?: number;
+	toolIsSubagent?: boolean;
+	toolInRun?: boolean;
+	toolIsLast?: boolean;
+	toolDefaultOpen?: boolean;
 }
 
 export interface PixiMessageItem {
@@ -92,12 +161,19 @@ function displayTime(iso?: string | null): string | undefined {
 	if (!iso) return undefined;
 	const d = new Date(iso);
 	if (Number.isNaN(d.getTime())) return undefined;
-	return d.toLocaleString([], {
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
+	const now = new Date();
+	const isToday =
+		d.getFullYear() === now.getFullYear() &&
+		d.getMonth() === now.getMonth() &&
+		d.getDate() === now.getDate();
+	return isToday
+		? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+		: d.toLocaleString([], {
+				month: "2-digit",
+				day: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit",
+			});
 }
 
 function blockText(block: Record<string, unknown>): string {
@@ -136,6 +212,8 @@ function specialLabel(type: string): string {
 			return "Bash";
 		case "tool_loaded":
 			return "Tool loaded";
+		case "tool_unloaded":
+			return "Tool unloaded";
 		case "text_file":
 			return "Text file";
 		case "image":
@@ -213,6 +291,743 @@ function titleForMessage(msg: NarratorMsg): string {
 	return msg.role ?? "Message";
 }
 
+function truncateLine(text: string, max = 180): string {
+	const singleLine = text.replace(/\s+/g, " ").trim();
+	return singleLine.length > max ? `${singleLine.slice(0, max - 1)}…` : singleLine;
+}
+
+function firstLines(text: string, maxLines = 3, maxChars = 240): PixiToolDetailLineModel[] {
+	return text
+		.split(/\r?\n/)
+		.map((line) => line.trimEnd())
+		.filter((line) => line.trim().length > 0)
+		.slice(0, maxLines)
+		.map((line) => ({ text: truncateLine(line, maxChars), kind: "code" as const }));
+}
+
+function objectValue(input: unknown, key: string): unknown {
+	return typeof input === "object" && input && !Array.isArray(input)
+		? (input as Record<string, unknown>)[key]
+		: undefined;
+}
+
+function statusColor(status: string): ToolDisplayColor {
+	if (status === "completed" || status === "success") return "green";
+	if (status === "fail" || status === "failed" || status === "error") return "red";
+	if (status === "cancelled") return "gray";
+	if (status === "running" || status === "initializing" || status === "pending") return "yellow";
+	return "blue";
+}
+
+function addOutputLines(lines: PixiToolDetailLineModel[], outputJson: unknown): void {
+	const output = resolveDisplayText(outputJson);
+	if (!output.trim()) return;
+	lines.push(...firstLines(output, Math.max(1, 4 - lines.length)));
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function metadataFrom(
+	outputJson: unknown,
+	metadata?: Record<string, unknown>,
+): Record<string, unknown> {
+	return (asRecord(outputJson)?._metadata as Record<string, unknown> | undefined) ?? metadata ?? {};
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> | null {
+	const record = asRecord(value);
+	if (record) return record;
+	const raw = resolveDisplayText(value).trim();
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw);
+		return asRecord(parsed);
+	} catch {
+		return null;
+	}
+}
+
+function parseJsonArray(value: unknown): Array<Record<string, unknown>> {
+	const raw = resolveDisplayText(value).trim();
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		if (Array.isArray(parsed))
+			return parsed.filter((v): v is Record<string, unknown> => Boolean(asRecord(v)));
+		if (Array.isArray(parsed?.results)) {
+			return parsed.results.filter((v: unknown): v is Record<string, unknown> =>
+				Boolean(asRecord(v)),
+			);
+		}
+	} catch {
+		// ignore non-JSON output
+	}
+	return [];
+}
+
+function outputPanel(
+	blocks: PixiToolDetailBlockModel[],
+	outputJson: unknown,
+	kind: "code-panel" | "terminal-panel" = "code-panel",
+	title = "Output",
+	maxLines = 8,
+): void {
+	const output = resolveDisplayText(outputJson);
+	if (!output.trim()) return;
+	blocks.push({
+		kind,
+		text: output,
+		title,
+		maxLines,
+	});
+}
+
+function inputPanel(
+	blocks: PixiToolDetailBlockModel[],
+	inputJson: unknown,
+	title = "Input",
+	maxLines = 8,
+): void {
+	const input = resolveDisplayText(inputJson);
+	if (!input.trim()) return;
+	blocks.push({ kind: "section-title", text: title });
+	blocks.push({ kind: "code-panel", text: input, title, maxLines, lang: "json" });
+}
+
+function parseTaskOutputXml(raw: string): Record<string, string> {
+	const result: Record<string, string> = {};
+	const tagRegex = /<(\w+)>([\s\S]*?)<\/\1>/g;
+	let match = tagRegex.exec(raw);
+	while (match !== null) {
+		result[match[1]] = match[2].trim();
+		match = tagRegex.exec(raw);
+	}
+	if (!result.output) {
+		const outputMatch = raw.match(/<output>([\s\S]*)$/);
+		if (outputMatch) result.output = outputMatch[1].trim();
+	}
+	return result;
+}
+
+function coerceQuestionSummary(
+	value: unknown,
+): Array<{ header: string; question: string; answer?: string }> {
+	if (!Array.isArray(value)) return [];
+	return value.slice(0, 4).map((question, index) => {
+		const record = asRecord(question) ?? {};
+		const header = String(record.header ?? `Question ${index + 1}`);
+		return {
+			header,
+			question: String(record.question ?? ""),
+			answer: undefined,
+		};
+	});
+}
+
+function badge(
+	text: string,
+	color: ToolDisplayColor = "gray",
+	variant: "light" | "outline" | "dot" = "light",
+) {
+	return { text, color, variant } satisfies PixiToolBadgeModel;
+}
+
+function getStreamingFileInput(
+	inputJson: unknown,
+): { filePath: string; fieldName: string; value: string } | null {
+	const input = asRecord(inputJson);
+	if (!input) return null;
+	const fields = asRecord(input._streamingFields);
+	const filePath =
+		(typeof input._streamingFilePath === "string" ? input._streamingFilePath : undefined) ??
+		(typeof fields?.file_path === "string" ? fields.file_path : undefined) ??
+		getFilePath(inputJson);
+	const fieldName =
+		typeof input._streamingFieldName === "string" ? input._streamingFieldName : undefined;
+	const value =
+		typeof input._streamingFieldValue === "string" ? input._streamingFieldValue : undefined;
+	if (!filePath || !fieldName || !value) return null;
+	if (fieldName !== "content" && fieldName !== "new_string") return null;
+	return { filePath, fieldName, value };
+}
+
+function buildToolDetailBlocks(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata?: Record<string, unknown>,
+	errorMessage?: string,
+): PixiToolDetailBlockModel[] {
+	const category = getCategory(toolName);
+	const blocks: PixiToolDetailBlockModel[] = [];
+	const streamingFile = category === "file" ? getStreamingFileInput(inputJson) : null;
+	const filePath = streamingFile?.filePath ?? getFilePath(inputJson);
+	const meta = metadataFrom(outputJson, metadata);
+	const output = resolveDisplayText(outputJson);
+	switch (category) {
+		case "bash": {
+			const command = extractField(inputJson, "command");
+			if (command)
+				blocks.push({
+					kind: "terminal-panel",
+					title: "Command",
+					text: `$ ${command}`,
+					maxLines: 3,
+				});
+			outputPanel(blocks, outputJson, "terminal-panel", "Output");
+			break;
+		}
+		case "read": {
+			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
+			if (meta.isImage === true) {
+				const info = [meta.sizeKB != null ? `${meta.sizeKB} KB` : null, meta.imageFormat]
+					.filter(Boolean)
+					.join(" · ");
+				blocks.push({
+					kind: "result-card",
+					title: filePath ? filePath.split("/").pop() : "Image",
+					subtitle: info || "image preview",
+					text: "Image preview is available in the React renderer.",
+					color: "teal",
+				});
+			} else if (output.trim()) {
+				blocks.push({
+					kind: "code-panel",
+					title: filePath || "Read",
+					text: output,
+					maxLines: 8,
+					lang: filePath ? getShikiLang(filePath) : "text",
+				});
+			}
+			break;
+		}
+		case "file": {
+			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
+			if (streamingFile) {
+				blocks.push({ kind: "badge-row", badges: [badge("streaming", "blue", "dot")] });
+				blocks.push({
+					kind: "code-panel",
+					title: filePath ? filePath.split("/").pop() : `Streaming ${streamingFile.fieldName}`,
+					text: streamingFile.value,
+					maxLines: 10,
+					lang: filePath ? getShikiLang(filePath) : "text",
+				});
+			} else if (toolName === "Edit" || toolName === "MultiEdit") {
+				const oldString = extractField(inputJson, "old_string");
+				const newString = extractField(inputJson, "new_string");
+				const startLine = typeof meta.startLine === "number" ? meta.startLine : undefined;
+				if (oldString || newString) {
+					blocks.push({
+						kind: "diff-panel",
+						title: filePath || "Diff",
+						oldText: oldString,
+						newText: newString,
+						maxLines: 8,
+						lang: filePath ? getShikiLang(filePath) : "diff",
+						startLine,
+					});
+				} else if (Object.keys(asRecord(inputJson) ?? {}).length > 0) {
+					blocks.push({
+						kind: "code-panel",
+						title: filePath || toolName,
+						text: resolveDisplayText(inputJson),
+						maxLines: 8,
+						lang: "json",
+					});
+				}
+			} else if (toolName === "Write") {
+				const content = extractField(inputJson, "content");
+				if (content)
+					blocks.push({
+						kind: "code-panel",
+						title: filePath || "Write",
+						text: content,
+						maxLines: 8,
+						lang: filePath ? getShikiLang(filePath) : "text",
+					});
+			}
+			outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "search": {
+			const pattern = extractField(inputJson, "pattern", "glob");
+			const path = extractField(inputJson, "path");
+			const badges = [pattern ? badge(pattern, "gray", "outline") : null].filter(
+				Boolean,
+			) as PixiToolBadgeModel[];
+			if (badges.length) blocks.push({ kind: "badge-row", badges });
+			if (path) blocks.push({ kind: "text-line", text: `in ${path}`, muted: true });
+			outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "webSearch": {
+			const query = extractField(inputJson, "query");
+			if (query) blocks.push({ kind: "badge-row", badges: [badge(query, "gray", "outline")] });
+			const results = parseJsonArray(outputJson).slice(0, 5);
+			if (results.length > 0) {
+				for (const r of results) {
+					blocks.push({
+						kind: "result-card",
+						title: String(r.title ?? r.url ?? "Result"),
+						subtitle: String(r.domain ?? r.url ?? ""),
+						text: String(r.snippet ?? ""),
+						color: "indigo",
+					});
+				}
+			} else outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "webFetch":
+		case "browser": {
+			const url = extractField(inputJson, "url");
+			const mode = extractField(inputJson, "mode", "action");
+			const selector = extractField(inputJson, "selector");
+			const row = [
+				mode ? badge(mode, "teal") : null,
+				extractField(inputJson, "session_id")
+					? badge(String(extractField(inputJson, "session_id")).slice(0, 8), "gray", "outline")
+					: null,
+			].filter(Boolean) as PixiToolBadgeModel[];
+			if (row.length) blocks.push({ kind: "badge-row", badges: row });
+			if (url) blocks.push({ kind: "text-line", text: url, color: "teal", mono: true });
+			if (selector) blocks.push({ kind: "text-line", text: `selector: ${selector}`, muted: true });
+			if (mode === "screenshot" || mode === "dom") {
+				blocks.push({
+					kind: "result-card",
+					title: mode === "dom" ? "DOM" : "Screenshot",
+					subtitle: url,
+					text: output || "Preview available in React renderer.",
+					color: "teal",
+				});
+			} else outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "terminal": {
+			const action = extractField(inputJson, "action");
+			const terminalId = extractField(inputJson, "terminal_id");
+			if (terminalId)
+				blocks.push({
+					kind: "text-line",
+					text: `Terminal: ${terminalId}`,
+					muted: true,
+					mono: true,
+				});
+			const input = extractField(inputJson, "input");
+			if (action === "write" && input)
+				blocks.push({ kind: "terminal-panel", title: "Terminal Input", text: input, maxLines: 3 });
+			outputPanel(
+				blocks,
+				outputJson,
+				action === "read" ? "terminal-panel" : "code-panel",
+				action === "read" ? "Terminal Buffer" : "Output",
+			);
+			break;
+		}
+		case "share": {
+			const filename = String(meta.filename ?? "file");
+			const badges = [
+				meta.sizeFormatted ? badge(String(meta.sizeFormatted), "gray") : null,
+				meta.isDirectory ? badge("directory", "blue") : null,
+				meta.format === "zip" ? badge("zip", "violet") : null,
+				meta.preview ? badge("preview", "teal") : null,
+				meta.expiryHours ? badge(`${meta.expiryHours}h`, "yellow") : null,
+			].filter(Boolean) as PixiToolBadgeModel[];
+			if (meta.downloadUrl)
+				blocks.push({ kind: "share-card", filename, badges, note: String(meta.downloadUrl) });
+			else outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "todo": {
+			const todos = objectValue(inputJson, "todos") ?? objectValue(outputJson, "todos");
+			if (Array.isArray(todos)) {
+				for (const todo of todos.slice(0, 8)) {
+					const record = asRecord(todo) ?? {};
+					blocks.push({
+						kind: "todo-row",
+						text: String(record.content ?? "—"),
+						status: String(record.status ?? "pending"),
+					});
+				}
+				if (todos.length > 8)
+					blocks.push({ kind: "text-line", text: `+ ${todos.length - 8} more…`, muted: true });
+			}
+			break;
+		}
+		case "goal": {
+			const payload = parseJsonRecord(outputJson);
+			const goals = Array.isArray(payload?.goals) ? payload.goals : [];
+			const objective =
+				extractField(inputJson, "objective") ||
+				String(asRecord(payload?.active)?.objective ?? asRecord(payload?.added)?.objective ?? "");
+			if (objective)
+				blocks.push({
+					kind: "result-card",
+					title: "Goal",
+					subtitle: String(
+						asRecord(payload?.active)?.status ?? asRecord(payload?.added)?.status ?? "",
+					),
+					text: objective,
+					color: "teal",
+				});
+			for (const goal of goals.slice(0, 6)) {
+				const g = asRecord(goal) ?? {};
+				blocks.push({
+					kind: "result-card",
+					title: String(g.status ?? "goal"),
+					text: String(g.objective ?? "—"),
+					color: "gray",
+				});
+			}
+			break;
+		}
+		case "await": {
+			const awaitType = extractField(inputJson, "type") || String(meta.awaitType ?? "task");
+			const target = extractField(inputJson, "id") || String(meta.targetId ?? "");
+			blocks.push({
+				kind: "badge-row",
+				badges: [
+					badge(awaitType, awaitType === "bash" ? "orange" : "indigo"),
+					target ? badge(target, "gray", "outline") : null,
+					badge(String(meta.status ?? "result"), statusColor(String(meta.status ?? "success"))),
+				].filter(Boolean) as PixiToolBadgeModel[],
+			});
+			const wait = extractField(inputJson, "wait_for_text") || String(meta.waitForText ?? "");
+			if (wait) blocks.push({ kind: "text-line", text: `Waiting for text: ${wait}`, muted: true });
+			outputPanel(
+				blocks,
+				outputJson,
+				awaitType === "bash" ? "terminal-panel" : "code-panel",
+				awaitType === "bash" ? "Output" : "Result",
+			);
+			break;
+		}
+		case "send": {
+			const targets = [extractField(inputJson, "id"), extractField(inputJson, "name")].filter(
+				Boolean,
+			);
+			blocks.push({
+				kind: "badge-row",
+				badges: [
+					targets[0] ? badge(`→ ${targets[0]}`, "blue") : badge("Subagent message", "blue"),
+					badge(
+						objectValue(inputJson, "await") ? "await" : "async",
+						objectValue(inputJson, "await") ? "indigo" : "gray",
+					),
+					objectValue(inputJson, "doInterrupt") ? badge("interrupt", "orange") : null,
+				].filter(Boolean) as PixiToolBadgeModel[],
+			});
+			const message = extractField(inputJson, "message");
+			if (message) {
+				blocks.push({ kind: "section-title", text: "Message" });
+				blocks.push({ kind: "code-panel", title: "Send message", text: message, maxLines: 6 });
+			}
+			outputPanel(
+				blocks,
+				outputJson,
+				"code-panel",
+				objectValue(inputJson, "await") ? "Reply" : "Result",
+			);
+			break;
+		}
+		case "skill": {
+			const name =
+				extractField(inputJson, "skill", "name") ||
+				output.match(/<skill_content\s+name="([^"]+)">/)?.[1];
+			if (name)
+				blocks.push({
+					kind: "badge-row",
+					badges: [badge(name, "grape"), badge("loaded", "gray", "outline")],
+				});
+			const contentStart = output.indexOf("\n\n");
+			const contentEnd = output.indexOf("\nBase directory for this skill:");
+			const skillContent =
+				contentStart >= 0 && contentEnd > contentStart
+					? output
+							.slice(contentStart + 2, contentEnd)
+							.replace(/^#\s+Skill:\s+.+\n*/, "")
+							.trim()
+					: output;
+			if (skillContent.trim()) {
+				blocks.push({
+					kind: "code-panel",
+					title: name ? `Skill: ${name}` : "Skill",
+					text: skillContent,
+					maxLines: 10,
+				});
+			}
+			const files = [...output.matchAll(/<file>([^<]+)<\/file>/g)].map((m) => m[1]);
+			if (files.length) {
+				blocks.push({
+					kind: "badge-row",
+					badges: files
+						.slice(0, 6)
+						.map((file) => badge(file.split("/").pop() || file, "gray", "dot")),
+				});
+			}
+			break;
+		}
+		case "recall": {
+			const action = String(meta.action ?? "");
+			if (Array.isArray(meta.queries))
+				blocks.push({
+					kind: "badge-row",
+					badges: meta.queries.slice(0, 5).map((q) => badge(String(q), "cyan")),
+				});
+			const results = Array.isArray(meta.results) ? meta.results : [];
+			for (const result of results.slice(0, 5)) {
+				const r = asRecord(result) ?? {};
+				blocks.push({
+					kind: "result-card",
+					title: String(r.narratorTitle ?? r.role ?? action),
+					subtitle: String(r.createdAt ?? ""),
+					text: String(r.snippet ?? "")
+						.replace(/>>>|<<</g, "")
+						.trim(),
+					color: r.role === "user" ? "blue" : "green",
+				});
+			}
+			if (results.length === 0) outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "taskOutput": {
+			const taskId = extractField(inputJson, "task_id");
+			const parsed = parseTaskOutputXml(output);
+			const badges = [
+				taskId ? badge(taskId, "indigo") : null,
+				parsed.status ? badge(parsed.status, statusColor(parsed.status)) : null,
+				parsed.task_type ? badge(parsed.task_type, "gray", "outline") : null,
+			].filter(Boolean) as PixiToolBadgeModel[];
+			if (badges.length) blocks.push({ kind: "badge-row", badges });
+			if (parsed.retrieval_status && parsed.retrieval_status !== "success") {
+				blocks.push({
+					kind: "text-line",
+					text: `retrieval: ${parsed.retrieval_status}`,
+					color: "red",
+				});
+			}
+			if (parsed.output)
+				blocks.push({
+					kind: "code-panel",
+					title: taskId ? `TaskOutput ${taskId}` : "TaskOutput",
+					text: parsed.output,
+					maxLines: 10,
+				});
+			else outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "agent": {
+			const type = extractField(inputJson, "subagent_type");
+			const description = extractField(inputJson, "description");
+			const model = extractField(inputJson, "model");
+			const prompt = extractField(inputJson, "prompt");
+			const badges = [
+				type ? badge(type, "indigo") : null,
+				model ? badge(model, "gray", "outline") : null,
+			].filter(Boolean) as PixiToolBadgeModel[];
+			if (badges.length) blocks.push({ kind: "badge-row", badges });
+			if (description)
+				blocks.push({ kind: "result-card", title: "Task", text: description, color: "indigo" });
+			if (prompt) blocks.push({ kind: "code-panel", title: "Prompt", text: prompt, maxLines: 8 });
+			outputPanel(blocks, outputJson, "code-panel", "Result");
+			break;
+		}
+		case "plan": {
+			const plan = extractField(inputJson, "plan");
+			const denied = String(meta.permissionDenyMessage ?? "");
+			if (denied) blocks.push({ kind: "text-line", text: denied, color: "yellow" });
+			if (plan)
+				blocks.push({ kind: "code-panel", title: `Plan — ${toolName}`, text: plan, maxLines: 14 });
+			else outputPanel(blocks, outputJson, "code-panel", "Output");
+			break;
+		}
+		case "ask": {
+			const summaries = coerceQuestionSummary(objectValue(inputJson, "questions"));
+			const answers = asRecord(objectValue(inputJson, "answers")) ?? {};
+			for (const question of summaries) {
+				blocks.push({
+					kind: "result-card",
+					title: question.header,
+					subtitle: String(answers[question.header] ?? ""),
+					text: question.question,
+					color: "blue",
+				});
+			}
+			if (summaries.length === 0) inputPanel(blocks, inputJson, "Questions", 8);
+			break;
+		}
+		default:
+			inputPanel(blocks, inputJson, `${toolName} Input`, 6);
+			outputPanel(blocks, outputJson, "code-panel", `${toolName} Output`, 8);
+	}
+	if (errorMessage) blocks.unshift({ kind: "text-line", text: errorMessage, color: "red" });
+	return blocks.slice(0, 14);
+}
+
+function buildToolDetailLines(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+): PixiToolDetailLineModel[] {
+	const category = getCategory(toolName);
+	const lines: PixiToolDetailLineModel[] = [];
+	const filePath = getFilePath(inputJson);
+	switch (category) {
+		case "bash": {
+			const command = extractField(inputJson, "command");
+			if (command) lines.push({ label: "cmd", text: command, kind: "code" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "read":
+		case "file": {
+			if (filePath) lines.push({ label: "file", text: filePath, kind: "muted" });
+			if (toolName === "Edit" || toolName === "MultiEdit") {
+				const oldString = extractField(inputJson, "old_string");
+				const newString = extractField(inputJson, "new_string");
+				if (oldString)
+					lines.push({ label: "old", text: truncateLine(oldString, 120), kind: "code" });
+				if (newString)
+					lines.push({ label: "new", text: truncateLine(newString, 120), kind: "code" });
+			} else if (toolName === "Write") {
+				const content = extractField(inputJson, "content");
+				if (content)
+					lines.push({
+						label: "content",
+						text: `${content.length.toLocaleString()} chars`,
+						kind: "muted",
+					});
+			}
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "search": {
+			const pattern = extractField(inputJson, "pattern", "glob");
+			const path = extractField(inputJson, "path");
+			if (pattern) lines.push({ label: "pattern", text: pattern, kind: "code" });
+			if (path) lines.push({ label: "path", text: path, kind: "muted" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "webSearch":
+		case "webFetch":
+		case "browser": {
+			const query = extractField(inputJson, "query");
+			const url = extractField(inputJson, "url");
+			const mode = extractField(inputJson, "mode", "action");
+			if (query) lines.push({ label: "query", text: query, kind: "text" });
+			if (url) lines.push({ label: "url", text: url, kind: "muted" });
+			if (mode) lines.push({ label: "mode", text: mode, kind: "muted" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "agent": {
+			const type = extractField(inputJson, "subagent_type");
+			const desc = extractField(inputJson, "description");
+			const model = extractField(inputJson, "model");
+			if (type) lines.push({ label: "type", text: type, kind: "muted" });
+			if (desc) lines.push({ label: "task", text: desc, kind: "text" });
+			if (model) lines.push({ label: "model", text: model, kind: "muted" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "todo": {
+			const todos = objectValue(inputJson, "todos");
+			if (Array.isArray(todos)) lines.push({ text: `${todos.length} todo item(s)`, kind: "muted" });
+			break;
+		}
+		case "goal": {
+			const objective = extractField(inputJson, "objective");
+			if (objective) lines.push({ label: "goal", text: objective, kind: "text" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		case "await":
+		case "send":
+		case "ask":
+		case "terminal":
+		case "share":
+		case "skill":
+		case "recall": {
+			const summary = getSummary(toolName, inputJson);
+			if (summary) lines.push({ text: summary, kind: "text" });
+			addOutputLines(lines, outputJson);
+			break;
+		}
+		default:
+			addOutputLines(lines, outputJson);
+	}
+	return lines.slice(0, 5);
+}
+
+function buildToolUseBlock(
+	item: {
+		tc: {
+			toolName: string;
+			status?: string;
+			durationMs?: number;
+			errorMessage?: string;
+			inputJson: unknown;
+			outputJson?: unknown;
+			_metadata?: Record<string, unknown>;
+		};
+		children: unknown[];
+		isSubagent?: boolean;
+	},
+	inRun: boolean,
+	isLast: boolean,
+): PixiMessageBlockModel {
+	const status = item.tc.status ?? "running";
+	const category = getCategory(item.tc.toolName);
+	// Pixi currently renders chevrons but does not have pointer hit-testing / expand state yet.
+	// Keep details visible by default so tool outputs remain inspectable in Pixi mode.
+	const defaultOpen = true;
+	const detailBlocks = buildToolDetailBlocks(
+		item.tc.toolName,
+		item.tc.inputJson,
+		item.tc.outputJson,
+		item.tc._metadata,
+		item.tc.errorMessage,
+	);
+	const detailLines = buildToolDetailLines(item.tc.toolName, item.tc.inputJson, item.tc.outputJson);
+	if (item.tc.errorMessage) {
+		detailLines.unshift({ text: item.tc.errorMessage, kind: "error" });
+	}
+	if (item.children.length > 0) {
+		detailLines.push({ text: `${item.children.length} child message(s)`, kind: "muted" });
+		detailBlocks.push({
+			text: `${item.children.length} child message(s)`,
+			kind: "text-line",
+			muted: true,
+		});
+	}
+	const summary = getSummary(item.tc.toolName, item.tc.inputJson, item.tc._metadata);
+	return {
+		type: "tool_use",
+		label: item.isSubagent ? "Agent" : item.tc.toolName,
+		text: summary || status,
+		color: statusColor(status),
+		toolName: item.tc.toolName,
+		toolCategory: item.isSubagent ? "agent" : category,
+		toolSummary: summary,
+		toolStatus: status,
+		toolDuration:
+			item.tc.durationMs != null ? formatCompletedDuration(item.tc.durationMs) : undefined,
+		toolStatusColor: statusColor(status),
+		toolCategoryColor: getCategoryColor(item.isSubagent ? "agent" : category),
+		toolDetailLines: detailLines,
+		toolDetailBlocks: detailBlocks,
+		toolChildCount: item.children.length,
+		toolIsSubagent: item.isSubagent,
+		toolInRun: inRun,
+		toolIsLast: isLast,
+		toolDefaultOpen: defaultOpen,
+	};
+}
+
 function messageItem(
 	msg: NarratorMsg,
 	key: string,
@@ -273,30 +1088,16 @@ export function buildPixiMessageItems(opts: BuildPixiMessageItemsOptions): PixiM
 			continue;
 		}
 		const first = seg.sourceMessages[0];
-		const title =
-			seg.items.length === 1
-				? `Tool · ${seg.items[0].tc.toolName}`
-				: `Tool run · ${seg.items.length} tools`;
+		const inRun = seg.items.length >= 2;
 		items.push({
 			key: uniqueKey(`tool-run-${first?.id ?? items.length}`),
 			kind: "tool-run",
 			targetIds: collectSegmentTargetIds(seg),
 			role: "assistant",
-			title,
-			blocks: seg.items.map((item) => {
-				const status = item.tc.status ?? "running";
-				const duration = item.tc.durationMs != null ? ` · ${Math.round(item.tc.durationMs)}ms` : "";
-				const childInfo =
-					item.children.length > 0 ? ` · ${item.children.length} child message(s)` : "";
-				const error = item.tc.errorMessage ? `\n${item.tc.errorMessage}` : "";
-				const output = item.tc.outputJson ? `\n${safeJsonSummary(item.tc.outputJson, 220)}` : "";
-				return {
-					type: "tool_use",
-					label: item.isSubagent ? "Agent" : item.tc.toolName,
-					text: `${status}${duration}${childInfo}${error}${output}`,
-					color: status === "error" ? "red" : status === "completed" ? "green" : "yellow",
-				};
-			}),
+			title: "",
+			blocks: seg.items.map((item, index) =>
+				buildToolUseBlock(item, inRun, index === seg.items.length - 1),
+			),
 		});
 	}
 	if (opts.showConclusionButton) {

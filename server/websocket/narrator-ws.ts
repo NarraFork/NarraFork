@@ -17,10 +17,19 @@ import { logger } from "../lib/logger";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
-import type { LoadToolNotFound, LoadToolResult } from "../services/command-service";
+import type {
+	LoadToolNotFound,
+	LoadToolResult,
+	UnloadToolNotFound,
+	UnloadToolResult,
+} from "../services/command-service";
 import { resolveCommand } from "../services/command-service";
 import { getStreamingSnapshot } from "../services/narrator-event-handler";
-import { handleLoadToolCommand, narratorService } from "../services/narrator-service";
+import {
+	handleLoadToolCommand,
+	handleUnloadToolCommand,
+	narratorService,
+} from "../services/narrator-service";
 import {
 	clearBufferedMessages,
 	getBufferedMessages,
@@ -740,6 +749,18 @@ export const handleNarratorWS = {
 								cmdResult as LoadToolResult | LoadToolNotFound,
 								locale,
 								userId,
+							);
+							return;
+						}
+						if (
+							cmdResult.resolved &&
+							("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)
+						) {
+							const locale = await getUserLanguage(userId);
+							await handleUnloadToolCommand(
+								msg.narratorId,
+								cmdResult as UnloadToolResult | UnloadToolNotFound,
+								locale,
 							);
 							return;
 						}

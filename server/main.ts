@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
-import { db } from "./db";
+import { db, markDatabaseCleanShutdown } from "./db";
 import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import {
@@ -828,7 +828,7 @@ async function performGracefulShutdown(
 
 		// Terminate all WebSocket connections first — this sends TCP RST so the
 		// OS releases the sockets immediately instead of lingering in FIN_WAIT_2
-		// / CLOSE_WAIT.  Must happen before _server.stop() which may wait for
+		// / CLOSE_WAIT. Must happen before _server.stop() which may wait for
 		// graceful close on active connections.
 		closeAllConnections();
 
@@ -857,6 +857,11 @@ async function performGracefulShutdown(
 			})(),
 			new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS)),
 		]);
+
+		// Mark the main DB clean before reporting graceful shutdown complete.
+		// The update handoff starts the replacement process before this process exits,
+		// so relying on the process "exit" handler is too late for that path.
+		markDatabaseCleanShutdown();
 
 		// Stop the HTTP server — force-close any remaining connections so the
 		// listening socket is released immediately.

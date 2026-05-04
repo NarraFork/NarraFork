@@ -51,6 +51,18 @@ export interface LoadToolNotFound {
 	rawCommand: string;
 }
 
+export interface UnloadToolResult {
+	resolved: true;
+	unloadTool: string;
+	rawCommand: string;
+}
+
+export interface UnloadToolNotFound {
+	resolved: true;
+	unloadToolNotFound: string;
+	rawCommand: string;
+}
+
 export interface LoadSkillResult {
 	resolved: true;
 	loadSkill: string;
@@ -79,6 +91,8 @@ export type ResolveResult =
 	| CommandNotResolved
 	| LoadToolResult
 	| LoadToolNotFound
+	| UnloadToolResult
+	| UnloadToolNotFound
 	| LoadSkillResult
 	| BashCommandResult
 	| GoalCommandResult;
@@ -227,6 +241,16 @@ function replaceCommandPlaceholders(template: string, values: Record<string, str
 	return result;
 }
 
+function resolveBuiltinToolById(toolId: string) {
+	return getBuiltinToolRoutines().find((r) => r.id === toolId && r.tool);
+}
+
+export function getAvailableOptionalToolIds(): string[] {
+	return getBuiltinToolRoutines()
+		.filter((r) => r.tool)
+		.map((r) => r.id);
+}
+
 /**
  * Check if a prompt is a slash command and resolve it.
  * Returns the expanded prompt text if matched, or null.
@@ -243,12 +267,22 @@ export async function resolveCommand(
 	if (parsed.name.toLowerCase() === "load") {
 		const toolId = parsed.input.trim().toLowerCase();
 		if (!toolId) return { resolved: false };
-		// Match against builtin tool routines by id
-		const toolRoutine = getBuiltinToolRoutines().find((r) => r.id === toolId);
+		const toolRoutine = resolveBuiltinToolById(toolId);
 		if (toolRoutine?.tool) {
 			return { resolved: true, loadTool: toolRoutine.tool.toolName, rawCommand: prompt };
 		}
 		return { resolved: true, loadToolNotFound: toolId, rawCommand: prompt };
+	}
+
+	// Handle /unload <toolName> — unload an optional tool from the session
+	if (parsed.name.toLowerCase() === "unload") {
+		const toolId = parsed.input.trim().toLowerCase();
+		if (!toolId) return { resolved: false };
+		const toolRoutine = resolveBuiltinToolById(toolId);
+		if (toolRoutine?.tool) {
+			return { resolved: true, unloadTool: toolRoutine.tool.toolName, rawCommand: prompt };
+		}
+		return { resolved: true, unloadToolNotFound: toolId, rawCommand: prompt };
 	}
 
 	// Handle /skill <name> [input] — directly inject skill content into the message

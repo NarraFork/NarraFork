@@ -68,7 +68,7 @@ export async function agentGenerateWithMeta(
 	systemInstruction?: string,
 	options?: GenerateOptions,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
-): Promise<{ text: string; contextPercent?: number }> {
+): Promise<import("./provider").GenerateMetaResult> {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const resolved = resolveProviderAndModel(requestedModel);
 	const generate = () =>
@@ -95,15 +95,43 @@ export async function agentGenerateWithHistory(
 	locale?: string,
 	options?: GenerateOptions,
 ): Promise<string> {
-	const requestedModel = model ?? settings.agent.defaultModel;
-	const resolved = resolveProviderAndModel(requestedModel);
-	return resolved.adapter.generateWithHistory(
+	const result = await agentGenerateWithHistoryWithMeta(
 		systemInstruction,
 		content,
-		resolved.model,
+		model,
 		locale,
 		options,
 	);
+	return result.text;
+}
+
+export async function agentGenerateWithHistoryWithMeta(
+	systemInstruction: string,
+	content: string,
+	model?: string,
+	locale?: string,
+	options?: GenerateOptions,
+): Promise<import("./provider").GenerateMetaResult> {
+	const requestedModel = model ?? settings.agent.defaultModel;
+	const resolved = resolveProviderAndModel(requestedModel);
+	if (resolved.adapter.generateWithHistoryWithMeta) {
+		return resolved.adapter.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			resolved.model,
+			locale,
+			options,
+		);
+	}
+	return {
+		text: await resolved.adapter.generateWithHistory(
+			systemInstruction,
+			content,
+			resolved.model,
+			locale,
+			options,
+		),
+	};
 }
 
 // === Summary model wrappers ===
@@ -235,7 +263,7 @@ export async function summaryGenerate(
 	text: string,
 	systemInstruction?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
-): Promise<{ text: string; contextPercent?: number }> {
+): Promise<import("./provider").GenerateMetaResult> {
 	return withSummaryRetry(() =>
 		agentGenerateWithMeta(
 			text,
@@ -258,15 +286,14 @@ export async function summaryGenerateWithHistory(
 	locale?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<string> {
-	const generate = async () => ({
-		text: await agentGenerateWithHistory(
+	const generate = () =>
+		agentGenerateWithHistoryWithMeta(
 			systemInstruction,
 			content,
 			settings.agent.summaryModel,
 			locale,
 			SUMMARY_GENERATE_OPTIONS,
-		),
-	});
+		);
 	const result = await withSummaryRetry(async () => {
 		if (!tracking) return generate();
 		const resolved = resolveProviderAndModel(settings.agent.summaryModel);

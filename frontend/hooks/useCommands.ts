@@ -33,37 +33,53 @@ export function useNarratorCommands(narratorId: string | undefined) {
 			const toolItems = data.tools ?? [];
 			const items: CommandItem[] = [...commands, ...skills];
 
-			// Add a single "/load" entry when tools are available
+			// Add "/load" and "/unload" entries when optional tools are available
 			if (toolItems.length > 0) {
-				const toolNames = toolItems
-					.map(
-						(t: { id: string; toolName: string; descriptionEn: string; descriptionZh: string }) =>
-							t.id,
-					)
-					.join(", ");
-				items.push({
-					name: "load",
-					prompt: "",
-					description: isZh
-						? `加载可选工具到当前会话 (${toolNames})`
-						: `Load an optional tool into the session (${toolNames})`,
-					source: "builtin",
-					type: "tool" as const,
-				});
-				// Add sub-items for each tool: "load <id>"
-				for (const t of toolItems as Array<{
+				const typedToolItems = toolItems as Array<{
 					id: string;
 					toolName: string;
 					descriptionEn: string;
 					descriptionZh: string;
-				}>) {
-					items.push({
-						name: `load ${t.id}`,
+				}>;
+				const toolNames = typedToolItems.map((t) => t.id).join(", ");
+				items.push(
+					{
+						name: "load",
 						prompt: "",
-						description: isZh ? t.descriptionZh : t.descriptionEn,
+						description: isZh
+							? `加载可选工具到当前会话 (${toolNames})`
+							: `Load an optional tool into the session (${toolNames})`,
 						source: "builtin",
 						type: "tool" as const,
-					});
+					},
+					{
+						name: "unload",
+						prompt: "",
+						description: isZh
+							? `从当前会话卸载可选工具 (${toolNames})`
+							: `Unload an optional tool from the session (${toolNames})`,
+						source: "builtin",
+						type: "tool" as const,
+					},
+				);
+				// Add sub-items for each tool: "load <id>" and "unload <id>"
+				for (const t of typedToolItems) {
+					items.push(
+						{
+							name: `load ${t.id}`,
+							prompt: "",
+							description: isZh ? t.descriptionZh : t.descriptionEn,
+							source: "builtin",
+							type: "tool" as const,
+						},
+						{
+							name: `unload ${t.id}`,
+							prompt: "",
+							description: isZh ? t.descriptionZh : t.descriptionEn,
+							source: "builtin",
+							type: "tool" as const,
+						},
+					);
 				}
 			}
 

@@ -1646,12 +1646,12 @@ export function NarratorPanel({
 		input.startsWith("/") ? narratorId : undefined,
 	);
 	// Show command popover only when typing command name (no space yet),
-	// or when typing "/load <tool>" sub-completion.
+	// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
 	// Suppress when browsing input history so arrow keys keep navigating history.
 	const commandPopoverVisible =
 		input.startsWith("/") &&
 		!input.includes("\n") &&
-		(!input.includes(" ") || /^\/load\s\S*$/i.test(input)) &&
+		(!input.includes(" ") || /^\/(?:load|unload)\s\S*$/i.test(input)) &&
 		(commandsList?.length ?? 0) > 0 &&
 		!inputHistory.isBrowsing;
 	// Matched command for param helper (after space is typed)

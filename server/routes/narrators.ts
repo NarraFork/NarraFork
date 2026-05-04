@@ -94,6 +94,8 @@ import type {
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
+	UnloadToolNotFound,
+	UnloadToolResult,
 } from "../services/command-service";
 import { getSlashMenuItems, resolveCommand } from "../services/command-service";
 import {
@@ -110,6 +112,7 @@ import {
 	handleBashCommand,
 	handleLoadSkillCommand,
 	handleLoadToolCommand,
+	handleUnloadToolCommand,
 	narratorService,
 } from "../services/narrator-service";
 import {
@@ -598,6 +601,15 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			cmdResult as LoadToolResult | LoadToolNotFound,
 			locale,
 			userId,
+		);
+		return c.json(result, 200);
+	}
+	if (cmdResult.resolved && ("unloadTool" in cmdResult || "unloadToolNotFound" in cmdResult)) {
+		const locale = await getUserLanguage(userId);
+		const result = await handleUnloadToolCommand(
+			id,
+			cmdResult as UnloadToolResult | UnloadToolNotFound,
+			locale,
 		);
 		return c.json(result, 200);
 	}

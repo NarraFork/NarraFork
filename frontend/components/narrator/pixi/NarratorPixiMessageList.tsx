@@ -1,20 +1,26 @@
+import { clearCache as clearPretextCache, setLocale as setPretextLocale } from "@chenglou/pretext";
+import i18n from "@frontend/lib/i18n";
 import { Application, Container, Graphics } from "pixi.js";
 import {
 	forwardRef,
+	type MutableRefObject,
 	type RefObject,
 	useCallback,
 	useEffect,
 	useImperativeHandle,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
 } from "react";
 import { getRenderableMessageOrder } from "../message-order-utils";
 import type { MessagesQueryData, NarratorMsg } from "../narrator-panel-types";
-import { drawPixiMessages } from "./pixi-message-draw";
-import { layoutPixiMessageItems } from "./pixi-message-layout";
+import { drawPixiMessages, TextPool } from "./pixi-message-draw";
+import { clearPixiMessageLayoutCache, layoutPixiMessageItems } from "./pixi-message-layout";
 import { buildPixiMessageItems } from "./pixi-message-model";
-import { resolvePixiMessageTheme } from "./pixi-message-theme";
+import { invalidatePixiMessageThemeCache, resolvePixiMessageTheme } from "./pixi-message-theme";
+import { subscribePixiShikiHighlights } from "./pixi-shiki-highlight";
+import { IconSpritePool, subscribePixiTablerIconLoads } from "./pixi-tabler-icons";
 
 export interface NarratorPixiMessageListHandle {
 	scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" }) => void;
@@ -45,6 +51,10 @@ function destroyPixiApplication(app: Application): void {
 	app.destroy(true, { children: true });
 }
 
+function isViewportAtBottom(viewport: HTMLElement): boolean {
+	return viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 30;
+}
+
 export const NarratorPixiMessageList = forwardRef<
 	NarratorPixiMessageListHandle,
 	NarratorPixiMessageListProps
@@ -61,6 +71,7 @@ export const NarratorPixiMessageList = forwardRef<
 		highlightedId,
 		scrollRef,
 		contentRef,
+		shift,
 	},
 	ref,
 ) {
@@ -70,9 +81,19 @@ export const NarratorPixiMessageList = forwardRef<
 	const appRef = useRef<Application | null>(null);
 	const stageContainerRef = useRef<Container | null>(null);
 	const gfxRef = useRef<Graphics | null>(null);
+	const textPoolRef = useRef<TextPool | null>(null);
+	const iconPoolRef = useRef<IconSpritePool | null>(null);
 	const [ready, setReady] = useState(false);
 	const [size, setSize] = useState({ width: 0, height: 0 });
 	const [scrollTop, setScrollTop] = useState(0);
+	const [themeVersion, setThemeVersion] = useState(0);
+	const [layoutVersion, setLayoutVersion] = useState(0);
+	const [dprVersion, setDprVersion] = useState(0);
+	const [iconVersion, setIconVersion] = useState(0);
+	const [highlightVersion, setHighlightVersion] = useState(0);
+	const isAtBottomRef = useRef(true);
+	const prevTotalHeightRef = useRef(0);
+	const prevFirstKeyRef = useRef<string | null>(null);
 
 	const orderedMessages = useMemo(() => {
 		if (!messagesData?.pages?.length) return [];
@@ -107,10 +128,22 @@ export const NarratorPixiMessageList = forwardRef<
 		],
 	);
 
-	const layout = useMemo(
-		() => layoutPixiMessageItems(items, Math.max(1, size.width)),
-		[items, size.width],
-	);
+	const refreshTheme = useCallback(() => {
+		invalidatePixiMessageThemeCache();
+		setThemeVersion((version) => version + 1);
+	}, []);
+
+	const refreshLayoutLocale = useCallback((locale?: string | null) => {
+		setPretextLocale(locale || undefined);
+		clearPretextCache();
+		clearPixiMessageLayoutCache();
+		setLayoutVersion((version) => version + 1);
+	}, []);
+
+	const layout = useMemo(() => {
+		void layoutVersion;
+		return layoutPixiMessageItems(items, Math.max(1, size.width));
+	}, [items, size.width, layoutVersion]);
 
 	const setViewportNode = useCallback(
 		(node: HTMLDivElement | null) => {
@@ -118,17 +151,19 @@ export const NarratorPixiMessageList = forwardRef<
 			if (typeof scrollRef === "function") {
 				scrollRef(node);
 			} else if (scrollRef) {
-				(scrollRef as React.MutableRefObject<HTMLElement | null>).current = node;
+				(scrollRef as MutableRefObject<HTMLElement | null>).current = node;
 			}
 		},
 		[scrollRef],
 	);
 
-	useEffect(() => {
-		if (contentRef && spacerRef.current) {
-			(contentRef as React.MutableRefObject<HTMLDivElement | null>).current = spacerRef.current;
-		}
-	}, [contentRef]);
+	const setSpacerNode = useCallback(
+		(node: HTMLDivElement | null) => {
+			spacerRef.current = node;
+			(contentRef as MutableRefObject<HTMLDivElement | null>).current = node;
+		},
+		[contentRef],
+	);
 
 	useEffect(() => {
 		const viewport = viewportRef.current;
@@ -145,10 +180,114 @@ export const NarratorPixiMessageList = forwardRef<
 	useEffect(() => {
 		const viewport = viewportRef.current;
 		if (!viewport) return;
-		const onScroll = () => setScrollTop(viewport.scrollTop);
+		const onScroll = () => {
+			setScrollTop(viewport.scrollTop);
+			isAtBottomRef.current = isViewportAtBottom(viewport);
+		};
 		onScroll();
 		viewport.addEventListener("scroll", onScroll, { passive: true });
 		return () => viewport.removeEventListener("scroll", onScroll);
+	}, []);
+
+	useLayoutEffect(() => {
+		const previousTotalHeight = prevTotalHeightRef.current;
+		const previousFirstKey = prevFirstKeyRef.current;
+		const nextTotalHeight = layout.totalHeight;
+		const nextFirstKey = layout.items[0]?.item.key ?? null;
+		const heightDelta = nextTotalHeight - previousTotalHeight;
+		const viewport = viewportRef.current;
+
+		if (viewport) {
+			const prependedItems =
+				shift === true &&
+				previousFirstKey !== null &&
+				nextFirstKey !== previousFirstKey &&
+				heightDelta > 0;
+
+			if (prependedItems) {
+				viewport.scrollTop += heightDelta;
+				setScrollTop(viewport.scrollTop);
+				isAtBottomRef.current = isViewportAtBottom(viewport);
+			} else if (isAtBottomRef.current) {
+				viewport.scrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+				setScrollTop(viewport.scrollTop);
+				isAtBottomRef.current = true;
+			}
+		}
+
+		prevTotalHeightRef.current = nextTotalHeight;
+		prevFirstKeyRef.current = nextFirstKey;
+	}, [layout, shift]);
+
+	useEffect(() => {
+		const observer = new MutationObserver((mutations) => {
+			const hasThemeChange = mutations.some(
+				(mutation) =>
+					mutation.attributeName === "data-mantine-color-scheme" ||
+					mutation.attributeName === "data-oled",
+			);
+			if (hasThemeChange) refreshTheme();
+		});
+		observer.observe(document.documentElement, {
+			attributes: true,
+			attributeFilter: ["data-mantine-color-scheme", "data-oled"],
+		});
+		return () => observer.disconnect();
+	}, [refreshTheme]);
+
+	useEffect(() => {
+		const onStorage = (event: StorageEvent) => {
+			if (event.key === "narrafork_oled") {
+				refreshTheme();
+				return;
+			}
+			if (event.key === "narrafork_lang") {
+				refreshLayoutLocale(event.newValue ?? i18n.language);
+			}
+		};
+		window.addEventListener("storage", onStorage);
+		return () => window.removeEventListener("storage", onStorage);
+	}, [refreshLayoutLocale, refreshTheme]);
+
+	useEffect(() => {
+		const readCurrentLanguage = () => {
+			try {
+				return localStorage.getItem("narrafork_lang") ?? i18n.language;
+			} catch {
+				return i18n.language;
+			}
+		};
+		const onLanguageChanged = (language: string) => refreshLayoutLocale(language);
+		refreshLayoutLocale(readCurrentLanguage());
+		i18n.on("languageChanged", onLanguageChanged);
+		return () => {
+			i18n.off("languageChanged", onLanguageChanged);
+		};
+	}, [refreshLayoutLocale]);
+
+	useEffect(() => {
+		return subscribePixiTablerIconLoads(() => setIconVersion((version) => version + 1));
+	}, []);
+
+	useEffect(() => {
+		return subscribePixiShikiHighlights(() => setHighlightVersion((version) => version + 1));
+	}, []);
+
+	useEffect(() => {
+		let removeCurrentListener: (() => void) | null = null;
+		const attachDprListener = () => {
+			const dpr = window.devicePixelRatio || 1;
+			const media = window.matchMedia(`(resolution: ${dpr}dppx)`);
+			const onChange = () => {
+				removeCurrentListener?.();
+				setDprVersion((version) => version + 1);
+				attachDprListener();
+			};
+			media.addEventListener("change", onChange);
+			removeCurrentListener = () => media.removeEventListener("change", onChange);
+		};
+		attachDprListener();
+		return () => removeCurrentListener?.();
 	}, []);
 
 	useEffect(() => {
@@ -187,6 +326,8 @@ export const NarratorPixiMessageList = forwardRef<
 				app.stage.addChild(container);
 				stageContainerRef.current = container;
 				gfxRef.current = gfx;
+				textPoolRef.current = new TextPool(container);
+				iconPoolRef.current = new IconSpritePool(container);
 				setReady(true);
 			});
 		return () => {
@@ -195,20 +336,45 @@ export const NarratorPixiMessageList = forwardRef<
 			appRef.current = null;
 			stageContainerRef.current = null;
 			gfxRef.current = null;
+			textPoolRef.current = null;
+			iconPoolRef.current = null;
 		};
 		// init once; resize is handled below
 	}, []);
 
 	useEffect(() => {
+		void dprVersion;
 		const app = appRef.current;
-		if (!app?.renderer) return;
-		app.renderer.resize(Math.max(1, size.width), Math.max(1, size.height));
-	}, [size]);
+		if (!ready || !app?.renderer) return;
+		app.renderer.resize(
+			Math.max(1, size.width),
+			Math.max(1, size.height),
+			window.devicePixelRatio || 1,
+		);
+	}, [ready, size, dprVersion]);
 
 	useEffect(() => {
-		if (!ready || !appRef.current || !stageContainerRef.current || !gfxRef.current) return;
+		void themeVersion;
+		void dprVersion;
+		void iconVersion;
+		void highlightVersion;
+		if (
+			!ready ||
+			!appRef.current ||
+			!stageContainerRef.current ||
+			!gfxRef.current ||
+			!textPoolRef.current ||
+			!iconPoolRef.current
+		) {
+			return;
+		}
+		const textPool = textPoolRef.current;
+		const iconPool = iconPoolRef.current;
+		textPool.reset();
+		iconPool.reset();
 		drawPixiMessages({
-			container: stageContainerRef.current,
+			textPool,
+			iconPool,
 			gfx: gfxRef.current,
 			items: layout.items,
 			theme: resolvePixiMessageTheme(),
@@ -216,8 +382,20 @@ export const NarratorPixiMessageList = forwardRef<
 			viewportHeight: size.height,
 			highlightedId,
 		});
+		textPool.releaseUnused();
+		iconPool.releaseUnused();
 		appRef.current.render();
-	}, [ready, layout, scrollTop, size.height, highlightedId]);
+	}, [
+		ready,
+		layout,
+		scrollTop,
+		size.height,
+		highlightedId,
+		themeVersion,
+		dprVersion,
+		iconVersion,
+		highlightVersion,
+	]);
 
 	useImperativeHandle(
 		ref,
@@ -268,7 +446,7 @@ export const NarratorPixiMessageList = forwardRef<
 				}}
 			/>
 			<div
-				ref={spacerRef}
+				ref={setSpacerNode}
 				style={{
 					height: Math.max(size.height, layout.totalHeight),
 					marginTop: -(size.height || 0),

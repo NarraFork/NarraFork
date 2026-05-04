@@ -6,11 +6,13 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { AnthropicProviderConfig } from "../settings";
 import { getModelContextWindow, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
+import { extractAnthropicUsage } from "../usage-tracking";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
 	ChatParams,
 	DbMessage,
+	GenerateMetaResult,
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
@@ -1168,7 +1170,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		model: string,
 		systemInstruction?: string,
 		options?: GenerateOptions,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<GenerateMetaResult> {
 		const apiKey = this.config.apiKey;
 
 		if (!apiKey) {
@@ -1236,6 +1238,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		return {
 			text: resultText,
 			contextPercent: calculateAnthropicContextPercent(json.usage, bareModel, this.config),
+			usage: json.usage ? extractAnthropicUsage(json.usage) : null,
 		};
 	}
 
@@ -1246,6 +1249,23 @@ export class AnthropicProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string> {
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+			options,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: GenerateOptions,
+	): Promise<GenerateMetaResult> {
 		const apiKey = this.config.apiKey;
 
 		if (!apiKey) {
@@ -1301,14 +1321,18 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		const json = (await response.json()) as {
 			content?: Array<{ type?: string; text?: string }>;
+			usage?: AnthropicUsagePayload;
 		};
 
-		return (
-			json.content
-				?.filter((c) => c.type === "text")
-				.map((c) => c.text ?? "")
-				.join("") ?? ""
-		);
+		return {
+			text:
+				json.content
+					?.filter((c) => c.type === "text")
+					.map((c) => c.text ?? "")
+					.join("") ?? "",
+			contextPercent: calculateAnthropicContextPercent(json.usage, bareModel, this.config),
+			usage: json.usage ? extractAnthropicUsage(json.usage) : null,
+		};
 	}
 }
 

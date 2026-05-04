@@ -85,13 +85,14 @@ export function CommandPopover({
 	// Filter commands based on input after /
 	const query = input.startsWith("/") ? input.slice(1).toLowerCase() : "";
 	const filtered = useMemo(() => {
-		// When query starts with "load " (with space), show only the sub-items (load <tool>)
-		if (query.startsWith("load ")) {
+		// When query starts with "load "/"unload ", show only matching sub-items.
+		if (query.startsWith("load ") || query.startsWith("unload ")) {
+			const parent = query.startsWith("load ") ? "load" : "unload";
 			return commands.filter(
-				(c) => c.name.toLowerCase().startsWith(query) && c.name.toLowerCase() !== "load",
+				(c) => c.name.toLowerCase().startsWith(query) && c.name.toLowerCase() !== parent,
 			);
 		}
-		// Otherwise, hide the sub-items (load <tool>) and only show the parent /load entry
+		// Otherwise, hide the sub-items (load <tool>/unload <tool>) and only show parent entries
 		return commands.filter((c) => {
 			if (c.type === "tool" && c.name.includes(" ")) return false;
 			return c.name.toLowerCase().startsWith(query);

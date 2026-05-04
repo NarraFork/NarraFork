@@ -5,11 +5,11 @@ import {
 	startWalCheckpointInterval,
 	tryWalRecovery,
 } from "../lib/db-resilience";
-import { hotOnce, hotTimer } from "../lib/hot-safe";
+import { hotOnce, hotSafe, hotTimer } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
-import { ensureFts } from "./fts";
+import { ensureFts, markCleanShutdown } from "./fts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
 import * as schema from "./schema";
@@ -17,6 +17,16 @@ import * as schema from "./schema";
 const dbPath = getDbPath();
 
 let sqlite = openDatabase();
+
+const dbLifecycle = hotSafe("narrafork.dbLifecycle", () => ({
+	initialized: false,
+	cleanMarked: false,
+	sqlite: undefined as typeof sqlite | undefined,
+	walCheckpointTimer: undefined as ReturnType<typeof setInterval> | undefined,
+}));
+const isHotReload = dbLifecycle.initialized;
+dbLifecycle.sqlite = sqlite;
+dbLifecycle.cleanMarked = false;
 
 // Startup integrity check — detect corruption early
 const integrity = checkIntegrity(sqlite);
@@ -32,6 +42,7 @@ if (!integrity.ok) {
 		sqlite.close();
 		const recovered = recoverWithCli(dbPath);
 		sqlite = openDatabase();
+		dbLifecycle.sqlite = sqlite;
 		if (recovered && checkIntegrity(sqlite).ok) {
 			logger.info("Database recovered via sqlite3 CLI .recover");
 		} else {
@@ -179,25 +190,33 @@ ensureColumns(sqlite);
 }
 
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
-ensureFts(sqlite);
+ensureFts(sqlite, { skipUncleanShutdownRebuild: isHotReload });
+dbLifecycle.initialized = true;
 
 // Periodic WAL checkpoint to prevent WAL file bloat and reduce corruption risk.
 // hotTimer clears the previous interval on Bun --hot reloads before creating a new one.
 const walCheckpointTimer = hotTimer("narrafork.walCheckpointTimer", () =>
 	startWalCheckpointInterval(sqlite),
 );
+dbLifecycle.walCheckpointTimer = walCheckpointTimer;
+
+export function markDatabaseCleanShutdown(): void {
+	if (dbLifecycle.cleanMarked) return;
+	if (dbLifecycle.walCheckpointTimer) clearInterval(dbLifecycle.walCheckpointTimer);
+	const currentSqlite = dbLifecycle.sqlite;
+	if (!currentSqlite) return;
+	try {
+		markCleanShutdown(currentSqlite);
+		dbLifecycle.cleanMarked = true;
+	} catch (err) {
+		logger.warn("Failed to mark database clean shutdown", { error: String(err) });
+	}
+}
 
 // Clean up on process exit — hotOnce prevents duplicate handler accumulation on hot reloads.
 if (hotOnce("narrafork.walExitHandler")) {
 	process.on("exit", () => {
-		clearInterval(walCheckpointTimer);
-		try {
-			sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
-			// Mark clean shutdown so next startup can skip FTS rebuild
-			sqlite.run("PRAGMA application_id = 0x4E465243"); // "NFRC" = NarraFork Clean
-		} catch {
-			// best-effort on exit
-		}
+		markDatabaseCleanShutdown();
 	});
 }
 

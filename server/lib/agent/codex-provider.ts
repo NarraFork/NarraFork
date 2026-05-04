@@ -22,6 +22,7 @@ import {
 import type {
 	ChatParams,
 	DbMessage,
+	GenerateMetaResult,
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
@@ -554,7 +555,7 @@ export class CodexProvider implements ProviderAdapter {
 		model: string,
 		systemInstruction?: string,
 		options?: GenerateOptions,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<GenerateMetaResult> {
 		return this.runWithFailover("generateWithMeta", (provider) =>
 			provider.generateWithMeta(text, model, systemInstruction, options),
 		);
@@ -567,8 +568,25 @@ export class CodexProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string> {
-		return this.runWithFailover("generateWithHistory", (provider) =>
-			provider.generateWithHistory(systemInstruction, content, model, locale, options),
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+			options,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: GenerateOptions,
+	): Promise<GenerateMetaResult> {
+		return this.runWithFailover("generateWithHistoryWithMeta", (provider) =>
+			provider.generateWithHistoryWithMeta(systemInstruction, content, model, locale, options),
 		);
 	}
 }

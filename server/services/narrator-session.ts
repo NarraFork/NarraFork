@@ -3439,6 +3439,41 @@ export async function loadOptionalTool(
 	return "loaded";
 }
 
+/**
+ * Disable an optional tool for a narrator.
+ * Removes it from DB and updates the in-memory session if active.
+ */
+export async function unloadOptionalTool(
+	narratorId: string,
+	toolName: string,
+): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
+	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
+
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { enabledTools: true },
+	});
+	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
+	const next = current.filter((name) => name !== toolName);
+	const wasPersisted = next.length !== current.length;
+
+	const active = activeNarrators.get(narratorId);
+	const wasActive = active?._enabledOptionalTools.has(toolName) ?? false;
+
+	if (!wasPersisted && !wasActive) return "not_loaded";
+
+	if (wasPersisted) {
+		await db.update(narrators).set({ enabledTools: next }).where(eq(narrators.id, narratorId));
+	}
+
+	if (active) {
+		active._enabledOptionalTools.delete(toolName);
+	}
+
+	logger.info("Optional tool unloaded", { narratorId, toolName });
+	return "unloaded";
+}
+
 /** Get the set of enabled optional tool names for a narrator session. */
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);

@@ -1,10 +1,17 @@
 import type {
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NUGProviderConfig } from "../settings";
+import type { UsageData } from "../usage-tracking";
 import {
 	extractImageFileName,
 	parseSSEStream,
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import type {
+	ChatParams,
+	DbMessage,
+	GenerateMetaResult,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
@@ -15,6 +22,38 @@ function httpError(message: string, status: number): Error {
 	const err = new Error(message);
 	(err as Error & { status: number }).status = status;
 	return err;
+}
+
+function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
+	if (!usage) return undefined;
+	return {
+		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
+	};
+}
+
+export interface NugUsageEvent {
+	id: string;
+	channelType: string;
+	model: string;
+	meterUsage: number;
+	quotaCost: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationInputTokens?: number;
+	cacheReadInputTokens?: number;
+	status: string;
+	createdAt: string;
+	[key: string]: unknown;
+}
+
+export interface NugUsageSummary {
+	[key: string]: unknown;
 }
 
 /**
@@ -70,25 +109,6 @@ export interface NugChannelHealthStatus {
 export interface NugQuota {
 	balance: number;
 	totalGranted: number;
-}
-
-export interface NugUsageEvent {
-	id: string;
-	channelType: string;
-	model: string;
-	meterUsage: number;
-	quotaCost: number;
-	inputTokens: number;
-	outputTokens: number;
-	cacheCreationInputTokens?: number;
-	cacheReadInputTokens?: number;
-	status: string;
-	createdAt: string;
-	[key: string]: unknown;
-}
-
-export interface NugUsageSummary {
-	[key: string]: unknown;
 }
 
 /**
@@ -334,7 +354,7 @@ export class NugProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<GenerateMetaResult> {
 		const modelId = resolveModel(model);
 				conversationId: crypto.randomUUID(),
 				...(systemInstruction
@@ -370,15 +390,25 @@ export class NugProvider implements ProviderAdapter {
 
 		const chunks: string[] = [];
 		let contextPercent: number | undefined;
+		let usage: UsageData | undefined;
+		let credentialId: string | undefined;
+		let meterUsage: number | undefined;
+		let meterUnit: string | undefined;
 
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
 				if (evt.text != null) chunks.push(evt.text);
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
+				if (evt.usage) usage = toUsageData(evt.usage);
+				if (evt.credentialId) credentialId = evt.credentialId;
+				if (evt.metering) {
+					meterUsage = evt.metering.usage;
+					meterUnit = evt.metering.unit;
+				}
 			}
 		}
 
-		return { text: chunks.join(""), contextPercent };
+		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
 	}
 
 	async generateWithHistory(
@@ -387,6 +417,21 @@ export class NugProvider implements ProviderAdapter {
 		model: string,
 		locale?: string,
 	): Promise<string> {
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<GenerateMetaResult> {
 		const modelId = resolveModel(model);
 		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
@@ -423,13 +468,25 @@ export class NugProvider implements ProviderAdapter {
 		}
 
 		const chunks: string[] = [];
+		let contextPercent: number | undefined;
+		let usage: UsageData | undefined;
+		let credentialId: string | undefined;
+		let meterUsage: number | undefined;
+		let meterUnit: string | undefined;
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
 				if (evt.text != null) chunks.push(evt.text);
+				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
+				if (evt.usage) usage = toUsageData(evt.usage);
+				if (evt.credentialId) credentialId = evt.credentialId;
+				if (evt.metering) {
+					meterUsage = evt.metering.usage;
+					meterUnit = evt.metering.unit;
+				}
 			}
 		}
 
-		return chunks.join("");
+		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
 	}
 
 	// === NUG-specific methods (for frontend proxy routes) ===

@@ -19,6 +19,13 @@ export interface PixiMessageTheme {
 	blue: number;
 	teal: number;
 	indigo: number;
+	pink: number;
+	orange: number;
+	violet: number;
+	cyan: number;
+	lime: number;
+	grape: number;
+	gray: number;
 }
 
 function cssColorToHex(css: string): number {
@@ -47,10 +54,23 @@ function varToHex(name: string, fallback: number): number {
 	return val ? cssColorToHex(val) : fallback;
 }
 
+function isOledEnabled(): boolean {
+	try {
+		return localStorage.getItem("narrafork_oled") === "true";
+	} catch {
+		return false;
+	}
+}
+
+let cached: { scheme: string; oled: boolean; theme: PixiMessageTheme } | null = null;
+
 export function resolvePixiMessageTheme(): PixiMessageTheme {
 	const scheme = document.documentElement.getAttribute("data-mantine-color-scheme") ?? "dark";
 	const dark = scheme === "dark";
-	return {
+	const oled = isOledEnabled();
+	if (cached && cached.scheme === scheme && cached.oled === oled) return cached.theme;
+
+	let theme: PixiMessageTheme = {
 		bodyBg: varToHex(
 			dark ? "--mantine-color-dark-7" : "--mantine-color-gray-0",
 			dark ? 0x1a1b1e : 0xf8f9fa,
@@ -98,5 +118,30 @@ export function resolvePixiMessageTheme(): PixiMessageTheme {
 		blue: varToHex("--mantine-color-blue-5", 0x339af0),
 		teal: varToHex("--mantine-color-teal-5", 0x20c997),
 		indigo: varToHex("--mantine-color-indigo-5", 0x5c7cfa),
+		pink: varToHex("--mantine-color-pink-5", 0xf06595),
+		orange: varToHex("--mantine-color-orange-5", 0xff922b),
+		violet: varToHex("--mantine-color-violet-5", 0x845ef7),
+		cyan: varToHex("--mantine-color-cyan-5", 0x22b8cf),
+		lime: varToHex("--mantine-color-lime-5", 0x94d82d),
+		grape: varToHex("--mantine-color-grape-5", 0xcc5de8),
+		gray: varToHex("--mantine-color-gray-5", 0xadb5bd),
 	};
+
+	if (dark && oled) {
+		theme = {
+			...theme,
+			bodyBg: 0x000000,
+			panelBg: 0x000000,
+			assistantBg: 0x000000,
+			toolBg: 0x0a0a0a,
+			systemBg: 0x0a0a0a,
+		};
+	}
+
+	cached = { scheme, oled, theme };
+	return theme;
+}
+
+export function invalidatePixiMessageThemeCache(): void {
+	cached = null;
 }

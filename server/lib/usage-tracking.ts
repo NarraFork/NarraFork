@@ -164,10 +164,10 @@ export async function updateMessageUsage(
  * 从 Anthropic usage 对象提取 token 数据
  */
 export function extractAnthropicUsage(usage: {
-	input_tokens: number;
-	output_tokens: number;
-	cache_read_input_tokens?: number;
-	cache_creation_input_tokens?: number;
+	input_tokens?: number | null;
+	output_tokens?: number | null;
+	cache_read_input_tokens?: number | null;
+	cache_creation_input_tokens?: number | null;
 }): UsageData {
 	// 尝试从嵌套对象中提取 5m/1h 缓存明细（如果存在）
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic structure
@@ -176,8 +176,8 @@ export function extractAnthropicUsage(usage: {
 	const cache1h = cacheCreation?.ephemeral_1h_input_tokens || 0;
 
 	return {
-		inputTokens: usage.input_tokens,
-		outputTokens: usage.output_tokens,
+		inputTokens: usage.input_tokens ?? 0,
+		outputTokens: usage.output_tokens ?? 0,
 		cachedInputTokens: usage.cache_read_input_tokens || 0,
 		cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
 		cacheCreation5mInputTokens: cache5m,
@@ -189,8 +189,8 @@ export function extractAnthropicUsage(usage: {
  * 从 OpenAI usage 对象提取 token 数据
  */
 export function extractOpenAIUsage(usage: {
-	prompt_tokens: number;
-	completion_tokens: number;
+	prompt_tokens?: number;
+	completion_tokens?: number;
 	prompt_tokens_details?: {
 		cached_tokens?: number;
 	};
@@ -199,8 +199,8 @@ export function extractOpenAIUsage(usage: {
 	};
 }): UsageData {
 	return {
-		inputTokens: usage.prompt_tokens,
-		outputTokens: usage.completion_tokens,
+		inputTokens: usage.prompt_tokens ?? 0,
+		outputTokens: usage.completion_tokens ?? 0,
 		cachedInputTokens: usage.prompt_tokens_details?.cached_tokens || 0,
 		reasoningTokens: usage.completion_tokens_details?.reasoning_tokens || 0,
 	};

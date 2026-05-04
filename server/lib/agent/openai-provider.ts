@@ -5,6 +5,7 @@ import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
+import { extractOpenAIUsage } from "../usage-tracking";
 import { getHttpUserAgent } from "../user-agent";
 import {
 	type CodexResponsesRequestBody,
@@ -16,6 +17,7 @@ import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import type {
 	ChatParams,
 	DbMessage,
+	GenerateMetaResult,
 	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
@@ -31,6 +33,43 @@ import {
 } from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
+
+function parsedUsageToUsageData(usage: unknown): GenerateMetaResult["usage"] {
+	if (typeof usage !== "object" || usage === null) return null;
+	const data = usage as Record<string, unknown>;
+	const details =
+		typeof data.output_tokens_details === "object" && data.output_tokens_details !== null
+			? (data.output_tokens_details as Record<string, unknown>)
+			: undefined;
+	const inputDetails =
+		typeof data.input_tokens_details === "object" && data.input_tokens_details !== null
+			? (data.input_tokens_details as Record<string, unknown>)
+			: undefined;
+	const numberValue = (...keys: string[]) => {
+		for (const key of keys) {
+			const value = data[key];
+			if (typeof value === "number") return value;
+		}
+		return undefined;
+	};
+	return {
+		inputTokens: numberValue("inputTokens", "promptTokens", "input_tokens", "prompt_tokens") ?? 0,
+		outputTokens:
+			numberValue("completionTokens", "outputTokens", "completion_tokens", "output_tokens") ?? 0,
+		cachedInputTokens:
+			numberValue("cachedInputTokens", "cached_input_tokens") ??
+			(typeof inputDetails?.cached_tokens === "number" ? inputDetails.cached_tokens : 0),
+		cacheCreationInputTokens:
+			numberValue("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0,
+		cacheCreation5mInputTokens:
+			numberValue("cacheCreation5mTokens", "cache_creation_5m_tokens") ?? 0,
+		cacheCreation1hInputTokens:
+			numberValue("cacheCreation1hTokens", "cache_creation_1h_tokens") ?? 0,
+		reasoningTokens:
+			numberValue("reasoningTokens", "reasoning_tokens") ??
+			(typeof details?.reasoning_tokens === "number" ? details.reasoning_tokens : 0),
+	};
+}
 
 /** Resolve apiMode from provider config, with backward compat for the old `responsesApi` boolean. */
 function resolveApiMode(config?: OpenAIProviderConfig): OpenAIApiMode {
@@ -850,7 +889,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		model: string,
 		systemInstruction?: string,
 		options?: GenerateOptions,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
@@ -877,8 +916,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				body.stream = true;
 			}
 			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			const resultText = await this.requestResponsesText(baseUrl, apiKey, body);
-			return { text: resultText, contextPercent: undefined };
+			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body);
 		}
 
 		// Completions: POST /chat/completions
@@ -906,12 +944,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		const raw = await response.text();
 		const json = parseJsonWithPreview<{
 			choices?: Array<{ message?: { content?: string } }>;
-			usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+			usage?: { prompt_tokens: number; completion_tokens: number; total_tokens?: number };
 		}>(raw, "OpenAI chat/completions returned non-JSON payload");
 
 		return {
 			text: json.choices?.[0]?.message?.content ?? "",
 			contextPercent: undefined,
+			usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 		};
 	}
 
@@ -922,6 +961,23 @@ export class OpenAIProvider implements ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string> {
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+			options,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: GenerateOptions,
+	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
@@ -944,7 +1000,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				body.stream = true;
 			}
 			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesText(baseUrl, apiKey, body);
+			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body);
 		}
 
 		// Completions
@@ -970,20 +1026,20 @@ export class OpenAIProvider implements ProviderAdapter {
 		const raw = await response.text();
 		const json = parseJsonWithPreview<{
 			choices?: Array<{ message?: { content?: string } }>;
+			usage?: { prompt_tokens: number; completion_tokens: number; total_tokens?: number };
 		}>(raw, "OpenAI chat/completions returned non-JSON payload");
 
-		return json.choices?.[0]?.message?.content ?? "";
+		return {
+			text: json.choices?.[0]?.message?.content ?? "",
+			usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+		};
 	}
 
-	/**
-	 * Request /responses and extract plain text result.
-	 * Supports both JSON (non-streaming) and SSE (streaming) responses.
-	 */
-	private async requestResponsesText(
+	private async requestResponsesTextWithMeta(
 		baseUrl: string,
 		apiKey: string,
 		body: Record<string, unknown>,
-	): Promise<string> {
+	): Promise<GenerateMetaResult> {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
@@ -998,7 +1054,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (!isStreaming) {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
-			return extractResponsesText(json.output);
+			return {
+				text: extractResponsesText(json.output),
+				usage: parsedUsageToUsageData(json.usage),
+			};
 		}
 
 		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
@@ -1006,7 +1065,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (looksJson) {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
-			return extractResponsesText(json.output);
+			return {
+				text: extractResponsesText(json.output),
+				usage: parsedUsageToUsageData(json.usage),
+			};
 		}
 
 		if (!response.body) {
@@ -1014,15 +1076,17 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		let text = "";
+		let usage: GenerateMetaResult["usage"] = null;
 		for await (const evt of _parseResponsesAPIStream(response.body)) {
 			if (evt.text) text += evt.text;
+			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
 				throw new Error(
 					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
 				);
 			}
 		}
-		return text;
+		return { text, usage };
 	}
 
 	/** Build common request headers, with Codex-specific extras. */
@@ -1229,9 +1293,11 @@ function parseJsonWithPreview<T>(raw: string, errorPrefix: string): T {
 /** Parse a /responses JSON payload with a clearer error message. */
 function parseResponsesJson(raw: string): {
 	output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+	usage?: unknown;
 } {
 	return parseJsonWithPreview<{
 		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+		usage?: unknown;
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 

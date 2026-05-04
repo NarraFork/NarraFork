@@ -4,7 +4,14 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { ClineProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
-import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { extractOpenAIUsage } from "../usage-tracking";
+import type {
+	ChatParams,
+	DbMessage,
+	GenerateMetaResult,
+	ParsedStreamEvent,
+	ProviderAdapter,
+} from "./provider";
 import { sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -323,7 +330,7 @@ export class ClineProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || DEFAULT_CLINE_API_BASE).replace(/\/+$/, "");
 
@@ -355,10 +362,7 @@ export class ClineProvider implements ProviderAdapter {
 			throw new Error("Cline API returned no body");
 		}
 
-		return {
-			text: await this.collectStreamText(response.body),
-			contextPercent: undefined,
-		};
+		return this.collectStreamTextWithMeta(response.body);
 	}
 
 	async generateWithHistory(
@@ -367,6 +371,21 @@ export class ClineProvider implements ProviderAdapter {
 		model: string,
 		locale?: string,
 	): Promise<string> {
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || DEFAULT_CLINE_API_BASE).replace(/\/+$/, "");
 
@@ -397,7 +416,7 @@ export class ClineProvider implements ProviderAdapter {
 			throw new Error("Cline API returned no body");
 		}
 
-		return this.collectStreamText(response.body);
+		return this.collectStreamTextWithMeta(response.body);
 	}
 
 	// === Internal methods ===
@@ -510,14 +529,13 @@ export class ClineProvider implements ProviderAdapter {
 		return { history, trailingToolResults: pendingToolResults };
 	}
 
-	/**
-	 * Consume an SSE stream and return the concatenated text content.
-	 * Used by generateWithMeta / generateWithHistory where we only need the final text.
-	 */
-	private async collectStreamText(body: ReadableStream<Uint8Array>): Promise<string> {
+	private async collectStreamTextWithMeta(
+		body: ReadableStream<Uint8Array>,
+	): Promise<GenerateMetaResult> {
 		const decoder = new TextDecoder();
 		let buffer = "";
 		let text = "";
+		let usage: GenerateMetaResult["usage"] = null;
 
 		const reader = body.getReader();
 		try {
@@ -545,6 +563,10 @@ export class ClineProvider implements ProviderAdapter {
 						throw new ApiError(500, `Cline API error: ${chunk.error.message || "Unknown error"}`);
 					}
 
+					if (chunk.usage) {
+						usage = extractOpenAIUsage(chunk.usage);
+					}
+
 					const delta = chunk.choices?.[0]?.delta;
 					if (delta?.content) {
 						text += delta.content;
@@ -555,7 +577,7 @@ export class ClineProvider implements ProviderAdapter {
 			reader.releaseLock();
 		}
 
-		return text;
+		return { text, usage };
 	}
 
 	private async *parseSSEStream(

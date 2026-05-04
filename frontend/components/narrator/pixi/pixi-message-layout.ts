@@ -1,5 +1,71 @@
 import { type LayoutLine, layoutWithLines, prepareWithSegments } from "@chenglou/pretext";
-import type { PixiMessageItem } from "./pixi-message-model";
+import { type MdBlock, parseMarkdownBlocks } from "./pixi-markdown";
+import type {
+	PixiMessageItem,
+	PixiToolBadgeModel,
+	PixiToolDetailBlockModel,
+	PixiToolDetailLineModel,
+} from "./pixi-message-model";
+
+export interface PixiLaidOutMarkdownBlock {
+	kind: MdBlock["kind"];
+	text: string;
+	lines: LayoutLine[];
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	font: string;
+	lineHeight: number;
+	level?: number;
+	lang?: string;
+	ordered?: boolean;
+	index?: number;
+}
+
+export interface PixiLaidOutToolDetailLine extends PixiToolDetailLineModel {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	lines: LayoutLine[];
+}
+
+export interface PixiLaidOutToolBadge extends PixiToolBadgeModel {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+export interface PixiLaidOutToolDetailBlock {
+	kind: PixiToolDetailBlockModel["kind"];
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	text?: string;
+	title?: string;
+	subtitle?: string;
+	color?: string;
+	muted?: boolean;
+	mono?: boolean;
+	badges?: PixiLaidOutToolBadge[];
+	lines?: LayoutLine[];
+	diffLines?: Array<{
+		type: "removed" | "added" | "context";
+		text: string;
+		oldNo?: number;
+		newNo?: number;
+		lines: LayoutLine[];
+	}>;
+	oldLines?: LayoutLine[];
+	newLines?: LayoutLine[];
+	filename?: string;
+	note?: string;
+	status?: string;
+	lang?: string;
+}
 
 export interface PixiLaidOutBlock {
 	type: string;
@@ -11,6 +77,23 @@ export interface PixiLaidOutBlock {
 	y: number;
 	width: number;
 	height: number;
+	separatorBefore?: boolean;
+	mdBlocks?: PixiLaidOutMarkdownBlock[];
+	toolName?: string;
+	toolCategory?: PixiMessageItem["blocks"][number]["toolCategory"];
+	toolSummary?: string;
+	toolStatus?: string;
+	toolDuration?: string;
+	toolStatusColor?: string;
+	toolCategoryColor?: string;
+	toolIsSubagent?: boolean;
+	toolChildCount?: number;
+	toolInRun?: boolean;
+	toolIsLast?: boolean;
+	toolDefaultOpen?: boolean;
+	toolHeader?: { x: number; y: number; width: number; height: number };
+	toolDetailLines?: PixiLaidOutToolDetailLine[];
+	toolDetailBlocks?: PixiLaidOutToolDetailBlock[];
 }
 
 export interface PixiLaidOutItem {
@@ -35,11 +118,38 @@ const PADDING_Y = 12;
 const BLOCK_GAP = 8;
 const HEADER_H = 20;
 const TOKEN_H = 18;
+const TOOL_SEPARATOR_H = 1;
+const TOOL_CARD_PADDING = 8;
+const TOOL_HEADER_H = 18;
+const TOOL_DETAIL_LINE_H = 18;
+const TOOL_DETAIL_GAP = 6;
 const MIN_ITEM_H = 34;
 const FONT = "14px sans-serif";
 const SMALL_FONT = "12px sans-serif";
+const CODE_FONT = "13px monospace";
+const HEADING_FONTS: Record<1 | 2 | 3 | 4 | 5 | 6, string> = {
+	1: "700 22px sans-serif",
+	2: "700 19px sans-serif",
+	3: "700 17px sans-serif",
+	4: "700 15px sans-serif",
+	5: "700 15px sans-serif",
+	6: "700 15px sans-serif",
+};
+const HEADING_LINE_HEIGHTS: Record<1 | 2 | 3 | 4 | 5 | 6, number> = {
+	1: 30,
+	2: 26,
+	3: 24,
+	4: 22,
+	5: 22,
+	6: 22,
+};
 const LINE_H = 20;
+const CODE_LINE_H = 16;
 const SMALL_LINE_H = 17;
+const CODE_PADDING_X = 10;
+const CODE_PADDING_Y = 7;
+const BLOCKQUOTE_INDENT = 16;
+const LIST_INDENT = 24;
 const MAX_BLOCK_LINES = 120;
 
 const preparedCache = new Map<string, ReturnType<typeof prepareWithSegments>>();
@@ -48,12 +158,16 @@ const MAX_CACHE = 1200;
 function getPrepared(text: string, font: string) {
 	const key = `${font}\u0000${text}`;
 	const cached = preparedCache.get(key);
-	if (cached) return cached;
+	if (cached) {
+		preparedCache.delete(key);
+		preparedCache.set(key, cached);
+		return cached;
+	}
 	const prepared = prepareWithSegments(text, font, { whiteSpace: "pre-wrap" });
 	preparedCache.set(key, prepared);
 	if (preparedCache.size > MAX_CACHE) {
 		const first = preparedCache.keys().next().value;
-		if (first) preparedCache.delete(first);
+		if (first !== undefined) preparedCache.delete(first);
 	}
 	return prepared;
 }
@@ -74,6 +188,484 @@ function layoutText(text: string, width: number, font = FONT, lineHeight = LINE_
 	return result;
 }
 
+function capLines(lines: LayoutLine[], max: number): LayoutLine[] {
+	if (lines.length <= max) return lines;
+	const capped = lines.slice(0, max);
+	capped[capped.length - 1] = { ...capped[capped.length - 1], text: "…" };
+	return capped;
+}
+
+function layoutSpecialBlock(
+	type: string,
+	text: string,
+	width: number,
+): { lines: LayoutLine[]; height: number } | null {
+	switch (type) {
+		case "reasoning":
+		case "thinking": {
+			const result = layoutText(text, Math.max(24, width - 24), SMALL_FONT, SMALL_LINE_H);
+			return { lines: capLines(result.lines, 4), height: 92 };
+		}
+		case "web_search":
+			return { lines: [], height: 28 };
+		case "image":
+		case "image_generation":
+			return { lines: [], height: 120 };
+		case "compact":
+		case "segment_compact":
+			return { lines: [], height: 28 };
+		case "error": {
+			const result = layoutText(text, Math.max(24, width - 20), FONT, LINE_H);
+			const lines = capLines(result.lines, 8);
+			return { lines, height: Math.max(32, lines.length * LINE_H + 16) };
+		}
+		case "info":
+		case "tool_loaded":
+		case "tool_unloaded": {
+			const result = layoutText(text, Math.max(24, width - 20), SMALL_FONT, SMALL_LINE_H);
+			const lines = capLines(result.lines, 8);
+			return { lines, height: Math.max(28, lines.length * LINE_H + 12) };
+		}
+		case "plan": {
+			const result = layoutText(text, Math.max(24, width - 20), FONT, LINE_H);
+			const lines = capLines(result.lines, 10);
+			return { lines, height: Math.max(58, 40 + lines.length * LINE_H) };
+		}
+		case "merge_summary":
+		case "review_feedback":
+			return { lines: [], height: 30 };
+		case "goal_continuation":
+			return { lines: [], height: 28 };
+		default:
+			return null;
+	}
+}
+
+function headingFont(level: number): string {
+	return HEADING_FONTS[Math.min(6, Math.max(1, level)) as 1 | 2 | 3 | 4 | 5 | 6];
+}
+
+function headingLineHeight(level: number): number {
+	return HEADING_LINE_HEIGHTS[Math.min(6, Math.max(1, level)) as 1 | 2 | 3 | 4 | 5 | 6];
+}
+
+function markdownGapAfter(kind: MdBlock["kind"]): number {
+	switch (kind) {
+		case "empty":
+			return 0;
+		case "heading":
+			return 6;
+		case "code":
+			return 8;
+		case "hr":
+			return 4;
+		default:
+			return 4;
+	}
+}
+
+function layoutMarkdownBlocks(markdown: string, width: number) {
+	const parsed = parseMarkdownBlocks(markdown);
+	const mdBlocks: PixiLaidOutMarkdownBlock[] = [];
+	let y = 0;
+	let lastGap = 0;
+
+	for (const block of parsed) {
+		const add = (mdBlock: PixiLaidOutMarkdownBlock) => {
+			lastGap = markdownGapAfter(block.kind);
+			mdBlocks.push(mdBlock);
+			y += mdBlock.height + lastGap;
+		};
+
+		switch (block.kind) {
+			case "heading": {
+				const font = headingFont(block.level);
+				const lineHeight = headingLineHeight(block.level);
+				const result = layoutText(block.text, width, font, lineHeight);
+				add({
+					kind: block.kind,
+					text: block.text,
+					lines: result.lines,
+					x: 0,
+					y,
+					width,
+					height: Math.max(lineHeight, result.height),
+					font,
+					lineHeight,
+					level: block.level,
+				});
+				break;
+			}
+			case "paragraph": {
+				const result = layoutText(block.text, width, FONT, LINE_H);
+				add({
+					kind: block.kind,
+					text: block.text,
+					lines: result.lines,
+					x: 0,
+					y,
+					width,
+					height: Math.max(LINE_H, result.height),
+					font: FONT,
+					lineHeight: LINE_H,
+				});
+				break;
+			}
+			case "code": {
+				const textWidth = Math.max(24, width - CODE_PADDING_X * 2);
+				const result = layoutText(block.text || " ", textWidth, CODE_FONT, CODE_LINE_H);
+				add({
+					kind: block.kind,
+					text: block.text,
+					lines: result.lines,
+					x: 0,
+					y,
+					width,
+					height: Math.max(CODE_LINE_H, result.height) + CODE_PADDING_Y * 2,
+					font: CODE_FONT,
+					lineHeight: CODE_LINE_H,
+					lang: block.lang,
+				});
+				break;
+			}
+			case "blockquote": {
+				const textWidth = Math.max(24, width - BLOCKQUOTE_INDENT);
+				const result = layoutText(block.text, textWidth, FONT, LINE_H);
+				add({
+					kind: block.kind,
+					text: block.text,
+					lines: result.lines,
+					x: 0,
+					y,
+					width,
+					height: Math.max(LINE_H, result.height),
+					font: FONT,
+					lineHeight: LINE_H,
+				});
+				break;
+			}
+			case "list-item": {
+				const textWidth = Math.max(24, width - LIST_INDENT);
+				const result = layoutText(block.text, textWidth, FONT, LINE_H);
+				add({
+					kind: block.kind,
+					text: block.text,
+					lines: result.lines,
+					x: 0,
+					y,
+					width,
+					height: Math.max(LINE_H, result.height),
+					font: FONT,
+					lineHeight: LINE_H,
+					ordered: block.ordered,
+					index: block.index,
+				});
+				break;
+			}
+			case "hr":
+				add({
+					kind: block.kind,
+					text: "",
+					lines: [],
+					x: 0,
+					y,
+					width,
+					height: 17,
+					font: FONT,
+					lineHeight: LINE_H,
+				});
+				break;
+			case "empty":
+				add({
+					kind: block.kind,
+					text: "",
+					lines: [],
+					x: 0,
+					y,
+					width,
+					height: 8,
+					font: FONT,
+					lineHeight: LINE_H,
+				});
+				break;
+		}
+	}
+
+	return {
+		mdBlocks,
+		height: Math.max(LINE_H, mdBlocks.length > 0 ? y - lastGap : LINE_H),
+	};
+}
+
+function measureBadge(text: string): number {
+	return Math.max(28, text.length * 7 + 14);
+}
+
+function layoutBadges(
+	badges: PixiToolBadgeModel[],
+	width: number,
+	startY: number,
+): PixiLaidOutToolBadge[] {
+	const laid: PixiLaidOutToolBadge[] = [];
+	let x = TOOL_CARD_PADDING;
+	let y = startY;
+	for (const badge of badges) {
+		const badgeWidth = Math.min(width - TOOL_CARD_PADDING * 2, measureBadge(badge.text));
+		if (x > TOOL_CARD_PADDING && x + badgeWidth > width - TOOL_CARD_PADDING) {
+			x = TOOL_CARD_PADDING;
+			y += 20;
+		}
+		laid.push({ ...badge, x, y, width: badgeWidth, height: 16 });
+		x += badgeWidth + 4;
+	}
+	return laid;
+}
+
+function layoutToolDetailBlocks(
+	blocks: PixiToolDetailBlockModel[],
+	innerWidth: number,
+	startY: number,
+): { blocks: PixiLaidOutToolDetailBlock[]; height: number } {
+	const laid: PixiLaidOutToolDetailBlock[] = [];
+	let y = startY;
+	const contentWidth = Math.max(80, innerWidth - TOOL_CARD_PADDING * 2);
+	for (const detail of blocks) {
+		if (detail.kind === "badge-row") {
+			const badges = layoutBadges(detail.badges, innerWidth, y);
+			const height = badges.length > 0 ? Math.max(...badges.map((b) => b.y + b.height - y)) : 16;
+			laid.push({
+				kind: "badge-row",
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				badges,
+			});
+			y += height + 5;
+			continue;
+		}
+		if (detail.kind === "section-title") {
+			laid.push({
+				kind: "section-title",
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height: 17,
+				text: detail.text,
+			});
+			y += 19;
+			continue;
+		}
+		if (detail.kind === "text-line") {
+			const result = layoutText(
+				detail.text,
+				contentWidth,
+				detail.mono ? CODE_FONT : SMALL_FONT,
+				SMALL_LINE_H,
+			);
+			const height = Math.max(17, Math.min(result.height, SMALL_LINE_H * 2));
+			laid.push({
+				...detail,
+				kind: "text-line",
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				lines: result.lines.slice(0, 2),
+			});
+			y += height + 3;
+			continue;
+		}
+		if (detail.kind === "code-panel" || detail.kind === "terminal-panel") {
+			const maxLines = detail.maxLines ?? 8;
+			const result = layoutText(
+				detail.text,
+				contentWidth - CODE_PADDING_X * 2,
+				CODE_FONT,
+				CODE_LINE_H,
+			);
+			const lineCount = Math.min(result.lines.length, maxLines);
+			const height =
+				CODE_PADDING_Y * 2 +
+				Math.max(CODE_LINE_H, lineCount * CODE_LINE_H) +
+				(detail.title ? 17 : 0);
+			laid.push({
+				...detail,
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				lines: result.lines.slice(0, maxLines),
+			});
+			y += height + 6;
+			continue;
+		}
+		if (detail.kind === "diff-panel") {
+			const maxLines = detail.maxLines ?? 8;
+			const oldRaw = detail.oldText.split(/\r?\n/);
+			const newRaw = detail.newText.split(/\r?\n/);
+			const diffLines: NonNullable<PixiLaidOutToolDetailBlock["diffLines"]> = [];
+			const shared = Math.min(oldRaw.length, newRaw.length);
+			const diffTextWidth = Math.max(60, contentWidth - CODE_PADDING_X * 2 - 54);
+			let oldNo = detail.startLine ?? 1;
+			let newNo = detail.startLine ?? 1;
+			const pushDiff = (
+				type: "removed" | "added" | "context",
+				text: string,
+				oldLineNo?: number,
+				newLineNo?: number,
+			) => {
+				const result = layoutText(text || " ", diffTextWidth, CODE_FONT, CODE_LINE_H);
+				diffLines.push({
+					type,
+					text,
+					oldNo: oldLineNo,
+					newNo: newLineNo,
+					lines: result.lines.slice(0, 2),
+				});
+			};
+			for (let i = 0; i < shared && diffLines.length < maxLines; i++) {
+				if (oldRaw[i] === newRaw[i]) {
+					pushDiff("context", oldRaw[i], oldNo++, newNo++);
+				} else {
+					pushDiff("removed", oldRaw[i], oldNo++);
+					if (diffLines.length < maxLines) pushDiff("added", newRaw[i], undefined, newNo++);
+				}
+			}
+			for (let i = shared; i < oldRaw.length && diffLines.length < maxLines; i++) {
+				pushDiff("removed", oldRaw[i], oldNo++);
+			}
+			for (let i = shared; i < newRaw.length && diffLines.length < maxLines; i++) {
+				pushDiff("added", newRaw[i], undefined, newNo++);
+			}
+			const height =
+				CODE_PADDING_Y * 2 +
+				23 +
+				diffLines.reduce((sum, line) => sum + Math.max(1, line.lines.length) * CODE_LINE_H, 0);
+			laid.push({
+				...detail,
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				diffLines,
+			});
+			y += height + 6;
+			continue;
+		}
+		if (detail.kind === "todo-row") {
+			const result = layoutText(detail.text, contentWidth - 24, SMALL_FONT, SMALL_LINE_H);
+			const height = Math.max(18, Math.min(result.height, SMALL_LINE_H * 2));
+			laid.push({
+				...detail,
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				lines: result.lines.slice(0, 2),
+			});
+			y += height + 4;
+			continue;
+		}
+		if (detail.kind === "result-card") {
+			const titleLines = detail.title
+				? layoutText(detail.title, contentWidth - 12, SMALL_FONT, SMALL_LINE_H).lines.slice(0, 1)
+				: [];
+			const textLines = detail.text
+				? layoutText(detail.text, contentWidth - 12, SMALL_FONT, SMALL_LINE_H).lines.slice(0, 2)
+				: [];
+			const height =
+				12 + titleLines.length * 17 + (detail.subtitle ? 15 : 0) + textLines.length * 17;
+			laid.push({
+				kind: "result-card",
+				title: detail.title,
+				subtitle: detail.subtitle,
+				text: detail.text,
+				color: detail.color,
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height,
+				lines: [...titleLines, ...textLines],
+			});
+			y += height + 5;
+			continue;
+		}
+		if (detail.kind === "share-card") {
+			const badges = layoutBadges(detail.badges, contentWidth - 52, y + 25).map((b) => ({
+				...b,
+				x: b.x + 44 - TOOL_CARD_PADDING,
+			}));
+			const badgeHeight =
+				badges.length > 0 ? Math.max(...badges.map((b) => b.y + b.height - (y + 25))) : 0;
+			laid.push({
+				...detail,
+				x: TOOL_CARD_PADDING,
+				y,
+				width: contentWidth,
+				height: Math.max(56, 38 + badgeHeight),
+				badges,
+			});
+			y += Math.max(56, 38 + badgeHeight) + 6;
+		}
+	}
+	return { blocks: laid, height: Math.max(0, y - startY) };
+}
+
+function layoutToolUseBlock(
+	block: PixiMessageItem["blocks"][number],
+	innerWidth: number,
+): {
+	lines: LayoutLine[];
+	height: number;
+	toolHeader: { x: number; y: number; width: number; height: number };
+	toolDetailLines: PixiLaidOutToolDetailLine[];
+	toolDetailBlocks: PixiLaidOutToolDetailBlock[];
+} {
+	const blocksLayout = block.toolDefaultOpen
+		? layoutToolDetailBlocks(
+				block.toolDetailBlocks ?? [],
+				innerWidth,
+				TOOL_CARD_PADDING + TOOL_HEADER_H + TOOL_DETAIL_GAP,
+			)
+		: { blocks: [], height: 0 };
+	const detailLines: PixiLaidOutToolDetailLine[] = [];
+	let y = TOOL_CARD_PADDING + TOOL_HEADER_H + TOOL_DETAIL_GAP + blocksLayout.height;
+	for (const detail of block.toolDefaultOpen && blocksLayout.blocks.length === 0
+		? (block.toolDetailLines ?? [])
+		: []) {
+		const labelPrefix = detail.label ? `${detail.label}: ` : "";
+		const text = `${labelPrefix}${detail.text}`;
+		const font = detail.kind === "code" ? CODE_FONT : detail.kind === "muted" ? SMALL_FONT : FONT;
+		const lineHeight = detail.kind === "code" ? CODE_LINE_H : SMALL_LINE_H;
+		const width = Math.max(80, innerWidth - TOOL_CARD_PADDING * 2);
+		const result = layoutText(text, width, font, lineHeight);
+		const height = Math.max(TOOL_DETAIL_LINE_H, Math.min(result.height, lineHeight * 2));
+		detailLines.push({
+			...detail,
+			text,
+			lines: result.lines.slice(0, 2),
+			x: TOOL_CARD_PADDING,
+			y,
+			width,
+			height,
+		});
+		y += height + 3;
+	}
+	return {
+		lines: [],
+		height: Math.max(TOOL_CARD_PADDING * 2 + TOOL_HEADER_H, y - 3 + TOOL_CARD_PADDING),
+		toolHeader: {
+			x: TOOL_CARD_PADDING,
+			y: TOOL_CARD_PADDING,
+			width: innerWidth - TOOL_CARD_PADDING * 2,
+			height: TOOL_HEADER_H,
+		},
+		toolDetailLines: detailLines,
+		toolDetailBlocks: blocksLayout.blocks,
+	};
+}
+
 export function clearPixiMessageLayoutCache(): void {
 	preparedCache.clear();
 }
@@ -82,7 +674,7 @@ export function layoutPixiMessageItems(
 	items: PixiMessageItem[],
 	viewportWidth: number,
 ): PixiMessageLayoutResult {
-	const contentMaxWidth = Math.max(260, viewportWidth - 32);
+	const contentMaxWidth = Math.max(260, viewportWidth - 56);
 	const laidOut: PixiLaidOutItem[] = [];
 	let y = 12;
 
@@ -97,8 +689,9 @@ export function layoutPixiMessageItems(
 					? Math.min(720, contentMaxWidth * 0.82)
 					: contentMaxWidth;
 		const x = isUser ? Math.max(16, viewportWidth - itemWidth - 16) : 16;
-		const innerWidth = Math.max(80, itemWidth - PADDING_X * 2);
-		let innerY = PADDING_Y;
+		const isToolRun = item.kind === "tool-run";
+		const innerWidth = Math.max(80, isToolRun ? itemWidth : itemWidth - PADDING_X * 2);
+		let innerY = isToolRun ? 0 : PADDING_Y;
 		const blocks: PixiLaidOutBlock[] = [];
 
 		if (item.kind === "divider") {
@@ -116,26 +709,67 @@ export function layoutPixiMessageItems(
 			continue;
 		}
 
-		innerY += HEADER_H;
-		for (const block of item.blocks) {
-			const labelHeight = block.label ? SMALL_LINE_H : 0;
+		const isPlainAssistant = isAssistant && item.kind !== "tool-run";
+		if (!isPlainAssistant && !isToolRun) innerY += HEADER_H;
+		const hasToolSeparators = isToolRun && item.blocks.length >= 2;
+		for (let blockIndex = 0; blockIndex < item.blocks.length; blockIndex++) {
+			const block = item.blocks[blockIndex];
+			const separatorBefore = hasToolSeparators && blockIndex > 0;
+			if (separatorBefore) innerY += TOOL_SEPARATOR_H;
+			const isToolUse = block.type === "tool_use" && !!block.toolName;
+			const labelHeight = block.label && !isToolUse ? SMALL_LINE_H : 0;
 			const blockText = block.text || " ";
-			const font =
-				block.type === "bash_command" || block.type === "tool_use" ? "13px monospace" : FONT;
-			const linesResult = layoutText(blockText, innerWidth, font, LINE_H);
-			const height = Math.max(LINE_H, linesResult.height) + labelHeight;
+			const shouldRenderMarkdown = isAssistant && block.type === "text";
+			const font = block.type === "bash_command" || block.type === "tool_use" ? CODE_FONT : FONT;
+			const toolLayout = isToolUse ? layoutToolUseBlock(block, innerWidth) : null;
+			const specialLayout = !toolLayout
+				? layoutSpecialBlock(block.type, blockText, innerWidth)
+				: null;
+			const mdLayout =
+				!toolLayout && !specialLayout && shouldRenderMarkdown
+					? layoutMarkdownBlocks(blockText, innerWidth)
+					: null;
+			const linesResult =
+				toolLayout || specialLayout || mdLayout
+					? null
+					: layoutText(blockText, innerWidth, font, LINE_H);
+			const textHeight = toolLayout
+				? toolLayout.height
+				: specialLayout
+					? specialLayout.height
+					: mdLayout
+						? mdLayout.height
+						: Math.max(LINE_H, linesResult?.height ?? LINE_H);
+			const height = textHeight + labelHeight;
 			blocks.push({
 				type: block.type,
 				label: block.label,
 				color: block.color,
 				text: blockText,
-				lines: linesResult.lines,
-				x: PADDING_X,
+				lines: toolLayout?.lines ?? specialLayout?.lines ?? linesResult?.lines ?? [],
+				x: isToolRun ? 0 : PADDING_X,
 				y: innerY,
 				width: innerWidth,
 				height,
+				separatorBefore,
+				mdBlocks: mdLayout?.mdBlocks,
+				toolName: block.toolName,
+				toolCategory: block.toolCategory,
+				toolSummary: block.toolSummary,
+				toolStatus: block.toolStatus,
+				toolDuration: block.toolDuration,
+				toolStatusColor: block.toolStatusColor,
+				toolCategoryColor: block.toolCategoryColor,
+				toolIsSubagent: block.toolIsSubagent,
+				toolChildCount: block.toolChildCount,
+				toolInRun: block.toolInRun,
+				toolIsLast: block.toolIsLast,
+				toolDefaultOpen: block.toolDefaultOpen,
+				toolHeader: toolLayout?.toolHeader,
+				toolDetailLines: toolLayout?.toolDetailLines,
+				toolDetailBlocks: toolLayout?.toolDetailBlocks,
 			});
-			innerY += height + BLOCK_GAP;
+			innerY += height + (isToolRun ? 0 : BLOCK_GAP);
 		}
 		if (item.blocks.length === 0) innerY += LINE_H;
 		if (item.tokenUsage) {
@@ -152,7 +786,7 @@ export function layoutPixiMessageItems(
 			innerY += TOKEN_H;
 		}
 
-		const height = Math.max(MIN_ITEM_H, innerY + PADDING_Y - BLOCK_GAP);
+		const height = Math.max(MIN_ITEM_H, isToolRun ? innerY : innerY + PADDING_Y - BLOCK_GAP);
 		laidOut.push({
 			item,
 			index: i,

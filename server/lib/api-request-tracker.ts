@@ -98,12 +98,35 @@ export async function trackApiRequest<T>(
 	const handle = startApiRequest(options);
 	try {
 		const result = await fn();
+		const resultMeta = typeof result === "object" && result !== null ? result : null;
 		const contextPercent =
-			typeof result === "object" && result !== null && "contextPercent" in result
-				? (result.contextPercent as number | undefined)
+			resultMeta && "contextPercent" in resultMeta
+				? (resultMeta.contextPercent as number | undefined)
+				: undefined;
+		const usage =
+			resultMeta && "usage" in resultMeta
+				? (resultMeta.usage as UsageData | null | undefined)
+				: null;
+		const credentialId =
+			resultMeta && "credentialId" in resultMeta
+				? (resultMeta.credentialId as string | undefined)
+				: undefined;
+		const meterUsage =
+			resultMeta && "meterUsage" in resultMeta
+				? (resultMeta.meterUsage as number | undefined)
+				: undefined;
+		const meterUnit =
+			resultMeta && "meterUnit" in resultMeta
+				? (resultMeta.meterUnit as string | undefined)
 				: undefined;
 		try {
-			await finishApiRequest(handle, { contextPercent: contextPercent ?? null });
+			await finishApiRequest(handle, {
+				contextPercent: contextPercent ?? null,
+				credentialId: credentialId ?? null,
+				usage: usage ?? null,
+				meterUsage: meterUsage ?? null,
+				meterUnit: meterUnit ?? null,
+			});
 		} catch (error) {
 			logger.warn("Failed to record API request", { requestId: handle.id, error });
 		}

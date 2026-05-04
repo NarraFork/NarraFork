@@ -183,6 +183,11 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		"zh-CN":
 			'[可选工具 "{toolName}" 刚刚被加载到本次会话中。{toolDescription}。你现在可以在合适的时候使用这个工具。]',
 	},
+	"tool.toolUnloaded": {
+		en: '[The optional tool "{toolName}" has just been unloaded from this session. Do not use this tool unless it is loaded again.]',
+		"zh-CN":
+			'[可选工具 "{toolName}" 刚刚从本次会话中卸载。除非它再次被加载，否则不要使用这个工具。]',
+	},
 	"tool.forkNarratorSuccess": {
 		en: "New narrator forked successfully.\n\nNarrator ID: {narratorId}\nTitle: {title}\n{chapterInfo}\nThe new narrator is now running independently with your message.",
 		"zh-CN":
@@ -493,6 +498,7 @@ export type ToolMessageKey =
 	| "interruptionContinue"
 	| "userContinue"
 	| "toolLoaded"
+	| "toolUnloaded"
 	| "forkNarratorSuccess"
 	| "forkNarratorChapterInfo"
 	| "forkNarratorError";

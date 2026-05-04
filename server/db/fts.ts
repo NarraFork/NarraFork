@@ -10,7 +10,16 @@ const CLEAN_SHUTDOWN_MARKER = 0x4e465243; // "NFRC" = NarraFork Clean
  * All statements use IF NOT EXISTS / DROP-then-CREATE to be idempotent.
  * Old non-trigram FTS tables are detected and recreated.
  */
-export function ensureFts(sqlite: Database): { rebuilt: boolean } {
+export function markCleanShutdown(sqlite: Database): void {
+	// Set the marker before checkpointing so the marker itself is flushed out of WAL.
+	sqlite.run(`PRAGMA application_id = ${CLEAN_SHUTDOWN_MARKER}`);
+	sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+}
+
+export function ensureFts(
+	sqlite: Database,
+	options: { skipUncleanShutdownRebuild?: boolean } = {},
+): { rebuilt: boolean } {
 	// Guard: skip if base tables don't exist yet (fresh DB before first migration)
 	const hasBaseTables = sqlite
 		.prepare(
@@ -127,7 +136,9 @@ export function ensureFts(sqlite: Database): { rebuilt: boolean } {
 	const appId =
 		(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
 			?.application_id ?? 0;
-	const needsRebuild = ftsTablesRecreated.length > 0 || appId !== CLEAN_SHUTDOWN_MARKER;
+	const needsRebuild =
+		ftsTablesRecreated.length > 0 ||
+		(!options.skipUncleanShutdownRebuild && appId !== CLEAN_SHUTDOWN_MARKER);
 
 	if (needsRebuild) {
 		try {
@@ -142,7 +153,9 @@ export function ensureFts(sqlite: Database): { rebuilt: boolean } {
 		}
 	}
 
-	// Clear the clean shutdown marker — it will be set again on clean exit
+	// Clear the clean shutdown marker — it will be set again on clean exit.
+	// During Bun --hot reloads, skipUncleanShutdownRebuild prevents this running
+	// process from being misclassified as a crashed previous process.
 	sqlite.run("PRAGMA application_id = 0");
 
 	return { rebuilt: needsRebuild };
