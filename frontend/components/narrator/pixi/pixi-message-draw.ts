@@ -5,6 +5,7 @@ import {
 	getPixiGeneratedImageTexture,
 	getPixiPreviewImageTexture,
 	getPixiUploadImageTexture,
+	type PixiImageTextureResult,
 } from "./pixi-image-textures";
 import { PIXI_MESSAGE_FONT, PIXI_MESSAGE_METRICS, pixiCssFont } from "./pixi-message-constants";
 import type {
@@ -189,7 +190,8 @@ export class ImageSpritePool {
 				maskGfx.roundRect(x, y, width, height, mask.radius);
 			}
 			maskGfx.fill({ color: 0xffffff, alpha: 1 });
-			maskGfx.renderable = false;
+			maskGfx.visible = true;
+			maskGfx.renderable = true;
 			sprite.mask = maskGfx;
 		} else {
 			sprite.mask = null;
@@ -397,7 +399,7 @@ function drawUserAvatar(
 	gfx.circle(x + 10, y + 10, 10);
 	gfx.fill({ color: bg, alpha: 1 });
 
-	const texture = getPixiAvatarTexture(item.creator?.id, item.creator?.avatarImageId);
+	const { texture, status } = getPixiAvatarTexture(item.creator?.id, item.creator?.avatarImageId);
 	if (texture && texture !== Texture.EMPTY) {
 		imagePool.acquire(texture, x, y, 20, 20, 1, { kind: "circle", radius: 10 });
 		return;
@@ -406,6 +408,13 @@ function drawUserAvatar(
 	const initial = (item.creator?.username ?? item.title).trim().charAt(0).toUpperCase() || "U";
 	const initialWidth = measureTextWidth(initial, AVATAR_INITIAL_FONT);
 	textPool.acquire(initial, x + (20 - initialWidth) / 2, y + 3, AVATAR_INITIAL_STYLE, 0xffffff);
+	if (status === "loading") {
+		gfx.circle(x + 17, y + 17, 2);
+		gfx.fill({ color: 0xffffff, alpha: 0.72 });
+	} else if (status === "failed") {
+		gfx.circle(x + 17, y + 17, 2);
+		gfx.fill({ color: theme.red, alpha: 0.95 });
+	}
 }
 
 function compactText(text: string, maxChars: number): string {
@@ -557,22 +566,22 @@ function drawWebSearchBlock(opts: DrawSpecialBlockOptions) {
 	);
 }
 
-function textureForImageBlock(block: PixiLaidOutBlock): Texture | null {
+function textureForImageBlock(block: PixiLaidOutBlock): PixiImageTextureResult {
 	if (block.type === "image_generation") {
 		return getPixiGeneratedImageTexture({
 			result: block.imageSrc,
 			savedPath: block.imageSavedPath,
 		});
 	}
-	return (
-		getPixiPreviewImageTexture(block.imageSrc) ??
-		getPixiUploadImageTexture(block.imageUploadNarratorId, block.imageId)
-	);
+	const preview = getPixiPreviewImageTexture(block.imageSrc);
+	if (preview.status !== "idle") return preview;
+	return getPixiUploadImageTexture(block.imageUploadNarratorId, block.imageId);
 }
 
 function drawImageBlock(opts: DrawSpecialBlockOptions) {
 	const { textPool, imagePool, gfx, block, bx, by, theme } = opts;
-	const texture = textureForImageBlock(block);
+	const textureResult = textureForImageBlock(block);
+	const texture = textureResult.texture;
 	const maxWidth = Math.min(block.width, 512);
 	const maxHeight = block.height;
 	const label = block.type === "image_generation" ? "Generated image" : "Attached image";
@@ -597,13 +606,19 @@ function drawImageBlock(opts: DrawSpecialBlockOptions) {
 	gfx.roundRect(x, y, width, height, 6);
 	gfx.fill({ color: theme.systemBg, alpha: 0.35 });
 	drawDashedRect(gfx, x, y, width, height, theme.dimmed);
-	const text = `📷 ${compactText(block.imageFilename || block.text || label, 32)}`;
+	const statusLabel =
+		textureResult.status === "loading"
+			? "Loading image"
+			: textureResult.status === "failed"
+				? `Image failed: ${textureResult.error ?? "unknown"}`
+				: block.imageFilename || block.text || label;
+	const text = `📷 ${compactText(statusLabel, 42)}`;
 	textPool.acquire(
 		text,
 		centeredTextX(text, x, width, SMALL_STYLE),
 		y + height / 2 - 8,
 		SMALL_STYLE,
-		theme.dimmed,
+		textureResult.status === "failed" ? theme.red : theme.dimmed,
 	);
 }
 
