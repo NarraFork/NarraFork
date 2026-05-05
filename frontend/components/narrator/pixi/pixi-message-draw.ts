@@ -1674,7 +1674,7 @@ function drawToolUseBlock(
 	}
 
 	const iconBoxX = bx + header.x;
-	const iconBoxY = by + header.y + 1;
+	const iconBoxY = by + header.y + 2;
 	gfx.roundRect(iconBoxX, iconBoxY, 16, 16, 4);
 	gfx.fill({ color: categoryColor, alpha: 0.16 });
 	iconPool.acquire(
@@ -1696,7 +1696,7 @@ function drawToolUseBlock(
 	iconPool.acquire(
 		getPixiToolStatusIcon(block.toolStatus, statusColor, statusSize),
 		statusX,
-		by + header.y + 3,
+		by + header.y + 4,
 		statusSize,
 	);
 	if (block.toolDuration) {
@@ -1706,7 +1706,7 @@ function drawToolUseBlock(
 	iconPool.acquire(
 		getPixiToolChevronIcon(toolExpanded, theme.dimmed, chevronSize),
 		chevronX,
-		by + header.y + 3,
+		by + header.y + 4,
 		chevronSize,
 		0.85,
 	);
@@ -1717,7 +1717,7 @@ function drawToolUseBlock(
 		textPool.acquire(
 			compactText(summary, summaryMaxChars),
 			nameX + nameWidth,
-			by + header.y + 2,
+			by + header.y + 3,
 			MONO_STYLE,
 			theme.text,
 		);

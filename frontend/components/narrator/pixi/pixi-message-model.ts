@@ -111,6 +111,9 @@ export interface PixiMessageBlockModel {
 	toolDetailBlocks?: PixiToolDetailBlockModel[];
 	toolChildCount?: number;
 	toolIsSubagent?: boolean;
+	toolSubagentType?: string;
+	toolSubagentModel?: string;
+	toolSubagentDescription?: string;
 	toolInRun?: boolean;
 	toolIsLast?: boolean;
 	toolDefaultOpen?: boolean;
@@ -1593,6 +1596,18 @@ function buildToolUseBlock(
 	if (pendingPermission) {
 		detailBlocks.push(permissionPanel(pendingPermission, item.tc.toolName, summary || status));
 	}
+	// Extract subagent-specific fields
+	const subagentType = item.isSubagent
+		? extractField(item.tc.inputJson, "subagent_type") || "agent"
+		: undefined;
+	const subagentModel = item.isSubagent
+		? extractField(item.tc.inputJson, "model") || undefined
+		: undefined;
+	const subagentDescription = item.isSubagent
+		? extractField(item.tc.inputJson, "description") ||
+			extractField(item.tc.inputJson, "prompt")?.slice(0, 100) ||
+			undefined
+		: undefined;
 	return {
 		type: "tool_use",
 		label: item.isSubagent ? "Agent" : item.tc.toolName,
@@ -1621,6 +1636,9 @@ function buildToolUseBlock(
 		toolDetailBlocks: detailBlocks,
 		toolChildCount: item.children.length,
 		toolIsSubagent: item.isSubagent,
+		toolSubagentType: subagentType,
+		toolSubagentModel: subagentModel,
+		toolSubagentDescription: subagentDescription,
 		toolInRun: inRun,
 		toolIsLast: isLast,
 		toolKey,
