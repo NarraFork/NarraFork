@@ -3816,6 +3816,15 @@ export function InlinePermission({
 			typeof suggestion === "object" &&
 			(suggestion as { type?: string }).type === "yolo_reflection",
 	) as { status?: string; message?: string } | undefined;
+	const localizedDecisionReason = (() => {
+		if (!permission.decisionReason) return null;
+		const prefix = "YOLO safety pause:";
+		if (permission.decisionReason.startsWith(prefix)) {
+			const summary = permission.decisionReason.slice(prefix.length).trim();
+			return summary ? t("yoloSafetyPauseReason", { summary }) : t("yoloSafetyPauseReasonGeneric");
+		}
+		return permission.decisionReason;
+	})();
 
 	// ExitPlanMode: show plan content above the allow/deny buttons
 	const planText =
@@ -3882,7 +3891,7 @@ export function InlinePermission({
 						content={editedPlan ?? planText}
 						markdown
 						contentType="markdown"
-						title="Plan"
+						title={t("plan")}
 					/>
 				</Box>
 			)}
@@ -3897,9 +3906,9 @@ export function InlinePermission({
 					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
 				/>
 			)}
-			{permission.decisionReason && (
+			{localizedDecisionReason && (
 				<Text size="xs" c="dimmed" mb={4}>
-					{permission.decisionReason}
+					{localizedDecisionReason}
 				</Text>
 			)}
 			{yoloReflectionSuggestion && (
@@ -3910,11 +3919,10 @@ export function InlinePermission({
 						</ThemeIcon>
 						<Box>
 							<Text size="xs" fw={600} c="yellow.1">
-								YOLO safety reflection running
+								{t("yoloReflectionRunning")}
 							</Text>
 							<Text size="xs" c="yellow.2">
-								{yoloReflectionSuggestion.message ??
-									"AI is reflecting on this pending high-risk operation."}
+								{t("yoloReflectionMessage")}
 							</Text>
 						</Box>
 					</Group>

@@ -13,6 +13,12 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
+import {
+	appendSideCarsForApi,
+	outputToText,
+	sideCarsForToolResult,
+	sideCarsForUserMessage,
+} from "./sidecar";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
@@ -424,6 +430,7 @@ export class ClineProvider implements ProviderAdapter {
 	private buildClineHistory(dbMessages: DbMessage[]): {
 		history: ClineMessage[];
 		trailingToolResults: ClineToolResult[];
+		trailingUserText?: string;
 	} {
 		// Filter model-visible messages: user, assistant, sys (system context)
 		// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -439,6 +446,7 @@ export class ClineProvider implements ProviderAdapter {
 
 		const history: ClineMessage[] = [];
 		let pendingToolResults: ClineToolResult[] = [];
+		let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 		for (const msg of topLevel) {
 			if (msg.role === "assistant") {
@@ -446,7 +454,10 @@ export class ClineProvider implements ProviderAdapter {
 				for (const tr of pendingToolResults) {
 					history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 				}
+				const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
+				if (pendingSideCarText) history.push({ role: "user", content: pendingSideCarText });
 				pendingToolResults = [];
+				pendingUserSideCars = [];
 
 				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 				const textParts = content
@@ -485,12 +496,10 @@ export class ClineProvider implements ProviderAdapter {
 				if (msg.toolCalls) {
 					for (const tc of msg.toolCalls) {
 						if (tc.status === "success" || tc.status === "fail") {
-							const outputText =
-								typeof tc.outputJson === "string"
-									? tc.outputJson
-									: tc.outputJson != null
-										? JSON.stringify(tc.outputJson)
-										: "";
+							const outputText = appendSideCarsForApi(
+								outputToText(tc.outputJson),
+								sideCarsForToolResult(msg.sideCars, tc.toolUseId),
+							);
 							pendingToolResults.push({
 								tool_call_id: tc.toolUseId,
 								content: outputText,
@@ -498,6 +507,7 @@ export class ClineProvider implements ProviderAdapter {
 						}
 					}
 				}
+				pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 			} else if (msg.role === "user") {
 				// Flush pending tool results before user message
 				for (const tr of pendingToolResults) {
@@ -505,15 +515,19 @@ export class ClineProvider implements ProviderAdapter {
 				}
 				pendingToolResults = [];
 
-				const text = msg.contentText || "";
+				const text = appendSideCarsForApi(msg.contentText || "", pendingUserSideCars);
 				if (text) {
 					history.push({ role: "user", content: text });
 				}
+				pendingUserSideCars = [];
 			} else if (msg.role === "sys") {
 				for (const tr of pendingToolResults) {
 					history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 				}
+				const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
+				if (pendingSideCarText) history.push({ role: "user", content: pendingSideCarText });
 				pendingToolResults = [];
+				pendingUserSideCars = [];
 
 				const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 				const textParts = content
@@ -526,7 +540,11 @@ export class ClineProvider implements ProviderAdapter {
 			}
 		}
 
-		return { history, trailingToolResults: pendingToolResults };
+		return {
+			history,
+			trailingToolResults: pendingToolResults,
+			trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
+		};
 	}
 
 	private async collectStreamTextWithMeta(

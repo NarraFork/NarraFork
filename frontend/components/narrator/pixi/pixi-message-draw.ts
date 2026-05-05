@@ -56,6 +56,7 @@ const INLINE_CODE_STYLE = new TextStyle({
 	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
 	fontSize: PIXI_MESSAGE_FONT.sizes.code,
 });
+const inlineCodeStyleCache = new Map<number, TextStyle>();
 const MONO_STYLE = new TextStyle({
 	fontFamily: PIXI_MESSAGE_FONT.monoFamily,
 	fontSize: PIXI_MESSAGE_FONT.sizes.code,
@@ -97,6 +98,8 @@ const HEADING_4_STYLE = new TextStyle({
 const CODE_PADDING_X = PIXI_MESSAGE_METRICS.codePaddingX;
 const CODE_PADDING_Y = PIXI_MESSAGE_METRICS.codePaddingY;
 const CODE_LINE_H = PIXI_MESSAGE_METRICS.codeLineHeight;
+const INLINE_CODE_PADDING_X = 4;
+const INLINE_CODE_PADDING_Y = 2;
 const BLOCKQUOTE_INDENT = PIXI_MESSAGE_METRICS.blockquoteIndent;
 const LIST_INDENT = PIXI_MESSAGE_METRICS.listIndent;
 const AVATAR_INITIAL_STYLE = new TextStyle({
@@ -379,8 +382,25 @@ function splitInlineTokensByPretextLines(
 	return result;
 }
 
+function fontSizeOf(style: TextStyle): number {
+	return typeof style.fontSize === "number" ? style.fontSize : PIXI_MESSAGE_FONT.sizes.body;
+}
+
+function inlineCodeStyleForBaseStyle(baseStyle: TextStyle): TextStyle {
+	if (baseStyle === BODY_STYLE) return INLINE_CODE_STYLE;
+	const fontSize = Math.max(PIXI_MESSAGE_FONT.sizes.code, fontSizeOf(baseStyle) - 2);
+	const cached = inlineCodeStyleCache.get(fontSize);
+	if (cached) return cached;
+	const style = new TextStyle({
+		fontFamily: PIXI_MESSAGE_FONT.monoFamily,
+		fontSize,
+	});
+	inlineCodeStyleCache.set(fontSize, style);
+	return style;
+}
+
 function inlineStyleForToken(token: MdInlineToken, baseStyle: TextStyle): TextStyle {
-	if (token.kind === "code") return INLINE_CODE_STYLE;
+	if (token.kind === "code") return inlineCodeStyleForBaseStyle(baseStyle);
 	if (token.kind === "strong" && baseStyle === BODY_STYLE) return BODY_STRONG_STYLE;
 	if (token.kind === "em" && baseStyle === BODY_STYLE) return BODY_EM_STYLE;
 	if (token.kind === "delete") return BODY_STRIKE_STYLE;
@@ -396,6 +416,19 @@ function inlineColorForToken(
 	if (token.kind === "code") return theme.text;
 	if (token.kind === "delete") return theme.dimmed;
 	return baseColor;
+}
+
+function inlineTextYForToken(
+	token: MdInlineToken,
+	lineY: number,
+	baseStyle: TextStyle,
+	tokenStyle: TextStyle,
+): number {
+	if (token.kind === "code") {
+		return lineY + Math.max(0, (fontSizeOf(baseStyle) - fontSizeOf(tokenStyle)) / 2) - 1;
+	}
+	if (tokenStyle !== baseStyle) return lineY - 1;
+	return lineY;
 }
 
 function drawInlineMarkdownTextLines(
@@ -421,16 +454,29 @@ function drawInlineMarkdownTextLines(
 			if (!token.text) continue;
 			const tokenStyle = inlineStyleForToken(token, style);
 			const tokenColor = inlineColorForToken(token, theme, color);
-			const advance =
+			const textAdvance =
 				token.kind === "code"
 					? measureMonoAdvance(token.text, tokenStyle)
 					: textWidth(token.text, tokenStyle);
+			const advance = token.kind === "code" ? textAdvance + INLINE_CODE_PADDING_X * 2 : textAdvance;
+			const textX = token.kind === "code" ? tokenX + INLINE_CODE_PADDING_X : tokenX;
+			const textY = inlineTextYForToken(token, lineY, style, tokenStyle);
 			if (token.kind === "code") {
-				gfx.roundRect(tokenX - 3, lineY + 1, advance + 6, Math.max(14, mdBlock.lineHeight - 4), 4);
+				const pillHeight = Math.min(
+					mdBlock.lineHeight,
+					Math.max(14, fontSizeOf(tokenStyle) + INLINE_CODE_PADDING_Y * 2),
+				);
+				gfx.roundRect(
+					tokenX,
+					lineY + (mdBlock.lineHeight - pillHeight) / 2,
+					advance,
+					pillHeight,
+					4,
+				);
 				gfx.fill({ color: theme.toolBg, alpha: 0.9 });
 				gfx.stroke({ color: theme.toolBorder, alpha: 0.42, width: 1 });
 			}
-			textPool.acquire(token.text, tokenX, lineY, tokenStyle, tokenColor);
+			textPool.acquire(token.text, textX, textY, tokenStyle, tokenColor);
 			if (token.kind === "link") {
 				const underlineY = lineY + mdBlock.lineHeight - 4;
 				gfx.moveTo(tokenX, underlineY);
@@ -686,24 +732,32 @@ function compactText(text: string, maxChars: number): string {
 	return `${singleLine.slice(0, Math.max(0, maxChars - 1))}…`;
 }
 
-function measureMonoAdvance(text: string, style: TextStyle): number {
-	if (!text) return 0;
-	const fontSize = typeof style.fontSize === "number" ? style.fontSize : 12;
-	const family = Array.isArray(style.fontFamily) ? style.fontFamily[0] : style.fontFamily;
-	const fontWeight = style.fontWeight ? `${style.fontWeight} ` : "";
-	const font = `${fontWeight}${fontSize}px ${family ?? "monospace"}`;
-	// Use canvas measurement for token advances. pretext intentionally ignores
-	// some standalone whitespace in natural-width measurement, but syntax tokens
-	// need exact spaces/tabs to keep operators and words separated.
-	return measureCanvasTextWidth(text, font);
-}
-
-function textWidth(text: string, style: TextStyle): number {
+function cssFontForStyle(style: TextStyle, fallbackFamily: string): string {
 	const fontSize = typeof style.fontSize === "number" ? style.fontSize : 12;
 	const family = Array.isArray(style.fontFamily) ? style.fontFamily[0] : style.fontFamily;
 	const fontStyle = style.fontStyle ? `${style.fontStyle} ` : "";
 	const fontWeight = style.fontWeight ? `${style.fontWeight} ` : "";
-	return measureTextWidth(text, `${fontStyle}${fontWeight}${fontSize}px ${family ?? "sans-serif"}`);
+	return `${fontStyle}${fontWeight}${fontSize}px ${family ?? fallbackFamily}`;
+}
+
+function measureMonoAdvance(text: string, style: TextStyle): number {
+	if (!text) return 0;
+	// Use canvas measurement for token advances. pretext intentionally ignores
+	// some standalone whitespace in natural-width measurement, but syntax tokens
+	// need exact spaces/tabs to keep operators and words separated.
+	return measureCanvasTextWidth(text, cssFontForStyle(style, "monospace"));
+}
+
+function shouldMeasureTextStyleWithCanvas(style: TextStyle): boolean {
+	return (
+		!!style.fontWeight || !!style.fontStyle || style.fontFamily === PIXI_MESSAGE_FONT.monoFamily
+	);
+}
+
+function textWidth(text: string, style: TextStyle): number {
+	const font = cssFontForStyle(style, "sans-serif");
+	if (shouldMeasureTextStyleWithCanvas(style)) return measureCanvasTextWidth(text, font);
+	return measureTextWidth(text, font);
 }
 
 function centeredTextX(text: string, x: number, width: number, style: TextStyle): number {

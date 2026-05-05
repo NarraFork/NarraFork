@@ -21,6 +21,7 @@ import {
 import { estimateTokens } from "./estimate-tokens";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
+import { appendSideCarsForApi } from "./sidecar";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
@@ -37,6 +38,7 @@ import { YOLO_REFLECTION_TOOLS } from "./tools/yolo-pause";
 import type {
 	AgentConfig,
 	AgentEvent,
+	AgentSideCar,
 	AgentToolUse,
 	ContentBlock,
 	PermissionResult,
@@ -314,6 +316,8 @@ const PARALLEL_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 ]);
 
+const TODO_REMINDER_TOOL_INTERVAL = 4;
+
 /** Whether a tool use should skip parallel grouping and early execution. */
 function isStrictSerial(tu: AgentToolUse): boolean {
 	return (
@@ -526,7 +530,7 @@ export async function runReflectionLoop(options: ReflectionLoopRunOptions): Prom
 			reflectionLoop,
 			onEvent: undefined,
 			onBeforeTurn: undefined,
-			getInjectedUserText: undefined,
+			getSideCars: undefined,
 			shouldStop: undefined,
 			toolFilter: undefined,
 			permissionHandler: async (toolName, input, toolUseId) => {
@@ -857,6 +861,68 @@ export async function* agentLoop(
 	let tools = provider.formatTools(allTools);
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
+	let completedToolCount = config.sideCarInitialCompletedToolCount ?? 0;
+	const countedToolUseIds = new Set<string>();
+	const sideCarCheckedToolUseIds = new Set<string>();
+
+	async function collectToolResultSideCars(
+		tu: AgentToolUse,
+		result: ToolExecResult,
+	): Promise<AgentSideCar[]> {
+		if (result.broken || result.fatal || tu.name === "TaskCreate") return [];
+		if (!countedToolUseIds.has(tu.toolUseId)) {
+			countedToolUseIds.add(tu.toolUseId);
+			completedToolCount++;
+			config.onSideCarCompletedToolCount?.(completedToolCount);
+		}
+		if (!config.getSideCars || sideCarCheckedToolUseIds.has(tu.toolUseId)) {
+			return [];
+		}
+		sideCarCheckedToolUseIds.add(tu.toolUseId);
+		if (completedToolCount % TODO_REMINDER_TOOL_INTERVAL !== 0) {
+			return [];
+		}
+		try {
+			const sideCars = await config.getSideCars({
+				phase: "tool_result",
+				toolName: tu.name,
+				toolUseId: tu.toolUseId,
+				completedToolCount,
+			});
+			return sideCars.filter((sc) => sc.target === "tool_result");
+		} catch (err) {
+			logger.warn("Failed to collect tool result sidecars", {
+				narratorId: config.narratorId,
+				toolUseId: tu.toolUseId,
+				error: String(err),
+			});
+		}
+		return [];
+	}
+
+	/** Returns the assembled output (raw + sidecars) for the model API. */
+	async function applyToolResultReminder(
+		tu: AgentToolUse,
+		result: ToolExecResult,
+	): Promise<string> {
+		const sideCars = await collectToolResultSideCars(tu, result);
+		if (sideCars.length === 0) return result.output;
+		return appendSideCarsForApi(result.output, sideCars);
+	}
+
+	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
+		if (!config.getSideCars) return [];
+		try {
+			const sideCars = await config.getSideCars({ phase: "after_tools" });
+			return sideCars.filter((sc) => sc.target === "user_message");
+		} catch (err) {
+			logger.warn("Failed to collect after-tools sidecars", {
+				narratorId: config.narratorId,
+				error: String(err),
+			});
+		}
+		return [];
+	}
 
 	// Shallow-copy to avoid mutating the caller's array
 	history = [...history];
@@ -1613,7 +1679,7 @@ export async function* agentLoop(
 											toolName: prevTu.name,
 											output: sr.broken
 												? getToolMessage("brokenToolCallResult", locale)
-												: sr.output,
+												: await applyToolResultReminder(prevTu, sr),
 											isError: sr.isError ?? false,
 											durationMs: sr.durationMs,
 											permissionStartedAt: sr.permissionStartedAt,
@@ -2320,7 +2386,9 @@ export async function* agentLoop(
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+					output: sr.broken
+						? getToolMessage("brokenToolCallResult", locale)
+						: await applyToolResultReminder(tu, sr),
 					isError: sr.isError ?? false,
 					durationMs: sr.durationMs,
 					permissionStartedAt: sr.permissionStartedAt,
@@ -2393,7 +2461,9 @@ export async function* agentLoop(
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+					output: sr.broken
+						? getToolMessage("brokenToolCallResult", locale)
+						: await applyToolResultReminder(tu, sr),
 					isError: sr.isError ?? false,
 					durationMs: sr.durationMs,
 					permissionStartedAt: sr.permissionStartedAt,
@@ -2500,9 +2570,14 @@ export async function* agentLoop(
 				// update the in-memory tool_use so pushAssistantTurn writes the correct
 				// input into history — otherwise the model sees the original (wrong) path.
 				if (result.updatedInput) tu.input = result.updatedInput;
+				const toolSideCars = await collectToolResultSideCars(tu, result);
+				const outputWithReminder =
+					toolSideCars.length > 0
+						? appendSideCarsForApi(result.output, toolSideCars)
+						: result.output;
 				const isLastTool = toolIndex === toolUses.length - 1;
 				const outputForModel =
-					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
+					isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
 
 				pendingToolResults.push(
 					provider.formatToolResult(
@@ -2550,7 +2625,7 @@ export async function* agentLoop(
 						: undefined;
 					const displayOutput = result.broken
 						? getToolMessage("brokenToolCallResult", locale)
-						: result.output;
+						: outputWithReminder;
 
 					yield {
 						type: "tool_result",
@@ -2565,6 +2640,7 @@ export async function* agentLoop(
 							durationMs !== result.durationMs
 								? { ...result.metadata, execDurationMs: result.durationMs }
 								: result.metadata,
+						sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 					};
 					toolIndex++;
 
@@ -2634,9 +2710,14 @@ export async function* agentLoop(
 					}
 					if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
+					const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
+					const outputWithReminder =
+						parallelSideCars.length > 0
+							? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
+							: effectiveResult.output;
 					const isLastTool = toolIndex === toolUses.length - 1 && remaining.size === 0;
 					const outputForModel =
-						isLastTool && shouldNudge ? effectiveResult.output + nudgeText : effectiveResult.output;
+						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
 
 					pendingToolResults.push(
 						provider.formatToolResult(
@@ -2653,7 +2734,7 @@ export async function* agentLoop(
 							: undefined;
 						const displayOutput = effectiveResult.broken
 							? getToolMessage("brokenToolCallResult", locale)
-							: effectiveResult.output;
+							: outputWithReminder;
 
 						yield {
 							type: "tool_result",
@@ -2668,6 +2749,7 @@ export async function* agentLoop(
 							brokenInputOverride,
 							updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
 							metadata: effectiveResult.metadata,
+							sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
 						};
 					}
 					toolIndex++;
@@ -2753,14 +2835,15 @@ export async function* agentLoop(
 			);
 		}
 
-		// Allow external code (e.g. onExitPlanMode) to inject text into the next
-		// user turn. This text rides alongside the pending tool results so the
-		// model sees both the tool output and the injected message in one request.
-		if (config.getInjectedUserText) {
-			const injected = config.getInjectedUserText();
+		// Collect after-tools sidecars (replaces getInjectedUserText).
+		// These are assembled into the next user turn's text portion.
+		const afterToolsSideCars = await collectAfterToolsSideCars();
+		if (afterToolsSideCars.length > 0) {
+			const injected = appendSideCarsForApi("", afterToolsSideCars);
 			if (injected) {
 				nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
 			}
+			yield { type: "sidecars", sideCars: afterToolsSideCars };
 		}
 
 		yield { type: "turn_complete", turnIndex };

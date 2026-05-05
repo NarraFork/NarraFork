@@ -1298,7 +1298,7 @@ export const narratorPersistence = {
 		const ids = refs.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
+			with: { toolCalls: true, sideCars: true },
 		});
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
@@ -1405,7 +1405,7 @@ export const narratorPersistence = {
 		const ids = refs.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
+			with: { toolCalls: true, sideCars: true },
 		});
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));

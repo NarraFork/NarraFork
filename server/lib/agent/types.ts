@@ -142,6 +142,24 @@ export type PermissionResult =
 
 // === Agent events (yielded by the loop) ===
 
+export type AgentSideCarTarget = "tool_result" | "user_message";
+
+export interface AgentSideCar {
+	id?: string;
+	target: AgentSideCarTarget;
+	source: string;
+	content: string;
+	orderIndex?: number;
+	toolUseId?: string | null;
+}
+
+export interface AgentSideCarRequest {
+	phase: "tool_result" | "after_tools";
+	toolName?: string;
+	toolUseId?: string;
+	completedToolCount?: number;
+}
+
 export type AgentEvent =
 	| {
 			type: "assistant_message";
@@ -171,6 +189,7 @@ export type AgentEvent =
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;
+			sideCars?: AgentSideCar[];
 	  }
 	| { type: "tool_progress"; toolUseId: string; elapsed: number }
 	| { type: "tool_output"; toolUseId: string; output: string }
@@ -193,6 +212,7 @@ export type AgentEvent =
 			type: "block_complete";
 			block: ContentBlock;
 	  }
+	| { type: "sidecars"; sideCars: AgentSideCar[] }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
 	| { type: "retryable_error"; message: string }
@@ -414,12 +434,14 @@ export interface AgentConfig {
 		systemPrompt?: string;
 	} | null>;
 	/**
-	 * Called after tool execution to check if external code (e.g. onExitPlanMode)
-	 * wants to inject text into the next user turn alongside tool results.
-	 * The returned string is used as the user-text portion of pushUserTurn.
-	 * Consumed once per call (caller should clear after returning).
+	 * Unified sidecar channel. SideCars are stored separately and assembled into
+	 * either tool_result output or the next user message only when calling the API.
 	 */
-	getInjectedUserText?: () => string | null;
+	getSideCars?: (request: AgentSideCarRequest) => Promise<AgentSideCar[]> | AgentSideCar[];
+	/** Initial completed-tool count for sidecar cadence, persisted by caller across loop runs. */
+	sideCarInitialCompletedToolCount?: number;
+	/** Called whenever the sidecar cadence counter advances. */
+	onSideCarCompletedToolCount?: (completedToolCount: number) => void;
 	/**
 	 * Called before each non-first turn to check if the model should be switched.
 	 * When a new model is returned, the loop re-resolves the provider and rebuilds

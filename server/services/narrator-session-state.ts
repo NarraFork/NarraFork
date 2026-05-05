@@ -81,6 +81,8 @@ export interface ActiveNarrator {
 	_goalContinuationSuppressed?: boolean;
 	_goalContinuationTurn?: boolean;
 	_goalContinuationNoToolCount?: number;
+	/** Completed non-TaskCreate tool count used to keep TODO reminder cadence across loop runs. */
+	_todoReminderCompletedToolCount?: number;
 }
 
 // === PendingPermission interface ===

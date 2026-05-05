@@ -79,6 +79,7 @@ import {
 	resolveManualOverride,
 } from "./subagent-manual-override";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
+import { buildTodoToolResultReminder } from "./todo-reminder";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
@@ -174,7 +175,7 @@ export async function ensureNarrator(
  * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-conversation.
  */
 async function buildSystemPrompt(
-	narrator: { systemPrompt: string | null; contextSummary: string | null; todosJson?: unknown },
+	narrator: { systemPrompt: string | null; contextSummary: string | null },
 	cwd: string,
 	locale: Locale,
 	replyInUserLanguage: boolean,
@@ -187,7 +188,6 @@ async function buildSystemPrompt(
 		cwd,
 		locale,
 		contextSummary: narrator.contextSummary,
-		todosJson: narrator.todosJson,
 		planMode,
 		planFileId,
 		replyInUserLanguage,
@@ -261,7 +261,6 @@ async function createNarrator(
 		{
 			systemPrompt: narrator.systemPrompt,
 			contextSummary: effectiveContextSummary,
-			todosJson: narrator.todosJson,
 		},
 		narratorCwd,
 		locale,
@@ -400,7 +399,6 @@ async function finalizeInterruptedRun(
 
 // === Agent loop execution ===
 
-/** Append pending todos to the user message text so the model has context. */
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
 	return narratorGoalService.goalTokenDeltaForUsage(usage);
 }
@@ -458,25 +456,6 @@ async function maybeStartGoalContinuation(
 	});
 	active._goalContinuationTurn = true;
 	return prompt;
-}
-
-/** Append pending todos to the user message text so the model has context. */
-function appendTodosContext(text: string, todosJson: unknown): string {
-	if (!Array.isArray(todosJson) || todosJson.length === 0) return text;
-	const pending = todosJson.filter((t: { status?: string }) => t.status !== "completed");
-	if (pending.length === 0) return text;
-	const statusIcon: Record<string, string> = {
-		in_progress: "→",
-		pending: "○",
-	};
-	const lines = pending.map(
-		(t: { id?: string; content?: string; status?: string; priority?: string }) => {
-			const icon = statusIcon[t.status ?? "pending"] ?? "○";
-			const pri = t.priority && t.priority !== "medium" ? ` [${t.priority}]` : "";
-			return `${icon} [${t.id}] ${t.content ?? ""}${pri}`;
-		},
-	);
-	return `${text}\n\n<current_todos>\n${lines.join("\n")}\n</current_todos>`;
 }
 
 interface ContinuableTopLevelMessage {
@@ -791,7 +770,6 @@ export async function runAgentLoop(
 				{
 					systemPrompt: freshNarrator.systemPrompt,
 					contextSummary: freshNarrator.contextSummary,
-					todosJson: freshNarrator.todosJson,
 				},
 				active.cwd,
 				locale,
@@ -880,7 +858,6 @@ export async function runAgentLoop(
 						{
 							systemPrompt: freshNarrator.systemPrompt,
 							contextSummary: freshNarrator.contextSummary,
-							todosJson: freshNarrator.todosJson,
 						},
 						active.cwd,
 						locale,
@@ -1244,20 +1221,42 @@ export async function runAgentLoop(
 						locale,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
-				getInjectedUserText: () => {
-					let text: string | null = null;
+				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
+				onSideCarCompletedToolCount: (count) => {
+					active._todoReminderCompletedToolCount = count;
+				},
+				getSideCars: async (request) => {
+					if (request.phase === "tool_result") {
+						const row = await narratorService.getById(narratorId);
+						const reminder = buildTodoToolResultReminder(row.todosJson, locale);
+						if (!reminder) return [];
+						return [
+							{
+								target: "tool_result" as const,
+								source: "todo_reminder",
+								content: reminder,
+								toolUseId: request.toolUseId,
+							},
+						];
+					}
+					// phase === "after_tools"
+					const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
 
-					// Drain completed background subagent tasks (existing mechanism)
+					// Drain completed background subagent tasks
 					const subDone = drainCompletedBackgroundSubagents(narratorId);
 					if (subDone.length > 0) {
 						const lines = subDone.map(
 							(t) =>
 								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Await({ type: "agent", id: "${t.id}" }) to see the full result, or Send({ id: "${t.id}", message }) to continue.`,
 						);
-						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
+						sideCars.push({
+							target: "user_message",
+							source: "bg_agent",
+							content: lines.join("\n\n"),
+						});
 					}
 
-					// Drain completed background bash tasks from unified service
+					// Drain completed background bash tasks
 					const bashDone = backgroundTaskService.drainBashNotificationsSync(narratorId);
 					if (bashDone.length > 0) {
 						const lines = bashDone.map(
@@ -1265,10 +1264,14 @@ export async function runAgentLoop(
 								`[System] Background bash "${t.title || t.id}" (ID: ${t.alias ?? t.id}) ${t.status}.` +
 								`\nResult preview: ${t.outputPreview || "(empty)"}`,
 						);
-						text = text ? `${text}\n\n${lines.join("\n\n")}` : lines.join("\n\n");
+						sideCars.push({
+							target: "user_message",
+							source: "bg_bash",
+							content: lines.join("\n\n"),
+						});
 					}
 
-					return text;
+					return sideCars;
 				},
 				getModelOverride: () => {
 					// active.model is updated in real-time by updateNarratorModel()
@@ -1346,11 +1349,9 @@ export async function runAgentLoop(
 			// Run one agent loop pass
 
 			// When replaying a pure tool-result turn, preserve the original packet shape:
-			// no synthetic user text, no auto-added todos wrapper.
+			// no synthetic user text.
 			const isPureToolResultReplay = !currentText.trim() && trailingToolResults.length > 0;
-			const effectiveText = isPureToolResultReplay
-				? ""
-				: appendTodosContext(currentText, freshNarrator.todosJson);
+			const effectiveText = isPureToolResultReplay ? "" : currentText;
 
 			active._goalTurnStartedAtMs = Date.now();
 			active._goalTokenUsageBaseline = active._lastTokenUsage;

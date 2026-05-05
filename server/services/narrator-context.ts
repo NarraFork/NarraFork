@@ -4,6 +4,7 @@ import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { getSummaryModelContextWindow } from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
+import { buildTodoCompactContext } from "./todo-reminder";
 
 export { estimateTokens };
 
@@ -30,6 +31,19 @@ interface CompactEntry {
 	dropped: boolean;
 }
 
+const TODO_REMINDER_BLOCK_RE = /\n?\s*<todo_reminder>[\s\S]*?<\/todo_reminder>\s*/g;
+
+function stripTodoReminderBlocks(value: unknown): unknown {
+	if (typeof value === "string") return value.replace(TODO_REMINDER_BLOCK_RE, "").trimEnd();
+	if (Array.isArray(value)) return value.map(stripTodoReminderBlocks);
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, nested]) => [key, stripTodoReminderBlocks(nested)]),
+		);
+	}
+	return value;
+}
+
 /**
  * Convert a single message to its compact text representation.
  * Returns null for messages that produce no text (e.g. empty content, in-flight tools).
@@ -43,13 +57,13 @@ function messageToCompactText(m: CompactMessage): string | null {
 	if (tcs?.length && tcs.some((tc) => IN_FLIGHT_STATUSES.has(tc.status))) return null;
 
 	const role = m.role === "assistant" ? "Assistant" : "User";
-	let text = m.contentText || "";
+	let text = (stripTodoReminderBlocks(m.contentText || "") as string) || "";
 
 	// For assistant messages, enrich with tool call details
 	if (m.role === "assistant" && tcs?.length) {
 		const toolSummaries = tcs.map((tc) => {
 			const inputStr = summarizeJson(tc.inputJson, 300);
-			const outputStr = summarizeJson(tc.outputJson, 500);
+			const outputStr = summarizeJson(stripTodoReminderBlocks(tc.outputJson), 500);
 			const statusTag = tc.status === "fail" ? " [FAILED]" : "";
 			return `  - ${tc.toolName}${statusTag}: input=${inputStr} → output=${outputStr}`;
 		});
@@ -71,7 +85,7 @@ function messageToCompactTextPruned(m: CompactMessage): string | null {
 	if (tcs?.length && tcs.some((tc) => IN_FLIGHT_STATUSES.has(tc.status))) return null;
 
 	const role = m.role === "assistant" ? "Assistant" : "User";
-	const text = m.contentText || "";
+	const text = (stripTodoReminderBlocks(m.contentText || "") as string) || "";
 	if (!text) return null;
 	return `[${role}]: ${text}`;
 }
@@ -155,7 +169,7 @@ export const narratorContext = {
 		const messages =
 			providedMessages ?? (await narratorService.getMessagesSinceLastCompact(narratorId));
 
-		// Fetch narrator early — needed for contextSummary chaining and todo check
+		// Fetch narrator early — needed for contextSummary chaining
 		const narrator = await narratorService.getById(narratorId);
 
 		if (messages.length === 0 && !narrator.contextSummary) {
@@ -179,11 +193,12 @@ export const narratorContext = {
 
 		// ── Compute fixed overhead ──
 		const compactPrompt = getPrompt("compact", locale);
-		const todos = Array.isArray(narrator.todosJson) ? narrator.todosJson : [];
-		const hasPendingTodos = todos.some((t: { status?: string }) => t.status !== "completed");
-		const todoSkipHint = hasPendingTodos ? `\n\n${getToolMessage("compactTodoSkip", locale)}` : "";
+		const todoSkipHint = getToolMessage("compactTodoSkip", locale);
+		const latestTodoContext = buildTodoCompactContext(narrator.todosJson, locale);
 		const compactSuffix = getPrompt("compactSuffix", locale);
-		const compactSystemPrompt = `${compactPrompt}${todoSkipHint}`;
+		const compactSystemPrompt = [compactPrompt, todoSkipHint, latestTodoContext]
+			.filter(Boolean)
+			.join("\n\n");
 
 		const summaryCtxWindow = getSummaryModelContextWindow();
 		const tokenBudget = Math.floor(summaryCtxWindow * COMPACT_TARGET_RATIO);

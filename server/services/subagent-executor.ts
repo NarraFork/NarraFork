@@ -41,6 +41,7 @@ import {
 } from "./subagent-conclusion";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
+import { buildTodoToolResultReminder } from "./todo-reminder";
 
 // ---------------------------------------------------------------------------
 // Interfaces
@@ -430,6 +431,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const resolvedProvider = resolveProvider(model);
 		const resolvedServiceTier =
 			narratorFastMode && usesCodexApiMode(resolvedProvider) ? "priority" : undefined;
+		let todoReminderCompletedToolCount = 0;
 		const config: AgentConfig = {
 			narratorId,
 			conversationId: currentConversationId,
@@ -461,16 +463,34 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					parentNarratorId,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
-			getInjectedUserText: () => {
+			sideCarInitialCompletedToolCount: todoReminderCompletedToolCount,
+			onSideCarCompletedToolCount: (count) => {
+				todoReminderCompletedToolCount = count;
+			},
+			getSideCars: async (request) => {
+				if (request.phase === "tool_result") {
+					const row = await narratorService.getById(narratorId);
+					const reminder = buildTodoToolResultReminder(row.todosJson, locale as Locale);
+					if (!reminder) return [];
+					return [
+						{
+							target: "tool_result" as const,
+							source: "todo_reminder",
+							content: reminder,
+							toolUseId: request.toolUseId,
+						},
+					];
+				}
+				// phase === "after_tools"
+				const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
+
 				// 1. Check for buffered user messages
 				const queue = getSubagentBufferedMessagesMap().get(narratorId);
 				const buf = queue?.[0];
-				let userText: string | null = null;
 				if (buf) {
 					queue?.shift();
 					if (queue?.length === 0) getSubagentBufferedMessagesMap().delete(narratorId);
 					// Persist user message in the background (fire-and-forget).
-					// The text is injected into the next turn immediately.
 					narratorService
 						.persistSubagentUserMessage(narratorId, buf.text, toolUseId, buf.images)
 						.then((userMsg) => {
@@ -504,7 +524,11 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 						messageId: buf.id,
 						remaining,
 					});
-					userText = buf.text;
+					sideCars.push({
+						target: "user_message",
+						source: "buffered_user",
+						content: buf.text,
+					});
 				}
 
 				// 2. Drain team inbox and append as notifications
@@ -516,10 +540,14 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 								`[Team ${m.isBroadcast ? "broadcast" : "message"} from ${m.fromTitle ?? m.fromId} (${m.fromType})]: ${m.text}`,
 						)
 						.join("\n");
-					userText = userText ? `${userText}\n\n${teamBlock}` : teamBlock;
+					sideCars.push({
+						target: "user_message",
+						source: "team_message",
+						content: teamBlock,
+					});
 				}
 
-				return userText;
+				return sideCars;
 			},
 		};
 

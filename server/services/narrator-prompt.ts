@@ -6,7 +6,6 @@ import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
-	getTodoSystemReminder,
 	type Locale,
 } from "../lib/prompt-i18n";
 
@@ -19,8 +18,6 @@ export interface BuildPromptOptions {
 	locale: Locale;
 	/** Compact summary to inject (main narrator only) */
 	contextSummary?: string | null;
-	/** Todos JSON for reminder injection */
-	todosJson?: unknown;
 	/** Whether plan mode is active */
 	planMode?: boolean;
 	/** Plan file ID for plan mode (locks Write/Edit to .narrafork/plan-{id}.md) */
@@ -38,10 +35,10 @@ export interface BuildPromptResult {
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → AGENT.md/CLAUDE.md → ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → todos → plan mode.
+ * context summary → CWD → AGENT.md/CLAUDE.md → ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
- * optional fields (contextSummary, todosJson, planMode) to get a minimal prompt.
+ * optional fields (contextSummary, planMode) to get a minimal prompt.
  */
 export async function buildEffectiveSystemPrompt(
 	options: BuildPromptOptions,
@@ -51,7 +48,6 @@ export async function buildEffectiveSystemPrompt(
 		cwd,
 		locale,
 		contextSummary,
-		todosJson,
 		planMode,
 		planFileId,
 		replyInUserLanguage,
@@ -157,17 +153,7 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${sep}## Language\n\n${instruction}`;
 	}
 
-	// 5. Inject todo management reminder when narrator has active todos
-	if (
-		Array.isArray(todosJson) &&
-		todosJson.some((t: { status?: string }) => t.status !== "completed")
-	) {
-		const base = prompt ?? "";
-		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getTodoSystemReminder(locale)}`;
-	}
-
-	// 6. Inject plan mode system reminder
+	// 5. Inject plan mode system reminder
 	if (planMode) {
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";

@@ -18,6 +18,12 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
+import {
+	appendSideCarsForApi,
+	outputToText,
+	sideCarsForToolResult,
+	sideCarsForUserMessage,
+} from "./sidecar";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -1767,6 +1773,7 @@ function parseAnthropicEvent(
 function buildAnthropicHistory(dbMessages: DbMessage[]): {
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
+	trailingUserText?: string;
 } {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -1781,21 +1788,27 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 
 	const history: AnthropicMessage[] = [];
 	let pendingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }> = [];
+	let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 	for (const msg of topLevel) {
 		if (msg.role === "assistant") {
 			// Flush pending tool results as a user message
 			if (pendingToolResults.length > 0) {
+				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
 				history.push({
 					role: "user",
-					content: pendingToolResults.map((tr) => ({
-						type: "tool_result" as const,
-						tool_use_id: tr.tool_use_id,
-						content: tr.content,
-						is_error: tr.is_error,
-					})),
+					content: [
+						...pendingToolResults.map((tr) => ({
+							type: "tool_result" as const,
+							tool_use_id: tr.tool_use_id,
+							content: tr.content,
+							is_error: tr.is_error,
+						})),
+						...(sideCarText ? [{ type: "text" as const, text: sideCarText }] : []),
+					],
 				});
 				pendingToolResults = [];
+				pendingUserSideCars = [];
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -1939,12 +1952,10 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 			if (msg.toolCalls) {
 				for (const tc of msg.toolCalls) {
 					if (tc.status === "success" || tc.status === "fail") {
-						const outputText =
-							typeof tc.outputJson === "string"
-								? tc.outputJson
-								: tc.outputJson != null
-									? JSON.stringify(tc.outputJson)
-									: "";
+						const outputText = appendSideCarsForApi(
+							outputToText(tc.outputJson),
+							sideCarsForToolResult(msg.sideCars, tc.toolUseId),
+						);
 						pendingToolResults.push({
 							tool_use_id: tc.toolUseId,
 							content: outputText,
@@ -1953,33 +1964,47 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					}
 				}
 			}
+			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		} else if (msg.role === "user" || msg.role === "sys") {
 			// Flush pending tool results before the next model-visible context message
 			if (pendingToolResults.length > 0) {
+				const sideCarText = appendSideCarsForApi("", pendingUserSideCars);
 				history.push({
 					role: "user",
-					content: pendingToolResults.map((tr) => ({
-						type: "tool_result" as const,
-						tool_use_id: tr.tool_use_id,
-						content: tr.content,
-						is_error: tr.is_error,
-					})),
+					content: [
+						...pendingToolResults.map((tr) => ({
+							type: "tool_result" as const,
+							tool_use_id: tr.tool_use_id,
+							content: tr.content,
+							is_error: tr.is_error,
+						})),
+						...(sideCarText ? [{ type: "text" as const, text: sideCarText }] : []),
+					],
 				});
 				pendingToolResults = [];
+				pendingUserSideCars = [];
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
+			const text = appendSideCarsForApi(
+				textParts.join("\n") || msg.contentText || "",
+				pendingUserSideCars,
+			);
 			if (text) {
 				history.push({ role: "user", content: text });
 			}
+			pendingUserSideCars = [];
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return {
+		history,
+		trailingToolResults: pendingToolResults,
+		trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
+	};
 }
 
 // === Helpers ===

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages } from "../db/schema";
+import { apiRequests, narratorMessageRefs, narratorMessages, narratorSidecars } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { saveImageGenerationResult } from "../lib/agent/image-generation";
@@ -13,6 +13,7 @@ import {
 } from "../lib/api-request-tracker";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
@@ -1023,8 +1024,36 @@ export async function processEvent(
 				durationMs: event.durationMs,
 				...(event.updatedInput && { updatedInput: event.updatedInput }),
 				...(event.metadata && { metadata: event.metadata }),
+				...(event.sideCars?.length && { sideCars: event.sideCars }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
+
+			// Persist tool-result sidecars
+			if (event.sideCars?.length) {
+				const now = new Date().toISOString();
+				const partialId = ctx.getPartialMessageId();
+				try {
+					await db.insert(narratorSidecars).values(
+						event.sideCars.map((sc, idx) => ({
+							id: generateId(),
+							narratorId,
+							messageId: partialId ?? null,
+							toolUseId: event.toolUseId,
+							target: sc.target,
+							source: sc.source,
+							content: sc.content,
+							orderIndex: sc.orderIndex ?? idx,
+							createdAt: now,
+						})),
+					);
+				} catch (err) {
+					logger.warn("Failed to persist tool-result sidecars", {
+						narratorId,
+						toolUseId: event.toolUseId,
+						error: String(err),
+					});
+				}
+			}
 
 			// Main narrator: git tracking
 			if (hooks?.onGitTrack) {
@@ -1533,6 +1562,47 @@ export async function processEvent(
 			} finally {
 				// Clean up in-progress request info after persistence attempt.
 				ctx.apiRequestsMap?.delete(event.requestId);
+			}
+			return null;
+		}
+
+		case "sidecars": {
+			// Persist sidecars to DB and broadcast to frontend
+			const now = new Date().toISOString();
+			const partialId = ctx.getPartialMessageId();
+			if (event.sideCars.length > 0) {
+				try {
+					await db.insert(narratorSidecars).values(
+						event.sideCars.map((sc, idx) => ({
+							id: generateId(),
+							narratorId,
+							messageId: partialId ?? null,
+							toolUseId: sc.toolUseId ?? null,
+							target: sc.target,
+							source: sc.source,
+							content: sc.content,
+							orderIndex: sc.orderIndex ?? idx,
+							createdAt: now,
+						})),
+					);
+				} catch (err) {
+					logger.warn("Failed to persist sidecars", {
+						narratorId,
+						count: event.sideCars.length,
+						error: String(err),
+					});
+				}
+				dualBroadcast(ctx, {
+					type: "sidecars",
+					narratorId: broadcastTargetId,
+					sideCars: event.sideCars.map((sc) => ({
+						target: sc.target,
+						source: sc.source,
+						content: sc.content,
+						toolUseId: sc.toolUseId,
+					})),
+					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				});
 			}
 			return null;
 		}

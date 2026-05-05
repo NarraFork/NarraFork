@@ -179,6 +179,15 @@ export interface ToolCallRecord {
 	permissionSuggestions?: unknown[] | null;
 	resultMessageId?: string | null;
 	createdAt?: string;
+	sideCars?: SideCarRecord[];
+}
+
+export interface SideCarRecord {
+	target: "tool_result" | "user_message";
+	source: string;
+	content: string;
+	toolUseId?: string | null;
+	orderIndex?: number;
 }
 
 export interface WhitelistDir {

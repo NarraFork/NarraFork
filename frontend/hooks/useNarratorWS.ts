@@ -48,6 +48,12 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
 		parentToolUseId?: string,
+		sideCars?: Array<{
+			target: string;
+			source: string;
+			content: string;
+			toolUseId?: string | null;
+		}>,
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
@@ -324,6 +330,14 @@ export function useNarratorWS(
 							data.updatedInput as Record<string, unknown> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
+							data.sideCars as
+								| Array<{
+										target: string;
+										source: string;
+										content: string;
+										toolUseId?: string | null;
+								  }>
+								| undefined,
 						);
 						break;
 					case "tool_long_running":

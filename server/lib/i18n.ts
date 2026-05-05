@@ -44,8 +44,19 @@ const messages: Messages = {
 		"zh-CN": "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。",
 	},
 	"tool.compactTodoSkip": {
-		en: "Note: TODOs are tracked separately. Do NOT include any TODO or task list information in the summary.",
-		"zh-CN": "注意：待办事项已通过独立机制管理，摘要中不要包含任何 TODO 或待办事项信息。",
+		en: "Note: TODO reminder blocks in tool results are transient. Ignore any <todo_reminder> blocks in the message history; use only the latest TODO list below when TODO state is relevant.",
+		"zh-CN":
+			"注意：工具结果里的 TODO 提醒块是临时信息。请忽略消息历史中的 <todo_reminder> 块；只有在待办状态相关时，才使用下面的最新 TODO 列表。",
+	},
+	"tool.compactCurrentTodos": {
+		en: `<current_todos>
+Latest TODO list from narrator state:
+{todos}
+</current_todos>`,
+		"zh-CN": `<current_todos>
+来自叙述者状态的最新 TODO 列表：
+{todos}
+</current_todos>`,
 	},
 	"tool.enterPlanModeOutput": {
 		en: "Entered plan mode. Analyze and plan before making changes.",
@@ -132,6 +143,18 @@ const messages: Messages = {
 		en: "Updated todos: {total} total ({completed} completed, {inProgress} in progress, {pending} pending)",
 		"zh-CN":
 			"已更新待办事项：共 {total} 项（{completed} 已完成，{inProgress} 进行中，{pending} 待处理）",
+	},
+	"tool.todoReminder": {
+		en: `<todo_reminder>
+Current active todos:
+{todos}
+If any todo state changes, call TaskCreate with the complete updated list.
+</todo_reminder>`,
+		"zh-CN": `<todo_reminder>
+当前未完成待办：
+{todos}
+如果待办状态发生变化，请调用 TaskCreate 并传入完整更新后的列表。
+</todo_reminder>`,
 	},
 	"tool.suggestAnswerSystem": {
 		en: "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the full conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences.",
@@ -471,6 +494,7 @@ export type ToolMessageKey =
 	| "titleAck"
 	| "titleReminder"
 	| "compactTodoSkip"
+	| "compactCurrentTodos"
 	| "enterPlanModeOutput"
 	| "exitPlanModeOutput"
 	| "exitPlanModeApproved"
@@ -490,6 +514,7 @@ export type ToolMessageKey =
 	| "planModeToolDisabled"
 	| "planModeFileRedirected"
 	| "todoWriteOutput"
+	| "todoReminder"
 	| "suggestAnswerSystem"
 	| "turnNudge"
 	| "brokenToolCallReminder"

@@ -401,7 +401,7 @@ export const narratorMessageQueries = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: { toolCalls: true, sideCars: true },
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
@@ -452,7 +452,7 @@ export const narratorMessageQueries = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const messages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true },
+			with: { toolCalls: true, sideCars: true },
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));

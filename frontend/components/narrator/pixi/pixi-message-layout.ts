@@ -196,6 +196,7 @@ const BODY_STRONG_FONT = pixiCssFont(
 const BODY_EM_FONT = `italic ${PIXI_MESSAGE_FONT.sizes.body}px ${PIXI_MESSAGE_FONT.sansFamily}`;
 const SMALL_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.small, PIXI_MESSAGE_FONT.sansFamily);
 const CODE_FONT = pixiCssFont(PIXI_MESSAGE_FONT.sizes.code, PIXI_MESSAGE_FONT.monoFamily);
+const INLINE_CODE_PADDING_X = 4;
 const HEADING_FONTS: Record<PixiMessageHeadingLevel, string> = {
 	1: pixiCssFont(
 		PIXI_MESSAGE_FONT.headingSizes[1],
@@ -312,8 +313,18 @@ function hasStyledInlineTokens(tokens: MdInlineToken[] | undefined): boolean {
 	return !!tokens?.some((token) => token.kind !== "text");
 }
 
+function inlineCodeFontForBaseFont(baseFont: string): string {
+	if (baseFont === FONT) return CODE_FONT;
+	const baseSize = Number.parseInt(baseFont.match(/(\d+)px/)?.[1] ?? "0", 10);
+	if (!baseSize) return CODE_FONT;
+	return pixiCssFont(
+		Math.max(PIXI_MESSAGE_FONT.sizes.code, baseSize - 2),
+		PIXI_MESSAGE_FONT.monoFamily,
+	);
+}
+
 function fontForInlineToken(token: MdInlineToken, baseFont: string): string {
-	if (token.kind === "code") return CODE_FONT;
+	if (token.kind === "code") return inlineCodeFontForBaseFont(baseFont);
 	if (baseFont === FONT && token.kind === "strong") return BODY_STRONG_FONT;
 	if (baseFont === FONT && token.kind === "em") return BODY_EM_FONT;
 	return baseFont;
@@ -336,8 +347,12 @@ function measureCanvasTextWidth(text: string, font: string): number {
 	return ctx.measureText(text).width;
 }
 
+function shouldMeasureInlineWithCanvas(font: string): boolean {
+	return font !== FONT;
+}
+
 function measureInlineText(text: string, font: string): number {
-	if (font === CODE_FONT) return measureCanvasTextWidth(text, font);
+	if (shouldMeasureInlineWithCanvas(font)) return measureCanvasTextWidth(text, font);
 	return measureNaturalWidth(getPrepared(text || " ", font));
 }
 
@@ -377,19 +392,37 @@ function layoutInlineText(
 
 	for (const token of tokens ?? [{ kind: "text" as const, text }]) {
 		const font = fontForInlineToken(token, baseFont);
+		const isCode = token.kind === "code";
+		let codeRunOpen = false;
+		const openCodeRun = () => {
+			if (!isCode || codeRunOpen) return;
+			if (line && lineWidth + INLINE_CODE_PADDING_X > maxWidth) pushLine();
+			lineWidth += INLINE_CODE_PADDING_X;
+			codeRunOpen = true;
+		};
+		const closeCodeRun = () => {
+			if (!isCode || !codeRunOpen) return;
+			lineWidth += INLINE_CODE_PADDING_X;
+			codeRunOpen = false;
+		};
 		for (const char of Array.from(token.text)) {
 			if (truncated) break;
 			if (char === "\n") {
+				closeCodeRun();
 				pushLine();
 				continue;
 			}
+			openCodeRun();
 			const charWidth = measureInlineText(char, font);
-			if (line && lineWidth + charWidth > maxWidth) {
+			if (line && lineWidth + charWidth + (isCode ? INLINE_CODE_PADDING_X : 0) > maxWidth) {
+				if (isCode) codeRunOpen = false;
 				pushLine();
+				openCodeRun();
 			}
 			line += char;
 			lineWidth += charWidth;
 		}
+		closeCodeRun();
 		if (truncated) break;
 	}
 	if (!truncated && (line || lines.length === 0)) pushLine();

@@ -43,6 +43,24 @@ export type NarratorServerMessage =
 			output?: unknown;
 			durationMs?: number;
 			updatedInput?: Record<string, unknown>;
+			metadata?: Record<string, unknown>;
+			sideCars?: Array<{
+				target: string;
+				source: string;
+				content: string;
+				toolUseId?: string | null;
+			}>;
+			parentToolUseId?: string;
+	  }
+	| {
+			type: "sidecars";
+			narratorId: string;
+			sideCars: Array<{
+				target: string;
+				source: string;
+				content: string;
+				toolUseId?: string | null;
+			}>;
 			parentToolUseId?: string;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }

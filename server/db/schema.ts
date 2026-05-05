@@ -391,6 +391,31 @@ export const narratorMessageRefs = sqliteTable(
 	],
 );
 
+// === narrator_sidecars ===
+export const narratorSidecars = sqliteTable(
+	"narrator_sidecars",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		messageId: text("message_id").references(() => narratorMessages.id, {
+			onDelete: "cascade",
+		}),
+		toolUseId: text("tool_use_id"),
+		target: text("target", { enum: ["tool_result", "user_message"] }).notNull(),
+		source: text("source").notNull(),
+		content: text("content").notNull(),
+		orderIndex: integer("order_index").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_sidecars_message").on(table.messageId, table.target, table.orderIndex),
+		index("idx_sidecars_tool_use").on(table.toolUseId, table.target, table.orderIndex),
+		index("idx_sidecars_narrator").on(table.narratorId, table.createdAt),
+	],
+);
+
 // === narrator_tool_calls ===
 export const narratorToolCalls = sqliteTable(
 	"narrator_tool_calls",
