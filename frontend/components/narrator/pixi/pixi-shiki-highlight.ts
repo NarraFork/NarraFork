@@ -51,12 +51,13 @@ export function getPixiHighlightedTokens(
 	code: string,
 	lang: string | undefined,
 	theme: string,
+	cacheOnly?: boolean,
 ): PixiHighlightToken[][] | null {
 	if (!code || !lang || lang === "text") return null;
 	const key = `${theme}\u0000${lang}\u0000${code}`;
 	const cached = tokenCache.get(key);
 	if (cached) return cached;
-	if (loading.has(key)) return null;
+	if (cacheOnly || loading.has(key)) return null;
 
 	const cachedShiki = getCachedShiki();
 	const start = cachedShiki ? Promise.resolve(cachedShiki) : loadShiki();

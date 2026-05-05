@@ -1184,6 +1184,8 @@ export async function runAgentLoop(
 				signal: active.abortController.signal,
 				chapterId: active._chapterId,
 				planMode: freshNarrator.permissionMode === "plan",
+				previousPermissionMode:
+					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
 				relaxedPlan: !!freshNarrator.relaxedPlan,
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,

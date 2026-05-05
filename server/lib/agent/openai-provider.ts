@@ -1855,6 +1855,26 @@ export function parseResponsesAPIEvent(
 		results.push({ invalidState: { reason, message: `Response incomplete: ${reason}` } });
 		return results;
 	}
+	// Handle standalone "error" events from the Responses API.
+	// OpenAI sends these as: { type: "error", error: { type, code, message, param } }
+	// or the older documented format: { type: "error", code, message, param }
+	if (type === "error") {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic error event shape
+		const c = chunk as any;
+		const nested = c.error;
+		const errMsg =
+			(nested && typeof nested === "object" ? nested.message : undefined) ??
+			c.message ??
+			"Unknown API error";
+		const reason =
+			String(
+				(nested && typeof nested === "object" ? (nested.code ?? nested.type) : undefined) ??
+					c.code ??
+					"api_error",
+			) || "api_error";
+		results.push({ invalidState: { reason, message: errMsg } });
+		return results;
+	}
 
 	return results;
 }

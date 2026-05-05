@@ -401,6 +401,8 @@ export interface AgentConfig {
 	parentNarratorId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
+	/** Permission mode before entering plan mode — used to decide whether ExitPlanMode reflection is needed */
+	previousPermissionMode?: string;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */

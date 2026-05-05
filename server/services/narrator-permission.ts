@@ -1372,24 +1372,6 @@ export function classifyYoloDanger(
 		);
 	}
 
-	if (toolName === "Write") {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
-		if (filePath && existsSync(resolvePath(cwd, filePath))) {
-			return danger(
-				"Write will overwrite an existing file.",
-				[
-					"Existing content can be replaced in one operation.",
-					"If the file contains user changes, they may be difficult to reconstruct.",
-				],
-				[
-					"Read the file and use Edit for a smaller diff.",
-					"Create a backup or inspect git diff first.",
-				],
-				[`File: ${resolvePath(cwd, filePath)}`],
-			);
-		}
-	}
-
 	return null;
 }
 

@@ -3311,6 +3311,10 @@ export function NarratorPanel({
 		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || isFetchingNextPage) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
+		// Reset the "already triggered" gate when the effect re-runs after a fetch completes.
+		// Without this, the shift logic keeps the viewport near the top after prepending,
+		// and loadOlderNearTopRef stays true indefinitely (its reset requires scrollTop > 3×viewport).
+		loadOlderNearTopRef.current = false;
 		const check = () => {
 			// Normal scroll direction: scrollTop near 0 = near visual top (older messages).
 			// Trigger only once per deliberate upward entry into the top band. After a page

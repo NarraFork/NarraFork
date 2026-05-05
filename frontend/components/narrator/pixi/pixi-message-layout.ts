@@ -4,6 +4,7 @@ import {
 	measureNaturalWidth,
 	prepareWithSegments,
 } from "@chenglou/pretext";
+import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
 import { type MdBlock, type MdInlineToken, parseMarkdownBlocks } from "./pixi-markdown";
 import {
 	PIXI_MESSAGE_FONT,
@@ -18,6 +19,7 @@ import type {
 	PixiToolDetailBlockModel,
 	PixiToolDetailLineModel,
 } from "./pixi-message-model";
+import { getPixiHighlightedTokens } from "./pixi-shiki-highlight";
 
 export interface PixiLaidOutMarkdownBlock {
 	kind: MdBlock["kind"];
@@ -87,6 +89,8 @@ export interface PixiLaidOutToolDetailBlock {
 		oldNo?: number;
 		newNo?: number;
 		lines: LayoutLine[];
+		/** Word-level changes for modified lines (removed/added pairs) */
+		wordChanges?: Array<{ value: string; added?: boolean; removed?: boolean }>;
 	}>;
 	lineNumberPrefix?: string;
 	oldLines?: LayoutLine[];
@@ -293,6 +297,14 @@ function itemLayoutCacheKey(item: PixiMessageItem, itemWidth: number): string {
 	return `${itemWidth}\u0000${JSON.stringify(item)}`;
 }
 
+/** Split a diff change value into lines, removing trailing empty line from \n */
+function splitDiffValue(value: string): string[] {
+	if (!value) return [];
+	const lines = value.split("\n");
+	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	return lines;
+}
+
 function layoutText(text: string, width: number, font = FONT, lineHeight = LINE_H) {
 	const prepared = getPrepared(text || " ", font);
 	const result = layoutWithLines(prepared, Math.max(24, width), lineHeight);
@@ -311,6 +323,44 @@ function layoutText(text: string, width: number, font = FONT, lineHeight = LINE_
 
 function hasStyledInlineTokens(tokens: MdInlineToken[] | undefined): boolean {
 	return !!tokens?.some((token) => token.kind !== "text");
+}
+
+function shikiThemeNameForLayout(): string {
+	return document.documentElement.getAttribute("data-mantine-color-scheme") === "light"
+		? "github-light-default"
+		: "github-dark-default";
+}
+
+/**
+ * Expand code tokens into shiki-highlighted sub-tokens.
+ * Uses the synchronous cache path of getPixiHighlightedTokens — if the highlight
+ * is not yet cached, the code token is left as-is (will render without color until
+ * the async highlight completes and triggers a re-layout).
+ */
+function expandCodeTokensWithShiki(tokens: MdInlineToken[]): MdInlineToken[] {
+	const result: MdInlineToken[] = [];
+	for (const token of tokens) {
+		if (token.kind !== "code") {
+			result.push(token);
+			continue;
+		}
+		const highlighted = getPixiHighlightedTokens(
+			token.text,
+			"typescript",
+			shikiThemeNameForLayout(),
+			true, // cacheOnly — don't trigger loads during layout
+		);
+		if (highlighted?.[0]?.length) {
+			for (const ht of highlighted[0]) {
+				if (ht.content) {
+					result.push({ kind: "code", text: ht.content, color: ht.color });
+				}
+			}
+		} else {
+			result.push(token);
+		}
+	}
+	return result;
 }
 
 function inlineCodeFontForBaseFont(baseFont: string): string {
@@ -372,7 +422,11 @@ function layoutInlineText(
 	baseFont = FONT,
 	lineHeight = LINE_H,
 ) {
-	if (!hasStyledInlineTokens(tokens)) return layoutText(text, width, baseFont, lineHeight);
+	if (!hasStyledInlineTokens(tokens))
+		return { ...layoutText(text, width, baseFont, lineHeight), expandedTokens: undefined };
+
+	// Expand code tokens into shiki-highlighted sub-tokens before line-breaking
+	const expandedTokens = expandCodeTokensWithShiki(tokens as MdInlineToken[]);
 
 	const maxWidth = Math.max(24, width);
 	const lines: LayoutLine[] = [];
@@ -390,39 +444,49 @@ function layoutInlineText(
 		lineWidth = 0;
 	};
 
-	for (const token of tokens ?? [{ kind: "text" as const, text }]) {
+	let codeRunOpen = false;
+	for (const token of expandedTokens) {
 		const font = fontForInlineToken(token, baseFont);
 		const isCode = token.kind === "code";
-		let codeRunOpen = false;
-		const openCodeRun = () => {
-			if (!isCode || codeRunOpen) return;
-			if (line && lineWidth + INLINE_CODE_PADDING_X > maxWidth) pushLine();
-			lineWidth += INLINE_CODE_PADDING_X;
-			codeRunOpen = true;
-		};
-		const closeCodeRun = () => {
-			if (!isCode || !codeRunOpen) return;
-			lineWidth += INLINE_CODE_PADDING_X;
-			codeRunOpen = false;
-		};
 		for (const char of Array.from(token.text)) {
 			if (truncated) break;
 			if (char === "\n") {
-				closeCodeRun();
+				if (codeRunOpen) {
+					lineWidth += INLINE_CODE_PADDING_X;
+					codeRunOpen = false;
+				}
 				pushLine();
 				continue;
 			}
-			openCodeRun();
+			if (isCode && !codeRunOpen) {
+				if (line && lineWidth + INLINE_CODE_PADDING_X > maxWidth) pushLine();
+				lineWidth += INLINE_CODE_PADDING_X;
+				codeRunOpen = true;
+			}
 			const charWidth = measureInlineText(char, font);
-			if (line && lineWidth + charWidth + (isCode ? INLINE_CODE_PADDING_X : 0) > maxWidth) {
-				if (isCode) codeRunOpen = false;
+			if (
+				line &&
+				lineWidth + charWidth + (isCode && codeRunOpen ? INLINE_CODE_PADDING_X : 0) > maxWidth
+			) {
+				if (codeRunOpen) {
+					lineWidth += INLINE_CODE_PADDING_X;
+					codeRunOpen = false;
+				}
 				pushLine();
-				openCodeRun();
+				if (isCode) {
+					if (lineWidth + INLINE_CODE_PADDING_X <= maxWidth) {
+						lineWidth += INLINE_CODE_PADDING_X;
+						codeRunOpen = true;
+					}
+				}
 			}
 			line += char;
 			lineWidth += charWidth;
 		}
-		closeCodeRun();
+		if (!isCode && codeRunOpen) {
+			lineWidth += INLINE_CODE_PADDING_X;
+			codeRunOpen = false;
+		}
 		if (truncated) break;
 	}
 	if (!truncated && (line || lines.length === 0)) pushLine();
@@ -435,6 +499,7 @@ function layoutInlineText(
 		lineCount: lines.length,
 		height: Math.max(lineHeight, lines.length * lineHeight),
 		lines,
+		expandedTokens,
 	};
 }
 
@@ -579,7 +644,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					font,
 					lineHeight,
 					level: block.level,
-					inlineTokens: block.inlineTokens,
+					inlineTokens: result.expandedTokens ?? block.inlineTokens,
 				});
 				break;
 			}
@@ -595,7 +660,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
-					inlineTokens: block.inlineTokens,
+					inlineTokens: result.expandedTokens ?? block.inlineTokens,
 				});
 				break;
 			}
@@ -629,7 +694,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
-					inlineTokens: block.inlineTokens,
+					inlineTokens: result.expandedTokens ?? block.inlineTokens,
 				});
 				break;
 			}
@@ -647,7 +712,7 @@ function layoutMarkdownBlocks(markdown: string, width: number) {
 					height: Math.max(LINE_H, result.height),
 					font: FONT,
 					lineHeight: LINE_H,
-					inlineTokens: block.inlineTokens,
+					inlineTokens: result.expandedTokens ?? block.inlineTokens,
 					ordered: block.ordered,
 					index: block.index,
 					depth: block.depth,
@@ -890,10 +955,7 @@ function layoutToolDetailBlocks(
 		}
 		if (detail.kind === "diff-panel") {
 			const maxLines = detail.maxLines ?? 8;
-			const oldRaw = detail.oldText.split(/\r?\n/);
-			const newRaw = detail.newText.split(/\r?\n/);
 			const diffLines: NonNullable<PixiLaidOutToolDetailBlock["diffLines"]> = [];
-			const shared = Math.min(oldRaw.length, newRaw.length);
 			const diffTextWidth = Math.max(60, contentWidth - CODE_PADDING_X * 2 - 54);
 			let oldNo = detail.startLine ?? 1;
 			let newNo = detail.startLine ?? 1;
@@ -902,6 +964,7 @@ function layoutToolDetailBlocks(
 				text: string,
 				oldLineNo?: number,
 				newLineNo?: number,
+				wordChanges?: Array<{ value: string; added?: boolean; removed?: boolean }>,
 			) => {
 				const result = layoutText(text || " ", diffTextWidth, CODE_FONT, CODE_LINE_H);
 				diffLines.push({
@@ -910,22 +973,74 @@ function layoutToolDetailBlocks(
 					oldNo: oldLineNo,
 					newNo: newLineNo,
 					lines: result.lines.slice(0, 2),
+					wordChanges,
 				});
 			};
-			for (let i = 0; i < shared && diffLines.length < maxLines; i++) {
-				if (oldRaw[i] === newRaw[i]) {
-					pushDiff("context", oldRaw[i], oldNo++, newNo++);
-				} else {
-					pushDiff("removed", oldRaw[i], oldNo++);
-					if (diffLines.length < maxLines) pushDiff("added", newRaw[i], undefined, newNo++);
+
+			// Use proper diff algorithm
+			const changes = computeLineDiff(detail.oldText, detail.newText);
+			for (let i = 0; i < changes.length && diffLines.length < maxLines; i++) {
+				const change = changes[i];
+				if (!change.added && !change.removed) {
+					// Context lines
+					const lines = splitDiffValue(change.value);
+					for (const line of lines) {
+						if (diffLines.length >= maxLines) break;
+						pushDiff("context", line, oldNo++, newNo++);
+					}
+					continue;
+				}
+				if (change.removed) {
+					const next = changes[i + 1];
+					if (next?.added) {
+						// Modification pair: do word-level diff per paired line
+						const removedLines = splitDiffValue(change.value);
+						const addedLines = splitDiffValue(next.value);
+						const maxPaired = Math.min(removedLines.length, addedLines.length);
+						for (let j = 0; j < maxPaired && diffLines.length < maxLines; j++) {
+							const wc = diffWordsWithSpace(removedLines[j], addedLines[j]);
+							pushDiff(
+								"removed",
+								removedLines[j],
+								oldNo++,
+								undefined,
+								wc.filter((c) => !c.added),
+							);
+							if (diffLines.length < maxLines) {
+								pushDiff(
+									"added",
+									addedLines[j],
+									undefined,
+									newNo++,
+									wc.filter((c) => !c.removed),
+								);
+							}
+						}
+						for (let j = maxPaired; j < removedLines.length && diffLines.length < maxLines; j++) {
+							pushDiff("removed", removedLines[j], oldNo++);
+						}
+						for (let j = maxPaired; j < addedLines.length && diffLines.length < maxLines; j++) {
+							pushDiff("added", addedLines[j], undefined, newNo++);
+						}
+						i++; // skip the added chunk
+					} else {
+						// Pure removal
+						const lines = splitDiffValue(change.value);
+						for (const line of lines) {
+							if (diffLines.length >= maxLines) break;
+							pushDiff("removed", line, oldNo++);
+						}
+					}
+					continue;
+				}
+				// Pure addition
+				const lines = splitDiffValue(change.value);
+				for (const line of lines) {
+					if (diffLines.length >= maxLines) break;
+					pushDiff("added", line, undefined, newNo++);
 				}
 			}
-			for (let i = shared; i < oldRaw.length && diffLines.length < maxLines; i++) {
-				pushDiff("removed", oldRaw[i], oldNo++);
-			}
-			for (let i = shared; i < newRaw.length && diffLines.length < maxLines; i++) {
-				pushDiff("added", newRaw[i], undefined, newNo++);
-			}
+
 			const height =
 				CODE_PADDING_Y * 2 +
 				diffLines.reduce((sum, line) => sum + Math.max(1, line.lines.length) * CODE_LINE_H, 0);
@@ -1042,7 +1157,9 @@ function layoutToolUseBlock(
 	}
 	return {
 		lines: [],
-		height: Math.max(TOOL_CARD_PADDING * 2 + TOOL_HEADER_H, y - 3 + TOOL_CARD_PADDING),
+		height: toolOpen
+			? Math.max(TOOL_CARD_PADDING * 2 + TOOL_HEADER_H, y - 3 + TOOL_CARD_PADDING)
+			: TOOL_CARD_PADDING * 2 + TOOL_HEADER_H + 4,
 		toolHeader: {
 			x: TOOL_CARD_PADDING,
 			y: TOOL_CARD_PADDING,

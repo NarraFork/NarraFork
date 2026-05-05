@@ -839,7 +839,10 @@ export const NarratorPixiMessageList = forwardRef<
 	}, []);
 
 	useEffect(() => {
-		return subscribePixiShikiHighlights(() => setHighlightVersion((version) => version + 1));
+		return subscribePixiShikiHighlights(() => {
+			clearPixiMessageLayoutCache();
+			setHighlightVersion((version) => version + 1);
+		});
 	}, []);
 
 	useEffect(() => {

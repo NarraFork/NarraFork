@@ -4189,18 +4189,21 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// clicks it or if it was just streamed in (streaming cards go through
 	// _streamingChars → completed, so they never hit this path on first render).
 	const defaultOpen =
-		!isStreaming &&
-		(!!pendingPermission ||
-			toolCall.status === "pending" ||
-			cat === "todo" ||
-			cat === "share" ||
-			cat === "recall" ||
-			cat === "send" ||
-			(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
-			(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
-			(cat === "plan" && !isDeniedPlan) ||
-			(isEdit && !isTruncated) ||
-			(isFailed && !isEdit && !isDeniedPlan && !isTruncated));
+		// Edit tools should be expanded during streaming so the chevron shows the
+		// correct state and there's no collapse flash when streaming ends.
+		(isStreaming && isEdit) ||
+		(!isStreaming &&
+			(!!pendingPermission ||
+				toolCall.status === "pending" ||
+				cat === "todo" ||
+				cat === "share" ||
+				cat === "recall" ||
+				cat === "send" ||
+				(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
+				(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
+				(cat === "plan" && !isDeniedPlan) ||
+				(isEdit && !isTruncated) ||
+				(isFailed && !isEdit && !isDeniedPlan && !isTruncated)));
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Clamp plan card height to 85% of the nearest scroll container.

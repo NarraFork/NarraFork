@@ -766,12 +766,19 @@ async function executeToolAfterReflections(
 	history: unknown[],
 	locale: Locale,
 ): Promise<ToolExecResult> {
-	if (tu.name === "ExitPlanMode" && config.planMode && !config.reflectionLoop) {
+	if (
+		tu.name === "ExitPlanMode" &&
+		config.planMode &&
+		!config.reflectionLoop &&
+		config.previousPermissionMode === "bypassPermissions"
+	) {
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
 		tu.input = reflected.input;
 		if (reflected.decision.action !== "confirm") {
 			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
 		}
+		// Reflection confirmed — skip user approval and execute directly
+		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
 	}
 	return executeTool(tu, config);
 }

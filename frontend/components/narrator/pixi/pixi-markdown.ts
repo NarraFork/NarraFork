@@ -4,6 +4,8 @@ export interface MdInlineToken {
 	kind: MdInlineKind;
 	text: string;
 	href?: string;
+	/** Shiki highlight color (hex number) for code sub-tokens */
+	color?: number;
 }
 
 export type MdBlock =

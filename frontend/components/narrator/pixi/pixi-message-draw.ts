@@ -425,7 +425,9 @@ function inlineTextYForToken(
 	tokenStyle: TextStyle,
 ): number {
 	if (token.kind === "code") {
-		return lineY + Math.max(0, (fontSizeOf(baseStyle) - fontSizeOf(tokenStyle)) / 2) - 1;
+		// 行内代码的文本应该相对于普通文本有一个小的垂直偏移
+		// 以便在 pill 内部垂直居中，同时保持与周围文本对齐
+		return lineY + Math.max(0, (fontSizeOf(baseStyle) - fontSizeOf(tokenStyle)) / 2);
 	}
 	if (tokenStyle !== baseStyle) return lineY - 1;
 	return lineY;
@@ -442,6 +444,21 @@ function drawInlineMarkdownTextLines(
 	color: number,
 ) {
 	const tokenLines = splitInlineTokensByPretextLines(mdBlock.inlineTokens, mdBlock.lines);
+
+	// Trigger shiki loading for visible inline code (collect full code runs from all tokens)
+	if (mdBlock.inlineTokens?.length) {
+		let codeRun = "";
+		for (const token of mdBlock.inlineTokens) {
+			if (token.kind === "code") {
+				codeRun += token.text;
+			} else if (codeRun) {
+				getPixiHighlightedTokens(codeRun, "typescript", shikiThemeName());
+				codeRun = "";
+			}
+		}
+		if (codeRun) getPixiHighlightedTokens(codeRun, "typescript", shikiThemeName());
+	}
+
 	for (let i = 0; i < mdBlock.lines.length; i++) {
 		const lineY = y + i * mdBlock.lineHeight;
 		const lineTokens = tokenLines?.[i];
@@ -449,46 +466,79 @@ function drawInlineMarkdownTextLines(
 			textPool.acquire(mdBlock.lines[i].text, x, lineY, style, color);
 			continue;
 		}
+
+		// First pass: draw pill backgrounds for contiguous code runs
 		let tokenX = x;
-		for (const token of lineTokens) {
+		for (let t = 0; t < lineTokens.length; t++) {
+			const token = lineTokens[t];
+			if (!token.text) continue;
+			const tokenStyle = inlineStyleForToken(token, style);
+			if (token.kind === "code") {
+				const textAdv = measureMonoAdvance(token.text, tokenStyle);
+				const prevIsCode = t > 0 && lineTokens[t - 1].kind === "code";
+				const nextIsCode = t < lineTokens.length - 1 && lineTokens[t + 1].kind === "code";
+				const leftPad = prevIsCode ? 0 : INLINE_CODE_PADDING_X;
+				const rightPad = nextIsCode ? 0 : INLINE_CODE_PADDING_X;
+				if (!prevIsCode) {
+					// Start of a code run — measure full run width and draw pill
+					let runTextWidth = textAdv;
+					for (let r = t + 1; r < lineTokens.length && lineTokens[r].kind === "code"; r++) {
+						if (!lineTokens[r].text) continue;
+						runTextWidth += measureMonoAdvance(
+							lineTokens[r].text,
+							inlineStyleForToken(lineTokens[r], style),
+						);
+					}
+					const pillWidth = runTextWidth + INLINE_CODE_PADDING_X * 2;
+					const fontSize = fontSizeOf(tokenStyle);
+					const pillHeight = fontSize + INLINE_CODE_PADDING_Y * 2 + 4;
+					const textYBase = inlineTextYForToken(token, lineY, style, tokenStyle);
+					const pillY = textYBase - INLINE_CODE_PADDING_Y - 1;
+					gfx.roundRect(tokenX, pillY, pillWidth, pillHeight, 4);
+					gfx.fill({ color: theme.panelBg, alpha: 1 });
+					gfx.stroke({ color: theme.toolBorder, alpha: 0.55, width: 1 });
+				}
+				tokenX += leftPad + textAdv + rightPad;
+			} else {
+				tokenX += textWidth(token.text, tokenStyle);
+			}
+		}
+
+		// Second pass: draw text
+		tokenX = x;
+		for (let t = 0; t < lineTokens.length; t++) {
+			const token = lineTokens[t];
 			if (!token.text) continue;
 			const tokenStyle = inlineStyleForToken(token, style);
 			const tokenColor = inlineColorForToken(token, theme, color);
-			const textAdvance =
-				token.kind === "code"
-					? measureMonoAdvance(token.text, tokenStyle)
-					: textWidth(token.text, tokenStyle);
-			const advance = token.kind === "code" ? textAdvance + INLINE_CODE_PADDING_X * 2 : textAdvance;
-			const textX = token.kind === "code" ? tokenX + INLINE_CODE_PADDING_X : tokenX;
-			const textY = inlineTextYForToken(token, lineY, style, tokenStyle);
 			if (token.kind === "code") {
-				const pillHeight = Math.min(
-					mdBlock.lineHeight,
-					Math.max(14, fontSizeOf(tokenStyle) + INLINE_CODE_PADDING_Y * 2),
-				);
-				gfx.roundRect(
-					tokenX,
-					lineY + (mdBlock.lineHeight - pillHeight) / 2,
-					advance,
-					pillHeight,
-					4,
-				);
-				gfx.fill({ color: theme.toolBg, alpha: 0.9 });
-				gfx.stroke({ color: theme.toolBorder, alpha: 0.42, width: 1 });
+				const textAdv = measureMonoAdvance(token.text, tokenStyle);
+				const prevIsCode = t > 0 && lineTokens[t - 1].kind === "code";
+				const nextIsCode = t < lineTokens.length - 1 && lineTokens[t + 1].kind === "code";
+				const leftPad = prevIsCode ? 0 : INLINE_CODE_PADDING_X;
+				const rightPad = nextIsCode ? 0 : INLINE_CODE_PADDING_X;
+				const textX = tokenX + leftPad;
+				const textY = inlineTextYForToken(token, lineY, style, tokenStyle);
+				const finalColor = token.color ?? tokenColor;
+				textPool.acquire(token.text, textX, textY, tokenStyle, finalColor);
+				tokenX += leftPad + textAdv + rightPad;
+			} else {
+				const textAdv = textWidth(token.text, tokenStyle);
+				const textY = inlineTextYForToken(token, lineY, style, tokenStyle);
+				textPool.acquire(token.text, tokenX, textY, tokenStyle, tokenColor);
+				if (token.kind === "link") {
+					const underlineY = lineY + mdBlock.lineHeight - 4;
+					gfx.moveTo(tokenX, underlineY);
+					gfx.lineTo(tokenX + textAdv, underlineY);
+					gfx.stroke({ color: tokenColor, alpha: 0.55, width: 1 });
+				} else if (token.kind === "delete") {
+					const strikeY = lineY + mdBlock.lineHeight / 2;
+					gfx.moveTo(tokenX, strikeY);
+					gfx.lineTo(tokenX + textAdv, strikeY);
+					gfx.stroke({ color: tokenColor, alpha: 0.7, width: 1 });
+				}
+				tokenX += textAdv;
 			}
-			textPool.acquire(token.text, textX, textY, tokenStyle, tokenColor);
-			if (token.kind === "link") {
-				const underlineY = lineY + mdBlock.lineHeight - 4;
-				gfx.moveTo(tokenX, underlineY);
-				gfx.lineTo(tokenX + advance, underlineY);
-				gfx.stroke({ color: tokenColor, alpha: 0.55, width: 1 });
-			} else if (token.kind === "delete") {
-				const strikeY = lineY + mdBlock.lineHeight / 2;
-				gfx.moveTo(tokenX, strikeY);
-				gfx.lineTo(tokenX + advance, strikeY);
-				gfx.stroke({ color: tokenColor, alpha: 0.7, width: 1 });
-			}
-			tokenX += advance;
 		}
 	}
 }
@@ -1388,28 +1438,49 @@ function drawDiffPanel(
 		const color =
 			line.type === "removed" ? theme.red : line.type === "added" ? theme.green : theme.dimmed;
 		const rowHeight = Math.max(1, line.lines.length) * CODE_LINE_H;
+		// Line-level background highlight (level 1)
 		if (line.type === "removed" || line.type === "added") {
 			gfx.rect(x + 1, y - 1, block.width - 2, rowHeight);
-			gfx.fill({ color, alpha: 0.08 });
+			gfx.fill({ color, alpha: 0.13 });
 		}
 		const linePrefix = block.lineNumberPrefix ?? "";
 		const oldNo = line.oldNo != null ? `${linePrefix}${line.oldNo}`.padStart(3) : "   ";
 		const newNo = line.newNo != null ? `${linePrefix}${line.newNo}`.padStart(3) : "   ";
 		textPool.acquire(`${oldNo} ${newNo}${prefix}`, x + 8, y, MONO_STYLE, color);
-		const highlighted = getPixiHighlightedTokens(line.text, block.lang, shikiThemeName());
-		const highlightedVisualLines = splitTokensByPretextLines(highlighted, line.lines);
-		let lineY = y;
-		for (let i = 0; i < line.lines.length; i++) {
-			const visualLine = line.lines[i];
-			drawTokenLine(
-				textPool,
-				visualLine.text || " ",
-				highlightedVisualLines?.[i],
-				x + 60,
-				lineY,
-				line.type === "context" ? theme.text : color,
-			);
-			lineY += CODE_LINE_H;
+
+		if (line.wordChanges?.length) {
+			// Word-level diff rendering (level 2): draw each word chunk with
+			// highlighted background for changed words
+			let wordX = x + 60;
+			for (const wc of line.wordChanges) {
+				const wordWidth = measureMonoAdvance(wc.value, MONO_STYLE);
+				if ((wc.added || wc.removed) && wordWidth > 0) {
+					// Word-level background highlight (deeper color)
+					gfx.rect(wordX, y - 1, wordWidth, CODE_LINE_H);
+					gfx.fill({ color, alpha: 0.28 });
+				}
+				if (!/^\s+$/.test(wc.value)) {
+					textPool.acquire(wc.value, wordX, y, MONO_STYLE, color);
+				}
+				wordX += wordWidth;
+			}
+		} else {
+			// No word changes: use syntax highlighting as before
+			const highlighted = getPixiHighlightedTokens(line.text, block.lang, shikiThemeName());
+			const highlightedVisualLines = splitTokensByPretextLines(highlighted, line.lines);
+			let lineY = y;
+			for (let i = 0; i < line.lines.length; i++) {
+				const visualLine = line.lines[i];
+				drawTokenLine(
+					textPool,
+					visualLine.text || " ",
+					highlightedVisualLines?.[i],
+					x + 60,
+					lineY,
+					line.type === "context" ? theme.text : color,
+				);
+				lineY += CODE_LINE_H;
+			}
 		}
 		y += Math.max(1, line.lines.length) * CODE_LINE_H;
 	}
