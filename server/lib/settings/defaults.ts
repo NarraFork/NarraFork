@@ -31,6 +31,8 @@ export const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
+		planReflectionAutoApprove: false,
+		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20_000,
@@ -203,6 +205,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.defaultRelaxedPlan": {
 		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
+		type: "boolean",
+	},
+	"agent.planReflectionAutoApprove": {
+		desc: "启用后，在全部允许 + 宽松规划 + 计划模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
+		type: "boolean",
+	},
+	"agent.dangerReflectionEnabled": {
+		desc: "启用后，全部允许模式下的高风险操作会触发危险反思二次检查。关闭后这些二次检查会被跳过，但基础黑名单和灾难性命令保护仍保留。",
 		type: "boolean",
 	},
 	"agent.dangerSkipReadOnlyConfirmations": {

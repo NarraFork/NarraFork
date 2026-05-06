@@ -1064,18 +1064,39 @@ function DangerReflectionNotice({ toolCall }: { toolCall: ToolCallData }) {
 	const summary =
 		suggestion.reason || suggestion.danger?.summary || toolCall.permissionDecisionReason;
 	const running = status === "running";
+	const noticeStyle: React.CSSProperties = {
+		marginTop: 6,
+		marginBottom: "var(--mantine-spacing-sm)",
+		background: running
+			? "light-dark(color-mix(in srgb, var(--mantine-color-yellow-0) 88%, white), color-mix(in srgb, var(--mantine-color-yellow-9) 34%, transparent))"
+			: "light-dark(color-mix(in srgb, var(--mantine-color-gray-0) 88%, white), color-mix(in srgb, var(--mantine-color-dark-5) 52%, transparent))",
+		borderColor: running
+			? "light-dark(var(--mantine-color-yellow-3), color-mix(in srgb, var(--mantine-color-yellow-6) 45%, transparent))"
+			: "var(--mantine-color-default-border)",
+	};
+	const titleColor = running
+		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-2))"
+		: "var(--mantine-color-text)";
+	const summaryColor = running
+		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-1))"
+		: "var(--mantine-color-dimmed)";
+
 	return (
-		<Paper withBorder radius="sm" p="xs" mb="xs" bg={running ? "yellow.9" : "dark.6"}>
-			<Group gap="xs" wrap="nowrap" align="center">
-				<ThemeIcon size="sm" radius="xl" color={running ? "yellow" : "gray"} variant="light">
-					{running ? <IconLoader2 size={14} /> : <IconShield size={14} />}
+		<Paper withBorder radius="md" p="sm" style={noticeStyle}>
+			<Group gap="sm" wrap="nowrap" align="flex-start">
+				<ThemeIcon size="sm" radius="xl" color={running ? "yellow" : "gray"} variant="light" mt={1}>
+					{running ? (
+						<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+					) : (
+						<IconShield size={14} />
+					)}
 				</ThemeIcon>
-				<Box>
-					<Text size="xs" fw={600} c={running ? "yellow.1" : "dimmed"}>
+				<Box style={{ minWidth: 0 }}>
+					<Text size="xs" fw={700} lh={1.35} style={{ color: titleColor }}>
 						{running ? t("dangerReflectionRunning") : t("dangerReflectionResolved")}
 					</Text>
 					{summary && (
-						<Text size="xs" c={running ? "yellow.2" : "dimmed"}>
+						<Text size="xs" lh={1.45} mt={3} style={{ color: summaryColor }}>
 							{summary}
 						</Text>
 					)}

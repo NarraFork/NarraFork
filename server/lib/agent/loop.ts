@@ -847,6 +847,18 @@ async function resolveExitPlanModeReflection(
 	return { decision, input: resolvedInput.input };
 }
 
+export function shouldRunExitPlanModeReflection(
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "reflectionLoop" | "permissionMode">,
+): boolean {
+	return (
+		settings.agent.planReflectionAutoApprove &&
+		config.planMode === true &&
+		config.relaxedPlan === true &&
+		!config.reflectionLoop &&
+		config.permissionMode === "bypassPermissions"
+	);
+}
+
 function buildExitPlanReflectionDeniedToolResult(
 	decision: ExitPlanReflectionDecision,
 	locale: Locale,
@@ -873,13 +885,7 @@ async function executeToolAfterReflections(
 	history: unknown[],
 	locale: Locale,
 ): Promise<ToolExecResult> {
-	if (
-		tu.name === "ExitPlanMode" &&
-		config.planMode &&
-		config.relaxedPlan &&
-		!config.reflectionLoop &&
-		config.permissionMode === "bypassPermissions"
-	) {
+	if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
 		tu.input = reflected.input;
 		if (reflected.decision.action !== "confirm") {

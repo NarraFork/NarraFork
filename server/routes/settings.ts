@@ -158,6 +158,8 @@ const updateSettingsSchema = z
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
+				planReflectionAutoApprove: z.boolean(),
+				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),

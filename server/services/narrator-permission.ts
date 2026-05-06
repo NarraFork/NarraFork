@@ -266,8 +266,6 @@ export function resolvePermissionDecision(
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
 	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchViolations?.length)
 		return "deny";
-	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchWarnings?.length)
-		return "ask";
 
 	const protectedPathReason = resolveProtectedPathDeny(
 		toolName,
@@ -300,6 +298,9 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 	}
+
+	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchWarnings?.length)
+		return "ask";
 
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
@@ -347,7 +348,7 @@ export function resolvePermissionDecision(
 		}
 	}
 
-	// Blacklist takes priority over whitelist
+	// Path blacklist takes priority over path whitelist.
 	const blacklistResult = resolveBlacklistDecision(
 		toolName,
 		input,
@@ -1932,7 +1933,11 @@ export async function handlePermission(
 		isRelaxedPlan,
 		narrator?.previousPermissionMode,
 	);
-	if (decision === "allow" && effectiveMode === "bypassPermissions") {
+	if (
+		decision === "allow" &&
+		effectiveMode === "bypassPermissions" &&
+		settings.agent.dangerReflectionEnabled
+	) {
 		const danger =
 			toolName === SHELL_TOOL_NAME && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)

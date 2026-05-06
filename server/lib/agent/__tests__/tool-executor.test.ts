@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { z } from "zod/v4";
+import { settings } from "../../settings";
+import { shouldRunExitPlanModeReflection } from "../loop";
 import { executeTool } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
@@ -7,8 +9,15 @@ import type { AgentConfig, PermissionResult, ToolDefinition } from "../types";
 
 const TEST_TOOL_NAME = "__ExecutorGuardTest";
 
+const originalPlanReflectionAutoApprove = settings.agent.planReflectionAutoApprove;
+
+function setPlanReflectionAutoApprove(value: boolean) {
+	settings.agent.planReflectionAutoApprove = value;
+}
+
 afterEach(() => {
 	toolRegistry.unregister(TEST_TOOL_NAME);
+	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
 });
 
 function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentConfig {
@@ -60,6 +69,63 @@ describe("executeTool permission guard", () => {
 		expect(result.fatal).toBe(false);
 		expect(result.output).toContain("dangerReflection");
 		expect(result.output).toContain("not executed");
+	});
+});
+
+describe("ExitPlanMode reflection gate", () => {
+	test("requires the auto-approve setting", () => {
+		setPlanReflectionAutoApprove(false);
+
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				relaxedPlan: true,
+				permissionMode: "bypassPermissions",
+			}),
+		).toBe(false);
+
+		setPlanReflectionAutoApprove(true);
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				relaxedPlan: true,
+				permissionMode: "bypassPermissions",
+			}),
+		).toBe(true);
+	});
+
+	test("only runs in bypass relaxed plan mode outside reflection loops", () => {
+		setPlanReflectionAutoApprove(true);
+
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				relaxedPlan: false,
+				permissionMode: "bypassPermissions",
+			}),
+		).toBe(false);
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: false,
+				relaxedPlan: true,
+				permissionMode: "bypassPermissions",
+			}),
+		).toBe(false);
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				relaxedPlan: true,
+				permissionMode: "default",
+			}),
+		).toBe(false);
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				relaxedPlan: true,
+				permissionMode: "bypassPermissions",
+				reflectionLoop: { allowedTools: [], context: { kind: "exitPlanMode" } },
+			}),
+		).toBe(false);
 	});
 });
 

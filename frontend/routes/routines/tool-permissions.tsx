@@ -141,6 +141,7 @@ function ToolPermissionsPage() {
 	const [wfAllowAll, setWfAllowAll] = useState(false);
 	const [wfWl, setWfWl] = useState<PatternEntry[]>([]);
 	const [wfBl, setWfBl] = useState<PatternEntry[]>([]);
+	const planReflectionAutoApprove = settings?.agent?.planReflectionAutoApprove ?? false;
 	const initialized = useRef(false);
 
 	useEffect(() => {
@@ -188,6 +189,15 @@ function ToolPermissionsPage() {
 			},
 		});
 	}, [wfAllowAll, wfWl, wfBl, updateSettings]);
+
+	const handlePlanReflectionAutoApproveChange = useCallback(
+		(checked: boolean) => {
+			updateSettings.mutate({
+				agent: { planReflectionAutoApprove: checked },
+			});
+		},
+		[updateSettings],
+	);
 
 	// MCP servers
 	const { data: mcpServers } = useMcpServers();
@@ -360,27 +370,40 @@ function ToolPermissionsPage() {
 			</Text>
 			<Stack gap={6} mb="lg">
 				{BUILTIN_TOOLS.map((tool) => (
-					<Paper
-						key={tool.name}
-						withBorder
-						p="xs"
-						style={{ cursor: "pointer" }}
-						onClick={() => setSelectedTool(tool.name)}
-					>
-						<Group justify="space-between" wrap="nowrap">
-							<Group gap="xs">
-								<Text size="sm" fw={600}>
-									{tool.name}
+					<Stack key={tool.name} gap={6}>
+						<Paper
+							withBorder
+							p="xs"
+							style={{ cursor: "pointer" }}
+							onClick={() => setSelectedTool(tool.name)}
+						>
+							<Group justify="space-between" wrap="nowrap">
+								<Group gap="xs">
+									<Text size="sm" fw={600}>
+										{tool.name}
+									</Text>
+									<Badge size="xs" variant="light" color={categoryColor(tool.category)}>
+										{categoryLabel(tool.category, t)}
+									</Badge>
+								</Group>
+								<Text size="xs" c="dimmed" lineClamp={1} style={{ maxWidth: 400 }}>
+									{t(tool.descKey)}
 								</Text>
-								<Badge size="xs" variant="light" color={categoryColor(tool.category)}>
-									{categoryLabel(tool.category, t)}
-								</Badge>
 							</Group>
-							<Text size="xs" c="dimmed" lineClamp={1} style={{ maxWidth: 400 }}>
-								{t(tool.descKey)}
-							</Text>
-						</Group>
-					</Paper>
+						</Paper>
+						{tool.name === "ExitPlanMode" && (
+							<Paper withBorder p="xs" ml="md">
+								<Switch
+									label={t("tpPlanReflectionAutoApprove")}
+									description={t("tpPlanReflectionAutoApproveDesc")}
+									checked={planReflectionAutoApprove}
+									onChange={(e) => handlePlanReflectionAutoApproveChange(e.currentTarget.checked)}
+									disabled={updateSettings.isPending}
+									size="sm"
+								/>
+							</Paper>
+						)}
+					</Stack>
 				))}
 			</Stack>
 

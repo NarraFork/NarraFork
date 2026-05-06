@@ -245,6 +245,10 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Let ExitPlanMode plan reflection auto-approve plans in bypass + relaxed plan mode. */
+		planReflectionAutoApprove: boolean;
+		/** Enable danger reflection secondary confirmations for high-risk bypass-permissions operations. */
+		dangerReflectionEnabled: boolean;
 		/** Skip danger reflection secondary confirmations for operations that are classified as read-only. */
 		dangerSkipReadOnlyConfirmations: boolean;
 		/**

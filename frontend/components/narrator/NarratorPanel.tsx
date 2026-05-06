@@ -73,7 +73,7 @@ import {
 	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	startTransition,
@@ -527,6 +527,83 @@ function PermModeMenuItems({
 					</Menu.Item>
 				);
 			})}
+		</>
+	);
+}
+
+function PermissionMenuContent({
+	currentMode,
+	onSelectPermissionMode,
+	t,
+	hasPlanTrait,
+	onTogglePlanMode,
+	planModePending,
+	showPlanReflectionAutoApproveToggle,
+	planReflectionAutoApprove,
+	onPlanReflectionAutoApproveToggle,
+	planReflectionAutoApprovePending,
+	showDangerReflectionToggle,
+	dangerReflectionEnabled,
+	onDangerReflectionToggle,
+	dangerReflectionPending,
+}: {
+	currentMode: string;
+	onSelectPermissionMode: (mode: string) => void;
+	t: (key: string) => string;
+	hasPlanTrait: boolean;
+	onTogglePlanMode: () => void;
+	planModePending: boolean;
+	showPlanReflectionAutoApproveToggle: boolean;
+	planReflectionAutoApprove: boolean;
+	onPlanReflectionAutoApproveToggle: (enabled: boolean) => void;
+	planReflectionAutoApprovePending: boolean;
+	showDangerReflectionToggle: boolean;
+	dangerReflectionEnabled: boolean;
+	onDangerReflectionToggle: (enabled: boolean) => void;
+	dangerReflectionPending: boolean;
+}) {
+	return (
+		<>
+			<Menu.Label>{t("permissionMode")}</Menu.Label>
+			<PermModeMenuItems currentMode={currentMode} onSelect={onSelectPermissionMode} t={t} />
+			<Menu.Divider />
+			<Menu.Item
+				leftSection={<IconNotebook size={14} />}
+				onClick={onTogglePlanMode}
+				disabled={planModePending}
+			>
+				{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
+			</Menu.Item>
+			{showPlanReflectionAutoApproveToggle && (
+				<>
+					<Menu.Divider />
+					<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
+						<Switch
+							label={t("planReflectionAutoApprove")}
+							description={t("planReflectionAutoApproveDesc")}
+							checked={planReflectionAutoApprove}
+							onChange={(e) => onPlanReflectionAutoApproveToggle(e.currentTarget.checked)}
+							disabled={planReflectionAutoApprovePending}
+							size="xs"
+						/>
+					</Box>
+				</>
+			)}
+			{showDangerReflectionToggle && (
+				<>
+					<Menu.Divider />
+					<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
+						<Switch
+							label={t("dangerReflectionToggle")}
+							description={t("dangerReflectionToggleDesc")}
+							checked={dangerReflectionEnabled}
+							onChange={(e) => onDangerReflectionToggle(e.currentTarget.checked)}
+							disabled={dangerReflectionPending}
+							size="xs"
+						/>
+					</Box>
+				</>
+			)}
 		</>
 	);
 }
@@ -1467,6 +1544,12 @@ export function NarratorPanel({
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
+	const updateSettingsMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+	});
+	const dangerReflectionEnabled = settingsData?.agent?.dangerReflectionEnabled ?? true;
+	const planReflectionAutoApprove = settingsData?.agent?.planReflectionAutoApprove ?? false;
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
@@ -1947,6 +2030,10 @@ export function NarratorPanel({
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
 	const [detailsOpened, { toggle: toggleDetails, close: closeDetails }] = useDisclosure(false);
+	const [
+		dangerReflectionWarningOpened,
+		{ open: openDangerReflectionWarning, close: closeDangerReflectionWarning },
+	] = useDisclosure(false);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
@@ -2027,6 +2114,28 @@ export function NarratorPanel({
 			enterPlanModeMutation.mutate(narratorId);
 		}
 	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId]);
+	const handlePlanReflectionAutoApproveToggle = useCallback(
+		(enabled: boolean) => {
+			updateSettingsMutation.mutate({ agent: { planReflectionAutoApprove: enabled } });
+		},
+		[updateSettingsMutation],
+	);
+	const handleDangerReflectionToggle = useCallback(
+		(enabled: boolean) => {
+			if (!enabled) {
+				openDangerReflectionWarning();
+				return;
+			}
+			updateSettingsMutation.mutate({ agent: { dangerReflectionEnabled: true } });
+		},
+		[openDangerReflectionWarning, updateSettingsMutation],
+	);
+	const confirmDisableDangerReflection = useCallback(() => {
+		updateSettingsMutation.mutate(
+			{ agent: { dangerReflectionEnabled: false } },
+			{ onSuccess: closeDangerReflectionWarning },
+		);
+	}, [closeDangerReflectionWarning, updateSettingsMutation]);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
 	// Derive legacy boolean flags from substatus
@@ -5005,6 +5114,29 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
+					<Modal
+						opened={dangerReflectionWarningOpened}
+						onClose={closeDangerReflectionWarning}
+						title={t("dangerReflectionDisableTitle")}
+						centered
+					>
+						<Stack>
+							<Text size="sm">{t("dangerReflectionDisableWarning")}</Text>
+							<Group justify="flex-end">
+								<Button variant="default" onClick={closeDangerReflectionWarning}>
+									{t("cancel")}
+								</Button>
+								<Button
+									color="red"
+									onClick={confirmDisableDangerReflection}
+									loading={updateSettingsMutation.isPending}
+								>
+									{t("dangerReflectionDisableConfirm")}
+								</Button>
+							</Group>
+						</Stack>
+					</Modal>
+
 					{detailsOpened && (
 						<NarratorDetailsPanel
 							opened={detailsOpened}
@@ -5902,23 +6034,32 @@ export function NarratorPanel({
 															/>
 														</Menu.Target>
 														<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-															<PermModeMenuItems
+															<PermissionMenuContent
 																currentMode={narrator.permissionMode ?? "default"}
-																onSelect={(m) =>
+																onSelectPermissionMode={(m) =>
 																	permModeMutation.mutate({ id: narratorId, permissionMode: m })
 																}
 																t={t}
-															/>
-															<Menu.Divider />
-															<Menu.Item
-																leftSection={<IconNotebook size={14} />}
-																onClick={togglePlanMode}
-																disabled={
+																hasPlanTrait={hasPlanTrait}
+																onTogglePlanMode={togglePlanMode}
+																planModePending={
 																	enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
 																}
-															>
-																{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
-															</Menu.Item>
+																showPlanReflectionAutoApproveToggle={
+																	(narrator.permissionMode ?? "default") === "bypassPermissions"
+																}
+																planReflectionAutoApprove={planReflectionAutoApprove}
+																onPlanReflectionAutoApproveToggle={
+																	handlePlanReflectionAutoApproveToggle
+																}
+																planReflectionAutoApprovePending={updateSettingsMutation.isPending}
+																showDangerReflectionToggle={
+																	(narrator.permissionMode ?? "default") === "bypassPermissions"
+																}
+																dangerReflectionEnabled={dangerReflectionEnabled}
+																onDangerReflectionToggle={handleDangerReflectionToggle}
+																dangerReflectionPending={updateSettingsMutation.isPending}
+															/>
 														</Menu.Dropdown>
 													</Menu>
 												)}
@@ -6115,13 +6256,31 @@ export function NarratorPanel({
 														</ActionIcon>
 													</Menu.Target>
 													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-														<Menu.Label>{t("permissionMode")}</Menu.Label>
-														<PermModeMenuItems
+														<PermissionMenuContent
 															currentMode={narrator.permissionMode ?? "default"}
-															onSelect={(m) =>
+															onSelectPermissionMode={(m) =>
 																permModeMutation.mutate({ id: narratorId, permissionMode: m })
 															}
 															t={t}
+															hasPlanTrait={hasPlanTrait}
+															onTogglePlanMode={togglePlanMode}
+															planModePending={
+																enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
+															}
+															showPlanReflectionAutoApproveToggle={
+																(narrator.permissionMode ?? "default") === "bypassPermissions"
+															}
+															planReflectionAutoApprove={planReflectionAutoApprove}
+															onPlanReflectionAutoApproveToggle={
+																handlePlanReflectionAutoApproveToggle
+															}
+															planReflectionAutoApprovePending={updateSettingsMutation.isPending}
+															showDangerReflectionToggle={
+																(narrator.permissionMode ?? "default") === "bypassPermissions"
+															}
+															dangerReflectionEnabled={dangerReflectionEnabled}
+															onDangerReflectionToggle={handleDangerReflectionToggle}
+															dangerReflectionPending={updateSettingsMutation.isPending}
 														/>
 													</Menu.Dropdown>
 												</Menu>

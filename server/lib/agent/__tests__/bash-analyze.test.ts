@@ -823,6 +823,51 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBe("ask");
 	});
 
+	test("command whitelist does not bypass shell risk, path prompts, or blacklists", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "LD_PRELOAD=/tmp/evil.so ls" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: withEnvInjection,
+				commandWhitelist: [{ pattern: "ls", enabled: true }],
+			}),
+		).toBe("ask");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "cat /etc/passwd" },
+				permMode: "readOnly",
+				cwd,
+				bashAnalysis: withExternalPath,
+				commandWhitelist: [{ pattern: "cat /etc/passwd", enabled: true }],
+			}),
+		).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "git status" },
+				permMode: "default",
+				cwd,
+				bashAnalysis: allSafe,
+				commandWhitelist: [{ pattern: "git status", enabled: true }],
+				commandBlacklist: [{ pattern: "git status", enabled: true }],
+			}),
+		).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Bash",
+				input: { command: "cat /etc/passwd" },
+				permMode: "bypassPermissions",
+				cwd,
+				bashAnalysis: withExternalPath,
+				commandWhitelist: [{ pattern: "cat /etc/passwd", enabled: true }],
+				blacklistDirs: [{ path: "/etc", denyLevel: "denyAll", enabled: true }],
+			}),
+		).toBe("deny");
+	});
+
 	test("bypassPermissions → allow at decision layer", () => {
 		expect(
 			resolvePermissionDecision({
