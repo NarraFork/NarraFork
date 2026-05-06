@@ -78,6 +78,7 @@ const RETRYABLE_INVALID_STATE_REASONS = new Set([
 	"internal_server_error",
 	"service_unavailable",
 	"temporarily_unavailable",
+	"stream_closed_before_response_completed",
 ]);
 
 /** Extract a human-readable message from any thrown value, including ErrorEvent objects. */

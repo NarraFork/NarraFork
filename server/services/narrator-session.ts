@@ -396,26 +396,49 @@ async function finalizeInterruptedRun(
 		data: { message: "Narrator interrupted" },
 	});
 
-	const cleanupTasks = [cleanupOrphanedToolCalls(narratorId, active.locale)];
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true, substatus: true },
-	});
-	const currentSubstatus = parseSubstatus(current?.substatus);
-	if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
-		cleanupTasks.push(
-			narratorService.updateStatus(narratorId, "idle", { substatus: ["interrupted"] }),
-		);
-	}
 	if (partialId) {
-		cleanupTasks.push(finalizeOrCleanupPartialMessage(partialId, narratorId).then(() => {}));
+		try {
+			// Preserve the partial assistant message before any deletion decision runs.
+			// `finalizeOrCleanupPartialMessage` keeps messages that contain executed
+			// tool calls, so first convert in-flight calls on this partial message into
+			// explicit interrupted failures.  Running this sequentially avoids a race
+			// where the finalizer sees only "initializing" tool calls and deletes the
+			// whole message, making already-visible tool calls disappear from history.
+			await markInterruptedToolCallsForMessage(narratorId, partialId, active.locale);
+			await finalizeOrCleanupPartialMessage(partialId, narratorId);
+		} catch (err) {
+			logger.warn("Failed to finalize interrupted partial message", {
+				narratorId,
+				partialId,
+				error: String(err),
+			});
+		}
 	}
-	await Promise.all(cleanupTasks).catch((err) => {
-		logger.warn("Post-interrupt cleanup failed", {
+
+	try {
+		await cleanupOrphanedToolCalls(narratorId, active.locale);
+	} catch (err) {
+		logger.warn("Failed to clean up orphaned tool calls after interrupt", {
 			narratorId,
 			error: String(err),
 		});
-	});
+	}
+
+	try {
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true, substatus: true },
+		});
+		const currentSubstatus = parseSubstatus(current?.substatus);
+		if (!(current?.status === "idle" && currentSubstatus.includes("error"))) {
+			await narratorService.updateStatus(narratorId, "idle", { substatus: ["interrupted"] });
+		}
+	} catch (err) {
+		logger.warn("Failed to update narrator status after interrupt", {
+			narratorId,
+			error: String(err),
+		});
+	}
 }
 
 // === Agent loop execution ===
@@ -3085,24 +3108,55 @@ export async function finalizeOrCleanupPartialMessage(
 	}
 }
 
+const INTERRUPTABLE_TOOL_CALL_STATUSES = ["initializing", "pending", "running"] as const;
+
 /**
- * Mark any in-flight tool calls for this narrator as failed.
- * Without this, an interrupt leaves orphaned tool call records in
- * "initializing" / "pending" / "running" state, which breaks the
+ * Mark in-flight tool calls for one assistant message as interrupted.
+ *
+ * This is intentionally message-scoped so the interrupt finalizer can first
+ * protect the current partial assistant message before deciding whether that
+ * partial should be kept or deleted.
  */
-async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
-	const staleStatuses = ["initializing", "pending", "running"] as const;
+export async function markInterruptedToolCallsForMessage(
+	narratorId: string,
+	messageId: string,
+	locale: Locale = "en",
+): Promise<void> {
 	await db
 		.update(narratorToolCalls)
 		.set({
 			status: "fail",
 			errorMessage: "Narrator interrupted by user",
 			outputJson: getToolMessage("interruptedByUser", locale),
+			completedAt: new Date().toISOString(),
 		})
 		.where(
 			and(
 				eq(narratorToolCalls.narratorId, narratorId),
-				inArray(narratorToolCalls.status, [...staleStatuses]),
+				eq(narratorToolCalls.messageId, messageId),
+				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
+			),
+		);
+}
+
+/**
+ * Mark any in-flight tool calls for this narrator as failed.
+ * Without this, an interrupt leaves orphaned tool call records in
+ * "initializing" / "pending" / "running" state, which breaks the
+ */
+async function cleanupOrphanedToolCalls(narratorId: string, locale: Locale = "en"): Promise<void> {
+	await db
+		.update(narratorToolCalls)
+		.set({
+			status: "fail",
+			errorMessage: "Narrator interrupted by user",
+			outputJson: getToolMessage("interruptedByUser", locale),
+			completedAt: new Date().toISOString(),
+		})
+		.where(
+			and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.status, [...INTERRUPTABLE_TOOL_CALL_STATUSES]),
 			),
 		);
 }

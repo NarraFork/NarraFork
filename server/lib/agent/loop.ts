@@ -271,7 +271,8 @@ function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
 		parsed.toolUseChunk ||
 		parsed.reasoning ||
 		parsed.webSearch ||
-		parsed.imageGeneration
+		parsed.imageGeneration ||
+		parsed.queueStatus
 	);
 }
 
@@ -876,14 +877,13 @@ async function resolveExitPlanModeReflection(
 }
 
 export function shouldRunExitPlanModeReflection(
-	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "reflectionLoop" | "permissionMode">,
+	config: Pick<AgentConfig, "planMode" | "reflectionLoop" | "permissionMode">,
 ): boolean {
 	return (
 		settings.agent.planReflectionAutoApprove &&
 		config.planMode === true &&
-		config.relaxedPlan === true &&
 		!config.reflectionLoop &&
-		config.permissionMode === "bypassPermissions"
+		(config.permissionMode === "acceptEdits" || config.permissionMode === "bypassPermissions")
 	);
 }
 
@@ -1293,6 +1293,47 @@ export async function* agentLoop(
 		>();
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
+
+		function* drainSettledEarlyToolResults(): Generator<AgentEvent> {
+			for (const tu of toolUses) {
+				const settled = settledResults.get(tu.toolUseId);
+				if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
+				yieldedToolResults.add(tu.toolUseId);
+				if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
+				if (settled.updatedInput) tu.input = settled.updatedInput;
+				const brokenOverride = settled.broken
+					? sanitizeBrokenInput(tu.name, tu.input, locale)
+					: undefined;
+				yield {
+					type: "tool_result",
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
+					isError: settled.isError ?? false,
+					durationMs: settled.durationMs,
+					permissionStartedAt: settled.permissionStartedAt,
+					executionStartedAt: settled.executionStartedAt,
+					completedAt: settled.completedAt,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride ?? settled.updatedInput,
+					metadata: settled.metadata,
+				};
+			}
+		}
+
+		async function* drainStartedEarlyToolResults(): AsyncGenerator<AgentEvent> {
+			for (const tu of toolUses) {
+				const earlyPromise = earlyExecMap.get(tu.toolUseId);
+				if (earlyPromise && !settledResults.has(tu.toolUseId)) {
+					settledResults.set(tu.toolUseId, await earlyPromise);
+				}
+			}
+			yield* drainSettledEarlyToolResults();
+		}
+
+		function hasStartedEarlyToolExecution(): boolean {
+			return earlyExecMap.size > 0 || yieldedToolResults.size > 0;
+		}
 
 		// API request tracking variables (moved outside retry loop)
 		let requestId = "";
@@ -2196,6 +2237,25 @@ export async function* agentLoop(
 							continue;
 						}
 						if (isRetryableInvalidStateReason(reason, message)) {
+							if (hasStartedEarlyToolExecution()) {
+								logger.warn("Retryable provider stream error after tool execution started", {
+									narratorId: config.narratorId,
+									provider: effectiveProvider,
+									model: effectiveModel,
+									reason,
+									toolCount: toolUses.length,
+									startedToolCount: earlyExecMap.size,
+								});
+								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* drainStartedEarlyToolResults();
+								yield* finishRequest(message);
+								yield {
+									type: "invalid_state",
+									reason,
+									message,
+								};
+								return;
+							}
 							// In-loop retry: skip block_complete persistence and retry
 							// the same chat() call with identical parameters.
 							// -1 means infinite retries (consistent with handleTransientError)
@@ -2259,6 +2319,12 @@ export async function* agentLoop(
 				yield* flushRequestStart();
 			} catch (err) {
 				if (config.signal.aborted) {
+					// Let already-fulfilled eager tool promises publish into `settledResults`,
+					// then persist their completed results before surfacing the abort.  Without
+					// this, a user interrupt during trailing text can leave tool calls that had
+					// already finished execution stuck as running/interrupted in history.
+					await Promise.resolve();
+					yield* drainSettledEarlyToolResults();
 					// Even on abort, yield block_complete for accumulated content so it can be persisted
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield* finishRequest("Aborted");
@@ -2789,6 +2855,8 @@ export async function* agentLoop(
 		let prevToolsExecMs = 0;
 		for (const group of groups) {
 			if (config.signal.aborted) {
+				await Promise.resolve();
+				yield* drainSettledEarlyToolResults();
 				yield { type: "error", message: "Aborted" };
 				return;
 			}

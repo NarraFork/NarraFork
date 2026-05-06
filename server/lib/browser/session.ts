@@ -13,6 +13,7 @@ import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
 import { redactHeaders, redactPostData, redactUrl } from "./redaction";
+import { serializeBrowserValue } from "./serialization";
 
 /** Default session TTL: 10 minutes of inactivity. */
 const SESSION_TTL_MS = 10 * 60 * 1000;
@@ -28,6 +29,10 @@ const MAX_POST_DATA_LENGTH = 4_000;
 export interface BrowserConsoleMessage {
 	type: string;
 	text: string;
+	/** Serialized console arguments, when available. Falls back to text otherwise. */
+	args?: string[];
+	/** Monotonic per-session sequence number, stable even when the ring buffer rotates. */
+	seq: number;
 	timestamp: number;
 	location?: {
 		url?: string;
@@ -66,6 +71,10 @@ export interface BrowserSession {
 	headless: boolean;
 	/** Recent console output and page errors captured from the page. */
 	consoleMessages: BrowserConsoleMessage[];
+	/** Monotonic counter for console messages, independent of the capped buffer size. */
+	consoleMessageSeq: number;
+	/** Pending async console argument serialization tasks. */
+	pendingConsoleCaptures: Set<Promise<void>>;
 	/** Recent network requests captured from the page. */
 	networkRequests: BrowserNetworkRequest[];
 	/** Internal lookup for in-flight network requests. */
@@ -114,12 +123,97 @@ function ensureCleanupTimer(): void {
 
 function pushConsoleMessage(
 	session: BrowserSession,
-	message: Omit<BrowserConsoleMessage, "timestamp">,
-): void {
-	session.consoleMessages.push({ ...message, timestamp: Date.now() });
+	message: Omit<BrowserConsoleMessage, "seq" | "timestamp">,
+): BrowserConsoleMessage {
+	const entry = { ...message, seq: ++session.consoleMessageSeq, timestamp: Date.now() };
+	session.consoleMessages.push(entry);
 	if (session.consoleMessages.length > MAX_CONSOLE_MESSAGES) {
 		session.consoleMessages.splice(0, session.consoleMessages.length - MAX_CONSOLE_MESSAGES);
 	}
+	return entry;
+}
+
+function trackConsoleCapture(session: BrowserSession, capture: Promise<void>): void {
+	session.pendingConsoleCaptures.add(capture);
+	capture
+		.finally(() => {
+			session.pendingConsoleCaptures.delete(capture);
+		})
+		.catch(() => {
+			// The capture promise has its own fallback path; this avoids unhandled rejections.
+		});
+}
+
+function isLowInformationConsoleArg(text: string): boolean {
+	const trimmed = text.trim();
+	return (
+		trimmed === "" ||
+		trimmed === "{}" ||
+		trimmed === "[]" ||
+		trimmed === "null" ||
+		trimmed === "(undefined)" ||
+		trimmed.startsWith("JSHandle@")
+	);
+}
+
+function hasConsoleDiagnosticText(text: string): boolean {
+	return /\b(?:Error|Exception|DOMException|TypeError|ReferenceError|SyntaxError|RangeError|URIError)\b|JSHandle@/.test(
+		text,
+	);
+}
+
+function mergeConsoleArgText(originalText: string, serializedParts: string[]): string {
+	const serializedText = serializedParts.join(" ").trim();
+	const original = originalText.trim();
+	if (!serializedText) return originalText;
+	if (!original || serializedText === original) return serializedText;
+	if (serializedParts.every(isLowInformationConsoleArg)) return originalText;
+	if (serializedParts.some(isLowInformationConsoleArg) && hasConsoleDiagnosticText(original)) {
+		return `${originalText} | args: ${serializedText}`;
+	}
+	return serializedText;
+}
+
+async function populateConsoleMessageArgs(
+	entry: BrowserConsoleMessage,
+	msg: ConsoleMessage,
+): Promise<void> {
+	const handles = msg.args();
+	if (handles.length === 0) return;
+
+	const parts: string[] = [];
+	for (const handle of handles) {
+		try {
+			const value = await handle.jsonValue();
+			parts.push(serializeBrowserValue(value, { fallbackText: entry.text }));
+		} catch {
+			try {
+				parts.push(handle.toString());
+			} catch {
+				parts.push(entry.text);
+			}
+		} finally {
+			await handle.dispose().catch(() => {});
+		}
+	}
+
+	if (parts.length > 0) {
+		entry.args = parts;
+		entry.text = mergeConsoleArgText(entry.text, parts);
+	}
+}
+
+export async function drainConsoleCaptures(
+	session: BrowserSession,
+	timeoutMs = 1000,
+): Promise<void> {
+	const pending = Array.from(session.pendingConsoleCaptures);
+	if (pending.length === 0) return;
+
+	await Promise.race([
+		Promise.allSettled(pending).then(() => {}),
+		new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+	]);
 }
 
 function normalizeHeaders(
@@ -169,7 +263,7 @@ function finalizeNetworkRequest(
 function attachConsoleListeners(page: Page, session: BrowserSession): void {
 	page.on("console", (msg: ConsoleMessage) => {
 		const location = msg.location();
-		pushConsoleMessage(session, {
+		const entry = pushConsoleMessage(session, {
 			type: msg.type(),
 			text: msg.text(),
 			location: {
@@ -178,6 +272,14 @@ function attachConsoleListeners(page: Page, session: BrowserSession): void {
 				columnNumber: location.columnNumber,
 			},
 		});
+		trackConsoleCapture(
+			session,
+			populateConsoleMessageArgs(entry, msg).catch((err) => {
+				logger.debug("Failed to serialize browser console arguments", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}),
+		);
 	});
 
 	page.on("pageerror", (err: unknown) => {
@@ -247,6 +349,8 @@ export async function createSession(
 		lastActivity: Date.now(),
 		headless,
 		consoleMessages: [],
+		consoleMessageSeq: 0,
+		pendingConsoleCaptures: new Set(),
 		networkRequests: [],
 		networkRequestMap: new WeakMap(),
 	};

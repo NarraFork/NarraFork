@@ -79,7 +79,6 @@ describe("ExitPlanMode reflection gate", () => {
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: true,
-				relaxedPlan: true,
 				permissionMode: "bypassPermissions",
 			}),
 		).toBe(false);
@@ -88,40 +87,41 @@ describe("ExitPlanMode reflection gate", () => {
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: true,
-				relaxedPlan: true,
 				permissionMode: "bypassPermissions",
 			}),
 		).toBe(true);
 	});
 
-	test("only runs in bypass relaxed plan mode outside reflection loops", () => {
+	test("runs in edit-capable plan modes outside reflection loops", () => {
 		setPlanReflectionAutoApprove(true);
 
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: true,
-				relaxedPlan: false,
 				permissionMode: "bypassPermissions",
 			}),
-		).toBe(false);
+		).toBe(true);
+		expect(
+			shouldRunExitPlanModeReflection({
+				planMode: true,
+				permissionMode: "acceptEdits",
+			}),
+		).toBe(true);
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: false,
-				relaxedPlan: true,
 				permissionMode: "bypassPermissions",
 			}),
 		).toBe(false);
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: true,
-				relaxedPlan: true,
 				permissionMode: "default",
 			}),
 		).toBe(false);
 		expect(
 			shouldRunExitPlanModeReflection({
 				planMode: true,
-				relaxedPlan: true,
 				permissionMode: "bypassPermissions",
 				reflectionLoop: { allowedTools: [], context: { kind: "exitPlanMode" } },
 			}),

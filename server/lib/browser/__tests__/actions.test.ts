@@ -88,6 +88,21 @@ describe("Browser actions — evaluate and console capture", () => {
 		);
 	}, 30_000);
 
+	test("console capture preserves Error diagnostics when structured args are empty", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		await withSession(
+			`<html><body><script>console.error(new Error("boom diagnostic"))</script></body></html>`,
+			async (session) => {
+				const result = await actions.getConsole(session);
+
+				expect(result.count).toBe(1);
+				expect(result.output).toContain("boom diagnostic");
+				expect(result.output).not.toMatch(/ERROR\\s+\{\}\s*$/);
+			},
+		);
+	}, 30_000);
+
 	test("evaluateCapture returns only current run console and return value", async () => {
 		if (await skipIfNoBrowser()) return;
 
