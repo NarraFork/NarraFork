@@ -21,6 +21,7 @@ import {
 	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
 import {
+	isDangerReflectionPermissionLike,
 	removeStreamingChunksMsg,
 	revokeContentBlockPreviewUrls,
 } from "./narrator-message-helpers";
@@ -237,7 +238,7 @@ function applyPendingPermissionsToCache(
 	if (!old?.pages?.length || perms.length === 0) return old;
 	let result = old as MessagesQueryData | undefined;
 	for (const perm of perms) {
-		if (!perm.toolUseId || !result) continue;
+		if (!perm.toolUseId || !result || isDangerReflectionPermissionLike(perm)) continue;
 		result = mergeFieldsByIndex(result, perm.toolUseId, { status: "pending" }, index) as
 			| MessagesQueryData
 			| undefined;
@@ -1647,7 +1648,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
-			onDangerReflectionResolved: ({ toolUseId, decision, reason }) => {
+			onDangerReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+				setPendingPermsMap((prev) => {
+					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
+						return prev;
+					}
+					const next = new Map(prev);
+					next.delete(toolUseId);
+					for (const [key, perm] of next) {
+						if (perm.id === requestId) next.delete(key);
+					}
+					return next;
+				});
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
@@ -2286,7 +2298,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					setPendingPermsMap((prev) => {
 						const next = new Map(prev);
 						for (const p of perms) {
-							if (p.toolUseId) next.set(p.toolUseId, p);
+							if (p.toolUseId && !isDangerReflectionPermissionLike(p)) next.set(p.toolUseId, p);
 						}
 						return next;
 					});
@@ -2315,7 +2327,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						setPendingPermsMap((prev) => {
 							const next = new Map(prev);
 							for (const p of perms) {
-								if (p.toolUseId) next.set(p.toolUseId, p);
+								if (p.toolUseId && !isDangerReflectionPermissionLike(p)) next.set(p.toolUseId, p);
 							}
 							return next;
 						});

@@ -13,6 +13,15 @@ import {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
+function hasDangerReflectionSuggestion(suggestions: unknown): boolean {
+	if (!Array.isArray(suggestions)) return false;
+	return suggestions.some((suggestion) => {
+		if (!suggestion || typeof suggestion !== "object") return false;
+		const type = String((suggestion as { type?: unknown }).type ?? "");
+		return type === "danger_reflection" || type === "yolo_reflection";
+	});
+}
+
 /**
  * Delete orphaned messages and their associated refs/tool-calls within a
  * transaction. Also clears narrator FK references (forkMessageId,
@@ -1661,13 +1670,15 @@ export const narratorMessageQueries = {
 			),
 			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
 		});
-		return tcs.map((tc) => ({
-			id: tc.id,
-			toolName: tc.toolName,
-			toolUseId: tc.toolUseId,
-			inputJson: tc.inputJson,
-			decisionReason: tc.permissionDecisionReason,
-			suggestions: tc.permissionSuggestions,
-		}));
+		return tcs
+			.filter((tc) => !hasDangerReflectionSuggestion(tc.permissionSuggestions))
+			.map((tc) => ({
+				id: tc.id,
+				toolName: tc.toolName,
+				toolUseId: tc.toolUseId,
+				inputJson: tc.inputJson,
+				decisionReason: tc.permissionDecisionReason,
+				suggestions: tc.permissionSuggestions,
+			}));
 	},
 };

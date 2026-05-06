@@ -3,6 +3,23 @@ import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrat
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
+function hasDangerReflectionSuggestion(suggestions: unknown[] | null | undefined): boolean {
+	return Array.isArray(suggestions)
+		? suggestions.some((suggestion) => {
+				if (!suggestion || typeof suggestion !== "object") return false;
+				const type = String((suggestion as { type?: unknown }).type ?? "");
+				return type === "danger_reflection" || type === "yolo_reflection";
+			})
+		: false;
+}
+
+export function isDangerReflectionPermissionLike(value: {
+	suggestions?: unknown[] | null;
+	permissionSuggestions?: unknown[] | null;
+}): boolean {
+	return hasDangerReflectionSuggestion(value.suggestions ?? value.permissionSuggestions);
+}
+
 // Re-export functions that moved to message-segments.ts for backward compatibility
 export {
 	filterChildrenByToolUse,
@@ -30,7 +47,9 @@ export function resolvePendingPerm(
 	}
 	// Fallback: build from the tool call record itself (status-driven path,
 	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
-	if (!perm && tc.status === "pending" && tc.toolUseId) {
+	// Danger reflection also stores a pending tool-call row while the internal
+	// reflection loop decides, but it is not an actionable user permission request.
+	if (!perm && tc.status === "pending" && tc.toolUseId && !isDangerReflectionPermissionLike(tc)) {
 		perm = {
 			id: tc.id ?? tc.toolUseId,
 			toolName: tc.toolName,

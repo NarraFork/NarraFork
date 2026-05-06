@@ -2000,15 +2000,6 @@ export async function handlePermission(
 						substatus: ["silent_notification"],
 					});
 				}
-				broadcastToNarrator(wsTarget, {
-					type: "danger_reflection_started",
-					narratorId: wsTarget,
-					requestId,
-					toolUseId,
-					toolName,
-					danger,
-				});
-
 				if (signal.aborted) {
 					await markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, {
 						danger,
@@ -2058,6 +2049,14 @@ export async function handlePermission(
 						resolve,
 						cleanup,
 					});
+				});
+				broadcastToNarrator(wsTarget, {
+					type: "danger_reflection_started",
+					narratorId: wsTarget,
+					requestId,
+					toolUseId,
+					toolName,
+					danger,
 				});
 				return {
 					behavior: "dangerReflection",
