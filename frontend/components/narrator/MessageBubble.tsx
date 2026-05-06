@@ -34,6 +34,7 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconCopy,
+	IconDownload,
 	IconEyeCheck,
 	IconFile,
 	IconGitFork,
@@ -74,7 +75,11 @@ import {
 	MessageContextMenuCtx,
 	useMessageContextMenu,
 } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
+import {
+	BLOCK_ID_ATTR,
+	shouldIgnoreMessageBlockSelection,
+	useMessageSelection,
+} from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
 import { useRenderLod } from "./RenderLodCtx";
 import { SideCarNotice } from "./SideCarNotice";
@@ -231,6 +236,7 @@ function WebSearchBlock({
 			const isModKey = e.metaKey || e.ctrlKey;
 			const isShift = e.shiftKey;
 			if (!isModKey && !isShift) return;
+			if (shouldIgnoreMessageBlockSelection(e.target)) return;
 			if (!selection.selectionMode) {
 				const sel = window.getSelection();
 				if (sel && sel.toString().trim().length > 0) return;
@@ -439,76 +445,271 @@ interface ImageGenerationBlockData {
 	outputIndex?: number;
 }
 
-function ImageGenerationBlock({ block }: { block: ImageGenerationBlockData }) {
+function generatedImageFilename(block: ImageGenerationBlockData): string {
+	const savedName = block.savedPath?.split(/[\\/]/).pop();
+	if (savedName?.trim()) return savedName.endsWith(".png") ? savedName : `${savedName}.png`;
+	const safeId = (block.id || "generated-image").replace(/[^A-Za-z0-9_-]/g, "_");
+	return `${safeId || "generated-image"}.png`;
+}
+
+function downloadUrl(url: string, filename: string) {
+	const link = document.createElement("a");
+	link.href = url;
+	link.download = filename;
+	document.body.appendChild(link);
+	link.click();
+	link.remove();
+}
+
+function ImageGenerationBlock({
+	block,
+	blockIndex,
+}: {
+	block: ImageGenerationBlockData;
+	blockIndex?: number;
+}) {
 	const { t } = useTranslation("narrator");
+	const msgCtx = useMessageContextMenu();
+	const lod = useRenderLod();
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const isGenerating = block.status && block.status !== "completed";
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loadError, setLoadError] = useState(false);
+	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
+	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
+
+	const getPreviewHeaders = useCallback(() => {
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+		return headers;
+	}, []);
 
 	// Fetch image from savedPath via /api/fs/preview (blob URL)
 	useEffect(() => {
 		if (!block.savedPath) return;
 		let cancelled = false;
-		const headers: Record<string, string> = {};
-		const token = getToken();
-		if (token) headers.Authorization = `Bearer ${token}`;
-		fetch(`/api/fs/preview?path=${encodeURIComponent(block.savedPath)}`, { headers })
+		let objectUrl: string | null = null;
+		fetch(`/api/fs/preview?path=${encodeURIComponent(block.savedPath)}`, {
+			headers: getPreviewHeaders(),
+		})
 			.then((r) => {
 				if (!r.ok) throw new Error(r.statusText);
 				return r.blob();
 			})
 			.then((blob) => {
-				if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+				if (!cancelled) {
+					objectUrl = URL.createObjectURL(blob);
+					setBlobUrl(objectUrl);
+				}
 			})
 			.catch(() => {
 				if (!cancelled) setLoadError(true);
 			});
 		return () => {
 			cancelled = true;
+			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [block.savedPath]);
-
-	// Cleanup blob URL on unmount
-	useEffect(() => {
-		return () => {
-			if (blobUrl) URL.revokeObjectURL(blobUrl);
-		};
-	}, [blobUrl]);
+	}, [block.savedPath, getPreviewHeaders]);
 
 	// Determine image source: savedPath blob > inline base64 > none
 	const imageSrc = blobUrl ?? (block.result ? `data:image/png;base64,${block.result}` : null);
 	const hasImage = !!imageSrc && !loadError;
+	const canCopyImagePath = !!block.savedPath;
+	const canSaveImage = hasImage;
+	const hasMenuActions = !!(
+		canCopyImagePath ||
+		canSaveImage ||
+		msgCtx.onRollbackToBlock ||
+		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
+		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onDeleteBlock
+	);
+
+	const handleCopyImagePath = useCallback(async () => {
+		if (!block.savedPath) return;
+		try {
+			await navigator.clipboard.writeText(block.savedPath);
+			notifications.show({ color: "teal", message: t("copyImagePathSuccess") });
+		} catch {
+			notifications.show({ color: "red", message: t("copyImagePathFailed") });
+		}
+	}, [block.savedPath, t]);
+
+	const handleSaveImageAs = useCallback(() => {
+		if (!imageSrc) return;
+		try {
+			downloadUrl(imageSrc, generatedImageFilename(block));
+		} catch {
+			notifications.show({ color: "red", message: t("saveImageFailed") });
+		}
+	}, [block, imageSrc, t]);
+
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile || lod === "preview" || !hasMenuActions) return;
+			const sel = window.getSelection();
+			if (sel && sel.toString().trim().length > 0) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 220);
+			const flipY = e.clientY > window.innerHeight - 300;
+			setCtxMenuPos({ x, y: e.clientY, flipY });
+			setCtxMenuOpened(true);
+		},
+		[hasMenuActions, isMobile, lod],
+	);
+
+	const closeMenu = useCallback(() => setCtxMenuOpened(false), []);
 
 	return (
-		<Paper withBorder radius="sm" p="xs">
-			<Group gap={6} wrap="nowrap" align="center" mb={hasImage ? "xs" : 0}>
-				<ThemeIcon size={18} variant="light" color="violet" radius="sm">
-					<IconPhoto size={12} />
-				</ThemeIcon>
-				{isGenerating && <Loader size={12} color="violet" type="dots" />}
-				<Text size="xs" c="dimmed">
-					{isGenerating
-						? block.status === "generating"
-							? t("imageGenerating")
-							: t("imageGenerationPreparing")
-						: t("imageGenerated")}
-					{block.revisedPrompt && (
-						<Text span fw={500} c="violet" ml={4}>
-							{block.revisedPrompt}
-						</Text>
-					)}
-				</Text>
-			</Group>
-			{hasImage && (
-				<Image
-					src={imageSrc}
-					alt={block.revisedPrompt ?? "Generated image"}
-					radius="sm"
-					maw={512}
-					fit="contain"
-				/>
+		<>
+			<Paper withBorder radius="sm" p="xs" onContextMenu={handleContextMenu}>
+				<Group gap={6} wrap="nowrap" align="center" mb={hasImage ? "xs" : 0}>
+					<ThemeIcon size={18} variant="light" color="violet" radius="sm">
+						<IconPhoto size={12} />
+					</ThemeIcon>
+					{isGenerating && <Loader size={12} color="violet" type="dots" />}
+					<Text size="xs" c="dimmed">
+						{isGenerating
+							? block.status === "generating"
+								? t("imageGenerating")
+								: t("imageGenerationPreparing")
+							: t("imageGenerated")}
+						{block.revisedPrompt && (
+							<Text span fw={500} c="violet" ml={4}>
+								{block.revisedPrompt}
+							</Text>
+						)}
+					</Text>
+				</Group>
+				{hasImage && (
+					<Image
+						src={imageSrc}
+						alt={block.revisedPrompt ?? "Generated image"}
+						radius="sm"
+						maw={512}
+						fit="contain"
+					/>
+				)}
+			</Paper>
+			{ctxMenuOpened && (
+				<Menu
+					opened={ctxMenuOpened}
+					onChange={setCtxMenuOpened}
+					position="bottom-start"
+					withinPortal
+					transitionProps={FIXED_MENU_TRANSITION_PROPS}
+					styles={{
+						dropdown: {
+							position: "fixed",
+							left: ctxMenuPos.x,
+							...(ctxMenuPos.flipY
+								? { bottom: window.innerHeight - ctxMenuPos.y, top: "auto" }
+								: { top: ctxMenuPos.y }),
+						},
+					}}
+				>
+					<Menu.Target>
+						<div
+							style={{
+								position: "fixed",
+								left: ctxMenuPos.x,
+								top: ctxMenuPos.y,
+								pointerEvents: "none",
+							}}
+						/>
+					</Menu.Target>
+					<Menu.Dropdown>
+						{canCopyImagePath && (
+							<Menu.Item
+								leftSection={<IconCopy size={14} />}
+								onClick={() => {
+									void handleCopyImagePath();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_copyImagePath")}
+							</Menu.Item>
+						)}
+						{canSaveImage && (
+							<Menu.Item
+								leftSection={<IconDownload size={14} />}
+								onClick={() => {
+									void handleSaveImageAs();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_saveImageAs")}
+							</Menu.Item>
+						)}
+						{(canCopyImagePath || canSaveImage) &&
+							(msgCtx.onRollbackToBlock ||
+								msgCtx.onForkFromMessage ||
+								msgCtx.onAskInPassing ||
+								msgCtx.onCompactBeforeMessage ||
+								msgCtx.onDeleteBlock) && <Menu.Divider />}
+						{msgCtx.onRollbackToBlock && blockIndex != null && (
+							<Menu.Item
+								leftSection={<IconArrowBackUp size={14} />}
+								onClick={() => {
+									msgCtx.onRollbackToBlock?.(blockIndex);
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_rollback")}
+							</Menu.Item>
+						)}
+						{msgCtx.onForkFromMessage && (
+							<Menu.Item
+								leftSection={<IconGitFork size={14} />}
+								onClick={() => {
+									msgCtx.onForkFromMessage?.();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_fork")}
+							</Menu.Item>
+						)}
+						{msgCtx.onAskInPassing && (
+							<Menu.Item
+								leftSection={<IconMessageQuestion size={14} />}
+								onClick={() => {
+									msgCtx.onAskInPassing?.();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_askInPassing")}
+							</Menu.Item>
+						)}
+						{msgCtx.onCompactBeforeMessage && (
+							<Menu.Item
+								leftSection={<IconArrowsMinimize size={14} />}
+								onClick={() => {
+									msgCtx.onCompactBeforeMessage?.();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_compactBefore")}
+							</Menu.Item>
+						)}
+						{msgCtx.onDeleteBlock && blockIndex != null && (
+							<Menu.Item
+								color="red"
+								leftSection={<IconTrash size={14} />}
+								onClick={() => {
+									msgCtx.onDeleteBlock?.(blockIndex);
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_delete")}
+							</Menu.Item>
+						)}
+					</Menu.Dropdown>
+				</Menu>
 			)}
-		</Paper>
+		</>
 	);
 }
 
@@ -813,6 +1014,7 @@ export const ReasoningBlock = memo(
 				const isModKey = e.metaKey || e.ctrlKey;
 				const isShift = e.shiftKey;
 				if (!isModKey && !isShift) return;
+				if (shouldIgnoreMessageBlockSelection(e.target)) return;
 				// Don't interfere with text selection — but when block selection
 				// is already active, Shift+Click should always do range-select.
 				if (!selection.selectionMode) {
@@ -2809,9 +3011,11 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					if (block.type === "image_generation") {
 						return (
-							<BlockMenuWrapper key={key} blockIndex={realIndex}>
-								<ImageGenerationBlock block={block as ImageGenerationBlockData} />
-							</BlockMenuWrapper>
+							<ImageGenerationBlock
+								key={key}
+								block={block as ImageGenerationBlockData}
+								blockIndex={realIndex}
+							/>
 						);
 					}
 					if (block.type === "tool_use") {

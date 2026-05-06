@@ -357,7 +357,36 @@ export interface PaginatedMessages {
 }
 
 export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
+export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
 export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";
+
+export interface PublicCodexQuotaSegment {
+	type: PublicCodexPlanTier;
+	remainingAccountEquivalents: number;
+	totalAccountEquivalents: number;
+	averageRemainingPercent: number | null;
+	nextResetAt: number | null;
+}
+
+export interface PublicCodexQuotaForecastPoint {
+	timestamp: number;
+	byType: Partial<Record<PublicCodexPlanTier, number>>;
+}
+
+export interface PublicCodexQuotaOverview {
+	generatedAt: string;
+	unit: "account_equivalent";
+	totalRemainingAccountEquivalents: number;
+	totalAccountEquivalents: number;
+	segments: PublicCodexQuotaSegment[];
+	forecast: {
+		points: PublicCodexQuotaForecastPoint[];
+		types: PublicCodexPlanTier[];
+	};
+	nextResetAt: number | null;
+	usageQueueRunning: boolean;
+	schedulerStarted: boolean;
+}
 
 export interface CodexUsageWindow {
 	used_percent: number;

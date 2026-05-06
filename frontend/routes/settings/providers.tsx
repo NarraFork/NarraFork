@@ -39,6 +39,7 @@ function SettingsProvidersPage() {
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
 		oauth_error?: string;
+		provider?: string;
 	};
 
 	const { data: settings, isLoading } = useQuery({
@@ -226,6 +227,10 @@ function SettingsProvidersPage() {
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
 	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+
+	useEffect(() => {
+		if (search.provider === "codex") setSelectedProvider("codex");
+	}, [search.provider]);
 
 	useEffect(() => {
 		if (isDirty) {

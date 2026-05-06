@@ -17,12 +17,14 @@ import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
 	buildCodexUsageForecast,
 	buildCodexUsageSummary,
+	CODEX_DISPLAY_PLAN_TIERS,
 	type CodexPlanTier,
 	type CodexUsageForecast,
 	type CodexUsageSummary,
 	getScheduledUsageResetAt,
 	normalizeCodexPlanTier,
 } from "./codex-usage-summary";
+import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 
@@ -37,6 +39,7 @@ const MAX_SESSION_AFFINITY_ENTRIES = 2_000;
 const USAGE_RESET_REFRESH_GRACE_MS = 1_000;
 const USAGE_RESET_RETRY_DELAY_MS = 5 * 60_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const QUOTA_OVERVIEW_BROADCAST_DEBOUNCE_MS = 100;
 
 // === Types ===
 
@@ -126,6 +129,36 @@ export interface ManagerSnapshot {
 	lastBrowserAuthError?: string;
 }
 
+export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
+
+export interface PublicCodexQuotaSegment {
+	type: PublicCodexPlanTier;
+	remainingAccountEquivalents: number;
+	totalAccountEquivalents: number;
+	averageRemainingPercent: number | null;
+	nextResetAt: number | null;
+}
+
+export interface PublicCodexQuotaForecastPoint {
+	timestamp: number;
+	byType: Partial<Record<PublicCodexPlanTier, number>>;
+}
+
+export interface PublicCodexQuotaOverview {
+	generatedAt: string;
+	unit: "account_equivalent";
+	totalRemainingAccountEquivalents: number;
+	totalAccountEquivalents: number;
+	segments: PublicCodexQuotaSegment[];
+	forecast: {
+		points: PublicCodexQuotaForecastPoint[];
+		types: PublicCodexPlanTier[];
+	};
+	nextResetAt: number | null;
+	usageQueueRunning: boolean;
+	schedulerStarted: boolean;
+}
+
 export interface SnapshotOptions {
 	availablePage?: number;
 	unavailablePage?: number;
@@ -199,6 +232,7 @@ export class CodexManager {
 	private usageSchedulerStarted = false;
 	private usageSchedulerNextRunAt?: number;
 	private usageSchedulerRetryAfter = new Map<string, number>();
+	private quotaOverviewBroadcastTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -220,6 +254,10 @@ export class CodexManager {
 
 	dispose(): void {
 		this.stopUsageRefreshScheduler();
+		if (this.quotaOverviewBroadcastTimer) {
+			clearTimeout(this.quotaOverviewBroadcastTimer);
+			this.quotaOverviewBroadcastTimer = undefined;
+		}
 		process.off("beforeExit", this.beforeExitHandler);
 	}
 
@@ -447,6 +485,7 @@ export class CodexManager {
 			entry.disabledReason = "too_many_failures";
 			this.evictSessionsByCredential(id);
 			this.saveCredentials();
+			this.schedulePublicQuotaOverviewBroadcast();
 		}
 
 		this.saveStatsDebounced();
@@ -467,6 +506,7 @@ export class CodexManager {
 			entry.quotaResetsAt = resetsAt ?? entry.quotaResetsAt;
 			this.evictSessionsByCredential(id);
 			this.saveCredentials();
+			this.schedulePublicQuotaOverviewBroadcast();
 		}
 
 		this.saveStatsDebounced();
@@ -492,6 +532,7 @@ export class CodexManager {
 			}
 		}
 		this.saveCredentials();
+		this.schedulePublicQuotaOverviewBroadcast();
 		return true;
 	}
 
@@ -511,6 +552,7 @@ export class CodexManager {
 			this.saveCredentials();
 			this.saveStatsDebounced();
 			this.rescheduleUsageRefresh();
+			this.schedulePublicQuotaOverviewBroadcast();
 		}
 		return changed;
 	}
@@ -521,15 +563,18 @@ export class CodexManager {
 		if (this.usageSchedulerStarted) return;
 		this.usageSchedulerStarted = true;
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	stopUsageRefreshScheduler(): void {
+		const wasStarted = this.usageSchedulerStarted;
 		this.usageSchedulerStarted = false;
 		if (this.usageSchedulerTimer) {
 			clearTimeout(this.usageSchedulerTimer);
 			this.usageSchedulerTimer = undefined;
 		}
 		this.usageSchedulerNextRunAt = undefined;
+		if (wasStarted) this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	private shouldTrackUsageReset(entry: CodexCredential): boolean {
@@ -631,6 +676,73 @@ export class CodexManager {
 			dueCredentialCount: schedule.dueCredentialIds.length,
 			started: this.usageSchedulerStarted,
 		};
+	}
+
+	getPublicQuotaOverview(): PublicCodexQuotaOverview {
+		this.reviveQuotaResetCredentials();
+		this.pruneSessionAffinity();
+
+		const now = Date.now();
+		const summary = buildCodexUsageSummary(this.entries, now);
+		const forecast = buildCodexUsageForecast(this.entries, now);
+		const visibleTiers = CODEX_DISPLAY_PLAN_TIERS.filter(
+			(tier): tier is PublicCodexPlanTier =>
+				tier !== "other" && (summary.byTier[tier]?.accountCount ?? 0) > 0,
+		);
+		const segments = visibleTiers.map((tier) => {
+			const stats = summary.byTier[tier];
+			return {
+				type: tier,
+				remainingAccountEquivalents: stats.remainingAccountEquivalents,
+				totalAccountEquivalents: stats.accountCount,
+				averageRemainingPercent: stats.averageRemainingPercent,
+				nextResetAt: stats.nextResetAt ?? null,
+			};
+		});
+		const totalRemainingAccountEquivalents = Number(
+			segments.reduce((sum, segment) => sum + segment.remainingAccountEquivalents, 0).toFixed(4),
+		);
+		const totalAccountEquivalents = segments.reduce(
+			(sum, segment) => sum + segment.totalAccountEquivalents,
+			0,
+		);
+		const points = forecast.points.map((point) => {
+			const byType = Object.fromEntries(
+				visibleTiers.map((tier) => [tier, point.byTier[tier] ?? 0]),
+			) as Partial<Record<PublicCodexPlanTier, number>>;
+			return { timestamp: point.timestamp, byType };
+		});
+
+		return {
+			generatedAt: summary.generatedAt,
+			unit: forecast.unit,
+			totalRemainingAccountEquivalents,
+			totalAccountEquivalents,
+			segments,
+			forecast: {
+				points,
+				types: visibleTiers,
+			},
+			nextResetAt: summary.nextResetAt ?? null,
+			usageQueueRunning: codexUsageQueue.getSnapshot().isRunning,
+			schedulerStarted: this.usageSchedulerStarted,
+		};
+	}
+
+	private broadcastPublicQuotaOverview(): void {
+		eventBus.emit({
+			type: "codex:quota_overview_updated",
+			overview: this.getPublicQuotaOverview(),
+		});
+	}
+
+	private schedulePublicQuotaOverviewBroadcast(): void {
+		if (this.quotaOverviewBroadcastTimer) return;
+		this.quotaOverviewBroadcastTimer = setTimeout(() => {
+			this.quotaOverviewBroadcastTimer = undefined;
+			this.broadcastPublicQuotaOverview();
+		}, QUOTA_OVERVIEW_BROADCAST_DEBOUNCE_MS);
+		(this.quotaOverviewBroadcastTimer as { unref?: () => void }).unref?.();
 	}
 
 	// ==================== Admin API ====================
@@ -737,6 +849,7 @@ export class CodexManager {
 		}
 		this.saveCredentials();
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	setPriority(id: string, priority: number): void {
@@ -756,6 +869,7 @@ export class CodexManager {
 		if (stats) stats.failureCount = 0;
 		this.saveCredentials();
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	removeCredential(id: string): void {
@@ -772,6 +886,7 @@ export class CodexManager {
 		this.saveCredentials();
 		this.saveStats();
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 	}
 
 	removeCredentials(ids: string[]): { removed: string[]; notFound: string[] } {
@@ -801,6 +916,7 @@ export class CodexManager {
 			this.saveCredentials();
 			this.saveStats();
 			this.rescheduleUsageRefresh();
+			this.schedulePublicQuotaOverviewBroadcast();
 		}
 		return { removed, notFound };
 	}
@@ -955,6 +1071,7 @@ export class CodexManager {
 		if (stats) stats.failureCount = 0;
 		this.saveCredentials();
 		this.saveStatsDebounced();
+		this.schedulePublicQuotaOverviewBroadcast();
 		return true;
 	}
 
@@ -999,6 +1116,7 @@ export class CodexManager {
 		}
 		this.usageSchedulerRetryAfter.delete(id);
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 
 		return usage;
 	}
@@ -1069,6 +1187,7 @@ export class CodexManager {
 			}
 			this.saveCredentials();
 			this.rescheduleUsageRefresh();
+			this.schedulePublicQuotaOverviewBroadcast();
 			return existing;
 		}
 
@@ -1097,6 +1216,7 @@ export class CodexManager {
 		this.saveCredentials();
 		codexUsageQueue.enqueue(cred.id);
 		this.rescheduleUsageRefresh();
+		this.schedulePublicQuotaOverviewBroadcast();
 		return cred;
 	}
 
@@ -1143,6 +1263,7 @@ export class CodexManager {
 			const newIds = this.entries.filter((e) => !e.usage).map((e) => e.id);
 			codexUsageQueue.enqueueMany(newIds);
 			this.rescheduleUsageRefresh();
+			this.schedulePublicQuotaOverviewBroadcast();
 		}
 
 		return { added, duplicates, skipped };

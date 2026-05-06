@@ -434,6 +434,11 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		broadcastToNarrator(event.narratorId, event.message);
 	});
 
+	// === Codex quota overview broadcast ===
+	eventBus.on("codex:quota_overview_updated", (event) => {
+		broadcastToAll({ type: "codex_quota_overview_updated", overview: event.overview });
+	});
+
 	// === Recent tabs title sync ===
 	// When a narrator title changes, update the stored title in every user's recent_tabs
 	// and broadcast a fresh snapshot so the sidebar reflects the new title immediately.

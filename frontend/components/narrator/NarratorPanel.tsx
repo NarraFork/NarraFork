@@ -85,6 +85,7 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
@@ -165,6 +166,7 @@ import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageLis
 import { BrowserSessionBar } from "./BrowserSessionBar";
 import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
+import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
@@ -1536,6 +1538,7 @@ export function NarratorPanel({
 		aggregations,
 		providerLabels,
 	} = useAllModels();
+	const { data: currentUser } = useCurrentUser();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
@@ -1640,6 +1643,7 @@ export function NarratorPanel({
 		const providerPrefix = resolvedModel?.split(":")[0];
 		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
 	}, [codexCapableProviders, resolvedModel]);
+	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
 
 	// Reasoning effort is supported by Codex, Anthropic, and OpenAI providers
 	// (DeepSeek models via completions mode also support it)
@@ -5925,6 +5929,11 @@ export function NarratorPanel({
 										</Tooltip>
 									)}
 									{contextIndicator}
+									<CodexQuotaIndicator
+										enabled={isBuiltInCodexModel && !isWorkspacePreview}
+										isAdmin={currentUser?.role === "admin"}
+										compact={isMobileViewport}
+									/>
 											<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
 											</Text>
 										</Tooltip>
@@ -6080,6 +6089,7 @@ export function NarratorPanel({
 																	enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
 																}
 																showPlanReflectionAutoApproveToggle={
+																	(narrator.permissionMode ?? "default") === "acceptEdits" ||
 																	(narrator.permissionMode ?? "default") === "bypassPermissions"
 																}
 																planReflectionAutoApprove={planReflectionAutoApprove}
@@ -6302,6 +6312,7 @@ export function NarratorPanel({
 																enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
 															}
 															showPlanReflectionAutoApproveToggle={
+																(narrator.permissionMode ?? "default") === "acceptEdits" ||
 																(narrator.permissionMode ?? "default") === "bypassPermissions"
 															}
 															planReflectionAutoApprove={planReflectionAutoApprove}

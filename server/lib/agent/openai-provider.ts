@@ -1378,6 +1378,10 @@ async function* _parseResponsesAPIStream(
 	const decoder = new TextDecoder();
 	let buffer = "";
 	let lineCount = 0;
+	let sawResponsesEvent = false;
+	let completed = false;
+	let terminalError = false;
+	let lastParseError: { error: string; preview: string } | undefined;
 
 	// Tool call accumulators keyed by output_index (matches OpenAI SSE structure)
 	const toolAccum = new Map<number, ResponsesToolAccum>();
@@ -1385,6 +1389,58 @@ async function* _parseResponsesAPIStream(
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 	// Track SSE event: type for gateway-injected events
 	let currentEventType = "";
+
+	const parsePayload = (payload: string, eventType: string): ParsedStreamEvent[] => {
+		if (!payload || payload === "[DONE]") return [];
+
+		let data: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(payload);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				lastParseError = {
+					error: "SSE data was not a JSON object",
+					preview: payload.slice(0, 300),
+				};
+				return [];
+			}
+			data = parsed as Record<string, unknown>;
+		} catch (err) {
+			lastParseError = {
+				error: err instanceof Error ? err.message : String(err),
+				preview: payload.slice(0, 300),
+			};
+			return [];
+		}
+
+		// Gateway-injected events: check SSE event: type first, then data-embedded type.
+		if (eventType && isGatewayEventType(eventType)) {
+			const gwEvt = parseGatewaySSEEvent(eventType, data);
+			if (gwEvt) return [gwEvt];
+		}
+		const gwEvt = parseGatewayDataEvent(data);
+		if (gwEvt) return [gwEvt];
+
+		// Some SSE implementations carry the Responses event name in `event:` and omit
+		// `type` in `data`. Preserve that signal instead of falling through to the
+		// empty-response guard, which masks the real upstream state.
+		if (
+			eventType &&
+			typeof data.type !== "string" &&
+			(eventType.startsWith("response.") || eventType === "error")
+		) {
+			data.type = eventType;
+		}
+
+		const chunk = data as ResponsesAPIChunk;
+		const type = chunk.type;
+		if (typeof type === "string" && (type.startsWith("response.") || type === "error")) {
+			sawResponsesEvent = true;
+		}
+		const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+		if (type === "response.completed") completed = true;
+		if (events.some((evt) => evt.invalidState)) terminalError = true;
+		return events;
+	};
 
 	const reader = body.getReader();
 	try {
@@ -1398,13 +1454,16 @@ async function* _parseResponsesAPIStream(
 
 			for (const line of lines) {
 				const trimmed = line.trim();
-				if (!trimmed) continue;
+				if (!trimmed) {
+					currentEventType = "";
+					continue;
+				}
 				// Track SSE event: lines for gateway-injected events
 				if (trimmed.startsWith("event:")) {
 					currentEventType = trimmed.slice(6).trim();
 					continue;
 				}
-				if (!trimmed.startsWith("data: ")) continue;
+				if (!trimmed.startsWith("data:")) continue;
 
 				if (lineCount < 5) {
 					logger.debug("Responses API SSE line", {
@@ -1414,52 +1473,40 @@ async function* _parseResponsesAPIStream(
 				}
 				lineCount++;
 
-				let data: Record<string, unknown>;
-				try {
-					data = JSON.parse(trimmed.slice(6));
-				} catch {
-					currentEventType = "";
-					continue;
-				}
-
-				// Gateway-injected events: check SSE event: type first, then data-embedded type
-				if (currentEventType && isGatewayEventType(currentEventType)) {
-					const gwEvt = parseGatewaySSEEvent(currentEventType, data);
-					currentEventType = "";
-					if (gwEvt) {
-						yield gwEvt;
-						continue;
-					}
-				}
+				const payload = trimmed.slice(5).trimStart();
+				const eventType = currentEventType;
 				currentEventType = "";
-				const gwEvt = parseGatewayDataEvent(data);
-				if (gwEvt) {
-					yield gwEvt;
-					continue;
-				}
-
-				const events = parseResponsesAPIEvent(data as ResponsesAPIChunk, toolAccum, reasoningAccum);
+				const events = parsePayload(payload, eventType);
 				for (const evt of events) {
 					yield evt;
 				}
 			}
 		}
 		// Process remaining buffer
-		if (buffer.trim()?.startsWith("data: ")) {
-			try {
-				const chunk = JSON.parse(buffer.trim().slice(6));
-				const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
-				for (const evt of events) {
-					yield evt;
-				}
-			} catch (err) {
-				logger.debug("Responses API: failed to parse remaining buffer", {
-					bufferLength: buffer.length,
-					error: String(err),
-				});
+		if (buffer.trim()?.startsWith("data:")) {
+			const trimmed = buffer.trim();
+			const payload = trimmed.slice(5).trimStart();
+			const events = parsePayload(payload, currentEventType);
+			for (const evt of events) {
+				yield evt;
 			}
 		}
-		// Flush any un-emitted tool calls
+		if (!completed && !terminalError) {
+			const parseDetail = lastParseError
+				? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
+				: sawResponsesEvent
+					? ""
+					: " No Responses API events were parsed from the stream.";
+			yield {
+				invalidState: {
+					reason: "stream_closed_before_response_completed",
+					message: `Responses API stream closed before response.completed.${parseDetail}`,
+				},
+			};
+			return;
+		}
+		// Flush any un-emitted tool calls only after a completed response. Otherwise
+		// a truncated stream could execute a half-written tool call and hide the real failure.
 		for (const [, acc] of toolAccum) {
 			if (!acc.emitted) {
 				acc.emitted = true;

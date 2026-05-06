@@ -79,7 +79,17 @@ import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import {
+	BLOCK_ID_ATTR,
+	MESSAGE_SELECTION_IGNORE_ATTR,
+	NestedBlockCtx,
+	shouldIgnoreMessageBlockSelection,
+	useMessageSelection,
+} from "./MessageSelectionCtx";
+import {
+	getPermissionReflectionSuggestion,
+	type ReflectionSuggestion,
+} from "./narrator-message-helpers";
 import { useRenderLod } from "./RenderLodCtx";
 import { SideCarNotice } from "./SideCarNotice";
 import { StreamingCode } from "./StreamingCode";
@@ -1025,52 +1035,80 @@ export function ElapsedTimer({
 
 // --- Helper: status indicator icon ---
 
-function findDangerReflectionSuggestion(toolCall: ToolCallData) {
-	return toolCall.permissionSuggestions?.find(
-		(suggestion) =>
-			suggestion &&
-			typeof suggestion === "object" &&
-			["danger_reflection", "yolo_reflection"].includes(
-				String((suggestion as { type?: unknown }).type ?? ""),
-			),
-	) as { status?: string; reason?: string; danger?: { summary?: string } } | undefined;
+function getToolCallReflection(
+	toolCall: ToolCallData,
+	pendingPermission?: PendingPermission | null,
+) {
+	return getPermissionReflectionSuggestion({
+		permissionSuggestions: toolCall.permissionSuggestions,
+		suggestions: pendingPermission?.suggestions,
+	});
 }
 
-function DangerReflectionNotice({
+function ReflectionNotice({
 	toolCall,
 	pendingPermission,
+	reflection,
 }: {
 	toolCall: ToolCallData;
 	pendingPermission?: PendingPermission | null;
+	reflection: ReflectionSuggestion;
 }) {
 	const { t } = useTranslation("narrator");
-	const [stopping, setStopping] = useState(false);
-	const suggestion = findDangerReflectionSuggestion(toolCall);
-	if (!suggestion) return null;
-	const status = suggestion.status ?? "running";
+	const { setButtonCount, setHasFeedback, registerActions, activePermissionId } =
+		useContext(PermEnterHintCtx);
+	const [takingOver, setTakingOver] = useState(false);
+	const reflectionRequestId = reflection.requestId ?? pendingPermission?.id ?? toolCall.id;
+	const activeKeyboardPermissionId = pendingPermission?.id ?? toolCall.id;
+	const running = reflection.status === "running";
+	const isDanger = reflection.kind === "danger_reflection";
 	const summary =
-		suggestion.reason || suggestion.danger?.summary || toolCall.permissionDecisionReason;
-	const running = status === "running";
-	const awaitingUser = status === "awaiting_user";
-	const requestId = pendingPermission?.id ?? toolCall.id;
-	const title = running
-		? t("dangerReflectionRunning")
-		: awaitingUser
-			? t("dangerReflectionAwaitingUser")
-			: t("dangerReflectionResolved");
-	const handleStopReflection = async (e: React.MouseEvent) => {
+		reflection.reason || reflection.danger?.summary || toolCall.permissionDecisionReason;
+	const title = (() => {
+		if (running) return t(isDanger ? "dangerReflectionRunning" : "planReflectionRunning");
+		if (reflection.status === "awaiting_user") {
+			return t(isDanger ? "dangerReflectionAwaitingUser" : "planReflectionAwaitingUser");
+		}
+		if (reflection.status === "confirmed") {
+			return t(isDanger ? "dangerReflectionConfirmed" : "planReflectionConfirmed");
+		}
+		if (reflection.status === "cancelled") {
+			return t(isDanger ? "dangerReflectionCancelled" : "planReflectionCancelled");
+		}
+		if (reflection.status === "aborted") {
+			return t(isDanger ? "dangerReflectionAborted" : "planReflectionAborted");
+		}
+		return t(isDanger ? "dangerReflectionResolved" : "planReflectionResolved");
+	})();
+
+	useEffect(() => {
+		if (activeKeyboardPermissionId && activeKeyboardPermissionId === activePermissionId) {
+			setButtonCount(0);
+			setHasFeedback(false);
+			registerActions([]);
+		}
+	}, [
+		activeKeyboardPermissionId,
+		activePermissionId,
+		registerActions,
+		setButtonCount,
+		setHasFeedback,
+	]);
+
+	const handleTakeOver = async (e: React.MouseEvent) => {
 		e.stopPropagation();
-		if (!requestId || stopping) return;
-		setStopping(true);
+		if (!reflectionRequestId || takingOver) return;
+		setTakingOver(true);
 		try {
-			await api.stopDangerReflection(requestId);
+			if (isDanger) await api.stopDangerReflection(reflectionRequestId);
+			else await api.stopPlanReflection(reflectionRequestId);
 		} finally {
-			setStopping(false);
+			setTakingOver(false);
 		}
 	};
+
 	const noticeStyle: React.CSSProperties = {
-		marginTop: 6,
-		marginBottom: "var(--mantine-spacing-sm)",
+		marginTop: "var(--mantine-spacing-xs)",
 		background: running
 			? "light-dark(color-mix(in srgb, var(--mantine-color-yellow-0) 88%, white), color-mix(in srgb, var(--mantine-color-yellow-9) 34%, transparent))"
 			: "light-dark(color-mix(in srgb, var(--mantine-color-gray-0) 88%, white), color-mix(in srgb, var(--mantine-color-dark-5) 52%, transparent))",
@@ -1084,16 +1122,38 @@ function DangerReflectionNotice({
 	const summaryColor = running
 		? "light-dark(var(--mantine-color-yellow-9), var(--mantine-color-yellow-1))"
 		: "var(--mantine-color-dimmed)";
+	const iconColor = running
+		? "yellow"
+		: reflection.status === "confirmed"
+			? "green"
+			: reflection.status === "cancelled"
+				? "red"
+				: reflection.status === "aborted"
+					? "orange"
+					: "gray";
+	const icon = running ? (
+		<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
+	) : reflection.status === "confirmed" ? (
+		<IconCheck size={14} />
+	) : reflection.status === "cancelled" ? (
+		<IconX size={14} />
+	) : reflection.status === "aborted" ? (
+		<IconBan size={14} />
+	) : (
+		<IconShield size={14} />
+	);
 
 	return (
-		<Paper withBorder radius="md" p="sm" style={noticeStyle}>
+		<Paper
+			withBorder
+			radius="sm"
+			p="sm"
+			style={noticeStyle}
+			{...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}
+		>
 			<Group gap="sm" wrap="nowrap" align="flex-start">
-				<ThemeIcon size="sm" radius="xl" color={running ? "yellow" : "gray"} variant="light" mt={1}>
-					{running ? (
-						<IconLoader2 size={14} style={{ animation: "spin 1s linear infinite" }} />
-					) : (
-						<IconShield size={14} />
-					)}
+				<ThemeIcon size="sm" radius="sm" color={iconColor} variant="light" mt={1}>
+					{icon}
 				</ThemeIcon>
 				<Box style={{ minWidth: 0, flex: 1 }}>
 					<Text size="xs" fw={700} lh={1.35} style={{ color: titleColor }}>
@@ -1104,18 +1164,19 @@ function DangerReflectionNotice({
 							{summary}
 						</Text>
 					)}
-					{running && requestId && (
-						<Button
-							size="xs"
-							variant="light"
-							color="yellow"
-							mt="xs"
-							leftSection={<IconPlayerStop size={12} />}
-							loading={stopping}
-							onClick={handleStopReflection}
-						>
-							{t("stopDangerReflection")}
-						</Button>
+					{running && reflectionRequestId && (
+						<Group gap="xs" mt="xs">
+							<Button
+								size="xs"
+								variant="light"
+								color="yellow"
+								leftSection={<IconPlayerStop size={12} />}
+								loading={takingOver}
+								onClick={handleTakeOver}
+							>
+								{t("manualTakeoverReflection")}
+							</Button>
+						</Group>
 					)}
 				</Box>
 			</Group>
@@ -3909,7 +3970,7 @@ export function InlinePermission({
 			: [];
 	if (permission.toolName === "AskUserQuestion" && askQuestions.length > 0) {
 		return (
-			<Box mt="xs">
+			<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
 				<AskUserQuestionBanner
 					requestId={permission.id}
 					narratorId={narratorId ?? ""}
@@ -3976,7 +4037,7 @@ export function InlinePermission({
 
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
-		<Box mt="xs">
+		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
 			{planText && !editing && (
 				<Box mb="xs" style={{ minHeight: 0, maxHeight: planMaxHeight, overflow: "auto" }}>
 					{planEdited && (
@@ -4376,19 +4437,24 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isPreviewLod = lod === "preview";
 	const interactionEnabled = !isPreviewLod;
 
-	const permissionUI = pendingPermission ? (
-		<InlinePermission
-			permission={pendingPermission}
-			narratorId={narratorId}
-			onDecision={onPermissionDecision}
-			onQuestionSubmit={onQuestionSubmit}
-			onQuestionDeny={onQuestionDeny}
-			planMaxHeight={vpHeight}
-		/>
-	) : null;
-	const dangerReflectionNotice = (
-		<DangerReflectionNotice toolCall={toolCall} pendingPermission={pendingPermission} />
-	);
+	const reflection = getToolCallReflection(toolCall, pendingPermission);
+	const permissionUI =
+		reflection && reflection.status !== "awaiting_user" ? (
+			<ReflectionNotice
+				toolCall={toolCall}
+				pendingPermission={pendingPermission}
+				reflection={reflection}
+			/>
+		) : pendingPermission ? (
+			<InlinePermission
+				permission={pendingPermission}
+				narratorId={narratorId}
+				onDecision={onPermissionDecision}
+				onQuestionSubmit={onQuestionSubmit}
+				onQuestionDeny={onQuestionDeny}
+				planMaxHeight={vpHeight}
+			/>
+		) : null;
 
 	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
 
@@ -4446,6 +4512,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			const isModKey = e.metaKey || e.ctrlKey;
 			const isShift = e.shiftKey;
 			if (!isModKey && !isShift) return;
+			if (shouldIgnoreMessageBlockSelection(e.target)) return;
 			e.preventDefault();
 			if (isShift) {
 				window.getSelection()?.removeAllRanges();
@@ -4589,7 +4656,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
 					<LazyCollapse in={opened}>
-						{dangerReflectionNotice}
 						<Box style={planStyle}>
 							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
 						</Box>

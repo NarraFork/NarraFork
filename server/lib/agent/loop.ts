@@ -34,6 +34,8 @@ import {
 	createExitPlanReflectionDecision,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
+	isExitPlanReflectionWaitingForUser,
+	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
 import type {
 	AgentConfig,
@@ -808,7 +810,7 @@ async function resolveDangerReflectionDecision(
 }
 
 interface ExitPlanReflectionGateResult {
-	decision: ExitPlanReflectionDecision;
+	decision: ExitPlanReflectionDecision | { action: "manual"; reason?: string };
 	input: Record<string, unknown>;
 }
 
@@ -833,8 +835,16 @@ async function resolveExitPlanModeReflection(
 	}
 
 	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-	const decisionPromise = createExitPlanReflectionDecision(requestId);
 	const reflectionAbort = new AbortController();
+	const decisionPromise = createExitPlanReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: resolvedInput.input,
+		abortController: reflectionAbort,
+	});
+	await markExitPlanReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runExitPlanModeReflectionLoop(
 		config,
@@ -848,24 +858,31 @@ async function resolveExitPlanModeReflection(
 	});
 	const decision = await Promise.race([
 		decisionPromise.finally(() => reflectionAbort.abort()),
-		reflectionPromise.then(async () => {
-			const fallbackMessage =
-				"ExitPlanMode reflection loop did not call ExitPlanConfirm or ExitPlanRevise in its single allowed response";
-			const cancelled = cancelExitPlanReflection(requestId, fallbackMessage);
-			if (cancelled) return decisionPromise;
+		reflectionPromise
+			.catch((err) => {
+				logger.warn("ExitPlanMode reflection loop ended unexpectedly", { err: String(err) });
+			})
+			.then(async () => {
+				if (isExitPlanReflectionWaitingForUser(requestId)) {
+					return { action: "manual" as const };
+				}
+				const fallbackMessage =
+					"ExitPlanMode reflection loop did not call ExitPlanConfirm or ExitPlanRevise in its single allowed response";
+				const cancelled = await cancelExitPlanReflection(requestId, fallbackMessage);
+				if (cancelled) return decisionPromise;
 
-			// Prefer an already-settled decision if the tool resolved concurrently;
-			// otherwise fail closed and ask the model to revise before user approval.
-			const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
-				decisionPromise,
-				Promise.resolve(null),
-			]);
-			const fallbackDecision: ExitPlanReflectionDecision = {
-				action: "revise",
-				feedback: fallbackMessage,
-			};
-			return alreadySettled ?? fallbackDecision;
-		}),
+				// Prefer an already-settled decision if the tool resolved concurrently;
+				// otherwise fail closed and ask the model to revise before user approval.
+				const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
+					decisionPromise,
+					Promise.resolve(null),
+				]);
+				const fallbackDecision: ExitPlanReflectionDecision = {
+					action: "revise",
+					feedback: fallbackMessage,
+				};
+				return alreadySettled ?? fallbackDecision;
+			}),
 	]);
 	if (!reflectionDone) {
 		reflectionPromise.catch((err) => {
@@ -916,6 +933,9 @@ async function executeToolAfterReflections(
 	if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
 		tu.input = reflected.input;
+		if (reflected.decision.action === "manual") {
+			return executeTool(tu, config);
+		}
 		if (reflected.decision.action !== "confirm") {
 			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
 		}

@@ -4,8 +4,9 @@
 import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
+import { serializeBrowserValue } from "./serialization";
 import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
-import { touchSession } from "./session";
+import { drainConsoleCaptures, touchSession } from "./session";
 
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_ACTION_TIMEOUT = 10_000;
@@ -29,6 +30,94 @@ function formatConsoleLocation(message: BrowserConsoleMessage): string {
 	const line = location.lineNumber !== undefined ? `:${location.lineNumber}` : "";
 	const column = location.columnNumber !== undefined ? `:${location.columnNumber}` : "";
 	return ` (${location.url}${line}${column})`;
+}
+
+function formatConsoleLines(messages: BrowserConsoleMessage[]): string[] {
+	return messages.map((message) => {
+		const time = new Date(message.timestamp).toISOString();
+		return `[${time}] ${message.type.toUpperCase()}${formatConsoleLocation(message)} ${message.text}`;
+	});
+}
+
+function clipOutput(text: string, maxLength: number, label: string): string {
+	if (text.length <= maxLength) return text;
+	return `${text.slice(0, maxLength)}\n\n[${label} truncated at ${maxLength} characters]`;
+}
+
+function errorToMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function runWithTimeout<T>(
+	promise: Promise<T>,
+	opts?: { timeout?: number; signal?: AbortSignal; label?: string },
+): Promise<T> {
+	const timeout = opts?.timeout;
+	const signal = opts?.signal;
+	if ((!timeout || timeout <= 0) && !signal) return promise;
+
+	const label = opts?.label ?? "Browser action";
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+		const cleanup = () => {
+			if (timeoutId) clearTimeout(timeoutId);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const settle = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			fn();
+		};
+		const onAbort = () => {
+			settle(() => reject(new Error(`${label} aborted`)));
+		};
+
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		if (timeout && timeout > 0) {
+			timeoutId = setTimeout(() => {
+				settle(() => reject(new Error(`${label} timed out after ${timeout}ms`)));
+			}, timeout);
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => settle(() => resolve(value)),
+			(err) => settle(() => reject(err)),
+		);
+	});
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise<void>((resolve, reject) => {
+		let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		const cleanup = () => {
+			if (timeoutId) clearTimeout(timeoutId);
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
+			reject(new Error("Browser wait aborted"));
+		};
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		timeoutId = setTimeout(() => {
+			cleanup();
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+function formatConsoleOutput(messages: BrowserConsoleMessage[], emptyMessage: string): string {
+	return formatConsoleLines(messages).join("\n") || emptyMessage;
 }
 
 function formatNetworkRequest(request: BrowserNetworkRequest): string {
@@ -238,18 +327,12 @@ export async function getConsole(
 	opts?: { maxLength?: number; clear?: boolean },
 ): Promise<{ output: string; count: number; snapshot: PageSnapshot }> {
 	touchSession(session);
+	await drainConsoleCaptures(session);
 	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
 	const messages = session.consoleMessages;
 	const count = messages.length;
-	const lines = messages.map((message) => {
-		const time = new Date(message.timestamp).toISOString();
-		return `[${time}] ${message.type.toUpperCase()}${formatConsoleLocation(message)} ${message.text}`;
-	});
-	let output = lines.join("\n");
-	if (!output) output = "No console messages captured.";
-	if (output.length > maxLength) {
-		output = `${output.slice(0, maxLength)}\n\n[Console output truncated at ${maxLength} characters]`;
-	}
+	let output = formatConsoleOutput(messages, "No console messages captured.");
+	output = clipOutput(output, maxLength, "Console output");
 	if (opts?.clear) {
 		session.consoleMessages.length = 0;
 	}
@@ -310,18 +393,89 @@ export async function getNetwork(
 export async function evaluate(
 	session: BrowserSession,
 	expression: string,
-	opts?: { maxLength?: number },
+	opts?: { maxLength?: number; timeout?: number; signal?: AbortSignal },
 ): Promise<{ result: string; snapshot: PageSnapshot }> {
 	touchSession(session);
 	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
 
-	const raw = await session.page.evaluate(expression);
-	let result = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
-	if (result.length > maxLength) {
-		result = `${result.slice(0, maxLength)}\n\n[Output truncated at ${maxLength} characters]`;
-	}
+	const raw = await runWithTimeout(session.page.evaluate(expression), {
+		timeout: opts?.timeout,
+		signal: opts?.signal,
+		label: "Browser evaluate",
+	});
+	const result = clipOutput(serializeBrowserValue(raw, { pretty: true }), maxLength, "Output");
 
 	return { result, snapshot: await snapshot(session.page) };
+}
+
+export interface EvaluateCaptureResult {
+	result: string;
+	consoleOutput: string;
+	consoleCount: number;
+	snapshot: PageSnapshot;
+	durationMs: number;
+	isError?: boolean;
+	error?: string;
+}
+
+/** Execute JavaScript and return both the value and console emitted during the run. */
+export async function evaluateCapture(
+	session: BrowserSession,
+	expression: string,
+	opts?: {
+		maxLength?: number;
+		timeout?: number;
+		clear?: boolean;
+		waitAfterMs?: number;
+		signal?: AbortSignal;
+	},
+): Promise<EvaluateCaptureResult> {
+	touchSession(session);
+	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
+	await drainConsoleCaptures(session);
+	if (opts?.clear ?? true) {
+		session.consoleMessages.length = 0;
+	}
+	const startSeq = session.consoleMessageSeq;
+	const startedAt = Date.now();
+
+	let result = "";
+	let isError = false;
+	let error: string | undefined;
+	try {
+		const raw = await runWithTimeout(session.page.evaluate(expression), {
+			timeout: opts?.timeout,
+			signal: opts?.signal,
+			label: "Browser evaluate_capture",
+		});
+		result = clipOutput(serializeBrowserValue(raw, { pretty: true }), maxLength, "Output");
+	} catch (err) {
+		isError = true;
+		error = errorToMessage(err);
+		result = `Evaluation failed: ${error}`;
+	}
+
+	if (opts?.waitAfterMs && opts.waitAfterMs > 0) {
+		await delay(opts.waitAfterMs, opts.signal);
+	}
+	await drainConsoleCaptures(session);
+
+	const capturedMessages = session.consoleMessages.filter((message) => message.seq > startSeq);
+	let consoleOutput = formatConsoleOutput(
+		capturedMessages,
+		"No console messages captured during script.",
+	);
+	consoleOutput = clipOutput(consoleOutput, maxLength, "Console output");
+
+	return {
+		result,
+		consoleOutput,
+		consoleCount: capturedMessages.length,
+		snapshot: await snapshot(session.page),
+		durationMs: Date.now() - startedAt,
+		isError,
+		...(error ? { error } : {}),
+	};
 }
 
 /** Wait for an element to appear or a condition. */

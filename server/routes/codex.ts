@@ -21,7 +21,16 @@ function isCodexLoadBalancingMode(mode: unknown): mode is LoadBalancingMode {
 	return mode === "priority" || mode === "balanced" || mode === "tier-balanced";
 }
 
-// All Codex routes require admin privileges
+/**
+ * GET /api/codex/quota-overview
+ * Public-safe Codex quota overview for all authenticated users.
+ */
+codexRoutes.get("/quota-overview", requireAuth, (c) => {
+	const manager = getCodexManager();
+	return c.json(manager.getPublicQuotaOverview());
+});
+
+// All remaining Codex routes require admin privileges
 codexRoutes.use("*", requireAuth, requireAdmin);
 
 /**

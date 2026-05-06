@@ -37,6 +37,32 @@ export type NarratorServerMessage =
 			reason?: string;
 	  }
 	| {
+			type: "plan_reflection_started";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson: unknown;
+			reason?: string;
+	  }
+	| {
+			type: "plan_reflection_resolved";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+	  }
+	| {
+			type: "plan_reflection_stopped";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson: unknown;
+			reason?: string;
+	  }
+	| {
 			type: "status_change";
 			narratorId: string;
 			status: string;

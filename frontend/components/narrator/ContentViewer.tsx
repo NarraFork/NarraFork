@@ -38,7 +38,12 @@ import { DiffView } from "./DiffView";
 import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import {
+	BLOCK_ID_ATTR,
+	NestedBlockCtx,
+	shouldIgnoreMessageBlockSelection,
+	useMessageSelection,
+} from "./MessageSelectionCtx";
 import { useRenderLod } from "./RenderLodCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -363,6 +368,7 @@ export const ContentViewer = memo(
 				const isModKey = e.metaKey || e.ctrlKey;
 				const isShift = e.shiftKey;
 				if (!isModKey && !isShift) return;
+				if (shouldIgnoreMessageBlockSelection(e.target)) return;
 				// Don't interfere with text selection — but when block selection
 				// is already active, Shift+Click should always do range-select
 				// (browser may have produced a text selection via native shift-click).

@@ -44,7 +44,12 @@ import {
 	MessageContextMenuCtx,
 	useMessageContextMenu,
 } from "./MessageContextMenuCtx";
-import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
+import {
+	BLOCK_ID_ATTR,
+	NestedBlockCtx,
+	shouldIgnoreMessageBlockSelection,
+	useMessageSelection,
+} from "./MessageSelectionCtx";
 import {
 	filterChildrenByToolUse,
 	hasToolUse,
@@ -338,6 +343,7 @@ export const SubagentCard = memo(
 				const isModKey = e.metaKey || e.ctrlKey;
 				const isShift = e.shiftKey;
 				if (!isModKey && !isShift) return;
+				if (shouldIgnoreMessageBlockSelection(e.target)) return;
 				e.preventDefault();
 				if (isShift) {
 					selection.rangeSelectTo(saBlockId);

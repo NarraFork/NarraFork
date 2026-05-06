@@ -257,6 +257,10 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-reflection`, {
 			method: "POST",
 		}),
+	stopPlanReflection: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-plan-reflection`, {
+			method: "POST",
+		}),
 	updateNarratorTitle: (id: string, title: string) =>
 		request<{ ok: boolean; title: string }>(`/narrators/${id}/title`, {
 			method: "PATCH",

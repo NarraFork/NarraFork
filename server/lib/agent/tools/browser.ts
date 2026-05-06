@@ -20,6 +20,7 @@ const ACTIONS = [
 	"get_console",
 	"get_network",
 	"evaluate",
+	"evaluate_capture",
 	"wait",
 	"navigate",
 	"scroll",
@@ -54,7 +55,10 @@ export const browserTool: ToolDefinition = {
 		'- "get_attribute": Get an attribute value of an element\n' +
 		'- "get_console": Get captured console output and page errors\n' +
 		'- "get_network": Get captured network requests/responses and failures\n' +
-		'- "evaluate": Execute JavaScript in the page context\n' +
+		'- "evaluate": Execute JavaScript in the page context and return the evaluated value\n' +
+		'- "evaluate_capture": Execute JavaScript and return both the value and console output emitted during the run\n' +
+		"  Prefer evaluate_capture when using JavaScript to interact with the page and inspect logs. " +
+		"Use an IIFE/async IIFE for multi-statement scripts and return JSON-serializable data when possible.\n" +
 		'- "wait": Wait for an element to appear or become visible\n' +
 		'- "navigate": Go to a new URL, or go back/forward\n' +
 		'- "scroll": Scroll the page up or down\n' +
@@ -75,10 +79,11 @@ export const browserTool: ToolDefinition = {
 		"- value (optional): Value for fill/select/type/evaluate/get_attribute actions\n" +
 		"- key (optional): Special key name for type action (e.g. Enter, Tab, Escape, ArrowDown)\n" +
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
-		"- timeout (optional): Timeout in ms for wait/element actions (default: 10000)\n" +
+		"- timeout (optional): Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
-		"- max_length (optional): Max output length for dom/get_text/evaluate/get_console/get_network (default: 20000)\n" +
-		"- clear (optional): For get_console/get_network, clear captured output after reading (default: false)\n" +
+		"- max_length (optional): Max output length for dom/get_text/evaluate/evaluate_capture/get_console/get_network (default: 20000)\n" +
+		"- clear (optional): For get_console/get_network, clear captured output after reading; for evaluate_capture, clear console before running (default: true)\n" +
+		"- wait_after_ms (optional): For evaluate_capture, wait this many ms after script execution before collecting console output\n" +
 		"- include_details (optional): For get_network, include request/response headers and post data (default: false)\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
 		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
@@ -106,7 +111,7 @@ export const browserTool: ToolDefinition = {
 			},
 			value: {
 				description:
-					"Value for fill/select/type/evaluate/get_attribute actions, or filter for get_network",
+					"Value for fill/select/type/evaluate/evaluate_capture/get_attribute actions, or filter for get_network",
 				type: "string",
 			},
 			key: {
@@ -119,7 +124,8 @@ export const browserTool: ToolDefinition = {
 				enum: ["back", "forward", "up", "down"],
 			},
 			timeout: {
-				description: "Timeout in ms for wait/element actions (default: 10000)",
+				description:
+					"Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)",
 				type: "number",
 			},
 			coordinate: {
@@ -133,12 +139,20 @@ export const browserTool: ToolDefinition = {
 			},
 			max_length: {
 				description:
-					"Max output length for dom/get_text/evaluate/get_console/get_network (default: 20000)",
+					"Max output length for dom/get_text/evaluate/evaluate_capture/get_console/get_network (default: 20000)",
 				type: "number",
 			},
 			clear: {
-				description: "For get_console/get_network, clear captured output after reading",
+				description:
+					"For get_console/get_network, clear captured output after reading; " +
+					"for evaluate_capture, clear console before running",
 				type: "boolean",
+			},
+			wait_after_ms: {
+				description:
+					"For evaluate_capture, wait this many milliseconds after script execution " +
+					"before collecting console output",
+				type: "number",
 			},
 			include_details: {
 				description: "For get_network, include headers and post data in output",
@@ -169,7 +183,9 @@ export const browserTool: ToolDefinition = {
 		value: z
 			.string()
 			.optional()
-			.describe("Value for fill/select/type/evaluate/get_attribute, or filter for get_network"),
+			.describe(
+				"Value for fill/select/type/evaluate/evaluate_capture/get_attribute, or filter for get_network",
+			),
 		key: z.string().optional().describe("Special key name for type action"),
 		direction: z
 			.enum(["back", "forward", "up", "down"])
@@ -184,7 +200,15 @@ export const browserTool: ToolDefinition = {
 		clear: z
 			.boolean()
 			.optional()
-			.describe("For get_console/get_network, clear captured output after reading"),
+			.describe(
+				"For get_console/get_network, clear captured output after reading; for evaluate_capture, clear console before running",
+			),
+		wait_after_ms: z
+			.number()
+			.optional()
+			.describe(
+				"For evaluate_capture, wait after script execution before collecting console output",
+			),
 		include_details: z
 			.boolean()
 			.optional()
@@ -209,6 +233,7 @@ export const browserTool: ToolDefinition = {
 			coordinate,
 			max_length,
 			clear,
+			wait_after_ms,
 			include_details,
 			headless,
 			categories,
@@ -224,6 +249,7 @@ export const browserTool: ToolDefinition = {
 			coordinate?: { x: number; y: number };
 			max_length?: number;
 			clear?: boolean;
+			wait_after_ms?: number;
 			include_details?: boolean;
 			headless?: boolean;
 			categories?: string[];
@@ -255,9 +281,11 @@ export const browserTool: ToolDefinition = {
 						coordinate,
 						max_length,
 						clear,
+						wait_after_ms,
 						include_details,
 						url,
 						categories,
+						signal: ctx.signal,
 					});
 			}
 		} catch (err) {
@@ -349,9 +377,11 @@ async function handleSessionAction(
 		coordinate?: { x: number; y: number };
 		max_length?: number;
 		clear?: boolean;
+		wait_after_ms?: number;
 		include_details?: boolean;
 		url?: string;
 		categories?: string[];
+		signal?: AbortSignal;
 	},
 ): Promise<ToolResult> {
 	if (!opts.session_id) {
@@ -586,10 +616,43 @@ async function handleSessionAction(
 			}
 			const result = await actions.evaluate(session, opts.value, {
 				maxLength: opts.max_length,
+				timeout: opts.timeout,
+				signal: opts.signal,
 			});
 			return {
 				output: result.result,
 				metadata: { sessionId: session.id },
+			};
+		}
+
+		case "evaluate_capture": {
+			if (!opts.value) {
+				return {
+					output: "value (JavaScript expression) is required for evaluate_capture",
+					isError: true,
+				};
+			}
+			const result = await actions.evaluateCapture(session, opts.value, {
+				maxLength: opts.max_length,
+				timeout: opts.timeout,
+				clear: opts.clear,
+				waitAfterMs: opts.wait_after_ms,
+				signal: opts.signal,
+			});
+			return {
+				output:
+					`Return value:\n${result.result}\n\n` +
+					`Console messages during script (${result.consoleCount}):\n${result.consoleOutput}\n\n` +
+					`URL: ${result.snapshot.url}\n` +
+					`Title: ${result.snapshot.title}\n` +
+					`Duration: ${result.durationMs}ms`,
+				isError: result.isError,
+				metadata: {
+					sessionId: session.id,
+					consoleMessageCount: result.consoleCount,
+					durationMs: result.durationMs,
+					...(result.error ? { error: result.error } : {}),
+				},
 			};
 		}
 

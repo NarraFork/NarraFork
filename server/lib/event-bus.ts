@@ -231,6 +231,11 @@ export type NarraForkEvent =
 			parentNarratorId: string;
 			chunk: string;
 	  }
+	// Codex quota overview lifecycle
+	| {
+			type: "codex:quota_overview_updated";
+			overview: unknown;
+	  }
 	// Mirror of every broadcastToNarrator call — for non-WS consumers (e.g. IM gateway)
 	| {
 			type: "narrator:message_broadcast";

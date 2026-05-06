@@ -212,7 +212,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.planReflectionAutoApprove": {
-		desc: "启用后，在全部允许 + 宽松规划 + 计划模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
+		desc: "启用后，在允许编辑/全部允许 + 计划模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
 		type: "boolean",
 	},
 	"agent.dangerReflectionEnabled": {
@@ -239,7 +239,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "正整数，默认 20000",
 	},
 	"agent.firstTokenTimeoutMs": {
-		desc: "首 token 超时时间（毫秒）。AI API 请求发起后，若在此时间内未收到 text/tool/reasoning/web_search/image_generation 等实质事件，则中断本次请求并按可恢复错误规则重试。0 表示禁用。默认 60000（60 秒）。",
+		desc: "首 token 超时时间（毫秒）。AI API 请求发起后，若在此时间内未收到 text/tool/reasoning/web_search/image_generation/queueEvent 等实质事件，则中断本次请求并按可恢复错误规则重试。0 表示禁用。默认 60000（60 秒）。",
 		type: "number",
 		valid: "0-600000，0 = 禁用，默认 60000",
 	},

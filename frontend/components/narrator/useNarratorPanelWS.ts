@@ -26,8 +26,8 @@ import {
 	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
 import {
-	isDangerReflectionPermissionLike,
-	isRunningDangerReflectionPermissionLike,
+	isActiveReflectionPermissionLike,
+	isReflectionPermissionLike,
 	removeStreamingChunksMsg,
 	revokeContentBlockPreviewUrls,
 } from "./narrator-message-helpers";
@@ -307,7 +307,7 @@ function applyPendingPermissionsToCache(
 		if (
 			!perm.toolUseId ||
 			!result ||
-			(isDangerReflectionPermissionLike(perm) && !isRunningDangerReflectionPermissionLike(perm))
+			(isReflectionPermissionLike(perm) && !isActiveReflectionPermissionLike(perm))
 		) {
 			continue;
 		}
@@ -1735,7 +1735,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 			},
-			onDangerReflectionStarted: ({ toolUseId, danger }) => {
+			onDangerReflectionStarted: ({ requestId, toolUseId, danger }) => {
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
@@ -1747,7 +1747,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								typeof danger === "object" && danger && "summary" in danger
 									? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
 									: "Danger reflection in progress",
-							permissionSuggestions: [{ type: "danger_reflection", status: "running", danger }],
+							permissionSuggestions: [
+								{ type: "danger_reflection", status: "running", danger, requestId },
+							],
 						},
 						toolUseIndexRef.current,
 					);
@@ -1773,7 +1775,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						toolUseId,
 						inputJson: existing?.inputJson ?? inputJson ?? {},
 						decisionReason: reason ?? existing?.decisionReason,
-						suggestions: [{ type: "danger_reflection", status: "awaiting_user", danger, reason }],
+						suggestions: [
+							{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
+						],
 					});
 					return next;
 				});
@@ -1788,7 +1792,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							permissionDecisionReason:
 								reason ?? "Danger reflection stopped; awaiting user decision",
 							permissionSuggestions: [
-								{ type: "danger_reflection", status: "awaiting_user", danger, reason },
+								{ type: "danger_reflection", status: "awaiting_user", danger, requestId, reason },
 							],
 						},
 						toolUseIndexRef.current,
@@ -1822,7 +1826,91 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							permissionSuggestions: [
 								{
 									type: "danger_reflection",
-									status: decision === "allow" ? "confirmed" : decision,
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
+									reason,
+								},
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onPlanReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Plan reflection in progress",
+							permissionSuggestions: [
+								{ type: "plan_reflection", status: "running", requestId, reason },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onPlanReflectionStopped: ({ requestId, toolUseId, inputJson, reason }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Plan reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{ type: "plan_reflection", status: "awaiting_user", requestId, reason },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+			},
+			onPlanReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+				setPendingPermsMap((prev) => {
+					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
+						return prev;
+					}
+					const next = new Map(prev);
+					next.delete(toolUseId);
+					for (const [key, perm] of next) {
+						if (perm.id === requestId) next.delete(key);
+					}
+					return next;
+				});
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					const status = decision === "allow" ? "running" : "fail";
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "plan_reflection",
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
 									reason,
 								},
 							],
@@ -2448,7 +2536,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						for (const p of perms) {
 							if (
 								p.toolUseId &&
-								(!isDangerReflectionPermissionLike(p) || isRunningDangerReflectionPermissionLike(p))
+								(!isReflectionPermissionLike(p) || isActiveReflectionPermissionLike(p))
 							) {
 								next.set(p.toolUseId, p);
 							}
@@ -2482,8 +2570,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							for (const p of perms) {
 								if (
 									p.toolUseId &&
-									(!isDangerReflectionPermissionLike(p) ||
-										isRunningDangerReflectionPermissionLike(p))
+									(!isReflectionPermissionLike(p) || isActiveReflectionPermissionLike(p))
 								) {
 									next.set(p.toolUseId, p);
 								}

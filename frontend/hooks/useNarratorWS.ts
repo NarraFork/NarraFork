@@ -40,6 +40,26 @@ interface NarratorWSCallbacks {
 		inputJson?: Record<string, unknown>;
 		reason?: string;
 	}) => void;
+	onPlanReflectionStarted?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		inputJson?: Record<string, unknown>;
+		reason?: string;
+	}) => void;
+	onPlanReflectionResolved?: (data: {
+		requestId: string;
+		toolUseId: string;
+		decision: "allow" | "deny" | "aborted";
+		reason?: string;
+	}) => void;
+	onPlanReflectionStopped?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		inputJson?: Record<string, unknown>;
+		reason?: string;
+	}) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -326,6 +346,32 @@ export function useNarratorWS(
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
 							danger: data.danger,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							reason: data.reason as string | undefined,
+						});
+						break;
+					case "plan_reflection_started":
+						callbacksRef.current.onPlanReflectionStarted?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							reason: data.reason as string | undefined,
+						});
+						break;
+					case "plan_reflection_resolved":
+						callbacksRef.current.onPlanReflectionResolved?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							decision: data.decision as "allow" | "deny" | "aborted",
+							reason: data.reason as string | undefined,
+						});
+						break;
+					case "plan_reflection_stopped":
+						callbacksRef.current.onPlanReflectionStopped?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
 							inputJson: data.inputJson as Record<string, unknown> | undefined,
 							reason: data.reason as string | undefined,
 						});

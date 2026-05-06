@@ -6,6 +6,35 @@ import { createContext, useContext } from "react";
  */
 export const BLOCK_ID_ATTR = "data-block-id";
 
+/** Attribute placed on interactive islands that must not trigger message-block selection. */
+export const MESSAGE_SELECTION_IGNORE_ATTR = "data-message-selection-ignore";
+
+const MESSAGE_SELECTION_IGNORE_SELECTOR = [
+	`[${MESSAGE_SELECTION_IGNORE_ATTR}]`,
+	"input",
+	"textarea",
+	"select",
+	"button",
+	"a",
+	"label",
+	"[contenteditable='true']",
+	"[role='button']",
+	"[role='checkbox']",
+	"[role='radio']",
+	"[role='textbox']",
+	"[role='option']",
+	"[role='switch']",
+	"[role='menuitem']",
+	".mantine-Menu-dropdown",
+	".mantine-Combobox-dropdown",
+	".mantine-Modal-root",
+].join(", ");
+
+/** Return true when a click target belongs to an interactive area, not selectable content. */
+export function shouldIgnoreMessageBlockSelection(target: EventTarget | null): boolean {
+	return target instanceof Element && !!target.closest(MESSAGE_SELECTION_IGNORE_SELECTOR);
+}
+
 /**
  * When set to a non-null string, nested ContentViewers should NOT register
  * their own block ID for multi-select. The value is the parent ToolCallCard's

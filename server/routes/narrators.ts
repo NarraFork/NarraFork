@@ -37,6 +37,7 @@ import {
 	users,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
+import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { screenshot as browserScreenshot } from "../lib/browser/actions";
 import {
 	closeSession as closeBrowserSession,
@@ -1961,6 +1962,16 @@ narratorRoutes.post("/permissions/:requestId/stop-reflection", async (c) => {
 	const reason = typeof body.reason === "string" ? body.reason : undefined;
 	const stopped = await stopDangerReflectionLoop(requestId, reason);
 	if (!stopped) return c.json({ error: "Danger reflection request not found" }, 404);
+	return c.json({ ok: true });
+});
+
+// Stop automatic plan reflection and fall back to the normal ExitPlanMode approval request
+narratorRoutes.post("/permissions/:requestId/stop-plan-reflection", async (c) => {
+	const requestId = c.req.param("requestId");
+	const body = await c.req.json().catch(() => ({}));
+	const reason = typeof body.reason === "string" ? body.reason : undefined;
+	const stopped = await takeOverExitPlanReflection(requestId, reason);
+	if (!stopped) return c.json({ error: "Plan reflection request not found" }, 404);
 	return c.json({ ok: true });
 });
 

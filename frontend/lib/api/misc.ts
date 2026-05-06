@@ -14,6 +14,7 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	HookApiRecord,
+	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	StorageScanResult,
 } from "./types";
@@ -282,6 +283,7 @@ export const miscApi = {
 		}),
 
 	// Codex credential pool management
+	codexQuotaOverview: () => request<PublicCodexQuotaOverview>("/codex/quota-overview"),
 	codexStatus: (params?: {
 		availablePage?: number;
 		unavailablePage?: number;

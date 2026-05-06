@@ -3,32 +3,77 @@ import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrat
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
-function getDangerReflectionStatus(suggestions: unknown[] | null | undefined): string | null {
+export type ReflectionKind = "danger_reflection" | "plan_reflection";
+export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
+
+export interface ReflectionSuggestion {
+	kind: ReflectionKind;
+	status: ReflectionStatus;
+	reason?: string;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic suggestion payload
+	danger?: any;
+	requestId?: string;
+}
+
+const REFLECTION_KINDS = new Set<ReflectionKind>(["danger_reflection", "plan_reflection"]);
+const ACTIVE_REFLECTION_STATUSES = new Set<ReflectionStatus>(["running", "awaiting_user"]);
+
+export function getReflectionSuggestion(
+	suggestions: unknown[] | null | undefined,
+): ReflectionSuggestion | null {
 	if (!Array.isArray(suggestions)) return null;
 	for (const suggestion of suggestions) {
 		if (!suggestion || typeof suggestion !== "object") continue;
-		const record = suggestion as { type?: unknown; status?: unknown };
-		const type = String(record.type ?? "");
-		if (type === "danger_reflection" || type === "yolo_reflection") {
-			return typeof record.status === "string" ? record.status : "running";
-		}
+		const record = suggestion as {
+			type?: unknown;
+			status?: unknown;
+			reason?: unknown;
+			danger?: unknown;
+			requestId?: unknown;
+		};
+		const kind = String(record.type ?? "");
+		if (!REFLECTION_KINDS.has(kind as ReflectionKind)) continue;
+		const rawStatus = typeof record.status === "string" ? record.status : "running";
+		const status = ACTIVE_REFLECTION_STATUSES.has(rawStatus as ReflectionStatus)
+			? (rawStatus as ReflectionStatus)
+			: rawStatus === "allow"
+				? "confirmed"
+				: rawStatus === "deny"
+					? "cancelled"
+					: rawStatus === "confirmed" || rawStatus === "cancelled" || rawStatus === "aborted"
+						? (rawStatus as ReflectionStatus)
+						: "running";
+		return {
+			kind: kind as ReflectionKind,
+			status,
+			reason: typeof record.reason === "string" ? record.reason : undefined,
+			danger: record.danger,
+			requestId: typeof record.requestId === "string" ? record.requestId : undefined,
+		};
 	}
 	return null;
 }
 
-export function isDangerReflectionPermissionLike(value: {
+export function getPermissionReflectionSuggestion(value: {
 	suggestions?: unknown[] | null;
 	permissionSuggestions?: unknown[] | null;
-}): boolean {
-	return getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions) !== null;
+}): ReflectionSuggestion | null {
+	return getReflectionSuggestion(value.suggestions ?? value.permissionSuggestions);
 }
 
-export function isRunningDangerReflectionPermissionLike(value: {
+export function isReflectionPermissionLike(value: {
 	suggestions?: unknown[] | null;
 	permissionSuggestions?: unknown[] | null;
 }): boolean {
-	const status = getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions);
-	return status === "running" || status === "awaiting_user";
+	return getPermissionReflectionSuggestion(value) !== null;
+}
+
+export function isActiveReflectionPermissionLike(value: {
+	suggestions?: unknown[] | null;
+	permissionSuggestions?: unknown[] | null;
+}): boolean {
+	const reflection = getPermissionReflectionSuggestion(value);
+	return reflection ? ACTIVE_REFLECTION_STATUSES.has(reflection.status) : false;
 }
 
 // Re-export functions that moved to message-segments.ts for backward compatibility
@@ -58,14 +103,14 @@ export function resolvePendingPerm(
 	}
 	// Fallback: build from the tool call record itself (status-driven path,
 	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
-	// Danger reflection also stores a pending tool-call row while the internal
-	// reflection loop decides. It is actionable only while the reflection is still running;
-	// after it resolves, the historical notice must not keep approval controls alive.
+	// Reflection gates also store a pending tool-call row while their internal
+	// loop decides. They are actionable only while still running or awaiting user;
+	// after they resolve, historical notices must not keep approval controls alive.
 	if (
 		!perm &&
 		tc.status === "pending" &&
 		tc.toolUseId &&
-		(!isDangerReflectionPermissionLike(tc) || isRunningDangerReflectionPermissionLike(tc))
+		(!isReflectionPermissionLike(tc) || isActiveReflectionPermissionLike(tc))
 	) {
 		perm = {
 			id: tc.id ?? tc.toolUseId,

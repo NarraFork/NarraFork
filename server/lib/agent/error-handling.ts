@@ -4,6 +4,7 @@ import { StreamStaleError } from "../stream-timeout";
 /** Patterns that indicate a transient API error worth retrying. */
 const RETRYABLE_PATTERNS = [
 	"MODEL_TEMPORARILY_UNAVAILABLE",
+	"overload",
 	"overloaded",
 	"too many requests",
 	"rate limit",
@@ -30,6 +31,20 @@ const RETRYABLE_PATTERNS = [
 	"internal server error",
 ];
 
+/** 429 is only retryable by default when the message looks like rate limiting/load. */
+const RETRYABLE_429_PATTERNS = [
+	"retry",
+	"retry-after",
+	"overload",
+	"overloaded",
+	"capacity",
+	"capacty",
+	"too many requests",
+	"rate limit",
+	"throttl",
+	"try again",
+];
+
 /** Error codes that represent transient network/transport failures. */
 const RETRYABLE_ERROR_CODES = new Set([
 	"ECONNRESET",
@@ -53,6 +68,13 @@ const NON_RETRYABLE_PATTERNS = [
 	"usage limit has been reached",
 	"insufficient_quota",
 	"quota exceeded",
+	"exceeded your current quota",
+	"check your plan and billing",
+	"billing details",
+	"payment required",
+	"insufficient balance",
+	"out of balance",
+	"credit balance",
 	'"plan_type":"free"',
 ];
 
@@ -68,8 +90,8 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	"too many tokens",
 ];
 
-/** HTTP status codes that indicate transient server-side issues. */
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 529]);
+/** HTTP status codes that indicate transient server-side issues without extra message checks. */
+const RETRYABLE_STATUS_CODES = new Set([500, 502, 503, 529]);
 
 /** Reasons from invalidState that indicate a transient server-side issue worth retrying. */
 const RETRYABLE_INVALID_STATE_REASONS = new Set([
@@ -94,6 +116,35 @@ export function extractErrorMessage(err: unknown): string {
 	return String(err);
 }
 
+function collectStatusCodes(obj: Record<string, unknown>): Set<number> {
+	const statusCodes = new Set<number>();
+	for (const field of [obj, obj.error, obj.cause]) {
+		if (field && typeof field === "object") {
+			const f = field as Record<string, unknown>;
+			if (typeof f.status === "number") statusCodes.add(f.status);
+			if (typeof f.statusCode === "number") statusCodes.add(f.statusCode);
+		}
+	}
+	return statusCodes;
+}
+
+function has429Message(message: string): boolean {
+	return /\b429\b/.test(message);
+}
+
+function isRetryable429Message(message: string): boolean {
+	return (
+		has429Message(message) && RETRYABLE_429_PATTERNS.some((pattern) => message.includes(pattern))
+	);
+}
+
+function hasRetryable429(statusCodes: Set<number>, msgCandidates: string[]): boolean {
+	return (
+		statusCodes.has(429) &&
+		msgCandidates.some((msg) => RETRYABLE_429_PATTERNS.some((pattern) => msg.includes(pattern)))
+	);
+}
+
 export function isRetryableInvalidStateReason(reason: string, message?: string): boolean {
 	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
 	// Also check the message for retryable patterns (e.g. "Too many requests",
@@ -102,9 +153,16 @@ export function isRetryableInvalidStateReason(reason: string, message?: string):
 	if (message) {
 		const m = message.toLowerCase();
 		if (NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
+		if (isRetryable429Message(m)) return true;
+		// Plain 429 messages must not fall through to broader transient keywords.
+		if (has429Message(m)) {
+			const obj: Record<string, unknown> = { reason, message };
+			const msgCandidates = [reason, message ?? ""].filter(Boolean);
+			return matchesCustomRetryRules(obj, msgCandidates);
+		}
 		if (RETRYABLE_PATTERNS.some((p) => m.includes(p))) return true;
-		// Check for HTTP status codes embedded in the message
-		if (/\b(429|500|502|503|529)\b/.test(m)) return true;
+		// Check for HTTP status codes embedded in the message.
+		if (/\b(500|502|503|529)\b/.test(m)) return true;
 	}
 	// Check user-defined custom retry rules against the invalidState reason/message
 	const obj: Record<string, unknown> = { reason, message };
@@ -177,6 +235,7 @@ export function isRetryableError(err: unknown): boolean {
 	]
 		.filter((value): value is string => typeof value === "string")
 		.map((value) => value.toLowerCase());
+	const statusCodes = collectStatusCodes(obj);
 
 	// Message-based hard quota / plan restrictions should never retry.
 	if (msgCandidates.some((msg) => NON_RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
@@ -222,25 +281,13 @@ export function isRetryableError(err: unknown): boolean {
 		return true;
 	}
 
-	// Check HTTP status codes.
-	if (typeof obj.status === "number" && RETRYABLE_STATUS_CODES.has(obj.status)) return true;
-	if (typeof obj.statusCode === "number" && RETRYABLE_STATUS_CODES.has(obj.statusCode)) {
-		return true;
-	}
-	if (typeof nestedObj?.status === "number" && RETRYABLE_STATUS_CODES.has(nestedObj.status)) {
-		return true;
-	}
-	if (
-		typeof nestedObj?.statusCode === "number" &&
-		RETRYABLE_STATUS_CODES.has(nestedObj.statusCode)
-	) {
-		return true;
-	}
-	if (typeof causeObj?.status === "number" && RETRYABLE_STATUS_CODES.has(causeObj.status)) {
-		return true;
-	}
-	if (typeof causeObj?.statusCode === "number" && RETRYABLE_STATUS_CODES.has(causeObj.statusCode)) {
-		return true;
+	// Check HTTP status codes. 429 needs a rate-limit/load keyword to avoid retrying billing/quota failures.
+	if ([...statusCodes].some((statusCode) => RETRYABLE_STATUS_CODES.has(statusCode))) return true;
+	if (hasRetryable429(statusCodes, msgCandidates)) return true;
+	if (msgCandidates.some(isRetryable429Message)) return true;
+	// Plain 429 errors must not fall through to broader transient keywords.
+	if (statusCodes.has(429) || msgCandidates.some(has429Message)) {
+		return matchesCustomRetryRules(obj, msgCandidates);
 	}
 
 	if (msgCandidates.some((msg) => RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
@@ -259,14 +306,7 @@ export function matchesCustomRetryRules(
 	const rules = settings.agent.customRetryRules;
 	if (!rules?.length) return false;
 
-	const statusCodes = new Set<number>();
-	for (const field of [obj, obj.error, obj.cause]) {
-		if (field && typeof field === "object") {
-			const f = field as Record<string, unknown>;
-			if (typeof f.status === "number") statusCodes.add(f.status);
-			if (typeof f.statusCode === "number") statusCodes.add(f.statusCode);
-		}
-	}
+	const statusCodes = collectStatusCodes(obj);
 
 	const allText = msgCandidates.join(" ").toLowerCase();
 
