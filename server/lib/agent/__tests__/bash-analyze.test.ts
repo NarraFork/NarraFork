@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import {
-	classifyYoloDanger,
-	createYoloDangerFingerprint,
+	classifyDanger,
+	createDangerFingerprint,
 	isInsideWorktree,
 	resolvePermissionDecision,
 } from "../../../services/narrator-permission";
-import { analyzeBashCommand, type BashAnalysis } from "../bash-analyze";
+import { analyzeBashCommand, analyzePowerShellCommand, type BashAnalysis } from "../bash-analyze";
 
 const CWD = "/home/user/project";
 
@@ -835,18 +835,18 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBe("allow");
 	});
 
-	test("YOLO danger classifier ignores safe shell command", () => {
-		expect(classifyYoloDanger("Bash", { command: "git status" }, cwd, allSafe)).toBeNull();
+	test("Danger classifier ignores safe shell command", () => {
+		expect(classifyDanger("Bash", { command: "git status" }, cwd, allSafe)).toBeNull();
 	});
 
-	test("YOLO danger classifier catches rm deletion", () => {
-		const result = classifyYoloDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted);
+	test("Danger classifier catches rm deletion", () => {
+		const result = classifyDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted);
 		expect(result?.summary).toContain("rm deletes files");
 	});
 
-	test("YOLO danger classifier ignores recoverable edit operations", () => {
+	test("Danger classifier ignores recoverable edit operations", () => {
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Edit",
 				{
 					file_path: "src/index.ts",
@@ -857,7 +857,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			),
 		).toBeNull();
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Edit",
 				{
 					file_path: "/mnt/shared/index.ts",
@@ -868,51 +868,29 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				cwd,
 			),
 		).toBeNull();
-		expect(
-			classifyYoloDanger(
-				"MultiEdit",
-				{
-					file_path: "src/index.ts",
-					old_string: "foo",
-					new_string: "bar",
-					replace_all: true,
-				},
-				cwd,
-			),
-		).toBeNull();
 	});
 
-	test("YOLO danger classifier catches git reset --hard", async () => {
+	test("Danger classifier catches git reset --hard", async () => {
 		const analysis = await analyzeBashCommand("git reset --hard HEAD~1", cwd, false);
-		const result = classifyYoloDanger(
-			"Bash",
-			{ command: "git reset --hard HEAD~1" },
-			cwd,
-			analysis,
-		);
+		const result = classifyDanger("Bash", { command: "git reset --hard HEAD~1" }, cwd, analysis);
 		expect(result?.summary).toContain("Git reset");
 	});
 
-	test("YOLO danger classifier catches git clean", async () => {
+	test("Danger classifier catches git clean", async () => {
 		const analysis = await analyzeBashCommand("git clean -fd", cwd, false);
-		const result = classifyYoloDanger("Bash", { command: "git clean -fd" }, cwd, analysis);
+		const result = classifyDanger("Bash", { command: "git clean -fd" }, cwd, analysis);
 		expect(result?.summary).toContain("Git clean");
 	});
 
-	test("YOLO danger classifier catches git checkout path restore", async () => {
+	test("Danger classifier catches git checkout path restore", async () => {
 		const analysis = await analyzeBashCommand("git checkout src/index.ts", cwd, false);
-		const result = classifyYoloDanger(
-			"Bash",
-			{ command: "git checkout src/index.ts" },
-			cwd,
-			analysis,
-		);
+		const result = classifyDanger("Bash", { command: "git checkout src/index.ts" }, cwd, analysis);
 		expect(result?.summary).toContain("Git checkout");
 	});
 
-	test("YOLO danger classifier catches git checkout revision path restore", async () => {
+	test("Danger classifier catches git checkout revision path restore", async () => {
 		const analysis = await analyzeBashCommand("git checkout HEAD src/index.ts", cwd, false);
-		const result = classifyYoloDanger(
+		const result = classifyDanger(
 			"Bash",
 			{ command: "git checkout HEAD src/index.ts" },
 			cwd,
@@ -921,39 +899,26 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(result?.summary).toContain("Git checkout");
 	});
 
-	test("YOLO danger classifier does not treat plain branch checkout as path restore", async () => {
+	test("Danger classifier does not treat plain branch checkout as path restore", async () => {
 		const analysis = await analyzeBashCommand("git checkout main", cwd, false);
-		const result = classifyYoloDanger("Bash", { command: "git checkout main" }, cwd, analysis);
+		const result = classifyDanger("Bash", { command: "git checkout main" }, cwd, analysis);
 		expect(result).toBeNull();
 	});
 
-	test("YOLO danger classifier catches external path access", () => {
-		const result = classifyYoloDanger(
-			"Bash",
-			{ command: "cat /etc/passwd" },
-			cwd,
-			withExternalPath,
-		);
+	test("Danger classifier catches external path access", () => {
+		const result = classifyDanger("Bash", { command: "cat /etc/passwd" }, cwd, withExternalPath);
 		expect(result?.summary).toContain("outside the current working directory");
 	});
 
-	test("YOLO danger classifier can skip read-only external path confirmations", () => {
+	test("Danger classifier can skip read-only external path confirmations", () => {
 		expect(
-			classifyYoloDanger(
-				"Bash",
-				{ command: "cat /etc/passwd" },
-				cwd,
-				withExternalPath,
-				[],
-				[],
-				true,
-			),
+			classifyDanger("Bash", { command: "cat /etc/passwd" }, cwd, withExternalPath, [], [], true),
 		).toBeNull();
 		expect(
-			classifyYoloDanger("Read", { file_path: "/etc/passwd" }, cwd, undefined, [], [], true),
+			classifyDanger("Read", { file_path: "/etc/passwd" }, cwd, undefined, [], [], true),
 		).toBeNull();
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Agent",
 				{ subagent_type: "explore", workdir: "/mnt/shared" },
 				cwd,
@@ -965,7 +930,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBeNull();
 	});
 
-	test("YOLO read-only skip still catches write and dangerous operations", () => {
+	test("Danger read-only skip still catches write and dangerous operations", () => {
 		const writeAnalysis: BashAnalysis = {
 			...withExternalPath,
 			commands: [
@@ -979,7 +944,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			hasWriteOperation: true,
 		};
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Bash",
 				{ command: "touch /mnt/shared/out.txt" },
 				cwd,
@@ -990,11 +955,11 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			)?.summary,
 		).toContain("outside the current working directory");
 		expect(
-			classifyYoloDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted, [], [], true)
+			classifyDanger("Bash", { command: "rm -rf foo" }, cwd, withNonWhitelisted, [], [], true)
 				?.summary,
 		).toContain("rm deletes files");
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Write",
 				{ file_path: "/mnt/shared/new.txt", content: "ok" },
 				cwd,
@@ -1006,7 +971,7 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toContain("outside the current working directory");
 	});
 
-	test("YOLO danger classifier ignores read access in whitelisted external dir", () => {
+	test("Danger classifier ignores read access in whitelisted external dir", () => {
 		const analysis: BashAnalysis = {
 			...withExternalPath,
 			commands: [
@@ -1019,13 +984,13 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			filePaths: ["/mnt/shared/info.txt"],
 		};
 		expect(
-			classifyYoloDanger("Bash", { command: "cat /mnt/shared/info.txt" }, cwd, analysis, [
+			classifyDanger("Bash", { command: "cat /mnt/shared/info.txt" }, cwd, analysis, [
 				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
 			]),
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier ignores write access in readWrite whitelisted external dir", () => {
+	test("Danger classifier ignores write access in readWrite whitelisted external dir", () => {
 		const analysis: BashAnalysis = {
 			...withExternalPath,
 			commands: [
@@ -1039,13 +1004,13 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			hasWriteOperation: true,
 		};
 		expect(
-			classifyYoloDanger("Bash", { command: "touch /mnt/shared/out.txt" }, cwd, analysis, [
+			classifyDanger("Bash", { command: "touch /mnt/shared/out.txt" }, cwd, analysis, [
 				{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true },
 			]),
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier still catches write access with only readOnly whitelist", () => {
+	test("Danger classifier still catches write access with only readOnly whitelist", () => {
 		const analysis: BashAnalysis = {
 			...withExternalPath,
 			commands: [
@@ -1058,36 +1023,28 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 			filePaths: ["/mnt/shared/out.txt"],
 			hasWriteOperation: true,
 		};
-		const result = classifyYoloDanger(
-			"Bash",
-			{ command: "touch /mnt/shared/out.txt" },
-			cwd,
-			analysis,
-			[{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true }],
-		);
+		const result = classifyDanger("Bash", { command: "touch /mnt/shared/out.txt" }, cwd, analysis, [
+			{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
+		]);
 		expect(result?.summary).toContain("outside the current working directory");
 	});
 
-	test("YOLO danger classifier ignores direct tool access in whitelisted external dir", () => {
+	test("Danger classifier ignores direct tool access in whitelisted external dir", () => {
 		expect(
-			classifyYoloDanger("Read", { file_path: "/mnt/shared/info.txt" }, cwd, undefined, [
+			classifyDanger("Read", { file_path: "/mnt/shared/info.txt" }, cwd, undefined, [
 				{ path: "/mnt/shared", accessLevel: "readOnly", enabled: true },
 			]),
 		).toBeNull();
 		expect(
-			classifyYoloDanger(
-				"Write",
-				{ file_path: "/mnt/shared/new.txt", content: "ok" },
-				cwd,
-				undefined,
-				[{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true }],
-			),
+			classifyDanger("Write", { file_path: "/mnt/shared/new.txt", content: "ok" }, cwd, undefined, [
+				{ path: "/mnt/shared", accessLevel: "readWrite", enabled: true },
+			]),
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier ignores general subagent in full-whitelisted workdir", () => {
+	test("Danger classifier ignores general subagent in full-whitelisted workdir", () => {
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Agent",
 				{ subagent_type: "general", workdir: "/mnt/shared" },
 				cwd,
@@ -1097,9 +1054,9 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier ignores whitelisted rm command", () => {
+	test("Danger classifier ignores whitelisted rm command", () => {
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Bash",
 				{ command: "rm -rf build-cache" },
 				cwd,
@@ -1110,10 +1067,10 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier ignores whitelisted destructive git command", async () => {
+	test("Danger classifier ignores whitelisted destructive git command", async () => {
 		const analysis = await analyzeBashCommand("git reset --hard HEAD~1", cwd, false);
 		expect(
-			classifyYoloDanger(
+			classifyDanger(
 				"Bash",
 				{ command: "git reset --hard HEAD~1" },
 				cwd,
@@ -1124,8 +1081,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		).toBeNull();
 	});
 
-	test("YOLO danger classifier still catches external shell path when command is whitelisted", () => {
-		const result = classifyYoloDanger(
+	test("Danger classifier still catches external shell path when command is whitelisted", () => {
+		const result = classifyDanger(
 			"Bash",
 			{ command: "cat /etc/passwd" },
 			cwd,
@@ -1136,8 +1093,8 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(result?.summary).toContain("outside the current working directory");
 	});
 
-	test("YOLO danger classifier does not ignore env injection even when command is whitelisted", () => {
-		const result = classifyYoloDanger(
+	test("Danger classifier does not ignore env injection even when command is whitelisted", () => {
+		const result = classifyDanger(
 			"Bash",
 			{ command: "LD_PRELOAD=/tmp/evil.so ls" },
 			cwd,
@@ -1148,29 +1105,29 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		expect(result?.summary).toContain("dangerous execution patterns");
 	});
 
-	test("YOLO danger fingerprint is stable across object key order", () => {
-		expect(createYoloDangerFingerprint("Bash", { command: "rm foo", timeout: 1 }, cwd)).toBe(
-			createYoloDangerFingerprint("Bash", { timeout: 1, command: "rm foo" }, cwd),
+	test("Danger fingerprint is stable across object key order", () => {
+		expect(createDangerFingerprint("Bash", { command: "rm foo", timeout: 1 }, cwd)).toBe(
+			createDangerFingerprint("Bash", { timeout: 1, command: "rm foo" }, cwd),
 		);
 	});
 
-	test("YOLO danger fingerprint ignores description for Bash tool", () => {
+	test("Danger fingerprint ignores description for Bash tool", () => {
 		expect(
-			createYoloDangerFingerprint(
+			createDangerFingerprint(
 				"Bash",
 				{ command: "rm -rf build", description: "Delete build directory" },
 				cwd,
 			),
 		).toBe(
-			createYoloDangerFingerprint(
+			createDangerFingerprint(
 				"Bash",
 				{ command: "rm -rf build", description: "Retry: delete build directory" },
 				cwd,
 			),
 		);
 		// Also matches when description is absent
-		expect(createYoloDangerFingerprint("Bash", { command: "rm -rf build" }, cwd)).toBe(
-			createYoloDangerFingerprint(
+		expect(createDangerFingerprint("Bash", { command: "rm -rf build" }, cwd)).toBe(
+			createDangerFingerprint(
 				"Bash",
 				{ command: "rm -rf build", description: "Delete build directory" },
 				cwd,
@@ -1178,28 +1135,28 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 		);
 	});
 
-	test("YOLO danger fingerprint changes with cwd", () => {
-		expect(createYoloDangerFingerprint("Bash", { command: "rm foo" }, cwd)).not.toBe(
-			createYoloDangerFingerprint("Bash", { command: "rm foo" }, "/home/user/other"),
+	test("Danger fingerprint changes with cwd", () => {
+		expect(createDangerFingerprint("Bash", { command: "rm foo" }, cwd)).not.toBe(
+			createDangerFingerprint("Bash", { command: "rm foo" }, "/home/user/other"),
 		);
 	});
 
-	test("YOLO danger classifier catches git stash drop", async () => {
+	test("Danger classifier catches git stash drop", async () => {
 		const analysis = await analyzeBashCommand("git stash drop", cwd, false);
-		const result = classifyYoloDanger("Bash", { command: "git stash drop" }, cwd, analysis);
+		const result = classifyDanger("Bash", { command: "git stash drop" }, cwd, analysis);
 		expect(result?.summary).toContain("stash drop");
 	});
 
-	test("YOLO danger classifier catches git stash clear", async () => {
+	test("Danger classifier catches git stash clear", async () => {
 		const analysis = await analyzeBashCommand("git stash clear", cwd, false);
-		const result = classifyYoloDanger("Bash", { command: "git stash clear" }, cwd, analysis);
+		const result = classifyDanger("Bash", { command: "git stash clear" }, cwd, analysis);
 		expect(result?.summary).toContain("stash clear");
 	});
 
-	test("YOLO danger classifier allows git stash push/pop/apply/list", async () => {
+	test("Danger classifier allows git stash push/pop/apply/list", async () => {
 		for (const sub of ["push", "pop", "apply", "list", "show"]) {
 			const analysis = await analyzeBashCommand(`git stash ${sub}`, cwd, false);
-			const result = classifyYoloDanger("Bash", { command: `git stash ${sub}` }, cwd, analysis);
+			const result = classifyDanger("Bash", { command: `git stash ${sub}` }, cwd, analysis);
 			expect(result).toBeNull();
 		}
 	});
@@ -1256,6 +1213,33 @@ describe("resolvePermissionDecision with bashAnalysis", () => {
 				bashAnalysis: analysis,
 			}),
 		).toBe("allow");
+	});
+});
+
+// ══════════════════════════════════════════════════════════
+// PowerShell 安全分析
+// ══════════════════════════════════════════════════════════
+
+describe("PowerShell danger analysis", () => {
+	test("Remove-Item is marked dangerous and write-capable", () => {
+		const result = analyzePowerShellCommand("Remove-Item -Recurse ./dist", CWD);
+		expect(result.allWhitelisted).toBe(false);
+		expect(result.nonWhitelisted).toContain("Remove-Item");
+		expect(result.dangerousPatterns.join("\n")).toContain("PowerShell Remove-Item");
+		expect(result.hasWriteOperation).toBe(true);
+	});
+
+	test("Start-Process is marked as code/process execution danger", () => {
+		const result = analyzePowerShellCommand("Start-Process powershell -ArgumentList '-NoP'", CWD);
+		expect(result.allWhitelisted).toBe(false);
+		expect(result.nonWhitelisted).toContain("Start-Process");
+		expect(result.dangerousPatterns.join("\n")).toContain("executes code");
+	});
+
+	test("Set-Content extracts write paths", () => {
+		const result = analyzePowerShellCommand("Set-Content -Path ../outside.txt -Value hello", CWD);
+		expect(result.hasWriteOperation).toBe(true);
+		expect(result.filePaths.some((path) => path.endsWith("outside.txt"))).toBe(true);
 	});
 });
 

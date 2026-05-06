@@ -48,6 +48,64 @@ interface CodexSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
+interface CodexImportCredential {
+	refreshToken: string;
+	displayName?: string;
+	priority?: number;
+}
+
+const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
+const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
+
+function normalizeRefreshToken(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const token = value.trim();
+	return REFRESH_TOKEN_PATTERN.test(token) ? token : null;
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalPriority(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function credentialFromObject(item: unknown): CodexImportCredential | null {
+	if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+	const record = item as Record<string, unknown>;
+	const refreshToken = normalizeRefreshToken(record.refresh_token ?? record.refreshToken);
+	if (!refreshToken) return null;
+	const displayName = optionalString(record.email) ?? optionalString(record.displayName);
+	const priority = optionalPriority(record.priority);
+	return {
+		refreshToken,
+		...(displayName ? { displayName } : {}),
+		...(priority !== undefined ? { priority } : {}),
+	};
+}
+
+function credentialsFromText(text: string): CodexImportCredential[] {
+	const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+	return text.split(/[,\n]+/).flatMap((record) => {
+		const displayName = optionalString(record.match(emailRegex)?.[0]);
+		return [...record.matchAll(REFRESH_TOKEN_SEARCH_PATTERN)].flatMap((match) => {
+			const refreshToken = normalizeRefreshToken(match[0]);
+			return refreshToken ? [{ refreshToken, ...(displayName ? { displayName } : {}) }] : [];
+		});
+	});
+}
+
+function credentialsFromParsedImport(parsed: unknown): CodexImportCredential[] {
+	if (typeof parsed === "string") return credentialsFromText(parsed);
+	const items = Array.isArray(parsed) ? parsed : [parsed];
+	return items.flatMap((item) => {
+		if (typeof item === "string") return credentialsFromText(item);
+		const credential = credentialFromObject(item);
+		return credential ? [credential] : [];
+	});
+}
+
 export const CodexSection = React.memo(function CodexSection({
 	hiddenModels,
 	onToggleHidden,
@@ -471,34 +529,22 @@ export const CodexSection = React.memo(function CodexSection({
 	const handleImport = () => {
 		setImportError(null);
 		setImportResult(null);
+
+		const importText = importJson.trim();
+		let credentials: CodexImportCredential[];
+
 		try {
-			const parsed = JSON.parse(importJson);
-			const arr = Array.isArray(parsed) ? parsed : [parsed];
-
-			// Transform the input format to our API format
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const credentials = arr.map((item: any) => {
-				// Support both formats:
-				// 1. Direct format: { refreshToken, displayName?, priority? }
-				// 2. Extended format: { type: "codex", refresh_token, email?, ... }
-				if (item.refresh_token) {
-					return {
-						refreshToken: item.refresh_token,
-						displayName: item.email || item.displayName,
-						priority: item.priority,
-					};
-				}
-				return {
-					refreshToken: item.refreshToken,
-					displayName: item.displayName,
-					priority: item.priority,
-				};
-			});
-
-			importMut.mutate(credentials);
+			credentials = credentialsFromParsedImport(JSON.parse(importText));
 		} catch (_err) {
-			setImportError(t("codexImportInvalidJson"));
+			credentials = credentialsFromText(importText);
 		}
+
+		if (credentials.length === 0) {
+			setImportError(t("codexImportNoValidTokens"));
+			return;
+		}
+
+		importMut.mutate(credentials);
 	};
 
 	return (

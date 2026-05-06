@@ -18,6 +18,7 @@ const ACTIONS = [
 	"get_text",
 	"get_attribute",
 	"get_console",
+	"get_network",
 	"evaluate",
 	"wait",
 	"navigate",
@@ -35,7 +36,8 @@ export const browserTool: ToolDefinition = {
 	name: "Browser",
 	description:
 		"Control a browser for multi-step web interactions. Supports navigation, clicking, " +
-		"form filling, screenshots, DOM inspection, JavaScript execution, and performance profiling.\n\n" +
+		"form filling, screenshots, DOM inspection, JavaScript execution, network debugging, " +
+		"and performance profiling.\n\n" +
 		"Workflow:\n" +
 		'1. Use action "launch" with a URL to start a session (returns session_id)\n' +
 		"2. Use the session_id for subsequent actions (click, fill, type, etc.)\n" +
@@ -51,6 +53,7 @@ export const browserTool: ToolDefinition = {
 		'- "get_text": Get text content of an element\n' +
 		'- "get_attribute": Get an attribute value of an element\n' +
 		'- "get_console": Get captured console output and page errors\n' +
+		'- "get_network": Get captured network requests/responses and failures\n' +
 		'- "evaluate": Execute JavaScript in the page context\n' +
 		'- "wait": Wait for an element to appear or become visible\n' +
 		'- "navigate": Go to a new URL, or go back/forward\n' +
@@ -74,8 +77,9 @@ export const browserTool: ToolDefinition = {
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
 		"- timeout (optional): Timeout in ms for wait/element actions (default: 10000)\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
-		"- max_length (optional): Max output length for dom/get_text/evaluate/get_console (default: 20000)\n" +
-		"- clear (optional): For get_console, clear captured console output after reading (default: false)\n" +
+		"- max_length (optional): Max output length for dom/get_text/evaluate/get_console/get_network (default: 20000)\n" +
+		"- clear (optional): For get_console/get_network, clear captured output after reading (default: false)\n" +
+		"- include_details (optional): For get_network, include request/response headers and post data (default: false)\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
 		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
@@ -101,7 +105,8 @@ export const browserTool: ToolDefinition = {
 				type: "string",
 			},
 			value: {
-				description: "Value for fill/select/type/evaluate/get_attribute actions",
+				description:
+					"Value for fill/select/type/evaluate/get_attribute actions, or filter for get_network",
 				type: "string",
 			},
 			key: {
@@ -127,11 +132,16 @@ export const browserTool: ToolDefinition = {
 				required: ["x", "y"],
 			},
 			max_length: {
-				description: "Max output length for dom/get_text/evaluate/get_console (default: 20000)",
+				description:
+					"Max output length for dom/get_text/evaluate/get_console/get_network (default: 20000)",
 				type: "number",
 			},
 			clear: {
-				description: "For get_console, clear captured console output after reading",
+				description: "For get_console/get_network, clear captured output after reading",
+				type: "boolean",
+			},
+			include_details: {
+				description: "For get_network, include headers and post data in output",
 				type: "boolean",
 			},
 			headless: {
@@ -156,7 +166,10 @@ export const browserTool: ToolDefinition = {
 		url: z.string().optional().describe("URL for launch/navigate"),
 		session_id: z.string().optional().describe("Browser session ID"),
 		selector: z.string().optional().describe("CSS selector"),
-		value: z.string().optional().describe("Value for fill/select/type/evaluate/get_attribute"),
+		value: z
+			.string()
+			.optional()
+			.describe("Value for fill/select/type/evaluate/get_attribute, or filter for get_network"),
 		key: z.string().optional().describe("Special key name for type action"),
 		direction: z
 			.enum(["back", "forward", "up", "down"])
@@ -171,7 +184,11 @@ export const browserTool: ToolDefinition = {
 		clear: z
 			.boolean()
 			.optional()
-			.describe("For get_console, clear captured console output after reading"),
+			.describe("For get_console/get_network, clear captured output after reading"),
+		include_details: z
+			.boolean()
+			.optional()
+			.describe("For get_network, include headers and post data in output"),
 		headless: z
 			.boolean()
 			.optional()
@@ -192,6 +209,7 @@ export const browserTool: ToolDefinition = {
 			coordinate,
 			max_length,
 			clear,
+			include_details,
 			headless,
 			categories,
 		} = args as {
@@ -206,6 +224,7 @@ export const browserTool: ToolDefinition = {
 			coordinate?: { x: number; y: number };
 			max_length?: number;
 			clear?: boolean;
+			include_details?: boolean;
 			headless?: boolean;
 			categories?: string[];
 		};
@@ -236,6 +255,7 @@ export const browserTool: ToolDefinition = {
 						coordinate,
 						max_length,
 						clear,
+						include_details,
 						url,
 						categories,
 					});
@@ -329,6 +349,7 @@ async function handleSessionAction(
 		coordinate?: { x: number; y: number };
 		max_length?: number;
 		clear?: boolean;
+		include_details?: boolean;
 		url?: string;
 		categories?: string[];
 	},
@@ -507,6 +528,27 @@ async function handleSessionAction(
 					`Captured messages: ${result.count}${opts.clear ? " (cleared)" : ""}\n` +
 					`URL: ${result.snapshot.url}`,
 				metadata: { sessionId: session.id, consoleMessageCount: result.count },
+			};
+		}
+
+		case "get_network": {
+			const result = await actions.getNetwork(session, {
+				maxLength: opts.max_length,
+				clear: opts.clear,
+				filter: opts.value,
+				includeDetails: opts.include_details,
+			});
+			const filtered = opts.value ? ` matching "${opts.value}"` : "";
+			return {
+				output:
+					`${result.output}\n\n` +
+					`Captured requests${filtered}: ${result.count} / ${result.totalCount}${opts.clear ? " (cleared)" : ""}\n` +
+					`URL: ${result.snapshot.url}`,
+				metadata: {
+					sessionId: session.id,
+					networkRequestCount: result.count,
+					networkRequestTotalCount: result.totalCount,
+				},
 			};
 		}
 

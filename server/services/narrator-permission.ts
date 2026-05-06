@@ -21,7 +21,7 @@ import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
-import { isSubagentVariant } from "../lib/narrator-utils";
+import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
 import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -30,13 +30,14 @@ import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
+	type PendingDangerReflection,
+	pendingDangerConfirmations,
+	pendingDangerReflections,
 	pendingFeedback,
 	pendingPermissions,
 	pendingPlanApprover,
 	pendingPlanCompact,
 	pendingPlanDiff,
-	pendingYoloDangerConfirmations,
-	pendingYoloPauses,
 	planModeAskedOnce,
 } from "./narrator-session-state";
 import { resolveTaskAlias } from "./subagent-alias";
@@ -68,7 +69,6 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Write":
 		case "Edit":
 		case "NotebookEdit":
-		case "MultiEdit":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
 		case "ShareFile":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -259,7 +259,7 @@ export function resolvePermissionDecision(
 		commandWhitelist = [],
 		commandBlacklist = [],
 		relaxedPlan = false,
-		previousPermissionMode,
+		planMode = false,
 		meta,
 		projectGitPath,
 	} = opts;
@@ -281,7 +281,7 @@ export function resolvePermissionDecision(
 		return "deny";
 	}
 
-	if (permMode === "plan" && (toolName === "Write" || toolName === "Edit")) {
+	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
 			const absPath = resolvePath(cwd, filePath);
@@ -301,12 +301,7 @@ export function resolvePermissionDecision(
 		}
 	}
 
-	const effectiveMode =
-		permMode === "plan"
-			? relaxedPlan
-				? (previousPermissionMode ?? "default")
-				: "readOnly"
-			: permMode;
+	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
@@ -547,15 +542,7 @@ const ALWAYS_ALLOW_TOOLS = [
 	"UpdateGoal",
 ];
 
-const ACCEPT_EDITS_AUTO_ALLOW = [
-	"Edit",
-	"Write",
-	"NotebookEdit",
-	"MultiEdit",
-	"Read",
-	"Glob",
-	"Grep",
-];
+const ACCEPT_EDITS_AUTO_ALLOW = ["Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
 const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "ShareFile", "Await"];
@@ -676,6 +663,7 @@ export interface PermissionDecisionOpts {
 	bashAnalysis?: BashAnalysis;
 	isChapter?: boolean;
 	planFileId?: string;
+	planMode?: boolean;
 	conclusionFileId?: string;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
@@ -776,7 +764,7 @@ function isCommandWhitelisted(
 	);
 }
 
-function areUnsafeCommandsWhitelistedForYolo(
+function areUnsafeCommandsWhitelistedForDanger(
 	bashAnalysis: BashAnalysis,
 	commandWhitelist: CommandWhitelistEntry[],
 ): boolean {
@@ -790,7 +778,7 @@ function areUnsafeCommandsWhitelistedForYolo(
 
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "MultiEdit"]);
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
 function isGitInternalPath(absPath: string): boolean {
@@ -864,9 +852,9 @@ function resolveProtectedPathDeny(
 	return null;
 }
 
-const YOLO_DANGER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
+const DANGER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 
-export interface YoloDangerInfo {
+export interface DangerInfo {
 	summary: string;
 	consequences: string[];
 	saferAlternatives: string[];
@@ -882,7 +870,7 @@ function stableJson(value: unknown): string {
 	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
 }
 
-function getYoloFingerprintScope(
+function getDangerFingerprintScope(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd?: string,
@@ -905,9 +893,9 @@ function getYoloFingerprintScope(
 
 /**
  * 从 input 中提取影响 fingerprint 的核心字段，剔除 description 等不影响执行语义的字段。
- * 这确保 AI 模型重试相同命令时（即使 description 措辞不同）能匹配到之前的 YOLO 确认。
+ * 这确保 AI 模型重试相同命令时（即使 description 措辞不同）能匹配到之前的 danger 确认。
  */
-function getYoloFingerprintInput(
+function getDangerFingerprintInput(
 	toolName: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -921,7 +909,7 @@ function getYoloFingerprintInput(
 	return input;
 }
 
-export function createYoloDangerFingerprint(
+export function createDangerFingerprint(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd?: string,
@@ -930,58 +918,55 @@ export function createYoloDangerFingerprint(
 	return createHash("sha256")
 		.update(
 			stableJson({
-				input: getYoloFingerprintInput(toolName, input),
-				scope: getYoloFingerprintScope(toolName, input, cwd, bashAnalysis),
+				input: getDangerFingerprintInput(toolName, input),
+				scope: getDangerFingerprintScope(toolName, input, cwd, bashAnalysis),
 				toolName,
 			}),
 		)
 		.digest("hex");
 }
 
-function pruneExpiredYoloConfirmations(now = Date.now()): void {
-	for (const [key, entry] of pendingYoloDangerConfirmations) {
-		if (entry.expiresAt < now) pendingYoloDangerConfirmations.delete(key);
+function pruneExpiredDangerConfirmations(now = Date.now()): void {
+	for (const [key, entry] of pendingDangerConfirmations) {
+		if (entry.expiresAt < now) pendingDangerConfirmations.delete(key);
 	}
 }
 
-function yoloConfirmationKey(narratorId: string, fingerprint: string): string {
+function dangerConfirmationKey(narratorId: string, fingerprint: string): string {
 	return `${narratorId}:${fingerprint}`;
 }
 
-function consumeYoloConfirmation(narratorId: string, fingerprint: string): boolean {
-	pruneExpiredYoloConfirmations();
-	const key = yoloConfirmationKey(narratorId, fingerprint);
-	const entry = pendingYoloDangerConfirmations.get(key);
+function consumeDangerConfirmation(narratorId: string, fingerprint: string): boolean {
+	pruneExpiredDangerConfirmations();
+	const key = dangerConfirmationKey(narratorId, fingerprint);
+	const entry = pendingDangerConfirmations.get(key);
 	if (!entry) return false;
-	pendingYoloDangerConfirmations.delete(key);
+	pendingDangerConfirmations.delete(key);
 	return true;
 }
 
-function rememberYoloConfirmation(
+function rememberDangerConfirmation(
 	narratorId: string,
 	fingerprint: string,
-	danger: YoloDangerInfo,
+	danger: DangerInfo,
 ): void {
 	const now = Date.now();
-	pruneExpiredYoloConfirmations(now);
-	pendingYoloDangerConfirmations.set(yoloConfirmationKey(narratorId, fingerprint), {
+	pruneExpiredDangerConfirmations(now);
+	pendingDangerConfirmations.set(dangerConfirmationKey(narratorId, fingerprint), {
 		narratorId,
 		fingerprint,
-		expiresAt: now + YOLO_DANGER_CONFIRMATION_TTL_MS,
+		expiresAt: now + DANGER_CONFIRMATION_TTL_MS,
 		summary: danger.summary,
 	});
 }
 
 function getEffectivePermissionMode(
 	permMode: string,
+	planMode: boolean,
 	relaxedPlan: boolean,
-	previousPermissionMode?: string | null,
+	_previousPermissionMode?: string | null,
 ): string {
-	return permMode === "plan"
-		? relaxedPlan
-			? (previousPermissionMode ?? "default")
-			: "readOnly"
-		: permMode;
+	return planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 }
 
 function danger(
@@ -989,8 +974,33 @@ function danger(
 	consequences: string[],
 	saferAlternatives: string[],
 	details?: string[],
-): YoloDangerInfo {
+): DangerInfo {
 	return { summary, consequences, saferAlternatives, details };
+}
+
+function buildShellAnalysisFailureDanger(
+	toolName: string,
+	input: Record<string, unknown>,
+	errorMessage: string,
+): DangerInfo {
+	const command = typeof input.command === "string" ? input.command : "";
+	return danger(
+		"Shell command safety analysis failed.",
+		[
+			"NarraFork could not inspect the command before execution.",
+			"In Bypass All mode, executing an unanalyzed shell command may modify files, run code, or access external paths without an effective safety gate.",
+		],
+		[
+			"Retry after fixing the command analysis failure.",
+			"Break the task into dedicated read/write tools or smaller explicit commands.",
+			"Run only after the visible command has been manually verified as intentional and bounded.",
+		],
+		[
+			`Tool: ${toolName}`,
+			...(command ? [`Command: ${command}`] : []),
+			`Analysis error: ${errorMessage}`,
+		],
+	);
 }
 
 function getGitSubcommand(tokens: string[]): { sub?: string; args: string[] } {
@@ -1061,7 +1071,7 @@ function checkoutRestoresPath(args: string[]): boolean {
 	return positional.some(isLikelyCheckoutPathspec);
 }
 
-function classifyGitDanger(cmdText: string, tokens: string[]): YoloDangerInfo | null {
+function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null {
 	const { sub, args } = getGitSubcommand(tokens);
 	if (!sub) return null;
 	const detail = [`Command: ${cmdText}`];
@@ -1216,9 +1226,10 @@ function classifyShellDanger(
 	bashAnalysis: BashAnalysis | undefined,
 	whitelistDirs: WhitelistDir[] = [],
 	commandWhitelist: CommandWhitelistEntry[] = [],
-): YoloDangerInfo | null {
+	skipReadOnlyConfirmations = false,
+): DangerInfo | null {
 	if (!bashAnalysis) return null;
-	const unsafeCommandsWhitelisted = areUnsafeCommandsWhitelistedForYolo(
+	const unsafeCommandsWhitelisted = areUnsafeCommandsWhitelistedForDanger(
 		bashAnalysis,
 		commandWhitelist,
 	);
@@ -1285,12 +1296,31 @@ function classifyShellDanger(
 			bashAnalysis.dangerousPatterns,
 		);
 	}
-	if (!bashAnalysis.hasWriteOperation) return null;
+	if (bashAnalysis.nonWhitelisted.length > 0 && !unsafeCommandsWhitelisted) {
+		const commands = bashAnalysis.commands
+			.filter((cmd) => bashAnalysis.nonWhitelisted.includes(cmd.tokens[0]))
+			.map((cmd) => `Command: ${cmd.text}`);
+		return danger(
+			"Shell command includes commands outside the safety allowlist.",
+			[
+				"The command may run code, invoke a package/script, change system state, or perform side effects that NarraFork cannot classify as read-only.",
+				"In Bypass All mode this would otherwise execute without user approval.",
+			],
+			[
+				"Use a dedicated NarraFork tool for read/write operations when possible.",
+				"Break the command into smaller inspected steps or add a narrow command whitelist rule if this exact command is trusted.",
+			],
+			commands.length > 0
+				? commands
+				: [`Commands outside allowlist: ${bashAnalysis.nonWhitelisted.join(", ")}`],
+		);
+	}
+	if (!bashAnalysis.hasWriteOperation && skipReadOnlyConfirmations) return null;
 	const externalPaths = describeExternalPaths(
 		cwd,
 		getShellScopePaths(cwd, input, bashAnalysis),
 		whitelistDirs,
-		"readWrite",
+		bashAnalysis.hasWriteOperation ? "readWrite" : "readOnly",
 	);
 	if (externalPaths.length > 0) {
 		return danger(
@@ -1309,17 +1339,24 @@ function classifyShellDanger(
 	return null;
 }
 
-export function classifyYoloDanger(
+export function classifyDanger(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
 	bashAnalysis?: BashAnalysis,
 	whitelistDirs: WhitelistDir[] = [],
 	commandWhitelist: CommandWhitelistEntry[] = [],
-	_skipReadOnlyConfirmations = false,
-): YoloDangerInfo | null {
+	skipReadOnlyConfirmations = false,
+): DangerInfo | null {
 	if (toolName === SHELL_TOOL_NAME)
-		return classifyShellDanger(input, cwd, bashAnalysis, whitelistDirs, commandWhitelist);
+		return classifyShellDanger(
+			input,
+			cwd,
+			bashAnalysis,
+			whitelistDirs,
+			commandWhitelist,
+			skipReadOnlyConfirmations,
+		);
 
 	if (toolName === "Agent") {
 		if (input.subagent_type === "explore" || input.subagent_type === "plan") return null;
@@ -1375,29 +1412,6 @@ export function classifyYoloDanger(
 	return null;
 }
 
-function buildYoloDangerMessage(danger: YoloDangerInfo): string {
-	const lines = [
-		"YOLO safety pause: this operation was NOT executed.",
-		"",
-		"Detected high-risk operation:",
-		`- ${danger.summary}`,
-	];
-	if (danger.details?.length) {
-		lines.push("", "Details:", ...danger.details.map((d) => `- ${d}`));
-	}
-	lines.push("", "Possible consequences:", ...danger.consequences.map((c) => `- ${c}`));
-	lines.push(
-		"",
-		"Safer alternatives to consider:",
-		...danger.saferAlternatives.map((a) => `- ${a}`),
-	);
-	lines.push(
-		"",
-		"This operation is paused and still pending. A separate safety reflection loop must call YoloConfirm to proceed or YoloCancel to cancel. The user may also approve or deny the pending permission from the UI.",
-	);
-	return lines.join("\n");
-}
-
 type PermissionScopeNarrator = {
 	id?: string | null;
 	variant?: string | null;
@@ -1405,16 +1419,16 @@ type PermissionScopeNarrator = {
 	permissionMode?: string | null;
 	relaxedPlan?: boolean | null;
 	previousPermissionMode?: string | null;
+	traits?: unknown;
 };
 
 function permissionModeRank(narrator: PermissionScopeNarrator | null | undefined): number {
 	const permMode = narrator?.permissionMode ?? "default";
-	const effectiveMode =
-		permMode === "plan"
-			? narrator?.relaxedPlan
-				? (narrator.previousPermissionMode ?? "default")
-				: "readOnly"
-			: permMode;
+	const effectiveMode = isPlanModeTrait(narrator?.traits)
+		? narrator?.relaxedPlan
+			? permMode
+			: "readOnly"
+		: permMode;
 	switch (effectiveMode) {
 		case "dontAsk":
 			return 0;
@@ -1596,13 +1610,15 @@ export async function handlePermission(
 			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
+			planFileId: true,
 			variant: true,
 			parentNarratorId: true,
+			traits: true,
 		},
 	});
 	const permMode = narrator?.permissionMode ?? "default";
 	const isRelaxedPlan = !!narrator?.relaxedPlan;
-	const isPlanMode = permMode === "plan";
+	const isPlanMode = isPlanModeTrait(narrator?.traits);
 	const isChapter = !!narrator?.chapterId;
 
 	let effectiveInput = input;
@@ -1622,6 +1638,7 @@ export async function handlePermission(
 
 	// Shell command pre-analysis
 	let bashAnalysis: BashAnalysis | undefined;
+	let shellAnalysisError: string | undefined;
 	// Bash await/stop are control operations (no command execution) — always allow
 	const isBashControlOp =
 		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
@@ -1631,11 +1648,16 @@ export async function handlePermission(
 			const shellCwd = resolveToolCwd(cwd, effectiveInput);
 			bashAnalysis = await analyzeShellCommand(input.command, shellCwd, shellType, isChapter);
 		} catch (err) {
-			logger.warn("Bash command analysis failed, falling back to ask", { err });
+			shellAnalysisError = err instanceof Error ? err.message : String(err);
+			logger.warn("Bash command analysis failed; unsafe auto-allow will be blocked", {
+				error: shellAnalysisError,
+			});
 		}
 	}
 
-	const planFileId = isPlanMode ? activeNarrators.get(narratorId)?._planFileId : undefined;
+	const planFileId = isPlanMode
+		? (activeNarrators.get(narratorId)?._planFileId ?? narrator?.planFileId ?? undefined)
+		: undefined;
 
 	// Plan mode: redirect Write/Edit targeting any .md file to the designated plan file
 	let planRedirectNotice: string | undefined;
@@ -1876,6 +1898,7 @@ export async function handlePermission(
 					bashAnalysis,
 					isChapter,
 					planFileId,
+					planMode: isPlanMode,
 					conclusionFileId,
 					whitelistDirs: mergedWhitelist,
 					blacklistDirs: mergedBlacklist,
@@ -1905,23 +1928,26 @@ export async function handlePermission(
 
 	const effectiveMode = getEffectivePermissionMode(
 		permMode,
+		isPlanMode,
 		isRelaxedPlan,
 		narrator?.previousPermissionMode,
 	);
 	if (decision === "allow" && effectiveMode === "bypassPermissions") {
-		const danger = classifyYoloDanger(
-			toolName,
-			effectiveInput,
-			cwd,
-			bashAnalysis,
-			mergedWhitelist,
-			mergedCmdWhitelist,
-			settings.agent.yoloSkipReadOnlyConfirmations,
-		);
+		const danger =
+			toolName === SHELL_TOOL_NAME && shellAnalysisError
+				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
+				: classifyDanger(
+						toolName,
+						effectiveInput,
+						cwd,
+						bashAnalysis,
+						mergedWhitelist,
+						mergedCmdWhitelist,
+						settings.agent.dangerSkipReadOnlyConfirmations,
+					);
 		if (danger) {
-			const fingerprint = createYoloDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
-			if (!consumeYoloConfirmation(narratorId, fingerprint)) {
-				const warning = buildYoloDangerMessage(danger);
+			const fingerprint = createDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
+			if (!consumeDangerConfirmation(narratorId, fingerprint)) {
 				const toolCallRecord = await db.query.narratorToolCalls.findFirst({
 					where: and(
 						eq(narratorToolCalls.narratorId, narratorId),
@@ -1929,130 +1955,116 @@ export async function handlePermission(
 					),
 				});
 				if (!toolCallRecord) {
-					logger.error("Tool call record not found for YOLO pause", { narratorId, toolUseId });
+					logger.error("Tool call record not found for danger reflection", {
+						narratorId,
+						toolName,
+						toolUseId,
+					});
 					return { behavior: "deny", message: "Internal error: tool call record not found" };
 				}
-				const toolCallId = toolCallRecord.id;
-				const yoloReflectionSuggestion = {
-					type: "yolo_reflection",
-					status: "running",
-					message:
-						"AI safety reflection loop is running. It has one chance to call YoloConfirm or YoloCancel.",
-					requestId: toolCallId,
-					startedAt: new Date().toISOString(),
-				};
-				logger.warn("YOLO high-risk operation paused", {
+				const requestId = toolCallRecord.id;
+				const startedAtMs = Date.now();
+				const now = new Date(startedAtMs).toISOString();
+				const suggestions = [
+					{
+						type: "danger_reflection",
+						status: "running",
+						danger,
+						fingerprint,
+						startedAt: now,
+					},
+				];
+				logger.warn("Danger reflection: high-risk operation paused inside permission handler", {
 					narratorId,
 					toolName,
 					toolUseId,
 					fingerprint,
 					summary: danger.summary,
 				});
+
 				await db
 					.update(narratorToolCalls)
 					.set({
 						status: "pending",
 						inputJson: effectiveInput,
-						permissionStartedAt: new Date().toISOString(),
-						permissionDecisionReason: `YOLO safety pause: ${danger.summary}`,
-						permissionSuggestions: [yoloReflectionSuggestion],
+						permissionStartedAt: now,
+						permissionDecisionReason: `Danger reflection: ${danger.summary}`,
+						permissionSuggestions: suggestions,
 					})
-					.where(eq(narratorToolCalls.id, toolCallId));
-
-				broadcastToNarrator(wsTarget, {
-					type: "permission_request",
-					narratorId: wsTarget,
-					request: {
-						id: toolCallId,
-						toolName,
-						toolUseId,
-						inputJson: effectiveInput,
-						decisionReason: `YOLO safety pause: ${danger.summary}`,
-						suggestions: [yoloReflectionSuggestion],
-						suppressNotifications: true,
-					},
-				});
+					.where(eq(narratorToolCalls.id, requestId));
 				await narratorService.updateStatus(narratorId, "waiting", {
 					substatus: ["silent_notification"],
 				});
-				if (broadcastTargetId && broadcastTargetId !== narratorId) {
-					await narratorService.updateStatus(broadcastTargetId, "waiting", {
+				if (wsTarget !== narratorId) {
+					await narratorService.updateStatus(wsTarget, "waiting", {
 						substatus: ["silent_notification"],
 					});
 				}
+				broadcastToNarrator(wsTarget, {
+					type: "danger_reflection_started",
+					narratorId: wsTarget,
+					requestId,
+					toolUseId,
+					toolName,
+					danger,
+				});
 
 				if (signal.aborted) {
-					broadcastToNarrator(wsTarget, {
-						type: "permission_resolved",
-						narratorId: wsTarget,
-						requestId: toolCallId,
-						toolUseId,
+					await markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, {
+						danger,
+						fingerprint,
+						startedAt: startedAtMs,
 					});
-					await db
-						.update(narratorToolCalls)
-						.set({
-							status: "fail",
-							errorMessage: "Narrator aborted",
-							permissionDecidedBy: "aborted",
-							permissionDecidedAt: new Date().toISOString(),
-						})
-						.where(eq(narratorToolCalls.id, toolCallId));
 					return { behavior: "deny", message: "Narrator aborted" };
 				}
 
 				const decisionPromise = new Promise<PermissionResult>((resolve) => {
-					const cleanup = () => {
-						signal.removeEventListener("abort", onAbort);
-						pendingPermissions.delete(toolCallId);
-						pendingYoloPauses.delete(toolCallId);
-					};
-					const onAbort = async () => {
-						cleanup();
-						broadcastToNarrator(wsTarget, {
-							type: "permission_resolved",
-							narratorId: wsTarget,
-							requestId: toolCallId,
+					let cleanup = () => {};
+					const onAbort = () => {
+						void markDangerReflectionAborted(
+							requestId,
+							wsTarget,
 							toolUseId,
+							narratorId,
+							undefined,
+							{
+								cleanup: true,
+							},
+						).catch((err) => {
+							logger.warn("Failed to mark danger reflection as aborted", {
+								error: err instanceof Error ? err.message : String(err),
+								narratorId,
+								requestId,
+							});
 						});
-						await db
-							.update(narratorToolCalls)
-							.set({
-								status: "fail",
-								errorMessage: "Narrator aborted",
-								permissionDecidedBy: "aborted",
-								permissionDecidedAt: new Date().toISOString(),
-							})
-							.where(eq(narratorToolCalls.id, toolCallId));
 						resolve({ behavior: "deny", message: "Narrator aborted" });
 					};
+					cleanup = () => {
+						signal.removeEventListener("abort", onAbort);
+						pendingDangerReflections.delete(requestId);
+					};
 					signal.addEventListener("abort", onAbort, { once: true });
-					pendingPermissions.set(toolCallId, {
+					pendingDangerReflections.set(requestId, {
+						narratorId,
+						requestId,
+						toolCallId: requestId,
+						toolUseId,
+						toolName,
+						broadcastTargetId: wsTarget,
+						input: effectiveInput,
+						fingerprint,
+						danger,
+						startedAt: startedAtMs,
 						resolve,
 						cleanup,
-						input: effectiveInput,
-						narratorId,
-						toolName,
-						toolUseId,
-						broadcastTargetId: wsTarget,
 					});
 				});
-				pendingYoloPauses.set(toolCallId, {
-					narratorId,
-					requestId: toolCallId,
-					toolUseId,
-					toolName,
-					input: effectiveInput,
-					fingerprint,
-					danger,
-					startedAt: Date.now(),
-				});
 				return {
-					behavior: "yoloPause",
-					requestId: toolCallId,
-					toolCallId,
-					message: warning,
+					behavior: "dangerReflection",
+					requestId,
 					danger,
 					fingerprint,
+					input: effectiveInput,
 					decision: decisionPromise,
 				};
 			}
@@ -2182,7 +2194,7 @@ export async function handlePermission(
 		}
 		const branchViolations = bashAnalysis?.gitBranchViolations;
 		const isReadToolPathDenied =
-			(permMode === "readOnly" || permMode === "plan") &&
+			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
 				(toolName === SHELL_TOOL_NAME &&
 					bashAnalysis &&
@@ -2195,7 +2207,7 @@ export async function handlePermission(
 				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
 				: isReadToolPathDenied
 					? getToolMessage("permissionDeniedPathOutsideScope", locale)
-					: permMode === "plan"
+					: isPlanMode
 						? getToolMessage("permissionDeniedPlanMode", locale)
 						: permMode === "readOnly"
 							? getToolMessage("permissionDeniedReadOnly", locale)
@@ -2379,6 +2391,27 @@ export interface ResolvePermissionOpts {
 	updatedPlan?: string;
 	userId?: string;
 	decidedBy?: "user" | "auto";
+	exitPlanCancelled?: boolean;
+}
+
+type DangerReflectionDecidedBy = "reflection" | "user" | "auto";
+
+/** Cancel pending ExitPlanMode approvals for a narrator (e.g. manual plan-mode cancellation). */
+export async function cancelPendingExitPlanMode(
+	narratorId: string,
+	message?: string,
+): Promise<number> {
+	const requests = [...pendingPermissions.entries()].filter(
+		([, pending]) => pending.narratorId === narratorId && pending.toolName === "ExitPlanMode",
+	);
+	for (const [requestId] of requests) {
+		await resolvePermission(requestId, "deny", {
+			denyMessage: message,
+			decidedBy: "auto",
+			exitPlanCancelled: true,
+		});
+	}
+	return requests.length;
 }
 
 /** Called when a pending permission receives a user or automatic decision. */
@@ -2395,6 +2428,7 @@ export async function resolvePermission(
 		updatedPlan,
 		userId,
 		decidedBy = "user",
+		exitPlanCancelled,
 	} = opts;
 	const pending = pendingPermissions.get(requestId);
 	if (!pending) {
@@ -2413,7 +2447,6 @@ export async function resolvePermission(
 		toolUseId: pending.toolUseId,
 	});
 
-	const yoloPause = pendingYoloPauses.get(requestId);
 	pending.cleanup();
 
 	let updatedInput: Record<string, unknown> | undefined;
@@ -2445,10 +2478,6 @@ export async function resolvePermission(
 		}
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
-		const yoloAutoDenyReason =
-			decision === "deny" && yoloPause && decidedBy === "auto"
-				? `YOLO safety pause cancelled: ${effectiveDenyMessage || "permission denied"}`
-				: undefined;
 		await db
 			.update(narratorToolCalls)
 			.set({
@@ -2459,7 +2488,6 @@ export async function resolvePermission(
 				...(decision === "deny"
 					? {
 							errorMessage: effectiveDenyMessage || "Permission denied by user",
-							...(yoloAutoDenyReason ? { permissionDecisionReason: yoloAutoDenyReason } : {}),
 						}
 					: {}),
 			})
@@ -2472,10 +2500,6 @@ export async function resolvePermission(
 	}
 
 	if (decision === "allow") {
-		if (yoloPause) {
-			rememberYoloConfirmation(yoloPause.narratorId, yoloPause.fingerprint, yoloPause.danger);
-			pendingYoloPauses.delete(requestId);
-		}
 		if (feedbackText?.trim()) {
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
@@ -2544,18 +2568,19 @@ export async function resolvePermission(
 			}
 		}
 	} else {
-		if (yoloPause) {
-			pendingYoloPauses.delete(requestId);
-		}
 		const userFeedback = denyMessage || feedbackText?.trim();
 		if (pending.toolName === "ExitPlanMode") {
 			const locale = activeNarrators.get(pending.narratorId)?.locale ?? "en";
-			const planDenyMsg = userFeedback
-				? getToolMessageWithParams("exitPlanModeDeniedWithMessage", locale, {
-						message: userFeedback,
-					})
-				: getToolMessage("exitPlanModeDenied", locale);
-			pending.resolve({ behavior: "deny", message: planDenyMsg, rawMessage: true });
+			if (exitPlanCancelled && userFeedback) {
+				pending.resolve({ behavior: "deny", message: userFeedback, rawMessage: true });
+			} else {
+				const planDenyMsg = userFeedback
+					? getToolMessageWithParams("exitPlanModeDeniedWithMessage", locale, {
+							message: userFeedback,
+						})
+					: getToolMessage("exitPlanModeDenied", locale);
+				pending.resolve({ behavior: "deny", message: planDenyMsg, rawMessage: true });
+			}
 		} else {
 			const message = userFeedback || "Permission denied by user";
 			pending.resolve({ behavior: "deny", message });
@@ -2564,22 +2589,219 @@ export async function resolvePermission(
 	return true;
 }
 
-export async function confirmYoloPause(requestId: string, _reflection?: string): Promise<boolean> {
-	const pause = pendingYoloPauses.get(requestId);
-	if (!pause) return false;
-	return resolvePermission(requestId, "allow", { decidedBy: "auto" });
+export async function resolvePermissionOrDangerReflection(
+	requestId: string,
+	decision: "allow" | "deny",
+	opts: ResolvePermissionOpts = {},
+): Promise<boolean> {
+	if (pendingPermissions.has(requestId)) {
+		return resolvePermission(requestId, decision, opts);
+	}
+
+	if (pendingDangerReflections.has(requestId)) {
+		if (decision === "allow") {
+			const reflection = opts.feedbackText?.trim() || opts.denyMessage?.trim() || undefined;
+			return confirmDangerReflection(requestId, reflection, opts.decidedBy ?? "user");
+		}
+
+		const reason = opts.denyMessage?.trim() || opts.feedbackText?.trim() || undefined;
+		return cancelDangerReflection(requestId, reason, opts.decidedBy ?? "user");
+	}
+
+	return resolvePermission(requestId, decision, opts);
 }
 
-export async function cancelYoloPause(requestId: string, reason?: string): Promise<boolean> {
-	// Prefer the YOLO pause side table, but allow cancellation to resolve the underlying
-	// pending permission as a last line of defense. If the side table was cleaned up or
-	// lost while the permission is still pending, returning false would leave the
-	// original tool call waiting forever.
-	if (!pendingYoloPauses.has(requestId) && !pendingPermissions.has(requestId)) return false;
-	return resolvePermission(requestId, "deny", {
-		denyMessage: reason?.trim() || "YOLO safety pause cancelled by reflection loop",
-		decidedBy: "auto",
-	});
+function dangerReflectionSuggestions(
+	pause: {
+		danger: PendingDangerReflection["danger"];
+		fingerprint: string;
+		startedAt?: number;
+	},
+	status: "confirmed" | "cancelled" | "aborted",
+	reason?: string,
+) {
+	return [
+		{
+			type: "danger_reflection",
+			status,
+			danger: pause.danger,
+			fingerprint: pause.fingerprint,
+			startedAt:
+				typeof pause.startedAt === "number" ? new Date(pause.startedAt).toISOString() : undefined,
+			resolvedAt: new Date().toISOString(),
+			...(reason ? { reason } : {}),
+		},
+	];
+}
+
+async function markDangerReflectionAborted(
+	requestId: string,
+	broadcastTargetId: string,
+	toolUseId: string,
+	narratorId: string,
+	fallback?: Pick<PendingDangerReflection, "danger" | "fingerprint" | "startedAt">,
+	options: { cleanup?: boolean } = {},
+): Promise<void> {
+	const pause = pendingDangerReflections.get(requestId);
+	const suggestionSource = pause ?? fallback;
+	try {
+		const now = new Date().toISOString();
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: "Narrator aborted",
+				permissionDecidedBy: "aborted",
+				permissionDecidedAt: now,
+				permissionDecisionReason: "Danger reflection aborted",
+				...(suggestionSource
+					? {
+							permissionSuggestions: dangerReflectionSuggestions(
+								suggestionSource,
+								"aborted",
+								"Narrator aborted",
+							),
+						}
+					: {}),
+			})
+			.where(eq(narratorToolCalls.id, requestId));
+		broadcastToNarrator(broadcastTargetId, {
+			type: "danger_reflection_resolved",
+			narratorId: broadcastTargetId,
+			requestId,
+			toolUseId,
+			decision: "aborted",
+			reason: "Narrator aborted",
+		});
+		await narratorService.updateStatus(narratorId, "working").catch(() => {});
+		if (broadcastTargetId !== narratorId) {
+			await narratorService.updateStatus(broadcastTargetId, "working").catch(() => {});
+		}
+	} catch (err) {
+		logger.warn("Failed to mark danger reflection as aborted", {
+			requestId,
+			narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	} finally {
+		await narratorService.updateStatus(narratorId, "working").catch(() => {});
+		if (broadcastTargetId !== narratorId) {
+			await narratorService.updateStatus(broadcastTargetId, "working").catch(() => {});
+		}
+		if (options.cleanup) {
+			pendingDangerReflections.get(requestId)?.cleanup();
+			pendingDangerReflections.delete(requestId);
+		}
+	}
+}
+
+export async function confirmDangerReflection(
+	requestId: string,
+	reflection?: string,
+	decidedBy: DangerReflectionDecidedBy = "reflection",
+): Promise<boolean> {
+	const pause = pendingDangerReflections.get(requestId);
+	if (!pause) return false;
+	pause.cleanup();
+	const reason = reflection?.trim() || pause.danger.summary;
+	const result: PermissionResult = { behavior: "allow", updatedInput: pause.input };
+	try {
+		rememberDangerConfirmation(pause.narratorId, pause.fingerprint, pause.danger);
+		const now = new Date().toISOString();
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "running",
+				permissionDecidedBy: decidedBy,
+				permissionDecidedAt: now,
+				permissionDecisionReason: reason,
+				permissionSuggestions: dangerReflectionSuggestions(pause, "confirmed", reason),
+			})
+			.where(eq(narratorToolCalls.id, pause.toolCallId));
+		broadcastToNarrator(pause.broadcastTargetId, {
+			type: "danger_reflection_resolved",
+			narratorId: pause.broadcastTargetId,
+			requestId,
+			toolUseId: pause.toolUseId,
+			decision: "allow",
+			reason,
+		});
+		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
+		if (pause.broadcastTargetId !== pause.narratorId) {
+			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
+		}
+	} catch (err) {
+		logger.warn("Failed to finalize confirmed danger reflection", {
+			requestId,
+			narratorId: pause.narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	} finally {
+		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
+		if (pause.broadcastTargetId !== pause.narratorId) {
+			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
+		}
+		pause.resolve(result);
+	}
+	return true;
+}
+
+export async function cancelDangerReflection(
+	requestId: string,
+	reason?: string,
+	decidedBy: DangerReflectionDecidedBy = "reflection",
+): Promise<boolean> {
+	const pause = pendingDangerReflections.get(requestId);
+	if (!pause) return false;
+	pause.cleanup();
+	const message =
+		reason?.trim() ||
+		(decidedBy === "user"
+			? "Danger reflection pause cancelled by user"
+			: "Danger reflection pause cancelled by reflection loop");
+	const result: PermissionResult = {
+		behavior: "deny",
+		message,
+	};
+	try {
+		const now = new Date().toISOString();
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				errorMessage: message,
+				permissionDecidedBy: decidedBy,
+				permissionDecidedAt: now,
+				permissionDecisionReason: message,
+				permissionSuggestions: dangerReflectionSuggestions(pause, "cancelled", message),
+			})
+			.where(eq(narratorToolCalls.id, pause.toolCallId));
+		broadcastToNarrator(pause.broadcastTargetId, {
+			type: "danger_reflection_resolved",
+			narratorId: pause.broadcastTargetId,
+			requestId,
+			toolUseId: pause.toolUseId,
+			decision: "deny",
+			reason: message,
+		});
+		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
+		if (pause.broadcastTargetId !== pause.narratorId) {
+			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
+		}
+	} catch (err) {
+		logger.warn("Failed to finalize cancelled danger reflection", {
+			requestId,
+			narratorId: pause.narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	} finally {
+		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
+		if (pause.broadcastTargetId !== pause.narratorId) {
+			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});
+		}
+		pause.resolve(result);
+	}
+	return true;
 }
 
 /**

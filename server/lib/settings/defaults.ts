@@ -11,6 +11,7 @@ export const DEFAULTS: NarraForkSettings = {
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
 		defaultPermissionMode: "acceptEdits",
+		defaultStartInPlanMode: false,
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 200,
@@ -30,8 +31,7 @@ export const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
-		yoloSkipReadOnlyConfirmations: false,
-		smartInterruptionCheck: true,
+		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 60_000,
@@ -131,12 +131,15 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 	},
 	"agent.defaultPermissionMode": {
-		desc: "新建叙述者的默认权限模式。控制工具调用是否需要用户批准。",
+		desc: "新建叙述者的默认权限模式。控制工具调用是否需要用户批准（不包含计划模式）。",
 		type: "string",
-		valid:
-			'"default"(每次询问) | "acceptEdits"(自动接受编辑) | "bypassPermissions"(跳过所有) | ' +
-			'"readOnly"(只读) | "plan"(规划模式) | "dontAsk"(不询问)',
+		valid: '"default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk"',
 	},
+	"agent.defaultStartInPlanMode": {
+		desc: "新建叙述者是否默认进入计划模式。计划模式是独立 trait，不再作为权限模式保存。",
+		type: "boolean",
+	},
+
 	"agent.summaryModel": {
 		desc: "用于生成摘要的模型。用于压缩上下文、翻译推理块等辅助任务。应选择速度快成本低的模型。",
 		type: "string",
@@ -202,12 +205,8 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
 		type: "boolean",
 	},
-	"agent.yoloSkipReadOnlyConfirmations": {
-		desc: "YOLO 模式下跳过只读操作的二次确认；Edit/MultiEdit 视为可恢复操作，不触发安全暂停；Write 覆盖、删除、危险执行模式和环境注入仍会保留安全暂停。",
-		type: "boolean",
-	},
-	"agent.smartInterruptionCheck": {
-		desc: "自动检测模型输出是否被截断/中断。通过启发式检查（末尾标点、代码块闭合）和 summaryModel 判断，决定是否自动重试生成。",
+	"agent.dangerSkipReadOnlyConfirmations": {
+		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；Write 覆盖、删除、危险执行模式和环境注入仍会保留安全暂停。",
 		type: "boolean",
 	},
 	"agent.maxTransientRetries": {

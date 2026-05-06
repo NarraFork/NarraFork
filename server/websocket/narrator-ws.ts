@@ -35,7 +35,7 @@ import {
 	getBufferedMessages,
 	pushBufferedMessage,
 	removeBufferedMessage,
-	resolvePermission,
+	resolvePermissionOrDangerReflection,
 	toBufferSummary,
 	updateBufferedMessage,
 } from "../services/narrator-session";
@@ -71,6 +71,7 @@ export type NarratorClientMessage =
 			message?: string;
 			answers?: Record<string, string>;
 			feedbackText?: string;
+			compactAfter?: boolean;
 			updatedPlan?: string;
 	  }
 	| {
@@ -689,26 +690,46 @@ export const handleNarratorWS = {
 					hasFeedback: !!msg.feedbackText,
 					hasAnswers: !!msg.answers,
 				});
-				resolvePermission(msg.requestId, msg.decision, {
+				resolvePermissionOrDangerReflection(msg.requestId, msg.decision, {
 					denyMessage: msg.message,
 					answers: msg.answers,
 					feedbackText: msg.feedbackText,
 					compactAfter: msg.compactAfter,
 					updatedPlan: msg.updatedPlan,
 					userId: ws.data.userId,
-				}).catch((err) => {
-					logger.error("Failed to resolve permission", { error: String(err) });
-					try {
-						ws.send(
-							JSON.stringify({
-								type: "error",
-								message: `Failed to resolve permission: ${String(err)}`,
-							}),
-						);
-					} catch {
-						// connection may be dead
-					}
-				});
+					decidedBy: "user",
+				})
+					.then((resolved) => {
+						if (resolved) return;
+						logger.warn("Permission request not found", {
+							requestId: msg.requestId,
+							decision: msg.decision,
+						});
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "error",
+									message: "Permission request not found",
+								}),
+							);
+						} catch {
+							// ignore send failure
+						}
+					})
+					.catch((err) => {
+						logger.error("Failed to resolve permission", { error: String(err) });
+						try {
+							ws.send(
+								JSON.stringify({
+									type: "error",
+									message: `Failed to resolve permission: ${String(err)}`,
+								}),
+							);
+						} catch {
+							// ignore send failure
+						}
+					});
+
 				break;
 			}
 			case "merge_decision": {

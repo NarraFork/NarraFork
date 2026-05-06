@@ -14,6 +14,7 @@ import {
 	Select,
 	Stack,
 	Text,
+	TextInput,
 	Title,
 	Tooltip,
 } from "@mantine/core";
@@ -24,9 +25,11 @@ import {
 	IconEye,
 	IconFilter,
 	IconPlayerPlay,
+	IconSearch,
 	IconSortAscending,
 	IconSortDescending,
 	IconTerminal2,
+	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
@@ -44,6 +47,7 @@ import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { formatSmartTime } from "../../lib/format";
+import { highlightSearchText, includesSearch, normalizeSearchText } from "../../lib/search-utils";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 
 const ATTENTION_TAGS = ["unread", "error", "interrupted", "suspended", "manual_override"] as const;
@@ -75,6 +79,7 @@ interface NarratorSearchParams {
 	sortBy?: string;
 	sortOrder?: string;
 	filter?: string;
+	q?: string;
 	hasTerminals?: boolean;
 	hasContainers?: boolean;
 	hasRunningContainers?: boolean;
@@ -90,6 +95,7 @@ export const Route = createFileRoute("/narrators/")({
 		sortBy: typeof search.sortBy === "string" ? search.sortBy : undefined,
 		sortOrder: typeof search.sortOrder === "string" ? search.sortOrder : undefined,
 		filter: typeof search.filter === "string" ? search.filter : undefined,
+		q: typeof search.q === "string" ? search.q : undefined,
 		hasTerminals: parseBool(search.hasTerminals) || undefined,
 		hasContainers: parseBool(search.hasContainers) || undefined,
 		hasRunningContainers: parseBool(search.hasRunningContainers) || undefined,
@@ -104,6 +110,7 @@ function NarratorsPage() {
 	const sortBy = search.sortBy ?? "updatedAt";
 	const sortOrder = search.sortOrder ?? "desc";
 	const filter = search.filter ?? "all";
+	const localQuery = search.q ?? "";
 	const hasTerminals = search.hasTerminals ?? false;
 	const hasContainers = search.hasContainers ?? false;
 	const hasRunningContainers = search.hasRunningContainers ?? false;
@@ -120,6 +127,7 @@ function NarratorsPage() {
 					if (next.sortBy === "updatedAt") next.sortBy = undefined;
 					if (next.sortOrder === "desc") next.sortOrder = undefined;
 					if (next.filter === "all") next.filter = undefined;
+					if (!next.q?.trim()) next.q = undefined;
 					if (!next.hasTerminals) next.hasTerminals = undefined;
 					if (!next.hasContainers) next.hasContainers = undefined;
 					if (!next.hasRunningContainers) next.hasRunningContainers = undefined;
@@ -231,13 +239,14 @@ function NarratorsPage() {
 	// Infinite scroll sentinel
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
+		if (localQuery.trim()) return;
 		if (!sentinelRef.current || !hasNextPage) return;
 		const observer = new IntersectionObserver(([entry]) => {
 			if (entry.isIntersecting && !isFetchingNextPage) fetchNextPage();
 		});
 		observer.observe(sentinelRef.current);
 		return () => observer.disconnect();
-	}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+	}, [hasNextPage, isFetchingNextPage, fetchNextPage, localQuery]);
 
 	const sortOptions = useMemo(
 		() => [
@@ -255,6 +264,25 @@ function NarratorsPage() {
 		(hasRunningContainers ? 1 : 0) +
 		(hasViewers ? 1 : 0);
 
+	const filteredNarrators = useMemo(() => {
+		const normalizedQuery = normalizeSearchText(localQuery);
+		if (!normalizedQuery) return narrators;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		return narrators.filter((narrator: any) =>
+			[
+				narrator.title,
+				narrator.id,
+				narrator.cwd,
+				narrator.model,
+				narrator.status,
+				narrator.chapter?.title,
+				narrator.chapter?.projectName,
+			]
+				.filter(Boolean)
+				.some((value) => includesSearch(value, localQuery)),
+		);
+	}, [narrators, localQuery]);
+
 	const toggleSortOrder = () => setSearch({ sortOrder: sortOrder === "desc" ? "asc" : "desc" });
 
 	const handleNarratorClick = useCallback(
@@ -264,6 +292,24 @@ function NarratorsPage() {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId } });
 		},
 		[navigate, navigatingId],
+	);
+
+	const searchInput = (
+		<TextInput
+			size="xs"
+			w={{ base: "100%", sm: 220 }}
+			placeholder={t("localSearchPlaceholder")}
+			value={localQuery}
+			onChange={(e) => setSearch({ q: e.currentTarget.value || undefined })}
+			leftSection={<IconSearch size={14} />}
+			rightSection={
+				localQuery ? (
+					<ActionIcon size="xs" variant="subtle" onClick={() => setSearch({ q: undefined })}>
+						<IconX size={12} />
+					</ActionIcon>
+				) : undefined
+			}
+		/>
 	);
 
 	const handleCreated = useCallback(
@@ -280,12 +326,29 @@ function NarratorsPage() {
 		[navigate],
 	);
 
+	const renderLoadMoreToSearchButton = () => {
+		if (!localQuery.trim() || !hasNextPage) return null;
+		return (
+			<Group justify="center" py="xs">
+				<Button
+					size="xs"
+					variant="light"
+					onClick={() => fetchNextPage()}
+					loading={isFetchingNextPage}
+				>
+					{t("loadMoreToSearch")}
+				</Button>
+			</Group>
+		);
+	};
+
 	return (
 		<Stack>
 			{/* Desktop header */}
 			<Group justify="space-between" visibleFrom="sm">
 				<Title order={2}>{t("title")}</Title>
 				<Group gap="xs">
+					{searchInput}
 					<SegmentedControl
 						size="xs"
 						value={filter}
@@ -450,6 +513,7 @@ function NarratorsPage() {
 						</Button>
 					</Group>
 				</Group>
+				{searchInput}
 				<SegmentedControl
 					size="xs"
 					fullWidth
@@ -485,14 +549,28 @@ function NarratorsPage() {
 				</Group>
 			</Stack>
 
+			{localQuery.trim() && narrators.length > 0 && (
+				<Text size="xs" c="dimmed">
+					{t("localSearchSummary", {
+						shown: filteredNarrators.length,
+						loaded: narrators.length,
+					})}
+				</Text>
+			)}
+
 			{isLoading ? (
 				<Loader />
 			) : !narrators.length ? (
 				<Text c="dimmed">{t("noNarrators")}</Text>
+			) : !filteredNarrators.length ? (
+				<Stack>
+					<Text c="dimmed">{t("localSearchNoResults")}</Text>
+					{renderLoadMoreToSearchButton()}
+				</Stack>
 			) : (
 				<Stack>
 					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-					{narrators.map((narrator: any) => {
+					{filteredNarrators.map((narrator: any) => {
 						const isNavigating = navigatingId === narrator.id;
 						const viewers: Array<{
 							userId: string;
@@ -547,7 +625,10 @@ function NarratorsPage() {
 												);
 											})()}
 											<Text fw={500} truncate>
-												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
+												{highlightSearchText(
+													narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) }),
+													localQuery,
+												)}
 											</Text>
 										</Group>
 										<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
@@ -664,7 +745,10 @@ function NarratorsPage() {
 												);
 											})()}
 											<Text fw={500} truncate style={{ flex: 1, minWidth: 0 }}>
-												{narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) })}
+												{highlightSearchText(
+													narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) }),
+													localQuery,
+												)}
 											</Text>
 										</Group>
 										<Tooltip label={t("archive")}>
@@ -775,8 +859,9 @@ function NarratorsPage() {
 							</Card>
 						);
 					})}
-					<div ref={sentinelRef} style={{ height: 1 }} />
-					{isFetchingNextPage && (
+					{!localQuery.trim() && <div ref={sentinelRef} style={{ height: 1 }} />}
+					{renderLoadMoreToSearchButton()}
+					{isFetchingNextPage && !localQuery.trim() && (
 						<Group justify="center" py="md">
 							<Loader size="sm" />
 							<Text size="sm" c="dimmed">

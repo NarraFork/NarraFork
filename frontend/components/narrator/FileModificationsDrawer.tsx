@@ -8,7 +8,7 @@ import { FileDeletePreviewTab } from "./FileDeletePreviewTab";
 import { FileSummaryTab } from "./FileSummaryTab";
 import type { PendingPermission } from "./narrator-panel-types";
 
-const EDIT_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+const EDIT_TOOLS = new Set(["Write", "Edit"]);
 
 export interface FileModificationsPanelProps {
 	narratorId: string;

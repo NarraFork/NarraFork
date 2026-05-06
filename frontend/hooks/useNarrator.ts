@@ -482,6 +482,26 @@ export function useUpdatePermissionMode() {
 	});
 }
 
+export function useEnterPlanMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.enterPlanMode(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
+export function useExitPlanMode() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.exitPlanMode(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+		},
+	});
+}
+
 // ── Whitelist directories ──
 
 export function useWhitelistDirs(narratorId: string) {

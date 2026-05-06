@@ -47,7 +47,7 @@ export interface ActiveNarrator {
 	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
 	_planFileId?: string;
-	/** Permission mode before entering plan mode — used to restore on ExitPlanMode */
+	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	_previousPermissionMode?: string;
 	/** Cached base branch (for commits-ahead tracking) */
 	_baseBranch?: string;
@@ -169,23 +169,25 @@ export const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
 	() => new Map(),
 );
 
-export interface PendingYoloDangerConfirmation {
+export interface PendingDangerConfirmation {
 	narratorId: string;
 	fingerprint: string;
 	expiresAt: number;
 	summary: string;
 }
 
-export const pendingYoloDangerConfirmations = hotSafe<Map<string, PendingYoloDangerConfirmation>>(
-	"narrafork.pendingYoloDangerConfirmations",
+export const pendingDangerConfirmations = hotSafe<Map<string, PendingDangerConfirmation>>(
+	"narrafork.pendingDangerConfirmations",
 	() => new Map(),
 );
 
-export interface PendingYoloPause {
+export interface PendingDangerReflection {
 	narratorId: string;
 	requestId: string;
+	toolCallId: string;
 	toolUseId: string;
 	toolName: string;
+	broadcastTargetId: string;
 	input: Record<string, unknown>;
 	fingerprint: string;
 	danger: {
@@ -195,10 +197,12 @@ export interface PendingYoloPause {
 		details?: string[];
 	};
 	startedAt: number;
+	resolve: (result: PermissionResult) => void;
+	cleanup: () => void;
 }
 
-export const pendingYoloPauses = hotSafe<Map<string, PendingYoloPause>>(
-	"narrafork.pendingYoloPauses",
+export const pendingDangerReflections = hotSafe<Map<string, PendingDangerReflection>>(
+	"narrafork.pendingDangerReflections",
 	() => new Map(),
 );
 

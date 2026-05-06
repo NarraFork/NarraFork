@@ -9,6 +9,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
 import { logger } from "../lib/logger";
+import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
 import type {
 	DiscordConfig,
 	FeishuConfig,
@@ -207,14 +208,16 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
 	const rateLimitEnv = process.env.GATEWAY_RATE_LIMIT_PER_MINUTE;
 	const streamingEnv = process.env.GATEWAY_STREAMING;
 
+	const rawDefaultPermissionMode =
+		process.env.GATEWAY_DEFAULT_PERMISSION_MODE ?? dbCfg.defaultPermissionMode;
+	const defaultPermissionMode: GatewayConfig["defaultPermissionMode"] =
+		normalizeLegacyPermissionMode(rawDefaultPermissionMode, "bypassPermissions");
+
 	return {
 		enabled,
 		defaultProjectId: process.env.GATEWAY_DEFAULT_PROJECT_ID ?? dbCfg.defaultProjectId,
 		defaultChapterId: process.env.GATEWAY_DEFAULT_CHAPTER_ID ?? dbCfg.defaultChapterId,
-		defaultPermissionMode:
-			process.env.GATEWAY_DEFAULT_PERMISSION_MODE ??
-			dbCfg.defaultPermissionMode ??
-			"bypassPermissions",
+		defaultPermissionMode,
 		sessionIdleMinutes: sessionIdleMinutesEnv
 			? Number(sessionIdleMinutesEnv)
 			: (dbCfg.sessionIdleMinutes ?? 0),

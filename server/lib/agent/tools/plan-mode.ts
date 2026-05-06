@@ -71,12 +71,7 @@ export const enterPlanModeTool: ToolDefinition = {
 		properties: {},
 		additionalProperties: false,
 	},
-	parameters: z.object({
-		confirm: z
-			.literal(true)
-			.default(true)
-			.describe("Confirm entering plan mode. Always pass true."),
-	}),
+	parameters: z.object({}),
 	async execute(_args, ctx): Promise<ToolResult> {
 		// DB update + WS broadcast handled by session layer (assistant_message event).
 		const locale = (ctx?.locale as Locale) ?? "en";
@@ -121,7 +116,7 @@ export const exitPlanModeTool: ToolDefinition = {
 			},
 			allowedPrompts: {
 				description:
-					"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
+					"Optional notes for the ExitPlanMode readiness self-check about command categories the plan may require. These do not grant permissions after approval.",
 				type: "array",
 				items: {
 					type: "object",
@@ -164,7 +159,7 @@ export const exitPlanModeTool: ToolDefinition = {
 			)
 			.optional()
 			.describe(
-				"Prompt-based permissions needed to implement the plan. These describe categories of actions rather than specific commands.",
+				"Optional notes for the ExitPlanMode readiness self-check. These do not grant permissions after approval.",
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {

@@ -12,6 +12,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import type { PermissionMode } from "../lib/permission-modes";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -703,41 +704,13 @@ export const narratorPersistence = {
 		await db.update(narrators).set({ model, updatedAt: now }).where(eq(narrators.id, narratorId));
 	},
 
-	async updatePermissionMode(
-		narratorId: string,
-		permissionMode:
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "readOnly"
-			| "plan"
-			| "dontAsk",
-	) {
+	async updatePermissionMode(narratorId: string, permissionMode: PermissionMode) {
 		const now = new Date().toISOString();
 
-		if (permissionMode === "plan") {
-			const current = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { permissionMode: true },
-			});
-			const prevMode = current?.permissionMode ?? "default";
-			if (prevMode !== "plan") {
-				await db
-					.update(narrators)
-					.set({ permissionMode, previousPermissionMode: prevMode, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			} else {
-				await db
-					.update(narrators)
-					.set({ permissionMode, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			}
-		} else {
-			await db
-				.update(narrators)
-				.set({ permissionMode, previousPermissionMode: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
-		}
+		await db
+			.update(narrators)
+			.set({ permissionMode, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
 
 		await db
 			.update(narrators)

@@ -20,6 +20,18 @@ interface NarratorWSCallbacks {
 		feedbackText?: string,
 		subagentNarratorId?: string,
 	) => void;
+	onDangerReflectionStarted?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		danger?: unknown;
+	}) => void;
+	onDangerReflectionResolved?: (data: {
+		requestId: string;
+		toolUseId: string;
+		decision: "allow" | "deny" | "aborted";
+		reason?: string;
+	}) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -70,6 +82,7 @@ interface NarratorWSCallbacks {
 	onGoalsSet?: (goals: NarratorGoal[]) => void;
 	onGoalContinuation?: (goal: NarratorGoal) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
+	onPlanModeChanged?: (planMode: boolean, traits?: string[]) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
@@ -115,8 +128,6 @@ interface NarratorWSCallbacks {
 		maxRetries?: number;
 		delayMs?: number;
 	}) => void;
-	onInterruptChecking?: () => void;
-	onInterruptCheckDone?: () => void;
 	onModelChanged?: (model: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
@@ -289,6 +300,22 @@ export function useNarratorWS(
 							data.subagentNarratorId as string | undefined,
 						);
 						break;
+					case "danger_reflection_started":
+						callbacksRef.current.onDangerReflectionStarted?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							danger: data.danger,
+						});
+						break;
+					case "danger_reflection_resolved":
+						callbacksRef.current.onDangerReflectionResolved?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							decision: data.decision as "allow" | "deny" | "aborted",
+							reason: data.reason as string | undefined,
+						});
+						break;
 					case "status_change":
 						callbacksRef.current.onStatusChange?.(
 							data.status as string,
@@ -395,6 +422,12 @@ export function useNarratorWS(
 					case "permission_mode_changed":
 						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
 						break;
+					case "plan_mode_changed":
+						callbacksRef.current.onPlanModeChanged?.(
+							data.planMode as boolean,
+							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
+						);
+						break;
 					case "relaxed_plan_changed":
 						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
 						break;
@@ -497,12 +530,6 @@ export function useNarratorWS(
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
 						});
-						break;
-					case "interrupt_checking":
-						callbacksRef.current.onInterruptChecking?.();
-						break;
-					case "interrupt_check_done":
-						callbacksRef.current.onInterruptCheckDone?.();
 						break;
 					case "model_changed":
 					case "model_switched":

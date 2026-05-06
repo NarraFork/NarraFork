@@ -238,6 +238,9 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 	const blocks = Array.isArray(targetMsg.contentJson)
 		? (targetMsg.contentJson as { type: string; id?: string }[])
 		: [];
+	if (blockIndex < 0 || blockIndex >= blocks.length) {
+		throw new Error(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
+	}
 
 	// Collect tool_use IDs from blocks after blockIndex
 	const truncatedToolUseIds: string[] = [];
@@ -305,7 +308,7 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 	// Extract affected file paths
 	const files = new Set<string>();
 	for (const tc of allToolCalls) {
-		if (tc.toolName !== "Write" && tc.toolName !== "Edit" && tc.toolName !== "MultiEdit") continue;
+		if (tc.toolName !== "Write" && tc.toolName !== "Edit") continue;
 		const input = tc.inputJson as Record<string, unknown> | null;
 		if (!input?.file_path) continue;
 		files.add(input.file_path as string);
@@ -699,6 +702,15 @@ describe("rollback-preview", () => {
 		seedNarrator();
 
 		await expect(simulateRollbackPreview("n1", "nonexistent", 0)).rejects.toThrow("Ref not found");
+	});
+
+	it("throws on out-of-range blockIndex", async () => {
+		seedProject();
+		seedNarrator();
+		seedMessage("m0", "n1", "assistant", "only one");
+		seedRef("n1", "m0", 0);
+
+		await expect(simulateRollbackPreview("n1", "m0", 1)).rejects.toThrow("out of range");
 	});
 });
 

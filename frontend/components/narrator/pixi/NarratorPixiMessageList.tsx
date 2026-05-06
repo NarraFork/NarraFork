@@ -140,8 +140,12 @@ const SWIPE_REVEAL_WIDTH = 180;
 const SWIPE_CLOSE_DURATION = 220;
 const TOUCH_MOMENTUM_TIME_CONSTANT_MS = 325;
 const TOUCH_MOMENTUM_MIN_VELOCITY_PX_PER_MS = 0.02;
+const WHEEL_LINE_HEIGHT_PX = 16;
+const WHEEL_SMOOTHING_TIME_CONSTANT_MS = 95;
+const WHEEL_SMOOTHING_EPSILON_PX = 0.5;
 
 type MessageMenuTarget = Extract<PixiMessageHitTarget, { kind: "message-menu" }>;
+type ToolContentScrollTarget = Extract<PixiMessageHitTarget, { kind: "tool-content-scroll" }>;
 
 type PixiSwipeGeometry = {
 	initialRight: number;
@@ -175,6 +179,7 @@ type TouchScrollState = {
 	direction: "horizontal" | "vertical" | null;
 	rangeCandidate: boolean;
 	target: PixiMessageHitTarget | null;
+	scrollTarget: ToolContentScrollTarget | null;
 	swipeTarget: MessageMenuTarget | null;
 	swipeOffset: number;
 	swipeGeometry: PixiSwipeGeometry | null;
@@ -210,6 +215,18 @@ function hitTestPixiMessageMenuTarget(
 	for (let i = targets.length - 1; i >= 0; i--) {
 		const target = targets[i];
 		if (target.kind === "message-menu" && targetContainsPoint(target, x, y)) return target;
+	}
+	return null;
+}
+
+function hitTestPixiToolContentScrollTarget(
+	targets: PixiMessageHitTarget[],
+	x: number,
+	y: number,
+): ToolContentScrollTarget | null {
+	for (let i = targets.length - 1; i >= 0; i--) {
+		const target = targets[i];
+		if (target.kind === "tool-content-scroll" && targetContainsPoint(target, x, y)) return target;
 	}
 	return null;
 }
@@ -300,6 +317,7 @@ export const NarratorPixiMessageList = forwardRef<
 	const forcedToolExpandedKeysRef = useRef(new Set<string>());
 	const resolvedToolExpandedRef = useRef(new Map<string, boolean>());
 	const reasoningExpandedMapRef = useRef(new Map<string, boolean>());
+	const toolContentScrollMapRef = useRef(new Map<string, number>());
 	const userToggledReasoningKeysRef = useRef(new Set<string>());
 	const reasoningSlotExpandedRef = useRef(new Map<string, boolean>());
 	const reasoningKeySlotRef = useRef(new Map<string, string>());
@@ -325,6 +343,7 @@ export const NarratorPixiMessageList = forwardRef<
 	const virtualScrollTopRef = useRef(0);
 	const pixiScrollOffsetRef = useRef(0);
 	const touchDrivingScrollRef = useRef(false);
+	const outerScrollInProgressRef = useRef(false);
 	const scrollEndTimerRef = useRef(0);
 	const pixiDrivenScrollTopRef = useRef<number | null>(null);
 	const lastLightResumeAtRef = useRef(0);
@@ -632,6 +651,7 @@ export const NarratorPixiMessageList = forwardRef<
 				selectedBlockIds: selectionRef.current.selectionMode
 					? selectionRef.current.selectedBlockIds
 					: undefined,
+				getToolContentScroll: (scrollKey) => toolContentScrollMapRef.current.get(scrollKey) ?? 0,
 				...(options?.bufferPx != null ? { bufferPx: options.bufferPx } : {}),
 			});
 			imagePool.releaseUnused();
@@ -728,6 +748,14 @@ export const NarratorPixiMessageList = forwardRef<
 			isAtBottomRef.current = isViewportAtBottom(viewport);
 			renderPixiViewport(viewport.scrollTop, bufferPx == null ? undefined : { bufferPx });
 		};
+		const markOuterScrollInProgress = () => {
+			outerScrollInProgressRef.current = true;
+			clearTimeout(scrollEndTimerRef.current);
+			scrollEndTimerRef.current = window.setTimeout(() => {
+				outerScrollInProgressRef.current = false;
+				viewport.dispatchEvent(new Event("scrollend"));
+			}, 120);
+		};
 		const onScroll = () => {
 			const pixiDrivenScrollTop = pixiDrivenScrollTopRef.current;
 			const isPixiDrivenScroll =
@@ -739,10 +767,7 @@ export const NarratorPixiMessageList = forwardRef<
 				cancelAnimationFrame(renderRaf);
 				renderRaf = requestAnimationFrame(() => renderFromNativeScroll());
 			}
-			clearTimeout(scrollEndTimerRef.current);
-			scrollEndTimerRef.current = window.setTimeout(() => {
-				viewport.dispatchEvent(new Event("scrollend"));
-			}, 120);
+			markOuterScrollInProgress();
 		};
 
 		renderFromNativeScroll(0);
@@ -750,6 +775,7 @@ export const NarratorPixiMessageList = forwardRef<
 		return () => {
 			cancelAnimationFrame(renderRaf);
 			clearTimeout(scrollEndTimerRef.current);
+			outerScrollInProgressRef.current = false;
 			viewport.removeEventListener("scroll", onScroll);
 		};
 	}, [renderPixiViewport]);
@@ -924,6 +950,11 @@ export const NarratorPixiMessageList = forwardRef<
 		let momentumVelocity = 0;
 		let momentumTickerAttached = false;
 		let momentumTick: ((ticker: Ticker) => void) | null = null;
+		let wheelSmoothingTickerAttached = false;
+		let wheelSmoothingTick: ((ticker: Ticker) => void) | null = null;
+		let hasActiveWheelSmoothing = false;
+		let wheelSmoothingTarget: ToolContentScrollTarget | null = null;
+		let wheelSmoothingTargetOffset = 0;
 		const syncNativeScrollFromPixi = () => {
 			const viewport = viewportRef.current;
 			if (!viewport) return;
@@ -944,8 +975,19 @@ export const NarratorPixiMessageList = forwardRef<
 			touchDrivingScrollRef.current = false;
 			syncNativeScrollFromPixi();
 		};
+		const cancelWheelSmoothing = () => {
+			if (wheelSmoothingTickerAttached && wheelSmoothingTick) {
+				app.ticker.remove(wheelSmoothingTick);
+				wheelSmoothingTickerAttached = false;
+				if (app.ticker.count === 0) app.ticker.stop();
+			}
+			hasActiveWheelSmoothing = false;
+			wheelSmoothingTarget = null;
+			wheelSmoothingTargetOffset = 0;
+		};
 		const handleContextLost = (event: Event) => {
 			cancelTouchMomentum();
+			cancelWheelSmoothing();
 			event.preventDefault();
 		};
 		const handleContextRestored = () => refreshAfterResumeRef.current({ resetTextures: true });
@@ -961,6 +1003,10 @@ export const NarratorPixiMessageList = forwardRef<
 		const messageMenuTargetAtEvent = (event: PointerEvent | MouseEvent) => {
 			const point = eventLocalPoint(event);
 			return hitTestPixiMessageMenuTarget(hitTargetsRef.current, point.x, point.y);
+		};
+		const toolContentScrollTargetAtEvent = (event: PointerEvent | MouseEvent) => {
+			const point = eventLocalPoint(event);
+			return hitTestPixiToolContentScrollTarget(hitTargetsRef.current, point.x, point.y);
 		};
 		const swipeGeometryForTarget = (
 			target: MessageMenuTarget,
@@ -999,6 +1045,7 @@ export const NarratorPixiMessageList = forwardRef<
 			canvas.style.cursor = "default";
 		};
 		const triggerHitTarget = (target: PixiMessageHitTarget) => {
+			if (target.kind === "tool-content-scroll") return;
 			if (target.kind === "tool-toggle") {
 				toggleTool(target.toolKey);
 				return;
@@ -1029,6 +1076,7 @@ export const NarratorPixiMessageList = forwardRef<
 			const next = clamp(previous + deltaY, 0, getMaxScrollTop(viewport));
 			const actualDelta = next - previous;
 			if (actualDelta === 0) return false;
+			outerScrollInProgressRef.current = true;
 			pixiScrollOffsetRef.current = next;
 			virtualScrollTopRef.current = next;
 			isAtBottomRef.current = next >= getMaxScrollTop(viewport) - 30;
@@ -1037,6 +1085,38 @@ export const NarratorPixiMessageList = forwardRef<
 			viewport.scrollTop = next;
 			if (options?.renderNow) renderPixiViewportRef.current(next);
 			return true;
+		};
+		const scrollToolContentBy = (target: ToolContentScrollTarget, deltaY: number) => {
+			const previous = toolContentScrollMapRef.current.get(target.scrollKey) ?? 0;
+			const next = clamp(previous + deltaY, 0, target.maxScrollTop);
+			if (next === previous) return false;
+			toolContentScrollMapRef.current.set(target.scrollKey, next);
+			renderPixiViewportRef.current();
+			return true;
+		};
+		const normalizeWheelDeltaY = (event: WheelEvent) => {
+			if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * WHEEL_LINE_HEIGHT_PX;
+			if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+				return event.deltaY * Math.max(1, viewportRef.current?.clientHeight ?? 1);
+			}
+			return event.deltaY;
+		};
+		const currentWheelOffset = (target: ToolContentScrollTarget | null) =>
+			target
+				? (toolContentScrollMapRef.current.get(target.scrollKey) ?? 0)
+				: pixiScrollOffsetRef.current;
+		const maxWheelOffset = (target: ToolContentScrollTarget | null) =>
+			target ? target.maxScrollTop : viewportRef.current ? getMaxScrollTop(viewportRef.current) : 0;
+		const setWheelOffset = (target: ToolContentScrollTarget | null, offset: number) => {
+			if (target) {
+				const previous = toolContentScrollMapRef.current.get(target.scrollKey) ?? 0;
+				const next = clamp(offset, 0, target.maxScrollTop);
+				if (Math.abs(next - previous) < 0.01) return false;
+				toolContentScrollMapRef.current.set(target.scrollKey, next);
+				renderPixiViewportRef.current();
+				return true;
+			}
+			return scrollViewportBy(offset - pixiScrollOffsetRef.current, { renderNow: true });
 		};
 		momentumTick = (ticker: Ticker) => {
 			const dt = Math.max(Number.EPSILON, ticker.elapsedMS);
@@ -1050,6 +1130,21 @@ export const NarratorPixiMessageList = forwardRef<
 				cancelTouchMomentum();
 			}
 		};
+		wheelSmoothingTick = (ticker: Ticker) => {
+			const current = currentWheelOffset(wheelSmoothingTarget);
+			const remaining = wheelSmoothingTargetOffset - current;
+			if (Math.abs(remaining) <= WHEEL_SMOOTHING_EPSILON_PX) {
+				setWheelOffset(wheelSmoothingTarget, wheelSmoothingTargetOffset);
+				cancelWheelSmoothing();
+				return;
+			}
+			const dt = Math.max(Number.EPSILON, ticker.elapsedMS);
+			const step = remaining * (1 - Math.exp(-dt / WHEEL_SMOOTHING_TIME_CONSTANT_MS));
+			if (!setWheelOffset(wheelSmoothingTarget, current + step)) {
+				cancelWheelSmoothing();
+			}
+		};
+
 		const startTouchMomentum = (velocity: number) => {
 			cancelTouchMomentum();
 			if (Math.abs(velocity) < TOUCH_MOMENTUM_MIN_VELOCITY_PX_PER_MS) {
@@ -1068,6 +1163,34 @@ export const NarratorPixiMessageList = forwardRef<
 				momentumTickerAttached = true;
 			}
 			app.ticker.start();
+		};
+		const addWheelDelta = (deltaY: number, target: ToolContentScrollTarget | null) => {
+			const sameTarget =
+				hasActiveWheelSmoothing &&
+				(target ? wheelSmoothingTarget?.id === target.id : wheelSmoothingTarget === null);
+			const currentOffset = currentWheelOffset(target);
+			const maxOffset = maxWheelOffset(target);
+			const activeTargetOffset = sameTarget
+				? clamp(wheelSmoothingTargetOffset, 0, maxOffset)
+				: currentOffset;
+			// When the native viewport or content height changes while smoothing is still
+			// active, the old target can end up far above/below the new valid range. Anchor
+			// new wheel input to the visible offset in that case; otherwise a small delta can
+			// resurrect a stale target and look like a huge opposite-direction impulse.
+			const targetIsStale =
+				sameTarget && Math.abs(activeTargetOffset - currentOffset) > Math.abs(deltaY) * 4;
+			const baseOffset = targetIsStale ? currentOffset : activeTargetOffset;
+			const nextTargetOffset = clamp(baseOffset + deltaY, 0, maxOffset);
+			if (Math.abs(nextTargetOffset - currentOffset) <= WHEEL_SMOOTHING_EPSILON_PX) return false;
+			hasActiveWheelSmoothing = true;
+			wheelSmoothingTarget = target;
+			wheelSmoothingTargetOffset = nextTargetOffset;
+			if (!wheelSmoothingTickerAttached && wheelSmoothingTick) {
+				app.ticker.add(wheelSmoothingTick);
+				wheelSmoothingTickerAttached = true;
+			}
+			app.ticker.start();
+			return true;
 		};
 		const handlePointerMove = (event: PointerEvent) => {
 			const canvas = event.currentTarget as HTMLCanvasElement;
@@ -1114,23 +1237,31 @@ export const NarratorPixiMessageList = forwardRef<
 				}
 				if (touchScrollState.direction === "vertical") {
 					event.preventDefault();
-					const instantVelocity = deltaY / dt;
-					touchScrollState.velocity =
-						touchScrollState.velocity === 0
-							? instantVelocity
-							: touchScrollState.velocity * 0.6 + instantVelocity * 0.4;
-					scrollViewportBy(deltaY, { renderNow: true });
+					const scrolledToolContent =
+						!outerScrollInProgressRef.current && touchScrollState.scrollTarget
+							? scrollToolContentBy(touchScrollState.scrollTarget, deltaY)
+							: false;
+					if (!scrolledToolContent) {
+						const instantVelocity = deltaY / dt;
+						touchScrollState.velocity =
+							touchScrollState.velocity === 0
+								? instantVelocity
+								: touchScrollState.velocity * 0.6 + instantVelocity * 0.4;
+						scrollViewportBy(deltaY, { renderNow: true });
+					} else {
+						touchScrollState.velocity = 0;
+					}
 				}
 				return;
 			}
 			if (event.pointerType === "touch") return;
 			const target = hitTargetAtEvent(event);
-			const nextId = target?.id ?? null;
+			const nextId = target?.kind === "tool-content-scroll" ? null : (target?.id ?? null);
 			if (hoveredHitTargetIdRef.current !== nextId) {
 				hoveredHitTargetIdRef.current = nextId;
 				setHoveredHitTargetId(nextId);
 			}
-			canvas.style.cursor = target ? "pointer" : "default";
+			canvas.style.cursor = target && target.kind !== "tool-content-scroll" ? "pointer" : "default";
 		};
 		const handlePointerLeave = (event: PointerEvent) => {
 			if (touchScrollState?.pointerId === event.pointerId) return;
@@ -1140,8 +1271,10 @@ export const NarratorPixiMessageList = forwardRef<
 			const canvas = event.currentTarget as HTMLCanvasElement;
 			const target = hitTargetAtEvent(event);
 			const menuTarget = messageMenuTargetAtEvent(event);
+			const scrollTarget = toolContentScrollTargetAtEvent(event);
 			if (event.pointerType === "touch") {
 				cancelTouchMomentum();
+				cancelWheelSmoothing();
 				touchDrivingScrollRef.current = true;
 				const currentClose = getGlobalCloseSwipe();
 				const currentAnchor = getGlobalSwipeAnchor();
@@ -1164,6 +1297,7 @@ export const NarratorPixiMessageList = forwardRef<
 					direction: null,
 					rangeCandidate,
 					target,
+					scrollTarget,
 					swipeTarget: menuTarget,
 					swipeOffset: 0,
 					swipeGeometry,
@@ -1275,7 +1409,13 @@ export const NarratorPixiMessageList = forwardRef<
 			cancelTouchMomentum();
 			touchDrivingScrollRef.current = true;
 			event.preventDefault();
-			scrollViewportBy(event.deltaY, { renderNow: true });
+			const deltaY = normalizeWheelDeltaY(event);
+			const toolScrollTarget = toolContentScrollTargetAtEvent(event);
+			const innerTarget =
+				toolScrollTarget && !outerScrollInProgressRef.current ? toolScrollTarget : null;
+			if (!innerTarget || !addWheelDelta(deltaY, innerTarget)) {
+				addWheelDelta(deltaY, null);
+			}
 			touchDrivingScrollRef.current = false;
 		};
 		let destroyed = false;
@@ -1350,6 +1490,7 @@ export const NarratorPixiMessageList = forwardRef<
 		return () => {
 			destroyed = true;
 			cancelTouchMomentum();
+			cancelWheelSmoothing();
 			pixiDestroyedRef.current = true;
 			const app = appRef.current;
 			appRef.current = null;

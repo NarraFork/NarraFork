@@ -13,6 +13,14 @@ import type {
 	WhitelistDir,
 } from "./types";
 
+export interface PermissionDecisionPayload {
+	message?: string;
+	answers?: Record<string, string>;
+	feedbackText?: string;
+	compactAfter?: boolean;
+	updatedPlan?: string;
+}
+
 export const narratorsApi = {
 	listNarrators: (opts?: {
 		chapterId?: string;
@@ -90,6 +98,7 @@ export const narratorsApi = {
 		model?: string;
 		systemPrompt?: string;
 		permissionMode?: string;
+		startInPlanMode?: boolean;
 		reasoningEffort?: string | null;
 		fastMode?: boolean;
 		relaxedPlan?: boolean;
@@ -221,12 +230,19 @@ export const narratorsApi = {
 			body: JSON.stringify({ orderedIds }),
 		}),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
-	approvePermission: (requestId: string) =>
-		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, { method: "POST" }),
-	denyPermission: (requestId: string, message?: string) =>
+	approvePermission: (requestId: string, payload?: PermissionDecisionPayload) =>
+		request<ApiEntity>(`/narrators/permissions/${requestId}/approve`, {
+			method: "POST",
+			...(payload ? { body: JSON.stringify(payload) } : {}),
+		}),
+	denyPermission: (requestId: string, messageOrPayload?: string | PermissionDecisionPayload) =>
 		request<ApiEntity>(`/narrators/permissions/${requestId}/deny`, {
 			method: "POST",
-			body: JSON.stringify({ message }),
+			body: JSON.stringify(
+				typeof messageOrPayload === "string"
+					? { message: messageOrPayload }
+					: (messageOrPayload ?? {}),
+			),
 		}),
 	updateNarratorTitle: (id: string, title: string) =>
 		request<{ ok: boolean; title: string }>(`/narrators/${id}/title`, {
@@ -263,6 +279,16 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ permissionMode }),
 		}),
+	enterPlanMode: (id: string) =>
+		request<{ ok: boolean; planMode: boolean; traits: string[] }>(
+			`/narrators/${id}/plan-mode/enter`,
+			{ method: "POST" },
+		),
+	exitPlanMode: (id: string) =>
+		request<{ ok: boolean; planMode: boolean; traits: string[] }>(
+			`/narrators/${id}/plan-mode/exit`,
+			{ method: "POST" },
+		),
 	// Whitelist directories
 	getWhitelistDirs: (id: string) => request<WhitelistDir[]>(`/narrators/${id}/whitelist-dirs`),
 	createWhitelistDir: (
@@ -622,6 +648,7 @@ export const narratorsApi = {
 				url: string;
 				lastActivity: number;
 				tracing: { active: boolean; startedAt: number } | null;
+				networkRequestCount: number;
 			}[]
 		>(`/narrators/${narratorId}/browser-sessions`),
 	closeBrowserSession: (narratorId: string, sessionId: string) =>

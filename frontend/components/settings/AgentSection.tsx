@@ -14,7 +14,6 @@ import {
 import {
 	IconEye,
 	IconHandStop,
-	IconNotebook,
 	IconPencilCheck,
 	IconPlus,
 	IconShield,
@@ -47,12 +46,12 @@ export interface AgentSectionProps {
 	setRequestDumpEnabled: (v: boolean) => void;
 	expandReasoning: boolean;
 	setExpandReasoning: (v: boolean) => void;
+	defaultStartInPlanMode: boolean;
+	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
-	yoloSkipReadOnlyConfirmations: boolean;
-	setYoloSkipReadOnlyConfirmations: (v: boolean) => void;
-	smartInterruptionCheck: boolean;
-	setSmartInterruptionCheck: (v: boolean) => void;
+	dangerSkipReadOnlyConfirmations: boolean;
+	setDangerSkipReadOnlyConfirmations: (v: boolean) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
 	retryBackoffCeilMs: number;
@@ -125,7 +124,6 @@ export function AgentSection(props: AgentSectionProps) {
 					{ value: "acceptEdits", label: tn("perm_acceptEdits") },
 					{ value: "bypassPermissions", label: tn("perm_bypassPermissions") },
 					{ value: "readOnly", label: tn("perm_readOnly") },
-					{ value: "plan", label: tn("perm_plan") },
 					{ value: "dontAsk", label: tn("perm_dontAsk") },
 				]}
 				leftSection={
@@ -137,8 +135,6 @@ export function AgentSection(props: AgentSectionProps) {
 						<IconShieldOff size={14} />
 					) : props.permissionMode === "readOnly" ? (
 						<IconEye size={14} />
-					) : props.permissionMode === "plan" ? (
-						<IconNotebook size={14} />
 					) : props.permissionMode === "dontAsk" ? (
 						<IconHandStop size={14} />
 					) : (
@@ -151,7 +147,6 @@ export function AgentSection(props: AgentSectionProps) {
 						acceptEdits: <IconPencilCheck size={14} />,
 						bypassPermissions: <IconShieldOff size={14} />,
 						readOnly: <IconEye size={14} />,
-						plan: <IconNotebook size={14} />,
 						dontAsk: <IconHandStop size={14} />,
 					};
 					return (
@@ -205,22 +200,22 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(e) => props.setExpandReasoning(e.currentTarget.checked)}
 			/>
 			<Switch
+				label={t("defaultStartInPlanMode")}
+				description={t("defaultStartInPlanModeDesc")}
+				checked={props.defaultStartInPlanMode}
+				onChange={(e) => props.setDefaultStartInPlanMode(e.currentTarget.checked)}
+			/>
+			<Switch
 				label={t("defaultRelaxedPlan")}
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
 			/>
 			<Switch
-				label={t("yoloSkipReadOnlyConfirmations")}
-				description={t("yoloSkipReadOnlyConfirmationsDesc")}
-				checked={props.yoloSkipReadOnlyConfirmations}
-				onChange={(e) => props.setYoloSkipReadOnlyConfirmations(e.currentTarget.checked)}
-			/>
-			<Switch
-				label={t("smartInterruptionCheck")}
-				description={t("smartInterruptionCheckDesc")}
-				checked={props.smartInterruptionCheck}
-				onChange={(e) => props.setSmartInterruptionCheck(e.currentTarget.checked)}
+				label={t("dangerSkipReadOnlyConfirmations")}
+				description={t("dangerSkipReadOnlyConfirmationsDesc")}
+				checked={props.dangerSkipReadOnlyConfirmations}
+				onChange={(e) => props.setDangerSkipReadOnlyConfirmations(e.currentTarget.checked)}
 			/>
 			<NumberInput
 				label={t("maxTransientRetries")}

@@ -2,6 +2,8 @@
  * Shared types for the IM Gateway module.
  */
 
+import type { PermissionMode } from "../lib/permission-modes";
+
 // ---------------------------------------------------------------------------
 // Platform identifiers
 // ---------------------------------------------------------------------------
@@ -215,7 +217,7 @@ export interface GatewayConfig {
 	/** Default chapter ID to bind new IM sessions to (optional) */
 	defaultChapterId?: string;
 	/** Default permission mode for IM-created narrators */
-	defaultPermissionMode?: string;
+	defaultPermissionMode?: PermissionMode;
 	/** Session idle timeout in minutes. Sessions older than this auto-reset. 0 = never. */
 	sessionIdleMinutes?: number;
 	/** Max messages per user per minute. 0 = unlimited. */

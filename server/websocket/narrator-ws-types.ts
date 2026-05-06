@@ -11,6 +11,22 @@ export type NarratorServerMessage =
 	| { type: "stream_event"; narratorId: string; event: unknown }
 	| { type: "permission_request"; narratorId: string; request: unknown }
 	| {
+			type: "danger_reflection_started";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			danger: unknown;
+		}
+	| {
+			type: "danger_reflection_resolved";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+		}
+	| {
 			type: "status_change";
 			narratorId: string;
 			status: string;
@@ -94,6 +110,7 @@ export type NarratorServerMessage =
 			messages: Array<{ id: string; text: string; bufferedAt: string }>;
 	  }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
+	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean; traits: string[] }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
@@ -252,8 +269,6 @@ export type NarratorServerMessage =
 			delayMs?: number;
 	  }
 	| { type: "context_length_exceeded"; narratorId: string }
-	| { type: "interrupt_checking"; narratorId: string }
-	| { type: "interrupt_check_done"; narratorId: string }
 	| { type: "full_reload"; narratorId: string }
 	| {
 			type: "timeout_updated";

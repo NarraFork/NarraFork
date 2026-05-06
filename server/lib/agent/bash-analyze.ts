@@ -2325,6 +2325,162 @@ const PS_ALWAYS_ASK_CMDLETS = new Set([
 	"stop-computer",
 ]);
 
+const PS_WRITE_CMDLETS = new Set([
+	"remove-item",
+	"ri",
+	"rm",
+	"rmdir",
+	"del",
+	"erase",
+	"rd",
+	"clear-content",
+	"clc",
+	"clear-item",
+	"cli",
+	"clear-itemproperty",
+	"clp",
+	"set-content",
+	"sc",
+	"add-content",
+	"ac",
+	"out-file",
+	"copy-item",
+	"cp",
+	"copy",
+	"cpi",
+	"move-item",
+	"mv",
+	"move",
+	"mi",
+	"rename-item",
+	"ren",
+	"rni",
+	"new-item",
+	"ni",
+	"mkdir",
+	"md",
+	"set-itemproperty",
+	"sp",
+	"new-itemproperty",
+	"remove-itemproperty",
+	"rp",
+	"set-acl",
+]);
+
+const PS_EXECUTION_CMDLETS = new Set([
+	"start-process",
+	"saps",
+	"start",
+	"invoke-expression",
+	"iex",
+	"invoke-command",
+	"icm",
+	"start-job",
+	"sajb",
+	"powershell",
+	"pwsh",
+	"cmd",
+	"cmd.exe",
+	"node",
+	"python",
+	"python3",
+]);
+
+const PS_NETWORK_CMDLETS = new Set([
+	"invoke-webrequest",
+	"iwr",
+	"curl",
+	"wget",
+	"invoke-restmethod",
+	"irm",
+]);
+
+const PS_SYSTEM_CMDLETS = new Set([
+	"start-service",
+	"sasv",
+	"stop-service",
+	"spsv",
+	"restart-service",
+	"set-service",
+	"set-executionpolicy",
+	"install-module",
+	"install-package",
+	"install-script",
+	"restart-computer",
+	"stop-computer",
+	"stop-process",
+	"kill",
+	"spps",
+]);
+
+function describePowerShellDanger(cmdLower: string, commandText: string): string {
+	if (PS_WRITE_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (writes, moves, or deletes files/state)`;
+	if (PS_EXECUTION_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (executes code or starts a process)`;
+	if (PS_NETWORK_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (network access may fetch remote content)`;
+	if (PS_SYSTEM_CMDLETS.has(cmdLower))
+		return `PowerShell ${commandText} (changes process, service, package, policy, or system state)`;
+	return `PowerShell ${commandText} (requires approval)`;
+}
+
+function stripPowerShellQuotes(arg: string): string {
+	if ((arg.startsWith('"') && arg.endsWith('"')) || (arg.startsWith("'") && arg.endsWith("'"))) {
+		return arg.slice(1, -1);
+	}
+	return arg;
+}
+
+function extractPowerShellPathArgs(cmdLower: string, tokens: string[], cwd: string): string[] {
+	if (!PS_WRITE_CMDLETS.has(cmdLower)) return [];
+	const paths: string[] = [];
+	const pathValueFlags = new Set([
+		"-path",
+		"-literalpath",
+		"-destination",
+		"-target",
+		"-filepath",
+		"-outputpath",
+	]);
+	const nonPathValueFlags = new Set([
+		"-value",
+		"-inputobject",
+		"-encoding",
+		"-filter",
+		"-include",
+		"-exclude",
+		"-argumentlist",
+	]);
+	for (let i = 1; i < tokens.length; i++) {
+		const raw = tokens[i];
+		const lower = raw.toLowerCase();
+		if (pathValueFlags.has(lower)) {
+			const next = tokens[i + 1];
+			if (next && !next.startsWith("-")) paths.push(resolvePath(cwd, stripPowerShellQuotes(next)));
+			i++;
+			continue;
+		}
+		if (nonPathValueFlags.has(lower)) {
+			i++;
+			continue;
+		}
+		if (lower.includes(":")) {
+			const [flagName] = lower.split(":");
+			if (pathValueFlags.has(flagName)) {
+				const inlineValue = raw.slice(raw.indexOf(":") + 1);
+				if (inlineValue) paths.push(resolvePath(cwd, stripPowerShellQuotes(inlineValue)));
+				continue;
+			}
+			if (nonPathValueFlags.has(flagName)) continue;
+		}
+		if (raw.startsWith("-")) continue;
+		if (raw.startsWith("$") || raw.includes("|")) continue;
+		paths.push(resolvePath(cwd, stripPowerShellQuotes(raw)));
+	}
+	return paths;
+}
+
 /**
  * PowerShell 灾难性命令模式 — 即使 bypassPermissions 也必须拒绝。
  */
@@ -2361,7 +2517,7 @@ const PS_CATASTROPHIC_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
  */
 export function analyzePowerShellCommand(
 	command: string,
-	_cwd: string,
+	cwd: string,
 	isChapter = false,
 ): BashAnalysis {
 	const commands: BashAnalysis["commands"] = [];
@@ -2418,14 +2574,10 @@ export function analyzePowerShellCommand(
 			// PowerShell 危险 cmdlet
 			if (PS_ALWAYS_ASK_CMDLETS.has(cmdLower)) {
 				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
-				if (
-					cmdLower === "set-content" ||
-					cmdLower === "sc" ||
-					cmdLower === "add-content" ||
-					cmdLower === "ac" ||
-					cmdLower === "out-file"
-				) {
+				dangerousPatterns.push(describePowerShellDanger(cmdLower, segment));
+				if (PS_WRITE_CMDLETS.has(cmdLower)) {
 					hasWriteOperation = true;
+					filePaths.push(...extractPowerShellPathArgs(cmdLower, tokens, cwd));
 				}
 				continue;
 			}
@@ -2458,6 +2610,11 @@ export function analyzePowerShellCommand(
 
 			if (ALWAYS_ASK_COMMANDS.has(cmdLower)) {
 				if (!nonWhitelisted.includes(cmdName)) nonWhitelisted.push(cmdName);
+				dangerousPatterns.push(`${cmdName} (requires approval)`);
+				if (PATH_COMMANDS_WRITE.has(cmdLower)) {
+					hasWriteOperation = true;
+					filePaths.push(...extractPathArgs(cmdLower, tokens, cwd));
+				}
 				continue;
 			}
 

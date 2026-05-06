@@ -127,7 +127,7 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			title: `Webhook: ${msg.username}`,
 			status: "idle",
 			model: FOLLOW_DEFAULT_MODEL,
-			permissionMode: (config.defaultPermissionMode as any) ?? "bypassPermissions",
+			permissionMode: config.defaultPermissionMode ?? "default",
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: true,

@@ -35,12 +35,12 @@ function SettingsAgentPage() {
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
 				expandReasoning={expandReasoning}
 				setExpandReasoning={setExpandReasoning}
+				defaultStartInPlanMode={is.defaultStartInPlanMode}
+				setDefaultStartInPlanMode={is.setDefaultStartInPlanMode}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
-				yoloSkipReadOnlyConfirmations={is.yoloSkipReadOnlyConfirmations}
-				setYoloSkipReadOnlyConfirmations={is.setYoloSkipReadOnlyConfirmations}
-				smartInterruptionCheck={is.smartInterruptionCheck}
-				setSmartInterruptionCheck={is.setSmartInterruptionCheck}
+				dangerSkipReadOnlyConfirmations={is.dangerSkipReadOnlyConfirmations}
+				setDangerSkipReadOnlyConfirmations={is.setDangerSkipReadOnlyConfirmations}
 				maxTransientRetries={is.maxTransientRetries}
 				setMaxTransientRetries={is.setMaxTransientRetries}
 				retryBackoffCeilMs={is.retryBackoffCeilMs}

@@ -757,7 +757,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			params.requestDump?.setResponseBodyText(errText);
-			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(
+				response.status,
+				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
+			);
 		}
 
 		if (!response.body) {
@@ -944,7 +947,10 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(
+				response.status,
+				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
+			);
 		}
 
 		const raw = await response.text();
@@ -1026,7 +1032,10 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(
+				response.status,
+				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
+			);
 		}
 
 		const raw = await response.text();
@@ -1053,7 +1062,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(
+				response.status,
+				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
+			);
 		}
 
 		const isStreaming = body.stream === true;
@@ -1294,6 +1306,26 @@ function parseJsonWithPreview<T>(raw: string, errorPrefix: string): T {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`${errorPrefix}: ${message}. body preview=${raw.slice(0, 500)}`);
 	}
+}
+
+/**
+ * Extract a human-readable error message from an OpenAI API error response body.
+ * Attempts to parse JSON and extract the nested error.message field;
+ * falls back to the raw text if parsing fails or the field is missing.
+ */
+function extractApiErrorMessage(rawBody: string): string {
+	if (!rawBody) return "(empty response body)";
+	try {
+		const json = JSON.parse(rawBody);
+		// Standard OpenAI error format: { error: { message, type, code } }
+		if (json?.error?.message) return json.error.message;
+		// Some providers use a flat format: { message, type, code }
+		if (json?.message) return json.message;
+	} catch {
+		// Not JSON — return raw text (truncated for readability)
+	}
+	// Return raw body, truncated if very long
+	return rawBody.length > 500 ? `${rawBody.slice(0, 500)}...` : rawBody;
 }
 
 /** Parse a /responses JSON payload with a clearer error message. */

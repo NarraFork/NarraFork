@@ -11,10 +11,10 @@ import {
 } from "../settings";
 import {
 	extractErrorMessage,
+	isCompletionLimitReason,
 	isContextOverflowMessage,
 	isContextOverflowReason,
 	isContextWindowExceededError,
-	isOutputTruncationReason,
 	isRetryableError,
 	isRetryableInvalidStateReason,
 } from "./error-handling";
@@ -25,6 +25,7 @@ import { appendSideCarsForApi } from "./sidecar";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
+import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
 import {
@@ -34,7 +35,6 @@ import {
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
 } from "./tools/exit-plan-reflection";
-import { YOLO_REFLECTION_TOOLS } from "./tools/yolo-pause";
 import type {
 	AgentConfig,
 	AgentEvent,
@@ -318,6 +318,24 @@ const PARALLEL_TOOLS = new Set([
 
 const TODO_REMINDER_TOOL_INTERVAL = 4;
 
+const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
+	SHELL_TOOL_NAME,
+	"Shell",
+	"Execute",
+	"Agent",
+	"Write",
+	"Edit",
+	"Browser",
+	"Terminal",
+	"ShareFile",
+	"NarraForkAdmin",
+	"ForkNarrator",
+]);
+
+function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
+	return !EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name);
+}
+
 /** Whether a tool use should skip parallel grouping and early execution. */
 function isStrictSerial(tu: AgentToolUse): boolean {
 	return (
@@ -446,25 +464,27 @@ function bulletList(items: string[]): string {
 	return items.map((item) => `- ${item}`).join("\n");
 }
 
-function formatYoloDetails(details: string[] | undefined, locale: Locale): string {
+function formatDangerDetails(details: string[] | undefined, locale: Locale): string {
 	if (!details?.length) return "";
 	return locale === "zh-CN"
 		? `\n详情：\n${bulletList(details)}`
 		: `\nDetails:\n${bulletList(details)}`;
 }
 
-function buildYoloReflectionPrompt(
-	pause: NonNullable<ToolExecResult["yoloPause"]>,
+type DangerReflectionPermission = Extract<PermissionResult, { behavior: "dangerReflection" }>;
+
+function buildDangerReflectionPrompt(
+	pause: DangerReflectionPermission,
 	toolName: string,
 	input: Record<string, unknown>,
 	locale: Locale,
 ): string {
-	return getPrompt("yoloReflection", locale)
+	return getPrompt("dangerReflection", locale)
 		.replaceAll("{requestId}", pause.requestId)
 		.replaceAll("{toolName}", toolName)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
 		.replaceAll("{summary}", pause.danger.summary)
-		.replaceAll("{detailsSection}", formatYoloDetails(pause.danger.details, locale))
+		.replaceAll("{detailsSection}", formatDangerDetails(pause.danger.details, locale))
 		.replaceAll("{consequencesList}", bulletList(pause.danger.consequences))
 		.replaceAll("{alternativesList}", bulletList(pause.danger.saferAlternatives));
 }
@@ -504,12 +524,24 @@ export interface ReflectionLoopRunOptions {
 	label?: string;
 }
 
+export interface ReflectionLoopObservation {
+	assistantMessages: number;
+	assistantText: string;
+	assistantTextPreview: string;
+	toolCalls: string[];
+	toolResults: Array<{ toolName: string; isError: boolean; outputPreview: string }>;
+	errors: string[];
+	invalidStates: string[];
+}
+
 /**
  * Run a bounded nested agent loop for model self-checks or small decision gates.
  * The nested loop gets an isolated tool allowlist and no parent event/prompt hooks,
  * so callers can reuse the pattern without hand-rolling another agentLoop wrapper.
  */
-export async function runReflectionLoop(options: ReflectionLoopRunOptions): Promise<void> {
+export async function runReflectionLoop(
+	options: ReflectionLoopRunOptions,
+): Promise<ReflectionLoopObservation> {
 	const {
 		parentConfig,
 		history,
@@ -520,6 +552,15 @@ export async function runReflectionLoop(options: ReflectionLoopRunOptions): Prom
 		label = "reflection loop",
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
+	const observed: ReflectionLoopObservation = {
+		assistantMessages: 0,
+		assistantText: "",
+		assistantTextPreview: "",
+		toolCalls: [],
+		toolResults: [],
+		errors: [],
+		invalidStates: [],
+	};
 	const onParentAbort = () => abortController.abort();
 	parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
@@ -533,13 +574,41 @@ export async function runReflectionLoop(options: ReflectionLoopRunOptions): Prom
 			getSideCars: undefined,
 			shouldStop: undefined,
 			toolFilter: undefined,
-			permissionHandler: async (toolName, input, toolUseId) => {
+			permissionHandler: async (toolName) => {
 				if (allowedTools.has(toolName)) return { behavior: "allow" };
-				return parentConfig.permissionHandler(toolName, input, toolUseId);
+				return {
+					behavior: "deny",
+					rawMessage: true,
+					message:
+						`Reflection loop can only call allowed tools (${reflectionLoop.allowedTools.join(", ")}). ` +
+						`Tool "${toolName}" is not allowed in this reflection loop.`,
+				};
 			},
 		};
 		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
-			if (event.type === "error") {
+			if (event.type === "assistant_message") {
+				observed.assistantMessages++;
+				if (event.text) {
+					observed.assistantText = `${observed.assistantText}${event.text}`.slice(0, 4000);
+				}
+				if (!observed.assistantTextPreview && event.text) {
+					observed.assistantTextPreview = event.text.slice(0, 500);
+				}
+				for (const toolUse of event.toolUses) {
+					observed.toolCalls.push(toolUse.name);
+				}
+			} else if (event.type === "tool_call") {
+				observed.toolCalls.push(event.toolName);
+			} else if (event.type === "tool_result") {
+				observed.toolResults.push({
+					toolName: event.toolName,
+					isError: event.isError,
+					outputPreview: event.output.slice(0, 500),
+				});
+			} else if (event.type === "invalid_state") {
+				observed.invalidStates.push(`${event.reason}: ${event.message}`);
+			} else if (event.type === "error") {
+				observed.errors.push(event.message);
 				logger.warn(`${label} ended with error`, {
 					narratorId: parentConfig.narratorId,
 					kind: reflectionLoop.context.kind,
@@ -548,27 +617,37 @@ export async function runReflectionLoop(options: ReflectionLoopRunOptions): Prom
 				});
 			}
 		}
+		if (observed.toolCalls.length === 0 || observed.toolResults.some((result) => result.isError)) {
+			logger.warn(`${label} completed without a successful reflection tool decision`, {
+				narratorId: parentConfig.narratorId,
+				kind: reflectionLoop.context.kind,
+				requestId: reflectionLoop.context.requestId,
+				allowedTools: reflectionLoop.allowedTools,
+				...observed,
+			});
+		}
+		return observed;
 	} finally {
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
 	}
 }
 
-async function runYoloReflectionLoop(
+async function runDangerReflectionLoop(
 	parentConfig: AgentConfig,
 	history: unknown[],
-	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 	reflectionAbort: AbortController,
-): Promise<void> {
+): Promise<ReflectionLoopObservation> {
 	const locale = (parentConfig.locale as Locale) ?? "en";
-	await runReflectionLoop({
+	return runReflectionLoop({
 		parentConfig,
 		history,
-		prompt: buildYoloReflectionPrompt(pause, toolUse.name, toolUse.input, locale),
+		prompt: buildDangerReflectionPrompt(pause, toolUse.name, pause.input, locale),
 		reflectionLoop: {
-			allowedTools: [...YOLO_REFLECTION_TOOLS],
+			allowedTools: [...DANGER_REFLECTION_TOOLS],
 			context: {
-				kind: "yoloPause",
+				kind: "dangerReflection",
 				requestId: pause.requestId,
 				toolUseId: toolUse.toolUseId,
 				data: {
@@ -579,7 +658,7 @@ async function runYoloReflectionLoop(
 		},
 		abortController: reflectionAbort,
 		maxTurns: 1,
-		label: "YOLO reflection loop",
+		label: "Danger reflection loop",
 	});
 }
 
@@ -613,28 +692,44 @@ async function runExitPlanModeReflectionLoop(
 	});
 }
 
-function buildYoloDeniedToolResult(decision: PermissionResult, locale: Locale): ToolExecResult {
-	const reason =
-		decision.behavior === "deny" && decision.message?.trim()
-			? decision.message.trim()
-			: "YOLO safety pause cancelled. The operation was not executed.";
-	return {
-		output: getToolMessageWithParams("permissionDeniedWithMessage", locale, { message: reason }),
-		isError: true,
-		durationMs: 0,
-		completedAt: Date.now(),
-	};
+function parseDangerReflectionTextFallback(
+	text: string,
+): { action: "confirm"; reflection?: string } | { action: "cancel"; reason?: string } | null {
+	const match = text.match(/<DangerDecision>\s*([\s\S]*?)\s*<\/DangerDecision>/i);
+	if (!match) return null;
+	try {
+		const parsed = JSON.parse(match[1]) as {
+			action?: unknown;
+			reflection?: unknown;
+			reason?: unknown;
+		};
+		if (parsed.action === "confirm") {
+			return {
+				action: "confirm",
+				reflection: typeof parsed.reflection === "string" ? parsed.reflection : undefined,
+			};
+		}
+		if (parsed.action === "cancel") {
+			return {
+				action: "cancel",
+				reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+			};
+		}
+	} catch {
+		return null;
+	}
+	return null;
 }
 
-async function resolveYoloPauseDecision(
+async function resolveDangerReflectionDecision(
 	config: AgentConfig,
 	history: unknown[],
-	pause: NonNullable<ToolExecResult["yoloPause"]>,
+	pause: DangerReflectionPermission,
 	toolUse: AgentToolUse,
 ): Promise<PermissionResult> {
 	const reflectionAbort = new AbortController();
 	let reflectionDone = false;
-	const reflectionPromise = runYoloReflectionLoop(
+	const reflectionPromise = runDangerReflectionLoop(
 		config,
 		history,
 		pause,
@@ -645,11 +740,23 @@ async function resolveYoloPauseDecision(
 	});
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
-		reflectionPromise.then(async () => {
+		reflectionPromise.then(async (observed) => {
+			const textFallback = parseDangerReflectionTextFallback(observed.assistantText);
+			if (textFallback) {
+				const { cancelDangerReflection, confirmDangerReflection } = await import(
+					"@server/services/narrator-permission"
+				);
+				const resolved =
+					textFallback.action === "confirm"
+						? await confirmDangerReflection(pause.requestId, textFallback.reflection)
+						: await cancelDangerReflection(pause.requestId, textFallback.reason);
+				if (resolved) return pause.decision;
+			}
+
 			const fallbackMessage =
-				"YOLO reflection loop did not call YoloConfirm or YoloCancel in its single allowed response";
-			const { cancelYoloPause } = await import("@server/services/narrator-permission");
-			const cancelled = await cancelYoloPause(pause.requestId, fallbackMessage);
+				"Danger reflection loop did not call DangerConfirm or DangerCancel in its single allowed response";
+			const { cancelDangerReflection } = await import("@server/services/narrator-permission");
+			const cancelled = await cancelDangerReflection(pause.requestId, fallbackMessage);
 			if (cancelled) return pause.decision;
 
 			// If the cancellation path could not find the pending request, do not leave the
@@ -665,7 +772,7 @@ async function resolveYoloPauseDecision(
 	]);
 	if (!reflectionDone) {
 		reflectionPromise.catch((err) => {
-			logger.warn("YOLO reflection loop cleanup failed", { err: String(err) });
+			logger.warn("Danger reflection loop cleanup failed", { err: String(err) });
 		});
 	}
 	return decision;
@@ -769,8 +876,9 @@ async function executeToolAfterReflections(
 	if (
 		tu.name === "ExitPlanMode" &&
 		config.planMode &&
+		config.relaxedPlan &&
 		!config.reflectionLoop &&
-		config.previousPermissionMode === "bypassPermissions"
+		config.permissionMode === "bypassPermissions"
 	) {
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
 		tu.input = reflected.input;
@@ -802,20 +910,22 @@ export async function* agentLoop(
 	const locale = (config.locale as Locale) ?? "en";
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
-	// This prevents concurrent permission prompts / YOLO pauses from racing each other.
+	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
 	let permissionTail: Promise<void> = Promise.resolve();
 	config.permissionHandler = async (toolName, input, toolUseId) => {
-		const run = permissionTail.then(() => originalPermissionHandler(toolName, input, toolUseId));
+		const run = permissionTail.then(async () => {
+			const result = await originalPermissionHandler(toolName, input, toolUseId);
+			if (result.behavior !== "dangerReflection") return result;
+
+			return resolveDangerReflectionDecision(config, history, result, {
+				toolUseId,
+				name: toolName,
+				input: result.input,
+			});
+		});
 		permissionTail = run.then(
-			async (result) => {
-				// A YOLO pause returns immediately with a deferred decision. Keep subsequent
-				// permission checks queued until that pause is confirmed/cancelled, otherwise
-				// later tool calls can open new prompts while the original call is still pending.
-				if (result.behavior === "yoloPause") {
-					await result.decision.catch(() => undefined);
-				}
-			},
+			() => undefined,
 			() => undefined,
 		);
 		return run;
@@ -1339,7 +1449,8 @@ export async function* agentLoop(
 							if (
 								!earlyExecMap.has(tu.toolUseId) &&
 								!isStrictSerial(tu) &&
-								!eagerExecutionBlocked
+								!eagerExecutionBlocked &&
+								shouldEagerExecuteTool(tu)
 							) {
 								const execPromise = executeTool(tu, config).catch(
 									(err): ToolExecResult => ({
@@ -1633,7 +1744,7 @@ export async function* agentLoop(
 									// streaming loop can drain completed results without awaiting.
 									// Skip after a strict-serial barrier — those tools must execute
 									// in final group order after preceding tools complete.
-									if (!isStrictSerial(tu) && !eagerExecutionBlocked) {
+									if (!isStrictSerial(tu) && !eagerExecutionBlocked && shouldEagerExecuteTool(tu)) {
 										const execPromise = executeTool(tu, config).catch(
 											(err): ToolExecResult => ({
 												output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
@@ -1661,9 +1772,6 @@ export async function* agentLoop(
 									for (const prevTu of toolUses) {
 										const sr = settledResults.get(prevTu.toolUseId);
 										if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-										// YOLO pause is not a real result for the original tool call.
-										// Keep the original call pending until the reflection loop or user resolves it.
-										if (sr.yoloPause) continue;
 										yieldedToolResults.add(prevTu.toolUseId);
 										if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
 										if (sr.updatedInput) prevTu.input = sr.updatedInput;
@@ -1952,6 +2060,17 @@ export async function* agentLoop(
 							yield { type: "context_length_exceeded", message };
 							return;
 						}
+						if (isCompletionLimitReason(reason)) {
+							logger.info("Provider hit completion token limit", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								reason,
+								message,
+							});
+							yield { type: "output_truncated", message };
+							continue;
+						}
 						if (isRetryableInvalidStateReason(reason, message)) {
 							// In-loop retry: skip block_complete persistence and retry
 							// the same chat() call with identical parameters.
@@ -1988,29 +2107,20 @@ export async function* agentLoop(
 							yield { type: "retryable_error", message };
 							return;
 						}
-						// Output truncated by max_tokens — not an error, let smart
-						// interruption check handle the auto-continue.
-						if (isOutputTruncationReason(reason)) {
-							yield { type: "output_truncated", message };
-							// Don't return — fall through to yield assistant_message
-							// so the truncated content is persisted normally.
-						} else {
-							// Non-retryable, non-truncation invalidState — treat as a
-							// terminal error.  Flush any partial content and return
-							// immediately so the original error surfaces to the user
-							// instead of being masked by the downstream empty-response
-							// check (which would retry and eventually report a misleading
-							// "Provider returned an empty response" message).
-							sawErrorEvent = true;
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-							yield* finishRequest(message);
-							yield {
-								type: "invalid_state",
-								reason,
-								message,
-							};
-							return;
-						}
+						// Non-retryable invalidState — treat as a terminal error.
+						// Flush any partial content and return immediately so the original
+						// error surfaces to the user instead of being masked by the
+						// downstream empty-response check (which would retry and eventually
+						// report a misleading "Provider returned an empty response" message).
+						sawErrorEvent = true;
+						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* finishRequest(message);
+						yield {
+							type: "invalid_state",
+							reason,
+							message,
+						};
+						return;
 					}
 				}
 				yield* flushRequestStart();
@@ -2360,126 +2470,78 @@ export async function* agentLoop(
 		// Detect orphaned tool uses — tool calls whose streaming input was cut off
 		// before receiving a stop signal (typically due to API max_tokens truncation).
 		// These are silently dropped by the accumulator, so we must detect and handle them.
-		const hasOrphanedToolUses = toolUseAccum.size > 0;
-		if (hasOrphanedToolUses) {
-			const orphanedNames = [...toolUseAccum.values()].map((a) => a.name).join(", ");
-			toolUseAccum.clear();
+		const orphanedToolNames = [...toolUseAccum.values()].map((acc) => acc.name).filter(Boolean);
+		const hasOrphanedToolUses = orphanedToolNames.length > 0;
+		if (hasOrphanedToolUses) toolUseAccum.clear();
 
-			// Yield accumulated content before truncation
-			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+		// Yield accumulated content before assistant_message so partial-block
+		// persistence is finalized for both normal and truncated turns.
+		yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 
-			// Drain settled tool results before assistant_message so the DB
-			// has correct tool call statuses when the message is broadcast.
-			for (const tu of toolUses) {
-				const sr = settledResults.get(tu.toolUseId);
-				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
-				yieldedToolResults.add(tu.toolUseId);
-				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (sr.updatedInput) tu.input = sr.updatedInput;
-				const brokenOverride = sr.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
-				yield {
-					type: "tool_result",
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
-					isError: sr.isError ?? false,
-					durationMs: sr.durationMs,
-					permissionStartedAt: sr.permissionStartedAt,
-					executionStartedAt: sr.executionStartedAt,
-					completedAt: sr.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride,
-					metadata: sr.metadata,
-				};
-				if (sr.fatal) {
-					yield { type: "error", message: sr.output };
-					return;
-				}
-			}
-
-			// Persist the assistant message (only the complete tool calls survive)
+		// Drain settled tool results before assistant_message so the DB
+		// has correct tool call statuses when the message is broadcast.
+		for (const tu of toolUses) {
+			const sr = settledResults.get(tu.toolUseId);
+			if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
+			yieldedToolResults.add(tu.toolUseId);
+			if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
+			if (sr.updatedInput) tu.input = sr.updatedInput;
+			const brokenOverride = sr.broken ? sanitizeBrokenInput(tu.name, tu.input, locale) : undefined;
 			yield {
-				type: "assistant_message",
-				text: assistantText,
-				toolUses,
-				messageId,
-				credentialId,
+				type: "tool_result",
+				toolUseId: tu.toolUseId,
+				toolName: tu.name,
+				output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+				isError: sr.isError ?? false,
+				durationMs: sr.durationMs,
+				permissionStartedAt: sr.permissionStartedAt,
+				executionStartedAt: sr.executionStartedAt,
+				completedAt: sr.completedAt,
+				brokenInputOverride: brokenOverride,
+				updatedInput: brokenOverride,
+				metadata: sr.metadata,
 			};
+			if (sr.fatal) {
+				yield { type: "error", message: sr.output };
+				return;
+			}
+		}
 
+		// Yield the complete assistant message on every successful turn. Event consumers
+		// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
+		yield {
+			type: "assistant_message",
+			text: assistantText,
+			toolUses,
+			messageId,
+			credentialId,
+		};
+
+		if (hasOrphanedToolUses) {
+			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
+				toolNames: orphanedToolNames.join(", "),
+			});
 			if (toolUses.length === 0) {
-				// No complete tool calls at all — push the text-only assistant turn
-				// and inject a reminder so the model retries with a different strategy.
+				if (isFirstTurn) {
+					provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? []);
+				} else if (pendingToolResults.length > 0) {
+					provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
+				}
 				provider.pushAssistantTurn(
 					history,
 					assistantText,
 					[],
 					collectReasoningBlocks(reasoningBlockMap),
 					collectCompletedWebSearches(webSearchAccum),
-					undefined,
+					messageId,
 					collectCompletedImageGenerations(imageGenAccum),
 					textOutputIndex,
 					redactedThinkingBlocks,
 				);
-				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-					toolNames: orphanedNames,
-				});
 				yield { type: "turn_complete", turnIndex };
 				turnIndex++;
 				continue;
 			}
-			// Some complete tool calls exist alongside orphaned ones — fall through
-			// to execute them. The orphaned ones are already gone from toolUses.
-			// Set nextTurnContent so the model gets a reminder after execution.
-			nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
-				toolNames: orphanedNames,
-			});
-		}
-
-		if (!hasOrphanedToolUses) {
-			// Yield block_complete for accumulated content now that streaming is done
-			yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
-
-			// Drain settled tool results before assistant_message so the DB
-			// has correct tool call statuses when the message is broadcast.
-			for (const tu of toolUses) {
-				const sr = settledResults.get(tu.toolUseId);
-				if (!sr || yieldedToolResults.has(tu.toolUseId)) continue;
-				yieldedToolResults.add(tu.toolUseId);
-				if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
-				if (sr.updatedInput) tu.input = sr.updatedInput;
-				const brokenOverride = sr.broken
-					? sanitizeBrokenInput(tu.name, tu.input, locale)
-					: undefined;
-				yield {
-					type: "tool_result",
-					toolUseId: tu.toolUseId,
-					toolName: tu.name,
-					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
-					isError: sr.isError ?? false,
-					durationMs: sr.durationMs,
-					permissionStartedAt: sr.permissionStartedAt,
-					executionStartedAt: sr.executionStartedAt,
-					completedAt: sr.completedAt,
-					brokenInputOverride: brokenOverride,
-					updatedInput: brokenOverride,
-					metadata: sr.metadata,
-				};
-				if (sr.fatal) {
-					yield { type: "error", message: sr.output };
-					return;
-				}
-			}
-
-			// Yield the complete assistant message
-			yield {
-				type: "assistant_message",
-				text: assistantText,
-				toolUses,
-				messageId,
-				credentialId,
-			};
 		}
 
 		// No tool calls → we're done
@@ -2542,22 +2604,9 @@ export async function* agentLoop(
 				// Serial execution (single tool)
 				const tu = group[0];
 				const earlyPromise = earlyExecMap.get(tu.toolUseId);
-				let result = earlyPromise
+				const result = earlyPromise
 					? await earlyPromise
 					: await executeToolAfterReflections(tu, config, history, locale);
-				if (result.yoloPause) {
-					const yoloDecision = await resolveYoloPauseDecision(
-						config,
-						history,
-						result.yoloPause,
-						tu,
-					);
-					if (yoloDecision.behavior === "allow") {
-						result = await executeTool(tu, config, { preGrantedPermission: yoloDecision });
-					} else {
-						result = buildYoloDeniedToolResult(yoloDecision, locale);
-					}
-				}
 				if (result.broken) brokenToolUseIds.add(tu.toolUseId);
 				// When the permission handler redirected the input (e.g. conclusion file),
 				// update the in-memory tool_use so pushAssistantTurn writes the correct
@@ -2681,23 +2730,7 @@ export async function* agentLoop(
 					remaining = new Set([...remaining].filter((p) => p !== indexed[i]));
 
 					const tu = group[i];
-					let effectiveResult = result;
-					if (effectiveResult.yoloPause) {
-						const yoloDecision = await resolveYoloPauseDecision(
-							config,
-							history,
-							effectiveResult.yoloPause,
-							tu,
-						);
-						if (yoloDecision.behavior === "allow") {
-							effectiveResult = await executeTool(tu, config, {
-								preGrantedPermission: yoloDecision,
-							});
-						} else {
-							effectiveResult = buildYoloDeniedToolResult(yoloDecision, locale);
-						}
-						settled[i] = effectiveResult;
-					}
+					const effectiveResult = result;
 					if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
 					const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);

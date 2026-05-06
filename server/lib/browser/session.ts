@@ -1,11 +1,18 @@
 // Browser session management for the Browser tool.
 // Each narrator can hold multiple named sessions with automatic TTL cleanup.
 
-import type { BrowserContext, ConsoleMessage, Page } from "puppeteer-core";
+import type {
+	BrowserContext,
+	ConsoleMessage,
+	HTTPRequest,
+	HTTPResponse,
+	Page,
+} from "puppeteer-core";
 import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
+import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 
 /** Default session TTL: 10 minutes of inactivity. */
 const SESSION_TTL_MS = 10 * 60 * 1000;
@@ -13,6 +20,10 @@ const SESSION_TTL_MS = 10 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 /** Maximum console messages kept per session. */
 const MAX_CONSOLE_MESSAGES = 200;
+/** Maximum network requests kept per session. */
+const MAX_NETWORK_REQUESTS = 500;
+/** Maximum request body characters kept per request. */
+const MAX_POST_DATA_LENGTH = 4_000;
 
 export interface BrowserConsoleMessage {
 	type: string;
@@ -23,6 +34,23 @@ export interface BrowserConsoleMessage {
 		lineNumber?: number;
 		columnNumber?: number;
 	};
+}
+
+export interface BrowserNetworkRequest {
+	id: string;
+	url: string;
+	method: string;
+	resourceType: string;
+	startedAt: number;
+	requestHeaders: Record<string, string>;
+	postData?: string;
+	status?: number;
+	statusText?: string;
+	responseHeaders?: Record<string, string>;
+	finishedAt?: number;
+	durationMs?: number;
+	failed?: boolean;
+	failureText?: string;
 }
 
 export interface BrowserSession {
@@ -38,6 +66,10 @@ export interface BrowserSession {
 	headless: boolean;
 	/** Recent console output and page errors captured from the page. */
 	consoleMessages: BrowserConsoleMessage[];
+	/** Recent network requests captured from the page. */
+	networkRequests: BrowserNetworkRequest[];
+	/** Internal lookup for in-flight network requests. */
+	networkRequestMap: WeakMap<HTTPRequest, BrowserNetworkRequest>;
 	/** Performance tracing state. */
 	tracing?: { active: boolean; startedAt: number };
 }
@@ -90,6 +122,50 @@ function pushConsoleMessage(
 	}
 }
 
+function normalizeHeaders(
+	headers: Record<string, string | string[] | undefined>,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(headers).map(([key, value]) => [
+			key,
+			Array.isArray(value) ? value.join(", ") : (value ?? ""),
+		]),
+	);
+}
+
+function truncatePostData(postData: string | undefined): string | undefined {
+	if (postData === undefined) return undefined;
+	if (postData.length <= MAX_POST_DATA_LENGTH) return postData;
+	return `${postData.slice(0, MAX_POST_DATA_LENGTH)}\n\n[Post data truncated at ${MAX_POST_DATA_LENGTH} characters]`;
+}
+
+function pushNetworkRequest(
+	session: BrowserSession,
+	request: HTTPRequest,
+	entry: BrowserNetworkRequest,
+): void {
+	session.networkRequests.push(entry);
+	session.networkRequestMap.set(request, entry);
+	if (session.networkRequests.length > MAX_NETWORK_REQUESTS) {
+		session.networkRequests.splice(0, session.networkRequests.length - MAX_NETWORK_REQUESTS);
+	}
+}
+
+function finalizeNetworkRequest(
+	session: BrowserSession,
+	request: HTTPRequest,
+	updates: Partial<BrowserNetworkRequest>,
+): void {
+	const item = session.networkRequestMap.get(request);
+	if (!item) return;
+	const finishedAt = Date.now();
+	Object.assign(item, {
+		...updates,
+		finishedAt,
+		durationMs: finishedAt - item.startedAt,
+	});
+}
+
 function attachConsoleListeners(page: Page, session: BrowserSession): void {
 	page.on("console", (msg: ConsoleMessage) => {
 		const location = msg.location();
@@ -109,6 +185,36 @@ function attachConsoleListeners(page: Page, session: BrowserSession): void {
 		pushConsoleMessage(session, {
 			type: "pageerror",
 			text,
+		});
+	});
+}
+
+function attachNetworkListeners(page: Page, session: BrowserSession): void {
+	page.on("request", (request: HTTPRequest) => {
+		const requestHeaders = normalizeHeaders(request.headers());
+		pushNetworkRequest(session, request, {
+			id: generateShortId(),
+			url: redactUrl(request.url()),
+			method: request.method(),
+			resourceType: request.resourceType(),
+			startedAt: Date.now(),
+			requestHeaders: redactHeaders(requestHeaders),
+			postData: truncatePostData(redactPostData(request.postData(), requestHeaders)),
+		});
+	});
+
+	page.on("response", (response: HTTPResponse) => {
+		finalizeNetworkRequest(session, response.request(), {
+			status: response.status(),
+			statusText: response.statusText(),
+			responseHeaders: redactHeaders(normalizeHeaders(response.headers())),
+		});
+	});
+
+	page.on("requestfailed", (request: HTTPRequest) => {
+		finalizeNetworkRequest(session, request, {
+			failed: true,
+			failureText: request.failure()?.errorText ?? "Request failed",
 		});
 	});
 }
@@ -141,10 +247,24 @@ export async function createSession(
 		lastActivity: Date.now(),
 		headless,
 		consoleMessages: [],
+		networkRequests: [],
+		networkRequestMap: new WeakMap(),
 	};
 	attachConsoleListeners(page, session);
+	attachNetworkListeners(page, session);
 
-	await page.goto(url, { waitUntil: "domcontentloaded" });
+	try {
+		await page.goto(url, { waitUntil: "domcontentloaded" });
+	} catch (err) {
+		await context.close().catch((closeErr) => {
+			logger.warn("Failed to close browser context after initial navigation failure", {
+				narratorId,
+				sessionId,
+				error: String(closeErr),
+			});
+		});
+		throw err;
+	}
 
 	let map = sessions.get(narratorId);
 	if (!map) {
@@ -237,6 +357,7 @@ export function listSessions(narratorId: string): Array<{
 	lastActivity: number;
 	headless: boolean;
 	tracing: { active: boolean; startedAt: number } | null;
+	networkRequestCount: number;
 }> {
 	const map = sessions.get(narratorId);
 	if (!map) return [];
@@ -246,6 +367,7 @@ export function listSessions(narratorId: string): Array<{
 		lastActivity: s.lastActivity,
 		headless: s.headless,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
+		networkRequestCount: s.networkRequests.length,
 	}));
 }
 

@@ -314,7 +314,7 @@ async function executeTask(
 			title: `Bench: ${task.name}`,
 			model: run.model,
 			systemPrompt: run.systemPrompt ?? undefined,
-			permissionMode: (run.permissionMode as "bypassPermissions") ?? "bypassPermissions",
+			permissionMode: run.permissionMode ?? "bypassPermissions",
 			cwd: workDir,
 		});
 

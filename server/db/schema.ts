@@ -227,9 +227,11 @@ export const narrators = sqliteTable(
 		pendingModelRestore: text("pending_model_restore"),
 		systemPrompt: text("system_prompt"),
 		permissionMode: text("permission_mode", {
-			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"],
+			enum: ["default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk"],
 		}).default("default"),
 		previousPermissionMode: text("previous_permission_mode"),
+		/** Persistent ID for the designated .narrafork/plan-{id}.md file while in plan mode. */
+		planFileId: text("plan_file_id"),
 		reasoningEffort: text("reasoning_effort", {
 			enum: ["none", "low", "medium", "high", "xhigh"],
 		}),

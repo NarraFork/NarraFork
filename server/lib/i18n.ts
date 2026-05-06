@@ -139,6 +139,10 @@ Latest TODO list from narrator state:
 		"zh-CN":
 			'[计划模式] 注意：你的写入目标已从 "{originalPath}" 重定向到指定的计划文件 "{planFile}"。在计划模式下，请直接使用正确的计划文件路径。',
 	},
+	"tool.planModeCancelled": {
+		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
+		"zh-CN": "计划模式已被用户取消。除非用户再次要求规划，否则不要提交或执行此计划。",
+	},
 	"tool.todoWriteOutput": {
 		en: "Updated todos: {total} total ({completed} completed, {inProgress} in progress, {pending} pending)",
 		"zh-CN":
@@ -194,8 +198,8 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 			"工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。",
 	},
 	"tool.interruptionContinue": {
-		en: "Your previous response appears to have been cut off. Please continue from where you left off.",
-		"zh-CN": "你上一条回复似乎被截断了，请从中断处继续。",
+		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
+		"zh-CN": "你上一条回复因 completion token 限制被截断，请从中断处继续。",
 	},
 	"tool.userContinue": {
 		en: "Continue.",
@@ -513,6 +517,7 @@ export type ToolMessageKey =
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
 	| "planModeFileRedirected"
+	| "planModeCancelled"
 	| "todoWriteOutput"
 	| "todoReminder"
 	| "suggestAnswerSystem"

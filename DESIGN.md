@@ -305,9 +305,10 @@ export const narrators = sqliteTable('narrators', {
   model: text('model').default('claude-sonnet'),
   systemPrompt: text('system_prompt'),             // 额外的 system prompt
   permissionMode: text('permission_mode', {
-    enum: ['default', 'acceptEdits', 'bypassPermissions', 'readOnly', 'plan', 'dontAsk']
+    enum: ['default', 'acceptEdits', 'bypassPermissions', 'readOnly', 'dontAsk']
   }).default('default'),
-  previousPermissionMode: text('previous_permission_mode'),  // 切换前的权限模式
+  previousPermissionMode: text('previous_permission_mode'),  // 旧版 plan 迁移/UI 上下文
+  planFileId: text('plan_file_id'),          // plan trait 激活时的 .narrafork/plan-{id}.md
   reasoningEffort: text('reasoning_effort', {      // 推理努力级别
     enum: ['low', 'medium', 'high', 'xhigh']
   }),
@@ -906,11 +907,11 @@ Compact 机制：
 - 内存中维护 `Map<narratorId, { query, abortController }>` 用于中断控制
 - `startSession()` 是异步生成器，内部处理每条消息：持久化 assistant 消息、更新统计、广播到 WebSocket
 - 两阶段标题生成：首条用户消息时立即调用 `generateQuickTitle()` 生成快速标题（不等 AI 回复），session 结束后再调用 `generateAndSetTitle()` 生成更准确的标题（会 await quickTitle 完成以避免竞态）
-- 权限模式自动处理：
-  - `default` 模式：启用 `canUseTool` 回调，走完整审批流程
-  - `acceptEdits` 模式：自动允许 `Edit`/`Write`/`NotebookEdit`/`MultiEdit` 工具，其余走审批
-  - `bypassPermissions` / `dontAsk` 模式：跳过所有权限检查
-  - `plan` 模式：进入 plan 模式（只读分析，不执行写操作）
+- 权限与计划模式自动处理：
+  - `default` 权限模式：启用 `canUseTool` 回调，走完整审批流程
+  - `acceptEdits` 权限模式：自动允许 `Edit`/`Write`/`NotebookEdit` 工具，其余走审批
+  - `bypassPermissions` / `dontAsk` 权限模式：跳过/拒绝权限检查
+  - plan mode 不再是权限模式，而是 narrator trait overlay；默认限制为只读，仅允许写入指定 `.narrafork/plan-{id}.md`，用户批准 `ExitPlanMode` 后才进入执行阶段
 - `canUseTool` 对 `TodoWrite`/`TodoRead` 工具自动允许（白名单），不需要用户审批
 - 权限审批流程：创建 tool_call 记录（status: initializing）→ 判断权限决策（auto allow/deny/ask）→ 需要用户审批时更新 status 为 pending → WebSocket 推送 `permission_request` → 等待决定（5 分钟超时，超时自动拒绝，`permissionDecidedBy: "auto_timeout"`）→ 更新 tool_call 记录 → 返回 Agent Loop。权限状态直接记录在 `narrator_tool_calls` 表上，无独立的 `permission_requests` 表
 - "Allow with feedback" 流程：用户批准权限时附带 `feedbackText`，session 在当前 tool 完成后中断，feedbackText 作为下一条用户消息自动发送

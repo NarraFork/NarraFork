@@ -4,7 +4,7 @@
 import { writeFile } from "node:fs/promises";
 import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
-import type { BrowserConsoleMessage, BrowserSession } from "./session";
+import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
 import { touchSession } from "./session";
 
 const DEFAULT_MAX_LENGTH = 20_000;
@@ -29,6 +29,39 @@ function formatConsoleLocation(message: BrowserConsoleMessage): string {
 	const line = location.lineNumber !== undefined ? `:${location.lineNumber}` : "";
 	const column = location.columnNumber !== undefined ? `:${location.columnNumber}` : "";
 	return ` (${location.url}${line}${column})`;
+}
+
+function formatNetworkRequest(request: BrowserNetworkRequest): string {
+	const time = new Date(request.startedAt).toISOString();
+	const status = request.failed
+		? `FAILED ${request.failureText ?? ""}`.trim()
+		: request.status !== undefined
+			? `${request.status} ${request.statusText ?? ""}`.trim()
+			: "PENDING";
+	const duration = request.durationMs !== undefined ? ` ${request.durationMs}ms` : "";
+	return `[${time}] ${request.method} ${status} ${request.resourceType}${duration} ${request.url}`;
+}
+
+function filterNetworkRequests(
+	requests: BrowserNetworkRequest[],
+	filter: string | undefined,
+): BrowserNetworkRequest[] {
+	if (!filter) return requests;
+	const needle = filter.toLowerCase();
+	return requests.filter((request) => {
+		const haystack = [
+			request.url,
+			request.method,
+			request.resourceType,
+			request.status?.toString(),
+			request.statusText,
+			request.failureText,
+		]
+			.filter(Boolean)
+			.join(" ")
+			.toLowerCase();
+		return haystack.includes(needle);
+	});
 }
 
 /** Navigate to a URL or go back/forward. */
@@ -223,6 +256,52 @@ export async function getConsole(
 	return {
 		output,
 		count,
+		snapshot: await snapshot(session.page),
+	};
+}
+
+/** Get captured network requests. */
+export async function getNetwork(
+	session: BrowserSession,
+	opts?: { maxLength?: number; clear?: boolean; filter?: string; includeDetails?: boolean },
+): Promise<{ output: string; count: number; totalCount: number; snapshot: PageSnapshot }> {
+	touchSession(session);
+	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
+	const totalCount = session.networkRequests.length;
+	const requests = filterNetworkRequests(session.networkRequests, opts?.filter);
+	const count = requests.length;
+
+	const lines = requests.map((request) => {
+		if (!opts?.includeDetails) return formatNetworkRequest(request);
+		return [
+			formatNetworkRequest(request),
+			`  requestHeaders: ${JSON.stringify(request.requestHeaders)}`,
+			request.postData ? `  postData: ${request.postData}` : undefined,
+			request.responseHeaders
+				? `  responseHeaders: ${JSON.stringify(request.responseHeaders)}`
+				: undefined,
+		]
+			.filter(Boolean)
+			.join("\n");
+	});
+
+	let output = lines.join("\n");
+	if (!output) {
+		output = opts?.filter
+			? `No network requests matched filter: ${opts.filter}`
+			: "No network requests captured.";
+	}
+	if (output.length > maxLength) {
+		output = `${output.slice(0, maxLength)}\n\n[Network output truncated at ${maxLength} characters]`;
+	}
+	if (opts?.clear) {
+		session.networkRequests.length = 0;
+		session.networkRequestMap = new WeakMap();
+	}
+	return {
+		output,
+		count,
+		totalCount,
 		snapshot: await snapshot(session.page),
 	};
 }

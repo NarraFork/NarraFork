@@ -22,10 +22,14 @@ import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
+	addTrait,
+	isPlanModeTrait,
 	isReadOnlySubagentVariant,
 	isSubagentVariant,
 	parseSubstatus,
+	parseTraits,
 } from "../lib/narrator-utils";
+import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
@@ -124,6 +128,11 @@ import {
 	triggerMidTurnCompact,
 } from "./narrator-compact";
 import { handlePermission } from "./narrator-permission";
+import {
+	ensureNarratorPlanFileId,
+	enterNarratorPlanMode,
+	exitNarratorPlanMode,
+} from "./narrator-plan-mode";
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
@@ -251,11 +260,13 @@ async function createNarrator(
 		narratorCwd = narrator.cwd || getHome();
 	}
 
-	// Generate planFileId if narrator is already in plan mode (e.g. server restart recovery).
-	// A new ID is generated each time — any previously written plan file from a prior session
-	// becomes orphaned, but the model will use the new file path from the refreshed system prompt.
-	const isPlanMode = narrator.permissionMode === "plan";
-	const planFileId = isPlanMode ? generateWordSlug() : undefined;
+	// Restore or create the persistent plan file ID if the narrator is already in plan mode
+	// (e.g. server restart recovery). Keeping this stable prevents file-based plans from
+	// becoming orphaned when the active narrator is recreated.
+	const isPlanMode = isPlanModeTrait(narrator.traits);
+	const planFileId = isPlanMode
+		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
+		: undefined;
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
@@ -418,14 +429,10 @@ async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
 
 async function maybeStartGoalContinuation(
 	active: ActiveNarrator,
-	freshNarrator: { permissionMode?: string | null },
+	freshNarrator: { permissionMode?: string | null; traits?: unknown },
 	loopHadError: boolean,
 ): Promise<string | null> {
-	if (
-		loopHadError ||
-		freshNarrator.permissionMode === "plan" ||
-		active._goalContinuationSuppressed
-	) {
+	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._goalContinuationSuppressed) {
 		return null;
 	}
 	const goals = await narratorGoalService.listGoals(active.narratorId);
@@ -710,7 +717,7 @@ export async function runAgentLoop(
 	/** How many consecutive transient-error retries in this runAgentLoop call. */
 	let transientRetries = 0;
 
-	/** How many consecutive smart-interruption auto-continues in this runAgentLoop call. */
+	/** How many consecutive completion-limit auto-continues in this runAgentLoop call. */
 	let interruptionRetries = 0;
 	const MAX_INTERRUPTION_RETRIES = 3;
 
@@ -774,7 +781,7 @@ export async function runAgentLoop(
 				active.cwd,
 				locale,
 				active._replyInUserLanguage ?? false,
-				freshNarrator.permissionMode === "plan",
+				isPlanModeTrait(freshNarrator.traits),
 				active._planFileId,
 			);
 			active.systemPrompt = freshSystemPrompt;
@@ -862,7 +869,7 @@ export async function runAgentLoop(
 						active.cwd,
 						locale,
 						active._replyInUserLanguage ?? false,
-						freshNarrator.permissionMode === "plan",
+						isPlanModeTrait(freshNarrator.traits),
 						active._planFileId,
 						settings.agent.defaultSystemPrompt,
 					);
@@ -894,84 +901,33 @@ export async function runAgentLoop(
 					});
 				},
 				onEnterPlanMode: async () => {
-					active._planFileId = generateWordSlug();
-					// Save current permission mode and switch to plan
-					const current = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { permissionMode: true },
-					});
-					const prevMode = current?.permissionMode ?? "default";
-					// Guard: if already in plan mode, don't overwrite previousPermissionMode
-					if (prevMode === "plan") return;
-					active._previousPermissionMode = prevMode;
-					const now = new Date().toISOString();
-					await db
-						.update(narrators)
-						.set({
-							permissionMode: "plan",
-							previousPermissionMode: prevMode,
-							updatedAt: now,
-						})
-						.where(eq(narrators.id, narratorId));
+					const planState = await enterNarratorPlanMode(narratorId);
+					active._planFileId = planState.planFileId;
+					active._previousPermissionMode = planState.previousPermissionMode;
+					if (planState.wasPlanMode) return;
 					broadcastToNarrator(narratorId, {
-						type: "permission_mode_changed",
+						type: "plan_mode_changed",
 						narratorId,
-						permissionMode: "plan",
+						planMode: true,
+						traits: planState.traits,
 					});
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
-					planModeAskedOnce.delete(narratorId);
-					// Guard: if not currently in plan mode, the model called ExitPlanMode
-					// without a matching EnterPlanMode — skip permission mode restoration
-					// and plan-continuation logic to avoid accidentally resetting the
-					// user's chosen mode or aborting the agent loop.
-					const currentRow = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { permissionMode: true, previousPermissionMode: true },
-					});
-					if (currentRow?.permissionMode !== "plan") {
-						active._previousPermissionMode = undefined;
-						return;
-					}
-					// Restore previous permission mode — check in-memory first, then DB
-					let restoreMode = active._previousPermissionMode;
-					if (!restoreMode) {
-						restoreMode = currentRow.previousPermissionMode ?? undefined;
-					}
-					// If the previous mode would block plan execution, fall back to the user's
-					// configured default permission mode. This also covers narrators that were
-					// created directly in plan mode before previousPermissionMode was persisted.
-					const BLOCKED_MODES = new Set(["readOnly", "plan", "dontAsk"]);
-					const defaultRestoreMode = settings.agent.defaultPermissionMode;
-					const resolved =
-						restoreMode && !BLOCKED_MODES.has(restoreMode)
-							? restoreMode
-							: !BLOCKED_MODES.has(defaultRestoreMode)
-								? defaultRestoreMode
-								: "default";
-					const finalMode = resolved as
-						| "default"
-						| "acceptEdits"
-						| "bypassPermissions"
-						| "readOnly"
-						| "plan"
-						| "dontAsk";
 					active._previousPermissionMode = undefined;
-					const now = new Date().toISOString();
-					await db
-						.update(narrators)
-						.set({
-							permissionMode: finalMode,
-							previousPermissionMode: null,
-							updatedAt: now,
-						})
-						.where(eq(narrators.id, narratorId));
-					broadcastToNarrator(narratorId, {
-						type: "permission_mode_changed",
-						narratorId,
-						permissionMode: finalMode,
-					});
+					planModeAskedOnce.delete(narratorId);
+					// Plan mode is a trait overlay. Exiting it must not silently change the
+					// user's current permission policy. Still continue approval handling even
+					// if another path already cleared the trait, so successful ExitPlanMode is idempotent.
+					const planState = await exitNarratorPlanMode(narratorId);
+					if (planState.wasPlanMode) {
+						broadcastToNarrator(narratorId, {
+							type: "plan_mode_changed",
+							narratorId,
+							planMode: false,
+							traits: planState.traits,
+						});
+					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
 					if (pendingPlanCompact.has(narratorId)) {
 						pendingPlanCompact.delete(narratorId);
@@ -1183,7 +1139,8 @@ export async function runAgentLoop(
 				locale,
 				signal: active.abortController.signal,
 				chapterId: active._chapterId,
-				planMode: freshNarrator.permissionMode === "plan",
+				planMode: isPlanModeTrait(freshNarrator.traits),
+				permissionMode: freshNarrator.permissionMode ?? "default",
 				previousPermissionMode:
 					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
 				relaxedPlan: !!freshNarrator.relaxedPlan,
@@ -1534,31 +1491,15 @@ export async function runAgentLoop(
 			// Reset transient retry counter on success
 			transientRetries = 0;
 
-			if (result.shouldUpdateTitle) {
-				shouldUpdateTitle = true;
-			}
-
-			if (result.silentDisconnect) {
-				const partialId = active._partialMessageId;
-				active._partialMessageId = undefined;
-				if (partialId) {
-					await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				}
-			}
-
-			// Smart interruption check — auto-continue if output was truncated.
-			// When the last completed assistant turn was a tool-call turn, we must
-			// replay the tool-result request packet instead of appending a textual
-			// "continue" user message.
 			if (result.interrupted && active.alive) {
 				interruptionRetries++;
 				if (interruptionRetries > MAX_INTERRUPTION_RETRIES) {
-					logger.warn("Smart interruption check: max retries reached, stopping", {
+					logger.warn("Completion-limit continuation: max retries reached, stopping", {
 						narratorId,
 						retries: interruptionRetries,
 					});
 				} else if (result.shouldReplayInterruptedToolResultTurn) {
-					logger.info("Smart interruption check: replaying interrupted tool-result turn", {
+					logger.info("Completion-limit continuation: replaying interrupted tool-result turn", {
 						narratorId,
 						retries: interruptionRetries,
 					});
@@ -1582,8 +1523,19 @@ export async function runAgentLoop(
 					continue;
 				}
 			} else {
-				// Reset counter on successful non-interrupted output
 				interruptionRetries = 0;
+			}
+
+			if (result.shouldUpdateTitle) {
+				shouldUpdateTitle = true;
+			}
+
+			if (result.silentDisconnect) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
 			}
 
 			// Plan approved — abort was triggered by onExitPlanMode so we persist
@@ -2403,7 +2355,7 @@ export async function startGoalContinuationIfPossible(
 	return goalContinuationStartLock.acquire(narratorId, async () => {
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status === "working" || narrator.status === "waiting") return { started: false };
-		if (narrator.permissionMode === "plan") return { started: false };
+		if (isPlanModeTrait(narrator.traits)) return { started: false };
 		const goals = await narratorGoalService.listGoals(narratorId);
 		if (!goals.some((goal) => goal.status === "active")) return { started: false };
 
@@ -2643,20 +2595,35 @@ export async function rollbackToBlock(
 	}
 
 	if (blocksToDelete.length > 0) {
-		await narratorService.deleteMessageBlocks(narratorId, blocksToDelete, {
-			preserveConversationId: true,
-		});
+		const blockDeleteResult = await narratorService.deleteMessageBlocks(
+			narratorId,
+			blocksToDelete,
+			{
+				preserveConversationId: true,
+			},
+		);
 
-		// Broadcast the updated message
-		const updatedMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-		});
-		if (updatedMsg) {
+		const targetMessageDeleted = blockDeleteResult.results.some(
+			(r) => r.messageId === messageId && r.messageDeleted,
+		);
+		if (targetMessageDeleted) {
 			broadcastToNarrator(narratorId, {
-				type: "message_updated",
+				type: "messages_deleted",
 				narratorId,
-				message: updatedMsg,
+				deletedMessageIds: [messageId],
 			});
+		} else {
+			// Broadcast the updated message
+			const updatedMsg = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+			});
+			if (updatedMsg) {
+				broadcastToNarrator(narratorId, {
+					type: "message_updated",
+					narratorId,
+					message: updatedMsg,
+				});
+			}
 		}
 	}
 
@@ -3207,24 +3174,11 @@ export function updateNarratorChapterRole(narratorId: string, role: string): voi
 }
 
 export async function updateNarratorPermissionMode(
-	narratorId: string,
-	mode: string,
+	_narratorId: string,
+	_mode: string,
 ): Promise<void> {
 	// Permission mode is read from DB in real-time by handlePermission.
-	// When switching to/from plan mode, manage the plan file ID on the active narrator.
-	const active = activeNarrators.get(narratorId);
-	if (!active) return;
-	if (mode === "plan") {
-		if (!active._planFileId) {
-			active._planFileId = generateWordSlug();
-		}
-		// _previousPermissionMode is also persisted in DB by narratorService.updatePermissionMode,
-		// so onExitPlanMode will read it from DB if the in-memory value is missing.
-	} else {
-		active._planFileId = undefined;
-		active._previousPermissionMode = undefined;
-		planModeAskedOnce.delete(narratorId);
-	}
+	// Plan mode is now a narrator trait and is managed by Enter/ExitPlanMode handlers.
 }
 
 // === Startup recovery ===
@@ -3274,6 +3228,28 @@ export async function recoverOnStartup(): Promise<void> {
 			logger.info(`Narrator status migrated: ${from} → ${to}`, { count: result.changes });
 		}
 	}
+
+	// Legacy plan permission mode migration: plan is now a narrator trait.
+	const legacyPlanRows = sqlite
+		.prepare(
+			"SELECT id, traits, previous_permission_mode FROM narrators WHERE permission_mode = 'plan'",
+		)
+		.all() as Array<{ id: string; traits: string | null; previous_permission_mode: string | null }>;
+	for (const row of legacyPlanRows) {
+		const traits = addTrait(parseTraits(row.traits), "plan");
+		const permissionMode = normalizeLegacyPlanPreviousPermissionMode(row.previous_permission_mode);
+		sqlite
+			.prepare(
+				"UPDATE narrators SET permission_mode = ?, traits = ?, plan_mode = 1, previous_permission_mode = ?, plan_file_id = ?, updated_at = ? WHERE id = ?",
+			)
+			.run(permissionMode, JSON.stringify(traits), permissionMode, generateWordSlug(), now, row.id);
+	}
+	if (legacyPlanRows.length > 0) {
+		logger.info("Legacy plan permission mode migrated to narrator trait", {
+			count: legacyPlanRows.length,
+		});
+	}
+
 	// Active narrators interrupted by server restart — mark with interrupted substatus
 	// so users can see which narrators were mid-run.
 	const interruptStmt = sqlite.prepare(
@@ -3517,14 +3493,16 @@ export type {
 	WhitelistDir,
 } from "./narrator-permission";
 export {
-	classifyYoloDanger,
-	createYoloDangerFingerprint,
+	cancelPendingExitPlanMode,
+	classifyDanger,
+	createDangerFingerprint,
 	extractToolPaths,
 	handlePermission,
 	isInsideWorktree,
 	resolveAllPendingPermissions,
 	resolvePermission,
 	resolvePermissionDecision,
+	resolvePermissionOrDangerReflection,
 } from "./narrator-permission";
 
 export type { BufferCreator, NarratorEvent } from "./narrator-session-state";

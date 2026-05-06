@@ -21,6 +21,10 @@ import type {
 } from "./pixi-message-model";
 import { getPixiHighlightedTokens } from "./pixi-shiki-highlight";
 
+const MAX_TOOL_PANEL_LAYOUT_CHARS = 80_000;
+const MAX_TOOL_PANEL_LAYOUT_LINES = 2_000;
+const TOOL_PANEL_TRUNCATION_NOTICE = "[Preview truncated for performance]";
+
 export interface PixiLaidOutMarkdownBlock {
 	kind: MdBlock["kind"];
 	text: string;
@@ -99,6 +103,11 @@ export interface PixiLaidOutToolDetailBlock {
 	note?: string;
 	status?: string;
 	lang?: string;
+	scrollKey?: string;
+	contentHeight?: number;
+	viewportHeight?: number;
+	maxScrollTop?: number;
+	lineHeight?: number;
 }
 
 export interface PixiLaidOutBlock {
@@ -510,6 +519,10 @@ function capLines(lines: LayoutLine[], max: number): LayoutLine[] {
 	return capped;
 }
 
+function isReasoningBlockType(type?: string): boolean {
+	return type === "reasoning" || type === "thinking";
+}
+
 function ellipsizeLineToWidth(text: string, width: number): LayoutLine {
 	const source = text || " ";
 	const sourceWidth = measureInlineText(source, CODE_FONT);
@@ -539,6 +552,19 @@ function layoutPhysicalCodeLines(text: string, width: number, maxLines: number):
 		.split("\n")
 		.slice(0, maxLines)
 		.map((line) => ellipsizeLineToWidth(line, width));
+}
+
+function clampToolPanelText(text: string): { text: string; truncated: boolean } {
+	const normalized = text.replace(/\r\n?/g, "\n");
+	const byChars = normalized.length > MAX_TOOL_PANEL_LAYOUT_CHARS;
+	const charLimited = byChars ? normalized.slice(0, MAX_TOOL_PANEL_LAYOUT_CHARS) : normalized;
+	const lines = charLimited.split("\n");
+	const byLines = lines.length > MAX_TOOL_PANEL_LAYOUT_LINES;
+	if (!byChars && !byLines) return { text: normalized, truncated: false };
+	return {
+		text: `${lines.slice(0, MAX_TOOL_PANEL_LAYOUT_LINES).join("\n")}\n${TOOL_PANEL_TRUNCATION_NOTICE}`,
+		truncated: true,
+	};
 }
 
 function layoutSpecialBlock(
@@ -836,6 +862,7 @@ function layoutToolDetailBlocks(
 	blocks: PixiToolDetailBlockModel[],
 	innerWidth: number,
 	startY: number,
+	toolKey?: string,
 ): { blocks: PixiLaidOutToolDetailBlock[]; height: number } {
 	const laid: PixiLaidOutToolDetailBlock[] = [];
 	let y = startY;
@@ -877,7 +904,6 @@ function layoutToolDetailBlocks(
 			const height = Math.max(17, Math.min(result.height, SMALL_LINE_H * 2));
 			laid.push({
 				...detail,
-				kind: "text-line",
 				x: TOOL_CARD_PADDING,
 				y,
 				width: contentWidth,
@@ -934,21 +960,34 @@ function layoutToolDetailBlocks(
 		if (detail.kind === "code-panel" || detail.kind === "terminal-panel") {
 			const maxLines = detail.maxLines ?? 8;
 			const panelTextWidth = Math.max(24, contentWidth - CODE_PADDING_X * 2);
-			const lines =
+			const panelText = clampToolPanelText(detail.text);
+			let allLines =
 				detail.lang === "grep-output"
-					? layoutPhysicalCodeLines(detail.text, panelTextWidth, maxLines)
-					: layoutText(detail.text, panelTextWidth, CODE_FONT, CODE_LINE_H).lines.slice(
-							0,
-							maxLines,
-						);
-			const height = CODE_PADDING_Y * 2 + Math.max(CODE_LINE_H, lines.length * CODE_LINE_H);
+					? layoutPhysicalCodeLines(panelText.text, panelTextWidth, MAX_TOOL_PANEL_LAYOUT_LINES + 1)
+					: layoutText(panelText.text, panelTextWidth, CODE_FONT, CODE_LINE_H).lines;
+			if (allLines.length > MAX_TOOL_PANEL_LAYOUT_LINES) {
+				allLines = [
+					...allLines.slice(0, MAX_TOOL_PANEL_LAYOUT_LINES),
+					...layoutText(TOOL_PANEL_TRUNCATION_NOTICE, panelTextWidth, CODE_FONT, CODE_LINE_H).lines,
+				];
+			}
+			const visibleLineCount = Math.max(1, Math.min(allLines.length || 1, maxLines));
+			const contentHeight = Math.max(CODE_LINE_H, allLines.length * CODE_LINE_H);
+			const viewportHeight = visibleLineCount * CODE_LINE_H;
+			const height = CODE_PADDING_Y * 2 + viewportHeight;
 			laid.push({
 				...detail,
+				text: panelText.text,
 				x: TOOL_CARD_PADDING,
 				y,
 				width: contentWidth,
 				height,
-				lines,
+				lines: allLines,
+				contentHeight,
+				viewportHeight,
+				maxScrollTop: Math.max(0, contentHeight - viewportHeight),
+				lineHeight: CODE_LINE_H,
+				scrollKey: `${toolKey ?? "tool"}:${laid.length}:${detail.kind}`,
 			});
 			y += height + 6;
 			continue;
@@ -1130,6 +1169,7 @@ function layoutToolUseBlock(
 				block.toolDetailBlocks ?? [],
 				innerWidth,
 				TOOL_CARD_PADDING + TOOL_HEADER_H + TOOL_DETAIL_GAP,
+				block.toolKey ?? block.toolUseId ?? block.toolCallId,
 			)
 		: { blocks: [], height: 0 };
 	const detailLines: PixiLaidOutToolDetailLine[] = [];
@@ -1186,8 +1226,13 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 	const isUser = item.role === "user";
 	const isAssistant = item.role === "assistant";
 	const isToolRun = item.kind === "tool-run";
+	const isPlainAssistant = isAssistant && item.kind !== "tool-run";
+	const isReasoningOnlyAssistant =
+		isPlainAssistant &&
+		item.blocks.length > 0 &&
+		item.blocks.every((block) => isReasoningBlockType(block.type));
 	const paddingX = isUser ? USER_PADDING_X : PADDING_X;
-	const paddingY = isUser ? USER_PADDING_Y : PADDING_Y;
+	const paddingY = isReasoningOnlyAssistant ? 0 : isUser ? USER_PADDING_Y : PADDING_Y;
 	const innerWidth = Math.max(80, isToolRun ? itemWidth : itemWidth - paddingX * 2);
 	const blocks: PixiLaidOutBlock[] = [];
 
@@ -1203,7 +1248,6 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 	}
 
 	let innerY = isToolRun ? 0 : paddingY;
-	const isPlainAssistant = isAssistant && item.kind !== "tool-run";
 	if (!isPlainAssistant && !isToolRun) {
 		innerY += isUser ? USER_HEADER_H + USER_HEADER_CONTENT_GAP : HEADER_H;
 	}
@@ -1308,7 +1352,8 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 		innerY += TOKEN_H;
 	}
 
-	const height = Math.max(MIN_ITEM_H, isToolRun ? innerY : innerY + paddingY - BLOCK_GAP);
+	const minItemHeight = isReasoningOnlyAssistant ? 0 : MIN_ITEM_H;
+	const height = Math.max(minItemHeight, isToolRun ? innerY : innerY + paddingY - BLOCK_GAP);
 	const layout = {
 		width: itemWidth,
 		height,
@@ -1343,7 +1388,9 @@ export function layoutPixiMessageItems(
 			contentWidth: cached.contentWidth,
 			blocks: cached.blocks,
 		});
-		y += cached.height + GAP;
+		const lastBlock = cached.blocks[cached.blocks.length - 1];
+		const itemGap = isReasoningBlockType(lastBlock?.type) ? BLOCK_GAP : GAP;
+		y += cached.height + itemGap;
 	}
 
 	return { items: laidOut, totalHeight: Math.max(0, y) };

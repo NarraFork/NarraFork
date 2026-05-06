@@ -3,6 +3,8 @@
  * Extracted from the monolithic settings/index.ts for better modularity.
  */
 
+import type { PermissionMode } from "../permission-modes";
+
 export interface ModelOption {
 	value: string;
 	label: string;
@@ -215,7 +217,9 @@ export interface NarraForkSettings {
 	paths: { defaultProjectDir: string };
 	agent: {
 		defaultModel: string;
-		defaultPermissionMode: string;
+		defaultPermissionMode: PermissionMode;
+		/** Whether newly-created narrators should start with the plan trait enabled. */
+		defaultStartInPlanMode: boolean;
 		summaryModel: string;
 		customModels: ModelOption[];
 		hiddenModels: string[];
@@ -241,8 +245,8 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
-		/** Skip YOLO secondary confirmations for operations that are classified as read-only. */
-		yoloSkipReadOnlyConfirmations: boolean;
+		/** Skip danger reflection secondary confirmations for operations that are classified as read-only. */
+		dangerSkipReadOnlyConfirmations: boolean;
 		/**
 		 * Global default reasoning effort — lowest priority fallback.
 		 * Fallback chain: narrator.reasoningEffort → provider.defaultReasoningEffort → agent.defaultReasoningEffort.
@@ -254,8 +258,6 @@ export interface NarraForkSettings {
 		requestDumpEnabled: boolean;
 		/** Maximum size (bytes) for raw dump body text. Default 1MB. Set to -1 for unlimited. */
 		requestDumpMaxSize: number;
-		/** Smart output interruption check — auto-detect and retry interrupted model output. */
-		smartInterruptionCheck: boolean;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
 		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */

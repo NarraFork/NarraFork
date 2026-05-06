@@ -216,8 +216,8 @@ async function syncNarrator(narratorId: string): Promise<void> {
 		 prune_boundary_message_id, pruned_percent, created_at, substatus, variant, traits,
 		 is_background, background_status, background_result, background_completed_at,
 		 is_ask_in_passing, turn_started_at, message_version, prune_enabled, fast_mode,
-		 relaxed_plan, reasoning_effort, previous_permission_mode, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			narrator.id,
 			narrator.chapterId,
@@ -236,7 +236,7 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			narrator.totalCostUsd,
 			narrator.lastMessageAt,
 			narrator.status,
-			narrator.permissionMode === "plan" ? 1 : 0,
+			Array.isArray(narrator.traits) && narrator.traits.includes("plan") ? 1 : 0,
 			narrator.cwd,
 			narrator.errorMessage,
 			jsonCol(narrator.todosJson),
@@ -259,6 +259,7 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			narrator.relaxedPlan ? 1 : 0,
 			narrator.reasoningEffort,
 			narrator.previousPermissionMode,
+			narrator.planFileId,
 			narrator.updatedAt,
 		],
 	);

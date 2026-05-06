@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
 import type { NarraForkSettings } from "./types";
@@ -142,6 +143,38 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		merged.agent.legacyEncoding = true;
 		delete (merged.editor as Record<string, unknown>).legacyEncoding;
 		needsSave = true;
+	}
+
+	// Migrate legacy YOLO read-only skip setting to danger reflection naming.
+	if (
+		raw.agent?.yoloSkipReadOnlyConfirmations === true &&
+		raw.agent?.dangerSkipReadOnlyConfirmations === undefined
+	) {
+		merged.agent.dangerSkipReadOnlyConfirmations = true;
+		needsSave = true;
+	}
+	if (raw.agent?.yoloSkipReadOnlyConfirmations !== undefined) {
+		delete (merged.agent as Record<string, unknown>).yoloSkipReadOnlyConfirmations;
+		needsSave = true;
+	}
+
+	// Remove obsolete smart output interruption check setting.
+	if (raw.agent?.smartInterruptionCheck !== undefined) {
+		delete (merged.agent as Record<string, unknown>).smartInterruptionCheck;
+		needsSave = true;
+	}
+
+	// Normalize legacy / invalid permission modes. Plan mode is now an independent trait.
+	if (raw.agent?.defaultPermissionMode !== undefined) {
+		const normalized = normalizeLegacyPermissionMode(raw.agent.defaultPermissionMode, "default");
+		if (merged.agent.defaultPermissionMode !== normalized) {
+			merged.agent.defaultPermissionMode = normalized;
+			needsSave = true;
+		}
+		if (shouldMigrateLegacyPlanMode(raw.agent.defaultPermissionMode)) {
+			merged.agent.defaultStartInPlanMode = true;
+			needsSave = true;
+		}
 	}
 
 	// Migrate legacy single openai config → openaiProviders array

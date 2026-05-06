@@ -5,6 +5,7 @@ import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
+import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { editTool } from "./edit";
 import { exitPlanConfirmTool, exitPlanReviseTool } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
@@ -26,7 +27,6 @@ import { taskCreateTool } from "./todo";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
-import { yoloCancelTool, yoloConfirmTool } from "./yolo-pause";
 
 /**
  * Optional tools — registered in the registry but excluded by default.
@@ -78,8 +78,8 @@ const coreProvider: ToolProvider = {
 			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,
-			yoloConfirmTool,
-			yoloCancelTool,
+			dangerConfirmTool,
+			dangerCancelTool,
 			exitPlanConfirmTool,
 			exitPlanReviseTool,
 		];

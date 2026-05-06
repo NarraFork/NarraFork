@@ -88,6 +88,24 @@ const ALL_PLATFORMS: Platform[] = [
 	"qqbot",
 ];
 
+const GATEWAY_PERMISSION_MODES = [
+	"default",
+	"acceptEdits",
+	"bypassPermissions",
+	"readOnly",
+	"dontAsk",
+] as const;
+
+const GATEWAY_DEFAULT_PERMISSION_MODE = "bypassPermissions";
+
+function normalizeGatewayPermissionMode(value: unknown): string {
+	if (typeof value !== "string") return GATEWAY_DEFAULT_PERMISSION_MODE;
+	if ((GATEWAY_PERMISSION_MODES as readonly string[]).includes(value)) return value;
+	if (value === "allowByDefault") return "acceptEdits";
+	if (value === "denyByDefault") return "dontAsk";
+	return GATEWAY_DEFAULT_PERMISSION_MODE;
+}
+
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
 	const [config, setConfig] = useState<GatewayConfig>({});
@@ -100,8 +118,12 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 			const raw = userPrefs.gatewayConfig;
 			if (raw && typeof raw === "object") {
 				const parsed = raw as GatewayConfig;
-				setConfig(parsed);
-				serverSnapshot.current = parsed;
+				const normalized = {
+					...parsed,
+					defaultPermissionMode: normalizeGatewayPermissionMode(parsed.defaultPermissionMode),
+				};
+				setConfig(normalized);
+				serverSnapshot.current = normalized;
 			}
 			setInited(true);
 		}
@@ -151,6 +173,10 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 			const globalChanged =
 				serverSnapshot.current.enabled !== config.enabled ||
 				serverSnapshot.current.streaming !== config.streaming ||
+				serverSnapshot.current.defaultPermissionMode !== config.defaultPermissionMode ||
+				serverSnapshot.current.defaultProjectId !== config.defaultProjectId ||
+				serverSnapshot.current.defaultChapterId !== config.defaultChapterId ||
+				serverSnapshot.current.sessionIdleMinutes !== config.sessionIdleMinutes ||
 				serverSnapshot.current.rateLimitPerMinute !== config.rateLimitPerMinute;
 
 			if (globalChanged && changedPlatforms.length === 0) {
@@ -238,12 +264,16 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 					<Select
 						label={t("gatewayDefaultPermissionMode")}
 						description={t("gatewayDefaultPermissionModeDesc")}
-						value={config.defaultPermissionMode ?? "bypassPermissions"}
-						onChange={(v) => updateField("defaultPermissionMode", v ?? "bypassPermissions")}
+						value={normalizeGatewayPermissionMode(config.defaultPermissionMode)}
+						onChange={(v) =>
+							updateField("defaultPermissionMode", v ?? GATEWAY_DEFAULT_PERMISSION_MODE)
+						}
 						data={[
+							{ value: "default", label: t("gatewayPermDefault") },
+							{ value: "acceptEdits", label: t("gatewayPermAcceptEdits") },
 							{ value: "bypassPermissions", label: t("gatewayPermBypass") },
-							{ value: "allowByDefault", label: t("gatewayPermAllow") },
-							{ value: "denyByDefault", label: t("gatewayPermDeny") },
+							{ value: "readOnly", label: t("gatewayPermReadOnly") },
+							{ value: "dontAsk", label: t("gatewayPermDontAsk") },
 						]}
 					/>
 

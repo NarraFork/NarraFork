@@ -1386,7 +1386,7 @@ export async function processEvent(
 		}
 
 		case "output_truncated": {
-			logger.info("Agent output truncated by max_tokens", {
+			logger.info("Agent output truncated by completion token limit", {
 				narratorId,
 				message: event.message,
 			});

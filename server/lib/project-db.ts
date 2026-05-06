@@ -53,6 +53,7 @@ const PROJECT_DB_SCHEMA_PATCHES: Array<{
 			{ name: "relaxed_plan", type: "INTEGER NOT NULL DEFAULT 0" },
 			{ name: "reasoning_effort", type: "TEXT" },
 			{ name: "previous_permission_mode", type: "TEXT" },
+			{ name: "plan_file_id", type: "TEXT" },
 		],
 	},
 ];
@@ -186,6 +187,7 @@ CREATE TABLE IF NOT EXISTS narrators (
 	relaxed_plan INTEGER NOT NULL DEFAULT 0,
 	reasoning_effort TEXT,
 	previous_permission_mode TEXT,
+	plan_file_id TEXT,
 	updated_at TEXT NOT NULL
 );
 

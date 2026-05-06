@@ -9,13 +9,7 @@ import {
 } from "./pipeline-state";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
-import type {
-	AgentConfig,
-	AgentToolUse,
-	PermissionResult,
-	ToolContext,
-	YoloDangerInfo,
-} from "./types";
+import type { AgentConfig, AgentToolUse, AllowPermissionResult, ToolContext } from "./types";
 
 const PROGRESS_INTERVAL_MS = 5_000;
 
@@ -45,19 +39,10 @@ export interface ToolExecResult {
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
-	/** Internal YOLO safety pause result consumed by agentLoop before tool execution. */
-	yoloPause?: {
-		requestId: string;
-		toolCallId: string;
-		warning: string;
-		danger: YoloDangerInfo;
-		fingerprint: string;
-		decision: Promise<PermissionResult>;
-	};
 }
 
 interface ExecuteToolOptions {
-	preGrantedPermission?: Extract<PermissionResult, { behavior: "allow" }>;
+	preGrantedPermission?: AllowPermissionResult;
 }
 
 /** Max serialized size of tool_input passed to hooks (bytes). */
@@ -146,26 +131,6 @@ export async function executeTool(
 	const permission =
 		options.preGrantedPermission ??
 		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId));
-	if (permission.behavior === "yoloPause") {
-		return {
-			// A YOLO pause is not a result for the original tool call: the tool has not
-			// executed yet, and permission may still be denied. Keep the warning only in
-			// yoloPause metadata so callers cannot accidentally persist it as tool output.
-			output: "",
-			isError: false,
-			durationMs: 0,
-			permissionStartedAt,
-			completedAt: Date.now(),
-			yoloPause: {
-				requestId: permission.requestId,
-				toolCallId: permission.toolCallId,
-				warning: permission.message,
-				danger: permission.danger,
-				fingerprint: permission.fingerprint,
-				decision: permission.decision,
-			},
-		};
-	}
 	if (permission.behavior === "deny") {
 		const userMessage =
 			permission.rawMessage && permission.message
@@ -182,6 +147,18 @@ export async function executeTool(
 			permissionStartedAt,
 			completedAt: Date.now(),
 			fatal: permission.fatal,
+		};
+	}
+	if (permission.behavior === "dangerReflection") {
+		return {
+			output:
+				"Internal permission error: tool executor received an unresolved dangerReflection result. " +
+				"The tool was not executed.",
+			isError: true,
+			durationMs: 0,
+			permissionStartedAt,
+			completedAt: Date.now(),
+			fatal: false,
 		};
 	}
 
@@ -215,7 +192,7 @@ export async function executeTool(
 	const executionStartedAt = start;
 
 	const effectiveInput = permission.updatedInput ?? tu.input;
-	const permissionNotice = permission.behavior === "allow" ? permission.notice : undefined;
+	const permissionNotice = permission.notice;
 	// Track whether the permission handler redirected the input (e.g. plan-mode file path)
 	const redirectedInput =
 		permission.updatedInput && permission.updatedInput !== tu.input
@@ -243,7 +220,7 @@ export async function executeTool(
 
 	// Detect empty input for file-writing tools — a sign of complete truncation
 	// where the stream sent tool name/id but no input chunks at all.
-	const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit"]);
+	const FILE_TOOLS = new Set(["Write", "Edit"]);
 	if (FILE_TOOLS.has(tu.name) && Object.keys(effectiveInput).length === 0) {
 		return {
 			output:
@@ -465,7 +442,7 @@ export function sanitizeBrokenInput(
 ): Record<string, unknown> {
 	const placeholder = getToolMessage("brokenToolCallInputPlaceholder", (locale as Locale) ?? "en");
 	const clean: Record<string, unknown> = {};
-	const isEdit = toolName === "Edit" || toolName === "MultiEdit";
+	const isEdit = toolName === "Edit";
 
 	// If input is just { _raw: "..." }, extract file_path from the incomplete JSON
 	if ("_raw" in input && Object.keys(input).length === 1) {

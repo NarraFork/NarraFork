@@ -61,7 +61,7 @@ export function parseSubstatus(raw: unknown): string[] {
 // Trait helpers
 // ---------------------------------------------------------------------------
 
-export type NarratorTrait = "standalone" | "ask-in-passing" | "background";
+export type NarratorTrait = "standalone" | "ask-in-passing" | "background" | "plan";
 
 /** Parse the JSON traits column (handles null / empty). */
 export function parseTraits(raw: unknown): string[] {
@@ -88,4 +88,9 @@ export function addTrait(traits: string[], trait: NarratorTrait): string[] {
 
 export function removeTrait(traits: string[], trait: NarratorTrait): string[] {
 	return traits.filter((t) => t !== trait);
+}
+
+/** Check whether traits indicate the narrator is currently in plan mode. */
+export function isPlanModeTrait(raw: unknown): boolean {
+	return parseTraits(raw).includes("plan");
 }

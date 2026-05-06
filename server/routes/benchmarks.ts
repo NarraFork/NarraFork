@@ -3,6 +3,7 @@
  */
 import { Hono } from "hono";
 import { z } from "zod";
+import { permissionModeSchema } from "../lib/permission-modes";
 import { logger } from "../lib/logger";
 import {
 	cancelRun,
@@ -75,9 +76,7 @@ const createRunSchema = z.object({
 	name: z.string().min(1),
 	model: z.string().min(1),
 	systemPrompt: z.string().optional(),
-	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"])
-		.optional(),
+	permissionMode: permissionModeSchema.optional(),
 	config: z.record(z.string(), z.unknown()).optional(),
 });
 

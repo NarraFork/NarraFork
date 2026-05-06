@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { permissionModeSchema } from "../permission-modes";
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh"]);
 
@@ -7,9 +8,8 @@ export const createNarratorSchema = z.object({
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
 	systemPrompt: z.string().max(10000).optional(),
-	permissionMode: z
-		.enum(["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"])
-		.optional(),
+	permissionMode: permissionModeSchema.optional(),
+	startInPlanMode: z.boolean().optional(),
 	cwd: z.string().min(1).max(4096).optional(),
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	fastMode: z.boolean().optional(),
@@ -32,6 +32,10 @@ export const sendMessageSchema = z.object({
 export const permissionDecisionSchema = z.object({
 	decision: z.enum(["allow", "deny"]),
 	message: z.string().optional(),
+	answers: z.record(z.string(), z.string()).optional(),
+	feedbackText: z.string().optional(),
+	compactAfter: z.boolean().optional(),
+	updatedPlan: z.string().optional(),
 });
 
 export const createWhitelistDirSchema = z.object({

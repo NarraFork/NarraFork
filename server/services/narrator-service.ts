@@ -30,7 +30,8 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { isSubagentVariant, subagentVariant } from "../lib/narrator-utils";
+import { isSubagentVariant, parseTraits, subagentVariant } from "../lib/narrator-utils";
+import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
@@ -40,6 +41,7 @@ import {
 	settings,
 } from "../lib/settings";
 import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
+import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import type {
 	LoadSkillResult,
@@ -125,6 +127,7 @@ interface CreateNarratorInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
+	startInPlanMode?: boolean;
 	title?: string;
 }
 
@@ -534,14 +537,13 @@ export const narratorService = {
 
 		const now = new Date().toISOString();
 		const id = generateId();
-		const resolvedPermMode = (input.permissionMode ?? settings.agent.defaultPermissionMode) as
-			| "default"
-			| "acceptEdits"
-			| "bypassPermissions"
-			| "plan"
-			| "dontAsk";
-		const previousPermissionMode =
-			resolvedPermMode === "plan" ? settings.agent.defaultPermissionMode : null;
+		const resolvedPermMode = normalizeLegacyPermissionMode(
+			input.permissionMode ?? settings.agent.defaultPermissionMode,
+			"default",
+		);
+		const startInPlanMode = input.startInPlanMode ?? settings.agent.defaultStartInPlanMode;
+		const previousPermissionMode = startInPlanMode ? resolvedPermMode : null;
+		const planFileId = startInPlanMode ? generateWordSlug() : null;
 
 		const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
 		const actualModel = resolveEffectiveModel(storedModel);
@@ -553,6 +555,7 @@ export const narratorService = {
 
 		const chapterId = input.chapterId ?? null;
 		const traits: string[] = chapterId === null ? ["standalone"] : [];
+		if (startInPlanMode) traits.push("plan");
 
 		const [narrator] = await db
 			.insert(narrators)
@@ -566,6 +569,8 @@ export const narratorService = {
 				systemPrompt: input.systemPrompt,
 				permissionMode: resolvedPermMode,
 				previousPermissionMode,
+				planFileId,
+				planMode: startInPlanMode,
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: input.fastMode ?? false,
 				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
@@ -593,14 +598,14 @@ export const narratorService = {
 		const id = generateId();
 
 		let basePermMode = input.permissionMode ?? parent.permissionMode ?? "default";
-		if (basePermMode === "plan") {
-			basePermMode = parent.relaxedPlan ? (parent.previousPermissionMode ?? "default") : "readOnly";
+		if (parseTraits(parent.traits).includes("plan")) {
+			basePermMode = parent.relaxedPlan ? (parent.permissionMode ?? "default") : "readOnly";
 		}
 		const resolvedPermMode = basePermMode as
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
-			| "plan"
+			| "readOnly"
 			| "dontAsk";
 
 		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
@@ -881,6 +886,7 @@ export const narratorService = {
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
+			| "readOnly"
 			| "dontAsk";
 
 		const newNarrator = await db.transaction(async (tx) => {
@@ -956,6 +962,7 @@ export const narratorService = {
 			| "default"
 			| "acceptEdits"
 			| "bypassPermissions"
+			| "readOnly"
 			| "dontAsk";
 
 		const targetChapterId = opts?.newChapterId ?? null;

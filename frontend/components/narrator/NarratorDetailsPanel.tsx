@@ -169,6 +169,10 @@ export function NarratorDetailsPanel({
 	const enabledTools = Array.isArray(narrator?.enabledTools)
 		? (narrator.enabledTools as string[])
 		: [];
+	const planMode = !!(
+		narrator?.planMode ||
+		(Array.isArray(narrator?.traits) && (narrator.traits as string[]).includes("plan"))
+	);
 	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
 	const [cwdDirty, setCwdDirty] = useState(false);
 
@@ -429,7 +433,7 @@ export function NarratorDetailsPanel({
 				/>
 				<DetailRow
 					label={t("details.planMode")}
-					value={<Text size="sm">{formatBoolean(narrator?.planMode)}</Text>}
+					value={<Text size="sm">{formatBoolean(planMode)}</Text>}
 				/>
 				<DetailRow
 					label={t("details.backgroundStatus")}

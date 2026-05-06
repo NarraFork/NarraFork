@@ -122,7 +122,7 @@ export function isContextOverflowReason(reason: string): boolean {
 	);
 }
 
-export function isOutputTruncationReason(reason: string): boolean {
+export function isCompletionLimitReason(reason: string): boolean {
 	const r = reason.toLowerCase();
 	return r === "max_tokens" || r === "max_output_tokens" || r === "length";
 }

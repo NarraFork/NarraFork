@@ -158,12 +158,15 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 			setActiveId(null);
 			const { active, over } = event;
 			if (!over || active.id === over.id || !favorites) return;
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
 			const oldIndex = favorites.findIndex((f: any) => f.id === active.id);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
 			const newIndex = favorites.findIndex((f: any) => f.id === over.id);
 			if (oldIndex === -1 || newIndex === -1) return;
 			const newOrder = [...favorites];
 			const [moved] = newOrder.splice(oldIndex, 1);
 			newOrder.splice(newIndex, 0, moved);
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
 			reorderFavorites.mutate(newOrder.map((f: any) => f.id));
 		},
 		[favorites, reorderFavorites],
@@ -178,7 +181,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 			{
 				...(cwd ? { cwd } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
-				...(startInPlanMode ? { permissionMode: "plan" as const } : {}),
+				...(startInPlanMode ? { startInPlanMode: true } : {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -264,6 +267,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 								onDragCancel={handleDragCancel}
 							>
 								<SortableContext
+									// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
 									items={favorites.map((f: any) => f.id)}
 									strategy={verticalListSortingStrategy}
 								>

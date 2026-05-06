@@ -55,6 +55,7 @@ import {
 	parseTraits,
 	removeTrait,
 } from "../lib/narrator-utils";
+import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { pathsEqual, resolvePath } from "../lib/platform-path";
 import {
 	getToolMessage,
@@ -108,6 +109,7 @@ import {
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import { type NarratorGoalStatus, narratorGoalService } from "../services/narrator-goal-service";
+import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	handleBashCommand,
 	handleLoadSkillCommand,
@@ -117,6 +119,7 @@ import {
 } from "../services/narrator-service";
 import {
 	type BufferCreator,
+	cancelPendingExitPlanMode,
 	clearBufferedMessages,
 	closeNarrator,
 	continueNarrator,
@@ -129,7 +132,7 @@ import {
 	removeBufferedMessage,
 	reorderBufferedMessages,
 	resolveAllPendingPermissions,
-	resolvePermission,
+	resolvePermissionOrDangerReflection,
 	retryLastMessage,
 	rollbackToBlock,
 	runCustomCompact,
@@ -142,6 +145,7 @@ import {
 	updateNarratorModel,
 	updateNarratorPermissionMode,
 } from "../services/narrator-session";
+import { activeNarrators, planModeAskedOnce } from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
 import {
@@ -1294,9 +1298,8 @@ narratorRoutes.patch("/:id/model", async (c) => {
 narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	const id = c.req.param("id");
 	const { permissionMode } = await c.req.json();
-	const validModes = ["default", "acceptEdits", "bypassPermissions", "readOnly", "plan", "dontAsk"];
-	if (!permissionMode || !validModes.includes(permissionMode)) {
-		throw new ValidationError(`permissionMode must be one of: ${validModes.join(", ")}`);
+	if (!isPermissionMode(permissionMode)) {
+		throw new ValidationError(`permissionMode must be one of: ${PERMISSION_MODES.join(", ")}`);
 	}
 	const narrator = await narratorService.getById(id);
 
@@ -1307,7 +1310,6 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 		);
 	}
 
-	const currentMode = narrator.permissionMode;
 	await narratorService.updatePermissionMode(id, permissionMode);
 	await updateNarratorPermissionMode(id, permissionMode);
 
@@ -1317,82 +1319,103 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 		await resolveAllPendingPermissions(id);
 	}
 
-	// Persist synthetic tool call messages so the model sees mode transitions
-	// when context is rebuilt from message history.
-	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
+	return c.json({ ok: true });
+});
 
-	const isPlanLike = (m: string | null) => m === "plan";
-
-	if (isPlanLike(permissionMode) && !isPlanLike(currentMode)) {
-		// Entering plan mode — synthetic EnterPlanMode
-		const toolUseId = `toolu_manual_${generateShortId()}`;
-		const msg = await narratorService.persistAssistantMessage(id, {
-			uuid: randomUUID(),
-			session_id: randomUUID(),
-			parent_tool_use_id: null,
-			message: {
-				content: [
-					{
-						type: "tool_use",
-						id: toolUseId,
-						name: "EnterPlanMode",
-						input: { confirm: true },
-					},
-				],
-			},
-		});
-		await narratorService.updateToolCallResult(toolUseId, {
-			output: getToolMessage("enterPlanModeOutput", locale as Locale),
-			status: "success",
-		});
-		const fullMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, msg.id),
-			with: { toolCalls: true },
-		});
-		if (fullMsg) {
-			broadcastToNarrator(id, {
-				type: "message",
-				narratorId: id,
-				message: { ...fullMsg, seq: msg.seq },
-			});
-		}
-	} else if (isPlanLike(currentMode) && !isPlanLike(permissionMode)) {
-		// Leaving plan mode — synthetic ExitPlanMode
-		const toolUseId = `toolu_manual_${generateShortId()}`;
-		const msg = await narratorService.persistAssistantMessage(id, {
-			uuid: randomUUID(),
-			session_id: randomUUID(),
-			parent_tool_use_id: null,
-			message: {
-				content: [
-					{
-						type: "tool_use",
-						id: toolUseId,
-						name: "ExitPlanMode",
-						input: {},
-					},
-				],
-			},
-		});
-		await narratorService.updateToolCallResult(toolUseId, {
-			output: getToolMessage("exitPlanModeOutput", locale as Locale),
-			status: "success",
-		});
-		const fullMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, msg.id),
-			with: { toolCalls: true },
-		});
-		if (fullMsg) {
-			broadcastToNarrator(id, {
-				type: "message",
-				narratorId: id,
-				message: { ...fullMsg, seq: msg.seq },
-			});
-		}
+// Enter plan mode as a narrator trait (not a permission mode)
+narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const planState = await enterNarratorPlanMode(id);
+	const active = activeNarrators.get(id);
+	if (active) {
+		active._planFileId = planState.planFileId;
+		active._previousPermissionMode = planState.previousPermissionMode;
+	}
+	if (planState.wasPlanMode) {
+		return c.json({ ok: true, planMode: true, traits: planState.traits });
 	}
 
-	return c.json({ ok: true });
+	const userId = c.get("user").sub;
+	const locale = await getUserLanguage(userId);
+	const toolUseId = `toolu_manual_${generateShortId()}`;
+	const msg = await narratorService.persistAssistantMessage(id, {
+		uuid: randomUUID(),
+		session_id: randomUUID(),
+		parent_tool_use_id: null,
+		message: {
+			content: [
+				{
+					type: "tool_use",
+					id: toolUseId,
+					name: "EnterPlanMode",
+					input: {},
+				},
+			],
+		},
+	});
+	await narratorService.updateToolCallResult(toolUseId, {
+		output: getToolMessage("enterPlanModeOutput", locale as Locale),
+		status: "success",
+	});
+	const fullMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, msg.id),
+		with: { toolCalls: true },
+	});
+	if (fullMsg) {
+		broadcastToNarrator(id, {
+			type: "message",
+			narratorId: id,
+			message: { ...fullMsg, seq: msg.seq },
+		});
+	}
+	broadcastToNarrator(id, {
+		type: "plan_mode_changed",
+		narratorId: id,
+		planMode: true,
+		traits: planState.traits,
+	});
+	return c.json({ ok: true, planMode: true, traits: planState.traits });
+});
+
+// Cancel plan mode trait without changing the narrator's permission policy.
+narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const userId = c.get("user").sub;
+	const locale = (await getUserLanguage(userId)) as Locale;
+	const message = getToolMessage("planModeCancelled", locale);
+	const cancelledPermissions = await cancelPendingExitPlanMode(id, message);
+	const planState = await exitNarratorPlanMode(id);
+	const active = activeNarrators.get(id);
+	if (active) {
+		active._planFileId = undefined;
+		active._previousPermissionMode = undefined;
+	}
+	planModeAskedOnce.delete(id);
+
+	if (!planState.wasPlanMode && cancelledPermissions === 0) {
+		return c.json({ ok: true, planMode: false, traits: planState.traits });
+	}
+
+	const msg = await narratorService.persistSystemMessage(id, message, undefined, userId);
+	broadcastToNarrator(id, {
+		type: "message",
+		narratorId: id,
+		message: msg,
+	});
+	broadcastToNarrator(id, {
+		type: "plan_mode_changed",
+		narratorId: id,
+		planMode: false,
+		traits: planState.traits,
+	});
+	return c.json({
+		ok: true,
+		planMode: false,
+		traits: planState.traits,
+		cancelledPermissions,
+	});
 });
 
 // Update reasoning effort
@@ -1903,7 +1926,17 @@ narratorRoutes.get("/:id/permissions", async (c) => {
 narratorRoutes.post("/permissions/:requestId/approve", async (c) => {
 	const requestId = c.req.param("requestId");
 	const userId = c.get("user").sub;
-	await resolvePermission(requestId, "allow", { userId });
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = permissionDecisionSchema.safeParse({ decision: "allow", ...body });
+	const resolved = await resolvePermissionOrDangerReflection(requestId, "allow", {
+		answers: parsed.success ? parsed.data.answers : undefined,
+		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
+		compactAfter: parsed.success ? parsed.data.compactAfter : undefined,
+		updatedPlan: parsed.success ? parsed.data.updatedPlan : undefined,
+		userId,
+		decidedBy: "user",
+	});
+	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
 });
 
@@ -1912,9 +1945,14 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	const requestId = c.req.param("requestId");
 	const body = await c.req.json().catch(() => ({}));
 	const parsed = permissionDecisionSchema.safeParse({ decision: "deny", ...body });
-	await resolvePermission(requestId, "deny", {
+	const resolved = await resolvePermissionOrDangerReflection(requestId, "deny", {
 		denyMessage: parsed.success ? parsed.data.message : undefined,
+		answers: parsed.success ? parsed.data.answers : undefined,
+		feedbackText: parsed.success ? parsed.data.feedbackText : undefined,
+		updatedPlan: parsed.success ? parsed.data.updatedPlan : undefined,
+		decidedBy: "user",
 	});
+	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
 	return c.json({ ok: true });
 });
 
@@ -2362,6 +2400,9 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	const blocks = Array.isArray(targetMsg.contentJson)
 		? (targetMsg.contentJson as { type: string; id?: string }[])
 		: [];
+	if (blockIndex >= blocks.length) {
+		return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
+	}
 
 	// Collect tool_use IDs from blocks after blockIndex in the target message
 	const truncatedToolUseIds: string[] = [];

@@ -19,7 +19,7 @@ export class ApiError extends Error {
 // === Tool system ===
 
 export interface ReflectionLoopContext {
-	/** Kind of reflection loop, e.g. "yoloPause". */
+	/** Kind of reflection loop, e.g. "dangerReflection". */
 	kind: string;
 	/** Optional request/domain ID for the loop. */
 	requestId?: string;
@@ -64,7 +64,7 @@ export interface ToolContext {
 	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
-	/** Context for bounded reflection loops, such as YOLO pause review. */
+	/** Context for bounded reflection loops, such as danger reflection review. */
 	reflectionLoop?: ReflectionLoopContext;
 }
 
@@ -109,7 +109,7 @@ export type ResolvedToolDefinition = ToolDefinition & { description: string };
 
 // === Permission ===
 
-export interface YoloDangerInfo {
+export interface DangerInfo {
 	summary: string;
 	consequences: string[];
 	saferAlternatives: string[];
@@ -131,14 +131,16 @@ export type PermissionResult =
 			rawMessage?: boolean;
 	  }
 	| {
-			behavior: "yoloPause";
+			behavior: "dangerReflection";
 			requestId: string;
-			toolCallId: string;
-			message: string;
-			danger: YoloDangerInfo;
+			danger: DangerInfo;
 			fingerprint: string;
+			/** Effective input that should be reflected on and executed if confirmed. */
+			input: Record<string, unknown>;
 			decision: Promise<PermissionResult>;
 	  };
+
+export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow" }>;
 
 // === Agent events (yielded by the loop) ===
 
@@ -401,7 +403,9 @@ export interface AgentConfig {
 	parentNarratorId?: string;
 	maxTurns?: number;
 	planMode?: boolean;
-	/** Permission mode before entering plan mode — used to decide whether ExitPlanMode reflection is needed */
+	/** Current narrator permission mode; used for relaxed-plan safety checks. */
+	permissionMode?: string;
+	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	previousPermissionMode?: string;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;

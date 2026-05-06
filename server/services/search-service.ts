@@ -7,7 +7,19 @@ interface SearchResult {
 	title?: string;
 	snippet: string;
 	chapterId?: string;
+	chapterTitle?: string;
 	narratorId?: string;
+	narratorTitle?: string;
+	projectName?: string;
+	status?: string;
+	role?: string;
+	model?: string;
+	messageRole?: string;
+	createdAt?: string;
+	updatedAt?: string;
+	lastMessageAt?: string | null;
+	matchField?: string;
+	matchScore: number;
 }
 
 interface SearchOptions {
@@ -42,10 +54,13 @@ let _narratorsLike: Statement | null = null;
 function chaptersFtsStmt() {
 	if (!_chaptersFts) {
 		_chaptersFts = sqlite.prepare(
-			`SELECT c.id, c.title, c.project_id,
-			  snippet(chapters_fts, 1, '', '', '...', 64) as snippet
+			`SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at,
+			  p.name as project_name,
+			  snippet(chapters_fts, 1, '', '', '...', 96) as snippet,
+			  rank as rank_score
 			 FROM chapters_fts
 			 JOIN chapters c ON c.rowid = chapters_fts.rowid
+			 JOIN projects p ON p.id = c.project_id
 			 WHERE chapters_fts MATCH ?
 			 ORDER BY rank LIMIT ?`,
 		);
@@ -55,10 +70,12 @@ function chaptersFtsStmt() {
 function chaptersLikeStmt() {
 	if (!_chaptersLike) {
 		_chaptersLike = sqlite.prepare(
-			`SELECT id, title, project_id,
-			  substr(description, 1, 128) as snippet
-			 FROM chapters
-			 WHERE title LIKE ? OR description LIKE ?
+			`SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at,
+			  p.name as project_name,
+			  substr(COALESCE(c.description, c.title, ''), 1, 240) as snippet
+			 FROM chapters c
+			 JOIN projects p ON p.id = c.project_id
+			 WHERE c.title LIKE ? OR c.description LIKE ?
 			 LIMIT ?`,
 		);
 	}
@@ -67,11 +84,16 @@ function chaptersLikeStmt() {
 function messagesFtsStmt() {
 	if (!_messagesFts) {
 		_messagesFts = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
-			  snippet(narrator_messages_fts, 0, '', '', '...', 64) as snippet
+			`SELECT m.id, m.narrator_id, m.content_text, m.role as message_role, m.created_at,
+			  n.chapter_id, n.title as narrator_title, n.model,
+			  c.title as chapter_title, p.name as project_name,
+			  snippet(narrator_messages_fts, 0, '', '', '...', 96) as snippet,
+			  rank as rank_score
 			 FROM narrator_messages_fts
 			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
 			 WHERE narrator_messages_fts MATCH ?
 			 ORDER BY rank LIMIT ?`,
 		);
@@ -81,10 +103,14 @@ function messagesFtsStmt() {
 function messagesLikeStmt() {
 	if (!_messagesLike) {
 		_messagesLike = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.content_text, n.chapter_id,
-			  substr(m.content_text, 1, 200) as snippet
+			`SELECT m.id, m.narrator_id, m.content_text, m.role as message_role, m.created_at,
+			  n.chapter_id, n.title as narrator_title, n.model,
+			  c.title as chapter_title, p.name as project_name,
+			  substr(m.content_text, 1, 240) as snippet
 			 FROM narrator_messages m
 			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
 			 WHERE m.content_text LIKE ?
 			 LIMIT ?`,
 		);
@@ -94,10 +120,15 @@ function messagesLikeStmt() {
 function narratorsFtsStmt() {
 	if (!_narratorsFts) {
 		_narratorsFts = sqlite.prepare(
-			`SELECT n.id, n.title, n.chapter_id,
-			  snippet(narrators_fts, 0, '', '', '...', 64) as snippet
+			`SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.message_count,
+			  n.last_message_at, n.created_at, n.updated_at,
+			  c.title as chapter_title, p.name as project_name,
+			  snippet(narrators_fts, 0, '', '', '...', 96) as snippet,
+			  rank as rank_score
 			 FROM narrators_fts
 			 JOIN narrators n ON n.rowid = narrators_fts.rowid
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
 			 WHERE narrators_fts MATCH ?
 			 ORDER BY rank LIMIT ?`,
 		);
@@ -107,13 +138,23 @@ function narratorsFtsStmt() {
 function narratorsLikeStmt() {
 	if (!_narratorsLike) {
 		_narratorsLike = sqlite.prepare(
-			`SELECT id, title, chapter_id
-			 FROM narrators
-			 WHERE title LIKE ?
+			`SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.message_count,
+			  n.last_message_at, n.created_at, n.updated_at,
+			  c.title as chapter_title, p.name as project_name
+			 FROM narrators n
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE n.title LIKE ?
 			 LIMIT ?`,
 		);
 	}
 	return _narratorsLike;
+}
+
+function scoreFromRank(rank: unknown, fallback: number): number {
+	const numeric = typeof rank === "number" ? rank : Number(rank);
+	if (!Number.isFinite(numeric)) return fallback;
+	return Math.max(0, Math.round(1000 - numeric * 1000));
 }
 
 export const searchService = {
@@ -140,7 +181,16 @@ export const searchService = {
 					type: "chapter",
 					id: row.id,
 					title: row.title,
-					snippet: row.snippet || "",
+					projectName: row.project_name ?? undefined,
+					status: row.status,
+					role: row.role,
+					createdAt: row.created_at,
+					updatedAt: row.updated_at,
+					matchField: row.title?.toLowerCase().includes(safeQuery.toLowerCase())
+						? "title"
+						: "description",
+					matchScore: useFts ? scoreFromRank(row.rank_score, 760) : 520,
+					snippet: row.snippet || row.description || "",
 				});
 			}
 		}
@@ -155,8 +205,16 @@ export const searchService = {
 					type: "message",
 					id: row.id,
 					narratorId: row.narrator_id,
+					narratorTitle: row.narrator_title ?? undefined,
 					chapterId: row.chapter_id ?? undefined,
-					snippet: row.snippet || row.content_text?.slice(0, 200) || "",
+					chapterTitle: row.chapter_title ?? undefined,
+					projectName: row.project_name ?? undefined,
+					model: row.model ?? undefined,
+					messageRole: row.message_role ?? undefined,
+					createdAt: row.created_at,
+					matchField: "message",
+					matchScore: useFts ? scoreFromRank(row.rank_score, 700) : 500,
+					snippet: row.snippet || row.content_text?.slice(0, 240) || "",
 				});
 			}
 		}
@@ -172,11 +230,25 @@ export const searchService = {
 					id: row.id,
 					title: row.title,
 					chapterId: row.chapter_id ?? undefined,
+					chapterTitle: row.chapter_title ?? undefined,
+					projectName: row.project_name ?? undefined,
+					status: row.status,
+					model: row.model ?? undefined,
+					createdAt: row.created_at,
+					updatedAt: row.updated_at,
+					lastMessageAt: row.last_message_at,
+					matchField: "title",
+					matchScore: useFts ? scoreFromRank(row.rank_score, 820) : 620,
 					snippet: row.snippet || row.title || "",
 				});
 			}
 		}
 
-		return results;
+		return results.sort((a, b) => {
+			if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+			const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
+			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
+			return bTime - aTime;
+		});
 	},
 };

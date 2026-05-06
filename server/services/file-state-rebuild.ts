@@ -34,7 +34,7 @@ export async function queryOrderedToolCalls(
 	const conditions = [
 		eq(narratorToolCalls.narratorId, narratorId),
 		eq(narratorToolCalls.status, "success"),
-		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit', 'MultiEdit')`,
+		sql`${narratorToolCalls.toolName} IN ('Write', 'Edit')`,
 	];
 	if (maxSeq !== undefined) {
 		conditions.push(lte(narratorMessageRefs.seq, maxSeq));
@@ -79,7 +79,7 @@ export function applyToolCall(
 		return (input.content as string) ?? currentContent;
 	}
 
-	if (toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit") {
+	if (toolCall.toolName === "Edit") {
 		const oldString = input.old_string as string | undefined;
 		const newString = input.new_string as string | undefined;
 		const replaceAll = input.replace_all as boolean | undefined;
@@ -274,7 +274,7 @@ export function getAffectedFiles(
 ): string[] {
 	const files = new Set<string>();
 	for (const tc of toolCalls) {
-		if (tc.toolName !== "Write" && tc.toolName !== "Edit" && tc.toolName !== "MultiEdit") continue;
+		if (tc.toolName !== "Write" && tc.toolName !== "Edit") continue;
 		const input = tc.inputJson as Record<string, unknown> | null;
 		if (!input?.file_path) continue;
 		files.add(input.file_path as string);

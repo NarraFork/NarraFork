@@ -1,7 +1,6 @@
 import {
 	IconEye,
 	IconHandStop,
-	IconNotebook,
 	IconPencilCheck,
 	IconShield,
 	IconShieldOff,
@@ -100,6 +99,8 @@ export interface NarratorPanelSnapshot {
 	status: string;
 	totalCostUsd: number | null;
 	permissionMode: string | null;
+	traits?: string[] | null;
+	planMode?: boolean;
 	todosJson?: TodoItem[] | null;
 	todosToolUseId?: string | null;
 	errorMessage?: string | null;
@@ -182,7 +183,6 @@ export const PERM_MODES = [
 	"acceptEdits",
 	"bypassPermissions",
 	"readOnly",
-	"plan",
 	"dontAsk",
 ] as const;
 
@@ -191,6 +191,5 @@ export const PERM_MODE_ICONS: Record<string, React.ReactNode> = {
 	acceptEdits: createElement(IconPencilCheck, { size: 14 }),
 	bypassPermissions: createElement(IconShieldOff, { size: 14 }),
 	readOnly: createElement(IconEye, { size: 14 }),
-	plan: createElement(IconNotebook, { size: 14 }),
 	dontAsk: createElement(IconHandStop, { size: 14 }),
 };

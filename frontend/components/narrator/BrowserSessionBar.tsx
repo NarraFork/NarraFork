@@ -13,6 +13,7 @@ import {
 	IconCamera,
 	IconChevronDown,
 	IconChevronRight,
+	IconNetwork,
 	IconPlayerStop,
 	IconRefresh,
 	IconWorldWww,
@@ -100,6 +101,7 @@ function SessionCard({
 		url: string;
 		lastActivity: number;
 		tracing: { active: boolean; startedAt: number } | null;
+		networkRequestCount?: number;
 	};
 }) {
 	const { t } = useTranslation("narrator");
@@ -214,6 +216,7 @@ function SessionCard({
 				: `${Math.floor(elapsed / 3600_000)}h`;
 
 	const isTracing = session.tracing?.active ?? false;
+	const networkRequestCount = session.networkRequestCount ?? 0;
 
 	return (
 		<Box
@@ -236,6 +239,11 @@ function SessionCard({
 						<Text size="xs" c="dimmed">
 							{t("browser.lastActive", { time: elapsedLabel })}
 						</Text>
+						<Tooltip label={t("browser.networkRequests", { count: networkRequestCount })} fz="xs">
+							<Badge size="xs" variant="light" color="blue" leftSection={<IconNetwork size={10} />}>
+								{networkRequestCount}
+							</Badge>
+						</Tooltip>
 						{isTracing && (
 							<>
 								<Badge

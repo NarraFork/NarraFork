@@ -5,8 +5,8 @@ import { buildFtsQuery, sanitizeQuery } from "../../../services/search-service";
 import type { ToolDefinition, ToolResult } from "../types";
 
 /**
- * Recall — optional agent tool for full-text search and browsing of all
- * narrator conversations stored in NarraFork.
+ * Recall — optional agent tool for full-text search and browsing of the
+ * current narrator conversation stored in NarraFork.
  */
 
 const MAX_SEARCH_LIMIT = 50;
@@ -21,42 +21,76 @@ const MAX_TOOL_CALL_OUTPUT = 4000;
 // Avoids creating a new Statement object on every Recall tool invocation.
 
 let _searchFts: Statement | null = null;
+let _searchFtsWithFrom: Statement | null = null;
+let _searchFtsWithTo: Statement | null = null;
+let _searchFtsWithRange: Statement | null = null;
 let _searchLike: Statement | null = null;
+let _searchLikeWithFrom: Statement | null = null;
+let _searchLikeWithTo: Statement | null = null;
+let _searchLikeWithRange: Statement | null = null;
 let _getNarrator: Statement | null = null;
 let _getRefSeq: Statement | null = null;
 let _msgsAround: Statement | null = null;
 let _msgsLatest: Statement | null = null;
 let _getToolCall: Statement | null = null;
 
-function searchFtsStmt() {
-	if (!_searchFts) {
-		_searchFts = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.role, m.created_at,
-			        n.title AS narrator_title, n.chapter_id,
-			        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
-			 FROM narrator_messages_fts
-			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-			 JOIN narrators n ON n.id = m.narrator_id
-			 WHERE narrator_messages_fts MATCH ?
-			 ORDER BY rank
-			 LIMIT ?`,
-		);
+function prepareSearchFtsStmt(whereSuffix = "") {
+	return sqlite.prepare(
+		`SELECT m.id, r.narrator_id, m.role, m.created_at,
+		        n.title AS narrator_title, n.chapter_id,
+		        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
+		 FROM narrator_messages_fts
+		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+		 JOIN narrator_message_refs r ON r.message_id = m.id
+		 JOIN narrators n ON n.id = r.narrator_id
+		 WHERE narrator_messages_fts MATCH ? AND r.narrator_id = ?${whereSuffix}
+		 ORDER BY rank
+		 LIMIT ?`,
+	);
+}
+function searchFtsStmt(filter: TimeFilter): Statement {
+	if (filter.from && filter.to) {
+		_searchFtsWithRange ??= prepareSearchFtsStmt(" AND m.created_at >= ? AND m.created_at <= ?");
+		return _searchFtsWithRange;
 	}
+	if (filter.from) {
+		_searchFtsWithFrom ??= prepareSearchFtsStmt(" AND m.created_at >= ?");
+		return _searchFtsWithFrom;
+	}
+	if (filter.to) {
+		_searchFtsWithTo ??= prepareSearchFtsStmt(" AND m.created_at <= ?");
+		return _searchFtsWithTo;
+	}
+	_searchFts ??= prepareSearchFtsStmt();
 	return _searchFts;
 }
-function searchLikeStmt() {
-	if (!_searchLike) {
-		_searchLike = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.role, m.created_at,
-			        n.title AS narrator_title, n.chapter_id,
-			        substr(m.content_text, 1, ?) AS snippet
-			 FROM narrator_messages m
-			 JOIN narrators n ON n.id = m.narrator_id
-			 WHERE m.content_text LIKE ?
-			 ORDER BY m.created_at DESC
-			 LIMIT ?`,
-		);
+function prepareSearchLikeStmt(whereSuffix = "") {
+	return sqlite.prepare(
+		`SELECT m.id, r.narrator_id, m.role, m.created_at,
+		        n.title AS narrator_title, n.chapter_id,
+		        substr(m.content_text, 1, ?) AS snippet
+		 FROM narrator_messages m
+		 JOIN narrator_message_refs r ON r.message_id = m.id
+		 JOIN narrators n ON n.id = r.narrator_id
+		 WHERE m.content_text LIKE ? AND r.narrator_id = ?${whereSuffix}
+		 ORDER BY m.created_at DESC
+		 LIMIT ?`,
+	);
+}
+function searchLikeStmt(filter: TimeFilter): Statement {
+	if (filter.from && filter.to) {
+		_searchLikeWithRange ??= prepareSearchLikeStmt(" AND m.created_at >= ? AND m.created_at <= ?");
+		return _searchLikeWithRange;
 	}
+	if (filter.from) {
+		_searchLikeWithFrom ??= prepareSearchLikeStmt(" AND m.created_at >= ?");
+		return _searchLikeWithFrom;
+	}
+	if (filter.to) {
+		_searchLikeWithTo ??= prepareSearchLikeStmt(" AND m.created_at <= ?");
+		return _searchLikeWithTo;
+	}
+	_searchLike ??= prepareSearchLikeStmt();
 	return _searchLike;
 }
 function getNarratorStmt() {
@@ -108,7 +142,7 @@ function getToolCallStmt() {
 			        tc.narrator_id, n.title AS narrator_title
 			 FROM narrator_tool_calls tc
 			 JOIN narrators n ON n.id = tc.narrator_id
-			 WHERE tc.tool_use_id = ?`,
+			 WHERE tc.tool_use_id = ? AND tc.narrator_id = ?`,
 		);
 	}
 	return _getToolCall;
@@ -117,16 +151,17 @@ function getToolCallStmt() {
 export const recallTool: ToolDefinition = {
 	name: "Recall",
 	description:
-		"Search and browse all narrator conversations in NarraFork. " +
-		"Use this to recall previous discussions, find relevant context from other sessions, " +
-		"or explore what was discussed in any chapter.\n\n" +
+		"Search and browse the current narrator conversation in NarraFork. " +
+		"By default this tool is self-scoped: search, conversation reads, and tool-call reads " +
+		"can only access the narrator that is currently running this tool.\n\n" +
 		"Three actions are available:\n" +
-		'- "search": Full-text search across all narrator messages. Returns matching snippets with metadata. ' +
-		"Pass an array of strings to `query` to run multiple searches in one call.\n" +
-		'- "read_conversation": Read messages from a specific narrator session. ' +
+		'- "search": Full-text search across the current narrator messages. Returns matching snippets with metadata. ' +
+		"Pass an array of strings to `query` to run multiple searches in one call. " +
+		"Optionally restrict by absolute time (`from`, `to`) or relative time (`time_range`, e.g. 24h, 7d).\n" +
+		'- "read_conversation": Read messages from the current narrator session. ' +
 		"Each assistant message includes a summary of its tool calls (tool name + key params). " +
 		"Optionally center around a specific message ID (e.g. from a search result).\n" +
-		'- "read_tool_call": Read the full input/output of a specific tool call by its toolUseId ' +
+		'- "read_tool_call": Read the full input/output of a tool call in the current narrator by its toolUseId ' +
 		"(obtained from read_conversation results).",
 	parameters: z.object({
 		action: z
@@ -142,7 +177,9 @@ export const recallTool: ToolDefinition = {
 		narrator_id: z
 			.string()
 			.optional()
-			.describe('Narrator ID to read messages from (required for action "read_conversation")'),
+			.describe(
+				'Optional narrator ID for action "read_conversation"; if provided it must match the current narrator.',
+			),
 		message_id: z
 			.string()
 			.optional()
@@ -160,22 +197,48 @@ export const recallTool: ToolDefinition = {
 			.describe(
 				`Number of results to return. Default ${DEFAULT_SEARCH_LIMIT}, max ${MAX_SEARCH_LIMIT}.`,
 			),
+		from: z
+			.string()
+			.optional()
+			.describe(
+				'Optional absolute start time for search results, inclusive. Supports ISO strings, "YYYY-MM-DD", and "YYYY-MM-DD HH:mm".',
+			),
+		to: z
+			.string()
+			.optional()
+			.describe(
+				'Optional absolute end time for search results, inclusive. Supports ISO strings, "YYYY-MM-DD", and "YYYY-MM-DD HH:mm".',
+			),
+		time_range: z
+			.string()
+			.optional()
+			.describe(
+				'Optional relative time window for search results, such as "24h", "7d", "2w", "1mo", or "1y". Ignored when from/to is provided.',
+			),
 	}),
 
-	async execute(args): Promise<ToolResult> {
-		const { action, query, narrator_id, message_id, tool_call_id, limit } = args as {
-			action: "search" | "read_conversation" | "read_tool_call";
-			query?: string | string[];
-			narrator_id?: string;
-			message_id?: string;
-			tool_call_id?: string;
-			limit?: number;
-		};
+	async execute(args, ctx): Promise<ToolResult> {
+		const currentNarratorId = ctx.narratorId;
+		const { action, query, narrator_id, message_id, tool_call_id, limit, from, to, time_range } =
+			args as {
+				action: "search" | "read_conversation" | "read_tool_call";
+				query?: string | string[];
+				narrator_id?: string;
+				message_id?: string;
+				tool_call_id?: string;
+				limit?: number;
+				from?: string;
+				to?: string;
+				time_range?: string;
+			};
 
 		if (action === "search") {
+			const timeFilterResult = buildTimeFilter({ from, to, timeRange: time_range });
+			if (timeFilterResult.isError) return timeFilterResult;
+			const timeFilter = timeFilterResult.filter;
 			const queries = Array.isArray(query) ? query : [query];
 			if (queries.length === 1) {
-				return handleSearch(queries[0], limit);
+				return handleSearch(queries[0], limit, timeFilter, currentNarratorId);
 			}
 			if (queries.length > MAX_BATCH_QUERIES) {
 				return {
@@ -189,7 +252,7 @@ export const recallTool: ToolDefinition = {
 			const queryList: string[] = [];
 			let errorCount = 0;
 			for (const q of queries) {
-				const result = handleSearch(q, limit);
+				const result = handleSearch(q, limit, timeFilter, currentNarratorId);
 				if (result.isError) errorCount++;
 				sections.push(result.output);
 				// Collect structured results from each sub-search
@@ -205,13 +268,14 @@ export const recallTool: ToolDefinition = {
 					action: "search",
 					queries: queryList,
 					results: allResults,
+					...(timeFilter ? { timeFilter } : {}),
 				} satisfies BatchSearchMetadata,
 			};
 		}
 		if (action === "read_tool_call") {
-			return handleReadToolCall(tool_call_id);
+			return handleReadToolCall(tool_call_id, currentNarratorId);
 		}
-		return handleReadConversation(narrator_id, message_id, limit);
+		return handleReadConversation(narrator_id, message_id, limit, currentNarratorId);
 	},
 };
 
@@ -229,16 +293,24 @@ interface SearchResultItem {
 	snippet: string;
 }
 
+interface TimeFilter {
+	from?: string;
+	to?: string;
+	timeRange?: string;
+}
+
 interface SearchMetadata {
 	action: "search";
 	query: string;
 	results: SearchResultItem[];
+	timeFilter?: TimeFilter;
 }
 
 interface BatchSearchMetadata {
 	action: "search";
 	queries: string[];
 	results: SearchResultItem[];
+	timeFilter?: TimeFilter;
 }
 
 interface ConversationToolCall {
@@ -275,7 +347,7 @@ function extractStr(obj: any, ...keys: string[]): string {
 	return "";
 }
 
-const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit", "Glob"]);
+const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob"]);
 const BASH_TOOLS = new Set(["Bash", "Shell"]);
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
@@ -334,7 +406,111 @@ function getToolCallSummary(toolName: string, inputJson: any): string {
 // search
 // ---------------------------------------------------------------------------
 
-function handleSearch(query: string | undefined, limit: number | undefined): ToolResult {
+function isDateOnly(value: string): boolean {
+	return /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
+}
+
+function normalizeDateLike(value: string): string {
+	const trimmed = value.trim();
+	return trimmed.includes(" ") && !trimmed.includes("T") ? trimmed.replace(" ", "T") : trimmed;
+}
+
+function parseAbsoluteTime(value: string, boundary: "from" | "to"): string | null {
+	const normalized = isDateOnly(value)
+		? `${value.trim()}T${boundary === "to" ? "23:59:59.999" : "00:00:00.000"}`
+		: normalizeDateLike(value);
+	const date = new Date(normalized);
+	if (Number.isNaN(date.getTime())) return null;
+	return date.toISOString();
+}
+
+function applyRelativeTimeRange(now: Date, amount: number, unit: string): Date {
+	const from = new Date(now);
+	const normalized = unit.toLowerCase();
+	if (["m", "min", "mins", "minute", "minutes"].includes(normalized)) {
+		from.setMinutes(from.getMinutes() - amount);
+	} else if (["h", "hr", "hrs", "hour", "hours"].includes(normalized)) {
+		from.setHours(from.getHours() - amount);
+	} else if (["d", "day", "days"].includes(normalized)) {
+		from.setDate(from.getDate() - amount);
+	} else if (["w", "week", "weeks"].includes(normalized)) {
+		from.setDate(from.getDate() - amount * 7);
+	} else if (["mo", "month", "months"].includes(normalized)) {
+		from.setMonth(from.getMonth() - amount);
+	} else if (["y", "yr", "yrs", "year", "years"].includes(normalized)) {
+		from.setFullYear(from.getFullYear() - amount);
+	}
+	return from;
+}
+
+function parseRelativeTimeRange(value: string): { from: string; to: string } | null {
+	const match = value
+		.trim()
+		.match(
+			/^(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|yr|yrs|year|years)$/i,
+		);
+	if (!match) return null;
+	const amount = Number(match[1]);
+	if (!Number.isFinite(amount) || amount <= 0) return null;
+	const now = new Date();
+	return {
+		from: applyRelativeTimeRange(now, amount, match[2]).toISOString(),
+		to: now.toISOString(),
+	};
+}
+
+function buildTimeFilter(input: {
+	from?: string;
+	to?: string;
+	timeRange?: string;
+}): { filter?: TimeFilter; isError?: false } | (ToolResult & { isError: true }) {
+	const hasAbsolute = Boolean(input.from || input.to);
+	if (hasAbsolute) {
+		const from = input.from ? parseAbsoluteTime(input.from, "from") : undefined;
+		const to = input.to ? parseAbsoluteTime(input.to, "to") : undefined;
+		if (input.from && !from) {
+			return { output: `Invalid from time: "${input.from}".`, isError: true };
+		}
+		if (input.to && !to) {
+			return { output: `Invalid to time: "${input.to}".`, isError: true };
+		}
+		if (from && to && from > to) {
+			return { output: `Invalid time range: from (${from}) is after to (${to}).`, isError: true };
+		}
+		return { filter: { ...(from ? { from } : {}), ...(to ? { to } : {}) } };
+	}
+	if (!input.timeRange) return {};
+	const parsed = parseRelativeTimeRange(input.timeRange);
+	if (!parsed) {
+		return {
+			output: `Invalid time_range: "${input.timeRange}". Use values like "24h", "7d", "2w", "1mo", or "1y".`,
+			isError: true,
+		};
+	}
+	return { filter: { from: parsed.from, to: parsed.to, timeRange: input.timeRange } };
+}
+
+function timeFilterParams(filter: TimeFilter): string[] {
+	if (filter.from && filter.to) return [filter.from, filter.to];
+	if (filter.from) return [filter.from];
+	if (filter.to) return [filter.to];
+	return [];
+}
+
+function describeTimeFilter(filter: TimeFilter | undefined): string {
+	if (!filter) return "";
+	const parts: string[] = [];
+	if (filter.from) parts.push(`from ${filter.from}`);
+	if (filter.to) parts.push(`to ${filter.to}`);
+	return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+}
+
+function handleSearch(
+	query: string | undefined,
+	limit: number | undefined,
+	timeFilter: TimeFilter | undefined,
+	currentNarratorId: string,
+): ToolResult {
 	if (!query) {
 		return { output: 'Parameter "query" is required for action "search".', isError: true };
 	}
@@ -350,18 +526,25 @@ function handleSearch(query: string | undefined, limit: number | undefined): Too
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic SQL rows
 	let rows: any[];
 
+	const filter = timeFilter ?? {};
+	const timeParams = timeFilterParams(filter);
 	if (useFts) {
 		const ftsExpr = buildFtsQuery(safeQuery);
-		rows = searchFtsStmt().all(ftsExpr, cap);
+		rows = searchFtsStmt(filter).all(ftsExpr, currentNarratorId, ...timeParams, cap);
 	} else {
 		const like = `%${safeQuery}%`;
-		rows = searchLikeStmt().all(SNIPPET_CHARS, like, cap);
+		rows = searchLikeStmt(filter).all(SNIPPET_CHARS, like, currentNarratorId, ...timeParams, cap);
 	}
 
 	if (rows.length === 0) {
 		return {
-			output: `No results found for "${query}".`,
-			metadata: { action: "search", query, results: [] } satisfies SearchMetadata,
+			output: `No results found for "${query}"${describeTimeFilter(timeFilter)}.`,
+			metadata: {
+				action: "search",
+				query,
+				results: [],
+				...(timeFilter ? { timeFilter } : {}),
+			} satisfies SearchMetadata,
 		};
 	}
 
@@ -375,7 +558,9 @@ function handleSearch(query: string | undefined, limit: number | undefined): Too
 		snippet: (row.snippet ?? "").replace(/\n/g, " ").slice(0, SNIPPET_CHARS),
 	}));
 
-	const lines: string[] = [`Found ${rows.length} result(s) for "${query}":\n`];
+	const lines: string[] = [
+		`Found ${rows.length} result(s) for "${query}"${describeTimeFilter(timeFilter)}:\n`,
+	];
 	for (const r of results) {
 		lines.push(
 			`- [${r.role}] message ${r.id}` +
@@ -390,7 +575,12 @@ function handleSearch(query: string | undefined, limit: number | undefined): Too
 	return {
 		output: lines.join("\n"),
 		title: `Recall: ${query}`,
-		metadata: { action: "search", query, results } satisfies SearchMetadata,
+		metadata: {
+			action: "search",
+			query,
+			results,
+			...(timeFilter ? { timeFilter } : {}),
+		} satisfies SearchMetadata,
 	};
 }
 
@@ -402,10 +592,12 @@ function handleReadConversation(
 	narratorId: string | undefined,
 	messageId: string | undefined,
 	limit: number | undefined,
+	currentNarratorId: string,
 ): ToolResult {
-	if (!narratorId) {
+	const targetNarratorId = narratorId ?? currentNarratorId;
+	if (targetNarratorId !== currentNarratorId) {
 		return {
-			output: 'Parameter "narrator_id" is required for action "read_conversation".',
+			output: `Recall is scoped to the current narrator (${currentNarratorId}); narrator "${targetNarratorId}" is not accessible.`,
 			isError: true,
 		};
 	}
@@ -413,12 +605,12 @@ function handleReadConversation(
 	const cap = Math.min(Math.max(limit ?? DEFAULT_READ_LIMIT, 1), MAX_READ_LIMIT);
 
 	// Verify narrator exists
-	const narrator = getNarratorStmt().get(narratorId) as
+	const narrator = getNarratorStmt().get(targetNarratorId) as
 		| { id: string; title: string | null; chapter_id: string | null; model: string | null }
 		| undefined;
 
 	if (!narrator) {
-		return { output: `Narrator "${narratorId}" not found.`, isError: true };
+		return { output: `Narrator "${targetNarratorId}" not found.`, isError: true };
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic SQL rows
@@ -426,25 +618,25 @@ function handleReadConversation(
 
 	if (messageId) {
 		// Find the seq of the target message in this narrator's refs
-		const ref = getRefSeqStmt().get(narratorId, messageId) as { seq: number } | undefined;
+		const ref = getRefSeqStmt().get(targetNarratorId, messageId) as { seq: number } | undefined;
 
 		if (!ref) {
 			return {
-				output: `Message "${messageId}" not found in narrator "${narratorId}".`,
+				output: `Message "${messageId}" not found in the current narrator.`,
 				isError: true,
 			};
 		}
 
 		const half = Math.floor(cap / 2);
-		rows = msgsAroundStmt().all(narratorId, ref.seq - half, ref.seq + (cap - half));
+		rows = msgsAroundStmt().all(targetNarratorId, ref.seq - half, ref.seq + (cap - half));
 	} else {
 		// Latest messages
-		rows = msgsLatestStmt().all(narratorId, cap);
+		rows = msgsLatestStmt().all(targetNarratorId, cap);
 		rows.reverse();
 	}
 
 	if (rows.length === 0) {
-		return { output: `No messages found for narrator "${narratorId}".` };
+		return { output: `No messages found for the current narrator (${targetNarratorId}).` };
 	}
 
 	// Batch-load tool calls for all message IDs
@@ -453,10 +645,10 @@ function handleReadConversation(
 		.prepare(
 			`SELECT tool_use_id, tool_name, status, input_json, message_id
 			 FROM narrator_tool_calls
-			 WHERE message_id IN (${messageIds.map(() => "?").join(",")})
+			 WHERE message_id IN (${messageIds.map(() => "?").join(",")}) AND narrator_id = ?
 			 ORDER BY created_at ASC`,
 		)
-		.all(...messageIds) as Array<{
+		.all(...messageIds, targetNarratorId) as Array<{
 		tool_use_id: string;
 		tool_name: string;
 		status: string;
@@ -498,7 +690,7 @@ function handleReadConversation(
 	});
 
 	const header =
-		`Narrator: ${narrator.title ?? narratorId}` +
+		`Narrator: ${narrator.title ?? targetNarratorId}` +
 		(narrator.chapter_id ? ` (chapter ${narrator.chapter_id})` : "") +
 		(narrator.model ? ` [${narrator.model}]` : "") +
 		`\nShowing ${rows.length} message(s):\n`;
@@ -517,10 +709,10 @@ function handleReadConversation(
 
 	return {
 		output: lines.join("\n"),
-		title: `Conversation: ${narrator.title ?? narratorId}`,
+		title: `Conversation: ${narrator.title ?? targetNarratorId}`,
 		metadata: {
 			action: "read_conversation",
-			narratorId,
+			narratorId: targetNarratorId,
 			narratorTitle: narrator.title,
 			chapterId: narrator.chapter_id,
 			model: narrator.model,
@@ -533,7 +725,7 @@ function handleReadConversation(
 // read_tool_call
 // ---------------------------------------------------------------------------
 
-function handleReadToolCall(toolCallId: string | undefined): ToolResult {
+function handleReadToolCall(toolCallId: string | undefined, currentNarratorId: string): ToolResult {
 	if (!toolCallId) {
 		return {
 			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
@@ -541,7 +733,7 @@ function handleReadToolCall(toolCallId: string | undefined): ToolResult {
 		};
 	}
 
-	const tc = getToolCallStmt().get(toolCallId) as
+	const tc = getToolCallStmt().get(toolCallId, currentNarratorId) as
 		| {
 				tool_use_id: string;
 				tool_name: string;
@@ -557,7 +749,10 @@ function handleReadToolCall(toolCallId: string | undefined): ToolResult {
 		| undefined;
 
 	if (!tc) {
-		return { output: `Tool call "${toolCallId}" not found.`, isError: true };
+		return {
+			output: `Tool call "${toolCallId}" not found in the current narrator.`,
+			isError: true,
+		};
 	}
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON

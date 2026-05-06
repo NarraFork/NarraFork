@@ -187,7 +187,6 @@ function extractHeaderHints(toolName: string, input: any): Record<string, unknow
 	switch (toolName) {
 		case "Write":
 		case "Edit":
-		case "MultiEdit":
 		case "Read": {
 			const fp = str("file_path") ?? str("filePath") ?? str("path");
 			if (fp) h.file_path = fp;

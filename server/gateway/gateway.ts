@@ -598,7 +598,7 @@ class Gateway {
 			title: `IM: ${msg.username} (${msg.platform})`,
 			status: "idle",
 			model: FOLLOW_DEFAULT_MODEL,
-			permissionMode: (this.config?.defaultPermissionMode as any) ?? "bypassPermissions",
+			permissionMode: this.config?.defaultPermissionMode ?? "default",
 			messageCount: 0,
 			totalCostUsd: 0,
 			pruneEnabled: true,

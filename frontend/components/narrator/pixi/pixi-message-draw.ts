@@ -1152,6 +1152,11 @@ export type PixiMessageHitTarget =
 			reasoningKey: string;
 	  })
 	| (PixiMessageHitTargetBase & {
+			kind: "tool-content-scroll";
+			scrollKey: string;
+			maxScrollTop: number;
+	  })
+	| (PixiMessageHitTargetBase & {
 			kind: "message-menu";
 			blockId: string;
 			messageId?: string;
@@ -1385,6 +1390,7 @@ function drawCodePanel(
 	bx: number,
 	by: number,
 	terminal: boolean,
+	scrollTop = 0,
 ): void {
 	const x = bx + block.x;
 	const y = by + block.y;
@@ -1393,29 +1399,92 @@ function drawCodePanel(
 	gfx.roundRect(x, y, block.width, block.height, 4);
 	gfx.fill({ color: bg, alpha: terminal ? 0.92 : 0.42 });
 	gfx.stroke({ color: terminal ? theme.panelBorder : theme.toolBorder, alpha: 0.55, width: 1 });
-	let textY = y + CODE_PADDING_Y;
+	const allLines = block.lines ?? [];
+	const viewportHeight = block.viewportHeight ?? Math.max(0, block.height - CODE_PADDING_Y * 2);
+	const maxScrollTop = block.maxScrollTop ?? 0;
+	const clampedScrollTop = Math.max(0, Math.min(scrollTop, maxScrollTop));
+	const firstLine = Math.max(0, Math.floor(clampedScrollTop / CODE_LINE_H));
+	const lineOffset = clampedScrollTop % CODE_LINE_H;
+	const visibleLineCount = Math.ceil(viewportHeight / CODE_LINE_H) + 1;
+	let textY = y + CODE_PADDING_Y - lineOffset;
 	const isGrepOutput = block.lang === "grep-output";
-	const highlightedVisualLines = isGrepOutput
-		? (block.lines ?? []).map((line) => getGrepOutputLineTokens(line.text, theme))
+	const visibleLines = allLines.slice(firstLine, firstLine + visibleLineCount);
+	const visibleText = visibleLines.map((line) => line.text).join("\n");
+	const highlightedVisibleLines = isGrepOutput
+		? visibleLines.map((line) => getGrepOutputLineTokens(line.text, theme))
 		: splitTokensByPretextLines(
-				getPixiHighlightedTokens(block.text ?? "", block.lang, shikiThemeName()),
-				block.lines ?? [],
+				getPixiHighlightedTokens(visibleText, block.lang, shikiThemeName()),
+				visibleLines,
 			);
-	for (let lineIndex = 0; lineIndex < (block.lines ?? []).length; lineIndex++) {
-		const line = block.lines?.[lineIndex];
-		if (!line) continue;
-		// Shiki highlights the complete source to preserve semantic context.
-		// pretext decides the visual wraps; we slice the full token stream to match
-		// each pretext-produced visual line.
-		drawTokenLine(
-			textPool,
-			line.text,
-			highlightedVisualLines?.[lineIndex],
-			x + CODE_PADDING_X,
-			textY,
-			fg,
-		);
+	for (let lineIndex = 0; lineIndex < visibleLines.length; lineIndex++) {
+		const line = visibleLines[lineIndex];
+		if (textY > y + block.height - CODE_PADDING_Y) break;
+		if (textY + CODE_LINE_H >= y + CODE_PADDING_Y - 0.5) {
+			// Shiki highlights the complete source to preserve semantic context.
+			// pretext decides the visual wraps; we slice the full token stream to match
+			// each pretext-produced visual line.
+			drawTokenLine(
+				textPool,
+				line.text,
+				highlightedVisibleLines?.[lineIndex],
+				x + CODE_PADDING_X,
+				textY,
+				fg,
+			);
+		}
 		textY += CODE_LINE_H;
+	}
+	if (maxScrollTop > 0) {
+		const trackX = x + block.width - 5;
+		const trackY = y + CODE_PADDING_Y;
+		const trackH = Math.max(1, viewportHeight);
+		const thumbH = Math.max(
+			18,
+			(trackH * trackH) / Math.max(trackH, block.contentHeight ?? trackH),
+		);
+		const thumbY = trackY + ((trackH - thumbH) * clampedScrollTop) / maxScrollTop;
+		gfx.roundRect(trackX, trackY, 3, trackH, 2);
+		gfx.fill({ color: theme.toolBorder, alpha: 0.18 });
+		gfx.roundRect(trackX, thumbY, 3, thumbH, 2);
+		gfx.fill({ color: theme.dimmed, alpha: 0.55 });
+	}
+}
+
+function drawDiffWordBackgrounds(
+	gfx: Graphics,
+	visualLines: Array<{ text: string }>,
+	wordChanges: Array<{ value: string; added?: boolean; removed?: boolean }>,
+	x: number,
+	y: number,
+	color: number,
+): void {
+	const ranges: Array<{ start: number; end: number }> = [];
+	let offset = 0;
+	for (const wc of wordChanges) {
+		const start = offset;
+		offset += wc.value.length;
+		if ((wc.added || wc.removed) && offset > start) ranges.push({ start, end: offset });
+	}
+	if (ranges.length === 0) return;
+
+	let visualOffset = 0;
+	for (let i = 0; i < visualLines.length; i++) {
+		const text = visualLines[i]?.text ?? "";
+		const lineStart = visualOffset;
+		const lineEnd = lineStart + text.length;
+		for (const range of ranges) {
+			const start = Math.max(range.start, lineStart);
+			const end = Math.min(range.end, lineEnd);
+			if (end <= start) continue;
+			const localStart = start - lineStart;
+			const localEnd = end - lineStart;
+			const bgX = x + measureMonoAdvance(text.slice(0, localStart), MONO_STYLE);
+			const bgWidth = measureMonoAdvance(text.slice(localStart, localEnd), MONO_STYLE);
+			if (bgWidth <= 0) continue;
+			gfx.rect(bgX, y + i * CODE_LINE_H - 1, bgWidth, CODE_LINE_H);
+			gfx.fill({ color, alpha: 0.28 });
+		}
+		visualOffset = lineEnd;
 	}
 }
 
@@ -1448,39 +1517,24 @@ function drawDiffPanel(
 		const newNo = line.newNo != null ? `${linePrefix}${line.newNo}`.padStart(3) : "   ";
 		textPool.acquire(`${oldNo} ${newNo}${prefix}`, x + 8, y, MONO_STYLE, color);
 
+		const highlighted = getPixiHighlightedTokens(line.text, block.lang, shikiThemeName());
+		const highlightedVisualLines = splitTokensByPretextLines(highlighted, line.lines);
 		if (line.wordChanges?.length) {
-			// Word-level diff rendering (level 2): draw each word chunk with
-			// highlighted background for changed words
-			let wordX = x + 60;
-			for (const wc of line.wordChanges) {
-				const wordWidth = measureMonoAdvance(wc.value, MONO_STYLE);
-				if ((wc.added || wc.removed) && wordWidth > 0) {
-					// Word-level background highlight (deeper color)
-					gfx.rect(wordX, y - 1, wordWidth, CODE_LINE_H);
-					gfx.fill({ color, alpha: 0.28 });
-				}
-				if (!/^\s+$/.test(wc.value)) {
-					textPool.acquire(wc.value, wordX, y, MONO_STYLE, color);
-				}
-				wordX += wordWidth;
-			}
-		} else {
-			// No word changes: use syntax highlighting as before
-			const highlighted = getPixiHighlightedTokens(line.text, block.lang, shikiThemeName());
-			const highlightedVisualLines = splitTokensByPretextLines(highlighted, line.lines);
-			let lineY = y;
-			for (let i = 0; i < line.lines.length; i++) {
-				const visualLine = line.lines[i];
-				drawTokenLine(
-					textPool,
-					visualLine.text || " ",
-					highlightedVisualLines?.[i],
-					x + 60,
-					lineY,
-					line.type === "context" ? theme.text : color,
-				);
-				lineY += CODE_LINE_H;
-			}
+			// Word-level background highlight (level 2). Text is still drawn with Shiki below.
+			drawDiffWordBackgrounds(gfx, line.lines, line.wordChanges, x + 60, y, color);
+		}
+		let lineY = y;
+		for (let i = 0; i < line.lines.length; i++) {
+			const visualLine = line.lines[i];
+			drawTokenLine(
+				textPool,
+				visualLine.text || " ",
+				highlightedVisualLines?.[i],
+				x + 60,
+				lineY,
+				line.type === "context" ? theme.text : color,
+			);
+			lineY += CODE_LINE_H;
 		}
 		y += Math.max(1, line.lines.length) * CODE_LINE_H;
 	}
@@ -1525,6 +1579,7 @@ function drawToolDetailBlock(
 	by: number,
 	hitTargets?: PixiMessageHitTarget[],
 	hoveredHitTargetId?: string | null,
+	getToolContentScroll?: (scrollKey: string) => number,
 ): void {
 	if (block.kind === "badge-row") {
 		for (const badge of block.badges ?? []) {
@@ -1631,7 +1686,20 @@ function drawToolDetailBlock(
 		return;
 	}
 	if (block.kind === "code-panel" || block.kind === "terminal-panel") {
-		drawCodePanel(textPool, gfx, theme, block, bx, by, block.kind === "terminal-panel");
+		const scrollTop = block.scrollKey ? (getToolContentScroll?.(block.scrollKey) ?? 0) : 0;
+		drawCodePanel(textPool, gfx, theme, block, bx, by, block.kind === "terminal-panel", scrollTop);
+		if (block.scrollKey && (block.maxScrollTop ?? 0) > 0) {
+			hitTargets?.push({
+				id: `tool-content-scroll:${block.scrollKey}`,
+				kind: "tool-content-scroll",
+				scrollKey: block.scrollKey,
+				maxScrollTop: block.maxScrollTop ?? 0,
+				x: bx + block.x,
+				y: by + block.y,
+				width: block.width,
+				height: block.height,
+			});
+		}
 		return;
 	}
 	if (block.kind === "diff-panel") {
@@ -1693,9 +1761,21 @@ function drawToolUseBlock(
 		iconPool: IconSpritePool;
 		hitTargets?: PixiMessageHitTarget[];
 		hoveredHitTargetId?: string | null;
+		getToolContentScroll?: (scrollKey: string) => number;
 	},
 ): boolean {
-	const { textPool, iconPool, gfx, block, bx, by, theme, hitTargets, hoveredHitTargetId } = opts;
+	const {
+		textPool,
+		iconPool,
+		gfx,
+		block,
+		bx,
+		by,
+		theme,
+		hitTargets,
+		hoveredHitTargetId,
+		getToolContentScroll,
+	} = opts;
 	if (block.type !== "tool_use" || !block.toolName || !block.toolHeader) return false;
 	const categoryColor = colorForName(theme, block.toolCategoryColor);
 	const statusColor = colorForName(theme, block.toolStatusColor);
@@ -1795,7 +1875,17 @@ function drawToolUseBlock(
 	}
 
 	for (const detailBlock of block.toolDetailBlocks ?? []) {
-		drawToolDetailBlock(textPool, gfx, theme, detailBlock, bx, by, hitTargets, hoveredHitTargetId);
+		drawToolDetailBlock(
+			textPool,
+			gfx,
+			theme,
+			detailBlock,
+			bx,
+			by,
+			hitTargets,
+			hoveredHitTargetId,
+			getToolContentScroll,
+		);
 	}
 
 	for (const line of block.toolDetailBlocks?.length ? [] : (block.toolDetailLines ?? [])) {
@@ -1888,6 +1978,7 @@ export function drawPixiMessages(opts: {
 	hoveredHitTargetId?: string | null;
 	swipedMessage?: { targetId: string; offset: number; offscreen?: "top" | "bottom" | null } | null;
 	selectedBlockIds?: ReadonlySet<string>;
+	getToolContentScroll?: (scrollKey: string) => number;
 }) {
 	const {
 		textPool,
@@ -1904,6 +1995,7 @@ export function drawPixiMessages(opts: {
 		hoveredHitTargetId,
 		swipedMessage,
 		selectedBlockIds,
+		getToolContentScroll,
 	} = opts;
 	gfx.clear();
 	if (hitTargets) hitTargets.length = 0;
@@ -1943,12 +2035,9 @@ export function drawPixiMessages(opts: {
 		const itemSwipeDx = swipedBlock && !isTool ? -(swipedMessage?.offset ?? 0) : 0;
 		const isMultiToolRun = isTool && item.blocks.length >= 2;
 		const isPlainAssistant = item.role === "assistant" && item.kind !== "tool-run";
-		const hasBubble = !isPlainAssistant && !isTool;
-		const isSystem =
-			item.role === "system" ||
-			item.role === "sys" ||
-			item.role === "disp" ||
-			item.kind === "action";
+		const isSystemRole = item.role === "system" || item.role === "sys" || item.role === "disp";
+		const hasBubble = !isPlainAssistant && !isTool && !isSystemRole;
+		const isSystem = isSystemRole || item.kind === "action";
 		const bg = isUser
 			? theme.userBg
 			: isTool
@@ -1972,7 +2061,7 @@ export function drawPixiMessages(opts: {
 				laid.height,
 				8,
 				bg,
-				isUser ? null : border,
+				isUser || isSystemRole ? null : border,
 				isUser ? theme.userBgAlpha : 0.82,
 			);
 		} else if (isMultiToolRun) {
@@ -2072,6 +2161,7 @@ export function drawPixiMessages(opts: {
 					theme,
 					hitTargets,
 					hoveredHitTargetId,
+					getToolContentScroll,
 				})
 			) {
 				continue;

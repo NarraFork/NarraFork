@@ -59,10 +59,12 @@ import {
 	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
+	IconNotebook,
 	IconPaperclip,
 	IconPencil,
 	IconPhoto,
 	IconSearch,
+	IconSearchOff,
 	IconSettings,
 	IconShield,
 	IconSparkles,
@@ -105,6 +107,8 @@ import {
 	useDeleteCmdBlacklist,
 	useDeleteCmdWhitelist,
 	useDeleteWhitelistDir,
+	useEnterPlanMode,
+	useExitPlanMode,
 	useForkNarrator,
 	useInterruptNarrator,
 	useNarrator,
@@ -149,6 +153,7 @@ import {
 	parseAggModelValue,
 } from "../../lib/constants";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { compactSnippet, normalizeSearchText } from "../../lib/search-utils";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
@@ -225,6 +230,36 @@ const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }))
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
+
+function collectMessageSearchText(message: TreeMessage): string {
+	const parts: string[] = [
+		message.contentText ?? "",
+		message.commandText ?? "",
+		message.role ?? "",
+	];
+	for (const block of message.contentJson ?? []) {
+		if (!block || typeof block !== "object") continue;
+		const record = block as Record<string, unknown>;
+		for (const key of ["text", "content", "summary", "name", "input", "query", "command"]) {
+			const value = record[key];
+			if (typeof value === "string") parts.push(value);
+		}
+	}
+	for (const toolCall of message.toolCalls ?? []) {
+		parts.push(toolCall.toolName ?? "");
+	}
+	return parts.filter(Boolean).join("\n");
+}
+
+function flattenMessagesForSearch(messages: TreeMessage[] | undefined): TreeMessage[] {
+	const result: TreeMessage[] = [];
+	const visit = (message: TreeMessage) => {
+		result.push(message);
+		for (const child of message.children ?? []) visit(child);
+	};
+	for (const message of messages ?? []) visit(message);
+	return result;
+}
 
 function getMessageViewportScrollBottom(scroller: HTMLElement) {
 	return Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -1393,6 +1428,8 @@ export function NarratorPanel({
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
+	const enterPlanModeMutation = useEnterPlanMode();
+	const exitPlanModeMutation = useExitPlanMode();
 	const promoteMutation = usePromoteNarrator();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
@@ -1941,7 +1978,7 @@ export function NarratorPanel({
 	// Get the first pending Write/Edit permission for the drawer
 	const firstEditPermission = useMemo(() => {
 		for (const perm of renderPermCb.pendingPermsMap.values()) {
-			if (perm.toolName === "Write" || perm.toolName === "Edit" || perm.toolName === "MultiEdit") {
+			if (perm.toolName === "Write" || perm.toolName === "Edit") {
 				return perm;
 			}
 		}
@@ -1979,11 +2016,21 @@ export function NarratorPanel({
 	const isWorking = narrator?.status === "working";
 	const isActive = narrator?.status === "working" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
-	const isPlanning = narrator?.permissionMode === "plan" && narrator?.status === "working";
+	const hasPlanTrait = Array.isArray(narrator?.traits)
+		? narrator.traits.includes("plan")
+		: !!narrator?.planMode;
+	const togglePlanMode = useCallback(() => {
+		if (!narratorId) return;
+		if (hasPlanTrait) {
+			exitPlanModeMutation.mutate(narratorId);
+		} else {
+			enterPlanModeMutation.mutate(narratorId);
+		}
+	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId]);
+	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
 	// Derive legacy boolean flags from substatus
 	const isCompacting = substatus.includes("compacting");
-	const isCheckingInterrupt = substatus.includes("checking_interrupt");
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
 	// --- Turn elapsed timer ---
@@ -2414,6 +2461,10 @@ export function NarratorPanel({
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
 	const virtualListRef = useRef<BroadMessageListHandle>(null);
+	const [messageSearchOpen, setMessageSearchOpen] = useState(false);
+	const [messageSearchQuery, setMessageSearchQuery] = useState("");
+	const [activeMessageSearchIndex, setActiveMessageSearchIndex] = useState(0);
+	const messageSearchAutoJumpKeyRef = useRef<string | null>(null);
 
 	const clearHighlightTimers = useCallback(() => {
 		if (highlightStartTimerRef.current != null) {
@@ -3261,6 +3312,80 @@ export function NarratorPanel({
 		}
 		return indexMap;
 	}, [finalTargets]);
+
+	const messageSearchResults = useMemo(() => {
+		const normalizedQuery = normalizeSearchText(messageSearchQuery);
+		if (!normalizedQuery || !messagesData?.pages?.length) return [];
+		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		return flattenMessagesForSearch(orderedMessages)
+			.map((message) => {
+				const text = collectMessageSearchText(message);
+				return { message, text };
+			})
+			.filter(({ text }) => normalizeSearchText(text).includes(normalizedQuery))
+			.map(({ message, text }) => ({
+				id: message.id,
+				role: message.role,
+				createdAt: message.createdAt,
+				snippet: compactSnippet(text, messageSearchQuery, 72),
+				index: targetIndexMap.get(message.id) ?? -1,
+			}))
+			.filter((result) => result.index >= 0)
+			.sort((a, b) => a.index - b.index);
+	}, [messagesData, messageSearchQuery, targetIndexMap]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset active search item when the query/session changes
+	useEffect(() => {
+		setActiveMessageSearchIndex(0);
+	}, [messageSearchQuery, narratorId]);
+
+	useEffect(() => {
+		if (activeMessageSearchIndex >= messageSearchResults.length) {
+			setActiveMessageSearchIndex(Math.max(0, messageSearchResults.length - 1));
+		}
+	}, [activeMessageSearchIndex, messageSearchResults.length]);
+
+	const jumpToMessageSearchResult = useCallback(
+		(index: number) => {
+			const result = messageSearchResults[index];
+			if (!result) return;
+			virtualListRef.current?.scrollToIndex(result.index, { align: "center" });
+			scheduleHighlight(result.id, 120);
+			setActiveMessageSearchIndex(index);
+		},
+		[messageSearchResults, scheduleHighlight],
+	);
+
+	const jumpMessageSearch = useCallback(
+		(direction: 1 | -1) => {
+			if (!messageSearchResults.length) return;
+			const next =
+				(activeMessageSearchIndex + direction + messageSearchResults.length) %
+				messageSearchResults.length;
+			jumpToMessageSearchResult(next);
+		},
+		[activeMessageSearchIndex, jumpToMessageSearchResult, messageSearchResults.length],
+	);
+
+	const messageSearchResultKey = useMemo(
+		() => messageSearchResults.map((result) => result.id).join("|"),
+		[messageSearchResults],
+	);
+
+	useEffect(() => {
+		if (!messageSearchOpen || messageSearchResults.length === 0 || !messageSearchResultKey) return;
+		const autoJumpKey = `${narratorId}|${messageSearchQuery}|${messageSearchResultKey}`;
+		if (messageSearchAutoJumpKeyRef.current === autoJumpKey) return;
+		messageSearchAutoJumpKeyRef.current = autoJumpKey;
+		jumpToMessageSearchResult(0);
+	}, [
+		jumpToMessageSearchResult,
+		messageSearchOpen,
+		messageSearchQuery,
+		messageSearchResultKey,
+		messageSearchResults.length,
+		narratorId,
+	]);
 
 	// --- User message markers for scrollbar minimap ---
 	const userMessageMarkers = useMemo(() => {
@@ -4675,6 +4800,27 @@ export function NarratorPanel({
 						{!isWorkspacePreview && (
 							<Group gap="xs">
 								<Tooltip
+									label={messageSearchOpen ? t("closeMessageSearch") : t("openMessageSearch")}
+								>
+									<ActionIcon
+										size="sm"
+										variant={messageSearchOpen ? "light" : "subtle"}
+										color={messageSearchOpen ? "indigo" : "gray"}
+										onClick={() =>
+											setMessageSearchOpen((open) => {
+												const next = !open;
+												if (!next) {
+													setMessageSearchQuery("");
+													messageSearchAutoJumpKeyRef.current = null;
+												}
+												return next;
+											})
+										}
+									>
+										{messageSearchOpen ? <IconSearchOff size={16} /> : <IconSearch size={16} />}
+									</ActionIcon>
+								</Tooltip>
+								<Tooltip
 									label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}
 								>
 									<ActionIcon
@@ -4751,6 +4897,78 @@ export function NarratorPanel({
 							</Group>
 						)}
 					</Group>
+
+					{messageSearchOpen && !isWorkspacePreview && (
+						<Group
+							gap="xs"
+							px="md"
+							py={6}
+							wrap="nowrap"
+							style={{
+								borderBottom: "1px solid var(--mantine-color-default-border)",
+								flexShrink: 0,
+							}}
+						>
+							<TextInput
+								autoFocus
+								size="xs"
+								leftSection={<IconSearch size={14} />}
+								placeholder={t("messageSearchPlaceholder")}
+								value={messageSearchQuery}
+								onChange={(e) => setMessageSearchQuery(e.currentTarget.value)}
+								onKeyDown={(e) => {
+									if (e.key === "Enter") jumpMessageSearch(e.shiftKey ? -1 : 1);
+									if (e.key === "Escape") {
+										setMessageSearchOpen(false);
+										setMessageSearchQuery("");
+									}
+								}}
+								style={{ flex: 1 }}
+							/>
+							<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+								{messageSearchQuery.trim()
+									? t("messageSearchCount", {
+											current: messageSearchResults.length ? activeMessageSearchIndex + 1 : 0,
+											total: messageSearchResults.length,
+										})
+									: t("messageSearchLoaded", { count: totalMessageCount })}
+							</Text>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								disabled={!messageSearchResults.length}
+								onClick={() => jumpMessageSearch(-1)}
+							>
+								<IconChevronUp size={16} />
+							</ActionIcon>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								disabled={!messageSearchResults.length}
+								onClick={() => jumpMessageSearch(1)}
+							>
+								<IconChevronDown size={16} />
+							</ActionIcon>
+							<CloseButton
+								size="sm"
+								onClick={() => {
+									setMessageSearchOpen(false);
+									setMessageSearchQuery("");
+								}}
+							/>
+							{messageSearchQuery.trim() &&
+								messageSearchResults[activeMessageSearchIndex]?.snippet && (
+									<Text size="xs" c="dimmed" truncate style={{ flexBasis: "100%" }}>
+										{messageSearchResults[activeMessageSearchIndex].snippet}
+									</Text>
+								)}
+							{messageSearchQuery.trim() && hasNextPage && (
+								<Text size="xs" c="dimmed" style={{ flexBasis: "100%" }}>
+									{t("messageSearchMoreHint")}
+								</Text>
+							)}
+						</Group>
+					)}
 
 					<Modal
 						opened={archiveConfirmOpened}
@@ -5422,15 +5640,13 @@ export function NarratorPanel({
 										color={
 											isRetrying
 												? "yellow"
-												: isCheckingInterrupt
-													? "cyan"
-													: isCompacting
-														? "orange"
-														: isWaiting
-															? "yellow"
-															: isPlanning
-																? "green"
-																: "blue"
+												: isCompacting
+													? "orange"
+													: isWaiting
+														? "yellow"
+														: isPlanning
+															? "green"
+															: "blue"
 										}
 										style={{ flexShrink: 0 }}
 									/>
@@ -5439,15 +5655,13 @@ export function NarratorPanel({
 										c={
 											isRetrying
 												? "yellow"
-												: isCheckingInterrupt
-													? "cyan"
-													: isCompacting
-														? "orange"
-														: isWaiting
-															? "yellow"
-															: isPlanning
-																? "green"
-																: "blue"
+												: isCompacting
+													? "orange"
+													: isWaiting
+														? "yellow"
+														: isPlanning
+															? "green"
+															: "blue"
 										}
 										truncate
 									>
@@ -5466,15 +5680,13 @@ export function NarratorPanel({
 												? isWorking
 													? t("thinkingWithCompact")
 													: t("compacting")
-												: isCheckingInterrupt
-													? t("checkingInterrupt")
-													: activeTodo
-														? activeTodo.content || activeTodo.activeForm
-														: isWaiting
-															? t("status_waiting")
-															: isPlanning
-																? t("planning")
-																: t("thinking")}
+												: activeTodo
+													? activeTodo.content || activeTodo.activeForm
+													: isWaiting
+														? t("status_waiting")
+														: isPlanning
+															? t("planning")
+															: t("thinking")}
 									</Text>
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
@@ -5697,6 +5909,16 @@ export function NarratorPanel({
 																}
 																t={t}
 															/>
+															<Menu.Divider />
+															<Menu.Item
+																leftSection={<IconNotebook size={14} />}
+																onClick={togglePlanMode}
+																disabled={
+																	enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
+																}
+															>
+																{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
+															</Menu.Item>
 														</Menu.Dropdown>
 													</Menu>
 												)}
@@ -5722,7 +5944,7 @@ export function NarratorPanel({
 											)}
 											<PathRulesPopover narratorId={narratorId} t={t} />
 											{/* Relaxed Plan toggle (only visible in plan mode) */}
-											{narrator.permissionMode === "plan" && (
+											{hasPlanTrait && (
 												<Tooltip label={t("relaxed_plan_tooltip")}>
 													<ActionIcon
 														variant="subtle"
@@ -5926,7 +6148,7 @@ export function NarratorPanel({
 										)}
 										<PathRulesPopover narratorId={narratorId} t={t} />
 										{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
-										{narrator.permissionMode === "plan" && (
+										{hasPlanTrait && (
 											<Tooltip label={t("relaxed_plan_tooltip")}>
 												<ActionIcon
 													variant="subtle"

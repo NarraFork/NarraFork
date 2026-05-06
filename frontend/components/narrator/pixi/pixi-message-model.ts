@@ -760,7 +760,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function isEditTool(toolName: string): boolean {
-	return toolName === "Edit" || toolName === "Write" || toolName === "MultiEdit";
+	return toolName === "Edit" || toolName === "Write";
 }
 
 function hasTruncatedToolData(inputJson: unknown, outputJson: unknown): boolean {
@@ -1055,7 +1055,7 @@ function buildToolDetailBlocks(
 		}
 		case "file": {
 			const streamingEdit =
-				toolName === "Edit" || toolName === "MultiEdit"
+				toolName === "Edit"
 					? getStreamingEditInput(inputJson, metadata)
 					: null;
 			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
@@ -1084,7 +1084,7 @@ function buildToolDetailBlocks(
 					maxLines: 10,
 					lang: filePath ? getShikiLang(filePath) : "text",
 				});
-			} else if (toolName === "Edit" || toolName === "MultiEdit") {
+			} else if (toolName === "Edit") {
 				const oldString = extractField(inputJson, "old_string");
 				const newString = extractField(inputJson, "new_string");
 				const startLine = typeof meta.startLine === "number" ? meta.startLine : undefined;
@@ -1426,7 +1426,7 @@ function buildToolDetailLines(
 		case "read":
 		case "file": {
 			if (filePath) lines.push({ label: "file", text: filePath, kind: "muted" });
-			if (toolName === "Edit" || toolName === "MultiEdit") {
+			if (toolName === "Edit") {
 				const streamingEdit = getStreamingEditInput(inputJson, metadataFrom(outputJson));
 				if (streamingEdit) {
 					lines.push({ label: "phase", text: streamingEdit.phase, kind: "muted" });

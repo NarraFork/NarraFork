@@ -437,6 +437,7 @@ export class CodexManager {
 	// ==================== Admin API ====================
 
 	snapshot(opts?: SnapshotOptions): ManagerSnapshot {
+		this.reviveQuotaResetCredentials();
 		this.pruneSessionAffinity();
 
 		const mapEntry = (e: CodexCredential): CredentialSnapshot => {

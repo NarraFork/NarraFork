@@ -20,7 +20,7 @@ export type PromptKey =
 	| "conflictResolutionEnhanced"
 	| "rebaseConflictResolution"
 	| "mergeSummary"
-	| "yoloReflection"
+	| "dangerReflection"
 	| "exitPlanReflection";
 export type BuiltinSubagentType = "explore" | "plan" | "general";
 export type SubagentType = string;
@@ -259,7 +259,7 @@ Do not call ExitPlanMode from this reflection loop.`,
 已解析计划：
 {planText}
 
-请求的提示词权限：
+可选的实现权限说明（仅用于就绪度检查，不授予权限）：
 {allowedPromptsList}
 
 请在计划触达用户前检查其是否已准备好：是否具体、可执行、范围匹配用户请求，并且没有本应提前澄清的未决选择。
@@ -270,8 +270,8 @@ Do not call ExitPlanMode from this reflection loop.`,
 如果你在这一次回复中没有调用任一工具，该计划提交将被视为需要修改。
 不要在这个反思 loop 中调用 ExitPlanMode。`,
 	},
-	yoloReflection: {
-		en: `YOLO safety pause: a high-risk tool call is pending and has NOT executed yet.
+	dangerReflection: {
+		en: `Danger reflection pause: a high-risk tool call is pending and has NOT executed yet.
 
 Pending request ID: {requestId}
 Original tool: {toolName}
@@ -292,13 +292,14 @@ Reflect briefly. Use the conversation history available to this reflection loop:
 
 Judge the concrete input, not just the generic risk label. A syntactically risky wrapper (for example \`bun -e\`, \`node -e\`, or a shell chain) can still be acceptable when the visible payload is bounded, inspection-only, and does not write/delete files, install packages, fetch remote code, spawn subprocesses, modify environment/state, or access sensitive external paths.
 
-You have exactly one response, and you MUST call exactly one tool:
-- YoloConfirm only after confirming the operation is intentional, contextually justified by the conversation/task, still useful, and the concrete visible input is low-impact/read-only enough for the risk to be acceptable.
-- YoloCancel if the operation does not clearly match the conversation/task, may be accidental, is no longer necessary, has meaningful destructive/state-changing/network/supply-chain/privilege/hard-to-inspect side-effect risk, or if a materially safer alternative preserves the task without losing important information.
+You have exactly one response, and you MUST call exactly one tool. Do not answer with plain text only.
+- Call DangerConfirm with an optional reflection after confirming the operation is intentional, contextually justified by the conversation/task, still useful, and the concrete visible input is low-impact/read-only enough for the risk to be acceptable.
+- Call DangerCancel with an optional reason if the operation does not clearly match the conversation/task, may be accidental, is no longer necessary, has meaningful destructive/state-changing/network/supply-chain/privilege/hard-to-inspect side-effect risk, or if a materially safer alternative preserves the task without losing important information.
 Do not cancel merely because some safer alternative might exist in theory, but do cancel if necessity is unclear.
-If you do not call either tool in this one response, the operation will be treated as cancelled.
+If a provider/tooling limitation prevents a tool call, output exactly one fallback tag instead: <DangerDecision>{"action":"confirm","reflection":"..."}</DangerDecision> or <DangerDecision>{"action":"cancel","reason":"..."}</DangerDecision>.
+If you do not call either tool or emit a valid fallback tag in this one response, the operation will be treated as cancelled.
 Do not call the original tool from this reflection loop.`,
-		"zh-CN": `YOLO 安全暂停：一个高风险工具调用正在等待确认，尚未执行。
+		"zh-CN": `危险反思暂停：一个高风险工具调用正在等待确认，尚未执行。
 
 待确认请求 ID：{requestId}
 原始工具：{toolName}
@@ -321,11 +322,12 @@ Do not call the original tool from this reflection loop.`,
 
 权衡风险和必要性。低影响/只读的具体输入在符合任务时可以较容易确认。真正危险或会改变状态的操作也可以确认，但必须经过更严格审视：它需要明确符合用户意图，足够重要，没有能保留任务目标且实质更安全的替代方案，并且预期收益足以证明风险合理。
 
-你只有一次回复机会，并且必须且只能调用一个工具：
-- 在确认该操作是有意的、由会话/任务上下文支撑、仍然必要或有价值，并且结合必要性判断风险可以接受之后，调用 YoloConfirm。这可以包括明确符合意图且再三考虑后非常必要的危险操作。
-- 如果该操作不明确符合会话/任务、可能是误操作、已经不再必要、存在未被必要性证明的破坏性/状态变更/网络/供应链/提权/难以检查的副作用风险，或替代方案能在不丢失关键信息的前提下实质降低风险，调用 YoloCancel。
+你只有一次回复机会，并且必须且只能调用一个工具；不要只输出普通文本。
+- 在确认该操作是有意的、由会话/任务上下文支撑、仍然必要或有价值，并且结合必要性判断风险可以接受之后，调用 DangerConfirm，可附带可选的 reflection。这可以包括明确符合意图且再三考虑后非常必要的危险操作。
+- 如果该操作不明确符合会话/任务、可能是误操作、已经不再必要、存在未被必要性证明的破坏性/状态变更/网络/供应链/提权/难以检查的副作用风险，或替代方案能在不丢失关键信息的前提下实质降低风险，调用 DangerCancel，可附带可选的 reason。
 不要仅仅因为理论上可能存在更安全替代方案就取消；但如果必要性不清楚，或风险收益权衡不成立，应取消。
-如果你在这一次回复中没有调用任一工具，该操作将被视为已取消。
+如果 provider/工具限制导致无法发出工具调用，则只能输出一个精确 fallback 标签：<DangerDecision>{"action":"confirm","reflection":"..."}</DangerDecision> 或 <DangerDecision>{"action":"cancel","reason":"..."}</DangerDecision>。
+如果你在这一次回复中没有调用任一工具，也没有输出有效 fallback 标签，该操作将被视为已取消。
 不要在这个反思 loop 中调用原始工具。`,
 	},
 };

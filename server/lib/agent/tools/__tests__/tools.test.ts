@@ -1133,9 +1133,8 @@ import { webSearchTool } from "../web-search";
 // These are tracked here so the parity test doesn't mask new regressions.
 // TODO: fix these tools' rawJsonSchema to match their Zod parameters:
 //   - WebFetch: rawJsonSchema has extra/missing properties vs Zod
-//   - EnterPlanMode: rawJsonSchema required fields differ from Zod
 //   - Skill: rawJsonSchema properties differ from Zod
-const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "EnterPlanMode", "Skill"]);
+const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "Skill"]);
 
 const toolsWithRawJsonSchema = [
 	agentTool,

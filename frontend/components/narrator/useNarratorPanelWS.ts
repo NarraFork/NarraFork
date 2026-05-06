@@ -496,15 +496,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		},
 		[statusState.contextPercent],
 	);
-	const interruptCheckTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	useEffect(() => {
-		return () => {
-			if (interruptCheckTimeoutRef.current) {
-				clearTimeout(interruptCheckTimeoutRef.current);
-				interruptCheckTimeoutRef.current = null;
-			}
-		};
-	}, []);
 	const [browserSessionCount, setBrowserSessionCount] = useState(0);
 	);
 	useEffect(() => {
@@ -759,10 +750,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			);
 			// Fallback to HTTP API when WS send fails (e.g. reconnecting)
 			if (!wsSent) {
+				const payload = {
+					feedbackText,
+					compactAfter,
+					updatedPlan,
+				};
 				if (decision === "allow") {
-					api.approvePermission(requestId).catch(() => {});
+					api.approvePermission(requestId, payload).catch(() => {});
 				} else {
-					api.denyPermission(requestId, feedbackText).catch(() => {});
+					api.denyPermission(requestId, payload).catch(() => {});
 				}
 			}
 			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
@@ -814,7 +810,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const handleQuestionSubmit = useCallback(
 		(requestId: string, answers: Record<string, string>) => {
-			sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
+			const wsSent = sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
+			if (!wsSent) {
+				api.approvePermission(requestId, { answers }).catch(() => {});
+			}
 			const { toolUseId, perm } = resolveAndRemovePerm(requestId);
 			if (toolUseId && perm) {
 				const baseInput =
@@ -836,7 +835,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
-			sendPermissionDecisionRef.current?.(requestId, "deny", "User skipped the question");
+			const message = "User skipped the question";
+			const wsSent = sendPermissionDecisionRef.current?.(requestId, "deny", message);
+			if (!wsSent) {
+				api.denyPermission(requestId, { message }).catch(() => {});
+			}
 			const { toolUseId } = resolveAndRemovePerm(requestId);
 			if (toolUseId) {
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
@@ -1626,6 +1629,48 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 			},
+			onDangerReflectionStarted: ({ toolUseId, danger }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							permissionDecisionReason:
+								typeof danger === "object" && danger && "summary" in danger
+									? `Danger reflection: ${String((danger as { summary?: unknown }).summary ?? "")}`
+									: "Danger reflection in progress",
+							permissionSuggestions: [{ type: "danger_reflection", status: "running", danger }],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onDangerReflectionResolved: ({ toolUseId, decision, reason }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					const status = decision === "allow" ? "running" : "fail";
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "danger_reflection",
+									status: decision === "allow" ? "confirmed" : decision,
+									reason,
+								},
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
 				// Clean up streaming state when the narrator is no longer actively working.
@@ -1714,6 +1759,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, permissionMode } : old,
+				);
+			},
+			onPlanModeChanged: (planMode, traits) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, planMode, ...(traits ? { traits } : {}) } : old,
 				);
 			},
 			onRelaxedPlanChanged: (relaxedPlan) => {
@@ -1871,31 +1921,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						color: "green",
 						autoClose: 3000,
 					});
-				}
-			},
-			onInterruptChecking: () => {
-				// isCheckingInterrupt now comes via substatus_change.
-				// Safety timeout: if the backend never sends interrupt_check_done
-				// (e.g. WS glitch, backend crash), remove the checking_interrupt tag
-				// after 20 s so the UI doesn't stay stuck forever.
-				if (interruptCheckTimeoutRef.current) {
-					clearTimeout(interruptCheckTimeoutRef.current);
-				}
-				interruptCheckTimeoutRef.current = setTimeout(() => {
-					dispatchStatus({
-						type: "patch",
-						payload: {
-							substatus: statusState.substatus.filter((s) => s !== "checking_interrupt"),
-						},
-					});
-					interruptCheckTimeoutRef.current = null;
-				}, 20_000);
-			},
-			onInterruptCheckDone: () => {
-				// isCheckingInterrupt now comes via substatus_change.
-				if (interruptCheckTimeoutRef.current) {
-					clearTimeout(interruptCheckTimeoutRef.current);
-					interruptCheckTimeoutRef.current = null;
 				}
 			},
 			onNarratorError: (error, errorCode) => {

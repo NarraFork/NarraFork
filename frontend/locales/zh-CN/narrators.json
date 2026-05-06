@@ -66,5 +66,9 @@
 	"webviewPlaceholder": "网页视图",
 	"webviewUrlPlaceholder": "输入 URL...",
 	"webviewOpenExternal": "在浏览器中打开",
-	"webviewEmpty": "输入 URL 以加载页面"
+	"webviewEmpty": "输入 URL 以加载页面",
+	"localSearchPlaceholder": "搜索已加载叙述者...",
+	"localSearchSummary": "显示已加载 {{loaded}} 个中的 {{shown}} 个",
+	"localSearchNoResults": "已加载叙述者中没有匹配项。",
+	"loadMoreToSearch": "加载更多后继续搜索"
 }

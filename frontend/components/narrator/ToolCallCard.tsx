@@ -46,6 +46,7 @@ import {
 	IconRobot,
 	IconSearch,
 	IconShare,
+	IconShield,
 	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
@@ -204,8 +205,8 @@ import { TOOL_CALL_STATUS_COLORS as STATUS_COLORS } from "@frontend/lib/status-r
 export { STATUS_COLORS };
 
 const READ_TOOLS = new Set(["Read"]);
-const FILE_TOOLS = new Set(["Read", "Write", "Edit", "MultiEdit"]);
-const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit"]);
+const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
+const EDIT_TOOLS = new Set(["Edit", "Write"]);
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
@@ -1044,6 +1045,46 @@ export function ElapsedTimer({
 
 // --- Helper: status indicator icon ---
 
+function findDangerReflectionSuggestion(toolCall: ToolCallData) {
+	return toolCall.permissionSuggestions?.find(
+		(suggestion) =>
+			suggestion &&
+			typeof suggestion === "object" &&
+			["danger_reflection", "yolo_reflection"].includes(
+				String((suggestion as { type?: unknown }).type ?? ""),
+			),
+	) as { status?: string; reason?: string; danger?: { summary?: string } } | undefined;
+}
+
+function DangerReflectionNotice({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const suggestion = findDangerReflectionSuggestion(toolCall);
+	if (!suggestion) return null;
+	const status = suggestion.status ?? "running";
+	const summary =
+		suggestion.reason || suggestion.danger?.summary || toolCall.permissionDecisionReason;
+	const running = status === "running";
+	return (
+		<Paper withBorder radius="sm" p="xs" mb="xs" bg={running ? "yellow.9" : "dark.6"}>
+			<Group gap="xs" wrap="nowrap" align="center">
+				<ThemeIcon size="sm" radius="xl" color={running ? "yellow" : "gray"} variant="light">
+					{running ? <IconLoader2 size={14} /> : <IconShield size={14} />}
+				</ThemeIcon>
+				<Box>
+					<Text size="xs" fw={600} c={running ? "yellow.1" : "dimmed"}>
+						{running ? t("dangerReflectionRunning") : t("dangerReflectionResolved")}
+					</Text>
+					{summary && (
+						<Text size="xs" c={running ? "yellow.2" : "dimmed"}>
+							{summary}
+						</Text>
+					)}
+				</Box>
+			</Group>
+		</Paper>
+	);
+}
+
 export function StatusIcon({ status }: { status: string }) {
 	if (status === "running" || status === "pending" || status === "initializing") {
 		return <IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />;
@@ -1614,7 +1655,7 @@ function EditStreamingPreview({
 function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const fp = getFilePath(toolCall.inputJson);
-	const isEdit = toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit";
+	const isEdit = toolCall.toolName === "Edit";
 	const isWrite = toolCall.toolName === "Write";
 	const inputIsTruncated = isTruncated(toolCall.inputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
@@ -3350,7 +3391,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	// the same provisional diff preview used by the full detail view instead of hiding
 	// the matching phase while only old_string is available.
 	if (cat === "file") {
-		if (toolCall.toolName === "Edit" || toolCall.toolName === "MultiEdit") {
+		if (toolCall.toolName === "Edit") {
 			const preview = getStreamingEditPreview(toolCall.inputJson);
 			if (preview) {
 				const previewFilePath = filePath || "Edit";
@@ -3810,21 +3851,7 @@ export function InlinePermission({
 		);
 	}
 
-	const yoloReflectionSuggestion = permission.suggestions?.find(
-		(suggestion) =>
-			suggestion &&
-			typeof suggestion === "object" &&
-			(suggestion as { type?: string }).type === "yolo_reflection",
-	) as { status?: string; message?: string } | undefined;
-	const localizedDecisionReason = (() => {
-		if (!permission.decisionReason) return null;
-		const prefix = "YOLO safety pause:";
-		if (permission.decisionReason.startsWith(prefix)) {
-			const summary = permission.decisionReason.slice(prefix.length).trim();
-			return summary ? t("yoloSafetyPauseReason", { summary }) : t("yoloSafetyPauseReasonGeneric");
-		}
-		return permission.decisionReason;
-	})();
+	const localizedDecisionReason = permission.decisionReason ?? null;
 
 	// ExitPlanMode: show plan content above the allow/deny buttons
 	const planText =
@@ -3910,23 +3937,6 @@ export function InlinePermission({
 				<Text size="xs" c="dimmed" mb={4}>
 					{localizedDecisionReason}
 				</Text>
-			)}
-			{yoloReflectionSuggestion && (
-				<Paper withBorder radius="sm" p="xs" mb="xs" bg="yellow.9">
-					<Group gap="xs" wrap="nowrap" align="center">
-						<ThemeIcon size="sm" radius="xl" color="yellow" variant="light">
-							<IconLoader2 size={14} />
-						</ThemeIcon>
-						<Box>
-							<Text size="xs" fw={600} c="yellow.1">
-								{t("yoloReflectionRunning")}
-							</Text>
-							<Text size="xs" c="yellow.2">
-								{t("yoloReflectionMessage")}
-							</Text>
-						</Box>
-					</Group>
-				</Paper>
 			)}
 			<Textarea
 				size="xs"
@@ -4305,6 +4315,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			planMaxHeight={vpHeight}
 		/>
 	) : null;
+	const dangerReflectionNotice = <DangerReflectionNotice toolCall={toolCall} />;
 
 	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
 
@@ -4491,6 +4502,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
 					<LazyCollapse in={opened}>
+						{dangerReflectionNotice}
 						<Box style={planStyle}>
 							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
 						</Box>

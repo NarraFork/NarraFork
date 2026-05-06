@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema } from "./common";
 
 // === Gateway per-user configuration ===
@@ -41,9 +42,7 @@ const gatewayConfigSchema = z.object({
 	enabled: z.boolean().optional(),
 	defaultProjectId: z.string().max(50).optional(),
 	defaultChapterId: z.string().max(50).optional(),
-	defaultPermissionMode: z
-		.enum(["bypassPermissions", "allowByDefault", "denyByDefault"])
-		.optional(),
+	defaultPermissionMode: legacyPermissionModeSchema.optional(),
 	sessionIdleMinutes: z.number().int().min(0).max(43200).optional(),
 	rateLimitPerMinute: z.number().int().min(0).max(1000).optional(),
 	streaming: z.boolean().optional(),
