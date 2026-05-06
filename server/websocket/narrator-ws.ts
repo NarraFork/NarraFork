@@ -533,7 +533,8 @@ export const handleNarratorWS = {
 					const snap = getStreamingSnapshot(id);
 					if (!snap) continue;
 					const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
-					if (!hasStreaming && !hasQueue) continue;
+					const hasQueueMessage = !!snap.queueMessage;
+					if (!hasStreaming && !hasQueue && !hasQueueMessage) continue;
 					try {
 						if (hasStreaming) {
 							ws.send(
@@ -545,7 +546,15 @@ export const handleNarratorWS = {
 								}),
 							);
 						}
-						if (hasQueue) {
+						if (hasQueueMessage) {
+							ws.send(
+								JSON.stringify({
+									type: "queue_status",
+									narratorId: id,
+									queueMessage: snap.queueMessage,
+								}),
+							);
+						} else if (hasQueue) {
 							ws.send(
 								JSON.stringify({
 									narratorId: id,

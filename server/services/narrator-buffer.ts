@@ -69,6 +69,7 @@ function dbInsertBuffered(
 	createdBy?: string | null,
 	creator?: BufferCreator | null,
 	savedFiles?: SavedBufferedFile[],
+	priority = false,
 ): void {
 	db.insert(narratorBufferedMessages)
 		.values({
@@ -82,6 +83,7 @@ function dbInsertBuffered(
 			createdBy: createdBy ?? null,
 			creatorJson: creator ? JSON.stringify(creator) : null,
 			textFilePathsJson: savedFiles?.length ? JSON.stringify(savedFiles) : null,
+			priority,
 		})
 		.run();
 }
@@ -124,6 +126,7 @@ export async function pushBufferedMessage(
 		savedFiles = await persistBufferedTextFiles(id, textFiles);
 	}
 
+	const priority = position === "front";
 	const entry: BufferedMessage = {
 		id,
 		text,
@@ -133,6 +136,7 @@ export async function pushBufferedMessage(
 		commandText,
 		createdBy,
 		creator,
+		priority,
 		_savedFiles: savedFiles,
 	};
 	if (position === "front") {
@@ -155,6 +159,7 @@ export async function pushBufferedMessage(
 				createdBy,
 				creator,
 				savedFiles,
+				priority,
 			);
 		})();
 	} else {
@@ -170,6 +175,7 @@ export async function pushBufferedMessage(
 			createdBy,
 			creator,
 			savedFiles,
+			priority,
 		);
 	}
 	bufferedMessages.set(narratorId, queue);
@@ -272,13 +278,17 @@ export function getBufferedMessages(narratorId: string): BufferedMessage[] {
 
 /** Project a buffer queue to the minimal shape needed for WS broadcast / REST responses. */
 export function toBufferSummary(
-	msgs: readonly Pick<BufferedMessage, "id" | "text" | "bufferedAt" | "images" | "creator">[],
+	msgs: readonly Pick<
+		BufferedMessage,
+		"id" | "text" | "bufferedAt" | "images" | "creator" | "priority"
+	>[],
 ): Array<{
 	id: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
 	creator?: BufferCreator | null;
+	priority?: boolean;
 }> {
 	return msgs.map((m) => ({
 		id: m.id,
@@ -286,5 +296,6 @@ export function toBufferSummary(
 		bufferedAt: m.bufferedAt,
 		imageCount: m.images?.length ?? 0,
 		creator: m.creator ?? null,
+		priority: m.priority || undefined,
 	}));
 }

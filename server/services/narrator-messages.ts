@@ -1,6 +1,12 @@
 import { and, eq, gt, gte, inArray, isNotNull, isNull, like, lt, ne, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
+import {
+	narratorMessageRefs,
+	narratorMessages,
+	narratorSidecars,
+	narrators,
+	narratorToolCalls,
+} from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { isSubagentVariant } from "../lib/narrator-utils";
@@ -28,7 +34,7 @@ function getDangerReflectionStatus(suggestions: unknown): string | null {
 
 function isResolvedDangerReflection(suggestions: unknown): boolean {
 	const status = getDangerReflectionStatus(suggestions);
-	return status !== null && status !== "running";
+	return status !== null && status !== "running" && status !== "awaiting_user";
 }
 
 /**
@@ -311,27 +317,50 @@ function truncateInputWithHints(toolName: string, val: any, maxLen: number): any
 /** Recursively truncate large inputJson/outputJson in tool calls within a message tree */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
-	return tree.map((msg) => ({
-		...msg,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		toolCalls: msg.toolCalls?.map((tc: any) => {
-			if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return tc;
-			const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
-			return {
-				...tc,
-				inputJson: skipInput
-					? tc.inputJson
-					: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
-				outputJson: truncateJson(tc.outputJson, maxLen),
-			};
-		}),
-		children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
-	}));
+	return tree.map((msg) => {
+		const msgSideCars = Array.isArray(msg.sideCars) ? msg.sideCars : [];
+		return {
+			...msg,
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			toolCalls: msg.toolCalls?.map((tc: any) => {
+				const toolSideCars = msgSideCars.filter((sc: Record<string, unknown>) => {
+					return (
+						sc.target === "tool_result" && (sc.toolUseId === tc.toolUseId || sc.toolUseId == null)
+					);
+				});
+				const withSideCars = toolSideCars.length > 0 ? { ...tc, sideCars: toolSideCars } : tc;
+				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withSideCars;
+				const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
+				return {
+					...withSideCars,
+					inputJson: skipInput
+						? tc.inputJson
+						: truncateInputWithHints(tc.toolName, tc.inputJson, maxLen),
+					outputJson: truncateJson(tc.outputJson, maxLen),
+				};
+			}),
+			children: msg.children?.length ? truncateToolIO(msg.children, maxLen) : msg.children,
+		};
+	});
 }
 
 /**
  * Enrich tool_use blocks in contentJson with fields from the toolCalls relation.
  */
+async function attachSideCarsToToolCall<T extends { narratorId: string; toolUseId: string }>(
+	toolCall: T,
+): Promise<T & { sideCars: unknown[] }> {
+	const sideCars = await db.query.narratorSidecars.findMany({
+		where: and(
+			eq(narratorSidecars.narratorId, toolCall.narratorId),
+			eq(narratorSidecars.toolUseId, toolCall.toolUseId),
+			eq(narratorSidecars.target, "tool_result"),
+		),
+		orderBy: (s, { asc }) => [asc(s.orderIndex), asc(s.createdAt)],
+	});
+	return { ...toolCall, sideCars };
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function enrichToolUseBlocks(tree: any[]): any[] {
 	return tree.map((msg) => {
@@ -352,6 +381,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				...block,
 				inputJson: tc.inputJson ?? block.input,
 				outputJson: tc.outputJson,
+				sideCars: tc.sideCars,
 				status: tc.status,
 				durationMs: tc.durationMs,
 				streamStartedAt: tc.streamStartedAt,
@@ -382,7 +412,7 @@ export const narratorMessageQueries = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
 		return db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, narratorId),
-			with: { toolCalls: true },
+			with: { toolCalls: true, sideCars: true },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 			limit,
 			offset,
@@ -639,7 +669,7 @@ export const narratorMessageQueries = {
 		const messageIds = pageRows.map((r) => r.messageId);
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true, creator: true },
+			with: { toolCalls: true, sideCars: true, creator: true },
 		});
 
 		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
@@ -657,7 +687,7 @@ export const narratorMessageQueries = {
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, creator: true },
+						with: { toolCalls: true, sideCars: true, creator: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -739,7 +769,7 @@ export const narratorMessageQueries = {
 		const messageIds = refRows.map((r) => r.messageId);
 		const allMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true, creator: true },
+			with: { toolCalls: true, sideCars: true, creator: true },
 		});
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
@@ -772,7 +802,7 @@ export const narratorMessageQueries = {
 							)})`
 						: undefined,
 				),
-				with: { toolCalls: true, creator: true },
+				with: { toolCalls: true, sideCars: true, creator: true },
 				orderBy: (m, { asc }) => [asc(m.createdAt)],
 				limit: 500,
 			});
@@ -932,7 +962,7 @@ export const narratorMessageQueries = {
 
 		const topMessages = await db.query.narratorMessages.findMany({
 			where: inArray(narratorMessages.id, allIds),
-			with: { toolCalls: true, creator: true },
+			with: { toolCalls: true, sideCars: true, creator: true },
 		});
 		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		attachMessageSeqs(topMessages, seqMap);
@@ -948,7 +978,7 @@ export const narratorMessageQueries = {
 			parentToolUseIds.length > 0
 				? await db.query.narratorMessages.findMany({
 						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, creator: true },
+						with: { toolCalls: true, sideCars: true, creator: true },
 						orderBy: (m, { asc }) => [asc(m.createdAt)],
 						limit: 500,
 					})
@@ -979,7 +1009,7 @@ export const narratorMessageQueries = {
 				eq(narratorToolCalls.toolUseId, toolUseId),
 			),
 		});
-		if (tc) return tc;
+		if (tc) return attachSideCarsToToolCall(tc);
 
 		const candidate = await db.query.narratorToolCalls.findFirst({
 			where: eq(narratorToolCalls.toolUseId, toolUseId),
@@ -997,7 +1027,7 @@ export const narratorMessageQueries = {
 					eq(narratorMessageRefs.messageId, msg.id),
 				),
 			});
-			if (directRef) return candidate;
+			if (directRef) return attachSideCarsToToolCall(candidate);
 
 			if (msg.parentToolUseId) {
 				const parentTc = await db.query.narratorToolCalls.findFirst({
@@ -1011,7 +1041,7 @@ export const narratorMessageQueries = {
 							eq(narratorMessageRefs.messageId, parentTc.messageId),
 						),
 					});
-					if (parentRef) return candidate;
+					if (parentRef) return attachSideCarsToToolCall(candidate);
 				}
 			}
 		}

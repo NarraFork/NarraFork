@@ -85,6 +85,22 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
 
+	test("falls back to full create when reasoning settings change", () => {
+		const lastRequest = makeRequest([makeUserMessage("hello")]);
+		lastRequest.reasoning = { effort: "medium", summary: "auto" };
+		const lastCompleted = makeCompleted("resp-1", [makeAssistantMessage("assistant output")]);
+		const nextRequest = makeRequest([
+			makeUserMessage("hello"),
+			makeAssistantMessage("assistant output"),
+			makeUserMessage("second"),
+		]);
+		nextRequest.reasoning = { effort: "high", summary: "auto" };
+
+		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		expect(envelope.previous_response_id).toBeUndefined();
+		expect(envelope.input).toEqual(nextRequest.input);
+	});
+
 	test("falls back to full create when input is not a baseline extension", () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		const lastCompleted = makeCompleted("resp-1", []);

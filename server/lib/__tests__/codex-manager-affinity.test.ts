@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
 
-function createManagerWithCredentials(creds: Array<{ id: string; priority: number }>): {
+function createManagerWithCredentials(
+	creds: Array<{ id: string; priority: number; planType?: string }>,
+): {
 	manager: CodexManager;
 	tmpHome: string;
 } {
@@ -23,9 +25,9 @@ function createManagerWithCredentials(creds: Array<{ id: string; priority: numbe
 		disabled: false,
 		disabledReason: undefined,
 		usage:
-			i % 2 === 0
+			c.planType || i % 2 === 0
 				? {
-						plan_type: "pro",
+						plan_type: c.planType ?? "pro",
 						queriedAt: new Date(now).toISOString(),
 					}
 				: undefined,
@@ -161,5 +163,75 @@ describe("CodexManager session affinity", () => {
 		} finally {
 			Math.random = originalRandom;
 		}
+	});
+
+	test("tier-balanced 默认按 pro/prolite/plus/team/free 选择最高等级", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-plus", priority: 0, planType: "plus" },
+			{ id: "cred-pro", priority: 10, planType: "pro" },
+			{ id: "cred-team", priority: 1, planType: "team" },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setLoadBalancingMode("tier-balanced");
+
+		const ctx = await manager.acquireContext("session-tier");
+		expect(ctx.id).toBe("cred-pro");
+		expect(manager.snapshot().stickySessionCount).toBe(1);
+	});
+
+	test("tier-balanced 同等级内均衡随机选择", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-pro-a", priority: 0, planType: "pro" },
+			{ id: "cred-pro-b", priority: 1, planType: "pro" },
+			{ id: "cred-plus", priority: 2, planType: "plus" },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setLoadBalancingMode("tier-balanced");
+
+		const originalRandom = Math.random;
+		const randomValues = [0.1, 0.9];
+		let randomIndex = 0;
+		Math.random = () => randomValues[randomIndex++] ?? 0;
+
+		try {
+			const first = await manager.acquireContext("session-a");
+			const second = await manager.acquireContext("session-b");
+
+			expect(first.id).toBe("cred-pro-a");
+			expect(second.id).toBe("cred-pro-b");
+		} finally {
+			Math.random = originalRandom;
+		}
+	});
+
+	test("tier-balanced 支持自定义等级顺序", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-pro", priority: 0, planType: "pro" },
+			{ id: "cred-plus", priority: 1, planType: "plus" },
+			{ id: "cred-free", priority: 2, planType: "free" },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setLoadBalancingMode("tier-balanced");
+		manager.setTierOrder(["plus", "pro", "free"]);
+
+		const ctx = await manager.acquireContext("session-custom-tier");
+		expect(ctx.id).toBe("cred-plus");
+		expect(manager.snapshot().effectiveTierOrder.slice(0, 3)).toEqual(["plus", "pro", "free"]);
+	});
+
+	test("tier-balanced 将未知等级排在已配置等级之后", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-unknown", priority: 0, planType: "unknown-plan" },
+			{ id: "cred-team", priority: 1, planType: "team" },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setLoadBalancingMode("tier-balanced");
+
+		const ctx = await manager.acquireContext("session-known-tier");
+		expect(ctx.id).toBe("cred-team");
 	});
 });

@@ -5,7 +5,12 @@ import { join, resolve } from "node:path";
 import { pruneToolCalls } from "../../../services/narrator-session";
 import type { OpenAIProviderConfig } from "../../settings";
 import { setUploadsDirForTests } from "../../uploads";
-import { OpenAIProvider, parseResponsesAPIEvent } from "../openai-provider";
+import {
+	convertHistoryToResponsesApi,
+	type OAIMessage,
+	OpenAIProvider,
+	parseResponsesAPIEvent,
+} from "../openai-provider";
 import type { DbMessage } from "../provider";
 
 const TEST_PROVIDER: OpenAIProviderConfig = {
@@ -431,6 +436,26 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		const historyJson = JSON.stringify(history);
 		expect(historyJson).toContain('"type":"function_call_output"');
 		expect(historyJson).toContain('"call_id":"call_image"');
+		expect(historyJson).toContain('"type":"input_image"');
+		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
+	});
+
+	test("pushUserTurn preserves user images for tool continuation turns", () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const history: unknown[] = [];
+
+		provider.pushUserTurn(
+			history,
+			"Describe this screenshot",
+			"openai:gpt-5",
+			[],
+			[{ format: "png", base64: SAMPLE_PNG_BASE64 }],
+		);
+
+		const responsesInput = convertHistoryToResponsesApi(history as OAIMessage[]);
+		const historyJson = JSON.stringify(responsesInput);
+		expect(historyJson).toContain('"type":"input_text"');
+		expect(historyJson).toContain("Describe this screenshot");
 		expect(historyJson).toContain('"type":"input_image"');
 		expect(historyJson).toContain('"image_url":"data:image/png;base64,');
 	});

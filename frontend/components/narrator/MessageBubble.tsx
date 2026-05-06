@@ -63,7 +63,7 @@ import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api, getToken } from "../../lib/api";
+import { api, getToken, type SideCarRecord } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
 import { ContentViewer } from "./ContentViewer";
@@ -77,7 +77,11 @@ import {
 import { BLOCK_ID_ATTR, useMessageSelection } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
 import { useRenderLod } from "./RenderLodCtx";
+import { SideCarNotice } from "./SideCarNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
+
+const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
+const SYSTEM_MESSAGE_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
 
 // --- Editing message context ---
 // Allows MessageBubble to register its active editing state so that the
@@ -131,6 +135,7 @@ interface MessageBubbleProps {
 		contentText?: string | null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls?: any[];
+		sideCars?: SideCarRecord[];
 		messageUuid?: string | null;
 		commandText?: string | null;
 		createdAt?: string | null;
@@ -325,6 +330,7 @@ function WebSearchBlock({
 			onChange={swipe.setCtxMenuOpened}
 			position="bottom-start"
 			withinPortal
+			transitionProps={FIXED_MENU_TRANSITION_PROPS}
 			styles={{
 				dropdown: {
 					position: "fixed",
@@ -365,6 +371,7 @@ function WebSearchBlock({
 						zIndex: 1000,
 						transition: swipe.swipeMenuTransition,
 						pointerEvents: swipe.swipeClosing ? "none" : "auto",
+						opacity: swipe.swipeClosing ? 0 : 1,
 					}}
 				>
 					<Menu opened withinPortal={false} position="bottom-start">
@@ -558,6 +565,7 @@ function BlockMenuWrapper({
 					onChange={setCtxMenuOpened}
 					position="bottom-start"
 					withinPortal
+					transitionProps={FIXED_MENU_TRANSITION_PROPS}
 					styles={{
 						dropdown: {
 							position: "fixed",
@@ -1002,6 +1010,7 @@ export const ReasoningBlock = memo(
 				onChange={swipe.setCtxMenuOpened}
 				position="bottom-start"
 				withinPortal
+				transitionProps={FIXED_MENU_TRANSITION_PROPS}
 				styles={{
 					dropdown: {
 						position: "fixed",
@@ -1043,6 +1052,7 @@ export const ReasoningBlock = memo(
 							zIndex: 1000,
 							transition: swipe.swipeMenuTransition,
 							pointerEvents: swipe.swipeClosing ? "none" : "auto",
+							opacity: swipe.swipeClosing ? 0 : 1,
 						}}
 					>
 						<Menu opened withinPortal={false} position="bottom-start">
@@ -2476,7 +2486,7 @@ export const MessageBubble = memo(function MessageBubble({
 		const infoBlock = blocks.find((b: any) => b.type === "info");
 		if (infoBlock) {
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+				<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
 					<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
 						{infoBlock.message}
 					</Text>
@@ -2497,7 +2507,7 @@ export const MessageBubble = memo(function MessageBubble({
 			return (
 				<MessageContextMenuCtx.Provider value={ctxActions}>
 					<BlockMenuWrapper blockIndex={0}>
-						<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+						<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
 							<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
 								{toolLoadedBlock.text}
 							</Text>
@@ -2514,7 +2524,7 @@ export const MessageBubble = memo(function MessageBubble({
 			return (
 				<MessageContextMenuCtx.Provider value={ctxActions}>
 					<BlockMenuWrapper blockIndex={0}>
-						<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-dark-6)" }}>
+						<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
 							<Text size="xs" c="dimmed" ff="monospace" style={{ whiteSpace: "pre-wrap" }}>
 								$ {bashCommandBlock.command}
 							</Text>
@@ -2827,6 +2837,11 @@ export const MessageBubble = memo(function MessageBubble({
 							_streamingOutput: tc?._streamingOutput,
 							_resolvedModel: tc?._resolvedModel,
 							_timeoutMs: tc?._timeoutMs,
+							sideCars: Array.isArray(tc?.sideCars)
+								? tc.sideCars
+								: Array.isArray(block.sideCars)
+									? block.sideCars
+									: undefined,
 						};
 						const perm = resolvePerm?.(toolCallData) ?? null;
 						return (
@@ -2844,6 +2859,11 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					return null;
 				})}
+				<SideCarNotice
+					sideCars={message.sideCars?.filter(
+						(sideCar: SideCarRecord) => sideCar.target === "user_message",
+					)}
+				/>
 			</Stack>
 		</MessageContextMenuCtx.Provider>
 	);

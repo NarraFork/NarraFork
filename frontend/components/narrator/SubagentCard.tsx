@@ -33,6 +33,7 @@ import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
+import { formatDurationText } from "../../lib/format";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
 import { ContentViewer } from "./ContentViewer";
@@ -60,6 +61,8 @@ import {
 	ToolCallCard,
 } from "./ToolCallCard";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
+
+const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 
 /** Lightweight shape of the subagent narrator data from query cache */
 interface SubagentNarratorData {
@@ -642,7 +645,7 @@ export const SubagentCard = memo(
 									) : (
 										totalMs > 0 && (
 											<Text size="xs" c="dimmed" ff="monospace">
-												{(totalMs / 1000).toFixed(1)}s
+												{formatDurationText(totalMs, { style: "precise" })}
 											</Text>
 										)
 									)}
@@ -970,6 +973,7 @@ export const SubagentCard = memo(
 							zIndex: 1000,
 							transition: swipe.swipeMenuTransition,
 							pointerEvents: swipe.swipeClosing ? "none" : "auto",
+							opacity: swipe.swipeClosing ? 0 : 1,
 						}}
 					>
 						<Menu opened withinPortal={false} position="bottom-start">
@@ -988,6 +992,7 @@ export const SubagentCard = memo(
 				onChange={swipe.setCtxMenuOpened}
 				position="bottom-start"
 				withinPortal
+				transitionProps={FIXED_MENU_TRANSITION_PROPS}
 				styles={{
 					dropdown: {
 						position: "fixed",

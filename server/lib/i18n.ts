@@ -170,6 +170,14 @@ If any todo state changes, call TaskCreate with the complete updated list.
 		"zh-CN":
 			"\n\n[系统提示：你已使用 {turnIndex}/{maxTurns} 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]",
 	},
+	"tool.silentToolCallProgressReminder": {
+		en: `<progress_update_request>
+You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
+</progress_update_request>`,
+		"zh-CN": `<progress_update_request>
+你已经连续 {count} 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。
+</progress_update_request>`,
+	},
 	"tool.brokenToolCallReminder": {
 		en: `[SYSTEM: Your previous {toolNames} call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
 
@@ -522,6 +530,7 @@ export type ToolMessageKey =
 	| "todoReminder"
 	| "suggestAnswerSystem"
 	| "turnNudge"
+	| "silentToolCallProgressReminder"
 	| "brokenToolCallReminder"
 	| "brokenToolCallInputPlaceholder"
 	| "brokenToolCallResult"

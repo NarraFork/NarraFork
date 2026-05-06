@@ -135,7 +135,9 @@
 	"cancel": "Cancel",
 	"feedbackPlaceholder": "Feedback to model (optional)",
 	"dangerReflectionRunning": "Danger reflection is checking this operation",
+	"dangerReflectionAwaitingUser": "Danger reflection stopped; awaiting your decision",
 	"dangerReflectionResolved": "Danger reflection resolved",
+	"stopDangerReflection": "Stop reflection",
 	"planReflectionAutoApprove": "Auto-approve plans",
 	"planReflectionAutoApproveDesc": "Run plan reflection and skip manual ExitPlanMode approval after confirmation.",
 	"dangerReflectionToggle": "Danger reflection",
@@ -144,6 +146,8 @@
 	"dangerReflectionDisableWarning": "High-risk operations in Bypass All mode will no longer pause for danger reflection before running. Deletions, external writes, and dangerous shell commands may execute immediately. Basic blacklists and catastrophic command protection still remain.",
 	"dangerReflectionDisableConfirm": "Disable danger reflection",
 	"bufferedMessage": "Queued",
+	"queuedPriority": "Priority",
+	"queuedPriorityNextRequest": "Priority · send on next request",
 	"cancelBuffer": "Remove",
 	"clearAllQueued": "Clear all queued",
 	"queuedCount": "{{count}} queued",
@@ -473,6 +477,10 @@
 	"details.emptyRules": "No rules",
 	"details.stats.messages": "Messages",
 	"details.stats.cost": "Cost",
+	"details.stats.inputTokens": "Total input",
+	"details.stats.outputTokens": "Total output",
+	"details.stats.cacheReadTokens": "Cache reads",
+	"details.stats.usageHistoryIncludesSubagents": "From usage history · includes subagents",
 	"details.stats.viewers": "Viewers",
 	"details.stats.terminals": "Terminals",
 	"details.stats.browserSessions": "Browser",
@@ -497,6 +505,21 @@
 		"bashTask": "Command",
 		"openAgent": "Open agent"
 	},
+	"sidecar": {
+		"titleWithCount": "System injection ×{{count}}",
+		"unknownSource": "unknown",
+		"copy": "Copy sidecar content",
+		"copied": "Copied",
+		"empty": "No content",
+		"sources": {
+			"silent_progress": "Progress reminder",
+			"todo_reminder": "TODO reminder",
+			"bg_agent": "Background agent",
+			"bg_bash": "Background command",
+			"team_message": "Team message",
+			"buffered_user": "Buffered user message"
+		}
+	},
 	"toolCallInspector": {
 		"title": "Tool Call Inspector",
 		"inspect": "Inspect tool call",
@@ -510,7 +533,7 @@
 		"copyInput": "Copy input",
 		"copyOutput": "Copy output",
 		"loadFailed": "Failed to load tool call details",
-		"duration": "Duration {{ms}}ms",
+		"duration": "Duration {{duration}}",
 		"timing": {
 			"title": "Timing",
 			"streamStarted": "Tool streaming started",

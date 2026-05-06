@@ -17,6 +17,7 @@ import {
 	IconTerminal2,
 	IconUser,
 	IconUsers,
+	IconWand,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
@@ -42,6 +43,9 @@ function MobileSettingsNav() {
 	const { t } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
+	const openSetupWizard = () => {
+		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
+	};
 
 	const personalItems = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={20} /> },
@@ -129,6 +133,13 @@ function MobileSettingsNav() {
 							variant="subtle"
 						/>
 					))}
+					<NavLink
+						label={t("wizardReopen")}
+						leftSection={<IconWand size={20} />}
+						onClick={openSetupWizard}
+						variant="subtle"
+						mt="md"
+					/>
 				</>
 			)}
 		</Box>

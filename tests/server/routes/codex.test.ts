@@ -7,6 +7,8 @@ const settingsState: {
 	codex: {
 		useWebSocket?: boolean;
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+		loadBalancingMode?: "priority" | "balanced" | "tier-balanced";
+		tierOrder?: Array<"free" | "plus" | "team" | "prolite" | "pro" | "other">;
 	};
 } = {
 	codex: {
@@ -40,9 +42,12 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			stickySessionCount: 0,
 			usageCache: {},
 			loadBalancingMode: "priority",
+			tierOrder: ["pro", "prolite", "plus", "team", "free"],
+			effectiveTierOrder: ["pro", "prolite", "plus", "team", "free", "other"],
 		}),
 		setLoadBalancingMode: () => {},
-		importCredentials: () => ({ added: 0, duplicates: 0, total: 0 }),
+		setTierOrder: () => {},
+		importCredentials: () => ({ added: 0, duplicates: 0, skipped: 0 }),
 	}),
 }));
 
@@ -88,6 +93,8 @@ app.onError((err, c) => {
 beforeEach(() => {
 	settingsState.codex.useWebSocket = undefined;
 	settingsState.codex.defaultReasoningEffort = undefined;
+	settingsState.codex.loadBalancingMode = undefined;
+	settingsState.codex.tierOrder = undefined;
 	saveSettingsCalls = 0;
 });
 
@@ -135,6 +142,61 @@ describe("codex routes validation", () => {
 		expect(res.status).toBe(400);
 		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
 		expect(settingsState.codex.defaultReasoningEffort).toBeUndefined();
+		expect(saveSettingsCalls).toBe(0);
+	});
+
+	it("accepts tier-balanced load balancing mode", async () => {
+		const res = await app.request("/load-balancing-mode", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "tier-balanced" }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true, mode: "tier-balanced" });
+		expect(settingsState.codex.loadBalancingMode).toBe("tier-balanced");
+		expect(saveSettingsCalls).toBe(1);
+	});
+
+	it("rejects unsupported load balancing modes", async () => {
+		const res = await app.request("/load-balancing-mode", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "fastest" }),
+		});
+
+		expect(res.status).toBe(400);
+		expect(settingsState.codex.loadBalancingMode).toBeUndefined();
+		expect(saveSettingsCalls).toBe(0);
+	});
+
+	it("accepts and normalizes custom tier order", async () => {
+		const res = await app.request("/tier-order", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ tierOrder: ["plus", "pro", "plus", "free"] }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({
+			ok: true,
+			tierOrder: ["plus", "pro", "free"],
+			effectiveTierOrder: ["pro", "prolite", "plus", "team", "free", "other"],
+		});
+		expect(settingsState.codex.tierOrder).toEqual(["plus", "pro", "free"]);
+		expect(saveSettingsCalls).toBe(1);
+	});
+
+	it("rejects invalid tier order values", async () => {
+		const res = await app.request("/tier-order", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ tierOrder: ["pro", "enterprise"] }),
+		});
+
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
+		expect(settingsState.codex.tierOrder).toBeUndefined();
 		expect(saveSettingsCalls).toBe(0);
 	});
 });

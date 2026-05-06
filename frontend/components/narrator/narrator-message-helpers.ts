@@ -27,7 +27,8 @@ export function isRunningDangerReflectionPermissionLike(value: {
 	suggestions?: unknown[] | null;
 	permissionSuggestions?: unknown[] | null;
 }): boolean {
-	return getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions) === "running";
+	const status = getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions);
+	return status === "running" || status === "awaiting_user";
 }
 
 // Re-export functions that moved to message-segments.ts for backward compatibility

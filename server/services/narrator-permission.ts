@@ -2621,7 +2621,7 @@ function dangerReflectionSuggestions(
 		fingerprint: string;
 		startedAt?: number;
 	},
-	status: "confirmed" | "cancelled" | "aborted",
+	status: "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted",
 	reason?: string,
 ) {
 	return [
@@ -2699,6 +2699,54 @@ async function markDangerReflectionAborted(
 	}
 }
 
+export async function stopDangerReflectionLoop(
+	requestId: string,
+	reason?: string,
+): Promise<boolean> {
+	const pause = pendingDangerReflections.get(requestId);
+	if (!pause) return false;
+
+	const message = reason?.trim() || "Danger reflection stopped by user; awaiting user decision";
+	pause.reflectionStoppedByUser = true;
+	pause.reflectionAbortController?.abort(new Error(message));
+
+	try {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "pending",
+				permissionDecisionReason: message,
+				permissionSuggestions: dangerReflectionSuggestions(pause, "awaiting_user", message),
+			})
+			.where(eq(narratorToolCalls.id, pause.toolCallId));
+		broadcastToNarrator(pause.broadcastTargetId, {
+			type: "danger_reflection_stopped",
+			narratorId: pause.broadcastTargetId,
+			requestId,
+			toolUseId: pause.toolUseId,
+			toolName: pause.toolName,
+			danger: pause.danger,
+			inputJson: pause.input,
+			reason: message,
+		});
+		await narratorService.updateStatus(pause.narratorId, "waiting", {
+			substatus: ["silent_notification"],
+		});
+		if (pause.broadcastTargetId !== pause.narratorId) {
+			await narratorService.updateStatus(pause.broadcastTargetId, "waiting", {
+				substatus: ["silent_notification"],
+			});
+		}
+	} catch (err) {
+		logger.warn("Failed to stop danger reflection loop", {
+			requestId,
+			narratorId: pause.narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+	return true;
+}
+
 export async function confirmDangerReflection(
 	requestId: string,
 	reflection?: string,
@@ -2706,6 +2754,7 @@ export async function confirmDangerReflection(
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return false;
+	if (decidedBy === "reflection" && pause.reflectionStoppedByUser) return false;
 	pause.cleanup();
 	const reason = reflection?.trim() || pause.danger.summary;
 	const result: PermissionResult = { behavior: "allow", updatedInput: pause.input };
@@ -2757,6 +2806,7 @@ export async function cancelDangerReflection(
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
 	if (!pause) return false;
+	if (decidedBy === "reflection" && pause.reflectionStoppedByUser) return false;
 	pause.cleanup();
 	const message =
 		reason?.trim() ||

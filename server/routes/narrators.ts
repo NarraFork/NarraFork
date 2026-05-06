@@ -109,6 +109,7 @@ import {
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import { type NarratorGoalStatus, narratorGoalService } from "../services/narrator-goal-service";
+import { stopDangerReflectionLoop } from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	handleBashCommand,
@@ -131,6 +132,7 @@ import {
 	pushBufferedMessage,
 	removeBufferedMessage,
 	reorderBufferedMessages,
+	requestBufferedMessageSoftStop,
 	resolveAllPendingPermissions,
 	resolvePermissionOrDangerReflection,
 	retryLastMessage,
@@ -144,10 +146,12 @@ import {
 	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
+	updateNarratorReasoningEffort,
 } from "../services/narrator-session";
 import { activeNarrators, planModeAskedOnce } from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
+import { usageHistoryService } from "../services/usage-history-service";
 import {
 	broadcastToNarrator,
 	getNarratorIdsWithPresence,
@@ -432,6 +436,15 @@ narratorRoutes.get("/:id", async (c) => {
 	return c.json({ ...narrator, substatus: parseSubstatus(narrator.substatus) });
 });
 
+// Get usage stats for this narrator, optionally including direct subagents.
+narratorRoutes.get("/:id/usage-stats", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const includeSubagents = c.req.query("includeSubagents") !== "false";
+	const stats = await usageHistoryService.getUsageStats({ narratorId, includeSubagents });
+	return c.json(stats);
+});
+
 // Get available commands + skills for the slash menu
 narratorRoutes.get("/:id/commands", async (c) => {
 	const id = c.req.param("id");
@@ -671,11 +684,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "working" || narrator.status === "waiting") {
 		if (isSubagentVariant(narrator.variant)) {
-			const {
-				pushSubagentBufferedMessage,
-				getSubagentBufferedMessages,
-				interruptForegroundSubagent,
-			} = await import("../services/narrator-subagent");
+			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
+				"../services/narrator-subagent"
+			);
 			const result = pushSubagentBufferedMessage(
 				id,
 				finalMessage,
@@ -692,16 +703,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				narratorId: id,
 				messages,
 			});
-			if (priority) {
-				const interrupted = interruptForegroundSubagent(id);
-				if (!interrupted && (narrator.status === "working" || narrator.status === "waiting")) {
-					await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
-				}
-			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 
-		// Primary narrator: push onto buffer queue (or unshift if priority)
+		// Primary narrator: push onto buffer queue (or unshift if priority).
 		const user = await db.query.users.findFirst({
 			where: eq(users.id, userId),
 			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
@@ -731,19 +736,11 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				narratorId: id,
 				messages,
 			});
-			// If priority=true, automatically interrupt the narrator
+			// Priority messages should cut in at the next safe model-request boundary without
+			// aborting running tools. The loop soft-stops after current tools complete, then
+			// consumes the front of the buffer as the next request.
 			if (priority) {
-				let interrupted = interruptNarrator(id);
-				if (!interrupted) {
-					// Fallback: try interrupting a foreground subagent
-					const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
-					interrupted = interruptForegroundSubagent(id);
-				}
-				// Fallback: if no active loop found but DB status is still working/waiting,
-				// force-reset to interrupted
-				if (!interrupted && (narrator.status === "working" || narrator.status === "waiting")) {
-					await narratorService.updateStatus(id, "idle", { substatus: ["interrupted"] });
-				}
+				requestBufferedMessageSoftStop(id);
 			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
@@ -1432,6 +1429,7 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateReasoningEffort(id, reasoningEffort);
+	updateNarratorReasoningEffort(id, reasoningEffort ?? null);
 	return c.json({ ok: true });
 });
 
@@ -1953,6 +1951,16 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 		decidedBy: "user",
 	});
 	if (!resolved) return c.json({ error: "Permission request not found" }, 404);
+	return c.json({ ok: true });
+});
+
+// Stop automatic danger reflection but leave the tool permission pending for user decision
+narratorRoutes.post("/permissions/:requestId/stop-reflection", async (c) => {
+	const requestId = c.req.param("requestId");
+	const body = await c.req.json().catch(() => ({}));
+	const reason = typeof body.reason === "string" ? body.reason : undefined;
+	const stopped = await stopDangerReflectionLoop(requestId, reason);
+	if (!stopped) return c.json({ error: "Danger reflection request not found" }, 404);
 	return c.json({ ok: true });
 });
 

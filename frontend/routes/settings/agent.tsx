@@ -43,6 +43,8 @@ function SettingsAgentPage() {
 				setDangerSkipReadOnlyConfirmations={is.setDangerSkipReadOnlyConfirmations}
 				maxTransientRetries={is.maxTransientRetries}
 				setMaxTransientRetries={is.setMaxTransientRetries}
+				silentToolCallThreshold={is.silentToolCallThreshold}
+				setSilentToolCallThreshold={is.setSilentToolCallThreshold}
 				retryBackoffCeilMs={is.retryBackoffCeilMs}
 				setRetryBackoffCeilMs={is.setRetryBackoffCeilMs}
 				firstTokenTimeoutMs={is.firstTokenTimeoutMs}

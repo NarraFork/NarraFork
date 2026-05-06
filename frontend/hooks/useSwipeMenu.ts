@@ -556,7 +556,9 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 	// --- Computed ---
 	const isSwiping = !!swipeRef.current;
 	const swipeTransition = isSwiping ? "none" : "transform 200ms ease";
-	const swipeMenuTransition = isSwiping ? "none" : "left 200ms ease, transform 200ms ease";
+	const swipeMenuTransition = isSwiping
+		? "none"
+		: "left 200ms ease, transform 200ms ease, opacity 120ms ease";
 
 	const swipeStyle: React.CSSProperties =
 		swipeOffset > 0

@@ -54,6 +54,8 @@ export interface AgentSectionProps {
 	setDangerSkipReadOnlyConfirmations: (v: boolean) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
+	silentToolCallThreshold: number;
+	setSilentToolCallThreshold: (v: number) => void;
 	retryBackoffCeilMs: number;
 	setRetryBackoffCeilMs: (v: number) => void;
 	firstTokenTimeoutMs: number;
@@ -224,6 +226,16 @@ export function AgentSection(props: AgentSectionProps) {
 				onChange={(v) => props.setMaxTransientRetries(typeof v === "number" ? v : 10)}
 				min={-1}
 				max={100}
+			/>
+			<NumberInput
+				label={t("silentToolCallThreshold")}
+				description={t("silentToolCallThresholdDesc")}
+				value={props.silentToolCallThreshold}
+				onChange={(v) => props.setSilentToolCallThreshold(typeof v === "number" ? v : 20)}
+				min={-1}
+				max={1000}
+				step={1}
+				decimalScale={0}
 			/>
 			<NumberInput
 				label={t("retryBackoffCeil")}

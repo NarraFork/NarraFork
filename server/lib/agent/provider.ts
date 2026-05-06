@@ -85,7 +85,7 @@ export interface ParsedStreamEvent {
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
 	credentialId?: string;
-	queueStatus?: { position: number; queueDepth: number };
+	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };
 	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
 	quotaBalance?: string | null;
 	/** Streaming tool use chunk — accumulated by the loop */
@@ -230,7 +230,13 @@ export interface ProviderAdapter {
 	): unknown;
 
 	/** Append a user turn to history (mutates in place) */
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void;
 
 	/** Append an assistant turn to history (mutates in place) */
 	pushAssistantTurn(

@@ -17,9 +17,11 @@ import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
 	buildCodexUsageForecast,
 	buildCodexUsageSummary,
+	type CodexPlanTier,
 	type CodexUsageForecast,
 	type CodexUsageSummary,
 	getScheduledUsageResetAt,
+	normalizeCodexPlanTier,
 } from "./codex-usage-summary";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
@@ -39,7 +41,20 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 // === Types ===
 
 export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
-export type LoadBalancingMode = "priority" | "balanced";
+export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
+
+export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
+const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free", "other"];
+
+export function normalizeCodexTierOrder(order?: readonly string[] | null): CodexPlanTier[] {
+	const validTiers = new Set<CodexPlanTier>(ALL_CODEX_TIER_ORDER);
+	const result: CodexPlanTier[] = [];
+	for (const tier of order ?? []) {
+		if (!validTiers.has(tier as CodexPlanTier)) continue;
+		if (!result.includes(tier as CodexPlanTier)) result.push(tier as CodexPlanTier);
+	}
+	return result.length > 0 ? result : [...DEFAULT_CODEX_TIER_ORDER];
+}
 
 export interface CodexCredential {
 	id: string;
@@ -97,6 +112,8 @@ export interface ManagerSnapshot {
 	unavailableTotal: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
+	tierOrder: CodexPlanTier[];
+	effectiveTierOrder: CodexPlanTier[];
 	total: number;
 	available: number;
 	stickySessionCount: number;
@@ -170,6 +187,7 @@ export class CodexManager {
 	private stats: Map<string, CredentialStats>;
 	private currentId: string;
 	private loadBalancingMode: LoadBalancingMode;
+	private tierOrder: CodexPlanTier[];
 	private refreshPromises = new Map<string, Promise<CodexCredential>>();
 	private pendingDeviceFlow: PendingDeviceFlow | undefined;
 	private usageRefreshPromises = new Map<string, Promise<CodexUsageResult>>();
@@ -186,7 +204,8 @@ export class CodexManager {
 		this.entries = [];
 		this.stats = new Map();
 		this.currentId = "";
-		this.loadBalancingMode = "priority";
+		this.loadBalancingMode = "tier-balanced";
+		this.tierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 
 		this.loadCredentials();
 		this.loadStats();
@@ -211,7 +230,9 @@ export class CodexManager {
 		this.pruneSessionAffinity();
 		const total = this.entries.length;
 		const triedIds = new Set<string>();
-		const stickyEnabled = this.loadBalancingMode === "balanced" && !!sessionKey;
+		const stickyEnabled =
+			(this.loadBalancingMode === "balanced" || this.loadBalancingMode === "tier-balanced") &&
+			!!sessionKey;
 
 		if (stickyEnabled && sessionKey) {
 			const sticky = this.sessionAffinity.get(sessionKey);
@@ -275,13 +296,45 @@ export class CodexManager {
 		if (available.length === 0) return null;
 
 		if (this.loadBalancingMode === "balanced") {
-			// Balanced mode: random pick among currently available credentials.
-			const randomIndex = Math.floor(Math.random() * available.length);
-			return available[randomIndex] ?? available[0];
+			return this.selectRandomEntry(available);
+		}
+
+		if (this.loadBalancingMode === "tier-balanced") {
+			const effectiveTierOrder = this.getEffectiveTierOrder();
+			let bestTierRank = Number.POSITIVE_INFINITY;
+			let bestTierEntries: CodexCredential[] = [];
+
+			for (const entry of available) {
+				const tier = normalizeCodexPlanTier(entry.usage?.plan_type);
+				const tierRank = effectiveTierOrder.indexOf(tier);
+				const rank = tierRank >= 0 ? tierRank : effectiveTierOrder.length;
+				if (rank < bestTierRank) {
+					bestTierRank = rank;
+					bestTierEntries = [entry];
+				} else if (rank === bestTierRank) {
+					bestTierEntries.push(entry);
+				}
+			}
+
+			return this.selectRandomEntry(bestTierEntries);
 		}
 
 		// Priority mode: lowest priority number first
 		return available.reduce((best, e) => (e.priority < best.priority ? e : best));
+	}
+
+	private selectRandomEntry(entries: CodexCredential[]): CodexCredential | null {
+		if (entries.length === 0) return null;
+		const randomIndex = Math.floor(Math.random() * entries.length);
+		return entries[randomIndex] ?? entries[0];
+	}
+
+	private getEffectiveTierOrder(): CodexPlanTier[] {
+		const order = normalizeCodexTierOrder(this.tierOrder);
+		for (const tier of ALL_CODEX_TIER_ORDER) {
+			if (!order.includes(tier)) order.push(tier);
+		}
+		return order;
 	}
 
 	private async tryEnsureToken(entry: CodexCredential): Promise<CallContext | null> {
@@ -640,6 +693,8 @@ export class CodexManager {
 			unavailableTotal: allUnavailable.length,
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
+			tierOrder: [...this.tierOrder],
+			effectiveTierOrder: this.getEffectiveTierOrder(),
 			total: this.entries.length,
 			available: allAvailable.length,
 			stickySessionCount: this.sessionAffinity.size,
@@ -657,6 +712,14 @@ export class CodexManager {
 			this.sessionAffinity.clear();
 		}
 		this.loadBalancingMode = mode;
+	}
+
+	setTierOrder(order?: readonly string[] | null): void {
+		const next = normalizeCodexTierOrder(order);
+		if (next.join(",") !== this.tierOrder.join(",")) {
+			this.sessionAffinity.clear();
+		}
+		this.tierOrder = next;
 	}
 
 	setDisabled(id: string, disabled: boolean): void {

@@ -330,6 +330,15 @@ export function useNarrator(id: string) {
 	});
 }
 
+export function useNarratorUsageStats(narratorId: string, includeSubagents = true, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", narratorId, "usage-stats", { includeSubagents }],
+		queryFn: () => api.getNarratorUsageStats(narratorId, { includeSubagents }),
+		enabled: !!narratorId && enabled,
+		staleTime: 15_000,
+	});
+}
+
 type MessagePageParam =
 	| {
 			cursor: string;

@@ -1216,6 +1216,8 @@ function SortableQueuedMessageItem({
 	onRemove,
 	cancelBufferLabel,
 	editLabel,
+	priorityLabel,
+	priorityNextRequestLabel,
 }: {
 	msg: BufferMessageSummary;
 	index: number;
@@ -1228,6 +1230,8 @@ function SortableQueuedMessageItem({
 	onRemove: (id: string) => void;
 	cancelBufferLabel: string;
 	editLabel: string;
+	priorityLabel: string;
+	priorityNextRequestLabel: string;
 }) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
@@ -1237,6 +1241,7 @@ function SortableQueuedMessageItem({
 		transition,
 		opacity: isDragging ? 0.5 : 1,
 	};
+	const priorityText = index === 0 ? priorityNextRequestLabel : priorityLabel;
 
 	return (
 		<Group
@@ -1321,6 +1326,17 @@ function SortableQueuedMessageItem({
 						/>
 					) : (
 						<Box w={16} h={16} style={{ flexShrink: 0 }} />
+					)}
+					{msg.priority && (
+						<Badge
+							size="xs"
+							color="orange"
+							variant="light"
+							leftSection={<IconBolt size={10} />}
+							style={{ flexShrink: 0 }}
+						>
+							{priorityText}
+						</Badge>
 					)}
 					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
 						{msg.text}
@@ -2140,6 +2156,10 @@ export function NarratorPanel({
 	const isRetrying = !!retryInfo;
 	// Derive legacy boolean flags from substatus
 	const isCompacting = substatus.includes("compacting");
+	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
+	const queueMessageValue = queueMessage
+		? decodeURIComponent(queueMessage.slice("queue_message:".length))
+		: null;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
 	// --- Turn elapsed timer ---
@@ -4139,14 +4159,14 @@ export function NarratorPanel({
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
 
-	/** Send with priority=true (cut in line — interrupt + insert at front of queue). */
+	/** Send with priority=true (cut in line at the next safe request boundary). */
 	const handleSendPriority = async () => {
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
 		sendingRef.current = true;
 		try {
 			inputHistory.push(msg);
-			// Send with priority=true — backend will automatically interrupt and insert at front
+			// Send with priority=true — backend inserts at the front and waits for a safe boundary.
 			await doSendBuffered(msg, true);
 		} catch (err) {
 			// On error, restore input and attachments
@@ -5632,6 +5652,17 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
+									{queuedMessages[0].priority && (
+										<Badge
+											size="xs"
+											color="orange"
+											variant="light"
+											leftSection={<IconBolt size={10} />}
+											style={{ flexShrink: 0 }}
+										>
+											{t("queuedPriorityNextRequest")}
+										</Badge>
+									)}
 									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
 										{queuedMessages[0].text}
 									</Text>
@@ -5673,6 +5704,8 @@ export function NarratorPanel({
 													onRemove={handleRemoveQueued}
 													cancelBufferLabel={t("cancelBuffer")}
 													editLabel={tc("edit")}
+													priorityLabel={t("queuedPriority")}
+													priorityNextRequestLabel={t("queuedPriorityNextRequest")}
 												/>
 											))}
 										</SortableContext>
@@ -5822,8 +5855,9 @@ export function NarratorPanel({
 									</Text>
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
-											{t(
-											)}
+											{queueMessageValue ??
+												t(
+												)}
 										</Text>
 									)}
 									{turnElapsedText && (

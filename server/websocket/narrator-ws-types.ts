@@ -17,7 +17,7 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			toolName: string;
 			danger: unknown;
-		}
+	  }
 	| {
 			type: "danger_reflection_resolved";
 			narratorId: string;
@@ -25,7 +25,17 @@ export type NarratorServerMessage =
 			toolUseId: string;
 			decision: "allow" | "deny" | "aborted";
 			reason?: string;
-		}
+	  }
+	| {
+			type: "danger_reflection_stopped";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			danger: unknown;
+			inputJson: unknown;
+			reason?: string;
+	  }
 	| {
 			type: "status_change";
 			narratorId: string;
@@ -65,6 +75,7 @@ export type NarratorServerMessage =
 				source: string;
 				content: string;
 				toolUseId?: string | null;
+				orderIndex?: number;
 			}>;
 			parentToolUseId?: string;
 	  }
@@ -76,6 +87,7 @@ export type NarratorServerMessage =
 				source: string;
 				content: string;
 				toolUseId?: string | null;
+				orderIndex?: number;
 			}>;
 			parentToolUseId?: string;
 	  }
@@ -95,21 +107,36 @@ export type NarratorServerMessage =
 	| {
 			type: "buffer_set";
 			narratorId: string;
-			messages: Array<{ id: string; text: string; bufferedAt: string }>;
+			messages: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
 	  }
 	| {
 			type: "buffer_consumed";
 			narratorId: string;
 			messageId: string;
-			remaining: Array<{ id: string; text: string; bufferedAt: string }>;
+			remaining: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
 	  }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
 	| {
 			type: "buffer_preserved";
 			narratorId: string;
-			messages: Array<{ id: string; text: string; bufferedAt: string }>;
+			messages: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
 	  }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
+	| {
+			type: "model_settings_changed";
+			narratorId: string;
+			model?: string;
+			reasoningEffort?: string | null;
+			status: "updated" | "pending";
+			applyAt: "next_request" | "next_model_request";
+	  }
+	| {
+			type: "model_settings_applied";
+			narratorId: string;
+			model: string;
+			provider: string;
+			reasoningEffort?: string | null;
+	  }
 	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean; traits: string[] }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
@@ -320,8 +347,9 @@ export type NarratorServerMessage =
 	| {
 			type: "queue_status";
 			narratorId: string;
-			position: number;
-			queueDepth: number;
+			position?: number;
+			queueDepth?: number;
+			queueMessage?: string;
 	  }
 	| {
 			type: "streaming_snapshot";
@@ -362,7 +390,13 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
-	| { type: "model_switched"; narratorId: string; model: string; provider: string }
+	| {
+			type: "model_switched";
+			narratorId: string;
+			model: string;
+			provider: string;
+			reasoningEffort?: string | null;
+	  }
 	| {
 			type: "subagent_suspended";
 			narratorId: string;

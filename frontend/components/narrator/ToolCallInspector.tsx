@@ -15,8 +15,10 @@ import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../../lib/api";
+import { api, type SideCarRecord } from "../../lib/api";
+import { formatDurationText } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
+import { SideCarNotice } from "./SideCarNotice";
 
 interface ToolCallLike {
 	id?: string;
@@ -34,6 +36,7 @@ interface ToolCallLike {
 	inputJson?: any;
 	// biome-ignore lint/suspicious/noExplicitAny: tool call JSON is dynamic by design
 	outputJson?: any;
+	sideCars?: SideCarRecord[];
 }
 
 interface ToolCallInspectorProps {
@@ -52,14 +55,6 @@ function stringifyJson(value: unknown): string {
 	} catch {
 		return String(value);
 	}
-}
-
-function formatDuration(ms: number): string {
-	if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
-	if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
-	const minutes = Math.floor(ms / 60_000);
-	const seconds = Math.round((ms % 60_000) / 1000);
-	return `${minutes}min${seconds}s`;
 }
 
 function parseTime(value: string | null | undefined): number | null {
@@ -154,7 +149,7 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 								</Text>
 								{delta != null && (
 									<Badge size="xs" variant="light" color="gray">
-										+{formatDuration(delta)}
+										+{formatDurationText(delta, { style: "precise" })}
 									</Badge>
 								)}
 							</Group>
@@ -166,21 +161,23 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 				{streamStarted != null && totalEnd != null && (
 					<Badge size="sm" variant="light">
 						{t("toolCallInspector.timing.total", {
-							duration: formatDuration(totalEnd - streamStarted),
+							duration: formatDurationText(totalEnd - streamStarted, { style: "precise" }),
 						})}
 					</Badge>
 				)}
 				{permissionStarted != null && executionStarted != null && (
 					<Badge size="sm" variant="light" color="yellow">
 						{t("toolCallInspector.timing.permissionWait", {
-							duration: formatDuration(executionStarted - permissionStarted),
+							duration: formatDurationText(executionStarted - permissionStarted, {
+								style: "precise",
+							}),
 						})}
 					</Badge>
 				)}
 				{executionStarted != null && totalEnd != null && (
 					<Badge size="sm" variant="light" color="blue">
 						{t("toolCallInspector.timing.execution", {
-							duration: formatDuration(totalEnd - executionStarted),
+							duration: formatDurationText(totalEnd - executionStarted, { style: "precise" }),
 						})}
 					</Badge>
 				)}
@@ -273,7 +270,9 @@ export function ToolCallInspector({
 						</Group>
 						{toolCall?.durationMs != null && (
 							<Text size="xs" c="dimmed">
-								{t("toolCallInspector.duration", { ms: toolCall.durationMs })}
+								{t("toolCallInspector.duration", {
+									duration: formatDurationText(toolCall.durationMs, { style: "precise" }),
+								})}
 							</Text>
 						)}
 					</Stack>
@@ -312,6 +311,7 @@ export function ToolCallInspector({
 
 				<JsonSection title={t("toolCallInspector.input")} value={toolCall?.inputJson} />
 				<JsonSection title={t("toolCallInspector.output")} value={toolCall?.outputJson} />
+				<SideCarNotice sideCars={toolCall?.sideCars} mode="detail" />
 
 				<Group gap="xs" justify="flex-end">
 					<CopyButton value={inputContent} timeout={1500}>

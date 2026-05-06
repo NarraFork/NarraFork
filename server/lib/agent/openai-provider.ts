@@ -564,20 +564,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 		}
 
-		// Append current user message (skip "." continuation markers)
-		if (params.content && params.content !== ".") {
-			if (params.images?.length) {
-				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
-				for (const img of params.images) {
-					parts.push({
-						type: "image_url",
-						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-					});
-				}
-				messages.push({ role: "user", content: parts });
-			} else {
-				messages.push({ role: "user", content: params.content });
-			}
+		// Append current user message (skip "." continuation markers unless images are attached)
+		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		if (currentUserMessage) {
+			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0) {
 			messages.push({ role: "user", content: params.content });
 		}
@@ -809,23 +799,27 @@ export class OpenAIProvider implements ProviderAdapter {
 		return { tool_call_id: toolUseId, content: output } satisfies OAIToolResult;
 	}
 
-	pushUserTurn(history: unknown[], content: string, _model: string, toolResults: unknown[]): void {
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		_model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
 		const h = history as OAIMessage[];
 		if (this.responsesFormat) {
 			for (const tr of toolResults as ResponsesFunctionCallOutputMessage[]) {
 				h.push(...expandResponsesToolResultMessage(tr));
 			}
-			if (content && content !== ".") {
-				h.push(buildResponsesUserMessage(content));
-			}
+			const userMessage = buildOAIUserMessage(content, images);
+			if (userMessage) h.push(userMessage);
 			return;
 		}
 		for (const tr of toolResults as OAIToolResult[]) {
 			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 		}
-		if (content && content !== ".") {
-			h.push({ role: "user", content });
-		}
+		const userMessage = buildOAIUserMessage(content, images);
+		if (userMessage) h.push(userMessage);
 	}
 
 	pushAssistantTurn(
@@ -1221,19 +1215,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				} as unknown as OAIMessage);
 			}
 		}
-		if (params.content && params.content !== ".") {
-			if (params.images?.length) {
-				const parts: OAIContentPart[] = [{ type: "text", text: params.content }];
-				for (const img of params.images) {
-					parts.push({
-						type: "image_url",
-						image_url: { url: `data:image/${img.format};base64,${img.base64}` },
-					});
-				}
-				messages.push({ role: "user", content: parts });
-			} else {
-				messages.push({ role: "user", content: params.content });
-			}
+		const currentUserMessage = buildOAIUserMessage(params.content, params.images);
+		if (currentUserMessage) {
+			messages.push(currentUserMessage);
 		} else if (params.toolResults.length === 0) {
 			messages.push({ role: "user", content: params.content });
 		}
@@ -2326,6 +2310,30 @@ function findActiveReasoningAccum(
 }
 
 // === History builder ===
+
+function buildOAIUserMessage(
+	content: string,
+	images?: Array<{ format: string; base64: string }>,
+): OAIMessage | null {
+	const hasText = !!content && content !== ".";
+	const hasImages = !!images?.length;
+	if (!hasText && !hasImages) return null;
+
+	if (hasImages) {
+		const parts: OAIContentPart[] = [
+			{ type: "text", text: hasText ? content : "[user sent image(s)]" },
+		];
+		for (const img of images) {
+			parts.push({
+				type: "image_url",
+				image_url: { url: `data:image/${img.format};base64,${img.base64}` },
+			});
+		}
+		return { role: "user", content: parts };
+	}
+
+	return { role: "user", content };
+}
 
 function buildResponsesUserMessage(content: string): OAIMessage {
 	return { role: "user", content: [{ type: "input_text", text: content }] } as OAIMessage;

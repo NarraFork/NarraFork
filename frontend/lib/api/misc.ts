@@ -3,6 +3,8 @@ import type {
 	ApiEntity,
 	ChangelogEntry,
 	CodexCredentialEntry,
+	CodexLoadBalancingMode,
+	CodexPlanTier,
 	CodexUsageData,
 	CodexUsageForecast,
 	CodexUsageSchedulerSnapshot,
@@ -297,7 +299,9 @@ export const miscApi = {
 			availableTotal: number;
 			unavailableTotal: number;
 			currentId: string;
-			loadBalancingMode: "priority" | "balanced";
+			loadBalancingMode: CodexLoadBalancingMode;
+			tierOrder: CodexPlanTier[];
+			effectiveTierOrder: CodexPlanTier[];
 			total: number;
 			available: number;
 			stickySessionCount: number;
@@ -390,11 +394,19 @@ export const miscApi = {
 			};
 			queriedAt: string;
 		}>(`/codex/credentials/${id}/usage`, { method: "POST" }),
-	codexSetLoadBalancingMode: (mode: "priority" | "balanced") =>
-		request<{ ok: boolean; mode: string }>("/codex/load-balancing-mode", {
+	codexSetLoadBalancingMode: (mode: CodexLoadBalancingMode) =>
+		request<{ ok: boolean; mode: CodexLoadBalancingMode }>("/codex/load-balancing-mode", {
 			method: "POST",
 			body: JSON.stringify({ mode }),
 		}),
+	codexSetTierOrder: (tierOrder: CodexPlanTier[]) =>
+		request<{ ok: boolean; tierOrder: CodexPlanTier[]; effectiveTierOrder: CodexPlanTier[] }>(
+			"/codex/tier-order",
+			{
+				method: "POST",
+				body: JSON.stringify({ tierOrder }),
+			},
+		),
 	codexSetGlobalProxy: (proxy?: string) =>
 		request<{ ok: boolean }>("/codex/global-proxy", {
 			method: "POST",

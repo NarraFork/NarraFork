@@ -13,7 +13,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import { buildHistory, resolveProviderAndModel } from "../lib/agent";
+import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
@@ -33,7 +33,9 @@ import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-mod
 import { getHome } from "../lib/platform";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
+	FOLLOW_DEFAULT_MODEL,
 	getContextThresholds,
+	getSettingsRevision,
 	isAnthropicProvider,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
@@ -62,6 +64,7 @@ import {
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
+	getSilentToolCallThreshold,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
@@ -310,15 +313,22 @@ async function createNarrator(
 	const events = new EventEmitter();
 	events.setMaxListeners(20);
 
-	const narratorModel = resolveEffectiveModel(narrator.model);
+	const narratorModelRef = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+	const narratorModel = resolveEffectiveModel(narratorModelRef);
+	const narratorProvider = resolveProvider(narratorModel);
 
 	const active: ActiveNarrator = {
 		abortController,
 		narratorId,
 		conversationId: effectiveConversationId ?? randomUUID(),
 		cwd: narratorCwd,
+		_modelRef: narratorModelRef,
+		_settingsRevision: getSettingsRevision(),
 		model: narratorModel,
-		provider: resolveProvider(narratorModel),
+		provider: narratorProvider,
+		_reasoningEffortRef: narrator.reasoningEffort ?? null,
+		reasoningEffort:
+			narrator.reasoningEffort ?? resolveDefaultReasoningEffort(narratorProvider) ?? null,
 		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
@@ -650,7 +660,33 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		}
 	};
 
-	const onBeforeTurn = async () => {
+	const rebuildHistoryForCurrentContext = async (
+		boundary: string | null,
+		includeSystemPrompt: boolean,
+	) => {
+		setPruneBoundary(boundary);
+		const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		// Subagent messages all have parentToolUseId set — clear it so
+		// buildHistory treats them as top-level (same as loadSubagentHistory).
+		const msgs = isSubagentNarrator
+			? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
+			: rawMsgs;
+		if (boundary) pruneToolCalls(msgs, boundary);
+		const result = await buildHistory(msgs, getModel(), getProvider(), narratorId);
+		const systemPrompt = includeSystemPrompt
+			? ((await rebuildSystemPrompt?.()) ?? undefined)
+			: undefined;
+		return {
+			history: result.history,
+			pendingToolResults: result.trailingToolResults,
+			...(systemPrompt !== undefined ? { systemPrompt } : {}),
+		};
+	};
+
+	const onBeforeTurn: NonNullable<import("../lib/agent").AgentConfig["onBeforeTurn"]> = async (
+		_turnIndex,
+		reason,
+	) => {
 		// Check if a compact just finished — if so, force a full rebuild
 		// (history + system prompt) so the next API call uses compacted data.
 		// This takes priority over the prune-boundary check below because compact
@@ -659,18 +695,7 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		if (compactJustDone) {
 			clearCompactDone?.();
 			// After compact, pruneBoundary is cleared — sync local cache
-			setPruneBoundary(null);
-			const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
-			const msgs = isSubagentNarrator
-				? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
-				: rawMsgs;
-			const result = await buildHistory(msgs, getModel(), getProvider(), narratorId);
-			const systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
-			return {
-				history: result.history,
-				pendingToolResults: result.trailingToolResults,
-				systemPrompt,
-			};
+			return rebuildHistoryForCurrentContext(null, true);
 		}
 
 		const row = await db.query.narrators.findFirst({
@@ -678,17 +703,8 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			columns: { pruneBoundaryMessageId: true },
 		});
 		const newBoundary = row?.pruneBoundaryMessageId ?? null;
-		if (newBoundary === getPruneBoundary()) return null;
-		setPruneBoundary(newBoundary);
-		const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
-		// Subagent messages all have parentToolUseId set — clear it so
-		// buildHistory treats them as top-level (same as loadSubagentHistory).
-		const msgs = isSubagentNarrator
-			? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
-			: rawMsgs;
-		if (newBoundary) pruneToolCalls(msgs, newBoundary);
-		const result = await buildHistory(msgs, getModel(), getProvider(), narratorId);
-		return { history: result.history, pendingToolResults: result.trailingToolResults };
+		if (!reason?.force && newBoundary === getPruneBoundary()) return null;
+		return rebuildHistoryForCurrentContext(newBoundary, reason?.force === true);
 	};
 
 	return { onContextUsage, onBeforeTurn };
@@ -764,6 +780,15 @@ export async function runAgentLoop(
 				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
 			}
 
+			active._modelRef = freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
+			active._settingsRevision = getSettingsRevision();
+			active.model = resolveEffectiveModel(active._modelRef, active.provider);
+			active.provider = resolveProvider(active.model);
+			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
+			active.reasoningEffort = resolveRuntimeReasoningEffort(
+				active.provider,
+				active._reasoningEffortRef,
+			);
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
 			const { history, trailingToolResults } = await buildHistory(
@@ -1149,6 +1174,7 @@ export async function runAgentLoop(
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
+				silentToolCallThreshold: getSilentToolCallThreshold(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
 				firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 				metadata: isAnthropicProvider(resolved.provider)
@@ -1232,8 +1258,39 @@ export async function runAgentLoop(
 
 					return sideCars;
 				},
+				getRuntimeSettingsOverride: () => {
+					// active.model/reasoningEffort are updated in real time by narrator routes.
+					// For raw refs that follow settings (__default__ / __agg__), also re-resolve
+					// when global settings change so the next API request picks up default-model
+					// or aggregation membership/routing updates, including retry attempts.
+					const revision = getSettingsRevision();
+					if (active._settingsRevision !== revision) {
+						active._settingsRevision = revision;
+						const modelRef = active._modelRef ?? FOLLOW_DEFAULT_MODEL;
+						const resolvedModel = resolveEffectiveModel(modelRef, active.provider);
+						active.model = resolvedModel;
+						active.provider = resolveProvider(resolvedModel);
+						active.reasoningEffort = resolveRuntimeReasoningEffort(
+							active.provider,
+							active._reasoningEffortRef,
+						);
+					}
+
+					const next: import("../lib/agent").RuntimeSettingsOverride = {};
+					if (active.model !== config.model) {
+						next.model = active.model;
+					}
+
+					const runtimeReasoningEffort =
+						active.reasoningEffort ?? resolveDefaultReasoningEffort(active.provider) ?? null;
+					const currentReasoningEffort = config.reasoningEffort ?? null;
+					if (runtimeReasoningEffort !== currentReasoningEffort) {
+						next.reasoningEffort = runtimeReasoningEffort;
+					}
+
+					return Object.keys(next).length > 0 ? next : null;
+				},
 				getModelOverride: () => {
-					// active.model is updated in real-time by updateNarratorModel()
 					if (active.model !== config.model) {
 						return active.model;
 					}
@@ -1258,6 +1315,10 @@ export async function runAgentLoop(
 				shouldStop: () => {
 					if (active._feedbackSoftStop) {
 						active._feedbackSoftStop = false;
+						return true;
+					}
+					if (active._bufferSoftStop) {
+						active._bufferSoftStop = false;
 						return true;
 					}
 					return false;
@@ -3105,18 +3166,68 @@ export function isNarratorActive(narratorId: string): boolean {
 	return activeNarrators.has(narratorId);
 }
 
+export function requestBufferedMessageSoftStop(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) return false;
+	active._bufferSoftStop = true;
+	return true;
+}
+
 // === Dynamic narrator controls ===
+
+function resolveRuntimeReasoningEffort(
+	provider: string,
+	reasoningEffort: ReasoningEffort | null | undefined,
+): ReasoningEffort | null {
+	return reasoningEffort ?? resolveDefaultReasoningEffort(provider) ?? null;
+}
 
 export function updateNarratorModel(narratorId: string, model: string): void {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
-		const effectiveModel = resolveEffectiveModel(model);
+		active._modelRef = model || FOLLOW_DEFAULT_MODEL;
+		active._settingsRevision = getSettingsRevision();
+		const effectiveModel = resolveEffectiveModel(active._modelRef, active.provider);
 		active.model = effectiveModel;
 		active.provider = resolveProvider(effectiveModel);
+		active.reasoningEffort = resolveRuntimeReasoningEffort(
+			active.provider,
+			active._reasoningEffortRef,
+		);
 		broadcastToNarrator(narratorId, {
 			type: "model_changed",
 			narratorId,
 			model,
+		});
+		broadcastToNarrator(narratorId, {
+			type: "model_settings_changed",
+			narratorId,
+			model: effectiveModel,
+			reasoningEffort: active.reasoningEffort ?? null,
+			status: active._loopRunning ? "pending" : "updated",
+			applyAt: active._loopRunning ? "next_model_request" : "next_request",
+		});
+	}
+}
+
+export function updateNarratorReasoningEffort(
+	narratorId: string,
+	reasoningEffort: ReasoningEffort | null,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (active?.alive) {
+		active._reasoningEffortRef = reasoningEffort;
+		active.reasoningEffort = resolveRuntimeReasoningEffort(
+			active.provider,
+			active._reasoningEffortRef,
+		);
+		broadcastToNarrator(narratorId, {
+			type: "model_settings_changed",
+			narratorId,
+			model: active.model,
+			reasoningEffort: active.reasoningEffort,
+			status: active._loopRunning ? "pending" : "updated",
+			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
 	}
 }
@@ -3367,6 +3478,7 @@ export async function recoverOnStartup(): Promise<void> {
 				commandText: row.commandText,
 				createdBy: row.createdBy,
 				creator,
+				priority: row.priority,
 				_savedFiles: savedFiles,
 			};
 			const list = grouped.get(row.narratorId) ?? [];

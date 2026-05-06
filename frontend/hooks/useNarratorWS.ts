@@ -1,6 +1,6 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { BufferMessageSummary, NarratorGoal, TreeMessage } from "../lib/api";
+import type { BufferMessageSummary, NarratorGoal, SideCarRecord, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,
 	narratorWSManager,
@@ -32,6 +32,14 @@ interface NarratorWSCallbacks {
 		decision: "allow" | "deny" | "aborted";
 		reason?: string;
 	}) => void;
+	onDangerReflectionStopped?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		danger?: unknown;
+		inputJson?: Record<string, unknown>;
+		reason?: string;
+	}) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -60,13 +68,9 @@ interface NarratorWSCallbacks {
 		updatedInput?: Record<string, unknown>,
 		metadata?: Record<string, unknown>,
 		parentToolUseId?: string,
-		sideCars?: Array<{
-			target: string;
-			source: string;
-			content: string;
-			toolUseId?: string | null;
-		}>,
+		sideCars?: SideCarRecord[],
 	) => void;
+	onSideCars?: (sideCars: SideCarRecord[], parentToolUseId?: string) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
@@ -105,7 +109,7 @@ interface NarratorWSCallbacks {
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null) => void;
-	onQueueStatus?: (position: number, queueDepth: number) => void;
+	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
 		status: "in_progress" | "searching" | "completed",
@@ -316,6 +320,16 @@ export function useNarratorWS(
 							reason: data.reason as string | undefined,
 						});
 						break;
+					case "danger_reflection_stopped":
+						callbacksRef.current.onDangerReflectionStopped?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							danger: data.danger,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							reason: data.reason as string | undefined,
+						});
+						break;
 					case "status_change":
 						callbacksRef.current.onStatusChange?.(
 							data.status as string,
@@ -357,14 +371,13 @@ export function useNarratorWS(
 							data.updatedInput as Record<string, unknown> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
-							data.sideCars as
-								| Array<{
-										target: string;
-										source: string;
-										content: string;
-										toolUseId?: string | null;
-								  }>
-								| undefined,
+							data.sideCars as SideCarRecord[] | undefined,
+						);
+						break;
+					case "sidecars":
+						callbacksRef.current.onSideCars?.(
+							data.sideCars as SideCarRecord[],
+							data.parentToolUseId as string | undefined,
 						);
 						break;
 					case "tool_long_running":
@@ -494,8 +507,9 @@ export function useNarratorWS(
 						break;
 					case "queue_status":
 						callbacksRef.current.onQueueStatus?.(
-							data.position as number,
-							data.queueDepth as number,
+							data.position as number | undefined,
+							data.queueDepth as number | undefined,
+							data.queueMessage as string | undefined,
 						);
 						break;
 					case "web_search":
@@ -532,10 +546,16 @@ export function useNarratorWS(
 						});
 						break;
 					case "model_changed":
-					case "model_switched":
 						if (data.model) {
 							callbacksRef.current.onModelChanged?.(data.model as string);
 						}
+						break;
+					case "model_switched":
+					case "model_settings_changed":
+					case "model_settings_applied":
+						// Runtime/applied model events describe the concrete model being used for the
+						// current request. Do not write them into the narrator query cache, because
+						// narrator.model may intentionally remain __default__ or an aggregation ref.
 						break;
 					case "catch_up": {
 						const topLevel = (data.topLevel ?? []) as TreeMessage[];

@@ -1,3 +1,4 @@
+import { formatDurationText } from "@frontend/lib/format";
 import i18n from "@frontend/lib/i18n";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import { collectSegmentTargetIds, segmentMessages, type ToolRunItem } from "../message-segments";
@@ -5,7 +6,6 @@ import type { MessagesPage, NarratorMsg, PendingPermission } from "../narrator-p
 import {
 	basename,
 	extractField,
-	formatCompletedDuration,
 	getCategory,
 	getCategoryColor,
 	getFilePath,
@@ -1054,10 +1054,7 @@ function buildToolDetailBlocks(
 			break;
 		}
 		case "file": {
-			const streamingEdit =
-				toolName === "Edit"
-					? getStreamingEditInput(inputJson, metadata)
-					: null;
+			const streamingEdit = toolName === "Edit" ? getStreamingEditInput(inputJson, metadata) : null;
 			if (filePath) blocks.push({ kind: "text-line", text: filePath, muted: true, mono: true });
 			if (streamingEdit) {
 				metadataLine(blocks, [`streaming ${streamingEdit.phase}`]);
@@ -1629,7 +1626,9 @@ function buildToolUseBlock(
 		toolSummary: summary,
 		toolStatus: status,
 		toolDuration:
-			item.tc.durationMs != null ? formatCompletedDuration(item.tc.durationMs) : undefined,
+			item.tc.durationMs != null
+				? formatDurationText(item.tc.durationMs, { style: "precise" })
+				: undefined,
 		toolStatusColor: statusColor(status),
 		toolCategoryColor: getCategoryColor(item.isSubagent ? "agent" : category),
 		toolDetailLines: detailLines,

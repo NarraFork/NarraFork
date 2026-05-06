@@ -1,13 +1,25 @@
 import { Hono } from "hono";
-import { getCodexManager, type LoadBalancingMode } from "../lib/codex-manager";
+import {
+	getCodexManager,
+	type LoadBalancingMode,
+	normalizeCodexTierOrder,
+} from "../lib/codex-manager";
 import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { saveSettings, settings } from "../lib/settings";
-import { codexDefaultReasoningEffortSchema, codexUseWebSocketSchema } from "../lib/validators";
+import {
+	codexDefaultReasoningEffortSchema,
+	codexTierOrderSchema,
+	codexUseWebSocketSchema,
+} from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const codexRoutes = new Hono();
+
+function isCodexLoadBalancingMode(mode: unknown): mode is LoadBalancingMode {
+	return mode === "priority" || mode === "balanced" || mode === "tier-balanced";
+}
 
 // All Codex routes require admin privileges
 codexRoutes.use("*", requireAuth, requireAdmin);
@@ -19,9 +31,11 @@ codexRoutes.use("*", requireAuth, requireAdmin);
 codexRoutes.get("/status", (c) => {
 	const manager = getCodexManager();
 	const mode = settings.codex?.loadBalancingMode;
-	if (mode === "priority" || mode === "balanced") {
+	const tierOrder = normalizeCodexTierOrder(settings.codex?.tierOrder);
+	if (isCodexLoadBalancingMode(mode)) {
 		manager.setLoadBalancingMode(mode);
 	}
+	manager.setTierOrder(tierOrder);
 
 	const availablePage = Number(c.req.query("availablePage")) || undefined;
 	const unavailablePage = Number(c.req.query("unavailablePage")) || undefined;
@@ -32,7 +46,9 @@ codexRoutes.get("/status", (c) => {
 	return c.json({
 		...snapshot,
 		globalProxy: settings.codex?.proxy,
-		loadBalancingMode: mode ?? snapshot.loadBalancingMode,
+		loadBalancingMode: isCodexLoadBalancingMode(mode) ? mode : snapshot.loadBalancingMode,
+		tierOrder,
+		effectiveTierOrder: snapshot.effectiveTierOrder,
 		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
 		useWebSocket: settings.codex?.useWebSocket ?? true,
 	});
@@ -274,8 +290,11 @@ codexRoutes.post("/credentials/:id/usage", async (c) => {
  */
 codexRoutes.post("/load-balancing-mode", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { mode?: LoadBalancingMode };
-	if (!body.mode || (body.mode !== "priority" && body.mode !== "balanced")) {
-		return c.json({ error: "Invalid mode. Must be 'priority' or 'balanced'" }, 400);
+	if (!isCodexLoadBalancingMode(body.mode)) {
+		return c.json(
+			{ error: "Invalid mode. Must be 'priority', 'balanced', or 'tier-balanced'" },
+			400,
+		);
 	}
 
 	settings.codex = settings.codex || {};
@@ -286,6 +305,29 @@ codexRoutes.post("/load-balancing-mode", async (c) => {
 	manager.setLoadBalancingMode(body.mode);
 
 	return c.json({ ok: true, mode: body.mode });
+});
+
+/**
+ * POST /api/codex/tier-order
+ * Set the account tier order used by tier-balanced mode.
+ */
+codexRoutes.post("/tier-order", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexTierOrderSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	const tierOrder = normalizeCodexTierOrder(parsed.data.tierOrder);
+	settings.codex = settings.codex || {};
+	settings.codex.tierOrder = tierOrder;
+	saveSettings(settings);
+
+	const manager = getCodexManager();
+	manager.setTierOrder(tierOrder);
+	const snapshot = manager.snapshot();
+
+	return c.json({ ok: true, tierOrder, effectiveTierOrder: snapshot.effectiveTierOrder });
 });
 
 /**

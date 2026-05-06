@@ -58,6 +58,7 @@ export {
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,
 	codexDefaultReasoningEffortSchema,
+	codexTierOrderSchema,
 	codexUseWebSocketSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,

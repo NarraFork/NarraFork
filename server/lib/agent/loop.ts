@@ -317,6 +317,14 @@ const PARALLEL_TOOLS = new Set([
 ]);
 
 const TODO_REMINDER_TOOL_INTERVAL = 4;
+const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
+
+function normalizeSilentToolCallThreshold(value: number | undefined): number {
+	if (value == null) return DEFAULT_SILENT_TOOL_CALL_THRESHOLD;
+	if (!Number.isFinite(value)) return DEFAULT_SILENT_TOOL_CALL_THRESHOLD;
+	const threshold = Math.trunc(value);
+	return threshold < -1 ? -1 : threshold;
+}
 
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	SHELL_TOOL_NAME,
@@ -572,6 +580,7 @@ export async function runReflectionLoop(
 			onEvent: undefined,
 			onBeforeTurn: undefined,
 			getSideCars: undefined,
+			silentToolCallThreshold: -1,
 			shouldStop: undefined,
 			toolFilter: undefined,
 			permissionHandler: async (toolName) => {
@@ -721,6 +730,20 @@ function parseDangerReflectionTextFallback(
 	return null;
 }
 
+async function setDangerReflectionAbortController(
+	requestId: string,
+	reflectionAbortController: AbortController,
+): Promise<void> {
+	const { pendingDangerReflections } = await import("@server/services/narrator-session-state");
+	const pending = pendingDangerReflections.get(requestId);
+	if (pending) pending.reflectionAbortController = reflectionAbortController;
+}
+
+async function isDangerReflectionWaitingForUser(requestId: string): Promise<boolean> {
+	const { pendingDangerReflections } = await import("@server/services/narrator-session-state");
+	return pendingDangerReflections.get(requestId)?.reflectionStoppedByUser === true;
+}
+
 async function resolveDangerReflectionDecision(
 	config: AgentConfig,
 	history: unknown[],
@@ -728,6 +751,7 @@ async function resolveDangerReflectionDecision(
 	toolUse: AgentToolUse,
 ): Promise<PermissionResult> {
 	const reflectionAbort = new AbortController();
+	await setDangerReflectionAbortController(pause.requestId, reflectionAbort);
 	let reflectionDone = false;
 	const reflectionPromise = runDangerReflectionLoop(
 		config,
@@ -741,6 +765,10 @@ async function resolveDangerReflectionDecision(
 	const decision = await Promise.race([
 		pause.decision.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async (observed) => {
+			if (await isDangerReflectionWaitingForUser(pause.requestId)) {
+				return pause.decision;
+			}
+
 			const textFallback = parseDangerReflectionTextFallback(observed.assistantText);
 			if (textFallback) {
 				const { cancelDangerReflection, confirmDangerReflection } = await import(
@@ -957,16 +985,6 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
-	// Codex and official Anthropic providers use native server-side web_search —
-	// remove the WebSearch function tool to avoid duplicate search capabilities.
-	// Non-official (proxy) Anthropic providers keep the WebSearch function tool.
-	const isOfficialAnthropic =
-		isAnthropicProvider(effectiveProvider) &&
-		!!getAnthropicProviderConfig(effectiveProvider)?.officialApi;
-	if (usesCodexApiMode(effectiveProvider) || isOfficialAnthropic) {
-		allTools = allTools.filter((t) => t.name !== "WebSearch");
-	}
-
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
 	// When relaxedPlan is enabled, skip this — tools remain fully available.
 	if (config.planMode && !config.relaxedPlan) {
@@ -981,10 +999,24 @@ export async function* agentLoop(
 		);
 	}
 
-	let tools = provider.formatTools(allTools);
+	function resolveToolsForProvider(providerName: string): ResolvedToolDefinition[] {
+		// Codex and official Anthropic providers use native server-side web_search —
+		// remove the WebSearch function tool to avoid duplicate search capabilities.
+		// Non-official (proxy) Anthropic providers keep the WebSearch function tool.
+		const isOfficialAnthropic =
+			isAnthropicProvider(providerName) && !!getAnthropicProviderConfig(providerName)?.officialApi;
+		if (usesCodexApiMode(providerName) || isOfficialAnthropic) {
+			return allTools.filter((t) => t.name !== "WebSearch");
+		}
+		return allTools;
+	}
+
+	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider));
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.sideCarInitialCompletedToolCount ?? 0;
+	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
+	let silentToolCallCount = 0;
 	const countedToolUseIds = new Set<string>();
 	const sideCarCheckedToolUseIds = new Set<string>();
 
@@ -992,27 +1024,45 @@ export async function* agentLoop(
 		tu: AgentToolUse,
 		result: ToolExecResult,
 	): Promise<AgentSideCar[]> {
-		if (result.broken || result.fatal || tu.name === "TaskCreate") return [];
+		const sideCars: AgentSideCar[] = [];
+
+		if (!result.broken && !result.fatal) {
+			silentToolCallCount++;
+			if (silentToolCallThreshold >= 0 && silentToolCallCount >= silentToolCallThreshold) {
+				sideCars.push({
+					target: "tool_result",
+					source: "silent_progress",
+					content: getToolMessageWithParams("silentToolCallProgressReminder", locale, {
+						count: silentToolCallCount,
+					}),
+					orderIndex: 10,
+					toolUseId: tu.toolUseId,
+				});
+				silentToolCallCount = 0;
+			}
+		}
+
+		if (result.broken || result.fatal || tu.name === "TaskCreate") return sideCars;
 		if (!countedToolUseIds.has(tu.toolUseId)) {
 			countedToolUseIds.add(tu.toolUseId);
 			completedToolCount++;
 			config.onSideCarCompletedToolCount?.(completedToolCount);
 		}
 		if (!config.getSideCars || sideCarCheckedToolUseIds.has(tu.toolUseId)) {
-			return [];
+			return sideCars;
 		}
 		sideCarCheckedToolUseIds.add(tu.toolUseId);
 		if (completedToolCount % TODO_REMINDER_TOOL_INTERVAL !== 0) {
-			return [];
+			return sideCars;
 		}
 		try {
-			const sideCars = await config.getSideCars({
+			const collected = await config.getSideCars({
 				phase: "tool_result",
 				toolName: tu.name,
 				toolUseId: tu.toolUseId,
 				completedToolCount,
 			});
-			return sideCars.filter((sc) => sc.target === "tool_result");
+			sideCars.push(...collected.filter((sc) => sc.target === "tool_result"));
 		} catch (err) {
 			logger.warn("Failed to collect tool result sidecars", {
 				narratorId: config.narratorId,
@@ -1020,7 +1070,7 @@ export async function* agentLoop(
 				error: String(err),
 			});
 		}
-		return [];
+		return sideCars;
 	}
 
 	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
@@ -1049,6 +1099,107 @@ export async function* agentLoop(
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
 
+	function applyHistoryReplacement(replacement: {
+		history: unknown[];
+		pendingToolResults: unknown[];
+		systemPrompt?: string;
+	}) {
+		history = replacement.history;
+		if (replacement.systemPrompt != null) {
+			config.systemPrompt = replacement.systemPrompt;
+		}
+		if (config.systemPrompt) {
+			provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+		}
+		pendingToolResults = replacement.pendingToolResults;
+	}
+
+	function hasPendingRuntimeSettingsOverride(): boolean {
+		const runtimeSettings = config.getRuntimeSettingsOverride?.();
+		return Boolean(
+			(runtimeSettings && Object.keys(runtimeSettings).length > 0) || config.getModelOverride?.(),
+		);
+	}
+
+	async function applyPendingRuntimeSettings(
+		cause: "turn" | "retry",
+	): Promise<Extract<AgentEvent, { type: "model_switched" }> | null> {
+		const settingsOverride = config.getRuntimeSettingsOverride?.() ?? null;
+		const legacyModelOverride = config.getModelOverride?.() ?? null;
+		const newModel = settingsOverride?.model || legacyModelOverride;
+		const hasReasoningOverride =
+			!!settingsOverride && Object.hasOwn(settingsOverride, "reasoningEffort");
+		const nextReasoningEffort = hasReasoningOverride
+			? (settingsOverride.reasoningEffort ?? undefined)
+			: config.reasoningEffort;
+		const reasoningChanged = hasReasoningOverride && nextReasoningEffort !== config.reasoningEffort;
+
+		if (!newModel && !reasoningChanged) return null;
+
+		try {
+			let providerChanged = false;
+			let modelChanged = false;
+			if (newModel) {
+				const newResolved = resolveProviderAndModel(newModel);
+				providerChanged = newResolved.provider !== effectiveProvider;
+				modelChanged = newResolved.model !== effectiveModel;
+				provider = newResolved.adapter;
+				effectiveModel = newResolved.model;
+				effectiveProvider = newResolved.provider;
+				config.model = newResolved.model;
+				config.provider = newResolved.provider;
+				if (providerChanged || modelChanged) {
+					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider));
+				}
+			}
+
+			if (hasReasoningOverride) {
+				config.reasoningEffort = nextReasoningEffort;
+			}
+
+			if (providerChanged || modelChanged) {
+				// Force history/tool-result rebuild so the next API call uses the new
+				// provider protocol even when this switch happens inside a retry loop.
+				const replacement = await config.onBeforeTurn?.(turnIndex, {
+					force: true,
+					cause: "model_switch",
+				});
+				if (replacement) {
+					applyHistoryReplacement(replacement);
+				} else if (config.systemPrompt && providerChanged) {
+					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
+				}
+			}
+
+			logger.info("Agent loop switched runtime settings before API call", {
+				narratorId: config.narratorId,
+				cause,
+				model: effectiveModel,
+				provider: effectiveProvider,
+				reasoningEffort: config.reasoningEffort,
+				modelChanged,
+				providerChanged,
+				reasoningChanged,
+			});
+			return {
+				type: "model_switched",
+				model: effectiveModel,
+				provider: effectiveProvider,
+				reasoningEffort: config.reasoningEffort ?? null,
+				cause,
+			};
+		} catch (err) {
+			logger.warn("Failed to switch runtime settings during agent loop", {
+				narratorId: config.narratorId,
+				cause,
+				model: newModel,
+				reasoningEffort: settingsOverride?.reasoningEffort,
+				error: String(err),
+			});
+			return null;
+		}
+	}
+
 	while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
 			yield { type: "error", message: "Aborted" };
@@ -1057,61 +1208,15 @@ export async function* agentLoop(
 
 		const isFirstTurn = turnIndex === 0;
 
-		// Allow caller to rebuild history mid-loop (e.g. after prune boundary changes or compact)
-		if (!isFirstTurn && config.onBeforeTurn) {
-			const replacement = await config.onBeforeTurn(turnIndex);
-			if (replacement) {
-				history = replacement.history;
-				if (replacement.systemPrompt != null) {
-					config.systemPrompt = replacement.systemPrompt;
-				}
-				if (config.systemPrompt) {
-					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
-				}
-				pendingToolResults = replacement.pendingToolResults;
-			}
-		}
-
-		// Check for mid-loop model switch (only between turns, not on the first turn)
-		if (!isFirstTurn && config.getModelOverride) {
-			const newModel = config.getModelOverride();
-			if (newModel) {
-				try {
-					const newResolved = resolveProviderAndModel(newModel);
-					const providerChanged = newResolved.provider !== effectiveProvider;
-
-					effectiveModel = newResolved.model;
-					effectiveProvider = newResolved.provider;
-					config.model = newModel;
-					config.provider = newResolved.provider;
-
-					if (providerChanged) {
-						// Provider changed — rebuild tools and history for the new adapter
-						provider = newResolved.adapter;
-						tools = provider.formatTools(allTools);
-
-						// Force history rebuild via onBeforeTurn so messages are
-						// re-serialised in the new provider's format.
-						if (config.onBeforeTurn) {
-							const replacement = await config.onBeforeTurn(turnIndex);
-							if (replacement) {
-								history = replacement.history;
-								pendingToolResults = replacement.pendingToolResults;
-							}
-						}
-						if (config.systemPrompt) {
-							provider.injectSystemPrompt(
-								history,
-								config.systemPrompt,
-								effectiveModel,
-								config.locale,
-							);
-						}
-					}
-
-					yield { type: "model_switched", model: effectiveModel, provider: effectiveProvider };
-				} catch {
-					// resolveProviderAndModel failed — keep current model, skip switch
+		if (!isFirstTurn) {
+			const switchEvent = await applyPendingRuntimeSettings("turn");
+			if (switchEvent) {
+				yield switchEvent;
+			} else if (config.onBeforeTurn) {
+				// Allow caller to rebuild history mid-loop (e.g. after prune boundary changes or compact)
+				const replacement = await config.onBeforeTurn(turnIndex);
+				if (replacement) {
+					applyHistoryReplacement(replacement);
 				}
 			}
 		}
@@ -1271,7 +1376,7 @@ export async function* agentLoop(
 		// Stateful providers (responses/codex) cannot retry here because the
 		// server already consumed the request.
 		const maxConfiguredRetries = config.maxTransientRetries ?? 0;
-		const maxChatRetries = usesStatefulApi(effectiveProvider) ? 0 : maxConfiguredRetries;
+		const getMaxChatRetries = () => (usesStatefulApi(effectiveProvider) ? 0 : maxConfiguredRetries);
 		const maxFirstTokenRetries = maxConfiguredRetries;
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 60_000);
@@ -1279,6 +1384,11 @@ export async function* agentLoop(
 		let emptyResponseRetries = 0;
 		/** Set when a mimo model returns "..." as reasoning — triggers a retry. */
 		let mimoEllipsisRetry = false;
+		const resetRetryStateAfterModelSwitch = () => {
+			chatRetryCount = 0;
+			emptyResponseRetries = 0;
+			lastRetryErrorMessage = undefined;
+		};
 
 		for (;;) {
 			// Reset per-attempt accumulators so a retry starts with a clean slate.
@@ -1314,6 +1424,12 @@ export async function* agentLoop(
 			// response, we can surface the original error instead of the
 			// misleading "empty response" message.  It is cleared below when
 			// the attempt produces meaningful content.
+
+			const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
+			if (retrySwitchEvent) {
+				yield retrySwitchEvent;
+				resetRetryStateAfterModelSwitch();
+			}
 
 			// Generate unique request ID for this provider attempt (reset on each retry).
 			// The actual request start time is set by markRequestStarted() after the
@@ -1402,6 +1518,7 @@ export async function* agentLoop(
 
 					if (parsed.text) {
 						assistantText += parsed.text;
+						if (parsed.text.trim()) silentToolCallCount = 0;
 						if (parsed.textOutputIndex != null) {
 							textOutputIndex = parsed.textOutputIndex;
 						}
@@ -1948,6 +2065,7 @@ export async function* agentLoop(
 							type: "queue_status",
 							position: parsed.queueStatus.position,
 							queueDepth: parsed.queueStatus.queueDepth,
+							queueMessage: parsed.queueStatus.queueMessage,
 						};
 					}
 					if (parsed.quotaBalance !== undefined) {
@@ -2082,7 +2200,7 @@ export async function* agentLoop(
 							// the same chat() call with identical parameters.
 							// -1 means infinite retries (consistent with handleTransientError)
 							if (
-								(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 								!config.signal.aborted
 							) {
 								chatRetryCount++;
@@ -2095,7 +2213,7 @@ export async function* agentLoop(
 									type: "retrying",
 									message,
 									attempt: chatRetryCount,
-									maxRetries: maxChatRetries,
+									maxRetries: getMaxChatRetries(),
 									delayMs,
 								};
 								yield* finishRequest(message);
@@ -2105,6 +2223,15 @@ export async function* agentLoop(
 									return;
 								}
 								continue; // retry provider.chat()
+							}
+							if (hasPendingRuntimeSettingsOverride()) {
+								yield* finishRequest(message);
+								const switchEvent = await applyPendingRuntimeSettings("retry");
+								if (switchEvent) {
+									yield switchEvent;
+									resetRetryStateAfterModelSwitch();
+									continue;
+								}
 							}
 							// Exhausted retries — yield block_complete for partial content
 							// then signal retryable_error to the caller.
@@ -2173,6 +2300,15 @@ export async function* agentLoop(
 						}
 						continue; // retry provider.chat()
 					}
+					if (hasPendingRuntimeSettingsOverride()) {
+						yield* finishRequest(firstTokenTimeoutMessage);
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
+					}
 					yield* finishRequest(firstTokenTimeoutMessage);
 					yield { type: "retryable_error", message: firstTokenTimeoutMessage };
 					return;
@@ -2204,7 +2340,7 @@ export async function* agentLoop(
 					// In-loop retry for stateless providers
 					// -1 means infinite retries (consistent with handleTransientError)
 					if (
-						(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -2217,7 +2353,7 @@ export async function* agentLoop(
 							type: "retrying",
 							message: msg,
 							attempt: chatRetryCount,
-							maxRetries: maxChatRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 						};
 						yield* finishRequest(msg);
@@ -2227,6 +2363,15 @@ export async function* agentLoop(
 							return;
 						}
 						continue; // retry provider.chat()
+					}
+					if (hasPendingRuntimeSettingsOverride()) {
+						yield* finishRequest(msg);
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
 					}
 					// Exhausted retries — persist partial content and signal caller
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
@@ -2271,6 +2416,15 @@ export async function* agentLoop(
 					}
 					continue; // retry provider.chat()
 				}
+				if (hasPendingRuntimeSettingsOverride()) {
+					yield* finishRequest(firstTokenTimeoutMessage);
+					const switchEvent = await applyPendingRuntimeSettings("retry");
+					if (switchEvent) {
+						yield switchEvent;
+						resetRetryStateAfterModelSwitch();
+						continue;
+					}
+				}
 				yield* finishRequest(firstTokenTimeoutMessage);
 				yield { type: "retryable_error", message: firstTokenTimeoutMessage };
 				return;
@@ -2285,7 +2439,7 @@ export async function* agentLoop(
 					type: "retrying",
 					message: "Mimo model returned ellipsis-only reasoning, retrying",
 					attempt: chatRetryCount,
-					maxRetries: maxChatRetries,
+					maxRetries: getMaxChatRetries(),
 					delayMs,
 				};
 				yield* finishRequest("mimo ellipsis reasoning");
@@ -2311,6 +2465,14 @@ export async function* agentLoop(
 						model: effectiveModel,
 						requestId,
 					});
+					if (hasPendingRuntimeSettingsOverride()) {
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
+					}
 					yield { type: "error", message };
 					return;
 				}
@@ -2323,7 +2485,7 @@ export async function* agentLoop(
 				// response" message.
 				if (lastRetryErrorMessage) {
 					if (
-						(maxChatRetries === -1 || chatRetryCount < maxChatRetries) &&
+						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
@@ -2340,14 +2502,14 @@ export async function* agentLoop(
 								requestId,
 								originalError: lastRetryErrorMessage,
 								attempt: chatRetryCount,
-								maxRetries: maxChatRetries,
+								maxRetries: getMaxChatRetries(),
 							},
 						);
 						yield {
 							type: "retrying",
 							message: lastRetryErrorMessage,
 							attempt: chatRetryCount,
-							maxRetries: maxChatRetries,
+							maxRetries: getMaxChatRetries(),
 							delayMs,
 						};
 						yield* finishRequest(lastRetryErrorMessage);
@@ -2357,6 +2519,15 @@ export async function* agentLoop(
 							return;
 						}
 						continue; // retry provider.chat()
+					}
+					if (hasPendingRuntimeSettingsOverride()) {
+						yield* finishRequest(lastRetryErrorMessage);
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
 					}
 					// Chat retries exhausted — surface the original error
 					yield* finishRequest(lastRetryErrorMessage);
@@ -2396,6 +2567,16 @@ export async function* agentLoop(
 					}
 					continue; // retry provider.chat()
 				}
+				const emptyResponseMessage = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+				if (hasPendingRuntimeSettingsOverride()) {
+					yield* finishRequest(emptyResponseMessage);
+					const switchEvent = await applyPendingRuntimeSettings("retry");
+					if (switchEvent) {
+						yield switchEvent;
+						resetRetryStateAfterModelSwitch();
+						continue;
+					}
+				}
 				// Exhausted empty-response retries — surface as invalid_state
 				logger.warn("Provider returned empty response, retries exhausted", {
 					narratorId: config.narratorId,
@@ -2403,11 +2584,11 @@ export async function* agentLoop(
 					model: effectiveModel,
 					requestId,
 				});
-				yield* finishRequest(`${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`);
+				yield* finishRequest(emptyResponseMessage);
 				yield {
 					type: "invalid_state",
 					reason: "empty_response",
-					message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
+					message: emptyResponseMessage,
 				};
 				return;
 			}
@@ -2529,7 +2710,13 @@ export async function* agentLoop(
 			});
 			if (toolUses.length === 0) {
 				if (isFirstTurn) {
-					provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? []);
+					provider.pushUserTurn(
+						history,
+						userText,
+						effectiveModel,
+						initialToolResults ?? [],
+						images,
+					);
 				} else if (pendingToolResults.length > 0) {
 					provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
 				}
@@ -2560,7 +2747,7 @@ export async function* agentLoop(
 		// This must happen AFTER the API call (not before), because
 		// chat() references the history array directly.
 		if (isFirstTurn) {
-			provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? []);
+			provider.pushUserTurn(history, userText, effectiveModel, initialToolResults ?? [], images);
 		} else if (pendingToolResults.length > 0) {
 			provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
 		}

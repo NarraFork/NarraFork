@@ -247,7 +247,7 @@ export type AgentEvent =
 			isEstimated?: boolean;
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
-	| { type: "queue_status"; position: number; queueDepth: number }
+	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
 	| { type: "quota_balance"; quotaBalance: string | null }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "output_truncated"; message: string }
@@ -267,7 +267,13 @@ export type AgentEvent =
 			result?: string;
 			outputIndex?: number;
 	  }
-	| { type: "model_switched"; model: string; provider: string }
+	| {
+			type: "model_switched";
+			model: string;
+			provider: string;
+			reasoningEffort?: ReasoningEffort | null;
+			cause?: "turn" | "retry";
+	  }
 	| {
 			type: "api_request_start";
 			requestId: string;
@@ -388,6 +394,13 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 
 // === Agent config ===
 
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
+export interface RuntimeSettingsOverride {
+	model?: string | null;
+	reasoningEffort?: ReasoningEffort | null;
+}
+
 export interface AgentConfig {
 	narratorId: string;
 	conversationId: string;
@@ -414,7 +427,7 @@ export interface AgentConfig {
 	/** Skill scan root — project gitPath or git root resolved from cwd */
 	skillRoot?: string;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
@@ -432,9 +445,13 @@ export interface AgentConfig {
 	/**
 	 * Called before each non-first turn in the agent loop.
 	 * If it returns a new history + pendingToolResults, the loop replaces its
-	 * internal state — used for mid-turn context pruning.
+	 * internal state — used for mid-turn context pruning and forced rebuilds
+	 * before model/provider switches.
 	 */
-	onBeforeTurn?: (turnIndex: number) => Promise<{
+	onBeforeTurn?: (
+		turnIndex: number,
+		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
+	) => Promise<{
 		history: unknown[];
 		pendingToolResults: unknown[];
 		systemPrompt?: string;
@@ -449,9 +466,13 @@ export interface AgentConfig {
 	/** Called whenever the sidecar cadence counter advances. */
 	onSideCarCompletedToolCount?: (completedToolCount: number) => void;
 	/**
-	 * Called before each non-first turn to check if the model should be switched.
-	 * When a new model is returned, the loop re-resolves the provider and rebuilds
-	 * history/tools if the provider changed.
+	 * Called before each non-first turn/retry to check if runtime settings should be switched.
+	 * Changes are applied at the safe point before the next provider API request, so running
+	 * tools are not interrupted while the next model request uses fresh settings.
+	 */
+	getRuntimeSettingsOverride?: () => RuntimeSettingsOverride | null;
+	/**
+	 * Legacy model-only override hook. Prefer getRuntimeSettingsOverride for new callers.
 	 */
 	getModelOverride?: () => string | null;
 	/**
@@ -466,6 +487,11 @@ export interface AgentConfig {
 	 * Defaults to 0 (no in-loop retry — caller handles it).
 	 */
 	maxTransientRetries?: number;
+	/**
+	 * Number of completed tool calls without visible text before a progress sidecar is injected.
+	 * -1 disables the reminder. Defaults to 20.
+	 */
+	silentToolCallThreshold?: number;
 	/**
 	 * Maximum backoff delay (ms) for transient-error retries.
 	 * Exponential backoff is capped at this value.  Defaults to 20_000 (20s).

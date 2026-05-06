@@ -26,6 +26,7 @@ import {
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useNarrator,
+	useNarratorUsageStats,
 	useUpdateCwd,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
@@ -147,6 +148,7 @@ export function NarratorDetailsPanel({
 
 	const { data: chapter } = useChapter(opened ? chapterId : "");
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
+	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
 	const updateCwdMutation = useUpdateCwd();
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
@@ -187,6 +189,11 @@ export function NarratorDetailsPanel({
 	};
 
 	const formatBoolean = (value?: boolean | null) => (value ? t("details.on") : t("details.off"));
+
+	const formatStatNumber = (value?: number | null) =>
+		value == null ? "—" : value.toLocaleString(i18n.language);
+
+	const formatCost = (value?: number | null) => `$${Number(value ?? 0).toFixed(4)}`;
 
 	const formatStatus = (status?: string | null) => {
 		if (!status) return t("details.notAvailable");
@@ -247,6 +254,9 @@ export function NarratorDetailsPanel({
 		navigate({ to: "/narrators/$narratorId", params: { narratorId: parentNarratorId } });
 	};
 
+	const usageStatsHint = usageStats ? t("details.stats.usageHistoryIncludesSubagents") : undefined;
+	const displayedCost = usageStats?.totalCost ?? Number(narrator?.totalCostUsd ?? 0);
+
 	const handleSaveCwd = async () => {
 		const nextCwd = cwdValue.trim();
 		if (!nextCwd) {
@@ -283,7 +293,23 @@ export function NarratorDetailsPanel({
 				/>
 				<StatCard
 					label={t("details.stats.cost")}
-					value={`$${Number(narrator?.totalCostUsd ?? 0).toFixed(4)}`}
+					value={formatCost(displayedCost)}
+					hint={usageStatsHint}
+				/>
+				<StatCard
+					label={t("details.stats.inputTokens")}
+					value={formatStatNumber(usageStats?.totalInputTokens)}
+					hint={usageStatsHint}
+				/>
+				<StatCard
+					label={t("details.stats.outputTokens")}
+					value={formatStatNumber(usageStats?.totalOutputTokens)}
+					hint={usageStatsHint}
+				/>
+				<StatCard
+					label={t("details.stats.cacheReadTokens")}
+					value={formatStatNumber(usageStats?.totalCacheReadTokens)}
+					hint={usageStatsHint}
 				/>
 				<StatCard
 					label={t("details.stats.viewers")}

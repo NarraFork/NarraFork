@@ -22,6 +22,7 @@ import {
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
+	getSilentToolCallThreshold,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
@@ -52,6 +53,7 @@ export interface SubagentBufferedMessage {
 	text: string;
 	images?: ImageRef[];
 	bufferedAt: string;
+	priority?: boolean;
 }
 
 export interface SubagentExecOptions {
@@ -107,7 +109,7 @@ export function pushSubagentBufferedMessage(
 	if (queue.length >= MAX_BUFFERED_MESSAGES) {
 		return { ok: false, bufferedAt, id, full: true };
 	}
-	const entry = { id, text, images, bufferedAt };
+	const entry = { id, text, images, bufferedAt, priority: position === "front" || undefined };
 	if (position === "front") {
 		queue.unshift(entry);
 	} else {
@@ -445,6 +447,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
+			silentToolCallThreshold: getSilentToolCallThreshold(),
 			retryBackoffCeilMs: getRetryBackoffCeilMs(),
 			firstTokenTimeoutMs: getFirstTokenTimeoutMs(),
 			metadata: isAnthropicProvider(resolvedProvider)

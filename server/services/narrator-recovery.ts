@@ -31,6 +31,11 @@ export function getMaxTransientRetries(): number {
 	return settings.agent.maxTransientRetries;
 }
 
+/** Read the user-configured silent-tool-call threshold from settings. */
+export function getSilentToolCallThreshold(): number {
+	return settings.agent.silentToolCallThreshold;
+}
+
 /** Read the user-configured retry backoff ceiling (ms) from settings. */
 export function getRetryBackoffCeilMs(): number {
 	return settings.agent.retryBackoffCeilMs;

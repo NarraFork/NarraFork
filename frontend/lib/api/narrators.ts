@@ -1,3 +1,4 @@
+import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import { BASE, clearToken, getToken, request } from "./client";
 import type {
 	ApiEntity,
@@ -68,6 +69,14 @@ export const narratorsApi = {
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
+		const params = new URLSearchParams();
+		if (opts?.includeSubagents !== undefined) {
+			params.set("includeSubagents", String(opts.includeSubagents));
+		}
+		const qs = params.toString();
+		return request<UsageHistoryStats>(`/narrators/${id}/usage-stats${qs ? `?${qs}` : ""}`);
+	},
 	getNarratorCommands: (id: string) =>
 		request<{
 			commands: Array<{
@@ -243,6 +252,10 @@ export const narratorsApi = {
 					? { message: messageOrPayload }
 					: (messageOrPayload ?? {}),
 			),
+		}),
+	stopDangerReflection: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-reflection`, {
+			method: "POST",
 		}),
 	updateNarratorTitle: (id: string, title: string) =>
 		request<{ ok: boolean; title: string }>(`/narrators/${id}/title`, {

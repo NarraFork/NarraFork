@@ -1050,7 +1050,13 @@ export class AnthropicProvider implements ProviderAdapter {
 		return { tool_use_id: toolUseId, content: output, is_error: isError || undefined };
 	}
 
-	pushUserTurn(history: unknown[], content: string, _model: string, toolResults: unknown[]): void {
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		_model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
 		const h = history as AnthropicMessage[];
 		const parts: AnthropicContentPart[] = [];
 
@@ -1072,8 +1078,22 @@ export class AnthropicProvider implements ProviderAdapter {
 			});
 		}
 
-		if (content && content !== ".") {
+		for (const img of images ?? []) {
+			parts.push({
+				type: "image",
+				source: {
+					type: "base64",
+					media_type: `image/${img.format}`,
+					data: img.base64,
+				},
+			});
+		}
+
+		const hasText = !!content && content !== ".";
+		if (hasText) {
 			parts.push({ type: "text", text: content });
+		} else if (images?.length) {
+			parts.push({ type: "text", text: "[user sent image(s)]" });
 		}
 
 		if (parts.length > 0) {

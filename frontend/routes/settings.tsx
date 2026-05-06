@@ -17,6 +17,7 @@ import {
 	IconTerminal2,
 	IconUser,
 	IconUsers,
+	IconWand,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
@@ -53,6 +54,9 @@ function SettingsLayout() {
 	const instanceSettings = useInstanceSettings();
 	const { isDirty, isSaving, save, highlight } = instanceSettings;
 	const isAdmin = user?.role === "admin";
+	const openSetupWizard = () => {
+		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
+	};
 
 	const personalItems: NavItem[] = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={18} /> },
@@ -154,6 +158,13 @@ function SettingsLayout() {
 										variant="light"
 									/>
 								))}
+								<NavLink
+									label={t("wizardReopen")}
+									leftSection={<IconWand size={18} />}
+									onClick={openSetupWizard}
+									variant="subtle"
+									mt="md"
+								/>
 							</>
 						)}
 					</ScrollArea>

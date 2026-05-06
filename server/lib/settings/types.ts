@@ -3,6 +3,8 @@
  * Extracted from the monolithic settings/index.ts for better modularity.
  */
 
+import type { LoadBalancingMode } from "../codex-manager";
+import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
 
 export interface ModelOption {
@@ -264,6 +266,8 @@ export interface NarraForkSettings {
 		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */
 		maxTransientRetries: number;
+		/** Tool-call count without visible text before asking the model for a short progress update. -1 = disabled. */
+		silentToolCallThreshold: number;
 		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */
 		retryBackoffCeilMs: number;
 		/** Time to wait for the first meaningful AI API event before aborting and retrying. 0 = disabled. */
@@ -388,8 +392,10 @@ export interface NarraForkSettings {
 	codex?: {
 		/** Default HTTPS proxy for all Codex requests (can be overridden per-credential). */
 		proxy?: string;
-		/** Load balancing mode: "priority" (use highest priority) or "balanced" (round-robin). */
-		loadBalancingMode?: "priority" | "balanced";
+		/** Load balancing mode: priority, balanced, or tier-balanced. */
+		loadBalancingMode?: LoadBalancingMode;
+		/** Account tier order used by tier-balanced mode. */
+		tierOrder?: CodexPlanTier[];
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		/** Use WebSocket instead of HTTP for Codex connections (experimental, enabled by default). */

@@ -24,6 +24,10 @@ export const codexUseWebSocketSchema = z.object({
 	useWebSocket: z.boolean().optional(),
 });
 
+export const codexTierOrderSchema = z.object({
+	tierOrder: z.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"])).max(6),
+});
+
 export const sendMessageSchema = z.object({
 	message: z.string().min(1),
 	priority: z.boolean().optional(),

@@ -397,13 +397,3 @@ export function getSummary(
 			return toolName;
 	}
 }
-
-export function formatCompletedDuration(ms: number): string {
-	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-	const h = Math.floor(totalSeconds / 3600);
-	const m = Math.floor((totalSeconds % 3600) / 60);
-	const sec = totalSeconds % 60;
-	if (h > 0) return `${h}h${m.toString().padStart(2, "0")}m${sec.toString().padStart(2, "0")}s`;
-	return `${m}m${sec.toString().padStart(2, "0")}s`;
-}

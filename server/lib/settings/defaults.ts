@@ -4,6 +4,7 @@
  */
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
@@ -35,6 +36,7 @@ export const DEFAULTS: NarraForkSettings = {
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
+		silentToolCallThreshold: 20,
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 60_000,
 	},
@@ -65,6 +67,8 @@ export const DEFAULTS: NarraForkSettings = {
 		enabledRoutines: [],
 	},
 	codex: {
+		loadBalancingMode: "tier-balanced",
+		tierOrder: [...DEFAULT_CODEX_TIER_ORDER],
 		// codex-reversed 显示官方默认 reasoning level 为 medium，避免默认 high 过快消耗额度。
 		defaultReasoningEffort: "medium",
 		useWebSocket: true,
@@ -224,6 +228,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},
+	"agent.silentToolCallThreshold": {
+		desc: "模型连续执行工具但未输出可见文本达到此次数时，通过 sidecar 要求其简短说明当前工作。-1 表示关闭。",
+		type: "number",
+		valid: "-1 = 关闭，默认 20",
+	},
 	"agent.retryBackoffCeilMs": {
 		desc: "可恢复错误重试退避时间上限（毫秒）。指数退避不会超过此值。默认 20000（20 秒）。",
 		type: "number",
@@ -369,9 +378,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 	},
 	"codex.loadBalancingMode": {
-		desc: '多凭证时的负载均衡策略。"priority" 使用最高优先级凭证，"balanced" 轮询。',
+		desc: '多凭证时的负载均衡策略。"priority" 使用最高优先级凭证，"balanced" 均衡选择，"tier-balanced" 先按账号等级排序、同等级内均衡选择。',
 		type: "string",
-		valid: '"priority" | "balanced"',
+		valid: '"priority" | "balanced" | "tier-balanced"',
+	},
+	"codex.tierOrder": {
+		desc: 'Codex 等级均衡模式的账号等级顺序。默认 ["pro", "prolite", "plus", "team", "free"]，未列出的等级自动排在最后。',
+		type: "string[]",
+		valid: '"pro" | "prolite" | "plus" | "team" | "free" | "other"',
 	},
 	"codex.defaultReasoningEffort": {
 		desc: "Codex 模型默认推理努力级别。越高推理越深入但消耗更多 token。",

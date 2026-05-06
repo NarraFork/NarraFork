@@ -8,12 +8,12 @@
  * 1. SSE `event:` line format:
  *    ```
  *    event: queueEvent
- *    data: {"position": 3, "queueDepth": 10}
+ *    data: {"position": 3, "queueDepth": 10, "queueMessage": "Waiting for capacity"}
  *    ```
  *
  * 2. Data-embedded format (for non-streaming / WS / fallback):
  *    ```json
- *    {"type": "queueEvent", "position": 3, "queueDepth": 10}
+ *    {"type": "queueEvent", "position": 3, "queueDepth": 10, "queueMessage": "Waiting"}
  *    ```
  */
 
@@ -34,11 +34,13 @@ export function parseGatewaySSEEvent(
 	if (eventType === QUEUE_EVENT) {
 		const position = data.position;
 		const queueDepth = data.queueDepth;
-		if (position != null) {
+		const queueMessage = data.queueMessage;
+		if (position != null || queueMessage != null) {
 			return {
 				queueStatus: {
-					position: Number(position),
-					queueDepth: Number(queueDepth ?? 0),
+					position: position != null ? Number(position) : undefined,
+					queueDepth: queueDepth != null ? Number(queueDepth) : undefined,
+					queueMessage: queueMessage != null ? String(queueMessage) : undefined,
 				},
 			};
 		}

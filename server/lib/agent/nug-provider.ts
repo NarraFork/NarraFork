@@ -304,8 +304,16 @@ export class NugProvider implements ProviderAdapter {
 		return result;
 	}
 
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
 		const modelId = resolveModel(model);
+			source: { bytes: img.base64 },
+		}));
 
 				content,
 				modelId,

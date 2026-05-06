@@ -68,8 +68,10 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
+import { usePlatform } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { getToken } from "../../lib/api";
+import { api, getToken, type SideCarRecord } from "../../lib/api";
+import { formatDurationText } from "../../lib/format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
@@ -79,6 +81,7 @@ import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
 import { useRenderLod } from "./RenderLodCtx";
+import { SideCarNotice } from "./SideCarNotice";
 import { StreamingCode } from "./StreamingCode";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
@@ -160,6 +163,8 @@ export interface ToolCallData {
 	_resolvedModel?: string;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
 	_timeoutMs?: number;
+	/** Sidecar system injections attached to this tool result */
+	sideCars?: SideCarRecord[];
 	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
 	resultMessageId?: string;
 }
@@ -482,6 +487,10 @@ function basename(p: string): string {
 	return parts[parts.length - 1] || p;
 }
 
+function formatClipboardFilePath(p: string, platform: "windows" | "macos" | "linux"): string {
+	return platform === "windows" ? p.replace(/\//g, "\\") : p;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function getSendTargetLabels(input: any): string[] {
 	if (isTruncated(input)) return [];
@@ -779,31 +788,6 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 
 // --- Helper: live elapsed timer for running tools ---
 
-function formatElapsed(s: number): string {
-	const totalSeconds = Math.max(0, Math.floor(s));
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const h = Math.floor(totalSeconds / 3600);
-	const m = Math.floor((totalSeconds % 3600) / 60);
-	const sec = totalSeconds % 60;
-	if (h > 0) {
-		return `${h}h${m.toString().padStart(2, "0")}m${sec.toString().padStart(2, "0")}s`;
-	}
-	return `${m}m${sec.toString().padStart(2, "0")}s`;
-}
-
-function formatCompletedDuration(ms: number): string {
-	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-	return formatElapsed(Math.round(ms / 1000));
-}
-
-function formatSegmentDuration(ms: number): string {
-	if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
-	if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
-	const minutes = Math.floor(ms / 60_000);
-	const seconds = Math.round((ms % 60_000) / 1000);
-	return `${minutes}min${seconds}s`;
-}
-
 function parseIsoTime(value: string | null | undefined): number | null {
 	if (!value) return null;
 	const time = new Date(value).getTime();
@@ -865,7 +849,7 @@ function ToolTimingTooltipLabel({
 						</Text>
 						{delta != null && (
 							<Text size="xs" ff="monospace" c="dimmed" style={{ width: 54, textAlign: "right" }}>
-								+{formatSegmentDuration(delta)}
+								+{formatDurationText(delta, { style: "precise" })}
 							</Text>
 						)}
 					</Group>
@@ -874,34 +858,28 @@ function ToolTimingTooltipLabel({
 			{streamStarted != null && completed != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.total", {
-						duration: formatSegmentDuration(completed - streamStarted),
+						duration: formatDurationText(completed - streamStarted, { style: "precise" }),
 					})}
 				</Text>
 			)}
 			{permissionStarted != null && executionStarted != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.permissionWait", {
-						duration: formatSegmentDuration(executionStarted - permissionStarted),
+						duration: formatDurationText(executionStarted - permissionStarted, {
+							style: "precise",
+						}),
 					})}
 				</Text>
 			)}
 			{executionStarted != null && completed != null && (
 				<Text size="xs" c="dimmed">
 					{t("toolCallInspector.timing.execution", {
-						duration: formatSegmentDuration(completed - executionStarted),
+						duration: formatDurationText(completed - executionStarted, { style: "precise" }),
 					})}
 				</Text>
 			)}
 		</Stack>
 	);
-}
-
-function formatTimeoutShort(ms: number): string {
-	if (ms >= 60_000) {
-		const m = Math.round(ms / 60_000);
-		return `${m}m`;
-	}
-	return `${Math.round(ms / 1000)}s`;
 }
 
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
@@ -1018,11 +996,13 @@ export function ElapsedTimer({
 
 	const showTimeout = timeoutMs != null;
 	const effectiveTimeout = timeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
-	const timeoutStr = showTimeout ? formatTimeoutShort(effectiveTimeout) : null;
+	const timeoutStr = showTimeout
+		? formatDurationText(effectiveTimeout, { style: "timeout" })
+		: null;
 
 	const timerContent = (
 		<Text size="xs" c="dimmed" ff="monospace">
-			{formatElapsed(elapsed)}
+			{formatDurationText(elapsed * 1000)}
 			{timeoutStr && <span style={{ opacity: 0.5 }}> / {timeoutStr}</span>}
 		</Text>
 	);
@@ -1056,14 +1036,38 @@ function findDangerReflectionSuggestion(toolCall: ToolCallData) {
 	) as { status?: string; reason?: string; danger?: { summary?: string } } | undefined;
 }
 
-function DangerReflectionNotice({ toolCall }: { toolCall: ToolCallData }) {
+function DangerReflectionNotice({
+	toolCall,
+	pendingPermission,
+}: {
+	toolCall: ToolCallData;
+	pendingPermission?: PendingPermission | null;
+}) {
 	const { t } = useTranslation("narrator");
+	const [stopping, setStopping] = useState(false);
 	const suggestion = findDangerReflectionSuggestion(toolCall);
 	if (!suggestion) return null;
 	const status = suggestion.status ?? "running";
 	const summary =
 		suggestion.reason || suggestion.danger?.summary || toolCall.permissionDecisionReason;
 	const running = status === "running";
+	const awaitingUser = status === "awaiting_user";
+	const requestId = pendingPermission?.id ?? toolCall.id;
+	const title = running
+		? t("dangerReflectionRunning")
+		: awaitingUser
+			? t("dangerReflectionAwaitingUser")
+			: t("dangerReflectionResolved");
+	const handleStopReflection = async (e: React.MouseEvent) => {
+		e.stopPropagation();
+		if (!requestId || stopping) return;
+		setStopping(true);
+		try {
+			await api.stopDangerReflection(requestId);
+		} finally {
+			setStopping(false);
+		}
+	};
 	const noticeStyle: React.CSSProperties = {
 		marginTop: 6,
 		marginBottom: "var(--mantine-spacing-sm)",
@@ -1091,14 +1095,27 @@ function DangerReflectionNotice({ toolCall }: { toolCall: ToolCallData }) {
 						<IconShield size={14} />
 					)}
 				</ThemeIcon>
-				<Box style={{ minWidth: 0 }}>
+				<Box style={{ minWidth: 0, flex: 1 }}>
 					<Text size="xs" fw={700} lh={1.35} style={{ color: titleColor }}>
-						{running ? t("dangerReflectionRunning") : t("dangerReflectionResolved")}
+						{title}
 					</Text>
 					{summary && (
 						<Text size="xs" lh={1.45} mt={3} style={{ color: summaryColor }}>
 							{summary}
 						</Text>
+					)}
+					{running && requestId && (
+						<Button
+							size="xs"
+							variant="light"
+							color="yellow"
+							mt="xs"
+							leftSection={<IconPlayerStop size={12} />}
+							loading={stopping}
+							onClick={handleStopReflection}
+						>
+							{t("stopDangerReflection")}
+						</Button>
 					)}
 				</Box>
 			</Group>
@@ -1226,13 +1243,15 @@ const ToolHeader = memo(
 							isRunning={false}
 						>
 							<Text size="xs" c="dimmed" ff="monospace">
-								{formatCompletedDuration(displayDurationMs)}
-								<span style={{ opacity: 0.5 }}> / {formatTimeoutShort(effectiveTimeoutMs)}</span>
+								{formatDurationText(displayDurationMs, { style: "precise" })}
+								<span style={{ opacity: 0.5 }}>
+									/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
+								</span>
 							</Text>
 						</TimeoutPopover>
 					) : (
 						<Text size="xs" c="dimmed" ff="monospace">
-							{formatCompletedDuration(displayDurationMs)}
+							{formatDurationText(displayDurationMs, { style: "precise" })}
 						</Text>
 					))
 				)}
@@ -1622,54 +1641,94 @@ function getStreamingEditPreview(input: unknown): {
 	};
 }
 
-function EditStreamingPreview({
-	preview,
+function EditDiffBlock({
 	filePath,
+	oldString,
+	newString,
 	language,
 	startLine,
+	phase,
+	chars,
+	streaming,
 }: {
-	preview: NonNullable<ReturnType<typeof getStreamingEditPreview>>;
 	filePath: string;
+	oldString: string;
+	newString: string;
 	language?: string;
 	startLine?: number;
+	phase?: EditStreamingPhase;
+	chars?: number;
+	streaming?: boolean;
 }) {
-	const title = preview.phase === "matching" ? "matching" : "replacing";
-	const hasReplacement = preview.phase === "replacing";
-	const displayStartLine = startLine ?? 1;
+	const hasReplacement = phase ? phase === "replacing" : true;
+	const displayOldString = oldString || " ";
+	const displayNewString = hasReplacement ? newString : displayOldString;
+	const content = `--- old\n${oldString}\n+++ new\n${hasReplacement ? newString : oldString}`;
+	const title = filePath ? basename(filePath) : "Diff";
+	const displayStartLine = startLine ?? (streaming ? 1 : undefined);
+	const lineNumberPrefix = streaming && !hasReplacement ? "xx" : undefined;
+
 	return (
-		<Paper
-			p="xs"
-			radius="sm"
-			withBorder
-			style={{
-				borderColor: "color-mix(in srgb, var(--mantine-color-violet-5) 45%, transparent)",
-				background: "color-mix(in srgb, var(--mantine-color-violet-light) 24%, transparent)",
-			}}
-		>
-			<Group gap={6} mb={6} wrap="nowrap">
-				<Badge size="xs" variant="light" color={hasReplacement ? "violet" : "blue"}>
-					{title}
-				</Badge>
-				<IconLoader2 size={12} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
-				<Text size="xs" c="dimmed" ff="monospace" truncate style={{ flex: 1 }}>
+		<Box>
+			{filePath && (
+				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
 					{filePath}
 				</Text>
-				{preview.chars > 0 && (
-					<Text size="xs" c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
-						{preview.chars} chars
-					</Text>
+			)}
+			<Box pos="relative">
+				<ContentViewer
+					content={content}
+					title={title}
+					contentType="diff"
+					language={language}
+					diff={{
+						oldStr: oldString,
+						newStr: hasReplacement ? newString : oldString,
+					}}
+					renderContent={(wordWrap) => (
+						<DiffView
+							oldStr={displayOldString}
+							newStr={displayNewString}
+							maxHeight={200}
+							wordWrap={wordWrap}
+							language={language}
+							startLine={displayStartLine}
+							lineNumberPrefix={lineNumberPrefix}
+						/>
+					)}
+				/>
+				{streaming && phase && (
+					<Box
+						style={{
+							position: "absolute",
+							top: 6,
+							right: 6,
+							zIndex: 3,
+							display: "flex",
+							alignItems: "center",
+							gap: 4,
+							padding: "2px 7px",
+							borderRadius: "999px",
+							border:
+								"1px solid color-mix(in srgb, var(--mantine-color-default-border) 80%, transparent)",
+							background: "color-mix(in srgb, var(--mantine-color-body) 88%, transparent)",
+							boxShadow: "var(--mantine-shadow-xs)",
+							pointerEvents: "none",
+							backdropFilter: "blur(4px)",
+						}}
+					>
+						<IconLoader2
+							size={12}
+							style={{ animation: "spin 1s linear infinite", flexShrink: 0 }}
+						/>
+						<Text size="xs" c="dimmed" ff="monospace" lh={1.2}>
+							{phase}
+							{chars ? ` · ${chars} chars` : ""}
+						</Text>
+					</Box>
 				)}
-			</Group>
-			<DiffView
-				oldStr={preview.oldString || " "}
-				newStr={hasReplacement ? preview.newString : preview.oldString || " "}
-				maxHeight={200}
-				wordWrap
-				language={language}
-				startLine={displayStartLine}
-				lineNumberPrefix={hasReplacement ? undefined : "xx"}
-			/>
-		</Paper>
+			</Box>
+		</Box>
 	);
 }
 
@@ -1714,39 +1773,25 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	return (
 		<Box mt="xs">
-			{fp && (
-				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={fp}>
-					{fp}
-				</Text>
-			)}
 			{isEdit && editStreamingPreview && (
-				<EditStreamingPreview
-					preview={editStreamingPreview}
+				<EditDiffBlock
 					filePath={fp || "Edit"}
+					oldString={editStreamingPreview.oldString}
+					newString={editStreamingPreview.newString}
 					language={lang}
 					startLine={startLine}
+					phase={editStreamingPreview.phase}
+					chars={editStreamingPreview.chars}
+					streaming
 				/>
 			)}
 			{isEdit && !editStreamingPreview && oldString != null && (
-				<ContentViewer
-					content={`--- old\n${oldString}\n+++ new\n${newString ?? ""}`}
-					title={fp ? basename(fp) : "Diff"}
-					contentType="diff"
+				<EditDiffBlock
+					filePath={fp}
+					oldString={oldString}
+					newString={newString ?? ""}
 					language={lang}
-					diff={{
-						oldStr: oldString,
-						newStr: newString ?? "",
-					}}
-					renderContent={(wordWrap) => (
-						<DiffView
-							oldStr={oldString}
-							newStr={newString ?? ""}
-							maxHeight={200}
-							wordWrap={wordWrap}
-							language={lang}
-							startLine={startLine}
-						/>
-					)}
+					startLine={startLine}
 				/>
 			)}
 			{isEdit && !editStreamingPreview && inputIsTruncated && !oldString && (
@@ -1909,7 +1954,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					{isRunning && <IconLoader2 size={12} style={{ animation: "spin 1s linear infinite" }} />}
 					{awaitTimeout != null && (
 						<Text size="xs" c="dimmed">
-							timeout: {(awaitTimeout / 1000).toFixed(0)}s
+							timeout: {formatDurationText(awaitTimeout, { style: "timeout" })}
 						</Text>
 					)}
 					{awaitWaitForText && (
@@ -2849,7 +2894,7 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 				</Badge>
 				{typeof timeout === "number" && (
 					<Badge size="xs" color="gray" variant="light">
-						{formatTimeoutShort(timeout)}
+						{formatDurationText(timeout, { style: "timeout" })}
 					</Badge>
 				)}
 			</Group>
@@ -3429,11 +3474,15 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 							: undefined;
 				return (
 					<Box mt="xs">
-						<EditStreamingPreview
-							preview={preview}
+						<EditDiffBlock
 							filePath={previewFilePath}
+							oldString={preview.oldString}
+							newString={preview.newString}
 							language={previewFilePath ? getShikiLang(previewFilePath) : undefined}
 							startLine={startLine}
+							phase={preview.phase}
+							chars={preview.chars}
+							streaming
 						/>
 					</Box>
 				);
@@ -4125,6 +4174,7 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p._streamingOutput !== n._streamingOutput ||
 		p._timeoutMs !== n._timeoutMs ||
 		p._metadata !== n._metadata ||
+		p.sideCars !== n.sideCars ||
 		p._resolvedModel !== n._resolvedModel ||
 		p.startedAt !== n.startedAt ||
 		p.errorMessage !== n.errorMessage
@@ -4336,7 +4386,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 			planMaxHeight={vpHeight}
 		/>
 	) : null;
-	const dangerReflectionNotice = <DangerReflectionNotice toolCall={toolCall} />;
+	const dangerReflectionNotice = (
+		<DangerReflectionNotice toolCall={toolCall} pendingPermission={pendingPermission} />
+	);
 
 	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
 
@@ -4348,6 +4400,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 			: "";
 	const fileMenuPath = FILE_TOOLS.has(toolCall.toolName) ? inputFilePath || streamingFilePath : "";
 	const readFilePath = toolCall.toolName === "Read" ? fileMenuPath : "";
+	const platform = usePlatform();
+	const clipboardFilePath = formatClipboardFilePath(fileMenuPath, platform);
 	const filePathClipboard = useClipboard({ timeout: 1500 });
 	const [previewOpened, setPreviewOpened] = useState(false);
 	const [inspectorOpened, setInspectorOpened] = useState(false);
@@ -4421,7 +4475,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				<Menu.Item
 					leftSection={filePathClipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
 					onClick={() => {
-						filePathClipboard.copy(fileMenuPath);
+						filePathClipboard.copy(clipboardFilePath);
 						swipe.closeSwipe();
 					}}
 				>
@@ -4528,6 +4582,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onToggle={handleToggle}
 				narratorId={narratorId}
 			/>
+			<SideCarNotice sideCars={toolCall.sideCars} />
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} />
 			) : (
@@ -4766,7 +4821,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCall
 					) : (
 						totalMs > 0 && (
 							<Text size="xs" c="dimmed" ff="monospace">
-								{(totalMs / 1000).toFixed(1)}s
+								{formatDurationText(totalMs, { style: "precise" })}
 							</Text>
 						)
 					)}

@@ -71,6 +71,11 @@ export class CodexProvider implements ProviderAdapter {
 	private dummyProvider: OpenAIProvider;
 
 	constructor(options?: CodexProviderOptions) {
+		const mode = settings.codex?.loadBalancingMode;
+		if (mode === "priority" || mode === "balanced" || mode === "tier-balanced") {
+			this.manager.setLoadBalancingMode(mode);
+		}
+		this.manager.setTierOrder(settings.codex?.tierOrder);
 		this.useWebSocket = options?.useWebSocket ?? true;
 		// Create dummy provider once and reuse it
 		this.dummyProvider = new OpenAIProvider({
@@ -505,8 +510,14 @@ export class CodexProvider implements ProviderAdapter {
 		return this.dummyProvider.formatToolResult(toolUseId, output, isError, images);
 	}
 
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
-		this.dummyProvider.pushUserTurn(history, content, model, toolResults);
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
+		this.dummyProvider.pushUserTurn(history, content, model, toolResults, images);
 	}
 
 	pushAssistantTurn(

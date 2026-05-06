@@ -183,6 +183,7 @@ export interface ToolCallRecord {
 }
 
 export interface SideCarRecord {
+	id?: string;
 	target: "tool_result" | "user_message";
 	source: string;
 	content: string;
@@ -268,6 +269,7 @@ export interface BufferMessageSummary {
 	bufferedAt: string;
 	imageCount: number;
 	creator?: BufferCreator | null;
+	priority?: boolean;
 }
 
 export type NarratorGoalStatus = "pending" | "active" | "paused" | "complete" | "cancelled";
@@ -296,6 +298,7 @@ export interface TreeMessage {
 	contentJson: ContentBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
+	sideCars?: SideCarRecord[];
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	turnUsageJson?: {
@@ -353,7 +356,8 @@ export interface PaginatedMessages {
 	prunedPercent?: number | null;
 }
 
-export type CodexPlanTier = "free" | "plus" | "prolite" | "pro" | "other";
+export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
+export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 
 export interface CodexUsageWindow {
 	used_percent: number;

@@ -110,6 +110,7 @@ export function loadSettings(): NarraForkSettings {
  */
 export function reloadSettings(): NarraForkSettings {
 	const fresh = loadSettingsFromDisk();
+	settingsRevision++;
 	if (_cache.current) {
 		for (const key of Object.keys(fresh) as Array<keyof NarraForkSettings>) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -369,9 +370,16 @@ export function purgeStaleAgentModelRefs(
 /** Internal mutable holder. */
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
+let settingsRevision = 0;
+
+export function getSettingsRevision(): number {
+	return settingsRevision;
+}
+
 export function saveSettings(newSettings: NarraForkSettings): void {
 	mkdirSync(narraforkDir, { recursive: true });
 	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
+	settingsRevision++;
 	if (_cache.current) {
 		for (const key of Object.keys(newSettings) as Array<keyof NarraForkSettings>) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

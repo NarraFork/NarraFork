@@ -289,12 +289,30 @@ export class ClineProvider implements ProviderAdapter {
 		return { tool_call_id: toolUseId, content: output } satisfies ClineToolResult;
 	}
 
-	pushUserTurn(history: unknown[], content: string, _model: string, toolResults: unknown[]): void {
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		_model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
 		const h = history as ClineMessage[];
 		for (const tr of toolResults as ClineToolResult[]) {
 			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 		}
-		if (content && content !== ".") {
+		const hasText = !!content && content !== ".";
+		if (images?.length) {
+			const parts: ClineContentPart[] = [
+				{ type: "text", text: hasText ? content : "[user sent image(s)]" },
+			];
+			for (const img of images) {
+				parts.push({
+					type: "image_url",
+					image_url: { url: `data:image/${img.format};base64,${img.base64}` },
+				});
+			}
+			h.push({ role: "user", content: parts });
+		} else if (hasText) {
 			h.push({ role: "user", content });
 		}
 	}

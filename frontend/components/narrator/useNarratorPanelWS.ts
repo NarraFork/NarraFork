@@ -4,7 +4,12 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
-import { api, type BufferMessageSummary, type NarratorGoal } from "../../lib/api";
+import {
+	api,
+	type BufferMessageSummary,
+	type NarratorGoal,
+	type SideCarRecord,
+} from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
 import { clearToolBlockCache, type StreamingBlock } from "./message-segments";
@@ -50,6 +55,23 @@ export interface RetryInfo {
 	maxRetries: number;
 	/** Timestamp (ms) when the retry delay expires */
 	retryAt: number;
+}
+
+function isPageVisible(): boolean {
+	return typeof document === "undefined" || document.visibilityState === "visible";
+}
+
+function usePageVisibility(): boolean {
+	const [visible, setVisible] = useState(isPageVisible);
+
+	useEffect(() => {
+		if (typeof document === "undefined") return;
+		const handleVisibilityChange = () => setVisible(isPageVisible());
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+		return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+	}, []);
+
+	return visible;
 }
 
 function getStreamingBlockOutputIndex(block: StreamingBlock): number | undefined {
@@ -99,6 +121,33 @@ function insertTopLevelMessageBySeq(messages: NarratorMsg[], newMsg: NarratorMsg
 	const updated = [...messages];
 	updated.splice(insertIdx, 0, newMsg);
 	return updated;
+}
+
+function appendSideCarsToLatestAssistant(
+	messages: NarratorMsg[],
+	sideCars: SideCarRecord[],
+	parentToolUseId?: string,
+): { messages: NarratorMsg[]; changed: boolean } {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.children?.length) {
+			const childResult = appendSideCarsToLatestAssistant(msg.children, sideCars, parentToolUseId);
+			if (childResult.changed) {
+				const updated = [...messages];
+				updated[i] = { ...msg, children: childResult.messages };
+				return { messages: updated, changed: true };
+			}
+		}
+		const matchesParent = parentToolUseId
+			? msg.parentToolUseId === parentToolUseId
+			: !msg.parentToolUseId;
+		if (msg.role === "assistant" && matchesParent) {
+			const updated = [...messages];
+			updated[i] = { ...msg, sideCars: [...(msg.sideCars ?? []), ...sideCars] };
+			return { messages: updated, changed: true };
+		}
+	}
+	return { messages, changed: false };
 }
 
 export interface UseNarratorPanelWSOptions {
@@ -222,13 +271,29 @@ function statusReducer(state: StatusState, action: StatusAction): StatusState {
 	return state;
 }
 
-function withQueueSubstatus(substatus: string[], position: number, queueDepth: number): string[] {
+function withQueueSubstatus(
+	substatus: string[],
+	position?: number,
+	queueDepth?: number,
+	queueMessage?: string,
+): string[] {
 	const withoutQueue = substatus.filter(
-		(s) => !s.startsWith("queue_position:") && !s.startsWith("queue_depth:"),
+		(s) =>
+			!s.startsWith("queue_position:") &&
+			!s.startsWith("queue_depth:") &&
+			!s.startsWith("queue_message:"),
 	);
-	if (!Number.isFinite(position) || position <= 0) return withoutQueue;
-	const safeDepth = Number.isFinite(queueDepth) ? Math.max(0, queueDepth) : 0;
-	return [...withoutQueue, `queue_position:${position}`, `queue_depth:${safeDepth}`];
+	const nextSubstatus = [...withoutQueue];
+	const safePosition = typeof position === "number" && Number.isFinite(position) ? position : null;
+	if (safePosition != null && safePosition > 0) {
+		const safeDepth =
+			typeof queueDepth === "number" && Number.isFinite(queueDepth) ? Math.max(0, queueDepth) : 0;
+		nextSubstatus.push(`queue_position:${safePosition}`, `queue_depth:${safeDepth}`);
+	}
+	if (queueMessage) {
+		nextSubstatus.push(`queue_message:${encodeURIComponent(queueMessage)}`);
+	}
+	return nextSubstatus;
 }
 
 function applyPendingPermissionsToCache(
@@ -270,6 +335,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const interruptMutation = useInterruptNarrator();
+	const pageVisible = usePageVisibility();
 
 	// --- Streaming state ---
 	const [streamingVersion, setStreamingVersion] = useState(0);
@@ -644,6 +710,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._startedAt && { startedAt: ext._startedAt }),
 						...(ext._output !== undefined && { outputJson: ext._output }),
 						...(ext._durationMs != null && { durationMs: ext._durationMs }),
+						...(ext._sideCars && { sideCars: ext._sideCars }),
 						...(ext._metadata && { _metadata: ext._metadata }),
 						...(chunk.metadata && { _metadata: chunk.metadata }),
 						...(ext._longRunning && { _longRunning: true }),
@@ -926,8 +993,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [firstPageHasMoreAfter, messagesData]);
 
 	const applyQueueStatus = useCallback(
-		(position: number, queueDepth: number) => {
-			const substatusWithQueue = withQueueSubstatus(statusState.substatus, position, queueDepth);
+		(position?: number, queueDepth?: number, queueMessage?: string) => {
+			const substatusWithQueue = withQueueSubstatus(
+				statusState.substatus,
+				position,
+				queueDepth,
+				queueMessage,
+			);
 			dispatchStatus({ type: "patch", payload: { substatus: substatusWithQueue } });
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 				old ? { ...old, substatus: substatusWithQueue } : old,
@@ -1236,6 +1308,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				updatedInput?: Record<string, unknown>,
 				metadata?: Record<string, unknown>,
 				parentToolUseId?: string,
+				sideCars?: SideCarRecord[],
 			) => {
 				// Discard any pending RAF chunk and accumulated raw input for this tool
 				pendingToolChunkRef.current.delete(toolUseId);
@@ -1257,6 +1330,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							_output: output,
 							_durationMs: durationMs,
 							_metadata: metadata,
+							_sideCars: sideCars,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
 						bumpTopLevelStreamingChunksVersion((v) => v + 1);
@@ -1289,7 +1363,31 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							toolUseIndexRef.current,
 						);
 					}
+					if (sideCars?.length && result) {
+						result = mergeFieldsByIndex(result, toolUseId, { sideCars }, toolUseIndexRef.current);
+					}
 					return result;
+				});
+			},
+			onSideCars: (sideCars: SideCarRecord[], parentToolUseId?: string) => {
+				const userSideCars = sideCars.filter((sc) => sc.target === "user_message");
+				if (userSideCars.length === 0) return;
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+						const page = pages[pageIdx];
+						const result = appendSideCarsToLatestAssistant(
+							page.messages,
+							userSideCars,
+							parentToolUseId,
+						);
+						if (result.changed) {
+							pages[pageIdx] = { ...page, messages: result.messages };
+							return { ...old, pages };
+						}
+					}
+					return old;
 				});
 			},
 			onToolLongRunning: (toolUseId: string, _elapsed: number, parentToolUseId?: string) => {
@@ -1655,6 +1753,49 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onDangerReflectionStopped: ({
+				requestId,
+				toolUseId,
+				toolName,
+				danger,
+				inputJson,
+				reason,
+			}) => {
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					const existing =
+						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
+					if (existing) next.delete(existing.toolUseId ?? toolUseId);
+					next.set(toolUseId, {
+						...(existing ?? {}),
+						id: requestId,
+						toolName,
+						toolUseId,
+						inputJson: existing?.inputJson ?? inputJson ?? {},
+						decisionReason: reason ?? existing?.decisionReason,
+						suggestions: [{ type: "danger_reflection", status: "awaiting_user", danger, reason }],
+					});
+					return next;
+				});
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason:
+								reason ?? "Danger reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{ type: "danger_reflection", status: "awaiting_user", danger, reason },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+			},
 			onDangerReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
 				setPendingPermsMap((prev) => {
 					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
@@ -1829,8 +1970,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onQuotaBalance: (_balance) => {
 				// Generic gateway quota balance — currently a no-op.
 			},
-			onQueueStatus: (position, queueDepth) => {
-				applyQueueStatus(position, queueDepth);
+			onQueueStatus: (position, queueDepth, queueMessage) => {
+				applyQueueStatus(position, queueDepth, queueMessage);
 			},
 			onBrowserSessionCount: (count) => {
 				setBrowserSessionCount(count);
@@ -2368,6 +2509,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// With substatus refactor, "done" is now idle + substatus includes "unread".
 	const hasUnreadSubstatus = substatus.includes("unread");
 	useEffect(() => {
+		// Do not auto-clear unread while the page is in the background.
+		if (!pageVisible) return;
 		// Subagents must stay in done/error so follow-up Send can pick them up.
 		if (isSubagent) return;
 		// Preserve error sessions: do not auto-clear when an error exists.
@@ -2379,7 +2522,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
-	}, [narratorId, narratorStatus, hasUnreadSubstatus, narratorErrorMessage, isSubagent, qc]);
+	}, [
+		narratorId,
+		narratorStatus,
+		hasUnreadSubstatus,
+		narratorErrorMessage,
+		isSubagent,
+		pageVisible,
+		qc,
+	]);
 
 	// --- Derive compacting substatus from persisted messages ---
 	// On initial load (before WS connects), detect if the last message has an

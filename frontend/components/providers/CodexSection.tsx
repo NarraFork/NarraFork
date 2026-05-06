@@ -1,4 +1,14 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { arrayMove, rectSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Badge,
 	Button,
@@ -24,6 +34,7 @@ import { notifications } from "@mantine/notifications";
 import {
 	IconCheck,
 	IconDeviceFloppy,
+	IconGripVertical,
 	IconPencil,
 	IconRefresh,
 	IconTrash,
@@ -34,10 +45,12 @@ import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type {
+	CodexLoadBalancingMode,
 	CodexPlanTier,
 	CodexUsageForecast,
 	CodexUsageSchedulerSnapshot,
 	CodexUsageSummary,
+	CodexUsageTierStats,
 } from "../../lib/api/types";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -63,10 +76,20 @@ interface CodexImportCredential {
 
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
-const CODEX_DISPLAY_TIERS: CodexPlanTier[] = ["free", "plus", "prolite", "pro"];
+const CODEX_DISPLAY_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
+const CODEX_TIER_ORDER_VALUES: CodexPlanTier[] = [
+	"pro",
+	"prolite",
+	"plus",
+	"team",
+	"free",
+	"other",
+];
+const CODEX_DEFAULT_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
 const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
 	free: "gray",
 	plus: "blue",
+	team: "cyan",
 	prolite: "violet",
 	pro: "green",
 	other: "dark",
@@ -74,10 +97,24 @@ const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
 const CODEX_TIER_STROKES: Record<CodexPlanTier, string> = {
 	free: "var(--mantine-color-gray-6)",
 	plus: "var(--mantine-color-blue-6)",
+	team: "var(--mantine-color-cyan-6)",
 	prolite: "var(--mantine-color-violet-6)",
 	pro: "var(--mantine-color-green-6)",
 	other: "var(--mantine-color-dark-4)",
 };
+
+function getDisplayTierOrder(order?: CodexPlanTier[]): CodexPlanTier[] {
+	const result: CodexPlanTier[] = [];
+	for (const tier of order ?? CODEX_DEFAULT_TIER_ORDER) {
+		if (!CODEX_TIER_ORDER_VALUES.includes(tier)) continue;
+		if (tier === "other") continue;
+		if (!result.includes(tier)) result.push(tier);
+	}
+	for (const tier of CODEX_DEFAULT_TIER_ORDER) {
+		if (!result.includes(tier)) result.push(tier);
+	}
+	return result;
+}
 
 function normalizeRefreshToken(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -128,6 +165,35 @@ function credentialsFromParsedImport(parsed: unknown): CodexImportCredential[] {
 	});
 }
 
+function SortableTierChip({ tier, label }: { tier: CodexPlanTier; label: string }) {
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: tier,
+	});
+	return (
+		<Paper
+			ref={setNodeRef}
+			withBorder
+			px="xs"
+			py={6}
+			style={{
+				transform: CSS.Transform.toString(transform),
+				transition,
+				opacity: isDragging ? 0.55 : 1,
+				cursor: "grab",
+			}}
+			{...attributes}
+			{...listeners}
+		>
+			<Group gap={6} wrap="nowrap">
+				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
+				<Badge color={CODEX_TIER_COLORS[tier]} variant="light">
+					{label}
+				</Badge>
+			</Group>
+		</Paper>
+	);
+}
+
 export const CodexSection = React.memo(function CodexSection({
 	hiddenModels,
 	onToggleHidden,
@@ -159,6 +225,8 @@ export const CodexSection = React.memo(function CodexSection({
 	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
 	const [useWebSocket, setUseWebSocket] = useState(true);
 	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
+	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
+	const [tierOrderInitialized, setTierOrderInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
@@ -166,6 +234,9 @@ export const CodexSection = React.memo(function CodexSection({
 	const [availablePage, setAvailablePage] = useState(1);
 	const [unavailablePage, setUnavailablePage] = useState(1);
 	const PAGE_SIZE = 20;
+	const tierOrderSensors = useSensors(
+		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+	);
 	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -207,7 +278,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const unavailableEntries = status?.unavailableEntries ?? [];
 	const availableTotal = status?.availableTotal ?? 0;
 	const unavailableTotal = status?.unavailableTotal ?? 0;
-	const loadBalancingMode = status?.loadBalancingMode ?? "priority";
+	const loadBalancingMode = status?.loadBalancingMode ?? "tier-balanced";
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
 	const lastBrowserAuthError = status?.lastBrowserAuthError;
@@ -226,7 +297,17 @@ export const CodexSection = React.memo(function CodexSection({
 			setUseWebSocket(status.useWebSocket ?? true);
 			setUseWebSocketInitialized(true);
 		}
-	}, [status, globalProxyInitialized, defaultReasoningInitialized, useWebSocketInitialized]);
+		if (!tierOrderInitialized) {
+			setTierOrder(getDisplayTierOrder(status.tierOrder));
+			setTierOrderInitialized(true);
+		}
+	}, [
+		status,
+		globalProxyInitialized,
+		defaultReasoningInitialized,
+		useWebSocketInitialized,
+		tierOrderInitialized,
+	]);
 
 	// Auto-detect browser auth failure from server-side error
 	useEffect(() => {
@@ -277,7 +358,7 @@ export const CodexSection = React.memo(function CodexSection({
 		},
 	});
 	const lbModeMut = useMutation({
-		mutationFn: (mode: "priority" | "balanced") => api.codexSetLoadBalancingMode(mode),
+		mutationFn: (mode: CodexLoadBalancingMode) => api.codexSetLoadBalancingMode(mode),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
 	});
 	const globalProxyMut = useMutation({
@@ -300,6 +381,17 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			notifications.show({ message: t("codexWebSocketUpdated"), color: "green" });
+		},
+	});
+	const tierOrderMut = useMutation({
+		mutationFn: (tierOrder: CodexPlanTier[]) => api.codexSetTierOrder(tierOrder),
+		onSuccess: (data) => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			setTierOrder(getDisplayTierOrder(data.tierOrder));
+			notifications.show({ message: t("codexTierOrderUpdated"), color: "green" });
+		},
+		onError: (err: Error) => {
+			notifications.show({ message: err.message, color: "red" });
 		},
 	});
 	const importMut = useMutation({
@@ -548,6 +640,22 @@ export const CodexSection = React.memo(function CodexSection({
 		});
 	};
 
+	const handleTierOrderDragEnd = (event: DragEndEvent) => {
+		const { active, over } = event;
+		if (!over || active.id === over.id) return;
+		const oldIndex = tierOrder.indexOf(active.id as CodexPlanTier);
+		const newIndex = tierOrder.indexOf(over.id as CodexPlanTier);
+		if (oldIndex === -1 || newIndex === -1) return;
+		const nextOrder = arrayMove(tierOrder, oldIndex, newIndex);
+		setTierOrder(nextOrder);
+		tierOrderMut.mutate(nextOrder);
+	};
+
+	const handleResetTierOrder = () => {
+		setTierOrder(CODEX_DEFAULT_TIER_ORDER);
+		tierOrderMut.mutate(CODEX_DEFAULT_TIER_ORDER);
+	};
+
 	const handleImport = () => {
 		setImportError(null);
 		setImportResult(null);
@@ -594,13 +702,47 @@ export const CodexSection = React.memo(function CodexSection({
 					<SegmentedControl
 						size="xs"
 						value={loadBalancingMode}
-						onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
+						onChange={(v) => lbModeMut.mutate(v as CodexLoadBalancingMode)}
 						data={[
 							{ label: t("codexModePriority"), value: "priority" },
 							{ label: t("codexModeBalanced"), value: "balanced" },
+							{ label: t("codexModeTierBalanced"), value: "tier-balanced" },
 						]}
 					/>
 				</Group>
+				<Stack gap={4}>
+					<Group justify="space-between" align="flex-end">
+						<Stack gap={2}>
+							<Text size="xs" fw={500}>
+								{t("codexTierOrder")}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("codexTierOrderDesc")}
+							</Text>
+						</Stack>
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							onClick={handleResetTierOrder}
+							loading={tierOrderMut.isPending}
+						>
+							{t("codexTierOrderReset")}
+						</Button>
+					</Group>
+					<DndContext
+						sensors={tierOrderSensors}
+						collisionDetection={closestCenter}
+						onDragEnd={handleTierOrderDragEnd}
+					>
+						<SortableContext items={tierOrder} strategy={rectSortingStrategy}>
+							<Group gap="xs" wrap="wrap">
+								{tierOrder.map((tier) => (
+									<SortableTierChip key={tier} tier={tier} label={getCodexTierLabel(t, tier)} />
+								))}
+							</Group>
+						</SortableContext>
+					</DndContext>
+				</Stack>
 				<Group align="flex-end">
 					<TextInput
 						size="xs"
@@ -973,9 +1115,22 @@ export const CodexSection = React.memo(function CodexSection({
 function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
 	if (tier === "free") return t("codexQuotaTierFree");
 	if (tier === "plus") return t("codexQuotaTierPlus");
+	if (tier === "team") return t("codexQuotaTierTeam");
 	if (tier === "prolite") return t("codexQuotaTierProLite");
 	if (tier === "pro") return t("codexQuotaTierPro");
 	return t("codexQuotaTierOther");
+}
+
+function getEmptyCodexUsageTierStats(tier: CodexPlanTier): CodexUsageTierStats {
+	return {
+		tier,
+		accountCount: 0,
+		knownUsageCount: 0,
+		zeroUsageCount: 0,
+		scheduledAccountCount: 0,
+		remainingAccountEquivalents: 0,
+		averageRemainingPercent: null,
+	};
 }
 
 function formatAccountEquivalent(value: number): string {
@@ -999,6 +1154,23 @@ function formatChartTimestamp(timestamp: number): string {
 	});
 }
 
+function formatQuotaForecastDuration(
+	timestamp: number,
+	t: (key: string, values?: Record<string, number | string>) => string,
+): string {
+	const diffMinutes = Math.round((timestamp - Date.now()) / 60_000);
+	if (Math.abs(diffMinutes) < 1) return t("codexQuotaForecastNow");
+
+	const absMinutes = Math.abs(diffMinutes);
+	const hours = Math.floor(absMinutes / 60);
+	const minutes = absMinutes % 60;
+	const duration = t("codexQuotaForecastHoursMinutes", { hours, minutes });
+
+	return diffMinutes > 0
+		? t("codexQuotaForecastInDuration", { duration })
+		: t("codexQuotaForecastAgoDuration", { duration });
+}
+
 function CodexQuotaOverview({
 	summary,
 	forecast,
@@ -1009,6 +1181,11 @@ function CodexQuotaOverview({
 	scheduler: CodexUsageSchedulerSnapshot;
 }) {
 	const { t } = useTranslation("settings");
+	const [selectedTierValues, setSelectedTierValues] = useState<string[]>(CODEX_DISPLAY_TIERS);
+	const selectedTiers = CODEX_DISPLAY_TIERS.filter((tier) => selectedTierValues.includes(tier));
+	const summaryByTier = (summary.byTier ?? {}) as Partial<
+		Record<CodexPlanTier, CodexUsageTierStats>
+	>;
 
 	return (
 		<Paper withBorder p="sm">
@@ -1039,53 +1216,80 @@ function CodexQuotaOverview({
 					</Stack>
 				</Group>
 
-				<SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }} spacing="xs">
-					{CODEX_DISPLAY_TIERS.map((tier) => {
-						const stat = summary.byTier[tier];
-						const average = stat.averageRemainingPercent ?? 0;
-						return (
-							<Paper key={tier} withBorder p="xs">
-								<Stack gap={6}>
-									<Group justify="space-between" wrap="nowrap">
-										<Badge color={CODEX_TIER_COLORS[tier]} variant="light">
-											{getCodexTierLabel(t, tier)}
-										</Badge>
+				<Stack gap={4}>
+					<Text size="xs" c="dimmed">
+						{t("codexQuotaVisibleTiers")}
+					</Text>
+					<Checkbox.Group value={selectedTierValues} onChange={setSelectedTierValues}>
+						<Group gap="xs" wrap="wrap">
+							{CODEX_DISPLAY_TIERS.map((tier) => (
+								<Checkbox
+									key={tier}
+									value={tier}
+									label={getCodexTierLabel(t, tier)}
+									size="xs"
+									color={CODEX_TIER_COLORS[tier]}
+								/>
+							))}
+						</Group>
+					</Checkbox.Group>
+				</Stack>
+
+				{selectedTiers.length === 0 ? (
+					<Paper withBorder p="sm">
+						<Text size="xs" c="dimmed" ta="center">
+							{t("codexQuotaNoTierSelected")}
+						</Text>
+					</Paper>
+				) : (
+					<SimpleGrid cols={{ base: 1, sm: 2, lg: 5 }} spacing="xs">
+						{selectedTiers.map((tier) => {
+							const stat = summaryByTier[tier] ?? getEmptyCodexUsageTierStats(tier);
+							const average = stat.averageRemainingPercent ?? 0;
+							return (
+								<Paper key={tier} withBorder p="xs">
+									<Stack gap={6}>
+										<Group justify="space-between" wrap="nowrap">
+											<Badge color={CODEX_TIER_COLORS[tier]} variant="light">
+												{getCodexTierLabel(t, tier)}
+											</Badge>
+											<Text size="xs" c="dimmed">
+												{t("codexQuotaAccounts", { count: stat.accountCount })}
+											</Text>
+										</Group>
+										<Text size="lg" fw={700}>
+											{formatAccountEquivalent(stat.remainingAccountEquivalents)}{" "}
+											<Text span size="xs" c="dimmed" fw={400}>
+												{t("codexQuotaAccountEquivalent")}
+											</Text>
+										</Text>
+										<Progress value={average} size="xs" color={CODEX_TIER_COLORS[tier]} />
+										<Group justify="space-between" gap="xs">
+											<Text size="xs" c="dimmed">
+												{t("codexQuotaAverageRemaining")}: {average.toFixed(1)}%
+											</Text>
+											<Text size="xs" c="dimmed">
+												{t("codexQuotaKnown", { count: stat.knownUsageCount })}
+											</Text>
+										</Group>
 										<Text size="xs" c="dimmed">
-											{t("codexQuotaAccounts", { count: stat.accountCount })}
+											{stat.nextResetAt
+												? t("codexQuotaNextReset", {
+														when: formatResetTimestamp(stat.nextResetAt),
+													})
+												: t("codexQuotaNoResetScheduled")}
 										</Text>
-									</Group>
-									<Text size="lg" fw={700}>
-										{formatAccountEquivalent(stat.remainingAccountEquivalents)}{" "}
-										<Text span size="xs" c="dimmed" fw={400}>
-											{t("codexQuotaAccountEquivalent")}
-										</Text>
-									</Text>
-									<Progress value={average} size="xs" color={CODEX_TIER_COLORS[tier]} />
-									<Group justify="space-between" gap="xs">
-										<Text size="xs" c="dimmed">
-											{t("codexQuotaAverageRemaining")}: {average.toFixed(1)}%
-										</Text>
-										<Text size="xs" c="dimmed">
-											{t("codexQuotaKnown", { count: stat.knownUsageCount })}
-										</Text>
-									</Group>
-									<Text size="xs" c="dimmed">
-										{stat.nextResetAt
-											? t("codexQuotaNextReset", {
-													when: formatResetTimestamp(stat.nextResetAt),
-												})
-											: t("codexQuotaNoResetScheduled")}
-									</Text>
-									{stat.zeroUsageCount > 0 && (
-										<Text size="xs" c="dimmed">
-											{t("codexQuotaZeroUsage", { count: stat.zeroUsageCount })}
-										</Text>
-									)}
-								</Stack>
-							</Paper>
-						);
-					})}
-				</SimpleGrid>
+										{stat.zeroUsageCount > 0 && (
+											<Text size="xs" c="dimmed">
+												{t("codexQuotaZeroUsage", { count: stat.zeroUsageCount })}
+											</Text>
+										)}
+									</Stack>
+								</Paper>
+							);
+						})}
+					</SimpleGrid>
+				)}
 
 				<Stack gap="xs">
 					<Group justify="space-between">
@@ -1096,22 +1300,35 @@ function CodexQuotaOverview({
 							{t("codexQuotaForecastUnit")}
 						</Text>
 					</Group>
-					<CodexQuotaForecastChart forecast={forecast} />
+					<CodexQuotaForecastChart forecast={forecast} selectedTiers={selectedTiers} />
 				</Stack>
 			</Stack>
 		</Paper>
 	);
 }
 
-function CodexQuotaForecastChart({ forecast }: { forecast: CodexUsageForecast }) {
+function CodexQuotaForecastChart({
+	forecast,
+	selectedTiers,
+}: {
+	forecast: CodexUsageForecast;
+	selectedTiers: CodexPlanTier[];
+}) {
 	const { t } = useTranslation("settings");
+	const svgRef = useRef<SVGSVGElement>(null);
+	const [hoveredCursor, setHoveredCursor] = useState<{
+		timestamp: number;
+		x: number;
+		overlayX: number;
+		alignRight: boolean;
+	} | null>(null);
 	const points = forecast.points;
 	const width = 680;
 	const height = 190;
 	const padding = { left: 42, right: 16, top: 14, bottom: 34 };
 	const chartWidth = width - padding.left - padding.right;
 	const chartHeight = height - padding.top - padding.bottom;
-	const visibleTiers = CODEX_DISPLAY_TIERS.filter((tier) => forecast.tiers.includes(tier));
+	const visibleTiers = selectedTiers.filter((tier) => forecast.tiers.includes(tier));
 	const maxValue = Math.max(
 		1,
 		...points.flatMap((point) => visibleTiers.map((tier) => point.byTier[tier] ?? 0)),
@@ -1119,6 +1336,16 @@ function CodexQuotaForecastChart({ forecast }: { forecast: CodexUsageForecast })
 	const minTime = points[0]?.timestamp ?? Date.now();
 	const maxTime = points[points.length - 1]?.timestamp ?? minTime;
 	const hasChartData = points.length >= 2;
+
+	if (visibleTiers.length === 0) {
+		return (
+			<Paper withBorder p="sm">
+				<Text size="xs" c="dimmed" ta="center">
+					{t("codexQuotaNoTierSelected")}
+				</Text>
+			</Paper>
+		);
+	}
 
 	if (!hasChartData) {
 		return (
@@ -1135,78 +1362,202 @@ function CodexQuotaForecastChart({ forecast }: { forecast: CodexUsageForecast })
 		return padding.left + ((timestamp - minTime) / (maxTime - minTime)) * chartWidth;
 	};
 	const yFor = (value: number) => padding.top + chartHeight - (value / maxValue) * chartHeight;
-	const buildPolyline = (tier: CodexPlanTier) =>
-		points.map((point) => `${xFor(point.timestamp)},${yFor(point.byTier[tier] ?? 0)}`).join(" ");
+	const timeFor = (x: number) => {
+		if (chartWidth <= 0 || maxTime === minTime) return minTime;
+		return minTime + ((x - padding.left) / chartWidth) * (maxTime - minTime);
+	};
+	const getForecastValueAt = (timestamp: number, tier: CodexPlanTier) => {
+		let value = points[0]?.byTier[tier] ?? 0;
+		for (const point of points) {
+			if (point.timestamp > timestamp) break;
+			value = point.byTier[tier] ?? 0;
+		}
+		return value;
+	};
+	const buildStepPath = (tier: CodexPlanTier) => {
+		const firstPoint = points[0];
+		if (!firstPoint) return "";
+		let path = `M ${xFor(firstPoint.timestamp)} ${yFor(firstPoint.byTier[tier] ?? 0)}`;
+		for (const point of points.slice(1)) {
+			const x = xFor(point.timestamp);
+			path += ` H ${x} V ${yFor(point.byTier[tier] ?? 0)}`;
+		}
+		return path;
+	};
+	const updateHoveredPoint = (event: React.PointerEvent<SVGSVGElement>) => {
+		const svg = svgRef.current;
+		const screenCtm = svg?.getScreenCTM();
+		if (!svg || !screenCtm) return;
+		const svgPoint = svg.createSVGPoint();
+		svgPoint.x = event.clientX;
+		svgPoint.y = event.clientY;
+		const point = svgPoint.matrixTransform(screenCtm.inverse());
+		const rawX = Math.min(Math.max(point.x, padding.left), padding.left + chartWidth);
+		const firstPoint = points[0];
+		if (!firstPoint) return;
+		const nearestResetPoint = points.reduce((nearest, forecastPoint) => {
+			const currentDistance = Math.abs(xFor(forecastPoint.timestamp) - rawX);
+			const nearestDistance = Math.abs(xFor(nearest.timestamp) - rawX);
+			return currentDistance < nearestDistance ? forecastPoint : nearest;
+		}, firstPoint);
+		const shouldSnap = Math.abs(xFor(nearestResetPoint.timestamp) - rawX) <= 8;
+		const x = shouldSnap ? xFor(nearestResetPoint.timestamp) : rawX;
+		const timestamp = shouldSnap ? nearestResetPoint.timestamp : timeFor(rawX);
+		const cursorPoint = svg.createSVGPoint();
+		cursorPoint.x = x;
+		cursorPoint.y = padding.top;
+		const screenPoint = cursorPoint.matrixTransform(screenCtm);
+		const rect = svg.getBoundingClientRect();
+		const overlayX = Math.min(Math.max(screenPoint.x - rect.left, 0), rect.width);
+		setHoveredCursor({ timestamp, x, overlayX, alignRight: overlayX > rect.width * 0.68 });
+	};
 
 	return (
 		<Stack gap="xs">
-			<svg
-				viewBox={`0 0 ${width} ${height}`}
-				role="img"
-				aria-label={t("codexQuotaForecastTitle")}
-				style={{ width: "100%", height: 220 }}
-			>
-				<line
-					x1={padding.left}
-					y1={padding.top}
-					x2={padding.left}
-					y2={padding.top + chartHeight}
-					stroke="var(--mantine-color-gray-4)"
-				/>
-				<line
-					x1={padding.left}
-					y1={padding.top + chartHeight}
-					x2={padding.left + chartWidth}
-					y2={padding.top + chartHeight}
-					stroke="var(--mantine-color-gray-4)"
-				/>
-				<text x={padding.left - 8} y={padding.top + 4} textAnchor="end" fontSize="10" fill="gray">
-					{formatAccountEquivalent(maxValue)}
-				</text>
-				<text
-					x={padding.left - 8}
-					y={padding.top + chartHeight}
-					textAnchor="end"
-					fontSize="10"
-					fill="gray"
+			<div style={{ position: "relative" }}>
+				<svg
+					ref={svgRef}
+					viewBox={`0 0 ${width} ${height}`}
+					role="img"
+					aria-label={t("codexQuotaForecastTitle")}
+					onPointerMove={updateHoveredPoint}
+					onPointerDown={updateHoveredPoint}
+					onPointerLeave={() => setHoveredCursor(null)}
+					onPointerCancel={() => setHoveredCursor(null)}
+					style={{ width: "100%", height: 220, touchAction: "none" }}
 				>
-					0
-				</text>
-				<text x={padding.left} y={height - 8} textAnchor="start" fontSize="10" fill="gray">
-					{formatChartTimestamp(minTime)}
-				</text>
-				<text
-					x={padding.left + chartWidth}
-					y={height - 8}
-					textAnchor="end"
-					fontSize="10"
-					fill="gray"
-				>
-					{formatChartTimestamp(maxTime)}
-				</text>
-				{visibleTiers.map((tier) => (
-					<polyline
-						key={tier}
-						points={buildPolyline(tier)}
-						fill="none"
-						stroke={CODEX_TIER_STROKES[tier]}
-						strokeWidth={2}
-						strokeLinejoin="round"
-						strokeLinecap="round"
-					/>
-				))}
-				{points.map((point) => (
 					<line
-						key={point.timestamp}
-						x1={xFor(point.timestamp)}
+						x1={padding.left}
 						y1={padding.top}
-						x2={xFor(point.timestamp)}
+						x2={padding.left}
 						y2={padding.top + chartHeight}
-						stroke="var(--mantine-color-gray-3)"
-						strokeDasharray="3 4"
+						stroke="var(--mantine-color-gray-4)"
 					/>
-				))}
-			</svg>
+					<line
+						x1={padding.left}
+						y1={padding.top + chartHeight}
+						x2={padding.left + chartWidth}
+						y2={padding.top + chartHeight}
+						stroke="var(--mantine-color-gray-4)"
+					/>
+					<text x={padding.left - 8} y={padding.top + 4} textAnchor="end" fontSize="10" fill="gray">
+						{formatAccountEquivalent(maxValue)}
+					</text>
+					<text
+						x={padding.left - 8}
+						y={padding.top + chartHeight}
+						textAnchor="end"
+						fontSize="10"
+						fill="gray"
+					>
+						0
+					</text>
+					<text x={padding.left} y={height - 8} textAnchor="start" fontSize="10" fill="gray">
+						{formatChartTimestamp(minTime)}
+					</text>
+					<text
+						x={padding.left + chartWidth}
+						y={height - 8}
+						textAnchor="end"
+						fontSize="10"
+						fill="gray"
+					>
+						{formatChartTimestamp(maxTime)}
+					</text>
+					{visibleTiers.map((tier) => (
+						<path
+							key={tier}
+							d={buildStepPath(tier)}
+							fill="none"
+							stroke={CODEX_TIER_STROKES[tier]}
+							strokeWidth={2}
+							strokeLinejoin="round"
+							strokeLinecap="round"
+						/>
+					))}
+					{points.map((point) => (
+						<line
+							key={point.timestamp}
+							x1={xFor(point.timestamp)}
+							y1={padding.top}
+							x2={xFor(point.timestamp)}
+							y2={padding.top + chartHeight}
+							stroke="var(--mantine-color-gray-3)"
+							strokeDasharray="3 4"
+						/>
+					))}
+					{hoveredCursor ? (
+						<>
+							<line
+								x1={hoveredCursor.x}
+								y1={padding.top}
+								x2={hoveredCursor.x}
+								y2={padding.top + chartHeight}
+								stroke="var(--mantine-color-gray-7)"
+								strokeWidth={1.5}
+								strokeDasharray="4 3"
+							/>
+							{visibleTiers.map((tier) => (
+								<circle
+									key={tier}
+									cx={hoveredCursor.x}
+									cy={yFor(getForecastValueAt(hoveredCursor.timestamp, tier))}
+									r={4}
+									fill="var(--mantine-color-body)"
+									stroke={CODEX_TIER_STROKES[tier]}
+									strokeWidth={2}
+								/>
+							))}
+						</>
+					) : null}
+				</svg>
+				{hoveredCursor ? (
+					<Paper
+						withBorder
+						p="xs"
+						shadow="md"
+						style={{
+							position: "absolute",
+							left: hoveredCursor.overlayX,
+							top: 8,
+							minWidth: 210,
+							pointerEvents: "none",
+							transform: hoveredCursor.alignRight ? "translateX(-100%)" : "translateX(8px)",
+							zIndex: 2,
+						}}
+					>
+						<Stack gap={4}>
+							<Text size="xs" fw={600}>
+								{formatChartTimestamp(hoveredCursor.timestamp)}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("codexQuotaForecastTooltipDistance")}:{" "}
+								{formatQuotaForecastDuration(hoveredCursor.timestamp, t)}
+							</Text>
+							{visibleTiers.map((tier) => (
+								<Group key={tier} justify="space-between" gap="sm" wrap="nowrap">
+									<Group gap={5} wrap="nowrap">
+										<span
+											style={{
+												width: 8,
+												height: 8,
+												borderRadius: 999,
+												background: CODEX_TIER_STROKES[tier],
+												display: "inline-block",
+												flexShrink: 0,
+											}}
+										/>
+										<Text size="xs">{getCodexTierLabel(t, tier)}</Text>
+									</Group>
+									<Text size="xs" fw={600}>
+										{formatAccountEquivalent(getForecastValueAt(hoveredCursor.timestamp, tier))}
+									</Text>
+								</Group>
+							))}
+						</Stack>
+					</Paper>
+				) : null}
+			</div>
 			<Group gap="xs" wrap="wrap">
 				{visibleTiers.map((tier) => (
 					<Group key={tier} gap={4}>

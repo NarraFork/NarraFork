@@ -971,6 +971,7 @@ export const narratorBufferedMessages = sqliteTable(
 		createdBy: text("created_by"),
 		creatorJson: text("creator_json"), // JSON: BufferCreator | null
 		textFilePathsJson: text("text_file_paths_json"), // JSON: SavedBufferedFile[] | null
+		priority: integer("priority", { mode: "boolean" }).notNull().default(false),
 		seq: integer("seq").notNull(),
 		bufferedAt: text("buffered_at").notNull(),
 	},

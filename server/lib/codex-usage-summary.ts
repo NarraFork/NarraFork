@@ -1,9 +1,16 @@
 import type { CodexUsageResult } from "./codex-usage";
 
-export type CodexPlanTier = "free" | "plus" | "prolite" | "pro" | "other";
+export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
 
-export const CODEX_PLAN_TIERS: CodexPlanTier[] = ["free", "plus", "prolite", "pro", "other"];
-export const CODEX_DISPLAY_PLAN_TIERS: CodexPlanTier[] = ["free", "plus", "prolite", "pro"];
+export const CODEX_PLAN_TIERS: CodexPlanTier[] = [
+	"free",
+	"plus",
+	"team",
+	"prolite",
+	"pro",
+	"other",
+];
+export const CODEX_DISPLAY_PLAN_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
 
 export interface CodexUsageSourceEntry {
 	id: string;
@@ -56,7 +63,8 @@ interface MutableForecastWindow {
 
 interface ForecastAccountState {
 	tier: CodexPlanTier;
-	windows: MutableForecastWindow[];
+	quotaWindow: MutableForecastWindow;
+	blockingWeeklyWindow?: MutableForecastWindow;
 }
 
 function emptyTierStats(tier: CodexPlanTier): CodexUsageTierStats {
@@ -75,6 +83,7 @@ function emptyTierValues(): Record<CodexPlanTier, number> {
 	return {
 		free: 0,
 		plus: 0,
+		team: 0,
 		prolite: 0,
 		pro: 0,
 		other: 0,
@@ -92,6 +101,21 @@ function getUsageWindows(usage: CodexUsageResult): UsageWindow[] {
 	);
 }
 
+function getWindowByType(
+	usage: CodexUsageResult,
+	windowType: UsageWindow["window_type"],
+): UsageWindow | undefined {
+	return getUsageWindows(usage).find((window) => window.window_type === windowType);
+}
+
+function getShortTermWindow(usage: CodexUsageResult): UsageWindow | undefined {
+	return getWindowByType(usage, "5h");
+}
+
+function getWeeklyWindow(usage: CodexUsageResult): UsageWindow | undefined {
+	return getWindowByType(usage, "weekly");
+}
+
 function getWindowRemainingPercent(window: UsageWindow): number {
 	if (Number.isFinite(window.remaining_percent)) {
 		return clampPercent(window.remaining_percent);
@@ -99,10 +123,45 @@ function getWindowRemainingPercent(window: UsageWindow): number {
 	return clampPercent(100 - window.used_percent);
 }
 
-function getEffectiveRemainingPercent(usage: CodexUsageResult): number | null {
-	const windows = getUsageWindows(usage);
-	if (windows.length === 0) return null;
-	return Math.min(...windows.map(getWindowRemainingPercent));
+function isMutableForecastWindow(
+	window: UsageWindow | MutableForecastWindow,
+): window is MutableForecastWindow {
+	return "remainingPercent" in window;
+}
+
+function getModeledWindowUsedPercent(window: UsageWindow | MutableForecastWindow): number {
+	return clampPercent(isMutableForecastWindow(window) ? window.usedPercent : window.used_percent);
+}
+
+function getModeledWindowRemainingPercent(window: UsageWindow | MutableForecastWindow): number {
+	return isMutableForecastWindow(window)
+		? clampPercent(window.remainingPercent)
+		: getWindowRemainingPercent(window);
+}
+
+function isWindowUsed(window: UsageWindow | MutableForecastWindow): boolean {
+	return getModeledWindowUsedPercent(window) > 0;
+}
+
+function isWindowExhausted(window: UsageWindow | MutableForecastWindow): boolean {
+	return (
+		getModeledWindowRemainingPercent(window) <= 0 || getModeledWindowUsedPercent(window) >= 100
+	);
+}
+
+function isWeeklyExhausted(usage: CodexUsageResult): boolean {
+	const weeklyWindow = getWeeklyWindow(usage);
+	return weeklyWindow ? isWindowExhausted(weeklyWindow) : false;
+}
+
+function getModeledRemainingPercent(usage: CodexUsageResult): number | null {
+	const shortTermWindow = getShortTermWindow(usage);
+	if (shortTermWindow) {
+		return isWeeklyExhausted(usage) ? 0 : getWindowRemainingPercent(shortTermWindow);
+	}
+
+	const weeklyWindow = getWeeklyWindow(usage);
+	return weeklyWindow ? getWindowRemainingPercent(weeklyWindow) : null;
 }
 
 function isQuotaTrackedEntry(entry: CodexUsageSourceEntry): boolean {
@@ -115,6 +174,7 @@ export function normalizeCodexPlanTier(planType?: string | null): CodexPlanTier 
 	if (!normalized) return "other";
 	if (normalized.includes("prolite") || normalized.includes("litepro")) return "prolite";
 	if (normalized.includes("plus")) return "plus";
+	if (normalized.includes("team") || normalized.includes("business")) return "team";
 	if (normalized.includes("free")) return "free";
 	if (normalized === "pro" || normalized.endsWith("pro") || normalized.includes("chatgptpro")) {
 		return "pro";
@@ -124,31 +184,37 @@ export function normalizeCodexPlanTier(planType?: string | null): CodexPlanTier 
 
 export function isZeroUsageAccount(usage?: CodexUsageResult): boolean {
 	if (!usage) return false;
-	const windows = getUsageWindows(usage);
-	return windows.length > 0 && windows.every((window) => clampPercent(window.used_percent) <= 0);
+	const shortTermWindow = getShortTermWindow(usage);
+	if (shortTermWindow) return !isWeeklyExhausted(usage) && !isWindowUsed(shortTermWindow);
+
+	const weeklyWindow = getWeeklyWindow(usage);
+	return !!weeklyWindow && !isWindowUsed(weeklyWindow);
+}
+
+function getModeledUsageResetAt(usage?: CodexUsageResult): number | undefined {
+	if (!usage) return undefined;
+	const weeklyWindow = getWeeklyWindow(usage);
+	const shortTermWindow = getShortTermWindow(usage);
+
+	if (shortTermWindow) {
+		if (weeklyWindow && isWindowExhausted(weeklyWindow)) return weeklyWindow.reset_at * 1000;
+		return isWindowUsed(shortTermWindow) ? shortTermWindow.reset_at * 1000 : undefined;
+	}
+
+	return weeklyWindow && isWindowUsed(weeklyWindow) ? weeklyWindow.reset_at * 1000 : undefined;
 }
 
 export function getScheduledUsageResetAt(usage?: CodexUsageResult): number | undefined {
-	if (!usage) return undefined;
-	const resetCandidates = getUsageWindows(usage)
-		.filter((window) => clampPercent(window.used_percent) > 0)
-		.map((window) => window.reset_at * 1000)
-		.filter((resetAt) => Number.isFinite(resetAt) && resetAt > 0);
-	if (resetCandidates.length === 0) return undefined;
-	return Math.min(...resetCandidates);
+	const resetAt = getModeledUsageResetAt(usage);
+	return resetAt && Number.isFinite(resetAt) && resetAt > 0 ? resetAt : undefined;
 }
 
 export function getNextUsageResetAt(
 	usage?: CodexUsageResult,
 	now = Date.now(),
 ): number | undefined {
-	if (!usage) return undefined;
-	const resetCandidates = getUsageWindows(usage)
-		.filter((window) => clampPercent(window.used_percent) > 0)
-		.map((window) => window.reset_at * 1000)
-		.filter((resetAt) => Number.isFinite(resetAt) && resetAt > now);
-	if (resetCandidates.length === 0) return undefined;
-	return Math.min(...resetCandidates);
+	const resetAt = getModeledUsageResetAt(usage);
+	return resetAt && Number.isFinite(resetAt) && resetAt > now ? resetAt : undefined;
 }
 
 export function buildCodexUsageSummary(
@@ -186,10 +252,10 @@ export function buildCodexUsageSummary(
 		totalKnownUsageAccounts++;
 		tierStats.knownUsageCount++;
 
-		const effectiveRemaining = getEffectiveRemainingPercent(usage);
-		if (effectiveRemaining !== null) {
-			tierStats.remainingAccountEquivalents += effectiveRemaining / 100;
-			remainingSums[tier] += effectiveRemaining;
+		const modeledRemaining = getModeledRemainingPercent(usage);
+		if (modeledRemaining !== null) {
+			tierStats.remainingAccountEquivalents += modeledRemaining / 100;
+			remainingSums[tier] += modeledRemaining;
 			remainingCounts[tier]++;
 		}
 
@@ -228,22 +294,39 @@ export function buildCodexUsageSummary(
 	};
 }
 
+function toMutableForecastWindow(window: UsageWindow): MutableForecastWindow {
+	return {
+		usedPercent: clampPercent(window.used_percent),
+		remainingPercent: getWindowRemainingPercent(window),
+		resetAt: window.reset_at * 1000,
+	};
+}
+
 function buildInitialForecastStates(entries: CodexUsageSourceEntry[]): ForecastAccountState[] {
 	return entries.flatMap((entry) => {
 		if (!isQuotaTrackedEntry(entry) || !entry.usage) return [];
-		const windows = getUsageWindows(entry.usage);
-		if (windows.length === 0) return [];
+		const shortTermWindow = getShortTermWindow(entry.usage);
+		const weeklyWindow = getWeeklyWindow(entry.usage);
+		const quotaWindow = shortTermWindow ?? weeklyWindow;
+		if (!quotaWindow) return [];
 		return [
 			{
 				tier: normalizeCodexPlanTier(entry.usage.plan_type),
-				windows: windows.map((window) => ({
-					usedPercent: clampPercent(window.used_percent),
-					remainingPercent: getWindowRemainingPercent(window),
-					resetAt: window.reset_at * 1000,
-				})),
+				quotaWindow: toMutableForecastWindow(quotaWindow),
+				...(shortTermWindow && weeklyWindow
+					? { blockingWeeklyWindow: toMutableForecastWindow(weeklyWindow) }
+					: {}),
 			},
 		];
 	});
+}
+
+function isForecastBlockedByWeekly(state: ForecastAccountState): boolean {
+	return state.blockingWeeklyWindow ? isWindowExhausted(state.blockingWeeklyWindow) : false;
+}
+
+function getForecastRemainingPercent(state: ForecastAccountState): number {
+	return isForecastBlockedByWeekly(state) ? 0 : state.quotaWindow.remainingPercent;
 }
 
 function calculateForecastPoint(
@@ -252,8 +335,7 @@ function calculateForecastPoint(
 ): CodexUsageForecastPoint {
 	const byTier = emptyTierValues();
 	for (const state of states) {
-		const remaining = Math.min(...state.windows.map((window) => window.remainingPercent));
-		byTier[state.tier] += remaining / 100;
+		byTier[state.tier] += getForecastRemainingPercent(state) / 100;
 	}
 	for (const tier of CODEX_PLAN_TIERS) {
 		byTier[tier] = Number(byTier[tier].toFixed(4));
@@ -268,11 +350,16 @@ export function buildCodexUsageForecast(
 	const states = buildInitialForecastStates(entries);
 	const resetTimes = [
 		...new Set(
-			states.flatMap((state) =>
-				state.windows
-					.filter((window) => window.usedPercent > 0 && window.resetAt > now)
-					.map((window) => window.resetAt),
-			),
+			states.flatMap((state) => {
+				if (isForecastBlockedByWeekly(state)) {
+					return state.blockingWeeklyWindow && state.blockingWeeklyWindow.resetAt > now
+						? [state.blockingWeeklyWindow.resetAt]
+						: [];
+				}
+				return isWindowUsed(state.quotaWindow) && state.quotaWindow.resetAt > now
+					? [state.quotaWindow.resetAt]
+					: [];
+			}),
 		),
 	].sort((a, b) => a - b);
 
@@ -280,11 +367,19 @@ export function buildCodexUsageForecast(
 
 	for (const resetTime of resetTimes) {
 		for (const state of states) {
-			for (const window of state.windows) {
-				if (window.usedPercent > 0 && window.resetAt <= resetTime) {
-					window.usedPercent = 0;
-					window.remainingPercent = 100;
+			if (state.blockingWeeklyWindow && isWindowExhausted(state.blockingWeeklyWindow)) {
+				if (state.blockingWeeklyWindow.resetAt <= resetTime) {
+					state.blockingWeeklyWindow.usedPercent = 0;
+					state.blockingWeeklyWindow.remainingPercent = 100;
+					state.quotaWindow.usedPercent = 0;
+					state.quotaWindow.remainingPercent = 100;
 				}
+				continue;
+			}
+
+			if (isWindowUsed(state.quotaWindow) && state.quotaWindow.resetAt <= resetTime) {
+				state.quotaWindow.usedPercent = 0;
+				state.quotaWindow.remainingPercent = 100;
 			}
 		}
 		points.push(calculateForecastPoint(states, resetTime));

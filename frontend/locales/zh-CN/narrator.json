@@ -135,7 +135,9 @@
 	"cancel": "取消",
 	"feedbackPlaceholder": "附加反馈给模型（可选）",
 	"dangerReflectionRunning": "危险反思正在检查此操作",
+	"dangerReflectionAwaitingUser": "危险反思已停止，等待你决定",
 	"dangerReflectionResolved": "危险反思已完成",
+	"stopDangerReflection": "停止反思",
 	"planReflectionAutoApprove": "自动批准计划",
 	"planReflectionAutoApproveDesc": "运行计划反思，确认后跳过 ExitPlanMode 人工审批。",
 	"dangerReflectionToggle": "危险反思",
@@ -144,6 +146,8 @@
 	"dangerReflectionDisableWarning": "关闭后，全部允许模式下的高风险操作将不再触发危险反思暂停。删除、外部路径写入、危险 shell 命令等操作可能会立即执行。基础黑名单和灾难性命令保护仍会保留。",
 	"dangerReflectionDisableConfirm": "关闭危险反思",
 	"bufferedMessage": "已排队",
+	"queuedPriority": "插队",
+	"queuedPriorityNextRequest": "插队 · 下次请求时发送",
 	"cancelBuffer": "移除",
 	"clearAllQueued": "清空所有排队",
 	"queuedCount": "{{count}} 条排队",
@@ -473,6 +477,10 @@
 	"details.emptyRules": "无规则",
 	"details.stats.messages": "消息",
 	"details.stats.cost": "成本",
+	"details.stats.inputTokens": "总输入",
+	"details.stats.outputTokens": "总输出",
+	"details.stats.cacheReadTokens": "缓存读取",
+	"details.stats.usageHistoryIncludesSubagents": "来自使用历史 · 含子代理",
 	"details.stats.viewers": "查看者",
 	"details.stats.terminals": "终端",
 	"details.stats.browserSessions": "浏览器",
@@ -497,6 +505,21 @@
 		"bashTask": "命令",
 		"openAgent": "打开 agent"
 	},
+	"sidecar": {
+		"titleWithCount": "系统注入 ×{{count}}",
+		"unknownSource": "未知来源",
+		"copy": "复制 sidecar 内容",
+		"copied": "已复制",
+		"empty": "无内容",
+		"sources": {
+			"silent_progress": "进度提醒",
+			"todo_reminder": "TODO 提醒",
+			"bg_agent": "后台代理通知",
+			"bg_bash": "后台命令通知",
+			"team_message": "团队消息",
+			"buffered_user": "缓冲用户消息"
+		}
+	},
 	"toolCallInspector": {
 		"title": "Tool Call 检查器",
 		"inspect": "检查 Tool Call",
@@ -510,7 +533,7 @@
 		"copyInput": "复制输入",
 		"copyOutput": "复制输出",
 		"loadFailed": "加载 Tool Call 详情失败",
-		"duration": "耗时 {{ms}}ms",
+		"duration": "耗时 {{duration}}",
 		"timing": {
 			"title": "时间线",
 			"streamStarted": "工具开始流式输出",

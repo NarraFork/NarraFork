@@ -41,6 +41,8 @@ import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import { BLOCK_ID_ATTR, NestedBlockCtx, useMessageSelection } from "./MessageSelectionCtx";
 import { useRenderLod } from "./RenderLodCtx";
 
+const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
+
 export type CodeContentType = "markdown" | "code" | "diff";
 
 interface ContentViewerEnvironment {
@@ -565,6 +567,7 @@ export const ContentViewer = memo(
 									zIndex: 1000,
 									transition: swipe.swipeMenuTransition,
 									pointerEvents: swipe.swipeClosing ? "none" : "auto",
+									opacity: swipe.swipeClosing ? 0 : 1,
 								}}
 							>
 								<Menu opened withinPortal={false} position="bottom-start">
@@ -796,6 +799,7 @@ export const ContentViewer = memo(
 						onChange={swipe.setCtxMenuOpened}
 						position="bottom-start"
 						withinPortal
+						transitionProps={FIXED_MENU_TRANSITION_PROPS}
 						styles={{
 							dropdown: {
 								position: "fixed",

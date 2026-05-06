@@ -1,5 +1,5 @@
 import type { EventEmitter } from "node:events";
-import type { PermissionResult } from "../lib/agent";
+import type { PermissionResult, ReasoningEffort } from "../lib/agent";
 import { hotSafe } from "../lib/hot-safe";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
@@ -12,8 +12,16 @@ export interface ActiveNarrator {
 	narratorId: string;
 	conversationId: string;
 	cwd: string;
+	/** Raw model reference stored on the narrator, e.g. __default__ or __agg__:id. */
+	_modelRef?: string;
 	model: string;
 	provider: string;
+	/** Settings revision used to derive `_modelRef` / `_reasoningEffortRef` into runtime values. */
+	_settingsRevision?: number;
+	/** Raw narrator reasoning effort override from DB. Null/undefined means follow provider/global default. */
+	_reasoningEffortRef?: ReasoningEffort | null;
+	/** Runtime reasoning effort to apply before the next model request. Null/undefined means use provider default. */
+	reasoningEffort?: ReasoningEffort | null;
 	systemPrompt: string | null;
 	events: EventEmitter;
 	alive: boolean;
@@ -68,6 +76,8 @@ export interface ActiveNarrator {
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;
+	/** Soft-stop flag: set when a priority buffered message should run after current tools finish. */
+	_bufferSoftStop?: boolean;
 	/** Set once interrupted cleanup has run for the current agent-loop iteration. */
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
@@ -127,6 +137,8 @@ export interface BufferedMessage {
 	commandText?: string | null;
 	createdBy?: string | null;
 	creator?: BufferCreator | null;
+	/** True when this queued message was inserted with priority/cut-in-line semantics. */
+	priority?: boolean;
 	/** Paths of text files persisted to disk (for DB recovery). */
 	_savedFiles?: SavedBufferedFile[];
 }
@@ -197,6 +209,10 @@ export interface PendingDangerReflection {
 		details?: string[];
 	};
 	startedAt: number;
+	/** Abort controller for the bounded automatic reflection loop only. */
+	reflectionAbortController?: AbortController;
+	/** True when the user stopped the automatic reflection loop but left permission pending. */
+	reflectionStoppedByUser?: boolean;
 	resolve: (result: PermissionResult) => void;
 	cleanup: () => void;
 }
