@@ -133,9 +133,16 @@ export const codexUsageQueue = {
 	/** Add a single credential to the queue. */
 	enqueue(credentialId: string) {
 		// Skip if already queued (pending or processing)
-		if (items.some((it) => it.credentialId === credentialId && it.status === "pending")) {
+		if (
+			items.some(
+				(it) =>
+					it.credentialId === credentialId &&
+					(it.status === "pending" || it.status === "processing"),
+			)
+		) {
 			return;
 		}
+
 		items.push({
 			id: generateShortId(),
 			credentialId,
@@ -150,8 +157,11 @@ export const codexUsageQueue = {
 	/** Add multiple credentials to the queue at once. */
 	enqueueMany(credentialIds: string[]) {
 		const pendingSet = new Set(
-			items.filter((it) => it.status === "pending").map((it) => it.credentialId),
+			items
+				.filter((it) => it.status === "pending" || it.status === "processing")
+				.map((it) => it.credentialId),
 		);
+
 		let enqueued = 0;
 		for (const cid of credentialIds) {
 			if (pendingSet.has(cid)) continue;

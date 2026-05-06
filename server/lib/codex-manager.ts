@@ -14,6 +14,13 @@ import {
 } from "./codex-auth";
 import { type CodexUsageResult, fetchCodexUsage } from "./codex-usage";
 import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
+import {
+	buildCodexUsageForecast,
+	buildCodexUsageSummary,
+	type CodexUsageForecast,
+	type CodexUsageSummary,
+	getScheduledUsageResetAt,
+} from "./codex-usage-summary";
 import { generateShortId } from "./id";
 import { logger } from "./logger";
 
@@ -25,6 +32,9 @@ const CREDENTIALS_FILE = "codex-credentials.json";
 const STATS_FILE = "codex-stats.json";
 const SESSION_AFFINITY_TTL_MS = 6 * 60 * 60_000; // 6h
 const MAX_SESSION_AFFINITY_ENTRIES = 2_000;
+const USAGE_RESET_REFRESH_GRACE_MS = 1_000;
+const USAGE_RESET_RETRY_DELAY_MS = 5 * 60_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 // === Types ===
 
@@ -72,6 +82,13 @@ export interface CredentialSnapshot {
 	usage?: CodexUsageResult;
 }
 
+export interface UsageSchedulerSnapshot {
+	nextRunAt?: number;
+	scheduledCredentialCount: number;
+	dueCredentialCount: number;
+	started: boolean;
+}
+
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
 	availableEntries: CredentialSnapshot[];
@@ -84,6 +101,9 @@ export interface ManagerSnapshot {
 	available: number;
 	stickySessionCount: number;
 	usageCache: Record<string, CodexUsageResult>;
+	usageSummary: CodexUsageSummary;
+	usageForecast: CodexUsageForecast;
+	usageScheduler: UsageSchedulerSnapshot;
 	usageQueue?: UsageQueueSnapshot;
 	/** Last browser OAuth error message (cleared on success). */
 	lastBrowserAuthError?: string;
@@ -157,6 +177,10 @@ export class CodexManager {
 	private readonly beforeExitHandler: () => void;
 	/** Exposed via snapshot so the frontend can show browser-auth errors. */
 	private _lastBrowserAuthError?: string;
+	private usageSchedulerTimer?: ReturnType<typeof setTimeout>;
+	private usageSchedulerStarted = false;
+	private usageSchedulerNextRunAt?: number;
+	private usageSchedulerRetryAfter = new Map<string, number>();
 
 	constructor(private readonly options?: { homeDir?: string; registerProcessHooks?: boolean }) {
 		this.entries = [];
@@ -176,6 +200,7 @@ export class CodexManager {
 	}
 
 	dispose(): void {
+		this.stopUsageRefreshScheduler();
 		process.off("beforeExit", this.beforeExitHandler);
 	}
 
@@ -372,6 +397,7 @@ export class CodexManager {
 		}
 
 		this.saveStatsDebounced();
+		this.rescheduleUsageRefresh();
 		return this.entries.some((e) => !e.disabled);
 	}
 
@@ -391,6 +417,7 @@ export class CodexManager {
 		}
 
 		this.saveStatsDebounced();
+		this.rescheduleUsageRefresh();
 		return this.entries.some((e) => !e.disabled);
 	}
 
@@ -430,8 +457,127 @@ export class CodexManager {
 		if (changed) {
 			this.saveCredentials();
 			this.saveStatsDebounced();
+			this.rescheduleUsageRefresh();
 		}
 		return changed;
+	}
+
+	// ==================== Usage Reset Scheduler ====================
+
+	startUsageRefreshScheduler(): void {
+		if (this.usageSchedulerStarted) return;
+		this.usageSchedulerStarted = true;
+		this.rescheduleUsageRefresh();
+	}
+
+	stopUsageRefreshScheduler(): void {
+		this.usageSchedulerStarted = false;
+		if (this.usageSchedulerTimer) {
+			clearTimeout(this.usageSchedulerTimer);
+			this.usageSchedulerTimer = undefined;
+		}
+		this.usageSchedulerNextRunAt = undefined;
+	}
+
+	private shouldTrackUsageReset(entry: CodexCredential): boolean {
+		if (entry.disabledReason === "manual" || entry.disabledReason === "too_many_failures") {
+			return false;
+		}
+		return !entry.disabled || entry.disabledReason === "quota_exhausted";
+	}
+
+	private getCredentialUsageResetAt(entry: CodexCredential): number | undefined {
+		if (entry.disabledReason === "quota_exhausted" && entry.quotaResetsAt) {
+			return entry.quotaResetsAt;
+		}
+		return getScheduledUsageResetAt(entry.usage);
+	}
+
+	private getUsageRefreshSchedule(now = Date.now()): {
+		nextRunAt?: number;
+		scheduledCredentialCount: number;
+		dueCredentialIds: string[];
+	} {
+		let nextRunAt: number | undefined;
+		let scheduledCredentialCount = 0;
+		const dueCredentialIds: string[] = [];
+
+		for (const entry of this.entries) {
+			if (!this.shouldTrackUsageReset(entry)) continue;
+			const resetAt = this.getCredentialUsageResetAt(entry);
+			if (!resetAt) continue;
+
+			scheduledCredentialCount++;
+			if (resetAt > now) {
+				this.usageSchedulerRetryAfter.delete(entry.id);
+				nextRunAt = Math.min(nextRunAt ?? resetAt, resetAt);
+				continue;
+			}
+
+			const retryAfter = this.usageSchedulerRetryAfter.get(entry.id);
+			if (retryAfter && retryAfter > now) {
+				nextRunAt = Math.min(nextRunAt ?? retryAfter, retryAfter);
+				continue;
+			}
+
+			dueCredentialIds.push(entry.id);
+		}
+
+		return { nextRunAt, scheduledCredentialCount, dueCredentialIds };
+	}
+
+	private rescheduleUsageRefresh(): void {
+		if (!this.usageSchedulerStarted) return;
+		if (this.usageSchedulerTimer) {
+			clearTimeout(this.usageSchedulerTimer);
+			this.usageSchedulerTimer = undefined;
+		}
+
+		const now = Date.now();
+		const schedule = this.getUsageRefreshSchedule(now + USAGE_RESET_REFRESH_GRACE_MS);
+		const nextRunAt = schedule.dueCredentialIds.length > 0 ? now : schedule.nextRunAt;
+		this.usageSchedulerNextRunAt = nextRunAt;
+
+		if (!nextRunAt) return;
+
+		const delay =
+			schedule.dueCredentialIds.length > 0
+				? 0
+				: Math.max(0, nextRunAt - now + USAGE_RESET_REFRESH_GRACE_MS);
+		this.usageSchedulerTimer = setTimeout(
+			() => this.handleScheduledUsageRefresh(),
+			Math.min(delay, MAX_TIMER_DELAY_MS),
+		);
+		(this.usageSchedulerTimer as { unref?: () => void }).unref?.();
+	}
+
+	private handleScheduledUsageRefresh(): void {
+		this.usageSchedulerTimer = undefined;
+		const now = Date.now();
+		const schedule = this.getUsageRefreshSchedule(now + USAGE_RESET_REFRESH_GRACE_MS);
+		const dueCredentialIds = schedule.dueCredentialIds;
+
+		if (dueCredentialIds.length > 0) {
+			for (const id of dueCredentialIds) {
+				this.usageSchedulerRetryAfter.set(id, now + USAGE_RESET_RETRY_DELAY_MS);
+			}
+			codexUsageQueue.enqueueMany(dueCredentialIds);
+			logger.info("Scheduled Codex usage refresh for reset credentials", {
+				count: dueCredentialIds.length,
+			});
+		}
+
+		this.rescheduleUsageRefresh();
+	}
+
+	private getUsageSchedulerSnapshot(): UsageSchedulerSnapshot {
+		const schedule = this.getUsageRefreshSchedule();
+		return {
+			nextRunAt: this.usageSchedulerNextRunAt ?? schedule.nextRunAt,
+			scheduledCredentialCount: schedule.scheduledCredentialCount,
+			dueCredentialCount: schedule.dueCredentialIds.length,
+			started: this.usageSchedulerStarted,
+		};
 	}
 
 	// ==================== Admin API ====================
@@ -484,6 +630,8 @@ export class CodexManager {
 			if (snap.usage) usageCacheObj[snap.id] = snap.usage;
 		}
 
+		const now = Date.now();
+
 		return {
 			entries: allPagedEntries,
 			availableEntries: availableSnapshots,
@@ -496,6 +644,9 @@ export class CodexManager {
 			available: allAvailable.length,
 			stickySessionCount: this.sessionAffinity.size,
 			usageCache: usageCacheObj,
+			usageSummary: buildCodexUsageSummary(this.entries, now),
+			usageForecast: buildCodexUsageForecast(this.entries, now),
+			usageScheduler: this.getUsageSchedulerSnapshot(),
 			usageQueue: codexUsageQueue.getSnapshot(),
 			lastBrowserAuthError: this._lastBrowserAuthError,
 		};
@@ -522,6 +673,7 @@ export class CodexManager {
 			this.evictSessionsByCredential(id);
 		}
 		this.saveCredentials();
+		this.rescheduleUsageRefresh();
 	}
 
 	setPriority(id: string, priority: number): void {
@@ -540,6 +692,7 @@ export class CodexManager {
 		const stats = this.stats.get(id);
 		if (stats) stats.failureCount = 0;
 		this.saveCredentials();
+		this.rescheduleUsageRefresh();
 	}
 
 	removeCredential(id: string): void {
@@ -548,12 +701,14 @@ export class CodexManager {
 		this.entries.splice(idx, 1);
 		this.stats.delete(id);
 		this.usageRefreshPromises.delete(id);
+		this.usageSchedulerRetryAfter.delete(id);
 		this.evictSessionsByCredential(id);
 		if (this.currentId === id && this.entries.length > 0) {
 			this.currentId = this.entries[0].id;
 		}
 		this.saveCredentials();
 		this.saveStats();
+		this.rescheduleUsageRefresh();
 	}
 
 	removeCredentials(ids: string[]): { removed: string[]; notFound: string[] } {
@@ -568,6 +723,7 @@ export class CodexManager {
 			this.entries.splice(idx, 1);
 			this.stats.delete(id);
 			this.usageRefreshPromises.delete(id);
+			this.usageSchedulerRetryAfter.delete(id);
 			this.evictSessionsByCredential(id);
 			removed.push(id);
 		}
@@ -581,6 +737,7 @@ export class CodexManager {
 		if (removed.length > 0) {
 			this.saveCredentials();
 			this.saveStats();
+			this.rescheduleUsageRefresh();
 		}
 		return { removed, notFound };
 	}
@@ -726,6 +883,18 @@ export class CodexManager {
 		return { exhausted: true, resetsAt };
 	}
 
+	private clearQuotaExhaustedIfRecovered(id: string, entry: CodexCredential): boolean {
+		if (entry.disabledReason !== "quota_exhausted") return false;
+		entry.disabled = false;
+		entry.disabledReason = undefined;
+		entry.quotaResetsAt = undefined;
+		const stats = this.stats.get(id);
+		if (stats) stats.failureCount = 0;
+		this.saveCredentials();
+		this.saveStatsDebounced();
+		return true;
+	}
+
 	private async refreshUsage(id: string): Promise<CodexUsageResult> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
@@ -762,7 +931,11 @@ export class CodexManager {
 		const quotaState = this.evaluateQuotaFromUsage(usage);
 		if (quotaState.exhausted) {
 			this.reportQuotaExhausted(id, quotaState.resetsAt);
+		} else {
+			this.clearQuotaExhaustedIfRecovered(id, entry);
 		}
+		this.usageSchedulerRetryAfter.delete(id);
+		this.rescheduleUsageRefresh();
 
 		return usage;
 	}
@@ -832,6 +1005,7 @@ export class CodexManager {
 				existing.disabledReason = undefined;
 			}
 			this.saveCredentials();
+			this.rescheduleUsageRefresh();
 			return existing;
 		}
 
@@ -859,6 +1033,7 @@ export class CodexManager {
 
 		this.saveCredentials();
 		codexUsageQueue.enqueue(cred.id);
+		this.rescheduleUsageRefresh();
 		return cred;
 	}
 
@@ -904,6 +1079,7 @@ export class CodexManager {
 			// Enqueue usage fetch for newly added credentials via serial queue
 			const newIds = this.entries.filter((e) => !e.usage).map((e) => e.id);
 			codexUsageQueue.enqueueMany(newIds);
+			this.rescheduleUsageRefresh();
 		}
 
 		return { added, duplicates, skipped };

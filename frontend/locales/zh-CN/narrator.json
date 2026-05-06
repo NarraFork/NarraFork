@@ -180,6 +180,7 @@
 	"contextMenu_edit": "编辑消息",
 	"contextMenu_jumpToSource": "跳转到来源叙述者",
 	"contextMenu_viewFile": "查看该文件",
+	"contextMenu_copyFilePath": "复制文件路径",
 	"contextMenu_askInPassing": "顺便提问",
 	"askInPassing_placeholder": "输入你的问题...",
 	"askInPassing_hint": "从此处创建分叉并发送新提问",

@@ -10,6 +10,7 @@ import {
 	Paper,
 	Progress,
 	SegmentedControl,
+	SimpleGrid,
 	Stack,
 	Switch,
 	Table,
@@ -32,6 +33,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import type {
+	CodexPlanTier,
+	CodexUsageForecast,
+	CodexUsageSchedulerSnapshot,
+	CodexUsageSummary,
+} from "../../lib/api/types";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -56,6 +63,21 @@ interface CodexImportCredential {
 
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
+const CODEX_DISPLAY_TIERS: CodexPlanTier[] = ["free", "plus", "prolite", "pro"];
+const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
+	free: "gray",
+	plus: "blue",
+	prolite: "violet",
+	pro: "green",
+	other: "dark",
+};
+const CODEX_TIER_STROKES: Record<CodexPlanTier, string> = {
+	free: "var(--mantine-color-gray-6)",
+	plus: "var(--mantine-color-blue-6)",
+	prolite: "var(--mantine-color-violet-6)",
+	pro: "var(--mantine-color-green-6)",
+	other: "var(--mantine-color-dark-4)",
+};
 
 function normalizeRefreshToken(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -782,6 +804,14 @@ export const CodexSection = React.memo(function CodexSection({
 				</Paper>
 			)}
 
+			{status?.usageSummary && status?.usageForecast && status?.usageScheduler && (
+				<CodexQuotaOverview
+					summary={status.usageSummary}
+					forecast={status.usageForecast}
+					scheduler={status.usageScheduler}
+				/>
+			)}
+
 			{/* Credentials list (responsive: cards on mobile, table on desktop) */}
 			{(status?.total ?? 0) > 0 && (
 				<Stack gap="xs">
@@ -939,6 +969,265 @@ export const CodexSection = React.memo(function CodexSection({
 		</Stack>
 	);
 });
+
+function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
+	if (tier === "free") return t("codexQuotaTierFree");
+	if (tier === "plus") return t("codexQuotaTierPlus");
+	if (tier === "prolite") return t("codexQuotaTierProLite");
+	if (tier === "pro") return t("codexQuotaTierPro");
+	return t("codexQuotaTierOther");
+}
+
+function formatAccountEquivalent(value: number): string {
+	return new Intl.NumberFormat(undefined, {
+		minimumFractionDigits: 0,
+		maximumFractionDigits: 2,
+	}).format(value);
+}
+
+function formatResetTimestamp(timestamp?: number): string {
+	if (!timestamp) return "-";
+	return relativeTime(new Date(timestamp).toISOString());
+}
+
+function formatChartTimestamp(timestamp: number): string {
+	return new Date(timestamp).toLocaleString(undefined, {
+		month: "short",
+		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
+
+function CodexQuotaOverview({
+	summary,
+	forecast,
+	scheduler,
+}: {
+	summary: CodexUsageSummary;
+	forecast: CodexUsageForecast;
+	scheduler: CodexUsageSchedulerSnapshot;
+}) {
+	const { t } = useTranslation("settings");
+
+	return (
+		<Paper withBorder p="sm">
+			<Stack gap="sm">
+				<Group justify="space-between" align="flex-start">
+					<Stack gap={2}>
+						<Text size="sm" fw={500}>
+							{t("codexQuotaOverviewTitle")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexQuotaOverviewDesc", {
+								known: summary.totalKnownUsageAccounts,
+								missing: summary.missingUsageAccounts,
+							})}
+						</Text>
+					</Stack>
+					<Stack gap={2} align="flex-end">
+						<Badge size="sm" color={scheduler.started ? "green" : "gray"} variant="light">
+							{scheduler.started ? t("codexQuotaSchedulerOn") : t("codexQuotaSchedulerOff")}
+						</Badge>
+						<Text size="xs" c="dimmed">
+							{scheduler.nextRunAt
+								? t("codexQuotaSchedulerNext", {
+										when: formatResetTimestamp(scheduler.nextRunAt),
+									})
+								: t("codexQuotaSchedulerIdle")}
+						</Text>
+					</Stack>
+				</Group>
+
+				<SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }} spacing="xs">
+					{CODEX_DISPLAY_TIERS.map((tier) => {
+						const stat = summary.byTier[tier];
+						const average = stat.averageRemainingPercent ?? 0;
+						return (
+							<Paper key={tier} withBorder p="xs">
+								<Stack gap={6}>
+									<Group justify="space-between" wrap="nowrap">
+										<Badge color={CODEX_TIER_COLORS[tier]} variant="light">
+											{getCodexTierLabel(t, tier)}
+										</Badge>
+										<Text size="xs" c="dimmed">
+											{t("codexQuotaAccounts", { count: stat.accountCount })}
+										</Text>
+									</Group>
+									<Text size="lg" fw={700}>
+										{formatAccountEquivalent(stat.remainingAccountEquivalents)}{" "}
+										<Text span size="xs" c="dimmed" fw={400}>
+											{t("codexQuotaAccountEquivalent")}
+										</Text>
+									</Text>
+									<Progress value={average} size="xs" color={CODEX_TIER_COLORS[tier]} />
+									<Group justify="space-between" gap="xs">
+										<Text size="xs" c="dimmed">
+											{t("codexQuotaAverageRemaining")}: {average.toFixed(1)}%
+										</Text>
+										<Text size="xs" c="dimmed">
+											{t("codexQuotaKnown", { count: stat.knownUsageCount })}
+										</Text>
+									</Group>
+									<Text size="xs" c="dimmed">
+										{stat.nextResetAt
+											? t("codexQuotaNextReset", {
+													when: formatResetTimestamp(stat.nextResetAt),
+												})
+											: t("codexQuotaNoResetScheduled")}
+									</Text>
+									{stat.zeroUsageCount > 0 && (
+										<Text size="xs" c="dimmed">
+											{t("codexQuotaZeroUsage", { count: stat.zeroUsageCount })}
+										</Text>
+									)}
+								</Stack>
+							</Paper>
+						);
+					})}
+				</SimpleGrid>
+
+				<Stack gap="xs">
+					<Group justify="space-between">
+						<Text size="sm" fw={500}>
+							{t("codexQuotaForecastTitle")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexQuotaForecastUnit")}
+						</Text>
+					</Group>
+					<CodexQuotaForecastChart forecast={forecast} />
+				</Stack>
+			</Stack>
+		</Paper>
+	);
+}
+
+function CodexQuotaForecastChart({ forecast }: { forecast: CodexUsageForecast }) {
+	const { t } = useTranslation("settings");
+	const points = forecast.points;
+	const width = 680;
+	const height = 190;
+	const padding = { left: 42, right: 16, top: 14, bottom: 34 };
+	const chartWidth = width - padding.left - padding.right;
+	const chartHeight = height - padding.top - padding.bottom;
+	const visibleTiers = CODEX_DISPLAY_TIERS.filter((tier) => forecast.tiers.includes(tier));
+	const maxValue = Math.max(
+		1,
+		...points.flatMap((point) => visibleTiers.map((tier) => point.byTier[tier] ?? 0)),
+	);
+	const minTime = points[0]?.timestamp ?? Date.now();
+	const maxTime = points[points.length - 1]?.timestamp ?? minTime;
+	const hasChartData = points.length >= 2;
+
+	if (!hasChartData) {
+		return (
+			<Paper withBorder p="sm">
+				<Text size="xs" c="dimmed" ta="center">
+					{t("codexQuotaForecastEmpty")}
+				</Text>
+			</Paper>
+		);
+	}
+
+	const xFor = (timestamp: number) => {
+		if (maxTime === minTime) return padding.left + chartWidth / 2;
+		return padding.left + ((timestamp - minTime) / (maxTime - minTime)) * chartWidth;
+	};
+	const yFor = (value: number) => padding.top + chartHeight - (value / maxValue) * chartHeight;
+	const buildPolyline = (tier: CodexPlanTier) =>
+		points.map((point) => `${xFor(point.timestamp)},${yFor(point.byTier[tier] ?? 0)}`).join(" ");
+
+	return (
+		<Stack gap="xs">
+			<svg
+				viewBox={`0 0 ${width} ${height}`}
+				role="img"
+				aria-label={t("codexQuotaForecastTitle")}
+				style={{ width: "100%", height: 220 }}
+			>
+				<line
+					x1={padding.left}
+					y1={padding.top}
+					x2={padding.left}
+					y2={padding.top + chartHeight}
+					stroke="var(--mantine-color-gray-4)"
+				/>
+				<line
+					x1={padding.left}
+					y1={padding.top + chartHeight}
+					x2={padding.left + chartWidth}
+					y2={padding.top + chartHeight}
+					stroke="var(--mantine-color-gray-4)"
+				/>
+				<text x={padding.left - 8} y={padding.top + 4} textAnchor="end" fontSize="10" fill="gray">
+					{formatAccountEquivalent(maxValue)}
+				</text>
+				<text
+					x={padding.left - 8}
+					y={padding.top + chartHeight}
+					textAnchor="end"
+					fontSize="10"
+					fill="gray"
+				>
+					0
+				</text>
+				<text x={padding.left} y={height - 8} textAnchor="start" fontSize="10" fill="gray">
+					{formatChartTimestamp(minTime)}
+				</text>
+				<text
+					x={padding.left + chartWidth}
+					y={height - 8}
+					textAnchor="end"
+					fontSize="10"
+					fill="gray"
+				>
+					{formatChartTimestamp(maxTime)}
+				</text>
+				{visibleTiers.map((tier) => (
+					<polyline
+						key={tier}
+						points={buildPolyline(tier)}
+						fill="none"
+						stroke={CODEX_TIER_STROKES[tier]}
+						strokeWidth={2}
+						strokeLinejoin="round"
+						strokeLinecap="round"
+					/>
+				))}
+				{points.map((point) => (
+					<line
+						key={point.timestamp}
+						x1={xFor(point.timestamp)}
+						y1={padding.top}
+						x2={xFor(point.timestamp)}
+						y2={padding.top + chartHeight}
+						stroke="var(--mantine-color-gray-3)"
+						strokeDasharray="3 4"
+					/>
+				))}
+			</svg>
+			<Group gap="xs" wrap="wrap">
+				{visibleTiers.map((tier) => (
+					<Group key={tier} gap={4}>
+						<span
+							style={{
+								width: 10,
+								height: 10,
+								borderRadius: 999,
+								background: CODEX_TIER_STROKES[tier],
+								display: "inline-block",
+							}}
+						/>
+						<Text size="xs" c="dimmed">
+							{getCodexTierLabel(t, tier)}
+						</Text>
+					</Group>
+				))}
+			</Group>
+		</Stack>
+	);
+}
 
 // Credential list wrapper (responsive)
 function CredentialList(props: {

@@ -180,6 +180,7 @@
 	"contextMenu_edit": "Edit message",
 	"contextMenu_jumpToSource": "Jump to source narrator",
 	"contextMenu_viewFile": "View this file",
+	"contextMenu_copyFilePath": "Copy file path",
 	"contextMenu_askInPassing": "Ask in passing",
 	"askInPassing_placeholder": "Type your question...",
 	"askInPassing_hint": "Fork from here and send a new question",

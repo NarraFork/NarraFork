@@ -4320,7 +4320,14 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
 
 	// --- File preview modal state ---
-	const readFilePath = toolCall.toolName === "Read" ? getFilePath(toolCall.inputJson) : "";
+	const inputFilePath = getFilePath(toolCall.inputJson);
+	const streamingFilePath =
+		typeof toolCall.inputJson?._streamingFilePath === "string"
+			? toolCall.inputJson._streamingFilePath
+			: "";
+	const fileMenuPath = FILE_TOOLS.has(toolCall.toolName) ? inputFilePath || streamingFilePath : "";
+	const readFilePath = toolCall.toolName === "Read" ? fileMenuPath : "";
+	const filePathClipboard = useClipboard({ timeout: 1500 });
 	const [previewOpened, setPreviewOpened] = useState(false);
 	const [inspectorOpened, setInspectorOpened] = useState(false);
 
@@ -4328,17 +4335,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const hasMessageActions = !!(
+		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
+		msgCtx.onCompactBeforeMessage ||
+		(msgCtx.onRollbackToBlock && blockIndex != null) ||
+		(msgCtx.onDeleteBlock && blockIndex != null)
+	);
 	const hasActions =
-		interactionEnabled &&
-		!!(
-			toolCall.toolUseId ||
-			readFilePath ||
-			msgCtx.onForkFromMessage ||
-			msgCtx.onAskInPassing ||
-			msgCtx.onCompactBeforeMessage ||
-			(msgCtx.onRollbackToBlock && blockIndex != null) ||
-			(msgCtx.onDeleteBlock && blockIndex != null)
-		);
+		interactionEnabled && !!(toolCall.toolUseId || fileMenuPath || hasMessageActions);
 
 	// --- Swipe & context-menu state ---
 	const tcBlockId = toolCall.toolUseId ? `tc-${toolCall.toolUseId}` : undefined;
@@ -4390,7 +4395,18 @@ export const ToolCallCard = memo(function ToolCallCard({
 					{tNarrator("toolCallInspector.inspect")}
 				</Menu.Item>
 			)}
-			{toolCall.toolUseId && readFilePath && <Menu.Divider />}
+			{toolCall.toolUseId && fileMenuPath && <Menu.Divider />}
+			{fileMenuPath && (
+				<Menu.Item
+					leftSection={filePathClipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+					onClick={() => {
+						filePathClipboard.copy(fileMenuPath);
+						swipe.closeSwipe();
+					}}
+				>
+					{filePathClipboard.copied ? tc("copied") : tNarrator("contextMenu_copyFilePath")}
+				</Menu.Item>
+			)}
 			{readFilePath && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
@@ -4402,12 +4418,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					{tNarrator("contextMenu_viewFile")}
 				</Menu.Item>
 			)}
-			{readFilePath &&
-				(msgCtx.onForkFromMessage ||
-					msgCtx.onAskInPassing ||
-					msgCtx.onCompactBeforeMessage ||
-					(msgCtx.onRollbackToBlock && blockIndex != null) ||
-					(msgCtx.onDeleteBlock && blockIndex != null)) && <Menu.Divider />}
+			{fileMenuPath && hasMessageActions && <Menu.Divider />}
 			{msgCtx.onRollbackToBlock && blockIndex != null && (
 				<Menu.Item
 					leftSection={<IconArrowBackUp size={14} />}

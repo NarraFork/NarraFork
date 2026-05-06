@@ -353,6 +353,8 @@ export interface PaginatedMessages {
 	prunedPercent?: number | null;
 }
 
+export type CodexPlanTier = "free" | "plus" | "prolite" | "pro" | "other";
+
 export interface CodexUsageWindow {
 	used_percent: number;
 	remaining_percent: number;
@@ -387,4 +389,45 @@ export interface CodexCredentialEntry {
 	lastUsedAt?: string;
 	expiresAt?: number;
 	usage?: CodexUsageData;
+}
+
+export interface CodexUsageTierStats {
+	tier: CodexPlanTier;
+	accountCount: number;
+	knownUsageCount: number;
+	zeroUsageCount: number;
+	scheduledAccountCount: number;
+	remainingAccountEquivalents: number;
+	averageRemainingPercent: number | null;
+	nextResetAt?: number;
+}
+
+export interface CodexUsageSummary {
+	generatedAt: string;
+	totalTrackedAccounts: number;
+	totalKnownUsageAccounts: number;
+	missingUsageAccounts: number;
+	zeroUsageAccounts: number;
+	scheduledAccountCount: number;
+	nextResetAt?: number;
+	byTier: Record<CodexPlanTier, CodexUsageTierStats>;
+}
+
+export interface CodexUsageForecastPoint {
+	timestamp: number;
+	byTier: Record<CodexPlanTier, number>;
+}
+
+export interface CodexUsageForecast {
+	generatedAt: string;
+	points: CodexUsageForecastPoint[];
+	tiers: CodexPlanTier[];
+	unit: "account_equivalent";
+}
+
+export interface CodexUsageSchedulerSnapshot {
+	nextRunAt?: number;
+	scheduledCredentialCount: number;
+	dueCredentialCount: number;
+	started: boolean;
 }
