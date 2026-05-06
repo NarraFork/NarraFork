@@ -3,21 +3,31 @@ import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrat
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
-function hasDangerReflectionSuggestion(suggestions: unknown[] | null | undefined): boolean {
-	return Array.isArray(suggestions)
-		? suggestions.some((suggestion) => {
-				if (!suggestion || typeof suggestion !== "object") return false;
-				const type = String((suggestion as { type?: unknown }).type ?? "");
-				return type === "danger_reflection" || type === "yolo_reflection";
-			})
-		: false;
+function getDangerReflectionStatus(suggestions: unknown[] | null | undefined): string | null {
+	if (!Array.isArray(suggestions)) return null;
+	for (const suggestion of suggestions) {
+		if (!suggestion || typeof suggestion !== "object") continue;
+		const record = suggestion as { type?: unknown; status?: unknown };
+		const type = String(record.type ?? "");
+		if (type === "danger_reflection" || type === "yolo_reflection") {
+			return typeof record.status === "string" ? record.status : "running";
+		}
+	}
+	return null;
 }
 
 export function isDangerReflectionPermissionLike(value: {
 	suggestions?: unknown[] | null;
 	permissionSuggestions?: unknown[] | null;
 }): boolean {
-	return hasDangerReflectionSuggestion(value.suggestions ?? value.permissionSuggestions);
+	return getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions) !== null;
+}
+
+export function isRunningDangerReflectionPermissionLike(value: {
+	suggestions?: unknown[] | null;
+	permissionSuggestions?: unknown[] | null;
+}): boolean {
+	return getDangerReflectionStatus(value.suggestions ?? value.permissionSuggestions) === "running";
 }
 
 // Re-export functions that moved to message-segments.ts for backward compatibility
@@ -48,8 +58,14 @@ export function resolvePendingPerm(
 	// Fallback: build from the tool call record itself (status-driven path,
 	// e.g. page refresh before WS reconnects or getPendingPermissions resolves).
 	// Danger reflection also stores a pending tool-call row while the internal
-	// reflection loop decides, but it is not an actionable user permission request.
-	if (!perm && tc.status === "pending" && tc.toolUseId && !isDangerReflectionPermissionLike(tc)) {
+	// reflection loop decides. It is actionable only while the reflection is still running;
+	// after it resolves, the historical notice must not keep approval controls alive.
+	if (
+		!perm &&
+		tc.status === "pending" &&
+		tc.toolUseId &&
+		(!isDangerReflectionPermissionLike(tc) || isRunningDangerReflectionPermissionLike(tc))
+	) {
 		perm = {
 			id: tc.id ?? tc.toolUseId,
 			toolName: tc.toolName,

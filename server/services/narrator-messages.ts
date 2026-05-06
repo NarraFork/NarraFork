@@ -13,13 +13,22 @@ import {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
-function hasDangerReflectionSuggestion(suggestions: unknown): boolean {
-	if (!Array.isArray(suggestions)) return false;
-	return suggestions.some((suggestion) => {
-		if (!suggestion || typeof suggestion !== "object") return false;
-		const type = String((suggestion as { type?: unknown }).type ?? "");
-		return type === "danger_reflection" || type === "yolo_reflection";
-	});
+function getDangerReflectionStatus(suggestions: unknown): string | null {
+	if (!Array.isArray(suggestions)) return null;
+	for (const suggestion of suggestions) {
+		if (!suggestion || typeof suggestion !== "object") continue;
+		const record = suggestion as { type?: unknown; status?: unknown };
+		const type = String(record.type ?? "");
+		if (type === "danger_reflection" || type === "yolo_reflection") {
+			return typeof record.status === "string" ? record.status : "running";
+		}
+	}
+	return null;
+}
+
+function isResolvedDangerReflection(suggestions: unknown): boolean {
+	const status = getDangerReflectionStatus(suggestions);
+	return status !== null && status !== "running";
 }
 
 /**
@@ -1671,7 +1680,7 @@ export const narratorMessageQueries = {
 			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
 		});
 		return tcs
-			.filter((tc) => !hasDangerReflectionSuggestion(tc.permissionSuggestions))
+			.filter((tc) => !isResolvedDangerReflection(tc.permissionSuggestions))
 			.map((tc) => ({
 				id: tc.id,
 				toolName: tc.toolName,

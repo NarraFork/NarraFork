@@ -22,6 +22,7 @@ import {
 } from "./message-tree-utils";
 import {
 	isDangerReflectionPermissionLike,
+	isRunningDangerReflectionPermissionLike,
 	removeStreamingChunksMsg,
 	revokeContentBlockPreviewUrls,
 } from "./narrator-message-helpers";
@@ -238,7 +239,13 @@ function applyPendingPermissionsToCache(
 	if (!old?.pages?.length || perms.length === 0) return old;
 	let result = old as MessagesQueryData | undefined;
 	for (const perm of perms) {
-		if (!perm.toolUseId || !result || isDangerReflectionPermissionLike(perm)) continue;
+		if (
+			!perm.toolUseId ||
+			!result ||
+			(isDangerReflectionPermissionLike(perm) && !isRunningDangerReflectionPermissionLike(perm))
+		) {
+			continue;
+		}
 		result = mergeFieldsByIndex(result, perm.toolUseId, { status: "pending" }, index) as
 			| MessagesQueryData
 			| undefined;
@@ -2298,7 +2305,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					setPendingPermsMap((prev) => {
 						const next = new Map(prev);
 						for (const p of perms) {
-							if (p.toolUseId && !isDangerReflectionPermissionLike(p)) next.set(p.toolUseId, p);
+							if (
+								p.toolUseId &&
+								(!isDangerReflectionPermissionLike(p) || isRunningDangerReflectionPermissionLike(p))
+							) {
+								next.set(p.toolUseId, p);
+							}
 						}
 						return next;
 					});
@@ -2327,7 +2339,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						setPendingPermsMap((prev) => {
 							const next = new Map(prev);
 							for (const p of perms) {
-								if (p.toolUseId && !isDangerReflectionPermissionLike(p)) next.set(p.toolUseId, p);
+								if (
+									p.toolUseId &&
+									(!isDangerReflectionPermissionLike(p) ||
+										isRunningDangerReflectionPermissionLike(p))
+								) {
+									next.set(p.toolUseId, p);
+								}
 							}
 							return next;
 						});
