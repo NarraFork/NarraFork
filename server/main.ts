@@ -904,51 +904,40 @@ async function performGracefulShutdown(
 		stopHeartbeat();
 		getCodexManager().stopUsageRefreshScheduler();
 		stopContainerProxy();
-
-		// Terminate all WebSocket connections first — this sends TCP RST so the
-		// OS releases the sockets immediately instead of lingering in FIN_WAIT_2
-		// / CLOSE_WAIT. Must happen before _server.stop() which may wait for
-		// graceful close on active connections.
-		closeAllConnections();
-
-		// Run remaining cleanup with a hard timeout so we never hang forever.
-		// On Windows, async cleanup may stall if child processes don't respond.
-		const SHUTDOWN_TIMEOUT_MS = 8_000;
-		await Promise.race([
-			(async () => {
-				await terminalService.shutdownAll();
-				await killAllBashProcesses();
-				chapterCleanup.clearAllTimers();
-				worktreeWatcher.shutdown();
-				projectDbManager.closeAll();
-				await mcpManager.shutdown().catch(() => {});
-				// Close browser pool if it was started
-				await import("./lib/browser/pool")
-					.then(({ closeBrowser }) => closeBrowser())
-					.catch(() => {});
-				// Close Codex WebSocket session cache — active outbound WS
-				// connections keep the event loop alive and delay exit.
-				await import("./lib/agent/codex-websocket")
-					.then(({ clearCodexResponsesWebSocketSessions }) =>
-						clearCodexResponsesWebSocketSessions(),
-					)
-					.catch(() => {});
-				if (!options.skipWindowsProcessTreeKill) {
-					killOwnWindowsChildProcesses();
-				}
-			})(),
-			new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS)),
-		]);
+		await terminalService.shutdownAll();
+		await killAllBashProcesses();
+		chapterCleanup.clearAllTimers();
+		worktreeWatcher.shutdown();
+		projectDbManager.closeAll();
+		await mcpManager.shutdown().catch(() => {});
+		// Close browser pool if it was started
+		await import("./lib/browser/pool")
+			.then(({ closeBrowser }) => closeBrowser())
+			.catch(() => {});
+		// Close Codex WebSocket session cache — active outbound WS
+		// connections keep the event loop alive and delay exit.
+		await import("./lib/agent/codex-websocket")
+			.then(({ clearCodexResponsesWebSocketSessions }) =>
+				clearCodexResponsesWebSocketSessions(),
+			)
+			.catch(() => {});
+		if (!options.skipWindowsProcessTreeKill) {
+			killOwnWindowsChildProcesses();
+		}
 
 		// Mark the main DB clean before reporting graceful shutdown complete.
 		// The update handoff starts the replacement process before this process exits,
 		// so relying on the process "exit" handler is too late for that path.
 		markDatabaseCleanShutdown();
 
-		// Stop the HTTP server — force-close any remaining connections so the
-		// listening socket is released immediately.
+		// Explicitly stop the HTTP server so the port is released immediately.
+		// On Windows, process.exit() alone may not close the socket in time,
+		// leaving a zombie process holding the port.
 		try {
-			_server?.stop(true);
+			// Send close frames to all WS clients first — on Windows, server.stop()
+			// alone may not deliver them, leaving TCP connections in CLOSE_WAIT.
+			closeAllConnections();
+			_server?.stop(options.closeActiveConnections);
 		} catch {
 			// best effort
 		}
