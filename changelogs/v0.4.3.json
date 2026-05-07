@@ -1,0 +1,6 @@
+{
+	"version": "0.4.3",
+	"date": "2026-05-07",
+	"en": "## New Features\n\n- Improved narrator runtime feedback with clearer retry progress, streaming status, and subagent activity indicators.\n- Optimized frontend loading and navigation paths for a smoother app experience.\n- Enhanced Browser session handling so active sessions stay visible and expire more predictably.\n- Improved Codex failover and usage visibility during long-running agent work.\n\n## Bug Fixes\n\n- Retry Codex WebSocket silent disconnects instead of ending the turn quietly.\n- Improved resilience for queued, truncated, and transient provider responses.\n- Fixed several UI edge cases around terminal panels, markdown rendering, recent tabs, and project/routine screens.",
+	"zh-CN": "## 新功能\n\n- 改进叙述者运行时反馈，更清晰展示重试进度、流式状态和子代理活动。\n- 优化前端加载与导航路径，让应用使用更顺滑。\n- 增强 Browser 会话处理，让活跃会话更稳定可见，并更可预测地过期清理。\n- 改进 Codex 故障切换和用量可见性，提升长时间 Agent 工作的可观察性。\n\n## 修复\n\n- 修复 Codex WebSocket silent disconnect 只静默结束、不触发重试的问题。\n- 提升队列中、截断和临时异常的提供商响应恢复能力。\n- 修复终端面板、Markdown 渲染、最近标签页以及项目/例程页面中的若干 UI 边界问题。"
+}
