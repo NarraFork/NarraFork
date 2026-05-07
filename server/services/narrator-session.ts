@@ -3708,7 +3708,7 @@ export {
 	extractToolPaths,
 	handlePermission,
 	isInsideWorktree,
-	resolveAllPendingPermissions,
+	reprocessAllPendingPermissions,
 	resolvePermission,
 	resolvePermissionDecision,
 	resolvePermissionOrDangerReflection,

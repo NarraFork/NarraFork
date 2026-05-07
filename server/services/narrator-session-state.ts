@@ -107,6 +107,9 @@ export interface PendingPermission {
 	toolName: string;
 	toolUseId: string;
 	broadcastTargetId: string;
+	cwd: string;
+	locale: Locale;
+	signal: AbortSignal;
 	planModeSoftDeny?: boolean;
 }
 

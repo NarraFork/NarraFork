@@ -126,6 +126,7 @@ export type NarratorServerMessage =
 			decision?: "allow" | "deny";
 			updatedInput?: Record<string, unknown>;
 			feedbackText?: string;
+			subagentNarratorId?: string;
 	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "goals_set"; narratorId: string; goals: unknown[] }

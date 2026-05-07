@@ -2382,6 +2382,9 @@ export async function handlePermission(
 			toolName,
 			toolUseId,
 			broadcastTargetId: wsTarget,
+			cwd,
+			locale,
+			signal,
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
 		});
 	});
@@ -2859,17 +2862,69 @@ export async function cancelDangerReflection(
 }
 
 /**
- * Auto-approve all pending permission requests for a narrator and its subagents.
+ * Re-run pending permission requests for a narrator and its subagents under the
+ * current permission policy. This is intentionally not a blind approval: when a
+ * user switches to bypassPermissions, the normal permission pipeline still runs
+ * so blacklists, fatal checks, and danger reflection can intercept risky tools.
  */
-export async function resolveAllPendingPermissions(narratorId: string): Promise<number> {
-	const toResolve: string[] = [];
-	for (const [requestId, pending] of pendingPermissions) {
-		if (pending.narratorId === narratorId || pending.broadcastTargetId === narratorId) {
-			toResolve.push(requestId);
-		}
+async function restoreReprocessedPermissionStatus(pending: {
+	narratorId: string;
+	broadcastTargetId: string;
+}): Promise<void> {
+	await narratorService.updateStatus(pending.narratorId, "working").catch(() => {});
+	if (pending.broadcastTargetId !== pending.narratorId) {
+		await narratorService.updateStatus(pending.broadcastTargetId, "working").catch(() => {});
 	}
-	for (const requestId of toResolve) {
-		await resolvePermission(requestId, "allow");
+}
+
+export function reprocessAllPendingPermissions(narratorId: string): number {
+	const toReprocess = [...pendingPermissions.entries()].filter(
+		([, pending]) => pending.narratorId === narratorId || pending.broadcastTargetId === narratorId,
+	);
+
+	for (const [requestId, pending] of toReprocess) {
+		pending.cleanup();
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "permission_resolved",
+			narratorId: pending.broadcastTargetId,
+			requestId,
+			toolUseId: pending.toolUseId,
+			...(pending.narratorId !== pending.broadcastTargetId
+				? { subagentNarratorId: pending.narratorId }
+				: {}),
+		});
+
+		void handlePermission(
+			pending.narratorId,
+			pending.signal,
+			pending.toolName,
+			pending.input,
+			pending.toolUseId,
+			pending.cwd,
+			pending.locale,
+			pending.broadcastTargetId,
+		)
+			.then(async (result) => {
+				if (result.behavior !== "dangerReflection") {
+					await restoreReprocessedPermissionStatus(pending);
+				}
+				pending.resolve(result);
+			})
+			.catch(async (err) => {
+				const message = err instanceof Error ? err.message : String(err);
+				logger.error("Failed to reprocess pending permission", {
+					narratorId: pending.narratorId,
+					requestId,
+					toolName: pending.toolName,
+					error: message,
+				});
+				await restoreReprocessedPermissionStatus(pending);
+				pending.resolve({
+					behavior: "deny",
+					message: `Permission reprocessing failed: ${message}`,
+				});
+			});
 	}
-	return toResolve.length;
+
+	return toReprocess.length;
 }

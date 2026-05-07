@@ -451,8 +451,15 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 
 		migrateTabTypes(tabs);
 
-		// Upsert: merge into existing or insert into the recent order while preserving the pinned zone
-		const idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
+		// Upsert: merge into existing or insert into the recent order while preserving the pinned zone.
+		// Workspace split trees store narrator IDs, but recent tabs for chapter-bound narrators
+		// are represented as chapter tabs (`type: "chapter"`, `id: chapterId`, `narratorId`).
+		// For update-only workspace membership changes, fall back to matching by represented
+		// narrator ID so dragging a chapter's narrator keeps the chapter entry in the workspace.
+		let idx = tabs.findIndex((t) => t.type === tab.type && t.id === tab.id);
+		if (idx < 0 && updateOnly && tab.type === "narrator") {
+			idx = tabs.findIndex((t) => getTabNarratorId(t as Record<string, unknown>) === tab.id);
+		}
 		if (idx >= 0) {
 			if (updateOnly) {
 				// Only merge non-empty fields to avoid overwriting with placeholder values

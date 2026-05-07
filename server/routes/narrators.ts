@@ -137,8 +137,8 @@ import {
 	pushBufferedMessage,
 	removeBufferedMessage,
 	reorderBufferedMessages,
+	reprocessAllPendingPermissions,
 	requestBufferedMessageSoftStop,
-	resolveAllPendingPermissions,
 	resolvePermissionOrDangerReflection,
 	retryLastMessage,
 	rollbackToBlock,
@@ -1336,10 +1336,11 @@ narratorRoutes.patch("/:id/permission-mode", async (c) => {
 	await narratorService.updatePermissionMode(id, permissionMode);
 	await updateNarratorPermissionMode(id, permissionMode);
 
-	// When switching to bypassPermissions, auto-approve all pending permission requests
-	// for this narrator and its subagents so they don't stay stuck waiting.
+	// When switching to bypassPermissions, re-run pending permission requests for
+	// this narrator and its subagents. Do not blindly approve: the normal pipeline
+	// must still detect fatal/blacklisted/dangerous operations and trigger danger reflection.
 	if (permissionMode === "bypassPermissions") {
-		await resolveAllPendingPermissions(id);
+		reprocessAllPendingPermissions(id);
 	}
 
 	return c.json({ ok: true });
