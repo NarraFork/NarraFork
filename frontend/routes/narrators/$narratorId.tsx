@@ -577,6 +577,7 @@ function NarratorDetailPage() {
 					<NarratorPanel
 						key={narratorId}
 						narratorId={narratorId}
+						narrator={narrator}
 						highlightMessageId={highlightMessageId}
 						onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
 						onSendToTerminal={isSubagent ? undefined : handleSendToTerminal}
@@ -633,6 +634,7 @@ function NarratorDetailPage() {
 				<NarratorPanel
 					key={narratorId}
 					narratorId={narratorId}
+					narrator={narrator}
 					highlightMessageId={highlightMessageId}
 					onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
 					onSendToTerminal={

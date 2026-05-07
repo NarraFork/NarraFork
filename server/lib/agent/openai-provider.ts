@@ -699,29 +699,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			body,
 		});
 
-		logger.debug("OpenAI chat request", {
-			model,
-			apiMode: this.apiMode,
-			endpoint,
-			toolCount: tools.length,
-			messageCount: messages.length,
-			hasToolResults: (params.toolResults as unknown[]).length > 0,
-			messageStructure: messages.map((m, i) => {
-				// biome-ignore lint/suspicious/noExplicitAny: debug logging
-				const msg = m as any;
-				const role = msg.role ?? msg.type ?? "?";
-				const extra =
-					msg.type === "function_call"
-						? `:${msg.name}`
-						: msg.type === "function_call_output"
-							? `:${msg.call_id?.slice(0, 12)}`
-							: msg.tool_calls
-								? `:tc=${msg.tool_calls.length}`
-								: "";
-				return `[${i}]${role}${extra}`;
-			}),
-		});
-
 		const bodyText = JSON.stringify(body);
 		params.onRequestStart?.();
 		const response = await this.pfetch(endpoint, {
@@ -1525,6 +1502,8 @@ export interface ResponsesAPIChunk {
 	/** Present on delta/done events to identify the item */
 	item_id?: string;
 	delta?: string;
+	/** Present on *.done events that carry the full accumulated text. */
+	text?: string;
 	output_index?: number;
 	content_index?: number;
 	/** Present on reasoning_summary_text.delta / reasoning_summary_part.added */
@@ -1547,6 +1526,49 @@ export interface ResponsesReasoningAccum {
 	itemId: string;
 	/** Encrypted reasoning content for continuation */
 	encryptedContent?: string | null;
+	/** Text already emitted from delta events; used to avoid duplicating *.done fallbacks. */
+	emittedText?: string;
+}
+
+function resolveReasoningAccum(
+	chunk: ResponsesAPIChunk,
+	reasoningAccum: Map<number, ResponsesReasoningAccum>,
+): ResponsesReasoningAccum | undefined {
+	const idx = chunk.output_index;
+	if (idx != null) return reasoningAccum.get(idx);
+	if (chunk.item_id) return findReasoningAccumByItemId(reasoningAccum, chunk.item_id);
+	return findActiveReasoningAccum(reasoningAccum);
+}
+
+function pushReasoningTextEvent(
+	results: ParsedStreamEvent[],
+	chunk: ResponsesAPIChunk,
+	reasoningAccum: Map<number, ResponsesReasoningAccum>,
+	text: string,
+	options: { appendToAccumulator?: boolean; emitOnlyIfAccumulatorEmpty?: boolean } = {},
+): void {
+	const acc = resolveReasoningAccum(chunk, reasoningAccum);
+	if (acc && options.emitOnlyIfAccumulatorEmpty && (acc.emittedText?.length ?? 0) > 0) return;
+	if (acc && options.appendToAccumulator) {
+		acc.emittedText = `${acc.emittedText ?? ""}${text}`;
+	}
+	if (acc) {
+		results.push({
+			reasoning: text,
+			reasoningMetadata: {
+				openai: {
+					itemId: acc.itemId,
+					reasoningEncryptedContent: acc.encryptedContent,
+				},
+			},
+			reasoningOutputIndex: chunk.output_index,
+		});
+		return;
+	}
+	results.push({
+		reasoning: text,
+		reasoningOutputIndex: chunk.output_index,
+	});
 }
 
 export function parseResponsesAPIEvent(
@@ -1740,6 +1762,7 @@ export function parseResponsesAPIEvent(
 			reasoningAccum.set(idx, {
 				itemId: chunk.item.id ?? "",
 				encryptedContent: chunk.item.encrypted_content ?? null,
+				emittedText: "",
 			});
 			logger.debug("Responses API reasoning item started", {
 				outputIndex: idx,
@@ -1776,28 +1799,30 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 
-	// ── Reasoning content (summary text delta) ──
-	if (type === "response.reasoning_summary_text.delta" && typeof chunk.delta === "string") {
-		// Look up the active reasoning item to attach metadata
-		const idx = chunk.output_index;
-		const acc = idx != null ? reasoningAccum.get(idx) : findActiveReasoningAccum(reasoningAccum);
-		if (acc) {
-			results.push({
-				reasoning: chunk.delta,
-				reasoningMetadata: {
-					openai: {
-						itemId: acc.itemId,
-						reasoningEncryptedContent: acc.encryptedContent,
-					},
-				},
-				reasoningOutputIndex: chunk.output_index,
-			});
-		} else {
-			results.push({
-				reasoning: chunk.delta,
-				reasoningOutputIndex: chunk.output_index,
-			});
-		}
+	// ── Reasoning content ──
+	// Responses API may stream either a summary (`reasoning_summary_text.delta`)
+	// or raw reasoning text (`reasoning_text.delta`). The latter has no summary,
+	// but it should still be shown immediately instead of waiting until a later
+	// block_complete/tool call causes the persisted message to appear.
+	if (
+		(type === "response.reasoning_summary_text.delta" ||
+			type === "response.reasoning_text.delta") &&
+		typeof chunk.delta === "string"
+	) {
+		pushReasoningTextEvent(results, chunk, reasoningAccum, chunk.delta, {
+			appendToAccumulator: true,
+		});
+		return results;
+	}
+
+	if (
+		(type === "response.reasoning_summary_text.done" || type === "response.reasoning_text.done") &&
+		typeof chunk.text === "string" &&
+		chunk.text.length > 0
+	) {
+		pushReasoningTextEvent(results, chunk, reasoningAccum, chunk.text, {
+			emitOnlyIfAccumulatorEmpty: true,
+		});
 		return results;
 	}
 
@@ -2340,6 +2365,17 @@ function findAccByCallId(
 ): ToolAccumEntry | undefined {
 	for (const [, acc] of toolAccum) {
 		if (acc.id === callId) return acc;
+	}
+	return undefined;
+}
+
+/** Find reasoning accumulator by item id when an event omits output_index. */
+function findReasoningAccumByItemId(
+	reasoningAccum: Map<number, ResponsesReasoningAccum>,
+	itemId: string,
+): ResponsesReasoningAccum | undefined {
+	for (const [, acc] of reasoningAccum) {
+		if (acc.itemId === itemId) return acc;
 	}
 	return undefined;
 }

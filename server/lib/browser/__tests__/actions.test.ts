@@ -77,6 +77,67 @@ describe("Browser actions — evaluate and console capture", () => {
 		}
 	}, 30_000);
 
+	test("network capture defaults off and can be enabled before launch navigation", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		const defaultNarratorId = `test-browser-${crypto.randomUUID()}`;
+		const defaultSession = await createSession(
+			defaultNarratorId,
+			dataUrl("<html><body>ok</body></html>"),
+			true,
+		);
+		try {
+			expect(defaultSession.networkCaptureEnabled).toBe(false);
+			expect(listSessions(defaultNarratorId)[0]?.networkCaptureEnabled).toBe(false);
+		} finally {
+			await closeSession(defaultNarratorId, defaultSession.id).catch(() => {});
+		}
+
+		const captureNarratorId = `test-browser-${crypto.randomUUID()}`;
+		const captureSession = await createSession(
+			captureNarratorId,
+			dataUrl("<html><body>ok</body></html>"),
+			true,
+			undefined,
+			true,
+		);
+		try {
+			expect(captureSession.networkCaptureEnabled).toBe(true);
+			expect(listSessions(captureNarratorId)[0]?.networkCaptureEnabled).toBe(true);
+		} finally {
+			await closeSession(captureNarratorId, captureSession.id).catch(() => {});
+		}
+	}, 30_000);
+
+	test("network capture can be started, stopped, and cleared", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		await withSession("<html><body>ok</body></html>", async (session) => {
+			expect(session.networkCaptureEnabled).toBe(false);
+
+			actions.networkStart(session);
+			expect(session.networkCaptureEnabled).toBe(true);
+
+			session.networkRequests.push({
+				id: "req-test",
+				url: "https://example.com/api",
+				method: "GET",
+				resourceType: "fetch",
+				startedAt: Date.now(),
+				requestHeaders: {},
+			});
+			expect(session.networkRequests.length).toBe(1);
+
+			actions.networkStop(session);
+			expect(session.networkCaptureEnabled).toBe(false);
+			expect(session.networkRequests.length).toBe(1);
+
+			actions.networkStart(session, { clear: true });
+			expect(session.networkCaptureEnabled).toBe(true);
+			expect(session.networkRequests.length).toBe(0);
+		});
+	}, 30_000);
+
 	test("evaluate returns pretty JSON for objects", async () => {
 		if (await skipIfNoBrowser()) return;
 

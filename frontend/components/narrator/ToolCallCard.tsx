@@ -3579,13 +3579,47 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
 	const cat = getCategory(toolCall.toolName);
+	const planFollowResetKey =
+		toolCall.toolName === "ExitPlanMode" ? (toolCall.toolUseId ?? "exit-plan") : null;
 	const planScrollRef = useRef<HTMLDivElement>(null);
+	const planAutoFollowRef = useRef(true);
+	const planProgrammaticScrollUntilRef = useRef(0);
+
+	useEffect(() => {
+		if (!planFollowResetKey) return;
+		planAutoFollowRef.current = true;
+		planProgrammaticScrollUntilRef.current = 0;
+	}, [planFollowResetKey]);
+
+	const stopPlanAutoFollow = useCallback(() => {
+		planAutoFollowRef.current = false;
+	}, []);
+
+	const handlePlanScroll = useCallback(() => {
+		if (performance.now() <= planProgrammaticScrollUntilRef.current) return;
+		planAutoFollowRef.current = false;
+	}, []);
+
+	const handlePlanPointerDown = useCallback(
+		(event: React.PointerEvent<HTMLDivElement>) => {
+			const el = event.currentTarget;
+			const verticalScrollbarWidth = el.offsetWidth - el.clientWidth;
+			if (verticalScrollbarWidth <= 0) return;
+			const rect = el.getBoundingClientRect();
+			if (event.clientX >= rect.right - verticalScrollbarWidth) {
+				stopPlanAutoFollow();
+			}
+		},
+		[stopPlanAutoFollow],
+	);
 
 	useLayoutEffect(() => {
 		if (toolCall.toolName !== "ExitPlanMode" || sfName !== "plan" || !sfValue) return;
+		if (!planAutoFollowRef.current) return;
 		const el = planScrollRef.current;
 		if (!el) return;
 		const scrollToPlanBottom = () => {
+			planProgrammaticScrollUntilRef.current = performance.now() + 80;
 			el.scrollTop = el.scrollHeight;
 		};
 		scrollToPlanBottom();
@@ -3723,6 +3757,10 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 			<Box
 				ref={planScrollRef}
 				mt="xs"
+				onScroll={handlePlanScroll}
+				onWheel={stopPlanAutoFollow}
+				onTouchMove={stopPlanAutoFollow}
+				onPointerDown={handlePlanPointerDown}
 				style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}
 			>
 				<ContentViewer content={plan} title="Plan" markdown streaming />

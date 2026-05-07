@@ -26,6 +26,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import { normalizeProxyUrl } from "../../lib/proxy";
 
 export const Route = createFileRoute("/settings/providers")({
 	component: SettingsProvidersPage,
@@ -220,10 +221,16 @@ function SettingsProvidersPage() {
 				}
 			}
 		}
-		pendingSnapshot.current = createSnapshot(state);
+		const normalizedAnthropicProviders = state.anthropicProviders.map((provider) => ({
+			...provider,
+			proxy: normalizeProxyUrl(provider.proxy) ?? "",
+		}));
+		const normalizedState = { ...state, anthropicProviders: normalizedAnthropicProviders };
+		pendingSnapshot.current = createSnapshot(normalizedState);
+		dispatchers.setAnthropicProviders(normalizedAnthropicProviders);
 		updateMutation.mutate({
 			openaiProviders: state.openaiProviders,
-			anthropicProviders: state.anthropicProviders,
+			anthropicProviders: normalizedAnthropicProviders,
 			nugProviders: state.nugProviders,
 			agent: {
 				hiddenModels: [...state.hiddenModels],
@@ -233,7 +240,7 @@ function SettingsProvidersPage() {
 				disabledProviders: [...state.disabledProviders],
 			},
 		});
-	}, [updateMutation, state]);
+	}, [dispatchers, updateMutation, state]);
 
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);

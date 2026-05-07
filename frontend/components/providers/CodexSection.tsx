@@ -52,6 +52,7 @@ import type {
 	CodexUsageSummary,
 	CodexUsageTierStats,
 } from "../../lib/api/types";
+import { normalizeProxyUrl } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { CodexQuotaForecastChart as SharedCodexQuotaForecastChart } from "./CodexQuotaForecastChart";
@@ -603,7 +604,9 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleSaveGlobalProxy = () => {
-		globalProxyMut.mutate(globalProxy || undefined);
+		const normalized = normalizeProxyUrl(globalProxy);
+		setGlobalProxy(normalized ?? "");
+		globalProxyMut.mutate(normalized);
 	};
 
 	const effectiveDefaultReasoningEffort = defaultReasoningInitialized

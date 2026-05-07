@@ -1,7 +1,10 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
+	Button,
 	Group,
+	Modal,
 	NumberInput,
 	Paper,
 	Select,
@@ -12,6 +15,7 @@ import {
 	Title,
 } from "@mantine/core";
 import {
+	IconAlertTriangle,
 	IconEye,
 	IconHandStop,
 	IconPencilCheck,
@@ -115,6 +119,20 @@ export interface AgentSectionProps {
 export function AgentSection(props: AgentSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
+
+	const handleRequestDumpToggle = (checked: boolean) => {
+		if (checked && !props.requestDumpEnabled) {
+			setDumpWarningOpen(true);
+			return;
+		}
+		props.setRequestDumpEnabled(checked);
+	};
+
+	const confirmRequestDump = () => {
+		props.setRequestDumpEnabled(true);
+		setDumpWarningOpen(false);
+	};
 
 	return (
 		<Stack>
@@ -189,12 +207,34 @@ export function AgentSection(props: AgentSectionProps) {
 				checked={props.translateReasoning}
 				onChange={(e) => props.setTranslateReasoning(e.currentTarget.checked)}
 			/>
-			<Switch
-				label={t("requestDumpEnabled")}
-				description={t("requestDumpEnabledDesc")}
-				checked={props.requestDumpEnabled}
-				onChange={(e) => props.setRequestDumpEnabled(e.currentTarget.checked)}
-			/>
+			<Stack id="request-dump-enabled" gap={4}>
+				<Switch
+					label={t("requestDumpEnabled")}
+					description={t("requestDumpEnabledDesc")}
+					checked={props.requestDumpEnabled}
+					onChange={(e) => handleRequestDumpToggle(e.currentTarget.checked)}
+				/>
+				<Modal
+					opened={dumpWarningOpen}
+					onClose={() => setDumpWarningOpen(false)}
+					title={t("requestDumpWarningTitle")}
+					centered
+				>
+					<Stack>
+						<Alert color="orange" icon={<IconAlertTriangle size={16} />} variant="light">
+							<Text size="sm">{t("requestDumpWarningBody")}</Text>
+						</Alert>
+						<Group justify="flex-end">
+							<Button variant="default" onClick={() => setDumpWarningOpen(false)}>
+								{t("requestDumpWarningCancel")}
+							</Button>
+							<Button color="orange" onClick={confirmRequestDump}>
+								{t("requestDumpWarningConfirm")}
+							</Button>
+						</Group>
+					</Stack>
+				</Modal>
+			</Stack>
 			<Switch
 				label={t("expandReasoning")}
 				description={t("expandReasoningDesc")}

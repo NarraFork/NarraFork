@@ -177,6 +177,59 @@ interface MessageBubbleProps {
 	hasChapter?: boolean;
 }
 
+type MessageBubbleMessage = MessageBubbleProps["message"];
+
+function sameMessageCreator(
+	prev: MessageBubbleMessage["creator"],
+	next: MessageBubbleMessage["creator"],
+): boolean {
+	if (prev === next) return true;
+	if (!prev || !next) return false;
+	return (
+		prev.id === next.id &&
+		prev.username === next.username &&
+		prev.avatarColor === next.avatarColor &&
+		prev.avatarImageId === next.avatarImageId
+	);
+}
+
+function sameMessagePayload(prev: MessageBubbleMessage, next: MessageBubbleMessage): boolean {
+	return (
+		prev === next ||
+		(prev.id === next.id &&
+			prev.narratorId === next.narratorId &&
+			prev.role === next.role &&
+			prev.contentJson === next.contentJson &&
+			prev.contentText === next.contentText &&
+			prev.toolCalls === next.toolCalls &&
+			prev.sideCars === next.sideCars &&
+			prev.messageUuid === next.messageUuid &&
+			prev.commandText === next.commandText &&
+			prev.createdAt === next.createdAt &&
+			prev._blockOriginalIndices === next._blockOriginalIndices &&
+			sameMessageCreator(prev.creator, next.creator))
+	);
+}
+
+function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProps): boolean {
+	return (
+		prev.narratorId === next.narratorId &&
+		prev.onForkFromMessage === next.onForkFromMessage &&
+		prev.onAskInPassing === next.onAskInPassing &&
+		prev.resolvePerm === next.resolvePerm &&
+		prev.onPermissionDecision === next.onPermissionDecision &&
+		prev.onQuestionSubmit === next.onQuestionSubmit &&
+		prev.onQuestionDeny === next.onQuestionDeny &&
+		prev.onCompactBeforeMessage === next.onCompactBeforeMessage &&
+		prev.onDeleteBlock === next.onDeleteBlock &&
+		prev.onRollbackToBlock === next.onRollbackToBlock &&
+		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
+		prev.isLastUserMessage === next.isLastUserMessage &&
+		prev.hasChapter === next.hasChapter &&
+		sameMessagePayload(prev.message, next.message)
+	);
+}
+
 function WebSearchBlock({
 	block,
 	blockIndex,
@@ -3071,4 +3124,4 @@ export const MessageBubble = memo(function MessageBubble({
 			</Stack>
 		</MessageContextMenuCtx.Provider>
 	);
-});
+}, messageBubbleAreEqual);

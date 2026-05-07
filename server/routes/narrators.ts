@@ -133,6 +133,7 @@ import {
 	interruptNarrator,
 	isCompactInProgress,
 	isNarratorActive,
+	notifyRunningNarratorGoalStateChanged,
 	pushBufferedMessage,
 	removeBufferedMessage,
 	reorderBufferedMessages,
@@ -465,16 +466,17 @@ function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {
 	throw new ValidationError("Invalid goal status");
 }
 
-async function persistGoalUserMessage(narratorId: string, text: string, userId: string) {
-	const userMsg = await narratorService.persistUserMessage(
-		narratorId,
-		text,
-		[{ type: "text", text }],
-		null,
-		userId,
-	);
-	broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
-	return userMsg;
+async function persistGoalDisplayMessage(narratorId: string, text: string) {
+	return narratorService.persistDisplayMessage(narratorId, text);
+}
+
+function notifyGoalStateIfRunning(
+	narratorId: string,
+	action: string,
+	result: { goals?: Awaited<ReturnType<typeof narratorGoalService.listGoals>> },
+) {
+	if (!result.goals) return;
+	notifyRunningNarratorGoalStateChanged(narratorId, action, result.goals);
 }
 
 async function handleGoalCommand(narratorId: string, cmd: GoalCommandResult, userId: string) {
@@ -546,7 +548,8 @@ narratorRoutes.post("/:id/goals", async (c) => {
 	if (!body.objective) throw new ValidationError("objective is required");
 	const userId = c.get("user").sub;
 	const result = await narratorGoalService.createGoal(id, body.objective, userId);
-	await persistGoalUserMessage(id, body.objective, userId);
+	notifyGoalStateIfRunning(id, result.created ? "add" : "add_existing", result);
+	await persistGoalDisplayMessage(id, body.objective);
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 	await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
@@ -563,6 +566,7 @@ narratorRoutes.patch("/:id/goals/:goalId", async (c) => {
 		objective: body.objective,
 		status,
 	});
+	notifyGoalStateIfRunning(id, status ? `update:${status}` : "update", result);
 	if (status === "active") {
 		const userId = c.get("user").sub;
 		const locale = await getUserLanguage(userId);
@@ -576,7 +580,9 @@ narratorRoutes.delete("/:id/goals/:goalId", async (c) => {
 	const id = c.req.param("id");
 	const goalId = c.req.param("goalId");
 	await narratorService.getById(id);
-	return c.json(await narratorGoalService.removeGoal(id, goalId));
+	const result = await narratorGoalService.removeGoal(id, goalId);
+	notifyGoalStateIfRunning(id, "remove", result);
+	return c.json(result);
 });
 
 narratorRoutes.put("/:id/goals/reorder", async (c) => {
@@ -585,6 +591,7 @@ narratorRoutes.put("/:id/goals/reorder", async (c) => {
 	const body = (await c.req.json()) as { orderedIds?: string[] };
 	if (!Array.isArray(body.orderedIds)) throw new ValidationError("orderedIds is required");
 	const result = await narratorGoalService.reorderGoals(id, body.orderedIds);
+	notifyGoalStateIfRunning(id, "reorder", result);
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
@@ -595,7 +602,9 @@ narratorRoutes.put("/:id/goals/reorder", async (c) => {
 narratorRoutes.delete("/:id/goals", async (c) => {
 	const id = c.req.param("id");
 	await narratorService.getById(id);
-	return c.json(await narratorGoalService.clearOpenGoals(id));
+	const result = await narratorGoalService.clearOpenGoals(id);
+	notifyGoalStateIfRunning(id, "clear", result);
+	return c.json(result);
 });
 
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
@@ -656,7 +665,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	if (cmdResult.resolved && "goalCommand" in cmdResult) {
 		const goalCommand = cmdResult as GoalCommandResult;
 		const result = await handleGoalCommand(id, goalCommand, userId);
-		await persistGoalUserMessage(id, goalCommand.rawCommand, userId);
+		if (goalCommand.action !== "list") {
+			notifyGoalStateIfRunning(id, goalCommand.action, result);
+		}
+		await persistGoalDisplayMessage(id, goalCommand.rawCommand);
 		if (["add", "resume", "complete"].includes(goalCommand.action)) {
 			const locale = await getUserLanguage(userId);
 			const replyInUserLanguage = await getUserReplyInLanguage(userId);
@@ -2978,6 +2990,7 @@ narratorRoutes.patch("/:id/browser-sessions/:sessionId/ttl", async (c) => {
 				? { active: session.tracing.active, startedAt: session.tracing.startedAt }
 				: null,
 			networkRequestCount: session.networkRequests.length,
+			networkCaptureEnabled: session.networkCaptureEnabled,
 		},
 	});
 });

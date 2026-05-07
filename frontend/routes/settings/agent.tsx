@@ -1,5 +1,6 @@
 import { Stack, Title } from "@mantine/core";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useRouterState } from "@tanstack/react-router";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentSection } from "../../components/settings/AgentSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
@@ -16,6 +17,17 @@ function SettingsAgentPage() {
 	const { data: userPrefs } = useUserPreferences();
 	const updateUserPref = useUpdateUserPreferences();
 	const [expandReasoning, setExpandReasoning] = useLocalPref("narrafork_expand_reasoning");
+	const hash = useRouterState({ select: (s) => s.location.hash });
+
+	useEffect(() => {
+		if (hash !== "request-dump-enabled") return;
+		requestAnimationFrame(() => {
+			document.getElementById("request-dump-enabled")?.scrollIntoView({
+				behavior: "smooth",
+				block: "center",
+			});
+		});
+	}, [hash]);
 
 	return (
 		<Stack>

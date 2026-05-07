@@ -283,6 +283,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (normalizeSettingsProxyUrls(merged)) {
+		needsSave = true;
+	}
+
 	if (needsSave) saveSettings(merged);
 
 	return merged;
@@ -376,7 +380,49 @@ export function getSettingsRevision(): number {
 	return settingsRevision;
 }
 
+const PROXY_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Normalize user-entered proxy addresses.
+ * If a user enters only host:port, assume an HTTP proxy by default.
+ */
+export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (PROXY_PROTOCOL_RE.test(trimmed)) return trimmed;
+	return `http://${trimmed}`;
+}
+
+function normalizeProxyField(target: { proxy?: string }): boolean {
+	const before = target.proxy;
+	const after = normalizeProxyUrl(before);
+	if (before === after) return false;
+	target.proxy = after;
+	return true;
+}
+
+function normalizeWebFetchProxyUrl(settings: NarraForkSettings): boolean {
+	const proxy = settings.agent.webFetchPolicy?.proxy;
+	if (!proxy) return false;
+	const before = proxy.url;
+	const after = normalizeProxyUrl(before);
+	if (before === after) return false;
+	proxy.url = after;
+	return true;
+}
+
+export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
+	let changed = false;
+	if (settings.codex) changed = normalizeProxyField(settings.codex) || changed;
+	for (const provider of settings.anthropicProviders ?? []) {
+		changed = normalizeProxyField(provider) || changed;
+	}
+	changed = normalizeWebFetchProxyUrl(settings) || changed;
+	return changed;
+}
+
 export function saveSettings(newSettings: NarraForkSettings): void {
+	normalizeSettingsProxyUrls(newSettings);
 	mkdirSync(narraforkDir, { recursive: true });
 	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
 	settingsRevision++;

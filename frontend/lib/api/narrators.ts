@@ -669,6 +669,7 @@ export const narratorsApi = {
 				headless: boolean;
 				tracing: { active: boolean; startedAt: number } | null;
 				networkRequestCount: number;
+				networkCaptureEnabled: boolean;
 			}[]
 		>(`/narrators/${narratorId}/browser-sessions`),
 	closeBrowserSession: (narratorId: string, sessionId: string) =>

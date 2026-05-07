@@ -30,5 +30,7 @@
 	"revealInExplorer": "Reveal in File Manager",
 	"totalOutputChars": "Total AI output chars",
 	"feedback": "Feedback",
+	"requestDumpEnabledBadge": "Dump on",
+	"requestDumpEnabledTooltip": "Every AI request is being dumped. Click to open this setting.",
 	"licenses": "Licenses"
 }

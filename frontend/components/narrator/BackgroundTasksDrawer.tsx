@@ -156,6 +156,7 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 					processing
 					disabled={runningCount === 0}
 					offset={3}
+					zIndex={1}
 					style={{ height: "var(--ai-size-sm)", display: "flex", alignItems: "center" }}
 				>
 					<ActionIcon

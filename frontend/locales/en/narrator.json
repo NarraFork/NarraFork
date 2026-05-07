@@ -378,6 +378,8 @@
 	"browser.tracingActive": "Recording",
 	"browser.stopTracing": "Stop tracing",
 	"browser.networkRequests": "{{count}} network requests captured",
+	"browser.networkCaptureOn": "Network capture is on",
+	"browser.networkCaptureOff": "Network capture is off",
 	"filePreview_loadError": "Failed to load file",
 	"filePreview_loading": "Loading…",
 	"splitRight": "Split right",

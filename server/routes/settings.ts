@@ -15,6 +15,7 @@ import {
 	getBuiltinModelContextWindows,
 	getContextThresholds,
 	type NarraForkSettings,
+	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
 	saveSettings,
 	settings,
@@ -41,6 +42,19 @@ const modelOptionSchema = z.object({
 	provider: z.string().optional(),
 });
 
+const proxyUrlSchema = z.preprocess(
+	(value) => (typeof value === "string" ? normalizeProxyUrl(value) : value),
+	z.string().optional(),
+);
+
+const webFetchProxyUrlSchema = z.preprocess(
+	(value) => (typeof value === "string" ? normalizeProxyUrl(value) : value),
+	z
+		.string()
+		.regex(/^(https?|socks4|socks5h?):\/\//)
+		.optional(),
+);
+
 const openaiProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -64,7 +78,7 @@ const anthropicProviderSchema = z.object({
 	baseUrl: z.string(),
 	defaultModel: z.string(),
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
-	proxy: z.string().optional(),
+	proxy: proxyUrlSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
 	disabled: z.boolean().optional(),
@@ -218,10 +232,7 @@ const updateSettingsSchema = z
 						proxy: z
 							.object({
 								mode: z.enum(["direct", "system", "custom"]),
-								url: z
-									.string()
-									.regex(/^(https?|socks[45]?):\/\//)
-									.optional(),
+								url: webFetchProxyUrlSchema,
 							})
 							.optional(),
 					})
@@ -285,7 +296,7 @@ const updateSettingsSchema = z
 		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
 			.object({
-				proxy: z.string().optional(),
+				proxy: proxyUrlSchema,
 				loadBalancingMode: z.enum(["priority", "balanced", "tier-balanced"]).optional(),
 				tierOrder: z
 					.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"]))

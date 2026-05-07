@@ -75,6 +75,8 @@ export interface BrowserSession {
 	ttlMs: number;
 	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
 	headless: boolean;
+	/** Whether network request capture is currently enabled for this session. */
+	networkCaptureEnabled: boolean;
 	/** Recent console output and page errors captured from the page. */
 	consoleMessages: BrowserConsoleMessage[];
 	/** Monotonic counter for console messages, independent of the capped buffer size. */
@@ -326,6 +328,7 @@ function attachConsoleListeners(page: Page, session: BrowserSession): void {
 
 function attachNetworkListeners(page: Page, session: BrowserSession): void {
 	page.on("request", (request: HTTPRequest) => {
+		if (!session.networkCaptureEnabled) return;
 		const requestHeaders = normalizeHeaders(request.headers());
 		pushNetworkRequest(session, request, {
 			id: generateShortId(),
@@ -365,6 +368,7 @@ export async function createSession(
 	url: string,
 	headless = true,
 	ttlMs?: number,
+	captureNetwork = false,
 ): Promise<BrowserSession> {
 	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
 	const context = await createContext(headless);
@@ -384,6 +388,7 @@ export async function createSession(
 		lastActivity: Date.now(),
 		ttlMs: normalizedTtlMs,
 		headless,
+		networkCaptureEnabled: captureNetwork,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
 		pendingConsoleCaptures: new Set(),
@@ -420,6 +425,7 @@ export async function createSession(
 		url,
 		headless,
 		ttlMs: normalizedTtlMs,
+		networkCaptureEnabled: captureNetwork,
 	});
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
 	return session;
@@ -488,6 +494,39 @@ export function setSessionTtl(
 	return session;
 }
 
+/** Enable network request capture for a specific session. */
+export function startNetworkCapture(
+	narratorId: string,
+	sessionId: string,
+	opts?: { clear?: boolean },
+): BrowserSession | undefined {
+	const session = getSession(narratorId, sessionId);
+	if (!session) return undefined;
+	if (opts?.clear) {
+		session.networkRequests.length = 0;
+		session.networkRequestMap = new WeakMap();
+	}
+	session.networkCaptureEnabled = true;
+	touchSession(session);
+	logger.info("Browser network capture started", { narratorId, sessionId, clear: opts?.clear });
+	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
+	return session;
+}
+
+/** Disable network request capture for a specific session. */
+export function stopNetworkCapture(
+	narratorId: string,
+	sessionId: string,
+): BrowserSession | undefined {
+	const session = getSession(narratorId, sessionId);
+	if (!session) return undefined;
+	session.networkCaptureEnabled = false;
+	touchSession(session);
+	logger.info("Browser network capture stopped", { narratorId, sessionId });
+	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
+	return session;
+}
+
 /** Close all sessions for a narrator (called when narrator ends). */
 export async function cleanupNarrator(narratorId: string): Promise<void> {
 	const map = sessions.get(narratorId);
@@ -529,6 +568,7 @@ export function listSessions(narratorId: string): Array<{
 	headless: boolean;
 	tracing: { active: boolean; startedAt: number } | null;
 	networkRequestCount: number;
+	networkCaptureEnabled: boolean;
 }> {
 	const map = sessions.get(narratorId);
 	if (!map) return [];
@@ -547,6 +587,7 @@ export function listSessions(narratorId: string): Array<{
 		headless: s.headless,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
 		networkRequestCount: s.networkRequests.length,
+		networkCaptureEnabled: s.networkCaptureEnabled,
 	}));
 }
 

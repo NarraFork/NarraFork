@@ -538,8 +538,9 @@ class NarratorWSManager {
 		ws.onclose = (ev) => {
 			if (this.cancelled || this.ws !== ws) return;
 			this.ws = null;
-			this._setConnected(false, false);
 			// 1001 = Going Away — server is shutting down, don't reconnect.
+			if (ev.code === 1001) this._disconnected = true;
+			this._setConnected(false, false);
 			if (ev.code === 1001) return;
 			this._scheduleReconnect();
 		};
@@ -555,13 +556,13 @@ class NarratorWSManager {
 			// Give up — server is likely down for good.
 			if (!this._disconnected) {
 				this._disconnected = true;
-				this._syncGlobalStatus(false);
+				this._syncGlobalStatus();
 			}
 			return;
 		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._disconnected = true;
-			this._syncGlobalStatus(false);
+			this._syncGlobalStatus();
 		}
 		const delay = Math.min(
 			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts,
@@ -584,7 +585,7 @@ class NarratorWSManager {
 		const changed = this._connected !== connected;
 		this._connected = connected;
 		if (connected) this._disconnected = false;
-		this._syncGlobalStatus(connected);
+		this._syncGlobalStatus();
 		if (changed) {
 			for (const cb of this.connectionChangeCallbacks) {
 				try {
@@ -596,10 +597,14 @@ class NarratorWSManager {
 		}
 	}
 
-	private _syncGlobalStatus(connected: boolean): void {
+	private _syncGlobalStatus(): void {
+		if (this.cancelled) {
+			removeWSStatus(WS_STATUS_ID);
+			return;
+		}
 		setWSStatus(WS_STATUS_ID, {
 			label: "Narrator",
-			connected,
+			connected: this._connected || !this._disconnected,
 			reconnect: () => this.reconnect(),
 		});
 	}

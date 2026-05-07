@@ -154,68 +154,72 @@ const MIME_TYPES: Record<string, string> = {
 
 // Production: serve Vite build output via Hono
 if (isProd) {
-	// Try embedded assets first (compiled single-executable mode)
+	// Try embedded assets only for compiled single-executable mode. Source runs
+	// (`bun run start`) should serve dist/frontend from disk so a later
+	// `bun run build` with new hashed asset names is visible without restart.
 	let hasEmbedded = false;
-	try {
-		// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
-		const generatedFrontendModulePath = "./generated/embedded-frontend";
-		const generatedModule = (await import(generatedFrontendModulePath)) as {
-			embeddedAssets?: Record<string, string>;
-		};
-		const rawAssets = generatedModule.embeddedAssets ?? {};
-		// Normalise keys: on Windows the build script may produce backslash
-		// keys (e.g. "/assets\\index-abc.js") — convert them to forward slashes
-		// so they match browser request paths.
-		const embeddedAssets: Record<string, string> = {};
-		for (const [key, value] of Object.entries(rawAssets)) {
-			embeddedAssets[key.replaceAll("\\", "/")] = value;
-		}
-		const indexPath = embeddedAssets["/index.html"];
-		if (indexPath) {
-			hasEmbedded = true;
-			logger.info("Serving frontend from embedded assets");
+	if (isCompiledBinary) {
+		try {
+			// Dynamic import so it doesn't fail when the generated file doesn't exist (dev / bundle mode)
+			const generatedFrontendModulePath = "./generated/embedded-frontend";
+			const generatedModule = (await import(generatedFrontendModulePath)) as {
+				embeddedAssets?: Record<string, string>;
+			};
+			const rawAssets = generatedModule.embeddedAssets ?? {};
+			// Normalise keys: on Windows the build script may produce backslash
+			// keys (e.g. "/assets\\index-abc.js") — convert them to forward slashes
+			// so they match browser request paths.
+			const embeddedAssets: Record<string, string> = {};
+			for (const [key, value] of Object.entries(rawAssets)) {
+				embeddedAssets[key.replaceAll("\\", "/")] = value;
+			}
+			const indexPath = embeddedAssets["/index.html"];
+			if (indexPath) {
+				hasEmbedded = true;
+				logger.info("Serving frontend from embedded assets");
 
-			// Serve exact-match embedded files
-			app.use("*", async (c, next) => {
-				// Skip API and WebSocket routes
-				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+				// Serve exact-match embedded files
+				app.use("*", async (c, next) => {
+					// Skip API and WebSocket routes
+					if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+						return next();
+					}
+
+					const filePath = embeddedAssets[c.req.path];
+					if (filePath) {
+						const blob = Bun.file(filePath);
+						const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
+						const isHashed = c.req.path.startsWith("/assets/");
+						return new Response(blob, {
+							headers: {
+								"Content-Type": mime,
+								"Cache-Control": isHashed
+									? "public, max-age=31536000, immutable"
+									: "public, max-age=3600",
+							},
+						});
+					}
+
+					// SPA catch-all: serve index.html for non-file routes
+					if (!c.req.path.includes(".")) {
+						const blob = Bun.file(indexPath);
+						return new Response(blob, {
+							headers: {
+								"Content-Type": "text/html; charset=utf-8",
+								"Cache-Control": "no-cache",
+							},
+						});
+					}
+
 					return next();
-				}
-
-				const filePath = embeddedAssets[c.req.path];
-				if (filePath) {
-					const blob = Bun.file(filePath);
-					const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
-					const isHashed = c.req.path.startsWith("/assets/");
-					return new Response(blob, {
-						headers: {
-							"Content-Type": mime,
-							"Cache-Control": isHashed
-								? "public, max-age=31536000, immutable"
-								: "public, max-age=3600",
-						},
-					});
-				}
-
-				// SPA catch-all: serve index.html for non-file routes
-				if (!c.req.path.includes(".")) {
-					const blob = Bun.file(indexPath);
-					return new Response(blob, {
-						headers: {
-							"Content-Type": "text/html; charset=utf-8",
-							"Cache-Control": "no-cache",
-						},
-					});
-				}
-
-				return next();
+				});
+			}
+		} catch (err) {
+			// Generated file doesn't exist — fall through to filesystem mode
+			logger.debug("Embedded frontend not available, falling back to filesystem", {
+				error: String(err),
 			});
 		}
-	} catch (err) {
-		// Generated file doesn't exist — fall through to filesystem mode
-		logger.debug("Embedded frontend not available, falling back to filesystem", {
-			error: String(err),
-		});
 	}
 
 	// Fallback: serve from filesystem (bundle mode or bun run start)
@@ -224,38 +228,40 @@ if (isProd) {
 		logger.info(
 			`Static file serving: filesystem mode, dir=${staticDir}, exists=${existsSync(staticDir)}`,
 		);
-		if (existsSync(staticDir)) {
-			// Serve all static files from dist/frontend via a single middleware
-			app.use("*", async (c, next) => {
-				// Skip API and WebSocket routes
-				if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
-					return next();
-				}
+		// Serve all static files from dist/frontend via a single middleware.
+		// Install this even when dist/frontend is currently missing so a later
+		// `bun run build` becomes visible to this running process.
+		app.use("*", async (c, next) => {
+			// Skip API and WebSocket routes
+			if (c.req.path.startsWith("/api") || c.req.path.startsWith("/ws")) {
+				return next();
+			}
 
-				const filePath = resolve(staticDir, `.${c.req.path}`);
-				// Security: ensure resolved path is within staticDir
-				if (!filePath.startsWith(staticDir)) {
-					return next();
-				}
+			const filePath = resolve(staticDir, `.${c.req.path}`);
+			// Security: ensure resolved path is within staticDir
+			if (!filePath.startsWith(staticDir)) {
+				return next();
+			}
 
-				const file = Bun.file(filePath);
-				if (await file.exists()) {
-					const ext = extname(c.req.path);
-					const mime = MIME_TYPES[ext] ?? "application/octet-stream";
-					const isHashed = c.req.path.startsWith("/assets/");
-					return new Response(file, {
-						headers: {
-							"Content-Type": mime,
-							"Cache-Control": isHashed
-								? "public, max-age=31536000, immutable"
-								: "public, max-age=3600",
-						},
-					});
-				}
+			const file = Bun.file(filePath);
+			if (await file.exists()) {
+				const ext = extname(c.req.path);
+				const mime = MIME_TYPES[ext] ?? "application/octet-stream";
+				const isHashed = c.req.path.startsWith("/assets/");
+				return new Response(file, {
+					headers: {
+						"Content-Type": mime,
+						"Cache-Control": isHashed
+							? "public, max-age=31536000, immutable"
+							: "public, max-age=3600",
+					},
+				});
+			}
 
-				// SPA catch-all: serve index.html for non-file routes
-				if (!c.req.path.includes(".")) {
-					const indexFile = Bun.file(resolve(staticDir, "index.html"));
+			// SPA catch-all: serve index.html for non-file routes
+			if (!c.req.path.includes(".")) {
+				const indexFile = Bun.file(resolve(staticDir, "index.html"));
+				if (await indexFile.exists()) {
 					return new Response(indexFile, {
 						headers: {
 							"Content-Type": "text/html; charset=utf-8",
@@ -263,10 +269,10 @@ if (isProd) {
 						},
 					});
 				}
+			}
 
-				return next();
-			});
-		}
+			return next();
+		});
 	}
 }
 

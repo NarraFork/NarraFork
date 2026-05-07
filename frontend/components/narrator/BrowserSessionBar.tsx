@@ -123,6 +123,7 @@ function SessionCard({
 		headless?: boolean;
 		tracing: { active: boolean; startedAt: number } | null;
 		networkRequestCount?: number;
+		networkCaptureEnabled?: boolean;
 	};
 }) {
 	const { t } = useTranslation("narrator");
@@ -241,6 +242,7 @@ function SessionCard({
 
 	const isTracing = session.tracing?.active ?? false;
 	const networkRequestCount = session.networkRequestCount ?? 0;
+	const networkCaptureEnabled = session.networkCaptureEnabled ?? false;
 
 	return (
 		<Box
@@ -268,8 +270,18 @@ function SessionCard({
 								{t("browser.expiresIn", { time: expiresInLabel })}
 							</Text>
 						</Tooltip>
-						<Tooltip label={t("browser.networkRequests", { count: networkRequestCount })} fz="xs">
-							<Badge size="xs" variant="light" color="blue" leftSection={<IconNetwork size={10} />}>
+						<Tooltip
+							label={`${t("browser.networkRequests", { count: networkRequestCount })} · ${t(
+								networkCaptureEnabled ? "browser.networkCaptureOn" : "browser.networkCaptureOff",
+							)}`}
+							fz="xs"
+						>
+							<Badge
+								size="xs"
+								variant="light"
+								color={networkCaptureEnabled ? "blue" : "gray"}
+								leftSection={<IconNetwork size={10} />}
+							>
 								{networkRequestCount}
 							</Badge>
 						</Tooltip>

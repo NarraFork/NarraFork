@@ -15,6 +15,8 @@ export {
 	MIN_SESSION_TTL_MS,
 	normalizeSessionTtlMs,
 	setSessionTtl,
+	startNetworkCapture,
+	stopNetworkCapture,
 	stopTracing,
 	touchSession,
 } from "./session";

@@ -209,6 +209,93 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(parsed?.messageId).toBe("msg_remote_2");
 	});
 
+	test("parseResponsesAPIEvent streams raw reasoning_text deltas without summary", () => {
+		const reasoningAccum = new Map();
+		parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: {
+					type: "reasoning",
+					id: "rs_raw",
+					encrypted_content: "enc_raw",
+				},
+			},
+			new Map(),
+			reasoningAccum,
+		);
+
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.reasoning_text.delta",
+				output_index: 0,
+				delta: "raw reasoning chunk",
+			},
+			new Map(),
+			reasoningAccum,
+		);
+
+		const parsed = events.find((event) => event.reasoning);
+		expect(parsed?.reasoning).toBe("raw reasoning chunk");
+		expect(parsed?.reasoningMetadata?.openai?.itemId).toBe("rs_raw");
+		expect(parsed?.reasoningMetadata?.openai?.reasoningEncryptedContent).toBe("enc_raw");
+		expect(parsed?.reasoningOutputIndex).toBe(0);
+	});
+
+	test("parseResponsesAPIEvent uses reasoning_text.done only when no delta was emitted", () => {
+		const reasoningAccum = new Map();
+		parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "reasoning", id: "rs_done" },
+			},
+			new Map(),
+			reasoningAccum,
+		);
+
+		const doneEvents = parseResponsesAPIEvent(
+			{
+				type: "response.reasoning_text.done",
+				output_index: 0,
+				text: "complete reasoning",
+			},
+			new Map(),
+			reasoningAccum,
+		);
+		expect(doneEvents.find((event) => event.reasoning)?.reasoning).toBe("complete reasoning");
+
+		const deltaAccum = new Map();
+		parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 1,
+				item: { type: "reasoning", id: "rs_delta" },
+			},
+			new Map(),
+			deltaAccum,
+		);
+		parseResponsesAPIEvent(
+			{
+				type: "response.reasoning_text.delta",
+				output_index: 1,
+				delta: "already streamed",
+			},
+			new Map(),
+			deltaAccum,
+		);
+		const skippedDoneEvents = parseResponsesAPIEvent(
+			{
+				type: "response.reasoning_text.done",
+				output_index: 1,
+				text: "already streamed",
+			},
+			new Map(),
+			deltaAccum,
+		);
+		expect(skippedDoneEvents.some((event) => event.reasoning)).toBe(false);
+	});
+
 	test("pushAssistantTurn keeps non-replayable reasoning as assistant text fallback", () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const history: unknown[] = [];

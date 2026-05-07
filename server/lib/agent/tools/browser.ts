@@ -11,6 +11,8 @@ import {
 	MAX_SESSION_TTL_MS,
 	MIN_SESSION_TTL_MS,
 	setSessionTtl,
+	startNetworkCapture,
+	stopNetworkCapture,
 } from "../../browser";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
@@ -29,6 +31,8 @@ const ACTIONS = [
 	"get_attribute",
 	"get_console",
 	"get_network",
+	"network_start",
+	"network_stop",
 	"evaluate",
 	"evaluate_capture",
 	"wait",
@@ -66,6 +70,8 @@ export const browserTool: ToolDefinition = {
 		'- "get_attribute": Get an attribute value of an element\n' +
 		'- "get_console": Get captured console output and page errors\n' +
 		'- "get_network": Get captured network requests/responses and failures\n' +
+		'- "network_start": Start capturing network requests for this session (optionally clear old captures)\n' +
+		'- "network_stop": Stop capturing network requests for this session\n' +
 		'- "evaluate": Execute JavaScript in the page context and return the evaluated value\n' +
 		'- "evaluate_capture": Execute JavaScript and return both the value and console output emitted during the run\n' +
 		"  Prefer evaluate_capture when using JavaScript to interact with the page and inspect logs. " +
@@ -83,6 +89,8 @@ export const browserTool: ToolDefinition = {
 		'- "perf_stop": Stop tracing and save trace data to a JSON file (returns file path). ' +
 		"The trace file is in Chrome DevTools Trace Event format — " +
 		"use grep/bash/python to analyze it, or open it in Chrome DevTools\n\n" +
+		"Network capture is OFF by default. Use network_start/network_stop to capture only when needed. " +
+		"If you need the initial page-load requests, set capture_network=true on launch.\n\n" +
 		"Parameters:\n" +
 		"- action (required): The action to perform\n" +
 		"- url (optional): URL for launch/navigate actions\n" +
@@ -91,6 +99,7 @@ export const browserTool: ToolDefinition = {
 		"- value (optional): Value for fill/select/type/evaluate/get_attribute actions\n" +
 		"- key (optional): Special key name for type action (e.g. Enter, Tab, Escape, ArrowDown)\n" +
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
+		"- amount (optional): Scroll distance in pixels for scroll action (default: 500)\n" +
 		"- timeout (optional): Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)\n" +
 		"- ttl_ms (optional): Browser session inactivity auto-close TTL in ms for launch/set_ttl; default 600000, allowed 1000–86400000\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
@@ -98,6 +107,7 @@ export const browserTool: ToolDefinition = {
 		"- clear (optional): For get_console/get_network, clear captured output after reading; for evaluate_capture, clear console before running (default: true)\n" +
 		"- wait_after_ms (optional): For evaluate_capture, wait this many ms after script execution before collecting console output\n" +
 		"- include_details (optional): For get_network, include request/response headers and post data (default: false)\n" +
+		"- capture_network (optional): For launch only, start network capture before initial navigation (default: false)\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
 		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
@@ -156,6 +166,10 @@ export const browserTool: ToolDefinition = {
 				},
 				required: ["x", "y"],
 			},
+			amount: {
+				description: "Scroll distance in pixels for scroll action (default: 500)",
+				type: "number",
+			},
 			max_length: {
 				description:
 					"Max output length for dom/get_text/evaluate/evaluate_capture/get_console/get_network (default: 20000)",
@@ -175,6 +189,11 @@ export const browserTool: ToolDefinition = {
 			},
 			include_details: {
 				description: "For get_network, include headers and post data in output",
+				type: "boolean",
+			},
+			capture_network: {
+				description:
+					"For launch only, start network capture before initial navigation (default: false)",
 				type: "boolean",
 			},
 			headless: {
@@ -222,6 +241,7 @@ export const browserTool: ToolDefinition = {
 			.object({ x: z.number(), y: z.number() })
 			.optional()
 			.describe("Coordinates for positional actions"),
+		amount: z.number().optional().describe("Scroll distance in pixels for scroll action"),
 		max_length: z.number().optional().describe("Max output length"),
 		clear: z
 			.boolean()
@@ -239,6 +259,10 @@ export const browserTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe("For get_network, include headers and post data in output"),
+		capture_network: z
+			.boolean()
+			.optional()
+			.describe("For launch only, start network capture before initial navigation"),
 		headless: z
 			.boolean()
 			.optional()
@@ -258,10 +282,12 @@ export const browserTool: ToolDefinition = {
 			timeout,
 			ttl_ms,
 			coordinate,
+			amount,
 			max_length,
 			clear,
 			wait_after_ms,
 			include_details,
+			capture_network,
 			headless,
 			categories,
 		} = args as {
@@ -275,10 +301,12 @@ export const browserTool: ToolDefinition = {
 			timeout?: number;
 			ttl_ms?: number;
 			coordinate?: { x: number; y: number };
+			amount?: number;
 			max_length?: number;
 			clear?: boolean;
 			wait_after_ms?: number;
 			include_details?: boolean;
+			capture_network?: boolean;
 			headless?: boolean;
 			categories?: string[];
 		};
@@ -293,7 +321,13 @@ export const browserTool: ToolDefinition = {
 		try {
 			switch (action) {
 				case "launch":
-					return await handleLaunch(ctx.narratorId, url, headless ?? true, ttl_ms);
+					return await handleLaunch(
+						ctx.narratorId,
+						url,
+						headless ?? true,
+						ttl_ms,
+						capture_network ?? false,
+					);
 				case "list_sessions":
 					return handleListSessions(ctx.narratorId);
 				case "close":
@@ -310,6 +344,7 @@ export const browserTool: ToolDefinition = {
 						timeout,
 						ttl_ms,
 						coordinate,
+						amount,
 						max_length,
 						clear,
 						wait_after_ms,
@@ -341,6 +376,7 @@ async function handleLaunch(
 	url?: string,
 	headless = true,
 	ttlMs?: number,
+	captureNetwork = false,
 ): Promise<ToolResult> {
 	if (!url) {
 		return { output: "url is required for launch action", isError: true };
@@ -359,7 +395,7 @@ async function handleLaunch(
 		return { output: `Invalid URL: ${url}`, isError: true };
 	}
 
-	const session = await createSession(narratorId, url, headless, ttlMs);
+	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork);
 	const title = await session.page.title();
 
 	return {
@@ -367,6 +403,7 @@ async function handleLaunch(
 			`Browser session started (${headless ? "headless" : "headed/GUI"}).\n` +
 			`Session ID: ${session.id}\n` +
 			`Auto-close TTL: ${session.ttlMs}ms (${formatDurationMs(session.ttlMs)} of inactivity)\n` +
+			`Network capture: ${session.networkCaptureEnabled ? "enabled" : "disabled"}\n` +
 			`URL: ${session.page.url()}\n` +
 			`Title: ${title}`,
 		metadata: { sessionId: session.id },
@@ -381,6 +418,7 @@ function handleListSessions(narratorId: string): ToolResult {
 	const lines = list.map(
 		(s) =>
 			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | ` +
+			`network: ${s.networkCaptureEnabled ? "capturing" : "off"} (${s.networkRequestCount}) | ` +
 			`ttl: ${formatDurationMs(s.ttlMs)} | expires: ${new Date(s.expiresAt).toISOString()} | ` +
 			`last active: ${new Date(s.lastActivity).toISOString()}`,
 	);
@@ -447,6 +485,7 @@ async function handleSessionAction(
 		timeout?: number;
 		ttl_ms?: number;
 		coordinate?: { x: number; y: number };
+		amount?: number;
 		max_length?: number;
 		clear?: boolean;
 		wait_after_ms?: number;
@@ -645,11 +684,39 @@ async function handleSessionAction(
 				output:
 					`${result.output}\n\n` +
 					`Captured requests${filtered}: ${result.count} / ${result.totalCount}${opts.clear ? " (cleared)" : ""}\n` +
+					`Network capture: ${session.networkCaptureEnabled ? "enabled" : "disabled"}\n` +
 					`URL: ${result.snapshot.url}`,
 				metadata: {
 					sessionId: session.id,
 					networkRequestCount: result.count,
 					networkRequestTotalCount: result.totalCount,
+					networkCaptureEnabled: session.networkCaptureEnabled,
+				},
+			};
+		}
+
+		case "network_start": {
+			const updated = startNetworkCapture(narratorId, session.id, { clear: opts.clear }) ?? session;
+			return {
+				output:
+					`Network capture started for session ${updated.id}.` +
+					(opts.clear ? " Existing captured requests were cleared." : ""),
+				metadata: {
+					sessionId: updated.id,
+					networkCaptureEnabled: updated.networkCaptureEnabled,
+					networkRequestCount: updated.networkRequests.length,
+				},
+			};
+		}
+
+		case "network_stop": {
+			const updated = stopNetworkCapture(narratorId, session.id) ?? session;
+			return {
+				output: `Network capture stopped for session ${updated.id}. Captured requests are retained for get_network.`,
+				metadata: {
+					sessionId: updated.id,
+					networkCaptureEnabled: updated.networkCaptureEnabled,
+					networkRequestCount: updated.networkRequests.length,
 				},
 			};
 		}
@@ -759,11 +826,12 @@ async function handleSessionAction(
 				opts.direction === "up" || opts.direction === "down" ? opts.direction : "down";
 			const result = await actions.scroll(session, {
 				direction: scrollDir,
+				amount: opts.amount,
 				selector: opts.selector,
 				coordinate: opts.coordinate,
 			});
 			return {
-				output: `Scrolled ${scrollDir}\nURL: ${result.snapshot.url}`,
+				output: `Scrolled ${scrollDir}${opts.amount ? ` ${opts.amount}px` : ""}\nURL: ${result.snapshot.url}`,
 				metadata: { sessionId: session.id },
 			};
 		}

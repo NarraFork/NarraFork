@@ -91,7 +91,6 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
-import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -163,10 +162,8 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
-import { BlurInOnAppearProvider } from "./BlurInOnAppear";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserSessionBar } from "./BrowserSessionBar";
-import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
@@ -242,6 +239,8 @@ const ENABLE_MESSAGE_RENDER_WINDOW = true;
 const MESSAGE_RENDER_WINDOW_THRESHOLD = 260;
 const MESSAGE_RENDER_WINDOW_SIZE = 180;
 const MESSAGE_RENDER_TARGET_RADIUS = 40;
+const MESSAGE_MOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_SIZE;
+const MESSAGE_UNMOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_THRESHOLD * 2;
 
 type MessageRenderWindow = {
 	start: number;
@@ -1586,6 +1585,66 @@ export function NarratorPanel({
 		fetchPreviousPage,
 		isFetchingPreviousPage,
 	} = useNarratorMessages(narratorId, aroundOptions);
+	const [messageRenderReady, setMessageRenderReady] = useState(false);
+	const [messageRenderPhase, setMessageRenderPhase] = useState<"tail" | "full">(() =>
+		highlightMessageId ? "full" : "tail",
+	);
+	useEffect(() => {
+		if (highlightMessageId) setMessageRenderPhase("full");
+	}, [highlightMessageId]);
+	useEffect(() => {
+		let cancelled = false;
+		let timeoutId: number | null = null;
+		const rafId = requestAnimationFrame(() => {
+			timeoutId = window.setTimeout(() => {
+				if (cancelled) return;
+				startTransition(() => setMessageRenderReady(true));
+			}, 0);
+		});
+		return () => {
+			cancelled = true;
+			cancelAnimationFrame(rafId);
+			if (timeoutId != null) window.clearTimeout(timeoutId);
+		};
+	}, []);
+	const canRenderMessages = messageRenderReady && !messagesLoading;
+	useEffect(() => {
+		if (!canRenderMessages || highlightMessageId || messageRenderPhase !== "tail") return;
+		let cancelled = false;
+		let timeoutId: number | null = null;
+		let idleId: number | null = null;
+		const expandToFull = () => {
+			if (cancelled) return;
+			const wasAtBottom = isAtBottomRef.current;
+			startTransition(() => setMessageRenderPhase("full"));
+			if (wasAtBottom) {
+				requestAnimationFrame(() => {
+					requestAnimationFrame(() => scrollToBottomRef.current(true));
+				});
+			}
+		};
+		if (typeof window.requestIdleCallback === "function") {
+			idleId = window.requestIdleCallback(expandToFull, { timeout: 1000 });
+		} else {
+			timeoutId = window.setTimeout(expandToFull, 800);
+		}
+		return () => {
+			cancelled = true;
+			if (idleId != null) window.cancelIdleCallback(idleId);
+			if (timeoutId != null) window.clearTimeout(timeoutId);
+		};
+	}, [canRenderMessages, highlightMessageId, messageRenderPhase]);
+	const deferredMessagesData = useMemo(() => {
+		if (!canRenderMessages) return undefined;
+		if (highlightMessageId || messageRenderPhase === "full") return messagesData;
+		const firstPage = messagesData?.pages?.[0];
+		if (!messagesData || !firstPage) return messagesData;
+		return {
+			...messagesData,
+			pages: [firstPage],
+			pageParams: messagesData.pageParams?.slice(0, 1) ?? [undefined],
+		};
+	}, [canRenderMessages, highlightMessageId, messageRenderPhase, messagesData]);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
@@ -1916,6 +1975,7 @@ export function NarratorPanel({
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const isTailRenderWindowRef = useRef(true);
+	const scrollToBottomRef = useRef<(instant?: boolean) => void>(() => {});
 
 	// --- Scroll helpers ---
 	const followRafRef = useRef(0);
@@ -2001,6 +2061,7 @@ export function NarratorPanel({
 		},
 		[startFollowing],
 	);
+	scrollToBottomRef.current = scrollToBottom;
 	const wasWorkspacePreviewRef = useRef(isWorkspacePreview);
 	useEffect(() => {
 		const wasWorkspacePreview = wasWorkspacePreviewRef.current;
@@ -2050,7 +2111,7 @@ export function NarratorPanel({
 		narratorId,
 		narratorStatus: narrator?.status,
 		narratorErrorMessage: narrator?.errorMessage ?? null,
-		messagesData,
+		messagesData: deferredMessagesData,
 		messagesQueryKey,
 		isAtBottomRef,
 		scrollToBottom,
@@ -2565,13 +2626,13 @@ export function NarratorPanel({
 
 	// Lightweight derived values — avoid full reverse().flatMap() on every update.
 	const totalMessageCount = useMemo(() => {
-		if (!hydrated || !messagesData?.pages) return 0;
-		return messagesData.pages.reduce((sum, p) => sum + (p.messages?.length ?? 0), 0);
-	}, [hydrated, messagesData]);
+		if (!hydrated || !deferredMessagesData?.pages) return 0;
+		return deferredMessagesData.pages.reduce((sum, p) => sum + (p.messages?.length ?? 0), 0);
+	}, [hydrated, deferredMessagesData]);
 
 	const lastMessage = useMemo<NarratorMsg | null>(() => {
-		if (!hydrated || !messagesData?.pages?.length) return null;
-		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		if (!hydrated || !deferredMessagesData?.pages?.length) return null;
+		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
 		for (let i = orderedMessages.length - 1; i >= 0; i--) {
 			const msg = orderedMessages[i];
 			if (!msg || msg.id === STREAMING_CHUNKS_MSG_ID) continue;
@@ -2586,7 +2647,7 @@ export function NarratorPanel({
 			return msg;
 		}
 		return null;
-	}, [hydrated, messagesData]);
+	}, [hydrated, deferredMessagesData]);
 
 	const narratorIsIdle = narrator?.status === "idle";
 
@@ -2604,8 +2665,8 @@ export function NarratorPanel({
 
 	// Find the last user message ID for edit confirmation logic
 	const lastUserMessageId = useMemo(() => {
-		if (!hydrated || !messagesData?.pages) return undefined;
-		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		if (!hydrated || !deferredMessagesData?.pages) return undefined;
+		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
 		for (let i = orderedMessages.length - 1; i >= 0; i--) {
 			const msg = orderedMessages[i];
 			if (msg?.role === "user" && !String(msg.id).startsWith("optimistic-")) {
@@ -2613,7 +2674,7 @@ export function NarratorPanel({
 			}
 		}
 		return undefined;
-	}, [hydrated, messagesData]);
+	}, [hydrated, deferredMessagesData]);
 
 	const hasChapter = !!narrator?.chapterId;
 
@@ -2762,10 +2823,9 @@ export function NarratorPanel({
 	const mountTrimmedRef = useRef(false);
 	if (!mountTrimmedRef.current) {
 		mountTrimmedRef.current = true;
-		const MAX_MOUNT_MESSAGES = 60;
 		const cached = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
 		if (cached?.pages && cached.pages.length > 1) {
-			const trimmed = evictOldestPages(cached, MAX_MOUNT_MESSAGES);
+			const trimmed = evictOldestPages(cached, MESSAGE_MOUNT_CACHE_LIMIT);
 			if (trimmed !== cached) {
 				qc.setQueryData(messagesQueryKey, trimmed);
 			}
@@ -2779,10 +2839,9 @@ export function NarratorPanel({
 	useEffect(() => {
 		const keyToTrim = messagesQueryKey;
 		return () => {
-			const MAX_CACHED_MESSAGES = 200;
 			qc.setQueryData(keyToTrim, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length || old.pages.length <= 1) return old;
-				return evictOldestPages(old, MAX_CACHED_MESSAGES) as MessagesQueryData;
+				return evictOldestPages(old, MESSAGE_UNMOUNT_CACHE_LIMIT) as MessagesQueryData;
 			});
 		};
 	}, [messagesQueryKey, qc]);
@@ -3101,7 +3160,6 @@ export function NarratorPanel({
 
 	// --- Flat message elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
 	const [messageRendererMode, setMessageRendererMode] = useNarratorMessageRendererMode();
 	const usePixiRenderer = messageRendererMode === "pixi" && !isWorkspacePreview;
 	const rendererScrollSnapshotRef = useRef<{
@@ -3153,22 +3211,10 @@ export function NarratorPanel({
 			cancelled = true;
 		};
 	}, [messageRendererMode]);
-	const suppressBlurIn =
-		!advancedAnim ||
-		isResizing ||
-		!initialScrollDone ||
-		isFetchingNextPage ||
-		isFetchingPreviousPage;
-	const blurInSeedIds = useMemo(() => {
-		if (!advancedAnim || !suppressBlurIn || !messagesData?.pages?.length) return [];
-		const ids = new Set<string>();
-		for (const page of messagesData.pages) {
-			for (const animationId of collectBlurInAnimationIdsFromMessages(page.messages)) {
-				ids.add(animationId);
-			}
-		}
-		return [...ids];
-	}, [advancedAnim, suppressBlurIn, messagesData]);
+	// Keep message element wrappers stable across narrator status changes.
+	// Re-enabling blur-in when a user sends a message changes the rendered element
+	// tree for existing history and can make the broad list lose its scroll anchor.
+	const enableMessageBlurIn = false;
 	// Page-level cache: keyed by page reference → rendered elements/keys/targets/meta.
 	// Build a synthetic streaming message from the current streaming state.
 	// All streaming content (reasoning, text, web_search, tool chunks) is combined
@@ -3205,15 +3251,15 @@ export function NarratorPanel({
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
 	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
-		if (isResizing || !messagesData?.pages) {
+		if (isResizing || !deferredMessagesData?.pages) {
 			return {
 				flatElements: [],
 				flatKeys: [],
 				flatTargets: [],
 			};
 		}
-		const pages = messagesData.pages;
-		const pageParams = messagesData.pageParams ?? [];
+		const pages = deferredMessagesData.pages;
+		const pageParams = deferredMessagesData.pageParams ?? [];
 		const ordered = getRenderableMessageOrder(pages);
 		const reversed = ordered.normalized
 			? [
@@ -3293,6 +3339,7 @@ export function NarratorPanel({
 					sm,
 					resolvePermForRender,
 					handleAskInPassing,
+					enableMessageBlurIn,
 				);
 
 			const collectResults = (
@@ -3404,7 +3451,7 @@ export function NarratorPanel({
 		};
 	}, [
 		isResizing,
-		messagesData,
+		deferredMessagesData,
 		narratorId,
 		forkHandler,
 		renderPermCb,
@@ -3554,6 +3601,9 @@ export function NarratorPanel({
 	};
 	const scrollToLatestMessageWindow = useCallback(
 		(instant?: boolean) => {
+			if (messageRenderPhase !== "full") {
+				startTransition(() => setMessageRenderPhase("full"));
+			}
 			const setTailWindowIfNeeded = () => {
 				const state = latestMessageWindowStateRef.current;
 				if (!state.shouldWindowMessages) return false;
@@ -3574,10 +3624,13 @@ export function NarratorPanel({
 				requestAnimationFrame(() => scrollToBottom(instant));
 			});
 		},
-		[scrollToBottom],
+		[messageRenderPhase, scrollToBottom],
 	);
 
 	const handleShowOlderLoadedMessages = useCallback(() => {
+		if (messageRenderPhase !== "full") {
+			startTransition(() => setMessageRenderPhase("full"));
+		}
 		detachFromFullBottom();
 		setMessageRenderWindow((current) => {
 			const currentStart = activeMessageRenderWindow?.start ?? current.start;
@@ -3586,7 +3639,12 @@ export function NarratorPanel({
 			const nextWindow: MessageRenderWindow = { start: newStart, end: newEnd, reason: "manual" };
 			return isSameMessageRenderWindow(current, nextWindow) ? current : nextWindow;
 		});
-	}, [activeMessageRenderWindow?.start, detachFromFullBottom, finalElements.length]);
+	}, [
+		activeMessageRenderWindow?.start,
+		detachFromFullBottom,
+		finalElements.length,
+		messageRenderPhase,
+	]);
 
 	const renderedElements = useMemo(() => {
 		if (isWorkspacePreview) {
@@ -3692,6 +3750,9 @@ export function NarratorPanel({
 
 	const scrollToFullIndex = useCallback(
 		(fullIndex: number, options: ScrollToFullIndexOptions = {}) => {
+			if (messageRenderPhase !== "full") {
+				startTransition(() => setMessageRenderPhase("full"));
+			}
 			if (fullIndex < 0 || fullIndex >= finalElements.length) return false;
 			const align = options.align ?? "start";
 			const runDomCorrection = () => {
@@ -3742,6 +3803,7 @@ export function NarratorPanel({
 			detachFromFullBottom,
 			finalElements.length,
 			fullIndexToVisibleIndexMap,
+			messageRenderPhase,
 			scheduleHighlight,
 			scrollDomIdsIntoView,
 			shouldWindowMessages,
@@ -3750,8 +3812,8 @@ export function NarratorPanel({
 
 	const messageSearchResults = useMemo(() => {
 		const normalizedQuery = normalizeSearchText(messageSearchQuery);
-		if (!normalizedQuery || !messagesData?.pages?.length) return [];
-		const orderedMessages = getRenderableMessageOrder(messagesData.pages).messages;
+		if (!normalizedQuery || !deferredMessagesData?.pages?.length) return [];
+		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
 		return flattenMessagesForSearch(orderedMessages)
 			.map((message) => {
 				const text = collectMessageSearchText(message);
@@ -3767,7 +3829,7 @@ export function NarratorPanel({
 			}))
 			.filter((result) => result.index >= 0)
 			.sort((a, b) => a.index - b.index);
-	}, [messagesData, messageSearchQuery, targetIndexMap]);
+	}, [deferredMessagesData, messageSearchQuery, targetIndexMap]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset active search item when the query/session changes
 	useEffect(() => {
@@ -3828,9 +3890,9 @@ export function NarratorPanel({
 
 	// --- User message markers for scrollbar minimap ---
 	const userMessageMarkers = useMemo(() => {
-		if (!messagesData?.pages) return [];
+		if (!deferredMessagesData?.pages) return [];
 		const markers: { index: number; id: string }[] = [];
-		for (const page of messagesData.pages) {
+		for (const page of deferredMessagesData.pages) {
 			for (const msg of page.messages ?? []) {
 				if (msg.role === "user" && msg.id) {
 					const idx = targetIndexMap.get(msg.id);
@@ -3840,7 +3902,7 @@ export function NarratorPanel({
 		}
 		markers.sort((a, b) => a.index - b.index);
 		return markers;
-	}, [messagesData, targetIndexMap]);
+	}, [deferredMessagesData, targetIndexMap]);
 
 	const handleMarkerJump = useCallback(
 		(elementIndex: number) => {
@@ -3852,8 +3914,11 @@ export function NarratorPanel({
 	// --- Load older / newer ---
 	const handleLoadOlder = useCallback(() => {
 		if (isFetchingNextPage) return;
+		if (messageRenderPhase !== "full") {
+			startTransition(() => setMessageRenderPhase("full"));
+		}
 		fetchNextPage();
-	}, [fetchNextPage, isFetchingNextPage]);
+	}, [fetchNextPage, isFetchingNextPage, messageRenderPhase]);
 	loadOlderBtnRef.current = handleLoadOlder;
 
 	const handleLoadNewer = useCallback(async () => {
@@ -4403,6 +4468,22 @@ export function NarratorPanel({
 					return { ...old, pages };
 				});
 				scrollToLatestMessageWindow(true);
+			} else if (result?.goalCommand) {
+				// /goal commands persist a display-only message and broadcast goals via WS,
+				// so the optimistic user entry must be removed instead of lingering in history.
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					firstPage.messages = firstPage.messages.filter((m: NarratorMsg) => m.id !== optimisticId);
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
+				if (Array.isArray(result.goals)) {
+					qc.setQueryData(["narrators", narratorId, "goals"], { goals: result.goals });
+				}
+				setTimeout(() => narratorWSManager.checkSync(narratorId), 500);
+				scrollToLatestMessageWindow(true);
 			} else if (result?.buffered) {
 				// Message was buffered — remove optimistic chat history entry and show it
 				// in the queue immediately.  The WS buffer_set event can be missed when
@@ -4498,6 +4579,9 @@ export function NarratorPanel({
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
 			);
+			if (result?.goalCommand && Array.isArray(result.goals)) {
+				qc.setQueryData(["narrators", narratorId, "goals"], { goals: result.goals });
+			}
 			applyBufferedSendResult(result, msg, images.length, priority);
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
@@ -5008,7 +5092,7 @@ export function NarratorPanel({
 		return () => window.removeEventListener("keydown", handler);
 	}, [effectiveFocusIndex, permButtonCount, input]);
 
-	if (!narrator || messagesLoading) return <NarratorPanelSkeleton />;
+	if (!narrator) return <NarratorPanelSkeleton />;
 
 	const hasContextData = contextPercent != null;
 	const contextIndicatorPercent = hasContextData ? Math.min(contextPercent, 100) : 0;
@@ -5624,7 +5708,47 @@ export function NarratorPanel({
 								<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
 									<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
 										<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-											{isWorkspacePreview ? (
+											{!canRenderMessages ? (
+												<Box h="100%" py="sm" px="md">
+													<Stack gap="md">
+														<Group align="flex-start" gap="sm">
+															<Skeleton height={28} width={28} circle />
+															<Box style={{ flex: 1 }}>
+																<Skeleton height={14} width={60} mb={6} radius="sm" />
+																<Skeleton height={36} radius="sm" />
+															</Box>
+														</Group>
+														<Group align="flex-start" gap="sm">
+															<Skeleton height={28} width={28} circle />
+															<Box style={{ flex: 1 }}>
+																<Skeleton height={14} width={80} mb={6} radius="sm" />
+																<Skeleton height={16} width="95%" mb={4} radius="sm" />
+																<Skeleton height={16} width="88%" mb={4} radius="sm" />
+																<Skeleton height={16} width="72%" mb={4} radius="sm" />
+																<Skeleton height={80} width="100%" mt={8} radius="sm" />
+																<Skeleton height={16} width="90%" mt={8} radius="sm" />
+																<Skeleton height={16} width="60%" radius="sm" />
+															</Box>
+														</Group>
+														<Group align="flex-start" gap="sm">
+															<Skeleton height={28} width={28} circle />
+															<Box style={{ flex: 1 }}>
+																<Skeleton height={14} width={60} mb={6} radius="sm" />
+																<Skeleton height={24} width="70%" radius="sm" />
+															</Box>
+														</Group>
+														<Group align="flex-start" gap="sm">
+															<Skeleton height={28} width={28} circle />
+															<Box style={{ flex: 1 }}>
+																<Skeleton height={14} width={80} mb={6} radius="sm" />
+																<Skeleton height={16} width="92%" mb={4} radius="sm" />
+																<Skeleton height={16} width="85%" mb={4} radius="sm" />
+																<Skeleton height={16} width="45%" radius="sm" />
+															</Box>
+														</Group>
+													</Stack>
+												</Box>
+											) : isWorkspacePreview ? (
 												<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
 													<Box
 														px="md"
@@ -5652,7 +5776,7 @@ export function NarratorPanel({
 											) : usePixiRenderer ? (
 												<NarratorPixiMessageList
 													ref={virtualListRef}
-													messagesData={messagesData}
+													messagesData={deferredMessagesData}
 													narratorId={narratorId}
 													streamingMsg={streamingMsg}
 													pruneBoundaryMessageId={pruneBoundaryMessageId}
@@ -5673,21 +5797,6 @@ export function NarratorPanel({
 													contentRef={contentRef}
 													shift={isFetchingNextPage}
 												/>
-											) : advancedAnim ? (
-												<BlurInOnAppearProvider
-													scopeKey={narratorId}
-													suppress={suppressBlurIn}
-													seedIds={blurInSeedIds}
-												>
-													<BroadMessageList
-														ref={virtualListRef}
-														elements={renderedElements}
-														elementKeys={renderedKeys}
-														scrollRef={viewportCallbackRef}
-														contentRef={contentRef}
-														shift={isFetchingNextPage}
-													/>
-												</BlurInOnAppearProvider>
 											) : (
 												<BroadMessageList
 													ref={virtualListRef}

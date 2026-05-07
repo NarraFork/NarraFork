@@ -370,9 +370,14 @@ export async function getNetwork(
 
 	let output = lines.join("\n");
 	if (!output) {
-		output = opts?.filter
-			? `No network requests matched filter: ${opts.filter}`
-			: "No network requests captured.";
+		if (!session.networkCaptureEnabled && totalCount === 0) {
+			output =
+				"Network capture is not enabled. Use network_start first, or launch with capture_network=true to capture initial page requests.";
+		} else {
+			output = opts?.filter
+				? `No network requests matched filter: ${opts.filter}`
+				: "No network requests captured.";
+		}
 	}
 	if (output.length > maxLength) {
 		output = `${output.slice(0, maxLength)}\n\n[Network output truncated at ${maxLength} characters]`;
@@ -387,6 +392,22 @@ export async function getNetwork(
 		totalCount,
 		snapshot: await snapshot(session.page),
 	};
+}
+
+/** Start capturing network requests for this session. */
+export function networkStart(session: BrowserSession, opts?: { clear?: boolean }): void {
+	touchSession(session);
+	if (opts?.clear) {
+		session.networkRequests.length = 0;
+		session.networkRequestMap = new WeakMap();
+	}
+	session.networkCaptureEnabled = true;
+}
+
+/** Stop capturing network requests for this session. Existing captured entries are kept. */
+export function networkStop(session: BrowserSession): void {
+	touchSession(session);
+	session.networkCaptureEnabled = false;
 }
 
 /** Execute JavaScript in the page context. */

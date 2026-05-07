@@ -125,9 +125,10 @@ class TerminalWSManager {
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this._connected = false;
+			// 1001 = Going Away — server is shutting down, don't reconnect.
+			if (ev.code === 1001) this._disconnected = true;
 			this.notifyStatus();
 			this.syncGlobalStatus();
-			// 1001 = Going Away — server is shutting down, don't reconnect.
 			if (ev.code === 1001) return;
 			this.scheduleReconnect();
 		};
@@ -168,6 +169,7 @@ class TerminalWSManager {
 		this.reconnectAttempts = 0;
 		this._disconnected = false;
 		this.notifyStatus();
+		this.syncGlobalStatus();
 		const ws = this.ws;
 		this.ws = null;
 		if (ws) {
@@ -240,7 +242,7 @@ class TerminalWSManager {
 		}
 		setWSStatus("terminal", {
 			label: "Terminal",
-			connected: this._connected,
+			connected: this._connected || !this._disconnected,
 			reconnect: () => this.resetReconnect(),
 		});
 	}

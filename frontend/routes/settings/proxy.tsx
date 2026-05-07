@@ -17,6 +17,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
+import { normalizeProxyUrl } from "../../lib/proxy";
 
 export const Route = createFileRoute("/settings/proxy")({
 	component: ProxyManagementPage,
@@ -64,7 +65,9 @@ function ProxyManagementPage() {
 	});
 
 	const handleSave = useCallback(() => {
-		saveMut.mutate(proxy || undefined);
+		const normalized = normalizeProxyUrl(proxy);
+		setProxy(normalized ?? "");
+		saveMut.mutate(normalized);
 	}, [proxy, saveMut]);
 
 	return (
@@ -121,7 +124,9 @@ function CodexProxyCard() {
 	});
 
 	const handleSave = useCallback(() => {
-		saveMut.mutate(proxy || undefined);
+		const normalized = normalizeProxyUrl(proxy);
+		setProxy(normalized ?? "");
+		saveMut.mutate(normalized);
 	}, [proxy, saveMut]);
 
 	return (

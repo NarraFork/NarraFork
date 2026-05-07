@@ -31,6 +31,7 @@ export interface RenderToolRunOptions {
 	onViewSubagentSession?: (narratorId: string) => void;
 	containerStyle?: React.CSSProperties;
 	containerClassName?: string;
+	enableBlurIn?: boolean;
 }
 
 export type RenderedTreeElementMeta =
@@ -111,6 +112,7 @@ export function renderToolRun(
 		onViewSubagentSession,
 		containerStyle,
 		containerClassName,
+		enableBlurIn = true,
 	} = opts;
 
 	if (items.length === 0) return null;
@@ -121,7 +123,11 @@ export function renderToolRun(
 	const taskCount = items.filter((it) => it.isSubagent).length;
 	const soleSubagent = taskCount === 1;
 	const wrapWithBlur = (animationId: string | null, node: React.ReactNode) =>
-		animationId ? <BlurInOnAppear animationId={animationId}>{node}</BlurInOnAppear> : node;
+		enableBlurIn && animationId ? (
+			<BlurInOnAppear animationId={animationId}>{node}</BlurInOnAppear>
+		) : (
+			node
+		);
 
 	const renderItem = (item: ToolRunItem, idx: number, total: number) => {
 		const key = item.tc.toolUseId ?? `${item.msg.id}-${idx}`;
@@ -253,6 +259,7 @@ export function renderTreeMessages(
 	streamingMsg?: NarratorMsg | null,
 	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>,
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void,
+	enableBlurIn = true,
 ): { elements: React.ReactNode[]; meta: RenderedTreeElementMeta[]; segments: RenderSegment[] } {
 	const segments = segmentMessages(messages, {
 		pruneBoundaryMessageId,
@@ -362,7 +369,9 @@ export function renderTreeMessages(
 			</Box>
 		);
 		const userAnimationId =
-			targetMsg.role === "user" ? getUserMessageBlurAnimationId(targetMsg.id) : null;
+			enableBlurIn && targetMsg.role === "user"
+				? getUserMessageBlurAnimationId(targetMsg.id)
+				: null;
 		return userAnimationId ? (
 			<BlurInOnAppear key={key} animationId={userAnimationId}>
 				{content}
@@ -415,6 +424,7 @@ export function renderTreeMessages(
 			onDeleteBlock,
 			onRollbackToBlock,
 			onViewSubagentSession,
+			enableBlurIn,
 		});
 		if (el) {
 			elements.push(el);

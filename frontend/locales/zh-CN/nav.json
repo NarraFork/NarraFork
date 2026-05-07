@@ -30,5 +30,7 @@
 	"revealInExplorer": "在资源管理器中打开",
 	"totalOutputChars": "AI 输出总字符数",
 	"feedback": "反馈问题",
+	"requestDumpEnabledBadge": "Dump 已开启",
+	"requestDumpEnabledTooltip": "正在记录每条 AI 请求，点击跳转到设置",
 	"licenses": "开源协议"
 }

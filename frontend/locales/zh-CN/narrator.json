@@ -378,6 +378,8 @@
 	"browser.tracingActive": "录制中",
 	"browser.stopTracing": "停止录制",
 	"browser.networkRequests": "已捕获 {{count}} 个网络请求",
+	"browser.networkCaptureOn": "网络请求捕获已开启",
+	"browser.networkCaptureOff": "网络请求捕获已关闭",
 	"filePreview_loadError": "加载文件失败",
 	"filePreview_loading": "加载中…",
 	"splitRight": "向右分割",

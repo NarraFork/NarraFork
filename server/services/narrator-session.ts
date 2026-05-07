@@ -91,7 +91,7 @@ import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
 
-import { narratorGoalService } from "./narrator-goal-service";
+import { type NarratorGoalDTO, narratorGoalService } from "./narrator-goal-service";
 import type {
 	ActiveNarrator,
 	BufferCreator,
@@ -445,6 +445,22 @@ async function finalizeInterruptedRun(
 
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
 	return narratorGoalService.goalTokenDeltaForUsage(usage);
+}
+
+function formatGoalNoticeList(goals: NarratorGoalDTO[]): string {
+	if (goals.length === 0) return "(empty)";
+	return goals.map((goal, index) => `${index + 1}. [${goal.status}] ${goal.objective}`).join("\n");
+}
+
+export function notifyRunningNarratorGoalStateChanged(
+	narratorId: string,
+	action: string,
+	goals: NarratorGoalDTO[],
+): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive || !active._loopRunning) return false;
+	active._pendingGoalStateNotice = `[System] The NarraFork goal list was changed externally while this turn was already running (action: ${action}). Treat the list below as the current source of truth. Do not call AddGoal for an objective that is already listed; continue according to the active goal and the latest user intent.\n\nCurrent goal list:\n${formatGoalNoticeList(goals)}`;
+	return true;
 }
 
 async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
@@ -1249,6 +1265,16 @@ export async function runAgentLoop(
 					}
 					// phase === "after_tools"
 					const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
+
+					if (active._pendingGoalStateNotice) {
+						sideCars.push({
+							target: "user_message",
+							source: "goal_update",
+							content: active._pendingGoalStateNotice,
+							orderIndex: 0,
+						});
+						active._pendingGoalStateNotice = undefined;
+					}
 
 					// Drain completed background subagent tasks
 					const subDone = drainCompletedBackgroundSubagents(narratorId);

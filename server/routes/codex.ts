@@ -7,7 +7,7 @@ import {
 import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { saveSettings, settings } from "../lib/settings";
+import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
 	codexDefaultReasoningEffortSchema,
 	codexTierOrderSchema,
@@ -347,7 +347,7 @@ codexRoutes.post("/global-proxy", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { proxy?: string };
 
 	settings.codex = settings.codex || {};
-	settings.codex.proxy = body.proxy || undefined;
+	settings.codex.proxy = normalizeProxyUrl(body.proxy);
 	saveSettings(settings);
 
 	return c.json({ ok: true });

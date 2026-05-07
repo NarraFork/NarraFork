@@ -22,6 +22,7 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
@@ -33,7 +34,7 @@ import {
 } from "../../hooks/useFavoriteDirectories";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
-import { usePlatform } from "../../hooks/usePlatform";
+import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 
@@ -129,9 +130,13 @@ function SortableFavoriteItem({
 
 export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
-	const platform = usePlatform();
 	const createNarrator = useCreateNarrator();
 	const { groupedModels } = useAllModels();
+	const { data: settings } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+	const defaultProjectDir = settings?.paths?.defaultProjectDir ?? "";
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -228,9 +233,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				<DirectoryPicker
 					label={t("workingDirectory")}
 					description={t("workingDirectoryHint")}
-					placeholder={
-						platform === "windows" ? "E:\\Code\\my-project" : "/home/user/projects/my-project"
-					}
+					placeholder={defaultProjectDir || undefined}
 					leftSection={<IconFolder size={16} />}
 					value={cwd}
 					onChange={setCwd}

@@ -54,7 +54,7 @@ import { userPreferencesRoutes } from "./routes/user-preferences";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 
-const isCompiledBinary = import.meta.url.startsWith("file:///$bunfs/");
+const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
 const hasFrontendBuild = existsSync(
 	resolve(import.meta.dir, "..", "dist", "frontend", "index.html"),
 );
