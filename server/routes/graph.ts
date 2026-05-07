@@ -1,9 +1,10 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, ne } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
-import { chapterEdges, chapters, explorationGroups } from "../db/schema";
+import { chapterEdges, chapters, containerInstances, explorationGroups } from "../db/schema";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
 import { updateGraphPositionsSchema } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
@@ -22,6 +23,7 @@ export interface GraphNode {
 		narratorCount: number;
 		narratorId: string | null;
 		narratorStatus: string | null;
+		narratorSubstatus: string[] | null;
 		hasContainers: boolean;
 		hasUpstreamUpdates: boolean;
 		isRoot: boolean;
@@ -73,6 +75,7 @@ export function buildGraph(
 	narratorCounts: Map<string, number>,
 	narratorIds: Map<string, string>,
 	narratorStatuses: Map<string, string>,
+	narratorSubstatuses: Map<string, string[]>,
 	containerPresence: Set<string>,
 	edgeRows: {
 		id: string;
@@ -96,6 +99,7 @@ export function buildGraph(
 			narratorCount: narratorCounts.get(ch.id) ?? 0,
 			narratorId: narratorIds.get(ch.id) ?? null,
 			narratorStatus: narratorStatuses.get(ch.id) ?? null,
+			narratorSubstatus: narratorSubstatuses.get(ch.id) ?? null,
 			hasContainers: containerPresence.has(ch.id),
 			hasUpstreamUpdates: false,
 			isRoot: !!ch.isRoot,
@@ -202,27 +206,51 @@ graphRoutes.get("/:id/graph", async (c) => {
 		}
 	}
 
-	// Get narrator counts and container presence per chapter
+	// Get graph metadata once chapter IDs are known.
 	const chapterIds = projectChapters.map((ch) => ch.id);
-
-	const allNarrators = chapterIds.length
-		? await db.query.narrators.findMany({
-				where: (n, { inArray }) => inArray(n.chapterId, chapterIds),
-				columns: { id: true, chapterId: true, status: true },
-			})
-		: [];
-
-	const allContainers = chapterIds.length
-		? await db.query.containerInstances.findMany({
-				where: (ci, { inArray, and, ne }) =>
-					and(inArray(ci.chapterId, chapterIds), ne(ci.status, "removed")),
-				columns: { id: true, chapterId: true },
-			})
-		: [];
+	const [allNarrators, allContainers, edgeRows, groups, openedTerminals] = await Promise.all([
+		chapterIds.length
+			? db.query.narrators.findMany({
+					where: (n, { inArray }) => inArray(n.chapterId, chapterIds),
+					columns: { id: true, chapterId: true, status: true, substatus: true },
+				})
+			: Promise.resolve([]),
+		chapterIds.length
+			? db
+					.select({ chapterId: containerInstances.chapterId })
+					.from(containerInstances)
+					.where(
+						and(
+							inArray(containerInstances.chapterId, chapterIds),
+							ne(containerInstances.status, "removed"),
+						),
+					)
+					.groupBy(containerInstances.chapterId)
+					.all()
+			: Promise.resolve([]),
+		db.select().from(chapterEdges).where(eq(chapterEdges.projectId, projectId)).all(),
+		db.select().from(explorationGroups).where(eq(explorationGroups.projectId, projectId)).all(),
+		chapterIds.length
+			? db.query.terminals.findMany({
+					where: (t, { and, inArray, eq }) =>
+						and(inArray(t.chapterId, chapterIds), eq(t.graphOpened, 1), eq(t.status, "running")),
+					columns: {
+						id: true,
+						chapterId: true,
+						name: true,
+						graphX: true,
+						graphY: true,
+						graphWidth: true,
+						graphHeight: true,
+					},
+				})
+			: Promise.resolve([]),
+	]);
 
 	const narratorCounts = new Map<string, number>();
 	const narratorIds = new Map<string, string>();
 	const narratorStatuses = new Map<string, string>();
+	const narratorSubstatuses = new Map<string, string[]>();
 	for (const n of allNarrators) {
 		if (n.chapterId) {
 			narratorCounts.set(n.chapterId, (narratorCounts.get(n.chapterId) ?? 0) + 1);
@@ -230,6 +258,7 @@ graphRoutes.get("/:id/graph", async (c) => {
 			if (!narratorIds.has(n.chapterId)) {
 				narratorIds.set(n.chapterId, n.id);
 				if (n.status) narratorStatuses.set(n.chapterId, n.status);
+				narratorSubstatuses.set(n.chapterId, parseSubstatus(n.substatus));
 			}
 		}
 	}
@@ -239,46 +268,16 @@ graphRoutes.get("/:id/graph", async (c) => {
 		containerPresence.add(ci.chapterId);
 	}
 
-	// Get edges from chapter_edges table
-	const edgeRows = await db
-		.select()
-		.from(chapterEdges)
-		.where(eq(chapterEdges.projectId, projectId))
-		.all();
-
-	// Get exploration groups for this project
-	const groups = await db
-		.select()
-		.from(explorationGroups)
-		.where(eq(explorationGroups.projectId, projectId))
-		.all();
-
 	// Build graph
 	const { nodes, edges } = buildGraph(
 		projectChapters,
 		narratorCounts,
 		narratorIds,
 		narratorStatuses,
+		narratorSubstatuses,
 		containerPresence,
 		edgeRows,
 	);
-
-	// Get terminals that are opened in the graph
-	const openedTerminals = chapterIds.length
-		? await db.query.terminals.findMany({
-				where: (t, { and, inArray, eq }) =>
-					and(inArray(t.chapterId, chapterIds), eq(t.graphOpened, 1), eq(t.status, "running")),
-				columns: {
-					id: true,
-					chapterId: true,
-					name: true,
-					graphX: true,
-					graphY: true,
-					graphWidth: true,
-					graphHeight: true,
-				},
-			})
-		: [];
 
 	return c.json({ nodes, edges, explorationGroups: groups, openedTerminals });
 });
@@ -303,17 +302,19 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 		}
 	}
 
-	for (const pos of parsed.data.positions) {
-		const updates: Record<string, unknown> = {
-			anchorCommitSha: pos.anchorCommitSha ?? null,
-			axisOffset: pos.axisOffset,
-			crossOffset: pos.crossOffset,
-		};
-		if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
-		if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
-		if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;
-		await db.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId));
-	}
+	await db.transaction(async (tx) => {
+		for (const pos of parsed.data.positions) {
+			const updates: Record<string, unknown> = {
+				anchorCommitSha: pos.anchorCommitSha ?? null,
+				axisOffset: pos.axisOffset,
+				crossOffset: pos.crossOffset,
+			};
+			if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
+			if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
+			if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;
+			await tx.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId));
+		}
+	});
 
 	return c.json({ ok: true });
 });

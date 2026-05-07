@@ -1998,11 +1998,11 @@ export async function handlePermission(
 					})
 					.where(eq(narratorToolCalls.id, requestId));
 				await narratorService.updateStatus(narratorId, "waiting", {
-					substatus: ["silent_notification"],
+					substatus: ["silent_notification", "reflecting"],
 				});
 				if (wsTarget !== narratorId) {
 					await narratorService.updateStatus(wsTarget, "waiting", {
-						substatus: ["silent_notification"],
+						substatus: ["silent_notification", "reflecting"],
 					});
 				}
 				if (signal.aborted) {

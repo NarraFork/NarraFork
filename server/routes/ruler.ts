@@ -17,9 +17,10 @@ import { getPrompt, getUserLanguage, type Locale } from "../lib/prompt-i18n";
  * priority list for the detailed narrator panel view.
  */
 function resolveNarratorDisplayStatus(status: string, substatusRaw?: string | null): string {
-	if (status === "working" || status === "waiting") return status;
-	if (status !== "idle" || !substatusRaw) return status;
 	const sub = parseSubstatus(substatusRaw);
+	if (sub.includes("reflecting")) return "reflecting";
+	if (status === "working" || status === "waiting") return status;
+	if (status !== "idle") return status;
 	// Priority: error > suspended > manual_override > interrupted > unread
 	if (sub.includes("error")) return "error";
 	if (sub.includes("suspended")) return "suspended";
@@ -94,7 +95,7 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 
 	// Get main branch commit log
 	const branch = project.defaultBranch ?? "main";
-	const totalCommitCount = await gitService.getCommitCount(project.gitPath, branch);
+	const totalCommitCountPromise = gitService.getCommitCount(project.gitPath, branch);
 
 	// Cursor-based pagination: use git rev-list to find cursor's absolute position
 	if (cursor) {
@@ -118,11 +119,14 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 		}
 	}
 
-	const commits = await gitService.getLog(project.gitPath, {
-		limit,
-		skip,
-		branch,
-	});
+	const [totalCommitCount, commits] = await Promise.all([
+		totalCommitCountPromise,
+		gitService.getLog(project.gitPath, {
+			limit,
+			skip,
+			branch,
+		}),
+	]);
 
 	// Build a SHA set for fast lookup
 	const commitShaSet = new Set(commits.map((co) => co.sha));
@@ -375,36 +379,30 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	);
 	const chapterIds = segmentChapters.map((ch) => ch.id);
 
-	// Get narrator info
-	let narratorMap = new Map<string, { id: string; status: string }>();
-	if (chapterIds.length > 0) {
-		const chapterNarrators = await db.query.narrators.findMany({
-			where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
-			columns: { id: true, chapterId: true, status: true, substatus: true },
-		});
-		narratorMap = new Map(
-			chapterNarrators
-				.filter(hasChapterId)
-				.map((n) => [
-					n.chapterId,
-					{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
-				]),
-		);
-	}
+	const [chapterNarrators, edges] = chapterIds.length
+		? await Promise.all([
+				db.query.narrators.findMany({
+					where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
+					columns: { id: true, chapterId: true, status: true, substatus: true },
+				}),
+				db.query.chapterEdges.findMany({
+					where: and(
+						eq(chapterEdges.projectId, projectId),
+						inArray(chapterEdges.sourceId, chapterIds),
+					),
+					columns: { id: true, sourceId: true, targetId: true, type: true },
+				}),
+			])
+		: [[], []];
 
-	// Get edges between these chapters
-	let edges: Array<{
-		id: string;
-		sourceId: string;
-		targetId: string;
-		type: string;
-	}> = [];
-	if (chapterIds.length > 0) {
-		edges = await db.query.chapterEdges.findMany({
-			where: and(eq(chapterEdges.projectId, projectId), inArray(chapterEdges.sourceId, chapterIds)),
-			columns: { id: true, sourceId: true, targetId: true, type: true },
-		});
-	}
+	const narratorMap = new Map(
+		chapterNarrators
+			.filter(hasChapterId)
+			.map((n) => [
+				n.chapterId,
+				{ id: n.id, status: resolveNarratorDisplayStatus(n.status, n.substatus) },
+			]),
+	);
 
 	const result = segmentChapters.map((ch) => {
 		const narrator = narratorMap.get(ch.id);
@@ -441,19 +439,21 @@ rulerRoutes.patch("/:id/ruler/positions", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { positions } = parsed.data;
 
-	for (const pos of positions) {
-		const updates: Record<string, unknown> = {
-			anchorCommitSha: pos.anchorCommitSha,
-			axisOffset: pos.axisOffset,
-			crossOffset: pos.crossOffset,
-		};
-		if (pos.width != null) updates.panelWidth = pos.width;
-		if (pos.height != null) updates.panelHeight = pos.height;
-		await db
-			.update(chapters)
-			.set(updates)
-			.where(and(eq(chapters.id, pos.chapterId), eq(chapters.projectId, projectId)));
-	}
+	await db.transaction(async (tx) => {
+		for (const pos of positions) {
+			const updates: Record<string, unknown> = {
+				anchorCommitSha: pos.anchorCommitSha,
+				axisOffset: pos.axisOffset,
+				crossOffset: pos.crossOffset,
+			};
+			if (pos.width != null) updates.panelWidth = pos.width;
+			if (pos.height != null) updates.panelHeight = pos.height;
+			await tx
+				.update(chapters)
+				.set(updates)
+				.where(and(eq(chapters.id, pos.chapterId), eq(chapters.projectId, projectId)));
+		}
+	});
 
 	return c.json({ success: true });
 });

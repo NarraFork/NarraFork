@@ -32,9 +32,9 @@ function getReflectionStatus(suggestions: unknown): string | null {
 	return null;
 }
 
-function isResolvedReflection(suggestions: unknown): boolean {
+function shouldHidePendingPermission(suggestions: unknown): boolean {
 	const status = getReflectionStatus(suggestions);
-	return status !== null && status !== "running" && status !== "awaiting_user";
+	return status !== null && status !== "awaiting_user";
 }
 
 /**
@@ -722,15 +722,16 @@ export const narratorMessageQueries = {
 	},
 
 	async getMessagesAfter(narratorId: string, afterMessageId: string, limit = 40) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, afterMessageId),
-			),
-			columns: { seq: true },
-		});
+		const [isSubagent, ref] = await Promise.all([
+			this.isSubagentNarrator(narratorId),
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, afterMessageId),
+				),
+				columns: { seq: true },
+			}),
+		]);
 		if (!ref) return { topLevel: [], orphanChildren: [], hitLimit: true };
 
 		const countConditions = [
@@ -861,22 +862,23 @@ export const narratorMessageQueries = {
 		const before = Math.max(0, opts.before ?? 5);
 		const after = Math.max(0, opts.after ?? 20);
 		const fallbackLimit = Math.max(before + after + 1, 10);
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { seq: true },
-		});
+		const [isSubagent, targetRef, target] = await Promise.all([
+			this.isSubagentNarrator(narratorId),
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { seq: true },
+			}),
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { id: true, parentToolUseId: true },
+			}),
+		]);
 		if (!targetRef) {
 			return this.getMessagesCursor(narratorId, fallbackLimit);
 		}
-
-		const target = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-		});
 		if (!target) {
 			return this.getMessagesCursor(narratorId, fallbackLimit);
 		}
@@ -916,39 +918,41 @@ export const narratorMessageQueries = {
 
 		const topLevelFilter = isSubagent ? undefined : isNull(narratorMessages.parentToolUseId);
 
-		const olderRefRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					lt(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-					...(topLevelFilter ? [topLevelFilter] : []),
-				),
-			)
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(before + 1);
+		const [olderRefRows, newerRefRows] = await Promise.all([
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						lt(narratorMessageRefs.seq, anchorRef.seq),
+						isNull(narratorMessageRefs.segmentCompactId),
+						...(topLevelFilter ? [topLevelFilter] : []),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(before + 1),
+			db
+				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gt(narratorMessageRefs.seq, anchorRef.seq),
+						isNull(narratorMessageRefs.segmentCompactId),
+						...(topLevelFilter ? [topLevelFilter] : []),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq)
+				.limit(after + 1),
+		]);
 
 		const hasMore = olderRefRows.length > before;
 		const olderRows = hasMore ? olderRefRows.slice(0, before) : olderRefRows;
 		olderRows.reverse();
 
-		const newerRefRows = await db
-			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					gt(narratorMessageRefs.seq, anchorRef.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-					...(topLevelFilter ? [topLevelFilter] : []),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq)
-			.limit(after + 1);
 		const hasMoreAfter = newerRefRows.length > after;
 		const newerRows = hasMoreAfter ? newerRefRows.slice(0, after) : newerRefRows;
 
@@ -1710,7 +1714,7 @@ export const narratorMessageQueries = {
 			orderBy: (tc, { asc }) => [asc(tc.createdAt)],
 		});
 		return tcs
-			.filter((tc) => !isResolvedReflection(tc.permissionSuggestions))
+			.filter((tc) => !shouldHidePendingPermission(tc.permissionSuggestions))
 			.map((tc) => ({
 				id: tc.id,
 				toolName: tc.toolName,

@@ -126,7 +126,7 @@ describe("narratorService message query regressions", () => {
 	it("subagent narrator 的 prune/compact 边界计算应包含 child 消息", async () => {
 		seedBase("n-sub");
 		db.update(narrators)
-			.set({ type: "subagent", subagentType: "general" })
+			.set({ type: "subagent", subagentType: "general", variant: "subagent:general" })
 			.where(eq(narrators.id, "n-sub"))
 			.run();
 

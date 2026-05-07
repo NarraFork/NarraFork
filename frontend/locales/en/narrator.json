@@ -60,6 +60,7 @@
 	"status_error": "Error",
 	"status_interrupted": "Interrupted",
 	"status_suspended": "Suspended",
+	"status_reflecting": "Reflecting",
 	"status_reasoning": "Reasoning",
 	"status_compacting": "Compacting",
 	"status_planning": "Planning",

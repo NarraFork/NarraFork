@@ -379,6 +379,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				width: number;
 				height: number;
 				narratorStatus: string | null;
+				narratorSubstatus: string[] | null;
 				onToggleExpand: (chapterId: string) => void;
 			}
 		>
@@ -610,23 +611,31 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const narratorIdsForWS = useMemo(() => [...narratorIdMap.keys()], [narratorIdMap]);
 
-	const liveStatusesRef = useRef(new Map<string, string>());
+	type LiveNarratorStatus = { status?: string; substatus?: string[] };
+	const liveStatusesRef = useRef(new Map<string, LiveNarratorStatus>());
 	const [liveStatusesTick, setLiveStatusesTick] = useState(0);
 	// Derive a stable snapshot for consumers — only changes when tick changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: liveStatusesTick is intentionally used to trigger re-read of the mutable ref
 	const liveStatuses = useMemo(() => liveStatusesRef.current, [liveStatusesTick]);
 
 	const handleNarratorWSUpdate = useCallback(
-		(narratorId: string, event: { type: string; status?: string }) => {
-			if (event.type === "status" && event.status) {
-				const chapterId = narratorIdMap.get(narratorId);
-				if (chapterId) {
-					const prev = liveStatusesRef.current.get(chapterId);
-					if (prev !== event.status) {
-						liveStatusesRef.current.set(chapterId, event.status as string);
-						setLiveStatusesTick((t) => t + 1);
-					}
-				}
+		(narratorId: string, event: { type: string; status?: string; substatus?: string[] }) => {
+			if (event.type !== "status") return;
+			const chapterId = narratorIdMap.get(narratorId);
+			if (!chapterId) return;
+
+			const prev = liveStatusesRef.current.get(chapterId) ?? {};
+			const next = {
+				...prev,
+				...(event.status !== undefined ? { status: event.status } : {}),
+				...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
+			};
+			if (
+				prev.status !== next.status ||
+				JSON.stringify(prev.substatus ?? []) !== JSON.stringify(next.substatus ?? [])
+			) {
+				liveStatusesRef.current.set(chapterId, next);
+				setLiveStatusesTick((t) => t + 1);
 			}
 		},
 		[narratorIdMap],
@@ -659,6 +668,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				width: number;
 				height: number;
 				narratorStatus: string | null;
+				narratorSubstatus: string[] | null;
 				onToggleExpand: (chapterId: string) => void;
 			}
 		>();
@@ -668,9 +678,15 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			const size = panelSizesRef.current.get(node.id);
 			const width = size?.w ?? 380;
 			const height = size?.h ?? 640;
-			const baseNarratorStatus =
-				(node.data as { narratorStatus?: string | null }).narratorStatus ?? null;
-			const narratorStatus = liveStatuses.get(node.id) ?? baseNarratorStatus;
+			const nodeData = node.data as {
+				narratorStatus?: string | null;
+				narratorSubstatus?: string[] | null;
+			};
+			const liveNarratorStatus = liveStatuses.get(node.id);
+			const baseNarratorStatus = nodeData.narratorStatus ?? null;
+			const baseNarratorSubstatus = nodeData.narratorSubstatus ?? null;
+			const narratorStatus = liveNarratorStatus?.status ?? baseNarratorStatus;
+			const narratorSubstatus = liveNarratorStatus?.substatus ?? baseNarratorSubstatus;
 			const cached = renderedNodeCacheRef.current.get(node.id);
 
 			if (
@@ -680,6 +696,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				cached.width === width &&
 				cached.height === height &&
 				cached.narratorStatus === narratorStatus &&
+				JSON.stringify(cached.narratorSubstatus ?? []) ===
+					JSON.stringify(narratorSubstatus ?? []) &&
 				cached.onToggleExpand === handleToggleExpand
 			) {
 				nextCache.set(node.id, cached);
@@ -693,6 +711,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					expanded: isExpanded,
 					onToggleExpand: handleToggleExpand,
 					narratorStatus,
+					narratorSubstatus,
 				},
 				...(isExpanded
 					? {
@@ -709,6 +728,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				width,
 				height,
 				narratorStatus,
+				narratorSubstatus,
 				onToggleExpand: handleToggleExpand,
 			};
 			nextCache.set(node.id, cacheEntry);

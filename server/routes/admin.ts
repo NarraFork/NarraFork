@@ -1,4 +1,4 @@
-import { count, eq } from "drizzle-orm";
+import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
@@ -206,14 +206,14 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const memUsage = process.memoryUsage();
 
 	// Active narrators (working/waiting status)
-	const activeNarratorRows = await db.query.narrators.findMany({
-		where: eq(narrators.status, "working"),
-		columns: { id: true, status: true, chapterId: true },
-	});
-	const waitingNarratorRows = await db.query.narrators.findMany({
-		where: eq(narrators.status, "waiting"),
-		columns: { id: true, status: true, chapterId: true },
-	});
+	const narratorStatusCounts = await db
+		.select({ status: narrators.status, value: count() })
+		.from(narrators)
+		.where(inArray(narrators.status, ["working", "waiting"]))
+		.groupBy(narrators.status);
+	const narratorCountByStatus = new Map(narratorStatusCounts.map((row) => [row.status, row.value]));
+	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
+	const waitingNarratorCount = narratorCountByStatus.get("waiting") ?? 0;
 
 	// Worktree watchers
 	const watcherPaths = worktreeWatcher.getActivePaths();
@@ -242,8 +242,8 @@ adminRoutes.get("/diagnostics", async (c) => {
 			heapTotal: memUsage.heapTotal,
 		},
 		narrators: {
-			thinking: activeNarratorRows.length,
-			waiting: waitingNarratorRows.length,
+			thinking: workingNarratorCount,
+			waiting: waitingNarratorCount,
 		},
 		worktreeWatchers: {
 			count: worktreeWatcher.getActiveCount(),

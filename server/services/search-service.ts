@@ -84,7 +84,8 @@ function chaptersLikeStmt() {
 function messagesFtsStmt() {
 	if (!_messagesFts) {
 		_messagesFts = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.content_text, m.role as message_role, m.created_at,
+			`SELECT m.id, m.narrator_id, substr(m.content_text, 1, 240) as content_preview,
+			  m.role as message_role, m.created_at,
 			  n.chapter_id, n.title as narrator_title, n.model,
 			  c.title as chapter_title, p.name as project_name,
 			  snippet(narrator_messages_fts, 0, '', '', '...', 96) as snippet,
@@ -103,7 +104,8 @@ function messagesFtsStmt() {
 function messagesLikeStmt() {
 	if (!_messagesLike) {
 		_messagesLike = sqlite.prepare(
-			`SELECT m.id, m.narrator_id, m.content_text, m.role as message_role, m.created_at,
+			`SELECT m.id, m.narrator_id, substr(m.content_text, 1, 240) as content_preview,
+			  m.role as message_role, m.created_at,
 			  n.chapter_id, n.title as narrator_title, n.model,
 			  c.title as chapter_title, p.name as project_name,
 			  substr(m.content_text, 1, 240) as snippet
@@ -170,6 +172,7 @@ export const searchService = {
 		const useFts = safeQuery.length >= 3;
 		const quoted = `"${safeQuery}"`;
 		const like = `%${safeQuery}%`;
+		const safeQueryLower = safeQuery.toLowerCase();
 
 		if (entities.includes("chapters")) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -186,9 +189,7 @@ export const searchService = {
 					role: row.role,
 					createdAt: row.created_at,
 					updatedAt: row.updated_at,
-					matchField: row.title?.toLowerCase().includes(safeQuery.toLowerCase())
-						? "title"
-						: "description",
+					matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "description",
 					matchScore: useFts ? scoreFromRank(row.rank_score, 760) : 520,
 					snippet: row.snippet || row.description || "",
 				});
@@ -214,7 +215,7 @@ export const searchService = {
 					createdAt: row.created_at,
 					matchField: "message",
 					matchScore: useFts ? scoreFromRank(row.rank_score, 700) : 500,
-					snippet: row.snippet || row.content_text?.slice(0, 240) || "",
+					snippet: row.snippet || row.content_preview || "",
 				});
 			}
 		}

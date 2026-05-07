@@ -26,19 +26,27 @@ interface ContainerAccessInfo {
 }
 
 async function getContainerAccessInfo(chapterId: string): Promise<ContainerAccessInfo | null> {
-	const instances = await db.query.containerInstances.findMany({
-		where: and(
-			eq(containerInstances.chapterId, chapterId),
-			eq(containerInstances.status, "running"),
-		),
-	});
+	const [instances, chapter] = await Promise.all([
+		db.query.containerInstances.findMany({
+			where: and(
+				eq(containerInstances.chapterId, chapterId),
+				eq(containerInstances.status, "running"),
+			),
+			columns: {
+				serviceName: true,
+				hostPort: true,
+				containerPort: true,
+				proxyLabel: true,
+			},
+		}),
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { projectId: true },
+		}),
+	]);
 	if (instances.length === 0) return null;
 
 	// Determine if proxy mode
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { projectId: true },
-	});
 	if (!chapter) return null;
 
 	const project = await db.query.projects.findFirst({

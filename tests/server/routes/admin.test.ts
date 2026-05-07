@@ -1,0 +1,75 @@
+import { afterEach, describe, expect, it, mock } from "bun:test";
+import { Hono } from "hono";
+import { narrators } from "../../../server/db/schema";
+import { cleanDb, getTestDb } from "../../setup";
+
+const { db, sqlite } = getTestDb();
+
+mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/middleware/auth", () => ({
+	requireAuth: async (
+		c: { set: (key: string, value: unknown) => void },
+		next: () => Promise<void>,
+	) => {
+		c.set("user", { sub: "admin-1", role: "admin" });
+		await next();
+	},
+	requireAdmin: async (_c: unknown, next: () => Promise<void>) => {
+		await next();
+	},
+}));
+mock.module("../../../server/services/terminal-service", () => ({
+	terminalService: {
+		listAll: async () => [{ status: "running" }, { status: "exited" }],
+	},
+}));
+mock.module("../../../server/services/worktree-watcher", () => ({
+	worktreeWatcher: {
+		getActivePaths: () => ["/repo/.worktrees/chapter-a"],
+		getActiveCount: () => 1,
+	},
+}));
+
+const { adminRoutes } = await import("../../../server/routes/admin");
+
+const app = new Hono();
+app.route("/", adminRoutes);
+
+const NOW = "2025-01-01T00:00:00.000Z";
+
+afterEach(() => cleanDb(sqlite));
+
+function seedNarrator(id: string, status: "idle" | "working" | "waiting" | "archived") {
+	db.insert(narrators)
+		.values({
+			id,
+			status,
+			type: "primary",
+			variant: "primary",
+			inheritMode: "fresh",
+			createdAt: NOW,
+			updatedAt: NOW,
+		})
+		.run();
+}
+
+describe("admin diagnostics", () => {
+	it("counts working and waiting narrators from a single status query", async () => {
+		seedNarrator("n-working-1", "working");
+		seedNarrator("n-working-2", "working");
+		seedNarrator("n-waiting", "waiting");
+		seedNarrator("n-idle", "idle");
+
+		const res = await app.request("/diagnostics");
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			narrators: { thinking: number; waiting: number };
+			terminals: { total: number; running: number };
+			worktreeWatchers: { count: number; paths: string[] };
+		};
+		expect(body.narrators).toEqual({ thinking: 2, waiting: 1 });
+		expect(body.terminals).toEqual({ total: 2, running: 1 });
+		expect(body.worktreeWatchers).toEqual({ count: 1, paths: ["/repo/.worktrees/chapter-a"] });
+	});
+});

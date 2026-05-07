@@ -7,12 +7,7 @@ import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
-import {
-	CHAPTER_ROLE_ICONS,
-	CHAPTER_STATUS_COLORS,
-	NARRATOR_STATUS_COLORS,
-	statusRegistry,
-} from "../../lib/constants";
+import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 
 export interface ChapterNodeData {
@@ -22,6 +17,7 @@ export interface ChapterNodeData {
 	narratorCount: number;
 	narratorId?: string | null;
 	narratorStatus?: string | null;
+	narratorSubstatus?: string[] | null;
 	hasContainers: boolean;
 	role?: string;
 	color?: string;
@@ -48,6 +44,9 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	const { t: tc } = useTranslation("common");
 	const { t: tch } = useTranslation("chapters");
 	const queryClient = useQueryClient();
+	const narratorDisplay = d.narratorStatus
+		? statusRegistry.narratorEffective(d.narratorStatus, d.narratorSubstatus ?? undefined)
+		: null;
 
 	// Fork-from-message: directly fork without modal
 	const forkFromMessage = useMutation({
@@ -253,13 +252,9 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 										{role}
 									</Badge>
 								)}
-								{d.narratorStatus ? (
-									<Badge
-										size="xs"
-										variant="dot"
-										color={NARRATOR_STATUS_COLORS[d.narratorStatus] ?? "gray"}
-									>
-										{d.narratorStatus}
+								{d.narratorStatus && narratorDisplay ? (
+									<Badge size="xs" variant="dot" color={narratorDisplay.color}>
+										{tc(narratorDisplay.i18nKey)}
 									</Badge>
 								) : (
 									<Text size="xs" c="dimmed">
@@ -324,6 +319,8 @@ function areChapterNodePropsEqual(prev: NodeProps, next: NodeProps) {
 		prevData.narratorCount === nextData.narratorCount &&
 		prevData.narratorId === nextData.narratorId &&
 		prevData.narratorStatus === nextData.narratorStatus &&
+		JSON.stringify(prevData.narratorSubstatus ?? []) ===
+			JSON.stringify(nextData.narratorSubstatus ?? []) &&
 		prevData.hasContainers === nextData.hasContainers &&
 		prevData.role === nextData.role &&
 		prevData.color === nextData.color &&

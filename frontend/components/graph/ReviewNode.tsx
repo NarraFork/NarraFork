@@ -3,7 +3,7 @@ import { IconEye } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
 import { memo, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import { statusRegistry } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 
 export interface ReviewNodeData {
@@ -13,6 +13,7 @@ export interface ReviewNodeData {
 	narratorCount: number;
 	narratorId?: string | null;
 	narratorStatus?: string | null;
+	narratorSubstatus?: string[] | null;
 	reviewSourceChapterId?: string | null;
 	reviewStatus?: string | null;
 	expanded?: boolean;
@@ -28,10 +29,14 @@ const MIN_RESIZE_HEIGHT = 300;
 function ReviewNodeInner({ data, id }: NodeProps) {
 	const d = data as ReviewNodeData;
 	const { t } = useTranslation("chapters");
+	const { t: tc } = useTranslation("common");
 
 	const expanded = !!d.expanded;
 	const hasNarrator = !!d.narratorId;
 	const reviewStatus = d.reviewStatus ?? "reviewing";
+	const narratorDisplay = d.narratorStatus
+		? statusRegistry.narratorEffective(d.narratorStatus, d.narratorSubstatus ?? undefined)
+		: null;
 
 	const statusColor =
 		reviewStatus === "concluded" ? "green" : reviewStatus === "reviewing" ? "yellow" : "gray";
@@ -134,18 +139,18 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 				</Group>
 
 				{/* Narrator status indicator */}
-				{!expanded && hasNarrator && d.narratorStatus && (
+				{!expanded && hasNarrator && d.narratorStatus && narratorDisplay && (
 					<Group gap={4} px="xs" py={4}>
 						<div
 							style={{
 								width: 6,
 								height: 6,
 								borderRadius: "50%",
-								background: `var(--mantine-color-${NARRATOR_STATUS_COLORS[d.narratorStatus] ?? "gray"}-5)`,
+								background: `var(--mantine-color-${narratorDisplay.color}-5)`,
 							}}
 						/>
 						<Text size="xs" c="dimmed">
-							{d.narratorStatus}
+							{tc(narratorDisplay.i18nKey)}
 						</Text>
 					</Group>
 				)}

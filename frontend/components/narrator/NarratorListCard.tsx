@@ -25,7 +25,14 @@ import { highlightSearchText } from "../../lib/search-utils";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 import { UserAvatar } from "../UserAvatar";
 
-const ATTENTION_TAGS = ["unread", "error", "interrupted", "suspended", "manual_override"] as const;
+const ATTENTION_TAGS = [
+	"unread",
+	"error",
+	"interrupted",
+	"suspended",
+	"manual_override",
+	"reflecting",
+] as const;
 
 export interface NarratorListViewer {
 	userId: string;
@@ -92,9 +99,9 @@ function getNarratorBadgeInfo(
 		(ATTENTION_TAGS as readonly string[]).includes(s),
 	);
 	const showBadge =
+		!!activeSubstatus ||
 		(status !== "idle" && status !== "working") ||
-		(status === "working" && substatus?.includes("planning")) ||
-		(status === "idle" && !!activeSubstatus);
+		(status === "working" && substatus?.includes("planning"));
 	if (!showBadge) return null;
 	const labelKey = activeSubstatus
 		? `status_${activeSubstatus}`

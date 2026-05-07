@@ -69,6 +69,7 @@ export type NarratorSubstatus =
 	| "interrupted"
 	| "suspended"
 	| "manual_override"
+	| "reflecting"
 	| "reasoning"
 	| "compacting"
 	| "planning"
@@ -81,6 +82,7 @@ const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
 	interrupted: { color: "orange", icon: "⊘", i18nKey: "status.narratorInterrupted" },
 	suspended: { color: "yellow", icon: "◔", i18nKey: "status.narratorSuspended" },
 	manual_override: { color: "orange", icon: "◔", i18nKey: "status.narratorManualOverride" },
+	reflecting: { color: "grape", icon: "◉", i18nKey: "status.narratorReflecting" },
 	reasoning: { color: "grape", icon: "◉", i18nKey: "status.narratorReasoning" },
 	compacting: { color: "orange", icon: "◉", i18nKey: "status.narratorCompacting" },
 	planning: { color: "green", icon: "◉", i18nKey: "status.narratorPlanning" },
@@ -106,6 +108,7 @@ export function getEffectiveNarratorDisplay(status: string, substatus?: string[]
 			"compacting",
 			"suspended",
 			"manual_override",
+			"reflecting",
 			"reasoning",
 			"planning",
 			"queued",

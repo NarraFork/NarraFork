@@ -27,6 +27,7 @@ export interface PixiTheme {
 	narratorUnread: number;
 	narratorError: number;
 	narratorWaiting: number;
+	narratorReflecting: number;
 	narratorManualOverride: number;
 	narratorInterrupted: number;
 	narratorSuspended: number;
@@ -118,6 +119,7 @@ export function resolvePixiTheme(): PixiTheme {
 		narratorUnread: varToHex("--mantine-color-green-5", 0x22c55e),
 		narratorError: varToHex("--mantine-color-red-5", 0xef4444),
 		narratorWaiting: varToHex("--mantine-color-yellow-5", 0xeab308),
+		narratorReflecting: varToHex("--mantine-color-grape-5", 0xa855f7),
 		narratorManualOverride: varToHex("--mantine-color-orange-5", 0xf97316),
 		narratorInterrupted: varToHex("--mantine-color-orange-5", 0xf97316),
 		narratorSuspended: varToHex("--mantine-color-yellow-5", 0xeab308),

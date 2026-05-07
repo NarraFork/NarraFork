@@ -170,6 +170,8 @@ function narratorStatusColor(theme: PixiTheme, status: string): number {
 			return theme.narratorError;
 		case "waiting":
 			return theme.narratorWaiting;
+		case "reflecting":
+			return theme.narratorReflecting;
 		case "manual_override":
 			return theme.narratorManualOverride;
 		case "interrupted":

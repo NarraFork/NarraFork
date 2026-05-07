@@ -3470,13 +3470,11 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight?: number }) {
 	const { t } = useTranslation("narrator");
-	// Plan content lives in inputJson.plan (populated by handlePermission).
-	// outputJson is just a short confirmation message after approval.
+	// Plan content lives in inputJson.plan. It may be resolved before user approval
+	// (for plan reflection), so render it independently from the final tool status.
 	const planText =
-		toolCall.status === "success" || toolCall.status === "fail"
-			? typeof toolCall.inputJson?.plan === "string"
-				? toolCall.inputJson.plan
-				: ""
+		toolCall.toolName === "ExitPlanMode" && typeof toolCall.inputJson?.plan === "string"
+			? toolCall.inputJson.plan
 			: "";
 
 	const isDenied = toolCall.status === "fail" && toolCall.toolName === "ExitPlanMode";
@@ -3979,7 +3977,7 @@ export function InlinePermission({
 	onDecision,
 	onQuestionSubmit,
 	onQuestionDeny,
-	planMaxHeight,
+	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
 	narratorId?: string;
@@ -3992,7 +3990,7 @@ export function InlinePermission({
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionDeny?: (requestId: string) => void;
-	planMaxHeight?: number;
+	onPlanPreviewChange?: (requestId: string, previewPlan: string | null) => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -4052,6 +4050,24 @@ export function InlinePermission({
 	const [feedbackConfirmOpen, setFeedbackConfirmOpen] = useState(false);
 	const [pendingCompactAfter, setPendingCompactAfter] = useState<boolean | undefined>();
 
+	// ExitPlanMode plan content is rendered by the tool card itself. The permission
+	// area only exposes approval controls and an explicit edit mode.
+	const planText =
+		permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
+			? permission.inputJson.plan
+			: null;
+	const isExitPlan = permission.toolName === "ExitPlanMode";
+	const planEdited = editedPlan !== null && editedPlan !== planText;
+	const previewPlan =
+		isExitPlan && planText && (editing || planEdited) ? (editedPlan ?? planText) : null;
+
+	useEffect(() => {
+		onPlanPreviewChange?.(permission.id, previewPlan);
+	}, [onPlanPreviewChange, permission.id, previewPlan]);
+	useEffect(() => {
+		return () => onPlanPreviewChange?.(permission.id, null);
+	}, [onPlanPreviewChange, permission.id]);
+
 	// AskUserQuestion: render the full question form inline
 	const askQuestions =
 		permission.toolName === "AskUserQuestion"
@@ -4072,15 +4088,6 @@ export function InlinePermission({
 	}
 
 	const localizedDecisionReason = permission.decisionReason ?? null;
-
-	// ExitPlanMode: show plan content above the allow/deny buttons
-	const planText =
-		permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
-			? permission.inputJson.plan
-			: null;
-
-	const isExitPlan = permission.toolName === "ExitPlanMode";
-	const planEdited = editedPlan !== null && editedPlan !== planText;
 
 	const handleAllow = (compactAfter?: boolean) => {
 		// If ExitPlanMode and user has feedback text, show confirmation dialog
@@ -4127,20 +4134,10 @@ export function InlinePermission({
 	// Regular permission: feedback textarea + Allow/Deny buttons
 	return (
 		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
-			{planText && !editing && (
-				<Box mb="xs" style={{ minHeight: 0, maxHeight: planMaxHeight, overflow: "auto" }}>
-					{planEdited && (
-						<Badge size="xs" color="indigo" variant="light" mb={4}>
-							{t("planEdited")}
-						</Badge>
-					)}
-					<ContentViewer
-						content={editedPlan ?? planText}
-						markdown
-						contentType="markdown"
-						title={t("plan")}
-					/>
-				</Box>
+			{planEdited && !editing && (
+				<Badge size="xs" color="indigo" variant="light" mb={4}>
+					{t("planEdited")}
+				</Badge>
 			)}
 			{planText && editing && (
 				<Textarea
@@ -4269,10 +4266,12 @@ function LazyDetailRenderer({
 	toolCall,
 	narratorId,
 	opened,
+	planPreviewOverride,
 }: {
 	toolCall: ToolCallData;
 	narratorId?: string;
 	opened: boolean;
+	planPreviewOverride?: string | null;
 }) {
 	const needsFetch = hasTruncatedData(toolCall) && opened && !!narratorId;
 	const {
@@ -4283,13 +4282,22 @@ function LazyDetailRenderer({
 	} = useToolCallDetail(narratorId ?? "", toolCall.toolUseId ?? "", needsFetch);
 
 	const resolvedToolCall = useMemo(() => {
-		if (!fullTc) return toolCall;
-		return {
-			...toolCall,
-			inputJson: fullTc.inputJson ?? toolCall.inputJson,
-			outputJson: fullTc.outputJson ?? toolCall.outputJson,
-		};
-	}, [toolCall, fullTc]);
+		const base = fullTc
+			? {
+					...toolCall,
+					inputJson: fullTc.inputJson ?? toolCall.inputJson,
+					outputJson: fullTc.outputJson ?? toolCall.outputJson,
+				}
+			: toolCall;
+		if (base.toolName !== "ExitPlanMode" || typeof planPreviewOverride !== "string") {
+			return base;
+		}
+		const inputJson =
+			base.inputJson && typeof base.inputJson === "object" && !Array.isArray(base.inputJson)
+				? { ...base.inputJson, plan: planPreviewOverride }
+				: { plan: planPreviewOverride };
+		return { ...base, inputJson };
+	}, [toolCall, fullTc, planPreviewOverride]);
 
 	const fetchCtx = useMemo(
 		() => ({ isLoading: needsFetch && isLoading, isError, refetch }),
@@ -4525,6 +4533,20 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const lod = useRenderLod();
 	const isPreviewLod = lod === "preview";
 	const interactionEnabled = !isPreviewLod;
+	const [planPreviewOverride, setPlanPreviewOverride] = useState<{
+		requestId: string;
+		plan: string;
+	} | null>(null);
+	const handlePlanPreviewChange = useCallback((requestId: string, previewPlan: string | null) => {
+		setPlanPreviewOverride((current) => {
+			if (!previewPlan) return current?.requestId === requestId ? null : current;
+			if (current?.requestId === requestId && current.plan === previewPlan) return current;
+			return { requestId, plan: previewPlan };
+		});
+	}, []);
+	useEffect(() => {
+		if (!pendingPermission && planPreviewOverride) setPlanPreviewOverride(null);
+	}, [pendingPermission, planPreviewOverride]);
 
 	const reflection = getToolCallReflection(toolCall, pendingPermission);
 	const permissionUI =
@@ -4541,7 +4563,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onDecision={onPermissionDecision}
 				onQuestionSubmit={onQuestionSubmit}
 				onQuestionDeny={onQuestionDeny}
-				planMaxHeight={vpHeight}
+				onPlanPreviewChange={handlePlanPreviewChange}
 			/>
 		) : null;
 
@@ -4717,6 +4739,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const planStyle =
 		isPlan && vpHeight ? { maxHeight: vpHeight, overflow: "hidden auto" as const } : undefined;
+	const effectivePlanPreviewOverride =
+		planPreviewOverride && pendingPermission?.id === planPreviewOverride.requestId
+			? planPreviewOverride.plan
+			: null;
 
 	const shimmerClass = isStreaming
 		? "tool-card-shimmer"
@@ -4746,7 +4772,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
 					<LazyCollapse in={opened}>
 						<Box style={planStyle}>
-							<LazyDetailRenderer toolCall={toolCall} narratorId={narratorId} opened={opened} />
+							<LazyDetailRenderer
+								toolCall={toolCall}
+								narratorId={narratorId}
+								opened={opened}
+								planPreviewOverride={effectivePlanPreviewOverride}
+							/>
 						</Box>
 						{permissionUI}
 					</LazyCollapse>

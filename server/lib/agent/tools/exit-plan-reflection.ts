@@ -132,6 +132,7 @@ async function markExitPlanReflectionStatus(
 							: status === "running" || status === "awaiting_user"
 								? "pending"
 								: "fail",
+					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
 					permissionSuggestions: planReflectionSuggestions(pending, status, message),
 					...(status !== "running" && status !== "awaiting_user"
@@ -143,6 +144,23 @@ async function markExitPlanReflectionStatus(
 		}
 	} catch {
 		// Status persistence is best-effort; the in-memory decision still drives execution.
+	}
+
+	try {
+		const { narratorService } = await import("@server/services/narrator-service");
+		const nextStatus = status === "running" || status === "awaiting_user" ? "waiting" : "working";
+		const substatus =
+			status === "running"
+				? ["silent_notification", "reflecting"]
+				: status === "awaiting_user"
+					? ["silent_notification"]
+					: [];
+		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
+		if (pending.broadcastTargetId !== pending.narratorId) {
+			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });
+		}
+	} catch {
+		// Status update is best-effort; the in-memory decision still drives execution.
 	}
 
 	try {

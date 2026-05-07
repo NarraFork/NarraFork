@@ -60,6 +60,7 @@
 	"status_error": "错误",
 	"status_interrupted": "已中断",
 	"status_suspended": "已暂停",
+	"status_reflecting": "反思中",
 	"status_reasoning": "推理中",
 	"status_compacting": "压缩中",
 	"status_planning": "计划中",

@@ -980,13 +980,23 @@ narratorRoutes.get("/:id/messages", async (c) => {
 	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
 	const cursor = c.req.query("cursor") || undefined;
 	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
-	const result = await narratorService.getMessagesCursor(id, limit, cursor, direction);
-	const narrator = await narratorService.getById(id);
+	const [result, narratorMeta] = await Promise.all([
+		narratorService.getMessagesCursor(id, limit, cursor, direction),
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: {
+				pruneBoundaryMessageId: true,
+				prunedPercent: true,
+				messageVersion: true,
+			},
+		}),
+	]);
+	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	return c.json({
 		...result,
-		pruneBoundaryMessageId: narrator.pruneBoundaryMessageId ?? null,
-		prunedPercent: narrator.prunedPercent ?? null,
-		messageVersion: narrator.messageVersion ?? 0,
+		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
+		prunedPercent: narratorMeta.prunedPercent ?? null,
+		messageVersion: narratorMeta.messageVersion ?? 0,
 	});
 });
 
