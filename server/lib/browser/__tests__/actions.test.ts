@@ -1,5 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { actions, type BrowserSession, closeBrowser, closeSession, createSession } from "../index";
+import {
+	actions,
+	type BrowserSession,
+	closeBrowser,
+	closeSession,
+	createSession,
+	listSessions,
+	setSessionTtl,
+} from "../index";
 
 let browserChecked = false;
 let browserOk = false;
@@ -45,6 +53,30 @@ afterAll(async () => {
 });
 
 describe("Browser actions — evaluate and console capture", () => {
+	test("session TTL can be configured and updated", async () => {
+		if (await skipIfNoBrowser()) return;
+
+		const narratorId = `test-browser-${crypto.randomUUID()}`;
+		const session = await createSession(
+			narratorId,
+			dataUrl("<html><body>ok</body></html>"),
+			true,
+			60_000,
+		);
+		try {
+			expect(session.ttlMs).toBe(60_000);
+			expect(listSessions(narratorId)[0]?.ttlMs).toBe(60_000);
+
+			const updated = setSessionTtl(narratorId, session.id, 120_000);
+			expect(updated?.ttlMs).toBe(120_000);
+			const listed = listSessions(narratorId)[0];
+			expect(listed?.ttlMs).toBe(120_000);
+			expect(listed?.expiresAt).toBe(session.lastActivity + 120_000);
+		} finally {
+			await closeSession(narratorId, session.id).catch(() => {});
+		}
+	}, 30_000);
+
 	test("evaluate returns pretty JSON for objects", async () => {
 		if (await skipIfNoBrowser()) return;
 

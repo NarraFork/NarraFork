@@ -17,7 +17,7 @@ export function GitFileDiff({ chapterId, file, staged = false, onClose }: GitFil
 		<Modal opened={!!file} onClose={onClose} title={file ? t("diffTitle", { file }) : ""} size="xl">
 			{isLoading && <Loader size="sm" />}
 
-			{!isLoading && (!data || !data.diff) && (
+			{!isLoading && !data?.diff && (
 				<Text size="sm" c="dimmed">
 					{t("noDiff")}
 				</Text>

@@ -1,6 +1,7 @@
 import { Badge, Card, Group, Loader, SimpleGrid, Stack, Text, Title } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 
@@ -19,10 +20,13 @@ function DashboardPage() {
 		queryFn: () => api.listNarratorsPaginated({ standalone: true, limit: 1 }),
 	});
 
-	if (projectsLoading) return <Loader />;
+	const activeProjects = useMemo(() => {
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		return projects?.filter((p: any) => p.status === "active") ?? [];
+	}, [projects]);
+	const recentProjects = useMemo(() => activeProjects.slice(0, 6), [activeProjects]);
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const activeProjects = projects?.filter((p: any) => p.status === "active") ?? [];
+	if (projectsLoading) return <Loader />;
 
 	return (
 		<Stack>
@@ -57,7 +61,7 @@ function DashboardPage() {
 					</Title>
 					<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
 						{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-						{activeProjects.slice(0, 6).map((project: any) => (
+						{recentProjects.map((project: any) => (
 							<Card
 								key={project.id}
 								withBorder

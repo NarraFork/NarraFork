@@ -9,13 +9,40 @@ import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
 import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
+interface FeishuClientLike {
+	contact: {
+		user: {
+			get: (args: Record<string, unknown>) => Promise<{ data?: { user?: { open_id?: string } } }>;
+		};
+	};
+	im: {
+		message: {
+			create: (args: Record<string, unknown>) => Promise<{ data?: { message_id?: string } }>;
+			patch: (args: Record<string, unknown>) => Promise<unknown>;
+		};
+	};
+}
+
+interface FeishuWsClientLike {
+	start: (args: { eventDispatcher: unknown }) => Promise<unknown>;
+}
+
+interface FeishuMessageData {
+	message?: {
+		message_type?: string;
+		sender?: { sender_id?: { open_id?: string; union_id?: string } };
+		content?: string;
+		chat_id?: string;
+	};
+}
+
 export class FeishuAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "feishu";
 	readonly maxMessageLength = 8000;
 	override readonly supportsEdit = true;
 
-	private client: any = null;
-	private wsClient: any = null;
+	private client: FeishuClientLike | null = null;
+	private wsClient: FeishuWsClientLike | null = null;
 	private config: FeishuConfig;
 	private botOpenId: string | null = null;
 
@@ -32,18 +59,18 @@ export class FeishuAdapter extends BaseAdapter {
 				appId: this.config.appId,
 				appSecret: this.config.appSecret,
 				appType: lark.AppType.SelfBuild,
-			});
+			}) as unknown as FeishuClientLike;
 
 			// Create WebSocket client for event subscription
 			this.wsClient = new lark.WSClient({
 				appId: this.config.appId,
 				appSecret: this.config.appSecret,
 				loggerLevel: lark.LoggerLevel.warn,
-			});
+			}) as unknown as FeishuWsClientLike;
 
 			// Register message event handler
 			const eventDispatcher = new lark.EventDispatcher({}).register({
-				"im.message.receive_v1": (data: any) => {
+				"im.message.receive_v1": (data: FeishuMessageData) => {
 					this.handleFeishuMessage(data).catch((err) => {
 						logger.error("[feishu] Message handler error", {
 							error: err instanceof Error ? err.message : String(err),
@@ -157,7 +184,7 @@ export class FeishuAdapter extends BaseAdapter {
 	// Private
 	// -----------------------------------------------------------------------
 
-	private async handleFeishuMessage(data: any): Promise<void> {
+	private async handleFeishuMessage(data: FeishuMessageData): Promise<void> {
 		const message = data?.message;
 		if (!message) return;
 

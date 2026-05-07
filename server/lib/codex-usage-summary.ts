@@ -165,7 +165,11 @@ function getModeledRemainingPercent(usage: CodexUsageResult): number | null {
 }
 
 function isQuotaTrackedEntry(entry: CodexUsageSourceEntry): boolean {
-	return entry.disabledReason !== "manual" && entry.disabledReason !== "too_many_failures";
+	return (
+		entry.disabledReason !== "manual" &&
+		entry.disabledReason !== "too_many_failures" &&
+		entry.disabledReason !== "banned"
+	);
 }
 
 export function normalizeCodexPlanTier(planType?: string | null): CodexPlanTier {

@@ -16,7 +16,11 @@ import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
 
 /** Default session TTL: 10 minutes of inactivity. */
-const SESSION_TTL_MS = 10 * 60 * 1000;
+export const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
+/** Minimum configurable session TTL: 1 second. */
+export const MIN_SESSION_TTL_MS = 1_000;
+/** Maximum configurable session TTL: 24 hours. */
+export const MAX_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Cleanup check interval. */
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 /** Maximum console messages kept per session. */
@@ -67,6 +71,8 @@ export interface BrowserSession {
 	url: string;
 	/** Last activity timestamp (ms). */
 	lastActivity: number;
+	/** Inactivity TTL before automatic cleanup (ms). */
+	ttlMs: number;
 	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
 	headless: boolean;
 	/** Recent console output and page errors captured from the page. */
@@ -83,6 +89,19 @@ export interface BrowserSession {
 	tracing?: { active: boolean; startedAt: number };
 }
 
+export function normalizeSessionTtlMs(ttlMs: number | undefined): number {
+	const value = ttlMs ?? DEFAULT_SESSION_TTL_MS;
+	if (!Number.isFinite(value)) {
+		throw new Error("Browser session TTL must be a finite number of milliseconds");
+	}
+	if (value < MIN_SESSION_TTL_MS || value > MAX_SESSION_TTL_MS) {
+		throw new Error(
+			`Browser session TTL must be between ${MIN_SESSION_TTL_MS}ms and ${MAX_SESSION_TTL_MS}ms`,
+		);
+	}
+	return Math.floor(value);
+}
+
 /**
  * narratorId → Map<sessionId, BrowserSession>
  */
@@ -91,21 +110,35 @@ const sessions = new Map<string, Map<string, BrowserSession>>();
 /** Start periodic cleanup of expired sessions. */
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
+function isSessionExpired(session: BrowserSession, now = Date.now()): boolean {
+	return now - session.lastActivity > session.ttlMs;
+}
+
+function expireSession(
+	narratorId: string,
+	map: Map<string, BrowserSession>,
+	sessionId: string,
+	session: BrowserSession,
+): void {
+	logger.info("Browser session expired", { narratorId, sessionId, ttlMs: session.ttlMs });
+	if (session.tracing?.active) {
+		void session.page.tracing.stop().catch(() => {});
+		session.tracing = undefined;
+	}
+	void session.context.close().catch(() => {});
+	map.delete(sessionId);
+	if (map.size === 0) sessions.delete(narratorId);
+	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
+}
+
 function ensureCleanupTimer(): void {
 	if (cleanupTimer) return;
 	cleanupTimer = setInterval(() => {
 		const now = Date.now();
 		for (const [narratorId, map] of sessions) {
 			for (const [sessionId, session] of map) {
-				if (now - session.lastActivity > SESSION_TTL_MS) {
-					logger.info("Browser session expired", { narratorId, sessionId });
-					if (session.tracing?.active) {
-						void session.page.tracing.stop().catch(() => {});
-						session.tracing = undefined;
-					}
-					void session.context.close().catch(() => {});
-					map.delete(sessionId);
-					eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
+				if (isSessionExpired(session, now)) {
+					expireSession(narratorId, map, sessionId, session);
 				}
 			}
 			if (map.size === 0) sessions.delete(narratorId);
@@ -331,7 +364,9 @@ export async function createSession(
 	narratorId: string,
 	url: string,
 	headless = true,
+	ttlMs?: number,
 ): Promise<BrowserSession> {
+	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
 	const context = await createContext(headless);
 	const page = await context.newPage();
 
@@ -347,6 +382,7 @@ export async function createSession(
 		page,
 		url,
 		lastActivity: Date.now(),
+		ttlMs: normalizedTtlMs,
 		headless,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
@@ -378,7 +414,13 @@ export async function createSession(
 	map.set(sessionId, session);
 
 	ensureCleanupTimer();
-	logger.info("Browser session created", { narratorId, sessionId, url, headless });
+	logger.info("Browser session created", {
+		narratorId,
+		sessionId,
+		url,
+		headless,
+		ttlMs: normalizedTtlMs,
+	});
 	eventBus.emit({ type: "browser:session_created", sessionId, narratorId, url });
 	return session;
 }
@@ -389,6 +431,11 @@ export function getSession(narratorId: string, sessionId: string): BrowserSessio
 	if (!map) return undefined;
 	const session = map.get(sessionId);
 	if (!session) return undefined;
+
+	if (isSessionExpired(session)) {
+		expireSession(narratorId, map, sessionId, session);
+		return undefined;
+	}
 
 	// Check if context is still alive
 	try {
@@ -421,6 +468,24 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 	logger.info("Browser session closed", { narratorId, sessionId });
 	eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 	return true;
+}
+
+/** Update automatic inactivity cleanup time for a specific session. */
+export function setSessionTtl(
+	narratorId: string,
+	sessionId: string,
+	ttlMs: number,
+): BrowserSession | undefined {
+	const session = getSession(narratorId, sessionId);
+	if (!session) return undefined;
+	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
+	session.ttlMs = normalizedTtlMs;
+	// Treat a manual/agent TTL update as activity, so the new countdown starts now.
+	touchSession(session);
+	ensureCleanupTimer();
+	logger.info("Browser session TTL updated", { narratorId, sessionId, ttlMs: normalizedTtlMs });
+	eventBus.emit({ type: "browser:session_updated", sessionId, narratorId });
+	return session;
 }
 
 /** Close all sessions for a narrator (called when narrator ends). */
@@ -459,16 +524,26 @@ export function listSessions(narratorId: string): Array<{
 	id: string;
 	url: string;
 	lastActivity: number;
+	ttlMs: number;
+	expiresAt: number;
 	headless: boolean;
 	tracing: { active: boolean; startedAt: number } | null;
 	networkRequestCount: number;
 }> {
 	const map = sessions.get(narratorId);
 	if (!map) return [];
+	const now = Date.now();
+	for (const [sessionId, session] of map) {
+		if (isSessionExpired(session, now)) {
+			expireSession(narratorId, map, sessionId, session);
+		}
+	}
 	return Array.from(map.values()).map((s) => ({
 		id: s.id,
 		url: s.page.url(),
 		lastActivity: s.lastActivity,
+		ttlMs: s.ttlMs,
+		expiresAt: s.lastActivity + s.ttlMs,
 		headless: s.headless,
 		tracing: s.tracing ? { active: s.tracing.active, startedAt: s.tracing.startedAt } : null,
 		networkRequestCount: s.networkRequests.length,

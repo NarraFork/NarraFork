@@ -1,10 +1,13 @@
 import { ActionIcon, Group, Modal } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconFolderOpen } from "@tabler/icons-react";
-import { useCallback } from "react";
+import { lazy, Suspense, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { DirectoryBrowser } from "./DirectoryPicker";
 import { PathInput } from "./PathInput";
+
+const DirectoryBrowser = lazy(() =>
+	import("./DirectoryPicker").then((m) => ({ default: m.DirectoryBrowser })),
+);
 
 interface PathInputWithBrowseProps {
 	placeholder?: string;
@@ -43,7 +46,11 @@ export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBro
 				zIndex={400}
 				styles={{ body: { padding: 0 } }}
 			>
-				<DirectoryBrowser onSelect={handleSelect} onCancel={close} />
+				{opened && (
+					<Suspense fallback={null}>
+						<DirectoryBrowser onSelect={handleSelect} onCancel={close} />
+					</Suspense>
+				)}
 			</Modal>
 		</>
 	);

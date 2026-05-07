@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolContext } from "../../types";
+import type { ToolContext, ToolDefinition } from "../../types";
 import { bashTool } from "../bash";
 import {
 	BlockAnchorReplacer,
@@ -987,24 +987,21 @@ describe("zodToJsonSchema", () => {
 			mode: z.enum(["a", "b", "c"]),
 		});
 		const json = zodToJsonSchema(schema);
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const props = json.properties as Record<string, any>;
+		const props = json.properties as Record<string, { enum?: unknown }>;
 		expect(props.mode.enum).toEqual(["a", "b", "c"]);
 	});
 
 	test("converts boolean schema", () => {
 		const schema = z.object({ flag: z.boolean() });
 		const json = zodToJsonSchema(schema);
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const props = json.properties as Record<string, any>;
+		const props = json.properties as Record<string, { type?: string }>;
 		expect(props.flag).toEqual({ type: "boolean" });
 	});
 
 	test("converts grep tool schema without error", () => {
 		const json = zodToJsonSchema(grepTool.parameters);
 		expect(json.type).toBe("object");
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const props = json.properties as Record<string, any>;
+		const props = json.properties as Record<string, { type?: string; description?: string }>;
 		expect(props.pattern.type).toBe("string");
 		expect(props.pattern.description).toBeDefined();
 		expect(props.glob.type).toBe("string");
@@ -1034,28 +1031,35 @@ describe("zodToJsonSchema", () => {
 // Agent tool — rawJsonSchema parity with Zod schema
 // ============================================================
 
+type TestJsonSchema = {
+	properties?: Record<string, { type?: string; enum?: unknown; description?: string } | undefined>;
+	required?: string[];
+};
+
+function requireRawJsonSchema(tool: ToolDefinition): TestJsonSchema {
+	const schema = tool.rawJsonSchema;
+	if (!schema) throw new Error(`${tool.name} rawJsonSchema is missing`);
+	return schema as TestJsonSchema;
+}
+
 describe("Agent tool rawJsonSchema", () => {
 	test("rawJsonSchema includes model parameter", () => {
-		const schema = agentTool.rawJsonSchema!;
-		const props = schema.properties as Record<string, any>;
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
 		expect(props.model).toBeDefined();
-		expect(props.model.type).toBe("string");
+		expect(props.model?.type).toBe("string");
 	});
 
 	test("rawJsonSchema includes workdir parameter", () => {
-		const schema = agentTool.rawJsonSchema!;
-		const props = schema.properties as Record<string, any>;
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
 		expect(props.workdir).toBeDefined();
-		expect(props.workdir.type).toBe("string");
+		expect(props.workdir?.type).toBe("string");
 	});
 
 	test("rawJsonSchema includes reasoning_effort parameter", () => {
-		const schema = agentTool.rawJsonSchema;
-		if (!schema) throw new Error("Agent tool rawJsonSchema is missing");
-		const props = schema.properties as Record<
-			string,
-			{ type?: string; enum?: unknown; description?: string } | undefined
-		>;
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
 		expect(props.reasoning_effort).toBeDefined();
 		expect(props.reasoning_effort?.type).toBe("string");
 		expect(props.reasoning_effort?.enum).toEqual(["none", "low", "medium", "high", "xhigh"]);
@@ -1063,14 +1067,14 @@ describe("Agent tool rawJsonSchema", () => {
 	});
 
 	test("model description includes available models list", () => {
-		const schema = agentTool.rawJsonSchema!;
-		const props = schema.properties as Record<string, any>;
-		expect(props.model.description).toContain("Available models:");
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
+		expect(props.model?.description).toContain("Available models:");
 	});
 
 	test("rawJsonSchema no longer includes resume parameter", () => {
-		const schema = agentTool.rawJsonSchema!;
-		const props = schema.properties as Record<string, any>;
+		const schema = requireRawJsonSchema(agentTool);
+		const props = schema.properties ?? {};
 		expect(props.resume).toBeUndefined();
 	});
 
@@ -1084,16 +1088,14 @@ describe("Agent tool rawJsonSchema", () => {
 
 	test("resolveToolJsonSchema uses rawJsonSchema over Zod", () => {
 		const resolved = resolveToolJsonSchema(agentTool);
-		const raw = agentTool.rawJsonSchema!;
+		const raw = requireRawJsonSchema(agentTool);
 		expect(resolved).toEqual(raw);
 	});
 
 	test("rawJsonSchema covers all Zod parameter keys", () => {
 		const zodSchema = zodToJsonSchema(agentTool.parameters);
 		const zodKeys = Object.keys(zodSchema.properties as Record<string, unknown>);
-		const rawKeys = Object.keys(
-			(agentTool.rawJsonSchema!.properties as Record<string, unknown>) ?? {},
-		);
+		const rawKeys = Object.keys(requireRawJsonSchema(agentTool).properties ?? {});
 		// Zod and rawJsonSchema now use the same parameter names
 		for (const key of zodKeys) {
 			expect(rawKeys).toContain(key);
@@ -1103,7 +1105,7 @@ describe("Agent tool rawJsonSchema", () => {
 	test("rawJsonSchema.required matches Zod required fields", () => {
 		const zodSchema = zodToJsonSchema(agentTool.parameters);
 		const zodRequired = new Set((zodSchema.required as string[]) ?? []);
-		const rawRequired = new Set((agentTool.rawJsonSchema!.required as string[]) ?? []);
+		const rawRequired = new Set(requireRawJsonSchema(agentTool).required ?? []);
 		// Every field required in rawJsonSchema must also be required in Zod
 		for (const key of rawRequired) {
 			expect(zodRequired).toContain(key);
@@ -1164,9 +1166,7 @@ describe("rawJsonSchema parity for all tools", () => {
 		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema keys cover Zod keys`, () => {
 			const zodSchema = zodToJsonSchema(tool.parameters);
 			const zodKeys = Object.keys((zodSchema.properties as Record<string, unknown>) ?? {});
-			const rawKeys = Object.keys(
-				(tool.rawJsonSchema!.properties as Record<string, unknown>) ?? {},
-			);
+			const rawKeys = Object.keys(requireRawJsonSchema(tool).properties ?? {});
 			for (const key of zodKeys) {
 				expect(rawKeys).toContain(key);
 			}
@@ -1175,7 +1175,7 @@ describe("rawJsonSchema parity for all tools", () => {
 		(skip ? test.skip : test)(`${tool.name}: rawJsonSchema.required matches Zod required`, () => {
 			const zodSchema = zodToJsonSchema(tool.parameters);
 			const zodRequired = new Set((zodSchema.required as string[]) ?? []);
-			const rawRequired = new Set((tool.rawJsonSchema!.required as string[]) ?? []);
+			const rawRequired = new Set(requireRawJsonSchema(tool).required ?? []);
 			// rawJsonSchema must not require fields that Zod considers optional
 			for (const key of rawRequired) {
 				expect(zodRequired).toContain(key);

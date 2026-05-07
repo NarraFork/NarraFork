@@ -367,7 +367,7 @@ const _winFolderCache: Record<string, string | null> = {};
  * 2. For Downloads (no enum), use Shell.Application COM object with GUID
  * 3. Return null if all methods fail (no USERPROFILE concatenation fallback)
  */
-function resolveWindowsKnownFolder(key: string, home: string): string | null {
+function resolveWindowsKnownFolder(key: string, _home: string): string | null {
 	if (key in _winFolderCache) return _winFolderCache[key];
 
 	const specialFolder = WINDOWS_SPECIAL_FOLDER[key];

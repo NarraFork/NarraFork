@@ -23,6 +23,8 @@ const RETRYABLE_PATTERNS = [
 	"fetch failed",
 	"failed to fetch",
 	"network error",
+	"stream_read_error",
+	"stream read error",
 	"unable to connect",
 	"the operation timed out",
 	"server_error",
@@ -57,6 +59,7 @@ const RETRYABLE_ERROR_CODES = new Set([
 	"UND_ERR_SOCKET",
 	"UND_ERR_CONNECT_TIMEOUT",
 	"UND_ERR_HEADERS_TIMEOUT",
+	"STREAM_READ_ERROR",
 	// Bun-specific error codes (PascalCase instead of Node.js SCREAMING_SNAKE_CASE)
 	"CONNECTIONREFUSED",
 	"CONNECTIONRESET",
@@ -101,6 +104,7 @@ const RETRYABLE_INVALID_STATE_REASONS = new Set([
 	"service_unavailable",
 	"temporarily_unavailable",
 	"stream_closed_before_response_completed",
+	"stream_read_error",
 ]);
 
 /** Extract a human-readable message from any thrown value, including ErrorEvent objects. */

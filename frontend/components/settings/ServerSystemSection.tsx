@@ -13,14 +13,20 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconCertificate, IconRefresh, IconSearch } from "@tabler/icons-react";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
-import { UpdateModal, type UpdateModalData } from "../UpdateModal";
+import type { UpdateModalData } from "../UpdateModal";
 import { DependencyStatus } from "./DependencyStatus";
 
 const HOST_PRESETS = ["localhost", "127.0.0.1", "::1", "192.168.0.0", "0.0.0.0"];
+
+const UpdateModal = lazy(() =>
+	import("../UpdateModal").then((m) => ({
+		default: m.UpdateModal,
+	})),
+);
 
 export interface ServerSystemSectionProps {
 	port: number | undefined;
@@ -277,7 +283,11 @@ export function ServerSystemSection({
 				)}
 			</Group>
 
-			<UpdateModal opened={updateModalOpened} onClose={closeUpdateModal} data={updateData} />
+			{updateModalOpened && (
+				<Suspense fallback={null}>
+					<UpdateModal opened={updateModalOpened} onClose={closeUpdateModal} data={updateData} />
+				</Suspense>
+			)}
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

@@ -227,6 +227,21 @@ export interface UseNarratorPanelWSReturn {
 
 /** Max messages to keep in cache while the user is at the bottom. */
 const MAX_LIVE_MESSAGES = 200;
+const STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS = 16_000;
+const STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS = 12_000;
+const STREAMING_TOOL_OUTPUT_THROTTLE_MS = 250;
+
+interface ToolOutputPreviewState {
+	preview: string;
+	lastFlushedPreview: string;
+	lastFlushAt: number;
+	timer: ReturnType<typeof setTimeout> | null;
+}
+
+function getToolOutputPreview(output: string): string {
+	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
+	return output.slice(-STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS);
+}
 
 // --- Reducer for co-updated state ---
 // These fields are frequently set together in the same WS callback
@@ -269,6 +284,10 @@ function statusReducer(state: StatusState, action: StatusAction): StatusState {
 		return { ...state, ...action.payload };
 	}
 	return state;
+}
+
+function withoutQueueMessageSubstatus(substatus: string[]): string[] {
+	return substatus.filter((s) => !s.startsWith("queue_message:"));
 }
 
 function withQueueSubstatus(
@@ -393,6 +412,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	/** Accumulated streaming field value per tool (persists across RAF frames) */
 	const toolStreamingFieldRef = useRef<Map<string, { name: string; value: string }>>(new Map());
 	const toolChunkRafRef = useRef(0);
+	const toolOutputPreviewRef = useRef<Map<string, ToolOutputPreviewState>>(new Map());
 
 	// Cancel pending RAF handles and clear module-level streaming caches on unmount.
 	useEffect(() => {
@@ -403,6 +423,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			streamingBlocksRef.current = [];
 			pendingToolChunkRef.current.clear();
 			toolStreamingFieldRef.current.clear();
+			for (const state of toolOutputPreviewRef.current.values()) {
+				if (state.timer) clearTimeout(state.timer);
+			}
+			toolOutputPreviewRef.current.clear();
 			clearToolBlockCache();
 		};
 	}, []);
@@ -426,6 +450,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		if (includeSubagent) {
 			pendingToolChunkRef.current.clear();
 			toolStreamingFieldRef.current.clear();
+			for (const state of toolOutputPreviewRef.current.values()) {
+				if (state.timer) clearTimeout(state.timer);
+			}
+			toolOutputPreviewRef.current.clear();
 		} else {
 			// Only remove top-level entries; keep subagent chunks intact.
 			// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
@@ -503,6 +531,33 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		},
 		[qc, messagesQueryKey],
 	);
+
+	const flushToolOutputPreview = useCallback(
+		(toolUseId: string, preview: string) => {
+			const state = toolOutputPreviewRef.current.get(toolUseId);
+			if (state) {
+				if (preview === state.lastFlushedPreview) return;
+				state.lastFlushedPreview = preview;
+				state.lastFlushAt = Date.now();
+			}
+			scheduleCacheUpdate((old) => {
+				if (!old?.pages?.length) return old;
+				return mergeFieldsByIndex(
+					old,
+					toolUseId,
+					{ _streamingOutput: preview },
+					toolUseIndexRef.current,
+				);
+			});
+		},
+		[scheduleCacheUpdate],
+	);
+
+	const clearToolOutputPreviewState = useCallback((toolUseId: string) => {
+		const state = toolOutputPreviewRef.current.get(toolUseId);
+		if (state?.timer) clearTimeout(state.timer);
+		toolOutputPreviewRef.current.delete(toolUseId);
+	}, []);
 
 	// --- Permission state ---
 	const [pendingPermsMap, setPendingPermsMap] = useState<Map<string, PendingPermission>>(
@@ -1008,6 +1063,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[narratorId, qc, statusState.substatus],
 	);
 
+	const clearQueueMessage = useCallback(() => {
+		if (!statusState.substatus.some((s) => s.startsWith("queue_message:"))) return;
+		const substatusWithoutQueueMessage = withoutQueueMessageSubstatus(statusState.substatus);
+		dispatchStatus({ type: "patch", payload: { substatus: substatusWithoutQueueMessage } });
+		qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+			old ? { ...old, substatus: substatusWithoutQueueMessage } : old,
+		);
+	}, [narratorId, qc, statusState.substatus]);
+
 	// --- WebSocket ---
 	const {
 		connected,
@@ -1031,6 +1095,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return;
 				}
 				if (ev.delta.type === "text_delta") {
+					// A real upstream event means queue-only explanatory text is no longer current.
+					clearQueueMessage();
 					// Streaming content arriving means any pending retry has succeeded.
 					// Only call setRetryInfo when there is actually a retry to clear —
 					// avoids a no-op setState on every delta that still increments
@@ -1062,6 +1128,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return;
 				}
 				if (ev.delta.type === "reasoning_delta") {
+					// A real upstream event means queue-only explanatory text is no longer current.
+					clearQueueMessage();
 					clearRetryIfActive();
 					const blocks = streamingBlocksRef.current;
 					const reasoningId =
@@ -1113,6 +1181,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
+						// A real upstream message means queue-only explanatory text is no longer current.
+						clearQueueMessage();
 						// New assistant message means any pending retry succeeded
 						clearRetryIfActive();
 						// Only clear top-level streaming state for non-subagent messages.
@@ -1310,9 +1380,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string,
 				sideCars?: SideCarRecord[],
 			) => {
-				// Discard any pending RAF chunk and accumulated raw input for this tool
+				// Discard any pending RAF chunk/output preview and accumulated raw input for this tool
 				pendingToolChunkRef.current.delete(toolUseId);
 				toolStreamingFieldRef.current.delete(toolUseId);
+				clearToolOutputPreviewState(toolUseId);
 
 				// Update the streaming chunk entry if it still exists (top-level only)
 				if (!parentToolUseId) {
@@ -1331,6 +1402,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							_durationMs: durationMs,
 							_metadata: metadata,
 							_sideCars: sideCars,
+							_streamingOutput: undefined,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
 						bumpTopLevelStreamingChunksVersion((v) => v + 1);
@@ -1346,6 +1418,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						output,
 						toolUseIndexRef.current,
 						durationMs,
+					);
+					result = mergeFieldsByIndex(
+						result,
+						toolUseId,
+						{ _streamingOutput: undefined },
+						toolUseIndexRef.current,
 					);
 					if (updatedInput && result) {
 						result = mergeFieldsByIndex(
@@ -1421,16 +1499,46 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onToolOutput: (toolUseId: string, output: string, _parentToolUseId?: string) => {
-				// 实时更新 bash 工具的流式输出到已持久化的 tool call 上
-				scheduleCacheUpdate((old) => {
-					if (!old?.pages?.length) return old;
-					return mergeFieldsByIndex(
-						old,
-						toolUseId,
-						{ _streamingOutput: output },
-						toolUseIndexRef.current,
-					);
-				});
+				// Store only a bounded live preview in React Query while preserving final outputJson
+				// semantics when tool_completed arrives.
+				const preview = getToolOutputPreview(output);
+				const shouldThrottle = output.length >= STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS;
+				const now = Date.now();
+				let state = toolOutputPreviewRef.current.get(toolUseId);
+				if (!state) {
+					state = { preview: "", lastFlushedPreview: "", lastFlushAt: 0, timer: null };
+					toolOutputPreviewRef.current.set(toolUseId, state);
+				}
+				if (preview === state.preview) return;
+				state.preview = preview;
+
+				if (!shouldThrottle) {
+					if (state.timer) {
+						clearTimeout(state.timer);
+						state.timer = null;
+					}
+					flushToolOutputPreview(toolUseId, preview);
+					return;
+				}
+
+				const elapsed = now - state.lastFlushAt;
+				if (elapsed >= STREAMING_TOOL_OUTPUT_THROTTLE_MS) {
+					if (state.timer) {
+						clearTimeout(state.timer);
+						state.timer = null;
+					}
+					flushToolOutputPreview(toolUseId, preview);
+					return;
+				}
+
+				if (!state.timer) {
+					state.timer = setTimeout(() => {
+						const latest = toolOutputPreviewRef.current.get(toolUseId);
+						if (!latest) return;
+						latest.timer = null;
+						flushToolOutputPreview(toolUseId, latest.preview);
+					}, STREAMING_TOOL_OUTPUT_THROTTLE_MS - elapsed);
+				}
 			},
 			onToolStarted: (
 				toolUseId: string,

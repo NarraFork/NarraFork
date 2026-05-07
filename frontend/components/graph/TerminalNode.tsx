@@ -11,10 +11,13 @@ import {
 } from "@mantine/core";
 import { IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
-import { TerminalPanel } from "../terminal/TerminalPanel";
+
+const TerminalPanel = lazy(() =>
+	import("../terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
+);
 
 export interface TerminalNodeData {
 	terminalId: string;
@@ -230,7 +233,9 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 					onContextMenu={(e) => e.stopPropagation()}
 					style={{ flex: 1, minHeight: 0, overflow: "hidden" }}
 				>
-					<TerminalPanel terminalId={d.terminalId} />
+					<Suspense fallback={null}>
+						<TerminalPanel terminalId={d.terminalId} />
+					</Suspense>
 				</div>
 			</Card>
 

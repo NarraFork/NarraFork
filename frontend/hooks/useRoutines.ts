@@ -1,6 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+type ProjectRoutinesResponse = Awaited<ReturnType<typeof api.getProjectRoutines>>;
+type ProjectRoutineAction = "enable" | "disable" | "reset";
+type ProjectRoutineOverride = "global" | "enabled" | "disabled";
+
+const actionToOverride: Record<ProjectRoutineAction, ProjectRoutineOverride> = {
+	enable: "enabled",
+	disable: "disabled",
+	reset: "global",
+};
+
 export function useRoutines() {
 	return useQuery({
 		queryKey: ["routines"],
@@ -31,11 +41,37 @@ export function useProjectRoutines(projectId: string | undefined) {
 
 export function useToggleProjectRoutine(projectId: string) {
 	const qc = useQueryClient();
+	const queryKey = ["project-routines", projectId];
 	return useMutation({
-		mutationFn: ({ id, action }: { id: string; action: "enable" | "disable" | "reset" }) =>
+		mutationFn: ({ id, action }: { id: string; action: ProjectRoutineAction }) =>
 			api.toggleProjectRoutine(projectId, id, action),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["project-routines", projectId] });
+		onMutate: async ({ id, action }) => {
+			await qc.cancelQueries({ queryKey });
+			const previous = qc.getQueryData<ProjectRoutinesResponse>(queryKey);
+			const override = actionToOverride[action];
+			qc.setQueryData<ProjectRoutinesResponse>(queryKey, (old) => {
+				if (!old) return old;
+				return {
+					...old,
+					routines: old.routines.map((routine) => {
+						if (routine.id !== id) return routine;
+						return {
+							...routine,
+							override,
+							enabled: override === "global" ? routine.globalEnabled : override === "enabled",
+						};
+					}),
+				};
+			});
+			return { previous };
+		},
+		onError: (_error, _variables, context) => {
+			if (context?.previous) {
+				qc.setQueryData(queryKey, context.previous);
+			}
+		},
+		onSettled: () => {
+			qc.invalidateQueries({ queryKey });
 			// Also invalidate narrator commands since routines affect the slash menu
 			qc.invalidateQueries({ queryKey: ["narrator-commands"] });
 		},

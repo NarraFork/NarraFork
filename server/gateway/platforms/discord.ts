@@ -9,12 +9,48 @@ import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
 import type { DiscordConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
+interface DiscordUserLike {
+	id: string;
+	tag?: string;
+	username?: string;
+	bot?: boolean;
+}
+
+interface DiscordTextChannelLike {
+	id?: string;
+	isTextBased?: () => boolean;
+	send: (text: string) => Promise<{ id?: string | null }>;
+	sendTyping?: () => Promise<unknown>;
+	messages: {
+		fetch: (messageId: string) => Promise<{ edit: (text: string) => Promise<unknown> } | null>;
+	};
+}
+
+interface DiscordClientLike {
+	on(event: "messageCreate", listener: (msg: DiscordMessageLike) => void): void;
+	on(event: "error", listener: (err: unknown) => void): void;
+	login(token: string): Promise<unknown>;
+	destroy(): Promise<unknown> | unknown;
+	user?: DiscordUserLike | null;
+	channels: {
+		fetch: (chatId: string) => Promise<DiscordTextChannelLike | null>;
+	};
+}
+
+interface DiscordMessageLike {
+	author: DiscordUserLike;
+	content?: string;
+	guild?: unknown;
+	mentions: { has: (user: DiscordUserLike) => boolean };
+	channel: { id: string };
+}
+
 export class DiscordAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "discord";
 	readonly maxMessageLength = 2000;
 	override readonly supportsEdit = true;
 
-	private client: any = null;
+	private client: DiscordClientLike | null = null;
 	private config: DiscordConfig;
 
 	constructor(config: DiscordConfig) {
@@ -33,13 +69,13 @@ export class DiscordAdapter extends BaseAdapter {
 					GatewayIntentBits.DirectMessages,
 					GatewayIntentBits.MessageContent,
 				],
-			});
+			}) as DiscordClientLike;
 
-			this.client.on("messageCreate", (msg: any) => this.handleDiscordMessage(msg));
+			this.client.on("messageCreate", (msg) => this.handleDiscordMessage(msg));
 
-			this.client.on("error", (err: any) => {
+			this.client.on("error", (err) => {
 				logger.error("[discord] Client error", {
-					error: err?.message ?? String(err),
+					error: err instanceof Error ? err.message : String(err),
 				});
 			});
 
@@ -135,7 +171,10 @@ export class DiscordAdapter extends BaseAdapter {
 	// Private
 	// -----------------------------------------------------------------------
 
-	private async handleDiscordMessage(msg: any): Promise<void> {
+	private async handleDiscordMessage(msg: DiscordMessageLike): Promise<void> {
+		const client = this.client;
+		if (!client) return;
+
 		// Ignore bot messages (including self)
 		if (msg.author.bot) return;
 
@@ -153,15 +192,15 @@ export class DiscordAdapter extends BaseAdapter {
 		}
 
 		// In guild channels, require @mention
-		if (msg.guild && this.client.user) {
-			const mentioned = msg.mentions.has(this.client.user);
+		if (msg.guild && client.user) {
+			const mentioned = msg.mentions.has(client.user);
 			if (!mentioned) return;
 		}
 
 		// Strip the bot mention from the message text
 		let text = msg.content;
-		if (this.client.user) {
-			text = text.replace(new RegExp(`<@!?${this.client.user.id}>`, "g"), "").trim();
+		if (client.user) {
+			text = text.replace(new RegExp(`<@!?${client.user.id}>`, "g"), "").trim();
 		}
 
 		if (!text) return;

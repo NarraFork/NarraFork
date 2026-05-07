@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ApiError, api, clearToken, getToken, setToken } from "../lib/api";
-import i18n from "../lib/i18n";
+import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
 
 export function useAuthStatus() {
 	return useQuery({
@@ -31,11 +31,15 @@ export function useLogin() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.login,
-		onSuccess: (data) => {
+		onSuccess: async (data) => {
 			setToken(data.token);
 			// Seed the user cache immediately so AuthenticatedLayout won't flash
 			qc.setQueryData(["auth", "me"], data.user);
-			i18n.changeLanguage(data.language);
+			try {
+				await changeAppLanguage(data.language, getNamespacesForPath("/"));
+			} catch (error) {
+				console.warn("Failed to change app language after login", error);
+			}
 		},
 	});
 }
@@ -44,10 +48,14 @@ export function useRegister() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.register,
-		onSuccess: (data) => {
+		onSuccess: async (data) => {
 			setToken(data.token);
 			qc.setQueryData(["auth", "me"], data.user);
-			i18n.changeLanguage(data.language);
+			try {
+				await changeAppLanguage(data.language, getNamespacesForPath("/"));
+			} catch (error) {
+				console.warn("Failed to change app language after registration", error);
+			}
 		},
 	});
 }

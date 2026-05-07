@@ -200,7 +200,7 @@ class McpManager {
 		// Disconnect removed or disabled servers
 		for (const [id] of this.clients) {
 			const cfg = configMap.get(id);
-			if (!cfg || !cfg.enabled) {
+			if (!cfg?.enabled) {
 				await this.disconnect(id);
 			}
 		}

@@ -52,6 +52,28 @@ export interface CodexUsageResult {
 const USAGE_API_URL = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_USAGE_FETCH_TIMEOUT_MS = 20_000;
 
+export class CodexUsageFetchError extends Error {
+	readonly status?: number;
+	readonly statusText?: string;
+
+	constructor(message: string, status?: number, statusText?: string) {
+		super(message);
+		this.name = "CodexUsageFetchError";
+		this.status = status;
+		this.statusText = statusText;
+	}
+}
+
+export function isUnauthorizedCodexUsageError(error: unknown): boolean {
+	if (error instanceof CodexUsageFetchError) return error.status === 401;
+	if (typeof error === "object" && error !== null && "status" in error) {
+		const status = (error as { status?: unknown }).status;
+		if (status === 401) return true;
+	}
+	const message = error instanceof Error ? error.message : String(error ?? "");
+	return /Failed to fetch usage:\s*401\b/i.test(message);
+}
+
 function identifyWindowType(limitWindowSeconds: number): "5h" | "weekly" | "unknown" {
 	if (limitWindowSeconds === 18000) return "5h"; // 5 hours
 	if (limitWindowSeconds === 604800) return "weekly"; // 7 days
@@ -99,7 +121,11 @@ export async function fetchCodexUsage(
 		const response = await fetch(USAGE_API_URL, fetchOptions);
 
 		if (!response.ok) {
-			throw new Error(`Failed to fetch usage: ${response.status} ${response.statusText}`);
+			throw new CodexUsageFetchError(
+				`Failed to fetch usage: ${response.status} ${response.statusText}`,
+				response.status,
+				response.statusText,
+			);
 		}
 
 		const raw = await response.text();

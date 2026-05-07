@@ -1,13 +1,11 @@
 import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
 import { AnimatedMarkdown } from "flowtoken";
 import "flowtoken/dist/styles.css";
-import "katex/dist/katex.min.css";
-import { Component, memo, type ReactNode } from "react";
+import { Component, memo, type ReactNode, useEffect, useMemo, useState } from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
+import type { Pluggable, PluggableList } from "unified";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
 
@@ -23,6 +21,66 @@ export function extractText(node: ReactNode): string {
 
 export const MD_PATTERN =
 	/(?:^#{1,6}\s|(?:^|\n)```|\*\*|__|\*(?!\s)|_(?!\s)|\[.+?\]\(.+?\)|^>\s|^[-*+]\s|^\d+\.\s|^\|.+\||!\[)/m;
+
+const DISPLAY_MATH_PATTERN = /(^|\n)\s*\$\$[\s\S]*?\$\$/;
+const INLINE_MATH_PATTERN = /(^|[^\\$])\$[^\s$](?:[^\n$]*[^\s$])?\$/;
+const PAREN_MATH_PATTERN = /\\\([\s\S]*?\\\)/;
+const BRACKET_MATH_PATTERN = /\\\[[\s\S]*?\\\]/;
+
+interface MathPlugins {
+	remarkMath: Pluggable;
+	rehypeKatex: Pluggable;
+}
+
+let mathPluginsPromise: Promise<MathPlugins | null> | null = null;
+
+function hasMarkdownMath(text: string): boolean {
+	return (
+		DISPLAY_MATH_PATTERN.test(text) ||
+		INLINE_MATH_PATTERN.test(text) ||
+		PAREN_MATH_PATTERN.test(text) ||
+		BRACKET_MATH_PATTERN.test(text)
+	);
+}
+
+function loadMathPlugins(): Promise<MathPlugins | null> {
+	if (!mathPluginsPromise) {
+		mathPluginsPromise = Promise.all([
+			import("remark-math"),
+			import("rehype-katex"),
+			import("katex/dist/katex.min.css"),
+		])
+			.then(([remarkMathModule, rehypeKatexModule]) => ({
+				remarkMath: remarkMathModule.default as Pluggable,
+				rehypeKatex: rehypeKatexModule.default as Pluggable,
+			}))
+			.catch(() => {
+				mathPluginsPromise = null;
+				return null;
+			});
+	}
+
+	return mathPluginsPromise;
+}
+
+function useMathPlugins(enabled: boolean): MathPlugins | null {
+	const [plugins, setPlugins] = useState<MathPlugins | null>(null);
+
+	useEffect(() => {
+		if (!enabled) return;
+
+		let cancelled = false;
+		loadMathPlugins().then((loadedPlugins) => {
+			if (!cancelled) setPlugins(loadedPlugins);
+		});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [enabled]);
+
+	return enabled ? plugins : null;
+}
 
 /** Detect box-drawing / ASCII-art diagram characters that should never be word-wrapped */
 const DIAGRAM_PATTERN =
@@ -308,7 +366,8 @@ const supportsLookbehind = (() => {
 	}
 })();
 
-const remarkPlugins = supportsLookbehind ? [remarkGfm, remarkMath] : [remarkMath];
+const STREAMING_ANIM_MAX_CHARS = 4_000;
+const STREAMING_MARKDOWN_MAX_CHARS = 12_000;
 
 /** Thin error boundary so a remark-gfm regex crash doesn't blank the chat. */
 class MarkdownErrorBoundary extends Component<
@@ -343,11 +402,24 @@ export const MarkdownContent = memo(function MarkdownContent({
 }: MarkdownContentProps) {
 	const trimmed = text.trim();
 
+	const canAnimateStreaming = !!streaming && trimmed.length <= STREAMING_ANIM_MAX_CHARS;
 	const advancedAnim =
+		canAnimateStreaming &&
 		typeof document !== "undefined" &&
 		document.documentElement.getAttribute("data-advanced-anim") === "true";
 
-	const shouldAnimate = streaming && advancedAnim;
+	const shouldAnimate = canAnimateStreaming && advancedAnim;
+	const usesStaticMarkdown =
+		!(streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) && !shouldAnimate;
+	const mathPlugins = useMathPlugins(usesStaticMarkdown && hasMarkdownMath(trimmed));
+	const remarkPlugins = useMemo<PluggableList>(() => {
+		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
+		if (mathPlugins) plugins.push(mathPlugins.remarkMath);
+		return plugins;
+	}, [mathPlugins]);
+	const rehypePlugins = useMemo<PluggableList>(() => {
+		return mathPlugins ? [mathPlugins.rehypeKatex] : [];
+	}, [mathPlugins]);
 
 	const plainFallback = (
 		<Text
@@ -357,6 +429,10 @@ export const MarkdownContent = memo(function MarkdownContent({
 			{trimmed}
 		</Text>
 	);
+
+	if (streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) {
+		return plainFallback;
+	}
 
 	// Streaming mode: AnimatedMarkdown with our Mantine customComponents for
 	// consistent styling + flowtoken's per-word blur-in animation
@@ -383,7 +459,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
 				<Markdown
 					remarkPlugins={remarkPlugins}
-					rehypePlugins={[rehypeKatex]}
+					rehypePlugins={rehypePlugins}
 					components={staticComponents}
 				>
 					{trimmed}

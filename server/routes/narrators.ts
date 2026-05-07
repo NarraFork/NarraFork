@@ -43,6 +43,9 @@ import {
 	closeSession as closeBrowserSession,
 	getSession as getBrowserSession,
 	listSessions as listBrowserSessions,
+	MAX_SESSION_TTL_MS,
+	MIN_SESSION_TTL_MS,
+	setSessionTtl as setBrowserSessionTtl,
 	stopTracing as stopBrowserTracing,
 } from "../lib/browser/session";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -2935,6 +2938,38 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 narratorRoutes.get("/:id/browser-sessions", (c) => {
 	const narratorId = c.req.param("id");
 	return c.json(listBrowserSessions(narratorId));
+});
+
+narratorRoutes.patch("/:id/browser-sessions/:sessionId/ttl", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const body = await c.req.json().catch(() => ({}));
+	const ttlMs = Number((body as { ttlMs?: unknown }).ttlMs);
+	if (!Number.isFinite(ttlMs) || !Number.isInteger(ttlMs)) {
+		throw new ValidationError("ttlMs must be an integer number of milliseconds");
+	}
+	if (ttlMs < MIN_SESSION_TTL_MS || ttlMs > MAX_SESSION_TTL_MS) {
+		throw new ValidationError(
+			`ttlMs must be between ${MIN_SESSION_TTL_MS} and ${MAX_SESSION_TTL_MS}`,
+		);
+	}
+	const session = setBrowserSessionTtl(narratorId, sessionId, ttlMs);
+	if (!session) throw new NotFoundError("BrowserSession", sessionId);
+	return c.json({
+		ok: true,
+		session: {
+			id: session.id,
+			url: session.page.url(),
+			lastActivity: session.lastActivity,
+			ttlMs: session.ttlMs,
+			expiresAt: session.lastActivity + session.ttlMs,
+			headless: session.headless,
+			tracing: session.tracing
+				? { active: session.tracing.active, startedAt: session.tracing.startedAt }
+				: null,
+			networkRequestCount: session.networkRequests.length,
+		},
+	});
 });
 
 narratorRoutes.delete("/:id/browser-sessions/:sessionId", async (c) => {

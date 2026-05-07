@@ -9,12 +9,37 @@ import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, SlackConfig } from "../types";
 
+interface SlackMessageLike {
+	subtype?: string;
+	bot_id?: string;
+	text?: string;
+	user?: string;
+	channel?: string;
+	[key: string]: unknown;
+}
+
+interface SlackAppLike {
+	message: (listener: (args: { message: SlackMessageLike }) => Promise<void> | void) => void;
+	event: (
+		eventName: string,
+		listener: (args: { event: SlackMessageLike }) => Promise<void> | void,
+	) => void;
+	start: () => Promise<void>;
+	stop: () => Promise<void>;
+	client: {
+		chat: {
+			postMessage: (args: Record<string, unknown>) => Promise<{ ok?: boolean; ts?: string }>;
+			update: (args: Record<string, unknown>) => Promise<{ ok?: boolean }>;
+		};
+	};
+}
+
 export class SlackAdapter extends BaseAdapter {
 	readonly platform: GatewayPlatform = "slack";
 	readonly maxMessageLength = 39000;
 	override readonly supportsEdit = true;
 
-	private app: any = null;
+	private app: SlackAppLike | null = null;
 	private config: SlackConfig;
 
 	constructor(config: SlackConfig) {
@@ -30,15 +55,15 @@ export class SlackAdapter extends BaseAdapter {
 				token: this.config.botToken,
 				appToken: this.config.appToken,
 				socketMode: true,
-			});
+			}) as unknown as SlackAppLike;
 
 			// Listen for messages
-			this.app.message(async ({ message }: any) => {
+			this.app.message(async ({ message }) => {
 				await this.handleSlackMessage(message);
 			});
 
 			// Listen for app_mention events (in channels)
-			this.app.event("app_mention", async ({ event }: any) => {
+			this.app.event("app_mention", async ({ event }) => {
 				await this.handleSlackMessage(event);
 			});
 
@@ -127,7 +152,7 @@ export class SlackAdapter extends BaseAdapter {
 	// Private
 	// -----------------------------------------------------------------------
 
-	private async handleSlackMessage(message: any): Promise<void> {
+	private async handleSlackMessage(message: SlackMessageLike): Promise<void> {
 		// Skip bot messages, message_changed, etc.
 		if (message.subtype) return;
 		if (message.bot_id) return;

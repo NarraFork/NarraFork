@@ -14,6 +14,8 @@ import {
 // Re-export for backward compat — callers that imported from here still work.
 export { clearHighlightCache } from "./highlight-cache";
 
+const MAX_HIGHLIGHT_CODE_CHARS = MAX_CACHEABLE_CODE_CHARS;
+
 interface HighlightedCodeProps {
 	/** Source code to highlight */
 	code: string;
@@ -39,7 +41,7 @@ export const HighlightedCode = memo(function HighlightedCode({
 	// We can't synchronously check bundledLanguages before shiki loads,
 	// so we start with the raw lang and validate once shiki is available.
 	const [html, setHtml] = useState<string | null>(() => {
-		if (!lang || lang === "text") return null;
+		if (!lang || lang === "text" || code.length > MAX_HIGHLIGHT_CODE_CHARS) return null;
 		return peekCachedHtml(cacheKey(theme, lang, code));
 	});
 
@@ -47,13 +49,16 @@ export const HighlightedCode = memo(function HighlightedCode({
 	const bundledLangsRef = useRef<Record<string, unknown> | null>(null);
 
 	useEffect(() => {
-		if (!lang || lang === "text") {
+		if (!lang || lang === "text" || code.length > MAX_HIGHLIGHT_CODE_CHARS) {
 			setHtml(null);
 			return;
 		}
 
 		const shouldCache = code.length <= MAX_CACHEABLE_CODE_CHARS;
 		let cancelled = false;
+
+		const initialKey = cacheKey(theme, lang, code);
+		setHtml(shouldCache ? peekCachedHtml(initialKey) : null);
 
 		loadShiki().then((shiki) => {
 			if (cancelled || !shiki) return;
@@ -91,8 +96,8 @@ export const HighlightedCode = memo(function HighlightedCode({
 		};
 	}, [lang, code, theme]);
 
-	// Plain text or pending — use Mantine Code
-	if (!html) {
+	// Plain text, oversized, or pending — use Mantine Code
+	if (code.length > MAX_HIGHLIGHT_CODE_CHARS || !html) {
 		return (
 			<Code
 				block

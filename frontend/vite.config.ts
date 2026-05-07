@@ -143,7 +143,18 @@ export default defineConfig(({ mode, command }) => {
 					],
 				},
 				injectManifest: {
-					globPatterns: ["**/*.{js,css,html,svg,png,woff2}"],
+					// Use IIFE output for the custom service worker to avoid Rolldown's
+					// deprecated inlineDynamicImports path in the plugin's ES build mode.
+					rollupFormat: "iife",
+					globPatterns: [
+						"index.html",
+						"registerSW.js",
+						"manifest.webmanifest",
+						"favicon.svg",
+						"apple-touch-icon-180x180.png",
+						"pwa-*.png",
+						"assets/**/*.{js,css,woff,woff2,ttf,png,svg}",
+					],
 					maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
 				},
 			}),

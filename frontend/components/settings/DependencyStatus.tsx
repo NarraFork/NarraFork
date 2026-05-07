@@ -4,9 +4,12 @@ import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { IconCheck, IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { DependencyInstallTerminal } from "./DependencyInstallTerminal";
+
+const DependencyInstallTerminal = lazy(() =>
+	import("./DependencyInstallTerminal").then((m) => ({ default: m.DependencyInstallTerminal })),
+);
 
 const DESC_KEYS: Record<string, string> = {
 	git: "depsGitDesc",
@@ -232,16 +235,18 @@ export function DependencyStatus() {
 				closeOnClickOutside={false}
 				closeOnEscape={false}
 			>
-				{selectedDep && (
-					<DependencyInstallTerminal
-						command={selectedDep.command}
-						onDone={() => {
-							closeTerminal();
-							qc.invalidateQueries({ queryKey: ["dependencies"] });
-							qc.invalidateQueries({ queryKey: ["health"] });
-							setSelectedDep(null);
-						}}
-					/>
+				{terminalOpened && selectedDep && (
+					<Suspense fallback={<Loader size="sm" />}>
+						<DependencyInstallTerminal
+							command={selectedDep.command}
+							onDone={() => {
+								closeTerminal();
+								qc.invalidateQueries({ queryKey: ["dependencies"] });
+								qc.invalidateQueries({ queryKey: ["health"] });
+								setSelectedDep(null);
+							}}
+						/>
+					</Suspense>
 				)}
 			</Modal>
 		</>

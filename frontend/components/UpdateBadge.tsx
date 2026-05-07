@@ -1,9 +1,15 @@
 import { Badge, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconRocket } from "@tabler/icons-react";
+import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateCheck } from "../hooks/useUpdateCheck";
-import { UpdateModal } from "./UpdateModal";
+
+const UpdateModal = lazy(() =>
+	import("./UpdateModal").then((m) => ({
+		default: m.UpdateModal,
+	})),
+);
 
 /**
  * Inline update badge — shown next to the app title in the header.
@@ -41,20 +47,24 @@ export function UpdateBadge() {
 				</Badge>
 			</Tooltip>
 
-			<UpdateModal
-				opened={opened}
-				onClose={close}
-				data={{
-					latestVersion,
-					currentVersion,
-					releaseInfo,
-					releaseNotes,
-					releaseNotesPerVersion,
-					releaseDate,
-					downloadSize,
-					totalSize,
-				}}
-			/>
+			{opened && (
+				<Suspense fallback={null}>
+					<UpdateModal
+						opened={opened}
+						onClose={close}
+						data={{
+							latestVersion,
+							currentVersion,
+							releaseInfo,
+							releaseNotes,
+							releaseNotesPerVersion,
+							releaseDate,
+							downloadSize,
+							totalSize,
+						}}
+					/>
+				</Suspense>
+			)}
 		</>
 	);
 }

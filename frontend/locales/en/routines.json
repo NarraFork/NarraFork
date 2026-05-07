@@ -180,7 +180,7 @@
 	"tpToolDescEnterPlanMode": "Enter plan mode for implementation planning.",
 	"tpToolDescExitPlanMode": "Exit plan mode and submit plan for approval.",
 	"tpPlanReflectionAutoApprove": "Auto-approve plans",
-	"tpPlanReflectionAutoApproveDesc": "When enabled, ExitPlanMode runs plan reflection and skips manual approval after confirmation in bypass permissions + relaxed plan mode.",
+	"tpPlanReflectionAutoApproveDesc": "When enabled, ExitPlanMode runs plan reflection and skips manual approval after confirmation in edit-capable permission modes.",
 	"tpToolDescTaskCreate": "Create or update the todo list for the session.",
 	"tpToolDescAskUserQuestion": "Ask the user a question during execution.",
 	"tpToolDescSkill": "Invoke a skill within the conversation.",

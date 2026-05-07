@@ -76,6 +76,8 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
+	lazy,
+	Suspense,
 	startTransition,
 	useCallback,
 	useEffect,
@@ -190,7 +192,6 @@ import { getRenderableMessageOrder } from "./message-order-utils";
 import { useNarratorMessageRendererMode } from "./message-renderer-mode";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
-import { NarratorDetailsPanel } from "./NarratorDetailsPanel";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
@@ -228,10 +229,75 @@ import { useNarratorPanelWS } from "./useNarratorPanelWS";
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
+const NarratorDetailsPanel = lazy(() =>
+	import("./NarratorDetailsPanel").then((module) => ({ default: module.NarratorDetailsPanel })),
+);
+
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
+
+const ENABLE_MESSAGE_RENDER_WINDOW = true;
+const MESSAGE_RENDER_WINDOW_THRESHOLD = 260;
+const MESSAGE_RENDER_WINDOW_SIZE = 180;
+const MESSAGE_RENDER_TARGET_RADIUS = 40;
+
+type MessageRenderWindow = {
+	start: number;
+	end: number;
+	reason: "tail" | "target" | "manual";
+};
+
+type ScrollToFullIndexOptions = {
+	align?: "start" | "center" | "end";
+	domIds?: string[];
+	highlightId?: string;
+	highlightDelayMs?: number;
+};
+
+type PendingMessageScroll = Required<Pick<ScrollToFullIndexOptions, "align">> &
+	Pick<ScrollToFullIndexOptions, "domIds" | "highlightId" | "highlightDelayMs"> & {
+		fullIndex: number;
+	};
+
+function getTailMessageRenderWindow(totalCount: number): MessageRenderWindow {
+	return {
+		start: Math.max(0, totalCount - MESSAGE_RENDER_WINDOW_SIZE),
+		end: totalCount,
+		reason: "tail",
+	};
+}
+
+function centerMessageRenderWindowAround(
+	fullIndex: number,
+	totalCount: number,
+): MessageRenderWindow {
+	const maxStart = Math.max(0, totalCount - MESSAGE_RENDER_WINDOW_SIZE);
+	const centeredStart = fullIndex - Math.floor(MESSAGE_RENDER_WINDOW_SIZE / 2);
+	const minStartForRadius =
+		fullIndex + MESSAGE_RENDER_TARGET_RADIUS + 1 - MESSAGE_RENDER_WINDOW_SIZE;
+	const maxStartForRadius = fullIndex - MESSAGE_RENDER_TARGET_RADIUS;
+	const lowerBound = Math.max(0, Math.min(maxStart, minStartForRadius));
+	const upperBound = Math.max(0, Math.min(maxStart, maxStartForRadius));
+	const clampedCenteredStart = Math.max(0, Math.min(maxStart, centeredStart));
+	const start = Math.max(lowerBound, Math.min(upperBound, clampedCenteredStart));
+	return {
+		start,
+		end: Math.min(totalCount, start + MESSAGE_RENDER_WINDOW_SIZE),
+		reason: "target",
+	};
+}
+
+function isSameMessageRenderWindow(a: MessageRenderWindow, b: MessageRenderWindow) {
+	return a.start === b.start && a.end === b.end && a.reason === b.reason;
+}
+
+type BufferedSendResult = {
+	buffered?: boolean;
+	id?: string;
+	bufferedAt?: string;
+};
 
 function collectMessageSearchText(message: TreeMessage): string {
 	const parts: string[] = [
@@ -1849,6 +1915,7 @@ export function NarratorPanel({
 	const contentRef = useRef<HTMLDivElement>(null);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
+	const isTailRenderWindowRef = useRef(true);
 
 	// --- Scroll helpers ---
 	const followRafRef = useRef(0);
@@ -1885,7 +1952,7 @@ export function NarratorPanel({
 				programmaticScrollRef.current = true;
 				vp.scrollTop = target;
 				followingRef.current = false;
-				if (!isAtBottomRef.current) {
+				if (isTailRenderWindowRef.current && !isAtBottomRef.current) {
 					isAtBottomRef.current = true;
 					setIsAtBottom(true);
 					setUnreadCountRef.current?.(0);
@@ -1906,15 +1973,25 @@ export function NarratorPanel({
 		cancelAnimationFrame(followRafRef.current);
 	}, []);
 
+	const detachFromFullBottom = useCallback(() => {
+		stopFollowing();
+		if (isAtBottomRef.current) {
+			isAtBottomRef.current = false;
+			setIsAtBottom(false);
+		}
+	}, [stopFollowing]);
+
 	const scrollToBottom = useCallback(
 		(instant?: boolean) => {
 			const vp = viewportRef.current;
 			if (!vp) return;
-			if (!isAtBottomRef.current) {
-				isAtBottomRef.current = true;
-				setIsAtBottom(true);
+			if (isTailRenderWindowRef.current) {
+				if (!isAtBottomRef.current) {
+					isAtBottomRef.current = true;
+					setIsAtBottom(true);
+				}
+				setUnreadCountRef.current?.(0);
 			}
-			setUnreadCountRef.current?.(0);
 			if (instant) {
 				programmaticScrollRef.current = true;
 				vp.scrollTop = getMessageViewportScrollBottom(vp);
@@ -2081,7 +2158,6 @@ export function NarratorPanel({
 		: setInternalFileModOpen;
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
-
 	// Get the first pending Write/Edit permission for the drawer
 	const firstEditPermission = useMemo(() => {
 		for (const perm of renderPermCb.pendingPermsMap.values()) {
@@ -3419,20 +3495,148 @@ export function NarratorPanel({
 		return targets;
 	}, [showManualLoadOlder, flatTargets, showConclusionBtn]);
 	const previewMessageCount = 5;
-	const renderedElements = useMemo(
-		() =>
-			isWorkspacePreview
-				? finalElements.slice(Math.max(0, finalElements.length - previewMessageCount))
-				: finalElements,
-		[finalElements, isWorkspacePreview],
+	const [messageRenderWindow, setMessageRenderWindow] = useState<MessageRenderWindow>(() =>
+		getTailMessageRenderWindow(0),
 	);
-	const renderedKeys = useMemo(
-		() =>
-			isWorkspacePreview
-				? finalKeys.slice(Math.max(0, finalKeys.length - previewMessageCount))
-				: finalKeys,
-		[finalKeys, isWorkspacePreview],
+	const shouldWindowMessages =
+		ENABLE_MESSAGE_RENDER_WINDOW &&
+		!isWorkspacePreview &&
+		!usePixiRenderer &&
+		!selectionMode &&
+		finalElements.length > MESSAGE_RENDER_WINDOW_THRESHOLD;
+	const prevWindowStateRef = useRef({ enabled: false, finalLength: 0 });
+
+	useLayoutEffect(() => {
+		const prev = prevWindowStateRef.current;
+		if (shouldWindowMessages) {
+			const justEnabled = !prev.enabled;
+			const lengthIncreased = finalElements.length > prev.finalLength;
+			setMessageRenderWindow((current) => {
+				const tailWindow = getTailMessageRenderWindow(finalElements.length);
+				const wasAtFullBottom = isAtBottomRef.current && current.end >= prev.finalLength;
+				if (justEnabled || (lengthIncreased && wasAtFullBottom)) {
+					return isSameMessageRenderWindow(current, tailWindow) ? current : tailWindow;
+				}
+				if (current.start >= finalElements.length || current.end > finalElements.length) {
+					return isSameMessageRenderWindow(current, tailWindow) ? current : tailWindow;
+				}
+				return current;
+			});
+		}
+		prevWindowStateRef.current = {
+			enabled: shouldWindowMessages,
+			finalLength: finalElements.length,
+		};
+	}, [shouldWindowMessages, finalElements.length]);
+
+	const activeMessageRenderWindow = useMemo(() => {
+		if (!shouldWindowMessages) return null;
+		const maxStart = Math.max(0, finalElements.length - MESSAGE_RENDER_WINDOW_SIZE);
+		const start = Math.max(0, Math.min(maxStart, messageRenderWindow.start));
+		const end = Math.min(finalElements.length, Math.max(start, messageRenderWindow.end));
+		if (end <= start) return getTailMessageRenderWindow(finalElements.length);
+		return { start, end, reason: messageRenderWindow.reason };
+	}, [shouldWindowMessages, finalElements.length, messageRenderWindow]);
+	const hasHiddenNewerLoadedWindow =
+		shouldWindowMessages &&
+		activeMessageRenderWindow != null &&
+		activeMessageRenderWindow.end < finalElements.length;
+	isTailRenderWindowRef.current = !hasHiddenNewerLoadedWindow;
+	useLayoutEffect(() => {
+		if (hasHiddenNewerLoadedWindow) {
+			detachFromFullBottom();
+		}
+	}, [detachFromFullBottom, hasHiddenNewerLoadedWindow]);
+	const latestMessageWindowStateRef = useRef({ shouldWindowMessages: false, finalLength: 0 });
+	latestMessageWindowStateRef.current = {
+		shouldWindowMessages,
+		finalLength: finalElements.length,
+	};
+	const scrollToLatestMessageWindow = useCallback(
+		(instant?: boolean) => {
+			const setTailWindowIfNeeded = () => {
+				const state = latestMessageWindowStateRef.current;
+				if (!state.shouldWindowMessages) return false;
+				const tailWindow = getTailMessageRenderWindow(state.finalLength);
+				setMessageRenderWindow((current) =>
+					isSameMessageRenderWindow(current, tailWindow) ? current : tailWindow,
+				);
+				return true;
+			};
+
+			if (!setTailWindowIfNeeded()) {
+				scrollToBottom(instant);
+				return;
+			}
+
+			requestAnimationFrame(() => {
+				setTailWindowIfNeeded();
+				requestAnimationFrame(() => scrollToBottom(instant));
+			});
+		},
+		[scrollToBottom],
 	);
+
+	const handleShowOlderLoadedMessages = useCallback(() => {
+		detachFromFullBottom();
+		setMessageRenderWindow((current) => {
+			const currentStart = activeMessageRenderWindow?.start ?? current.start;
+			const newStart = Math.max(0, currentStart - MESSAGE_RENDER_WINDOW_SIZE);
+			const newEnd = Math.min(finalElements.length, newStart + MESSAGE_RENDER_WINDOW_SIZE);
+			const nextWindow: MessageRenderWindow = { start: newStart, end: newEnd, reason: "manual" };
+			return isSameMessageRenderWindow(current, nextWindow) ? current : nextWindow;
+		});
+	}, [activeMessageRenderWindow?.start, detachFromFullBottom, finalElements.length]);
+
+	const renderedElements = useMemo(() => {
+		if (isWorkspacePreview) {
+			return finalElements.slice(Math.max(0, finalElements.length - previewMessageCount));
+		}
+		if (!shouldWindowMessages || !activeMessageRenderWindow) return finalElements;
+		const windowedElements = finalElements.slice(
+			activeMessageRenderWindow.start,
+			activeMessageRenderWindow.end,
+		);
+		if (activeMessageRenderWindow.start <= 0) return windowedElements;
+		return [
+			<Box ta="center" py={4} key="__show-loaded-older-btn__">
+				<Button size="compact-xs" variant="light" onClick={handleShowOlderLoadedMessages}>
+					{t("loadOlderMessages")}
+				</Button>
+			</Box>,
+			...windowedElements,
+		];
+	}, [
+		activeMessageRenderWindow,
+		finalElements,
+		handleShowOlderLoadedMessages,
+		isWorkspacePreview,
+		shouldWindowMessages,
+		t,
+	]);
+	const renderedKeys = useMemo(() => {
+		if (isWorkspacePreview) {
+			return finalKeys.slice(Math.max(0, finalKeys.length - previewMessageCount));
+		}
+		if (!shouldWindowMessages || !activeMessageRenderWindow) return finalKeys;
+		const windowedKeys = finalKeys.slice(
+			activeMessageRenderWindow.start,
+			activeMessageRenderWindow.end,
+		);
+		return activeMessageRenderWindow.start > 0
+			? ["__show-loaded-older-btn__", ...windowedKeys]
+			: windowedKeys;
+	}, [activeMessageRenderWindow, finalKeys, isWorkspacePreview, shouldWindowMessages]);
+
+	const fullIndexToVisibleIndexMap = useMemo(() => {
+		const indexMap = new Map<number, number>();
+		if (!shouldWindowMessages || !activeMessageRenderWindow) return indexMap;
+		const visibleOffset = activeMessageRenderWindow.start > 0 ? 1 : 0;
+		for (let i = activeMessageRenderWindow.start; i < activeMessageRenderWindow.end; i++) {
+			indexMap.set(i, i - activeMessageRenderWindow.start + visibleOffset);
+		}
+		return indexMap;
+	}, [activeMessageRenderWindow, shouldWindowMessages]);
 
 	const targetIndexMap = useMemo(() => {
 		const indexMap = new Map<string, number>();
@@ -3445,6 +3649,104 @@ export function NarratorPanel({
 		}
 		return indexMap;
 	}, [finalTargets]);
+
+	const pendingMessageScrollRef = useRef<PendingMessageScroll | null>(null);
+	const pendingMessageScrollRafRef = useRef(0);
+	const scrollDomIdsIntoView = useCallback((domIds: string[] | undefined) => {
+		if (!domIds?.length) return false;
+		for (const domId of domIds) {
+			const el = document.getElementById(domId);
+			if (el) {
+				el.scrollIntoView({ block: "center" });
+				return true;
+			}
+		}
+		return false;
+	}, []);
+
+	useEffect(() => {
+		return () => cancelAnimationFrame(pendingMessageScrollRafRef.current);
+	}, []);
+
+	useLayoutEffect(() => {
+		const pending = pendingMessageScrollRef.current;
+		if (!pending) return;
+		const visibleIndex = shouldWindowMessages
+			? fullIndexToVisibleIndexMap.get(pending.fullIndex)
+			: pending.fullIndex;
+		if (visibleIndex == null) return;
+		pendingMessageScrollRef.current = null;
+		cancelAnimationFrame(pendingMessageScrollRafRef.current);
+		pendingMessageScrollRafRef.current = requestAnimationFrame(() => {
+			virtualListRef.current?.scrollToIndex(visibleIndex, { align: pending.align });
+			if (pending.domIds?.length || pending.highlightId) {
+				requestAnimationFrame(() => {
+					scrollDomIdsIntoView(pending.domIds);
+					if (pending.highlightId) {
+						scheduleHighlight(pending.highlightId, pending.highlightDelayMs ?? 300);
+					}
+				});
+			}
+		});
+	}, [shouldWindowMessages, fullIndexToVisibleIndexMap, scrollDomIdsIntoView, scheduleHighlight]);
+
+	const scrollToFullIndex = useCallback(
+		(fullIndex: number, options: ScrollToFullIndexOptions = {}) => {
+			if (fullIndex < 0 || fullIndex >= finalElements.length) return false;
+			const align = options.align ?? "start";
+			const runDomCorrection = () => {
+				if (options.domIds?.length) {
+					window.setTimeout(() => scrollDomIdsIntoView(options.domIds), 80);
+				}
+				if (options.highlightId) {
+					scheduleHighlight(options.highlightId, options.highlightDelayMs ?? 300);
+				}
+			};
+
+			if (!shouldWindowMessages) {
+				if (!virtualListRef.current) return false;
+				virtualListRef.current.scrollToIndex(fullIndex, { align });
+				runDomCorrection();
+				return true;
+			}
+
+			const visibleIndex = fullIndexToVisibleIndexMap.get(fullIndex);
+			if (visibleIndex != null) {
+				if (!virtualListRef.current) return false;
+				if (activeMessageRenderWindow && activeMessageRenderWindow.end < finalElements.length) {
+					detachFromFullBottom();
+				}
+				virtualListRef.current.scrollToIndex(visibleIndex, { align });
+				runDomCorrection();
+				return true;
+			}
+
+			pendingMessageScrollRef.current = {
+				fullIndex,
+				align,
+				domIds: options.domIds,
+				highlightId: options.highlightId,
+				highlightDelayMs: options.highlightDelayMs,
+			};
+			const nextWindow = centerMessageRenderWindowAround(fullIndex, finalElements.length);
+			if (nextWindow.end < finalElements.length) {
+				detachFromFullBottom();
+			}
+			setMessageRenderWindow((current) =>
+				isSameMessageRenderWindow(current, nextWindow) ? current : nextWindow,
+			);
+			return true;
+		},
+		[
+			activeMessageRenderWindow,
+			detachFromFullBottom,
+			finalElements.length,
+			fullIndexToVisibleIndexMap,
+			scheduleHighlight,
+			scrollDomIdsIntoView,
+			shouldWindowMessages,
+		],
+	);
 
 	const messageSearchResults = useMemo(() => {
 		const normalizedQuery = normalizeSearchText(messageSearchQuery);
@@ -3482,11 +3784,15 @@ export function NarratorPanel({
 		(index: number) => {
 			const result = messageSearchResults[index];
 			if (!result) return;
-			virtualListRef.current?.scrollToIndex(result.index, { align: "center" });
-			scheduleHighlight(result.id, 120);
+			scrollToFullIndex(result.index, {
+				align: "center",
+				domIds: [`msg-${result.id}`],
+				highlightId: result.id,
+				highlightDelayMs: 120,
+			});
 			setActiveMessageSearchIndex(index);
 		},
-		[messageSearchResults, scheduleHighlight],
+		[messageSearchResults, scrollToFullIndex],
 	);
 
 	const jumpMessageSearch = useCallback(
@@ -3536,9 +3842,12 @@ export function NarratorPanel({
 		return markers;
 	}, [messagesData, targetIndexMap]);
 
-	const handleMarkerJump = useCallback((elementIndex: number) => {
-		virtualListRef.current?.scrollToIndex(elementIndex, { align: "center" });
-	}, []);
+	const handleMarkerJump = useCallback(
+		(elementIndex: number) => {
+			scrollToFullIndex(elementIndex, { align: "center" });
+		},
+		[scrollToFullIndex],
+	);
 
 	// --- Load older / newer ---
 	const handleLoadOlder = useCallback(() => {
@@ -3558,15 +3867,25 @@ export function NarratorPanel({
 			if (!firstPage?.hasMoreAfter || !firstPage.prevCursor) break;
 			await fetchPreviousPage();
 		}
-		scrollToBottom(true);
-	}, [fetchPreviousPage, messagesQueryKey, qc, scrollToBottom]);
+		scrollToLatestMessageWindow(true);
+	}, [fetchPreviousPage, messagesQueryKey, qc, scrollToLatestMessageWindow]);
 
 	const handleLoadOlderRef = useRef(handleLoadOlder);
 	handleLoadOlderRef.current = handleLoadOlder;
 	const loadOlderArmedRef = useRef(false);
 	const loadOlderNearTopRef = useRef(false);
+	const hasHiddenOlderLoadedWindow =
+		shouldWindowMessages && (activeMessageRenderWindow?.start ?? 0) > 0;
 	useEffect(() => {
-		if (!autoLoadEnabled || !hasNextPage || !initialScrollDone || isFetchingNextPage) return;
+		if (
+			!autoLoadEnabled ||
+			!hasNextPage ||
+			!initialScrollDone ||
+			isFetchingNextPage ||
+			hasHiddenOlderLoadedWindow
+		) {
+			return;
+		}
 		const vp = viewportRef.current;
 		if (!vp) return;
 		// Reset the "already triggered" gate when the effect re-runs after a fetch completes.
@@ -3593,13 +3912,26 @@ export function NarratorPanel({
 		check();
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
-	}, [autoLoadEnabled, hasNextPage, initialScrollDone, isFetchingNextPage]);
+	}, [
+		autoLoadEnabled,
+		hasHiddenOlderLoadedWindow,
+		hasNextPage,
+		initialScrollDone,
+		isFetchingNextPage,
+	]);
 
 	const handleLoadNewerRef = useRef(handleLoadNewer);
 	handleLoadNewerRef.current = handleLoadNewer;
 	useEffect(() => {
-		if (!autoLoadEnabled || !hasPreviousPage || !initialScrollDone || isFetchingPreviousPage)
+		if (
+			!autoLoadEnabled ||
+			!hasPreviousPage ||
+			!initialScrollDone ||
+			isFetchingPreviousPage ||
+			hasHiddenNewerLoadedWindow
+		) {
 			return;
+		}
 		const vp = viewportRef.current;
 		if (!vp) return;
 		const check = () => {
@@ -3612,7 +3944,13 @@ export function NarratorPanel({
 		};
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
-	}, [autoLoadEnabled, hasPreviousPage, initialScrollDone, isFetchingPreviousPage]);
+	}, [
+		autoLoadEnabled,
+		hasHiddenNewerLoadedWindow,
+		hasPreviousPage,
+		initialScrollDone,
+		isFetchingPreviousPage,
+	]);
 
 	// --- Scroll state: user-input driven ---
 	const lastTouchYRef = useRef(0);
@@ -3639,7 +3977,8 @@ export function NarratorPanel({
 			return false;
 		};
 		const checkAtBottom = () => {
-			const atBottom = getMessageViewportDistanceFromBottom(node) < 30;
+			const atBottom =
+				isTailRenderWindowRef.current && getMessageViewportDistanceFromBottom(node) < 30;
 			if (atBottom && !isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
@@ -3799,16 +4138,18 @@ export function NarratorPanel({
 			// Debounce via rAF to batch rapid DOM mutations (e.g. streaming)
 			cancelAnimationFrame(mutationRafId);
 			mutationRafId = requestAnimationFrame(() => {
+				const canUseVisibleBottomAsFullBottom =
+					isTailRenderWindowRef.current && !highlightMessageId;
 				if (resizingRef.current) {
-					if (isAtBottomRef.current && !highlightMessageId) {
+					if (isAtBottomRef.current && canUseVisibleBottomAsFullBottom) {
 						programmaticScrollRef.current = true;
 						vp.scrollTop = getMessageViewportScrollBottom(vp);
 					}
 					return;
 				}
-				if (isAtBottomRef.current && !highlightMessageId) {
+				if (isAtBottomRef.current && canUseVisibleBottomAsFullBottom) {
 					startFollowing();
-				} else if (!isAtBottomRef.current && !highlightMessageId) {
+				} else if (!isAtBottomRef.current && canUseVisibleBottomAsFullBottom) {
 					if (getMessageViewportDistanceFromBottom(vp) < 30) {
 						isAtBottomRef.current = true;
 						setIsAtBottom(true);
@@ -3827,14 +4168,16 @@ export function NarratorPanel({
 			if (!initialScrollDoneRef.current || resizingRef.current) return;
 			cancelAnimationFrame(contentResizeRafId);
 			contentResizeRafId = requestAnimationFrame(() => {
+				const canUseVisibleBottomAsFullBottom =
+					isTailRenderWindowRef.current && !highlightMessageId;
 				if (resizingRef.current) {
-					if (isAtBottomRef.current && !highlightMessageId) {
+					if (isAtBottomRef.current && canUseVisibleBottomAsFullBottom) {
 						programmaticScrollRef.current = true;
 						vp.scrollTop = getMessageViewportScrollBottom(vp);
 					}
 					return;
 				}
-				if (isAtBottomRef.current && !highlightMessageId) {
+				if (isAtBottomRef.current && canUseVisibleBottomAsFullBottom) {
 					startFollowing();
 				}
 			});
@@ -3856,7 +4199,7 @@ export function NarratorPanel({
 				resizingRef.current = false;
 			}, 150);
 
-			if (isAtBottomRef.current && !highlightMessageId) {
+			if (isAtBottomRef.current && isTailRenderWindowRef.current && !highlightMessageId) {
 				programmaticScrollRef.current = true;
 				vp.scrollTop = getMessageViewportScrollBottom(vp);
 			}
@@ -3868,7 +4211,7 @@ export function NarratorPanel({
 		// content height gradually; by the time this event fires (~300ms after
 		// expand) the animation is done and we can reliably scroll to bottom.
 		const onSubagentExpand = () => {
-			if (isAtBottomRef.current && !highlightMessageId) {
+			if (isAtBottomRef.current && isTailRenderWindowRef.current && !highlightMessageId) {
 				startFollowing();
 			}
 		};
@@ -3912,27 +4255,17 @@ export function NarratorPanel({
 			const targetIndex = targetIds
 				.map((targetId) => targetIndexMap.get(targetId))
 				.find((index): index is number => index != null);
-			if (targetIndex != null && virtualListRef.current) {
-				virtualListRef.current.scrollToIndex(targetIndex, { align: "center" });
-				if (domIds.length > 0) {
-					window.setTimeout(() => {
-						for (const domId of domIds) {
-							const el = document.getElementById(domId);
-							if (el) {
-								el.scrollIntoView({ block: "center" });
-								break;
-							}
-						}
-					}, 80);
-				}
-				if (highlightId) {
-					scheduleHighlight(highlightId, 300);
-				}
-				return true;
+			if (targetIndex != null) {
+				return scrollToFullIndex(targetIndex, {
+					align: "center",
+					domIds,
+					highlightId,
+					highlightDelayMs: 300,
+				});
 			}
 			return false;
 		},
-		[scheduleHighlight, targetIndexMap],
+		[scheduleHighlight, scrollToFullIndex, targetIndexMap],
 	);
 
 	// --- Scroll to highlighted message ---
@@ -3944,6 +4277,47 @@ export function NarratorPanel({
 			highlightId: highlightMessageId,
 		});
 	}, [highlightMessageId, totalMessageCount, scrollToMessageTarget]);
+
+	const applyBufferedSendResult = useCallback(
+		(
+			result: BufferedSendResult | null | undefined,
+			text: string,
+			imageCount: number,
+			priority?: boolean,
+		) => {
+			if (!result?.buffered || !result.id) return false;
+
+			const queuedMessage: BufferMessageSummary = {
+				id: result.id,
+				text,
+				bufferedAt: result.bufferedAt ?? new Date().toISOString(),
+				imageCount,
+				creator:
+					currentUser?.id && currentUser?.username
+						? {
+								id: String(currentUser.id),
+								username: String(currentUser.username),
+								avatarColor: currentUser.avatarColor ?? null,
+								avatarImageId: currentUser.avatarImageId ?? null,
+							}
+						: null,
+				priority: priority || undefined,
+			};
+
+			setQueuedMessages((prev) => {
+				if (prev.some((m) => m.id === queuedMessage.id)) return prev;
+				return priority ? [queuedMessage, ...prev] : [...prev, queuedMessage];
+			});
+
+			void api
+				.getBufferedMessages(narratorId)
+				.then((messages) => setQueuedMessages(messages ?? []))
+				.catch(() => {});
+
+			return true;
+		},
+		[narratorId, currentUser, setQueuedMessages],
+	);
 
 	// --- Send / retry message ---
 	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
@@ -3993,7 +4367,7 @@ export function NarratorPanel({
 			pages[0] = firstPage;
 			return { ...old, pages };
 		});
-		scrollToBottom(true);
+		scrollToLatestMessageWindow(true);
 		try {
 			const result = await api.sendNarratorMessage(
 				narratorId,
@@ -4028,10 +4402,11 @@ export function NarratorPanel({
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
-				scrollToBottom(true);
+				scrollToLatestMessageWindow(true);
 			} else if (result?.buffered) {
-				// Message was buffered — remove optimistic message,
-				// WS buffer_set broadcast will sync the queue state.
+				// Message was buffered — remove optimistic chat history entry and show it
+				// in the queue immediately.  The WS buffer_set event can be missed when
+				// the subscription is not fully caught up, so also reconcile with REST.
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					const pages = [...old.pages];
@@ -4040,7 +4415,8 @@ export function NarratorPanel({
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
-				scrollToBottom(true);
+				applyBufferedSendResult(result, msg, images.length);
+				scrollToLatestMessageWindow(true);
 			} else if (result?.id) {
 				// Normal message — replace optimistic message with the real server message
 				// so we don't depend solely on WS onUserMessage for dedup.
@@ -4115,16 +4491,17 @@ export function NarratorPanel({
 		setAttachedImages([]);
 		setAttachedTextFiles([]);
 		try {
-			await api.sendNarratorMessage(
+			const result = await api.sendNarratorMessage(
 				narratorId,
 				msg,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
 			);
+			applyBufferedSendResult(result, msg, images.length, priority);
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
-			scrollToBottom(true);
+			scrollToLatestMessageWindow(true);
 		} catch (err) {
 			// Restore input and attachments on error
 			setInput(msg);
@@ -5162,14 +5539,16 @@ export function NarratorPanel({
 					</Modal>
 
 					{detailsOpened && (
-						<NarratorDetailsPanel
-							opened={detailsOpened}
-							onClose={closeDetails}
-							narratorId={narratorId}
-							narrator={narrator}
-							viewers={viewers}
-							defaultModelValue={defaultModelValue}
-						/>
+						<Suspense fallback={null}>
+							<NarratorDetailsPanel
+								opened={detailsOpened}
+								onClose={closeDetails}
+								narratorId={narratorId}
+								narrator={narrator}
+								viewers={viewers}
+								defaultModelValue={defaultModelValue}
+							/>
+						</Suspense>
 					)}
 
 					{/* Messages */}
@@ -5397,10 +5776,14 @@ export function NarratorPanel({
 									bottom: 12,
 									right: 24,
 									zIndex: 10,
-									transform: !isAtBottom || hasPreviousPage ? "translateY(0)" : "translateY(80px)",
-									opacity: !isAtBottom || hasPreviousPage ? 1 : 0,
+									transform:
+										!isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow
+											? "translateY(0)"
+											: "translateY(80px)",
+									opacity: !isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow ? 1 : 0,
 									transition: "transform 200ms ease, opacity 200ms ease",
-									pointerEvents: !isAtBottom || hasPreviousPage ? "auto" : "none",
+									pointerEvents:
+										!isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow ? "auto" : "none",
 								}}
 							>
 								{unreadCount > 0 && (
@@ -5424,7 +5807,9 @@ export function NarratorPanel({
 									color="gray"
 									radius="xl"
 									size="lg"
-									onClick={() => (hasPreviousPage ? revealLatestMessages() : scrollToBottom(true))}
+									onClick={() =>
+										hasPreviousPage ? revealLatestMessages() : scrollToLatestMessageWindow(true)
+									}
 									title={
 										unreadCount > 0
 											? t("scrollToBottomWithCount", { count: unreadCount })
@@ -6503,6 +6888,7 @@ export function NarratorPanel({
 									const hasInput = !!input.trim();
 									const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0;
 									const showInterrupt = isActive && !hasInput && !hasAttachments;
+									const hasCutInMessage = !!queuedMessages[0]?.priority;
 									const showRetry =
 										!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
 									const showContinue =
@@ -6553,7 +6939,7 @@ export function NarratorPanel({
 													/>
 												)}
 												<span style={{ position: "relative" }}>
-													{queuedMessages.length > 0 ? t("interruptCutInLine") : t("interrupt")}
+													{hasCutInMessage ? t("interruptCutInLine") : t("interrupt")}
 												</span>
 											</Button>
 										);

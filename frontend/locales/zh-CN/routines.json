@@ -180,7 +180,7 @@
 	"tpToolDescEnterPlanMode": "进入计划模式进行实现规划。",
 	"tpToolDescExitPlanMode": "退出计划模式并提交计划供审批。",
 	"tpPlanReflectionAutoApprove": "自动批准计划",
-	"tpPlanReflectionAutoApproveDesc": "启用后，在全部允许 + 宽松规划模式下，ExitPlanMode 会运行计划反思；确认通过后跳过人工审批。",
+	"tpPlanReflectionAutoApproveDesc": "启用后，在允许编辑/全部允许模式下，ExitPlanMode 会运行计划反思；确认通过后跳过人工审批。",
 	"tpToolDescTaskCreate": "创建或更新会话的待办列表。",
 	"tpToolDescAskUserQuestion": "在执行过程中向用户提问。",
 	"tpToolDescSkill": "在对话中调用技能。",

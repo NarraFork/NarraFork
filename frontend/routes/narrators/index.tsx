@@ -2,12 +2,9 @@ import { Button, Group, Loader, Modal, Stack, Text, Title } from "@mantine/core"
 import { useDisclosure } from "@mantine/hooks";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	CreateNarratorModal,
-	type CreateNarratorResult,
-} from "../../components/narrator/CreateNarratorModal";
+import type { CreateNarratorResult } from "../../components/narrator/CreateNarratorModal";
 import {
 	NarratorListCard,
 	type NarratorListItem,
@@ -33,6 +30,12 @@ import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrat
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
+
+const CreateNarratorModal = lazy(() =>
+	import("../../components/narrator/CreateNarratorModal").then((m) => ({
+		default: m.CreateNarratorModal,
+	})),
+);
 
 interface NarratorSearchParams extends NarratorListSearchParams {
 	create?: boolean;
@@ -266,7 +269,11 @@ function NarratorsPage() {
 				</Stack>
 			)}
 
-			<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
+			{opened && (
+				<Suspense fallback={null}>
+					<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
+				</Suspense>
+			)}
 
 			<Modal
 				opened={!!confirmArchiveId}

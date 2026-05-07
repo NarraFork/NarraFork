@@ -8,8 +8,13 @@ export {
 	cleanupNarrator,
 	closeSession,
 	createSession,
+	DEFAULT_SESSION_TTL_MS,
 	getSession,
 	listSessions,
+	MAX_SESSION_TTL_MS,
+	MIN_SESSION_TTL_MS,
+	normalizeSessionTtlMs,
+	setSessionTtl,
 	stopTracing,
 	touchSession,
 } from "./session";

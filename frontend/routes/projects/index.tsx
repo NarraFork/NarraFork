@@ -20,12 +20,17 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertCircle } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useCreateProject, useCreateProjectStream, useProjects } from "../../hooks/useProjects";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
+
+const DirectoryPicker = lazy(() =>
+	import("../../components/common/DirectoryPicker").then((module) => ({
+		default: module.DirectoryPicker,
+	})),
+);
 
 export const Route = createFileRoute("/projects/")({
 	component: ProjectListPage,
@@ -61,6 +66,17 @@ function ProjectListPage() {
 		platform === "windows" ? "E:\\Code\\my-repo" : "/home/user/projects/my-repo";
 
 	const isCloning = createProjectStream.isPending;
+	const repoPathDescription =
+		repoMode === "init"
+			? t("initPathDescription")
+			: repoMode === "clone"
+				? t("clonePathDescription")
+				: t("repositoryPathDescription");
+
+	const handleRepoPathChange = (val: string) => {
+		setRepoPath(val);
+		if (repoPathError) setRepoPathError("");
+	};
 
 	const resetForm = () => {
 		setName("");
@@ -286,25 +302,31 @@ function ProjectListPage() {
 							/>
 						</>
 					)}
-					<DirectoryPicker
-						label={t("repositoryPath")}
-						placeholder={pathPlaceholder}
-						value={repoPath}
-						onChange={(val) => {
-							setRepoPath(val);
-							if (repoPathError) setRepoPathError("");
-						}}
-						description={
-							repoMode === "init"
-								? t("initPathDescription")
-								: repoMode === "clone"
-									? t("clonePathDescription")
-									: t("repositoryPathDescription")
+					<Suspense
+						fallback={
+							<TextInput
+								label={t("repositoryPath")}
+								placeholder={pathPlaceholder}
+								value={repoPath}
+								onChange={(e) => handleRepoPathChange(e.currentTarget.value)}
+								description={repoPathDescription}
+								error={repoPathError}
+								required
+								disabled={isCloning}
+							/>
 						}
-						error={repoPathError}
-						required
-						disabled={isCloning}
-					/>
+					>
+						<DirectoryPicker
+							label={t("repositoryPath")}
+							placeholder={pathPlaceholder}
+							value={repoPath}
+							onChange={handleRepoPathChange}
+							description={repoPathDescription}
+							error={repoPathError}
+							required
+							disabled={isCloning}
+						/>
+					</Suspense>
 					{isCloning && (
 						<Stack gap="xs">
 							<Text size="sm" fw={500}>

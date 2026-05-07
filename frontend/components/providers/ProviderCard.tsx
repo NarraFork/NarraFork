@@ -21,9 +21,9 @@ export interface ProviderCardProps {
 	badgeLabel?: string;
 	status: ProviderStatus;
 	statusError?: string;
-	modelCount: number;
+	visibleCount: number;
 	hiddenCount: number;
-	visibleModels: string[];
+	previewModels: string[];
 	disabled: boolean;
 	isRefreshing?: boolean;
 	onToggleDisabled: () => void;
@@ -38,9 +38,9 @@ export const ProviderCard = React.memo(function ProviderCard({
 	badgeLabel,
 	status,
 	statusError,
-	modelCount,
+	visibleCount,
 	hiddenCount,
-	visibleModels,
+	previewModels,
 	disabled,
 	isRefreshing,
 	onToggleDisabled,
@@ -51,10 +51,8 @@ export const ProviderCard = React.memo(function ProviderCard({
 	const { t } = useTranslation("settings");
 	const [isHovered, setIsHovered] = useState(false);
 
-	const visibleCount = modelCount - hiddenCount;
 	const isHighlighted = Boolean(isSelected || isHovered);
-	const previewModels = visibleModels.slice(0, 3);
-	const hasMore = visibleModels.length > 3;
+	const hasMore = visibleCount > previewModels.length;
 
 	return (
 		<Card
@@ -133,7 +131,7 @@ export const ProviderCard = React.memo(function ProviderCard({
 						))}
 						{hasMore && (
 							<Text size="xs" c="dimmed" fs="italic">
-								+{visibleModels.length - 3} {t("overviewMoreModels")}
+								+{visibleCount - previewModels.length} {t("overviewMoreModels")}
 							</Text>
 						)}
 					</Stack>

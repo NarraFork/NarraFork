@@ -56,11 +56,15 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import {
+	type CSSProperties,
 	createContext,
+	lazy,
 	memo,
+	Suspense,
 	useCallback,
 	useContext,
 	useEffect,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -92,9 +96,75 @@ import {
 } from "./narrator-message-helpers";
 import { useRenderLod } from "./RenderLodCtx";
 import { SideCarNotice } from "./SideCarNotice";
-import { StreamingCode } from "./StreamingCode";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
+
+const LazyStreamingCode = lazy(() =>
+	import("./StreamingCode").then((module) => ({ default: module.StreamingCode })),
+);
+
+interface StreamingCodeLazyProps {
+	code: string;
+	lang?: string;
+	style?: CSSProperties;
+}
+
+const streamingCodeFallbackRootStyle: CSSProperties = {
+	borderRadius: "var(--mantine-radius-sm)",
+	backgroundColor: "var(--mantine-color-body)",
+	border: "1px solid var(--mantine-color-default-border)",
+	overflow: "hidden",
+};
+
+const streamingCodeFallbackPreStyle: CSSProperties = {
+	whiteSpace: "pre-wrap",
+	wordBreak: "break-word",
+	overflowWrap: "break-word",
+	fontFamily:
+		"var(--mantine-font-family-monospace), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+	fontSize: "inherit",
+	lineHeight: 1.55,
+	margin: 0,
+	padding: "var(--mantine-spacing-xs)",
+	tabSize: 4,
+	background: "transparent",
+};
+
+const streamingCodeFallbackCodeStyle: CSSProperties = {
+	fontFamily: "inherit",
+	fontSize: "inherit",
+	background: "none",
+};
+
+function StreamingCodeFallback({ code, style }: Pick<StreamingCodeLazyProps, "code" | "style">) {
+	const scrollRef = useRef<HTMLDivElement>(null);
+
+	useEffect(() => {
+		const currentCode = code;
+		const rafId = requestAnimationFrame(() => {
+			if (!currentCode) return;
+			const el = scrollRef.current;
+			if (el) el.scrollTop = el.scrollHeight;
+		});
+		return () => cancelAnimationFrame(rafId);
+	}, [code]);
+
+	return (
+		<div ref={scrollRef} style={{ ...streamingCodeFallbackRootStyle, ...style }}>
+			<pre style={streamingCodeFallbackPreStyle}>
+				<code style={streamingCodeFallbackCodeStyle}>{code}</code>
+			</pre>
+		</div>
+	);
+}
+
+function StreamingCodeLazy({ code, lang, style }: StreamingCodeLazyProps) {
+	return (
+		<Suspense fallback={<StreamingCodeFallback code={code} style={style} />}>
+			<LazyStreamingCode code={code} lang={lang} style={style} />
+		</Suspense>
+	);
+}
 
 /**
  * Context carrying the toolUseId of the narrator's latest TaskCreate call
@@ -3502,13 +3572,28 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
  */
 const StreamingInputDetail = memo(function StreamingInputDetail({
 	toolCall,
+	maxHeight,
 }: {
 	toolCall: ToolCallData;
+	maxHeight?: number;
 }) {
 	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
 	const cat = getCategory(toolCall.toolName);
+	const planScrollRef = useRef<HTMLDivElement>(null);
+
+	useLayoutEffect(() => {
+		if (toolCall.toolName !== "ExitPlanMode" || sfName !== "plan" || !sfValue) return;
+		const el = planScrollRef.current;
+		if (!el) return;
+		const scrollToPlanBottom = () => {
+			el.scrollTop = el.scrollHeight;
+		};
+		scrollToPlanBottom();
+		const rafId = requestAnimationFrame(scrollToPlanBottom);
+		return () => cancelAnimationFrame(rafId);
+	}, [toolCall.toolName, sfName, sfValue]);
 	const filePath =
 		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
@@ -3558,7 +3643,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 				<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={filePath}>
 					{filePath}
 				</Text>
-				<StreamingCode code={sfValue} lang={lang} style={codeStyle} />
+				<StreamingCodeLazy code={sfValue} lang={lang} style={codeStyle} />
 			</Box>
 		);
 	}
@@ -3637,8 +3722,12 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const plan = sfName === "plan" ? sfValue : null;
 		if (!plan) return null;
 		return (
-			<Box mt="xs">
-				<ContentViewer content={plan} style={codeStyle} title="Plan" markdown streaming />
+			<Box
+				ref={planScrollRef}
+				mt="xs"
+				style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}
+			>
+				<ContentViewer content={plan} title="Plan" markdown streaming />
 			</Box>
 		);
 	}
@@ -4651,7 +4740,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			/>
 			<SideCarNotice sideCars={toolCall.sideCars} />
 			{isStreaming ? (
-				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} />
+				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (
 				<>
 					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />

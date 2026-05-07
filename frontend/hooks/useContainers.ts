@@ -11,11 +11,15 @@ export function useContainers(chapterId: string) {
 	});
 }
 
-export function useContainerLogs(chapterId: string, opts?: { tail?: number; service?: string }) {
+export function useContainerLogs(
+	chapterId: string,
+	opts?: { tail?: number; service?: string },
+	queryOpts?: { enabled?: boolean },
+) {
 	return useQuery({
 		queryKey: ["containerLogs", chapterId, opts],
 		queryFn: () => api.getContainerLogs(chapterId, opts),
-		enabled: !!chapterId,
+		enabled: !!chapterId && (queryOpts?.enabled ?? true),
 	});
 }
 

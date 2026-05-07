@@ -220,7 +220,7 @@ class Gateway {
 
 			// Find the new config for this platform
 			const pConfig = newConfig.platforms.find((c) => c.platform === p);
-			if (!pConfig || !pConfig.enabled) {
+			if (!pConfig?.enabled) {
 				// Platform removed or disabled — already disconnected above
 				reloaded.push(p);
 				continue;
@@ -293,9 +293,11 @@ class Gateway {
 				const { QQBotAdapter } = await import("./platforms/qqbot");
 				return new QQBotAdapter(config as QQBotConfig);
 			}
-			default:
-				logger.warn(`[gateway] Unknown platform: ${(config as any).platform}`);
+			default: {
+				const unknownConfig = config as { platform?: unknown };
+				logger.warn(`[gateway] Unknown platform: ${String(unknownConfig.platform)}`);
 				return null;
+			}
 		}
 	}
 

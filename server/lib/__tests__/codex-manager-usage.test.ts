@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
+import { isUnauthorizedCodexUsageError } from "../codex-usage";
 
 function createManagerWithOneCredential(
 	id: string,
@@ -103,6 +104,27 @@ describe("CodexManager usage quota state", () => {
 		expect(entry).toBeDefined();
 		expect(entry?.disabled).toBe(false);
 		expect(entry?.disabledReason).toBeUndefined();
+	});
+
+	test("usage 401 可被识别并用于 banned 标记", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-401");
+		tempHomes.push(tmpHome);
+
+		globalThis.fetch = (async () =>
+			new Response("Unauthorized", { status: 401 })) as unknown as typeof fetch;
+
+		let caught: unknown;
+		try {
+			await manager.getUsage("cred-401");
+		} catch (error) {
+			caught = error;
+		}
+		expect(isUnauthorizedCodexUsageError(caught)).toBe(true);
+
+		manager.markBanned("cred-401");
+		const entry = manager.snapshot().entries.find((item) => item.id === "cred-401");
+		expect(entry?.disabled).toBe(true);
+		expect(entry?.disabledReason).toBe("banned");
 	});
 
 	test("查询 usage 恢复剩余时清理 quota_exhausted 状态", async () => {

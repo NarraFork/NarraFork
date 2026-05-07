@@ -1,6 +1,6 @@
 import { ActionIcon, Group, Stack, Tooltip } from "@mantine/core";
 import { IconEye, IconEyeOff } from "@tabler/icons-react";
-import React from "react";
+import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelRow } from "./ModelRow";
 
@@ -33,15 +33,21 @@ export const ModelList = React.memo(function ModelList({
 	showContextWindow = true,
 }: ModelListProps) {
 	const { t } = useTranslation("settings");
+	const allHidden = useMemo(
+		() => models.every((m) => hiddenModels.has(m.value)),
+		[models, hiddenModels],
+	);
+	const sortedModels = useMemo(
+		() =>
+			[...models].sort((a, b) => {
+				const aHidden = hiddenModels.has(a.value);
+				const bHidden = hiddenModels.has(b.value);
+				return Number(aHidden) - Number(bHidden);
+			}),
+		[models, hiddenModels],
+	);
 
 	if (models.length === 0) return null;
-
-	const allHidden = models.every((m) => hiddenModels.has(m.value));
-	const sortedModels = [...models].sort((a, b) => {
-		const aHidden = hiddenModels.has(a.value);
-		const bHidden = hiddenModels.has(b.value);
-		return Number(aHidden) - Number(bHidden);
-	});
 
 	return (
 		<Stack gap="xs" mt="xs">

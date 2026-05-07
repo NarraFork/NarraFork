@@ -28,6 +28,8 @@ if (typeof document !== "undefined") {
 export interface BroadMessageListHandle {
 	/** Scroll to a specific element index */
 	scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" }) => void;
+	/** Scroll to a specific visible element key */
+	scrollToKey: (key: string, options?: { align?: "start" | "center" | "end" }) => void;
 	/** Get current scroll size (total content height) */
 	getTotalSize: () => number;
 	/** Find the index of an element by its key */
@@ -171,6 +173,10 @@ export const BroadMessageList = forwardRef<BroadMessageListHandle, BroadMessageL
 					if (!item || !listRef.current) return;
 					const align = options?.align ?? "start";
 					listRef.current.scrollToKey(item.key, "smooth", align);
+				},
+				scrollToKey: (key, options) => {
+					const align = options?.align ?? "start";
+					listRef.current?.scrollToKey(key, "smooth", align);
 				},
 				getTotalSize: () => {
 					const el = listRef.current?.scrollViewRef?.current;

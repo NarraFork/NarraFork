@@ -28,6 +28,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { LazyCollapse } from "./LazyCollapse";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
 const GitPanel = lazy(() =>
@@ -318,7 +319,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			</Collapse>
 
 			{/* Git panel collapse */}
-			<Collapse in={gitPanelOpen}>
+			<LazyCollapse in={gitPanelOpen}>
 				<div
 					style={{
 						borderBottom: "1px solid var(--mantine-color-default-border)",
@@ -328,7 +329,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 						<GitPanel chapterId={chapterId} />
 					</Suspense>
 				</div>
-			</Collapse>
+			</LazyCollapse>
 
 			{/* Modals */}
 			{forkModalOpen && (

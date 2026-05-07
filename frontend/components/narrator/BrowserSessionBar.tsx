@@ -5,6 +5,7 @@ import {
 	Collapse,
 	Group,
 	Loader,
+	Menu,
 	Text,
 	Tooltip,
 	UnstyledButton,
@@ -13,6 +14,7 @@ import {
 	IconCamera,
 	IconChevronDown,
 	IconChevronRight,
+	IconClock,
 	IconNetwork,
 	IconPlayerStop,
 	IconRefresh,
@@ -24,6 +26,7 @@ import { useTranslation } from "react-i18next";
 import {
 	useBrowserSessions,
 	useCloseBrowserSession,
+	useSetBrowserSessionTtl,
 	useStopBrowserTracing,
 } from "../../hooks/useBrowserSessions";
 import { getToken } from "../../lib/api";
@@ -91,6 +94,21 @@ function formatSize(bytes: number): string {
 /** Estimated trace growth rate: ~2 MB/s (typical Chrome trace with default categories). */
 const TRACE_RATE_BYTES_PER_MS = 2000;
 
+const TTL_PRESETS = [
+	{ label: "10m", value: 10 * 60_000 },
+	{ label: "1h", value: 60 * 60_000 },
+	{ label: "6h", value: 6 * 60 * 60_000 },
+	{ label: "24h", value: 24 * 60 * 60_000 },
+];
+
+function formatCompactDuration(ms: number): string {
+	if (ms <= 0) return "0m";
+	if (ms < 60_000) return "<1m";
+	if (ms < 3_600_000) return `${Math.ceil(ms / 60_000)}m`;
+	if (ms < 86_400_000) return `${Math.ceil(ms / 3_600_000)}h`;
+	return `${Math.ceil(ms / 86_400_000)}d`;
+}
+
 function SessionCard({
 	narratorId,
 	session,
@@ -100,12 +118,16 @@ function SessionCard({
 		id: string;
 		url: string;
 		lastActivity: number;
+		ttlMs: number;
+		expiresAt: number;
+		headless?: boolean;
 		tracing: { active: boolean; startedAt: number } | null;
 		networkRequestCount?: number;
 	};
 }) {
 	const { t } = useTranslation("narrator");
 	const closeMutation = useCloseBrowserSession();
+	const setTtlMutation = useSetBrowserSessionTtl();
 	const stopTracingMutation = useStopBrowserTracing();
 	const [showScreenshot, setShowScreenshot] = useState(false);
 	const [screenshotKey, setScreenshotKey] = useState(0);
@@ -214,6 +236,8 @@ function SessionCard({
 			: elapsed < 3600_000
 				? `${Math.floor(elapsed / 60_000)}m`
 				: `${Math.floor(elapsed / 3600_000)}h`;
+	const expiresInLabel = formatCompactDuration(session.expiresAt - Date.now());
+	const ttlLabel = formatCompactDuration(session.ttlMs);
 
 	const isTracing = session.tracing?.active ?? false;
 	const networkRequestCount = session.networkRequestCount ?? 0;
@@ -239,6 +263,11 @@ function SessionCard({
 						<Text size="xs" c="dimmed">
 							{t("browser.lastActive", { time: elapsedLabel })}
 						</Text>
+						<Tooltip label={t("browser.autoCloseTooltip", { ttl: ttlLabel })} fz="xs">
+							<Text size="xs" c="dimmed">
+								{t("browser.expiresIn", { time: expiresInLabel })}
+							</Text>
+						</Tooltip>
 						<Tooltip label={t("browser.networkRequests", { count: networkRequestCount })} fz="xs">
 							<Badge size="xs" variant="light" color="blue" leftSection={<IconNetwork size={10} />}>
 								{networkRequestCount}
@@ -298,6 +327,36 @@ function SessionCard({
 							<IconCamera size={14} />
 						</ActionIcon>
 					</Tooltip>
+					<Menu position="bottom-end" withinPortal>
+						<Menu.Target>
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								color="gray"
+								loading={setTtlMutation.isPending}
+								title={t("browser.setAutoClose")}
+							>
+								<IconClock size={14} />
+							</ActionIcon>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Label>{t("browser.autoClose")}</Menu.Label>
+							{TTL_PRESETS.map((preset) => (
+								<Menu.Item
+									key={preset.value}
+									onClick={() =>
+										setTtlMutation.mutate({
+											narratorId,
+											sessionId: session.id,
+											ttlMs: preset.value,
+										})
+									}
+								>
+									{preset.label}
+								</Menu.Item>
+							))}
+						</Menu.Dropdown>
+					</Menu>
 					<Tooltip label={t("browser.closeSession")} fz="xs">
 						<ActionIcon
 							variant="subtle"

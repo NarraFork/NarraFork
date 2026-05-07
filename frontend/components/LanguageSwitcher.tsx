@@ -1,6 +1,8 @@
 import { Select } from "@mantine/core";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUpdateUserPreferences } from "../hooks/useUserPreferences";
+import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
 
 const LANGUAGE_OPTIONS = [
 	{ value: "en", label: "English" },
@@ -10,20 +12,32 @@ const LANGUAGE_OPTIONS = [
 export function LanguageSwitcher() {
 	const { i18n } = useTranslation();
 	const updatePrefs = useUpdateUserPreferences();
+	const [isChangingLanguage, setIsChangingLanguage] = useState(false);
+	const currentLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
+
+	const handleChange = (value: string | null) => {
+		if (!value || normalizeLanguage(value) === currentLanguage) return;
+
+		setIsChangingLanguage(true);
+		void (async () => {
+			try {
+				await changeAppLanguage(value, getNamespacesForPath(window.location.pathname));
+				updatePrefs.mutate({ language: value });
+			} finally {
+				setIsChangingLanguage(false);
+			}
+		})();
+	};
 
 	return (
 		<Select
 			data={LANGUAGE_OPTIONS}
-			value={i18n.language}
-			onChange={(value) => {
-				if (value) {
-					i18n.changeLanguage(value);
-					updatePrefs.mutate({ language: value });
-				}
-			}}
+			value={currentLanguage}
+			onChange={handleChange}
 			size="sm"
 			w={120}
 			allowDeselect={false}
+			disabled={isChangingLanguage}
 		/>
 	);
 }

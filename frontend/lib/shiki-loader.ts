@@ -46,6 +46,3 @@ export function loadShiki(): Promise<ShikiModule | null> {
 export function getCachedShiki(): ShikiModule | null {
 	return shikiCache;
 }
-
-// Kick off the load immediately so it's ready by the time we need it.
-loadShiki();

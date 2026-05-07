@@ -1,13 +1,22 @@
 import { Box } from "@mantine/core";
 import { useQueryClient } from "@tanstack/react-query";
-import { createContext, memo, useCallback, useContext, useEffect, useRef, useState } from "react";
+import {
+	createContext,
+	lazy,
+	memo,
+	Suspense,
+	useCallback,
+	useContext,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import {
 	type NarratorDragState,
 	onNarratorDragEnd,
 	onNarratorDragMove,
 	startNarratorDrag,
 } from "../../lib/narrator-drag";
-import { WorkspaceTerminalPanel } from "../terminal/WorkspaceTerminalPanel";
 import { NarratorPanel } from "./NarratorPanel";
 import type {
 	SplitBranch,
@@ -21,6 +30,11 @@ import { leafPanelType, normalizeDirectorPrimaryRatio } from "./split-tree";
 import { WebviewPanel } from "./WebviewPanel";
 
 const MIN_SIZE_PCT = 15;
+const WorkspaceTerminalPanel = lazy(() =>
+	import("../terminal/WorkspaceTerminalPanel").then((m) => ({
+		default: m.WorkspaceTerminalPanel,
+	})),
+);
 
 /** Which zone the cursor is hovering over */
 type DropZone = "left" | "right" | "top" | "bottom" | "center" | null;
@@ -316,13 +330,15 @@ export function LeafPanelContent({
 
 	if (panelType === "terminal" && leaf.terminalConfig) {
 		return (
-			<WorkspaceTerminalPanel
-				key={leaf.id}
-				config={leaf.terminalConfig}
-				leafId={leaf.id}
-				onClose={closeHandler}
-				onHeaderPointerDown={onHeaderPointerDown}
-			/>
+			<Suspense fallback={null}>
+				<WorkspaceTerminalPanel
+					key={leaf.id}
+					config={leaf.terminalConfig}
+					leafId={leaf.id}
+					onClose={closeHandler}
+					onHeaderPointerDown={onHeaderPointerDown}
+				/>
+			</Suspense>
 		);
 	}
 

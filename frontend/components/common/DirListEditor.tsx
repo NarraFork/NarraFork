@@ -1,9 +1,13 @@
 import { ActionIcon, Group, Modal, SegmentedControl, Stack, Switch, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconFolderOpen, IconTrash } from "@tabler/icons-react";
+import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { DirectoryBrowser } from "./DirectoryPicker";
 import { PathInput } from "./PathInput";
+
+const DirectoryBrowser = lazy(() =>
+	import("./DirectoryPicker").then((m) => ({ default: m.DirectoryBrowser })),
+);
 
 export interface WhitelistEntry {
 	path: string;
@@ -142,13 +146,17 @@ export function DirListEditor(props: DirListEditorProps) {
 				size="lg"
 				styles={{ body: { padding: 0 } }}
 			>
-				<DirectoryBrowser
-					onSelect={(path) => {
-						addDir(path);
-						close();
-					}}
-					onCancel={close}
-				/>
+				{opened && (
+					<Suspense fallback={null}>
+						<DirectoryBrowser
+							onSelect={(path) => {
+								addDir(path);
+								close();
+							}}
+							onCancel={close}
+						/>
+					</Suspense>
+				)}
 			</Modal>
 		</Stack>
 	);

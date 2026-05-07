@@ -1,4 +1,4 @@
-import { memo, type RefObject, useEffect, useRef, useState } from "react";
+import { memo, type RefObject, useEffect, useState } from "react";
 
 interface UserMarkerEntry {
 	/** Element index in the flat elements array */

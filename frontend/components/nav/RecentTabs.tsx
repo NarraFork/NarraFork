@@ -69,9 +69,15 @@ import {
 	startNarratorDragManual,
 } from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
-import { CreateNarratorModal, type CreateNarratorResult } from "../narrator/CreateNarratorModal";
+import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { addLeaf, parseWorkspaceLayout, serializeWorkspaceLayout } from "../narrator/split-tree";
 import { UserAvatar } from "../UserAvatar";
+
+const CreateNarratorModal = React.lazy(() =>
+	import("../narrator/CreateNarratorModal").then((m) => ({
+		default: m.CreateNarratorModal,
+	})),
+);
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
 
@@ -1003,11 +1009,15 @@ export function RecentTabList({
 					t={t}
 				/>
 			)}
-			<CreateNarratorModal
-				opened={wsCreateTarget !== null}
-				onClose={() => setWsCreateTarget(null)}
-				onCreated={handleWsNarratorCreated}
-			/>
+			{wsCreateTarget !== null && (
+				<React.Suspense fallback={null}>
+					<CreateNarratorModal
+						opened={wsCreateTarget !== null}
+						onClose={() => setWsCreateTarget(null)}
+						onCreated={handleWsNarratorCreated}
+					/>
+				</React.Suspense>
+			)}
 		</Box>
 	);
 }

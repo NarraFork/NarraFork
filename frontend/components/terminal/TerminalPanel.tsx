@@ -131,6 +131,8 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		// onData with response sequences (DA, color queries, DECRPM, etc.).
 		// We set this flag during write() to distinguish those from real user input.
 		const writingRef = useRef(false);
+		const outputBufferRef = useRef<string[]>([]);
+		const outputRafRef = useRef<number | null>(null);
 
 		// Pending data queue: buffers WS data arriving before xterm is initialized
 		type PendingData =
@@ -199,6 +201,74 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		onExitRef.current = onExit;
 
 		const resizeRef = useRef<(cols: number, rows: number) => void>(() => {});
+		const fitRafRef = useRef<number | null>(null);
+		const pendingFitRef = useRef({ notifyResize: false, forceNotify: false });
+
+		const writeTerminalOutput = useCallback((data: string) => {
+			const term = termRef.current;
+			if (!term || data.length === 0) return false;
+			writingRef.current = true;
+			try {
+				term.write(data);
+			} finally {
+				writingRef.current = false;
+			}
+			return true;
+		}, []);
+
+		const flushPendingOutput = useCallback(() => {
+			if (outputRafRef.current !== null) {
+				cancelAnimationFrame(outputRafRef.current);
+				outputRafRef.current = null;
+			}
+			if (outputBufferRef.current.length === 0) return true;
+			const chunks = outputBufferRef.current;
+			const data = chunks.join("");
+			outputBufferRef.current = [];
+			if (writeTerminalOutput(data)) return true;
+			outputBufferRef.current = chunks;
+			return false;
+		}, [writeTerminalOutput]);
+
+		const enqueueOutput = useCallback(
+			(data: string) => {
+				outputBufferRef.current.push(data);
+				if (outputRafRef.current !== null) return;
+				outputRafRef.current = requestAnimationFrame(() => {
+					outputRafRef.current = null;
+					flushPendingOutput();
+				});
+			},
+			[flushPendingOutput],
+		);
+
+		const runFit = useCallback((notifyResize: boolean, forceNotify: boolean) => {
+			const term = termRef.current;
+			const fitAddon = fitAddonRef.current;
+			if (!term || !fitAddon) return;
+			const prev = { cols: term.cols, rows: term.rows };
+			fitAddon.fit();
+			if (notifyResize && (forceNotify || term.cols !== prev.cols || term.rows !== prev.rows)) {
+				resizeRef.current(term.cols, term.rows);
+			}
+		}, []);
+
+		const scheduleFit = useCallback(
+			(notifyResize = false, forceNotify = false) => {
+				pendingFitRef.current = {
+					notifyResize: pendingFitRef.current.notifyResize || notifyResize,
+					forceNotify: pendingFitRef.current.forceNotify || forceNotify,
+				};
+				if (fitRafRef.current !== null) return;
+				fitRafRef.current = requestAnimationFrame(() => {
+					fitRafRef.current = null;
+					const pending = pendingFitRef.current;
+					pendingFitRef.current = { notifyResize: false, forceNotify: false };
+					runFit(pending.notifyResize, pending.forceNotify);
+				});
+			},
+			[runFit],
+		);
 
 		const { write, resize, disconnected } = useTerminalWS(terminalId, {
 			onOutput: (data) => {
@@ -206,37 +276,37 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					pendingDataRef.current.push({ type: "output", data });
 					return;
 				}
-				writingRef.current = true;
-				termRef.current?.write(data);
-				writingRef.current = false;
+				enqueueOutput(data);
 			},
 			onScrollback: (data, dims) => {
+				flushPendingOutput();
 				if (!termReadyRef.current) {
 					// Scrollback is a full snapshot — replace all pending data
 					pendingDataRef.current = [{ type: "scrollback", data, dims }];
 					return;
 				}
 				const term = termRef.current;
-				const fitAddon = fitAddonRef.current;
 				if (!term) return;
 				writingRef.current = true;
-				// Resize to match the server-side buffer dimensions so line wrapping is correct
-				term.resize(dims.cols, dims.rows);
-				term.reset();
-				term.write(data);
-				writingRef.current = false;
-				// Fit back to actual container size and notify server
-				if (fitAddon) {
-					fitAddon.fit();
-					resize(term.cols, term.rows);
+				try {
+					// Resize to match the server-side buffer dimensions so line wrapping is correct
+					term.resize(dims.cols, dims.rows);
+					term.reset();
+					term.write(data);
+				} finally {
+					writingRef.current = false;
 				}
+				// Fit back to actual container size and notify server
+				scheduleFit(true, true);
 			},
 			onExit: (code) => {
-				termRef.current?.write(`\r\n${t("processExited", { code })}\r\n`);
+				flushPendingOutput();
+				writeTerminalOutput(`\r\n${t("processExited", { code })}\r\n`);
 				onExitRef.current?.(code);
 			},
 			onError: (message) => {
-				termRef.current?.write(`\r\n${t("error", { message })}\r\n`);
+				flushPendingOutput();
+				writeTerminalOutput(`\r\n${t("error", { message })}\r\n`);
 			},
 			onRequestResize: () => {
 				const term = termRef.current;
@@ -279,30 +349,32 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			const fitAddon = new FitAddon();
 			term.loadAddon(fitAddon);
 			term.open(containerRef.current);
-			fitAddon.fit();
+			termRef.current = term;
+			fitAddonRef.current = fitAddon;
+			runFit(false, false);
 
 			// OSC 52 clipboard handler
 			const disposeOsc52 = setupOsc52Handler(term);
 
-			termRef.current = term;
-			fitAddonRef.current = fitAddon;
 			termReadyRef.current = true;
 
 			// Flush any data received before xterm was ready
 			if (pendingDataRef.current.length > 0) {
 				writingRef.current = true;
-				for (const pending of pendingDataRef.current) {
-					if (pending.type === "scrollback") {
-						term.resize(pending.dims.cols, pending.dims.rows);
-						term.reset();
+				try {
+					for (const pending of pendingDataRef.current) {
+						if (pending.type === "scrollback") {
+							term.resize(pending.dims.cols, pending.dims.rows);
+							term.reset();
+						}
+						term.write(pending.data);
 					}
-					term.write(pending.data);
+				} finally {
+					writingRef.current = false;
 				}
-				writingRef.current = false;
 				pendingDataRef.current = [];
 				// Fit to actual container size after replaying scrollback
-				fitAddon.fit();
-				resize(term.cols, term.rows);
+				scheduleFit(true, true);
 			}
 
 			// Intercept Ctrl+C when text is selected: copy to clipboard instead of sending SIGINT
@@ -364,14 +436,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 			const resizeObserver = new ResizeObserver(() => {
 				if (pinchingRef.current) {
-					fitAddon.fit();
+					scheduleFit();
 					return;
 				}
-				const prev = { cols: term.cols, rows: term.rows };
-				fitAddon.fit();
-				if (term.cols !== prev.cols || term.rows !== prev.rows) {
-					resize(term.cols, term.rows);
-				}
+				scheduleFit(true);
 			});
 			resizeObserver.observe(containerRef.current);
 			// Pinch-to-zoom on mobile
@@ -387,8 +455,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				if (pinchResizeTimerRef.current) clearTimeout(pinchResizeTimerRef.current);
 				pinchResizeTimerRef.current = setTimeout(() => {
 					pinchResizeTimerRef.current = null;
-					fitAddon.fit();
-					resize(term.cols, term.rows);
+					scheduleFit(true, true);
 				}, 300);
 			}
 			function onTouchStart(e: TouchEvent) {
@@ -415,7 +482,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					2;
 				if (newSize !== term.options.fontSize) {
 					term.options.fontSize = newSize;
-					fitAddon.fit();
+					scheduleFit();
 				}
 			}
 			function onTouchEnd(e: TouchEvent) {
@@ -588,6 +655,16 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			return () => {
 				termReadyRef.current = false;
 				pendingDataRef.current = [];
+				if (outputRafRef.current !== null) {
+					cancelAnimationFrame(outputRafRef.current);
+					outputRafRef.current = null;
+				}
+				outputBufferRef.current = [];
+				if (fitRafRef.current !== null) {
+					cancelAnimationFrame(fitRafRef.current);
+					fitRafRef.current = null;
+				}
+				pendingFitRef.current = { notifyResize: false, forceNotify: false };
 				disposeOsc52();
 				selDisposable.dispose();
 				resizeObserver.disconnect();
@@ -603,7 +680,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				termRef.current = null;
 				fitAddonRef.current = null;
 			};
-		}, [write, resize, handleSelectionChange]);
+		}, [write, runFit, scheduleFit, handleSelectionChange]);
 
 		// Live-update theme and font size without recreating the terminal
 		useEffect(() => {
@@ -612,9 +689,9 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			term.options.theme = resolvedTheme;
 			if (term.options.fontSize !== terminalFontSize) {
 				term.options.fontSize = terminalFontSize;
-				fitAddonRef.current?.fit();
+				scheduleFit();
 			}
-		}, [resolvedTheme, terminalFontSize]);
+		}, [resolvedTheme, terminalFontSize, scheduleFit]);
 
 		const handleAuxKey = useCallback(
 			(data: string) => {

@@ -1623,6 +1623,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	totalMainRef.current = layout.totalWidth;
 
+	const tickPositions = useMemo(() => {
+		const map = new Map<string, number>();
+		for (const tick of layout.ticks) {
+			map.set(tick.sha, tick.x);
+		}
+		return map;
+	}, [layout.ticks]);
+
 	useEffect(() => {
 		const timer = setInterval(() => {
 			const cam = cameraRef.current;
@@ -1635,16 +1643,17 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const bufferSize = (worldEnd - worldStart) * 3;
 			const queries = queryClient.getQueriesData({ queryKey: ["rulerSegment", projectId] });
 			for (const [key] of queries) {
-				const fromSha = key[2] as string;
-				const tick = layout.ticks.find((t) => t.sha === fromSha);
-				if (!tick) continue;
-				if (tick.x < worldStart - bufferSize || tick.x > worldEnd + bufferSize) {
+				const fromSha = key[2];
+				if (typeof fromSha !== "string") continue;
+				const tickX = tickPositions.get(fromSha);
+				if (tickX == null) continue;
+				if (tickX < worldStart - bufferSize || tickX > worldEnd + bufferSize) {
 					queryClient.removeQueries({ queryKey: key });
 				}
 			}
 		}, 30_000);
 		return () => clearInterval(timer);
-	}, [projectId, queryClient, layout.ticks]);
+	}, [projectId, queryClient, tickPositions]);
 
 	// Clean up all segment caches when unmounting the ruler view
 	const projectIdRef = useRef(projectId);
@@ -1670,14 +1679,6 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		cameraRef.current = clamped;
 		setCamera({ ...clamped });
 	}, [needsInitialPosition, commits.length, layout.totalWidth, getBounds]);
-
-	const tickPositions = useMemo(() => {
-		const map = new Map<string, number>();
-		for (const tick of layout.ticks) {
-			map.set(tick.sha, tick.x);
-		}
-		return map;
-	}, [layout.ticks]);
 
 	const { panX, panY, scale, orientation, edge } = camera;
 	const isHorizontal = orientation === "horizontal";
@@ -2337,8 +2338,8 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				const ch = chs.find((c) => c.id === chId);
 				if (!ch) continue;
 				// Find the tick position for this segment
-				const tick = layout.ticks.find((t) => t.sha === sha);
-				if (!tick) break;
+				const segMainPos = tickPositions.get(sha);
+				if (segMainPos == null) break;
 				const ps = panelSizes.get(ch.id);
 				result.push({
 					id: ch.id,
@@ -2353,7 +2354,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					mergeCommitSha: ch.mergeCommitSha,
 					layoutX: ch.layoutX,
 					layoutY: ch.layoutY,
-					segMainPos: tick.x,
+					segMainPos,
 					panelWidth: ps?.w ?? DEFAULT_PANEL_WIDTH,
 					panelHeight: ps?.h ?? DEFAULT_PANEL_HEIGHT,
 				});
@@ -2362,7 +2363,14 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		}
 
 		return result;
-	}, [segmentTicks, pixiChaptersTick, panelSizes, openPanelChapterIds, closingPanelChapterIds]);
+	}, [
+		segmentTicks,
+		pixiChaptersTick,
+		panelSizes,
+		openPanelChapterIds,
+		closingPanelChapterIds,
+		tickPositions,
+	]);
 
 	// Always-visible chapters for L0 dot rendering.
 	// Uses activeChapters + mergedChapters from the main ruler query (no segment fetch needed).

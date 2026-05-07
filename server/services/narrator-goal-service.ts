@@ -147,15 +147,24 @@ export async function createGoal(
 	narratorId: string,
 	objective: string,
 	createdBy?: string | null,
-): Promise<{ goal: NarratorGoalDTO; goals: NarratorGoalDTO[] }> {
+): Promise<{ goal: NarratorGoalDTO; goals: NarratorGoalDTO[]; created: boolean }> {
+	const normalizedObjective = validateGoalObjective(objective);
+	const existingGoals = await listGoals(narratorId);
+	const existingGoal = existingGoals.find((goal) => goal.objective === normalizedObjective);
+	if (existingGoal) {
+		return { goal: existingGoal, goals: existingGoals, created: false };
+	}
+
 	const now = new Date().toISOString();
-	const shouldActivate = !(await hasActiveOrPausedGoal(narratorId));
+	const shouldActivate = !existingGoals.some(
+		(goal) => goal.status === "active" || goal.status === "paused",
+	);
 	const [row] = await db
 		.insert(narratorGoals)
 		.values({
 			id: generateId(),
 			narratorId,
-			objective: validateGoalObjective(objective),
+			objective: normalizedObjective,
 			status: shouldActivate ? "active" : "pending",
 			sortOrder: await nextSortOrder(narratorId),
 			createdBy: createdBy ?? null,
@@ -165,7 +174,7 @@ export async function createGoal(
 		.returning();
 	const [goal] = await attachCreators([row]);
 	const goals = await broadcastGoals(narratorId);
-	return { goal, goals };
+	return { goal, goals, created: true };
 }
 
 export async function updateGoal(

@@ -54,6 +54,7 @@ mock.module("../../../server/lib/codex-manager", () => ({
 mock.module("../../../server/lib/codex-usage-queue", () => ({
 	codexUsageQueue: {
 		clearCompleted: () => {},
+		getSnapshot: () => ({ items: [], isRunning: false }),
 	},
 }));
 

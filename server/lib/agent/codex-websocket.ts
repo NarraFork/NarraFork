@@ -189,6 +189,11 @@ export function isCodexWebSocketIdleTimeoutError(error: unknown): boolean {
 	);
 }
 
+export function isCodexExpected101StatusError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error ?? "");
+	return /Expected\s+101\s+status\s+code/i.test(message);
+}
+
 export function isCodexWebSocketConnectionLimitError(error: CodexWrappedErrorEvent): boolean {
 	const code = error.error?.code ?? error.error?.type;
 	return code === "websocket_connection_limit_reached";

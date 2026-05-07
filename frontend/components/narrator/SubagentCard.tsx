@@ -236,18 +236,21 @@ export const SubagentCard = memo(
 
 		// Render all subagent results as markdown
 		const useMarkdown = true;
-		const childToolCalls: {
-			tc: ToolCallData;
-			toolUseId: string | null;
-			msgId: string;
-			childMsg: NarratorMsg;
-		}[] = [];
-		for (const cm of childMessages) {
-			if (!hasToolUse(cm)) continue;
-			for (const tc of resolveAllToolCallsFromMsg(cm)) {
-				childToolCalls.push({ tc, toolUseId: tc.toolUseId ?? null, msgId: cm.id, childMsg: cm });
+		const childToolCalls = useMemo(() => {
+			const calls: {
+				tc: ToolCallData;
+				toolUseId: string | null;
+				msgId: string;
+				childMsg: NarratorMsg;
+			}[] = [];
+			for (const cm of childMessages) {
+				if (!hasToolUse(cm)) continue;
+				for (const tc of resolveAllToolCallsFromMsg(cm)) {
+					calls.push({ tc, toolUseId: tc.toolUseId ?? null, msgId: cm.id, childMsg: cm });
+				}
 			}
-		}
+			return calls;
+		}, [childMessages]);
 
 		const totalMs = toolCall.durationMs ?? 0;
 
@@ -779,160 +782,164 @@ export const SubagentCard = memo(
 											</Group>
 										</UnstyledButton>
 										<LazyCollapse in={showCalls}>
-											<Box
-												ref={scrollBoxRef}
-												pl="xs"
-												mt={4}
-												style={{
-													overflow: "hidden auto",
-													maxHeight: vpHeight,
-												}}
-											>
-												{(() => {
-													const els: React.ReactNode[] = [];
-													let ci = 0;
-													while (ci < childToolCalls.length) {
-														const item = childToolCalls[ci];
-														const subCh = filterChildrenByToolUse(
-															item.childMsg?.children,
-															item.tc.toolUseId,
-														);
-														const isSub =
-															(subCh && subCh.length > 0) || item.tc.toolName === "Agent";
-														if (isSub) {
-															const subAnimId = getToolCallBlurAnimationId({
-																toolUseId: item.toolUseId,
-																messageId: item.msgId,
-																fallbackKey: ci,
-															});
-															els.push(
-																<BlurInOnAppear
-																	key={item.toolUseId ?? item.tc.toolName}
-																	animationId={subAnimId}
-																>
-																	<div
-																		id={
-																			item.toolUseId
-																				? `tool-use-${item.toolUseId}`
-																				: `msg-${item.msgId}`
-																		}
+											{showCalls ? (
+												<Box
+													ref={scrollBoxRef}
+													pl="xs"
+													mt={4}
+													style={{
+														overflow: "hidden auto",
+														maxHeight: vpHeight,
+													}}
+												>
+													{(() => {
+														const els: React.ReactNode[] = [];
+														let ci = 0;
+														while (ci < childToolCalls.length) {
+															const item = childToolCalls[ci];
+															const subCh = filterChildrenByToolUse(
+																item.childMsg?.children,
+																item.tc.toolUseId,
+															);
+															const isSub =
+																(subCh && subCh.length > 0) || item.tc.toolName === "Agent";
+															if (isSub) {
+																const subAnimId = getToolCallBlurAnimationId({
+																	toolUseId: item.toolUseId,
+																	messageId: item.msgId,
+																	fallbackKey: ci,
+																});
+																els.push(
+																	<BlurInOnAppear
+																		key={item.toolUseId ?? item.tc.toolName}
+																		animationId={subAnimId}
 																	>
-																		<SubagentCard
-																			toolCall={item.tc}
-																			childMessages={subCh ?? []}
-																			narratorId={narratorId}
-																			permCb={permCb}
-																			editExpandOverride={editExpandOverride}
-																			onBgAgentRetry={permCb?.onBgAgentRetry}
-																			onViewSubagentSession={onViewSubagentSession}
-																		/>
-																	</div>
-																</BlurInOnAppear>,
-															);
-															ci++;
-															continue;
-														}
-														// Collect consecutive non-subagent calls into a run
-														const run: typeof childToolCalls = [item];
-														let j = ci + 1;
-														while (j < childToolCalls.length) {
-															const nx = childToolCalls[j];
-															const nxCh = filterChildrenByToolUse(
-																nx.childMsg?.children,
-																nx.tc.toolUseId,
-															);
-															if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Agent") break;
-															run.push(nx);
-															j++;
-														}
-														if (run.length >= 2) {
-															els.push(
-																<Box
-																	key={`crun-${run[0].msgId}`}
-																	style={{
-																		border: "1px solid var(--mantine-color-default-border)",
-																		borderRadius: "var(--mantine-radius-sm)",
-																		overflow: "hidden",
-																	}}
-																>
-																	{run.map((r, ri) => {
-																		const mp = resolvePendingPerm(
-																			r.tc,
-																			permCb?.pendingPermission,
-																			permCb?.pendingPermsMap,
-																		);
-																		const runAnimId = getToolCallBlurAnimationId({
-																			toolUseId: r.toolUseId,
-																			messageId: r.msgId,
-																			fallbackKey: ri,
-																		});
-																		return (
-																			<BlurInOnAppear
-																				key={r.toolUseId ?? r.tc.toolName}
-																				animationId={runAnimId}
-																			>
-																				<div
-																					id={
-																						r.toolUseId
-																							? `tool-use-${r.toolUseId}`
-																							: `msg-${r.msgId}`
-																					}
+																		<div
+																			id={
+																				item.toolUseId
+																					? `tool-use-${item.toolUseId}`
+																					: `msg-${item.msgId}`
+																			}
+																		>
+																			<SubagentCard
+																				toolCall={item.tc}
+																				childMessages={subCh ?? []}
+																				narratorId={narratorId}
+																				permCb={permCb}
+																				editExpandOverride={editExpandOverride}
+																				onBgAgentRetry={permCb?.onBgAgentRetry}
+																				onViewSubagentSession={onViewSubagentSession}
+																			/>
+																		</div>
+																	</BlurInOnAppear>,
+																);
+																ci++;
+																continue;
+															}
+															// Collect consecutive non-subagent calls into a run
+															const run: typeof childToolCalls = [item];
+															let j = ci + 1;
+															while (j < childToolCalls.length) {
+																const nx = childToolCalls[j];
+																const nxCh = filterChildrenByToolUse(
+																	nx.childMsg?.children,
+																	nx.tc.toolUseId,
+																);
+																if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Agent") break;
+																run.push(nx);
+																j++;
+															}
+															if (run.length >= 2) {
+																els.push(
+																	<Box
+																		key={`crun-${run[0].msgId}`}
+																		style={{
+																			border: "1px solid var(--mantine-color-default-border)",
+																			borderRadius: "var(--mantine-radius-sm)",
+																			overflow: "hidden",
+																		}}
+																	>
+																		{run.map((r, ri) => {
+																			const mp = resolvePendingPerm(
+																				r.tc,
+																				permCb?.pendingPermission,
+																				permCb?.pendingPermsMap,
+																			);
+																			const runAnimId = getToolCallBlurAnimationId({
+																				toolUseId: r.toolUseId,
+																				messageId: r.msgId,
+																				fallbackKey: ri,
+																			});
+																			return (
+																				<BlurInOnAppear
+																					key={r.toolUseId ?? r.tc.toolName}
+																					animationId={runAnimId}
 																				>
-																					<ToolCallCard
-																						toolCall={r.tc}
-																						narratorId={narratorId}
-																						inRun
-																						isLast={ri === run.length - 1}
-																						pendingPermission={mp}
-																						onPermissionDecision={permCb?.onPermissionDecision}
-																						onQuestionSubmit={permCb?.onQuestionSubmit}
-																						onQuestionDeny={permCb?.onQuestionDeny}
-																						editExpandOverride={editExpandOverride}
-																					/>
-																				</div>
-																			</BlurInOnAppear>
-																		);
-																	})}
-																</Box>,
-															);
-														} else {
-															const r = run[0];
-															const mp = resolvePendingPerm(
-																r.tc,
-																permCb?.pendingPermission,
-																permCb?.pendingPermsMap,
-															);
-															const singleAnimId = getToolCallBlurAnimationId({
-																toolUseId: r.toolUseId,
-																messageId: r.msgId,
-																fallbackKey: ci,
-															});
-															els.push(
-																<BlurInOnAppear
-																	key={r.toolUseId ?? r.tc.toolName}
-																	animationId={singleAnimId}
-																>
-																	<div
-																		id={r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`}
+																					<div
+																						id={
+																							r.toolUseId
+																								? `tool-use-${r.toolUseId}`
+																								: `msg-${r.msgId}`
+																						}
+																					>
+																						<ToolCallCard
+																							toolCall={r.tc}
+																							narratorId={narratorId}
+																							inRun
+																							isLast={ri === run.length - 1}
+																							pendingPermission={mp}
+																							onPermissionDecision={permCb?.onPermissionDecision}
+																							onQuestionSubmit={permCb?.onQuestionSubmit}
+																							onQuestionDeny={permCb?.onQuestionDeny}
+																							editExpandOverride={editExpandOverride}
+																						/>
+																					</div>
+																				</BlurInOnAppear>
+																			);
+																		})}
+																	</Box>,
+																);
+															} else {
+																const r = run[0];
+																const mp = resolvePendingPerm(
+																	r.tc,
+																	permCb?.pendingPermission,
+																	permCb?.pendingPermsMap,
+																);
+																const singleAnimId = getToolCallBlurAnimationId({
+																	toolUseId: r.toolUseId,
+																	messageId: r.msgId,
+																	fallbackKey: ci,
+																});
+																els.push(
+																	<BlurInOnAppear
+																		key={r.toolUseId ?? r.tc.toolName}
+																		animationId={singleAnimId}
 																	>
-																		<ToolCallCard
-																			toolCall={r.tc}
-																			narratorId={narratorId}
-																			pendingPermission={mp}
-																			onPermissionDecision={permCb?.onPermissionDecision}
-																			onQuestionSubmit={permCb?.onQuestionSubmit}
-																			onQuestionDeny={permCb?.onQuestionDeny}
-																			editExpandOverride={editExpandOverride}
-																		/>
-																	</div>
-																</BlurInOnAppear>,
-															);
+																		<div
+																			id={
+																				r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
+																			}
+																		>
+																			<ToolCallCard
+																				toolCall={r.tc}
+																				narratorId={narratorId}
+																				pendingPermission={mp}
+																				onPermissionDecision={permCb?.onPermissionDecision}
+																				onQuestionSubmit={permCb?.onQuestionSubmit}
+																				onQuestionDeny={permCb?.onQuestionDeny}
+																				editExpandOverride={editExpandOverride}
+																			/>
+																		</div>
+																	</BlurInOnAppear>,
+																);
+															}
+															ci = j;
 														}
-														ci = j;
-													}
-													return els;
-												})()}
-											</Box>
+														return els;
+													})()}
+												</Box>
+											) : null}
 										</LazyCollapse>
 									</Box>
 								)}

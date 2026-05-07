@@ -894,11 +894,10 @@ async function resolveExitPlanModeReflection(
 }
 
 export function shouldRunExitPlanModeReflection(
-	config: Pick<AgentConfig, "planMode" | "reflectionLoop" | "permissionMode">,
+	config: Pick<AgentConfig, "reflectionLoop" | "permissionMode">,
 ): boolean {
 	return (
 		settings.agent.planReflectionAutoApprove &&
-		config.planMode === true &&
 		!config.reflectionLoop &&
 		(config.permissionMode === "acceptEdits" || config.permissionMode === "bypassPermissions")
 	);

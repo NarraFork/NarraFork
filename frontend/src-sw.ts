@@ -1,11 +1,13 @@
 /// <reference lib="webworker" />
+import { CacheableResponsePlugin } from "workbox-cacheable-response";
+import { ExpirationPlugin } from "workbox-expiration";
 import {
 	cleanupOutdatedCaches,
 	createHandlerBoundToURL,
 	precacheAndRoute,
 } from "workbox-precaching";
 import { NavigationRoute, registerRoute } from "workbox-routing";
-import { NetworkOnly } from "workbox-strategies";
+import { CacheFirst, NetworkOnly, StaleWhileRevalidate } from "workbox-strategies";
 
 declare let self: ServiceWorkerGlobalScope;
 
@@ -16,6 +18,50 @@ cleanupOutdatedCaches();
 // API and WebSocket requests always go to network
 registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "GET");
 registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "POST");
+
+const STATIC_ASSET_DESTINATIONS = new Set(["script", "style", "worker"]);
+const STATIC_MEDIA_DESTINATIONS = new Set(["font", "image"]);
+const SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60;
+const THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60;
+
+function isApiOrWsPath(pathname: string) {
+	return (
+		pathname === "/api" ||
+		pathname.startsWith("/api/") ||
+		pathname === "/ws" ||
+		pathname.startsWith("/ws/")
+	);
+}
+
+// Same-origin JS/CSS/workers: keep fast while refreshing in the background.
+registerRoute(
+	({ request, url }) =>
+		url.origin === self.location.origin &&
+		!isApiOrWsPath(url.pathname) &&
+		STATIC_ASSET_DESTINATIONS.has(request.destination),
+	new StaleWhileRevalidate({
+		cacheName: "narrafork-static-assets",
+		plugins: [
+			new CacheableResponsePlugin({ statuses: [200] }),
+			new ExpirationPlugin({ maxEntries: 120, maxAgeSeconds: SEVEN_DAYS_SECONDS }),
+		],
+	}),
+);
+
+// Same-origin fonts/images: prefer cached media with bounded retention.
+registerRoute(
+	({ request, url }) =>
+		url.origin === self.location.origin &&
+		!isApiOrWsPath(url.pathname) &&
+		STATIC_MEDIA_DESTINATIONS.has(request.destination),
+	new CacheFirst({
+		cacheName: "narrafork-static-media",
+		plugins: [
+			new CacheableResponsePlugin({ statuses: [200] }),
+			new ExpirationPlugin({ maxEntries: 80, maxAgeSeconds: THIRTY_DAYS_SECONDS }),
+		],
+	}),
+);
 
 // SPA: serve index.html for navigation requests, but NOT for /api/ or /ws/ paths
 registerRoute(

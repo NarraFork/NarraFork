@@ -1,38 +1,17 @@
-import enChapters from "@frontend/locales/en/chapters.json";
-import enCommon from "@frontend/locales/en/common.json";
-import enContainers from "@frontend/locales/en/containers.json";
-import enDashboard from "@frontend/locales/en/dashboard.json";
-import enExplorations from "@frontend/locales/en/explorations.json";
-import enGit from "@frontend/locales/en/git.json";
-import enGraph from "@frontend/locales/en/graph.json";
-import enNarrator from "@frontend/locales/en/narrator.json";
-import enNarrators from "@frontend/locales/en/narrators.json";
-import enNav from "@frontend/locales/en/nav.json";
-import enProjects from "@frontend/locales/en/projects.json";
-import enRoutines from "@frontend/locales/en/routines.json";
-import enSearch from "@frontend/locales/en/search.json";
-import enSettings from "@frontend/locales/en/settings.json";
-import enTerminal from "@frontend/locales/en/terminal.json";
-import zhChapters from "@frontend/locales/zh-CN/chapters.json";
-import zhCommon from "@frontend/locales/zh-CN/common.json";
-import zhContainers from "@frontend/locales/zh-CN/containers.json";
-import zhDashboard from "@frontend/locales/zh-CN/dashboard.json";
-import zhExplorations from "@frontend/locales/zh-CN/explorations.json";
-import zhGit from "@frontend/locales/zh-CN/git.json";
-import zhGraph from "@frontend/locales/zh-CN/graph.json";
-import zhNarrator from "@frontend/locales/zh-CN/narrator.json";
-import zhNarrators from "@frontend/locales/zh-CN/narrators.json";
-import zhNav from "@frontend/locales/zh-CN/nav.json";
-import zhProjects from "@frontend/locales/zh-CN/projects.json";
-import zhRoutines from "@frontend/locales/zh-CN/routines.json";
-import zhSearch from "@frontend/locales/zh-CN/search.json";
-import zhSettings from "@frontend/locales/zh-CN/settings.json";
-import zhTerminal from "@frontend/locales/zh-CN/terminal.json";
 import i18n from "i18next";
 import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
 
-const ns = [
+declare global {
+	interface ImportMeta {
+		glob<T>(pattern: string): Record<string, () => Promise<T>>;
+	}
+}
+
+export const supportedLanguages = ["en", "zh-CN"] as const;
+export type SupportedLanguage = (typeof supportedLanguages)[number];
+
+export const namespaces = [
 	"common",
 	"chapters",
 	"containers",
@@ -49,63 +28,203 @@ const ns = [
 	"terminal",
 	"routines",
 ] as const;
+export type Namespace = (typeof namespaces)[number];
 
-i18n
-	.use(LanguageDetector)
-	.use(initReactI18next)
-	.init({
-		resources: {
-			en: {
-				common: enCommon,
-				chapters: enChapters,
-				containers: enContainers,
-				dashboard: enDashboard,
-				explorations: enExplorations,
-				git: enGit,
-				graph: enGraph,
-				narrator: enNarrator,
-				nav: enNav,
-				projects: enProjects,
-				search: enSearch,
-				narrators: enNarrators,
-				settings: enSettings,
-				terminal: enTerminal,
-				routines: enRoutines,
-			},
-			"zh-CN": {
-				common: zhCommon,
-				chapters: zhChapters,
-				containers: zhContainers,
-				dashboard: zhDashboard,
-				explorations: zhExplorations,
-				git: zhGit,
-				graph: zhGraph,
-				narrator: zhNarrator,
-				nav: zhNav,
-				projects: zhProjects,
-				search: zhSearch,
-				narrators: zhNarrators,
-				settings: zhSettings,
-				terminal: zhTerminal,
-				routines: zhRoutines,
-			},
-		},
-		fallbackLng: "en",
-		defaultNS: "common",
-		ns: [...ns],
-		interpolation: {
-			escapeValue: false,
-		},
-		detection: {
-			order: ["localStorage", "navigator"],
-			lookupLocalStorage: "narrafork_lang",
-			caches: ["localStorage"],
-		},
-	});
+const localeLoaders = import.meta.glob<{ default: Record<string, unknown> }>("../locales/*/*.json");
+const namespaceSet = new Set<string>(namespaces);
+const resourceCache = new Map<string, Promise<Record<string, unknown>>>();
+let initPromise: Promise<typeof i18n> | undefined;
+
+export function normalizeLanguage(lng: string | null | undefined): SupportedLanguage {
+	const normalized = lng?.toLowerCase().replace("_", "-");
+	return normalized?.startsWith("zh") ? "zh-CN" : "en";
+}
+
+function normalizePathname(pathname: string): string {
+	const path = pathname.split(/[?#]/, 1)[0] || "/";
+	if (path === "/") return path;
+	return path.replace(/\/+$/, "") || "/";
+}
+
+export function getNamespacesForPath(pathname: string): Namespace[] {
+	const path = normalizePathname(pathname);
+
+	if (path === "/login") return ["common"];
+	if (path === "/licenses") return ["common", "nav"];
+	if (path === "/changelog") return ["common", "nav", "settings"];
+	if (path === "/") return ["common", "nav", "dashboard"];
+	if (path === "/projects") return ["common", "nav", "projects"];
+	if (path.startsWith("/projects/")) {
+		return ["common", "nav", "projects", "chapters", "graph", "settings"];
+	}
+	if (path === "/narrators") return ["common", "nav", "narrators", "narrator"];
+	if (path === "/narrators/archived") return ["common", "nav", "narrators"];
+	if (path.startsWith("/narrators/workspace/")) {
+		return ["common", "nav", "narrators", "narrator", "terminal"];
+	}
+	if (path.startsWith("/narrators/")) {
+		return ["common", "nav", "narrators", "narrator", "chapters", "settings", "terminal"];
+	}
+	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
+		return ["common", "nav", "settings", "narrator"];
+	}
+	if (path === "/settings/terminals") {
+		return ["common", "nav", "settings", "terminal"];
+	}
+	if (path === "/settings" || path.startsWith("/settings/")) {
+		return ["common", "nav", "settings"];
+	}
+	if (path === "/routines" || path.startsWith("/routines/")) {
+		return ["common", "nav", "routines", "settings"];
+	}
+	if (path === "/search") return ["common", "nav", "search"];
+
+	return ["common", "nav"];
+}
+
+export function getInitialNamespaces(pathname: string): Namespace[] {
+	return getNamespacesForPath(pathname);
+}
+
+function normalizeNamespace(namespace: string): Namespace {
+	if (namespaceSet.has(namespace)) return namespace as Namespace;
+	throw new Error(`Unsupported i18n namespace: ${namespace}`);
+}
+
+function uniqueNamespaces(ns: readonly Namespace[]): Namespace[] {
+	return Array.from(new Set(ns));
+}
+
+function getCurrentRouteNamespaces(): Namespace[] {
+	if (typeof window === "undefined") return getInitialNamespaces("/");
+	return getNamespacesForPath(window.location.pathname);
+}
+
+function setDocumentLanguage(lng: string | null | undefined) {
+	if (typeof document === "undefined") return;
+	document.documentElement.lang = normalizeLanguage(lng);
+}
+
+function loadLocaleResource(
+	language: string | null | undefined,
+	namespace: string,
+): Promise<Record<string, unknown>> {
+	const normalizedLng = normalizeLanguage(language);
+	const normalizedNamespace = normalizeNamespace(namespace);
+	const cacheKey = `${normalizedLng}:${normalizedNamespace}`;
+	const cached = resourceCache.get(cacheKey);
+	if (cached) return cached;
+
+	const resourcePath = `../locales/${normalizedLng}/${normalizedNamespace}.json`;
+	const loader = localeLoaders[resourcePath];
+	if (!loader) {
+		return Promise.reject(new Error(`Missing i18n resource: ${resourcePath}`));
+	}
+
+	const promise = loader()
+		.then((module) => module.default)
+		.catch((error) => {
+			resourceCache.delete(cacheKey);
+			throw error;
+		});
+	resourceCache.set(cacheKey, promise);
+	return promise;
+}
+
+const dynamicResourcesBackend = {
+	type: "backend" as const,
+	read(
+		language: string,
+		namespace: string,
+		callback: (error: Error | null, resources?: false | Record<string, unknown>) => void,
+	) {
+		void loadLocaleResource(language, namespace)
+			.then((resources) => callback(null, resources))
+			.catch((error) => {
+				callback(error instanceof Error ? error : new Error(String(error)), false);
+			});
+	},
+};
+
+async function loadNamespaceBundle(
+	language: SupportedLanguage,
+	namespace: Namespace,
+): Promise<void> {
+	if (i18n.hasResourceBundle(language, namespace)) return;
+	const resources = await loadLocaleResource(language, namespace);
+	if (!i18n.hasResourceBundle(language, namespace)) {
+		i18n.addResourceBundle(language, namespace, resources, true, true);
+	}
+}
+
+export async function ensureI18nNamespaces(ns: readonly Namespace[], lng?: string): Promise<void> {
+	const targetNamespaces = uniqueNamespaces(ns);
+	if (targetNamespaces.length === 0) return;
+
+	const targetLanguage = normalizeLanguage(lng ?? i18n.resolvedLanguage ?? i18n.language);
+	const languages: SupportedLanguage[] = targetLanguage === "en" ? ["en"] : [targetLanguage, "en"];
+
+	await Promise.all(
+		languages.flatMap((language) =>
+			targetNamespaces.map((namespace) => loadNamespaceBundle(language, namespace)),
+		),
+	);
+}
+
+export async function changeAppLanguage(
+	lng: string,
+	extraNamespaces: readonly Namespace[] = [],
+): Promise<void> {
+	const normalizedLng = normalizeLanguage(lng);
+	const requiredNamespaces = uniqueNamespaces([...getCurrentRouteNamespaces(), ...extraNamespaces]);
+
+	await ensureI18nNamespaces(requiredNamespaces, normalizedLng);
+	await i18n.changeLanguage(normalizedLng);
+	setDocumentLanguage(normalizedLng);
+}
 
 i18n.on("languageChanged", (lng) => {
-	document.documentElement.lang = lng;
+	setDocumentLanguage(lng);
 });
-document.documentElement.lang = i18n.language;
+
+export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeof i18n> {
+	const initialNs = uniqueNamespaces(initialNamespaces.length > 0 ? initialNamespaces : ["common"]);
+
+	if (i18n.isInitialized) {
+		return ensureI18nNamespaces(initialNs).then(() => i18n);
+	}
+	if (initPromise) return initPromise;
+
+	initPromise = i18n
+		.use(dynamicResourcesBackend)
+		.use(LanguageDetector)
+		.use(initReactI18next)
+		.init({
+			fallbackLng: "en",
+			supportedLngs: [...supportedLanguages],
+			load: "currentOnly",
+			defaultNS: "common",
+			ns: initialNs,
+			interpolation: {
+				escapeValue: false,
+			},
+			detection: {
+				order: ["localStorage", "navigator"],
+				lookupLocalStorage: "narrafork_lang",
+				caches: ["localStorage"],
+				convertDetectedLanguage: normalizeLanguage,
+			},
+			react: {
+				useSuspense: true,
+			},
+		})
+		.then(async () => {
+			await ensureI18nNamespaces(initialNs);
+			setDocumentLanguage(i18n.resolvedLanguage ?? i18n.language);
+			return i18n;
+		});
+
+	return initPromise;
+}
 
 export default i18n;

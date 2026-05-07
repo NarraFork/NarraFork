@@ -43,7 +43,7 @@ const QUOTA_OVERVIEW_BROADCAST_DEBOUNCE_MS = 100;
 
 // === Types ===
 
-export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
+export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted" | "banned";
 export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 
 export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
@@ -514,6 +514,27 @@ export class CodexManager {
 		return this.entries.some((e) => !e.disabled);
 	}
 
+	markBanned(id: string): boolean {
+		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
+		stats.failureCount = MAX_FAILURES_PER_CREDENTIAL;
+		stats.lastUsedAt = new Date().toISOString();
+		this.stats.set(id, stats);
+
+		const entry = this.entries.find((e) => e.id === id);
+		if (entry) {
+			entry.disabled = true;
+			entry.disabledReason = "banned";
+			entry.quotaResetsAt = undefined;
+			this.evictSessionsByCredential(id);
+			this.saveCredentials();
+			this.schedulePublicQuotaOverviewBroadcast();
+		}
+
+		this.saveStatsDebounced();
+		this.rescheduleUsageRefresh();
+		return this.entries.some((e) => !e.disabled);
+	}
+
 	// ==================== Self-healing ====================
 
 	private trySelfHeal(): boolean {
@@ -578,7 +599,11 @@ export class CodexManager {
 	}
 
 	private shouldTrackUsageReset(entry: CodexCredential): boolean {
-		if (entry.disabledReason === "manual" || entry.disabledReason === "too_many_failures") {
+		if (
+			entry.disabledReason === "manual" ||
+			entry.disabledReason === "too_many_failures" ||
+			entry.disabledReason === "banned"
+		) {
 			return false;
 		}
 		return !entry.disabled || entry.disabledReason === "quota_exhausted";

@@ -45,11 +45,19 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	};
 
 	const renderProviderCard = (group: ProviderGroup) => {
-		const hiddenCount = group.models.filter((m) => hiddenModels.has(m.value)).length;
+		let hiddenCount = 0;
+		const previewModels: string[] = [];
+		for (const model of group.models) {
+			if (hiddenModels.has(model.value)) {
+				hiddenCount += 1;
+				continue;
+			}
+			if (previewModels.length < 3) {
+				previewModels.push(model.label);
+			}
+		}
+		const visibleCount = group.models.length - hiddenCount;
 		const status = getProviderStatus(group);
-		const visibleModelsList = group.models
-			.filter((m) => !hiddenModels.has(m.value))
-			.map((m) => m.label);
 
 		return (
 			<Grid.Col key={group.prefix} span={{ base: 12, sm: 6, md: 4, lg: 3 }}>
@@ -58,9 +66,9 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					type={group.isPlatform ? "platform" : "custom"}
 					badgeLabel={group.badgeLabel}
 					status={status}
-					modelCount={group.models.length}
+					visibleCount={visibleCount}
 					hiddenCount={hiddenCount}
-					visibleModels={visibleModelsList}
+					previewModels={previewModels}
 					disabled={group.disabled}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}

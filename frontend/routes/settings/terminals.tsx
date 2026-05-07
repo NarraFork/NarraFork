@@ -24,12 +24,15 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
-import { TerminalPanel } from "../../components/terminal/TerminalPanel";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
+
+const TerminalPanel = lazy(() =>
+	import("../../components/terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
+);
 
 export const Route = createFileRoute("/settings/terminals")({
 	component: SettingsTerminalsPage,
@@ -100,25 +103,38 @@ function SettingsTerminalsPage() {
 		});
 	}, []);
 
-	if (isLoading) return <Loader />;
+	const terminals = useMemo(() => data?.terminals ?? [], [data?.terminals]);
+	const orphanSockets = useMemo(() => data?.orphanSockets ?? [], [data?.orphanSockets]);
+	const runningTerminals = useMemo(
+		() => terminals.filter((t: { status: string }) => t.status === "running"),
+		[terminals],
+	);
+	const exitedTerminals = useMemo(
+		() => terminals.filter((t: { status: string }) => t.status !== "running"),
+		[terminals],
+	);
+	const runningTerminalIds = useMemo(
+		() => runningTerminals.map((t: { id: string }) => t.id),
+		[runningTerminals],
+	);
+	const allRunningSelected = useMemo(
+		() => runningTerminalIds.length > 0 && runningTerminalIds.every((id) => selected.has(id)),
+		[runningTerminalIds, selected],
+	);
+	const someRunningSelected = useMemo(
+		() => runningTerminalIds.some((id) => selected.has(id)),
+		[runningTerminalIds, selected],
+	);
 
-	const terminals = data?.terminals ?? [];
-	const orphanSockets = data?.orphanSockets ?? [];
-	const runningTerminals = terminals.filter((t: { status: string }) => t.status === "running");
-	const exitedTerminals = terminals.filter((t: { status: string }) => t.status !== "running");
-
-	const allRunningSelected =
-		runningTerminals.length > 0 &&
-		runningTerminals.every((t: { id: string }) => selected.has(t.id));
-	const someRunningSelected = runningTerminals.some((t: { id: string }) => selected.has(t.id));
-
-	const toggleSelectAll = () => {
+	const toggleSelectAll = useCallback(() => {
 		if (allRunningSelected) {
 			setSelected(new Set());
 		} else {
-			setSelected(new Set(runningTerminals.map((t: { id: string }) => t.id)));
+			setSelected(new Set(runningTerminalIds));
 		}
-	};
+	}, [allRunningSelected, runningTerminalIds]);
+
+	if (isLoading) return <Loader />;
 
 	return (
 		<Stack>
@@ -155,7 +171,9 @@ function SettingsTerminalsPage() {
 							</ActionIcon>
 						</Group>
 						<Box style={{ height: 400 }}>
-							<TerminalPanel terminalId={openTerminalId} />
+							<Suspense fallback={null}>
+								<TerminalPanel terminalId={openTerminalId} />
+							</Suspense>
 						</Box>
 					</Paper>
 				)}

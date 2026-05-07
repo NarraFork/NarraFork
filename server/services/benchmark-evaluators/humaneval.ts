@@ -36,9 +36,10 @@ async function extractSolution(agentOutput: string, workDir: string): Promise<st
 	// Extract from markdown code fence
 	const fenceRe = /```(?:python)?\s*\n([\s\S]*?)```/g;
 	let best = "";
-	let m: RegExpExecArray | null;
-	while ((m = fenceRe.exec(agentOutput)) !== null) {
-		if (m[1].length > best.length) best = m[1];
+	let match = fenceRe.exec(agentOutput);
+	while (match !== null) {
+		if (match[1].length > best.length) best = match[1];
+		match = fenceRe.exec(agentOutput);
 	}
 	if (best) return best;
 

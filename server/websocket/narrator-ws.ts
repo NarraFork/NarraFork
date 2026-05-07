@@ -392,6 +392,10 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		debouncedBrowserSessionCount(event.narratorId);
 	});
 
+	eventBus.on("browser:session_updated", (event) => {
+		debouncedBrowserSessionCount(event.narratorId);
+	});
+
 	eventBus.on("container:started", (event) => {
 		debouncedContainerStatus(event.chapterId);
 		broadcastToAll({ type: "container:started", chapterId: event.chapterId });

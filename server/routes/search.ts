@@ -5,7 +5,7 @@ export const searchRoutes = new Hono();
 
 searchRoutes.get("/", async (c) => {
 	const q = c.req.query("q");
-	if (!q || !q.trim()) return c.json({ results: [] });
+	if (!q?.trim()) return c.json({ results: [] });
 
 	const entitiesParam = c.req.query("entities") ?? "chapters,messages,narrators";
 	const entities = entitiesParam

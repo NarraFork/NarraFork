@@ -3,11 +3,13 @@
 // Supports both HTTP (default) and Responses WebSocket modes
 
 import { type CallContext, getCodexManager } from "../codex-manager";
+import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
+	isCodexExpected101StatusError,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
@@ -138,6 +140,69 @@ export class CodexProvider implements ProviderAdapter {
 		return Math.max(this.manager.snapshot().available, 1);
 	}
 
+	private getCredentialSnapshot(id: string) {
+		return this.manager.snapshot().entries.find((entry) => entry.id === id);
+	}
+
+	private async resolveExpected101WebSocketFailure(
+		ctx: CallContext,
+		err: unknown,
+	): Promise<"not_expected_101" | "retry_sse" | "credential_unavailable"> {
+		if (!isCodexExpected101StatusError(err)) return "not_expected_101";
+
+		try {
+			await this.manager.getUsage(ctx.id);
+			const credential = this.getCredentialSnapshot(ctx.id);
+			if (credential?.disabled) {
+				this.context = null;
+				this.contextSessionKey = undefined;
+				logger.warn(
+					"Codex Responses WebSocket expected 101 failure; usage check disabled credential",
+					{
+						credentialId: ctx.id,
+						accountId: ctx.credential.accountId,
+						disabledReason: credential.disabledReason,
+						error: err instanceof Error ? err.message : String(err),
+					},
+				);
+				return "credential_unavailable";
+			}
+			logger.warn(
+				"Codex Responses WebSocket expected 101 failure; usage check passed, retrying via SSE",
+				{
+					credentialId: ctx.id,
+					accountId: ctx.credential.accountId,
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
+			return "retry_sse";
+		} catch (usageError) {
+			if (isUnauthorizedCodexUsageError(usageError)) {
+				this.manager.markBanned(ctx.id);
+				this.context = null;
+				this.contextSessionKey = undefined;
+				logger.warn("Codex credential usage check returned 401; marked credential as banned", {
+					credentialId: ctx.id,
+					accountId: ctx.credential.accountId,
+					websocketError: err instanceof Error ? err.message : String(err),
+					usageError: usageError instanceof Error ? usageError.message : String(usageError),
+				});
+				return "credential_unavailable";
+			}
+
+			logger.warn(
+				"Codex Responses WebSocket expected 101 failure; usage check was inconclusive, retrying via SSE",
+				{
+					credentialId: ctx.id,
+					accountId: ctx.credential.accountId,
+					websocketError: err instanceof Error ? err.message : String(err),
+					usageError: usageError instanceof Error ? usageError.message : String(usageError),
+				},
+			);
+			return "retry_sse";
+		}
+	}
+
 	private reportCallError(
 		ctx: CallContext,
 		err: unknown,
@@ -165,6 +230,33 @@ export class CodexProvider implements ProviderAdapter {
 		}
 
 		return { classified, hasMore };
+	}
+
+	private shouldRetryAfterFallbackError(
+		ctx: CallContext,
+		err: unknown,
+		hasStreamedEvents: boolean,
+		attempt: number,
+		maxAttempts: number,
+		operation: string,
+	): boolean {
+		const { classified, hasMore } = this.reportCallError(ctx, err);
+		const shouldRetry =
+			classified.type === "quota_exhausted" &&
+			hasMore &&
+			!hasStreamedEvents &&
+			attempt < maxAttempts;
+		if (shouldRetry) {
+			this.context = null;
+			this.contextSessionKey = undefined;
+			logger.info("Codex SSE fallback quota failover: retrying with next credential", {
+				operation,
+				attempt,
+				maxAttempts,
+				previousCredentialId: ctx.id,
+			});
+		}
+		return shouldRetry;
 	}
 
 	private async runWithFailover<T>(
@@ -367,18 +459,82 @@ export class CodexProvider implements ProviderAdapter {
 				if (params.signal.aborted) {
 					throw err;
 				}
+
+				const expected101Decision = await this.resolveExpected101WebSocketFailure(ctx, err);
+				if (expected101Decision === "retry_sse") {
+					try {
+						for await (const event of provider.chat(chatParams)) {
+							hasStreamedEvents = true;
+							yield { ...event, credentialId: ctx.id };
+						}
+						this.manager.reportSuccess(ctx.id);
+						return;
+					} catch (fallbackErr) {
+						if (params.signal.aborted) throw fallbackErr;
+						lastError = fallbackErr;
+						attempt++;
+						if (
+							this.shouldRetryAfterFallbackError(
+								ctx,
+								fallbackErr,
+								hasStreamedEvents,
+								attempt,
+								maxAttempts,
+								"chat",
+							)
+						) {
+							continue;
+						}
+						throw fallbackErr;
+					}
+				}
+				if (expected101Decision === "credential_unavailable") {
+					lastError = err;
+					attempt++;
+					const hasMore = this.manager.snapshot().available > 0;
+					if (hasMore && !hasStreamedEvents && attempt < maxAttempts) {
+						logger.info("Codex unavailable credential failover: retrying with next credential", {
+							operation: "chat",
+							attempt,
+							maxAttempts,
+							previousCredentialId: ctx.id,
+						});
+						continue;
+					}
+					throw err;
+				}
+
 				if (err instanceof CodexWebSocketFallbackError) {
-					logger.warn("Codex Responses WebSocket unavailable, falling back to HTTP", {
+					logger.warn("Codex Responses WebSocket unavailable, falling back to SSE", {
 						credentialId: ctx.id,
 						status: err.status,
 						error: err.message,
 					});
-					for await (const event of provider.chat(chatParams)) {
-						hasStreamedEvents = true;
-						yield { ...event, credentialId: ctx.id };
+					try {
+						for await (const event of provider.chat(chatParams)) {
+							hasStreamedEvents = true;
+							yield { ...event, credentialId: ctx.id };
+						}
+						this.manager.reportSuccess(ctx.id);
+						return;
+					} catch (fallbackErr) {
+						if (params.signal.aborted) throw fallbackErr;
+						lastError = fallbackErr;
+						attempt++;
+						if (
+							this.shouldRetryAfterFallbackError(
+								ctx,
+								fallbackErr,
+								hasStreamedEvents,
+								attempt,
+								maxAttempts,
+								"chat",
+							)
+						) {
+							continue;
+						}
+						throw fallbackErr;
 					}
-					this.manager.reportSuccess(ctx.id);
-					return;
 				}
 
 				lastError = err;

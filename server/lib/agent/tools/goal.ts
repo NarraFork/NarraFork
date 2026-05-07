@@ -41,9 +41,13 @@ export const addGoalTool: ToolDefinition = {
 		return {
 			output: JSON.stringify(
 				{
-					added: result.goal,
+					added: result.created ? result.goal : null,
+					alreadyExists: !result.created,
+					goal: result.goal,
 					goals: result.goals,
-					summary: formatGoals(result.goals),
+					summary: result.created
+						? formatGoals(result.goals)
+						: `A matching open goal already exists; no duplicate was added.\n${formatGoals(result.goals)}`,
 				},
 				null,
 				2,

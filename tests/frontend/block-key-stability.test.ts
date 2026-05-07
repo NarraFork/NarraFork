@@ -3,8 +3,22 @@ import {
 	buildStreamingMsg,
 	clearToolBlockCache,
 	generateBlockKeys,
-	type StreamingBlock,
 } from "../../frontend/components/narrator/message-segments";
+import type { ContentBlock } from "../../frontend/lib/api";
+
+type StreamingMsg = ReturnType<typeof buildStreamingMsg>;
+
+function getContentBlocks(msg: StreamingMsg): ContentBlock[] {
+	return msg?.contentJson ?? [];
+}
+
+function findContentBlock(msg: StreamingMsg, type: string): ContentBlock | undefined {
+	return getContentBlocks(msg).find((block) => block.type === type);
+}
+
+function getToolUseBlocks(msg: StreamingMsg): ContentBlock[] {
+	return getContentBlocks(msg).filter((block) => block.type === "tool_use");
+}
 
 // ---------------------------------------------------------------------------
 // buildStreamingMsg — stable synthetic IDs
@@ -19,7 +33,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			streamingBlocks: [{ type: "reasoning", text: "thinking..." }],
 		});
 		expect(msg).not.toBeNull();
-		const reasoningBlock = msg?.contentJson.find((b: any) => b.type === "reasoning");
+		const reasoningBlock = findContentBlock(msg, "reasoning");
 		expect(reasoningBlock).toBeDefined();
 		expect(reasoningBlock?.id).toBe("streaming:reasoning:0");
 	});
@@ -30,7 +44,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			streamingBlocks: [{ type: "text", text: "hello" }],
 		});
 		expect(msg).not.toBeNull();
-		const textBlock = msg?.contentJson.find((b: any) => b.type === "text");
+		const textBlock = findContentBlock(msg, "text");
 		expect(textBlock).toBeDefined();
 		expect(textBlock?.id).toBe("streaming:text:0");
 	});
@@ -44,7 +58,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			],
 		});
 		expect(msg).not.toBeNull();
-		const ids = msg?.contentJson.map((b: any) => b.id);
+		const ids = getContentBlocks(msg).map((block) => block.id);
 		expect(ids).toEqual(["streaming:reasoning:0", "streaming:text:1"]);
 	});
 
@@ -54,7 +68,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			streamingBlocks: [{ type: "web_search", id: "ws-123", status: "searching", query: "test" }],
 		});
 		expect(msg).not.toBeNull();
-		const wsBlock = msg?.contentJson.find((b: any) => b.type === "web_search");
+		const wsBlock = findContentBlock(msg, "web_search");
 		expect(wsBlock).toBeDefined();
 		expect(wsBlock?.id).toBe("ws-123");
 	});
@@ -76,8 +90,8 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		};
 		const msg = buildStreamingMsg({ ...base, toolChunksMsg });
 		expect(msg).not.toBeNull();
-		const toolBlocks = msg?.contentJson.filter((b: any) => b.type === "tool_use") ?? [];
-		expect(toolBlocks.map((b: any) => b.id)).toEqual(["tu-1", "tu-2"]);
+		const toolBlocks = getToolUseBlocks(msg);
+		expect(toolBlocks.map((b: ContentBlock) => b.id)).toEqual(["tu-1", "tu-2"]);
 	});
 
 	test("all block types combined: ids remain stable", () => {
@@ -102,7 +116,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			toolChunksMsg,
 		});
 		expect(msg).not.toBeNull();
-		const ids = msg?.contentJson.map((b: any) => b.id);
+		const ids = getContentBlocks(msg).map((block) => block.id);
 		expect(ids).toEqual(["streaming:reasoning:0", "ws-1", "streaming:text:2", "tu-1"]);
 	});
 
@@ -112,7 +126,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			...base,
 			streamingBlocks: [{ type: "reasoning", text: "t" }],
 		});
-		const reasoningId1 = step1?.contentJson[0].id;
+		const reasoningId1 = getContentBlocks(step1)[0]?.id;
 
 		const step2 = buildStreamingMsg({
 			...base,
@@ -121,8 +135,8 @@ describe("buildStreamingMsg — stable block IDs", () => {
 				{ type: "text", text: "hel" },
 			],
 		});
-		const reasoningId2 = step2?.contentJson.find((b: any) => b.type === "reasoning")?.id;
-		const textId2 = step2?.contentJson.find((b: any) => b.type === "text")?.id;
+		const reasoningId2 = findContentBlock(step2, "reasoning")?.id;
+		const textId2 = findContentBlock(step2, "text")?.id;
 
 		const step3 = buildStreamingMsg({
 			...base,
@@ -132,8 +146,8 @@ describe("buildStreamingMsg — stable block IDs", () => {
 				{ type: "text", text: "hello world" },
 			],
 		});
-		const reasoningId3 = step3?.contentJson.find((b: any) => b.type === "reasoning")?.id;
-		const textId3 = step3?.contentJson.find((b: any) => b.type === "text")?.id;
+		const reasoningId3 = findContentBlock(step3, "reasoning")?.id;
+		const textId3 = findContentBlock(step3, "text")?.id;
 
 		// All ids should be identical across steps
 		expect(reasoningId1).toBe("streaming:reasoning:0");
@@ -154,7 +168,7 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			],
 		});
 		expect(msg).not.toBeNull();
-		const types = msg?.contentJson.map((b: any) => b.type);
+		const types = getContentBlocks(msg).map((block) => block.type);
 		expect(types).toEqual(["reasoning", "web_search", "text"]);
 	});
 
@@ -169,11 +183,11 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			],
 		});
 		expect(msg).not.toBeNull();
-		const types = msg?.contentJson.map((b: any) => b.type);
+		const types = getContentBlocks(msg).map((block) => block.type);
 		expect(types).toEqual(["reasoning", "web_search", "web_search", "text"]);
-		const wsIds = msg?.contentJson
-			.filter((b: any) => b.type === "web_search")
-			.map((b: any) => b.id);
+		const wsIds = getContentBlocks(msg)
+			.filter((block) => block.type === "web_search")
+			.map((block) => block.id);
 		expect(wsIds).toEqual(["ws-1", "ws-2"]);
 	});
 });
@@ -362,8 +376,8 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 		expect(msg1).not.toBeNull();
 		expect(msg2).not.toBeNull();
 
-		const toolBlock1 = msg1?.contentJson.find((b: any) => b.type === "tool_use");
-		const toolBlock2 = msg2?.contentJson.find((b: any) => b.type === "tool_use");
+		const toolBlock1 = getToolUseBlocks(msg1)[0];
+		const toolBlock2 = getToolUseBlocks(msg2)[0];
 
 		// Same object reference — not just same data
 		expect(toolBlock1).toBe(toolBlock2);
@@ -389,8 +403,8 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 		const msg1 = buildStreamingMsg({ narratorId: "n1", toolChunksMsg: toolChunksMsg1 });
 		const msg2 = buildStreamingMsg({ narratorId: "n1", toolChunksMsg: toolChunksMsg2 });
 
-		const toolBlock1 = msg1?.contentJson.find((b: any) => b.type === "tool_use");
-		const toolBlock2 = msg2?.contentJson.find((b: any) => b.type === "tool_use");
+		const toolBlock1 = getToolUseBlocks(msg1)[0];
+		const toolBlock2 = getToolUseBlocks(msg2)[0];
 
 		// Different input → different reference
 		expect(toolBlock1).not.toBe(toolBlock2);
@@ -429,7 +443,7 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 			toolChunksMsg,
 		});
 
-		const getToolBlocks = (msg: any) => msg?.contentJson.filter((b: any) => b.type === "tool_use");
+		const getToolBlocks = getToolUseBlocks;
 
 		const [tu1_1, tu2_1] = getToolBlocks(msg1);
 		const [tu1_2, tu2_2] = getToolBlocks(msg2);

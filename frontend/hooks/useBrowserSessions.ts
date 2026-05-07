@@ -20,6 +20,24 @@ export function useCloseBrowserSession() {
 	});
 }
 
+export function useSetBrowserSessionTtl() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			sessionId,
+			ttlMs,
+		}: {
+			narratorId: string;
+			sessionId: string;
+			ttlMs: number;
+		}) => api.setBrowserSessionTtl(narratorId, sessionId, ttlMs),
+		onSuccess: (_, { narratorId }) => {
+			qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
+		},
+	});
+}
+
 export function useStopBrowserTracing() {
 	const qc = useQueryClient();
 	return useMutation({

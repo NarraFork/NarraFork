@@ -65,18 +65,19 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 	const [logService, setLogService] = useState<string | null>(null);
 	const [logTail, setLogTail] = useState("100");
 
-	const {
-		data: logData,
-		isLoading: logsLoading,
-		refetch: refetchLogs,
-	} = useContainerLogs(chapterId, {
-		tail: Number.parseInt(logTail, 10),
-		service: logService ?? undefined,
-	});
-
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
 	const running = containers?.filter((c: any) => c.status === "running") ?? [];
 	const hasInstances = (containers?.length ?? 0) > 0;
+	const runtimeLogsEnabled = hasInstances && !starting && logsOpen;
+
+	const { data: logData, isLoading: logsLoading } = useContainerLogs(
+		chapterId,
+		{
+			tail: Number.parseInt(logTail, 10),
+			service: logService ?? undefined,
+		},
+		{ enabled: runtimeLogsEnabled },
+	);
 
 	// Deduplicated service names for log filter
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
@@ -233,10 +234,7 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 							size="compact-xs"
 							variant="light"
 							leftSection={<IconScript size={12} />}
-							onClick={() => {
-								if (!logsOpen) refetchLogs();
-								setLogsOpen(!logsOpen);
-							}}
+							onClick={() => setLogsOpen((open) => !open)}
 						>
 							{logsOpen ? t("hideLogs") : t("showLogs")}
 						</Button>

@@ -30,6 +30,7 @@ interface ChapterNarrator {
 }
 
 const MAX_TEXT_LEN = 80;
+const MAX_STREAM_BUF_LEN = 1000;
 
 function truncate(s: string, max: number): string {
 	if (s.length <= max) return s;
@@ -139,7 +140,9 @@ export function useRulerChapterActivity(
 						ev.delta?.text &&
 						!ev.subagentToolUseId
 					) {
-						const buf = (streamBufRef.current.get(narratorId) ?? "") + ev.delta.text;
+						const nextBuf = (streamBufRef.current.get(narratorId) ?? "") + ev.delta.text;
+						const buf =
+							nextBuf.length > MAX_STREAM_BUF_LEN ? nextBuf.slice(-MAX_STREAM_BUF_LEN) : nextBuf;
 						streamBufRef.current.set(narratorId, buf);
 						// Update activity with accumulated text
 						const prev = activityRef.current.get(chapterId);

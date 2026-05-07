@@ -1,8 +1,7 @@
 import { Loader, Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AvatarCropModal } from "../../components/AvatarCropModal";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { ProfileSection } from "../../components/settings/ProfileSection";
 import {
@@ -11,6 +10,10 @@ import {
 	useUpdateProfile,
 	useUploadAvatar,
 } from "../../hooks/useAuth";
+
+const AvatarCropModal = lazy(() =>
+	import("../../components/AvatarCropModal").then((m) => ({ default: m.AvatarCropModal })),
+);
 
 export const Route = createFileRoute("/settings/profile")({
 	component: SettingsProfilePage,
@@ -99,13 +102,15 @@ function SettingsProfilePage() {
 				updateProfile={updateProfile}
 			/>
 			{cropSrc && (
-				<AvatarCropModal
-					opened={!!cropSrc}
-					onClose={clearCropSrc}
-					imageSrc={cropSrc}
-					onConfirm={handleCropConfirm}
-					loading={uploadAvatar.isPending}
-				/>
+				<Suspense fallback={null}>
+					<AvatarCropModal
+						opened={!!cropSrc}
+						onClose={clearCropSrc}
+						imageSrc={cropSrc}
+						onConfirm={handleCropConfirm}
+						loading={uploadAvatar.isPending}
+					/>
+				</Suspense>
 			)}
 		</Stack>
 	);

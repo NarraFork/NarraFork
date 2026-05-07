@@ -664,12 +664,20 @@ export const narratorsApi = {
 				id: string;
 				url: string;
 				lastActivity: number;
+				ttlMs: number;
+				expiresAt: number;
+				headless: boolean;
 				tracing: { active: boolean; startedAt: number } | null;
 				networkRequestCount: number;
 			}[]
 		>(`/narrators/${narratorId}/browser-sessions`),
 	closeBrowserSession: (narratorId: string, sessionId: string) =>
 		request(`/narrators/${narratorId}/browser-sessions/${sessionId}`, { method: "DELETE" }),
+	setBrowserSessionTtl: (narratorId: string, sessionId: string, ttlMs: number) =>
+		request(`/narrators/${narratorId}/browser-sessions/${sessionId}/ttl`, {
+			method: "PATCH",
+			body: JSON.stringify({ ttlMs }),
+		}),
 	stopBrowserTracing: (narratorId: string, sessionId: string) =>
 		request(`/narrators/${narratorId}/browser-sessions/${sessionId}/stop-tracing`, {
 			method: "POST",

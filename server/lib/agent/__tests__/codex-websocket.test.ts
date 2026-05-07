@@ -7,6 +7,7 @@ import {
 	clearCodexResponsesWebSocketSessions,
 	decidePrematureCodexReconnect,
 	hasRecentNarratorMessage,
+	isCodexExpected101StatusError,
 	isCodexResponsesWebSocketSessionExpired,
 	isCodexWebSocketConnectionLimitError,
 	isCodexWebSocketIdleTimeoutError,
@@ -130,6 +131,17 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(
 			isCodexWebSocketIdleTimeoutError("Codex WebSocket idle timeout waiting for response event"),
 		).toBe(false);
+	});
+
+	test("detects websocket expected 101 status errors", () => {
+		expect(
+			isCodexExpected101StatusError(
+				new Error(
+					"WebSocket connection to 'wss://chatgpt.com/backend-api/codex/responses' failed: Expected 101 status code",
+				),
+			),
+		).toBe(true);
+		expect(isCodexExpected101StatusError(new Error("Unexpected server response: 403"))).toBe(false);
 	});
 
 	test("detects websocket connection lifetime limit errors", () => {

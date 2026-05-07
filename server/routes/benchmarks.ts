@@ -3,8 +3,8 @@
  */
 import { Hono } from "hono";
 import { z } from "zod";
-import { permissionModeSchema } from "../lib/permission-modes";
 import { logger } from "../lib/logger";
+import { permissionModeSchema } from "../lib/permission-modes";
 import {
 	cancelRun,
 	compareRuns,

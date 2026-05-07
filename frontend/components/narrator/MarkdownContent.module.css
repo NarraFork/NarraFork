@@ -14,10 +14,12 @@
    2. pre-wrap inside list items preserves stray \n between items as visible
       blank lines during streaming → override to normal inside <li>. */
 .root span[style*="inline-block"] {
+	/* biome-ignore lint/complexity/noImportantStyles: flowtoken emits inline styles, so overriding requires !important. */
 	display: inline !important;
 }
 
 .root li span[style*="pre-wrap"] {
+	/* biome-ignore lint/complexity/noImportantStyles: flowtoken emits inline styles, so overriding requires !important. */
 	white-space: normal !important;
 }
 

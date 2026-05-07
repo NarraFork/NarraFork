@@ -1,10 +1,21 @@
-import { ActionIcon, CopyButton, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Code, CopyButton, Text, Tooltip } from "@mantine/core";
 import { IconCopy } from "@tabler/icons-react";
-import { memo, type ReactNode } from "react";
+import { type CSSProperties, lazy, memo, type ReactNode, Suspense } from "react";
 import { useTranslation } from "react-i18next";
-import { HighlightedCode } from "./HighlightedCode";
 import { extractText } from "./MarkdownContent";
 import classes from "./MarkdownContent.module.css";
+
+const HighlightedCode = lazy(() =>
+	import("./HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
+);
+
+const fallbackCodeStyle: CSSProperties = {
+	maxWidth: "100%",
+	border: "none",
+	whiteSpace: "pre-wrap",
+	wordBreak: "break-word",
+	overflowWrap: "break-word",
+};
 
 interface MarkdownCodeBlockProps {
 	language: string;
@@ -49,7 +60,15 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 				</CopyButton>
 			</div>
 
-			<HighlightedCode code={code} lang={language} style={{ maxWidth: "100%", border: "none" }} />
+			<Suspense
+				fallback={
+					<Code block fz="xs" style={fallbackCodeStyle}>
+						{code}
+					</Code>
+				}
+			>
+				<HighlightedCode code={code} lang={language} style={{ maxWidth: "100%", border: "none" }} />
+			</Suspense>
 		</div>
 	);
 });

@@ -2,7 +2,6 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
-	Collapse,
 	CopyButton,
 	Group,
 	Stack,
@@ -21,6 +20,7 @@ import {
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { SideCarRecord } from "../../lib/api";
+import { LazyCollapse } from "./LazyCollapse";
 
 const SOURCE_META: Record<string, { color: string; key: string }> = {
 	silent_progress: { color: "indigo", key: "silent_progress" },
@@ -146,9 +146,12 @@ export function SideCarNotice({
 		() => (sideCars ?? []).filter((sideCar) => sideCar.content?.trim()),
 		[sideCars],
 	);
+	const sources = useMemo(
+		() => [...new Set(visibleSideCars.map((sideCar) => sideCar.source))],
+		[visibleSideCars],
+	);
 	if (visibleSideCars.length === 0) return null;
 
-	const sources = [...new Set(visibleSideCars.map((sideCar) => sideCar.source))];
 	const title = t("sidecar.titleWithCount", { count: visibleSideCars.length });
 
 	if (mode === "detail") {
@@ -193,13 +196,13 @@ export function SideCarNotice({
 					{opened ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
 				</Group>
 			</UnstyledButton>
-			<Collapse in={opened}>
+			<LazyCollapse in={opened}>
 				<Stack gap={6} mt={6}>
 					{visibleSideCars.map((sideCar) => (
 						<SideCarItem key={sideCarKey(sideCar)} sideCar={sideCar} />
 					))}
 				</Stack>
-			</Collapse>
+			</LazyCollapse>
 		</Box>
 	);
 }

@@ -15,6 +15,7 @@ interface StreamingCodeProps {
 
 /** Interval between highlight passes (ms) */
 const HIGHLIGHT_INTERVAL = 300;
+const STREAMING_CODE_HIGHLIGHT_MAX_CHARS = 20_000;
 
 /**
  * Code viewer optimised for streaming: renders an ever-growing `code` string
@@ -48,7 +49,16 @@ export const StreamingCode = memo(function StreamingCode({
 
 	// --- Throttled highlight pass ---
 	useEffect(() => {
-		if (!lang || lang === "text" || !code) return;
+		if (!lang || lang === "text" || !code || code.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS) {
+			if (timerRef.current != null) {
+				clearTimeout(timerRef.current);
+				timerRef.current = null;
+			}
+			inflightRef.current++;
+			highlightedLenRef.current = 0;
+			setTokens(null);
+			return;
+		}
 
 		// Schedule a highlight pass if one isn't already pending
 		if (timerRef.current == null) {
@@ -58,10 +68,19 @@ export const StreamingCode = memo(function StreamingCode({
 				// Read the latest code from ref so we always highlight the most
 				// recent text, even if code changed while the timer was pending.
 				const latestCode = codeRef.current;
+				if (latestCode.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS) {
+					highlightedLenRef.current = 0;
+					setTokens(null);
+					return;
+				}
 				loadShiki().then((shiki) => {
 					if (!shiki || gen !== inflightRef.current) return;
 					const effectiveLang = lang in shiki.bundledLanguages ? lang : null;
-					if (!effectiveLang) return;
+					if (!effectiveLang) {
+						highlightedLenRef.current = 0;
+						setTokens(null);
+						return;
+					}
 					shiki
 						.codeToTokens(latestCode, {
 							lang: effectiveLang as BundledLanguage,

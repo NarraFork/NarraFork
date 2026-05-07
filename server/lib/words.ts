@@ -766,7 +766,11 @@ function randomInt(max: number): number {
 }
 
 function pickRandom<T>(array: readonly T[]): T {
-	return array[randomInt(array.length)]!;
+	const item = array[randomInt(array.length)];
+	if (item === undefined) {
+		throw new Error("Cannot pick a random item from an empty array");
+	}
+	return item;
 }
 
 /**

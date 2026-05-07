@@ -212,7 +212,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.planReflectionAutoApprove": {
-		desc: "启用后，在允许编辑/全部允许 + 计划模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
+		desc: "启用后，在允许编辑/全部允许模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
 		type: "boolean",
 	},
 	"agent.dangerReflectionEnabled": {

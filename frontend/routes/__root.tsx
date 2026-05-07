@@ -43,16 +43,12 @@ import {
 	useRouter,
 	useRouterState,
 } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { GitMissingAlert } from "../components/GitMissingAlert";
-import {
-	CreateNarratorModal,
-	type CreateNarratorResult,
-} from "../components/narrator/CreateNarratorModal";
+import type { CreateNarratorResult } from "../components/narrator/CreateNarratorModal";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "../components/nav/RecentTabs";
-import { SetupWizard } from "../components/settings/SetupWizard";
-import { SummaryModelPickerModal } from "../components/settings/SummaryModelPickerModal";
+import { SummaryModelPickerHost } from "../components/settings/SummaryModelPickerHost";
 import { UpdateBadge } from "../components/UpdateBadge";
 import { VersionUpdateBanner } from "../components/VersionUpdateBanner";
 import { WSConnectionAlert } from "../components/WSConnectionAlert";
@@ -65,13 +61,34 @@ import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, clearToken, getToken } from "../lib/api";
+import {
+	changeAppLanguage,
+	ensureI18nNamespaces,
+	getNamespacesForPath,
+	normalizeLanguage,
+} from "../lib/i18n";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+
+const CreateNarratorModal = lazy(() =>
+	import("../components/narrator/CreateNarratorModal").then((m) => ({
+		default: m.CreateNarratorModal,
+	})),
+);
+
+const SetupWizard = lazy(() =>
+	import("../components/settings/SetupWizard").then((m) => ({
+		default: m.SetupWizard,
+	})),
+);
 
 interface RouterContext {
 	queryClient: QueryClient;
 }
 
 export const Route = createRootRouteWithContext<RouterContext>()({
+	beforeLoad: async ({ location }) => {
+		await ensureI18nNamespaces(getNamespacesForPath(location.pathname));
+	},
 	component: RootLayout,
 	errorComponent: RootErrorBoundary,
 });
@@ -281,11 +298,16 @@ function AuthenticatedLayout() {
 	}, [closeNav]);
 
 	// Sync language from backend preference on login / app init
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally do not react to i18n.language changes, otherwise manual language switches can be rolled back by stale backend prefs
 	useEffect(() => {
-		if (prefs?.language && prefs.language !== i18n.language) {
-			i18n.changeLanguage(prefs.language);
+		if (!prefs?.language) return;
+
+		const preferredLanguage = normalizeLanguage(prefs.language);
+		const currentLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
+		if (preferredLanguage !== currentLanguage) {
+			void changeAppLanguage(prefs.language, getNamespacesForPath(window.location.pathname));
 		}
-	}, [prefs?.language, i18n]);
+	}, [prefs?.language]);
 
 	// Sync OLED mode data attribute on <html>
 	useEffect(() => {
@@ -701,33 +723,41 @@ function AuthenticatedLayout() {
 				</Group>
 			</Modal>
 
-			<SetupWizard
-				opened={wizardOpen}
-				minimized={wizardMinimized}
-				initialStep={wizardInitialStep}
-				onClose={() => {
-					setWizardOpen(false);
-					setWizardMinimized(false);
-					setWizardInitialStep(undefined);
-				}}
-				onMinimize={() => {
-					setWizardOpen(false);
-					setWizardMinimized(true);
-					setWizardInitialStep(undefined);
-				}}
-				onRestore={() => {
-					setWizardMinimized(false);
-					setWizardOpen(true);
-				}}
-			/>
+			{(wizardOpen || wizardMinimized) && (
+				<Suspense fallback={null}>
+					<SetupWizard
+						opened={wizardOpen}
+						minimized={wizardMinimized}
+						initialStep={wizardInitialStep}
+						onClose={() => {
+							setWizardOpen(false);
+							setWizardMinimized(false);
+							setWizardInitialStep(undefined);
+						}}
+						onMinimize={() => {
+							setWizardOpen(false);
+							setWizardMinimized(true);
+							setWizardInitialStep(undefined);
+						}}
+						onRestore={() => {
+							setWizardMinimized(false);
+							setWizardOpen(true);
+						}}
+					/>
+				</Suspense>
+			)}
 
-			<SummaryModelPickerModal />
+			<SummaryModelPickerHost />
 
-			<CreateNarratorModal
-				opened={createNarratorOpened}
-				onClose={() => setCreateNarratorOpened(false)}
-				onCreated={handleNarratorCreated}
-			/>
+			{createNarratorOpened && (
+				<Suspense fallback={null}>
+					<CreateNarratorModal
+						opened={createNarratorOpened}
+						onClose={() => setCreateNarratorOpened(false)}
+						onCreated={handleNarratorCreated}
+					/>
+				</Suspense>
+			)}
 		</AppShell>
 	);
 }

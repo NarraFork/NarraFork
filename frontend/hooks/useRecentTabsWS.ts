@@ -29,6 +29,7 @@ export function useRecentTabsWS(
 	const subHandleRef = useRef<SubscriptionHandle | null>(null);
 	const presenceHandleIdRef = useRef<number | null>(null);
 	const presenceIdsRef = useRef<Set<string>>(new Set());
+	const narratorIdSetRef = useRef<Set<string>>(new Set(narratorIds));
 
 	const idsKey = useMemo(() => narratorIds.join(","), [narratorIds]);
 
@@ -38,46 +39,60 @@ export function useRecentTabsWS(
 		const presenceHandleId = narratorWSManager.allocateId();
 		presenceHandleIdRef.current = presenceHandleId;
 
-		const listenerHandle: ListenerHandle = narratorWSManager.addListener(
-			{ narratorIds: "*" },
+		const narratorListenerHandle: ListenerHandle = narratorWSManager.addListener(
+			{
+				narratorIds: "*",
+				types: [
+					"status_change",
+					"narrator:status_changed",
+					"title_updated",
+					"narrator:title_updated",
+					"permission_mode_changed",
+					"presence_update",
+					"terminal_count_changed",
+					"container_status_changed",
+				],
+			},
 			(data) => {
 				const nId = data.narratorId as string | undefined;
+				if (!nId || !narratorIdSetRef.current.has(nId)) return;
+
 				if (data.type === "status_change" || data.type === "narrator:status_changed") {
-					if (nId)
-						onUpdateRef.current(nId, {
-							type: "status",
-							status: data.status as string,
-							substatus: data.substatus as string[] | undefined,
-						});
+					onUpdateRef.current(nId, {
+						type: "status",
+						status: data.status as string,
+						substatus: data.substatus as string[] | undefined,
+					});
 				} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
-					if (nId) onUpdateRef.current(nId, { type: "title", title: data.title as string });
+					onUpdateRef.current(nId, { type: "title", title: data.title as string });
 				} else if (data.type === "permission_mode_changed") {
-					if (nId)
-						onUpdateRef.current(nId, {
-							type: "permissionMode",
-							permissionMode: data.permissionMode as string,
-						});
+					onUpdateRef.current(nId, {
+						type: "permissionMode",
+						permissionMode: data.permissionMode as string,
+					});
 				} else if (data.type === "presence_update") {
-					if (nId)
-						onUpdateRef.current(nId, {
-							type: "presence",
-							viewers: data.viewers as NarratorListWSEvent["viewers"],
-						});
+					onUpdateRef.current(nId, {
+						type: "presence",
+						viewers: data.viewers as NarratorListWSEvent["viewers"],
+					});
 				} else if (data.type === "terminal_count_changed") {
-					if (nId)
-						onUpdateRef.current(nId, {
-							type: "terminalCount",
-							activeTerminalCount: data.activeTerminalCount as number,
-						});
+					onUpdateRef.current(nId, {
+						type: "terminalCount",
+						activeTerminalCount: data.activeTerminalCount as number,
+					});
 				} else if (data.type === "container_status_changed") {
-					if (nId)
-						onUpdateRef.current(nId, {
-							type: "containerStatus",
-							containerStatus: data.containerStatus as NarratorListWSEvent["containerStatus"],
-						});
-				} else if ((data.type as string).startsWith("user:")) {
-					onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
+					onUpdateRef.current(nId, {
+						type: "containerStatus",
+						containerStatus: data.containerStatus as NarratorListWSEvent["containerStatus"],
+					});
 				}
+			},
+		);
+
+		const globalListenerHandle: ListenerHandle = narratorWSManager.addListener(
+			{ typePrefixes: ["user:"] },
+			(data) => {
+				onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
 			},
 		);
 
@@ -89,7 +104,8 @@ export function useRecentTabsWS(
 
 		return () => {
 			unsubConnection();
-			narratorWSManager.removeListener(listenerHandle);
+			narratorWSManager.removeListener(narratorListenerHandle);
+			narratorWSManager.removeListener(globalListenerHandle);
 			// Clean up subscription
 			if (subHandleRef.current) {
 				narratorWSManager.unsubscribe(subHandleRef.current);
@@ -114,6 +130,7 @@ export function useRecentTabsWS(
 
 		// Presence diff
 		const desired = new Set(narratorIds);
+		narratorIdSetRef.current = desired;
 		const current = presenceIdsRef.current;
 		const hId = presenceHandleIdRef.current ?? narratorWSManager.allocateId();
 

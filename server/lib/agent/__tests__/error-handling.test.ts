@@ -6,6 +6,16 @@ describe("agent error handling", () => {
 		expect(isRetryableInvalidStateReason("stream_closed_before_response_completed")).toBe(true);
 	});
 
+	test("treats stream read errors as retryable", () => {
+		expect(isRetryableInvalidStateReason("stream_read_error")).toBe(true);
+		expect(isRetryableError({ reason: "stream_read_error", message: "stream read failed" })).toBe(
+			true,
+		);
+		expect(isRetryableError(new Error("OpenAI Responses stream error (stream_read_error)"))).toBe(
+			true,
+		);
+	});
+
 	test("does not retry plain 429 errors without retry/load keywords", () => {
 		expect(
 			isRetryableError({ status: 429, message: "Provider API error 429: billing failed" }),

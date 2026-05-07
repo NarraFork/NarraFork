@@ -1,7 +1,17 @@
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod/v4";
-import { actions, closeSession, createSession, getSession, listSessions } from "../../browser";
+import {
+	actions,
+	closeSession,
+	createSession,
+	DEFAULT_SESSION_TTL_MS,
+	getSession,
+	listSessions,
+	MAX_SESSION_TTL_MS,
+	MIN_SESSION_TTL_MS,
+	setSessionTtl,
+} from "../../browser";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { createShare, getShareDir } from "../../shares";
@@ -26,6 +36,7 @@ const ACTIONS = [
 	"scroll",
 	"dom",
 	"close",
+	"set_ttl",
 	"list_sessions",
 	"perf_start",
 	"perf_stop",
@@ -42,7 +53,7 @@ export const browserTool: ToolDefinition = {
 		"Workflow:\n" +
 		'1. Use action "launch" with a URL to start a session (returns session_id)\n' +
 		"2. Use the session_id for subsequent actions (click, fill, type, etc.)\n" +
-		'3. Use action "close" when done, or sessions auto-expire after 10 min of inactivity\n\n' +
+		'3. Use action "close" when done, or sessions auto-expire after the configured inactivity TTL (default 10 min)\n\n' +
 		"Actions:\n" +
 		'- "launch": Open a URL and create a browser session\n' +
 		'- "click": Click an element (by CSS selector)\n' +
@@ -64,6 +75,7 @@ export const browserTool: ToolDefinition = {
 		'- "scroll": Scroll the page up or down\n' +
 		'- "dom": Get cleaned HTML of the page or a specific selector\n' +
 		'- "close": Close a browser session\n' +
+		'- "set_ttl": Update a session inactivity auto-close TTL in milliseconds\n' +
 		'- "list_sessions": List all active browser sessions\n' +
 		'- "perf_start": Start performance tracing (records CPU profile, layout, scripting, etc.). ' +
 		"Note: the user can stop tracing or close the session from the browser management panel — " +
@@ -80,6 +92,7 @@ export const browserTool: ToolDefinition = {
 		"- key (optional): Special key name for type action (e.g. Enter, Tab, Escape, ArrowDown)\n" +
 		"- direction (optional): 'back'/'forward' for navigate, 'up'/'down' for scroll\n" +
 		"- timeout (optional): Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)\n" +
+		"- ttl_ms (optional): Browser session inactivity auto-close TTL in ms for launch/set_ttl; default 600000, allowed 1000–86400000\n" +
 		"- coordinate (optional): {x, y} for click/scroll at specific position\n" +
 		"- max_length (optional): Max output length for dom/get_text/evaluate/evaluate_capture/get_console/get_network (default: 20000)\n" +
 		"- clear (optional): For get_console/get_network, clear captured output after reading; for evaluate_capture, clear console before running (default: true)\n" +
@@ -127,6 +140,12 @@ export const browserTool: ToolDefinition = {
 				description:
 					"Timeout in ms for wait/element actions and JavaScript execution (default: 10000 for wait)",
 				type: "number",
+			},
+			ttl_ms: {
+				description: "Browser session inactivity auto-close TTL in milliseconds for launch/set_ttl",
+				type: "number",
+				minimum: MIN_SESSION_TTL_MS,
+				maximum: MAX_SESSION_TTL_MS,
 			},
 			coordinate: {
 				description: "Coordinates for positional click/scroll",
@@ -192,6 +211,13 @@ export const browserTool: ToolDefinition = {
 			.optional()
 			.describe("Direction for navigate/scroll"),
 		timeout: z.number().optional().describe("Timeout in ms"),
+		ttl_ms: z
+			.number()
+			.int()
+			.min(MIN_SESSION_TTL_MS)
+			.max(MAX_SESSION_TTL_MS)
+			.optional()
+			.describe("Browser session inactivity auto-close TTL in milliseconds"),
 		coordinate: z
 			.object({ x: z.number(), y: z.number() })
 			.optional()
@@ -230,6 +256,7 @@ export const browserTool: ToolDefinition = {
 			key,
 			direction,
 			timeout,
+			ttl_ms,
 			coordinate,
 			max_length,
 			clear,
@@ -246,6 +273,7 @@ export const browserTool: ToolDefinition = {
 			key?: string;
 			direction?: "back" | "forward" | "up" | "down";
 			timeout?: number;
+			ttl_ms?: number;
 			coordinate?: { x: number; y: number };
 			max_length?: number;
 			clear?: boolean;
@@ -265,11 +293,13 @@ export const browserTool: ToolDefinition = {
 		try {
 			switch (action) {
 				case "launch":
-					return await handleLaunch(ctx.narratorId, url, headless ?? true);
+					return await handleLaunch(ctx.narratorId, url, headless ?? true, ttl_ms);
 				case "list_sessions":
 					return handleListSessions(ctx.narratorId);
 				case "close":
 					return await handleClose(ctx.narratorId, session_id);
+				case "set_ttl":
+					return handleSetTtl(ctx.narratorId, session_id, ttl_ms);
 				default:
 					return await handleSessionAction(ctx.narratorId, action, {
 						session_id,
@@ -278,6 +308,7 @@ export const browserTool: ToolDefinition = {
 						key,
 						direction,
 						timeout,
+						ttl_ms,
 						coordinate,
 						max_length,
 						clear,
@@ -298,10 +329,18 @@ export const browserTool: ToolDefinition = {
 
 // ── Action handlers ──
 
+function formatDurationMs(ms: number): string {
+	if (ms < 60_000) return `${ms}ms`;
+	if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+	if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+	return `${Math.round(ms / 86_400_000)}d`;
+}
+
 async function handleLaunch(
 	narratorId: string,
 	url?: string,
 	headless = true,
+	ttlMs?: number,
 ): Promise<ToolResult> {
 	if (!url) {
 		return { output: "url is required for launch action", isError: true };
@@ -320,13 +359,14 @@ async function handleLaunch(
 		return { output: `Invalid URL: ${url}`, isError: true };
 	}
 
-	const session = await createSession(narratorId, url, headless);
+	const session = await createSession(narratorId, url, headless, ttlMs);
 	const title = await session.page.title();
 
 	return {
 		output:
 			`Browser session started (${headless ? "headless" : "headed/GUI"}).\n` +
 			`Session ID: ${session.id}\n` +
+			`Auto-close TTL: ${session.ttlMs}ms (${formatDurationMs(session.ttlMs)} of inactivity)\n` +
 			`URL: ${session.page.url()}\n` +
 			`Title: ${title}`,
 		metadata: { sessionId: session.id },
@@ -340,7 +380,9 @@ function handleListSessions(narratorId: string): ToolResult {
 	}
 	const lines = list.map(
 		(s) =>
-			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | last active: ${new Date(s.lastActivity).toISOString()}`,
+			`- ${s.id} | ${s.url} | ${s.headless ? "headless" : "headed"} | ` +
+			`ttl: ${formatDurationMs(s.ttlMs)} | expires: ${new Date(s.expiresAt).toISOString()} | ` +
+			`last active: ${new Date(s.lastActivity).toISOString()}`,
 	);
 	return {
 		output: `Active sessions (${list.length}):\n${lines.join("\n")}`,
@@ -364,6 +406,35 @@ async function handleClose(narratorId: string, sessionId?: string): Promise<Tool
 	return { output: `Session ${sessionId} closed.` };
 }
 
+function handleSetTtl(narratorId: string, sessionId?: string, ttlMs?: number): ToolResult {
+	if (!sessionId) {
+		return {
+			output: "session_id is required for set_ttl action",
+			isError: true,
+		};
+	}
+	if (ttlMs === undefined) {
+		return {
+			output: `ttl_ms is required for set_ttl action (default is ${DEFAULT_SESSION_TTL_MS}ms)`,
+			isError: true,
+		};
+	}
+	const session = setSessionTtl(narratorId, sessionId, ttlMs);
+	if (!session) {
+		return {
+			output: `Session not found or expired: ${sessionId}`,
+			isError: true,
+		};
+	}
+	return {
+		output:
+			`Session ${sessionId} auto-close TTL set to ${session.ttlMs}ms ` +
+			`(${formatDurationMs(session.ttlMs)} of inactivity).\n` +
+			`Expires at: ${new Date(session.lastActivity + session.ttlMs).toISOString()}`,
+		metadata: { sessionId: session.id, ttlMs: session.ttlMs },
+	};
+}
+
 async function handleSessionAction(
 	narratorId: string,
 	action: Action,
@@ -374,6 +445,7 @@ async function handleSessionAction(
 		key?: string;
 		direction?: "back" | "forward" | "up" | "down";
 		timeout?: number;
+		ttl_ms?: number;
 		coordinate?: { x: number; y: number };
 		max_length?: number;
 		clear?: boolean;

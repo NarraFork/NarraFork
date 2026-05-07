@@ -21,8 +21,10 @@ import {
 	type CSSProperties,
 	createContext,
 	forwardRef,
+	lazy,
 	memo,
 	type ReactNode,
+	Suspense,
 	useCallback,
 	useContext,
 	useEffect,
@@ -35,7 +37,6 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { DiffView } from "./DiffView";
-import { HighlightedCode } from "./HighlightedCode";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import {
@@ -47,6 +48,30 @@ import {
 import { useRenderLod } from "./RenderLodCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
+
+const HighlightedCode = lazy(() =>
+	import("./HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
+);
+
+interface CodeHighlightOrFallbackProps {
+	code: string;
+	lang: string;
+	style?: CSSProperties;
+}
+
+function CodeHighlightOrFallback({ code, lang, style }: CodeHighlightOrFallbackProps) {
+	return (
+		<Suspense
+			fallback={
+				<Code block style={style}>
+					{code}
+				</Code>
+			}
+		>
+			<HighlightedCode code={code} lang={lang} style={style} />
+		</Suspense>
+	);
+}
 
 export type CodeContentType = "markdown" | "code" | "diff";
 
@@ -544,7 +569,7 @@ export const ContentViewer = memo(
 									overflowY: style?.maxHeight ? "auto" : undefined,
 								})
 							) : language && language !== "text" ? (
-								<HighlightedCode
+								<CodeHighlightOrFallback
 									code={fullContent ?? content}
 									lang={language}
 									style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
@@ -766,7 +791,7 @@ export const ContentViewer = memo(
 						) : markdown ? (
 							renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
 						) : language && language !== "text" ? (
-							<HighlightedCode
+							<CodeHighlightOrFallback
 								code={modalContent}
 								lang={language}
 								style={{

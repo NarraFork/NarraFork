@@ -5,6 +5,8 @@
  * Supports message editing for progressive streaming.
  */
 
+import type TelegramBot from "node-telegram-bot-api";
+import type { TelegramMessage } from "node-telegram-bot-api";
 import { logger } from "../../lib/logger";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, TelegramConfig } from "../types";
@@ -14,7 +16,7 @@ export class TelegramAdapter extends BaseAdapter {
 	readonly maxMessageLength = 4096;
 	override readonly supportsEdit = true;
 
-	private bot: any = null;
+	private bot: TelegramBot | null = null;
 	private config: TelegramConfig;
 
 	constructor(config: TelegramConfig) {
@@ -24,12 +26,12 @@ export class TelegramAdapter extends BaseAdapter {
 
 	async connect(): Promise<boolean> {
 		try {
-			const TelegramBot = (await import("node-telegram-bot-api")).default;
-			this.bot = new TelegramBot(this.config.token, { polling: true });
+			const TelegramBotCtor = (await import("node-telegram-bot-api")).default;
+			this.bot = new TelegramBotCtor(this.config.token, { polling: true });
 
-			this.bot.on("message", (msg: any) => this.handleTelegramMessage(msg));
+			this.bot.on("message", (msg) => this.handleTelegramMessage(msg));
 
-			this.bot.on("polling_error", (err: any) => {
+			this.bot.on("polling_error", (err) => {
 				logger.error("[telegram] Polling error", {
 					error: err?.message ?? String(err),
 				});
@@ -59,34 +61,36 @@ export class TelegramAdapter extends BaseAdapter {
 	}
 
 	async send(chatId: string, text: string): Promise<void> {
-		if (!this.bot) return;
+		const bot = this.bot;
+		if (!bot) return;
 
 		const chunks = this.splitMessage(text);
 		for (const chunk of chunks) {
-			await this.bot
+			await bot
 				.sendMessage(chatId, chunk, {
 					parse_mode: "Markdown",
 					disable_web_page_preview: true,
 				})
 				.catch(async () => {
 					// Fallback: send without Markdown if parsing fails
-					await this.bot.sendMessage(chatId, chunk);
+					await bot.sendMessage(chatId, chunk);
 				});
 		}
 	}
 
 	override async sendAndGetId(chatId: string, text: string): Promise<SendResult> {
-		if (!this.bot) return { success: false, error: "Bot not connected" };
+		const bot = this.bot;
+		if (!bot) return { success: false, error: "Bot not connected" };
 
 		try {
-			const sent = await this.bot
+			const sent = await bot
 				.sendMessage(chatId, text, {
 					parse_mode: "Markdown",
 					disable_web_page_preview: true,
 				})
 				.catch(async () => {
 					// Fallback: send without Markdown
-					return this.bot.sendMessage(chatId, text);
+					return bot.sendMessage(chatId, text);
 				});
 
 			return {
@@ -102,10 +106,11 @@ export class TelegramAdapter extends BaseAdapter {
 	}
 
 	override async editMessage(chatId: string, messageId: string, text: string): Promise<SendResult> {
-		if (!this.bot) return { success: false, error: "Bot not connected" };
+		const bot = this.bot;
+		if (!bot) return { success: false, error: "Bot not connected" };
 
 		try {
-			await this.bot
+			await bot
 				.editMessageText(text, {
 					chat_id: chatId,
 					message_id: Number(messageId),
@@ -114,7 +119,7 @@ export class TelegramAdapter extends BaseAdapter {
 				})
 				.catch(async () => {
 					// Fallback: edit without Markdown
-					await this.bot.editMessageText(text, {
+					await bot.editMessageText(text, {
 						chat_id: chatId,
 						message_id: Number(messageId),
 					});
@@ -136,7 +141,10 @@ export class TelegramAdapter extends BaseAdapter {
 	// Private
 	// -----------------------------------------------------------------------
 
-	private async handleTelegramMessage(msg: any): Promise<void> {
+	private async handleTelegramMessage(msg: TelegramMessage): Promise<void> {
+		const bot = this.bot;
+		if (!bot) return;
+
 		const userId = String(msg.from?.id ?? "");
 		const username = msg.from?.username ?? msg.from?.first_name ?? "unknown";
 
@@ -154,7 +162,7 @@ export class TelegramAdapter extends BaseAdapter {
 			// Telegram sends multiple sizes — pick the largest
 			const largest = msg.photo[msg.photo.length - 1];
 			try {
-				const fileLink = await this.bot.getFileLink(largest.file_id);
+				const fileLink = await bot.getFileLink(largest.file_id);
 				images.push({
 					url: fileLink,
 					mediaType: "image/jpeg",
@@ -170,7 +178,7 @@ export class TelegramAdapter extends BaseAdapter {
 		// Extract document images
 		if (msg.document?.mime_type?.startsWith("image/")) {
 			try {
-				const fileLink = await this.bot.getFileLink(msg.document.file_id);
+				const fileLink = await bot.getFileLink(msg.document.file_id);
 				images.push({
 					url: fileLink,
 					mediaType: msg.document.mime_type,

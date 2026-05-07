@@ -15,19 +15,59 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChapterBatchMergeModal } from "../../components/chapter/ChapterBatchMergeModal";
-import { ChapterCleanupModal } from "../../components/chapter/ChapterCleanupModal";
-import { NarraFlow } from "../../components/graph/NarraFlow";
-import { ProjectCommandsModal } from "../../components/project/ProjectCommandsModal";
-import { ProjectRoutinesModal } from "../../components/project/ProjectRoutinesModal";
-import { ProjectSettingsModal } from "../../components/project/ProjectSettingsModal";
-import { ProjectSkillsModal } from "../../components/project/ProjectSkillsModal";
-import { RulerFlow } from "../../components/ruler/RulerFlow";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
+
+const NarraFlow = lazy(() =>
+	import("../../components/graph/NarraFlow").then((m) => ({
+		default: m.NarraFlow,
+	})),
+);
+
+const RulerFlow = lazy(() =>
+	import("../../components/ruler/RulerFlow").then((m) => ({
+		default: m.RulerFlow,
+	})),
+);
+
+const ChapterBatchMergeModal = lazy(() =>
+	import("../../components/chapter/ChapterBatchMergeModal").then((m) => ({
+		default: m.ChapterBatchMergeModal,
+	})),
+);
+
+const ChapterCleanupModal = lazy(() =>
+	import("../../components/chapter/ChapterCleanupModal").then((m) => ({
+		default: m.ChapterCleanupModal,
+	})),
+);
+
+const ProjectCommandsModal = lazy(() =>
+	import("../../components/project/ProjectCommandsModal").then((m) => ({
+		default: m.ProjectCommandsModal,
+	})),
+);
+
+const ProjectRoutinesModal = lazy(() =>
+	import("../../components/project/ProjectRoutinesModal").then((m) => ({
+		default: m.ProjectRoutinesModal,
+	})),
+);
+
+const ProjectSettingsModal = lazy(() =>
+	import("../../components/project/ProjectSettingsModal").then((m) => ({
+		default: m.ProjectSettingsModal,
+	})),
+);
+
+const ProjectSkillsModal = lazy(() =>
+	import("../../components/project/ProjectSkillsModal").then((m) => ({
+		default: m.ProjectSkillsModal,
+	})),
+);
 
 export const Route = createFileRoute("/projects/$projectId")({
 	component: ProjectDetailPage,
@@ -162,11 +202,13 @@ function ProjectDetailPage() {
 
 			{/* Graph canvas */}
 			<Box style={{ flex: 1, minHeight: 0 }}>
-				{project?.flowMode === "ruler" ? (
-					<RulerFlow projectId={projectId} focusChapterId={focus} />
-				) : (
-					<NarraFlow projectId={projectId} focusChapterId={focus} />
-				)}
+				<Suspense fallback={<Loader />}>
+					{project?.flowMode === "ruler" ? (
+						<RulerFlow projectId={projectId} focusChapterId={focus} />
+					) : (
+						<NarraFlow projectId={projectId} focusChapterId={focus} />
+					)}
+				</Suspense>
 			</Box>
 
 			{/* New chapter modal */}
@@ -191,26 +233,58 @@ function ProjectDetailPage() {
 				</Stack>
 			</Modal>
 
-			<ChapterCleanupModal
-				chapters={chapters ?? []}
-				opened={cleanupOpened}
-				onClose={closeCleanup}
-			/>
-			<ChapterBatchMergeModal
-				chapters={chapters ?? []}
-				opened={batchMergeOpened}
-				onClose={closeBatchMerge}
-			/>
-			<ProjectCommandsModal projectId={projectId} opened={commandsOpened} onClose={closeCommands} />
-			<ProjectSkillsModal projectId={projectId} opened={skillsOpened} onClose={closeSkills} />
-			<ProjectRoutinesModal projectId={projectId} opened={routinesOpened} onClose={closeRoutines} />
-			<ProjectSettingsModal
-				projectId={projectId}
-				proxyDomain={project.proxyDomain ?? null}
-				chapterSettings={project.chapterSettings}
-				opened={settingsOpened}
-				onClose={closeSettings}
-			/>
+			{cleanupOpened && (
+				<Suspense fallback={null}>
+					<ChapterCleanupModal
+						chapters={chapters ?? []}
+						opened={cleanupOpened}
+						onClose={closeCleanup}
+					/>
+				</Suspense>
+			)}
+			{batchMergeOpened && (
+				<Suspense fallback={null}>
+					<ChapterBatchMergeModal
+						chapters={chapters ?? []}
+						opened={batchMergeOpened}
+						onClose={closeBatchMerge}
+					/>
+				</Suspense>
+			)}
+			{commandsOpened && (
+				<Suspense fallback={null}>
+					<ProjectCommandsModal
+						projectId={projectId}
+						opened={commandsOpened}
+						onClose={closeCommands}
+					/>
+				</Suspense>
+			)}
+			{skillsOpened && (
+				<Suspense fallback={null}>
+					<ProjectSkillsModal projectId={projectId} opened={skillsOpened} onClose={closeSkills} />
+				</Suspense>
+			)}
+			{routinesOpened && (
+				<Suspense fallback={null}>
+					<ProjectRoutinesModal
+						projectId={projectId}
+						opened={routinesOpened}
+						onClose={closeRoutines}
+					/>
+				</Suspense>
+			)}
+			{settingsOpened && (
+				<Suspense fallback={null}>
+					<ProjectSettingsModal
+						projectId={projectId}
+						proxyDomain={project.proxyDomain ?? null}
+						chapterSettings={project.chapterSettings}
+						opened={settingsOpened}
+						onClose={closeSettings}
+					/>
+				</Suspense>
+			)}
 
 			<Modal
 				opened={deleteOpened}

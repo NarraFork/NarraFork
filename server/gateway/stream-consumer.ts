@@ -276,7 +276,7 @@ export class GatewayStreamConsumer {
 		this._finalResponseSent = true;
 	}
 
-	private async sendOrEdit(text: string, finalize = false): Promise<boolean> {
+	private async sendOrEdit(text: string, _finalize = false): Promise<boolean> {
 		if (!text.trim()) return true;
 
 		try {
