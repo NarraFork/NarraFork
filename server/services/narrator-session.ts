@@ -1553,6 +1553,31 @@ export async function runAgentLoop(
 				break;
 			}
 
+			if (result.silentDisconnect && active.alive) {
+				const message = "Codex WebSocket silent disconnect";
+				transientRetries++;
+				const { shouldRetry } = await handleTransientError({
+					narratorId,
+					error: message,
+					retryCount: transientRetries,
+					maxRetries: getMaxTransientRetries(),
+					signal: active.abortController.signal,
+				});
+
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
+
+				if (shouldRetry) {
+					continue;
+				}
+				if (!active.alive) {
+					break;
+				}
+			}
+
 			if (result.hasError && active.alive && !loopHadError) {
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
@@ -1572,7 +1597,7 @@ export async function runAgentLoop(
 				break;
 			}
 
-			// Reset transient retry counter on success
+			// Reset transient retry counter on success or after a non-retried silent disconnect.
 			transientRetries = 0;
 
 			if (result.interrupted && active.alive) {
@@ -1612,14 +1637,6 @@ export async function runAgentLoop(
 
 			if (result.shouldUpdateTitle) {
 				shouldUpdateTitle = true;
-			}
-
-			if (result.silentDisconnect) {
-				const partialId = active._partialMessageId;
-				active._partialMessageId = undefined;
-				if (partialId) {
-					await finalizeOrCleanupPartialMessage(partialId, narratorId);
-				}
 			}
 
 			// Plan approved — abort was triggered by onExitPlanMode so we persist
