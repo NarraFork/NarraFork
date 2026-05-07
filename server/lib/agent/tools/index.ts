@@ -12,6 +12,7 @@ import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { grepTool } from "./grep";
+import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { endPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -64,6 +65,7 @@ const coreProvider: ToolProvider = {
 			grepTool,
 			webSearchTool,
 			webFetchTool,
+			learningGuideTool,
 			getGoalsTool,
 			addGoalTool,
 			updateGoalTool,

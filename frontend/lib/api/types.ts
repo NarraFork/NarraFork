@@ -5,6 +5,49 @@ export interface ChangelogEntry {
 	"zh-CN": string;
 }
 
+export interface LearningAction {
+	label: string;
+	description: string;
+	href: string;
+}
+
+export interface LearningSection {
+	title: string;
+	body: string;
+}
+
+export interface LearningDocSummary {
+	id: string;
+	category: string;
+	tags: string[];
+	title: string;
+	summary: string;
+	actions: LearningAction[];
+}
+
+export interface LearningDoc extends LearningDocSummary {
+	sections: LearningSection[];
+	workflow: string[];
+	bestPractices: string[];
+	pitfalls: string[];
+	agentHints: string[];
+}
+
+export interface LearningCategory {
+	id: string;
+	label: string;
+	description: string;
+}
+
+export interface LearningIndexResponse {
+	categories: LearningCategory[];
+	docs: LearningDocSummary[];
+}
+
+export interface LearningSearchResponse {
+	results: LearningDocSummary[];
+}
+
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;

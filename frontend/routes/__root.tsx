@@ -20,6 +20,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
+	IconBook2,
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
@@ -661,6 +662,15 @@ function AuthenticatedLayout() {
 							to="/routines"
 							label={navCollapsed ? undefined : t("routines")}
 							leftSection={<IconWand size={16} />}
+							onClick={closeNavForLink}
+						/>
+					</Tooltip>
+					<Tooltip label={t("learning")} position="right" disabled={!navCollapsed}>
+						<NavLink
+							component={Link}
+							to="/learn"
+							label={navCollapsed ? undefined : t("learning")}
+							leftSection={<IconBook2 size={16} />}
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>

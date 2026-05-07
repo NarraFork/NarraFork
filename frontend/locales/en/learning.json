@@ -1,0 +1,17 @@
+{
+	"title": "Learning Center",
+	"subtitle": "Documentation, workflows, and best practices for NarraFork features outside the NarraFlow itself. Humans can read it directly, and agents can consult the same knowledge base through LearningGuide.",
+	"sharedBadge": "Shared by users and agents",
+	"askAgent": "Open narrators",
+	"searchPlaceholder": "Search features, workflows, or best practices...",
+	"allCategories": "All categories",
+	"allCategoriesDescription": "Show every learning document",
+	"noResults": "No matching learning documents found.",
+	"selectDoc": "Select a learning document.",
+	"jumpToFeature": "Feature shortcuts",
+	"workflow": "Recommended workflow",
+	"bestPractices": "Best practices",
+	"pitfalls": "Common pitfalls",
+	"agentHints": "Agent hints",
+	"agentToolHint": "Agents can consult the same source with:"
+}
