@@ -21,6 +21,7 @@ export const namespaces = [
 	"graph",
 	"narrator",
 	"nav",
+	"learning",
 	"projects",
 	"search",
 	"narrators",
@@ -77,6 +78,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	if (path === "/routines" || path.startsWith("/routines/")) {
 		return ["common", "nav", "routines", "settings"];
 	}
+	if (path === "/learn") return ["common", "nav", "learning"];
 	if (path === "/search") return ["common", "nav", "search"];
 
 	return ["common", "nav"];

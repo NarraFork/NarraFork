@@ -29,6 +29,7 @@ import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
+import { learningRoutes } from "./routes/learning";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
@@ -131,6 +132,7 @@ app.use("/api/*", requireAuth);
 // frontend can still render the "install git" dialog and settings pages.
 const GIT_FREE_PREFIXES = [
 	"/api/settings",
+	"/api/learning",
 	"/api/admin",
 	"/api/storage",
 	"/api/runtime",
@@ -164,6 +166,7 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
+app.route("/api/learning", learningRoutes);
 app.route("/api/dependencies", dependencyRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);

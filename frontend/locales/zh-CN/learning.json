@@ -1,0 +1,17 @@
+{
+	"title": "学习中心",
+	"subtitle": "这里汇总 NarraFork 除叙事线以外的主要功能文档、使用流程与最佳实践。用户可以直接阅读，Agent 也可以通过 LearningGuide 查阅同一份知识库。",
+	"sharedBadge": "用户与 Agent 共用",
+	"askAgent": "打开叙述者",
+	"searchPlaceholder": "搜索功能、流程或最佳实践...",
+	"allCategories": "全部分类",
+	"allCategoriesDescription": "查看所有学习文档",
+	"noResults": "没有找到匹配的学习文档。",
+	"selectDoc": "请选择一篇学习文档。",
+	"jumpToFeature": "可直接跳转的功能入口",
+	"workflow": "推荐使用流程",
+	"bestPractices": "最佳实践",
+	"pitfalls": "常见坑",
+	"agentHints": "Agent 查阅提示",
+	"agentToolHint": "Agent 可使用同源工具查阅："
+}

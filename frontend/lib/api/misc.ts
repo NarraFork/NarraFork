@@ -14,12 +14,27 @@ import type {
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
 	HookApiRecord,
+	LearningDoc,
+	LearningIndexResponse,
+	LearningSearchResponse,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	StorageScanResult,
 } from "./types";
 
 export const miscApi = {
+	// Learning
+	getLearningIndex: (lang?: string) =>
+		request<LearningIndexResponse>(`/learning${lang ? `?lang=${encodeURIComponent(lang)}` : ""}`),
+	getLearningDoc: (id: string, lang?: string) =>
+		request<LearningDoc>(
+			`/learning/${encodeURIComponent(id)}${lang ? `?lang=${encodeURIComponent(lang)}` : ""}`,
+		),
+	searchLearningDocs: (q: string, lang?: string) =>
+		request<LearningSearchResponse>(
+			`/learning/search?q=${encodeURIComponent(q)}${lang ? `&lang=${encodeURIComponent(lang)}` : ""}`,
+		),
+
 	// Search
 	search: (q: string, entities = "chapters,messages") =>
 		request<{ results: ApiEntity[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
