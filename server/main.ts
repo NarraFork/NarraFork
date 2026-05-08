@@ -22,6 +22,8 @@ import {
 	registerServerRestart,
 } from "./lib/server-restart";
 import { saveSettings, settings } from "./lib/settings";
+import type { VNetRelayAuth } from "./lib/vnet/types";
+import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -530,6 +532,30 @@ function getProtocol(): "https" | "http" {
 	return settings.server.tls?.enabled ? "https" : "http";
 }
 
+async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
+	if (!settings.vnet?.enabled) return null;
+	const bearer = req.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+	const queryToken = url.searchParams.get("token") ?? undefined;
+	const token = bearer || queryToken;
+	const relayToken = settings.vnet.relayToken?.trim();
+
+	if (token && relayToken && token === relayToken) {
+		return { kind: "relay-token" };
+	}
+	if (token) {
+		try {
+			const payload = await verifyToken(token);
+			return { kind: "jwt", userId: payload.sub };
+		} catch {
+			// Fall through to anonymous only when explicitly enabled.
+		}
+	}
+	if (settings.vnet.allowAnonymousRelay) {
+		return { kind: "anonymous" };
+	}
+	return null;
+}
+
 function startServer(listenPort: number) {
 	const tlsCfg = settings.server.tls;
 	const tls =
@@ -549,6 +575,20 @@ function startServer(listenPort: number) {
 		tls,
 		async fetch(req, server) {
 			const url = new URL(req.url);
+
+			if (url.pathname === "/ws/vnet") {
+				const auth = await resolveVNetRelayAuth(req, url);
+				if (!auth) {
+					return new Response("VNet relay authentication required", { status: 401 });
+				}
+				const wsData = resolveWSData(url, undefined, auth);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
 			// WebSocket upgrade for /ws/narrator and /ws/terminal
 			if (url.pathname.startsWith("/ws")) {
@@ -770,6 +810,10 @@ async function openAsApp(url: string) {
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
 
+startVNetUdpRendezvous(settings.vnet).catch((err) => {
+	logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
+});
+
 try {
 	getCodexManager().startUsageRefreshScheduler();
 } catch (err) {
@@ -928,6 +972,7 @@ async function performGracefulShutdown(
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
+		await stopVNetUdpRendezvous().catch(() => {});
 		getCodexManager().stopUsageRefreshScheduler();
 		stopContainerProxy();
 		await terminalService.shutdownAll();

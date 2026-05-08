@@ -2,7 +2,6 @@ import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
 import { chapters, reviewConclusions } from "../../../db/schema";
-import { reviewService } from "../../../services/review-service";
 import { generateId } from "../../id";
 import { logger } from "../../logger";
 import type { ToolContext, ToolDefinition, ToolResult } from "../types";
@@ -126,6 +125,9 @@ export const concludeReviewTool: ToolDefinition = {
 			findingsJson: findings,
 			createdAt: now,
 		});
+
+		// Import lazily to avoid a startup cycle through narrator-session -> agent index.
+		const { reviewService } = await import("../../../services/review-service");
 
 		// Trigger the existing concludeReview flow (status update + event emission)
 		await reviewService.concludeReview(ctx.chapterId);

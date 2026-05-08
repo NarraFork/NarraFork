@@ -1,6 +1,9 @@
+import { Buffer } from "node:buffer";
 import type { ServerWebSocket } from "bun";
 import { hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { settings } from "../lib/settings";
+import type { VNetClientMessage } from "../lib/vnet/types";
 import {
 	getNarratorConnections,
 	handleNarratorWS,
@@ -8,12 +11,14 @@ import {
 	type NarratorWSData,
 } from "./narrator-ws";
 import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
+import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
 // === Unified WS data type ===
 
 export type WSData =
 	| ({ channel: "narrator" } & NarratorWSData)
-	| ({ channel: "terminal" } & TerminalWSData);
+	| ({ channel: "terminal" } & TerminalWSData)
+	| ({ channel: "vnet" } & VNetWSData);
 
 /**
  * Determine channel from the upgrade URL path and build initial WSData.
@@ -27,6 +32,7 @@ export function resolveWSData(
 		avatarColor: string | null;
 		avatarImageId: string | null;
 	},
+	vnetAuth?: VNetWSData["auth"],
 ): WSData | null {
 	if (url.pathname === "/ws/narrator" || url.pathname.startsWith("/ws/narrator?")) {
 		return {
@@ -48,6 +54,14 @@ export function resolveWSData(
 			subscribedTerminals: new Set(),
 		};
 	}
+	if (url.pathname === "/ws/vnet" || url.pathname.startsWith("/ws/vnet?")) {
+		return {
+			channel: "vnet",
+			connectedAt: Date.now(),
+			lastPongAt: Date.now(),
+			auth: vnetAuth ?? { kind: "anonymous" },
+		};
+	}
 	return null;
 }
 
@@ -66,6 +80,7 @@ export function startHeartbeat() {
 			const now = Date.now();
 			const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
 			const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
+			const staleVNet: Array<ServerWebSocket<WSData & { channel: "vnet" }>> = [];
 
 			for (const ws of getNarratorConnections()) {
 				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
@@ -91,6 +106,18 @@ export function startHeartbeat() {
 				}
 			}
 
+			for (const ws of getVNetConnections()) {
+				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+					staleVNet.push(ws);
+					continue;
+				}
+				try {
+					ws.send(pingPayload);
+				} catch {
+					staleVNet.push(ws);
+				}
+			}
+
 			for (const ws of staleNarrator) {
 				// Delegate to the channel handler so presence / stats are cleaned up
 				handleNarratorWS.close(ws);
@@ -108,6 +135,19 @@ export function startHeartbeat() {
 				});
 				// Delegate to the channel handler so subscriptions are cleaned up
 				handleTerminalWS.close(ws);
+				try {
+					ws.close(1000, "heartbeat timeout");
+				} catch {
+					// already dead
+				}
+			}
+
+			for (const ws of staleVNet) {
+				logger.debug("Closing stale VNet WS (heartbeat timeout)", {
+					connectedAt: ws.data.connectedAt,
+					lastPongAt: ws.data.lastPongAt,
+				});
+				handleVNetWS.close(ws);
 				try {
 					ws.close(1000, "heartbeat timeout");
 				} catch {
@@ -144,6 +184,13 @@ export function closeAllConnections() {
 			// already dead — ignore
 		}
 	}
+	for (const ws of getVNetConnections()) {
+		try {
+			ws.terminate();
+		} catch {
+			// already dead — ignore
+		}
+	}
 }
 
 // === Bun WebSocket handlers ===
@@ -156,12 +203,39 @@ export const wsHandlers = {
 			handleNarratorWS.open(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
 		} else if (channel === "terminal") {
 			handleTerminalWS.open(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
+		} else if (channel === "vnet") {
+			handleVNetWS.open(ws as ServerWebSocket<WSData & { channel: "vnet" }>);
 		}
 	},
 
 	message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
-		const text = typeof message === "string" ? message : new TextDecoder().decode(message);
 		const { channel } = ws.data;
+		if (channel === "vnet") {
+			const rawBytes =
+				typeof message === "string" ? Buffer.byteLength(message) : message.byteLength;
+			const maxBytes = settings.vnet?.maxMessageBytes ?? 1024 * 1024;
+			if (rawBytes > maxBytes) {
+				logger.warn("VNet WS message rejected before parsing: payload too large", {
+					rawBytes,
+					maxBytes,
+				});
+				try {
+					ws.send(
+						JSON.stringify({
+							type: "error",
+							code: "MESSAGE_TOO_LARGE",
+							message: "Message is too large",
+						}),
+					);
+					ws.close(1009, "message too large");
+				} catch {
+					// connection may be dead
+				}
+				return;
+			}
+		}
+
+		const text = typeof message === "string" ? message : new TextDecoder().decode(message);
 
 		let parsed: unknown;
 		try {
@@ -204,6 +278,17 @@ export const wsHandlers = {
 				});
 		} else if (channel === "terminal") {
 			handleTerminalWS.message(ws as ServerWebSocket<WSData & { channel: "terminal" }>, parsed);
+		} else if (channel === "vnet") {
+			handleVNetWS
+				.message(ws as ServerWebSocket<WSData & { channel: "vnet" }>, parsed as VNetClientMessage)
+				.catch((err: unknown) => {
+					logger.warn("VNet WS message handler error", { error: String(err) });
+					try {
+						ws.send(JSON.stringify({ type: "error", message: "Internal error" }));
+					} catch {
+						// connection may be dead
+					}
+				});
 		}
 	},
 
@@ -214,6 +299,8 @@ export const wsHandlers = {
 			handleNarratorWS.close(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
 		} else if (channel === "terminal") {
 			handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
+		} else if (channel === "vnet") {
+			handleVNetWS.close(ws as ServerWebSocket<WSData & { channel: "vnet" }>);
 		}
 	},
 };

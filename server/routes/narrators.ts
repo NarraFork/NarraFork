@@ -52,6 +52,19 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
+	DISABLED_TOOLS_TRAIT_PREFIX,
+	getConfigurableTools,
+	getDisabledToolSet,
+	getVisibleModelUses,
+	normalizeDisabledTools,
+	normalizeSubagentModelRestriction,
+	parseDisabledToolsTrait,
+	parseSubagentModelRestrictionTrait,
+	removeEncodedTrait,
+	SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX,
+	upsertEncodedTrait,
+} from "../lib/narrator-custom-traits";
+import {
 	addTrait,
 	hasTrait,
 	isSubagentVariant,
@@ -148,6 +161,7 @@ import {
 	setTemporaryModelRestore,
 	startGoalContinuationIfPossible,
 	toBufferSummary,
+	updateActiveDisabledTools,
 	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
@@ -456,6 +470,74 @@ narratorRoutes.get("/:id/commands", async (c) => {
 	const userId = c.get("user").sub;
 	const result = await getSlashMenuItems(id, userId);
 	return c.json(result);
+});
+
+function customTraitsResponse(traits: unknown) {
+	return {
+		subagentModelRestriction: parseSubagentModelRestrictionTrait(traits),
+		disabledTools: parseDisabledToolsTrait(traits),
+		availableModels: getVisibleModelUses(),
+		availableTools: getConfigurableTools(),
+	};
+}
+
+async function updateNarratorTraits(id: string, traits: string[]) {
+	await db
+		.update(narrators)
+		.set({ traits, updatedAt: new Date().toISOString() })
+		.where(eq(narrators.id, id));
+	updateActiveDisabledTools(id, getDisabledToolSet(traits));
+	broadcastToNarrator(id, {
+		type: "custom_traits_changed",
+		narratorId: id,
+		traits,
+		customTraits: customTraitsResponse(traits),
+	});
+}
+
+narratorRoutes.get("/:id/custom-traits", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	return c.json(customTraitsResponse(narrator.traits));
+});
+
+narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const body = await c.req.json().catch(() => ({}));
+	const restriction = normalizeSubagentModelRestriction(body);
+	const traits =
+		Object.keys(restriction.pools).length === 0
+			? removeEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX)
+			: upsertEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction);
+	await updateNarratorTraits(id, traits);
+	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+});
+
+narratorRoutes.delete("/:id/custom-traits/subagent-model-restriction", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const traits = removeEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX);
+	await updateNarratorTraits(id, traits);
+	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+});
+
+narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const body = await c.req.json().catch(() => ({}));
+	const disabledTools = normalizeDisabledTools(body);
+	const traits = upsertEncodedTrait(narrator.traits, DISABLED_TOOLS_TRAIT_PREFIX, disabledTools);
+	await updateNarratorTraits(id, traits);
+	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+});
+
+narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	const traits = removeEncodedTrait(narrator.traits, DISABLED_TOOLS_TRAIT_PREFIX);
+	await updateNarratorTraits(id, traits);
+	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
 });
 
 function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {

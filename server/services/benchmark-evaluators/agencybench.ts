@@ -4,7 +4,7 @@
  * Original AgencyBench uses eval_task.py (1000+ line Python scripts) with
  * Docker sandboxes, vision-based judges, and LLM-as-judge for evaluation.
  *
- * This evaluator implements a simplified but honest approach:
+ * This evaluator implements a simplified "heuristic-lite" approach:
  *   1. Check if the agent produced deliverable files
  *   2. Try to run any executable deliverables (Python scripts, etc.)
  *   3. Parse rubric text for numeric thresholds and check against output
@@ -155,16 +155,17 @@ export const agencybenchEvaluator: BenchmarkEvaluator = {
 					passed: true,
 					score: 0.5,
 					maxScore: 1,
-					details: `Agent produced output (${agentFiles.length} files) but no rubric to evaluate against`,
-					metadata: { agentFiles },
+					details: `Heuristic-lite evaluation (not official AgencyBench): agent produced output (${agentFiles.length} files) but no rubric to evaluate against`,
+					metadata: { evaluationMode: "heuristic-lite", officialComparable: false, agentFiles },
 				};
 			}
 			return {
 				passed: false,
 				score: 0,
 				maxScore: 1,
-				details: "No rubric defined and agent produced no meaningful output",
-				metadata: { agentFiles },
+				details:
+					"Heuristic-lite evaluation (not official AgencyBench): no rubric defined and agent produced no meaningful output",
+				metadata: { evaluationMode: "heuristic-lite", officialComparable: false, agentFiles },
 			};
 		}
 
@@ -191,8 +192,13 @@ export const agencybenchEvaluator: BenchmarkEvaluator = {
 			passed,
 			score: normalizedScore,
 			maxScore: 1,
-			details: `Score: ${totalScore}/${totalMax} (${Math.round(normalizedScore * 100)}%)\n${detailLines.join("\n")}`,
-			metadata: { criterionResults, agentFiles },
+			details: `Heuristic-lite evaluation (not official AgencyBench)\nScore: ${totalScore}/${totalMax} (${Math.round(normalizedScore * 100)}%)\n${detailLines.join("\n")}`,
+			metadata: {
+				evaluationMode: "heuristic-lite",
+				officialComparable: false,
+				criterionResults,
+				agentFiles,
+			},
 		};
 	},
 };

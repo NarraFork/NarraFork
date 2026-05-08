@@ -22,6 +22,10 @@ import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
+	formatSubagentModelRestrictionDescription,
+	getDisabledToolSet,
+} from "../lib/narrator-custom-traits";
+import {
 	addTrait,
 	isPlanModeTrait,
 	isReadOnlySubagentVariant,
@@ -345,6 +349,7 @@ async function createNarrator(
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
 		_enabledOptionalTools: new Set(),
+		_disabledTools: getDisabledToolSet(narrator.traits),
 		_interruptCleanupDone: false,
 		_substatus: new Set(),
 	};
@@ -1219,8 +1224,13 @@ export async function runAgentLoop(
 				metadata: isAnthropicProvider(resolved.provider)
 					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,
+				disabledTools: active._disabledTools,
+				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
+					freshNarrator.traits,
+				),
 				// Exclude optional tools that haven't been loaded for this session
 				toolFilter: (tool) => {
+					if (active._disabledTools.has(tool.name)) return false;
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return active._enabledOptionalTools.has(tool.name);
 					}
@@ -3730,6 +3740,12 @@ export async function unloadOptionalTool(
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);
 	return active?._enabledOptionalTools ?? new Set();
+}
+
+export function updateActiveDisabledTools(narratorId: string, tools: Iterable<string>): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	active._disabledTools = new Set(tools);
 }
 
 // === Re-exports from extracted modules ===

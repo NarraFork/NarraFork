@@ -3,7 +3,7 @@
  *
  * Flow: createSuite → createRun → executeRun (sequential tasks) → collect results.
  */
-import { readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +40,10 @@ const evaluators = new Map<string, BenchmarkEvaluator>([
 	["swe-bench", swebenchEvaluator],
 	["agencybench", agencybenchEvaluator],
 ]);
+
+type BenchmarkRun = typeof benchmarkRuns.$inferSelect;
+
+type CancelRunResult = "cancelled" | "not_found" | "not_cancellable";
 
 // ── Active run tracking (for cancellation) ──────────────────────────
 
@@ -225,9 +229,24 @@ async function collectMetrics(narratorId: string) {
 	};
 }
 
+function copySourceWorkspace(sourcePath: string, workDir: string): void {
+	if (!existsSync(sourcePath)) {
+		throw new Error(`Benchmark sourcePath does not exist: ${sourcePath}`);
+	}
+	const sourceStat = statSync(sourcePath);
+	if (!sourceStat.isDirectory()) {
+		throw new Error(`Benchmark sourcePath must be a directory: ${sourcePath}`);
+	}
+	cpSync(sourcePath, workDir, {
+		recursive: true,
+		force: true,
+		dereference: true,
+	});
+}
+
 /** Execute a single benchmark task. */
 async function executeTask(
-	run: typeof benchmarkRuns.$inferSelect,
+	run: BenchmarkRun,
 	task: BenchmarkTask,
 	taskResultId: string,
 	signal: AbortSignal,
@@ -250,6 +269,12 @@ async function executeTask(
 			.update(benchmarkTaskResults)
 			.set({ status: "running", startedAt: now })
 			.where(eq(benchmarkTaskResults.id, taskResultId));
+
+		const sourcePath = typeof meta.sourcePath === "string" ? meta.sourcePath : undefined;
+		if (sourcePath) {
+			copySourceWorkspace(sourcePath, workDir);
+			logger.info("Benchmark source workspace copied", { taskId: task.id, sourcePath, workDir });
+		}
 
 		// === SWE-bench container setup ===
 		if (isSWEBench && meta.repo && meta.baseCommit) {
@@ -276,7 +301,7 @@ async function executeTask(
 
 			// Install git and clone repo inside container
 			const setupScript = [
-				"set -e",
+				"set -eo pipefail",
 				"apt-get update -qq && apt-get install -y -qq git > /dev/null 2>&1",
 				...preInstall,
 				`git clone https://github.com/${repo}.git /testbed_repo`,
@@ -295,12 +320,24 @@ async function executeTask(
 				300_000,
 			);
 			if (setupResult.exitCode !== 0) {
-				logger.warn("SWE-bench container setup had errors", {
+				const durationMs = Date.now() - startTime;
+				const setupOutput = [setupResult.stdout, setupResult.stderr].filter(Boolean).join("\n");
+				logger.warn("SWE-bench container setup failed", {
 					taskId: task.id,
 					exitCode: setupResult.exitCode,
 					stderr: setupResult.stderr.slice(0, 500),
 				});
-				// Don't fail — some install warnings are non-fatal
+				await db
+					.update(benchmarkTaskResults)
+					.set({
+						status: "error",
+						errorMessage: `SWE-bench setup failed (exit ${setupResult.exitCode})`,
+						evalOutput: setupOutput.slice(0, 50000),
+						durationMs,
+						completedAt: new Date().toISOString(),
+					})
+					.where(eq(benchmarkTaskResults.id, taskResultId));
+				return;
 			}
 
 			// Inject containerId into task metadata so evaluator can use it
@@ -467,25 +504,69 @@ function cleanupStaleBenchmarkDirs(): void {
 	}
 }
 
+function reconcileStaleBenchmarkRuns(): void {
+	try {
+		const now = new Date().toISOString();
+		const staleTasks = sqlite
+			.prepare(
+				"UPDATE benchmark_task_results SET status = 'error', error_message = COALESCE(error_message, 'Interrupted by server restart'), completed_at = ? WHERE status = 'running'",
+			)
+			.run(now);
+		const staleRuns = sqlite
+			.prepare(
+				"UPDATE benchmark_runs SET status = 'failed', completed_at = ?, total_duration_ms = CASE WHEN started_at IS NOT NULL THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE total_duration_ms END WHERE status = 'running'",
+			)
+			.run(now, now);
+		if (staleRuns.changes > 0 || staleTasks.changes > 0) {
+			logger.warn("Reconciled stale benchmark runs from previous process", {
+				runs: staleRuns.changes,
+				tasks: staleTasks.changes,
+			});
+		}
+	} catch (err) {
+		logger.warn("Failed to reconcile stale benchmark runs", { error: String(err) });
+	}
+}
+
 // Run once at module load
 cleanupStaleBenchmarkDirs();
+reconcileStaleBenchmarkRuns();
 
-/** Execute all tasks in a benchmark run sequentially. */
-export async function executeRun(runId: string): Promise<void> {
+async function claimRun(runId: string): Promise<BenchmarkRun> {
 	const run = await getRun(runId);
 	if (!run) throw new Error(`Run not found: ${runId}`);
 
-	// Atomic status claim: only one caller can transition pending → running
+	const suite = await getSuite(run.suiteId);
+	if (!suite) throw new Error(`Suite not found: ${run.suiteId}`);
+
 	const now = new Date().toISOString();
 	const claimed = sqlite
 		.prepare(
-			"UPDATE benchmark_runs SET status = 'running', started_at = ? WHERE id = ? AND status = 'pending'",
+			"UPDATE benchmark_runs SET status = 'running', started_at = ?, completed_at = NULL WHERE id = ? AND status = 'pending'",
 		)
 		.run(now, runId);
 	if (claimed.changes === 0) {
-		throw new Error(`Run ${runId} is not pending (current: ${run.status})`);
+		const current = await getRun(runId);
+		throw new Error(`Run ${runId} is not pending (current: ${current?.status ?? run.status})`);
 	}
 
+	const claimedRun = await getRun(runId);
+	if (!claimedRun) throw new Error(`Run not found after claim: ${runId}`);
+	return claimedRun;
+}
+
+/** Start a benchmark run in the background after synchronously claiming it. */
+export async function startRun(runId: string): Promise<BenchmarkRun> {
+	const run = await claimRun(runId);
+	executeClaimedRun(run).catch((err) => {
+		logger.error("Benchmark run execution failed", { runId, error: String(err) });
+	});
+	return run;
+}
+
+/** Execute all tasks in a benchmark run sequentially after it has been claimed. */
+async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
+	const runId = run.id;
 	const suite = await getSuite(run.suiteId);
 	if (!suite) throw new Error(`Suite not found: ${run.suiteId}`);
 
@@ -494,6 +575,8 @@ export async function executeRun(runId: string): Promise<void> {
 
 	const abortController = new AbortController();
 	activeRuns.set(runId, abortController);
+	const currentRun = await getRun(runId);
+	if (currentRun?.status === "cancelled") abortController.abort();
 
 	logger.info("Benchmark run started", { runId, model: run.model, tasks: tasks.length });
 
@@ -574,25 +657,39 @@ export async function executeRun(runId: string): Promise<void> {
 			total: tasks.length,
 		});
 	} catch (err) {
+		const failureStatus = abortController.signal.aborted ? "cancelled" : "failed";
 		await db
 			.update(benchmarkRuns)
-			.set({ status: "failed", completedAt: new Date().toISOString() })
+			.set({ status: failureStatus, completedAt: new Date().toISOString() })
 			.where(eq(benchmarkRuns.id, runId));
-		logger.error("Benchmark run failed", { runId, error: String(err) });
+		logger.error("Benchmark run failed", { runId, status: failureStatus, error: String(err) });
 		throw err;
 	} finally {
 		activeRuns.delete(runId);
 	}
 }
 
-/** Cancel a running benchmark. */
-export function cancelRun(runId: string): boolean {
+/** Execute all tasks in a benchmark run sequentially and wait for completion. */
+export async function executeRun(runId: string): Promise<void> {
+	const run = await claimRun(runId);
+	await executeClaimedRun(run);
+}
+
+/** Cancel a pending or running benchmark. */
+export async function cancelRun(runId: string): Promise<CancelRunResult> {
+	const run = await getRun(runId);
+	if (!run) return "not_found";
+	if (run.status !== "pending" && run.status !== "running") return "not_cancellable";
+
 	const controller = activeRuns.get(runId);
-	if (controller) {
-		controller.abort();
-		return true;
-	}
-	return false;
+	if (controller) controller.abort();
+
+	await db
+		.update(benchmarkRuns)
+		.set({ status: "cancelled", completedAt: new Date().toISOString() })
+		.where(eq(benchmarkRuns.id, runId));
+
+	return "cancelled";
 }
 
 // ── Summary / comparison ────────────────────────────────────────────

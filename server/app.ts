@@ -52,6 +52,7 @@ import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
+import { vnetRoutes } from "./routes/vnet";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
 import { workspaceRoutes } from "./routes/workspaces";
 
@@ -139,6 +140,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/user-preferences",
 	"/api/notification",
 	"/api/update",
+	"/api/vnet",
 	"/api/routines",
 	"/api/skills",
 	"/api/custom-subagents",
@@ -190,6 +192,7 @@ app.route("/api/routines", routineRoutes);
 app.route("/api/hooks", hookRoutes);
 app.route("/api/reviews", reviewsRouter);
 app.route("/api/update", updateRoutes);
+app.route("/api/vnet", vnetRoutes);
 app.route("/api/usage-history", usageHistoryRoutes);
 app.route("/api/workspaces", workspaceRoutes);
 app.route("/api/benchmarks", benchmarkRoutes);

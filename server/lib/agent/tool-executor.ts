@@ -126,6 +126,18 @@ export async function executeTool(
 		};
 	}
 
+	const disabledTools =
+		config.disabledTools instanceof Set
+			? config.disabledTools
+			: new Set(config.disabledTools ?? []);
+	if (disabledTools.has(tu.name)) {
+		return {
+			output: `Tool disabled by this narrator's custom trait: ${tu.name}`,
+			isError: true,
+			durationMs: 0,
+		};
+	}
+
 	// Permission check
 	const permissionStartedAt = Date.now();
 	const permission =

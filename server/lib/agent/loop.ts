@@ -1209,6 +1209,7 @@ export async function* agentLoop(
 		.map((t) => ({
 			...t,
 			description: typeof t.description === "function" ? t.description(config) : t.description,
+			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
 		}));
 
 	if (config.reflectionLoop) {

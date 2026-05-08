@@ -88,6 +88,8 @@ export interface ToolDefinition {
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;
+	/** Optional dynamic schema override for tools that depend on current agent config. */
+	getRawJsonSchema?: (config: AgentConfig) => Record<string, unknown>;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 	/** If provided, tool is only included when this returns true */
 	isAvailable?: () => boolean;
@@ -433,8 +435,12 @@ export interface AgentConfig {
 	serviceTier?: string;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
-	/** Filter tools available to this agent (subagent tool restriction) */
+	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
+	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
+	disabledTools?: Set<string> | string[];
+	/** Custom description appended to Agent.model schema when narrator traits restrict subagent models. */
+	subagentModelRestrictionDescription?: string | null;
 	/** Internal bounded reflection loop context. */
 	reflectionLoop?: ReflectionLoopConfig;
 	permissionHandler: (

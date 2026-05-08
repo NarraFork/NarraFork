@@ -291,6 +291,39 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ model }),
 		}),
+	getCustomTraits: (id: string) =>
+		request<{
+			subagentModelRestriction: {
+				version: 1;
+				pools: Record<string, { model: string; purpose?: string }[]>;
+			} | null;
+			disabledTools: { version: 1; tools: string[] } | null;
+			availableModels: { model: string; purpose?: string }[];
+			availableTools: { name: string; description: string; category: string }[];
+		}>(`/narrators/${id}/custom-traits`),
+	updateSubagentModelRestriction: (
+		id: string,
+		pools: Record<string, { model: string; purpose?: string }[]>,
+	) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/subagent-model-restriction`,
+			{ method: "PUT", body: JSON.stringify({ pools }) },
+		),
+	clearSubagentModelRestriction: (id: string) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/subagent-model-restriction`,
+			{ method: "DELETE" },
+		),
+	updateDisabledTools: (id: string, tools: string[]) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/disabled-tools`,
+			{ method: "PUT", body: JSON.stringify({ tools }) },
+		),
+	clearDisabledTools: (id: string) =>
+		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+			`/narrators/${id}/custom-traits/disabled-tools`,
+			{ method: "DELETE" },
+		),
 	updateNarratorPermissionMode: (id: string, permissionMode: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/permission-mode`, {
 			method: "PATCH",

@@ -203,17 +203,17 @@ export class CodexProvider implements ProviderAdapter {
 		}
 	}
 
-	private reportCallError(
+	private async reportCallError(
 		ctx: CallContext,
 		err: unknown,
-	): {
+	): Promise<{
 		classified: ReturnType<typeof classifyCodexError>;
 		hasMore: boolean;
-	} {
+	}> {
 		const classified = classifyCodexError(err);
 		const hasMore =
 			classified.type === "quota_exhausted"
-				? this.manager.reportQuotaExhausted(ctx.id, classified.resetsAt)
+				? await this.manager.reportQuotaExhaustedAndRefreshUsage(ctx.id, classified.resetsAt)
 				: this.manager.reportFailure(ctx.id);
 
 		if (classified.type === "quota_exhausted") {
@@ -232,15 +232,15 @@ export class CodexProvider implements ProviderAdapter {
 		return { classified, hasMore };
 	}
 
-	private shouldRetryAfterFallbackError(
+	private async shouldRetryAfterFallbackError(
 		ctx: CallContext,
 		err: unknown,
 		hasStreamedEvents: boolean,
 		attempt: number,
 		maxAttempts: number,
 		operation: string,
-	): boolean {
-		const { classified, hasMore } = this.reportCallError(ctx, err);
+	): Promise<boolean> {
+		const { classified, hasMore } = await this.reportCallError(ctx, err);
 		const shouldRetry =
 			classified.type === "quota_exhausted" &&
 			hasMore &&
@@ -279,7 +279,7 @@ export class CodexProvider implements ProviderAdapter {
 			} catch (err) {
 				lastError = err;
 				attempt++;
-				const { classified, hasMore } = this.reportCallError(ctx, err);
+				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" && hasMore && attempt < maxAttempts;
 				if (shouldRetry) {
@@ -382,7 +382,7 @@ export class CodexProvider implements ProviderAdapter {
 				lastError = err;
 				attempt++;
 
-				const { classified, hasMore } = this.reportCallError(ctx, err);
+				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" &&
 					hasMore &&
@@ -474,7 +474,7 @@ export class CodexProvider implements ProviderAdapter {
 						lastError = fallbackErr;
 						attempt++;
 						if (
-							this.shouldRetryAfterFallbackError(
+							await this.shouldRetryAfterFallbackError(
 								ctx,
 								fallbackErr,
 								hasStreamedEvents,
@@ -522,7 +522,7 @@ export class CodexProvider implements ProviderAdapter {
 						lastError = fallbackErr;
 						attempt++;
 						if (
-							this.shouldRetryAfterFallbackError(
+							await this.shouldRetryAfterFallbackError(
 								ctx,
 								fallbackErr,
 								hasStreamedEvents,
@@ -540,7 +540,7 @@ export class CodexProvider implements ProviderAdapter {
 				lastError = err;
 				attempt++;
 
-				const { classified, hasMore } = this.reportCallError(ctx, err);
+				const { classified, hasMore } = await this.reportCallError(ctx, err);
 				const shouldRetry =
 					classified.type === "quota_exhausted" &&
 					hasMore &&

@@ -73,6 +73,8 @@ export interface ActiveNarrator {
 	_skillRoot?: string | null;
 	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
 	_enabledOptionalTools: Set<string>;
+	/** Tools disabled by narrator custom traits. */
+	_disabledTools: Set<string>;
 	/** Soft-stop flag: set when user approves a permission with feedbackText.
 	 *  The agent loop checks this via shouldStop() after tools complete. */
 	_feedbackSoftStop?: boolean;

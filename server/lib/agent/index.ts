@@ -3,11 +3,8 @@ import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import { isRetryableError } from "./loop";
 import { type GenerateOptions, resolveProviderAndModel } from "./provider";
-import { registerCoreTools } from "./tools";
+import "./tools";
 import { initTruncateCleanup } from "./truncate";
-
-// Auto-register core tools on module load
-registerCoreTools();
 
 // Start periodic cleanup of truncated output files
 initTruncateCleanup();

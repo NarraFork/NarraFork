@@ -468,6 +468,21 @@ export interface NarraForkSettings {
 		/** Automatically download updates when available. */
 		autoDownload: boolean;
 	};
+	/** Application-level virtual network relay for Bun-to-Bun communication. */
+	vnet?: {
+		enabled: boolean;
+		/** Optional shared relay token for non-browser Bun applications. */
+		relayToken?: string;
+		/** Allow unauthenticated relay websocket connections. Disabled by default. */
+		allowAnonymousRelay: boolean;
+		maxPeersPerNetwork: number;
+		maxMessageBytes: number;
+		udp: {
+			enabled: boolean;
+			host: string;
+			port: number;
+		};
+	};
 	/** File sharing configuration (ShareFile tool). */
 	shares?: {
 		/** Default expiry time in hours for shared files (default: 24). */

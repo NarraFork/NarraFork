@@ -31,6 +31,18 @@ type PublicForecast = PublicCodexQuotaOverview["forecast"];
 type ForecastLike = CodexUsageForecast | PublicForecast;
 type ForecastPointLike = CodexUsageForecast["points"][number] | PublicForecast["points"][number];
 
+const HOUR_MS = 60 * 60 * 1000;
+const NEAR_WINDOW_MS = 5 * HOUR_MS;
+const COMPRESSED_NEAR_WIDTH_RATIO = 0.68;
+const COMPRESSED_GRID_TARGET_LINES = 42;
+
+const GRID_STEPS_MS = [HOUR_MS, 2 * HOUR_MS, 4 * HOUR_MS, 6 * HOUR_MS, 12 * HOUR_MS, 24 * HOUR_MS];
+
+type ForecastGridLine = {
+	timestamp: number;
+	variant: "near" | "compressed" | "boundary";
+};
+
 export function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
 	if (tier === "free") return t("codexQuotaTierFree");
 	if (tier === "plus") return t("codexQuotaTierPlus");
@@ -59,6 +71,45 @@ function formatChartTimestamp(timestamp: number): string {
 		hour: "2-digit",
 		minute: "2-digit",
 	});
+}
+
+function getAlignedTimestamp(timestamp: number, stepMs: number): number {
+	return Math.ceil(timestamp / stepMs) * stepMs;
+}
+
+function chooseCompressedGridStep(duration: number): number {
+	const targetStep = duration / COMPRESSED_GRID_TARGET_LINES;
+	return (
+		GRID_STEPS_MS.find((step) => step >= targetStep) ?? GRID_STEPS_MS[GRID_STEPS_MS.length - 1]
+	);
+}
+
+function buildForecastGridLines({
+	minTime,
+	nearEndTime,
+	maxTime,
+	isCompressed,
+}: {
+	minTime: number;
+	nearEndTime: number;
+	maxTime: number;
+	isCompressed: boolean;
+}): ForecastGridLine[] {
+	const lines: ForecastGridLine[] = [];
+	const nearStart = getAlignedTimestamp(minTime + 1, HOUR_MS);
+	for (let timestamp = nearStart; timestamp < nearEndTime; timestamp += HOUR_MS) {
+		lines.push({ timestamp, variant: "near" });
+	}
+
+	if (!isCompressed) return lines;
+
+	lines.push({ timestamp: nearEndTime, variant: "boundary" });
+	const compressedStep = chooseCompressedGridStep(maxTime - nearEndTime);
+	const compressedStart = getAlignedTimestamp(nearEndTime + 1, compressedStep);
+	for (let timestamp = compressedStart; timestamp < maxTime; timestamp += compressedStep) {
+		lines.push({ timestamp, variant: "compressed" });
+	}
+	return lines;
 }
 
 function formatQuotaForecastDuration(
@@ -125,6 +176,18 @@ export function CodexQuotaForecastChart({
 	const minTime = points[0]?.timestamp ?? Date.now();
 	const maxTime = points[points.length - 1]?.timestamp ?? minTime;
 	const hasChartData = points.length >= 2;
+	const nearEndTime = Math.min(minTime + NEAR_WINDOW_MS, maxTime);
+	const nearDuration = Math.max(nearEndTime - minTime, 1);
+	const compressedDuration = Math.max(maxTime - nearEndTime, 0);
+	const isCompressedTimeScale = compressedDuration > HOUR_MS;
+	const nearWidth = isCompressedTimeScale ? chartWidth * COMPRESSED_NEAR_WIDTH_RATIO : chartWidth;
+	const compressedWidth = Math.max(chartWidth - nearWidth, 1);
+	const gridLines = buildForecastGridLines({
+		minTime,
+		nearEndTime,
+		maxTime,
+		isCompressed: isCompressedTimeScale,
+	});
 
 	if (visibleTiers.length === 0) {
 		return (
@@ -148,12 +211,29 @@ export function CodexQuotaForecastChart({
 
 	const xFor = (timestamp: number) => {
 		if (maxTime === minTime) return padding.left + chartWidth / 2;
-		return padding.left + ((timestamp - minTime) / (maxTime - minTime)) * chartWidth;
+		const clampedTimestamp = Math.min(Math.max(timestamp, minTime), maxTime);
+		if (!isCompressedTimeScale) {
+			return padding.left + ((clampedTimestamp - minTime) / (maxTime - minTime)) * chartWidth;
+		}
+		if (clampedTimestamp <= nearEndTime) {
+			return padding.left + ((clampedTimestamp - minTime) / nearDuration) * nearWidth;
+		}
+		return (
+			padding.left +
+			nearWidth +
+			((clampedTimestamp - nearEndTime) / compressedDuration) * compressedWidth
+		);
 	};
 	const yFor = (value: number) => padding.top + chartHeight - (value / maxValue) * chartHeight;
 	const timeFor = (x: number) => {
 		if (chartWidth <= 0 || maxTime === minTime) return minTime;
-		return minTime + ((x - padding.left) / chartWidth) * (maxTime - minTime);
+		const clampedX = Math.min(Math.max(x, padding.left), padding.left + chartWidth);
+		if (!isCompressedTimeScale) {
+			return minTime + ((clampedX - padding.left) / chartWidth) * (maxTime - minTime);
+		}
+		const localX = clampedX - padding.left;
+		if (localX <= nearWidth) return minTime + (localX / nearWidth) * nearDuration;
+		return nearEndTime + ((localX - nearWidth) / compressedWidth) * compressedDuration;
 	};
 	const getForecastValueAt = (timestamp: number, tier: CodexPlanTier) => {
 		let value = getPointValue(points[0], tier);
@@ -173,6 +253,14 @@ export function CodexQuotaForecastChart({
 		}
 		return path;
 	};
+	const renderTimeTick = (timestamp: number, x: number, textAnchor: "start" | "middle" | "end") => (
+		<text x={x} y={height - 19} textAnchor={textAnchor} fontSize="10" fill="gray">
+			<tspan x={x}>{formatChartTimestamp(timestamp)}</tspan>
+			<tspan x={x} dy={13} fill="var(--mantine-color-dimmed)">
+				{formatQuotaForecastDuration(timestamp, t)}
+			</tspan>
+		</text>
+	);
 	const updateHoveredPoint = (event: PointerEvent<SVGSVGElement>) => {
 		const svg = svgRef.current;
 		const screenCtm = svg?.getScreenCTM();
@@ -215,6 +303,22 @@ export function CodexQuotaForecastChart({
 					onPointerCancel={() => setHoveredCursor(null)}
 					style={{ width: "100%", height: compact ? 180 : 220, touchAction: "none" }}
 				>
+					{gridLines.map((line) => (
+						<line
+							key={`${line.variant}-${line.timestamp}`}
+							x1={xFor(line.timestamp)}
+							y1={padding.top}
+							x2={xFor(line.timestamp)}
+							y2={padding.top + chartHeight}
+							stroke={
+								line.variant === "boundary"
+									? "var(--mantine-color-gray-5)"
+									: "var(--mantine-color-gray-3)"
+							}
+							strokeOpacity={line.variant === "compressed" ? 0.42 : 0.28}
+							strokeDasharray={line.variant === "boundary" ? "5 4" : "2 6"}
+						/>
+					))}
 					<line
 						x1={padding.left}
 						y1={padding.top}
@@ -241,18 +345,9 @@ export function CodexQuotaForecastChart({
 					>
 						0
 					</text>
-					<text x={padding.left} y={height - 8} textAnchor="start" fontSize="10" fill="gray">
-						{formatChartTimestamp(minTime)}
-					</text>
-					<text
-						x={padding.left + chartWidth}
-						y={height - 8}
-						textAnchor="end"
-						fontSize="10"
-						fill="gray"
-					>
-						{formatChartTimestamp(maxTime)}
-					</text>
+					{renderTimeTick(minTime, padding.left, "start")}
+					{isCompressedTimeScale && renderTimeTick(nearEndTime, xFor(nearEndTime), "middle")}
+					{renderTimeTick(maxTime, padding.left + chartWidth, "end")}
 					{visibleTiers.map((tier) => (
 						<path
 							key={tier}
@@ -271,8 +366,8 @@ export function CodexQuotaForecastChart({
 							y1={padding.top}
 							x2={xFor(point.timestamp)}
 							y2={padding.top + chartHeight}
-							stroke="var(--mantine-color-gray-3)"
-							strokeDasharray="3 4"
+							stroke="var(--mantine-color-gray-4)"
+							strokeOpacity={0.82}
 						/>
 					))}
 					{hoveredCursor ? (

@@ -107,6 +107,7 @@ interface NarratorWSCallbacks {
 	onGoalContinuation?: (goal: NarratorGoal) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onPlanModeChanged?: (planMode: boolean, traits?: string[]) => void;
+	onCustomTraitsChanged?: (traits?: string[]) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
@@ -484,6 +485,11 @@ export function useNarratorWS(
 					case "plan_mode_changed":
 						callbacksRef.current.onPlanModeChanged?.(
 							data.planMode as boolean,
+							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
+						);
+						break;
+					case "custom_traits_changed":
+						callbacksRef.current.onCustomTraitsChanged?.(
 							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
 						);
 						break;

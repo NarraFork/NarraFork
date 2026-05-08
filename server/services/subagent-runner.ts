@@ -5,6 +5,11 @@ import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import {
+	DISABLED_TOOLS_TRAIT_PREFIX,
+	resolveEffectiveSubagentModelPolicy,
+	resolveSubagentModelFromPolicy,
+} from "../lib/narrator-custom-traits";
+import {
 	getSubagentType,
 	hasTrait,
 	isSubagentVariant,
@@ -14,7 +19,6 @@ import {
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
-	resolveAllowedModelCandidate,
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
@@ -643,41 +647,34 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		subagentPref = customDef.defaultModel || undefined;
 	}
 
-	// Apply per-type subagent allowed-model pool restriction.
-	// When the pool is non-empty, only models in the pool may be used.
-	// Walk the priority chain and pick the first allowed candidate.
-	// Note: "review" and custom subagent types fall back to the "general" pool
-	// since they don't have dedicated pool configurations.
-	const poolKey =
-		subagentType === "explore" || subagentType === "plan" || subagentType === "general"
-			? subagentType
-			: "general";
-	const allowedPool = settings.agent.subagentAllowedModels?.[poolKey] ?? [];
-	let resolvedModelInput: string | undefined;
-	if (allowedPool.length > 0) {
-		const parent = await narratorService.getById(parentNarratorId);
-		const candidates = [
-			explicitModel,
-			subagentPref,
-			parent.model ?? FOLLOW_DEFAULT_MODEL,
-			settings.agent.defaultModel,
-		].filter((m): m is string => !!m);
-		resolvedModelInput =
-			candidates
-				.map((candidate) => resolveAllowedModelCandidate(candidate, allowedPool))
-				.find((candidate): candidate is string => !!candidate) ?? undefined;
-		if (!resolvedModelInput) {
-			throw new ValidationError(
-				`No candidate model is in the allowed pool for "${poolKey}" subagents. ` +
-					`Allowed models: ${allowedPool.join(", ")}. ` +
-					`Please specify one of these models explicitly.`,
-			);
-		}
-	} else {
-		resolvedModelInput = explicitModel || subagentPref || undefined;
+	// Apply effective per-narrator subagent model policy. Custom narrator traits override
+	// global settings.agent.subagentAllowedModels.
+	const parent = await narratorService.getById(parentNarratorId);
+	const modelPolicy = resolveEffectiveSubagentModelPolicy(parent.traits, subagentType);
+	const candidateModels = [
+		subagentPref,
+		parent.model ?? FOLLOW_DEFAULT_MODEL,
+		settings.agent.defaultModel,
+	];
+	const resolvedModelInput = resolveSubagentModelFromPolicy({
+		policy: modelPolicy,
+		explicitModel,
+		candidates: candidateModels,
+	});
+	if (modelPolicy.source !== "none" && !resolvedModelInput) {
+		const allowedModels = modelPolicy.models.map((entry) => entry.model);
+		throw new ValidationError(
+			modelPolicy.isExplicitEmpty
+				? `No models are allowed for "${modelPolicy.poolKey}" subagents by this narrator's custom trait.`
+				: `No candidate model is in the allowed pool for "${modelPolicy.poolKey}" subagents. ` +
+						`Allowed models: ${allowedModels.join(", ")}. Please specify one of these models explicitly.`,
+		);
 	}
 
 	// 1. Create subagent narrator
+	const inheritedTraits = parseTraits(parent.traits).filter((trait) =>
+		trait.startsWith(DISABLED_TOOLS_TRAIT_PREFIX),
+	);
 	const subagent = await narratorService.createSubagent({
 		parentNarratorId,
 		subagentType,
@@ -686,6 +683,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		systemPrompt,
 		model: resolvedModelInput,
 		reasoningEffort,
+		inheritedTraits,
 	});
 
 	const subagentId = subagent.id;

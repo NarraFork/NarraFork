@@ -23,7 +23,9 @@ export async function runCommand(
 			stderr: "pipe",
 		});
 
+		let timedOut = false;
 		const timer = setTimeout(() => {
+			timedOut = true;
 			try {
 				proc.kill();
 			} catch {
@@ -38,7 +40,7 @@ export async function runCommand(
 		const exitCode = await proc.exited;
 		clearTimeout(timer);
 
-		return { exitCode, stdout, stderr, timedOut: false };
+		return { exitCode, stdout, stderr, timedOut };
 	} catch (err) {
 		return {
 			exitCode: -1,

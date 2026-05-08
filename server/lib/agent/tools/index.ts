@@ -113,3 +113,8 @@ export function registerCoreTools(): void {
 	toolRegistry.registerProvider(optionalProvider);
 	toolRegistry.registerProvider(reviewProvider);
 }
+
+// Register after this module has finished initializing provider constants. Keeping the
+// side effect here avoids calling registerCoreTools from a circular importer while
+// coreProvider is still in the temporal dead zone.
+registerCoreTools();

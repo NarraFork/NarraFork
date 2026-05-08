@@ -34,19 +34,36 @@ function createManagerWithOneCredential(
 }
 
 function createUsageResponse(primaryUsedPercent: number, resetAtSec: number): Response {
+	return createUsageResponseWithWeekly(primaryUsedPercent, resetAtSec);
+}
+
+function createUsageResponseWithWeekly(
+	primaryUsedPercent: number,
+	primaryResetAtSec: number,
+	weeklyUsedPercent?: number,
+	weeklyResetAtSec?: number,
+): Response {
 	return new Response(
 		JSON.stringify({
 			plan_type: "plus",
 			rate_limit: {
 				allowed: true,
-				limit_reached: primaryUsedPercent >= 100,
+				limit_reached: primaryUsedPercent >= 100 || (weeklyUsedPercent ?? 0) >= 100,
 				primary_window: {
 					used_percent: primaryUsedPercent,
 					limit_window_seconds: 18_000,
-					reset_after_seconds: Math.max(resetAtSec - Math.floor(Date.now() / 1000), 0),
-					reset_at: resetAtSec,
+					reset_after_seconds: Math.max(primaryResetAtSec - Math.floor(Date.now() / 1000), 0),
+					reset_at: primaryResetAtSec,
 				},
-				secondary_window: null,
+				secondary_window:
+					weeklyUsedPercent === undefined || weeklyResetAtSec === undefined
+						? null
+						: {
+								used_percent: weeklyUsedPercent,
+								limit_window_seconds: 604_800,
+								reset_after_seconds: Math.max(weeklyResetAtSec - Math.floor(Date.now() / 1000), 0),
+								reset_at: weeklyResetAtSec,
+							},
 			},
 			code_review_rate_limit: {
 				allowed: true,
@@ -61,6 +78,48 @@ function createUsageResponse(primaryUsedPercent: number, resetAtSec: number): Re
 			headers: { "Content-Type": "application/json" },
 		},
 	);
+}
+
+function createManagerWithCachedUsageCredentials(
+	creds: Array<{ id: string; priority: number; weeklyUsedPercent: number; weeklyResetAt: number }>,
+): { manager: CodexManager; tmpHome: string } {
+	const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+	const narraforkDir = join(tmpHome, ".narrafork");
+	mkdirSync(narraforkDir, { recursive: true });
+
+	const now = Date.now();
+	const payload = creds.map((cred) => ({
+		id: cred.id,
+		refreshToken: `rt-${cred.id}`,
+		accessToken: `at-${cred.id}`,
+		expiresAt: now + 30 * 60_000,
+		accountId: `acc-${cred.id}`,
+		priority: cred.priority,
+		disabled: false,
+		usage: {
+			plan_type: "plus",
+			primary_window: {
+				used_percent: 50,
+				remaining_percent: 50,
+				reset_at: Math.floor((now + 60 * 60_000) / 1000),
+				reset_after_seconds: 60 * 60,
+				window_type: "5h",
+			},
+			secondary_window: {
+				used_percent: cred.weeklyUsedPercent,
+				remaining_percent: 100 - cred.weeklyUsedPercent,
+				reset_at: cred.weeklyResetAt,
+				reset_after_seconds: Math.max(cred.weeklyResetAt - Math.floor(now / 1000), 0),
+				window_type: "weekly",
+			},
+			queriedAt: new Date(now).toISOString(),
+		},
+	}));
+	writeFileSync(join(narraforkDir, "codex-credentials.json"), JSON.stringify(payload, null, 2));
+	writeFileSync(join(narraforkDir, "codex-stats.json"), JSON.stringify({}, null, 2));
+
+	const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+	return { manager, tmpHome };
 }
 
 const tempHomes: string[] = [];
@@ -147,6 +206,30 @@ describe("CodexManager usage quota state", () => {
 		expect(entry?.quotaResetsAt).toBeUndefined();
 	});
 
+	test("quota 错误后刷新 usage 以记录周限恢复时间", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-quota-error");
+		tempHomes.push(tmpHome);
+		const primaryResetAtSec = Math.floor(Date.now() / 1000) + 1800;
+		const weeklyResetAtSec = Math.floor(Date.now() / 1000) + 7200;
+
+		globalThis.fetch = (async () =>
+			createUsageResponseWithWeekly(
+				50,
+				primaryResetAtSec,
+				100,
+				weeklyResetAtSec,
+			)) as unknown as typeof fetch;
+
+		const hasMore = await manager.reportQuotaExhaustedAndRefreshUsage("cred-quota-error");
+		const entry = manager.snapshot().entries.find((item) => item.id === "cred-quota-error");
+
+		expect(hasMore).toBe(false);
+		expect(entry?.disabled).toBe(true);
+		expect(entry?.disabledReason).toBe("quota_exhausted");
+		expect(entry?.quotaResetsAt).toBe(weeklyResetAtSec * 1000);
+		expect(entry?.usage?.secondary_window?.window_type).toBe("weekly");
+	});
+
 	test("quota_exhausted 调度优先使用耗尽窗口的恢复时间", () => {
 		const now = Date.now();
 		const quotaResetsAt = now + 120_000;
@@ -176,5 +259,25 @@ describe("CodexManager usage quota state", () => {
 		tempHomes.push(tmpHome);
 
 		expect(manager.snapshot().usageScheduler.nextRunAt).toBe(quotaResetsAt);
+	});
+
+	test("选择凭据时跳过缓存中周限未恢复的账号", async () => {
+		const now = Date.now();
+		const weeklyResetAt = Math.floor((now + 2 * 60 * 60_000) / 1000);
+		const { manager, tmpHome } = createManagerWithCachedUsageCredentials([
+			{ id: "cred-weekly-exhausted", priority: 0, weeklyUsedPercent: 100, weeklyResetAt },
+			{ id: "cred-ready", priority: 1, weeklyUsedPercent: 25, weeklyResetAt },
+		]);
+		tempHomes.push(tmpHome);
+
+		const ctx = await manager.acquireContext();
+		const exhausted = manager
+			.snapshot()
+			.entries.find((item) => item.id === "cred-weekly-exhausted");
+
+		expect(ctx.id).toBe("cred-ready");
+		expect(exhausted?.disabled).toBe(true);
+		expect(exhausted?.disabledReason).toBe("quota_exhausted");
+		expect(exhausted?.quotaResetsAt).toBe(weeklyResetAt * 1000);
 	});
 });

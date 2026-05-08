@@ -7,11 +7,13 @@ import {
 	Divider,
 	Drawer,
 	Group,
+	MultiSelect,
 	Paper,
 	ScrollArea,
 	SimpleGrid,
 	Stack,
 	Text,
+	Textarea,
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
@@ -23,11 +25,16 @@ import { useBrowserSessions } from "../../hooks/useBrowserSessions";
 import { useChapter } from "../../hooks/useChapters";
 import {
 	useBlacklistDirs,
+	useClearDisabledTools,
+	useClearSubagentModelRestriction,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useNarrator,
+	useNarratorCustomTraits,
 	useNarratorUsageStats,
 	useUpdateCwd,
+	useUpdateDisabledTools,
+	useUpdateSubagentModelRestriction,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { usePermissions } from "../../hooks/usePermissions";
@@ -177,6 +184,53 @@ export function NarratorDetailsPanel({
 	);
 	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
 	const [cwdDirty, setCwdDirty] = useState(false);
+	const { data: customTraits } = useNarratorCustomTraits(narratorId, opened);
+	const updateSubagentModelsMutation = useUpdateSubagentModelRestriction();
+	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
+	const updateDisabledToolsMutation = useUpdateDisabledTools();
+	const clearDisabledToolsMutation = useClearDisabledTools();
+	const [modelPools, setModelPools] = useState<Record<string, string[]>>({
+		explore: [],
+		plan: [],
+		general: [],
+	});
+	const [modelPurposes, setModelPurposes] = useState<Record<string, Record<string, string>>>({});
+	const [disabledToolSelection, setDisabledToolSelection] = useState<string[]>([]);
+
+	const modelOptions = useMemo(
+		() =>
+			(customTraits?.availableModels ?? []).map((item) => ({
+				value: item.model,
+				label: item.model,
+			})),
+		[customTraits?.availableModels],
+	);
+	const toolOptions = useMemo(
+		() =>
+			(customTraits?.availableTools ?? []).map((tool) => ({
+				value: tool.name,
+				label: `${tool.category}:${tool.name}`,
+			})),
+		[customTraits?.availableTools],
+	);
+
+	useEffect(() => {
+		const pools = customTraits?.subagentModelRestriction?.pools ?? {};
+		setModelPools({
+			explore: (pools.explore ?? []).map((entry) => entry.model),
+			plan: (pools.plan ?? []).map((entry) => entry.model),
+			general: (pools.general ?? []).map((entry) => entry.model),
+		});
+		const nextPurposes: Record<string, Record<string, string>> = {};
+		for (const [type, entries] of Object.entries(pools)) {
+			nextPurposes[type] = {};
+			for (const entry of entries) {
+				if (entry.purpose) nextPurposes[type][entry.model] = entry.purpose;
+			}
+		}
+		setModelPurposes(nextPurposes);
+		setDisabledToolSelection(customTraits?.disabledTools?.tools ?? []);
+	}, [customTraits]);
 
 	const formatDateTime = (value?: string | null) => {
 		if (!value) return t("details.notAvailable");
@@ -282,6 +336,55 @@ export function NarratorDetailsPanel({
 				color: "red",
 			});
 		}
+	};
+
+	const handleSaveSubagentModels = async () => {
+		const pools = Object.fromEntries(
+			(["explore", "plan", "general"] as const)
+				.map((type) => {
+					const entries = (modelPools[type] ?? []).map((model) => ({
+						model,
+						...(modelPurposes[type]?.[model]?.trim()
+							? { purpose: modelPurposes[type][model].trim() }
+							: {}),
+					}));
+					return [type, entries] as const;
+				})
+				.filter(([, entries]) => entries.length > 0),
+		);
+		await updateSubagentModelsMutation.mutateAsync({ id: narratorId, pools });
+		notifications.show({
+			title: t("details.customTraitsSaved"),
+			message: t("details.customTraitsSaved"),
+			color: "teal",
+		});
+	};
+
+	const handleClearSubagentModels = async () => {
+		await clearSubagentModelsMutation.mutateAsync(narratorId);
+		notifications.show({
+			title: t("details.customTraitsCleared"),
+			message: t("details.customTraitsCleared"),
+			color: "blue",
+		});
+	};
+
+	const handleSaveDisabledTools = async () => {
+		await updateDisabledToolsMutation.mutateAsync({ id: narratorId, tools: disabledToolSelection });
+		notifications.show({
+			title: t("details.customTraitsSaved"),
+			message: t("details.customTraitsSaved"),
+			color: "teal",
+		});
+	};
+
+	const handleClearDisabledTools = async () => {
+		await clearDisabledToolsMutation.mutateAsync(narratorId);
+		notifications.show({
+			title: t("details.customTraitsCleared"),
+			message: t("details.customTraitsCleared"),
+			color: "blue",
+		});
 	};
 
 	const content = (
@@ -499,6 +602,97 @@ export function NarratorDetailsPanel({
 						}
 					/>
 				) : null}
+			</DetailSection>
+
+			<DetailSection title={t("details.customTraits")}>
+				<Stack gap="md">
+					<Stack gap="xs">
+						<Text size="sm" fw={600}>
+							{t("details.subagentModelRestriction")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("details.subagentModelRestrictionDesc")}
+						</Text>
+						{(["explore", "plan", "general"] as const).map((type) => (
+							<Stack key={type} gap={6}>
+								<MultiSelect
+									label={t(`details.subagentType_${type}`)}
+									data={modelOptions}
+									searchable
+									clearable
+									value={modelPools[type] ?? []}
+									onChange={(value) => setModelPools((old) => ({ ...old, [type]: value }))}
+								/>
+								{(modelPools[type] ?? []).map((model) => (
+									<Textarea
+										key={`${type}-${model}`}
+										label={model}
+										placeholder={t("details.modelPurposePlaceholder")}
+										minRows={2}
+										value={modelPurposes[type]?.[model] ?? ""}
+										onChange={(event) =>
+											setModelPurposes((old) => ({
+												...old,
+												[type]: { ...(old[type] ?? {}), [model]: event.currentTarget.value },
+											}))
+										}
+									/>
+								))}
+							</Stack>
+						))}
+						<Group justify="flex-end" gap="xs">
+							<Button
+								variant="default"
+								size="xs"
+								loading={clearSubagentModelsMutation.isPending}
+								onClick={handleClearSubagentModels}
+							>
+								{t("details.clearTrait")}
+							</Button>
+							<Button
+								size="xs"
+								loading={updateSubagentModelsMutation.isPending}
+								onClick={handleSaveSubagentModels}
+							>
+								{tc("save")}
+							</Button>
+						</Group>
+					</Stack>
+					<Divider />
+					<Stack gap="xs">
+						<Text size="sm" fw={600}>
+							{t("details.toolRestriction")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("details.toolRestrictionDesc")}
+						</Text>
+						<MultiSelect
+							data={toolOptions}
+							searchable
+							clearable
+							value={disabledToolSelection}
+							onChange={setDisabledToolSelection}
+							placeholder={t("details.disabledToolsPlaceholder")}
+						/>
+						<Group justify="flex-end" gap="xs">
+							<Button
+								variant="default"
+								size="xs"
+								loading={clearDisabledToolsMutation.isPending}
+								onClick={handleClearDisabledTools}
+							>
+								{t("details.clearTrait")}
+							</Button>
+							<Button
+								size="xs"
+								loading={updateDisabledToolsMutation.isPending}
+								onClick={handleSaveDisabledTools}
+							>
+								{tc("save")}
+							</Button>
+						</Group>
+					</Stack>
+				</Stack>
 			</DetailSection>
 
 			<DetailSection title={t("details.relationships")}>

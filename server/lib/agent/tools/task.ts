@@ -29,7 +29,10 @@ function getAvailableModelsList(): string {
 }
 
 /** When per-type pool restrictions are active, append a note to the model parameter description. */
-function getSubagentPoolNote(): string {
+function getSubagentPoolNote(config?: AgentConfig): string {
+	if (config?.subagentModelRestrictionDescription) {
+		return `\n\n${config.subagentModelRestrictionDescription}`;
+	}
 	const pools = settings.agent.subagentAllowedModels;
 	if (!pools) return "";
 	const parts: string[] = [];
@@ -41,6 +44,13 @@ function getSubagentPoolNote(): string {
 	}
 	if (parts.length === 0) return "";
 	return `\n\nNote: Subagent model selection is restricted per type. Allowed models — ${parts.join("; ")}. Models outside the pool for a given type will be ignored.`;
+}
+
+function getModelParameterDescription(config?: AgentConfig): string {
+	const list = config?.subagentModelRestrictionDescription
+		? "see custom restriction below"
+		: getAvailableModelsList();
+	return `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${list}${getSubagentPoolNote(config)}`;
 }
 
 function buildParameters() {
@@ -61,12 +71,7 @@ function buildParameters() {
 			.describe(
 				"Set to true to run this agent in the background. You will be notified when it completes.",
 			),
-		model: z
-			.string()
-			.optional()
-			.describe(
-				`Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
-			),
+		model: z.string().optional().describe(getModelParameterDescription()),
 		reasoning_effort: z
 			.enum(REASONING_EFFORT_VALUES)
 			.optional()
@@ -116,7 +121,7 @@ export const agentTool: ToolDefinition = {
 	get parameters() {
 		return buildParameters();
 	},
-	get rawJsonSchema() {
+	getRawJsonSchema(config: AgentConfig) {
 		return {
 			type: "object" as const,
 			properties: {
@@ -136,7 +141,7 @@ export const agentTool: ToolDefinition = {
 					type: "boolean",
 				},
 				model: {
-					description: `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${getAvailableModelsList()}${getSubagentPoolNote()}`,
+					description: getModelParameterDescription(config),
 					type: "string",
 				},
 				reasoning_effort: {

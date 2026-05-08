@@ -760,6 +760,65 @@ export function useUpdateCwd() {
 	});
 }
 
+export function useNarratorCustomTraits(id: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrators", id, "custom-traits"],
+		queryFn: () => api.getCustomTraits(id),
+		enabled: !!id && enabled,
+	});
+}
+
+export function useUpdateSubagentModelRestriction() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			pools,
+		}: {
+			id: string;
+			pools: Record<string, { model: string; purpose?: string }[]>;
+		}) => api.updateSubagentModelRestriction(id, pools),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+		},
+	});
+}
+
+export function useClearSubagentModelRestriction() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearSubagentModelRestriction(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+		},
+	});
+}
+
+export function useUpdateDisabledTools() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, tools }: { id: string; tools: string[] }) =>
+			api.updateDisabledTools(id, tools),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id, "custom-traits"] });
+		},
+	});
+}
+
+export function useClearDisabledTools() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.clearDisabledTools(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+			qc.invalidateQueries({ queryKey: ["narrators", id, "custom-traits"] });
+		},
+	});
+}
+
 export function useUpdatePruneEnabled() {
 	const qc = useQueryClient();
 	return useMutation({

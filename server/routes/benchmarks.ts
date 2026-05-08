@@ -5,50 +5,108 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { logger } from "../lib/logger";
 import { permissionModeSchema } from "../lib/permission-modes";
+import { requireAdmin } from "../middleware/auth";
 import {
 	cancelRun,
 	compareRuns,
 	createRun,
 	createSuite,
-	executeRun,
 	getRun,
 	getRunResults,
 	getRunSummary,
 	getSuite,
 	listRuns,
 	listSuites,
+	startRun,
 } from "../services/benchmark-service";
 
 export const benchmarkRoutes = new Hono();
 
+// Benchmarks can execute model- or suite-provided code. Keep the entire surface admin-only.
+benchmarkRoutes.use("*", requireAdmin);
+
 // ── Suite endpoints ─────────────────────────────────────────────────
 
-const createSuiteSchema = z.object({
-	name: z.string().min(1),
-	version: z.string().optional(),
-	description: z.string().optional(),
-	tasks: z.array(
-		z.object({
-			id: z.string(),
-			name: z.string(),
-			prompt: z.string(),
-			language: z.string().optional(),
-			expectedOutput: z.string().optional(),
-			testCode: z.string().optional(),
-			rubric: z
-				.array(
-					z.object({
-						name: z.string(),
-						description: z.string(),
-						maxPoints: z.number(),
-					}),
-				)
-				.optional(),
-			metadata: z.record(z.string(), z.unknown()).optional(),
-			timeoutMs: z.number().optional(),
-		}),
-	),
+const MAX_TASKS_PER_SUITE = 1_000;
+const MAX_PROMPT_CHARS = 200_000;
+const MAX_TEST_CODE_CHARS = 500_000;
+const MAX_OUTPUT_CHARS = 500_000;
+const MAX_METADATA_JSON_CHARS = 200_000;
+const MAX_SUITE_JSON_CHARS = 20_000_000;
+
+function jsonSize(value: unknown): number {
+	try {
+		return JSON.stringify(value).length;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
+const metadataSchema = z
+	.record(z.string().max(100), z.unknown())
+	.refine((value) => jsonSize(value) <= MAX_METADATA_JSON_CHARS, {
+		message: `metadata must be <= ${MAX_METADATA_JSON_CHARS} JSON characters`,
+	});
+
+const benchmarkTaskSchema = z.object({
+	id: z
+		.string()
+		.min(1)
+		.max(120)
+		.regex(
+			/^[A-Za-z0-9._:-]+$/,
+			"Task ID may only contain letters, numbers, '.', '_', ':' and '-'",
+		),
+	name: z.string().min(1).max(300),
+	prompt: z.string().min(1).max(MAX_PROMPT_CHARS),
+	language: z.string().min(1).max(50).optional(),
+	expectedOutput: z.string().max(MAX_OUTPUT_CHARS).optional(),
+	testCode: z.string().max(MAX_TEST_CODE_CHARS).optional(),
+	rubric: z
+		.array(
+			z.object({
+				name: z.string().min(1).max(120),
+				description: z.string().min(1).max(5_000),
+				maxPoints: z.number().positive().max(1_000),
+			}),
+		)
+		.max(100)
+		.optional(),
+	metadata: metadataSchema.optional(),
+	timeoutMs: z
+		.number()
+		.int()
+		.positive()
+		.max(24 * 60 * 60 * 1000)
+		.optional(),
 });
+
+const createSuiteSchema = z
+	.object({
+		name: z.string().min(1).max(120),
+		version: z.string().min(1).max(120).optional(),
+		description: z.string().max(2_000).optional(),
+		tasks: z.array(benchmarkTaskSchema).min(1).max(MAX_TASKS_PER_SUITE),
+	})
+	.superRefine((suite, ctx) => {
+		const seenTaskIds = new Set<string>();
+		for (const [index, task] of suite.tasks.entries()) {
+			if (seenTaskIds.has(task.id)) {
+				ctx.addIssue({
+					code: "custom",
+					message: `Duplicate task ID: ${task.id}`,
+					path: ["tasks", index, "id"],
+				});
+			}
+			seenTaskIds.add(task.id);
+		}
+		if (jsonSize(suite) > MAX_SUITE_JSON_CHARS) {
+			ctx.addIssue({
+				code: "custom",
+				message: `Suite payload must be <= ${MAX_SUITE_JSON_CHARS} JSON characters`,
+			});
+		}
+	});
 
 benchmarkRoutes.post("/suites", async (c) => {
 	const body = await c.req.json();
@@ -72,12 +130,12 @@ benchmarkRoutes.get("/suites/:id", async (c) => {
 // ── Run endpoints ───────────────────────────────────────────────────
 
 const createRunSchema = z.object({
-	suiteId: z.string(),
-	name: z.string().min(1),
-	model: z.string().min(1),
-	systemPrompt: z.string().optional(),
+	suiteId: z.string().min(1).max(120),
+	name: z.string().min(1).max(120),
+	model: z.string().min(1).max(200),
+	systemPrompt: z.string().max(100_000).optional(),
 	permissionMode: permissionModeSchema.optional(),
-	config: z.record(z.string(), z.unknown()).optional(),
+	config: metadataSchema.optional(),
 });
 
 benchmarkRoutes.post("/runs", async (c) => {
@@ -107,23 +165,23 @@ benchmarkRoutes.get("/runs/:id", async (c) => {
 benchmarkRoutes.post("/runs/:id/start", async (c) => {
 	const runId = c.req.param("id");
 	try {
-		// Fire-and-forget: executeRun does atomic status claim internally
-		executeRun(runId).catch((err) => {
-			logger.error("Benchmark run execution failed", { runId, error: String(err) });
-		});
-		return c.json({ ok: true, message: "Run started" });
+		const run = await startRun(runId);
+		return c.json({ ok: true, message: "Run started", runId: run.id, status: run.status });
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		if (msg.includes("not found")) return c.json({ error: msg }, 404);
-		if (msg.includes("already") || msg.includes("not pending")) return c.json({ error: msg }, 409);
+		logger.warn("Benchmark run start rejected", { runId, error: msg });
+		if (msg.includes("not found") || msg.includes("Suite not found"))
+			return c.json({ error: msg }, 404);
+		if (msg.includes("not pending")) return c.json({ error: msg }, 409);
 		return c.json({ error: msg }, 400);
 	}
 });
 
 benchmarkRoutes.post("/runs/:id/cancel", async (c) => {
 	const runId = c.req.param("id");
-	const cancelled = cancelRun(runId);
-	if (!cancelled) return c.json({ error: "Run is not active" }, 404);
+	const result = await cancelRun(runId);
+	if (result === "not_found") return c.json({ error: "Run not found" }, 404);
+	if (result === "not_cancellable") return c.json({ error: "Run is not pending or running" }, 409);
 	return c.json({ ok: true, message: "Run cancellation requested" });
 });
 

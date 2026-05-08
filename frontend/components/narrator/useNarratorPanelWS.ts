@@ -2123,6 +2123,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, planMode, ...(traits ? { traits } : {}) } : old,
 				);
 			},
+			onCustomTraitsChanged: (traits) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, ...(traits ? { traits } : {}) } : old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", narratorId, "custom-traits"] });
+			},
 			onRelaxedPlanChanged: (relaxedPlan) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, relaxedPlan } : old,

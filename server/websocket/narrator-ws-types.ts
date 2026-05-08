@@ -165,6 +165,7 @@ export type NarratorServerMessage =
 			reasoningEffort?: string | null;
 	  }
 	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean; traits: string[] }
+	| { type: "custom_traits_changed"; narratorId: string; traits: string[]; customTraits: unknown }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }

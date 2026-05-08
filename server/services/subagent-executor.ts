@@ -4,6 +4,7 @@ import { type AgentConfig, buildHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	isAnthropicProvider,
@@ -392,9 +393,12 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	const initialNarrator = await narratorService.getById(narratorId);
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastMode = initialNarrator.fastMode ?? false;
+	const disabledTools = getDisabledToolSet(initialNarrator.traits);
 
 	// Resolve tool filter for this subagent type using pre-loaded customDef
-	const toolFilter = resolveToolFilter(subagentType, opts.customDef);
+	const baseToolFilter = resolveToolFilter(subagentType, opts.customDef);
+	const toolFilter = (tool: import("../lib/agent").ToolDefinition) =>
+		!disabledTools.has(tool.name) && (!baseToolFilter || baseToolFilter(tool));
 
 	while (true) {
 		const eventContext = buildSubagentEventContext(
@@ -453,6 +457,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,
+			disabledTools,
 			toolFilter,
 			permissionHandler: (toolName, permInput, permToolUseId) =>
 				handlePermission(

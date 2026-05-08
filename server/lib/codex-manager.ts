@@ -265,6 +265,7 @@ export class CodexManager {
 
 	async acquireContext(sessionKey?: string): Promise<CallContext> {
 		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
 		const total = this.entries.length;
 		const triedIds = new Set<string>();
@@ -514,6 +515,30 @@ export class CodexManager {
 		return this.entries.some((e) => !e.disabled);
 	}
 
+	async reportQuotaExhaustedAndRefreshUsage(id: string, resetsAt?: number): Promise<boolean> {
+		this.reportQuotaExhausted(id, resetsAt);
+		try {
+			await this.refreshUsageDeduplicated(id);
+		} catch (err) {
+			logger.warn("Codex usage refresh after quota error failed", {
+				credentialId: id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+
+		const entry = this.entries.find((e) => e.id === id);
+		if (entry?.disabledReason !== "quota_exhausted") {
+			const refreshedQuotaState = entry?.usage
+				? this.evaluateQuotaFromUsage(entry.usage)
+				: undefined;
+			this.reportQuotaExhausted(
+				id,
+				refreshedQuotaState?.exhausted ? refreshedQuotaState.resetsAt : resetsAt,
+			);
+		}
+		return this.entries.some((e) => !e.disabled);
+	}
+
 	markBanned(id: string): boolean {
 		const stats = this.stats.get(id) ?? { successCount: 0, failureCount: 0 };
 		stats.failureCount = MAX_FAILURES_PER_CREDENTIAL;
@@ -705,6 +730,7 @@ export class CodexManager {
 
 	getPublicQuotaOverview(): PublicCodexQuotaOverview {
 		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
 
 		const now = Date.now();
@@ -774,6 +800,7 @@ export class CodexManager {
 
 	snapshot(opts?: SnapshotOptions): ManagerSnapshot {
 		this.reviveQuotaResetCredentials();
+		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
 
 		const mapEntry = (e: CodexCredential): CredentialSnapshot => {
@@ -1070,21 +1097,56 @@ export class CodexManager {
 		return now >= effectiveDeadline;
 	}
 
-	private evaluateQuotaFromUsage(usage: CodexUsageResult): {
+	private evaluateQuotaFromUsage(
+		usage: CodexUsageResult,
+		now = Date.now(),
+	): {
 		exhausted: boolean;
 		resetsAt?: number;
+		windowType?: "5h" | "weekly" | "unknown";
 	} {
 		const exhaustedWindows = [usage.primary_window, usage.secondary_window].filter(
-			(window): window is NonNullable<CodexUsageResult["primary_window"]> =>
-				!!window && window.remaining_percent <= 0,
+			(window): window is NonNullable<CodexUsageResult["primary_window"]> => {
+				if (!window) return false;
+				const resetAt = window.reset_at * 1000;
+				return window.remaining_percent <= 0 && Number.isFinite(resetAt) && resetAt > now;
+			},
 		);
 		if (exhaustedWindows.length === 0) return { exhausted: false };
 
+		const weeklyWindow = exhaustedWindows.find((window) => window.window_type === "weekly");
+		const blockingWindow = weeklyWindow ?? exhaustedWindows[0];
 		const resetAtCandidates = exhaustedWindows
 			.map((window) => window.reset_at * 1000)
 			.filter((resetAt) => Number.isFinite(resetAt));
 		const resetsAt = resetAtCandidates.length > 0 ? Math.max(...resetAtCandidates) : undefined;
-		return { exhausted: true, resetsAt };
+		return { exhausted: true, resetsAt, windowType: blockingWindow?.window_type };
+	}
+
+	private applyCachedQuotaStates(now = Date.now()): boolean {
+		let changed = false;
+		for (const entry of this.entries) {
+			if (entry.disabled || !entry.usage) continue;
+			const quotaState = this.evaluateQuotaFromUsage(entry.usage, now);
+			if (!quotaState.exhausted) continue;
+			entry.disabled = true;
+			entry.disabledReason = "quota_exhausted";
+			entry.quotaResetsAt = quotaState.resetsAt ?? entry.quotaResetsAt;
+			this.evictSessionsByCredential(entry.id);
+			changed = true;
+			logger.warn("Codex credential skipped due to cached exhausted quota", {
+				credentialId: entry.id,
+				accountId: entry.accountId,
+				resetsAt: quotaState.resetsAt,
+				windowType: quotaState.windowType,
+			});
+		}
+		if (changed) {
+			this.saveCredentials();
+			this.rescheduleUsageRefresh();
+			this.schedulePublicQuotaOverviewBroadcast();
+		}
+		return changed;
 	}
 
 	private clearQuotaExhaustedIfRecovered(id: string, entry: CodexCredential): boolean {

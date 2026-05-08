@@ -83,6 +83,17 @@ export const DEFAULTS: NarraForkSettings = {
 		checkIntervalMinutes: 60,
 		autoDownload: false,
 	},
+	vnet: {
+		enabled: true,
+		allowAnonymousRelay: false,
+		maxPeersPerNetwork: 64,
+		maxMessageBytes: 1024 * 1024,
+		udp: {
+			enabled: true,
+			host: "0.0.0.0",
+			port: 0,
+		},
+	},
 	shares: {
 		defaultExpiryHours: 24,
 		maxFileSizeMb: 4096,
@@ -133,6 +144,40 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"paths.defaultProjectDir": {
 		desc: "默认项目目录。新建项目时的默认父目录。",
 		type: "string",
+	},
+
+	// ── vnet ────────────────────────────────────────────────────────────
+	"vnet.enabled": {
+		desc: "启用应用层虚拟网络 relay。用于 Bun 应用间通过虚拟地址通信。",
+		type: "boolean",
+	},
+	"vnet.relayToken": {
+		desc: "外部 Bun 应用连接 /ws/vnet 时可使用的共享 relay token。为空时仅支持 JWT 或显式匿名。",
+		type: "string",
+	},
+	"vnet.allowAnonymousRelay": {
+		desc: "是否允许无 JWT/无 relayToken 的 vnet relay 连接。默认关闭，仅建议本地实验使用。",
+		type: "boolean",
+	},
+	"vnet.maxPeersPerNetwork": {
+		desc: "单个虚拟网络允许的最大 peer 数。",
+		type: "number",
+	},
+	"vnet.maxMessageBytes": {
+		desc: "单个 vnet relay 消息的最大字节数。",
+		type: "number",
+	},
+	"vnet.udp.enabled": {
+		desc: "是否启用 UDP rendezvous / 基础打洞。失败时自动降级为 relay-only。",
+		type: "boolean",
+	},
+	"vnet.udp.host": {
+		desc: "UDP rendezvous 监听地址。",
+		type: "string",
+	},
+	"vnet.udp.port": {
+		desc: "UDP rendezvous 监听端口。0 表示自动分配。",
+		type: "number",
 	},
 
 	// ── agent ───────────────────────────────────────────────────────────

@@ -30,6 +30,7 @@ import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { isSubagentVariant, parseTraits, subagentVariant } from "../lib/narrator-utils";
 import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
@@ -140,6 +141,7 @@ interface CreateSubagentInput {
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	systemPrompt?: string;
+	inheritedTraits?: string[];
 }
 
 function formatAvailableOptionalToolIds(): string {
@@ -166,6 +168,15 @@ export async function handleLoadToolCommand(
 		return { toolName: toolId, loaded: false, alreadyLoaded: false };
 	}
 	const toolName = cmdResult.loadTool;
+	const currentNarrator = await narratorService.getById(narratorId);
+	if (getDisabledToolSet(currentNarrator.traits).has(toolName)) {
+		const infoText =
+			locale === "zh-CN"
+				? `⛔ 工具已被此叙述者的自定义 trait 禁用：${toolName}`
+				: `⛔ Tool disabled by this narrator's custom trait: ${toolName}`;
+		await narratorService.persistDisplayMessage(narratorId, infoText);
+		return { toolName, loaded: false, alreadyLoaded: false };
+	}
 
 	// Admin-only tool check
 	if (toolName === "NarraForkAdmin") {
@@ -616,7 +627,10 @@ export const narratorService = {
 				: input.reasoningEffort;
 
 		const subChapterId = parent.chapterId ?? null;
-		const subTraits: string[] = subChapterId === null ? ["standalone"] : [];
+		const subTraits: string[] = [
+			...(subChapterId === null ? ["standalone"] : []),
+			...(input.inheritedTraits ?? []),
+		];
 
 		const [narrator] = await db
 			.insert(narrators)
