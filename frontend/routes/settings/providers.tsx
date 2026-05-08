@@ -5,12 +5,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
 import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
+import {
+	CUSTOM_API_PROTOCOL_LABEL_KEYS,
+	CustomApiProviderSection,
+} from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
-import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
@@ -120,26 +122,18 @@ function SettingsProvidersPage() {
 	}, [search.oauth_success, search.oauth_error, qc, t]);
 
 	// Per-provider dirty checkers
-	const openaiDirtyProviderIds = useMemo(
-		() => getDirtyProviderIds(state.openaiProviders, savedProviderSnapshot.openaiProviders),
-		[state.openaiProviders, savedProviderSnapshot],
-	);
-	const anthropicDirtyProviderIds = useMemo(
-		() => getDirtyProviderIds(state.anthropicProviders, savedProviderSnapshot.anthropicProviders),
-		[state.anthropicProviders, savedProviderSnapshot],
+	const customApiDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.customApiProviders, savedProviderSnapshot.customApiProviders),
+		[state.customApiProviders, savedProviderSnapshot],
 	);
 	);
 	const nugDirtyProviderIds = useMemo(
 		() => getDirtyProviderIds(state.nugProviders, savedProviderSnapshot.nugProviders),
 		[state.nugProviders, savedProviderSnapshot],
 	);
-	const isOpenaiProviderDirty = useCallback(
-		(providerId: string) => openaiDirtyProviderIds.has(providerId),
-		[openaiDirtyProviderIds],
-	);
-	const isAnthropicProviderDirty = useCallback(
-		(providerId: string) => anthropicDirtyProviderIds.has(providerId),
-		[anthropicDirtyProviderIds],
+	const isCustomApiProviderDirty = useCallback(
+		(providerId: string) => customApiDirtyProviderIds.has(providerId),
+		[customApiDirtyProviderIds],
 	);
 	);
 	const isNugProviderDirty = useCallback(
@@ -157,20 +151,13 @@ function SettingsProvidersPage() {
 	const allPrefixToId = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const p of [
-			...state.openaiProviders,
-			...state.anthropicProviders,
+			...state.customApiProviders,
 			...state.nugProviders,
 			...clineProviderPrefixes,
 		]) {
 			if (p.prefix) map.set(p.prefix, p.id);
 		}
 		return map;
-	}, [
-		state.openaiProviders,
-		state.anthropicProviders,
-		state.nugProviders,
-		clineProviderPrefixes,
-	]);
 	const getPrefixError = useCallback(
 		(prefix: string, currentProviderId: string): string | undefined => {
 			if (!prefix) return undefined;
@@ -202,8 +189,7 @@ function SettingsProvidersPage() {
 		const migratedWindows = { ...state.modelContextWindows };
 		const snap = savedSnapshot.current;
 		for (const providers of [
-			{ cur: state.openaiProviders, saved: snap.openaiProviders },
-			{ cur: state.anthropicProviders, saved: snap.anthropicProviders },
+			{ cur: state.customApiProviders, saved: snap.customApiProviders },
 			{ cur: state.nugProviders, saved: snap.nugProviders },
 		]) {
 			for (const provider of providers.cur) {
@@ -221,16 +207,15 @@ function SettingsProvidersPage() {
 				}
 			}
 		}
-		const normalizedAnthropicProviders = state.anthropicProviders.map((provider) => ({
+		const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 			...provider,
 			proxy: normalizeProxyUrl(provider.proxy) ?? "",
 		}));
-		const normalizedState = { ...state, anthropicProviders: normalizedAnthropicProviders };
+		const normalizedState = { ...state, customApiProviders: normalizedCustomApiProviders };
 		pendingSnapshot.current = createSnapshot(normalizedState);
-		dispatchers.setAnthropicProviders(normalizedAnthropicProviders);
+		dispatchers.setCustomApiProviders(normalizedCustomApiProviders);
 		updateMutation.mutate({
-			openaiProviders: state.openaiProviders,
-			anthropicProviders: normalizedAnthropicProviders,
+			customApiProviders: normalizedCustomApiProviders,
 			nugProviders: state.nugProviders,
 			agent: {
 				hiddenModels: [...state.hiddenModels],
@@ -267,7 +252,7 @@ function SettingsProvidersPage() {
 					]);
 					break;
 				case "openai":
-					dispatchers.setOpenaiProviders((prev) => [
+					dispatchers.setCustomApiProviders((prev) => [
 						...prev,
 						{
 							id,
@@ -276,13 +261,16 @@ function SettingsProvidersPage() {
 							apiKey: "",
 							baseUrl: "",
 							defaultModel: "",
-							apiMode: "completions" as const,
+							protocol: "completions-compatible" as const,
 							codexAccountId: "",
+							codexWebSocket: false,
+							proxy: "",
+							tlsRejectUnauthorized: true,
 						},
 					]);
 					break;
 				case "anthropic":
-					dispatchers.setAnthropicProviders((prev) => [
+					dispatchers.setCustomApiProviders((prev) => [
 						...prev,
 						{
 							id,
@@ -291,7 +279,11 @@ function SettingsProvidersPage() {
 							apiKey: "",
 							baseUrl: "",
 							defaultModel: "",
+							protocol: "anthropic-compatible" as const,
+							codexAccountId: "",
+							codexWebSocket: false,
 							proxy: "",
+							tlsRejectUnauthorized: true,
 						},
 					]);
 					break;
@@ -443,9 +435,8 @@ function SettingsProvidersPage() {
 		const byPrefix = new Map<string, ModelOption[]>();
 
 		const getBadgeLabel = (prefix: string): string | undefined => {
-			const openaiProvider = state.openaiProviders.find((p) => p.prefix === prefix);
-			if (openaiProvider) return openaiProvider.apiMode ?? "responses";
-			if (state.anthropicProviders.some((p) => p.prefix === prefix)) return "anthropic";
+			const customApiProvider = state.customApiProviders.find((p) => p.prefix === prefix);
+			if (customApiProvider) return t(CUSTOM_API_PROTOCOL_LABEL_KEYS[customApiProvider.protocol]);
 			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
 			return undefined;
 		};
@@ -476,8 +467,7 @@ function SettingsProvidersPage() {
 		// Ensure platform providers always present
 		for (const p of platformPrefixes) ensureEmpty(p);
 		// Ensure multi-instance providers always present (even disabled)
-		for (const p of state.openaiProviders) ensureEmpty(p.prefix);
-		for (const p of state.anthropicProviders) ensureEmpty(p.prefix);
+		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
 		return [...byPrefix].map(([prefix, models]) => {
@@ -488,8 +478,7 @@ function SettingsProvidersPage() {
 			let providerId: string | undefined;
 			if (!isPlatform) {
 				const match =
-					state.openaiProviders.find((p) => p.prefix === prefix) ??
-					state.anthropicProviders.find((p) => p.prefix === prefix) ??
+					state.customApiProviders.find((p) => p.prefix === prefix) ??
 					state.nugProviders.find((p) => p.prefix === prefix);
 				providerId = match?.id;
 			}
@@ -511,9 +500,9 @@ function SettingsProvidersPage() {
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
-		state.openaiProviders,
-		state.anthropicProviders,
+		state.customApiProviders,
 		state.nugProviders,
+		t,
 	]);
 
 	// ── Provider label for detail panel ──
@@ -524,15 +513,13 @@ function SettingsProvidersPage() {
 		}
 		// Multi-instance providers: selectedProvider is the provider ID
 		const p =
-			state.openaiProviders.find((p) => p.id === selectedProvider) ??
-			state.anthropicProviders.find((p) => p.id === selectedProvider) ??
+			state.customApiProviders.find((p) => p.id === selectedProvider) ??
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
 		return "";
 	}, [
 		selectedProvider,
-		state.openaiProviders,
-		state.anthropicProviders,
+		state.customApiProviders,
 		state.nugProviders,
 		providerLabels,
 	]);
@@ -555,8 +542,7 @@ function SettingsProvidersPage() {
 						providerModelsMap={providerModelsMap}
 						anthropicModelsMap={anthropicModelsMap}
 						nugModelsMap={nugModelsMap}
-						isOpenaiProviderDirty={isOpenaiProviderDirty}
-						isAnthropicProviderDirty={isAnthropicProviderDirty}
+						isCustomApiProviderDirty={isCustomApiProviderDirty}
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
 						onTestModel={setTestingModel}
@@ -663,8 +649,7 @@ interface ProviderSectionContentProps {
 	providerModelsMap: Record<string, ModelOption[]>;
 	anthropicModelsMap: Record<string, ModelOption[]>;
 	nugModelsMap: Record<string, ModelOption[]>;
-	isOpenaiProviderDirty: (id: string) => boolean;
-	isAnthropicProviderDirty: (id: string) => boolean;
+	isCustomApiProviderDirty: (id: string) => boolean;
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	onTestModel: (model: string) => void;
@@ -679,8 +664,7 @@ function ProviderSectionContent({
 	providerModelsMap,
 	anthropicModelsMap,
 	nugModelsMap,
-	isOpenaiProviderDirty,
-	isAnthropicProviderDirty,
+	isCustomApiProviderDirty,
 	isNugProviderDirty,
 	getPrefixError,
 	onTestModel,
@@ -729,39 +713,20 @@ function ProviderSectionContent({
 	}
 
 	// Multi-instance providers: matched by ID (immutable, survives prefix edits)
-	const openaiMatch = state.openaiProviders.find((p) => p.id === providerKey);
-	if (openaiMatch) {
+	const customApiMatch = state.customApiProviders.find((p) => p.id === providerKey);
+	if (customApiMatch) {
 		return (
-			<OpenAIProvidersSection
-				providers={[openaiMatch]}
-				onProvidersChange={dispatchers.setOpenaiProviders}
-				providerModelsMap={providerModelsMap}
+			<CustomApiProviderSection
+				provider={customApiMatch}
+				onProvidersChange={dispatchers.setCustomApiProviders}
+				openAIProviderModelsMap={providerModelsMap}
+				anthropicProviderModelsMap={anthropicModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
-				isProviderDirty={isOpenaiProviderDirty}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				getPrefixError={getPrefixError}
-				onTestModel={onTestModel}
-			/>
-		);
-	}
-	const anthropicMatch = state.anthropicProviders.find((p) => p.id === providerKey);
-	if (anthropicMatch) {
-		return (
-			<AnthropicProvidersSection
-				providers={[anthropicMatch]}
-				onProvidersChange={dispatchers.setAnthropicProviders}
-				providerModelsMap={anthropicModelsMap}
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				onBatchToggleHidden={dispatchers.batchToggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				isProviderDirty={isAnthropicProviderDirty}
+				isProviderDirty={isCustomApiProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}

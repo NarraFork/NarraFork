@@ -10,10 +10,22 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
+import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
 import type { NarraForkSettings } from "./types";
 
+export {
+	customApiProtocolFromAnthropic,
+	customApiProtocolFromOpenAI,
+	customApiProtocolToOpenAIApiMode,
+	customApiProvidersToAnthropic,
+	customApiProvidersToOpenAI,
+	deriveCustomApiProvidersFromLegacy,
+	isAnthropicCustomApiProtocol,
+	isOpenAICustomApiProtocol,
+	normalizeCustomApiProviderSettings,
+} from "./custom-api-providers";
 export { DEFAULTS, SETTING_DOCS } from "./defaults";
 export {
 	_bindSettings,
@@ -258,6 +270,13 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		}
 	}
 
+	if (!Array.isArray((raw as { customApiProviders?: unknown }).customApiProviders)) {
+		merged.customApiProviders = undefined;
+	}
+	if (normalizeCustomApiProviderSettings(merged)) {
+		needsSave = true;
+	}
+
 	if (migrateLegacyMcpBehaviors(merged)) {
 		needsSave = true;
 	}
@@ -422,6 +441,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 }
 
 export function saveSettings(newSettings: NarraForkSettings): void {
+	normalizeCustomApiProviderSettings(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	mkdirSync(narraforkDir, { recursive: true });
 	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));

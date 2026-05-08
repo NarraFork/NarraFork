@@ -62,11 +62,17 @@ export function getAnthropicCachedModelsByProvider(providerId: string): Anthropi
 	return cachedModelsByProvider.get(providerId) ?? [];
 }
 
-/** Get all cached models across all providers. */
+function activeAnthropicProviderIds(): Set<string> {
+	return new Set((settings.anthropicProviders ?? []).filter((p) => !p.disabled).map((p) => p.id));
+}
+
+/** Get all cached models across active providers. */
 export function getAnthropicCachedModels(): AnthropicModelInfo[] {
+	const providerIds = activeAnthropicProviderIds();
 	const seen = new Set<string>();
 	const result: AnthropicModelInfo[] = [];
-	for (const models of cachedModelsByProvider.values()) {
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		for (const m of models) {
 			if (!seen.has(m.id)) {
 				seen.add(m.id);
@@ -95,7 +101,9 @@ export function getAnthropicCachedModelsGrouped(): Array<{
 
 // Register model checker and lister
 registerAnthropicModelChecker((model) => {
-	for (const models of cachedModelsByProvider.values()) {
+	const providerIds = activeAnthropicProviderIds();
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		if (models.some((m) => m.id === model)) return true;
 	}
 	return false;

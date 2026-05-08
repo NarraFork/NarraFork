@@ -46,6 +46,7 @@ const testProvider: ProviderAdapter = {
 };
 
 mock.module("../provider", () => ({
+	getProvider: () => testProvider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
 		requestedModel: "test:model",
@@ -105,6 +106,34 @@ describe("agentLoop abort result draining", () => {
 
 		const lastEvent = events.at(-1);
 		expect(lastEvent).toEqual({ type: "error", message: "Aborted" });
+	});
+
+	test("宽松计划模式下非只读工具结果会注入计划提醒 sidecar", async () => {
+		providerScenario = "abort";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(
+			makeConfig(ac.signal, { planMode: true, relaxedPlan: true }),
+			"run tools while planning",
+			[],
+		)) {
+			events.push(event);
+			if (event.type === "stream_text") {
+				ac.abort();
+			}
+		}
+
+		const toolResult = events.find(
+			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
+				event.type === "tool_result",
+		);
+		expect(toolResult?.sideCars?.some((sideCar) => sideCar.source === "relaxed_plan")).toBe(true);
+		expect(
+			toolResult?.sideCars?.some((sideCar) => sideCar.content.includes("<relaxed_plan_reminder>")),
+		).toBe(true);
+		expect(toolResult?.output).not.toContain("<relaxed_plan_reminder>");
 	});
 
 	test("工具执行已启动后遇到 retryable 截断流时不重试并保留结果", async () => {

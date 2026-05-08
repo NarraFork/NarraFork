@@ -51,6 +51,8 @@ export interface ImageRef {
 	imageId: string;
 	filename: string;
 	mediaType: string;
+	/** Original narrator that owns the uploaded image file. */
+	uploadNarratorId?: string;
 }
 
 export async function saveUploadedImage(narratorId: string, file: File): Promise<ImageRef> {

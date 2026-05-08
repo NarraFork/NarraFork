@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { narratorGoalService } from "../../../services/narrator-goal-service";
 import type { ToolDefinition, ToolResult } from "../types";
+import { consumeGoalCompletionReflectionGrant } from "./goal-reflection";
 
 function formatGoals(goals: Awaited<ReturnType<typeof narratorGoalService.listGoals>>): string {
 	if (goals.length === 0) return "No goals are currently set.";
@@ -59,13 +60,20 @@ export const addGoalTool: ToolDefinition = {
 export const updateGoalTool: ToolDefinition = {
 	name: "UpdateGoal",
 	description:
-		"Update the current active goal. Use this tool only to mark the active goal complete when the objective has actually been achieved and no required work remains.",
+		"Update the current active goal. This tool can only mark the active goal complete after NarraFork has run a separate goal-completion reflection gate that verifies the user-provided objective is actually achieved and no required work remains.",
 	parameters: z.object({
 		status: z
 			.literal("complete")
 			.describe("Set to complete only when the active goal is achieved."),
 	}),
 	async execute(_args, ctx): Promise<ToolResult> {
+		if (!consumeGoalCompletionReflectionGrant(ctx.narratorId, ctx.currentToolUseId)) {
+			return {
+				output:
+					"UpdateGoal was blocked: completing a user-set goal requires a successful NarraFork goal-completion reflection check first. Continue working or gather concrete verification evidence before trying again.",
+				isError: true,
+			};
+		}
 		const result = await narratorGoalService.completeActiveGoal(ctx.narratorId);
 		if (!result.completed) {
 			return { output: "No active goal exists to complete.", isError: true };

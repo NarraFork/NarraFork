@@ -21,7 +21,8 @@ export type PromptKey =
 	| "rebaseConflictResolution"
 	| "mergeSummary"
 	| "dangerReflection"
-	| "exitPlanReflection";
+	| "exitPlanReflection"
+	| "goalCompletionReflection";
 export type BuiltinSubagentType = "explore" | "plan" | "general";
 export type SubagentType = string;
 
@@ -269,6 +270,54 @@ Do not call ExitPlanMode from this reflection loop.`,
 - 如果计划还需要更多细节、存在未决选择，或应先修改再给用户审批，调用 ExitPlanRevise。
 如果你在这一次回复中没有调用任一工具，该计划提交将被视为需要修改。
 不要在这个反思 loop 中调用 ExitPlanMode。`,
+	},
+	goalCompletionReflection: {
+		en: `Goal-completion reflection: the narrator is attempting to mark a user-set goal complete.
+
+Pending reflection ID: {requestId}
+Original UpdateGoal input:
+{inputJson}
+
+Active goal:
+{activeGoalJson}
+
+Open goal list:
+{goalsJson}
+
+Your job is to prevent premature or lazy completion. Audit the active goal against the conversation and tool-result evidence available in this reflection loop.
+
+Confirm ONLY if every material requirement in the active goal is satisfied by concrete evidence, the result has been verified enough for the task's risk level, and no required work remains. Progress, intent, partial implementation, or a vague final statement is not enough.
+
+Reject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved.
+
+You have exactly one response, and you MUST call exactly one tool:
+- GoalCompleteConfirm if the active goal is actually achieved. Include objective-specific evidence.
+- GoalCompleteRevise if more work or verification is needed. Explain what is missing.
+If you do not call either tool in this one response, the goal completion will be rejected.
+Do not call UpdateGoal from this reflection loop.`,
+		"zh-CN": `目标完成反思：叙述者正在尝试把一个用户设定的目标标记为完成。
+
+待反思 ID：{requestId}
+原始 UpdateGoal 输入：
+{inputJson}
+
+当前活跃目标：
+{activeGoalJson}
+
+开放目标列表：
+{goalsJson}
+
+你的职责是防止过早或偷懒地完成目标。请根据这个 reflection loop 能看到的会话历史和工具结果证据，审计当前活跃目标是否真的达成。
+
+只有在当前活跃目标的每一项实质要求都有具体证据表明已满足、结果已按任务风险程度完成足够验证，并且没有剩余必做工作时，才能确认完成。仅有进展、意图、部分实现，或一句含糊的收尾说明，都不够。
+
+如果任何要求尚未验证、存在歧义、只是部分完成、仍被阻塞、依赖失败/缺失的检查，或会话中缺少具体证据，就必须拒绝完成。把不确定视为尚未达成。
+
+你只有一次回复机会，并且必须且只能调用一个工具：
+- 如果当前活跃目标确实已经达成，调用 GoalCompleteConfirm，并给出针对该目标的具体证据。
+- 如果还需要继续工作或补充验证，调用 GoalCompleteRevise，并说明缺少什么。
+如果你在这一次回复中没有调用任一工具，本次目标完成将被拒绝。
+不要在这个 reflection loop 中调用 UpdateGoal。`,
 	},
 	dangerReflection: {
 		en: `Danger reflection pause: a high-risk tool call is pending and has NOT executed yet.

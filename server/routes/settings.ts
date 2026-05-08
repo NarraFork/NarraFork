@@ -11,10 +11,16 @@ import { logger } from "../lib/logger";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
+	customApiProvidersToAnthropic,
+	customApiProvidersToOpenAI,
+	deriveCustomApiProvidersFromLegacy,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
 	getContextThresholds,
+	isAnthropicCustomApiProtocol,
+	isOpenAICustomApiProtocol,
 	type NarraForkSettings,
+	normalizeCustomApiProviderSettings,
 	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
 	saveSettings,
@@ -54,6 +60,31 @@ const webFetchProxyUrlSchema = z.preprocess(
 		.regex(/^(https?|socks4|socks5h?):\/\//)
 		.optional(),
 );
+
+const customApiProtocolSchema = z.enum([
+	"anthropic-official",
+	"anthropic-compatible",
+	"codex-native",
+	"responses-compatible",
+	"completions-compatible",
+]);
+
+const customApiProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	protocol: customApiProtocolSchema,
+	defaultContextWindow: z.number().int().min(1).optional(),
+	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+	proxy: proxyUrlSchema,
+	tlsRejectUnauthorized: z.boolean().optional(),
+	codexAccountId: z.string().optional(),
+	codexWebSocket: z.boolean().optional(),
+	disabled: z.boolean().optional(),
+});
 
 const openaiProviderSchema = z.object({
 	id: z.string().min(1),
@@ -290,6 +321,7 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		customApiProviders: z.array(customApiProviderSchema).optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
@@ -404,20 +436,68 @@ function getRemovedProviderIds(
 	return (oldList ?? []).filter((p) => !newIds.has(p.id)).map((p) => p.id);
 }
 
+function uniqueIds(ids: string[]): string[] {
+	return [...new Set(ids.filter(Boolean))];
+}
+
+function getCustomApiProviderIdsLeavingFamily(
+	prev: NarraForkSettings["customApiProviders"],
+	next: NarraForkSettings["customApiProviders"],
+	family: "openai" | "anthropic",
+): string[] {
+	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
+	return (prev ?? [])
+		.filter((provider) => {
+			const nextProvider = nextById.get(provider.id);
+			if (!nextProvider) return false;
+			if (family === "openai") {
+				return (
+					isOpenAICustomApiProtocol(provider.protocol) &&
+					!isOpenAICustomApiProtocol(nextProvider.protocol)
+				);
+			}
+			return (
+				isAnthropicCustomApiProtocol(provider.protocol) &&
+				!isAnthropicCustomApiProtocol(nextProvider.protocol)
+			);
+		})
+		.map((provider) => provider.id);
+}
+
 /**
  * After settings are saved, detect providers that were removed and purge their
  * in-memory + on-disk model caches so no stale data lingers.
  */
 function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSettings): void {
+	const removedCustomApiIds = getRemovedProviderIds(
+		prev.customApiProviders,
+		next.customApiProviders,
+	);
+	const staleOpenaiCustomApiIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsLeavingFamily(
+			prev.customApiProviders,
+			next.customApiProviders,
+			"openai",
+		),
+	]);
+	const staleAnthropicCustomApiIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsLeavingFamily(
+			prev.customApiProviders,
+			next.customApiProviders,
+			"anthropic",
+		),
+	]);
 	const purges: Array<{ type: string; ids: string[]; fn: (ids: string[]) => void }> = [
 		{
 			type: "openai",
-			ids: getRemovedProviderIds(prev.openaiProviders, next.openaiProviders),
+			ids: staleOpenaiCustomApiIds,
 			fn: purgeOpenaiProviderCache,
 		},
 		{
 			type: "anthropic",
-			ids: getRemovedProviderIds(prev.anthropicProviders, next.anthropicProviders),
+			ids: staleAnthropicCustomApiIds,
 			fn: purgeAnthropicProviderCache,
 		},
 		{
@@ -444,18 +524,24 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	// Collect prefixes of removed providers — needed to purge agent-level fields
 	// (summaryModel, hiddenModels, modelContextWindows, customModels) that reference stale models.
 	const removedPrefixes = new Set<string>();
-	for (const { ids } of purges) {
+	const removedProviderGroups = [
+		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
+		{
+		},
+		{
+			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
+			providers: prev.nugProviders,
+		},
+		{
+			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
+			providers: prev.clineProviders,
+		},
+	];
+	for (const { ids, providers } of removedProviderGroups) {
 		if (!ids.length) continue;
 		const idSet = new Set(ids);
-		for (const prov of [
-			prev.openaiProviders,
-			prev.anthropicProviders,
-			prev.nugProviders,
-			prev.clineProviders,
-		]) {
-			for (const p of prov ?? []) {
-				if (idSet.has(p.id)) removedPrefixes.add(p.prefix ?? "");
-			}
+		for (const p of providers ?? []) {
+			if (idSet.has(p.id)) removedPrefixes.add(p.prefix ?? "");
 		}
 	}
 	// Don't purge empty-prefix entries (would match everything)
@@ -484,6 +570,10 @@ settingsRoutes.get("/", (c) => {
 		},
 		auth: { ...s.auth, jwtSecret: undefined },
 		// Multi-provider — mask all keys
+		customApiProviders: (s.customApiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		openaiProviders: (s.openaiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
@@ -567,14 +657,20 @@ settingsRoutes.patch("/", async (c) => {
 	const current = settings;
 	const validated = parsed.data;
 
+	const effectiveCustomApiProviders =
+		validated.customApiProviders ??
+		deriveCustomApiProvidersFromLegacy(
+			validated.openaiProviders ?? current.openaiProviders,
+			validated.anthropicProviders ?? current.anthropicProviders,
+		);
+
 	// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 	{
 		const allPrefixes: Array<{ prefix: string; source: string }> = [];
-		for (const p of validated.openaiProviders ?? current.openaiProviders ?? []) {
-			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `OpenAI "${p.name || p.id}"` });
-		}
-		for (const p of validated.anthropicProviders ?? current.anthropicProviders ?? []) {
-			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Anthropic "${p.name || p.id}"` });
+		for (const p of effectiveCustomApiProviders) {
+			if (p.prefix) {
+				allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
+			}
 		}
 		}
 		for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
@@ -640,26 +736,53 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
-	// Preserve real API keys for multi-provider
+	const currentCustomApiProviders =
+		current.customApiProviders ??
+		deriveCustomApiProvidersFromLegacy(current.openaiProviders, current.anthropicProviders);
+	const findExistingCustomApiKey = (id: string): string =>
+		currentCustomApiProviders.find((p) => p.id === id)?.apiKey ??
+		current.openaiProviders?.find((p) => p.id === id)?.apiKey ??
+		current.anthropicProviders?.find((p) => p.id === id)?.apiKey ??
+		"";
+
+	// Preserve real API keys for unified custom API providers.
+	if (validated.customApiProviders) {
+		for (const p of validated.customApiProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				p.apiKey = findExistingCustomApiKey(p.id);
+			}
+		}
+		validated.openaiProviders = customApiProvidersToOpenAI(validated.customApiProviders);
+		validated.anthropicProviders = customApiProvidersToAnthropic(validated.customApiProviders);
+	}
+
+	// Preserve real API keys for OpenAI-compatible providers.
 	if (validated.openaiProviders) {
-		const currentProviders = current.openaiProviders ?? [];
 		for (const p of validated.openaiProviders) {
 			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
+				p.apiKey = findExistingCustomApiKey(p.id);
 			}
 		}
 	}
 
-	// Preserve real API keys for Anthropic providers
+	// Preserve real API keys for Anthropic providers.
 	if (validated.anthropicProviders) {
-		const currentProviders = current.anthropicProviders ?? [];
 		for (const p of validated.anthropicProviders) {
 			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
+				p.apiKey = findExistingCustomApiKey(p.id);
 			}
 		}
+	}
+
+	if (
+		!validated.customApiProviders &&
+		(validated.openaiProviders || validated.anthropicProviders)
+	) {
+		// Backward compatibility for older frontends that still submit the split arrays.
+		validated.customApiProviders = deriveCustomApiProvidersFromLegacy(
+			validated.openaiProviders ?? current.openaiProviders,
+			validated.anthropicProviders ?? current.anthropicProviders,
+		);
 	}
 
 			if (p.apiKey?.startsWith("*")) {
@@ -701,6 +824,7 @@ settingsRoutes.patch("/", async (c) => {
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
 		if (
+			key === "customApiProviders" ||
 			key === "openaiProviders" ||
 			key === "anthropicProviders" ||
 			key === "nugProviders" ||
@@ -717,6 +841,8 @@ settingsRoutes.patch("/", async (c) => {
 			(merged as any)[key] = val;
 		}
 	}
+
+	normalizeCustomApiProviderSettings(merged);
 
 	// Apply container proxy runtime changes first, then persist settings.
 	// This keeps persisted config and runtime state consistent if start/restart fails.
@@ -771,6 +897,10 @@ settingsRoutes.patch("/", async (c) => {
 				: undefined,
 		},
 		auth: { ...merged.auth, jwtSecret: undefined },
+		customApiProviders: (merged.customApiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		openaiProviders: (merged.openaiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",

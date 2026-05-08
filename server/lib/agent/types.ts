@@ -390,6 +390,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Send",
 	"AskUserQuestion",
 	"Skill",
+	"LearningGuide",
 ]);
 
 // === Agent config ===

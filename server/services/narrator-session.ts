@@ -1390,7 +1390,8 @@ export async function runAgentLoop(
 			if (currentImages?.length) {
 				const resolved: Array<{ format: string; base64: string }> = [];
 				for (const img of currentImages) {
-					const filePath = getImagePath(narratorId, img.imageId);
+					const uploadNarratorId = img.uploadNarratorId ?? narratorId;
+					const filePath = getImagePath(uploadNarratorId, img.imageId);
 					if (filePath) {
 						try {
 							const result = await imageToBase64(filePath);
@@ -2575,7 +2576,7 @@ export async function retryLastMessage(
 		});
 	}
 
-	const imageRefs = extractImageRefs(lastMsg.contentJson);
+	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
@@ -2758,7 +2759,10 @@ export async function rollbackToBlock(
 }
 
 /** Extract image refs from a message's contentJson. */
-function extractImageRefs(contentJson: unknown): ImageRef[] {
+function extractImageRefs(
+	contentJson: unknown,
+	fallbackUploadNarratorId?: string | null,
+): ImageRef[] {
 	const imageRefs: ImageRef[] = [];
 	if (Array.isArray(contentJson)) {
 		for (const block of contentJson as Array<Record<string, unknown>>) {
@@ -2768,15 +2772,80 @@ function extractImageRefs(contentJson: unknown): ImageRef[] {
 				typeof block.filename === "string" &&
 				typeof block.mediaType === "string"
 			) {
+				const uploadNarratorId =
+					typeof block.uploadNarratorId === "string"
+						? block.uploadNarratorId
+						: fallbackUploadNarratorId;
 				imageRefs.push({
 					imageId: block.imageId as string,
 					filename: block.filename as string,
 					mediaType: block.mediaType as string,
+					...(uploadNarratorId ? { uploadNarratorId } : {}),
 				});
 			}
 		}
 	}
 	return imageRefs;
+}
+
+type EditableUserContentBlock =
+	| { type: "text"; text: string }
+	| {
+			type: "image";
+			imageId: string;
+			filename: string;
+			mediaType: string;
+			uploadNarratorId?: string;
+	  };
+
+/**
+ * Replace editable text while preserving the persisted attachment block order.
+ * New user messages are stored as images first, then text; editing must not move
+ * those image blocks or history replay/front-end fetches can target the wrong shape.
+ */
+function buildEditedUserContentJson(
+	contentJson: unknown,
+	newContent: string,
+	fallbackUploadNarratorId?: string | null,
+): EditableUserContentBlock[] {
+	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
+	const newBlocks: EditableUserContentBlock[] = [];
+	let insertedText = false;
+
+	for (const block of blocks) {
+		if (block.type === "text") {
+			if (!insertedText) {
+				newBlocks.push({ type: "text", text: newContent });
+				insertedText = true;
+			}
+			continue;
+		}
+
+		if (
+			block.type === "image" &&
+			typeof block.imageId === "string" &&
+			typeof block.filename === "string" &&
+			typeof block.mediaType === "string"
+		) {
+			const uploadNarratorId =
+				typeof block.uploadNarratorId === "string"
+					? block.uploadNarratorId
+					: fallbackUploadNarratorId;
+			newBlocks.push({
+				type: "image",
+				imageId: block.imageId,
+				filename: block.filename,
+				mediaType: block.mediaType,
+				...(uploadNarratorId ? { uploadNarratorId } : {}),
+			});
+		}
+	}
+
+	if (!insertedText) {
+		newBlocks.push({ type: "text", text: newContent });
+	}
+
+	return newBlocks;
 }
 
 /**
@@ -2818,21 +2887,13 @@ export async function editAndRegenerate(
 		});
 	}
 
-	// Update the message content
-	const newContentJson: Array<Record<string, string | undefined>> = [
-		{ type: "text", text: newContent },
-	];
-
-	// Preserve existing images in contentJson
-	const existingImages = extractImageRefs(targetMsg.contentJson);
-	for (const img of existingImages) {
-		newContentJson.push({
-			type: "image",
-			imageId: img.imageId,
-			filename: img.filename,
-			mediaType: img.mediaType,
-		});
-	}
+	// Update the editable text while preserving existing image block order and ownership.
+	const newContentJson = buildEditedUserContentJson(
+		targetMsg.contentJson,
+		newContent,
+		targetMsg.narratorId,
+	);
+	const existingImages = extractImageRefs(targetMsg.contentJson, targetMsg.narratorId);
 
 	const privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 		contentText: newContent,

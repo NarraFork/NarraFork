@@ -1,4 +1,8 @@
 import { summaryGenerate } from "../lib/agent";
+import {
+	isContextOverflowMessage,
+	isContextWindowExceededError,
+} from "../lib/agent/error-handling";
 import { estimateTokens } from "../lib/agent/estimate-tokens";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
@@ -10,6 +14,9 @@ export { estimateTokens };
 
 const SUMMARY_MAX_MESSAGES = 50;
 const COMPACT_MAX_RETRIES = 2;
+const COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH = 8;
+const COMPACT_OVERFLOW_RETRY_BUDGET_RATIO = 0.6;
+const COMPACT_MIN_TEXT_SPLIT_CHARS = 1_000;
 
 /** Tool call statuses that indicate the call is still in-flight. */
 const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
@@ -88,6 +95,34 @@ function messageToCompactTextPruned(m: CompactMessage): string | null {
 	const text = (stripTodoReminderBlocks(m.contentText || "") as string) || "";
 	if (!text) return null;
 	return `[${role}]: ${text}`;
+}
+
+function isCompactContextOverflowError(err: unknown): boolean {
+	if (isContextWindowExceededError(err)) return true;
+	if (typeof err === "string") return isContextOverflowMessage(err);
+	if (err instanceof Error) return isContextOverflowMessage(err.message);
+	return false;
+}
+
+function cloneCompactEntries(entries: CompactEntry[]): CompactEntry[] {
+	return entries.map((entry) => ({ ...entry }));
+}
+
+function splitTextEntryForContextOverflow(entry: CompactEntry): CompactEntry[][] | null {
+	if (entry.text.length < COMPACT_MIN_TEXT_SPLIT_CHARS) return null;
+
+	const midpoint = Math.floor(entry.text.length / 2);
+	const window = Math.floor(entry.text.length * 0.1);
+	const leftWindow = Math.max(0, midpoint - window);
+	const rightWindow = Math.min(entry.text.length, midpoint + window);
+	const candidate = entry.text.lastIndexOf("\n\n", midpoint);
+	const splitAt = candidate >= leftWindow ? candidate : entry.text.indexOf("\n\n", midpoint);
+	const safeSplitAt = splitAt > 0 && splitAt <= rightWindow ? splitAt : midpoint;
+
+	const firstText = `${entry.text.slice(0, safeSplitAt).trimEnd()}\n[Message continues in next compact chunk]`;
+	const secondText = `[Continuation of previous message]\n${entry.text.slice(safeSplitAt).trimStart()}`;
+
+	return [[{ ...entry, text: firstText }], [{ ...entry, text: secondText }]];
 }
 
 // ── Compact summary generation ────────────────────────────────────────────────
@@ -217,33 +252,44 @@ export const narratorContext = {
 			: 0;
 		const contentBudget = tokenBudget - baseFixedTokens - previousSummaryTokens;
 
-		if (totalTokens <= contentBudget) {
-			// Single-pass: everything fits in one call
-			return this._summarizeChunk(
+		const chunks =
+			totalTokens <= contentBudget
+				? [cloneCompactEntries(entries)]
+				: splitIntoChunks(entries, tokenBudget, baseFixedTokens, previousSummary);
+
+		if (chunks.length > 1) {
+			logger.info("Cascading compact: splitting conversation into chunks", {
 				narratorId,
-				entries,
-				previousSummary,
-				compactSystemPrompt,
-				compactSuffix,
-				baseFixedTokens,
-				tokenBudget,
-			);
+				totalEntries: entries.length,
+				totalTokens,
+				summaryModelCtx: summaryCtxWindow,
+				chunks: chunks.length,
+			});
 		}
 
-		// ── Cascading summarization ──
-		// Split entries into chunks that each fit the summary model's budget.
-		// Each chunk's summary becomes the next chunk's "previous summary".
-		const chunks = splitIntoChunks(entries, tokenBudget, baseFixedTokens, previousSummary);
-
-		logger.info("Cascading compact: splitting conversation into chunks", {
+		return this._summarizeChunkSequence(
 			narratorId,
-			totalEntries: entries.length,
-			totalTokens,
-			summaryModelCtx: summaryCtxWindow,
-			chunks: chunks.length,
-		});
+			chunks,
+			previousSummary,
+			compactSystemPrompt,
+			compactSuffix,
+			baseFixedTokens,
+			tokenBudget,
+			0,
+		);
+	},
 
-		let rollingSummary = previousSummary;
+	async _summarizeChunkSequence(
+		narratorId: string,
+		chunks: CompactEntry[][],
+		initialSummary: string,
+		compactSystemPrompt: string,
+		compactSuffix: string,
+		baseFixedTokens: number,
+		tokenBudget: number,
+		depth: number,
+	): Promise<{ summary: string; contextPercent?: number }> {
+		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
 
 		for (let i = 0; i < chunks.length; i++) {
@@ -255,10 +301,11 @@ export const narratorContext = {
 				chunk: i + 1,
 				totalChunks: chunks.length,
 				chunkEntries: chunk.length,
+				depth,
 				isLast,
 			});
 
-			const result = await this._summarizeChunk(
+			const result = await this._summarizeChunkWithOverflowFallback(
 				narratorId,
 				chunk,
 				rollingSummary,
@@ -266,23 +313,77 @@ export const narratorContext = {
 				compactSuffix,
 				baseFixedTokens,
 				tokenBudget,
+				depth,
 			);
 
 			rollingSummary = result.summary;
 			lastContextPercent = result.contextPercent;
 
 			if (!isLast) {
-				// Intermediate summaries don't need to be perfect — just preserve
-				// enough context for the next chunk. Log progress.
 				logger.info("Cascading compact: intermediate summary generated", {
 					narratorId,
 					chunk: i + 1,
+					depth,
 					summaryLength: rollingSummary.length,
 				});
 			}
 		}
 
 		return { summary: rollingSummary, contextPercent: lastContextPercent };
+	},
+
+	async _summarizeChunkWithOverflowFallback(
+		narratorId: string,
+		entries: CompactEntry[],
+		previousSummary: string,
+		compactSystemPrompt: string,
+		compactSuffix: string,
+		baseFixedTokens: number,
+		tokenBudget: number,
+		depth: number,
+	): Promise<{ summary: string; contextPercent?: number }> {
+		try {
+			return await this._summarizeChunk(
+				narratorId,
+				entries,
+				previousSummary,
+				compactSystemPrompt,
+				compactSuffix,
+				baseFixedTokens,
+				tokenBudget,
+			);
+		} catch (err) {
+			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
+				throw err;
+			}
+
+			const fallbackChunks = splitChunkForContextOverflow(
+				entries,
+				tokenBudget,
+				baseFixedTokens,
+				previousSummary,
+			);
+			if (fallbackChunks.length <= 1) throw err;
+
+			logger.warn("Compact chunk exceeded summary model context, cascading into smaller chunks", {
+				narratorId,
+				depth,
+				chunkEntries: entries.length,
+				fallbackChunks: fallbackChunks.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+
+			return this._summarizeChunkSequence(
+				narratorId,
+				fallbackChunks,
+				previousSummary,
+				compactSystemPrompt,
+				compactSuffix,
+				baseFixedTokens,
+				tokenBudget,
+				depth + 1,
+			);
+		}
 	},
 
 	/**
@@ -402,6 +503,16 @@ export const narratorContext = {
 				};
 			} catch (err) {
 				lastError = err;
+				if (isCompactContextOverflowError(err)) {
+					logger.warn("Compact summary request exceeded summary model context", {
+						narratorId,
+						estimatedTokens: totalTokens + fixedTokens,
+						tokenBudget,
+						activeEntries: activeTexts.length,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					throw err;
+				}
 				logger.error("Compact summary generation attempt failed", {
 					narratorId,
 					attempt,
@@ -473,6 +584,33 @@ function splitIntoChunks(
 	}
 
 	return chunks;
+}
+
+function splitChunkForContextOverflow(
+	entries: CompactEntry[],
+	tokenBudget: number,
+	baseFixedTokens: number,
+	previousSummary: string,
+): CompactEntry[][] {
+	if (entries.length === 0) return [];
+
+	if (entries.length === 1) {
+		const textChunks = splitTextEntryForContextOverflow(entries[0]);
+		return textChunks ?? [cloneCompactEntries(entries)];
+	}
+
+	const reducedBudget = Math.max(
+		Math.floor(tokenBudget * COMPACT_OVERFLOW_RETRY_BUDGET_RATIO),
+		baseFixedTokens + 1,
+	);
+	const reducedChunks = splitIntoChunks(entries, reducedBudget, baseFixedTokens, previousSummary);
+	if (reducedChunks.length > 1) return reducedChunks;
+
+	const midpoint = Math.max(1, Math.floor(entries.length / 2));
+	return [
+		cloneCompactEntries(entries.slice(0, midpoint)),
+		cloneCompactEntries(entries.slice(midpoint)),
+	].filter((chunk) => chunk.length > 0);
 }
 
 /** Truncate a JSON value to a readable preview string. */

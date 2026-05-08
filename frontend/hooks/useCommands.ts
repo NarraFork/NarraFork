@@ -12,16 +12,27 @@ export function useNarratorCommands(narratorId: string | undefined) {
 		enabled: !!narratorId,
 		staleTime: 30_000,
 		select: (data): CommandItem[] => {
-			const commands: CommandItem[] = (data.commands ?? []).map((c) => ({
-				name: c.name,
-				prompt: c.prompt,
-				description: c.description,
-				source: c.source,
-				type: "command" as const,
-				runBashFirst: c.runBashFirst,
-				bashCommand: c.bashCommand,
-				params: c.params,
-			}));
+			const commands: CommandItem[] = [
+				{
+					name: "new",
+					prompt: "/new [message]",
+					description: isZh
+						? "按当前工作目录新建并打开会话；后续文本会作为首条消息发送"
+						: "Create and open a session in the current working directory; send trailing text as the first message",
+					source: "builtin",
+					type: "command" as const,
+				},
+				...(data.commands ?? []).map((c) => ({
+					name: c.name,
+					prompt: c.prompt,
+					description: c.description,
+					source: c.source,
+					type: "command" as const,
+					runBashFirst: c.runBashFirst,
+					bashCommand: c.bashCommand,
+					params: c.params,
+				})),
+			];
 			const skills: CommandItem[] = (data.skills ?? []).map((s) => ({
 				name: s.name,
 				prompt: "",

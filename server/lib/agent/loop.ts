@@ -9,6 +9,7 @@ import {
 	usesCodexApiMode,
 	usesStatefulApi,
 } from "../settings";
+import { analyzeShellCommand } from "./bash-analyze";
 import {
 	extractErrorMessage,
 	isCompletionLimitReason,
@@ -21,6 +22,7 @@ import {
 import { estimateTokens } from "./estimate-tokens";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
+import { detectShell } from "./shell";
 import { appendSideCarsForApi } from "./sidecar";
 import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-executor";
 import { toolRegistry } from "./tool-registry";
@@ -37,6 +39,14 @@ import {
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
+import {
+	cancelGoalCompletionReflection,
+	cleanupGoalCompletionReflection,
+	createGoalCompletionReflectionDecision,
+	GOAL_COMPLETION_REFLECTION_TOOLS,
+	type GoalCompletionReflectionDecision,
+	grantGoalCompletionReflection,
+} from "./tools/goal-reflection";
 import type {
 	AgentConfig,
 	AgentEvent,
@@ -155,6 +165,8 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	WebFetch: { short: ["url", "mode"], large: [] },
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
+	GoalCompleteConfirm: { short: ["confirm"], large: ["evidence", "reflection"] },
+	GoalCompleteRevise: { short: ["confirm"], large: ["feedback"] },
 	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
 	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
@@ -322,6 +334,63 @@ const PARALLEL_TOOLS = new Set([
 const TODO_REMINDER_TOOL_INTERVAL = 4;
 const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
 
+const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
+	"Read",
+	"Grep",
+	"Glob",
+	"WebSearch",
+	"WebFetch",
+	"Await",
+	"ShareFile",
+	"LearningGuide",
+	"GetGoals",
+	"StartPipeline",
+	"EndPipeline",
+	"AskUserQuestion",
+	"EnterPlanMode",
+	"ExitPlanMode",
+]);
+
+const RELAXED_PLAN_READ_ONLY_SUBAGENTS = new Set(["explore", "plan"]);
+
+export async function shouldInjectRelaxedPlanToolReminder(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId">,
+): Promise<boolean> {
+	if (!config.planMode || !config.relaxedPlan) return false;
+	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
+
+	if (tu.name === "Agent" || tu.name === "Task") {
+		const subagentType =
+			typeof tu.input.subagent_type === "string" ? tu.input.subagent_type : undefined;
+		return !subagentType || !RELAXED_PLAN_READ_ONLY_SUBAGENTS.has(subagentType);
+	}
+
+	if (tu.name === SHELL_TOOL_NAME || tu.name === "Shell") {
+		const command = typeof tu.input.command === "string" ? tu.input.command : "";
+		if (!command) return false;
+		try {
+			const workdir = typeof tu.input.workdir === "string" ? tu.input.workdir : undefined;
+			const shellCwd = workdir ? resolve(config.cwd, workdir) : config.cwd;
+			const analysis = await analyzeShellCommand(
+				command,
+				shellCwd,
+				detectShell().type,
+				!!config.chapterId,
+			);
+			return analysis.hasWriteOperation;
+		} catch (err) {
+			logger.debug("Failed to classify relaxed-plan shell tool use", {
+				toolUseId: tu.toolUseId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return true;
+		}
+	}
+
+	return true;
+}
+
 function normalizeSilentToolCallThreshold(value: number | undefined): number {
 	if (value == null) return DEFAULT_SILENT_TOOL_CALL_THRESHOLD;
 	if (!Number.isFinite(value)) return DEFAULT_SILENT_TOOL_CALL_THRESHOLD;
@@ -341,6 +410,7 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"ShareFile",
 	"NarraForkAdmin",
 	"ForkNarrator",
+	"UpdateGoal",
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
@@ -525,6 +595,20 @@ function buildExitPlanReflectionPrompt(
 		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
 }
 
+function buildGoalCompletionReflectionPrompt(
+	requestId: string,
+	input: Record<string, unknown>,
+	activeGoal: unknown,
+	goals: unknown,
+	locale: Locale,
+): string {
+	return getPrompt("goalCompletionReflection", locale)
+		.replaceAll("{requestId}", requestId)
+		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
+		.replaceAll("{activeGoalJson}", JSON.stringify(activeGoal, null, 2))
+		.replaceAll("{goalsJson}", JSON.stringify(goals, null, 2));
+}
+
 export interface ReflectionLoopRunOptions {
 	parentConfig: AgentConfig;
 	history: unknown[];
@@ -704,6 +788,38 @@ async function runExitPlanModeReflectionLoop(
 	});
 }
 
+async function runGoalCompletionReflectionLoop(
+	parentConfig: AgentConfig,
+	history: unknown[],
+	requestId: string,
+	toolUse: AgentToolUse,
+	input: Record<string, unknown>,
+	activeGoal: unknown,
+	goals: unknown,
+	reflectionAbort: AbortController,
+): Promise<void> {
+	const locale = (parentConfig.locale as Locale) ?? "en";
+	await runReflectionLoop({
+		parentConfig,
+		history,
+		prompt: buildGoalCompletionReflectionPrompt(requestId, input, activeGoal, goals, locale),
+		reflectionLoop: {
+			allowedTools: [...GOAL_COMPLETION_REFLECTION_TOOLS],
+			context: {
+				kind: "goalCompletion",
+				requestId,
+				toolUseId: toolUse.toolUseId,
+				data: {
+					toolName: toolUse.name,
+				},
+			},
+		},
+		abortController: reflectionAbort,
+		maxTurns: 1,
+		label: "Goal-completion reflection loop",
+	});
+}
+
 function parseDangerReflectionTextFallback(
 	text: string,
 ): { action: "confirm"; reflection?: string } | { action: "cancel"; reason?: string } | null {
@@ -814,6 +930,11 @@ interface ExitPlanReflectionGateResult {
 	input: Record<string, unknown>;
 }
 
+interface GoalCompletionReflectionGateResult {
+	decision: GoalCompletionReflectionDecision;
+	input: Record<string, unknown>;
+}
+
 async function resolveExitPlanModeReflection(
 	config: AgentConfig,
 	history: unknown[],
@@ -893,6 +1014,69 @@ async function resolveExitPlanModeReflection(
 	return { decision, input: resolvedInput.input };
 }
 
+async function resolveGoalCompletionReflection(
+	config: AgentConfig,
+	history: unknown[],
+	toolUse: AgentToolUse,
+): Promise<GoalCompletionReflectionGateResult> {
+	const { narratorGoalService } = await import("@server/services/narrator-goal-service");
+	const goals = await narratorGoalService.listGoals(config.narratorId);
+	const activeGoal = goals.find((goal) => goal.status === "active") ?? null;
+	if (!activeGoal) {
+		return {
+			decision: { action: "revise", feedback: "No active goal exists to complete." },
+			input: toolUse.input,
+		};
+	}
+
+	const requestId = `goal_complete_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const reflectionAbort = new AbortController();
+	const decisionPromise = createGoalCompletionReflectionDecision(requestId);
+	let reflectionDone = false;
+	const reflectionPromise = runGoalCompletionReflectionLoop(
+		config,
+		history,
+		requestId,
+		toolUse,
+		toolUse.input,
+		activeGoal,
+		goals,
+		reflectionAbort,
+	)
+		.catch((err) => {
+			logger.warn("Goal-completion reflection loop ended unexpectedly", { err: String(err) });
+		})
+		.finally(() => {
+			reflectionDone = true;
+		});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise.then(async () => {
+			const fallbackMessage =
+				"Goal-completion reflection loop did not call GoalCompleteConfirm or GoalCompleteRevise in its single allowed response";
+			const cancelled = await cancelGoalCompletionReflection(requestId, fallbackMessage);
+			if (cancelled) return decisionPromise;
+
+			const alreadySettled = await Promise.race<GoalCompletionReflectionDecision | null>([
+				decisionPromise,
+				Promise.resolve(null),
+			]);
+			const fallbackDecision: GoalCompletionReflectionDecision = {
+				action: "revise",
+				feedback: fallbackMessage,
+			};
+			return alreadySettled ?? fallbackDecision;
+		}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("Goal-completion reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	cleanupGoalCompletionReflection(requestId);
+	return { decision, input: toolUse.input };
+}
+
 export function shouldRunExitPlanModeReflection(
 	config: Pick<AgentConfig, "reflectionLoop" | "permissionMode">,
 ): boolean {
@@ -901,6 +1085,12 @@ export function shouldRunExitPlanModeReflection(
 		!config.reflectionLoop &&
 		(config.permissionMode === "acceptEdits" || config.permissionMode === "bypassPermissions")
 	);
+}
+
+export function shouldRunGoalCompletionReflection(
+	config: Pick<AgentConfig, "reflectionLoop">,
+): boolean {
+	return !config.reflectionLoop;
 }
 
 function buildExitPlanReflectionDeniedToolResult(
@@ -915,6 +1105,26 @@ function buildExitPlanReflectionDeniedToolResult(
 		locale === "zh-CN"
 			? `ExitPlanMode 反思认为计划还不应提交给用户审批。请先修改计划。\n\n反馈：${feedback}`
 			: `ExitPlanMode reflection decided the plan should not be submitted for user approval yet. Revise the plan first.\n\nFeedback: ${feedback}`;
+	return {
+		output,
+		isError: true,
+		durationMs: 0,
+		completedAt: Date.now(),
+	};
+}
+
+function buildGoalCompletionReflectionDeniedToolResult(
+	decision: GoalCompletionReflectionDecision,
+	locale: Locale,
+): ToolExecResult {
+	const feedback =
+		decision.action === "revise" && decision.feedback.trim()
+			? decision.feedback.trim()
+			: "Goal-completion reflection found that the active goal is not proven complete.";
+	const output =
+		locale === "zh-CN"
+			? `目标完成反思认为当前目标还不能标记为完成。请继续工作或补充验证。\n\n反馈：${feedback}`
+			: `Goal-completion reflection decided the active goal is not ready to mark complete. Continue working or gather verification first.\n\nFeedback: ${feedback}`;
 	return {
 		output,
 		isError: true,
@@ -939,6 +1149,15 @@ async function executeToolAfterReflections(
 			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
 		}
 		// Reflection confirmed — skip user approval and execute directly
+		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
+	}
+	if (tu.name === "UpdateGoal" && shouldRunGoalCompletionReflection(config)) {
+		const reflected = await resolveGoalCompletionReflection(config, history, tu);
+		tu.input = reflected.input;
+		if (reflected.decision.action !== "confirm") {
+			return buildGoalCompletionReflectionDeniedToolResult(reflected.decision, locale);
+		}
+		grantGoalCompletionReflection(config.narratorId, tu.toolUseId);
 		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
 	}
 	return executeTool(tu, config);
@@ -1038,11 +1257,21 @@ export async function* agentLoop(
 	let silentToolCallCount = 0;
 	const countedToolUseIds = new Set<string>();
 	const sideCarCheckedToolUseIds = new Set<string>();
+	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
+
+	function cacheToolResultSideCars(toolUseId: string, sideCars: AgentSideCar[]): AgentSideCar[] {
+		toolResultSideCarCache.set(toolUseId, sideCars);
+		return sideCars;
+	}
 
 	async function collectToolResultSideCars(
 		tu: AgentToolUse,
 		result: ToolExecResult,
 	): Promise<AgentSideCar[]> {
+		if (toolResultSideCarCache.has(tu.toolUseId)) {
+			return toolResultSideCarCache.get(tu.toolUseId) ?? [];
+		}
+
 		const sideCars: AgentSideCar[] = [];
 
 		if (!result.broken && !result.fatal) {
@@ -1061,18 +1290,29 @@ export async function* agentLoop(
 			}
 		}
 
-		if (result.broken || result.fatal || tu.name === "TaskCreate") return sideCars;
+		if (result.broken || result.fatal || tu.name === "TaskCreate") {
+			return cacheToolResultSideCars(tu.toolUseId, sideCars);
+		}
+		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
+			sideCars.push({
+				target: "tool_result",
+				source: "relaxed_plan",
+				content: getToolMessage("relaxedPlanToolReminder", locale),
+				orderIndex: 20,
+				toolUseId: tu.toolUseId,
+			});
+		}
 		if (!countedToolUseIds.has(tu.toolUseId)) {
 			countedToolUseIds.add(tu.toolUseId);
 			completedToolCount++;
 			config.onSideCarCompletedToolCount?.(completedToolCount);
 		}
 		if (!config.getSideCars || sideCarCheckedToolUseIds.has(tu.toolUseId)) {
-			return sideCars;
+			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		sideCarCheckedToolUseIds.add(tu.toolUseId);
 		if (completedToolCount % TODO_REMINDER_TOOL_INTERVAL !== 0) {
-			return sideCars;
+			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		try {
 			const collected = await config.getSideCars({
@@ -1089,7 +1329,7 @@ export async function* agentLoop(
 				error: String(err),
 			});
 		}
-		return sideCars;
+		return cacheToolResultSideCars(tu.toolUseId, sideCars);
 	}
 
 	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
@@ -1313,7 +1553,7 @@ export async function* agentLoop(
 		// Track whether the provider reported usage data during this turn
 		let receivedUsage = false;
 
-		function* drainSettledEarlyToolResults(): Generator<AgentEvent> {
+		async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 			for (const tu of toolUses) {
 				const settled = settledResults.get(tu.toolUseId);
 				if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
@@ -1323,11 +1563,15 @@ export async function* agentLoop(
 				const brokenOverride = settled.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
+				const toolSideCars = await collectToolResultSideCars(tu, settled);
+				const baseOutput = settled.broken
+					? getToolMessage("brokenToolCallResult", locale)
+					: settled.output;
 				yield {
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
+					output: baseOutput,
 					isError: settled.isError ?? false,
 					durationMs: settled.durationMs,
 					permissionStartedAt: settled.permissionStartedAt,
@@ -1336,6 +1580,7 @@ export async function* agentLoop(
 					brokenInputOverride: brokenOverride,
 					updatedInput: brokenOverride ?? settled.updatedInput,
 					metadata: settled.metadata,
+					sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 				};
 			}
 		}
@@ -1961,13 +2206,15 @@ export async function* agentLoop(
 										const brokenOverride = sr.broken
 											? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 											: undefined;
+										const toolSideCars = await collectToolResultSideCars(prevTu, sr);
+										const baseOutput = sr.broken
+											? getToolMessage("brokenToolCallResult", locale)
+											: sr.output;
 										yield {
 											type: "tool_result",
 											toolUseId: prevTu.toolUseId,
 											toolName: prevTu.name,
-											output: sr.broken
-												? getToolMessage("brokenToolCallResult", locale)
-												: sr.output,
+											output: baseOutput,
 											isError: sr.isError ?? false,
 											durationMs: sr.durationMs,
 											permissionStartedAt: sr.permissionStartedAt,
@@ -1976,6 +2223,7 @@ export async function* agentLoop(
 											brokenInputOverride: brokenOverride,
 											updatedInput: brokenOverride ?? sr.updatedInput,
 											metadata: sr.metadata,
+											sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 										};
 										if (sr.fatal) {
 											yield* finishRequest(sr.output);
@@ -2759,19 +3007,22 @@ export async function* agentLoop(
 			if (sr.broken) brokenToolUseIds.add(tu.toolUseId);
 			if (sr.updatedInput) tu.input = sr.updatedInput;
 			const brokenOverride = sr.broken ? sanitizeBrokenInput(tu.name, tu.input, locale) : undefined;
+			const toolSideCars = await collectToolResultSideCars(tu, sr);
+			const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
 			yield {
 				type: "tool_result",
 				toolUseId: tu.toolUseId,
 				toolName: tu.name,
-				output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
+				output: baseOutput,
 				isError: sr.isError ?? false,
 				durationMs: sr.durationMs,
 				permissionStartedAt: sr.permissionStartedAt,
 				executionStartedAt: sr.executionStartedAt,
 				completedAt: sr.completedAt,
 				brokenInputOverride: brokenOverride,
-				updatedInput: brokenOverride,
+				updatedInput: brokenOverride ?? sr.updatedInput,
 				metadata: sr.metadata,
+				sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 			};
 			if (sr.fatal) {
 				yield { type: "error", message: sr.output };

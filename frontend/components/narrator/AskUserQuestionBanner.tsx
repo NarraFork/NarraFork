@@ -175,11 +175,12 @@ export function AskUserQuestionBanner({
 	return (
 		<Alert color={alertColor} radius="md">
 			<Stack gap="md">
-				{questions.map((q) => {
+				{questions.map((q, questionIndex) => {
 					const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
 					const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
+					const questionKey = `${q.question}-${questionIndex}`;
 					return (
-						<Stack key={q.question} gap="xs">
+						<Stack key={questionKey} gap="xs">
 							<Text size="sm" fw={500}>
 								{q.header}
 							</Text>
@@ -204,6 +205,7 @@ export function AskUserQuestionBanner({
 									</Stack>
 								) : (
 									<Radio.Group
+										name={`${requestId}-question-${questionIndex}`}
 										value={
 											readOnly
 												? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")

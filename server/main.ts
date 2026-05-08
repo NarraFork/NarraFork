@@ -21,7 +21,7 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { saveSettings, settings } from "./lib/settings";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -776,10 +776,30 @@ try {
 	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 }
 
-	try {
+	if (configuredCredentialsPath) {
+		return {
+			credentialsPath: configuredCredentialsPath,
 			configPath:
+				configuredCredentialsPath.replace("credentials.json", "config.json"),
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		});
+		};
+	}
+
+	if (!existsSync(defaultCredentialsPath)) return null;
+
+		credentialsPath: defaultCredentialsPath,
+	};
+	saveSettings(settings);
+		credentialsPath: defaultCredentialsPath,
+	});
+
+	return {
+		credentialsPath: defaultCredentialsPath,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	};
+}
+
+	try {
 		});
 			if (cached.length > 0) {
 			} else {

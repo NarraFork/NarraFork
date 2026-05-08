@@ -1,11 +1,22 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { z } from "zod/v4";
+import { resolvePermissionDecision } from "../../../services/narrator-permission";
 import { settings } from "../../settings";
-import { shouldRunExitPlanModeReflection } from "../loop";
+import {
+	shouldInjectRelaxedPlanToolReminder,
+	shouldRunExitPlanModeReflection,
+	shouldRunGoalCompletionReflection,
+} from "../loop";
 import { executeTool } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
-import type { AgentConfig, PermissionResult, ToolDefinition } from "../types";
+import { goalCompleteConfirmTool, goalCompleteReviseTool } from "../tools/goal-reflection";
+import {
+	type AgentConfig,
+	type PermissionResult,
+	PLAN_MODE_ALLOWED_TOOLS,
+	type ToolDefinition,
+} from "../types";
 
 const TEST_TOOL_NAME = "__ExecutorGuardTest";
 
@@ -114,6 +125,97 @@ describe("ExitPlanMode reflection gate", () => {
 				reflectionLoop: { allowedTools: [], context: { kind: "exitPlanMode" } },
 			}),
 		).toBe(false);
+	});
+});
+
+describe("Goal completion reflection gate", () => {
+	test("runs outside reflection loops regardless of permission mode", () => {
+		expect(shouldRunGoalCompletionReflection({})).toBe(true);
+		expect(
+			shouldRunGoalCompletionReflection({
+				reflectionLoop: { allowedTools: [], context: { kind: "goalCompletion" } },
+			}),
+		).toBe(false);
+	});
+});
+
+describe("relaxed plan reminder classifier", () => {
+	const relaxedPlanConfig = {
+		planMode: true,
+		relaxedPlan: true,
+		cwd: "/tmp",
+	};
+
+	test("ignores read-only tools and read-only subagents", async () => {
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-read", name: "Read", input: { file_path: "x.ts" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-agent", name: "Agent", input: { subagent_type: "explore" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+	});
+
+	test("flags mutating tools and write-capable subagents", async () => {
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-write", name: "Write", input: { file_path: "x.ts" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-agent", name: "Agent", input: { subagent_type: "general" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+	});
+});
+
+describe("LearningGuide permission integration", () => {
+	test("is available in safe permission modes and plan mode", () => {
+		const base = {
+			toolName: "LearningGuide",
+			input: { mode: "list" },
+			cwd: "/tmp",
+		};
+
+		expect(resolvePermissionDecision({ ...base, permMode: "default" })).toBe("allow");
+		expect(resolvePermissionDecision({ ...base, permMode: "readOnly" })).toBe("allow");
+		expect(resolvePermissionDecision({ ...base, permMode: "acceptEdits" })).toBe("allow");
+		expect(PLAN_MODE_ALLOWED_TOOLS.has("LearningGuide")).toBe(true);
+	});
+});
+
+describe("goal completion reflection tools", () => {
+	test("GoalCompleteConfirm requires concrete evidence", () => {
+		expect(
+			goalCompleteConfirmTool.parameters.safeParse({ confirm: true, evidence: "too short" })
+				.success,
+		).toBe(false);
+		expect(
+			goalCompleteConfirmTool.parameters.safeParse({
+				confirm: true,
+				evidence: "Verified every requested requirement with concrete tool output.",
+			}).success,
+		).toBe(true);
+	});
+
+	test("GoalCompleteRevise requires feedback", () => {
+		expect(
+			goalCompleteReviseTool.parameters.safeParse({ confirm: true, feedback: "" }).success,
+		).toBe(false);
+		expect(
+			goalCompleteReviseTool.parameters.safeParse({
+				confirm: true,
+				feedback: "Need to run the requested verification first.",
+			}).success,
+		).toBe(true);
 	});
 });
 

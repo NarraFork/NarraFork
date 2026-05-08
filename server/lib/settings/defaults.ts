@@ -66,6 +66,9 @@ export const DEFAULTS: NarraForkSettings = {
 		disabledRoutines: [],
 		enabledRoutines: [],
 	},
+	customApiProviders: [],
+	openaiProviders: [],
+	anthropicProviders: [],
 	codex: {
 		loadBalancingMode: "tier-balanced",
 		tierOrder: [...DEFAULT_CODEX_TIER_ORDER],

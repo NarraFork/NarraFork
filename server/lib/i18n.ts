@@ -139,6 +139,14 @@ Latest TODO list from narrator state:
 		"zh-CN":
 			'[计划模式] 注意：你的写入目标已从 "{originalPath}" 重定向到指定的计划文件 "{planFile}"。在计划模式下，请直接使用正确的计划文件路径。',
 	},
+	"tool.relaxedPlanToolReminder": {
+		en: `<relaxed_plan_reminder>
+You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
+</relaxed_plan_reminder>`,
+		"zh-CN": `<relaxed_plan_reminder>
+你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
+</relaxed_plan_reminder>`,
+	},
 	"tool.planModeCancelled": {
 		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
 		"zh-CN": "计划模式已被用户取消。除非用户再次要求规划，否则不要提交或执行此计划。",
@@ -525,6 +533,7 @@ export type ToolMessageKey =
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
 	| "planModeFileRedirected"
+	| "relaxedPlanToolReminder"
 	| "planModeCancelled"
 	| "todoWriteOutput"
 	| "todoReminder"

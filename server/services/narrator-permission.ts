@@ -539,6 +539,7 @@ const ALWAYS_ALLOW_TOOLS = [
 	"WebSearch",
 	"Await",
 	"Skill",
+	"LearningGuide",
 	"GetGoals",
 	"UpdateGoal",
 ];

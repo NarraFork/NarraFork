@@ -13,6 +13,41 @@ export interface ModelOption {
 	provider?: string;
 }
 
+export type CustomApiProtocol =
+	| "anthropic-official"
+	| "anthropic-compatible"
+	| "codex-native"
+	| "responses-compatible"
+	| "completions-compatible";
+
+export interface CustomApiProviderConfig {
+	/** Unique short ID shared across protocol switches. */
+	id: string;
+	/** User-defined display name. */
+	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
+	/** User-defined provider prefix used in model IDs, e.g. "openai" or "anthropic". */
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+	/** Canonical custom API protocol used by the UI and settings storage. */
+	protocol: CustomApiProtocol;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
+	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	/** Anthropic: optional HTTPS proxy URL for all requests to this provider. */
+	proxy?: string;
+	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
+	tlsRejectUnauthorized?: boolean;
+	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header. */
+	codexAccountId?: string;
+	/** Codex: use Responses WebSocket instead of HTTP. */
+	codexWebSocket?: boolean;
+}
+
 export interface OpenAIProviderConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -71,7 +106,7 @@ export interface AnthropicProviderConfig {
 	 * Default reasoning effort for Anthropic models when narrator reasoningEffort is unset.
 	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high";
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
 	/** Optional HTTPS proxy URL for all requests to this provider. */
 	proxy?: string;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
@@ -408,9 +443,11 @@ export interface NarraForkSettings {
 		/** Explicitly enabled routine IDs (for routines with defaultEnabled: false). */
 		enabledRoutines: string[];
 	};
-	/** Multiple OpenAI-compatible API providers. */
+	/** Canonical custom API providers shared by Anthropic/OpenAI/Codex-compatible protocols. */
+	customApiProviders?: CustomApiProviderConfig[];
+	/** Multiple OpenAI-compatible API providers (derived from customApiProviders). */
 	openaiProviders?: OpenAIProviderConfig[];
-	/** Anthropic native API providers. */
+	/** Anthropic native API providers (derived from customApiProviders). */
 	anthropicProviders?: AnthropicProviderConfig[];
 	/** NUG (Narrafork Unified Gateway) providers — unified AI gateway. */
 	nugProviders?: NUGProviderConfig[];

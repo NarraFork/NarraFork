@@ -80,11 +80,17 @@ export function getOpenaiCachedModelsByProvider(providerId: string): OpenAIModel
 	return cachedModelsByProvider.get(providerId) ?? [];
 }
 
-/** Get all cached models across all providers (for backward compat). */
+function activeOpenaiProviderIds(): Set<string> {
+	return new Set((settings.openaiProviders ?? []).filter((p) => !p.disabled).map((p) => p.id));
+}
+
+/** Get all cached models across active providers (for backward compat). */
 export function getOpenaiCachedModels(): OpenAIModelInfo[] {
+	const providerIds = activeOpenaiProviderIds();
 	const seen = new Set<string>();
 	const result: OpenAIModelInfo[] = [];
-	for (const models of cachedModelsByProvider.values()) {
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		for (const m of models) {
 			if (!seen.has(m.id)) {
 				seen.add(m.id);
@@ -113,7 +119,9 @@ export function getOpenaiCachedModelsGrouped(): Array<{
 
 // Register model checker and lister so settings module can detect/list OpenAI models
 registerOpenaiModelChecker((model) => {
-	for (const models of cachedModelsByProvider.values()) {
+	const providerIds = activeOpenaiProviderIds();
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		if (models.some((m) => m.id === model)) return true;
 	}
 	return false;

@@ -11,6 +11,7 @@ import { exitPlanConfirmTool, exitPlanReviseTool } from "./exit-plan-reflection"
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
+import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflection";
 import { grepTool } from "./grep";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
@@ -84,6 +85,8 @@ const coreProvider: ToolProvider = {
 			dangerCancelTool,
 			exitPlanConfirmTool,
 			exitPlanReviseTool,
+			goalCompleteConfirmTool,
+			goalCompleteReviseTool,
 		];
 	},
 };

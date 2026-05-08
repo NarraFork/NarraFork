@@ -104,6 +104,7 @@ import {
 	useCreateBlacklistDir,
 	useCreateCmdBlacklist,
 	useCreateCmdWhitelist,
+	useCreateNarrator,
 	useCreateWhitelistDir,
 	useDeleteBlacklistDir,
 	useDeleteCmdBlacklist,
@@ -1554,8 +1555,11 @@ export function NarratorPanel({
 	const { data: chapterData } = useChapter(chapterId ?? "");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterStatus = (chapterData as any)?.status as string | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const chapterWorktreePath = (chapterData as any)?.worktreePath as string | null | undefined;
 	const isChapterMerged = chapterStatus === "merged";
 	const forkNarratorMutation = useForkNarrator();
+	const createNarratorMutation = useCreateNarrator();
 	const updateConclusionMutation = useUpdateSubagentConclusion();
 	const { data: goalsData } = useNarratorGoals(narratorId);
 	const goals = goalsData?.goals ?? [];
@@ -4599,8 +4603,48 @@ export function NarratorPanel({
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
 		sendingRef.current = true;
+		let restoreOnError: { msg: string; images: File[]; textFiles: File[] } | null = null;
 		try {
 			inputHistory.push(msg);
+
+			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
+			if (newMatch) {
+				const initialMessage = newMatch[1]?.trim() ?? "";
+				const images = [...attachedImages];
+				const textFiles = [...attachedTextFiles];
+				restoreOnError = { msg, images, textFiles };
+				setInput("");
+				setAttachedImages([]);
+				setAttachedTextFiles([]);
+
+				const currentCwd =
+					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
+				const newNarrator = await createNarratorMutation.mutateAsync({
+					chapterId: null,
+					model: fetchedNarrator?.model ?? narrator?.model ?? undefined,
+					systemPrompt: fetchedNarrator?.systemPrompt ?? narrator?.systemPrompt ?? undefined,
+					permissionMode: fetchedNarrator?.permissionMode ?? narrator?.permissionMode ?? undefined,
+					reasoningEffort:
+						fetchedNarrator?.reasoningEffort ?? narrator?.reasoningEffort ?? undefined,
+					fastMode: fetchedNarrator?.fastMode ?? narrator?.fastMode ?? undefined,
+					relaxedPlan: fetchedNarrator?.relaxedPlan ?? narrator?.relaxedPlan ?? undefined,
+					cwd: currentCwd,
+				});
+
+				if (initialMessage) {
+					await api.sendNarratorMessage(
+						newNarrator.id,
+						initialMessage,
+						images.length > 0 ? images : undefined,
+						textFiles.length > 0 ? textFiles : undefined,
+					);
+				}
+
+				restoreOnError = null;
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
+				return;
+			}
+
 			if (isActive) {
 				await doSendBuffered(msg);
 				return;
@@ -4612,6 +4656,11 @@ export function NarratorPanel({
 			setAttachedTextFiles([]);
 			await submitMessage(msg, images, textFiles);
 		} catch (err) {
+			if (restoreOnError) {
+				setInput(restoreOnError.msg);
+				if (restoreOnError.images.length > 0) setAttachedImages(restoreOnError.images);
+				if (restoreOnError.textFiles.length > 0) setAttachedTextFiles(restoreOnError.textFiles);
+			}
 			notifications.show({
 				title: t("sendFailed"),
 				message: err instanceof Error ? err.message : String(err),

@@ -1,5 +1,29 @@
 import type { ModelOption } from "../../lib/constants";
 
+export type CustomApiProtocol =
+	| "anthropic-official"
+	| "anthropic-compatible"
+	| "codex-native"
+	| "responses-compatible"
+	| "completions-compatible";
+
+export interface CustomApiProviderState {
+	id: string;
+	name: string;
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+	protocol: CustomApiProtocol;
+	defaultContextWindow?: number;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	proxy?: string;
+	tlsRejectUnauthorized?: boolean;
+	codexAccountId: string;
+	codexWebSocket?: boolean;
+	disabled?: boolean;
+}
+
 export interface OpenAIProviderState {
 	id: string;
 	name: string;
@@ -7,7 +31,9 @@ export interface OpenAIProviderState {
 	apiKey: string;
 	baseUrl: string;
 	defaultModel: string;
-	apiMode: "responses" | "completions" | "codex";
+	/** @deprecated Use apiMode. Preserved so legacy responsesApi=false migrates correctly. */
+	responsesApi?: boolean;
+	apiMode?: "responses" | "completions" | "codex";
 	codexAccountId: string;
 	codexWebSocket?: boolean;
 	disabled?: boolean;
