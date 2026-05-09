@@ -1,4 +1,5 @@
 import {
+	Anchor,
 	Badge,
 	Box,
 	Button,
@@ -646,6 +647,16 @@ export function NarratorDetailsPanel({
 						</Stack>
 					}
 				/>
+				<Group justify="flex-end" mt={-6}>
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						onClick={() => navigate({ to: "/settings/agent" })}
+					>
+						{t("globalAgentSettings")}
+					</Anchor>
+				</Group>
 				<DetailRow
 					label={t("details.pruneEnabled")}
 					value={<Text size="sm">{formatBoolean(narrator?.pruneEnabled ?? true)}</Text>}

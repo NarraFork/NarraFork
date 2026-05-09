@@ -52,6 +52,7 @@ export function ConfirmDialogProvider({ children }: { children: ReactNode }) {
 				title={pending?.title ?? t("confirmTitle")}
 				size="sm"
 				centered
+				zIndex={1000}
 			>
 				{pending && (
 					<Stack>

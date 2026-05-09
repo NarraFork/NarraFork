@@ -11,6 +11,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import {
 	ActionIcon,
+	Anchor,
 	Avatar,
 	Badge,
 	Box,
@@ -73,7 +74,7 @@ import {
 	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
@@ -251,6 +252,17 @@ function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean
 	const override = normalizeBooleanOverride(value);
 	if (override === "inherit") return globalDefault;
 	return override === "on";
+}
+
+function formatOverrideStatus(
+	override: BooleanOverride,
+	effective: boolean,
+	t: (key: string) => string,
+): string {
+	if (override === "inherit") {
+		return `${t("override_inherit")} · ${effective ? t("details.on") : t("details.off")}`;
+	}
+	return override === "on" ? t("override_on") : t("override_off");
 }
 
 /** Number of queued messages before the queue collapses into a summary bar. */
@@ -551,6 +563,11 @@ function ModelMenuItems({
 }) {
 	const { t } = useTranslation("narrator");
 	const [filter, setFilter] = useState("");
+	const filterInputRef = useRef<HTMLInputElement>(null);
+	useEffect(() => {
+		const id = window.setTimeout(() => filterInputRef.current?.focus({ preventScroll: true }));
+		return () => window.clearTimeout(id);
+	}, []);
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {
 		if (!groups.has(prov)) groups.set(prov, []);
@@ -594,39 +611,6 @@ function ModelMenuItems({
 				</>
 			)}
 			{label && <Menu.Label>{label}</Menu.Label>}
-			<Box
-				p={4}
-				style={{
-					position: "sticky",
-					top: 0,
-					zIndex: 2,
-					background: "var(--mantine-color-body)",
-				}}
-				onClick={(e) => e.stopPropagation()}
-			>
-				<TextInput
-					autoFocus
-					leftSection={<IconSearch size={14} />}
-					onChange={(e) => setFilter(e.currentTarget.value)}
-					onKeyDown={(e) => e.stopPropagation()}
-					placeholder={t("modelFilterPlaceholder")}
-					rightSection={
-						filter ? (
-							<CloseButton
-								aria-label={t("clearModelFilter")}
-								onClick={(e) => {
-									e.stopPropagation();
-									setFilter("");
-								}}
-								size="xs"
-							/>
-						) : undefined
-					}
-					size="xs"
-					value={filter}
-				/>
-			</Box>
-			<Menu.Divider />
 			{filteredEntries.length === 0 ? (
 				<Text c="dimmed" p="xs" size="xs">
 					{t("noModelMatches")}
@@ -667,6 +651,39 @@ function ModelMenuItems({
 					</span>
 				))
 			)}
+			<Menu.Divider />
+			<Box
+				p={4}
+				style={{
+					position: "sticky",
+					bottom: 0,
+					zIndex: 2,
+					background: "var(--mantine-color-body)",
+				}}
+				onClick={(e) => e.stopPropagation()}
+			>
+				<TextInput
+					ref={filterInputRef}
+					leftSection={<IconSearch size={14} />}
+					onChange={(e) => setFilter(e.currentTarget.value)}
+					onKeyDown={(e) => e.stopPropagation()}
+					placeholder={t("modelFilterPlaceholder")}
+					rightSection={
+						filter ? (
+							<CloseButton
+								aria-label={t("clearModelFilter")}
+								onClick={(e) => {
+									e.stopPropagation();
+									setFilter("");
+								}}
+								size="xs"
+							/>
+						) : undefined
+					}
+					size="xs"
+					value={filter}
+				/>
+			</Box>
 		</>
 	);
 }
@@ -816,16 +833,10 @@ function PermissionMenuContent({
 	showPlanReflectionAutoApproveToggle,
 	planReflectionAutoApproveOverride,
 	planReflectionAutoApproveEffective,
-	planReflectionAutoApproveGlobal,
-	onPlanReflectionAutoApproveOverride,
-	planReflectionAutoApprovePending,
 	showDangerReflectionToggle,
 	dangerReflectionOverride,
 	dangerReflectionEffective,
-	dangerReflectionGlobal,
-	onDangerReflectionOverride,
-	dangerReflectionPending,
-	onOpenGlobalSettings,
+	onOpenReflectionSettings,
 }: {
 	currentMode: string;
 	onSelectPermissionMode: (mode: string) => void;
@@ -836,23 +847,17 @@ function PermissionMenuContent({
 	showPlanReflectionAutoApproveToggle: boolean;
 	planReflectionAutoApproveOverride: BooleanOverride;
 	planReflectionAutoApproveEffective: boolean;
-	planReflectionAutoApproveGlobal: boolean;
-	onPlanReflectionAutoApproveOverride: (value: BooleanOverride) => void;
-	planReflectionAutoApprovePending: boolean;
 	showDangerReflectionToggle: boolean;
 	dangerReflectionOverride: BooleanOverride;
 	dangerReflectionEffective: boolean;
-	dangerReflectionGlobal: boolean;
-	onDangerReflectionOverride: (value: BooleanOverride) => void;
-	dangerReflectionPending: boolean;
-	onOpenGlobalSettings: () => void;
+	onOpenReflectionSettings: () => void;
 }) {
+	const hasReflectionSettings = showPlanReflectionAutoApproveToggle || showDangerReflectionToggle;
 	return (
 		<>
 			<Menu.Label>{t("permissionMode")}</Menu.Label>
 			<PermModeMenuItems currentMode={currentMode} onSelect={onSelectPermissionMode} t={t} />
 			<Menu.Divider />
-			<Menu.Label>{t("planSettings")}</Menu.Label>
 			<Menu.Item
 				leftSection={<IconNotebook size={14} />}
 				onClick={onTogglePlanMode}
@@ -860,42 +865,32 @@ function PermissionMenuContent({
 			>
 				{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
 			</Menu.Item>
-			{showPlanReflectionAutoApproveToggle && (
-				<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
-					<OverrideControl
-						label={t("sessionPlanReflectionAutoApprove")}
-						description={t("sessionPlanReflectionAutoApproveDesc")}
-						value={planReflectionAutoApproveOverride}
-						effective={planReflectionAutoApproveEffective}
-						globalDefault={planReflectionAutoApproveGlobal}
-						disabled={planReflectionAutoApprovePending}
-						onChange={onPlanReflectionAutoApproveOverride}
-						t={t}
-					/>
-				</Box>
-			)}
-			{showDangerReflectionToggle && (
+			{hasReflectionSettings && (
 				<>
 					<Menu.Divider />
-					<Menu.Label>{t("safetySettings")}</Menu.Label>
-					<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
-						<OverrideControl
-							label={t("sessionDangerReflection")}
-							description={t("sessionDangerReflectionDesc")}
-							value={dangerReflectionOverride}
-							effective={dangerReflectionEffective}
-							globalDefault={dangerReflectionGlobal}
-							disabled={dangerReflectionPending}
-							onChange={onDangerReflectionOverride}
-							t={t}
-						/>
-					</Box>
+					<Menu.Item leftSection={<IconSettings size={14} />} onClick={onOpenReflectionSettings}>
+						<Stack gap={2}>
+							<Text size="sm">{t("sessionReflectionSettings")}</Text>
+							{showPlanReflectionAutoApproveToggle && (
+								<Text size="xs" c="dimmed">
+									{t("planReflectionShort")}:{" "}
+									{formatOverrideStatus(
+										planReflectionAutoApproveOverride,
+										planReflectionAutoApproveEffective,
+										t,
+									)}
+								</Text>
+							)}
+							{showDangerReflectionToggle && (
+								<Text size="xs" c="dimmed">
+									{t("dangerReflectionShort")}:{" "}
+									{formatOverrideStatus(dangerReflectionOverride, dangerReflectionEffective, t)}
+								</Text>
+							)}
+						</Stack>
+					</Menu.Item>
 				</>
 			)}
-			<Menu.Divider />
-			<Menu.Item leftSection={<IconExternalLink size={14} />} onClick={onOpenGlobalSettings}>
-				{t("globalAgentSettings")}
-			</Menu.Item>
 		</>
 	);
 }
@@ -1917,8 +1912,16 @@ export function NarratorPanel({
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
+	const updateSettingsMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: (data) => {
+			qc.setQueryData(["settings"], data);
+			qc.invalidateQueries({ queryKey: ["settings"] });
+		},
+	});
 	const dangerReflectionGlobal = settingsData?.agent?.dangerReflectionEnabled ?? true;
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const globalReflectionSettingsDisabled = !settingsData || updateSettingsMutation.isPending;
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
@@ -2523,6 +2526,10 @@ export function NarratorPanel({
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
 	const [detailsOpened, { toggle: toggleDetails, close: closeDetails }] = useDisclosure(false);
+	const [
+		reflectionSettingsOpened,
+		{ open: openReflectionSettings, close: closeReflectionSettings },
+	] = useDisclosure(false);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
@@ -2632,6 +2639,24 @@ export function NarratorPanel({
 			reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: value });
 		},
 		[confirm, dangerReflectionEffective, narratorId, reflectionOverridesMutation, t],
+	);
+	const handlePlanReflectionAutoApproveGlobal = useCallback(
+		(enabled: boolean) => {
+			if (!settingsData) return;
+			updateSettingsMutation.mutate({ agent: { planReflectionAutoApprove: enabled } });
+		},
+		[settingsData, updateSettingsMutation],
+	);
+	const handleDangerReflectionGlobal = useCallback(
+		async (enabled: boolean) => {
+			if (!settingsData) return;
+			if (!enabled && dangerReflectionGlobal) {
+				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
+				if (!ok) return;
+			}
+			updateSettingsMutation.mutate({ agent: { dangerReflectionEnabled: enabled } });
+		},
+		[confirm, dangerReflectionGlobal, settingsData, t, updateSettingsMutation],
 	);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
@@ -6196,6 +6221,84 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
+					<Modal
+						opened={reflectionSettingsOpened}
+						onClose={closeReflectionSettings}
+						title={t("sessionReflectionSettings")}
+						centered
+						size="lg"
+					>
+						<Stack gap="md">
+							<Stack gap="sm">
+								<Text size="sm" fw={600}>
+									{t("sessionOverrides")}
+								</Text>
+								{((narrator.permissionMode ?? "default") === "acceptEdits" ||
+									(narrator.permissionMode ?? "default") === "bypassPermissions") && (
+									<OverrideControl
+										label={t("sessionPlanReflectionAutoApprove")}
+										description={t("sessionPlanReflectionAutoApproveDesc")}
+										value={planReflectionAutoApproveOverride}
+										effective={planReflectionAutoApproveEffective}
+										globalDefault={planReflectionAutoApproveGlobal}
+										disabled={reflectionOverridesMutation.isPending}
+										onChange={handlePlanReflectionAutoApproveOverride}
+										t={t}
+									/>
+								)}
+								{(narrator.permissionMode ?? "default") === "bypassPermissions" && (
+									<OverrideControl
+										label={t("sessionDangerReflection")}
+										description={t("sessionDangerReflectionDesc")}
+										value={dangerReflectionOverride}
+										effective={dangerReflectionEffective}
+										globalDefault={dangerReflectionGlobal}
+										disabled={reflectionOverridesMutation.isPending}
+										onChange={handleDangerReflectionOverride}
+										t={t}
+									/>
+								)}
+							</Stack>
+							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
+							<Stack gap="sm">
+								<Text size="sm" fw={600}>
+									{t("globalDefaults")}
+								</Text>
+								<Switch
+									label={t("globalPlanReflectionAutoApprove")}
+									description={t("globalPlanReflectionAutoApproveDesc")}
+									checked={planReflectionAutoApproveGlobal}
+									onChange={(event) =>
+										handlePlanReflectionAutoApproveGlobal(event.currentTarget.checked)
+									}
+									disabled={globalReflectionSettingsDisabled}
+								/>
+								<Switch
+									label={t("globalDangerReflection")}
+									description={t("globalDangerReflectionDesc")}
+									checked={dangerReflectionGlobal}
+									onChange={(event) => handleDangerReflectionGlobal(event.currentTarget.checked)}
+									disabled={globalReflectionSettingsDisabled}
+								/>
+							</Stack>
+							<Group justify="space-between">
+								<Anchor
+									component="button"
+									type="button"
+									size="xs"
+									onClick={() => navigate({ to: "/settings/agent" })}
+									style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+								>
+									{t("globalAgentSettings")}
+									<IconExternalLink size={12} />
+								</Anchor>
+								<Button variant="default" onClick={closeReflectionSettings}>
+									{tc("close")}
+								</Button>
+							</Group>
+						</Stack>
+					</Modal>
+
 					{detailsOpened && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
@@ -7172,22 +7275,12 @@ export function NarratorPanel({
 																planReflectionAutoApproveEffective={
 																	planReflectionAutoApproveEffective
 																}
-																planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
-																onPlanReflectionAutoApproveOverride={
-																	handlePlanReflectionAutoApproveOverride
-																}
-																planReflectionAutoApprovePending={
-																	reflectionOverridesMutation.isPending
-																}
 																showDangerReflectionToggle={
 																	(narrator.permissionMode ?? "default") === "bypassPermissions"
 																}
 																dangerReflectionOverride={dangerReflectionOverride}
 																dangerReflectionEffective={dangerReflectionEffective}
-																dangerReflectionGlobal={dangerReflectionGlobal}
-																onDangerReflectionOverride={handleDangerReflectionOverride}
-																dangerReflectionPending={reflectionOverridesMutation.isPending}
-																onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
+																onOpenReflectionSettings={openReflectionSettings}
 															/>
 														</Menu.Dropdown>
 													</Menu>
@@ -7404,22 +7497,12 @@ export function NarratorPanel({
 															planReflectionAutoApproveEffective={
 																planReflectionAutoApproveEffective
 															}
-															planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
-															onPlanReflectionAutoApproveOverride={
-																handlePlanReflectionAutoApproveOverride
-															}
-															planReflectionAutoApprovePending={
-																reflectionOverridesMutation.isPending
-															}
 															showDangerReflectionToggle={
 																(narrator.permissionMode ?? "default") === "bypassPermissions"
 															}
 															dangerReflectionOverride={dangerReflectionOverride}
 															dangerReflectionEffective={dangerReflectionEffective}
-															dangerReflectionGlobal={dangerReflectionGlobal}
-															onDangerReflectionOverride={handleDangerReflectionOverride}
-															dangerReflectionPending={reflectionOverridesMutation.isPending}
-															onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
+															onOpenReflectionSettings={openReflectionSettings}
 														/>
 													</Menu.Dropdown>
 												</Menu>
