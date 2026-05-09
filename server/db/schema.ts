@@ -237,6 +237,16 @@ export const narrators = sqliteTable(
 		}),
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
 		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),
+		planReflectionAutoApproveOverride: text("plan_reflection_auto_approve_override", {
+			enum: ["inherit", "on", "off"],
+		})
+			.notNull()
+			.default("inherit"),
+		dangerReflectionOverride: text("danger_reflection_override", {
+			enum: ["inherit", "on", "off"],
+		})
+			.notNull()
+			.default("inherit"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),

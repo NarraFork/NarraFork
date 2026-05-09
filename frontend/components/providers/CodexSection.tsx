@@ -76,6 +76,7 @@ interface CodexImportCredential {
 	priority?: number;
 }
 
+const CODEX_STATUS_GC_TIME_MS = 60_000;
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
 const CODEX_DISPLAY_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
@@ -261,6 +262,7 @@ export const CodexSection = React.memo(function CodexSection({
 			if (query.state.data?.usageQueue?.isRunning) return 3_000;
 			return 30_000;
 		},
+		gcTime: CODEX_STATUS_GC_TIME_MS,
 	});
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];

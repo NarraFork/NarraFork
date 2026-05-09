@@ -29,6 +29,13 @@ const SOURCE_COLORS: Record<string, string> = {
 	cherry_pick: "grape",
 	initial: "blue",
 };
+const MAX_COMMIT_LIST_MESSAGE_CHARS = 1_000;
+
+function clampCommitListText(value: string): string {
+	return value.length > MAX_COMMIT_LIST_MESSAGE_CHARS
+		? `${value.slice(0, MAX_COMMIT_LIST_MESSAGE_CHARS)}…`
+		: value;
+}
 
 function CommitRow({ commit }: { commit: Commit }) {
 	return (
@@ -51,7 +58,7 @@ function CommitRow({ commit }: { commit: Commit }) {
 			)}
 
 			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-				{commit.message}
+				{clampCommitListText(commit.message)}
 			</Text>
 
 			{commit.linesAdded != null &&

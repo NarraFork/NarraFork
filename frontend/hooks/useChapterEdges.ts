@@ -1,6 +1,8 @@
 import { api } from "@frontend/lib/api";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+const CHAPTER_EDGES_QUERY_GC_TIME_MS = 60_000;
+
 export function useChapterEdges(projectId: string | undefined) {
 	return useQuery({
 		queryKey: ["chapterEdges", projectId],
@@ -9,6 +11,7 @@ export function useChapterEdges(projectId: string | undefined) {
 			return api.listChapterEdges({ projectId });
 		},
 		enabled: !!projectId,
+		gcTime: CHAPTER_EDGES_QUERY_GC_TIME_MS,
 	});
 }
 

@@ -20,7 +20,7 @@ import {
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertCircle } from "@tabler/icons-react";
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useCreateProject, useCreateProjectStream, useProjects } from "../../hooks/useProjects";
@@ -31,6 +31,7 @@ const DirectoryPicker = lazy(() =>
 		default: module.DirectoryPicker,
 	})),
 );
+const PROJECT_LIST_RENDER_LIMIT = 200;
 
 export const Route = createFileRoute("/projects/")({
 	component: ProjectListPage,
@@ -52,6 +53,7 @@ function ProjectListPage() {
 	const [cloneBranch, setCloneBranch] = useState("");
 	const [cloneUsername, setCloneUsername] = useState("");
 	const [clonePassword, setClonePassword] = useState("");
+	const [projectFilter, setProjectFilter] = useState("");
 	const { t } = useTranslation("projects");
 	const { t: tc } = useTranslation("common");
 	const platform = usePlatform();
@@ -169,6 +171,19 @@ function ProjectListPage() {
 		}
 	};
 
+	const normalizedProjectFilter = projectFilter.trim().toLowerCase();
+	const filteredProjects = useMemo(() => {
+		if (!projects?.length) return [];
+		if (!normalizedProjectFilter) return projects;
+		return projects.filter((project) => {
+			const haystack = `${project.name ?? ""}\n${project.description ?? ""}\n${project.gitPath ?? ""}`;
+			return haystack.toLowerCase().includes(normalizedProjectFilter);
+		});
+	}, [normalizedProjectFilter, projects]);
+	const displayedProjects = filteredProjects.slice(0, PROJECT_LIST_RENDER_LIMIT);
+	const hiddenProjectCount = Math.max(0, filteredProjects.length - displayedProjects.length);
+	const showProjectFilter = (projects?.length ?? 0) > PROJECT_LIST_RENDER_LIMIT || !!projectFilter;
+
 	// Parse git clone progress for a progress bar
 	const progressPercent = parseGitProgress(createProjectStream.cloneProgress);
 
@@ -187,35 +202,58 @@ function ProjectListPage() {
 			{!projects?.length ? (
 				<Text c="dimmed">{t("noProjects")}</Text>
 			) : (
-				<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
-					{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-					{projects.map((project: any) => (
-						<Card
-							key={project.id}
-							shadow="sm"
-							padding="lg"
-							radius="md"
-							withBorder
-							component={Link}
-							to="/projects/$projectId"
-							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-							params={{ projectId: project.id } as any}
-							style={{ textDecoration: "none" }}
-						>
-							<Group justify="space-between" mb="xs">
-								<Text fw={500}>{project.name}</Text>
-								<Badge color={statusRegistry.projectStatus(project.status).color}>
-									{tc(statusRegistry.projectStatus(project.status).i18nKey)}
-								</Badge>
-							</Group>
-							{project.description && (
-								<Text size="sm" c="dimmed" lineClamp={2}>
-									{project.description}
+				<Stack gap="sm">
+					{showProjectFilter && (
+						<TextInput
+							placeholder={t("projectSearchPlaceholder")}
+							value={projectFilter}
+							onChange={(event) => setProjectFilter(event.currentTarget.value)}
+						/>
+					)}
+					{filteredProjects.length === 0 ? (
+						<Text c="dimmed">{t("noProjectMatches")}</Text>
+					) : (
+						<>
+							<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }}>
+								{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+								{displayedProjects.map((project: any) => (
+									<Card
+										key={project.id}
+										shadow="sm"
+										padding="lg"
+										radius="md"
+										withBorder
+										component={Link}
+										to="/projects/$projectId"
+										// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+										params={{ projectId: project.id } as any}
+										style={{ textDecoration: "none" }}
+									>
+										<Group justify="space-between" mb="xs">
+											<Text fw={500}>{project.name}</Text>
+											<Badge color={statusRegistry.projectStatus(project.status).color}>
+												{tc(statusRegistry.projectStatus(project.status).i18nKey)}
+											</Badge>
+										</Group>
+										{project.description && (
+											<Text size="sm" c="dimmed" lineClamp={2}>
+												{project.description}
+											</Text>
+										)}
+									</Card>
+								))}
+							</SimpleGrid>
+							{hiddenProjectCount > 0 && (
+								<Text size="sm" c="dimmed" ta="center">
+									{t("projectListTruncated", {
+										shown: displayedProjects.length,
+										hidden: hiddenProjectCount,
+									})}
 								</Text>
 							)}
-						</Card>
-					))}
-				</SimpleGrid>
+						</>
+					)}
+				</Stack>
 			)}
 
 			<Modal

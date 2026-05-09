@@ -72,6 +72,61 @@ function categoryColor(cat: PermCategory | "mcp"): string {
 	}
 }
 
+const MCP_SCHEMA_PREVIEW_MAX_CHARS = 80_000;
+
+function appendWithBudget(parts: string[], text: string, budget: { remaining: number }): boolean {
+	if (budget.remaining <= 0) return false;
+	const chunk = text.length > budget.remaining ? text.slice(0, budget.remaining) : text;
+	parts.push(chunk);
+	budget.remaining -= chunk.length;
+	return text.length <= chunk.length;
+}
+
+function formatJsonPreview(value: unknown, maxChars = MCP_SCHEMA_PREVIEW_MAX_CHARS): string {
+	const parts: string[] = [];
+	const budget = { remaining: maxChars };
+	const seen = new WeakSet<object>();
+
+	const write = (current: unknown, depth: number): boolean => {
+		if (current == null || typeof current === "number" || typeof current === "boolean") {
+			return appendWithBudget(parts, JSON.stringify(current), budget);
+		}
+		if (typeof current === "string") {
+			return appendWithBudget(parts, JSON.stringify(current), budget);
+		}
+		if (typeof current !== "object") {
+			return appendWithBudget(parts, JSON.stringify(String(current)), budget);
+		}
+		if (seen.has(current)) return appendWithBudget(parts, '"[Circular]"', budget);
+		seen.add(current);
+
+		const indent = "  ".repeat(depth);
+		const nextIndent = "  ".repeat(depth + 1);
+		if (Array.isArray(current)) {
+			if (!appendWithBudget(parts, "[", budget)) return false;
+			for (let i = 0; i < current.length; i++) {
+				if (!appendWithBudget(parts, `${i === 0 ? "" : ","}\n${nextIndent}`, budget)) return false;
+				if (!write(current[i], depth + 1)) return false;
+			}
+			return appendWithBudget(parts, `${current.length ? `\n${indent}` : ""}]`, budget);
+		}
+
+		const record = current as Record<string, unknown>;
+		const keys = Object.keys(record);
+		if (!appendWithBudget(parts, "{", budget)) return false;
+		for (let i = 0; i < keys.length; i++) {
+			const key = keys[i];
+			if (!appendWithBudget(parts, `${i === 0 ? "" : ","}\n${nextIndent}`, budget)) return false;
+			if (!appendWithBudget(parts, `${JSON.stringify(key)}: `, budget)) return false;
+			if (!write(record[key], depth + 1)) return false;
+		}
+		return appendWithBudget(parts, `${keys.length ? `\n${indent}` : ""}}`, budget);
+	};
+
+	const complete = write(value, 0);
+	return complete ? parts.join("") : `${parts.join("")}\n…`;
+}
+
 function categoryLabel(cat: PermCategory | "mcp", t: (key: string) => string): string {
 	switch (cat) {
 		case "always-allow":
@@ -216,6 +271,10 @@ function ToolPermissionsPage() {
 		const tool = server.tools?.find((t: any) => t.name === toolName);
 		return tool ? { ...tool, serverName } : null;
 	}, [selectedTool, mcpServers]);
+	const selectedMcpSchemaPreview = useMemo(() => {
+		if (selectedMcpTool?.inputSchema == null) return null;
+		return formatJsonPreview(selectedMcpTool.inputSchema);
+	}, [selectedMcpTool?.inputSchema]);
 
 	// Detail view
 	if (selectedTool && (selectedBuiltin || selectedMcpTool)) {
@@ -333,13 +392,13 @@ function ToolPermissionsPage() {
 							<Text size="sm" fw={600} mb={4}>
 								{t("tpMcpServer", { name: selectedMcpTool.serverName })}
 							</Text>
-							{selectedMcpTool.inputSchema != null && (
+							{selectedMcpSchemaPreview != null && (
 								<Text
 									size="xs"
 									c="dimmed"
 									style={{ fontFamily: "monospace", whiteSpace: "pre-wrap" }}
 								>
-									{JSON.stringify(selectedMcpTool.inputSchema, null, 2)}
+									{selectedMcpSchemaPreview}
 								</Text>
 							)}
 						</Paper>

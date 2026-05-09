@@ -25,6 +25,7 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
+import { type BooleanOverride, normalizeBooleanOverride } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -128,6 +129,8 @@ interface CreateNarratorInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
+	planReflectionAutoApproveOverride?: BooleanOverride;
+	dangerReflectionOverride?: BooleanOverride;
 	startInPlanMode?: boolean;
 	title?: string;
 }
@@ -585,6 +588,8 @@ export const narratorService = {
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: input.fastMode ?? false,
 				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+				planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
+				dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
 				cwd: input.cwd ?? null,
 				inheritMode: "fresh",
 				status: "idle",
@@ -648,6 +653,8 @@ export const narratorService = {
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: parent.fastMode ?? false,
 				relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
+				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
@@ -918,6 +925,8 @@ export const narratorService = {
 					reasoningEffort: parent.reasoningEffort ?? null,
 					fastMode: parent.fastMode ?? false,
 					relaxedPlan: parent.relaxedPlan ?? false,
+					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
+					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					parentNarratorId,
 					inheritMode: "full",
 					status: "idle",
@@ -1068,6 +1077,8 @@ export const narratorService = {
 					reasoningEffort: resolvedReasoningEffort,
 					fastMode: parent.fastMode ?? false,
 					relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
+					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					parentNarratorId,
 					forkMessageId: resolvedForkMessageId,
 					inheritMode,
@@ -1223,6 +1234,10 @@ export const narratorService = {
 					| undefined,
 				fastMode: parent.fastMode ?? undefined,
 				relaxedPlan: parent.relaxedPlan ?? undefined,
+				planReflectionAutoApproveOverride: normalizeBooleanOverride(
+					parent.planReflectionAutoApproveOverride,
+				),
+				dangerReflectionOverride: normalizeBooleanOverride(parent.dangerReflectionOverride),
 				title: opts?.title ?? undefined,
 			});
 			eventBus.emit({
@@ -1296,6 +1311,8 @@ export const narratorService = {
 	updateConversationId: narratorPersistence.updateConversationId.bind(narratorPersistence),
 	updateStats: narratorPersistence.updateStats.bind(narratorPersistence),
 	updateMessageCost: narratorPersistence.updateMessageCost.bind(narratorPersistence),
+	updateMessageHistoryTokenEstimate:
+		narratorPersistence.updateMessageHistoryTokenEstimate.bind(narratorPersistence),
 	updateTitle: narratorPersistence.updateTitle.bind(narratorPersistence),
 	updateCwd: narratorPersistence.updateCwd.bind(narratorPersistence),
 	updateModel: narratorPersistence.updateModel.bind(narratorPersistence),
@@ -1303,6 +1320,8 @@ export const narratorService = {
 	updateReasoningEffort: narratorPersistence.updateReasoningEffort.bind(narratorPersistence),
 	updateFastMode: narratorPersistence.updateFastMode.bind(narratorPersistence),
 	updateRelaxedPlan: narratorPersistence.updateRelaxedPlan.bind(narratorPersistence),
+	updateReflectionOverrides:
+		narratorPersistence.updateReflectionOverrides.bind(narratorPersistence),
 	updatePruneEnabled: narratorPersistence.updatePruneEnabled.bind(narratorPersistence),
 	updateStatus: narratorPersistence.updateStatus.bind(narratorPersistence),
 	compareAndSetStatus: narratorPersistence.compareAndSetStatus.bind(narratorPersistence),

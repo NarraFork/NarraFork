@@ -4,6 +4,16 @@ import { dirname, join } from "node:path";
 
 const GENERATED_IMAGE_ARTIFACTS_DIR = "generated_images";
 const STANDARD_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+export interface ImageGenerationDimensions {
+	width: number;
+	height: number;
+}
+
+export interface ImageGenerationSaveResult extends Partial<ImageGenerationDimensions> {
+	filePath: string;
+}
 
 export function sanitizeImageGenerationPathPart(value: string): string {
 	const sanitized = Array.from(value)
@@ -45,16 +55,29 @@ export function decodeStandardBase64Image(result: string): Buffer {
 	return bytes;
 }
 
+export function readPngImageDimensions(bytes: Buffer): ImageGenerationDimensions | undefined {
+	if (bytes.length < 24) return undefined;
+	if (!bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) return undefined;
+	if (bytes.toString("ascii", 12, 16) !== "IHDR") return undefined;
+	if (bytes.readUInt32BE(8) < 13) return undefined;
+
+	const width = bytes.readUInt32BE(16);
+	const height = bytes.readUInt32BE(20);
+	if (width <= 0 || height <= 0) return undefined;
+	return { width, height };
+}
+
 export async function saveImageGenerationResult(
 	sessionId: string,
 	imageId: string,
 	result: string,
-): Promise<string> {
+): Promise<ImageGenerationSaveResult> {
 	const bytes = decodeStandardBase64Image(result);
 	const filePath = imageGenerationArtifactPath(sessionId, imageId);
+	const dimensions = readPngImageDimensions(bytes);
 	await mkdir(dirname(filePath), { recursive: true });
 	await writeFile(filePath, bytes);
-	return filePath;
+	return { filePath, ...(dimensions ?? {}) };
 }
 
 export function buildImageGenerationSavedPathInstruction(savedPath: string): string {

@@ -572,7 +572,7 @@ export const narratorMessageQueries = {
 		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
 			includeChildMessages,
 		});
-		const keepCount = keepPairs * 2;
+		const keepCount = Math.max(1, Math.floor(keepPairs)) * 2;
 		if (refs.length < keepCount + 2) return null;
 		const boundaryRef = refs[refs.length - keepCount];
 		return boundaryRef.messageId;

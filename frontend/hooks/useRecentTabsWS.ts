@@ -51,6 +51,7 @@ export function useRecentTabsWS(
 					"presence_update",
 					"terminal_count_changed",
 					"container_status_changed",
+					"draft_changed",
 				],
 			},
 			(data) => {
@@ -84,6 +85,11 @@ export function useRecentTabsWS(
 					onUpdateRef.current(nId, {
 						type: "containerStatus",
 						containerStatus: data.containerStatus as NarratorListWSEvent["containerStatus"],
+					});
+				} else if (data.type === "draft_changed") {
+					onUpdateRef.current(nId, {
+						type: "draft",
+						hasDraft: !!data.hasDraft,
 					});
 				}
 			},

@@ -50,6 +50,7 @@ export interface ModelOverviewTabProps {
 }
 
 const MAX_HIDDEN_COLLAPSED = 3;
+const MAX_OVERVIEW_MODELS_RENDERED = 200;
 
 export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 	groups,
@@ -310,6 +311,12 @@ const ProviderModelGroup = React.memo(function ProviderModelGroup({
 		}
 		return { visible: v, hidden: h };
 	}, [group.models, hiddenModels]);
+	const visiblePreview = visible.slice(0, MAX_OVERVIEW_MODELS_RENDERED);
+	const hiddenPreview = hiddenExpanded
+		? hidden.slice(0, MAX_OVERVIEW_MODELS_RENDERED)
+		: hidden.slice(0, MAX_HIDDEN_COLLAPSED);
+	const hiddenVisibleOverflow = Math.max(0, visible.length - visiblePreview.length);
+	const hiddenHiddenOverflow = Math.max(0, hidden.length - hiddenPreview.length);
 
 	if (visible.length === 0 && hidden.length === 0) return null;
 
@@ -319,14 +326,30 @@ const ProviderModelGroup = React.memo(function ProviderModelGroup({
 				{group.label}
 			</Text>
 			<Stack gap={1} pl="xs">
-				{visible.map((m) => (
+				{visiblePreview.map((m) => (
 					<ModelLine key={m.value} model={m} dimmed={false} />
 				))}
+				{hiddenVisibleOverflow > 0 && (
+					<Text size="xs" c="dimmed">
+						{t("overviewModelPreviewTruncated", {
+							shown: visiblePreview.length,
+							hidden: hiddenVisibleOverflow,
+						})}
+					</Text>
+				)}
 				{hidden.length > 0 && (
 					<>
-						{(hiddenExpanded ? hidden : hidden.slice(0, MAX_HIDDEN_COLLAPSED)).map((m) => (
+						{hiddenPreview.map((m) => (
 							<ModelLine key={m.value} model={m} dimmed />
 						))}
+						{hiddenHiddenOverflow > 0 && (
+							<Text size="xs" c="dimmed">
+								{t("overviewHiddenPreviewTruncated", {
+									shown: hiddenPreview.length,
+									hidden: hiddenHiddenOverflow,
+								})}
+							</Text>
+						)}
 						{hidden.length > MAX_HIDDEN_COLLAPSED && (
 							<UnstyledButton onClick={() => setHiddenExpanded((v) => !v)}>
 								<Text size="xs" c="dimmed" td="underline">

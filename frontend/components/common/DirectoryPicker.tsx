@@ -55,6 +55,9 @@ import {
 import { api } from "../../lib/api";
 import { PathInput } from "./PathInput";
 
+const MAX_DIRECTORY_ENTRIES = 1_000;
+const FS_SHORTCUTS_QUERY_GC_TIME_MS = 60_000;
+
 interface DirectoryPickerProps {
 	value: string;
 	onChange: (path: string) => void;
@@ -253,6 +256,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 		queryKey: ["fs-shortcuts"],
 		queryFn: () => api.fsShortcuts(),
 		staleTime: 60_000,
+		gcTime: FS_SHORTCUTS_QUERY_GC_TIME_MS,
 	});
 
 	// Favorites
@@ -293,7 +297,10 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["fs-browse", currentPath, showHidden],
 		queryFn: () => api.fsBrowse(currentPath, { showHidden }),
+		gcTime: 30_000,
 	});
+	const displayedEntries = data?.entries.slice(0, MAX_DIRECTORY_ENTRIES) ?? [];
+	const hiddenEntryCount = Math.max(0, (data?.entries.length ?? 0) - displayedEntries.length);
 
 	const isFavorited = favorites.some((f) => f.path === (data?.path ?? ""));
 
@@ -639,7 +646,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 									</>
 								)}
 								{/* Subdirectories */}
-								{data.entries.map((entry) => (
+								{displayedEntries.map((entry) => (
 									<UnstyledButton
 										key={entry.path}
 										onClick={() => navigateTo(entry.path)}
@@ -667,6 +674,11 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 										</Group>
 									</UnstyledButton>
 								))}
+								{hiddenEntryCount > 0 && (
+									<Text c="dimmed" size="xs" ta="center" px="sm" py={8}>
+										{t("directoryPickerMoreEntries", { count: hiddenEntryCount })}
+									</Text>
+								)}
 								{/* Inline new folder input */}
 								{creatingFolder && data.path && (
 									<Group gap="xs" px="sm" py={4} wrap="nowrap">

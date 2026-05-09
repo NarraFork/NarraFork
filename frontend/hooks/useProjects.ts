@@ -2,10 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { api } from "../lib/api";
 
+const PROJECT_QUERY_GC_TIME_MS = 60_000;
+
 export function useProjects(status?: string) {
 	return useQuery({
 		queryKey: ["projects", { status }],
 		queryFn: () => api.listProjects(status),
+		gcTime: PROJECT_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -14,6 +17,7 @@ export function useProject(id: string) {
 		queryKey: ["projects", id],
 		queryFn: () => api.getProject(id),
 		enabled: !!id,
+		gcTime: PROJECT_QUERY_GC_TIME_MS,
 	});
 }
 

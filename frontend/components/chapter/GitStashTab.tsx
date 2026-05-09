@@ -3,6 +3,15 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useGitStash, useGitStashList } from "../../hooks/useGit";
 
+const MAX_GIT_STASH_TEXT_CHARS = 1_000;
+
+function clampGitStashText(value: string | null | undefined): string {
+	if (!value) return "";
+	return value.length > MAX_GIT_STASH_TEXT_CHARS
+		? `${value.slice(0, MAX_GIT_STASH_TEXT_CHARS)}…`
+		: value;
+}
+
 export function GitStashTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
 	const { data: stashes, isLoading } = useGitStashList(chapterId);
@@ -53,10 +62,10 @@ export function GitStashTab({ chapterId }: { chapterId: string }) {
 							{"}"}
 						</Text>
 						<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-							{s.message}
+							{clampGitStashText(s.message)}
 						</Text>
 						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-							{s.date}
+							{clampGitStashText(s.date)}
 						</Text>
 						<Group gap={4} style={{ flexShrink: 0 }}>
 							<Button

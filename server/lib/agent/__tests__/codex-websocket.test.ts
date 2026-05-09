@@ -188,9 +188,15 @@ describe("Codex Responses WebSocket helpers", () => {
 		});
 	});
 
-	test("only counts completed visible stream events as yielded output", () => {
+	test("counts visible stream events and any tool use chunks as yielded output", () => {
 		expect(shouldTreatCodexStreamEventAsYielded({ responseId: "resp_1" })).toBe(false);
 		expect(shouldTreatCodexStreamEventAsYielded({ messageId: "msg_1" })).toBe(false);
+		expect(shouldTreatCodexStreamEventAsYielded({ credentialId: "cred_1" })).toBe(false);
+		expect(shouldTreatCodexStreamEventAsYielded({ queueStatus: { position: 1 } })).toBe(false);
+		expect(shouldTreatCodexStreamEventAsYielded({ quotaBalance: "42" })).toBe(false);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({ usage: { promptTokens: 10, completionTokens: 0 } }),
+		).toBe(false);
 		expect(
 			shouldTreatCodexStreamEventAsYielded({ webSearch: { id: "ws_1", status: "in_progress" } }),
 		).toBe(false);
@@ -201,12 +207,27 @@ describe("Codex Responses WebSocket helpers", () => {
 		).toBe(true);
 		expect(
 			shouldTreatCodexStreamEventAsYielded({
-				toolUseChunk: { toolUseId: "call_1", name: "Read", input: "{}" },
+				imageGeneration: { id: "img_1", status: "generating" },
 			}),
 		).toBe(false);
 		expect(
 			shouldTreatCodexStreamEventAsYielded({
+				imageGeneration: { id: "img_1", status: "completed", final: true, result: "base64" },
+			}),
+		).toBe(true);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
+				toolUseChunk: { toolUseId: "call_1", name: "Read", input: "{}" },
+			}),
+		).toBe(true);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
 				toolUseChunk: { toolUseId: "call_1", name: "Read", stop: true },
+			}),
+		).toBe(true);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
+				toolUses: [{ toolUseId: "call_2", name: "Read", input: {} }],
 			}),
 		).toBe(true);
 		expect(shouldTreatCodexStreamEventAsYielded({ text: "hello" })).toBe(true);

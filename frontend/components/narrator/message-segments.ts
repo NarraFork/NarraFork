@@ -395,7 +395,16 @@ export function collectSegmentTargetIds(seg: RenderSegment): string[] {
 // reusing the old reference when data is shallowly equal, we prevent
 // unnecessary re-renders of ToolCallCard components that would
 // otherwise receive new prop object references every frame.
+const MAX_TOOL_BLOCK_CACHE_ENTRIES = 256;
 const toolBlockCache = new Map<string, ContentBlock>();
+
+function trimToolBlockCache() {
+	while (toolBlockCache.size > MAX_TOOL_BLOCK_CACHE_ENTRIES) {
+		const oldestKey = toolBlockCache.keys().next().value;
+		if (oldestKey === undefined) return;
+		toolBlockCache.delete(oldestKey);
+	}
+}
 
 function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
 	const id = block.id;
@@ -403,9 +412,12 @@ function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
 
 	const cached = toolBlockCache.get(id);
 	if (cached && shallowBlockEqual(cached, block)) {
+		toolBlockCache.delete(id);
+		toolBlockCache.set(id, cached);
 		return cached;
 	}
 	toolBlockCache.set(id, block);
+	trimToolBlockCache();
 	return block;
 }
 

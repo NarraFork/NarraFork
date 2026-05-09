@@ -51,6 +51,10 @@ function SettingsAgentPage() {
 				setDefaultStartInPlanMode={is.setDefaultStartInPlanMode}
 				defaultRelaxedPlan={is.defaultRelaxedPlan}
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
+				planReflectionAutoApprove={is.planReflectionAutoApprove}
+				setPlanReflectionAutoApprove={is.setPlanReflectionAutoApprove}
+				dangerReflectionEnabled={is.dangerReflectionEnabled}
+				setDangerReflectionEnabled={is.setDangerReflectionEnabled}
 				dangerSkipReadOnlyConfirmations={is.dangerSkipReadOnlyConfirmations}
 				setDangerSkipReadOnlyConfirmations={is.setDangerSkipReadOnlyConfirmations}
 				maxTransientRetries={is.maxTransientRetries}
@@ -65,6 +69,8 @@ function SettingsAgentPage() {
 				setCustomRetryRules={is.setCustomRetryRules}
 				contextThresholds={is.contextThresholds}
 				setContextThresholds={is.setContextThresholds}
+				autoCompactKeepPairs={is.autoCompactKeepPairs}
+				setAutoCompactKeepPairs={is.setAutoCompactKeepPairs}
 				globalWhitelistDirs={is.globalWhitelistDirs}
 				setGlobalWhitelistDirs={is.setGlobalWhitelistDirs}
 				globalBlacklistDirs={is.globalBlacklistDirs}

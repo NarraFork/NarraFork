@@ -11,6 +11,7 @@ interface ModelTestDialogProps {
 }
 
 const DEFAULT_PROMPT = "Please introduce yourself in one sentence. / 请用一句话介绍你自己。";
+const MAX_MODEL_TEST_RESULT_CHARS = 60_000;
 
 export function ModelTestDialog({ opened, onClose, modelValue }: ModelTestDialogProps) {
 	const { t } = useTranslation("settings");
@@ -19,6 +20,11 @@ export function ModelTestDialog({ opened, onClose, modelValue }: ModelTestDialog
 	const testMut = useMutation({
 		mutationFn: () => api.testModel(modelValue, prompt),
 	});
+	const displayedResult =
+		testMut.data?.text && testMut.data.text.length > MAX_MODEL_TEST_RESULT_CHARS
+			? testMut.data.text.slice(0, MAX_MODEL_TEST_RESULT_CHARS)
+			: testMut.data?.text;
+	const resultTruncated = !!testMut.data?.text && displayedResult !== testMut.data.text;
 
 	const handleTest = () => {
 		testMut.mutate();
@@ -63,9 +69,14 @@ export function ModelTestDialog({ opened, onClose, modelValue }: ModelTestDialog
 						<Text size="sm" fw={500}>
 							{t("modelTestResult")}
 						</Text>
+						{resultTruncated && (
+							<Text size="xs" c="yellow">
+								{t("modelTestResultTruncated")}
+							</Text>
+						)}
 						<ScrollArea.Autosize mah={300}>
 							<Code block style={{ whiteSpace: "pre-wrap" }}>
-								{testMut.data.text}
+								{displayedResult}
 							</Code>
 						</ScrollArea.Autosize>
 					</Stack>

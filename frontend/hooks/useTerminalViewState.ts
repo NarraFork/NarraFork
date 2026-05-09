@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef } from "react";
 import { api } from "../lib/api";
 
+const TERMINAL_VIEW_STATE_QUERY_GC_TIME_MS = 60_000;
+
 interface ViewState {
 	layout: string;
 	activeTabId: string | null;
@@ -16,6 +18,7 @@ export function useTerminalViewState(opts: { chapterId?: string; narratorId?: st
 		queryKey: ["terminalViewState", opts],
 		queryFn: () => api.getTerminalViewState(opts),
 		enabled: !!(opts.chapterId || opts.narratorId),
+		gcTime: TERMINAL_VIEW_STATE_QUERY_GC_TIME_MS,
 	});
 
 	const mutation = useMutation({

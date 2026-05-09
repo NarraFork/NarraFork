@@ -9,15 +9,19 @@ export const Route = createFileRoute("/")({
 	component: DashboardPage,
 });
 
+const DASHBOARD_QUERY_GC_TIME_MS = 60_000;
+
 function DashboardPage() {
 	const { t } = useTranslation("dashboard");
 	const { data: projects, isLoading: projectsLoading } = useQuery({
 		queryKey: ["projects"],
 		queryFn: () => api.listProjects(),
+		gcTime: DASHBOARD_QUERY_GC_TIME_MS,
 	});
 	const { data: sessionsData } = useQuery({
 		queryKey: ["narrators", "count", { standalone: true }],
 		queryFn: () => api.listNarratorsPaginated({ standalone: true, limit: 1 }),
+		gcTime: DASHBOARD_QUERY_GC_TIME_MS,
 	});
 
 	const activeProjects = useMemo(() => {

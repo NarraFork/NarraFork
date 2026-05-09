@@ -115,8 +115,9 @@ function buildForecastGridLines({
 function formatQuotaForecastDuration(
 	timestamp: number,
 	t: (key: string, values?: Record<string, number | string>) => string,
+	referenceTime = Date.now(),
 ): string {
-	const diffMinutes = Math.round((timestamp - Date.now()) / 60_000);
+	const diffMinutes = Math.round((timestamp - referenceTime) / 60_000);
 	if (Math.abs(diffMinutes) < 1) return t("codexQuotaForecastNow");
 
 	const absMinutes = Math.abs(diffMinutes);
@@ -139,6 +140,16 @@ function getPointValue(point: ForecastPointLike, tier: CodexPlanTier): number {
 	return point.byType[tier as PublicCodexPlanTier] ?? 0;
 }
 
+function getForecastGeneratedAt(forecast: ForecastLike): number {
+	const generatedAt = new Date(forecast.generatedAt).getTime();
+	return Number.isFinite(generatedAt) ? generatedAt : Date.now();
+}
+
+function shouldRenderSeparateTick(timestamp: number, minTime: number, maxTime: number): boolean {
+	const minTickDistance = 15 * 60_000;
+	return timestamp > minTime + minTickDistance && timestamp < maxTime - minTickDistance;
+}
+
 export function CodexQuotaForecastChart({
 	forecast,
 	selectedTiers,
@@ -158,7 +169,8 @@ export function CodexQuotaForecastChart({
 		overlayX: number;
 		alignRight: boolean;
 	} | null>(null);
-	const points = forecast.points;
+	const points = [...forecast.points].sort((a, b) => a.timestamp - b.timestamp);
+	const forecastNow = getForecastGeneratedAt(forecast);
 	const width = 680;
 	const height = 190;
 	const padding = { left: 42, right: 16, top: 14, bottom: 34 };
@@ -173,10 +185,12 @@ export function CodexQuotaForecastChart({
 		1,
 		...points.flatMap((point) => visibleTiers.map((tier) => getPointValue(point, tier))),
 	);
-	const minTime = points[0]?.timestamp ?? Date.now();
-	const maxTime = points[points.length - 1]?.timestamp ?? minTime;
+	const firstPointTime = points[0]?.timestamp ?? forecastNow;
+	const lastPointTime = points[points.length - 1]?.timestamp ?? forecastNow;
+	const minTime = Math.min(firstPointTime, forecastNow);
+	const maxTime = Math.max(lastPointTime, forecastNow);
 	const hasChartData = points.length >= 2;
-	const nearEndTime = Math.min(minTime + NEAR_WINDOW_MS, maxTime);
+	const nearEndTime = Math.min(forecastNow + NEAR_WINDOW_MS, maxTime);
 	const nearDuration = Math.max(nearEndTime - minTime, 1);
 	const compressedDuration = Math.max(maxTime - nearEndTime, 0);
 	const isCompressedTimeScale = compressedDuration > HOUR_MS;
@@ -225,6 +239,11 @@ export function CodexQuotaForecastChart({
 		);
 	};
 	const yFor = (value: number) => padding.top + chartHeight - (value / maxValue) * chartHeight;
+	const nowX = xFor(forecastNow);
+	const showNowMarker = maxTime > minTime && forecastNow >= minTime && forecastNow <= maxTime;
+	const showNowTick = showNowMarker && shouldRenderSeparateTick(forecastNow, minTime, maxTime);
+	const showCompressedBoundaryTick =
+		isCompressedTimeScale && shouldRenderSeparateTick(nearEndTime, minTime, maxTime);
 	const timeFor = (x: number) => {
 		if (chartWidth <= 0 || maxTime === minTime) return minTime;
 		const clampedX = Math.min(Math.max(x, padding.left), padding.left + chartWidth);
@@ -257,7 +276,7 @@ export function CodexQuotaForecastChart({
 		<text x={x} y={height - 19} textAnchor={textAnchor} fontSize="10" fill="gray">
 			<tspan x={x}>{formatChartTimestamp(timestamp)}</tspan>
 			<tspan x={x} dy={13} fill="var(--mantine-color-dimmed)">
-				{formatQuotaForecastDuration(timestamp, t)}
+				{formatQuotaForecastDuration(timestamp, t, forecastNow)}
 			</tspan>
 		</text>
 	);
@@ -346,7 +365,8 @@ export function CodexQuotaForecastChart({
 						0
 					</text>
 					{renderTimeTick(minTime, padding.left, "start")}
-					{isCompressedTimeScale && renderTimeTick(nearEndTime, xFor(nearEndTime), "middle")}
+					{showNowTick && renderTimeTick(forecastNow, nowX, "middle")}
+					{showCompressedBoundaryTick && renderTimeTick(nearEndTime, xFor(nearEndTime), "middle")}
 					{renderTimeTick(maxTime, padding.left + chartWidth, "end")}
 					{visibleTiers.map((tier) => (
 						<path
@@ -370,6 +390,28 @@ export function CodexQuotaForecastChart({
 							strokeOpacity={0.82}
 						/>
 					))}
+					{showNowMarker ? (
+						<>
+							<line
+								x1={nowX}
+								y1={padding.top}
+								x2={nowX}
+								y2={padding.top + chartHeight}
+								stroke="var(--mantine-color-indigo-6)"
+								strokeWidth={1.5}
+								strokeDasharray="3 3"
+							/>
+							<text
+								x={Math.min(Math.max(nowX, padding.left + 18), padding.left + chartWidth - 18)}
+								y={padding.top + 11}
+								textAnchor="middle"
+								fontSize="10"
+								fill="var(--mantine-color-indigo-6)"
+							>
+								{t("codexQuotaForecastNow")}
+							</text>
+						</>
+					) : null}
 					{hoveredCursor ? (
 						<>
 							<line
@@ -416,7 +458,7 @@ export function CodexQuotaForecastChart({
 							</Text>
 							<Text size="xs" c="dimmed">
 								{t("codexQuotaForecastTooltipDistance")}:{" "}
-								{formatQuotaForecastDuration(hoveredCursor.timestamp, t)}
+								{formatQuotaForecastDuration(hoveredCursor.timestamp, t, forecastNow)}
 							</Text>
 							{visibleTiers.map((tier) => (
 								<Group key={tier} justify="space-between" gap="sm" wrap="nowrap">

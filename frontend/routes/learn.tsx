@@ -52,6 +52,8 @@ function normalizeLanguage(lng: string | undefined): string {
 	return lng?.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
 }
 
+const LEARNING_QUERY_GC_TIME_MS = 60_000;
+
 function LearnPage() {
 	const { t, i18n } = useTranslation("learning");
 	const search = Route.useSearch();
@@ -63,6 +65,7 @@ function LearnPage() {
 	const { data: index, isLoading: indexLoading } = useQuery({
 		queryKey: ["learning", "index", lang],
 		queryFn: () => api.getLearningIndex(lang),
+		gcTime: LEARNING_QUERY_GC_TIME_MS,
 	});
 
 	const filteredDocs = useMemo(() => {
@@ -92,6 +95,7 @@ function LearnPage() {
 		queryKey: ["learning", "doc", effectiveDocId, lang],
 		queryFn: () => api.getLearningDoc(effectiveDocId ?? "", lang),
 		enabled: !!effectiveDocId,
+		gcTime: LEARNING_QUERY_GC_TIME_MS,
 	});
 
 	const selectDoc = (id: string) => {

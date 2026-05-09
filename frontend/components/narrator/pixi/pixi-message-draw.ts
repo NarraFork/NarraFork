@@ -170,6 +170,9 @@ function drawRoundRect(
 	}
 }
 
+const MAX_IDLE_IMAGE_POOL_ITEMS = 64;
+const MAX_IDLE_TEXT_POOL_ITEMS = 300;
+
 export class ImageSpritePool {
 	private pool: Sprite[] = [];
 	private maskPool: Graphics[] = [];
@@ -233,11 +236,28 @@ export class ImageSpritePool {
 		for (let i = this.cursor; i < this.maskPool.length; i++) {
 			this.maskPool[i].clear();
 		}
+		this.trimIdleItems();
 	}
 
 	refreshTextures(): void {
 		for (const sprite of this.pool) {
 			sprite.texture = Texture.EMPTY;
+		}
+	}
+
+	private trimIdleItems(): void {
+		const maxRetained = this.cursor + MAX_IDLE_IMAGE_POOL_ITEMS;
+		while (this.pool.length > maxRetained) {
+			const sprite = this.pool.pop();
+			if (!sprite) break;
+			this.container.removeChild(sprite);
+			sprite.destroy();
+		}
+		while (this.maskPool.length > maxRetained) {
+			const mask = this.maskPool.pop();
+			if (!mask) break;
+			this.container.removeChild(mask);
+			mask.destroy();
 		}
 	}
 
@@ -288,7 +308,9 @@ export class TextPool {
 	releaseUnused(): void {
 		for (let i = this.cursor; i < this.pool.length; i++) {
 			this.pool[i].visible = false;
+			this.pool[i].text = "";
 		}
+		this.trimIdleItems();
 	}
 
 	refreshTextures(): void {
@@ -298,6 +320,16 @@ export class TextPool {
 			// unchanged. This recovers text textures after mobile browsers suspend or
 			// restore the WebGL context while the app is in the background.
 			node.resolution = resolution;
+		}
+	}
+
+	private trimIdleItems(): void {
+		const maxRetained = this.cursor + MAX_IDLE_TEXT_POOL_ITEMS;
+		while (this.pool.length > maxRetained) {
+			const node = this.pool.pop();
+			if (!node) break;
+			this.container.removeChild(node);
+			node.destroy();
 		}
 	}
 
@@ -1004,7 +1036,9 @@ function drawImageBlock(opts: DrawSpecialBlockOptions) {
 			? "Loading image"
 			: textureResult.status === "failed"
 				? `Image failed: ${textureResult.error ?? "unknown"}`
-				: block.imageFilename || block.text || label;
+				: block.imageStatus === "too_large"
+					? "Image too large to preview"
+					: block.imageFilename || block.text || label;
 	const text = `📷 ${compactText(statusLabel, 42)}`;
 	textPool.acquire(
 		text,
@@ -1163,6 +1197,8 @@ export type PixiMessageHitTarget =
 			messageUuid?: string | null;
 			blockIndex?: number;
 			copyText?: string;
+			imageSrc?: string;
+			imageSavedPath?: string;
 			/** Right edge of the element that visually moves during swipe. */
 			swipeInitialRight?: number;
 	  });
@@ -2123,7 +2159,10 @@ export function drawPixiMessages(opts: {
 			const swipeInitialRight = isTool ? laid.x + block.x + block.width : laid.x + laid.width;
 			const isSelected = selectedBlockIds?.has(blockId) ?? false;
 			let by = y + block.y;
-			if (hitTargets && (block.messageId || block.copyText)) {
+			if (
+				hitTargets &&
+				(block.messageId || block.copyText || block.imageSrc || block.imageSavedPath)
+			) {
 				hitTargets.push({
 					id: messageMenuId,
 					kind: "message-menu",
@@ -2132,6 +2171,8 @@ export function drawPixiMessages(opts: {
 					messageUuid: block.messageUuid ?? item.messageUuid,
 					blockIndex: block.blockIndex,
 					copyText: block.copyText || block.text,
+					imageSrc: block.imageSrc,
+					imageSavedPath: block.imageSavedPath,
 					swipeInitialRight,
 					x: bx,
 					y: by,

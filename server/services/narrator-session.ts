@@ -18,6 +18,7 @@ import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
+import { resolveBooleanOverride } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -32,12 +33,14 @@ import {
 	isSubagentVariant,
 	parseSubstatus,
 	parseTraits,
+	redactDraftTraits,
 } from "../lib/narrator-utils";
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { getHome } from "../lib/platform";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
+	getAutoCompactKeepPairs,
 	getContextThresholds,
 	getSettingsRevision,
 	isAnthropicProvider,
@@ -978,7 +981,7 @@ export async function runAgentLoop(
 						type: "plan_mode_changed",
 						narratorId,
 						planMode: true,
-						traits: planState.traits,
+						traits: redactDraftTraits(planState.traits),
 					});
 				},
 				onExitPlanMode: async (toolUseId) => {
@@ -994,7 +997,7 @@ export async function runAgentLoop(
 							type: "plan_mode_changed",
 							narratorId,
 							planMode: false,
-							traits: planState.traits,
+							traits: redactDraftTraits(planState.traits),
 						});
 					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
@@ -1213,6 +1216,10 @@ export async function runAgentLoop(
 				previousPermissionMode:
 					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
 				relaxedPlan: !!freshNarrator.relaxedPlan,
+				planReflectionAutoApprove: resolveBooleanOverride(
+					freshNarrator.planReflectionAutoApproveOverride,
+					settings.agent.planReflectionAutoApprove,
+				),
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
@@ -1558,7 +1565,7 @@ export async function runAgentLoop(
 					narratorId,
 					error: result.retryableError,
 					retryCount: transientRetries,
-					maxRetries: getMaxTransientRetries(),
+					maxRetries: result.bypassRetryLimit ? -1 : getMaxTransientRetries(),
 					signal: active.abortController.signal,
 				});
 				if (shouldRetry) {
@@ -1568,8 +1575,13 @@ export async function runAgentLoop(
 					// Otherwise the partial is deleted so the retry starts fresh.
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
+					let keptPartial = false;
 					if (partialId) {
-						await finalizeOrCleanupPartialMessage(partialId, narratorId);
+						keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+					}
+					if (keptPartial) {
+						currentText = "";
+						currentImages = undefined;
 					}
 					continue;
 				}
@@ -1829,7 +1841,10 @@ export async function runAgentLoop(
 						},
 					);
 				} else {
-					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+						narratorId,
+						getAutoCompactKeepPairs(),
+					);
 
 					if (boundaryMessageId) {
 						logger.info("Context usage high, triggering background compact (post-turn)", {

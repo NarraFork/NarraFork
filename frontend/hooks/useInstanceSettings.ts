@@ -35,6 +35,8 @@ export interface InstanceSettingsState {
 	requestDumpEnabled: boolean;
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
+	planReflectionAutoApprove: boolean;
+	dangerReflectionEnabled: boolean;
 	dangerSkipReadOnlyConfirmations: boolean;
 	maxTransientRetries: number;
 	silentToolCallThreshold: number;
@@ -52,6 +54,7 @@ export interface InstanceSettingsState {
 		standard: { pruneStart: number; compactStart: number };
 		large: { pruneStart: number; compactStart: number };
 	};
+	autoCompactKeepPairs: number;
 	codexDefaultReasoningEffort: string;
 	agentDefaultReasoningEffort: string;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
@@ -114,6 +117,8 @@ function makeDefaults(): InstanceSettingsState {
 		requestDumpEnabled: false,
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
+		planReflectionAutoApprove: false,
+		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
@@ -124,6 +129,7 @@ function makeDefaults(): InstanceSettingsState {
 			standard: { pruneStart: 95, compactStart: 99 },
 			large: { pruneStart: 95, compactStart: 99 },
 		},
+		autoCompactKeepPairs: 2,
 		codexDefaultReasoningEffort: "high",
 		agentDefaultReasoningEffort: "",
 		globalWhitelistDirs: [],
@@ -191,6 +197,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
+				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
+				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
@@ -201,6 +209,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					standard: { pruneStart: 95, compactStart: 99 },
 					large: { pruneStart: 95, compactStart: 99 },
 				},
+				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
@@ -275,6 +284,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					requestDumpEnabled: state.requestDumpEnabled,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
+					planReflectionAutoApprove: state.planReflectionAutoApprove,
+					dangerReflectionEnabled: state.dangerReflectionEnabled,
 					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
@@ -285,6 +296,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					firstTokenTimeoutMs: state.firstTokenTimeoutMs,
 					customRetryRules: state.customRetryRules,
 					contextThresholds: state.contextThresholds,
+					autoCompactKeepPairs: state.autoCompactKeepPairs,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,

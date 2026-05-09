@@ -18,6 +18,8 @@ import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ModelAggregation, ModelOption } from "../../lib/constants";
 
+const MODEL_SELECT_OPTION_LIMIT = 100;
+
 export interface ModelAggregationsSectionProps {
 	aggregations: ModelAggregation[];
 	onChange: (aggregations: ModelAggregation[]) => void;
@@ -191,6 +193,7 @@ function AddAggregationModal({
 					value={models}
 					onChange={setModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					placeholder={t("aggModelsPlaceholder")}
 					maxDropdownHeight={240}
 				/>
@@ -295,6 +298,7 @@ const AggregationCard = memo(function AggregationCard({
 					value={agg.models}
 					onChange={(v) => onUpdate(agg.id, { models: v })}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					placeholder={t("aggModelsPlaceholder")}
 					maxDropdownHeight={200}
 				/>

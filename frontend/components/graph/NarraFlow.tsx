@@ -63,6 +63,13 @@ const edgeTypes = {
 	review: ReviewEdge,
 };
 
+function areStringArraysEqual(a?: readonly string[] | null, b?: readonly string[] | null): boolean {
+	const left = a ?? [];
+	const right = b ?? [];
+	if (left.length !== right.length) return false;
+	return left.every((value, index) => value === right[index]);
+}
+
 interface ContextMenuState {
 	x: number;
 	y: number;
@@ -404,6 +411,26 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		if (restored.size > 0) setExpandedNodes(restored);
 	}, [graphNodes]);
 
+	// Drop UI-only graph state for nodes that disappeared from the server graph.
+	useEffect(() => {
+		const validNodeIds = new Set(graphNodes.map((node) => node.id));
+		for (const nodeId of panelSizesRef.current.keys()) {
+			if (!validNodeIds.has(nodeId)) panelSizesRef.current.delete(nodeId);
+		}
+		setExpandedNodes((prev) => {
+			let changed = false;
+			const next = new Set<string>();
+			for (const nodeId of prev) {
+				if (validNodeIds.has(nodeId)) {
+					next.add(nodeId);
+				} else {
+					changed = true;
+				}
+			}
+			return changed ? next : prev;
+		});
+	}, [graphNodes]);
+
 	// Focus on a specific chapter node when navigating back from narrator page.
 	// `nodes` is intentionally in the dep array: tryFocusChapter reads nodesRef
 	// which updates when nodes change, so we need to re-attempt when new nodes arrive.
@@ -630,10 +657,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				...(event.status !== undefined ? { status: event.status } : {}),
 				...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
 			};
-			if (
-				prev.status !== next.status ||
-				JSON.stringify(prev.substatus ?? []) !== JSON.stringify(next.substatus ?? [])
-			) {
+			if (prev.status !== next.status || !areStringArraysEqual(prev.substatus, next.substatus)) {
 				liveStatusesRef.current.set(chapterId, next);
 				setLiveStatusesTick((t) => t + 1);
 			}
@@ -696,8 +720,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				cached.width === width &&
 				cached.height === height &&
 				cached.narratorStatus === narratorStatus &&
-				JSON.stringify(cached.narratorSubstatus ?? []) ===
-					JSON.stringify(narratorSubstatus ?? []) &&
+				areStringArraysEqual(cached.narratorSubstatus, narratorSubstatus) &&
 				cached.onToggleExpand === handleToggleExpand
 			) {
 				nextCache.set(node.id, cached);

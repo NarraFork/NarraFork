@@ -93,6 +93,7 @@ function formatSize(bytes: number): string {
 
 /** Estimated trace growth rate: ~2 MB/s (typical Chrome trace with default categories). */
 const TRACE_RATE_BYTES_PER_MS = 2000;
+const MAX_SCREENSHOT_BLOB_BYTES = 20 * 1024 * 1024;
 
 const TTL_PRESETS = [
 	{ label: "10m", value: 10 * 60_000 },
@@ -169,6 +170,7 @@ function SessionCard({
 			);
 			if (!res.ok) throw new Error(`HTTP ${res.status}`);
 			const blob = await res.blob();
+			if (blob.size > MAX_SCREENSHOT_BLOB_BYTES) throw new Error("Screenshot too large");
 			const url = URL.createObjectURL(blob);
 			if (controller.signal.aborted) {
 				URL.revokeObjectURL(url);

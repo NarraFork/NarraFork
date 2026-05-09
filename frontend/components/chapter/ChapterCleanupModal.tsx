@@ -3,6 +3,15 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+
+const MAX_CHAPTER_CLEANUP_LABEL_CHARS = 500;
+
+function clampCleanupLabel(value: string): string {
+	return value.length > MAX_CHAPTER_CLEANUP_LABEL_CHARS
+		? `${value.slice(0, MAX_CHAPTER_CLEANUP_LABEL_CHARS)}…`
+		: value;
+}
 
 interface ChapterCleanupModalProps {
 	chapters: Array<{ id: string; title: string; status: string }>;
@@ -17,6 +26,7 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 	const qc = useQueryClient();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
+	const confirm = useConfirmDialog();
 
 	const resetState = () => {
 		setSelected([]);
@@ -47,6 +57,31 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 		setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
 	};
 
+	const handleCleanup = async () => {
+		if (force || deleteBranch) {
+			const confirmed = await confirm({
+				title: t("cleanupConfirmTitle"),
+				message: (
+					<Stack gap={4}>
+						<Text size="sm">{t("cleanupConfirmMessage", { count: selected.length })}</Text>
+						<Text size="sm">
+							{t("cleanupConfirmForce", { value: force ? tc("yes") : tc("no") })}
+						</Text>
+						<Text size="sm">
+							{t("cleanupConfirmDeleteBranch", {
+								value: deleteBranch ? tc("yes") : tc("no"),
+							})}
+						</Text>
+					</Stack>
+				),
+				confirmLabel: t("cleanupConfirmButton"),
+				confirmColor: "red",
+			});
+			if (!confirmed) return;
+		}
+		cleanup.mutate();
+	};
+
 	// Only show chapters that can be cleaned up
 	const cleanable = chapters.filter((ch) => ch.status === "active" || ch.status === "dormant");
 
@@ -59,7 +94,7 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 				{cleanable.map((ch) => (
 					<Checkbox
 						key={ch.id}
-						label={ch.title}
+						label={clampCleanupLabel(ch.title)}
 						checked={selected.includes(ch.id)}
 						onChange={() => toggleChapter(ch.id)}
 					/>
@@ -88,7 +123,7 @@ export function ChapterCleanupModal({ chapters, opened, onClose }: ChapterCleanu
 				)}
 				<Button
 					color="red"
-					onClick={() => cleanup.mutate()}
+					onClick={handleCleanup}
 					loading={cleanup.isPending}
 					disabled={selected.length === 0}
 				>

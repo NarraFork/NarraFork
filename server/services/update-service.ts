@@ -822,7 +822,7 @@ function moveFileSync(src: string, dst: string): void {
  * 1. Move the update file to the same directory as the current executable
  * 2. Mark a one-time graceful restart handoff session as pending
  * 3. Spawn the new binary as a detached replacement process
- * 4. The new process calls /api/gracefully_shutdown and waits for us to release the port
+ * 4. The new process calls /api/gracefully_shutdown and waits for the marker nonce
  */
 export function applyUpdate(): {
 	success: boolean;
@@ -877,6 +877,8 @@ export function applyUpdate(): {
 			...process.env,
 			NARRAFORK_GRACEFUL_RESTART_URL: session.url,
 			NARRAFORK_GRACEFUL_RESTART_TOKEN: session.token,
+			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
+			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
 		const proc = Bun.spawn([newExecPath, ...process.argv.slice(2)], {
 			cwd: process.cwd(),
@@ -891,6 +893,7 @@ export function applyUpdate(): {
 			newExecPath,
 			replacementPid: proc.pid,
 			handoffUrl: session.url,
+			markerPath: session.markerPath,
 		});
 
 		return {

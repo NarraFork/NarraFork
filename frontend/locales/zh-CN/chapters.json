@@ -79,6 +79,11 @@
 	"deleteBranches": "删除 Git 分支",
 	"cleanupFailed": "清理失败",
 	"cleanupCount": "清理 {{count}} 个章节",
+	"cleanupConfirmTitle": "确认危险清理",
+	"cleanupConfirmMessage": "即将清理选中的 {{count}} 个章节。此操作不可撤销。",
+	"cleanupConfirmForce": "强制清理：{{value}}",
+	"cleanupConfirmDeleteBranch": "删除 Git 分支：{{value}}",
+	"cleanupConfirmButton": "仍然清理",
 	"forkFromMessage": "从此消息分叉",
 	"dormant": "休眠",
 	"wake": "唤醒",
@@ -91,6 +96,9 @@
 		"frozen": "已冻结"
 	},
 	"commitDetail": {
-		"noDiff": "此提交没有文件变更。"
+		"noDiff": "此提交没有文件变更。",
+		"diffPreviewTruncated": "Diff 预览已截断以保持界面响应。",
+		"filesPreviewTruncated": "仅显示前 1,000 个文件。另有 {{count}} 个已隐藏。",
+		"messagePreviewTruncated": "提交消息预览已截断以保持界面响应。"
 	}
 }

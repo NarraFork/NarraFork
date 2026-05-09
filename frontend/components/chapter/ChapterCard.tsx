@@ -5,6 +5,14 @@ import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 
+const MAX_CHAPTER_CARD_TEXT_CHARS = 500;
+
+function clampChapterCardText(value: string): string {
+	return value.length > MAX_CHAPTER_CARD_TEXT_CHARS
+		? `${value.slice(0, MAX_CHAPTER_CARD_TEXT_CHARS)}…`
+		: value;
+}
+
 interface ChapterCardProps {
 	chapter: {
 		id: string;
@@ -46,12 +54,12 @@ export function ChapterCard({ chapter }: ChapterCardProps) {
 				style={{ textDecoration: "none" }}
 			>
 				<Group justify="space-between" mb="xs">
-					<Text fw={500}>{chapter.title}</Text>
+					<Text fw={500}>{clampChapterCardText(chapter.title)}</Text>
 					<Badge size="sm" color={CHAPTER_STATUS_COLORS[chapter.status] ?? "gray"}>
 						{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
 					</Badge>
 				</Group>
-				<Code>{chapter.branch}</Code>
+				<Code>{clampChapterCardText(chapter.branch)}</Code>
 			</Card.Section>
 
 			{(chapter.status === "active" || chapter.status === "dormant") && (

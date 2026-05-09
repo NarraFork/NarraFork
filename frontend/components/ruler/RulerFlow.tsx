@@ -49,6 +49,25 @@ interface RulerFlowProps {
 
 /** Multiplier of viewport size used as off-screen buffer for expanded segment canvases */
 const SEGMENT_VIEWPORT_MULTIPLIER = 3;
+const RULER_SEGMENT_GC_TIME_MS = 60_000;
+const MAX_NOTIFICATION_LIST_ITEMS = 20;
+const MAX_NOTIFICATION_LIST_CHARS = 2_000;
+
+function formatNotificationList(items: string[] | undefined): string {
+	if (!items?.length) return "";
+	const visibleItems = items.slice(0, MAX_NOTIFICATION_LIST_ITEMS);
+	let text = "";
+	let hidden = items.length - visibleItems.length;
+	for (const item of visibleItems) {
+		const prefix = text ? ", " : "";
+		if (text.length + prefix.length + item.length > MAX_NOTIFICATION_LIST_CHARS) {
+			hidden += 1;
+			break;
+		}
+		text += `${prefix}${item}`;
+	}
+	return hidden > 0 ? `${text}, … (+${hidden})` : text;
+}
 
 interface Camera {
 	panX: number;
@@ -590,6 +609,11 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	// --- Intelligent prefetch for segment data ---
 	const prefetchStateRef = useRef({ lastViewCenter: 0, velocity: 0 });
 	const prefetchQueueRef = useRef(new Set<string>());
+	const prefetchProjectIdRef = useRef(projectId);
+	if (prefetchProjectIdRef.current !== projectId) {
+		prefetchProjectIdRef.current = projectId;
+		prefetchQueueRef.current.clear();
+	}
 	const updatePrefetch = useCallback(() => {
 		const cam = cameraRef.current;
 		const isH = cam.orientation === "horizontal";
@@ -613,14 +637,20 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			const tickX = tick?.x ?? seg.fromIndex * COLLAPSED_GAP;
 			const distance = Math.abs(tickX - predicted);
 			if (distance < 1000 && !queue.has(seg.fromSha)) {
-				const cached = queryClient.getQueryData(["rulerSegment", projectId, seg.fromSha]);
+				const queryKey = ["rulerSegment", projectId, seg.fromSha, "summary"];
+				const cached = queryClient.getQueryData(queryKey);
 				if (!cached) {
 					queue.add(seg.fromSha);
-					queryClient.prefetchQuery({
-						queryKey: ["rulerSegment", projectId, seg.fromSha],
-						queryFn: () => api.getRulerSegment(projectId, seg.fromSha, seg.toSha),
-						staleTime: 30_000,
-					});
+					queryClient
+						.prefetchQuery({
+							queryKey,
+							queryFn: () => api.getRulerSegment(projectId, seg.fromSha, seg.toSha, "summary"),
+							staleTime: 30_000,
+							gcTime: RULER_SEGMENT_GC_TIME_MS,
+						})
+						.finally(() => {
+							queue.delete(seg.fromSha);
+						});
 				}
 			}
 		}
@@ -947,10 +977,13 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				}
 			} catch (err) {
 				if (err instanceof ApiError && err.data?.aiAttempted) {
+					const remainingFiles = Array.isArray(err.data.remainingFiles)
+						? (err.data.remainingFiles as string[])
+						: undefined;
 					notifications.show({
 						title: t("ruler.mergeConflictFailed"),
 						message: t("ruler.mergeConflictFailedDesc", {
-							files: (err.data.remainingFiles as string[])?.join(", ") ?? "",
+							files: formatNotificationList(remainingFiles),
 						}),
 						color: "orange",
 						autoClose: false,

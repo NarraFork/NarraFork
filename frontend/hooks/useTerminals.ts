@@ -3,6 +3,8 @@ import { useEffect } from "react";
 import { api } from "../lib/api";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
+const TERMINALS_QUERY_GC_TIME_MS = 60_000;
+
 export function useTerminals(chapterId: string) {
 	const qc = useQueryClient();
 
@@ -22,6 +24,7 @@ export function useTerminals(chapterId: string) {
 		queryKey: ["terminals", { chapterId }],
 		queryFn: () => api.listTerminals(chapterId),
 		enabled: !!chapterId,
+		gcTime: TERMINALS_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -44,6 +47,7 @@ export function useNarratorTerminals(narratorId: string) {
 		queryKey: ["terminals", { narratorId }],
 		queryFn: () => api.listTerminalsByNarrator(narratorId),
 		enabled: !!narratorId,
+		gcTime: TERMINALS_QUERY_GC_TIME_MS,
 	});
 }
 

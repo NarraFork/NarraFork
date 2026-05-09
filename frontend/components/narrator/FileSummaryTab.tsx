@@ -27,6 +27,8 @@ import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 
+const MAX_FILE_SUMMARY_FILES = 1_000;
+
 function FileDiffContent({
 	narratorId,
 	snapshotId,
@@ -238,6 +240,8 @@ export function FileSummaryTab({
 	}
 
 	const files = data?.files ?? [];
+	const displayedFiles = files.slice(0, MAX_FILE_SUMMARY_FILES);
+	const hiddenFileCount = Math.max(0, files.length - displayedFiles.length);
 
 	const handleRevert = async (filePath: string) => {
 		try {
@@ -304,7 +308,7 @@ export function FileSummaryTab({
 					}}
 				>
 					<Stack gap={2} mx="xs">
-						{files.map((file) => {
+						{displayedFiles.map((file) => {
 							const isExpanded = expandedFile === file.filePath;
 							const displayPath = toRelativePath(file.filePath, basePath);
 							return (
@@ -420,6 +424,14 @@ export function FileSummaryTab({
 								</Box>
 							);
 						})}
+						{hiddenFileCount > 0 && (
+							<Text size="xs" c="dimmed" ta="center" py="xs">
+								{t("fileMod_listTruncated", {
+									shown: displayedFiles.length,
+									hidden: hiddenFileCount,
+								})}
+							</Text>
+						)}
 					</Stack>
 				</Box>
 			)}

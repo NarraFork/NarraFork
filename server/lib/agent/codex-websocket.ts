@@ -231,8 +231,10 @@ export function shouldTreatCodexStreamEventAsYielded(event: ParsedStreamEvent): 
 	return Boolean(
 		(typeof event.text === "string" && event.text.length > 0) ||
 			(typeof event.reasoning === "string" && event.reasoning.length > 0) ||
-			event.toolUseChunk?.stop === true ||
-			event.webSearch?.final === true,
+			(event.toolUses?.length ?? 0) > 0 ||
+			event.toolUseChunk != null ||
+			event.webSearch?.final === true ||
+			event.imageGeneration?.final === true,
 	);
 }
 
@@ -664,6 +666,12 @@ export async function* streamCodexResponsesWebSocket(
 	const toolAccum = new Map<number, ResponsesToolAccum>();
 	const reasoningAccum = new Map<number, ResponsesReasoningAccum>();
 	let requestDispatched = false;
+	const resetAbortedSessionIfNeeded = async () => {
+		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
+			await resetSession(session, false);
+			connection = null;
+		}
+	};
 
 	try {
 		const websocketRequest = buildCodexResponsesWebSocketRequest(
@@ -890,6 +898,7 @@ export async function* streamCodexResponsesWebSocket(
 		await resetSession(session, false);
 		throw error;
 	} finally {
+		await resetAbortedSessionIfNeeded();
 		session.busy = false;
 		touchSession(session);
 		if (!completed && connection?.isClosed()) {

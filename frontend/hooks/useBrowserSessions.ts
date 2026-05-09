@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const BROWSER_SESSIONS_GC_TIME_MS = 30_000;
+
 export function useBrowserSessions(narratorId: string) {
 	return useQuery({
 		queryKey: ["browser-sessions", narratorId],
 		queryFn: () => api.listBrowserSessions(narratorId),
 		enabled: !!narratorId,
+		gcTime: BROWSER_SESSIONS_GC_TIME_MS,
 	});
 }
 

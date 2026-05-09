@@ -33,6 +33,7 @@ import { api } from "../../lib/api";
 const TerminalPanel = lazy(() =>
 	import("../../components/terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
 );
+const ADMIN_TERMINALS_QUERY_GC_TIME_MS = 60_000;
 
 export const Route = createFileRoute("/settings/terminals")({
 	component: SettingsTerminalsPage,
@@ -52,6 +53,7 @@ function SettingsTerminalsPage() {
 		queryFn: api.listAdminTerminals,
 		enabled: user?.role === "admin",
 		refetchInterval: 10_000,
+		gcTime: ADMIN_TERMINALS_QUERY_GC_TIME_MS,
 	});
 
 	const killTerminal = useMutation({

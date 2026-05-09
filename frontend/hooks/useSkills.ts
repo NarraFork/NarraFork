@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const SKILL_QUERY_GC_TIME_MS = 60_000;
+
 export function useSkills(projectId: string, enabled = true) {
 	return useQuery({
 		queryKey: ["skills", projectId],
 		queryFn: () => api.listSkills(projectId),
 		enabled: !!projectId && enabled,
+		gcTime: SKILL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -14,6 +17,7 @@ export function useSkill(projectId: string, name: string, enabled = true) {
 		queryKey: ["skill", projectId, name],
 		queryFn: () => api.getSkill(projectId, name),
 		enabled: !!projectId && !!name && enabled,
+		gcTime: SKILL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -21,6 +25,7 @@ export function useGlobalSkills() {
 	return useQuery({
 		queryKey: ["global-skills"],
 		queryFn: () => api.listGlobalSkills(),
+		gcTime: SKILL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -29,6 +34,7 @@ export function useGlobalSkill(name: string, enabled = true) {
 		queryKey: ["global-skill", name],
 		queryFn: () => api.getGlobalSkill(name),
 		enabled: !!name && enabled,
+		gcTime: SKILL_QUERY_GC_TIME_MS,
 	});
 }
 

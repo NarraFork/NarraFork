@@ -6,6 +6,8 @@ interface CacheEntry {
 	refCount: number;
 }
 
+const MAX_AVATAR_BLOB_BYTES = 5 * 1024 * 1024;
+
 /** Shared cache: key = "userId:avatarImageId" → blob URL with ref counting. */
 const cache = new Map<string, CacheEntry>();
 /** In-flight fetches to avoid duplicate requests. */
@@ -39,7 +41,7 @@ function fetchAvatar(userId: string, avatarImageId: string): Promise<string | nu
 		.then((res) => (res.ok ? res.blob() : null))
 		.then((blob) => {
 			pending.delete(key);
-			if (!blob) return null;
+			if (!blob || blob.size > MAX_AVATAR_BLOB_BYTES) return null;
 
 			// Race guard: another fetch may have populated the cache while this
 			// request was in flight. Reuse that URL and do not create an orphan URL.

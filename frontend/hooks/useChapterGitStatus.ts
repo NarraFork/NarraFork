@@ -1,6 +1,8 @@
 import { api } from "@frontend/lib/api";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+const CHAPTER_GIT_STATUS_GC_TIME_MS = 60_000;
+
 export interface ChapterGitStatus {
 	commitsAhead: number;
 	baseBranch: string;
@@ -23,6 +25,7 @@ export function useChapterGitStatus(chapterId: string | undefined | null) {
 		enabled: !!chapterId,
 		refetchInterval: 30_000, // fallback polling every 30s
 		staleTime: 10_000,
+		gcTime: CHAPTER_GIT_STATUS_GC_TIME_MS,
 	});
 }
 

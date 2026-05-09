@@ -2,6 +2,7 @@ import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
+import { parseDraftTrait } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
@@ -28,6 +29,99 @@ export function getTabNarratorId(tab: Record<string, unknown>): string | undefin
 	return undefined;
 }
 
+function tabRepresentsNarrator(tab: Record<string, unknown>, narratorId: string): boolean {
+	return getTabNarratorId(tab) === narratorId;
+}
+
+function tabKey(tab: Record<string, unknown>): string {
+	return `${String(tab.type)}:${String(tab.id)}`;
+}
+
+/**
+ * Enforce workspace grouping invariant: workspace header is immediately followed
+ * by all its children. Operates in-place.
+ */
+function regroupWorkspaces(tabs: Record<string, unknown>[]): void {
+	const childrenByWs = new Map<string, Record<string, unknown>[]>();
+	for (const tab of tabs) {
+		const wsId = typeof tab.workspaceId === "string" ? tab.workspaceId : undefined;
+		if (!wsId) continue;
+		const arr = childrenByWs.get(wsId);
+		if (arr) arr.push(tab);
+		else childrenByWs.set(wsId, [tab]);
+	}
+	if (childrenByWs.size === 0) return;
+
+	let i = 0;
+	while (i < tabs.length) {
+		if (tabs[i].workspaceId) tabs.splice(i, 1);
+		else i++;
+	}
+
+	const headerIds = new Set<string>();
+	for (let j = 0; j < tabs.length; j++) {
+		if (tabs[j].type !== "workspace") continue;
+		const wsId = tabs[j].id as string;
+		headerIds.add(wsId);
+		const children = childrenByWs.get(wsId);
+		if (!children?.length) continue;
+		tabs.splice(j + 1, 0, ...children);
+		j += children.length;
+	}
+
+	for (const [wsId, children] of childrenByWs) {
+		if (headerIds.has(wsId)) continue;
+		for (const child of children) delete child.workspaceId;
+		tabs.push(...children);
+	}
+}
+
+function getPinnedSectionEndIndex(tabs: Record<string, unknown>[]): number {
+	let idx = 0;
+	while (idx < tabs.length) {
+		const tab = tabs[idx];
+		if (tab.workspaceId) {
+			idx++;
+			continue;
+		}
+		if (!tab.pinned) break;
+		idx++;
+		if (tab.type === "workspace") {
+			while (idx < tabs.length && tabs[idx]?.workspaceId === tab.id) idx++;
+		}
+	}
+	return idx;
+}
+
+function promoteTopLevelTabRespectingPins(tabs: Record<string, unknown>[], idx: number): boolean {
+	const tab = tabs[idx];
+	if (!tab || tab.workspaceId || tab.pinned) return false;
+	const before = tabs.map(tabKey).join("|");
+	let movedGroup: Record<string, unknown>[];
+	if (tab.type === "workspace") {
+		let end = idx + 1;
+		while (end < tabs.length && tabs[end]?.workspaceId === tab.id) end++;
+		movedGroup = tabs.splice(idx, end - idx);
+	} else {
+		movedGroup = tabs.splice(idx, 1);
+	}
+	tabs.splice(getPinnedSectionEndIndex(tabs), 0, ...movedGroup);
+	return tabs.map(tabKey).join("|") !== before;
+}
+
+function promoteDraftTab(tabs: Record<string, unknown>[], narratorId: string): boolean {
+	const idx = tabs.findIndex((tab) => tabRepresentsNarrator(tab, narratorId));
+	if (idx < 0) return false;
+	const tab = tabs[idx];
+	if (typeof tab.workspaceId === "string") {
+		const headerIdx = tabs.findIndex(
+			(candidate) => candidate.type === "workspace" && candidate.id === tab.workspaceId,
+		);
+		if (headerIdx >= 0) return promoteTopLevelTabRespectingPins(tabs, headerIdx);
+	}
+	return promoteTopLevelTabRespectingPins(tabs, idx);
+}
+
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
 export async function enrichTabs(
 	tabs: Record<string, unknown>[],
@@ -39,16 +133,21 @@ export async function enrichTabs(
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
-		// Narrator status
+		// Narrator status + draft marker
 		const rows = await db
-			.select({ id: narrators.id, status: narrators.status })
+			.select({ id: narrators.id, status: narrators.status, traits: narrators.traits })
 			.from(narrators)
 			.where(inArray(narrators.id, narratorIds));
-		const statusMap = new Map(rows.map((r) => [r.id, r.status]));
+		const narratorMap = new Map(rows.map((r) => [r.id, r]));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
-			if (nId && statusMap.has(nId)) {
-				tab.status = statusMap.get(nId);
+			const row = nId ? narratorMap.get(nId) : undefined;
+			if (row) {
+				tab.status = row.status;
+				if (parseDraftTrait(row.traits)) tab.hasDraft = true;
+				else delete tab.hasDraft;
+			} else {
+				delete tab.hasDraft;
 			}
 		}
 
@@ -125,6 +224,51 @@ export async function broadcastTabsSnapshot(
 		revision: Date.now(),
 	});
 	return enriched;
+}
+
+/**
+ * Refresh every user's recent-tabs snapshot for a narrator draft state change.
+ * When a draft first appears, promote the affected top-level tab (or workspace
+ * header) to the top of the unpinned section. Repeated non-empty draft updates
+ * intentionally do not reorder the list, avoiding sidebar jitter while typing.
+ */
+export async function syncNarratorDraftToRecentTabs(
+	narratorId: string,
+	opts: { promote: boolean },
+): Promise<void> {
+	const rows = db
+		.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
+		.from(userPreferences)
+		.all();
+	const now = new Date().toISOString();
+
+	for (const row of rows) {
+		let tabs: Record<string, unknown>[];
+		try {
+			tabs = JSON.parse(row.recentTabs);
+		} catch {
+			continue;
+		}
+		if (!Array.isArray(tabs)) continue;
+		migrateTabTypes(tabs);
+		if (!tabs.some((tab) => tabRepresentsNarrator(tab, narratorId))) continue;
+
+		let changed = false;
+		if (opts.promote) {
+			const before = JSON.stringify(tabs);
+			promoteDraftTab(tabs, narratorId);
+			regroupWorkspaces(tabs);
+			changed = JSON.stringify(tabs) !== before;
+		}
+		if (changed) {
+			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+				JSON.stringify(tabs),
+				now,
+				row.userId,
+			]);
+		}
+		await broadcastTabsSnapshot(row.userId, tabs);
+	}
 }
 
 // ── Tab removal ────────────────────────────────────────────────────────────

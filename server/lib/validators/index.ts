@@ -76,6 +76,7 @@ export {
 	updateBlacklistDirSchema,
 	updateBufferedMessageSchema,
 	updateNarratorCwdSchema,
+	updateNarratorDraftSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,

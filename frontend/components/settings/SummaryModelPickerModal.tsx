@@ -5,6 +5,8 @@ import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
 
+const MODEL_SELECT_OPTION_LIMIT = 100;
+
 export type SummaryModelPickerErrorKind = "unavailable" | "error";
 
 export interface SummaryModelPickerModalProps {
@@ -76,6 +78,7 @@ export function SummaryModelPickerModal({
 					label={t("summaryModel")}
 					data={groupedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					value={selected}
 					onChange={setSelected}
 				/>

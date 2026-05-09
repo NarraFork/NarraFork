@@ -23,6 +23,9 @@ export interface ExecuteLoopResult {
 	contextLengthExceeded?: boolean;
 	/** Set when the error is transient and the caller should retry after a delay. */
 	retryableError?: string;
+	retryableErrorCode?: string;
+	/** Retry without applying the normal transient retry limit (e.g. Codex account failover). */
+	bypassRetryLimit?: boolean;
 	/** Upstream socket closed quietly and the turn should end without recovery/error UI. */
 	silentDisconnect?: boolean;
 	/** Set when the agent loop was aborted before the turn completed normally. */
@@ -62,6 +65,8 @@ export async function executeAgentLoop(
 	let errorCode: string | undefined;
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
+	let retryableErrorCode: string | undefined;
+	let bypassRetryLimit = false;
 	let silentDisconnect = false;
 	let aborted = false;
 	let interrupted = false;
@@ -114,6 +119,8 @@ export async function executeAgentLoop(
 		}
 		if (event.type === "retryable_error") {
 			retryableError = event.message;
+			retryableErrorCode = event.code;
+			bypassRetryLimit = event.bypassRetryLimit === true;
 			break;
 		}
 		if (event.type === "output_truncated") {
@@ -154,6 +161,8 @@ export async function executeAgentLoop(
 		shouldUpdateTitle,
 		contextLengthExceeded,
 		retryableError,
+		retryableErrorCode,
+		bypassRetryLimit,
 		silentDisconnect,
 		aborted,
 		hadToolUses,

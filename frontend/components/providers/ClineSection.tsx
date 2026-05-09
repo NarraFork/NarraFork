@@ -34,6 +34,9 @@ import { api } from "../../lib/api";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 
+const CLINE_PROVIDER_QUERY_GC_TIME_MS = 60_000;
+const CLINE_POOL_SEARCH_GC_TIME_MS = 30_000;
+
 interface ClineSectionProps {
 	settings: Record<string, unknown> | undefined;
 	hiddenModels: Set<string>;
@@ -72,6 +75,7 @@ export const ClineSection = React.memo(function ClineSection({
 			if (query.state.data?.pendingAuth) return 2000;
 			return false;
 		},
+		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
 
 	// Query balance (only when authenticated)
@@ -84,6 +88,7 @@ export const ClineSection = React.memo(function ClineSection({
 		queryFn: api.clineBalance,
 		enabled: clineStatus?.authenticated === true,
 		staleTime: 60_000,
+		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
 
 	// Query recommended/free models
@@ -91,6 +96,7 @@ export const ClineSection = React.memo(function ClineSection({
 		queryKey: ["cline", "recommended-models"],
 		queryFn: api.clineRecommendedModels,
 		staleTime: 30 * 60_000,
+		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
 
 	// Pool search
@@ -99,6 +105,7 @@ export const ClineSection = React.memo(function ClineSection({
 		queryFn: () => api.clinePoolSearch(debouncedSearch, 100),
 		enabled: debouncedSearch.length >= 2,
 		staleTime: 60_000,
+		gcTime: CLINE_POOL_SEARCH_GC_TIME_MS,
 	});
 
 	// Pool count
@@ -106,6 +113,7 @@ export const ClineSection = React.memo(function ClineSection({
 		queryKey: ["cline", "pool", "count"],
 		queryFn: api.clinePoolCount,
 		staleTime: 60_000,
+		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
 
 	// Login mutation

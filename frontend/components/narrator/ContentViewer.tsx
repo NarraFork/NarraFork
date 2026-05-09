@@ -48,6 +48,8 @@ import {
 import { useRenderLod } from "./RenderLodCtx";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
+const INLINE_FULL_CONTENT_MAX_CHARS = 20_000;
+const MODAL_FULL_CONTENT_MAX_CHARS = 120_000;
 
 const HighlightedCode = lazy(() =>
 	import("./HighlightedCode").then((module) => ({ default: module.HighlightedCode })),
@@ -369,7 +371,7 @@ export const ContentViewer = memo(
 			(e: React.MouseEvent) => {
 				if (!interactionEnabled || isMobile) return;
 				const selection = window.getSelection();
-				if (selection && selection.toString().trim().length > 0) return;
+				if (selection && selection.rangeCount > 0 && !selection.isCollapsed) return;
 				e.preventDefault();
 				e.stopPropagation();
 				const x = Math.min(e.clientX, window.innerWidth - 200);
@@ -399,7 +401,7 @@ export const ContentViewer = memo(
 				// (browser may have produced a text selection via native shift-click).
 				if (!selection.selectionMode) {
 					const sel = window.getSelection();
-					if (sel && sel.toString().trim().length > 0) return;
+					if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 				}
 				e.preventDefault();
 				if (isShift) {
@@ -442,10 +444,23 @@ export const ContentViewer = memo(
 				)}
 			</CopyButton>
 		);
-		/** Prefer untruncated content everywhere it's available */
-		const inlineContent = fullContent ?? content;
-		const copyBtn = makeCopyBtn(inlineContent);
-		const modalContent = fullContent ?? content;
+		const copyContent = fullContent ?? content;
+		// Keep inline rendering bounded: huge full payloads remain available via copy/fullscreen,
+		// but the chat list itself should keep rendering the already-truncated preview.
+		const inlineContent =
+			fullContent && fullContent.length <= INLINE_FULL_CONTENT_MAX_CHARS ? fullContent : content;
+		const copyBtn = makeCopyBtn(copyContent);
+		const modalContent = copyContent;
+		const modalPreview =
+			modalContent.length > MODAL_FULL_CONTENT_MAX_CHARS
+				? {
+						content: modalContent.slice(0, MODAL_FULL_CONTENT_MAX_CHARS),
+						truncated: true,
+					}
+				: { content: modalContent, truncated: false };
+		const modalRenderContent = modalPreview.truncated
+			? `${modalPreview.content}\n\n${t("contentViewerTruncated")}`
+			: modalPreview.content;
 		const modalCopyBtn = fullContent ? makeCopyBtn(modalContent) : copyBtn;
 
 		const fullscreenBtn = (
@@ -558,25 +573,24 @@ export const ContentViewer = memo(
 						</div>
 					)}
 
-					{/* Inline content — prefer fullContent when available so truncated
-				    previews are replaced once the full payload has been fetched. */}
+					{/* Inline content stays bounded; full payloads are still available via actions. */}
 					{renderContent
 						? renderContent(wordWrap)
 						: (children ??
 							(markdown ? (
-								renderMarkdown(fullContent ?? content, {
+								renderMarkdown(inlineContent, {
 									maxHeight: style?.maxHeight,
 									overflowY: style?.maxHeight ? "auto" : undefined,
 								})
 							) : language && language !== "text" ? (
 								<CodeHighlightOrFallback
-									code={fullContent ?? content}
+									code={inlineContent}
 									lang={language}
 									style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
 								/>
 							) : (
 								<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
-									{fullContent ?? content}
+									{inlineContent}
 								</Code>
 							)))}
 				</Box>
@@ -632,7 +646,7 @@ export const ContentViewer = memo(
 										<Menu.Item
 											leftSection={<IconCopy size={14} />}
 											onClick={() => {
-												navigator.clipboard.writeText(content);
+												navigator.clipboard.writeText(copyContent);
 												swipe.closeSwipe();
 											}}
 										>
@@ -789,10 +803,10 @@ export const ContentViewer = memo(
 								/>
 							</Box>
 						) : markdown ? (
-							renderMarkdown(modalContent, { flex: 1, minHeight: 0, overflow: "auto" })
+							renderMarkdown(modalRenderContent, { flex: 1, minHeight: 0, overflow: "auto" })
 						) : language && language !== "text" ? (
 							<CodeHighlightOrFallback
-								code={modalContent}
+								code={modalRenderContent}
 								lang={language}
 								style={{
 									...style,
@@ -817,7 +831,7 @@ export const ContentViewer = memo(
 									minHeight: 0,
 								}}
 							>
-								{modalContent}
+								{modalRenderContent}
 							</Code>
 						)}
 					</Modal>
@@ -868,7 +882,7 @@ export const ContentViewer = memo(
 							</Menu.Item>
 							<Menu.Item
 								leftSection={<IconCopy size={14} />}
-								onClick={() => navigator.clipboard.writeText(content)}
+								onClick={() => navigator.clipboard.writeText(copyContent)}
 							>
 								{t("copy")}
 							</Menu.Item>

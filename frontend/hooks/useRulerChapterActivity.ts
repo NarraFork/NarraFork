@@ -37,6 +37,24 @@ function truncate(s: string, max: number): string {
 	return `${s.slice(0, max)}…`;
 }
 
+function appendStreamTail(current: string, delta: string, maxChars: number): string {
+	if (delta.length >= maxChars) return delta.slice(-maxChars);
+	const keepFromCurrent = maxChars - delta.length;
+	return `${current.slice(-keepFromCurrent)}${delta}`;
+}
+
+function textSnippetPreview(text: string, maxChars: number): string {
+	let result = "";
+	let seenText = false;
+	for (let i = 0; i < text.length && result.length < maxChars; i++) {
+		const char = text[i] === "\n" ? " " : text[i];
+		if (!seenText && /\s/.test(char)) continue;
+		seenText = true;
+		result += char;
+	}
+	return truncate(result.trimEnd(), maxChars);
+}
+
 /**
  * Hook that monitors narrator WS events for a set of active chapters
  * and returns a map of chapter activity info for badge/tooltip rendering.
@@ -69,13 +87,31 @@ export function useRulerChapterActivity(
 		}, 300);
 	}, []);
 
-	// Update narrator→chapter mapping when chapters change
+	// Update narrator→chapter mapping when chapters change and prune stale activity state.
 	useEffect(() => {
 		const map = new Map<string, string>();
+		const validChapterIds = new Set<string>();
+		const validNarratorIds = new Set<string>();
 		for (const ch of chapters) {
-			if (ch.narratorId) map.set(ch.narratorId, ch.chapterId);
+			validChapterIds.add(ch.chapterId);
+			if (ch.narratorId) {
+				map.set(ch.narratorId, ch.chapterId);
+				validNarratorIds.add(ch.narratorId);
+			}
 		}
 		narratorToChapterRef.current = map;
+
+		let activityChanged = false;
+		for (const chapterId of activityRef.current.keys()) {
+			if (!validChapterIds.has(chapterId)) {
+				activityRef.current.delete(chapterId);
+				activityChanged = true;
+			}
+		}
+		for (const narratorId of streamBufRef.current.keys()) {
+			if (!validNarratorIds.has(narratorId)) streamBufRef.current.delete(narratorId);
+		}
+		if (activityChanged) setActivityMap(new Map(activityRef.current));
 	}, [chapters]);
 
 	// Clear activity for chapters whose panels are open
@@ -140,15 +176,17 @@ export function useRulerChapterActivity(
 						ev.delta?.text &&
 						!ev.subagentToolUseId
 					) {
-						const nextBuf = (streamBufRef.current.get(narratorId) ?? "") + ev.delta.text;
-						const buf =
-							nextBuf.length > MAX_STREAM_BUF_LEN ? nextBuf.slice(-MAX_STREAM_BUF_LEN) : nextBuf;
+						const buf = appendStreamTail(
+							streamBufRef.current.get(narratorId) ?? "",
+							ev.delta.text,
+							MAX_STREAM_BUF_LEN,
+						);
 						streamBufRef.current.set(narratorId, buf);
 						// Update activity with accumulated text
 						const prev = activityRef.current.get(chapterId);
 						activityRef.current.set(chapterId, {
 							count: prev?.count ?? 0,
-							lastText: truncate(buf.replace(/\n/g, " ").trim(), MAX_TEXT_LEN),
+							lastText: textSnippetPreview(buf, MAX_TEXT_LEN),
 							lastToolName: prev?.lastToolName ?? null,
 							timestamp: Date.now(),
 						});
@@ -189,7 +227,7 @@ export function useRulerChapterActivity(
 						const prev = activityRef.current.get(chapterId);
 						activityRef.current.set(chapterId, {
 							count: (prev?.count ?? 0) + 1,
-							lastText: truncate(text.replace(/\n/g, " ").trim(), MAX_TEXT_LEN),
+							lastText: textSnippetPreview(text, MAX_TEXT_LEN),
 							lastToolName: null,
 							timestamp: Date.now(),
 						});

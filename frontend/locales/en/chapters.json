@@ -79,6 +79,11 @@
 	"deleteBranches": "Delete git branches",
 	"cleanupFailed": "Cleanup failed",
 	"cleanupCount": "Cleanup {{count}} chapter(s)",
+	"cleanupConfirmTitle": "Confirm dangerous cleanup",
+	"cleanupConfirmMessage": "You are about to clean up {{count}} selected chapter(s). This action cannot be undone.",
+	"cleanupConfirmForce": "Force cleanup: {{value}}",
+	"cleanupConfirmDeleteBranch": "Delete git branches: {{value}}",
+	"cleanupConfirmButton": "Clean up anyway",
 	"forkFromMessage": "Fork from this message",
 	"dormant": "Dormant",
 	"wake": "Wake",
@@ -91,6 +96,9 @@
 		"frozen": "Frozen"
 	},
 	"commitDetail": {
-		"noDiff": "No file changes in this commit."
+		"noDiff": "No file changes in this commit.",
+		"diffPreviewTruncated": "Diff preview truncated to keep the UI responsive.",
+		"filesPreviewTruncated": "Showing the first 1,000 files. {{count}} more hidden.",
+		"messagePreviewTruncated": "Commit message preview truncated to keep the UI responsive."
 	}
 }

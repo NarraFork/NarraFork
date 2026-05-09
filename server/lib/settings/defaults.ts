@@ -39,6 +39,7 @@ export const DEFAULTS: NarraForkSettings = {
 		silentToolCallThreshold: 20,
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 60_000,
+		autoCompactKeepPairs: 2,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -350,6 +351,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.contextThresholds.large.compactStart": {
 		desc: "大模型触发上下文压缩的百分比(0-100)。",
+		type: "number",
+	},
+	"agent.autoCompactKeepPairs": {
+		desc: "自动压缩时在压缩摘要之后保留的最近 user/assistant 对话轮数。",
 		type: "number",
 	},
 

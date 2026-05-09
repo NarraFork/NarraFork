@@ -136,23 +136,31 @@ const streamingCodeFallbackCodeStyle: CSSProperties = {
 	background: "none",
 };
 
+const STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS = 80_000;
+
 function StreamingCodeFallback({ code, style }: Pick<StreamingCodeLazyProps, "code" | "style">) {
 	const scrollRef = useRef<HTMLDivElement>(null);
+	const isDisplayTruncated = code.length > STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS;
+	const displayCode = isDisplayTruncated
+		? code.slice(-STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS)
+		: code;
 
 	useEffect(() => {
-		const currentCode = code;
+		const currentCode = displayCode;
 		const rafId = requestAnimationFrame(() => {
 			if (!currentCode) return;
 			const el = scrollRef.current;
 			if (el) el.scrollTop = el.scrollHeight;
 		});
 		return () => cancelAnimationFrame(rafId);
-	}, [code]);
+	}, [displayCode]);
 
 	return (
 		<div ref={scrollRef} style={{ ...streamingCodeFallbackRootStyle, ...style }}>
 			<pre style={streamingCodeFallbackPreStyle}>
-				<code style={streamingCodeFallbackCodeStyle}>{code}</code>
+				<code style={streamingCodeFallbackCodeStyle}>
+					{isDisplayTruncated ? `…\n${displayCode}` : displayCode}
+				</code>
 			</pre>
 		</div>
 	);
@@ -462,19 +470,132 @@ function isTruncated(val: any): val is {
 	return val?._truncated === true && typeof val?.preview === "string";
 }
 
+const TOOLCARD_DISPLAY_TEXT_MAX_CHARS = 120_000;
+const TOOLCARD_RECALL_MAX_RESULTS = 50;
+const TOOLCARD_RECALL_MAX_MESSAGES = 100;
+const TOOLCARD_RECALL_MAX_QUERY_BADGES = 12;
+const TOOLCARD_RECALL_MESSAGE_TEXT_CHARS = 4_000;
+const TOOLCARD_SKILL_MAX_FILES = 50;
+
+function capToolCardDisplayText(text: string, maxChars = TOOLCARD_DISPLAY_TEXT_MAX_CHARS): string {
+	if (text.length <= maxChars) return text;
+	return text.slice(0, maxChars);
+}
+
+function appendToolCardPreview(parts: string[], value: string, budget: { remaining: number }) {
+	if (budget.remaining <= 0 || value.length === 0) return;
+	const chunk = value.length > budget.remaining ? value.slice(0, budget.remaining) : value;
+	parts.push(chunk);
+	budget.remaining -= chunk.length;
+}
+
+function appendToolCardJsonPreview(
+	parts: string[],
+	value: unknown,
+	budget: { remaining: number },
+	seen: WeakSet<object>,
+	depth = 0,
+) {
+	if (budget.remaining <= 0) return;
+	if (
+		value === null ||
+		value === undefined ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	) {
+		appendToolCardPreview(parts, value === undefined ? "undefined" : JSON.stringify(value), budget);
+		return;
+	}
+	if (typeof value === "string") {
+		appendToolCardPreview(
+			parts,
+			JSON.stringify(capToolCardDisplayText(value, budget.remaining)),
+			budget,
+		);
+		return;
+	}
+	if (typeof value !== "object") {
+		appendToolCardPreview(parts, JSON.stringify(String(value)), budget);
+		return;
+	}
+	if (seen.has(value)) {
+		appendToolCardPreview(parts, '"[Circular]"', budget);
+		return;
+	}
+	seen.add(value);
+	if (Array.isArray(value)) {
+		appendToolCardPreview(parts, "[", budget);
+		for (let i = 0; i < value.length && budget.remaining > 0; i++) {
+			if (i > 0) appendToolCardPreview(parts, ", ", budget);
+			appendToolCardJsonPreview(parts, value[i], budget, seen, depth + 1);
+		}
+		appendToolCardPreview(parts, "]", budget);
+		return;
+	}
+	appendToolCardPreview(parts, "{", budget);
+	let index = 0;
+	for (const [key, child] of Object.entries(value)) {
+		if (budget.remaining <= 0) break;
+		appendToolCardPreview(
+			parts,
+			`${index > 0 ? "," : ""}\n${"\t".repeat(depth + 1)}${JSON.stringify(key)}: `,
+			budget,
+		);
+		appendToolCardJsonPreview(parts, child, budget, seen, depth + 1);
+		index++;
+	}
+	if (index > 0) appendToolCardPreview(parts, `\n${"\t".repeat(depth)}}`, budget);
+	else appendToolCardPreview(parts, "}", budget);
+}
+
+function stringifyToolCardJsonPreview(value: unknown): string {
+	const parts: string[] = [];
+	appendToolCardJsonPreview(
+		parts,
+		value,
+		{ remaining: TOOLCARD_DISPLAY_TEXT_MAX_CHARS },
+		new WeakSet(),
+	);
+	return parts.join("");
+}
+
 /**
  * Resolve a possibly-truncated JSON value to a displayable string.
- * For truncated objects, returns the `preview` field (raw JSON prefix).
- * For normal values, returns JSON.stringify or the string itself.
+ * For truncated objects, returns a bounded `preview` field (raw JSON prefix).
+ * For normal values, returns a bounded JSON/text preview.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function resolveDisplayText(val: any): string {
 	if (val === null || val === undefined) return "";
-	if (isTruncated(val)) return val.preview;
-	if (typeof val === "string") return val;
+	if (isTruncated(val)) return capToolCardDisplayText(val.preview);
+	if (typeof val === "string") return capToolCardDisplayText(val);
 	// Structured output from tools like Read/Edit: { _text, _metadata }
-	if (typeof val._text === "string") return val._text;
-	return JSON.stringify(val, null, 2);
+	if (typeof val._text === "string") return capToolCardDisplayText(val._text);
+	return stringifyToolCardJsonPreview(val);
+}
+
+function collectToolCardTextPreview(value: unknown): string {
+	if (!value) return "";
+	if (typeof value === "string") return capToolCardDisplayText(value);
+	if (Array.isArray(value)) {
+		const parts: string[] = [];
+		const budget = { remaining: TOOLCARD_DISPLAY_TEXT_MAX_CHARS };
+		for (const block of value) {
+			if (budget.remaining <= 0) break;
+			const text =
+				typeof block === "object" && block && "text" in block
+					? String((block as { text?: unknown }).text ?? "")
+					: "";
+			if (!text) continue;
+			if (parts.length > 0) appendToolCardPreview(parts, "\n", budget);
+			appendToolCardPreview(parts, text, budget);
+		}
+		return parts.join("");
+	}
+	if (typeof value === "object" && "_text" in value) {
+		return capToolCardDisplayText(String((value as { _text?: unknown })._text ?? ""));
+	}
+	return "";
 }
 
 /** Escape special regex characters in a string. */
@@ -1573,6 +1694,39 @@ const IMAGE_EXTS = new Set([
 	".ico",
 ]);
 const PDF_EXTS = new Set([".pdf"]);
+const MAX_FILE_PREVIEW_TEXT_CHARS = 120_000;
+const MAX_FILE_PREVIEW_BLOB_BYTES = 25 * 1024 * 1024;
+
+async function readTextPreview(
+	response: Response,
+	maxChars: number,
+): Promise<{ text: string; truncated: boolean }> {
+	const reader = response.body?.getReader();
+	if (!reader) {
+		const text = await response.text();
+		return text.length > maxChars
+			? { text: text.slice(0, maxChars), truncated: true }
+			: { text, truncated: false };
+	}
+
+	const decoder = new TextDecoder();
+	let text = "";
+	let truncated = false;
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		const chunk = decoder.decode(value, { stream: true });
+		if (text.length + chunk.length > maxChars) {
+			text += chunk.slice(0, maxChars - text.length);
+			truncated = true;
+			await reader.cancel().catch(() => {});
+			break;
+		}
+		text += chunk;
+	}
+	if (!truncated) text += decoder.decode();
+	return { text, truncated };
+}
 
 function getFilePreviewType(filePath: string): "image" | "pdf" | "text" {
 	const dot = filePath.lastIndexOf(".");
@@ -1597,6 +1751,7 @@ function FilePreviewModal({
 	const [error, setError] = useState(false);
 	const [loading, setLoading] = useState(false);
 	const [textContent, setTextContent] = useState<string | null>(null);
+	const [textPreviewTruncated, setTextPreviewTruncated] = useState(false);
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const lang = getShikiLang(filePath);
 	const fileName = filePath.split("/").pop() || filePath;
@@ -1606,6 +1761,7 @@ function FilePreviewModal({
 	useEffect(() => {
 		setError(false);
 		setTextContent(null);
+		setTextPreviewTruncated(false);
 		setBlobUrl(null);
 		if (!opened) setLoading(false);
 	}, [opened, filePath]);
@@ -1632,10 +1788,12 @@ function FilePreviewModal({
 			fetch(url, { headers, signal: controller.signal })
 				.then((r) => {
 					if (!r.ok) throw new Error(r.statusText);
-					return r.text();
+					return readTextPreview(r, MAX_FILE_PREVIEW_TEXT_CHARS);
 				})
-				.then((text) => {
-					if (!cancelled) setTextContent(text);
+				.then((preview) => {
+					if (cancelled) return;
+					setTextContent(preview.text);
+					setTextPreviewTruncated(preview.truncated);
 				})
 				.catch(() => {
 					if (!cancelled) setError(true);
@@ -1651,6 +1809,7 @@ function FilePreviewModal({
 					return r.blob();
 				})
 				.then((blob) => {
+					if (blob.size > MAX_FILE_PREVIEW_BLOB_BYTES) throw new Error("Preview too large");
 					const nextUrl = URL.createObjectURL(blob);
 					if (cancelled) {
 						URL.revokeObjectURL(nextUrl);
@@ -1728,7 +1887,9 @@ function FilePreviewModal({
 			{!error && !loading && previewType === "text" && textContent != null && (
 				<Box p="xs">
 					<ContentViewer
-						content={textContent}
+						content={
+							textPreviewTruncated ? `${textContent}\n\n${t("filePreview_truncated")}` : textContent
+						}
 						style={{ fontSize: 12, maxHeight: "75vh", overflow: "auto" }}
 						title={fileName}
 						language={lang}
@@ -1963,7 +2124,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 			)}
 			{isEdit && !editStreamingPreview && !inputIsTruncated && !toolCall.inputJson?.old_string && (
 				<ContentViewer
-					content={JSON.stringify(toolCall.inputJson, null, 2)}
+					content={resolveDisplayText(toolCall.inputJson)}
 					style={codeStyle}
 					title={fp ? basename(fp) : "Edit"}
 					language="json"
@@ -2661,14 +2822,21 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 	if (action === "search") {
 		// For batch queries, results are merged from all sub-queries
 		const allResults = (Array.isArray(meta.results) ? meta.results : []) as Array<RecallResult>;
+		const visibleResults = allResults.slice(0, TOOLCARD_RECALL_MAX_RESULTS);
+		const hiddenResultCount = Math.max(0, allResults.length - visibleResults.length);
 		const queries = Array.isArray(meta.queries) ? meta.queries : meta.query ? [meta.query] : [];
+		const visibleQueries = queries.slice(0, TOOLCARD_RECALL_MAX_QUERY_BADGES);
+		const hiddenQueryCount = Math.max(0, queries.length - visibleQueries.length);
 
 		if (allResults.length === 0) {
+			const queryLabel = visibleQueries
+				.map((q: string) => `"${capToolCardDisplayText(q, 80)}"`)
+				.join(", ");
 			return (
 				<Box mt="xs">
 					<Text size="xs" c="dimmed">
 						No results found
-						{queries.length > 0 && ` for ${queries.map((q: string) => `"${q}"`).join(", ")}`}.
+						{queryLabel && ` for ${queryLabel}${hiddenQueryCount > 0 ? ", …" : ""}`}.
 					</Text>
 				</Box>
 			);
@@ -2678,16 +2846,21 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<Box mt="xs">
 				{queries.length > 0 && (
 					<Group gap={4} mb={6} wrap="wrap">
-						{queries.map((q: string, i: number) => (
+						{visibleQueries.map((q: string, i: number) => (
 							// biome-ignore lint/suspicious/noArrayIndexKey: static badge list, no reordering
 							<Badge key={`${i}:${q}`} size="xs" variant="light" color="cyan">
-								{q}
+								{capToolCardDisplayText(q, 80)}
 							</Badge>
 						))}
+						{hiddenQueryCount > 0 && (
+							<Badge size="xs" variant="outline" color="gray">
+								+{hiddenQueryCount}
+							</Badge>
+						)}
 					</Group>
 				)}
 				<Stack gap={4}>
-					{allResults.map((r: RecallResult) => (
+					{visibleResults.map((r: RecallResult) => (
 						<Paper
 							key={r.id}
 							p={6}
@@ -2715,8 +2888,12 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 								</Text>
 							</Group>
 							<Text size="xs" c="dimmed" lineClamp={2} style={{ whiteSpace: "pre-wrap" }}>
-								{r.snippet.replace(/>>>/g, "").replace(/<<</g, "").trim()}
+								{capToolCardDisplayText(
+									r.snippet.replace(/>>>/g, "").replace(/<<</g, "").trim(),
+									1_000,
+								)}
 							</Text>
+
 							<Group gap={4} mt={2}>
 								<Code style={{ fontSize: 10 }}>{r.id.slice(0, 8)}</Code>
 								{r.chapterId && (
@@ -2727,6 +2904,11 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 							</Group>
 						</Paper>
 					))}
+					{hiddenResultCount > 0 && (
+						<Text size="xs" c="dimmed" ta="center">
+							Showing first {visibleResults.length} results; {hiddenResultCount} more hidden.
+						</Text>
+					)}
 				</Stack>
 			</Box>
 		);
@@ -2734,6 +2916,8 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	// action === "read_conversation"
 	const messages = Array.isArray(meta.messages) ? meta.messages : [];
+	const visibleMessages = messages.slice(0, TOOLCARD_RECALL_MAX_MESSAGES);
+	const hiddenMessageCount = Math.max(0, messages.length - visibleMessages.length);
 	const narratorTitle = meta.narratorTitle as string | undefined;
 	const model = meta.model as string | undefined;
 
@@ -2752,7 +2936,7 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 				)}
 			</Group>
 			<Stack gap={2}>
-				{messages.map(
+				{visibleMessages.map(
 					(msg: { id: string; seq: number; role: string; text: string; createdAt: string }) => (
 						<Box
 							key={msg.id}
@@ -2783,10 +2967,17 @@ function RecallDetail({ toolCall }: { toolCall: ToolCallData }) {
 								lineClamp={4}
 								style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
 							>
-								{msg.text || "—"}
+								{msg.text
+									? capToolCardDisplayText(msg.text, TOOLCARD_RECALL_MESSAGE_TEXT_CHARS)
+									: "—"}
 							</Text>
 						</Box>
 					),
+				)}
+				{hiddenMessageCount > 0 && (
+					<Text size="xs" c="dimmed" ta="center">
+						Showing first {visibleMessages.length} messages; {hiddenMessageCount} more hidden.
+					</Text>
 				)}
 			</Stack>
 		</Box>
@@ -2827,6 +3018,8 @@ function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
 			files.push(m[1]);
 		}
 	}
+	const visibleFiles = files.slice(0, TOOLCARD_SKILL_MAX_FILES);
+	const hiddenFileCount = Math.max(0, files.length - visibleFiles.length);
 
 	// Extract content between header and base directory / skill_files
 	let content = "";
@@ -2871,11 +3064,16 @@ function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
 						{t("toolSkillFiles")}
 					</Text>
 					<Group gap={4} wrap="wrap">
-						{files.map((f) => (
+						{visibleFiles.map((f) => (
 							<Badge key={f} size="xs" variant="dot" color="gray">
 								{basename(f)}
 							</Badge>
 						))}
+						{hiddenFileCount > 0 && (
+							<Badge size="xs" variant="outline" color="gray">
+								+{hiddenFileCount}
+							</Badge>
+						)}
 					</Group>
 				</Box>
 			)}
@@ -3153,19 +3351,8 @@ interface GoalView {
 
 function parseGoalToolPayload(value: unknown): Record<string, unknown> | null {
 	if (!value) return null;
-	let raw = "";
-	if (typeof value === "string") raw = value;
-	else if (Array.isArray(value)) {
-		raw = value
-			.map((block) =>
-				typeof block === "object" && block && "text" in block
-					? String((block as { text?: unknown }).text ?? "")
-					: "",
-			)
-			.join("\n");
-	} else if (typeof value === "object" && "_text" in value) {
-		raw = String((value as { _text?: unknown })._text ?? "");
-	} else if (typeof value === "object") {
+	const raw = collectToolCardTextPreview(value);
+	if (!raw && typeof value === "object" && !Array.isArray(value)) {
 		return value as Record<string, unknown>;
 	}
 	if (!raw.trim()) return null;
@@ -3403,13 +3590,7 @@ function TaskOutputDetail({ toolCall }: { toolCall: ToolCallData }) {
 		const out = toolCall.outputJson;
 		if (!out) return null;
 		if (isTruncated(out)) return null;
-		const raw =
-			typeof out === "string"
-				? out
-				: Array.isArray(out)
-					? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-						out.map((b: any) => b.text ?? "").join("")
-					: "";
+		const raw = collectToolCardTextPreview(out);
 		if (!raw) return null;
 		return parseTaskOutputXml(raw);
 	}, [toolCall.outputJson]);
@@ -3795,7 +3976,10 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 				return r.blob();
 			})
 			.then((blob) => {
-				if (!cancelled) setBlobUrl(URL.createObjectURL(blob));
+				if (!cancelled) {
+					if (blob.size > MAX_FILE_PREVIEW_BLOB_BYTES) throw new Error("Preview too large");
+					setBlobUrl(URL.createObjectURL(blob));
+				}
 			})
 			.catch(() => {
 				if (!cancelled) setLoadError(true);
@@ -4009,6 +4193,45 @@ function PermButtonBar({
 
 // --- Inline permission UI rendered inside the tool call card ---
 
+const PERMISSION_DRAFT_STORAGE_MAX_CHARS = 256_000;
+const PERMISSION_DRAFT_FIELD_MAX_CHARS = 120_000;
+
+interface StoredPermissionDraft {
+	feedback: string;
+	editedPlan: string | null;
+}
+
+function readStoredPermissionDraft(draftKey: string): StoredPermissionDraft | null {
+	try {
+		const raw = sessionStorage.getItem(draftKey);
+		if (!raw) return null;
+		if (raw.length > PERMISSION_DRAFT_STORAGE_MAX_CHARS) {
+			sessionStorage.removeItem(draftKey);
+			return null;
+		}
+		const parsed = JSON.parse(raw) as { feedback?: unknown; editedPlan?: unknown };
+		const feedback =
+			typeof parsed.feedback === "string" &&
+			parsed.feedback.length <= PERMISSION_DRAFT_FIELD_MAX_CHARS
+				? parsed.feedback
+				: "";
+		const editedPlan =
+			typeof parsed.editedPlan === "string" &&
+			parsed.editedPlan.length <= PERMISSION_DRAFT_FIELD_MAX_CHARS
+				? parsed.editedPlan
+				: null;
+		return { feedback, editedPlan };
+	} catch {
+		return null;
+	}
+}
+
+function canPersistPermissionDraft(feedback: string, editedPlan: string | null): boolean {
+	if (feedback.length > PERMISSION_DRAFT_FIELD_MAX_CHARS) return false;
+	if (editedPlan && editedPlan.length > PERMISSION_DRAFT_FIELD_MAX_CHARS) return false;
+	return JSON.stringify({ feedback, editedPlan }).length <= PERMISSION_DRAFT_STORAGE_MAX_CHARS;
+}
+
 export function InlinePermission({
 	permission,
 	narratorId,
@@ -4036,42 +4259,33 @@ export function InlinePermission({
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
 	const draftKey = `narrafork_perm_draft_${permission.id}`;
-	const [feedback, setFeedback] = useState(() => {
-		try {
-			const raw = sessionStorage.getItem(draftKey);
-			if (raw) return JSON.parse(raw).feedback ?? "";
-		} catch {}
-		return "";
-	});
+	const storedDraftRef = useRef<StoredPermissionDraft | null | undefined>(undefined);
+	const getStoredDraft = () => {
+		if (storedDraftRef.current === undefined) {
+			storedDraftRef.current = readStoredPermissionDraft(draftKey) ?? null;
+		}
+		return storedDraftRef.current;
+	};
+	const [feedback, setFeedback] = useState(() => getStoredDraft()?.feedback ?? "");
 	const [editing, setEditing] = useState(() => {
-		try {
-			const raw = sessionStorage.getItem(draftKey);
-			if (raw) {
-				const parsed = JSON.parse(raw);
-				const pt =
-					permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
-						? permission.inputJson.plan
-						: null;
-				return parsed.editedPlan != null && parsed.editedPlan !== pt;
-			}
-		} catch {}
+		const storedDraft = getStoredDraft();
+		if (storedDraft?.editedPlan != null) {
+			const pt =
+				permission.toolName === "ExitPlanMode" && typeof permission.inputJson?.plan === "string"
+					? permission.inputJson.plan
+					: null;
+			return storedDraft.editedPlan !== pt;
+		}
 		return false;
 	});
-	const [editedPlan, setEditedPlan] = useState<string | null>(() => {
-		try {
-			const raw = sessionStorage.getItem(draftKey);
-			if (raw) {
-				const parsed = JSON.parse(raw);
-				return parsed.editedPlan !== undefined ? parsed.editedPlan : null;
-			}
-		} catch {}
-		return null;
-	});
+	const [editedPlan, setEditedPlan] = useState<string | null>(
+		() => getStoredDraft()?.editedPlan ?? null,
+	);
 
 	// Persist draft to sessionStorage
 	useEffect(() => {
 		const hasContent = feedback || editedPlan !== null;
-		if (hasContent) {
+		if (hasContent && canPersistPermissionDraft(feedback, editedPlan)) {
 			sessionStorage.setItem(draftKey, JSON.stringify({ feedback, editedPlan }));
 		} else {
 			sessionStorage.removeItem(draftKey);

@@ -17,6 +17,8 @@ import { useTranslation } from "react-i18next";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { DiffView } from "./DiffView";
 
+const MAX_DELETE_PREVIEW_FILES = 1_000;
+
 export function FileDeletePreviewTab({
 	narratorId,
 	basePath,
@@ -43,6 +45,8 @@ export function FileDeletePreviewTab({
 	}
 
 	const affectedFiles = data?.affectedFiles ?? [];
+	const displayedAffectedFiles = affectedFiles.slice(0, MAX_DELETE_PREVIEW_FILES);
+	const hiddenAffectedFileCount = Math.max(0, affectedFiles.length - displayedAffectedFiles.length);
 	const toolCallCount = data?.toolCallCount ?? 0;
 
 	if (affectedFiles.length === 0) {
@@ -95,7 +99,7 @@ export function FileDeletePreviewTab({
 				}}
 			>
 				<Stack gap={2} mx="xs">
-					{affectedFiles.map((file) => {
+					{displayedAffectedFiles.map((file) => {
 						const lang = file.filePath.split(".").pop() ?? "";
 						const isExpanded = expandedFile === file.filePath;
 						const displayPath = toRelativePath(file.filePath, basePath);
@@ -167,6 +171,14 @@ export function FileDeletePreviewTab({
 							</Box>
 						);
 					})}
+					{hiddenAffectedFileCount > 0 && (
+						<Text size="xs" c="dimmed" ta="center" py="xs">
+							{t("fileMod_listTruncated", {
+								shown: displayedAffectedFiles.length,
+								hidden: hiddenAffectedFileCount,
+							})}
+						</Text>
+					)}
 				</Stack>
 			</Box>
 

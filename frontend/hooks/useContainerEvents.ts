@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const MAX_LOG_LINES = 200;
+const LOG_FLUSH_FALLBACK_MS = 250;
 
 export interface ContainerLogEntry {
 	line: string;
@@ -24,11 +25,16 @@ export function useContainerEvents(chapterId: string) {
 	const pendingLogsRef = useRef<ContainerLogEntry[]>([]);
 	const pendingPhaseRef = useRef<"build" | "start" | null>(null);
 	const logRafRef = useRef<number | null>(null);
+	const logTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	const flushPendingLogs = useCallback(() => {
 		if (logRafRef.current !== null) {
 			cancelAnimationFrame(logRafRef.current);
 			logRafRef.current = null;
+		}
+		if (logTimeoutRef.current !== null) {
+			clearTimeout(logTimeoutRef.current);
+			logTimeoutRef.current = null;
 		}
 		const pendingLogs = pendingLogsRef.current;
 		const pendingPhase = pendingPhaseRef.current;
@@ -45,17 +51,28 @@ export function useContainerEvents(chapterId: string) {
 	}, []);
 
 	const scheduleLogFlush = useCallback(() => {
-		if (logRafRef.current !== null) return;
-		logRafRef.current = requestAnimationFrame(() => {
-			logRafRef.current = null;
-			flushPendingLogs();
-		});
+		if (logRafRef.current === null) {
+			logRafRef.current = requestAnimationFrame(() => {
+				logRafRef.current = null;
+				flushPendingLogs();
+			});
+		}
+		if (logTimeoutRef.current === null) {
+			logTimeoutRef.current = setTimeout(() => {
+				logTimeoutRef.current = null;
+				flushPendingLogs();
+			}, LOG_FLUSH_FALLBACK_MS);
+		}
 	}, [flushPendingLogs]);
 
 	const clearPendingLogs = useCallback(() => {
 		if (logRafRef.current !== null) {
 			cancelAnimationFrame(logRafRef.current);
 			logRafRef.current = null;
+		}
+		if (logTimeoutRef.current !== null) {
+			clearTimeout(logTimeoutRef.current);
+			logTimeoutRef.current = null;
 		}
 		pendingLogsRef.current = [];
 		pendingPhaseRef.current = null;

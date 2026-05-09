@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
@@ -163,6 +163,36 @@ describe("CodexManager usage quota state", () => {
 		expect(entry).toBeDefined();
 		expect(entry?.disabled).toBe(false);
 		expect(entry?.disabledReason).toBeUndefined();
+	});
+
+	test("刷新 usage 时记录并循环裁剪额度历史", async () => {
+		const now = Date.now();
+		const oldHistoryTimestamp = now - 3 * 60 * 60_000;
+		const retainedHistoryTimestamp = now - 30 * 60_000;
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-history", {
+			usageHistory: [
+				{ timestamp: oldHistoryTimestamp, tier: "plus", remainingPercent: 10 },
+				{ timestamp: retainedHistoryTimestamp, tier: "plus", remainingPercent: 30 },
+			],
+		});
+		tempHomes.push(tmpHome);
+		const resetAtSec = Math.floor(Date.now() / 1000) + 3600;
+
+		globalThis.fetch = (async () => createUsageResponse(40, resetAtSec)) as unknown as typeof fetch;
+
+		await manager.getUsage("cred-history");
+		const saved = JSON.parse(
+			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf-8"),
+		) as Array<{
+			id: string;
+			usageHistory?: Array<{ timestamp: number; remainingPercent: number }>;
+		}>;
+		const entry = saved.find((item) => item.id === "cred-history");
+		const history = entry?.usageHistory ?? [];
+
+		expect(history.some((item) => item.timestamp === oldHistoryTimestamp)).toBe(false);
+		expect(history.some((item) => item.timestamp === retainedHistoryTimestamp)).toBe(true);
+		expect(history.at(-1)?.remainingPercent).toBe(60);
 	});
 
 	test("usage 401 可被识别并用于 banned 标记", async () => {

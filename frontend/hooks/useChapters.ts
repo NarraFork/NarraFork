@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const CHAPTER_QUERY_GC_TIME_MS = 60_000;
+
 export function useChapters(projectId: string, status?: string) {
 	return useQuery({
 		queryKey: ["chapters", { projectId, status }],
 		queryFn: () => api.listChapters(projectId, status),
 		enabled: !!projectId,
+		gcTime: CHAPTER_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -14,6 +17,7 @@ export function useChapter(id: string) {
 		queryKey: ["chapters", id],
 		queryFn: () => api.getChapter(id),
 		enabled: !!id,
+		gcTime: CHAPTER_QUERY_GC_TIME_MS,
 	});
 }
 

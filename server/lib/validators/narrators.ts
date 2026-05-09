@@ -2,6 +2,7 @@ import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh"]);
+const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
 
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
@@ -14,6 +15,8 @@ export const createNarratorSchema = z.object({
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	fastMode: z.boolean().optional(),
 	relaxedPlan: z.boolean().optional(),
+	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
+	dangerReflectionOverride: booleanOverrideSchema.optional(),
 });
 
 export const codexDefaultReasoningEffortSchema = z.object({
@@ -31,6 +34,11 @@ export const codexTierOrderSchema = z.object({
 export const sendMessageSchema = z.object({
 	message: z.string().min(1),
 	priority: z.boolean().optional(),
+});
+
+export const updateNarratorDraftSchema = z.object({
+	text: z.string().max(100_000),
+	sourceId: z.string().min(1).max(120).optional(),
 });
 
 export const permissionDecisionSchema = z.object({

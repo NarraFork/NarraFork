@@ -98,6 +98,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	worktrees: "orange",
 	containers: "cyan",
 };
+const STORAGE_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
 const DATABASE_TARGET_DEFAULT_DAYS: Record<
 	Exclude<DatabaseCleanupTarget, "archivedSessions">,
@@ -148,11 +149,19 @@ export function StorageSection() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: STORAGE_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const requestDumpEnabled = Boolean(
 		(settingsData as { agent?: { requestDumpEnabled?: boolean } } | undefined)?.agent
 			?.requestDumpEnabled,
 	);
+
+	useEffect(() => {
+		return () => {
+			abortRef.current?.abort();
+			abortRef.current = null;
+		};
+	}, []);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -239,6 +248,7 @@ export function StorageSection() {
 		} finally {
 			setScanning(false);
 			setProgressMsg("");
+			abortRef.current = null;
 		}
 	};
 

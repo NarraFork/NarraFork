@@ -26,6 +26,14 @@ import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { ToolCallInspector } from "./ToolCallInspector";
 
+const TASK_OUTPUT_PREVIEW_CHARS = 4_000;
+
+function toTaskOutputPreview(output: string | null | undefined): string | null {
+	if (!output) return null;
+	if (output.length <= TASK_OUTPUT_PREVIEW_CHARS) return output;
+	return `${output.slice(0, TASK_OUTPUT_PREVIEW_CHARS)}\n…`;
+}
+
 interface BackgroundTasksDrawerProps {
 	narratorId: string;
 }
@@ -79,8 +87,22 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 
 	const { data, isLoading } = useQuery({
 		queryKey: ["background-tasks", narratorId],
-		queryFn: () => api.listBackgroundTasks(narratorId),
+		queryFn: async () => {
+			const tasksData = await api.listBackgroundTasks(narratorId);
+			return {
+				...tasksData,
+				tasks: tasksData.tasks.map((task) => ({
+					...task,
+					output: toTaskOutputPreview(task.output),
+				})),
+				legacySubagentTasks: tasksData.legacySubagentTasks.map((task) => ({
+					...task,
+					backgroundResult: toTaskOutputPreview(task.backgroundResult),
+				})),
+			};
+		},
 		refetchInterval: opened ? 3000 : 10000,
+		gcTime: 30_000,
 	});
 
 	// Merge unified tasks and legacy subagent tasks into a single list

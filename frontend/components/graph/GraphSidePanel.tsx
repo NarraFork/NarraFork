@@ -9,6 +9,14 @@ import { Link } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+const MAX_GRAPH_SIDE_PANEL_TEXT_CHARS = 1_000;
+
+function clampGraphSidePanelText(value: string): string {
+	return value.length > MAX_GRAPH_SIDE_PANEL_TEXT_CHARS
+		? `${value.slice(0, MAX_GRAPH_SIDE_PANEL_TEXT_CHARS)}…`
+		: value;
+}
+
 interface GraphSidePanelProps {
 	selectedNode: {
 		id: string;
@@ -42,6 +50,8 @@ export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 	if (!selectedNode) return null;
 
 	const roleIcon = CHAPTER_ROLE_ICONS[selectedNode.role] || "";
+	const displayTitle = clampGraphSidePanelText(selectedNode.title);
+	const displayBranch = clampGraphSidePanelText(selectedNode.branch);
 
 	return (
 		<>
@@ -57,7 +67,7 @@ export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 			>
 				<Group justify="space-between" mb="md">
 					<Title order={5}>
-						{roleIcon} {selectedNode.title}
+						{roleIcon} {displayTitle}
 					</Title>
 					<ActionIcon variant="subtle" onClick={onClose}>
 						<IconChevronRight size={16} />
@@ -80,7 +90,7 @@ export function GraphSidePanel({ selectedNode, onClose }: GraphSidePanelProps) {
 					</Group>
 
 					<Text size="sm" c="dimmed">
-						{selectedNode.branch}
+						{displayBranch}
 					</Text>
 
 					{selectedNode.commitCount != null && selectedNode.commitCount > 0 && (

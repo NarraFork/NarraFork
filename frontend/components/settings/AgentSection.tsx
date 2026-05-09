@@ -54,6 +54,10 @@ export interface AgentSectionProps {
 	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
+	planReflectionAutoApprove: boolean;
+	setPlanReflectionAutoApprove: (v: boolean) => void;
+	dangerReflectionEnabled: boolean;
+	setDangerReflectionEnabled: (v: boolean) => void;
 	dangerSkipReadOnlyConfirmations: boolean;
 	setDangerSkipReadOnlyConfirmations: (v: boolean) => void;
 	maxTransientRetries: number;
@@ -90,6 +94,8 @@ export interface AgentSectionProps {
 		standard: { pruneStart: number; compactStart: number };
 		large: { pruneStart: number; compactStart: number };
 	}) => void;
+	autoCompactKeepPairs: number;
+	setAutoCompactKeepPairs: (v: number) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -241,6 +247,9 @@ export function AgentSection(props: AgentSectionProps) {
 				checked={props.expandReasoning}
 				onChange={(e) => props.setExpandReasoning(e.currentTarget.checked)}
 			/>
+			<Title order={5} mt="sm">
+				{t("planAndApprovalSettings")}
+			</Title>
 			<Switch
 				label={t("defaultStartInPlanMode")}
 				description={t("defaultStartInPlanModeDesc")}
@@ -252,6 +261,21 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("planReflectionAutoApprove")}
+				description={t("planReflectionAutoApproveDesc")}
+				checked={props.planReflectionAutoApprove}
+				onChange={(e) => props.setPlanReflectionAutoApprove(e.currentTarget.checked)}
+			/>
+			<Title order={5} mt="sm">
+				{t("safetyGuardSettings")}
+			</Title>
+			<Switch
+				label={t("dangerReflectionEnabled")}
+				description={t("dangerReflectionEnabledDesc")}
+				checked={props.dangerReflectionEnabled}
+				onChange={(e) => props.setDangerReflectionEnabled(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("dangerSkipReadOnlyConfirmations")}
@@ -342,6 +366,15 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("contextThresholdsDesc")}
 			</Text>
+			<NumberInput
+				label={t("autoCompactKeepPairs")}
+				description={t("autoCompactKeepPairsDesc")}
+				value={props.autoCompactKeepPairs}
+				onChange={(v) => props.setAutoCompactKeepPairs(typeof v === "number" ? v : 2)}
+				min={1}
+				max={25}
+				allowDecimal={false}
+			/>
 			<Text size="sm" fw={500} mt={4}>
 				{t("contextThresholdsStandard")}
 			</Text>

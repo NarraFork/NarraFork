@@ -2,6 +2,14 @@ import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 
+const MAX_NODE_CONTEXT_TITLE_CHARS = 500;
+
+function clampNodeContextTitle(value: string): string {
+	return value.length > MAX_NODE_CONTEXT_TITLE_CHARS
+		? `${value.slice(0, MAX_NODE_CONTEXT_TITLE_CHARS)}…`
+		: value;
+}
+
 interface NodeContextMenuProps {
 	x: number;
 	y: number;
@@ -48,6 +56,7 @@ export function NodeContextMenu({
 }: NodeContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const isRoot = !!nodeData.isRoot;
+	const displayTitle = clampNodeContextTitle(nodeData.title);
 	const platform = usePlatform();
 	const canReveal = platform !== "linux" && !!nodeData.worktreePath;
 
@@ -78,7 +87,7 @@ export function NodeContextMenu({
 			>
 				<Stack gap={2}>
 					<Text size="xs" fw={600} c="dimmed" px="xs">
-						{nodeData.title}
+						{displayTitle}
 					</Text>
 					<UnstyledButton px="xs" py={4} onClick={() => onFork(nodeId)} style={{ borderRadius: 4 }}>
 						<Text size="sm">{t("contextMenu.fork")}</Text>

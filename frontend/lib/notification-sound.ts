@@ -109,6 +109,7 @@ export function playBuiltinSound(name: string): void {
 
 const audioCache = new Map<string, string>(); // url -> blobUrl
 const MAX_AUDIO_CACHE_ENTRIES = 3;
+const MAX_CUSTOM_AUDIO_BLOB_BYTES = 10 * 1024 * 1024;
 
 function touchAudioCache(url: string, blobUrl: string) {
 	audioCache.delete(url);
@@ -139,6 +140,7 @@ export async function playCustomSound(url: string): Promise<void> {
 			const res = await fetch(url, { headers });
 			if (!res.ok) return;
 			const blob = await res.blob();
+			if (blob.size > MAX_CUSTOM_AUDIO_BLOB_BYTES) return;
 			blobUrl = URL.createObjectURL(blob);
 			touchAudioCache(url, blobUrl);
 			trimAudioCache();

@@ -4,6 +4,14 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
+const MAX_CHAPTER_BATCH_MERGE_LABEL_CHARS = 500;
+
+function clampBatchMergeLabel(value: string): string {
+	return value.length > MAX_CHAPTER_BATCH_MERGE_LABEL_CHARS
+		? `${value.slice(0, MAX_CHAPTER_BATCH_MERGE_LABEL_CHARS)}…`
+		: value;
+}
+
 interface ChapterBatchMergeModalProps {
 	chapters: Array<{ id: string; title: string; status: string }>;
 	opened: boolean;
@@ -55,7 +63,7 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	// Target chapter options: active chapters that are not selected as source
 	const targetOptions = activeChapters
 		.filter((ch) => !selected.includes(ch.id))
-		.map((ch) => ({ value: ch.id, label: ch.title }));
+		.map((ch) => ({ value: ch.id, label: clampBatchMergeLabel(ch.title) }));
 
 	// Source chapter options: active chapters that are not the selected target
 	const sourceChapters = activeChapters.filter((ch) => ch.id !== baseChapterId);
@@ -81,7 +89,7 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 				{sourceChapters.map((ch) => (
 					<Checkbox
 						key={ch.id}
-						label={ch.title}
+						label={clampBatchMergeLabel(ch.title)}
 						checked={selected.includes(ch.id)}
 						onChange={() => toggleChapter(ch.id)}
 					/>

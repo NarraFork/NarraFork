@@ -25,6 +25,13 @@ const NODE_WIDTH = 260;
 const NODE_HEIGHT = 100;
 const MIN_RESIZE_WIDTH = 260;
 const MIN_RESIZE_HEIGHT = 300;
+const MAX_REVIEW_NODE_TITLE_CHARS = 500;
+
+function clampReviewNodeTitle(value: string): string {
+	return value.length > MAX_REVIEW_NODE_TITLE_CHARS
+		? `${value.slice(0, MAX_REVIEW_NODE_TITLE_CHARS)}…`
+		: value;
+}
 
 function ReviewNodeInner({ data, id }: NodeProps) {
 	const d = data as ReviewNodeData;
@@ -34,6 +41,7 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 	const expanded = !!d.expanded;
 	const hasNarrator = !!d.narratorId;
 	const reviewStatus = d.reviewStatus ?? "reviewing";
+	const displayTitle = clampReviewNodeTitle(d.title);
 	const narratorDisplay = d.narratorStatus
 		? statusRegistry.narratorEffective(d.narratorStatus, d.narratorSubstatus ?? undefined)
 		: null;
@@ -131,7 +139,7 @@ function ReviewNodeInner({ data, id }: NodeProps) {
 				>
 					<IconEye size={14} color="#fab005" />
 					<Text size="xs" fw={600} truncate style={{ flex: 1 }}>
-						{d.title}
+						{displayTitle}
 					</Text>
 					<Badge size="xs" color={statusColor} variant="light">
 						{t(`reviewStatus.${reviewStatus}`, reviewStatus)}

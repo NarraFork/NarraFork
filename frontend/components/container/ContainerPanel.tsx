@@ -21,9 +21,9 @@ import {
 	IconSettings,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { type ContainerLogEntry, useContainerEvents } from "../../hooks/useContainerEvents";
+import { useContainerEvents } from "../../hooks/useContainerEvents";
 import {
 	useContainerLogs,
 	useContainers,
@@ -33,6 +33,10 @@ import {
 import { api } from "../../lib/api";
 import { CONTAINER_STATUS_COLORS } from "../../lib/constants";
 import { VolumeSnapshotPanel } from "./VolumeSnapshotPanel";
+
+const MAX_RENDERED_RUNTIME_LOG_CHARS = 120_000;
+const MAX_RENDERED_BUILD_LOG_CHARS = 120_000;
+const CONTAINER_PANEL_QUERY_GC_TIME_MS = 60_000;
 
 interface ContainerPanelProps {
 	chapterId: string;
@@ -47,16 +51,19 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 		queryKey: ["chapters", chapterId],
 		queryFn: () => api.getChapter(chapterId),
 		enabled: !!chapterId,
+		gcTime: CONTAINER_PANEL_QUERY_GC_TIME_MS,
 	});
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
 		staleTime: 30_000,
+		gcTime: CONTAINER_PANEL_QUERY_GC_TIME_MS,
 	});
 	const { data: project } = useQuery({
 		queryKey: ["projects", chapter?.projectId],
 		queryFn: () => api.getProject(chapter?.projectId ?? ""),
 		enabled: !!chapter?.projectId,
+		gcTime: CONTAINER_PANEL_QUERY_GC_TIME_MS,
 	});
 	const start = useStartContainers();
 	const stop = useStopContainers();
@@ -78,6 +85,28 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 		},
 		{ enabled: runtimeLogsEnabled },
 	);
+	const displayedRuntimeLogs = useMemo(() => {
+		const logs = logData?.logs;
+		if (!logs || logs.length <= MAX_RENDERED_RUNTIME_LOG_CHARS) return logs;
+		return `${logs.slice(-MAX_RENDERED_RUNTIME_LOG_CHARS)}\n\n${t("logsTruncated")}`;
+	}, [logData?.logs, t]);
+	const displayedBuildLogs = useMemo(() => {
+		let output = "";
+		let truncated = false;
+		for (let i = buildLogs.length - 1; i >= 0; i--) {
+			const line = buildLogs[i].line;
+			const separator = output ? "\n" : "";
+			const nextLength = line.length + separator.length + output.length;
+			if (nextLength > MAX_RENDERED_BUILD_LOG_CHARS) {
+				const remaining = MAX_RENDERED_BUILD_LOG_CHARS - output.length - separator.length;
+				if (remaining > 0) output = `${line.slice(-remaining)}${separator}${output}`;
+				truncated = true;
+				break;
+			}
+			output = `${line}${separator}${output}`;
+		}
+		return truncated ? `${output}\n\n${t("logsTruncated")}` : output;
+	}, [buildLogs, t]);
 
 	// Deduplicated service names for log filter
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
@@ -148,10 +177,10 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 							)}
 						</Group>
 					)}
-					{buildLogs.length > 0 && (
+					{displayedBuildLogs && (
 						<ScrollArea.Autosize mah={120} type="auto">
 							<Code block style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
-								{buildLogs.map((entry: ContainerLogEntry) => entry.line).join("\n")}
+								{displayedBuildLogs}
 							</Code>
 						</ScrollArea.Autosize>
 					)}
@@ -201,10 +230,10 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 						</Group>
 						{logsLoading ? (
 							<Loader size="xs" />
-						) : logData?.logs ? (
+						) : displayedRuntimeLogs ? (
 							<ScrollArea.Autosize mah={200} type="auto">
 								<Code block style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
-									{logData.logs}
+									{displayedRuntimeLogs}
 								</Code>
 							</ScrollArea.Autosize>
 						) : (

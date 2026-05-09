@@ -37,6 +37,14 @@ const MIN_RESIZE_WIDTH = 280;
 const MIN_RESIZE_HEIGHT = 300;
 const TRUNK_WIDTH = 320;
 const TRUNK_HEIGHT = 140;
+const MAX_CHAPTER_NODE_TEXT_CHARS = 500;
+
+function clampChapterNodeText(value: string | null | undefined): string {
+	if (!value) return "";
+	return value.length > MAX_CHAPTER_NODE_TEXT_CHARS
+		? `${value.slice(0, MAX_CHAPTER_NODE_TEXT_CHARS)}…`
+		: value;
+}
 
 function ChapterNodeInner({ data, id }: NodeProps) {
 	const d = data as ChapterNodeData;
@@ -78,7 +86,9 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 
 				notifications.show({
 					title: tch("forkSuccess"),
-					message: tch("forkCreatedClick", { title: data.title ?? "Fork" }),
+					message: tch("forkCreatedClick", {
+						title: clampChapterNodeText(data.title ?? "Fork"),
+					}),
 					color: "green",
 					autoClose: 6000,
 				});
@@ -110,6 +120,8 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 		: (d.color ?? `var(--mantine-color-${CHAPTER_STATUS_COLORS[d.status] ?? "gray"}-4)`);
 
 	const hasNarrator = !!d.narratorId;
+	const displayTitle = clampChapterNodeText(d.title);
+	const displayBranch = clampChapterNodeText(d.branch);
 
 	const collapsedW = isRoot || isTrunk ? TRUNK_WIDTH : COLLAPSED_WIDTH;
 	const collapsedH = isRoot || isTrunk ? TRUNK_HEIGHT : COLLAPSED_HEIGHT;
@@ -221,7 +233,7 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 							style={{ maxWidth: nodeWidth - (hasNarrator ? 100 : 80), minWidth: 0 }}
 						>
 							{roleIcon ? `${roleIcon} ` : ""}
-							{d.title}
+							{displayTitle}
 						</Text>
 						<Group gap={4} wrap="nowrap">
 							<Badge size="xs" color={CHAPTER_STATUS_COLORS[d.status] ?? "gray"}>
@@ -239,7 +251,7 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					{!expanded && (
 						<>
 							<Text size="xs" c="dimmed" lineClamp={1}>
-								{d.branch}
+								{displayBranch}
 							</Text>
 							<Group gap={8} mt={4}>
 								{isRoot && (
@@ -307,6 +319,13 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 	);
 }
 
+function areStringArraysEqual(a?: readonly string[] | null, b?: readonly string[] | null): boolean {
+	const left = a ?? [];
+	const right = b ?? [];
+	if (left.length !== right.length) return false;
+	return left.every((value, index) => value === right[index]);
+}
+
 function areChapterNodePropsEqual(prev: NodeProps, next: NodeProps) {
 	const prevData = prev.data as ChapterNodeData;
 	const nextData = next.data as ChapterNodeData;
@@ -319,8 +338,7 @@ function areChapterNodePropsEqual(prev: NodeProps, next: NodeProps) {
 		prevData.narratorCount === nextData.narratorCount &&
 		prevData.narratorId === nextData.narratorId &&
 		prevData.narratorStatus === nextData.narratorStatus &&
-		JSON.stringify(prevData.narratorSubstatus ?? []) ===
-			JSON.stringify(nextData.narratorSubstatus ?? []) &&
+		areStringArraysEqual(prevData.narratorSubstatus, nextData.narratorSubstatus) &&
 		prevData.hasContainers === nextData.hasContainers &&
 		prevData.role === nextData.role &&
 		prevData.color === nextData.color &&

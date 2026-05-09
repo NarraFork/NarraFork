@@ -12,6 +12,8 @@ function getSegmentStaleTime(segment: RulerSegment): number {
 	return 5 * 60 * 1000; // 5min for historical
 }
 
+const RULER_SEGMENT_GC_TIME_MS = 60_000;
+
 interface SegmentChapter {
 	id: string;
 	title: string;
@@ -156,6 +158,7 @@ export const SegmentCanvas = memo(
 					needsFull ? "full" : "summary",
 				) as Promise<SegmentData>,
 			staleTime: getSegmentStaleTime(_segment),
+			gcTime: RULER_SEGMENT_GC_TIME_MS,
 			placeholderData: _segment.activeChapterCount === 0 ? keepPreviousData : undefined,
 		});
 

@@ -8,6 +8,43 @@ import { DiffView } from "./DiffView";
 import type { PendingPermission } from "./narrator-panel-types";
 import { PermEnterHintCtx } from "./ToolCallCard";
 
+const MAX_FULL_FILE_PREVIEW_CHARS = 120_000;
+const FILE_APPROVAL_DRAFT_STORAGE_MAX_CHARS = 160_000;
+const FILE_APPROVAL_FEEDBACK_MAX_CHARS = 120_000;
+
+function readFileApprovalDraft(draftKey: string): string {
+	try {
+		const raw = sessionStorage.getItem(draftKey);
+		if (!raw) return "";
+		if (raw.length > FILE_APPROVAL_DRAFT_STORAGE_MAX_CHARS) {
+			sessionStorage.removeItem(draftKey);
+			return "";
+		}
+		const feedback = JSON.parse(raw).feedback;
+		return typeof feedback === "string" && feedback.length <= FILE_APPROVAL_FEEDBACK_MAX_CHARS
+			? feedback
+			: "";
+	} catch {
+		return "";
+	}
+}
+
+function persistFileApprovalDraft(draftKey: string, feedback: string) {
+	try {
+		if (feedback && feedback.length <= FILE_APPROVAL_FEEDBACK_MAX_CHARS) {
+			sessionStorage.setItem(draftKey, JSON.stringify({ feedback }));
+		} else {
+			sessionStorage.removeItem(draftKey);
+		}
+	} catch {
+		try {
+			sessionStorage.removeItem(draftKey);
+		} catch {
+			// ignore storage cleanup failures
+		}
+	}
+}
+
 export function FileApprovalTab({
 	narratorId,
 	basePath,
@@ -28,22 +65,10 @@ export function FileApprovalTab({
 	const { data, isLoading } = usePermissionFilePreview(narratorId, toolUseId, !!toolUseId);
 
 	const draftKey = `narrafork_perm_draft_${permission.id}`;
-	const [feedback, setFeedback] = useState(() => {
-		try {
-			const raw = sessionStorage.getItem(draftKey);
-			if (raw) return JSON.parse(raw).feedback ?? "";
-		} catch {
-			// sessionStorage may be disabled or JSON malformed — ignore
-		}
-		return "";
-	});
+	const [feedback, setFeedback] = useState(() => readFileApprovalDraft(draftKey));
 
 	useEffect(() => {
-		if (feedback) {
-			sessionStorage.setItem(draftKey, JSON.stringify({ feedback }));
-		} else {
-			sessionStorage.removeItem(draftKey);
-		}
+		persistFileApprovalDraft(draftKey, feedback);
 	}, [draftKey, feedback]);
 
 	// Notify parent when feedback presence changes so the Enter hint can auto-switch
@@ -83,6 +108,10 @@ export function FileApprovalTab({
 	const lang = filePath.split(".").pop() ?? "";
 	const currentContent = data?.currentContent ?? "";
 	const previewContent = data?.previewContent ?? "";
+	const fullPreviewContent =
+		previewContent.length > MAX_FULL_FILE_PREVIEW_CHARS
+			? `${previewContent.slice(0, MAX_FULL_FILE_PREVIEW_CHARS)}\n\n${t("filePreview_truncated")}`
+			: previewContent;
 
 	// For Edit tool, show the old_string → new_string diff from inputJson
 	const isEdit = permission.toolName === "Edit";
@@ -148,7 +177,7 @@ export function FileApprovalTab({
 								borderRadius: "var(--mantine-radius-sm)",
 							}}
 						>
-							{previewContent || "(empty)"}
+							{fullPreviewContent || "(empty)"}
 						</Box>
 					</Tabs.Panel>
 				</Tabs>

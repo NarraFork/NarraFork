@@ -19,6 +19,7 @@ import { detectShell } from "../lib/agent/shell";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
+import { resolveBooleanOverride } from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
@@ -1613,6 +1614,7 @@ export async function handlePermission(
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			planFileId: true,
+			dangerReflectionOverride: true,
 			variant: true,
 			parentNarratorId: true,
 			traits: true,
@@ -1934,11 +1936,11 @@ export async function handlePermission(
 		isRelaxedPlan,
 		narrator?.previousPermissionMode,
 	);
-	if (
-		decision === "allow" &&
-		effectiveMode === "bypassPermissions" &&
-		settings.agent.dangerReflectionEnabled
-	) {
+	const dangerReflectionEnabled = resolveBooleanOverride(
+		narrator?.dangerReflectionOverride,
+		settings.agent.dangerReflectionEnabled,
+	);
+	if (decision === "allow" && effectiveMode === "bypassPermissions" && dangerReflectionEnabled) {
 		const danger =
 			toolName === SHELL_TOOL_NAME && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)

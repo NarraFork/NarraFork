@@ -716,6 +716,8 @@ export const DEFAULT_CONTEXT_THRESHOLDS = {
 	large: { pruneStart: 95, compactStart: 99 },
 };
 
+export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
+
 /**
  * Resolve the summary model's effective context window (tokens).
  */
@@ -737,6 +739,14 @@ export function getContextThresholds(
 		pruneStart: cfg.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].pruneStart,
 		compactStart: cfg.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS[tier].compactStart,
 	};
+}
+
+export function getAutoCompactKeepPairs(): number {
+	const configured = s().agent.autoCompactKeepPairs;
+	if (typeof configured !== "number" || !Number.isFinite(configured)) {
+		return DEFAULT_AUTO_COMPACT_KEEP_PAIRS;
+	}
+	return Math.max(1, Math.min(25, Math.floor(configured)));
 }
 
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {

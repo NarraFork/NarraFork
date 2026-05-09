@@ -33,6 +33,13 @@ export interface TerminalNodeData {
 
 const MIN_WIDTH = 320;
 const MIN_HEIGHT = 240;
+const MAX_TERMINAL_NODE_NAME_CHARS = 500;
+
+function clampTerminalNodeName(value: string): string {
+	return value.length > MAX_TERMINAL_NODE_NAME_CHARS
+		? `${value.slice(0, MAX_TERMINAL_NODE_NAME_CHARS)}…`
+		: value;
+}
 
 function TerminalNodeInner({ data, id }: NodeProps) {
 	const d = data as TerminalNodeData;
@@ -43,6 +50,7 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 	const [editing, setEditing] = useState(false);
 	const [editValue, setEditValue] = useState(d.terminalName);
 	const inputRef = useRef<HTMLInputElement>(null);
+	const displayName = clampTerminalNodeName(d.terminalName);
 
 	const handleMinimize = useCallback(
 		(e: React.MouseEvent) => {
@@ -194,7 +202,7 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 									style={{ minWidth: 0, cursor: "default" }}
 									onDoubleClick={startEditing}
 								>
-									{d.terminalName}
+									{displayName}
 								</Text>
 							)}
 						</Group>

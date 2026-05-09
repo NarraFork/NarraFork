@@ -26,6 +26,8 @@ export const Route = createFileRoute("/settings/users")({
 	component: SettingsUsersPage,
 });
 
+const SETTINGS_USERS_QUERY_GC_TIME_MS = 60_000;
+
 function SettingsUsersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("common");
@@ -40,12 +42,14 @@ function SettingsUsersPage() {
 		queryKey: ["admin", "users"],
 		queryFn: api.listUsers,
 		enabled: user?.role === "admin",
+		gcTime: SETTINGS_USERS_QUERY_GC_TIME_MS,
 	});
 
 	const { data: settings } = useQuery({
 		queryKey: ["admin", "settings"],
 		queryFn: api.getSettings,
 		enabled: user?.role === "admin",
+		gcTime: SETTINGS_USERS_QUERY_GC_TIME_MS,
 	});
 
 	const deleteUser = useMutation({

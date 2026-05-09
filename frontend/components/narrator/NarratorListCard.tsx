@@ -34,6 +34,31 @@ const ATTENTION_TAGS = [
 	"reflecting",
 ] as const;
 
+const MAX_NARRATOR_LIST_TITLE_CHARS = 500;
+const MAX_NARRATOR_LIST_META_CHARS = 1_000;
+const MAX_NARRATOR_LIST_VIEWER_TOOLTIP_ITEMS = 20;
+const MAX_NARRATOR_LIST_VIEWER_TOOLTIP_CHARS = 2_000;
+
+function clampNarratorListText(value: string | null | undefined, maxChars: number): string {
+	if (!value) return "";
+	return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+function formatViewerTooltip(viewers: NarratorListViewer[]): string {
+	let text = "";
+	let hidden = Math.max(0, viewers.length - MAX_NARRATOR_LIST_VIEWER_TOOLTIP_ITEMS);
+	for (const viewer of viewers.slice(0, MAX_NARRATOR_LIST_VIEWER_TOOLTIP_ITEMS)) {
+		const username = clampNarratorListText(viewer.username, MAX_NARRATOR_LIST_TITLE_CHARS);
+		const prefix = text ? ", " : "";
+		if (text.length + prefix.length + username.length > MAX_NARRATOR_LIST_VIEWER_TOOLTIP_CHARS) {
+			hidden += 1;
+			break;
+		}
+		text += `${prefix}${username}`;
+	}
+	return hidden > 0 ? `${text}, … (+${hidden})` : text;
+}
+
 export interface NarratorListViewer {
 	userId: string;
 	username: string;
@@ -119,14 +144,11 @@ function NarratorTitle({
 	localQuery: string;
 }) {
 	const { t } = useTranslation("narrators");
-	return (
-		<>
-			{highlightSearchText(
-				narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) }),
-				localQuery,
-			)}
-		</>
+	const title = clampNarratorListText(
+		narrator.title || t("narratorId", { id: narrator.id.slice(0, 8) }),
+		MAX_NARRATOR_LIST_TITLE_CHARS,
 	);
+	return <>{highlightSearchText(title, localQuery)}</>;
 }
 
 function NarratorMeta({
@@ -139,13 +161,18 @@ function NarratorMeta({
 	size?: "xs" | "sm";
 }) {
 	const { t } = useTranslation("narrators");
+	const modelLabel = clampNarratorListText(
+		narrator.model === FOLLOW_DEFAULT_MODEL
+			? t("followDefault", {
+					model: clampNarratorListText(defaultModelValue, MAX_NARRATOR_LIST_META_CHARS),
+				})
+			: narrator.model,
+		MAX_NARRATOR_LIST_META_CHARS,
+	);
 	return (
 		<Text size={size} c="dimmed" truncate>
 			{t("narratorMeta", {
-				model:
-					narrator.model === FOLLOW_DEFAULT_MODEL
-						? t("followDefault", { model: defaultModelValue })
-						: narrator.model,
+				model: modelLabel,
 				count: narrator.messageCount ?? 0,
 			})}
 		</Text>
@@ -194,14 +221,19 @@ function ProjectCwdLine({ narrator }: { narrator: NarratorListItem }) {
 	const { t } = useTranslation("narrators");
 	const chapter = narrator.chapter;
 	if (!chapter?.projectName && !narrator.cwd) return null;
+	const parts = [
+		chapter?.projectName &&
+			t("projectLabel", {
+				name: clampNarratorListText(chapter.projectName, MAX_NARRATOR_LIST_META_CHARS),
+			}),
+		narrator.cwd &&
+			t("cwdLabel", {
+				path: clampNarratorListText(narrator.cwd, MAX_NARRATOR_LIST_META_CHARS),
+			}),
+	].filter(Boolean);
 	return (
 		<Text size="xs" c="dimmed" truncate>
-			{[
-				chapter?.projectName && t("projectLabel", { name: chapter.projectName }),
-				narrator.cwd && t("cwdLabel", { path: narrator.cwd }),
-			]
-				.filter(Boolean)
-				.join(" · ")}
+			{clampNarratorListText(parts.join(" · "), MAX_NARRATOR_LIST_META_CHARS)}
 		</Text>
 	);
 }
@@ -211,12 +243,12 @@ function ViewerAvatars({ narrator }: { narrator: NarratorListItem }) {
 	const viewers = narrator.viewers ?? [];
 	if (viewers.length === 0) return null;
 	return (
-		<Tooltip label={`${t("viewingNow")}: ${viewers.map((v) => v.username).join(", ")}`}>
+		<Tooltip label={`${t("viewingNow")}: ${formatViewerTooltip(viewers)}`}>
 			<Avatar.Group spacing="xs">
 				{viewers.slice(0, 3).map((v) => (
 					<UserAvatar
 						key={v.userId}
-						username={v.username}
+						username={clampNarratorListText(v.username, MAX_NARRATOR_LIST_TITLE_CHARS)}
 						avatarColor={v.avatarColor}
 						avatarImageId={v.avatarImageId}
 						userId={v.userId}

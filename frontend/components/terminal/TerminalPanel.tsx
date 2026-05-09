@@ -27,6 +27,16 @@ export const TERM_BG = "#1a1b26"; // Default fallback, actual bg comes from them
 
 const HANDLE_SIZE = 20;
 const HANDLE_COLOR = "#4c6ef5"; // Mantine indigo
+const TERMINAL_OUTPUT_FLUSH_FALLBACK_MS = 250;
+const TERMINAL_SCROLLBACK_LINES = 2_000;
+const TERMINAL_PENDING_BUFFER_MAX_CHARS = 1_000_000;
+const TERMINAL_SELECTION_STATE_MAX_CHARS = 10_000;
+
+function trimTerminalBufferText(data: string): string {
+	return data.length > TERMINAL_PENDING_BUFFER_MAX_CHARS
+		? data.slice(-TERMINAL_PENDING_BUFFER_MAX_CHARS)
+		: data;
+}
 
 /** Teardrop-shaped selection handle rendered as an absolutely positioned element */
 function SelectionHandleEl({
@@ -119,6 +129,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const resolvedTheme = getTerminalTheme(terminalThemeKey, computedScheme, oledMode);
 		const themeBg = resolvedTheme.background ?? TERM_BG;
 		const [xtermSelection, setXtermSelection] = useState<string>("");
+		const xtermSelectionRef = useRef("");
 		const [selectionAnchor, setSelectionAnchor] = useState<{ x: number; y: number } | null>(null);
 		const isMobile = useMediaQuery("(max-width: 768px)");
 		const [kbHeight, setKbHeight] = useState(0);
@@ -132,13 +143,16 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		// We set this flag during write() to distinguish those from real user input.
 		const writingRef = useRef(false);
 		const outputBufferRef = useRef<string[]>([]);
+		const outputBufferCharsRef = useRef(0);
 		const outputRafRef = useRef<number | null>(null);
+		const outputTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 		// Pending data queue: buffers WS data arriving before xterm is initialized
 		type PendingData =
 			| { type: "output"; data: string }
 			| { type: "scrollback"; data: string; dims: { cols: number; rows: number } };
 		const pendingDataRef = useRef<PendingData[]>([]);
+		const pendingDataCharsRef = useRef(0);
 		const termReadyRef = useRef(false);
 
 		// Pinch-to-zoom state
@@ -216,30 +230,64 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			return true;
 		}, []);
 
+		const trimOutputBuffer = useCallback(() => {
+			while (
+				outputBufferRef.current.length > 1 &&
+				outputBufferCharsRef.current > TERMINAL_PENDING_BUFFER_MAX_CHARS
+			) {
+				const removed = outputBufferRef.current.shift();
+				outputBufferCharsRef.current -= removed?.length ?? 0;
+			}
+			const first = outputBufferRef.current[0];
+			if (first && outputBufferCharsRef.current > TERMINAL_PENDING_BUFFER_MAX_CHARS) {
+				const trimmed = first.slice(-TERMINAL_PENDING_BUFFER_MAX_CHARS);
+				outputBufferRef.current[0] = trimmed;
+				outputBufferCharsRef.current = trimmed.length;
+			}
+		}, []);
+
 		const flushPendingOutput = useCallback(() => {
 			if (outputRafRef.current !== null) {
 				cancelAnimationFrame(outputRafRef.current);
 				outputRafRef.current = null;
 			}
+			if (outputTimeoutRef.current !== null) {
+				clearTimeout(outputTimeoutRef.current);
+				outputTimeoutRef.current = null;
+			}
 			if (outputBufferRef.current.length === 0) return true;
 			const chunks = outputBufferRef.current;
+			const charCount = outputBufferCharsRef.current;
 			const data = chunks.join("");
 			outputBufferRef.current = [];
+			outputBufferCharsRef.current = 0;
 			if (writeTerminalOutput(data)) return true;
 			outputBufferRef.current = chunks;
+			outputBufferCharsRef.current = charCount;
 			return false;
 		}, [writeTerminalOutput]);
 
 		const enqueueOutput = useCallback(
 			(data: string) => {
-				outputBufferRef.current.push(data);
-				if (outputRafRef.current !== null) return;
-				outputRafRef.current = requestAnimationFrame(() => {
-					outputRafRef.current = null;
-					flushPendingOutput();
-				});
+				const chunk = trimTerminalBufferText(data);
+				if (!chunk) return;
+				outputBufferRef.current.push(chunk);
+				outputBufferCharsRef.current += chunk.length;
+				trimOutputBuffer();
+				if (outputRafRef.current === null) {
+					outputRafRef.current = requestAnimationFrame(() => {
+						outputRafRef.current = null;
+						flushPendingOutput();
+					});
+				}
+				if (outputTimeoutRef.current === null) {
+					outputTimeoutRef.current = setTimeout(() => {
+						outputTimeoutRef.current = null;
+						flushPendingOutput();
+					}, TERMINAL_OUTPUT_FLUSH_FALLBACK_MS);
+				}
 			},
-			[flushPendingOutput],
+			[flushPendingOutput, trimOutputBuffer],
 		);
 
 		const runFit = useCallback((notifyResize: boolean, forceNotify: boolean) => {
@@ -270,10 +318,45 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			[runFit],
 		);
 
+		const trimPendingData = useCallback(() => {
+			while (
+				pendingDataRef.current.length > 1 &&
+				pendingDataCharsRef.current > TERMINAL_PENDING_BUFFER_MAX_CHARS
+			) {
+				const removed = pendingDataRef.current.shift();
+				pendingDataCharsRef.current -= removed?.data.length ?? 0;
+			}
+			const first = pendingDataRef.current[0];
+			if (first && pendingDataCharsRef.current > TERMINAL_PENDING_BUFFER_MAX_CHARS) {
+				first.data = first.data.slice(-TERMINAL_PENDING_BUFFER_MAX_CHARS);
+				pendingDataCharsRef.current = first.data.length;
+			}
+		}, []);
+
+		const appendPendingOutput = useCallback(
+			(data: string) => {
+				const chunk = trimTerminalBufferText(data);
+				if (!chunk) return;
+				pendingDataRef.current.push({ type: "output", data: chunk });
+				pendingDataCharsRef.current += chunk.length;
+				trimPendingData();
+			},
+			[trimPendingData],
+		);
+
+		const replacePendingScrollback = useCallback(
+			(data: string, dims: { cols: number; rows: number }) => {
+				const chunk = trimTerminalBufferText(data);
+				pendingDataRef.current = [{ type: "scrollback", data: chunk, dims }];
+				pendingDataCharsRef.current = chunk.length;
+			},
+			[],
+		);
+
 		const { write, resize, disconnected } = useTerminalWS(terminalId, {
 			onOutput: (data) => {
 				if (!termReadyRef.current) {
-					pendingDataRef.current.push({ type: "output", data });
+					appendPendingOutput(data);
 					return;
 				}
 				enqueueOutput(data);
@@ -282,17 +365,18 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				flushPendingOutput();
 				if (!termReadyRef.current) {
 					// Scrollback is a full snapshot — replace all pending data
-					pendingDataRef.current = [{ type: "scrollback", data, dims }];
+					replacePendingScrollback(data, dims);
 					return;
 				}
 				const term = termRef.current;
 				if (!term) return;
+				const scrollbackData = trimTerminalBufferText(data);
 				writingRef.current = true;
 				try {
 					// Resize to match the server-side buffer dimensions so line wrapping is correct
 					term.resize(dims.cols, dims.rows);
 					term.reset();
-					term.write(data);
+					term.write(scrollbackData);
 				} finally {
 					writingRef.current = false;
 				}
@@ -320,17 +404,16 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 
 		const handleSelectionChange = useCallback(() => {
 			const sel = termRef.current?.getSelection()?.trim() ?? "";
-			setXtermSelection(sel);
+			xtermSelectionRef.current = sel;
+			setXtermSelection(sel.slice(0, TERMINAL_SELECTION_STATE_MAX_CHARS));
 		}, []);
-
-		const xtermSelectionRef = useRef("");
-		xtermSelectionRef.current = xtermSelection;
 
 		const handleSendSelection = useCallback(
 			(text: string) => {
 				const termText = xtermSelectionRef.current;
 				onSendToChat?.(termText || text);
 				termRef.current?.clearSelection();
+				xtermSelectionRef.current = "";
 				setXtermSelection("");
 				setSelHandles(null);
 				setSelectionAnchor(null);
@@ -344,6 +427,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 				cursorBlink: true,
 				fontSize: terminalFontSize,
 				fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+				scrollback: TERMINAL_SCROLLBACK_LINES,
 				theme: resolvedTheme,
 			});
 			const fitAddon = new FitAddon();
@@ -373,6 +457,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 					writingRef.current = false;
 				}
 				pendingDataRef.current = [];
+				pendingDataCharsRef.current = 0;
 				// Fit to actual container size after replaying scrollback
 				scheduleFit(true, true);
 			}
@@ -642,6 +727,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						setSelHandles(null);
 						setSelectionAnchor(null);
 						term.clearSelection();
+						xtermSelectionRef.current = "";
 						setXtermSelection("");
 					}
 				}
@@ -655,11 +741,17 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			return () => {
 				termReadyRef.current = false;
 				pendingDataRef.current = [];
+				pendingDataCharsRef.current = 0;
 				if (outputRafRef.current !== null) {
 					cancelAnimationFrame(outputRafRef.current);
 					outputRafRef.current = null;
 				}
+				if (outputTimeoutRef.current !== null) {
+					clearTimeout(outputTimeoutRef.current);
+					outputTimeoutRef.current = null;
+				}
 				outputBufferRef.current = [];
+				outputBufferCharsRef.current = 0;
 				if (fitRafRef.current !== null) {
 					cancelAnimationFrame(fitRafRef.current);
 					fitRafRef.current = null;

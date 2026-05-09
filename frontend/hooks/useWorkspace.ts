@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const WORKSPACE_QUERY_GC_TIME_MS = 60_000;
+
 export function useWorkspace(id: string) {
 	return useQuery({
 		queryKey: ["workspace", id],
 		queryFn: () => api.getWorkspace(id),
 		enabled: !!id,
+		gcTime: WORKSPACE_QUERY_GC_TIME_MS,
 	});
 }
 

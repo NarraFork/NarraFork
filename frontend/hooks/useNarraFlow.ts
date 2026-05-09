@@ -163,12 +163,15 @@ export interface OpenedTerminal {
 	graphHeight: number | null;
 }
 
+const NARRA_FLOW_GC_TIME_MS = 60_000;
+
 export function useNarraFlow(projectId: string) {
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["narraFlow", projectId],
 		queryFn: () => api.getProjectGraph(projectId),
 		enabled: !!projectId,
 		refetchInterval: 60_000, // Fallback polling for external git changes not covered by WS events
+		gcTime: NARRA_FLOW_GC_TIME_MS,
 	});
 
 	const layoutData = useMemo(() => {

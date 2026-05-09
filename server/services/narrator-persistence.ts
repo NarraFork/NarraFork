@@ -7,6 +7,8 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { narratorSubstatusLock } from "../lib/async-mutex";
+import type { BooleanOverride } from "../lib/boolean-override";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -78,6 +80,17 @@ async function appendMessageRef(
 
 // ── Exported appendMessageRef for use by narrator-service.ts ───────────────
 export { appendMessageRef, insertMessageRef };
+
+async function writeSubstatus(
+	narratorId: string,
+	substatus: string[],
+	now = new Date().toISOString(),
+) {
+	await db
+		.update(narrators)
+		.set({ substatus: JSON.stringify(substatus), updatedAt: now })
+		.where(eq(narrators.id, narratorId));
+}
 
 // ── narratorPersistence object ─────────────────────────────────────────────
 
@@ -546,6 +559,8 @@ export const narratorPersistence = {
 					outputIndex?: number;
 					savedPath?: string;
 					result?: string;
+					width?: number;
+					height?: number;
 			  },
 	) {
 		const existing = await db.query.narratorMessages.findFirst({
@@ -689,6 +704,39 @@ export const narratorPersistence = {
 			.where(eq(narratorMessages.id, messageId));
 	},
 
+	async updateMessageHistoryTokenEstimate(
+		messageId: string,
+		narratorId: string,
+		estimate: {
+			promptTokens: number;
+			turnUsage: Record<string, unknown>;
+			contextPercent?: number;
+		},
+	) {
+		return db.transaction(async (tx) => {
+			const [updated] = await tx
+				.update(narratorMessages)
+				.set({
+					tokensIn: estimate.promptTokens,
+					turnUsageJson: estimate.turnUsage,
+					...(estimate.contextPercent != null ? { contextPercent: estimate.contextPercent } : {}),
+				})
+				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+				.returning();
+			if (!updated) return null;
+
+			const ref = await tx.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.messageId, messageId),
+					eq(narratorMessageRefs.narratorId, narratorId),
+				),
+				columns: { seq: true },
+			});
+
+			return { ...updated, seq: ref?.seq };
+		});
+	},
+
 	async updateTitle(narratorId: string, title: string) {
 		const now = new Date().toISOString();
 		await db.update(narrators).set({ title, updatedAt: now }).where(eq(narrators.id, narratorId));
@@ -751,6 +799,20 @@ export const narratorPersistence = {
 			.where(eq(narrators.id, narratorId));
 	},
 
+	async updateReflectionOverrides(
+		narratorId: string,
+		updates: {
+			planReflectionAutoApproveOverride?: BooleanOverride;
+			dangerReflectionOverride?: BooleanOverride;
+		},
+	) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ ...updates, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
 	async updatePruneEnabled(narratorId: string, pruneEnabled: boolean) {
 		const now = new Date().toISOString();
 		await db
@@ -781,16 +843,23 @@ export const narratorPersistence = {
 		const now = new Date().toISOString();
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const turnStartedAt = setTurnStart ? now : undefined;
-		await db
-			.update(narrators)
-			.set({
-				status,
-				errorMessage: normalizedErrorMessage,
-				updatedAt: now,
-				...(turnStartedAt !== undefined && { turnStartedAt }),
-				...(substatus !== undefined && { substatus: JSON.stringify(substatus) }),
-			})
-			.where(eq(narrators.id, narratorId));
+		const writeStatus = async () => {
+			await db
+				.update(narrators)
+				.set({
+					status,
+					errorMessage: normalizedErrorMessage,
+					updatedAt: now,
+					...(turnStartedAt !== undefined && { turnStartedAt }),
+					...(substatus !== undefined && { substatus: JSON.stringify(substatus) }),
+				})
+				.where(eq(narrators.id, narratorId));
+		};
+		if (substatus !== undefined) {
+			await narratorSubstatusLock.acquire(narratorId, writeStatus);
+		} else {
+			await writeStatus();
+		}
 
 		// Always emit status_changed so downstream listeners (gateway, notifications)
 		// are notified. For errors, also emit the dedicated narrator:error event.
@@ -874,17 +943,22 @@ export const narratorPersistence = {
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
 		const substatusJson = substatus !== undefined ? JSON.stringify(substatus) : undefined;
 		const placeholders = expected.map(() => "?").join(",");
-		const result = sqlite
-			.prepare(
-				substatusJson !== undefined
-					? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
-					: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
-			)
-			.run(
-				...(substatusJson !== undefined
-					? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
-					: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
-			);
+		const runCompareAndSet = () =>
+			sqlite
+				.prepare(
+					substatusJson !== undefined
+						? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
+						: `UPDATE narrators SET status = ?, error_message = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`,
+				)
+				.run(
+					...(substatusJson !== undefined
+						? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
+						: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
+				);
+		const result =
+			substatusJson !== undefined
+				? await narratorSubstatusLock.acquire(narratorId, async () => runCompareAndSet())
+				: runCompareAndSet();
 
 		if (result.changes === 0) return false;
 
@@ -911,16 +985,13 @@ export const narratorPersistence = {
 	 * Broadcasts a substatus_change event to all subscribers.
 	 */
 	async updateSubstatus(narratorId: string, substatus: string[]) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ substatus: JSON.stringify(substatus), updatedAt: now })
-			.where(eq(narrators.id, narratorId));
-
-		broadcastToNarrator(narratorId, {
-			type: "substatus_change",
-			narratorId,
-			substatus,
+		await narratorSubstatusLock.acquire(narratorId, async () => {
+			await writeSubstatus(narratorId, substatus);
+			broadcastToNarrator(narratorId, {
+				type: "substatus_change",
+				narratorId,
+				substatus,
+			});
 		});
 	},
 
@@ -928,38 +999,52 @@ export const narratorPersistence = {
 	 * Add a single substatus tag. No-op if already present.
 	 * Returns the new substatus array.
 	 *
-	 * @internal Only call through narrator-session.ts's in-memory Set which
-	 * serializes access via the single-threaded event loop. Direct calls from
-	 * routes or other services will cause read-modify-write race conditions.
+	 * Serialized with all other substatus writers to avoid stale read-modify-write
+	 * updates clobbering persistent tags like "error" or "unread".
 	 */
 	async addSubstatus(narratorId: string, tag: string): Promise<string[]> {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { substatus: true },
+		return narratorSubstatusLock.acquire(narratorId, async () => {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { substatus: true },
+			});
+			const current = parseSubstatus(row?.substatus);
+			if (current.includes(tag)) return current;
+			const updated = [...current, tag];
+			await writeSubstatus(narratorId, updated);
+			broadcastToNarrator(narratorId, {
+				type: "substatus_change",
+				narratorId,
+				substatus: updated,
+			});
+			return updated;
 		});
-		const current = parseSubstatus(row?.substatus);
-		if (current.includes(tag)) return current;
-		const updated = [...current, tag];
-		await this.updateSubstatus(narratorId, updated);
-		return updated;
 	},
 
 	/**
 	 * Remove a single substatus tag. No-op if not present.
 	 * Returns the new substatus array.
 	 *
-	 * @internal Same serialization requirement as addSubstatus — see above.
+	 * Serialized with all other substatus writers to avoid stale read-modify-write
+	 * updates clobbering persistent tags like "error" or "unread".
 	 */
 	async removeSubstatus(narratorId: string, tag: string): Promise<string[]> {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { substatus: true },
+		return narratorSubstatusLock.acquire(narratorId, async () => {
+			const row = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { substatus: true },
+			});
+			const current = parseSubstatus(row?.substatus);
+			if (!current.includes(tag)) return current;
+			const updated = current.filter((t) => t !== tag);
+			await writeSubstatus(narratorId, updated);
+			broadcastToNarrator(narratorId, {
+				type: "substatus_change",
+				narratorId,
+				substatus: updated,
+			});
+			return updated;
 		});
-		const current = parseSubstatus(row?.substatus);
-		if (!current.includes(tag)) return current;
-		const updated = current.filter((t) => t !== tag);
-		await this.updateSubstatus(narratorId, updated);
-		return updated;
 	},
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

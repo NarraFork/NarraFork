@@ -11,12 +11,20 @@ export const CODEX_PLAN_TIERS: CodexPlanTier[] = [
 	"other",
 ];
 export const CODEX_DISPLAY_PLAN_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
+export const CODEX_USAGE_FORECAST_HISTORY_MS = 60 * 60_000;
+
+export interface CodexUsageHistoryEntry {
+	timestamp: number;
+	tier: CodexPlanTier;
+	remainingPercent: number;
+}
 
 export interface CodexUsageSourceEntry {
 	id: string;
 	disabled?: boolean;
 	disabledReason?: string;
 	usage?: CodexUsageResult;
+	usageHistory?: CodexUsageHistoryEntry[];
 }
 
 export interface CodexUsageTierStats {
@@ -186,6 +194,29 @@ export function normalizeCodexPlanTier(planType?: string | null): CodexPlanTier 
 	return "other";
 }
 
+export function createCodexUsageHistoryEntry(
+	usage: CodexUsageResult,
+	timestamp?: number,
+): CodexUsageHistoryEntry | null {
+	const remainingPercent = getModeledRemainingPercent(usage);
+	if (remainingPercent === null) return null;
+
+	const queriedAtMs = new Date(usage.queriedAt).getTime();
+	const effectiveTimestamp =
+		typeof timestamp === "number" && Number.isFinite(timestamp)
+			? timestamp
+			: Number.isFinite(queriedAtMs)
+				? queriedAtMs
+				: Date.now();
+	if (!Number.isFinite(effectiveTimestamp)) return null;
+
+	return {
+		timestamp: effectiveTimestamp,
+		tier: normalizeCodexPlanTier(usage.plan_type),
+		remainingPercent: Number(clampPercent(remainingPercent).toFixed(4)),
+	};
+}
+
 export function isZeroUsageAccount(usage?: CodexUsageResult): boolean {
 	if (!usage) return false;
 	const shortTermWindow = getShortTermWindow(usage);
@@ -347,6 +378,155 @@ function calculateForecastPoint(
 	return { timestamp, byTier };
 }
 
+function normalizeStoredUsageHistoryEntry(
+	entry: CodexUsageHistoryEntry,
+): CodexUsageHistoryEntry | null {
+	if (!Number.isFinite(entry.timestamp)) return null;
+	if (!CODEX_PLAN_TIERS.includes(entry.tier)) return null;
+	return {
+		timestamp: entry.timestamp,
+		tier: entry.tier,
+		remainingPercent: Number(clampPercent(entry.remainingPercent).toFixed(4)),
+	};
+}
+
+function getCurrentUsageHistoryEntry(
+	entry: CodexUsageSourceEntry,
+	now: number,
+): CodexUsageHistoryEntry | null {
+	if (!entry.usage) return null;
+	const queriedAtMs = new Date(entry.usage.queriedAt).getTime();
+	const timestamp = Number.isFinite(queriedAtMs) ? Math.min(queriedAtMs, now) : now;
+	return createCodexUsageHistoryEntry(entry.usage, timestamp);
+}
+
+function buildAccountHistorySnapshots(
+	entry: CodexUsageSourceEntry,
+	now: number,
+): CodexUsageHistoryEntry[] {
+	const snapshots = (entry.usageHistory ?? [])
+		.map(normalizeStoredUsageHistoryEntry)
+		.filter((snapshot): snapshot is CodexUsageHistoryEntry => !!snapshot);
+	const currentSnapshot = getCurrentUsageHistoryEntry(entry, now);
+	if (currentSnapshot) snapshots.push(currentSnapshot);
+
+	const byTimestamp = new Map<number, CodexUsageHistoryEntry>();
+	for (const snapshot of snapshots) {
+		const existing = byTimestamp.get(snapshot.timestamp);
+		if (!existing || snapshot.timestamp >= existing.timestamp) {
+			byTimestamp.set(snapshot.timestamp, snapshot);
+		}
+	}
+
+	return [...byTimestamp.values()].sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function getSnapshotAt(
+	snapshots: CodexUsageHistoryEntry[],
+	timestamp: number,
+): CodexUsageHistoryEntry | undefined {
+	let latestBefore: CodexUsageHistoryEntry | undefined;
+	for (const snapshot of snapshots) {
+		if (snapshot.timestamp <= timestamp) {
+			latestBefore = snapshot;
+			continue;
+		}
+		return latestBefore ?? snapshot;
+	}
+	return latestBefore;
+}
+
+function compressHistoricalTimes(times: number[], minGapMs: number): number[] {
+	const sorted = [...new Set(times)].sort((a, b) => a - b);
+	if (sorted.length <= 2) return sorted;
+
+	const result = [sorted[0]];
+	for (const timestamp of sorted.slice(1, -1)) {
+		const last = result[result.length - 1];
+		if (result.length === 1 && timestamp - last < minGapMs) {
+			continue;
+		}
+		if (timestamp - last < minGapMs) {
+			result[result.length - 1] = timestamp;
+		} else {
+			result.push(timestamp);
+		}
+	}
+
+	const lastTimestamp = sorted[sorted.length - 1];
+	if (result.length === 1 && lastTimestamp - result[0] < minGapMs) {
+		result.push(lastTimestamp);
+	} else if (lastTimestamp - result[result.length - 1] < minGapMs) {
+		result[result.length - 1] = lastTimestamp;
+	} else {
+		result.push(lastTimestamp);
+	}
+	return result;
+}
+
+function buildHistoricalForecastPoints(
+	entries: CodexUsageSourceEntry[],
+	now: number,
+): CodexUsageForecastPoint[] {
+	const historyStart = now - CODEX_USAGE_FORECAST_HISTORY_MS;
+	const hasStoredHistory = entries.some(
+		(entry) =>
+			isQuotaTrackedEntry(entry) &&
+			!!entry.usage &&
+			(entry.usageHistory ?? []).some(
+				(snapshot) =>
+					Number.isFinite(snapshot.timestamp) &&
+					snapshot.timestamp >= historyStart &&
+					snapshot.timestamp <= now,
+			),
+	);
+	if (!hasStoredHistory) return [];
+
+	const accountSnapshots = entries.flatMap((entry) => {
+		if (!isQuotaTrackedEntry(entry) || !entry.usage) return [];
+		const snapshots = buildAccountHistorySnapshots(entry, now);
+		return snapshots.length > 0 ? [snapshots] : [];
+	});
+	if (accountSnapshots.length === 0) return [];
+
+	const candidateTimes = [
+		historyStart,
+		...accountSnapshots.flatMap((snapshots) =>
+			snapshots
+				.map((snapshot) => snapshot.timestamp)
+				.filter((timestamp) => timestamp > historyStart && timestamp < now),
+		),
+	];
+	const times = compressHistoricalTimes(candidateTimes, 60_000).filter(
+		(timestamp) => timestamp < now,
+	);
+
+	return times.map((timestamp) => {
+		const byTier = emptyTierValues();
+		for (const snapshots of accountSnapshots) {
+			const snapshot = getSnapshotAt(snapshots, timestamp);
+			if (!snapshot) continue;
+			byTier[snapshot.tier] += snapshot.remainingPercent / 100;
+		}
+		for (const tier of CODEX_PLAN_TIERS) {
+			byTier[tier] = Number(byTier[tier].toFixed(4));
+		}
+		return { timestamp, byTier };
+	});
+}
+
+function appendForecastPoint(
+	points: CodexUsageForecastPoint[],
+	point: CodexUsageForecastPoint,
+): void {
+	const last = points[points.length - 1];
+	if (last && last.timestamp === point.timestamp) {
+		points[points.length - 1] = point;
+		return;
+	}
+	points.push(point);
+}
+
 export function buildCodexUsageForecast(
 	entries: CodexUsageSourceEntry[],
 	now = Date.now(),
@@ -367,7 +547,8 @@ export function buildCodexUsageForecast(
 		),
 	].sort((a, b) => a - b);
 
-	const points: CodexUsageForecastPoint[] = [calculateForecastPoint(states, now)];
+	const points: CodexUsageForecastPoint[] = buildHistoricalForecastPoints(entries, now);
+	appendForecastPoint(points, calculateForecastPoint(states, now));
 
 	for (const resetTime of resetTimes) {
 		for (const state of states) {
@@ -386,7 +567,7 @@ export function buildCodexUsageForecast(
 				state.quotaWindow.remainingPercent = 100;
 			}
 		}
-		points.push(calculateForecastPoint(states, resetTime));
+		appendForecastPoint(points, calculateForecastPoint(states, resetTime));
 	}
 
 	return {

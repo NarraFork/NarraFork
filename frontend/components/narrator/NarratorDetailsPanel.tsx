@@ -10,6 +10,7 @@ import {
 	MultiSelect,
 	Paper,
 	ScrollArea,
+	SegmentedControl,
 	SimpleGrid,
 	Stack,
 	Text,
@@ -34,6 +35,7 @@ import {
 	useNarratorUsageStats,
 	useUpdateCwd,
 	useUpdateDisabledTools,
+	useUpdateReflectionOverrides,
 	useUpdateSubagentModelRestriction,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
@@ -59,6 +61,8 @@ interface NarratorDetailsPanelProps {
 	narrator: ApiEntity;
 	viewers: ViewerInfo[];
 	defaultModelValue?: string;
+	planReflectionAutoApproveGlobal?: boolean;
+	dangerReflectionGlobal?: boolean;
 }
 
 function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
@@ -113,6 +117,21 @@ function StatCard({
 	);
 }
 
+const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
+type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
+
+function normalizeBooleanOverride(value: unknown): BooleanOverride {
+	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
+		? (value as BooleanOverride)
+		: "inherit";
+}
+
+function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean {
+	const override = normalizeBooleanOverride(value);
+	if (override === "inherit") return globalDefault;
+	return override === "on";
+}
+
 function RuleList({
 	items,
 	emptyLabel,
@@ -140,6 +159,8 @@ export function NarratorDetailsPanel({
 	narrator,
 	viewers,
 	defaultModelValue,
+	planReflectionAutoApproveGlobal = false,
+	dangerReflectionGlobal = true,
 }: NarratorDetailsPanelProps) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const navigate = useNavigate();
@@ -157,6 +178,7 @@ export function NarratorDetailsPanel({
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
 	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
 	const updateCwdMutation = useUpdateCwd();
+	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
 	const { data: browserSessions } = useBrowserSessions(opened ? narratorId : "");
@@ -181,6 +203,18 @@ export function NarratorDetailsPanel({
 	const planMode = !!(
 		narrator?.planMode ||
 		(Array.isArray(narrator?.traits) && (narrator.traits as string[]).includes("plan"))
+	);
+	const planReflectionAutoApproveOverride = normalizeBooleanOverride(
+		narrator?.planReflectionAutoApproveOverride,
+	);
+	const dangerReflectionOverride = normalizeBooleanOverride(narrator?.dangerReflectionOverride);
+	const planReflectionAutoApproveEffective = resolveBooleanOverride(
+		planReflectionAutoApproveOverride,
+		planReflectionAutoApproveGlobal,
+	);
+	const dangerReflectionEffective = resolveBooleanOverride(
+		dangerReflectionOverride,
+		dangerReflectionGlobal,
 	);
 	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
 	const [cwdDirty, setCwdDirty] = useState(false);
@@ -555,6 +589,62 @@ export function NarratorDetailsPanel({
 				<DetailRow
 					label={t("details.relaxedPlan")}
 					value={<Text size="sm">{formatBoolean(narrator?.relaxedPlan)}</Text>}
+				/>
+				<DetailRow
+					label={t("details.planReflectionAutoApprove")}
+					value={
+						<Stack gap={4} align="stretch">
+							<SegmentedControl
+								size="xs"
+								value={planReflectionAutoApproveOverride}
+								onChange={(value) =>
+									updateReflectionOverridesMutation.mutate({
+										id: narratorId,
+										planReflectionAutoApproveOverride: value as BooleanOverride,
+									})
+								}
+								disabled={updateReflectionOverridesMutation.isPending}
+								data={[
+									{ value: "inherit", label: t("override_inherit") },
+									{ value: "on", label: t("override_on") },
+									{ value: "off", label: t("override_off") },
+								]}
+							/>
+							<Text size="xs" c="dimmed" ta="right">
+								{t("details.effectiveBoolean", {
+									value: planReflectionAutoApproveEffective ? t("details.on") : t("details.off"),
+								})}
+							</Text>
+						</Stack>
+					}
+				/>
+				<DetailRow
+					label={t("details.dangerReflection")}
+					value={
+						<Stack gap={4} align="stretch">
+							<SegmentedControl
+								size="xs"
+								value={dangerReflectionOverride}
+								onChange={(value) =>
+									updateReflectionOverridesMutation.mutate({
+										id: narratorId,
+										dangerReflectionOverride: value as BooleanOverride,
+									})
+								}
+								disabled={updateReflectionOverridesMutation.isPending}
+								data={[
+									{ value: "inherit", label: t("override_inherit") },
+									{ value: "on", label: t("override_on") },
+									{ value: "off", label: t("override_off") },
+								]}
+							/>
+							<Text size="xs" c="dimmed" ta="right">
+								{t("details.effectiveBoolean", {
+									value: dangerReflectionEffective ? t("details.on") : t("details.off"),
+								})}
+							</Text>
+						</Stack>
+					}
 				/>
 				<DetailRow
 					label={t("details.pruneEnabled")}

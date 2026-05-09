@@ -6,10 +6,12 @@ import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
+import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
 	isCodexExpected101StatusError,
+	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
@@ -232,6 +234,22 @@ export class CodexProvider implements ProviderAdapter {
 		return { classified, hasMore };
 	}
 
+	private throwRebuildHistoryRetry(ctx: CallContext, operation: string, cause: unknown): never {
+		this.context = null;
+		this.contextSessionKey = undefined;
+		const causeMessage = cause instanceof Error ? cause.message : String(cause ?? "");
+		logger.info("Codex quota failover requires rebuilt history before retrying", {
+			operation,
+			previousCredentialId: ctx.id,
+			accountId: ctx.credential.accountId,
+			error: causeMessage,
+		});
+		throw new CodexRebuildHistoryRetryError(
+			causeMessage || "Codex credential quota exhausted; retrying with rebuilt history",
+			{ previousCredentialId: ctx.id, operation },
+		);
+	}
+
 	private async shouldRetryAfterFallbackError(
 		ctx: CallContext,
 		err: unknown,
@@ -255,6 +273,9 @@ export class CodexProvider implements ProviderAdapter {
 				maxAttempts,
 				previousCredentialId: ctx.id,
 			});
+		}
+		if (classified.type === "quota_exhausted" && hasMore && hasStreamedEvents) {
+			this.throwRebuildHistoryRetry(ctx, operation, err);
 		}
 		return shouldRetry;
 	}
@@ -369,7 +390,7 @@ export class CodexProvider implements ProviderAdapter {
 
 			try {
 				for await (const event of provider.chat(chatParams)) {
-					hasStreamedEvents = true;
+					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					// Inject credentialId into the event
 					yield { ...event, credentialId: ctx.id };
 				}
@@ -398,6 +419,9 @@ export class CodexProvider implements ProviderAdapter {
 						previousCredentialId: ctx.id,
 					});
 					continue;
+				}
+				if (classified.type === "quota_exhausted" && hasMore && hasStreamedEvents) {
+					this.throwRebuildHistoryRetry(ctx, "chat", err);
 				}
 				throw err;
 			}
@@ -450,7 +474,7 @@ export class CodexProvider implements ProviderAdapter {
 					request,
 					signal: params.signal,
 				})) {
-					hasStreamedEvents = true;
+					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: ctx.id };
 				}
 				this.manager.reportSuccess(ctx.id);
@@ -464,7 +488,7 @@ export class CodexProvider implements ProviderAdapter {
 				if (expected101Decision === "retry_sse") {
 					try {
 						for await (const event of provider.chat(chatParams)) {
-							hasStreamedEvents = true;
+							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 							yield { ...event, credentialId: ctx.id };
 						}
 						this.manager.reportSuccess(ctx.id);
@@ -512,7 +536,7 @@ export class CodexProvider implements ProviderAdapter {
 					});
 					try {
 						for await (const event of provider.chat(chatParams)) {
-							hasStreamedEvents = true;
+							hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 							yield { ...event, credentialId: ctx.id };
 						}
 						this.manager.reportSuccess(ctx.id);
@@ -556,6 +580,9 @@ export class CodexProvider implements ProviderAdapter {
 						previousCredentialId: ctx.id,
 					});
 					continue;
+				}
+				if (classified.type === "quota_exhausted" && hasMore && hasStreamedEvents) {
+					this.throwRebuildHistoryRetry(ctx, "chat", err);
 				}
 				throw err;
 			}

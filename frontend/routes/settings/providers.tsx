@@ -34,6 +34,8 @@ export const Route = createFileRoute("/settings/providers")({
 	component: SettingsProvidersPage,
 });
 
+const PROVIDER_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
 function getDirtyProviderIds<T extends { id: string }>(
 	currentProviders: T[],
 	savedProviders: T[],
@@ -66,6 +68,7 @@ function SettingsProvidersPage() {
 		queryKey: ["admin", "settings"],
 		queryFn: api.getSettings,
 		enabled: user?.role === "admin",
+		gcTime: PROVIDER_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	// ── Single reducer ──

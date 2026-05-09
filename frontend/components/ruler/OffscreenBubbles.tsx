@@ -51,6 +51,22 @@ const MERGE_DISTANCE = 40;
 
 /** Only show offscreen bubbles for cards whose narrator needs attention */
 const BUBBLE_NARRATOR_STATUSES = new Set(["waiting", "unread", "error", "manual_override"]);
+const MAX_BUBBLE_TITLE_ITEMS = 20;
+const MAX_BUBBLE_TITLE_CHARS = 2_000;
+
+function formatBubbleTitle(titles: string[]): string {
+	let text = "";
+	let hidden = Math.max(0, titles.length - MAX_BUBBLE_TITLE_ITEMS);
+	for (const title of titles.slice(0, MAX_BUBBLE_TITLE_ITEMS)) {
+		const prefix = text ? "\n" : "";
+		if (text.length + prefix.length + title.length > MAX_BUBBLE_TITLE_CHARS) {
+			hidden += 1;
+			break;
+		}
+		text += `${prefix}${title}`;
+	}
+	return hidden > 0 ? `${text}\n… (+${hidden})` : text;
+}
 
 const BUBBLE_STATUS_COLORS: Record<string, { bg: string; border: string }> = {
 	unread: {
@@ -252,7 +268,7 @@ export const OffscreenBubbles = memo(function OffscreenBubbles({
 							cursor: "pointer",
 							boxShadow: "0 2px 8px light-dark(rgba(0,0,0,0.15), rgba(0,0,0,0.4))",
 						}}
-						title={b.titles.join("\n")}
+						title={formatBubbleTitle(b.titles)}
 						onClick={() => onNavigate?.(b.avgWorldX, b.avgWorldY)}
 					>
 						<Text size="9px" c="white" fw={700}>

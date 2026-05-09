@@ -11,11 +11,14 @@ const actionToOverride: Record<ProjectRoutineAction, ProjectRoutineOverride> = {
 	reset: "global",
 };
 
+const ROUTINE_QUERY_GC_TIME_MS = 60_000;
+
 export function useRoutines() {
 	return useQuery({
 		queryKey: ["routines"],
 		queryFn: api.getRoutines,
 		staleTime: 30_000,
+		gcTime: ROUTINE_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -36,6 +39,7 @@ export function useProjectRoutines(projectId: string | undefined) {
 		queryFn: () => api.getProjectRoutines(projectId as string),
 		enabled: !!projectId,
 		staleTime: 30_000,
+		gcTime: ROUTINE_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -83,6 +87,7 @@ export function useGlobalPrompt() {
 		queryKey: ["global-prompt"],
 		queryFn: api.getGlobalPrompt,
 		staleTime: 30_000,
+		gcTime: ROUTINE_QUERY_GC_TIME_MS,
 	});
 }
 

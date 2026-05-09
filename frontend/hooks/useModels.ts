@@ -11,6 +11,8 @@ import {
 	modelValue,
 } from "../lib/constants";
 
+const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
 export interface ProviderModels {
 	prefix: string;
 	name: string;
@@ -25,6 +27,7 @@ export function useAllModels() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	return useMemo(() => {
@@ -208,34 +211,9 @@ export function useAllModels() {
 			providerModelArrays.push({ prefix, models });
 		};
 
-			addGroup(
-				prefix,
-			);
-		}
-		// OpenAI models by prefix
-		const openaiPrefixes = new Set(fetchedOpenaiModels.map((m) => m.provider ?? "openai"));
-		for (const prefix of openaiPrefixes) {
-			addGroup(
-				prefix,
-				fetchedOpenaiModels.filter((m) => (m.provider ?? "openai") === prefix),
-			);
-		}
-		// Anthropic models by prefix
-		const anthropicPrefixes = new Set(fetchedAnthropicModels.map((m) => m.provider ?? "anthropic"));
-		for (const prefix of anthropicPrefixes) {
-			addGroup(
-				prefix,
-				fetchedAnthropicModels.filter((m) => (m.provider ?? "anthropic") === prefix),
-			);
-		}
-		// Cline models by prefix
-		const clinePrefixes = new Set(fetchedClineModels.map((m) => m.provider ?? "cline"));
-		for (const prefix of clinePrefixes) {
-			addGroup(
-				prefix,
-				fetchedClineModels.filter((m) => (m.provider ?? "cline") === prefix),
-			);
-		}
+		for (const group of openaiByProvider) addGroup(group.prefix, group.models);
+		for (const group of anthropicByProvider) addGroup(group.prefix, group.models);
+		for (const group of clineByProvider) addGroup(group.prefix, group.models);
 		if (codexModels.length > 0) addGroup("codex", codexModels);
 		if (customModels.length > 0) addGroup("__custom__", customModels);
 

@@ -16,8 +16,23 @@ const MAX_CACHE_ENTRIES = 64;
 const MAX_CACHE_BYTES = 1 * 1024 * 1024;
 export const MAX_CACHEABLE_CODE_CHARS = 20_000;
 
+function hashCodeForCache(code: string): string {
+	let hash1 = 0xdeadbeef;
+	let hash2 = 0x41c6ce57;
+	for (let i = 0; i < code.length; i++) {
+		const ch = code.charCodeAt(i);
+		hash1 = Math.imul(hash1 ^ ch, 2654435761);
+		hash2 = Math.imul(hash2 ^ ch, 1597334677);
+	}
+	hash1 =
+		Math.imul(hash1 ^ (hash1 >>> 16), 2246822507) ^ Math.imul(hash2 ^ (hash2 >>> 13), 3266489909);
+	hash2 =
+		Math.imul(hash2 ^ (hash2 >>> 16), 2246822507) ^ Math.imul(hash1 ^ (hash1 >>> 13), 3266489909);
+	return `${(hash2 >>> 0).toString(36)}${(hash1 >>> 0).toString(36)}`;
+}
+
 export function cacheKey(theme: string, lang: string, code: string) {
-	return `${theme}\0${lang}\0${code}`;
+	return `${theme}\0${lang}\0${code.length}\0${hashCodeForCache(code)}`;
 }
 
 export function peekCachedHtml(key: string): string | null {
@@ -47,7 +62,7 @@ export function setCachedHtml(key: string, html: string) {
 		htmlCacheBytes -= existing.size;
 		htmlCache.delete(key);
 	}
-	const entry = { html, size: html.length * 2 };
+	const entry = { html, size: (key.length + html.length) * 2 };
 	htmlCache.set(key, entry);
 	htmlCacheBytes += entry.size;
 	while (htmlCache.size > MAX_CACHE_ENTRIES || htmlCacheBytes > MAX_CACHE_BYTES) {

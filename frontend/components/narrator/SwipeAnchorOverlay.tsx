@@ -1,51 +1,24 @@
-import { Box } from "@mantine/core";
-import { memo, useEffect, useRef } from "react";
+import { Box, Text } from "@mantine/core";
+import { memo } from "react";
 import type { SwipeAnchorInfo } from "./swipeState";
 
-/** Max height (px) for the cloned message preview. */
-const MAX_CLONE_HEIGHT = 72;
+/** Max height (px) for the pinned message preview. */
+const MAX_PREVIEW_HEIGHT = 72;
 
 /**
- * When a swiped message scrolls off-screen, this overlay renders a cloned
- * preview of the original DOM element pinned to the top or bottom edge of
- * the scroll area. Clicking it scrolls back to the original message.
+ * When a swiped message scrolls off-screen, this overlay renders a compact
+ * text preview pinned to the top or bottom edge of the scroll area. Clicking
+ * it scrolls back to the original message.
  *
- * The clone is a shallow `cloneNode(true)` with interactivity stripped
- * (pointer-events: none on children) so it acts as a pure visual preview.
+ * Intentionally avoids cloning the original message DOM: large messages and
+ * code blocks can contain huge subtrees, and cloning them would duplicate that
+ * memory even though only a small clipped strip is visible.
  */
 export const SwipeAnchorOverlay = memo(function SwipeAnchorOverlay({
 	info,
 }: {
 	info: SwipeAnchorInfo;
 }) {
-	const containerRef = useRef<HTMLDivElement>(null);
-
-	// Clone the source element into the overlay container.
-	// Re-run whenever the source element or direction changes.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: re-clone when offScreen direction changes
-	useEffect(() => {
-		const container = containerRef.current;
-		if (!container) return;
-		// Clear previous clone
-		container.innerHTML = "";
-
-		const src = info.element;
-		if (!src.isConnected) return;
-
-		const clone = src.cloneNode(true) as HTMLElement;
-		// Strip interactivity from the clone
-		clone.style.pointerEvents = "none";
-		// Reset any transform the swipe may have applied (translateX offset)
-		clone.style.transform = "none";
-		clone.style.transition = "none";
-		// Ensure it fills the container width
-		clone.style.width = "100%";
-		clone.style.maxWidth = "100%";
-		clone.style.margin = "0";
-
-		container.appendChild(clone);
-	}, [info.element, info.offScreen]);
-
 	const isTop = info.offScreen === "top";
 
 	return (
@@ -56,7 +29,7 @@ export const SwipeAnchorOverlay = memo(function SwipeAnchorOverlay({
 				right: 0,
 				...(isTop ? { top: 0 } : { bottom: 0 }),
 				zIndex: 10,
-				maxHeight: MAX_CLONE_HEIGHT,
+				maxHeight: MAX_PREVIEW_HEIGHT,
 				overflow: "hidden",
 				cursor: "pointer",
 				// Fade-out gradient at the clipped edge
@@ -70,21 +43,21 @@ export const SwipeAnchorOverlay = memo(function SwipeAnchorOverlay({
 			onClick={() => info.scrollBack()}
 		>
 			<Box
-				ref={containerRef}
+				px="md"
+				py={6}
 				style={{
-					padding: "0 var(--mantine-spacing-md)",
-					// For bottom overlay, align the clone to the bottom so the
-					// visible portion is the tail of the message, not the head.
-					...(isTop
-						? {}
-						: {
-								display: "flex",
-								flexDirection: "column",
-								justifyContent: "flex-end",
-								minHeight: MAX_CLONE_HEIGHT,
-							}),
+					minHeight: MAX_PREVIEW_HEIGHT,
+					display: "flex",
+					alignItems: isTop ? "flex-start" : "flex-end",
+					background: "var(--mantine-color-body)",
+					borderTop: isTop ? undefined : "1px solid var(--mantine-color-default-border)",
+					borderBottom: isTop ? "1px solid var(--mantine-color-default-border)" : undefined,
 				}}
-			/>
+			>
+				<Text size="xs" c="dimmed" lineClamp={2} style={{ width: "100%" }}>
+					{info.previewText}
+				</Text>
+			</Box>
 		</Box>
 	);
 });

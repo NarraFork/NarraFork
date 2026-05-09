@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const CUSTOM_SUBAGENT_QUERY_GC_TIME_MS = 60_000;
+
 export interface CustomSubagentDef {
 	name: string;
 	description: string;
@@ -14,6 +16,7 @@ export function useCustomSubagents() {
 	return useQuery({
 		queryKey: ["custom-subagents"],
 		queryFn: () => api.listCustomSubagents(),
+		gcTime: CUSTOM_SUBAGENT_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -22,6 +25,7 @@ export function useCustomSubagent(name: string, enabled = true) {
 		queryKey: ["custom-subagent", name],
 		queryFn: () => api.getCustomSubagent(name),
 		enabled: !!name && enabled,
+		gcTime: CUSTOM_SUBAGENT_QUERY_GC_TIME_MS,
 	});
 }
 

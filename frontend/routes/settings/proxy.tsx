@@ -23,6 +23,8 @@ export const Route = createFileRoute("/settings/proxy")({
 	component: ProxyManagementPage,
 });
 
+const PROXY_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
 function ProxyManagementPage() {
 	const { t } = useTranslation("settings");
 	const { data: user } = useCurrentUser();
@@ -52,6 +54,7 @@ function ProxyManagementPage() {
 	const [proxy, setProxy] = useState("");
 	const [initialized, setInitialized] = useState(false);
 
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	useEffect(() => {
@@ -106,6 +109,7 @@ function CodexProxyCard() {
 	const { data: codexStatus } = useQuery({
 		queryKey: ["codex", "status"],
 		queryFn: () => api.codexStatus(),
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	useEffect(() => {
@@ -164,6 +168,7 @@ function AnthropicProxyCard() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["admin", "settings"],
 		queryFn: api.getSettings,
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -220,6 +225,7 @@ function WebFetchProxyCard() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["admin", "settings"],
 		queryFn: api.getSettings,
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

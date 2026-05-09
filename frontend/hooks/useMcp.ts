@@ -1,11 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const MCP_SERVERS_QUERY_GC_TIME_MS = 60_000;
+
 export function useMcpServers() {
 	return useQuery({
 		queryKey: ["mcp-servers"],
 		queryFn: api.mcpListServers,
 		select: (data) => data.servers,
+		gcTime: MCP_SERVERS_QUERY_GC_TIME_MS,
 	});
 }
 

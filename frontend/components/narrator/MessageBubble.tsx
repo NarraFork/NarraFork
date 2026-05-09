@@ -68,6 +68,11 @@ import { api, getToken, type SideCarRecord } from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
 import { ContentViewer } from "./ContentViewer";
+import {
+	copyGeneratedImageToClipboard,
+	MAX_IMAGE_CLIPBOARD_BLOB_BYTES,
+	MAX_INLINE_IMAGE_SOURCE_CHARS,
+} from "./image-clipboard";
 import { LazyCollapse } from "./LazyCollapse";
 import { MarkdownContent } from "./MarkdownContent";
 import {
@@ -87,6 +92,63 @@ import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 const SYSTEM_MESSAGE_BG = "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))";
+export const COMPACTING_MARKER_ATTR = "data-compacting-marker";
+const COMPACT_DETAIL_QUERY_GC_TIME_MS = 30_000;
+const MAX_HIDDEN_COMPACT_MESSAGES = 100;
+const HIDDEN_COMPACT_MESSAGE_PREVIEW_CHARS = 800;
+const MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES = MAX_IMAGE_CLIPBOARD_BLOB_BYTES;
+const MAX_INLINE_IMAGE_RESULT_CHARS = MAX_INLINE_IMAGE_SOURCE_CHARS;
+const GENERATED_IMAGE_MAX_DISPLAY_WIDTH = 512;
+const MAX_USER_MESSAGE_DISPLAY_CHARS = 120_000;
+const MAX_USER_MESSAGE_EDIT_CHARS = 200_000;
+
+function collectTextBlocksPreview(
+	blocks: Array<{ type?: string; text?: unknown }>,
+	maxChars: number,
+): { text: string; truncated: boolean } {
+	let result = "";
+	let truncated = false;
+	for (const block of blocks) {
+		if (block.type !== "text" || typeof block.text !== "string") continue;
+		const separator = result ? "\n\n" : "";
+		const remaining = maxChars - result.length - separator.length;
+		if (remaining <= 0) {
+			truncated = true;
+			break;
+		}
+		result += separator;
+		if (block.text.length > remaining) {
+			result += block.text.slice(0, remaining);
+			truncated = true;
+			break;
+		}
+		result += block.text;
+	}
+	return { text: result, truncated };
+}
+
+function collectHiddenCompactMessagePreview(blocks: { type: string; text?: string }[]): {
+	text: string;
+	truncated: boolean;
+} {
+	let result = "";
+	let truncated = false;
+	for (const block of blocks) {
+		if (block.type !== "text" || !block.text) continue;
+		const separator = result ? "\n\n" : "";
+		const remaining = HIDDEN_COMPACT_MESSAGE_PREVIEW_CHARS - result.length - separator.length;
+		if (remaining <= 0) {
+			truncated = true;
+			break;
+		}
+		result += separator + block.text.slice(0, remaining);
+		if (block.text.length > remaining || result.length >= HIDDEN_COMPACT_MESSAGE_PREVIEW_CHARS) {
+			truncated = true;
+			break;
+		}
+	}
+	return { text: result, truncated };
+}
 
 // --- Editing message context ---
 // Allows MessageBubble to register its active editing state so that the
@@ -112,7 +174,27 @@ export const EditingMessageCtx = createContext<{
 // Key: `${narratorId}:${blockIndex}`, Value: expanded (true) or collapsed (false).
 // Only written when the user explicitly toggles — blocks without an entry
 // always follow the global preference (narrafork_expand_reasoning).
+const MAX_REASONING_EXPAND_STATE_ENTRIES = 500;
 const reasoningExpandState = new Map<string, boolean>();
+
+function getReasoningExpandState(key: string): boolean | undefined {
+	const value = reasoningExpandState.get(key);
+	if (value !== undefined) {
+		reasoningExpandState.delete(key);
+		reasoningExpandState.set(key, value);
+	}
+	return value;
+}
+
+function setReasoningExpandState(key: string, value: boolean) {
+	reasoningExpandState.delete(key);
+	reasoningExpandState.set(key, value);
+	while (reasoningExpandState.size > MAX_REASONING_EXPAND_STATE_ENTRIES) {
+		const oldestKey = reasoningExpandState.keys().next().value;
+		if (oldestKey === undefined) break;
+		reasoningExpandState.delete(oldestKey);
+	}
+}
 
 function hasEncryptedReasoningMetadata(block: unknown): boolean {
 	if (!block || typeof block !== "object") return false;
@@ -272,7 +354,7 @@ function WebSearchBlock({
 		(e: React.MouseEvent) => {
 			if (isMobile) return;
 			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			e.preventDefault();
 			e.stopPropagation();
 			const x = Math.min(e.clientX, window.innerWidth - 200);
@@ -292,7 +374,7 @@ function WebSearchBlock({
 			if (shouldIgnoreMessageBlockSelection(e.target)) return;
 			if (!selection.selectionMode) {
 				const sel = window.getSelection();
-				if (sel && sel.toString().trim().length > 0) return;
+				if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			}
 			e.preventDefault();
 			if (isShift) {
@@ -496,6 +578,8 @@ interface ImageGenerationBlockData {
 	result?: string;
 	savedPath?: string;
 	outputIndex?: number;
+	width?: number;
+	height?: number;
 }
 
 function generatedImageFilename(block: ImageGenerationBlockData): string {
@@ -512,6 +596,29 @@ function downloadUrl(url: string, filename: string) {
 	document.body.appendChild(link);
 	link.click();
 	link.remove();
+}
+
+function getImageGenerationDisplayMetrics(block: ImageGenerationBlockData): {
+	width: number;
+	height: number;
+	displayWidth: number;
+} | null {
+	const { width, height } = block;
+	if (
+		typeof width !== "number" ||
+		typeof height !== "number" ||
+		!Number.isFinite(width) ||
+		!Number.isFinite(height) ||
+		width <= 0 ||
+		height <= 0
+	) {
+		return null;
+	}
+	return {
+		width,
+		height,
+		displayWidth: Math.min(width, GENERATED_IMAGE_MAX_DISPLAY_WIDTH),
+	};
 }
 
 function ImageGenerationBlock({
@@ -552,6 +659,7 @@ function ImageGenerationBlock({
 			})
 			.then((blob) => {
 				if (!cancelled) {
+					if (blob.size > MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) throw new Error("Image too large");
 					objectUrl = URL.createObjectURL(blob);
 					setBlobUrl(objectUrl);
 				}
@@ -565,12 +673,38 @@ function ImageGenerationBlock({
 		};
 	}, [block.savedPath, getPreviewHeaders]);
 
-	// Determine image source: savedPath blob > inline base64 > none
-	const imageSrc = blobUrl ?? (block.result ? `data:image/png;base64,${block.result}` : null);
-	const hasImage = !!imageSrc && !loadError;
+	// Determine image source: savedPath blob > bounded inline base64 > none
+	const inlineImageSrc =
+		block.result && block.result.length <= MAX_INLINE_IMAGE_RESULT_CHARS
+			? block.result.startsWith("data:")
+				? block.result
+				: `data:image/png;base64,${block.result}`
+			: null;
+	const imageSrc = blobUrl ?? inlineImageSrc;
+	const inlineResultUnavailable =
+		!block.savedPath && !!block.result && block.result.length > MAX_INLINE_IMAGE_RESULT_CHARS;
+	const imageUnavailable = loadError || inlineResultUnavailable;
+	const hasImage = !!imageSrc && !imageUnavailable;
+	const imageMetrics = getImageGenerationDisplayMetrics(block);
+	const shouldReserveImageFrame =
+		!!imageMetrics && (!!block.savedPath || !!block.result || imageUnavailable);
+	const imageFrameStyle: React.CSSProperties | undefined = imageMetrics
+		? {
+				width: `min(100%, ${imageMetrics.displayWidth}px)`,
+				aspectRatio: `${imageMetrics.width} / ${imageMetrics.height}`,
+				borderRadius: "var(--mantine-radius-sm)",
+				overflow: "hidden",
+				backgroundColor: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+			}
+		: undefined;
+	const canCopyImage = hasImage || !!block.savedPath;
 	const canCopyImagePath = !!block.savedPath;
 	const canSaveImage = hasImage;
 	const hasMenuActions = !!(
+		canCopyImage ||
 		canCopyImagePath ||
 		canSaveImage ||
 		msgCtx.onRollbackToBlock ||
@@ -579,6 +713,16 @@ function ImageGenerationBlock({
 		msgCtx.onCompactBeforeMessage ||
 		msgCtx.onDeleteBlock
 	);
+
+	const handleCopyImage = useCallback(async () => {
+		if (!imageSrc && !block.savedPath) return;
+		try {
+			await copyGeneratedImageToClipboard({ imageSrc, savedPath: block.savedPath });
+			notifications.show({ color: "teal", message: t("copyImageSuccess") });
+		} catch {
+			notifications.show({ color: "red", message: t("copyImageFailed") });
+		}
+	}, [block.savedPath, imageSrc, t]);
 
 	const handleCopyImagePath = useCallback(async () => {
 		if (!block.savedPath) return;
@@ -603,7 +747,7 @@ function ImageGenerationBlock({
 		(e: React.MouseEvent) => {
 			if (isMobile || lod === "preview" || !hasMenuActions) return;
 			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			e.preventDefault();
 			e.stopPropagation();
 			const x = Math.min(e.clientX, window.innerWidth - 220);
@@ -619,7 +763,12 @@ function ImageGenerationBlock({
 	return (
 		<>
 			<Paper withBorder radius="sm" p="xs" onContextMenu={handleContextMenu}>
-				<Group gap={6} wrap="nowrap" align="center" mb={hasImage ? "xs" : 0}>
+				<Group
+					gap={6}
+					wrap="nowrap"
+					align="center"
+					mb={hasImage || shouldReserveImageFrame ? "xs" : 0}
+				>
 					<ThemeIcon size={18} variant="light" color="violet" radius="sm">
 						<IconPhoto size={12} />
 					</ThemeIcon>
@@ -637,7 +786,27 @@ function ImageGenerationBlock({
 						)}
 					</Text>
 				</Group>
-				{hasImage && (
+				{imageMetrics && shouldReserveImageFrame ? (
+					<Box style={imageFrameStyle}>
+						{hasImage ? (
+							<Image
+								src={imageSrc}
+								alt={block.revisedPrompt ?? "Generated image"}
+								radius="sm"
+								w="100%"
+								h="100%"
+								fit="contain"
+								style={{ display: "block" }}
+							/>
+						) : imageUnavailable ? (
+							<Text size="xs" c="dimmed">
+								{t("imageLoadFailed", { defaultValue: "Failed to load image" })}
+							</Text>
+						) : (
+							<Skeleton h="100%" w="100%" radius="sm" />
+						)}
+					</Box>
+				) : hasImage ? (
 					<Image
 						src={imageSrc}
 						alt={block.revisedPrompt ?? "Generated image"}
@@ -645,7 +814,7 @@ function ImageGenerationBlock({
 						maw={512}
 						fit="contain"
 					/>
-				)}
+				) : null}
 			</Paper>
 			{ctxMenuOpened && (
 				<Menu
@@ -675,6 +844,17 @@ function ImageGenerationBlock({
 						/>
 					</Menu.Target>
 					<Menu.Dropdown>
+						{canCopyImage && (
+							<Menu.Item
+								leftSection={<IconPhoto size={14} />}
+								onClick={() => {
+									void handleCopyImage();
+									closeMenu();
+								}}
+							>
+								{t("contextMenu_copyImage")}
+							</Menu.Item>
+						)}
 						{canCopyImagePath && (
 							<Menu.Item
 								leftSection={<IconCopy size={14} />}
@@ -697,7 +877,7 @@ function ImageGenerationBlock({
 								{t("contextMenu_saveImageAs")}
 							</Menu.Item>
 						)}
-						{(canCopyImagePath || canSaveImage) &&
+						{(canCopyImage || canCopyImagePath || canSaveImage) &&
 							(msgCtx.onRollbackToBlock ||
 								msgCtx.onForkFromMessage ||
 								msgCtx.onAskInPassing ||
@@ -797,7 +977,7 @@ function BlockMenuWrapper({
 		(e: React.MouseEvent) => {
 			if (isMobile || !hasActions) return;
 			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			e.preventDefault();
 			e.stopPropagation();
 			const x = Math.min(e.clientX, window.innerWidth - 200);
@@ -907,7 +1087,7 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
 			.then((res) => (res.ok ? res.blob() : null))
 			.then((blob) => {
-				if (blob && !cancelled) {
+				if (blob && !cancelled && blob.size <= MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) {
 					objectUrl = URL.createObjectURL(blob);
 					setBlobUrl(objectUrl);
 				}
@@ -993,7 +1173,7 @@ export const ReasoningBlock = memo(
 			narratorId != null && blockIndex != null ? `${narratorId}:${blockIndex}` : undefined;
 
 		// Initialize from persisted state (if user toggled before remount) or global pref.
-		const persistedState = persistKey != null ? reasoningExpandState.get(persistKey) : undefined;
+		const persistedState = persistKey != null ? getReasoningExpandState(persistKey) : undefined;
 		const [opened, setOpened] = useState(
 			persistedState !== undefined ? persistedState : expandReasoning,
 		);
@@ -1049,7 +1229,7 @@ export const ReasoningBlock = memo(
 			(e: React.MouseEvent) => {
 				if (isMobile) return;
 				const sel = window.getSelection();
-				if (sel && sel.toString().trim().length > 0) return;
+				if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 				e.preventDefault();
 				e.stopPropagation();
 				const x = Math.min(e.clientX, window.innerWidth - 200);
@@ -1072,7 +1252,7 @@ export const ReasoningBlock = memo(
 				// is already active, Shift+Click should always do range-select.
 				if (!selection.selectionMode) {
 					const sel = window.getSelection();
-					if (sel && sel.toString().trim().length > 0) return;
+					if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 				}
 				e.preventDefault();
 				if (isShift) {
@@ -1091,7 +1271,7 @@ export const ReasoningBlock = memo(
 				const next = !v;
 				// Persist to module-level map so the state survives component remounts
 				// (e.g. when streaming __streaming__ message is replaced by real message).
-				if (persistKey) reasoningExpandState.set(persistKey, next);
+				if (persistKey) setReasoningExpandState(persistKey, next);
 				return next;
 			});
 		};
@@ -1582,6 +1762,7 @@ function CompactIndicator({
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
+	const queryClient = useQueryClient();
 
 	const canClick = !isCompacting && narratorId && messageId;
 
@@ -1589,7 +1770,16 @@ function CompactIndicator({
 		queryKey: ["compact-summary", narratorId, messageId],
 		queryFn: () => api.getCompactSummary(narratorId ?? "", messageId ?? ""),
 		enabled: opened && !!narratorId && !!messageId,
+		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 	});
+
+	useEffect(() => {
+		if (opened || !narratorId || !messageId) return;
+		queryClient.removeQueries({
+			queryKey: ["compact-summary", narratorId, messageId],
+			exact: true,
+		});
+	}, [opened, narratorId, messageId, queryClient]);
 
 	const handleDelete = async () => {
 		if (!narratorId || !messageId) return;
@@ -1633,6 +1823,8 @@ function CompactIndicator({
 				gap={6}
 				justify="center"
 				py={4}
+				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "context" } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
 				style={canClick ? { cursor: "pointer" } : undefined}
 				onClick={canClick ? open : undefined}
 			>
@@ -1739,6 +1931,7 @@ function SegmentCompactIndicator({
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
 	const [expanded, setExpanded] = useState(false);
+	const queryClient = useQueryClient();
 
 	const canClick = !isCompacting && narratorId && messageId;
 
@@ -1746,6 +1939,7 @@ function SegmentCompactIndicator({
 		queryKey: ["segment-compact-summary", narratorId, messageId],
 		queryFn: () => api.getSegmentCompactSummary(narratorId ?? "", messageId ?? ""),
 		enabled: opened && !!narratorId && !!messageId,
+		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 	});
 
 	const {
@@ -1756,7 +1950,24 @@ function SegmentCompactIndicator({
 		queryKey: ["segment-compact-messages", narratorId, messageId],
 		queryFn: () => api.getSegmentCompactMessages(narratorId ?? "", messageId ?? ""),
 		enabled: expanded && !!narratorId && !!messageId,
+		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 	});
+
+	useEffect(() => {
+		if (!narratorId || !messageId) return;
+		if (!opened) {
+			queryClient.removeQueries({
+				queryKey: ["segment-compact-summary", narratorId, messageId],
+				exact: true,
+			});
+		}
+		if (!expanded) {
+			queryClient.removeQueries({
+				queryKey: ["segment-compact-messages", narratorId, messageId],
+				exact: true,
+			});
+		}
+	}, [opened, expanded, narratorId, messageId, queryClient]);
 
 	const handleDelete = async () => {
 		if (!narratorId || !messageId) return;
@@ -1801,10 +2012,21 @@ function SegmentCompactIndicator({
 	}
 
 	const hiddenMessages = (hiddenData?.messages ?? []) as HiddenMessage[];
+	const visibleHiddenMessages = hiddenMessages.slice(0, MAX_HIDDEN_COMPACT_MESSAGES);
+	const hiddenMessageOverflowCount = Math.max(
+		0,
+		hiddenMessages.length - visibleHiddenMessages.length,
+	);
 
 	return (
 		<>
-			<Group gap={6} justify="center" py={4}>
+			<Group
+				gap={6}
+				justify="center"
+				py={4}
+				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "segment" } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
+			>
 				{isCompacting ? (
 					<Loader size={14} color="teal" />
 				) : (
@@ -1866,13 +2088,10 @@ function SegmentCompactIndicator({
 					)}
 					{hiddenMessages.length > 0 && (
 						<Stack gap={6}>
-							{hiddenMessages.map((msg) => {
+							{visibleHiddenMessages.map((msg) => {
 								const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-								const textParts = blocks
-									.filter((b) => b.type === "text")
-									.map((b) => b.text ?? "")
-									.join("\n\n");
-								if (!textParts) return null;
+								const preview = collectHiddenCompactMessagePreview(blocks);
+								if (!preview.text) return null;
 								return (
 									<Box
 										key={msg.id}
@@ -1893,11 +2112,19 @@ function SegmentCompactIndicator({
 												overflow: "auto",
 											}}
 										>
-											{textParts.length > 800 ? `${textParts.slice(0, 800)}…` : textParts}
+											{preview.truncated ? `${preview.text}…` : preview.text}
 										</Text>
 									</Box>
 								);
 							})}
+							{hiddenMessageOverflowCount > 0 && (
+								<Text size="xs" c="dimmed" ta="center">
+									{t("segmentHiddenMessagesTruncated", {
+										shown: visibleHiddenMessages.length,
+										hidden: hiddenMessageOverflowCount,
+									})}
+								</Text>
+							)}
 						</Stack>
 					)}
 				</Paper>
@@ -2404,14 +2631,14 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
-		const textBlocks = blocks.filter((b: { type: string }) => b.type === "text");
-		const fullText = textBlocks
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.map((b: any) => b.text)
-			.join("\n\n");
-		setEditContent(fullText);
+		const editPreview = collectTextBlocksPreview(blocks, MAX_USER_MESSAGE_EDIT_CHARS);
+		if (editPreview.truncated) {
+			notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
+			return;
+		}
+		setEditContent(editPreview.text);
 		setIsEditing(true);
-	}, [blocks]);
+	}, [blocks, t]);
 
 	const cancelEditing = useCallback(() => {
 		setIsEditing(false);
@@ -2623,7 +2850,7 @@ export const MessageBubble = memo(function MessageBubble({
 			<SegmentCompactIndicator
 				isCompacting={isSegCompacting}
 				narratorId={canNavigate ? narratorId : undefined}
-				messageId={canNavigate ? message.id : undefined}
+				messageId={message.id}
 				messageCount={segmentCompactBlock.messageCount}
 				onDelete={canNavigate ? invalidateMessages : undefined}
 			/>
@@ -2704,7 +2931,7 @@ export const MessageBubble = memo(function MessageBubble({
 				<CompactIndicator
 					isCompacting={isCompacting}
 					narratorId={canNavigate ? narratorId : undefined}
-					messageId={canNavigate ? message.id : undefined}
+					messageId={message.id}
 					onDelete={canNavigate ? invalidateMessages : undefined}
 				/>
 			);
@@ -2789,12 +3016,8 @@ export const MessageBubble = memo(function MessageBubble({
 			);
 		}
 
-		const fullText = blocks
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.filter((b: any) => b.type === "text" && b.text)
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			.map((b: any) => b.text)
-			.join("\n\n");
+		const userTextPreview = collectTextBlocksPreview(blocks, MAX_USER_MESSAGE_DISPLAY_CHARS);
+		const fullText = userTextPreview.text;
 		const hasCommand = !!message.commandText;
 
 		// Edit mode UI
@@ -2934,6 +3157,11 @@ export const MessageBubble = memo(function MessageBubble({
 									</Text>
 								)}
 							</Group>
+							{userTextPreview.truncated && (
+								<Text size="xs" c="orange">
+									{t("userMessagePreviewTruncated")}
+								</Text>
+							)}
 							{hasCommand ? (
 								<>
 									<Text size="sm" fw={500} c="indigo.4" style={{ fontFamily: "monospace" }}>

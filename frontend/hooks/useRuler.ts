@@ -2,6 +2,7 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
 const MAX_RULER_PAGES = 20;
+const RULER_QUERY_GC_TIME_MS = 60_000;
 
 export interface RulerCommit {
 	sha: string;
@@ -51,6 +52,7 @@ export function useRulerData(projectId: string) {
 		queryKey: ["ruler", projectId],
 		queryFn: () => api.getRulerData(projectId) as Promise<RulerData>,
 		enabled: !!projectId,
+		gcTime: RULER_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -78,6 +80,7 @@ export function useRulerInfinite(projectId: string) {
 					}
 				: undefined,
 		staleTime: 5 * 60 * 1000,
+		gcTime: RULER_QUERY_GC_TIME_MS,
 		maxPages: MAX_RULER_PAGES,
 		enabled: !!projectId,
 	});

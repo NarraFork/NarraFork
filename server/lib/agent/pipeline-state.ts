@@ -1,7 +1,7 @@
 import { db } from "@server/db";
 import { narrators } from "@server/db/schema";
 import { eq } from "drizzle-orm";
-import { hotSafe } from "../hot-safe";
+import { narratorTraitsLock } from "../async-mutex";
 import { parseTraits } from "../narrator-utils";
 import { persistOutput } from "./truncate";
 
@@ -34,8 +34,6 @@ export interface PipelineCaptureResult {
 	capture: PipelineCapture;
 	previewOutput: string;
 }
-
-const locks = hotSafe<Map<string, Promise<void>>>("narrafork.pipelineStateLocks", () => new Map());
 
 function encodeState(state: PipelineState): string {
 	return `${PIPELINE_TRAIT_PREFIX}${Buffer.from(JSON.stringify(state), "utf-8").toString("base64url")}`;
@@ -79,26 +77,7 @@ function clampPreviewChars(value: unknown): number {
 }
 
 async function withPipelineLock<T>(narratorId: string, fn: () => Promise<T>): Promise<T> {
-	const previous = locks.get(narratorId) ?? Promise.resolve();
-	let release: () => void = () => {};
-	const current = previous
-		.catch(() => {})
-		.then(
-			() =>
-				new Promise<void>((resolve) => {
-					release = resolve;
-				}),
-		);
-	locks.set(narratorId, current);
-	await previous.catch(() => {});
-	try {
-		return await fn();
-	} finally {
-		release();
-		if (locks.get(narratorId) === current) {
-			locks.delete(narratorId);
-		}
-	}
+	return narratorTraitsLock.acquire(narratorId, fn);
 }
 
 async function readTraits(narratorId: string): Promise<string[]> {

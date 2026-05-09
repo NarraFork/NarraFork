@@ -38,6 +38,9 @@ import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 
+const MODEL_SELECT_OPTION_LIMIT = 100;
+const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
 export interface CreateNarratorResult {
 	id: string;
 	title: string;
@@ -135,6 +138,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const defaultProjectDir = settings?.paths?.defaultProjectDir ?? "";
 	const { data: favorites } = useFavoriteDirectories();
@@ -311,6 +315,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 					description={t("modelHint")}
 					data={groupedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					value={selectedModel || FOLLOW_DEFAULT_MODEL}
 					onChange={(v) => setSelectedModel(v ?? "")}
 					maxDropdownHeight={320}

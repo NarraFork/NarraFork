@@ -166,7 +166,22 @@ export type NarratorServerMessage =
 	  }
 	| { type: "plan_mode_changed"; narratorId: string; planMode: boolean; traits: string[] }
 	| { type: "custom_traits_changed"; narratorId: string; traits: string[]; customTraits: unknown }
+	| {
+			type: "draft_changed";
+			narratorId: string;
+			hasDraft: boolean;
+			text: string;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+	  }
 	| { type: "relaxed_plan_changed"; narratorId: string; relaxedPlan: boolean }
+	| {
+			type: "reflection_overrides_changed";
+			narratorId: string;
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off";
+	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string }
 	| {

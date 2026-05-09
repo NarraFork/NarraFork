@@ -2,12 +2,16 @@ import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const CONTAINERS_QUERY_GC_TIME_MS = 60_000;
+const CONTAINER_LOGS_GC_TIME_MS = 30_000;
+
 export function useContainers(chapterId: string) {
 	return useQuery({
 		queryKey: ["containers", chapterId],
 		queryFn: () => api.getContainers(chapterId),
 		enabled: !!chapterId,
 		refetchInterval: 60_000, // Fallback polling — primary updates via WS (useContainerEvents)
+		gcTime: CONTAINERS_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -20,6 +24,7 @@ export function useContainerLogs(
 		queryKey: ["containerLogs", chapterId, opts],
 		queryFn: () => api.getContainerLogs(chapterId, opts),
 		enabled: !!chapterId && (queryOpts?.enabled ?? true),
+		gcTime: CONTAINER_LOGS_GC_TIME_MS,
 	});
 }
 

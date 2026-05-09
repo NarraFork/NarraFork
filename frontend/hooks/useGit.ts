@@ -42,12 +42,15 @@ export interface GitStashEntry {
 
 // Queries
 
+const GIT_QUERY_GC_TIME_MS = 60_000;
+
 export function useGitStatus(chapterId: string | undefined | null) {
 	return useQuery<GitStatusSummary>({
 		queryKey: ["gitStatus", chapterId],
 		queryFn: () => api.getGitStatus(chapterId as string),
 		enabled: !!chapterId,
 		refetchInterval: 30_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -56,6 +59,7 @@ export function useGitLog(chapterId: string | undefined | null, limit = 50, skip
 		queryKey: ["gitLog", chapterId, limit, skip],
 		queryFn: () => api.getGitLog(chapterId as string, limit, skip),
 		enabled: !!chapterId,
+		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -64,6 +68,7 @@ export function useGitStashList(chapterId: string | undefined | null) {
 		queryKey: ["gitStashList", chapterId],
 		queryFn: () => api.getGitStashList(chapterId as string),
 		enabled: !!chapterId,
+		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -76,6 +81,7 @@ export function useGitDiff(
 		queryKey: ["gitDiff", chapterId, file, staged],
 		queryFn: () => api.getGitDiff(chapterId as string, file as string, staged),
 		enabled: !!chapterId && !!file,
+		gcTime: 30_000,
 	});
 }
 

@@ -15,7 +15,7 @@ import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getContextThresholds, settings } from "../lib/settings";
+import { getAutoCompactKeepPairs, getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import { runCustomCompact } from "./narrator-session";
@@ -185,8 +185,11 @@ export async function handleContextOverflow(opts: {
 	// ── Step 2: Emergency compact ────────────────────────────────────────
 	// generateCompactSummary now handles progressive input fitting internally
 	// (pruning tool calls + dropping old messages to fit the summary model's
-	// context window), so a single compact attempt with keepPairs=2 suffices.
-	const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+	// context window), so a single compact attempt with configured recent-turn retention suffices.
+	const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+		narratorId,
+		getAutoCompactKeepPairs(),
+	);
 	if (!boundaryMessageId) {
 		logger.warn("No compact boundary found", { narratorId });
 		return { action: "failed", overflowRetries };

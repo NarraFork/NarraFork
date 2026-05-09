@@ -38,6 +38,14 @@ interface CommandPopoverProps {
 	anchorRef?: React.RefObject<HTMLElement | null>;
 }
 
+const MAX_COMMAND_POPOVER_ITEMS = 120;
+const MAX_COMMAND_POPOVER_DESCRIPTION_CHARS = 300;
+
+function capCommandPopoverText(text: string): string {
+	if (text.length <= MAX_COMMAND_POPOVER_DESCRIPTION_CHARS) return text;
+	return `${text.slice(0, MAX_COMMAND_POPOVER_DESCRIPTION_CHARS)}…`;
+}
+
 /** Left color bar based on item type + source */
 function getBarColor(item: CommandItem): string {
 	if (item.type === "skill") {
@@ -98,12 +106,20 @@ export function CommandPopover({
 			return c.name.toLowerCase().startsWith(query);
 		});
 	}, [commands, query]);
+	const visibleCommands = useMemo(() => filtered.slice(0, MAX_COMMAND_POPOVER_ITEMS), [filtered]);
+	const hiddenCommandCount = Math.max(0, filtered.length - visibleCommands.length);
 
 	// Reset selection when filter changes
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on query change
 	useEffect(() => {
 		setSelectedIndex(0);
 	}, [query]);
+
+	useEffect(() => {
+		if (selectedIndex >= visibleCommands.length) {
+			setSelectedIndex(Math.max(0, visibleCommands.length - 1));
+		}
+	}, [selectedIndex, visibleCommands.length]);
 
 	// Scroll selected item into view
 	useEffect(() => {
@@ -114,17 +130,17 @@ export function CommandPopover({
 
 	const handleKeyDown = useCallback(
 		(e: KeyboardEvent) => {
-			if (!visible || filtered.length === 0) return;
+			if (!visible || visibleCommands.length === 0) return;
 
 			if (e.key === "ArrowDown") {
 				e.preventDefault();
-				setSelectedIndex((i) => (i + 1) % filtered.length);
+				setSelectedIndex((i) => (i + 1) % visibleCommands.length);
 			} else if (e.key === "ArrowUp") {
 				e.preventDefault();
-				setSelectedIndex((i) => (i - 1 + filtered.length) % filtered.length);
+				setSelectedIndex((i) => (i - 1 + visibleCommands.length) % visibleCommands.length);
 			} else if (e.key === "Enter" && !e.shiftKey) {
 				// If input exactly matches a no-param command, let Enter bubble to send
-				const selected = filtered[selectedIndex];
+				const selected = visibleCommands[selectedIndex];
 				const exactMatch = selected && selected.name.toLowerCase() === query;
 				const hasParams =
 					selected?.type === "command" &&
@@ -137,16 +153,16 @@ export function CommandPopover({
 				}
 				e.preventDefault();
 				e.stopPropagation();
-				onSelect(filtered[selectedIndex]);
+				onSelect(visibleCommands[selectedIndex]);
 			} else if (e.key === "Escape") {
 				e.preventDefault();
 				onClose();
 			} else if (e.key === "Tab") {
 				e.preventDefault();
-				onSelect(filtered[selectedIndex]);
+				onSelect(visibleCommands[selectedIndex]);
 			}
 		},
-		[visible, filtered, selectedIndex, onSelect, onClose, query],
+		[visible, visibleCommands, selectedIndex, onSelect, onClose, query],
 	);
 
 	useEffect(() => {
@@ -156,7 +172,7 @@ export function CommandPopover({
 		}
 	}, [visible, handleKeyDown]);
 
-	if (!visible || filtered.length === 0) return null;
+	if (!visible || visibleCommands.length === 0) return null;
 
 	return (
 		<Paper
@@ -175,7 +191,7 @@ export function CommandPopover({
 			}}
 			ref={listRef}
 		>
-			{filtered.map((cmd, i) => (
+			{visibleCommands.map((cmd, i) => (
 				<UnstyledButton
 					key={`${cmd.type}-${cmd.name}`}
 					data-command-item
@@ -209,7 +225,7 @@ export function CommandPopover({
 						</Text>
 						{(cmd.description || cmd.prompt) && (
 							<Text size="xs" c="dimmed" truncate="end" style={{ flex: 1 }}>
-								{cmd.description || cmd.prompt}
+								{capCommandPopoverText(cmd.description || cmd.prompt)}
 							</Text>
 						)}
 						{cmd.type === "command" && cmd.runBashFirst && cmd.bashCommand && (
@@ -221,6 +237,12 @@ export function CommandPopover({
 					</Group>
 				</UnstyledButton>
 			))}
+			{hiddenCommandCount > 0 && (
+				<Text size="xs" c="dimmed" ta="center" py={6}>
+					Showing first {visibleCommands.length} items; keep typing to narrow {hiddenCommandCount}{" "}
+					more.
+				</Text>
+			)}
 		</Paper>
 	);
 }

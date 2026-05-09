@@ -1,6 +1,89 @@
 import { ApiError, BASE, getToken } from "./client";
 import type { StorageCategoryResult, StorageScanResult } from "./types";
 
+const MAX_SSE_BUFFER_CHARS = 64_000;
+
+function createSseResidualError(): Error {
+	return new Error(`SSE stream line exceeded ${MAX_SSE_BUFFER_CHARS} characters before a newline`);
+}
+
+async function cancelSseReader(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+	try {
+		await reader.cancel();
+	} catch {
+		// Ignore cancellation failures; the original error is more important.
+	}
+}
+
+function drainCompleteSseLines(buffer: string, onLine: (line: string) => void): string {
+	let newlineIndex = buffer.indexOf("\n");
+	while (newlineIndex !== -1) {
+		let line = buffer.slice(0, newlineIndex);
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		onLine(line);
+		buffer = buffer.slice(newlineIndex + 1);
+		newlineIndex = buffer.indexOf("\n");
+	}
+	return buffer;
+}
+
+interface ParsedSseEvent {
+	eventName: string;
+	data: string;
+}
+
+function readSseFieldValue(line: string, prefixLength: number): string {
+	const value = line.slice(prefixLength);
+	return value.startsWith(" ") ? value.slice(1) : value;
+}
+
+function createSseEventParser(defaultEventName: string) {
+	let eventName = defaultEventName;
+	let dataLines: string[] = [];
+
+	const reset = () => {
+		eventName = defaultEventName;
+		dataLines = [];
+	};
+
+	const dispatch = (): ParsedSseEvent | null => {
+		const hasExplicitEvent = eventName !== defaultEventName;
+		if (dataLines.length === 0 && !hasExplicitEvent) {
+			reset();
+			return null;
+		}
+
+		const event = { eventName, data: dataLines.join("\n") };
+		reset();
+		return event;
+	};
+
+	return {
+		handleLine(line: string): ParsedSseEvent | null {
+			if (line.trim() === "") return dispatch();
+			if (line.startsWith(":")) return null;
+			if (line.startsWith("event:")) {
+				eventName = readSseFieldValue(line, 6).trim();
+				return null;
+			}
+			if (line.startsWith("data:")) {
+				dataLines.push(readSseFieldValue(line, 5));
+			}
+			return null;
+		},
+		flushPending: dispatch,
+	};
+}
+
+async function enforceSseResidualLimit(
+	buffer: string,
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+	if (buffer.length <= MAX_SSE_BUFFER_CHARS) return;
+	await cancelSseReader(reader);
+	throw createSseResidualError();
+}
+
 	text: string,
 	model?: string,
 	signal?: AbortSignal,
@@ -23,27 +106,58 @@ import type { StorageCategoryResult, StorageScanResult } from "./types";
 	const reader = res.body.getReader();
 	const decoder = new TextDecoder();
 	let buf = "";
-	let currentEvent = "chunk";
+	const parser = createSseEventParser("chunk");
+
+	const consumeEvent = (event: ParsedSseEvent, chunks: string[]): Error | "done" | null => {
+		if (event.eventName === "error") return new Error(event.data || "Unknown error");
+		if (event.eventName === "done") return "done";
+		chunks.push(event.data);
+		return null;
+	};
+
+	const flushLines = async (final = false): Promise<{ chunks: string[]; done: boolean }> => {
+		const chunks: string[] = [];
+		let terminal: Error | "done" | null = null;
+		buf = drainCompleteSseLines(buf, (line) => {
+			if (terminal) return;
+			const event = parser.handleLine(line);
+			if (event) terminal = consumeEvent(event, chunks);
+		});
+		if (!terminal && final) {
+			if (buf.length > 0) {
+				const finalLine = buf.endsWith("\r") ? buf.slice(0, -1) : buf;
+				const event = parser.handleLine(finalLine);
+				if (event) terminal = consumeEvent(event, chunks);
+				buf = "";
+			}
+			if (!terminal) {
+				const event = parser.flushPending();
+				if (event) terminal = consumeEvent(event, chunks);
+			}
+		}
+		if (terminal instanceof Error) {
+			await cancelSseReader(reader);
+			throw terminal;
+		}
+		return { chunks, done: terminal === "done" };
+	};
 
 	while (true) {
 		const { done, value } = await reader.read();
 		if (done) break;
 		buf += decoder.decode(value, { stream: true });
-
-		const lines = buf.split("\n");
-		buf = lines.pop() ?? "";
-
-		for (const line of lines) {
-			if (line.startsWith("event:")) {
-				currentEvent = line.slice(6).trim();
-			} else if (line.startsWith("data:")) {
-				const data = line.slice(5).trimStart();
-				if (currentEvent === "error") throw new Error(data || "Unknown error");
-				if (currentEvent === "done") return;
-				yield data;
-			}
+		const parsed = await flushLines();
+		for (const chunk of parsed.chunks) yield chunk;
+		if (parsed.done) {
+			await cancelSseReader(reader);
+			return;
 		}
+		await enforceSseResidualLimit(buf, reader);
 	}
+
+	buf += decoder.decode();
+	const parsed = await flushLines(true);
+	for (const chunk of parsed.chunks) yield chunk;
 }
 
 /**
@@ -51,76 +165,86 @@ import type { StorageCategoryResult, StorageScanResult } from "./types";
  * Calls onProgress for status updates, onCategory for each scanned category,
  * and resolves with the complete result.
  */
-export function scanStorageStream(callbacks: {
+export async function scanStorageStream(callbacks: {
 	onProgress?: (message: string) => void;
 	onCategory?: (data: StorageCategoryResult) => void;
 	signal?: AbortSignal;
 }): Promise<StorageScanResult> {
-	return new Promise((resolve, reject) => {
-		const headers: Record<string, string> = {};
-		const token = getToken();
-		if (token) headers.Authorization = `Bearer ${token}`;
+	const headers: Record<string, string> = {};
+	const token = getToken();
+	if (token) headers.Authorization = `Bearer ${token}`;
 
-		fetch(`${BASE}/storage/scan`, { headers, signal: callbacks.signal })
-			.then((response) => {
-				if (!response.ok) {
-					reject(new ApiError("Scan failed", response.status));
-					return;
-				}
-				const reader = response.body?.getReader();
-				if (!reader) {
-					reject(new ApiError("No response body", 500));
-					return;
-				}
+	const response = await fetch(`${BASE}/storage/scan`, { headers, signal: callbacks.signal });
+	if (!response.ok) {
+		throw new ApiError("Scan failed", response.status);
+	}
+	const reader = response.body?.getReader();
+	if (!reader) {
+		throw new ApiError("No response body", 500);
+	}
 
-				const decoder = new TextDecoder();
-				let buffer = "";
+	const decoder = new TextDecoder();
+	let buffer = "";
+	const parser = createSseEventParser("");
+	let result: StorageScanResult | null = null;
+	let terminalError: Error | null = null;
 
-				const pump = (): void => {
-					reader
-						.read()
-						.then(({ done, value }) => {
-							if (done) return;
-							buffer += decoder.decode(value, { stream: true });
-							const lines = buffer.split("\n");
-							buffer = lines.pop() ?? "";
+	const handleEvent = ({ eventName, data }: ParsedSseEvent) => {
+		const jsonStr = data.trim();
+		if (!jsonStr) return;
+		try {
+			const parsed = JSON.parse(jsonStr);
+			if (eventName === "progress") {
+				callbacks.onProgress?.(parsed.message);
+			} else if (eventName === "category") {
+				callbacks.onCategory?.(parsed);
+			} else if (eventName === "complete") {
+				result = parsed as StorageScanResult;
+			} else if (eventName === "error") {
+				terminalError = new ApiError(parsed.error ?? "Scan failed", 500);
+			}
+		} catch {
+			// Skip malformed JSON, matching the previous tolerant behavior.
+		}
+	};
 
-							let eventType = "";
-							for (const line of lines) {
-								if (line.startsWith("event:")) {
-									eventType = line.slice(6).trim();
-								} else if (line.startsWith("data:")) {
-									const jsonStr = line.slice(5).trim();
-									if (!jsonStr) continue;
-									try {
-										const parsed = JSON.parse(jsonStr);
-										if (eventType === "progress") {
-											callbacks.onProgress?.(parsed.message);
-										} else if (eventType === "category") {
-											callbacks.onCategory?.(parsed);
-										} else if (eventType === "complete") {
-											reader.cancel().catch(() => {});
-											resolve(parsed as StorageScanResult);
-											return;
-										} else if (eventType === "error") {
-											reader.cancel().catch(() => {});
-											reject(new ApiError(parsed.error ?? "Scan failed", 500));
-											return;
-										}
-									} catch {
-										// skip malformed JSON
-									}
-								} else if (line.trim() === "") {
-									// Empty line marks end of SSE event — reset for next event
-									eventType = "";
-								}
-							}
-							pump();
-						})
-						.catch(reject);
-				};
-				pump();
-			})
-			.catch(reject);
-	});
+	const flushLines = (final = false) => {
+		buffer = drainCompleteSseLines(buffer, (line) => {
+			const event = parser.handleLine(line);
+			if (event) handleEvent(event);
+		});
+		if (!final) return;
+		if (buffer.length > 0) {
+			const finalLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+			const event = parser.handleLine(finalLine);
+			if (event) handleEvent(event);
+			buffer = "";
+		}
+		const event = parser.flushPending();
+		if (event) handleEvent(event);
+	};
+
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			flushLines();
+			if (terminalError) throw terminalError;
+			if (result) {
+				await cancelSseReader(reader);
+				return result;
+			}
+			await enforceSseResidualLimit(buffer, reader);
+		}
+
+		buffer += decoder.decode();
+		flushLines(true);
+		if (terminalError) throw terminalError;
+		if (result) return result;
+		throw new ApiError("Scan stream ended before completion", 500);
+	} catch (err) {
+		await cancelSseReader(reader);
+		throw err;
+	}
 }

@@ -24,6 +24,8 @@ export const Route = createFileRoute("/settings/usage")({
 	component: SettingsUsagePage,
 });
 
+const USAGE_HISTORY_QUERY_GC_TIME_MS = 60_000;
+
 function SettingsUsagePage() {
 	const { t } = useTranslation("common");
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
@@ -41,16 +43,19 @@ function SettingsUsagePage() {
 	} = useQuery({
 		queryKey: ["usage-history", "list", filters, page, pageSize],
 		queryFn: () => usageHistoryApi.list({ ...filters, page, pageSize }),
+		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
 	const { data: stats, refetch: refetchStats } = useQuery({
 		queryKey: ["usage-history", "stats", filters],
 		queryFn: () => usageHistoryApi.getStats(filters),
+		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
 	const { data: providersData } = useQuery({
 		queryKey: ["usage-history", "providers"],
 		queryFn: () => usageHistoryApi.listProviders(),
+		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
 	const kindOptions = [

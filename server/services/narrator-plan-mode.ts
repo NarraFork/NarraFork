@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { narratorTraitsLock } from "../lib/async-mutex";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
 import { generateWordSlug } from "../lib/words";
 
@@ -30,81 +31,85 @@ export async function ensureNarratorPlanFileId(
 }
 
 export async function enterNarratorPlanMode(narratorId: string): Promise<PlanModeStateResult> {
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			permissionMode: true,
-			previousPermissionMode: true,
-			planFileId: true,
-			planMode: true,
-			traits: true,
-		},
-	});
-	const currentTraits = parseTraits(current?.traits);
-	const wasPlanMode = currentTraits.includes("plan");
-	const previousPermissionMode =
-		current?.previousPermissionMode ?? current?.permissionMode ?? "default";
-	const planFileId = current?.planFileId ?? generatePlanFileId();
-	const nextTraits = wasPlanMode ? currentTraits : addTrait(currentTraits, "plan");
-	const changed = !wasPlanMode || current?.planMode !== true || !current?.planFileId;
-
-	if (changed) {
-		await db
-			.update(narrators)
-			.set({
-				traits: nextTraits,
+	return narratorTraitsLock.acquire(narratorId, async () => {
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				permissionMode: true,
+				previousPermissionMode: true,
+				planFileId: true,
 				planMode: true,
-				previousPermissionMode,
-				planFileId,
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, narratorId));
-	}
+				traits: true,
+			},
+		});
+		const currentTraits = parseTraits(current?.traits);
+		const wasPlanMode = currentTraits.includes("plan");
+		const previousPermissionMode =
+			current?.previousPermissionMode ?? current?.permissionMode ?? "default";
+		const planFileId = current?.planFileId ?? generatePlanFileId();
+		const nextTraits = wasPlanMode ? currentTraits : addTrait(currentTraits, "plan");
+		const changed = !wasPlanMode || current?.planMode !== true || !current?.planFileId;
 
-	return {
-		traits: nextTraits,
-		planFileId,
-		previousPermissionMode,
-		wasPlanMode,
-		changed,
-	};
+		if (changed) {
+			await db
+				.update(narrators)
+				.set({
+					traits: nextTraits,
+					planMode: true,
+					previousPermissionMode,
+					planFileId,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		}
+
+		return {
+			traits: nextTraits,
+			planFileId,
+			previousPermissionMode,
+			wasPlanMode,
+			changed,
+		};
+	});
 }
 
 export async function exitNarratorPlanMode(narratorId: string): Promise<PlanModeStateResult> {
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			previousPermissionMode: true,
-			planFileId: true,
-			planMode: true,
-			traits: true,
-		},
+	return narratorTraitsLock.acquire(narratorId, async () => {
+		const current = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				previousPermissionMode: true,
+				planFileId: true,
+				planMode: true,
+				traits: true,
+			},
+		});
+		const currentTraits = parseTraits(current?.traits);
+		const wasPlanMode = currentTraits.includes("plan");
+		const nextTraits = wasPlanMode ? removeTrait(currentTraits, "plan") : currentTraits;
+		const changed =
+			wasPlanMode ||
+			current?.planMode !== false ||
+			!!current?.previousPermissionMode ||
+			!!current?.planFileId;
+
+		if (changed) {
+			await db
+				.update(narrators)
+				.set({
+					traits: nextTraits,
+					planMode: false,
+					previousPermissionMode: null,
+					planFileId: null,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId));
+		}
+
+		return {
+			traits: nextTraits,
+			wasPlanMode,
+			changed,
+		};
 	});
-	const currentTraits = parseTraits(current?.traits);
-	const wasPlanMode = currentTraits.includes("plan");
-	const nextTraits = wasPlanMode ? removeTrait(currentTraits, "plan") : currentTraits;
-	const changed =
-		wasPlanMode ||
-		current?.planMode !== false ||
-		!!current?.previousPermissionMode ||
-		!!current?.planFileId;
-
-	if (changed) {
-		await db
-			.update(narrators)
-			.set({
-				traits: nextTraits,
-				planMode: false,
-				previousPermissionMode: null,
-				planFileId: null,
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, narratorId));
-	}
-
-	return {
-		traits: nextTraits,
-		wasPlanMode,
-		changed,
-	};
 }

@@ -423,6 +423,7 @@ export interface PublicCodexQuotaOverview {
 	totalAccountEquivalents: number;
 	segments: PublicCodexQuotaSegment[];
 	forecast: {
+		generatedAt: string;
 		points: PublicCodexQuotaForecastPoint[];
 		types: PublicCodexPlanTier[];
 	};

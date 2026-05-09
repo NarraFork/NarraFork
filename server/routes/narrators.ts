@@ -38,6 +38,8 @@ import {
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
+import { narratorTraitsLock } from "../lib/async-mutex";
+import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
 import { screenshot as browserScreenshot } from "../lib/browser/actions";
 import {
 	closeSession as closeBrowserSession,
@@ -66,11 +68,15 @@ import {
 } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
+	hasDraftTrait,
 	hasTrait,
 	isSubagentVariant,
+	parseDraftTrait,
 	parseSubstatus,
 	parseTraits,
+	redactDraftTraits,
 	removeTrait,
+	upsertDraftTrait,
 } from "../lib/narrator-utils";
 import { isPermissionMode, PERMISSION_MODES } from "../lib/permission-modes";
 import { pathsEqual, resolvePath } from "../lib/platform-path";
@@ -99,6 +105,7 @@ import {
 	updateBlacklistDirSchema,
 	updateBufferedMessageSchema,
 	updateNarratorCwdSchema,
+	updateNarratorDraftSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
@@ -171,6 +178,7 @@ import { activeNarrators, planModeAskedOnce } from "../services/narrator-session
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
 import { usageHistoryService } from "../services/usage-history-service";
+import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
 	broadcastToNarrator,
 	getNarratorIdsWithPresence,
@@ -223,6 +231,26 @@ export async function parseMessageRequest(
 }
 
 export const narratorRoutes = new Hono();
+
+function parseBooleanOverride(value: unknown, field: string): BooleanOverride {
+	if (typeof value === "string" && BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)) {
+		return value as BooleanOverride;
+	}
+	throw new ValidationError(`${field} must be one of: ${BOOLEAN_OVERRIDE_VALUES.join(", ")}`);
+}
+
+function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown }>(narrator: T) {
+	return {
+		...narrator,
+		traits: redactDraftTraits(narrator.traits),
+		hasDraft: hasDraftTrait(narrator.traits),
+		substatus: parseSubstatus(narrator.substatus),
+	};
+}
+
+function publicTraitsResponse(traits: unknown): string[] {
+	return redactDraftTraits(traits);
+}
 
 // List narrators — by chapterId, or standalone (chapterId IS NULL)
 narratorRoutes.get("/", async (c) => {
@@ -423,8 +451,7 @@ narratorRoutes.get("/", async (c) => {
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
 
 		const items = rawItems.map((n) => ({
-			...n,
-			substatus: parseSubstatus(n.substatus),
+			...publicNarratorResponse(n),
 			chapter: n.chapterId ? (chapterMap.get(n.chapterId) ?? null) : null,
 			activeTerminalCount: terminalCounts.get(n.id) ?? 0,
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
@@ -437,7 +464,7 @@ narratorRoutes.get("/", async (c) => {
 
 	if (!chapterId) throw new ValidationError("chapterId or standalone=true is required");
 	const list = await narratorService.listByChapter(chapterId);
-	return c.json(list.map((n) => ({ ...n, substatus: parseSubstatus(n.substatus) })));
+	return c.json(list.map(publicNarratorResponse));
 });
 
 // Create narrator
@@ -446,13 +473,64 @@ narratorRoutes.post("/", async (c) => {
 	const parsed = createNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const narrator = await narratorService.create(parsed.data);
-	return c.json({ ...narrator, substatus: parseSubstatus(narrator.substatus) }, 201);
+	return c.json(publicNarratorResponse(narrator), 201);
 });
 
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
 	const narrator = await narratorService.getById(c.req.param("id"));
-	return c.json({ ...narrator, substatus: parseSubstatus(narrator.substatus) });
+	return c.json(publicNarratorResponse(narrator));
+});
+
+function draftResponse(traits: unknown) {
+	const draft = parseDraftTrait(traits);
+	return {
+		hasDraft: !!draft,
+		text: draft?.text ?? "",
+		updatedAt: draft?.updatedAt ?? null,
+		updatedBy: draft?.updatedBy ?? null,
+		sourceId: draft?.sourceId ?? null,
+	};
+}
+
+narratorRoutes.get("/:id/draft", async (c) => {
+	const narrator = await narratorService.getById(c.req.param("id"));
+	return c.json(draftResponse(narrator.traits));
+});
+
+narratorRoutes.put("/:id/draft", async (c) => {
+	const id = c.req.param("id");
+	const userId = c.get("user").sub;
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = updateNarratorDraftSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const update = await narratorTraitsLock.acquire(id, async () => {
+		const narrator = await narratorService.getById(id);
+		const previousDraft = parseDraftTrait(narrator.traits);
+		const now = new Date().toISOString();
+		const draft = parsed.data.text.trim()
+			? {
+					text: parsed.data.text,
+					updatedAt: now,
+					updatedBy: userId,
+					sourceId: parsed.data.sourceId ?? null,
+				}
+			: null;
+		const traits = upsertDraftTrait(narrator.traits, draft);
+		await db.update(narrators).set({ traits, updatedAt: now }).where(eq(narrators.id, id));
+		return { draft, previousDraft, response: draftResponse(traits), traits };
+	});
+
+	broadcastToNarrator(id, {
+		type: "draft_changed",
+		narratorId: id,
+		...update.response,
+	});
+	await syncNarratorDraftToRecentTabs(id, {
+		promote: !update.previousDraft && !!update.draft,
+	});
+	return c.json({ ok: true, traits: publicTraitsResponse(update.traits), ...update.response });
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.
@@ -481,18 +559,24 @@ function customTraitsResponse(traits: unknown) {
 	};
 }
 
-async function updateNarratorTraits(id: string, traits: string[]) {
-	await db
-		.update(narrators)
-		.set({ traits, updatedAt: new Date().toISOString() })
-		.where(eq(narrators.id, id));
+async function updateNarratorTraits(id: string, update: (traits: string[]) => string[]) {
+	const traits = await narratorTraitsLock.acquire(id, async () => {
+		const narrator = await narratorService.getById(id);
+		const nextTraits = update(parseTraits(narrator.traits));
+		await db
+			.update(narrators)
+			.set({ traits: nextTraits, updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, id));
+		return nextTraits;
+	});
 	updateActiveDisabledTools(id, getDisabledToolSet(traits));
 	broadcastToNarrator(id, {
 		type: "custom_traits_changed",
 		narratorId: id,
-		traits,
+		traits: publicTraitsResponse(traits),
 		customTraits: customTraitsResponse(traits),
 	});
+	return traits;
 }
 
 narratorRoutes.get("/:id/custom-traits", async (c) => {
@@ -503,41 +587,56 @@ narratorRoutes.get("/:id/custom-traits", async (c) => {
 
 narratorRoutes.put("/:id/custom-traits/subagent-model-restriction", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
 	const body = await c.req.json().catch(() => ({}));
 	const restriction = normalizeSubagentModelRestriction(body);
-	const traits =
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
 		Object.keys(restriction.pools).length === 0
-			? removeEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX)
-			: upsertEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction);
-	await updateNarratorTraits(id, traits);
-	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+			? removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX)
+			: upsertEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, restriction),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
 });
 
 narratorRoutes.delete("/:id/custom-traits/subagent-model-restriction", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	const traits = removeEncodedTrait(narrator.traits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX);
-	await updateNarratorTraits(id, traits);
-	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
+		removeEncodedTrait(currentTraits, SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
 });
 
 narratorRoutes.put("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
 	const body = await c.req.json().catch(() => ({}));
 	const disabledTools = normalizeDisabledTools(body);
-	const traits = upsertEncodedTrait(narrator.traits, DISABLED_TOOLS_TRAIT_PREFIX, disabledTools);
-	await updateNarratorTraits(id, traits);
-	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
+		upsertEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX, disabledTools),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
 });
 
 narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id);
-	const traits = removeEncodedTrait(narrator.traits, DISABLED_TOOLS_TRAIT_PREFIX);
-	await updateNarratorTraits(id, traits);
-	return c.json({ ok: true, traits, customTraits: customTraitsResponse(traits) });
+	const traits = await updateNarratorTraits(id, (currentTraits) =>
+		removeEncodedTrait(currentTraits, DISABLED_TOOLS_TRAIT_PREFIX),
+	);
+	return c.json({
+		ok: true,
+		traits: publicTraitsResponse(traits),
+		customTraits: customTraitsResponse(traits),
+	});
 });
 
 function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {
@@ -1439,7 +1538,7 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		active._previousPermissionMode = planState.previousPermissionMode;
 	}
 	if (planState.wasPlanMode) {
-		return c.json({ ok: true, planMode: true, traits: planState.traits });
+		return c.json({ ok: true, planMode: true, traits: publicTraitsResponse(planState.traits) });
 	}
 
 	const userId = c.get("user").sub;
@@ -1479,9 +1578,9 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		type: "plan_mode_changed",
 		narratorId: id,
 		planMode: true,
-		traits: planState.traits,
+		traits: publicTraitsResponse(planState.traits),
 	});
-	return c.json({ ok: true, planMode: true, traits: planState.traits });
+	return c.json({ ok: true, planMode: true, traits: publicTraitsResponse(planState.traits) });
 });
 
 // Cancel plan mode trait without changing the narrator's permission policy.
@@ -1501,7 +1600,7 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 	planModeAskedOnce.delete(id);
 
 	if (!planState.wasPlanMode && cancelledPermissions === 0) {
-		return c.json({ ok: true, planMode: false, traits: planState.traits });
+		return c.json({ ok: true, planMode: false, traits: publicTraitsResponse(planState.traits) });
 	}
 
 	const msg = await narratorService.persistSystemMessage(id, message, undefined, userId);
@@ -1514,12 +1613,12 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 		type: "plan_mode_changed",
 		narratorId: id,
 		planMode: false,
-		traits: planState.traits,
+		traits: publicTraitsResponse(planState.traits),
 	});
 	return c.json({
 		ok: true,
 		planMode: false,
-		traits: planState.traits,
+		traits: publicTraitsResponse(planState.traits),
 		cancelledPermissions,
 	});
 });
@@ -1564,6 +1663,39 @@ narratorRoutes.patch("/:id/relaxed-plan", async (c) => {
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateRelaxedPlan(id, relaxedPlan);
 	broadcastToNarrator(id, { type: "relaxed_plan_changed", narratorId: id, relaxedPlan });
+	return c.json({ ok: true });
+});
+
+// Update per-session reflection overrides
+narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
+	const id = c.req.param("id");
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("Request body must be an object");
+	}
+	const input = body as Record<string, unknown>;
+	const updates: {
+		planReflectionAutoApproveOverride?: BooleanOverride;
+		dangerReflectionOverride?: BooleanOverride;
+	} = {};
+	if (Object.hasOwn(input, "planReflectionAutoApproveOverride")) {
+		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
+			input.planReflectionAutoApproveOverride,
+			"planReflectionAutoApproveOverride",
+		);
+	}
+	if (Object.hasOwn(input, "dangerReflectionOverride")) {
+		updates.dangerReflectionOverride = parseBooleanOverride(
+			input.dangerReflectionOverride,
+			"dangerReflectionOverride",
+		);
+	}
+	if (!updates.planReflectionAutoApproveOverride && !updates.dangerReflectionOverride) {
+		throw new ValidationError("At least one reflection override must be provided");
+	}
+	await narratorService.getById(id);
+	await narratorService.updateReflectionOverrides(id, updates);
+	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
 	return c.json({ ok: true });
 });
 
@@ -1703,7 +1835,7 @@ narratorRoutes.post("/:id/fork-messages", async (c) => {
 	const newNarrator = await narratorService.forkFromMessages(id, parsed.messageIds, {
 		title: parsed.title,
 	});
-	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
+	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
 // Fork standalone narrator (chapter-bound narrators must fork via chapter fork)
@@ -1716,7 +1848,7 @@ narratorRoutes.post("/:id/fork", async (c) => {
 		title: parsed.data.title,
 		inheritMode: parsed.data.inheritMode ?? "full",
 	});
-	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
+	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
 // === Ask in passing ===
@@ -1914,7 +2046,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		message: updatedMsg,
 	});
 
-	return c.json({ ...newNarrator, substatus: parseSubstatus(newNarrator.substatus) }, 201);
+	return c.json(publicNarratorResponse(newNarrator), 201);
 });
 
 // Cancel: delete a pending message
@@ -1978,16 +2110,19 @@ narratorRoutes.post("/:id/promote", async (c) => {
 
 	if (!narrator.chapterId) {
 		// Standalone narrator: just unlock
-		const unlockedTraits = removeTrait(narratorTraits, "ask-in-passing");
-		await db
-			.update(narrators)
-			.set({
-				isAskInPassing: false,
-				traits: unlockedTraits,
-				permissionMode: "default",
-				updatedAt: new Date().toISOString(),
-			})
-			.where(eq(narrators.id, id));
+		await narratorTraitsLock.acquire(id, async () => {
+			const current = await narratorService.getById(id);
+			const unlockedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
+			await db
+				.update(narrators)
+				.set({
+					isAskInPassing: false,
+					traits: unlockedTraits,
+					permissionMode: "default",
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, id));
+		});
 
 		await updateNarratorPermissionMode(id, "default");
 
@@ -1998,7 +2133,7 @@ narratorRoutes.post("/:id/promote", async (c) => {
 			permissionMode: "default",
 		});
 
-		return c.json({ type: "unlocked", narrator: updated });
+		return c.json({ type: "unlocked", narrator: publicNarratorResponse(updated) });
 	}
 
 	// Chapter-bound narrator: fork a new chapter
@@ -2009,15 +2144,18 @@ narratorRoutes.post("/:id/promote", async (c) => {
 	// Mark the original ask-in-passing narrator as promoted so the UI
 	// no longer shows it as locked.  We keep permissionMode as readOnly
 	// since the original narrator stays as a read-only question record.
-	const promotedTraits = removeTrait(narratorTraits, "ask-in-passing");
-	await db
-		.update(narrators)
-		.set({
-			isAskInPassing: false,
-			traits: promotedTraits,
-			updatedAt: new Date().toISOString(),
-		})
-		.where(eq(narrators.id, id));
+	await narratorTraitsLock.acquire(id, async () => {
+		const current = await narratorService.getById(id);
+		const promotedTraits = removeTrait(parseTraits(current.traits), "ask-in-passing");
+		await db
+			.update(narrators)
+			.set({
+				isAskInPassing: false,
+				traits: promotedTraits,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(narrators.id, id));
+	});
 
 	return c.json({ type: "forked", chapter });
 });

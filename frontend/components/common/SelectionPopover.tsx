@@ -2,6 +2,7 @@ import { ActionIcon, Group, Portal, Tooltip } from "@mantine/core";
 import { IconCopy, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { collectSelectionTextPreview } from "../../lib/dom-text";
 
 interface SelectionPopoverProps {
 	containerRef: React.RefObject<HTMLElement | null>;
@@ -11,6 +12,14 @@ interface SelectionPopoverProps {
 	externalSelection?: string;
 	/** Anchor position for external selection (e.g. touch point). When provided, popover appears near this point. */
 	externalAnchor?: { x: number; y: number } | null;
+}
+
+const MAX_SELECTION_POPOVER_TEXT_CHARS = 200_000;
+
+function clampSelectionPopoverText(text: string): string {
+	return text.length > MAX_SELECTION_POPOVER_TEXT_CHARS
+		? text.slice(0, MAX_SELECTION_POPOVER_TEXT_CHARS)
+		: text;
 }
 
 export function SelectionPopover({
@@ -27,20 +36,25 @@ export function SelectionPopover({
 	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const { t } = useTranslation("common");
 
+	const clearSelection = useCallback(() => {
+		selectedTextRef.current = "";
+		setPosition(null);
+	}, []);
+
 	const handleMouseUp = useCallback(() => {
 		// Small delay to let selection finalize
 		setTimeout(() => {
 			const selection = window.getSelection();
-			const text = selection?.toString().trim();
+			const text = collectSelectionTextPreview(selection, MAX_SELECTION_POPOVER_TEXT_CHARS);
 			if (!text || !containerRef.current) {
-				setPosition(null);
+				clearSelection();
 				return;
 			}
 
 			// Check if selection is within our container
 			const range = selection?.getRangeAt(0);
 			if (!range || !containerRef.current.contains(range.commonAncestorContainer)) {
-				setPosition(null);
+				clearSelection();
 				return;
 			}
 
@@ -51,13 +65,16 @@ export function SelectionPopover({
 				left: Math.min(window.innerWidth - 36, Math.max(4, rect.left + rect.width / 2 - 16)),
 			});
 		}, 10);
-	}, [containerRef]);
+	}, [clearSelection, containerRef]);
 
-	const handleMouseDown = useCallback((e: MouseEvent) => {
-		// Don't dismiss if clicking the popover itself
-		if (popoverRef.current?.contains(e.target as Node)) return;
-		setPosition(null);
-	}, []);
+	const handleMouseDown = useCallback(
+		(e: MouseEvent) => {
+			// Don't dismiss if clicking the popover itself
+			if (popoverRef.current?.contains(e.target as Node)) return;
+			clearSelection();
+		},
+		[clearSelection],
+	);
 
 	useEffect(() => {
 		const container = containerRef.current;
@@ -75,7 +92,7 @@ export function SelectionPopover({
 	// Handle external selection (e.g. from xterm canvas)
 	useEffect(() => {
 		if (externalSelection) {
-			selectedTextRef.current = externalSelection;
+			selectedTextRef.current = clampSelectionPopoverText(externalSelection);
 			if (externalAnchor) {
 				// Position popover above the touch point
 				setPosition({
@@ -94,33 +111,35 @@ export function SelectionPopover({
 			}
 			setCopied(false);
 		} else if (externalSelection === "") {
-			setPosition(null);
+			clearSelection();
 		}
-	}, [externalSelection, externalAnchor, containerRef]);
+	}, [externalSelection, externalAnchor, containerRef, clearSelection]);
 
 	const handleClick = useCallback(() => {
 		if (selectedTextRef.current) {
 			onAction(selectedTextRef.current);
-			setPosition(null);
+			clearSelection();
 			window.getSelection()?.removeAllRanges();
 		}
-	}, [onAction]);
+	}, [clearSelection, onAction]);
 
 	const handleCopy = useCallback(() => {
 		if (selectedTextRef.current) {
 			navigator.clipboard.writeText(selectedTextRef.current);
+			selectedTextRef.current = "";
 			setCopied(true);
 			copyTimerRef.current = setTimeout(() => {
-				setPosition(null);
+				clearSelection();
 				setCopied(false);
 			}, 600);
 		}
-	}, []);
+	}, [clearSelection]);
 
 	// Cleanup copy timer on unmount
 	useEffect(() => {
 		return () => {
 			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+			selectedTextRef.current = "";
 		};
 	}, []);
 

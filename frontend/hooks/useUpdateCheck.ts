@@ -2,6 +2,89 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken } from "../lib/api";
 
+const MAX_SSE_BUFFER_CHARS = 64_000;
+
+function createSseResidualError(): Error {
+	return new Error(`SSE stream line exceeded ${MAX_SSE_BUFFER_CHARS} characters before a newline`);
+}
+
+async function cancelSseReader(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<void> {
+	try {
+		await reader.cancel();
+	} catch {
+		// Ignore cancellation failures; the original error is more important.
+	}
+}
+
+function drainCompleteSseLines(buffer: string, onLine: (line: string) => void): string {
+	let newlineIndex = buffer.indexOf("\n");
+	while (newlineIndex !== -1) {
+		let line = buffer.slice(0, newlineIndex);
+		if (line.endsWith("\r")) line = line.slice(0, -1);
+		onLine(line);
+		buffer = buffer.slice(newlineIndex + 1);
+		newlineIndex = buffer.indexOf("\n");
+	}
+	return buffer;
+}
+
+interface ParsedSseEvent {
+	eventName: string;
+	data: string;
+}
+
+function readSseFieldValue(line: string, prefixLength: number): string {
+	const value = line.slice(prefixLength);
+	return value.startsWith(" ") ? value.slice(1) : value;
+}
+
+function createSseEventParser(defaultEventName: string) {
+	let eventName = defaultEventName;
+	let dataLines: string[] = [];
+
+	const reset = () => {
+		eventName = defaultEventName;
+		dataLines = [];
+	};
+
+	const dispatch = (): ParsedSseEvent | null => {
+		const hasExplicitEvent = eventName !== defaultEventName;
+		if (dataLines.length === 0 && !hasExplicitEvent) {
+			reset();
+			return null;
+		}
+
+		const event = { eventName, data: dataLines.join("\n") };
+		reset();
+		return event;
+	};
+
+	return {
+		handleLine(line: string): ParsedSseEvent | null {
+			if (line.trim() === "") return dispatch();
+			if (line.startsWith(":")) return null;
+			if (line.startsWith("event:")) {
+				eventName = readSseFieldValue(line, 6).trim();
+				return null;
+			}
+			if (line.startsWith("data:")) {
+				dataLines.push(readSseFieldValue(line, 5));
+			}
+			return null;
+		},
+		flushPending: dispatch,
+	};
+}
+
+async function enforceSseResidualLimit(
+	buffer: string,
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+	if (buffer.length <= MAX_SSE_BUFFER_CHARS) return;
+	await cancelSseReader(reader);
+	throw createSseResidualError();
+}
+
 export interface UpdateProgress {
 	phase: "checking" | "downloading" | "applying" | "complete" | "error";
 	bytesDownloaded: number;
@@ -22,6 +105,24 @@ export interface UpdateDownloadResult {
 	updatePath?: string;
 	instructions?: UpdateInstructions;
 	error?: string;
+}
+
+function errorToMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function createErrorProgress(error: string): UpdateProgress {
+	return {
+		phase: "error",
+		bytesDownloaded: 0,
+		totalBytes: 0,
+		percent: 0,
+		error,
+	};
+}
+
+function createFailureResult(error: string): UpdateDownloadResult {
+	return { success: false, error };
 }
 
 export function useUpdateCheck(intervalMs = 60 * 60_000) {
@@ -102,50 +203,114 @@ export function useUpdateDownload() {
 
 				const decoder = new TextDecoder();
 				let buffer = "";
+				let receivedTerminalResult = false;
+				const parser = createSseEventParser("");
+
+				const markFailure = (error: string) => {
+					receivedTerminalResult = true;
+					setProgress(createErrorProgress(error));
+					setResult(createFailureResult(error));
+				};
+
+				const markSuccess = (downloadResult: UpdateDownloadResult) => {
+					receivedTerminalResult = true;
+					setResult(downloadResult);
+					setProgress((current) => {
+						if (current?.phase === "complete") return current;
+						return {
+							phase: "complete",
+							bytesDownloaded: current?.bytesDownloaded ?? 0,
+							totalBytes: current?.totalBytes ?? 0,
+							percent: 100,
+						};
+					});
+				};
+
+				const handleEvent = ({ eventName, data }: ParsedSseEvent) => {
+					if (receivedTerminalResult) return;
+					const jsonStr = data.trim();
+					if (!jsonStr) {
+						if (eventName === "error") {
+							markFailure("Update download stream emitted an empty error event");
+						}
+						return;
+					}
+
+					let parsed: unknown;
+					try {
+						parsed = JSON.parse(jsonStr);
+					} catch (err) {
+						const prefix =
+							eventName === "error" ? "Malformed SSE error event" : "Malformed SSE data";
+						throw new Error(`${prefix}: ${errorToMessage(err)}`);
+					}
+
+					if (!parsed || typeof parsed !== "object") {
+						throw new Error(`Malformed SSE data: expected object, got ${typeof parsed}`);
+					}
+
+					const payload = parsed as Partial<UpdateProgress & UpdateDownloadResult>;
+					if (payload.phase) {
+						setProgress(payload as UpdateProgress);
+					}
+
+					const payloadError =
+						typeof payload.error === "string" && payload.error
+							? payload.error
+							: "Update download failed";
+					if (eventName === "error" || payload.phase === "error") {
+						markFailure(payloadError);
+						return;
+					}
+
+					if (typeof payload.success === "boolean") {
+						const downloadResult = payload as UpdateDownloadResult;
+						if (downloadResult.success) {
+							markSuccess(downloadResult);
+						} else {
+							markFailure(payloadError);
+						}
+					}
+				};
+
+				const flushLines = (final = false) => {
+					buffer = drainCompleteSseLines(buffer, (line) => {
+						const event = parser.handleLine(line);
+						if (event) handleEvent(event);
+					});
+					if (!final) return;
+					if (buffer.length > 0) {
+						const finalLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+						const event = parser.handleLine(finalLine);
+						if (event) handleEvent(event);
+						buffer = "";
+					}
+					const event = parser.flushPending();
+					if (event) handleEvent(event);
+				};
 
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
 
 					buffer += decoder.decode(value, { stream: true });
-					const lines = buffer.split("\n");
-					buffer = lines.pop() ?? "";
+					flushLines();
+					await enforceSseResidualLimit(buffer, reader);
+				}
 
-					for (const line of lines) {
-						if (line.startsWith("event:")) {
-							const _event = line.slice(6).trim();
-							// Handle event type
-						} else if (line.startsWith("data:")) {
-							const data = line.slice(5).trim();
-							if (!data) continue;
-
-							try {
-								const parsed = JSON.parse(data);
-								if (parsed.phase) {
-									setProgress(parsed as UpdateProgress);
-								}
-								if (parsed.success !== undefined) {
-									setResult(parsed as UpdateDownloadResult);
-								}
-							} catch {
-								// Ignore parse errors
-							}
-						}
-					}
+				buffer += decoder.decode();
+				flushLines(true);
+				if (!receivedTerminalResult) {
+					markFailure("Update download stream ended without a terminal result");
 				}
 			} catch (err) {
 				if ((err as Error).name === "AbortError") {
 					setProgress(null);
 					return;
 				}
-				setProgress({
-					phase: "error",
-					bytesDownloaded: 0,
-					totalBytes: 0,
-					percent: 0,
-					error: String(err),
-				});
-				setResult({ success: false, error: String(err) });
+				const error = errorToMessage(err);
+				setProgress(createErrorProgress(error));
+				setResult(createFailureResult(error));
 			} finally {
 				abortControllerRef.current = null;
 			}

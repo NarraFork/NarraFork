@@ -55,3 +55,9 @@ export const worktreeLock = new AsyncMutex();
 
 /** Per-chapter mutex — guards container lifecycle operations (start, stop, pause, remove). */
 export const containerLock = new AsyncMutex();
+
+/** Per-narrator mutex — guards read-modify-write updates to narrator traits. */
+export const narratorTraitsLock = new AsyncMutex();
+
+/** Per-narrator mutex — guards read-modify-write updates to narrator substatus. */
+export const narratorSubstatusLock = new AsyncMutex();

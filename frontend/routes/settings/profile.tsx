@@ -1,4 +1,5 @@
 import { Loader, Stack, Title } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -18,6 +19,8 @@ const AvatarCropModal = lazy(() =>
 export const Route = createFileRoute("/settings/profile")({
 	component: SettingsProfilePage,
 });
+
+const MAX_AVATAR_SOURCE_FILE_BYTES = 20 * 1024 * 1024;
 
 function SettingsProfilePage() {
 	const { t } = useTranslation("settings");
@@ -58,6 +61,10 @@ function SettingsProfilePage() {
 
 	const handleAvatarFileSelected = (file: File | null) => {
 		if (!file) return;
+		if (file.size > MAX_AVATAR_SOURCE_FILE_BYTES) {
+			notifications.show({ color: "red", message: t("avatarFileTooLarge", { max: "20 MB" }) });
+			return;
+		}
 		const url = URL.createObjectURL(file);
 		setCropSrc((prev) => {
 			if (prev) URL.revokeObjectURL(prev);

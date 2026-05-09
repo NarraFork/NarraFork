@@ -31,6 +31,8 @@ const SOURCE_META: Record<string, { color: string; key: string }> = {
 	buffered_user: { color: "gray", key: "buffered_user" },
 };
 
+const SIDECAR_DETAIL_MAX_CHARS = 120_000;
+
 function sourceColor(source: string): string {
 	return SOURCE_META[source]?.color ?? "gray";
 }
@@ -39,6 +41,11 @@ function previewContent(content: string): string {
 	const compact = content.replace(/\s+/g, " ").trim();
 	if (!compact) return "";
 	return compact.length > 120 ? `${compact.slice(0, 120)}…` : compact;
+}
+
+function detailContent(content: string, truncatedLabel: string): string {
+	if (content.length <= SIDECAR_DETAIL_MAX_CHARS) return content;
+	return `${content.slice(0, SIDECAR_DETAIL_MAX_CHARS)}\n\n${truncatedLabel}`;
 }
 
 function sideCarKey(sideCar: SideCarRecord): string {
@@ -65,6 +72,9 @@ function SideCarItem({ sideCar, detail }: { sideCar: SideCarRecord; detail?: boo
 	const label = sourceLabel(t, sideCar.source);
 	const color = sourceColor(sideCar.source);
 	const content = sideCar.content ?? "";
+	const displayContent = detail
+		? detailContent(content, t("sidecar.truncated"))
+		: previewContent(content);
 
 	return (
 		<Box
@@ -123,7 +133,7 @@ function SideCarItem({ sideCar, detail }: { sideCar: SideCarRecord; detail?: boo
 					}}
 				>
 					<Text size="xs" c="dimmed" component="span">
-						{detail ? content || t("sidecar.empty") : previewContent(content) || t("sidecar.empty")}
+						{displayContent || t("sidecar.empty")}
 					</Text>
 				</Box>
 			</Stack>

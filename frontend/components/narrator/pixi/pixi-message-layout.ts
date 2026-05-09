@@ -262,12 +262,136 @@ const TABLE_ROW_H = 26;
 const TABLE_MAX_ROWS = 12;
 const MAX_BLOCK_LINES = 120;
 
-const preparedCache = new Map<string, ReturnType<typeof prepareWithSegments>>();
-const itemLayoutCache = new Map<string, CachedItemLayout>();
-const MAX_CACHE = 1200;
-const MAX_ITEM_LAYOUT_CACHE = 800;
-
+type CachedPrepared = ReturnType<typeof prepareWithSegments>;
 type CachedItemLayout = Pick<PixiLaidOutItem, "width" | "height" | "contentWidth" | "blocks">;
+
+type CacheEntry<T> = { value: T; bytes: number };
+
+const preparedCache = new Map<string, CacheEntry<CachedPrepared>>();
+const itemLayoutCache = new Map<string, CacheEntry<CachedItemLayout>>();
+const MAX_CACHE = 1200;
+const MAX_PREPARED_CACHE_BYTES = 4 * 1024 * 1024;
+const MAX_PREPARED_CACHE_KEY_CHARS = 12_000;
+const MAX_ITEM_LAYOUT_CACHE = 800;
+const MAX_ITEM_LAYOUT_CACHE_BYTES = 12 * 1024 * 1024;
+const MAX_ITEM_LAYOUT_CACHE_KEY_CHARS = 60_000;
+let preparedCacheBytes = 0;
+let itemLayoutCacheBytes = 0;
+
+function estimateTextBytes(text: string | undefined): number {
+	return (text?.length ?? 0) * 2;
+}
+
+function estimateLinesBytes(lines: LayoutLine[] | undefined): number {
+	if (!lines?.length) return 0;
+	let bytes = lines.length * 64;
+	for (const line of lines) bytes += estimateTextBytes(line.text);
+	return bytes;
+}
+
+function estimateItemLayoutBytes(key: string, layout: CachedItemLayout): number {
+	let bytes = key.length * 2 + 128;
+	for (const block of layout.blocks) {
+		bytes += estimateTextBytes(block.text) + estimateLinesBytes(block.lines) + 128;
+		for (const mdBlock of block.mdBlocks ?? []) {
+			bytes += estimateTextBytes(mdBlock.text) + estimateLinesBytes(mdBlock.lines) + 96;
+		}
+		for (const line of block.toolDetailLines ?? []) {
+			bytes += estimateTextBytes(line.text) + estimateLinesBytes(line.lines) + 96;
+		}
+		for (const detail of block.toolDetailBlocks ?? []) {
+			bytes +=
+				estimateTextBytes(detail.text) +
+				estimateTextBytes(detail.title) +
+				estimateTextBytes(detail.subtitle) +
+				estimateLinesBytes(detail.lines) +
+				estimateLinesBytes(detail.oldLines) +
+				estimateLinesBytes(detail.newLines) +
+				128;
+			for (const diffLine of detail.diffLines ?? []) {
+				bytes += estimateTextBytes(diffLine.text) + estimateLinesBytes(diffLine.lines) + 96;
+			}
+		}
+	}
+	return bytes;
+}
+
+function estimateToolDetailSourceChars(detail: PixiToolDetailBlockModel): number {
+	switch (detail.kind) {
+		case "badge-row":
+			return detail.badges.reduce((total, badge) => total + badge.text.length, 0);
+		case "section-title":
+		case "text-line":
+		case "todo-row":
+			return detail.text.length;
+		case "permission-panel":
+			return (
+				detail.toolName.length +
+				(detail.decisionReason?.length ?? 0) +
+				(detail.summary?.length ?? 0) +
+				(detail.planPreview?.length ?? 0) +
+				detail.actions.reduce((total, action) => total + action.label.length, 0)
+			);
+		case "code-panel":
+		case "terminal-panel":
+			return detail.text.length;
+		case "diff-panel":
+			return detail.oldText.length + detail.newText.length;
+		case "result-card":
+			return (
+				(detail.title?.length ?? 0) +
+				(detail.subtitle?.length ?? 0) +
+				(detail.text?.length ?? 0) +
+				(detail.badges ?? []).reduce((total, badge) => total + badge.text.length, 0)
+			);
+		case "share-card":
+			return (
+				detail.filename.length +
+				(detail.note?.length ?? 0) +
+				detail.badges.reduce((total, badge) => total + badge.text.length, 0)
+			);
+	}
+}
+
+function estimateItemSourceChars(item: PixiMessageItem): number {
+	let chars =
+		item.key.length +
+		item.title.length +
+		(item.subtitle?.length ?? 0) +
+		(item.tokenUsage?.length ?? 0);
+	for (const block of item.blocks) {
+		chars +=
+			block.type.length +
+			block.text.length +
+			(block.label?.length ?? 0) +
+			(block.copyText?.length ?? 0) +
+			(block.toolSummary?.length ?? 0) +
+			(block.pendingPermissionReason?.length ?? 0);
+		for (const line of block.toolDetailLines ?? []) {
+			chars += (line.label?.length ?? 0) + line.text.length;
+		}
+		for (const detail of block.toolDetailBlocks ?? []) {
+			chars += estimateToolDetailSourceChars(detail);
+		}
+	}
+	return chars;
+}
+
+function evictPreparedCacheEntry(): void {
+	const first = preparedCache.keys().next().value;
+	if (first === undefined) return;
+	const entry = preparedCache.get(first);
+	if (entry) preparedCacheBytes = Math.max(0, preparedCacheBytes - entry.bytes);
+	preparedCache.delete(first);
+}
+
+function evictItemLayoutCacheEntry(): void {
+	const first = itemLayoutCache.keys().next().value;
+	if (first === undefined) return;
+	const entry = itemLayoutCache.get(first);
+	if (entry) itemLayoutCacheBytes = Math.max(0, itemLayoutCacheBytes - entry.bytes);
+	itemLayoutCache.delete(first);
+}
 
 function getPrepared(text: string, font: string) {
 	const key = `${font}\u0000${text}`;
@@ -275,13 +399,16 @@ function getPrepared(text: string, font: string) {
 	if (cached) {
 		preparedCache.delete(key);
 		preparedCache.set(key, cached);
-		return cached;
+		return cached.value;
 	}
 	const prepared = prepareWithSegments(text, font, { whiteSpace: "pre-wrap" });
-	preparedCache.set(key, prepared);
-	if (preparedCache.size > MAX_CACHE) {
-		const first = preparedCache.keys().next().value;
-		if (first !== undefined) preparedCache.delete(first);
+	if (key.length > MAX_PREPARED_CACHE_KEY_CHARS) return prepared;
+	const bytes = key.length * 4;
+	if (bytes > MAX_PREPARED_CACHE_BYTES) return prepared;
+	preparedCache.set(key, { value: prepared, bytes });
+	preparedCacheBytes += bytes;
+	while (preparedCache.size > MAX_CACHE || preparedCacheBytes > MAX_PREPARED_CACHE_BYTES) {
+		evictPreparedCacheEntry();
 	}
 	return prepared;
 }
@@ -291,19 +418,32 @@ function getCachedItemLayout(key: string): CachedItemLayout | undefined {
 	if (!cached) return undefined;
 	itemLayoutCache.delete(key);
 	itemLayoutCache.set(key, cached);
-	return cached;
+	return cached.value;
 }
 
 function setCachedItemLayout(key: string, layout: CachedItemLayout): void {
-	itemLayoutCache.set(key, layout);
-	if (itemLayoutCache.size > MAX_ITEM_LAYOUT_CACHE) {
-		const first = itemLayoutCache.keys().next().value;
-		if (first !== undefined) itemLayoutCache.delete(first);
+	if (key.length > MAX_ITEM_LAYOUT_CACHE_KEY_CHARS) return;
+	const bytes = estimateItemLayoutBytes(key, layout);
+	if (bytes > MAX_ITEM_LAYOUT_CACHE_BYTES / 4) return;
+	const existing = itemLayoutCache.get(key);
+	if (existing) {
+		itemLayoutCacheBytes = Math.max(0, itemLayoutCacheBytes - existing.bytes);
+		itemLayoutCache.delete(key);
+	}
+	itemLayoutCache.set(key, { value: layout, bytes });
+	itemLayoutCacheBytes += bytes;
+	while (
+		itemLayoutCache.size > MAX_ITEM_LAYOUT_CACHE ||
+		itemLayoutCacheBytes > MAX_ITEM_LAYOUT_CACHE_BYTES
+	) {
+		evictItemLayoutCacheEntry();
 	}
 }
 
-function itemLayoutCacheKey(item: PixiMessageItem, itemWidth: number): string {
-	return `${itemWidth}\u0000${JSON.stringify(item)}`;
+function itemLayoutCacheKey(item: PixiMessageItem, itemWidth: number): string | null {
+	if (estimateItemSourceChars(item) > MAX_ITEM_LAYOUT_CACHE_KEY_CHARS) return null;
+	const key = `${itemWidth}\u0000${JSON.stringify(item)}`;
+	return key.length > MAX_ITEM_LAYOUT_CACHE_KEY_CHARS ? null : key;
 }
 
 /** Split a diff change value into lines, removing trailing empty line from \n */
@@ -1214,13 +1354,15 @@ function layoutToolUseBlock(
 export function clearPixiMessageLayoutCache(): void {
 	preparedCache.clear();
 	itemLayoutCache.clear();
+	preparedCacheBytes = 0;
+	itemLayoutCacheBytes = 0;
 }
 
 function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): CachedItemLayout {
 	const contentMaxWidth = Math.max(260, viewportWidth - 32);
 	const itemWidth = contentMaxWidth;
 	const cacheKey = itemLayoutCacheKey(item, itemWidth);
-	const cached = getCachedItemLayout(cacheKey);
+	const cached = cacheKey ? getCachedItemLayout(cacheKey) : undefined;
 	if (cached) return cached;
 
 	const isUser = item.role === "user";
@@ -1243,7 +1385,7 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 			contentWidth: innerWidth,
 			blocks,
 		};
-		setCachedItemLayout(cacheKey, layout);
+		if (cacheKey) setCachedItemLayout(cacheKey, layout);
 		return layout;
 	}
 
@@ -1360,7 +1502,7 @@ function layoutPixiMessageItem(item: PixiMessageItem, viewportWidth: number): Ca
 		contentWidth: innerWidth,
 		blocks,
 	};
-	setCachedItemLayout(cacheKey, layout);
+	if (cacheKey) setCachedItemLayout(cacheKey, layout);
 	if (!isAssistant && !isUser) {
 		// no-op; retained to make role-based layout explicit
 	}

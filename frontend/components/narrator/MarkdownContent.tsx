@@ -368,6 +368,7 @@ const supportsLookbehind = (() => {
 
 const STREAMING_ANIM_MAX_CHARS = 4_000;
 const STREAMING_MARKDOWN_MAX_CHARS = 12_000;
+const STATIC_MARKDOWN_MAX_CHARS = 80_000;
 
 /** Thin error boundary so a remark-gfm regex crash doesn't blank the chat. */
 class MarkdownErrorBoundary extends Component<
@@ -409,8 +410,11 @@ export const MarkdownContent = memo(function MarkdownContent({
 		document.documentElement.getAttribute("data-advanced-anim") === "true";
 
 	const shouldAnimate = canAnimateStreaming && advancedAnim;
+	const tooLargeForMarkdown = trimmed.length > STATIC_MARKDOWN_MAX_CHARS;
 	const usesStaticMarkdown =
-		!(streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) && !shouldAnimate;
+		!tooLargeForMarkdown &&
+		!(streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) &&
+		!shouldAnimate;
 	const mathPlugins = useMathPlugins(usesStaticMarkdown && hasMarkdownMath(trimmed));
 	const remarkPlugins = useMemo<PluggableList>(() => {
 		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
@@ -430,7 +434,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 		</Text>
 	);
 
-	if (streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) {
+	if ((streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) || tooLargeForMarkdown) {
 		return plainFallback;
 	}
 

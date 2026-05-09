@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 
+const VOLUME_SNAPSHOTS_GC_TIME_MS = 60_000;
+
 export function useVolumeSnapshots(
 	projectId: string | undefined,
 	filters?: { serviceName?: string },
@@ -11,6 +13,7 @@ export function useVolumeSnapshots(
 		queryKey: ["volumeSnapshots", projectId, filters],
 		queryFn: () => api.listVolumeSnapshots(projectId as string, filters),
 		enabled: !!projectId,
+		gcTime: VOLUME_SNAPSHOTS_GC_TIME_MS,
 	});
 }
 
@@ -118,5 +121,6 @@ export function useSnapshotApplications(snapshotId: string | undefined) {
 		queryKey: ["snapshotApplications", snapshotId],
 		queryFn: () => api.getSnapshotApplications(snapshotId as string),
 		enabled: !!snapshotId,
+		gcTime: VOLUME_SNAPSHOTS_GC_TIME_MS,
 	});
 }

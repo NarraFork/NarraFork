@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import { collectElementTextPreviewResult } from "../../lib/dom-text";
 
 /**
  * Attribute name placed on every selectable content block (ContentViewer / ToolCallCard).
@@ -43,21 +44,21 @@ export function shouldIgnoreMessageBlockSelection(target: EventTarget | null): b
 export const NestedBlockCtx = createContext<string | null>(null);
 
 export interface MessageSelectionState {
-	/** Whether multi-select mode is active. */
 	selectionMode: boolean;
-	/** Set of currently selected block IDs. */
 	selectedBlockIds: Set<string>;
-	/** The anchor block ID (first swipe). */
 	anchorBlockId: string | null;
-	/** Exit multi-select mode and clear selection. */
 	exitSelection: () => void;
-	/** Remove a single block from the selection. Exits selection mode if empty. */
 	deselectBlock: (blockId: string) => void;
-	/** Toggle a single block (Ctrl/Cmd+Click). Enters selection mode if not active. */
 	toggleBlock: (blockId: string) => void;
-	/** Range-select from anchor to target (Shift+Click). */
 	rangeSelectTo: (blockId: string) => void;
 }
+
+export interface CollectedSelectedText {
+	text: string;
+	truncated: boolean;
+}
+
+const MAX_COLLECTED_SELECTED_TEXT_CHARS = 200_000;
 
 const DEFAULT_STATE: MessageSelectionState = {
 	selectionMode: false,
@@ -178,21 +179,27 @@ export function resolveSelectedMessageIds(
 
 /**
  * Collect the visible text content of all selected blocks in DOM order.
- * For `cv-*` blocks, uses the `handleRegistry` via `data-cv-id` if available,
- * otherwise falls back to `innerText`.
- * For `tc-*` blocks, uses `innerText`.
+ * For `cv-*` blocks, uses the `handleRegistry` via `data-cv-id` if available.
+ * Otherwise, falls back to bounded DOM text traversal instead of materializing `innerText`.
  */
 export function collectSelectedText(
 	container: HTMLElement,
 	selectedIds: Set<string>,
 	handleRegistry?: Map<number, { getContent?: () => string }>,
-): string {
+): CollectedSelectedText {
 	const allBlocks = container.querySelectorAll<HTMLElement>(`[${BLOCK_ID_ATTR}]`);
 	const parts: string[] = [];
+	let remaining = MAX_COLLECTED_SELECTED_TEXT_CHARS;
+	let truncated = false;
 	for (const el of allBlocks) {
 		const blockId = el.getAttribute(BLOCK_ID_ATTR);
 		if (!blockId || !selectedIds.has(blockId)) continue;
+		if (remaining <= 0) {
+			truncated = true;
+			break;
+		}
 		let text: string | undefined;
+		let fallbackTruncated = false;
 		// Try handleRegistry for ContentViewer blocks
 		if (blockId.startsWith("cv-") && handleRegistry) {
 			const cvId = el.getAttribute("data-cv-id");
@@ -202,11 +209,49 @@ export function collectSelectedText(
 			}
 		}
 		if (!text) {
-			text = el.innerText;
+			const preview = collectElementTextPreviewResult(el, remaining);
+			text = preview.text;
+			fallbackTruncated = preview.truncated;
 		}
-		if (text?.trim()) {
-			parts.push(text.trim());
+		if (!text) {
+			if (fallbackTruncated) {
+				truncated = true;
+				break;
+			}
+			continue;
+		}
+
+		let start = 0;
+		let end = text.length;
+		while (start < end && /\s/.test(text[start])) start++;
+		while (end > start && /\s/.test(text[end - 1])) end--;
+		if (start >= end) {
+			if (fallbackTruncated) {
+				truncated = true;
+				break;
+			}
+			continue;
+		}
+
+		const separator = parts.length > 0 ? "\n\n" : "";
+		const available = remaining - separator.length;
+		if (available <= 0) {
+			truncated = true;
+			break;
+		}
+		parts.push(separator);
+		const textLength = end - start;
+		if (textLength > available) {
+			parts.push(text.slice(start, start + available));
+			truncated = true;
+			break;
+		}
+		parts.push(text.slice(start, end));
+		remaining -= separator.length + textLength;
+		if (fallbackTruncated) {
+			truncated = true;
+			break;
 		}
 	}
-	return parts.join("\n\n");
+	return { text: parts.join(""), truncated };
 }

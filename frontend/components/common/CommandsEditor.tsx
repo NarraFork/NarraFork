@@ -17,6 +17,8 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 
+const MODEL_SELECT_OPTION_LIMIT = 100;
+
 export interface CommandParamDef {
 	name: string;
 	description?: string;
@@ -387,6 +389,7 @@ export function CommandsEditor({ commands, onChange, ns = "settings" }: Commands
 											}));
 										}}
 										searchable
+										limit={MODEL_SELECT_OPTION_LIMIT}
 										size="xs"
 									/>
 									<SegmentedControl

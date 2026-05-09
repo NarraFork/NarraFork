@@ -87,6 +87,10 @@ const gutterStyle = {
 
 // --- Helpers ---
 
+function clampLineContent(line: string): string {
+	return line.length > MAX_DIFF_LINE_CHARS ? `${line.slice(0, MAX_DIFF_LINE_CHARS)} …` : line;
+}
+
 function splitIntoLines(value: string): string[] {
 	if (!value) return [];
 	const lines = value.split("\n");
@@ -94,16 +98,71 @@ function splitIntoLines(value: string): string[] {
 	if (lines.length > 0 && lines[lines.length - 1] === "") {
 		lines.pop();
 	}
-	return lines;
+	return lines.map(clampLineContent);
 }
 
 const MAX_DIFF_LINES = 500;
+const MAX_DIFF_INPUT_CHARS = 240_000;
+const MAX_DIFF_HIGHLIGHT_CHARS = 80_000;
+const MAX_WORD_DIFF_CHARS = 4_000;
+const MAX_DIFF_LINE_CHARS = 4_000;
+
+function appendPreviewLines(
+	value: string,
+	type: "removed" | "added",
+	startLine: number,
+	maxLines: number,
+	result: DiffLine[],
+) {
+	let lineNo = startLine;
+	let start = 0;
+	while (start <= value.length && result.length < maxLines) {
+		const newline = value.indexOf("\n", start);
+		const end = newline === -1 ? value.length : newline;
+		const rawContent = value.slice(start, end);
+		const content =
+			rawContent.length > MAX_DIFF_LINE_CHARS
+				? `${rawContent.slice(0, MAX_DIFF_LINE_CHARS)} …`
+				: rawContent;
+		result.push({
+			type,
+			content,
+			oldLineNo: type === "removed" ? lineNo : undefined,
+			newLineNo: type === "added" ? lineNo : undefined,
+		});
+		lineNo++;
+		start = newline === -1 ? value.length + 1 : newline + 1;
+	}
+}
+
+function buildLargeInputPreview(oldStr: string, newStr: string, startLine: number): DiffLine[] {
+	const result: DiffLine[] = [
+		{
+			type: "context",
+			content:
+				"... diff input too large; showing a bounded preview without full diff computation ...",
+		},
+	];
+	const perSide = Math.floor((MAX_DIFF_LINES - result.length) / 2);
+	appendPreviewLines(oldStr, "removed", startLine, perSide, result);
+	appendPreviewLines(newStr, "added", startLine, MAX_DIFF_LINES - result.length, result);
+	return result;
+}
 
 function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] {
+	if (oldStr.length + newStr.length > MAX_DIFF_INPUT_CHARS) {
+		return buildLargeInputPreview(oldStr, newStr, startLine);
+	}
+
 	const changes = computeLineDiff(oldStr, newStr);
 	const result: DiffLine[] = [];
 	let oldLine = startLine;
 	let newLine = startLine;
+	const appendLine = (line: DiffLine): boolean => {
+		if (result.length >= MAX_DIFF_LINES) return false;
+		result.push(line);
+		return true;
+	};
 
 	for (let i = 0; i < changes.length; i++) {
 		if (result.length >= MAX_DIFF_LINES) break;
@@ -112,7 +171,11 @@ function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] 
 		if (!change.added && !change.removed) {
 			// Context lines
 			for (const line of splitIntoLines(change.value)) {
-				result.push({ type: "context", content: line, oldLineNo: oldLine, newLineNo: newLine });
+				if (
+					!appendLine({ type: "context", content: line, oldLineNo: oldLine, newLineNo: newLine })
+				) {
+					return result;
+				}
 				oldLine++;
 				newLine++;
 			}
@@ -128,36 +191,52 @@ function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] 
 				const maxPaired = Math.min(removedLines.length, addedLines.length);
 
 				for (let j = 0; j < maxPaired; j++) {
-					const wc = diffWordsWithSpace(removedLines[j], addedLines[j]);
-					result.push({
-						type: "removed",
-						content: removedLines[j],
-						wordChanges: wc.filter((c) => !c.added),
-						oldLineNo: oldLine,
-					});
+					const shouldWordDiff =
+						removedLines[j].length + addedLines[j].length <= MAX_WORD_DIFF_CHARS;
+					const wc = shouldWordDiff ? diffWordsWithSpace(removedLines[j], addedLines[j]) : null;
+					if (
+						!appendLine({
+							type: "removed",
+							content: removedLines[j],
+							wordChanges: wc?.filter((c) => !c.added),
+							oldLineNo: oldLine,
+						})
+					) {
+						return result;
+					}
 					oldLine++;
-					result.push({
-						type: "added",
-						content: addedLines[j],
-						wordChanges: wc.filter((c) => !c.removed),
-						newLineNo: newLine,
-					});
+					if (
+						!appendLine({
+							type: "added",
+							content: addedLines[j],
+							wordChanges: wc?.filter((c) => !c.removed),
+							newLineNo: newLine,
+						})
+					) {
+						return result;
+					}
 					newLine++;
 				}
 				// Remaining unpaired lines
 				for (let j = maxPaired; j < removedLines.length; j++) {
-					result.push({ type: "removed", content: removedLines[j], oldLineNo: oldLine });
+					if (!appendLine({ type: "removed", content: removedLines[j], oldLineNo: oldLine })) {
+						return result;
+					}
 					oldLine++;
 				}
 				for (let j = maxPaired; j < addedLines.length; j++) {
-					result.push({ type: "added", content: addedLines[j], newLineNo: newLine });
+					if (!appendLine({ type: "added", content: addedLines[j], newLineNo: newLine })) {
+						return result;
+					}
 					newLine++;
 				}
 				i++; // skip the added chunk
 			} else {
 				// Pure removal
 				for (const line of splitIntoLines(change.value)) {
-					result.push({ type: "removed", content: line, oldLineNo: oldLine });
+					if (!appendLine({ type: "removed", content: line, oldLineNo: oldLine })) {
+						return result;
+					}
 					oldLine++;
 				}
 			}
@@ -166,7 +245,9 @@ function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] 
 
 		// Pure addition (not preceded by removal)
 		for (const line of splitIntoLines(change.value)) {
-			result.push({ type: "added", content: line, newLineNo: newLine });
+			if (!appendLine({ type: "added", content: line, newLineNo: newLine })) {
+				return result;
+			}
 			newLine++;
 		}
 	}
@@ -178,6 +259,18 @@ function computeDiff(oldStr: string, newStr: string, startLine = 1): DiffLine[] 
 
 type TokenMap = Map<string, ThemedToken[]>;
 
+function buildHighlightSourceText(lines: DiffLine[]): string | null {
+	let totalLength = 0;
+	const sourceLines: string[] = [];
+	for (const line of lines) {
+		const nextLength = totalLength + (sourceLines.length > 0 ? 1 : 0) + line.content.length;
+		if (nextLength > MAX_DIFF_HIGHLIGHT_CHARS) return null;
+		sourceLines.push(line.content);
+		totalLength = nextLength;
+	}
+	return sourceLines.join("\n");
+}
+
 function useTokenMap(
 	lines: DiffLine[],
 	language: string | undefined,
@@ -185,11 +278,11 @@ function useTokenMap(
 ): TokenMap | null {
 	const [tokenMap, setTokenMap] = useState<TokenMap | null>(null);
 
-	// Build the full source text for tokenisation (all unique lines)
+	// Build the full source text for tokenisation with a hard total-size guard.
 	const sourceText = useMemo(() => {
 		if (!language || language === "text") return null;
-		// Reconstruct a plausible source from all lines so shiki gets proper context
-		return lines.map((l) => l.content).join("\n");
+		// Reconstruct a plausible source from all lines so shiki gets proper context.
+		return buildHighlightSourceText(lines);
 	}, [language, lines]);
 
 	useEffect(() => {

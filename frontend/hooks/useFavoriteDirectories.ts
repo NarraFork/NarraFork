@@ -1,10 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
+const FAVORITE_DIRECTORIES_QUERY_GC_TIME_MS = 60_000;
+
 export function useFavoriteDirectories() {
 	return useQuery({
 		queryKey: ["favoriteDirectories"],
 		queryFn: api.listFavoriteDirectories,
+		gcTime: FAVORITE_DIRECTORIES_QUERY_GC_TIME_MS,
 	});
 }
 

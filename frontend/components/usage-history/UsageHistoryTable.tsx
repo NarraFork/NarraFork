@@ -31,12 +31,88 @@ import {
 	IconToggleRight,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 interface UsageHistoryTableProps {
 	records: UsageHistoryRecord[];
 	loading?: boolean;
+}
+
+const MAX_RAW_DUMP_DISPLAY_CHARS = 120_000;
+
+function formatRawDumpPreview(
+	value: unknown,
+	maxChars: number,
+): { text: string; truncated: boolean } {
+	const parts: string[] = [];
+	const seen = new WeakSet<object>();
+	let remaining = maxChars;
+	let truncated = false;
+
+	const append = (text: string): boolean => {
+		if (remaining <= 0) {
+			truncated = true;
+			return false;
+		}
+		if (text.length > remaining) {
+			parts.push(text.slice(0, remaining));
+			remaining = 0;
+			truncated = true;
+			return false;
+		}
+		parts.push(text);
+		remaining -= text.length;
+		return true;
+	};
+
+	const writeIndent = (depth: number) => append("  ".repeat(depth));
+
+	const write = (current: unknown, depth: number): boolean => {
+		if (current == null || typeof current === "number" || typeof current === "boolean") {
+			return append(JSON.stringify(current));
+		}
+		if (typeof current === "string") {
+			const snippet = current.length > remaining ? current.slice(0, remaining) : current;
+			return append(JSON.stringify(snippet));
+		}
+		if (typeof current !== "object") return append(JSON.stringify(String(current)));
+		if (seen.has(current)) return append('"[Circular]"');
+		seen.add(current);
+
+		if (Array.isArray(current)) {
+			if (current.length === 0) return append("[]");
+			if (!append("[\n")) return false;
+			for (let i = 0; i < current.length; i++) {
+				if (!writeIndent(depth + 1)) return false;
+				if (!write(current[i], depth + 1)) return false;
+				if (!append(i === current.length - 1 ? "\n" : ",\n")) return false;
+			}
+			return writeIndent(depth) && append("]");
+		}
+
+		let wroteAny = false;
+		if (!append("{\n")) return false;
+		let first = true;
+		const record = current as Record<string, unknown>;
+		for (const key in record) {
+			if (!Object.hasOwn(record, key)) continue;
+			if (!first && !append(",\n")) return false;
+			first = false;
+			wroteAny = true;
+			if (!writeIndent(depth + 1)) return false;
+			if (!append(`${JSON.stringify(key)}: `)) return false;
+			if (!write(record[key], depth + 1)) return false;
+		}
+		if (!wroteAny) {
+			parts.pop();
+			return append("{}");
+		}
+		return append("\n") && writeIndent(depth) && append("}");
+	};
+
+	write(value, 0);
+	return { text: parts.join(""), truncated };
 }
 
 function formatDuration(ms: number | null): string {
@@ -178,7 +254,12 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 		queryKey: ["usage-history", "detail", selectedRecordId],
 		queryFn: () => usageHistoryApi.getRecord(selectedRecordId as string),
 		enabled: !!selectedRecordId,
+		gcTime: 0,
 	});
+	const rawDumpDisplay = useMemo(() => {
+		if (!selectedRecord?.rawDump) return null;
+		return formatRawDumpPreview(selectedRecord.rawDump, MAX_RAW_DUMP_DISPLAY_CHARS);
+	}, [selectedRecord?.rawDump]);
 
 	if (loading) {
 		return <Text c="dimmed">{t("loading", "加载中...")}</Text>;
@@ -508,7 +589,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 							{t("usageHistoryRawDumpLoading")}
 						</Text>
 					</Group>
-				) : selectedRecord?.rawDump ? (
+				) : rawDumpDisplay ? (
 					<Code
 						block
 						style={{
@@ -519,7 +600,8 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 							fontSize: 12,
 						}}
 					>
-						{JSON.stringify(selectedRecord.rawDump, null, 2)}
+						{rawDumpDisplay.text}
+						{rawDumpDisplay.truncated ? `\n\n${t("usageHistoryRawDumpTruncated")}` : null}
 					</Code>
 				) : (
 					<Text size="sm" c="dimmed">

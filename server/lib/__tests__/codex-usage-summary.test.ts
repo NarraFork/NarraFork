@@ -54,6 +54,13 @@ function weeklyOnlyUsage(
 	};
 }
 
+function usageQueriedAt(usageResult: CodexUsageResult, timestamp: number): CodexUsageResult {
+	return {
+		...usageResult,
+		queriedAt: new Date(timestamp).toISOString(),
+	};
+}
+
 describe("Codex usage summary", () => {
 	test("normalizes Codex plan tiers", () => {
 		expect(normalizeCodexPlanTier("free")).toBe("free");
@@ -280,5 +287,41 @@ describe("Codex usage summary", () => {
 		expect(forecast.points[0]?.byTier.free).toBe(0.6);
 		expect(forecast.points[1]?.timestamp).toBe(weeklyReset);
 		expect(forecast.points[1]?.byTier.free).toBe(1);
+	});
+
+	test("forecast extends one hour back using stored usage history", () => {
+		const now = 10_000_000;
+		const reset = now + 60_000;
+		const oldPoint = now - 45 * 60_000;
+		const recentPoint = now - 15 * 60_000;
+		const forecast = buildCodexUsageForecast(
+			[
+				{
+					id: "plus-a",
+					usage: usageQueriedAt(
+						usage("plus", { used: 50, remaining: 50, resetAt: reset / 1000 }),
+						now,
+					),
+					usageHistory: [
+						{ timestamp: oldPoint, tier: "plus", remainingPercent: 90 },
+						{ timestamp: recentPoint, tier: "plus", remainingPercent: 60 },
+					],
+				},
+				{
+					id: "plus-b",
+					usage: usageQueriedAt(
+						usage("plus", { used: 20, remaining: 80, resetAt: reset / 1000 }),
+						now,
+					),
+				},
+			],
+			now,
+		);
+
+		expect(forecast.points[0]?.timestamp).toBe(now - 60 * 60_000);
+		expect(forecast.points.find((point) => point.timestamp === oldPoint)?.byTier.plus).toBe(1.7);
+		expect(forecast.points.find((point) => point.timestamp === recentPoint)?.byTier.plus).toBe(1.4);
+		expect(forecast.points.find((point) => point.timestamp === now)?.byTier.plus).toBe(1.3);
+		expect(forecast.points.at(-1)?.timestamp).toBe(reset);
 	});
 });

@@ -1,12 +1,14 @@
 import { clearCache as clearPretextCache, setLocale as setPretextLocale } from "@chenglou/pretext";
 import i18n from "@frontend/lib/i18n";
 import { Box, Menu } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconArrowBackUp,
 	IconArrowsMinimize,
 	IconCopy,
 	IconGitFork,
 	IconMessageQuestion,
+	IconPhoto,
 	IconTrash,
 	IconX,
 } from "@tabler/icons-react";
@@ -26,6 +28,7 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../../hooks/useLocalPref";
+import { copyGeneratedImageToClipboard } from "../image-clipboard";
 import { BLOCK_ID_ATTR, useMessageSelection } from "../MessageSelectionCtx";
 import { getRenderableMessageOrder } from "../message-order-utils";
 import { resolvePendingPerm } from "../narrator-message-helpers";
@@ -229,6 +232,18 @@ function hitTestPixiToolContentScrollTarget(
 		if (target.kind === "tool-content-scroll" && targetContainsPoint(target, x, y)) return target;
 	}
 	return null;
+}
+
+function pruneMapToKeys<V>(map: Map<string, V>, keys: ReadonlySet<string>): void {
+	for (const key of map.keys()) {
+		if (!keys.has(key)) map.delete(key);
+	}
+}
+
+function pruneSetToKeys(set: Set<string>, keys: ReadonlySet<string>): void {
+	for (const key of set) {
+		if (!keys.has(key)) set.delete(key);
+	}
 }
 
 function computePixiSwipeMenuPosition(
@@ -506,6 +521,40 @@ export const NarratorPixiMessageList = forwardRef<
 		void layoutVersion;
 		return layoutPixiMessageItems(items, Math.max(1, size.width));
 	}, [items, size.width, layoutVersion]);
+	const pixiStateKeys = useMemo(() => {
+		const toolKeys = new Set<string>();
+		const reasoningKeys = new Set<string>();
+		const reasoningSlotKeys = new Set<string>();
+		const toolContentScrollKeys = new Set<string>();
+		for (const laid of layout.items) {
+			for (const block of laid.blocks) {
+				if (block.toolKey) toolKeys.add(block.toolKey);
+				if (block.reasoningKey) {
+					reasoningKeys.add(block.reasoningKey);
+					const slotKey = reasoningKeySlotRef.current.get(block.reasoningKey);
+					if (slotKey) reasoningSlotKeys.add(slotKey);
+				}
+				for (const detail of block.toolDetailBlocks ?? []) {
+					if (detail.scrollKey) toolContentScrollKeys.add(detail.scrollKey);
+				}
+			}
+		}
+		return { toolKeys, reasoningKeys, reasoningSlotKeys, toolContentScrollKeys };
+	}, [layout.items]);
+
+	useEffect(() => {
+		pruneMapToKeys(toolExpandedMapRef.current, pixiStateKeys.toolKeys);
+		pruneSetToKeys(userToggledToolKeysRef.current, pixiStateKeys.toolKeys);
+		pruneSetToKeys(forcedToolExpandedKeysRef.current, pixiStateKeys.toolKeys);
+		pruneMapToKeys(resolvedToolExpandedRef.current, pixiStateKeys.toolKeys);
+		pruneMapToKeys(reasoningExpandedMapRef.current, pixiStateKeys.reasoningKeys);
+		pruneSetToKeys(userToggledReasoningKeysRef.current, pixiStateKeys.reasoningKeys);
+		pruneMapToKeys(resolvedReasoningExpandedRef.current, pixiStateKeys.reasoningKeys);
+		pruneSetToKeys(seenReasoningKeysRef.current, pixiStateKeys.reasoningKeys);
+		pruneMapToKeys(reasoningKeySlotRef.current, pixiStateKeys.reasoningKeys);
+		pruneMapToKeys(reasoningSlotExpandedRef.current, pixiStateKeys.reasoningSlotKeys);
+		pruneMapToKeys(toolContentScrollMapRef.current, pixiStateKeys.toolContentScrollKeys);
+	}, [pixiStateKeys]);
 	const virtualScrollHeight = Math.max(size.height, layout.totalHeight);
 	const selectionMarkers = useMemo(() => {
 		const markers: Array<{
@@ -1560,8 +1609,25 @@ export const NarratorPixiMessageList = forwardRef<
 			const messageId = target.messageId;
 			const blockIndex = target.blockIndex;
 			const canUseBlock = !!messageId && blockIndex != null;
+			const canCopyImage = !!(target.imageSrc || target.imageSavedPath);
 			return (
 				<>
+					{canCopyImage && (
+						<Menu.Item
+							leftSection={<IconPhoto size={14} />}
+							onClick={() => {
+								void copyGeneratedImageToClipboard({
+									imageSrc: target.imageSrc,
+									savedPath: target.imageSavedPath,
+								})
+									.then(() => notifications.show({ color: "teal", message: t("copyImageSuccess") }))
+									.catch(() => notifications.show({ color: "red", message: t("copyImageFailed") }));
+								close();
+							}}
+						>
+							{t("contextMenu_copyImage")}
+						</Menu.Item>
+					)}
 					<Menu.Item
 						leftSection={<IconCopy size={14} />}
 						onClick={() => {

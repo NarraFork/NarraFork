@@ -84,7 +84,22 @@ interface SubagentNarratorData {
 }
 
 const SUBAGENT_ID_RE = /<subagent_id>[^<]*<\/subagent_id>/g;
+const MAX_SUBAGENT_RESULT_PREVIEW_CHARS = 120_000;
+const MAX_SUBAGENT_PROMPT_INLINE_CHARS = 120_000;
+const MAX_SUBAGENT_DESCRIPTION_CHARS = 4_000;
 const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
+
+function appendLimited(parts: string[], value: string, budget: { remaining: number }) {
+	if (budget.remaining <= 0 || value.length === 0) return;
+	const chunk = value.length > budget.remaining ? value.slice(0, budget.remaining) : value;
+	parts.push(chunk);
+	budget.remaining -= chunk.length;
+}
+
+function capSubagentResult(text: string, maxChars = MAX_SUBAGENT_RESULT_PREVIEW_CHARS): string {
+	if (text.length <= maxChars) return text;
+	return text.slice(0, maxChars);
+}
 
 /**
  * Extract the _text value from a truncated JSON preview string.
@@ -96,21 +111,86 @@ function extractTextFromPreview(preview: string): string {
 	const complete = preview.match(/"_text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
 	if (complete) {
 		try {
-			return JSON.parse(`"${complete[1]}"`);
+			return capSubagentResult(JSON.parse(`"${complete[1]}"`));
 		} catch {
-			return complete[1];
+			return capSubagentResult(complete[1]);
 		}
 	}
 	// Try truncated _text value (no closing quote — preview was cut mid-value)
 	const truncated = preview.match(/"_text"\s*:\s*"((?:[^"\\]|\\.)*)/);
 	if (truncated) {
 		try {
-			return JSON.parse(`"${truncated[1]}"`);
+			return capSubagentResult(JSON.parse(`"${truncated[1]}"`));
 		} catch {
-			return truncated[1];
+			return capSubagentResult(truncated[1]);
 		}
 	}
-	return preview;
+	return capSubagentResult(preview);
+}
+
+/**
+ * Build a bounded preview of a generic JSON-like value without first
+ * stringifying the whole object.
+ */
+function appendJsonPreview(
+	parts: string[],
+	value: unknown,
+	budget: { remaining: number },
+	seen: WeakSet<object>,
+	depth = 0,
+) {
+	if (budget.remaining <= 0) return;
+	if (
+		value === null ||
+		value === undefined ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	) {
+		appendLimited(parts, value === undefined ? "undefined" : JSON.stringify(value), budget);
+		return;
+	}
+	if (typeof value === "string") {
+		appendLimited(parts, JSON.stringify(capSubagentResult(value, budget.remaining)), budget);
+		return;
+	}
+	if (typeof value !== "object") {
+		appendLimited(parts, JSON.stringify(String(value)), budget);
+		return;
+	}
+	if (seen.has(value)) {
+		appendLimited(parts, '"[Circular]"', budget);
+		return;
+	}
+	seen.add(value);
+	if (Array.isArray(value)) {
+		appendLimited(parts, "[", budget);
+		for (let i = 0; i < value.length && budget.remaining > 0; i++) {
+			if (i > 0) appendLimited(parts, ", ", budget);
+			appendJsonPreview(parts, value[i], budget, seen, depth + 1);
+		}
+		appendLimited(parts, "]", budget);
+		return;
+	}
+	appendLimited(parts, "{", budget);
+	let index = 0;
+	for (const [key, child] of Object.entries(value)) {
+		if (budget.remaining <= 0) break;
+		appendLimited(
+			parts,
+			`${index > 0 ? "," : ""}\n${"\t".repeat(depth + 1)}${JSON.stringify(key)}: `,
+			budget,
+		);
+		appendJsonPreview(parts, child, budget, seen, depth + 1);
+		index++;
+	}
+	if (index > 0) appendLimited(parts, `\n${"\t".repeat(depth)}}`, budget);
+	else appendLimited(parts, "}", budget);
+}
+
+function stringifyJsonPreview(value: unknown): string {
+	const parts: string[] = [];
+	appendJsonPreview(parts, value, { remaining: MAX_SUBAGENT_RESULT_PREVIEW_CHARS }, new WeakSet());
+	return parts.join("");
 }
 
 /**
@@ -121,18 +201,23 @@ function extractTextFromPreview(preview: string): string {
 // biome-ignore lint/suspicious/noExplicitAny: outputJson is untyped
 function parseOutputJson(out: any): string {
 	if (!out) return "";
-	if (typeof out === "string") return out;
+	if (typeof out === "string") return capSubagentResult(out);
 	if (out._truncated && typeof out.preview === "string") {
 		return extractTextFromPreview(out.preview);
 	}
 	if (Array.isArray(out)) {
-		return out
-			.filter((b: ContentBlock) => b.text)
-			.map((b: ContentBlock) => b.text)
-			.join("\n");
+		const budget = { remaining: MAX_SUBAGENT_RESULT_PREVIEW_CHARS };
+		const parts: string[] = [];
+		for (const block of out as ContentBlock[]) {
+			if (budget.remaining <= 0) break;
+			if (!block.text) continue;
+			if (parts.length > 0) appendLimited(parts, "\n", budget);
+			appendLimited(parts, block.text, budget);
+		}
+		return parts.join("");
 	}
-	if (typeof out._text === "string") return out._text;
-	if (typeof out === "object") return JSON.stringify(out, null, 2);
+	if (typeof out._text === "string") return capSubagentResult(out._text);
+	if (typeof out === "object") return stringifyJsonPreview(out);
 	return "";
 }
 
@@ -184,12 +269,15 @@ export const SubagentCard = memo(
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
 		const prompt = input.prompt ?? "";
+		const promptPreview = capSubagentResult(prompt, MAX_SUBAGENT_PROMPT_INLINE_CHARS);
 		const promptHasLineBreak = prompt.includes("\n");
 		const promptShownInHeader = !input.description && !!prompt && !promptHasLineBreak;
-		const description =
-			input.description ??
-			(promptShownInHeader ? prompt : input.prompt?.slice(0, 80)) ??
-			"Subagent";
+		const rawDescription =
+			input.description ?? (promptShownInHeader ? prompt : prompt.slice(0, 80));
+		const description = capSubagentResult(
+			String(rawDescription ?? "Subagent"),
+			MAX_SUBAGENT_DESCRIPTION_CHARS,
+		);
 		const [showPrompt, setShowPrompt] = useState(false);
 		const [showCalls, setShowCalls] = useState(soleAndRunning);
 		const resolvedModel = childMessages[0]?.subagentModel ?? toolCall._resolvedModel ?? input.model;
@@ -757,7 +845,8 @@ export const SubagentCard = memo(
 										<LazyCollapse in={showPrompt}>
 											<Box mt={4}>
 												<ContentViewer
-													content={prompt}
+													content={promptPreview}
+													fullContent={prompt}
 													style={{
 														fontSize: 11,
 														maxHeight: 200,

@@ -10,6 +10,8 @@ interface MergeCheckResult {
 	isFastForward: boolean;
 }
 
+const MERGE_MODAL_QUERY_GC_TIME_MS = 60_000;
+
 interface ChapterMergeModalProps {
 	chapterId: string;
 	projectId: string;
@@ -36,6 +38,7 @@ export function ChapterMergeModal({
 		queryKey: ["project", projectId],
 		queryFn: () => api.getProject(projectId),
 		enabled: opened,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
 	});
 
 	const cs = project?.chapterSettings as Record<string, unknown> | null;
@@ -46,6 +49,7 @@ export function ChapterMergeModal({
 		queryKey: ["reviewConclusion", "source", chapterId],
 		queryFn: () => api.getReviewConclusionForSource(chapterId),
 		enabled: opened && requireReview,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
 	});
 
 	const reviewVerdict = reviewData?.conclusion?.verdict ?? null;
@@ -68,6 +72,7 @@ export function ChapterMergeModal({
 		queryKey: ["chapters", { projectId }],
 		queryFn: () => api.listChapters(projectId),
 		enabled: opened,
+		gcTime: MERGE_MODAL_QUERY_GC_TIME_MS,
 	});
 
 	const targetOptions = (chapters ?? [])

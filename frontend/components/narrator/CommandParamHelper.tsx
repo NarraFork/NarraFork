@@ -9,13 +9,26 @@ interface CommandParamHelperProps {
 	visible: boolean;
 }
 
+const MAX_COMMAND_ARG_PARSE_CHARS = 50_000;
+const MAX_COMMAND_PREVIEW_CHARS = 20_000;
+const MAX_COMMAND_PARAM_BADGES = 24;
+
+function capCommandPreview(text: string): string {
+	if (text.length <= MAX_COMMAND_PREVIEW_CHARS) return text;
+	return `${text.slice(0, MAX_COMMAND_PREVIEW_CHARS)}\n…`;
+}
+
 /** Parse positional args from user input based on command param definitions. */
 function parseArgs(
 	input: string,
 	params: CommandParam[],
 ): { args: Record<string, string>; currentIndex: number } {
 	const spaceIdx = input.indexOf(" ");
-	const argsStr = spaceIdx >= 0 ? input.slice(spaceIdx + 1) : "";
+	const rawArgsStr = spaceIdx >= 0 ? input.slice(spaceIdx + 1) : "";
+	const argsStr =
+		rawArgsStr.length > MAX_COMMAND_ARG_PARSE_CHARS
+			? rawArgsStr.slice(0, MAX_COMMAND_ARG_PARSE_CHARS)
+			: rawArgsStr;
 
 	if (!params.length) {
 		// Legacy {{input}} mode
@@ -54,7 +67,7 @@ function buildPreview(
 	} else if (result.includes("{{input}}")) {
 		result = result.replaceAll("{{input}}", args.input || "[input]");
 	}
-	return result;
+	return capCommandPreview(result);
 }
 
 export function CommandParamHelper({ command, input, visible }: CommandParamHelperProps) {
@@ -89,11 +102,17 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 
 	if (!shouldShow) return null;
 
-	const displayParams = hasParams
-		? params
-		: hasInputPlaceholder
-			? [{ name: "input", description: undefined } as CommandParam]
-			: [];
+	const displayParams = (
+		hasParams
+			? params
+			: hasInputPlaceholder
+				? [{ name: "input", description: undefined } as CommandParam]
+				: []
+	).slice(0, MAX_COMMAND_PARAM_BADGES);
+	const hiddenParamCount = Math.max(
+		0,
+		(hasParams ? params.length : displayParams.length) - displayParams.length,
+	);
 
 	return (
 		<Paper
@@ -171,6 +190,11 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 								</Badge>
 							);
 						})}
+						{hiddenParamCount > 0 && (
+							<Badge size="sm" variant="outline" color="gray">
+								+{hiddenParamCount}
+							</Badge>
+						)}
 					</Group>
 				)}
 			</Stack>

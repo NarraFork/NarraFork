@@ -18,9 +18,12 @@ import {
 	buildCodexUsageForecast,
 	buildCodexUsageSummary,
 	CODEX_DISPLAY_PLAN_TIERS,
+	CODEX_USAGE_FORECAST_HISTORY_MS,
 	type CodexPlanTier,
 	type CodexUsageForecast,
+	type CodexUsageHistoryEntry,
 	type CodexUsageSummary,
+	createCodexUsageHistoryEntry,
 	getScheduledUsageResetAt,
 	normalizeCodexPlanTier,
 } from "./codex-usage-summary";
@@ -40,6 +43,9 @@ const USAGE_RESET_REFRESH_GRACE_MS = 1_000;
 const USAGE_RESET_RETRY_DELAY_MS = 5 * 60_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const QUOTA_OVERVIEW_BROADCAST_DEBOUNCE_MS = 100;
+const USAGE_HISTORY_RETENTION_MS = CODEX_USAGE_FORECAST_HISTORY_MS * 2;
+const MAX_USAGE_HISTORY_ENTRIES_PER_CREDENTIAL = 240;
+const USAGE_HISTORY_DEDUPE_WINDOW_MS = 60_000;
 
 // === Types ===
 
@@ -76,6 +82,8 @@ export interface CodexCredential {
 	quotaResetsAt?: number;
 	/** Cached usage snapshot persisted with credential. */
 	usage?: CodexUsageResult;
+	/** Rolling usage snapshots used to extend quota forecasts into the recent past. */
+	usageHistory?: CodexUsageHistoryEntry[];
 }
 
 export interface CredentialStats {
@@ -151,6 +159,7 @@ export interface PublicCodexQuotaOverview {
 	totalAccountEquivalents: number;
 	segments: PublicCodexQuotaSegment[];
 	forecast: {
+		generatedAt: string;
 		points: PublicCodexQuotaForecastPoint[];
 		types: PublicCodexPlanTier[];
 	};
@@ -771,6 +780,7 @@ export class CodexManager {
 			totalAccountEquivalents,
 			segments,
 			forecast: {
+				generatedAt: forecast.generatedAt,
 				points,
 				types: visibleTiers,
 			},
@@ -1162,6 +1172,37 @@ export class CodexManager {
 		return true;
 	}
 
+	private recordUsageHistory(
+		entry: CodexCredential,
+		usage: CodexUsageResult,
+		now = Date.now(),
+	): void {
+		const snapshot = createCodexUsageHistoryEntry(usage);
+		if (!snapshot) return;
+
+		const minTimestamp = now - USAGE_HISTORY_RETENTION_MS;
+		const history = (entry.usageHistory ?? [])
+			.filter(
+				(item): item is CodexUsageHistoryEntry =>
+					!!item &&
+					Number.isFinite(item.timestamp) &&
+					Number.isFinite(item.remainingPercent) &&
+					item.timestamp >= minTimestamp,
+			)
+			.sort((a, b) => a.timestamp - b.timestamp);
+		const last = history[history.length - 1];
+		if (last && Math.abs(last.timestamp - snapshot.timestamp) <= USAGE_HISTORY_DEDUPE_WINDOW_MS) {
+			history[history.length - 1] = snapshot;
+		} else {
+			history.push(snapshot);
+		}
+
+		while (history.length > MAX_USAGE_HISTORY_ENTRIES_PER_CREDENTIAL) {
+			history.shift();
+		}
+		entry.usageHistory = history;
+	}
+
 	private async refreshUsage(id: string): Promise<CodexUsageResult> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
@@ -1193,6 +1234,7 @@ export class CodexManager {
 
 		const usage = await fetchCodexUsage(entry.accessToken, entry.accountId, proxy);
 		entry.usage = usage;
+		this.recordUsageHistory(entry, usage);
 		this.saveCredentials();
 
 		const quotaState = this.evaluateQuotaFromUsage(usage);

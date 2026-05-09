@@ -743,14 +743,19 @@ export async function processEvent(
 				// Save base64 image to filesystem. If saving fails, keep the raw result
 				// in the persisted block so the UI/history replay can still recover it.
 				let savedPath: string | undefined;
+				let imageWidth: number | undefined;
+				let imageHeight: number | undefined;
 				let shouldPersistInlineResult = false;
 				if (block.result) {
 					try {
-						savedPath = await saveImageGenerationResult(
+						const saved = await saveImageGenerationResult(
 							ctx.conversationId ?? "unknown",
 							block.id,
 							block.result,
 						);
+						savedPath = saved.filePath;
+						imageWidth = saved.width;
+						imageHeight = saved.height;
 					} catch (err) {
 						shouldPersistInlineResult = true;
 						logger.warn("Failed to save generated image to disk", {
@@ -765,6 +770,9 @@ export async function processEvent(
 					revisedPrompt: block.revisedPrompt,
 					outputIndex: block.outputIndex,
 					...(savedPath ? { savedPath } : {}),
+					...(imageWidth != null && imageHeight != null
+						? { width: imageWidth, height: imageHeight }
+						: {}),
 					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
 				});
 			}

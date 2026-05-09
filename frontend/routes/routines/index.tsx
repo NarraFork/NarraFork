@@ -80,6 +80,8 @@ export const Route = createFileRoute("/routines/")({
 	component: RoutinesPage,
 });
 
+const ROUTINES_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+
 // === Helpers ===
 
 function getSourceLabel(location: string): string {
@@ -94,6 +96,30 @@ function getSourceColor(source: string): string {
 	if (source === ".claude") return "violet";
 	if (source === ".agents") return "teal";
 	return "gray";
+}
+
+const MAX_SKILL_FILE_PREVIEW_ITEMS = 50;
+const MAX_SKILL_FILE_PREVIEW_CHARS = 2_000;
+const MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS = 1_000;
+const MAX_ROUTINE_DETAIL_TEXT_PREVIEW_CHARS = 4_000;
+
+function formatRoutineTextPreview(value: string | undefined, maxChars: number): string {
+	if (!value) return "";
+	return value.length > maxChars ? `${value.slice(0, maxChars)}…` : value;
+}
+
+function formatSkillFilesPreview(files: string[]): string {
+	let text = "";
+	let hidden = Math.max(0, files.length - MAX_SKILL_FILE_PREVIEW_ITEMS);
+	for (const file of files.slice(0, MAX_SKILL_FILE_PREVIEW_ITEMS)) {
+		const prefix = text ? ", " : "";
+		if (text.length + prefix.length + file.length > MAX_SKILL_FILE_PREVIEW_CHARS) {
+			hidden += 1;
+			break;
+		}
+		text += `${prefix}${file}`;
+	}
+	return hidden > 0 ? `${text}, … (+${hidden})` : text;
 }
 
 // === Skill type for list items ===
@@ -201,7 +227,10 @@ function OptionalToolsTab() {
 								</Badge>
 							</Group>
 							<Text size="xs" c="dimmed">
-								{isZh ? routine.descriptionZh : routine.descriptionEn}
+								{formatRoutineTextPreview(
+									isZh ? routine.descriptionZh : routine.descriptionEn,
+									MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+								)}
 							</Text>
 						</div>
 						<Switch
@@ -729,7 +758,7 @@ function GlobalSkillsTab() {
 									)}
 								</Group>
 								<Text size="xs" c="dimmed" truncate="end">
-									{skill.description}
+									{formatRoutineTextPreview(skill.description, MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS)}
 								</Text>
 							</div>
 							<Group gap={4}>
@@ -842,14 +871,17 @@ function GlobalSkillsTab() {
 				{viewTarget && (
 					<Stack>
 						<Text size="sm" c="dimmed">
-							{viewTarget.description}
+							{formatRoutineTextPreview(
+								viewTarget.description,
+								MAX_ROUTINE_DETAIL_TEXT_PREVIEW_CHARS,
+							)}
 						</Text>
 						<Text size="xs" c="dimmed">
 							{t("skillLocation")}: {viewTarget.location}
 						</Text>
 						{viewTarget.files.length > 0 && (
 							<Text size="xs" c="dimmed">
-								Files: {viewTarget.files.join(", ")}
+								Files: {formatSkillFilesPreview(viewTarget.files)}
 							</Text>
 						)}
 					</Stack>
@@ -999,6 +1031,7 @@ function DefaultSystemPromptTab() {
 	const { data: settings, isLoading } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: ROUTINES_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const qc = useQueryClient();
 	const updateMutation = useMutation({
@@ -1234,7 +1267,10 @@ function CustomSubagentsTab() {
 								</Badge>
 							</Group>
 							<Text size="xs" c="dimmed" truncate="end">
-								{sa.description || sa.prompt.slice(0, 80)}
+								{formatRoutineTextPreview(
+									sa.description || sa.prompt,
+									MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+								)}
 							</Text>
 						</div>
 						<Group gap={4}>
@@ -1443,8 +1479,9 @@ function ProjectSkillsTab() {
 								)}
 							</Group>
 							<Text size="xs" c="dimmed" truncate="end">
-								{skill.description}
+								{formatRoutineTextPreview(skill.description, MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS)}
 							</Text>
+
 							<Text size="xs" c="dimmed" truncate="end" mt={2}>
 								{skill.location}
 							</Text>
@@ -1806,7 +1843,10 @@ function McpToolsTab() {
 														</Text>
 														{tool.description && (
 															<Text size="xs" c="dimmed" lineClamp={1}>
-																{tool.description}
+																{formatRoutineTextPreview(
+																	tool.description,
+																	MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS,
+																)}
 															</Text>
 														)}
 													</div>
@@ -1860,7 +1900,10 @@ function McpToolsTab() {
 							</Text>
 							{tool.description && (
 								<Text size="xs" c="dimmed">
-									{tool.description}
+									{formatRoutineTextPreview(
+										tool.description,
+										MAX_ROUTINE_DETAIL_TEXT_PREVIEW_CHARS,
+									)}
 								</Text>
 							)}
 						</Paper>

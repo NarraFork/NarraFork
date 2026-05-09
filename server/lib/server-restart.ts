@@ -1,4 +1,7 @@
 import { randomBytes } from "node:crypto";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { logger } from "./logger";
 
 /**
@@ -34,10 +37,14 @@ type GracefulShutdownFn = (request: GracefulShutdownRequest) => Promise<Graceful
 type GracefulRestartSession = {
 	token: string;
 	url: string;
+	markerPath: string;
+	markerNonce: string;
 	createdAt: number;
 	state: "pending" | "shutting_down" | "completed";
 	shutdownPromise?: Promise<GracefulShutdownResult>;
 };
+
+const RESTART_HANDOFF_DIR = resolve(homedir(), ".narrafork", "restart-handoff");
 
 let _restartFn: RestartFn | null = null;
 let _runtimeAddressGetter: RuntimeAddressGetter | null = null;
@@ -93,6 +100,37 @@ function buildGracefulShutdownUrl(address: RuntimeAddress): string {
 	return `${address.protocol}://${host}:${address.port}/api/gracefully_shutdown`;
 }
 
+function markerPathForNonce(nonce: string): string {
+	return resolve(RESTART_HANDOFF_DIR, `${Date.now()}-${nonce.slice(0, 12)}.json`);
+}
+
+function writeGracefulRestartMarker(
+	session: GracefulRestartSession,
+	result: GracefulShutdownResult,
+): void {
+	try {
+		mkdirSync(RESTART_HANDOFF_DIR, { recursive: true });
+		const tempPath = `${session.markerPath}.tmp`;
+		writeFileSync(
+			tempPath,
+			JSON.stringify({
+				nonce: session.markerNonce,
+				pid: result.pid,
+				reason: result.reason,
+				durationMs: result.durationMs,
+				ts: new Date().toISOString(),
+			}),
+		);
+		renameSync(tempPath, session.markerPath);
+		logger.info("Graceful restart marker written", { markerPath: session.markerPath });
+	} catch (err) {
+		logger.error("Failed to write graceful restart marker", {
+			markerPath: session.markerPath,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 /**
  * Mark that this server is intentionally starting a replacement process.
  * Until this is called, /api/gracefully_shutdown will always reject requests.
@@ -101,16 +139,21 @@ export function beginGracefulRestartSession(): GracefulRestartSession {
 	if (!_runtimeAddressGetter) {
 		throw new Error("Runtime address getter is not registered");
 	}
+	mkdirSync(RESTART_HANDOFF_DIR, { recursive: true });
 	const address = _runtimeAddressGetter();
+	const markerNonce = randomToken();
 	const session: GracefulRestartSession = {
 		token: randomToken(),
 		url: buildGracefulShutdownUrl(address),
+		markerPath: markerPathForNonce(markerNonce),
+		markerNonce,
 		createdAt: Date.now(),
 		state: "pending",
 	};
 	_gracefulRestartSession = session;
 	logger.info("Graceful restart handoff session started", {
 		url: session.url,
+		markerPath: session.markerPath,
 		createdAt: session.createdAt,
 	});
 	return session;
@@ -118,6 +161,12 @@ export function beginGracefulRestartSession(): GracefulRestartSession {
 
 /** Cancel the pending restart session if spawning the replacement failed. */
 export function cancelGracefulRestartSession(): void {
+	const session = _gracefulRestartSession;
+	if (session) {
+		try {
+			unlinkSync(session.markerPath);
+		} catch {}
+	}
 	_gracefulRestartSession = null;
 }
 
@@ -155,6 +204,7 @@ export async function handleGracefullyShutdownRequest(
 			session.state = "shutting_down";
 			session.shutdownPromise = _gracefulShutdownFn(request).then((result) => {
 				session.state = "completed";
+				writeGracefulRestartMarker(session, result);
 				return result;
 			});
 		}

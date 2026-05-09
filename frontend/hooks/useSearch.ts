@@ -21,6 +21,8 @@ export function useSearch(
 			queryKey: ["search", debouncedQuery, entities],
 			queryFn: () => api.search(debouncedQuery, entities),
 			enabled: debouncedQuery.length >= 3 || (isShortQuery && forceSearch),
+			staleTime: 30_000,
+			gcTime: 60_000,
 		}),
 		isShortQuery,
 	};

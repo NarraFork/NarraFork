@@ -17,6 +17,8 @@ const fallbackCodeStyle: CSSProperties = {
 	overflowWrap: "break-word",
 };
 
+const MAX_MARKDOWN_CODE_RENDER_CHARS = 80_000;
+
 interface MarkdownCodeBlockProps {
 	language: string;
 	children: ReactNode;
@@ -28,6 +30,10 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 }: MarkdownCodeBlockProps) {
 	const { t } = useTranslation("common");
 	const code = extractText(children).replace(/\n$/, "");
+	const displayCode =
+		code.length > MAX_MARKDOWN_CODE_RENDER_CHARS
+			? `${code.slice(0, MAX_MARKDOWN_CODE_RENDER_CHARS)}\n\n${t("contentViewerTruncated")}`
+			: code;
 
 	const hasLang = language && language !== "text";
 	const className = hasLang
@@ -63,11 +69,15 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 			<Suspense
 				fallback={
 					<Code block fz="xs" style={fallbackCodeStyle}>
-						{code}
+						{displayCode}
 					</Code>
 				}
 			>
-				<HighlightedCode code={code} lang={language} style={{ maxWidth: "100%", border: "none" }} />
+				<HighlightedCode
+					code={displayCode}
+					lang={language}
+					style={{ maxWidth: "100%", border: "none" }}
+				/>
 			</Suspense>
 		</div>
 	);

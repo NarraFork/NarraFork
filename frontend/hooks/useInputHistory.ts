@@ -1,6 +1,8 @@
 import { useCallback, useRef, useSyncExternalStore } from "react";
 
 const MAX_HISTORY = 50;
+const MAX_HISTORY_MESSAGE_CHARS = 20_000;
+const MAX_HISTORY_STORAGE_CHARS = 512_000;
 
 /**
  * 消息输入历史记录 hook。
@@ -29,7 +31,17 @@ export function useInputHistory(storageKey: string) {
 	const getHistory = useCallback((): string[] => {
 		try {
 			const raw = sessionStorage.getItem(storageKey);
-			return raw ? JSON.parse(raw) : [];
+			if (!raw) return [];
+			if (raw.length > MAX_HISTORY_STORAGE_CHARS) {
+				sessionStorage.removeItem(storageKey);
+				return [];
+			}
+			const parsed: unknown = JSON.parse(raw);
+			if (!Array.isArray(parsed)) return [];
+			return parsed
+				.filter((item): item is string => typeof item === "string")
+				.filter((item) => item.length <= MAX_HISTORY_MESSAGE_CHARS)
+				.slice(0, MAX_HISTORY);
 		} catch {
 			return [];
 		}
@@ -37,7 +49,11 @@ export function useInputHistory(storageKey: string) {
 
 	const setHistory = useCallback(
 		(history: string[]) => {
-			sessionStorage.setItem(storageKey, JSON.stringify(history));
+			try {
+				sessionStorage.setItem(storageKey, JSON.stringify(history.slice(0, MAX_HISTORY)));
+			} catch {
+				// Ignore storage quota/private mode errors. Chat content itself is already persisted server-side.
+			}
 		},
 		[storageKey],
 	);
@@ -47,6 +63,11 @@ export function useInputHistory(storageKey: string) {
 		(message: string) => {
 			const trimmed = message.trim();
 			if (!trimmed) return;
+			if (trimmed.length > MAX_HISTORY_MESSAGE_CHARS) {
+				indexRef.current = -1;
+				notify();
+				return;
+			}
 			const history = getHistory();
 			// 去重：如果最近一条相同则不重复添加
 			if (history[0] === trimmed) {

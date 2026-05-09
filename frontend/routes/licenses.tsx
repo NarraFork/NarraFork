@@ -27,6 +27,7 @@ export const Route = createFileRoute("/licenses")({
 });
 
 const licenses = __LICENSE_DATA__;
+const MAX_LICENSE_TEXT_CHARS = 120_000;
 
 function LicensesPage() {
 	const { t } = useTranslation("common");
@@ -93,9 +94,11 @@ function DepName({ dep }: { dep: LicenseEntry }) {
 }
 
 function LicenseTextBlock({ text }: { text: string }) {
+	const displayText =
+		text.length > MAX_LICENSE_TEXT_CHARS ? `${text.slice(0, MAX_LICENSE_TEXT_CHARS)}\n…` : text;
 	return (
 		<Code block style={{ whiteSpace: "pre-wrap", maxHeight: 300, overflow: "auto" }}>
-			{text}
+			{displayText}
 		</Code>
 	);
 }
@@ -146,9 +149,11 @@ function LicenseCards({ entries }: { entries: LicenseEntry[] }) {
 									</Group>
 								</UnstyledButton>
 								<Collapse in={isOpen}>
-									<Box mt="xs">
-										<LicenseTextBlock text={dep.licenseText} />
-									</Box>
+									{isOpen && (
+										<Box mt="xs">
+											<LicenseTextBlock text={dep.licenseText} />
+										</Box>
+									)}
 								</Collapse>
 							</>
 						)}

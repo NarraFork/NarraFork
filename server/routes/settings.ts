@@ -243,6 +243,7 @@ const updateSettingsSchema = z
 						}),
 					})
 					.optional(),
+				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),

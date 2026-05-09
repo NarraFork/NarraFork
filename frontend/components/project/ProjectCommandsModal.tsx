@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { type CommandDef, CommandsEditor } from "../common/CommandsEditor";
 
+const PROJECT_COMMANDS_QUERY_GC_TIME_MS = 60_000;
+
 interface ProjectCommandsModalProps {
 	projectId: string;
 	opened: boolean;
@@ -18,6 +20,7 @@ export function ProjectCommandsModal({ projectId, opened, onClose }: ProjectComm
 		queryKey: ["project", projectId],
 		queryFn: () => api.getProject(projectId),
 		enabled: opened,
+		gcTime: PROJECT_COMMANDS_QUERY_GC_TIME_MS,
 	});
 
 	const updateProject = useMutation({

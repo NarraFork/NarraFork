@@ -24,6 +24,14 @@ import {
 
 const linkStyle = { textDecoration: "none", color: "inherit" } as const;
 const MAX_VISIBLE_RESULTS = 200;
+const MAX_SEARCH_TITLE_CHARS = 500;
+const MAX_SEARCH_SNIPPET_CHARS = 2_000;
+const MAX_SEARCH_META_CHARS = 500;
+
+function clampSearchText(value: string | undefined, maxChars: number): string | undefined {
+	if (!value) return value;
+	return value.length > maxChars ? value.slice(0, maxChars) : value;
+}
 
 function humanizeEnumValue(value: string): string {
 	const normalized = value.replace(/[_-]+/g, " ").trim();
@@ -136,7 +144,15 @@ function SearchPage() {
 				result,
 				key: `${result.type}-${result.id}`,
 				link: getResultLink(result),
-				title: getSearchResultDisplayTitle(result, (id) => t("resultUntitled", { id })),
+				title:
+					clampSearchText(
+						getSearchResultDisplayTitle(result, (id) => t("resultUntitled", { id })),
+						MAX_SEARCH_TITLE_CHARS,
+					) ?? "",
+				snippet: clampSearchText(result.snippet, MAX_SEARCH_SNIPPET_CHARS),
+				projectName: clampSearchText(result.projectName, MAX_SEARCH_META_CHARS),
+				chapterTitle: clampSearchText(result.chapterTitle, MAX_SEARCH_META_CHARS),
+				narratorTitle: clampSearchText(result.narratorTitle, MAX_SEARCH_META_CHARS),
 				timestamp: result.updatedAt ?? result.createdAt ?? result.lastMessageAt,
 			})),
 		[displayedResults, t],
@@ -227,76 +243,94 @@ function SearchPage() {
 							</Text>
 						</Alert>
 					)}
-					{displayedResultEntries.map(({ result, key, link, title, timestamp }) => {
-						const card = (
-							<Card
-								key={key}
-								shadow="sm"
-								padding="md"
-								withBorder
-								style={{ textDecoration: "none", cursor: link ? "pointer" : undefined }}
-							>
-								<Group gap="xs" mb={6} justify="space-between" wrap="nowrap">
-									<Group gap="xs" style={{ minWidth: 0 }}>
-										<Badge
-											size="xs"
-											color={
-												result.type === "chapter"
-													? "blue"
-													: result.type === "narrator"
-														? "indigo"
-														: "grape"
-											}
-										>
-											{t(`label_${result.type}`)}
+					{displayedResultEntries.map(
+						({
+							result,
+							key,
+							link,
+							title,
+							snippet,
+							projectName,
+							chapterTitle,
+							narratorTitle,
+							timestamp,
+						}) => {
+							const card = (
+								<Card
+									key={key}
+									shadow="sm"
+									padding="md"
+									withBorder
+									style={{ textDecoration: "none", cursor: link ? "pointer" : undefined }}
+								>
+									<Group gap="xs" mb={6} justify="space-between" wrap="nowrap">
+										<Group gap="xs" style={{ minWidth: 0 }}>
+											<Badge
+												size="xs"
+												color={
+													result.type === "chapter"
+														? "blue"
+														: result.type === "narrator"
+															? "indigo"
+															: "grape"
+												}
+											>
+												{t(`label_${result.type}`)}
+											</Badge>
+											<Text fw={500} truncate>
+												{highlightSearchText(title, q ?? "")}
+											</Text>
+										</Group>
+										<Badge size="xs" variant="light" color="gray">
+											{t("score", { score: result.matchScore ?? 0 })}
 										</Badge>
-										<Text fw={500} truncate>
-											{highlightSearchText(title, q ?? "")}
-										</Text>
 									</Group>
-									<Badge size="xs" variant="light" color="gray">
-										{t("score", { score: result.matchScore ?? 0 })}
-									</Badge>
-								</Group>
-								<Text size="sm" c="dimmed" lineClamp={3} mb={8}>
-									{highlightSearchText(result.snippet ?? "", q ?? "")}
-								</Text>
-								<Group gap={6} wrap="wrap">
-									{result.projectName && <Badge variant="outline">{result.projectName}</Badge>}
-									{result.chapterTitle && <Badge variant="light">{result.chapterTitle}</Badge>}
-									{result.narratorTitle && <Badge variant="light">{result.narratorTitle}</Badge>}
-									{result.status && (
-										<Badge variant="dot">
-											{translateSearchEnum(`status_${result.type}`, result.status)}
-										</Badge>
-									)}
-									{result.messageRole && (
-										<Badge variant="dot">
-											{translateSearchEnum("messageRole", result.messageRole)}
-										</Badge>
-									)}
-									{result.matchField && (
-										<Badge variant="outline">
-											{t("matchField", {
-												field: translateSearchEnum("matchField", result.matchField),
-											})}
-										</Badge>
-									)}
-									{timestamp && (
-										<Text size="xs" c="dimmed">
-											{formatSmartTime(timestamp)}
-										</Text>
-									)}
-								</Group>
-							</Card>
-						);
-						if (!link) return card;
-						return (
-							<Link key={key} to={link.to} params={link.params} hash={link.hash} style={linkStyle}>
-								{card}
-							</Link>
-						);
-					})}
+									<Text size="sm" c="dimmed" lineClamp={3} mb={8}>
+										{highlightSearchText(snippet ?? "", q ?? "")}
+									</Text>
+									<Group gap={6} wrap="wrap">
+										{projectName && <Badge variant="outline">{projectName}</Badge>}
+										{chapterTitle && <Badge variant="light">{chapterTitle}</Badge>}
+										{narratorTitle && <Badge variant="light">{narratorTitle}</Badge>}
+										{result.status && (
+											<Badge variant="dot">
+												{translateSearchEnum(`status_${result.type}`, result.status)}
+											</Badge>
+										)}
+										{result.messageRole && (
+											<Badge variant="dot">
+												{translateSearchEnum("messageRole", result.messageRole)}
+											</Badge>
+										)}
+										{result.matchField && (
+											<Badge variant="outline">
+												{t("matchField", {
+													field: translateSearchEnum("matchField", result.matchField),
+												})}
+											</Badge>
+										)}
+										{timestamp && (
+											<Text size="xs" c="dimmed">
+												{formatSmartTime(timestamp)}
+											</Text>
+										)}
+									</Group>
+								</Card>
+							);
+							if (!link) return card;
+							return (
+								<Link
+									key={key}
+									to={link.to}
+									params={link.params}
+									hash={link.hash}
+									style={linkStyle}
+								>
+									{card}
+								</Link>
+							);
+						},
+					)}
 				</Stack>
 			)}
 		</Stack>

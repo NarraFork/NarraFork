@@ -14,6 +14,7 @@ import {
 	type ToolCategory,
 	type ToolDisplayColor,
 } from "../tool-display";
+import { MAX_INLINE_IMAGE_RESULT_CHARS } from "./pixi-image-textures";
 
 export type PixiMessageItemKind = "message" | "tool-run" | "divider" | "action";
 
@@ -513,15 +514,18 @@ function messageBlocks(
 			const status = typeof block.status === "string" ? block.status : undefined;
 			const savedPath = typeof block.savedPath === "string" ? block.savedPath : undefined;
 			const resultBase64 = typeof block.result === "string" ? block.result : undefined;
+			const inlineResultTooLarge =
+				!savedPath && !!resultBase64 && resultBase64.length > MAX_INLINE_IMAGE_RESULT_CHARS;
 			result.push({
 				type,
 				label: "Image generation",
 				text: revisedPrompt ?? status ?? "Generated image",
 				color: "grape",
-				imageSrc: resultBase64,
+				// savedPath is preferred by the texture/copy path; avoid retaining huge inline base64.
+				imageSrc: !savedPath && resultBase64 && !inlineResultTooLarge ? resultBase64 : undefined,
 				imageSavedPath: savedPath,
 				imageAlt: revisedPrompt ?? "Generated image",
-				imageStatus: status,
+				imageStatus: inlineResultTooLarge ? "too_large" : status,
 			});
 			continue;
 		}

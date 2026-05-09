@@ -31,10 +31,58 @@ export interface RecentTab {
 	// Runtime-enriched fields (not persisted to DB)
 	activeTerminalCount?: number;
 	viewers?: RecentTabViewer[];
+	viewerCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
+	/** Runtime-enriched marker: this narrator has unsent draft text. */
+	hasDraft?: boolean;
 }
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
+const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
+const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
+const RECENT_TAB_VIEWERS_MAX = 20;
+
+export function clampRecentTabText(value: string | undefined): string | undefined {
+	if (!value) return value;
+	return value.length > RECENT_TAB_TEXT_MAX_CHARS
+		? value.slice(0, RECENT_TAB_TEXT_MAX_CHARS)
+		: value;
+}
+
+export function normalizeRecentTabViewers(viewers: RecentTabViewer[] | undefined): {
+	viewers: RecentTabViewer[] | undefined;
+	viewerCount: number | undefined;
+} {
+	if (!viewers) return { viewers, viewerCount: undefined };
+	return {
+		viewers: viewers.slice(0, RECENT_TAB_VIEWERS_MAX).map((viewer) => ({
+			...viewer,
+			username: clampRecentTabText(viewer.username) ?? "",
+		})),
+		viewerCount: viewers.length,
+	};
+}
+
+export function normalizeRecentTab(tab: RecentTab): RecentTab {
+	const title = clampRecentTabText(tab.title) ?? "";
+	const subtitle = clampRecentTabText(tab.subtitle);
+	const normalizedViewers = normalizeRecentTabViewers(tab.viewers);
+	if (
+		title === tab.title &&
+		subtitle === tab.subtitle &&
+		normalizedViewers.viewers === tab.viewers &&
+		normalizedViewers.viewerCount === tab.viewerCount
+	) {
+		return tab;
+	}
+	return {
+		...tab,
+		title,
+		subtitle,
+		viewers: normalizedViewers.viewers,
+		viewerCount: normalizedViewers.viewerCount,
+	};
+}
 
 /** Target types accepted by the server API */
 export type RecentTabApiMoveTarget = { toIndex: number } | { position: "top" | "above_idle" };
@@ -153,9 +201,10 @@ export function useRecentTabs() {
 		queryKey: RECENT_TABS_QUERY_KEY,
 		queryFn: async () => {
 			const prefs = await api.getUserPreferences();
-			return (prefs.recentTabs ?? []) as RecentTab[];
+			return ((prefs.recentTabs ?? []) as RecentTab[]).map(normalizeRecentTab);
 		},
 		staleTime: 60_000,
+		gcTime: RECENT_TABS_QUERY_GC_TIME_MS,
 	});
 
 	// --- Remove a single tab (optimistic) ---
@@ -353,7 +402,7 @@ export function addRecentTab(
 	tab: Omit<RecentTab, "lastVisitedAt"> & { lastVisitedAt?: number; updateOnly?: boolean },
 ) {
 	const { updateOnly: explicitUpdateOnly, ...rest } = tab;
-	const entry = { ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() };
+	const entry = normalizeRecentTab({ ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() });
 
 	// Auto-detect: if updateOnly is not explicitly set, check if tab already exists
 	let updateOnly = explicitUpdateOnly;
@@ -377,13 +426,16 @@ export function updateRecentTabLocal(
 	id: string,
 	patch: Partial<Pick<RecentTab, "title" | "subtitle" | "status">>,
 ) {
+	const normalizedPatch = { ...patch };
+	if ("title" in patch) normalizedPatch.title = clampRecentTabText(patch.title);
+	if ("subtitle" in patch) normalizedPatch.subtitle = clampRecentTabText(patch.subtitle);
 	globalQC.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (prev) => {
 		if (!prev) return prev;
 		let changed = false;
 		const next = prev.map((t) => {
 			if (t.type === type && t.id === id) {
 				changed = true;
-				return { ...t, ...patch };
+				return { ...t, ...normalizedPatch };
 			}
 			return t;
 		});

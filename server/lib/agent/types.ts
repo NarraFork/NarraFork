@@ -219,7 +219,7 @@ export type AgentEvent =
 	| { type: "sidecars"; sideCars: AgentSideCar[] }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "error"; message: string }
-	| { type: "retryable_error"; message: string }
+	| { type: "retryable_error"; message: string; code?: string; bypassRetryLimit?: boolean }
 	| {
 			type: "retrying";
 			message: string;
@@ -367,6 +367,8 @@ export type ContentBlock =
 			revisedPrompt?: string;
 			result?: string;
 			outputIndex?: number;
+			width?: number;
+			height?: number;
 	  };
 
 // === Plan mode constants ===
@@ -425,6 +427,8 @@ export interface AgentConfig {
 	previousPermissionMode?: string;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;
+	/** Effective per-session/global value for ExitPlanMode reflection auto-approval. */
+	planReflectionAutoApprove?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */

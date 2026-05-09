@@ -37,6 +37,7 @@ import {
 	IconGitBranch,
 	IconMessageCircle,
 	IconMessageCircleFilled,
+	IconPencil,
 	IconPin,
 	IconPinnedOff,
 	IconPlus,
@@ -54,6 +55,9 @@ import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
 	applyRecentTabMove,
+	clampRecentTabText,
+	normalizeRecentTab,
+	normalizeRecentTabViewers,
 	type RecentTab,
 	type RecentTabViewer,
 	useRecentTabs,
@@ -189,18 +193,29 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			const patch: Partial<
 				Pick<
 					RecentTab,
-					"title" | "status" | "substatus" | "viewers" | "activeTerminalCount" | "containerStatus"
+					| "title"
+					| "status"
+					| "substatus"
+					| "viewers"
+					| "viewerCount"
+					| "activeTerminalCount"
+					| "containerStatus"
+					| "hasDraft"
 				>
 			> = {};
-			if (event.type === "title" && event.title) patch.title = event.title;
+			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
 			else if (event.type === "status") {
 				if (event.status) patch.status = event.status;
 				if (event.substatus !== undefined) patch.substatus = event.substatus;
 				if (!patch.status && !patch.substatus) return;
-			} else if (event.type === "presence" && event.viewers) patch.viewers = event.viewers;
-			else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined)
+			} else if (event.type === "presence" && event.viewers) {
+				const normalizedViewers = normalizeRecentTabViewers(event.viewers);
+				patch.viewers = normalizedViewers.viewers;
+				patch.viewerCount = normalizedViewers.viewerCount;
+			} else if (event.type === "terminalCount" && event.activeTerminalCount !== undefined)
 				patch.activeTerminalCount = event.activeTerminalCount;
 			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
+			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
 			else return;
 
 			// Trigger client-side notifications for done(unread)/waiting
@@ -255,7 +270,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				if (revision > 0 && revision < lastRevisionRef.current) return;
 				lastRevisionRef.current = revision || Date.now();
 
-				const serverTabs = event.tabs as RecentTab[];
+				const serverTabs = (event.tabs as RecentTab[]).map(normalizeRecentTab);
 
 				// If the current page's tab was removed, navigate to dashboard
 				const currentPath = pathnameRef.current;
@@ -270,12 +285,16 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					// Merge: server owns structure + order, preserve local runtime fields
 					const runtimeMap = new Map<
 						string,
-						Pick<RecentTab, "status" | "viewers" | "activeTerminalCount" | "containerStatus">
+						Pick<
+							RecentTab,
+							"status" | "viewers" | "viewerCount" | "activeTerminalCount" | "containerStatus"
+						>
 					>();
 					for (const t of prev) {
 						runtimeMap.set(`${t.type}:${t.id}`, {
 							status: t.status,
 							viewers: t.viewers,
+							viewerCount: t.viewerCount,
 							activeTerminalCount: t.activeTerminalCount,
 							containerStatus: t.containerStatus,
 						});
@@ -1034,18 +1053,49 @@ function TabIcon({
 	iconColor?: string;
 	filledStatus: boolean;
 }) {
-	if (tab.type === "project") return <IconFolder size={size} />;
-	if (tab.type === "workspace") return <IconColumns size={size} />;
-	if (tab.type === "chapter")
-		return (
+	let icon: React.ReactNode;
+	if (tab.type === "project") icon = <IconFolder size={size} />;
+	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
+	else if (tab.type === "chapter") {
+		icon = (
 			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
 		);
-	if (tab.type === "subagent") return <IconRobot size={size} color={iconColor} />;
-	// narrator
-	return filledStatus ? (
-		<IconMessageCircleFilled size={size} color={iconColor} />
-	) : (
-		<IconMessageCircle size={size} color={iconColor} />
+	} else if (tab.type === "subagent") icon = <IconRobot size={size} color={iconColor} />;
+	else {
+		icon = filledStatus ? (
+			<IconMessageCircleFilled size={size} color={iconColor} />
+		) : (
+			<IconMessageCircle size={size} color={iconColor} />
+		);
+	}
+
+	const canShowDraft = tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
+	if (!tab.hasDraft || !canShowDraft) return icon;
+
+	return (
+		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
+			{icon}
+			<Box
+				component="span"
+				style={{
+					position: "absolute",
+					right: -4,
+					top: -4,
+					width: 11,
+					height: 11,
+					borderRadius: "50%",
+					background: "var(--mantine-color-yellow-6)",
+					border: "1px solid var(--mantine-color-body)",
+					display: "inline-flex",
+					alignItems: "center",
+					justifyContent: "center",
+					color: "var(--mantine-color-dark-9)",
+					pointerEvents: "none",
+				}}
+			>
+				<IconPencil size={7} stroke={2.5} />
+			</Box>
+		</Box>
 	);
 }
 
@@ -1580,7 +1630,8 @@ interface TabIndicatorsProps {
 }
 
 function TabIndicators({ tab, t }: TabIndicatorsProps) {
-	const hasViewers = tab.viewers && tab.viewers.length >= 2;
+	const viewerCount = tab.viewerCount ?? tab.viewers?.length ?? 0;
+	const hasViewers = viewerCount >= 2;
 	const hasContainer = tab.type === "chapter" && tab.containerStatus;
 	const hasTerminals = (tab.activeTerminalCount ?? 0) > 0;
 
@@ -1588,7 +1639,13 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 
 	return (
 		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{hasViewers && <ViewerAvatars viewers={tab.viewers as RecentTabViewer[]} t={t} />}
+			{hasViewers && (
+				<ViewerAvatars
+					viewers={(tab.viewers ?? []) as RecentTabViewer[]}
+					viewerCount={viewerCount}
+					t={t}
+				/>
+			)}
 			{hasContainer && (
 				<Tooltip
 					label={t(CONTAINER_STATUS_I18N[tab.containerStatus as string] ?? "containerStopped")}
@@ -1621,17 +1678,18 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 
 interface ViewerAvatarsProps {
 	viewers: RecentTabViewer[];
+	viewerCount: number;
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
 const MAX_VISIBLE_AVATARS = 3;
 
-function ViewerAvatars({ viewers, t }: ViewerAvatarsProps) {
+function ViewerAvatars({ viewers, viewerCount, t }: ViewerAvatarsProps) {
 	const visible = viewers.slice(0, MAX_VISIBLE_AVATARS);
-	const overflow = viewers.length - MAX_VISIBLE_AVATARS;
+	const overflow = Math.max(0, viewerCount - MAX_VISIBLE_AVATARS);
 
 	return (
-		<Tooltip label={t("viewersWatching", { count: viewers.length })} withArrow position="right">
+		<Tooltip label={t("viewersWatching", { count: viewerCount })} withArrow position="right">
 			<Avatar.Group spacing={4}>
 				{visible.map((v) => (
 					<UserAvatar

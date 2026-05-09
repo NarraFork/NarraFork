@@ -13,12 +13,14 @@ import {
 } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, type SideCarRecord } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
 import { SideCarNotice } from "./SideCarNotice";
+
+const MAX_JSON_PREVIEW_CHARS = 80_000;
 
 interface ToolCallLike {
 	id?: string;
@@ -55,6 +57,79 @@ function stringifyJson(value: unknown): string {
 	} catch {
 		return String(value);
 	}
+}
+
+function formatJsonPreview(value: unknown, maxChars: number): { text: string; truncated: boolean } {
+	if (value == null) return { text: "", truncated: false };
+	if (typeof value === "string") {
+		return value.length > maxChars
+			? { text: value.slice(0, maxChars), truncated: true }
+			: { text: value, truncated: false };
+	}
+
+	const parts: string[] = [];
+	const seen = new WeakSet<object>();
+	let remaining = maxChars;
+	let truncated = false;
+	const append = (text: string): boolean => {
+		if (remaining <= 0) {
+			truncated = true;
+			return false;
+		}
+		if (text.length > remaining) {
+			parts.push(text.slice(0, remaining));
+			remaining = 0;
+			truncated = true;
+			return false;
+		}
+		parts.push(text);
+		remaining -= text.length;
+		return true;
+	};
+	const writeIndent = (depth: number) => append("  ".repeat(depth));
+	const write = (current: unknown, depth: number): boolean => {
+		if (current == null || typeof current === "number" || typeof current === "boolean") {
+			return append(JSON.stringify(current));
+		}
+		if (typeof current === "string") {
+			const snippet = current.length > remaining ? current.slice(0, remaining) : current;
+			return append(JSON.stringify(snippet));
+		}
+		if (typeof current !== "object") return append(JSON.stringify(String(current)));
+		if (seen.has(current)) return append('"[Circular]"');
+		seen.add(current);
+		if (Array.isArray(current)) {
+			if (current.length === 0) return append("[]");
+			if (!append("[\n")) return false;
+			for (let i = 0; i < current.length; i++) {
+				if (!writeIndent(depth + 1)) return false;
+				if (!write(current[i], depth + 1)) return false;
+				if (!append(i === current.length - 1 ? "\n" : ",\n")) return false;
+			}
+			return writeIndent(depth) && append("]");
+		}
+		const record = current as Record<string, unknown>;
+		let wroteAny = false;
+		let first = true;
+		if (!append("{\n")) return false;
+		for (const key in record) {
+			if (!Object.hasOwn(record, key)) continue;
+			if (!first && !append(",\n")) return false;
+			first = false;
+			wroteAny = true;
+			if (!writeIndent(depth + 1)) return false;
+			if (!append(`${JSON.stringify(key)}: `)) return false;
+			if (!write(record[key], depth + 1)) return false;
+		}
+		if (!wroteAny) {
+			parts.pop();
+			return append("{}");
+		}
+		return append("\n") && writeIndent(depth) && append("}");
+	};
+
+	write(value, 0);
+	return { text: parts.join(""), truncated };
 }
 
 function parseTime(value: string | null | undefined): number | null {
@@ -101,6 +176,30 @@ function CopyIconButton({ value, label }: { value: string; label: string }) {
 				</Tooltip>
 			)}
 		</CopyButton>
+	);
+}
+
+function LazyCopyJsonIconButton({ value, label }: { value: unknown; label: string }) {
+	const [copied, setCopied] = useState(false);
+	const disabled = value == null;
+	return (
+		<Tooltip label={copied ? label : label}>
+			<ActionIcon
+				variant="subtle"
+				color={copied ? "green" : "gray"}
+				size="sm"
+				disabled={disabled}
+				onClick={async () => {
+					const text = stringifyJson(value);
+					if (!text) return;
+					await navigator.clipboard.writeText(text);
+					setCopied(true);
+					setTimeout(() => setCopied(false), 1500);
+				}}
+			>
+				{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+			</ActionIcon>
+		</Tooltip>
 	);
 }
 
@@ -188,19 +287,21 @@ function TimingTimeline({ toolCall }: { toolCall: ToolCallLike }) {
 
 function JsonSection({ title, value }: { title: string; value: unknown }) {
 	const { t } = useTranslation("narrator");
-	const content = stringifyJson(value);
+	const preview = useMemo(() => formatJsonPreview(value, MAX_JSON_PREVIEW_CHARS), [value]);
+	const content = preview.truncated
+		? `${preview.text}\n\n${t("toolCallInspector.truncatedPreview")}`
+		: preview.text;
 	return (
 		<Stack gap={6}>
 			<Group justify="space-between" gap="xs">
 				<Text size="sm" fw={600}>
 					{title}
 				</Text>
-				<CopyIconButton value={content} label={t("toolCallInspector.copy")} />
+				<LazyCopyJsonIconButton value={value} label={t("toolCallInspector.copy")} />
 			</Group>
 			{content ? (
 				<ContentViewer
 					content={content}
-					fullContent={content}
 					title={title}
 					language="json"
 					style={{ maxHeight: 260, overflow: "auto", fontSize: 12 }}
@@ -228,6 +329,7 @@ export function ToolCallInspector({
 		queryFn: () => api.getToolCallDetail(narratorId, toolUseId as string),
 		enabled,
 		staleTime: 30 * 1000,
+		gcTime: 0,
 	});
 
 	const toolCall = useMemo<ToolCallLike | null>(() => {
@@ -237,9 +339,6 @@ export function ToolCallInspector({
 			...data,
 		};
 	}, [data, initialToolCall]);
-
-	const inputContent = stringifyJson(toolCall?.inputJson);
-	const outputContent = stringifyJson(toolCall?.outputJson);
 
 	return (
 		<Modal
@@ -314,30 +413,14 @@ export function ToolCallInspector({
 				<SideCarNotice sideCars={toolCall?.sideCars} mode="detail" />
 
 				<Group gap="xs" justify="flex-end">
-					<CopyButton value={inputContent} timeout={1500}>
-						{({ copied, copy }) => (
-							<ActionIcon.Group>
-								<Tooltip
-									label={copied ? t("toolCallInspector.copied") : t("toolCallInspector.copyInput")}
-								>
-									<ActionIcon variant="light" onClick={copy} disabled={!inputContent}>
-										{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-									</ActionIcon>
-								</Tooltip>
-							</ActionIcon.Group>
-						)}
-					</CopyButton>
-					<CopyButton value={outputContent} timeout={1500}>
-						{({ copied, copy }) => (
-							<Tooltip
-								label={copied ? t("toolCallInspector.copied") : t("toolCallInspector.copyOutput")}
-							>
-								<ActionIcon variant="light" onClick={copy} disabled={!outputContent}>
-									{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
-								</ActionIcon>
-							</Tooltip>
-						)}
-					</CopyButton>
+					<LazyCopyJsonIconButton
+						value={toolCall?.inputJson}
+						label={t("toolCallInspector.copyInput")}
+					/>
+					<LazyCopyJsonIconButton
+						value={toolCall?.outputJson}
+						label={t("toolCallInspector.copyOutput")}
+					/>
 				</Group>
 			</Stack>
 		</Modal>

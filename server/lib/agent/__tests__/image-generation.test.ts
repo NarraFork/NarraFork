@@ -2,8 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
 	decodeStandardBase64Image,
 	imageGenerationArtifactPath,
+	readPngImageDimensions,
 	sanitizeImageGenerationPathPart,
 } from "../image-generation";
+
+const SAMPLE_PNG_BASE64 =
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 describe("image generation artifacts", () => {
 	test("sanitizes session and image ids in artifact paths", () => {
@@ -19,5 +23,11 @@ describe("image generation artifacts", () => {
 		expect(() => decodeStandardBase64Image("data:image/png;base64,Zm9v")).toThrow();
 		expect(() => decodeStandardBase64Image("_-8")).toThrow();
 		expect(() => decodeStandardBase64Image("Zm9v=")).toThrow();
+	});
+
+	test("reads PNG dimensions from IHDR", () => {
+		const bytes = Buffer.from(SAMPLE_PNG_BASE64, "base64");
+		expect(readPngImageDimensions(bytes)).toEqual({ width: 1, height: 1 });
+		expect(readPngImageDimensions(Buffer.from("not a png"))).toBeUndefined();
 	});
 });

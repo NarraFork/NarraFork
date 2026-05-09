@@ -8,6 +8,7 @@ import {
 	setGlobalCloseSwipe,
 	setGlobalSwipeAnchor,
 } from "../components/narrator/swipeState";
+import { collectElementTextPreview, compactWhitespacePreview } from "../lib/dom-text";
 
 const DEFAULT_THRESHOLD = 60;
 const DEFAULT_REVEAL_WIDTH = 180;
@@ -172,7 +173,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			// Don't initiate swipe when text is selected — let the user interact
 			// with the native selection handles / copy menu instead.
 			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 
 			const curClose = getGlobalCloseSwipe();
 			const curAnchor = getGlobalSwipeAnchor();
@@ -490,8 +491,8 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 						offScreenRef.current = dir;
 						const bid = effectiveAnchor;
 						if (bid) {
-							// Extract preview text from the swiped block
-							const preview = (box.innerText ?? "").slice(0, 80).replace(/\n+/g, " ").trim() || bid;
+							// Extract a bounded preview without materializing the full block text.
+							const preview = compactWhitespacePreview(collectElementTextPreview(box, 80)) || bid;
 							getGlobalOnSwipeAnchorInfo()?.({
 								blockId: bid,
 								previewText: preview,
@@ -542,7 +543,7 @@ export function useSwipeMenu(opts: UseSwipeMenuOptions): SwipeMenuState {
 			const el = e.target as HTMLElement;
 			if (excludeSelectors.some((sel) => el.closest?.(sel))) return;
 			const sel = window.getSelection();
-			if (sel && sel.toString().trim().length > 0) return;
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
 			e.preventDefault();
 			e.stopPropagation();
 			const x = Math.min(e.clientX, window.innerWidth - 200);

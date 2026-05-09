@@ -73,7 +73,7 @@ import {
 	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
@@ -131,6 +131,7 @@ import {
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
+	useUpdateReflectionOverrides,
 	useUpdateRelaxedPlan,
 	useUpdateSubagentConclusion,
 	useUpdateWhitelistDir,
@@ -155,6 +156,7 @@ import {
 	NARRATOR_STATUS_COLORS,
 	parseAggModelValue,
 } from "../../lib/constants";
+import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { compactSnippet, normalizeSearchText } from "../../lib/search-utils";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -171,7 +173,11 @@ import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
-import { EditingMessageCtx, type EditingMessageState } from "./MessageBubble";
+import {
+	COMPACTING_MARKER_ATTR,
+	EditingMessageCtx,
+	type EditingMessageState,
+} from "./MessageBubble";
 import {
 	type RenderedTreeElementMeta,
 	RenderProgress,
@@ -232,6 +238,20 @@ const NarratorDetailsPanel = lazy(() =>
 );
 
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
+const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
+type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
+
+function normalizeBooleanOverride(value: unknown): BooleanOverride {
+	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
+		? (value as BooleanOverride)
+		: "inherit";
+}
+
+function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean {
+	const override = normalizeBooleanOverride(value);
+	if (override === "inherit") return globalDefault;
+	return override === "on";
+}
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
@@ -242,6 +262,10 @@ const MESSAGE_RENDER_WINDOW_SIZE = 180;
 const MESSAGE_RENDER_TARGET_RADIUS = 40;
 const MESSAGE_MOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_SIZE;
 const MESSAGE_UNMOUNT_CACHE_LIMIT = MESSAGE_RENDER_WINDOW_THRESHOLD * 2;
+const MAX_PAGE_RENDER_CACHE_ENTRIES = 6;
+const INPUT_DRAFT_STORAGE_MAX_CHARS = 200_000;
+const INPUT_DRAFT_SYNC_MAX_CHARS = 100_000;
+const INPUT_DRAFT_SYNC_DEBOUNCE_MS = 800;
 
 type MessageRenderWindow = {
 	start: number;
@@ -249,17 +273,73 @@ type MessageRenderWindow = {
 	reason: "tail" | "target" | "manual";
 };
 
+type MessageScrollAlign = NonNullable<
+	NonNullable<Parameters<BroadMessageListHandle["scrollToIndex"]>[1]>["align"]
+>;
+
 type ScrollToFullIndexOptions = {
-	align?: "start" | "center" | "end";
+	align?: MessageScrollAlign;
 	domIds?: string[];
 	highlightId?: string;
 	highlightDelayMs?: number;
 };
 
-type PendingMessageScroll = Required<Pick<ScrollToFullIndexOptions, "align">> &
-	Pick<ScrollToFullIndexOptions, "domIds" | "highlightId" | "highlightDelayMs"> & {
-		fullIndex: number;
-	};
+type PendingMessageScroll = {
+	fullIndex: number;
+	align: MessageScrollAlign;
+	domIds?: string[];
+	highlightId?: string;
+	highlightDelayMs?: number;
+};
+
+function getInputDraftKey(narratorId: string): string {
+	return `narrafork_draft_${narratorId}`;
+}
+
+function readInputDraft(narratorId: string): string {
+	const draftKey = getInputDraftKey(narratorId);
+	try {
+		const raw = sessionStorage.getItem(draftKey);
+		if (!raw) return "";
+		if (raw.length > INPUT_DRAFT_STORAGE_MAX_CHARS) {
+			sessionStorage.removeItem(draftKey);
+			return "";
+		}
+		return raw;
+	} catch {
+		return "";
+	}
+}
+
+function persistInputDraft(narratorId: string, input: string) {
+	const draftKey = getInputDraftKey(narratorId);
+	try {
+		if (input && input.length <= INPUT_DRAFT_STORAGE_MAX_CHARS) {
+			sessionStorage.setItem(draftKey, input);
+		} else {
+			sessionStorage.removeItem(draftKey);
+		}
+	} catch {
+		try {
+			sessionStorage.removeItem(draftKey);
+		} catch {
+			// ignore storage cleanup failures
+		}
+	}
+}
+
+function createDraftSourceId(): string {
+	return (
+		globalThis.crypto?.randomUUID?.() ??
+		`draft-${Date.now()}-${Math.random().toString(36).slice(2)}`
+	);
+}
+
+function getSyncableDraftText(input: string): string {
+	return input.length > INPUT_DRAFT_SYNC_MAX_CHARS
+		? input.slice(0, INPUT_DRAFT_SYNC_MAX_CHARS)
+		: input;
+}
 
 function getTailMessageRenderWindow(totalCount: number): MessageRenderWindow {
 	return {
@@ -293,30 +373,88 @@ function isSameMessageRenderWindow(a: MessageRenderWindow, b: MessageRenderWindo
 	return a.start === b.start && a.end === b.end && a.reason === b.reason;
 }
 
+type CompactingMarkerKind = "context" | "segment";
+
+function getCompactingMarkerKind(
+	message: Pick<NarratorMsg, "contentJson">,
+): CompactingMarkerKind | null {
+	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const block = blocks.find(
+		(block: ContentBlock) =>
+			(block.type === "compact" || block.type === "segment_compact") &&
+			block.status === "compacting",
+	);
+	if (!block) return null;
+	return block.type === "segment_compact" ? "segment" : "context";
+}
+
+function createCompactingMarkerOverlaySource(label: string, kind: CompactingMarkerKind) {
+	const host = document.createElement("div");
+	host.style.position = "fixed";
+	host.style.left = "-10000px";
+	host.style.top = "0";
+	host.style.width = "min(640px, 100vw)";
+	host.style.pointerEvents = "none";
+	host.style.opacity = "0";
+
+	const source = document.createElement("div");
+	source.setAttribute(COMPACTING_MARKER_ATTR, kind);
+	source.style.display = "flex";
+	source.style.alignItems = "center";
+	source.style.justifyContent = "center";
+	source.style.gap = "6px";
+	source.style.padding = "4px 0";
+	source.style.fontSize = "var(--mantine-font-size-xs)";
+	source.style.lineHeight = "var(--mantine-line-height-xs)";
+	source.style.color = `var(--mantine-color-${kind === "segment" ? "teal" : "orange"}-6)`;
+
+	const icon = document.createElement("span");
+	icon.textContent = "◉";
+	const text = document.createElement("span");
+	text.textContent = label;
+	source.append(icon, text);
+	host.appendChild(source);
+	document.body.appendChild(host);
+
+	return { host, element: source };
+}
+
 type BufferedSendResult = {
 	buffered?: boolean;
 	id?: string;
 	bufferedAt?: string;
 };
 
+const MESSAGE_SEARCH_TEXT_BUDGET_CHARS = 80_000;
+const MESSAGE_SEARCH_MAX_RESULTS = 500;
+
+function appendMessageSearchPart(parts: string[], value: unknown, budget: { remaining: number }) {
+	if (typeof value !== "string" || value.length === 0 || budget.remaining <= 0) return;
+	const chunk = value.length > budget.remaining ? value.slice(0, budget.remaining) : value;
+	parts.push(chunk);
+	budget.remaining -= chunk.length;
+}
+
 function collectMessageSearchText(message: TreeMessage): string {
-	const parts: string[] = [
-		message.contentText ?? "",
-		message.commandText ?? "",
-		message.role ?? "",
-	];
+	const budget = { remaining: MESSAGE_SEARCH_TEXT_BUDGET_CHARS };
+	const parts: string[] = [];
+	appendMessageSearchPart(parts, message.contentText, budget);
+	appendMessageSearchPart(parts, message.commandText, budget);
+	appendMessageSearchPart(parts, message.role, budget);
 	for (const block of message.contentJson ?? []) {
+		if (budget.remaining <= 0) break;
 		if (!block || typeof block !== "object") continue;
 		const record = block as Record<string, unknown>;
 		for (const key of ["text", "content", "summary", "name", "input", "query", "command"]) {
-			const value = record[key];
-			if (typeof value === "string") parts.push(value);
+			appendMessageSearchPart(parts, record[key], budget);
+			if (budget.remaining <= 0) break;
 		}
 	}
 	for (const toolCall of message.toolCalls ?? []) {
-		parts.push(toolCall.toolName ?? "");
+		if (budget.remaining <= 0) break;
+		appendMessageSearchPart(parts, toolCall.toolName, budget);
 	}
-	return parts.filter(Boolean).join("\n");
+	return parts.join("\n");
 }
 
 function flattenMessagesForSearch(messages: TreeMessage[] | undefined): TreeMessage[] {
@@ -345,6 +483,24 @@ type PageRenderCacheEntry = {
 	targets: string[][];
 	meta: RenderedTreeElementMeta[];
 };
+
+function touchPageRenderCacheEntry(
+	cache: Map<string, PageRenderCacheEntry>,
+	key: string,
+	entry: PageRenderCacheEntry,
+): PageRenderCacheEntry {
+	cache.delete(key);
+	cache.set(key, entry);
+	return entry;
+}
+
+function prunePageRenderCache(cache: Map<string, PageRenderCacheEntry>): void {
+	while (cache.size > MAX_PAGE_RENDER_CACHE_ENTRIES) {
+		const oldestKey = cache.keys().next().value;
+		if (oldestKey === undefined) return;
+		cache.delete(oldestKey);
+	}
+}
 
 function hasSamePageMessageRefs(
 	prevMessages: readonly NarratorMsg[],
@@ -599,6 +755,57 @@ function PermModeMenuItems({
 	);
 }
 
+function OverrideControl({
+	label,
+	description,
+	value,
+	effective,
+	globalDefault,
+	disabled,
+	onChange,
+	t,
+}: {
+	label: string;
+	description: string;
+	value: BooleanOverride;
+	effective: boolean;
+	globalDefault: boolean;
+	disabled: boolean;
+	onChange: (value: BooleanOverride) => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<Stack gap={4}>
+			<Group justify="space-between" align="center" wrap="nowrap">
+				<Text size="xs" fw={600}>
+					{label}
+				</Text>
+				<Badge size="xs" variant="light" color={effective ? "teal" : "gray"}>
+					{effective ? t("details.on") : t("details.off")}
+				</Badge>
+			</Group>
+			<Text size="xs" c="dimmed">
+				{description}
+			</Text>
+			<SegmentedControl
+				size="xs"
+				fullWidth
+				value={value}
+				onChange={(next) => onChange(next as BooleanOverride)}
+				disabled={disabled}
+				data={[
+					{
+						value: "inherit",
+						label: `${t("override_inherit")} (${globalDefault ? t("details.on") : t("details.off")})`,
+					},
+					{ value: "on", label: t("override_on") },
+					{ value: "off", label: t("override_off") },
+				]}
+			/>
+		</Stack>
+	);
+}
+
 function PermissionMenuContent({
 	currentMode,
 	onSelectPermissionMode,
@@ -607,13 +814,18 @@ function PermissionMenuContent({
 	onTogglePlanMode,
 	planModePending,
 	showPlanReflectionAutoApproveToggle,
-	planReflectionAutoApprove,
-	onPlanReflectionAutoApproveToggle,
+	planReflectionAutoApproveOverride,
+	planReflectionAutoApproveEffective,
+	planReflectionAutoApproveGlobal,
+	onPlanReflectionAutoApproveOverride,
 	planReflectionAutoApprovePending,
 	showDangerReflectionToggle,
-	dangerReflectionEnabled,
-	onDangerReflectionToggle,
+	dangerReflectionOverride,
+	dangerReflectionEffective,
+	dangerReflectionGlobal,
+	onDangerReflectionOverride,
 	dangerReflectionPending,
+	onOpenGlobalSettings,
 }: {
 	currentMode: string;
 	onSelectPermissionMode: (mode: string) => void;
@@ -622,19 +834,25 @@ function PermissionMenuContent({
 	onTogglePlanMode: () => void;
 	planModePending: boolean;
 	showPlanReflectionAutoApproveToggle: boolean;
-	planReflectionAutoApprove: boolean;
-	onPlanReflectionAutoApproveToggle: (enabled: boolean) => void;
+	planReflectionAutoApproveOverride: BooleanOverride;
+	planReflectionAutoApproveEffective: boolean;
+	planReflectionAutoApproveGlobal: boolean;
+	onPlanReflectionAutoApproveOverride: (value: BooleanOverride) => void;
 	planReflectionAutoApprovePending: boolean;
 	showDangerReflectionToggle: boolean;
-	dangerReflectionEnabled: boolean;
-	onDangerReflectionToggle: (enabled: boolean) => void;
+	dangerReflectionOverride: BooleanOverride;
+	dangerReflectionEffective: boolean;
+	dangerReflectionGlobal: boolean;
+	onDangerReflectionOverride: (value: BooleanOverride) => void;
 	dangerReflectionPending: boolean;
+	onOpenGlobalSettings: () => void;
 }) {
 	return (
 		<>
 			<Menu.Label>{t("permissionMode")}</Menu.Label>
 			<PermModeMenuItems currentMode={currentMode} onSelect={onSelectPermissionMode} t={t} />
 			<Menu.Divider />
+			<Menu.Label>{t("planSettings")}</Menu.Label>
 			<Menu.Item
 				leftSection={<IconNotebook size={14} />}
 				onClick={onTogglePlanMode}
@@ -643,35 +861,41 @@ function PermissionMenuContent({
 				{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
 			</Menu.Item>
 			{showPlanReflectionAutoApproveToggle && (
-				<>
-					<Menu.Divider />
-					<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
-						<Switch
-							label={t("planReflectionAutoApprove")}
-							description={t("planReflectionAutoApproveDesc")}
-							checked={planReflectionAutoApprove}
-							onChange={(e) => onPlanReflectionAutoApproveToggle(e.currentTarget.checked)}
-							disabled={planReflectionAutoApprovePending}
-							size="xs"
-						/>
-					</Box>
-				</>
+				<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
+					<OverrideControl
+						label={t("sessionPlanReflectionAutoApprove")}
+						description={t("sessionPlanReflectionAutoApproveDesc")}
+						value={planReflectionAutoApproveOverride}
+						effective={planReflectionAutoApproveEffective}
+						globalDefault={planReflectionAutoApproveGlobal}
+						disabled={planReflectionAutoApprovePending}
+						onChange={onPlanReflectionAutoApproveOverride}
+						t={t}
+					/>
+				</Box>
 			)}
 			{showDangerReflectionToggle && (
 				<>
 					<Menu.Divider />
+					<Menu.Label>{t("safetySettings")}</Menu.Label>
 					<Box px="sm" py={6} onClick={(e) => e.stopPropagation()}>
-						<Switch
-							label={t("dangerReflectionToggle")}
-							description={t("dangerReflectionToggleDesc")}
-							checked={dangerReflectionEnabled}
-							onChange={(e) => onDangerReflectionToggle(e.currentTarget.checked)}
+						<OverrideControl
+							label={t("sessionDangerReflection")}
+							description={t("sessionDangerReflectionDesc")}
+							value={dangerReflectionOverride}
+							effective={dangerReflectionEffective}
+							globalDefault={dangerReflectionGlobal}
 							disabled={dangerReflectionPending}
-							size="xs"
+							onChange={onDangerReflectionOverride}
+							t={t}
 						/>
 					</Box>
 				</>
 			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconExternalLink size={14} />} onClick={onOpenGlobalSettings}>
+				{t("globalAgentSettings")}
+			</Menu.Item>
 		</>
 	);
 }
@@ -1658,6 +1882,7 @@ export function NarratorPanel({
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
+	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const modelMutation = useUpdateModel();
 	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const {
@@ -1692,12 +1917,8 @@ export function NarratorPanel({
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
-	const updateSettingsMutation = useMutation({
-		mutationFn: api.updateSettings,
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
-	});
-	const dangerReflectionEnabled = settingsData?.agent?.dangerReflectionEnabled ?? true;
-	const planReflectionAutoApprove = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const dangerReflectionGlobal = settingsData?.agent?.dangerReflectionEnabled ?? true;
+	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
@@ -1905,17 +2126,126 @@ export function NarratorPanel({
 	);
 
 	// --- Input management ---
-	const [input, setInput] = useState(
-		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",
-	);
+	const [input, setInput] = useState(() => readInputDraft(narratorId));
+	const [draftHydrated, setDraftHydrated] = useState(false);
+	const inputRef = useRef(input);
+	inputRef.current = input;
+	const draftSourceIdRef = useRef(createDraftSourceId());
+	const lastSyncedDraftRef = useRef("");
+	const lastDraftUpdatedAtRef = useRef<string | null>(null);
+	const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const draftSyncSeqRef = useRef(0);
 	const inputHistory = useInputHistory(`narrafork_input_history_${narratorId}`);
 	useEffect(() => {
-		if (input) {
-			sessionStorage.setItem(`narrafork_draft_${narratorId}`, input);
-		} else {
-			sessionStorage.removeItem(`narrafork_draft_${narratorId}`);
-		}
+		persistInputDraft(narratorId, input);
 	}, [input, narratorId]);
+
+	const syncDraftNow = useCallback(
+		async (text: string) => {
+			if (draftSyncTimerRef.current) {
+				clearTimeout(draftSyncTimerRef.current);
+				draftSyncTimerRef.current = null;
+			}
+			const syncText = getSyncableDraftText(text);
+			const seq = ++draftSyncSeqRef.current;
+			const result = await api.updateNarratorDraft(narratorId, syncText, draftSourceIdRef.current);
+			if (seq === draftSyncSeqRef.current) {
+				lastSyncedDraftRef.current = result.text;
+				lastDraftUpdatedAtRef.current = result.updatedAt;
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, traits: result.traits } : old,
+				);
+			}
+			return result;
+		},
+		[narratorId, qc],
+	);
+
+	const clearInputAndDraft = useCallback(() => {
+		setInput("");
+		void syncDraftNow("").catch(() => {});
+	}, [syncDraftNow]);
+
+	useEffect(() => {
+		let cancelled = false;
+		setDraftHydrated(false);
+		lastSyncedDraftRef.current = "";
+		lastDraftUpdatedAtRef.current = null;
+		if (draftSyncTimerRef.current) {
+			clearTimeout(draftSyncTimerRef.current);
+			draftSyncTimerRef.current = null;
+		}
+		const localDraftAtRequest = inputRef.current;
+		api
+			.getNarratorDraft(narratorId)
+			.then((draft) => {
+				if (cancelled) return;
+				const serverText = draft.hasDraft ? draft.text : "";
+				const currentInput = inputRef.current;
+				const localChangedSinceRequest = currentInput !== localDraftAtRequest;
+				lastSyncedDraftRef.current = serverText;
+				lastDraftUpdatedAtRef.current = draft.updatedAt;
+				if (serverText && (!localChangedSinceRequest || !currentInput.trim())) {
+					setInput(serverText);
+				} else if (!serverText && !currentInput.trim()) {
+					setInput("");
+				}
+			})
+			.catch(() => {})
+			.finally(() => {
+				if (!cancelled) setDraftHydrated(true);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [narratorId]);
+
+	useEffect(() => {
+		if (!draftHydrated) return;
+		const syncText = getSyncableDraftText(input);
+		if (syncText === lastSyncedDraftRef.current) return;
+		if (draftSyncTimerRef.current) clearTimeout(draftSyncTimerRef.current);
+		draftSyncTimerRef.current = setTimeout(() => {
+			draftSyncTimerRef.current = null;
+			void syncDraftNow(inputRef.current).catch((err) => {
+				if (import.meta.env.DEV) console.warn("[NarratorPanel] draft sync failed:", err);
+			});
+		}, INPUT_DRAFT_SYNC_DEBOUNCE_MS);
+		return () => {
+			if (draftSyncTimerRef.current) {
+				clearTimeout(draftSyncTimerRef.current);
+				draftSyncTimerRef.current = null;
+			}
+		};
+	}, [input, draftHydrated, syncDraftNow]);
+
+	const handleDraftChanged = useCallback(
+		(draft: {
+			hasDraft: boolean;
+			text: string;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+		}) => {
+			const remoteText = draft.hasDraft ? draft.text : "";
+			if (
+				draft.updatedAt &&
+				lastDraftUpdatedAtRef.current &&
+				draft.updatedAt < lastDraftUpdatedAtRef.current
+			) {
+				return;
+			}
+			const currentSyncText = getSyncableDraftText(inputRef.current);
+			const hasLocalUnsyncedChanges = currentSyncText !== lastSyncedDraftRef.current;
+			lastSyncedDraftRef.current = remoteText;
+			lastDraftUpdatedAtRef.current = draft.updatedAt;
+			if (draft.sourceId === draftSourceIdRef.current) return;
+			if (!hasLocalUnsyncedChanges || !inputRef.current.trim()) {
+				setInput(remoteText);
+			}
+		},
+		[],
+	);
 
 	// --- Command popover ---
 	// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
@@ -1956,8 +2286,8 @@ export function NarratorPanel({
 		}
 	}, []);
 	const closeCommandPopover = useCallback(() => {
-		setInput("");
-	}, []);
+		clearInputAndDraft();
+	}, [clearInputAndDraft]);
 	useEffect(() => {
 		if (appendInputRef) {
 			appendInputRef.current = (text: string) =>
@@ -2123,6 +2453,7 @@ export function NarratorPanel({
 		narratorTodosToolUseId: narrator?.todosToolUseId,
 		isSubagent,
 		narratorSubstatus,
+		onDraftChanged: handleDraftChanged,
 	});
 	const {
 		disconnected,
@@ -2192,10 +2523,6 @@ export function NarratorPanel({
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
 	const [detailsOpened, { toggle: toggleDetails, close: closeDetails }] = useDisclosure(false);
-	const [
-		dangerReflectionWarningOpened,
-		{ open: openDangerReflectionWarning, close: closeDangerReflectionWarning },
-	] = useDisclosure(false);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
@@ -2267,6 +2594,18 @@ export function NarratorPanel({
 	const hasPlanTrait = Array.isArray(narrator?.traits)
 		? narrator.traits.includes("plan")
 		: !!narrator?.planMode;
+	const planReflectionAutoApproveOverride = normalizeBooleanOverride(
+		narrator?.planReflectionAutoApproveOverride,
+	);
+	const dangerReflectionOverride = normalizeBooleanOverride(narrator?.dangerReflectionOverride);
+	const planReflectionAutoApproveEffective = resolveBooleanOverride(
+		planReflectionAutoApproveOverride,
+		planReflectionAutoApproveGlobal,
+	);
+	const dangerReflectionEffective = resolveBooleanOverride(
+		dangerReflectionOverride,
+		dangerReflectionGlobal,
+	);
 	const togglePlanMode = useCallback(() => {
 		if (!narratorId) return;
 		if (hasPlanTrait) {
@@ -2275,28 +2614,25 @@ export function NarratorPanel({
 			enterPlanModeMutation.mutate(narratorId);
 		}
 	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId]);
-	const handlePlanReflectionAutoApproveToggle = useCallback(
-		(enabled: boolean) => {
-			updateSettingsMutation.mutate({ agent: { planReflectionAutoApprove: enabled } });
+	const handlePlanReflectionAutoApproveOverride = useCallback(
+		(value: BooleanOverride) => {
+			reflectionOverridesMutation.mutate({
+				id: narratorId,
+				planReflectionAutoApproveOverride: value,
+			});
 		},
-		[updateSettingsMutation],
+		[narratorId, reflectionOverridesMutation],
 	);
-	const handleDangerReflectionToggle = useCallback(
-		(enabled: boolean) => {
-			if (!enabled) {
-				openDangerReflectionWarning();
-				return;
+	const handleDangerReflectionOverride = useCallback(
+		async (value: BooleanOverride) => {
+			if (value === "off" && dangerReflectionEffective) {
+				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
+				if (!ok) return;
 			}
-			updateSettingsMutation.mutate({ agent: { dangerReflectionEnabled: true } });
+			reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: value });
 		},
-		[openDangerReflectionWarning, updateSettingsMutation],
+		[confirm, dangerReflectionEffective, narratorId, reflectionOverridesMutation, t],
 	);
-	const confirmDisableDangerReflection = useCallback(() => {
-		updateSettingsMutation.mutate(
-			{ agent: { dangerReflectionEnabled: false } },
-			{ onSuccess: closeDangerReflectionWarning },
-		);
-	}, [closeDangerReflectionWarning, updateSettingsMutation]);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
 	// Derive legacy boolean flags from substatus
@@ -2431,15 +2767,14 @@ export function NarratorPanel({
 	}, [currentTodos]);
 
 	// --- Image management ---
-	const imagePreviewUrls = useMemo(
-		() => attachedImages.map((f) => URL.createObjectURL(f)),
-		[attachedImages],
-	);
+	const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
 	useEffect(() => {
+		const urls = attachedImages.map((file) => URL.createObjectURL(file));
+		setImagePreviewUrls(urls);
 		return () => {
-			for (const url of imagePreviewUrls) URL.revokeObjectURL(url);
+			for (const url of urls) URL.revokeObjectURL(url);
 		};
-	}, [imagePreviewUrls]);
+	}, [attachedImages]);
 
 	// --- Title editing ---
 	const [editingTitle, setEditingTitle] = useState(false);
@@ -2781,6 +3116,14 @@ export function NarratorPanel({
 		pageCacheRef.current.clear();
 	}
 
+	useEffect(() => {
+		return () => {
+			stableToolRunKeyByTargetIdRef.current.clear();
+			nextStableToolRunKeyRef.current = 1;
+			pageCacheRef.current.clear();
+		};
+	}, []);
+
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/highlightMessageId are used to reset one-shot highlight state when the active target changes
 	useEffect(() => {
 		highlightScrolledRef.current = false;
@@ -2945,8 +3288,11 @@ export function NarratorPanel({
 		setGlobalToggleBlock(null);
 	}, [selectionMode, toggleBlock]);
 
-	// --- Off-screen swipe anchor overlay state ---
+	// --- Off-screen swipe/compacting anchor overlay state ---
 	const [swipeAnchorOverlay, setSwipeAnchorOverlay] = useState<SwipeAnchorInfo | null>(null);
+	const [compactingMarkerOverlay, setCompactingMarkerOverlay] = useState<SwipeAnchorInfo | null>(
+		null,
+	);
 
 	useEffect(() => {
 		setGlobalOnSwipeAnchorInfo(setSwipeAnchorOverlay);
@@ -3020,13 +3366,15 @@ export function NarratorPanel({
 	const handleBatchCopy = useCallback(async () => {
 		const container = contentRef.current;
 		if (!container || selectedBlockIds.size === 0) return;
-		const text = collectSelectedText(container, selectedBlockIds, handleRegistry);
-		if (!text) return;
+		const selectedText = collectSelectedText(container, selectedBlockIds, handleRegistry);
+		if (!selectedText.text) return;
 		try {
-			await navigator.clipboard.writeText(text);
+			await navigator.clipboard.writeText(selectedText.text);
 			notifications.show({
-				message: t("batchCopySuccess", { count: selectedBlockIds.size }),
-				color: "teal",
+				message: t(selectedText.truncated ? "batchCopySuccessTruncated" : "batchCopySuccess", {
+					count: selectedBlockIds.size,
+				}),
+				color: selectedText.truncated ? "yellow" : "teal",
 			});
 		} catch {
 			// Fallback: some browsers block clipboard in non-secure contexts
@@ -3303,7 +3651,10 @@ export function NarratorPanel({
 			const pageStreamingMsg = isNewestPage ? streamingMsg : null;
 
 			// Check cache for non-streaming pages.
-			const cached = cache.get(pageKey);
+			const cachedEntry = cache.get(pageKey);
+			const cached = cachedEntry
+				? touchPageRenderCacheEntry(cache, pageKey, cachedEntry)
+				: undefined;
 			if (
 				!pageStreamingMsg &&
 				cached &&
@@ -3371,7 +3722,10 @@ export function NarratorPanel({
 				// Instead of rendering twice to compare element counts, we call
 				// segmentMessages (pure computation, no React element creation)
 				// to determine which case applies, then render only once.
-				let cachedNoStreaming = cache.get(pageKey);
+				const cachedNoStreamingEntry = cache.get(pageKey);
+				let cachedNoStreaming = cachedNoStreamingEntry
+					? touchPageRenderCacheEntry(cache, pageKey, cachedNoStreamingEntry)
+					: undefined;
 				if (
 					!cachedNoStreaming ||
 					!hasSamePageMessageRefs(cachedNoStreaming.messageRefs, page.messages) ||
@@ -3447,6 +3801,7 @@ export function NarratorPanel({
 				cache.delete(cachedPageKey);
 			}
 		}
+		prunePageRenderCache(cache);
 
 		return {
 			flatElements: allElements,
@@ -3492,6 +3847,7 @@ export function NarratorPanel({
 			substatus.includes("manual_override")) &&
 		!isActive;
 	const finalElements = useMemo(() => {
+		if (!showManualLoadOlder && !showConclusionBtn) return flatElements;
 		const elements = showManualLoadOlder
 			? [
 					<Box ta="center" py={4} key="__load-older-btn__">
@@ -3536,11 +3892,13 @@ export function NarratorPanel({
 		updateConclusionMutation,
 	]);
 	const finalKeys = useMemo(() => {
+		if (!showManualLoadOlder && !showConclusionBtn) return flatKeys;
 		const keys = showManualLoadOlder ? ["__load-older-btn__", ...flatKeys] : [...flatKeys];
 		if (showConclusionBtn) keys.push("__update-conclusion-btn__");
 		return keys;
 	}, [showManualLoadOlder, flatKeys, showConclusionBtn]);
 	const finalTargets = useMemo(() => {
+		if (!showManualLoadOlder && !showConclusionBtn) return flatTargets;
 		const targets = showManualLoadOlder ? [[], ...flatTargets] : [...flatTargets];
 		if (showConclusionBtn) targets.push([]);
 		return targets;
@@ -3818,22 +4176,33 @@ export function NarratorPanel({
 		const normalizedQuery = normalizeSearchText(messageSearchQuery);
 		if (!normalizedQuery || !deferredMessagesData?.pages?.length) return [];
 		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
-		return flattenMessagesForSearch(orderedMessages)
-			.map((message) => {
-				const text = collectMessageSearchText(message);
-				return { message, text };
-			})
-			.filter(({ text }) => normalizeSearchText(text).includes(normalizedQuery))
-			.map(({ message, text }) => ({
+		const results: Array<{
+			id: string;
+			role: string;
+			createdAt: string;
+			snippet: string;
+			index: number;
+		}> = [];
+		for (const message of flattenMessagesForSearch(orderedMessages)) {
+			const index = targetIndexMap.get(message.id) ?? -1;
+			if (index < 0) continue;
+			const text = collectMessageSearchText(message);
+			if (!normalizeSearchText(text).includes(normalizedQuery)) continue;
+			results.push({
 				id: message.id,
 				role: message.role,
 				createdAt: message.createdAt,
 				snippet: compactSnippet(text, messageSearchQuery, 72),
-				index: targetIndexMap.get(message.id) ?? -1,
-			}))
-			.filter((result) => result.index >= 0)
-			.sort((a, b) => a.index - b.index);
+				index,
+			});
+			if (results.length >= MESSAGE_SEARCH_MAX_RESULTS) break;
+		}
+		return results.sort((a, b) => a.index - b.index);
 	}, [deferredMessagesData, messageSearchQuery, targetIndexMap]);
+	const messageSearchTotalLabel =
+		messageSearchResults.length >= MESSAGE_SEARCH_MAX_RESULTS
+			? `${MESSAGE_SEARCH_MAX_RESULTS}+`
+			: messageSearchResults.length;
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset active search item when the query/session changes
 	useEffect(() => {
@@ -4337,6 +4706,178 @@ export function NarratorPanel({
 		[scheduleHighlight, scrollToFullIndex, targetIndexMap],
 	);
 
+	const compactingMarkerInfo = useMemo(() => {
+		if (!deferredMessagesData?.pages?.length) return null;
+		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
+		for (const message of orderedMessages) {
+			if (!message.id) continue;
+			const kind = getCompactingMarkerKind(message);
+			if (kind) return { messageId: message.id, kind };
+		}
+		return null;
+	}, [deferredMessagesData]);
+	const compactingMarkerMessageId = compactingMarkerInfo?.messageId ?? null;
+	const compactingMarkerKind = compactingMarkerInfo?.kind ?? "context";
+
+	useEffect(() => {
+		// Re-run after rendered message window changes so newly mounted compact markers are observed.
+		void renderedKeys;
+		if (!compactingMarkerMessageId || isWorkspacePreview || usePixiRenderer) {
+			setCompactingMarkerOverlay(null);
+			return;
+		}
+
+		const scrollEl = viewportRef.current;
+		if (!scrollEl) {
+			setCompactingMarkerOverlay(null);
+			return;
+		}
+		const contentEl = contentRef.current ?? scrollEl;
+
+		let rafId = 0;
+		let fallbackHost: HTMLElement | null = null;
+		let fallbackElement: HTMLElement | null = null;
+		const findMarker = () => contentEl.querySelector<HTMLElement>(`[${COMPACTING_MARKER_ATTR}]`);
+		const disposeFallback = () => {
+			fallbackHost?.remove();
+			fallbackHost = null;
+			fallbackElement = null;
+		};
+		const clearOverlay = () => {
+			disposeFallback();
+			setCompactingMarkerOverlay(null);
+		};
+		const ensureFallbackElement = () => {
+			if (fallbackElement?.isConnected) return fallbackElement;
+			disposeFallback();
+			const created = createCompactingMarkerOverlaySource(
+				compactingMarkerKind === "segment" ? t("segmentCompacting") : t("compacting"),
+				compactingMarkerKind,
+			);
+			fallbackHost = created.host;
+			fallbackElement = created.element;
+			fallbackElement.setAttribute("data-message-id", compactingMarkerMessageId);
+			return fallbackElement;
+		};
+		const scrollBackToMarker = (source: HTMLElement, messageId: string) => {
+			if (source.isConnected && source !== fallbackElement) {
+				source.scrollIntoView({ behavior: "smooth", block: "center" });
+				return;
+			}
+			scrollToMessageTarget({
+				domIds: [`msg-${messageId}`],
+				targetIds: [messageId],
+				highlightId: messageId,
+			});
+		};
+		const showOverlay = (source: HTMLElement, offScreen: "top" | "bottom") => {
+			const messageId = source.getAttribute("data-message-id") ?? compactingMarkerMessageId;
+			const blockId = `compacting:${messageId}`;
+			const previewText =
+				compactWhitespacePreview(collectElementTextPreview(source, 80)) || blockId;
+
+			setCompactingMarkerOverlay((prev) => {
+				if (prev?.blockId === blockId && prev.element === source && prev.offScreen === offScreen) {
+					return prev;
+				}
+				return {
+					blockId,
+					previewText,
+					element: source,
+					scrollBack: () => scrollBackToMarker(source, messageId),
+					close: clearOverlay,
+					offScreen,
+				};
+			});
+		};
+		const getFallbackOffScreen = (): "top" | "bottom" | null => {
+			const markerIndex = targetIndexMap.get(compactingMarkerMessageId);
+			if (markerIndex == null) return null;
+			if (shouldWindowMessages && activeMessageRenderWindow) {
+				if (markerIndex < activeMessageRenderWindow.start) return "top";
+				if (markerIndex >= activeMessageRenderWindow.end) return "bottom";
+			}
+			const viewportRect = scrollEl.getBoundingClientRect();
+			let minVisibleIndex = Number.POSITIVE_INFINITY;
+			let maxVisibleIndex = Number.NEGATIVE_INFINITY;
+			const messageNodes = contentEl.querySelectorAll<HTMLElement>("[id^='msg-']");
+			for (const node of messageNodes) {
+				const rect = node.getBoundingClientRect();
+				if (rect.bottom < viewportRect.top || rect.top > viewportRect.bottom) continue;
+				const id = node.id.startsWith("msg-") ? node.id.slice(4) : node.id;
+				const index = targetIndexMap.get(id);
+				if (index == null) continue;
+				minVisibleIndex = Math.min(minVisibleIndex, index);
+				maxVisibleIndex = Math.max(maxVisibleIndex, index);
+			}
+			if (!Number.isFinite(minVisibleIndex)) return null;
+			if (markerIndex < minVisibleIndex) return "top";
+			if (markerIndex > maxVisibleIndex) return "bottom";
+			return null;
+		};
+		const checkMarker = () => {
+			const marker = findMarker();
+			if (marker?.isConnected) {
+				disposeFallback();
+				const markerRect = marker.getBoundingClientRect();
+				const viewportRect = scrollEl.getBoundingClientRect();
+				if (markerRect.bottom < viewportRect.top) {
+					showOverlay(marker, "top");
+					return;
+				}
+				if (markerRect.top > viewportRect.bottom) {
+					showOverlay(marker, "bottom");
+					return;
+				}
+				setCompactingMarkerOverlay(null);
+				return;
+			}
+			const fallbackOffScreen = getFallbackOffScreen();
+			if (!fallbackOffScreen) {
+				clearOverlay();
+				return;
+			}
+			showOverlay(ensureFallbackElement(), fallbackOffScreen);
+		};
+		const scheduleCheck = () => {
+			if (rafId) return;
+			rafId = window.requestAnimationFrame(() => {
+				rafId = 0;
+				checkMarker();
+			});
+		};
+
+		scheduleCheck();
+		scrollEl.addEventListener("scroll", scheduleCheck, { passive: true });
+		window.addEventListener("resize", scheduleCheck, { passive: true });
+		const mutationObserver = new MutationObserver(scheduleCheck);
+		mutationObserver.observe(contentEl, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: [COMPACTING_MARKER_ATTR, "data-message-id"],
+		});
+
+		return () => {
+			cancelAnimationFrame(rafId);
+			scrollEl.removeEventListener("scroll", scheduleCheck);
+			window.removeEventListener("resize", scheduleCheck);
+			mutationObserver.disconnect();
+			clearOverlay();
+		};
+	}, [
+		activeMessageRenderWindow,
+		compactingMarkerKind,
+		compactingMarkerMessageId,
+		isWorkspacePreview,
+		renderedKeys,
+		scrollToMessageTarget,
+		shouldWindowMessages,
+		t,
+		targetIndexMap,
+		usePixiRenderer,
+	]);
+
 	// --- Scroll to highlighted message ---
 	useEffect(() => {
 		if (!highlightMessageId || totalMessageCount === 0 || highlightScrolledRef.current) return;
@@ -4572,7 +5113,7 @@ export function NarratorPanel({
 	const doSendBuffered = async (msg: string, priority?: boolean) => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
-		setInput("");
+		clearInputAndDraft();
 		setAttachedImages([]);
 		setAttachedTextFiles([]);
 		try {
@@ -4613,7 +5154,7 @@ export function NarratorPanel({
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
-				setInput("");
+				clearInputAndDraft();
 				setAttachedImages([]);
 				setAttachedTextFiles([]);
 
@@ -4628,6 +5169,13 @@ export function NarratorPanel({
 						fetchedNarrator?.reasoningEffort ?? narrator?.reasoningEffort ?? undefined,
 					fastMode: fetchedNarrator?.fastMode ?? narrator?.fastMode ?? undefined,
 					relaxedPlan: fetchedNarrator?.relaxedPlan ?? narrator?.relaxedPlan ?? undefined,
+					planReflectionAutoApproveOverride: normalizeBooleanOverride(
+						fetchedNarrator?.planReflectionAutoApproveOverride ??
+							narrator?.planReflectionAutoApproveOverride,
+					),
+					dangerReflectionOverride: normalizeBooleanOverride(
+						fetchedNarrator?.dangerReflectionOverride ?? narrator?.dangerReflectionOverride,
+					),
 					cwd: currentCwd,
 				});
 
@@ -4651,7 +5199,7 @@ export function NarratorPanel({
 			}
 			const images = [...attachedImages];
 			const textFiles = [...attachedTextFiles];
-			setInput("");
+			clearInputAndDraft();
 			setAttachedImages([]);
 			setAttachedTextFiles([]);
 			await submitMessage(msg, images, textFiles);
@@ -5572,7 +6120,7 @@ export function NarratorPanel({
 								{messageSearchQuery.trim()
 									? t("messageSearchCount", {
 											current: messageSearchResults.length ? activeMessageSearchIndex + 1 : 0,
-											total: messageSearchResults.length,
+											total: messageSearchTotalLabel,
 										})
 									: t("messageSearchLoaded", { count: totalMessageCount })}
 							</Text>
@@ -5648,29 +6196,6 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
-					<Modal
-						opened={dangerReflectionWarningOpened}
-						onClose={closeDangerReflectionWarning}
-						title={t("dangerReflectionDisableTitle")}
-						centered
-					>
-						<Stack>
-							<Text size="sm">{t("dangerReflectionDisableWarning")}</Text>
-							<Group justify="flex-end">
-								<Button variant="default" onClick={closeDangerReflectionWarning}>
-									{t("cancel")}
-								</Button>
-								<Button
-									color="red"
-									onClick={confirmDisableDangerReflection}
-									loading={updateSettingsMutation.isPending}
-								>
-									{t("dangerReflectionDisableConfirm")}
-								</Button>
-							</Group>
-						</Stack>
-					</Modal>
-
 					{detailsOpened && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
@@ -5680,6 +6205,8 @@ export function NarratorPanel({
 								narrator={narrator}
 								viewers={viewers}
 								defaultModelValue={defaultModelValue}
+								planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
+								dangerReflectionGlobal={dangerReflectionGlobal}
 							/>
 						</Suspense>
 					)}
@@ -5870,8 +6397,12 @@ export function NarratorPanel({
 							)}
 						</Box>
 
-						{/* Off-screen swipe anchor overlay — cloned message preview */}
-						{swipeAnchorOverlay && <SwipeAnchorOverlay info={swipeAnchorOverlay} />}
+						{/* Off-screen swipe/compacting anchor overlay — cloned message preview */}
+						{(swipeAnchorOverlay ?? compactingMarkerOverlay) && (
+							<SwipeAnchorOverlay
+								info={(swipeAnchorOverlay ?? compactingMarkerOverlay) as SwipeAnchorInfo}
+							/>
+						)}
 
 						{/* Multi-select floating toolbar — fixed center, similar to swipe menu style */}
 						{selectionMode && (
@@ -6635,17 +7166,28 @@ export function NarratorPanel({
 																	(narrator.permissionMode ?? "default") === "acceptEdits" ||
 																	(narrator.permissionMode ?? "default") === "bypassPermissions"
 																}
-																planReflectionAutoApprove={planReflectionAutoApprove}
-																onPlanReflectionAutoApproveToggle={
-																	handlePlanReflectionAutoApproveToggle
+																planReflectionAutoApproveOverride={
+																	planReflectionAutoApproveOverride
 																}
-																planReflectionAutoApprovePending={updateSettingsMutation.isPending}
+																planReflectionAutoApproveEffective={
+																	planReflectionAutoApproveEffective
+																}
+																planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
+																onPlanReflectionAutoApproveOverride={
+																	handlePlanReflectionAutoApproveOverride
+																}
+																planReflectionAutoApprovePending={
+																	reflectionOverridesMutation.isPending
+																}
 																showDangerReflectionToggle={
 																	(narrator.permissionMode ?? "default") === "bypassPermissions"
 																}
-																dangerReflectionEnabled={dangerReflectionEnabled}
-																onDangerReflectionToggle={handleDangerReflectionToggle}
-																dangerReflectionPending={updateSettingsMutation.isPending}
+																dangerReflectionOverride={dangerReflectionOverride}
+																dangerReflectionEffective={dangerReflectionEffective}
+																dangerReflectionGlobal={dangerReflectionGlobal}
+																onDangerReflectionOverride={handleDangerReflectionOverride}
+																dangerReflectionPending={reflectionOverridesMutation.isPending}
+																onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
 															/>
 														</Menu.Dropdown>
 													</Menu>
@@ -6858,17 +7400,26 @@ export function NarratorPanel({
 																(narrator.permissionMode ?? "default") === "acceptEdits" ||
 																(narrator.permissionMode ?? "default") === "bypassPermissions"
 															}
-															planReflectionAutoApprove={planReflectionAutoApprove}
-															onPlanReflectionAutoApproveToggle={
-																handlePlanReflectionAutoApproveToggle
+															planReflectionAutoApproveOverride={planReflectionAutoApproveOverride}
+															planReflectionAutoApproveEffective={
+																planReflectionAutoApproveEffective
 															}
-															planReflectionAutoApprovePending={updateSettingsMutation.isPending}
+															planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
+															onPlanReflectionAutoApproveOverride={
+																handlePlanReflectionAutoApproveOverride
+															}
+															planReflectionAutoApprovePending={
+																reflectionOverridesMutation.isPending
+															}
 															showDangerReflectionToggle={
 																(narrator.permissionMode ?? "default") === "bypassPermissions"
 															}
-															dangerReflectionEnabled={dangerReflectionEnabled}
-															onDangerReflectionToggle={handleDangerReflectionToggle}
-															dangerReflectionPending={updateSettingsMutation.isPending}
+															dangerReflectionOverride={dangerReflectionOverride}
+															dangerReflectionEffective={dangerReflectionEffective}
+															dangerReflectionGlobal={dangerReflectionGlobal}
+															onDangerReflectionOverride={handleDangerReflectionOverride}
+															dangerReflectionPending={reflectionOverridesMutation.isPending}
+															onOpenGlobalSettings={() => navigate({ to: "/settings/agent" })}
 														/>
 													</Menu.Dropdown>
 												</Menu>

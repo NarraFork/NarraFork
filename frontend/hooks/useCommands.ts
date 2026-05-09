@@ -3,6 +3,8 @@ import { useTranslation } from "react-i18next";
 import type { CommandItem } from "../components/narrator/CommandPopover";
 import { api } from "../lib/api";
 
+const NARRATOR_COMMANDS_GC_TIME_MS = 60_000;
+
 export function useNarratorCommands(narratorId: string | undefined) {
 	const { i18n } = useTranslation();
 	const isZh = i18n.language?.startsWith("zh");
@@ -11,6 +13,7 @@ export function useNarratorCommands(narratorId: string | undefined) {
 		queryFn: () => api.getNarratorCommands(narratorId as string),
 		enabled: !!narratorId,
 		staleTime: 30_000,
+		gcTime: NARRATOR_COMMANDS_GC_TIME_MS,
 		select: (data): CommandItem[] => {
 			const commands: CommandItem[] = [
 				{

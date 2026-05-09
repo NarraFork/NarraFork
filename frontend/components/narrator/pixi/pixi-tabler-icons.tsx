@@ -103,6 +103,7 @@ function iconForStatus(status?: string): Icon {
 const textureCache = new Map<string, Texture>();
 const loadingCache = new Set<string>();
 const loadListeners = new Set<() => void>();
+const MAX_IDLE_ICON_POOL_ITEMS = 128;
 
 function notifyIconLoaded(): void {
 	for (const listener of loadListeners) listener();
@@ -227,11 +228,22 @@ export class IconSpritePool {
 			this.pool[i].visible = false;
 			this.pool[i].texture = Texture.EMPTY;
 		}
+		this.trimIdleItems();
 	}
 
 	refreshTextures(): void {
 		for (const sprite of this.pool) {
 			sprite.texture = Texture.EMPTY;
+		}
+	}
+
+	private trimIdleItems(): void {
+		const maxRetained = this.cursor + MAX_IDLE_ICON_POOL_ITEMS;
+		while (this.pool.length > maxRetained) {
+			const sprite = this.pool.pop();
+			if (!sprite) break;
+			this.container.removeChild(sprite);
+			sprite.destroy();
 		}
 	}
 }

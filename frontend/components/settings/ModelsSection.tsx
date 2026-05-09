@@ -4,6 +4,8 @@ import type { NavigateOptions, ToOptions } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
+const MODEL_SELECT_OPTION_LIMIT = 100;
+
 /** Prepend "group:" prefix to each item label so the selected value shows the provider. */
 function prefixLabels(data: ComboboxData): ComboboxData {
 	return (data as ComboboxItemGroup[]).map((g) => ({
@@ -114,12 +116,14 @@ export function ModelsSection({
 				label={t("defaultModel")}
 				data={prefixedModelsNoDefault}
 				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}
 			/>
 			<Select
 				label={t("summaryModel")}
 				data={prefixedModels}
 				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
 			/>
 			<Stack gap="xs">
@@ -133,6 +137,7 @@ export function ModelsSection({
 					label={t("subagentExploreModel")}
 					data={prefixedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
 					value={subagentExploreModel || null}
@@ -142,6 +147,7 @@ export function ModelsSection({
 					label={t("subagentPlanModel")}
 					data={prefixedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentModelInherit")}
 					value={subagentPlanModel || null}
@@ -159,6 +165,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsExplore")}
 					data={prefixedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.explore}
@@ -168,6 +175,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsPlan")}
 					data={prefixedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.plan}
@@ -177,6 +185,7 @@ export function ModelsSection({
 					label={t("subagentAllowedModelsGeneral")}
 					data={prefixedModels}
 					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
 					clearable
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.general}

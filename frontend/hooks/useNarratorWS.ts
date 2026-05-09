@@ -108,7 +108,18 @@ interface NarratorWSCallbacks {
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onPlanModeChanged?: (planMode: boolean, traits?: string[]) => void;
 	onCustomTraitsChanged?: (traits?: string[]) => void;
+	onDraftChanged?: (draft: {
+		hasDraft: boolean;
+		text: string;
+		updatedAt: string | null;
+		updatedBy: string | null;
+		sourceId: string | null;
+	}) => void;
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
+	onReflectionOverridesChanged?: (overrides: {
+		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+		dangerReflectionOverride?: "inherit" | "on" | "off";
+	}) => void;
 	onCompacting?: () => void;
 	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
 	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
@@ -493,8 +504,31 @@ export function useNarratorWS(
 							Array.isArray(data.traits) ? (data.traits as string[]) : undefined,
 						);
 						break;
+					case "draft_changed":
+						callbacksRef.current.onDraftChanged?.({
+							hasDraft: !!data.hasDraft,
+							text: typeof data.text === "string" ? data.text : "",
+							updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : null,
+							updatedBy: typeof data.updatedBy === "string" ? data.updatedBy : null,
+							sourceId: typeof data.sourceId === "string" ? data.sourceId : null,
+						});
+						break;
 					case "relaxed_plan_changed":
 						callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan as boolean);
+						break;
+					case "reflection_overrides_changed":
+						callbacksRef.current.onReflectionOverridesChanged?.({
+							planReflectionAutoApproveOverride: data.planReflectionAutoApproveOverride as
+								| "inherit"
+								| "on"
+								| "off"
+								| undefined,
+							dangerReflectionOverride: data.dangerReflectionOverride as
+								| "inherit"
+								| "on"
+								| "off"
+								| undefined,
+						});
 						break;
 					case "compacting":
 						callbacksRef.current.onCompacting?.();
@@ -860,7 +894,14 @@ export function useNarratorWS(
  * Calls `onUpdate` with the specific narrator ID and event data for targeted cache updates.
  */
 export interface NarratorListWSEvent {
-	type: "status" | "title" | "permissionMode" | "presence" | "terminalCount" | "containerStatus";
+	type:
+		| "status"
+		| "title"
+		| "permissionMode"
+		| "presence"
+		| "terminalCount"
+		| "containerStatus"
+		| "draft";
 	status?: string;
 	substatus?: string[];
 	title?: string;
@@ -873,6 +914,7 @@ export interface NarratorListWSEvent {
 	}>;
 	activeTerminalCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
+	hasDraft?: boolean;
 }
 
 export function useNarratorsListWS(

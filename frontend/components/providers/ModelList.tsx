@@ -1,6 +1,6 @@
-import { ActionIcon, Group, Stack, Tooltip } from "@mantine/core";
-import { IconEye, IconEyeOff } from "@tabler/icons-react";
-import React, { useMemo } from "react";
+import { ActionIcon, Group, Stack, Text, TextInput, Tooltip } from "@mantine/core";
+import { IconEye, IconEyeOff, IconSearch } from "@tabler/icons-react";
+import React, { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelRow } from "./ModelRow";
 
@@ -8,6 +8,8 @@ export interface ModelListItem {
 	value: string;
 	label: string;
 }
+
+const MAX_VISIBLE_MODEL_ROWS = 200;
 
 export interface ModelListProps {
 	models: ModelListItem[];
@@ -33,24 +35,42 @@ export const ModelList = React.memo(function ModelList({
 	showContextWindow = true,
 }: ModelListProps) {
 	const { t } = useTranslation("settings");
+	const [query, setQuery] = useState("");
+	const normalizedQuery = query.trim().toLowerCase();
 	const allHidden = useMemo(
 		() => models.every((m) => hiddenModels.has(m.value)),
 		[models, hiddenModels],
 	);
-	const sortedModels = useMemo(
-		() =>
-			[...models].sort((a, b) => {
-				const aHidden = hiddenModels.has(a.value);
-				const bHidden = hiddenModels.has(b.value);
-				return Number(aHidden) - Number(bHidden);
-			}),
-		[models, hiddenModels],
-	);
+	const sortedModels = useMemo(() => {
+		const filtered = normalizedQuery
+			? models.filter((model) => {
+					const value = model.value.toLowerCase();
+					const label = model.label.toLowerCase();
+					return value.includes(normalizedQuery) || label.includes(normalizedQuery);
+				})
+			: models;
+		return [...filtered].sort((a, b) => {
+			const aHidden = hiddenModels.has(a.value);
+			const bHidden = hiddenModels.has(b.value);
+			return Number(aHidden) - Number(bHidden);
+		});
+	}, [models, hiddenModels, normalizedQuery]);
+	const visibleModels = sortedModels.slice(0, MAX_VISIBLE_MODEL_ROWS);
+	const hiddenRowCount = Math.max(0, sortedModels.length - visibleModels.length);
 
 	if (models.length === 0) return null;
 
 	return (
 		<Stack gap="xs" mt="xs">
+			{models.length > MAX_VISIBLE_MODEL_ROWS && (
+				<TextInput
+					size="xs"
+					leftSection={<IconSearch size={14} />}
+					placeholder={t("modelListSearchPlaceholder")}
+					value={query}
+					onChange={(event) => setQuery(event.currentTarget.value)}
+				/>
+			)}
 			{onBatchToggleHidden && (
 				<Group gap="xs" justify="flex-end">
 					<Tooltip label={allHidden ? t("showAllModels") : t("hideAllModels")}>
@@ -69,7 +89,7 @@ export const ModelList = React.memo(function ModelList({
 					</Tooltip>
 				</Group>
 			)}
-			{sortedModels.map((m) => (
+			{visibleModels.map((m) => (
 				<ModelRow
 					key={m.value}
 					modelValue={m.value}
@@ -82,6 +102,14 @@ export const ModelList = React.memo(function ModelList({
 					showContextWindow={showContextWindow}
 				/>
 			))}
+			{hiddenRowCount > 0 && (
+				<Text size="xs" c="dimmed" ta="center">
+					{t("modelListItemsTruncated", {
+						shown: visibleModels.length,
+						hidden: hiddenRowCount,
+					})}
+				</Text>
+			)}
 		</Stack>
 	);
 });

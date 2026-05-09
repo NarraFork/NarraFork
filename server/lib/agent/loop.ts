@@ -10,6 +10,7 @@ import {
 	usesStatefulApi,
 } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
+import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import {
 	extractErrorMessage,
 	isCompletionLimitReason,
@@ -1078,10 +1079,10 @@ async function resolveGoalCompletionReflection(
 }
 
 export function shouldRunExitPlanModeReflection(
-	config: Pick<AgentConfig, "reflectionLoop" | "permissionMode">,
+	config: Pick<AgentConfig, "reflectionLoop" | "permissionMode" | "planReflectionAutoApprove">,
 ): boolean {
 	return (
-		settings.agent.planReflectionAutoApprove &&
+		(config.planReflectionAutoApprove ?? settings.agent.planReflectionAutoApprove) &&
 		!config.reflectionLoop &&
 		(config.permissionMode === "acceptEdits" || config.permissionMode === "bypassPermissions")
 	);
@@ -2645,6 +2646,27 @@ export async function* agentLoop(
 					}
 					yield* finishRequest(firstTokenTimeoutMessage);
 					yield { type: "retryable_error", message: firstTokenTimeoutMessage };
+					return;
+				}
+				if (isCodexRebuildHistoryRetryError(err)) {
+					const message = extractErrorMessage(err);
+					logger.warn("Codex quota failover requires rebuilt history retry", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						toolCount: toolUses.length,
+						startedToolCount: earlyExecMap.size,
+					});
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+					yield* drainStartedEarlyToolResults();
+					yield* finishRequest(message);
+					yield {
+						type: "retryable_error",
+						message,
+						code: CODEX_REBUILD_HISTORY_RETRY_CODE,
+						bypassRetryLimit: true,
+					};
 					return;
 				}
 				const msg = extractErrorMessage(err);

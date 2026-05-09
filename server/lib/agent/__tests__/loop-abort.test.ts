@@ -1,12 +1,17 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
+import { CODEX_REBUILD_HISTORY_RETRY_CODE, CodexRebuildHistoryRetryError } from "../codex-errors";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
 const TEST_TOOL_NAME = "TestAbortDrainTool";
 
-let providerScenario: "abort" | "truncated_after_tool" = "abort";
+let providerScenario:
+	| "abort"
+	| "truncated_after_tool"
+	| "codex_rebuild_after_text"
+	| "codex_rebuild_after_tool" = "abort";
 let providerAttempts = 0;
 
 const testProvider: ProviderAdapter = {
@@ -16,12 +21,25 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		providerAttempts++;
 		params.onRequestStart?.();
+		if (providerScenario === "codex_rebuild_after_text") {
+			yield { text: "partial codex output" };
+			throw new CodexRebuildHistoryRetryError("The usage limit has been reached", {
+				previousCredentialId: "cred-a",
+				operation: "chat",
+			});
+		}
 		yield {
 			toolUses: [
 				{ toolUseId: "tu_done_1", name: TEST_TOOL_NAME, input: { value: "one" } },
 				{ toolUseId: "tu_done_2", name: TEST_TOOL_NAME, input: { value: "two" } },
 			],
 		};
+		if (providerScenario === "codex_rebuild_after_tool") {
+			throw new CodexRebuildHistoryRetryError("The usage limit has been reached", {
+				previousCredentialId: "cred-a",
+				operation: "chat",
+			});
+		}
 		if (providerScenario === "truncated_after_tool") {
 			yield {
 				invalidState: {
@@ -163,6 +181,55 @@ describe("agentLoop abort result draining", () => {
 			type: "invalid_state",
 			reason: "stream_closed_before_response_completed",
 			message: "Responses API stream closed before response.completed.",
+		});
+	});
+
+	test("Codex 切号重试前保留已输出文本并要求外层重建 history", async () => {
+		providerScenario = "codex_rebuild_after_text";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(makeConfig(ac.signal), "answer then quota", [])) {
+			events.push(event);
+		}
+
+		expect(providerAttempts).toBe(1);
+		expect(events).toContainEqual({ type: "stream_text", text: "partial codex output" });
+		const textBlock = events.find(
+			(event): event is Extract<AgentEvent, { type: "block_complete" }> =>
+				event.type === "block_complete" && event.block.type === "text",
+		);
+		expect(textBlock?.block).toMatchObject({ type: "text", text: "partial codex output" });
+		const lastEvent = events.at(-1);
+		expect(lastEvent).toEqual({
+			type: "retryable_error",
+			message: "The usage limit has been reached",
+			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
+			bypassRetryLimit: true,
+		});
+	});
+
+	test("Codex 切号重试前保留已启动工具结果并要求外层重建 history", async () => {
+		providerScenario = "codex_rebuild_after_tool";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		const events: AgentEvent[] = [];
+
+		for await (const event of agentLoop(makeConfig(ac.signal), "tool then quota", [])) {
+			events.push(event);
+		}
+
+		expect(providerAttempts).toBe(1);
+		const toolResults = events.filter((event) => event.type === "tool_result");
+		expect(toolResults).toHaveLength(2);
+		expect(toolResults.map((event) => event.output)).toEqual(["completed:one", "completed:two"]);
+		const lastEvent = events.at(-1);
+		expect(lastEvent).toEqual({
+			type: "retryable_error",
+			message: "The usage limit has been reached",
+			code: CODEX_REBUILD_HISTORY_RETRY_CODE,
+			bypassRetryLimit: true,
 		});
 	});
 });

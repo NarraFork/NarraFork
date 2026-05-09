@@ -16,6 +16,7 @@ interface StreamingCodeProps {
 /** Interval between highlight passes (ms) */
 const HIGHLIGHT_INTERVAL = 300;
 const STREAMING_CODE_HIGHLIGHT_MAX_CHARS = 20_000;
+const STREAMING_CODE_DISPLAY_MAX_CHARS = 80_000;
 
 /**
  * Code viewer optimised for streaming: renders an ever-growing `code` string
@@ -38,69 +39,103 @@ export const StreamingCode = memo(function StreamingCode({
 
 	// Highlighted tokens (line-grouped). null = not yet highlighted.
 	const [tokens, setTokens] = useState<ThemedToken[][] | null>(null);
-	// How many chars of `code` the current `tokens` cover.
+	// How much of `code` the current `tokens` cover.
 	const highlightedLenRef = useRef(0);
+	const highlightedCodeRef = useRef("");
 
 	const scrollRef = useRef<HTMLDivElement>(null);
 	const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const inflightRef = useRef(0); // generation counter to discard stale results
+	const tokenContextKeyRef = useRef<string | null>(null);
+	const scheduleContextKeyRef = useRef<string | null>(null);
 	const codeRef = useRef(code);
 	codeRef.current = code;
+	const highlightContextKey = `${lang ?? ""}\u0000${theme}`;
 
 	// --- Throttled highlight pass ---
 	useEffect(() => {
-		if (!lang || lang === "text" || !code || code.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS) {
+		const clearPendingTimer = () => {
 			if (timerRef.current != null) {
 				clearTimeout(timerRef.current);
 				timerRef.current = null;
 			}
+		};
+		const clearHighlight = () => {
 			inflightRef.current++;
 			highlightedLenRef.current = 0;
+			highlightedCodeRef.current = "";
+			tokenContextKeyRef.current = null;
 			setTokens(null);
+		};
+
+		if (scheduleContextKeyRef.current !== highlightContextKey) {
+			scheduleContextKeyRef.current = highlightContextKey;
+			clearPendingTimer();
+			clearHighlight();
+		}
+
+		if (!lang || lang === "text" || !code || code.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS) {
+			clearPendingTimer();
+			clearHighlight();
 			return;
 		}
 
-		// Schedule a highlight pass if one isn't already pending
+		// Schedule a highlight pass if one isn't already pending. Code changes keep
+		// the pending timer; lang/theme changes are handled by the context key above.
 		if (timerRef.current == null) {
+			const scheduledLang = lang;
+			const scheduledTheme = theme;
+			const scheduledContextKey = highlightContextKey;
 			timerRef.current = setTimeout(() => {
 				timerRef.current = null;
 				const gen = ++inflightRef.current;
 				// Read the latest code from ref so we always highlight the most
 				// recent text, even if code changed while the timer was pending.
 				const latestCode = codeRef.current;
-				if (latestCode.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS) {
-					highlightedLenRef.current = 0;
-					setTokens(null);
+				if (
+					scheduledContextKey !== scheduleContextKeyRef.current ||
+					latestCode.length > STREAMING_CODE_HIGHLIGHT_MAX_CHARS
+				) {
+					if (scheduledContextKey === scheduleContextKeyRef.current) clearHighlight();
 					return;
 				}
 				loadShiki().then((shiki) => {
-					if (!shiki || gen !== inflightRef.current) return;
-					const effectiveLang = lang in shiki.bundledLanguages ? lang : null;
+					if (
+						!shiki ||
+						gen !== inflightRef.current ||
+						scheduledContextKey !== scheduleContextKeyRef.current
+					) {
+						return;
+					}
+					const effectiveLang = scheduledLang in shiki.bundledLanguages ? scheduledLang : null;
 					if (!effectiveLang) {
-						highlightedLenRef.current = 0;
-						setTokens(null);
+						clearHighlight();
 						return;
 					}
 					shiki
 						.codeToTokens(latestCode, {
 							lang: effectiveLang as BundledLanguage,
-							theme,
+							theme: scheduledTheme,
 						})
 						.then((result) => {
-							if (gen !== inflightRef.current) return;
+							if (
+								gen !== inflightRef.current ||
+								scheduledContextKey !== scheduleContextKeyRef.current
+							) {
+								return;
+							}
+							tokenContextKeyRef.current = scheduledContextKey;
+							highlightedCodeRef.current = latestCode;
 							setTokens(result.tokens);
 							highlightedLenRef.current = latestCode.length;
 						})
-						.catch(() => {});
+						.catch(() => {
+							if (gen === inflightRef.current) clearHighlight();
+						});
 				});
 			}, HIGHLIGHT_INTERVAL);
 		}
-
-		return () => {
-			// Don't clear the timer on every code change — let it fire on schedule.
-			// Only clean up on unmount or when lang/theme changes.
-		};
-	}, [lang, theme, code]);
+	}, [lang, theme, code, highlightContextKey]);
 
 	// Cleanup timer on unmount
 	useEffect(() => {
@@ -110,6 +145,8 @@ export const StreamingCode = memo(function StreamingCode({
 				timerRef.current = null;
 			}
 			inflightRef.current++;
+			highlightedCodeRef.current = "";
+			tokenContextKeyRef.current = null;
 		};
 	}, []);
 
@@ -127,14 +164,21 @@ export const StreamingCode = memo(function StreamingCode({
 	}, [code, tokens]);
 
 	// --- Render ---
-	const pendingText = code.slice(highlightedLenRef.current);
+	const isDisplayTruncated = code.length > STREAMING_CODE_DISPLAY_MAX_CHARS;
+	const displayCode = isDisplayTruncated ? code.slice(-STREAMING_CODE_DISPLAY_MAX_CHARS) : code;
+	const tokensMatchContext = tokenContextKeyRef.current === highlightContextKey;
+	const tokensMatchCode = tokensMatchContext && code.startsWith(highlightedCodeRef.current);
+	const highlightedChars = isDisplayTruncated || !tokensMatchCode ? 0 : highlightedLenRef.current;
+	const displayTokens = isDisplayTruncated || !tokensMatchCode ? null : tokens;
+	const pendingText = displayCode.slice(highlightedChars);
 
 	return (
 		<div className={classes.root} style={style} ref={scrollRef}>
 			<pre>
 				<code>
-					{tokens
-						? tokens.map((line, li) => (
+					{isDisplayTruncated && <span>{"…\n"}</span>}
+					{displayTokens
+						? displayTokens.map((line, li) => (
 								// biome-ignore lint/suspicious/noArrayIndexKey: lines are positional
 								<span key={li}>
 									{li > 0 && "\n"}
@@ -146,7 +190,7 @@ export const StreamingCode = memo(function StreamingCode({
 									))}
 								</span>
 							))
-						: code.slice(0, highlightedLenRef.current)}
+						: displayCode.slice(0, highlightedChars)}
 					{pendingText && <span>{pendingText}</span>}
 				</code>
 			</pre>

@@ -27,6 +27,13 @@ import { GitFileDiff } from "./GitFileDiff";
 
 /** Max files to render per section to avoid UI freeze. */
 const MAX_DISPLAY_FILES = 80;
+const MAX_GIT_FILE_PATH_CHARS = 1_000;
+
+function clampGitFilePath(path: string): string {
+	return path.length > MAX_GIT_FILE_PATH_CHARS
+		? `${path.slice(0, MAX_GIT_FILE_PATH_CHARS)}…`
+		: path;
+}
 
 export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
@@ -279,7 +286,7 @@ function FileRow({
 				{statusChar}
 			</Badge>
 			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }} ff="monospace">
-				{file.path}
+				{clampGitFilePath(file.path)}
 			</Text>
 			{(file.displayLinesAdded > 0 || file.displayLinesRemoved > 0) && (
 				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>

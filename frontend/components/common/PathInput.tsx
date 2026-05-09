@@ -6,6 +6,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 
+const MAX_PATH_OPTIONS = 120;
+
 interface PathInputBaseProps {
 	placeholder?: string;
 	/** Auto-focus on mount */
@@ -95,6 +97,7 @@ export function PathInput(props: PathInputProps) {
 		queryFn: () => api.fsBrowse(parsed.dir || undefined),
 		enabled: parsed.dir.length > 0,
 		staleTime: 5000,
+		gcTime: 30_000,
 		retry: false,
 	});
 
@@ -102,6 +105,8 @@ export function PathInput(props: PathInputProps) {
 	const filterLower = parsed.filter.toLowerCase();
 	const options =
 		data?.entries.filter((e) => !filterLower || e.name.toLowerCase().includes(filterLower)) ?? [];
+	const displayedOptions = options.slice(0, MAX_PATH_OPTIONS);
+	const hiddenOptions = Math.max(0, options.length - displayedOptions.length);
 
 	// Show "Create <name>" option when:
 	// - there's a filter segment typed (user is typing a name)
@@ -144,9 +149,11 @@ export function PathInput(props: PathInputProps) {
 	}, [autoFocus]);
 
 	const CREATE_OPTION_VALUE = "__create__";
+	const MORE_OPTION_VALUE = "__more__";
 
 	const handleOptionSubmit = useCallback(
 		(optionValue: string) => {
+			if (optionValue === MORE_OPTION_VALUE) return;
 			if (optionValue === CREATE_OPTION_VALUE) {
 				// Create the directory
 				if (data?.path && parsed.filter) {
@@ -167,15 +174,15 @@ export function PathInput(props: PathInputProps) {
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
 		// Tab = autocomplete first candidate (like shell tab-completion)
-		if (e.key === "Tab" && combobox.dropdownOpened && options.length > 0) {
+		if (e.key === "Tab" && combobox.dropdownOpened && displayedOptions.length > 0) {
 			e.preventDefault();
 			const idx = combobox.getSelectedOptionIndex();
 			if (idx !== -1) {
 				// Highlighted option — select it
 				combobox.selectOption(idx);
 			} else {
-				// No highlight — pick the first candidate
-				handleOptionSubmit(options[0].path);
+				// No highlight — pick the first displayed candidate
+				handleOptionSubmit(displayedOptions[0].path);
 			}
 			return;
 		}
@@ -247,7 +254,7 @@ export function PathInput(props: PathInputProps) {
 							</Text>
 						</Combobox.Empty>
 					)}
-					{options.map((entry) => (
+					{displayedOptions.map((entry) => (
 						<Combobox.Option key={entry.path} value={entry.path}>
 							<Group gap={8} wrap="nowrap">
 								<IconFolder size={14} style={{ flexShrink: 0, opacity: 0.5 }} />
@@ -257,6 +264,13 @@ export function PathInput(props: PathInputProps) {
 							</Group>
 						</Combobox.Option>
 					))}
+					{hiddenOptions > 0 && (
+						<Combobox.Option value={MORE_OPTION_VALUE} disabled>
+							<Text size="xs" c="dimmed" ta="center">
+								{t("pathInputMoreResults", { count: hiddenOptions })}
+							</Text>
+						</Combobox.Option>
+					)}
 					{canCreate && (
 						<Combobox.Option value={CREATE_OPTION_VALUE} disabled={mkdirMutation.isPending}>
 							<Group gap={8} wrap="nowrap">

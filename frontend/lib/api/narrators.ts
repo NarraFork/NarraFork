@@ -69,6 +69,27 @@ export const narratorsApi = {
 		return request<PaginatedNarrators>(`/narrators${qs ? `?${qs}` : ""}`);
 	},
 	getNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`),
+	getNarratorDraft: (id: string) =>
+		request<{
+			hasDraft: boolean;
+			text: string;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+		}>(`/narrators/${id}/draft`),
+	updateNarratorDraft: (id: string, text: string, sourceId?: string) =>
+		request<{
+			ok: boolean;
+			traits: string[];
+			hasDraft: boolean;
+			text: string;
+			updatedAt: string | null;
+			updatedBy: string | null;
+			sourceId: string | null;
+		}>(`/narrators/${id}/draft`, {
+			method: "PUT",
+			body: JSON.stringify({ text, sourceId }),
+		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
 		if (opts?.includeSubagents !== undefined) {
@@ -111,6 +132,8 @@ export const narratorsApi = {
 		reasoningEffort?: string | null;
 		fastMode?: boolean;
 		relaxedPlan?: boolean;
+		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+		dangerReflectionOverride?: "inherit" | "on" | "off";
 		cwd?: string;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) =>
@@ -418,6 +441,17 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${id}/relaxed-plan`, {
 			method: "PATCH",
 			body: JSON.stringify({ relaxedPlan }),
+		}),
+	updateNarratorReflectionOverrides: (
+		id: string,
+		data: {
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off";
+		},
+	) =>
+		request<{ ok: boolean }>(`/narrators/${id}/reflection-overrides`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
 		}),
 	updateNarratorPruneEnabled: (id: string, pruneEnabled: boolean) =>
 		request<{ ok: boolean }>(`/narrators/${id}/prune-enabled`, {

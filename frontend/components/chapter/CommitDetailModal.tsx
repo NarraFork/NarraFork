@@ -24,7 +24,7 @@ import {
 	IconPencil,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 interface CommitDetailModalProps {
@@ -41,62 +41,116 @@ const STATUS_ICONS: Record<string, typeof IconFile> = {
 	renamed: IconFileSymlink,
 };
 
+const MAX_DIFF_RENDER_LINES = 3_000;
+const MAX_DIFF_RENDER_CHARS = 160_000;
+const MAX_COMMIT_FILES_RENDERED = 1_000;
+const MAX_COMMIT_FULL_MESSAGE_CHARS = 20_000;
+const MAX_COMMIT_DETAIL_INLINE_TEXT_CHARS = 1_000;
+
+function clampCommitDetailInlineText(value: string | undefined): string {
+	if (!value) return "";
+	return value.length > MAX_COMMIT_DETAIL_INLINE_TEXT_CHARS
+		? `${value.slice(0, MAX_COMMIT_DETAIL_INLINE_TEXT_CHARS)}…`
+		: value;
+}
+
+function formatCommitFilePath(file: { path: string; oldPath?: string }): string {
+	const path = clampCommitDetailInlineText(file.path);
+	if (!file.oldPath) return path;
+	return `${clampCommitDetailInlineText(file.oldPath)} → ${path}`;
+}
+
+function isDiffMetadataLine(line: string): boolean {
+	return (
+		line.startsWith("diff --git") ||
+		line.startsWith("index ") ||
+		line.startsWith("old mode") ||
+		line.startsWith("new mode")
+	);
+}
+
+function buildDiffPreview(diff: string): { lines: string[]; truncated: boolean } {
+	const lines: string[] = [];
+	let renderedChars = 0;
+	let truncated = false;
+	let start = 0;
+
+	while (start <= diff.length) {
+		const newline = diff.indexOf("\n", start);
+		const end = newline === -1 ? diff.length : newline;
+		const line = diff.slice(start, end);
+		start = newline === -1 ? diff.length + 1 : newline + 1;
+		if (isDiffMetadataLine(line)) continue;
+		if (
+			lines.length >= MAX_DIFF_RENDER_LINES ||
+			renderedChars + line.length > MAX_DIFF_RENDER_CHARS
+		) {
+			truncated = true;
+			break;
+		}
+		lines.push(line);
+		renderedChars += line.length + 1;
+	}
+
+	return { lines, truncated };
+}
+
 function DiffBlock({ diff }: { diff: string }) {
-	const lines = diff
-		.split("\n")
-		.filter(
-			(l) =>
-				!l.startsWith("diff --git") &&
-				!l.startsWith("index ") &&
-				!l.startsWith("old mode") &&
-				!l.startsWith("new mode"),
-		);
+	const { t } = useTranslation("chapters");
+	const { lines, truncated } = useMemo(() => buildDiffPreview(diff), [diff]);
 
 	if (lines.length === 0) return null;
 
 	return (
-		<Box
-			style={{
-				borderRadius: 4,
-				border: "1px solid var(--mantine-color-dark-4)",
-				overflow: "hidden",
-				marginBottom: 8,
-			}}
-		>
-			{lines.map((line, i) => {
-				let bg: string | undefined;
-				let color: string | undefined;
-				if (line.startsWith("+") && !line.startsWith("+++")) {
-					bg = "rgba(40, 167, 69, 0.12)";
-					color = "var(--mantine-color-green-4)";
-				} else if (line.startsWith("-") && !line.startsWith("---")) {
-					bg = "rgba(220, 53, 69, 0.12)";
-					color = "var(--mantine-color-red-4)";
-				} else if (line.startsWith("@@")) {
-					color = "var(--mantine-color-blue-4)";
-				}
-				return (
-					<Box
-						// biome-ignore lint/suspicious/noArrayIndexKey: diff lines have no stable key
-						key={i}
-						component="pre"
-						style={{
-							margin: 0,
-							padding: "0 8px",
-							backgroundColor: bg,
-							color,
-							fontSize: 12,
-							fontFamily: "var(--mantine-font-family-monospace)",
-							lineHeight: 1.6,
-							whiteSpace: "pre-wrap",
-							wordBreak: "break-all",
-						}}
-					>
-						{line}
-					</Box>
-				);
-			})}
-		</Box>
+		<>
+			<Box
+				style={{
+					borderRadius: 4,
+					border: "1px solid var(--mantine-color-dark-4)",
+					overflow: "hidden",
+					marginBottom: 8,
+				}}
+			>
+				{lines.map((line, i) => {
+					let bg: string | undefined;
+					let color: string | undefined;
+					if (line.startsWith("+") && !line.startsWith("+++")) {
+						bg = "rgba(40, 167, 69, 0.12)";
+						color = "var(--mantine-color-green-4)";
+					} else if (line.startsWith("-") && !line.startsWith("---")) {
+						bg = "rgba(220, 53, 69, 0.12)";
+						color = "var(--mantine-color-red-4)";
+					} else if (line.startsWith("@@")) {
+						color = "var(--mantine-color-blue-4)";
+					}
+					return (
+						<Box
+							// biome-ignore lint/suspicious/noArrayIndexKey: diff lines have no stable key
+							key={i}
+							component="pre"
+							style={{
+								margin: 0,
+								padding: "0 8px",
+								backgroundColor: bg,
+								color,
+								fontSize: 12,
+								fontFamily: "var(--mantine-font-family-monospace)",
+								lineHeight: 1.6,
+								whiteSpace: "pre-wrap",
+								wordBreak: "break-all",
+							}}
+						>
+							{line}
+						</Box>
+					);
+				})}
+			</Box>
+			{truncated && (
+				<Badge size="xs" color="orange" mb={4}>
+					{t("commitDetail.diffPreviewTruncated")}
+				</Badge>
+			)}
+		</>
 	);
 }
 
@@ -130,6 +184,7 @@ function FileDiffRow({
 		queryFn: () => api.getCommitFileDiff(chapterId, sha, file.path),
 		enabled: expanded && !hasInline,
 		staleTime: 5 * 60_000,
+		gcTime: 30_000,
 	});
 
 	const resolvedDiff = hasInline ? inlineDiff : diffData?.diff;
@@ -142,7 +197,7 @@ function FileDiffRow({
 					{expanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
 					<StatusIcon size={14} color={`var(--mantine-color-${statusColor}-5)`} />
 					<Text size="sm" ff="monospace" style={{ flex: 1, minWidth: 0 }} lineClamp={1}>
-						{file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}
+						{formatCommitFilePath(file)}
 					</Text>
 					<Group gap={4} style={{ flexShrink: 0 }}>
 						{file.linesAdded > 0 && (
@@ -190,10 +245,18 @@ export function CommitDetailModal({
 		queryKey: ["commitDetail", chapterId, commitSha],
 		queryFn: () => api.getChapterCommit(chapterId, commitSha ?? ""),
 		enabled: opened && !!commitSha,
+		gcTime: 30_000,
 	});
 
 	const totalAdded = data?.files.reduce((s, f) => s + f.linesAdded, 0) ?? 0;
 	const totalRemoved = data?.files.reduce((s, f) => s + f.linesRemoved, 0) ?? 0;
+	const displayedFiles = data?.files.slice(0, MAX_COMMIT_FILES_RENDERED) ?? [];
+	const hiddenFiles = Math.max(0, (data?.files.length ?? 0) - displayedFiles.length);
+	const displayedFullMessage =
+		data?.fullMessage && data.fullMessage.length > MAX_COMMIT_FULL_MESSAGE_CHARS
+			? data.fullMessage.slice(0, MAX_COMMIT_FULL_MESSAGE_CHARS)
+			: data?.fullMessage;
+	const fullMessageTruncated = !!data?.fullMessage && displayedFullMessage !== data.fullMessage;
 
 	return (
 		<Modal
@@ -203,7 +266,7 @@ export function CommitDetailModal({
 				<Group gap={8}>
 					<Code>{commitSha?.slice(0, 10)}</Code>
 					<Text size="sm" lineClamp={1}>
-						{data?.message}
+						{clampCommitDetailInlineText(data?.message)}
 					</Text>
 				</Group>
 			}
@@ -236,10 +299,17 @@ export function CommitDetailModal({
 								{data.source}
 							</Badge>
 						</Group>
-						{data.fullMessage && data.fullMessage !== data.message && (
-							<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }} mt={4}>
-								{data.fullMessage}
-							</Text>
+						{displayedFullMessage && displayedFullMessage !== data.message && (
+							<>
+								<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }} mt={4}>
+									{displayedFullMessage}
+								</Text>
+								{fullMessageTruncated && (
+									<Text size="xs" c="orange" mt={2}>
+										{t("commitDetail.messagePreviewTruncated")}
+									</Text>
+								)}
+							</>
 						)}
 						<Group gap="xs" mt={4}>
 							<Text size="xs" c="dimmed">
@@ -262,7 +332,7 @@ export function CommitDetailModal({
 
 					<ScrollArea.Autosize mah="65vh" px="sm" py="xs">
 						<Stack gap={0}>
-							{data.files.map((file) => (
+							{displayedFiles.map((file) => (
 								<FileDiffRow
 									key={file.path}
 									chapterId={chapterId}
@@ -271,6 +341,11 @@ export function CommitDetailModal({
 									inlineDiff={data.diffInlined ? file.diff : undefined}
 								/>
 							))}
+							{hiddenFiles > 0 && (
+								<Text size="xs" c="dimmed" ta="center" py="sm">
+									{t("commitDetail.filesPreviewTruncated", { count: hiddenFiles })}
+								</Text>
+							)}
 							{data.files.length === 0 && (
 								<Text size="sm" c="dimmed" ta="center" py="xl">
 									{t("commitDetail.noDiff", "No file changes in this commit.")}

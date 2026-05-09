@@ -3,8 +3,10 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
+import { getAutoCompactKeepPairs } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
+import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult } from "./narrator-session-state";
 import { activeNarrators, compactLocks, pruneLocks } from "./narrator-session-state";
@@ -12,6 +14,17 @@ import { activeNarrators, compactLocks, pruneLocks } from "./narrator-session-st
 /** Compact operation timeout in milliseconds (5 minutes). */
 const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
 const COMPACT_FAILURE_TEXT = "[Compact Failed]";
+const COMPACTING_SUBSTATUS = "compacting";
+
+async function setCompactingSubstatus(narratorId: string, enabled: boolean) {
+	const updated = enabled
+		? await narratorService.addSubstatus(narratorId, COMPACTING_SUBSTATUS)
+		: await narratorService.removeSubstatus(narratorId, COMPACTING_SUBSTATUS);
+	const active = activeNarrators.get(narratorId);
+	if (active?.alive) {
+		active._substatus = new Set(updated);
+	}
+}
 
 /**
  * Minimum prunedPercent required before compact is allowed at the compactStart
@@ -26,6 +39,34 @@ export function isCompactInProgress(narratorId: string): boolean {
 
 // Re-export locks so narrator-session can access them
 export { compactLocks, pruneLocks };
+
+type MessageWithSeq = { id: string; seq?: number };
+
+async function attachBuildHistoryTokenEstimate<T extends MessageWithSeq>(
+	narratorId: string,
+	locale: Locale,
+	message: T,
+): Promise<{ message: T; contextPercent?: number }> {
+	try {
+		const estimate = await estimateNarratorBuildHistoryTokens(narratorId, locale);
+		const updated = await narratorService.updateMessageHistoryTokenEstimate(
+			message.id,
+			narratorId,
+			estimate,
+		);
+		return {
+			message: (updated ? { ...updated, seq: updated.seq ?? message.seq } : message) as T,
+			contextPercent: estimate.contextPercent,
+		};
+	} catch (err) {
+		logger.warn("Failed to estimate build history tokens after compact", {
+			narratorId,
+			messageId: message.id,
+			error: String(err),
+		});
+		return { message };
+	}
+}
 
 /**
  * Trigger a mid-turn compact: eagerly reserve the lock, find the boundary, and run compact.
@@ -43,7 +84,10 @@ export function triggerMidTurnCompact(
 	logger.info("Context usage high, triggering compact (mid-turn)", { narratorId });
 	let compactLock!: CompactLock;
 	const compactPromise: Promise<CompactLockResult> = (async () => {
-		const boundaryMessageId = await narratorService.getCompactBoundaryMessage(narratorId);
+		const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+			narratorId,
+			getAutoCompactKeepPairs(),
+		);
 		if (!boundaryMessageId) {
 			logger.debug("No compact boundary found, aborting mid-turn compact", { narratorId });
 			return { kind: "history_probe", compacted: false };
@@ -176,6 +220,7 @@ async function doRunCustomCompact(
 
 	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
+	await setCompactingSubstatus(narratorId, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
 
 	const narrator = await db.query.narrators.findFirst({
@@ -200,31 +245,23 @@ async function doRunCustomCompact(
 			contextPercent,
 		);
 
-		if (compactedMsg) {
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactedMsg });
-		}
 		await narratorService.clearPruneBoundary(narratorId);
 
-		// Only transition status for primary narrators.
-		// Subagents manage their own lifecycle via finalizeSubagent — touching
-		// their status/substatus here creates a race that can clear substatus=["unread"]
-		// after the subagent has already been finalized.
-		if (!isSubagent) {
-			const transitioned = await narratorService.compareAndSetStatus(narratorId, "idle", "idle", {
-				substatus: [],
-			});
-			if (!transitioned) {
-				logger.info("Skipping idle transition after compact — narrator already moved on", {
-					narratorId,
-				});
-			}
+		let contextPercentAfter = contextPercent;
+		if (compactedMsg) {
+			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, compactedMsg);
+			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: estimated.message });
 		}
 
+		// Do not force a status transition here. Clearing only the compacting tag
+		// in finally preserves unrelated substatus and avoids racing subagent
+		// lifecycle updates managed by finalizeSubagent.
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 		broadcastToNarrator(narratorId, {
 			type: "compact_done",
 			narratorId,
-			contextPercentAfter: contextPercent,
+			contextPercentAfter,
 		});
 		return true;
 	} catch (err) {
@@ -276,6 +313,13 @@ async function doRunCustomCompact(
 			messageId: compactingMsg.id,
 		});
 		throw err;
+	} finally {
+		await setCompactingSubstatus(narratorId, false).catch((err) => {
+			logger.warn("Failed to clear compacting substatus after custom compact", {
+				narratorId,
+				error: String(err),
+			});
+		});
 	}
 }
 
@@ -335,6 +379,7 @@ async function doRunSegmentCompact(
 	const { message: markerMsg, hiddenMessageIds } =
 		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
+	await setCompactingSubstatus(narratorId, true);
 	broadcastToNarrator(narratorId, {
 		type: "segment_compact_hide",
 		narratorId,
@@ -347,6 +392,7 @@ async function doRunSegmentCompact(
 
 		if (messages.length === 0) {
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
+			await setCompactingSubstatus(narratorId, false);
 			broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
 			return false;
 		}
@@ -365,8 +411,11 @@ async function doRunSegmentCompact(
 			contextPercent,
 		);
 
+		let contextPercentAfter = contextPercent;
 		if (finalizedMsg) {
-			broadcastToNarrator(narratorId, { type: "message", narratorId, message: finalizedMsg });
+			const estimated = await attachBuildHistoryTokenEstimate(narratorId, locale, finalizedMsg);
+			contextPercentAfter = estimated.contextPercent ?? contextPercentAfter;
+			broadcastToNarrator(narratorId, { type: "message", narratorId, message: estimated.message });
 		}
 
 		logger.info("Segment compact completed", {
@@ -374,9 +423,11 @@ async function doRunSegmentCompact(
 			messageCount: messageIds.length,
 			summaryLength: summary.length,
 		});
+		await setCompactingSubstatus(narratorId, false);
 		broadcastToNarrator(narratorId, {
 			type: "compact_done",
 			narratorId,
+			contextPercentAfter,
 			isSegment: true,
 		});
 		return true;
@@ -407,6 +458,7 @@ async function doRunSegmentCompact(
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
 		}
 
+		await setCompactingSubstatus(narratorId, false).catch(() => {});
 		broadcastToNarrator(narratorId, {
 			type: "compact_failed",
 			narratorId,

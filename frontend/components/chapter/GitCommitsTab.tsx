@@ -16,6 +16,14 @@ import { formatRelativeTime } from "../../lib/format";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 const LIMIT = 50;
+const MAX_GIT_COMMIT_LIST_TEXT_CHARS = 1_000;
+
+function clampGitCommitListText(value: string | null | undefined): string {
+	if (!value) return "";
+	return value.length > MAX_GIT_COMMIT_LIST_TEXT_CHARS
+		? `${value.slice(0, MAX_GIT_COMMIT_LIST_TEXT_CHARS)}…`
+		: value;
+}
 
 export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
@@ -50,10 +58,10 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 							{c.shortSha}
 						</Text>
 						<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }}>
-							{c.message}
+							{clampGitCommitListText(c.message)}
 						</Text>
 						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-							{c.author}
+							{clampGitCommitListText(c.author)}
 						</Text>
 						<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 							{formatRelativeTime(c.date)}

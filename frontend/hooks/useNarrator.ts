@@ -12,6 +12,10 @@ import {
 } from "../lib/api";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
+const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
+const NARRATORS_LIST_GC_TIME_MS = 60_000;
+const NARRATOR_DETAIL_QUERY_GC_TIME_MS = 60_000;
+
 export function useNarrators(opts?: {
 	chapterId?: string;
 	standalone?: boolean;
@@ -23,6 +27,7 @@ export function useNarrators(opts?: {
 		queryKey: ["narrators", { ...opts }],
 		queryFn: () => api.listNarrators(opts),
 		enabled: !!(opts?.chapterId || opts?.standalone),
+		gcTime: NARRATORS_LIST_GC_TIME_MS,
 	});
 }
 
@@ -45,6 +50,7 @@ export function useNarratorsPaginated(opts?: {
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (lastPage) =>
 			lastPage.hasMore ? (lastPage.nextCursor ?? undefined) : undefined,
+		gcTime: NARRATORS_LIST_GC_TIME_MS,
 	});
 }
 
@@ -67,6 +73,7 @@ export function useFileModifications(
 		queryFn: () =>
 			api.getFileModifications(narratorId, upToMessageId ?? undefined, fromMessageId ?? undefined),
 		enabled,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -94,6 +101,7 @@ export function useFileDiff(
 				fromMessageId ?? undefined,
 			),
 		enabled: enabled && !!snapshotId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -102,6 +110,7 @@ export function useDeletePreview(narratorId: string, messageId: string | null, e
 		queryKey: ["narrators", narratorId, "delete-preview", messageId],
 		queryFn: () => api.getDeletePreview(narratorId, messageId as string),
 		enabled: enabled && !!messageId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -115,6 +124,7 @@ export function useRollbackPreview(
 		queryKey: ["narrators", narratorId, "rollback-preview", messageId, blockIndex],
 		queryFn: () => api.getRollbackPreview(narratorId, messageId as string, blockIndex as number),
 		enabled: enabled && !!messageId && blockIndex != null,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -127,6 +137,7 @@ export function usePermissionFilePreview(
 		queryKey: ["narrators", narratorId, "permission-file-preview", toolUseId],
 		queryFn: () => api.getPermissionFilePreview(narratorId, toolUseId as string),
 		enabled: enabled && !!toolUseId,
+		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -268,6 +279,7 @@ export function useNarratorGoals(narratorId: string) {
 		queryKey: ["narrators", narratorId, "goals"],
 		queryFn: () => api.getGoals(narratorId),
 		enabled: !!narratorId,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -327,6 +339,7 @@ export function useNarrator(id: string) {
 		// A 30s staleTime avoids redundant refetches when multiple components
 		// subscribe to the same narrator (e.g. route + NarratorPanel).
 		staleTime: 30_000,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -336,8 +349,11 @@ export function useNarratorUsageStats(narratorId: string, includeSubagents = tru
 		queryFn: () => api.getNarratorUsageStats(narratorId, { includeSubagents }),
 		enabled: !!narratorId && enabled,
 		staleTime: 15_000,
+		gcTime: 60_000,
 	});
 }
+
+const NARRATOR_MESSAGES_GC_TIME_MS = 60_000;
 
 type MessagePageParam =
 	| {
@@ -377,6 +393,7 @@ export function useNarratorMessages(narratorId: string, around?: NarratorMessage
 		// from refetching ALL cached pages when the component remounts, which would
 		// cause a cascade of API calls proportional to the number of loaded pages.
 		staleTime: Infinity,
+		gcTime: NARRATOR_MESSAGES_GC_TIME_MS,
 	});
 }
 
@@ -413,6 +430,8 @@ export function useCreateNarrator() {
 			reasoningEffort?: string | null;
 			fastMode?: boolean;
 			relaxedPlan?: boolean;
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
 		}) => api.createNarrator(data),
 		onSuccess: () => {
@@ -738,6 +757,24 @@ export function useUpdateRelaxedPlan() {
 	});
 }
 
+export function useUpdateReflectionOverrides() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off";
+		}) => api.updateNarratorReflectionOverrides(id, data),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
 export function useUpdateModel() {
 	const qc = useQueryClient();
 	return useMutation({
@@ -765,6 +802,7 @@ export function useNarratorCustomTraits(id: string, enabled = true) {
 		queryKey: ["narrators", id, "custom-traits"],
 		queryFn: () => api.getCustomTraits(id),
 		enabled: !!id && enabled,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
 	});
 }
 

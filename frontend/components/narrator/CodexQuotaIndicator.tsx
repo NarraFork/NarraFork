@@ -25,6 +25,7 @@ function getSegmentRatio(segment: PublicCodexQuotaSegment): number {
 }
 
 const CODEX_QUOTA_QUERY_KEY = ["codex", "quota-overview"] as const;
+const CODEX_QUOTA_QUERY_GC_TIME_MS = 60_000;
 const TOUCH_HOVER_SUPPRESS_MS = 900;
 
 function hasChartData(overview: PublicCodexQuotaOverview): boolean {
@@ -123,6 +124,7 @@ export function CodexQuotaIndicator({
 		refetchOnMount: "always",
 		refetchOnReconnect: false,
 		refetchOnWindowFocus: false,
+		gcTime: CODEX_QUOTA_QUERY_GC_TIME_MS,
 	});
 
 	useEffect(() => {

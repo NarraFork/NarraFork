@@ -188,6 +188,34 @@ describe("executeAgentLoop result handling", () => {
 		expect(result.hasError).toBe(false);
 	});
 
+	test("preserves retryable error metadata for outer recovery", async () => {
+		const ac = new AbortController();
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "retryable_error",
+						message: "retry me",
+						code: "codex_quota_failover_rebuild",
+						bypassRetryLimit: true,
+					},
+				]),
+				processEventFn: async () => null,
+			},
+		);
+
+		expect(result.retryableError).toBe("retry me");
+		expect(result.retryableErrorCode).toBe("codex_quota_failover_rebuild");
+		expect(result.bypassRetryLimit).toBe(true);
+	});
+
 	test("treats empty-response invalid state as an error", async () => {
 		const ac = new AbortController();
 

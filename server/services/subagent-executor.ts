@@ -638,7 +638,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				narratorId,
 				error: result.retryableError,
 				retryCount: transientRetries,
-				maxRetries: getMaxTransientRetries(),
+				maxRetries: result.bypassRetryLimit ? -1 : getMaxTransientRetries(),
 				signal,
 			});
 			if (shouldRetry) {
@@ -646,9 +646,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				// If tools were already executed, the message is kept so the
 				// rebuilt history includes them.
 				const partialId = eventContext.getPartialMessageId();
+				let keptPartial = false;
 				if (partialId) {
-					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+					keptPartial = await finalizeOrCleanupPartialMessage(partialId, narratorId);
 					eventContext.setPartialMessageId(undefined);
+				}
+				if (keptPartial) {
+					prompt = "";
 				}
 				// Rebuild history from DB so the retry includes any tool calls
 				// that were persisted before the API error occurred. Without this,

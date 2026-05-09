@@ -9,6 +9,7 @@ const SummaryModelPickerModal = lazy(() =>
 		default: m.SummaryModelPickerModal,
 	})),
 );
+const SUMMARY_MODEL_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
 /**
  * Lightweight global host for summary model warnings.
@@ -33,6 +34,7 @@ export function SummaryModelPickerHost() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: SUMMARY_MODEL_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	// Check on settings load: if summaryModelAvailable is false, open the modal
