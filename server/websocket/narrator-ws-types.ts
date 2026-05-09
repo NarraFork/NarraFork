@@ -3,6 +3,8 @@
  * both event-bus.ts and narrator-ws.ts can reference NarratorServerMessage
  * without creating circular imports.
  */
+
+import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { GitStatusSummary } from "../services/git-service";
 
 // Server → Client messages
@@ -328,6 +330,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			orphanChildren: unknown[];
 			topLevel: unknown[];
+			cursor?: CatchUpCursor;
+			messageVersion?: number;
 	  }
 	| { type: "error"; message: string }
 	| {

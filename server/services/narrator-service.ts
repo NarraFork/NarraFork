@@ -54,7 +54,11 @@ import type {
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
 import { narratorMessageQueries } from "./narrator-messages";
-import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
+import {
+	appendMessageRef,
+	bumpParentNarratorMessageVersion,
+	narratorPersistence,
+} from "./narrator-persistence";
 
 export {
 	enrichToolUseBlocks,
@@ -720,6 +724,7 @@ export const narratorService = {
 			.returning();
 
 		await appendMessageRef(narratorId, id);
+		await bumpParentNarratorMessageVersion(parentToolUseId);
 		return msg;
 	},
 

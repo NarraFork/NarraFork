@@ -1,4 +1,19 @@
+import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { z } from "zod";
+
+const catchUpCursorSchema = z.object({
+	parentLastMessageId: z.string().min(1).optional(),
+	childAnchors: z
+		.array(
+			z.object({
+				parentToolUseId: z.string().min(1),
+				narratorId: z.string().min(1).optional(),
+				lastMessageId: z.string().min(1).optional(),
+			}),
+		)
+		.max(MAX_CATCH_UP_CHILD_ANCHORS)
+		.optional(),
+});
 
 // Narrator client → server
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
@@ -7,6 +22,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		type: z.literal("subscribe"),
 		narratorIds: z.array(z.string().min(1)),
 		lastMessageId: z.string().min(1).optional(),
+		catchUpCursor: catchUpCursorSchema.optional(),
 	}),
 	z.object({
 		type: z.literal("unsubscribe"),
@@ -62,6 +78,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		narratorId: z.string().min(1),
 		version: z.number().int().min(0),
 		lastMessageId: z.string().min(1).optional(),
+		catchUpCursor: catchUpCursorSchema.optional(),
 	}),
 	z.object({
 		type: z.literal("update_timeout"),

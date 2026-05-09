@@ -10,6 +10,8 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
+import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { getToken } from "./api";
 import { buildWsUrl, safeCloseWs } from "./ws";
 import { removeWSStatus, setWSStatus } from "./ws-status";
@@ -47,6 +49,59 @@ interface ListenerEntry {
 }
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
+
+type MinimalTreeMessage = {
+	id?: unknown;
+	narratorId?: unknown;
+	parentToolUseId?: unknown;
+	toolCalls?: unknown;
+	contentJson?: unknown;
+};
+
+function upsertChildAnchor(cursor: CatchUpCursor, anchor: CatchUpChildAnchor): CatchUpCursor {
+	const anchors = new Map<string, CatchUpChildAnchor>();
+	for (const item of cursor.childAnchors ?? []) {
+		if (!item.parentToolUseId) continue;
+		anchors.set(item.parentToolUseId, item);
+	}
+	const existing = anchors.get(anchor.parentToolUseId);
+	anchors.delete(anchor.parentToolUseId);
+	anchors.set(anchor.parentToolUseId, {
+		parentToolUseId: anchor.parentToolUseId,
+		narratorId: anchor.narratorId ?? existing?.narratorId,
+		lastMessageId: anchor.lastMessageId ?? existing?.lastMessageId,
+	});
+	return { ...cursor, childAnchors: [...anchors.values()].slice(-MAX_CATCH_UP_CHILD_ANCHORS) };
+}
+
+function normalizeCatchUpCursor(cursor: CatchUpCursor): CatchUpCursor {
+	let normalized: CatchUpCursor = { parentLastMessageId: cursor.parentLastMessageId };
+	for (const anchor of cursor.childAnchors ?? []) {
+		if (anchor.parentToolUseId) normalized = upsertChildAnchor(normalized, anchor);
+	}
+	return normalized;
+}
+
+function extractToolUseIds(message: MinimalTreeMessage): string[] {
+	const ids = new Set<string>();
+	if (Array.isArray(message.toolCalls)) {
+		for (const tc of message.toolCalls) {
+			if (tc && typeof tc === "object") {
+				const toolUseId = (tc as { toolUseId?: unknown }).toolUseId;
+				if (typeof toolUseId === "string") ids.add(toolUseId);
+			}
+		}
+	}
+	if (Array.isArray(message.contentJson)) {
+		for (const block of message.contentJson) {
+			if (block && typeof block === "object") {
+				const record = block as { type?: unknown; id?: unknown };
+				if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
+			}
+		}
+	}
+	return [...ids];
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -104,8 +159,11 @@ class NarratorWSManager {
 	// --- Stats ---
 	private statsRefCount = 0;
 
-	// --- Last message IDs for catch-up ---
+	// --- Last message IDs for legacy catch-up fallback ---
 	private lastMessageIds = new Map<string, string>();
+
+	// --- Compound catch-up cursors for top-level + subagent child streams ---
+	private catchUpCursors = new Map<string, CatchUpCursor>();
 
 	// --- Message version tracking for sync_check ---
 	private messageVersions = new Map<string, number>();
@@ -204,8 +262,10 @@ class NarratorWSManager {
 			this.lastMessageIds.set(narratorIds[0], opts.lastMessageId);
 			while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
 				const oldest = this.lastMessageIds.keys().next().value;
-				if (oldest !== undefined) this.lastMessageIds.delete(oldest);
-				else break;
+				if (oldest !== undefined) {
+					this.lastMessageIds.delete(oldest);
+					this.catchUpCursors.delete(oldest);
+				} else break;
 			}
 		}
 
@@ -271,6 +331,7 @@ class NarratorWSManager {
 				this.narratorRefCounts.delete(nId);
 				this.pendingSubscribeIds.delete(nId);
 				this.lastMessageIds.delete(nId);
+				this.catchUpCursors.delete(nId);
 				this.messageVersions.delete(nId);
 				actuallyRemoved.push(nId);
 			}
@@ -386,9 +447,46 @@ class NarratorWSManager {
 		// Evict oldest entries if over limit
 		while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
 			const oldest = this.lastMessageIds.keys().next().value;
-			if (oldest !== undefined) this.lastMessageIds.delete(oldest);
-			else break;
+			if (oldest !== undefined) {
+				this.lastMessageIds.delete(oldest);
+				this.catchUpCursors.delete(oldest);
+			} else break;
 		}
+	}
+
+	updateCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): void {
+		if (!cursor) return;
+		const normalized = normalizeCatchUpCursor(cursor);
+		if (normalized.parentLastMessageId)
+			this.updateLastMessageId(narratorId, normalized.parentLastMessageId);
+		this.catchUpCursors.delete(narratorId);
+		this.catchUpCursors.set(narratorId, normalized);
+	}
+
+	clearCatchUpState(narratorId: string): void {
+		this.catchUpCursors.delete(narratorId);
+		this.lastMessageIds.delete(narratorId);
+	}
+
+	noteMessage(narratorId: string, message: MinimalTreeMessage | undefined): void {
+		if (!message || typeof message.id !== "string") return;
+		this.updateLastMessageId(narratorId, message.id);
+		let cursor = this.catchUpCursors.get(narratorId) ?? {
+			parentLastMessageId: this.lastMessageIds.get(narratorId),
+		};
+		if (typeof message.parentToolUseId === "string" && message.parentToolUseId) {
+			cursor = upsertChildAnchor(cursor, {
+				parentToolUseId: message.parentToolUseId,
+				narratorId: typeof message.narratorId === "string" ? message.narratorId : undefined,
+				lastMessageId: message.id,
+			});
+		} else {
+			cursor = { ...cursor, parentLastMessageId: message.id };
+			for (const toolUseId of extractToolUseIds(message)) {
+				cursor = upsertChildAnchor(cursor, { parentToolUseId: toolUseId });
+			}
+		}
+		this.updateCatchUpCursor(narratorId, cursor);
 	}
 
 	// -----------------------------------------------------------------------
@@ -413,13 +511,15 @@ class NarratorWSManager {
 	checkSync(narratorId: string): void {
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
 		const version = this.messageVersions.get(narratorId) ?? 0;
+		const cursor = this.catchUpCursors.get(narratorId);
 		const lastMessageId = this.lastMessageIds.get(narratorId);
 		const msg: Record<string, unknown> = {
 			type: "sync_check",
 			narratorId,
 			version,
 		};
-		if (lastMessageId) msg.lastMessageId = lastMessageId;
+		if (cursor) msg.catchUpCursor = cursor;
+		else if (lastMessageId) msg.lastMessageId = lastMessageId;
 		this.ws.send(JSON.stringify(msg));
 	}
 
@@ -620,15 +720,9 @@ class NarratorWSManager {
 		// Clear pending queue — everything in narratorRefCounts will be sent below
 		this.pendingSubscribeIds.clear();
 
-		// Subscribe narrators — send individually so each can carry its own lastMessageId
+		// Subscribe narrators individually so each can carry its own catch-up cursor.
 		for (const [narratorId] of this.narratorRefCounts) {
-			const lastMessageId = this.lastMessageIds.get(narratorId);
-			const msg: Record<string, unknown> = {
-				type: "subscribe",
-				narratorIds: [narratorId],
-			};
-			if (lastMessageId) msg.lastMessageId = lastMessageId;
-			ws.send(JSON.stringify(msg));
+			this._sendSubscribe([narratorId]);
 		}
 
 		// Presence
@@ -710,18 +804,19 @@ class NarratorWSManager {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-		if (lastMessageId && narratorIds.length === 1) {
-			ws.send(
-				JSON.stringify({
-					type: "subscribe",
-					narratorIds,
-					lastMessageId,
-				}),
-			);
-		} else {
-			// For batch subscribes (no catch-up), send as one message
-			ws.send(JSON.stringify({ type: "subscribe", narratorIds }));
+		if (narratorIds.length === 1) {
+			const narratorId = narratorIds[0];
+			const cursor = this.catchUpCursors.get(narratorId);
+			const legacyLastMessageId = lastMessageId ?? this.lastMessageIds.get(narratorId);
+			const msg: Record<string, unknown> = { type: "subscribe", narratorIds };
+			if (cursor) msg.catchUpCursor = cursor;
+			else if (legacyLastMessageId) msg.lastMessageId = legacyLastMessageId;
+			ws.send(JSON.stringify(msg));
+			return;
 		}
+
+		// For batch subscribes (no catch-up), send as one message
+		ws.send(JSON.stringify({ type: "subscribe", narratorIds }));
 	}
 
 	// Message types that are latency-sensitive and must be dispatched immediately

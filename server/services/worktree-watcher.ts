@@ -58,10 +58,10 @@ interface WatcherEntry {
 const parcelWatcher = hotSafe<ParcelRecursiveWatcher>(
 	"narrafork.worktreeWatcher.parcel",
 	() =>
-		new ParcelRecursiveWatcher((rootPath, _events) => {
+		new ParcelRecursiveWatcher((rootPath, events) => {
 			// Events from parcel are already coalesced and throttled.
 			// We just need to trigger the debounced git-status flow.
-			worktreeWatcher._onFileChange(rootPath);
+			worktreeWatcher._onFileChange(rootPath, events.length);
 		}),
 );
 
@@ -195,10 +195,11 @@ export const worktreeWatcher = {
 	},
 
 	/** Internal: debounced handler for file change events with rate limiting. */
-	_onFileChange(worktreePath: string): void {
+	_onFileChange(worktreePath: string, eventCount = 1): void {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 
+		const normalizedEventCount = Math.max(1, eventCount);
 		const now = Date.now();
 		const rl = entry.rateLimit;
 		if (now - rl.windowStart > RATE_WINDOW_MS) {
@@ -206,13 +207,18 @@ export const worktreeWatcher = {
 			rl.count = 0;
 			rl.warned = false;
 		}
-		rl.count++;
+		rl.count += normalizedEventCount;
 		if (rl.count > RATE_LIMIT) {
+			if (entry.debounceTimer) {
+				clearTimeout(entry.debounceTimer);
+				entry.debounceTimer = undefined;
+			}
 			if (!rl.warned) {
 				rl.warned = true;
 				logger.warn("Worktree watcher rate limit exceeded, suppressing events", {
 					worktreePath,
 					eventsInWindow: rl.count,
+					eventCount: normalizedEventCount,
 					windowMs: RATE_WINDOW_MS,
 				});
 			}

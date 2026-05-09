@@ -2411,14 +2411,31 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (topLevel.length > 0) {
 						const pages = [...result.pages];
 						const firstPage = { ...pages[0] };
-						const existingIds = new Set(firstPage.messages.map((m: NarratorMsg) => m.id));
-						const newMsgs = topLevel
-							.filter((m: NarratorMsg) => m?.id && m?.createdAt && !existingIds.has(m.id))
-							.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
-						if (newMsgs.length > 0) {
+						const incomingById = new Map(
+							topLevel
+								.filter((m: NarratorMsg) => m?.id && m?.createdAt)
+								.map((m: NarratorMsg) => [m.id, { ...m, children: m.children ?? [] }]),
+						);
+						let refreshedExisting = false;
+						const updatedMessages = firstPage.messages.map((existing: NarratorMsg) => {
+							if (existing.id === STREAMING_CHUNKS_MSG_ID) return existing;
+							const fresh = incomingById.get(existing.id);
+							if (!fresh) return existing;
+							refreshedExisting = true;
+							return {
+								...existing,
+								...fresh,
+								children: fresh.children?.length ? fresh.children : (existing.children ?? []),
+							};
+						});
+						const existingIds = new Set(updatedMessages.map((m: NarratorMsg) => m.id));
+						const newMsgs = [...incomingById.values()].filter(
+							(m: NarratorMsg) => !existingIds.has(m.id),
+						);
+						if (refreshedExisting || newMsgs.length > 0) {
 							firstPage.messages = newMsgs.reduce(
 								(messages, msg) => insertTopLevelMessageBySeq(messages, msg),
-								firstPage.messages,
+								updatedMessages,
 							);
 							pages[0] = firstPage;
 							result = { ...result, pages };

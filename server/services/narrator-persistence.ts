@@ -22,6 +22,32 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
+async function bumpNarratorMessageVersions(
+	narratorIds: Iterable<string | null | undefined>,
+): Promise<void> {
+	const ids = [...new Set([...narratorIds].filter((id): id is string => !!id))];
+	if (ids.length === 0) return;
+	await db
+		.update(narrators)
+		.set({
+			messageVersion: sql`${narrators.messageVersion} + 1`,
+			updatedAt: new Date().toISOString(),
+		})
+		.where(inArray(narrators.id, ids));
+}
+
+export async function bumpParentNarratorMessageVersion(
+	parentToolUseId?: string | null,
+): Promise<void> {
+	if (!parentToolUseId) return;
+	const parentToolCall = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.toolUseId, parentToolUseId),
+		columns: { narratorId: true },
+	});
+	if (!parentToolCall) return;
+	await bumpNarratorMessageVersions([parentToolCall.narratorId]);
+}
+
 /** Insert a message into narrator_message_refs junction table */
 async function insertMessageRef(
 	narratorId: string,
@@ -482,6 +508,7 @@ export const narratorPersistence = {
 			.returning();
 
 		const seq = await appendMessageRef(narratorId, id);
+		await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const toolUseBlocks = content.filter((b: any) => b.type === "tool_use");
@@ -563,6 +590,7 @@ export const narratorPersistence = {
 			.returning();
 
 		const seq = await appendMessageRef(narratorId, id);
+		await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
 		return { ...msg, seq };
 	},
 
@@ -1109,11 +1137,16 @@ export const narratorPersistence = {
 			executionStartedAt?: number;
 			completedAt?: number;
 			resultMessageId?: string;
+			bumpMessageVersion?: boolean;
 		},
 		messageId?: string,
 	) {
 		const conditions = [eq(narratorToolCalls.toolUseId, toolUseId)];
 		if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		const affectedToolCalls = await db
+			.select({ narratorId: narratorToolCalls.narratorId, messageId: narratorToolCalls.messageId })
+			.from(narratorToolCalls)
+			.where(and(...conditions));
 		await db
 			.update(narratorToolCalls)
 			.set({
@@ -1136,6 +1169,32 @@ export const narratorPersistence = {
 				...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 			})
 			.where(and(...conditions));
+
+		const affectedNarratorIds = affectedToolCalls.map((tc) => tc.narratorId);
+		const affectedMessageIds = [
+			...new Set(affectedToolCalls.map((tc) => tc.messageId).filter((id): id is string => !!id)),
+		];
+		if (affectedMessageIds.length > 0) {
+			const affectedMessages = await db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, affectedMessageIds),
+				columns: { parentToolUseId: true },
+			});
+			const parentToolUseIds = [
+				...new Set(
+					affectedMessages.map((msg) => msg.parentToolUseId).filter((id): id is string => !!id),
+				),
+			];
+			if (parentToolUseIds.length > 0) {
+				const parentToolCalls = await db.query.narratorToolCalls.findMany({
+					where: inArray(narratorToolCalls.toolUseId, parentToolUseIds),
+					columns: { narratorId: true },
+				});
+				affectedNarratorIds.push(...parentToolCalls.map((tc) => tc.narratorId));
+			}
+		}
+		if (result.bumpMessageVersion !== false) {
+			await bumpNarratorMessageVersions(affectedNarratorIds);
+		}
 	},
 
 	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {

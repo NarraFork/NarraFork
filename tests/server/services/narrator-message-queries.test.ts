@@ -282,7 +282,7 @@ describe("narratorService message query regressions", () => {
 		expect(readBlock?.outputJson?._truncated).toBe(true);
 	});
 
-	it("getMessagesAfter 仅把上游运行中工具的子消息作为 orphanChildren 返回", async () => {
+	it("getMessagesAfter 可通过 legacy parent anchor 补拉遗漏的 child 消息", async () => {
 		seedBase();
 
 		insertMessage({
@@ -336,7 +336,124 @@ describe("narratorService message query regressions", () => {
 			.run();
 
 		const second = await narratorService.getMessagesAfter("n1", "m-old", 40);
-		expect(second.orphanChildren).toHaveLength(0);
+		expect(second.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-orphan"]);
+	});
+
+	it("getMessagesAfter 复合 cursor 同时补拉 child stream 和父流新增消息", async () => {
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "sub1",
+				chapterId: "ch1",
+				type: "subagent",
+				subagentType: "general",
+				variant: "subagent:general",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+
+		insertMessage({
+			id: "m-old",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "tu-old", name: "Agent", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-old",
+			toolUseId: "tu-old",
+			toolName: "Agent",
+			status: "running",
+		});
+		insertMessage({
+			id: "c-seen",
+			seq: 0,
+			narratorId: "sub1",
+			parentToolUseId: "tu-old",
+			contentJson: [{ type: "text", text: "seen child" }],
+		});
+		insertMessage({
+			id: "c-missed",
+			seq: 1,
+			narratorId: "sub1",
+			parentToolUseId: "tu-old",
+			contentJson: [{ type: "text", text: "missed child" }],
+		});
+		insertMessage({
+			id: "m-new",
+			seq: 1,
+			contentJson: [{ type: "text", text: "new parent" }],
+		});
+
+		const first = await narratorService.getMessagesAfter("n1", {
+			parentLastMessageId: "m-old",
+			childAnchors: [{ parentToolUseId: "tu-old", narratorId: "sub1", lastMessageId: "c-seen" }],
+		});
+		expect(first.hitLimit).toBe(false);
+		expect(first.topLevel.map((m: { id: string }) => m.id)).toEqual(["m-new"]);
+		expect(first.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-missed"]);
+		expect(first.cursor?.parentLastMessageId).toBe("m-new");
+		expect(
+			first.cursor?.childAnchors?.find((a) => a.parentToolUseId === "tu-old")?.lastMessageId,
+		).toBe("c-missed");
+
+		insertMessage({
+			id: "c-next",
+			seq: 2,
+			narratorId: "sub1",
+			parentToolUseId: "tu-old",
+			contentJson: [{ type: "text", text: "next child" }],
+		});
+
+		const cursor = first.cursor;
+		expect(cursor).toBeDefined();
+		if (!cursor) throw new Error("Expected catch-up cursor");
+		const second = await narratorService.getMessagesAfter("n1", cursor, 40);
+		expect(second.topLevel).toHaveLength(0);
+		expect(second.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-next"]);
+	});
+
+	it("getMessagesAfter open child anchor 可补拉第一条 missed child", async () => {
+		seedBase();
+		db.insert(narrators)
+			.values({
+				id: "sub1",
+				chapterId: "ch1",
+				type: "subagent",
+				subagentType: "general",
+				variant: "subagent:general",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+
+		insertMessage({
+			id: "m-old",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "tu-old", name: "Agent", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-old",
+			toolUseId: "tu-old",
+			toolName: "Agent",
+			status: "running",
+		});
+		insertMessage({
+			id: "c-first",
+			seq: 0,
+			narratorId: "sub1",
+			parentToolUseId: "tu-old",
+			contentJson: [{ type: "text", text: "first child" }],
+		});
+
+		const result = await narratorService.getMessagesAfter("n1", {
+			parentLastMessageId: "m-old",
+			childAnchors: [{ parentToolUseId: "tu-old" }],
+		});
+		expect(result.hitLimit).toBe(false);
+		expect(result.topLevel).toHaveLength(0);
+		expect(result.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-first"]);
 	});
 
 	it("getMessagesAround 以子消息所属顶层消息为锚点并返回有界上下文窗口", async () => {

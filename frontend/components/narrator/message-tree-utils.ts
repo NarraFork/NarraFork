@@ -95,12 +95,22 @@ function insertChildAtPath(
 	if (!msg) return { messages, changed: false };
 
 	if (rest.length === 0) {
-		// This is the target message — append child
-		if (msg.children?.some((c) => c.id === childMsg.id)) {
-			return { messages, changed: false };
-		}
+		// This is the target message — append or refresh child
+		const children = msg.children || [];
+		const existingIdx = children.findIndex((c) => c.id === childMsg.id);
 		const updated = [...messages];
-		updated[idx] = { ...msg, children: [...(msg.children || []), childMsg] };
+		if (existingIdx !== -1) {
+			const nextChildren = [...children];
+			const existing = nextChildren[existingIdx];
+			nextChildren[existingIdx] = {
+				...existing,
+				...childMsg,
+				children: childMsg.children?.length ? childMsg.children : (existing.children ?? []),
+			};
+			updated[idx] = { ...msg, children: nextChildren };
+			return { messages: updated, changed: true };
+		}
+		updated[idx] = { ...msg, children: [...children, childMsg] };
 		return { messages: updated, changed: true };
 	}
 	// Navigate deeper into children
@@ -124,9 +134,20 @@ function insertChildIntoMessages(
 			(tc) => tc.toolUseId === childMsg.parentToolUseId,
 		);
 		if (hasParentTool) {
-			if (msg.children?.some((c) => c.id === childMsg.id)) return msg;
+			const children = msg.children || [];
+			const existingIdx = children.findIndex((c) => c.id === childMsg.id);
 			anyChanged = true;
-			return { ...msg, children: [...(msg.children || []), childMsg] };
+			if (existingIdx !== -1) {
+				const nextChildren = [...children];
+				const existing = nextChildren[existingIdx];
+				nextChildren[existingIdx] = {
+					...existing,
+					...childMsg,
+					children: childMsg.children?.length ? childMsg.children : (existing.children ?? []),
+				};
+				return { ...msg, children: nextChildren };
+			}
+			return { ...msg, children: [...children, childMsg] };
 		}
 		// Recurse into children
 		if (msg.children?.length) {

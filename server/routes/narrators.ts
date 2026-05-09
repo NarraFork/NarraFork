@@ -1562,6 +1562,8 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 	await narratorService.updateToolCallResult(toolUseId, {
 		output: getToolMessage("enterPlanModeOutput", locale as Locale),
 		status: "success",
+		// The following message broadcast already accounts for this persisted tool state.
+		bumpMessageVersion: false,
 	});
 	const fullMsg = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, msg.id),

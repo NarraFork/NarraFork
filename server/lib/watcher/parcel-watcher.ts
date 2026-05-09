@@ -9,6 +9,7 @@
  */
 
 import { type Stats, unwatchFile, watchFile } from "node:fs";
+import { relative, sep } from "node:path";
 import { logger } from "../logger";
 import { coalesceEvents } from "./event-coalescer";
 import { FileChangeType, type IFileChange } from "./types";
@@ -110,6 +111,7 @@ const PARCEL_TYPE_MAP: Record<ParcelEventType, FileChangeType> = {
  */
 const DEFAULT_EXCLUDES: readonly string[] = [
 	"**/.git/**",
+	"**/.narrafork/**",
 	"**/node_modules/**",
 	"**/.next/**",
 	"**/dist/**",
@@ -138,6 +140,49 @@ const DEFAULT_EXCLUDES: readonly string[] = [
 	"**/.worktrees/**",
 ];
 
+const DEFAULT_EXCLUDE_SEGMENTS = new Set([
+	".git",
+	".narrafork",
+	".worktrees",
+	"node_modules",
+	".next",
+	"dist",
+	"build",
+	"out",
+	"__pycache__",
+	".cache",
+	".parcel-cache",
+	".turbo",
+	".nuxt",
+	".output",
+	".svelte-kit",
+	"target",
+	".venv",
+	"venv",
+	"vendor",
+	".gradle",
+	".idea",
+	".vscode",
+	"coverage",
+	".nyc_output",
+	".pytest_cache",
+	".mypy_cache",
+	".ruff_cache",
+	".tox",
+]);
+
+function normalizePathForMatch(path: string): string {
+	return path.split(sep).join("/");
+}
+
+function isIgnoredEventPath(rootPath: string, eventPath: string): boolean {
+	const rel = normalizePathForMatch(relative(rootPath, eventPath));
+	if (!rel || rel === ".") return false;
+	if (rel.startsWith("../") || rel === "..") return true;
+	const segments = rel.split("/");
+	return segments.some((segment) => DEFAULT_EXCLUDE_SEGMENTS.has(segment));
+}
+
 // ── ParcelWatcherInstance ───────────────────────────────────────────────────
 
 /**
@@ -160,6 +205,7 @@ export class ParcelWatcherInstance {
 	handleEvents(events: ParcelEvent[]): void {
 		if (this._stopped) return;
 		for (const evt of events) {
+			if (isIgnoredEventPath(this.path, evt.path)) continue;
 			const type = PARCEL_TYPE_MAP[evt.type];
 			if (type !== undefined) {
 				this.worker.work({ type, path: evt.path });
