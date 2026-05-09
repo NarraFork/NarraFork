@@ -51,15 +51,6 @@ export function GitMissingAlert() {
 		enabled: !!health && !health.gitAvailable,
 	});
 
-	const { data: authStatus } = useQuery({
-		queryKey: ["auth", "status"],
-		queryFn: api.authStatus,
-		retry: false,
-		staleTime: 60_000,
-		// Only needed before login to distinguish first-user setup from normal login.
-		enabled: !!health && !health.gitAvailable && !hasToken,
-	});
-
 	const installMutation = useMutation({
 		mutationFn: () => api.installDependency("git"),
 		onSuccess: (result) => {
@@ -84,7 +75,7 @@ export function GitMissingAlert() {
 	const pm = deps?.packageManager;
 	const gitDep = deps?.dependencies.find((d) => d.name === "git");
 	const installCmd = pm && gitDep?.installCommands[pm] ? gitDep.installCommands[pm] : null;
-	const canInstall = hasToken || authStatus?.hasUsers === false;
+	const canInstall = hasToken;
 
 	return (
 		<>

@@ -93,7 +93,7 @@ app.use("/api/*", async (c, next) => {
 // Public routes (no auth required)
 app.route("/api/auth", authRoutes);
 // Dependency status is needed before login when Git is missing. Installing is
-// allowed only for admins, or during first-user setup before any admin exists.
+// still restricted to authenticated admins by the dependency route itself.
 app.route("/api/dependencies", dependencyRoutes);
 app.get("/api/health", (c) => {
 	// Re-check git when it was previously unavailable so the frontend

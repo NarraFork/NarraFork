@@ -1084,11 +1084,11 @@ export const narratorService = {
 						sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
 					),
 				)
-				.orderBy(narratorMessageRefs.seq)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 				.limit(MAX_INHERITED_FULL_FORK_REFS + 1);
 
 			if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
-				prefixRows = rows.slice(-MAX_INHERITED_FULL_FORK_REFS);
+				prefixRows = rows.slice(0, MAX_INHERITED_FULL_FORK_REFS).reverse();
 				logger.warn("Full narrator fork context truncated to safe ref limit", {
 					parentNarratorId,
 					newNarratorId: id,
@@ -1097,7 +1097,7 @@ export const narratorService = {
 					hasCompactSummary: Boolean(parent.contextSummary),
 				});
 			} else {
-				prefixRows = rows;
+				prefixRows = rows.reverse();
 			}
 			resolvedForkMessageId = prefixRows[prefixRows.length - 1]?.messageId ?? null;
 		}

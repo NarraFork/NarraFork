@@ -6,7 +6,7 @@ import {
 	tryWalRecovery,
 } from "../lib/db-resilience";
 import { hotOnce, hotSafe, hotTimer } from "../lib/hot-safe";
-import { acquireInstanceLock } from "../lib/instance-lock";
+import { acquireInstanceLock, releaseInstanceLock } from "../lib/instance-lock";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
@@ -204,15 +204,20 @@ const walCheckpointTimer = hotTimer("narrafork.walCheckpointTimer", () =>
 dbLifecycle.walCheckpointTimer = walCheckpointTimer;
 
 export function markDatabaseCleanShutdown(): void {
-	if (dbLifecycle.cleanMarked) return;
-	if (dbLifecycle.walCheckpointTimer) clearInterval(dbLifecycle.walCheckpointTimer);
+	if (dbLifecycle.walCheckpointTimer) {
+		clearInterval(dbLifecycle.walCheckpointTimer);
+		dbLifecycle.walCheckpointTimer = undefined;
+	}
 	const currentSqlite = dbLifecycle.sqlite;
-	if (!currentSqlite) return;
 	try {
-		markCleanShutdown(currentSqlite);
-		dbLifecycle.cleanMarked = true;
+		if (!dbLifecycle.cleanMarked && currentSqlite) {
+			markCleanShutdown(currentSqlite);
+			dbLifecycle.cleanMarked = true;
+		}
 	} catch (err) {
 		logger.warn("Failed to mark database clean shutdown", { error: String(err) });
+	} finally {
+		releaseInstanceLock();
 	}
 }
 
