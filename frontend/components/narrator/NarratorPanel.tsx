@@ -92,6 +92,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -398,37 +399,6 @@ function getCompactingMarkerKind(
 	);
 	if (!block) return null;
 	return block.type === "segment_compact" ? "segment" : "context";
-}
-
-function createCompactingMarkerOverlaySource(label: string, kind: CompactingMarkerKind) {
-	const host = document.createElement("div");
-	host.style.position = "fixed";
-	host.style.left = "-10000px";
-	host.style.top = "0";
-	host.style.width = "min(640px, 100vw)";
-	host.style.pointerEvents = "none";
-	host.style.opacity = "0";
-
-	const source = document.createElement("div");
-	source.setAttribute(COMPACTING_MARKER_ATTR, kind);
-	source.style.display = "flex";
-	source.style.alignItems = "center";
-	source.style.justifyContent = "center";
-	source.style.gap = "6px";
-	source.style.padding = "4px 0";
-	source.style.fontSize = "var(--mantine-font-size-xs)";
-	source.style.lineHeight = "var(--mantine-line-height-xs)";
-	source.style.color = `var(--mantine-color-${kind === "segment" ? "teal" : "orange"}-6)`;
-
-	const icon = document.createElement("span");
-	icon.textContent = "◉";
-	const text = document.createElement("span");
-	text.textContent = label;
-	source.append(icon, text);
-	host.appendChild(source);
-	document.body.appendChild(host);
-
-	return { host, element: source };
 }
 
 type BufferedSendResult = {
@@ -1765,6 +1735,9 @@ export function NarratorPanel({
 	fileModPanelOpen,
 	onToggleFileModPanel,
 	onFileModPropsChange,
+	detailsPanelOpen,
+	onToggleDetailsPanel,
+	onDetailsPropsChange,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
@@ -1889,8 +1862,11 @@ export function NarratorPanel({
 	} = useAllModels();
 	const { data: currentUser } = useCurrentUser();
 	const { data: userPrefs } = useUserPreferences();
+	const [fastModeDefault, setFastModeDefault] = useLocalPref("narrafork_fast_mode_default");
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
+	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
+	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
 	const contentViewerEnvironment = useMemo(
 		() => ({
 			isMobile: isMobileViewport,
@@ -2525,11 +2501,106 @@ export function NarratorPanel({
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
-	const [detailsOpened, { toggle: toggleDetails, close: closeDetails }] = useDisclosure(false);
+	const [internalDetailsOpened, { toggle: toggleInternalDetails, close: closeInternalDetails }] =
+		useDisclosure(false);
+	const detailsOpened = onToggleDetailsPanel ? (detailsPanelOpen ?? false) : internalDetailsOpened;
+	const detailsPanelOpenRef = useRef(detailsPanelOpen ?? false);
+	detailsPanelOpenRef.current = detailsPanelOpen ?? false;
+	const toggleDetails = onToggleDetailsPanel ?? toggleInternalDetails;
+	const closeDetails = useCallback(() => {
+		if (onToggleDetailsPanel) {
+			if (detailsPanelOpenRef.current) onToggleDetailsPanel();
+			return;
+		}
+		closeInternalDetails();
+	}, [closeInternalDetails, onToggleDetailsPanel]);
 	const [
 		reflectionSettingsOpened,
 		{ open: openReflectionSettings, close: closeReflectionSettings },
 	] = useDisclosure(false);
+
+	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
+	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
+	const fastModeLongPressTimerRef = useRef<number | null>(null);
+	const fastModeLongPressFiredRef = useRef(false);
+
+	const clearFastModeSettingsCloseTimer = useCallback(() => {
+		if (fastModeSettingsCloseTimerRef.current != null) {
+			window.clearTimeout(fastModeSettingsCloseTimerRef.current);
+			fastModeSettingsCloseTimerRef.current = null;
+		}
+	}, []);
+
+	const clearFastModeLongPressTimer = useCallback(() => {
+		if (fastModeLongPressTimerRef.current != null) {
+			window.clearTimeout(fastModeLongPressTimerRef.current);
+			fastModeLongPressTimerRef.current = null;
+		}
+	}, []);
+
+	const openFastModeSettings = useCallback(() => {
+		clearFastModeSettingsCloseTimer();
+		setFastModeSettingsOpened(true);
+	}, [clearFastModeSettingsCloseTimer]);
+
+	const closeFastModeSettings = useCallback(() => {
+		clearFastModeSettingsCloseTimer();
+		setFastModeSettingsOpened(false);
+	}, [clearFastModeSettingsCloseTimer]);
+
+	const scheduleFastModeSettingsClose = useCallback(() => {
+		if (fastModeUsesTapSettings) return;
+		clearFastModeSettingsCloseTimer();
+		fastModeSettingsCloseTimerRef.current = window.setTimeout(() => {
+			setFastModeSettingsOpened(false);
+			fastModeSettingsCloseTimerRef.current = null;
+		}, 180);
+	}, [clearFastModeSettingsCloseTimer, fastModeUsesTapSettings]);
+
+	const startFastModeLongPress = useCallback(
+		(event: React.PointerEvent) => {
+			fastModeLongPressFiredRef.current = false;
+			if (!fastModeUsesTapSettings || event.pointerType === "mouse") return;
+			clearFastModeLongPressTimer();
+			fastModeLongPressTimerRef.current = window.setTimeout(() => {
+				fastModeLongPressFiredRef.current = true;
+				fastModeLongPressTimerRef.current = null;
+				openFastModeSettings();
+			}, 550);
+		},
+		[clearFastModeLongPressTimer, fastModeUsesTapSettings, openFastModeSettings],
+	);
+
+	useEffect(() => {
+		return () => {
+			clearFastModeSettingsCloseTimer();
+			clearFastModeLongPressTimer();
+		};
+	}, [clearFastModeLongPressTimer, clearFastModeSettingsCloseTimer]);
+
+	const detailsPanelExternalProps = useMemo(
+		() => ({
+			narratorId,
+			narrator,
+			viewers,
+			defaultModelValue,
+			planReflectionAutoApproveGlobal,
+			dangerReflectionGlobal,
+		}),
+		[
+			dangerReflectionGlobal,
+			defaultModelValue,
+			narrator,
+			narratorId,
+			planReflectionAutoApproveGlobal,
+			viewers,
+		],
+	);
+
+	useEffect(() => {
+		if (!detailsOpened || !onDetailsPropsChange || !narrator) return;
+		onDetailsPropsChange(detailsPanelExternalProps);
+	}, [detailsOpened, detailsPanelExternalProps, narrator, onDetailsPropsChange]);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
@@ -4745,47 +4816,29 @@ export function NarratorPanel({
 	const compactingMarkerKind = compactingMarkerInfo?.kind ?? "context";
 
 	useEffect(() => {
-		// Re-run after rendered message window changes so newly mounted compact markers are observed.
-		void renderedKeys;
 		if (!compactingMarkerMessageId || isWorkspacePreview || usePixiRenderer) {
-			setCompactingMarkerOverlay(null);
+			setCompactingMarkerOverlay((prev) => (prev ? null : prev));
 			return;
 		}
 
 		const scrollEl = viewportRef.current;
 		if (!scrollEl) {
-			setCompactingMarkerOverlay(null);
+			setCompactingMarkerOverlay((prev) => (prev ? null : prev));
 			return;
 		}
 		const contentEl = contentRef.current ?? scrollEl;
+		const fallbackPreviewText =
+			compactingMarkerKind === "segment" ? t("segmentCompacting") : t("compacting");
 
 		let rafId = 0;
-		let fallbackHost: HTMLElement | null = null;
-		let fallbackElement: HTMLElement | null = null;
 		const findMarker = () => contentEl.querySelector<HTMLElement>(`[${COMPACTING_MARKER_ATTR}]`);
-		const disposeFallback = () => {
-			fallbackHost?.remove();
-			fallbackHost = null;
-			fallbackElement = null;
-		};
-		const clearOverlay = () => {
-			disposeFallback();
-			setCompactingMarkerOverlay(null);
-		};
-		const ensureFallbackElement = () => {
-			if (fallbackElement?.isConnected) return fallbackElement;
-			disposeFallback();
-			const created = createCompactingMarkerOverlaySource(
-				compactingMarkerKind === "segment" ? t("segmentCompacting") : t("compacting"),
-				compactingMarkerKind,
-			);
-			fallbackHost = created.host;
-			fallbackElement = created.element;
-			fallbackElement.setAttribute("data-message-id", compactingMarkerMessageId);
-			return fallbackElement;
-		};
-		const scrollBackToMarker = (source: HTMLElement, messageId: string) => {
-			if (source.isConnected && source !== fallbackElement) {
+		const clearOverlay = () => setCompactingMarkerOverlay((prev) => (prev ? null : prev));
+		const scrollBackToMarker = (
+			source: HTMLElement,
+			messageId: string,
+			sourceIsMarker: boolean,
+		) => {
+			if (sourceIsMarker && source.isConnected) {
 				source.scrollIntoView({ behavior: "smooth", block: "center" });
 				return;
 			}
@@ -4795,21 +4848,35 @@ export function NarratorPanel({
 				highlightId: messageId,
 			});
 		};
-		const showOverlay = (source: HTMLElement, offScreen: "top" | "bottom") => {
+		const showOverlay = (
+			source: HTMLElement,
+			offScreen: "top" | "bottom",
+			sourceIsMarker: boolean,
+			previewTextOverride?: string,
+		) => {
 			const messageId = source.getAttribute("data-message-id") ?? compactingMarkerMessageId;
 			const blockId = `compacting:${messageId}`;
 			const previewText =
-				compactWhitespacePreview(collectElementTextPreview(source, 80)) || blockId;
+				previewTextOverride ??
+				compactWhitespacePreview(collectElementTextPreview(source, 80)) ??
+				blockId;
+			const previewColor = compactingMarkerKind === "segment" ? "teal" : "orange";
 
 			setCompactingMarkerOverlay((prev) => {
-				if (prev?.blockId === blockId && prev.element === source && prev.offScreen === offScreen) {
+				if (
+					prev?.blockId === blockId &&
+					prev.offScreen === offScreen &&
+					prev.previewText === previewText &&
+					prev.previewColor === previewColor
+				) {
 					return prev;
 				}
 				return {
 					blockId,
 					previewText,
+					previewColor,
 					element: source,
-					scrollBack: () => scrollBackToMarker(source, messageId),
+					scrollBack: () => scrollBackToMarker(source, messageId, sourceIsMarker),
 					close: clearOverlay,
 					offScreen,
 				};
@@ -4843,26 +4910,27 @@ export function NarratorPanel({
 		const checkMarker = () => {
 			const marker = findMarker();
 			if (marker?.isConnected) {
-				disposeFallback();
 				const markerRect = marker.getBoundingClientRect();
 				const viewportRect = scrollEl.getBoundingClientRect();
-				if (markerRect.bottom < viewportRect.top) {
-					showOverlay(marker, "top");
+				const showMargin = 4;
+				const clearMargin = 16;
+				if (markerRect.bottom < viewportRect.top - showMargin) {
+					showOverlay(marker, "top", true);
 					return;
 				}
-				if (markerRect.top > viewportRect.bottom) {
-					showOverlay(marker, "bottom");
+				if (markerRect.top > viewportRect.bottom + showMargin) {
+					showOverlay(marker, "bottom", true);
 					return;
 				}
-				setCompactingMarkerOverlay(null);
+				const markerSafelyVisible =
+					markerRect.bottom > viewportRect.top + clearMargin &&
+					markerRect.top < viewportRect.bottom - clearMargin;
+				if (markerSafelyVisible) clearOverlay();
 				return;
 			}
 			const fallbackOffScreen = getFallbackOffScreen();
-			if (!fallbackOffScreen) {
-				clearOverlay();
-				return;
-			}
-			showOverlay(ensureFallbackElement(), fallbackOffScreen);
+			if (!fallbackOffScreen) return;
+			showOverlay(scrollEl, fallbackOffScreen, false, fallbackPreviewText);
 		};
 		const scheduleCheck = () => {
 			if (rafId) return;
@@ -4888,14 +4956,12 @@ export function NarratorPanel({
 			scrollEl.removeEventListener("scroll", scheduleCheck);
 			window.removeEventListener("resize", scheduleCheck);
 			mutationObserver.disconnect();
-			clearOverlay();
 		};
 	}, [
 		activeMessageRenderWindow,
 		compactingMarkerKind,
 		compactingMarkerMessageId,
 		isWorkspacePreview,
-		renderedKeys,
 		scrollToMessageTarget,
 		shouldWindowMessages,
 		t,
@@ -5856,6 +5922,81 @@ export function NarratorPanel({
 		</Menu>
 	);
 
+	const renderFastModeControl = (position: "top-end" | "bottom-end") => (
+		<Popover
+			opened={fastModeSettingsOpened}
+			onChange={setFastModeSettingsOpened}
+			onClose={closeFastModeSettings}
+			position={position}
+			width={fastModeUsesTapSettings ? 280 : 320}
+			shadow="md"
+			withinPortal
+		>
+			<Popover.Target>
+				<Group
+					gap={4}
+					wrap="nowrap"
+					onMouseEnter={fastModeUsesTapSettings ? undefined : openFastModeSettings}
+					onMouseLeave={fastModeUsesTapSettings ? undefined : scheduleFastModeSettingsClose}
+					style={{ flexShrink: 0 }}
+				>
+					<Tooltip
+						label={t("fast_mode_tooltip")}
+						position={position.startsWith("top") ? "top" : "bottom"}
+						disabled={fastModeSettingsOpened}
+					>
+						<ActionIcon
+							variant="subtle"
+							color={narrator.fastMode ? "yellow" : "gray"}
+							size="sm"
+							onPointerDown={startFastModeLongPress}
+							onPointerUp={clearFastModeLongPressTimer}
+							onPointerCancel={clearFastModeLongPressTimer}
+							onPointerLeave={clearFastModeLongPressTimer}
+							onContextMenu={(event) => event.preventDefault()}
+							onClick={(event) => {
+								if (fastModeLongPressFiredRef.current) {
+									event.preventDefault();
+									event.stopPropagation();
+									fastModeLongPressFiredRef.current = false;
+									return;
+								}
+								fastModeMutation.mutate({
+									id: narratorId,
+									fastMode: !narrator.fastMode,
+								});
+							}}
+						>
+							<IconBolt size={16} />
+						</ActionIcon>
+					</Tooltip>
+				</Group>
+			</Popover.Target>
+			<Popover.Dropdown
+				onMouseEnter={fastModeUsesTapSettings ? undefined : openFastModeSettings}
+				onMouseLeave={fastModeUsesTapSettings ? undefined : scheduleFastModeSettingsClose}
+			>
+				<Stack gap={8}>
+					<Text size="sm" fw={600}>
+						{t("fast_mode")}
+					</Text>
+					<Switch
+						size="sm"
+						checked={fastModeDefault}
+						onChange={(event) => setFastModeDefault(event.currentTarget.checked)}
+						label={t("fast_mode_default_switch")}
+					/>
+					<Text size="xs" c="dimmed">
+						{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{fastModeUsesTapSettings ? t("fast_mode_mobile_hint") : t("fast_mode_desktop_hint")}
+					</Text>
+				</Stack>
+			</Popover.Dropdown>
+		</Popover>
+	);
+
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
 			<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
@@ -6299,7 +6440,7 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
-					{detailsOpened && (
+					{detailsOpened && !onToggleDetailsPanel && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
 								opened={detailsOpened}
@@ -6310,6 +6451,7 @@ export function NarratorPanel({
 								defaultModelValue={defaultModelValue}
 								planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
 								dangerReflectionGlobal={dangerReflectionGlobal}
+								displayMode="drawer"
 							/>
 						</Suspense>
 					)}
@@ -7199,23 +7341,9 @@ export function NarratorPanel({
 												</Menu>
 											)}
 											{/* Fast Mode toggle (only for Codex-mode providers) */}
-											{supportsCodexControls && (
-												<Tooltip label={t("fast_mode_tooltip")}>
-													<ActionIcon
-														variant="subtle"
-														color={narrator.fastMode ? "yellow" : "gray"}
-														size="sm"
-														onClick={() =>
-															fastModeMutation.mutate({
-																id: narratorId,
-																fastMode: !narrator.fastMode,
-															})
-														}
-													>
-														<IconBolt size={16} />
-													</ActionIcon>
-												</Tooltip>
-											)}
+											{supportsCodexControls &&
+												!isMobileViewport &&
+												renderFastModeControl("top-end")}
 											<Tooltip
 												label={
 													narrator.isAskInPassing
@@ -7434,23 +7562,9 @@ export function NarratorPanel({
 											</Menu>
 										)}
 										{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-										{supportsCodexControls && (
-											<Tooltip label={t("fast_mode_tooltip")}>
-												<ActionIcon
-													variant="subtle"
-													color={narrator.fastMode ? "yellow" : "gray"}
-													size="sm"
-													onClick={() =>
-														fastModeMutation.mutate({
-															id: narratorId,
-															fastMode: !narrator.fastMode,
-														})
-													}
-												>
-													<IconBolt size={16} />
-												</ActionIcon>
-											</Tooltip>
-										)}
+										{supportsCodexControls &&
+											(compact || isMobileViewport) &&
+											renderFastModeControl("bottom-end")}
 										<Tooltip
 											label={
 												narrator.isAskInPassing

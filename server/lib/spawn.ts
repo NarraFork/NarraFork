@@ -72,6 +72,11 @@ export interface SafeSpawnOptions {
 	 * Called at most once per safeSpawn invocation.
 	 */
 	onLongRunning?: (elapsed: number) => void;
+	/**
+	 * Best-effort cleanup of child processes spawned by the command. Useful for
+	 * startup hooks that may launch long-running dev servers via a shell.
+	 */
+	killProcessTree?: boolean;
 }
 
 /**
@@ -86,6 +91,35 @@ function isPidAlive(pid: number): boolean {
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+function getChildPids(pid: number): number[] {
+	if (process.platform === "win32") return [];
+	try {
+		const result = Bun.spawnSync(["pgrep", "-P", String(pid)], {
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		if (result.exitCode !== 0) return [];
+		const text = new TextDecoder().decode(result.stdout);
+		return text
+			.split(/\s+/)
+			.map((part) => Number.parseInt(part, 10))
+			.filter((childPid) => Number.isInteger(childPid) && childPid > 0);
+	} catch {
+		return [];
+	}
+}
+
+function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
+	for (const childPid of getChildPids(pid)) {
+		killUnixProcessTree(childPid, signal);
+	}
+	try {
+		process.kill(pid, signal);
+	} catch {
+		// already gone or not permitted; best effort only
 	}
 }
 
@@ -126,6 +160,9 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	const kill = () => {
 		if (killed) return;
 		killed = true;
+		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
+			killUnixProcessTree(proc.pid);
+		}
 		try {
 			proc.kill();
 		} catch {

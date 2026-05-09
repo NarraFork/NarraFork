@@ -10,6 +10,7 @@ import { db, markDatabaseCleanShutdown } from "./db";
 import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import { getCodexManager } from "./lib/codex-manager";
+import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import {
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
@@ -54,6 +55,9 @@ import {
 	stopHeartbeat,
 	wsHandlers,
 } from "./websocket/ws-handler";
+
+// Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
+startEventLoopMonitor();
 
 // Set rootless podman env vars early so all child processes inherit them
 ensureRootlessEnv();
@@ -982,15 +986,11 @@ async function performGracefulShutdown(
 		projectDbManager.closeAll();
 		await mcpManager.shutdown().catch(() => {});
 		// Close browser pool if it was started
-		await import("./lib/browser/pool")
-			.then(({ closeBrowser }) => closeBrowser())
-			.catch(() => {});
+		await import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()).catch(() => {});
 		// Close Codex WebSocket session cache — active outbound WS
 		// connections keep the event loop alive and delay exit.
 		await import("./lib/agent/codex-websocket")
-			.then(({ clearCodexResponsesWebSocketSessions }) =>
-				clearCodexResponsesWebSocketSessions(),
-			)
+			.then(({ clearCodexResponsesWebSocketSessions }) => clearCodexResponsesWebSocketSessions())
 			.catch(() => {});
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();

@@ -70,6 +70,7 @@ export { narratorPersistence } from "./narrator-persistence";
  * (3000 variables) to stay well within the limit.
  */
 const REFS_INSERT_BATCH = 500;
+const MAX_INHERITED_FULL_FORK_REFS = 500;
 
 /** Batch-insert narratorMessageRefs rows, chunking to stay within SQLite's variable limit. */
 async function insertRefsBatched(
@@ -1011,6 +1012,7 @@ export const narratorService = {
 			seq: number;
 			isCompact: number;
 			prunedPercent: number | null;
+			segmentCompactId: string | null;
 		}> = [];
 		let resolvedForkMessageId: string | null = null;
 
@@ -1043,6 +1045,7 @@ export const narratorService = {
 					seq: narratorMessageRefs.seq,
 					isCompact: narratorMessageRefs.isCompact,
 					prunedPercent: narratorMessageRefs.prunedPercent,
+					segmentCompactId: narratorMessageRefs.segmentCompactId,
 				})
 				.from(narratorMessageRefs)
 				.where(
@@ -1052,6 +1055,59 @@ export const narratorService = {
 					),
 				)
 				.orderBy(narratorMessageRefs.seq);
+		} else if (inheritMode === "full") {
+			const lastCompact = await db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, parentNarratorId),
+						eq(narratorMessageRefs.isCompact, 1),
+					),
+				)
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1);
+			const compactSeq = lastCompact[0]?.seq;
+			const rows = await db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+					isCompact: narratorMessageRefs.isCompact,
+					prunedPercent: narratorMessageRefs.prunedPercent,
+					segmentCompactId: narratorMessageRefs.segmentCompactId,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, parentNarratorId),
+						compactSeq != null ? sql`${narratorMessageRefs.seq} > ${compactSeq}` : undefined,
+						sql`${narratorMessageRefs.segmentCompactId} IS NULL`,
+					),
+				)
+				.orderBy(narratorMessageRefs.seq)
+				.limit(MAX_INHERITED_FULL_FORK_REFS + 1);
+
+			if (rows.length > MAX_INHERITED_FULL_FORK_REFS) {
+				prefixRows = rows.slice(-MAX_INHERITED_FULL_FORK_REFS);
+				logger.warn("Full narrator fork context truncated to safe ref limit", {
+					parentNarratorId,
+					newNarratorId: id,
+					limit: MAX_INHERITED_FULL_FORK_REFS,
+					copiedRefs: prefixRows.length,
+					hasCompactSummary: Boolean(parent.contextSummary),
+				});
+			} else {
+				prefixRows = rows;
+			}
+			resolvedForkMessageId = prefixRows[prefixRows.length - 1]?.messageId ?? null;
+		}
+
+		if (inheritMode === "full" && prefixRows.length === 0 && parent.apiConversationId) {
+			apiConversationId = null;
+			logger.warn("Full narrator fork has no local refs; remote conversation id not inherited", {
+				parentNarratorId,
+				newNarratorId: id,
+			});
 		}
 
 		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
@@ -1093,13 +1149,14 @@ export const narratorService = {
 				.returning();
 
 			if (prefixRows.length > 0) {
-				const refValues = prefixRows.map((row) => ({
+				const refValues = prefixRows.map((row, index) => ({
 					id: generateId(),
 					narratorId: id,
 					messageId: row.messageId,
-					seq: row.seq,
+					seq: index,
 					isCompact: row.isCompact,
 					prunedPercent: row.prunedPercent,
+					segmentCompactId: row.segmentCompactId,
 				}));
 				await insertRefsBatched(tx, refValues);
 

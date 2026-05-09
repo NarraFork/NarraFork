@@ -63,9 +63,9 @@ chapterRoutes.get("/merge-sessions/:sessionId", async (c) => {
 	return c.json(session);
 });
 
-chapterRoutes.get("/container-setup", (c) => {
+chapterRoutes.get("/container-setup", async (c) => {
 	const refresh = c.req.query("refresh") === "true";
-	return c.json(getContainerSetupStatus(refresh));
+	return c.json(await getContainerSetupStatus(refresh));
 });
 
 chapterRoutes.get("/:id", async (c) => {
@@ -225,8 +225,8 @@ chapterRoutes.post("/batch-merge", async (c) => {
 
 // === Podman ===
 
-chapterRoutes.get("/podman/status", (c) => {
-	const status = getPodmanStatus();
+chapterRoutes.get("/podman/status", async (c) => {
+	const status = await getPodmanStatus();
 	const platform =
 		process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
 	return c.json({ ...status, platform, supported: supportsContainers() });
@@ -259,7 +259,7 @@ chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
 
 	if (result.exitCode === 0) {
 		resetPodmanCache();
-		const status = getPodmanStatus();
+		const status = await getPodmanStatus();
 		return c.json({ ok: true, ...status });
 	}
 	return c.json({ ok: false, error: (result.stderr || result.stdout).trim() }, 500);
@@ -274,7 +274,7 @@ chapterRoutes.get("/:id/compose-info", async (c) => {
 	const config = chapter.containerConfig as { composeFile?: string } | null;
 	const composeFile = resolveComposeFile(chapter.worktreePath, config);
 	if (!composeFile) return c.json({ services: [] });
-	const services = parseComposeFile(chapter.worktreePath, composeFile);
+	const services = await parseComposeFile(chapter.worktreePath, composeFile);
 	return c.json({ services });
 });
 

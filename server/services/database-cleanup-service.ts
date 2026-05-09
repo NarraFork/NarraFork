@@ -621,120 +621,151 @@ async function summarizeDumpTarget(
 	};
 }
 
+function logSlowDatabaseStep(
+	step: string,
+	startedAt: number,
+	data: Record<string, unknown> = {},
+): void {
+	const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+	if (durationMs >= 1_000) {
+		logger.warn("Slow database cleanup step", { step, durationMs, ...data });
+	}
+}
+
 function compactDatabaseIfNeeded(changed: boolean): boolean {
 	if (!changed) return false;
+	const startedAt = performance.now();
 	try {
-		sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
-		sqlite.run("VACUUM");
-		sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+		// Avoid running VACUUM synchronously in the HTTP request path: on large SQLite
+		// files it can freeze Bun's main thread long enough to make the backend appear dead.
+		// Keep only lightweight best-effort maintenance here; a future background job can
+		// run full compaction outside request handling.
+		sqlite.run("PRAGMA wal_checkpoint(PASSIVE)");
 		sqlite.run("PRAGMA optimize");
-		return true;
+		return false;
 	} catch (error) {
 		logger.warn("Database cleanup maintenance failed", { error: String(error) });
 		return false;
+	} finally {
+		logSlowDatabaseStep("maintenance", startedAt, { vacuumSkipped: true });
 	}
 }
 
 export const databaseCleanupService = {
 	async scanDatabaseBreakdown(): Promise<DatabaseStorageBreakdown> {
-		const [fileSizes, cleanupContext] = await Promise.all([
-			getDatabaseFileSizes(),
-			loadCleanupNarratorContext(),
-		]);
-		const [archivedSessions, staleSessions, apiRequestDumps] = await Promise.all([
-			summarizeSessionTarget("archivedSessions", cleanupContext),
-			summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
-			summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
-		]);
-		return {
-			...fileSizes,
-			cleanupCandidates: {
-				archivedSessions,
-				staleSessions,
-				apiRequestDumps,
-			},
-		};
+		const startedAt = performance.now();
+		try {
+			const [fileSizes, cleanupContext] = await Promise.all([
+				getDatabaseFileSizes(),
+				loadCleanupNarratorContext(),
+			]);
+			const [archivedSessions, staleSessions, apiRequestDumps] = await Promise.all([
+				summarizeSessionTarget("archivedSessions", cleanupContext),
+				summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
+				summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
+			]);
+			return {
+				...fileSizes,
+				cleanupCandidates: {
+					archivedSessions,
+					staleSessions,
+					apiRequestDumps,
+				},
+			};
+		} finally {
+			logSlowDatabaseStep("scanDatabaseBreakdown", startedAt);
+		}
 	},
 
 	async previewCleanup(
 		target: DatabaseCleanupTarget,
 		options: { olderThanDays?: number; sampleLimit?: number } = {},
 	): Promise<DatabaseCleanupPreviewResult> {
-		const sampleLimit = options.sampleLimit ?? DEFAULT_PREVIEW_SAMPLE_LIMIT;
-		if (target === "apiRequestDumps") {
-			return buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), sampleLimit);
+		const startedAt = performance.now();
+		try {
+			const sampleLimit = options.sampleLimit ?? DEFAULT_PREVIEW_SAMPLE_LIMIT;
+			if (target === "apiRequestDumps") {
+				return buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), sampleLimit);
+			}
+			const cleanupContext = await loadCleanupNarratorContext();
+			const { preview } = await buildSessionPreview(
+				target,
+				normalizePreviewDays(target, options.olderThanDays),
+				sampleLimit,
+				cleanupContext,
+			);
+			return preview;
+		} finally {
+			logSlowDatabaseStep("previewCleanup", startedAt, { target });
 		}
-		const cleanupContext = await loadCleanupNarratorContext();
-		const { preview } = await buildSessionPreview(
-			target,
-			normalizePreviewDays(target, options.olderThanDays),
-			sampleLimit,
-			cleanupContext,
-		);
-		return preview;
 	},
 
 	async executeCleanup(
 		target: DatabaseCleanupTarget,
 		options: { olderThanDays?: number } = {},
 	): Promise<DatabaseCleanupExecutionResult> {
-		return databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
-			const beforeSizes = await getDatabaseFileSizes();
-			const beforeBytes = beforeSizes.mainBytes + beforeSizes.walBytes + beforeSizes.shmBytes;
-			let preview: DatabaseCleanupPreviewResult;
-			let changed = false;
+		const startedAt = performance.now();
+		try {
+			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
+				const beforeSizes = await getDatabaseFileSizes();
+				const beforeBytes = beforeSizes.mainBytes + beforeSizes.walBytes + beforeSizes.shmBytes;
+				let preview: DatabaseCleanupPreviewResult;
+				let changed = false;
 
-			if (target === "apiRequestDumps") {
-				preview = await buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), 0);
-				if (preview.counts.dumpsCleared > 0) {
-					const cutoffIso = getCutoffIso(preview.olderThanDays ?? DEFAULT_API_REQUEST_DUMP_DAYS);
-					const result = sqlite
-						.prepare(
-							`UPDATE api_requests
+				if (target === "apiRequestDumps") {
+					preview = await buildDumpPreview(normalizePreviewDays(target, options.olderThanDays), 0);
+					if (preview.counts.dumpsCleared > 0) {
+						const cutoffIso = getCutoffIso(preview.olderThanDays ?? DEFAULT_API_REQUEST_DUMP_DAYS);
+						const result = sqlite
+							.prepare(
+								`UPDATE api_requests
 							 SET raw_dump_json = NULL
 							 WHERE raw_dump_json IS NOT NULL AND created_at <= ?`,
-						)
-						.run(cutoffIso);
-					changed = numberFromRow(result?.changes) > 0;
-				}
-			} else {
-				const cleanupContext = await loadCleanupNarratorContext();
-				const sessionPreview = await buildSessionPreview(
-					target,
-					normalizePreviewDays(target, options.olderThanDays),
-					0,
-					cleanupContext,
-				);
-				preview = sessionPreview.preview;
-				if (sessionPreview.safeRoots.length > 0) {
-					for (const root of sessionPreview.safeRoots) {
-						await narratorService.remove(root.rootNarratorId);
+							)
+							.run(cutoffIso);
+						changed = numberFromRow(result?.changes) > 0;
 					}
-					changed = true;
+				} else {
+					const cleanupContext = await loadCleanupNarratorContext();
+					const sessionPreview = await buildSessionPreview(
+						target,
+						normalizePreviewDays(target, options.olderThanDays),
+						0,
+						cleanupContext,
+					);
+					preview = sessionPreview.preview;
+					if (sessionPreview.safeRoots.length > 0) {
+						for (const root of sessionPreview.safeRoots) {
+							await narratorService.remove(root.rootNarratorId);
+						}
+						changed = true;
+					}
 				}
-			}
 
-			const vacuumRan = compactDatabaseIfNeeded(changed);
-			const afterSizes = await getDatabaseFileSizes();
-			const afterBytes = afterSizes.mainBytes + afterSizes.walBytes + afterSizes.shmBytes;
-			const result: DatabaseCleanupExecutionResult = {
-				...preview,
-				ok: true,
-				beforeBytes,
-				afterBytes,
-				freedBytes: Math.max(0, beforeBytes - afterBytes),
-				vacuumRan,
-				changed,
-			};
-			logger.info("Database cleanup completed", {
-				target,
-				olderThanDays: result.olderThanDays,
-				changed,
-				freedBytes: result.freedBytes,
-				beforeBytes,
-				afterBytes,
+				const vacuumRan = compactDatabaseIfNeeded(changed);
+				const afterSizes = await getDatabaseFileSizes();
+				const afterBytes = afterSizes.mainBytes + afterSizes.walBytes + afterSizes.shmBytes;
+				const result: DatabaseCleanupExecutionResult = {
+					...preview,
+					ok: true,
+					beforeBytes,
+					afterBytes,
+					freedBytes: Math.max(0, beforeBytes - afterBytes),
+					vacuumRan,
+					changed,
+				};
+				logger.info("Database cleanup completed", {
+					target,
+					olderThanDays: result.olderThanDays,
+					changed,
+					freedBytes: result.freedBytes,
+					beforeBytes,
+					afterBytes,
+				});
+				return result;
 			});
-			return result;
-		});
+		} finally {
+			logSlowDatabaseStep("executeCleanup", startedAt, { target });
+		}
 	},
 };

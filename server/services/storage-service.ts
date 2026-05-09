@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessages, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
+import { safeSpawn } from "../lib/spawn";
 import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { databaseCleanupService } from "./database-cleanup-service";
 import { gitService } from "./git-service";
@@ -187,16 +188,14 @@ async function scanWorktrees(): Promise<StorageCategoryResult> {
 
 async function scanContainers(): Promise<StorageCategoryResult> {
 	try {
-		const proc = Bun.spawn(["podman", "system", "df", "--format", "json"], {
-			stdout: "pipe",
-			stderr: "pipe",
+		const result = await safeSpawn({
+			cmd: ["podman", "system", "df", "--format", "json"],
+			timeout: 15_000,
 		});
-		const text = await new Response(proc.stdout).text();
-		const exitCode = await proc.exited;
-		if (exitCode !== 0) {
+		if (result.exitCode !== 0) {
 			return { key: "containers", sizeBytes: 0, details: { available: false } };
 		}
-		const data = JSON.parse(text);
+		const data = JSON.parse(result.stdout);
 		let totalSize = 0;
 		const info: Record<string, unknown> = { available: true };
 
@@ -404,14 +403,12 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 export async function pruneContainerImages(): Promise<{ success: boolean; output: string }> {
 	try {
 		// Only prune dangling images (-f without -a) to avoid removing intentionally kept images
-		const proc = Bun.spawn(["podman", "image", "prune", "-f"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const output = await new Response(proc.stdout).text();
-		const exitCode = await proc.exited;
+		const result = await safeSpawn({ cmd: ["podman", "image", "prune", "-f"], timeout: 60_000 });
 		cachedResult = null;
-		return { success: exitCode === 0, output: output.trim() };
+		return {
+			success: result.exitCode === 0,
+			output: (result.stdout || result.stderr).trim(),
+		};
 	} catch {
 		return { success: false, output: "Podman is not available" };
 	}

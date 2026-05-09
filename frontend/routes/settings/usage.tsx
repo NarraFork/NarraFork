@@ -1,7 +1,8 @@
+import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHistoryChart";
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
 import { UsageStatsCards } from "@frontend/components/usage-history/UsageStatsCards";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
-import type { UsageHistoryFilters } from "@frontend/types/usage-history";
+import type { UsageHistoryFilters, UsageHistoryGranularity } from "@frontend/types/usage-history";
 import {
 	Autocomplete,
 	Button,
@@ -33,6 +34,7 @@ function SettingsUsagePage() {
 	const pageSize = 50;
 	const [filters, setFilters] = useState<UsageHistoryFilters>({});
 	const [tempFilters, setTempFilters] = useState<UsageHistoryFilters>({});
+	const [granularity, setGranularity] = useState<UsageHistoryGranularity>("day");
 	const [startDate, setStartDate] = useState("");
 	const [endDate, setEndDate] = useState("");
 
@@ -49,6 +51,16 @@ function SettingsUsagePage() {
 	const { data: stats, refetch: refetchStats } = useQuery({
 		queryKey: ["usage-history", "stats", filters],
 		queryFn: () => usageHistoryApi.getStats(filters),
+		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
+	});
+
+	const {
+		data: timeSeries,
+		isLoading: isLoadingTimeSeries,
+		refetch: refetchTimeSeries,
+	} = useQuery({
+		queryKey: ["usage-history", "timeseries", filters, granularity],
+		queryFn: () => usageHistoryApi.getTimeSeries(filters, { granularity }),
 		gcTime: USAGE_HISTORY_QUERY_GC_TIME_MS,
 	});
 
@@ -110,6 +122,7 @@ function SettingsUsagePage() {
 							onClick={() => {
 								refetchList();
 								refetchStats();
+								refetchTimeSeries();
 							}}
 						>
 							{t("usageHistoryRefresh")}
@@ -124,6 +137,7 @@ function SettingsUsagePage() {
 							onClick={() => {
 								refetchList();
 								refetchStats();
+								refetchTimeSeries();
 							}}
 						>
 							{t("usageHistoryRefresh")}
@@ -132,6 +146,13 @@ function SettingsUsagePage() {
 				)}
 
 				{stats ? <UsageStatsCards stats={stats} /> : null}
+
+				<UsageHistoryChart
+					data={timeSeries}
+					loading={isLoadingTimeSeries}
+					granularity={granularity}
+					onGranularityChange={setGranularity}
+				/>
 
 				<Stack gap={isMobile ? "xs" : "md"}>
 					<SimpleGrid

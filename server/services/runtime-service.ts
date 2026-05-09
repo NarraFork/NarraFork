@@ -4,6 +4,7 @@ import { containerInstances } from "../db/schema";
 import { closeBrowser, getBrowserStatus } from "../lib/browser/pool";
 import { closeAllSessions, getAllSessionStats } from "../lib/browser/session";
 import { logger } from "../lib/logger";
+import { safeSpawn } from "../lib/spawn";
 import { terminalService } from "./terminal-service";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -64,11 +65,8 @@ async function scanTerminals(): Promise<RuntimeTerminalInfo> {
 async function scanContainers(): Promise<RuntimeContainerInfo> {
 	let podmanAvailable = false;
 	try {
-		const proc = Bun.spawn(["podman", "--version"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		podmanAvailable = (await proc.exited) === 0;
+		const result = await safeSpawn({ cmd: ["podman", "--version"], timeout: 5_000 });
+		podmanAvailable = result.exitCode === 0;
 	} catch {
 		// Podman not installed
 	}
@@ -152,11 +150,7 @@ async function cleanupContainers(): Promise<{ stopped: number }> {
 		for (const c of running) {
 			if (!c.containerId) continue;
 			try {
-				const proc = Bun.spawn(["podman", "stop", c.containerId], {
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				await proc.exited;
+				await safeSpawn({ cmd: ["podman", "stop", c.containerId], timeout: 30_000 });
 				// Update DB status
 				db.update(containerInstances)
 					.set({ status: "stopped", updatedAt: new Date().toISOString() })

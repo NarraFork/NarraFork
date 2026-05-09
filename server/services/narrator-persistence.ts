@@ -9,6 +9,7 @@ import {
 } from "../db/schema";
 import { narratorSubstatusLock } from "../lib/async-mutex";
 import type { BooleanOverride } from "../lib/boolean-override";
+import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
@@ -19,6 +20,8 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
+type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
 /** Insert a message into narrator_message_refs junction table */
 async function insertMessageRef(
 	narratorId: string,
@@ -27,14 +30,57 @@ async function insertMessageRef(
 	isCompact = 0,
 	prunedPercent?: number | null,
 ): Promise<void> {
-	await db.insert(narratorMessageRefs).values({
+	await withDbRetry(
+		() =>
+			db.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId,
+				messageId,
+				seq,
+				isCompact,
+				prunedPercent: prunedPercent ?? null,
+			}),
+		{ label: "insertMessageRef", maxRetries: 5 },
+	);
+}
+
+async function appendMessageRefTx(
+	tx: DbTx,
+	narratorId: string,
+	messageId: string,
+	isCompact = 0,
+	prunedPercent?: number | null,
+): Promise<number> {
+	const result = await tx
+		.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+		.from(narratorMessageRefs)
+		.where(eq(narratorMessageRefs.narratorId, narratorId));
+	const seq = (result[0]?.maxSeq ?? -1) + 1;
+
+	let resolvedPrunedPercent = prunedPercent ?? null;
+	if (resolvedPrunedPercent == null) {
+		const narrator = await tx.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { prunedPercent: true },
+		});
+		resolvedPrunedPercent = narrator?.prunedPercent ?? null;
+	}
+
+	await tx.insert(narratorMessageRefs).values({
 		id: generateId(),
 		narratorId,
 		messageId,
 		seq,
 		isCompact,
-		prunedPercent: prunedPercent ?? null,
+		prunedPercent: resolvedPrunedPercent,
 	});
+
+	await tx
+		.update(narrators)
+		.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
+		.where(eq(narrators.id, narratorId));
+
+	return seq;
 }
 
 /** Atomically get next seq and insert into narrator_message_refs */
@@ -44,38 +90,13 @@ async function appendMessageRef(
 	isCompact = 0,
 	prunedPercent?: number | null,
 ): Promise<number> {
-	return db.transaction(async (tx) => {
-		const result = await tx
-			.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId));
-		const seq = (result[0]?.maxSeq ?? -1) + 1;
-
-		let resolvedPrunedPercent = prunedPercent ?? null;
-		if (resolvedPrunedPercent == null) {
-			const narrator = await tx.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { prunedPercent: true },
-			});
-			resolvedPrunedPercent = narrator?.prunedPercent ?? null;
-		}
-
-		await tx.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId,
-			messageId,
-			seq,
-			isCompact,
-			prunedPercent: resolvedPrunedPercent,
-		});
-
-		await tx
-			.update(narrators)
-			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, narratorId));
-
-		return seq;
-	});
+	return withDbRetry(
+		() =>
+			db.transaction((tx) =>
+				appendMessageRefTx(tx, narratorId, messageId, isCompact, prunedPercent),
+			),
+		{ label: "appendMessageRef", maxRetries: 5 },
+	);
 }
 
 // ── Exported appendMessageRef for use by narrator-service.ts ───────────────
@@ -103,32 +124,39 @@ export const narratorPersistence = {
 		commandText?: string | null,
 		createdBy?: string | null,
 	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "user",
-				contentJson: contentBlocks ?? [{ type: "text", text }],
-				contentText: text,
-				commandText: commandText ?? null,
-				createdBy: createdBy ?? null,
-				createdAt: now,
-			})
-			.returning();
+		return withDbRetry(
+			async () => {
+				const id = generateId();
+				const now = new Date().toISOString();
+				const { msg, seq } = await db.transaction(async (tx) => {
+					const [created] = await tx
+						.insert(narratorMessages)
+						.values({
+							id,
+							narratorId,
+							role: "user",
+							contentJson: contentBlocks ?? [{ type: "text", text }],
+							contentText: text,
+							commandText: commandText ?? null,
+							createdBy: createdBy ?? null,
+							createdAt: now,
+						})
+						.returning();
+					const seq = await appendMessageRefTx(tx, narratorId, id);
+					return { msg: created, seq };
+				});
 
-		const seq = await appendMessageRef(narratorId, id);
-
-		if (createdBy) {
-			const user = await db.query.users.findFirst({
-				where: eq(users.id, createdBy),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			});
-			return { ...msg, seq, creator: user ?? null };
-		}
-		return { ...msg, seq, creator: null };
+				if (createdBy) {
+					const user = await db.query.users.findFirst({
+						where: eq(users.id, createdBy),
+						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+					});
+					return { ...msg, seq, creator: user ?? null };
+				}
+				return { ...msg, seq, creator: null };
+			},
+			{ label: "persistUserMessage", maxRetries: 5 },
+		);
 	},
 
 	async persistSystemMessage(
@@ -138,41 +166,54 @@ export const narratorPersistence = {
 		contentBlocks?: any[],
 		createdBy?: string,
 	) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "sys",
-				contentJson: blocks,
-				contentText: text,
-				createdBy: createdBy ?? null,
-				createdAt: now,
-			})
-			.returning();
+		return withDbRetry(
+			() =>
+				db.transaction(async (tx) => {
+					const id = generateId();
+					const now = new Date().toISOString();
+					const blocks: unknown[] = [{ type: "text", text }, ...(contentBlocks ?? [])];
+					const [msg] = await tx
+						.insert(narratorMessages)
+						.values({
+							id,
+							narratorId,
+							role: "sys",
+							contentJson: blocks,
+							contentText: text,
+							createdBy: createdBy ?? null,
+							createdAt: now,
+						})
+						.returning();
 
-		const seq = await appendMessageRef(narratorId, id);
-		return { ...msg, seq };
+					const seq = await appendMessageRefTx(tx, narratorId, id);
+					return { ...msg, seq };
+				}),
+			{ label: "persistSystemMessage", maxRetries: 5 },
+		);
 	},
 
 	async persistDisplayMessage(narratorId: string, text: string) {
-		const id = generateId();
-		const now = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "disp",
-				contentJson: [{ type: "info", message: text }],
-				contentText: `[Info] ${text}`,
-				createdAt: now,
-			})
-			.returning();
-		const seq = await appendMessageRef(narratorId, id);
+		const { msg, seq } = await withDbRetry(
+			() =>
+				db.transaction(async (tx) => {
+					const id = generateId();
+					const now = new Date().toISOString();
+					const [msg] = await tx
+						.insert(narratorMessages)
+						.values({
+							id,
+							narratorId,
+							role: "disp",
+							contentJson: [{ type: "info", message: text }],
+							contentText: `[Info] ${text}`,
+							createdAt: now,
+						})
+						.returning();
+					const seq = await appendMessageRefTx(tx, narratorId, id);
+					return { msg, seq };
+				}),
+			{ label: "persistDisplayMessage", maxRetries: 5 },
+		);
 		broadcastToNarrator(narratorId, {
 			type: "message",
 			narratorId,

@@ -248,18 +248,22 @@ export async function rebuildFileStatesExcluding(
 	const snapshotMap = new Map(snapshots.map((s) => [s.filePath, s.originalContent]));
 
 	const filePathSet = new Set(filePaths);
+	const grouped = new Map<string, OrderedToolCall[]>();
+	for (const tc of allToolCalls) {
+		if (excludeToolUseIds.has(tc.toolUseId)) continue;
+		const input = tc.inputJson as Record<string, unknown> | null;
+		const filePath = input?.file_path as string | undefined;
+		if (!filePath || !filePathSet.has(filePath)) continue;
+		const list = grouped.get(filePath) ?? [];
+		list.push(tc);
+		grouped.set(filePath, list);
+	}
 
 	for (const filePath of filePathSet) {
 		let content = snapshotMap.get(filePath) ?? null;
-
-		// Replay only non-excluded tool calls for this file
-		for (const tc of allToolCalls) {
-			if (excludeToolUseIds.has(tc.toolUseId)) continue;
-			const input = tc.inputJson as Record<string, unknown> | null;
-			if (input?.file_path !== filePath) continue;
+		for (const tc of grouped.get(filePath) ?? []) {
 			content = applyToolCall(content, tc);
 		}
-
 		result.set(filePath, content);
 	}
 

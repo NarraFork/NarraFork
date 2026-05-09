@@ -7,6 +7,7 @@ import {
 } from "@tabler/icons-react";
 import { createElement } from "react";
 import type {
+	ApiEntity,
 	BaseContentBlock,
 	ToolCallRecord,
 	ToolUseContentBlock,
@@ -109,6 +110,23 @@ export interface NarratorPanelSnapshot {
 	turnStartedAt?: string | null;
 }
 
+export interface NarratorDetailsViewerInfo {
+	userId: string;
+	username: string;
+	avatarColor: string | null;
+	avatarImageId: string | null;
+}
+
+/** Props that NarratorPanel exposes for the external details sidebar panel */
+export interface NarratorDetailsPanelExternalProps {
+	narratorId: string;
+	narrator: ApiEntity;
+	viewers: NarratorDetailsViewerInfo[];
+	defaultModelValue?: string;
+	planReflectionAutoApproveGlobal?: boolean;
+	dangerReflectionGlobal?: boolean;
+}
+
 export interface NarratorPanelProps {
 	narratorId: string;
 	narrator?: NarratorPanelSnapshot;
@@ -144,6 +162,12 @@ export interface NarratorPanelProps {
 	onToggleFileModPanel?: () => void;
 	/** Callback that NarratorPanel calls when file-mod panel props change, so the parent can render the sidebar */
 	onFileModPropsChange?: (props: FileModPanelExternalProps) => void;
+	/** Whether the details panel is open (desktop sidebar mode) */
+	detailsPanelOpen?: boolean;
+	/** Toggle the details panel (desktop sidebar mode) */
+	onToggleDetailsPanel?: () => void;
+	/** Callback that NarratorPanel calls when details props change, so the parent can render the sidebar */
+	onDetailsPropsChange?: (props: NarratorDetailsPanelExternalProps) => void;
 }
 
 /** Props that NarratorPanel exposes for the external file-mod sidebar panel */

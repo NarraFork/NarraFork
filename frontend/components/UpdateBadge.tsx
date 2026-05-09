@@ -47,24 +47,22 @@ export function UpdateBadge() {
 				</Badge>
 			</Tooltip>
 
-			{opened && (
-				<Suspense fallback={null}>
-					<UpdateModal
-						opened={opened}
-						onClose={close}
-						data={{
-							latestVersion,
-							currentVersion,
-							releaseInfo,
-							releaseNotes,
-							releaseNotesPerVersion,
-							releaseDate,
-							downloadSize,
-							totalSize,
-						}}
-					/>
-				</Suspense>
-			)}
+			<Suspense fallback={null}>
+				<UpdateModal
+					opened={opened}
+					onClose={close}
+					data={{
+						latestVersion,
+						currentVersion,
+						releaseInfo,
+						releaseNotes,
+						releaseNotesPerVersion,
+						releaseDate,
+						downloadSize,
+						totalSize,
+					}}
+				/>
+			</Suspense>
 		</>
 	);
 }

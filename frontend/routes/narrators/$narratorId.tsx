@@ -8,7 +8,10 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
-import type { FileModPanelExternalProps } from "../../components/narrator/narrator-panel-types";
+import type {
+	FileModPanelExternalProps,
+	NarratorDetailsPanelExternalProps,
+} from "../../components/narrator/narrator-panel-types";
 import {
 	createBranch,
 	createLeafWith,
@@ -24,6 +27,11 @@ const NarratorTerminal = lazy(() =>
 const FileModificationsPanel = lazy(() =>
 	import("../../components/narrator/FileModificationsDrawer").then((m) => ({
 		default: m.FileModificationsPanel,
+	})),
+);
+const NarratorDetailsPanel = lazy(() =>
+	import("../../components/narrator/NarratorDetailsPanel").then((m) => ({
+		default: m.NarratorDetailsPanel,
 	})),
 );
 
@@ -220,22 +228,41 @@ function NarratorDetailPage() {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const dragging = useRef(false);
 
-	// Desktop file modifications panel
+	// Desktop right-side utility panels
 	const [fileModOpen, setFileModOpen] = useState(false);
 	const [fileModPanelProps, setFileModPanelProps] = useState<FileModPanelExternalProps | null>(
 		null,
 	);
-	// When file mod panel opens, we keep terminal visible (they share the right side)
-	// The right side shows whichever was opened last; for simplicity, they are mutually exclusive.
+	const [detailsOpen, setDetailsOpen] = useState(false);
+	const [detailsPanelProps, setDetailsPanelProps] =
+		useState<NarratorDetailsPanelExternalProps | null>(null);
+	// The right side shows whichever utility panel was opened last.
 	const handleToggleFileModPanel = useCallback(() => {
 		setFileModOpen((prev) => {
 			if (!prev) {
-				// Opening file mod panel — close terminal
 				setTerminalOpen(false);
+				setDetailsOpen(false);
 				localStorage.setItem(terminalStorageKey(narratorId), "false");
 			}
 			return !prev;
 		});
+	}, [narratorId]);
+	const handleToggleDetailsPanel = useCallback(() => {
+		setDetailsOpen((prev) => {
+			if (!prev) {
+				setTerminalOpen(false);
+				setFileModOpen(false);
+				localStorage.setItem(terminalStorageKey(narratorId), "false");
+			}
+			return !prev;
+		});
+	}, [narratorId]);
+
+	useEffect(() => {
+		setFileModOpen(false);
+		setFileModPanelProps((prev) => (prev?.narratorId === narratorId ? prev : null));
+		setDetailsOpen(false);
+		setDetailsPanelProps((prev) => (prev?.narratorId === narratorId ? prev : null));
 	}, [narratorId]);
 
 	// Mobile: open drawer and auto-create terminal if none running
@@ -271,8 +298,11 @@ function NarratorDetailPage() {
 		if (willOpen && !hasRunningTerminal) {
 			createTerminal.mutate({ name: "Terminal 1" });
 		}
-		// Close file mod panel when opening terminal
-		if (willOpen) setFileModOpen(false);
+		// Close utility panels when opening terminal
+		if (willOpen) {
+			setFileModOpen(false);
+			setDetailsOpen(false);
+		}
 	}, [narratorId, terminalOpen, hasRunningTerminal, createTerminal]);
 
 	const { t: tc } = useTranslation("chapters");
@@ -648,6 +678,9 @@ function NarratorDetailPage() {
 					fileModPanelOpen={isSubagent ? undefined : fileModOpen}
 					onToggleFileModPanel={isSubagent ? undefined : handleToggleFileModPanel}
 					onFileModPropsChange={isSubagent ? undefined : setFileModPanelProps}
+					detailsPanelOpen={detailsOpen}
+					onToggleDetailsPanel={handleToggleDetailsPanel}
+					onDetailsPropsChange={setDetailsPanelProps}
 				/>
 			</Box>
 
@@ -734,6 +767,49 @@ function NarratorDetailPage() {
 								deletePreviewMessageId={fileModPanelProps?.deletePreviewMessageId}
 								onConfirmDelete={fileModPanelProps?.onConfirmDelete}
 								onCancelDelete={fileModPanelProps?.onCancelDelete}
+							/>
+						</Suspense>
+					</Box>
+				</>
+			)}
+
+			{detailsOpen && !terminalOpen && !fileModOpen && detailsPanelProps && (
+				<>
+					{/* Drag handle */}
+					<Box
+						onMouseDown={onDragStart}
+						onTouchStart={onDragStart}
+						style={{
+							position: "relative",
+							width: 6,
+							cursor: "col-resize",
+							flexShrink: 0,
+							borderLeft: "1px solid var(--mantine-color-default-border)",
+						}}
+					/>
+
+					{/* Session details panel */}
+					<Box
+						style={{
+							width: `${terminalRatio * 100}%`,
+							minWidth: Math.max(MIN_PANEL_WIDTH, 360),
+							flexShrink: 0,
+							overflow: "hidden",
+							paddingLeft: 4,
+						}}
+					>
+						<Suspense
+							fallback={
+								<Center h="100%">
+									<Loader size="sm" />
+								</Center>
+							}
+						>
+							<NarratorDetailsPanel
+								{...detailsPanelProps}
+								opened={detailsOpen}
+								onClose={() => setDetailsOpen(false)}
+								displayMode="inline"
 							/>
 						</Suspense>
 					</Box>

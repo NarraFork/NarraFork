@@ -102,7 +102,10 @@ export interface UpdateInstructions {
 
 export interface UpdateDownloadResult {
 	success: boolean;
+	version?: string;
 	updatePath?: string;
+	newBinaryPath?: string;
+	placed?: boolean;
 	instructions?: UpdateInstructions;
 	error?: string;
 }
@@ -121,8 +124,8 @@ function createErrorProgress(error: string): UpdateProgress {
 	};
 }
 
-function createFailureResult(error: string): UpdateDownloadResult {
-	return { success: false, error };
+function createFailureResult(error: string, version?: string): UpdateDownloadResult {
+	return { success: false, error, version };
 }
 
 export function useUpdateCheck(intervalMs = 60 * 60_000) {
@@ -209,12 +212,12 @@ export function useUpdateDownload() {
 				const markFailure = (error: string) => {
 					receivedTerminalResult = true;
 					setProgress(createErrorProgress(error));
-					setResult(createFailureResult(error));
+					setResult(createFailureResult(error, releaseInfo.version));
 				};
 
 				const markSuccess = (downloadResult: UpdateDownloadResult) => {
 					receivedTerminalResult = true;
-					setResult(downloadResult);
+					setResult({ ...downloadResult, version: downloadResult.version ?? releaseInfo.version });
 					setProgress((current) => {
 						if (current?.phase === "complete") return current;
 						return {
@@ -310,7 +313,7 @@ export function useUpdateDownload() {
 				}
 				const error = errorToMessage(err);
 				setProgress(createErrorProgress(error));
-				setResult(createFailureResult(error));
+				setResult(createFailureResult(error, releaseInfo.version));
 			} finally {
 				abortControllerRef.current = null;
 			}
@@ -358,11 +361,11 @@ export function useUpdateApply() {
 		replacementPid?: number;
 	} | null>(null);
 
-	const apply = useCallback(async () => {
+	const apply = useCallback(async (version?: string) => {
 		setIsApplying(true);
 		setApplyResult(null);
 		try {
-			const result = await api.applyUpdate();
+			const result = await api.applyUpdate(version);
 			setApplyResult(result);
 			if (!result.success) {
 				setIsApplying(false);

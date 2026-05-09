@@ -32,6 +32,10 @@ const statsQuerySchema = z.object({
 	endDate: z.string().optional(),
 });
 
+const timeSeriesQuerySchema = statsQuerySchema.extend({
+	granularity: z.enum(["hour", "day", "month"]).default("day"),
+});
+
 /**
  * GET /api/usage-history
  * 获取使用历史记录列表（分页）
@@ -68,6 +72,17 @@ usageHistoryRoutes.get("/stats", async (c) => {
 	const filters = statsQuerySchema.parse(c.req.query());
 	const stats = await usageHistoryService.getUsageStats(filters);
 	return c.json(stats);
+});
+
+/**
+ * GET /api/usage-history/timeseries
+ * 获取后端聚合后的时间序列统计
+ */
+usageHistoryRoutes.get("/timeseries", async (c) => {
+	const query = timeSeriesQuerySchema.parse(c.req.query());
+	const { granularity, ...filters } = query;
+	const result = await usageHistoryService.getUsageTimeSeries(filters, { granularity });
+	return c.json(result);
 });
 
 /**

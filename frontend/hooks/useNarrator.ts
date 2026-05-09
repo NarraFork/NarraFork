@@ -433,7 +433,17 @@ export function useCreateNarrator() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
-		}) => api.createNarrator(data),
+		}) => {
+			let shouldDefaultFastMode = false;
+			try {
+				shouldDefaultFastMode = localStorage.getItem("narrafork_fast_mode_default") === "true";
+			} catch {
+				// ignore localStorage access failures
+			}
+			return api.createNarrator(
+				data.fastMode === undefined && shouldDefaultFastMode ? { ...data, fastMode: true } : data,
+			);
+		},
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},

@@ -1286,7 +1286,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			if (payload.mode === "fork" && payload.parentChapterId) {
 				const draftNode = nodesRef.current.find((n) => n.id === draftNodeId);
 				const draftX = draftNode?.position?.x ?? 0;
-				const draftY = draftNode?.position?.y ?? 0;
+				const draftY = Math.max(0, draftNode?.position?.y ?? 0);
 
 				api
 					.forkChapter(payload.parentChapterId, {
@@ -1442,7 +1442,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			try {
 				const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
 				const posX = (sourceNode?.position?.x ?? 0) + 380;
-				const posY = sourceNode?.position?.y ?? 0;
+				const posY = Math.max(0, sourceNode?.position?.y ?? 0);
 				await api.createReview(nodeId, { axisOffset: posX, crossOffset: posY });
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 				queryClient.invalidateQueries({ queryKey: ["graph"] });

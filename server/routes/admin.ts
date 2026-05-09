@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
 import { AppError, formatZodError } from "../lib/errors";
+import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
 import { saveSettings, settings } from "../lib/settings";
 import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -228,10 +229,13 @@ adminRoutes.get("/diagnostics", async (c) => {
 		setTimeout(() => resolve(Math.round((performance.now() - start) * 100) / 100), 0);
 	});
 
+	const eventLoopLag = getEventLoopLagSnapshot();
+
 	return c.json({
 		timestamp: new Date().toISOString(),
 		uptime: Math.round(process.uptime()),
 		eventLoopLagMs: loopLagMs,
+		eventLoopLag,
 		cpu: {
 			userMs: Math.round(cpuUsage.user / 1000),
 			systemMs: Math.round(cpuUsage.system / 1000),

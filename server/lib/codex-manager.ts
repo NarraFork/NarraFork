@@ -147,7 +147,7 @@ export interface PublicCodexQuotaSegment {
 	nextResetAt: number | null;
 }
 
-export interface PublicCodexQuotaForecastPoint {
+export interface PublicCodexQuotaTrendPoint {
 	timestamp: number;
 	byType: Partial<Record<PublicCodexPlanTier, number>>;
 }
@@ -158,9 +158,9 @@ export interface PublicCodexQuotaOverview {
 	totalRemainingAccountEquivalents: number;
 	totalAccountEquivalents: number;
 	segments: PublicCodexQuotaSegment[];
-	forecast: {
+	trend: {
 		generatedAt: string;
-		points: PublicCodexQuotaForecastPoint[];
+		points: PublicCodexQuotaTrendPoint[];
 		types: PublicCodexPlanTier[];
 	};
 	nextResetAt: number | null;
@@ -744,7 +744,7 @@ export class CodexManager {
 
 		const now = Date.now();
 		const summary = buildCodexUsageSummary(this.entries, now);
-		const forecast = buildCodexUsageForecast(this.entries, now);
+		const trend = buildCodexUsageForecast(this.entries, now);
 		const visibleTiers = CODEX_DISPLAY_PLAN_TIERS.filter(
 			(tier): tier is PublicCodexPlanTier =>
 				tier !== "other" && (summary.byTier[tier]?.accountCount ?? 0) > 0,
@@ -766,7 +766,7 @@ export class CodexManager {
 			(sum, segment) => sum + segment.totalAccountEquivalents,
 			0,
 		);
-		const points = forecast.points.map((point) => {
+		const points = trend.points.map((point) => {
 			const byType = Object.fromEntries(
 				visibleTiers.map((tier) => [tier, point.byTier[tier] ?? 0]),
 			) as Partial<Record<PublicCodexPlanTier, number>>;
@@ -775,12 +775,12 @@ export class CodexManager {
 
 		return {
 			generatedAt: summary.generatedAt,
-			unit: forecast.unit,
+			unit: trend.unit,
 			totalRemainingAccountEquivalents,
 			totalAccountEquivalents,
 			segments,
-			forecast: {
-				generatedAt: forecast.generatedAt,
+			trend: {
+				generatedAt: trend.generatedAt,
 				points,
 				types: visibleTiers,
 			},

@@ -31,6 +31,175 @@ export interface UsageHistoryStats {
 	averageTtftMs: number;
 }
 
+export type UsageHistoryGranularity = "hour" | "day" | "month";
+
+export interface UsageHistoryTimeSeriesPoint {
+	timestamp: string;
+	requestCount: number;
+	totalInputTokens: number;
+	totalOutputTokens: number;
+	totalCacheCreationTokens: number;
+	totalCacheReadTokens: number;
+	totalCacheCreation5mTokens: number;
+	totalCacheCreation1hTokens: number;
+	totalReasoningTokens: number;
+	totalTokens: number;
+	totalCost: number;
+	averageDurationMs: number;
+	averageTtftMs: number;
+	errorCount: number;
+	meterUsage: number;
+	meterUnit: string | null;
+}
+
+export interface UsageHistoryTimeSeriesResponse {
+	granularity: UsageHistoryGranularity;
+	points: UsageHistoryTimeSeriesPoint[];
+	bucketCount: number;
+	maxBuckets: number;
+	truncated: boolean;
+	requestedStartDate: string;
+	requestedEndDate: string;
+	effectiveStartDate: string;
+	effectiveEndDate: string;
+	generatedAt: string;
+}
+
+export interface UsageHistoryTimeSeriesOptions {
+	granularity?: UsageHistoryGranularity;
+	now?: Date;
+}
+
+const USAGE_TIME_SERIES_CONFIG = {
+	hour: { maxBuckets: 744, defaultBuckets: 24 * 7 },
+	day: { maxBuckets: 366, defaultBuckets: 90 },
+	month: { maxBuckets: 60, defaultBuckets: 24 },
+} satisfies Record<UsageHistoryGranularity, { maxBuckets: number; defaultBuckets: number }>;
+
+interface UsageTimeSeriesRange {
+	startBucketDate: Date;
+	endBucketDate: Date;
+	requestedStartDate: string;
+	requestedEndDate: string;
+	effectiveStartDate: string;
+	effectiveEndDate: string;
+	truncated: boolean;
+}
+
+function parseDateOrNull(value: string | undefined): Date | null {
+	if (!value) return null;
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function normalizeToBucketStart(date: Date, granularity: UsageHistoryGranularity): Date {
+	const normalized = new Date(date.getTime());
+	if (granularity === "hour") {
+		normalized.setUTCMinutes(0, 0, 0);
+		return normalized;
+	}
+	if (granularity === "day") {
+		normalized.setUTCHours(0, 0, 0, 0);
+		return normalized;
+	}
+	normalized.setUTCDate(1);
+	normalized.setUTCHours(0, 0, 0, 0);
+	return normalized;
+}
+
+function addBuckets(date: Date, amount: number, granularity: UsageHistoryGranularity): Date {
+	const next = new Date(date.getTime());
+	if (granularity === "hour") next.setUTCHours(next.getUTCHours() + amount);
+	else if (granularity === "day") next.setUTCDate(next.getUTCDate() + amount);
+	else next.setUTCMonth(next.getUTCMonth() + amount);
+	return next;
+}
+
+function countBucketsBetween(start: Date, end: Date, granularity: UsageHistoryGranularity): number {
+	if (start.getTime() > end.getTime()) return 0;
+	if (granularity === "hour") {
+		return Math.floor((end.getTime() - start.getTime()) / (60 * 60 * 1000)) + 1;
+	}
+	if (granularity === "day") {
+		return Math.floor((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+	}
+	return (
+		(end.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+		(end.getUTCMonth() - start.getUTCMonth()) +
+		1
+	);
+}
+
+function buildBucketTimestamps(
+	start: Date,
+	end: Date,
+	granularity: UsageHistoryGranularity,
+): string[] {
+	const timestamps: string[] = [];
+	let cursor = new Date(start.getTime());
+	const maxBuckets = USAGE_TIME_SERIES_CONFIG[granularity].maxBuckets;
+	while (cursor.getTime() <= end.getTime() && timestamps.length < maxBuckets) {
+		timestamps.push(cursor.toISOString());
+		cursor = addBuckets(cursor, 1, granularity);
+	}
+	return timestamps;
+}
+
+function resolveUsageTimeSeriesRange(
+	filters: UsageHistoryFilters,
+	granularity: UsageHistoryGranularity,
+	now: Date,
+): UsageTimeSeriesRange {
+	const config = USAGE_TIME_SERIES_CONFIG[granularity];
+	const parsedEnd = parseDateOrNull(filters.endDate);
+	const requestedEnd = parsedEnd ?? now;
+	const requestedEndBucket = normalizeToBucketStart(requestedEnd, granularity);
+	const parsedStart = parseDateOrNull(filters.startDate);
+	let requestedStart =
+		parsedStart ?? addBuckets(requestedEndBucket, -(config.defaultBuckets - 1), granularity);
+
+	if (requestedStart.getTime() > requestedEnd.getTime()) {
+		requestedStart = new Date(requestedEnd.getTime());
+	}
+
+	let startBucketDate = normalizeToBucketStart(requestedStart, granularity);
+	const endBucketDate = normalizeToBucketStart(requestedEnd, granularity);
+	let effectiveStart = requestedStart;
+	let truncated = false;
+
+	const bucketCount = countBucketsBetween(startBucketDate, endBucketDate, granularity);
+	if (bucketCount > config.maxBuckets) {
+		startBucketDate = addBuckets(endBucketDate, -(config.maxBuckets - 1), granularity);
+		effectiveStart = startBucketDate;
+		truncated = true;
+	}
+
+	return {
+		startBucketDate,
+		endBucketDate,
+		requestedStartDate: requestedStart.toISOString(),
+		requestedEndDate: requestedEnd.toISOString(),
+		effectiveStartDate: effectiveStart.toISOString(),
+		effectiveEndDate: requestedEnd.toISOString(),
+		truncated,
+	};
+}
+
+function getBucketExpression(granularity: UsageHistoryGranularity) {
+	if (granularity === "hour") {
+		return sql<string>`substr(${apiRequests.createdAt}, 1, 13) || ':00:00.000Z'`;
+	}
+	if (granularity === "day") {
+		return sql<string>`substr(${apiRequests.createdAt}, 1, 10) || 'T00:00:00.000Z'`;
+	}
+	return sql<string>`substr(${apiRequests.createdAt}, 1, 7) || '-01T00:00:00.000Z'`;
+}
+
+function toNumber(value: unknown): number {
+	const numberValue = Number(value ?? 0);
+	return Number.isFinite(numberValue) ? numberValue : 0;
+}
+
 export interface UsageHistoryRecord {
 	id: string;
 	narratorId: string | null;
@@ -223,6 +392,93 @@ export class UsageHistoryService {
 			totalCost: stats?.totalCost ?? 0,
 			averageDurationMs: stats?.averageDurationMs ?? 0,
 			averageTtftMs: stats?.averageTtftMs ?? 0,
+		};
+	}
+
+	async getUsageTimeSeries(
+		filters: UsageHistoryFilters,
+		options: UsageHistoryTimeSeriesOptions = {},
+	): Promise<UsageHistoryTimeSeriesResponse> {
+		const granularity = options.granularity ?? "day";
+		const config = USAGE_TIME_SERIES_CONFIG[granularity];
+		const range = resolveUsageTimeSeriesRange(filters, granularity, options.now ?? new Date());
+		const conditions = this.buildWhereConditions({
+			...filters,
+			startDate: range.effectiveStartDate,
+			endDate: range.effectiveEndDate,
+		});
+		const bucket = getBucketExpression(granularity);
+
+		const rows = await db
+			.select({
+				bucket,
+				requestCount: sql<number>`count(*)`,
+				totalInputTokens: sql<number>`coalesce(sum(${apiRequests.inputTokens}), 0)`,
+				totalOutputTokens: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
+				totalCacheCreationTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`,
+				totalCacheReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
+				totalCacheCreation5mTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation5mTokens}), 0)`,
+				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
+				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
+				totalCost: sql<number>`coalesce(sum(${apiRequests.costUsd}), 0)`,
+				averageDurationMs: sql<number>`coalesce(avg(${apiRequests.durationMs}), 0)`,
+				averageTtftMs: sql<number>`coalesce(avg(${apiRequests.ttftMs}), 0)`,
+				errorCount: sql<number>`coalesce(sum(case when ${apiRequests.errorMessage} is not null and trim(${apiRequests.errorMessage}) <> '' then 1 else 0 end), 0)`,
+				meterUsage: sql<number>`coalesce(sum(${apiRequests.meterUsage}), 0)`,
+				meterUnit: sql<
+					string | null
+				>`case when count(distinct ${apiRequests.meterUnit}) = 1 then max(${apiRequests.meterUnit}) when count(distinct ${apiRequests.meterUnit}) > 1 then 'mixed' else null end`,
+			})
+			.from(apiRequests)
+			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
+			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+			.where(and(...conditions))
+			.groupBy(bucket)
+			.orderBy(bucket);
+
+		const rowsByBucket = new Map(rows.map((row) => [row.bucket, row]));
+		const points = buildBucketTimestamps(
+			range.startBucketDate,
+			range.endBucketDate,
+			granularity,
+		).map((timestamp) => {
+			const row = rowsByBucket.get(timestamp);
+			const totalInputTokens = toNumber(row?.totalInputTokens);
+			const totalOutputTokens = toNumber(row?.totalOutputTokens);
+			const totalCacheCreationTokens = toNumber(row?.totalCacheCreationTokens);
+			const totalCacheReadTokens = toNumber(row?.totalCacheReadTokens);
+			return {
+				timestamp,
+				requestCount: toNumber(row?.requestCount),
+				totalInputTokens,
+				totalOutputTokens,
+				totalCacheCreationTokens,
+				totalCacheReadTokens,
+				totalCacheCreation5mTokens: toNumber(row?.totalCacheCreation5mTokens),
+				totalCacheCreation1hTokens: toNumber(row?.totalCacheCreation1hTokens),
+				totalReasoningTokens: toNumber(row?.totalReasoningTokens),
+				totalTokens:
+					totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens,
+				totalCost: toNumber(row?.totalCost),
+				averageDurationMs: toNumber(row?.averageDurationMs),
+				averageTtftMs: toNumber(row?.averageTtftMs),
+				errorCount: toNumber(row?.errorCount),
+				meterUsage: toNumber(row?.meterUsage),
+				meterUnit: row?.meterUnit ?? null,
+			};
+		});
+
+		return {
+			granularity,
+			points,
+			bucketCount: points.length,
+			maxBuckets: config.maxBuckets,
+			truncated: range.truncated,
+			requestedStartDate: range.requestedStartDate,
+			requestedEndDate: range.requestedEndDate,
+			effectiveStartDate: range.effectiveStartDate,
+			effectiveEndDate: range.effectiveEndDate,
+			generatedAt: new Date().toISOString(),
 		};
 	}
 

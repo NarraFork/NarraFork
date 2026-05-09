@@ -2805,8 +2805,8 @@ narratorRoutes.get("/:id/delete-preview", async (c) => {
 
 	const excludeIds = new Set(toolCallsToRevert.map((tc) => tc.toolUseId));
 
-	// Current state (all tool calls applied)
-	const currentStates = await rebuildFileStatesUpToSeq(narratorId, Number.MAX_SAFE_INTEGER);
+	// Current state (all tool calls applied) for affected files only.
+	const currentStates = await rebuildFileStatesExcluding(narratorId, affectedFilePaths, new Set());
 	// State after revert (excluding deleted tool calls)
 	const revertedStates = await rebuildFileStatesExcluding(
 		narratorId,

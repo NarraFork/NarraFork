@@ -8,16 +8,16 @@ import {
 	copyFileSync,
 	createReadStream,
 	existsSync,
+	constants as fsConstants,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
-	renameSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { logger } from "../lib/logger";
 import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
@@ -172,6 +172,19 @@ export interface UpdateProgress {
 }
 
 const UPDATE_DIR = resolve(homedir(), ".narrafork", "updates");
+const PLACED_UPDATE_INFO_PATH = join(UPDATE_DIR, "placed-update.json");
+
+interface PlacedUpdateInfo {
+	version: string;
+	fromVersion: string;
+	fileName: string;
+	newBinaryPath?: string;
+	updatePath?: string;
+	placed: boolean;
+	placedAt: string;
+	sha512: string;
+	sizeBytes: number;
+}
 
 /**
  * Get the platform identifier for update server.
@@ -203,6 +216,111 @@ function getCurrentExecutablePath(): string | null {
 		return process.execPath;
 	}
 	return null;
+}
+
+function normalizePathForCompare(filePath: string): string {
+	const resolved = resolve(filePath);
+	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSamePath(a: string, b: string): boolean {
+	return normalizePathForCompare(a) === normalizePathForCompare(b);
+}
+
+function isPathInsideDirectory(childPath: string, parentPath: string): boolean {
+	const relativePath = relative(resolve(parentPath), resolve(childPath));
+	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function sanitizeVersionFragment(version: string): string {
+	return version.replace(/[^a-zA-Z0-9._-]+/g, "-") || "unknown";
+}
+
+function sanitizeUpdateFileName(filePath: string, version: string): string {
+	const fallbackExt = process.platform === "win32" ? ".exe" : "";
+	const fallback = `narrafork-${sanitizeVersionFragment(version)}${fallbackExt}`;
+	const baseName = basename(filePath).replace(/[<>:"/\\|?*]+/g, "-");
+	if (!baseName || baseName === "." || baseName === "..") return fallback;
+	return baseName;
+}
+
+function appendFileNameSuffix(fileName: string, suffix: string): string {
+	const ext = extname(fileName);
+	const stem = ext ? fileName.slice(0, -ext.length) : fileName;
+	return `${stem}${suffix}${ext}`;
+}
+
+interface PreparedBinaryDestination {
+	path: string;
+	fileName: string;
+	alreadyPresent: boolean;
+}
+
+function chooseNonOverwritingDestination({
+	directory,
+	baseName,
+	version,
+	sha512,
+	disallowedPath,
+}: {
+	directory: string;
+	baseName: string;
+	version: string;
+	sha512: string;
+	disallowedPath?: string;
+}): PreparedBinaryDestination {
+	const versionSuffix = sanitizeVersionFragment(version);
+	const candidates = [
+		baseName,
+		appendFileNameSuffix(baseName, `-${versionSuffix}-prepared`),
+		...Array.from({ length: 20 }, (_, index) =>
+			appendFileNameSuffix(baseName, `-${versionSuffix}-prepared-${index + 2}`),
+		),
+	];
+
+	for (const fileName of candidates) {
+		const candidatePath = resolve(directory, fileName);
+		if (!isPathInsideDirectory(candidatePath, directory)) continue;
+		if (disallowedPath && isSamePath(candidatePath, disallowedPath)) continue;
+
+		if (existsSync(candidatePath)) {
+			try {
+				const stat = statSync(candidatePath);
+				if (stat.isFile() && computeFileSha512Sync(candidatePath) === sha512) {
+					return { path: candidatePath, fileName, alreadyPresent: true };
+				}
+			} catch {
+				// If an existing candidate cannot be read, do not overwrite it.
+			}
+			continue;
+		}
+
+		return { path: candidatePath, fileName, alreadyPresent: false };
+	}
+
+	throw new Error("Unable to choose a safe update binary path without overwriting existing files");
+}
+
+function resolvePreparedBinaryDestination(
+	execPath: string,
+	releaseInfo: ReleaseInfo,
+): PreparedBinaryDestination {
+	return chooseNonOverwritingDestination({
+		directory: dirname(execPath),
+		baseName: sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version),
+		version: releaseInfo.version,
+		sha512: releaseInfo.sha512,
+		disallowedPath: execPath,
+	});
+}
+
+function resolveUpdateCacheDestination(releaseInfo: ReleaseInfo): PreparedBinaryDestination {
+	return chooseNonOverwritingDestination({
+		directory: UPDATE_DIR,
+		baseName: sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version),
+		version: releaseInfo.version,
+		sha512: releaseInfo.sha512,
+	});
 }
 
 /** V2 API response from the update server */
@@ -430,7 +548,14 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(
 	releaseInfo: ReleaseInfo,
 	onProgress?: (progress: UpdateProgress) => void,
-): Promise<{ success: boolean; error?: string; updatePath?: string }> {
+): Promise<{
+	success: boolean;
+	error?: string;
+	version?: string;
+	updatePath?: string;
+	newBinaryPath?: string;
+	placed?: boolean;
+}> {
 	const serverUrl = getServerBaseUrl();
 	if (!serverUrl) {
 		return { success: false, error: "Update server not configured" };
@@ -441,8 +566,9 @@ export async function downloadUpdate(
 	// Ensure update directory exists
 	mkdirSync(UPDATE_DIR, { recursive: true });
 
-	const updatePath = join(UPDATE_DIR, basename(releaseInfo.path));
-	const tempPath = `${updatePath}.tmp`;
+	const releaseFileName = sanitizeUpdateFileName(releaseInfo.path, releaseInfo.version);
+	const updatePath = join(UPDATE_DIR, releaseFileName);
+	const tempPath = `${updatePath}.${process.pid}.${Date.now()}.tmp`;
 
 	logger.info("Starting update download", {
 		version: releaseInfo.version,
@@ -655,11 +781,54 @@ export async function downloadUpdate(
 			};
 		}
 
-		// Move to final location
-		if (existsSync(updatePath)) {
-			unlinkSync(updatePath);
+		let finalUpdatePath = updatePath;
+		let newBinaryPath: string | undefined;
+		let placed = false;
+		let finalFileName = releaseFileName;
+
+		if (execPath) {
+			const destination = resolvePreparedBinaryDestination(execPath, releaseInfo);
+			newBinaryPath = destination.path;
+			finalFileName = destination.fileName;
+			if (destination.alreadyPresent) {
+				unlinkSync(tempPath);
+			} else {
+				moveFileNoOverwriteSync(tempPath, newBinaryPath);
+			}
+			if (process.platform !== "win32") {
+				chmodSync(newBinaryPath, 0o755);
+			}
+			finalUpdatePath = newBinaryPath;
+			placed = true;
+			logger.info("Update binary placed next to current executable", {
+				newBinaryPath,
+				version: releaseInfo.version,
+				reusedExisting: destination.alreadyPresent,
+			});
+		} else {
+			// Development mode fallback: keep the rebuilt binary in the update cache.
+			const destination = resolveUpdateCacheDestination(releaseInfo);
+			finalUpdatePath = destination.path;
+			finalFileName = destination.fileName;
+			if (destination.alreadyPresent) {
+				unlinkSync(tempPath);
+			} else {
+				moveFileNoOverwriteSync(tempPath, finalUpdatePath);
+			}
 		}
-		renameSync(tempPath, updatePath);
+
+		const finalSize = statSync(finalUpdatePath).size;
+		writePlacedUpdateInfo({
+			version: releaseInfo.version,
+			fromVersion: APP_VERSION,
+			fileName: finalFileName,
+			newBinaryPath,
+			updatePath: finalUpdatePath,
+			placed,
+			placedAt: new Date().toISOString(),
+			sha512: releaseInfo.sha512,
+			sizeBytes: finalSize,
+		});
 
 		onProgress?.({
 			phase: "complete",
@@ -668,7 +837,13 @@ export async function downloadUpdate(
 			percent: 100,
 		});
 
-		return { success: true, updatePath };
+		return {
+			success: true,
+			version: releaseInfo.version,
+			updatePath: finalUpdatePath,
+			newBinaryPath,
+			placed,
+		};
 	} catch (err) {
 		// Cleanup temp file
 		if (existsSync(tempPath)) {
@@ -704,13 +879,63 @@ async function computeFileSha512(filePath: string): Promise<string> {
 	});
 }
 
+function computeFileSha512Sync(filePath: string): string {
+	const hash = createHash("sha512");
+	hash.update(readFileSync(filePath));
+	return hash.digest("base64");
+}
+
+function writePlacedUpdateInfo(info: PlacedUpdateInfo): void {
+	mkdirSync(UPDATE_DIR, { recursive: true });
+	writeFileSync(PLACED_UPDATE_INFO_PATH, JSON.stringify(info, null, 2));
+}
+
+function readPlacedUpdateInfo(options: { targetVersion?: string } = {}): PlacedUpdateInfo | null {
+	if (!existsSync(PLACED_UPDATE_INFO_PATH)) return null;
+	try {
+		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
+		if (options.targetVersion && info.version !== options.targetVersion) return null;
+		if (info.fromVersion !== APP_VERSION) return null;
+		if (typeof info.sha512 !== "string" || !info.sha512) return null;
+		if (typeof info.sizeBytes !== "number" || !Number.isFinite(info.sizeBytes)) return null;
+
+		const candidatePath = info.newBinaryPath ?? info.updatePath;
+		if (!candidatePath) return null;
+		const resolvedCandidatePath = resolve(candidatePath);
+		const execPath = getCurrentExecutablePath();
+		const allowedDirectories = [UPDATE_DIR, execPath ? dirname(execPath) : null].filter(
+			(dir): dir is string => Boolean(dir),
+		);
+		if (!allowedDirectories.some((dir) => isPathInsideDirectory(resolvedCandidatePath, dir))) {
+			return null;
+		}
+		if (execPath && isSamePath(resolvedCandidatePath, execPath)) return null;
+		if (!existsSync(resolvedCandidatePath)) return null;
+
+		const stat = statSync(resolvedCandidatePath);
+		if (!stat.isFile() || stat.size !== info.sizeBytes) return null;
+		if (computeFileSha512Sync(resolvedCandidatePath) !== info.sha512) return null;
+
+		return {
+			...info,
+			newBinaryPath: info.newBinaryPath ? resolve(info.newBinaryPath) : undefined,
+			updatePath: info.updatePath ? resolve(info.updatePath) : undefined,
+		};
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Returns update instructions.
- * When running as a compiled binary, `manual` is false — the frontend can use
- * the /api/update/apply endpoint for automatic restart.
+ * Compiled binaries are placed next to the current executable as soon as the
+ * patch is verified; users can decide when to stop the old process and run it.
  * In dev mode, manual instructions are provided as a fallback.
  */
-export function getUpdateInstructions(updatePath: string): {
+export function getUpdateInstructions(
+	updatePath: string,
+	newBinaryPath?: string,
+): {
 	manual: boolean;
 	command?: string;
 	newBinaryPath?: string;
@@ -720,29 +945,16 @@ export function getUpdateInstructions(updatePath: string): {
 	if (!execPath) {
 		return {
 			manual: true,
-			message:
-				"Running in development mode. Update downloaded but cannot be applied automatically.",
+			message: "Running in development mode. Update rebuilt and saved to the update cache.",
 		};
 	}
 
-	const execDir = join(execPath, "..");
-	const updateFile = basename(updatePath);
-	const newExecPath = join(execDir, updateFile);
-
-	if (process.platform === "win32") {
-		return {
-			manual: false,
-			newBinaryPath: newExecPath,
-			command: `"${newExecPath}"`,
-			message: "Update ready. Click apply to stop the server, then run the new binary.",
-		};
-	}
-
+	const finalBinaryPath = newBinaryPath ?? updatePath;
 	return {
 		manual: false,
-		newBinaryPath: newExecPath,
-		command: `"${newExecPath}"`,
-		message: "Update ready. Click apply to stop the server, then run the new binary.",
+		newBinaryPath: finalBinaryPath,
+		command: `"${finalBinaryPath}"`,
+		message: "Update ready. Run the new binary whenever you choose.",
 	};
 }
 
@@ -776,55 +988,41 @@ export function getUpdateDirectory(): string {
 }
 
 /**
- * Find the downloaded update file in the updates directory.
- */
-function findUpdateFile(): string | null {
-	if (!existsSync(UPDATE_DIR)) return null;
-	const files = readdirSync(UPDATE_DIR);
-	return files.find((f) => f.startsWith("narrafork-") && !f.endsWith(".tmp")) ?? null;
-}
-
-/**
  * Check if an update has been downloaded and is ready to apply.
  */
-export function getUpdateStatus(): {
+export function getUpdateStatus(targetVersion?: string): {
 	ready: boolean;
 	updateFile?: string;
 	canAutoRestart: boolean;
+	newBinaryPath?: string;
+	updatePath?: string;
+	placed?: boolean;
+	version?: string;
 } {
-	const execPath = getCurrentExecutablePath();
-	const updateFile = findUpdateFile();
+	const placedInfo = readPlacedUpdateInfo({ targetVersion });
 	return {
-		ready: !!updateFile,
-		updateFile: updateFile ?? undefined,
-		canAutoRestart: !!execPath,
+		ready: !!placedInfo,
+		updateFile: placedInfo?.fileName,
+		canAutoRestart: !!getCurrentExecutablePath(),
+		newBinaryPath: placedInfo?.newBinaryPath,
+		updatePath: placedInfo?.updatePath,
+		placed: placedInfo?.placed,
+		version: placedInfo?.version,
 	};
 }
 
 /**
- * Move a file, falling back to copy+delete when src and dst are on different filesystems.
+ * Move a file without overwriting an existing destination.
  */
-function moveFileSync(src: string, dst: string): void {
-	try {
-		renameSync(src, dst);
-	} catch (err: unknown) {
-		if ((err as NodeJS.ErrnoException).code === "EXDEV") {
-			copyFileSync(src, dst);
-			unlinkSync(src);
-		} else {
-			throw err;
-		}
-	}
+function moveFileNoOverwriteSync(src: string, dst: string): void {
+	copyFileSync(src, dst, fsConstants.COPYFILE_EXCL);
+	unlinkSync(src);
 }
 
 /**
- * Apply a downloaded update:
- * 1. Move the update file to the same directory as the current executable
- * 2. Mark a one-time graceful restart handoff session as pending
- * 3. Spawn the new binary as a detached replacement process
- * 4. The new process calls /api/gracefully_shutdown and waits for the marker nonce
+ * Restart into the verified prepared update.
  */
-export function applyUpdate(): {
+export function applyUpdate(options: { targetVersion?: string } = {}): {
 	success: boolean;
 	error?: string;
 	newBinaryPath?: string;
@@ -836,29 +1034,19 @@ export function applyUpdate(): {
 		return { success: false, error: "Not running as compiled binary" };
 	}
 
-	const updateFile = findUpdateFile();
-	if (!updateFile) {
-		return { success: false, error: "No update file found" };
+	const placedInfo = readPlacedUpdateInfo({ targetVersion: options.targetVersion });
+	const newExecPath = placedInfo?.newBinaryPath ?? placedInfo?.updatePath;
+	if (!placedInfo || !newExecPath) {
+		return { success: false, error: "No verified prepared update file found" };
+	}
+	if (!placedInfo.placed) {
+		return { success: false, error: "Prepared update is not placed next to the executable" };
 	}
 
-	const updatePath = join(UPDATE_DIR, updateFile);
-	const execDir = join(execPath, "..");
-	const newExecPath = join(execDir, updateFile);
-	const isWindows = process.platform === "win32";
-
-	try {
-		// Move update file to the same directory as current executable, with new filename
-		if (existsSync(newExecPath)) {
-			try {
-				unlinkSync(newExecPath);
-			} catch {}
-		}
-		moveFileSync(updatePath, newExecPath);
-		if (!isWindows) {
+	if (process.platform !== "win32") {
+		try {
 			chmodSync(newExecPath, 0o755);
-		}
-	} catch (err) {
-		return { success: false, error: `Failed to place new binary: ${err}` };
+		} catch {}
 	}
 
 	let session: ReturnType<typeof beginGracefulRestartSession>;
@@ -888,7 +1076,7 @@ export function applyUpdate(): {
 		});
 		(proc as { unref?: () => void }).unref?.();
 
-		logger.info("Update applied, replacement server spawned", {
+		logger.info("Update replacement server spawned", {
 			oldExecPath: execPath,
 			newExecPath,
 			replacementPid: proc.pid,

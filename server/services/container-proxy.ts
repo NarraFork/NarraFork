@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, projects } from "../db/schema";
@@ -359,16 +358,19 @@ let _pastaBackendCache: boolean | null = null;
  * Returns true for pasta/passt (Podman 5.0+), false for slirp4netns.
  * Result is cached after first call.
  */
-export function isPastaBackend(): boolean {
+export async function isPastaBackend(): Promise<boolean> {
 	if (_pastaBackendCache !== null) return _pastaBackendCache;
 	try {
-		const out = execSync("podman info --format '{{.Host.RootlessNetworkCmd}}'", {
-			encoding: "utf-8",
-			stdio: "pipe",
+		const result = await safeSpawn({
+			cmd: ["podman", "info", "--format", "{{.Host.RootlessNetworkCmd}}"],
 			timeout: 5000,
-		}).trim();
+		});
+		if (result.exitCode !== 0) {
+			_pastaBackendCache = false;
+			return _pastaBackendCache;
+		}
 		// Remove surrounding quotes if present
-		const cmd = out.replace(/^'|'$/g, "").toLowerCase();
+		const cmd = result.stdout.trim().replace(/^'|'$/g, "").toLowerCase();
 		_pastaBackendCache = cmd === "pasta" || cmd === "passt";
 	} catch {
 		_pastaBackendCache = false;
@@ -457,7 +459,7 @@ export async function startContainerProxy(port?: number): Promise<void> {
 	const listenPort = port ?? settings.containers.proxy.port;
 
 	// Verify pasta backend
-	if (!isPastaBackend()) {
+	if (!(await isPastaBackend())) {
 		logger.warn(
 			"Container proxy requires Podman 5.0+ with pasta network backend. " +
 				"Current backend does not support direct host→container IP access. " +

@@ -9,6 +9,7 @@ import {
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
@@ -450,6 +451,17 @@ export const narratorMessageQueries = {
 			where: inArray(narratorMessages.id, messageIds),
 			with: { toolCalls: true, sideCars: true },
 		});
+
+		if (messages.length !== refRows.length) {
+			const foundIds = new Set(messages.map((m) => m.id));
+			const missingMessageIds = messageIds.filter((id) => !foundIds.has(id)).slice(0, 20);
+			logger.warn("Narrator message refs point to missing messages", {
+				narratorId,
+				refCount: refRows.length,
+				messageCount: messages.length,
+				missingMessageIds,
+			});
+		}
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));

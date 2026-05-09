@@ -15,7 +15,10 @@ import { IconBrandGit, IconDownload, IconPlayerPlay, IconRefresh } from "@tabler
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
+import { api, getToken } from "../lib/api";
+
+const OVERLAY_Z_INDEX = 10000;
+const MODAL_Z_INDEX = OVERLAY_Z_INDEX + 1;
 
 /**
  * Full-screen overlay shown when the backend reports git is not installed.
@@ -26,6 +29,7 @@ import { api } from "../lib/api";
 export function GitMissingAlert() {
 	const { t } = useTranslation("common");
 	const qc = useQueryClient();
+	const hasToken = !!getToken();
 	const [skipped, setSkipped] = useState(false);
 	const [confirmOpened, { open: openConfirm, close: closeConfirm }] = useDisclosure(false);
 
@@ -45,6 +49,15 @@ export function GitMissingAlert() {
 		staleTime: 5 * 60 * 1000,
 		// Only fetch when git is missing
 		enabled: !!health && !health.gitAvailable,
+	});
+
+	const { data: authStatus } = useQuery({
+		queryKey: ["auth", "status"],
+		queryFn: api.authStatus,
+		retry: false,
+		staleTime: 60_000,
+		// Only needed before login to distinguish first-user setup from normal login.
+		enabled: !!health && !health.gitAvailable && !hasToken,
 	});
 
 	const installMutation = useMutation({
@@ -71,6 +84,7 @@ export function GitMissingAlert() {
 	const pm = deps?.packageManager;
 	const gitDep = deps?.dependencies.find((d) => d.name === "git");
 	const installCmd = pm && gitDep?.installCommands[pm] ? gitDep.installCommands[pm] : null;
+	const canInstall = hasToken || authStatus?.hasUsers === false;
 
 	return (
 		<>
@@ -80,7 +94,7 @@ export function GitMissingAlert() {
 				pos="fixed"
 				top={0}
 				left={0}
-				style={{ zIndex: 10000, backgroundColor: "var(--mantine-color-body)" }}
+				style={{ zIndex: OVERLAY_Z_INDEX, backgroundColor: "var(--mantine-color-body)" }}
 			>
 				<Container size="xs" ta="center">
 					<IconBrandGit size={64} color="var(--mantine-color-red-6)" />
@@ -91,8 +105,8 @@ export function GitMissingAlert() {
 						{t("gitNotInstalledDesc")}
 					</Text>
 					<Stack gap="sm" align="center">
-						{/* One-click install — only when package manager is detected */}
-						{installCmd ? (
+						{/* One-click install — when package manager is detected and install is allowed. */}
+						{installCmd && canInstall ? (
 							<Button
 								size="lg"
 								leftSection={<IconPlayerPlay size={20} />}
@@ -149,6 +163,7 @@ export function GitMissingAlert() {
 				title={t("gitInstallConfirmTitle")}
 				centered
 				size="md"
+				zIndex={MODAL_Z_INDEX}
 			>
 				<Stack gap="md">
 					<Text size="sm">{t("gitInstallConfirmMessage")}</Text>

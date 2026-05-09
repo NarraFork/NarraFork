@@ -20,6 +20,7 @@ import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
 import { resolveBooleanOverride } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
@@ -1984,10 +1985,21 @@ export async function runAgentLoop(
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
 		logger.error("Narrator loop error", { narratorId, error: errorMsg });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: errorMsg,
-		});
+		try {
+			await withDbRetry(
+				() =>
+					narratorService.updateStatus(narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: errorMsg,
+					}),
+				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
+			);
+		} catch (statusErr) {
+			logger.error("Failed to persist narrator error status", {
+				narratorId,
+				error: String(statusErr),
+			});
+		}
 		loopHadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
@@ -3489,6 +3501,52 @@ export async function updateNarratorPermissionMode(
  */
 const HOT_RELOAD_GUARD = Symbol.for("narrafork.narrator.initialized");
 
+function logNarratorIntegrityDiagnostics(): void {
+	try {
+		const fullForkEmptyRefs = sqlite
+			.prepare(
+				`SELECT n.id, n.parent_narrator_id AS parentNarratorId,
+					(SELECT count(*) FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id) AS parentRefCount
+				 FROM narrators n
+				 WHERE n.inherit_mode = 'full'
+				   AND n.parent_narrator_id IS NOT NULL
+				   AND NOT EXISTS (SELECT 1 FROM narrator_message_refs r WHERE r.narrator_id = n.id)
+				   AND EXISTS (SELECT 1 FROM narrator_message_refs pr WHERE pr.narrator_id = n.parent_narrator_id)
+				 LIMIT 20`,
+			)
+			.all();
+		if (fullForkEmptyRefs.length > 0) {
+			logger.warn("Narrator integrity diagnostic: full forks with empty local refs", {
+				count: fullForkEmptyRefs.length,
+				samples: fullForkEmptyRefs,
+			});
+		}
+
+		const missingForkRefs = sqlite
+			.prepare(
+				`SELECT n.id, n.parent_narrator_id AS parentNarratorId, n.fork_message_id AS forkMessageId, n.inherit_mode AS inheritMode
+				 FROM narrators n
+				 WHERE n.fork_message_id IS NOT NULL
+				   AND n.parent_narrator_id IS NOT NULL
+				   AND NOT EXISTS (
+				     SELECT 1 FROM narrator_message_refs r
+				     WHERE r.narrator_id = n.parent_narrator_id
+				       AND r.message_id = n.fork_message_id
+				   )
+				 LIMIT 20`,
+			)
+			.all();
+		if (missingForkRefs.length > 0) {
+			logger.warn("Narrator integrity diagnostic: fork messages missing from parent refs", {
+				count: missingForkRefs.length,
+				samples: missingForkRefs,
+			});
+		}
+	} catch (err) {
+		logger.warn("Narrator integrity diagnostics failed", { error: String(err) });
+	}
+}
+
 /** Clean up stale in-progress states left by a previous server run. */
 export async function recoverOnStartup(): Promise<void> {
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
@@ -3557,6 +3615,8 @@ export async function recoverOnStartup(): Promise<void> {
 			});
 		}
 	}
+
+	logNarratorIntegrityDiagnostics();
 
 	const stalePermissions = await db.query.narratorToolCalls.findMany({
 		where: eq(narratorToolCalls.status, "pending"),

@@ -78,6 +78,8 @@ export interface SwipeAnchorInfo {
 	blockId: string;
 	/** Short preview text extracted from the swiped block. */
 	previewText: string;
+	/** Optional Mantine text color for the pinned preview. Defaults to dimmed. */
+	previewColor?: string;
 	/** Reference to the swiped DOM element for cloning into the overlay. */
 	element: HTMLElement;
 	/** Scroll the swiped block back into view. */

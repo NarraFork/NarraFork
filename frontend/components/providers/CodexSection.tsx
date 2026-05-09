@@ -55,7 +55,7 @@ import type {
 import { normalizeProxyUrl } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
-import { CodexQuotaForecastChart as SharedCodexQuotaForecastChart } from "./CodexQuotaForecastChart";
+import { CodexQuotaTrendChart as SharedCodexQuotaTrendChart } from "./CodexQuotaTrendChart";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -946,7 +946,7 @@ export const CodexSection = React.memo(function CodexSection({
 			{status?.usageSummary && status?.usageForecast && status?.usageScheduler && (
 				<CodexQuotaOverview
 					summary={status.usageSummary}
-					forecast={status.usageForecast}
+					trend={status.usageForecast}
 					scheduler={status.usageScheduler}
 				/>
 			)}
@@ -1144,11 +1144,11 @@ function formatResetTimestamp(timestamp?: number): string {
 
 function CodexQuotaOverview({
 	summary,
-	forecast,
+	trend,
 	scheduler,
 }: {
 	summary: CodexUsageSummary;
-	forecast: CodexUsageForecast;
+	trend: CodexUsageForecast;
 	scheduler: CodexUsageSchedulerSnapshot;
 }) {
 	const { t } = useTranslation("settings");
@@ -1265,13 +1265,13 @@ function CodexQuotaOverview({
 				<Stack gap="xs">
 					<Group justify="space-between">
 						<Text size="sm" fw={500}>
-							{t("codexQuotaForecastTitle")}
+							{t("codexQuotaTrendTitle")}
 						</Text>
 						<Text size="xs" c="dimmed">
-							{t("codexQuotaForecastUnit")}
+							{t("codexQuotaTrendUnit")}
 						</Text>
 					</Group>
-					<SharedCodexQuotaForecastChart forecast={forecast} selectedTiers={selectedTiers} />
+					<SharedCodexQuotaTrendChart trend={trend} selectedTiers={selectedTiers} />
 				</Stack>
 			</Stack>
 		</Paper>

@@ -21,8 +21,14 @@ import {
 	IconPower,
 	IconX,
 } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { useUpdateApply, useUpdateDownload } from "../hooks/useUpdateCheck";
+import {
+	type UpdateDownloadResult,
+	useUpdateApply,
+	useUpdateDownload,
+} from "../hooks/useUpdateCheck";
+import { api } from "../lib/api";
 import { MarkdownContent } from "./narrator/MarkdownContent";
 
 function formatBytes(bytes: number): string {
@@ -88,6 +94,14 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		downloadSize,
 		totalSize,
 	} = data;
+	const targetVersion = releaseInfo?.version ?? latestVersion;
+
+	const { data: preparedStatus, isLoading: isCheckingPreparedStatus } = useQuery({
+		queryKey: ["update-status", targetVersion],
+		queryFn: () => api.getUpdateStatus(targetVersion),
+		enabled: opened && !!targetVersion,
+		staleTime: 0,
+	});
 
 	const handleDownload = () => {
 		if (releaseInfo) {
@@ -97,11 +111,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 
 	const handleApply = async () => {
 		const { clearPwaCache, waitForUpdatedServerAndReload } = await import("@frontend/lib/pwa");
-		const applyResponse = await apply();
+		const applyResponse = await apply(targetVersion);
 		if (!applyResponse.success) return;
 		if ("restarting" in applyResponse && applyResponse.restarting) {
 			void waitForUpdatedServerAndReload({
-				targetVersion: releaseInfo?.version ?? latestVersion,
+				targetVersion,
 				requestTimeoutMs: 3000,
 			});
 			return;
@@ -110,17 +124,51 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	};
 
 	const handleClose = () => {
-		if (isDownloading) {
-			cancel();
-		}
-		reset();
 		onClose();
+	};
+
+	const handleCancel = () => {
+		cancel();
+		reset();
 	};
 
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
+	const preparedStatusMatches =
+		preparedStatus?.ready && !!targetVersion && preparedStatus.version === targetVersion;
+	const restoredResult: UpdateDownloadResult | null = preparedStatusMatches
+		? {
+				success: true,
+				version: preparedStatus.version,
+				updatePath: preparedStatus.updatePath ?? preparedStatus.newBinaryPath,
+				newBinaryPath: preparedStatus.newBinaryPath,
+				placed: preparedStatus.placed,
+				instructions: {
+					manual: !preparedStatus.placed,
+					newBinaryPath: preparedStatus.newBinaryPath,
+					command: preparedStatus.newBinaryPath ? `"${preparedStatus.newBinaryPath}"` : undefined,
+					message: preparedStatus.placed
+						? t("updatePreparedDescription")
+						: t("updateCachedDescription"),
+				},
+			}
+		: null;
+	const effectiveResult = result ?? restoredResult;
 
-	const canApply = result?.success && result.instructions && !result.instructions.manual;
+	const preparedBinaryPath =
+		effectiveResult?.instructions?.newBinaryPath ??
+		effectiveResult?.newBinaryPath ??
+		effectiveResult?.updatePath;
+	const preparedCommand =
+		effectiveResult?.instructions?.command ??
+		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
+	const preparedDescription = effectiveResult?.placed
+		? t("updatePreparedDescription")
+		: t("updateCachedDescription");
+	const canRestartIntoUpdate =
+		effectiveResult?.success &&
+		effectiveResult.instructions &&
+		!effectiveResult.instructions.manual;
 	const restartStarted = applyResult?.success && applyResult.restarting;
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
@@ -203,7 +251,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</ScrollArea.Autosize>
 				</div>
 
-				{savingsPercent > 0 && !result?.success && (
+				{savingsPercent > 0 && !effectiveResult?.success && (
 					<Text size="xs" c="dimmed">
 						{t("updatePatchInfo", {
 							downloadSize: formatBytes(downloadSize ?? 0),
@@ -215,14 +263,19 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 				<Divider />
 
 				{/* Download button */}
-				{!progress && !result && (
-					<Button fullWidth leftSection={<IconDownload size={16} />} onClick={handleDownload}>
+				{!progress && !effectiveResult && (
+					<Button
+						fullWidth
+						leftSection={<IconDownload size={16} />}
+						onClick={handleDownload}
+						loading={isCheckingPreparedStatus}
+					>
 						{t("download")} ({formatBytes(downloadSize ?? totalSize ?? 0)})
 					</Button>
 				)}
 
 				{/* Download progress */}
-				{progress && !result && (
+				{progress && !effectiveResult && (
 					<>
 						<Text size="sm" c="dimmed">
 							{progress.phase === "checking" && t("updatePhaseChecking")}
@@ -275,88 +328,23 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					</Alert>
 				)}
 
-				{/* Download complete — apply section */}
-				{canApply && !applyResult?.success && (
+				{/* Download complete — binary is already prepared */}
+				{effectiveResult?.success && (
 					<Stack gap="sm">
 						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
 							{t("updateDownloadComplete")}
 						</Alert>
 
-						<Text size="sm">{t("updateApplyDescription")}</Text>
-						<Button
-							fullWidth
-							color="red"
-							variant="light"
-							leftSection={<IconPower size={16} />}
-							onClick={handleApply}
-							loading={isApplying}
-						>
-							{t("updateStopAndApply")}
-						</Button>
-					</Stack>
-				)}
+						<Text size="sm">
+							{preparedBinaryPath ? preparedDescription : t("updateApplyInstructions")}
+						</Text>
 
-				{/* Apply error */}
-				{applyError && (
-					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
-						<Text size="sm">{applyError}</Text>
-					</Alert>
-				)}
-
-				{/* Replacement process started — it will ask the old server to exit, then bind the port. */}
-				{restartStarted && (
-					<Stack gap="sm">
-						<Alert color="blue" variant="light" icon={<IconPower size={16} />}>
-							{t("updateRestarting")}
-						</Alert>
-						<Text size="sm">{t("updateRestartingDescription")}</Text>
-					</Stack>
-				)}
-
-				{/* Server stopped — show new binary path */}
-				{serverStopped && applyResult.newBinaryPath && (
-					<Stack gap="sm">
-						<Alert color="yellow" variant="light" icon={<IconPower size={16} />}>
-							{t("updateServerStopped")}
-						</Alert>
-
-						<Text size="sm">{t("updateRunNewBinary")}</Text>
-
-						<Group gap="xs" align="flex-start">
-							<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
-								{applyResult.newBinaryPath}
-							</Code>
-							<CopyButton value={applyResult.newBinaryPath}>
-								{({ copied, copy }) => (
-									<Tooltip label={copied ? t("copied") : t("copy")}>
-										<Button
-											size="xs"
-											variant="subtle"
-											color={copied ? "green" : "gray"}
-											onClick={copy}
-										>
-											{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-										</Button>
-									</Tooltip>
-								)}
-							</CopyButton>
-						</Group>
-					</Stack>
-				)}
-
-				{/* Manual instructions (dev mode) */}
-				{result?.success && result.instructions?.manual && (
-					<Stack gap="sm">
-						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
-							{t("updateDownloadComplete")}
-						</Alert>
-						<Text size="sm">{t("updateApplyInstructions")}</Text>
-						{result.instructions.command && (
+						{preparedBinaryPath && (
 							<Group gap="xs" align="flex-start">
 								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
-									{result.instructions.command}
+									{preparedBinaryPath}
 								</Code>
-								<CopyButton value={result.instructions.command}>
+								<CopyButton value={preparedBinaryPath}>
 									{({ copied, copy }) => (
 										<Tooltip label={copied ? t("copied") : t("copy")}>
 											<Button
@@ -372,12 +360,82 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 								</CopyButton>
 							</Group>
 						)}
+
+						{preparedCommand && preparedCommand !== preparedBinaryPath && (
+							<Group gap="xs" align="flex-start">
+								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+									{preparedCommand}
+								</Code>
+								<CopyButton value={preparedCommand}>
+									{({ copied, copy }) => (
+										<Tooltip label={copied ? t("copied") : t("copy")}>
+											<Button
+												size="xs"
+												variant="subtle"
+												color={copied ? "green" : "gray"}
+												onClick={copy}
+											>
+												{copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+											</Button>
+										</Tooltip>
+									)}
+								</CopyButton>
+							</Group>
+						)}
+
+						{canRestartIntoUpdate && !applyResult?.success && (
+							<>
+								<Text size="sm">{t("updateApplyDescription")}</Text>
+								<Button
+									fullWidth
+									color="red"
+									variant="light"
+									leftSection={<IconPower size={16} />}
+									onClick={handleApply}
+									loading={isApplying}
+								>
+									{t("updateStopAndApply")}
+								</Button>
+							</>
+						)}
+					</Stack>
+				)}
+
+				{applyError && (
+					<Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />}>
+						<Text size="sm">{applyError}</Text>
+					</Alert>
+				)}
+
+				{restartStarted && (
+					<Stack gap="sm">
+						<Alert color="blue" variant="light" icon={<IconPower size={16} />}>
+							{t("updateRestarting")}
+						</Alert>
+						<Text size="sm">{t("updateRestartingDescription")}</Text>
+					</Stack>
+				)}
+
+				{serverStopped && applyResult.newBinaryPath && (
+					<Stack gap="sm">
+						<Alert color="yellow" variant="light" icon={<IconPower size={16} />}>
+							{t("updateServerStopped")}
+						</Alert>
+						<Text size="sm">{t("updateRunNewBinary")}</Text>
+						<Code block style={{ fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
+							{applyResult.newBinaryPath}
+						</Code>
 					</Stack>
 				)}
 
 				<Group justify="flex-end" gap="sm">
 					{isDownloading ? (
-						<Button variant="subtle" color="red" onClick={cancel} leftSection={<IconX size={14} />}>
+						<Button
+							variant="subtle"
+							color="red"
+							onClick={handleCancel}
+							leftSection={<IconX size={14} />}
+						>
 							{t("cancel")}
 						</Button>
 					) : (

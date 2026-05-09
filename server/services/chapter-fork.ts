@@ -35,6 +35,18 @@ export interface ForkChapterInput {
 	crossOffset?: number;
 }
 
+function summarizeStartupScript(script: string): string {
+	const oneLine = script.replace(/\s+/g, " ").trim();
+	return oneLine.length > 160 ? `${oneLine.slice(0, 160)}…` : oneLine;
+}
+
+function isRiskyNarraforkStartupScript(script: string, worktreePath: string): boolean {
+	const normalized = script.toLowerCase();
+	const looksLikeDevServer = /\b(bun|npm|pnpm|yarn)\s+(run\s+)?dev\b/.test(normalized);
+	const mentionsNarrafork = normalized.includes("narrafork");
+	return mentionsNarrafork || (looksLikeDevServer && /narrafork/i.test(worktreePath));
+}
+
 export const chapterFork = {
 	/**
 	 * Fork a chapter with atomic operations and rollback stack.
@@ -173,11 +185,14 @@ export const chapterFork = {
 			let axisOffset: number;
 			let crossOffset: number;
 
-			if (input.anchorCommitSha != null) {
-				// Use explicit position from the client
-				anchorCommitSha = input.anchorCommitSha;
+			const hasExplicitPosition =
+				input.anchorCommitSha != null || input.axisOffset != null || input.crossOffset != null;
+			if (hasExplicitPosition) {
+				// Use explicit position from the client. Classic graph clients may only
+				// send offsets; anchor those to the fork commit rather than ignoring them.
+				anchorCommitSha = input.anchorCommitSha ?? commitSha;
 				axisOffset = input.axisOffset ?? 0;
-				crossOffset = input.crossOffset ?? 0;
+				crossOffset = Math.max(0, input.crossOffset ?? 0);
 			} else {
 				// Default: anchor to the fork commit
 				anchorCommitSha = commitSha;
@@ -315,16 +330,36 @@ export const chapterFork = {
 
 			// Step 6: Execute startup script (if project has one)
 			if (project.startupScript) {
+				const scriptSummary = summarizeStartupScript(project.startupScript);
+				if (isRiskyNarraforkStartupScript(project.startupScript, worktreePath)) {
+					const warning =
+						"Startup script appears to start a NarraFork/dev server from the forked worktree; " +
+						"a second server process can lock the shared NarraFork database.";
+					warnings.push(warning);
+					logger.warn("Potentially unsafe startup script during fork", {
+						chapterId: id,
+						worktreePath,
+						script: scriptSummary,
+					});
+				}
+
 				try {
 					const result = await safeSpawn({
 						cmd: ["sh", "-c", project.startupScript],
 						cwd: worktreePath,
-						env: { ...process.env, NARRAFORK_CHAPTER_ID: id },
+						env: {
+							...process.env,
+							NARRAFORK_CHAPTER_ID: id,
+							NARRAFORK_STARTUP_SCRIPT: "1",
+						},
 						timeout: 60_000,
+						killProcessTree: true,
 					});
 					if (result.exitCode !== 0) {
 						logger.warn("Startup script failed during fork (non-fatal)", {
 							chapterId: id,
+							worktreePath,
+							script: scriptSummary,
 							exitCode: result.exitCode,
 							stderr: result.stderr.trim(),
 						});
@@ -332,6 +367,8 @@ export const chapterFork = {
 				} catch (err) {
 					logger.warn("Startup script error during fork (non-fatal)", {
 						chapterId: id,
+						worktreePath,
+						script: scriptSummary,
 						error: String(err),
 					});
 				}

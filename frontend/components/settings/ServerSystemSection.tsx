@@ -283,11 +283,9 @@ export function ServerSystemSection({
 				)}
 			</Group>
 
-			{updateModalOpened && (
-				<Suspense fallback={null}>
-					<UpdateModal opened={updateModalOpened} onClose={closeUpdateModal} data={updateData} />
-				</Suspense>
-			)}
+			<Suspense fallback={null}>
+				<UpdateModal opened={updateModalOpened} onClose={closeUpdateModal} data={updateData} />
+			</Suspense>
 
 			{/* System Dependencies */}
 			<Title order={5} mt="sm">

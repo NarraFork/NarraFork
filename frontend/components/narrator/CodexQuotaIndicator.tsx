@@ -1,4 +1,5 @@
 import { Box, Group, Paper, Popover, Stack, Text, UnstyledButton } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
@@ -8,11 +9,11 @@ import { api, type PublicCodexQuotaOverview, type PublicCodexQuotaSegment } from
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	CODEX_TIER_STROKES,
-	CodexQuotaForecastChart,
+	CodexQuotaTrendChart,
 	formatAccountEquivalent,
 	formatResetTimestamp,
 	getCodexTierLabel,
-} from "../providers/CodexQuotaForecastChart";
+} from "../providers/CodexQuotaTrendChart";
 
 function clampRatio(value: number): number {
 	if (!Number.isFinite(value)) return 0;
@@ -29,11 +30,11 @@ const CODEX_QUOTA_QUERY_GC_TIME_MS = 60_000;
 const TOUCH_HOVER_SUPPRESS_MS = 900;
 
 function hasChartData(overview: PublicCodexQuotaOverview): boolean {
-	return overview.forecast.types.length > 0 && overview.forecast.points.length >= 2;
+	return overview.trend.types.length > 0 && overview.trend.points.length >= 2;
 }
 
 function isPublicCodexQuotaOverview(value: unknown): value is PublicCodexQuotaOverview {
-	return !!value && typeof value === "object" && "segments" in value && "forecast" in value;
+	return !!value && typeof value === "object" && "segments" in value && "trend" in value;
 }
 
 function SegmentBars({
@@ -108,6 +109,7 @@ export function CodexQuotaIndicator({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const [detailsOpened, setDetailsOpened] = useState(false);
@@ -149,6 +151,11 @@ export function CodexQuotaIndicator({
 	if (!enabled) return null;
 
 	const segments = overview?.segments ?? [];
+	const useReadableText = compact || isMobile;
+	const detailTitleSize = useReadableText ? "md" : "sm";
+	const detailTextSize = useReadableText ? "sm" : "xs";
+	const detailValueSize = useReadableText ? "xl" : "lg";
+	const detailMarkerSize = useReadableText ? 10 : 8;
 	const canOpenSettings = isAdmin;
 	const errorMessage = error instanceof Error ? error.message : "";
 	const showErrorState = isError && !overview;
@@ -194,7 +201,7 @@ export function CodexQuotaIndicator({
 
 	return (
 		<Popover
-			width={compact ? "min(360px, calc(100vw - 24px))" : "min(520px, calc(100vw - 24px))"}
+			width={compact ? "min(420px, calc(100vw - 20px))" : "min(560px, calc(100vw - 24px))"}
 			shadow="md"
 			withArrow
 			position="top-end"
@@ -231,19 +238,22 @@ export function CodexQuotaIndicator({
 			<Popover.Dropdown
 				onMouseEnter={openDetailsFromMouse}
 				onMouseLeave={scheduleCloseDetails}
-				style={{ maxWidth: "calc(100vw - 24px)", overflow: "visible" }}
+				style={{
+					maxWidth: compact ? "calc(100vw - 20px)" : "calc(100vw - 24px)",
+					overflow: "visible",
+				}}
 			>
 				<Stack gap="sm">
 					<Group justify="space-between" align="flex-start" wrap="nowrap">
 						<Stack gap={2}>
-							<Text size="sm" fw={600}>
+							<Text size={detailTitleSize} fw={600}>
 								{t("codexQuotaIndicatorLabel")}
 							</Text>
-							<Text size="xs" c="dimmed">
-								{overview?.unit === "account_equivalent" ? ts("codexQuotaForecastUnit") : ""}
+							<Text size={detailTextSize} c="dimmed">
+								{overview?.unit === "account_equivalent" ? ts("codexQuotaTrendUnit") : ""}
 							</Text>
 						</Stack>
-						<Text size="lg" fw={700} style={{ whiteSpace: "nowrap" }}>
+						<Text size={detailValueSize} fw={700} style={{ whiteSpace: "nowrap" }}>
 							{summaryLabel}
 						</Text>
 					</Group>
@@ -251,11 +261,11 @@ export function CodexQuotaIndicator({
 					{showErrorState ? (
 						<Paper withBorder p="xs">
 							<Stack gap={2}>
-								<Text size="xs" c="red" ta="center" fw={500}>
+								<Text size={detailTextSize} c="red" ta="center" fw={500}>
 									{t("codexQuotaIndicatorError")}
 								</Text>
 								{errorMessage && (
-									<Text size="xs" c="dimmed" ta="center" lineClamp={2}>
+									<Text size={detailTextSize} c="dimmed" ta="center" lineClamp={2}>
 										{errorMessage}
 									</Text>
 								)}
@@ -268,19 +278,19 @@ export function CodexQuotaIndicator({
 									<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
 										<span
 											style={{
-												width: 8,
-												height: 8,
+												width: detailMarkerSize,
+												height: detailMarkerSize,
 												borderRadius: 999,
 												background: CODEX_TIER_STROKES[segment.type],
 												display: "inline-block",
 												flexShrink: 0,
 											}}
 										/>
-										<Text size="xs" truncate>
+										<Text size={detailTextSize} truncate>
 											{getCodexTierLabel(ts, segment.type)}
 										</Text>
 									</Group>
-									<Text size="xs" fw={600} style={{ flexShrink: 0 }}>
+									<Text size={detailTextSize} fw={600} style={{ flexShrink: 0 }}>
 										{formatAccountEquivalent(segment.remainingAccountEquivalents)} /{" "}
 										{formatAccountEquivalent(segment.totalAccountEquivalents)}
 									</Text>
@@ -289,23 +299,23 @@ export function CodexQuotaIndicator({
 						</Stack>
 					) : (
 						<Paper withBorder p="xs">
-							<Text size="xs" c="dimmed" ta="center">
+							<Text size={detailTextSize} c="dimmed" ta="center">
 								{t("codexQuotaIndicatorEmpty")}
 							</Text>
 						</Paper>
 					)}
 
 					{overview && hasChartData(overview) && (
-						<CodexQuotaForecastChart forecast={overview.forecast} compact showLegend={false} />
+						<CodexQuotaTrendChart trend={overview.trend} compact showLegend={false} />
 					)}
 
 					{isError && overview && (
-						<Text size="xs" c="red" ta="center">
+						<Text size={detailTextSize} c="red" ta="center">
 							{t("codexQuotaIndicatorError")}
 						</Text>
 					)}
 
-					<Text size="xs" c="dimmed">
+					<Text size={detailTextSize} c="dimmed">
 						{overview?.nextResetAt
 							? ts("codexQuotaNextReset", {
 									when: formatResetTimestamp(overview.nextResetAt),
@@ -314,7 +324,7 @@ export function CodexQuotaIndicator({
 					</Text>
 					<UnstyledButton onClick={handleOpenSettings} style={{ alignSelf: "flex-start" }}>
 						<Text
-							size="xs"
+							size={detailTextSize}
 							c={canOpenSettings ? "blue" : "yellow"}
 							td={canOpenSettings ? "underline" : undefined}
 						>

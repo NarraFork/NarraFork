@@ -64,6 +64,8 @@ const isProd = isCompiledBinary || process.env.NODE_ENV === "production" || hasF
 
 const app = new Hono();
 
+const SLOW_API_REQUEST_MS = 1_000;
+
 app.use(
 	"/api/*",
 	cors({
@@ -71,8 +73,28 @@ app.use(
 	}),
 );
 
+app.use("/api/*", async (c, next) => {
+	const startedAt = performance.now();
+	try {
+		await next();
+	} finally {
+		const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+		if (durationMs >= SLOW_API_REQUEST_MS) {
+			logger.warn("Slow API request", {
+				method: c.req.method,
+				path: c.req.path,
+				status: c.res.status,
+				durationMs,
+			});
+		}
+	}
+});
+
 // Public routes (no auth required)
 app.route("/api/auth", authRoutes);
+// Dependency status is needed before login when Git is missing. Installing is
+// allowed only for admins, or during first-user setup before any admin exists.
+app.route("/api/dependencies", dependencyRoutes);
 app.get("/api/health", (c) => {
 	// Re-check git when it was previously unavailable so the frontend
 	// "recheck" button works without a server restart.
@@ -151,7 +173,6 @@ const GIT_FREE_PREFIXES = [
 	"/api/anthropic",
 	"/api/nug",
 	"/api/gateway",
-	"/api/dependencies",
 	"/api/terminals",
 ];
 app.use("/api/*", async (c, next) => {
@@ -169,7 +190,6 @@ app.route("/api/narrators", narratorRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/learning", learningRoutes);
-app.route("/api/dependencies", dependencyRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);

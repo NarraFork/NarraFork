@@ -54,7 +54,7 @@ export const SwipeAnchorOverlay = memo(function SwipeAnchorOverlay({
 					borderBottom: isTop ? "1px solid var(--mantine-color-default-border)" : undefined,
 				}}
 			>
-				<Text size="xs" c="dimmed" lineClamp={2} style={{ width: "100%" }}>
+				<Text size="xs" c={info.previewColor ?? "dimmed"} lineClamp={2} style={{ width: "100%" }}>
 					{info.previewText}
 				</Text>
 			</Box>

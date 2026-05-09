@@ -1,3 +1,4 @@
+import { formatCompactNumber, formatDuration } from "@frontend/lib/compact-number";
 import { usageHistoryApi } from "@frontend/lib/usage-history-api";
 import type { UsageHistoryRecord } from "@frontend/types/usage-history";
 import {
@@ -115,12 +116,6 @@ function formatRawDumpPreview(
 	return { text: parts.join(""), truncated };
 }
 
-function formatDuration(ms: number | null): string {
-	if (ms == null) return "-";
-	if (ms < 1000) return `${ms}ms`;
-	return `${(ms / 1000).toFixed(2)}s`;
-}
-
 function getProviderColor(provider: string | null) {
 	switch (provider) {
 		case "anthropic":
@@ -143,11 +138,28 @@ function getKindLabel(
 	return t(`usageHistoryKind_${kind}`, { defaultValue: kind });
 }
 
-function formatTokenCount(count: number): string {
-	if (count >= 1000) {
-		return `${(count / 1000).toFixed(1)}K`;
-	}
-	return count.toLocaleString();
+function TokenAmount({
+	value,
+	compact = false,
+	textSize,
+}: {
+	value: number;
+	compact?: boolean;
+	textSize: "xs" | "sm";
+}) {
+	const formatted = formatCompactNumber(value);
+	return (
+		<Stack gap={0}>
+			<Text size={textSize} fw={500} lh={1.2}>
+				{formatted.compact}
+			</Text>
+			{formatted.isCompact ? (
+				<Text size={compact ? "9px" : "10px"} c="dimmed" lh={1.1}>
+					{formatted.exact}
+				</Text>
+			) : null}
+		</Stack>
+	);
 }
 
 function TokensCell({
@@ -170,46 +182,40 @@ function TokensCell({
 
 	const iconSize = compact ? 12 : 14;
 	const textSize = compact ? "xs" : "sm";
+	const cacheWriteTokens = formatCompactNumber(record.cacheCreationInputTokens);
 
 	return (
 		<Stack gap={compact ? 2 : 4} style={{ minWidth: compact ? undefined : 100 }}>
 			<Group gap={compact ? 8 : 12} wrap="nowrap">
-				<Group gap={4} wrap="nowrap">
+				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowUp size={iconSize} color="var(--mantine-color-violet-6)" />
-					<Text size={textSize} fw={500}>
-						{formatTokenCount(actualInputTokens)}
-					</Text>
+					<TokenAmount value={actualInputTokens} compact={compact} textSize={textSize} />
 				</Group>
-				<Group gap={4} wrap="nowrap">
+				<Group gap={4} wrap="nowrap" align="flex-start">
 					<IconArrowDown size={iconSize} color="var(--mantine-color-green-6)" />
-					<Text size={textSize} fw={500}>
-						{formatTokenCount(record.outputTokens)}
-					</Text>
+					<TokenAmount value={record.outputTokens} compact={compact} textSize={textSize} />
 				</Group>
 			</Group>
 			{(record.cachedInputTokens > 0 || record.reasoningTokens > 0) && (
 				<Group gap={compact ? 8 : 12} wrap="nowrap">
 					{record.cachedInputTokens > 0 && (
-						<Group gap={4} wrap="nowrap">
+						<Group gap={4} wrap="nowrap" align="flex-start">
 							<IconDeviceFloppy size={iconSize} color="var(--mantine-color-blue-6)" />
-							<Text size={textSize} fw={500}>
-								{formatTokenCount(record.cachedInputTokens)}
-							</Text>
+							<TokenAmount value={record.cachedInputTokens} compact={compact} textSize={textSize} />
 						</Group>
 					)}
 					{record.reasoningTokens > 0 && (
-						<Group gap={4} wrap="nowrap">
+						<Group gap={4} wrap="nowrap" align="flex-start">
 							<IconBrain size={iconSize} color="var(--mantine-color-yellow-6)" />
-							<Text size={textSize} fw={500}>
-								{formatTokenCount(record.reasoningTokens)}
-							</Text>
+							<TokenAmount value={record.reasoningTokens} compact={compact} textSize={textSize} />
 						</Group>
 					)}
 				</Group>
 			)}
 			{record.cacheCreationInputTokens > 0 && (
 				<Text size="xs" c="dimmed">
-					{t("usageHistoryTokenCacheWrite")}: {record.cacheCreationInputTokens.toLocaleString()}
+					{t("usageHistoryTokenCacheWrite")}: {cacheWriteTokens.compact}
+					{cacheWriteTokens.isCompact ? ` (${cacheWriteTokens.exact})` : ""}
 				</Text>
 			)}
 		</Stack>

@@ -4,6 +4,7 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { APP_VERSION } from "../lib/version";
+import { requireAdmin, requireAuth } from "../middleware/auth";
 import {
 	applyUpdate,
 	checkForUpdate,
@@ -12,7 +13,6 @@ import {
 	getUpdateDirectory,
 	getUpdateInstructions,
 	getUpdateStatus,
-	type ReleaseInfo,
 	type UpdateProgress,
 } from "../services/update-service";
 
@@ -42,24 +42,35 @@ updateRoutes.get("/version", (c) => {
 /**
  * POST /api/update/download
  * Download an update. Streams progress via SSE.
- * The frontend sends a minimal releaseInfo, but we re-fetch the full check
- * to get _v2 URLs (zstd patch, patch chain).
+ * The frontend may send the version it expects, but all release metadata and
+ * patch URLs are re-fetched from the configured update server.
  */
-updateRoutes.post("/download", async (c) => {
-	let clientReleaseInfo: ReleaseInfo | undefined;
+updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
+	let requestedVersion: string | undefined;
 	try {
 		const body = await c.req.json();
-		clientReleaseInfo = body?.releaseInfo;
+		const version = body?.releaseInfo?.version;
+		if (typeof version === "string" && version.trim()) requestedVersion = version.trim();
 	} catch {
-		// Empty body is OK — we'll re-check
+		// Empty body is OK — we'll re-check and use server-side release metadata.
 	}
 
-	// Re-check to get full releaseInfo with _v2 URLs
+	// Re-check to get full releaseInfo with trusted _v2 URLs. Never trust client-supplied URLs.
 	const checkResult = await checkForUpdate();
-	const releaseInfo = checkResult.releaseInfo ?? clientReleaseInfo;
+	const releaseInfo = checkResult.releaseInfo;
 
 	if (!releaseInfo) {
 		return c.json({ error: "No update available" }, 404);
+	}
+	if (requestedVersion && requestedVersion !== releaseInfo.version) {
+		return c.json(
+			{
+				error: "Requested update version no longer matches the latest server metadata",
+				requestedVersion,
+				latestVersion: releaseInfo.version,
+			},
+			409,
+		);
 	}
 
 	return streamSSE(c, async (stream) => {
@@ -73,12 +84,15 @@ updateRoutes.post("/download", async (c) => {
 		const result = await downloadUpdate(releaseInfo, onProgress);
 
 		if (result.success && result.updatePath) {
-			const instructions = getUpdateInstructions(result.updatePath);
+			const instructions = getUpdateInstructions(result.updatePath, result.newBinaryPath);
 			await stream.writeSSE({
 				event: "complete",
 				data: JSON.stringify({
 					success: true,
+					version: result.version ?? releaseInfo.version,
 					updatePath: result.updatePath,
+					newBinaryPath: result.newBinaryPath,
+					placed: result.placed,
 					instructions,
 				}),
 			});
@@ -87,6 +101,7 @@ updateRoutes.post("/download", async (c) => {
 				event: "error",
 				data: JSON.stringify({
 					success: false,
+					version: releaseInfo.version,
 					error: result.error,
 				}),
 			});
@@ -98,7 +113,7 @@ updateRoutes.post("/download", async (c) => {
  * POST /api/update/cleanup
  * Clean up old update files.
  */
-updateRoutes.post("/cleanup", (c) => {
+updateRoutes.post("/cleanup", requireAuth, requireAdmin, (c) => {
 	cleanupOldUpdates();
 	return c.json({ success: true });
 });
@@ -107,7 +122,7 @@ updateRoutes.post("/cleanup", (c) => {
  * GET /api/update/directory
  * Get the update download directory.
  */
-updateRoutes.get("/directory", (c) => {
+updateRoutes.get("/directory", requireAuth, requireAdmin, (c) => {
 	return c.json({ directory: getUpdateDirectory() });
 });
 
@@ -115,8 +130,9 @@ updateRoutes.get("/directory", (c) => {
  * GET /api/update/status
  * Check if an update is downloaded and ready to apply.
  */
-updateRoutes.get("/status", (c) => {
-	return c.json(getUpdateStatus());
+updateRoutes.get("/status", requireAuth, requireAdmin, (c) => {
+	const targetVersion = c.req.query("version") || undefined;
+	return c.json(getUpdateStatus(targetVersion));
 });
 
 /**
@@ -124,7 +140,16 @@ updateRoutes.get("/status", (c) => {
  * Move the downloaded update next to the current binary and exit.
  * The user needs to start the new binary manually.
  */
-updateRoutes.post("/apply", (c) => {
-	const result = applyUpdate();
+updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
+	let targetVersion: string | undefined;
+	try {
+		const body = await c.req.json();
+		if (typeof body?.version === "string" && body.version.trim()) {
+			targetVersion = body.version.trim();
+		}
+	} catch {
+		// Empty body is OK; applyUpdate still validates the prepared update metadata.
+	}
+	const result = applyUpdate({ targetVersion });
 	return c.json(result);
 });

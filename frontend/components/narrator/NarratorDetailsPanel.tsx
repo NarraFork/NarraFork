@@ -1,4 +1,5 @@
 import {
+	ActionIcon,
 	Anchor,
 	Badge,
 	Box,
@@ -20,6 +21,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { IconArrowLeft, IconInfoCircle } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -55,7 +57,7 @@ import { UserAvatar } from "../UserAvatar";
 import { localizeNarratorError } from "./error-localization";
 import type { ViewerInfo } from "./useNarratorPanelWS";
 
-interface NarratorDetailsPanelProps {
+export interface NarratorDetailsPanelProps {
 	opened: boolean;
 	onClose: () => void;
 	narratorId: string;
@@ -64,7 +66,14 @@ interface NarratorDetailsPanelProps {
 	defaultModelValue?: string;
 	planReflectionAutoApproveGlobal?: boolean;
 	dangerReflectionGlobal?: boolean;
+	/** Desktop route can embed this as a resizable sidebar; other contexts keep a drawer. */
+	displayMode?: "drawer" | "inline";
 }
+
+export type NarratorDetailsPanelExternalProps = Omit<
+	NarratorDetailsPanelProps,
+	"opened" | "onClose" | "displayMode"
+>;
 
 function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
 	return (
@@ -162,6 +171,7 @@ export function NarratorDetailsPanel({
 	defaultModelValue,
 	planReflectionAutoApproveGlobal = false,
 	dangerReflectionGlobal = true,
+	displayMode = "drawer",
 }: NarratorDetailsPanelProps) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const navigate = useNavigate();
@@ -1053,39 +1063,78 @@ export function NarratorDetailsPanel({
 		</Stack>
 	);
 
-	if (isMobile) {
+	if (!opened) return null;
+
+	const title = (
+		<Group gap="xs" wrap="nowrap">
+			<ActionIcon variant="subtle" color="gray" onClick={onClose} aria-label={tc("close")}>
+				<IconArrowLeft size={18} />
+			</ActionIcon>
+			<Text fw={600}>{t("details.title")}</Text>
+		</Group>
+	);
+
+	if (displayMode === "drawer" || isMobile) {
 		return (
 			<Drawer
 				opened={opened}
 				onClose={onClose}
 				position="right"
-				size="100%"
-				title={t("details.title")}
-				padding="md"
+				size={isMobile ? "100%" : 480}
+				withCloseButton={false}
+				title={title}
+				styles={{
+					header: {
+						borderBottom: "1px solid var(--mantine-color-default-border)",
+						paddingBottom: 8,
+					},
+					body: {
+						height: "calc(100% - 60px)",
+						padding: 0,
+					},
+				}}
 			>
-				{content}
+				<ScrollArea h="100%" p="md">
+					{content}
+				</ScrollArea>
 			</Drawer>
 		);
 	}
 
 	return (
-		<Drawer
-			opened={opened}
-			onClose={onClose}
-			position="right"
-			size={440}
-			withCloseButton={false}
-			title={
-				<Group justify="space-between" w="100%" wrap="nowrap">
-					<Text fw={600}>{t("details.title")}</Text>
-					<CloseButton onClick={onClose} />
-				</Group>
-			}
-			padding={0}
+		<Box
+			w="100%"
+			h="100%"
+			style={{
+				borderLeft: "1px solid var(--mantine-color-default-border)",
+				display: "flex",
+				flexDirection: "column",
+				overflow: "hidden",
+				background: "var(--mantine-color-body)",
+			}}
 		>
-			<ScrollArea h="100%" p="md">
+			<Group
+				gap="xs"
+				px="sm"
+				py={8}
+				wrap="nowrap"
+				style={{
+					flexShrink: 0,
+					borderBottom: "1px solid var(--mantine-color-default-border)",
+				}}
+			>
+				<IconInfoCircle size={16} color="var(--mantine-color-dimmed)" />
+				<Text size="sm" fw={600} style={{ flex: 1 }} truncate>
+					{t("details.title")}
+				</Text>
+				<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"} variant="light">
+					{formatStatus(narrator?.status)}
+				</Badge>
+				<CloseButton size="sm" onClick={onClose} />
+			</Group>
+			<ScrollArea style={{ flex: 1, minHeight: 0 }} p="sm">
 				{content}
 			</ScrollArea>
-		</Drawer>
+		</Box>
 	);
 }

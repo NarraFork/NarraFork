@@ -1,9 +1,11 @@
 import type {
 	UsageHistoryFilters,
+	UsageHistoryGranularity,
 	UsageHistoryListResponse,
 	UsageHistoryProvidersResponse,
 	UsageHistoryRecord,
 	UsageHistoryStats,
+	UsageHistoryTimeSeriesResponse,
 } from "@frontend/types/usage-history";
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -19,6 +21,17 @@ async function fetchJson<T>(url: string): Promise<T> {
 	return response.json();
 }
 
+function appendUsageHistoryFilters(params: URLSearchParams, filters: UsageHistoryFilters): void {
+	if (filters.narratorId) params.append("narratorId", filters.narratorId);
+	if (filters.chapterId) params.append("chapterId", filters.chapterId);
+	if (filters.projectId) params.append("projectId", filters.projectId);
+	if (filters.provider) params.append("provider", filters.provider);
+	if (filters.model) params.append("model", filters.model);
+	if (filters.kind) params.append("kind", filters.kind);
+	if (filters.startDate) params.append("startDate", filters.startDate);
+	if (filters.endDate) params.append("endDate", filters.endDate);
+}
+
 export const usageHistoryApi = {
 	/**
 	 * 获取使用历史记录列表
@@ -27,15 +40,7 @@ export const usageHistoryApi = {
 		filters: UsageHistoryFilters & { page?: number; pageSize?: number },
 	): Promise<UsageHistoryListResponse> {
 		const params = new URLSearchParams();
-
-		if (filters.narratorId) params.append("narratorId", filters.narratorId);
-		if (filters.chapterId) params.append("chapterId", filters.chapterId);
-		if (filters.projectId) params.append("projectId", filters.projectId);
-		if (filters.provider) params.append("provider", filters.provider);
-		if (filters.model) params.append("model", filters.model);
-		if (filters.kind) params.append("kind", filters.kind);
-		if (filters.startDate) params.append("startDate", filters.startDate);
-		if (filters.endDate) params.append("endDate", filters.endDate);
+		appendUsageHistoryFilters(params, filters);
 		if (filters.page) params.append("page", filters.page.toString());
 		if (filters.pageSize) params.append("pageSize", filters.pageSize.toString());
 
@@ -47,17 +52,23 @@ export const usageHistoryApi = {
 	 */
 	async getStats(filters: UsageHistoryFilters): Promise<UsageHistoryStats> {
 		const params = new URLSearchParams();
-
-		if (filters.narratorId) params.append("narratorId", filters.narratorId);
-		if (filters.chapterId) params.append("chapterId", filters.chapterId);
-		if (filters.projectId) params.append("projectId", filters.projectId);
-		if (filters.provider) params.append("provider", filters.provider);
-		if (filters.model) params.append("model", filters.model);
-		if (filters.kind) params.append("kind", filters.kind);
-		if (filters.startDate) params.append("startDate", filters.startDate);
-		if (filters.endDate) params.append("endDate", filters.endDate);
+		appendUsageHistoryFilters(params, filters);
 
 		return fetchJson(`/api/usage-history/stats?${params.toString()}`);
+	},
+
+	/**
+	 * 获取时间序列统计
+	 */
+	async getTimeSeries(
+		filters: UsageHistoryFilters,
+		options: { granularity?: UsageHistoryGranularity } = {},
+	): Promise<UsageHistoryTimeSeriesResponse> {
+		const params = new URLSearchParams();
+		appendUsageHistoryFilters(params, filters);
+		if (options.granularity) params.append("granularity", options.granularity);
+
+		return fetchJson(`/api/usage-history/timeseries?${params.toString()}`);
 	},
 
 	/**

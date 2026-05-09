@@ -411,7 +411,7 @@ export interface PublicCodexQuotaSegment {
 	nextResetAt: number | null;
 }
 
-export interface PublicCodexQuotaForecastPoint {
+export interface PublicCodexQuotaTrendPoint {
 	timestamp: number;
 	byType: Partial<Record<PublicCodexPlanTier, number>>;
 }
@@ -422,9 +422,9 @@ export interface PublicCodexQuotaOverview {
 	totalRemainingAccountEquivalents: number;
 	totalAccountEquivalents: number;
 	segments: PublicCodexQuotaSegment[];
-	forecast: {
+	trend: {
 		generatedAt: string;
-		points: PublicCodexQuotaForecastPoint[];
+		points: PublicCodexQuotaTrendPoint[];
 		types: PublicCodexPlanTier[];
 	};
 	nextResetAt: number | null;

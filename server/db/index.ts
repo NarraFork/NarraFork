@@ -6,6 +6,7 @@ import {
 	tryWalRecovery,
 } from "../lib/db-resilience";
 import { hotOnce, hotSafe, hotTimer } from "../lib/hot-safe";
+import { acquireInstanceLock } from "../lib/instance-lock";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
@@ -15,6 +16,8 @@ import { runMigrations } from "./run-migrations";
 import * as schema from "./schema";
 
 const dbPath = getDbPath();
+
+acquireInstanceLock(dbPath);
 
 let sqlite = openDatabase();
 

@@ -764,9 +764,19 @@ export const miscApi = {
 		request<{ version: string; platform: string; arch: string }>("/update/version"),
 	getUpdateDirectory: () => request<{ directory: string }>("/update/directory"),
 	cleanupUpdates: () => request<{ success: boolean }>("/update/cleanup", { method: "POST" }),
-	getUpdateStatus: () =>
-		request<{ ready: boolean; updateFile?: string; canAutoRestart: boolean }>("/update/status"),
-	applyUpdate: () =>
+	getUpdateStatus: (version?: string) => {
+		const suffix = version ? `?version=${encodeURIComponent(version)}` : "";
+		return request<{
+			ready: boolean;
+			updateFile?: string;
+			canAutoRestart: boolean;
+			newBinaryPath?: string;
+			updatePath?: string;
+			placed?: boolean;
+			version?: string;
+		}>(`/update/status${suffix}`);
+	},
+	applyUpdate: (version?: string) =>
 		request<{
 			success: boolean;
 			error?: string;
@@ -775,6 +785,7 @@ export const miscApi = {
 			replacementPid?: number;
 		}>("/update/apply", {
 			method: "POST",
+			body: version ? JSON.stringify({ version }) : undefined,
 		}),
 
 	// Workspaces

@@ -62,6 +62,40 @@ export interface UsageHistoryStats {
 	averageTtftMs: number;
 }
 
+export type UsageHistoryGranularity = "hour" | "day" | "month";
+
+export interface UsageHistoryTimeSeriesPoint {
+	timestamp: string;
+	requestCount: number;
+	totalInputTokens: number;
+	totalOutputTokens: number;
+	totalCacheCreationTokens: number;
+	totalCacheReadTokens: number;
+	totalCacheCreation5mTokens: number;
+	totalCacheCreation1hTokens: number;
+	totalReasoningTokens: number;
+	totalTokens: number;
+	totalCost: number;
+	averageDurationMs: number;
+	averageTtftMs: number;
+	errorCount: number;
+	meterUsage: number;
+	meterUnit: string | null;
+}
+
+export interface UsageHistoryTimeSeriesResponse {
+	granularity: UsageHistoryGranularity;
+	points: UsageHistoryTimeSeriesPoint[];
+	bucketCount: number;
+	maxBuckets: number;
+	truncated: boolean;
+	requestedStartDate: string;
+	requestedEndDate: string;
+	effectiveStartDate: string;
+	effectiveEndDate: string;
+	generatedAt: string;
+}
+
 export interface UsageHistoryFilters {
 	narratorId?: string;
 	chapterId?: string;
