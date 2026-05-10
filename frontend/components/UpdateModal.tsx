@@ -162,13 +162,14 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const preparedCommand =
 		effectiveResult?.instructions?.command ??
 		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
-	const preparedDescription = effectiveResult?.placed
-		? t("updatePreparedDescription")
-		: t("updateCachedDescription");
 	const canRestartIntoUpdate =
 		effectiveResult?.success &&
 		effectiveResult.instructions &&
 		!effectiveResult.instructions.manual;
+	const preparedDescription = effectiveResult?.placed
+		? t("updatePreparedDescription")
+		: t("updateCachedDescription");
+	const shouldShowPreparedDescription = !canRestartIntoUpdate || !preparedBinaryPath;
 	const restartStarted = applyResult?.success && applyResult.restarting;
 	const serverStopped = applyResult?.success && !applyResult.restarting;
 	const rawDownloadError = result && !result.success ? result.error : null;
@@ -335,9 +336,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							{t("updateDownloadComplete")}
 						</Alert>
 
-						<Text size="sm">
-							{preparedBinaryPath ? preparedDescription : t("updateApplyInstructions")}
-						</Text>
+						{shouldShowPreparedDescription && (
+							<Text size="sm">
+								{preparedBinaryPath ? preparedDescription : t("updateApplyInstructions")}
+							</Text>
+						)}
 
 						{preparedBinaryPath && (
 							<Group gap="xs" align="flex-start">

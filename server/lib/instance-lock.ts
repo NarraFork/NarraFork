@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
 	closeSync,
@@ -13,6 +14,8 @@ import { logger } from "./logger";
 
 const ALLOW_MULTIPLE_ENV = "NARRAFORK_ALLOW_MULTIPLE";
 const LOCK_STATE_KEY = Symbol.for("narrafork.instanceLock");
+const WINDOWS_PID_CHECK_TIMEOUT_MS = 1500;
+const WINDOWS_PID_CHECK_MAX_BUFFER = 64 * 1024;
 
 interface InstanceLockPayload {
 	pid: number;
@@ -55,14 +58,84 @@ function readLockPayload(path: string): InstanceLockPayload | null {
 	}
 }
 
+function parseCsvLine(line: string): string[] {
+	const fields: string[] = [];
+	let current = "";
+	let inQuotes = false;
+
+	for (let i = 0; i < line.length; i++) {
+		const char = line[i];
+		if (char === '"') {
+			if (inQuotes && line[i + 1] === '"') {
+				current += '"';
+				i++;
+			} else {
+				inQuotes = !inQuotes;
+			}
+		} else if (char === "," && !inQuotes) {
+			fields.push(current);
+			current = "";
+		} else {
+			current += char;
+		}
+	}
+	fields.push(current);
+
+	return fields.map((field) => field.trim().replace(/^\uFEFF/, ""));
+}
+
+function isPidAliveByWindowsTasklist(pid: number): boolean | null {
+	const result = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+		encoding: "utf8",
+		maxBuffer: WINDOWS_PID_CHECK_MAX_BUFFER,
+		timeout: WINDOWS_PID_CHECK_TIMEOUT_MS,
+		windowsHide: true,
+	});
+
+	if (result.error || result.status === null) {
+		logger.warn("Failed to check Windows process liveness with tasklist", {
+			pid,
+			error: result.error ? String(result.error) : null,
+			status: result.status,
+			signal: result.signal,
+		});
+		return null;
+	}
+
+	if (result.status !== 0) {
+		logger.warn("tasklist returned a non-zero status while checking process liveness", {
+			pid,
+			status: result.status,
+			stderr: String(result.stderr ?? "").slice(0, 200),
+		});
+		return null;
+	}
+
+	for (const line of String(result.stdout ?? "").split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		const fields = parseCsvLine(trimmed);
+		if (fields[1] === String(pid)) return true;
+	}
+
+	return false;
+}
+
 function isPidAlive(pid: number): boolean {
 	if (!Number.isInteger(pid) || pid <= 0) return false;
+
+	if (process.platform === "win32") {
+		const tasklistResult = isPidAliveByWindowsTasklist(pid);
+		if (tasklistResult !== null) return tasklistResult;
+	}
+
 	try {
 		process.kill(pid, 0);
 		return true;
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException)?.code;
-		return code !== "ESRCH";
+		if (code === "ESRCH") return false;
+		return true;
 	}
 }
 

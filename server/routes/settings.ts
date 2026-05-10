@@ -284,7 +284,7 @@ const updateSettingsSchema = z
 					.max(50)
 					.optional(),
 				providerOrder: z.array(z.string()).max(50).optional(),
-				disabledProviders: z.array(z.string()).max(20).optional(),
+				disabledProviders: z.array(z.string()).max(200).optional(),
 			})
 			.partial()
 			.optional(),
