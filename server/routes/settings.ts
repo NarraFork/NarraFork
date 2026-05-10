@@ -244,6 +244,7 @@ const updateSettingsSchema = z
 					})
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
+				autoCompactPruneThreshold: z.number().int().min(0).max(100).optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),

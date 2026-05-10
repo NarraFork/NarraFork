@@ -71,6 +71,8 @@ function SettingsAgentPage() {
 				setContextThresholds={is.setContextThresholds}
 				autoCompactKeepPairs={is.autoCompactKeepPairs}
 				setAutoCompactKeepPairs={is.setAutoCompactKeepPairs}
+				autoCompactPruneThreshold={is.autoCompactPruneThreshold}
+				setAutoCompactPruneThreshold={is.setAutoCompactPruneThreshold}
 				globalWhitelistDirs={is.globalWhitelistDirs}
 				setGlobalWhitelistDirs={is.setGlobalWhitelistDirs}
 				globalBlacklistDirs={is.globalBlacklistDirs}

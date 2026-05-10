@@ -26,15 +26,15 @@ import { highlightSearchText } from "../../lib/search-utils";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 import { UserAvatar } from "../UserAvatar";
 
-const ATTENTION_TAGS = [
-	"unread",
+const ATTENTION_TAG_PRIORITY = [
 	"error",
-	"interrupted",
+	"compacting",
+	"background_compacting",
 	"suspended",
 	"manual_override",
 	"reflecting",
-	"compacting",
-	"background_compacting",
+	"interrupted",
+	"unread",
 ] as const;
 
 const MAX_NARRATOR_LIST_TITLE_CHARS = 500;
@@ -124,9 +124,7 @@ function getNarratorBadgeInfo(
 	substatus?: string[] | null,
 ): { color: string; labelKey: string } | null {
 	const display = getEffectiveNarratorDisplay(status, substatus ?? undefined);
-	const activeSubstatus = substatus?.find((s: string) =>
-		(ATTENTION_TAGS as readonly string[]).includes(s),
-	);
+	const activeSubstatus = ATTENTION_TAG_PRIORITY.find((tag) => substatus?.includes(tag));
 	const showBadge =
 		!!activeSubstatus ||
 		(status !== "idle" && status !== "working") ||

@@ -25,6 +25,7 @@ import {
 	Menu,
 	Modal,
 	NativeSelect,
+	NumberInput,
 	Popover,
 	SegmentedControl,
 	Skeleton,
@@ -242,6 +243,24 @@ const NarratorDetailsPanel = lazy(() =>
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
 const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
 type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
+
+type ContextThresholdsDraft = {
+	standard: { pruneStart: number; compactStart: number };
+	large: { pruneStart: number; compactStart: number };
+};
+
+type ContextManagementDraft = {
+	contextThresholds: ContextThresholdsDraft;
+	autoCompactKeepPairs: number;
+	autoCompactPruneThreshold: number;
+};
+
+const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = {
+	standard: { pruneStart: 95, compactStart: 99 },
+	large: { pruneStart: 95, compactStart: 99 },
+};
+const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
+const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
 
 function normalizeBooleanOverride(value: unknown): BooleanOverride {
 	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
@@ -1885,6 +1904,7 @@ export function NarratorPanel({
 	);
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: ts } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
@@ -1893,11 +1913,37 @@ export function NarratorPanel({
 		onSuccess: (data) => {
 			qc.setQueryData(["settings"], data);
 			qc.invalidateQueries({ queryKey: ["settings"] });
+			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});
 	const dangerReflectionGlobal = settingsData?.agent?.dangerReflectionEnabled ?? true;
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
 	const globalReflectionSettingsDisabled = !settingsData || updateSettingsMutation.isPending;
+	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
+		const thresholds = settingsData?.agent?.contextThresholds ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT;
+		return {
+			contextThresholds: {
+				standard: {
+					pruneStart:
+						thresholds.standard?.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.standard.pruneStart,
+					compactStart:
+						thresholds.standard?.compactStart ??
+						DEFAULT_CONTEXT_THRESHOLDS_DRAFT.standard.compactStart,
+				},
+				large: {
+					pruneStart:
+						thresholds.large?.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.large.pruneStart,
+					compactStart:
+						thresholds.large?.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.large.compactStart,
+				},
+			},
+			autoCompactKeepPairs:
+				settingsData?.agent?.autoCompactKeepPairs ?? DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
+			autoCompactPruneThreshold:
+				settingsData?.agent?.autoCompactPruneThreshold ?? DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
+		};
+	}, [settingsData?.agent]);
+	const forceCompactPruneThreshold = contextThresholdSettings.autoCompactPruneThreshold;
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
@@ -2518,6 +2564,12 @@ export function NarratorPanel({
 		reflectionSettingsOpened,
 		{ open: openReflectionSettings, close: closeReflectionSettings },
 	] = useDisclosure(false);
+	const [
+		contextThresholdSettingsOpened,
+		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
+	] = useDisclosure(false);
+	const [contextThresholdDraft, setContextThresholdDraft] =
+		useState<ContextManagementDraft>(contextThresholdSettings);
 
 	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
 	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
@@ -2729,12 +2781,70 @@ export function NarratorPanel({
 		},
 		[confirm, dangerReflectionGlobal, settingsData, t, updateSettingsMutation],
 	);
+	const handleOpenContextThresholdSettings = useCallback(() => {
+		setContextThresholdDraft(contextThresholdSettings);
+		openContextThresholdSettingsModal();
+	}, [contextThresholdSettings, openContextThresholdSettingsModal]);
+	const handleSaveContextThresholdSettings = useCallback(() => {
+		const normalized: ContextManagementDraft = {
+			contextThresholds: {
+				standard: {
+					pruneStart: Math.max(
+						50,
+						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.standard.pruneStart)),
+					),
+					compactStart: Math.max(
+						50,
+						Math.min(
+							100,
+							Math.round(contextThresholdDraft.contextThresholds.standard.compactStart),
+						),
+					),
+				},
+				large: {
+					pruneStart: Math.max(
+						10,
+						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.pruneStart)),
+					),
+					compactStart: Math.max(
+						10,
+						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.compactStart)),
+					),
+				},
+			},
+			autoCompactKeepPairs: Math.max(
+				1,
+				Math.min(25, Math.round(contextThresholdDraft.autoCompactKeepPairs)),
+			),
+			autoCompactPruneThreshold: Math.max(
+				0,
+				Math.min(100, Math.round(contextThresholdDraft.autoCompactPruneThreshold)),
+			),
+		};
+		updateSettingsMutation.mutate(
+			{
+				agent: {
+					contextThresholds: normalized.contextThresholds,
+					autoCompactKeepPairs: normalized.autoCompactKeepPairs,
+					autoCompactPruneThreshold: normalized.autoCompactPruneThreshold,
+				},
+			},
+			{
+				onSuccess: () => {
+					setContextThresholdDraft(normalized);
+					closeContextThresholdSettings();
+					notifications.show({ message: t("contextThresholdSettingsSaved"), color: "teal" });
+				},
+			},
+		);
+	}, [closeContextThresholdSettings, contextThresholdDraft, t, updateSettingsMutation]);
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
-	// Derive legacy boolean flags from substatus
-	const isWaitingForCompact = substatus.includes("compacting");
+	// Derive compacting flags from substatus. "compacting" is blocking; background compact
+	// can run alongside an active turn or after the turn has become idle.
+	const isBlockingCompacting = substatus.includes("compacting");
 	const isBackgroundCompacting = substatus.includes("background_compacting");
-	const isCompacting = isWaitingForCompact || isBackgroundCompacting;
+	const isCompacting = isBlockingCompacting || isBackgroundCompacting;
 	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
 	const queueMessageValue = queueMessage
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
@@ -5847,18 +5957,14 @@ export function NarratorPanel({
 					{t("activeThresholds", {
 						prune: activePruneStart ?? modelThresholds?.pruneStart,
 						compact: activeCompactStart ?? modelThresholds?.compactStart,
+						force: forceCompactPruneThreshold,
 					})}
 				</Menu.Label>
 				<Menu.Item
 					leftSection={<IconSettings size={14} />}
 					c="dimmed"
 					fz="xs"
-					onClick={() =>
-						navigate({
-							to: "/settings",
-							search: { section: "agent", scrollTo: "contextThresholds" },
-						})
-					}
+					onClick={handleOpenContextThresholdSettings}
 				>
 					{t("thresholdSettings")}
 				</Menu.Item>
@@ -6360,6 +6466,182 @@ export function NarratorPanel({
 								>
 									{t("confirmArchive")}
 								</Button>
+							</Group>
+						</Stack>
+					</Modal>
+
+					<Modal
+						opened={contextThresholdSettingsOpened}
+						onClose={closeContextThresholdSettings}
+						title={t("contextThresholdSettingsTitle")}
+						centered
+						size="lg"
+					>
+						<Stack gap="md">
+							<Text size="sm" c="dimmed">
+								{t("contextThresholdSettingsIntro")}
+							</Text>
+							<Group grow align="flex-start">
+								<NumberInput
+									label={ts("autoCompactKeepPairs")}
+									description={ts("autoCompactKeepPairsDesc")}
+									value={contextThresholdDraft.autoCompactKeepPairs}
+									onChange={(value) =>
+										setContextThresholdDraft((prev) => ({
+											...prev,
+											autoCompactKeepPairs:
+												typeof value === "number" ? value : DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
+										}))
+									}
+									min={1}
+									max={25}
+									allowDecimal={false}
+								/>
+								<NumberInput
+									label={ts("autoCompactPruneThreshold")}
+									description={ts("autoCompactPruneThresholdDesc")}
+									value={contextThresholdDraft.autoCompactPruneThreshold}
+									onChange={(value) =>
+										setContextThresholdDraft((prev) => ({
+											...prev,
+											autoCompactPruneThreshold:
+												typeof value === "number" ? value : DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
+										}))
+									}
+									min={0}
+									max={100}
+									allowDecimal={false}
+									suffix="%"
+								/>
+							</Group>
+							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
+							<Stack gap="xs">
+								<Text size="sm" fw={600}>
+									{ts("contextThresholdsStandard")}
+								</Text>
+								<Text size="xs" c="dimmed">
+									{t("contextThresholdSettingsStandardDesc")}
+								</Text>
+								<Group grow align="flex-start">
+									<NumberInput
+										label={ts("pruneStart")}
+										description={ts("pruneStartDesc")}
+										value={contextThresholdDraft.contextThresholds.standard.pruneStart}
+										onChange={(value) =>
+											setContextThresholdDraft((prev) => ({
+												...prev,
+												contextThresholds: {
+													...prev.contextThresholds,
+													standard: {
+														...prev.contextThresholds.standard,
+														pruneStart: typeof value === "number" ? value : 95,
+													},
+												},
+											}))
+										}
+										min={50}
+										max={100}
+										allowDecimal={false}
+										suffix="%"
+									/>
+									<NumberInput
+										label={ts("compactStart")}
+										description={ts("compactStartDesc")}
+										value={contextThresholdDraft.contextThresholds.standard.compactStart}
+										onChange={(value) =>
+											setContextThresholdDraft((prev) => ({
+												...prev,
+												contextThresholds: {
+													...prev.contextThresholds,
+													standard: {
+														...prev.contextThresholds.standard,
+														compactStart: typeof value === "number" ? value : 99,
+													},
+												},
+											}))
+										}
+										min={50}
+										max={100}
+										allowDecimal={false}
+										suffix="%"
+									/>
+								</Group>
+							</Stack>
+							<Stack gap="xs">
+								<Text size="sm" fw={600}>
+									{ts("contextThresholdsLarge")}
+								</Text>
+								<Text size="xs" c="dimmed">
+									{t("contextThresholdSettingsLargeDesc")}
+								</Text>
+								<Group grow align="flex-start">
+									<NumberInput
+										label={ts("pruneStart")}
+										description={ts("pruneStartDesc")}
+										value={contextThresholdDraft.contextThresholds.large.pruneStart}
+										onChange={(value) =>
+											setContextThresholdDraft((prev) => ({
+												...prev,
+												contextThresholds: {
+													...prev.contextThresholds,
+													large: {
+														...prev.contextThresholds.large,
+														pruneStart: typeof value === "number" ? value : 95,
+													},
+												},
+											}))
+										}
+										min={10}
+										max={100}
+										allowDecimal={false}
+										suffix="%"
+									/>
+									<NumberInput
+										label={ts("compactStart")}
+										description={ts("compactStartDesc")}
+										value={contextThresholdDraft.contextThresholds.large.compactStart}
+										onChange={(value) =>
+											setContextThresholdDraft((prev) => ({
+												...prev,
+												contextThresholds: {
+													...prev.contextThresholds,
+													large: {
+														...prev.contextThresholds.large,
+														compactStart: typeof value === "number" ? value : 99,
+													},
+												},
+											}))
+										}
+										min={10}
+										max={100}
+										allowDecimal={false}
+										suffix="%"
+									/>
+								</Group>
+							</Stack>
+							<Group justify="space-between">
+								<Anchor
+									component="button"
+									type="button"
+									size="xs"
+									onClick={() => navigate({ to: "/settings/agent" })}
+									style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+								>
+									{t("globalAgentSettings")}
+									<IconExternalLink size={12} />
+								</Anchor>
+								<Group gap="xs">
+									<Button variant="default" onClick={closeContextThresholdSettings}>
+										{tc("cancel")}
+									</Button>
+									<Button
+										onClick={handleSaveContextThresholdSettings}
+										loading={updateSettingsMutation.isPending}
+										disabled={!settingsData}
+									>
+										{tc("save")}
+									</Button>
+								</Group>
 							</Group>
 						</Stack>
 					</Modal>
@@ -7130,7 +7412,7 @@ export function NarratorPanel({
 										color={
 											isRetrying
 												? "yellow"
-												: isWaitingForCompact || (isBackgroundCompacting && !isWorking)
+												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
 													? "orange"
 													: isWaiting
 														? "yellow"
@@ -7145,7 +7427,7 @@ export function NarratorPanel({
 										c={
 											isRetrying
 												? "yellow"
-												: isWaitingForCompact || (isBackgroundCompacting && !isWorking)
+												: isBlockingCompacting || (isBackgroundCompacting && !isWorking)
 													? "orange"
 													: isWaiting
 														? "yellow"
@@ -7166,10 +7448,8 @@ export function NarratorPanel({
 														count: retryInfo?.retryCount,
 														max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 													})
-											: isWaitingForCompact
-												? isWorking
-													? t("thinkingWithCompact")
-													: t("compacting")
+											: isBlockingCompacting
+												? t("compacting")
 												: activeTodo
 													? activeTodo.content || activeTodo.activeForm
 													: isWaiting
@@ -7187,7 +7467,7 @@ export function NarratorPanel({
 												)}
 										</Text>
 									)}
-									{isBackgroundCompacting && isWorking && !isWaitingForCompact && (
+									{isBackgroundCompacting && isWorking && !isBlockingCompacting && (
 										<Text size="xs" c="orange" style={{ flexShrink: 0 }}>
 											· {t("backgroundCompactingShort")}
 										</Text>

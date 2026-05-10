@@ -40,6 +40,7 @@ export const DEFAULTS: NarraForkSettings = {
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 60_000,
 		autoCompactKeepPairs: 2,
+		autoCompactPruneThreshold: 80,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -338,24 +339,29 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 	},
 	"agent.contextThresholds.standard.pruneStart": {
-		desc: "标准模型(≤600k tokens)开始渐进式消息剪枝的上下文使用百分比(0-100)。",
+		desc: "标准模型(≤600k tokens)开始裁剪的上下文使用百分比(0-100)。",
 		type: "number",
 	},
 	"agent.contextThresholds.standard.compactStart": {
-		desc: "标准模型触发上下文压缩的百分比(0-100)。达到此阈值时压缩旧消息。",
+		desc: "标准模型开始压缩的上下文使用百分比(0-100)。达到此阈值时触发压缩检查；若小于等于 pruneStart，则禁用渐进裁剪并在该阈值直接压缩。",
 		type: "number",
 	},
 	"agent.contextThresholds.large.pruneStart": {
-		desc: "大模型(>600k tokens)开始渐进式消息剪枝的百分比(0-100)。",
+		desc: "大模型(>600k tokens)开始裁剪的上下文使用百分比(0-100)。",
 		type: "number",
 	},
 	"agent.contextThresholds.large.compactStart": {
-		desc: "大模型触发上下文压缩的百分比(0-100)。",
+		desc: "大模型开始压缩的上下文使用百分比(0-100)；若小于等于 pruneStart，则禁用渐进裁剪并在该阈值直接压缩。",
 		type: "number",
 	},
 	"agent.autoCompactKeepPairs": {
 		desc: "自动压缩时在压缩摘要之后保留的最近 user/assistant 对话轮数。",
 		type: "number",
+	},
+	"agent.autoCompactPruneThreshold": {
+		desc: "最大裁剪百分比。已裁剪消息占总消息数达到此值时，强制启动后台上下文压缩；低于此值时继续渐进式裁剪。",
+		type: "number",
+		valid: "0-100, 默认 80",
 	},
 
 	// ── chapters ────────────────────────────────────────────────────────

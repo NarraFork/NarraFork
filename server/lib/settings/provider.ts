@@ -717,6 +717,7 @@ export const DEFAULT_CONTEXT_THRESHOLDS = {
 };
 
 export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
+export const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
 
 /**
  * Resolve the summary model's effective context window (tokens).
@@ -747,6 +748,14 @@ export function getAutoCompactKeepPairs(): number {
 		return DEFAULT_AUTO_COMPACT_KEEP_PAIRS;
 	}
 	return Math.max(1, Math.min(25, Math.floor(configured)));
+}
+
+export function getAutoCompactPruneThreshold(): number {
+	const configured = s().agent.autoCompactPruneThreshold;
+	if (typeof configured !== "number" || !Number.isFinite(configured)) {
+		return DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD;
+	}
+	return Math.max(0, Math.min(100, Math.floor(configured)));
 }
 
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {

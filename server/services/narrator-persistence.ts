@@ -1745,6 +1745,16 @@ export const narratorPersistence = {
 			columns: { pruneBoundaryMessageId: true, pruneEnabled: true },
 		});
 
+		// compactStart <= pruneStart means there is no progressive pruning window.
+		// Clear any stale boundary from a previous configuration and let callers
+		// compact directly at compactStart.
+		if (PRUNE_END <= PRUNE_START) {
+			if (narrator?.pruneBoundaryMessageId) {
+				await this.clearPruneBoundary(narratorId);
+			}
+			return null;
+		}
+
 		if (narrator && !narrator.pruneEnabled) return null;
 
 		if (contextPct < PRUNE_START) {

@@ -72,12 +72,6 @@ export async function markCompactAsBlocking(narratorId: string) {
 	}
 }
 
-/**
- * Minimum prunedPercent required before compact is allowed at the compactStart
- * threshold.
- */
-export const COMPACT_PRUNE_THRESHOLD_PCT = 80;
-
 /** Check whether a compact operation is already running for the given narrator. */
 export function isCompactInProgress(narratorId: string): boolean {
 	return compactLocks.has(narratorId);

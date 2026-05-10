@@ -96,6 +96,8 @@ export interface AgentSectionProps {
 	}) => void;
 	autoCompactKeepPairs: number;
 	setAutoCompactKeepPairs: (v: number) => void;
+	autoCompactPruneThreshold: number;
+	setAutoCompactPruneThreshold: (v: number) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -366,15 +368,27 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("contextThresholdsDesc")}
 			</Text>
-			<NumberInput
-				label={t("autoCompactKeepPairs")}
-				description={t("autoCompactKeepPairsDesc")}
-				value={props.autoCompactKeepPairs}
-				onChange={(v) => props.setAutoCompactKeepPairs(typeof v === "number" ? v : 2)}
-				min={1}
-				max={25}
-				allowDecimal={false}
-			/>
+			<Group grow>
+				<NumberInput
+					label={t("autoCompactKeepPairs")}
+					description={t("autoCompactKeepPairsDesc")}
+					value={props.autoCompactKeepPairs}
+					onChange={(v) => props.setAutoCompactKeepPairs(typeof v === "number" ? v : 2)}
+					min={1}
+					max={25}
+					allowDecimal={false}
+				/>
+				<NumberInput
+					label={t("autoCompactPruneThreshold")}
+					description={t("autoCompactPruneThresholdDesc")}
+					value={props.autoCompactPruneThreshold}
+					onChange={(v) => props.setAutoCompactPruneThreshold(typeof v === "number" ? v : 80)}
+					min={0}
+					max={100}
+					allowDecimal={false}
+					suffix="%"
+				/>
+			</Group>
 			<Text size="sm" fw={500} mt={4}>
 				{t("contextThresholdsStandard")}
 			</Text>

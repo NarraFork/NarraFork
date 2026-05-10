@@ -392,6 +392,8 @@ export interface NarraForkSettings {
 		};
 		/** Number of recent user/assistant turns kept after automatic history compact. */
 		autoCompactKeepPairs?: number;
+		/** Pruned message percentage at which automatic background compact is forced. */
+		autoCompactPruneThreshold?: number;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

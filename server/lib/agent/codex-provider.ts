@@ -10,7 +10,6 @@ import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
-	isCodexExpected101StatusError,
 	shouldTreatCodexStreamEventAsYielded,
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
@@ -33,10 +32,30 @@ import type {
 } from "./provider";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
+function getCodexProviderErrorMessage(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	if (typeof err === "string") return err;
+	if (err && typeof err === "object") {
+		const obj = err as Record<string, unknown>;
+		if (typeof obj.message === "string" && obj.message) return obj.message;
+		if (obj.error instanceof Error) return obj.error.message;
+		if (typeof obj.error === "string" && obj.error) return obj.error;
+		if (obj.error && typeof obj.error === "object") {
+			const nested = obj.error as Record<string, unknown>;
+			if (typeof nested.message === "string" && nested.message) return nested.message;
+		}
+	}
+	return String(err ?? "");
+}
+
+export function isCodexProviderExpected101WebSocketFailure(err: unknown): boolean {
+	return /Expected\s+101\s+status\s+code/i.test(getCodexProviderErrorMessage(err));
+}
+
 function classifyCodexError(
 	err: unknown,
 ): { type: "quota_exhausted"; message?: string; resetsAt?: number } | { type: "other" } {
-	const msg = err instanceof Error ? err.message : String(err ?? "");
+	const msg = getCodexProviderErrorMessage(err);
 	const lower = msg.toLowerCase();
 	if (
 		lower.includes("usage_limit_reached") ||
@@ -150,7 +169,8 @@ export class CodexProvider implements ProviderAdapter {
 		ctx: CallContext,
 		err: unknown,
 	): Promise<"not_expected_101" | "retry_sse" | "credential_unavailable"> {
-		if (!isCodexExpected101StatusError(err)) return "not_expected_101";
+		if (!isCodexProviderExpected101WebSocketFailure(err)) return "not_expected_101";
+		const websocketErrorMessage = getCodexProviderErrorMessage(err);
 
 		try {
 			await this.manager.getUsage(ctx.id);
@@ -164,7 +184,7 @@ export class CodexProvider implements ProviderAdapter {
 						credentialId: ctx.id,
 						accountId: ctx.credential.accountId,
 						disabledReason: credential.disabledReason,
-						error: err instanceof Error ? err.message : String(err),
+						error: websocketErrorMessage,
 					},
 				);
 				return "credential_unavailable";
@@ -174,7 +194,7 @@ export class CodexProvider implements ProviderAdapter {
 				{
 					credentialId: ctx.id,
 					accountId: ctx.credential.accountId,
-					error: err instanceof Error ? err.message : String(err),
+					error: websocketErrorMessage,
 				},
 			);
 			return "retry_sse";
@@ -186,8 +206,8 @@ export class CodexProvider implements ProviderAdapter {
 				logger.warn("Codex credential usage check returned 401; marked credential as banned", {
 					credentialId: ctx.id,
 					accountId: ctx.credential.accountId,
-					websocketError: err instanceof Error ? err.message : String(err),
-					usageError: usageError instanceof Error ? usageError.message : String(usageError),
+					websocketError: websocketErrorMessage,
+					usageError: getCodexProviderErrorMessage(usageError),
 				});
 				return "credential_unavailable";
 			}
@@ -197,8 +217,8 @@ export class CodexProvider implements ProviderAdapter {
 				{
 					credentialId: ctx.id,
 					accountId: ctx.credential.accountId,
-					websocketError: err instanceof Error ? err.message : String(err),
-					usageError: usageError instanceof Error ? usageError.message : String(usageError),
+					websocketError: websocketErrorMessage,
+					usageError: getCodexProviderErrorMessage(usageError),
 				},
 			);
 			return "retry_sse";

@@ -1,8 +1,24 @@
 import { describe, expect, test } from "bun:test";
-import { CodexProvider } from "../codex-provider";
+import { CodexProvider, isCodexProviderExpected101WebSocketFailure } from "../codex-provider";
 import { supportsCodexImageGeneration } from "../openai-provider";
 
-describe("CodexProvider Responses WebSocket image handling", () => {
+describe("CodexProvider Responses WebSocket handling", () => {
+	test("detects expected 101 errors from wrapped runtime events", () => {
+		const expected101Message =
+			"WebSocket connection to 'wss://chatgpt.com/backend-api/codex/responses' failed: Expected 101 status code";
+		expect(isCodexProviderExpected101WebSocketFailure(new Error(expected101Message))).toBe(true);
+		expect(isCodexProviderExpected101WebSocketFailure({ message: expected101Message })).toBe(true);
+		expect(
+			isCodexProviderExpected101WebSocketFailure({ error: new Error(expected101Message) }),
+		).toBe(true);
+		expect(
+			isCodexProviderExpected101WebSocketFailure({ error: { message: expected101Message } }),
+		).toBe(true);
+		expect(
+			isCodexProviderExpected101WebSocketFailure(new Error("Unexpected server response: 403")),
+		).toBe(false);
+	});
+
 	test("gpt-5.3-codex-spark is not allowed to use native image generation", () => {
 		expect(supportsCodexImageGeneration("codex:gpt-5.3-codex-spark")).toBe(false);
 	});

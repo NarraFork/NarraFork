@@ -42,6 +42,7 @@ import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/pr
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
+	getAutoCompactPruneThreshold,
 	getContextThresholds,
 	getSettingsRevision,
 	isAnthropicProvider,
@@ -136,7 +137,6 @@ import {
 	toBufferSummary,
 } from "./narrator-buffer";
 import {
-	COMPACT_PRUNE_THRESHOLD_PCT,
 	pruneToolCalls,
 	runCustomCompact,
 	runPlanCompact,
@@ -154,6 +154,13 @@ import {
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
 const MAX_GOAL_CONTINUATION_NO_TOOL_TURNS = 3;
 const goalContinuationStartLock = new AsyncMutex();
+
+function isDynamicPruningWindowEnabled(thresholds: {
+	pruneStart: number;
+	compactStart: number;
+}): boolean {
+	return thresholds.compactStart > thresholds.pruneStart;
+}
 
 /** Parse `git status --porcelain` output into a set of file paths. */
 function parsePorcelainFiles(output: string): Set<string> {
@@ -621,13 +628,19 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 
 	const onContextUsage = (percentage: number) => {
 		const thresholds = getContextThresholds(getModel(), getProvider());
+		const pruningWindowEnabled = isDynamicPruningWindowEnabled(thresholds);
 
-		// Dynamic pruning: pruneStart – (compactStart - 1)%
+		// Dynamic pruning: pruneStart – (compactStart - 1)%. Once pruning reaches
+		// the configured ratio, start background compact immediately instead of
+		// waiting for compactStart. If compactStart <= pruneStart, the pruning window
+		// is disabled and compactStart acts as the direct compact trigger.
 		if (
+			pruningWindowEnabled &&
 			percentage >= thresholds.pruneStart &&
 			percentage < thresholds.compactStart &&
 			!pruneLocks.has(narratorId)
 		) {
+			const compactPruneThreshold = getAutoCompactPruneThreshold();
 			pruneLocks.add(narratorId);
 			narratorService
 				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
@@ -638,6 +651,17 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 						boundaryMessageId: result?.boundaryMessageId ?? null,
 						prunedPercent: result?.prunedPercent ?? null,
 					});
+
+					const prunedPct = result?.prunedPercent ?? 0;
+					if (prunedPct >= compactPruneThreshold) {
+						logger.info("Pruned percent reached threshold, triggering background compact", {
+							narratorId,
+							contextPct: percentage,
+							prunedPercent: prunedPct,
+							threshold: compactPruneThreshold,
+						});
+						triggerMidTurnCompact(narratorId, locale, onCompactDone);
+					}
 				})
 				.catch((err) => {
 					logger.error("Failed to update prune boundary", {
@@ -651,15 +675,27 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 				});
 		}
 
-		// ≥ compactStart%: check prunedPercent before deciding compact vs continued prune.
-		// If prunedPercent < 80%, there's still room to prune further — skip compact.
-		// Exception: when pruning is disabled for this narrator, skip the prune gate
-		// and compact immediately (otherwise compact would never trigger).
+		// ≥ compactStart%: force compact only after pruning reaches the configured
+		// ratio; otherwise keep advancing the prune boundary. Exceptions: when the
+		// pruning window is disabled (compactStart <= pruneStart), or pruning is
+		// disabled for this narrator, skip the prune gate and compact immediately.
 		if (
 			percentage >= thresholds.compactStart &&
 			!pruneLocks.has(narratorId) &&
 			!compactLocks.has(narratorId)
 		) {
+			if (!pruningWindowEnabled) {
+				logger.info("Pruning window disabled, triggering background compact", {
+					narratorId,
+					contextPct: percentage,
+					pruneStart: thresholds.pruneStart,
+					compactStart: thresholds.compactStart,
+				});
+				triggerMidTurnCompact(narratorId, locale, onCompactDone);
+				return;
+			}
+
+			const compactPruneThreshold = getAutoCompactPruneThreshold();
 			pruneLocks.add(narratorId);
 			narratorService
 				.computeAndUpdatePruneBoundary(narratorId, percentage, thresholds)
@@ -686,19 +722,24 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 					}
 
 					const prunedPct = result?.prunedPercent ?? 0;
-					if (prunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
+					if (prunedPct < compactPruneThreshold) {
 						logger.info(
 							"Context above compactStart but prunedPercent below threshold, continuing prune",
 							{
 								narratorId,
 								contextPct: percentage,
 								prunedPercent: prunedPct,
-								threshold: COMPACT_PRUNE_THRESHOLD_PCT,
+								threshold: compactPruneThreshold,
 							},
 						);
 						return; // stay in prune mode — don't compact yet
 					}
-					// prunedPercent ≥ 80%: prune is exhausted, proceed to compact
+					logger.info("Pruned percent reached threshold, triggering background compact", {
+						narratorId,
+						contextPct: percentage,
+						prunedPercent: prunedPct,
+						threshold: compactPruneThreshold,
+					});
 					triggerMidTurnCompact(narratorId, locale, onCompactDone);
 				})
 				.catch((err) => {
@@ -756,7 +797,18 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			where: eq(narrators.id, narratorId),
 			columns: { pruneBoundaryMessageId: true },
 		});
-		const newBoundary = row?.pruneBoundaryMessageId ?? null;
+		const thresholds = getContextThresholds(getModel(), getProvider());
+		let newBoundary = row?.pruneBoundaryMessageId ?? null;
+		if (!isDynamicPruningWindowEnabled(thresholds) && newBoundary) {
+			await narratorService.clearPruneBoundary(narratorId);
+			broadcastToNarrator(narratorId, {
+				type: "prune_boundary",
+				narratorId,
+				boundaryMessageId: null,
+				prunedPercent: null,
+			});
+			newBoundary = null;
+		}
 		if (!reason?.force && newBoundary === getPruneBoundary()) return null;
 		return rebuildHistoryForCurrentContext(newBoundary, reason?.force === true);
 	};
@@ -828,13 +880,6 @@ export async function runAgentLoop(
 				? rawMessages.map((m) => ({ ...m, parentToolUseId: null }))
 				: rawMessages;
 
-			// Apply dynamic pruning — strip tool calls from messages at or
-			// before the persisted boundary so the context stays within budget.
-			active._pruneBoundaryMessageId = freshNarrator.pruneBoundaryMessageId ?? null;
-			if (freshNarrator.pruneBoundaryMessageId) {
-				pruneToolCalls(dbMessages, freshNarrator.pruneBoundaryMessageId);
-			}
-
 			active._modelRef = freshNarrator.model ?? FOLLOW_DEFAULT_MODEL;
 			active._settingsRevision = getSettingsRevision();
 			active.model = resolveEffectiveModel(active._modelRef, active.provider);
@@ -846,6 +891,28 @@ export async function runAgentLoop(
 			);
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
+
+			// Apply dynamic pruning — strip tool calls from messages at or before the
+			// persisted boundary so the context stays within budget. When compactStart
+			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
+			// boundary left over from an earlier threshold configuration.
+			const loopThresholds = getContextThresholds(resolved.model, resolved.provider);
+			const pruningWindowEnabled = isDynamicPruningWindowEnabled(loopThresholds);
+			active._pruneBoundaryMessageId = pruningWindowEnabled
+				? (freshNarrator.pruneBoundaryMessageId ?? null)
+				: null;
+			if (!pruningWindowEnabled && freshNarrator.pruneBoundaryMessageId) {
+				await narratorService.clearPruneBoundary(narratorId);
+				broadcastToNarrator(narratorId, {
+					type: "prune_boundary",
+					narratorId,
+					boundaryMessageId: null,
+					prunedPercent: null,
+				});
+			} else if (active._pruneBoundaryMessageId) {
+				pruneToolCalls(dbMessages, active._pruneBoundaryMessageId);
+			}
+
 			const { history, trailingToolResults } = await buildHistory(
 				dbMessages,
 				resolved.model,
@@ -1831,50 +1898,77 @@ export async function runAgentLoop(
 			// Agent loop done — update stats (always, even if we continue with buffered messages)
 			await narratorService.updateStats(narratorId, 0);
 
-			// Compact if context usage is high (checked after a complete turn).
-			// This is a fallback — the mid-turn compact in the context_usage handler
-			// may have already started a background compact.
-			// Before compacting, check prunedPercent: if < 80%, continue pruning instead.
+			// Compact after a complete turn when either:
+			// 1. context usage is above compactStart and the prune gate allows compact, or
+			// 2. the pruned message ratio itself has reached the configured force-compact threshold.
+			// This is a fallback — the mid-turn context_usage handler may have already started
+			// a background compact.
 			const { model: postModel, provider: postProvider } = resolveProviderAndModel(
 				active.model,
 				active.provider,
 			);
 			const postTurnThresholds = getContextThresholds(postModel, postProvider);
-			if (
-				active._contextUsagePct != null &&
-				active._contextUsagePct >= postTurnThresholds.compactStart &&
-				!compactLocks.has(narratorId)
-			) {
+			if (active._contextUsagePct != null && !compactLocks.has(narratorId)) {
+				const postTurnContextPct = active._contextUsagePct;
 				active._contextUsagePct = undefined;
 
-				// Check current prunedPercent — if below threshold, prune further instead of compacting.
-				// Exception: when pruning is disabled, skip the prune gate and compact directly.
-				const narrator = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { prunedPercent: true, pruneEnabled: true },
-				});
-				const currentPrunedPct = narrator?.prunedPercent ?? 0;
-				const pruneDisabled = narrator != null && !narrator.pruneEnabled;
+				const compactPruneThreshold = getAutoCompactPruneThreshold();
+				const contextReachedCompactStart = postTurnContextPct >= postTurnThresholds.compactStart;
+				const pruningWindowEnabled = isDynamicPruningWindowEnabled(postTurnThresholds);
+				let currentPrunedPct = 0;
+				let shouldCompact = false;
+				let compactReason: "context_threshold" | "prune_threshold" | "pruning_window_disabled" =
+					"context_threshold";
 
-				if (!pruneDisabled && currentPrunedPct < COMPACT_PRUNE_THRESHOLD_PCT) {
-					logger.info(
-						"Context above compactStart post-turn but prunedPercent below threshold, skipping compact",
-						{
-							narratorId,
-							prunedPercent: currentPrunedPct,
-							threshold: COMPACT_PRUNE_THRESHOLD_PCT,
-						},
-					);
+				if (contextReachedCompactStart && !pruningWindowEnabled) {
+					logger.info("Pruning window disabled, triggering background compact (post-turn)", {
+						narratorId,
+						contextPct: postTurnContextPct,
+						pruneStart: postTurnThresholds.pruneStart,
+						compactStart: postTurnThresholds.compactStart,
+					});
+					shouldCompact = true;
+					compactReason = "pruning_window_disabled";
 				} else {
+					const narrator = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { prunedPercent: true, pruneEnabled: true },
+					});
+					currentPrunedPct = narrator?.prunedPercent ?? 0;
+					const pruneDisabled = narrator != null && !narrator.pruneEnabled;
+					const pruneReachedForceCompact =
+						!pruneDisabled && currentPrunedPct >= compactPruneThreshold;
+
+					if (contextReachedCompactStart && !pruneDisabled && !pruneReachedForceCompact) {
+						logger.info(
+							"Context above compactStart post-turn but prunedPercent below threshold, skipping compact",
+							{
+								narratorId,
+								contextPct: postTurnContextPct,
+								prunedPercent: currentPrunedPct,
+								threshold: compactPruneThreshold,
+							},
+						);
+					} else if (contextReachedCompactStart || pruneReachedForceCompact) {
+						shouldCompact = true;
+						compactReason = pruneReachedForceCompact ? "prune_threshold" : "context_threshold";
+					}
+				}
+
+				if (shouldCompact) {
 					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
 						narratorId,
 						getAutoCompactKeepPairs(),
 					);
 
 					if (boundaryMessageId) {
-						logger.info("Context usage high, triggering background compact (post-turn)", {
+						logger.info("Triggering background compact (post-turn)", {
 							narratorId,
 							boundaryMessageId,
+							contextPct: postTurnContextPct,
+							prunedPercent: currentPrunedPct,
+							threshold: compactPruneThreshold,
+							reason: compactReason,
 						});
 
 						// Fire-and-forget: compact runs in the background.
@@ -1889,8 +1983,10 @@ export async function runAgentLoop(
 							},
 						);
 					} else {
-						logger.info("Context usage high but not enough messages to compact", {
+						logger.info("Compact requested but not enough messages to compact", {
 							narratorId,
+							contextPct: postTurnContextPct,
+							prunedPercent: currentPrunedPct,
 						});
 					}
 				}

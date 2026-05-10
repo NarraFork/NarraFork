@@ -32,6 +32,7 @@ import { notifications } from "@mantine/notifications";
 import {
 	IconArrowUp,
 	IconBox,
+	IconBrain,
 	IconColumns,
 	IconFolder,
 	IconGitBranch,
@@ -85,6 +86,14 @@ const CreateNarratorModal = React.lazy(() =>
 );
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
+
+function getRecentTabIconColor(tab: RecentTab): string | undefined {
+	if (!tab.status) return undefined;
+	const substatus = tab.substatus?.includes("reasoning")
+		? tab.substatus.filter((tag) => tag !== "reasoning")
+		: tab.substatus;
+	return mantineVar(getEffectiveNarratorDisplay(tab.status, substatus).color);
+}
 
 const CONTAINER_STATUS_I18N: Record<string, string> = {
 	running: "containerRunning",
@@ -1076,11 +1085,34 @@ function TabIcon({
 		tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showActiveGoal = !!tab.hasActiveGoal && canShowMarker;
-	if (!showDraft && !showActiveGoal) return icon;
+	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
+	if (!showDraft && !showActiveGoal && !showReasoning) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
 			{icon}
+			{showReasoning && (
+				<Box
+					component="span"
+					style={{
+						position: "absolute",
+						left: -4,
+						top: -4,
+						width: 11,
+						height: 11,
+						borderRadius: "50%",
+						background: "var(--mantine-color-grape-light)",
+						border: "1px solid var(--mantine-color-body)",
+						display: "inline-flex",
+						alignItems: "center",
+						justifyContent: "center",
+						color: "var(--mantine-color-grape-light-color)",
+						pointerEvents: "none",
+					}}
+				>
+					<IconBrain size={7} stroke={2.5} />
+				</Box>
+			)}
 			{showDraft && (
 				<Box
 					component="span"
@@ -1160,9 +1192,7 @@ function WorkspaceChildTab({
 		tab.type === "chapter" && tab.narratorId
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
-	const iconColor = tab.status
-		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
-		: undefined;
+	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus =
 		tab.status === "working" ||
 		!!tab.substatus?.includes("error") ||
@@ -1227,9 +1257,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 		tab.type === "chapter" && tab.narratorId
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
-	const iconColor = tab.status
-		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
-		: undefined;
+	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus =
 		tab.status === "working" ||
 		!!tab.substatus?.includes("error") ||
@@ -1335,9 +1363,7 @@ function DragOverlayWorkspaceItem({
 /** Rendered in DragOverlay while a non-workspace tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
-	const iconColor = tab.status
-		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
-		: undefined;
+	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus =
 		tab.status === "working" ||
 		!!tab.substatus?.includes("error") ||
@@ -1426,9 +1452,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				: tab.type === "workspace"
 					? `/narrators/workspace/${tab.id}`
 					: `/narrators/${tab.id}`;
-	const iconColor = tab.status
-		? mantineVar(getEffectiveNarratorDisplay(tab.status, tab.substatus).color)
-		: undefined;
+	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus =
 		tab.status === "working" ||
 		!!tab.substatus?.includes("error") ||

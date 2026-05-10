@@ -323,6 +323,14 @@ function withoutCompactingSubstatus(substatus: unknown): string[] {
 		: [];
 }
 
+function withCompactingSubstatus(substatus: string[], compactSubstatus: string): string[] {
+	return [...withoutCompactingSubstatus(substatus), compactSubstatus];
+}
+
+function withoutSubstatusTag(substatus: unknown, tag: string): string[] {
+	return Array.isArray(substatus) ? substatus.filter((s) => s !== tag) : [];
+}
+
 function withQueueSubstatus(
 	substatus: string[],
 	position?: number,
@@ -2814,10 +2822,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		if (isSubagent) return;
 		// Preserve error sessions: do not auto-clear when an error exists.
 		if (narratorStatus === "idle" && hasUnreadSubstatus && !narratorErrorMessage) {
-			// Optimistically update cache so the UI reflects "idle" immediately,
-			// even if the WS event arrives late or is missed entirely.
+			// Optimistically remove only the unread tag so coexisting transient tags
+			// (for example background_compacting) keep their visible state.
+			const nextSubstatus = withoutSubstatusTag(statusState.substatus, "unread");
+			dispatchStatus({ type: "patch", payload: { substatus: nextSubstatus } });
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-				old ? { ...old, status: "idle", substatus: [] } : old,
+				old
+					? { ...old, status: "idle", substatus: withoutSubstatusTag(old.substatus, "unread") }
+					: old,
 			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
@@ -2829,6 +2841,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		isSubagent,
 		pageVisible,
 		qc,
+		statusState.substatus,
 	]);
 
 	// --- Derive compacting substatus from persisted messages ---
@@ -2850,10 +2863,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				compactBlock.mode === "background" ? "background_compacting" : "compacting";
 			dispatchStatus({
 				type: "patch",
-				payload: { substatus: [compactSubstatus] },
+				payload: { substatus: withCompactingSubstatus(statusState.substatus, compactSubstatus) },
 			});
 		}
-	}, [messagesData]);
+	}, [messagesData, statusState.substatus]);
 
 	return useMemo(
 		() => ({

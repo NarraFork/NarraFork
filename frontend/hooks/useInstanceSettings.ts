@@ -55,6 +55,7 @@ export interface InstanceSettingsState {
 		large: { pruneStart: number; compactStart: number };
 	};
 	autoCompactKeepPairs: number;
+	autoCompactPruneThreshold: number;
 	codexDefaultReasoningEffort: string;
 	agentDefaultReasoningEffort: string;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
@@ -130,6 +131,7 @@ function makeDefaults(): InstanceSettingsState {
 			large: { pruneStart: 95, compactStart: 99 },
 		},
 		autoCompactKeepPairs: 2,
+		autoCompactPruneThreshold: 80,
 		codexDefaultReasoningEffort: "high",
 		agentDefaultReasoningEffort: "",
 		globalWhitelistDirs: [],
@@ -210,6 +212,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					large: { pruneStart: 95, compactStart: 99 },
 				},
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
+				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
@@ -297,6 +300,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					customRetryRules: state.customRetryRules,
 					contextThresholds: state.contextThresholds,
 					autoCompactKeepPairs: state.autoCompactKeepPairs,
+					autoCompactPruneThreshold: state.autoCompactPruneThreshold,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,

@@ -268,7 +268,8 @@ export const SubagentCard = memo(
 		const isInitializing = toolCall.status === "initializing";
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
 		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
-		const prompt = input.prompt ?? "";
+		const promptValue = input.prompt ?? (toolCall.toolName === "Send" ? input.message : "");
+		const prompt = typeof promptValue === "string" ? promptValue : String(promptValue ?? "");
 		const promptPreview = capSubagentResult(prompt, MAX_SUBAGENT_PROMPT_INLINE_CHARS);
 		const promptHasLineBreak = prompt.includes("\n");
 		const promptShownInHeader = !input.description && !!prompt && !promptHasLineBreak;
