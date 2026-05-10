@@ -84,6 +84,8 @@ export interface ActiveNarrator {
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
 	_loopRunning?: boolean;
+	/** Immediate title derived from the first user message while model title generation runs. */
+	_provisionalTitle?: string;
 	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
 	_substatus: Set<string>;
 	/** Goal accounting baseline at the start of the current turn. */

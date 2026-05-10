@@ -36,6 +36,7 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { AutoFollowScroll } from "./AutoFollowScroll";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
@@ -134,6 +135,10 @@ interface ContentViewerProps {
 	blockIndex?: number;
 	/** Whether this content is currently being streamed (enables per-char animation) */
 	streaming?: boolean;
+	/** Keep the inline scrollable content pinned to bottom until the user scrolls manually. */
+	autoFollow?: boolean;
+	/** Changing this resets auto-follow for a new streaming session. */
+	autoFollowKey?: string | number | null;
 }
 
 /** Sticky wrapper: zero-height, sticks to the top of the nearest scroll
@@ -207,6 +212,8 @@ export const ContentViewer = memo(
 			language,
 			blockIndex,
 			streaming,
+			autoFollow,
+			autoFollowKey,
 		},
 		ref,
 	) {
@@ -527,6 +534,37 @@ export const ContentViewer = memo(
 				</Box>
 			);
 
+		const contentNode = renderContent
+			? renderContent(wordWrap)
+			: (children ??
+				(markdown ? (
+					renderMarkdown(inlineContent, {
+						maxHeight: style?.maxHeight,
+						overflowY: style?.maxHeight ? "auto" : undefined,
+					})
+				) : language && language !== "text" ? (
+					<CodeHighlightOrFallback
+						code={inlineContent}
+						lang={language}
+						style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
+					/>
+				) : (
+					<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
+						{inlineContent}
+					</Code>
+				)));
+		const inlineNode = autoFollow ? (
+			<AutoFollowScroll
+				asChild
+				followKey={autoFollowKey ?? title ?? contentType}
+				deps={[inlineContent]}
+			>
+				{contentNode}
+			</AutoFollowScroll>
+		) : (
+			contentNode
+		);
+
 		const SWIPE_REVEAL_WIDTH = 180;
 
 		// Selected blocks get a visual offset to match the anchor's swipe (mobile only)
@@ -574,25 +612,7 @@ export const ContentViewer = memo(
 					)}
 
 					{/* Inline content stays bounded; full payloads are still available via actions. */}
-					{renderContent
-						? renderContent(wordWrap)
-						: (children ??
-							(markdown ? (
-								renderMarkdown(inlineContent, {
-									maxHeight: style?.maxHeight,
-									overflowY: style?.maxHeight ? "auto" : undefined,
-								})
-							) : language && language !== "text" ? (
-								<CodeHighlightOrFallback
-									code={inlineContent}
-									lang={language}
-									style={{ ...style, ...wrapStyle, maxWidth: "100%" }}
-								/>
-							) : (
-								<Code block style={{ ...style, ...wrapStyle, maxWidth: "100%" }}>
-									{inlineContent}
-								</Code>
-							)))}
+					{inlineNode}
 				</Box>
 
 				{/* Swipe-reveal action menu — portal to body, position:fixed to bypass containing blocks */}

@@ -38,11 +38,6 @@ type ProtocolOptionConfig = {
 
 export const CUSTOM_API_PROTOCOL_OPTIONS: ProtocolOptionConfig[] = [
 	{
-		value: "anthropic-official",
-		labelKey: "customApiProtocolAnthropicOfficial",
-		descKey: "customApiProtocolAnthropicOfficialDesc",
-	},
-	{
 		value: "anthropic-compatible",
 		labelKey: "customApiProtocolAnthropicCompatible",
 		descKey: "customApiProtocolAnthropicCompatibleDesc",
@@ -56,6 +51,11 @@ export const CUSTOM_API_PROTOCOL_OPTIONS: ProtocolOptionConfig[] = [
 		value: "responses-compatible",
 		labelKey: "customApiProtocolResponsesCompatible",
 		descKey: "customApiProtocolResponsesCompatibleDesc",
+	},
+	{
+		value: "anthropic-official",
+		labelKey: "customApiProtocolAnthropicOfficial",
+		descKey: "customApiProtocolAnthropicOfficialDesc",
 	},
 	{
 		value: "completions-compatible",

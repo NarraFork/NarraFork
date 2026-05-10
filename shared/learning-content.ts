@@ -81,15 +81,15 @@ const categories: Record<string, LocalizedText & { description: LocalizedText }>
 		"zh-CN": "自动化",
 		description: {
 			en: "Routines, skills, hooks, MCP, and reusable workflows.",
-			"zh-CN": "例程、技能、Hook、MCP 与可复用工作流。",
+			"zh-CN": "套路、技能、钩子、MCP 与可复用工作流。",
 		},
 	},
 	runtime: {
 		en: "Runtime",
-		"zh-CN": "运行环境",
+		"zh-CN": "运行资源",
 		description: {
 			en: "Terminals, containers, files, snapshots, sharing, and storage.",
-			"zh-CN": "终端、容器、文件、快照、分享与存储。",
+			"zh-CN": "终端、容器、文件、快照、分享与储存空间。",
 		},
 	},
 	admin: {
@@ -119,26 +119,18 @@ const docs: LearningDocSource[] = [
 				body: {
 					en: "A narrator is an AI work session with tools. Projects connect NarraFork to your Git repositories. Supporting features such as routines, skills, terminals, containers, notifications, and reviews make that work repeatable and auditable.",
 					"zh-CN":
-						"叙述者是带工具的 AI 工作会话；项目把 NarraFork 连接到你的 Git 仓库；例程、技能、终端、容器、通知和评审让工作可复用、可审计。",
-				},
-			},
-			{
-				title: { en: "Who should read this area", "zh-CN": "谁适合使用学习版块" },
-				body: {
-					en: "Humans can use it as product documentation. Agents can use the same content through the LearningGuide tool to decide which NarraFork feature or route to use next.",
-					"zh-CN":
-						"用户可以把这里当产品文档；Agent 可以通过 LearningGuide 工具查阅同一份内容，判断下一步该使用哪个 NarraFork 功能或入口。",
+						"叙述者是带工具的 AI 工作会话；叙事线把 NarraFork 连接到你的 Git 仓库；套路、技能、终端、容器、通知和评审让工作可复用、可审计。",
 				},
 			},
 		],
 		workflow: [
 			{
 				en: "Finish initial setup: configure providers and models, then verify runtime availability.",
-				"zh-CN": "先完成初始化：配置提供商与模型，再确认运行环境可用。",
+				"zh-CN": "先完成初始化：配置提供商与模型，再确认运行资源可用。",
 			},
 			{
 				en: "Create or open a project only when you need repository-bound work; otherwise start with a standalone narrator.",
-				"zh-CN": "需要绑定仓库时创建/打开项目；只想讨论、规划或查阅资料时可直接新建独立叙述者。",
+				"zh-CN": "需要绑定仓库时创建/打开叙事线；只想讨论、规划或查阅资料时可直接新建独立叙述者。",
 			},
 			{
 				en: "Give narrators concrete objectives, let them plan larger changes, and review tool results before merging or releasing.",
@@ -148,7 +140,7 @@ const docs: LearningDocSource[] = [
 		bestPractices: [
 			{
 				en: "Use this Learning area before creating new routines or permissions so the automation matches existing platform conventions.",
-				"zh-CN": "创建例程或权限前先查学习版块，确保自动化方式符合平台已有约定。",
+				"zh-CN": "创建套路或权限前先查学习版块，确保自动化方式符合平台已有约定。",
 			},
 			{
 				en: "Prefer small, reviewable tasks for narrators; split broad goals into phases with checkpoints.",
@@ -161,18 +153,13 @@ const docs: LearningDocSource[] = [
 				"zh-CN": "不要因为工具调用成功就把 AI 产出视为最终结果；仍需验证构建、测试和用户可见行为。",
 			},
 		],
-		agentHints: [
-			{
-				en: "When unsure which NarraFork feature helps the user, call LearningGuide with mode=search and a short query first.",
-				"zh-CN": "不确定该用哪个 NarraFork 功能时，先用 LearningGuide 的 search 模式查询关键词。",
-			},
-		],
+		agentHints: [],
 		actions: [
 			{
 				label: { en: "Open settings", "zh-CN": "打开设置" },
 				description: {
 					en: "Configure providers, models, appearance, and runtime.",
-					"zh-CN": "配置提供商、模型、外观与运行环境。",
+					"zh-CN": "配置提供商、模型、外观与运行资源。",
 				},
 				href: "/settings",
 			},
@@ -180,7 +167,7 @@ const docs: LearningDocSource[] = [
 				label: { en: "New narrator", "zh-CN": "新建叙述者" },
 				description: {
 					en: "Start an AI session not bound to a specific project.",
-					"zh-CN": "启动不绑定具体项目的 AI 会话。",
+					"zh-CN": "启动不绑定具体叙事线的 AI 会话。",
 				},
 				href: "/narrators",
 			},
@@ -198,11 +185,11 @@ const docs: LearningDocSource[] = [
 		},
 		sections: [
 			{
-				title: { en: "Standalone vs project-bound", "zh-CN": "独立会话与项目会话" },
+				title: { en: "Standalone vs project-bound", "zh-CN": "独立会话与叙事线会话" },
 				body: {
 					en: "Standalone narrators are best for planning, research, and operations. Project-bound narrators inherit repository context and are better for code changes.",
 					"zh-CN":
-						"独立叙述者适合规划、研究和运维；项目内叙述者继承仓库上下文，更适合实际代码修改。",
+						"独立叙述者适合规划、研究和运维；绑定叙事线的叙述者继承仓库上下文，更适合实际代码修改。",
 				},
 			},
 			{
@@ -217,7 +204,7 @@ const docs: LearningDocSource[] = [
 		workflow: [
 			{
 				en: "Choose the right context: standalone for thinking, project-bound for repository work.",
-				"zh-CN": "先选上下文：思考/调研用独立会话，仓库改动用项目会话。",
+				"zh-CN": "先选上下文：思考/调研用独立会话，仓库改动用叙事线会话。",
 			},
 			{
 				en: "State the objective, constraints, and what counts as done.",
@@ -352,10 +339,10 @@ const docs: LearningDocSource[] = [
 		],
 		actions: [
 			{
-				label: { en: "Agent settings", "zh-CN": "Agent 设置" },
+				label: { en: "Agent settings", "zh-CN": "AI 代理" },
 				description: {
 					en: "Adjust agent behavior and prompts.",
-					"zh-CN": "调整 Agent 行为与提示词。",
+					"zh-CN": "调整 AI 代理行为与提示词。",
 				},
 				href: "/settings/agent",
 			},
@@ -377,7 +364,7 @@ const docs: LearningDocSource[] = [
 		summary: {
 			en: "NarraFork pauses sensitive tool calls for approval and supports reusable permission routines to reduce repeated prompts without sacrificing safety.",
 			"zh-CN":
-				"NarraFork 会暂停敏感工具调用等待审批，也支持可复用权限例程，在减少重复弹窗的同时保持安全边界。",
+				"NarraFork 会暂停敏感工具调用等待审批，也支持可复用权限规则，在减少重复弹窗的同时保持安全边界。",
 		},
 		sections: [
 			{
@@ -391,7 +378,7 @@ const docs: LearningDocSource[] = [
 				title: { en: "Reusable permissions", "zh-CN": "可复用权限" },
 				body: {
 					en: "Tool permission routines let you whitelist safe commands or directories and blacklist dangerous patterns.",
-					"zh-CN": "工具权限例程可白名单安全命令/目录，也可黑名单危险模式。",
+					"zh-CN": "工具权限规则可白名单安全命令/目录，也可黑名单危险模式。",
 				},
 			},
 		],
@@ -416,7 +403,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Review permission routines after incidents or repeated denials.",
-				"zh-CN": "出现事故或反复拒绝后，复盘并调整权限例程。",
+				"zh-CN": "出现事故或反复拒绝后，复盘并调整权限规则。",
 			},
 		],
 		pitfalls: [
@@ -440,13 +427,13 @@ const docs: LearningDocSource[] = [
 				label: { en: "Tool permissions", "zh-CN": "工具权限" },
 				description: {
 					en: "Configure reusable permission routines.",
-					"zh-CN": "配置可复用的工具权限例程。",
+					"zh-CN": "配置可复用的工具权限规则。",
 				},
 				href: "/routines/tool-permissions",
 			},
 			{
-				label: { en: "Routines", "zh-CN": "例程" },
-				description: { en: "Manage automation routines.", "zh-CN": "管理自动化例程。" },
+				label: { en: "Routines", "zh-CN": "套路" },
+				description: { en: "Manage automation routines.", "zh-CN": "管理自动化套路。" },
 				href: "/routines",
 			},
 		],
@@ -455,17 +442,17 @@ const docs: LearningDocSource[] = [
 		id: "routines",
 		category: "automation",
 		tags: ["routines", "automation", "prompts", "permissions"],
-		title: { en: "Routines", "zh-CN": "例程" },
+		title: { en: "Routines", "zh-CN": "套路" },
 		summary: {
 			en: "Routines package repeatable instructions, permissions, and automation behavior so narrators can follow team conventions consistently.",
-			"zh-CN": "例程把可复用指令、权限和自动化行为打包起来，让叙述者稳定遵循团队约定。",
+			"zh-CN": "套路把可复用指令、权限和自动化行为打包起来，让叙述者稳定遵循团队约定。",
 		},
 		sections: [
 			{
-				title: { en: "What routines are for", "zh-CN": "例程适合做什么" },
+				title: { en: "What routines are for", "zh-CN": "套路适合做什么" },
 				body: {
 					en: "Use routines for recurring workflows such as release preparation, review checklists, test plans, or safe tool permission bundles.",
-					"zh-CN": "适合把发布准备、评审清单、测试计划、安全权限包等重复流程沉淀为例程。",
+					"zh-CN": "适合把发布准备、评审清单、测试计划、安全权限包等重复流程沉淀为套路。",
 				},
 			},
 		],
@@ -476,11 +463,11 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Write the routine as operational instructions, not abstract policy.",
-				"zh-CN": "把例程写成可执行指令，而不是抽象原则。",
+				"zh-CN": "把套路写成可执行指令，而不是抽象原则。",
 			},
 			{
 				en: "Attach permissions only when they are narrow and justified.",
-				"zh-CN": "只有权限范围窄且理由充分时，才把权限附加到例程。",
+				"zh-CN": "只有权限范围窄且理由充分时，才把权限附加到套路。",
 			},
 			{
 				en: "Test the routine on a low-risk task before broad use.",
@@ -490,28 +477,28 @@ const docs: LearningDocSource[] = [
 		bestPractices: [
 			{
 				en: "Keep routine names outcome-oriented, such as 'prepare-release' or 'review-api-change'.",
-				"zh-CN": "例程命名应面向结果，例如 prepare-release 或 review-api-change。",
+				"zh-CN": "套路命名应面向结果，例如 prepare-release 或 review-api-change。",
 			},
 			{
 				en: "Version important routines by updating their description when behavior changes.",
-				"zh-CN": "重要例程行为变化时，在描述里说明版本/变化点。",
+				"zh-CN": "重要套路行为变化时，在描述里说明版本/变化点。",
 			},
 		],
 		pitfalls: [
 			{
 				en: "Do not hide critical project decisions inside a routine that users never see.",
-				"zh-CN": "不要把关键项目决策藏在用户看不到的例程里。",
+				"zh-CN": "不要把关键叙事线决策藏在用户看不到的套路里。",
 			},
 		],
 		agentHints: [
 			{
 				en: "If a user references a slash command, check whether it maps to a skill or routine before improvising.",
-				"zh-CN": "用户提到 slash command 时，先判断是否对应技能或例程，不要自行发挥。",
+				"zh-CN": "用户提到 slash command 时，先判断是否对应技能或套路，不要自行发挥。",
 			},
 		],
 		actions: [
 			{
-				label: { en: "Open routines", "zh-CN": "打开例程" },
+				label: { en: "Open routines", "zh-CN": "打开套路" },
 				description: {
 					en: "Create and maintain reusable workflows.",
 					"zh-CN": "创建和维护可复用工作流。",
@@ -549,7 +536,7 @@ const docs: LearningDocSource[] = [
 		workflow: [
 			{
 				en: "Create a skill when instructions are domain-specific and longer than a routine should be.",
-				"zh-CN": "当指令具有领域性且长度超过普通例程时，创建技能。",
+				"zh-CN": "当指令具有领域性且长度超过普通套路时，创建技能。",
 			},
 			{
 				en: "Give the skill a clear trigger description so agents know when it is mandatory.",
@@ -584,7 +571,7 @@ const docs: LearningDocSource[] = [
 		],
 		actions: [
 			{
-				label: { en: "Routines & skills", "zh-CN": "例程与技能" },
+				label: { en: "Routines & skills", "zh-CN": "套路与技能" },
 				description: {
 					en: "Manage workflow automation and skill content.",
 					"zh-CN": "管理工作流自动化与技能内容。",
@@ -597,10 +584,10 @@ const docs: LearningDocSource[] = [
 		id: "mcp-and-hooks",
 		category: "automation",
 		tags: ["mcp", "hooks", "integrations", "tools"],
-		title: { en: "MCP servers and hooks", "zh-CN": "MCP 服务与 Hook" },
+		title: { en: "MCP servers and hooks", "zh-CN": "MCP 服务器与钩子" },
 		summary: {
 			en: "MCP extends agent tools through external servers. Hooks connect NarraFork activity to scripts and integrations.",
-			"zh-CN": "MCP 通过外部服务扩展 Agent 工具；Hook 把 NarraFork 活动连接到脚本和集成系统。",
+			"zh-CN": "MCP 通过外部服务器扩展 AI 代理工具；钩子把 NarraFork 活动连接到脚本和集成系统。",
 		},
 		sections: [
 			{
@@ -608,15 +595,14 @@ const docs: LearningDocSource[] = [
 				body: {
 					en: "Configure MCP servers when agents need tools outside NarraFork's built-ins, such as proprietary systems, internal docs, or specialized APIs.",
 					"zh-CN":
-						"当 Agent 需要内置工具之外的能力（如内部系统、私有文档、专用 API）时，配置 MCP 服务。",
+						"当 AI 代理需要内置工具之外的能力（如内部系统、私有文档、专用 API）时，配置 MCP 服务器。",
 				},
 			},
 			{
-				title: { en: "Hooks", "zh-CN": "Hook" },
+				title: { en: "Hooks", "zh-CN": "钩子" },
 				body: {
 					en: "Use hooks for event-driven glue such as notifying another system, running audit scripts, or recording lifecycle events.",
-					"zh-CN":
-						"Hook 适合事件驱动的胶水逻辑，例如通知外部系统、运行审计脚本或记录生命周期事件。",
+					"zh-CN": "钩子适合事件驱动的胶水逻辑，例如通知外部系统、运行审计脚本或记录生命周期事件。",
 				},
 			},
 		],
@@ -641,7 +627,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Keep hook scripts idempotent so repeated events do not corrupt state.",
-				"zh-CN": "Hook 脚本应具备幂等性，避免重复事件破坏状态。",
+				"zh-CN": "钩子脚本应具备幂等性，避免重复事件破坏状态。",
 			},
 		],
 		pitfalls: [
@@ -661,15 +647,15 @@ const docs: LearningDocSource[] = [
 				label: { en: "MCP tools", "zh-CN": "MCP 工具" },
 				description: {
 					en: "Manage external MCP servers from the routines page.",
-					"zh-CN": "在例程页面管理外部 MCP 服务。",
+					"zh-CN": "在套路页面管理外部 MCP 服务器。",
 				},
 				href: "/routines",
 			},
 			{
-				label: { en: "Gateway", "zh-CN": "网关" },
+				label: { en: "Gateway", "zh-CN": "IM 网关" },
 				description: {
 					en: "Configure message gateway integrations.",
-					"zh-CN": "配置消息网关集成。",
+					"zh-CN": "配置 IM 网关集成。",
 				},
 				href: "/settings/gateway",
 			},
@@ -682,7 +668,7 @@ const docs: LearningDocSource[] = [
 		title: { en: "Terminals and containers", "zh-CN": "终端与容器" },
 		summary: {
 			en: "Terminals provide interactive shells. Containers isolate project runtimes and allocate ports for services.",
-			"zh-CN": "终端提供交互式 shell；容器隔离项目运行环境，并为服务分配端口。",
+			"zh-CN": "终端提供交互式 shell；容器隔离叙事线运行环境，并为服务分配端口。",
 		},
 		sections: [
 			{
@@ -697,7 +683,7 @@ const docs: LearningDocSource[] = [
 				title: { en: "Containers", "zh-CN": "容器" },
 				body: {
 					en: "Container support is optional and relies on Podman. It is useful when a project needs repeatable dependencies or isolated service processes.",
-					"zh-CN": "容器能力是可选的，依赖 Podman；当项目需要可复现依赖或隔离服务进程时很有用。",
+					"zh-CN": "容器能力是可选的，依赖 Podman；当叙事线需要可复现依赖或隔离服务进程时很有用。",
 				},
 			},
 		],
@@ -722,7 +708,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Document project port assumptions before enabling container automation.",
-				"zh-CN": "启用容器自动化前，先记录项目端口假设。",
+				"zh-CN": "启用容器自动化前，先记录叙事线端口假设。",
 			},
 		],
 		pitfalls: [
@@ -747,10 +733,10 @@ const docs: LearningDocSource[] = [
 				href: "/settings/terminals",
 			},
 			{
-				label: { en: "Runtime", "zh-CN": "运行时" },
+				label: { en: "Runtime", "zh-CN": "运行资源" },
 				description: {
 					en: "Check runtime and external dependencies.",
-					"zh-CN": "检查运行时与外部依赖。",
+					"zh-CN": "检查运行资源与外部依赖。",
 				},
 				href: "/settings/runtime",
 			},
@@ -792,7 +778,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Use storage settings to inspect large database or file growth.",
-				"zh-CN": "通过存储设置检查数据库或文件体积增长。",
+				"zh-CN": "通过储存空间设置检查数据库或文件体积增长。",
 			},
 		],
 		bestPractices: [
@@ -819,10 +805,10 @@ const docs: LearningDocSource[] = [
 		],
 		actions: [
 			{
-				label: { en: "Storage", "zh-CN": "存储" },
+				label: { en: "Storage", "zh-CN": "储存空间" },
 				description: {
 					en: "Inspect storage usage and cleanup options.",
-					"zh-CN": "查看存储占用与清理选项。",
+					"zh-CN": "查看储存空间占用与清理选项。",
 				},
 				href: "/settings/storage",
 			},
@@ -835,21 +821,21 @@ const docs: LearningDocSource[] = [
 		title: { en: "Search, recent tabs, and navigation", "zh-CN": "搜索、最近访问与导航" },
 		summary: {
 			en: "Use global search for indexed chapters and messages, and use recent tabs to jump back to active projects or narrator sessions quickly.",
-			"zh-CN": "使用全局搜索查找已索引的章节和消息，并用最近访问快速回到活跃项目或叙述者会话。",
+			"zh-CN": "使用全局搜索查找已索引的章节和消息，并用最近访问快速回到活跃叙事线或叙述者会话。",
 		},
 		sections: [
 			{
 				title: { en: "Global search", "zh-CN": "全局搜索" },
 				body: {
 					en: "Search is useful when you remember a message, decision, or title but not the exact project or narrator where it happened.",
-					"zh-CN": "当你记得某条消息、决策或标题，却忘记具体项目/叙述者时，使用全局搜索。",
+					"zh-CN": "当你记得某条消息、决策或标题，却忘记具体叙事线/叙述者时，使用全局搜索。",
 				},
 			},
 			{
 				title: { en: "Recent tabs", "zh-CN": "最近访问" },
 				body: {
 					en: "Recent tabs keep active project and narrator contexts close at hand, including unread or working states.",
-					"zh-CN": "最近访问会保留活跃项目和叙述者上下文，并显示未读或工作中状态。",
+					"zh-CN": "最近访问会保留活跃叙事线和叙述者上下文，并显示未读或工作中状态。",
 				},
 			},
 		],
@@ -861,13 +847,13 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Clear idle narrators or project tabs to reduce sidebar noise.",
-				"zh-CN": "清理空闲叙述者或项目标签，减少侧边栏噪音。",
+				"zh-CN": "清理空闲叙述者或叙事线标签，减少侧边栏噪音。",
 			},
 		],
 		bestPractices: [
 			{
 				en: "Use distinctive narrator and project titles to make later search easier.",
-				"zh-CN": "使用有辨识度的叙述者/项目标题，方便后续检索。",
+				"zh-CN": "使用有辨识度的叙述者/叙事线标题，方便后续检索。",
 			},
 			{
 				en: "Search messages before asking an agent to rediscover prior decisions.",
@@ -970,7 +956,8 @@ const docs: LearningDocSource[] = [
 		title: { en: "Providers, models, and quotas", "zh-CN": "提供商、模型与额度" },
 		summary: {
 			en: "Configure AI providers, select models, manage credentials, and monitor usage so narrator work is reliable and cost-aware.",
-			"zh-CN": "配置 AI 提供商、选择模型、管理凭据并监控用量，让叙述者工作更可靠且可控成本。",
+			"zh-CN":
+				"配置 AI 提供商、选择模型、管理凭据并监控使用历史和额度，让叙述者工作更可靠且可控成本。",
 		},
 		sections: [
 			{
@@ -1040,7 +1027,7 @@ const docs: LearningDocSource[] = [
 				href: "/settings/models",
 			},
 			{
-				label: { en: "Usage", "zh-CN": "用量" },
+				label: { en: "Usage", "zh-CN": "使用历史" },
 				description: { en: "Inspect usage history and quotas.", "zh-CN": "查看使用历史与额度。" },
 				href: "/settings/usage",
 			},
@@ -1050,10 +1037,10 @@ const docs: LearningDocSource[] = [
 		id: "notifications-and-gateway",
 		category: "admin",
 		tags: ["notifications", "sound", "gateway", "webhook"],
-		title: { en: "Notifications, sounds, and gateway", "zh-CN": "通知、声音与网关" },
+		title: { en: "Notifications, sounds, and gateway", "zh-CN": "通知、声音与 IM 网关" },
 		summary: {
 			en: "Notifications keep humans aware of long-running AI work, permission requests, completions, failures, and external message gateway events.",
-			"zh-CN": "通知帮助用户及时感知长时间 AI 工作、权限请求、完成、失败以及外部消息网关事件。",
+			"zh-CN": "通知帮助用户及时感知长时间 AI 工作、权限请求、完成、失败以及外部 IM 网关事件。",
 		},
 		sections: [
 			{
@@ -1064,10 +1051,10 @@ const docs: LearningDocSource[] = [
 				},
 			},
 			{
-				title: { en: "Gateway", "zh-CN": "网关" },
+				title: { en: "Gateway", "zh-CN": "IM 网关" },
 				body: {
 					en: "The gateway connects external messaging flows to NarraFork sessions, useful for lightweight remote operations or bot-style usage.",
-					"zh-CN": "网关把外部消息流连接到 NarraFork 会话，适合轻量远程操作或机器人式使用。",
+					"zh-CN": "IM 网关把外部消息流连接到 NarraFork 会话，适合轻量远程操作或机器人式使用。",
 				},
 			},
 		],
@@ -1079,7 +1066,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Test webhook or gateway settings with harmless messages.",
-				"zh-CN": "用无害消息测试 webhook 或网关配置。",
+				"zh-CN": "用无害消息测试 webhook 或 IM 网关配置。",
 			},
 		],
 		bestPractices: [
@@ -1111,8 +1098,8 @@ const docs: LearningDocSource[] = [
 				href: "/settings/notifications",
 			},
 			{
-				label: { en: "Gateway", "zh-CN": "网关" },
-				description: { en: "Configure external message gateway.", "zh-CN": "配置外部消息网关。" },
+				label: { en: "Gateway", "zh-CN": "IM 网关" },
+				description: { en: "Configure external message gateway.", "zh-CN": "配置外部 IM 网关。" },
 				href: "/settings/gateway",
 			},
 		],
@@ -1125,7 +1112,7 @@ const docs: LearningDocSource[] = [
 		summary: {
 			en: "Settings cover personal preferences and instance administration: users, runtime, storage, updates, appearance, server details, and profile data.",
 			"zh-CN":
-				"设置同时覆盖个人偏好和实例管理：用户、运行时、存储、更新、外观、服务器信息和个人资料。",
+				"设置同时覆盖个人偏好和实例管理：用户、运行资源、储存空间、更新、外观、服务器信息和个人资料。",
 		},
 		sections: [
 			{
@@ -1139,7 +1126,7 @@ const docs: LearningDocSource[] = [
 				title: { en: "Instance settings", "zh-CN": "实例设置" },
 				body: {
 					en: "Admins can manage providers, users, runtime, storage, terminal settings, server status, and update information.",
-					"zh-CN": "管理员可管理提供商、用户、运行时、存储、终端设置、服务器状态和更新信息。",
+					"zh-CN": "管理员可管理提供商、用户、运行资源、储存空间、终端设置、服务器状态和更新信息。",
 				},
 			},
 		],
@@ -1150,7 +1137,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Admins should configure providers, runtime, storage, and users after first login.",
-				"zh-CN": "管理员首次登录后应配置提供商、运行时、存储和用户。",
+				"zh-CN": "管理员首次登录后应配置提供商、运行资源、储存空间和用户。",
 			},
 			{
 				en: "Check changelogs and update status before planning maintenance windows.",
@@ -1164,7 +1151,7 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Use storage diagnostics before deleting data; user data may be difficult to recover.",
-				"zh-CN": "删除数据前先使用存储诊断；用户数据可能难以恢复。",
+				"zh-CN": "删除数据前先使用储存空间诊断；用户数据可能难以恢复。",
 			},
 			{
 				en: "Read release notes before updating production-like instances.",

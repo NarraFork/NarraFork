@@ -2,6 +2,7 @@ import { useComputedColorScheme } from "@mantine/core";
 import { type CSSProperties, memo, useEffect, useRef, useState } from "react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { loadShiki } from "../../lib/shiki-loader";
+import { AutoFollowScroll } from "./AutoFollowScroll";
 import classes from "./HighlightedCode.module.css";
 
 interface StreamingCodeProps {
@@ -43,7 +44,6 @@ export const StreamingCode = memo(function StreamingCode({
 	const highlightedLenRef = useRef(0);
 	const highlightedCodeRef = useRef("");
 
-	const scrollRef = useRef<HTMLDivElement>(null);
 	const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const inflightRef = useRef(0); // generation counter to discard stale results
 	const tokenContextKeyRef = useRef<string | null>(null);
@@ -150,19 +150,6 @@ export const StreamingCode = memo(function StreamingCode({
 		};
 	}, []);
 
-	// --- Auto-scroll to bottom ---
-	// biome-ignore lint/correctness/useExhaustiveDependencies: we need to re-scroll whenever code grows or tokens update
-	useEffect(() => {
-		const el = scrollRef.current;
-		if (!el) return;
-		const raf = requestAnimationFrame(() => {
-			if (scrollRef.current) {
-				scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-			}
-		});
-		return () => cancelAnimationFrame(raf);
-	}, [code, tokens]);
-
 	// --- Render ---
 	const isDisplayTruncated = code.length > STREAMING_CODE_DISPLAY_MAX_CHARS;
 	const displayCode = isDisplayTruncated ? code.slice(-STREAMING_CODE_DISPLAY_MAX_CHARS) : code;
@@ -173,27 +160,29 @@ export const StreamingCode = memo(function StreamingCode({
 	const pendingText = displayCode.slice(highlightedChars);
 
 	return (
-		<div className={classes.root} style={style} ref={scrollRef}>
-			<pre>
-				<code>
-					{isDisplayTruncated && <span>{"…\n"}</span>}
-					{displayTokens
-						? displayTokens.map((line, li) => (
-								// biome-ignore lint/suspicious/noArrayIndexKey: lines are positional
-								<span key={li}>
-									{li > 0 && "\n"}
-									{line.map((tok, ti) => (
-										// biome-ignore lint/suspicious/noArrayIndexKey: tokens are positional
-										<span key={ti} style={tok.color ? { color: tok.color } : undefined}>
-											{tok.content}
-										</span>
-									))}
-								</span>
-							))
-						: displayCode.slice(0, highlightedChars)}
-					{pendingText && <span>{pendingText}</span>}
-				</code>
-			</pre>
-		</div>
+		<AutoFollowScroll asChild followKey={highlightContextKey} deps={[code, tokens]}>
+			<div className={classes.root} style={style}>
+				<pre>
+					<code>
+						{isDisplayTruncated && <span>{"…\n"}</span>}
+						{displayTokens
+							? displayTokens.map((line, li) => (
+									// biome-ignore lint/suspicious/noArrayIndexKey: lines are positional
+									<span key={li}>
+										{li > 0 && "\n"}
+										{line.map((tok, ti) => (
+											// biome-ignore lint/suspicious/noArrayIndexKey: tokens are positional
+											<span key={ti} style={tok.color ? { color: tok.color } : undefined}>
+												{tok.content}
+											</span>
+										))}
+									</span>
+								))
+							: displayCode.slice(0, highlightedChars)}
+						{pendingText && <span>{pendingText}</span>}
+					</code>
+				</pre>
+			</div>
+		</AutoFollowScroll>
 	);
 });

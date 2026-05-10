@@ -179,6 +179,33 @@ export async function generateTitle(narratorId: string, locale: Locale = "en"): 
 	return title || "New conversation";
 }
 
+function buildProvisionalTitle(userMessage: string): string | null {
+	const normalized = userMessage.replace(/\s+/g, " ").trim();
+	if (!normalized) return null;
+
+	const firstSentence = normalized.match(/^.+?[。！？.!?](?:\s|$)/u)?.[0].trim() ?? normalized;
+	const chars = Array.from(firstSentence);
+	if (chars.length <= 50) return firstSentence;
+	return `${chars.slice(0, 49).join("")}…`;
+}
+
+/**
+ * Persist an immediate placeholder title from the user's first message.
+ * This fills the UI gap while the summary model is still producing a better title.
+ */
+export async function setProvisionalTitleFromUserMessage(
+	narratorId: string,
+	userMessage: string,
+): Promise<string | null> {
+	const title = buildProvisionalTitle(userMessage);
+	if (!title) return null;
+
+	const persisted = await persistTitle(narratorId, title);
+	if (!persisted) return null;
+	logger.info("Provisional title set from first user message", { narratorId, title });
+	return title;
+}
+
 /**
  * Generate a quick title from just the user message (before AI replies).
  * Fire-and-forget — errors are logged, not thrown.

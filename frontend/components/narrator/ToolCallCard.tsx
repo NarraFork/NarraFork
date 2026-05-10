@@ -64,7 +64,6 @@ import {
 	useCallback,
 	useContext,
 	useEffect,
-	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -79,6 +78,7 @@ import { formatDurationText } from "../../lib/format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
+import { AutoFollowScroll } from "./AutoFollowScroll";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
@@ -139,30 +139,21 @@ const streamingCodeFallbackCodeStyle: CSSProperties = {
 const STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS = 80_000;
 
 function StreamingCodeFallback({ code, style }: Pick<StreamingCodeLazyProps, "code" | "style">) {
-	const scrollRef = useRef<HTMLDivElement>(null);
 	const isDisplayTruncated = code.length > STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS;
 	const displayCode = isDisplayTruncated
 		? code.slice(-STREAMING_CODE_FALLBACK_DISPLAY_MAX_CHARS)
 		: code;
 
-	useEffect(() => {
-		const currentCode = displayCode;
-		const rafId = requestAnimationFrame(() => {
-			if (!currentCode) return;
-			const el = scrollRef.current;
-			if (el) el.scrollTop = el.scrollHeight;
-		});
-		return () => cancelAnimationFrame(rafId);
-	}, [displayCode]);
-
 	return (
-		<div ref={scrollRef} style={{ ...streamingCodeFallbackRootStyle, ...style }}>
-			<pre style={streamingCodeFallbackPreStyle}>
-				<code style={streamingCodeFallbackCodeStyle}>
-					{isDisplayTruncated ? `…\n${displayCode}` : displayCode}
-				</code>
-			</pre>
-		</div>
+		<AutoFollowScroll asChild deps={[displayCode]}>
+			<div style={{ ...streamingCodeFallbackRootStyle, ...style }}>
+				<pre style={streamingCodeFallbackPreStyle}>
+					<code style={streamingCodeFallbackCodeStyle}>
+						{isDisplayTruncated ? `…\n${displayCode}` : displayCode}
+					</code>
+				</pre>
+			</div>
+		</AutoFollowScroll>
 	);
 }
 
@@ -1986,6 +1977,7 @@ function EditDiffBlock({
 							language={language}
 							startLine={displayStartLine}
 							lineNumberPrefix={lineNumberPrefix}
+							autoFollowKey={streaming ? filePath : null}
 						/>
 					)}
 				/>
@@ -2218,23 +2210,6 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const awaitTimeout = isAwaitMode ? awaitParam.timeout : null;
 	const awaitWaitForText = isAwaitMode ? awaitParam.wait_for_text : null;
 
-	// Auto-scroll streaming output to bottom.
-	// The scrollable container is Mantine's <pre class="mantine-Code-root"> inside ContentViewer.
-	useEffect(() => {
-		if (!streamingOutput || !toolCall.toolUseId) return;
-		const raf = requestAnimationFrame(() => {
-			const card = document.getElementById(`tool-use-${toolCall.toolUseId}`);
-			if (!card) return;
-			// Find all Code-root <pre> elements; the last one is the streaming output
-			const pres = card.querySelectorAll<HTMLElement>("pre.mantine-Code-root");
-			const scrollable = pres.length > 1 ? pres[pres.length - 1] : pres[0];
-			if (scrollable && scrollable.scrollHeight > scrollable.clientHeight) {
-				scrollable.scrollTop = scrollable.scrollHeight;
-			}
-		});
-		return () => cancelAnimationFrame(raf);
-	}, [streamingOutput, toolCall.toolUseId]);
-
 	return (
 		<Box mt="xs">
 			{isAwaitMode && (
@@ -2287,6 +2262,8 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 						content={streamingOutput}
 						style={termStyle}
 						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Shell"}
+						autoFollow
+						autoFollowKey={toolCall.toolUseId ?? "bash-output"}
 					/>
 				</>
 			)}
@@ -3760,53 +3737,6 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
 	const cat = getCategory(toolCall.toolName);
-	const planFollowResetKey =
-		toolCall.toolName === "ExitPlanMode" ? (toolCall.toolUseId ?? "exit-plan") : null;
-	const planScrollRef = useRef<HTMLDivElement>(null);
-	const planAutoFollowRef = useRef(true);
-	const planProgrammaticScrollUntilRef = useRef(0);
-
-	useEffect(() => {
-		if (!planFollowResetKey) return;
-		planAutoFollowRef.current = true;
-		planProgrammaticScrollUntilRef.current = 0;
-	}, [planFollowResetKey]);
-
-	const stopPlanAutoFollow = useCallback(() => {
-		planAutoFollowRef.current = false;
-	}, []);
-
-	const handlePlanScroll = useCallback(() => {
-		if (performance.now() <= planProgrammaticScrollUntilRef.current) return;
-		planAutoFollowRef.current = false;
-	}, []);
-
-	const handlePlanPointerDown = useCallback(
-		(event: React.PointerEvent<HTMLDivElement>) => {
-			const el = event.currentTarget;
-			const verticalScrollbarWidth = el.offsetWidth - el.clientWidth;
-			if (verticalScrollbarWidth <= 0) return;
-			const rect = el.getBoundingClientRect();
-			if (event.clientX >= rect.right - verticalScrollbarWidth) {
-				stopPlanAutoFollow();
-			}
-		},
-		[stopPlanAutoFollow],
-	);
-
-	useLayoutEffect(() => {
-		if (toolCall.toolName !== "ExitPlanMode" || sfName !== "plan" || !sfValue) return;
-		if (!planAutoFollowRef.current) return;
-		const el = planScrollRef.current;
-		if (!el) return;
-		const scrollToPlanBottom = () => {
-			planProgrammaticScrollUntilRef.current = performance.now() + 80;
-			el.scrollTop = el.scrollHeight;
-		};
-		scrollToPlanBottom();
-		const rafId = requestAnimationFrame(scrollToPlanBottom);
-		return () => cancelAnimationFrame(rafId);
-	}, [toolCall.toolName, sfName, sfValue]);
 	const filePath =
 		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
@@ -3901,6 +3831,8 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 					title={toolCall.toolName}
 					markdown
 					streaming
+					autoFollow
+					autoFollowKey={toolCall.toolUseId ?? toolCall.toolName}
 				/>
 			</Box>
 		);
@@ -3918,6 +3850,8 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 					title="Send message"
 					markdown
 					streaming
+					autoFollow
+					autoFollowKey={toolCall.toolUseId ?? "send-message"}
 				/>
 			</Box>
 		);
@@ -3935,16 +3869,16 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 		const plan = sfName === "plan" ? sfValue : null;
 		if (!plan) return null;
 		return (
-			<Box
-				ref={planScrollRef}
-				mt="xs"
-				onScroll={handlePlanScroll}
-				onWheel={stopPlanAutoFollow}
-				onTouchMove={stopPlanAutoFollow}
-				onPointerDown={handlePlanPointerDown}
-				style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}
-			>
-				<ContentViewer content={plan} title="Plan" markdown streaming />
+			<Box mt="xs" style={{ flex: 1, minHeight: 0 }}>
+				<ContentViewer
+					content={plan}
+					title="Plan"
+					style={{ maxHeight: maxHeight ?? 400, overflow: "auto" }}
+					markdown
+					streaming
+					autoFollow
+					autoFollowKey={toolCall.toolUseId ?? "plan"}
+				/>
 			</Box>
 		);
 	}

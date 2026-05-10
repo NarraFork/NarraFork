@@ -311,7 +311,7 @@
 	"usageHistoryStatCacheRead": "Cache Read",
 	"usageHistoryStatCacheWrite": "Cache Write",
 	"usageHistoryChartTitle": "Usage Trend",
-	"usageHistoryChartDescription": "The backend aggregates time buckets, and the frontend only renders the result to reduce resource usage.",
+	"usageHistoryChartDescription": "Shows request, token, cost, and error trends over time.",
 	"usageHistoryChartLoading": "Loading trend data...",
 	"usageHistoryChartEmpty": "No trend data for the current filters.",
 	"usageHistoryChartTruncated": "To limit resource usage, showing only {{start}} to {{end}} ({{bucketCount}}/{{maxBuckets}} buckets).",

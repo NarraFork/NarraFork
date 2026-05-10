@@ -4,6 +4,7 @@ import { diffLines as computeLineDiff, diffWordsWithSpace } from "diff";
 import { memo, useEffect, useMemo, useState } from "react";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { loadShiki } from "../../lib/shiki-loader";
+import { AutoFollowScroll } from "./AutoFollowScroll";
 
 // --- Types ---
 
@@ -20,6 +21,8 @@ interface DiffViewProps {
 	startLine?: number;
 	/** Optional prefix for provisional line numbers while the real match location is unknown. */
 	lineNumberPrefix?: string;
+	/** Enable streaming auto-follow for the scrollable diff container. */
+	autoFollowKey?: string | number | null;
 }
 
 type DiffLine = {
@@ -448,6 +451,7 @@ export const DiffView = memo(function DiffView({
 	language,
 	startLine,
 	lineNumberPrefix,
+	autoFollowKey,
 }: DiffViewProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const isDark = computedScheme === "dark";
@@ -490,28 +494,36 @@ export const DiffView = memo(function DiffView({
 
 	const truncated = lines.length >= MAX_DIFF_LINES;
 
-	return (
-		<Box style={style}>
-			<div style={wordWrap ? undefined : { minWidth: "fit-content" }}>
-				{lines.map((line, i) => {
-					const key = `${line.type}-${i}`;
-					return (
-						<DiffLineRow
-							key={key}
-							line={line}
-							tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
-							diffStyles={diffStyles}
-							lineNoWidth={lineNoWidth}
-							lineNumberPrefix={lineNumberPrefix}
-						/>
-					);
-				})}
-				{truncated && (
-					<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
-						... diff truncated at {MAX_DIFF_LINES} lines ...
-					</div>
-				)}
-			</div>
-		</Box>
+	const content = (
+		<div style={wordWrap ? undefined : { minWidth: "fit-content" }}>
+			{lines.map((line, i) => {
+				const key = `${line.type}-${i}`;
+				return (
+					<DiffLineRow
+						key={key}
+						line={line}
+						tokens={!line.wordChanges ? (tokenMap?.get(String(i)) ?? undefined) : undefined}
+						diffStyles={diffStyles}
+						lineNoWidth={lineNoWidth}
+						lineNumberPrefix={lineNumberPrefix}
+					/>
+				);
+			})}
+			{truncated && (
+				<div style={{ textAlign: "center", opacity: 0.6, paddingTop: 4 }}>
+					... diff truncated at {MAX_DIFF_LINES} lines ...
+				</div>
+			)}
+		</div>
 	);
+
+	if (autoFollowKey != null) {
+		return (
+			<AutoFollowScroll asChild followKey={autoFollowKey} deps={[oldStr, newStr, tokenMap]}>
+				<Box style={style}>{content}</Box>
+			</AutoFollowScroll>
+		);
+	}
+
+	return <Box style={style}>{content}</Box>;
 });

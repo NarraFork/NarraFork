@@ -259,12 +259,35 @@ export function UsageHistoryChart({
 		hoveredPoint?.meterUnit ?? meterUnit,
 	);
 
+	const getSvgPoint = (clientX: number, clientY: number) => {
+		const svg = svgRef.current;
+		const screenCtm = svg?.getScreenCTM();
+		if (!svg || !screenCtm) return null;
+		const point = svg.createSVGPoint();
+		point.x = clientX;
+		point.y = clientY;
+		return point.matrixTransform(screenCtm.inverse());
+	};
+
+	const getLocalXForSvgX = (svgX: number) => {
+		const svg = svgRef.current;
+		const screenCtm = svg?.getScreenCTM();
+		const containerRect = svg?.parentElement?.getBoundingClientRect();
+		if (!svg || !screenCtm || !containerRect) return null;
+		const point = svg.createSVGPoint();
+		point.x = svgX;
+		point.y = 0;
+		return point.matrixTransform(screenCtm).x - containerRect.left;
+	};
+
+	const hoveredSvgX = xFor(hoveredIndex ?? 0);
+	const hoveredLocalX = hoveredPoint ? getLocalXForSvgX(hoveredSvgX) : null;
+
 	const handlePointerMove = (event: PointerEvent<SVGSVGElement>) => {
 		if (points.length === 0) return;
-		const rect = svgRef.current?.getBoundingClientRect();
-		if (!rect || rect.width <= 0) return;
-		const viewX = ((event.clientX - rect.left) / rect.width) * CHART_WIDTH;
-		const ratio = clamp((viewX - PADDING.left) / CHART_INNER_WIDTH, 0, 1);
+		const svgPoint = getSvgPoint(event.clientX, event.clientY);
+		if (!svgPoint) return;
+		const ratio = clamp((svgPoint.x - PADDING.left) / CHART_INNER_WIDTH, 0, 1);
 		const nextIndex = clamp(Math.round(ratio * (points.length - 1)), 0, points.length - 1);
 		setHoveredIndex(nextIndex);
 	};
@@ -393,16 +416,16 @@ export function UsageHistoryChart({
 							{hoveredPoint ? (
 								<>
 									<line
-										x1={xFor(hoveredIndex ?? 0)}
+										x1={hoveredSvgX}
 										y1={PADDING.top}
-										x2={xFor(hoveredIndex ?? 0)}
+										x2={hoveredSvgX}
 										y2={PADDING.top + CHART_INNER_HEIGHT}
 										stroke="var(--mantine-color-gray-7)"
 										strokeWidth={1.5}
 										strokeDasharray="4 3"
 									/>
 									<circle
-										cx={xFor(hoveredIndex ?? 0)}
+										cx={hoveredSvgX}
 										cy={yFor(hoveredValue)}
 										r={4.5}
 										fill="var(--mantine-color-body)"
@@ -419,14 +442,13 @@ export function UsageHistoryChart({
 								p="xs"
 								style={{
 									position: "absolute",
-									left: `${(xFor(hoveredIndex ?? 0) / CHART_WIDTH) * 100}%`,
+									left:
+										hoveredLocalX == null ? `${(hoveredSvgX / CHART_WIDTH) * 100}%` : hoveredLocalX,
 									top: 10,
 									minWidth: 190,
 									pointerEvents: "none",
 									transform:
-										xFor(hoveredIndex ?? 0) > CHART_WIDTH * 0.68
-											? "translateX(-100%)"
-											: "translateX(8px)",
+										hoveredSvgX > CHART_WIDTH * 0.68 ? "translateX(-100%)" : "translateX(8px)",
 									zIndex: 2,
 								}}
 							>

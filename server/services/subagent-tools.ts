@@ -60,9 +60,9 @@ function resolveMcpToolBehavior(tool: ToolDefinition): string | null {
 /**
  * Check if an MCP tool should be included for a given subagent type.
  * - explore/plan (read-only): only readOnly MCP tools
- * - general (read-write): readOnly + readWrite MCP tools
+ * - general (read-write): all MCP tools except explicit deny
  * - deny MCP tools are always excluded
- * - MCP tools with no explicit config or "ask" are excluded from subagents
+ * - MCP tools with no explicit config or "ask" are available to general subagents
  */
 function isMcpToolAllowedForSubagent(tool: ToolDefinition, subagentType: string): boolean {
 	const behavior = resolveMcpToolBehavior(tool);
@@ -71,7 +71,7 @@ function isMcpToolAllowedForSubagent(tool: ToolDefinition, subagentType: string)
 		return behavior === "readOnly";
 	}
 	// general / custom with general access
-	return behavior === "readOnly" || behavior === "readWrite";
+	return true;
 }
 
 /**
@@ -119,7 +119,8 @@ export function resolveToolFilter(
 		case "custom": {
 			const allowed = new Set(customDef.customTools);
 			return (tool) =>
-				allowed.has(tool.name) || (isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general"));
+				allowed.has(tool.name) &&
+				(!isMcpTool(tool) || isMcpToolAllowedForSubagent(tool, "general"));
 		}
 		default:
 			return BUILTIN_TOOL_FILTERS.explore;

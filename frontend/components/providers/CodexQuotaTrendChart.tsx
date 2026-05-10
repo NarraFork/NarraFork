@@ -43,6 +43,12 @@ type TrendGridLine = {
 	variant: "near" | "compressed" | "boundary";
 };
 
+type ConsumptionProjection = {
+	tier: CodexPlanTier;
+	consumptionRatePerMs: number;
+	endTime: number;
+};
+
 export function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
 	if (tier === "free") return t("codexQuotaTierFree");
 	if (tier === "plus") return t("codexQuotaTierPlus");
@@ -242,8 +248,80 @@ export function CodexQuotaTrendChart({
 	const firstPointTime = points[0]?.timestamp ?? trendNow;
 	const lastPointTime = points[points.length - 1]?.timestamp ?? trendNow;
 	const minTime = Math.min(firstPointTime, trendNow);
-	const maxTime = Math.max(lastPointTime, trendNow);
+	const preliminaryMaxTime = Math.max(lastPointTime, trendNow);
 	const hasChartData = points.length >= 2;
+	const getTrendValueAt = (timestamp: number, tier: CodexPlanTier) => {
+		const firstPoint = points[0];
+		if (!firstPoint) return 0;
+		if (timestamp <= firstPoint.timestamp) return getPointValue(firstPoint, tier);
+
+		if (timestamp > trendNow) {
+			let latestPoint = firstPoint;
+			for (const point of points) {
+				if (point.timestamp > timestamp) break;
+				latestPoint = point;
+			}
+			return getPointValue(latestPoint, tier);
+		}
+
+		let latestHistoricalPoint = firstPoint;
+		for (let index = 1; index < points.length; index++) {
+			const previousPoint = points[index - 1];
+			const currentPoint = points[index];
+			if (currentPoint.timestamp > trendNow) break;
+			latestHistoricalPoint = currentPoint;
+			if (timestamp > currentPoint.timestamp) continue;
+
+			const previousValue = getPointValue(previousPoint, tier);
+			const currentValue = getPointValue(currentPoint, tier);
+			const duration = currentPoint.timestamp - previousPoint.timestamp;
+			if (duration <= 0) return currentValue;
+			const ratio = (timestamp - previousPoint.timestamp) / duration;
+			return previousValue + (currentValue - previousValue) * ratio;
+		}
+
+		return getPointValue(latestHistoricalPoint, tier);
+	};
+	const firstHistoricalPoint = points.find((point) => point.timestamp <= trendNow);
+	const projectionReferenceTime = firstHistoricalPoint
+		? Math.max(trendNow - HOUR_MS, firstHistoricalPoint.timestamp)
+		: trendNow;
+	const projectionDuration = trendNow - projectionReferenceTime;
+	const getConsumedValueInProjectionWindow = (tier: CodexPlanTier) => {
+		const samples = [
+			{ timestamp: projectionReferenceTime, value: getTrendValueAt(projectionReferenceTime, tier) },
+			...points
+				.filter((point) => point.timestamp > projectionReferenceTime && point.timestamp < trendNow)
+				.map((point) => ({ timestamp: point.timestamp, value: getPointValue(point, tier) })),
+			{ timestamp: trendNow, value: getTrendValueAt(trendNow, tier) },
+		].sort((a, b) => a.timestamp - b.timestamp);
+
+		let consumedValue = 0;
+		for (let index = 1; index < samples.length; index++) {
+			consumedValue += Math.max(0, samples[index - 1].value - samples[index].value);
+		}
+		return consumedValue;
+	};
+	const projectionHorizon = Math.max(preliminaryMaxTime, trendNow + NEAR_WINDOW_MS);
+	const consumptionProjections = visibleTiers.flatMap((tier): ConsumptionProjection[] => {
+		if (projectionDuration < 60_000 || projectionHorizon <= trendNow) return [];
+
+		const startValue = getTrendValueAt(trendNow, tier);
+		const consumedValue = getConsumedValueInProjectionWindow(tier);
+		if (startValue <= 0 || consumedValue <= 0.001) return [];
+
+		return [
+			{
+				tier,
+				consumptionRatePerMs: consumedValue / projectionDuration,
+				endTime: projectionHorizon,
+			},
+		];
+	});
+	const maxTime = Math.max(
+		preliminaryMaxTime,
+		...consumptionProjections.map((projection) => projection.endTime),
+	);
 	const nearEndTime = Math.min(trendNow + NEAR_WINDOW_MS, maxTime);
 	const nearDuration = Math.max(nearEndTime - minTime, 1);
 	const compressedDuration = Math.max(maxTime - nearEndTime, 0);
@@ -326,38 +404,6 @@ export function CodexQuotaTrendChart({
 		if (localX <= nearWidth) return minTime + (localX / nearWidth) * nearDuration;
 		return nearEndTime + ((localX - nearWidth) / compressedWidth) * compressedDuration;
 	};
-	const getTrendValueAt = (timestamp: number, tier: CodexPlanTier) => {
-		const firstPoint = points[0];
-		if (!firstPoint) return 0;
-		if (timestamp <= firstPoint.timestamp) return getPointValue(firstPoint, tier);
-
-		if (timestamp > trendNow) {
-			let latestPoint = firstPoint;
-			for (const point of points) {
-				if (point.timestamp > timestamp) break;
-				latestPoint = point;
-			}
-			return getPointValue(latestPoint, tier);
-		}
-
-		let latestHistoricalPoint = firstPoint;
-		for (let index = 1; index < points.length; index++) {
-			const previousPoint = points[index - 1];
-			const currentPoint = points[index];
-			if (currentPoint.timestamp > trendNow) break;
-			latestHistoricalPoint = currentPoint;
-			if (timestamp > currentPoint.timestamp) continue;
-
-			const previousValue = getPointValue(previousPoint, tier);
-			const currentValue = getPointValue(currentPoint, tier);
-			const duration = currentPoint.timestamp - previousPoint.timestamp;
-			if (duration <= 0) return currentValue;
-			const ratio = (timestamp - previousPoint.timestamp) / duration;
-			return previousValue + (currentValue - previousValue) * ratio;
-		}
-
-		return getPointValue(latestHistoricalPoint, tier);
-	};
 	const buildHybridPath = (tier: CodexPlanTier) => {
 		const firstPoint = points[0];
 		if (!firstPoint) return "";
@@ -378,6 +424,67 @@ export function CodexQuotaTrendChart({
 			}
 
 			path += ` H ${xFor(point.timestamp)} V ${yFor(currentValue)}`;
+		}
+		return path;
+	};
+	const buildConsumptionProjectionPath = (projection: ConsumptionProjection) => {
+		const { tier, consumptionRatePerMs, endTime } = projection;
+		const projectedValue = (timestamp: number, baseValue: number, baseTimestamp: number) =>
+			Math.max(0, baseValue - consumptionRatePerMs * Math.max(0, timestamp - baseTimestamp));
+		let segmentBaseTimestamp = trendNow;
+		let baselineValueBeforeNextReset = getTrendValueAt(trendNow, tier);
+		let projectedSegmentBaseValue = baselineValueBeforeNextReset;
+		let currentTimestamp = trendNow;
+		let currentProjectedValue = projectedValue(
+			trendNow,
+			projectedSegmentBaseValue,
+			segmentBaseTimestamp,
+		);
+		let path = `M ${nowX} ${yFor(currentProjectedValue)}`;
+
+		const appendSlopeTo = (timestamp: number) => {
+			const nextProjectedValue = projectedValue(
+				timestamp,
+				projectedSegmentBaseValue,
+				segmentBaseTimestamp,
+			);
+			if (currentProjectedValue > 0 && nextProjectedValue <= 0) {
+				const depletionTime = Math.min(
+					segmentBaseTimestamp + projectedSegmentBaseValue / consumptionRatePerMs,
+					timestamp,
+				);
+				if (depletionTime > currentTimestamp) {
+					path += ` L ${xFor(depletionTime)} ${yFor(0)}`;
+				}
+				if (depletionTime < timestamp) {
+					path += ` L ${xFor(timestamp)} ${yFor(0)}`;
+				}
+			} else {
+				path += ` L ${xFor(timestamp)} ${yFor(nextProjectedValue)}`;
+			}
+			currentTimestamp = timestamp;
+			currentProjectedValue = nextProjectedValue;
+		};
+
+		for (const point of points) {
+			if (point.timestamp <= trendNow || point.timestamp > endTime) continue;
+
+			appendSlopeTo(point.timestamp);
+
+			// Future forecast points are quota reset steps. The consumption projection should add
+			// only the reset delta, not jump back to the no-consumption forecast value.
+			const baselineValueAfterReset = getPointValue(point, tier);
+			const resetDelta = baselineValueAfterReset - baselineValueBeforeNextReset;
+			currentProjectedValue = Math.max(0, currentProjectedValue + resetDelta);
+			path += ` V ${yFor(currentProjectedValue)}`;
+
+			baselineValueBeforeNextReset = baselineValueAfterReset;
+			projectedSegmentBaseValue = currentProjectedValue;
+			segmentBaseTimestamp = point.timestamp;
+		}
+
+		if (currentTimestamp < endTime) {
+			appendSlopeTo(endTime);
 		}
 		return path;
 	};
@@ -491,6 +598,19 @@ export function CodexQuotaTrendChart({
 							fill="none"
 							stroke={CODEX_TIER_STROKES[tier]}
 							strokeWidth={2}
+							strokeLinejoin="round"
+							strokeLinecap="round"
+						/>
+					))}
+					{consumptionProjections.map((projection) => (
+						<path
+							key={`${projection.tier}-consumption-projection`}
+							d={buildConsumptionProjectionPath(projection)}
+							fill="none"
+							stroke={CODEX_TIER_STROKES[projection.tier]}
+							strokeWidth={1.75}
+							strokeOpacity={0.72}
+							strokeDasharray="6 5"
 							strokeLinejoin="round"
 							strokeLinecap="round"
 						/>
@@ -635,6 +755,24 @@ export function CodexQuotaTrendChart({
 							</Text>
 						</Group>
 					))}
+					{consumptionProjections.length > 0 ? (
+						<Group gap={4}>
+							<svg width={18} height={10} aria-hidden="true">
+								<line
+									x1={1}
+									y1={5}
+									x2={17}
+									y2={5}
+									stroke="var(--mantine-color-dimmed)"
+									strokeWidth={1.5}
+									strokeDasharray="4 3"
+								/>
+							</svg>
+							<Text size={compact ? "sm" : "xs"} c="dimmed">
+								{t("codexQuotaTrendPastHourProjection")}
+							</Text>
+						</Group>
+					) : null}
 				</Group>
 			)}
 		</Stack>

@@ -1,5 +1,4 @@
 import {
-	Anchor,
 	Badge,
 	Box,
 	Button,
@@ -22,28 +21,28 @@ import {
 	IconBook2,
 	IconBulb,
 	IconChecklist,
+	IconChevronDown,
+	IconChevronRight,
+	IconFolder,
 	IconInfoCircle,
-	IconRobot,
 	IconSearch,
 	IconSparkles,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { type ReactNode, useEffect, useMemo } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api, type LearningDocSummary } from "../lib/api";
+import { api, type LearningCategory, type LearningDocSummary } from "../lib/api";
 
 interface LearnSearchParams {
 	doc?: string;
 	q?: string;
-	category?: string;
 }
 
 export const Route = createFileRoute("/learn")({
 	validateSearch: (search: Record<string, unknown>): LearnSearchParams => ({
 		doc: typeof search.doc === "string" ? search.doc : undefined,
 		q: typeof search.q === "string" ? search.q : undefined,
-		category: typeof search.category === "string" ? search.category : undefined,
 	}),
 	component: LearnPage,
 });
@@ -60,7 +59,7 @@ function LearnPage() {
 	const navigate = Route.useNavigate();
 	const lang = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language);
 	const query = search.q ?? "";
-	const activeCategory = search.category ?? "all";
+	const [collapsedCategoryIds, setCollapsedCategoryIds] = useState<Set<string>>(() => new Set());
 
 	const { data: index, isLoading: indexLoading } = useQuery({
 		queryKey: ["learning", "index", lang],
@@ -72,15 +71,39 @@ function LearnPage() {
 		const docs = index?.docs ?? [];
 		const q = query.trim().toLowerCase();
 		return docs.filter((doc) => {
-			const categoryMatches = activeCategory === "all" || doc.category === activeCategory;
-			if (!categoryMatches) return false;
 			if (!q) return true;
 			return [doc.title, doc.summary, doc.id, doc.category, ...doc.tags]
 				.join("\n")
 				.toLowerCase()
 				.includes(q);
 		});
-	}, [activeCategory, index?.docs, query]);
+	}, [index?.docs, query]);
+
+	const docsByCategory = useMemo(() => {
+		if (!index) return [];
+		const byCategory = new Map<string, LearningDocSummary[]>();
+		for (const doc of filteredDocs) {
+			const docs = byCategory.get(doc.category) ?? [];
+			docs.push(doc);
+			byCategory.set(doc.category, docs);
+		}
+
+		const knownCategories = new Set(index.categories.map((category) => category.id));
+		const grouped = index.categories.map((category) => ({
+			category,
+			docs: byCategory.get(category.id) ?? [],
+		}));
+
+		for (const [categoryId, docs] of byCategory) {
+			if (knownCategories.has(categoryId)) continue;
+			grouped.push({
+				category: { id: categoryId, label: categoryId, description: "" },
+				docs,
+			});
+		}
+
+		return grouped.filter((group) => group.docs.length > 0);
+	}, [filteredDocs, index]);
 
 	const selectedId = search.doc ?? filteredDocs[0]?.id;
 	const selectedSummary = filteredDocs.find((doc) => doc.id === selectedId) ?? filteredDocs[0];
@@ -106,98 +129,80 @@ function LearnPage() {
 		void navigate({ search: (prev) => ({ ...prev, q: value || undefined, doc: undefined }) });
 	};
 
-	const setCategory = (category: string) => {
-		void navigate({
-			search: (prev) => ({
-				...prev,
-				category: category === "all" ? undefined : category,
-				doc: undefined,
-			}),
+	const toggleCategory = (categoryId: string) => {
+		setCollapsedCategoryIds((previous) => {
+			const next = new Set(previous);
+			if (next.has(categoryId)) {
+				next.delete(categoryId);
+			} else {
+				next.add(categoryId);
+			}
+			return next;
 		});
 	};
 
 	if (indexLoading) return <Loader />;
 
 	return (
-		<Stack gap="lg">
-			<Paper withBorder p="xl" radius="lg">
-				<Group justify="space-between" align="flex-start" gap="lg">
+		<Stack gap="md" className="nf-blur-in-enter">
+			<Paper withBorder p="xl" radius="lg" className="learn-hero">
+				<Group gap="md" align="flex-start" wrap="nowrap">
+					<ThemeIcon variant="gradient" gradient={{ from: "indigo", to: "violet" }} size="xl">
+						<IconBook2 size={24} />
+					</ThemeIcon>
 					<Box maw={760}>
-						<Group gap="xs" mb="xs">
-							<ThemeIcon variant="light" size="lg">
-								<IconBook2 size={20} />
-							</ThemeIcon>
-							<Badge variant="light" color="indigo">
-								{t("sharedBadge")}
-							</Badge>
-						</Group>
-						<Title order={1}>{t("title")}</Title>
-						<Text c="dimmed" mt="sm" size="lg">
+						<Title order={1} lh={1.1}>
+							{t("title")}
+						</Title>
+						<Text c="dimmed" mt="sm" size="lg" maw={680}>
 							{t("subtitle")}
 						</Text>
 					</Box>
-					<Button component="a" href="/narrators" rightSection={<IconArrowRight size={16} />}>
-						{t("askAgent")}
-					</Button>
 				</Group>
 			</Paper>
 
-			<Grid gutter="lg">
-				<Grid.Col span={{ base: 12, md: 3 }}>
-					<Card withBorder p="md" radius="lg">
-						<Stack gap="sm">
+			<Grid gutter="md">
+				<Grid.Col span={{ base: 12, md: 4 }}>
+					<Card withBorder p={0} radius="lg" className="learn-panel learn-doc-list">
+						<Box p="md" pb="sm">
 							<TextInput
 								leftSection={<IconSearch size={16} />}
 								placeholder={t("searchPlaceholder")}
 								value={query}
 								onChange={(event) => setQuery(event.currentTarget.value)}
 							/>
-							<Stack gap={4}>
-								<CategoryButton
-									active={activeCategory === "all"}
-									label={t("allCategories")}
-									description={t("allCategoriesDescription")}
-									onClick={() => setCategory("all")}
-								/>
-								{index?.categories.map((category) => (
-									<CategoryButton
-										key={category.id}
-										active={activeCategory === category.id}
-										label={category.label}
-										description={category.description}
-										onClick={() => setCategory(category.id)}
-									/>
-								))}
-							</Stack>
-						</Stack>
-					</Card>
-				</Grid.Col>
-
-				<Grid.Col span={{ base: 12, md: 3 }}>
-					<Card withBorder p={0} radius="lg">
+						</Box>
 						<ScrollArea h={640}>
-							<Stack gap={0}>
+							<Stack gap={2} px="xs" pb="xs">
 								{filteredDocs.length === 0 ? (
 									<Text c="dimmed" p="md">
 										{t("noResults")}
 									</Text>
 								) : (
-									filteredDocs.map((item) => (
-										<DocListItem
-											key={item.id}
-											doc={item}
-											active={item.id === effectiveDocId}
-											onClick={() => selectDoc(item.id)}
-										/>
-									))
+									docsByCategory.map(({ category, docs }) => {
+										const hasActiveDoc = docs.some((item) => item.id === effectiveDocId);
+										const opened = hasActiveDoc || !collapsedCategoryIds.has(category.id);
+
+										return (
+											<TreeCategory
+												key={category.id}
+												category={category}
+												docs={docs}
+												opened={opened}
+												activeDocId={effectiveDocId}
+												onToggle={() => toggleCategory(category.id)}
+												onSelectDoc={selectDoc}
+											/>
+										);
+									})
 								)}
 							</Stack>
 						</ScrollArea>
 					</Card>
 				</Grid.Col>
 
-				<Grid.Col span={{ base: 12, md: 6 }}>
-					<Card withBorder p="xl" radius="lg">
+				<Grid.Col span={{ base: 12, md: 8 }}>
+					<Card withBorder p="xl" radius="lg" className="learn-panel learn-content">
 						{docLoading ? (
 							<Loader />
 						) : doc ? (
@@ -217,7 +222,7 @@ function LearnPage() {
 								</Box>
 
 								{doc.actions.length > 0 && (
-									<Paper withBorder p="md" radius="md">
+									<Paper withBorder p="md" radius="md" className="learn-callout">
 										<Text fw={700} mb="sm">
 											{t("jumpToFeature")}
 										</Text>
@@ -265,15 +270,6 @@ function LearnPage() {
 									items={doc.pitfalls}
 									color="orange"
 								/>
-								<LearningList
-									icon={<IconRobot size={18} />}
-									title={t("agentHints")}
-									items={doc.agentHints}
-									color="violet"
-								/>
-								<Text size="sm" c="dimmed">
-									{t("agentToolHint")} <Anchor>LearningGuide</Anchor>
-								</Text>
 							</Stack>
 						) : (
 							<Text c="dimmed">{t("selectDoc")}</Text>
@@ -281,42 +277,130 @@ function LearnPage() {
 					</Card>
 				</Grid.Col>
 			</Grid>
+
+			<style>{`
+				.learn-hero {
+					position: relative;
+					overflow: hidden;
+					background:
+						radial-gradient(circle at top left, color-mix(in srgb, var(--mantine-color-indigo-6) 18%, transparent), transparent 34rem),
+						radial-gradient(circle at 85% 10%, color-mix(in srgb, var(--mantine-color-violet-6) 14%, transparent), transparent 26rem),
+						light-dark(var(--mantine-color-white), var(--mantine-color-dark-7));
+					border-color: light-dark(var(--mantine-color-indigo-1), var(--mantine-color-dark-4));
+				}
+
+				.learn-panel {
+					background: light-dark(var(--mantine-color-white), var(--mantine-color-dark-7));
+					border-color: light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-4));
+					box-shadow: 0 10px 30px light-dark(rgba(15, 23, 42, 0.06), rgba(0, 0, 0, 0.22));
+				}
+
+				.learn-content {
+					background:
+						linear-gradient(180deg, color-mix(in srgb, var(--mantine-color-indigo-6) 5%, transparent), transparent 12rem),
+						light-dark(var(--mantine-color-white), var(--mantine-color-dark-7));
+				}
+
+				.learn-callout {
+					background: light-dark(var(--mantine-color-indigo-0), color-mix(in srgb, var(--mantine-color-indigo-9) 24%, var(--mantine-color-dark-7)));
+					border-color: light-dark(var(--mantine-color-indigo-2), var(--mantine-color-indigo-9));
+				}
+
+				.learn-tree-children {
+					margin-left: 18px;
+					padding-left: 8px;
+					border-left: 1px dashed light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4));
+				}
+
+				.learn-category,
+				.learn-doc-item {
+					border-radius: var(--mantine-radius-sm);
+					transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+				}
+
+				.learn-category:hover,
+				.learn-doc-item:hover {
+					background: light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-6));
+				}
+
+				.learn-category[data-active="true"],
+				.learn-doc-item[data-active="true"] {
+					background: linear-gradient(90deg, var(--mantine-color-indigo-light), transparent);
+					border-color: var(--mantine-color-indigo-5);
+				}
+			`}</style>
 		</Stack>
 	);
 }
 
-function CategoryButton({
-	active,
-	label,
-	description,
-	onClick,
+function TreeCategory({
+	category,
+	docs,
+	opened,
+	activeDocId,
+	onToggle,
+	onSelectDoc,
 }: {
-	active: boolean;
-	label: string;
-	description: string;
-	onClick: () => void;
+	category: LearningCategory;
+	docs: LearningDocSummary[];
+	opened: boolean;
+	activeDocId?: string;
+	onToggle: () => void;
+	onSelectDoc: (id: string) => void;
 }) {
 	return (
-		<Paper
-			component="button"
-			type="button"
-			withBorder={active}
-			p="sm"
-			radius="md"
-			onClick={onClick}
-			style={{
-				textAlign: "left",
-				cursor: "pointer",
-				background: active ? "var(--mantine-color-indigo-light)" : "transparent",
-			}}
-		>
-			<Text fw={700} size="sm">
-				{label}
-			</Text>
-			<Text c="dimmed" size="xs" lineClamp={2}>
-				{description}
-			</Text>
-		</Paper>
+		<Box className="learn-tree-group">
+			<Box
+				component="button"
+				type="button"
+				className="learn-category"
+				data-active={docs.some((doc) => doc.id === activeDocId)}
+				onClick={onToggle}
+				style={{
+					width: "100%",
+					border: 0,
+					background: "transparent",
+					color: "inherit",
+					cursor: "pointer",
+					textAlign: "left",
+					padding: "8px 10px",
+				}}
+			>
+				<Group gap="xs" wrap="nowrap">
+					<ThemeIcon variant="subtle" color="indigo" size="sm">
+						{opened ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+					</ThemeIcon>
+					<IconFolder size={16} color="var(--mantine-color-indigo-4)" />
+					<Box style={{ flex: 1, minWidth: 0 }}>
+						<Group gap={6} wrap="nowrap">
+							<Text fw={700} size="sm" lineClamp={1}>
+								{category.label}
+							</Text>
+							<Badge size="xs" variant="light" color="gray">
+								{docs.length}
+							</Badge>
+						</Group>
+						{category.description && (
+							<Text c="dimmed" size="xs" lineClamp={1}>
+								{category.description}
+							</Text>
+						)}
+					</Box>
+				</Group>
+			</Box>
+			{opened && (
+				<Stack gap={1} className="learn-tree-children">
+					{docs.map((item) => (
+						<DocListItem
+							key={item.id}
+							doc={item}
+							active={item.id === activeDocId}
+							onClick={() => onSelectDoc(item.id)}
+						/>
+					))}
+				</Stack>
+			)}
+		</Box>
 	);
 }
 
@@ -333,23 +417,30 @@ function DocListItem({
 		<Box
 			component="button"
 			type="button"
+			className="learn-doc-item"
+			data-active={active}
 			onClick={onClick}
 			style={{
+				width: "100%",
 				border: 0,
+				borderLeft: "3px solid transparent",
 				borderBottom: "1px solid var(--mantine-color-default-border)",
-				background: active ? "var(--mantine-color-indigo-light)" : "transparent",
+				background: "transparent",
+				color: "inherit",
 				cursor: "pointer",
 				textAlign: "left",
-				padding: "var(--mantine-spacing-md)",
+				padding: "8px 10px",
 			}}
 		>
-			<Group wrap="nowrap" align="flex-start" gap="sm">
-				<ThemeIcon variant="light" color={active ? "indigo" : "gray"} size="md">
-					<IconInfoCircle size={16} />
+			<Group wrap="nowrap" align="flex-start" gap="xs">
+				<ThemeIcon variant="light" color={active ? "indigo" : "gray"} size="sm">
+					<IconInfoCircle size={14} />
 				</ThemeIcon>
 				<Box style={{ flex: 1, minWidth: 0 }}>
-					<Text fw={700}>{doc.title}</Text>
-					<Text size="sm" c="dimmed" lineClamp={3}>
+					<Text fw={700} size="sm">
+						{doc.title}
+					</Text>
+					<Text size="xs" c="dimmed" lineClamp={2}>
 						{doc.summary}
 					</Text>
 					<Group gap={4} mt="xs">
@@ -380,7 +471,7 @@ function LearningList({
 }) {
 	if (items.length === 0) return null;
 	return (
-		<Paper withBorder p="md" radius="md">
+		<Paper withBorder p="md" radius="md" className="learn-callout">
 			<Group gap="xs" mb="sm">
 				<ThemeIcon variant="light" color={color}>
 					{icon}

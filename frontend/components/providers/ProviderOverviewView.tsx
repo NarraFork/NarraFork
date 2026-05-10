@@ -40,12 +40,12 @@ const ADD_PROVIDER_OPTIONS: Array<{
 		recommendKey: "addProviderRecommendedChineseModels",
 	},
 	{
-		type: "completions-compatible",
-		labelKey: "addProviderCompletions",
-		badgeKey: "addProviderBadgeOpenAI",
-		descriptionKey: "addProviderCompletionsDesc",
-		hintKey: "addProviderCompletionsHint",
-		color: "blue",
+		type: "codex-native",
+		labelKey: "addProviderCodex",
+		badgeKey: "addProviderBadgeCodex",
+		descriptionKey: "addProviderCodexDesc",
+		hintKey: "addProviderCodexHint",
+		color: "violet",
 	},
 	{
 		type: "responses-compatible",
@@ -56,20 +56,20 @@ const ADD_PROVIDER_OPTIONS: Array<{
 		color: "cyan",
 	},
 	{
-		type: "codex-native",
-		labelKey: "addProviderCodex",
-		badgeKey: "addProviderBadgeCodex",
-		descriptionKey: "addProviderCodexDesc",
-		hintKey: "addProviderCodexHint",
-		color: "violet",
-	},
-	{
 		type: "anthropic-official",
 		labelKey: "addProviderClaudeCode",
 		badgeKey: "addProviderBadgeClaudeCode",
 		descriptionKey: "addProviderClaudeCodeDesc",
 		hintKey: "addProviderClaudeCodeHint",
 		color: "orange",
+	},
+	{
+		type: "completions-compatible",
+		labelKey: "addProviderCompletions",
+		badgeKey: "addProviderBadgeOpenAI",
+		descriptionKey: "addProviderCompletionsDesc",
+		hintKey: "addProviderCompletionsHint",
+		color: "blue",
 	},
 	{
 		type: "nug",
@@ -244,7 +244,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					<Text size="sm" c="dimmed">
 						{t("addProviderModalDesc")}
 					</Text>
-					<SimpleGrid cols={{ base: 1, sm: 2, lg: 3 }} spacing="sm">
+					<SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
 						{ADD_PROVIDER_OPTIONS.map((option) => (
 							<Card
 								key={option.type}

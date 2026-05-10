@@ -79,7 +79,11 @@ import {
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
-import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
+import {
+	generateAndSetTitle,
+	generateQuickTitle,
+	setProvisionalTitleFromUserMessage,
+} from "./narrator-title";
 import { reviewService } from "./review-service";
 import {
 	deleteConclusionFileId,
@@ -959,7 +963,12 @@ export async function runAgentLoop(
 						where: eq(narrators.id, narratorId),
 						columns: { messageCount: true, title: true },
 					});
-					const titleUpdate = !!(n && (n.messageCount ?? 0) <= 1 && !n.title);
+					const hasOnlyInitialUserMessage = (n?.messageCount ?? 0) <= 1;
+					const titleUpdate = !!(
+						n &&
+						hasOnlyInitialUserMessage &&
+						(!n.title || (active._provisionalTitle && n.title === active._provisionalTitle))
+					);
 					return { titleUpdate };
 				},
 				onTodoWrite: async (todos, toolUseId) => {
@@ -2185,6 +2194,7 @@ export async function runAgentLoop(
 		if (shouldUpdateTitle) {
 			generateAndSetTitle(narratorId, locale).catch(() => {});
 		}
+		active._provisionalTitle = undefined;
 
 		// Auto-resume: when the loop was interrupted and buffered messages remain,
 		// schedule a new agent loop to consume them.  This makes "long-press cut in
@@ -2372,6 +2382,8 @@ async function feedMessage(
 
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
+		active._provisionalTitle =
+			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
 	}
 
