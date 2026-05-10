@@ -2,6 +2,7 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
 import { logger } from "./lib/logger";
 import { APP_VERSION } from "./lib/version";
+import { WATCHER_WORKER_FLAG } from "./lib/watcher/worker-protocol";
 
 const HANDOFF_URL_ENV = "NARRAFORK_GRACEFUL_RESTART_URL";
 const HANDOFF_TOKEN_ENV = "NARRAFORK_GRACEFUL_RESTART_TOKEN";
@@ -283,8 +284,12 @@ async function waitForPreviousServerShutdown(): Promise<boolean> {
 	return handoffSucceeded;
 }
 
-const handoffOk = await waitForPreviousServerShutdown();
-if (!handoffOk) {
-	process.exit(1);
+if (process.argv.includes(WATCHER_WORKER_FLAG)) {
+	await import("./lib/watcher/parcel-watcher-worker");
+} else {
+	const handoffOk = await waitForPreviousServerShutdown();
+	if (!handoffOk) {
+		process.exit(1);
+	}
+	await import("./main");
 }
-await import("./main");

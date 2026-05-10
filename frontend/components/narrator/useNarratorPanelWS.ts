@@ -313,6 +313,10 @@ function withoutQueueMessageSubstatus(substatus: string[]): string[] {
 	return substatus.filter((s) => !s.startsWith("queue_message:"));
 }
 
+function withoutCompactingSubstatus(substatus: unknown): string[] {
+	return Array.isArray(substatus) ? substatus.filter((s) => s !== "compacting") : [];
+}
+
 function withQueueSubstatus(
 	substatus: string[],
 	position?: number,
@@ -616,6 +620,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId,
 		prunedPercent,
 	} = statusState;
+	const suppressMessageDerivedCompactingRef = useRef(false);
 
 	// --- Seed substatus from persisted narrator data ---
 	// The reducer starts with substatus=[] and is normally updated via WS events.
@@ -2086,6 +2091,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// Clear substatus when transitioning to idle without explicit substatus
 					patch.substatus = [];
 				}
+				if (patch.substatus !== undefined) {
+					suppressMessageDerivedCompactingRef.current = !patch.substatus.includes("compacting");
+				}
 				dispatchStatus({ type: "patch", payload: patch });
 				if (isNotWorking) {
 					const hadStreaming = streamingBlocksRef.current.length > 0;
@@ -2121,6 +2129,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onSubstatusChange: (newSubstatus) => {
+				suppressMessageDerivedCompactingRef.current = !newSubstatus.includes("compacting");
 				dispatchStatus({ type: "patch", payload: { substatus: newSubstatus } });
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: newSubstatus } : old,
@@ -2316,13 +2325,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onCompactDone: (contextPercentAfter?: number, isSegment?: boolean) => {
+				suppressMessageDerivedCompactingRef.current = true;
+				const nextSubstatus = withoutCompactingSubstatus(statusState.substatus);
 				dispatchStatus({
 					type: "patch",
 					payload: {
+						substatus: nextSubstatus,
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
 					},
 				});
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
+				);
 				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
@@ -2807,6 +2822,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// On initial load (before WS connects), detect if the last message has an
 	// active compact block and seed the substatus accordingly.
 	useEffect(() => {
+		if (suppressMessageDerivedCompactingRef.current) return;
 		if (!messagesData?.pages?.length) return;
 		const firstPage = messagesData.pages[0];
 		const msgs = firstPage?.messages;

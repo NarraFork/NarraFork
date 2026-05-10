@@ -5,22 +5,22 @@
  * updates to subscribed narrators via WebSocket.
  *
  * Architecture (modelled after VS Code):
- *   @parcel/watcher (1 native recursive subscription per worktree)
+ *   optional isolated @parcel/watcher worker process
  *     → event coalescing (75ms aggregate + merge)
  *     → throttled emission (500/batch, 200ms rest)
  *     → debounce (1.5s) + rate limit
  *     → git status query + WS broadcast
  *
- * This replaces the previous approach of N × fs.watch() per worktree
- * (one per subdirectory), which consumed O(directories) inotify watches.
- * Now each worktree uses exactly 1 inotify watch via @parcel/watcher.
+ * If the native worker is disabled or unhealthy, the service keeps the same
+ * registry active and falls back to low-frequency git-status polling. The main
+ * server never loads @parcel/watcher's native addon directly.
  */
 
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
-import { ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
+import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
 
@@ -31,6 +31,10 @@ const DEBOUNCE_MS = 1500;
 
 const RATE_WINDOW_MS = 2000;
 const RATE_LIMIT = 200;
+const FALLBACK_POLL_INTERVAL_MS = Math.max(
+	1000,
+	Number(process.env.NARRAFORK_WATCHER_POLL_INTERVAL_MS) || 5000,
+);
 
 interface RateLimitState {
 	windowStart: number;
@@ -45,8 +49,62 @@ interface WatcherEntry {
 	narratorIds: Set<string>;
 	locale: Locale;
 	debounceTimer?: ReturnType<typeof setTimeout>;
+	pollTimer?: ReturnType<typeof setInterval>;
 	lastHeadSha?: string;
+	lastStatusSignature?: string;
+	processing: boolean;
+	pendingProcess: boolean;
 	rateLimit: RateLimitState;
+}
+
+interface StatusSignatureFileInput {
+	status: string;
+	path: string;
+	linesAdded: number;
+	linesRemoved: number;
+	stagedLinesAdded: number;
+	stagedLinesRemoved: number;
+	unstagedLinesAdded: number;
+	unstagedLinesRemoved: number;
+}
+
+interface StatusSignatureInput {
+	hasChanges: boolean;
+	staged: number;
+	unstaged: number;
+	untracked: number;
+	totalFiles: number;
+	headSha?: string;
+	branch?: string;
+	linesAdded: number;
+	linesRemoved: number;
+	files?: StatusSignatureFileInput[];
+}
+
+function getStatusSignature(status: StatusSignatureInput): string {
+	return JSON.stringify({
+		hasChanges: status.hasChanges,
+		staged: status.staged,
+		unstaged: status.unstaged,
+		untracked: status.untracked,
+		totalFiles: status.totalFiles,
+		headSha: status.headSha,
+		branch: status.branch,
+		linesAdded: status.linesAdded,
+		linesRemoved: status.linesRemoved,
+		files: [...(status.files ?? [])]
+			.sort((a, b) => a.path.localeCompare(b.path) || a.status.localeCompare(b.status))
+			.map((file) => ({
+				status: file.status,
+				path: file.path,
+				linesAdded: file.linesAdded,
+				linesRemoved: file.linesRemoved,
+				stagedLinesAdded: file.stagedLinesAdded,
+				stagedLinesRemoved: file.stagedLinesRemoved,
+				unstagedLinesAdded: file.unstagedLinesAdded,
+				unstagedLinesRemoved: file.unstagedLinesRemoved,
+			})),
+	});
 }
 
 // ── Singleton ParcelRecursiveWatcher ────────────────────────────────────────
@@ -58,11 +116,16 @@ interface WatcherEntry {
 const parcelWatcher = hotSafe<ParcelRecursiveWatcher>(
 	"narrafork.worktreeWatcher.parcel",
 	() =>
-		new ParcelRecursiveWatcher((rootPath, events) => {
-			// Events from parcel are already coalesced and throttled.
-			// We just need to trigger the debounced git-status flow.
-			worktreeWatcher._onFileChange(rootPath, events.length);
-		}),
+		new ParcelRecursiveWatcher(
+			(rootPath, events) => {
+				// Events from parcel are already coalesced and throttled.
+				// We just need to trigger the debounced git-status flow.
+				worktreeWatcher._onFileChange(rootPath, events.length);
+			},
+			(reason) => {
+				worktreeWatcher._onWatcherBackendUnavailable(reason);
+			},
+		),
 );
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -112,18 +175,26 @@ export const worktreeWatcher = {
 			chapterId,
 			narratorIds: new Set([narratorId]),
 			locale,
+			processing: false,
+			pendingProcess: false,
 			rateLimit: { windowStart: Date.now(), count: 0, warned: false },
 		};
 
 		this._entries.set(worktreePath, entry);
 
-		// Start the parcel watcher (async, fire-and-forget)
-		parcelWatcher.watch(worktreePath).catch((err) => {
-			logger.warn("Failed to start worktree watcher", {
-				worktreePath,
-				error: String(err),
+		// Start the native parcel watcher through an isolated worker process.
+		// If disabled or unhealthy, keep the registry alive and use polling fallback.
+		if (isNativeWatcherEnabled()) {
+			parcelWatcher.watch(worktreePath).catch((err) => {
+				logger.warn("Failed to start native worktree watcher", {
+					worktreePath,
+					error: String(err),
+				});
+				this._startFallbackPolling(worktreePath, entry, String(err));
 			});
-		});
+		} else {
+			this._startFallbackPolling(worktreePath, entry, "native watcher disabled");
+		}
 
 		// Capture initial HEAD SHA
 		gitService
@@ -228,13 +299,56 @@ export const worktreeWatcher = {
 		if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
 		entry.debounceTimer = setTimeout(() => {
 			entry.debounceTimer = undefined;
-			this._processChange(worktreePath, entry).catch((err) => {
+			this._enqueueProcessChange(worktreePath, entry);
+		}, DEBOUNCE_MS);
+	},
+
+	/** Internal: native watcher failed/disabled; enable polling for all active worktrees. */
+	_onWatcherBackendUnavailable(reason: string): void {
+		for (const [worktreePath, entry] of this._entries) {
+			this._startFallbackPolling(worktreePath, entry, reason);
+		}
+	},
+
+	/** Internal: start low-frequency git status polling fallback. */
+	_startFallbackPolling(worktreePath: string, entry: WatcherEntry, reason: string): void {
+		if (entry.pollTimer) return;
+		logger.info("Worktree watcher fallback polling started", {
+			worktreePath,
+			chapterId: entry.chapterId,
+			reason,
+			intervalMs: FALLBACK_POLL_INTERVAL_MS,
+		});
+		entry.pollTimer = setInterval(() => {
+			if (!this._entries.has(worktreePath)) return;
+			this._enqueueProcessChange(worktreePath, entry);
+		}, FALLBACK_POLL_INTERVAL_MS);
+	},
+
+	/** Internal: coalesce concurrent git-status refreshes per worktree. */
+	_enqueueProcessChange(worktreePath: string, entry: WatcherEntry): void {
+		if (!this._entries.has(worktreePath)) return;
+		if (entry.processing) {
+			entry.pendingProcess = true;
+			return;
+		}
+
+		entry.processing = true;
+		this._processChange(worktreePath, entry)
+			.catch((err) => {
 				logger.debug("Worktree watcher change processing failed", {
 					worktreePath,
 					error: String(err),
 				});
+			})
+			.finally(() => {
+				entry.processing = false;
+				if (!this._entries.has(worktreePath)) return;
+				if (entry.pendingProcess) {
+					entry.pendingProcess = false;
+					this._enqueueProcessChange(worktreePath, entry);
+				}
 			});
-		}, DEBOUNCE_MS);
 	},
 
 	/** Internal: process a debounced file change event. */
@@ -243,29 +357,36 @@ export const worktreeWatcher = {
 
 		const statusSummary = await gitService.getStatusSummary(worktreePath);
 		const currentHead = statusSummary.headSha;
+		const previousHead = entry.lastHeadSha;
+		const statusSignature = getStatusSignature(statusSummary);
+		const statusChanged = statusSignature !== entry.lastStatusSignature;
 
-		// Strip files array from WS broadcast to keep payloads small
-		const { files: _files, ...statusWithoutFiles } = statusSummary;
+		if (statusChanged) {
+			entry.lastStatusSignature = statusSignature;
 
-		// Broadcast git status to all subscribed narrators
-		for (const narratorId of narratorIds) {
-			eventBus.emit({
-				type: "narrator:ws_broadcast",
-				narratorId,
-				message: {
-					type: "git_status",
+			// Strip files array from WS broadcast to keep payloads small
+			const { files: _files, ...statusWithoutFiles } = statusSummary;
+
+			// Broadcast git status to all subscribed narrators
+			for (const narratorId of narratorIds) {
+				eventBus.emit({
+					type: "narrator:ws_broadcast",
 					narratorId,
-					chapterId,
-					toolUseId: "",
-					status: statusWithoutFiles as typeof statusSummary,
-					linesAdded: statusSummary.linesAdded,
-					linesRemoved: statusSummary.linesRemoved,
-				},
-			});
+					message: {
+						type: "git_status",
+						narratorId,
+						chapterId,
+						toolUseId: "",
+						status: statusWithoutFiles as typeof statusSummary,
+						linesAdded: statusSummary.linesAdded,
+						linesRemoved: statusSummary.linesRemoved,
+					},
+				});
+			}
 		}
 
 		// Detect new commits (HEAD changed)
-		if (currentHead && entry.lastHeadSha && currentHead !== entry.lastHeadSha) {
+		if (currentHead && previousHead && currentHead !== previousHead) {
 			entry.lastHeadSha = currentHead;
 
 			// Sync commit history from git log
@@ -292,11 +413,13 @@ export const worktreeWatcher = {
 					error: String(err),
 				});
 			}
-		} else if (currentHead && !entry.lastHeadSha) {
+		} else if (currentHead && !previousHead) {
 			entry.lastHeadSha = currentHead;
 		}
 
-		eventBus.emit({ type: "chapter:files_changed", chapterId, worktreePath });
+		if (statusChanged) {
+			eventBus.emit({ type: "chapter:files_changed", chapterId, worktreePath });
+		}
 	},
 
 	/** Internal: close and remove a watcher entry. */
@@ -304,6 +427,8 @@ export const worktreeWatcher = {
 		const entry = this._entries.get(worktreePath);
 		if (!entry) return;
 		if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
+		if (entry.pollTimer) clearInterval(entry.pollTimer);
+		entry.pendingProcess = false;
 		this._entries.delete(worktreePath);
 
 		// Stop the underlying parcel watcher for this path

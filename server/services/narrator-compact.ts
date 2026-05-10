@@ -254,9 +254,16 @@ async function doRunCustomCompact(
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: estimated.message });
 		}
 
-		// Do not force a status transition here. Clearing only the compacting tag
-		// in finally preserves unrelated substatus and avoids racing subagent
-		// lifecycle updates managed by finalizeSubagent.
+		// Clear the compacting tag before compact_done so clients never process
+		// completion while the transient substatus still says compacting. This is
+		// UI-state cleanup only, so failure must not turn a completed compact into
+		// a failed compact.
+		await setCompactingSubstatus(narratorId, false).catch((err) => {
+			logger.warn("Failed to clear compacting substatus before compact_done", {
+				narratorId,
+				error: String(err),
+			});
+		});
 		logger.info("Custom compact completed", { narratorId, summaryLength: summary.length });
 		broadcastToNarrator(narratorId, {
 			type: "compact_done",
@@ -307,6 +314,12 @@ async function doRunCustomCompact(
 		if (active?.alive) {
 			active.abortController.abort();
 		}
+		await setCompactingSubstatus(narratorId, false).catch((err) => {
+			logger.warn("Failed to clear compacting substatus after failed custom compact", {
+				narratorId,
+				error: String(err),
+			});
+		});
 		broadcastToNarrator(narratorId, {
 			type: "compact_failed",
 			narratorId,
@@ -423,7 +436,12 @@ async function doRunSegmentCompact(
 			messageCount: messageIds.length,
 			summaryLength: summary.length,
 		});
-		await setCompactingSubstatus(narratorId, false);
+		await setCompactingSubstatus(narratorId, false).catch((err) => {
+			logger.warn("Failed to clear compacting substatus before segment compact_done", {
+				narratorId,
+				error: String(err),
+			});
+		});
 		broadcastToNarrator(narratorId, {
 			type: "compact_done",
 			narratorId,

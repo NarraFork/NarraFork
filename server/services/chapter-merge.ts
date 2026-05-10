@@ -45,6 +45,8 @@ export interface AiResolveResult {
 	error?: string;
 }
 
+type ChapterRow = typeof chapters.$inferSelect;
+
 export interface RulerAiResolveResult {
 	resolved: boolean;
 	mergeResult?: MergeResult;
@@ -62,6 +64,126 @@ async function getProjectGitPath(projectId: string): Promise<string> {
 	return project.gitPath;
 }
 
+function buildPreMergeAutoCommitMessage(source: ChapterRow, target: ChapterRow): string {
+	const sourceLabel = source.title?.trim() || source.branch;
+	return `Auto-commit ${sourceLabel} changes before merge into ${target.branch}`;
+}
+
+async function autoCommitSourceBeforeMerge(
+	source: ChapterRow,
+	target: ChapterRow,
+): Promise<string | null> {
+	const sourceWorktree = source.worktreePath;
+	if (!sourceWorktree) return null;
+
+	const message = buildPreMergeAutoCommitMessage(source, target);
+	return worktreeLock.acquire(sourceWorktree, async () => {
+		const currentBranch = (await gitService.getCurrentBranch(sourceWorktree)).trim();
+		if (currentBranch !== source.branch) {
+			throw new ValidationError(
+				`Source chapter worktree is on branch ${currentBranch || "(detached)"}, expected ${source.branch}`,
+			);
+		}
+
+		const commitSha = await gitService.autoCommit(sourceWorktree, message);
+		if (!commitSha) return null;
+
+		const normalizedSha = commitSha.trim();
+		logger.info("Auto-committed source chapter worktree before merge", {
+			sourceChapterId: source.id,
+			targetChapterId: target.id,
+			worktreePath: sourceWorktree,
+			commitSha: normalizedSha,
+		});
+		try {
+			await commitSyncService.recordCommit({
+				chapterId: source.id,
+				sha: normalizedSha,
+				message,
+				source: "auto",
+			});
+		} catch (err) {
+			logger.warn("Failed to record pre-merge auto-commit (non-fatal)", {
+				sourceChapterId: source.id,
+				commitSha: normalizedSha,
+				error: String(err),
+			});
+		}
+		return normalizedSha;
+	});
+}
+
+function reviewCommitSha(
+	reviewChapter: Pick<ChapterRow, "forkPoint" | "startCommitSha" | "headCommitSha">,
+): string | null {
+	const forkPoint = reviewChapter.forkPoint;
+	if (forkPoint && typeof forkPoint === "object" && "commitSha" in forkPoint) {
+		const commitSha = (forkPoint as { commitSha?: unknown }).commitSha;
+		if (typeof commitSha === "string" && commitSha.trim()) return commitSha.trim();
+	}
+	return reviewChapter.startCommitSha?.trim() || reviewChapter.headCommitSha?.trim() || null;
+}
+
+async function ensureSourceReadyForRequiredReview(
+	source: ChapterRow,
+	gitPath: string,
+): Promise<void> {
+	if (source.worktreePath) {
+		const status = await gitService.getStatus(source.worktreePath);
+		if (status.trim()) {
+			throw new ValidationError(
+				"Source chapter has uncommitted changes. Commit them and run a new review before merging.",
+			);
+		}
+	}
+
+	const latestConclusion = await db.query.reviewConclusions.findFirst({
+		where: eq(reviewConclusions.sourceChapterId, source.id),
+		orderBy: [desc(reviewConclusions.createdAt)],
+	});
+	if (!latestConclusion || latestConclusion.verdict !== "approve") {
+		throw new ValidationError(
+			"Review approval required before merge. " +
+				(latestConclusion
+					? `Latest review verdict: ${latestConclusion.verdict}`
+					: "No review found."),
+		);
+	}
+
+	const reviewChapter = await db.query.chapters.findFirst({
+		where: eq(chapters.id, latestConclusion.reviewChapterId),
+		columns: { forkPoint: true, startCommitSha: true, headCommitSha: true },
+	});
+	const reviewedSha = reviewChapter ? reviewCommitSha(reviewChapter) : null;
+	const sourceHeadSha = (
+		source.worktreePath
+			? await gitService.getHeadCommit(source.worktreePath)
+			: await gitService.getRefCommit(gitPath, source.branch)
+	).trim();
+	if (reviewedSha && reviewedSha !== sourceHeadSha) {
+		throw new ValidationError(
+			"Review approval is stale: the source branch changed after the approved review. Run a new review before merging.",
+		);
+	}
+}
+
+async function prepareSourceBeforeMerge(
+	source: ChapterRow,
+	target: ChapterRow,
+	gitPath: string,
+	requireReviewBeforeMerge: boolean,
+): Promise<void> {
+	if (requireReviewBeforeMerge) {
+		await ensureSourceReadyForRequiredReview(source, gitPath);
+		return;
+	}
+
+	// If the source chapter still has uncommitted worktree changes, persist them
+	// to its branch before computing merge context / fast-forward state. Otherwise
+	// git merge only sees the old branch tip and silently drops those changes.
+	await autoCommitSourceBeforeMerge(source, target);
+}
+
 export const chapterMerge = {
 	async checkConflicts(
 		sourceChapterId: string,
@@ -75,6 +197,8 @@ export const chapterMerge = {
 			where: eq(chapters.id, targetChapterId),
 		});
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
+		if (sourceChapterId === targetChapterId)
+			throw new ValidationError("Cannot merge a chapter into itself");
 		if (source.status !== "active") throw new ValidationError("Source chapter must be active");
 		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
 		if (source.projectId !== target.projectId) {
@@ -118,6 +242,9 @@ export const chapterMerge = {
 			where: eq(chapters.id, input.targetChapterId),
 		});
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
+		if (sourceChapterId === input.targetChapterId) {
+			throw new ValidationError("Cannot merge a chapter into itself");
+		}
 		if (source.status !== "active" && source.status !== "dormant") {
 			throw new ValidationError("Source chapter must be active or dormant");
 		}
@@ -132,25 +259,16 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
-		// Review gate: if project requires review approval before merge
 		const project = await db.query.projects.findFirst({
 			where: eq(projects.id, source.projectId),
 		});
 		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
-		if (chapterSettings?.requireReviewBeforeMerge) {
-			const latestConclusion = await db.query.reviewConclusions.findFirst({
-				where: eq(reviewConclusions.sourceChapterId, sourceChapterId),
-				orderBy: [desc(reviewConclusions.createdAt)],
-			});
-			if (!latestConclusion || latestConclusion.verdict !== "approve") {
-				throw new ValidationError(
-					"Review approval required before merge. " +
-						(latestConclusion
-							? `Latest review verdict: ${latestConclusion.verdict}`
-							: "No review found."),
-				);
-			}
-		}
+		await prepareSourceBeforeMerge(
+			source,
+			target,
+			gitPath,
+			chapterSettings?.requireReviewBeforeMerge === true,
+		);
 
 		// Check if fast-forward is possible (only for "merge" strategy)
 		const canFastForward =
@@ -283,6 +401,9 @@ export const chapterMerge = {
 			where: eq(chapters.id, input.targetChapterId),
 		});
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
+		if (sourceChapterId === input.targetChapterId) {
+			throw new ValidationError("Cannot merge a chapter into itself");
+		}
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
 		if (source.projectId !== target.projectId) {
 			throw new ValidationError("Cannot merge chapters from different projects");
@@ -300,6 +421,16 @@ export const chapterMerge = {
 		const strategy = input.strategy ?? "merge";
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, source.projectId),
+		});
+		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
+		await prepareSourceBeforeMerge(
+			source,
+			target,
+			gitPath,
+			chapterSettings?.requireReviewBeforeMerge === true,
+		);
 
 		// Collect commit messages and diff stat BEFORE the merge — this is a
 		// read-only operation so it's safe (and desirable) to run outside the lock.

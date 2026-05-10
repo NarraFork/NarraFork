@@ -357,6 +357,13 @@ export const gitService = {
 		return result.stdout;
 	},
 
+	async getRefCommit(repoPath: string, ref: string): Promise<string> {
+		const result = await execRead(["rev-parse", ref], repoPath);
+		if (result.exitCode !== 0)
+			throw new GitError(`Failed to get commit for ${ref}: ${result.stderr}`);
+		return result.stdout;
+	},
+
 	async getCommitsAhead(
 		worktreePath: string,
 		baseBranch: string,

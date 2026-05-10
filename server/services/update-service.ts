@@ -676,7 +676,7 @@ export async function downloadUpdate(
 			if (chain && chain.length > 0) {
 				try {
 					logger.info("Using patch chain", { steps: chain.length });
-					let currentBuf = readFileSync(execPath);
+					let currentBuf: Buffer<ArrayBufferLike> = readFileSync(execPath);
 
 					for (let i = 0; i < chain.length; i++) {
 						const step = chain[i];
@@ -727,7 +727,7 @@ export async function downloadUpdate(
 							zstdCliPath = cli;
 						}
 
-						currentBuf = Buffer.from(applyZstdPatch(currentBuf, patchBuf, meta, zstdCliPath));
+						currentBuf = applyZstdPatch(currentBuf, patchBuf, meta, zstdCliPath);
 					}
 
 					writeFileSync(tempPath, currentBuf);
