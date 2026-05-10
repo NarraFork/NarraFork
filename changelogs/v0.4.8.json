@@ -1,0 +1,6 @@
+{
+	"version": "0.4.8",
+	"date": "2026-05-10",
+	"en": "## Bug Fixes\n\n- Isolate the native file watcher in a worker process with safe polling fallback to keep worktree status updates reliable.\n- Preserve source worktree changes before chapter merges and prevent stale review approvals from being merged.\n- Clear compacting indicators consistently after successful or failed compaction to avoid stuck narrator UI states.",
+	"zh-CN": "## 修复\n\n- 将原生文件监听隔离到独立 worker，并在不可用时安全回退到轮询，提升 worktree 状态更新可靠性。\n- 章节合并前自动保留来源 worktree 变更，并阻止使用过期评审通过结果进行合并。\n- 压缩成功或失败后稳定清理 compacting 状态，避免叙述者界面卡在压缩中。"
+}
