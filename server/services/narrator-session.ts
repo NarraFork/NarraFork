@@ -123,6 +123,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	pruneLocks,
+	resetActiveUpstreamSession,
 } from "./narrator-session-state";
 
 // === Imported from extracted modules ===
@@ -333,6 +334,7 @@ async function createNarrator(
 		abortController,
 		narratorId,
 		conversationId: effectiveConversationId ?? randomUUID(),
+		_resetUpstreamSessionOnNextRequest: effectiveConversationId == null,
 		cwd: narratorCwd,
 		_modelRef: narratorModelRef,
 		_settingsRevision: getSettingsRevision(),
@@ -810,6 +812,7 @@ export async function runAgentLoop(
 
 	try {
 		while (active.alive) {
+			const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
@@ -926,10 +929,6 @@ export async function runAgentLoop(
 					active._pruneBoundaryMessageId = id;
 				},
 				onCompactDone: () => {
-					const s = activeNarrators.get(narratorId);
-					if (s?.alive) {
-						s.conversationId = randomUUID();
-					}
 					compactDoneFlag = true;
 				},
 				isCompactDone: () => compactDoneFlag,
@@ -1026,7 +1025,7 @@ export async function runAgentLoop(
 						const planText = await narratorService.getToolCallPlanText(toolUseId);
 						if (planText) {
 							await runPlanCompact(narratorId, planText);
-							active.conversationId = randomUUID();
+							resetActiveUpstreamSession(narratorId);
 							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 							active._planApprovedContinue = "compact";
 							active.abortController.abort();
@@ -1221,6 +1220,9 @@ export async function runAgentLoop(
 			const resolvedServiceTier =
 				freshNarrator.fastMode && usesCodexApiMode(resolved.provider) ? "priority" : undefined;
 
+			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
+			active._resetUpstreamSessionOnNextRequest = false;
+
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
 				conversationId: active.conversationId,
@@ -1250,6 +1252,7 @@ export async function runAgentLoop(
 				metadata: isAnthropicProvider(resolved.provider)
 					? { user_id: `user_${narratorId}_account__session_${active.conversationId}` }
 					: undefined,
+				resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 				disabledTools: active._disabledTools,
 				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
 					freshNarrator.traits,
@@ -1522,19 +1525,22 @@ export async function runAgentLoop(
 					model: active.model,
 					overflowRetries: contextOverflowRetries,
 					maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
-					onBroadcast(event) {
-						broadcastToNarrator(narratorId, event as Parameters<typeof broadcastToNarrator>[1]);
-					},
+					baselineCompactSeq,
+					onBroadcast: (event) =>
+						broadcastToNarrator(narratorId, event as Parameters<typeof broadcastToNarrator>[1]),
 				});
+
 				contextOverflowRetries = overflow.overflowRetries;
 
 				if (overflow.action === "retry_pruned") {
 					active._pruneBoundaryMessageId = overflow.boundaryMessageId;
+					active._resetUpstreamSessionOnNextRequest = true;
 					transientRetries = 0;
 					continue;
 				}
 				if (overflow.action === "retry_compacted") {
 					active.conversationId = overflow.newConversationId;
+					active._resetUpstreamSessionOnNextRequest = true;
 					transientRetries = 0;
 					continue;
 				}
@@ -1874,20 +1880,14 @@ export async function runAgentLoop(
 						// Fire-and-forget: compact runs in the background.
 						// On completion it resets the narrator's conversationId so the next
 						// agent loop iteration starts a fresh API conversation.
-						runCustomCompact(narratorId, locale, boundaryMessageId)
-							.then((compacted) => {
-								if (!compacted) return;
-								const current = activeNarrators.get(narratorId);
-								if (current?.alive) {
-									current.conversationId = randomUUID();
-								}
-							})
-							.catch((compactErr) => {
+						runCustomCompact(narratorId, locale, boundaryMessageId, { mode: "background" }).catch(
+							(compactErr) => {
 								logger.error("Auto-compact failed", {
 									narratorId,
 									error: String(compactErr),
 								});
-							});
+							},
+						);
 					} else {
 						logger.info("Context usage high but not enough messages to compact", {
 							narratorId,
@@ -3715,6 +3715,22 @@ export async function recoverOnStartup(): Promise<void> {
 		});
 	}
 
+	const transientCompactRows = await db.query.narrators.findMany({
+		columns: { id: true, substatus: true },
+	});
+	for (const row of transientCompactRows) {
+		const current = parseSubstatus(row.substatus);
+		const next = current.filter((tag) => tag !== "compacting" && tag !== "background_compacting");
+		if (next.length !== current.length) {
+			await narratorService.updateSubstatus(row.id, next).catch((err) => {
+				logger.warn("Failed to clear stale compact substatus on startup", {
+					narratorId: row.id,
+					error: String(err),
+				});
+			});
+		}
+	}
+
 	// Recover persisted buffered messages into the in-memory Map.
 	// These survive server restarts so users don't lose queued messages.
 	const bufferedRows = db
@@ -3859,6 +3875,7 @@ export {
 export {
 	compactLocks,
 	isCompactInProgress,
+	markCompactAsBlocking,
 	pruneLocks,
 	pruneToolCalls,
 	runCustomCompact,

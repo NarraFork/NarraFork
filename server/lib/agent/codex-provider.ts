@@ -473,6 +473,7 @@ export class CodexProvider implements ProviderAdapter {
 					model: params.model,
 					request,
 					signal: params.signal,
+					resetSessionBeforeRequest: params.resetUpstreamSession,
 				})) {
 					hasStreamedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 					yield { ...event, credentialId: ctx.id };

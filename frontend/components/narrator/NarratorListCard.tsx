@@ -33,6 +33,8 @@ const ATTENTION_TAGS = [
 	"suspended",
 	"manual_override",
 	"reflecting",
+	"compacting",
+	"background_compacting",
 ] as const;
 
 const MAX_NARRATOR_LIST_TITLE_CHARS = 500;

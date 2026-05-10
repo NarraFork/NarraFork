@@ -255,7 +255,7 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("idle"),
-		/** JSON array of substatus tags (e.g. ["reasoning","compacting"]) */
+		/** JSON array of substatus tags (e.g. ["reasoning","compacting","background_compacting"]) */
 		substatus: text("substatus").notNull().default("[]"),
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),

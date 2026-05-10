@@ -1,9 +1,8 @@
 /**
- * Zstd dictionary-based patch generation/application
- * for efficient delta updates.
+ * Zstd patch generation/application for efficient delta updates.
  */
 import { createHash } from "node:crypto";
-import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
+import { zstdDecompressSync } from "node:zlib";
 
 /** Default block size: 64KB (same as electron-builder) */
 export const DEFAULT_BLOCK_SIZE = 64 * 1024;
@@ -27,7 +26,7 @@ export interface ZstdPatchMeta {
 	newFileSize: number;
 	/** SHA512 of the complete new binary (base64) */
 	newFileSha512: string;
-	/** Patch mode: "patch-from" uses zstd CLI long-range matching, "dictionary" uses Bun zstd API */
+	/** Patch mode: new patches use zstd CLI `--patch-from`; dictionary is legacy-only. */
 	mode?: "patch-from" | "dictionary";
 }
 
@@ -57,9 +56,9 @@ export function findStableEnd(
 /**
  * Generate a zstd patch from old → new binary.
  *
- * Tries two strategies:
- * 1. zstd CLI `--patch-from` (best compression via long-range matching, ~276KB for 134MB)
- * 2. Bun zstd dictionary API (fallback, larger patches but no external dependency)
+ * Only zstd CLI `--patch-from` is accepted for newly generated patches. The
+ * older Bun dictionary fallback produced very large patches and hid real zstd
+ * failures, so failures now surface to the release log instead.
  */
 export function generateZstdPatch(
 	oldBuf: Buffer,
@@ -68,65 +67,32 @@ export function generateZstdPatch(
 ): { patch: Buffer; meta: ZstdPatchMeta } {
 	const level = opts.level ?? 19;
 	const newFileSha512 = createHash("sha512").update(newBuf).digest("base64");
-
-	// Try CLI --patch-from first (much better compression)
-	const cliPatch = tryZstdCliPatchFrom(oldBuf, newBuf, level);
-	if (cliPatch) {
-		const meta: ZstdPatchMeta = {
-			fromVersion: opts.fromVersion,
-			toVersion: opts.toVersion,
-			stableEnd: 0,
-			newTailSize: newBuf.length,
-			patchSize: cliPatch.length,
-			newFileSize: newBuf.length,
-			newFileSha512,
-			mode: "patch-from",
-		};
-		return { patch: cliPatch, meta };
-	}
-
-	// Fallback: Bun dictionary mode
-	const stableEnd = findStableEnd(oldBuf, newBuf);
-	const oldTail = oldBuf.subarray(stableEnd);
-	const newTail = newBuf.subarray(stableEnd);
-
-	const patch =
-		oldTail.length > 0
-			? zstdCompressSync(newTail, { dictionary: oldTail, level } as Parameters<
-					typeof zstdCompressSync
-				>[1])
-			: zstdCompressSync(newTail, { level } as Parameters<typeof zstdCompressSync>[1]);
-
+	const patch = tryZstdCliPatchFrom(oldBuf, newBuf, level);
 	const meta: ZstdPatchMeta = {
 		fromVersion: opts.fromVersion,
 		toVersion: opts.toVersion,
-		stableEnd,
-		newTailSize: newTail.length,
+		stableEnd: 0,
+		newTailSize: newBuf.length,
 		patchSize: patch.length,
 		newFileSize: newBuf.length,
 		newFileSha512,
-		mode: "dictionary",
+		mode: "patch-from",
 	};
-
 	return { patch, meta };
 }
 
-/**
- * Try generating a patch using zstd CLI --patch-from.
- * Returns null if zstd CLI is not available.
- */
-function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buffer | null {
+/** Generate a patch using zstd CLI --patch-from, or throw with diagnostic output. */
+function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buffer {
+	const { tmpdir } = require("node:os");
+	const { join } = require("node:path");
+	const { writeFileSync, readFileSync, unlinkSync } = require("node:fs");
+	const tmp = tmpdir();
+	const id = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+	const oldPath = join(tmp, `nf-zstd-old-${id}`);
+	const newPath = join(tmp, `nf-zstd-new-${id}`);
+	const patchPath = join(tmp, `nf-zstd-patch-${id}.zst`);
+
 	try {
-		const { tmpdir } = require("node:os");
-		const { join } = require("node:path");
-		const { writeFileSync, readFileSync, unlinkSync } = require("node:fs");
-
-		const tmp = tmpdir();
-		const id = Date.now().toString(36);
-		const oldPath = join(tmp, `nf-zstd-old-${id}`);
-		const newPath = join(tmp, `nf-zstd-new-${id}`);
-		const patchPath = join(tmp, `nf-zstd-patch-${id}.zst`);
-
 		writeFileSync(oldPath, oldBuf);
 		writeFileSync(newPath, newBuf);
 
@@ -144,29 +110,45 @@ function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buf
 			{ stdout: "pipe", stderr: "pipe" },
 		);
 
-		// Cleanup temp files
-		try {
-			unlinkSync(oldPath);
-		} catch {}
-		try {
-			unlinkSync(newPath);
-		} catch {}
-
 		if (result.exitCode !== 0) {
-			try {
-				unlinkSync(patchPath);
-			} catch {}
-			return null;
+			throw new Error(
+				`zstd --patch-from failed with exit code ${result.exitCode}: ${formatProcessOutput(
+					result.stdout,
+					result.stderr,
+				)}`,
+			);
 		}
 
-		const patch = readFileSync(patchPath);
-		try {
-			unlinkSync(patchPath);
-		} catch {}
-		return patch;
-	} catch {
-		return null;
+		return readFileSync(patchPath);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("zstd --patch-from failed")) {
+			throw error;
+		}
+		throw new Error(`zstd --patch-from failed before completion: ${String(error)}`);
+	} finally {
+		for (const path of [oldPath, newPath, patchPath]) {
+			try {
+				unlinkSync(path);
+			} catch {
+				// Best effort temp-file cleanup.
+			}
+		}
 	}
+}
+
+function formatProcessOutput(stdout: Uint8Array, stderr: Uint8Array): string {
+	const decoder = new TextDecoder();
+	const parts = [
+		["stderr", decoder.decode(stderr).trim()],
+		["stdout", decoder.decode(stdout).trim()],
+	]
+		.filter(([, value]) => value)
+		.map(([label, value]) => `${label}: ${truncateForLog(value)}`);
+	return parts.length > 0 ? parts.join("; ") : "no output";
+}
+
+function truncateForLog(value: string, maxLength = 4000): string {
+	return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
 }
 
 /**

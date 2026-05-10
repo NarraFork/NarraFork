@@ -585,7 +585,7 @@ export const narratorMessageQueries = {
 		});
 	},
 
-	async getMessagesSinceLastCompact(narratorId: string) {
+	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
 		const lastCompactRow = await db
 			.select({ seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
@@ -594,8 +594,11 @@ export const narratorMessageQueries = {
 			)
 			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
 			.limit(1);
+		return lastCompactRow[0]?.seq ?? null;
+	},
 
-		const compactSeq = lastCompactRow[0]?.seq;
+	async getMessagesSinceLastCompact(narratorId: string) {
+		const compactSeq = await this.getLatestCompactSeq(narratorId);
 
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })

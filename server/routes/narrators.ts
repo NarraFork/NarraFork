@@ -174,7 +174,11 @@ import {
 	updateNarratorPermissionMode,
 	updateNarratorReasoningEffort,
 } from "../services/narrator-session";
-import { activeNarrators, planModeAskedOnce } from "../services/narrator-session-state";
+import {
+	activeNarrators,
+	planModeAskedOnce,
+	resetActiveUpstreamSession,
+} from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
 import { usageHistoryService } from "../services/usage-history-service";
@@ -1294,6 +1298,7 @@ narratorRoutes.post("/:id/clear-context", async (c) => {
 	const narratorId = c.req.param("id");
 	await narratorService.getById(narratorId);
 	const msg = await narratorService.clearContext(narratorId);
+	resetActiveUpstreamSession(narratorId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true });

@@ -87,6 +87,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	model: string;
 	request: CodexResponsesRequestBody;
 	signal: AbortSignal;
+	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
+	resetSessionBeforeRequest?: boolean;
 	turnMetadata?: string;
 }
 
@@ -674,6 +676,9 @@ export async function* streamCodexResponsesWebSocket(
 	};
 
 	try {
+		if (options.resetSessionBeforeRequest) {
+			await resetSession(session, false);
+		}
 		const websocketRequest = buildCodexResponsesWebSocketRequest(
 			request,
 			session.lastRequest,

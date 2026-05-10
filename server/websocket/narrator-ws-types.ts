@@ -185,14 +185,20 @@ export type NarratorServerMessage =
 			dangerReflectionOverride?: "inherit" | "on" | "off";
 	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
-	| { type: "compacting"; narratorId: string }
+	| { type: "compacting"; narratorId: string; mode?: "blocking" | "background" }
 	| {
 			type: "compact_done";
 			narratorId: string;
 			contextPercentAfter?: number;
 			isSegment?: boolean;
+			mode?: "blocking" | "background";
 	  }
-	| { type: "compact_failed"; narratorId: string; messageId: string }
+	| {
+			type: "compact_failed";
+			narratorId: string;
+			messageId: string;
+			mode?: "blocking" | "background";
+	  }
 	| { type: "segment_compact_hide"; narratorId: string; hiddenMessageIds: string[] }
 	| {
 			type: "context_usage";

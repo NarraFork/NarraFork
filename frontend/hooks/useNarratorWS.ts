@@ -121,8 +121,12 @@ interface NarratorWSCallbacks {
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off";
 	}) => void;
-	onCompacting?: () => void;
-	onCompactDone?: (contextPercentAfter?: number, isSegment?: boolean) => void;
+	onCompacting?: (mode?: "blocking" | "background") => void;
+	onCompactDone?: (
+		contextPercentAfter?: number,
+		isSegment?: boolean,
+		mode?: "blocking" | "background",
+	) => void;
 	onSegmentCompactHide?: (hiddenMessageIds: string[]) => void;
 	onContextUsage?: (
 		percentage: number,
@@ -554,13 +558,16 @@ export function useNarratorWS(
 						});
 						break;
 					case "compacting":
-						callbacksRef.current.onCompacting?.();
+						callbacksRef.current.onCompacting?.(
+							data.mode === "background" ? "background" : "blocking",
+						);
 						break;
 					case "compact_done":
 					case "compact_failed":
 						callbacksRef.current.onCompactDone?.(
 							data.contextPercentAfter as number | undefined,
 							data.isSegment as boolean | undefined,
+							data.mode === "background" ? "background" : "blocking",
 						);
 						break;
 					case "segment_compact_hide":

@@ -16,6 +16,8 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 86_400_000;
 const BACKGROUND_TIMEOUT_MS = 1_800_000; // 30 minutes max for background tasks
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10 MB max in-memory output (foreground & background)
+const LIVE_OUTPUT_INTERVAL_MS = 250;
+const LIVE_OUTPUT_MAX_CHARS = 100_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
@@ -283,7 +285,33 @@ export const bashTool: ToolDefinition = {
 			// Use StringDecoder to handle multi-byte UTF-8 characters split across chunks.
 			let outputBytes = 0;
 			let outputTruncated = false;
+			let lastLiveEmitAt = 0;
+			let pendingLiveEmit = false;
+			let liveEmitTimer: ReturnType<typeof setTimeout> | null = null;
 			const decoder = new StringDecoder("utf-8");
+			const getLiveOutputPreview = () =>
+				output.length > LIVE_OUTPUT_MAX_CHARS
+					? `...${output.length - LIVE_OUTPUT_MAX_CHARS} chars omitted...\n${output.slice(-LIVE_OUTPUT_MAX_CHARS)}`
+					: output;
+			const flushLiveOutput = () => {
+				if (liveEmitTimer) {
+					clearTimeout(liveEmitTimer);
+					liveEmitTimer = null;
+				}
+				pendingLiveEmit = false;
+				lastLiveEmitAt = Date.now();
+				ctx.emitOutput?.(getLiveOutputPreview());
+			};
+			const scheduleLiveOutput = (force = false) => {
+				if (!ctx.emitOutput) return;
+				if (force || Date.now() - lastLiveEmitAt >= LIVE_OUTPUT_INTERVAL_MS) {
+					flushLiveOutput();
+					return;
+				}
+				if (pendingLiveEmit) return;
+				pendingLiveEmit = true;
+				liveEmitTimer = setTimeout(flushLiveOutput, LIVE_OUTPUT_INTERVAL_MS);
+			};
 			const append = (chunk: Buffer) => {
 				if (outputTruncated) return;
 				outputBytes += chunk.byteLength;
@@ -292,11 +320,11 @@ export const bashTool: ToolDefinition = {
 					output +=
 						"\n\n<bash_metadata>\nOutput truncated at 10MB in-memory limit\n</bash_metadata>";
 					outputTruncated = true;
-					ctx.emitOutput?.(output);
+					scheduleLiveOutput(true);
 					return;
 				}
 				output += decoder.write(chunk);
-				ctx.emitOutput?.(output);
+				scheduleLiveOutput();
 			};
 			proc.stdout?.on("data", append);
 			proc.stderr?.on("data", append);
@@ -405,6 +433,9 @@ export const bashTool: ToolDefinition = {
 				clearInterval(watchdogTimer);
 				ctx.signal.removeEventListener("abort", abortHandler);
 			}
+
+			// Flush any pending live output before sending the final tool result.
+			if (pendingLiveEmit || output) flushLiveOutput();
 
 			// Capture the effective timeout (may have been updated mid-execution)
 			const effectiveTimeout = toolUseId

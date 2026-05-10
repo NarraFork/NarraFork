@@ -38,7 +38,6 @@ import {
 	type DatabaseCleanupPreviewResult,
 	type DatabaseCleanupTarget,
 	type DatabaseStorageBreakdown,
-	type DatabaseVacuumResult,
 	type StorageCategoryResult,
 	type StorageScanResult,
 	scanStorageStream,
@@ -145,7 +144,6 @@ export function StorageSection() {
 	const [databasePreviewLoading, setDatabasePreviewLoading] = useState(false);
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
 	const [databaseCleaning, setDatabaseCleaning] = useState(false);
-	const [databaseVacuuming, setDatabaseVacuuming] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
 
 	const { data: settingsData } = useQuery({
@@ -343,31 +341,6 @@ export function StorageSection() {
 		}
 	};
 
-	const handleDatabaseVacuum = async () => {
-		if (!(await confirm({ message: t("storageDatabaseVacuumConfirm") }))) return;
-		setDatabaseVacuuming(true);
-		try {
-			const result: DatabaseVacuumResult = await api.vacuumDatabase();
-			notifications.show({
-				color: result.freedBytes > 0 ? "green" : "blue",
-				message: t("storageDatabaseVacuumSuccess", {
-					size: formatBytes(result.freedBytes),
-					freeBefore: formatBytes(result.freelistBeforeBytes),
-					duration: (result.durationMs / 1000).toFixed(1),
-				}),
-			});
-			void handleScan();
-		} catch (err) {
-			console.error("Database VACUUM failed:", err);
-			notifications.show({
-				color: "red",
-				message: t("storageDatabaseVacuumFailed"),
-			});
-		} finally {
-			setDatabaseVacuuming(false);
-		}
-	};
-
 	const getCategory = (key: string): StorageCategoryResult | undefined =>
 		scanResult?.categories.find((c) => c.key === key);
 
@@ -407,9 +380,6 @@ export function StorageSection() {
 
 	const databaseCategory = getCategory("database");
 	const databaseDetails = getDatabaseBreakdown(databaseCategory);
-	const databaseUnreleasedBytes =
-		(databaseDetails?.freelistBytes ?? 0) + (databaseDetails?.walBytes ?? 0);
-	const canVacuumDatabase = Boolean(databaseDetails) && databaseUnreleasedBytes > 0;
 	const databaseUsageCategories =
 		databaseDetails?.categories?.filter((category) => category.totalBytes > 0) ?? [];
 	const databaseTopTables =
@@ -567,16 +537,13 @@ export function StorageSection() {
 																		)}
 																	</Badge>
 																)}
-																<Button
-																	size="xs"
-																	variant="light"
-																	color="orange"
-																	loading={databaseVacuuming}
-																	disabled={!canVacuumDatabase || scanning}
-																	onClick={handleDatabaseVacuum}
-																>
-																	{t("storageDatabaseVacuum")}
-																</Button>
+																<Tooltip label={t("storageDatabaseVacuumDisabled")}>
+																	<span>
+																		<Button size="xs" variant="light" color="orange" disabled>
+																			{t("storageDatabaseVacuum")}
+																		</Button>
+																	</span>
+																</Tooltip>
 															</Group>
 														</Group>
 

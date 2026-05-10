@@ -1329,6 +1329,7 @@ export const narratorService = {
 	getMessages: narratorMessageQueries.getMessages.bind(narratorMessageQueries),
 	getMessagesSinceLastCompact:
 		narratorMessageQueries.getMessagesSinceLastCompact.bind(narratorMessageQueries),
+	getLatestCompactSeq: narratorMessageQueries.getLatestCompactSeq.bind(narratorMessageQueries),
 	getMessagesBefore: narratorMessageQueries.getMessagesBefore.bind(narratorMessageQueries),
 	getEarliestMessages: narratorMessageQueries.getEarliestMessages.bind(narratorMessageQueries),
 	_getPostCompactTopLevelRefs:

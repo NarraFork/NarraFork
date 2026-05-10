@@ -907,6 +907,7 @@
 	"storageDatabaseUsageFreeStats": "SQLite pages that are reusable but not yet returned to the filesystem",
 	"storageDatabaseTopTables": "Largest tables: {{tables}}",
 	"storageDatabaseVacuum": "Release unused space",
+	"storageDatabaseVacuumDisabled": "Synchronous SQLite VACUUM is disabled to avoid freezing the backend. Database compaction must be run as a background maintenance job.",
 	"storageDatabaseVacuumConfirm": "This will run SQLite VACUUM to compact the database and return free pages to the filesystem. It may take a while and temporarily need extra disk space. Continue?",
 	"storageDatabaseVacuumSuccess": "Database compaction completed, freed {{size}} (previous free pages {{freeBefore}}, {{duration}}s)",
 	"storageDatabaseVacuumFailed": "Database compaction failed",

@@ -179,6 +179,12 @@ export interface ChatParams {
 	/** Optional collector for persisting raw provider request/response dumps. */
 	requestDump?: ApiRequestDumpCollector;
 	/**
+	 * Reset any reusable upstream transport state before this request. Used when the
+	 * agent loop rebuilt history (e.g. after compact) so WebSocket/previous-response
+	 * chains do not continue from stale context.
+	 */
+	resetUpstreamSession?: boolean;
+	/**
 	 * Called after the provider has successfully assembled a concrete request and is
 	 * about to hand it to the upstream transport.  The agent loop uses this marker
 	 * to distinguish a real empty upstream response from local request preparation

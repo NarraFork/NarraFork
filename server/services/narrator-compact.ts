@@ -1,6 +1,6 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narrators } from "../db/schema";
+import { narratorMessages, narrators } from "../db/schema";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { getAutoCompactKeepPairs } from "../lib/settings";
@@ -8,21 +8,67 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorContext } from "./narrator-context";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
-import type { CompactLock, CompactLockResult } from "./narrator-session-state";
-import { activeNarrators, compactLocks, pruneLocks } from "./narrator-session-state";
+import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
+import {
+	activeNarrators,
+	compactLocks,
+	pruneLocks,
+	resetActiveUpstreamSession,
+} from "./narrator-session-state";
 
 /** Compact operation timeout in milliseconds (5 minutes). */
 const COMPACT_TIMEOUT_MS = 5 * 60 * 1000;
 const COMPACT_FAILURE_TEXT = "[Compact Failed]";
 const COMPACTING_SUBSTATUS = "compacting";
+const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
 
-async function setCompactingSubstatus(narratorId: string, enabled: boolean) {
-	const updated = enabled
-		? await narratorService.addSubstatus(narratorId, COMPACTING_SUBSTATUS)
-		: await narratorService.removeSubstatus(narratorId, COMPACTING_SUBSTATUS);
+function compactSubstatusForMode(mode: CompactMode): string {
+	return mode === "background" ? BACKGROUND_COMPACTING_SUBSTATUS : COMPACTING_SUBSTATUS;
+}
+
+function syncActiveSubstatus(narratorId: string, substatus: string[]) {
 	const active = activeNarrators.get(narratorId);
 	if (active?.alive) {
-		active._substatus = new Set(updated);
+		active._substatus = new Set(substatus);
+	}
+}
+
+async function setCompactingSubstatus(narratorId: string, mode: CompactMode, enabled: boolean) {
+	const target = compactSubstatusForMode(mode);
+	const other = mode === "background" ? COMPACTING_SUBSTATUS : BACKGROUND_COMPACTING_SUBSTATUS;
+	let updated: string[];
+	if (enabled) {
+		updated = await narratorService.removeSubstatus(narratorId, other);
+		updated = await narratorService.addSubstatus(narratorId, target);
+	} else {
+		// Remove both tags so a background compact that later becomes blocking
+		// cannot leave either transient state behind after completion/failure.
+		updated = await narratorService.removeSubstatus(narratorId, target);
+		updated = await narratorService.removeSubstatus(narratorId, other);
+	}
+	syncActiveSubstatus(narratorId, updated);
+}
+
+function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): CompactMode {
+	const existing = compactLocks.get(narratorId);
+	return existing && existing.kind !== "segment" && existing.mode ? existing.mode : fallback;
+}
+
+export async function markCompactAsBlocking(narratorId: string) {
+	await setCompactingSubstatus(narratorId, "blocking", true);
+	try {
+		await db
+			.update(narratorMessages)
+			.set({ contentJson: [{ type: "compact", status: "compacting", mode: "blocking" }] })
+			.where(
+				and(
+					eq(narratorMessages.narratorId, narratorId),
+					eq(narratorMessages.role, "system"),
+					eq(narratorMessages.contentText, "[Compacting]"),
+				),
+			);
+	} catch (err) {
+		logger.warn("Failed to update compact marker mode", { narratorId, error: String(err) });
 	}
 }
 
@@ -75,13 +121,14 @@ export function triggerMidTurnCompact(
 	narratorId: string,
 	locale: Locale,
 	onCompactDone?: () => void,
+	mode: CompactMode = "background",
 ): void {
 	if (compactLocks.has(narratorId)) {
 		logger.debug("Compact already in progress, skipping mid-turn trigger", { narratorId });
 		return;
 	}
 
-	logger.info("Context usage high, triggering compact (mid-turn)", { narratorId });
+	logger.info("Context usage high, triggering compact (mid-turn)", { narratorId, mode });
 	let compactLock!: CompactLock;
 	const compactPromise: Promise<CompactLockResult> = (async () => {
 		const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
@@ -90,7 +137,7 @@ export function triggerMidTurnCompact(
 		);
 		if (!boundaryMessageId) {
 			logger.debug("No compact boundary found, aborting mid-turn compact", { narratorId });
-			return { kind: "history_probe", compacted: false };
+			return { kind: "history_probe", compacted: false, mode };
 		}
 
 		// Release this wrapper lock before delegating to runCustomCompact(), which
@@ -99,18 +146,22 @@ export function triggerMidTurnCompact(
 		if (compactLocks.get(narratorId) === compactLock) {
 			compactLocks.delete(narratorId);
 		}
+		const effectiveMode = compactLock.mode ?? mode;
 		logger.info("Starting runCustomCompact", {
 			narratorId,
 			boundaryMessageId,
 			hasLock: compactLocks.has(narratorId),
+			mode: effectiveMode,
 		});
-		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId);
+		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
+			mode: effectiveMode,
+		});
 		if (compacted) {
 			onCompactDone?.();
 		}
-		return { kind: "history_probe", compacted };
+		return { kind: "history_probe", compacted, mode: effectiveMode };
 	})();
-	compactLock = { kind: "history_probe", promise: compactPromise };
+	compactLock = { kind: "history_probe", promise: compactPromise, mode };
 	compactLocks.set(narratorId, compactLock);
 	compactPromise
 		.catch((err) => {
@@ -133,7 +184,9 @@ export async function runCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
+	options?: { mode?: CompactMode },
 ): Promise<boolean> {
+	const mode = options?.mode ?? "blocking";
 	while (true) {
 		const existing = compactLocks.get(narratorId);
 		if (!existing) break;
@@ -141,7 +194,18 @@ export async function runCustomCompact(
 		logger.info("Compact already in progress, waiting for it to finish", {
 			narratorId,
 			kind: existing.kind,
+			mode: existing.mode,
+			requestedMode: mode,
 		});
+		if (mode === "blocking" && existing.mode === "background" && existing.kind !== "segment") {
+			await markCompactAsBlocking(narratorId).catch((err) => {
+				logger.warn("Failed to mark background compact as blocking", {
+					narratorId,
+					error: String(err),
+				});
+			});
+			existing.mode = "blocking";
+		}
 		let result: CompactLockResult;
 		try {
 			result = await existing.promise;
@@ -158,7 +222,11 @@ export async function runCustomCompact(
 		}
 
 		if (existing.kind !== "segment" && result.compacted) {
-			broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+			broadcastToNarrator(narratorId, {
+				type: "compact_done",
+				narratorId,
+				mode: existing.mode ?? result.mode ?? mode,
+			});
 			return true;
 		}
 
@@ -171,9 +239,10 @@ export async function runCustomCompact(
 
 	let compactTimer: ReturnType<typeof setTimeout>;
 	const compactPromise: Promise<CompactLockResult> = Promise.race([
-		doRunCustomCompact(narratorId, locale, beforeMessageId).then((compacted) => ({
+		doRunCustomCompact(narratorId, locale, beforeMessageId, mode).then((compacted) => ({
 			kind: "history" as const,
 			compacted,
+			mode: currentHistoryCompactMode(narratorId, mode),
 		})),
 		new Promise<CompactLockResult>((_, reject) => {
 			compactTimer = setTimeout(
@@ -182,7 +251,7 @@ export async function runCustomCompact(
 			);
 		}),
 	]);
-	const compactLock: CompactLock = { kind: "history", promise: compactPromise };
+	const compactLock: CompactLock = { kind: "history", promise: compactPromise, mode };
 	compactLocks.set(narratorId, compactLock);
 	try {
 		const result = await compactPromise;
@@ -205,9 +274,10 @@ export async function runCustomCompact(
 async function doRunCustomCompact(
 	narratorId: string,
 	locale: Locale,
-	beforeMessageId?: string,
+	beforeMessageId: string | undefined,
+	mode: CompactMode,
 ): Promise<boolean> {
-	logger.info("Starting custom compact", { narratorId, beforeMessageId });
+	logger.info("Starting custom compact", { narratorId, beforeMessageId, mode });
 
 	const messages = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
@@ -218,10 +288,14 @@ async function doRunCustomCompact(
 		return false;
 	}
 
-	const compactingMsg = await narratorService.persistCompactingMessage(narratorId, beforeMessageId);
+	const compactingMsg = await narratorService.persistCompactingMessage(
+		narratorId,
+		beforeMessageId,
+		mode,
+	);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: compactingMsg });
-	await setCompactingSubstatus(narratorId, true);
-	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
+	await setCompactingSubstatus(narratorId, mode, true);
+	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -238,14 +312,17 @@ async function doRunCustomCompact(
 			pruneBoundaryMessageId,
 		);
 
+		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
 		const compactedMsg = await narratorService.finalizeCompactingMessage(
 			compactingMsg.id,
 			narratorId,
 			summary,
 			contextPercent,
+			{ mode: finalizeMode },
 		);
 
 		await narratorService.clearPruneBoundary(narratorId);
+		resetActiveUpstreamSession(narratorId);
 
 		let contextPercentAfter = contextPercent;
 		if (compactedMsg) {
@@ -258,7 +335,7 @@ async function doRunCustomCompact(
 		// completion while the transient substatus still says compacting. This is
 		// UI-state cleanup only, so failure must not turn a completed compact into
 		// a failed compact.
-		await setCompactingSubstatus(narratorId, false).catch((err) => {
+		await setCompactingSubstatus(narratorId, finalizeMode, false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus before compact_done", {
 				narratorId,
 				error: String(err),
@@ -269,6 +346,7 @@ async function doRunCustomCompact(
 			type: "compact_done",
 			narratorId,
 			contextPercentAfter,
+			mode: finalizeMode,
 		});
 		return true;
 	} catch (err) {
@@ -279,11 +357,13 @@ async function doRunCustomCompact(
 			error: errorMsg,
 		});
 
+		const failureMode = currentHistoryCompactMode(narratorId, mode);
 		const failedSummary = `${COMPACT_FAILURE_TEXT}\n${errorMsg}`;
 		const failedMsg = await narratorService
 			.finalizeCompactingMessage(compactingMsg.id, narratorId, failedSummary, undefined, {
 				status: "failed",
 				error: errorMsg,
+				mode: failureMode,
 			})
 			.catch((e) => {
 				logger.error("Failed to finalize failed compact marker", {
@@ -298,23 +378,25 @@ async function doRunCustomCompact(
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
 		}
 
-		await narratorService.clearPruneBoundary(narratorId).catch(() => {});
-		// Only override status for primary narrators — subagent status is
-		// managed by finalizeSubagent; overwriting it here would race.
-		if (!isSubagent) {
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: `Compact failed: ${errorMsg}`,
-			});
+		if (failureMode === "blocking") {
+			await narratorService.clearPruneBoundary(narratorId).catch(() => {});
+			// Only override status for primary narrators — subagent status is
+			// managed by finalizeSubagent; overwriting it here would race.
+			if (!isSubagent) {
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["error"],
+					errorMessage: `Compact failed: ${errorMsg}`,
+				});
+			}
+			// activeNarrators only tracks primary narrators; subagents are not
+			// registered there, so this abort is a no-op for them (which is fine —
+			// the subagent's own signal is managed by executeSubagent).
+			const active = activeNarrators.get(narratorId);
+			if (active?.alive) {
+				active.abortController.abort();
+			}
 		}
-		// activeNarrators only tracks primary narrators; subagents are not
-		// registered there, so this abort is a no-op for them (which is fine —
-		// the subagent's own signal is managed by executeSubagent).
-		const active = activeNarrators.get(narratorId);
-		if (active?.alive) {
-			active.abortController.abort();
-		}
-		await setCompactingSubstatus(narratorId, false).catch((err) => {
+		await setCompactingSubstatus(narratorId, failureMode, false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus after failed custom compact", {
 				narratorId,
 				error: String(err),
@@ -324,10 +406,15 @@ async function doRunCustomCompact(
 			type: "compact_failed",
 			narratorId,
 			messageId: compactingMsg.id,
+			mode: failureMode,
 		});
 		throw err;
 	} finally {
-		await setCompactingSubstatus(narratorId, false).catch((err) => {
+		await setCompactingSubstatus(
+			narratorId,
+			currentHistoryCompactMode(narratorId, mode),
+			false,
+		).catch((err) => {
 			logger.warn("Failed to clear compacting substatus after custom compact", {
 				narratorId,
 				error: String(err),
@@ -346,7 +433,13 @@ export async function runSegmentCompact(
 	const existing = compactLocks.get(narratorId);
 	if (existing) {
 		await existing.promise.catch(() => {});
-		broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
+		broadcastToNarrator(narratorId, {
+			type: "compact_done",
+			narratorId,
+			isSegment: true,
+			mode: "blocking",
+		});
+
 		return;
 	}
 
@@ -355,6 +448,7 @@ export async function runSegmentCompact(
 		doRunSegmentCompact(narratorId, locale, messageIds).then((compacted) => ({
 			kind: "segment" as const,
 			compacted,
+			mode: "blocking" as const,
 		})),
 		new Promise<CompactLockResult>((_, reject) => {
 			timer = setTimeout(
@@ -363,7 +457,7 @@ export async function runSegmentCompact(
 			);
 		}),
 	]);
-	const lock: CompactLock = { kind: "segment", promise };
+	const lock: CompactLock = { kind: "segment", promise, mode: "blocking" };
 	compactLocks.set(narratorId, lock);
 	try {
 		await promise;
@@ -392,21 +486,27 @@ async function doRunSegmentCompact(
 	const { message: markerMsg, hiddenMessageIds } =
 		await narratorService.persistSegmentCompactMarker(narratorId, messageIds);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: markerMsg });
-	await setCompactingSubstatus(narratorId, true);
+	await setCompactingSubstatus(narratorId, "blocking", true);
 	broadcastToNarrator(narratorId, {
 		type: "segment_compact_hide",
 		narratorId,
 		hiddenMessageIds,
 	});
-	broadcastToNarrator(narratorId, { type: "compacting", narratorId });
+	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
 
 	try {
 		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
 
 		if (messages.length === 0) {
 			await narratorService.deleteSegmentCompact(narratorId, markerMsg.id);
-			await setCompactingSubstatus(narratorId, false);
-			broadcastToNarrator(narratorId, { type: "compact_done", narratorId, isSegment: true });
+			await setCompactingSubstatus(narratorId, "blocking", false);
+			broadcastToNarrator(narratorId, {
+				type: "compact_done",
+				narratorId,
+				isSegment: true,
+				mode: "blocking",
+			});
+
 			return false;
 		}
 
@@ -436,7 +536,7 @@ async function doRunSegmentCompact(
 			messageCount: messageIds.length,
 			summaryLength: summary.length,
 		});
-		await setCompactingSubstatus(narratorId, false).catch((err) => {
+		await setCompactingSubstatus(narratorId, "blocking", false).catch((err) => {
 			logger.warn("Failed to clear compacting substatus before segment compact_done", {
 				narratorId,
 				error: String(err),
@@ -447,6 +547,7 @@ async function doRunSegmentCompact(
 			narratorId,
 			contextPercentAfter,
 			isSegment: true,
+			mode: "blocking",
 		});
 		return true;
 	} catch (err) {
@@ -476,11 +577,12 @@ async function doRunSegmentCompact(
 			broadcastToNarrator(narratorId, { type: "message", narratorId, message: failedMsg });
 		}
 
-		await setCompactingSubstatus(narratorId, false).catch(() => {});
+		await setCompactingSubstatus(narratorId, "blocking", false).catch(() => {});
 		broadcastToNarrator(narratorId, {
 			type: "compact_failed",
 			narratorId,
 			messageId: markerMsg.id,
+			mode: "blocking",
 		});
 		throw err;
 	}

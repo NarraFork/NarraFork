@@ -337,6 +337,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let pruneBoundaryId: string | null = null;
 	let needsRestart = false;
 	let currentConversationId = randomUUID();
+	let resetUpstreamSessionOnNextRequest = false;
 	let contextLengthExceeded = false;
 	let overflowRetries = 0;
 
@@ -372,6 +373,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		onCompactDone: () => {
 			needsRestart = true;
 			currentConversationId = randomUUID();
+			resetUpstreamSessionOnNextRequest = true;
 			compactDoneFlag = true;
 		},
 		isCompactDone: () => compactDoneFlag,
@@ -438,6 +440,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const resolvedServiceTier =
 			narratorFastMode && usesCodexApiMode(resolvedProvider) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
+		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
+		resetUpstreamSessionOnNextRequest = false;
 		const config: AgentConfig = {
 			narratorId,
 			conversationId: currentConversationId,
@@ -457,6 +461,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			metadata: isAnthropicProvider(resolvedProvider)
 				? { user_id: `user_${narratorId}_account__session_${currentConversationId}` }
 				: undefined,
+			resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 			disabledTools,
 			toolFilter,
 			permissionHandler: (toolName, permInput, permToolUseId) =>
@@ -562,6 +567,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		needsRestart = false;
 		compactConsumedInLoop = false;
 
+		const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
 		const result = await executeAgentLoop({
 			config,
 			userText: prompt,
@@ -602,11 +608,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				model,
 				overflowRetries,
 				maxRetries: MAX_CONTEXT_OVERFLOW_RETRIES,
+				baselineCompactSeq,
 			});
 			overflowRetries = overflow.overflowRetries;
 
 			if (overflow.action === "retry_pruned") {
 				pruneBoundaryId = overflow.boundaryMessageId;
+				resetUpstreamSessionOnNextRequest = true;
 				const rebuilt = await loadSubagentHistory(
 					narratorId,
 					model,
@@ -621,6 +629,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			if (overflow.action === "retry_compacted") {
 				needsRestart = true;
 				currentConversationId = overflow.newConversationId;
+				resetUpstreamSessionOnNextRequest = true;
 				transientRetries = 0;
 				// Continue to the restart-after-compact flow below
 			} else {
@@ -667,6 +676,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				history = rebuilt.history;
 				trailingToolResults = rebuilt.trailingToolResults;
 				currentConversationId = randomUUID();
+				resetUpstreamSessionOnNextRequest = true;
 				continue;
 			}
 			// If aborted during backoff sleep, don't mark as error — the
@@ -705,6 +715,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				history = consumedBuffered.history;
 				trailingToolResults = consumedBuffered.trailingToolResults;
 				currentConversationId = randomUUID();
+				resetUpstreamSessionOnNextRequest = true;
 				continue;
 			}
 		}

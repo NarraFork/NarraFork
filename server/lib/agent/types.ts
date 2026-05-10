@@ -444,6 +444,12 @@ export interface AgentConfig {
 	serviceTier?: string;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
+	/**
+	 * One-shot reset for reusable upstream transport/session state before the first
+	 * provider request in this agent loop. Used after compact/context-clear rebuilt
+	 * history outside the inner loop.
+	 */
+	resetUpstreamSessionOnFirstRequest?: boolean;
 	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */

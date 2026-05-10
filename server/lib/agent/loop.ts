@@ -1379,11 +1379,14 @@ export async function* agentLoop(
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
 
+	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
+
 	function applyHistoryReplacement(replacement: {
 		history: unknown[];
 		pendingToolResults: unknown[];
 		systemPrompt?: string;
 	}) {
+		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
@@ -1808,6 +1811,8 @@ export async function* agentLoop(
 			}
 
 			try {
+				const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
+				resetUpstreamSessionOnNextRequest = false;
 				const stream = provider.chat({
 					conversationId: config.conversationId,
 					content,
@@ -1822,6 +1827,7 @@ export async function* agentLoop(
 					serviceTier: config.serviceTier,
 					metadata: config.metadata,
 					requestDump,
+					resetUpstreamSession,
 					onRequestStart: markRequestStarted,
 					...(isFirstTurn && images?.length ? { images } : {}),
 				});

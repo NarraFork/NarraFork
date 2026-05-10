@@ -1147,6 +1147,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				model: params.model,
 				request,
 				signal: params.signal,
+				resetSessionBeforeRequest: params.resetUpstreamSession,
 			})) {
 				yield event;
 			}

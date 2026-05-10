@@ -907,6 +907,7 @@
 	"storageDatabaseUsageFreeStats": "SQLite 可复用但尚未归还给文件系统的页面",
 	"storageDatabaseTopTables": "最大表：{{tables}}",
 	"storageDatabaseVacuum": "释放未归还空间",
+	"storageDatabaseVacuumDisabled": "同步 SQLite VACUUM 已禁用，以避免冻结后端。数据库压缩需要作为后台维护任务运行。",
 	"storageDatabaseVacuumConfirm": "将执行 SQLite VACUUM 来压缩数据库并归还空闲页。过程可能持续一段时间，并会临时占用额外磁盘空间。确定继续吗？",
 	"storageDatabaseVacuumSuccess": "数据库压缩完成，释放 {{size}}（原空闲页 {{freeBefore}}，耗时 {{duration}} 秒）",
 	"storageDatabaseVacuumFailed": "数据库压缩失败",

@@ -1,3 +1,4 @@
+import { createReadStream } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { z } from "zod/v4";
@@ -10,6 +11,15 @@ import { readFileText } from "./encoding";
  * to avoid blowing up the context window.
  */
 const READ_ALL_MAX_CHARS = 100_000;
+
+/** For large text files, never fall back to whole-file `.text()` + `.split()`. */
+const FULL_READ_STREAM_THRESHOLD_BYTES = 5 * 1024 * 1024;
+
+/** Default number of lines shown when a large file is read without offset/limit. */
+const DEFAULT_LARGE_FILE_LINES = 2000;
+
+/** Long physical lines can otherwise dominate memory and UI rendering. */
+const MAX_LINE_CHARS = 2000;
 
 /** Image extensions → format string for the API (Anthropic media_type = `image/${format}`). */
 const IMAGE_EXTENSIONS: Record<string, string> = {
@@ -56,7 +66,7 @@ export const readTool: ToolDefinition = {
 			},
 			limit: {
 				description:
-					"The number of lines to read. Set to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+					"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 				type: "number",
 			},
 			pages: {
@@ -80,7 +90,7 @@ export const readTool: ToolDefinition = {
 			.number()
 			.optional()
 			.describe(
-				"The number of lines to read. Set to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
+				"The number of lines to read. Set limit to -1 to read from the offset (or start) to EOF while bypassing output truncation (up to ~100k chars). Only provide if the file is too large to read at once.",
 			),
 		pages: z
 			.string()
@@ -167,40 +177,64 @@ export const readTool: ToolDefinition = {
 
 		// ── Text file handling ──
 		try {
+			const file = Bun.file(resolvedPath);
+			const fileSize = file.size;
+			const shouldStream = readAll || fileSize > FULL_READ_STREAM_THRESHOLD_BYTES;
+
+			if (shouldStream) {
+				const startLine = offset ?? 1;
+				const largeFileAutoLimited =
+					fileSize > FULL_READ_STREAM_THRESHOLD_BYTES && limit == null && !readAll;
+				const effectiveLimit = readAll
+					? undefined
+					: (limit ?? (largeFileAutoLimited ? DEFAULT_LARGE_FILE_LINES : undefined));
+				const streamResult = await readTextLinesStream(
+					resolvedPath,
+					startLine,
+					effectiveLimit,
+					READ_ALL_MAX_CHARS,
+					ctx.signal,
+				);
+				const numbered = formatNumberedLines(streamResult.lines, startLine, {
+					truncateLines: false,
+				});
+				const suffix = buildStreamSuffix({
+					readAll,
+					largeFileAutoLimited,
+					startLine,
+					effectiveLimit,
+					streamResult,
+				});
+
+				return {
+					output: (numbered || "(no lines in requested range)") + suffix,
+					title: file_path,
+					truncated:
+						readAll ||
+						streamResult.cappedByChars ||
+						streamResult.cappedByLines ||
+						(fileSize > FULL_READ_STREAM_THRESHOLD_BYTES && limit == null),
+					metadata: {
+						readLines: streamResult.lines.length,
+						readAll,
+						startLine,
+						fileSize,
+						totalLines: streamResult.totalLinesKnown ? streamResult.scannedLines : undefined,
+						totalLinesKnown: streamResult.totalLinesKnown,
+					},
+				};
+			}
+
 			const { text } = await readFileText(resolvedPath);
 			const lines = text.split("\n");
 			const start = Math.max(0, (offset ?? 1) - 1);
-			const end = readAll ? lines.length : limit ? start + limit : lines.length;
+			const end = limit ? start + limit : lines.length;
 			const slice = lines.slice(start, end);
-
-			let numbered = slice
-				.map((line, i) => `${String(start + i + 1).padStart(6)}│${line}`)
-				.join("\n");
-
-			// read-all mode caps output at ~100k chars to avoid blowing up context.
-			let capped = false;
-			if (readAll && numbered.length > READ_ALL_MAX_CHARS) {
-				numbered = numbered.slice(0, READ_ALL_MAX_CHARS);
-				// Trim to last complete line to avoid a broken trailing line,
-				// but only if a newline exists in the last 200 chars — otherwise
-				// the file has very long / no-newline lines and hard-cutting is fine.
-				const tail = numbered.length - 200;
-				const lastNewline = numbered.lastIndexOf("\n");
-				if (lastNewline > tail) {
-					numbered = numbered.slice(0, lastNewline);
-				}
-				capped = true;
-			}
-
-			const suffix = capped
-				? `\n\n...output capped at ${READ_ALL_MAX_CHARS} chars. Use offset/limit to read the rest.`
-				: "";
+			const numbered = formatNumberedLines(slice, start + 1);
 
 			return {
-				output: (numbered || "(empty file)") + suffix,
+				output: numbered || "(empty file)",
 				title: file_path,
-				// Mark as pre-truncated to signal loop layer: do not apply global 50KB truncation.
-				truncated: readAll,
 				metadata: {
 					totalLines: lines.length,
 					readLines: slice.length,
@@ -215,6 +249,189 @@ export const readTool: ToolDefinition = {
 		}
 	},
 };
+
+type StreamReadResult = {
+	lines: string[];
+	scannedLines: number;
+	totalLinesKnown: boolean;
+	cappedByChars: boolean;
+	cappedByLines: boolean;
+};
+
+function truncateDisplayLine(line: string): string {
+	if (line.length <= MAX_LINE_CHARS) return line;
+	return `${line.slice(0, MAX_LINE_CHARS)}… [line truncated, ${line.length} chars total]`;
+}
+
+function formatNumberedLines(
+	lines: string[],
+	startLine: number,
+	options: { truncateLines?: boolean } = {},
+): string {
+	const truncateLines = options.truncateLines ?? true;
+	return lines
+		.map(
+			(line, i) =>
+				`${String(startLine + i).padStart(6)}│${truncateLines ? truncateDisplayLine(line) : line}`,
+		)
+		.join("\n");
+}
+
+async function readTextLinesStream(
+	filePath: string,
+	startLine: number,
+	limit: number | undefined,
+	maxChars: number,
+	signal: AbortSignal,
+): Promise<StreamReadResult> {
+	const stream = createReadStream(filePath, { encoding: "utf-8" });
+	const lines: string[] = [];
+	let scannedLines = 0;
+	let chars = 0;
+	let cappedByChars = false;
+	let cappedByLines = false;
+	let totalLinesKnown = true;
+	let stopped = false;
+
+	let currentLine = "";
+	let currentLineChars = 0;
+	let currentLineTruncated = false;
+
+	const resetCurrentLine = () => {
+		currentLine = "";
+		currentLineChars = 0;
+		currentLineTruncated = false;
+	};
+
+	const shouldCaptureCurrentLine = () => scannedLines + 1 >= startLine;
+	const lineLimitReached = () =>
+		limit != null && shouldCaptureCurrentLine() && lines.length >= limit;
+
+	const appendLineSegment = (segment: string) => {
+		if (lineLimitReached()) {
+			cappedByLines = true;
+			totalLinesKnown = false;
+			stopped = true;
+			return;
+		}
+
+		currentLineChars += segment.length;
+		if (!shouldCaptureCurrentLine()) return;
+		if (currentLine.length >= MAX_LINE_CHARS) {
+			if (segment.length > 0) currentLineTruncated = true;
+			return;
+		}
+
+		const remaining = MAX_LINE_CHARS - currentLine.length;
+		const captured = segment.slice(0, remaining);
+		currentLine += captured;
+		if (captured.length < segment.length) currentLineTruncated = true;
+	};
+
+	const finalizeCurrentLine = () => {
+		if (stopped) return;
+		if (lineLimitReached()) {
+			cappedByLines = true;
+			totalLinesKnown = false;
+			stopped = true;
+			resetCurrentLine();
+			return;
+		}
+
+		scannedLines++;
+		if (scannedLines < startLine) {
+			resetCurrentLine();
+			return;
+		}
+
+		let displayLine = currentLine;
+		let physicalChars = currentLineChars;
+		if (displayLine.endsWith("\r")) {
+			displayLine = displayLine.slice(0, -1);
+			physicalChars = Math.max(0, physicalChars - 1);
+		}
+		if (currentLineTruncated || physicalChars > displayLine.length) {
+			displayLine = `${displayLine}… [line truncated, ${physicalChars} chars total]`;
+		}
+
+		const projectedChars = chars + displayLine.length + 16;
+		if (projectedChars > maxChars) {
+			cappedByChars = true;
+			totalLinesKnown = false;
+			stopped = true;
+			resetCurrentLine();
+			return;
+		}
+
+		lines.push(displayLine);
+		chars = projectedChars;
+		resetCurrentLine();
+	};
+
+	const onAbort = () => {
+		stream.destroy(new Error("Read aborted"));
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+
+	try {
+		for await (const chunk of stream) {
+			if (signal.aborted) throw new Error("Read aborted");
+			const text = typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+			let start = 0;
+			while (start < text.length) {
+				const newlineIndex = text.indexOf("\n", start);
+				const end = newlineIndex === -1 ? text.length : newlineIndex;
+				appendLineSegment(text.slice(start, end));
+				if (stopped) break;
+				if (newlineIndex === -1) break;
+				finalizeCurrentLine();
+				if (stopped) break;
+				start = newlineIndex + 1;
+			}
+			if (stopped) break;
+		}
+
+		if (!stopped && currentLineChars > 0) {
+			finalizeCurrentLine();
+		}
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		stream.destroy();
+	}
+
+	return { lines, scannedLines, totalLinesKnown, cappedByChars, cappedByLines };
+}
+
+function buildStreamSuffix(options: {
+	readAll: boolean;
+	largeFileAutoLimited: boolean;
+	startLine: number;
+	effectiveLimit: number | undefined;
+	streamResult: StreamReadResult;
+}): string {
+	const suffix: string[] = [];
+	const { readAll, largeFileAutoLimited, startLine, effectiveLimit, streamResult } = options;
+
+	if (streamResult.cappedByChars) {
+		suffix.push(
+			`output capped at ${READ_ALL_MAX_CHARS} chars. Use offset/limit to read a smaller range.`,
+		);
+	}
+	if (streamResult.cappedByLines && effectiveLimit != null) {
+		const nextOffset = startLine + streamResult.lines.length;
+		suffix.push(`output limited to ${effectiveLimit} lines. Continue with offset=${nextOffset}.`);
+	}
+	if (largeFileAutoLimited && !readAll && effectiveLimit != null) {
+		suffix.push(
+			`large file detected; streamed only the first ${effectiveLimit} lines. Use offset/limit for more.`,
+		);
+	}
+	if (readAll && !streamResult.totalLinesKnown) {
+		suffix.push("read-all mode stops after the safe output cap instead of loading the whole file.");
+	}
+
+	return suffix.length > 0 ? `\n\n...${suffix.join(" ")}` : "";
+}
 
 // ── Directory listing helper ──
 

@@ -2732,7 +2732,9 @@ export function NarratorPanel({
 	const isPlanning = hasPlanTrait && narrator?.status === "working";
 	const isRetrying = !!retryInfo;
 	// Derive legacy boolean flags from substatus
-	const isCompacting = substatus.includes("compacting");
+	const isWaitingForCompact = substatus.includes("compacting");
+	const isBackgroundCompacting = substatus.includes("background_compacting");
+	const isCompacting = isWaitingForCompact || isBackgroundCompacting;
 	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
 	const queueMessageValue = queueMessage
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
@@ -7128,7 +7130,7 @@ export function NarratorPanel({
 										color={
 											isRetrying
 												? "yellow"
-												: isCompacting
+												: isWaitingForCompact || (isBackgroundCompacting && !isWorking)
 													? "orange"
 													: isWaiting
 														? "yellow"
@@ -7143,7 +7145,7 @@ export function NarratorPanel({
 										c={
 											isRetrying
 												? "yellow"
-												: isCompacting
+												: isWaitingForCompact || (isBackgroundCompacting && !isWorking)
 													? "orange"
 													: isWaiting
 														? "yellow"
@@ -7164,7 +7166,7 @@ export function NarratorPanel({
 														count: retryInfo?.retryCount,
 														max: retryInfo?.maxRetries === -1 ? "∞" : retryInfo?.maxRetries,
 													})
-											: isCompacting
+											: isWaitingForCompact
 												? isWorking
 													? t("thinkingWithCompact")
 													: t("compacting")
@@ -7174,13 +7176,20 @@ export function NarratorPanel({
 														? t("status_waiting")
 														: isPlanning
 															? t("planning")
-															: t("thinking")}
+															: isBackgroundCompacting
+																? t("backgroundCompacting")
+																: t("thinking")}
 									</Text>
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
 											{queueMessageValue ??
 												t(
 												)}
+										</Text>
+									)}
+									{isBackgroundCompacting && isWorking && !isWaitingForCompact && (
+										<Text size="xs" c="orange" style={{ flexShrink: 0 }}>
+											· {t("backgroundCompactingShort")}
 										</Text>
 									)}
 									{turnElapsedText && (

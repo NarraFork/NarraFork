@@ -22,10 +22,13 @@ export interface SafeSpawnResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
+	stdoutTruncated?: boolean;
+	stderrTruncated?: boolean;
 }
 
 /** Watchdog check interval in milliseconds. */
 const WATCHDOG_INTERVAL_MS = 15_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 /**
  * Callback invoked by the watchdog on each tick.
@@ -72,6 +75,12 @@ export interface SafeSpawnOptions {
 	 * Called at most once per safeSpawn invocation.
 	 */
 	onLongRunning?: (elapsed: number) => void;
+	/**
+	 * Maximum bytes to retain per stdout/stderr stream. Streams are still drained
+	 * to avoid child-process pipe deadlocks, but captured strings are truncated.
+	 * Set to 0 to keep no output, or Infinity to explicitly allow unbounded capture.
+	 */
+	maxOutputBytes?: number;
 	/**
 	 * Best-effort cleanup of child processes spawned by the command. Useful for
 	 * startup hooks that may launch long-running dev servers via a shell.
@@ -254,13 +263,20 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		// 关键：先并行读完 stdout/stderr 再 await exit。
 		// Windows 管道缓冲区仅 4KB，如果不先消费输出，子进程 write() 会阻塞，
 		// 而 await proc.exited 又在等子进程退出 → 死锁。
+		const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 		const [stdout, stderr] = await Promise.all([
-			drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput),
-			drainStream(proc.stderr as ReadableStream<Uint8Array>, trackOutput),
+			drainStream(proc.stdout as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
+			drainStream(proc.stderr as ReadableStream<Uint8Array>, trackOutput, maxOutputBytes),
 		]);
 		const exitCode = await proc.exited;
 
-		return { stdout, stderr, exitCode };
+		return {
+			stdout: stdout.text,
+			stderr: stderr.text,
+			exitCode,
+			stdoutTruncated: stdout.truncated,
+			stderrTruncated: stderr.truncated,
+		};
 	} finally {
 		if (hardTimer != null) clearTimeout(hardTimer);
 		if (watchdogTimer != null) clearInterval(watchdogTimer);
@@ -280,32 +296,54 @@ function defaultWatchdog(info: WatchdogInfo): "kill" | "renew" {
 
 /**
  * Read a ReadableStream to completion, calling `onChunk` with each decoded
- * text fragment for output-length tracking.
+ * text fragment for output-length tracking. Captured output is bounded by
+ * maxBytes, but the stream is always drained to avoid child-process deadlocks.
  */
 async function drainStream(
 	stream: ReadableStream<Uint8Array>,
 	onChunk: (text: string) => void,
-): Promise<string> {
+	maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
 	const chunks: string[] = [];
+	let capturedBytes = 0;
+	let truncated = false;
+	const capture = (text: string) => {
+		onChunk(text);
+		if (maxBytes <= 0 || truncated) return;
+		if (!Number.isFinite(maxBytes)) {
+			chunks.push(text);
+			return;
+		}
+		const chunkBytes = Buffer.byteLength(text, "utf-8");
+		if (capturedBytes + chunkBytes <= maxBytes) {
+			chunks.push(text);
+			capturedBytes += chunkBytes;
+			return;
+		}
+		const remaining = Math.max(0, maxBytes - capturedBytes);
+		if (remaining > 0) {
+			let cutLen = Math.min(text.length, remaining);
+			while (cutLen > 0 && Buffer.byteLength(text.slice(0, cutLen), "utf-8") > remaining) {
+				cutLen = Math.floor(cutLen * 0.9);
+			}
+			if (cutLen > 0) chunks.push(text.slice(0, cutLen));
+		}
+		chunks.push("\n\n[safeSpawn output truncated — exceeded capture limit]");
+		truncated = true;
+	};
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
 			if (done) break;
-			const text = decoder.decode(value, { stream: true });
-			chunks.push(text);
-			// onChunk 回调更新 currentOutputLength，供看门狗判断进程是否仍有输出
-			onChunk(text);
+			capture(decoder.decode(value, { stream: true }));
 		}
 		// Flush any remaining bytes
 		const final = decoder.decode();
-		if (final) {
-			chunks.push(final);
-			onChunk(final);
-		}
+		if (final) capture(final);
 	} finally {
 		reader.releaseLock();
 	}
-	return chunks.join("");
+	return { text: chunks.join(""), truncated };
 }

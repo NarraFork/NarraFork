@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { PermissionResult, ReasoningEffort } from "../lib/agent";
 import { hotSafe } from "../lib/hot-safe";
@@ -88,6 +89,8 @@ export interface ActiveNarrator {
 	_provisionalTitle?: string;
 	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
 	_substatus: Set<string>;
+	/** One-shot reset for reusable upstream provider sessions before the next request. */
+	_resetUpstreamSessionOnNextRequest?: boolean;
 	/** Goal accounting baseline at the start of the current turn. */
 	_goalTurnStartedAtMs?: number;
 	_goalTokenUsageBaseline?: TokenUsageSnapshot;
@@ -180,6 +183,18 @@ export const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
 	() => new Map(),
 );
 
+/**
+ * Reset reusable upstream provider/session state for the active narrator before
+ * its next model request. Returns false when the narrator is not currently active.
+ */
+export function resetActiveUpstreamSession(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) return false;
+	active.conversationId = randomUUID();
+	active._resetUpstreamSessionOnNextRequest = true;
+	return true;
+}
+
 export const narratorCreationLocks = hotSafe<Map<string, Promise<ActiveNarrator>>>(
 	"narrafork.narratorCreationLocks",
 	() => new Map(),
@@ -264,16 +279,21 @@ export const bufferedMessages = hotSafe<Map<string, BufferedMessage[]>>(
 // === Compact/Prune locks ===
 
 export type CompactLockKind = "history" | "history_probe" | "segment";
+export type CompactMode = "blocking" | "background";
 
 export interface CompactLockResult {
 	kind: CompactLockKind;
 	/** True only when this lock actually produced or waited for a history compact. */
 	compacted: boolean;
+	/** Whether this compact blocked the active turn or ran in the background. */
+	mode?: CompactMode;
 }
 
 export interface CompactLock {
 	kind: CompactLockKind;
 	promise: Promise<CompactLockResult>;
+	/** Whether this compact blocks the active turn or runs alongside it. */
+	mode?: CompactMode;
 }
 
 /** Per-narrator lock to prevent concurrent compact operations. */

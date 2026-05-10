@@ -128,6 +128,19 @@ async function appendMessageRef(
 // ── Exported appendMessageRef for use by narrator-service.ts ───────────────
 export { appendMessageRef, insertMessageRef };
 
+const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
+
+function preserveBackgroundCompactingSubstatus(current: string[], next: string[]): string[] {
+	if (
+		current.includes(BACKGROUND_COMPACTING_SUBSTATUS) &&
+		!next.includes(BACKGROUND_COMPACTING_SUBSTATUS) &&
+		!next.includes("compacting")
+	) {
+		return [...next, BACKGROUND_COMPACTING_SUBSTATUS];
+	}
+	return next;
+}
+
 async function writeSubstatus(
 	narratorId: string,
 	substatus: string[],
@@ -257,7 +270,11 @@ export const narratorPersistence = {
 		return { ...msg, seq };
 	},
 
-	async persistCompactingMessage(narratorId: string, beforeMessageId?: string) {
+	async persistCompactingMessage(
+		narratorId: string,
+		beforeMessageId?: string,
+		mode: "blocking" | "background" = "blocking",
+	) {
 		const id = generateId();
 
 		let seq: number;
@@ -298,7 +315,7 @@ export const narratorPersistence = {
 				id,
 				narratorId,
 				role: "system",
-				contentJson: [{ type: "compact", status: "compacting" }],
+				contentJson: [{ type: "compact", status: "compacting", mode }],
 				contentText: "[Compacting]",
 				createdAt,
 			})
@@ -391,11 +408,14 @@ export const narratorPersistence = {
 		narratorId: string,
 		summary: string,
 		contextPercent?: number,
-		options?: { status?: "compacted" | "failed"; error?: string },
+		options?: { status?: "compacted" | "failed"; error?: string; mode?: "blocking" | "background" },
 	) {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
 		const compactBlock: Record<string, unknown> = { type: "compact", status, summary };
+		if (options?.mode) {
+			compactBlock.mode = options.mode;
+		}
 		if (status === "failed" && options?.error) {
 			compactBlock.error = options.error;
 		}
@@ -905,14 +925,26 @@ export const narratorPersistence = {
 		const errorCode = options?.errorCode;
 		const setTurnStart = options?.setTurnStart;
 		// When transitioning to an active status without explicit substatus,
-		// auto-clear stale tags (e.g. leftover "unread"/"error"/"interrupted").
-		const substatus =
+		// auto-clear stale tags (e.g. leftover "unread"/"error"/"interrupted"),
+		// but preserve a background compact that is intentionally running alongside it.
+		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
-		const isError = substatus?.includes("error");
+		const isError = requestedSubstatus?.includes("error");
 		const now = new Date().toISOString();
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const turnStartedAt = setTurnStart ? now : undefined;
+		let actualSubstatus = requestedSubstatus;
 		const writeStatus = async () => {
+			if (requestedSubstatus !== undefined) {
+				const row = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				});
+				actualSubstatus = preserveBackgroundCompactingSubstatus(
+					parseSubstatus(row?.substatus),
+					requestedSubstatus,
+				);
+			}
 			await db
 				.update(narrators)
 				.set({
@@ -920,11 +952,11 @@ export const narratorPersistence = {
 					errorMessage: normalizedErrorMessage,
 					updatedAt: now,
 					...(turnStartedAt !== undefined && { turnStartedAt }),
-					...(substatus !== undefined && { substatus: JSON.stringify(substatus) }),
+					...(actualSubstatus !== undefined && { substatus: JSON.stringify(actualSubstatus) }),
 				})
 				.where(eq(narrators.id, narratorId));
 		};
-		if (substatus !== undefined) {
+		if (requestedSubstatus !== undefined) {
 			await narratorSubstatusLock.acquire(narratorId, writeStatus);
 		} else {
 			await writeStatus();
@@ -932,7 +964,12 @@ export const narratorPersistence = {
 
 		// Always emit status_changed so downstream listeners (gateway, notifications)
 		// are notified. For errors, also emit the dedicated narrator:error event.
-		eventBus.emit({ type: "narrator:status_changed", narratorId, status, substatus });
+		eventBus.emit({
+			type: "narrator:status_changed",
+			narratorId,
+			status,
+			substatus: actualSubstatus,
+		});
 		if (isError) {
 			eventBus.emit({
 				type: "narrator:error",
@@ -987,7 +1024,7 @@ export const narratorPersistence = {
 			type: "status_change",
 			narratorId,
 			status,
-			substatus,
+			substatus: actualSubstatus,
 			turnStartedAt: turnStartedAt ?? undefined,
 		});
 	},
@@ -1002,18 +1039,30 @@ export const narratorPersistence = {
 		},
 	): Promise<boolean> {
 		// When transitioning to an active status without explicit substatus,
-		// auto-clear stale tags.
-		const substatus =
+		// auto-clear stale tags, while preserving background compact state.
+		const requestedSubstatus =
 			options?.substatus ?? (newStatus === "working" || newStatus === "waiting" ? [] : undefined);
 		const errorMessage = options?.errorMessage;
-		const isError = substatus?.includes("error");
+		const isError = requestedSubstatus?.includes("error");
 		const now = new Date().toISOString();
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
-		const substatusJson = substatus !== undefined ? JSON.stringify(substatus) : undefined;
+		let actualSubstatus = requestedSubstatus;
 		const placeholders = expected.map(() => "?").join(",");
-		const runCompareAndSet = () =>
-			sqlite
+		const runCompareAndSet = async () => {
+			if (requestedSubstatus !== undefined) {
+				const row = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				});
+				actualSubstatus = preserveBackgroundCompactingSubstatus(
+					parseSubstatus(row?.substatus),
+					requestedSubstatus,
+				);
+			}
+			const substatusJson =
+				actualSubstatus !== undefined ? JSON.stringify(actualSubstatus) : undefined;
+			return sqlite
 				.prepare(
 					substatusJson !== undefined
 						? `UPDATE narrators SET status = ?, error_message = ?, substatus = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`
@@ -1024,15 +1073,21 @@ export const narratorPersistence = {
 						? [newStatus, normalizedErrorMessage, substatusJson, now, narratorId, ...expected]
 						: [newStatus, normalizedErrorMessage, now, narratorId, ...expected]),
 				);
+		};
 		const result =
-			substatusJson !== undefined
-				? await narratorSubstatusLock.acquire(narratorId, async () => runCompareAndSet())
-				: runCompareAndSet();
+			requestedSubstatus !== undefined
+				? await narratorSubstatusLock.acquire(narratorId, runCompareAndSet)
+				: await runCompareAndSet();
 
 		if (result.changes === 0) return false;
 
 		// Always emit status_changed; for errors also emit narrator:error.
-		eventBus.emit({ type: "narrator:status_changed", narratorId, status: newStatus, substatus });
+		eventBus.emit({
+			type: "narrator:status_changed",
+			narratorId,
+			status: newStatus,
+			substatus: actualSubstatus,
+		});
 		if (isError) {
 			eventBus.emit({
 				type: "narrator:error",
@@ -1044,7 +1099,7 @@ export const narratorPersistence = {
 			type: "status_change",
 			narratorId,
 			status: newStatus,
-			substatus,
+			substatus: actualSubstatus,
 		});
 		return true;
 	},

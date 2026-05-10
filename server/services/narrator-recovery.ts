@@ -18,7 +18,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { getAutoCompactKeepPairs, getContextThresholds, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
-import { runCustomCompact } from "./narrator-session";
+import { markCompactAsBlocking, runCustomCompact } from "./narrator-session";
 import { compactLocks } from "./narrator-session-state";
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -86,6 +86,8 @@ export async function handleContextOverflow(opts: {
 	model: string;
 	overflowRetries: number;
 	maxRetries: number;
+	/** Latest compact seq observed when the failed request's history was built. */
+	baselineCompactSeq?: number | null;
 	onBroadcast?: (event: Record<string, unknown>) => void;
 }): Promise<OverflowResult> {
 	const { narratorId, locale, provider, model, onBroadcast } = opts;
@@ -105,6 +107,19 @@ export async function handleContextOverflow(opts: {
 
 	onBroadcast?.({ type: "context_length_exceeded", narratorId });
 
+	const latestCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+	const baselineCompactSeq = opts.baselineCompactSeq ?? -1;
+	if (latestCompactSeq != null && latestCompactSeq > baselineCompactSeq) {
+		const newConversationId = randomUUID();
+		onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
+		logger.info("A completed compact already supersedes the failed request, retrying", {
+			narratorId,
+			baselineCompactSeq: opts.baselineCompactSeq ?? null,
+			latestCompactSeq,
+		});
+		return { action: "retry_compacted", newConversationId, overflowRetries };
+	}
+
 	// If auto-compact was already triggered while the failed request was in flight,
 	// wait for it. Only a completed history compact is enough to retry directly;
 	// segment compacts and no-op probes do not reduce the overflow recovery history.
@@ -114,12 +129,22 @@ export async function handleContextOverflow(opts: {
 			narratorId,
 			attempt: overflowRetries,
 			kind: existingCompact.kind,
+			mode: existingCompact.mode,
 		});
+		if (existingCompact.mode === "background" && existingCompact.kind !== "segment") {
+			await markCompactAsBlocking(narratorId).catch((err) => {
+				logger.warn("Failed to mark existing compact as blocking during overflow recovery", {
+					narratorId,
+					error: String(err),
+				});
+			});
+			existingCompact.mode = "blocking";
+		}
 		try {
 			const compactResult = await existingCompact.promise;
 			if (existingCompact.kind !== "segment" && compactResult.compacted) {
 				const newConversationId = randomUUID();
-				onBroadcast?.({ type: "compact_done", narratorId });
+				onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 				logger.info("Existing history compact finished after context overflow, retrying", {
 					narratorId,
 					kind: existingCompact.kind,
@@ -199,7 +224,7 @@ export async function handleContextOverflow(opts: {
 		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId);
 		if (compacted) {
 			const newConversationId = randomUUID();
-			onBroadcast?.({ type: "compact_done", narratorId });
+			onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
 			logger.info("Emergency compact succeeded, retrying", { narratorId });
 			return { action: "retry_compacted", newConversationId, overflowRetries };
 		}

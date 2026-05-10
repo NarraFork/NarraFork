@@ -19,6 +19,8 @@ export function openDatabase(dbPath?: string): Database {
 	const conn = new Database(dbPath ?? getDbPath());
 	conn.run("PRAGMA journal_mode = WAL");
 	conn.run("PRAGMA foreign_keys = ON");
-	conn.run("PRAGMA busy_timeout = 5000");
+	// Keep SQLite lock waits short: bun:sqlite executes synchronously on the JS thread,
+	// so multi-second busy waits make the whole HTTP/WS server appear frozen.
+	conn.run("PRAGMA busy_timeout = 250");
 	return conn;
 }
