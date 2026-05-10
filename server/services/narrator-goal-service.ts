@@ -129,6 +129,16 @@ export async function getActiveGoal(narratorId: string): Promise<NarratorGoalDTO
 	return goal;
 }
 
+export async function getNarratorIdsWithActiveGoals(narratorIds: string[]): Promise<Set<string>> {
+	if (narratorIds.length === 0) return new Set();
+	const rows = await db
+		.select({ narratorId: narratorGoals.narratorId })
+		.from(narratorGoals)
+		.where(and(inArray(narratorGoals.narratorId, narratorIds), eq(narratorGoals.status, "active")))
+		.groupBy(narratorGoals.narratorId);
+	return new Set(rows.map((row) => row.narratorId));
+}
+
 export async function activateNextPendingGoal(narratorId: string): Promise<NarratorGoalDTO | null> {
 	if (await hasActiveOrPausedGoal(narratorId)) return getActiveGoal(narratorId);
 	const next = await db.query.narratorGoals.findFirst({
@@ -335,6 +345,7 @@ function escapeXml(input: string): string {
 export const narratorGoalService = {
 	listGoals,
 	getActiveGoal,
+	getNarratorIdsWithActiveGoals,
 	createGoal,
 	updateGoal,
 	completeActiveGoal,

@@ -22,93 +22,72 @@ const DEFAULT_PREVIEW_SAMPLE_LIMIT = 10;
 const DATABASE_MAINTENANCE_LOCK_KEY = "database-maintenance";
 const databaseMaintenanceLock = new AsyncMutex();
 
-const NARRATOR_BYTES_EXPR = [
-	"length(CAST(coalesce(n.id, '') AS BLOB))",
-	"length(CAST(coalesce(n.chapter_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.api_conversation_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.fork_message_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.type, '') AS BLOB))",
-	"length(CAST(coalesce(n.subagent_type, '') AS BLOB))",
-	"length(CAST(coalesce(n.title, '') AS BLOB))",
-	"length(CAST(coalesce(n.inherit_mode, '') AS BLOB))",
-	"length(CAST(coalesce(n.parent_narrator_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.context_summary, '') AS BLOB))",
-	"length(CAST(coalesce(n.model, '') AS BLOB))",
-	"length(CAST(coalesce(n.pending_model_restore, '') AS BLOB))",
-	"length(CAST(coalesce(n.system_prompt, '') AS BLOB))",
-	"length(CAST(coalesce(n.permission_mode, '') AS BLOB))",
-	"length(CAST(coalesce(n.previous_permission_mode, '') AS BLOB))",
-	"length(CAST(coalesce(n.reasoning_effort, '') AS BLOB))",
-	"length(CAST(coalesce(n.last_message_at, '') AS BLOB))",
-	"length(CAST(coalesce(n.status, '') AS BLOB))",
-	"length(CAST(coalesce(n.cwd, '') AS BLOB))",
-	"length(CAST(coalesce(n.error_message, '') AS BLOB))",
-	"length(CAST(coalesce(n.todos_json, '') AS BLOB))",
-	"length(CAST(coalesce(n.todos_tool_use_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.prune_boundary_message_id, '') AS BLOB))",
-	"length(CAST(coalesce(n.enabled_tools, '') AS BLOB))",
-	"length(CAST(coalesce(n.background_status, '') AS BLOB))",
-	"length(CAST(coalesce(n.background_result, '') AS BLOB))",
-	"length(CAST(coalesce(n.background_completed_at, '') AS BLOB))",
-	"length(CAST(coalesce(n.turn_started_at, '') AS BLOB))",
-	"length(CAST(coalesce(n.created_at, '') AS BLOB))",
-	"length(CAST(coalesce(n.updated_at, '') AS BLOB))",
-].join(" + ");
+const DATABASE_STORAGE_CATEGORY_KEYS = [
+	"sessions",
+	"apiRequests",
+	"projects",
+	"runtime",
+	"users",
+	"search",
+	"gateway",
+	"benchmarks",
+	"internal",
+	"free",
+	"other",
+] as const;
 
-const MESSAGE_BYTES_EXPR = [
-	"length(CAST(coalesce(m.id, '') AS BLOB))",
-	"length(CAST(coalesce(m.narrator_id, '') AS BLOB))",
-	"length(CAST(coalesce(m.sdk_message_uuid, '') AS BLOB))",
-	"length(CAST(coalesce(m.parent_tool_use_id, '') AS BLOB))",
-	"length(CAST(coalesce(m.role, '') AS BLOB))",
-	"length(CAST(coalesce(m.content_json, '') AS BLOB))",
-	"length(CAST(coalesce(m.content_text, '') AS BLOB))",
-	"length(CAST(coalesce(m.turn_usage_json, '') AS BLOB))",
-	"length(CAST(coalesce(m.provider, '') AS BLOB))",
-	"length(CAST(coalesce(m.credential_id, '') AS BLOB))",
-	"length(CAST(coalesce(m.model, '') AS BLOB))",
-	"length(CAST(coalesce(m.commit_sha, '') AS BLOB))",
-	"length(CAST(coalesce(m.command_text, '') AS BLOB))",
-	"length(CAST(coalesce(m.created_by, '') AS BLOB))",
-	"length(CAST(coalesce(m.created_at, '') AS BLOB))",
-].join(" + ");
+export type DatabaseStorageCategoryKey = (typeof DATABASE_STORAGE_CATEGORY_KEYS)[number];
 
-const MESSAGE_REF_BYTES_EXPR = [
-	"length(CAST(coalesce(r.id, '') AS BLOB))",
-	"length(CAST(coalesce(r.narrator_id, '') AS BLOB))",
-	"length(CAST(coalesce(r.message_id, '') AS BLOB))",
-	"length(CAST(coalesce(r.segment_compact_id, '') AS BLOB))",
-].join(" + ");
+export type DatabaseTableKind = "table" | "virtual" | "shadow" | "internal";
 
-const TOOL_CALL_BYTES_EXPR = [
-	"length(CAST(coalesce(tc.id, '') AS BLOB))",
-	"length(CAST(coalesce(tc.narrator_id, '') AS BLOB))",
-	"length(CAST(coalesce(tc.message_id, '') AS BLOB))",
-	"length(CAST(coalesce(tc.tool_use_id, '') AS BLOB))",
-	"length(CAST(coalesce(tc.tool_name, '') AS BLOB))",
-	"length(CAST(coalesce(tc.input_json, '') AS BLOB))",
-	"length(CAST(coalesce(tc.output_json, '') AS BLOB))",
-	"length(CAST(coalesce(tc.status, '') AS BLOB))",
-	"length(CAST(coalesce(tc.error_message, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_decided_by, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_decided_at, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_deny_message, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_decision_reason, '') AS BLOB))",
-	"length(CAST(coalesce(tc.permission_suggestions, '') AS BLOB))",
-	"length(CAST(coalesce(tc.created_at, '') AS BLOB))",
-].join(" + ");
+interface SqliteTableListRow {
+	schema?: string;
+	name: string;
+	type: string;
+}
 
-const API_REQUEST_BYTES_EXPR = [
-	"length(CAST(coalesce(ar.id, '') AS BLOB))",
-	"length(CAST(coalesce(ar.narrator_id, '') AS BLOB))",
-	"length(CAST(coalesce(ar.message_id, '') AS BLOB))",
-	"length(CAST(coalesce(ar.provider, '') AS BLOB))",
-	"length(CAST(coalesce(ar.credential_id, '') AS BLOB))",
-	"length(CAST(coalesce(ar.model, '') AS BLOB))",
-	"length(CAST(coalesce(ar.meter_unit, '') AS BLOB))",
-	"length(CAST(coalesce(ar.raw_dump_json, '') AS BLOB))",
-	"length(CAST(coalesce(ar.created_at, '') AS BLOB))",
-].join(" + ");
+interface SqliteIndexRow {
+	name: string;
+	tableName: string;
+}
+
+interface SqliteTableColumnRow {
+	name: string;
+	hidden?: number | string | bigint;
+}
+
+interface TableSessionRelation {
+	tableName: string;
+	alias: string;
+	narratorColumn: string;
+	countAs?: "toolCalls" | "apiRequests";
+}
+
+const SESSION_OWNED_TABLES: TableSessionRelation[] = [
+	{ tableName: "narrator_message_refs", alias: "r", narratorColumn: "narrator_id" },
+	{
+		tableName: "narrator_tool_calls",
+		alias: "tc",
+		narratorColumn: "narrator_id",
+		countAs: "toolCalls",
+	},
+	{ tableName: "narrator_sidecars", alias: "ns", narratorColumn: "narrator_id" },
+	{ tableName: "api_requests", alias: "ar", narratorColumn: "narrator_id", countAs: "apiRequests" },
+	{ tableName: "terminal_view_state", alias: "tvs", narratorColumn: "narrator_id" },
+	{ tableName: "terminal_tabs", alias: "tt", narratorColumn: "narrator_id" },
+	{ tableName: "terminals", alias: "t", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_buffered_messages", alias: "nbm", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_goals", alias: "ng", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_file_snapshots", alias: "nfs", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_patches", alias: "np", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_whitelist_dirs", alias: "nwd", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_blacklist_dirs", alias: "nbd", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_whitelist_cmds", alias: "nwc", narratorColumn: "narrator_id" },
+	{ tableName: "narrator_blacklist_cmds", alias: "nbc", narratorColumn: "narrator_id" },
+	{ tableName: "gateway_session_mappings", alias: "gsm", narratorColumn: "narrator_id" },
+];
+
+const SEARCH_TABLE_PREFIXES = ["chapters_fts", "narrator_messages_fts", "narrators_fts"];
 
 interface DatabaseFileSizes {
 	mainBytes: number;
@@ -124,10 +103,38 @@ export interface DatabaseCleanupCandidateSummary {
 	retentionDays?: number;
 }
 
+export interface DatabaseStorageCategorySummary {
+	key: DatabaseStorageCategoryKey;
+	tableCount: number;
+	rowCount: number;
+	approxContentBytes: number;
+	diskBytes: number;
+	indexBytes: number;
+	totalBytes: number;
+}
+
+export interface DatabaseStorageTableSummary {
+	name: string;
+	category: DatabaseStorageCategoryKey;
+	kind: DatabaseTableKind;
+	rowCount: number | null;
+	approxContentBytes: number;
+	diskBytes: number;
+	indexBytes: number;
+	totalBytes: number;
+}
+
 export interface DatabaseStorageBreakdown {
 	mainBytes: number;
 	walBytes: number;
 	shmBytes: number;
+	pageSize: number;
+	pageCount: number;
+	freelistBytes: number;
+	objectBytes: number;
+	scanMode: "dbstat" | "approximate";
+	categories: DatabaseStorageCategorySummary[];
+	topTables: DatabaseStorageTableSummary[];
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
@@ -197,6 +204,19 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+}
+
+export interface DatabaseVacuumResult {
+	ok: true;
+	beforeBytes: number;
+	afterBytes: number;
+	freedBytes: number;
+	freelistBeforeBytes: number;
+	freelistAfterBytes: number;
+	vacuumRan: boolean;
+	checkpointRan: boolean;
+	optimized: boolean;
+	durationMs: number;
 }
 
 interface CleanupNarratorContext {
@@ -278,6 +298,327 @@ async function getDatabaseFileSizes(): Promise<DatabaseFileSizes> {
 		mainBytes: await fileSizeOrZero(dbPath),
 		walBytes: await fileSizeOrZero(`${dbPath}-wal`),
 		shmBytes: await fileSizeOrZero(`${dbPath}-shm`),
+	};
+}
+
+function totalDatabaseBytes(sizes: DatabaseFileSizes): number {
+	return sizes.mainBytes + sizes.walBytes + sizes.shmBytes;
+}
+
+function quoteIdentifier(identifier: string): string {
+	return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function readPragmaNumber(name: string): number {
+	try {
+		const row = sqlite.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | undefined;
+		return numberFromRow(row?.[name]);
+	} catch {
+		return 0;
+	}
+}
+
+function isSearchTableName(tableName: string): boolean {
+	return SEARCH_TABLE_PREFIXES.some(
+		(prefix) => tableName === prefix || tableName.startsWith(`${prefix}_`),
+	);
+}
+
+export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCategoryKey {
+	if (tableName.startsWith("sqlite_")) return "internal";
+	if (isSearchTableName(tableName)) return "search";
+	if (
+		[
+			"narrators",
+			"narrator_goals",
+			"narrator_messages",
+			"narrator_message_refs",
+			"narrator_sidecars",
+			"narrator_tool_calls",
+			"narrator_buffered_messages",
+			"narrator_file_snapshots",
+			"narrator_patches",
+			"narrator_whitelist_dirs",
+			"narrator_blacklist_dirs",
+			"narrator_whitelist_cmds",
+			"narrator_blacklist_cmds",
+			"background_tasks",
+		].includes(tableName)
+	) {
+		return "sessions";
+	}
+	if (tableName === "api_requests") return "apiRequests";
+	if (
+		[
+			"projects",
+			"exploration_groups",
+			"chapters",
+			"chapter_edges",
+			"chapter_commits",
+			"merge_sessions",
+			"review_conclusions",
+		].includes(tableName)
+	) {
+		return "projects";
+	}
+	if (
+		[
+			"terminals",
+			"terminal_tabs",
+			"terminal_view_state",
+			"container_instances",
+			"port_allocations",
+			"volume_snapshots",
+			"volume_snapshot_applications",
+		].includes(tableName)
+	) {
+		return "runtime";
+	}
+	if (
+		["users", "user_preferences", "user_favorite_directories", "workspaces", "hooks"].includes(
+			tableName,
+		)
+	) {
+		return "users";
+	}
+	if (tableName === "gateway_session_mappings") return "gateway";
+	if (["benchmark_suites", "benchmark_runs", "benchmark_task_results"].includes(tableName)) {
+		return "benchmarks";
+	}
+	return "other";
+}
+
+function normalizeTableKind(type: string): DatabaseTableKind {
+	if (type === "virtual" || type === "shadow") return type;
+	return type === "internal" ? "internal" : "table";
+}
+
+function tableExists(tableName: string): boolean {
+	const row = sqlite
+		.prepare("SELECT 1 FROM sqlite_schema WHERE name = ? AND type IN ('table', 'view') LIMIT 1")
+		.get(tableName);
+	return Boolean(row);
+}
+
+function loadSqliteTables(): Array<{ name: string; kind: DatabaseTableKind }> {
+	try {
+		const rows = sqlite.prepare("PRAGMA table_list").all() as SqliteTableListRow[];
+		return rows
+			.filter((row) => (row.schema ?? "main") === "main")
+			.filter((row) => ["table", "virtual", "shadow"].includes(row.type))
+			.filter((row) => !row.name.startsWith("sqlite_"))
+			.map((row) => ({ name: row.name, kind: normalizeTableKind(row.type) }))
+			.sort((a, b) => a.name.localeCompare(b.name));
+	} catch {
+		const rows = sqlite
+			.prepare(
+				"SELECT name, type FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+			)
+			.all() as SqliteTableListRow[];
+		return rows
+			.map((row) => ({ name: row.name, kind: normalizeTableKind(row.type) }))
+			.sort((a, b) => a.name.localeCompare(b.name));
+	}
+}
+
+function loadSqliteIndexes(): SqliteIndexRow[] {
+	return sqlite
+		.prepare("SELECT name, tbl_name AS tableName FROM sqlite_schema WHERE type = 'index'")
+		.all() as SqliteIndexRow[];
+}
+
+function loadDbstatObjectBytes(): { supported: boolean; bytesByName: Map<string, number> } {
+	try {
+		const rows = sqlite
+			.prepare(
+				"SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE schema = 'main' GROUP BY name",
+			)
+			.all() as Array<{ name: string; bytes: number | string | bigint }>;
+		return {
+			supported: true,
+			bytesByName: new Map(rows.map((row) => [row.name, numberFromRow(row.bytes)])),
+		};
+	} catch {
+		try {
+			const rows = sqlite
+				.prepare("SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat GROUP BY name")
+				.all() as Array<{ name: string; bytes: number | string | bigint }>;
+			return {
+				supported: true,
+				bytesByName: new Map(rows.map((row) => [row.name, numberFromRow(row.bytes)])),
+			};
+		} catch {
+			return { supported: false, bytesByName: new Map() };
+		}
+	}
+}
+
+const tableColumnCache = new Map<string, string[]>();
+
+function getTableValueColumnNames(tableName: string): string[] {
+	const cached = tableColumnCache.get(tableName);
+	if (cached) return cached;
+	try {
+		const rows = sqlite
+			.prepare(`PRAGMA table_xinfo(${quoteIdentifier(tableName)})`)
+			.all() as SqliteTableColumnRow[];
+		const columns = rows
+			.filter((row) => numberFromRow(row.hidden) === 0)
+			.map((row) => row.name)
+			.filter(Boolean);
+		tableColumnCache.set(tableName, columns);
+		return columns;
+	} catch {
+		tableColumnCache.set(tableName, []);
+		return [];
+	}
+}
+
+function buildApproxBytesExpression(tableName: string, alias: string): string {
+	const columns = getTableValueColumnNames(tableName);
+	if (columns.length === 0) return "0";
+	return columns
+		.map((column) => `length(CAST(coalesce(${alias}.${quoteIdentifier(column)}, '') AS BLOB))`)
+		.join(" + ");
+}
+
+function sumTableApproxBytes(tableName: string, alias: string, fromClause: string): number {
+	return sumBytesQuery(buildApproxBytesExpression(tableName, alias), fromClause);
+}
+
+function safeCountRows(tableName: string): number | null {
+	try {
+		return countQuery(`FROM ${quoteIdentifier(tableName)}`);
+	} catch {
+		return null;
+	}
+}
+
+function safeEstimateTableContentBytes(tableName: string): number {
+	try {
+		return sumTableApproxBytes(tableName, "t", `FROM ${quoteIdentifier(tableName)} t`);
+	} catch {
+		return 0;
+	}
+}
+
+function scanDatabaseObjectStorage(mainBytes: number): {
+	pageSize: number;
+	pageCount: number;
+	freelistBytes: number;
+	objectBytes: number;
+	scanMode: "dbstat" | "approximate";
+	categories: DatabaseStorageCategorySummary[];
+	topTables: DatabaseStorageTableSummary[];
+} {
+	const pageSize = readPragmaNumber("page_size");
+	const pageCount = readPragmaNumber("page_count");
+	const rawFreelistBytes = pageSize * readPragmaNumber("freelist_count");
+	const freelistBytes = Math.min(rawFreelistBytes, Math.max(mainBytes, pageSize * pageCount));
+	const tables = loadSqliteTables();
+	const indexes = loadSqliteIndexes();
+	const indexesByTable = new Map<string, string[]>();
+	for (const index of indexes) {
+		const names = indexesByTable.get(index.tableName) ?? [];
+		names.push(index.name);
+		indexesByTable.set(index.tableName, names);
+	}
+
+	const dbstat = loadDbstatObjectBytes();
+	const usedObjectNames = new Set<string>();
+	const tableSummaries: DatabaseStorageTableSummary[] = tables.map((table) => {
+		const rowCount = safeCountRows(table.name);
+		// dbstat already gives exact page-level object sizes. Avoid an additional
+		// SUM(length(...)) full-table scan for large message/dump tables on the
+		// storage settings page; only compute content bytes in approximate mode.
+		const approxContentBytes =
+			dbstat.supported || table.kind === "virtual" ? 0 : safeEstimateTableContentBytes(table.name);
+		const indexNames = indexesByTable.get(table.name) ?? [];
+		const diskBytes = dbstat.supported
+			? (dbstat.bytesByName.get(table.name) ?? 0)
+			: approxContentBytes;
+		const indexBytes = dbstat.supported
+			? indexNames.reduce((sum, indexName) => sum + (dbstat.bytesByName.get(indexName) ?? 0), 0)
+			: 0;
+		usedObjectNames.add(table.name);
+		for (const indexName of indexNames) {
+			usedObjectNames.add(indexName);
+		}
+		return {
+			name: table.name,
+			category: getDatabaseStorageCategory(table.name),
+			kind: table.kind,
+			rowCount,
+			approxContentBytes,
+			diskBytes,
+			indexBytes,
+			totalBytes: diskBytes + indexBytes,
+		};
+	});
+
+	const categoryMap = new Map<DatabaseStorageCategoryKey, DatabaseStorageCategorySummary>();
+	const ensureCategory = (key: DatabaseStorageCategoryKey): DatabaseStorageCategorySummary => {
+		const existing = categoryMap.get(key);
+		if (existing) return existing;
+		const created: DatabaseStorageCategorySummary = {
+			key,
+			tableCount: 0,
+			rowCount: 0,
+			approxContentBytes: 0,
+			diskBytes: 0,
+			indexBytes: 0,
+			totalBytes: 0,
+		};
+		categoryMap.set(key, created);
+		return created;
+	};
+	for (const table of tableSummaries) {
+		const category = ensureCategory(table.category);
+		category.tableCount += 1;
+		category.rowCount += table.rowCount ?? 0;
+		category.approxContentBytes += table.approxContentBytes;
+		category.diskBytes += table.diskBytes;
+		category.indexBytes += table.indexBytes;
+		category.totalBytes += table.totalBytes;
+	}
+
+	let objectBytes = tableSummaries.reduce((sum, table) => sum + table.totalBytes, 0);
+	if (dbstat.supported) {
+		let internalBytes = 0;
+		for (const [objectName, bytes] of dbstat.bytesByName) {
+			if (usedObjectNames.has(objectName)) continue;
+			internalBytes += bytes;
+		}
+		if (internalBytes > 0) {
+			const internal = ensureCategory("internal");
+			internal.diskBytes += internalBytes;
+			internal.totalBytes += internalBytes;
+			objectBytes += internalBytes;
+		}
+	}
+
+	if (freelistBytes > 0) {
+		const free = ensureCategory("free");
+		free.diskBytes += freelistBytes;
+		free.totalBytes += freelistBytes;
+	}
+
+	const categories = DATABASE_STORAGE_CATEGORY_KEYS.map((key) => categoryMap.get(key))
+		.filter((category): category is DatabaseStorageCategorySummary => Boolean(category))
+		.filter((category) => category.totalBytes > 0 || category.tableCount > 0);
+	const topTables = tableSummaries
+		.filter((table) => table.totalBytes > 0 || table.approxContentBytes > 0)
+		.sort((a, b) => b.totalBytes - a.totalBytes || a.name.localeCompare(b.name))
+		.slice(0, 12);
+
+	return {
+		pageSize,
+		pageCount,
+		freelistBytes,
+		objectBytes,
+		scanMode: dbstat.supported ? "dbstat" : "approximate",
+		categories,
+		topTables,
 	};
 }
 
@@ -391,61 +732,72 @@ async function collectSessionAggregateStats(narratorIds: string[]): Promise<Sess
 		};
 	}
 	return withTempIdTable(narratorIds, "cleanup_narrators", async (narratorTable) => {
-		const narrators = countQuery(
-			`FROM narrators n JOIN ${narratorTable} target_n ON target_n.id = n.id`,
-		);
-		const toolCalls = countQuery(
-			`FROM narrator_tool_calls tc JOIN ${narratorTable} target_n ON target_n.id = tc.narrator_id`,
-		);
-		const apiRequests = countQuery(
-			`FROM api_requests ar JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id`,
-		);
-		const dumpsCleared = countQuery(
-			`FROM api_requests ar
-			 JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id
-			 WHERE ar.raw_dump_json IS NOT NULL`,
-		);
-		const narratorBytes = sumBytesQuery(
-			NARRATOR_BYTES_EXPR,
-			`FROM narrators n JOIN ${narratorTable} target_n ON target_n.id = n.id`,
-		);
-		const messageRefBytes = sumBytesQuery(
-			MESSAGE_REF_BYTES_EXPR,
-			`FROM narrator_message_refs r JOIN ${narratorTable} target_n ON target_n.id = r.narrator_id`,
-		);
-		const toolCallBytes = sumBytesQuery(
-			TOOL_CALL_BYTES_EXPR,
-			`FROM narrator_tool_calls tc JOIN ${narratorTable} target_n ON target_n.id = tc.narrator_id`,
-		);
-		const apiRequestBytes = sumBytesQuery(
-			API_REQUEST_BYTES_EXPR,
-			`FROM api_requests ar JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id`,
-		);
+		const narratorFrom = `FROM narrators n JOIN ${narratorTable} target_n ON target_n.id = n.id`;
+		const narrators = countQuery(narratorFrom);
+		let toolCalls = 0;
+		let apiRequests = 0;
+		let approxBytes = sumTableApproxBytes("narrators", "n", narratorFrom);
 
-		const messageIds = sqlite
-			.prepare(
-				`SELECT m.id AS id
-			 FROM narrator_messages m
-			 JOIN ${narratorTable} target_n ON target_n.id = m.narrator_id
-			 WHERE NOT EXISTS (
-				SELECT 1
-				FROM narrator_message_refs r
-				WHERE r.message_id = m.id
-				  AND r.narrator_id NOT IN (SELECT id FROM ${narratorTable})
-			 )`,
-			)
-			.all() as Array<{ id: string }>;
+		for (const relation of SESSION_OWNED_TABLES) {
+			if (!tableExists(relation.tableName)) continue;
+			const fromClause = `FROM ${quoteIdentifier(relation.tableName)} ${relation.alias}
+				JOIN ${narratorTable} target_n ON target_n.id = ${relation.alias}.${quoteIdentifier(
+					relation.narratorColumn,
+				)}`;
+			const count = countQuery(fromClause);
+			approxBytes += sumTableApproxBytes(relation.tableName, relation.alias, fromClause);
+			if (relation.countAs === "toolCalls") {
+				toolCalls += count;
+			} else if (relation.countAs === "apiRequests") {
+				apiRequests += count;
+			}
+		}
+
+		let dumpsCleared = 0;
+		if (tableExists("api_requests")) {
+			dumpsCleared = countQuery(
+				`FROM api_requests ar
+				 JOIN ${narratorTable} target_n ON target_n.id = ar.narrator_id
+				 WHERE ar.raw_dump_json IS NOT NULL`,
+			);
+		}
+
+		if (tableExists("background_tasks")) {
+			const fromClause = `FROM background_tasks bt
+				WHERE EXISTS (
+					SELECT 1 FROM ${narratorTable} target_n
+					WHERE target_n.id = bt.parent_narrator_id
+					   OR target_n.id = bt.subagent_narrator_id
+				)`;
+			approxBytes += sumTableApproxBytes("background_tasks", "bt", fromClause);
+		}
+
+		const messageIds = tableExists("narrator_messages")
+			? (sqlite
+					.prepare(
+						`SELECT m.id AS id
+				 FROM narrator_messages m
+				 JOIN ${narratorTable} target_n ON target_n.id = m.narrator_id
+				 WHERE NOT EXISTS (
+					SELECT 1
+					FROM narrator_message_refs r
+					WHERE r.message_id = m.id
+					  AND r.narrator_id NOT IN (SELECT id FROM ${narratorTable})
+				 )`,
+					)
+					.all() as Array<{ id: string }>)
+			: [];
 		const messageIdList = messageIds.map((row) => row.id);
 		let messages = 0;
-		let messageBytes = 0;
 		if (messageIdList.length > 0) {
 			messages = messageIdList.length;
-			messageBytes = await withTempIdTable(
+			approxBytes += await withTempIdTable(
 				messageIdList,
 				"cleanup_messages",
 				async (messageTable) =>
-					sumBytesQuery(
-						MESSAGE_BYTES_EXPR,
+					sumTableApproxBytes(
+						"narrator_messages",
+						"m",
 						`FROM narrator_messages m JOIN ${messageTable} target_m ON target_m.id = m.id`,
 					),
 			);
@@ -457,7 +809,7 @@ async function collectSessionAggregateStats(narratorIds: string[]): Promise<Sess
 			toolCalls,
 			apiRequests,
 			dumpsCleared,
-			approxBytes: narratorBytes + messageRefBytes + toolCallBytes + apiRequestBytes + messageBytes,
+			approxBytes,
 		};
 	});
 }
@@ -659,13 +1011,15 @@ export const databaseCleanupService = {
 				getDatabaseFileSizes(),
 				loadCleanupNarratorContext(),
 			]);
-			const [archivedSessions, staleSessions, apiRequestDumps] = await Promise.all([
+			const [archivedSessions, staleSessions, apiRequestDumps, objectStorage] = await Promise.all([
 				summarizeSessionTarget("archivedSessions", cleanupContext),
 				summarizeSessionTarget("staleSessions", cleanupContext, DEFAULT_STALE_SESSION_DAYS),
 				summarizeDumpTarget(DEFAULT_API_REQUEST_DUMP_DAYS),
+				Promise.resolve(scanDatabaseObjectStorage(fileSizes.mainBytes)),
 			]);
 			return {
 				...fileSizes,
+				...objectStorage,
 				cleanupCandidates: {
 					archivedSessions,
 					staleSessions,
@@ -708,7 +1062,7 @@ export const databaseCleanupService = {
 		try {
 			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
 				const beforeSizes = await getDatabaseFileSizes();
-				const beforeBytes = beforeSizes.mainBytes + beforeSizes.walBytes + beforeSizes.shmBytes;
+				const beforeBytes = totalDatabaseBytes(beforeSizes);
 				let preview: DatabaseCleanupPreviewResult;
 				let changed = false;
 
@@ -744,7 +1098,7 @@ export const databaseCleanupService = {
 
 				const vacuumRan = compactDatabaseIfNeeded(changed);
 				const afterSizes = await getDatabaseFileSizes();
-				const afterBytes = afterSizes.mainBytes + afterSizes.walBytes + afterSizes.shmBytes;
+				const afterBytes = totalDatabaseBytes(afterSizes);
 				const result: DatabaseCleanupExecutionResult = {
 					...preview,
 					ok: true,
@@ -766,6 +1120,67 @@ export const databaseCleanupService = {
 			});
 		} finally {
 			logSlowDatabaseStep("executeCleanup", startedAt, { target });
+		}
+	},
+
+	async vacuumDatabase(): Promise<DatabaseVacuumResult> {
+		const startedAt = performance.now();
+		try {
+			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
+				const beforeSizes = await getDatabaseFileSizes();
+				const beforeBytes = totalDatabaseBytes(beforeSizes);
+				const beforeStorage = scanDatabaseObjectStorage(beforeSizes.mainBytes);
+				let checkpointRan = false;
+				let optimized = false;
+
+				try {
+					sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+					checkpointRan = true;
+				} catch (error) {
+					logger.warn("Database checkpoint before VACUUM failed", { error: String(error) });
+				}
+
+				sqlite.run("VACUUM");
+
+				try {
+					sqlite.run("PRAGMA optimize");
+					optimized = true;
+				} catch (error) {
+					logger.warn("Database optimize after VACUUM failed", { error: String(error) });
+				}
+
+				try {
+					sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+					checkpointRan = true;
+				} catch (error) {
+					logger.warn("Database checkpoint after VACUUM failed", { error: String(error) });
+				}
+
+				const afterSizes = await getDatabaseFileSizes();
+				const afterBytes = totalDatabaseBytes(afterSizes);
+				const afterStorage = scanDatabaseObjectStorage(afterSizes.mainBytes);
+				const result: DatabaseVacuumResult = {
+					ok: true,
+					beforeBytes,
+					afterBytes,
+					freedBytes: Math.max(0, beforeBytes - afterBytes),
+					freelistBeforeBytes: beforeStorage.freelistBytes,
+					freelistAfterBytes: afterStorage.freelistBytes,
+					vacuumRan: true,
+					checkpointRan,
+					optimized,
+					durationMs: Math.round(performance.now() - startedAt),
+				};
+				logger.info("Database VACUUM completed", {
+					freedBytes: result.freedBytes,
+					freelistBeforeBytes: result.freelistBeforeBytes,
+					freelistAfterBytes: result.freelistAfterBytes,
+					durationMs: result.durationMs,
+				});
+				return result;
+			});
+		} finally {
+			logSlowDatabaseStep("vacuumDatabase", startedAt);
 		}
 	},
 };

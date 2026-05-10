@@ -447,8 +447,10 @@ narratorRoutes.get("/", async (c) => {
 			}
 		}
 
-		// Batch fetch presence
+		// Batch fetch presence and goal state
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
+		const activeGoalNarratorIds =
+			await narratorGoalService.getNarratorIdsWithActiveGoals(narratorIds);
 
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n),
@@ -457,6 +459,7 @@ narratorRoutes.get("/", async (c) => {
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
 			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
+			hasActiveGoal: activeGoalNarratorIds.has(n.id),
 		}));
 
 		return c.json({ items, hasMore, nextCursor, totalCount });
@@ -1816,14 +1819,11 @@ narratorRoutes.patch("/:id/mark-read", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 	if (isSubagentVariant(narrator.variant)) return c.json({ ok: true });
-	if (
-		narrator.status === "idle" &&
-		narrator.substatus?.includes("unread") &&
-		!narrator.errorMessage
-	) {
-		// Atomic CAS: only clear unread substatus if status is still "idle".
-		// Avoids clobbering a "working" state set by a concurrent sendMessage.
-		await narratorService.compareAndSetStatus(id, "idle", "idle", { substatus: [] });
+	const currentSubstatus = parseSubstatus(narrator.substatus);
+	if (narrator.status === "idle" && currentSubstatus.includes("unread") && !narrator.errorMessage) {
+		// Only remove the unread tag. Other tags (e.g. compacting/suspended/manual_override)
+		// can coexist with unread and must not be clobbered by a read acknowledgement.
+		await narratorService.removeSubstatus(id, "unread");
 	}
 	return c.json({ ok: true });
 });

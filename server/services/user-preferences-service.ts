@@ -1,8 +1,14 @@
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
+import {
+	containerInstances,
+	narratorGoals,
+	narrators,
+	terminals,
+	userPreferences,
+} from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
-import { parseDraftTrait } from "../lib/narrator-utils";
+import { parseDraftTrait, parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
@@ -133,21 +139,39 @@ export async function enrichTabs(
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
-		// Narrator status + draft marker
+		// Narrator status + draft/active-goal markers
 		const rows = await db
-			.select({ id: narrators.id, status: narrators.status, traits: narrators.traits })
+			.select({
+				id: narrators.id,
+				status: narrators.status,
+				substatus: narrators.substatus,
+				traits: narrators.traits,
+			})
 			.from(narrators)
 			.where(inArray(narrators.id, narratorIds));
+		const activeGoalRows = await db
+			.select({ narratorId: narratorGoals.narratorId })
+			.from(narratorGoals)
+			.where(
+				and(inArray(narratorGoals.narratorId, narratorIds), eq(narratorGoals.status, "active")),
+			)
+			.groupBy(narratorGoals.narratorId);
 		const narratorMap = new Map(rows.map((r) => [r.id, r]));
+		const activeGoalNarratorIds = new Set(activeGoalRows.map((row) => row.narratorId));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
 			const row = nId ? narratorMap.get(nId) : undefined;
 			if (row) {
 				tab.status = row.status;
+				tab.substatus = parseSubstatus(row.substatus);
 				if (parseDraftTrait(row.traits)) tab.hasDraft = true;
 				else delete tab.hasDraft;
+				if (activeGoalNarratorIds.has(row.id)) tab.hasActiveGoal = true;
+				else delete tab.hasActiveGoal;
 			} else {
+				delete tab.substatus;
 				delete tab.hasDraft;
+				delete tab.hasActiveGoal;
 			}
 		}
 

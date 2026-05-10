@@ -29,6 +29,8 @@
 	"usernameTooLong": "用户名不能超过 50 个字符",
 	"usernameInvalidChars": "用户名只能包含字母、数字、连字符和下划线",
 	"firstUserSetup": "还没有用户，请创建第一个管理员账户。",
+	"firstUserSetupTitle": "初始化当前 NarraFork 实例",
+	"firstUserSetupDescription": "这是为当前 NarraFork 实例（这台机器或服务器）创建第一个本地管理员账户。它只用于登录这套 NarraFork、管理用户、AI 提供商和系统设置；不是注册 NarraFork 云账号，也不会创建外部服务账号。",
 	"createAdmin": "创建管理员账户",
 	"adminPanel": "管理面板",
 	"registrationSettings": "注册设置",

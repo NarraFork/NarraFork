@@ -44,6 +44,7 @@ export function useRecentTabsWS(
 				narratorIds: "*",
 				types: [
 					"status_change",
+					"substatus_change",
 					"narrator:status_changed",
 					"title_updated",
 					"narrator:title_updated",
@@ -52,6 +53,7 @@ export function useRecentTabsWS(
 					"terminal_count_changed",
 					"container_status_changed",
 					"draft_changed",
+					"goals_set",
 				],
 			},
 			(data) => {
@@ -63,6 +65,11 @@ export function useRecentTabsWS(
 						type: "status",
 						status: data.status as string,
 						substatus: data.substatus as string[] | undefined,
+					});
+				} else if (data.type === "substatus_change") {
+					onUpdateRef.current(nId, {
+						type: "status",
+						substatus: data.substatus as string[],
 					});
 				} else if (data.type === "title_updated" || data.type === "narrator:title_updated") {
 					onUpdateRef.current(nId, { type: "title", title: data.title as string });
@@ -90,6 +97,15 @@ export function useRecentTabsWS(
 					onUpdateRef.current(nId, {
 						type: "draft",
 						hasDraft: !!data.hasDraft,
+					});
+				} else if (data.type === "goals_set") {
+					const goals = Array.isArray(data.goals)
+						? (data.goals as NonNullable<NarratorListWSEvent["goals"]>)
+						: [];
+					onUpdateRef.current(nId, {
+						type: "goals",
+						goals,
+						hasActiveGoal: goals.some((goal) => goal.status === "active"),
 					});
 				}
 			},

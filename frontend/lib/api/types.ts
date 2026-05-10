@@ -68,10 +68,53 @@ export interface DatabaseCleanupCandidateSummary {
 	retentionDays?: number;
 }
 
+export type DatabaseStorageCategoryKey =
+	| "sessions"
+	| "apiRequests"
+	| "projects"
+	| "runtime"
+	| "users"
+	| "search"
+	| "gateway"
+	| "benchmarks"
+	| "internal"
+	| "free"
+	| "other";
+
+export type DatabaseTableKind = "table" | "virtual" | "shadow" | "internal";
+
+export interface DatabaseStorageCategorySummary {
+	key: DatabaseStorageCategoryKey;
+	tableCount: number;
+	rowCount: number;
+	approxContentBytes: number;
+	diskBytes: number;
+	indexBytes: number;
+	totalBytes: number;
+}
+
+export interface DatabaseStorageTableSummary {
+	name: string;
+	category: DatabaseStorageCategoryKey;
+	kind: DatabaseTableKind;
+	rowCount: number | null;
+	approxContentBytes: number;
+	diskBytes: number;
+	indexBytes: number;
+	totalBytes: number;
+}
+
 export interface DatabaseStorageBreakdown {
 	mainBytes: number;
 	walBytes: number;
 	shmBytes: number;
+	pageSize?: number;
+	pageCount?: number;
+	freelistBytes?: number;
+	objectBytes?: number;
+	scanMode?: "dbstat" | "approximate";
+	categories?: DatabaseStorageCategorySummary[];
+	topTables?: DatabaseStorageTableSummary[];
 	cleanupCandidates: {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
@@ -151,6 +194,19 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+}
+
+export interface DatabaseVacuumResult {
+	ok: true;
+	beforeBytes: number;
+	afterBytes: number;
+	freedBytes: number;
+	freelistBeforeBytes: number;
+	freelistAfterBytes: number;
+	vacuumRan: boolean;
+	checkpointRan: boolean;
+	optimized: boolean;
+	durationMs: number;
 }
 
 export interface RuntimeScanResult {

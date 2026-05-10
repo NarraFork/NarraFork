@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
 import { z } from "zod";
+import { gitAvailable, recheckGit } from "../lib/git-status";
 import { generateShortId } from "../lib/id";
 import { mcpManager } from "../lib/mcp/manager";
 import { syncMcpTools } from "../lib/mcp/tool-bridge";
@@ -11,6 +12,13 @@ import { chapterMerge } from "../services/chapter-merge";
 import { chapterService } from "../services/chapter-service";
 import { narratorContext } from "../services/narrator-context";
 import { narratorService } from "../services/narrator-service";
+
+function assertGitAvailableForMcp(): void {
+	if (gitAvailable || recheckGit()) return;
+	throw new Error(
+		"GIT_NOT_INSTALLED: Git is not installed. Please install git and retry this Git-dependent action.",
+	);
+}
 
 function createMcpServer(): McpServer {
 	const server = new McpServer({
@@ -66,6 +74,7 @@ function createMcpServer(): McpServer {
 		},
 		async ({ chapterId, title, inheritMode }) => {
 			try {
+				assertGitAvailableForMcp();
 				const chapter = await chapterFork.fork(chapterId, { title, inheritMode });
 				return {
 					content: [{ type: "text", text: JSON.stringify(chapter, null, 2) }],
@@ -91,6 +100,7 @@ function createMcpServer(): McpServer {
 		},
 		async ({ chapterId, targetChapterId, strategy }) => {
 			try {
+				assertGitAvailableForMcp();
 				const result = await chapterMerge.merge(chapterId, { targetChapterId, strategy });
 				return {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -115,6 +125,7 @@ function createMcpServer(): McpServer {
 		},
 		async ({ chapterId, targetChapterId }) => {
 			try {
+				assertGitAvailableForMcp();
 				const result = await chapterMerge.checkConflicts(chapterId, targetChapterId);
 				return {
 					content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

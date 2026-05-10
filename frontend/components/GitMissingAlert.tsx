@@ -23,8 +23,8 @@ const MODAL_Z_INDEX = OVERLAY_Z_INDEX + 1;
 /**
  * Full-screen overlay shown when the backend reports git is not installed.
  * Provides one-click install (when a package manager is detected), a manual
- * download link, a recheck button, and a "skip" option so the user isn't
- * completely blocked from accessing settings / provider configuration.
+ * download link, a recheck button, and a "skip" option. It is only shown after
+ * login so first-time account creation is not blocked by Git setup.
  */
 export function GitMissingAlert() {
 	const { t } = useTranslation("common");
@@ -41,14 +41,15 @@ export function GitMissingAlert() {
 		queryKey: ["health"],
 		queryFn: () => api.health(),
 		staleTime: Number.POSITIVE_INFINITY,
+		enabled: hasToken,
 	});
 
 	const { data: deps } = useQuery({
 		queryKey: ["dependencies"],
 		queryFn: api.checkDependencies,
 		staleTime: 5 * 60 * 1000,
-		// Only fetch when git is missing
-		enabled: !!health && !health.gitAvailable,
+		// Only fetch when an authenticated user can act on missing Git.
+		enabled: hasToken && !!health && !health.gitAvailable,
 	});
 
 	const installMutation = useMutation({
@@ -66,8 +67,8 @@ export function GitMissingAlert() {
 		},
 	});
 
-	// Don't render anything if health hasn't loaded yet or git is available
-	if (!health || health.gitAvailable) return null;
+	// Don't render anything before login, while health is loading, or when Git is available.
+	if (!hasToken || !health || health.gitAvailable) return null;
 
 	// User chose to skip — let them through
 	if (skipped) return null;

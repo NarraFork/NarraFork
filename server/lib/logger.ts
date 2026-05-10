@@ -15,8 +15,24 @@ const consoleMethods: Record<LogLevel, (msg: string) => void> = {
 	error: (msg) => console.error(msg),
 };
 
+function pad(value: number, length = 2): string {
+	return String(value).padStart(length, "0");
+}
+
+function formatLocalTimestamp(date = new Date()): string {
+	const offsetMinutes = -date.getTimezoneOffset();
+	const sign = offsetMinutes >= 0 ? "+" : "-";
+	const absOffsetMinutes = Math.abs(offsetMinutes);
+	const offsetHours = Math.floor(absOffsetMinutes / 60);
+	const offsetRemainderMinutes = absOffsetMinutes % 60;
+
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+		date.getHours(),
+	)}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${sign}${pad(offsetHours)}:${pad(offsetRemainderMinutes)}`;
+}
+
 function log(level: LogLevel, message: string, data?: Record<string, unknown>) {
-	const entry = JSON.stringify({ ts: new Date().toISOString(), level, msg: message, ...data });
+	const entry = JSON.stringify({ ts: formatLocalTimestamp(), level, msg: message, ...data });
 	consoleMethods[level](entry);
 	try {
 		appendFileSync(logPath, `${entry}\n`);

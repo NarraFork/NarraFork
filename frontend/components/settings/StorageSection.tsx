@@ -38,6 +38,7 @@ import {
 	type DatabaseCleanupPreviewResult,
 	type DatabaseCleanupTarget,
 	type DatabaseStorageBreakdown,
+	type DatabaseVacuumResult,
 	type StorageCategoryResult,
 	type StorageScanResult,
 	scanStorageStream,
@@ -144,6 +145,7 @@ export function StorageSection() {
 	const [databasePreviewLoading, setDatabasePreviewLoading] = useState(false);
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
 	const [databaseCleaning, setDatabaseCleaning] = useState(false);
+	const [databaseVacuuming, setDatabaseVacuuming] = useState(false);
 	const abortRef = useRef<AbortController | null>(null);
 
 	const { data: settingsData } = useQuery({
@@ -341,6 +343,31 @@ export function StorageSection() {
 		}
 	};
 
+	const handleDatabaseVacuum = async () => {
+		if (!(await confirm({ message: t("storageDatabaseVacuumConfirm") }))) return;
+		setDatabaseVacuuming(true);
+		try {
+			const result: DatabaseVacuumResult = await api.vacuumDatabase();
+			notifications.show({
+				color: result.freedBytes > 0 ? "green" : "blue",
+				message: t("storageDatabaseVacuumSuccess", {
+					size: formatBytes(result.freedBytes),
+					freeBefore: formatBytes(result.freelistBeforeBytes),
+					duration: (result.durationMs / 1000).toFixed(1),
+				}),
+			});
+			void handleScan();
+		} catch (err) {
+			console.error("Database VACUUM failed:", err);
+			notifications.show({
+				color: "red",
+				message: t("storageDatabaseVacuumFailed"),
+			});
+		} finally {
+			setDatabaseVacuuming(false);
+		}
+	};
+
 	const getCategory = (key: string): StorageCategoryResult | undefined =>
 		scanResult?.categories.find((c) => c.key === key);
 
@@ -380,6 +407,13 @@ export function StorageSection() {
 
 	const databaseCategory = getCategory("database");
 	const databaseDetails = getDatabaseBreakdown(databaseCategory);
+	const databaseUnreleasedBytes =
+		(databaseDetails?.freelistBytes ?? 0) + (databaseDetails?.walBytes ?? 0);
+	const canVacuumDatabase = Boolean(databaseDetails) && databaseUnreleasedBytes > 0;
+	const databaseUsageCategories =
+		databaseDetails?.categories?.filter((category) => category.totalBytes > 0) ?? [];
+	const databaseTopTables =
+		databaseDetails?.topTables?.filter((table) => table.totalBytes > 0) ?? [];
 	const databaseRows = databaseDetails
 		? [
 				{
@@ -519,6 +553,86 @@ export function StorageSection() {
 										{isDatabase && databaseDetails && (
 											<>
 												<Divider />
+												{databaseUsageCategories.length > 0 && (
+													<Stack gap="xs">
+														<Group justify="space-between" align="center" gap="xs">
+															<Text size="sm" fw={500}>
+																{t("storageDatabaseUsageTitle")}
+															</Text>
+															<Group gap="xs">
+																{databaseDetails.scanMode && (
+																	<Badge size="xs" variant="outline" color="gray">
+																		{t(
+																			`storageDatabaseScanMode_${databaseDetails.scanMode}` as never,
+																		)}
+																	</Badge>
+																)}
+																<Button
+																	size="xs"
+																	variant="light"
+																	color="orange"
+																	loading={databaseVacuuming}
+																	disabled={!canVacuumDatabase || scanning}
+																	onClick={handleDatabaseVacuum}
+																>
+																	{t("storageDatabaseVacuum")}
+																</Button>
+															</Group>
+														</Group>
+
+														{databaseDetails.objectBytes != null && (
+															<Text size="xs" c="dimmed">
+																{t("storageDatabaseUsageDesc", {
+																	objects: formatBytes(databaseDetails.objectBytes),
+																	free: formatBytes(databaseDetails.freelistBytes ?? 0),
+																})}
+															</Text>
+														)}
+														<Stack gap={6}>
+															{databaseUsageCategories.map((category) => (
+																<Paper key={category.key} p="xs" radius="sm" bg="dark.6" withBorder>
+																	<Group
+																		justify="space-between"
+																		align="flex-start"
+																		gap="xs"
+																		wrap="nowrap"
+																	>
+																		<div style={{ flex: 1, minWidth: 0 }}>
+																			<Text size="sm" fw={500}>
+																				{t(`storageDatabaseUsageCategory_${category.key}` as never)}
+																			</Text>
+																			<Text size="xs" c="dimmed">
+																				{category.key === "free"
+																					? t("storageDatabaseUsageFreeStats")
+																					: t("storageDatabaseUsageCategoryStats", {
+																							tables: category.tableCount,
+																							rows: category.rowCount,
+																							indexes: formatBytes(category.indexBytes),
+																						})}
+																			</Text>
+																		</div>
+																		<Badge size="xs" variant="light" color="indigo">
+																			{formatBytes(category.totalBytes)}
+																		</Badge>
+																	</Group>
+																</Paper>
+															))}
+														</Stack>
+														{databaseTopTables.length > 0 && (
+															<Text size="xs" c="dimmed">
+																{t("storageDatabaseTopTables", {
+																	tables: databaseTopTables
+																		.slice(0, 5)
+																		.map(
+																			(table) => `${table.name} ${formatBytes(table.totalBytes)}`,
+																		)
+																		.join(" · "),
+																})}
+															</Text>
+														)}
+													</Stack>
+												)}
+												{databaseUsageCategories.length > 0 && <Divider />}
 												<Stack gap="xs">
 													{databaseRows.map((row) => (
 														<Paper key={row.target} p="xs" radius="sm" bg="dark.6" withBorder>

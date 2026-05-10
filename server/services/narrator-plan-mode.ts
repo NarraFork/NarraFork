@@ -1,6 +1,6 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import { narrators } from "../db/schema";
+import { narratorGoals, narrators } from "../db/schema";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import { addTrait, parseTraits, removeTrait } from "../lib/narrator-utils";
 import { generateWordSlug } from "../lib/words";
@@ -11,6 +11,14 @@ export interface PlanModeStateResult {
 	previousPermissionMode?: string;
 	wasPlanMode: boolean;
 	changed: boolean;
+	relaxedPlan: boolean;
+	relaxedPlanChanged: boolean;
+	activeGoalId?: string;
+}
+
+export interface EnterPlanModeOptions {
+	/** Auto-enable relaxed plan when an agent enters plan mode while pursuing an active goal. */
+	autoRelaxedPlanForActiveGoal?: boolean;
 }
 
 function generatePlanFileId(): string {
@@ -30,7 +38,10 @@ export async function ensureNarratorPlanFileId(
 	return planFileId;
 }
 
-export async function enterNarratorPlanMode(narratorId: string): Promise<PlanModeStateResult> {
+export async function enterNarratorPlanMode(
+	narratorId: string,
+	options: EnterPlanModeOptions = {},
+): Promise<PlanModeStateResult> {
 	return narratorTraitsLock.acquire(narratorId, async () => {
 		const current = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
@@ -39,6 +50,7 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 				previousPermissionMode: true,
 				planFileId: true,
 				planMode: true,
+				relaxedPlan: true,
 				traits: true,
 			},
 		});
@@ -48,7 +60,20 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 			current?.previousPermissionMode ?? current?.permissionMode ?? "default";
 		const planFileId = current?.planFileId ?? generatePlanFileId();
 		const nextTraits = wasPlanMode ? currentTraits : addTrait(currentTraits, "plan");
-		const changed = !wasPlanMode || current?.planMode !== true || !current?.planFileId;
+		const activeGoal =
+			options.autoRelaxedPlanForActiveGoal && !current?.relaxedPlan
+				? await db.query.narratorGoals.findFirst({
+						where: and(
+							eq(narratorGoals.narratorId, narratorId),
+							eq(narratorGoals.status, "active"),
+						),
+						columns: { id: true },
+					})
+				: null;
+		const relaxedPlanChanged = !!activeGoal;
+		const relaxedPlan = current?.relaxedPlan || relaxedPlanChanged;
+		const changed =
+			!wasPlanMode || current?.planMode !== true || !current?.planFileId || relaxedPlanChanged;
 
 		if (changed) {
 			await db
@@ -58,6 +83,7 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 					planMode: true,
 					previousPermissionMode,
 					planFileId,
+					...(relaxedPlanChanged ? { relaxedPlan: true } : {}),
 					updatedAt: new Date().toISOString(),
 				})
 				.where(eq(narrators.id, narratorId));
@@ -69,6 +95,9 @@ export async function enterNarratorPlanMode(narratorId: string): Promise<PlanMod
 			previousPermissionMode,
 			wasPlanMode,
 			changed,
+			relaxedPlan,
+			relaxedPlanChanged,
+			activeGoalId: activeGoal?.id,
 		};
 	});
 }
@@ -81,6 +110,7 @@ export async function exitNarratorPlanMode(narratorId: string): Promise<PlanMode
 				previousPermissionMode: true,
 				planFileId: true,
 				planMode: true,
+				relaxedPlan: true,
 				traits: true,
 			},
 		});
@@ -110,6 +140,8 @@ export async function exitNarratorPlanMode(narratorId: string): Promise<PlanMode
 			traits: nextTraits,
 			wasPlanMode,
 			changed,
+			relaxedPlan: !!current?.relaxedPlan,
+			relaxedPlanChanged: false,
 		};
 	});
 }

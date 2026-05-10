@@ -59,6 +59,7 @@ function getDirtyProviderIds<T extends { id: string }>(
 function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("settings");
+	const { t: tc } = useTranslation("common");
 	const qc = useQueryClient();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const search = useSearch({ strict: false }) as {
@@ -184,8 +185,13 @@ function SettingsProvidersPage() {
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		},
-		onError: () => {
+		onError: (error) => {
 			pendingSnapshot.current = null;
+			notifications.show({
+				title: tc("operationFailed"),
+				message: error instanceof Error ? error.message : tc("unexpectedError"),
+				color: "red",
+			});
 		},
 	});
 	const handleDiscard = useCallback(() => {

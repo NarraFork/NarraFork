@@ -44,6 +44,7 @@
 	"chapterLabel": "Chapter: {{title}}",
 	"projectLabel": "Project: {{name}}",
 	"activeTerminals": "{{count}} terminal(s)",
+	"activeGoal": "Goal",
 	"viewingNow": "Viewing now",
 	"filterHasTerminals": "Has Terminals",
 	"filterHasContainers": "Has Containers",

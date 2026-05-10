@@ -427,6 +427,11 @@ export interface AgentConfig {
 	previousPermissionMode?: string;
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;
+	/**
+	 * Per-session override for ExitPlanMode reflection auto-approval.
+	 * "inherit" follows the current global default at decision time.
+	 */
+	planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 	/** Effective per-session/global value for ExitPlanMode reflection auto-approval. */
 	planReflectionAutoApprove?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */

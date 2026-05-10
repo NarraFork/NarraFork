@@ -1,89 +1,10 @@
-import { existsSync, readdirSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
-import { logger } from "../../logger";
-import { IS_WINDOWS } from "../../platform";
+import { isRgAvailable, RG_INSTALL_HINT, resolveRgPath } from "../../ripgrep";
 import { settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
-const RG_INSTALL_HINT = IS_WINDOWS
-	? "ripgrep (rg) is not installed. Install it with:\n\n  winget install BurntSushi.ripgrep.MSVC\n\nThen restart NarraFork."
-	: "ripgrep (rg) is not installed. Install it with your package manager, e.g.:\n\n  # macOS\n  brew install ripgrep\n\n  # Ubuntu/Debian\n  sudo apt install ripgrep\n\nThen restart NarraFork.";
-
-/**
- * Scan the WinGet packages directory for any ripgrep package folder.
- * The folder name contains a version-dependent hash (e.g.
- * `BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe`)
- * so we cannot hard-code it — instead we glob for `BurntSushi.ripgrep*`.
- */
-function findRgInWinGet(): string | undefined {
-	const localAppData = process.env.LOCALAPPDATA;
-	if (!localAppData) return undefined;
-	const packagesDir = join(localAppData, "Microsoft", "WinGet", "Packages");
-	try {
-		const entries = readdirSync(packagesDir);
-		for (const entry of entries) {
-			if (entry.toLowerCase().startsWith("burntsushi.ripgrep")) {
-				const candidate = join(packagesDir, entry, "rg.exe");
-				if (existsSync(candidate)) return candidate;
-			}
-		}
-	} catch {
-		// Directory doesn't exist or not readable
-	}
-	return undefined;
-}
-
-/** Resolve the ripgrep binary path. Returns null when rg cannot be found. */
-function findRg(): string | null {
-	if (IS_WINDOWS) {
-		// 1. Static well-known paths (scoop, chocolatey, cargo, Program Files)
-		const winPaths = [
-			`${process.env.USERPROFILE ?? ""}\\scoop\\shims\\rg.exe`,
-			`${process.env.ProgramData ?? "C:\\ProgramData"}\\chocolatey\\bin\\rg.exe`,
-			`${process.env.ProgramFiles ?? "C:\\Program Files"}\\ripgrep\\rg.exe`,
-			`${process.env.USERPROFILE ?? ""}\\.cargo\\bin\\rg.exe`,
-		];
-		for (const p of winPaths) {
-			if (p && existsSync(p)) return p;
-		}
-		// 2. WinGet packages (dynamic folder name)
-		const winget = findRgInWinGet();
-		if (winget) return winget;
-		// 3. Ask the OS to find it on PATH
-		const which = Bun.which("rg");
-		if (which) return which;
-		// Not found
-		return null;
-	}
-	const systemPaths = [
-		"/usr/bin/rg",
-		"/usr/local/bin/rg",
-		"/opt/homebrew/bin/rg",
-		"/home/linuxbrew/.linuxbrew/bin/rg",
-	];
-	for (const p of systemPaths) {
-		if (existsSync(p)) return p;
-	}
-	// Last check via PATH
-	const which = Bun.which("rg");
-	if (which) return which;
-	return null;
-}
-
-const RG_PATH = findRg();
-
-/** Whether ripgrep is available on this system. */
-export const isRgAvailable = RG_PATH !== null;
-
-// Log a warning at startup so the user sees it in the server console
-if (!RG_PATH) {
-	logger.warn(
-		IS_WINDOWS
-			? "ripgrep (rg) not found — Grep tool will be unavailable. Install: winget install BurntSushi.ripgrep.MSVC"
-			: "ripgrep (rg) not found — Grep tool will be unavailable. Install via your package manager (e.g. brew install ripgrep, apt install ripgrep).",
-	);
-}
+export { isRgAvailable };
 
 const DESCRIPTION = `A powerful search tool built on ripgrep
 
@@ -227,7 +148,8 @@ export const grepTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		if (!RG_PATH) {
+		const rgPath = await resolveRgPath();
+		if (!rgPath) {
 			return { output: RG_INSTALL_HINT, isError: true };
 		}
 
@@ -271,7 +193,7 @@ export const grepTool: ToolDefinition = {
 		searchPath = isAbsolute(searchPath) ? searchPath : resolve(ctx.cwd, searchPath);
 
 		// Build rg arguments
-		const rgArgs: string[] = [RG_PATH, "--hidden", "--no-messages"];
+		const rgArgs: string[] = [rgPath, "--hidden", "--no-messages"];
 
 		// When legacy encoding is enabled, use --encoding none so rg doesn't skip
 		// non-UTF-8 files. This makes rg search raw bytes, allowing matches in

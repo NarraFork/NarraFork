@@ -23,6 +23,8 @@ interface DiffViewProps {
 	lineNumberPrefix?: string;
 	/** Enable streaming auto-follow for the scrollable diff container. */
 	autoFollowKey?: string | number | null;
+	/** During replacement streaming, follow the latest added line instead of the diff bottom. */
+	autoFollowTarget?: "bottom" | "latest-added";
 }
 
 type DiffLine = {
@@ -371,18 +373,40 @@ function formatGutter(
 	return `${old} ${nw}${prefix}`;
 }
 
+const DIFF_AUTO_FOLLOW_TARGET_ATTR = "data-diff-auto-follow-target";
+
+function scrollToDiffTarget(el: HTMLElement) {
+	const target = el.querySelector<HTMLElement>(`[${DIFF_AUTO_FOLLOW_TARGET_ATTR}="true"]`);
+	if (!target) {
+		el.scrollTop = el.scrollHeight;
+		return;
+	}
+	const margin = 24;
+	const targetTop = target.offsetTop;
+	const targetBottom = targetTop + target.offsetHeight;
+	const viewportTop = el.scrollTop;
+	const viewportBottom = viewportTop + el.clientHeight;
+	if (targetBottom + margin > viewportBottom) {
+		el.scrollTop = Math.max(0, targetBottom - el.clientHeight + margin);
+	} else if (targetTop - margin < viewportTop) {
+		el.scrollTop = Math.max(0, targetTop - margin);
+	}
+}
+
 const DiffLineRow = memo(function DiffLineRow({
 	line,
 	tokens,
 	diffStyles,
 	lineNoWidth,
 	lineNumberPrefix,
+	autoFollowTarget,
 }: {
 	line: DiffLine;
 	tokens?: ThemedToken[];
 	diffStyles: ReturnType<typeof getDiffStyles>;
 	lineNoWidth?: number;
 	lineNumberPrefix?: string;
+	autoFollowTarget?: boolean;
 }) {
 	const prefix = line.type === "removed" ? "-" : line.type === "added" ? "+" : " ";
 	const lineStyle =
@@ -399,7 +423,10 @@ const DiffLineRow = memo(function DiffLineRow({
 				: "var(--mantine-color-dimmed)";
 
 	return (
-		<div style={lineStyle}>
+		<div
+			style={lineStyle}
+			{...(autoFollowTarget ? { [DIFF_AUTO_FOLLOW_TARGET_ATTR]: "true" } : {})}
+		>
 			{lineNoWidth != null ? (
 				<span style={{ ...lineNoGutterStyle, color: gutterColor }}>
 					{formatGutter(line.oldLineNo, line.newLineNo, prefix, lineNoWidth, lineNumberPrefix)}
@@ -452,6 +479,7 @@ export const DiffView = memo(function DiffView({
 	startLine,
 	lineNumberPrefix,
 	autoFollowKey,
+	autoFollowTarget = "bottom",
 }: DiffViewProps) {
 	const computedScheme = useComputedColorScheme("dark");
 	const isDark = computedScheme === "dark";
@@ -493,6 +521,8 @@ export const DiffView = memo(function DiffView({
 				};
 
 	const truncated = lines.length >= MAX_DIFF_LINES;
+	const latestAddedIndex =
+		autoFollowTarget === "latest-added" ? lines.findLastIndex((line) => line.type === "added") : -1;
 
 	const content = (
 		<div style={wordWrap ? undefined : { minWidth: "fit-content" }}>
@@ -506,6 +536,7 @@ export const DiffView = memo(function DiffView({
 						diffStyles={diffStyles}
 						lineNoWidth={lineNoWidth}
 						lineNumberPrefix={lineNumberPrefix}
+						autoFollowTarget={i === latestAddedIndex}
 					/>
 				);
 			})}
@@ -519,7 +550,12 @@ export const DiffView = memo(function DiffView({
 
 	if (autoFollowKey != null) {
 		return (
-			<AutoFollowScroll asChild followKey={autoFollowKey} deps={[oldStr, newStr, tokenMap]}>
+			<AutoFollowScroll
+				asChild
+				followKey={autoFollowKey}
+				deps={[oldStr, newStr, tokenMap]}
+				followTo={autoFollowTarget === "latest-added" ? scrollToDiffTarget : undefined}
+			>
 				<Box style={style}>{content}</Box>
 			</AutoFollowScroll>
 		);

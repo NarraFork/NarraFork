@@ -44,12 +44,17 @@ function seedRecentTabs(tabs: unknown[]) {
 		.run();
 }
 
-function seedNarrator(id: string) {
+function seedNarrator(
+	id: string,
+	opts: { status?: "idle" | "working" | "waiting" | "archived"; substatus?: string[] } = {},
+) {
 	db.insert(narrators)
 		.values({
 			id,
 			type: "primary",
 			inheritMode: "fresh",
+			status: opts.status,
+			substatus: opts.substatus ? JSON.stringify(opts.substatus) : undefined,
 			createdAt: NOW,
 			updatedAt: NOW,
 		})
@@ -185,5 +190,46 @@ describe("recent tabs pinned ordering", () => {
 			"project:other-project",
 		]);
 		expect(tabs[2]?.workspaceId).toBe("ws-1");
+	});
+});
+
+describe("recent tabs narrator substatus enrichment", () => {
+	it("returns live narrator substatus for recent tabs", async () => {
+		seedNarrator("n-unread", { substatus: ["unread", "compacting"] });
+		seedRecentTabs([
+			{
+				type: "narrator",
+				id: "n-unread",
+				title: "Unread narrator",
+				status: "idle",
+				lastVisitedAt: 100,
+			},
+		]);
+
+		const res = await app.request("/");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { recentTabs: Array<Record<string, unknown>> };
+
+		expect(body.recentTabs[0]?.status).toBe("idle");
+		expect(body.recentTabs[0]?.substatus).toEqual(["unread", "compacting"]);
+	});
+
+	it("removes stale substatus when the narrator no longer exists", async () => {
+		seedRecentTabs([
+			{
+				type: "narrator",
+				id: "missing-narrator",
+				title: "Missing narrator",
+				status: "idle",
+				substatus: ["unread"],
+				lastVisitedAt: 100,
+			},
+		]);
+
+		const res = await app.request("/");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { recentTabs: Array<Record<string, unknown>> };
+
+		expect(body.recentTabs[0]?.substatus).toBeUndefined();
 	});
 });

@@ -18,7 +18,7 @@ import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
-import { resolveBooleanOverride } from "../lib/boolean-override";
+import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError } from "../lib/errors";
@@ -983,16 +983,26 @@ export async function runAgentLoop(
 					});
 				},
 				onEnterPlanMode: async () => {
-					const planState = await enterNarratorPlanMode(narratorId);
+					const planState = await enterNarratorPlanMode(narratorId, {
+						autoRelaxedPlanForActiveGoal: true,
+					});
 					active._planFileId = planState.planFileId;
 					active._previousPermissionMode = planState.previousPermissionMode;
-					if (planState.wasPlanMode) return;
-					broadcastToNarrator(narratorId, {
-						type: "plan_mode_changed",
-						narratorId,
-						planMode: true,
-						traits: redactDraftTraits(planState.traits),
-					});
+					if (!planState.wasPlanMode) {
+						broadcastToNarrator(narratorId, {
+							type: "plan_mode_changed",
+							narratorId,
+							planMode: true,
+							traits: redactDraftTraits(planState.traits),
+						});
+					}
+					if (planState.relaxedPlanChanged) {
+						broadcastToNarrator(narratorId, {
+							type: "relaxed_plan_changed",
+							narratorId,
+							relaxedPlan: true,
+						});
+					}
 				},
 				onExitPlanMode: async (toolUseId) => {
 					active._planFileId = undefined;
@@ -1226,9 +1236,8 @@ export async function runAgentLoop(
 				previousPermissionMode:
 					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
 				relaxedPlan: !!freshNarrator.relaxedPlan,
-				planReflectionAutoApprove: resolveBooleanOverride(
+				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
-					settings.agent.planReflectionAutoApprove,
 				),
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,

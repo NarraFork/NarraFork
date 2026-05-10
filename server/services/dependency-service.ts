@@ -8,6 +8,7 @@
 
 import { execSync } from "node:child_process";
 import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { findRgSync, getRgVersionSync } from "../lib/ripgrep";
 import { safeSpawn } from "../lib/spawn";
 import { refreshWindowsPath } from "../lib/win-env";
 
@@ -130,13 +131,8 @@ function checkGit(): DependencyInfo {
 }
 
 function checkRg(): DependencyInfo {
-	const path = Bun.which("rg");
-	let version: string | undefined;
-	if (path) {
-		const out = execQuiet("rg --version");
-		// "ripgrep 14.1.0\n..."
-		version = out?.match(/ripgrep ([\d.]+)/)?.[1] ?? undefined;
-	}
+	const path = findRgSync();
+	const version = getRgVersionSync(path);
 	return {
 		name: "rg",
 		required: false,

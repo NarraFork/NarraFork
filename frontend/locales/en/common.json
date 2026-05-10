@@ -29,6 +29,8 @@
 	"usernameTooLong": "Username must be at most 50 characters",
 	"usernameInvalidChars": "Username can only contain letters, numbers, hyphens, and underscores",
 	"firstUserSetup": "No users yet. Create the first admin account.",
+	"firstUserSetupTitle": "Initialize this NarraFork instance",
+	"firstUserSetupDescription": "This creates the first local administrator account for this NarraFork instance on this machine or server. It is only used to sign in here and manage users, AI providers, and system settings; it is not a NarraFork cloud signup and does not create an external service account.",
 	"createAdmin": "Create Admin Account",
 	"adminPanel": "Admin Panel",
 	"registrationSettings": "Registration Settings",

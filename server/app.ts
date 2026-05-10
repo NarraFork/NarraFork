@@ -150,36 +150,54 @@ app.get("/api/nug/oauth/callback", handleNugOAuthCallback);
 // All routes below require authentication
 app.use("/api/*", requireAuth);
 
-// When git is not installed, block routes that depend on git operations.
-// Configuration / provider / notification routes remain accessible so the
-// frontend can still render the "install git" dialog and settings pages.
-const GIT_FREE_PREFIXES = [
-	"/api/settings",
-	"/api/learning",
-	"/api/admin",
-	"/api/storage",
-	"/api/runtime",
-	"/api/user-preferences",
-	"/api/notification",
-	"/api/update",
-	"/api/vnet",
-	"/api/routines",
-	"/api/skills",
-	"/api/custom-subagents",
-	"/api/hooks",
-	"/api/openai",
-	"/api/codex",
-	"/api/cline",
-	"/api/anthropic",
-	"/api/nug",
-	"/api/gateway",
-	"/api/terminals",
+// When git is not installed, only block routes that are known to execute git.
+// Most settings, account, AI provider, standalone narrator, search, upload, and
+// database-only routes should remain usable so first-time setup is not blocked by Git.
+type GitRequiredRule = {
+	methods?: readonly string[];
+	pattern: RegExp;
+};
+
+const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
+	// Creating a project invokes git init/clone/repository detection.
+	{ methods: ["POST"], pattern: /^\/api\/projects$/ },
+	// Ruler/NarraFlow routes are backed by git log/rev-list/rebase operations.
+	{ pattern: /^\/api\/projects\/[^/]+\/ruler(?:\/|$)/ },
+	// Chapter lifecycle and merge operations create/remove branches and worktrees.
+	{ methods: ["POST"], pattern: /^\/api\/chapters$/ },
+	{ methods: ["DELETE"], pattern: /^\/api\/chapters\/[^/]+$/ },
+	{ methods: ["POST"], pattern: /^\/api\/chapters\/(?:cleanup|batch-merge)$/ },
+	{
+		methods: ["GET", "POST"],
+		pattern:
+			/^\/api\/chapters\/[^/]+\/(?:fork|review|merge-check|merge|ai-resolve|unmerge|dormant|wake|git-status)(?:\/|$)/,
+	},
+	// Git panel endpoints are explicitly git-backed.
+	{ pattern: /^\/api\/chapters\/[^/]+\/git(?:\/|$)/ },
+	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
+	// back to database records, so they are intentionally not blocked here.
+	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
 ];
+
+function requiresGit(method: string, path: string): boolean {
+	const upperMethod = method.toUpperCase();
+	return GIT_REQUIRED_RULES.some((rule) => {
+		if (rule.methods && !rule.methods.includes(upperMethod)) return false;
+		return rule.pattern.test(path);
+	});
+}
+
 app.use("/api/*", async (c, next) => {
-	if (gitAvailable) return next();
 	const path = c.req.path;
-	if (GIT_FREE_PREFIXES.some((p) => path.startsWith(p))) return next();
-	return c.json({ error: "Git is not installed. Please install git and restart NarraFork." }, 503);
+	if (!requiresGit(c.req.method, path)) return next();
+	if (gitAvailable || recheckGit()) return next();
+	return c.json(
+		{
+			error: "Git is not installed. Please install git and retry this Git-dependent action.",
+			code: "GIT_NOT_INSTALLED",
+		},
+		503,
+	);
 });
 
 app.route("/api/projects", projectRoutes);

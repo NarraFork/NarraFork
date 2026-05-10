@@ -13,8 +13,20 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 
 let minLevel: LogLevel = "info";
 
-function formatTime(): string {
-	return new Date().toISOString();
+function pad(value: number, length = 2): string {
+	return String(value).padStart(length, "0");
+}
+
+function formatTime(date = new Date()): string {
+	const offsetMinutes = -date.getTimezoneOffset();
+	const sign = offsetMinutes >= 0 ? "+" : "-";
+	const absOffsetMinutes = Math.abs(offsetMinutes);
+	const offsetHours = Math.floor(absOffsetMinutes / 60);
+	const offsetRemainderMinutes = absOffsetMinutes % 60;
+
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(
+		date.getHours(),
+	)}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${sign}${pad(offsetHours)}:${pad(offsetRemainderMinutes)}`;
 }
 
 function log(level: LogLevel, message: string, data?: Record<string, unknown>): void {

@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import {
@@ -1078,11 +1079,29 @@ async function resolveGoalCompletionReflection(
 	return { decision, input: toolUse.input };
 }
 
+function resolvePlanReflectionAutoApprove(
+	config: Pick<AgentConfig, "planReflectionAutoApprove" | "planReflectionAutoApproveOverride">,
+): boolean {
+	if (config.planReflectionAutoApproveOverride !== undefined) {
+		return resolveBooleanOverride(
+			config.planReflectionAutoApproveOverride,
+			settings.agent.planReflectionAutoApprove,
+		);
+	}
+	return config.planReflectionAutoApprove ?? settings.agent.planReflectionAutoApprove;
+}
+
 export function shouldRunExitPlanModeReflection(
-	config: Pick<AgentConfig, "reflectionLoop" | "permissionMode" | "planReflectionAutoApprove">,
+	config: Pick<
+		AgentConfig,
+		| "reflectionLoop"
+		| "permissionMode"
+		| "planReflectionAutoApprove"
+		| "planReflectionAutoApproveOverride"
+	>,
 ): boolean {
 	return (
-		(config.planReflectionAutoApprove ?? settings.agent.planReflectionAutoApprove) &&
+		resolvePlanReflectionAutoApprove(config) &&
 		!config.reflectionLoop &&
 		(config.permissionMode === "acceptEdits" || config.permissionMode === "bypassPermissions")
 	);

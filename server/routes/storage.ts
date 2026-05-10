@@ -148,3 +148,12 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 	storageService.invalidateStorageCache();
 	return c.json(result);
 });
+
+/**
+ * POST /api/storage/database/vacuum — Run SQLite VACUUM to release reusable free pages.
+ */
+storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
+	const result = await databaseCleanupService.vacuumDatabase();
+	storageService.invalidateStorageCache();
+	return c.json(result);
+});

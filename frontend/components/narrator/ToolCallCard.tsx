@@ -1950,6 +1950,7 @@ function EditDiffBlock({
 	const title = filePath ? basename(filePath) : "Diff";
 	const displayStartLine = startLine ?? (streaming ? 1 : undefined);
 	const lineNumberPrefix = streaming && !hasReplacement ? "xx" : undefined;
+	const autoFollowTarget = streaming && phase === "replacing" ? "latest-added" : "bottom";
 
 	return (
 		<Box>
@@ -1978,6 +1979,7 @@ function EditDiffBlock({
 							startLine={displayStartLine}
 							lineNumberPrefix={lineNumberPrefix}
 							autoFollowKey={streaming ? filePath : null}
+							autoFollowTarget={autoFollowTarget}
 						/>
 					)}
 				/>

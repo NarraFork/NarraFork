@@ -18,23 +18,20 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { downloadHelperBinary, getHelperBinaryServerBaseUrl } from "../lib/helper-binaries";
 import { logger } from "../lib/logger";
 import { beginGracefulRestartSession, cancelGracefulRestartSession } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
 
-const NARRAFORK_DIR = join(homedir(), ".narrafork");
-const BIN_DIR = join(NARRAFORK_DIR, "bin");
-
 /**
  * Find or download the zstd CLI binary.
- * - Linux/macOS: check system PATH
- * - Windows: check BIN_DIR for cached zstd.exe, download from update server if missing
+ * - Checks system PATH first.
+ * - Falls back to a NarraFork-managed helper binary cached under ~/.narrafork/bin.
  * Returns the path to zstd binary, or null if unavailable.
  */
 async function getZstdCliPath(): Promise<string | null> {
-	// Check system PATH first
 	try {
 		const result = Bun.spawnSync(["zstd", "--version"], {
 			stdout: "pipe",
@@ -45,20 +42,9 @@ async function getZstdCliPath(): Promise<string | null> {
 		// zstd not in PATH
 	}
 
-	// Determine platform-specific binary name
-	let toolName: string;
-	let cachedName: string;
-	if (process.platform === "win32") {
-		toolName = "zstd-win64.exe";
-		cachedName = "zstd.exe";
-	} else if (process.platform === "linux" && process.arch === "arm64") {
-		toolName = "zstd-linux-arm64";
-		cachedName = "zstd";
-	} else if (process.platform === "linux") {
-		toolName = "zstd-linux-x64";
-		cachedName = "zstd";
-	} else if (process.platform === "darwin") {
-		// macOS: try installing via Homebrew
+	if (process.platform === "darwin") {
+		// Keep the existing macOS behavior: Homebrew is the most reliable source
+		// for a signed, architecture-correct zstd binary.
 		const brewResult = Bun.spawnSync(["brew", "install", "zstd"], {
 			stdout: "pipe",
 			stderr: "pipe",
@@ -74,40 +60,24 @@ async function getZstdCliPath(): Promise<string | null> {
 			}
 		}
 		return null;
+	}
+
+	let toolName: string;
+	let cachedName: string;
+	if (process.platform === "win32") {
+		toolName = "zstd-win64.exe";
+		cachedName = "zstd.exe";
+	} else if (process.platform === "linux" && process.arch === "arm64") {
+		toolName = "zstd-linux-arm64";
+		cachedName = "zstd";
+	} else if (process.platform === "linux") {
+		toolName = "zstd-linux-x64";
+		cachedName = "zstd";
 	} else {
-		// Unknown platform
 		return null;
 	}
 
-	// Check cached binary
-	const cached = join(BIN_DIR, cachedName);
-	if (existsSync(cached)) {
-		// Ensure executable
-		try {
-			chmodSync(cached, 0o755);
-		} catch {}
-		return cached;
-	}
-
-	// Download from update server
-	const serverUrl = getServerBaseUrl();
-	if (!serverUrl) return null;
-
-	try {
-		const resp = await fetch(`${serverUrl}/api/v2/tools/${toolName}`);
-		if (resp.ok) {
-			mkdirSync(BIN_DIR, { recursive: true });
-			const buf = Buffer.from(await resp.arrayBuffer());
-			writeFileSync(cached, buf);
-			chmodSync(cached, 0o755);
-			logger.info("Downloaded zstd CLI", { path: cached, size: buf.length });
-			return cached;
-		}
-	} catch (err) {
-		logger.debug("Failed to download zstd CLI", { error: String(err) });
-	}
-
-	return null;
+	return downloadHelperBinary({ toolName, cachedName, displayName: "zstd CLI" });
 }
 
 export interface ReleaseInfo {
@@ -356,15 +326,12 @@ interface V2CheckResponse {
 	}>;
 }
 
-const DEFAULT_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
-
 /**
  * Build the base URL for the update server (strips trailing slash).
  * Falls back to the default update server when the configured URL is empty.
  */
 function getServerBaseUrl(): string {
-	const url = settings.update?.serverUrl || DEFAULT_UPDATE_SERVER_URL;
-	return url.replace(/\/+$/, "");
+	return getHelperBinaryServerBaseUrl();
 }
 
 /**

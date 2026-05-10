@@ -116,9 +116,9 @@ function LoginPage() {
 
 						{needsSetup ? (
 							<>
-								<Text size="sm" c="dimmed" ta="center">
-									{t("firstUserSetup")}
-								</Text>
+								<Alert color="blue" variant="light" title={t("firstUserSetupTitle")}>
+									<Text size="sm">{t("firstUserSetupDescription")}</Text>
+								</Alert>
 								{error && <Alert color="red">{error}</Alert>}
 								<TextInput
 									label={t("username")}

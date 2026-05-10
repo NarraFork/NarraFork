@@ -934,7 +934,8 @@ export interface NarratorListWSEvent {
 		| "presence"
 		| "terminalCount"
 		| "containerStatus"
-		| "draft";
+		| "draft"
+		| "goals";
 	status?: string;
 	substatus?: string[];
 	title?: string;
@@ -948,6 +949,8 @@ export interface NarratorListWSEvent {
 	activeTerminalCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
+	hasActiveGoal?: boolean;
+	goals?: NarratorGoal[];
 }
 
 export function useNarratorsListWS(
@@ -1004,6 +1007,7 @@ export function useNarratorsListWS(
 					"title_updated",
 					"permission_mode_changed",
 					"presence_update",
+					"goals_set",
 				],
 			},
 			(data) => {
@@ -1035,6 +1039,15 @@ export function useNarratorsListWS(
 							type: "presence",
 							viewers: data.viewers as NarratorListWSEvent["viewers"],
 						});
+				} else if (data.type === "goals_set") {
+					if (nId) {
+						const goals = Array.isArray(data.goals) ? (data.goals as NarratorGoal[]) : [];
+						onUpdateRef.current(nId, {
+							type: "goals",
+							goals,
+							hasActiveGoal: goals.some((goal) => goal.status === "active"),
+						});
+					}
 				}
 			},
 		);

@@ -47,6 +47,8 @@ export interface AutoFollowScrollProps extends Omit<BoxProps, "children"> {
 	followKey?: string | number | null;
 	/** Values that should trigger a follow attempt after render. */
 	deps?: readonly unknown[];
+	/** Custom follow behavior. Defaults to scrolling to the container bottom. */
+	followTo?: (el: HTMLElement) => void;
 	/** Allow disabling without changing call sites. Defaults to true. */
 	enabled?: boolean;
 	/** When true, injects `ref` into a single valid child instead of making Box scrollable. */
@@ -61,6 +63,7 @@ export function AutoFollowScroll({
 	children,
 	followKey,
 	deps = [],
+	followTo,
 	enabled = true,
 	asChild,
 	onScroll,
@@ -100,9 +103,9 @@ export function AutoFollowScroll({
 		const el = scrollRef.current;
 		if (!enabled || !el) return;
 		noteProgrammaticScroll();
-		scrollToBottom(el);
+		(followTo ?? scrollToBottom)(el);
 		setShowResume(false);
-	}, [enabled, noteProgrammaticScroll]);
+	}, [enabled, followTo, noteProgrammaticScroll]);
 
 	const registerUserIntent = useCallback(() => {
 		if (!enabled) return;

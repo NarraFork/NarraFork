@@ -101,6 +101,37 @@ describe("ExitPlanMode reflection gate", () => {
 		).toBe(true);
 	});
 
+	test("inherit override follows the current global setting at decision time", () => {
+		const config = {
+			permissionMode: "bypassPermissions",
+			planReflectionAutoApproveOverride: "inherit" as const,
+		};
+
+		setPlanReflectionAutoApprove(false);
+		expect(shouldRunExitPlanModeReflection(config)).toBe(false);
+
+		setPlanReflectionAutoApprove(true);
+		expect(shouldRunExitPlanModeReflection(config)).toBe(true);
+	});
+
+	test("explicit session override takes precedence over the global setting", () => {
+		setPlanReflectionAutoApprove(false);
+		expect(
+			shouldRunExitPlanModeReflection({
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "on",
+			}),
+		).toBe(true);
+
+		setPlanReflectionAutoApprove(true);
+		expect(
+			shouldRunExitPlanModeReflection({
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "off",
+			}),
+		).toBe(false);
+	});
+
 	test("runs in edit-capable modes outside reflection loops", () => {
 		setPlanReflectionAutoApprove(true);
 

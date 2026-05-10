@@ -11,6 +11,7 @@ import {
 	like,
 	lt,
 	ne,
+	or,
 	type SQL,
 	sql,
 } from "drizzle-orm";
@@ -218,6 +219,93 @@ function buildCatchUpCursor(params: {
 		parentLastMessageId: params.parentLastMessageId,
 		childAnchors: trimCursorChildAnchors(anchors),
 	};
+}
+
+type ResolvedChildAnchor = CatchUpChildAnchor & { seq: number };
+
+function refKey(narratorId: string, messageId: string): string {
+	return `${narratorId}\u0000${messageId}`;
+}
+
+async function resolveCatchUpChildAnchors(
+	anchors: CatchUpChildAnchor[],
+): Promise<Map<string, ResolvedChildAnchor>> {
+	const resolved = new Map<string, ResolvedChildAnchor>();
+	const lastMessageIds = [
+		...new Set(anchors.map((anchor) => anchor.lastMessageId).filter((id): id is string => !!id)),
+	];
+	const childMessageMap = new Map<
+		string,
+		{ id: string; narratorId: string; parentToolUseId: string | null }
+	>();
+	const refSeqMap = new Map<string, number>();
+
+	if (lastMessageIds.length > 0) {
+		const [childMessages, childRefs] = await Promise.all([
+			db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, lastMessageIds),
+				columns: { id: true, narratorId: true, parentToolUseId: true },
+			}),
+			db.query.narratorMessageRefs.findMany({
+				where: inArray(narratorMessageRefs.messageId, lastMessageIds),
+				columns: { messageId: true, narratorId: true, seq: true },
+			}),
+		]);
+		for (const message of childMessages) {
+			childMessageMap.set(message.id, message);
+		}
+		for (const ref of childRefs) {
+			refSeqMap.set(refKey(ref.narratorId, ref.messageId), ref.seq);
+		}
+	}
+
+	for (const anchor of anchors) {
+		let narratorForAnchor = anchor.narratorId;
+		let seq = -1;
+		let lastMessageId = anchor.lastMessageId;
+		if (lastMessageId) {
+			const childMessage = childMessageMap.get(lastMessageId);
+			if (childMessage?.parentToolUseId !== anchor.parentToolUseId) continue;
+			narratorForAnchor = narratorForAnchor ?? childMessage.narratorId;
+			const childSeq = narratorForAnchor
+				? refSeqMap.get(refKey(narratorForAnchor, lastMessageId))
+				: undefined;
+			if (childSeq == null) continue;
+			seq = childSeq;
+		} else {
+			lastMessageId = undefined;
+		}
+
+		const existing = resolved.get(anchor.parentToolUseId);
+		if (!existing || seq >= existing.seq) {
+			resolved.set(anchor.parentToolUseId, {
+				parentToolUseId: anchor.parentToolUseId,
+				narratorId: narratorForAnchor,
+				lastMessageId,
+				seq,
+			});
+		}
+	}
+
+	return resolved;
+}
+
+function childCatchUpCondition(anchor: ResolvedChildAnchor): SQL<unknown> {
+	const conditions = [
+		gt(narratorMessageRefs.seq, anchor.seq),
+		isNull(narratorMessageRefs.segmentCompactId),
+		eq(narratorMessages.parentToolUseId, anchor.parentToolUseId),
+	];
+	if (anchor.narratorId) {
+		conditions.push(eq(narratorMessageRefs.narratorId, anchor.narratorId));
+	}
+	return and(...conditions) as SQL<unknown>;
+}
+
+function combineOrConditions(conditions: SQL<unknown>[]): SQL<unknown> | undefined {
+	if (conditions.length === 0) return undefined;
+	if (conditions.length === 1) return conditions[0];
+	return or(...conditions);
 }
 
 /**
@@ -882,45 +970,9 @@ export const narratorMessageQueries = {
 			if (anchor.parentToolUseId) upsertCursorChildAnchor(baseChildAnchors, anchor);
 		}
 
-		type ResolvedChildAnchor = CatchUpChildAnchor & { seq: number };
-		const resolvedChildAnchors = new Map<string, ResolvedChildAnchor>();
-		if (!isSubagent) {
-			for (const anchor of trimCursorChildAnchors(baseChildAnchors)) {
-				let narratorForAnchor = anchor.narratorId;
-				let seq = -1;
-				let lastMessageId = anchor.lastMessageId;
-				if (lastMessageId) {
-					const childMessage = await db.query.narratorMessages.findFirst({
-						where: eq(narratorMessages.id, lastMessageId),
-						columns: { narratorId: true, parentToolUseId: true },
-					});
-					if (childMessage?.parentToolUseId !== anchor.parentToolUseId) continue;
-					narratorForAnchor = narratorForAnchor ?? childMessage.narratorId;
-					const childRef = narratorForAnchor
-						? await db.query.narratorMessageRefs.findFirst({
-								where: and(
-									eq(narratorMessageRefs.narratorId, narratorForAnchor),
-									eq(narratorMessageRefs.messageId, lastMessageId),
-								),
-								columns: { seq: true },
-							})
-						: null;
-					if (!childRef) continue;
-					seq = childRef.seq;
-				} else {
-					lastMessageId = undefined;
-				}
-				const existing = resolvedChildAnchors.get(anchor.parentToolUseId);
-				if (!existing || seq >= existing.seq) {
-					resolvedChildAnchors.set(anchor.parentToolUseId, {
-						parentToolUseId: anchor.parentToolUseId,
-						narratorId: narratorForAnchor,
-						lastMessageId,
-						seq,
-					});
-				}
-			}
-		}
+		const resolvedChildAnchors = !isSubagent
+			? await resolveCatchUpChildAnchors(trimCursorChildAnchors(baseChildAnchors))
+			: new Map<string, ResolvedChildAnchor>();
 
 		if (parentAnchorSeq == null && resolvedChildAnchors.size === 0) {
 			return { topLevel: [], orphanChildren: [], hitLimit: true };
@@ -943,27 +995,16 @@ export const narratorMessageQueries = {
 		}
 
 		let childCount = 0;
-		const childConditionsByAnchor = [] as Array<{
-			anchor: ResolvedChildAnchor;
-			conditions: SQL<unknown>[];
-		}>;
-		if (!isSubagent) {
-			for (const anchor of resolvedChildAnchors.values()) {
-				const conditions = [
-					gt(narratorMessageRefs.seq, anchor.seq),
-					isNull(narratorMessageRefs.segmentCompactId),
-					eq(narratorMessages.parentToolUseId, anchor.parentToolUseId),
-				];
-				if (anchor.narratorId)
-					conditions.push(eq(narratorMessageRefs.narratorId, anchor.narratorId));
-				const [{ cnt }] = await db
-					.select({ cnt: sql<number>`count(*)` })
-					.from(narratorMessageRefs)
-					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-					.where(and(...conditions));
-				childCount += cnt;
-				childConditionsByAnchor.push({ anchor, conditions });
-			}
+		const childWhere = combineOrConditions(
+			[...resolvedChildAnchors.values()].map((anchor) => childCatchUpCondition(anchor)),
+		);
+		if (childWhere) {
+			const [{ cnt }] = await db
+				.select({ cnt: sql<number>`count(*)` })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(childWhere);
+			childCount = cnt;
 		}
 
 		if (parentCount + childCount > limit) {
@@ -990,20 +1031,18 @@ export const narratorMessageQueries = {
 				.limit(10_000);
 		}
 
-		const childRefRows: Array<{ messageId: string; seq: number }> = [];
-		for (const { conditions } of childConditionsByAnchor) {
-			const rows = await db
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-				})
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(and(...conditions))
-				.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-				.limit(10_000);
-			childRefRows.push(...rows);
-		}
+		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
+			? await db
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(childWhere)
+					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
+					.limit(10_000)
+			: [];
 
 		if (refRows.length === 0 && childRefRows.length === 0) {
 			const cursor = buildCatchUpCursor({
