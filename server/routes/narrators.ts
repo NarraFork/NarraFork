@@ -841,7 +841,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		finalMessage = `<command-name>${skillResult.skillName}</command-name>\n${skillResult.content}${userInput ? `\n\n${userInput}` : ""}`;
 		commandText = cmdResult.rawCommand;
 	}
-	if (cmdResult.resolved && "bashCommand" in cmdResult) {
+	// Only the built-in /bash command should short-circuit here. Custom slash commands
+	// with runBashFirst also carry bashCommand, but they must continue below so the
+	// expanded prompt is sent after the pre-prompt Bash command completes.
+	if (cmdResult.resolved && "bashCommand" in cmdResult && !("expandedPrompt" in cmdResult)) {
 		const bashResult = await handleBashCommand(
 			id,
 			(cmdResult as BashCommandResult).bashCommand,
