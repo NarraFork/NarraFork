@@ -1,0 +1,6 @@
+{
+	"version": "0.4.10",
+	"date": "2026-05-10",
+	"en": "## Bug Fixes\n\n- Avoid duplicate restart guidance after a prepared update and keep the restart action as the single clear next step.\n- Make narrator compaction and session recovery more reliable, with safer status synchronization for active narrator views.\n- Improve Windows instance-lock cleanup so stale locks are detected correctly before startup is blocked.\n- Allow larger disabled-provider lists to be saved successfully in provider settings.\n\n## Other Changes\n\n- Add regression coverage for stale instance-lock cleanup and ownership-safe lock release.\n- Harden backend tool and patch handling paths with bounded process output and safer file reads.",
+	"zh-CN": "## 修复\n\n- 避免更新准备完成后重复显示重启说明，让“重启并运行新版”成为唯一清晰的下一步。\n- 提高叙述者压缩和会话恢复的可靠性，并让活跃叙述者视图的状态同步更稳健。\n- 改进 Windows 实例锁清理，启动前能正确识别并移除陈旧锁。\n- 允许在提供商设置中保存更大的禁用提供商列表。\n\n## 其他变更\n\n- 新增实例锁陈旧清理和仅释放当前进程持有锁的回归测试。\n- 加固后端工具和补丁处理路径，限制进程输出并改进文件读取安全性。"
+}
