@@ -17,6 +17,7 @@
  */
 
 import { logger } from "./logger";
+import { clearInheritableHandlesBeforeSpawn } from "./win-handle-guard";
 
 export interface SafeSpawnResult {
 	stdout: string;
@@ -144,6 +145,7 @@ function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): v
 export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult> {
 	let proc: ReturnType<typeof Bun.spawn>;
 	try {
+		clearInheritableHandlesBeforeSpawn();
 		proc = Bun.spawn(opts.cmd, {
 			cwd: opts.cwd,
 			env: opts.env,

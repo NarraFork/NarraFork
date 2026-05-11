@@ -8,6 +8,7 @@ import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
 import { getHome } from "../../platform";
 import { loadSettings } from "../../settings";
+import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -271,6 +272,7 @@ export const bashTool: ToolDefinition = {
 				];
 			}
 
+			clearInheritableHandlesBeforeSpawn();
 			const proc = spawn(...spawnArgs);
 
 			let output = "";
@@ -560,6 +562,7 @@ async function _runInBackground(
 				];
 			}
 
+			clearInheritableHandlesBeforeSpawn();
 			const proc = spawn(...spawnArgs);
 			let exited = false;
 			let outputBytes = 0;

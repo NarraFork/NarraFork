@@ -41,15 +41,17 @@ if (IS_WINDOWS) {
 }
 
 /**
- * Clear HANDLE_FLAG_INHERIT on current Windows process handles after server bind.
+ * Clear HANDLE_FLAG_INHERIT on current Windows process handles.
  *
- * Bun on Windows can spawn children with bInheritHandles=TRUE. If the HTTP
- * server socket remains inheritable, a child process may keep the listening port
- * open after NarraFork exits. The server socket is created only when Bun.serve()
- * binds/re-binds, so callers should run this once immediately after each
- * successful server bind rather than before every spawn.
+ * Bun/Node child process creation on Windows may use bInheritHandles=TRUE for
+ * stdio pipes. If any server/client socket remains inheritable at that moment,
+ * the child can keep NarraFork's listening port open after the parent exits.
+ *
+ * This is intentionally best-effort and safe to call before every child process
+ * spawn. Do not restore the flag: NarraFork does not intentionally pass arbitrary
+ * socket/file handles to children, and stdio handles are explicitly skipped.
  */
-export function clearInheritableHandlesAfterServerBind(): void {
+function clearInheritableWindowsHandles(phase: "after server bind" | "before spawn"): void {
 	if (!setHandleInformation) return;
 
 	try {
@@ -72,7 +74,7 @@ export function clearInheritableHandlesAfterServerBind(): void {
 
 		if (!successLogged) {
 			successLogged = true;
-			logger.info("Windows handle guard completed best-effort handle scan after server bind", {
+			logger.info(`Windows handle guard completed best-effort handle scan ${phase}`, {
 				candidateHandles,
 				updatedHandles,
 				maxHandle: MAX_HANDLE,
@@ -80,10 +82,18 @@ export function clearInheritableHandlesAfterServerBind(): void {
 			});
 		}
 	} catch (error) {
-		// Best-effort workaround only. Never fail server startup because of FFI guard issues.
+		// Best-effort workaround only. Never fail server startup/spawn because of FFI guard issues.
 		if (!ffiWarningLogged) {
 			ffiWarningLogged = true;
-			logger.warn("Windows handle guard failed after server bind", { error: String(error) });
+			logger.warn(`Windows handle guard failed ${phase}`, { error: String(error) });
 		}
 	}
+}
+
+export function clearInheritableHandlesAfterServerBind(): void {
+	clearInheritableWindowsHandles("after server bind");
+}
+
+export function clearInheritableHandlesBeforeSpawn(): void {
+	clearInheritableWindowsHandles("before spawn");
 }

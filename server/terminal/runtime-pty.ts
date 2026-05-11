@@ -7,6 +7,7 @@
  */
 
 import { spawn as ptySpawn } from "bun-pty";
+import { clearInheritableHandlesBeforeSpawn } from "../lib/win-handle-guard";
 import type { TerminalRuntime, TerminalSpawnOptions } from "./runtime";
 
 export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
@@ -15,6 +16,7 @@ export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
 		if (v !== undefined) env[k] = v;
 	}
 
+	clearInheritableHandlesBeforeSpawn();
 	const pty = ptySpawn(opts.cmd[0], opts.cmd.slice(1), {
 		name: "xterm-256color",
 		cols: opts.cols,
