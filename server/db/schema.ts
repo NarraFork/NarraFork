@@ -594,6 +594,7 @@ export const userPreferences = sqliteTable("user_preferences", {
 	autoLoadOlderMessages: integer("auto_load_older_messages", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	fastModeDefault: integer("fast_mode_default", { mode: "boolean" }).notNull().default(false),
 	language: text("language").notNull().default("en"),
 	wordWrapMarkdown: integer("word_wrap_markdown", { mode: "boolean" }).notNull().default(true),
 	wordWrapCode: integer("word_wrap_code", { mode: "boolean" }).notNull().default(true),

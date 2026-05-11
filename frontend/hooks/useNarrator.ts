@@ -434,14 +434,18 @@ export function useCreateNarrator() {
 			dangerReflectionOverride?: "inherit" | "on" | "off";
 			cwd?: string;
 		}) => {
-			let shouldDefaultFastMode = false;
+			let shouldUseLegacyFastModeDefault = false;
 			try {
-				shouldDefaultFastMode = localStorage.getItem("narrafork_fast_mode_default") === "true";
+				shouldUseLegacyFastModeDefault =
+					localStorage.getItem("narrafork_fast_mode_default") === "true";
 			} catch {
-				// ignore localStorage access failures
+				// Ignore localStorage access failures.
 			}
+
 			return api.createNarrator(
-				data.fastMode === undefined && shouldDefaultFastMode ? { ...data, fastMode: true } : data,
+				data.fastMode === undefined && shouldUseLegacyFastModeDefault
+					? { ...data, fastMode: true }
+					: data,
 			);
 		},
 		onSuccess: () => {

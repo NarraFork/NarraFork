@@ -34,6 +34,7 @@ import {
 	narratorWhitelistDirs,
 	projects,
 	terminals,
+	userPreferences,
 	users,
 } from "../db/schema";
 import { agentGenerateWithHistory } from "../lib/agent";
@@ -479,7 +480,18 @@ narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
 	const parsed = createNarratorSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const narrator = await narratorService.create(parsed.data);
+
+	let input = parsed.data;
+	if (input.fastMode === undefined) {
+		const userId = c.get("user").sub;
+		const pref = await db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { fastModeDefault: true },
+		});
+		if (pref?.fastModeDefault) input = { ...input, fastMode: true };
+	}
+
+	const narrator = await narratorService.create(input);
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 

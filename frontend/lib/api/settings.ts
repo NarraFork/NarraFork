@@ -32,6 +32,7 @@ export const settingsApi = {
 	getUserPreferences: () =>
 		request<{
 			autoLoadOlderMessages: boolean;
+			fastModeDefault: boolean;
 			language: string;
 			wordWrapMarkdown: boolean;
 			wordWrapCode: boolean;
@@ -87,6 +88,7 @@ export const settingsApi = {
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
+		fastModeDefault?: boolean;
 		language?: string;
 		wordWrapMarkdown?: boolean;
 		wordWrapCode?: boolean;

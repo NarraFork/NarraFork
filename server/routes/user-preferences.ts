@@ -27,6 +27,7 @@ const MAX_RECENT_TABS = 20;
 
 const DEFAULTS = {
 	autoLoadOlderMessages: true,
+	fastModeDefault: false,
 	language: "en",
 	wordWrapMarkdown: true,
 	wordWrapCode: true,
@@ -308,8 +309,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 	sqlite.run(
 		`INSERT INTO user_preferences (
 			id, user_id,
-			auto_load_older_messages, language, word_wrap_markdown, word_wrap_code, word_wrap_diff,
-			reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
+			auto_load_older_messages, fast_mode_default, language, word_wrap_markdown, word_wrap_code,
+			word_wrap_diff, reply_in_user_language, show_token_usage, show_output_stats, terminal_theme, terminal_font_size,
 			add_subagent_to_recent_tabs,
 			notify_on_done, notify_on_waiting, notify_pwa_enabled,
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
@@ -317,9 +318,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
 			commands, send_mode, setup_wizard_completed, gateway_config,
 			created_at, updated_at
-		) VALUES (${Array(32).fill("?").join(", ")})
+		) VALUES (${Array(33).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
+		   fast_mode_default = COALESCE(?, fast_mode_default),
 		   language = COALESCE(?, language),
 		   word_wrap_markdown = COALESCE(?, word_wrap_markdown),
 		   word_wrap_code = COALESCE(?, word_wrap_code),
@@ -353,6 +355,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			id,
 			userId,
 			(d.autoLoadOlderMessages ?? DEFAULTS.autoLoadOlderMessages) ? 1 : 0,
+			(d.fastModeDefault ?? DEFAULTS.fastModeDefault) ? 1 : 0,
 			d.language ?? DEFAULTS.language,
 			(d.wordWrapMarkdown ?? DEFAULTS.wordWrapMarkdown) ? 1 : 0,
 			(d.wordWrapCode ?? DEFAULTS.wordWrapCode) ? 1 : 0,
@@ -384,6 +387,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 			now,
 			// ON CONFLICT UPDATE values (null = keep existing)
 			d.autoLoadOlderMessages != null ? (d.autoLoadOlderMessages ? 1 : 0) : null,
+			d.fastModeDefault != null ? (d.fastModeDefault ? 1 : 0) : null,
 			d.language ?? null,
 			d.wordWrapMarkdown != null ? (d.wordWrapMarkdown ? 1 : 0) : null,
 			d.wordWrapCode != null ? (d.wordWrapCode ? 1 : 0) : null,

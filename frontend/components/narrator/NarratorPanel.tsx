@@ -93,7 +93,6 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
-import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import {
 	DEFAULT_MESSAGES_AROUND_AFTER,
@@ -141,7 +140,7 @@ import {
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
-import { useUserPreferences } from "../../hooks/useUserPreferences";
+import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	ApiError,
 	api,
@@ -1883,11 +1882,13 @@ export function NarratorPanel({
 	} = useAllModels();
 	const { data: currentUser } = useCurrentUser();
 	const { data: userPrefs } = useUserPreferences();
-	const [fastModeDefault, setFastModeDefault] = useLocalPref("narrafork_fast_mode_default");
+	const updateUserPrefs = useUpdateUserPreferences();
+	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
+
 	const contentViewerEnvironment = useMemo(
 		() => ({
 			isMobile: isMobileViewport,
@@ -6093,7 +6094,9 @@ export function NarratorPanel({
 					<Switch
 						size="sm"
 						checked={fastModeDefault}
-						onChange={(event) => setFastModeDefault(event.currentTarget.checked)}
+						onChange={(event) =>
+							updateUserPrefs.mutate({ fastModeDefault: event.currentTarget.checked })
+						}
 						label={t("fast_mode_default_switch")}
 					/>
 					<Text size="xs" c="dimmed">

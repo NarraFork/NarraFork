@@ -51,6 +51,7 @@ const gatewayConfigSchema = z.object({
 
 export const updateUserPreferencesSchema = z.object({
 	autoLoadOlderMessages: z.boolean().optional(),
+	fastModeDefault: z.boolean().optional(),
 	language: z.enum(["en", "zh-CN"]).optional(),
 	wordWrapMarkdown: z.boolean().optional(),
 	wordWrapCode: z.boolean().optional(),

@@ -52,7 +52,7 @@ import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
 import { addRecentTab, useRecentTabs } from "../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
-import { useUserPreferences } from "../hooks/useUserPreferences";
+import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, api, clearToken, getToken } from "../lib/api";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
@@ -181,6 +181,7 @@ function AuthenticatedLayout() {
 	const { data: user, isLoading, isError, error, fetchStatus } = useCurrentUser();
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
+	const updatePrefs = useUpdateUserPreferences();
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
@@ -204,6 +205,40 @@ function AuthenticatedLayout() {
 		toggleCollapsed: toggleNavCollapsed,
 	} = useResizableNav();
 	const outputStats = useOutputStats(prefs?.showOutputStats ?? false);
+	const legacyFastModeDefaultMigrationRef = useRef(false);
+
+	useEffect(() => {
+		if (legacyFastModeDefaultMigrationRef.current || !prefs) return;
+
+		let legacyValue: string | null = null;
+		try {
+			legacyValue = localStorage.getItem("narrafork_fast_mode_default");
+		} catch {
+			legacyFastModeDefaultMigrationRef.current = true;
+			return;
+		}
+
+		if (legacyValue == null) {
+			legacyFastModeDefaultMigrationRef.current = true;
+			return;
+		}
+
+		const removeLegacyValue = () => {
+			try {
+				localStorage.removeItem("narrafork_fast_mode_default");
+			} catch {
+				// Ignore localStorage access failures.
+			}
+		};
+
+		legacyFastModeDefaultMigrationRef.current = true;
+		if (legacyValue === "true" && !prefs.fastModeDefault) {
+			updatePrefs.mutate({ fastModeDefault: true }, { onSuccess: removeLegacyValue });
+			return;
+		}
+
+		removeLegacyValue();
+	}, [prefs, updatePrefs]);
 
 	// --- Global narrator WebSocket connection ---
 	useEffect(() => {
