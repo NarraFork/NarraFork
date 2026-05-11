@@ -317,6 +317,8 @@
 	"translateReasoningDesc": "每个思考/推理块完成后，通过摘要模型将其翻译为你的语言。原始内容和翻译内容均会保存。",
 	"requestDumpEnabled": "Dump 每条 API 请求",
 	"requestDumpEnabledDesc": "为每次 AI 提供商调用持久化原始请求与响应数据到请求历史中，之后可在列表里查看完整 payload。",
+	"requestDumpErrorsOnly": "仅保留报错请求 dump",
+	"requestDumpErrorsOnlyDesc": "开启后仍会在请求执行期间收集 dump，但只有报错请求会保存到请求历史，成功请求不会落库。",
 	"requestDumpWarningTitle": "确认开启请求 Dump？",
 	"requestDumpWarningBody": "开启后，NarraFork 会为每次 AI 提供商调用持久化原始请求与响应 dump，可能快速占用大量磁盘空间。请仅在需要调试请求问题时临时开启，并在调试完成后关闭。",
 	"requestDumpWarningCancel": "取消",

@@ -13,6 +13,7 @@ export type ToolCategory =
 	| "send"
 	| "ask"
 	| "plan"
+	| "pipeline"
 	| "terminal"
 	| "share"
 	| "recall"
@@ -34,6 +35,7 @@ const AWAIT_TOOLS = new Set(["Await"]);
 const SEND_TOOLS = new Set(["Send"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
+const PIPELINE_TOOLS = new Set(["StartPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
@@ -55,6 +57,7 @@ export function getCategory(name: string): ToolCategory {
 	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
+	if (PIPELINE_TOOLS.has(name)) return "pipeline";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (RECALL_TOOLS.has(name)) return "recall";
@@ -108,6 +111,8 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		case "plan":
 		case "skill":
 			return "grape";
+		case "pipeline":
+			return "indigo";
 		case "terminal":
 			return "yellow";
 		case "recall":
@@ -215,6 +220,12 @@ export function extractNumericField(val: unknown, ...keys: string[]): number | u
 		if (m) return Number(m[1]);
 	}
 	return undefined;
+}
+
+function extractStringArrayField(val: unknown, key: string): string[] {
+	if (!val || isTruncated(val) || typeof val !== "object") return [];
+	const raw = (val as Record<string, unknown>)[key];
+	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
 }
 
 export function getFilePath(input: unknown): string {
@@ -362,6 +373,18 @@ export function getSummary(
 		}
 		case "plan":
 			return toolName === "ExitPlanMode" ? "Plan ready" : "Enter plan mode";
+		case "pipeline": {
+			if (toolName === "StartPipeline") {
+				const label = extractField(input, "label");
+				const maxPreview = extractNumericField(input, "maxPreviewChars");
+				const suffix = maxPreview != null ? ` · preview≤${maxPreview}` : "";
+				return label ? `start: ${short(label, 60)}${suffix}` : `start capture${suffix}`;
+			}
+			const rule = extractField(input, "rule");
+			if (rule) return short(rule, 80);
+			const aliases = extractStringArrayField(input, "aliases");
+			return aliases.length > 0 ? `aliases ${aliases.join(", ")}` : "finish pipeline";
+		}
 		case "terminal": {
 			const action = extractField(input, "action");
 			const tid = extractField(input, "terminal_id");

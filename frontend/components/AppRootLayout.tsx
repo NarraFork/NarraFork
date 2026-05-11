@@ -194,6 +194,7 @@ function AuthenticatedLayout() {
 		enabled: hasToken,
 	});
 	const requestDumpEnabled = settings?.agent?.requestDumpEnabled === true;
+	const requestDumpErrorsOnly = settings?.agent?.requestDumpErrorsOnly === true;
 	const computedScheme = useComputedColorScheme("dark");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const {
@@ -413,7 +414,15 @@ function AuthenticatedLayout() {
 						</Tooltip>
 						<UpdateBadge />
 						{requestDumpEnabled && (
-							<Tooltip label={t("requestDumpEnabledTooltip")} position="bottom" withArrow>
+							<Tooltip
+								label={t(
+									requestDumpErrorsOnly
+										? "requestDumpErrorsOnlyTooltip"
+										: "requestDumpEnabledTooltip",
+								)}
+								position="bottom"
+								withArrow
+							>
 								<Button
 									variant="light"
 									color="orange"

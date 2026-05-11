@@ -297,6 +297,8 @@ export interface NarraForkSettings {
 		freshShellEnv: boolean;
 		/** Persist raw request/response dumps for each provider call into usage history. */
 		requestDumpEnabled: boolean;
+		/** When request dumps are enabled, only persist raw dumps for failed provider calls. */
+		requestDumpErrorsOnly: boolean;
 		/** Maximum size (bytes) for raw dump body text. Default 1MB. Set to -1 for unlimited. */
 		requestDumpMaxSize: number;
 		/** Maximum retries for recoverable (transient) API errors. -1 = infinite. */

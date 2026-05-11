@@ -364,9 +364,13 @@
 	"usageHistoryKind_title": "Title",
 	"usageHistoryKind_merge_summary": "Merge summary",
 	"usageHistoryKind_web_fetch_smart": "Web fetch",
+	"usageHistoryKind_reflection": "Reflection",
 	"usageHistoryKind_reasoning_translation": "Reasoning translation",
 	"usageHistoryKind_settings_test": "Settings test",
 	"usageHistoryKind_git_summary": "Git summary",
 	"usageHistoryKind_internal": "Internal",
-	"usageHistoryError": "Error"
+	"usageHistoryError": "Error",
+	"usageHistoryCopyError": "Copy error message",
+	"usageHistoryDownloadRequestResponse": "Download request/response",
+	"usageHistoryDownloadFailed": "Failed to download request/response"
 }

@@ -364,9 +364,13 @@
 	"usageHistoryKind_title": "标题",
 	"usageHistoryKind_merge_summary": "合并摘要",
 	"usageHistoryKind_web_fetch_smart": "网页摘要",
+	"usageHistoryKind_reflection": "反思检查",
 	"usageHistoryKind_reasoning_translation": "推理翻译",
 	"usageHistoryKind_settings_test": "设置测试",
 	"usageHistoryKind_git_summary": "Git 摘要",
 	"usageHistoryKind_internal": "内部",
-	"usageHistoryError": "错误"
+	"usageHistoryError": "错误",
+	"usageHistoryCopyError": "复制错误信息",
+	"usageHistoryDownloadRequestResponse": "下载请求/回复",
+	"usageHistoryDownloadFailed": "下载请求/回复失败"
 }

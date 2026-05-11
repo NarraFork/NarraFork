@@ -2,6 +2,7 @@ import { db } from "@server/db";
 import { apiRequests } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { settings } from "@server/lib/settings";
 import { calculateCost, type UsageData } from "@server/lib/usage-tracking";
 
 export type ApiRequestKind =
@@ -11,6 +12,7 @@ export type ApiRequestKind =
 	| "title"
 	| "merge_summary"
 	| "web_fetch_smart"
+	| "reflection"
 	| "reasoning_translation"
 	| "settings_test"
 	| "git_summary"
@@ -52,13 +54,23 @@ export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHand
 	};
 }
 
+function hasErrorMessage(errorMessage: string | null | undefined): boolean {
+	return typeof errorMessage === "string" && errorMessage.trim().length > 0;
+}
+
+function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
+	if (options.rawDump == null) return false;
+	if (!settings.agent.requestDumpErrorsOnly) return true;
+	return hasErrorMessage(options.errorMessage);
+}
+
 export async function finishApiRequest(
 	handle: ApiRequestHandle,
 	options: ApiRequestFinishOptions = {},
 ): Promise<string> {
 	const usage = options.usage ?? null;
 	const cost = usage ? calculateCost(usage, handle.provider, handle.model) : null;
-	const rawDump = options.rawDump ? JSON.stringify(options.rawDump) : null;
+	const rawDump = shouldPersistRawDump(options) ? JSON.stringify(options.rawDump) : null;
 
 	await db.insert(apiRequests).values({
 		id: handle.id,

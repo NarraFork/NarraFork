@@ -7,6 +7,7 @@ import {
 	Button,
 	Card,
 	Code,
+	CopyButton,
 	Divider,
 	Group,
 	Loader,
@@ -24,9 +25,12 @@ import {
 	IconArrowDown,
 	IconArrowUp,
 	IconBrain,
+	IconCheck,
 	IconClock,
 	IconCodeDots,
+	IconCopy,
 	IconDeviceFloppy,
+	IconDownload,
 	IconExclamationCircle,
 	IconToggleLeft,
 	IconToggleRight,
@@ -114,6 +118,46 @@ function formatRawDumpPreview(
 
 	write(value, 0);
 	return { text: parts.join(""), truncated };
+}
+
+function buildRawDumpExport(record: UsageHistoryRecord): unknown {
+	return {
+		id: record.id,
+		createdAt: record.createdAt,
+		kind: record.kind,
+		provider: record.provider,
+		credentialId: record.credentialId,
+		credentialName: record.credentialName,
+		model: record.model,
+		narratorId: record.narratorId,
+		narratorTitle: record.narratorTitle,
+		chapterId: record.chapterId,
+		chapterTitle: record.chapterTitle,
+		projectId: record.projectId,
+		errorMessage: record.errorMessage ?? null,
+		request: record.rawDump?.request ?? null,
+		response: record.rawDump?.response ?? null,
+		rawDump: record.rawDump ?? null,
+	};
+}
+
+function rawDumpDownloadFileName(record: UsageHistoryRecord): string {
+	const timestamp = Number.isFinite(Date.parse(record.createdAt))
+		? new Date(record.createdAt).toISOString().replace(/[:.]/g, "-")
+		: "unknown-time";
+	return `api-request-${timestamp}-${record.id}.json`;
+}
+
+function downloadJsonFile(fileName: string, value: unknown): void {
+	const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+	const url = URL.createObjectURL(blob);
+	const link = document.createElement("a");
+	link.href = url;
+	link.download = fileName;
+	document.body.append(link);
+	link.click();
+	link.remove();
+	URL.revokeObjectURL(url);
 }
 
 function getProviderColor(provider: string | null) {
@@ -249,12 +293,173 @@ function DetailField({
 	);
 }
 
+function CopyableErrorBadge({ message }: { message: string }) {
+	const { t } = useTranslation("common");
+
+	return (
+		<CopyButton value={message} timeout={1500}>
+			{({ copied, copy }) => (
+				<Tooltip
+					label={copied ? t("copied") : `${t("usageHistoryCopyError")}: ${message}`}
+					multiline
+					maw={400}
+				>
+					<Badge
+						color={copied ? "green" : "red"}
+						variant="light"
+						size="xs"
+						leftSection={copied ? <IconCheck size={10} /> : <IconExclamationCircle size={10} />}
+						onClick={(event) => {
+							event.stopPropagation();
+							copy();
+						}}
+						onKeyDown={(event) => {
+							if (event.key !== "Enter" && event.key !== " ") return;
+							event.preventDefault();
+							event.stopPropagation();
+							copy();
+						}}
+						role="button"
+						tabIndex={0}
+						aria-label={t("usageHistoryCopyError")}
+						style={{ cursor: "copy", userSelect: "none" }}
+					>
+						{copied ? t("copied") : t("usageHistoryError")}
+					</Badge>
+				</Tooltip>
+			)}
+		</CopyButton>
+	);
+}
+
+function CopyableErrorText({ message }: { message: string }) {
+	const { t } = useTranslation("common");
+
+	return (
+		<CopyButton value={message} timeout={1500}>
+			{({ copied, copy }) => (
+				<Tooltip label={copied ? t("copied") : t("usageHistoryCopyError")} withArrow>
+					<Text
+						size="xs"
+						c={copied ? "green" : "red"}
+						lineClamp={2}
+						onClick={(event) => {
+							event.stopPropagation();
+							copy();
+						}}
+						onKeyDown={(event) => {
+							if (event.key !== "Enter" && event.key !== " ") return;
+							event.preventDefault();
+							event.stopPropagation();
+							copy();
+						}}
+						role="button"
+						tabIndex={0}
+						aria-label={t("usageHistoryCopyError")}
+						style={{ cursor: "copy", wordBreak: "break-word" }}
+					>
+						{message}
+					</Text>
+				</Tooltip>
+			)}
+		</CopyButton>
+	);
+}
+
+function CopyErrorAction({ message, asButton = false }: { message: string; asButton?: boolean }) {
+	const { t } = useTranslation("common");
+
+	return (
+		<CopyButton value={message} timeout={1500}>
+			{({ copied, copy }) =>
+				asButton ? (
+					<Button
+						size="compact-xs"
+						variant="light"
+						color={copied ? "green" : "red"}
+						leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+						onClick={(event) => {
+							event.stopPropagation();
+							copy();
+						}}
+					>
+						{copied ? t("copied") : t("usageHistoryCopyError")}
+					</Button>
+				) : (
+					<Tooltip label={copied ? t("copied") : t("usageHistoryCopyError")} withArrow>
+						<ActionIcon
+							variant="subtle"
+							color={copied ? "green" : "red"}
+							onClick={(event) => {
+								event.stopPropagation();
+								copy();
+							}}
+							aria-label={t("usageHistoryCopyError")}
+						>
+							{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}
+						</ActionIcon>
+					</Tooltip>
+				)
+			}
+		</CopyButton>
+	);
+}
+
+function DownloadRawDumpAction({
+	record,
+	loading,
+	onDownload,
+	asButton = false,
+}: {
+	record: UsageHistoryRecord;
+	loading: boolean;
+	onDownload: (record: UsageHistoryRecord) => void;
+	asButton?: boolean;
+}) {
+	const { t } = useTranslation("common");
+
+	if (asButton) {
+		return (
+			<Button
+				size="compact-xs"
+				variant="light"
+				leftSection={<IconDownload size={14} />}
+				loading={loading}
+				onClick={(event) => {
+					event.stopPropagation();
+					onDownload(record);
+				}}
+			>
+				{t("usageHistoryDownloadRequestResponse")}
+			</Button>
+		);
+	}
+
+	return (
+		<Tooltip label={t("usageHistoryDownloadRequestResponse")} withArrow>
+			<ActionIcon
+				variant="subtle"
+				color="blue"
+				loading={loading}
+				onClick={(event) => {
+					event.stopPropagation();
+					onDownload(record);
+				}}
+				aria-label={t("usageHistoryDownloadRequestResponse")}
+			>
+				<IconDownload size={16} />
+			</ActionIcon>
+		</Tooltip>
+	);
+}
+
 export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) {
 	const { t } = useTranslation("common");
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const [showNarratorId, setShowNarratorId] = useState(false);
 	const [showCredentialId, setShowCredentialId] = useState(false);
 	const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+	const [downloadingRecordId, setDownloadingRecordId] = useState<string | null>(null);
 
 	const { data: selectedRecord, isLoading: isLoadingRawDump } = useQuery({
 		queryKey: ["usage-history", "detail", selectedRecordId],
@@ -266,6 +471,20 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 		if (!selectedRecord?.rawDump) return null;
 		return formatRawDumpPreview(selectedRecord.rawDump, MAX_RAW_DUMP_DISPLAY_CHARS);
 	}, [selectedRecord?.rawDump]);
+
+	const handleDownloadRawDump = async (record: UsageHistoryRecord) => {
+		setDownloadingRecordId(record.id);
+		try {
+			const fullRecord = record.rawDump ? record : await usageHistoryApi.getRecord(record.id);
+			if (!fullRecord.rawDump) return;
+			downloadJsonFile(rawDumpDownloadFileName(fullRecord), buildRawDumpExport(fullRecord));
+		} catch (error) {
+			console.error("Failed to download raw dump", error);
+			window.alert(t("usageHistoryDownloadFailed"));
+		} finally {
+			setDownloadingRecordId(null);
+		}
+	};
 
 	if (loading) {
 		return <Text c="dimmed">{t("loading", "加载中...")}</Text>;
@@ -331,10 +550,19 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 									</Group>
 								</Group>
 
+								{record.errorMessage ? <CopyableErrorText message={record.errorMessage} /> : null}
 								{record.errorMessage ? (
-									<Text size="xs" c="red" lineClamp={2}>
-										{record.errorMessage}
-									</Text>
+									<Group gap="xs">
+										<CopyErrorAction message={record.errorMessage} asButton />
+										{record.hasRawDump ? (
+											<DownloadRawDumpAction
+												record={record}
+												loading={downloadingRecordId === record.id}
+												onDownload={handleDownloadRawDump}
+												asButton
+											/>
+										) : null}
+									</Group>
 								) : null}
 
 								<SimpleGrid cols={1} spacing="xs">
@@ -475,16 +703,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 											<Group gap={6} wrap="nowrap">
 												<Text size="sm">{new Date(record.createdAt).toLocaleString()}</Text>
 												{record.errorMessage ? (
-													<Tooltip label={record.errorMessage} multiline maw={400}>
-														<Badge
-															color="red"
-															variant="light"
-															size="xs"
-															leftSection={<IconExclamationCircle size={10} />}
-														>
-															{t("usageHistoryError")}
-														</Badge>
-													</Tooltip>
+													<CopyableErrorBadge message={record.errorMessage} />
 												) : null}
 											</Group>
 											{record.chapterTitle ? (
@@ -558,16 +777,31 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										)}
 									</Table.Td>
 									<Table.Td>
-										{record.hasRawDump ? (
-											<Tooltip label={t("usageHistoryViewRawDump")}>
-												<ActionIcon
-													variant="subtle"
-													color="gray"
-													onClick={() => setSelectedRecordId(record.id)}
-												>
-													<IconCodeDots size={16} />
-												</ActionIcon>
-											</Tooltip>
+										{record.hasRawDump || record.errorMessage ? (
+											<Group gap={4} wrap="nowrap">
+												{record.errorMessage ? (
+													<CopyErrorAction message={record.errorMessage} />
+												) : null}
+												{record.errorMessage && record.hasRawDump ? (
+													<DownloadRawDumpAction
+														record={record}
+														loading={downloadingRecordId === record.id}
+														onDownload={handleDownloadRawDump}
+													/>
+												) : null}
+												{record.hasRawDump ? (
+													<Tooltip label={t("usageHistoryViewRawDump")}>
+														<ActionIcon
+															variant="subtle"
+															color="gray"
+															onClick={() => setSelectedRecordId(record.id)}
+															aria-label={t("usageHistoryViewRawDump")}
+														>
+															<IconCodeDots size={16} />
+														</ActionIcon>
+													</Tooltip>
+												) : null}
+											</Group>
 										) : (
 											<Text size="sm" c="dimmed">
 												-
@@ -588,6 +822,21 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 				size="xl"
 				centered
 			>
+				{selectedRecord?.errorMessage || selectedRecord?.hasRawDump ? (
+					<Group justify="flex-end" mb="sm" gap="xs">
+						{selectedRecord.errorMessage ? (
+							<CopyErrorAction message={selectedRecord.errorMessage} asButton />
+						) : null}
+						{selectedRecord.hasRawDump ? (
+							<DownloadRawDumpAction
+								record={selectedRecord}
+								loading={downloadingRecordId === selectedRecord.id}
+								onDownload={handleDownloadRawDump}
+								asButton
+							/>
+						) : null}
+					</Group>
+				) : null}
 				{isLoadingRawDump ? (
 					<Group justify="center" py="xl">
 						<Loader size="sm" />

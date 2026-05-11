@@ -77,6 +77,7 @@ function SettingsUsagePage() {
 		"title",
 		"merge_summary",
 		"web_fetch_smart",
+		"reflection",
 		"reasoning_translation",
 		"settings_test",
 		"git_summary",

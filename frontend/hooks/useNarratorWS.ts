@@ -180,6 +180,11 @@ interface NarratorWSCallbacks {
 	) => void;
 	onSubagentStarted?: (toolUseId: string, model?: string) => void;
 	onSubagentSuspended?: (subagentNarratorId: string, toolUseId: string) => void;
+	onSubagentStatusChanged?: (
+		subagentNarratorId: string,
+		status: string,
+		substatus?: string[],
+	) => void;
 	onSubagentTodosUpdated?: (
 		subagentNarratorId: string,
 		todos: { id?: string; content?: string; status?: string }[],
@@ -743,6 +748,13 @@ export function useNarratorWS(
 						callbacksRef.current.onSubagentSuspended?.(
 							data.subagentNarratorId as string,
 							data.toolUseId as string,
+						);
+						break;
+					case "subagent_status_changed":
+						callbacksRef.current.onSubagentStatusChanged?.(
+							data.subagentNarratorId as string,
+							data.status as string,
+							data.substatus as string[] | undefined,
 						);
 						break;
 					case "subagent_todos_updated":

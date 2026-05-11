@@ -28,6 +28,7 @@ export const DEFAULTS: NarraForkSettings = {
 		legacyEncoding: false,
 		freshShellEnv: false,
 		requestDumpEnabled: false,
+		requestDumpErrorsOnly: false,
 		requestDumpMaxSize: 1024 * 1024, // 1MB
 		modelContextWindows: {},
 		translateReasoning: false,
@@ -243,6 +244,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.requestDumpEnabled": {
 		desc: "启用后为每次模型/API 请求持久化原始请求与响应 dump，可在管理员请求历史中查看完整原始数据。",
+		type: "boolean",
+	},
+	"agent.requestDumpErrorsOnly": {
+		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。",
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {

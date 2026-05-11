@@ -457,6 +457,13 @@ export type NarratorServerMessage =
 			toolUseId: string;
 	  }
 	| {
+			type: "subagent_status_changed";
+			narratorId: string;
+			subagentNarratorId: string;
+			status: string;
+			substatus?: string[];
+	  }
+	| {
 			type: "subagent_todos_updated";
 			narratorId: string;
 			subagentNarratorId: string;

@@ -8,6 +8,7 @@ import {
 	IconClock,
 	IconCode,
 	IconEye,
+	IconFilter,
 	IconGitFork,
 	IconHistory,
 	IconListCheck,
@@ -63,6 +64,8 @@ function iconForCategory(category?: ToolCategory): Icon {
 			return IconMessageQuestion;
 		case "plan":
 			return IconMap;
+		case "pipeline":
+			return IconFilter;
 		case "terminal":
 			return IconTerminal2;
 		case "share":

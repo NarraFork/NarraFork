@@ -1675,6 +1675,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// Invalidate the subagent narrator query so SubagentCard picks up "suspended" status
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
+			onSubagentStatusChanged: (
+				subagentNarratorId: string,
+				status: string,
+				substatus?: string[],
+			) => {
+				qc.setQueryData(
+					["narrators", subagentNarratorId],
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
+					(old: any) =>
+						old
+							? {
+									...old,
+									status,
+									...(substatus !== undefined ? { substatus } : {}),
+									_retryInfo: undefined,
+								}
+							: old,
+				);
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+			},
 			onSubagentTodosUpdated: (
 				subagentNarratorId: string,
 				todos: unknown[],

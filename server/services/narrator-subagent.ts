@@ -36,6 +36,7 @@ export {
 	getDetachableMap,
 	getForegroundAbortControllers,
 	interruptForegroundSubagent,
+	interruptForegroundSubagentsForParent,
 	ProxyAbortController,
 } from "./subagent-detach";
 

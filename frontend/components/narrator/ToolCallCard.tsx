@@ -33,6 +33,7 @@ import {
 	IconDownload,
 	IconEye,
 	IconFileCode,
+	IconFilter,
 	IconGitFork,
 	IconHistory,
 	IconInfoCircle,
@@ -303,6 +304,7 @@ const AWAIT_TOOLS = new Set(["Await"]);
 const SEND_TOOLS = new Set(["Send"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
+const PIPELINE_TOOLS = new Set(["StartPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
@@ -324,6 +326,7 @@ export type ToolCategory =
 	| "send"
 	| "ask"
 	| "plan"
+	| "pipeline"
 	| "terminal"
 	| "share"
 	| "recall"
@@ -350,6 +353,7 @@ export function getCategory(name: string): ToolCategory {
 	if (SEND_TOOLS.has(name)) return "send";
 	if (ASK_TOOLS.has(name)) return "ask";
 	if (PLAN_TOOLS.has(name)) return "plan";
+	if (PIPELINE_TOOLS.has(name)) return "pipeline";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
 	if (RECALL_TOOLS.has(name)) return "recall";
@@ -388,6 +392,8 @@ export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 			return IconPlayerPlay;
 		case "plan":
 			return IconMap;
+		case "pipeline":
+			return IconFilter;
 		case "terminal":
 			return IconTerminal2;
 		case "share":
@@ -433,6 +439,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "blue";
 		case "plan":
 			return "grape";
+		case "pipeline":
+			return "indigo";
 		case "terminal":
 			return "yellow";
 		case "share":
@@ -667,6 +675,13 @@ function extractNumericField(val: any, ...keys: string[]): number | undefined {
 	return undefined;
 }
 
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function extractStringArrayField(val: any, key: string): string[] {
+	if (!val || isTruncated(val)) return [];
+	const raw = val[key];
+	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
+}
+
 // --- Helper: extract a human-readable summary for the header ---
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -870,6 +885,20 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		}
 		case "plan":
 			return toolName === "ExitPlanMode" ? "Plan ready" : "Enter plan mode";
+		case "pipeline": {
+			if (toolName === "StartPipeline") {
+				const label = extractField(input, "label");
+				const maxPreview = extractNumericField(input, "maxPreviewChars");
+				const suffix = maxPreview != null ? ` · preview≤${maxPreview}` : "";
+				return label
+					? `start: ${label.length > 60 ? `${label.slice(0, 57)}...` : label}${suffix}`
+					: `start capture${suffix}`;
+			}
+			const rule = extractField(input, "rule");
+			if (rule) return rule.length > 80 ? `${rule.slice(0, 77)}...` : rule;
+			const aliases = extractStringArrayField(input, "aliases");
+			return aliases.length > 0 ? `aliases ${aliases.join(", ")}` : "finish pipeline";
+		}
 		case "terminal": {
 			const action = extractField(input, "action");
 			const tid = extractField(input, "terminal_id");
@@ -1419,11 +1448,14 @@ const ToolHeader = memo(
 			});
 		}, [toolCall.startedAt, t]);
 
-		// For Terminal tool, show "Terminal Read" / "Terminal Write" / "Terminal List" as the label
+		// Use concise labels for tool families with action-like names.
 		const displayName = useMemo(() => {
 			if (cat === "terminal") {
 				const action = extractField(toolCall.inputJson, "action");
 				if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+			}
+			if (cat === "pipeline") {
+				return toolCall.toolName === "StartPipeline" ? "Pipeline Start" : "Pipeline End";
 			}
 			return toolCall.toolName;
 		}, [cat, toolCall.toolName, toolCall.inputJson]);
@@ -3459,6 +3491,185 @@ function GoalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+interface ParsedPipelineResult {
+	aliases: string;
+	captured: string;
+	rule: string;
+	body: string;
+}
+
+interface ParsedPipelineCapture {
+	alias: string;
+	toolName: string;
+	bytes: string;
+}
+
+function parsePipelineResultOutput(text: string): ParsedPipelineResult | null {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	if (lines[0]?.trim() !== "Pipeline result") return null;
+	const blankIndex = lines.findIndex((line, index) => index > 0 && line.trim() === "");
+	const headerLines = blankIndex === -1 ? lines.slice(1) : lines.slice(1, blankIndex);
+	const body = blankIndex === -1 ? "" : lines.slice(blankIndex + 1).join("\n");
+	const pick = (prefix: string) =>
+		headerLines
+			.find((line) => line.startsWith(prefix))
+			?.slice(prefix.length)
+			.trim() ?? "";
+	return {
+		aliases: pick("Aliases used:"),
+		captured: pick("Captured:"),
+		rule: pick("Rule:"),
+		body,
+	};
+}
+
+function parsePipelineCaptures(captured: string): ParsedPipelineCapture[] {
+	if (!captured || captured === "(none)") return [];
+	return captured.split(/,\s*/).map((entry) => {
+		const match = entry.match(/^([^=]+)=([^()]+)\(([^)]*)\)$/);
+		return match
+			? { alias: match[1], toolName: match[2], bytes: match[3] }
+			: { alias: entry, toolName: "capture", bytes: "" };
+	});
+}
+
+function formatPipelineBytes(value: string): string {
+	const normalized = value.trim().replace(/B$/i, "");
+	const bytes = Number(normalized);
+	if (!Number.isFinite(bytes)) return value;
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("common");
+	const isStart = toolCall.toolName === "StartPipeline";
+	const label = extractField(toolCall.inputJson, "label");
+	const maxPreviewChars = extractNumericField(toolCall.inputJson, "maxPreviewChars") ?? 100;
+	const aliases = extractStringArrayField(toolCall.inputJson, "aliases");
+	const inputRule = extractField(toolCall.inputJson, "rule");
+	const format = extractField(toolCall.inputJson, "format") || "sections";
+	const maxChars = extractNumericField(toolCall.inputJson, "maxChars");
+	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputIsTruncated = isTruncated(toolCall.outputJson);
+	const parsed = !isStart && outputText ? parsePipelineResultOutput(outputText) : null;
+	const capturedEntries = parsePipelineCaptures(parsed?.captured ?? "");
+	const parsedAliases = parsed?.aliases && parsed.aliases !== "(none)" ? parsed.aliases : "";
+	const aliasList = parsedAliases
+		? parsedAliases
+				.split(/,\s*/)
+				.map((alias) => alias.trim())
+				.filter(Boolean)
+		: aliases;
+	const rule = inputRule || parsed?.rule || (aliases.length > 0 ? `from ${aliases.join(" ")}` : "");
+	const isFailed = toolCall.status === "fail";
+
+	return (
+		<Box mt="xs">
+			<Group gap={6} wrap="wrap" mb={rule || capturedEntries.length > 0 || outputText ? 4 : 0}>
+				<Badge size="xs" variant="light" color={isStart ? "blue" : "indigo"}>
+					{isStart ? "start" : "end"}
+				</Badge>
+				{label && (
+					<Badge size="xs" variant="outline" color="gray">
+						{label}
+					</Badge>
+				)}
+				{format && !isStart && (
+					<Badge size="xs" variant="outline" color="gray">
+						{format}
+					</Badge>
+				)}
+				{isStart && (
+					<Badge size="xs" variant="outline" color="gray">
+						preview ≤ {maxPreviewChars} chars
+					</Badge>
+				)}
+				{maxChars != null && (
+					<Badge size="xs" variant="outline" color="gray">
+						max {maxChars.toLocaleString()} chars
+					</Badge>
+				)}
+				{aliasList.map((alias) => (
+					<Badge key={alias} size="xs" variant="dot" color="indigo">
+						{alias}
+					</Badge>
+				))}
+			</Group>
+
+			{rule && (
+				<Box mt={4}>
+					<Text size="xs" fw={500} mb={2}>
+						Rule
+					</Text>
+					<Code
+						block
+						style={{
+							fontSize: 11,
+							whiteSpace: "pre-wrap",
+							wordBreak: "break-word",
+						}}
+					>
+						{rule}
+					</Code>
+				</Box>
+			)}
+
+			{capturedEntries.length > 0 && (
+				<Stack gap={4} mt="xs">
+					<Text size="xs" fw={500}>
+						Captured aliases
+					</Text>
+					{capturedEntries.map((entry) => (
+						<Group key={`${entry.alias}-${entry.toolName}`} gap={6} wrap="nowrap">
+							<Badge size="xs" variant="light" color="indigo" miw={34}>
+								{entry.alias}
+							</Badge>
+							<Text size="xs" ff="monospace" style={{ flex: 1, minWidth: 0 }} truncate>
+								{entry.toolName}
+							</Text>
+							{entry.bytes && (
+								<Text size="xs" c="dimmed" ff="monospace">
+									{formatPipelineBytes(entry.bytes)}
+								</Text>
+							)}
+						</Group>
+					))}
+				</Stack>
+			)}
+
+			{isFailed && outputText && (
+				<Text size="xs" c="red" mt="xs" style={{ whiteSpace: "pre-wrap" }}>
+					{outputText}
+				</Text>
+			)}
+			{!isFailed && parsed?.body && (
+				<Box mt="xs">
+					<Text size="xs" fw={500} mb={2}>
+						{t("output")}
+					</Text>
+					<ContentViewer content={parsed.body} style={termStyle} title="Pipeline result" />
+				</Box>
+			)}
+			{!isFailed && !parsed && outputText && isStart && (
+				<Text size="xs" c="dimmed" mt="xs" style={{ whiteSpace: "pre-wrap" }}>
+					{outputText}
+				</Text>
+			)}
+			{!isFailed && !parsed && outputText && !isStart && (
+				<Box mt="xs">
+					<Text size="xs" fw={500} mb={2}>
+						{t("output")}
+					</Text>
+					<ContentViewer content={outputText} style={termStyle} title="Pipeline output" />
+				</Box>
+			)}
+			{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
+		</Box>
+	);
+}
+
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
@@ -4028,6 +4239,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <AskDetail toolCall={toolCall} />;
 		case "plan":
 			return <PlanDetail toolCall={toolCall} />;
+		case "pipeline":
+			return <PipelineDetail toolCall={toolCall} />;
 		case "terminal":
 			return <TerminalDetail toolCall={toolCall} />;
 		case "share":
@@ -4626,6 +4839,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				cat === "share" ||
 				cat === "recall" ||
 				cat === "send" ||
+				cat === "pipeline" ||
 				(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 				(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 				(cat === "plan" && !isDeniedPlan) ||
@@ -4675,6 +4889,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				cat === "share" ||
 				cat === "recall" ||
 				cat === "send" ||
+				cat === "pipeline" ||
 				cat === "await" ||
 				cat === "plan" ||
 				cat === "bash" ||

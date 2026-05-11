@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
@@ -631,6 +632,85 @@ export interface ReflectionLoopObservation {
 	invalidStates: string[];
 }
 
+type ApiRequestEndEvent = Extract<AgentEvent, { type: "api_request_end" }>;
+
+function normalizeApiRequestUsage(usage: ApiRequestEndEvent["usage"]) {
+	if (!usage) return null;
+	return {
+		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
+	};
+}
+
+async function recordReflectionApiRequestEnd(
+	pendingApiRequests: Map<string, ApiRequestHandle>,
+	event: ApiRequestEndEvent,
+	parentConfig: AgentConfig,
+	label: string,
+): Promise<void> {
+	const requestInfo = pendingApiRequests.get(event.requestId);
+	if (!requestInfo) {
+		logger.warn("Reflection API request end without start", {
+			narratorId: parentConfig.narratorId,
+			requestId: event.requestId,
+			label,
+		});
+		return;
+	}
+
+	try {
+		await finishApiRequest(requestInfo, {
+			usage: normalizeApiRequestUsage(event.usage),
+			credentialId: event.credentialId,
+			ttftMs: event.ttftMs ?? null,
+			durationMs: event.durationMs ?? null,
+			contextPercent: event.contextPercent ?? null,
+			meterUsage: event.meterUsage ?? null,
+			meterUnit: event.meterUnit ?? null,
+			errorMessage: event.errorMessage ?? null,
+			rawDump: event.rawDump,
+		});
+	} catch (error) {
+		logger.warn("Failed to record reflection API request", {
+			narratorId: parentConfig.narratorId,
+			requestId: event.requestId,
+			apiRequestId: requestInfo.id,
+			label,
+			error: String(error),
+		});
+	} finally {
+		pendingApiRequests.delete(event.requestId);
+	}
+}
+
+async function recordUnfinishedReflectionApiRequests(
+	pendingApiRequests: Map<string, ApiRequestHandle>,
+	parentConfig: AgentConfig,
+	label: string,
+): Promise<void> {
+	for (const [requestId, requestInfo] of pendingApiRequests) {
+		try {
+			await finishApiRequest(requestInfo, {
+				errorMessage: `${label} ended before the API request completed`,
+			});
+		} catch (error) {
+			logger.warn("Failed to record unfinished reflection API request", {
+				narratorId: parentConfig.narratorId,
+				requestId,
+				apiRequestId: requestInfo.id,
+				label,
+				error: String(error),
+			});
+		}
+	}
+	pendingApiRequests.clear();
+}
+
 /**
  * Run a bounded nested agent loop for model self-checks or small decision gates.
  * The nested loop gets an isolated tool allowlist and no parent event/prompt hooks,
@@ -649,6 +729,7 @@ export async function runReflectionLoop(
 		label = "reflection loop",
 	} = options;
 	const allowedTools = new Set(reflectionLoop.allowedTools);
+	const pendingApiRequests = new Map<string, ApiRequestHandle>();
 	const observed: ReflectionLoopObservation = {
 		assistantMessages: 0,
 		assistantText: "",
@@ -684,6 +765,23 @@ export async function runReflectionLoop(
 			},
 		};
 		for await (const event of agentLoop(reflectionConfig, prompt, [...history])) {
+			if (event.type === "api_request_start") {
+				pendingApiRequests.set(
+					event.requestId,
+					startApiRequest({
+						narratorId: parentConfig.narratorId,
+						provider: event.provider,
+						model: event.model,
+						credentialId: event.credentialId,
+						kind: "reflection",
+					}),
+				);
+				continue;
+			}
+			if (event.type === "api_request_end") {
+				await recordReflectionApiRequestEnd(pendingApiRequests, event, parentConfig, label);
+				continue;
+			}
 			if (event.type === "assistant_message") {
 				observed.assistantMessages++;
 				if (event.text) {
@@ -726,6 +824,7 @@ export async function runReflectionLoop(
 		}
 		return observed;
 	} finally {
+		await recordUnfinishedReflectionApiRequests(pendingApiRequests, parentConfig, label);
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
 	}
 }

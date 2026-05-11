@@ -317,6 +317,8 @@
 	"translateReasoningDesc": "Translate AI thinking/reasoning content into your language via the summary model after each block completes. Both original and translated text are stored.",
 	"requestDumpEnabled": "Dump every API request",
 	"requestDumpEnabledDesc": "Persist the raw request and response data for every AI provider call into request history so you can inspect the full payload later.",
+	"requestDumpErrorsOnly": "Keep error dumps only",
+	"requestDumpErrorsOnlyDesc": "When enabled, dumps are still collected while a request runs, but only failed requests are saved to request history; successful requests are discarded.",
 	"requestDumpWarningTitle": "Enable request dumps?",
 	"requestDumpWarningBody": "When enabled, NarraFork will persist raw request and response dumps for every AI provider call, which may quickly consume significant disk space. Turn this on only while debugging request issues, and turn it off when debugging is complete.",
 	"requestDumpWarningCancel": "Cancel",

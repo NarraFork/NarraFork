@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { z } from "zod/v4";
-import { resolvePermissionDecision } from "../../../services/narrator-permission";
+import { extractToolPaths, resolvePermissionDecision } from "../../../services/narrator-permission";
+import {
+	SUBAGENT_ALIAS_TRAIT_PREFIX,
+	subagentMatchesSelector,
+} from "../../../services/subagent-alias";
 import { settings } from "../../settings";
 import {
 	shouldInjectRelaxedPlanToolReminder,
@@ -9,6 +13,7 @@ import {
 } from "../loop";
 import { executeTool } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
+import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import { goalCompleteConfirmTool, goalCompleteReviseTool } from "../tools/goal-reflection";
 import {
@@ -205,6 +210,74 @@ describe("relaxed plan reminder classifier", () => {
 				relaxedPlanConfig,
 			),
 		).resolves.toBe(true);
+	});
+});
+
+describe("Subagent selector matching", () => {
+	const candidate = {
+		id: "subagent-abc123",
+		title: "Explore Payment Flow",
+		traits: [`${SUBAGENT_ALIAS_TRAIT_PREFIX}payment-explorer`],
+	};
+
+	test("matches IDs, title slugs, and persisted aliases consistently", () => {
+		expect(subagentMatchesSelector(candidate, "subagent-abc123")).toBe(true);
+		expect(subagentMatchesSelector(candidate, "subagent-abc")).toBe(true);
+		expect(subagentMatchesSelector(candidate, "Explore Payment Flow")).toBe(true);
+		expect(subagentMatchesSelector(candidate, "explore-payment-flow")).toBe(true);
+		expect(subagentMatchesSelector(candidate, "payment-explorer")).toBe(true);
+		expect(subagentMatchesSelector(candidate, "other-agent")).toBe(false);
+	});
+});
+
+describe("Browser screenshot file output permission integration", () => {
+	test("accepts file_path for screenshot and treats it as a write path", () => {
+		const input = {
+			action: "screenshot",
+			session_id: "session-test",
+			file_path: "artifacts/browser-shot.png",
+		};
+		const cwd = "/tmp/narrafork-test";
+
+		expect(browserTool.parameters.safeParse(input).success).toBe(true);
+		expect(extractToolPaths("Browser", input)).toEqual(["artifacts/browser-shot.png"]);
+		expect(
+			resolvePermissionDecision({ toolName: "Browser", input, cwd, permMode: "default" }),
+		).toBe("ask");
+		expect(
+			resolvePermissionDecision({ toolName: "Browser", input, cwd, permMode: "bypassPermissions" }),
+		).toBe("allow");
+	});
+
+	test("blocks screenshot writes into protected paths", () => {
+		const cwd = "/tmp/narrafork-test";
+		const input = {
+			action: "screenshot",
+			session_id: "session-test",
+			file_path: ".git/browser-shot.png",
+		};
+		const meta: { blacklistReason?: string } = {};
+
+		expect(
+			resolvePermissionDecision({
+				toolName: "Browser",
+				input,
+				cwd,
+				permMode: "bypassPermissions",
+				meta,
+			}),
+		).toBe("deny");
+		expect(meta.blacklistReason).toContain(".git");
+	});
+
+	test("ignores file_path on non-screenshot Browser actions", () => {
+		const input = {
+			action: "launch",
+			url: "https://example.com",
+			file_path: "ignored.png",
+		};
+
+		expect(extractToolPaths("Browser", input)).toEqual([]);
 	});
 });
 

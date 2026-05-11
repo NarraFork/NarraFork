@@ -884,6 +884,34 @@ function coerceQuestionSummary(
 	});
 }
 
+function stringArrayValue(input: unknown, key: string): string[] {
+	const raw = objectValue(input, key);
+	return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
+}
+
+function parsePipelineResultOutput(text: string): {
+	aliases: string;
+	captured: string;
+	rule: string;
+	body: string;
+} | null {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	if (lines[0]?.trim() !== "Pipeline result") return null;
+	const blankIndex = lines.findIndex((line, index) => index > 0 && line.trim() === "");
+	const headerLines = blankIndex === -1 ? lines.slice(1) : lines.slice(1, blankIndex);
+	const pick = (prefix: string) =>
+		headerLines
+			.find((line) => line.startsWith(prefix))
+			?.slice(prefix.length)
+			.trim() ?? "";
+	return {
+		aliases: pick("Aliases used:"),
+		captured: pick("Captured:"),
+		rule: pick("Rule:"),
+		body: blankIndex === -1 ? "" : lines.slice(blankIndex + 1).join("\n"),
+	};
+}
+
 function badge(
 	text: string,
 	color: ToolDisplayColor = "gray",
@@ -1386,6 +1414,39 @@ function buildToolDetailBlocks(
 			else outputPanel(blocks, outputJson, "code-panel", "Output");
 			break;
 		}
+		case "pipeline": {
+			const isStart = toolName === "StartPipeline";
+			const label = extractField(inputJson, "label");
+			const maxPreview = objectValue(inputJson, "maxPreviewChars");
+			const aliases = stringArrayValue(inputJson, "aliases");
+			const parsed = parsePipelineResultOutput(output);
+			const aliasText =
+				parsed?.aliases && parsed.aliases !== "(none)" ? parsed.aliases : aliases.join(", ");
+			const rule = extractField(inputJson, "rule") || parsed?.rule;
+			blocks.push({
+				kind: "badge-row",
+				badges: [
+					badge(isStart ? "start" : "end", "indigo"),
+					label ? badge(label, "gray", "outline") : null,
+					isStart && typeof maxPreview === "number"
+						? badge(`preview ≤ ${maxPreview}`, "gray", "outline")
+						: null,
+					aliasText ? badge(aliasText, "indigo", "dot") : null,
+				].filter(Boolean) as PixiToolBadgeModel[],
+			});
+			if (rule) blocks.push({ kind: "code-panel", text: rule, maxLines: 3, lang: "bash" });
+			if (parsed?.captured && parsed.captured !== "(none)") {
+				blocks.push({
+					kind: "text-line",
+					text: `Captured: ${parsed.captured}`,
+					muted: true,
+					mono: true,
+				});
+			}
+			if (parsed?.body) blocks.push({ kind: "terminal-panel", text: parsed.body, maxLines: 12 });
+			else if (output.trim()) outputPanel(blocks, outputJson, "terminal-panel", "Output", 8);
+			break;
+		}
 		case "ask": {
 			const summaries = coerceQuestionSummary(objectValue(inputJson, "questions"));
 			const answers = asRecord(objectValue(inputJson, "answers")) ?? {};
@@ -1507,6 +1568,7 @@ function buildToolDetailLines(
 		case "await":
 		case "send":
 		case "ask":
+		case "pipeline":
 		case "terminal":
 		case "share":
 		case "skill":
@@ -1556,6 +1618,7 @@ function buildToolUseBlock(
 				category === "share" ||
 				category === "recall" ||
 				category === "send" ||
+				category === "pipeline" ||
 				(category === "await" && (item.tc.outputJson != null || item.tc.startedAt != null)) ||
 				(category === "bash" && (item.tc.outputJson != null || item.tc.startedAt != null)) ||
 				(category === "plan" && !isDeniedPlan) ||

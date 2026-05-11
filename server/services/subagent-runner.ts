@@ -29,7 +29,7 @@ import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentResultMessageId } from "./narrator-session";
-import { registerTaskAlias } from "./subagent-alias";
+import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
 	getAttachWaitersMap,
@@ -393,6 +393,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 
 	let finalText = "";
 	let hasError = false;
+	let wasInterrupted = false;
 	let currentPrompt = input.prompt;
 	let currentHistory: unknown[] = input.initialHistory;
 	let currentTrailingToolResults: unknown[] | undefined = input.initialTrailingToolResults;
@@ -455,6 +456,11 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 					? "Error: context length exceeded"
 					: result.finalText;
 				hasError = result.hasError || !!result.contextLengthExceeded;
+				if (result.aborted && signal.aborted) {
+					wasInterrupted = true;
+					finalText = "Subagent interrupted because parent narrator was interrupted";
+					hasError = false;
+				}
 				getForegroundAbortControllers().delete(subagentId);
 
 				// Check if we were detached during execution
@@ -511,6 +517,11 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 
 					finalText = overrideResult.finalText;
 					hasError = overrideResult.hasError;
+					if (signal.aborted) {
+						wasInterrupted = true;
+						finalText = "Subagent interrupted because parent narrator was interrupted";
+						hasError = false;
+					}
 				}
 				break;
 			}
@@ -527,6 +538,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 					toolUseId,
 					hasError,
 					hasError ? finalText : null,
+					{ interrupted: wasInterrupted },
 				);
 
 				// Bind the result to the subagent's last assistant message
@@ -689,6 +701,21 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 	const subagentId = subagent.id;
 	const model = resolveEffectiveModel(subagent.model);
 	const provider = resolveProvider(model);
+	let aliasRegistration: { alias: string; conflicted: boolean };
+	try {
+		aliasRegistration = await registerAndPersistSubagentAlias(
+			parentNarratorId,
+			subagentId,
+			alias || title,
+		);
+	} catch (err) {
+		aliasRegistration = registerTaskAlias(parentNarratorId, subagentId, alias || title);
+		logger.warn("Failed to persist subagent alias", {
+			subagentId,
+			alias: aliasRegistration.alias,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 
 	// 2. Persist subagent's user message (linked to parent's tool_use)
 	await narratorService.persistSubagentUserMessage(subagentId, prompt, toolUseId);
@@ -737,7 +764,6 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		getBackgroundAbortControllers().set(subagentId, bgAbort);
 		backgroundTaskService.registerAbortController(subagentId, bgAbort);
 
-		const aliasRegistration = registerTaskAlias(parentNarratorId, subagentId, alias || title);
 		await backgroundTaskService
 			.createAgentTask({
 				id: subagentId,
@@ -792,7 +818,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 
 	// --- Foreground mode ---
 
-	return runForegroundLoop({
+	let output = await runForegroundLoop({
 		subagentId,
 		parentNarratorId,
 		toolUseId,
@@ -808,6 +834,14 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		customDef,
 		rebuildSystemPrompt,
 	});
+	if (aliasRegistration.conflicted) {
+		const requestedAliasLabel = alias || title || subagentId;
+		output +=
+			`\n\nNote: The requested alias "${requestedAliasLabel}" was already taken. ` +
+			`This agent was assigned "${aliasRegistration.alias}" instead. ` +
+			`Use this alias with Await or Send to reference this agent.`;
+	}
+	return output;
 }
 
 // === Continue subagent ===

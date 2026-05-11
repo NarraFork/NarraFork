@@ -45,6 +45,8 @@ function SettingsAgentPage() {
 				setTranslateReasoning={is.setTranslateReasoning}
 				requestDumpEnabled={is.requestDumpEnabled}
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
+				requestDumpErrorsOnly={is.requestDumpErrorsOnly}
+				setRequestDumpErrorsOnly={is.setRequestDumpErrorsOnly}
 				expandReasoning={expandReasoning}
 				setExpandReasoning={setExpandReasoning}
 				defaultStartInPlanMode={is.defaultStartInPlanMode}

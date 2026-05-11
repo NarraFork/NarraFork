@@ -41,7 +41,7 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
-import { resolveTaskAlias } from "./subagent-alias";
+import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import {
 	getConclusionEntry,
 	getConclusionFileId,
@@ -76,6 +76,12 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Glob":
 		case "Grep":
 			return typeof input.path === "string" ? [input.path] : [];
+		case "Browser":
+			return input.action === "screenshot" &&
+				typeof input.file_path === "string" &&
+				input.file_path.length > 0
+				? [input.file_path]
+				: [];
 		case SHELL_TOOL_NAME: {
 			const paths: string[] = [];
 			if (typeof input.workdir === "string") paths.push(input.workdir);
@@ -815,9 +821,9 @@ function resolveProtectedPathDeny(
 	projectGitPath: string | undefined,
 	bashAnalysis?: BashAnalysis,
 ): string | null {
-	if (WRITE_TOOLS.has(toolName)) {
+	if (WRITE_TOOLS.has(toolName) || toolName === "Browser") {
 		const filePath = typeof input.file_path === "string" ? input.file_path : "";
-		if (!filePath) return null;
+		if (!filePath || (toolName === "Browser" && input.action !== "screenshot")) return null;
 		const absPath = resolvePath(cwd, filePath);
 		if (isGitInternalPath(absPath)) {
 			return `Write to .git directory is forbidden: ${absPath}`;
@@ -1513,7 +1519,7 @@ async function resolveSendTargetsForPermission(
 		const siblings = await narratorService.listSubagentsByParent(teamParentId);
 		const candidates = siblings.filter((s) => {
 			if (callerIsSubagent && s.id === callerId) return false;
-			return s.id === selector || s.id.startsWith(selector) || s.title === selector;
+			return subagentMatchesSelector(s, selector);
 		});
 		if (candidates.length !== 1) return [];
 		const target = await narratorService.getById(candidates[0].id);

@@ -5,7 +5,7 @@ import type { Locale } from "@server/lib/prompt-i18n";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import { getSubagentFinalText } from "./narrator-session";
-import { resolveTaskAlias } from "./subagent-alias";
+import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { interruptForegroundSubagent } from "./subagent-detach";
 import { pushSubagentBufferedMessage } from "./subagent-executor";
 import { continueSubagent, waitForBackgroundTask } from "./subagent-runner";
@@ -136,7 +136,7 @@ async function resolveOneTarget(
 	const siblings = await narratorService.listSubagentsByParent(scope.teamParentId);
 	const candidates = siblings.filter((s) => {
 		if (scope.callerIsSubagent && s.id === scope.caller.id) return false;
-		return s.id === selector || s.id.startsWith(selector) || s.title === selector;
+		return subagentMatchesSelector(s, selector);
 	});
 
 	if (candidates.length === 0) {
@@ -330,11 +330,12 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	}
 	const finalText = await getSubagentFinalText(target.id);
 	const output = formatSubagentResult(target.id, finalText);
+	const status = settledSubagentStatus(target);
 	return {
 		id: target.id,
-		status: "completed",
+		status,
 		output: finalText,
-		formatted: `Agent ${target.id} status: completed\n\n${output}`,
+		formatted: `Agent ${target.id} status: ${status}\n\n${output}`,
 	};
 }
 

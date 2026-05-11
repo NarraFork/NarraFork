@@ -1,5 +1,5 @@
-import { writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
 import {
 	actions,
@@ -17,7 +17,8 @@ import {
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
 import { createShare, getShareDir } from "../../shares";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+import { trackFileChange } from "./track-file-change";
 
 const ACTIONS = [
 	"launch",
@@ -108,6 +109,7 @@ export const browserTool: ToolDefinition = {
 		"- wait_after_ms (optional): For evaluate_capture, wait this many ms after script execution before collecting console output\n" +
 		"- include_details (optional): For get_network, include request/response headers and post data (default: false)\n" +
 		"- capture_network (optional): For launch only, start network capture before initial navigation (default: false)\n" +
+		"- file_path (optional): For screenshot only, save the PNG to this path; relative paths resolve against cwd\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
 		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
@@ -196,6 +198,12 @@ export const browserTool: ToolDefinition = {
 					"For launch only, start network capture before initial navigation (default: false)",
 				type: "boolean",
 			},
+			file_path: {
+				description:
+					"For screenshot only, save the captured PNG to this path. Relative paths resolve against cwd.",
+				type: "string",
+				minLength: 1,
+			},
 			headless: {
 				description:
 					"Set to false to launch a visible browser window with GUI (default: true). " +
@@ -263,6 +271,11 @@ export const browserTool: ToolDefinition = {
 			.boolean()
 			.optional()
 			.describe("For launch only, start network capture before initial navigation"),
+		file_path: z
+			.string()
+			.min(1)
+			.optional()
+			.describe("For screenshot only, save the captured PNG to this path"),
 		headless: z
 			.boolean()
 			.optional()
@@ -288,6 +301,7 @@ export const browserTool: ToolDefinition = {
 			wait_after_ms,
 			include_details,
 			capture_network,
+			file_path,
 			headless,
 			categories,
 		} = args as {
@@ -307,6 +321,7 @@ export const browserTool: ToolDefinition = {
 			wait_after_ms?: number;
 			include_details?: boolean;
 			capture_network?: boolean;
+			file_path?: string;
 			headless?: boolean;
 			categories?: string[];
 		};
@@ -335,7 +350,7 @@ export const browserTool: ToolDefinition = {
 				case "set_ttl":
 					return handleSetTtl(ctx.narratorId, session_id, ttl_ms);
 				default:
-					return await handleSessionAction(ctx.narratorId, action, {
+					return await handleSessionAction(ctx, action, {
 						session_id,
 						selector,
 						value,
@@ -349,6 +364,7 @@ export const browserTool: ToolDefinition = {
 						clear,
 						wait_after_ms,
 						include_details,
+						file_path,
 						url,
 						categories,
 						signal: ctx.signal,
@@ -474,7 +490,7 @@ function handleSetTtl(narratorId: string, sessionId?: string, ttlMs?: number): T
 }
 
 async function handleSessionAction(
-	narratorId: string,
+	ctx: ToolContext,
 	action: Action,
 	opts: {
 		session_id?: string;
@@ -490,11 +506,13 @@ async function handleSessionAction(
 		clear?: boolean;
 		wait_after_ms?: number;
 		include_details?: boolean;
+		file_path?: string;
 		url?: string;
 		categories?: string[];
 		signal?: AbortSignal;
 	},
 ): Promise<ToolResult> {
+	const narratorId = ctx.narratorId;
 	if (!opts.session_id) {
 		return {
 			output: "session_id is required for this action",
@@ -603,16 +621,27 @@ async function handleSessionAction(
 
 		case "screenshot": {
 			const result = await actions.screenshot(session);
+			const buffer = Buffer.from(result.base64, "base64");
+			let savedFilePath: string | undefined;
+
+			if (opts.file_path) {
+				savedFilePath = resolve(ctx.cwd, opts.file_path);
+				await mkdir(dirname(savedFilePath), { recursive: true });
+				await writeFile(savedFilePath, buffer);
+				await trackFileChange(ctx, savedFilePath);
+			}
 
 			// Save as temporary share for frontend preview
-			let metadata: Record<string, unknown> = { sessionId: session.id };
+			let metadata: Record<string, unknown> = {
+				sessionId: session.id,
+				...(savedFilePath ? { savedFilePath } : {}),
+			};
 			try {
 				const shareId = generateShortId();
 				const shareDir = getShareDir(shareId);
 				const filename = "screenshot.png";
 				const filePath = resolve(shareDir, filename);
-				const buffer = Buffer.from(result.base64, "base64");
-				writeFileSync(filePath, buffer);
+				await writeFile(filePath, buffer);
 				createShare({
 					id: shareId,
 					originalName: filename,
@@ -635,7 +664,9 @@ async function handleSessionAction(
 			}
 
 			return {
-				output: `Screenshot captured (${result.width}x${result.height})`,
+				output:
+					`Screenshot captured (${result.width}x${result.height})` +
+					(savedFilePath ? `\nSaved to: ${savedFilePath}` : ""),
 				images: [{ format: "png", base64: result.base64 }],
 				metadata,
 			};

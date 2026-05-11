@@ -48,6 +48,8 @@ export interface AgentSectionProps {
 	setTranslateReasoning: (v: boolean) => void;
 	requestDumpEnabled: boolean;
 	setRequestDumpEnabled: (v: boolean) => void;
+	requestDumpErrorsOnly: boolean;
+	setRequestDumpErrorsOnly: (v: boolean) => void;
 	expandReasoning: boolean;
 	setExpandReasoning: (v: boolean) => void;
 	defaultStartInPlanMode: boolean;
@@ -221,6 +223,13 @@ export function AgentSection(props: AgentSectionProps) {
 					description={t("requestDumpEnabledDesc")}
 					checked={props.requestDumpEnabled}
 					onChange={(e) => handleRequestDumpToggle(e.currentTarget.checked)}
+				/>
+				<Switch
+					label={t("requestDumpErrorsOnly")}
+					description={t("requestDumpErrorsOnlyDesc")}
+					checked={props.requestDumpErrorsOnly}
+					disabled={!props.requestDumpEnabled}
+					onChange={(e) => props.setRequestDumpErrorsOnly(e.currentTarget.checked)}
 				/>
 				<Modal
 					opened={dumpWarningOpen}

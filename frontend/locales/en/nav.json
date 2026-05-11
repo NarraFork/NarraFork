@@ -33,5 +33,6 @@
 	"feedback": "Feedback",
 	"requestDumpEnabledBadge": "Dump on",
 	"requestDumpEnabledTooltip": "Every AI request is being dumped. Click to open this setting.",
+	"requestDumpErrorsOnlyTooltip": "Only failed AI requests are being dumped. Click to open this setting.",
 	"licenses": "Licenses"
 }

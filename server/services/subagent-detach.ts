@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
@@ -8,8 +8,12 @@ import { getSubagentType, parseTraits } from "../lib/narrator-utils";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
-import { registerTaskAlias } from "./subagent-alias";
-import { isManualOverride, resolveManualOverride } from "./subagent-manual-override";
+import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
+import {
+	abandonManualOverride,
+	isManualOverride,
+	resolveManualOverride,
+} from "./subagent-manual-override";
 
 // === In-memory state ===
 // Use `let` + lazy getter to avoid TDZ issues under Bun --hot reload,
@@ -109,6 +113,87 @@ export function interruptForegroundSubagent(subagentId: string): boolean {
 	return true;
 }
 
+/**
+ * Interrupt all foreground subagents currently owned by a parent narrator.
+ * This is a defensive cleanup path for primary narrator interrupts: the parent
+ * abort signal should normally propagate through ProxyAbortController, but this
+ * also updates DB/UI state so child cards do not remain stuck as "working" if
+ * the parent loop stops before the child finalizer can broadcast.
+ */
+export async function interruptForegroundSubagentsForParent(
+	parentNarratorId: string,
+): Promise<number> {
+	const entries = [...getDetachableMap().values()].filter(
+		(entry) => entry.parentNarratorId === parentNarratorId,
+	);
+	let interrupted = 0;
+	const touched = new Set<string>();
+	const markInterrupted = async (subagentId: string, toolUseId = "stale-interrupt") => {
+		if (touched.has(subagentId)) return;
+		touched.add(subagentId);
+		await narratorService.updateStatus(subagentId, "idle", {
+			substatus: ["interrupted"],
+			skipErrorMessage: true,
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "subagent_status_changed",
+			narratorId: parentNarratorId,
+			subagentNarratorId: subagentId,
+			status: "idle",
+			substatus: ["interrupted"],
+		});
+		eventBus.emit({
+			type: "narrator:subagent_completed",
+			narratorId: subagentId,
+			parentNarratorId,
+			toolUseId,
+		});
+		interrupted++;
+	};
+
+	for (const entry of entries) {
+		const { subagentId } = entry;
+		try {
+			entry.fgAbort.abort("Parent narrator interrupted");
+			entry.proxy.abort("Parent narrator interrupted");
+			abandonManualOverride(subagentId);
+			getForegroundAbortControllers().delete(subagentId);
+			await markInterrupted(subagentId, entry.toolUseId);
+		} catch (err) {
+			logger.warn("Failed to interrupt foreground subagent for parent", {
+				parentNarratorId,
+				subagentId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	// Reconcile any stale foreground children that no longer have an in-memory
+	// controller but are still persisted as active. Background tasks are excluded:
+	// they intentionally outlive the parent narrator.
+	const staleChildren = await db.query.narrators.findMany({
+		where: and(
+			eq(narrators.parentNarratorId, parentNarratorId),
+			eq(narrators.isBackground, false),
+			inArray(narrators.status, ["working", "waiting"]),
+		),
+		columns: { id: true },
+	});
+	for (const child of staleChildren) {
+		try {
+			await markInterrupted(child.id);
+		} catch (err) {
+			logger.warn("Failed to mark stale foreground subagent interrupted", {
+				parentNarratorId,
+				subagentId: child.id,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	return interrupted;
+}
+
 export interface DetachEntry {
 	/** Called to set the detached flag inside runLoop. */
 	markDetached: () => void;
@@ -197,11 +282,25 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 		.where(eq(narrators.id, subagentId));
 
 	// 4. Register alias if not already registered (foreground tasks may not have one yet)
-	const { alias: detachAlias } = registerTaskAlias(
-		entry.parentNarratorId,
-		subagentId,
-		subNarrator.title ?? undefined,
-	);
+	let detachAlias: string;
+	try {
+		({ alias: detachAlias } = await registerAndPersistSubagentAlias(
+			entry.parentNarratorId,
+			subagentId,
+			subNarrator.title ?? undefined,
+		));
+	} catch (err) {
+		({ alias: detachAlias } = registerTaskAlias(
+			entry.parentNarratorId,
+			subagentId,
+			subNarrator.title ?? undefined,
+		));
+		logger.warn("Failed to persist detached subagent alias", {
+			subagentId,
+			alias: detachAlias,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
 	await backgroundTaskService
 		.createAgentTask({
 			id: subagentId,

@@ -87,12 +87,27 @@ const CreateNarratorModal = React.lazy(() =>
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
 
-function getRecentTabIconColor(tab: RecentTab): string | undefined {
-	if (!tab.status) return undefined;
-	const substatus = tab.substatus?.includes("reasoning")
+function getRecentTabDisplaySubstatus(tab: RecentTab): string[] | undefined {
+	// Reasoning has its own corner marker in RecentTabs; don't let it override
+	// higher-level session states such as planning for the base icon color.
+	return tab.substatus?.includes("reasoning")
 		? tab.substatus.filter((tag) => tag !== "reasoning")
 		: tab.substatus;
-	return mantineVar(getEffectiveNarratorDisplay(tab.status, substatus).color);
+}
+
+function getRecentTabIconColor(tab: RecentTab): string | undefined {
+	const substatus = getRecentTabDisplaySubstatus(tab);
+	if (!tab.status && !substatus?.length) return undefined;
+	return mantineVar(getEffectiveNarratorDisplay(tab.status ?? "idle", substatus).color);
+}
+
+function isFilledRecentTabStatus(tab: RecentTab): boolean {
+	return (
+		tab.status === "working" ||
+		!!tab.substatus?.includes("planning") ||
+		!!tab.substatus?.includes("error") ||
+		!!tab.substatus?.includes("unread")
+	);
 }
 
 const CONTAINER_STATUS_I18N: Record<string, string> = {
@@ -1193,10 +1208,7 @@ function WorkspaceChildTab({
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus =
-		tab.status === "working" ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread");
+	const filledStatus = isFilledRecentTabStatus(tab);
 
 	return (
 		<NavLink
@@ -1258,10 +1270,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus =
-		tab.status === "working" ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread");
+	const filledStatus = isFilledRecentTabStatus(tab);
 
 	// When the parent workspace header is being dragged, collapse children to
 	// zero height so dnd-kit measures the gap as header-only and the full group
@@ -1364,10 +1373,7 @@ function DragOverlayWorkspaceItem({
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
 	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus =
-		tab.status === "working" ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread");
+	const filledStatus = isFilledRecentTabStatus(tab);
 
 	return (
 		<div style={{ overflow: "hidden" }}>
@@ -1453,10 +1459,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 					? `/narrators/workspace/${tab.id}`
 					: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus =
-		tab.status === "working" ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread");
+	const filledStatus = isFilledRecentTabStatus(tab);
 
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tabSortId(tab),

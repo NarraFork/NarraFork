@@ -204,6 +204,7 @@ const updateSettingsSchema = z
 				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
+				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
 				dangerReflectionEnabled: z.boolean(),

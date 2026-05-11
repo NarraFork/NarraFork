@@ -1660,6 +1660,13 @@ export async function runAgentLoop(
 					maxRetries: result.bypassRetryLimit ? -1 : getMaxTransientRetries(),
 					signal: active.abortController.signal,
 				});
+				if (active.abortController.signal.aborted) {
+					const partialId = active._partialMessageId;
+					active._partialMessageId = undefined;
+					await finalizeInterruptedRun(active, narratorId, partialId);
+					loopWasInterrupted = true;
+					break;
+				}
 				if (shouldRetry) {
 					// Finalize or clean up the partial message from the failed turn.
 					// If tools were already executed (side effects occurred), the message
@@ -1704,6 +1711,14 @@ export async function runAgentLoop(
 					maxRetries: getMaxTransientRetries(),
 					signal: active.abortController.signal,
 				});
+
+				if (active.abortController.signal.aborted) {
+					const partialId = active._partialMessageId;
+					active._partialMessageId = undefined;
+					await finalizeInterruptedRun(active, narratorId, partialId);
+					loopWasInterrupted = true;
+					break;
+				}
 
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;
@@ -3441,6 +3456,20 @@ export function interruptNarrator(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active) return false;
 	active.abortController.abort();
+	// Also fan out to foreground subagents owned by this primary narrator. The
+	// parent abort signal normally propagates into the child loop, but doing this
+	// explicitly prevents child DB/UI state from staying stuck as working if the
+	// parent loop exits before the child finalizer broadcasts.
+	import("./narrator-subagent")
+		.then(({ interruptForegroundSubagentsForParent }) =>
+			interruptForegroundSubagentsForParent(narratorId),
+		)
+		.catch((err) => {
+			logger.warn("Failed to interrupt foreground subagents", {
+				narratorId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
 	// Cleanup is handled by the agent loop's onErrorCleanup callback
 	// when it detects the "Aborted" error — no need to duplicate here.
 	logger.info("Narrator interrupted", { narratorId });

@@ -186,6 +186,7 @@ export async function finalizeSubagent(
 	toolUseId: string,
 	hasError: boolean,
 	errorText: string | null,
+	options?: { interrupted?: boolean },
 ): Promise<void> {
 	// Clean up any remaining buffered messages and team inbox
 	getSubagentBufferedMessagesMap().delete(subagentId);
@@ -195,10 +196,18 @@ export async function finalizeSubagent(
 	// They remain available for sibling subagents to query via TeamStatus.file_changes
 	// until the parent narrator session ends (clearTeamFileChanges is called then).
 
+	const substatus = options?.interrupted ? ["interrupted"] : hasError ? ["error"] : ["unread"];
 	await narratorService.updateStatus(subagentId, "idle", {
-		substatus: hasError ? ["error"] : ["unread"],
-		errorMessage: hasError ? (errorText ?? undefined) : undefined,
+		substatus,
+		errorMessage: hasError && !options?.interrupted ? (errorText ?? undefined) : undefined,
 		skipErrorMessage: true,
+	});
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_status_changed",
+		narratorId: parentNarratorId,
+		subagentNarratorId: subagentId,
+		status: "idle",
+		substatus,
 	});
 
 	eventBus.emit({
@@ -311,6 +320,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	finalText: string;
 	hasError: boolean;
 	contextLengthExceeded?: boolean;
+	aborted?: boolean;
 }> {
 	let {
 		narratorId,
@@ -392,6 +402,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 	let finalText = "";
 	let hasError = false;
+	let aborted = false;
 	const initialNarrator = await narratorService.getById(narratorId);
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastMode = initialNarrator.fastMode ?? false;
@@ -579,6 +590,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
 		hasError = result.hasError;
+		aborted = aborted || result.aborted === true || signal.aborted;
 		if (result.retryableError && !result.hasError) {
 			// Don't mark as error yet — try transient retry below
 		}
@@ -586,6 +598,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 		if (result.contextLengthExceeded) {
 			if (signal.aborted) {
+				aborted = true;
 				hasError = true;
 				contextLengthExceeded = true;
 				finalText = "Error: context length exceeded";
@@ -682,6 +695,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			// If aborted during backoff sleep, don't mark as error — the
 			// caller will handle the abort status.
 			if (signal.aborted) {
+				aborted = true;
 				break;
 			}
 			hasError = true;
@@ -780,5 +794,5 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		}
 	}
 
-	return { finalText, hasError, contextLengthExceeded };
+	return { finalText, hasError, contextLengthExceeded, aborted: aborted || signal.aborted };
 }
