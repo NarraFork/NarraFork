@@ -1,0 +1,6 @@
+{
+	"version": "0.4.13",
+	"date": "2026-05-11",
+	"en": "## Bug Fixes\n\n- Persisted the fast mode default in user preferences so new narrators respect the setting across devices and entry points.\n- Added Windows handle cleanup around server binding and child process launches to reduce stale port ownership after NarraFork exits.\n\n## Documentation\n\n- Documented 123 upload directory creation behavior for deployment troubleshooting.",
+	"zh-CN": "## 修复\n\n- 将 fast mode 默认值保存到用户偏好中，新建叙述者时可跨设备、跨入口正确沿用设置。\n- 在 Windows 服务绑定和子进程启动前清理可继承句柄，降低 NarraFork 退出后端口仍被占用的概率。\n\n## 文档\n\n- 补充 123 上传目录创建行为说明，便于部署排障。"
+}
