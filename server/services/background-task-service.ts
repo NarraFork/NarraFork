@@ -411,6 +411,10 @@ class BackgroundTaskService {
 		this.abortControllers.set(taskId, ctrl);
 	}
 
+	unregisterAbortController(taskId: string): void {
+		this.abortControllers.delete(taskId);
+	}
+
 	registerKillHandler(taskId: string, handler: () => void): void {
 		this.killHandlers.set(taskId, handler);
 	}

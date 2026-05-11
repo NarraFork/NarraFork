@@ -1426,10 +1426,21 @@ function buildToolDetailBlocks(
 			blocks.push({
 				kind: "badge-row",
 				badges: [
-					badge(isStart ? "start" : "end", "indigo"),
+					badge(
+						isStart
+							? tNarrator("pipelineStageStart", "start")
+							: tNarrator("pipelineStageEnd", "end"),
+						"indigo",
+					),
 					label ? badge(label, "gray", "outline") : null,
 					isStart && typeof maxPreview === "number"
-						? badge(`preview ≤ ${maxPreview}`, "gray", "outline")
+						? badge(
+								tNarrator("pipelinePreviewChars", `preview ≤ ${maxPreview} chars`, {
+									value: maxPreview.toLocaleString(),
+								}),
+								"gray",
+								"outline",
+							)
 						: null,
 					aliasText ? badge(aliasText, "indigo", "dot") : null,
 				].filter(Boolean) as PixiToolBadgeModel[],
@@ -1438,13 +1449,23 @@ function buildToolDetailBlocks(
 			if (parsed?.captured && parsed.captured !== "(none)") {
 				blocks.push({
 					kind: "text-line",
-					text: `Captured: ${parsed.captured}`,
+					text: tNarrator("pipelineCaptured", `Captured: ${parsed.captured}`, {
+						captured: parsed.captured,
+					}),
 					muted: true,
 					mono: true,
 				});
 			}
 			if (parsed?.body) blocks.push({ kind: "terminal-panel", text: parsed.body, maxLines: 12 });
-			else if (output.trim()) outputPanel(blocks, outputJson, "terminal-panel", "Output", 8);
+			else if (output.trim()) {
+				outputPanel(
+					blocks,
+					outputJson,
+					"terminal-panel",
+					tNarrator("pipelineOutput", "Pipeline output"),
+					8,
+				);
+			}
 			break;
 		}
 		case "ask": {

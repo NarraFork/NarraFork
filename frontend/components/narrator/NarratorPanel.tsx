@@ -1822,7 +1822,9 @@ export function NarratorPanel({
 			if (timeoutId != null) window.clearTimeout(timeoutId);
 		};
 	}, []);
-	const canRenderMessages = messageRenderReady && !messagesLoading;
+	const hasMessagePageData = !!messagesData?.pages?.length;
+	const canRenderMessages =
+		!messagesLoading && (messageRenderReady || (!highlightMessageId && hasMessagePageData));
 	useEffect(() => {
 		if (!canRenderMessages || highlightMessageId || messageRenderPhase !== "tail") return;
 		let cancelled = false;

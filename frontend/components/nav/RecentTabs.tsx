@@ -51,6 +51,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { getNarratorMessagesQueryKey } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { usePlatform } from "../../hooks/usePlatform";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
@@ -67,7 +68,7 @@ import {
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api } from "../../lib/api";
+import { api, type PaginatedMessages } from "../../lib/api";
 import {
 	endNarratorDrag,
 	moveNarratorDrag,
@@ -120,6 +121,20 @@ const CONTAINER_STATUS_I18N: Record<string, string> = {
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 const SWIPE_THRESHOLD = 80;
+const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
+
+type PrefetchMessagePageParam =
+	| {
+			cursor: string;
+			direction: "older" | "newer";
+	  }
+	| undefined;
+
+function getRecentTabNarratorId(tab: RecentTab): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
+	if (tab.type === "chapter") return tab.narratorId ?? null;
+	return null;
+}
 
 // Module-level flag: set on dragEnd, cleared on next click capture.
 // Prevents the synthetic click after drag from triggering Link navigation.
@@ -422,6 +437,60 @@ export function RecentTabList({
 	tabsRef.current = tabs;
 	const pathnameRef = useRef(pathname);
 	pathnameRef.current = pathname;
+
+	const prefetchNarratorTab = useCallback(
+		(tab: RecentTab) => {
+			const narratorId = getRecentTabNarratorId(tab);
+			if (!narratorId) return;
+
+			const narratorKey = ["narrators", narratorId] as const;
+			if (
+				!qc.getQueryData(narratorKey) &&
+				qc.getQueryState(narratorKey)?.fetchStatus !== "fetching"
+			) {
+				void qc.prefetchQuery({
+					queryKey: narratorKey,
+					queryFn: () => api.getNarrator(narratorId),
+					staleTime: 30_000,
+					gcTime: PREFETCH_QUERY_GC_TIME_MS,
+				});
+			}
+
+			const messagesKey = getNarratorMessagesQueryKey(narratorId);
+			if (
+				!qc.getQueryData(messagesKey) &&
+				qc.getQueryState(messagesKey)?.fetchStatus !== "fetching"
+			) {
+				void qc.prefetchInfiniteQuery({
+					queryKey: messagesKey,
+					queryFn: ({ pageParam }) => {
+						const typedPageParam = pageParam as PrefetchMessagePageParam;
+						return api.getNarratorMessages(narratorId, {
+							limit: typedPageParam ? 50 : 20,
+							cursor: typedPageParam?.cursor,
+							direction: typedPageParam?.direction,
+						});
+					},
+					initialPageParam: undefined as PrefetchMessagePageParam,
+					getNextPageParam: (lastPage: PaginatedMessages) =>
+						lastPage.hasMore && lastPage.nextCursor
+							? { cursor: lastPage.nextCursor, direction: "older" as const }
+							: undefined,
+					staleTime: Infinity,
+					gcTime: PREFETCH_QUERY_GC_TIME_MS,
+				});
+			}
+
+			if (tab.type === "chapter" && !qc.getQueryData(["chapters", tab.id])) {
+				void qc.prefetchQuery({
+					queryKey: ["chapters", tab.id],
+					queryFn: () => api.getChapter(tab.id),
+					gcTime: PREFETCH_QUERY_GC_TIME_MS,
+				});
+			}
+		},
+		[qc],
+	);
 
 	const [ctxMenu, setCtxMenu] = useState<{
 		x: number;
@@ -974,6 +1043,7 @@ export function RecentTabList({
 									onRemove={handleRemove}
 									onNavigate={onNavigate}
 									onContextMenu={handleContextMenu}
+									onPrefetch={prefetchNarratorTab}
 									dimmed={isDraggingThis || !!isChildOfDraggingWs}
 									collapsed={!!tab.workspaceId && tab.workspaceId === collapsedWsId}
 								/>
@@ -997,6 +1067,7 @@ export function RecentTabList({
 								onRemove={handleRemove}
 								onNavigate={onNavigate}
 								onContextMenu={handleContextMenu}
+								onPrefetch={prefetchNarratorTab}
 								connectTop={shouldConnectTop}
 								onWsAddClick={tab.type === "workspace" ? handleWsAddClick : undefined}
 								dimmed={isDraggingThis}
@@ -1239,6 +1310,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 	onRemove,
 	onNavigate,
 	onContextMenu,
+	onPrefetch,
 	dimmed,
 	collapsed: collapsedProp,
 }: {
@@ -1247,6 +1319,7 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 	onRemove: (type: RecentTab["type"], id: string) => void;
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
+	onPrefetch?: (tab: RecentTab) => void;
 	/** When true, hide the child (opacity 0) — overlay is showing it */
 	dimmed?: boolean;
 	/** When true, collapse to height 0 so dnd-kit measures header-only gap */
@@ -1271,6 +1344,19 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 			: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus = isFilledRecentTabStatus(tab);
+	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
+	const handleClick = useCallback(() => {
+		handlePrefetch();
+		onNavigate?.();
+		navigate({ to });
+	}, [handlePrefetch, navigate, onNavigate, to]);
+	const handleMouseDown = useCallback(
+		(e: React.MouseEvent) => {
+			handlePrefetch();
+			if (e.button === 1) e.preventDefault();
+		},
+		[handlePrefetch],
+	);
 
 	// When the parent workspace header is being dragged, collapse children to
 	// zero height so dnd-kit measures the gap as header-only and the full group
@@ -1300,13 +1386,10 @@ const SortableWorkspaceChildTab = React.memo(function SortableWorkspaceChildTab(
 				leftSection={
 					<TabIcon tab={tab} size={14} iconColor={iconColor} filledStatus={filledStatus} />
 				}
-				onClick={() => {
-					onNavigate?.();
-					navigate({ to });
-				}}
-				onMouseDown={(e: React.MouseEvent) => {
-					if (e.button === 1) e.preventDefault();
-				}}
+				onClick={handleClick}
+				onPointerEnter={handlePrefetch}
+				onFocus={handlePrefetch}
+				onMouseDown={handleMouseDown}
 				onAuxClick={(e: React.MouseEvent) => {
 					if (e.button === 1) {
 						e.preventDefault();
@@ -1427,6 +1510,7 @@ interface SortableTabItemProps {
 	onRemove: (type: RecentTab["type"], id: string) => void;
 	onNavigate?: () => void;
 	onContextMenu: (e: React.MouseEvent, tab: RecentTab) => void;
+	onPrefetch?: (tab: RecentTab) => void;
 	/** When true and active, remove top border-radius to connect with nav above */
 	connectTop?: boolean;
 	/** Workspace-only: click handler for the "add narrator" button */
@@ -1443,6 +1527,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 	onRemove,
 	onNavigate,
 	onContextMenu,
+	onPrefetch,
 	connectTop,
 	onWsAddClick,
 	dimmed,
@@ -1475,23 +1560,30 @@ const SortableTabItem = React.memo(function SortableTabItem({
 		...(isDragging && wsGroupHeight ? { height: wsGroupHeight } : {}),
 	};
 
+	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
+
 	// Click to navigate — blocked after drag via module-level flag
 	const handleClick = useCallback(() => {
 		if (justDragged) {
 			justDragged = false;
 			return;
 		}
+		handlePrefetch();
 		navigate({ to });
 		onNavigate?.();
-	}, [navigate, to, onNavigate]);
+	}, [handlePrefetch, navigate, to, onNavigate]);
 
 	// Middle-click to close — preventDefault on mousedown to suppress autoscroll
 	// when the tab list overflows and has a scrollbar.
-	const handleMouseDown = useCallback((e: React.MouseEvent) => {
-		if (e.button === 1) {
-			e.preventDefault();
-		}
-	}, []);
+	const handleMouseDown = useCallback(
+		(e: React.MouseEvent) => {
+			handlePrefetch();
+			if (e.button === 1) {
+				e.preventDefault();
+			}
+		},
+		[handlePrefetch],
+	);
 	const handleAuxClick = useCallback(
 		(e: React.MouseEvent) => {
 			if (e.button === 1) {
@@ -1607,6 +1699,8 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				<NavLink
 					active={active}
 					onClick={handleClick}
+					onPointerEnter={handlePrefetch}
+					onFocus={handlePrefetch}
 					onMouseDown={handleMouseDown}
 					onAuxClick={handleAuxClick}
 					onContextMenu={handleContextMenu}

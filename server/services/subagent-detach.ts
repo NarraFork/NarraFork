@@ -194,9 +194,14 @@ export async function interruptForegroundSubagentsForParent(
 	return interrupted;
 }
 
+export interface DetachSetupResult {
+	alias: string;
+	subagentType: string;
+}
+
 export interface DetachEntry {
-	/** Called to set the detached flag inside runLoop. */
-	markDetached: () => void;
+	/** Called to set the detached flag inside runLoop and hand it the setup barrier. */
+	markDetached: (setup: Promise<DetachSetupResult>) => void;
 	/** Resolve the foreground Promise (unblocks parent narrator immediately). */
 	foregroundResolve: (result: string) => void;
 	proxy: ProxyAbortController;
@@ -230,47 +235,112 @@ export function getAttachWaitersMap() {
 
 // === Detach / Attach ===
 
-/**
- * Detach a foreground subagent to background mode (zero-interrupt).
- * The agent loop continues running; the parent narrator's blocking Promise resolves immediately.
- */
-export async function detachSubagent(subagentId: string): Promise<boolean> {
-	const entry = getDetachableMap().get(subagentId);
-	if (!entry) return false;
+async function prepareDetachedBackgroundTask(
+	subagentId: string,
+	entry: DetachEntry,
+): Promise<DetachSetupResult> {
+	const { proxy, parentSignal, toolUseId } = entry;
+	let bgAbort: AbortController | undefined;
 
-	// If the subagent is blocked in waitForManualOverride, resolve it first so
-	// the runForegroundLoop can proceed to its finally block and eventually call
-	// finalizeBackgroundCompletion after we mark it as detached.
-	if (isManualOverride(subagentId)) {
-		const { getSubagentFinalText } = await import("./narrator-session");
-		const finalText = await getSubagentFinalText(subagentId);
-		resolveManualOverride(subagentId, finalText, false);
-		// Yield so the resolved Promise propagates through the event loop
-		// before we proceed with detach setup.
-		await new Promise((r) => setTimeout(r, 0));
+	try {
+		// 1. Create independent background AbortController.
+		bgAbort = new AbortController();
+		getBackgroundAbortControllers().set(subagentId, bgAbort);
+		backgroundTaskService.registerAbortController(subagentId, bgAbort);
+
+		// 2. Swap signal source: remove parent signal, add background signal.
+		proxy.replaceSource(parentSignal, bgAbort.signal);
+
+		// Also remove the fgAbort listener (it's no longer relevant).
+		const fgCtrl = getForegroundAbortControllers().get(subagentId);
+		if (fgCtrl) {
+			proxy.unlisten(fgCtrl.signal);
+			getForegroundAbortControllers().delete(subagentId);
+		}
+
+		// 3. Update DB.
+		const now = new Date().toISOString();
+		const subNarrator = await narratorService.getById(subagentId);
+		const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
+		await db
+			.update(narrators)
+			.set({
+				isBackground: true,
+				backgroundStatus: "running",
+				traits: updatedTraits,
+				updatedAt: now,
+			})
+			.where(eq(narrators.id, subagentId));
+
+		// 4. Register alias if not already registered (foreground tasks may not have one yet).
+		let detachAlias: string;
+		try {
+			({ alias: detachAlias } = await registerAndPersistSubagentAlias(
+				entry.parentNarratorId,
+				subagentId,
+				subNarrator.title ?? undefined,
+			));
+		} catch (err) {
+			({ alias: detachAlias } = registerTaskAlias(
+				entry.parentNarratorId,
+				subagentId,
+				subNarrator.title ?? undefined,
+			));
+			logger.warn("Failed to persist detached subagent alias", {
+				subagentId,
+				alias: detachAlias,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+
+		const subagentType = getSubagentType(subNarrator.variant) ?? "general";
+		await backgroundTaskService
+			.createAgentTask({
+				id: subagentId,
+				parentNarratorId: entry.parentNarratorId,
+				subagentNarratorId: subagentId,
+				subagentType,
+				toolUseId,
+				alias: detachAlias,
+				title: subNarrator.title ?? undefined,
+			})
+			.catch((err) => {
+				logger.warn("Failed to register detached background task in DB", {
+					subagentId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+
+		return { alias: detachAlias, subagentType };
+	} catch (err) {
+		if (bgAbort) {
+			proxy.replaceSource(bgAbort.signal, parentSignal);
+			if (!entry.fgAbort.signal.aborted) {
+				proxy.listenTo(entry.fgAbort.signal);
+				getForegroundAbortControllers().set(subagentId, entry.fgAbort);
+			}
+			getBackgroundAbortControllers().delete(subagentId);
+			backgroundTaskService.unregisterAbortController(subagentId);
+		}
+		throw err;
 	}
+}
 
-	const { proxy, parentSignal, toolUseId, parentNarratorId } = entry;
+async function restoreAttachedSubagentToBackground(
+	subagentId: string,
+	bgAbort: AbortController,
+): Promise<boolean> {
+	getForegroundAbortControllers().delete(subagentId);
 
-	// 1. Create independent background AbortController
-	const bgAbort = new AbortController();
+	const current = await narratorService.getById(subagentId).catch(() => null);
+	if (!current) return false;
+	if (current.backgroundStatus && current.backgroundStatus !== "running") return false;
+
 	getBackgroundAbortControllers().set(subagentId, bgAbort);
 	backgroundTaskService.registerAbortController(subagentId, bgAbort);
 
-	// 2. Swap signal source: remove parent signal, add background signal
-	proxy.replaceSource(parentSignal, bgAbort.signal);
-
-	// Also remove the fgAbort listener (it's no longer relevant)
-	const fgCtrl = getForegroundAbortControllers().get(subagentId);
-	if (fgCtrl) {
-		proxy.unlisten(fgCtrl.signal);
-		getForegroundAbortControllers().delete(subagentId);
-	}
-
-	// 3. Update DB
 	const now = new Date().toISOString();
-	const subNarrator = await narratorService.getById(subagentId);
-	const updatedTraits = [...new Set([...parseTraits(subNarrator.traits), "background"])];
+	const updatedTraits = [...new Set([...parseTraits(current.traits), "background"])];
 	await db
 		.update(narrators)
 		.set({
@@ -280,70 +350,63 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 			updatedAt: now,
 		})
 		.where(eq(narrators.id, subagentId));
+	return true;
+}
 
-	// 4. Register alias if not already registered (foreground tasks may not have one yet)
-	let detachAlias: string;
-	try {
-		({ alias: detachAlias } = await registerAndPersistSubagentAlias(
-			entry.parentNarratorId,
-			subagentId,
-			subNarrator.title ?? undefined,
-		));
-	} catch (err) {
-		({ alias: detachAlias } = registerTaskAlias(
-			entry.parentNarratorId,
-			subagentId,
-			subNarrator.title ?? undefined,
-		));
-		logger.warn("Failed to persist detached subagent alias", {
-			subagentId,
-			alias: detachAlias,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	}
-	await backgroundTaskService
-		.createAgentTask({
-			id: subagentId,
-			parentNarratorId: entry.parentNarratorId,
-			subagentNarratorId: subagentId,
-			subagentType: getSubagentType(subNarrator.variant) ?? "general",
-			toolUseId,
-			alias: detachAlias,
-			title: subNarrator.title ?? undefined,
-		})
-		.catch((err) => {
-			logger.warn("Failed to register detached background task in DB", {
-				subagentId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		});
+/**
+ * Detach a foreground subagent to background mode (zero-interrupt).
+ * The agent loop continues running; the parent narrator's blocking Promise resolves immediately.
+ */
+export async function detachSubagent(subagentId: string): Promise<boolean> {
+	const entry = getDetachableMap().get(subagentId);
+	if (!entry) return false;
 
-	// 5. Mark as detached (signals to runForegroundLoop)
-	entry.markDetached();
+	const wasManualOverride = isManualOverride(subagentId);
+	const setupPromise = prepareDetachedBackgroundTask(subagentId, entry);
+
+	// Mark as detached before any await/override resolution so runForegroundLoop cannot
+	// race into the normal foreground finalizer while detach setup is in flight.
+	entry.markDetached(setupPromise);
 	getDetachableMap().delete(subagentId);
 
-	// 6. Immediately resolve the foreground Promise (unblocks parent narrator)
-	// Use raw subagentId in the tag — the Agent tool will replace it with the alias
+	let setup: DetachSetupResult;
+	try {
+		setup = await setupPromise;
+	} catch (err) {
+		logger.warn("Failed to detach subagent to background", {
+			subagentId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return false;
+	}
+
+	if (wasManualOverride && isManualOverride(subagentId)) {
+		const { getSubagentFinalText } = await import("./narrator-session");
+		const finalText = await getSubagentFinalText(subagentId);
+		resolveManualOverride(subagentId, finalText, false);
+	}
+
+	// Immediately resolve the foreground Promise (unblocks parent narrator).
+	// Use raw subagentId in the tag — the Agent tool will replace it with the alias.
 	const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
 	entry.foregroundResolve(
 		resultPrefix +
-			`Subagent detached to background. Use Await({ type: "agent", id: "${detachAlias}" }) to get results, or Send({ id: "${detachAlias}", message }) to continue.`,
+			`Subagent detached to background. Use Await({ type: "agent", id: "${setup.alias}" }) to get results, or Send({ id: "${setup.alias}", message }) to continue.`,
 	);
 
-	// 7. Broadcast events
 	eventBus.emit({
 		type: "narrator:background_task_started",
-		narratorId: parentNarratorId,
-		parentNarratorId,
+		narratorId: entry.parentNarratorId,
+		parentNarratorId: entry.parentNarratorId,
 		taskNarratorId: subagentId,
-		toolUseId,
-		subagentType: getSubagentType(subNarrator.variant) ?? "general",
+		toolUseId: entry.toolUseId,
+		subagentType: setup.subagentType,
 	});
-	broadcastToNarrator(parentNarratorId, {
+	broadcastToNarrator(entry.parentNarratorId, {
 		type: "subagent_detached",
-		narratorId: parentNarratorId,
+		narratorId: entry.parentNarratorId,
 		subagentNarratorId: subagentId,
-		toolUseId,
+		toolUseId: entry.toolUseId,
 	});
 
 	return true;
@@ -357,10 +420,10 @@ export async function detachSubagent(subagentId: string): Promise<boolean> {
 export async function attachSubagent(
 	subagentId: string,
 	parentNarratorId: string,
-	_toolUseId: string,
+	toolUseId: string,
 	signal: AbortSignal,
 ): Promise<string> {
-	// 1. Migrate abort controller: background → foreground
+	// 1. Migrate abort controller: background → foreground waiter.
 	const bgAbort = getBackgroundAbortControllers().get(subagentId);
 	if (!bgAbort) {
 		throw new ValidationError("Background task abort controller not found");
@@ -368,7 +431,7 @@ export async function attachSubagent(
 	getBackgroundAbortControllers().delete(subagentId);
 	getForegroundAbortControllers().set(subagentId, bgAbort);
 
-	// 2. Update DB
+	// 2. Update DB.
 	const now = new Date().toISOString();
 	const subNarrator = await narratorService.getById(subagentId);
 	const updatedTraits = parseTraits(subNarrator.traits).filter((t) => t !== "background");
@@ -382,24 +445,25 @@ export async function attachSubagent(
 		})
 		.where(eq(narrators.id, subagentId));
 
-	// 3. Create attach waiter — the running loop will resolve this when it completes
+	// 3. Create attach waiter — the running loop will resolve this when it completes.
 	const { promise, resolve } = Promise.withResolvers<{ finalText: string; hasError: boolean }>();
 	getAttachWaitersMap().set(subagentId, { promise, resolve });
 
-	// 4. Broadcast
+	// 4. Broadcast.
 	broadcastToNarrator(parentNarratorId, {
 		type: "subagent_attached",
 		narratorId: parentNarratorId,
 		subagentNarratorId: subagentId,
 	});
 
-	// 5. Wait for the loop to complete (or parent abort)
-	const abortPromise = new Promise<{ finalText: string; hasError: boolean }>((res) => {
+	// 5. Wait for the loop to complete, or stop waiting if the caller is interrupted.
+	type AttachWaitResult = { finalText: string; hasError: boolean; aborted?: boolean };
+	const abortPromise = new Promise<AttachWaitResult>((res) => {
 		if (signal.aborted) {
-			res({ finalText: "Aborted", hasError: true });
+			res({ finalText: "Aborted", hasError: true, aborted: true });
 			return;
 		}
-		const handler = () => res({ finalText: "Aborted", hasError: true });
+		const handler = () => res({ finalText: "Aborted", hasError: true, aborted: true });
 		signal.addEventListener("abort", handler, { once: true });
 		promise.then((result) => {
 			signal.removeEventListener("abort", handler);
@@ -409,6 +473,23 @@ export async function attachSubagent(
 
 	const result = await abortPromise;
 	getAttachWaitersMap().delete(subagentId);
+
+	if (result.aborted) {
+		const restored = await restoreAttachedSubagentToBackground(subagentId, bgAbort);
+		if (restored) {
+			broadcastToNarrator(parentNarratorId, {
+				type: "subagent_detached",
+				narratorId: parentNarratorId,
+				subagentNarratorId: subagentId,
+				toolUseId,
+			});
+		}
+		const resultPrefix = `<background_task_id>${subagentId}</background_task_id>\n\n`;
+		return (
+			resultPrefix +
+			"Attach interrupted. The subagent is still running in background. Use Await to get results or Send to continue it."
+		);
+	}
 
 	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 	return resultPrefix + (result.finalText || "(no output)");

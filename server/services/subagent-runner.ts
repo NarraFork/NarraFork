@@ -32,6 +32,7 @@ import { getSubagentResultMessageId } from "./narrator-session";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
+	type DetachSetupResult,
 	getAttachWaitersMap,
 	getBackgroundAbortControllers,
 	getDetachableMap,
@@ -402,8 +403,9 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 	const { promise: foregroundPromise, resolve: foregroundResolve } =
 		Promise.withResolvers<string>();
 
-	// Track whether we've been detached (set by detachSubagent)
+	// Track whether we've been detached (set by detachSubagent) and wait for setup if needed.
 	let detached = false;
+	let detachReadyPromise: Promise<DetachSetupResult> | undefined;
 
 	const runLoop = async () => {
 		const proxy = new ProxyAbortController();
@@ -411,8 +413,9 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 		try {
 			// Register detach entry so the API can detach this subagent
 			getDetachableMap().set(subagentId, {
-				markDetached: () => {
+				markDetached: (setup) => {
 					detached = true;
+					detachReadyPromise = setup;
 				},
 				foregroundResolve,
 				proxy,
@@ -531,6 +534,24 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 			getManualOverrideMap().delete(subagentId);
 			getForegroundAbortControllers().delete(subagentId);
 
+			let detachSetupSucceeded = detached;
+			if (detached) {
+				if (!detachReadyPromise) {
+					detachSetupSucceeded = false;
+					logger.warn("Detached subagent setup promise missing", { subagentId });
+				} else {
+					try {
+						await detachReadyPromise;
+					} catch (err) {
+						detachSetupSucceeded = false;
+						logger.warn("Detached subagent setup failed before completion", {
+							subagentId,
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
+			}
+
 			try {
 				await finalizeSubagent(
 					subagentId,
@@ -553,31 +574,36 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 				// Non-critical — don't fail the whole flow
 			}
 
-			if (detached) {
-				// Background completion path — use shared helper
+			if (detachSetupSucceeded) {
 				try {
-					await finalizeBackgroundCompletion(
-						subagentId,
-						parentNarratorId,
-						toolUseId,
-						hasError,
-						finalText,
-					);
-				} catch {
-					// Non-critical
-				}
+					// Background completion path — use shared helper
+					try {
+						await finalizeBackgroundCompletion(
+							subagentId,
+							parentNarratorId,
+							toolUseId,
+							hasError,
+							finalText,
+						);
+					} catch {
+						// Non-critical
+					}
 
-				// Notify attach waiter if any (background → foreground transition)
-				const attachWaiter = getAttachWaitersMap().get(subagentId);
-				if (attachWaiter) {
-					attachWaiter.resolve({ finalText, hasError });
-					getAttachWaitersMap().delete(subagentId);
-				}
+					// Notify attach waiter if any (background → foreground transition)
+					const attachWaiter = getAttachWaitersMap().get(subagentId);
+					if (attachWaiter) {
+						attachWaiter.resolve({ finalText, hasError });
+						getAttachWaitersMap().delete(subagentId);
+					}
 
-				// Clean up team tracking
-				clearTeamInbox(subagentId);
+					// Clean up team tracking
+					clearTeamInbox(subagentId);
+				} finally {
+					getBackgroundAbortControllers().delete(subagentId);
+					backgroundTaskService.unregisterAbortController(subagentId);
+				}
 			} else {
-				// Normal foreground completion
+				// Normal foreground completion, or detach setup failed before background handoff finished.
 				const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 				foregroundResolve(resultPrefix + (finalText || "(no output)"));
 			}

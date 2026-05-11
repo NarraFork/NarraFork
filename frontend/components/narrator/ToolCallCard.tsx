@@ -1455,10 +1455,10 @@ const ToolHeader = memo(
 				if (action) return `Terminal ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
 			}
 			if (cat === "pipeline") {
-				return toolCall.toolName === "StartPipeline" ? "Pipeline Start" : "Pipeline End";
+				return toolCall.toolName === "StartPipeline" ? t("pipelineStart") : t("pipelineEnd");
 			}
 			return toolCall.toolName;
-		}, [cat, toolCall.toolName, toolCall.inputJson]);
+		}, [cat, toolCall.toolName, toolCall.inputJson, t]);
 
 		// For Bash tools, resolve the effective timeout (from _timeoutMs, inputJson, or default)
 		const effectiveTimeoutMs = useMemo(() => {
@@ -3543,7 +3543,7 @@ function formatPipelineBytes(value: string): string {
 }
 
 function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const { t } = useTranslation("common");
+	const { t } = useTranslation("narrator");
 	const isStart = toolCall.toolName === "StartPipeline";
 	const label = extractField(toolCall.inputJson, "label");
 	const maxPreviewChars = extractNumericField(toolCall.inputJson, "maxPreviewChars") ?? 100;
@@ -3569,7 +3569,7 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 		<Box mt="xs">
 			<Group gap={6} wrap="wrap" mb={rule || capturedEntries.length > 0 || outputText ? 4 : 0}>
 				<Badge size="xs" variant="light" color={isStart ? "blue" : "indigo"}>
-					{isStart ? "start" : "end"}
+					{isStart ? t("pipelineStageStart") : t("pipelineStageEnd")}
 				</Badge>
 				{label && (
 					<Badge size="xs" variant="outline" color="gray">
@@ -3583,12 +3583,12 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 				)}
 				{isStart && (
 					<Badge size="xs" variant="outline" color="gray">
-						preview ≤ {maxPreviewChars} chars
+						{t("pipelinePreviewChars", { value: maxPreviewChars.toLocaleString() })}
 					</Badge>
 				)}
 				{maxChars != null && (
 					<Badge size="xs" variant="outline" color="gray">
-						max {maxChars.toLocaleString()} chars
+						{t("pipelineMaxChars", { value: maxChars.toLocaleString() })}
 					</Badge>
 				)}
 				{aliasList.map((alias) => (
@@ -3601,7 +3601,7 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{rule && (
 				<Box mt={4}>
 					<Text size="xs" fw={500} mb={2}>
-						Rule
+						{t("pipelineRule")}
 					</Text>
 					<Code
 						block
@@ -3619,7 +3619,7 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{capturedEntries.length > 0 && (
 				<Stack gap={4} mt="xs">
 					<Text size="xs" fw={500}>
-						Captured aliases
+						{t("pipelineCapturedAliases")}
 					</Text>
 					{capturedEntries.map((entry) => (
 						<Group key={`${entry.alias}-${entry.toolName}`} gap={6} wrap="nowrap">
@@ -3647,9 +3647,9 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{!isFailed && parsed?.body && (
 				<Box mt="xs">
 					<Text size="xs" fw={500} mb={2}>
-						{t("output")}
+						{t("pipelineOutput")}
 					</Text>
-					<ContentViewer content={parsed.body} style={termStyle} title="Pipeline result" />
+					<ContentViewer content={parsed.body} style={termStyle} title={t("pipelineResult")} />
 				</Box>
 			)}
 			{!isFailed && !parsed && outputText && isStart && (
@@ -3660,9 +3660,9 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 			{!isFailed && !parsed && outputText && !isStart && (
 				<Box mt="xs">
 					<Text size="xs" fw={500} mb={2}>
-						{t("output")}
+						{t("pipelineOutput")}
 					</Text>
-					<ContentViewer content={outputText} style={termStyle} title="Pipeline output" />
+					<ContentViewer content={outputText} style={termStyle} title={t("pipelineOutput")} />
 				</Box>
 			)}
 			{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}

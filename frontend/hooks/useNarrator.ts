@@ -353,7 +353,7 @@ export function useNarratorUsageStats(narratorId: string, includeSubagents = tru
 	});
 }
 
-const NARRATOR_MESSAGES_GC_TIME_MS = 60_000;
+const NARRATOR_MESSAGES_GC_TIME_MS = 5 * 60_000;
 
 type MessagePageParam =
 	| {
