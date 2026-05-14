@@ -11,7 +11,7 @@ import {
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
-	usesCodexApiMode,
+	usesCodexModel,
 } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
@@ -449,7 +449,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		const resolvedProvider = resolveProvider(model);
 		const resolvedServiceTier =
-			narratorFastMode && usesCodexApiMode(resolvedProvider) ? "priority" : undefined;
+			narratorFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
 		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
 		resetUpstreamSessionOnNextRequest = false;
@@ -463,7 +463,8 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			locale,
 			signal,
 			parentNarratorId,
-			reasoningEffort: narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider),
+			reasoningEffort:
+				narratorReasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, model),
 			serviceTier: resolvedServiceTier,
 			maxTransientRetries: getMaxTransientRetries(),
 			silentToolCallThreshold: getSilentToolCallThreshold(),

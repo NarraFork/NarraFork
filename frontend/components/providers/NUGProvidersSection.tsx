@@ -122,6 +122,32 @@ const CHANNEL_COLORS: Record<string, string> = {
 const TIME_RANGES = ["today", "7days", "30days", "all"] as const;
 type TimeRange = (typeof TIME_RANGES)[number];
 
+function usageNumber(record: Record<string, unknown>, keys: string[], fallback = 0): number {
+	for (const key of keys) {
+		const value = record[key];
+		const numberValue =
+			typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+		if (Number.isFinite(numberValue)) return numberValue;
+	}
+	return fallback;
+}
+
+function usageString(record: Record<string, unknown>, keys: string[], fallback = ""): string {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.length > 0) return value;
+		if (typeof value === "number" && Number.isFinite(value)) return String(value);
+	}
+	return fallback;
+}
+
+function usageTime(record: Record<string, unknown>): string {
+	const createdAt = usageString(record, ["createdAt", "created_at", "timestamp"]);
+	if (!createdAt) return "-";
+	const date = new Date(createdAt);
+	return Number.isNaN(date.getTime()) ? "-" : date.toLocaleTimeString();
+}
+
 /* ── NUG Login Modal ───────────────────────────────────── */
 
 function NUGLoginModal({
@@ -344,7 +370,7 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 				api.nugGetUsage(providerId, range),
 			]);
 			setSummary(summaryRes);
-			setEvents(eventsRes.events ?? []);
+			setEvents(Array.isArray(eventsRes.events) ? eventsRes.events : []);
 		} catch {
 			/* ignore */
 		} finally {
@@ -355,6 +381,17 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 	useEffect(() => {
 		fetchUsage();
 	}, [fetchUsage]);
+
+	const summaryRecord = summary as unknown as Record<string, unknown> | null;
+	const requestCount = summaryRecord
+		? usageNumber(summaryRecord, ["requestCount", "request_count"])
+		: 0;
+	const totalMeterUsage = summaryRecord
+		? usageNumber(summaryRecord, ["totalMeterUsage", "total_meter_usage"])
+		: 0;
+	const totalQuotaCost = summaryRecord
+		? usageNumber(summaryRecord, ["totalQuotaCost", "total_quota_cost"])
+		: 0;
 
 	return (
 		<Paper withBorder p="xs">
@@ -381,19 +418,19 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 						<Text size="xs" c="dimmed">
 							{t("nugStatRequests")}
 						</Text>
-						<Text fw={600}>{summary.requestCount.toLocaleString()}</Text>
+						<Text fw={600}>{requestCount.toLocaleString()}</Text>
 					</Paper>
 					<Paper withBorder p="xs" ta="center">
 						<Text size="xs" c="dimmed">
 							{t("nugStatMeterUsage")}
 						</Text>
-						<Text fw={600}>{summary.totalMeterUsage.toFixed(2)}</Text>
+						<Text fw={600}>{totalMeterUsage.toFixed(2)}</Text>
 					</Paper>
 					<Paper withBorder p="xs" ta="center">
 						<Text size="xs" c="dimmed">
 							{t("nugStatQuotaCost")}
 						</Text>
-						<Text fw={600}>{summary.totalQuotaCost.toFixed(2)}</Text>
+						<Text fw={600}>{totalQuotaCost.toFixed(2)}</Text>
 					</Paper>
 				</SimpleGrid>
 			)}
@@ -411,19 +448,60 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 					</Table.Tr>
 				</Table.Thead>
 				<Table.Tbody>
-					{events.map((ev) => {
-						const normalInput =
-							ev.inputTokens - ev.cacheCreationInputTokens - ev.cacheReadInputTokens;
-						const hasCache = ev.cacheCreationInputTokens > 0 || ev.cacheReadInputTokens > 0;
+					{events.map((ev, index) => {
+						const record = ev as unknown as Record<string, unknown>;
+						const inputTokens = usageNumber(record, [
+							"inputTokens",
+							"input_tokens",
+							"tokensIn",
+							"tokens_in",
+						]);
+						const outputTokens = usageNumber(record, [
+							"outputTokens",
+							"output_tokens",
+							"completionTokens",
+						]);
+						const cacheCreationInputTokens = usageNumber(record, [
+							"cacheCreationInputTokens",
+							"cache_creation_input_tokens",
+							"cacheCreationTokens",
+							"cache_creation_tokens",
+							"cacheWriteInputTokens",
+							"cache_write_input_tokens",
+							"cacheWriteTokens",
+							"cache_write_tokens",
+						]);
+						const cacheReadInputTokens = usageNumber(record, [
+							"cacheReadInputTokens",
+							"cache_read_input_tokens",
+							"cachedInputTokens",
+							"cached_input_tokens",
+							"cacheReadTokens",
+							"cache_read_tokens",
+						]);
+						const channelType = usageString(
+							record,
+							["channelType", "channel_type", "channel"],
+							"unknown",
+						);
+						const model = usageString(record, ["model", "model_id", "modelId"], "-");
+						const status = usageString(record, ["status"], "unknown");
+						const meterUsage = usageNumber(record, ["meterUsage", "meter_usage"]);
+						const quotaCost = usageNumber(record, ["quotaCost", "quota_cost"]);
+						const normalInput = Math.max(
+							0,
+							inputTokens - cacheCreationInputTokens - cacheReadInputTokens,
+						);
+						const hasCache = cacheCreationInputTokens > 0 || cacheReadInputTokens > 0;
 						return (
-							<Table.Tr key={ev.id}>
-								<Table.Td>{new Date(ev.createdAt).toLocaleTimeString()}</Table.Td>
+							<Table.Tr key={ev.id || `usage-${index}`}>
+								<Table.Td>{usageTime(record)}</Table.Td>
 								<Table.Td>
-									<Badge size="xs" color={CHANNEL_COLORS[ev.channelType] ?? "blue"}>
-										{ev.channelType}
+									<Badge size="xs" color={CHANNEL_COLORS[channelType] ?? "blue"}>
+										{channelType}
 									</Badge>
 								</Table.Td>
-								<Table.Td>{ev.model}</Table.Td>
+								<Table.Td>{model}</Table.Td>
 								<Table.Td>
 									<Stack gap={2}>
 										<Group gap={4} wrap="nowrap">
@@ -433,14 +511,14 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 											<Text size="xs">{normalInput.toLocaleString()}</Text>
 											{hasCache && (
 												<>
-													{ev.cacheCreationInputTokens > 0 && (
+													{cacheCreationInputTokens > 0 && (
 														<Text size="xs" c="orange">
-															+W:{ev.cacheCreationInputTokens.toLocaleString()}
+															+W:{cacheCreationInputTokens.toLocaleString()}
 														</Text>
 													)}
-													{ev.cacheReadInputTokens > 0 && (
+													{cacheReadInputTokens > 0 && (
 														<Text size="xs" c="teal">
-															+R:{ev.cacheReadInputTokens.toLocaleString()}
+															+R:{cacheReadInputTokens.toLocaleString()}
 														</Text>
 													)}
 												</>
@@ -450,15 +528,15 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 											<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
 												Out:
 											</Text>
-											<Text size="xs">{ev.outputTokens.toLocaleString()}</Text>
+											<Text size="xs">{outputTokens.toLocaleString()}</Text>
 										</Group>
 									</Stack>
 								</Table.Td>
-								<Table.Td ta="right">{ev.meterUsage.toFixed(2)}</Table.Td>
-								<Table.Td ta="right">{ev.quotaCost.toFixed(4)}</Table.Td>
+								<Table.Td ta="right">{meterUsage.toFixed(2)}</Table.Td>
+								<Table.Td ta="right">{quotaCost.toFixed(4)}</Table.Td>
 								<Table.Td ta="center">
-									<Badge size="xs" color={ev.status === "completed" ? "green" : "red"}>
-										{ev.status}
+									<Badge size="xs" color={status === "completed" ? "green" : "red"}>
+										{status}
 									</Badge>
 								</Table.Td>
 							</Table.Tr>

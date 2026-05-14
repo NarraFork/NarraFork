@@ -1,6 +1,6 @@
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { getAnthropicProviderConfig, isAnthropicProvider, usesCodexApiMode } from "../settings";
+import { getAnthropicProviderConfig, isAnthropicProvider, usesCodexModel } from "../settings";
 import {
 	capturePipelineOutput,
 	clipText,
@@ -104,7 +104,10 @@ export async function executeTool(
 	const isOfficialAnthropic =
 		isAnthropicProvider(config.provider) &&
 		!!getAnthropicProviderConfig(config.provider)?.officialApi;
-	if (tu.name === "WebSearch" && (usesCodexApiMode(config.provider) || isOfficialAnthropic)) {
+	if (
+		tu.name === "WebSearch" &&
+		(usesCodexModel(config.provider, config.model) || isOfficialAnthropic)
+	) {
 		logger.warn("Blocked WebSearch function tool for native-search provider", {
 			provider: config.provider,
 			model: config.model,

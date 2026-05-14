@@ -1,9 +1,23 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { api } from "../lib/api";
+import type { ApiEntity } from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 
 const TERMINALS_QUERY_GC_TIME_MS = 60_000;
+
+function appendTerminalToCache(
+	qc: QueryClient,
+	queryKey: readonly ["terminals", { chapterId?: string; narratorId?: string }],
+	terminal: ApiEntity,
+) {
+	if (!terminal?.id) return;
+	qc.setQueryData<ApiEntity[]>(queryKey, (old) => {
+		if (!old) return [terminal];
+		if (old.some((t) => t.id === terminal.id)) return old;
+		return [...old, terminal];
+	});
+}
 
 export function useTerminals(chapterId: string) {
 	const qc = useQueryClient();
@@ -53,22 +67,26 @@ export function useNarratorTerminals(narratorId: string) {
 
 export function useCreateTerminal(chapterId: string) {
 	const qc = useQueryClient();
+	const queryKey = ["terminals", { chapterId }] as const;
 	return useMutation({
 		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) =>
 			api.createTerminal({ chapterId, ...data }),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["terminals", { chapterId }] });
+		onSuccess: (terminal) => {
+			appendTerminalToCache(qc, queryKey, terminal);
+			qc.invalidateQueries({ queryKey });
 		},
 	});
 }
 
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
+	const queryKey = ["terminals", { narratorId }] as const;
 	return useMutation({
 		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) =>
 			api.createTerminal({ narratorId, ...data }),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["terminals", { narratorId }] });
+		onSuccess: (terminal) => {
+			appendTerminalToCache(qc, queryKey, terminal);
+			qc.invalidateQueries({ queryKey });
 		},
 	});
 }

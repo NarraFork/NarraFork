@@ -8,8 +8,8 @@
 import embeddedBashWasm from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "file" };
 
 // Embed WASM files for compiled single-executable mode.
-// `import ... with { type: "file" }` makes Bun include these in $bunfs.
-// At runtime we prefer the embedded path; fall back to require.resolve for dev.
+// `import ... with { type: "file" }` gives Bun an explicit asset edge so the
+// WASM files are available both in dev and in packaged binaries.
 import embeddedTreeSitterWasm from "web-tree-sitter/tree-sitter.wasm" with { type: "file" };
 import { resolvePath, toForwardSlash } from "../platform-path";
 
@@ -1058,33 +1058,23 @@ async function initParser(): Promise<TreeSitterParser> {
 		throw new Error("web-tree-sitter Language API is unavailable");
 	}
 
-	// In compiled single-executable mode, embedded WASM paths point to $bunfs
-	// which web-tree-sitter's internal fs.readFileSync cannot resolve (path
-	// contains `../` that breaks under the virtual FS).  We extract both WASM
-	// files to a real temp directory so the standard Node fs APIs work.
-	let treeSitterWasmPath: string;
-	let bashWasmBytes: Uint8Array;
+	// Parser.init ultimately lets Emscripten read tree-sitter.wasm through Node fs.
+	// In compiled single-executable mode Bun exposes imported assets via virtual
+	// $bunfs/~BUN paths, while require.resolve may still resolve to the build
+	// machine's node_modules path.  Materialize the explicitly imported assets into
+	// a real temp directory so dev and packaged binaries take the same path.
+	const { mkdtempSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const tmpDir = mkdtempSync(join(tmpdir(), "narrafork-wasm-"));
 
-	const isEmbedded =
-		typeof embeddedTreeSitterWasm === "string" && embeddedTreeSitterWasm.includes("~BUN");
+	const tsWasmBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
+	const treeSitterWasmPath = join(tmpDir, "tree-sitter.wasm");
+	writeFileSync(treeSitterWasmPath, new Uint8Array(tsWasmBuf));
 
-	if (isEmbedded) {
-		const { mkdtempSync, writeFileSync } = await import("node:fs");
-		const { join } = await import("node:path");
-		const tmpDir = mkdtempSync(join(globalThis.process?.env?.TEMP || "/tmp", "narrafork-wasm-"));
-		// tree-sitter.wasm — Parser.init needs a real filesystem path
-		const tsWasmBuf = await Bun.file(embeddedTreeSitterWasm).arrayBuffer();
-		treeSitterWasmPath = join(tmpDir, "tree-sitter.wasm");
-		writeFileSync(treeSitterWasmPath, new Uint8Array(tsWasmBuf));
-		// tree-sitter-bash.wasm — Language.load accepts Uint8Array directly
-		const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
-		bashWasmBytes = new Uint8Array(bashBuf);
-	} else {
-		treeSitterWasmPath = require.resolve("web-tree-sitter/tree-sitter.wasm");
-		const bashWasmPath = require.resolve("tree-sitter-bash/tree-sitter-bash.wasm");
-		const bashBuf = await Bun.file(bashWasmPath).arrayBuffer();
-		bashWasmBytes = new Uint8Array(bashBuf);
-	}
+	// tree-sitter-bash.wasm — Language.load accepts Uint8Array directly.
+	const bashBuf = await Bun.file(embeddedBashWasm).arrayBuffer();
+	const bashWasmBytes = new Uint8Array(bashBuf);
 
 	await Parser.init({
 		locateFile() {

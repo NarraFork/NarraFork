@@ -8,8 +8,8 @@ import {
 	getModelContextWindow,
 	isAnthropicProvider,
 	settings,
-	usesCodexApiMode,
-	usesStatefulApi,
+	usesCodexModel,
+	usesStatefulModel,
 } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -1357,19 +1357,22 @@ export async function* agentLoop(
 		);
 	}
 
-	function resolveToolsForProvider(providerName: string): ResolvedToolDefinition[] {
+	function resolveToolsForProvider(
+		providerName: string,
+		modelName: string,
+	): ResolvedToolDefinition[] {
 		// Codex and official Anthropic providers use native server-side web_search —
 		// remove the WebSearch function tool to avoid duplicate search capabilities.
 		// Non-official (proxy) Anthropic providers keep the WebSearch function tool.
 		const isOfficialAnthropic =
 			isAnthropicProvider(providerName) && !!getAnthropicProviderConfig(providerName)?.officialApi;
-		if (usesCodexApiMode(providerName) || isOfficialAnthropic) {
+		if (usesCodexModel(providerName, modelName) || isOfficialAnthropic) {
 			return allTools.filter((t) => t.name !== "WebSearch");
 		}
 		return allTools;
 	}
 
-	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider));
+	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
 	let completedToolCount = config.sideCarInitialCompletedToolCount ?? 0;
@@ -1531,7 +1534,7 @@ export async function* agentLoop(
 				config.model = newResolved.model;
 				config.provider = newResolved.provider;
 				if (providerChanged || modelChanged) {
-					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider));
+					tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 				}
 			}
 
@@ -1804,7 +1807,8 @@ export async function* agentLoop(
 		// Stateful providers (responses/codex) cannot retry here because the
 		// server already consumed the request.
 		const maxConfiguredRetries = config.maxTransientRetries ?? 0;
-		const getMaxChatRetries = () => (usesStatefulApi(effectiveProvider) ? 0 : maxConfiguredRetries);
+		const getMaxChatRetries = () =>
+			usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
 		const maxFirstTokenRetries = maxConfiguredRetries;
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
 		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 60_000);

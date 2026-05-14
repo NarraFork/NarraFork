@@ -8,6 +8,7 @@ import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
@@ -37,7 +38,7 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
-import { getNugCachedModelsGrouped, purgeNugProviderCache } from "./nug";
+import { purgeNugProviderCache } from "./nug";
 import {
 	getOpenaiCachedModels,
 	getOpenaiCachedModelsGrouped,
@@ -48,6 +49,8 @@ const modelOptionSchema = z.object({
 	value: z.string().min(1),
 	label: z.string().min(1),
 	provider: z.string().optional(),
+	channel: z.string().optional(),
+	channelType: z.string().optional(),
 });
 
 const proxyUrlSchema = z.preprocess(
@@ -633,7 +636,7 @@ settingsRoutes.get("/", (c) => {
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
-		nugModelsGrouped: getNugCachedModelsGrouped(),
+		nugModelsGrouped: getNugCachedModelsGrouped(s.nugProviders ?? []),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),

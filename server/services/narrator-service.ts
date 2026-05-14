@@ -392,7 +392,7 @@ export async function handleLoadSkillCommand(
 /**
  * Handle `/bash <command>` slash command.
  * Directly executes a bash command without AI involvement.
- * Persists user message + assistant message (with tool_use/tool_result) + tool call record.
+ * Persists a running tool card before execution, then streams output via WS.
  */
 export async function handleBashCommand(
 	narratorId: string,
@@ -403,7 +403,7 @@ export async function handleBashCommand(
 	const narrator = await narratorService.getById(narratorId);
 	const cwd = narrator.cwd ?? process.cwd();
 
-	// 1. Persist user message with bash_command content block
+	// 1. Persist and broadcast the user-visible /bash command immediately.
 	const userMsg = await narratorService.persistUserMessage(
 		narratorId,
 		rawCommand,
@@ -422,71 +422,53 @@ export async function handleBashCommand(
 			contentText: userMsg.contentText,
 			commandText: rawCommand,
 			createdAt: userMsg.createdAt,
+			seq: userMsg.seq,
 			children: [],
 			creator: userMsg.creator ?? null,
 		},
 	});
 
-	// 2. Execute bash command using the tool directly
 	const { bashTool } = await import("../lib/agent/tools/bash");
 	const toolUseId = `toolu_bash_${generateId()}`;
-	const startTime = Date.now();
-
-	const result = await bashTool.execute(
-		{ command, description: command },
-		{
-			narratorId,
-			cwd,
-			signal: new AbortController().signal,
-			locale: "en",
-			requestPermission: async () => ({ behavior: "allow" as const }),
-		},
-	);
-	const durationMs = Date.now() - startTime;
-
-	// 3. Persist assistant message with tool_use + tool_result blocks
+	const toolCallId = generateId();
+	const assistantMsgId = generateId();
+	const streamStartedAt = Date.now();
+	const streamStartedAtIso = new Date(streamStartedAt).toISOString();
+	const toolInput = { command, description: command };
 	const toolUseBlock = {
 		type: "tool_use",
 		id: toolUseId,
 		name: "Bash",
-		input: { command, description: command },
+		input: toolInput,
+		streamStartedAt,
 	};
-	const toolResultBlock = {
-		type: "tool_result",
-		tool_use_id: toolUseId,
-		content: result.output,
-		is_error: result.isError ?? false,
-	};
-	const assistantMsgId = generateId();
 	const now = new Date().toISOString();
+
+	// 2. Persist and broadcast a running assistant tool card before the process starts.
 	const [assistantMsg] = await db
 		.insert(narratorMessages)
 		.values({
 			id: assistantMsgId,
 			narratorId,
 			role: "assistant",
-			contentJson: [toolUseBlock, toolResultBlock],
+			contentJson: [toolUseBlock],
 			contentText: null,
 			createdAt: now,
 		})
 		.returning();
-	await appendMessageRef(narratorId, assistantMsgId);
-
-	// 4. Persist tool call record
+	const assistantSeq = await appendMessageRef(narratorId, assistantMsgId);
 	await db.insert(narratorToolCalls).values({
-		id: generateId(),
+		id: toolCallId,
 		narratorId,
 		messageId: assistantMsgId,
 		toolUseId,
 		toolName: "Bash",
-		inputJson: { command, description: command },
-		outputJson: result.output,
-		status: result.isError ? "fail" : "success",
-		durationMs,
+		inputJson: toolInput,
+		status: "running",
+		streamStartedAt: streamStartedAtIso,
 		createdAt: now,
 	});
 
-	// 5. Broadcast assistant message
 	broadcastToNarrator(narratorId, {
 		type: "message",
 		narratorId,
@@ -497,19 +479,119 @@ export async function handleBashCommand(
 			contentJson: assistantMsg.contentJson,
 			contentText: assistantMsg.contentText,
 			createdAt: assistantMsg.createdAt,
+			seq: assistantSeq,
 			children: [],
 			toolCalls: [
 				{
-					id: toolUseId,
+					id: toolCallId,
 					toolUseId,
 					toolName: "Bash",
-					inputJson: { command, description: command },
-					outputJson: result.output,
-					status: result.isError ? "fail" : "success",
-					durationMs,
+					inputJson: toolInput,
+					status: "running",
+					streamStartedAt: streamStartedAtIso,
 				},
 			],
 		},
+	});
+	broadcastToNarrator(narratorId, {
+		type: "tool_started",
+		narratorId,
+		toolUseId,
+		toolName: "Bash",
+		input: toolInput,
+		streamStartedAt,
+	});
+
+	// 3. Execute the process with live-output callbacks wired into the WS channel.
+	const progressTimer = setInterval(() => {
+		broadcastToNarrator(narratorId, {
+			type: "tool_progress",
+			narratorId,
+			toolUseId,
+			elapsed: Math.floor((Date.now() - streamStartedAt) / 1000),
+		});
+	}, 5000);
+
+	let result: Awaited<ReturnType<typeof bashTool.execute>>;
+	try {
+		result = await bashTool.execute(toolInput, {
+			narratorId,
+			cwd,
+			signal: new AbortController().signal,
+			locale: "en",
+			requestPermission: async () => ({ behavior: "allow" as const }),
+			currentToolUseId: toolUseId,
+			emitOutput: (output) => {
+				broadcastToNarrator(narratorId, {
+					type: "tool_output",
+					narratorId,
+					toolUseId,
+					output,
+				});
+			},
+			emitLongRunning: (_toolUseId, elapsed) => {
+				broadcastToNarrator(narratorId, {
+					type: "tool_long_running",
+					narratorId,
+					toolUseId,
+					elapsed,
+				});
+			},
+		});
+	} catch (err) {
+		result = {
+			output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+		};
+	} finally {
+		clearInterval(progressTimer);
+	}
+
+	const completedAt = Date.now();
+	const durationMs = completedAt - streamStartedAt;
+	const status = result.isError ? "fail" : "success";
+	const persistedOutput = result.metadata
+		? { _text: result.output, _metadata: result.metadata }
+		: result.output;
+	const toolResultBlock = {
+		type: "tool_result",
+		tool_use_id: toolUseId,
+		content: result.output,
+		is_error: result.isError ?? false,
+	};
+
+	await db
+		.update(narratorMessages)
+		.set({
+			contentJson: [toolUseBlock, toolResultBlock],
+			durationMs,
+		})
+		.where(eq(narratorMessages.id, assistantMsgId));
+	await narratorService.updateToolCallResult(toolUseId, {
+		output: persistedOutput,
+		status,
+		errorMessage: result.isError ? result.output : undefined,
+		durationMs,
+		executionStartedAt: streamStartedAt,
+		completedAt,
+	});
+
+	broadcastToNarrator(narratorId, {
+		type: "tool_completed",
+		narratorId,
+		toolUseId,
+		toolName: "Bash",
+		status,
+		output:
+			result.output.length > 2000
+				? {
+						_truncated: true,
+						preview: result.output.slice(0, 2000),
+						fullLength: result.output.length,
+					}
+				: result.output,
+		durationMs,
+		...(result.metadata && { metadata: result.metadata }),
 	});
 
 	return {
@@ -569,7 +651,7 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(actualModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
-				? (resolveDefaultReasoningEffort(resolvedProvider) ?? null)
+				? (resolveDefaultReasoningEffort(resolvedProvider, actualModel) ?? null)
 				: input.reasoningEffort;
 
 		const chapterId = input.chapterId ?? null;
@@ -633,7 +715,8 @@ export const narratorService = {
 		const resolvedProvider = resolveProvider(resolvedModel);
 		const resolvedReasoningEffort =
 			input.reasoningEffort === undefined
-				? parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null)
+				? parent.reasoningEffort ||
+					(resolveDefaultReasoningEffort(resolvedProvider, resolvedModel) ?? null)
 				: input.reasoningEffort;
 
 		const subChapterId = parent.chapterId ?? null;
@@ -1119,7 +1202,8 @@ export const narratorService = {
 		const effectiveModel = resolveEffectiveModel(storedModel);
 		const resolvedProvider = resolveProvider(effectiveModel);
 		const resolvedReasoningEffort =
-			parent.reasoningEffort || (resolveDefaultReasoningEffort(resolvedProvider) ?? null);
+			parent.reasoningEffort ||
+			(resolveDefaultReasoningEffort(resolvedProvider, effectiveModel) ?? null);
 
 		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 

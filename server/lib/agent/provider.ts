@@ -420,6 +420,9 @@ function buildResolution(
 		provider === requestedProvider
 			? requestedModel
 			: (defaultModelForProvider(provider) ?? `${provider}:${bareRequestedModel || "default"}`);
+	if (adapter instanceof NugProvider) {
+		adapter.prepareForModel(model);
+	}
 	return {
 		requestedProvider,
 		requestedModel,

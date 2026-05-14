@@ -177,6 +177,9 @@ import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewe
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	COMPACTING_MARKER_ATTR,
+	CompactSummaryModal,
+	CompactSummaryModalCtx,
+	type CompactSummaryModalTarget,
 	EditingMessageCtx,
 	type EditingMessageState,
 } from "./MessageBubble";
@@ -1318,8 +1321,27 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
 };
 
-function getCodexReasoningEffortOptions(model?: string): readonly ReasoningEffortValue[] {
-	const bareModel = model?.split(":").slice(1).join(":") ?? "";
+function getBareModelForReasoning(model?: string, modelOption?: ModelOption): string {
+	if (modelOption?.bareModel) return modelOption.bareModel;
+	if (!model) return "";
+	const modelWithoutProvider = model.includes(":") ? model.split(":").slice(1).join(":") : model;
+	const channel = modelOption?.channel ?? modelWithoutProvider.split(":")[0];
+	if (channel) {
+		const channelPrefix = `${channel}:`;
+		if (modelWithoutProvider.startsWith(channelPrefix)) {
+			return modelWithoutProvider.slice(channelPrefix.length);
+		}
+	}
+	return modelWithoutProvider.startsWith("codex:")
+		? modelWithoutProvider.slice("codex:".length)
+		: modelWithoutProvider;
+}
+
+function getCodexReasoningEffortOptions(
+	model?: string,
+	modelOption?: ModelOption,
+): readonly ReasoningEffortValue[] {
+	const bareModel = getBareModelForReasoning(model, modelOption);
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
 }
 
@@ -2017,10 +2039,17 @@ export function NarratorPanel({
 		}
 		return providers;
 	}, [settingsData]);
+	const resolvedModelOption = useMemo(
+		() => allModels.find((m) => m.value === resolvedModel),
+		[allModels, resolvedModel],
+	);
+	const isCodexChannelModel =
+		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
+		resolvedBareModel.startsWith("codex:");
 	const supportsCodexControls = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
-		return !!providerPrefix && codexCapableProviders.has(providerPrefix);
-	}, [codexCapableProviders, resolvedModel]);
+		return (!!providerPrefix && codexCapableProviders.has(providerPrefix)) || isCodexChannelModel;
+	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
 	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
 
 	// Reasoning effort is supported by Codex, Anthropic, and OpenAI providers
@@ -2028,7 +2057,7 @@ export function NarratorPanel({
 	const supportsReasoningEffort = useMemo(() => {
 		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
-		if (codexCapableProviders.has(providerPrefix)) return true;
+		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
 		// Check Anthropic providers
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
 		if (anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
@@ -2042,6 +2071,7 @@ export function NarratorPanel({
 		return false;
 	}, [
 		codexCapableProviders,
+		isCodexChannelModel,
 		settingsData?.anthropicProviders,
 		settingsData?.openaiProviders,
 		resolvedModel,
@@ -2051,11 +2081,12 @@ export function NarratorPanel({
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		const providerPrefix = resolvedModel.split(":")[0];
-		if (providerPrefix && codexCapableProviders.has(providerPrefix)) {
-			return getCodexReasoningEffortOptions(resolvedModel);
+		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
+			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
 		}
 		return DEFAULT_REASONING_EFFORT_OPTIONS;
-	}, [codexCapableProviders, resolvedModel]);
+	}, [codexCapableProviders, isCodexChannelModel, resolvedModel, resolvedModelOption]);
+
 	const displayedReasoningEffort = useMemo(
 		() => normalizeReasoningEffortForModel(resolvedModel, narrator?.reasoningEffort),
 		[resolvedModel, narrator?.reasoningEffort],
@@ -2152,6 +2183,23 @@ export function NarratorPanel({
 		}),
 		[],
 	);
+
+	// Hoist compact-summary modals above the virtualized message rows so a message
+	// append/stream update cannot unmount the row and implicitly close the modal.
+	const [compactSummaryModalTarget, setCompactSummaryModalTarget] =
+		useState<CompactSummaryModalTarget | null>(null);
+	const compactSummaryModalCtxValue = useMemo(
+		() => ({
+			open: (target: CompactSummaryModalTarget) => setCompactSummaryModalTarget(target),
+		}),
+		[],
+	);
+	const closeCompactSummaryModal = useCallback(() => setCompactSummaryModalTarget(null), []);
+	useEffect(() => {
+		setCompactSummaryModalTarget((current) =>
+			current?.narratorId === narratorId ? current : null,
+		);
+	}, [narratorId]);
 
 	// --- Input management ---
 	const [input, setInput] = useState(() => readInputDraft(narratorId));
@@ -6475,6 +6523,11 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
+					<CompactSummaryModal
+						target={compactSummaryModalTarget}
+						onClose={closeCompactSummaryModal}
+					/>
+
 					<Modal
 						opened={contextThresholdSettingsOpened}
 						onClose={closeContextThresholdSettings}
@@ -6814,113 +6867,115 @@ export function NarratorPanel({
 								userSelect: selectionMode ? "none" : undefined,
 							}}
 						>
-							<MessageSelectionCtx.Provider value={selectionCtxValue}>
-								<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
-									<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-										<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-											{!canRenderMessages ? (
-												<Box h="100%" py="sm" px="md">
-													<Stack gap="md">
-														<Group align="flex-start" gap="sm">
-															<Skeleton height={28} width={28} circle />
-															<Box style={{ flex: 1 }}>
-																<Skeleton height={14} width={60} mb={6} radius="sm" />
-																<Skeleton height={36} radius="sm" />
-															</Box>
-														</Group>
-														<Group align="flex-start" gap="sm">
-															<Skeleton height={28} width={28} circle />
-															<Box style={{ flex: 1 }}>
-																<Skeleton height={14} width={80} mb={6} radius="sm" />
-																<Skeleton height={16} width="95%" mb={4} radius="sm" />
-																<Skeleton height={16} width="88%" mb={4} radius="sm" />
-																<Skeleton height={16} width="72%" mb={4} radius="sm" />
-																<Skeleton height={80} width="100%" mt={8} radius="sm" />
-																<Skeleton height={16} width="90%" mt={8} radius="sm" />
-																<Skeleton height={16} width="60%" radius="sm" />
-															</Box>
-														</Group>
-														<Group align="flex-start" gap="sm">
-															<Skeleton height={28} width={28} circle />
-															<Box style={{ flex: 1 }}>
-																<Skeleton height={14} width={60} mb={6} radius="sm" />
-																<Skeleton height={24} width="70%" radius="sm" />
-															</Box>
-														</Group>
-														<Group align="flex-start" gap="sm">
-															<Skeleton height={28} width={28} circle />
-															<Box style={{ flex: 1 }}>
-																<Skeleton height={14} width={80} mb={6} radius="sm" />
-																<Skeleton height={16} width="92%" mb={4} radius="sm" />
-																<Skeleton height={16} width="85%" mb={4} radius="sm" />
-																<Skeleton height={16} width="45%" radius="sm" />
-															</Box>
-														</Group>
-													</Stack>
-												</Box>
-											) : isWorkspacePreview ? (
-												<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
-													<Box
-														px="md"
-														pt="md"
-														style={{
-															position: "absolute",
-															left: 0,
-															right: 0,
-															bottom: 0,
-															display: "flex",
-															flexDirection: "column",
-															gap: 12,
-														}}
-													>
-														{renderedElements.map((element, index) => (
-															<Box
-																key={renderedKeys[index] ?? `preview-${index}`}
-																style={{ flex: "0 0 auto", minWidth: 0 }}
-															>
-																{element}
-															</Box>
-														))}
+							<CompactSummaryModalCtx.Provider value={compactSummaryModalCtxValue}>
+								<MessageSelectionCtx.Provider value={selectionCtxValue}>
+									<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
+										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+												{!canRenderMessages ? (
+													<Box h="100%" py="sm" px="md">
+														<Stack gap="md">
+															<Group align="flex-start" gap="sm">
+																<Skeleton height={28} width={28} circle />
+																<Box style={{ flex: 1 }}>
+																	<Skeleton height={14} width={60} mb={6} radius="sm" />
+																	<Skeleton height={36} radius="sm" />
+																</Box>
+															</Group>
+															<Group align="flex-start" gap="sm">
+																<Skeleton height={28} width={28} circle />
+																<Box style={{ flex: 1 }}>
+																	<Skeleton height={14} width={80} mb={6} radius="sm" />
+																	<Skeleton height={16} width="95%" mb={4} radius="sm" />
+																	<Skeleton height={16} width="88%" mb={4} radius="sm" />
+																	<Skeleton height={16} width="72%" mb={4} radius="sm" />
+																	<Skeleton height={80} width="100%" mt={8} radius="sm" />
+																	<Skeleton height={16} width="90%" mt={8} radius="sm" />
+																	<Skeleton height={16} width="60%" radius="sm" />
+																</Box>
+															</Group>
+															<Group align="flex-start" gap="sm">
+																<Skeleton height={28} width={28} circle />
+																<Box style={{ flex: 1 }}>
+																	<Skeleton height={14} width={60} mb={6} radius="sm" />
+																	<Skeleton height={24} width="70%" radius="sm" />
+																</Box>
+															</Group>
+															<Group align="flex-start" gap="sm">
+																<Skeleton height={28} width={28} circle />
+																<Box style={{ flex: 1 }}>
+																	<Skeleton height={14} width={80} mb={6} radius="sm" />
+																	<Skeleton height={16} width="92%" mb={4} radius="sm" />
+																	<Skeleton height={16} width="85%" mb={4} radius="sm" />
+																	<Skeleton height={16} width="45%" radius="sm" />
+																</Box>
+															</Group>
+														</Stack>
 													</Box>
-												</Box>
-											) : usePixiRenderer ? (
-												<NarratorPixiMessageList
-													ref={virtualListRef}
-													messagesData={deferredMessagesData}
-													narratorId={narratorId}
-													streamingMsg={streamingMsg}
-													pruneBoundaryMessageId={pruneBoundaryMessageId}
-													pruneDividerLabel={pruneDividerLabel}
-													showManualLoadOlder={showManualLoadOlder}
-													showConclusionButton={showConclusionBtn}
-													showTokenUsage={showTokenUsage}
-													highlightedId={highlightedId}
-													pendingPermission={renderPermCb.pendingPermission}
-													pendingPermsMap={renderPermCb.pendingPermsMap}
-													onPermissionDecision={renderPermCb.onPermissionDecision}
-													onForkFromMessage={forkHandler}
-													onAskInPassing={handleAskInPassing}
-													onCompactBeforeMessage={handleCompactBefore}
-													onDeleteBlock={handleDeleteBlock}
-													onRollbackToBlock={handleRollback}
-													scrollRef={viewportCallbackRef}
-													contentRef={contentRef}
-													shift={isFetchingNextPage}
-												/>
-											) : (
-												<BroadMessageList
-													ref={virtualListRef}
-													elements={renderedElements}
-													elementKeys={renderedKeys}
-													scrollRef={viewportCallbackRef}
-													contentRef={contentRef}
-													shift={isFetchingNextPage}
-												/>
-											)}
-										</EditingMessageCtx.Provider>
-									</LatestTodosToolUseIdCtx.Provider>
-								</FileModDrawerCtx.Provider>
-							</MessageSelectionCtx.Provider>
+												) : isWorkspacePreview ? (
+													<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
+														<Box
+															px="md"
+															pt="md"
+															style={{
+																position: "absolute",
+																left: 0,
+																right: 0,
+																bottom: 0,
+																display: "flex",
+																flexDirection: "column",
+																gap: 12,
+															}}
+														>
+															{renderedElements.map((element, index) => (
+																<Box
+																	key={renderedKeys[index] ?? `preview-${index}`}
+																	style={{ flex: "0 0 auto", minWidth: 0 }}
+																>
+																	{element}
+																</Box>
+															))}
+														</Box>
+													</Box>
+												) : usePixiRenderer ? (
+													<NarratorPixiMessageList
+														ref={virtualListRef}
+														messagesData={deferredMessagesData}
+														narratorId={narratorId}
+														streamingMsg={streamingMsg}
+														pruneBoundaryMessageId={pruneBoundaryMessageId}
+														pruneDividerLabel={pruneDividerLabel}
+														showManualLoadOlder={showManualLoadOlder}
+														showConclusionButton={showConclusionBtn}
+														showTokenUsage={showTokenUsage}
+														highlightedId={highlightedId}
+														pendingPermission={renderPermCb.pendingPermission}
+														pendingPermsMap={renderPermCb.pendingPermsMap}
+														onPermissionDecision={renderPermCb.onPermissionDecision}
+														onForkFromMessage={forkHandler}
+														onAskInPassing={handleAskInPassing}
+														onCompactBeforeMessage={handleCompactBefore}
+														onDeleteBlock={handleDeleteBlock}
+														onRollbackToBlock={handleRollback}
+														scrollRef={viewportCallbackRef}
+														contentRef={contentRef}
+														shift={isFetchingNextPage}
+													/>
+												) : (
+													<BroadMessageList
+														ref={virtualListRef}
+														elements={renderedElements}
+														elementKeys={renderedKeys}
+														scrollRef={viewportCallbackRef}
+														contentRef={contentRef}
+														shift={isFetchingNextPage}
+													/>
+												)}
+											</EditingMessageCtx.Provider>
+										</LatestTodosToolUseIdCtx.Provider>
+									</FileModDrawerCtx.Provider>
+								</MessageSelectionCtx.Provider>
+							</CompactSummaryModalCtx.Provider>
 							{!isWorkspacePreview && (
 								<ScrollbarUserMarkers
 									markers={userMessageMarkers}
@@ -7215,6 +7270,7 @@ export function NarratorPanel({
 													color="teal"
 													onClick={() => setGoalsExpanded(false)}
 													leftSection={<IconChevronDown size={12} />}
+													style={{ marginRight: "auto" }}
 												>
 													{t("collapseGoals")}
 												</Button>
@@ -7337,6 +7393,7 @@ export function NarratorPanel({
 													color="blue"
 													onClick={() => setQueueExpanded(false)}
 													leftSection={<IconChevronDown size={12} />}
+													style={{ marginRight: "auto" }}
 												>
 													{t("collapseQueue")}
 												</Button>

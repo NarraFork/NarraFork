@@ -419,12 +419,23 @@ function SettingsProvidersPage() {
 			for (const m of group.models) {
 				const id = String(m.model_id ?? m.modelId ?? m.id ?? "");
 				if (!id) continue;
+				const channel = String(m.channel ?? id.split(":")[0] ?? "");
+				const channelType = String(m.channelType ?? channel);
+				const rawBareModel = m.model ?? id.split(":").slice(1).join(":");
+				const bareModel = String(rawBareModel || id);
 				models.push({
 					value: `${prefix}:${id}`,
-					label: String(
-						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? m.name ?? id,
-					),
+					label: `${String(
+						m.model_short_name ??
+							m.modelShortName ??
+							m.model_name ??
+							m.modelName ??
+							m.name ??
+							bareModel,
+					)} · ${channel} / ${channelType}`,
 					provider: prefix,
+					channel,
+					channelType,
 				});
 			}
 			map[group.providerId] = models;

@@ -3,6 +3,7 @@
  * Extracted from the monolithic settings/index.ts.
  */
 import { getCodexManager } from "../codex-manager";
+import { resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
 	ClineProviderConfig,
@@ -399,11 +400,32 @@ export function usesCodexApiMode(prefix?: string): boolean {
 	return getOpenaiProviderConfig(prefix)?.apiMode === "codex";
 }
 
+function resolveNugChannelType(prefix?: string, model?: string): string | undefined {
+	if (!prefix || !model) return undefined;
+	const config = getNugProviderConfig(prefix);
+	if (!config) return undefined;
+	try {
+		return resolveNugModelMeta(config.id, config.prefix, model).channelType;
+	} catch {
+		return undefined;
+	}
+}
+
+export function usesCodexModel(prefix?: string, model?: string): boolean {
+	if (usesCodexApiMode(prefix)) return true;
+	return resolveNugChannelType(prefix, model) === "codex";
+}
+
 export function usesStatefulApi(prefix?: string): boolean {
 	if (!prefix) return false;
 	if (prefix === "codex") return true;
 	const mode = getOpenaiProviderConfig(prefix)?.apiMode;
 	return mode === "codex" || mode === "responses";
+}
+
+export function usesStatefulModel(prefix?: string, model?: string): boolean {
+	if (usesStatefulApi(prefix)) return true;
+	return usesCodexModel(prefix, model);
 }
 
 export function isAnthropicProvider(prefix?: string): boolean {
@@ -413,8 +435,9 @@ export function isAnthropicProvider(prefix?: string): boolean {
 
 export function resolveDefaultReasoningEffort(
 	provider?: string,
+	model?: string,
 ): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
-	if (usesCodexApiMode(provider)) {
+	if (usesCodexModel(provider, model)) {
 		return s().codex?.defaultReasoningEffort ?? s().agent.defaultReasoningEffort;
 	}
 	if (isAnthropicProvider(provider)) {

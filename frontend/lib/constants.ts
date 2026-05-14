@@ -12,6 +12,9 @@ export type ModelOption = {
 	value: string;
 	label: string;
 	provider?: string;
+	channel?: string;
+	channelType?: string;
+	bareModel?: string;
 	rateMultiplier?: number;
 };
 

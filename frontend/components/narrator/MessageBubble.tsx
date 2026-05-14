@@ -169,6 +169,19 @@ export const EditingMessageCtx = createContext<{
 	unregister: () => {},
 });
 
+export type CompactSummaryKind = "context" | "segment";
+
+export interface CompactSummaryModalTarget {
+	kind: CompactSummaryKind;
+	narratorId: string;
+	messageId: string;
+	onDelete?: () => void;
+}
+
+export const CompactSummaryModalCtx = createContext<{
+	open: (target: CompactSummaryModalTarget) => void;
+} | null>(null);
+
 // Module-level map that persists reasoning expand/collapse state across
 // component remounts (e.g. when streaming __streaming__ → real message).
 // Key: `${narratorId}:${blockIndex}`, Value: expanded (true) or collapsed (false).
@@ -1745,6 +1758,189 @@ function ErrorNotice({
 	);
 }
 
+export function CompactSummaryModal({
+	target,
+	onClose,
+}: {
+	target: CompactSummaryModalTarget | null;
+	onClose: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const queryClient = useQueryClient();
+	const [deleting, setDeleting] = useState(false);
+	const [editing, setEditing] = useState(false);
+	const [editText, setEditText] = useState("");
+	const [saving, setSaving] = useState(false);
+	const isSegment = target?.kind === "segment";
+	const queryKey = target
+		? [
+				isSegment ? "segment-compact-summary" : "compact-summary",
+				target.narratorId,
+				target.messageId,
+			]
+		: ["compact-summary", "closed"];
+	const targetKey = target ? `${target.kind}:${target.narratorId}:${target.messageId}` : null;
+
+	const { data, isLoading, error, refetch } = useQuery({
+		queryKey,
+		queryFn: () => {
+			if (!target) return Promise.resolve({ summary: "" });
+			return isSegment
+				? api.getSegmentCompactSummary(target.narratorId, target.messageId)
+				: api.getCompactSummary(target.narratorId, target.messageId);
+		},
+		enabled: !!target,
+		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
+	});
+
+	useEffect(() => {
+		if (!targetKey) {
+			setEditing(false);
+			setEditText("");
+			setDeleting(false);
+			setSaving(false);
+			return;
+		}
+		setEditing(false);
+		setEditText("");
+		setDeleting(false);
+		setSaving(false);
+	}, [targetKey]);
+
+	const handleClose = () => {
+		onClose();
+		setEditing(false);
+	};
+
+	const handleDelete = async () => {
+		if (!target) return;
+		const currentTarget = target;
+		setDeleting(true);
+		try {
+			if (currentTarget.kind === "segment") {
+				await api.deleteSegmentCompact(currentTarget.narratorId, currentTarget.messageId);
+			} else {
+				await api.deleteCompactMessage(currentTarget.narratorId, currentTarget.messageId);
+			}
+			handleClose();
+			currentTarget.onDelete?.();
+		} catch {
+			notifications.show({
+				title:
+					currentTarget.kind === "segment" ? t("segmentCompactFailed") : t("deleteMessageFailed"),
+				message:
+					currentTarget.kind === "segment"
+						? t("segmentCompactFailedDesc")
+						: t("deleteMessageFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
+		} finally {
+			setDeleting(false);
+		}
+	};
+
+	const handleEdit = () => {
+		setEditText(data?.summary ?? "");
+		setEditing(true);
+	};
+
+	const handleSave = async () => {
+		if (!target) return;
+		const currentTarget = target;
+		setSaving(true);
+		try {
+			if (currentTarget.kind === "segment") {
+				await api.updateSegmentCompactSummary(
+					currentTarget.narratorId,
+					currentTarget.messageId,
+					editText,
+				);
+			} else {
+				await api.updateCompactSummary(currentTarget.narratorId, currentTarget.messageId, editText);
+			}
+			queryClient.setQueryData(queryKey, { summary: editText });
+			setEditing(false);
+			refetch();
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	const color = isSegment ? "teal" : "orange";
+
+	return (
+		<Modal
+			opened={!!target}
+			onClose={handleClose}
+			title={
+				<Group gap="xs">
+					<IconArrowsMinimize size={18} style={{ color: `var(--mantine-color-${color}-6)` }} />
+					<Text fw={600}>
+						{t(isSegment ? "segmentCompactSummaryTitle" : "compactSummaryTitle")}
+					</Text>
+				</Group>
+			}
+			size="lg"
+		>
+			{isLoading && (
+				<Group justify="center" py="xl">
+					<Loader size="sm" />
+				</Group>
+			)}
+			{error && (
+				<Text c="red" size="sm">
+					{error instanceof Error ? error.message : String(error)}
+				</Text>
+			)}
+			{editing ? (
+				<Textarea
+					value={editText}
+					onChange={(e) => setEditText(e.currentTarget.value)}
+					autosize
+					minRows={8}
+					maxRows={20}
+				/>
+			) : (
+				data?.summary && (
+					<ScrollArea.Autosize mah="70vh">
+						<MarkdownContent text={data.summary} />
+					</ScrollArea.Autosize>
+				)
+			)}
+			{target && (
+				<Group justify="flex-end" mt="md">
+					{editing ? (
+						<>
+							<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
+								{t("cancelEdit")}
+							</Button>
+							<Button size="xs" loading={saving} onClick={handleSave}>
+								{t("saveEdit")}
+							</Button>
+						</>
+					) : (
+						<>
+							<Button
+								color="red"
+								variant="light"
+								size="xs"
+								loading={deleting}
+								onClick={handleDelete}
+							>
+								{t(isSegment ? "deleteSegmentCompact" : "deleteCompact")}
+							</Button>
+							<Button variant="light" size="xs" onClick={handleEdit}>
+								{t("editCompact")}
+							</Button>
+						</>
+					)}
+				</Group>
+			)}
+		</Modal>
+	);
+}
+
 function CompactIndicator({
 	isCompacting,
 	narratorId,
@@ -1758,28 +1954,38 @@ function CompactIndicator({
 }) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
+	const compactSummaryModal = useContext(CompactSummaryModalCtx);
 	const [deleting, setDeleting] = useState(false);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
 	const queryClient = useQueryClient();
 
-	const canClick = !isCompacting && narratorId && messageId;
+	const canClick = !isCompacting && !!narratorId && !!messageId;
+
+	const handleOpen = useCallback(() => {
+		if (!narratorId || !messageId) return;
+		if (compactSummaryModal) {
+			compactSummaryModal.open({ kind: "context", narratorId, messageId, onDelete });
+			return;
+		}
+		open();
+	}, [compactSummaryModal, messageId, narratorId, onDelete, open]);
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey: ["compact-summary", narratorId, messageId],
 		queryFn: () => api.getCompactSummary(narratorId ?? "", messageId ?? ""),
-		enabled: opened && !!narratorId && !!messageId,
+		enabled: !compactSummaryModal && opened && !!narratorId && !!messageId,
 		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 	});
 
 	useEffect(() => {
-		if (opened || !narratorId || !messageId) return;
+		if (compactSummaryModal || opened || !narratorId || !messageId) return;
 		queryClient.removeQueries({
 			queryKey: ["compact-summary", narratorId, messageId],
 			exact: true,
 		});
-	}, [opened, narratorId, messageId, queryClient]);
+	}, [compactSummaryModal, opened, narratorId, messageId, queryClient]);
 
 	const handleDelete = async () => {
 		if (!narratorId || !messageId) return;
@@ -1826,7 +2032,7 @@ function CompactIndicator({
 				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "context" } : {})}
 				{...(messageId ? { "data-message-id": messageId } : {})}
 				style={canClick ? { cursor: "pointer" } : undefined}
-				onClick={canClick ? open : undefined}
+				onClick={canClick ? handleOpen : undefined}
 			>
 				{isCompacting ? (
 					<Loader size={14} color="orange" />
@@ -1838,75 +2044,77 @@ function CompactIndicator({
 				</Text>
 			</Group>
 
-			<Modal
-				opened={opened}
-				onClose={() => {
-					close();
-					setEditing(false);
-				}}
-				title={
-					<Group gap="xs">
-						<IconArrowsMinimize size={18} style={{ color: "var(--mantine-color-orange-6)" }} />
-						<Text fw={600}>{t("compactSummaryTitle")}</Text>
-					</Group>
-				}
-				size="lg"
-			>
-				{isLoading && (
-					<Group justify="center" py="xl">
-						<Loader size="sm" />
-					</Group>
-				)}
-				{error && (
-					<Text c="red" size="sm">
-						{error instanceof Error ? error.message : String(error)}
-					</Text>
-				)}
-				{editing ? (
-					<Textarea
-						value={editText}
-						onChange={(e) => setEditText(e.currentTarget.value)}
-						autosize
-						minRows={8}
-						maxRows={20}
-					/>
-				) : (
-					data?.summary && (
-						<ScrollArea.Autosize mah="70vh">
-							<MarkdownContent text={data.summary} />
-						</ScrollArea.Autosize>
-					)
-				)}
-				{canClick && (
-					<Group justify="flex-end" mt="md">
-						{editing ? (
-							<>
-								<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
-									{t("cancelEdit")}
-								</Button>
-								<Button size="xs" loading={saving} onClick={handleSave}>
-									{t("saveEdit")}
-								</Button>
-							</>
-						) : (
-							<>
-								<Button
-									color="red"
-									variant="light"
-									size="xs"
-									loading={deleting}
-									onClick={handleDelete}
-								>
-									{t("deleteCompact")}
-								</Button>
-								<Button variant="light" size="xs" onClick={handleEdit}>
-									{t("editCompact")}
-								</Button>
-							</>
-						)}
-					</Group>
-				)}
-			</Modal>
+			{!compactSummaryModal && (
+				<Modal
+					opened={opened}
+					onClose={() => {
+						close();
+						setEditing(false);
+					}}
+					title={
+						<Group gap="xs">
+							<IconArrowsMinimize size={18} style={{ color: "var(--mantine-color-orange-6)" }} />
+							<Text fw={600}>{t("compactSummaryTitle")}</Text>
+						</Group>
+					}
+					size="lg"
+				>
+					{isLoading && (
+						<Group justify="center" py="xl">
+							<Loader size="sm" />
+						</Group>
+					)}
+					{error && (
+						<Text c="red" size="sm">
+							{error instanceof Error ? error.message : String(error)}
+						</Text>
+					)}
+					{editing ? (
+						<Textarea
+							value={editText}
+							onChange={(e) => setEditText(e.currentTarget.value)}
+							autosize
+							minRows={8}
+							maxRows={20}
+						/>
+					) : (
+						data?.summary && (
+							<ScrollArea.Autosize mah="70vh">
+								<MarkdownContent text={data.summary} />
+							</ScrollArea.Autosize>
+						)
+					)}
+					{canClick && (
+						<Group justify="flex-end" mt="md">
+							{editing ? (
+								<>
+									<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
+										{t("cancelEdit")}
+									</Button>
+									<Button size="xs" loading={saving} onClick={handleSave}>
+										{t("saveEdit")}
+									</Button>
+								</>
+							) : (
+								<>
+									<Button
+										color="red"
+										variant="light"
+										size="xs"
+										loading={deleting}
+										onClick={handleDelete}
+									>
+										{t("deleteCompact")}
+									</Button>
+									<Button variant="light" size="xs" onClick={handleEdit}>
+										{t("editCompact")}
+									</Button>
+								</>
+							)}
+						</Group>
+					)}
+				</Modal>
+			)}
 		</>
 	);
 }
@@ -1926,6 +2134,7 @@ function SegmentCompactIndicator({
 }) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
+	const compactSummaryModal = useContext(CompactSummaryModalCtx);
 	const [deleting, setDeleting] = useState(false);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
@@ -1933,12 +2142,21 @@ function SegmentCompactIndicator({
 	const [expanded, setExpanded] = useState(false);
 	const queryClient = useQueryClient();
 
-	const canClick = !isCompacting && narratorId && messageId;
+	const canClick = !isCompacting && !!narratorId && !!messageId;
+
+	const handleOpenSummary = useCallback(() => {
+		if (!narratorId || !messageId) return;
+		if (compactSummaryModal) {
+			compactSummaryModal.open({ kind: "segment", narratorId, messageId, onDelete });
+			return;
+		}
+		open();
+	}, [compactSummaryModal, messageId, narratorId, onDelete, open]);
 
 	const { data, isLoading, error, refetch } = useQuery({
 		queryKey: ["segment-compact-summary", narratorId, messageId],
 		queryFn: () => api.getSegmentCompactSummary(narratorId ?? "", messageId ?? ""),
-		enabled: opened && !!narratorId && !!messageId,
+		enabled: !compactSummaryModal && opened && !!narratorId && !!messageId,
 		gcTime: COMPACT_DETAIL_QUERY_GC_TIME_MS,
 	});
 
@@ -1955,7 +2173,7 @@ function SegmentCompactIndicator({
 
 	useEffect(() => {
 		if (!narratorId || !messageId) return;
-		if (!opened) {
+		if (!compactSummaryModal && !opened) {
 			queryClient.removeQueries({
 				queryKey: ["segment-compact-summary", narratorId, messageId],
 				exact: true,
@@ -1967,7 +2185,7 @@ function SegmentCompactIndicator({
 				exact: true,
 			});
 		}
-	}, [opened, expanded, narratorId, messageId, queryClient]);
+	}, [compactSummaryModal, opened, expanded, narratorId, messageId, queryClient]);
 
 	const handleDelete = async () => {
 		if (!narratorId || !messageId) return;
@@ -2037,7 +2255,7 @@ function SegmentCompactIndicator({
 					c="teal"
 					td={canClick ? "underline" : undefined}
 					style={canClick ? { cursor: "pointer" } : undefined}
-					onClick={canClick ? open : undefined}
+					onClick={canClick ? handleOpenSummary : undefined}
 				>
 					{isCompacting
 						? t("segmentCompacting")
@@ -2130,75 +2348,77 @@ function SegmentCompactIndicator({
 				</Paper>
 			</Collapse>
 
-			<Modal
-				opened={opened}
-				onClose={() => {
-					close();
-					setEditing(false);
-				}}
-				title={
-					<Group gap="xs">
-						<IconArrowsMinimize size={18} style={{ color: "var(--mantine-color-teal-6)" }} />
-						<Text fw={600}>{t("segmentCompactSummaryTitle")}</Text>
-					</Group>
-				}
-				size="lg"
-			>
-				{isLoading && (
-					<Group justify="center" py="xl">
-						<Loader size="sm" />
-					</Group>
-				)}
-				{error && (
-					<Text c="red" size="sm">
-						{error instanceof Error ? error.message : String(error)}
-					</Text>
-				)}
-				{editing ? (
-					<Textarea
-						value={editText}
-						onChange={(e) => setEditText(e.currentTarget.value)}
-						autosize
-						minRows={8}
-						maxRows={20}
-					/>
-				) : (
-					data?.summary && (
-						<ScrollArea.Autosize mah="70vh">
-							<MarkdownContent text={data.summary} />
-						</ScrollArea.Autosize>
-					)
-				)}
-				{canClick && (
-					<Group justify="flex-end" mt="md">
-						{editing ? (
-							<>
-								<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
-									{t("cancelEdit")}
-								</Button>
-								<Button size="xs" loading={saving} onClick={handleSave}>
-									{t("saveEdit")}
-								</Button>
-							</>
-						) : (
-							<>
-								<Button
-									color="red"
-									variant="light"
-									size="xs"
-									loading={deleting}
-									onClick={handleDelete}
-								>
-									{t("deleteSegmentCompact")}
-								</Button>
-								<Button variant="light" size="xs" onClick={handleEdit}>
-									{t("editCompact")}
-								</Button>
-							</>
-						)}
-					</Group>
-				)}
-			</Modal>
+			{!compactSummaryModal && (
+				<Modal
+					opened={opened}
+					onClose={() => {
+						close();
+						setEditing(false);
+					}}
+					title={
+						<Group gap="xs">
+							<IconArrowsMinimize size={18} style={{ color: "var(--mantine-color-teal-6)" }} />
+							<Text fw={600}>{t("segmentCompactSummaryTitle")}</Text>
+						</Group>
+					}
+					size="lg"
+				>
+					{isLoading && (
+						<Group justify="center" py="xl">
+							<Loader size="sm" />
+						</Group>
+					)}
+					{error && (
+						<Text c="red" size="sm">
+							{error instanceof Error ? error.message : String(error)}
+						</Text>
+					)}
+					{editing ? (
+						<Textarea
+							value={editText}
+							onChange={(e) => setEditText(e.currentTarget.value)}
+							autosize
+							minRows={8}
+							maxRows={20}
+						/>
+					) : (
+						data?.summary && (
+							<ScrollArea.Autosize mah="70vh">
+								<MarkdownContent text={data.summary} />
+							</ScrollArea.Autosize>
+						)
+					)}
+					{canClick && (
+						<Group justify="flex-end" mt="md">
+							{editing ? (
+								<>
+									<Button variant="subtle" size="xs" onClick={() => setEditing(false)}>
+										{t("cancelEdit")}
+									</Button>
+									<Button size="xs" loading={saving} onClick={handleSave}>
+										{t("saveEdit")}
+									</Button>
+								</>
+							) : (
+								<>
+									<Button
+										color="red"
+										variant="light"
+										size="xs"
+										loading={deleting}
+										onClick={handleDelete}
+									>
+										{t("deleteSegmentCompact")}
+									</Button>
+									<Button variant="light" size="xs" onClick={handleEdit}>
+										{t("editCompact")}
+									</Button>
+								</>
+							)}
+						</Group>
+					)}
+				</Modal>
+			)}
 		</>
 	);
 }

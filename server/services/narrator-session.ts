@@ -50,8 +50,8 @@ import {
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
-	usesCodexApiMode,
-	usesStatefulApi,
+	usesCodexModel,
+	usesStatefulModel,
 } from "../lib/settings";
 import type { ImageRef, TextFileRef } from "../lib/uploads";
 import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uploads";
@@ -349,7 +349,9 @@ async function createNarrator(
 		provider: narratorProvider,
 		_reasoningEffortRef: narrator.reasoningEffort ?? null,
 		reasoningEffort:
-			narrator.reasoningEffort ?? resolveDefaultReasoningEffort(narratorProvider) ?? null,
+			narrator.reasoningEffort ??
+			resolveDefaultReasoningEffort(narratorProvider, narratorModel) ??
+			null,
 		systemPrompt: effectiveSystemPrompt,
 		events,
 		alive: true,
@@ -887,6 +889,7 @@ export async function runAgentLoop(
 			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
 			active.reasoningEffort = resolveRuntimeReasoningEffort(
 				active.provider,
+				active.model,
 				active._reasoningEffortRef,
 			);
 			const resolved = resolveProviderAndModel(active.model, active.provider);
@@ -1282,10 +1285,13 @@ export async function runAgentLoop(
 			};
 
 			const resolvedReasoningEffort =
-				freshNarrator.reasoningEffort || resolveDefaultReasoningEffort(resolved.provider);
+				freshNarrator.reasoningEffort ||
+				resolveDefaultReasoningEffort(resolved.provider, resolved.model);
 
 			const resolvedServiceTier =
-				freshNarrator.fastMode && usesCodexApiMode(resolved.provider) ? "priority" : undefined;
+				freshNarrator.fastMode && usesCodexModel(resolved.provider, resolved.model)
+					? "priority"
+					: undefined;
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
@@ -1427,6 +1433,7 @@ export async function runAgentLoop(
 						active.provider = resolveProvider(resolvedModel);
 						active.reasoningEffort = resolveRuntimeReasoningEffort(
 							active.provider,
+							active.model,
 							active._reasoningEffortRef,
 						);
 					}
@@ -1437,7 +1444,9 @@ export async function runAgentLoop(
 					}
 
 					const runtimeReasoningEffort =
-						active.reasoningEffort ?? resolveDefaultReasoningEffort(active.provider) ?? null;
+						active.reasoningEffort ??
+						resolveDefaultReasoningEffort(active.provider, active.model) ??
+						null;
 					const currentReasoningEffort = config.reasoningEffort ?? null;
 					if (runtimeReasoningEffort !== currentReasoningEffort) {
 						next.reasoningEffort = runtimeReasoningEffort;
@@ -1633,7 +1642,7 @@ export async function runAgentLoop(
 			// were exhausted.  Only stateful providers (responses/codex) benefit from
 			// an outer retry that rebuilds history from DB.
 			if (result.retryableError && active.alive) {
-				if (!usesStatefulApi(resolved.provider)) {
+				if (!usesStatefulModel(resolved.provider, resolved.model)) {
 					// Stateless provider: in-loop retries exhausted — give up.
 					const partialId = active._partialMessageId;
 					active._partialMessageId = undefined;
@@ -3518,9 +3527,10 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 
 function resolveRuntimeReasoningEffort(
 	provider: string,
+	model: string,
 	reasoningEffort: ReasoningEffort | null | undefined,
 ): ReasoningEffort | null {
-	return reasoningEffort ?? resolveDefaultReasoningEffort(provider) ?? null;
+	return reasoningEffort ?? resolveDefaultReasoningEffort(provider, model) ?? null;
 }
 
 export function updateNarratorModel(narratorId: string, model: string): void {
@@ -3533,6 +3543,7 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 		active.provider = resolveProvider(effectiveModel);
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
+			active.model,
 			active._reasoningEffortRef,
 		);
 		broadcastToNarrator(narratorId, {
@@ -3560,6 +3571,7 @@ export function updateNarratorReasoningEffort(
 		active._reasoningEffortRef = reasoningEffort;
 		active.reasoningEffort = resolveRuntimeReasoningEffort(
 			active.provider,
+			active.model,
 			active._reasoningEffortRef,
 		);
 		broadcastToNarrator(narratorId, {

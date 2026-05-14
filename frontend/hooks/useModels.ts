@@ -184,6 +184,42 @@ export function useAllModels() {
 			clineByProvider.push({ prefix, name, models });
 		}
 
+		// --- NUG models (per-provider, channel metadata aware) ---
+		const nugModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<Record<string, unknown>>;
+		}> = settingsData?.nugModelsGrouped ?? [];
+
+		const serverNugProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.nugProviders ?? [];
+
+		const nugByProvider: ProviderModels[] = [];
+		for (const group of nugModelsGrouped) {
+			const cfg = serverNugProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "nug";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const id = String(m.id ?? "");
+				if (!id) continue;
+				const rawBareModel = m.model ?? id.split(":").slice(1).join(":");
+				const bareModel = String(rawBareModel || id);
+				const channel = String(m.channel ?? id.split(":")[0] ?? "");
+				const channelType = String(m.channelType ?? channel);
+				models.push({
+					value: `${prefix}:${id}`,
+					label: `${String(m.name ?? bareModel)} · ${channel} / ${channelType}`,
+					provider: prefix,
+					channel,
+					channelType,
+					bareModel,
+				});
+			}
+			nugByProvider.push({ prefix, name, models });
+		}
+
 		// --- Custom models ---
 		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
 			(m: { value: string; label: string; provider?: string }) => ({
@@ -200,6 +236,7 @@ export function useAllModels() {
 					value: modelValue("codex", id),
 					label: id,
 					provider: "codex",
+					bareModel: id,
 				}))
 			: [];
 
@@ -214,6 +251,7 @@ export function useAllModels() {
 		for (const group of openaiByProvider) addGroup(group.prefix, group.models);
 		for (const group of anthropicByProvider) addGroup(group.prefix, group.models);
 		for (const group of clineByProvider) addGroup(group.prefix, group.models);
+		for (const group of nugByProvider) addGroup(group.prefix, group.models);
 		if (codexModels.length > 0) addGroup("codex", codexModels);
 		if (customModels.length > 0) addGroup("__custom__", customModels);
 
@@ -282,6 +320,8 @@ export function useAllModels() {
 			anthropicByProvider,
 			/** Cline models grouped by provider. */
 			clineByProvider,
+			/** NUG models grouped by provider. */
+			nugByProvider,
 			/** Custom models. */
 			customModels,
 			/** Hidden model values set. */

@@ -76,7 +76,9 @@ export {
 	resolveEffectiveModel,
 	resolveProvider,
 	usesCodexApiMode,
+	usesCodexModel,
 	usesStatefulApi,
+	usesStatefulModel,
 } from "./provider";
 // Re-export everything from sub-modules so existing imports keep working
 export * from "./types";

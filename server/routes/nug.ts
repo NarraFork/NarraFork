@@ -1,9 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { Hono } from "hono";
 import { NugProvider } from "../lib/agent/nug-provider";
 import { logger } from "../lib/logger";
+import {
+	deleteNugCachedModels,
+	getNugCachedModels,
+	getNugCachedModelsByProvider,
+	type NugModelInfo,
+	saveAllCachedNugModels,
+	setNugCachedModels,
+} from "../lib/nug-model-cache";
 import {
 	type NUGProviderConfig,
 	nugProviderPrefix,
@@ -14,14 +19,6 @@ import {
 } from "../lib/settings";
 
 export const nugRoutes = new Hono();
-
-const cacheDir = resolve(homedir(), ".narrafork");
-
-/** NUG model info — OpenAI-list compatible shape from NUG /v1/models. */
-export type NugModelInfo = Record<string, unknown>;
-
-/** Per-provider cached model lists. Key = provider id. */
-const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
 
 // === In-memory NUG quota cache (key = provider id) ===
 
@@ -38,6 +35,83 @@ function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugP
 	const config = providers.find((p) => p.id === id);
 	if (!config) return null;
 	return { config, provider: new NugProvider(config) };
+}
+
+type NugUsageRecord = Record<string, unknown>;
+
+function toRecord(value: unknown): NugUsageRecord {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as NugUsageRecord)
+		: {};
+}
+
+function numericField(record: NugUsageRecord, keys: string[], fallback = 0): number {
+	for (const key of keys) {
+		const value = record[key];
+		const numberValue =
+			typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+		if (Number.isFinite(numberValue)) return numberValue;
+	}
+	return fallback;
+}
+
+function stringField(record: NugUsageRecord, keys: string[], fallback = ""): string {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.length > 0) return value;
+		if (typeof value === "number" && Number.isFinite(value)) return String(value);
+	}
+	return fallback;
+}
+
+function normalizeNugUsageEvent(value: unknown, index: number): NugUsageRecord {
+	const record = toRecord(value);
+	return {
+		...record,
+		id: stringField(record, ["id"], `usage-${index}`),
+		channelType: stringField(record, ["channelType", "channel_type", "channel"], "unknown"),
+		model: stringField(record, ["model", "model_id", "modelId"]),
+		inputTokens: numericField(record, ["inputTokens", "input_tokens", "tokensIn", "tokens_in"]),
+		outputTokens: numericField(record, ["outputTokens", "output_tokens", "completionTokens"]),
+		cacheCreationInputTokens: numericField(record, [
+			"cacheCreationInputTokens",
+			"cache_creation_input_tokens",
+			"cacheCreationTokens",
+			"cache_creation_tokens",
+			"cacheWriteInputTokens",
+			"cache_write_input_tokens",
+			"cacheWriteTokens",
+			"cache_write_tokens",
+		]),
+		cacheReadInputTokens: numericField(record, [
+			"cacheReadInputTokens",
+			"cache_read_input_tokens",
+			"cachedInputTokens",
+			"cached_input_tokens",
+			"cacheReadTokens",
+			"cache_read_tokens",
+		]),
+		quotaCost: numericField(record, ["quotaCost", "quota_cost"]),
+		meterUsage: numericField(record, ["meterUsage", "meter_usage"]),
+		status: stringField(record, ["status"], "unknown"),
+		durationMs: numericField(record, ["durationMs", "duration_ms"]),
+		createdAt: stringField(record, ["createdAt", "created_at", "timestamp"]),
+	};
+}
+
+function normalizeNugUsageResponse(value: unknown): NugUsageRecord {
+	const record = toRecord(value);
+	const rawEvents = Array.isArray(record.events)
+		? record.events
+		: Array.isArray(record.data)
+			? record.data
+			: [];
+	const events = rawEvents.map((event, index) => normalizeNugUsageEvent(event, index));
+	return {
+		...record,
+		events,
+		total: numericField(record, ["total", "count"], events.length),
+	};
 }
 
 /** Fetch quota from a single NUG provider. */
@@ -108,89 +182,19 @@ export function getAllNugCachedQuotas(): Record<
 	return result;
 }
 
-// Load cache on startup
-loadAllCachedModels();
-
-function loadAllCachedModels(): void {
-	const cachePath = resolve(cacheDir, "nug-models-providers.json");
-	try {
-		if (existsSync(cachePath)) {
-			const data = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<string, NugModelInfo[]>;
-			for (const [id, models] of Object.entries(data)) {
-				cachedModelsByProvider.set(id, models);
-			}
-		}
-	} catch {
-		// corrupt — ignore
-	}
-}
-
-function saveAllCachedModels(): void {
-	try {
-		mkdirSync(cacheDir, { recursive: true });
-		const data: Record<string, NugModelInfo[]> = {};
-		for (const [id, models] of cachedModelsByProvider) {
-			data[id] = models;
-		}
-		writeFileSync(resolve(cacheDir, "nug-models-providers.json"), JSON.stringify(data));
-	} catch {
-		// non-critical
-	}
-}
-
 /** Remove cached models and quotas for providers that no longer exist in settings. */
 export function purgeNugProviderCache(removedIds: string[]): void {
 	let changed = false;
 	for (const id of removedIds) {
-		if (cachedModelsByProvider.delete(id)) changed = true;
+		if (deleteNugCachedModels(id)) changed = true;
 		cachedQuotaByProvider.delete(id);
 	}
-	if (changed) saveAllCachedModels();
-}
-
-/** Get cached models for a specific provider. */
-export function getNugCachedModelsByProvider(providerId: string): NugModelInfo[] {
-	return cachedModelsByProvider.get(providerId) ?? [];
-}
-
-/** Get all cached models across all providers. */
-export function getNugCachedModels(): NugModelInfo[] {
-	const seen = new Set<string>();
-	const result: NugModelInfo[] = [];
-	for (const models of cachedModelsByProvider.values()) {
-		for (const m of models) {
-			const id = String(m.id ?? "");
-			if (id && !seen.has(id)) {
-				seen.add(id);
-				result.push(m);
-			}
-		}
-	}
-	return result;
-}
-
-/** Get all cached models grouped by provider. */
-export function getNugCachedModelsGrouped(): Array<{
-	providerId: string;
-	providerName: string;
-	models: NugModelInfo[];
-}> {
-	const providers = settings.nugProviders ?? [];
-	return providers
-		.filter((p) => !p.disabled && cachedModelsByProvider.has(p.id))
-		.map((p) => ({
-			providerId: p.id,
-			providerName: p.name,
-			models: cachedModelsByProvider.get(p.id) ?? [],
-		}));
+	if (changed) saveAllCachedNugModels();
 }
 
 // Register model checker and lister
 registerNugModelChecker((model) => {
-	for (const models of cachedModelsByProvider.values()) {
-		if (models.some((m) => String(m.id ?? "") === model)) return true;
-	}
-	return false;
+	return getNugCachedModels().some((m) => String(m.id ?? "") === model);
 });
 
 registerNugModelLister(() => {
@@ -199,7 +203,7 @@ registerNugModelLister(() => {
 	for (const p of providers) {
 		if (p.disabled) continue;
 		const prefix = nugProviderPrefix(p);
-		const models = cachedModelsByProvider.get(p.id) ?? [];
+		const models = getNugCachedModelsByProvider(p.id);
 		for (const m of models) {
 			result.push(`${prefix}:${String(m.id ?? "")}`);
 		}
@@ -248,7 +252,7 @@ nugRoutes.post("/models/refresh", async (c) => {
 	for (const p of providers) {
 		try {
 			const models = await fetchNugModels(p);
-			cachedModelsByProvider.set(p.id, models);
+			setNugCachedModels(p.id, models);
 			results.push({ providerId: p.id, name: p.name, count: models.length });
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
@@ -256,7 +260,7 @@ nugRoutes.post("/models/refresh", async (c) => {
 			results.push({ providerId: p.id, name: p.name, count: 0, error: msg });
 		}
 	}
-	saveAllCachedModels();
+	saveAllCachedNugModels();
 	return c.json({ results, models: getNugCachedModels(), fromCache: false });
 });
 
@@ -274,8 +278,8 @@ nugRoutes.post("/providers/:id/models/refresh", async (c) => {
 	}
 	try {
 		const models = await fetchNugModels(config);
-		cachedModelsByProvider.set(id, models);
-		saveAllCachedModels();
+		setNugCachedModels(id, models);
+		saveAllCachedNugModels();
 		return c.json({ models, fromCache: false });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -326,7 +330,7 @@ nugRoutes.get("/providers/:id/usage", async (c) => {
 	const offset = Math.max(Number(c.req.query("offset")) || 0, 0);
 	try {
 		const data = await entry.provider.getUsage(limit, offset);
-		return c.json(data);
+		return c.json(normalizeNugUsageResponse(data));
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG usage fetch failed", { error: msg, provider: entry.config.name });
