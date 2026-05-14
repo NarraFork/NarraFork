@@ -7,7 +7,7 @@ import {
 	precacheAndRoute,
 } from "workbox-precaching";
 import { NavigationRoute, registerRoute } from "workbox-routing";
-import { CacheFirst, NetworkOnly, StaleWhileRevalidate } from "workbox-strategies";
+import { CacheFirst, StaleWhileRevalidate } from "workbox-strategies";
 
 declare let self: ServiceWorkerGlobalScope;
 
@@ -15,10 +15,9 @@ declare let self: ServiceWorkerGlobalScope;
 precacheAndRoute(self.__WB_MANIFEST);
 cleanupOutdatedCaches();
 
-// API and WebSocket requests always go to network
-registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "GET");
-registerRoute(/^https?:\/\/.*\/api\//, new NetworkOnly(), "POST");
-
+// API and WebSocket requests are intentionally left to the browser network stack.
+// NarraFork is server-backed; Service Worker caching should only cover static
+// frontend assets and SPA navigations.
 const STATIC_ASSET_DESTINATIONS = new Set(["script", "style", "worker"]);
 const STATIC_MEDIA_DESTINATIONS = new Set(["font", "image"]);
 const SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60;
@@ -72,38 +71,69 @@ registerRoute(
 
 // ── Version check on activate ──────────────────────────────────────────────
 const APP_VERSION = __APP_VERSION__;
+const VERSION_CHECK_TIMEOUT_MS = 2500;
 
-async function checkVersionAndMaybeUnregister() {
+function normalizeVersion(version: string | undefined): string | undefined {
+	return version?.replace(/^v/, "");
+}
+
+async function fetchServerVersion(): Promise<string | undefined> {
+	const controller = new AbortController();
+	const timeout = self.setTimeout(() => controller.abort(), VERSION_CHECK_TIMEOUT_MS);
+
 	try {
-		const res = await fetch("/api/health", { cache: "no-store" });
-		if (!res.ok) return;
-		const data = await res.json();
-		const serverVersion: string = data.version;
-
-		if (serverVersion && serverVersion !== APP_VERSION) {
-			// Notify all controlled clients before unregistering
-			const clients = await self.clients.matchAll({ type: "window" });
-			for (const client of clients) {
-				client.postMessage({
-					type: "VERSION_MISMATCH",
-					serverVersion,
-					swVersion: APP_VERSION,
-				});
-			}
-			// Unregister this service worker
-			await self.registration.unregister();
-		}
+		const res = await fetch("/api/health", {
+			cache: "no-store",
+			headers: { "Cache-Control": "no-cache" },
+			signal: controller.signal,
+		});
+		if (!res.ok) return undefined;
+		const data = (await res.json()) as { version?: string };
+		return data.version;
 	} catch {
-		// Network error — skip check, don't block activation
+		// Network error — skip check, don't block activation.
+		return undefined;
+	} finally {
+		self.clearTimeout(timeout);
 	}
+}
+
+async function notifyVersionMismatch(serverVersion: string) {
+	const clients = await self.clients.matchAll({
+		type: "window",
+		includeUncontrolled: true,
+	});
+	for (const client of clients) {
+		client.postMessage({
+			type: "VERSION_MISMATCH",
+			serverVersion,
+			swVersion: APP_VERSION,
+		});
+	}
+}
+
+async function checkVersionAndMaybeUnregister(): Promise<boolean> {
+	const serverVersion = await fetchServerVersion();
+	if (!serverVersion) return false;
+
+	if (normalizeVersion(serverVersion) !== normalizeVersion(APP_VERSION)) {
+		await notifyVersionMismatch(serverVersion);
+		await self.registration.unregister();
+		return true;
+	}
+
+	return false;
 }
 
 self.addEventListener("activate", (event) => {
 	event.waitUntil(
 		(async () => {
-			// Claim clients first so the SW controls pages immediately
-			await self.clients.claim();
-			await checkVersionAndMaybeUnregister();
+			// Check before claiming clients. A stale SW should notify and unregister,
+			// but must not take over current pages and start handling their fetches.
+			const unregistered = await checkVersionAndMaybeUnregister();
+			if (!unregistered) {
+				await self.clients.claim();
+			}
 		})(),
 	);
 });

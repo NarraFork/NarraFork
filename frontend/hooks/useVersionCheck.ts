@@ -2,6 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
 
+function normalizeVersion(version: string | undefined): string | undefined {
+	return version?.replace(/^v/, "");
+}
+
 /**
  * Periodically checks the backend version against the frontend build version.
  * Returns `updateAvailable: true` when they differ, plus a `refresh()` helper
@@ -12,7 +16,6 @@ import { api } from "../lib/api";
  */
 export function useVersionCheck(intervalMs = 5 * 60_000) {
 	const [dismissed, setDismissed] = useState(false);
-	const [swMismatch, setSwMismatch] = useState(false);
 	const [swServerVersion, setSwServerVersion] = useState<string | undefined>();
 
 	const { data } = useQuery({
@@ -22,21 +25,33 @@ export function useVersionCheck(intervalMs = 5 * 60_000) {
 		staleTime: intervalMs,
 	});
 
-	const serverVersion = swServerVersion ?? data?.version;
+	const appVersion = normalizeVersion(__APP_VERSION__);
+	const healthVersion = normalizeVersion(data?.version);
+	const serverVersion =
+		healthVersion === appVersion ? data?.version : (swServerVersion ?? data?.version);
 	const updateAvailable =
-		!dismissed && (swMismatch || (!!serverVersion && serverVersion !== __APP_VERSION__));
+		!dismissed &&
+		!!normalizeVersion(serverVersion) &&
+		normalizeVersion(serverVersion) !== appVersion;
 
-	// Listen for VERSION_MISMATCH from service worker
+	// Listen for VERSION_MISMATCH from service worker. The message only provides
+	// another source of the backend version; the banner is still gated by comparing
+	// the backend version to the current frontend build version.
 	useEffect(() => {
 		const handler = (event: MessageEvent) => {
 			if (event.data?.type === "VERSION_MISMATCH") {
-				setSwMismatch(true);
 				setSwServerVersion(event.data.serverVersion);
 			}
 		};
 		navigator.serviceWorker?.addEventListener("message", handler);
 		return () => navigator.serviceWorker?.removeEventListener("message", handler);
 	}, []);
+
+	useEffect(() => {
+		if (healthVersion === appVersion) {
+			setSwServerVersion(undefined);
+		}
+	}, [appVersion, healthVersion]);
 
 	// Auto-reset dismissed flag when version changes again
 	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when serverVersion changes

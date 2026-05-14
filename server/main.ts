@@ -159,6 +159,19 @@ const MIME_TYPES: Record<string, string> = {
 	".map": "application/json",
 };
 
+const NO_CACHE_FRONTEND_PATHS = new Set([
+	"/index.html",
+	"/src-sw.js",
+	"/registerSW.js",
+	"/manifest.webmanifest",
+]);
+
+function getFrontendCacheControl(path: string): string {
+	if (path.startsWith("/assets/")) return "public, max-age=31536000, immutable";
+	if (NO_CACHE_FRONTEND_PATHS.has(path)) return "no-cache";
+	return "public, max-age=3600";
+}
+
 // Production: serve Vite build output via Hono
 if (isProd) {
 	// Try embedded assets only for compiled single-executable mode. Source runs
@@ -196,13 +209,10 @@ if (isProd) {
 					if (filePath) {
 						const blob = Bun.file(filePath);
 						const mime = MIME_TYPES[extname(c.req.path)] ?? "application/octet-stream";
-						const isHashed = c.req.path.startsWith("/assets/");
 						return new Response(blob, {
 							headers: {
 								"Content-Type": mime,
-								"Cache-Control": isHashed
-									? "public, max-age=31536000, immutable"
-									: "public, max-age=3600",
+								"Cache-Control": getFrontendCacheControl(c.req.path),
 							},
 						});
 					}
@@ -254,13 +264,10 @@ if (isProd) {
 			if (await file.exists()) {
 				const ext = extname(c.req.path);
 				const mime = MIME_TYPES[ext] ?? "application/octet-stream";
-				const isHashed = c.req.path.startsWith("/assets/");
 				return new Response(file, {
 					headers: {
 						"Content-Type": mime,
-						"Cache-Control": isHashed
-							? "public, max-age=31536000, immutable"
-							: "public, max-age=3600",
+						"Cache-Control": getFrontendCacheControl(c.req.path),
 					},
 				});
 			}
