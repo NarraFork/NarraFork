@@ -49,7 +49,11 @@ export function parseGatewaySSEEvent(
 
 	if (eventType === QUOTA_BALANCE_EVENT) {
 		const balance = data.quotaBalance;
-		return { quotaBalance: balance != null ? String(balance) : null };
+		const detailedBalance = data.detailedQuotaBalance;
+		return {
+			quotaBalance: balance != null ? String(balance) : null,
+			detailedQuotaBalance: detailedBalance != null ? String(detailedBalance) : null,
+		};
 	}
 
 	return null;

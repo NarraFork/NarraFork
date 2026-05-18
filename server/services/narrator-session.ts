@@ -567,7 +567,9 @@ async function maybeStartGoalContinuation(
 	const goals = await narratorGoalService.listGoals(active.narratorId);
 	const activeGoal = goals.find((goal) => goal.status === "active");
 	if (!activeGoal) return null;
-	const prompt = narratorGoalService.buildGoalContinuationPrompt(activeGoal, goals);
+	const prompt = narratorGoalService.buildGoalContinuationPrompt(activeGoal, goals, {
+		noToolContinuationCount: active._goalContinuationNoToolCount ?? 0,
+	});
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 		{ type: "goal_continuation", goalId: activeGoal.id, objective: activeGoal.objective },
 	]);

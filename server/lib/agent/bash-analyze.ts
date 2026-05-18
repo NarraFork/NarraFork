@@ -39,9 +39,9 @@ export interface BashAnalysis {
 	isCatastrophic: boolean;
 	/** 灾难性命令的原因描述 */
 	catastrophicReason?: string;
-	/** Chapter 模式下检测到的 git 分支违规操作（硬拒绝，不可绕过） */
+	/** Chapter 模式下检测到的 git 分支/工作树高风险操作（交由权限系统决策） */
 	gitBranchViolations: string[];
-	/** Chapter 模式下检测到的 git 分支警告操作（走权限申请，用户可批准） */
+	/** Chapter 模式下检测到的 git 分支/工作树警告操作（交由权限系统决策） */
 	gitBranchWarnings: string[];
 	/** 是否包含写操作（如 biome --write）— 只在 acceptEdits 模式下允许 */
 	hasWriteOperation: boolean;
@@ -1534,12 +1534,12 @@ const GIT_CURRENT_BRANCH_SAFE = new Set([
 ]);
 
 /**
- * 检测 chapter 模式下的 git 分支违规和警告操作。
- * 返回 violations（硬拒绝）和 warnings（走权限申请）。
+ * 检测 chapter 模式下的 git 分支/工作树高风险和警告操作。
+ * 返回 violations（高风险权限项）和 warnings（普通警告权限项）。
  *
  * 在 chapter 模式下，agent 只能在当前分支上工作：
- * - violations（硬拒绝）：切换分支、创建/删除分支、强制推送、合并、变基到其他分支、硬重置等
- * - warnings（权限申请）：soft/mixed reset、force-with-lease push、stash branch 等
+ * - violations（高风险权限项）：切换分支、创建/删除分支、强制推送、合并、变基到其他分支、硬重置等
+ * - warnings（普通警告权限项）：soft/mixed reset、force-with-lease push、stash branch 等
  * - 放行：恢复操作（merge --abort）、标签操作、只读 plumbing 命令等
  */
 function detectGitBranchViolations(commands: BashAnalysis["commands"]): {

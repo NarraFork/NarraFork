@@ -194,7 +194,12 @@ export interface CodexImportCredentialInput {
 	sub?: string;
 	displayName?: string;
 	display_name?: string;
+	name?: string;
 	priority?: number;
+	/** Nested credential object used by sub2api-style account exports. */
+	credentials?: Record<string, unknown>;
+	/** Optional metadata object used by sub2api-style account exports. */
+	extra?: Record<string, unknown>;
 }
 
 interface PendingDeviceFlow {
@@ -228,6 +233,29 @@ function sha256Hex(input: string): string {
 
 function normalizeOptionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> {
+	return isRecord(value) ? value : {};
+}
+
+function firstOptionalString(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		const normalized = normalizeOptionalString(value);
+		if (normalized) return normalized;
+	}
+	return undefined;
+}
+
+function firstOptionalNumber(...values: unknown[]): number | undefined {
+	for (const value of values) {
+		if (typeof value === "number" && Number.isFinite(value)) return value;
+	}
+	return undefined;
 }
 
 function getRefreshToken(cred: Pick<CodexCredential, "refreshToken">): string | undefined {
@@ -284,21 +312,62 @@ function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
 ): CodexCredential | null {
-	const refreshToken = normalizeOptionalString(input.refreshToken ?? input.refresh_token);
-	const accessToken = normalizeOptionalString(input.accessToken ?? input.access_token);
+	const nestedCredentials = optionalRecord(input.credentials);
+	const extra = optionalRecord(input.extra);
+	const refreshToken = firstOptionalString(
+		input.refreshToken,
+		input.refresh_token,
+		nestedCredentials.refreshToken,
+		nestedCredentials.refresh_token,
+	);
+	const accessToken = firstOptionalString(
+		input.accessToken,
+		input.access_token,
+		nestedCredentials.accessToken,
+		nestedCredentials.access_token,
+	);
 	if (!refreshToken && !accessToken) return null;
 
 	const tokenInfo = extractCodexTokenInfo({ accessToken });
-	const accountId =
-		normalizeOptionalString(input.accountId ?? input.account_id) ?? tokenInfo.accountId;
-	const email = normalizeOptionalString(input.email) ?? tokenInfo.email;
-	const sub = normalizeOptionalString(input.sub) ?? tokenInfo.sub;
-	const displayName =
-		normalizeOptionalString(input.displayName ?? input.display_name) ??
-		email ??
-		accountId ??
-		undefined;
-	const expiresAt = normalizeExpiresAt(input.expiresAt ?? input.expires_at);
+	const accountId = firstOptionalString(
+		input.accountId,
+		input.account_id,
+		nestedCredentials.accountId,
+		nestedCredentials.account_id,
+		nestedCredentials.chatgptAccountId,
+		nestedCredentials.chatgpt_account_id,
+		tokenInfo.accountId,
+	);
+	const email = firstOptionalString(
+		input.email,
+		nestedCredentials.email,
+		extra.email,
+		tokenInfo.email,
+	);
+	const sub = firstOptionalString(
+		input.sub,
+		nestedCredentials.sub,
+		nestedCredentials.chatgptUserId,
+		nestedCredentials.chatgpt_user_id,
+		tokenInfo.sub,
+	);
+	const displayName = firstOptionalString(
+		input.displayName,
+		input.display_name,
+		input.name,
+		nestedCredentials.displayName,
+		nestedCredentials.display_name,
+		email,
+		accountId,
+	);
+	const expiresAt = normalizeExpiresAt(
+		input.expiresAt ??
+			input.expires_at ??
+			nestedCredentials.expiresAt ??
+			nestedCredentials.expires_at,
+	);
+	const priority =
+		firstOptionalNumber(input.priority, nestedCredentials.priority) ?? defaultPriority;
 
 	return {
 		id: generateShortId(),
@@ -309,10 +378,7 @@ function createCredentialFromImport(
 		...(email ? { email } : {}),
 		...(sub ? { sub } : {}),
 		...(displayName ? { displayName } : {}),
-		priority:
-			typeof input.priority === "number" && Number.isFinite(input.priority)
-				? input.priority
-				: defaultPriority,
+		priority,
 		disabled: false,
 	};
 }

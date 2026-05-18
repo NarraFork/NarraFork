@@ -11,12 +11,27 @@ export const GOAL_COMPLETION_REFLECTION_TOOLS = new Set([
 
 export type GoalCompletionReflectionDecision =
 	| { action: "confirm"; evidence: string; reflection?: string }
-	| { action: "revise"; feedback: string };
+	| { action: "revise"; feedback: string; nextSteps?: string };
 
-interface GoalCompletionReflectionPending {
+export const GOAL_REFLECTION_TYPE = "goal_reflection";
+
+export type GoalCompletionReflectionStatus = "running" | "confirmed" | "cancelled" | "aborted";
+
+interface GoalCompletionReflectionMeta {
+	narratorId: string;
+	broadcastTargetId: string;
+	toolUseId: string;
+	toolName: string;
+	inputJson: Record<string, unknown>;
+	activeGoal: unknown;
+	toolCallId?: string;
+}
+
+interface GoalCompletionReflectionPending extends GoalCompletionReflectionMeta {
 	requestId: string;
 	resolve: (decision: GoalCompletionReflectionDecision) => void;
 	resolved: boolean;
+	startedAt: number;
 }
 
 const pendingGoalCompletionReflections = hotSafe<Map<string, GoalCompletionReflectionPending>>(
@@ -55,21 +70,176 @@ function getActiveGoalCompletionReflectionRequestId(
 	return ctx.reflectionLoop.requestId ?? null;
 }
 
+function goalReflectionSuggestions(
+	pending: Pick<GoalCompletionReflectionPending, "requestId" | "startedAt" | "activeGoal">,
+	status: GoalCompletionReflectionStatus,
+	reason?: string,
+	nextSteps?: string,
+) {
+	return [
+		{
+			type: GOAL_REFLECTION_TYPE,
+			status,
+			requestId: pending.requestId,
+			startedAt: new Date(pending.startedAt).toISOString(),
+			activeGoal: pending.activeGoal,
+			...(status === "confirmed" || status === "cancelled" || status === "aborted"
+				? { resolvedAt: new Date().toISOString() }
+				: {}),
+			...(reason ? { reason } : {}),
+			...(nextSteps ? { nextSteps } : {}),
+		},
+	];
+}
+
+function statusReason(
+	status: GoalCompletionReflectionStatus,
+	reason?: string,
+	nextSteps?: string,
+): string {
+	if (reason?.trim() && nextSteps?.trim())
+		return `${reason.trim()}\n\nNext steps: ${nextSteps.trim()}`;
+	if (reason?.trim()) return reason.trim();
+	switch (status) {
+		case "running":
+			return "Goal completion reflection is checking the active goal";
+		case "confirmed":
+			return "Goal completion reflection confirmed the active goal";
+		case "cancelled":
+			return "Goal completion reflection requested more work";
+		case "aborted":
+			return "Goal completion reflection aborted";
+	}
+}
+
+async function resolveGoalReflectionToolCallId(
+	pending: GoalCompletionReflectionPending,
+): Promise<string | null> {
+	if (pending.toolCallId) return pending.toolCallId;
+	try {
+		const { and, eq } = await import("drizzle-orm");
+		const { db } = await import("@server/db");
+		const { narratorToolCalls } = await import("@server/db/schema");
+		const row = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, pending.narratorId),
+				eq(narratorToolCalls.toolUseId, pending.toolUseId),
+			),
+			columns: { id: true },
+		});
+		if (row?.id) {
+			pending.toolCallId = row.id;
+			return row.id;
+		}
+	} catch {
+		// Best-effort lookup. Live clients still receive websocket updates.
+	}
+	return null;
+}
+
+async function markGoalCompletionReflectionStatus(
+	pending: GoalCompletionReflectionPending,
+	status: GoalCompletionReflectionStatus,
+	reason?: string,
+	nextSteps?: string,
+): Promise<void> {
+	const message = statusReason(status, reason, nextSteps);
+	try {
+		const toolCallId = await resolveGoalReflectionToolCallId(pending);
+		if (toolCallId) {
+			const { eq } = await import("drizzle-orm");
+			const { db } = await import("@server/db");
+			const { narratorToolCalls } = await import("@server/db/schema");
+			await db
+				.update(narratorToolCalls)
+				.set({
+					status: status === "confirmed" ? "running" : status === "running" ? "pending" : "fail",
+					inputJson: pending.inputJson,
+					permissionDecisionReason: message,
+					permissionSuggestions: goalReflectionSuggestions(pending, status, reason, nextSteps),
+					...(status !== "running" ? { permissionDecidedAt: new Date().toISOString() } : {}),
+					...(status === "cancelled" || status === "aborted" ? { errorMessage: message } : {}),
+				})
+				.where(eq(narratorToolCalls.id, toolCallId));
+		}
+	} catch {
+		// Status persistence is best-effort; the in-memory decision still drives execution.
+	}
+
+	try {
+		const { narratorService } = await import("@server/services/narrator-service");
+		const nextStatus = status === "running" ? "waiting" : "working";
+		const substatus = status === "running" ? ["silent_notification", "reflecting"] : [];
+		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
+		if (pending.broadcastTargetId !== pending.narratorId) {
+			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });
+		}
+	} catch {
+		// Status update is best-effort; the in-memory decision still drives execution.
+	}
+
+	try {
+		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		if (status === "running") {
+			broadcastToNarrator(pending.broadcastTargetId, {
+				type: "goal_reflection_started",
+				narratorId: pending.broadcastTargetId,
+				requestId: pending.requestId,
+				toolUseId: pending.toolUseId,
+				toolName: pending.toolName,
+				inputJson: pending.inputJson,
+				activeGoal: pending.activeGoal,
+				reason: message,
+			});
+		} else {
+			broadcastToNarrator(pending.broadcastTargetId, {
+				type: "goal_reflection_resolved",
+				narratorId: pending.broadcastTargetId,
+				requestId: pending.requestId,
+				toolUseId: pending.toolUseId,
+				decision: status === "confirmed" ? "allow" : status === "aborted" ? "aborted" : "deny",
+				reason: reason ?? message,
+				nextSteps,
+			});
+		}
+	} catch {
+		// Broadcast is best-effort; clients can recover from persisted tool-call state.
+	}
+}
+
 export function createGoalCompletionReflectionDecision(
 	requestId: string,
+	meta: GoalCompletionReflectionMeta,
 ): Promise<GoalCompletionReflectionDecision> {
 	const { promise, resolve } = Promise.withResolvers<GoalCompletionReflectionDecision>();
-	pendingGoalCompletionReflections.set(requestId, { requestId, resolve, resolved: false });
+	pendingGoalCompletionReflections.set(requestId, {
+		...meta,
+		requestId,
+		resolve,
+		resolved: false,
+		startedAt: Date.now(),
+	});
 	return promise;
+}
+
+export async function markGoalCompletionReflectionStarted(requestId: string): Promise<boolean> {
+	const pending = pendingGoalCompletionReflections.get(requestId);
+	if (!pending || pending.resolved) return false;
+	await markGoalCompletionReflectionStatus(pending, "running");
+	return true;
 }
 
 async function resolveGoalCompletionReflection(
 	requestId: string,
 	decision: GoalCompletionReflectionDecision,
+	status: Exclude<GoalCompletionReflectionStatus, "running" | "aborted">,
+	reason?: string,
+	nextSteps?: string,
 ): Promise<boolean> {
 	const pending = pendingGoalCompletionReflections.get(requestId);
 	if (!pending || pending.resolved) return false;
 	pending.resolved = true;
+	await markGoalCompletionReflectionStatus(pending, status, reason, nextSteps);
 	pendingGoalCompletionReflections.delete(requestId);
 	pending.resolve(decision);
 	return true;
@@ -80,14 +250,27 @@ export async function confirmGoalCompletionReflection(
 	evidence: string,
 	reflection?: string,
 ): Promise<boolean> {
-	return resolveGoalCompletionReflection(requestId, { action: "confirm", evidence, reflection });
+	const reason = reflection?.trim() || evidence.trim();
+	return resolveGoalCompletionReflection(
+		requestId,
+		{ action: "confirm", evidence, reflection },
+		"confirmed",
+		reason,
+	);
 }
 
 export async function cancelGoalCompletionReflection(
 	requestId: string,
 	feedback: string,
+	nextSteps?: string,
 ): Promise<boolean> {
-	return resolveGoalCompletionReflection(requestId, { action: "revise", feedback });
+	return resolveGoalCompletionReflection(
+		requestId,
+		{ action: "revise", feedback, nextSteps },
+		"cancelled",
+		feedback,
+		nextSteps,
+	);
 }
 
 export function cleanupGoalCompletionReflection(requestId: string): void {
@@ -151,7 +334,13 @@ export const goalCompleteReviseTool: ToolDefinition = {
 		feedback: z
 			.string()
 			.min(1)
-			.describe("Concise, actionable feedback describing what is missing before completion."),
+			.describe("Concise feedback describing why the goal cannot be completed yet."),
+		nextSteps: z
+			.string()
+			.min(1)
+			.describe(
+				"Concrete next action for the main narrator: what to verify, implement, ask, or do before trying UpdateGoal again.",
+			),
 	}),
 	execute: async (args, ctx) => {
 		const requestId = getActiveGoalCompletionReflectionRequestId(ctx);
@@ -165,7 +354,11 @@ export const goalCompleteReviseTool: ToolDefinition = {
 		if (!feedback) {
 			return { output: "The 'feedback' parameter is required.", isError: true };
 		}
-		const ok = await cancelGoalCompletionReflection(requestId, feedback);
+		const nextSteps = typeof args.nextSteps === "string" ? args.nextSteps.trim() : "";
+		if (!nextSteps) {
+			return { output: "The 'nextSteps' parameter is required.", isError: true };
+		}
+		const ok = await cancelGoalCompletionReflection(requestId, feedback, nextSteps);
 		return {
 			output: ok
 				? "Goal-completion reflection requested more work. The active goal will not be marked complete yet."

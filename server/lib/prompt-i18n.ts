@@ -288,11 +288,11 @@ Your job is to prevent premature or lazy completion. Audit the active goal again
 
 Confirm ONLY if every material requirement in the active goal is satisfied by concrete evidence, the result has been verified enough for the task's risk level, and no required work remains. Progress, intent, partial implementation, or a vague final statement is not enough.
 
-Reject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved.
+Reject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved. When rejecting, include both why completion is blocked and concrete next steps the main narrator should take before trying UpdateGoal again.
 
 You have exactly one response, and you MUST call exactly one tool:
 - GoalCompleteConfirm if the active goal is actually achieved. Include objective-specific evidence.
-- GoalCompleteRevise if more work or verification is needed. Explain what is missing.
+- GoalCompleteRevise if more work or verification is needed. Provide feedback and nextSteps. nextSteps must be actionable: name the next verification, implementation, question, or blocker-handling action.
 If you do not call either tool in this one response, the goal completion will be rejected.
 Do not call UpdateGoal from this reflection loop.`,
 		"zh-CN": `目标完成反思：叙述者正在尝试把一个用户设定的目标标记为完成。
@@ -311,11 +311,11 @@ Do not call UpdateGoal from this reflection loop.`,
 
 只有在当前活跃目标的每一项实质要求都有具体证据表明已满足、结果已按任务风险程度完成足够验证，并且没有剩余必做工作时，才能确认完成。仅有进展、意图、部分实现，或一句含糊的收尾说明，都不够。
 
-如果任何要求尚未验证、存在歧义、只是部分完成、仍被阻塞、依赖失败/缺失的检查，或会话中缺少具体证据，就必须拒绝完成。把不确定视为尚未达成。
+如果任何要求尚未验证、存在歧义、只是部分完成、仍被阻塞、依赖失败/缺失的检查，或会话中缺少具体证据，就必须拒绝完成。把不确定视为尚未达成。拒绝时必须同时说明为什么不能完成，以及主叙述者下一步应该怎么做，避免只返回“未通过”。
 
 你只有一次回复机会，并且必须且只能调用一个工具：
 - 如果当前活跃目标确实已经达成，调用 GoalCompleteConfirm，并给出针对该目标的具体证据。
-- 如果还需要继续工作或补充验证，调用 GoalCompleteRevise，并说明缺少什么。
+- 如果还需要继续工作或补充验证，调用 GoalCompleteRevise，并提供 feedback 和 nextSteps。nextSteps 必须可执行：指出下一步要补充的验证、实现、提问或阻塞处理动作。
 如果你在这一次回复中没有调用任一工具，本次目标完成将被拒绝。
 不要在这个 reflection loop 中调用 UpdateGoal。`,
 	},

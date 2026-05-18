@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolvePendingPerm } from "./narrator-message-helpers";
+import { getReflectionSuggestion, resolvePendingPerm } from "./narrator-message-helpers";
 import type { PendingPermission } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
@@ -59,6 +59,34 @@ describe("resolvePendingPerm", () => {
 		const resolved = resolvePendingPerm(
 			toolCall({
 				permissionSuggestions: [{ type: "danger_reflection", status: "confirmed" }],
+			}),
+			null,
+		);
+
+		expect(resolved).toBeNull();
+	});
+
+	test("recognizes goal reflection suggestions without making resolved ones actionable", () => {
+		expect(
+			getReflectionSuggestion([
+				{
+					type: "goal_reflection",
+					status: "running",
+					requestId: "goal-reflection-1",
+					reason: "Checking completion evidence",
+					nextSteps: "Run the missing verification.",
+				},
+			]),
+		).toMatchObject({
+			kind: "goal_reflection",
+			status: "running",
+			requestId: "goal-reflection-1",
+			nextSteps: "Run the missing verification.",
+		});
+
+		const resolved = resolvePendingPerm(
+			toolCall({
+				permissionSuggestions: [{ type: "goal_reflection", status: "confirmed" }],
 			}),
 			null,
 		);

@@ -1273,23 +1273,18 @@ function ReflectionNotice({
 	const activeKeyboardPermissionId = pendingPermission?.id ?? toolCall.id;
 	const running = reflection.status === "running";
 	const isDanger = reflection.kind === "danger_reflection";
+	const isPlan = reflection.kind === "plan_reflection";
+	const isGoal = reflection.kind === "goal_reflection";
 	const summary =
 		reflection.reason || reflection.danger?.summary || toolCall.permissionDecisionReason;
+	const titleKeyPrefix = isDanger ? "danger" : isPlan ? "plan" : "goal";
 	const title = (() => {
-		if (running) return t(isDanger ? "dangerReflectionRunning" : "planReflectionRunning");
-		if (reflection.status === "awaiting_user") {
-			return t(isDanger ? "dangerReflectionAwaitingUser" : "planReflectionAwaitingUser");
-		}
-		if (reflection.status === "confirmed") {
-			return t(isDanger ? "dangerReflectionConfirmed" : "planReflectionConfirmed");
-		}
-		if (reflection.status === "cancelled") {
-			return t(isDanger ? "dangerReflectionCancelled" : "planReflectionCancelled");
-		}
-		if (reflection.status === "aborted") {
-			return t(isDanger ? "dangerReflectionAborted" : "planReflectionAborted");
-		}
-		return t(isDanger ? "dangerReflectionResolved" : "planReflectionResolved");
+		if (running) return t(`${titleKeyPrefix}ReflectionRunning`);
+		if (reflection.status === "awaiting_user") return t(`${titleKeyPrefix}ReflectionAwaitingUser`);
+		if (reflection.status === "confirmed") return t(`${titleKeyPrefix}ReflectionConfirmed`);
+		if (reflection.status === "cancelled") return t(`${titleKeyPrefix}ReflectionCancelled`);
+		if (reflection.status === "aborted") return t(`${titleKeyPrefix}ReflectionAborted`);
+		return t(`${titleKeyPrefix}ReflectionResolved`);
 	})();
 
 	useEffect(() => {
@@ -1375,7 +1370,12 @@ function ReflectionNotice({
 							{summary}
 						</Text>
 					)}
-					{running && reflectionRequestId && (
+					{reflection.nextSteps && (
+						<Text size="xs" lh={1.45} mt={3} style={{ color: summaryColor }}>
+							{t("reflectionNextSteps", { nextSteps: reflection.nextSteps })}
+						</Text>
+					)}
+					{running && reflectionRequestId && !isGoal && (
 						<Group gap="xs" mt="xs">
 							<Button
 								size="xs"

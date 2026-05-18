@@ -197,7 +197,8 @@ export function isCodexExpected101StatusError(error: unknown): boolean {
 }
 
 export function isCodexWebSocketConnectionLimitError(error: CodexWrappedErrorEvent): boolean {
-	const code = error.error?.code ?? error.error?.type;
+	const dynamicError = error as CodexWrappedErrorEvent & { code?: string };
+	const code = error.error?.code ?? error.error?.type ?? dynamicError.code;
 	return code === "websocket_connection_limit_reached";
 }
 
@@ -346,19 +347,73 @@ function buildHandshakeHeaders(
 	return headers;
 }
 
-function parseWrappedError(text: string): CodexWrappedErrorEvent | null {
-	try {
-		const parsed = JSON.parse(text) as CodexWrappedErrorEvent;
-		return parsed.type === "error" ? parsed : null;
-	} catch {
-		return null;
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+function coerceWrappedError(value: unknown): CodexWrappedErrorEvent | null {
+	const obj = asRecord(value);
+	if (!obj) return null;
+
+	const nested = asRecord(obj.error);
+	const hasStructuredError =
+		nested &&
+		(typeof nested.message === "string" ||
+			typeof nested.code === "string" ||
+			typeof nested.type === "string");
+	const hasFlatError =
+		typeof obj.message === "string" ||
+		typeof obj.code === "string" ||
+		typeof obj.status === "number" ||
+		typeof obj.status_code === "number";
+
+	if (obj.type === "error") return obj as unknown as CodexWrappedErrorEvent;
+	if (hasStructuredError) return { ...(obj as object), type: "error" } as CodexWrappedErrorEvent;
+	if (!hasFlatError) return null;
+
+	return {
+		type: "error",
+		status: typeof obj.status === "number" ? obj.status : undefined,
+		status_code: typeof obj.status_code === "number" ? obj.status_code : undefined,
+		error: {
+			code: typeof obj.code === "string" ? obj.code : undefined,
+			type: typeof obj.type === "string" ? obj.type : undefined,
+			message: typeof obj.message === "string" ? obj.message : undefined,
+		},
+	};
+}
+
+export function parseCodexWrappedError(text: string): CodexWrappedErrorEvent | null {
+	const trimmed = text.trim();
+	if (!trimmed) return null;
+
+	const candidates = [trimmed];
+	const jsonStart = trimmed.indexOf("{");
+	const jsonEnd = trimmed.lastIndexOf("}");
+	if (jsonStart >= 0 && jsonEnd > jsonStart) {
+		const embeddedJson = trimmed.slice(jsonStart, jsonEnd + 1);
+		if (embeddedJson !== trimmed) candidates.push(embeddedJson);
 	}
+
+	for (const candidate of candidates) {
+		try {
+			const parsed = JSON.parse(candidate);
+			const wrapped = coerceWrappedError(parsed);
+			if (wrapped) return wrapped;
+		} catch {
+			// Try the next candidate. Close reasons may include a text prefix before JSON.
+		}
+	}
+	return null;
 }
 
 function formatWrappedError(error: CodexWrappedErrorEvent): Error {
+	const dynamicError = error as CodexWrappedErrorEvent & { code?: string; message?: string };
 	const status = error.status ?? error.status_code;
-	const code = error.error?.code ?? error.error?.type;
-	const message = error.error?.message ?? "Codex WebSocket request failed";
+	const code = error.error?.code ?? error.error?.type ?? dynamicError.code;
+	const message = error.error?.message ?? dynamicError.message ?? "Codex WebSocket request failed";
 	const suffix = [status ? `status=${status}` : null, code ? `code=${code}` : null]
 		.filter(Boolean)
 		.join(", ");
@@ -759,12 +814,72 @@ export async function* streamCodexResponsesWebSocket(
 				throw frame.error;
 			}
 			if (frame.type === "close") {
-				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				if (options.signal.aborted) {
 					await resetSession(session, false);
 					yield { silentDisconnect: true };
 					return;
 				}
+
+				const closeWrappedError = parseCodexWrappedError(frame.reason);
+				if (closeWrappedError) {
+					const status = closeWrappedError.status ?? closeWrappedError.status_code;
+					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
+					const error = formatWrappedError(closeWrappedError);
+					if (isCodexWebSocketConnectionLimitError(closeWrappedError)) {
+						const shouldReconnect =
+							!hasYieldedEvents && reconnectCount < MAX_PREMATURE_CLOSE_RECONNECTS;
+						const shouldFallback = !hasYieldedEvents;
+						logger.warn("Codex WebSocket close reason reached connection lifetime limit", {
+							sessionKey: options.sessionKey,
+							narratorId: options.narratorId,
+							credentialId: options.credentialId,
+							model: options.model,
+							closeCode: frame.code,
+							status,
+							shouldReconnect,
+							shouldFallback,
+							hasYieldedEvents,
+							reconnectCount,
+						});
+						if (shouldReconnect) {
+							await closeSessionConnection(session);
+							connection = null;
+							reconnectCount++;
+							touchSession(session);
+							connection = await ensureConnection(session, options);
+							if (options.signal.aborted) {
+								await resetSession(session, false);
+								yield { silentDisconnect: true };
+								return;
+							}
+							await connection.send(requestText);
+							continue;
+						}
+						await resetSession(session, false);
+						connection = null;
+						if (shouldFallback) {
+							throw new CodexWebSocketFallbackError(error.message, status);
+						}
+						throw error;
+					}
+					logger.warn("Codex WebSocket closed with error reason", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						closeCode: frame.code,
+						status,
+						errorCode,
+						error: error.message,
+					});
+					if (shouldDisableWebSocketForStatus(status)) {
+						await resetSession(session, true);
+						throw new CodexWebSocketFallbackError(error.message, status);
+					}
+					throw error;
+				}
+
+				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				const decision = decidePrematureCodexReconnect(
 					latestMessageCreatedAt,
 					hasYieldedEvents,
@@ -799,16 +914,21 @@ export async function* streamCodexResponsesWebSocket(
 				}
 				await resetSession(session, false);
 				connection = null;
+				const closeReason = frame.reason.trim();
+				const closeMessage =
+					`Codex WebSocket closed before response.completed ` +
+					`(code: ${frame.code}, reason: ${frame.reason})`;
 				if (decision.shouldFallback) {
-					throw new CodexWebSocketFallbackError(
-						`Codex WebSocket closed before response.completed (code: ${frame.code}, reason: ${frame.reason})`,
-					);
+					throw new CodexWebSocketFallbackError(closeMessage);
+				}
+				if (closeReason) {
+					throw new Error(closeMessage);
 				}
 				yield { silentDisconnect: true };
 				return;
 			}
 
-			const wrappedError = parseWrappedError(frame.text);
+			const wrappedError = parseCodexWrappedError(frame.text);
 			if (wrappedError) {
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);

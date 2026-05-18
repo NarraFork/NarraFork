@@ -377,6 +377,7 @@ interface AnthropicStreamEvent {
 		text?: string;
 		input?: Record<string, unknown>;
 		thinking?: string;
+		reasoning_content?: string;
 		signature?: string;
 		data?: string;
 		// server_tool_use / web_search_tool_result fields
@@ -397,6 +398,7 @@ interface AnthropicStreamEvent {
 		partial_json?: string;
 		stop_reason?: string;
 		thinking?: string;
+		reasoning_content?: string;
 		signature?: string;
 	};
 	usage?: AnthropicUsagePayload;
@@ -1521,7 +1523,7 @@ function isParsableJson(s: string): boolean {
 /** Accumulator for thinking block signature (keyed by content_block index). */
 type ThinkingAccumEntry = { signature: string; blockIndex: number };
 
-function parseAnthropicEvent(
+export function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
 	toolAccum: Map<number, ToolAccumEntry>,
 	thinkingAccum: Map<number, ThinkingAccumEntry>,
@@ -1599,9 +1601,24 @@ function parseAnthropicEvent(
 			}
 			return [{ webSearch: { id: toolUseId, status: "completed", query } }];
 		}
-		// Thinking block start — initialize signature accumulator
+		// Thinking block start — initialize signature accumulator.
+		// Some Anthropic-compatible APIs (notably DeepSeek relays) put the
+		// first/full thinking text directly on content_block_start instead of
+		// emitting Anthropic's standard thinking_delta events. Treat it as
+		// reasoning so it is persisted and replayed as a thinking block on the
+		// next request.
 		if (block.type === "thinking") {
 			thinkingAccum.set(idx, { signature: "", blockIndex: idx });
+			const initialThinking = block.thinking ?? block.reasoning_content ?? block.text;
+			if (initialThinking) {
+				return [
+					{
+						reasoning: initialThinking,
+						reasoningMetadata: { anthropic: { blockIndex: idx } },
+						reasoningOutputIndex: idx,
+					},
+				];
+			}
 			return [];
 		}
 		// Redacted thinking arrives as a complete content block. Match Claude Code's
@@ -1618,20 +1635,27 @@ function parseAnthropicEvent(
 	if (type === "content_block_delta" && event.delta) {
 		const idx = event.index ?? 0;
 
-		// Text delta
-		if (event.delta.type === "text_delta" && event.delta.text != null) {
-			return [{ text: event.delta.text, textOutputIndex: idx }];
-		}
-
-		// Thinking delta (extended thinking)
-		if (event.delta.type === "thinking_delta" && event.delta.thinking != null) {
+		// Thinking delta (extended thinking).
+		// Official Anthropic streams use `thinking_delta.thinking`; a few
+		// Anthropic-compatible relays stream a thinking content block using
+		// `text_delta.text` or `reasoning_content` instead. If the current block
+		// index was introduced as `type: "thinking"`, route those deltas to the
+		// reasoning channel rather than visible assistant text.
+		const isThinkingBlockDelta = event.delta.type === "thinking_delta" || thinkingAccum.has(idx);
+		const thinkingDelta = event.delta.thinking ?? event.delta.reasoning_content ?? event.delta.text;
+		if (isThinkingBlockDelta && thinkingDelta != null) {
 			return [
 				{
-					reasoning: event.delta.thinking,
+					reasoning: thinkingDelta,
 					reasoningMetadata: { anthropic: { blockIndex: idx } },
 					reasoningOutputIndex: idx,
 				},
 			];
+		}
+
+		// Text delta
+		if (event.delta.type === "text_delta" && event.delta.text != null) {
+			return [{ text: event.delta.text, textOutputIndex: idx }];
 		}
 
 		// Signature delta — assign (Anthropic sends one per thinking block)

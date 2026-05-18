@@ -186,6 +186,48 @@ describe("CodexManager usage quota state", () => {
 		expect(fetchCalled).toBe(false);
 	});
 
+	test("支持导入 sub2api accounts 嵌套凭据", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		const accessToken = createJwt({
+			sub: "jwt-sub",
+			email: "jwt@example.com",
+			chatgpt_account_id: "jwt-account",
+		});
+		const expiresAt = "2026-05-28T14:06:40.000Z";
+
+		const result = manager.importCredentials([
+			{
+				name: "Sub2Api Plus Account",
+				priority: 7,
+				credentials: {
+					access_token: accessToken,
+					chatgpt_account_id: "acc-sub2api",
+					chatgpt_user_id: "user-sub2api",
+					email: "sub2api@example.com",
+					expires_at: expiresAt,
+				},
+				extra: { email: "fallback@example.com" },
+			},
+		]);
+		const entry = manager.snapshot().entries[0];
+		const stored = JSON.parse(
+			readFileSync(join(tmpHome, ".narrafork", "codex-credentials.json"), "utf8"),
+		)[0];
+
+		expect(result).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		expect(entry).toMatchObject({
+			displayName: "Sub2Api Plus Account",
+			accountId: "acc-sub2api",
+			email: "sub2api@example.com",
+			priority: 7,
+			expiresAt: Date.parse(expiresAt),
+		});
+		expect(stored.sub).toBe("user-sub2api");
+		expect(stored.accessToken).toBe(accessToken);
+	});
+
 	test("查询 usage 剩余为 0% 时直接标记 quota_exhausted", async () => {
 		const { manager, tmpHome } = createManagerWithOneCredential("cred-a");
 		tempHomes.push(tmpHome);

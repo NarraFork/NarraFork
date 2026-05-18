@@ -2,6 +2,7 @@ import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db, sqlite } from "../db";
 import { narrators, userPreferences, workspaces } from "../db/schema";
+import { userPreferencesLock } from "../lib/async-mutex";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -19,7 +20,6 @@ import {
 	getTabNarratorId,
 	migrateTabTypes,
 } from "../services/user-preferences-service";
-import { broadcastToUser } from "../websocket/narrator-ws";
 
 export const userPreferencesRoutes = new Hono();
 
@@ -438,15 +438,12 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 	const now = new Date().toISOString();
 	const id = generateId();
 
-	let tabs: (typeof tab)[];
-
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	const tabs = await userPreferencesLock.acquire(userId, async () => {
 		// Read current tabs
 		const pref = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		tabs = [];
+		let tabs: (typeof tab)[] = [];
 		try {
 			tabs = pref ? JSON.parse(pref.recentTabs) : [];
 		} catch {
@@ -478,8 +475,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 				promoteTopLevelTabRespectingPins(tabs as Record<string, unknown>[], idx);
 			}
 		} else if (updateOnly) {
-			sqlite.run("COMMIT");
-			return c.json(tabs);
+			return tabs;
 		} else {
 			// New tab: if it belongs to a workspace, insert after the workspace header's
 			// last child instead of prepending to the top.
@@ -516,11 +512,8 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 			   updated_at = ?`,
 			[id, userId, tabsJson, now, now, tabsJson, now],
 		);
-		sqlite.run("COMMIT");
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+		return tabs;
+	});
 
 	const enriched = await broadcastTabsSnapshot(userId, tabs);
 	return c.json(enriched);
@@ -535,17 +528,11 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const now = new Date().toISOString();
-	let filtered: unknown[];
-
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	const filtered = await userPreferencesLock.acquire(userId, async () => {
 		const pref = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		if (!pref) {
-			sqlite.run("COMMIT");
-			return c.json([]);
-		}
+		if (!pref) return [];
 
 		let tabs: unknown[] = [];
 		try {
@@ -561,24 +548,19 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 			for (const t of tabs as Record<string, unknown>[]) {
 				if (t.workspaceId === tabId) delete t.workspaceId;
 			}
-			db.delete(workspaces)
-				.where(eq(workspaces.id, tabId))
-				.catch(() => {});
+			await db.delete(workspaces).where(eq(workspaces.id, tabId));
 		}
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		filtered = tabs.filter((t: any) => !(t.type === tabType && t.id === tabId));
+		const filtered = tabs.filter((t: any) => !(t.type === tabType && t.id === tabId));
 
 		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
 			JSON.stringify(filtered),
 			now,
 			userId,
 		]);
-		sqlite.run("COMMIT");
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+		return filtered;
+	});
 
 	const enriched = await broadcastTabsSnapshot(userId, filtered as Record<string, unknown>[]);
 	return c.json(enriched);
@@ -599,54 +581,48 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 		keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false;
 
 	if (scope === "all") {
-		if (keepTabKey) {
-			// Keep the single tab that matches keepTabKey
-			let kept: Record<string, unknown>[] = [];
-			const pref = await db.query.userPreferences.findFirst({
-				where: eq(userPreferences.userId, userId),
-			});
-			if (pref) {
-				try {
-					const tabs: Record<string, unknown>[] = JSON.parse(pref.recentTabs);
-					kept = tabs.filter(isKept);
-				} catch {
-					// corrupted
+		const tabs = await userPreferencesLock.acquire(userId, async () => {
+			if (keepTabKey) {
+				// Keep the single tab that matches keepTabKey
+				let kept: Record<string, unknown>[] = [];
+				const pref = await db.query.userPreferences.findFirst({
+					where: eq(userPreferences.userId, userId),
+				});
+				if (pref) {
+					try {
+						const tabs: Record<string, unknown>[] = JSON.parse(pref.recentTabs);
+						kept = tabs.filter(isKept);
+					} catch {
+						// corrupted
+					}
 				}
+				sqlite.run(
+					`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`,
+					[JSON.stringify(kept), now, userId],
+				);
+				return kept;
 			}
-			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-				JSON.stringify(kept),
-				now,
-				userId,
-			]);
-			const enriched = await broadcastTabsSnapshot(userId, kept);
-			return c.json(enriched);
-		}
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = '[]', updated_at = ? WHERE user_id = ?`, [
-			now,
-			userId,
-		]);
-		broadcastToUser(userId, { type: "user:recent_tabs_snapshot", tabs: [], revision: Date.now() });
-		return c.json([]);
+			sqlite.run(
+				`UPDATE user_preferences SET recent_tabs = '[]', updated_at = ? WHERE user_id = ?`,
+				[now, userId],
+			);
+			return [];
+		});
+		const enriched = await broadcastTabsSnapshot(userId, tabs);
+		return c.json(enriched);
 	}
 
-	let filtered: Record<string, unknown>[];
-
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	const filtered = await userPreferencesLock.acquire(userId, async () => {
 		const pref = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		if (!pref) {
-			sqlite.run("COMMIT");
-			return c.json([]);
-		}
+		if (!pref) return [];
 
 		let tabs: Record<string, unknown>[] = [];
 		try {
 			tabs = JSON.parse(pref.recentTabs);
 		} catch {
-			sqlite.run("COMMIT");
-			return c.json([]);
+			return [];
 		}
 		migrateTabTypes(tabs);
 
@@ -655,6 +631,7 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 		// (even though its main status is "idle")
 		const ATTENTION_SUBSTATUS = new Set(["unread", "error"]);
 
+		let filtered: Record<string, unknown>[];
 		if (scope === "projects") {
 			filtered = tabs.filter((t) => t.type !== "project" || isKept(t));
 		} else {
@@ -752,11 +729,8 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 			now,
 			userId,
 		]);
-		sqlite.run("COMMIT");
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+		return filtered;
+	});
 
 	const enriched = await broadcastTabsSnapshot(userId, filtered);
 	return c.json(enriched);
@@ -773,135 +747,123 @@ userPreferencesRoutes.patch("/recent-tabs/move", async (c) => {
 	if (toIndex == null && !position) throw new ValidationError("toIndex or position required");
 
 	const now = new Date().toISOString();
-	let result: Record<string, unknown>[];
-
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	const result = await userPreferencesLock.acquire(userId, async () => {
 		const pref = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		if (!pref) {
-			sqlite.run("COMMIT");
-			return c.json([]);
-		}
+		if (!pref) return [];
 
 		let tabs: Record<string, unknown>[] = [];
 		try {
 			tabs = JSON.parse(pref.recentTabs);
 		} catch {
-			sqlite.run("COMMIT");
-			return c.json([]);
+			return [];
 		}
 		migrateTabTypes(tabs);
 
 		const idx = tabs.findIndex((t) => `${t.type}:${t.id}` === key);
 		if (idx === -1) {
 			// Tab not found — return current list unchanged
-			sqlite.run("COMMIT");
-			result = tabs;
-		} else {
-			const tab = tabs[idx];
+			return tabs;
+		}
 
-			// Extract the item (or workspace group) from the array
-			let movedGroup: Record<string, unknown>[];
-			if (tab.type === "workspace") {
-				// Workspace header: extract header + all contiguous children
-				let end = idx + 1;
-				while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
-				movedGroup = tabs.splice(idx, end - idx);
-			} else {
-				movedGroup = tabs.splice(idx, 1);
+		const tab = tabs[idx];
+
+		// Extract the item (or workspace group) from the array
+		let movedGroup: Record<string, unknown>[];
+		if (tab.type === "workspace") {
+			// Workspace header: extract header + all contiguous children
+			let end = idx + 1;
+			while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
+			movedGroup = tabs.splice(idx, end - idx);
+		} else {
+			movedGroup = tabs.splice(idx, 1);
+		}
+
+		if (position === "top") {
+			tabs.unshift(...movedGroup);
+		} else if (position === "above_idle") {
+			// If the moved tab is a workspace child, promote the whole workspace instead.
+			// The movedGroup is already extracted; find the workspace header and re-extract.
+			const wsId = movedGroup[0].workspaceId as string | undefined;
+			if (wsId && movedGroup.length === 1) {
+				// Put the child back first, then re-extract the whole workspace group
+				tabs.splice(idx, 0, ...movedGroup);
+				const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
+				if (headerIdx >= 0) {
+					let end = headerIdx + 1;
+					while (end < tabs.length && tabs[end].workspaceId === wsId) end++;
+					movedGroup = tabs.splice(headerIdx, end - headerIdx);
+				}
 			}
 
-			if (position === "top") {
-				tabs.unshift(...movedGroup);
-			} else if (position === "above_idle") {
-				// If the moved tab is a workspace child, promote the whole workspace instead.
-				// The movedGroup is already extracted; find the workspace header and re-extract.
-				const wsId = movedGroup[0].workspaceId as string | undefined;
-				if (wsId && movedGroup.length === 1) {
-					// Put the child back first, then re-extract the whole workspace group
-					tabs.splice(idx, 0, ...movedGroup);
-					const headerIdx = tabs.findIndex((t) => t.type === "workspace" && t.id === wsId);
-					if (headerIdx >= 0) {
-						let end = headerIdx + 1;
-						while (end < tabs.length && tabs[end].workspaceId === wsId) end++;
-						movedGroup = tabs.splice(headerIdx, end - headerIdx);
-					}
-				}
+			// Need live status from DB
+			const narratorIds = tabs
+				.filter((t) => t.type !== "project" && t.type !== "workspace")
+				.map(getTabNarratorId)
+				.filter((id): id is string => !!id);
+			const statusMap = new Map<string, string>();
+			if (narratorIds.length > 0) {
+				const rows = await db
+					.select({ id: narrators.id, status: narrators.status })
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds));
+				for (const r of rows) statusMap.set(r.id, r.status);
+			}
 
-				// Need live status from DB
-				const narratorIds = tabs
-					.filter((t) => t.type !== "project" && t.type !== "workspace")
-					.map(getTabNarratorId)
-					.filter((id): id is string => !!id);
-				const statusMap = new Map<string, string>();
-				if (narratorIds.length > 0) {
-					const rows = await db
-						.select({ id: narrators.id, status: narrators.status })
-						.from(narrators)
-						.where(inArray(narrators.id, narratorIds));
-					for (const r of rows) statusMap.set(r.id, r.status);
-				}
-
-				// Find the first idle top-level tab (skip workspace children and pinned tabs)
-				const IDLE_STATUSES = new Set(["idle"]);
-				let firstIdleIdx = -1;
-				for (let i = 0; i < tabs.length; i++) {
-					// Skip pinned tabs — they stay at the top
-					if (tabs[i].pinned) continue;
-					// Skip workspace children — they move with their header
-					if (tabs[i].workspaceId) continue;
-					// Skip workspace headers — check their children's status
-					if (tabs[i].type === "workspace") {
-						const wsChildren: Record<string, unknown>[] = [];
-						for (let k = i + 1; k < tabs.length && tabs[k].workspaceId === tabs[i].id; k++) {
-							wsChildren.push(tabs[k]);
-						}
-						const allIdle = wsChildren.every((c) => {
-							const nId = getTabNarratorId(c);
-							const st = nId ? statusMap.get(nId) : undefined;
-							return st != null && IDLE_STATUSES.has(st);
-						});
-						if (wsChildren.length > 0 && allIdle) {
-							firstIdleIdx = i;
-							break;
-						}
-						continue;
+			// Find the first idle top-level tab (skip workspace children and pinned tabs)
+			const IDLE_STATUSES = new Set(["idle"]);
+			let firstIdleIdx = -1;
+			for (let i = 0; i < tabs.length; i++) {
+				// Skip pinned tabs — they stay at the top
+				if (tabs[i].pinned) continue;
+				// Skip workspace children — they move with their header
+				if (tabs[i].workspaceId) continue;
+				// Skip workspace headers — check their children's status
+				if (tabs[i].type === "workspace") {
+					const wsChildren: Record<string, unknown>[] = [];
+					for (let k = i + 1; k < tabs.length && tabs[k].workspaceId === tabs[i].id; k++) {
+						wsChildren.push(tabs[k]);
 					}
-					const nId = getTabNarratorId(tabs[i]);
-					const status = nId ? statusMap.get(nId) : undefined;
-					if (status && IDLE_STATUSES.has(status)) {
+					const allIdle = wsChildren.every((c) => {
+						const nId = getTabNarratorId(c);
+						const st = nId ? statusMap.get(nId) : undefined;
+						return st != null && IDLE_STATUSES.has(st);
+					});
+					if (wsChildren.length > 0 && allIdle) {
 						firstIdleIdx = i;
 						break;
 					}
+					continue;
 				}
-				if (firstIdleIdx === -1) {
-					tabs.push(...movedGroup);
-				} else {
-					tabs.splice(firstIdleIdx, 0, ...movedGroup);
+				const nId = getTabNarratorId(tabs[i]);
+				const status = nId ? statusMap.get(nId) : undefined;
+				if (status && IDLE_STATUSES.has(status)) {
+					firstIdleIdx = i;
+					break;
 				}
-			} else if (toIndex != null) {
-				// toIndex — clamp to valid range
-				const target = Math.min(toIndex, tabs.length);
-				tabs.splice(target, 0, ...movedGroup);
 			}
-
-			// Ensure workspace grouping invariant after any move
-			regroupWorkspaces(tabs);
-
-			result = tabs;
-			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-				JSON.stringify(result),
-				now,
-				userId,
-			]);
-			sqlite.run("COMMIT");
+			if (firstIdleIdx === -1) {
+				tabs.push(...movedGroup);
+			} else {
+				tabs.splice(firstIdleIdx, 0, ...movedGroup);
+			}
+		} else if (toIndex != null) {
+			// toIndex — clamp to valid range
+			const target = Math.min(toIndex, tabs.length);
+			tabs.splice(target, 0, ...movedGroup);
 		}
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+
+		// Ensure workspace grouping invariant after any move
+		regroupWorkspaces(tabs);
+
+		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+			JSON.stringify(tabs),
+			now,
+			userId,
+		]);
+		return tabs;
+	});
 
 	const enriched = await broadcastTabsSnapshot(userId, result);
 	return c.json(enriched);
@@ -916,62 +878,48 @@ userPreferencesRoutes.patch("/recent-tabs/pin", async (c) => {
 
 	const { key, pinned } = parsed.data;
 	const now = new Date().toISOString();
-	let result: Record<string, unknown>[];
-
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	const result = await userPreferencesLock.acquire(userId, async () => {
 		const pref = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 		});
-		if (!pref) {
-			sqlite.run("COMMIT");
-			return c.json([]);
-		}
+		if (!pref) return [];
 
 		let tabs: Record<string, unknown>[] = [];
 		try {
 			tabs = JSON.parse(pref.recentTabs);
 		} catch {
-			sqlite.run("COMMIT");
-			return c.json([]);
+			return [];
 		}
 		migrateTabTypes(tabs);
 
 		const idx = tabs.findIndex((t) => `${t.type}:${t.id}` === key);
-		if (idx === -1) {
-			sqlite.run("COMMIT");
-			result = tabs;
+		if (idx === -1) return tabs;
+
+		if (pinned) {
+			tabs[idx].pinned = true;
+			// Move to end of pinned section (before first non-pinned tab)
+			const tab = tabs.splice(idx, 1)[0];
+			let insertIdx = 0;
+			while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
+			tabs.splice(insertIdx, 0, tab);
 		} else {
-			if (pinned) {
-				tabs[idx].pinned = true;
-				// Move to end of pinned section (before first non-pinned tab)
-				const tab = tabs.splice(idx, 1)[0];
-				let insertIdx = 0;
-				while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
-				tabs.splice(insertIdx, 0, tab);
-			} else {
-				delete tabs[idx].pinned;
-				// Move to start of non-pinned section (after last pinned tab)
-				const tab = tabs.splice(idx, 1)[0];
-				let insertIdx = 0;
-				while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
-				tabs.splice(insertIdx, 0, tab);
-			}
-
-			regroupWorkspaces(tabs);
-			result = tabs;
-
-			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-				JSON.stringify(result),
-				now,
-				userId,
-			]);
-			sqlite.run("COMMIT");
+			delete tabs[idx].pinned;
+			// Move to start of non-pinned section (after last pinned tab)
+			const tab = tabs.splice(idx, 1)[0];
+			let insertIdx = 0;
+			while (insertIdx < tabs.length && tabs[insertIdx].pinned) insertIdx++;
+			tabs.splice(insertIdx, 0, tab);
 		}
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+
+		regroupWorkspaces(tabs);
+
+		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+			JSON.stringify(tabs),
+			now,
+			userId,
+		]);
+		return tabs;
+	});
 
 	const enriched = await broadcastTabsSnapshot(userId, result);
 	return c.json(enriched);
@@ -997,9 +945,7 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 	const now = new Date().toISOString();
 	const id = generateId();
 
-	// Use BEGIN IMMEDIATE to prevent concurrent read-modify-write races
-	sqlite.run("BEGIN IMMEDIATE");
-	try {
+	await userPreferencesLock.acquire(userId, async () => {
 		const existing = await db.query.userPreferences.findFirst({
 			where: eq(userPreferences.userId, userId),
 			columns: { graphViewports: true },
@@ -1035,11 +981,7 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 			   updated_at = ?`,
 			[id, userId, JSON.stringify(viewports), now, now, JSON.stringify(viewports), now],
 		);
-		sqlite.run("COMMIT");
-	} catch (err) {
-		sqlite.run("ROLLBACK");
-		throw err;
-	}
+	});
 
 	return c.json({ ok: true });
 });

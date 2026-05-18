@@ -3,7 +3,7 @@ import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrat
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
-export type ReflectionKind = "danger_reflection" | "plan_reflection";
+export type ReflectionKind = "danger_reflection" | "plan_reflection" | "goal_reflection";
 export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
 
 export interface ReflectionSuggestion {
@@ -12,10 +12,16 @@ export interface ReflectionSuggestion {
 	reason?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic suggestion payload
 	danger?: any;
+	activeGoal?: unknown;
+	nextSteps?: string;
 	requestId?: string;
 }
 
-const REFLECTION_KINDS = new Set<ReflectionKind>(["danger_reflection", "plan_reflection"]);
+const REFLECTION_KINDS = new Set<ReflectionKind>([
+	"danger_reflection",
+	"plan_reflection",
+	"goal_reflection",
+]);
 const ACTIVE_REFLECTION_STATUSES = new Set<ReflectionStatus>(["running", "awaiting_user"]);
 
 export function getReflectionSuggestion(
@@ -29,6 +35,8 @@ export function getReflectionSuggestion(
 			status?: unknown;
 			reason?: unknown;
 			danger?: unknown;
+			activeGoal?: unknown;
+			nextSteps?: unknown;
 			requestId?: unknown;
 		};
 		const kind = String(record.type ?? "");
@@ -48,6 +56,8 @@ export function getReflectionSuggestion(
 			status,
 			reason: typeof record.reason === "string" ? record.reason : undefined,
 			danger: record.danger,
+			activeGoal: record.activeGoal,
+			nextSteps: typeof record.nextSteps === "string" ? record.nextSteps : undefined,
 			requestId: typeof record.requestId === "string" ? record.requestId : undefined,
 		};
 	}

@@ -11,6 +11,7 @@ import {
 	isCodexResponsesWebSocketSessionExpired,
 	isCodexWebSocketConnectionLimitError,
 	isCodexWebSocketIdleTimeoutError,
+	parseCodexWrappedError,
 	shouldTreatCodexStreamEventAsYielded,
 } from "../codex-websocket";
 import type { OAIMessage } from "../openai-provider";
@@ -166,6 +167,33 @@ describe("Codex Responses WebSocket helpers", () => {
 				error: { code: "rate_limit_exceeded" },
 			}),
 		).toBe(false);
+	});
+
+	test("parses detailed websocket close reasons as wrapped errors", () => {
+		const parsed = parseCodexWrappedError(
+			JSON.stringify({
+				type: "error",
+				status: 429,
+				error: {
+					code: "usage_limit_reached",
+					message: "Usage limit reached for this Codex account",
+				},
+			}),
+		);
+
+		expect(parsed?.status).toBe(429);
+		expect(parsed?.error?.code).toBe("usage_limit_reached");
+		expect(parsed?.error?.message).toBe("Usage limit reached for this Codex account");
+	});
+
+	test("parses embedded JSON from websocket close reasons", () => {
+		const parsed = parseCodexWrappedError(
+			'closed by server: {"error":{"type":"server_error","message":"upstream crashed"}}',
+		);
+
+		expect(parsed?.type).toBe("error");
+		expect(parsed?.error?.type).toBe("server_error");
+		expect(parsed?.error?.message).toBe("upstream crashed");
 	});
 
 	test("reconnect decision only retries before any events were yielded", () => {

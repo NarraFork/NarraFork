@@ -88,6 +88,8 @@ export interface ParsedStreamEvent {
 	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };
 	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
 	quotaBalance?: string | null;
+	/** Optional multiline quota details to show in the quota tooltip. */
+	detailedQuotaBalance?: string | null;
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

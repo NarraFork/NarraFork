@@ -250,7 +250,7 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
-	| { type: "quota_balance"; quotaBalance: string | null }
+	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "output_truncated"; message: string }
 	| {

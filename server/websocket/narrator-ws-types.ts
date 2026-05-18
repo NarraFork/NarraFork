@@ -65,6 +65,25 @@ export type NarratorServerMessage =
 			reason?: string;
 	  }
 	| {
+			type: "goal_reflection_started";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson: unknown;
+			activeGoal: unknown;
+			reason?: string;
+	  }
+	| {
+			type: "goal_reflection_resolved";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+			nextSteps?: string;
+	  }
+	| {
 			type: "status_change";
 			narratorId: string;
 			status: string;
@@ -402,6 +421,7 @@ export type NarratorServerMessage =
 			type: "quota_balance";
 			narratorId: string;
 			quotaBalance: string | null;
+			detailedQuotaBalance?: string | null;
 	  }
 	| {
 			type: "queue_status";

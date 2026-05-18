@@ -61,6 +61,21 @@ interface NarratorWSCallbacks {
 		inputJson?: Record<string, unknown>;
 		reason?: string;
 	}) => void;
+	onGoalReflectionStarted?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		inputJson?: Record<string, unknown>;
+		activeGoal?: unknown;
+		reason?: string;
+	}) => void;
+	onGoalReflectionResolved?: (data: {
+		requestId: string;
+		toolUseId: string;
+		decision: "allow" | "deny" | "aborted";
+		reason?: string;
+		nextSteps?: string;
+	}) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -146,7 +161,7 @@ interface NarratorWSCallbacks {
 		linesRemoved: number;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
-	onQuotaBalance?: (quotaBalance: string | null) => void;
+	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
@@ -420,6 +435,25 @@ export function useNarratorWS(
 							reason: data.reason as string | undefined,
 						});
 						break;
+					case "goal_reflection_started":
+						callbacksRef.current.onGoalReflectionStarted?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							activeGoal: data.activeGoal,
+							reason: data.reason as string | undefined,
+						});
+						break;
+					case "goal_reflection_resolved":
+						callbacksRef.current.onGoalReflectionResolved?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							decision: data.decision as "allow" | "deny" | "aborted",
+							reason: data.reason as string | undefined,
+							nextSteps: data.nextSteps as string | undefined,
+						});
+						break;
 					case "status_change":
 						callbacksRef.current.onStatusChange?.(
 							data.status as string,
@@ -632,8 +666,11 @@ export function useNarratorWS(
 						break;
 					case "quota_balance": {
 						const quotaBalance = data.quotaBalance;
+						const detailedQuotaBalance = data.detailedQuotaBalance;
+						const detailedText = detailedQuotaBalance == null ? null : String(detailedQuotaBalance);
 						callbacksRef.current.onQuotaBalance?.(
 							quotaBalance == null ? null : String(quotaBalance),
+							detailedText?.trim() ? detailedText : null,
 						);
 						break;
 					}

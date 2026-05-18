@@ -310,7 +310,7 @@ describe("goal completion reflection tools", () => {
 		).toBe(true);
 	});
 
-	test("GoalCompleteRevise requires feedback", () => {
+	test("GoalCompleteRevise requires feedback and next steps", () => {
 		expect(
 			goalCompleteReviseTool.parameters.safeParse({ confirm: true, feedback: "" }).success,
 		).toBe(false);
@@ -318,6 +318,13 @@ describe("goal completion reflection tools", () => {
 			goalCompleteReviseTool.parameters.safeParse({
 				confirm: true,
 				feedback: "Need to run the requested verification first.",
+			}).success,
+		).toBe(false);
+		expect(
+			goalCompleteReviseTool.parameters.safeParse({
+				confirm: true,
+				feedback: "Need to run the requested verification first.",
+				nextSteps: "Run the missing verification, then call UpdateGoal if it passes.",
 			}).success,
 		).toBe(true);
 	});

@@ -22,13 +22,99 @@ function isCodexLoadBalancingMode(mode: unknown): mode is LoadBalancingMode {
 	return mode === "priority" || mode === "balanced" || mode === "tier-balanced";
 }
 
+const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> {
+	return isRecord(value) ? value : {};
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 function hasCodexImportToken(credential: CodexImportCredentialInput): boolean {
-	const refreshToken = credential.refreshToken ?? credential.refresh_token;
-	const accessToken = credential.accessToken ?? credential.access_token;
-	return (
-		(typeof refreshToken === "string" && !!refreshToken.trim()) ||
-		(typeof accessToken === "string" && !!accessToken.trim())
+	const nestedCredentials = optionalRecord(credential.credentials);
+	const refreshToken = optionalString(
+		credential.refreshToken ??
+			credential.refresh_token ??
+			nestedCredentials.refreshToken ??
+			nestedCredentials.refresh_token,
 	);
+	const accessToken = optionalString(
+		credential.accessToken ??
+			credential.access_token ??
+			nestedCredentials.accessToken ??
+			nestedCredentials.access_token,
+	);
+	return !!refreshToken || !!accessToken;
+}
+
+function codexCredentialsFromAtMarkerRecord(
+	record: string,
+	email?: string,
+): CodexImportCredentialInput[] {
+	const parts = record.split("----").map((part) => part.trim());
+	return parts.flatMap((part, index) => {
+		if (part.toLowerCase() !== "at") return [];
+		const accessToken = optionalString(parts[index + 1]);
+		return accessToken
+			? [
+					{
+						accessToken,
+						...(email ? { email, displayName: email } : {}),
+					},
+				]
+			: [];
+	});
+}
+
+function codexCredentialsFromText(text: string): CodexImportCredentialInput[] {
+	const trimmed = text.trim();
+	if (!trimmed) return [];
+	if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+		try {
+			return codexCredentialsFromParsedImport(JSON.parse(trimmed));
+		} catch {
+			// Fall through to token extraction for non-JSON text that starts with braces.
+		}
+	}
+
+	const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+	return trimmed.split(/[,\n]+/).flatMap((record) => {
+		const email = optionalString(record.match(emailRegex)?.[0]);
+		const refreshCredentials = [...record.matchAll(REFRESH_TOKEN_SEARCH_PATTERN)].flatMap(
+			(match) => {
+				const refreshToken = optionalString(match[0]);
+				return refreshToken
+					? [
+							{
+								refreshToken,
+								...(email ? { email, displayName: email } : {}),
+							},
+						]
+					: [];
+			},
+		);
+		return [...refreshCredentials, ...codexCredentialsFromAtMarkerRecord(record, email)];
+	});
+}
+
+function codexCredentialsFromParsedImport(value: unknown): CodexImportCredentialInput[] {
+	if (typeof value === "string") return codexCredentialsFromText(value);
+	if (Array.isArray(value)) return value.flatMap((item) => codexCredentialsFromParsedImport(item));
+	if (!isRecord(value)) return [];
+
+	if (Array.isArray(value.accounts)) {
+		return value.accounts.flatMap((item) => codexCredentialsFromParsedImport(item));
+	}
+	if (Array.isArray(value.credentials)) {
+		return value.credentials.flatMap((item) => codexCredentialsFromParsedImport(item));
+	}
+	return [value as CodexImportCredentialInput];
 }
 
 /**
@@ -413,15 +499,28 @@ codexRoutes.post("/use-websocket", async (c) => {
  */
 codexRoutes.post("/import", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as {
-		credentials?: CodexImportCredentialInput[];
+		credentials?: unknown;
+		text?: unknown;
+		importText?: unknown;
 	};
+	const credentialItems =
+		body.credentials === undefined
+			? []
+			: Array.isArray(body.credentials)
+				? body.credentials
+				: [body.credentials];
+	const credentials = [
+		...codexCredentialsFromParsedImport(credentialItems),
+		...codexCredentialsFromParsedImport(body.text),
+		...codexCredentialsFromParsedImport(body.importText),
+	];
 
-	if (!body.credentials?.length) {
+	if (!credentials.length) {
 		return c.json({ error: "No credentials provided" }, 400);
 	}
 
 	// Validate that at least one credential has a refresh token or access token.
-	const validCredentials = body.credentials.filter(hasCodexImportToken);
+	const validCredentials = credentials.filter(hasCodexImportToken);
 	if (validCredentials.length === 0) {
 		return c.json(
 			{
@@ -433,7 +532,7 @@ codexRoutes.post("/import", async (c) => {
 	}
 
 	const manager = getCodexManager();
-	const result = manager.importCredentials(body.credentials);
+	const result = manager.importCredentials(credentials);
 	return c.json(result);
 });
 

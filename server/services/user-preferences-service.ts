@@ -7,6 +7,7 @@ import {
 	terminals,
 	userPreferences,
 } from "../db/schema";
+import { userPreferencesLock } from "../lib/async-mutex";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { parseDraftTrait, parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
@@ -126,6 +127,33 @@ function promoteDraftTab(tabs: Record<string, unknown>[], narratorId: string): b
 		if (headerIdx >= 0) return promoteTopLevelTabRespectingPins(tabs, headerIdx);
 	}
 	return promoteTopLevelTabRespectingPins(tabs, idx);
+}
+
+function readRecentTabsForUser(userId: string): Record<string, unknown>[] | null {
+	const row = db
+		.select({ recentTabs: userPreferences.recentTabs })
+		.from(userPreferences)
+		.where(eq(userPreferences.userId, userId))
+		.get();
+	if (!row) return null;
+	try {
+		const tabs = JSON.parse(row.recentTabs);
+		return Array.isArray(tabs) ? tabs : null;
+	} catch {
+		return null;
+	}
+}
+
+function writeRecentTabsForUser(
+	userId: string,
+	tabs: Record<string, unknown>[],
+	now: string,
+): void {
+	sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
+		JSON.stringify(tabs),
+		now,
+		userId,
+	]);
 }
 
 /** Enrich raw tabs with live runtime data (narrator status, terminals, presence, containers). */
@@ -260,38 +288,59 @@ export async function syncNarratorDraftToRecentTabs(
 	narratorId: string,
 	opts: { promote: boolean },
 ): Promise<void> {
-	const rows = db
-		.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
-		.from(userPreferences)
-		.all();
-	const now = new Date().toISOString();
+	const rows = db.select({ userId: userPreferences.userId }).from(userPreferences).all();
 
 	for (const row of rows) {
-		let tabs: Record<string, unknown>[];
-		try {
-			tabs = JSON.parse(row.recentTabs);
-		} catch {
-			continue;
-		}
-		if (!Array.isArray(tabs)) continue;
-		migrateTabTypes(tabs);
-		if (!tabs.some((tab) => tabRepresentsNarrator(tab, narratorId))) continue;
+		const tabs = await userPreferencesLock.acquire(row.userId, async () => {
+			const tabs = readRecentTabsForUser(row.userId);
+			if (!tabs) return null;
+			migrateTabTypes(tabs);
+			if (!tabs.some((tab) => tabRepresentsNarrator(tab, narratorId))) return null;
 
-		let changed = false;
-		if (opts.promote) {
-			const before = JSON.stringify(tabs);
-			promoteDraftTab(tabs, narratorId);
-			regroupWorkspaces(tabs);
-			changed = JSON.stringify(tabs) !== before;
-		}
-		if (changed) {
-			sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-				JSON.stringify(tabs),
-				now,
-				row.userId,
-			]);
-		}
-		await broadcastTabsSnapshot(row.userId, tabs);
+			let changed = false;
+			if (opts.promote) {
+				const before = JSON.stringify(tabs);
+				promoteDraftTab(tabs, narratorId);
+				regroupWorkspaces(tabs);
+				changed = JSON.stringify(tabs) !== before;
+			}
+			if (changed) writeRecentTabsForUser(row.userId, tabs, new Date().toISOString());
+			return tabs;
+		});
+		if (tabs) await broadcastTabsSnapshot(row.userId, tabs);
+	}
+}
+
+/**
+ * Sync a narrator title into every user's recent_tabs using the same per-user
+ * lock as the REST recent-tabs routes, so title updates cannot be overwritten
+ * by concurrent tab moves/pins/clears.
+ */
+export async function syncNarratorTitleToRecentTabs(
+	narratorId: string,
+	title: string,
+): Promise<void> {
+	const rows = db.select({ userId: userPreferences.userId }).from(userPreferences).all();
+
+	for (const row of rows) {
+		const tabs = await userPreferencesLock.acquire(row.userId, async () => {
+			const tabs = readRecentTabsForUser(row.userId);
+			if (!tabs) return null;
+			migrateTabTypes(tabs);
+
+			let changed = false;
+			for (const tab of tabs) {
+				if (tabRepresentsNarrator(tab, narratorId) && tab.title !== title) {
+					tab.title = title;
+					changed = true;
+				}
+			}
+			if (!changed) return null;
+
+			writeRecentTabsForUser(row.userId, tabs, new Date().toISOString());
+			return tabs;
+		});
+		if (tabs) await broadcastTabsSnapshot(row.userId, tabs);
 	}
 }
 
@@ -305,32 +354,20 @@ export async function removeTabFromAllUsers(
 	tabType: "chapter" | "narrator" | "project",
 	tabId: string,
 ): Promise<void> {
-	const rows = db
-		.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
-		.from(userPreferences)
-		.all();
-
-	const now = new Date().toISOString();
+	const rows = db.select({ userId: userPreferences.userId }).from(userPreferences).all();
 
 	for (const row of rows) {
-		let tabs: Record<string, unknown>[];
-		try {
-			tabs = JSON.parse(row.recentTabs);
-		} catch {
-			continue;
-		}
-		if (!Array.isArray(tabs)) continue;
+		const filtered = await userPreferencesLock.acquire(row.userId, async () => {
+			const tabs = readRecentTabsForUser(row.userId);
+			if (!tabs) return null;
+			const filtered = tabs.filter(
+				(t: Record<string, unknown>) => !(t.type === tabType && t.id === tabId),
+			);
+			if (filtered.length === tabs.length) return null; // nothing removed
 
-		const filtered = tabs.filter(
-			(t: Record<string, unknown>) => !(t.type === tabType && t.id === tabId),
-		);
-		if (filtered.length === tabs.length) continue; // nothing removed
-
-		sqlite.run(`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, [
-			JSON.stringify(filtered),
-			now,
-			row.userId,
-		]);
-		broadcastTabsSnapshot(row.userId, filtered);
+			writeRecentTabsForUser(row.userId, filtered, new Date().toISOString());
+			return filtered;
+		});
+		if (filtered) await broadcastTabsSnapshot(row.userId, filtered);
 	}
 }

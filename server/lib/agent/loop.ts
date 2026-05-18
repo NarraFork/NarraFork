@@ -49,6 +49,7 @@ import {
 	GOAL_COMPLETION_REFLECTION_TOOLS,
 	type GoalCompletionReflectionDecision,
 	grantGoalCompletionReflection,
+	markGoalCompletionReflectionStarted,
 } from "./tools/goal-reflection";
 import type {
 	AgentConfig,
@@ -235,7 +236,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
 	GoalCompleteConfirm: { short: ["confirm"], large: ["evidence", "reflection"] },
-	GoalCompleteRevise: { short: ["confirm"], large: ["feedback"] },
+	GoalCompleteRevise: { short: ["confirm"], large: ["feedback", "nextSteps"] },
 	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
 	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
@@ -1191,14 +1192,26 @@ async function resolveGoalCompletionReflection(
 	const activeGoal = goals.find((goal) => goal.status === "active") ?? null;
 	if (!activeGoal) {
 		return {
-			decision: { action: "revise", feedback: "No active goal exists to complete." },
+			decision: {
+				action: "revise",
+				feedback: "No active goal exists to complete.",
+				nextSteps: "Add or resume an active goal before trying to mark a goal complete.",
+			},
 			input: toolUse.input,
 		};
 	}
 
 	const requestId = `goal_complete_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 	const reflectionAbort = new AbortController();
-	const decisionPromise = createGoalCompletionReflectionDecision(requestId);
+	const decisionPromise = createGoalCompletionReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: toolUse.input,
+		activeGoal,
+	});
+	await markGoalCompletionReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runGoalCompletionReflectionLoop(
 		config,
@@ -1221,7 +1234,11 @@ async function resolveGoalCompletionReflection(
 		reflectionPromise.then(async () => {
 			const fallbackMessage =
 				"Goal-completion reflection loop did not call GoalCompleteConfirm or GoalCompleteRevise in its single allowed response";
-			const cancelled = await cancelGoalCompletionReflection(requestId, fallbackMessage);
+			const cancelled = await cancelGoalCompletionReflection(
+				requestId,
+				fallbackMessage,
+				"Review the active goal, gather concrete completion evidence, and try UpdateGoal again only after every requirement is verified.",
+			);
 			if (cancelled) return decisionPromise;
 
 			const alreadySettled = await Promise.race<GoalCompletionReflectionDecision | null>([
@@ -1231,6 +1248,8 @@ async function resolveGoalCompletionReflection(
 			const fallbackDecision: GoalCompletionReflectionDecision = {
 				action: "revise",
 				feedback: fallbackMessage,
+				nextSteps:
+					"Review the active goal, gather concrete completion evidence, and try UpdateGoal again only after every requirement is verified.",
 			};
 			return alreadySettled ?? fallbackDecision;
 		}),
@@ -1306,10 +1325,14 @@ function buildGoalCompletionReflectionDeniedToolResult(
 		decision.action === "revise" && decision.feedback.trim()
 			? decision.feedback.trim()
 			: "Goal-completion reflection found that the active goal is not proven complete.";
+	const nextSteps =
+		decision.action === "revise" && decision.nextSteps?.trim()
+			? decision.nextSteps.trim()
+			: "Continue working, gather concrete verification evidence, and try UpdateGoal again only after every material requirement is satisfied.";
 	const output =
 		locale === "zh-CN"
-			? `目标完成反思认为当前目标还不能标记为完成。请继续工作或补充验证。\n\n反馈：${feedback}`
-			: `Goal-completion reflection decided the active goal is not ready to mark complete. Continue working or gather verification first.\n\nFeedback: ${feedback}`;
+			? `目标完成反思认为当前目标还不能标记为完成。\n\n反馈：${feedback}\n\n下一步：${nextSteps}`
+			: `Goal-completion reflection decided the active goal is not ready to mark complete.\n\nFeedback: ${feedback}\n\nNext steps: ${nextSteps}`;
 	return {
 		output,
 		isError: true,
@@ -2574,7 +2597,11 @@ export async function* agentLoop(
 						};
 					}
 					if (parsed.quotaBalance !== undefined) {
-						yield { type: "quota_balance", quotaBalance: parsed.quotaBalance };
+						yield {
+							type: "quota_balance",
+							quotaBalance: parsed.quotaBalance,
+							detailedQuotaBalance: parsed.detailedQuotaBalance,
+						};
 					}
 					// Convert OpenAI/Anthropic usage to context_usage percentage
 					if (parsed.usage && parsed.usage.promptTokens != null) {

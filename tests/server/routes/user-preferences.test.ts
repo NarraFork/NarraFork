@@ -13,6 +13,9 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 }));
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
+const { syncNarratorTitleToRecentTabs } = await import(
+	"../../../server/services/user-preferences-service"
+);
 
 const authUser: JwtPayload = {
 	sub: "user-1",
@@ -32,16 +35,20 @@ afterEach(() => cleanDb(sqlite));
 
 const NOW = "2025-01-01T00:00:00.000Z";
 
-function seedRecentTabs(tabs: unknown[]) {
+function seedRecentTabsForUser(userId: string, tabs: unknown[]) {
 	db.insert(userPreferences)
 		.values({
-			id: "pref-1",
-			userId: "user-1",
+			id: `pref-${userId}`,
+			userId,
 			recentTabs: JSON.stringify(tabs),
 			createdAt: NOW,
 			updatedAt: NOW,
 		})
 		.run();
+}
+
+function seedRecentTabs(tabs: unknown[]) {
+	seedRecentTabsForUser("user-1", tabs);
 }
 
 function seedNarrator(
@@ -190,6 +197,42 @@ describe("recent tabs pinned ordering", () => {
 			"project:other-project",
 		]);
 		expect(tabs[2]?.workspaceId).toBe("ws-1");
+	});
+});
+
+describe("recent tabs service sync", () => {
+	it("updates narrator titles through the locked recent-tabs service path", async () => {
+		seedRecentTabs([
+			{
+				type: "narrator",
+				id: "n-title",
+				title: "Old title",
+				lastVisitedAt: 100,
+			},
+			{
+				type: "project",
+				id: "project-1",
+				title: "Project title",
+				lastVisitedAt: 90,
+			},
+		]);
+		seedRecentTabsForUser("user-2", [
+			{
+				type: "chapter",
+				id: "chapter-1",
+				narratorId: "n-title",
+				title: "Old chapter title",
+				lastVisitedAt: 80,
+			},
+		]);
+
+		await syncNarratorTitleToRecentTabs("n-title", "New title");
+
+		const rows = await db.select().from(userPreferences);
+		const byUser = new Map(rows.map((row) => [row.userId, JSON.parse(row.recentTabs)]));
+		expect(byUser.get("user-1")?.[0]?.title).toBe("New title");
+		expect(byUser.get("user-1")?.[1]?.title).toBe("Project title");
+		expect(byUser.get("user-2")?.[0]?.title).toBe("New title");
 	});
 });
 

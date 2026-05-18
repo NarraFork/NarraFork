@@ -1,14 +1,8 @@
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
-import { db, sqlite } from "../db";
-import {
-	containerInstances,
-	narrators,
-	narratorToolCalls,
-	terminals,
-	userPreferences,
-} from "../db/schema";
+import { db } from "../db";
+import { containerInstances, narrators, narratorToolCalls, terminals } from "../db/schema";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
@@ -456,45 +450,14 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	});
 
 	// === Recent tabs title sync ===
-	// When a narrator title changes, update the stored title in every user's recent_tabs
-	// and broadcast a fresh snapshot so the sidebar reflects the new title immediately.
-
+	// Keep the actual JSON read-modify-write in user-preferences-service so every
+	// recent-tabs writer shares the same per-user lock.
 	eventBus.on("narrator:title_updated", async (event) => {
 		try {
-			const { broadcastTabsSnapshot } = await import("../services/user-preferences-service");
-			const rows = db
-				.select({ userId: userPreferences.userId, recentTabs: userPreferences.recentTabs })
-				.from(userPreferences)
-				.all();
-
-			for (const row of rows) {
-				let tabs: Record<string, unknown>[];
-				try {
-					tabs = JSON.parse(row.recentTabs);
-				} catch {
-					continue;
-				}
-				if (!Array.isArray(tabs)) continue;
-
-				let changed = false;
-				for (const tab of tabs) {
-					const isMatch =
-						(tab.type === "narrator" && tab.id === event.narratorId) ||
-						(tab.type === "chapter" && tab.narratorId === event.narratorId);
-					if (isMatch && tab.title !== event.title) {
-						tab.title = event.title;
-						changed = true;
-					}
-				}
-				if (!changed) continue;
-
-				const now = new Date().toISOString();
-				sqlite.run(
-					`UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`,
-					[JSON.stringify(tabs), now, row.userId],
-				);
-				broadcastTabsSnapshot(row.userId, tabs);
-			}
+			const { syncNarratorTitleToRecentTabs } = await import(
+				"../services/user-preferences-service"
+			);
+			await syncNarratorTitleToRecentTabs(event.narratorId, event.title);
 		} catch (err) {
 			logger.error("Failed to sync recent tabs after title update", {
 				narratorId: event.narratorId,

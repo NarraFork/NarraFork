@@ -146,18 +146,79 @@ function optionalPriority(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> {
+	return isRecord(value) ? value : {};
+}
+
+function firstOptionalString(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		const normalized = optionalString(value);
+		if (normalized) return normalized;
+	}
+	return undefined;
+}
+
+function firstOptionalPriority(...values: unknown[]): number | undefined {
+	for (const value of values) {
+		const normalized = optionalPriority(value);
+		if (normalized !== undefined) return normalized;
+	}
+	return undefined;
+}
+
 function credentialFromObject(item: unknown): CodexImportCredential | null {
-	if (!item || typeof item !== "object" || Array.isArray(item)) return null;
-	const record = item as Record<string, unknown>;
-	const refreshToken = normalizeRefreshToken(record.refresh_token ?? record.refreshToken);
-	const accessToken = normalizeAccessToken(record.access_token ?? record.accessToken);
+	if (!isRecord(item)) return null;
+	const record = item;
+	const nestedCredentials = optionalRecord(record.credentials);
+	const extra = optionalRecord(record.extra);
+	const refreshToken = normalizeRefreshToken(
+		record.refresh_token ??
+			record.refreshToken ??
+			nestedCredentials.refresh_token ??
+			nestedCredentials.refreshToken,
+	);
+	const accessToken = normalizeAccessToken(
+		record.access_token ??
+			record.accessToken ??
+			nestedCredentials.access_token ??
+			nestedCredentials.accessToken,
+	);
 	if (!refreshToken && !accessToken) return null;
-	const email = optionalString(record.email);
-	const accountId = optionalString(record.account_id ?? record.accountId);
-	const sub = optionalString(record.sub);
-	const displayName = email ?? optionalString(record.displayName ?? record.display_name);
-	const priority = optionalPriority(record.priority);
-	const expiresAt = normalizeExpiresAt(record.expires_at ?? record.expiresAt);
+	const email = firstOptionalString(record.email, nestedCredentials.email, extra.email);
+	const accountId = firstOptionalString(
+		record.account_id,
+		record.accountId,
+		nestedCredentials.account_id,
+		nestedCredentials.accountId,
+		nestedCredentials.chatgpt_account_id,
+		nestedCredentials.chatgptAccountId,
+	);
+	const sub = firstOptionalString(
+		record.sub,
+		nestedCredentials.sub,
+		nestedCredentials.chatgpt_user_id,
+		nestedCredentials.chatgptUserId,
+	);
+	const displayName =
+		email ??
+		firstOptionalString(
+			record.displayName,
+			record.display_name,
+			record.name,
+			nestedCredentials.displayName,
+			nestedCredentials.display_name,
+		);
+	const priority = firstOptionalPriority(record.priority, nestedCredentials.priority);
+	const expiresAt = normalizeExpiresAt(
+		record.expires_at ??
+			record.expiresAt ??
+			nestedCredentials.expires_at ??
+			nestedCredentials.expiresAt,
+	);
 	return {
 		...(refreshToken ? { refreshToken } : {}),
 		...(accessToken ? { accessToken } : {}),
@@ -209,12 +270,19 @@ function credentialsFromText(text: string): CodexImportCredential[] {
 
 function credentialsFromParsedImport(parsed: unknown): CodexImportCredential[] {
 	if (typeof parsed === "string") return credentialsFromText(parsed);
-	const items = Array.isArray(parsed) ? parsed : [parsed];
-	return items.flatMap((item) => {
-		if (typeof item === "string") return credentialsFromText(item);
-		const credential = credentialFromObject(item);
-		return credential ? [credential] : [];
-	});
+	if (Array.isArray(parsed)) return parsed.flatMap((item) => credentialsFromParsedImport(item));
+	if (!isRecord(parsed)) return [];
+
+	const accounts = parsed.accounts;
+	if (Array.isArray(accounts)) return accounts.flatMap((item) => credentialsFromParsedImport(item));
+
+	const credentials = parsed.credentials;
+	if (Array.isArray(credentials)) {
+		return credentials.flatMap((item) => credentialsFromParsedImport(item));
+	}
+
+	const credential = credentialFromObject(parsed);
+	return credential ? [credential] : [];
 }
 
 function SortableTierChip({ tier, label }: { tier: CodexPlanTier; label: string }) {

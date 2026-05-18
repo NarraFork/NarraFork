@@ -5,6 +5,10 @@ import { z } from "zod";
 import { agentGenerateWithMeta } from "../lib/agent";
 import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
+import {
+	getAllCustomApiCachedQuotas,
+	purgeCustomApiQuotaCache,
+} from "../lib/custom-api-quota-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -502,6 +506,26 @@ function getCustomApiProviderIdsLeavingFamily(
 		.map((provider) => provider.id);
 }
 
+function getCustomApiProviderIdsWithQuotaIdentityChanges(
+	prev: NarraForkSettings["customApiProviders"],
+	next: NarraForkSettings["customApiProviders"],
+): string[] {
+	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
+	return (prev ?? [])
+		.filter((provider) => {
+			const nextProvider = nextById.get(provider.id);
+			if (!nextProvider) return false;
+			return (
+				provider.prefix !== nextProvider.prefix ||
+				provider.baseUrl !== nextProvider.baseUrl ||
+				provider.apiKey !== nextProvider.apiKey ||
+				provider.protocol !== nextProvider.protocol ||
+				provider.codexAccountId !== nextProvider.codexAccountId
+			);
+		})
+		.map((provider) => provider.id);
+}
+
 /**
  * After settings are saved, detect providers that were removed and purge their
  * in-memory + on-disk model caches so no stale data lingers.
@@ -557,6 +581,17 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn(ids);
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
+	}
+	const staleCustomApiQuotaIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsWithQuotaIdentityChanges(
+			prev.customApiProviders,
+			next.customApiProviders,
+		),
+	]);
+	if (staleCustomApiQuotaIds.length) {
+		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
+		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
@@ -638,6 +673,7 @@ settingsRoutes.get("/", (c) => {
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(s.nugProviders ?? []),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
+		customApiQuotas: getAllCustomApiCachedQuotas(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),

@@ -18,6 +18,7 @@ const settingsState: {
 };
 
 let saveSettingsCalls = 0;
+let codexImportedCredentials: unknown[] = [];
 
 const actualSettingsModule = await import("../../../server/lib/settings");
 
@@ -47,7 +48,10 @@ mock.module("../../../server/lib/codex-manager", () => ({
 		}),
 		setLoadBalancingMode: () => {},
 		setTierOrder: () => {},
-		importCredentials: () => ({ added: 0, duplicates: 0, skipped: 0 }),
+		importCredentials: (credentials: unknown[]) => {
+			codexImportedCredentials = credentials;
+			return { added: credentials.length, duplicates: 0, skipped: 0 };
+		},
 	}),
 }));
 
@@ -97,6 +101,7 @@ beforeEach(() => {
 	settingsState.codex.loadBalancingMode = undefined;
 	settingsState.codex.tierOrder = undefined;
 	saveSettingsCalls = 0;
+	codexImportedCredentials = [];
 });
 
 describe("codex routes validation", () => {
@@ -199,5 +204,47 @@ describe("codex routes validation", () => {
 		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
 		expect(settingsState.codex.tierOrder).toBeUndefined();
 		expect(saveSettingsCalls).toBe(0);
+	});
+
+	it("expands sub2api account exports during import", async () => {
+		const res = await app.request("/import", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				importText: JSON.stringify({
+					exported_at: "2026-05-18T14:06:47.807Z",
+					accounts: [
+						{
+							name: "Sub2Api Plus Account",
+							platform: "openai",
+							type: "oauth",
+							credentials: {
+								access_token: "access-token-from-sub2api",
+								chatgpt_account_id: "acc-sub2api",
+								chatgpt_user_id: "user-sub2api",
+								email: "sub2api@example.com",
+								expires_at: "2026-05-28T14:06:40.000Z",
+							},
+							priority: 3,
+						},
+					],
+				}),
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		expect(codexImportedCredentials).toEqual([
+			expect.objectContaining({
+				name: "Sub2Api Plus Account",
+				priority: 3,
+				credentials: expect.objectContaining({
+					access_token: "access-token-from-sub2api",
+					chatgpt_account_id: "acc-sub2api",
+					chatgpt_user_id: "user-sub2api",
+					email: "sub2api@example.com",
+				}),
+			}),
+		]);
 	});
 });

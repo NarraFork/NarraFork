@@ -249,6 +249,16 @@ function findBlacklistedPath(
 	return null;
 }
 
+function getChapterGitPermissionIssues(bashAnalysis?: BashAnalysis): string[] {
+	return [...(bashAnalysis?.gitBranchViolations ?? []), ...(bashAnalysis?.gitBranchWarnings ?? [])];
+}
+
+function resolveChapterGitIssueDecision(effectiveMode: string): "allow" | "deny" | "ask" {
+	if (effectiveMode === "bypassPermissions") return "allow";
+	if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
+	return "ask";
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -270,9 +280,8 @@ export function resolvePermissionDecision(
 		meta,
 		projectGitPath,
 	} = opts;
+	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
-	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchViolations?.length)
-		return "deny";
 
 	const protectedPathReason = resolveProtectedPathDeny(
 		toolName,
@@ -306,10 +315,6 @@ export function resolvePermissionDecision(
 		}
 	}
 
-	if (toolName === SHELL_TOOL_NAME && isChapter && bashAnalysis?.gitBranchWarnings?.length)
-		return "ask";
-
-	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 
@@ -366,6 +371,11 @@ export function resolvePermissionDecision(
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
 		return "deny";
+	}
+
+	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
+	if (toolName === SHELL_TOOL_NAME && chapterGitIssues.length > 0) {
+		return resolveChapterGitIssueDecision(effectiveMode);
 	}
 
 	const whitelistDecision = resolveWhitelistDecision(
@@ -1242,6 +1252,7 @@ function classifyShellDanger(
 		bashAnalysis,
 		commandWhitelist,
 	);
+	const chapterGitIssues = getChapterGitPermissionIssues(bashAnalysis);
 	for (const cmd of bashAnalysis.commands) {
 		const [name, ...args] = cmd.tokens;
 		if (name === "git") {
@@ -1276,6 +1287,20 @@ function classifyShellDanger(
 				[`Command: ${cmd.text}`],
 			);
 		}
+	}
+	if (chapterGitIssues.length > 0) {
+		return danger(
+			"Git command changes chapter branch/worktree state.",
+			[
+				"The command can switch, create, delete, rewrite, or otherwise move branch/worktree state outside the normal chapter workflow.",
+				"NarraFork may lose track of which chapter owns the resulting git state.",
+			],
+			[
+				"Prefer NarraFork chapter/fork/merge operations for branch and worktree changes.",
+				"If this git operation is intentional, confirm the exact target branch or worktree first.",
+			],
+			chapterGitIssues.map((issue) => `Chapter git issue: ${issue}`),
+		);
 	}
 	if (bashAnalysis.hasEnvInjection) {
 		return danger(
@@ -2139,11 +2164,12 @@ export async function handlePermission(
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.
 	let promotedPlanSoftDeny = false;
 	if (decision === "deny") {
+		const hasChapterGitIssues = isChapter && getChapterGitPermissionIssues(bashAnalysis).length > 0;
 		const isPlanModeSoftDeny =
 			isPlanMode &&
 			!isRelaxedPlan &&
 			!permMeta.commandBlacklistReason &&
-			!(isChapter && bashAnalysis?.gitBranchViolations?.length) &&
+			!hasChapterGitIssues &&
 			(permMeta.planModeSoftDeny || !permMeta.blacklistReason);
 		if (isPlanModeSoftDeny && !planModeAskedOnce.has(narratorId)) {
 			planModeAskedOnce.add(narratorId);
@@ -2205,7 +2231,7 @@ export async function handlePermission(
 				);
 			return { behavior: "deny", message: denyMsg };
 		}
-		const branchViolations = bashAnalysis?.gitBranchViolations;
+		const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
@@ -2216,8 +2242,8 @@ export async function handlePermission(
 					!bashAnalysis.dangerousPatterns.length &&
 					!bashAnalysis.hasEnvInjection));
 		const denyMsg =
-			isChapter && branchViolations?.length
-				? `DENIED: Chapter mode restricts git branch operations. Violations: ${branchViolations.join("; ")}. You may only work on the current branch.`
+			chapterGitIssues.length > 0
+				? `DENIED: Chapter mode restricts git branch/worktree operations. Issues: ${chapterGitIssues.join("; ")}. Use NarraFork chapter operations or request explicit permission in an interactive mode.`
 				: isReadToolPathDenied
 					? getToolMessage("permissionDeniedPathOutsideScope", locale)
 					: isPlanMode
@@ -2225,8 +2251,7 @@ export async function handlePermission(
 						: permMode === "readOnly"
 							? getToolMessage("permissionDeniedReadOnly", locale)
 							: getToolMessage("permissionDeniedNonInteractive", locale);
-		const decisionReason =
-			isChapter && branchViolations?.length ? branchViolations.join("; ") : undefined;
+		const decisionReason = chapterGitIssues.length > 0 ? chapterGitIssues.join("; ") : undefined;
 		logger.debug("Permission auto-denied", {
 			narratorId,
 			toolName,
@@ -2292,9 +2317,18 @@ export async function handlePermission(
 		}
 		decisionReason = parts.join("; ");
 	}
-	if (isChapter && bashAnalysis?.gitBranchWarnings?.length) {
-		const warningMsg = `Chapter branch warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`;
-		decisionReason = decisionReason ? `${decisionReason}; ${warningMsg}` : warningMsg;
+	if (isChapter && bashAnalysis) {
+		const chapterGitParts: string[] = [];
+		if (bashAnalysis.gitBranchViolations.length > 0) {
+			chapterGitParts.push(`Chapter git issues: ${bashAnalysis.gitBranchViolations.join("; ")}`);
+		}
+		if (bashAnalysis.gitBranchWarnings.length > 0) {
+			chapterGitParts.push(`Chapter git warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`);
+		}
+		if (chapterGitParts.length > 0) {
+			const chapterGitMsg = chapterGitParts.join("; ");
+			decisionReason = decisionReason ? `${decisionReason}; ${chapterGitMsg}` : chapterGitMsg;
+		}
 	}
 
 	if (toolName === "Agent" && typeof input.workdir === "string" && input.workdir) {

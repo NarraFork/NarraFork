@@ -297,7 +297,8 @@ function initProjectDb(gitPath: string): Database {
 	const conn = new Database(dbPath);
 	conn.run("PRAGMA journal_mode = WAL");
 	conn.run("PRAGMA foreign_keys = OFF");
-	conn.run("PRAGMA busy_timeout = 3000");
+	// Keep waits short: bun:sqlite busy handlers block the JS thread.
+	conn.run("PRAGMA busy_timeout = 250");
 	conn.exec(CREATE_TABLES_SQL);
 	ensureProjectDbSchema(conn);
 	conn.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);

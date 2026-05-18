@@ -321,6 +321,62 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 	});
 
+	test("chapter git branch/worktree issues follow permission modes", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["git", "worktree", "add", "../other", "main"],
+					text: "git worktree add ../other main",
+					fullText: "git worktree add ../other main",
+				},
+			],
+			gitBranchViolations: ["git worktree add (creates worktree for another branch)"],
+		});
+		const base = {
+			toolName: "Bash",
+			input: { command: "git worktree add ../other main" },
+			cwd: CWD,
+			bashAnalysis: analysis,
+			isChapter: true,
+		};
+
+		expect(resolvePermissionDecision({ ...base, permMode: "bypassPermissions" })).toBe("allow");
+		expect(resolvePermissionDecision({ ...base, permMode: "default" })).toBe("ask");
+		expect(resolvePermissionDecision({ ...base, permMode: "acceptEdits" })).toBe("ask");
+		expect(resolvePermissionDecision({ ...base, permMode: "readOnly" })).toBe("deny");
+		expect(resolvePermissionDecision({ ...base, permMode: "dontAsk" })).toBe("deny");
+		expect(
+			resolvePermissionDecision({
+				...base,
+				permMode: "bypassPermissions",
+				commandBlacklist: [{ pattern: "git worktree", enabled: true }],
+			}),
+		).toBe("deny");
+	});
+
+	test("chapter git warnings can be bypass-allowed for danger reflection", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["git", "reset", "--soft", "HEAD~1"],
+					text: "git reset --soft HEAD~1",
+					fullText: "git reset --soft HEAD~1",
+				},
+			],
+			gitBranchWarnings: ["git reset --soft (moves HEAD, keeps working tree and index)"],
+		});
+		const base = {
+			toolName: "Bash",
+			input: { command: "git reset --soft HEAD~1" },
+			cwd: CWD,
+			bashAnalysis: analysis,
+			isChapter: true,
+		};
+
+		expect(resolvePermissionDecision({ ...base, permMode: "bypassPermissions" })).toBe("allow");
+		expect(resolvePermissionDecision({ ...base, permMode: "default" })).toBe("ask");
+	});
+
 	// --- dontAsk mode ---
 
 	test("dontAsk denies everything (except always-allow)", () => {
@@ -894,5 +950,31 @@ describe("classifyDanger", () => {
 		);
 
 		expect(result?.summary).toContain("dangerous execution patterns");
+	});
+
+	test("chapter git issues trigger danger reflection classification", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["git", "worktree", "add", "../other", "main"],
+					text: "git worktree add ../other main",
+					fullText: "git worktree add ../other main",
+				},
+			],
+			gitBranchViolations: ["git worktree add (creates worktree for another branch)"],
+		});
+
+		const result = classifyDanger(
+			"Bash",
+			{ command: "git worktree add ../other main" },
+			CWD,
+			analysis,
+			[],
+			[],
+			true,
+		);
+
+		expect(result?.summary).toContain("branch/worktree state");
+		expect(result?.details?.[0]).toContain("git worktree add");
 	});
 });
