@@ -27,11 +27,13 @@ import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { coerceAskQuestions, generateAskUserQuestionAnswers } from "./ask-user-question-reflection";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
 	type PendingDangerReflection,
+	type PendingPermission,
 	pendingDangerConfirmations,
 	pendingDangerReflections,
 	pendingFeedback,
@@ -986,6 +988,181 @@ function getEffectivePermissionMode(
 	_previousPermissionMode?: string | null,
 ): string {
 	return planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
+}
+
+type QuestionReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
+
+function questionReflectionSuggestions(
+	status: QuestionReflectionStatus,
+	requestId: string,
+	reason?: string,
+) {
+	return [
+		{
+			type: "question_reflection",
+			status,
+			requestId,
+			resolvedAt: status === "running" ? undefined : new Date().toISOString(),
+			...(reason ? { reason } : {}),
+		},
+	];
+}
+
+async function markQuestionReflectionStatus(
+	requestId: string,
+	pending: PendingPermission,
+	status: QuestionReflectionStatus,
+	reason?: string,
+): Promise<void> {
+	const suggestions = questionReflectionSuggestions(status, requestId, reason);
+	await db
+		.update(narratorToolCalls)
+		.set({
+			permissionSuggestions: suggestions,
+			...(reason ? { permissionDecisionReason: reason } : {}),
+		})
+		.where(eq(narratorToolCalls.id, requestId));
+
+	if (status === "running") {
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "question_reflection_started",
+			narratorId: pending.broadcastTargetId,
+			requestId,
+			toolUseId: pending.toolUseId,
+			toolName: pending.toolName,
+			inputJson: pending.input,
+			reason,
+		});
+	} else {
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "question_reflection_resolved",
+			narratorId: pending.broadcastTargetId,
+			requestId,
+			toolUseId: pending.toolUseId,
+			decision:
+				status === "confirmed"
+					? "allow"
+					: status === "aborted" || status === "awaiting_user"
+						? "aborted"
+						: "deny",
+			reason,
+		});
+	}
+}
+
+function getQuestionReflectionTimeoutMs(): number {
+	const value = settings.agent.questionReflectionTimeoutMs;
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(10_000, value) : 300_000;
+}
+
+function shouldScheduleQuestionReflection(effectiveMode: string): boolean {
+	return effectiveMode === "bypassPermissions" && settings.agent.questionReflectionEnabled === true;
+}
+
+function scheduleQuestionReflection(
+	requestId: string,
+	effectiveMode: string,
+): ReturnType<typeof setTimeout> | undefined {
+	if (!shouldScheduleQuestionReflection(effectiveMode)) return undefined;
+	return setTimeout(() => {
+		void reflectPendingAskUserQuestion(requestId, { automatic: true }).catch((err) => {
+			logger.warn("AskUserQuestion automatic reflection failed", {
+				requestId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		});
+	}, getQuestionReflectionTimeoutMs());
+}
+
+async function currentPermissionModeAllowsAutomaticQuestionReflection(
+	pending: PendingPermission,
+): Promise<boolean> {
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, pending.narratorId),
+		columns: {
+			permissionMode: true,
+			relaxedPlan: true,
+			previousPermissionMode: true,
+			traits: true,
+		},
+	});
+	if (!narrator) return false;
+	const effectiveMode = getEffectivePermissionMode(
+		narrator.permissionMode ?? "default",
+		isPlanModeTrait(narrator.traits),
+		!!narrator.relaxedPlan,
+		narrator.previousPermissionMode,
+	);
+	return shouldScheduleQuestionReflection(effectiveMode);
+}
+
+export async function reflectPendingAskUserQuestion(
+	requestId: string,
+	opts: { automatic?: boolean } = {},
+): Promise<{ ok: boolean; answers?: Record<string, string>; reason?: string }> {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending) return { ok: false, reason: "Permission request not found" };
+	if (pending.toolName !== "AskUserQuestion") {
+		return { ok: false, reason: "Permission request is not AskUserQuestion" };
+	}
+	if (pending.signal.aborted) return { ok: false, reason: "Narrator aborted" };
+	if (opts.automatic) {
+		if (!(await currentPermissionModeAllowsAutomaticQuestionReflection(pending))) {
+			return { ok: false, reason: "Question reflection is not enabled for this permission mode" };
+		}
+	}
+
+	if (pending.questionReflectionTimer) {
+		clearTimeout(pending.questionReflectionTimer);
+		pending.questionReflectionTimer = undefined;
+	}
+
+	const questions = coerceAskQuestions(pending.input.questions);
+	if (questions.length === 0) return { ok: false, reason: "No AskUserQuestion questions found" };
+
+	await markQuestionReflectionStatus(
+		requestId,
+		pending,
+		"running",
+		"Question reflection is answering AskUserQuestion",
+	);
+	try {
+		const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
+		const answers = await generateAskUserQuestionAnswers(pending.narratorId, questions, {
+			locale: pending.locale,
+			model: narrator?.model,
+			mode: "reflection",
+		});
+		if (!pendingPermissions.has(requestId)) {
+			await db
+				.update(narratorToolCalls)
+				.set({ permissionSuggestions: null })
+				.where(eq(narratorToolCalls.id, requestId));
+			return { ok: false, answers, reason: "Already resolved" };
+		}
+		await markQuestionReflectionStatus(
+			requestId,
+			pending,
+			"confirmed",
+			"Question reflection answered automatically",
+		);
+		const resolved = await resolvePermission(requestId, "allow", {
+			answers,
+			decidedBy: "reflection",
+		});
+		return { ok: resolved, answers, reason: resolved ? undefined : "Already resolved" };
+	} catch (err) {
+		const reason = err instanceof Error ? err.message : String(err);
+		logger.warn("AskUserQuestion reflection failed", {
+			requestId,
+			narratorId: pending.narratorId,
+			reason,
+		});
+		if (pendingPermissions.has(requestId)) {
+			await markQuestionReflectionStatus(requestId, pending, "awaiting_user", reason);
+		}
+		return { ok: false, reason };
+	}
 }
 
 function danger(
@@ -2008,6 +2185,7 @@ export async function handlePermission(
 					{
 						type: "danger_reflection",
 						status: "running",
+						requestId,
 						danger,
 						fingerprint,
 						startedAt: now,
@@ -2381,7 +2559,12 @@ export async function handlePermission(
 	}
 
 	return new Promise<PermissionResult>((resolve) => {
+		let pendingEntry: PendingPermission | undefined;
 		const cleanup = () => {
+			if (pendingEntry?.questionReflectionTimer) {
+				clearTimeout(pendingEntry.questionReflectionTimer);
+				pendingEntry.questionReflectionTimer = undefined;
+			}
 			signal.removeEventListener("abort", onAbort);
 			pendingPermissions.delete(toolCallId);
 		};
@@ -2417,7 +2600,7 @@ export async function handlePermission(
 
 		signal.addEventListener("abort", onAbort, { once: true });
 
-		pendingPermissions.set(toolCallId, {
+		pendingEntry = {
 			resolve,
 			cleanup,
 			input: effectiveInput,
@@ -2429,7 +2612,11 @@ export async function handlePermission(
 			locale,
 			signal,
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
-		});
+		};
+		pendingPermissions.set(toolCallId, pendingEntry);
+		if (toolName === "AskUserQuestion") {
+			pendingEntry.questionReflectionTimer = scheduleQuestionReflection(toolCallId, effectiveMode);
+		}
 	});
 }
 
@@ -2440,7 +2627,7 @@ export interface ResolvePermissionOpts {
 	compactAfter?: boolean;
 	updatedPlan?: string;
 	userId?: string;
-	decidedBy?: "user" | "auto";
+	decidedBy?: "user" | "auto" | "reflection";
 	exitPlanCancelled?: boolean;
 }
 
@@ -2666,6 +2853,7 @@ function dangerReflectionSuggestions(
 		danger: PendingDangerReflection["danger"];
 		fingerprint: string;
 		startedAt?: number;
+		requestId?: string;
 	},
 	status: "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted",
 	reason?: string,
@@ -2674,6 +2862,7 @@ function dangerReflectionSuggestions(
 		{
 			type: "danger_reflection",
 			status,
+			requestId: pause.requestId,
 			danger: pause.danger,
 			fingerprint: pause.fingerprint,
 			startedAt:
@@ -2707,7 +2896,7 @@ async function markDangerReflectionAborted(
 				...(suggestionSource
 					? {
 							permissionSuggestions: dangerReflectionSuggestions(
-								suggestionSource,
+								{ ...suggestionSource, requestId },
 								"aborted",
 								"Narrator aborted",
 							),
@@ -2745,12 +2934,142 @@ async function markDangerReflectionAborted(
 	}
 }
 
+function getPersistedDangerReflectionSuggestion(
+	suggestions: unknown,
+): { status: string; reason?: string } | null {
+	if (!Array.isArray(suggestions)) return null;
+	for (const suggestion of suggestions) {
+		if (!suggestion || typeof suggestion !== "object" || Array.isArray(suggestion)) continue;
+		const record = suggestion as Record<string, unknown>;
+		if (record.type !== "danger_reflection") continue;
+		return {
+			status: typeof record.status === "string" ? record.status : "running",
+			reason: typeof record.reason === "string" ? record.reason : undefined,
+		};
+	}
+	return null;
+}
+
+function dangerReflectionDecisionFromStatus(status: string): "allow" | "deny" | "aborted" {
+	if (status === "confirmed" || status === "allow") return "allow";
+	if (status === "aborted") return "aborted";
+	return "deny";
+}
+
+function abortPersistedDangerReflectionSuggestions(
+	suggestions: unknown,
+	reason: string,
+	resolvedAt: string,
+	requestId: string,
+): unknown[] | null {
+	if (!Array.isArray(suggestions)) return null;
+	let changed = false;
+	const next = suggestions.map((suggestion) => {
+		if (!suggestion || typeof suggestion !== "object" || Array.isArray(suggestion)) {
+			return suggestion;
+		}
+		const record = suggestion as Record<string, unknown>;
+		if (record.type !== "danger_reflection") return suggestion;
+		const status = typeof record.status === "string" ? record.status : "running";
+		if (status !== "running" && status !== "awaiting_user") return suggestion;
+		changed = true;
+		return {
+			...record,
+			requestId: typeof record.requestId === "string" ? record.requestId : requestId,
+			status: "aborted",
+			reason,
+			resolvedAt,
+		};
+	});
+	return changed ? next : null;
+}
+
+async function abortPersistedDangerReflectionWithoutRuntime(
+	requestId: string,
+	reason?: string,
+): Promise<boolean> {
+	const toolCall = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, requestId),
+		columns: {
+			id: true,
+			narratorId: true,
+			toolUseId: true,
+			status: true,
+			permissionSuggestions: true,
+		},
+	});
+	if (!toolCall) return false;
+
+	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
+	if (!existingReflection) return false;
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, toolCall.narratorId),
+		columns: { parentNarratorId: true },
+	});
+	const broadcastTargetIds = [
+		...new Set(
+			[toolCall.narratorId, narrator?.parentNarratorId].filter((id): id is string => !!id),
+		),
+	];
+	const broadcastResolved = (decision: "allow" | "deny" | "aborted", resolvedReason?: string) => {
+		for (const targetId of broadcastTargetIds) {
+			broadcastToNarrator(targetId, {
+				type: "danger_reflection_resolved",
+				narratorId: targetId,
+				requestId,
+				toolUseId: toolCall.toolUseId,
+				decision,
+				reason: resolvedReason,
+			});
+		}
+	};
+
+	const message =
+		reason?.trim() ||
+		"Danger reflection was interrupted before manual takeover; no live reflection loop remains";
+	const now = new Date().toISOString();
+	const abortedSuggestions = abortPersistedDangerReflectionSuggestions(
+		toolCall.permissionSuggestions,
+		message,
+		now,
+		requestId,
+	);
+
+	if (abortedSuggestions) {
+		await db
+			.update(narratorToolCalls)
+			.set({
+				...(toolCall.status === "pending"
+					? {
+							status: "fail",
+							errorMessage: message,
+							permissionDecidedBy: "aborted",
+							permissionDecidedAt: now,
+						}
+					: {}),
+				permissionDecisionReason: message,
+				permissionSuggestions: abortedSuggestions,
+			})
+			.where(eq(narratorToolCalls.id, requestId));
+		broadcastResolved("aborted", message);
+		return true;
+	}
+
+	// Idempotent no-op: startup recovery may have already marked the persisted
+	// reflection as resolved while an old browser tab still has a running notice.
+	broadcastResolved(
+		dangerReflectionDecisionFromStatus(existingReflection.status),
+		reason?.trim() || existingReflection.reason,
+	);
+	return true;
+}
+
 export async function stopDangerReflectionLoop(
 	requestId: string,
 	reason?: string,
 ): Promise<boolean> {
 	const pause = pendingDangerReflections.get(requestId);
-	if (!pause) return false;
+	if (!pause) return abortPersistedDangerReflectionWithoutRuntime(requestId, reason);
 
 	const message = reason?.trim() || "Danger reflection stopped by user; awaiting user decision";
 	pause.reflectionStoppedByUser = true;

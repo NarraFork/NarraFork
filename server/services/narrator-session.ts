@@ -3877,6 +3877,43 @@ export async function updateNarratorPermissionMode(
  */
 const HOT_RELOAD_GUARD = Symbol.for("narrafork.narrator.initialized");
 
+const REFLECTION_SUGGESTION_TYPES = new Set([
+	"danger_reflection",
+	"plan_reflection",
+	"goal_reflection",
+	"question_reflection",
+]);
+const ACTIVE_REFLECTION_SUGGESTION_STATUSES = new Set(["running", "awaiting_user"]);
+
+function abortActiveReflectionSuggestions(
+	suggestions: unknown,
+	reason: string,
+	resolvedAt: string,
+): unknown[] | undefined {
+	if (!Array.isArray(suggestions)) return undefined;
+	let changed = false;
+	const next = suggestions.map((suggestion) => {
+		if (!suggestion || typeof suggestion !== "object" || Array.isArray(suggestion)) {
+			return suggestion;
+		}
+		const record = suggestion as Record<string, unknown>;
+		const type = typeof record.type === "string" ? record.type : "";
+		if (!REFLECTION_SUGGESTION_TYPES.has(type)) return suggestion;
+
+		const status = typeof record.status === "string" ? record.status : "running";
+		if (!ACTIVE_REFLECTION_SUGGESTION_STATUSES.has(status)) return suggestion;
+
+		changed = true;
+		return {
+			...record,
+			status: "aborted",
+			reason,
+			resolvedAt,
+		};
+	});
+	return changed ? next : undefined;
+}
+
 function logNarratorIntegrityDiagnostics(): void {
 	try {
 		const fullForkEmptyRefs = sqlite
@@ -3998,17 +4035,34 @@ export async function recoverOnStartup(): Promise<void> {
 		where: eq(narratorToolCalls.status, "pending"),
 	});
 	if (stalePermissions.length > 0) {
-		await db
-			.update(narratorToolCalls)
-			.set({
-				status: "fail",
-				errorMessage: "Interrupted by server restart",
-				permissionDecidedBy: "server_restart",
-				permissionDecidedAt: now,
-			})
-			.where(eq(narratorToolCalls.status, "pending"));
+		let staleReflectionCount = 0;
+		const restartMessage = "Interrupted by server restart";
+		for (const toolCall of stalePermissions) {
+			const abortedSuggestions = abortActiveReflectionSuggestions(
+				toolCall.permissionSuggestions,
+				restartMessage,
+				now,
+			);
+			if (abortedSuggestions) staleReflectionCount++;
+			await db
+				.update(narratorToolCalls)
+				.set({
+					status: "fail",
+					errorMessage: restartMessage,
+					permissionDecidedBy: "server_restart",
+					permissionDecidedAt: now,
+					...(abortedSuggestions
+						? {
+								permissionDecisionReason: restartMessage,
+								permissionSuggestions: abortedSuggestions,
+							}
+						: {}),
+				})
+				.where(eq(narratorToolCalls.id, toolCall.id));
+		}
 		logger.info("Stale pending tool calls auto-denied on startup", {
 			count: stalePermissions.length,
+			staleReflectionCount,
 		});
 	}
 

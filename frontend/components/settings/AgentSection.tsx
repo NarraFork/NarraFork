@@ -58,6 +58,10 @@ export interface AgentSectionProps {
 	setDefaultRelaxedPlan: (v: boolean) => void;
 	planReflectionAutoApprove: boolean;
 	setPlanReflectionAutoApprove: (v: boolean) => void;
+	questionReflectionEnabled: boolean;
+	setQuestionReflectionEnabled: (v: boolean) => void;
+	questionReflectionTimeoutMs: number;
+	setQuestionReflectionTimeoutMs: (v: number) => void;
 	dangerReflectionEnabled: boolean;
 	setDangerReflectionEnabled: (v: boolean) => void;
 	dangerSkipReadOnlyConfirmations: boolean;
@@ -278,6 +282,27 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("planReflectionAutoApproveDesc")}
 				checked={props.planReflectionAutoApprove}
 				onChange={(e) => props.setPlanReflectionAutoApprove(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("questionReflectionEnabled")}
+				description={t("questionReflectionEnabledDesc")}
+				checked={props.questionReflectionEnabled}
+				onChange={(e) => props.setQuestionReflectionEnabled(e.currentTarget.checked)}
+			/>
+			<NumberInput
+				label={t("questionReflectionTimeout")}
+				description={t("questionReflectionTimeoutDesc")}
+				value={props.questionReflectionTimeoutMs / 1000}
+				onChange={(v) =>
+					props.setQuestionReflectionTimeoutMs(
+						typeof v === "number" ? Math.round(v * 1000) : 300000,
+					)
+				}
+				min={10}
+				max={3600}
+				step={10}
+				decimalScale={0}
+				suffix="s"
 			/>
 			<Title order={5} mt="sm">
 				{t("safetyGuardSettings")}

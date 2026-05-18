@@ -15,6 +15,8 @@ import { type Subprocess, spawn, spawnSync } from "bun";
 
 const isWindows = process.platform === "win32";
 const isCold = process.argv.includes("--cold");
+const backendArg = process.argv.find((arg) => arg.startsWith("--backend="))?.split("=")[1] ?? "ts";
+const backendMode = backendArg === "go" ? "go" : "ts";
 
 // Step 1: run migrations synchronously
 const migrate = spawn(["bun", "run", "db:migrate"], {
@@ -28,13 +30,21 @@ if (migrateCode !== 0) {
 }
 
 // Step 2: start backend + frontend
-const backendArgs = isCold
-	? ["bun", "server/index.ts"]
-	: ["bun", "run", "--hot", "server/index.ts"];
+const backendArgs =
+	backendMode === "go"
+		? ["bun", "scripts/go-task.ts", "run", "--port=7779", "--host=127.0.0.1"]
+		: isCold
+			? ["bun", "server/index.ts"]
+			: ["bun", "run", "--hot", "server/index.ts"];
+const backendEnv = {
+	...process.env,
+	PORT: "7779",
+	...(backendMode === "go" ? { HOST: "127.0.0.1" } : {}),
+};
 
-const backend = spawn(backendArgs, {
+const backendProc = spawn(backendArgs, {
 	stdio: ["inherit", "inherit", "inherit"],
-	env: { ...process.env, PORT: "7779" },
+	env: backendEnv,
 });
 
 const frontend = spawn(["bunx", "vite", "--config", "frontend/vite.config.ts"], {
@@ -42,7 +52,7 @@ const frontend = spawn(["bunx", "vite", "--config", "frontend/vite.config.ts"], 
 	env: { ...process.env },
 });
 
-const children: Subprocess[] = [backend, frontend];
+const children: Subprocess[] = [backendProc, frontend];
 
 function killAll() {
 	for (const child of children) {
@@ -84,7 +94,7 @@ if (isWindows) {
 
 // Wait for either process to exit, then kill the other
 const results = await Promise.race([
-	backend.exited.then((code) => ({ who: "backend", code })),
+	backendProc.exited.then((code) => ({ who: "backend", code })),
 	frontend.exited.then((code) => ({ who: "frontend", code })),
 ]);
 
@@ -92,5 +102,5 @@ console.log(`\n${results.who} exited with code ${results.code}, shutting down...
 killAll();
 
 // Give remaining processes a moment to clean up
-await Promise.allSettled([backend.exited, frontend.exited]);
+await Promise.allSettled([backendProc.exited, frontend.exited]);
 process.exit(results.code ?? 0);

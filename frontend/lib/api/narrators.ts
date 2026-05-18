@@ -276,6 +276,13 @@ export const narratorsApi = {
 					: (messageOrPayload ?? {}),
 			),
 		}),
+	reflectQuestion: (requestId: string) =>
+		request<{ ok: boolean; answers: Record<string, string> }>(
+			`/narrators/permissions/${requestId}/reflect-question`,
+			{
+				method: "POST",
+			},
+		),
 	stopDangerReflection: (requestId: string) =>
 		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-reflection`, {
 			method: "POST",

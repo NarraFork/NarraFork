@@ -1,5 +1,4 @@
 import {
-	Alert,
 	Badge,
 	Box,
 	Button,
@@ -14,7 +13,6 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
-	IconAlertTriangle,
 	IconArrowBackUp,
 	IconArrowsMinimize,
 	IconChevronDown,
@@ -65,6 +63,7 @@ import {
 	StatusIcon,
 	ToolCallCard,
 } from "./ToolCallCard";
+import { getFilePath } from "./tool-display";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -230,7 +229,6 @@ export interface SubagentCardProps {
 	isSoleInRun?: boolean;
 	permCb?: PermissionCallbacks;
 	editExpandOverride?: boolean | null;
-	onBgAgentRetry?: (toolUseId: string) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
@@ -246,7 +244,6 @@ export const SubagentCard = memo(
 		isSoleInRun,
 		permCb,
 		editExpandOverride,
-		onBgAgentRetry,
 		onViewSubagentSession,
 		blockIndex,
 	}: SubagentCardProps) {
@@ -260,14 +257,10 @@ export const SubagentCard = memo(
 		const agentType = input.subagent_type ?? "agent";
 		const isBuiltinType = ["explore", "plan", "general", "agent"].includes(agentType);
 		const agentBadgeColor = isBuiltinType ? "indigo" : "teal";
-		const isBgWarning = isBackground && !/^explore$/i.test(agentType);
-		const dismissed =
-			(toolCall.toolUseId && permCb?.bgRetryDismissedIds?.has(toolCall.toolUseId)) ?? false;
-		const showBgWarning = isBgWarning && !dismissed && !!onBgAgentRetry;
 		const isTerminal = /^(success|completed|denied|error|fail|cancelled)$/.test(toolCall.status);
 		const isInitializing = toolCall.status === "initializing";
 		const soleAndRunning = !!isSoleInRun && !isTerminal;
-		const [expanded, setExpanded] = useState(showBgWarning || !!isSoleInRun);
+		const [expanded, setExpanded] = useState(!!isSoleInRun);
 		const promptValue = input.prompt ?? (toolCall.toolName === "Send" ? input.message : "");
 		const prompt = typeof promptValue === "string" ? promptValue : String(promptValue ?? "");
 		const promptPreview = capSubagentResult(prompt, MAX_SUBAGENT_PROMPT_INLINE_CHARS);
@@ -340,6 +333,17 @@ export const SubagentCard = memo(
 			}
 			return calls;
 		}, [childMessages]);
+		const writePathSummary = useMemo(() => {
+			const paths: string[] = [];
+			for (const { tc } of childToolCalls) {
+				if (tc.toolName !== "Write") continue;
+				const path = getFilePath(tc.inputJson);
+				if (path && !paths.includes(path)) paths.push(path);
+			}
+			if (paths.length === 0) return "";
+			const shown = paths.slice(0, 2).join(", ");
+			return paths.length > 2 ? `${shown}, +${paths.length - 2}` : shown;
+		}, [childToolCalls]);
 
 		const totalMs = toolCall.durationMs ?? 0;
 
@@ -796,37 +800,12 @@ export const SubagentCard = memo(
 									<Box mx="xs" mb={4}>
 										<InlinePermission
 											permission={selfPerm}
-											narratorId={narratorId}
 											onDecision={permCb?.onPermissionDecision}
 											onQuestionSubmit={permCb?.onQuestionSubmit}
+											onQuestionReflect={permCb?.onQuestionReflect}
 											onQuestionDeny={permCb?.onQuestionDeny}
 										/>
 									</Box>
-								)}
-								{/* Background agent warning */}
-								{showBgWarning && (
-									<Alert
-										icon={<IconAlertTriangle size={16} />}
-										color="orange"
-										variant="light"
-										mx="xs"
-										mb={4}
-										p="xs"
-										styles={{ message: { fontSize: 12 } }}
-									>
-										<Group gap="xs" justify="space-between" wrap="nowrap">
-											<Text size="xs">{t("bgAgentWarning")}</Text>
-											<Button
-												size="compact-xs"
-												variant="light"
-												color="orange"
-												style={{ flexShrink: 0 }}
-												onClick={() => onBgAgentRetry(toolCall.toolUseId ?? "")}
-											>
-												{t("bgAgentRetry")}
-											</Button>
-										</Group>
-									</Alert>
 								)}
 								{/* Prompt — shown first when expanded */}
 								{prompt && (
@@ -866,8 +845,9 @@ export const SubagentCard = memo(
 										<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
 											<Group gap={4}>
 												{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-												<Text size="xs" c="dimmed">
+												<Text size="xs" c="dimmed" truncate title={writePathSummary || undefined}>
 													{childToolCalls.length} tool calls
+													{!showCalls && writePathSummary ? ` · ${writePathSummary}` : ""}
 												</Text>
 											</Group>
 										</UnstyledButton>
@@ -917,7 +897,6 @@ export const SubagentCard = memo(
 																				narratorId={narratorId}
 																				permCb={permCb}
 																				editExpandOverride={editExpandOverride}
-																				onBgAgentRetry={permCb?.onBgAgentRetry}
 																				onViewSubagentSession={onViewSubagentSession}
 																			/>
 																		</div>
@@ -980,6 +959,7 @@ export const SubagentCard = memo(
 																							pendingPermission={mp}
 																							onPermissionDecision={permCb?.onPermissionDecision}
 																							onQuestionSubmit={permCb?.onQuestionSubmit}
+																							onQuestionReflect={permCb?.onQuestionReflect}
 																							onQuestionDeny={permCb?.onQuestionDeny}
 																							editExpandOverride={editExpandOverride}
 																						/>
@@ -1017,6 +997,7 @@ export const SubagentCard = memo(
 																				pendingPermission={mp}
 																				onPermissionDecision={permCb?.onPermissionDecision}
 																				onQuestionSubmit={permCb?.onQuestionSubmit}
+																				onQuestionReflect={permCb?.onQuestionReflect}
 																				onQuestionDeny={permCb?.onQuestionDeny}
 																				editExpandOverride={editExpandOverride}
 																			/>
@@ -1207,6 +1188,5 @@ export const SubagentCard = memo(
 		prev.isSoleInRun === next.isSoleInRun &&
 		prev.editExpandOverride === next.editExpandOverride &&
 		prev.onViewSubagentSession === next.onViewSubagentSession &&
-		prev.permCb?.pendingPermsMap === next.permCb?.pendingPermsMap &&
-		prev.permCb?.bgRetryDismissedIds === next.permCb?.bgRetryDismissedIds,
+		prev.permCb?.pendingPermsMap === next.permCb?.pendingPermsMap,
 );

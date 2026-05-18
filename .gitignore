@@ -17,7 +17,13 @@ analyze2/
 
 *.heapsnapshot
 script/
-scripts/
+scripts/*
+!scripts/build-go-backend.ts
+!scripts/go-backend-shared.ts
+!scripts/go-task.ts
+!scripts/release-go-beta.ts
+!scripts/go-rollback-drill.ts
+.tmp-narrafork-home.*
 .release.local.json
 mitm-dump/
 *-dump.json

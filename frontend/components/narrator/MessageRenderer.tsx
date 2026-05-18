@@ -175,7 +175,6 @@ export function renderToolRun(
 								isSoleInRun={soleSubagent}
 								permCb={permCb}
 								editExpandOverride={editExpandOverride}
-								onBgAgentRetry={permCb?.onBgAgentRetry}
 								onViewSubagentSession={onViewSubagentSession}
 								blockIndex={item.blockIndex}
 							/>
@@ -200,6 +199,7 @@ export function renderToolRun(
 							pendingPermission={matchPermission(item.tc)}
 							onPermissionDecision={permCb.onPermissionDecision}
 							onQuestionSubmit={permCb.onQuestionSubmit}
+							onQuestionReflect={permCb.onQuestionReflect}
 							onQuestionDeny={permCb.onQuestionDeny}
 							forceExpand={expandedToolUseId === item.tc.toolUseId}
 							editExpandOverride={editExpandOverride}
@@ -329,6 +329,7 @@ export function renderTreeMessages(
 					}
 					onPermissionDecision={permCb.onPermissionDecision}
 					onQuestionSubmit={permCb.onQuestionSubmit}
+					onQuestionReflect={permCb.onQuestionReflect}
 					onQuestionDeny={permCb.onQuestionDeny}
 					onCompactBeforeMessage={onCompactBeforeMessage}
 					onDeleteBlock={onDeleteBlock}

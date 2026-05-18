@@ -55,6 +55,10 @@ function SettingsAgentPage() {
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
 				planReflectionAutoApprove={is.planReflectionAutoApprove}
 				setPlanReflectionAutoApprove={is.setPlanReflectionAutoApprove}
+				questionReflectionEnabled={is.questionReflectionEnabled}
+				setQuestionReflectionEnabled={is.setQuestionReflectionEnabled}
+				questionReflectionTimeoutMs={is.questionReflectionTimeoutMs}
+				setQuestionReflectionTimeoutMs={is.setQuestionReflectionTimeoutMs}
 				dangerReflectionEnabled={is.dangerReflectionEnabled}
 				setDangerReflectionEnabled={is.setDangerReflectionEnabled}
 				dangerSkipReadOnlyConfirmations={is.dangerSkipReadOnlyConfirmations}

@@ -76,6 +76,19 @@ interface NarratorWSCallbacks {
 		reason?: string;
 		nextSteps?: string;
 	}) => void;
+	onQuestionReflectionStarted?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		inputJson?: Record<string, unknown>;
+		reason?: string;
+	}) => void;
+	onQuestionReflectionResolved?: (data: {
+		requestId: string;
+		toolUseId: string;
+		decision: "allow" | "deny" | "aborted";
+		reason?: string;
+	}) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -452,6 +465,23 @@ export function useNarratorWS(
 							decision: data.decision as "allow" | "deny" | "aborted",
 							reason: data.reason as string | undefined,
 							nextSteps: data.nextSteps as string | undefined,
+						});
+						break;
+					case "question_reflection_started":
+						callbacksRef.current.onQuestionReflectionStarted?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							reason: data.reason as string | undefined,
+						});
+						break;
+					case "question_reflection_resolved":
+						callbacksRef.current.onQuestionReflectionResolved?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							decision: data.decision as "allow" | "deny" | "aborted",
+							reason: data.reason as string | undefined,
 						});
 						break;
 					case "status_change":

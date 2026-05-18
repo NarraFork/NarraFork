@@ -2,7 +2,6 @@ import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useInterruptNarrator } from "../../hooks/useNarrator";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import {
 	api,
@@ -57,8 +56,6 @@ export interface RetryInfo {
 	/** Timestamp (ms) when the retry delay expires */
 	retryAt: number;
 }
-
-const MAX_BG_RETRY_DISMISSED_IDS = 128;
 
 function isPageVisible(): boolean {
 	return typeof document === "undefined" || document.visibilityState === "visible";
@@ -497,7 +494,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
-	const interruptMutation = useInterruptNarrator();
 	const pageVisible = usePageVisibility();
 
 	// --- Streaming state ---
@@ -809,7 +805,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Tool expand ---
 	const [expandedToolUseId, setExpandedToolUseId] = useState<string | null>(null);
 	const [editExpandOverride, setEditExpandOverride] = useState<boolean | null>(null);
-	const [bgRetryDismissedIds, setBgRetryDismissedIds] = useState<Set<string>>(() => new Set());
 
 	useEffect(() => {
 		if (!expandedToolUseId) return;
@@ -982,9 +977,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		  ) => boolean)
 		| null
 	>(null);
-	const sendBufferMessageRef = useRef<((targetNarratorId: string, text: string) => boolean) | null>(
-		null,
-	);
 	const pendingPermsMapRef = useRef(pendingPermsMap);
 	pendingPermsMapRef.current = pendingPermsMap;
 
@@ -1118,6 +1110,36 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[qc, messagesQueryKey, resolveAndRemovePerm],
 	);
 
+	const handleQuestionReflect = useCallback(
+		async (requestId: string) => {
+			try {
+				const { answers } = await api.reflectQuestion(requestId);
+				const { toolUseId, perm } = resolveAndRemovePerm(requestId);
+				if (toolUseId && perm) {
+					const baseInput =
+						perm.inputJson && typeof perm.inputJson === "object" ? perm.inputJson : {};
+					const mergedInput = { ...baseInput, answers };
+					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+						if (!old?.pages?.length) return old;
+						return mergeFieldsByIndex(
+							old,
+							toolUseId,
+							{ inputJson: mergedInput, status: "running" },
+							toolUseIndexRef.current,
+						);
+					});
+				}
+			} catch {
+				notifications.show({
+					message: t("questionReflectionFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+			}
+		},
+		[qc, messagesQueryKey, resolveAndRemovePerm, t],
+	);
+
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
 			const message = "User skipped the question";
@@ -1136,25 +1158,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[qc, messagesQueryKey, resolveAndRemovePerm],
 	);
 
-	const handleBgAgentRetry = useCallback(
-		(toolUseId: string) => {
-			setBgRetryDismissedIds((prev) => {
-				const next = new Set(prev);
-				next.delete(toolUseId);
-				next.add(toolUseId);
-				while (next.size > MAX_BG_RETRY_DISMISSED_IDS) {
-					const oldest = next.values().next().value;
-					if (oldest === undefined) break;
-					next.delete(oldest);
-				}
-				return next;
-			});
-			sendBufferMessageRef.current?.(narratorId, t("bgAgentRetryPrompt"));
-			interruptMutation.mutate(narratorId);
-		},
-		[narratorId, interruptMutation, t],
-	);
-
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -1162,9 +1165,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pendingPermsMap,
 		onPermissionDecision: handlePermissionDecision,
 		onQuestionSubmit: handleQuestionSubmit,
+		onQuestionReflect: handleQuestionReflect,
 		onQuestionDeny: handleQuestionDeny,
-		onBgAgentRetry: handleBgAgentRetry,
-		bgRetryDismissedIds,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -1172,9 +1174,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pendingPermsMap: new Map(),
 			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
+			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
-			onBgAgentRetry: (...args) => permCbRef.current?.onBgAgentRetry?.(...args),
-			bgRetryDismissedIds: new Set(),
 		}),
 		[],
 	);
@@ -1183,9 +1184,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			...stablePermCb,
 			pendingPermission,
 			pendingPermsMap,
-			bgRetryDismissedIds,
 		}),
-		[stablePermCb, pendingPermission, pendingPermsMap, bgRetryDismissedIds],
+		[stablePermCb, pendingPermission, pendingPermsMap],
 	);
 
 	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
@@ -2272,6 +2272,88 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onQuestionReflectionStarted: ({ requestId, toolUseId, toolName, inputJson, reason }) => {
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					const existing =
+						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
+					if (existing) next.delete(existing.toolUseId ?? toolUseId);
+					next.set(toolUseId, {
+						...(existing ?? {}),
+						id: requestId,
+						toolName,
+						toolUseId,
+						inputJson: existing?.inputJson ?? inputJson ?? {},
+						decisionReason: reason ?? existing?.decisionReason,
+						suggestions: [{ type: "question_reflection", status: "running", requestId, reason }],
+					});
+					return next;
+				});
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Question reflection in progress",
+							permissionSuggestions: [
+								{ type: "question_reflection", status: "running", requestId, reason },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onQuestionReflectionResolved: ({ requestId, toolUseId, decision, reason }) => {
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					if (decision === "allow") {
+						next.delete(toolUseId);
+						for (const [key, perm] of next) {
+							if (perm.id === requestId) next.delete(key);
+						}
+						return next;
+					}
+					const existing =
+						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
+					if (!existing) return prev;
+					if (existing.toolUseId) next.delete(existing.toolUseId);
+					next.set(toolUseId, {
+						...existing,
+						id: requestId,
+						toolUseId,
+						decisionReason: reason ?? existing.decisionReason,
+						suggestions: [
+							{ type: "question_reflection", status: "awaiting_user", requestId, reason },
+						],
+					});
+					return next;
+				});
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					const reflectionStatus =
+						decision === "allow"
+							? "confirmed"
+							: decision === "aborted"
+								? "awaiting_user"
+								: "cancelled";
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: decision === "allow" ? "running" : "pending",
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{ type: "question_reflection", status: reflectionStatus, requestId, reason },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
 				// Clean up streaming state when the narrator is no longer actively working.
@@ -2881,7 +2963,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
-	sendBufferMessageRef.current = sendBufferMessage;
 
 	// --- Sync on page navigation (mount with existing cache) ---
 	// When the user navigates away and back, the global WS stays connected but

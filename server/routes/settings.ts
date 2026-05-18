@@ -214,6 +214,8 @@ const updateSettingsSchema = z
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
+				questionReflectionEnabled: z.boolean(),
+				questionReflectionTimeoutMs: z.number().int().min(10000).max(3600000),
 				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),

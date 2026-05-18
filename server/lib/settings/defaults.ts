@@ -34,6 +34,8 @@ export const DEFAULTS: NarraForkSettings = {
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		planReflectionAutoApprove: false,
+		questionReflectionEnabled: false,
+		questionReflectionTimeoutMs: 300_000,
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
@@ -269,6 +271,15 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.planReflectionAutoApprove": {
 		desc: "启用后，在允许编辑/全部允许模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
 		type: "boolean",
+	},
+	"agent.questionReflectionEnabled": {
+		desc: "启用后，AskUserQuestion 在全部允许模式下等待超时仍未回答时，会自动运行 question reflection 并提交答案。",
+		type: "boolean",
+	},
+	"agent.questionReflectionTimeoutMs": {
+		desc: "AskUserQuestion 自动 question reflection 的等待时间（毫秒）。默认 300000，即 5 分钟。",
+		type: "number",
+		valid: "10000-3600000，默认 300000",
 	},
 	"agent.dangerReflectionEnabled": {
 		desc: "启用后，全部允许模式下的高风险操作会触发危险反思二次检查。关闭后这些二次检查会被跳过，但基础黑名单和灾难性命令保护仍保留。",

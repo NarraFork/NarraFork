@@ -284,6 +284,10 @@ export interface NarraForkSettings {
 		defaultRelaxedPlan: boolean;
 		/** Let ExitPlanMode plan reflection auto-approve plans in edit-capable permission modes. */
 		planReflectionAutoApprove: boolean;
+		/** Let AskUserQuestion auto-answer with reflection after a timeout in bypass-permissions mode. */
+		questionReflectionEnabled: boolean;
+		/** Timeout in milliseconds before AskUserQuestion auto-answer reflection runs. */
+		questionReflectionTimeoutMs: number;
 		/** Enable danger reflection secondary confirmations for high-risk bypass-permissions operations. */
 		dangerReflectionEnabled: boolean;
 		/** Skip danger reflection secondary confirmations for operations that are classified as read-only. */

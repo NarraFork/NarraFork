@@ -271,6 +271,8 @@ interface ToolCallCardProps {
 	) => void;
 	/** Callback when user submits answers to AskUserQuestion */
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
+	/** Callback when user asks reflection to answer AskUserQuestion */
+	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	/** Callback when user skips/denies AskUserQuestion */
 	onQuestionDeny?: (requestId: string) => void;
 	/** Force expand this card from outside (e.g. when navigating to it) */
@@ -1250,10 +1252,23 @@ function getToolCallReflection(
 	toolCall: ToolCallData,
 	pendingPermission?: PendingPermission | null,
 ) {
-	return getPermissionReflectionSuggestion({
+	const reflection = getPermissionReflectionSuggestion({
 		permissionSuggestions: toolCall.permissionSuggestions,
 		suggestions: pendingPermission?.suggestions,
 	});
+	if (
+		reflection &&
+		!pendingPermission &&
+		(reflection.status === "running" || reflection.status === "awaiting_user") &&
+		toolCall.status !== "pending"
+	) {
+		return {
+			...reflection,
+			status: "aborted" as const,
+			reason: toolCall.errorMessage || toolCall.permissionDecisionReason || reflection.reason,
+		};
+	}
+	return reflection;
 }
 
 function ReflectionNotice({
@@ -1274,10 +1289,10 @@ function ReflectionNotice({
 	const running = reflection.status === "running";
 	const isDanger = reflection.kind === "danger_reflection";
 	const isPlan = reflection.kind === "plan_reflection";
-	const isGoal = reflection.kind === "goal_reflection";
+	const isQuestion = reflection.kind === "question_reflection";
 	const summary =
 		reflection.reason || reflection.danger?.summary || toolCall.permissionDecisionReason;
-	const titleKeyPrefix = isDanger ? "danger" : isPlan ? "plan" : "goal";
+	const titleKeyPrefix = isDanger ? "danger" : isPlan ? "plan" : isQuestion ? "question" : "goal";
 	const title = (() => {
 		if (running) return t(`${titleKeyPrefix}ReflectionRunning`);
 		if (reflection.status === "awaiting_user") return t(`${titleKeyPrefix}ReflectionAwaitingUser`);
@@ -1307,7 +1322,7 @@ function ReflectionNotice({
 		setTakingOver(true);
 		try {
 			if (isDanger) await api.stopDangerReflection(reflectionRequestId);
-			else await api.stopPlanReflection(reflectionRequestId);
+			else if (isPlan) await api.stopPlanReflection(reflectionRequestId);
 		} finally {
 			setTakingOver(false);
 		}
@@ -1375,7 +1390,7 @@ function ReflectionNotice({
 							{t("reflectionNextSteps", { nextSteps: reflection.nextSteps })}
 						</Text>
 					)}
-					{running && reflectionRequestId && !isGoal && (
+					{running && reflectionRequestId && (isDanger || isPlan) && (
 						<Group gap="xs" mt="xs">
 							<Button
 								size="xs"
@@ -2123,8 +2138,13 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<TruncatedBadge fullLength={toolCall.inputJson.fullLength} />
 				</>
 			)}
-			{isWrite && writeContent && (
+			{isWrite && (
 				<>
+					{fp && (
+						<Text size="xs" c="dimmed" ff="monospace" mb={4} style={{ wordBreak: "break-all" }}>
+							{fp}
+						</Text>
+					)}
 					<ContentViewer
 						content={writeContent}
 						style={codeStyle}
@@ -3922,13 +3942,7 @@ function AskDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 	return (
 		<Box mt="xs">
-			<AskUserQuestionBanner
-				requestId=""
-				narratorId=""
-				questions={questions}
-				answers={answers}
-				readOnly
-			/>
+			<AskUserQuestionBanner requestId="" questions={questions} answers={answers} readOnly />
 		</Box>
 	);
 }
@@ -4383,14 +4397,13 @@ function canPersistPermissionDraft(feedback: string, editedPlan: string | null):
 
 export function InlinePermission({
 	permission,
-	narratorId,
 	onDecision,
 	onQuestionSubmit,
+	onQuestionReflect,
 	onQuestionDeny,
 	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
-	narratorId?: string;
 	onDecision?: (
 		requestId: string,
 		decision: "allow" | "deny",
@@ -4399,6 +4412,7 @@ export function InlinePermission({
 		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
+	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
 	onPlanPreviewChange?: (requestId: string, previewPlan: string | null) => void;
 }) {
@@ -4479,9 +4493,9 @@ export function InlinePermission({
 			<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
 				<AskUserQuestionBanner
 					requestId={permission.id}
-					narratorId={narratorId ?? ""}
 					questions={askQuestions}
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
+					onReflect={(reqId) => onQuestionReflect?.(reqId)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}
 				/>
 			</Box>
@@ -4751,6 +4765,7 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.pendingPermission !== next.pendingPermission ||
 		prev.onPermissionDecision !== next.onPermissionDecision ||
 		prev.onQuestionSubmit !== next.onQuestionSubmit ||
+		prev.onQuestionReflect !== next.onQuestionReflect ||
 		prev.onQuestionDeny !== next.onQuestionDeny
 	) {
 		return false;
@@ -4766,6 +4781,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	pendingPermission,
 	onPermissionDecision,
 	onQuestionSubmit,
+	onQuestionReflect,
 	onQuestionDeny,
 	forceExpand,
 	editExpandOverride,
@@ -4962,9 +4978,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 		) : pendingPermission ? (
 			<InlinePermission
 				permission={pendingPermission}
-				narratorId={narratorId}
 				onDecision={onPermissionDecision}
 				onQuestionSubmit={onQuestionSubmit}
+				onQuestionReflect={onQuestionReflect}
 				onQuestionDeny={onQuestionDeny}
 				onPlanPreviewChange={handlePlanPreviewChange}
 			/>

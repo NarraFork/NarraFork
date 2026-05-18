@@ -1,0 +1,6 @@
+{
+	"version": "0.4.14",
+	"date": "2026-05-14",
+	"en": "## New Features\n\n- Routed NUG models by channel with channel-aware caching and delegation so provider selection stays accurate across model sources.\n- Surfaced NUG provider metadata in model selectors to make channel and provider choices clearer.\n\n## Bug Fixes\n\n- Fixed the packaged Bash command analyzer so embedded tree-sitter WASM assets load correctly in standalone binaries.\n- Preserved live bash output and compact-summary UI state while narrator messages update.",
+	"zh-CN": "## 新功能\n\n- 按 channel 路由 NUG 模型，并加入感知 channel 的缓存与委托逻辑，使不同模型来源下的 provider 选择更准确。\n- 在模型选择器中展示 NUG provider 元数据，让 channel 和 provider 选择更清晰。\n\n## 修复\n\n- 修复打包后的 Bash 命令分析器，使 standalone 二进制能正确加载内嵌的 tree-sitter WASM 资源。\n- 在叙述者消息更新时保留实时 bash 输出和 compact-summary UI 状态。"
+}

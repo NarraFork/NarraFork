@@ -37,6 +37,8 @@ export interface InstanceSettingsState {
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	planReflectionAutoApprove: boolean;
+	questionReflectionEnabled: boolean;
+	questionReflectionTimeoutMs: number;
 	dangerReflectionEnabled: boolean;
 	dangerSkipReadOnlyConfirmations: boolean;
 	maxTransientRetries: number;
@@ -121,6 +123,8 @@ function makeDefaults(): InstanceSettingsState {
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		planReflectionAutoApprove: false,
+		questionReflectionEnabled: false,
+		questionReflectionTimeoutMs: 300000,
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
@@ -203,6 +207,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
+				questionReflectionEnabled: settings.agent?.questionReflectionEnabled ?? false,
+				questionReflectionTimeoutMs: settings.agent?.questionReflectionTimeoutMs ?? 300000,
 				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
@@ -292,6 +298,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
+					questionReflectionEnabled: state.questionReflectionEnabled,
+					questionReflectionTimeoutMs: state.questionReflectionTimeoutMs,
 					dangerReflectionEnabled: state.dangerReflectionEnabled,
 					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
 					defaultReasoningEffort:

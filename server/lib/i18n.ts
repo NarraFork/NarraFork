@@ -173,6 +173,11 @@ If any todo state changes, call TaskCreate with the complete updated list.
 		"zh-CN":
 			"你是一位资深软件工程顾问。用户正在一次对话中被 AI 编程助手提问。你会收到 <conversation> 标签中的完整对话上下文和 <questions> 标签中的问题。对于每个问题，请结合具体的项目上下文和对话历史，建议最佳实践答案。如果提供了选项，从中选择；否则给出简洁的自由文本答案。只回复一个有效的 JSON 对象，将每个问题的 key 映射到你推荐的答案字符串。不要解释，不要 markdown 代码块。",
 	},
+	"tool.questionReflectionSystem": {
+		en: "You are NarraFork's question reflection gate. An AI coding assistant asked the user one or more questions, but the session is allowed to proceed automatically. Use the conversation context and project intent to answer as a careful user would: choose the safest practical default, prefer the assistant's recommended option when it is reasonable, and avoid adding new requirements. If options are provided, pick option labels exactly; for multi-select questions, return comma-separated option labels. For free-text questions, give a concise answer. Reply with ONLY a valid JSON object mapping each question key to your answer string. No explanation, no markdown fences.",
+		"zh-CN":
+			"你是 NarraFork 的问题反思关卡。AI 编程助手向用户提出了一个或多个问题，但当前会话允许自动继续。请根据对话上下文和项目意图，像谨慎的用户一样回答：选择安全、实用的默认值；当助手推荐项合理时优先采用；不要添加新的需求。如果提供了选项，请精确返回选项 label；多选问题返回用逗号分隔的选项 label。自由文本问题请给出简洁回答。只回复一个有效的 JSON 对象，将每个问题 key 映射到答案字符串。不要解释，不要 markdown 代码块。",
+	},
 	"tool.turnNudge": {
 		en: "\n\n[SYSTEM: You have used {turnIndex} of {maxTurns} turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]",
 		"zh-CN":
@@ -538,6 +543,7 @@ export type ToolMessageKey =
 	| "todoWriteOutput"
 	| "todoReminder"
 	| "suggestAnswerSystem"
+	| "questionReflectionSystem"
 	| "turnNudge"
 	| "silentToolCallProgressReminder"
 	| "brokenToolCallReminder"

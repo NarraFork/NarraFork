@@ -3924,8 +3924,7 @@ export function NarratorPanel({
 		// Build a secondary cache key for render-affecting props outside the page
 		// message references themselves.
 		const permsKey = `${renderPermCb.pendingPermsMap.size}:${[...renderPermCb.pendingPermsMap.keys()].join(",")}`;
-		const bgDismissedKey = `${renderPermCb.bgRetryDismissedIds.size}:${[...renderPermCb.bgRetryDismissedIds].join(",")}`;
-		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}|${bgDismissedKey}`;
+		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}`;
 
 		for (let ri = 0; ri < reversed.length; ri++) {
 			const { page, pageParam } = reversed[ri];

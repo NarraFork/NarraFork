@@ -87,9 +87,8 @@ export interface PermissionCallbacks {
 		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
+	onQuestionReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
-	onBgAgentRetry?: (toolUseId: string) => void;
-	bgRetryDismissedIds: Set<string>;
 }
 
 export interface NarratorPanelSnapshot {

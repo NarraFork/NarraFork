@@ -60,6 +60,44 @@ bun scripts/build-cross-platform.ts --platform=linux
 bun scripts/build-cross-platform.ts --platform=arm64
 ```
 
+## Go beta 后端通道
+
+Go 后端目前作为并行的 beta 通道存在，默认 TS 发行线保持不变。
+
+### 构建 Go 后端
+
+```bash
+bun run build:go
+bun run build:go:linux-x64
+bun run build:go:windows-x64
+```
+
+- 产物输出到 `dist/go-backend/<version>/`
+- 产物文件带有 `backend=go`、`buildChannel=go-beta` 等元数据
+- `build:go` 只负责本地产物生成，不会触碰更新服务器
+
+### 发布 Go beta
+
+```bash
+bun run release:go:beta 0.4.17
+bun run release:go:beta 0.4.17 --skip-build --dry-run
+```
+
+- 发布脚本只向更新服务器上传 **metadata + zstd patch**
+- 不会上传完整二进制文件
+- 默认产品名是 `narrafork-go-backend`，更新渠道是 `beta`
+- patch 基线按平台分别选择最近一个可用的上一版；因此不同平台可以来自不同的历史版本
+
+### 回滚演练
+
+```bash
+bun run rollback:go:drill
+bun run rollback:go:drill --dry-run
+```
+
+- 会在临时 HOME 中按 TS → Go → TS 的顺序启动/停止服务
+- 用于验证同一数据库可以从 Go beta 切回 TS legacy 通道
+
 ## 交叉编译说明
 
 ### 从 Linux x86 构建 macOS 版本

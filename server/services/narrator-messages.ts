@@ -42,7 +42,11 @@ function getReflectionStatus(suggestions: unknown): string | null {
 		if (!suggestion || typeof suggestion !== "object") continue;
 		const record = suggestion as { type?: unknown; status?: unknown };
 		const type = String(record.type ?? "");
-		if (type === "danger_reflection" || type === "plan_reflection") {
+		if (
+			type === "danger_reflection" ||
+			type === "plan_reflection" ||
+			type === "question_reflection"
+		) {
 			return typeof record.status === "string" ? record.status : "running";
 		}
 	}

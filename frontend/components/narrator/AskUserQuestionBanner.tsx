@@ -1,5 +1,21 @@
-import { Alert, Badge, Button, Checkbox, Group, Radio, Stack, Text, Textarea } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
+import {
+	ActionIcon,
+	Alert,
+	Badge,
+	Button,
+	Checkbox,
+	Group,
+	Modal,
+	NumberInput,
+	Radio,
+	Stack,
+	Switch,
+	Text,
+	Textarea,
+	Tooltip,
+} from "@mantine/core";
+import { IconSettings } from "@tabler/icons-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
@@ -100,7 +116,6 @@ export function coerceQuestions(raw: any): Question[] {
 
 interface AskUserQuestionBannerProps {
 	requestId: string;
-	narratorId: string;
 	questions: Question[];
 	/** Pre-filled answers — used for read-only display of completed questions */
 	answers?: Record<string, string>;
@@ -108,18 +123,45 @@ interface AskUserQuestionBannerProps {
 	readOnly?: boolean;
 	onSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onDeny?: (requestId: string) => void;
+	onReflect?: (requestId: string) => Promise<void> | void;
 }
 
 export function AskUserQuestionBanner({
 	requestId,
-	narratorId,
 	questions: rawQuestions,
 	answers: savedAnswers,
 	readOnly,
 	onSubmit,
 	onDeny,
+	onReflect,
 }: AskUserQuestionBannerProps) {
 	const { t } = useTranslation("narrator");
+	const { t: ts } = useTranslation("settings");
+	const { t: tc } = useTranslation("common");
+	const qc = useQueryClient();
+	const [settingsOpen, setSettingsOpen] = useState(false);
+	const { data: settingsData, isLoading: settingsLoading } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+	const updateSettingsMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: (data) => {
+			qc.setQueryData(["settings"], data);
+			qc.invalidateQueries({ queryKey: ["settings"] });
+		},
+	});
+	const questionReflectionEnabled = settingsData?.agent?.questionReflectionEnabled ?? false;
+	const questionReflectionTimeoutMs = settingsData?.agent?.questionReflectionTimeoutMs ?? 300000;
+	const settingsDisabled = settingsLoading || updateSettingsMutation.isPending;
+	const updateQuestionReflectionEnabled = (enabled: boolean) => {
+		updateSettingsMutation.mutate({ agent: { questionReflectionEnabled: enabled } });
+	};
+	const updateQuestionReflectionTimeout = (secondsValue: string | number) => {
+		if (typeof secondsValue !== "number" || !Number.isFinite(secondsValue)) return;
+		const timeoutMs = Math.max(10000, Math.min(3600000, Math.round(secondsValue * 1000)));
+		updateSettingsMutation.mutate({ agent: { questionReflectionTimeoutMs: timeoutMs } });
+	};
 	// Defensive: questions may come from untyped JSON or as a stringified array
 	const questions = coerceQuestions(rawQuestions);
 	const draftKey = `${DRAFT_KEY_PREFIX}${requestId}`;
@@ -136,7 +178,7 @@ export function AskUserQuestionBanner({
 	const [customInputs, setCustomInputs] = useState<Record<string, string>>(
 		() => getStoredDraft()?.customInputs ?? {},
 	);
-	const [suggesting, setSuggesting] = useState(false);
+	const [reflecting, setReflecting] = useState(false);
 
 	// Persist draft to sessionStorage
 	useEffect(() => {
@@ -181,40 +223,14 @@ export function AskUserQuestionBanner({
 		onSubmit?.(requestId, answers);
 	};
 
-	const handleSuggest = async () => {
-		setSuggesting(true);
+	const handleReflect = async () => {
+		if (!onReflect || reflecting) return;
+		setReflecting(true);
 		try {
-			const { answers } = await api.suggestAnswers(narratorId, questions);
-			const newSelections: Record<string, string> = {};
-			const newCustom: Record<string, string> = {};
-			for (const q of questions) {
-				const suggested = answers[q.question];
-				if (!suggested) continue;
-				const optionLabels = q.options.map((o) => o.label);
-				if (q.multiSelect) {
-					// Match comma-separated labels against options
-					const parts = suggested.split(", ").filter((p) => optionLabels.includes(p));
-					if (parts.length) {
-						newSelections[q.question] = parts.join(", ");
-					} else {
-						newCustom[q.question] = suggested;
-					}
-				} else if (optionLabels.includes(suggested)) {
-					newSelections[q.question] = suggested;
-				} else {
-					newCustom[q.question] = suggested;
-				}
-			}
-			setSelections((prev) => ({ ...prev, ...newSelections }));
-			setCustomInputs((prev) => ({ ...prev, ...newCustom }));
-		} catch {
-			notifications.show({
-				message: t("suggestFailed"),
-				color: "red",
-				autoClose: 3000,
-			});
+			await onReflect(requestId);
+			sessionStorage.removeItem(draftKey);
 		} finally {
-			setSuggesting(false);
+			setReflecting(false);
 		}
 	};
 
@@ -238,110 +254,165 @@ export function AskUserQuestionBanner({
 	const alertColor = readOnly ? "gray" : "blue";
 
 	return (
-		<Alert color={alertColor} radius="md">
-			<Stack gap="md">
-				{questions.map((q, questionIndex) => {
-					const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
-					const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
-					const questionKey = `${q.question}-${questionIndex}`;
-					return (
-						<Stack key={questionKey} gap="xs">
-							<Text size="sm" fw={500}>
-								{q.header}
-							</Text>
-							{q.options.length > 0 &&
-								(q.multiSelect ? (
-									<Stack gap={4}>
-										{q.options.map((opt) => (
-											<Checkbox
-												key={opt.label}
-												label={opt.label}
-												description={opt.description}
-												disabled={readOnly || hasCustom}
-												checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
-												onChange={
-													readOnly
-														? undefined
-														: (e) =>
-																handleCheckboxChange(q.question, opt.label, e.currentTarget.checked)
-												}
-											/>
-										))}
-									</Stack>
-								) : (
-									<Radio.Group
-										name={`${requestId}-question-${questionIndex}`}
-										value={
-											readOnly
-												? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
-													? savedAnswers?.[q.question]
-													: ""
-												: hasCustom
-													? ""
-													: (selections[q.question] ?? "")
-										}
-										onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
-									>
+		<>
+			<Alert color={alertColor} radius="md">
+				<Stack gap="md">
+					{questions.map((q, questionIndex) => {
+						const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
+						const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
+						const questionKey = `${q.question}-${questionIndex}`;
+						return (
+							<Stack key={questionKey} gap="xs">
+								<Text size="sm" fw={500}>
+									{q.header}
+								</Text>
+								{q.options.length > 0 &&
+									(q.multiSelect ? (
 										<Stack gap={4}>
 											{q.options.map((opt) => (
-												<Radio
+												<Checkbox
 													key={opt.label}
-													value={opt.label}
 													label={opt.label}
 													description={opt.description}
 													disabled={readOnly || hasCustom}
+													checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
+													onChange={
+														readOnly
+															? undefined
+															: (e) =>
+																	handleCheckboxChange(
+																		q.question,
+																		opt.label,
+																		e.currentTarget.checked,
+																	)
+													}
 												/>
 											))}
 										</Stack>
-									</Radio.Group>
-								))}
-							{readOnly ? (
-								customAnswer && (
-									<Text size="xs" ff="monospace" c="teal">
-										{customAnswer}
-									</Text>
-								)
-							) : (
-								<Textarea
-									size="xs"
-									placeholder={t("typeCustomAnswer")}
-									value={customInputs[q.question] ?? ""}
-									onChange={(e) => handleCustomInput(q.question, e.currentTarget.value)}
-									autosize
-									minRows={1}
-									maxRows={3}
-								/>
-							)}
-							{readOnly && savedAnswers?.[q.question] && (
-								<Badge size="xs" color="teal" variant="light">
-									{t("answered")}
-								</Badge>
-							)}
-						</Stack>
-					);
-				})}
-				{!readOnly && (
-					<Group>
-						<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
-							{t("submitAnswer")}
-						</Button>
-						<Button size="xs" variant="light" loading={suggesting} onClick={handleSuggest}>
-							{suggesting ? t("suggesting") : t("suggestAnswer")}
-						</Button>
-						<Button
-							size="xs"
-							color="red"
-							variant="light"
-							onClick={() => {
-								sessionStorage.removeItem(draftKey);
-								onDeny?.(requestId);
-							}}
-						>
-							{t("skipQuestion")}
+									) : (
+										<Radio.Group
+											name={`${requestId}-question-${questionIndex}`}
+											value={
+												readOnly
+													? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
+														? savedAnswers?.[q.question]
+														: ""
+													: hasCustom
+														? ""
+														: (selections[q.question] ?? "")
+											}
+											onChange={readOnly ? () => {} : (val) => handleRadioChange(q.question, val)}
+										>
+											<Stack gap={4}>
+												{q.options.map((opt) => (
+													<Radio
+														key={opt.label}
+														value={opt.label}
+														label={opt.label}
+														description={opt.description}
+														disabled={readOnly || hasCustom}
+													/>
+												))}
+											</Stack>
+										</Radio.Group>
+									))}
+								{readOnly ? (
+									customAnswer && (
+										<Text size="xs" ff="monospace" c="teal">
+											{customAnswer}
+										</Text>
+									)
+								) : (
+									<Textarea
+										size="xs"
+										placeholder={t("typeCustomAnswer")}
+										value={customInputs[q.question] ?? ""}
+										onChange={(e) => handleCustomInput(q.question, e.currentTarget.value)}
+										autosize
+										minRows={1}
+										maxRows={3}
+									/>
+								)}
+								{readOnly && savedAnswers?.[q.question] && (
+									<Badge size="xs" color="teal" variant="light">
+										{t("answered")}
+									</Badge>
+								)}
+							</Stack>
+						);
+					})}
+					{!readOnly && (
+						<Group>
+							<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>
+								{t("submitAnswer")}
+							</Button>
+							<Group gap={4} wrap="nowrap">
+								<Button size="xs" variant="light" loading={reflecting} onClick={handleReflect}>
+									{reflecting ? t("questionReflecting") : t("questionReflectionAnswer")}
+								</Button>
+								<Tooltip label={t("questionReflectionSettings")}>
+									<ActionIcon
+										size="sm"
+										variant="subtle"
+										aria-label={t("questionReflectionSettings")}
+										onClick={() => setSettingsOpen(true)}
+									>
+										<IconSettings size={14} />
+									</ActionIcon>
+								</Tooltip>
+							</Group>
+							<Button
+								size="xs"
+								color="red"
+								variant="light"
+								onClick={() => {
+									sessionStorage.removeItem(draftKey);
+									onDeny?.(requestId);
+								}}
+							>
+								{t("skipQuestion")}
+							</Button>
+						</Group>
+					)}
+				</Stack>
+			</Alert>
+			<Modal
+				opened={settingsOpen}
+				onClose={() => setSettingsOpen(false)}
+				title={t("questionReflectionSettings")}
+				centered
+				size="md"
+			>
+				<Stack gap="md">
+					<Text size="sm" c="dimmed">
+						{t("questionReflectionSettingsDesc")}
+					</Text>
+					<Switch
+						label={ts("questionReflectionEnabled")}
+						description={ts("questionReflectionEnabledDesc")}
+						checked={questionReflectionEnabled}
+						onChange={(event) => updateQuestionReflectionEnabled(event.currentTarget.checked)}
+						disabled={settingsDisabled}
+					/>
+					<NumberInput
+						label={ts("questionReflectionTimeout")}
+						description={ts("questionReflectionTimeoutDesc")}
+						value={questionReflectionTimeoutMs / 1000}
+						onChange={updateQuestionReflectionTimeout}
+						min={10}
+						max={3600}
+						step={10}
+						decimalScale={0}
+						suffix="s"
+						disabled={settingsDisabled}
+					/>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={() => setSettingsOpen(false)}>
+							{tc("close")}
 						</Button>
 					</Group>
-				)}
-			</Stack>
-		</Alert>
+				</Stack>
+			</Modal>
+		</>
 	);
 }

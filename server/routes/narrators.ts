@@ -37,7 +37,6 @@ import {
 	userPreferences,
 	users,
 } from "../db/schema";
-import { agentGenerateWithHistory } from "../lib/agent";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
@@ -117,6 +116,7 @@ import {
 	updateWhitelistCmdSchema,
 	updateWhitelistDirSchema,
 } from "../lib/validators";
+import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import { chapterFork } from "../services/chapter-fork";
 import type {
 	BashCommandResult,
@@ -138,7 +138,10 @@ import {
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import { type NarratorGoalStatus, narratorGoalService } from "../services/narrator-goal-service";
-import { stopDangerReflectionLoop } from "../services/narrator-permission";
+import {
+	reflectPendingAskUserQuestion,
+	stopDangerReflectionLoop,
+} from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
 	handleBashCommand,
@@ -2273,6 +2276,16 @@ narratorRoutes.post("/permissions/:requestId/deny", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Run AskUserQuestion reflection immediately and submit the generated answers
+narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
+	const requestId = c.req.param("requestId");
+	const result = await reflectPendingAskUserQuestion(requestId);
+	if (!result.ok) {
+		return c.json({ error: result.reason ?? "Question reflection request not found" }, 404);
+	}
+	return c.json({ ok: true, answers: result.answers ?? {} });
+});
+
 // Stop automatic danger reflection but leave the tool permission pending for user decision
 narratorRoutes.post("/permissions/:requestId/stop-reflection", async (c) => {
 	const requestId = c.req.param("requestId");
@@ -2304,56 +2317,11 @@ narratorRoutes.post("/:id/suggest-answers", async (c) => {
 	const parsed = suggestAnswersSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { questions } = parsed.data;
-
-	// Load full conversation context (since last compact)
-	const dbMessages = await narratorService.getMessagesSinceLastCompact(id);
-	const conversationLines: string[] = [];
-	for (const m of dbMessages) {
-		if (m.parentToolUseId) continue; // skip sub-messages
-		const role = m.role === "assistant" ? "Assistant" : m.role === "user" ? "User" : "System";
-		const text = m.contentText ?? "";
-		if (!text.trim()) continue;
-		conversationLines.push(`[${role}]: ${text}`);
-	}
-	const conversationContext = conversationLines.join("\n\n");
-
-	const systemPrompt = getToolMessage("suggestAnswerSystem", locale);
-
-	// Build a concise description of each question for the LLM
-	const questionsText = questions
-		.map((q) => {
-			const opts = q.options.length
-				? `\nOptions: ${q.options.map((o) => `${o.label} — ${o.description}`).join("; ")}`
-				: "\n(free-text, no predefined options)";
-			return `Key: "${q.question}"\nQuestion: ${q.header}${opts}`;
-		})
-		.join("\n\n");
-
-	const userMessage = conversationContext
-		? `<conversation>\n${conversationContext}\n</conversation>\n\n<questions>\n${questionsText}\n</questions>`
-		: questionsText;
-
-	const raw = await agentGenerateWithHistory(
-		systemPrompt,
-		userMessage,
-		narrator.model ?? undefined,
+	const answers = await generateAskUserQuestionAnswers(id, questions, {
 		locale,
-	);
-
-	// Parse JSON from the response (strip markdown fences if present)
-	let answers: Record<string, string> = {};
-	try {
-		const cleaned = raw
-			.replace(/```(?:json)?\s*/g, "")
-			.replace(/```\s*/g, "")
-			.trim();
-		answers = JSON.parse(cleaned);
-	} catch {
-		// If parsing fails, try to use the raw text as a single answer
-		if (questions.length === 1) {
-			answers = { [questions[0].question]: raw.trim() };
-		}
-	}
+		model: narrator.model,
+		mode: "suggest",
+	});
 
 	return c.json({ answers });
 });

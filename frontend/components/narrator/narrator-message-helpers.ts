@@ -3,7 +3,11 @@ import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrat
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
-export type ReflectionKind = "danger_reflection" | "plan_reflection" | "goal_reflection";
+export type ReflectionKind =
+	| "danger_reflection"
+	| "plan_reflection"
+	| "goal_reflection"
+	| "question_reflection";
 export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
 
 export interface ReflectionSuggestion {
@@ -21,6 +25,7 @@ const REFLECTION_KINDS = new Set<ReflectionKind>([
 	"danger_reflection",
 	"plan_reflection",
 	"goal_reflection",
+	"question_reflection",
 ]);
 const ACTIVE_REFLECTION_STATUSES = new Set<ReflectionStatus>(["running", "awaiting_user"]);
 

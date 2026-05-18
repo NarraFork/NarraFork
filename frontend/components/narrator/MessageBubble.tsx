@@ -261,6 +261,7 @@ interface MessageBubbleProps {
 		updatedPlan?: string,
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
+	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
@@ -314,6 +315,7 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.resolvePerm === next.resolvePerm &&
 		prev.onPermissionDecision === next.onPermissionDecision &&
 		prev.onQuestionSubmit === next.onQuestionSubmit &&
+		prev.onQuestionReflect === next.onQuestionReflect &&
 		prev.onQuestionDeny === next.onQuestionDeny &&
 		prev.onCompactBeforeMessage === next.onCompactBeforeMessage &&
 		prev.onDeleteBlock === next.onDeleteBlock &&
@@ -2826,6 +2828,7 @@ export const MessageBubble = memo(function MessageBubble({
 	resolvePerm,
 	onPermissionDecision,
 	onQuestionSubmit,
+	onQuestionReflect,
 	onQuestionDeny,
 	onCompactBeforeMessage,
 	onDeleteBlock,
@@ -3557,6 +3560,7 @@ export const MessageBubble = memo(function MessageBubble({
 								pendingPermission={perm}
 								onPermissionDecision={onPermissionDecision}
 								onQuestionSubmit={onQuestionSubmit}
+								onQuestionReflect={onQuestionReflect}
 								onQuestionDeny={onQuestionDeny}
 								blockIndex={realIndex}
 							/>

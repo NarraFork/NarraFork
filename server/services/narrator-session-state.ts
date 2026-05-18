@@ -118,6 +118,7 @@ export interface PendingPermission {
 	locale: Locale;
 	signal: AbortSignal;
 	planModeSoftDeny?: boolean;
+	questionReflectionTimer?: ReturnType<typeof setTimeout>;
 }
 
 // === BufferCreator interface ===
