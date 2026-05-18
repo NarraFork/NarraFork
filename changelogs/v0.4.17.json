@@ -1,0 +1,6 @@
+{
+	"version": "0.4.17",
+	"date": "2026-05-18",
+	"en": "## New Features\n\n- Added Go beta build, release, and rollback tooling with a dedicated update server for the beta channel.\n- Added AskUserQuestion reflection answers, including automatic timeout-based reflection controls and manual reflection submission.\n\n## Bug Fixes\n\n- Stabilized narrator runtime state across goal completion, quota persistence, Codex import errors, recent-tab updates, and chapter git permission review.\n- Improved AskUserQuestion recovery after restart so pending question reflections resolve cleanly.",
+	"zh-CN": "## 新功能\n\n- 增加 Go beta 的构建、发布和回滚工具，以及独立的 beta 更新服务器。\n- 为 AskUserQuestion 增加 Reflection 回答流程，支持超时自动反思和手动触发。\n\n## 修复\n\n- 稳定了叙述者运行态在目标完成、配额持久化、Codex 导入异常、最近访问标签更新和章节 Git 权限审查中的行为。\n- 改善 AskUserQuestion 在重启后的恢复，避免未完成的问题反思状态卡住。"
+}
