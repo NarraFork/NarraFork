@@ -40,7 +40,11 @@ import {
 import { agentGenerateWithHistory } from "../lib/agent";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
-import { BOOLEAN_OVERRIDE_VALUES, type BooleanOverride } from "../lib/boolean-override";
+import {
+	BOOLEAN_OVERRIDE_VALUES,
+	type BooleanOverride,
+	normalizeBooleanOverride,
+} from "../lib/boolean-override";
 import { screenshot as browserScreenshot } from "../lib/browser/actions";
 import {
 	closeSession as closeBrowserSession,
@@ -189,6 +193,12 @@ import {
 	getNarratorIdsWithPresence,
 	getNarratorPresenceBatch,
 } from "../websocket/narrator-ws";
+
+function parseNewCommand(message: string): { rawCommand: string; initialMessage: string } | null {
+	const match = message.trim().match(/^\/new(?:\s+([\s\S]*))?$/);
+	if (!match) return null;
+	return { rawCommand: message.trim(), initialMessage: match[1]?.trim() ?? "" };
+}
 
 /** Parse message request supporting both JSON and multipart/form-data (with images and text files) */
 export async function parseMessageRequest(
@@ -819,11 +829,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 
 	const { message, images, textFiles, priority } = await parseMessageRequest(c, id);
 	const userId = c.get("user").sub;
+	const queuedNewCommand = parseNewCommand(message);
 
 	// Resolve slash commands
 	let finalMessage = message;
-	let commandText: string | null = null;
-	const cmdResult = await resolveCommand(message, id, userId);
+	let commandText: string | null = queuedNewCommand?.rawCommand ?? null;
+	const cmdResult = queuedNewCommand
+		? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
+		: await resolveCommand(message, id, userId);
 	if (cmdResult.resolved && ("loadTool" in cmdResult || "loadToolNotFound" in cmdResult)) {
 		const locale = await getUserLanguage(userId);
 		const result = await handleLoadToolCommand(
@@ -900,9 +913,46 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		);
 	}
 
+	if (queuedNewCommand && !(narrator.status === "working" || narrator.status === "waiting")) {
+		const currentCwd = narrator.cwd ?? undefined;
+		const newNarrator = await narratorService.create({
+			chapterId: null,
+			model: narrator.model ?? undefined,
+			systemPrompt: narrator.systemPrompt ?? undefined,
+			permissionMode: narrator.permissionMode ?? undefined,
+			reasoningEffort: narrator.reasoningEffort ?? undefined,
+			fastMode: narrator.fastMode ?? undefined,
+			relaxedPlan: narrator.relaxedPlan ?? undefined,
+			planReflectionAutoApproveOverride: normalizeBooleanOverride(
+				narrator.planReflectionAutoApproveOverride,
+			),
+			dangerReflectionOverride: normalizeBooleanOverride(narrator.dangerReflectionOverride),
+			cwd: currentCwd,
+		});
+		const locale = await getUserLanguage(userId);
+		const replyInUserLanguage = await getUserReplyInLanguage(userId);
+		if (queuedNewCommand.initialMessage) {
+			await sendMessage(
+				newNarrator.id,
+				queuedNewCommand.initialMessage,
+				images,
+				locale,
+				replyInUserLanguage,
+				undefined,
+				userId,
+				textFiles,
+			);
+		}
+		return c.json({ newNarrator: publicNarratorResponse(newNarrator) }, 201);
+	}
+
 	// Running narrator: buffer the message for execution after the current turn
 	if (narrator.status === "working" || narrator.status === "waiting") {
 		if (isSubagentVariant(narrator.variant)) {
+			if (queuedNewCommand) {
+				throw new ValidationError("/new cannot be queued from a running subagent");
+			}
+
 			const { pushSubagentBufferedMessage, getSubagentBufferedMessages } = await import(
 				"../services/narrator-subagent"
 			);

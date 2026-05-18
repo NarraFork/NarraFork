@@ -17,6 +17,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMcpServers } from "../../hooks/useMcp";
+import { useMcpExternalToolsCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 export const Route = createFileRoute("/routines/tool-permissions")({
@@ -256,6 +257,7 @@ function ToolPermissionsPage() {
 
 	// MCP servers
 	const { data: mcpServers } = useMcpServers();
+	const mcpExternalToolsCapability = useMcpExternalToolsCapability();
 
 	// Selected tool for detail view
 	const [selectedTool, setSelectedTool] = useState<string | null>(null);
@@ -467,7 +469,12 @@ function ToolPermissionsPage() {
 			</Stack>
 
 			{/* MCP tools */}
-			{mcpServers && mcpServers.length > 0 && (
+			{mcpServers && mcpServers.length > 0 && !mcpExternalToolsCapability.supported && (
+				<Text size="xs" c="orange" mb="xs">
+					{mcpExternalToolsCapability.reason ?? t("tpMcpToolsUnsupported")}
+				</Text>
+			)}
+			{mcpServers && mcpServers.length > 0 && mcpExternalToolsCapability.supported && (
 				<>
 					<Text size="sm" fw={600} mb="xs">
 						{t("tpMcpTools")}

@@ -2,6 +2,7 @@ import { ActionIcon, Box, Group, Text, Tooltip } from "@mantine/core";
 import { IconPlus } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
 	useCreateTerminal,
 	useDeleteTerminal,
@@ -54,6 +55,9 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	const renameTerminal = useRenameTerminal(ctx);
 	const viewState = useTerminalViewState(ctx);
 	const { t } = useTranslation("terminal");
+	const terminalCapability = useTerminalCapability();
+	const terminalSupported = terminalCapability.supported;
+	const terminalUnsupportedReason = terminalCapability.reason ?? t("terminalUnsupported");
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
@@ -102,6 +106,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 	const terminalIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
 
 	const handleCreate = useCallback(() => {
+		if (!terminalSupported) return;
 		const name = `Terminal ${runningTerminals.length + 1}`;
 		createTerminal.mutate(
 			{ name },
@@ -113,7 +118,7 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 				},
 			},
 		);
-	}, [runningTerminals.length, createTerminal, viewState]);
+	}, [terminalSupported, runningTerminals.length, createTerminal, viewState]);
 
 	const handleClose = useCallback(
 		(terminalId: string) => {
@@ -150,10 +155,15 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 		return (
 			<Group justify="center" align="center" h="100%" gap="xs">
 				<Text size="sm" c="dimmed">
-					{t("noTerminals")}
+					{terminalSupported ? t("noTerminals") : terminalUnsupportedReason}
 				</Text>
-				<Tooltip label={t("newTerminal")}>
-					<ActionIcon variant="light" onClick={handleCreate} loading={createTerminal.isPending}>
+				<Tooltip label={terminalSupported ? t("newTerminal") : terminalUnsupportedReason}>
+					<ActionIcon
+						variant="light"
+						onClick={handleCreate}
+						loading={createTerminal.isPending}
+						disabled={!terminalSupported}
+					>
 						<IconPlus size={16} />
 					</ActionIcon>
 				</Tooltip>
@@ -173,6 +183,8 @@ export function TerminalTabs({ chapterId, onSendToChat }: TerminalTabsProps) {
 					onRename={(id, name) => renameTerminal.mutate({ id, name })}
 					onReorder={handleReorder}
 					createPending={createTerminal.isPending}
+					createDisabled={!terminalSupported}
+					createDisabledReason={terminalUnsupportedReason}
 				/>
 				<LayoutSelector value={layout} onChange={handleLayoutChange} />
 			</Group>

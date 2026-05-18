@@ -53,7 +53,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next";
 import { getNarratorMessagesQueryKey } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
-import { usePlatform } from "../../hooks/usePlatform";
+import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
@@ -909,7 +909,7 @@ export function RecentTabList({
 		setCtxMenu(null);
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
-	const platform = usePlatform();
+	const fsRevealCapability = useFsRevealCapability();
 
 	const handleReveal = useCallback(async () => {
 		if (!ctxMenu) return;
@@ -1118,7 +1118,7 @@ export function RecentTabList({
 					isPinned={!!ctxMenu.tab.pinned}
 					onRemove={handleCtxClose}
 					onReveal={handleReveal}
-					canReveal={platform !== "linux" && ctxMenu.tab.type !== "project"}
+					canReveal={fsRevealCapability.supported && ctxMenu.tab.type !== "project"}
 					isFirst={
 						topLevel.findIndex((t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id) === 0
 					}

@@ -5,11 +5,26 @@
  * between narrator-session and narrator-subagent.
  */
 
+const MAX_BACKGROUND_RESULT_CHARS = 12_000;
+
 export interface CompletedBgSubagentNotification {
 	id: string;
 	title: string;
 	status: string;
 	resultPreview: string;
+	/** Capped full result used when waking an idle parent narrator. */
+	result?: string;
+	resultTruncated?: boolean;
+}
+
+function capResult(result: string | undefined): { result: string | undefined; truncated: boolean } {
+	if (!result || result.length <= MAX_BACKGROUND_RESULT_CHARS) {
+		return { result, truncated: false };
+	}
+	return {
+		result: result.slice(0, MAX_BACKGROUND_RESULT_CHARS),
+		truncated: true,
+	};
 }
 
 let _bgCompletionQueue: Map<string, CompletedBgSubagentNotification[]> | undefined;
@@ -24,7 +39,12 @@ export function pushBgCompletionNotification(
 ) {
 	const queue = getBgCompletionQueue();
 	const list = queue.get(parentNarratorId) ?? [];
-	list.push(notification);
+	const capped = capResult(notification.result);
+	list.push({
+		...notification,
+		result: capped.result,
+		resultTruncated: notification.resultTruncated || capped.truncated,
+	});
 	queue.set(parentNarratorId, list);
 }
 
@@ -40,4 +60,24 @@ export function drainCompletedBackgroundSubagents(
 	if (!list || list.length === 0) return [];
 	queue.delete(parentNarratorId);
 	return list;
+}
+
+export function formatBackgroundCompletionNotifications(
+	notifications: CompletedBgSubagentNotification[],
+	options: { includeResult?: boolean } = {},
+): string {
+	const includeResult = options.includeResult === true;
+	const lines = notifications.map((task) => {
+		const header = `[System] Background agent "${task.title}" (ID: ${task.id}) ${task.status}.`;
+		const fullResult = task.result ?? task.resultPreview;
+		const resultText = includeResult
+			? `Result:\n${fullResult || "(empty)"}${
+					task.resultTruncated
+						? `\n[Result truncated to ${MAX_BACKGROUND_RESULT_CHARS} characters. Use Await({ type: "agent", id: "${task.id}" }) to see the stored result.]`
+						: ""
+				}`
+			: `Result preview: ${task.resultPreview || "(empty)"}`;
+		return `${header}\n${resultText}\nUse Await({ type: "agent", id: "${task.id}" }) to see the full result, or Send({ id: "${task.id}", message }) to continue.`;
+	});
+	return lines.join("\n\n");
 }

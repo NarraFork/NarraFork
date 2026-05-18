@@ -22,6 +22,7 @@ import { IconDeviceFloppy, IconPlus, IconQrcode, IconTrash } from "@tabler/icons
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useGatewayCapability } from "../../hooks/usePlatform";
 import { miscApi } from "../../lib/api/misc";
 
 type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin" | "qqbot";
@@ -108,6 +109,9 @@ function normalizeGatewayPermissionMode(value: unknown): string {
 
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
+	const { persistentRuntimes } = useGatewayCapability();
+	const persistentRuntimeDisabledReason = t("gatewayPersistentRuntimesUnsupported");
+	const addablePlatforms = persistentRuntimes ? ALL_PLATFORMS : (["webhook"] as Platform[]);
 	const [config, setConfig] = useState<GatewayConfig>({});
 	const [inited, setInited] = useState(false);
 	const [saving, setSaving] = useState(false);
@@ -209,6 +213,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 
 	const addPlatform = useCallback(
 		(platform: Platform) => {
+			if (!persistentRuntimes && platform !== "webhook") return;
 			const existing = platforms.find((p) => p.platform === platform);
 			if (existing) return;
 			setConfig((prev) => ({
@@ -216,7 +221,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 				platforms: [...(prev.platforms ?? []), { platform, enabled: true }],
 			}));
 		},
-		[platforms],
+		[persistentRuntimes, platforms],
 	);
 
 	const removePlatform = useCallback((index: number) => {
@@ -235,7 +240,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 		});
 	}, []);
 
-	const availablePlatforms = ALL_PLATFORMS.filter(
+	const availablePlatforms = addablePlatforms.filter(
 		(p) => !platforms.some((existing) => existing.platform === p),
 	);
 
@@ -244,6 +249,11 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 			<Text size="sm" c="dimmed">
 				{t("gatewayDesc")}
 			</Text>
+			{!persistentRuntimes && (
+				<Text size="xs" c="orange">
+					{persistentRuntimeDisabledReason}
+				</Text>
+			)}
 
 			<Switch
 				label={t("gatewayEnabled")}
@@ -344,6 +354,11 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 							index={index}
 							onUpdate={updatePlatform}
 							onRemove={removePlatform}
+							disabledReason={
+								!persistentRuntimes && platform.platform !== "webhook"
+									? persistentRuntimeDisabledReason
+									: undefined
+							}
 						/>
 					))}
 				</>
@@ -375,11 +390,13 @@ function PlatformCard({
 	index,
 	onUpdate,
 	onRemove,
+	disabledReason,
 }: {
 	platform: PlatformConfig;
 	index: number;
 	onUpdate: (index: number, patch: Partial<PlatformConfig>) => void;
 	onRemove: (index: number) => void;
+	disabledReason?: string;
 }) {
 	const { t } = useTranslation("settings");
 
@@ -392,6 +409,7 @@ function PlatformCard({
 						<Switch
 							size="xs"
 							checked={platform.enabled}
+							disabled={!!disabledReason}
 							onChange={(e) => onUpdate(index, { enabled: e.currentTarget.checked })}
 							label={t("gatewayPlatformEnabled")}
 						/>
@@ -407,7 +425,13 @@ function PlatformCard({
 					</ActionIcon>
 				</Group>
 
-				{platform.enabled && (
+				{disabledReason && (
+					<Text size="xs" c="orange">
+						{disabledReason}
+					</Text>
+				)}
+
+				{platform.enabled && !disabledReason && (
 					<PlatformFields platform={platform} index={index} onUpdate={onUpdate} />
 				)}
 			</Stack>
@@ -592,6 +616,8 @@ function WeixinFields({
 	saveAllowedUsers: (v: string) => void;
 }) {
 	const { t } = useTranslation("settings");
+	const { weixinQrSupported, weixinQrReason } = useGatewayCapability();
+	const qrDisabledReason = weixinQrReason ?? t("gatewayWeixinQrUnsupported");
 	const [qrStatus, setQrStatus] = useState<QrStatus>("idle");
 	const [qrUrl, setQrUrl] = useState<string | null>(null);
 	const [qrError, setQrError] = useState<string | null>(null);
@@ -612,6 +638,11 @@ function WeixinFields({
 	}, []);
 
 	const startQrLogin = useCallback(async () => {
+		if (!weixinQrSupported) {
+			setQrStatus("error");
+			setQrError(qrDisabledReason);
+			return;
+		}
 		setQrStatus("wait");
 		setQrError(null);
 		setQrUrl(null);
@@ -666,7 +697,7 @@ function WeixinFields({
 			setQrStatus("error");
 			setQrError(err instanceof Error ? err.message : String(err));
 		}
-	}, [index, onUpdate, stopPolling]);
+	}, [index, onUpdate, qrDisabledReason, stopPolling, weixinQrSupported]);
 
 	const statusBadge = () => {
 		switch (qrStatus) {
@@ -712,6 +743,11 @@ function WeixinFields({
 			<Text size="xs" c="dimmed">
 				{t("gatewayWeixinDesc")}
 			</Text>
+			{!weixinQrSupported && (
+				<Text size="xs" c="orange">
+					{qrDisabledReason}
+				</Text>
+			)}
 
 			{/* QR login section */}
 			<Group gap="sm">
@@ -720,7 +756,9 @@ function WeixinFields({
 					variant="light"
 					leftSection={<IconQrcode size={14} />}
 					onClick={startQrLogin}
-					loading={qrStatus === "wait" || qrStatus === "scaned"}
+					loading={weixinQrSupported && (qrStatus === "wait" || qrStatus === "scaned")}
+					disabled={!weixinQrSupported}
+					title={!weixinQrSupported ? qrDisabledReason : undefined}
 				>
 					{t("gatewayWeixinQrStart")}
 				</Button>

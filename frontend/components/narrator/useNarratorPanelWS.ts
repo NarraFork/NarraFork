@@ -9,6 +9,7 @@ import {
 	type BufferMessageSummary,
 	type NarratorGoal,
 	type SideCarRecord,
+	type ToolCallRecord,
 } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
@@ -125,6 +126,94 @@ function insertTopLevelMessageBySeq(messages: NarratorMsg[], newMsg: NarratorMsg
 	return updated;
 }
 
+function sideCarMergeKey(sideCar: SideCarRecord): string {
+	return [
+		sideCar.target,
+		sideCar.source,
+		sideCar.toolUseId ?? "",
+		sideCar.orderIndex ?? "",
+		sideCar.content,
+	].join("\u0000");
+}
+
+function mergeSideCarLists(
+	incoming?: SideCarRecord[] | null,
+	existing?: SideCarRecord[] | null,
+): SideCarRecord[] | undefined {
+	const merged: SideCarRecord[] = [];
+	const seen = new Set<string>();
+	for (const list of [incoming, existing]) {
+		for (const sideCar of list ?? []) {
+			const key = sideCarMergeKey(sideCar);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(sideCar);
+		}
+	}
+	return merged.length > 0 ? merged : undefined;
+}
+
+function collectToolSideCars(message: NarratorMsg): Map<string, SideCarRecord[]> {
+	const result = new Map<string, SideCarRecord[]>();
+	const add = (toolUseId: unknown, sideCars: unknown) => {
+		if (typeof toolUseId !== "string" || !Array.isArray(sideCars) || sideCars.length === 0) {
+			return;
+		}
+		const previous = result.get(toolUseId);
+		result.set(toolUseId, mergeSideCarLists(sideCars as SideCarRecord[], previous) ?? []);
+	};
+	for (const toolCall of message.toolCalls ?? []) {
+		add(toolCall.toolUseId, toolCall.sideCars);
+	}
+	for (const block of message.contentJson ?? []) {
+		if (block.type === "tool_use") {
+			add(block.id, block.sideCars);
+		}
+	}
+	return result;
+}
+
+function preserveLiveSideCars(
+	existing: NarratorMsg | undefined,
+	incoming: NarratorMsg,
+): NarratorMsg {
+	if (!existing) return incoming;
+
+	const sideCars = mergeSideCarLists(incoming.sideCars, existing.sideCars);
+	const existingToolSideCars = collectToolSideCars(existing);
+	let changed = sideCars !== incoming.sideCars;
+
+	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
+		const merged = mergeSideCarLists(
+			toolCall.sideCars,
+			existingToolSideCars.get(toolCall.toolUseId),
+		);
+		if (merged === toolCall.sideCars) return toolCall;
+		changed = true;
+		return { ...toolCall, sideCars: merged } as ToolCallRecord;
+	});
+
+	const toolCallSideCars = new Map<string, SideCarRecord[]>();
+	for (const toolCall of toolCalls) {
+		if (toolCall.toolUseId && toolCall.sideCars?.length) {
+			toolCallSideCars.set(toolCall.toolUseId, toolCall.sideCars);
+		}
+	}
+
+	const contentJson = (incoming.contentJson ?? []).map((block) => {
+		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
+		const merged = mergeSideCarLists(
+			Array.isArray(block.sideCars) ? (block.sideCars as SideCarRecord[]) : undefined,
+			toolCallSideCars.get(block.id),
+		);
+		if (!merged || merged === block.sideCars) return block;
+		changed = true;
+		return { ...block, sideCars: merged };
+	});
+
+	return changed ? { ...incoming, sideCars, toolCalls, contentJson } : incoming;
+}
+
 function appendSideCarsToLatestAssistant(
 	messages: NarratorMsg[],
 	sideCars: SideCarRecord[],
@@ -145,7 +234,7 @@ function appendSideCarsToLatestAssistant(
 			: !msg.parentToolUseId;
 		if (msg.role === "assistant" && matchesParent) {
 			const updated = [...messages];
-			updated[i] = { ...msg, sideCars: [...(msg.sideCars ?? []), ...sideCars] };
+			updated[i] = { ...msg, sideCars: mergeSideCarLists(sideCars, msg.sideCars) };
 			return { messages: updated, changed: true };
 		}
 	}
@@ -176,6 +265,7 @@ export interface UseNarratorPanelWSOptions {
 		updatedBy: string | null;
 		sourceId: string | null;
 	}) => void;
+	onQueuedNewNarratorCreated?: (newNarratorId: string) => void;
 }
 
 export interface UseNarratorPanelWSReturn {
@@ -215,6 +305,7 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	quotaBalance: string | null;
 	// Browser sessions
 	browserSessionCount: number;
 	// Retry
@@ -392,6 +483,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		isSubagent,
 		narratorSubstatus,
 		onDraftChanged,
+		onQueuedNewNarratorCreated,
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -670,6 +762,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	);
 	const [browserSessionCount, setBrowserSessionCount] = useState(0);
 	);
+	const [quotaBalance, setQuotaBalance] = useState<string | null>(null);
+	// Generic gateway balances are transient streaming state; clear them when switching narrators.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	useEffect(() => {
+		setQuotaBalance(null);
+	}, [narratorId]);
 	useEffect(() => {
 		}
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
@@ -1324,7 +1422,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							);
 							if (existingIdx !== -1) {
 								const updated = [...firstPage.messages];
-								updated[existingIdx] = newMsg;
+								updated[existingIdx] = preserveLiveSideCars(updated[existingIdx], newMsg);
 								firstPage.messages = updated;
 								pages[0] = firstPage;
 								return { ...old, pages };
@@ -2182,6 +2280,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBufferConsumed: (_messageId, remaining) => {
 				setQueuedMessages(remaining);
 			},
+			onQueuedNewNarratorCreated: (_messageId, newNarratorId) => {
+				qc.invalidateQueries({ queryKey: ["narrators"] });
+				qc.invalidateQueries({ queryKey: ["narrators", newNarratorId], exact: true });
+				onQueuedNewNarratorCreated?.(newNarratorId);
+			},
 			onBufferCleared: () => {
 				setQueuedMessages([]);
 			},
@@ -2265,8 +2368,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 				applyQueueStatus(position, queueDepth);
 			},
-			onQuotaBalance: (_balance) => {
-				// Generic gateway quota balance — currently a no-op.
+			onQuotaBalance: (balance) => {
+				setQuotaBalance(balance);
 			},
 			onQueueStatus: (position, queueDepth, queueMessage) => {
 				applyQueueStatus(position, queueDepth, queueMessage);
@@ -2914,6 +3017,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
+			quotaBalance,
 			browserSessionCount,
 			retryInfo,
 			currentTodos,
@@ -2952,6 +3056,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
+			quotaBalance,
 			browserSessionCount,
 			retryInfo,
 			currentTodos,

@@ -61,6 +61,13 @@ export function RuntimeSection() {
 		setCleaningTarget(target);
 		try {
 			const res = await api.cleanupRuntime(target);
+			if (res.dryRun) {
+				notifications.show({
+					message: t("runtimeCleanupPreviewOnly"),
+					color: "yellow",
+				});
+				return;
+			}
 			if (res.ok) {
 				if (target === "terminals") {
 					notifications.show({
@@ -82,6 +89,11 @@ export function RuntimeSection() {
 				}
 				// Re-scan after cleanup
 				void handleScan();
+			} else {
+				notifications.show({
+					color: "red",
+					message: res.errors?.[0]?.error ?? t("runtimeCleanupFailed"),
+				});
 			}
 		} catch (err) {
 			console.error("Cleanup failed:", err);

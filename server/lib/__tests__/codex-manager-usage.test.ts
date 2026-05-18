@@ -37,6 +37,12 @@ function createUsageResponse(primaryUsedPercent: number, resetAtSec: number): Re
 	return createUsageResponseWithWeekly(primaryUsedPercent, resetAtSec);
 }
 
+function createJwt(payload: Record<string, unknown>): string {
+	const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+	const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+	return `${header}.${body}.signature`;
+}
+
 function createUsageResponseWithWeekly(
 	primaryUsedPercent: number,
 	primaryResetAtSec: number,
@@ -133,6 +139,53 @@ afterEach(() => {
 });
 
 describe("CodexManager usage quota state", () => {
+	test("支持导入只有 access_token 的凭据并且不会尝试刷新", async () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		const accessToken = createJwt({
+			sub: "user-access-only",
+			email: "access-only@example.com",
+			chatgpt_account_id: "acc-access-only",
+		});
+		let fetchCalled = false;
+		globalThis.fetch = (async () => {
+			fetchCalled = true;
+			return new Response("should not refresh", { status: 500 });
+		}) as unknown as typeof fetch;
+
+		const result = manager.importCredentials([
+			{ refreshToken: "", accessToken, displayName: "Access Only" },
+		]);
+		const ctx = await manager.acquireContext();
+		const entry = manager.snapshot().entries[0];
+
+		expect(result).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		expect(ctx.token).toBe(accessToken);
+		expect(fetchCalled).toBe(false);
+		expect(entry?.accountId).toBe("acc-access-only");
+		expect(entry?.email).toBe("access-only@example.com");
+	});
+
+	test("只有 access_token 且明确过期时跳过该凭据而不是刷新", async () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		const accessToken = createJwt({ sub: "expired-access-only" });
+		let fetchCalled = false;
+		globalThis.fetch = (async () => {
+			fetchCalled = true;
+			return new Response("should not refresh", { status: 500 });
+		}) as unknown as typeof fetch;
+
+		manager.importCredentials([
+			{ accessToken, expiresAt: Date.now() - 60_000, displayName: "Expired Access Only" },
+		]);
+
+		await expect(manager.acquireContext()).rejects.toThrow("All Codex credentials exhausted");
+		expect(fetchCalled).toBe(false);
+	});
+
 	test("查询 usage 剩余为 0% 时直接标记 quota_exhausted", async () => {
 		const { manager, tmpHome } = createManagerWithOneCredential("cred-a");
 		tempHomes.push(tmpHome);

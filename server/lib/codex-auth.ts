@@ -106,14 +106,14 @@ function parseJwtClaims(token: string): IdTokenClaims | undefined {
 	}
 }
 
-function extractIdTokenInfo(tokens: TokenResponse): {
+export function extractCodexTokenInfo(tokens: { idToken?: string; accessToken?: string }): {
 	accountId?: string;
 	email?: string;
 	sub?: string;
 } {
 	const result: { accountId?: string; email?: string; sub?: string } = {};
-	if (tokens.id_token) {
-		const claims = parseJwtClaims(tokens.id_token);
+	if (tokens.idToken) {
+		const claims = parseJwtClaims(tokens.idToken);
 		if (claims) {
 			result.email = claims.email;
 			if (claims.sub) result.sub = claims.sub;
@@ -126,8 +126,8 @@ function extractIdTokenInfo(tokens: TokenResponse): {
 			if (id) result.accountId = id;
 		}
 	}
-	if (!result.accountId && tokens.access_token) {
-		const claims = parseJwtClaims(tokens.access_token);
+	if (!result.accountId && tokens.accessToken) {
+		const claims = parseJwtClaims(tokens.accessToken);
 		if (claims) {
 			result.accountId =
 				claims.chatgpt_account_id ||
@@ -138,6 +138,17 @@ function extractIdTokenInfo(tokens: TokenResponse): {
 		}
 	}
 	return result;
+}
+
+function extractIdTokenInfo(tokens: TokenResponse): {
+	accountId?: string;
+	email?: string;
+	sub?: string;
+} {
+	return extractCodexTokenInfo({
+		idToken: tokens.id_token,
+		accessToken: tokens.access_token,
+	});
 }
 
 // === Token exchange ===

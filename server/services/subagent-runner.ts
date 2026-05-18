@@ -28,7 +28,10 @@ import { backgroundTaskService } from "./background-task-service";
 import { pushBgCompletionNotification } from "./bg-completion-queue";
 import { customSubagentService } from "./custom-subagent-service";
 import { narratorService } from "./narrator-service";
-import { getSubagentResultMessageId } from "./narrator-session";
+import {
+	getSubagentResultMessageId,
+	startBackgroundCompletionContinuationIfPossible,
+} from "./narrator-session";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
@@ -64,6 +67,7 @@ async function finalizeBackgroundCompletion(
 	toolUseId: string,
 	hasError: boolean,
 	finalText: string,
+	locale: Locale = "en",
 ): Promise<void> {
 	const task = await backgroundTaskService.getById(narratorId).catch(() => null);
 	if (task) {
@@ -110,6 +114,7 @@ async function finalizeBackgroundCompletion(
 			title,
 			status: "failed",
 			resultPreview,
+			result: finalText,
 		});
 	} else {
 		eventBus.emit({
@@ -134,8 +139,17 @@ async function finalizeBackgroundCompletion(
 			title,
 			status: "completed",
 			resultPreview,
+			result: finalText,
 		});
 	}
+
+	startBackgroundCompletionContinuationIfPossible(parentNarratorId, locale).catch((err) => {
+		logger.warn("Failed to start parent narrator for background task completion", {
+			parentNarratorId,
+			taskNarratorId: narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
 }
 
 async function isBackgroundTaskCancelled(taskId: string): Promise<boolean> {
@@ -175,7 +189,7 @@ export function broadcastSubagentStarted(
  * Updates narrator status and broadcasts events on completion/failure.
  */
 export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<void> {
-	const { narratorId, parentNarratorId, toolUseId } = opts;
+	const { narratorId, parentNarratorId, toolUseId, locale } = opts;
 
 	// Set a maximum execution timeout
 	const timeoutId = setTimeout(() => {
@@ -208,6 +222,7 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 			toolUseId,
 			hasError,
 			finalText,
+			locale as Locale,
 		);
 	} catch (err) {
 		if (await isBackgroundTaskCancelled(narratorId)) return;
@@ -216,7 +231,14 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 		logger.error("Background task execution failed", { narratorId, error: errorText });
 
 		await finalizeSubagent(narratorId, parentNarratorId, toolUseId, true, errorText);
-		await finalizeBackgroundCompletion(narratorId, parentNarratorId, toolUseId, true, errorText);
+		await finalizeBackgroundCompletion(
+			narratorId,
+			parentNarratorId,
+			toolUseId,
+			true,
+			errorText,
+			locale as Locale,
+		);
 	} finally {
 		clearTimeout(timeoutId);
 		getBackgroundAbortControllers().delete(narratorId);
@@ -584,6 +606,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 							toolUseId,
 							hasError,
 							finalText,
+							locale as Locale,
 						);
 					} catch {
 						// Non-critical

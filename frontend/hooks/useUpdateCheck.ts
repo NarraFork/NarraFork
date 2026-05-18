@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken } from "../lib/api";
+import { useUpdateCapability } from "./usePlatform";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
 
@@ -352,6 +353,11 @@ export function useUpdateCleanup() {
 }
 
 export function useUpdateApply() {
+	const updateCapability = useUpdateCapability();
+	const autoApplyAvailable =
+		updateCapability.selfUpdateAvailable &&
+		!updateCapability.manualOnly &&
+		updateCapability.canAutoRestart;
 	const [isApplying, setIsApplying] = useState(false);
 	const [applyResult, setApplyResult] = useState<{
 		success: boolean;
@@ -361,24 +367,35 @@ export function useUpdateApply() {
 		replacementPid?: number;
 	} | null>(null);
 
-	const apply = useCallback(async (version?: string) => {
-		setIsApplying(true);
-		setApplyResult(null);
-		try {
-			const result = await api.applyUpdate(version);
-			setApplyResult(result);
-			if (!result.success) {
-				setIsApplying(false);
+	const apply = useCallback(
+		async (version?: string) => {
+			if (!autoApplyAvailable) {
+				const result = {
+					success: false,
+					error: "Automatic update apply is not available in this backend/runtime.",
+				};
+				setApplyResult(result);
+				return result;
 			}
-			// If successful, the server will exit — isApplying stays true
-			return result;
-		} catch (err) {
-			const result = { success: false, error: String(err) };
-			setApplyResult(result);
-			setIsApplying(false);
-			return result;
-		}
-	}, []);
+			setIsApplying(true);
+			setApplyResult(null);
+			try {
+				const result = await api.applyUpdate(version);
+				setApplyResult(result);
+				if (!result.success) {
+					setIsApplying(false);
+				}
+				// If successful, the server will exit — isApplying stays true
+				return result;
+			} catch (err) {
+				const result = { success: false, error: String(err) };
+				setApplyResult(result);
+				setIsApplying(false);
+				return result;
+			}
+		},
+		[autoApplyAvailable],
+	);
 
 	return { apply, isApplying, applyResult };
 }

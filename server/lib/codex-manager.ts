@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import {
 	type CodexTokens,
+	extractCodexTokenInfo,
 	pollDeviceCodeFlow,
 	refreshCodexToken,
 	startBrowserOAuth,
@@ -68,7 +69,7 @@ export function normalizeCodexTierOrder(order?: readonly string[] | null): Codex
 export interface CodexCredential {
 	id: string;
 	displayName?: string;
-	refreshToken: string;
+	refreshToken?: string;
 	accessToken?: string;
 	expiresAt?: number;
 	accountId?: string;
@@ -180,6 +181,22 @@ export interface CallContext {
 	token: string;
 }
 
+export interface CodexImportCredentialInput {
+	refreshToken?: string;
+	refresh_token?: string;
+	accessToken?: string;
+	access_token?: string;
+	expiresAt?: number | string;
+	expires_at?: number | string;
+	accountId?: string;
+	account_id?: string;
+	email?: string;
+	sub?: string;
+	displayName?: string;
+	display_name?: string;
+	priority?: number;
+}
+
 interface PendingDeviceFlow {
 	deviceAuthId: string;
 	userCode: string;
@@ -209,6 +226,47 @@ function sha256Hex(input: string): string {
 	return createHash("sha256").update(input).digest("hex");
 }
 
+function normalizeOptionalString(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function getRefreshToken(cred: Pick<CodexCredential, "refreshToken">): string | undefined {
+	return normalizeOptionalString(cred.refreshToken);
+}
+
+function getAccessToken(cred: Pick<CodexCredential, "accessToken">): string | undefined {
+	return normalizeOptionalString(cred.accessToken);
+}
+
+function hasRefreshToken(cred: Pick<CodexCredential, "refreshToken">): boolean {
+	return !!getRefreshToken(cred);
+}
+
+function normalizeExpiresAt(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		// OAuth-style imports sometimes use Unix seconds; internal storage uses milliseconds.
+		return value > 0 && value < 100_000_000_000 ? value * 1000 : value;
+	}
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	const numeric = Number(value);
+	if (Number.isFinite(numeric)) return normalizeExpiresAt(numeric);
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function getCredentialDedupeKeys(
+	cred: Pick<CodexCredential, "refreshToken" | "accessToken" | "accountId" | "email" | "sub">,
+): string[] {
+	const keys: string[] = [];
+	const refreshToken = getRefreshToken(cred);
+	const accessToken = getAccessToken(cred);
+	if (refreshToken) keys.push(`rt:${sha256Hex(refreshToken)}`);
+	if (cred.sub) keys.push(`sub:${cred.sub}`);
+	if (cred.accountId && cred.email) keys.push(`account-email:${cred.accountId}:${cred.email}`);
+	if (accessToken) keys.push(`at:${sha256Hex(accessToken)}`);
+	return keys;
+}
+
 function isExpired(cred: CodexCredential): boolean {
 	return isExpiringWithin(cred, 5) ?? true;
 }
@@ -220,6 +278,43 @@ function isExpiringSoon(cred: CodexCredential): boolean {
 function isExpiringWithin(cred: CodexCredential, minutes: number): boolean | null {
 	if (!cred.expiresAt) return null;
 	return cred.expiresAt <= Date.now() + minutes * 60_000;
+}
+
+function createCredentialFromImport(
+	input: CodexImportCredentialInput,
+	defaultPriority: number,
+): CodexCredential | null {
+	const refreshToken = normalizeOptionalString(input.refreshToken ?? input.refresh_token);
+	const accessToken = normalizeOptionalString(input.accessToken ?? input.access_token);
+	if (!refreshToken && !accessToken) return null;
+
+	const tokenInfo = extractCodexTokenInfo({ accessToken });
+	const accountId =
+		normalizeOptionalString(input.accountId ?? input.account_id) ?? tokenInfo.accountId;
+	const email = normalizeOptionalString(input.email) ?? tokenInfo.email;
+	const sub = normalizeOptionalString(input.sub) ?? tokenInfo.sub;
+	const displayName =
+		normalizeOptionalString(input.displayName ?? input.display_name) ??
+		email ??
+		accountId ??
+		undefined;
+	const expiresAt = normalizeExpiresAt(input.expiresAt ?? input.expires_at);
+
+	return {
+		id: generateShortId(),
+		...(refreshToken ? { refreshToken } : {}),
+		...(accessToken ? { accessToken } : {}),
+		...(expiresAt !== undefined ? { expiresAt } : {}),
+		...(accountId ? { accountId } : {}),
+		...(email ? { email } : {}),
+		...(sub ? { sub } : {}),
+		...(displayName ? { displayName } : {}),
+		priority:
+			typeof input.priority === "number" && Number.isFinite(input.priority)
+				? input.priority
+				: defaultPriority,
+		disabled: false,
+	};
 }
 
 // === CodexManager ===
@@ -386,11 +481,22 @@ export class CodexManager {
 	}
 
 	private async tryEnsureToken(entry: CodexCredential): Promise<CallContext | null> {
+		const accessToken = getAccessToken(entry);
 		const needsRefresh = isExpired(entry) || isExpiringSoon(entry);
 
-		if (!needsRefresh && entry.accessToken) {
+		if (!needsRefresh && accessToken) {
 			this.currentId = entry.id;
-			return { id: entry.id, credential: entry, token: entry.accessToken };
+			return { id: entry.id, credential: entry, token: accessToken };
+		}
+
+		if (!hasRefreshToken(entry)) {
+			// Access-token-only imports cannot refresh. Use the token when expiry is unknown;
+			// skip it only when we explicitly know it is already expired/near expiry.
+			if (accessToken && !entry.expiresAt) {
+				this.currentId = entry.id;
+				return { id: entry.id, credential: entry, token: accessToken };
+			}
+			return null;
 		}
 
 		try {
@@ -417,10 +523,17 @@ export class CodexManager {
 		const existing = this.refreshPromises.get(id);
 		if (existing) return existing;
 
+		const refreshToken = getRefreshToken(cred);
+		if (!refreshToken) {
+			throw new Error(
+				"Credential has no refresh token; access-token-only credentials cannot refresh",
+			);
+		}
+
 		const promise = (async () => {
 			const { settings } = await import("./settings");
 			const proxy = settings.codex?.proxy;
-			const tokens = await refreshCodexToken(cred.refreshToken, proxy);
+			const tokens = await refreshCodexToken(refreshToken, proxy);
 			return {
 				...cred,
 				accessToken: tokens.accessToken,
@@ -1207,18 +1320,28 @@ export class CodexManager {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 
-		// Ensure we have a valid access token
-		if (!entry.accessToken || isExpired(entry)) {
-			const refreshed = await this.deduplicatedRefresh(id, entry);
-			Object.assign(entry, {
-				accessToken: refreshed.accessToken,
-				refreshToken: refreshed.refreshToken,
-				expiresAt: refreshed.expiresAt,
-				accountId: refreshed.accountId,
-				email: refreshed.email,
-				sub: refreshed.sub,
-			});
-			this.saveCredentials();
+		// Ensure we have a valid access token. Access-token-only imports never refresh;
+		// if expiry is unknown, try the token and let the usage/API call decide validity.
+		const accessToken = getAccessToken(entry);
+		if (!accessToken || isExpired(entry)) {
+			if (!hasRefreshToken(entry)) {
+				if (!accessToken || entry.expiresAt) {
+					throw new Error(
+						"Access token is expired or unavailable and no refresh token is available",
+					);
+				}
+			} else {
+				const refreshed = await this.deduplicatedRefresh(id, entry);
+				Object.assign(entry, {
+					accessToken: refreshed.accessToken,
+					refreshToken: refreshed.refreshToken,
+					expiresAt: refreshed.expiresAt,
+					accountId: refreshed.accountId,
+					email: refreshed.email,
+					sub: refreshed.sub,
+				});
+				this.saveCredentials();
+			}
 		}
 
 		if (!entry.accountId) {
@@ -1277,27 +1400,11 @@ export class CodexManager {
 	// ==================== Credential Management ====================
 
 	private addCredentialFromTokens(tokens: CodexTokens): CodexCredential {
-		// Check for duplicates: refreshToken hash > sub > (accountId + email)
-		const refreshTokenHash = sha256Hex(tokens.refreshToken);
-		const existing = this.entries.find((e) => {
-			// Most precise: same refresh token
-			if (sha256Hex(e.refreshToken) === refreshTokenHash) return true;
-			// JWT subject is unique per user
-			if (e.sub && tokens.sub && e.sub === tokens.sub) return true;
-			// accountId alone is unreliable (org-level IDs can collide);
-			// require both accountId AND email to match.
-			if (
-				e.accountId &&
-				tokens.accountId &&
-				e.accountId === tokens.accountId &&
-				e.email &&
-				tokens.email &&
-				e.email === tokens.email
-			) {
-				return true;
-			}
-			return false;
-		});
+		// Check for duplicates: refreshToken hash > sub > (accountId + email) > accessToken hash
+		const tokenKeys = new Set(getCredentialDedupeKeys(tokens));
+		const existing = this.entries.find((e) =>
+			getCredentialDedupeKeys(e).some((key) => tokenKeys.has(key)),
+		);
 
 		if (existing) {
 			// Update existing credential
@@ -1349,48 +1456,45 @@ export class CodexManager {
 		return cred;
 	}
 
-	importCredentials(
-		creds: Array<{
-			refreshToken: string;
-			displayName?: string;
-			priority?: number;
-		}>,
-	): { added: number; duplicates: number; skipped: number } {
-		const existingHashes = new Set(this.entries.map((e) => sha256Hex(e.refreshToken)));
+	importCredentials(creds: CodexImportCredentialInput[]): {
+		added: number;
+		duplicates: number;
+		skipped: number;
+	} {
+		const existingKeys = new Set(this.entries.flatMap((e) => getCredentialDedupeKeys(e)));
+		const addedIds: string[] = [];
 		let added = 0;
 		let duplicates = 0;
 		let skipped = 0;
 
 		for (const c of creds) {
-			if (!c.refreshToken || typeof c.refreshToken !== "string") {
+			const cred = createCredentialFromImport(c, this.entries.length);
+			if (!cred) {
 				skipped++;
 				continue;
 			}
-			const hash = sha256Hex(c.refreshToken);
-			if (existingHashes.has(hash)) {
+
+			const keys = getCredentialDedupeKeys(cred);
+			if (keys.length === 0) {
+				skipped++;
+				continue;
+			}
+			if (keys.some((key) => existingKeys.has(key))) {
 				duplicates++;
 				continue;
 			}
-			existingHashes.add(hash);
-
-			const cred: CodexCredential = {
-				id: generateShortId(),
-				refreshToken: c.refreshToken,
-				displayName: c.displayName,
-				priority: c.priority ?? this.entries.length,
-				disabled: false,
-			};
+			for (const key of keys) existingKeys.add(key);
 
 			this.entries.push(cred);
 			this.stats.set(cred.id, { successCount: 0, failureCount: 0 });
+			addedIds.push(cred.id);
 			added++;
 		}
 
 		if (added > 0) {
 			this.saveCredentials();
-			// Enqueue usage fetch for newly added credentials via serial queue
-			const newIds = this.entries.filter((e) => !e.usage).map((e) => e.id);
-			codexUsageQueue.enqueueMany(newIds);
+			// Enqueue usage fetch for newly added credentials via serial queue.
+			codexUsageQueue.enqueueMany(addedIds);
 			this.rescheduleUsageRefresh();
 			this.schedulePublicQuotaOverviewBroadcast();
 		}
@@ -1411,16 +1515,31 @@ export class CodexManager {
 
 			const seen = new Set<string>();
 			for (const c of raw) {
-				if (!c.refreshToken) continue;
-				const hash = sha256Hex(c.refreshToken);
-				if (seen.has(hash)) continue;
-				seen.add(hash);
+				if (!c || typeof c !== "object") continue;
+				const credential = c as CodexCredential;
+				credential.refreshToken = getRefreshToken(credential);
+				credential.accessToken = getAccessToken(credential);
 
-				if (!c.id) c.id = generateShortId();
-				if (c.priority === undefined) c.priority = this.entries.length;
-				if (c.disabled === undefined) c.disabled = false;
+				if (!credential.refreshToken && !credential.accessToken) continue;
+				if (
+					credential.accessToken &&
+					(!credential.accountId || !credential.sub || !credential.email)
+				) {
+					const info = extractCodexTokenInfo({ accessToken: credential.accessToken });
+					credential.accountId ??= info.accountId;
+					credential.email ??= info.email;
+					credential.sub ??= info.sub;
+				}
 
-				this.entries.push(c as CodexCredential);
+				const keys = getCredentialDedupeKeys(credential);
+				if (keys.length === 0 || keys.some((key) => seen.has(key))) continue;
+				for (const key of keys) seen.add(key);
+
+				if (!credential.id) credential.id = generateShortId();
+				if (credential.priority === undefined) credential.priority = this.entries.length;
+				if (credential.disabled === undefined) credential.disabled = false;
+
+				this.entries.push(credential);
 			}
 
 			if (this.entries.length > 0) {
@@ -1524,7 +1643,7 @@ export function __setCodexManagerForTests(instance?: CodexManager): void {
 export function migrateLegacyCodexOAuth(
 	providers: Array<{
 		codexOAuth?: {
-			refreshToken: string;
+			refreshToken?: string;
 			accessToken?: string;
 			expiresAt?: number;
 			accountId?: string;
@@ -1533,10 +1652,13 @@ export function migrateLegacyCodexOAuth(
 ): void {
 	const manager = getCodexManager();
 	for (const p of providers) {
-		if (p.codexOAuth?.refreshToken) {
+		if (p.codexOAuth?.refreshToken || p.codexOAuth?.accessToken) {
 			manager.importCredentials([
 				{
 					refreshToken: p.codexOAuth.refreshToken,
+					accessToken: p.codexOAuth.accessToken,
+					expiresAt: p.codexOAuth.expiresAt,
+					accountId: p.codexOAuth.accountId,
 				},
 			]);
 		}

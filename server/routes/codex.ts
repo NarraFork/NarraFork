@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import {
+	type CodexImportCredentialInput,
 	getCodexManager,
 	type LoadBalancingMode,
 	normalizeCodexTierOrder,
@@ -19,6 +20,15 @@ export const codexRoutes = new Hono();
 
 function isCodexLoadBalancingMode(mode: unknown): mode is LoadBalancingMode {
 	return mode === "priority" || mode === "balanced" || mode === "tier-balanced";
+}
+
+function hasCodexImportToken(credential: CodexImportCredentialInput): boolean {
+	const refreshToken = credential.refreshToken ?? credential.refresh_token;
+	const accessToken = credential.accessToken ?? credential.access_token;
+	return (
+		(typeof refreshToken === "string" && !!refreshToken.trim()) ||
+		(typeof accessToken === "string" && !!accessToken.trim())
+	);
 }
 
 /**
@@ -399,28 +409,25 @@ codexRoutes.post("/use-websocket", async (c) => {
 
 /**
  * POST /api/codex/import
- * Import credentials from refresh tokens.
+ * Import credentials from refresh tokens or access tokens.
  */
 codexRoutes.post("/import", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as {
-		credentials?: Array<{
-			refreshToken: string;
-			displayName?: string;
-			priority?: number;
-		}>;
+		credentials?: CodexImportCredentialInput[];
 	};
 
 	if (!body.credentials?.length) {
 		return c.json({ error: "No credentials provided" }, 400);
 	}
 
-	// Validate that at least one credential has a refreshToken
-	const validCredentials = body.credentials.filter(
-		(c) => c.refreshToken && typeof c.refreshToken === "string",
-	);
+	// Validate that at least one credential has a refresh token or access token.
+	const validCredentials = body.credentials.filter(hasCodexImportToken);
 	if (validCredentials.length === 0) {
 		return c.json(
-			{ error: "No valid credentials: each credential must have a non-empty refreshToken" },
+			{
+				error:
+					"No valid credentials: each credential must have a non-empty refreshToken or accessToken",
+			},
 			400,
 		);
 	}

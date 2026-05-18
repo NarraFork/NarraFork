@@ -1,3 +1,4 @@
+import { useTerminalCapability } from "@frontend/hooks/usePlatform";
 import { useTerminalWS } from "@frontend/hooks/useTerminalWS";
 import { api } from "@frontend/lib/api";
 import { Box, Loader, Text } from "@mantine/core";
@@ -29,6 +30,10 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 	const doneRef = useRef(false);
 	const writingRef = useRef(false);
 	const doneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const terminalCapability = useTerminalCapability();
+	const terminalSupported = terminalCapability.supported;
+	const terminalUnsupportedReason =
+		terminalCapability.reason ?? "Terminal runtime is not available in this backend/runtime.";
 	const onDoneRef = useRef(onDone);
 	onDoneRef.current = onDone;
 
@@ -42,6 +47,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 
 	// Create terminal on mount
 	useEffect(() => {
+		if (!terminalSupported) return;
 		let cancelled = false;
 		api
 			.createTerminal({ name: "dep-install" })
@@ -56,7 +62,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [terminalSupported]);
 
 	// WebSocket subscription
 	const { write } = useTerminalWS(terminalId, {
@@ -157,6 +163,16 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 			}
 		};
 	}, [terminalId]);
+
+	if (!terminalSupported) {
+		return (
+			<Box py="xl" style={{ textAlign: "center" }}>
+				<Text size="xs" c="dimmed">
+					{terminalUnsupportedReason}
+				</Text>
+			</Box>
+		);
+	}
 
 	if (!terminalId) {
 		return (

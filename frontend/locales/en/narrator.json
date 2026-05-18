@@ -333,6 +333,7 @@
 	"contextUsageTokens": "{{tokens}} tokens",
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"estimated": "estimated",
+	"quotaBalance": "API balance: {{balance}}",
 	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data",
 	"truncatedLoading": "Loading full data ({{size}})…",
 	"truncatedError": "Failed to load full data — click to retry",

@@ -10,6 +10,7 @@ const TEST_TOOL_NAME = "TestAbortDrainTool";
 let providerScenario:
 	| "abort"
 	| "truncated_after_tool"
+	| "split_streaming_escape"
 	| "codex_rebuild_after_text"
 	| "codex_rebuild_after_tool" = "abort";
 let providerAttempts = 0;
@@ -27,6 +28,23 @@ const testProvider: ProviderAdapter = {
 				previousCredentialId: "cred-a",
 				operation: "chat",
 			});
+		}
+		if (providerScenario === "split_streaming_escape") {
+			yield {
+				toolUseChunk: {
+					toolUseId: "tu_split_escape",
+					name: "Write",
+					input: '{"file_path":"split.txt","content":"line1\\',
+				},
+			};
+			await new Promise((resolve) => setTimeout(resolve, 60));
+			yield {
+				toolUseChunk: {
+					toolUseId: "tu_split_escape",
+					input: "nline2",
+				},
+			};
+			return;
 		}
 		yield {
 			toolUses: [
@@ -152,6 +170,24 @@ describe("agentLoop abort result draining", () => {
 			toolResult?.sideCars?.some((sideCar) => sideCar.content.includes("<relaxed_plan_reminder>")),
 		).toBe(true);
 		expect(toolResult?.output).not.toContain("<relaxed_plan_reminder>");
+	});
+
+	test("流式工具参数跨 chunk 的换行转义会被正确还原", async () => {
+		providerScenario = "split_streaming_escape";
+		providerAttempts = 0;
+		const ac = new AbortController();
+		let streamedText = "";
+
+		for await (const event of agentLoop(makeConfig(ac.signal), "write a multiline file", [])) {
+			if (event.type === "tool_use_chunk" && event.streamingField?.delta) {
+				streamedText += event.streamingField.delta;
+				if (streamedText.includes("line2")) break;
+			}
+		}
+
+		expect(providerAttempts).toBe(1);
+		expect(streamedText).toBe("line1\nline2");
+		expect(streamedText).not.toContain("\\n");
 	});
 
 	test("工具执行已启动后遇到 retryable 截断流时不重试并保留结果", async () => {

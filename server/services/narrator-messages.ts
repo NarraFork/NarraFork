@@ -159,6 +159,84 @@ function collectToolUseIds(messages: any[]): string[] {
 	return ids;
 }
 
+function sideCarDedupeKey(sideCar: Record<string, unknown>): string {
+	if (typeof sideCar.id === "string" && sideCar.id) return sideCar.id;
+	return [
+		sideCar.target,
+		sideCar.source,
+		sideCar.toolUseId ?? "",
+		sideCar.orderIndex ?? "",
+		sideCar.content,
+	].join("\u0000");
+}
+
+function mergeSideCars(existing: unknown, additional: unknown[]): unknown[] {
+	const merged: unknown[] = [];
+	const seen = new Set<string>();
+	for (const sideCar of [...(Array.isArray(existing) ? existing : []), ...additional]) {
+		if (!sideCar || typeof sideCar !== "object") continue;
+		const key = sideCarDedupeKey(sideCar as Record<string, unknown>);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		merged.push(sideCar);
+	}
+	return merged;
+}
+
+/**
+ * Relation loading only returns sidecars linked through message_id. Some historical
+ * tool-result sidecars were persisted with only tool_use_id, so hydrate them onto
+ * their owning message before truncateToolIO/enrichToolUseBlocks attach them to
+ * tool call records and content blocks.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+async function hydrateToolUseSideCars(messages: any[]): Promise<void> {
+	if (messages.length === 0) return;
+	const narratorIds = new Set<string>();
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const toolUseToMessages = new Map<string, Set<any>>();
+	for (const msg of messages) {
+		if (typeof msg.narratorId === "string") narratorIds.add(msg.narratorId);
+		const register = (toolUseId: unknown) => {
+			if (typeof toolUseId !== "string" || !toolUseId) return;
+			let owners = toolUseToMessages.get(toolUseId);
+			if (!owners) {
+				owners = new Set();
+				toolUseToMessages.set(toolUseId, owners);
+			}
+			owners.add(msg);
+		};
+		for (const tc of msg.toolCalls ?? []) {
+			register(tc.toolUseId);
+		}
+		for (const block of Array.isArray(msg.contentJson) ? msg.contentJson : []) {
+			if (block?.type === "tool_use") register(block.id);
+		}
+	}
+
+	const narratorIdList = [...narratorIds];
+	const toolUseIds = [...toolUseToMessages.keys()];
+	if (narratorIdList.length === 0 || toolUseIds.length === 0) return;
+
+	const sideCars = await db.query.narratorSidecars.findMany({
+		where: and(
+			inArray(narratorSidecars.narratorId, narratorIdList),
+			inArray(narratorSidecars.toolUseId, toolUseIds),
+			eq(narratorSidecars.target, "tool_result"),
+		),
+		orderBy: (s, { asc }) => [asc(s.orderIndex), asc(s.createdAt)],
+	});
+
+	for (const sideCar of sideCars) {
+		if (!sideCar.toolUseId) continue;
+		const owners = toolUseToMessages.get(sideCar.toolUseId);
+		if (!owners) continue;
+		for (const msg of owners) {
+			msg.sideCars = mergeSideCars(msg.sideCars, [sideCar]);
+		}
+	}
+}
+
 function isCatchUpCursor(value: string | CatchUpCursor): value is CatchUpCursor {
 	return typeof value === "object" && value !== null;
 }
@@ -576,13 +654,15 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 
 export const narratorMessageQueries = {
 	async getMessages(narratorId: string, limit = 100, offset = 0) {
-		return db.query.narratorMessages.findMany({
+		const messages = await db.query.narratorMessages.findMany({
 			where: eq(narratorMessages.narratorId, narratorId),
 			with: { toolCalls: true, sideCars: true },
 			orderBy: (m, { asc }) => [asc(m.createdAt)],
 			limit,
 			offset,
 		});
+		await hydrateToolUseSideCars(messages);
+		return messages;
 	},
 
 	async getLatestCompactSeq(narratorId: string): Promise<number | null> {
@@ -633,6 +713,7 @@ export const narratorMessageQueries = {
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		await hydrateToolUseSideCars(messages);
 		return messages;
 	},
 
@@ -684,6 +765,7 @@ export const narratorMessageQueries = {
 
 		const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		await hydrateToolUseSideCars(messages);
 		return messages;
 	},
 
@@ -874,6 +956,7 @@ export const narratorMessageQueries = {
 				: [];
 
 		await attachSubagentModels(childMessages);
+		await hydrateToolUseSideCars([...topMessages, ...childMessages]);
 
 		const tree = enrichToolUseBlocks(
 			filterExitPlanBeforePlanCompact(
@@ -1104,6 +1187,7 @@ export const narratorMessageQueries = {
 		}
 
 		await attachSubagentModels(childMsgs);
+		await hydrateToolUseSideCars([...topMsgs, ...childMsgs]);
 
 		const tree = enrichToolUseBlocks(
 			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
@@ -1268,6 +1352,7 @@ export const narratorMessageQueries = {
 				: [];
 
 		await attachSubagentModels(childMessages);
+		await hydrateToolUseSideCars([...topMessages, ...childMessages]);
 
 		const tree = enrichToolUseBlocks(
 			filterExitPlanBeforePlanCompact(

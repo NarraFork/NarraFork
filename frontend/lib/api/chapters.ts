@@ -265,11 +265,16 @@ export const chaptersApi = {
 			allReady: boolean;
 		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>
-		request<{ installed: boolean; version?: string; platform: string; supported: boolean }>(
-			"/chapters/podman/status",
-		),
+		request<{
+			installed: boolean;
+			version?: string;
+			platform: string;
+			supported: boolean;
+			fallback?: boolean;
+			reason?: string;
+		}>("/chapters/podman/status"),
 	installPodman: () =>
-		request<{ ok: boolean; installed?: boolean; version?: string; error?: string }>(
+		request<{ ok: boolean; installed?: boolean; version?: string; code?: string; error?: string }>(
 			"/chapters/podman/install",
 			{ method: "POST" },
 		),

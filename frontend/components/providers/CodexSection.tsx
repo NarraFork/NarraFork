@@ -71,7 +71,12 @@ interface CodexSectionProps {
 }
 
 interface CodexImportCredential {
-	refreshToken: string;
+	refreshToken?: string;
+	accessToken?: string;
+	expiresAt?: number;
+	accountId?: string;
+	email?: string;
+	sub?: string;
 	displayName?: string;
 	priority?: number;
 }
@@ -116,6 +121,23 @@ function normalizeRefreshToken(value: unknown): string | null {
 	return REFRESH_TOKEN_PATTERN.test(token) ? token : null;
 }
 
+function normalizeAccessToken(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const token = value.trim();
+	return token ? token : null;
+}
+
+function normalizeExpiresAt(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value > 0 && value < 100_000_000_000 ? value * 1000 : value;
+	}
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	const numeric = Number(value);
+	if (Number.isFinite(numeric)) return normalizeExpiresAt(numeric);
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function optionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
@@ -128,24 +150,60 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 	if (!item || typeof item !== "object" || Array.isArray(item)) return null;
 	const record = item as Record<string, unknown>;
 	const refreshToken = normalizeRefreshToken(record.refresh_token ?? record.refreshToken);
-	if (!refreshToken) return null;
-	const displayName = optionalString(record.email) ?? optionalString(record.displayName);
+	const accessToken = normalizeAccessToken(record.access_token ?? record.accessToken);
+	if (!refreshToken && !accessToken) return null;
+	const email = optionalString(record.email);
+	const accountId = optionalString(record.account_id ?? record.accountId);
+	const sub = optionalString(record.sub);
+	const displayName = email ?? optionalString(record.displayName ?? record.display_name);
 	const priority = optionalPriority(record.priority);
+	const expiresAt = normalizeExpiresAt(record.expires_at ?? record.expiresAt);
 	return {
-		refreshToken,
+		...(refreshToken ? { refreshToken } : {}),
+		...(accessToken ? { accessToken } : {}),
+		...(expiresAt !== undefined ? { expiresAt } : {}),
+		...(accountId ? { accountId } : {}),
+		...(email ? { email } : {}),
+		...(sub ? { sub } : {}),
 		...(displayName ? { displayName } : {}),
 		...(priority !== undefined ? { priority } : {}),
 	};
 }
 
+function credentialsFromAtMarkerRecord(record: string, email?: string): CodexImportCredential[] {
+	const parts = record.split("----").map((part) => part.trim());
+	return parts.flatMap((part, index) => {
+		if (part.toLowerCase() !== "at") return [];
+		const accessToken = normalizeAccessToken(parts[index + 1]);
+		return accessToken
+			? [
+					{
+						accessToken,
+						...(email ? { email, displayName: email } : {}),
+					},
+				]
+			: [];
+	});
+}
+
 function credentialsFromText(text: string): CodexImportCredential[] {
 	const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 	return text.split(/[,\n]+/).flatMap((record) => {
-		const displayName = optionalString(record.match(emailRegex)?.[0]);
-		return [...record.matchAll(REFRESH_TOKEN_SEARCH_PATTERN)].flatMap((match) => {
-			const refreshToken = normalizeRefreshToken(match[0]);
-			return refreshToken ? [{ refreshToken, ...(displayName ? { displayName } : {}) }] : [];
-		});
+		const email = optionalString(record.match(emailRegex)?.[0]);
+		const refreshCredentials = [...record.matchAll(REFRESH_TOKEN_SEARCH_PATTERN)].flatMap(
+			(match) => {
+				const refreshToken = normalizeRefreshToken(match[0]);
+				return refreshToken
+					? [
+							{
+								refreshToken,
+								...(email ? { email, displayName: email } : {}),
+							},
+						]
+					: [];
+			},
+		);
+		return [...refreshCredentials, ...credentialsFromAtMarkerRecord(record, email)];
 	});
 }
 
@@ -390,14 +448,7 @@ export const CodexSection = React.memo(function CodexSection({
 		},
 	});
 	const importMut = useMutation({
-		mutationFn: (
-			credentials: Array<{
-				refreshToken: string;
-				displayName?: string;
-				priority?: number;
-				proxy?: string;
-			}>,
-		) => api.codexImportCredentials(credentials),
+		mutationFn: (credentials: CodexImportCredential[]) => api.codexImportCredentials(credentials),
 		onSuccess: (data) => {
 			const message = t("codexImportSuccess", {
 				added: data.added,

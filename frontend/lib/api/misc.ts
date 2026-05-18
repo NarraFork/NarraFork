@@ -451,8 +451,18 @@ export const miscApi = {
 		}),
 	codexImportCredentials: (
 		credentials: Array<{
-			refreshToken: string;
+			refreshToken?: string;
+			refresh_token?: string;
+			accessToken?: string;
+			access_token?: string;
+			expiresAt?: number | string;
+			expires_at?: number | string;
+			accountId?: string;
+			account_id?: string;
+			email?: string;
+			sub?: string;
 			displayName?: string;
+			display_name?: string;
 			priority?: number;
 		}>,
 	) =>
@@ -626,6 +636,122 @@ export const miscApi = {
 			commit: string;
 			platform: "windows" | "macos" | "linux";
 			gitAvailable: boolean;
+			capabilities?: {
+				database?: {
+					mainSchemaOwner?: string;
+					goMainMigrations?: boolean;
+					goEnsureColumns?: boolean;
+					ftsRepair?: boolean;
+					mode?: string;
+					reason?: string;
+				};
+				chapters?: {
+					split?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+				};
+				narrator?: {
+					browserSessions?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+					rollbackEditRegenerate?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+				};
+				mcp?: {
+					serverSettingsStorage?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						storage?: string;
+					};
+					externalToolsInjection?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+				};
+				benchmark?: {
+					containerExecution?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+				};
+				content?: {
+					projectRoutines?: {
+						supported?: boolean;
+						fallback?: boolean;
+						reason?: string;
+						storage?: string;
+					};
+					projectSkills?: {
+						supported?: boolean;
+						fallback?: boolean;
+						reason?: string;
+						storage?: string;
+					};
+				};
+				fs?: {
+					reveal?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+				};
+				providers?: Partial<
+					Record<
+						{
+							auth?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+							models?: { supported?: boolean; refreshSupported?: boolean; reason?: string };
+							quota?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+							agentMode?: {
+								supported?: boolean;
+								fallback?: boolean;
+								code?: string;
+								reason?: string;
+							};
+						}
+					>
+				>;
+				terminal?: {
+					supported?: boolean;
+					reason?: string;
+				};
+				vnet?: {
+					supported?: boolean;
+					reason?: string;
+				};
+				update?: {
+					selfUpdateAvailable?: boolean;
+					manualOnly?: boolean;
+					canAutoRestart?: boolean;
+				};
+				gateway?: {
+					persistentRuntimes?: boolean;
+					mode?: string;
+					reason?: string;
+					webhook?: { supported?: boolean; fallback?: boolean };
+					weixinQr?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+				};
+				storage?: {
+					vacuum?: { supported?: boolean; reason?: string };
+					cleanup?: Partial<
+						Record<
+							"uploads" | "shares" | "worktrees" | "containers",
+							{ supported?: boolean; fallback?: boolean; reason?: string }
+						>
+					>;
+				};
+			};
 		}>("/health"),
 
 	// Dependencies
@@ -646,6 +772,7 @@ export const miscApi = {
 	installDependency: (name: string) =>
 		request<{
 			ok: boolean;
+			code?: string;
 			error?: string;
 			dependency?: { name: string; installed: boolean; version?: string };
 		}>(`/dependencies/${name}/install`, { method: "POST" }),
@@ -811,6 +938,10 @@ export const miscApi = {
 			freedBytes?: number;
 			success?: boolean;
 			output?: string;
+			supported?: boolean;
+			fallback?: boolean;
+			code?: string;
+			reason?: string;
 		}>("/storage/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
 	previewDatabaseCleanup: (data: {
 		target: DatabaseCleanupTarget;
@@ -837,11 +968,16 @@ export const miscApi = {
 	cleanupRuntime: (target: "terminals" | "containers" | "browsers") =>
 		request<{
 			ok: boolean;
+			dryRun?: boolean;
 			killed?: number;
 			stopped?: number;
 			closedSessions?: number;
 			browserClosed?: boolean;
-		}>("/runtime/cleanup", { method: "POST", body: JSON.stringify({ target }) }),
+			supported?: Record<string, boolean>;
+			fallback?: Record<string, boolean>;
+			errorCount?: number;
+			errors?: { target: string; id?: string; error: string }[];
+		}>("/runtime/cleanup", { method: "POST", body: JSON.stringify({ target, execute: true }) }),
 
 	// Gateway — WeChat QR login
 	gatewayWeixinQrStart: () =>

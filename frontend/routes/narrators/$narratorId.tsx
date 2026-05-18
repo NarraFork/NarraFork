@@ -38,6 +38,7 @@ const NarratorDetailsPanel = lazy(() =>
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
+import { useTerminalCapability } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
@@ -183,6 +184,8 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const runningCount = (existingTerminals ?? []).filter((t: any) => t.status === "running").length;
 	const createTerminal = useCreateNarratorTerminal(narratorId);
+	const terminalCapability = useTerminalCapability();
+	const terminalSupported = terminalCapability.supported;
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
@@ -267,11 +270,11 @@ function NarratorDetailPage() {
 
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {
-		if (!hasRunningTerminal) {
+		if (terminalSupported && !hasRunningTerminal) {
 			createTerminal.mutate({ name: "Terminal 1" });
 		}
 		openDrawer();
-	}, [hasRunningTerminal, createTerminal, openDrawer]);
+	}, [terminalSupported, hasRunningTerminal, createTerminal, openDrawer]);
 	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
@@ -295,7 +298,7 @@ function NarratorDetailPage() {
 		const willOpen = !terminalOpen;
 		setTerminalOpen(willOpen);
 		localStorage.setItem(terminalStorageKey(narratorId), String(willOpen));
-		if (willOpen && !hasRunningTerminal) {
+		if (willOpen && terminalSupported && !hasRunningTerminal) {
 			createTerminal.mutate({ name: "Terminal 1" });
 		}
 		// Close utility panels when opening terminal
@@ -303,7 +306,7 @@ function NarratorDetailPage() {
 			setFileModOpen(false);
 			setDetailsOpen(false);
 		}
-	}, [narratorId, terminalOpen, hasRunningTerminal, createTerminal]);
+	}, [narratorId, terminalOpen, terminalSupported, hasRunningTerminal, createTerminal]);
 
 	const { t: tc } = useTranslation("chapters");
 	const { t: tCommon } = useTranslation("common");

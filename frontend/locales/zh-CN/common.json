@@ -242,6 +242,7 @@
 	"updateApplyInstructions": "运行以下命令使用新版：",
 	"updatePreparedDescription": "新版二进制已经放置好。你可以在方便时手动停止当前服务，然后运行这个新版二进制。",
 	"updateCachedDescription": "新版二进制已保存到更新缓存。开发模式下不会自动放置或重启。",
+	"updateManualOnlyNotice": "当前后端/运行时不支持自动应用更新或自动重启。请手动使用已准备好的二进制或命令。",
 	"updateApplyDescription": "新版二进制已经放置好。点击后会启动新版进程，并让旧服务优雅退出。",
 	"updateStopAndApply": "重启并运行新版",
 	"updateRestarting": "正在重启并切换到新版...",

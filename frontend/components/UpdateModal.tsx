@@ -23,6 +23,7 @@ import {
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
+import { useUpdateCapability } from "../hooks/usePlatform";
 import {
 	type UpdateDownloadResult,
 	useUpdateApply,
@@ -84,6 +85,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
+	const updateCapability = useUpdateCapability();
+	const autoApplyAvailable =
+		updateCapability.selfUpdateAvailable &&
+		!updateCapability.manualOnly &&
+		updateCapability.canAutoRestart;
 
 	const {
 		latestVersion,
@@ -163,6 +169,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		effectiveResult?.instructions?.command ??
 		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
 	const canRestartIntoUpdate =
+		autoApplyAvailable &&
 		effectiveResult?.success &&
 		effectiveResult.instructions &&
 		!effectiveResult.instructions.manual;
@@ -335,6 +342,12 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						<Alert color="green" variant="light" icon={<IconCheck size={16} />}>
 							{t("updateDownloadComplete")}
 						</Alert>
+
+						{!autoApplyAvailable && (
+							<Alert color="blue" variant="light" icon={<IconAlertTriangle size={16} />}>
+								<Text size="sm">{t("updateManualOnlyNotice")}</Text>
+							</Alert>
+						)}
 
 						{shouldShowPreparedDescription && (
 							<Text size="sm">

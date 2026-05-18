@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import { apiRequests, narratorMessageRefs, narratorMessages, narratorSidecars } from "../db/schema";
+import {
+	apiRequests,
+	narratorMessageRefs,
+	narratorMessages,
+	narratorSidecars,
+	narratorToolCalls,
+} from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import { saveImageGenerationResult } from "../lib/agent/image-generation";
@@ -266,6 +272,30 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 	}
 }
 
+async function getToolCallMessageId(narratorId: string, toolUseId: string): Promise<string | null> {
+	const row = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+		columns: { messageId: true },
+	});
+	return row?.messageId ?? null;
+}
+
+async function getLatestAssistantMessageId(narratorId: string): Promise<string | null> {
+	const [row] = await db
+		.select({ id: narratorMessages.id })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+		.where(
+			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "assistant")),
+		)
+		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+		.limit(1);
+	return row?.id ?? null;
+}
+
 // === Reasoning translation ===
 
 const LOCALE_NAMES: Record<string, string> = {
@@ -386,7 +416,7 @@ function translateReasoningBlock(
 			// Broadcast updated message so frontend picks up the translation
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
+				with: { toolCalls: true, sideCars: true },
 			});
 			if (fullMessage) {
 				const ref = await db.query.narratorMessageRefs.findFirst({
@@ -901,7 +931,7 @@ export async function processEvent(
 			// Load full message with tool calls for broadcast
 			const fullMessage = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true },
+				with: { toolCalls: true, sideCars: true },
 			});
 
 			const ref = await db.query.narratorMessageRefs.findFirst({
@@ -1042,12 +1072,13 @@ export async function processEvent(
 			if (event.sideCars?.length) {
 				const now = new Date().toISOString();
 				const partialId = ctx.getPartialMessageId();
+				const messageId = partialId ?? (await getToolCallMessageId(narratorId, event.toolUseId));
 				try {
 					await db.insert(narratorSidecars).values(
 						event.sideCars.map((sc, idx) => ({
 							id: generateId(),
 							narratorId,
-							messageId: partialId ?? null,
+							messageId,
 							toolUseId: event.toolUseId,
 							target: sc.target,
 							source: sc.source,
@@ -1598,12 +1629,15 @@ export async function processEvent(
 			const now = new Date().toISOString();
 			const partialId = ctx.getPartialMessageId();
 			if (event.sideCars.length > 0) {
+				const latestAssistantMessageId = partialId
+					? null
+					: await getLatestAssistantMessageId(narratorId);
 				try {
 					await db.insert(narratorSidecars).values(
 						event.sideCars.map((sc, idx) => ({
 							id: generateId(),
 							narratorId,
-							messageId: partialId ?? null,
+							messageId: partialId ?? latestAssistantMessageId,
 							toolUseId: sc.toolUseId ?? null,
 							target: sc.target,
 							source: sc.source,

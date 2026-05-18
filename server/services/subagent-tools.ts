@@ -21,8 +21,15 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"Send",
 ]);
 
-/** Tools available to general subagents (EXPLORE_PLAN_TOOLS + interactive tools, no nesting/plan/forking) */
-const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "AskUserQuestion", "Skill"]);
+/** Tools that are never available inside subagents. */
+const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);
+
+/** Tools available to general subagents (EXPLORE_PLAN_TOOLS + non-interactive helpers, no nesting/plan/forking) */
+const GENERAL_TOOLS = new Set([...EXPLORE_PLAN_TOOLS, "Skill"]);
+
+function isBuiltinToolAllowedForSubagent(toolName: string): boolean {
+	return !DISALLOWED_SUBAGENT_TOOLS.has(toolName);
+}
 
 /** MCP tools use the naming convention `mcp__<server>__<tool>` */
 function isMcpTool(tool: ToolDefinition): boolean {
@@ -86,14 +93,17 @@ export function isMcpToolAllowedForNarrator(tool: ToolDefinition): boolean {
 /** Tool filter factories per built-in subagent type */
 const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = {
 	explore: (tool) =>
-		EXPLORE_PLAN_TOOLS.has(tool.name) ||
-		(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "explore")),
+		isBuiltinToolAllowedForSubagent(tool.name) &&
+		(EXPLORE_PLAN_TOOLS.has(tool.name) ||
+			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "explore"))),
 	plan: (tool) =>
-		EXPLORE_PLAN_TOOLS.has(tool.name) ||
-		(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "plan")),
+		isBuiltinToolAllowedForSubagent(tool.name) &&
+		(EXPLORE_PLAN_TOOLS.has(tool.name) ||
+			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "plan"))),
 	general: (tool) =>
-		GENERAL_TOOLS.has(tool.name) ||
-		(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general")),
+		isBuiltinToolAllowedForSubagent(tool.name) &&
+		(GENERAL_TOOLS.has(tool.name) ||
+			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general"))),
 };
 
 /**
@@ -119,6 +129,7 @@ export function resolveToolFilter(
 		case "custom": {
 			const allowed = new Set(customDef.customTools);
 			return (tool) =>
+				isBuiltinToolAllowedForSubagent(tool.name) &&
 				allowed.has(tool.name) &&
 				(!isMcpTool(tool) || isMcpToolAllowedForSubagent(tool, "general"));
 		}

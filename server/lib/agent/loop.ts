@@ -84,14 +84,80 @@ function findClosingQuote(s: string, start: number): number {
 	return -1;
 }
 
-/** Unescape JSON string escapes (\\n, \\t, \\r, \\", \\\\) */
+/** Decode JSON string escapes, withholding an incomplete trailing escape until a later chunk. */
+function decodeJsonStringFragment(s: string): { text: string; consumedChars: number } {
+	let text = "";
+	let i = 0;
+	while (i < s.length) {
+		const ch = s[i];
+		if (ch !== "\\") {
+			text += ch;
+			i++;
+			continue;
+		}
+
+		if (i + 1 >= s.length) break;
+		const escaped = s[i + 1];
+		switch (escaped) {
+			case '"':
+				text += '"';
+				i += 2;
+				break;
+			case "\\":
+				text += "\\";
+				i += 2;
+				break;
+			case "/":
+				text += "/";
+				i += 2;
+				break;
+			case "b":
+				text += "\b";
+				i += 2;
+				break;
+			case "f":
+				text += "\f";
+				i += 2;
+				break;
+			case "n":
+				text += "\n";
+				i += 2;
+				break;
+			case "r":
+				text += "\r";
+				i += 2;
+				break;
+			case "t":
+				text += "\t";
+				i += 2;
+				break;
+			case "u": {
+				const hex = s.slice(i + 2, i + 6);
+				if (hex.length < 4) return { text, consumedChars: i };
+				if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+					text += `\\${escaped}`;
+					i += 2;
+					break;
+				}
+				text += String.fromCharCode(Number.parseInt(hex, 16));
+				i += 6;
+				break;
+			}
+			default:
+				// Preserve malformed escapes rather than dropping user-visible text.
+				text += `\\${escaped}`;
+				i += 2;
+		}
+	}
+	return { text, consumedChars: i };
+}
+
+/** Unescape JSON string content. Incomplete trailing escapes are preserved for completed fields. */
 function unescapeJsonString(s: string): string {
-	return s
-		.replace(/\\n/g, "\n")
-		.replace(/\\t/g, "\t")
-		.replace(/\\r/g, "\r")
-		.replace(/\\"/g, '"')
-		.replace(/\\\\/g, "\\");
+	const decoded = decodeJsonStringFragment(s);
+	return decoded.consumedChars === s.length
+		? decoded.text
+		: decoded.text + s.slice(decoded.consumedChars);
 }
 
 interface ExtractedFieldsResult {
@@ -1648,7 +1714,7 @@ export async function* agentLoop(
 				streamingMetadata?: Record<string, unknown>;
 				/** Name of the large field currently being streamed */
 				activeStreamingField?: string;
-				/** How many raw chars of the active field have been yielded so far */
+				/** How many raw chars of the active field have been decoded and emitted so far */
 				streamingFieldYielded: number;
 				lastYieldedAt: number;
 				/** Provider-native content block index for interleaved ordering. */
@@ -2152,16 +2218,16 @@ export async function* agentLoop(
 												) {
 													const fullRaw = raw.slice(sfResult.activeField.rawStart);
 													if (fullRaw.length > acc.streamingFieldYielded) {
-														const delta = unescapeJsonString(
+														const decoded = decodeJsonStringFragment(
 															fullRaw.slice(acc.streamingFieldYielded),
 														);
-														if (delta) {
+														if (decoded.text) {
 															streamingField = {
 																name: acc.activeStreamingField,
-																delta,
+																delta: decoded.text,
 															};
-															acc.streamingFieldYielded = fullRaw.length;
 														}
+														acc.streamingFieldYielded += decoded.consumedChars;
 													}
 												}
 											}
@@ -2218,15 +2284,16 @@ export async function* agentLoop(
 											) {
 												const fullRaw = stopRaw.slice(sfResult.activeField.rawStart);
 												if (fullRaw.length > acc.streamingFieldYielded) {
-													const delta = unescapeJsonString(
+													const decoded = decodeJsonStringFragment(
 														fullRaw.slice(acc.streamingFieldYielded),
 													);
-													if (delta) {
+													if (decoded.text) {
 														streamingField = {
 															name: acc.activeStreamingField,
-															delta,
+															delta: decoded.text,
 														};
 													}
+													acc.streamingFieldYielded += decoded.consumedChars;
 												}
 											}
 										}

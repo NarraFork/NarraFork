@@ -20,5 +20,6 @@
 	"disconnected": "Disconnected",
 	"terminalOf": "Terminal · {{name}}",
 	"pasteContent": "Paste",
-	"sendCtrlV": "Send Ctrl+V"
+	"sendCtrlV": "Send Ctrl+V",
+	"terminalUnsupported": "Terminal runtime is not available in this backend/runtime."
 }

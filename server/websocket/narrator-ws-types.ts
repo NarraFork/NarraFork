@@ -72,6 +72,12 @@ export type NarratorServerMessage =
 			turnStartedAt?: string;
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
+	| {
+			type: "queued_new_narrator_created";
+			narratorId: string;
+			messageId: string;
+			newNarratorId: string;
+	  }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
 	| {
 			type: "tool_output";

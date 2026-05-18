@@ -146,6 +146,7 @@
 	"tpBuiltinToolsDesc": "Core tools available to AI narrators. Permission category determines behavior under different permission modes.",
 	"tpMcpTools": "MCP Tools",
 	"tpMcpToolsDesc": "Tools provided by connected MCP servers.",
+	"tpMcpToolsUnsupported": "External MCP tools are not available in the current backend/runtime.",
 	"tpNoMcpTools": "No MCP servers connected.",
 	"tpCategoryAlwaysAllow": "always-allow",
 	"tpCategoryAlwaysAsk": "always-ask",

@@ -260,7 +260,15 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// Migrate legacy per-provider codexOAuth to centralized credential pool
 	// biome-ignore lint/suspicious/noExplicitAny: migration needs to read removed fields
 	const legacyProviders = merged.openaiProviders?.filter((p: any) => p.codexOAuth) as
-		| Array<{ codexOAuth?: { refreshToken: string }; codexProxy?: string }>
+		| Array<{
+				codexOAuth?: {
+					refreshToken?: string;
+					accessToken?: string;
+					expiresAt?: number;
+					accountId?: string;
+				};
+				codexProxy?: string;
+		  }>
 		| undefined;
 	if (legacyProviders?.length) {
 		migrateLegacyCodexOAuth(legacyProviders);

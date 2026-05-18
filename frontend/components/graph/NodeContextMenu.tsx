@@ -1,6 +1,6 @@
 import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useTranslation } from "react-i18next";
-import { usePlatform } from "../../hooks/usePlatform";
+import { useFsRevealCapability } from "../../hooks/usePlatform";
 
 const MAX_NODE_CONTEXT_TITLE_CHARS = 500;
 
@@ -57,8 +57,8 @@ export function NodeContextMenu({
 	const { t } = useTranslation("graph");
 	const isRoot = !!nodeData.isRoot;
 	const displayTitle = clampNodeContextTitle(nodeData.title);
-	const platform = usePlatform();
-	const canReveal = platform !== "linux" && !!nodeData.worktreePath;
+	const fsRevealCapability = useFsRevealCapability();
+	const canReveal = fsRevealCapability.supported && !!nodeData.worktreePath;
 
 	return (
 		<>

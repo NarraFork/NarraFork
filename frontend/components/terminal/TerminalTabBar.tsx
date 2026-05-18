@@ -38,6 +38,8 @@ interface TerminalTabBarProps {
 	onRename: (tabId: string, name: string) => void;
 	onReorder: (ids: string[]) => void;
 	createPending?: boolean;
+	createDisabled?: boolean;
+	createDisabledReason?: string;
 }
 
 function SortableTab({
@@ -201,6 +203,8 @@ export function TerminalTabBar({
 	onRename,
 	onReorder,
 	createPending,
+	createDisabled,
+	createDisabledReason,
 }: TerminalTabBarProps) {
 	const { t } = useTranslation("terminal");
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -246,11 +250,16 @@ export function TerminalTabBar({
 					</SortableContext>
 				</DndContext>
 			</div>
-			<Tooltip label={t("newTerminal")}>
+			<Tooltip
+				label={
+					createDisabled ? (createDisabledReason ?? t("terminalUnsupported")) : t("newTerminal")
+				}
+			>
 				<ActionIcon
 					variant="subtle"
 					onClick={onCreate}
 					loading={createPending}
+					disabled={createDisabled}
 					ml={4}
 					size="sm"
 					style={{ flexShrink: 0 }}

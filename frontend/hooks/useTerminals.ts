@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { api } from "../lib/api";
 import type { ApiEntity } from "../lib/api/types";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
+import { useTerminalCapability } from "./usePlatform";
 
 const TERMINALS_QUERY_GC_TIME_MS = 60_000;
 
@@ -67,10 +68,17 @@ export function useNarratorTerminals(narratorId: string) {
 
 export function useCreateTerminal(chapterId: string) {
 	const qc = useQueryClient();
+	const terminalCapability = useTerminalCapability();
 	const queryKey = ["terminals", { chapterId }] as const;
 	return useMutation({
-		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) =>
-			api.createTerminal({ chapterId, ...data }),
+		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) => {
+			if (!terminalCapability.supported) {
+				return Promise.reject(
+					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
+				);
+			}
+			return api.createTerminal({ chapterId, ...data });
+		},
 		onSuccess: (terminal) => {
 			appendTerminalToCache(qc, queryKey, terminal);
 			qc.invalidateQueries({ queryKey });
@@ -80,10 +88,17 @@ export function useCreateTerminal(chapterId: string) {
 
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
+	const terminalCapability = useTerminalCapability();
 	const queryKey = ["terminals", { narratorId }] as const;
 	return useMutation({
-		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) =>
-			api.createTerminal({ narratorId, ...data }),
+		mutationFn: (data?: { name?: string; cols?: number; rows?: number }) => {
+			if (!terminalCapability.supported) {
+				return Promise.reject(
+					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
+				);
+			}
+			return api.createTerminal({ narratorId, ...data });
+		},
 		onSuccess: (terminal) => {
 			appendTerminalToCache(qc, queryKey, terminal);
 			qc.invalidateQueries({ queryKey });

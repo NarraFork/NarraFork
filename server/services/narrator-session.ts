@@ -18,7 +18,7 @@ import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
-import { normalizeBooleanOverride } from "../lib/boolean-override";
+import { type BooleanOverride, normalizeBooleanOverride } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError } from "../lib/errors";
@@ -58,7 +58,11 @@ import { getImagePath, imageToBase64, saveTextFileToWorktree } from "../lib/uplo
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { backgroundTaskService } from "./background-task-service";
-import { drainCompletedBackgroundSubagents } from "./bg-completion-queue";
+import {
+	type CompletedBgSubagentNotification,
+	drainCompletedBackgroundSubagents,
+	formatBackgroundCompletionNotifications,
+} from "./bg-completion-queue";
 import { gitService } from "./git-service";
 import {
 	clearStreamingSnapshot,
@@ -154,6 +158,58 @@ import {
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
 const MAX_GOAL_CONTINUATION_NO_TOOL_TURNS = 3;
 const goalContinuationStartLock = new AsyncMutex();
+
+function parseQueuedNewCommand(message: string, commandText?: string | null) {
+	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
+	const match = raw.match(/^\/new(?:\s+([\s\S]*))?$/);
+	if (!match) return null;
+	return { rawCommand: raw, initialMessage: match[1]?.trim() ?? "" };
+}
+
+function normalizeOptionalBooleanOverride(value: unknown): BooleanOverride | undefined {
+	return value == null ? undefined : normalizeBooleanOverride(value);
+}
+
+async function executeQueuedNewCommand(
+	active: ActiveNarrator,
+	buffered: BufferedMessage,
+	initialMessage: string,
+): Promise<string> {
+	const sourceNarrator = await narratorService.getById(active.narratorId);
+	const newNarrator = await narratorService.create({
+		chapterId: null,
+		model: sourceNarrator.model ?? undefined,
+		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
+		permissionMode: sourceNarrator.permissionMode ?? undefined,
+		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
+		fastMode: sourceNarrator.fastMode ?? undefined,
+		relaxedPlan: sourceNarrator.relaxedPlan ?? undefined,
+		planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.planReflectionAutoApproveOverride,
+		),
+		dangerReflectionOverride: normalizeOptionalBooleanOverride(
+			sourceNarrator.dangerReflectionOverride,
+		),
+		cwd: active.cwd,
+	});
+
+	if (initialMessage) {
+		await sendMessage(
+			newNarrator.id,
+			initialMessage,
+			buffered.images,
+			active.locale,
+			active._replyInUserLanguage ?? false,
+			undefined,
+			buffered.createdBy,
+			buffered.textFiles,
+		);
+	}
+
+	return newNarrator.id;
+}
+
+const backgroundCompletionStartLock = new AsyncMutex();
 
 function isDynamicPruningWindowEnabled(thresholds: {
 	pruneStart: number;
@@ -535,6 +591,51 @@ async function maybeStartGoalContinuation(
 		goal: activeGoal,
 	});
 	active._goalContinuationTurn = true;
+	return prompt;
+}
+
+async function persistAndBroadcastSystemMessage(
+	narratorId: string,
+	text: string,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	contentBlocks?: any[],
+): Promise<typeof narratorMessages.$inferSelect & { seq: number }> {
+	const msg = await narratorService.persistSystemMessage(narratorId, text, contentBlocks);
+	broadcastToNarrator(narratorId, {
+		type: "message",
+		narratorId,
+		message: {
+			id: msg.id,
+			narratorId,
+			role: msg.role,
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			seq: msg.seq,
+			children: [],
+		},
+	});
+	return msg;
+}
+
+async function drainAndPersistBackgroundCompletionNotice(
+	active: ActiveNarrator,
+): Promise<string | null> {
+	const completed = drainCompletedBackgroundSubagents(active.narratorId);
+	if (completed.length === 0) return null;
+	const prompt = formatBackgroundCompletionNotifications(completed, { includeResult: true });
+	await persistAndBroadcastSystemMessage(active.narratorId, prompt, [
+		{
+			type: "background_agents_completed",
+			tasks: completed.map((task: CompletedBgSubagentNotification) => ({
+				id: task.id,
+				title: task.title,
+				status: task.status,
+				resultPreview: task.resultPreview,
+				resultTruncated: task.resultTruncated ?? false,
+			})),
+		},
+	]);
 	return prompt;
 }
 
@@ -1391,14 +1492,10 @@ export async function runAgentLoop(
 					// Drain completed background subagent tasks
 					const subDone = drainCompletedBackgroundSubagents(narratorId);
 					if (subDone.length > 0) {
-						const lines = subDone.map(
-							(t) =>
-								`[System] Background agent "${t.title}" (ID: ${t.id}) ${t.status}.\nResult preview: ${t.resultPreview || "(empty)"}\nUse Await({ type: "agent", id: "${t.id}" }) to see the full result, or Send({ id: "${t.id}", message }) to continue.`,
-						);
 						sideCars.push({
 							target: "user_message",
 							source: "bg_agent",
-							content: lines.join("\n\n"),
+							content: formatBackgroundCompletionNotifications(subDone),
 						});
 					}
 
@@ -2016,6 +2113,14 @@ export async function runAgentLoop(
 				}
 			}
 
+			const bgCompletionPrompt = await drainAndPersistBackgroundCompletionNotice(active);
+			if (bgCompletionPrompt) {
+				await narratorService.updateStatus(narratorId, "working");
+				currentText = "";
+				currentImages = undefined;
+				continue;
+			}
+
 			// Check for buffered messages BEFORE transitioning to idle/unread —
 			// this prevents spurious notifications when there are queued messages.
 			// When the loop had an error, skip consumption entirely so queued
@@ -2036,6 +2141,33 @@ export async function runAgentLoop(
 						messageId: buffered.id,
 						remaining,
 					});
+					const newCommand = parseQueuedNewCommand(buffered.text, buffered.commandText);
+					if (newCommand) {
+						const newNarratorId = await executeQueuedNewCommand(
+							active,
+							buffered,
+							newCommand.initialMessage,
+						);
+						broadcastToNarrator(narratorId, {
+							type: "queued_new_narrator_created",
+							narratorId,
+							messageId: buffered.id,
+							newNarratorId,
+						});
+						if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) {
+							loopWasInterrupted = true;
+						} else {
+							await narratorService.compareAndSetStatus(
+								narratorId,
+								["working", "waiting"],
+								"idle",
+								{
+									substatus: ["unread"],
+								},
+							);
+						}
+						break;
+					}
 					// Save buffered text files to worktree
 					const savedBufferedTextFiles: TextFileRef[] = [];
 					if (buffered.textFiles?.length) {
@@ -2115,6 +2247,17 @@ export async function runAgentLoop(
 				await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
 					substatus: ["unread"],
 				});
+
+				// Close the race where a background subagent completes after the post-turn
+				// drain but before this turn actually goes idle. If a notification is queued
+				// now, consume it in this loop instead of waiting for another user message.
+				const bgCompletionAfterIdle = await drainAndPersistBackgroundCompletionNotice(active);
+				if (bgCompletionAfterIdle) {
+					await narratorService.updateStatus(narratorId, "working");
+					currentText = "";
+					currentImages = undefined;
+					continue;
+				}
 			}
 
 			active.events.emit("event", { type: "done", data: null });
@@ -2326,10 +2469,8 @@ export async function runAgentLoop(
 		active._provisionalTitle = undefined;
 
 		// Auto-resume: when the loop was interrupted and buffered messages remain,
-		// schedule a new agent loop to consume them.  This makes "long-press cut in
-		// line" work end-to-end — the priority message is preserved in the buffer
-		// and a fresh loop picks it up immediately instead of waiting for the user
-		// to manually send another message.
+		// schedule a new agent loop to consume them. This makes priority messages
+		// run at the next safe boundary without waiting for manual input.
 		if (
 			loopWasInterrupted &&
 			!loopHadError &&
@@ -2347,39 +2488,70 @@ export async function runAgentLoop(
 					remaining: toBufferSummary(getBufferedMessages(narratorId)),
 				});
 
-				// Fire-and-forget: start a new session with the first buffered message.
-				// feedMessage handles ensureNarrator + persistUserMessage + runAgentLoop.
-				feedMessage(
-					narratorId,
-					first.text,
-					first.images,
-					locale,
-					active._replyInUserLanguage ?? false,
-					first.commandText,
-					first.createdBy,
-					first.textFiles,
-				)
-					.then(({ userMsg }) => {
-						broadcastToNarrator(narratorId, {
-							type: "user_message",
-							narratorId,
-							message: userMsg,
+				const newCommand = parseQueuedNewCommand(first.text, first.commandText);
+				if (newCommand) {
+					executeQueuedNewCommand(active, first, newCommand.initialMessage)
+						.then((newNarratorId) => {
+							broadcastToNarrator(narratorId, {
+								type: "queued_new_narrator_created",
+								narratorId,
+								messageId: first.id,
+								newNarratorId,
+							});
+						})
+						.catch(async (err) => {
+							logger.error("Queued /new execution after interrupt failed", {
+								narratorId,
+								error: String(err),
+							});
+							await narratorService
+								.updateStatus(narratorId, "idle", {
+									substatus: ["error"],
+									errorMessage: String(err),
+								})
+								.catch(() => {});
+							broadcastToNarrator(narratorId, {
+								type: "narrator_error",
+								narratorId,
+								error: String(err),
+							});
 						});
-					})
-					.catch(async (err) => {
-						logger.error("Auto-resume after interrupt failed", {
-							narratorId,
-							error: String(err),
+				} else {
+					feedMessage(
+						narratorId,
+						first.text,
+						first.images,
+						locale,
+						active._replyInUserLanguage ?? false,
+						first.commandText,
+						first.createdBy,
+						first.textFiles,
+					)
+						.then(({ userMsg }) => {
+							broadcastToNarrator(narratorId, {
+								type: "user_message",
+								narratorId,
+								message: userMsg,
+							});
+						})
+						.catch(async (err) => {
+							logger.error("Auto-resume after interrupt failed", {
+								narratorId,
+								error: String(err),
+							});
+							await narratorService
+								.updateStatus(narratorId, "idle", {
+									substatus: ["error"],
+									errorMessage: String(err),
+								})
+								.catch(() => {});
+							broadcastToNarrator(narratorId, {
+								type: "narrator_error",
+								narratorId,
+								error: String(err),
+							});
 						});
-						await narratorService
-							.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(err) })
-							.catch(() => {});
-						broadcastToNarrator(narratorId, {
-							type: "narrator_error",
-							narratorId,
-							error: String(err),
-						});
-					});
+				}
 			}
 		}
 	}
@@ -2678,6 +2850,50 @@ export async function startGoalContinuationIfPossible(
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 		runAgentLoop(active, "").catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (goal continuation)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { started: true };
+	});
+}
+
+export async function startBackgroundCompletionContinuationIfPossible(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ started: boolean }> {
+	return backgroundCompletionStartLock.acquire(narratorId, async () => {
+		const activeExisting = activeNarrators.get(narratorId);
+		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.status !== "idle") return { started: false };
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { started: false };
+
+		const prompt = await drainAndPersistBackgroundCompletionNotice(active);
+		if (!prompt) return { started: false };
+
+		active._goalContinuationSuppressed = false;
+		active._goalContinuationNoToolCount = 0;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = new Date().toISOString();
+
+		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+		runAgentLoop(active, "").catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (background completion)", {
 				narratorId,
 				error: String(err),
 			});

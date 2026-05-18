@@ -29,6 +29,7 @@ function makeMcpTool(serverId: string, toolName: string): ToolDefinition {
 
 const readTool = makeTool("Read");
 const grepTool = makeTool("Grep");
+const askUserQuestionTool = makeTool("AskUserQuestion");
 const mcpReadTool = makeMcpTool("configured", "read");
 const mcpWriteTool = makeMcpTool("configured", "write");
 const mcpAskTool = makeMcpTool("configured", "ask");
@@ -76,6 +77,7 @@ describe("resolveToolFilter", () => {
 			const filter = getFilter(subagentType);
 
 			expect(filter(mcpReadTool)).toBe(true);
+			expect(filter(askUserQuestionTool)).toBe(false);
 			expect(filter(mcpWriteTool)).toBe(false);
 			expect(filter(mcpAskTool)).toBe(false);
 			expect(filter(mcpDeniedTool)).toBe(false);
@@ -87,6 +89,7 @@ describe("resolveToolFilter", () => {
 		const filter = getFilter("general");
 
 		expect(filter(mcpReadTool)).toBe(true);
+		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
@@ -100,6 +103,7 @@ describe("resolveToolFilter", () => {
 			toolAccess: "custom",
 			customTools: [
 				"Read",
+				"AskUserQuestion",
 				"mcp__configured__write",
 				"mcp__unconfigured__unset",
 				"mcp__configured__denied",
@@ -112,6 +116,7 @@ describe("resolveToolFilter", () => {
 
 		expect(filter(readTool)).toBe(true);
 		expect(filter(grepTool)).toBe(false);
+		expect(filter(askUserQuestionTool)).toBe(false);
 		expect(filter(mcpWriteTool)).toBe(true);
 		expect(filter(mcpUnsetTool)).toBe(true);
 		expect(filter(mcpAskTool)).toBe(false);

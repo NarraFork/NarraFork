@@ -20,5 +20,6 @@
 	"disconnected": "连接断开",
 	"terminalOf": "终端 · {{name}}",
 	"pasteContent": "粘贴",
-	"sendCtrlV": "发送 Ctrl+V"
+	"sendCtrlV": "发送 Ctrl+V",
+	"terminalUnsupported": "当前后端/运行时不支持交互式终端。"
 }

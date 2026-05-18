@@ -29,6 +29,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useStorageCapability } from "../../hooks/usePlatform";
 import {
 	api,
 	type DatabaseCleanupApiRequestSample,
@@ -132,6 +133,11 @@ const CLEANUP_TARGETS: CleanupTarget[] = [
 export function StorageSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
+	const {
+		vacuumSupported,
+		vacuumReason,
+		cleanup: storageCleanupCapability,
+	} = useStorageCapability();
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [progressMsg, setProgressMsg] = useState("");
@@ -371,9 +377,17 @@ export function StorageSection() {
 		}
 	};
 
-	const canCleanup = (key: string): boolean => {
+	const cleanupCapability = (
+		target: CleanupTarget | undefined,
+	): { supported: boolean; reason?: string } => {
+		if (!target) return { supported: true };
+		return storageCleanupCapability[target.target];
+	};
+
+	const canCleanup = (key: string, target?: CleanupTarget): boolean => {
 		const cat = getCategory(key);
 		if (!cat) return false;
+		if (cleanupCapability(target).supported === false) return false;
 		if (key === "containers" && cat.details?.available === false) return false;
 		return cat.sizeBytes > 0;
 	};
@@ -417,6 +431,7 @@ export function StorageSection() {
 			: [];
 
 	const databasePreviewCount = databasePreview ? getDatabaseCleanupCount(databasePreview) : 0;
+	const vacuumDisabledReason = vacuumReason ?? t("storageDatabaseVacuumDisabled");
 
 	return (
 		<>
@@ -476,6 +491,12 @@ export function StorageSection() {
 								scanResult.totalBytes > 0 ? (cat.sizeBytes / scanResult.totalBytes) * 100 : 0;
 							const subtext = getCategorySubtext(cat);
 							const cleanupTarget = CLEANUP_TARGETS.find((ct) => ct.key === key);
+							const cleanupCap = cleanupCapability(cleanupTarget);
+							const cleanupUnsupportedReason =
+								cleanupCap.supported === false
+									? (cleanupCap.reason ?? t("storageCleanupUnsupported"))
+									: null;
+							const cleanupDisabled = !canCleanup(key, cleanupTarget) || cleaningTarget === key;
 							const isDatabase = key === "database";
 
 							return (
@@ -505,17 +526,21 @@ export function StorageSection() {
 												</div>
 											</Group>
 											{cleanupTarget && (
-												<Tooltip label={t(cleanupTarget.labelKey as never)}>
-													<ActionIcon
-														variant="subtle"
-														color="red"
-														size="sm"
-														disabled={!canCleanup(key) || cleaningTarget === key}
-														loading={cleaningTarget === key}
-														onClick={() => handleCleanup(cleanupTarget)}
-													>
-														<IconTrash size={14} />
-													</ActionIcon>
+												<Tooltip
+													label={cleanupUnsupportedReason ?? t(cleanupTarget.labelKey as never)}
+												>
+													<span>
+														<ActionIcon
+															variant="subtle"
+															color="red"
+															size="sm"
+															disabled={cleanupDisabled}
+															loading={cleaningTarget === key}
+															onClick={() => handleCleanup(cleanupTarget)}
+														>
+															<IconTrash size={14} />
+														</ActionIcon>
+													</span>
 												</Tooltip>
 											)}
 										</Group>
@@ -537,13 +562,15 @@ export function StorageSection() {
 																		)}
 																	</Badge>
 																)}
-																<Tooltip label={t("storageDatabaseVacuumDisabled")}>
-																	<span>
-																		<Button size="xs" variant="light" color="orange" disabled>
-																			{t("storageDatabaseVacuum")}
-																		</Button>
-																	</span>
-																</Tooltip>
+																{!vacuumSupported && (
+																	<Tooltip label={vacuumDisabledReason}>
+																		<span>
+																			<Button size="xs" variant="light" color="orange" disabled>
+																				{t("storageDatabaseVacuum")}
+																			</Button>
+																		</span>
+																	</Tooltip>
+																)}
 															</Group>
 														</Group>
 
