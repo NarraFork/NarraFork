@@ -98,15 +98,22 @@ export interface UpdateInstructions {
 	manual: boolean;
 	command?: string;
 	newBinaryPath?: string;
+	updatePath?: string;
 	message: string;
 }
 
 export interface UpdateDownloadResult {
 	success: boolean;
 	version?: string;
+	ready?: boolean;
 	updatePath?: string;
+	artifactPath?: string;
 	newBinaryPath?: string;
+	directory?: string;
 	placed?: boolean;
+	selfUpdateAvailable?: boolean;
+	canAutoRestart?: boolean;
+	manualOnly?: boolean;
 	instructions?: UpdateInstructions;
 	error?: string;
 }

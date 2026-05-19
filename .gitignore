@@ -23,6 +23,7 @@ scripts/*
 !scripts/go-task.ts
 !scripts/release-go-beta.ts
 !scripts/go-rollback-drill.ts
+!scripts/generate-go-drizzle-migrations.ts
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/

@@ -26,6 +26,7 @@ import { useTranslation } from "react-i18next";
 import { useUpdateCapability } from "../hooks/usePlatform";
 import {
 	type UpdateDownloadResult,
+	type UpdateInstructions,
 	useUpdateApply,
 	useUpdateDownload,
 } from "../hooks/useUpdateCheck";
@@ -80,6 +81,21 @@ export interface UpdateModalProps {
 	onClose: () => void;
 	data: UpdateModalData;
 }
+
+type PreparedUpdateStatus = {
+	ready: boolean;
+	updateFile?: string;
+	canAutoRestart: boolean;
+	newBinaryPath?: string;
+	updatePath?: string;
+	artifactPath?: string;
+	directory?: string;
+	placed?: boolean;
+	version?: string;
+	selfUpdateAvailable?: boolean;
+	manualOnly?: boolean;
+	instructions?: UpdateInstructions;
+};
 
 export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { t, i18n } = useTranslation("common");
@@ -140,31 +156,49 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 
 	const savingsPercent =
 		downloadSize && totalSize ? Math.round((1 - downloadSize / totalSize) * 100) : 0;
+	const preparedStatusDetails = preparedStatus as PreparedUpdateStatus | undefined;
 	const preparedStatusMatches =
-		preparedStatus?.ready && !!targetVersion && preparedStatus.version === targetVersion;
-	const restoredResult: UpdateDownloadResult | null = preparedStatusMatches
-		? {
-				success: true,
-				version: preparedStatus.version,
-				updatePath: preparedStatus.updatePath ?? preparedStatus.newBinaryPath,
-				newBinaryPath: preparedStatus.newBinaryPath,
-				placed: preparedStatus.placed,
-				instructions: {
-					manual: !preparedStatus.placed,
-					newBinaryPath: preparedStatus.newBinaryPath,
-					command: preparedStatus.newBinaryPath ? `"${preparedStatus.newBinaryPath}"` : undefined,
-					message: preparedStatus.placed
-						? t("updatePreparedDescription")
-						: t("updateCachedDescription"),
-				},
-			}
-		: null;
+		preparedStatusDetails?.ready &&
+		!!targetVersion &&
+		preparedStatusDetails.version === targetVersion;
+	const restoredInstructions = preparedStatusDetails?.instructions;
+	const restoredResult: UpdateDownloadResult | null =
+		preparedStatusMatches && preparedStatusDetails
+			? {
+					success: true,
+					version: preparedStatusDetails.version,
+					ready: preparedStatusDetails.ready,
+					updatePath:
+						preparedStatusDetails.updatePath ??
+						preparedStatusDetails.newBinaryPath ??
+						preparedStatusDetails.artifactPath,
+					artifactPath: preparedStatusDetails.artifactPath,
+					newBinaryPath: preparedStatusDetails.newBinaryPath,
+					directory: preparedStatusDetails.directory,
+					placed: preparedStatusDetails.placed,
+					selfUpdateAvailable: preparedStatusDetails.selfUpdateAvailable,
+					canAutoRestart: preparedStatusDetails.canAutoRestart,
+					manualOnly: preparedStatusDetails.manualOnly,
+					instructions: restoredInstructions ?? {
+						manual: !preparedStatusDetails.canAutoRestart,
+						newBinaryPath: preparedStatusDetails.newBinaryPath,
+						command: preparedStatusDetails.newBinaryPath
+							? `"${preparedStatusDetails.newBinaryPath}"`
+							: undefined,
+						message: preparedStatusDetails.placed
+							? t("updatePreparedDescription")
+							: t("updateCachedDescription"),
+					},
+				}
+			: null;
 	const effectiveResult = result ?? restoredResult;
 
 	const preparedBinaryPath =
 		effectiveResult?.instructions?.newBinaryPath ??
 		effectiveResult?.newBinaryPath ??
-		effectiveResult?.updatePath;
+		effectiveResult?.instructions?.updatePath ??
+		effectiveResult?.updatePath ??
+		effectiveResult?.artifactPath;
 	const preparedCommand =
 		effectiveResult?.instructions?.command ??
 		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
