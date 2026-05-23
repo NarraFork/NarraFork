@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Box,
 	Code,
@@ -23,6 +24,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { ToolCallInspector } from "./ToolCallInspector";
 
@@ -84,6 +86,12 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 	const [inspectedToolUseId, setInspectedToolUseId] = useState<string | null>(null);
 	const qc = useQueryClient();
 	const navigate = useNavigate();
+	const subagentsCapability = useNarratorSubagentsCapability();
+	const backgroundTasksSupported = subagentsCapability.supported && subagentsCapability.background;
+	const canOpenSubagentSessions = subagentsCapability.supported && subagentsCapability.detachAttach;
+	const showReattachFallback = canOpenSubagentSessions && !subagentsCapability.reattachBlocksParent;
+	const reattachFallbackReason =
+		subagentsCapability.reattachReason ?? t("backgroundTasks.reattachPartial");
 
 	const { data, isLoading } = useQuery({
 		queryKey: ["background-tasks", narratorId],
@@ -101,6 +109,7 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				})),
 			};
 		},
+		enabled: backgroundTasksSupported,
 		refetchInterval: opened ? 3000 : 10000,
 		gcTime: 30_000,
 	});
@@ -148,14 +157,16 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 
 	const handleOpenSubagent = useCallback(
 		(subagentNarratorId: string) => {
+			if (!canOpenSubagentSessions) return;
 			close();
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
 		},
-		[close, navigate],
+		[canOpenSubagentSessions, close, navigate],
 	);
 
 	const handleCancel = useCallback(
 		async (taskId: string) => {
+			if (!backgroundTasksSupported) return;
 			try {
 				await api.cancelBackgroundTask(narratorId, taskId);
 				qc.invalidateQueries({ queryKey: ["background-tasks", narratorId] });
@@ -163,10 +174,10 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				// ignore
 			}
 		},
-		[narratorId, qc],
+		[backgroundTasksSupported, narratorId, qc],
 	);
 
-	if (allTasks.length === 0 && !isLoading) return null;
+	if (!backgroundTasksSupported || (allTasks.length === 0 && !isLoading)) return null;
 
 	return (
 		<>
@@ -212,9 +223,15 @@ export function BackgroundTasksDrawer({ narratorId }: BackgroundTasksDrawerProps
 				padding="md"
 			>
 				<Stack gap="sm">
+					{showReattachFallback && (
+						<Alert color="yellow" variant="light">
+							{reattachFallbackReason}
+						</Alert>
+					)}
 					{allTasks.map((task) => {
 						const isRunning = task.status === "running";
-						const canOpenSubagent = task.kind === "agent" && !!task.subagentNarratorId;
+						const canOpenSubagent =
+							canOpenSubagentSessions && task.kind === "agent" && !!task.subagentNarratorId;
 						const canInspect = task.kind === "bash" && !!task.toolUseId;
 						const Icon = task.kind === "bash" ? IconTerminal2 : IconRobot;
 						return (

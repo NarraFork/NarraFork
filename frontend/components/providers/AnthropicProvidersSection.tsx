@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Divider,
@@ -16,6 +17,11 @@ import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderQuotaCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -37,6 +43,7 @@ interface AnthropicProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	onSaveBeforeRefresh?: () => Promise<boolean>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
@@ -53,6 +60,7 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	onSaveBeforeRefresh,
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
@@ -61,6 +69,23 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const anthropicRuntimeCapability = useProviderRuntimeCapability("anthropic");
+	const anthropicRefreshCapability = useProviderModelRefreshCapability("anthropic");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const anthropicRefreshReason =
+		anthropicRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const anthropicRoutesSupported = anthropicRuntimeCapability?.routes?.supported !== false;
+	const canRefreshAnthropicProviderModels =
+		anthropicRefreshCapability.supported &&
+		anthropicRoutesSupported &&
+		anthropicRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
+	const anthropicRefreshUnsupportedReason = anthropicRefreshCapability.supported
+		? providerRouteUnsupportedReason
+		: anthropicRefreshReason;
+	const anthropicQuotaCapability = useProviderQuotaCapability("anthropic");
+	const anthropicQuotaUnsupportedReason = anthropicQuotaCapability.supported
+		? undefined
+		: (anthropicQuotaCapability.reason ?? t("providerQuotaUnsupported"));
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
 	const handleRemoveProvider = useCallback(
@@ -95,9 +120,10 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
+			if (!canRefreshAnthropicProviderModels) return;
 			if (isProviderDirty?.(providerId)) {
-				notifications.show({ color: "yellow", title: t("refreshModelsSaveFirst"), message: "" });
-				return;
+				const saved = await onSaveBeforeRefresh?.();
+				if (!saved) return;
 			}
 			setRefreshingProvider(providerId);
 			try {
@@ -122,7 +148,7 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isProviderDirty],
+		[canRefreshAnthropicProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
 	);
 
 	return (
@@ -130,6 +156,12 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 			<Text size="sm" c="dimmed">
 				{t("anthropicProvidersSectionDesc")}
 			</Text>
+
+			{anthropicQuotaUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("providerQuotaUnsupported")}>
+					{anthropicQuotaUnsupportedReason}
+				</Alert>
+			)}
 
 			{providers.map((p, idx) => {
 				const pModels = providerModelsMap[p.id] ?? [];
@@ -255,7 +287,12 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 									variant="light"
 									leftSection={<IconRefresh size={14} />}
 									loading={refreshingProvider === p.id}
-									disabled={!p.apiKey}
+									disabled={!p.apiKey || !canRefreshAnthropicProviderModels}
+									title={
+										!canRefreshAnthropicProviderModels
+											? anthropicRefreshUnsupportedReason
+											: undefined
+									}
 									onClick={() => handleRefreshProviderModels(p.id)}
 								>
 									{refreshingProvider === p.id

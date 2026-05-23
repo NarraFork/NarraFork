@@ -1,0 +1,158 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { api } from "./index";
+
+describe("misc APIs", () => {
+	const g = globalThis as typeof globalThis & {
+		localStorage?: Storage;
+		fetch: typeof fetch;
+	};
+	const originalFetch = g.fetch;
+	const originalLocalStorage = g.localStorage;
+
+	afterEach(() => {
+		Object.defineProperty(g, "fetch", { value: originalFetch, configurable: true });
+		if (originalLocalStorage === undefined) {
+			Reflect.deleteProperty(g, "localStorage");
+		} else {
+			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
+		}
+	});
+
+	function installEnvironment(response: Response) {
+		Object.defineProperty(g, "localStorage", {
+			value: {
+				getItem: () => null,
+				setItem: () => {},
+				removeItem: () => {},
+			},
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () => response,
+			configurable: true,
+		});
+	}
+
+	test("preserves search degraded metadata", async () => {
+		installEnvironment(
+			new Response(
+				JSON.stringify({
+					results: [],
+					degraded: true,
+					fallbacks: [{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" }],
+					searchMetadata: {
+						degraded: true,
+						mode: "degraded-like-fallback",
+						ftsReady: false,
+						shortQuery: false,
+						requestedEntities: ["chapters"],
+						fallbacks: [
+							{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" },
+						],
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+
+		const response = await api.search("AlphaBeta", "chapters");
+		expect(response.degraded).toBe(true);
+		expect(response.searchMetadata?.mode).toBe("degraded-like-fallback");
+		expect(response.searchMetadata?.fallbacks?.[0]?.reason).toBe("fts_query_failed");
+	});
+
+	test("surfaces structured storage cleanup errors", async () => {
+		installEnvironment(
+			new Response(
+				JSON.stringify({
+					code: "STORAGE_CLEANUP_WORKTREES_UNSUPPORTED",
+					reason: "Storage cleanup does not remove git worktrees in go_backend",
+				}),
+				{
+					status: 403,
+					statusText: "Forbidden",
+					headers: { "content-type": "application/json" },
+				},
+			),
+		);
+
+		await expect(api.cleanupStorage("worktrees")).rejects.toThrow(
+			"Storage cleanup does not remove git worktrees in go_backend",
+		);
+	});
+
+	test("surfaces structured runtime cleanup errors", async () => {
+		installEnvironment(
+			new Response(
+				JSON.stringify({
+					code: "RUNTIME_CLEANUP_CONTAINERS_UNSUPPORTED",
+					reason: "Runtime cleanup is limited to safe semantics in go_backend",
+				}),
+				{
+					status: 403,
+					statusText: "Forbidden",
+					headers: { "content-type": "application/json" },
+				},
+			),
+		);
+
+		await expect(api.cleanupRuntime("containers")).rejects.toThrow(
+			"Runtime cleanup is limited to safe semantics in go_backend",
+		);
+	});
+
+	test("surfaces structured database cleanup errors", async () => {
+		installEnvironment(
+			new Response(
+				JSON.stringify({
+					code: "STORAGE_DATABASE_CLEANUP_DISABLED",
+					reason: "Database vacuum is disabled in go_backend",
+				}),
+				{
+					status: 403,
+					statusText: "Forbidden",
+					headers: { "content-type": "application/json" },
+				},
+			),
+		);
+
+		await expect(
+			api.cleanupDatabase({ target: "apiRequestDumps", olderThanDays: 7 }),
+		).rejects.toThrow("Database vacuum is disabled in go_backend");
+	});
+
+	test("surfaces structured notification webhook errors", async () => {
+		for (const tc of [
+			{
+				provider: "dingtalk",
+				code: "NOTIFICATION_DINGTALK_WEBHOOK_FAILED",
+				call: () => api.testDingtalkWebhook("https://example.test/dingtalk"),
+			},
+			{
+				provider: "feishu",
+				code: "NOTIFICATION_FEISHU_WEBHOOK_FAILED",
+				call: () => api.testFeishuWebhook("https://example.test/feishu"),
+			},
+		]) {
+			const diagnostic = `${tc.provider} upstream returned 500`;
+			installEnvironment(
+				new Response(
+					JSON.stringify({
+						ok: false,
+						code: tc.code,
+						reason: diagnostic,
+						error: diagnostic,
+						message: diagnostic,
+					}),
+					{
+						status: 502,
+						statusText: "Bad Gateway",
+						headers: { "content-type": "application/json" },
+					},
+				),
+			);
+
+			await expect(tc.call()).rejects.toThrow(diagnostic);
+		}
+	});
+});

@@ -92,7 +92,11 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 		setTestResult(null);
 		try {
 			const res = await api.testDingtalkWebhook(dingtalkWebhook, dingtalkSecret);
-			setTestResult({ type: "dingtalk", ok: res.ok, error: res.error });
+			setTestResult({
+				type: "dingtalk",
+				ok: res.ok,
+				error: res.message ?? res.reason ?? res.error ?? res.code,
+			});
 		} catch (err) {
 			setTestResult({
 				type: "dingtalk",
@@ -108,7 +112,11 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 		setTestResult(null);
 		try {
 			const res = await api.testFeishuWebhook(feishuWebhook, feishuSecret);
-			setTestResult({ type: "feishu", ok: res.ok, error: res.error });
+			setTestResult({
+				type: "feishu",
+				ok: res.ok,
+				error: res.message ?? res.reason ?? res.error ?? res.code,
+			});
 		} catch (err) {
 			setTestResult({
 				type: "feishu",

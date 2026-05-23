@@ -31,6 +31,11 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderQuotaCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -107,6 +112,9 @@ interface NUGProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	onSaveBeforeRefresh?: () => Promise<boolean>;
+	onSaveBeforeNugAction?: () => Promise<boolean>;
+	onLoginSuccess?: (providerId: string, apiKey: string, username: string) => Promise<boolean>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
@@ -155,13 +163,17 @@ function NUGLoginModal({
 	onClose,
 	providerId,
 	baseUrl,
+	canLogin,
+	onEnsureSaved,
 	onLoginSuccess,
 }: {
 	opened: boolean;
 	onClose: () => void;
 	providerId: string;
 	baseUrl: string;
-	onLoginSuccess: (apiKey: string, username: string) => void;
+	canLogin: boolean;
+	onEnsureSaved?: () => Promise<boolean>;
+	onLoginSuccess: (apiKey: string, username: string) => boolean | Promise<boolean>;
 }) {
 	const { t } = useTranslation("settings");
 	const [username, setUsername] = useState("");
@@ -169,15 +181,20 @@ function NUGLoginModal({
 	const [loading, setLoading] = useState(false);
 
 	const handleLogin = useCallback(async () => {
-		if (!username || !password) return;
+		if (!canLogin || !username || !password) return;
 		setLoading(true);
 		try {
+			if (onEnsureSaved) {
+				const saved = await onEnsureSaved();
+				if (!saved) return;
+			}
 			const res = await api.nugLogin(providerId, { username, password });
-			onLoginSuccess(res.apiKey, username);
+			const savedLogin = await onLoginSuccess(res.apiKey, username);
+			if (!savedLogin) return;
 			notifications.show({
 				color: "green",
 				title: t("nugLoginSuccess"),
-				message: "",
+				message: t("nugLoginAutoSaved"),
 			});
 			onClose();
 		} catch (err) {
@@ -189,7 +206,7 @@ function NUGLoginModal({
 		} finally {
 			setLoading(false);
 		}
-	}, [username, password, providerId, onLoginSuccess, onClose, t]);
+	}, [username, password, providerId, canLogin, onEnsureSaved, onLoginSuccess, onClose, t]);
 
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("nugLoginTitle")} centered>
@@ -211,7 +228,12 @@ function NUGLoginModal({
 					onChange={(e) => setPassword(e.currentTarget.value)}
 					onKeyDown={(e) => e.key === "Enter" && handleLogin()}
 				/>
-				<Button loading={loading} onClick={handleLogin} disabled={!username || !password}>
+				<Button
+					loading={loading}
+					onClick={handleLogin}
+					disabled={!canLogin || !username || !password}
+					title={!canLogin ? t("providerRouteUnsupported") : undefined}
+				>
 					{t("nugLoginBtn")}
 				</Button>
 			</Stack>
@@ -221,12 +243,28 @@ function NUGLoginModal({
 
 /* ── Account Info Panel ────────────────────────────────── */
 
-function NUGAccountInfo({ providerId, nugUsername }: { providerId: string; nugUsername?: string }) {
+function NUGAccountInfo({
+	providerId,
+	nugUsername,
+	quotaRouteSupported,
+	quotaRouteUnsupportedReason,
+}: {
+	providerId: string;
+	nugUsername?: string;
+	quotaRouteSupported: boolean;
+	quotaRouteUnsupportedReason: string;
+}) {
 	const { t } = useTranslation("settings");
+	const quotaCapability = useProviderQuotaCapability("nug");
+	const canReadQuota = quotaCapability.supported && quotaRouteSupported;
+	const quotaUnsupportedReason = quotaCapability.supported
+		? quotaRouteUnsupportedReason
+		: (quotaCapability.reason ?? t("providerQuotaUnsupported"));
 	const [quota, setQuota] = useState<QuotaInfo | null>(null);
 	const [loading, setLoading] = useState(false);
 
 	const fetchQuota = useCallback(async () => {
+		if (!canReadQuota) return;
 		setLoading(true);
 		try {
 			const res = await api.nugGetQuota(providerId);
@@ -236,11 +274,11 @@ function NUGAccountInfo({ providerId, nugUsername }: { providerId: string; nugUs
 		} finally {
 			setLoading(false);
 		}
-	}, [providerId]);
+	}, [providerId, canReadQuota]);
 
 	useEffect(() => {
-		fetchQuota();
-	}, [fetchQuota]);
+		if (canReadQuota) fetchQuota();
+	}, [fetchQuota, canReadQuota]);
 
 	if (!nugUsername && !quota) return null;
 
@@ -269,7 +307,14 @@ function NUGAccountInfo({ providerId, nugUsername }: { providerId: string; nugUs
 							</Badge>
 						</>
 					)}
-					<ActionIcon variant="subtle" size="sm" loading={loading} onClick={fetchQuota}>
+					<ActionIcon
+						variant="subtle"
+						size="sm"
+						loading={loading}
+						disabled={!canReadQuota}
+						title={!canReadQuota ? quotaUnsupportedReason : undefined}
+						onClick={fetchQuota}
+					>
 						<IconRefresh size={14} />
 					</ActionIcon>
 				</Group>
@@ -568,6 +613,9 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	onSaveBeforeRefresh,
+	onSaveBeforeNugAction,
+	onLoginSuccess,
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
@@ -575,6 +623,23 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 }: NUGProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const nugRuntimeCapability = useProviderRuntimeCapability("nug");
+	const nugRefreshCapability = useProviderModelRefreshCapability("nug");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const nugRefreshReason = nugRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const nugRoutesSupported = nugRuntimeCapability?.routes?.supported !== false;
+	const isNugRouteSupported = (route: string) =>
+		nugRoutesSupported && nugRuntimeCapability?.routes?.[route] !== false;
+	const canRefreshNugProviderModels =
+		nugRefreshCapability.supported && isNugRouteSupported("perProviderModelsRefresh");
+	const nugRefreshUnsupportedReason = nugRefreshCapability.supported
+		? providerRouteUnsupportedReason
+		: nugRefreshReason;
+	const canLogin = isNugRouteSupported("login");
+	const canOAuthStart = isNugRouteSupported("oauthStart");
+	const canReadQuota = isNugRouteSupported("quota");
+	const canReadChannelsHealth = isNugRouteSupported("channelsHealth");
+	const canReadUsage = isNugRouteSupported("usage") && isNugRouteSupported("usageSummary");
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 	const [loginModalProvider, setLoginModalProvider] = useState<string | null>(null);
 
@@ -603,13 +668,10 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 
 	const handleRefreshModels = useCallback(
 		async (providerId: string) => {
+			if (!canRefreshNugProviderModels) return;
 			if (isProviderDirty?.(providerId)) {
-				notifications.show({
-					color: "yellow",
-					title: t("refreshModelsSaveFirst"),
-					message: "",
-				});
-				return;
+				const saved = await onSaveBeforeRefresh?.();
+				if (!saved) return;
 			}
 			setRefreshingProvider(providerId);
 			try {
@@ -626,14 +688,16 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isProviderDirty],
+		[canRefreshNugProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
 	);
 
 	const handleLoginSuccess = useCallback(
-		(providerId: string, apiKey: string, username: string) => {
+		async (providerId: string, apiKey: string, username: string) => {
+			if (onLoginSuccess) return onLoginSuccess(providerId, apiKey, username);
 			updateProvider(providerId, { apiKey, nugUsername: username });
+			return true;
 		},
-		[updateProvider],
+		[onLoginSuccess, updateProvider],
 	);
 
 	const loginProvider = loginModalProvider
@@ -734,8 +798,9 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 										size="xs"
 										variant="light"
 										leftSection={<IconLogin size={14} />}
-										disabled={!p.baseUrl}
-										onClick={() => setLoginModalProvider(p.id)}
+										disabled={!p.baseUrl || !canLogin}
+										title={!canLogin ? providerRouteUnsupportedReason : undefined}
+										onClick={() => canLogin && setLoginModalProvider(p.id)}
 									>
 										{t("nugLoginBtn")}
 									</Button>
@@ -746,15 +811,14 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 											size="xs"
 											variant="light"
 											color="grape"
-											disabled={!p.baseUrl || !p.oauthClientId || isProviderDirty?.(p.id)}
+											disabled={!p.baseUrl || !p.oauthClientId || !canOAuthStart}
+											title={!canOAuthStart ? providerRouteUnsupportedReason : undefined}
 											onClick={async () => {
+												if (!canOAuthStart) return;
+
 												if (isProviderDirty?.(p.id)) {
-													notifications.show({
-														color: "yellow",
-														title: t("refreshModelsSaveFirst"),
-														message: "",
-													});
-													return;
+													const saved = await onSaveBeforeNugAction?.();
+													if (!saved) return;
 												}
 												try {
 													const result = await api.nugOAuthStart(p.id);
@@ -804,14 +868,23 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 
 							{/* Account info */}
 							{p.apiKey && p.baseUrl && (
-								<NUGAccountInfo providerId={p.id} nugUsername={p.nugUsername} />
+								<NUGAccountInfo
+									providerId={p.id}
+									nugUsername={p.nugUsername}
+									quotaRouteSupported={canReadQuota}
+									quotaRouteUnsupportedReason={providerRouteUnsupportedReason}
+								/>
 							)}
 
 							{/* Channel health */}
-							{p.apiKey && p.baseUrl && !p.disabled && <NUGChannelHealth providerId={p.id} />}
+							{p.apiKey && p.baseUrl && !p.disabled && canReadChannelsHealth && (
+								<NUGChannelHealth providerId={p.id} />
+							)}
 
 							{/* Usage panel */}
-							{p.apiKey && p.baseUrl && !p.disabled && <NUGUsagePanel providerId={p.id} />}
+							{p.apiKey && p.baseUrl && !p.disabled && canReadUsage && (
+								<NUGUsagePanel providerId={p.id} />
+							)}
 
 							{/* Models */}
 							<Group gap="xs">
@@ -820,7 +893,8 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									variant="light"
 									leftSection={<IconRefresh size={14} />}
 									loading={refreshingProvider === p.id}
-									disabled={!p.apiKey || !p.baseUrl}
+									disabled={!p.apiKey || !p.baseUrl || !canRefreshNugProviderModels}
+									title={!canRefreshNugProviderModels ? nugRefreshUnsupportedReason : undefined}
 									onClick={() => handleRefreshModels(p.id)}
 								>
 									{refreshingProvider === p.id
@@ -910,6 +984,8 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 					onClose={() => setLoginModalProvider(null)}
 					providerId={loginProvider.id}
 					baseUrl={loginProvider.baseUrl}
+					canLogin={canLogin}
+					onEnsureSaved={isProviderDirty?.(loginProvider.id) ? onSaveBeforeNugAction : undefined}
 					onLoginSuccess={(apiKey, username) =>
 						handleLoginSuccess(loginProvider.id, apiKey, username)
 					}

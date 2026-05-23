@@ -1,5 +1,6 @@
 import { Mark } from "@mantine/core";
 import type { ReactNode } from "react";
+import type { SearchFallback, SearchResponse } from "./api";
 
 export type SearchResultType = "all" | "chapter" | "narrator" | "message";
 
@@ -50,6 +51,44 @@ export function includesSearch(text: unknown, query: string): boolean {
 	const normalizedQuery = normalizeSearchText(query);
 	if (!normalizedQuery) return true;
 	return normalizeSearchText(text).includes(normalizedQuery);
+}
+
+export interface SearchRuntimeStatus {
+	degraded: boolean;
+	mode?: string;
+	fallbackMessages: string[];
+}
+
+export function formatSearchFallbackMessage(fallback: SearchFallback): string {
+	const scope = String(fallback.entity ?? fallback.feature ?? "search");
+	const detail = String(
+		fallback.reason ?? fallback.message ?? fallback.error ?? fallback.code ?? "fallback",
+	);
+	const route = fallback.from && fallback.to ? ` (${fallback.from} → ${fallback.to})` : "";
+	return `${scope}: ${detail}${route}`;
+}
+
+export function summarizeSearchRuntimeState(response?: SearchResponse): SearchRuntimeStatus {
+	const metadataFallbacks = Array.isArray(response?.searchMetadata?.fallbacks)
+		? response.searchMetadata.fallbacks
+		: [];
+	const topLevelFallbacks = Array.isArray(response?.fallbacks) ? response.fallbacks : [];
+	const seen = new Set<string>();
+	const fallbackMessages = [...metadataFallbacks, ...topLevelFallbacks]
+		.map((fallback) => formatSearchFallbackMessage(fallback))
+		.filter((message) => {
+			if (seen.has(message)) return false;
+			seen.add(message);
+			return true;
+		});
+	return {
+		degraded:
+			response?.degraded === true ||
+			response?.searchMetadata?.degraded === true ||
+			fallbackMessages.length > 0,
+		mode: response?.searchMetadata?.mode,
+		fallbackMessages,
+	};
 }
 
 export function highlightSearchText(text: string, query: string): ReactNode {

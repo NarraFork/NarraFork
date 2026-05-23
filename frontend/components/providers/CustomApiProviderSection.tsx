@@ -19,6 +19,10 @@ import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderRouteCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -102,6 +106,7 @@ interface CustomApiProviderSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	onSaveBeforeRefresh?: () => Promise<boolean>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
@@ -119,6 +124,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	onSaveBeforeRefresh,
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
@@ -127,12 +133,38 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const openaiRefreshCapability = useProviderModelRefreshCapability("openai");
+	const anthropicRefreshCapability = useProviderModelRefreshCapability("anthropic");
+	const openaiProviderRefreshRoute = useProviderRouteCapability(
+		"openai",
+		"perProviderModelsRefresh",
+	);
+	const anthropicProviderRefreshRoute = useProviderRouteCapability(
+		"anthropic",
+		"perProviderModelsRefresh",
+	);
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
 	const selectedProtocol =
 		CUSTOM_API_PROTOCOL_OPTIONS.find((option) => option.value === provider.protocol) ??
 		CUSTOM_API_PROTOCOL_OPTIONS[0];
 	const usesAnthropic = isAnthropicProtocol(provider.protocol);
+	const refreshCapability = usesAnthropic ? anthropicRefreshCapability : openaiRefreshCapability;
+	const refreshRouteCapability = usesAnthropic
+		? anthropicProviderRefreshRoute
+		: openaiProviderRefreshRoute;
+	const refreshReason = refreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const canRefreshOpenAIProviderModels =
+		openaiRefreshCapability.supported && openaiProviderRefreshRoute.supported;
+	const canRefreshAnthropicProviderModels =
+		anthropicRefreshCapability.supported && anthropicProviderRefreshRoute.supported;
+	const canRefreshProviderModels = usesAnthropic
+		? canRefreshAnthropicProviderModels
+		: canRefreshOpenAIProviderModels;
+	const refreshUnsupportedReason = refreshCapability.supported
+		? (refreshRouteCapability.reason ?? providerRouteUnsupportedReason)
+		: refreshReason;
 	const providerModels =
 		(usesAnthropic ? anthropicProviderModelsMap : openAIProviderModelsMap)[provider.id] ?? [];
 	const protocolData = useMemo(
@@ -169,9 +201,10 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	);
 
 	const handleRefreshProviderModels = useCallback(async () => {
+		if (!canRefreshProviderModels) return;
 		if (isProviderDirty?.(provider.id)) {
-			notifications.show({ color: "yellow", title: t("refreshModelsSaveFirst"), message: "" });
-			return;
+			const saved = await onSaveBeforeRefresh?.();
+			if (!saved) return;
 		}
 		setRefreshingProvider(provider.id);
 		try {
@@ -195,7 +228,15 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		} finally {
 			setRefreshingProvider(null);
 		}
-	}, [qc, t, isProviderDirty, provider.id, usesAnthropic]);
+	}, [
+		canRefreshProviderModels,
+		qc,
+		t,
+		isProviderDirty,
+		onSaveBeforeRefresh,
+		provider.id,
+		usesAnthropic,
+	]);
 
 	return (
 		<Stack>
@@ -364,7 +405,8 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 						variant="light"
 						leftSection={<IconRefresh size={14} />}
 						loading={refreshingProvider === provider.id}
-						disabled={!provider.apiKey}
+						disabled={!provider.apiKey || !canRefreshProviderModels}
+						title={!canRefreshProviderModels ? refreshUnsupportedReason : undefined}
 						onClick={handleRefreshProviderModels}
 					>
 						{refreshingProvider === provider.id

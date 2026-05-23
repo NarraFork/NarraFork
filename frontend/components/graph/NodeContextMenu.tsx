@@ -10,6 +10,13 @@ function clampNodeContextTitle(value: string): string {
 		: value;
 }
 
+interface ReviewActionAvailability {
+	request: boolean;
+	convertToSubagent: boolean;
+	promote: boolean;
+	dismiss: boolean;
+}
+
 interface NodeContextMenuProps {
 	x: number;
 	y: number;
@@ -22,6 +29,7 @@ interface NodeContextMenuProps {
 		worktreePath?: string | null;
 		reviewStatus?: string | null;
 	};
+	reviewActions?: ReviewActionAvailability;
 	onClose: () => void;
 	onFork: (nodeId: string) => void;
 	onReview: (nodeId: string) => void;
@@ -41,6 +49,7 @@ export function NodeContextMenu({
 	y,
 	nodeId,
 	nodeData,
+	reviewActions,
 	onClose,
 	onFork,
 	onReview,
@@ -59,6 +68,17 @@ export function NodeContextMenu({
 	const displayTitle = clampNodeContextTitle(nodeData.title);
 	const fsRevealCapability = useFsRevealCapability();
 	const canReveal = fsRevealCapability.supported && !!nodeData.worktreePath;
+	const effectiveReviewActions = reviewActions ?? {
+		request: true,
+		convertToSubagent: true,
+		promote: true,
+		dismiss: true,
+	};
+	const canConvertToSubagent =
+		effectiveReviewActions.convertToSubagent && nodeData.reviewStatus === "concluded";
+	const canPromoteReview =
+		effectiveReviewActions.promote &&
+		(nodeData.reviewStatus === "concluded" || nodeData.reviewStatus === "reviewing");
 
 	return (
 		<>
@@ -102,29 +122,31 @@ export function NodeContextMenu({
 							<Text size="sm">{t("contextMenu.revealInExplorer")}</Text>
 						</UnstyledButton>
 					)}
-					{nodeData.status === "active" && nodeData.role !== "review" && (
-						<UnstyledButton
-							px="xs"
-							py={4}
-							onClick={() => onReview(nodeId)}
-							style={{ borderRadius: 4 }}
-						>
-							<Text size="sm" c="yellow">
-								{t("contextMenu.review")}
-							</Text>
-						</UnstyledButton>
-					)}
+					{nodeData.status === "active" &&
+						nodeData.role !== "review" &&
+						effectiveReviewActions.request && (
+							<UnstyledButton
+								px="xs"
+								py={4}
+								onClick={() => onReview(nodeId)}
+								style={{ borderRadius: 4 }}
+							>
+								<Text size="sm" c="yellow">
+									{t("contextMenu.review")}
+								</Text>
+							</UnstyledButton>
+						)}
 					{nodeData.status === "active" && nodeData.role === "review" && (
 						<>
 							<Divider my={4} />
 							<UnstyledButton
 								px="xs"
 								py={4}
-								onClick={() => onConvertToSubagent(nodeId)}
-								disabled={nodeData.reviewStatus !== "concluded"}
+								onClick={() => canConvertToSubagent && onConvertToSubagent(nodeId)}
+								disabled={!canConvertToSubagent}
 								style={{
 									borderRadius: 4,
-									opacity: nodeData.reviewStatus !== "concluded" ? 0.4 : 1,
+									opacity: canConvertToSubagent ? 1 : 0.4,
 								}}
 							>
 								<Text size="sm">{t("contextMenu.reviewActions.sendToSource")}</Text>
@@ -132,16 +154,11 @@ export function NodeContextMenu({
 							<UnstyledButton
 								px="xs"
 								py={4}
-								onClick={() => onPromoteReview(nodeId)}
-								disabled={
-									nodeData.reviewStatus !== "concluded" && nodeData.reviewStatus !== "reviewing"
-								}
+								onClick={() => canPromoteReview && onPromoteReview(nodeId)}
+								disabled={!canPromoteReview}
 								style={{
 									borderRadius: 4,
-									opacity:
-										nodeData.reviewStatus !== "concluded" && nodeData.reviewStatus !== "reviewing"
-											? 0.4
-											: 1,
+									opacity: canPromoteReview ? 1 : 0.4,
 								}}
 							>
 								<Text size="sm">{t("contextMenu.reviewActions.promoteToChapter")}</Text>
@@ -149,8 +166,12 @@ export function NodeContextMenu({
 							<UnstyledButton
 								px="xs"
 								py={4}
-								onClick={() => onDismissReview(nodeId)}
-								style={{ borderRadius: 4 }}
+								onClick={() => effectiveReviewActions.dismiss && onDismissReview(nodeId)}
+								disabled={!effectiveReviewActions.dismiss}
+								style={{
+									borderRadius: 4,
+									opacity: effectiveReviewActions.dismiss ? 1 : 0.4,
+								}}
 							>
 								<Text size="sm" c="red">
 									{t("contextMenu.reviewActions.dismiss")}

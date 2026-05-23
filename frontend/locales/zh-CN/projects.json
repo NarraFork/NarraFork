@@ -65,6 +65,8 @@
 	"routinesButton": "套路",
 	"routinesTitle": "内置套路",
 	"routinesDesc": "为此叙事线启用或禁用内置命令和技能。可逐个覆盖全局设置。",
+	"routinesUnsupportedTitle": "项目级例程不可用",
+	"routinesUnsupportedDesc": "当前后端运行时不支持项目级例程覆盖。",
 	"routineFollowGlobal": "全局",
 	"skillsTitle": "叙事线技能",
 	"skillsDesc": "技能是为叙述者提供特定领域知识的可复用指令集。将 SKILL.md 文件放置在 .narrafork/skills/<name>/ 目录中。",

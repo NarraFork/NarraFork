@@ -26,6 +26,17 @@ type Listener = {
 	callbacks: TerminalWSCallbacks;
 };
 
+function terminalDiagnosticMessage(
+	msg: Record<string, unknown>,
+	fallback = "Terminal error",
+): string {
+	for (const key of ["reason", "message", "error", "code"]) {
+		const value = msg[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	return fallback;
+}
+
 // === Singleton WS Manager ===
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -271,7 +282,7 @@ class TerminalWSManager {
 					callbacks.onExit?.(msg.code as number);
 					break;
 				case "error":
-					callbacks.onError?.(msg.message as string);
+					callbacks.onError?.(terminalDiagnosticMessage(msg));
 					break;
 				case "requestResize":
 					callbacks.onRequestResize?.();

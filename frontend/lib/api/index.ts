@@ -23,7 +23,14 @@ export const api = {
 	...miscApi,
 };
 
-export { ApiError, clearToken, getToken, setToken } from "./client";
+export {
+	ApiError,
+	clearToken,
+	getToken,
+	readFetchError,
+	readFetchErrorMessage,
+	setToken,
+} from "./client";
 export type {
 	ApiEntity,
 	BaseContentBlock,
@@ -71,6 +78,9 @@ export type {
 	PublicCodexQuotaSegment,
 	PublicCodexQuotaTrendPoint,
 	RuntimeScanResult,
+	SearchFallback,
+	SearchMetadata,
+	SearchResponse,
 	SideCarRecord,
 	StorageCategoryResult,
 	StorageScanResult,

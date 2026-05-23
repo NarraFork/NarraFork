@@ -1,5 +1,6 @@
 import { useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useRemoveContainers } from "@frontend/hooks/useContainers";
+import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { api } from "@frontend/lib/api";
 import {
 	ActionIcon,
@@ -68,11 +69,16 @@ export function ContainerConfigModal({
 	const { t } = useTranslation("containers");
 	const updateChapter = useUpdateChapter();
 	const removeContainers = useRemoveContainers();
+	const containerCapability = useChapterContainersCapability();
+	const containerCapabilityReason = containerCapability.reason ?? t("capabilityUnsupported");
+	const canReadComposeInfo =
+		containerCapability.supported && containerCapability.routes.composeInfo;
+	const canRemoveContainers = containerCapability.supported && containerCapability.routes.remove;
 
 	const { data: composeInfo, isLoading: composeLoading } = useQuery({
 		queryKey: ["composeInfo", chapterId],
 		queryFn: () => api.getComposeInfo(chapterId),
-		enabled: opened,
+		enabled: opened && canReadComposeInfo,
 		gcTime: COMPOSE_INFO_QUERY_GC_TIME_MS,
 	});
 
@@ -106,6 +112,7 @@ export function ContainerConfigModal({
 	}
 
 	function handleRemoveContainers() {
+		if (!canRemoveContainers) return;
 		removeContainers.mutate(
 			{ chapterId, deleteVolumes: false },
 			{
@@ -127,6 +134,10 @@ export function ContainerConfigModal({
 				{/* Compose file detected info (read-only) */}
 				{composeLoading ? (
 					<Loader size="xs" />
+				) : !canReadComposeInfo ? (
+					<Text size="xs" c="dimmed">
+						{containerCapabilityReason}
+					</Text>
 				) : services.length > 0 ? (
 					<Stack gap="xs">
 						<Text size="sm" fw={500}>
@@ -247,6 +258,8 @@ export function ContainerConfigModal({
 							color="red"
 							onClick={handleRemoveContainers}
 							loading={removeContainers.isPending || updateChapter.isPending}
+							disabled={!canRemoveContainers}
+							title={!canRemoveContainers ? containerCapabilityReason : undefined}
 						>
 							{t("configModal.removeContainers")}
 						</Button>

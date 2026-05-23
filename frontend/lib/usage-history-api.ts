@@ -8,15 +8,16 @@ import type {
 	UsageHistoryTimeSeriesResponse,
 } from "@frontend/types/usage-history";
 
+import { ApiError, getToken, readFetchError } from "./api/client";
+
 async function fetchJson<T>(url: string): Promise<T> {
-	const token = localStorage.getItem("narrafork_token");
+	const token = getToken();
 	const response = await fetch(url, {
-		headers: {
-			Authorization: `Bearer ${token}`,
-		},
+		headers: token ? { Authorization: `Bearer ${token}` } : undefined,
 	});
 	if (!response.ok) {
-		throw new Error(`HTTP ${response.status}`);
+		const error = await readFetchError(response, `HTTP ${response.status}`);
+		throw new ApiError(error.message, response.status, error.data);
 	}
 	return response.json();
 }

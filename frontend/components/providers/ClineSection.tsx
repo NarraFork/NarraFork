@@ -24,12 +24,16 @@ import {
 	IconPlus,
 	IconRefresh,
 	IconSearch,
-	IconStar,
 	IconStarFilled,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderQuotaCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
@@ -62,6 +66,32 @@ export const ClineSection = React.memo(function ClineSection({
 }: ClineSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const clineRuntimeCapability = useProviderRuntimeCapability("cline");
+	const clineRefreshCapability = useProviderModelRefreshCapability("cline");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const clineRefreshReason = clineRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const clineQuotaCapability = useProviderQuotaCapability("cline");
+	const clineQuotaReason = clineQuotaCapability.reason ?? t("providerQuotaUnsupported");
+	const clineRoutesSupported = clineRuntimeCapability?.routes?.supported !== false;
+	const isClineRouteSupported = (route: string) =>
+		clineRoutesSupported && clineRuntimeCapability?.routes?.[route] !== false;
+	const canReadStatus = isClineRouteSupported("status");
+	const canReadBalance = isClineRouteSupported("balance") && clineQuotaCapability.supported;
+	const canReadRecommendedModels = isClineRouteSupported("recommendedModels");
+	const canSearchPool = isClineRouteSupported("poolSearch");
+	const canReadPoolCount = isClineRouteSupported("poolCount");
+	const canSetEnabledModels = isClineRouteSupported("enabledModels");
+	const canRefreshModels =
+		clineRefreshCapability.supported && isClineRouteSupported("modelsRefresh");
+	const clineRefreshUnsupportedReason = clineRefreshCapability.supported
+		? providerRouteUnsupportedReason
+		: clineRefreshReason;
+	const clineBalanceUnsupportedReason = clineQuotaCapability.supported
+		? providerRouteUnsupportedReason
+		: clineQuotaReason;
+	const canStartAuth = isClineRouteSupported("auth") && isClineRouteSupported("authBrowser");
+	const canImportCallback = isClineRouteSupported("auth") && isClineRouteSupported("authCallback");
+	const canLogout = isClineRouteSupported("logout");
 	const [refreshing, setRefreshing] = useState(false);
 	const [callbackUrl, setCallbackUrl] = useState("");
 	const [poolSearch, setPoolSearch] = useState("");
@@ -71,6 +101,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: clineStatus, refetch: refetchStatus } = useQuery({
 		queryKey: ["cline", "status"],
 		queryFn: api.clineStatus,
+		enabled: canReadStatus,
 		refetchInterval: (query) => {
 			if (query.state.data?.pendingAuth) return 2000;
 			return false;
@@ -86,7 +117,7 @@ export const ClineSection = React.memo(function ClineSection({
 	} = useQuery({
 		queryKey: ["cline", "balance"],
 		queryFn: api.clineBalance,
-		enabled: clineStatus?.authenticated === true,
+		enabled: clineStatus?.authenticated === true && canReadBalance,
 		staleTime: 60_000,
 		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
@@ -95,6 +126,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: recommendedData } = useQuery({
 		queryKey: ["cline", "recommended-models"],
 		queryFn: api.clineRecommendedModels,
+		enabled: canReadRecommendedModels,
 		staleTime: 30 * 60_000,
 		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
@@ -103,7 +135,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: poolData } = useQuery({
 		queryKey: ["cline", "pool", "search", debouncedSearch],
 		queryFn: () => api.clinePoolSearch(debouncedSearch, 100),
-		enabled: debouncedSearch.length >= 2,
+		enabled: canSearchPool && debouncedSearch.length >= 2,
 		staleTime: 60_000,
 		gcTime: CLINE_POOL_SEARCH_GC_TIME_MS,
 	});
@@ -112,6 +144,7 @@ export const ClineSection = React.memo(function ClineSection({
 	const { data: poolCountData } = useQuery({
 		queryKey: ["cline", "pool", "count"],
 		queryFn: api.clinePoolCount,
+		enabled: canReadPoolCount,
 		staleTime: 60_000,
 		gcTime: CLINE_PROVIDER_QUERY_GC_TIME_MS,
 	});
@@ -168,6 +201,7 @@ export const ClineSection = React.memo(function ClineSection({
 
 	// Refresh model pool
 	const handleRefreshModels = useCallback(async () => {
+		if (!canRefreshModels) return;
 		setRefreshing(true);
 		try {
 			await api.clineRefreshModels();
@@ -177,7 +211,7 @@ export const ClineSection = React.memo(function ClineSection({
 		} finally {
 			setRefreshing(false);
 		}
-	}, [qc, t]);
+	}, [canRefreshModels, qc, t]);
 
 	const isAuthenticated = clineStatus?.authenticated ?? false;
 	const isPending = clineStatus?.pendingAuth ?? false;
@@ -213,17 +247,18 @@ export const ClineSection = React.memo(function ClineSection({
 
 	const addModel = useCallback(
 		(modelId: string) => {
-			if (enabledSet.has(modelId)) return;
+			if (!canSetEnabledModels || enabledSet.has(modelId)) return;
 			setEnabledModelsMutation.mutate([...enabledModels, modelId]);
 		},
-		[enabledModels, enabledSet, setEnabledModelsMutation],
+		[canSetEnabledModels, enabledModels, enabledSet, setEnabledModelsMutation],
 	);
 
 	const removeModel = useCallback(
 		(modelId: string) => {
+			if (!canSetEnabledModels) return;
 			setEnabledModelsMutation.mutate(enabledModels.filter((id) => id !== modelId));
 		},
-		[enabledModels, setEnabledModelsMutation],
+		[canSetEnabledModels, enabledModels, setEnabledModelsMutation],
 	);
 
 	const poolCount = poolCountData?.count ?? 0;
@@ -246,7 +281,9 @@ export const ClineSection = React.memo(function ClineSection({
 									size="sm"
 									variant="subtle"
 									loading={balanceFetching}
-									onClick={() => refetchBalance()}
+									disabled={!canReadBalance}
+									title={!canReadBalance ? clineBalanceUnsupportedReason : undefined}
+									onClick={() => canReadBalance && refetchBalance()}
 								>
 									<IconRefresh size={14} />
 								</ActionIcon>
@@ -257,8 +294,10 @@ export const ClineSection = React.memo(function ClineSection({
 							variant="light"
 							color="red"
 							leftSection={<IconLogout size={14} />}
-							onClick={() => logoutMutation.mutate()}
+							onClick={() => canLogout && logoutMutation.mutate()}
 							loading={logoutMutation.isPending}
+							disabled={!canLogout}
+							title={!canLogout ? providerRouteUnsupportedReason : undefined}
 						>
 							{t("clineLogout")}
 						</Button>
@@ -268,8 +307,10 @@ export const ClineSection = React.memo(function ClineSection({
 						size="xs"
 						variant="light"
 						leftSection={<IconLogin size={14} />}
-						onClick={() => loginMutation.mutate()}
+						onClick={() => canStartAuth && loginMutation.mutate()}
 						loading={loginMutation.isPending || isPending}
+						disabled={!canStartAuth}
+						title={!canStartAuth ? providerRouteUnsupportedReason : undefined}
 					>
 						{isPending ? t("clineLoginLoading") : t("clineLogin")}
 					</Button>
@@ -297,9 +338,10 @@ export const ClineSection = React.memo(function ClineSection({
 							size="xs"
 							variant="light"
 							leftSection={<IconLink size={14} />}
-							onClick={() => importCallbackMutation.mutate(callbackUrl)}
+							onClick={() => canImportCallback && importCallbackMutation.mutate(callbackUrl)}
 							loading={importCallbackMutation.isPending}
-							disabled={!callbackUrl.trim()}
+							disabled={!callbackUrl.trim() || !canImportCallback}
+							title={!canImportCallback ? providerRouteUnsupportedReason : undefined}
 						>
 							{importCallbackMutation.isPending
 								? t("clineCallbackImporting")
@@ -330,7 +372,13 @@ export const ClineSection = React.memo(function ClineSection({
 											{m.id}
 										</Text>
 										{!enabledSet.has(m.id) ? (
-											<Button size="compact-xs" variant="subtle" onClick={() => addModel(m.id)}>
+											<Button
+												size="compact-xs"
+												variant="subtle"
+												onClick={() => canSetEnabledModels && addModel(m.id)}
+												disabled={!canSetEnabledModels}
+												title={!canSetEnabledModels ? providerRouteUnsupportedReason : undefined}
+											>
 												{t("clineAddRecommended")}
 											</Button>
 										) : (
@@ -345,7 +393,7 @@ export const ClineSection = React.memo(function ClineSection({
 						{recommendedData.recommended.length > 0 && (
 							<>
 								<Group gap={4}>
-									<IconStar size={14} color="var(--mantine-color-yellow-6)" />
+									<IconStarFilled size={14} color="var(--mantine-color-yellow-6)" />
 									<Text size="xs" fw={600}>
 										{t("clineRecommendedModels")}
 									</Text>
@@ -361,7 +409,13 @@ export const ClineSection = React.memo(function ClineSection({
 											{m.id}
 										</Text>
 										{!enabledSet.has(m.id) ? (
-											<Button size="compact-xs" variant="subtle" onClick={() => addModel(m.id)}>
+											<Button
+												size="compact-xs"
+												variant="subtle"
+												onClick={() => canSetEnabledModels && addModel(m.id)}
+												disabled={!canSetEnabledModels}
+												title={!canSetEnabledModels ? providerRouteUnsupportedReason : undefined}
+											>
 												{t("clineAddRecommended")}
 											</Button>
 										) : (
@@ -387,6 +441,8 @@ export const ClineSection = React.memo(function ClineSection({
 						variant="light"
 						leftSection={<IconRefresh size={12} />}
 						loading={refreshing}
+						disabled={!canRefreshModels}
+						title={!canRefreshModels ? clineRefreshUnsupportedReason : undefined}
 						onClick={handleRefreshModels}
 					>
 						{refreshing ? t("clineRefreshModelsLoading") : t("clineRefreshModels")}
@@ -406,7 +462,10 @@ export const ClineSection = React.memo(function ClineSection({
 					value={poolSearch}
 					onChange={(e) => setPoolSearch(e.currentTarget.value)}
 					size="xs"
+					disabled={!canSearchPool}
+					title={!canSearchPool ? providerRouteUnsupportedReason : undefined}
 				/>
+
 				{poolSearch.length >= 2 && poolData && (
 					<ScrollArea.Autosize mah={240}>
 						<Stack gap={2}>
@@ -453,7 +512,11 @@ export const ClineSection = React.memo(function ClineSection({
 											size="xs"
 											variant={isEnabled ? "filled" : "light"}
 											color={isEnabled ? "red" : "blue"}
-											onClick={() => (isEnabled ? removeModel(m.id) : addModel(m.id))}
+											onClick={() =>
+												canSetEnabledModels && (isEnabled ? removeModel(m.id) : addModel(m.id))
+											}
+											disabled={!canSetEnabledModels}
+											title={!canSetEnabledModels ? providerRouteUnsupportedReason : undefined}
 										>
 											{isEnabled ? <IconMinus size={12} /> : <IconPlus size={12} />}
 										</ActionIcon>
@@ -537,7 +600,13 @@ export const ClineSection = React.memo(function ClineSection({
 							>
 								{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
 							</ActionIcon>
-							<ActionIcon variant="subtle" color="red" onClick={() => removeModel(m.id)}>
+							<ActionIcon
+								variant="subtle"
+								color="red"
+								onClick={() => canSetEnabledModels && removeModel(m.id)}
+								disabled={!canSetEnabledModels}
+								title={!canSetEnabledModels ? providerRouteUnsupportedReason : undefined}
+							>
 								<IconMinus size={16} />
 							</ActionIcon>
 						</Group>

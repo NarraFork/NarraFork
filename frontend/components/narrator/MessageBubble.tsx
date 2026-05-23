@@ -62,9 +62,17 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
+import { useFileSystemCapability, useUploadCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api, getToken, type SideCarRecord } from "../../lib/api";
+import {
+	ApiError,
+	api,
+	clearToken,
+	getToken,
+	readFetchError,
+	type SideCarRecord,
+} from "../../lib/api";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
 import { ContentViewer } from "./ContentViewer";
@@ -645,11 +653,14 @@ function ImageGenerationBlock({
 }) {
 	const { t } = useTranslation("narrator");
 	const msgCtx = useMessageContextMenu();
+	const fsCapability = useFileSystemCapability();
+	const fsPreviewSupported = fsCapability.preview.supported;
 	const lod = useRenderLod();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const isGenerating = block.status && block.status !== "completed";
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loadError, setLoadError] = useState(false);
+	const [loadErrorMessage, setLoadErrorMessage] = useState<string | null>(null);
 	const [ctxMenuOpened, setCtxMenuOpened] = useState(false);
 	const [ctxMenuPos, setCtxMenuPos] = useState({ x: 0, y: 0, flipY: false });
 
@@ -662,14 +673,19 @@ function ImageGenerationBlock({
 
 	// Fetch image from savedPath via /api/fs/preview (blob URL)
 	useEffect(() => {
-		if (!block.savedPath) return;
+		if (!block.savedPath || !fsPreviewSupported) return;
 		let cancelled = false;
 		let objectUrl: string | null = null;
+		setLoadError(false);
+		setLoadErrorMessage(null);
 		fetch(`/api/fs/preview?path=${encodeURIComponent(block.savedPath)}`, {
 			headers: getPreviewHeaders(),
 		})
-			.then((r) => {
-				if (!r.ok) throw new Error(r.statusText);
+			.then(async (r) => {
+				if (!r.ok) {
+					const error = await readFetchError(r, "Request failed");
+					throw new ApiError(error.message, r.status, error.data);
+				}
 				return r.blob();
 			})
 			.then((blob) => {
@@ -679,14 +695,17 @@ function ImageGenerationBlock({
 					setBlobUrl(objectUrl);
 				}
 			})
-			.catch(() => {
-				if (!cancelled) setLoadError(true);
+			.catch((err) => {
+				if (!cancelled) {
+					setLoadError(true);
+					setLoadErrorMessage(err instanceof Error ? err.message : null);
+				}
 			});
 		return () => {
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [block.savedPath, getPreviewHeaders]);
+	}, [block.savedPath, fsPreviewSupported, getPreviewHeaders]);
 
 	// Determine image source: savedPath blob > bounded inline base64 > none
 	const inlineImageSrc =
@@ -698,7 +717,8 @@ function ImageGenerationBlock({
 	const imageSrc = blobUrl ?? inlineImageSrc;
 	const inlineResultUnavailable =
 		!block.savedPath && !!block.result && block.result.length > MAX_INLINE_IMAGE_RESULT_CHARS;
-	const imageUnavailable = loadError || inlineResultUnavailable;
+	const savedPathPreviewUnavailable = !!block.savedPath && !fsPreviewSupported && !inlineImageSrc;
+	const imageUnavailable = loadError || inlineResultUnavailable || savedPathPreviewUnavailable;
 	const hasImage = !!imageSrc && !imageUnavailable;
 	const imageMetrics = getImageGenerationDisplayMetrics(block);
 	const shouldReserveImageFrame =
@@ -715,7 +735,7 @@ function ImageGenerationBlock({
 				justifyContent: "center",
 			}
 		: undefined;
-	const canCopyImage = hasImage || !!block.savedPath;
+	const canCopyImage = hasImage || (!!block.savedPath && fsPreviewSupported);
 	const canCopyImagePath = !!block.savedPath;
 	const canSaveImage = hasImage;
 	const hasMenuActions = !!(
@@ -730,14 +750,17 @@ function ImageGenerationBlock({
 	);
 
 	const handleCopyImage = useCallback(async () => {
-		if (!imageSrc && !block.savedPath) return;
+		if (!imageSrc && (!block.savedPath || !fsPreviewSupported)) return;
 		try {
-			await copyGeneratedImageToClipboard({ imageSrc, savedPath: block.savedPath });
+			await copyGeneratedImageToClipboard({
+				imageSrc,
+				savedPath: fsPreviewSupported ? block.savedPath : null,
+			});
 			notifications.show({ color: "teal", message: t("copyImageSuccess") });
 		} catch {
 			notifications.show({ color: "red", message: t("copyImageFailed") });
 		}
-	}, [block.savedPath, imageSrc, t]);
+	}, [block.savedPath, fsPreviewSupported, imageSrc, t]);
 
 	const handleCopyImagePath = useCallback(async () => {
 		if (!block.savedPath) return;
@@ -815,7 +838,10 @@ function ImageGenerationBlock({
 							/>
 						) : imageUnavailable ? (
 							<Text size="xs" c="dimmed">
-								{t("imageLoadFailed", { defaultValue: "Failed to load image" })}
+								{savedPathPreviewUnavailable
+									? (fsCapability.preview.reason ?? t("filePreview_unsupported"))
+									: (loadErrorMessage ??
+										t("imageLoadFailed", { defaultValue: "Failed to load image" }))}
 							</Text>
 						) : (
 							<Skeleton h="100%" w="100%" radius="sm" />
@@ -1086,12 +1112,16 @@ function BlockMenuWrapper({
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
+	const { t } = useTranslation("narrator");
+	const uploadCapability = useUploadCapability();
+	const narratorImageServing = uploadCapability.serveNarratorImages;
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const uploadNarratorId =
 		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
 
 	useEffect(() => {
-		if (block.previewUrl || !uploadNarratorId || !block.imageId) return;
+		if (block.previewUrl || !narratorImageServing.supported || !uploadNarratorId || !block.imageId)
+			return;
 
 		const token = getToken();
 		const headers: Record<string, string> = {};
@@ -1100,7 +1130,13 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 		let cancelled = false;
 		let objectUrl: string | null = null;
 		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
-			.then((res) => (res.ok ? res.blob() : null))
+			.then((res) => {
+				if (!res.ok) {
+					if (res.status === 401) clearToken();
+					return null;
+				}
+				return res.blob();
+			})
 			.then((blob) => {
 				if (blob && !cancelled && blob.size <= MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) {
 					objectUrl = URL.createObjectURL(blob);
@@ -1113,9 +1149,19 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [uploadNarratorId, block.imageId, block.previewUrl]);
+	}, [uploadNarratorId, block.imageId, block.previewUrl, narratorImageServing.supported]);
 
 	const src = block.previewUrl ?? blobUrl;
+
+	if (!src && !narratorImageServing.supported) {
+		return (
+			<Paper p="sm" radius="sm" withBorder>
+				<Text size="sm" c="dimmed">
+					{narratorImageServing.reason ?? t("imagePreviewUnsupported")}
+				</Text>
+			</Paper>
+		);
+	}
 
 	if (!src) {
 		return <Skeleton h={200} w={300} radius="sm" />;

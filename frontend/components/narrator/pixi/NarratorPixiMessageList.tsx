@@ -28,6 +28,7 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../../hooks/useLocalPref";
+import { useFileSystemCapability, useUploadCapability } from "../../../hooks/usePlatform";
 import { copyGeneratedImageToClipboard } from "../image-clipboard";
 import { BLOCK_ID_ATTR, useMessageSelection } from "../MessageSelectionCtx";
 import { getRenderableMessageOrder } from "../message-order-utils";
@@ -300,6 +301,11 @@ export const NarratorPixiMessageList = forwardRef<
 ) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const fsCapability = useFileSystemCapability();
+	const fsPreviewSupported = fsCapability.preview.supported;
+	const uploadCapability = useUploadCapability();
+	const avatarServingSupported = uploadCapability.serveAvatars.supported;
+	const narratorImageServingSupported = uploadCapability.serveNarratorImages.supported;
 	const selection = useMessageSelection();
 	const viewportRef = useRef<HTMLDivElement | null>(null);
 	const canvasHostRef = useRef<HTMLDivElement | null>(null);
@@ -701,6 +707,9 @@ export const NarratorPixiMessageList = forwardRef<
 					? selectionRef.current.selectedBlockIds
 					: undefined,
 				getToolContentScroll: (scrollKey) => toolContentScrollMapRef.current.get(scrollKey) ?? 0,
+				fsPreviewSupported,
+				avatarServingSupported,
+				narratorImageServingSupported,
 				...(options?.bufferPx != null ? { bufferPx: options.bufferPx } : {}),
 			});
 			imagePool.releaseUnused();
@@ -714,6 +723,10 @@ export const NarratorPixiMessageList = forwardRef<
 			ready,
 			layout.items,
 			size.height,
+			fsPreviewSupported,
+			avatarServingSupported,
+			narratorImageServingSupported,
+
 			highlightedId,
 			themeVersion,
 			dprVersion,
@@ -1609,7 +1622,7 @@ export const NarratorPixiMessageList = forwardRef<
 			const messageId = target.messageId;
 			const blockIndex = target.blockIndex;
 			const canUseBlock = !!messageId && blockIndex != null;
-			const canCopyImage = !!(target.imageSrc || target.imageSavedPath);
+			const canCopyImage = !!target.imageSrc || (!!target.imageSavedPath && fsPreviewSupported);
 			return (
 				<>
 					{canCopyImage && (
@@ -1618,7 +1631,7 @@ export const NarratorPixiMessageList = forwardRef<
 							onClick={() => {
 								void copyGeneratedImageToClipboard({
 									imageSrc: target.imageSrc,
-									savedPath: target.imageSavedPath,
+									savedPath: fsPreviewSupported ? target.imageSavedPath : null,
 								})
 									.then(() => notifications.show({ color: "teal", message: t("copyImageSuccess") }))
 									.catch(() => notifications.show({ color: "red", message: t("copyImageFailed") }));
@@ -1696,6 +1709,7 @@ export const NarratorPixiMessageList = forwardRef<
 			);
 		},
 		[
+			fsPreviewSupported,
 			onAskInPassing,
 			onCompactBeforeMessage,
 			onDeleteBlock,

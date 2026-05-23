@@ -102,7 +102,14 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
 	const updateCapability = useUpdateCapability();
+	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
+	const downloadUnavailableReason = !updateCapability.download.supported
+		? (updateCapability.download.reason ?? t("updateDownloadUnavailable"))
+		: !updateCapability.download.sse
+			? t("updateDownloadRequiresSse")
+			: undefined;
 	const autoApplyAvailable =
+		updateCapability.apply.supported &&
 		updateCapability.selfUpdateAvailable &&
 		!updateCapability.manualOnly &&
 		updateCapability.canAutoRestart;
@@ -126,9 +133,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	});
 
 	const handleDownload = () => {
-		if (releaseInfo) {
-			download(releaseInfo);
-		}
+		if (!downloadAvailable || !releaseInfo) return;
+		download(releaseInfo);
 	};
 
 	const handleApply = async () => {
@@ -311,6 +317,8 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						leftSection={<IconDownload size={16} />}
 						onClick={handleDownload}
 						loading={isCheckingPreparedStatus}
+						disabled={!downloadAvailable}
+						title={downloadUnavailableReason}
 					>
 						{t("download")} ({formatBytes(downloadSize ?? totalSize ?? 0)})
 					</Button>
@@ -360,9 +368,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							color="orange"
 							size="xs"
 							mt={8}
+							disabled={!downloadAvailable}
+							title={downloadUnavailableReason}
 							onClick={() => {
 								reset();
-								if (releaseInfo) download(releaseInfo);
+								handleDownload();
 							}}
 						>
 							{t("retry")}

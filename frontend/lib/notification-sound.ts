@@ -3,7 +3,7 @@
  * Supports built-in oscillator-based sounds and custom audio files.
  */
 
-import { getToken } from "./api";
+import { clearToken, getToken } from "./api";
 
 let audioCtx: AudioContext | null = null;
 
@@ -138,7 +138,10 @@ export async function playCustomSound(url: string): Promise<void> {
 		if (token) headers.Authorization = `Bearer ${token}`;
 		try {
 			const res = await fetch(url, { headers });
-			if (!res.ok) return;
+			if (!res.ok) {
+				if (res.status === 401) clearToken();
+				return;
+			}
 			const blob = await res.blob();
 			if (blob.size > MAX_CUSTOM_AUDIO_BLOB_BYTES) return;
 			blobUrl = URL.createObjectURL(blob);

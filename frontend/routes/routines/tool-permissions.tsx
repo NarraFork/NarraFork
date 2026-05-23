@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Container,
@@ -17,7 +18,12 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMcpServers } from "../../hooks/useMcp";
-import { useMcpExternalToolsCapability } from "../../hooks/usePlatform";
+import {
+	useMcpBuiltinToolsCapability,
+	useMcpExternalAgentCapability,
+	useMcpExternalToolsCapability,
+	useNarratorToolInventoryCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 export const Route = createFileRoute("/routines/tool-permissions")({
@@ -53,6 +59,7 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Send", descKey: "tpToolDescSend", category: "default" },
 	{ name: "ShareFile", descKey: "tpToolDescShareFile", category: "optional" },
 	{ name: "Terminal", descKey: "tpToolDescTerminal", category: "optional" },
+	{ name: "Browser", descKey: "tpToolDescBrowser", category: "optional" },
 	{ name: "Recall", descKey: "tpToolDescRecall", category: "optional" },
 ];
 
@@ -256,8 +263,20 @@ function ToolPermissionsPage() {
 	);
 
 	// MCP servers
-	const { data: mcpServers } = useMcpServers();
 	const mcpExternalToolsCapability = useMcpExternalToolsCapability();
+	const { data: mcpServers } = useMcpServers({ enabled: mcpExternalToolsCapability.supported });
+	const mcpExternalAgentCapability = useMcpExternalAgentCapability();
+	const mcpBuiltinToolsCapability = useMcpBuiltinToolsCapability();
+	const toolInventoryCapability = useNarratorToolInventoryCapability();
+	const supportedOptionalTools = useMemo(
+		() => new Set(toolInventoryCapability.supportedOptionalTools),
+		[toolInventoryCapability.supportedOptionalTools],
+	);
+	const unsupportedOptionalTools = useMemo(
+		() => new Set(toolInventoryCapability.unsupportedOptionalTools),
+		[toolInventoryCapability.unsupportedOptionalTools],
+	);
+	const optionalToolSupportDeclared = toolInventoryCapability.supportedOptionalTools.length > 0;
 
 	// Selected tool for detail view
 	const [selectedTool, setSelectedTool] = useState<string | null>(null);
@@ -429,46 +448,97 @@ function ToolPermissionsPage() {
 			<Text size="sm" fw={600} mb="xs">
 				{t("tpBuiltinTools")}
 			</Text>
+			{(mcpBuiltinToolsCapability.parity === "partial" ||
+				mcpBuiltinToolsCapability.missing.length > 0 ||
+				!mcpBuiltinToolsCapability.supported) && (
+				<Alert
+					color={!mcpBuiltinToolsCapability.supported ? "yellow" : "blue"}
+					variant="light"
+					title={t("tpMcpBuiltinToolsPartialTitle")}
+					mb="xs"
+				>
+					{mcpBuiltinToolsCapability.reason ??
+						t("tpMcpBuiltinToolsPartial", {
+							missing: mcpBuiltinToolsCapability.missing.join(", ") || "—",
+						})}
+				</Alert>
+			)}
 			<Stack gap={6} mb="lg">
-				{BUILTIN_TOOLS.map((tool) => (
-					<Stack key={tool.name} gap={6}>
-						<Paper
-							withBorder
-							p="xs"
-							style={{ cursor: "pointer" }}
-							onClick={() => setSelectedTool(tool.name)}
-						>
-							<Group justify="space-between" wrap="nowrap">
-								<Group gap="xs">
-									<Text size="sm" fw={600}>
-										{tool.name}
+				{BUILTIN_TOOLS.map((tool) => {
+					const unsupportedOptionalTool =
+						tool.category === "optional" &&
+						(unsupportedOptionalTools.has(tool.name) ||
+							(optionalToolSupportDeclared && !supportedOptionalTools.has(tool.name)));
+					return (
+						<Stack key={tool.name} gap={6}>
+							<Paper
+								withBorder
+								p="xs"
+								style={{
+									cursor: unsupportedOptionalTool ? "not-allowed" : "pointer",
+									opacity: unsupportedOptionalTool ? 0.6 : 1,
+								}}
+								onClick={() => {
+									if (unsupportedOptionalTool) return;
+									setSelectedTool(tool.name);
+								}}
+							>
+								<Group justify="space-between" wrap="nowrap">
+									<Group gap="xs">
+										<Text size="sm" fw={600}>
+											{tool.name}
+										</Text>
+										<Badge size="xs" variant="light" color={categoryColor(tool.category)}>
+											{categoryLabel(tool.category, t)}
+										</Badge>
+										{unsupportedOptionalTool && (
+											<Badge size="xs" variant="outline" color="gray">
+												{t("tpToolUnsupported")}
+											</Badge>
+										)}
+									</Group>
+									<Text size="xs" c="dimmed" lineClamp={1} style={{ maxWidth: 400 }}>
+										{t(tool.descKey)}
 									</Text>
-									<Badge size="xs" variant="light" color={categoryColor(tool.category)}>
-										{categoryLabel(tool.category, t)}
-									</Badge>
 								</Group>
-								<Text size="xs" c="dimmed" lineClamp={1} style={{ maxWidth: 400 }}>
-									{t(tool.descKey)}
-								</Text>
-							</Group>
-						</Paper>
-						{tool.name === "ExitPlanMode" && (
-							<Paper withBorder p="xs" ml="md">
-								<Switch
-									label={t("tpPlanReflectionAutoApprove")}
-									description={t("tpPlanReflectionAutoApproveDesc")}
-									checked={planReflectionAutoApprove}
-									onChange={(e) => handlePlanReflectionAutoApproveChange(e.currentTarget.checked)}
-									disabled={updateSettings.isPending}
-									size="sm"
-								/>
 							</Paper>
-						)}
-					</Stack>
-				))}
+							{tool.name === "ExitPlanMode" && (
+								<Paper withBorder p="xs" ml="md">
+									<Switch
+										label={t("tpPlanReflectionAutoApprove")}
+										description={t("tpPlanReflectionAutoApproveDesc")}
+										checked={planReflectionAutoApprove}
+										onChange={(e) => handlePlanReflectionAutoApproveChange(e.currentTarget.checked)}
+										disabled={updateSettings.isPending}
+										size="sm"
+									/>
+								</Paper>
+							)}
+						</Stack>
+					);
+				})}
 			</Stack>
 
 			{/* MCP tools */}
+			{mcpServers &&
+				mcpServers.length > 0 &&
+				(!mcpExternalAgentCapability.supported ||
+					mcpExternalAgentCapability.parity === "partial" ||
+					mcpExternalAgentCapability.reason) && (
+					<Alert
+						color={
+							!mcpExternalAgentCapability.supported ||
+							mcpExternalAgentCapability.parity === "partial"
+								? "yellow"
+								: "blue"
+						}
+						variant="light"
+						title={t("tpMcpAgentInjectionTitle")}
+						mb="xs"
+					>
+						{mcpExternalAgentCapability.reason ?? t("tpMcpAgentInjectionPartial")}
+					</Alert>
+				)}
 			{mcpServers && mcpServers.length > 0 && !mcpExternalToolsCapability.supported && (
 				<Text size="xs" c="orange" mb="xs">
 					{mcpExternalToolsCapability.reason ?? t("tpMcpToolsUnsupported")}

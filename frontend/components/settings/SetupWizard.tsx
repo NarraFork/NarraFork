@@ -13,6 +13,7 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { useDebouncedCallback } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -499,11 +500,20 @@ function NetworkStep() {
 		onSuccess: (data) => {
 			qc.invalidateQueries({ queryKey: ["settings"] });
 			// Server is restarting at a new address — redirect after a short delay
-			const resp = data as { serverRestarting?: boolean; newUrl?: string };
+			const resp = data as {
+				serverRestarting?: boolean;
+				manualRestartRequired?: boolean;
+				newUrl?: string;
+			};
 			if (resp.serverRestarting && resp.newUrl) {
 				setTimeout(() => {
 					window.location.href = resp.newUrl as string;
 				}, 1000);
+			} else if (resp.manualRestartRequired) {
+				notifications.show({
+					message: t("serverRestartRequired"),
+					color: "yellow",
+				});
 			}
 		},
 	});

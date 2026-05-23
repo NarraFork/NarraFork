@@ -1,10 +1,11 @@
-import { Affix, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
+import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../../components/providers/providers-reducer";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useAllModels } from "../../hooks/useModels";
+import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { normalizeProxyUrl } from "../../lib/proxy";
@@ -56,11 +58,61 @@ function getDirtyProviderIds<T extends { id: string }>(
 	return dirtyIds;
 }
 
+function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: SavedSnapshot) {
+	const migratedWindows = { ...state.modelContextWindows };
+	for (const providers of [
+		{ cur: state.customApiProviders, saved: savedSnapshot.customApiProviders },
+		{ cur: state.nugProviders, saved: savedSnapshot.nugProviders },
+	]) {
+		for (const provider of providers.cur) {
+			const original = providers.saved.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${original.prefix}:`)) {
+						const model = key.slice(original.prefix.length + 1);
+						migratedWindows[`${provider.prefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
+	}
+
+	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
+		...provider,
+		proxy: normalizeProxyUrl(provider.proxy) ?? "",
+	}));
+	const normalizedState: ProvidersState = {
+		...state,
+		customApiProviders: normalizedCustomApiProviders,
+		modelContextWindows: migratedWindows,
+	};
+	const snapshot = createSnapshot(normalizedState);
+
+	return {
+		normalizedState,
+		snapshot,
+		payload: {
+			customApiProviders: normalizedCustomApiProviders,
+			nugProviders: state.nugProviders,
+			agent: {
+				hiddenModels: [...state.hiddenModels],
+				customModels: state.customModels,
+				modelContextWindows: migratedWindows,
+				providerOrder: state.providerOrder,
+				disabledProviders: [...state.disabledProviders],
+			},
+		} satisfies Record<string, unknown>,
+	};
+}
+
 function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("settings");
 	const { t: tc } = useTranslation("common");
+	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
+	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const search = useSearch({ strict: false }) as {
 		oauth_success?: string;
@@ -197,47 +249,28 @@ function SettingsProvidersPage() {
 	const handleDiscard = useCallback(() => {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
-	const handleSave = useCallback(() => {
-		const migratedWindows = { ...state.modelContextWindows };
-		const snap = savedSnapshot.current;
-		for (const providers of [
-			{ cur: state.customApiProviders, saved: snap.customApiProviders },
-			{ cur: state.nugProviders, saved: snap.nugProviders },
-		]) {
-			for (const provider of providers.cur) {
-				const original = providers.saved.find(
-					(p: { id: string; prefix: string }) => p.id === provider.id,
-				);
-				if (original && original.prefix !== provider.prefix) {
-					for (const key of Object.keys(migratedWindows)) {
-						if (key.startsWith(`${original.prefix}:`)) {
-							const model = key.slice(original.prefix.length + 1);
-							migratedWindows[`${provider.prefix}:${model}`] = migratedWindows[key];
-							delete migratedWindows[key];
-						}
-					}
-				}
+
+	const saveProvidersState = useCallback(
+		async (stateToSave: ProvidersState = state) => {
+			if (!settingsFeatureCapability.patchSupported) {
+				notifications.show({
+					title: t("settingsPatchUnsupportedWarning"),
+					message: t("settingsPatchUnsupportedWarningDesc"),
+					color: "yellow",
+				});
+				throw new Error(t("settingsPatchUnsupportedWarningDesc"));
 			}
-		}
-		const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
-			...provider,
-			proxy: normalizeProxyUrl(provider.proxy) ?? "",
-		}));
-		const normalizedState = { ...state, customApiProviders: normalizedCustomApiProviders };
-		pendingSnapshot.current = createSnapshot(normalizedState);
-		dispatchers.setCustomApiProviders(normalizedCustomApiProviders);
-		updateMutation.mutate({
-			customApiProviders: normalizedCustomApiProviders,
-			nugProviders: state.nugProviders,
-			agent: {
-				hiddenModels: [...state.hiddenModels],
-				customModels: state.customModels,
-				modelContextWindows: migratedWindows,
-				providerOrder: state.providerOrder,
-				disabledProviders: [...state.disabledProviders],
-			},
-		});
-	}, [dispatchers, updateMutation, state]);
+			const { snapshot, payload } = prepareProviderSettingsSave(stateToSave, savedSnapshot.current);
+			pendingSnapshot.current = snapshot;
+			await updateMutation.mutateAsync(payload);
+			dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot });
+		},
+		[settingsFeatureCapability.patchSupported, t, updateMutation, state],
+	);
+
+	const handleSave = useCallback(() => {
+		void saveProvidersState().catch(() => {});
+	}, [saveProvidersState]);
 
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
@@ -315,6 +348,51 @@ function SettingsProvidersPage() {
 			}
 		},
 		[dispatchers],
+	);
+
+	const confirmSaveBeforeRefresh = useCallback(async () => {
+		const confirmed = await confirm({
+			title: t("saveBeforeRefreshTitle"),
+			message: t("saveBeforeRefreshMessage"),
+			confirmLabel: t("saveAndRefresh"),
+			cancelLabel: tc("cancel"),
+			confirmColor: "indigo",
+		});
+		if (!confirmed) return false;
+		try {
+			await saveProvidersState();
+			return true;
+		} catch {
+			return false;
+		}
+	}, [confirm, saveProvidersState, t, tc]);
+
+	const saveBeforeNugAction = useCallback(async () => {
+		try {
+			await saveProvidersState();
+			return true;
+		} catch {
+			return false;
+		}
+	}, [saveProvidersState]);
+
+	const saveNugLoginResult = useCallback(
+		async (providerId: string, apiKey: string, username: string) => {
+			const nextState: ProvidersState = {
+				...state,
+				nugProviders: state.nugProviders.map((provider) =>
+					provider.id === providerId ? { ...provider, apiKey, nugUsername: username } : provider,
+				),
+			};
+			dispatchers.setNugProviders(nextState.nugProviders);
+			try {
+				await saveProvidersState(nextState);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+		[dispatchers, saveProvidersState, state],
 	);
 
 	// ── Models maps (memoized) ──
@@ -560,6 +638,9 @@ function SettingsProvidersPage() {
 						getPrefixError={getPrefixError}
 						onTestModel={setTestingModel}
 						onServerContextWindowsMerge={handleServerContextWindowsMerge}
+						onSaveBeforeRefresh={confirmSaveBeforeRefresh}
+						onSaveBeforeNugAction={saveBeforeNugAction}
+						onNugLoginSuccess={saveNugLoginResult}
 					/>
 				</ProviderConfigView>
 			);
@@ -599,6 +680,11 @@ function SettingsProvidersPage() {
 					<Group gap="xs">
 						<Title order={2}>{t("providersTitle")}</Title>
 					</Group>
+					{!settingsFeatureCapability.patchSupported && (
+						<Alert color="yellow" variant="light" title={t("settingsPatchUnsupportedWarning")}>
+							{t("settingsPatchUnsupportedWarningDesc")}
+						</Alert>
+					)}
 
 					<Box style={{ flex: 1, overflowY: "auto", overflowX: "hidden", minHeight: 0 }}>
 						{renderContent()}
@@ -623,6 +709,12 @@ function SettingsProvidersPage() {
 							<Button
 								onClick={handleSave}
 								loading={updateMutation.isPending}
+								disabled={!settingsFeatureCapability.patchSupported}
+								title={
+									!settingsFeatureCapability.patchSupported
+										? t("settingsPatchUnsupportedWarningDesc")
+										: undefined
+								}
 								size="md"
 								style={{
 									animation: highlight ? "providersPulse 1.5s ease" : undefined,
@@ -667,6 +759,9 @@ interface ProviderSectionContentProps {
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	onTestModel: (model: string) => void;
 	onServerContextWindowsMerge?: (windows: Record<string, number>) => void;
+	onSaveBeforeRefresh: () => Promise<boolean>;
+	onSaveBeforeNugAction: () => Promise<boolean>;
+	onNugLoginSuccess: (providerId: string, apiKey: string, username: string) => Promise<boolean>;
 }
 
 function ProviderSectionContent({
@@ -682,6 +777,9 @@ function ProviderSectionContent({
 	getPrefixError,
 	onTestModel,
 	onServerContextWindowsMerge,
+	onSaveBeforeRefresh,
+	onSaveBeforeNugAction,
+	onNugLoginSuccess,
 }: ProviderSectionContentProps) {
 	// Platform providers: matched by prefix
 		return (
@@ -744,6 +842,7 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
 				onTestModel={onTestModel}
+				onSaveBeforeRefresh={onSaveBeforeRefresh}
 			/>
 		);
 	}
@@ -756,6 +855,7 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
 				onTestModel={onTestModel}
+				onSaveBeforeRefresh={onSaveBeforeRefresh}
 			/>
 		);
 	}
@@ -775,6 +875,9 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
 				onTestModel={onTestModel}
+				onSaveBeforeRefresh={onSaveBeforeRefresh}
+				onSaveBeforeNugAction={onSaveBeforeNugAction}
+				onLoginSuccess={onNugLoginSuccess}
 			/>
 		);
 	}

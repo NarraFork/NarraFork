@@ -785,12 +785,17 @@ function drawUserAvatar(
 	item: PixiLaidOutItem["item"],
 	x: number,
 	y: number,
+	avatarServingSupported: boolean,
 ) {
 	const bg = parseHexColor(item.creator?.avatarColor) ?? theme.indigo;
 	gfx.circle(x + 10, y + 10, 10);
 	gfx.fill({ color: bg, alpha: 1 });
 
-	const { texture, status } = getPixiAvatarTexture(item.creator?.id, item.creator?.avatarImageId);
+	const { texture, status } = getPixiAvatarTexture(
+		item.creator?.id,
+		item.creator?.avatarImageId,
+		avatarServingSupported,
+	);
 	if (texture && texture !== Texture.EMPTY) {
 		imagePool.acquire(texture, x, y, 20, 20, 1, { kind: "circle", radius: 10 });
 		return;
@@ -991,21 +996,44 @@ function drawWebSearchBlock(opts: DrawSpecialBlockOptions) {
 	);
 }
 
-function textureForImageBlock(block: PixiLaidOutBlock): PixiImageTextureResult {
+function textureForImageBlock(
+	block: PixiLaidOutBlock,
+	fsPreviewSupported: boolean,
+	narratorImageServingSupported: boolean,
+): PixiImageTextureResult {
 	if (block.type === "image_generation") {
 		return getPixiGeneratedImageTexture({
 			result: block.imageSrc,
 			savedPath: block.imageSavedPath,
+			fsPreviewSupported,
 		});
 	}
 	const preview = getPixiPreviewImageTexture(block.imageSrc);
 	if (preview.status !== "idle") return preview;
-	return getPixiUploadImageTexture(block.imageUploadNarratorId, block.imageId);
+	return getPixiUploadImageTexture(
+		block.imageUploadNarratorId,
+		block.imageId,
+		narratorImageServingSupported,
+	);
 }
 
 function drawImageBlock(opts: DrawSpecialBlockOptions) {
-	const { textPool, imagePool, gfx, block, bx, by, theme } = opts;
-	const textureResult = textureForImageBlock(block);
+	const {
+		textPool,
+		imagePool,
+		gfx,
+		block,
+		bx,
+		by,
+		theme,
+		fsPreviewSupported = true,
+		narratorImageServingSupported = true,
+	} = opts;
+	const textureResult = textureForImageBlock(
+		block,
+		fsPreviewSupported,
+		narratorImageServingSupported,
+	);
 	const texture = textureResult.texture;
 	const maxWidth = Math.min(block.width, 512);
 	const maxHeight = block.height;
@@ -1214,6 +1242,9 @@ interface DrawSpecialBlockOptions {
 	theme: PixiMessageTheme;
 	hitTargets?: PixiMessageHitTarget[];
 	hoveredHitTargetId?: string | null;
+	fsPreviewSupported?: boolean;
+	avatarServingSupported?: boolean;
+	narratorImageServingSupported?: boolean;
 }
 
 function compactBadgeText(text: string, maxWidth: number): string {
@@ -2015,6 +2046,9 @@ export function drawPixiMessages(opts: {
 	swipedMessage?: { targetId: string; offset: number; offscreen?: "top" | "bottom" | null } | null;
 	selectedBlockIds?: ReadonlySet<string>;
 	getToolContentScroll?: (scrollKey: string) => number;
+	fsPreviewSupported?: boolean;
+	avatarServingSupported?: boolean;
+	narratorImageServingSupported?: boolean;
 }) {
 	const {
 		textPool,
@@ -2032,6 +2066,9 @@ export function drawPixiMessages(opts: {
 		swipedMessage,
 		selectedBlockIds,
 		getToolContentScroll,
+		fsPreviewSupported = true,
+		avatarServingSupported = true,
+		narratorImageServingSupported = true,
 	} = opts;
 	gfx.clear();
 	if (hitTargets) hitTargets.length = 0;
@@ -2123,7 +2160,16 @@ export function drawPixiMessages(opts: {
 			const headerY = y + 12;
 			const titleX = isUser ? headerX + 26 : headerX;
 			if (isUser) {
-				drawUserAvatar(textPool, imagePool, gfx, theme, item, headerX, headerY);
+				drawUserAvatar(
+					textPool,
+					imagePool,
+					gfx,
+					theme,
+					item,
+					headerX,
+					headerY,
+					avatarServingSupported,
+				);
 			}
 			textPool.acquire(
 				item.title,
@@ -2219,6 +2265,9 @@ export function drawPixiMessages(opts: {
 					theme,
 					hitTargets,
 					hoveredHitTargetId,
+					fsPreviewSupported,
+					avatarServingSupported,
+					narratorImageServingSupported,
 				})
 			) {
 				continue;

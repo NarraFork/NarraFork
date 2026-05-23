@@ -3,6 +3,7 @@ import { ActionIcon, Box, Drawer, Group, Tabs, Text } from "@mantine/core";
 import { IconFileCode, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { FileApprovalTab } from "./FileApprovalTab";
 import { FileDeletePreviewTab } from "./FileDeletePreviewTab";
 import { FileSummaryTab } from "./FileSummaryTab";
@@ -38,6 +39,9 @@ export function FileModificationsPanel({
 }: FileModificationsPanelProps) {
 	const { t } = useTranslation("narrator");
 	const { data: narrator } = useNarrator(narratorId);
+	const permissionCapability = useNarratorPermissionsCapability();
+	const permissionDecisionSupported =
+		permissionCapability.supported && permissionCapability.approveDeny;
 	const basePath = narrator?.cwd ?? null;
 	const [activeTab, setActiveTab] = useState<string>("summary");
 
@@ -66,6 +70,7 @@ export function FileModificationsPanel({
 		decision: "allow" | "deny",
 		feedbackText?: string,
 	) => {
+		if (!permissionDecisionSupported) return;
 		onPermissionDecision?.(requestId, decision, feedbackText);
 		setActiveTab("summary");
 	};
@@ -116,6 +121,7 @@ export function FileModificationsPanel({
 							narratorId={narratorId}
 							basePath={basePath}
 							permission={pendingPermission}
+							readOnly={!permissionDecisionSupported}
 							onDecision={handlePermissionDecision}
 						/>
 					</Tabs.Panel>

@@ -1,6 +1,15 @@
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export interface ChapterSplitResult {
+	prefixChapter: ApiEntity;
+	continuationChapter: ApiEntity;
+	newForkChapter: ApiEntity;
+	commitSha: string;
+	warnings?: string[];
+	fallbacks?: Array<Record<string, unknown>>;
+}
+
 export const chaptersApi = {
 	listChapters: (projectId: string, status?: string) =>
 		request<ApiEntity[]>(`/chapters?projectId=${projectId}${status ? `&status=${status}` : ""}`),
@@ -126,7 +135,7 @@ export const chaptersApi = {
 			newFork: { title: string; description?: string; inheritMode?: string };
 		},
 	) =>
-		request<ApiEntity>(`/chapters/${id}/split`, {
+		request<ChapterSplitResult>(`/chapters/${id}/split`, {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
@@ -263,6 +272,12 @@ export const chaptersApi = {
 			passt: { ok: boolean; version?: string };
 			rootlessNetwork: { ok: boolean; backend?: string };
 			allReady: boolean;
+			supported?: boolean;
+			fallback?: boolean;
+			reason?: string;
+			error?: string;
+			message?: string;
+			code?: string;
 		}>(`/chapters/container-setup${refresh ? "?refresh=true" : ""}`),
 	getPodmanStatus: () =>
 		request<{
@@ -272,6 +287,9 @@ export const chaptersApi = {
 			supported: boolean;
 			fallback?: boolean;
 			reason?: string;
+			error?: string;
+			message?: string;
+			code?: string;
 		}>("/chapters/podman/status"),
 	installPodman: () =>
 		request<{ ok: boolean; installed?: boolean; version?: string; code?: string; error?: string }>(

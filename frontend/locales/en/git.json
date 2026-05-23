@@ -37,5 +37,7 @@
 	"fileStatus.R": "Renamed",
 	"fileStatus.??": "Untracked",
 	"commitEmpty": "No commits yet",
+	"splitHere": "Split chapter here",
+	"splitUnsupported": "Chapter split is not available in this backend runtime.",
 	"loadMore": "Load More"
 }

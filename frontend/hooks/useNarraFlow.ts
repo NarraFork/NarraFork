@@ -2,6 +2,7 @@ import dagre from "@dagrejs/dagre";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "../lib/api";
+import type { ProjectGraphResponse } from "../lib/api/projects";
 
 const NODE_WIDTH = 280;
 const NODE_HEIGHT = 120;
@@ -165,6 +166,44 @@ export interface OpenedTerminal {
 
 const NARRA_FLOW_GC_TIME_MS = 60_000;
 
+export interface GraphRuntimeStatus {
+	degraded: boolean;
+	graphReadRefresh: boolean;
+	fallbackMessages: string[];
+}
+
+type ProjectGraphFallback = NonNullable<ProjectGraphResponse["fallbacks"]>[number];
+
+function fallbackText(fallback: ProjectGraphFallback, key: string): string {
+	const value = fallback[key];
+	return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function formatGraphFallbackMessage(fallback: ProjectGraphFallback): string {
+	const feature = fallbackText(fallback, "feature") || "graph";
+	const reason =
+		fallbackText(fallback, "reason") ||
+		fallbackText(fallback, "message") ||
+		fallbackText(fallback, "error") ||
+		fallbackText(fallback, "code") ||
+		"fallback";
+	const detail = fallbackText(fallback, "message") || fallbackText(fallback, "error");
+	return detail && detail !== reason
+		? `${feature}: ${reason} — ${detail}`
+		: `${feature}: ${reason}`;
+}
+
+export function summarizeGraphRuntimeState(graph?: ProjectGraphResponse): GraphRuntimeStatus {
+	const fallbacks = Array.isArray(graph?.fallbacks) ? graph.fallbacks : [];
+	const fallbackMessages = fallbacks.map((fallback) => formatGraphFallbackMessage(fallback));
+	const graphReadRefresh = graph?.capabilities?.commitSync?.graphReadRefresh === true;
+	return {
+		degraded: graph?.degraded === true || fallbackMessages.length > 0,
+		graphReadRefresh,
+		fallbackMessages,
+	};
+}
+
 export function useNarraFlow(projectId: string) {
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["narraFlow", projectId],
@@ -206,5 +245,7 @@ export function useNarraFlow(projectId: string) {
 		};
 	}, [data]);
 
-	return { ...layoutData, isLoading, error };
+	const graphRuntimeStatus = useMemo(() => summarizeGraphRuntimeState(data), [data]);
+
+	return { ...layoutData, graphRuntimeStatus, isLoading, error };
 }

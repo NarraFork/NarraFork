@@ -37,5 +37,7 @@
 	"fileStatus.R": "已重命名",
 	"fileStatus.??": "未追踪",
 	"commitEmpty": "暂无提交",
+	"splitHere": "在此拆分章节",
+	"splitUnsupported": "当前后端运行时不支持章节拆分。",
 	"loadMore": "加载更多"
 }

@@ -3,6 +3,7 @@ import { statusRegistry } from "@frontend/lib/status-registry";
 import {
 	Badge,
 	Box,
+	Button,
 	Code,
 	Collapse,
 	Divider,
@@ -26,6 +27,8 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useChapterSplitCapability } from "../../hooks/usePlatform";
+import { ChapterSplitModal } from "./ChapterSplitModal";
 
 interface CommitDetailModalProps {
 	chapterId: string;
@@ -240,6 +243,11 @@ export function CommitDetailModal({
 	onClose,
 }: CommitDetailModalProps) {
 	const { t } = useTranslation("chapters");
+	const chapterSplitCapability = useChapterSplitCapability();
+	const splitUnsupportedReason = chapterSplitCapability.supported
+		? undefined
+		: (chapterSplitCapability.reason ?? t("splitUnsupported"));
+	const [splitOpened, setSplitOpened] = useState(false);
 
 	const { data, isLoading } = useQuery({
 		queryKey: ["commitDetail", chapterId, commitSha],
@@ -259,102 +267,123 @@ export function CommitDetailModal({
 	const fullMessageTruncated = !!data?.fullMessage && displayedFullMessage !== data.fullMessage;
 
 	return (
-		<Modal
-			opened={opened}
-			onClose={onClose}
-			title={
-				<Group gap={8}>
-					<Code>{commitSha?.slice(0, 10)}</Code>
-					<Text size="sm" lineClamp={1}>
-						{clampCommitDetailInlineText(data?.message)}
-					</Text>
-				</Group>
-			}
-			size="xl"
-			styles={{
-				body: { padding: 0 },
-				header: { paddingBottom: 0 },
-			}}
-		>
-			{isLoading && (
-				<Group justify="center" py="xl">
-					<Loader size="sm" />
-				</Group>
-			)}
+		<>
+			<Modal
+				opened={opened}
+				onClose={onClose}
+				title={
+					<Group gap={8}>
+						<Code>{commitSha?.slice(0, 10)}</Code>
+						<Text size="sm" lineClamp={1}>
+							{clampCommitDetailInlineText(data?.message)}
+						</Text>
+					</Group>
+				}
+				size="xl"
+				styles={{
+					body: { padding: 0 },
+					header: { paddingBottom: 0 },
+				}}
+			>
+				{isLoading && (
+					<Group justify="center" py="xl">
+						<Loader size="sm" />
+					</Group>
+				)}
 
-			{data && (
-				<Stack gap={0}>
-					<Box px="md" py="sm">
-						<Group gap="xs" mb={4}>
-							<Text size="xs" c="dimmed">
-								{data.authorName}
-							</Text>
-							<Text size="xs" c="dimmed">
-								·
-							</Text>
-							<Text size="xs" c="dimmed">
-								{new Date(data.authoredAt).toLocaleString()}
-							</Text>
-							<Badge size="xs" variant="light" color="gray">
-								{data.source}
-							</Badge>
-						</Group>
-						{displayedFullMessage && displayedFullMessage !== data.message && (
-							<>
-								<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }} mt={4}>
-									{displayedFullMessage}
+				{data && (
+					<Stack gap={0}>
+						<Box px="md" py="sm">
+							<Group gap="xs" mb={4}>
+								<Text size="xs" c="dimmed">
+									{data.authorName}
 								</Text>
-								{fullMessageTruncated && (
-									<Text size="xs" c="orange" mt={2}>
-										{t("commitDetail.messagePreviewTruncated")}
+								<Text size="xs" c="dimmed">
+									·
+								</Text>
+								<Text size="xs" c="dimmed">
+									{new Date(data.authoredAt).toLocaleString()}
+								</Text>
+								<Badge size="xs" variant="light" color="gray">
+									{data.source}
+								</Badge>
+								<Button
+									size="compact-xs"
+									variant="light"
+									disabled={!chapterSplitCapability.supported || !commitSha}
+									title={splitUnsupportedReason}
+									onClick={() => {
+										if (!chapterSplitCapability.supported || !commitSha) return;
+										setSplitOpened(true);
+									}}
+								>
+									{t("splitHere")}
+								</Button>
+							</Group>
+							{displayedFullMessage && displayedFullMessage !== data.message && (
+								<>
+									<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }} mt={4}>
+										{displayedFullMessage}
+									</Text>
+									{fullMessageTruncated && (
+										<Text size="xs" c="orange" mt={2}>
+											{t("commitDetail.messagePreviewTruncated")}
+										</Text>
+									)}
+								</>
+							)}
+							<Group gap="xs" mt={4}>
+								<Text size="xs" c="dimmed">
+									{data.files.length} file(s)
+								</Text>
+								{totalAdded > 0 && (
+									<Text size="xs" c="green">
+										+{totalAdded}
 									</Text>
 								)}
-							</>
-						)}
-						<Group gap="xs" mt={4}>
-							<Text size="xs" c="dimmed">
-								{data.files.length} file(s)
-							</Text>
-							{totalAdded > 0 && (
-								<Text size="xs" c="green">
-									+{totalAdded}
-								</Text>
-							)}
-							{totalRemoved > 0 && (
-								<Text size="xs" c="red">
-									-{totalRemoved}
-								</Text>
-							)}
-						</Group>
-					</Box>
+								{totalRemoved > 0 && (
+									<Text size="xs" c="red">
+										-{totalRemoved}
+									</Text>
+								)}
+							</Group>
+						</Box>
 
-					<Divider />
+						<Divider />
 
-					<ScrollArea.Autosize mah="65vh" px="sm" py="xs">
-						<Stack gap={0}>
-							{displayedFiles.map((file) => (
-								<FileDiffRow
-									key={file.path}
-									chapterId={chapterId}
-									sha={data.sha}
-									file={file}
-									inlineDiff={data.diffInlined ? file.diff : undefined}
-								/>
-							))}
-							{hiddenFiles > 0 && (
-								<Text size="xs" c="dimmed" ta="center" py="sm">
-									{t("commitDetail.filesPreviewTruncated", { count: hiddenFiles })}
-								</Text>
-							)}
-							{data.files.length === 0 && (
-								<Text size="sm" c="dimmed" ta="center" py="xl">
-									{t("commitDetail.noDiff", "No file changes in this commit.")}
-								</Text>
-							)}
-						</Stack>
-					</ScrollArea.Autosize>
-				</Stack>
-			)}
-		</Modal>
+						<ScrollArea.Autosize mah="65vh" px="sm" py="xs">
+							<Stack gap={0}>
+								{displayedFiles.map((file) => (
+									<FileDiffRow
+										key={file.path}
+										chapterId={chapterId}
+										sha={data.sha}
+										file={file}
+										inlineDiff={data.diffInlined ? file.diff : undefined}
+									/>
+								))}
+								{hiddenFiles > 0 && (
+									<Text size="xs" c="dimmed" ta="center" py="sm">
+										{t("commitDetail.filesPreviewTruncated", { count: hiddenFiles })}
+									</Text>
+								)}
+								{data.files.length === 0 && (
+									<Text size="sm" c="dimmed" ta="center" py="xl">
+										{t("commitDetail.noDiff", "No file changes in this commit.")}
+									</Text>
+								)}
+							</Stack>
+						</ScrollArea.Autosize>
+					</Stack>
+				)}
+			</Modal>
+			<ChapterSplitModal
+				chapterId={chapterId}
+				commitSha={commitSha}
+				commitMessage={data?.message}
+				opened={splitOpened}
+				onClose={() => setSplitOpened(false)}
+			/>
+		</>
 	);
 }

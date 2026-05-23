@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Collapse,
@@ -57,6 +58,14 @@ import {
 	useTestMcpConnection,
 	useUpdateMcpServer,
 } from "../../hooks/useMcp";
+import {
+	useContentCapability,
+	useMcpExternalServerManagementCapability,
+	useMcpServerSettingsStorageCapability,
+	useMcpTransportsCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
+
 import { useProjects } from "../../hooks/useProjects";
 import {
 	useGlobalPrompt,
@@ -367,8 +376,8 @@ function HooksTab() {
 	}, [draft, editingId, createMutation, updateMutation, closeEdit]);
 
 	const handleDelete = useCallback(
-		(id: string) => {
-			setDeleteTarget(id);
+		(name: string) => {
+			setDeleteTarget(name);
 			openDelete();
 		},
 		[openDelete],
@@ -620,7 +629,13 @@ interface SkillDraft {
 
 function GlobalSkillsTab() {
 	const { t } = useTranslation("routines");
-	const { data: skills, isLoading } = useGlobalSkills();
+	const contentCapability = useContentCapability();
+	const skillsCapability = contentCapability.projectSkills;
+	const skillsUnsupportedReason = skillsCapability.supported
+		? undefined
+		: (skillsCapability.reason ?? t("globalSkillsUnsupportedDesc"));
+	const canManageGlobalSkills = skillsCapability.supported;
+	const { data: skills, isLoading } = useGlobalSkills(canManageGlobalSkills);
 	const createMutation = useCreateGlobalSkill();
 	const updateMutation = useUpdateGlobalSkill();
 	const deleteMutation = useDeleteGlobalSkill();
@@ -637,13 +652,15 @@ function GlobalSkillsTab() {
 	const [viewTarget, setViewTarget] = useState<SkillSummary | null>(null);
 
 	const handleCreate = useCallback(() => {
+		if (!canManageGlobalSkills) return;
 		setEditingSkill(null);
 		setDraft({ name: "", description: "", content: "" });
 		openEdit();
-	}, [openEdit]);
+	}, [canManageGlobalSkills, openEdit]);
 
 	const handleEdit = useCallback(
 		(skill: SkillSummary) => {
+			if (!canManageGlobalSkills) return;
 			setEditingSkill(skill.name);
 			setDraft({ name: skill.name, description: skill.description, content: "" });
 			// Fetch full content
@@ -652,10 +669,11 @@ function GlobalSkillsTab() {
 			});
 			openEdit();
 		},
-		[openEdit],
+		[canManageGlobalSkills, openEdit],
 	);
 
 	const handleSave = useCallback(() => {
+		if (!canManageGlobalSkills) return;
 		const data = {
 			name: draft.name.trim(),
 			description: draft.description.trim(),
@@ -671,7 +689,7 @@ function GlobalSkillsTab() {
 		} else {
 			createMutation.mutate(data, { onSuccess: () => closeEdit() });
 		}
-	}, [draft, editingSkill, createMutation, updateMutation, closeEdit]);
+	}, [canManageGlobalSkills, draft, editingSkill, createMutation, updateMutation, closeEdit]);
 
 	const handleDelete = useCallback(
 		(name: string) => {
@@ -687,11 +705,17 @@ function GlobalSkillsTab() {
 
 	const handleView = useCallback(
 		(skill: SkillSummary) => {
+			if (!canManageGlobalSkills) return;
 			setViewTarget(skill);
 			openView();
 		},
-		[openView],
+		[canManageGlobalSkills, openView],
 	);
+
+	const handleRefresh = useCallback(() => {
+		if (!canManageGlobalSkills) return;
+		refreshMutation.mutate();
+	}, [canManageGlobalSkills, refreshMutation]);
 
 	return (
 		<Stack>
@@ -699,13 +723,19 @@ function GlobalSkillsTab() {
 				<Text size="sm" c="dimmed" style={{ flex: 1 }}>
 					{t("globalSkillsDesc")}
 				</Text>
+				{skillsUnsupportedReason && (
+					<Alert color="yellow" variant="light" title={t("globalSkillsUnsupportedTitle")}>
+						{skillsUnsupportedReason}
+					</Alert>
+				)}
 				<Group gap="xs">
 					<ActionIcon
 						variant="subtle"
 						size="sm"
-						onClick={() => refreshMutation.mutate()}
+						onClick={handleRefresh}
 						loading={refreshMutation.isPending}
-						title={t("refreshSkills")}
+						disabled={!canManageGlobalSkills}
+						title={!canManageGlobalSkills ? skillsUnsupportedReason : t("refreshSkills")}
 					>
 						<IconRefresh size={14} />
 					</ActionIcon>
@@ -714,6 +744,8 @@ function GlobalSkillsTab() {
 						variant="light"
 						leftSection={<IconPlus size={14} />}
 						onClick={handleCreate}
+						disabled={!canManageGlobalSkills}
+						title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 					>
 						{t("createSkill")}
 					</Button>
@@ -764,18 +796,33 @@ function GlobalSkillsTab() {
 							<Group gap={4}>
 								<Switch
 									checked={!isDisabled}
-									onChange={(e) =>
+									onChange={(e) => {
+										if (!canManageGlobalSkills) return;
 										toggleMutation.mutate({
 											name: skill.name,
 											enabled: e.currentTarget.checked,
-										})
-									}
+										});
+									}}
 									size="sm"
+									disabled={!canManageGlobalSkills}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 								/>
-								<Button variant="subtle" size="compact-xs" onClick={() => handleView(skill)}>
+								<Button
+									variant="subtle"
+									size="compact-xs"
+									onClick={() => handleView(skill)}
+									disabled={!canManageGlobalSkills}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+								>
 									{t("viewSkill")}
 								</Button>
-								<Button variant="subtle" size="compact-xs" onClick={() => handleEdit(skill)}>
+								<Button
+									variant="subtle"
+									size="compact-xs"
+									onClick={() => handleEdit(skill)}
+									disabled={!canManageGlobalSkills}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
+								>
 									{t("editSkill")}
 								</Button>
 								<ActionIcon
@@ -783,6 +830,8 @@ function GlobalSkillsTab() {
 									color="red"
 									size="sm"
 									onClick={() => handleDelete(skill.name)}
+									disabled={!canManageGlobalSkills}
+									title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 								>
 									<IconTrash size={14} />
 								</ActionIcon>
@@ -836,8 +885,9 @@ function GlobalSkillsTab() {
 						</Button>
 						<Button
 							onClick={handleSave}
-							disabled={!draft.name.trim() || !draft.description.trim()}
+							disabled={!canManageGlobalSkills || !draft.name.trim() || !draft.description.trim()}
 							loading={createMutation.isPending || updateMutation.isPending}
+							title={!canManageGlobalSkills ? skillsUnsupportedReason : undefined}
 						>
 							{t("save")}
 						</Button>
@@ -895,7 +945,13 @@ function GlobalSkillsTab() {
 
 function GlobalPromptTab() {
 	const { t } = useTranslation("routines");
-	const { data, isLoading } = useGlobalPrompt();
+	const contentCapability = useContentCapability();
+	const routinesCapability = contentCapability.projectRoutines;
+	const globalPromptUnsupportedReason = routinesCapability.supported
+		? undefined
+		: (routinesCapability.reason ?? t("globalPromptUnsupportedDesc"));
+	const canManageGlobalPrompt = routinesCapability.supported;
+	const { data, isLoading } = useGlobalPrompt(canManageGlobalPrompt);
 	const updateMutation = useUpdateGlobalPrompt();
 
 	const [content, setContent] = useState("");
@@ -917,6 +973,7 @@ function GlobalPromptTab() {
 
 	const handleSave = useCallback(
 		(filePath?: string) => {
+			if (!canManageGlobalPrompt) return;
 			updateMutation.mutate(
 				{ content, filePath },
 				{
@@ -927,7 +984,7 @@ function GlobalPromptTab() {
 				},
 			);
 		},
-		[content, updateMutation],
+		[canManageGlobalPrompt, content, updateMutation],
 	);
 
 	if (isLoading) {
@@ -946,6 +1003,11 @@ function GlobalPromptTab() {
 			<Text size="sm" c="dimmed">
 				{t("globalPromptDesc")}
 			</Text>
+			{globalPromptUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("globalPromptUnsupportedTitle")}>
+					{globalPromptUnsupportedReason}
+				</Alert>
+			)}
 
 			{/* Candidate paths */}
 			<Stack gap={4}>
@@ -987,6 +1049,7 @@ function GlobalPromptTab() {
 				minRows={10}
 				maxRows={30}
 				styles={{ input: { fontFamily: "monospace", fontSize: 13 } }}
+				disabled={!canManageGlobalPrompt}
 			/>
 
 			<Group justify="flex-end" gap="xs">
@@ -1004,7 +1067,8 @@ function GlobalPromptTab() {
 							variant="light"
 							onClick={() => handleSave(c.path)}
 							loading={updateMutation.isPending}
-							disabled={!content.trim()}
+							disabled={!canManageGlobalPrompt || !content.trim()}
+							title={!canManageGlobalPrompt ? globalPromptUnsupportedReason : undefined}
 						>
 							{t("globalPromptSaveTo")} {c.path.split("/").pop()}
 						</Button>
@@ -1014,7 +1078,8 @@ function GlobalPromptTab() {
 						size="xs"
 						onClick={() => handleSave()}
 						loading={updateMutation.isPending}
-						disabled={!dirty}
+						disabled={!canManageGlobalPrompt || !dirty}
+						title={!canManageGlobalPrompt ? globalPromptUnsupportedReason : undefined}
 					>
 						{t("globalPromptSave")}
 					</Button>
@@ -1414,10 +1479,18 @@ function CustomSubagentsTab() {
 
 function ProjectSkillsTab() {
 	const { t } = useTranslation("routines");
+	const contentCapability = useContentCapability();
+	const skillsCapability = contentCapability.projectSkills;
+	const skillsUnsupportedReason = skillsCapability.supported
+		? undefined
+		: (skillsCapability.reason ?? t("projectSkillsUnsupportedDesc"));
 	const { data: projects } = useProjects();
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-	const { data: skills, isLoading } = useSkills(selectedProjectId ?? "", !!selectedProjectId);
-	const { data: globalSkills } = useGlobalSkills();
+	const { data: skills, isLoading } = useSkills(
+		selectedProjectId ?? "",
+		!!selectedProjectId && skillsCapability.supported,
+	);
+	const { data: globalSkills } = useGlobalSkills(skillsCapability.supported);
 
 	const globalNames = new Set(globalSkills?.map((s) => s.name) ?? []);
 
@@ -1432,11 +1505,17 @@ function ProjectSkillsTab() {
 			<Text size="sm" c="dimmed">
 				{t("projectSkillsDesc")}
 			</Text>
+			{skillsUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("projectSkillsUnsupportedTitle")}>
+					{skillsUnsupportedReason}
+				</Alert>
+			)}
 			<Select
 				placeholder={t("selectProject")}
 				data={projectOptions}
 				value={selectedProjectId}
 				onChange={setSelectedProjectId}
+				disabled={!skillsCapability.supported}
 				searchable
 				clearable
 			/>
@@ -1536,7 +1615,35 @@ function statusColor(status: string): string {
 
 function McpToolsTab() {
 	const { t } = useTranslation("routines");
-	const { data: servers, isLoading } = useMcpServers();
+	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
+	const mcpExternalServerManagementCapability = useMcpExternalServerManagementCapability();
+	const mcpTransportCapability = useMcpTransportsCapability();
+	const showMcpServerSettingsStorageWarning =
+		mcpServerSettingsStorageCapability.supported === false;
+	const mcpServerManagementSupported = mcpExternalServerManagementCapability.supported;
+	const mcpServerManagementFallbackReason =
+		mcpExternalServerManagementCapability.reason ?? t("mcpServerManagementUnsupportedDesc");
+	const mcpServerManagementUnsupportedReason = mcpServerManagementSupported
+		? undefined
+		: mcpServerManagementFallbackReason;
+	const mcpServerPermissionsSupported =
+		mcpServerManagementSupported && mcpExternalServerManagementCapability.permissions !== false;
+	const mcpServerImportSupported =
+		mcpServerManagementSupported && mcpExternalServerManagementCapability.import !== false;
+	const mcpServerImportUnsupportedReason = mcpServerImportSupported
+		? undefined
+		: mcpServerManagementFallbackReason;
+	const getDraftTransportCapability = (transport: McpServerDraft["transport"]) => {
+		if (transport === "streamable-http") return mcpTransportCapability.streamableHttp;
+		return mcpTransportCapability[transport];
+	};
+	const getServerTransportCapability = (transport: string | undefined) => {
+		if (transport === "stdio" || transport === "sse" || transport === "streamable-http") {
+			return getDraftTransportCapability(transport);
+		}
+		return { supported: false, reason: t("mcpTransportUnsupportedDesc") };
+	};
+	const { data: servers, isLoading } = useMcpServers({ enabled: mcpServerManagementSupported });
 	const createMutation = useCreateMcpServer();
 	const updateMutation = useUpdateMcpServer();
 	const deleteMutation = useDeleteMcpServer();
@@ -1548,6 +1655,10 @@ function McpToolsTab() {
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [editingId, setEditingId] = useState<string | null>(null);
 	const [draft, setDraft] = useState<McpServerDraft>({ ...EMPTY_DRAFT });
+	const draftTransportCapability = getDraftTransportCapability(draft.transport);
+	const draftTransportUnsupportedReason = draftTransportCapability.supported
+		? undefined
+		: (draftTransportCapability.reason ?? t("mcpTransportUnsupportedDesc"));
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
 	const [expandedServer, setExpandedServer] = useState<string | null>(null);
 
@@ -1565,6 +1676,7 @@ function McpToolsTab() {
 	// biome-ignore lint/suspicious/noExplicitAny: MCP tool list structure
 
 	const handleImport = useCallback(() => {
+		if (!mcpServerImportSupported) return;
 		setImportError(null);
 		setImportResult(null);
 		let parsed: unknown;
@@ -1587,14 +1699,15 @@ function McpToolsTab() {
 				setImportResult(null);
 			},
 		});
-	}, [importJson, importMutation, t]);
+	}, [importJson, importMutation, mcpServerImportSupported, t]);
 
 	const handleCreate = useCallback(() => {
+		if (!mcpServerManagementSupported) return;
 		setEditingId(null);
 		setDraft({ ...EMPTY_DRAFT });
 		testMutation.reset();
 		openEdit();
-	}, [openEdit, testMutation]);
+	}, [mcpServerManagementSupported, openEdit, testMutation]);
 
 	const handleEditServer = useCallback(
 		(server: {
@@ -1610,6 +1723,7 @@ function McpToolsTab() {
 			enabled?: boolean;
 			defaultBehavior?: string;
 		}) => {
+			if (!mcpServerManagementSupported) return;
 			setEditingId(server.id);
 			setDraft({
 				name: server.name ?? "",
@@ -1636,7 +1750,7 @@ function McpToolsTab() {
 			testMutation.reset();
 			openEdit();
 		},
-		[openEdit, testMutation],
+		[mcpServerManagementSupported, openEdit, testMutation],
 	);
 
 	const draftToPayload = useCallback((d: McpServerDraft, includeClears = false) => {
@@ -1672,7 +1786,9 @@ function McpToolsTab() {
 	}, []);
 
 	const handleSave = useCallback(() => {
+		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
 		const payload = draftToPayload(draft, Boolean(editingId));
+		if (!mcpServerPermissionsSupported) delete payload.defaultBehavior;
 		if (!payload.name) return;
 
 		if (editingId) {
@@ -1680,25 +1796,44 @@ function McpToolsTab() {
 		} else {
 			createMutation.mutate(payload, { onSuccess: () => closeEdit() });
 		}
-	}, [draft, editingId, createMutation, updateMutation, closeEdit, draftToPayload]);
+	}, [
+		draft,
+		editingId,
+		createMutation,
+		updateMutation,
+		closeEdit,
+		draftToPayload,
+		draftTransportUnsupportedReason,
+		mcpServerManagementSupported,
+		mcpServerPermissionsSupported,
+	]);
 
 	const handleTest = useCallback(() => {
+		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
 		testMutation.mutate(draftToPayload(draft));
-	}, [draft, testMutation, draftToPayload]);
+	}, [
+		draft,
+		testMutation,
+		draftToPayload,
+		draftTransportUnsupportedReason,
+		mcpServerManagementSupported,
+	]);
 
 	const handleDelete = useCallback(
 		(id: string, name: string) => {
+			if (!mcpServerManagementSupported) return;
 			setDeleteTarget({ id, name });
 			openDelete();
 		},
-		[openDelete],
+		[mcpServerManagementSupported, openDelete],
 	);
 
 	const confirmDelete = useCallback(() => {
+		if (!mcpServerManagementSupported) return;
 		if (deleteTarget) {
 			deleteMutation.mutate(deleteTarget.id, { onSuccess: () => closeDelete() });
 		}
-	}, [deleteTarget, deleteMutation, closeDelete]);
+	}, [deleteTarget, deleteMutation, closeDelete, mcpServerManagementSupported]);
 
 	return (
 		<Stack>
@@ -1711,7 +1846,10 @@ function McpToolsTab() {
 					<Button
 						size="xs"
 						variant="subtle"
+						disabled={!mcpServerImportSupported}
+						title={mcpServerImportUnsupportedReason}
 						onClick={() => {
+							if (!mcpServerImportSupported) return;
 							setImportJson("");
 							setImportError(null);
 							setImportResult(null);
@@ -1724,12 +1862,32 @@ function McpToolsTab() {
 						size="xs"
 						variant="light"
 						leftSection={<IconPlus size={14} />}
+						disabled={!mcpServerManagementSupported}
+						title={!mcpServerManagementSupported ? mcpServerManagementUnsupportedReason : undefined}
 						onClick={handleCreate}
 					>
 						{t("addMcpServer")}
 					</Button>
 				</Group>
 			</Group>
+
+			{showMcpServerSettingsStorageWarning && (
+				<Alert color="yellow" variant="light" title={t("mcpServerSettingsStorageWarning")}>
+					{t("mcpServerSettingsStorageWarningDesc")}
+				</Alert>
+			)}
+
+			{mcpServerManagementUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("mcpServerManagementUnsupportedTitle")}>
+					{mcpServerManagementUnsupportedReason}
+				</Alert>
+			)}
+
+			{mcpServerManagementSupported && !mcpServerPermissionsSupported && (
+				<Alert color="yellow" variant="light" title={t("mcpServerPermissionsUnsupportedTitle")}>
+					{t("mcpServerPermissionsUnsupportedDesc")}
+				</Alert>
+			)}
 
 			{isLoading && (
 				<Text size="sm" c="dimmed">
@@ -1745,6 +1903,12 @@ function McpToolsTab() {
 
 			{servers?.map((server) => {
 				const isExpanded = expandedServer === server.id;
+				const serverTransportCapability = getServerTransportCapability(server.transport);
+				const canConnectServer =
+					mcpServerManagementSupported && serverTransportCapability.supported;
+				const connectUnsupportedReason = !mcpServerManagementSupported
+					? mcpServerManagementUnsupportedReason
+					: (serverTransportCapability.reason ?? t("mcpTransportUnsupportedDesc"));
 				return (
 					<Paper key={server.id} withBorder p="sm">
 						<Stack gap="xs">
@@ -1778,9 +1942,17 @@ function McpToolsTab() {
 											variant="subtle"
 											size="sm"
 											color="orange"
-											onClick={() => disconnectMutation.mutate(server.id)}
+											disabled={!mcpServerManagementSupported}
+											onClick={() => {
+												if (!mcpServerManagementSupported) return;
+												disconnectMutation.mutate(server.id);
+											}}
 											loading={disconnectMutation.isPending}
-											title={t("mcpDisconnect")}
+											title={
+												mcpServerManagementSupported
+													? t("mcpDisconnect")
+													: mcpServerManagementUnsupportedReason
+											}
 										>
 											<IconPlugOff size={14} />
 										</ActionIcon>
@@ -1789,9 +1961,13 @@ function McpToolsTab() {
 											variant="subtle"
 											size="sm"
 											color="green"
-											onClick={() => connectMutation.mutate(server.id)}
+											disabled={!canConnectServer}
+											onClick={() => {
+												if (!canConnectServer) return;
+												connectMutation.mutate(server.id);
+											}}
 											loading={connectMutation.isPending}
-											title={t("mcpConnect")}
+											title={canConnectServer ? t("mcpConnect") : connectUnsupportedReason}
 										>
 											<IconPlug size={14} />
 										</ActionIcon>
@@ -1799,6 +1975,12 @@ function McpToolsTab() {
 									<Button
 										variant="subtle"
 										size="compact-xs"
+										disabled={!mcpServerManagementSupported}
+										title={
+											!mcpServerManagementSupported
+												? mcpServerManagementUnsupportedReason
+												: undefined
+										}
 										onClick={() => handleEditServer(server)}
 									>
 										{t("editMcpServer")}
@@ -1807,6 +1989,12 @@ function McpToolsTab() {
 										variant="subtle"
 										color="red"
 										size="sm"
+										disabled={!mcpServerManagementSupported}
+										title={
+											!mcpServerManagementSupported
+												? mcpServerManagementUnsupportedReason
+												: undefined
+										}
 										onClick={() => handleDelete(server.id, server.name)}
 									>
 										<IconTrash size={14} />
@@ -1852,7 +2040,9 @@ function McpToolsTab() {
 													</div>
 													<Select
 														value={currentBehavior}
+														disabled={!mcpServerPermissionsSupported}
 														onChange={(v) => {
+															if (!mcpServerPermissionsSupported) return;
 															const newBehavior = v ?? "";
 															updateMutation.mutate({
 																id: server.id,
@@ -1934,20 +2124,40 @@ function McpToolsTab() {
 						</Text>
 						<SegmentedControl
 							value={draft.transport}
-							onChange={(v) =>
+							onChange={(v) => {
+								const nextTransport = v as McpServerDraft["transport"];
+								if (!getDraftTransportCapability(nextTransport).supported) return;
 								setDraft((d) => ({
 									...d,
-									transport: v as McpServerDraft["transport"],
-								}))
-							}
+									transport: nextTransport,
+								}));
+							}}
 							data={[
-								{ value: "stdio", label: t("mcpTransportStdio") },
-								{ value: "streamable-http", label: t("mcpTransportHttp") },
-								{ value: "sse", label: t("mcpTransportSse") },
+								{
+									value: "stdio",
+									label: t("mcpTransportStdio"),
+									disabled: !mcpTransportCapability.stdio.supported,
+								},
+								{
+									value: "streamable-http",
+									label: t("mcpTransportHttp"),
+									disabled: !mcpTransportCapability.streamableHttp.supported,
+								},
+								{
+									value: "sse",
+									label: t("mcpTransportSse"),
+									disabled: !mcpTransportCapability.sse.supported,
+								},
 							]}
 							size="xs"
 						/>
 					</div>
+
+					{draftTransportUnsupportedReason && (
+						<Alert color="yellow" variant="light" title={t("mcpTransportUnsupportedTitle")}>
+							{draftTransportUnsupportedReason}
+						</Alert>
+					)}
 
 					{draft.transport === "stdio" ? (
 						<>
@@ -2130,12 +2340,14 @@ function McpToolsTab() {
 						label={t("mcpDefaultBehavior")}
 						description={t("mcpDefaultBehaviorDesc")}
 						value={draft.defaultBehavior}
-						onChange={(v) =>
+						disabled={!mcpServerPermissionsSupported}
+						onChange={(v) => {
+							if (!mcpServerPermissionsSupported) return;
 							setDraft((d) => ({
 								...d,
 								defaultBehavior: (v ?? "") as McpServerDraft["defaultBehavior"],
-							}))
-						}
+							}));
+						}}
 						data={[
 							{ value: "", label: t("mcpBehaviorFollow") },
 							{ value: "readOnly", label: t("mcpBehaviorReadOnly") },
@@ -2161,7 +2373,12 @@ function McpToolsTab() {
 					)}
 
 					<Group justify="flex-end" gap="xs">
-						<Button variant="light" onClick={handleTest} loading={testMutation.isPending}>
+						<Button
+							variant="light"
+							onClick={handleTest}
+							disabled={!mcpServerManagementSupported || !!draftTransportUnsupportedReason}
+							loading={testMutation.isPending}
+						>
 							{testMutation.isPending ? t("mcpTesting") : t("mcpTestConnection")}
 						</Button>
 						<Button variant="subtle" onClick={closeEdit}>
@@ -2169,7 +2386,11 @@ function McpToolsTab() {
 						</Button>
 						<Button
 							onClick={handleSave}
-							disabled={!draft.name.trim()}
+							disabled={
+								!mcpServerManagementSupported ||
+								!draft.name.trim() ||
+								!!draftTransportUnsupportedReason
+							}
 							loading={createMutation.isPending || updateMutation.isPending}
 						>
 							{t("save")}
@@ -2192,7 +2413,12 @@ function McpToolsTab() {
 						<Button variant="subtle" onClick={closeDelete}>
 							{t("cancel")}
 						</Button>
-						<Button color="red" onClick={confirmDelete} loading={deleteMutation.isPending}>
+						<Button
+							color="red"
+							onClick={confirmDelete}
+							disabled={!mcpServerManagementSupported}
+							loading={deleteMutation.isPending}
+						>
 							{t("deleteMcpServer")}
 						</Button>
 					</Group>
@@ -2231,7 +2457,7 @@ function McpToolsTab() {
 						<Button
 							onClick={handleImport}
 							loading={importMutation.isPending}
-							disabled={!importJson.trim()}
+							disabled={!mcpServerImportSupported || !importJson.trim()}
 						>
 							{t("mcpImportBtn")}
 						</Button>

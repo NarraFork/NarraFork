@@ -13,6 +13,7 @@ import { IconMinus, IconTerminal2, IconX } from "@tabler/icons-react";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
 import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 const TerminalPanel = lazy(() =>
@@ -44,6 +45,8 @@ function clampTerminalNodeName(value: string): string {
 function TerminalNodeInner({ data, id }: NodeProps) {
 	const d = data as TerminalNodeData;
 	const { t } = useTranslation("graph");
+	const terminalCapability = useTerminalCapability();
+	const processTreeSupported = terminalCapability.processTree?.supported !== false;
 	const panelWheelRef = useRef<HTMLDivElement>(null);
 	const [confirmOpen, setConfirmOpen] = useState(false);
 	const [closing, setClosing] = useState(false);
@@ -63,18 +66,20 @@ function TerminalNodeInner({ data, id }: NodeProps) {
 	const handleCloseClick = useCallback(
 		async (e: React.MouseEvent) => {
 			e.stopPropagation();
-			try {
-				const processes = await api.getTerminalProcesses(d.terminalId);
-				if (processes.length > 1) {
-					setConfirmOpen(true);
-					return;
+			if (processTreeSupported) {
+				try {
+					const processes = await api.getTerminalProcesses(d.terminalId);
+					if (processes.length > 1) {
+						setConfirmOpen(true);
+						return;
+					}
+				} catch {
+					// Can't check — just close directly
 				}
-			} catch {
-				// Can't check — just close directly
 			}
 			d.onClose?.(id, d.terminalId);
 		},
-		[d.onClose, d.terminalId, id],
+		[d.onClose, d.terminalId, id, processTreeSupported],
 	);
 
 	const handleConfirmClose = useCallback(() => {

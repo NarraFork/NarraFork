@@ -915,6 +915,7 @@ export function RecentTabList({
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
 		setCtxMenu(null);
+		if (!fsRevealCapability.supported) return;
 		try {
 			if (tab.type === "chapter") {
 				const chapter = await api.getChapter(tab.id);
@@ -930,7 +931,7 @@ export function RecentTabList({
 		} catch {
 			// ignore
 		}
-	}, [ctxMenu]);
+	}, [ctxMenu, fsRevealCapability.supported]);
 
 	const handleDragCancel = useCallback(() => {
 		endNarratorDrag();

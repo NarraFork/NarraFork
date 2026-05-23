@@ -1,4 +1,4 @@
-import { ApiError, BASE, clearToken, getToken, request } from "./client";
+import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
 import type { ApiEntity } from "./types";
 
 export const authApi = {
@@ -29,12 +29,12 @@ export const authApi = {
 		});
 		if (res.status === 401) {
 			clearToken();
-			const err = await res.json().catch(() => ({ error: "Unauthorized" }));
-			throw new ApiError(err.error ?? "Unauthorized", 401, err);
+			const error = await readFetchError(res, "Unauthorized");
+			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
-			const err = await res.json().catch(() => ({ error: "Upload failed" }));
-			throw new ApiError(err.error ?? "Upload failed", res.status);
+			const error = await readFetchError(res, "Upload failed");
+			throw new ApiError(error.message, res.status, error.data);
 		}
 		return res.json() as Promise<{ ok: boolean; avatarImageId: string }>;
 	},

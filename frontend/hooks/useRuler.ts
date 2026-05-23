@@ -37,6 +37,32 @@ export interface RulerActiveChapter {
 	crossOffset: number;
 }
 
+export interface RulerFallback {
+	feature?: string;
+	reason?: string;
+	message?: string;
+	error?: string;
+	code?: string;
+}
+
+export interface RulerFeatureCapability {
+	supported?: boolean;
+	fallback?: boolean;
+	code?: string;
+	reason?: string;
+}
+
+export interface RulerCapabilities {
+	read?: RulerFeatureCapability;
+	mutations?: Partial<
+		Record<
+			"fork" | "merge" | "abandon" | "rebase" | "rebaseResolve" | "rebaseContinue",
+			RulerFeatureCapability
+		>
+	>;
+	[key: string]: unknown;
+}
+
 export interface RulerData {
 	commits: RulerCommit[];
 	segments: RulerSegment[];
@@ -45,6 +71,10 @@ export interface RulerData {
 	totalCommitCount?: number;
 	oldestLoadedIndex?: number;
 	newestLoadedIndex?: number;
+	degraded?: boolean;
+	fallback?: boolean;
+	fallbacks?: RulerFallback[];
+	capabilities?: RulerCapabilities;
 }
 
 export function useRulerData(projectId: string) {
@@ -86,6 +116,24 @@ export function useRulerInfinite(projectId: string) {
 	});
 }
 
+function mergeRulerFallbacks(pages: RulerData[]): RulerFallback[] | undefined {
+	const seen = new Set<string>();
+	const merged: RulerFallback[] = [];
+	for (const fallback of pages.flatMap((page) => page.fallbacks ?? [])) {
+		const key = [
+			fallback.feature,
+			fallback.code,
+			fallback.reason,
+			fallback.message,
+			fallback.error,
+		].join("|");
+		if (seen.has(key)) continue;
+		seen.add(key);
+		merged.push(fallback);
+	}
+	return merged.length > 0 ? merged : undefined;
+}
+
 export function flattenRulerPages(pages: RulerData[]): RulerData {
 	if (pages.length === 0) return { commits: [], segments: [], activeChapters: [] };
 	if (pages.length === 1) return pages[0];
@@ -114,5 +162,9 @@ export function flattenRulerPages(pages: RulerData[]): RulerData {
 		totalCommitCount: pages[0].totalCommitCount,
 		oldestLoadedIndex: Math.min(...pages.map((p) => p.oldestLoadedIndex ?? 0)),
 		newestLoadedIndex: Math.max(...pages.map((p) => p.newestLoadedIndex ?? 0)),
+		degraded: pages.some((p) => p.degraded === true) || undefined,
+		fallback: pages.some((p) => p.fallback === true) || undefined,
+		fallbacks: mergeRulerFallbacks(pages),
+		capabilities: pages.find((p) => p.capabilities)?.capabilities,
 	};
 }

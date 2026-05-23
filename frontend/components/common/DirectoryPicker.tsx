@@ -52,6 +52,7 @@ import {
 	useFavoriteDirectories,
 	useReorderFavoriteDirectories,
 } from "../../hooks/useFavoriteDirectories";
+import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { PathInput } from "./PathInput";
 
@@ -85,10 +86,14 @@ export function DirectoryPicker({
 	leftSection,
 }: DirectoryPickerProps) {
 	const { t } = useTranslation("common");
+	const fsCapability = useFileSystemCapability();
+	const browseSupported = fsCapability.browse.supported;
+	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
 
 	const handleOpen = () => {
+		if (!browseSupported) return;
 		setBrowsePath(value || undefined);
 		open();
 	};
@@ -105,13 +110,20 @@ export function DirectoryPicker({
 				variant="subtle"
 				onClick={handleOpen}
 				aria-label={t("browse")}
-				disabled={disabled}
+				disabled={disabled || !browseSupported}
+				title={!browseSupported ? browseUnavailableReason : undefined}
 			>
 				<IconFolderOpen size={18} />
 			</ActionIcon>
 		</Group>
 	) : (
-		<ActionIcon variant="subtle" onClick={handleOpen} aria-label={t("browse")} disabled={disabled}>
+		<ActionIcon
+			variant="subtle"
+			onClick={handleOpen}
+			aria-label={t("browse")}
+			disabled={disabled || !browseSupported}
+			title={!browseSupported ? browseUnavailableReason : undefined}
+		>
 			<IconFolderOpen size={18} />
 		</ActionIcon>
 	);
@@ -245,6 +257,12 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const [showHidden, setShowHidden] = useState(false);
 	const newFolderInputRef = useRef<HTMLInputElement>(null);
 	const queryClient = useQueryClient();
+	const fsCapability = useFileSystemCapability();
+	const browseSupported = fsCapability.browse.supported;
+	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
+	const shortcutsSupported = fsCapability.shortcuts.supported;
+	const mkdirSupported = fsCapability.mkdir.supported;
+	const mkdirUnsupportedReason = fsCapability.mkdir.reason ?? t("fileSystemMkdirUnavailable");
 
 	// Editable path bar state
 	const [editing, setEditing] = useState(false);
@@ -255,6 +273,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const { data: shortcutsData } = useQuery({
 		queryKey: ["fs-shortcuts"],
 		queryFn: () => api.fsShortcuts(),
+		enabled: shortcutsSupported,
 		staleTime: 60_000,
 		gcTime: FS_SHORTCUTS_QUERY_GC_TIME_MS,
 	});
@@ -297,6 +316,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["fs-browse", currentPath, showHidden],
 		queryFn: () => api.fsBrowse(currentPath, { showHidden }),
+		enabled: browseSupported,
 		gcTime: 30_000,
 	});
 	const displayedEntries = data?.entries.slice(0, MAX_DIRECTORY_ENTRIES) ?? [];
@@ -344,17 +364,18 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	}, [queryClient, currentPath, showHidden]);
 
 	const startCreatingFolder = useCallback(() => {
+		if (!mkdirSupported) return;
 		setNewFolderName("");
 		mkdirMutation.reset();
 		setCreatingFolder(true);
 		setTimeout(() => newFolderInputRef.current?.focus(), 0);
-	}, [mkdirMutation]);
+	}, [mkdirMutation, mkdirSupported]);
 
 	const submitNewFolder = useCallback(() => {
 		const name = newFolderName.trim();
-		if (!name || !data?.path) return;
+		if (!mkdirSupported || !name || !data?.path) return;
 		mkdirMutation.mutate({ parent: data.path, name });
-	}, [newFolderName, data?.path, mkdirMutation]);
+	}, [newFolderName, data?.path, mkdirMutation, mkdirSupported]);
 
 	const startEditing = useCallback(() => {
 		setEditValue(data?.path ?? "");
@@ -439,12 +460,12 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 						<IconRefresh size={16} />
 					</ActionIcon>
 				</Tooltip>
-				<Tooltip label={t("newFolder")} openDelay={400}>
+				<Tooltip label={mkdirSupported ? t("newFolder") : mkdirUnsupportedReason} openDelay={400}>
 					<ActionIcon
 						variant="subtle"
 						size="sm"
 						onClick={startCreatingFolder}
-						disabled={!data?.path}
+						disabled={!data?.path || !mkdirSupported}
 					>
 						<IconFolderPlus size={16} />
 					</ActionIcon>
@@ -552,6 +573,11 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 							{t("quickAccess")}
 						</Text>
 						<Stack gap={0}>
+							{!shortcutsSupported && (
+								<Text size="xs" c="dimmed" px="xs" py={4}>
+									{fsCapability.shortcuts.reason ?? t("fileSystemShortcutsUnavailable")}
+								</Text>
+							)}
 							{shortcutsData?.shortcuts.map((s) => (
 								<NavLink
 									key={s.key}
@@ -618,6 +644,11 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 
 					{/* Directory listing */}
 					<ScrollArea style={{ flex: 1 }} h={350} type="auto" offsetScrollbars>
+						{!browseSupported && (
+							<Text c="dimmed" size="sm" ta="center" mt="xl" px="sm">
+								{browseUnavailableReason}
+							</Text>
+						)}
 						{isLoading && <Loader size="sm" m="auto" display="block" mt="xl" />}
 						{error && (
 							<Text c="red" size="sm" ta="center" mt="xl" px="sm">

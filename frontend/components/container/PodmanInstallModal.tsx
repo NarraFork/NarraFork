@@ -1,3 +1,4 @@
+import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { api } from "@frontend/lib/api";
 import { Button, Code, Group, Loader, Modal, Stack, Text, ThemeIcon } from "@mantine/core";
 import { IconCheck, IconX } from "@tabler/icons-react";
@@ -18,11 +19,17 @@ const INSTALL_HINTS: Record<string, string> = {
 export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps) {
 	const { t } = useTranslation("containers");
 	const qc = useQueryClient();
+	const containerCapability = useChapterContainersCapability();
+	const containerCapabilityReason = containerCapability.reason ?? t("capabilityUnsupported");
+	const canReadPodmanStatus =
+		containerCapability.supported && containerCapability.routes.podmanStatus;
+	const canInstallPodman =
+		containerCapability.supported && containerCapability.routes.podmanInstall;
 
 	const { data: status, isLoading } = useQuery({
 		queryKey: ["podmanStatus"],
 		queryFn: api.getPodmanStatus,
-		enabled: opened,
+		enabled: opened && canReadPodmanStatus,
 	});
 
 	const install = useMutation({
@@ -34,18 +41,26 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 
 	const platform = status?.platform ?? "linux";
 	const hint = INSTALL_HINTS[platform] ?? INSTALL_HINTS.linux;
+	const statusFallbackMessage = status?.reason ?? status?.message ?? status?.error ?? status?.code;
 
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("podman.title")} size="md">
 			<Stack gap="md">
 				{isLoading ? (
 					<Loader size="sm" />
+				) : !canReadPodmanStatus ? (
+					<Group gap="xs">
+						<ThemeIcon color="gray" size="sm" variant="light">
+							<IconX size={14} />
+						</ThemeIcon>
+						<Text size="sm">{containerCapabilityReason}</Text>
+					</Group>
 				) : status?.supported === false ? (
 					<Group gap="xs">
 						<ThemeIcon color="gray" size="sm" variant="light">
 							<IconX size={14} />
 						</ThemeIcon>
-						<Text size="sm">{t("podman.unsupportedPlatform")}</Text>
+						<Text size="sm">{statusFallbackMessage ?? t("podman.unsupportedPlatform")}</Text>
 					</Group>
 				) : status?.installed ? (
 					<Group gap="xs">
@@ -59,7 +74,7 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 						<ThemeIcon color="red" size="sm" variant="light">
 							<IconX size={14} />
 						</ThemeIcon>
-						<Text size="sm">{t("podman.notInstalled")}</Text>
+						<Text size="sm">{statusFallbackMessage ?? t("podman.notInstalled")}</Text>
 					</Group>
 				)}
 
@@ -92,9 +107,10 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 				<Group justify="flex-end">
 					{!status?.installed && status?.supported !== false && (
 						<Button
-							onClick={() => install.mutate()}
+							onClick={() => canInstallPodman && install.mutate()}
 							loading={install.isPending}
-							disabled={status?.installed}
+							disabled={status?.installed || !canInstallPodman}
+							title={!canInstallPodman ? containerCapabilityReason : undefined}
 						>
 							{t("podman.installButton")}
 						</Button>

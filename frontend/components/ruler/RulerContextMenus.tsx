@@ -44,6 +44,7 @@ interface TickContextMenuProps {
 	commitDate: string;
 	onClose: () => void;
 	onFork: (commitSha: string) => void;
+	forkDisabled?: boolean;
 }
 
 export function TickContextMenu({
@@ -55,6 +56,7 @@ export function TickContextMenu({
 	commitDate,
 	onClose,
 	onFork,
+	forkDisabled,
 }: TickContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const { ref, pos } = useMenuPosition(x, y);
@@ -125,6 +127,7 @@ export function TickContextMenu({
 			<MenuItem
 				icon={<IconGitBranch size={14} />}
 				label={t("ruler.forkFromHere")}
+				disabled={forkDisabled}
 				onClick={() => {
 					onFork(commitSha);
 					onClose();
@@ -132,6 +135,13 @@ export function TickContextMenu({
 			/>
 		</Box>
 	);
+}
+
+interface ReviewActionAvailability {
+	request: boolean;
+	convertToSubagent: boolean;
+	promote: boolean;
+	dismiss: boolean;
 }
 
 interface ChapterContextMenuProps {
@@ -142,6 +152,7 @@ interface ChapterContextMenuProps {
 	chapterStatus: string;
 	chapterRole: string;
 	reviewStatus?: string | null;
+	reviewActions?: ReviewActionAvailability;
 	onClose: () => void;
 	onFork: (chapterId: string) => void;
 	onMerge: (chapterId: string) => void;
@@ -151,6 +162,7 @@ interface ChapterContextMenuProps {
 	onConvertToSubagent: (chapterId: string) => void;
 	onPromoteReview: (chapterId: string) => void;
 	onDismissReview: (chapterId: string) => void;
+	disabledActions?: Partial<Record<"fork" | "merge" | "rebase" | "abandon", boolean>>;
 }
 
 export function ChapterContextMenu({
@@ -161,6 +173,7 @@ export function ChapterContextMenu({
 	chapterStatus,
 	chapterRole,
 	reviewStatus,
+	reviewActions,
 	onClose,
 	onFork,
 	onMerge,
@@ -170,11 +183,23 @@ export function ChapterContextMenu({
 	onConvertToSubagent,
 	onPromoteReview,
 	onDismissReview,
+	disabledActions,
 }: ChapterContextMenuProps) {
 	const { t } = useTranslation("graph");
 	const { ref, pos } = useMenuPosition(x, y);
 	const isActive = chapterStatus === "active";
 	const isReview = chapterRole === "review";
+	const effectiveReviewActions = reviewActions ?? {
+		request: true,
+		convertToSubagent: true,
+		promote: true,
+		dismiss: true,
+	};
+	const canConvertToSubagent =
+		effectiveReviewActions.convertToSubagent && reviewStatus === "concluded";
+	const canPromoteReview =
+		effectiveReviewActions.promote &&
+		(reviewStatus === "concluded" || reviewStatus === "reviewing");
 
 	return (
 		<Box
@@ -214,6 +239,7 @@ export function ChapterContextMenu({
 					<MenuItem
 						icon={<IconGitBranch size={14} />}
 						label={t("contextMenu.fork")}
+						disabled={disabledActions?.fork}
 						onClick={() => {
 							onFork(chapterId);
 							onClose();
@@ -222,6 +248,7 @@ export function ChapterContextMenu({
 					<MenuItem
 						icon={<IconGitMerge size={14} />}
 						label={t("ruler.mergeToTrunk")}
+						disabled={disabledActions?.merge}
 						onClick={() => {
 							onMerge(chapterId);
 							onClose();
@@ -230,16 +257,29 @@ export function ChapterContextMenu({
 					<MenuItem
 						icon={<IconGitPullRequest size={14} />}
 						label={t("ruler.rebaseOntoTrunk")}
+						disabled={disabledActions?.rebase}
 						onClick={() => {
 							onRebase(chapterId);
 							onClose();
 						}}
 					/>
+					{effectiveReviewActions.request && (
+						<MenuItem
+							icon={<IconEyeCheck size={14} />}
+							label={t("contextMenu.review")}
+							onClick={() => {
+								onReview(chapterId);
+								onClose();
+							}}
+						/>
+					)}
 					<MenuItem
-						icon={<IconEyeCheck size={14} />}
-						label={t("contextMenu.review")}
+						icon={<Text size="xs">✕</Text>}
+						label={t("ruler.abandon")}
+						color="red"
+						disabled={disabledActions?.abandon}
 						onClick={() => {
-							onReview(chapterId);
+							onAbandon(chapterId);
 							onClose();
 						}}
 					/>
@@ -251,7 +291,7 @@ export function ChapterContextMenu({
 					<MenuItem
 						icon={<IconMessageForward size={14} />}
 						label={t("contextMenu.reviewActions.sendToSource")}
-						disabled={reviewStatus !== "concluded"}
+						disabled={!canConvertToSubagent}
 						onClick={() => {
 							onConvertToSubagent(chapterId);
 							onClose();
@@ -260,7 +300,7 @@ export function ChapterContextMenu({
 					<MenuItem
 						icon={<IconPrompt size={14} />}
 						label={t("contextMenu.reviewActions.promoteToChapter")}
-						disabled={reviewStatus !== "concluded" && reviewStatus !== "reviewing"}
+						disabled={!canPromoteReview}
 						onClick={() => {
 							onPromoteReview(chapterId);
 							onClose();
@@ -270,24 +310,13 @@ export function ChapterContextMenu({
 						icon={<IconX size={14} />}
 						label={t("contextMenu.reviewActions.dismiss")}
 						color="red"
+						disabled={!effectiveReviewActions.dismiss}
 						onClick={() => {
 							onDismissReview(chapterId);
 							onClose();
 						}}
 					/>
 				</>
-			)}
-
-			{isActive && !isReview && (
-				<MenuItem
-					icon={<Text size="xs">✕</Text>}
-					label={t("ruler.abandon")}
-					color="red"
-					onClick={() => {
-						onAbandon(chapterId);
-						onClose();
-					}}
-				/>
 			)}
 		</Box>
 	);

@@ -82,10 +82,11 @@ export function useToggleProjectRoutine(projectId: string) {
 	});
 }
 
-export function useGlobalPrompt() {
+export function useGlobalPrompt(enabled = true) {
 	return useQuery({
 		queryKey: ["global-prompt"],
 		queryFn: api.getGlobalPrompt,
+		enabled,
 		staleTime: 30_000,
 		gcTime: ROUTINE_QUERY_GC_TIME_MS,
 	});

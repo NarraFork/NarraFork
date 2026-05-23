@@ -48,6 +48,35 @@ export interface LearningSearchResponse {
 	results: LearningDocSummary[];
 }
 
+export interface SearchFallback {
+	feature?: string;
+	entity?: string;
+	from?: string;
+	to?: string;
+	reason?: string;
+	error?: string;
+	message?: string;
+	code?: string;
+	[key: string]: unknown;
+}
+
+export interface SearchMetadata {
+	degraded?: boolean;
+	fallbacks?: SearchFallback[];
+	mode?: string;
+	ftsReady?: boolean | null;
+	shortQuery?: boolean;
+	requestedEntities?: string[];
+	[key: string]: unknown;
+}
+
+export interface SearchResponse {
+	results: ApiEntity[];
+	degraded?: boolean;
+	fallbacks?: SearchFallback[];
+	searchMetadata?: SearchMetadata;
+}
+
 export interface StorageCategoryResult {
 	key: string;
 	sizeBytes: number;
@@ -132,7 +161,18 @@ export type DatabaseCleanupBlockedReasonCode =
 	| "nonStaleStatus"
 	| "recentActivity";
 
-export type DatabaseCleanupWarningCode = "deletesUsageHistory";
+export type DatabaseCleanupWarningCode = string;
+
+export interface FallbackDiagnostics {
+	supported?: boolean;
+	degraded?: boolean;
+	fallback?: boolean;
+	fallbacks?: unknown[];
+	reason?: string;
+	error?: string;
+	message?: string;
+	code?: string;
+}
 
 export interface DatabaseCleanupPreviewCounts {
 	sessions: number;
@@ -144,18 +184,18 @@ export interface DatabaseCleanupPreviewCounts {
 	dumpsCleared: number;
 }
 
-export interface DatabaseCleanupNarratorSample {
+export interface DatabaseCleanupNarratorSample extends FallbackDiagnostics {
 	type: "narrator";
 	id: string;
-	title: string | null;
-	status: string;
-	lastActivityAt: string;
-	messageCount: number;
+	title?: string | null;
+	status?: string;
+	lastActivityAt?: string;
+	messageCount?: number;
 	descendantNarratorCount: number;
-	approxBytes: number;
+	approxBytes?: number;
 }
 
-export interface DatabaseCleanupApiRequestSample {
+export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	type: "apiRequest";
 	id: string;
 	narratorId: string | null;
@@ -175,7 +215,7 @@ export interface DatabaseCleanupBlockedItem {
 	blockingStatus: string;
 }
 
-export interface DatabaseCleanupPreviewResult {
+export interface DatabaseCleanupPreviewResult extends FallbackDiagnostics {
 	target: DatabaseCleanupTarget;
 	olderThanDays?: number;
 	approxBytes: number;
@@ -210,9 +250,28 @@ export interface DatabaseVacuumResult {
 }
 
 export interface RuntimeScanResult {
-	terminals: { running: number; exited: number; orphanSockets: number };
-	containers: { running: number; stopped: number; podmanAvailable: boolean };
-	browsers: { processRunning: boolean; connected: boolean; activeSessions: number };
+	terminals: {
+		running: number;
+		exited: number;
+		orphanSockets: number;
+	} & FallbackDiagnostics;
+	containers: {
+		running: number;
+		stopped: number;
+		podmanAvailable: boolean;
+	} & FallbackDiagnostics;
+	browsers: {
+		processRunning: boolean;
+		connected: boolean;
+		activeSessions: number;
+		memorySessions?: number;
+		persistedSessions?: number;
+		dbError?: string;
+		runtime?: string;
+		requiresChrome?: boolean;
+		cleanupSupported?: boolean;
+		sessionApiSupported?: boolean;
+	} & FallbackDiagnostics;
 	scannedAt: number;
 }
 

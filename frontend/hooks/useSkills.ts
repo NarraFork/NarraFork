@@ -21,10 +21,11 @@ export function useSkill(projectId: string, name: string, enabled = true) {
 	});
 }
 
-export function useGlobalSkills() {
+export function useGlobalSkills(enabled = true) {
 	return useQuery({
 		queryKey: ["global-skills"],
 		queryFn: () => api.listGlobalSkills(),
+		enabled,
 		gcTime: SKILL_QUERY_GC_TIME_MS,
 	});
 }

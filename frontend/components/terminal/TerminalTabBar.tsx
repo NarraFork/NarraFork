@@ -22,6 +22,7 @@ import {
 import { IconGripVertical, IconPlus, IconX } from "@tabler/icons-react";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 interface Tab {
@@ -48,12 +49,14 @@ function SortableTab({
 	onSelect,
 	onClose,
 	onRename,
+	processTreeSupported,
 }: {
 	tab: Tab;
 	isActive: boolean;
 	onSelect: () => void;
 	onClose: () => void;
 	onRename: (name: string) => void;
+	processTreeSupported: boolean;
 }) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: tab.id,
@@ -80,14 +83,16 @@ function SortableTab({
 	};
 
 	const tryClose = async () => {
-		try {
-			const processes = await api.getTerminalProcesses(tab.id);
-			if (processes.length > 1) {
-				setConfirmOpen(true);
-				return;
+		if (processTreeSupported) {
+			try {
+				const processes = await api.getTerminalProcesses(tab.id);
+				if (processes.length > 1) {
+					setConfirmOpen(true);
+					return;
+				}
+			} catch {
+				// Can't check — close directly
 			}
-		} catch {
-			// Can't check — close directly
 		}
 		onClose();
 	};
@@ -207,6 +212,8 @@ export function TerminalTabBar({
 	createDisabledReason,
 }: TerminalTabBarProps) {
 	const { t } = useTranslation("terminal");
+	const terminalCapability = useTerminalCapability();
+	const processTreeSupported = terminalCapability.processTree?.supported !== false;
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
 	const handleDragEnd = useCallback(
@@ -245,6 +252,7 @@ export function TerminalTabBar({
 								onSelect={() => onSelect(tab.id)}
 								onClose={() => onClose(tab.id)}
 								onRename={(name) => onRename(tab.id, name)}
+								processTreeSupported={processTreeSupported}
 							/>
 						))}
 					</SortableContext>

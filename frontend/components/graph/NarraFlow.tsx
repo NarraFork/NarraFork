@@ -21,11 +21,24 @@ import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters"
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useNarraFlow } from "@frontend/hooks/useNarraFlow";
 import { useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
+import {
+	useFsRevealCapability,
+	useNarratorReviewToolsCapability,
+} from "@frontend/hooks/usePlatform";
 import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
-import { Box, Button, Group, Modal, Stack, Text, useMantineColorScheme } from "@mantine/core";
+import {
+	Alert,
+	Box,
+	Button,
+	Group,
+	Modal,
+	Stack,
+	Text,
+	useMantineColorScheme,
+} from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconHandGrab, IconPointer } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -216,8 +229,31 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const { colorScheme } = useMantineColorScheme();
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
+	const reviewToolsCapability = useNarratorReviewToolsCapability();
+	const fsRevealCapability = useFsRevealCapability();
+	const reviewActions = useMemo(
+		() => ({
+			request: reviewToolsCapability.supported,
+			convertToSubagent: reviewToolsCapability.supported && reviewToolsCapability.convertToSubagent,
+			promote: reviewToolsCapability.supported && reviewToolsCapability.promote,
+			dismiss: reviewToolsCapability.supported && reviewToolsCapability.dismiss,
+		}),
+		[
+			reviewToolsCapability.supported,
+			reviewToolsCapability.convertToSubagent,
+			reviewToolsCapability.promote,
+			reviewToolsCapability.dismiss,
+		],
+	);
 	const { data: prefs } = useUserPreferences();
-	const { nodes: graphNodes, edges, isLoading, error, openedTerminals } = useNarraFlow(projectId);
+	const {
+		nodes: graphNodes,
+		edges,
+		graphRuntimeStatus,
+		isLoading,
+		error,
+		openedTerminals,
+	} = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
 	const createEdge = useCreateChapterEdge();
 	const updateChapter = useUpdateChapter();
@@ -1439,6 +1475,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const handleReview = useCallback(
 		async (nodeId: string) => {
 			setContextMenu(null);
+			if (!reviewActions.request) return;
 			try {
 				const sourceNode = nodesRef.current.find((n) => n.id === nodeId);
 				const posX = (sourceNode?.position?.x ?? 0) + 380;
@@ -1453,12 +1490,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				});
 			}
 		},
-		[queryClient],
+		[queryClient, reviewActions.request],
 	);
 
 	const handleConvertToSubagent = useCallback(
 		async (nodeId: string) => {
 			setContextMenu(null);
+			if (!reviewActions.convertToSubagent) return;
 			try {
 				await api.convertReviewToSubagent(nodeId);
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
@@ -1470,12 +1508,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				});
 			}
 		},
-		[queryClient],
+		[queryClient, reviewActions.convertToSubagent],
 	);
 
 	const handlePromoteReview = useCallback(
 		async (nodeId: string) => {
 			setContextMenu(null);
+			if (!reviewActions.promote) return;
 			try {
 				await api.promoteReview(nodeId);
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
@@ -1487,12 +1526,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				});
 			}
 		},
-		[queryClient],
+		[queryClient, reviewActions.promote],
 	);
 
 	const handleDismissReview = useCallback(
 		async (nodeId: string) => {
 			setContextMenu(null);
+			if (!reviewActions.dismiss) return;
 			try {
 				await api.dismissReview(nodeId);
 				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
@@ -1504,7 +1544,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				});
 			}
 		},
-		[queryClient],
+		[queryClient, reviewActions.dismiss],
 	);
 
 	const handleMergeNew = useCallback(
@@ -1613,13 +1653,14 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const handleReveal = useCallback(
 		(nodeId: string) => {
 			setContextMenu(null);
+			if (!fsRevealCapability.supported) return;
 			const node = nodes.find((n) => n.id === nodeId);
 			const path = (node?.data as { worktreePath?: string | null } | undefined)?.worktreePath;
 			if (path) {
 				api.fsReveal(path).catch(() => {});
 			}
 		},
-		[nodes],
+		[fsRevealCapability.supported, nodes],
 	);
 
 	const handleTerminalRename = useCallback((nodeId: string) => {
@@ -1714,8 +1755,36 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	}
 
 	return (
-		<Box style={{ height: "100%", display: "flex" }}>
-			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative" }}>
+		<Box style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
+			{(graphRuntimeStatus.graphReadRefresh || graphRuntimeStatus.degraded) && (
+				<Stack gap="xs" p="sm" style={{ flex: "none" }}>
+					{graphRuntimeStatus.graphReadRefresh && (
+						<Alert color="blue" variant="light" title={t("runtimeStatusTitle")}>
+							<Text size="sm">{t("runtimeRefreshDesc")}</Text>
+						</Alert>
+					)}
+					{graphRuntimeStatus.degraded && (
+						<Alert color="yellow" variant="light" title={t("runtimeDegradedTitle")}>
+							<Stack gap={4}>
+								<Text size="sm">{t("runtimeDegradedDesc")}</Text>
+								{graphRuntimeStatus.fallbackMessages.length > 0 && (
+									<Stack gap={2}>
+										<Text size="xs" fw={600}>
+											{t("runtimeFallbacksTitle")}
+										</Text>
+										{graphRuntimeStatus.fallbackMessages.map((message) => (
+											<Text key={message} size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+												{message}
+											</Text>
+										))}
+									</Stack>
+								)}
+							</Stack>
+						</Alert>
+					)}
+				</Stack>
+			)}
+			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative", minHeight: 0 }}>
 				<ReactFlow
 					onInit={handleInit}
 					onMoveEnd={handleMoveEnd}
@@ -1770,6 +1839,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						y={contextMenu.y}
 						nodeId={contextMenu.nodeId}
 						nodeData={contextMenu.nodeData}
+						reviewActions={reviewActions}
 						onClose={() => setContextMenu(null)}
 						onFork={handleFork}
 						onReview={handleReview}

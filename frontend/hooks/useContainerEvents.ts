@@ -116,17 +116,24 @@ export function useContainerEvents(chapterId: string) {
 				case "container:resumed":
 					qc.invalidateQueries({ queryKey: ["containers", chapterId] });
 					break;
-				case "container:error":
+				case "container:error": {
+					const errorMessage =
+						(data.reason as string | undefined) ??
+						(data.message as string | undefined) ??
+						(data.error as string | undefined) ??
+						(data.code as string | undefined) ??
+						"Unknown error";
 					flushPendingLogs();
 					setStarting(false);
-					setError((data.error as string) || "Unknown error");
+					setError(errorMessage);
 					notifications.show({
 						color: "red",
 						title: "Container error",
-						message: (data.error as string) || "Unknown error",
+						message: errorMessage,
 						autoClose: false,
 					});
 					break;
+				}
 			}
 		});
 

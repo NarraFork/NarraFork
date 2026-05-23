@@ -16,6 +16,8 @@ export const settingsApi = {
 			expiresAt: string;
 			newUrl: string;
 			serverRestarting: boolean;
+			manualRestartRequired?: boolean;
+			replacementPid?: number;
 		}>("/settings/generate-tls", { method: "POST" }),
 	addRetryRule: (data: { domain?: string; statusCode?: number; keyword?: string; note?: string }) =>
 		request<{ id: string }>("/settings/retry-rules", {

@@ -10,6 +10,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorReviewToolsCapability } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/useRuler";
 import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
@@ -191,6 +192,21 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const { data, isLoading, error } = useRulerData(projectId);
 	const { data: prefs } = useUserPreferences();
 	const queryClient = useQueryClient();
+	const reviewToolsCapability = useNarratorReviewToolsCapability();
+	const reviewActions = useMemo(
+		() => ({
+			request: reviewToolsCapability.supported,
+			convertToSubagent: reviewToolsCapability.supported && reviewToolsCapability.convertToSubagent,
+			promote: reviewToolsCapability.supported && reviewToolsCapability.promote,
+			dismiss: reviewToolsCapability.supported && reviewToolsCapability.dismiss,
+		}),
+		[
+			reviewToolsCapability.supported,
+			reviewToolsCapability.convertToSubagent,
+			reviewToolsCapability.promote,
+			reviewToolsCapability.dismiss,
+		],
+	);
 	// --- Camera state: ref is source of truth, state drives render via rAF ---
 	const hasRulerViewportRef = useRef(false);
 	const savedRulerThicknessRef = useRef(DEFAULT_RULER_THICKNESS);
@@ -1056,6 +1072,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handleChapterReview = useCallback(
 		async (chapterId: string) => {
+			if (!reviewActions.request) return;
 			try {
 				await api.createReview(chapterId, {});
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
@@ -1064,7 +1081,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient],
+		[projectId, queryClient, reviewActions.request],
 	);
 
 	const handleChapterAbandon = useCallback(
@@ -1082,6 +1099,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	const handleReviewConvertToSubagent = useCallback(
 		async (chapterId: string) => {
+			if (!reviewActions.convertToSubagent) return;
 			try {
 				await api.convertReviewToSubagent(chapterId);
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
@@ -1090,11 +1108,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient],
+		[projectId, queryClient, reviewActions.convertToSubagent],
 	);
 
 	const handleReviewPromote = useCallback(
 		async (chapterId: string) => {
+			if (!reviewActions.promote) return;
 			try {
 				await api.promoteReview(chapterId);
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
@@ -1103,11 +1122,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient],
+		[projectId, queryClient, reviewActions.promote],
 	);
 
 	const handleReviewDismiss = useCallback(
 		async (chapterId: string) => {
+			if (!reviewActions.dismiss) return;
 			try {
 				await api.dismissReview(chapterId);
 				queryClient.invalidateQueries({ queryKey: ["ruler", projectId] });
@@ -1116,7 +1136,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				/* global handler */
 			}
 		},
-		[projectId, queryClient],
+		[projectId, queryClient, reviewActions.dismiss],
 	);
 
 	// --- Tick context menu via hit-testing ---
@@ -1578,6 +1598,32 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 
 	// --- Layout computation ---
 	const rulerData = (data as RulerData) ?? { commits: [], segments: [], activeChapters: [] };
+	const rulerFallbackMessage = useMemo(() => {
+		if (!rulerData.degraded && !rulerData.fallback) return null;
+		const reasons = (rulerData.fallbacks ?? [])
+			.map(
+				(fallback) =>
+					fallback.reason ??
+					fallback.message ??
+					fallback.error ??
+					fallback.code ??
+					fallback.feature,
+			)
+			.filter((value): value is string => typeof value === "string" && value.trim().length > 0);
+		return reasons.length > 0
+			? formatNotificationList(reasons)
+			: t("ruler.degradedMode", { defaultValue: "Ruler is running in degraded mode." });
+	}, [rulerData.degraded, rulerData.fallback, rulerData.fallbacks, t]);
+	const rulerMutations = rulerData.capabilities?.mutations;
+	const rulerMutationDisabled = useMemo(
+		() => ({
+			fork: rulerMutations?.fork?.supported === false,
+			merge: rulerMutations?.merge?.supported === false,
+			rebase: rulerMutations?.rebase?.supported === false,
+			abandon: rulerMutations?.abandon?.supported === false,
+		}),
+		[rulerMutations],
+	);
 
 	const toggleOrientation = useCallback(() => {
 		const cam = cameraRef.current;
@@ -2613,6 +2659,25 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			onPointerMove={handlePointerMove}
 			onPointerUp={handlePointerUp}
 		>
+			{rulerFallbackMessage && (
+				<Card
+					withBorder
+					padding="xs"
+					style={{
+						position: "absolute",
+						top: 12,
+						left: 12,
+						zIndex: 50,
+						maxWidth: 520,
+						pointerEvents: "none",
+					}}
+				>
+					<Text size="xs" c="orange">
+						{rulerFallbackMessage}
+					</Text>
+				</Card>
+			)}
+
 			{/* Ruler track */}
 			<Box style={rulerTrackStyle} onContextMenu={handleTickContextMenu}>
 				<Text
@@ -2884,6 +2949,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					commitDate={tickMenu.date}
 					onClose={() => setTickMenu(null)}
 					onFork={handleForkFromCommit}
+					forkDisabled={rulerMutationDisabled.fork}
 				/>
 			)}
 
@@ -2896,6 +2962,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					chapterStatus={chapterMenu.chapter.status}
 					chapterRole={chapterMenu.chapter.role}
 					reviewStatus={chapterMenu.chapter.reviewStatus}
+					reviewActions={reviewActions}
 					onClose={() => setChapterMenu(null)}
 					onFork={handleChapterFork}
 					onMerge={handleChapterMerge}
@@ -2905,6 +2972,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					onConvertToSubagent={handleReviewConvertToSubagent}
 					onPromoteReview={handleReviewPromote}
 					onDismissReview={handleReviewDismiss}
+					disabledActions={rulerMutationDisabled}
 				/>
 			)}
 

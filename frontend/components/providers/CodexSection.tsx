@@ -10,6 +10,7 @@ import { arrayMove, rectSortingStrategy, SortableContext, useSortable } from "@d
 import { CSS } from "@dnd-kit/utilities";
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Checkbox,
@@ -29,6 +30,7 @@ import {
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
+
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
@@ -43,6 +45,10 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useCodexManagerParityCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type {
 	CodexLoadBalancingMode,
@@ -52,6 +58,7 @@ import type {
 	CodexUsageSummary,
 	CodexUsageTierStats,
 } from "../../lib/api/types";
+
 import { normalizeProxyUrl } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -327,6 +334,38 @@ export const CodexSection = React.memo(function CodexSection({
 	const { t: tn } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
+	const codexRuntimeCapability = useProviderRuntimeCapability("codex");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const codexRoutesSupported = codexRuntimeCapability?.routes?.supported !== false;
+	const isCodexRouteSupported = (route: string) =>
+		codexRoutesSupported && codexRuntimeCapability?.routes?.[route] !== false;
+	const codexManagerParity = useCodexManagerParityCapability();
+	const usageQueueClearSupported = codexManagerParity?.usageQueueClearSupported !== false;
+	const canReadCodexStatus = isCodexRouteSupported("status");
+	const canSetLoadBalancingMode = isCodexRouteSupported("loadBalancingMode");
+	const canSetGlobalProxy = isCodexRouteSupported("globalProxy");
+	const canSetDefaultReasoningEffort = isCodexRouteSupported("defaultReasoningEffort");
+	const canSetUseWebSocket = isCodexRouteSupported("useWebSocket");
+	const canSetTierOrder = isCodexRouteSupported("tierOrder");
+	const canQueryCredentialUsage = isCodexRouteSupported("credentialUsage");
+	const canEnableCredential = isCodexRouteSupported("credentialEnable");
+	const canDisableCredential = isCodexRouteSupported("credentialDisable");
+	const canResetCredential = isCodexRouteSupported("credentialReset");
+	const canUpdateCredential = isCodexRouteSupported("credentialUpdate");
+	const canDeleteCredential = isCodexRouteSupported("credentialDelete");
+	const canBatchDeleteCredentials = isCodexRouteSupported("credentialBatchDelete");
+	const canImportCredentials = isCodexRouteSupported("import");
+	const canClearUsageQueue = usageQueueClearSupported && isCodexRouteSupported("usageQueueClear");
+	const canStartBrowserAuth = isCodexRouteSupported("browserAuth");
+	const canCancelBrowserAuth = isCodexRouteSupported("browserAuthCancel");
+	const canStartDeviceAuth = isCodexRouteSupported("deviceAuthStart");
+	const canPollDeviceAuth = isCodexRouteSupported("deviceAuthPoll");
+	const canRunDeviceAuth = canStartDeviceAuth && canPollDeviceAuth;
+	const canCancelDeviceAuth = isCodexRouteSupported("deviceAuthCancel");
+	const showCodexParityWarning =
+		codexManagerParity?.tsCodexManagerEquivalent === false ||
+		codexManagerParity?.usageQueueParity === "partial" ||
+		codexManagerParity?.snapshotPaginationParity === "partial";
 	const [browserAuthPending, setBrowserAuthPending] = useState(false);
 	const [browserAuthLoading, setBrowserAuthLoading] = useState(false);
 	const [deviceAuthModal, setDeviceAuthModal] = useState(false);
@@ -383,6 +422,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const { data: status } = useQuery({
 		queryKey: ["codex", "status", { availablePage, unavailablePage, pageSize: PAGE_SIZE }],
 		queryFn: () => api.codexStatus({ availablePage, unavailablePage, pageSize: PAGE_SIZE }),
+		enabled: canReadCodexStatus,
 		refetchInterval: (query) => {
 			if (browserAuthPending) return 3_000;
 			if (query.state.data?.usageQueue?.isRunning) return 3_000;
@@ -581,13 +621,14 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleBatchDelete = async () => {
-		if (selectedIds.size === 0) return;
+		if (!canBatchDeleteCredentials || selectedIds.size === 0) return;
 		if (await confirm({ message: t("codexBatchDeleteConfirm", { count: selectedIds.size }) })) {
 			batchDeleteMut.mutate([...selectedIds]);
 		}
 	};
 
 	const handleBrowserAuth = async () => {
+		if (!canStartBrowserAuth) return;
 		const initialTotal = status?.total ?? 0;
 		setBrowserAuthLoading(true);
 		setBrowserAuthPending(true);
@@ -650,6 +691,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleCancelBrowserAuth = async () => {
+		if (!canCancelBrowserAuth) return;
 		try {
 			await api.codexBrowserAuthCancel();
 			setBrowserAuthPending(false);
@@ -663,6 +705,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleDeviceAuth = async () => {
+		if (!canRunDeviceAuth) return;
 		try {
 			const result = await api.codexDeviceAuthStart();
 			setDeviceAuthData({
@@ -681,6 +724,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const pollDeviceAuth = async () => {
+		if (!canPollDeviceAuth) return;
 		let polling = true;
 		deviceAuthIntervalRef.current = setInterval(async () => {
 			if (!polling) return;
@@ -716,7 +760,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleSaveEdit = () => {
-		if (!editingId) return;
+		if (!editingId || !canUpdateCredential) return;
 		const data: { displayName?: string; priority?: number } = {
 			displayName: editForm.displayName || undefined,
 			priority: editForm.priority,
@@ -725,6 +769,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleSaveGlobalProxy = () => {
+		if (!canSetGlobalProxy) return;
 		const normalized = normalizeProxyUrl(globalProxy);
 		setGlobalProxy(normalized ?? "");
 		globalProxyMut.mutate(normalized);
@@ -747,6 +792,7 @@ export const CodexSection = React.memo(function CodexSection({
 							: tn("reasoning_auto");
 
 	const handleSaveDefaultReasoningEffort = () => {
+		if (!canSetDefaultReasoningEffort) return;
 		const nextReasoningEffort =
 			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") || null;
 		defaultReasoningMut.mutate(nextReasoningEffort, {
@@ -757,6 +803,7 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleTierOrderDragEnd = (event: DragEndEvent) => {
+		if (!canSetTierOrder) return;
 		const { active, over } = event;
 		if (!over || active.id === over.id) return;
 		const oldIndex = tierOrder.indexOf(active.id as CodexPlanTier);
@@ -768,11 +815,13 @@ export const CodexSection = React.memo(function CodexSection({
 	};
 
 	const handleResetTierOrder = () => {
+		if (!canSetTierOrder) return;
 		setTierOrder(CODEX_DEFAULT_TIER_ORDER);
 		tierOrderMut.mutate(CODEX_DEFAULT_TIER_ORDER);
 	};
 
 	const handleImport = () => {
+		if (!canImportCredentials) return;
 		setImportError(null);
 		setImportResult(null);
 
@@ -803,6 +852,11 @@ export const CodexSection = React.memo(function CodexSection({
 					{status?.available ?? 0} / {status?.total ?? 0}
 				</Badge>
 			</Group>
+			{showCodexParityWarning && (
+				<Alert color="yellow" variant="light" title={t("codexManagerParityWarning")}>
+					{codexManagerParity?.reason ?? t("codexManagerParityWarningDesc")}
+				</Alert>
+			)}
 
 			{/* Global settings */}
 			<Stack gap="xs">
@@ -818,7 +872,10 @@ export const CodexSection = React.memo(function CodexSection({
 					<SegmentedControl
 						size="xs"
 						value={loadBalancingMode}
-						onChange={(v) => lbModeMut.mutate(v as CodexLoadBalancingMode)}
+						disabled={!canSetLoadBalancingMode}
+						onChange={(v) =>
+							canSetLoadBalancingMode && lbModeMut.mutate(v as CodexLoadBalancingMode)
+						}
 						data={[
 							{ label: t("codexModePriority"), value: "priority" },
 							{ label: t("codexModeBalanced"), value: "balanced" },
@@ -841,6 +898,8 @@ export const CodexSection = React.memo(function CodexSection({
 							variant="subtle"
 							onClick={handleResetTierOrder}
 							loading={tierOrderMut.isPending}
+							disabled={!canSetTierOrder}
+							title={!canSetTierOrder ? providerRouteUnsupportedReason : undefined}
 						>
 							{t("codexTierOrderReset")}
 						</Button>
@@ -869,7 +928,13 @@ export const CodexSection = React.memo(function CodexSection({
 						onChange={(e) => setGlobalProxy(e.target.value)}
 						style={{ flex: 1 }}
 					/>
-					<Button size="xs" onClick={handleSaveGlobalProxy} loading={globalProxyMut.isPending}>
+					<Button
+						size="xs"
+						onClick={handleSaveGlobalProxy}
+						loading={globalProxyMut.isPending}
+						disabled={!canSetGlobalProxy}
+						title={!canSetGlobalProxy ? providerRouteUnsupportedReason : undefined}
+					>
 						{t("codexSave")}
 					</Button>
 				</Group>
@@ -885,6 +950,7 @@ export const CodexSection = React.memo(function CodexSection({
 					<SegmentedControl
 						size="xs"
 						value={effectiveDefaultReasoningEffort || "auto"}
+						disabled={!canSetDefaultReasoningEffort}
 						onChange={(v) => setDefaultReasoningEffort(v === "auto" ? "" : v)}
 						data={[
 							{ label: tn("reasoning_auto"), value: "auto" },
@@ -899,6 +965,8 @@ export const CodexSection = React.memo(function CodexSection({
 						size="xs"
 						onClick={handleSaveDefaultReasoningEffort}
 						loading={defaultReasoningMut.isPending}
+						disabled={!canSetDefaultReasoningEffort}
+						title={!canSetDefaultReasoningEffort ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexSave")}
 					</Button>
@@ -921,11 +989,14 @@ export const CodexSection = React.memo(function CodexSection({
 						size="sm"
 						checked={useWebSocket}
 						onChange={(e) => setUseWebSocket(e.currentTarget.checked)}
+						disabled={!canSetUseWebSocket}
 					/>
 					<Button
 						size="xs"
-						onClick={() => useWebSocketMut.mutate(useWebSocket)}
+						onClick={() => canSetUseWebSocket && useWebSocketMut.mutate(useWebSocket)}
 						loading={useWebSocketMut.isPending}
+						disabled={!canSetUseWebSocket}
+						title={!canSetUseWebSocket ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexSave")}
 					</Button>
@@ -945,17 +1016,36 @@ export const CodexSection = React.memo(function CodexSection({
 									Waiting for browser authorization...
 								</Text>
 							</Group>
-							<Button size="xs" variant="light" color="orange" onClick={handleCancelBrowserAuth}>
+							<Button
+								size="xs"
+								variant="light"
+								color="orange"
+								onClick={handleCancelBrowserAuth}
+								disabled={!canCancelBrowserAuth}
+								title={!canCancelBrowserAuth ? providerRouteUnsupportedReason : undefined}
+							>
 								Cancel
 							</Button>
 						</Stack>
 					</Paper>
 				) : (
 					<Group>
-						<Button size="xs" onClick={handleBrowserAuth} loading={browserAuthLoading}>
+						<Button
+							size="xs"
+							onClick={handleBrowserAuth}
+							loading={browserAuthLoading}
+							disabled={!canStartBrowserAuth}
+							title={!canStartBrowserAuth ? providerRouteUnsupportedReason : undefined}
+						>
 							{t("codexAddBrowser")}
 						</Button>
-						<Button size="xs" variant="light" onClick={handleDeviceAuth}>
+						<Button
+							size="xs"
+							variant="light"
+							onClick={handleDeviceAuth}
+							disabled={!canRunDeviceAuth}
+							title={!canRunDeviceAuth ? providerRouteUnsupportedReason : undefined}
+						>
 							{t("codexAddDevice")}
 						</Button>
 					</Group>
@@ -993,7 +1083,8 @@ export const CodexSection = React.memo(function CodexSection({
 						size="xs"
 						onClick={handleImport}
 						loading={importMut.isPending}
-						disabled={!importJson.trim()}
+						disabled={!importJson.trim() || !canImportCredentials}
+						title={!canImportCredentials ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexImport")}
 					</Button>
@@ -1022,8 +1113,16 @@ export const CodexSection = React.memo(function CodexSection({
 							<Button
 								size="compact-xs"
 								variant="subtle"
-								onClick={() => usageQueueClearMut.mutate()}
+								onClick={() => canClearUsageQueue && usageQueueClearMut.mutate()}
 								loading={usageQueueClearMut.isPending}
+								disabled={!canClearUsageQueue}
+								title={
+									!canClearUsageQueue
+										? usageQueueClearSupported
+											? providerRouteUnsupportedReason
+											: t("codexUsageQueueClearUnsupported")
+										: undefined
+								}
 							>
 								{t("codexUsageQueueClear")}
 							</Button>
@@ -1088,6 +1187,10 @@ export const CodexSection = React.memo(function CodexSection({
 											leftSection={<IconTrash size={14} />}
 											onClick={handleBatchDelete}
 											loading={batchDeleteMut.isPending}
+											disabled={!canBatchDeleteCredentials}
+											title={
+												!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined
+											}
 										>
 											{t("codexBatchDelete")} ({selectedIds.size})
 										</Button>
@@ -1120,6 +1223,13 @@ export const CodexSection = React.memo(function CodexSection({
 								onToggleSelect={toggleSelect}
 								onToggleSelectAll={toggleSelectAll}
 								t={t}
+								canQueryCredentialUsage={canQueryCredentialUsage}
+								canEnableCredential={canEnableCredential}
+								canDisableCredential={canDisableCredential}
+								canResetCredential={canResetCredential}
+								canUpdateCredential={canUpdateCredential}
+								canDeleteCredential={canDeleteCredential}
+								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
 							/>
 						</Stack>
 					)}
@@ -1157,6 +1267,13 @@ export const CodexSection = React.memo(function CodexSection({
 								onToggleSelect={toggleSelect}
 								onToggleSelectAll={toggleSelectAll}
 								t={t}
+								canQueryCredentialUsage={canQueryCredentialUsage}
+								canEnableCredential={canEnableCredential}
+								canDisableCredential={canDisableCredential}
+								canResetCredential={canResetCredential}
+								canUpdateCredential={canUpdateCredential}
+								canDeleteCredential={canDeleteCredential}
+								credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
 							/>
 						</Stack>
 					)}
@@ -1200,7 +1317,7 @@ export const CodexSection = React.memo(function CodexSection({
 				opened={deviceAuthModal}
 				onClose={() => {
 					setDeviceAuthModal(false);
-					api.codexDeviceAuthCancel();
+					if (canCancelDeviceAuth) api.codexDeviceAuthCancel();
 				}}
 				title={t("codexDeviceAuthTitle")}
 			>
@@ -1440,6 +1557,13 @@ function CredentialList(props: {
 	onToggleSelect: (id: string) => void;
 	onToggleSelectAll: (entryIds: string[]) => void;
 	t: (key: string) => string;
+	canQueryCredentialUsage: boolean;
+	canEnableCredential: boolean;
+	canDisableCredential: boolean;
+	canResetCredential: boolean;
+	canUpdateCredential: boolean;
+	canDeleteCredential: boolean;
+	credentialRouteUnsupportedReason: string;
 }) {
 	const {
 		entries,
@@ -1464,6 +1588,13 @@ function CredentialList(props: {
 		onToggleSelect,
 		onToggleSelectAll,
 		t,
+		canQueryCredentialUsage,
+		canEnableCredential,
+		canDisableCredential,
+		canResetCredential,
+		canUpdateCredential,
+		canDeleteCredential,
+		credentialRouteUnsupportedReason,
 	} = props;
 	const isMobile = useMediaQuery("(max-width: 768px)");
 	const { t: tSettings } = useTranslation("settings");
@@ -1580,7 +1711,15 @@ function CredentialList(props: {
 										{isEditing ? (
 											<>
 												<Tooltip label={t("codexSave")}>
-													<ActionIcon size="sm" color="green" onClick={onSaveEdit}>
+													<ActionIcon
+														size="sm"
+														color="green"
+														onClick={() => canUpdateCredential && onSaveEdit()}
+														disabled={!canUpdateCredential}
+														title={
+															!canUpdateCredential ? credentialRouteUnsupportedReason : undefined
+														}
+													>
 														<IconCheck size={16} />
 													</ActionIcon>
 												</Tooltip>
@@ -1593,7 +1732,14 @@ function CredentialList(props: {
 										) : (
 											<>
 												<Tooltip label={t("codexEdit")}>
-													<ActionIcon size="sm" onClick={() => onEdit(entry)}>
+													<ActionIcon
+														size="sm"
+														onClick={() => canUpdateCredential && onEdit(entry)}
+														disabled={!canUpdateCredential}
+														title={
+															!canUpdateCredential ? credentialRouteUnsupportedReason : undefined
+														}
+													>
 														<IconPencil size={16} />
 													</ActionIcon>
 												</Tooltip>
@@ -1602,8 +1748,14 @@ function CredentialList(props: {
 													<ActionIcon
 														size="sm"
 														color="blue"
-														onClick={() => usageMut.mutate(entry.id)}
+														onClick={() => canQueryCredentialUsage && usageMut.mutate(entry.id)}
 														loading={usageMut.isPending}
+														disabled={!canQueryCredentialUsage}
+														title={
+															!canQueryCredentialUsage
+																? credentialRouteUnsupportedReason
+																: undefined
+														}
 													>
 														<IconRefresh size={16} />
 													</ActionIcon>
@@ -1613,7 +1765,11 @@ function CredentialList(props: {
 														<ActionIcon
 															size="sm"
 															color="green"
-															onClick={() => enableMut.mutate(entry.id)}
+															onClick={() => canEnableCredential && enableMut.mutate(entry.id)}
+															disabled={!canEnableCredential}
+															title={
+																!canEnableCredential ? credentialRouteUnsupportedReason : undefined
+															}
 														>
 															<IconCheck size={16} />
 														</ActionIcon>
@@ -1623,7 +1779,11 @@ function CredentialList(props: {
 														<ActionIcon
 															size="sm"
 															color="orange"
-															onClick={() => disableMut.mutate(entry.id)}
+															onClick={() => canDisableCredential && disableMut.mutate(entry.id)}
+															disabled={!canDisableCredential}
+															title={
+																!canDisableCredential ? credentialRouteUnsupportedReason : undefined
+															}
 														>
 															<IconX size={16} />
 														</ActionIcon>
@@ -1634,7 +1794,11 @@ function CredentialList(props: {
 														<ActionIcon
 															size="sm"
 															color="blue"
-															onClick={() => resetMut.mutate(entry.id)}
+															onClick={() => canResetCredential && resetMut.mutate(entry.id)}
+															disabled={!canResetCredential}
+															title={
+																!canResetCredential ? credentialRouteUnsupportedReason : undefined
+															}
 														>
 															<IconDeviceFloppy size={16} />
 														</ActionIcon>
@@ -1645,10 +1809,15 @@ function CredentialList(props: {
 														size="sm"
 														color="red"
 														onClick={async () => {
+															if (!canDeleteCredential) return;
 															if (await confirm({ message: t("codexDeleteConfirm") })) {
 																deleteMut.mutate(entry.id);
 															}
 														}}
+														disabled={!canDeleteCredential}
+														title={
+															!canDeleteCredential ? credentialRouteUnsupportedReason : undefined
+														}
 													>
 														<IconTrash size={16} />
 													</ActionIcon>
@@ -1720,6 +1889,13 @@ function CredentialCards(props: {
 	onToggleSelect: (id: string) => void;
 	onToggleSelectAll: (entryIds: string[]) => void;
 	t: (key: string) => string;
+	canQueryCredentialUsage: boolean;
+	canEnableCredential: boolean;
+	canDisableCredential: boolean;
+	canResetCredential: boolean;
+	canUpdateCredential: boolean;
+	canDeleteCredential: boolean;
+	credentialRouteUnsupportedReason: string;
 }) {
 	const {
 		entries,
@@ -1743,6 +1919,13 @@ function CredentialCards(props: {
 		selectedIds,
 		onToggleSelect,
 		t,
+		canQueryCredentialUsage,
+		canEnableCredential,
+		canDisableCredential,
+		canResetCredential,
+		canUpdateCredential,
+		canDeleteCredential,
+		credentialRouteUnsupportedReason,
 	} = props;
 
 	const { t: tSettings } = useTranslation("settings");
@@ -1817,8 +2000,10 @@ function CredentialCards(props: {
 									<Group gap="xs">
 										<Button
 											size="compact-xs"
-											onClick={onSaveEdit}
+											onClick={() => canUpdateCredential && onSaveEdit()}
 											leftSection={<IconDeviceFloppy size={12} />}
+											disabled={!canUpdateCredential}
+											title={!canUpdateCredential ? credentialRouteUnsupportedReason : undefined}
 										>
 											{t("codexSave")}
 										</Button>
@@ -1887,15 +2072,25 @@ function CredentialCards(props: {
 							<Group gap="xs" wrap="wrap">
 								{!isEditing && (
 									<>
-										<Button variant="subtle" size="compact-xs" onClick={() => onEdit(entry)}>
+										<Button
+											variant="subtle"
+											size="compact-xs"
+											onClick={() => canUpdateCredential && onEdit(entry)}
+											disabled={!canUpdateCredential}
+											title={!canUpdateCredential ? credentialRouteUnsupportedReason : undefined}
+										>
 											{t("codexEdit")}
 										</Button>
 
 										<Button
 											variant="subtle"
 											size="compact-xs"
-											onClick={() => usageMut.mutate(entry.id)}
+											onClick={() => canQueryCredentialUsage && usageMut.mutate(entry.id)}
 											loading={usageMut.isPending}
+											disabled={!canQueryCredentialUsage}
+											title={
+												!canQueryCredentialUsage ? credentialRouteUnsupportedReason : undefined
+											}
 										>
 											{t("codexQueryUsage")}
 										</Button>
@@ -1904,7 +2099,9 @@ function CredentialCards(props: {
 												variant="subtle"
 												size="compact-xs"
 												color="green"
-												onClick={() => enableMut.mutate(entry.id)}
+												onClick={() => canEnableCredential && enableMut.mutate(entry.id)}
+												disabled={!canEnableCredential}
+												title={!canEnableCredential ? credentialRouteUnsupportedReason : undefined}
 											>
 												{t("codexEnable")}
 											</Button>
@@ -1913,7 +2110,9 @@ function CredentialCards(props: {
 												variant="subtle"
 												size="compact-xs"
 												color="orange"
-												onClick={() => disableMut.mutate(entry.id)}
+												onClick={() => canDisableCredential && disableMut.mutate(entry.id)}
+												disabled={!canDisableCredential}
+												title={!canDisableCredential ? credentialRouteUnsupportedReason : undefined}
 											>
 												{t("codexDisable")}
 											</Button>
@@ -1923,7 +2122,9 @@ function CredentialCards(props: {
 												variant="subtle"
 												size="compact-xs"
 												color="blue"
-												onClick={() => resetMut.mutate(entry.id)}
+												onClick={() => canResetCredential && resetMut.mutate(entry.id)}
+												disabled={!canResetCredential}
+												title={!canResetCredential ? credentialRouteUnsupportedReason : undefined}
 											>
 												{t("codexReset")}
 											</Button>
@@ -1933,10 +2134,13 @@ function CredentialCards(props: {
 											color="red"
 											size="sm"
 											onClick={async () => {
+												if (!canDeleteCredential) return;
 												if (await confirm({ message: t("codexDeleteConfirm") })) {
 													deleteMut.mutate(entry.id);
 												}
 											}}
+											disabled={!canDeleteCredential}
+											title={!canDeleteCredential ? credentialRouteUnsupportedReason : undefined}
 										>
 											<IconTrash size={14} />
 										</ActionIcon>

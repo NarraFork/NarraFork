@@ -4,6 +4,7 @@ import { IconFolder, IconFolderPlus } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useFileSystemCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 const MAX_PATH_OPTIONS = 120;
@@ -71,6 +72,9 @@ export function PathInput(props: PathInputProps) {
 	const isControlled = props.value !== undefined;
 	const { t } = useTranslation("common");
 	const queryClient = useQueryClient();
+	const fsCapability = useFileSystemCapability();
+	const browseSupported = fsCapability.browse.supported;
+	const mkdirSupported = fsCapability.mkdir.supported;
 
 	const [internalValue, setInternalValue] = useState("");
 	const value = isControlled ? props.value : internalValue;
@@ -95,7 +99,7 @@ export function PathInput(props: PathInputProps) {
 	} = useQuery({
 		queryKey: ["fs-browse", parsed.dir],
 		queryFn: () => api.fsBrowse(parsed.dir || undefined),
-		enabled: parsed.dir.length > 0,
+		enabled: browseSupported && parsed.dir.length > 0,
 		staleTime: 5000,
 		gcTime: 30_000,
 		retry: false,
@@ -113,6 +117,7 @@ export function PathInput(props: PathInputProps) {
 	// - the parent directory exists (we got data back)
 	// - no existing entry matches the filter exactly
 	const canCreate =
+		mkdirSupported &&
 		parsed.filter.length > 0 &&
 		!!data?.path &&
 		!data.entries.some((e) => e.name.toLowerCase() === filterLower);
@@ -156,7 +161,7 @@ export function PathInput(props: PathInputProps) {
 			if (optionValue === MORE_OPTION_VALUE) return;
 			if (optionValue === CREATE_OPTION_VALUE) {
 				// Create the directory
-				if (data?.path && parsed.filter) {
+				if (mkdirSupported && data?.path && parsed.filter) {
 					mkdirMutation.mutate({ parent: data.path, name: parsed.filter });
 				}
 				return;
@@ -169,7 +174,7 @@ export function PathInput(props: PathInputProps) {
 			// Re-focus so user can keep typing
 			setTimeout(() => inputRef.current?.focus(), 0);
 		},
-		[data?.sep, data?.path, parsed.filter, combobox, setValue, mkdirMutation],
+		[data?.sep, data?.path, parsed.filter, combobox, setValue, mkdirMutation, mkdirSupported],
 	);
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {

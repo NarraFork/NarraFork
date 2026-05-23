@@ -1,4 +1,4 @@
-import { ApiError, BASE, getToken, request } from "./client";
+import { ApiError, BASE, getToken, readFetchError, request } from "./client";
 import type {
 	ApiEntity,
 	ChangelogEntry,
@@ -20,6 +20,7 @@ import type {
 	LearningSearchResponse,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
+	SearchResponse,
 	StorageScanResult,
 } from "./types";
 
@@ -38,7 +39,7 @@ export const miscApi = {
 
 	// Search
 	search: (q: string, entities = "chapters,messages") =>
-		request<{ results: ApiEntity[] }>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
+		request<SearchResponse>(`/search?q=${encodeURIComponent(q)}&entities=${entities}`),
 
 	// Favorite Directories
 	listFavoriteDirectories: () => request<ApiEntity[]>("/favorites"),
@@ -69,23 +70,29 @@ export const miscApi = {
 			body: formData,
 		});
 		if (!res.ok) {
-			const err = await res.json().catch(() => ({ error: "Upload failed" }));
-			throw new ApiError(err.error ?? "Upload failed", res.status);
+			const error = await readFetchError(res, "Upload failed");
+			throw new ApiError(error.message, res.status, error.data);
 		}
 		return res.json() as Promise<{ id: string; filename: string; mediaType: string }>;
 	},
 	deleteNotificationSound: (id: string) =>
 		request<{ ok: boolean }>(`/notification-sounds/${id}`, { method: "DELETE" }),
 	testDingtalkWebhook: (webhook: string, secret?: string) =>
-		request<{ ok: boolean; error?: string }>("/notifications/test-dingtalk", {
-			method: "POST",
-			body: JSON.stringify({ webhook, secret }),
-		}),
+		request<{ ok: boolean; code?: string; reason?: string; error?: string; message?: string }>(
+			"/notifications/test-dingtalk",
+			{
+				method: "POST",
+				body: JSON.stringify({ webhook, secret }),
+			},
+		),
 	testFeishuWebhook: (webhook: string, secret?: string) =>
-		request<{ ok: boolean; error?: string }>("/notifications/test-feishu", {
-			method: "POST",
-			body: JSON.stringify({ webhook, secret }),
-		}),
+		request<{ ok: boolean; code?: string; reason?: string; error?: string; message?: string }>(
+			"/notifications/test-feishu",
+			{
+				method: "POST",
+				body: JSON.stringify({ webhook, secret }),
+			},
+		),
 
 	// Skills
 	listSkills: (projectId: string) =>
@@ -638,21 +645,251 @@ export const miscApi = {
 			gitAvailable: boolean;
 			capabilities?: {
 				database?: {
+					engine?: string;
 					mainSchemaOwner?: string;
 					goMainMigrations?: boolean;
 					goEnsureColumns?: boolean;
 					ftsRepair?: boolean;
 					mode?: string;
+					searchMode?: string;
 					reason?: string;
 				};
-				chapters?: {
-					split?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+				frontend?: {
+					staticHosted?: boolean;
+					mode?: string;
+					directory?: string;
 				};
+				releasePackaging?: {
+					buildInfo?: string;
+					frontend?: string;
+					changelog?: string;
+					singleFileEmbedded?: boolean;
+				};
+				nativeExtensions?: {
+					defaultEnabled?: boolean;
+					scope?: string;
+					browserSessions?: {
+						defaultEnabled?: boolean;
+						storage?: string;
+						cutover?: string;
+						rollback?: string;
+						reason?: string;
+					};
+					containerBrowserToolAutoEnable?: {
+						defaultEnabled?: boolean;
+						cutover?: string;
+						rollback?: string;
+						reason?: string;
+					};
+				};
+				chapters?: {
+					split?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						mode?: string;
+						routes?: { splitAtCommit?: boolean };
+						partials?: {
+							compressedAISummary?: {
+								supported?: boolean;
+								fallback?: boolean;
+								code?: string;
+								reason?: string;
+								mode?: string;
+							};
+							containerAutostart?: {
+								supported?: boolean;
+								fallback?: boolean;
+								code?: string;
+								reason?: string;
+								mode?: string;
+							};
+						};
+					};
+					containers?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						routes?: Partial<
+							Record<
+								| "setup"
+								| "podmanStatus"
+								| "podmanInstall"
+								| "composeInfo"
+								| "list"
+								| "start"
+								| "stop"
+								| "pause"
+								| "unpause"
+								| "logs"
+								| "remove",
+								boolean
+							>
+						>;
+						runtime?: {
+							podmanCompose?: boolean;
+							podmanComposeFallbackCommand?: boolean;
+							boundedOutput?: boolean;
+							syncStartRequest?: boolean;
+							backgroundStart?: boolean;
+							backgroundStartReason?: string;
+							streamingLogs?: boolean;
+							perChapterLock?: boolean;
+						};
+						ports?: { legacyHostPortAllocation?: boolean; portRelease?: boolean };
+						proxy?: {
+							metadataSupported?: boolean;
+							requiresPastaPasst?: boolean;
+							overridePortsReset?: boolean;
+							reverseProxyServer?: boolean;
+							http?: boolean;
+							websocket?: boolean;
+							dynamicSettingsHook?: boolean;
+						};
+						lifecycle?: {
+							manualControls?: boolean;
+							autoStartOnFork?: boolean;
+							pauseOnDormant?: boolean;
+							unpauseOnWake?: boolean;
+							removeOnDelete?: boolean;
+							removeOnMergeCleanup?: boolean;
+							deleteVolumes?: boolean;
+						};
+						narratorIntegration?: {
+							statusChangedEvent?: boolean;
+							containerReadyMessage?: boolean;
+							browserToolAutoEnable?: boolean;
+							browserToolAutoEnableReason?: string;
+							defaultEnabled?: boolean;
+							cutover?: string;
+							rollback?: string;
+						};
+					};
+				};
+
 				narrator?: {
+					wsEvents?: {
+						p0?: {
+							supported?: boolean;
+							fallback?: boolean;
+							code?: string;
+							reason?: string;
+							events?: string[];
+						};
+						p1?: {
+							supported?: boolean;
+							fallback?: boolean;
+							code?: string;
+							reason?: string;
+							mode?: string;
+							events?: string[];
+						};
+					};
+					messageHistory?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						catchUp?: boolean;
+						messageVersion?: boolean;
+						childOrphans?: boolean;
+						toolCalls?: boolean;
+						compactMarkers?: boolean;
+						structuredContent?: boolean;
+					};
+					planMode?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						api?: boolean;
+						toolReflection?: boolean;
+						previousModeRestore?: boolean;
+					};
+					retryRecovery?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						retry?: boolean;
+						continue?: boolean;
+						interrupt?: boolean;
+						manualOverride?: boolean;
+						rollback?: boolean;
+						editAndRegenerate?: boolean;
+					};
+					permissions?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						modes?: string[];
+						approveDeny?: boolean;
+						updatedInput?: boolean;
+						pauseResume?: string;
+						reflections?: string[];
+					};
+					reviewTools?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						concludeReview?: boolean;
+						feedbackInjection?: boolean;
+						promote?: boolean;
+						dismiss?: boolean;
+						convertToSubagent?: boolean;
+						staleMergeGuard?: boolean;
+					};
+					subagents?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						foreground?: boolean;
+						background?: boolean;
+						awaitAgent?: boolean;
+						send?: boolean;
+						teamStatus?: boolean;
+						detachAttach?: boolean;
+						detachUnblocksParent?: boolean;
+						reattachBlocksParent?: boolean;
+						backgroundResultInjection?: boolean;
+						staleRecovery?: boolean;
+					};
+					compact?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						segmentCompact?: boolean;
+						contextClear?: boolean;
+						mode?: string;
+						fallbackSummary?: boolean;
+						fallbackReason?: string;
+					};
 					browserSessions?: {
 						supported?: boolean;
 						fallback?: boolean;
 						code?: string;
+						reason?: string;
+						defaultEnabled?: boolean;
+						runtime?: string;
+						storage?: string;
+						cutover?: string;
+						rollback?: string;
+						narratorBound?: boolean;
+						lifecycleEvents?: boolean;
+						artifactPersistence?: boolean;
+						resourceLimits?: boolean;
+						requiresChrome?: boolean;
+					};
+					containerBrowserToolAutoEnable?: {
+						defaultEnabled?: boolean;
+						cutover?: string;
+						rollback?: string;
 						reason?: string;
 					};
 					rollbackEditRegenerate?: {
@@ -660,9 +897,41 @@ export const miscApi = {
 						fallback?: boolean;
 						code?: string;
 						reason?: string;
+						rollback?: boolean;
+						editAndRegenerate?: boolean;
+						copyOnWrite?: boolean;
+						messageRefTruncation?: boolean;
+						fileStateRebuild?: boolean;
+						toolCallInvalidation?: boolean;
+						agentRerun?: boolean;
+						optionalFileRevert?: boolean;
+						optionalAgentRerun?: boolean;
+						wsEvents?: boolean;
+					};
+					toolInventory?: {
+						supported?: boolean;
+						categories?: string[];
+						supportedOptionalTools?: string[];
+						unsupportedOptionalTools?: string[];
+						reason?: string;
+						mcpExternalTools?: {
+							supported?: boolean;
+							fallback?: boolean;
+							code?: string;
+							reason?: string;
+							parity?: string;
+							transport?: string;
+							lifecycle?: string;
+						};
 					};
 				};
 				mcp?: {
+					builtinProtocol?: {
+						supported?: boolean;
+						initialize?: boolean;
+						toolsList?: boolean;
+						toolsCall?: boolean;
+					};
 					serverSettingsStorage?: {
 						supported?: boolean;
 						fallback?: boolean;
@@ -670,11 +939,64 @@ export const miscApi = {
 						reason?: string;
 						storage?: string;
 					};
+					externalServerManagement?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						storage?: string;
+						permissions?: boolean;
+						import?: boolean;
+					};
+					builtinTools?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						parity?: string;
+						missing?: string[];
+					};
+					toolsList?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						source?: string;
+					};
+					toolsCall?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						scope?: string;
+					};
 					externalToolsInjection?: {
 						supported?: boolean;
 						fallback?: boolean;
 						code?: string;
 						reason?: string;
+						parity?: string;
+						transport?: string;
+						lifecycle?: string;
+					};
+					externalAgentInjection?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						parity?: string;
+						transport?: string;
+						lifecycle?: string;
+					};
+					transports?: {
+						stdio?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+						sse?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+						streamableHttp?: {
+							supported?: boolean;
+							fallback?: boolean;
+							code?: string;
+							reason?: string;
+						};
 					};
 				};
 				benchmark?: {
@@ -683,6 +1005,10 @@ export const miscApi = {
 						fallback?: boolean;
 						code?: string;
 						reason?: string;
+						runtime?: string;
+						resourceLimits?: boolean;
+						timeout?: boolean;
+						outputLimitBytes?: number;
 					};
 				};
 				content?: {
@@ -700,6 +1026,17 @@ export const miscApi = {
 					};
 				};
 				fs?: {
+					browse?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					shortcuts?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					mkdir?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					preview?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						maxTextBytes?: number;
+						maxBinaryBytes?: number;
+					};
 					reveal?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
 				};
 				providers?: Partial<
@@ -714,28 +1051,187 @@ export const miscApi = {
 								code?: string;
 								reason?: string;
 							};
+							routes?: { [key: string]: boolean | string | undefined };
+							agentRuntime?: { [key: string]: boolean | string | undefined };
+							pluginBridge?: {
+								supported?: boolean;
+								fallback?: boolean;
+								code?: string;
+								reason?: string;
+								requiresBun?: boolean;
+							};
+							mcp?: {
+								listToolsRoute?: boolean;
+								searchRoute?: boolean;
+								agentInjection?: boolean;
+							};
+							managerParity?: {
+								tsCodexManagerEquivalent?: boolean;
+								usageQueueParity?: string;
+								usageQueueClearSupported?: boolean;
+								snapshotPaginationParity?: string;
+								reason?: string;
+							};
 						}
 					>
 				>;
 				terminal?: {
 					supported?: boolean;
 					reason?: string;
+					directPty?: boolean;
+					windowsPty?: boolean;
+					dtachSupported?: boolean;
+					dtachAvailable?: boolean;
+					detachedReattach?: boolean;
+					orphanRecovery?: boolean;
+					scrollbackReplay?: boolean;
+					scrollbackReplayMode?: string;
+					bufferStateReplay?: boolean;
+					bufferStateMode?: string;
+					xtermSerializedReplay?: boolean;
+					xtermSerializedReplayReason?: string;
+					maxSnapshotBytes?: number;
+					multiClientResizeMode?: string;
+					ws?: {
+						subscribe?: boolean;
+						create?: boolean;
+						input?: boolean;
+						resize?: boolean;
+						kill?: boolean;
+						rename?: boolean;
+						scrollback?: boolean;
+						bufferState?: boolean;
+					};
+					processTree?: { supported?: boolean; platform?: string };
 				};
 				vnet?: {
 					supported?: boolean;
 					reason?: string;
+					mode?: string;
+					ws?: boolean;
+					peerCleanup?: boolean;
+					udpRendezvous?: boolean;
+					udpRendezvousReason?: string;
 				};
 				update?: {
 					selfUpdateAvailable?: boolean;
 					manualOnly?: boolean;
 					canAutoRestart?: boolean;
+					download?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						sse?: boolean;
+						sha512?: boolean;
+						maxBytes?: number;
+						trustMode?: string;
+					};
+					apply?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						handoff?: string;
+					};
+				};
+				settings?: {
+					storage?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						path?: string;
+					};
+					patch?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					validation?: {
+						tsZodParity?: boolean;
+						mode?: string;
+						reason?: string;
+					};
+					secretMasking?: boolean;
+					providerModelAugmentation?: boolean;
+					tlsGeneration?: boolean;
+					retryRules?: boolean;
+				};
+				runtime?: {
+					backend?: string;
+					buildChannel?: string;
+					scan?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					cached?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					cleanup?: Partial<
+						Record<
+							"terminals" | "containers" | "browsers" | "worktrees",
+							{ supported?: boolean; reason?: string; mode?: string }
+						>
+					>;
 				};
 				gateway?: {
 					persistentRuntimes?: boolean;
 					mode?: string;
 					reason?: string;
-					webhook?: { supported?: boolean; fallback?: boolean };
+					supportedPlatforms?: Array<
+						"telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin" | "qqbot"
+					>;
+					unsupportedPlatforms?: Partial<
+						Record<
+							"telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin" | "qqbot",
+							string
+						>
+					>;
+					webhook?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						error?: string;
+						message?: string;
+					};
 					weixinQr?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						error?: string;
+						message?: string;
+					};
+				};
+				uploads?: {
+					serveNarratorImages?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+					serveAvatars?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+					cleanupPreservesMessageImageRefs?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+				};
+				shares?: {
+					create?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
+					publicDownload?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+					};
+					preview?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						htmlMode?: string;
+					};
+					ephemeralOnly?: {
 						supported?: boolean;
 						fallback?: boolean;
 						code?: string;
@@ -743,11 +1239,43 @@ export const miscApi = {
 					};
 				};
 				storage?: {
+					scan?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						sse?: boolean;
+						cache?: boolean;
+					};
+					cached?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						cache?: boolean;
+					};
+					database?: {
+						preview?: boolean;
+						cleanup?: boolean;
+						cleanupTargets?: Partial<
+							Record<
+								"archivedSessions" | "staleSessions" | "apiRequestDumps",
+								{ supported?: boolean; fallback?: boolean; code?: string; reason?: string }
+							>
+						>;
+					};
 					vacuum?: { supported?: boolean; reason?: string };
 					cleanup?: Partial<
 						Record<
 							"uploads" | "shares" | "worktrees" | "containers",
-							{ supported?: boolean; fallback?: boolean; reason?: string }
+							{
+								supported?: boolean;
+								fallback?: boolean;
+								reason?: string;
+								mode?: string;
+								alternative?: string;
+								preservesMessageImageRefs?: boolean;
+							}
 						>
 					>;
 				};
@@ -965,7 +1493,7 @@ export const miscApi = {
 	// Runtime Resources
 	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),
 	getCachedRuntime: () => request<{ cached: boolean; data?: RuntimeScanResult }>("/runtime/cached"),
-	cleanupRuntime: (target: "terminals" | "containers" | "browsers") =>
+	cleanupRuntime: (target: "terminals" | "containers" | "browsers" | "worktrees") =>
 		request<{
 			ok: boolean;
 			dryRun?: boolean;
@@ -973,6 +1501,10 @@ export const miscApi = {
 			stopped?: number;
 			closedSessions?: number;
 			browserClosed?: boolean;
+			removedCounts?: Partial<
+				Record<"terminals" | "containers" | "browsers" | "worktrees", number>
+			>;
+			removed?: Partial<Record<"terminals" | "containers" | "browsers" | "worktrees", string[]>>;
 			supported?: Record<string, boolean>;
 			fallback?: Record<string, boolean>;
 			errorCount?: number;
@@ -981,7 +1513,17 @@ export const miscApi = {
 
 	// Gateway — WeChat QR login
 	gatewayWeixinQrStart: () =>
-		request<{ qrcodeUrl: string; qrcodeToken: string }>("/gateway/weixin/qr-start", {
+		request<{
+			qrcodeUrl: string;
+			qrcodeToken: string;
+			status?: string;
+			supported?: boolean;
+			fallback?: boolean;
+			reason?: string;
+			error?: string;
+			message?: string;
+			code?: string;
+		}>("/gateway/weixin/qr-start", {
 			method: "POST",
 		}),
 	gatewayWeixinQrPoll: () =>
@@ -993,6 +1535,11 @@ export const miscApi = {
 			baseUrl?: string;
 			userId?: string;
 			message?: string;
+			reason?: string;
+			error?: string;
+			code?: string;
+			supported?: boolean;
+			fallback?: boolean;
 			qrcodeUrl?: string;
 			qrcodeToken?: string;
 		}>("/gateway/weixin/qr-poll"),

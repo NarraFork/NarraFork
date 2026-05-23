@@ -1,4 +1,14 @@
-import { Affix, Box, Button, Group, NavLink, ScrollArea, Text, Transition } from "@mantine/core";
+import {
+	Affix,
+	Alert,
+	Box,
+	Button,
+	Group,
+	NavLink,
+	ScrollArea,
+	Text,
+	Transition,
+} from "@mantine/core";
 import {
 	IconArrowLeft,
 	IconBell,
@@ -23,6 +33,10 @@ import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tansta
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../hooks/useAuth";
 import { InstanceSettingsProvider, useInstanceSettings } from "../hooks/useInstanceSettings";
+import {
+	useSettingsFeatureCapability,
+	useSettingsValidationCapability,
+} from "../hooks/usePlatform";
 
 export const Route = createFileRoute("/settings")({
 	component: SettingsLayout,
@@ -53,6 +67,8 @@ function SettingsLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const instanceSettings = useInstanceSettings();
 	const { isDirty, isSaving, save, highlight } = instanceSettings;
+	const settingsValidation = useSettingsValidationCapability();
+	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const isAdmin = user?.role === "admin";
 	const openSetupWizard = () => {
 		window.dispatchEvent(new CustomEvent("narrafork:open-wizard"));
@@ -201,6 +217,26 @@ function SettingsLayout() {
 					)}
 
 					<Box p="md" pb={80}>
+						{settingsValidation.looseValidation && (
+							<Alert
+								color="yellow"
+								variant="light"
+								mb="md"
+								title={t("settingsLooseValidationWarning")}
+							>
+								{settingsValidation.reason ?? t("settingsLooseValidationWarningDesc")}
+							</Alert>
+						)}
+						{!settingsFeatureCapability.patchSupported && (
+							<Alert
+								color="yellow"
+								variant="light"
+								mb="md"
+								title={t("settingsPatchUnsupportedWarning")}
+							>
+								{t("settingsPatchUnsupportedWarningDesc")}
+							</Alert>
+						)}
 						<Outlet />
 					</Box>
 				</Box>
@@ -212,6 +248,12 @@ function SettingsLayout() {
 							<Button
 								onClick={save}
 								loading={isSaving}
+								disabled={!settingsFeatureCapability.patchSupported}
+								title={
+									!settingsFeatureCapability.patchSupported
+										? t("settingsPatchUnsupportedWarningDesc")
+										: undefined
+								}
 								size="md"
 								style={{
 									...styles,

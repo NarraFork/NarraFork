@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Box,
 	Button,
@@ -28,6 +29,7 @@ import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 const TerminalPanel = lazy(() =>
@@ -42,6 +44,68 @@ export const Route = createFileRoute("/settings/terminals")({
 function SettingsTerminalsPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("common");
+	const { t: tt } = useTranslation("terminal");
+	const terminalCapability = useTerminalCapability();
+	const terminalSupported = terminalCapability.supported;
+	const terminalUnsupportedReason = terminalCapability.reason ?? tt("terminalUnsupported");
+	const terminalRuntimeNotes = useMemo(() => {
+		const notes: string[] = [];
+		if (terminalCapability.multiClientResizeMode) {
+			notes.push(
+				t("adminTerminalsResizeModeDesc", {
+					mode: terminalCapability.multiClientResizeMode,
+				}),
+			);
+		}
+		if (terminalCapability.scrollbackReplayMode) {
+			notes.push(
+				t("adminTerminalsReplayModeDesc", {
+					mode: terminalCapability.scrollbackReplayMode,
+				}),
+			);
+		}
+		if (terminalCapability.dtachSupported && terminalCapability.dtachAvailable === false) {
+			notes.push(t("adminTerminalsDtachUnavailable"));
+		}
+		if (terminalCapability.detachedReattach === false) {
+			notes.push(t("adminTerminalsDetachedReattachUnsupported"));
+		}
+		if (terminalCapability.xtermSerializedReplay === false) {
+			notes.push(
+				terminalCapability.xtermSerializedReplayReason ??
+					t("adminTerminalsXtermSerializedReplayUnsupported"),
+			);
+		}
+		if (terminalCapability.orphanRecovery === false) {
+			notes.push(t("adminTerminalsOrphanRecoveryUnsupported"));
+		}
+		if (terminalCapability.processTree?.supported === false) {
+			notes.push(
+				t("adminTerminalsProcessTreeUnsupported", {
+					platform: terminalCapability.processTree.platform ?? "unsupported",
+				}),
+			);
+		}
+		return notes;
+	}, [
+		terminalCapability.multiClientResizeMode,
+		terminalCapability.scrollbackReplayMode,
+		terminalCapability.dtachSupported,
+		terminalCapability.dtachAvailable,
+		terminalCapability.detachedReattach,
+		terminalCapability.xtermSerializedReplay,
+		terminalCapability.xtermSerializedReplayReason,
+		terminalCapability.orphanRecovery,
+		terminalCapability.processTree?.platform,
+		terminalCapability.processTree?.supported,
+		t,
+	]);
+	const terminalRuntimeNotesAreWarnings =
+		(terminalCapability.dtachSupported && terminalCapability.dtachAvailable === false) ||
+		terminalCapability.detachedReattach === false ||
+		terminalCapability.xtermSerializedReplay === false ||
+		terminalCapability.orphanRecovery === false ||
+		terminalCapability.processTree?.supported === false;
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 
@@ -51,8 +115,8 @@ function SettingsTerminalsPage() {
 	const { data, isLoading, refetch } = useQuery({
 		queryKey: ["admin", "terminals"],
 		queryFn: api.listAdminTerminals,
-		enabled: user?.role === "admin",
-		refetchInterval: 10_000,
+		enabled: user?.role === "admin" && terminalSupported,
+		refetchInterval: terminalSupported ? 10_000 : false,
 		gcTime: ADMIN_TERMINALS_QUERY_GC_TIME_MS,
 	});
 
@@ -142,8 +206,8 @@ function SettingsTerminalsPage() {
 		<Stack>
 			<Group justify="space-between">
 				<Title order={3}>{t("adminTerminalsTitle")}</Title>
-				<Tooltip label={t("refresh")}>
-					<ActionIcon variant="subtle" onClick={() => refetch()}>
+				<Tooltip label={terminalSupported ? t("refresh") : terminalUnsupportedReason}>
+					<ActionIcon variant="subtle" disabled={!terminalSupported} onClick={() => refetch()}>
 						<IconRefresh size={18} />
 					</ActionIcon>
 				</Tooltip>
@@ -151,6 +215,26 @@ function SettingsTerminalsPage() {
 			<Text size="sm" c="dimmed">
 				{t("adminTerminalsDesc")}
 			</Text>
+			{!terminalSupported && (
+				<Alert color="yellow" variant="light">
+					{terminalUnsupportedReason}
+				</Alert>
+			)}
+			{terminalSupported && terminalRuntimeNotes.length > 0 && (
+				<Alert
+					color={terminalRuntimeNotesAreWarnings ? "yellow" : "blue"}
+					variant="light"
+					title={t("adminTerminalsRuntimeModeTitle")}
+				>
+					<Stack gap={4}>
+						{terminalRuntimeNotes.map((note) => (
+							<Text key={note} size="sm">
+								{note}
+							</Text>
+						))}
+					</Stack>
+				</Alert>
+			)}
 
 			{/* Embedded terminal panel */}
 			<Collapse in={!!openTerminalId}>

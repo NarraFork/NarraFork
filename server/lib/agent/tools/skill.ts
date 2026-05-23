@@ -57,8 +57,12 @@ export const skillTool: ToolDefinition = {
 	rawJsonSchema: {
 		type: "object",
 		properties: {
+			name: {
+				description: "The name of the skill to load",
+				type: "string",
+			},
 			skill: {
-				description: 'The skill name. E.g., "commit", "review-pr", or "pdf"',
+				description: "The skill name (alias for name)",
 				type: "string",
 			},
 			args: {
@@ -66,7 +70,6 @@ export const skillTool: ToolDefinition = {
 				type: "string",
 			},
 		},
-		required: ["skill"],
 		additionalProperties: false,
 	},
 	parameters: z.object({

@@ -20,6 +20,7 @@ import {
 	getSearchResultDisplayTitle,
 	highlightSearchText,
 	normalizeSearchType,
+	summarizeSearchRuntimeState,
 } from "../lib/search-utils";
 
 const linkStyle = { textDecoration: "none", color: "inherit" } as const;
@@ -91,6 +92,7 @@ function SearchPage() {
 		forceSearch,
 	);
 	const { t } = useTranslation("search");
+	const searchRuntimeStatus = useMemo(() => summarizeSearchRuntimeState(data), [data]);
 	const translateSearchEnum = (prefix: string, value: string) =>
 		t(`${prefix}_${value}`, { defaultValue: humanizeEnumValue(value) });
 	const results = useMemo(() => {
@@ -172,6 +174,23 @@ function SearchPage() {
 				<Text c="dimmed" size="sm">
 					{t("resultsFor", { query: q })}
 				</Text>
+			)}
+
+			{searchRuntimeStatus.degraded && (
+				<Alert color="yellow" variant="light" title={t("degradedTitle")}>
+					<Stack gap={4}>
+						<Text size="sm">
+							{t("degradedDescription", {
+								mode: searchRuntimeStatus.mode ?? t("degradedModeUnknown"),
+							})}
+						</Text>
+						{searchRuntimeStatus.fallbackMessages.map((message) => (
+							<Text key={message} size="xs" c="dimmed">
+								{message}
+							</Text>
+						))}
+					</Stack>
+				</Alert>
 			)}
 
 			{data?.results?.length ? (

@@ -50,11 +50,13 @@ export function FileApprovalTab({
 	basePath,
 	permission,
 	onDecision,
+	readOnly,
 }: {
 	narratorId: string;
 	basePath: string | null;
 	permission: PendingPermission;
 	onDecision?: (requestId: string, decision: "allow" | "deny", feedbackText?: string) => void;
+	readOnly?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -89,9 +91,14 @@ export function FileApprovalTab({
 	// Report button count and register actions — only for the active (earliest) permission
 	useEffect(() => {
 		if (!isActivePermission) return;
+		if (readOnly) {
+			setButtonCount(0);
+			registerActions([]);
+			return;
+		}
 		setButtonCount(2);
 		registerActions([handleAllow, handleDeny]);
-	}, [isActivePermission, setButtonCount, registerActions, handleAllow, handleDeny]);
+	}, [isActivePermission, readOnly, setButtonCount, registerActions, handleAllow, handleDeny]);
 
 	if (isLoading) {
 		return (
@@ -204,50 +211,57 @@ export function FileApprovalTab({
 					minRows={1}
 					maxRows={3}
 					mb="xs"
+					disabled={readOnly}
 				/>
-				<Group gap="sm">
-					<Button
-						size="sm"
-						color="green"
-						onClick={handleAllow}
-						className={isActivePermission && focusIndex === 0 ? "perm-btn-pulse" : undefined}
-						style={
-							isActivePermission && focusIndex === 0
-								? ({
-										"--perm-pulse-color": "var(--mantine-color-green-filled)",
-									} as React.CSSProperties)
-								: undefined
-						}
-					>
-						{tc("allow")}
-						{isActivePermission && focusIndex === 0 && (
-							<Text span size="xs" ml={4} opacity={0.7}>
-								⏎
-							</Text>
-						)}
-					</Button>
-					<Button
-						size="sm"
-						color="red"
-						variant="light"
-						onClick={handleDeny}
-						className={isActivePermission && focusIndex === 1 ? "perm-btn-pulse" : undefined}
-						style={
-							isActivePermission && focusIndex === 1
-								? ({
-										"--perm-pulse-color": "var(--mantine-color-red-filled)",
-									} as React.CSSProperties)
-								: undefined
-						}
-					>
-						{tc("deny")}
-						{isActivePermission && focusIndex === 1 && (
-							<Text span size="xs" ml={4} opacity={0.7}>
-								⏎
-							</Text>
-						)}
-					</Button>
-				</Group>
+				{readOnly ? (
+					<Text size="xs" c="dimmed">
+						{t("permissionActionsUnavailable")}
+					</Text>
+				) : (
+					<Group gap="sm">
+						<Button
+							size="sm"
+							color="green"
+							onClick={handleAllow}
+							className={isActivePermission && focusIndex === 0 ? "perm-btn-pulse" : undefined}
+							style={
+								isActivePermission && focusIndex === 0
+									? ({
+											"--perm-pulse-color": "var(--mantine-color-green-filled)",
+										} as React.CSSProperties)
+									: undefined
+							}
+						>
+							{tc("allow")}
+							{isActivePermission && focusIndex === 0 && (
+								<Text span size="xs" ml={4} opacity={0.7}>
+									⏎
+								</Text>
+							)}
+						</Button>
+						<Button
+							size="sm"
+							color="red"
+							variant="light"
+							onClick={handleDeny}
+							className={isActivePermission && focusIndex === 1 ? "perm-btn-pulse" : undefined}
+							style={
+								isActivePermission && focusIndex === 1
+									? ({
+											"--perm-pulse-color": "var(--mantine-color-red-filled)",
+										} as React.CSSProperties)
+									: undefined
+							}
+						>
+							{tc("deny")}
+							{isActivePermission && focusIndex === 1 && (
+								<Text span size="xs" ml={4} opacity={0.7}>
+									⏎
+								</Text>
+							)}
+						</Button>
+					</Group>
+				)}
 			</Box>
 		</Box>
 	);

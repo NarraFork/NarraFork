@@ -1,0 +1,111 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { ApiError } from "./client";
+
+	const g = globalThis as typeof globalThis & {
+		localStorage?: Storage;
+		fetch: typeof fetch;
+	};
+	const originalFetch = g.fetch;
+	const originalLocalStorage = g.localStorage;
+
+	afterEach(() => {
+		Object.defineProperty(g, "fetch", { value: originalFetch, configurable: true });
+		if (originalLocalStorage === undefined) {
+			Reflect.deleteProperty(g, "localStorage");
+		} else {
+			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
+		}
+	});
+
+		Object.defineProperty(g, "localStorage", {
+			value: {
+				getItem: () => null,
+				setItem: () => {},
+				removeItem: () => {},
+			},
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(
+					JSON.stringify({
+					}),
+					{
+						status: 503,
+						statusText: "Service Unavailable",
+						headers: { "content-type": "application/json" },
+					},
+				),
+			configurable: true,
+		});
+
+		try {
+			await generator.next();
+		} catch (err) {
+			expect(err).toBeInstanceOf(ApiError);
+			expect((err as ApiError).status).toBe(503);
+		}
+	});
+
+		Object.defineProperty(g, "localStorage", {
+			value: {
+				getItem: () => null,
+				setItem: () => {},
+				removeItem: () => {},
+			},
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(
+					{
+						status: 200,
+						headers: { "content-type": "text/event-stream" },
+					},
+				),
+			configurable: true,
+		});
+
+		try {
+			await generator.next();
+		} catch (err) {
+			expect(err).toBeInstanceOf(ApiError);
+			expect((err as ApiError).status).toBe(500);
+		}
+	});
+
+	test("surfaces structured storage scan errors", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: {
+				getItem: () => null,
+				setItem: () => {},
+				removeItem: () => {},
+			},
+			configurable: true,
+		});
+		Object.defineProperty(g, "fetch", {
+			value: async () =>
+				new Response(
+					JSON.stringify({
+						code: "STORAGE_SCAN_FORBIDDEN",
+						reason: "Admin access required",
+					}),
+					{
+						status: 403,
+						statusText: "Forbidden",
+						headers: { "content-type": "application/json" },
+					},
+				),
+			configurable: true,
+		});
+
+		try {
+			await scanStorageStream({});
+			throw new Error("expected storage scan to fail");
+		} catch (err) {
+			expect(err).toBeInstanceOf(ApiError);
+			expect((err as Error).message).toBe("Admin access required");
+			expect((err as ApiError).data?.code).toBe("STORAGE_SCAN_FORBIDDEN");
+		}
+	});
+});

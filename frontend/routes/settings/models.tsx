@@ -1,4 +1,4 @@
-import { Divider, Stack, Title } from "@mantine/core";
+import { Alert, Divider, Stack, Title } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback } from "react";
@@ -27,7 +27,13 @@ function generateShortId(): string {
 function SettingsModelsPage() {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
-	const { groupedModels, visibleModels, providerLabels, aggregations } = useAllModels();
+	const {
+		groupedModels,
+		visibleModels,
+		providerLabels,
+		aggregations,
+		agentModeUnsupportedProviders,
+	} = useAllModels();
 	const is = useInstanceSettingsContext();
 	const qc = useQueryClient();
 
@@ -47,6 +53,13 @@ function SettingsModelsPage() {
 	return (
 		<Stack>
 			<Title order={3}>{t("modelsSection")}</Title>
+			{agentModeUnsupportedProviders.size > 0 && (
+				<Alert color="yellow" variant="light" title={t("providerAgentModeUnsupportedTitle")}>
+					{t("providerAgentModeUnsupportedDesc", {
+						providers: Array.from(agentModeUnsupportedProviders).join(", "),
+					})}
+				</Alert>
+			)}
 			<ModelsSection
 				defaultModel={is.defaultModel}
 				setDefaultModel={is.setDefaultModel}

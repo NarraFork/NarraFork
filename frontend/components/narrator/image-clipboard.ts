@@ -1,4 +1,4 @@
-import { getToken } from "../../lib/api";
+import { ApiError, getToken, readFetchError } from "../../lib/api";
 
 export const MAX_INLINE_IMAGE_SOURCE_CHARS = 16 * 1024 * 1024;
 export const MAX_IMAGE_CLIPBOARD_BLOB_BYTES = 25 * 1024 * 1024;
@@ -74,7 +74,10 @@ async function fetchImageBlob({ imageSrc, savedPath }: CopyGeneratedImageOptions
 	const needsAuth = savedPathSource != null || source.startsWith("/api/");
 
 	const response = await fetch(source, needsAuth ? { headers: getAuthHeaders() } : undefined);
-	if (!response.ok) throw new Error(response.statusText);
+	if (!response.ok) {
+		const error = await readFetchError(response, `HTTP ${response.status}`);
+		throw new ApiError(error.message, response.status, error.data);
+	}
 	const blob = await response.blob();
 	assertBlobSafe(blob);
 	if (blob.type.startsWith("image/")) return blob;

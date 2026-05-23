@@ -1131,12 +1131,20 @@ import { teamStatusTool } from "../team-status";
 import { webFetchTool } from "../web-fetch";
 import { webSearchTool } from "../web-search";
 
-// Tools with known pre-existing schema mismatches (not introduced by recent changes).
-// These are tracked here so the parity test doesn't mask new regressions.
-// TODO: fix these tools' rawJsonSchema to match their Zod parameters:
-//   - WebFetch: rawJsonSchema has extra/missing properties vs Zod
-//   - Skill: rawJsonSchema properties differ from Zod
-const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "Skill"]);
+describe("Skill tool rawJsonSchema", () => {
+	test("exposes runtime-supported name alias without over-requiring skill", () => {
+		const schema = requireRawJsonSchema(skillTool);
+		const props = schema.properties ?? {};
+		expect(props.name).toBeDefined();
+		expect(props.skill).toBeDefined();
+		expect(props.args).toBeDefined();
+		expect(schema.required ?? []).not.toContain("skill");
+	});
+});
+
+// WebFetch keeps mode optional at the raw provider-schema layer so callers may rely on the
+// runtime default even though zod-to-json-schema treats `.default("readability")` as required.
+const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch"]);
 
 const toolsWithRawJsonSchema = [
 	agentTool,

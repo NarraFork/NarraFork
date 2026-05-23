@@ -1,5 +1,5 @@
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
-import { BASE, clearToken, getToken, request } from "./client";
+import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -502,12 +502,12 @@ export const narratorsApi = {
 		});
 		if (res.status === 401) {
 			clearToken();
-			const error = await res.json().catch(() => ({ error: "Unauthorized" }));
-			throw new Error(error.error ?? "Unauthorized");
+			const error = await readFetchError(res, "Unauthorized");
+			throw new ApiError(error.message, 401, error.data);
 		}
 		if (!res.ok) {
-			const error = await res.json().catch(() => ({ error: res.statusText }));
-			throw new Error(error.error ?? "Request failed");
+			const error = await readFetchError(res, "Request failed");
+			throw new ApiError(error.message, res.status, error.data);
 		}
 		return res.json();
 	},
@@ -526,10 +526,13 @@ export const narratorsApi = {
 			body: JSON.stringify({ content, rollback }),
 		}),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/compact`, {
-			method: "POST",
-			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
-		}),
+		request<{ ok: boolean; fallbackSummary?: boolean; fallbackReason?: string; summary?: string }>(
+			`/narrators/${narratorId}/compact`,
+			{
+				method: "POST",
+				body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
+			},
+		),
 	clearContext: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/clear-context`, {
 			method: "POST",
@@ -578,7 +581,13 @@ export const narratorsApi = {
 
 	// Segment compact
 	triggerSegmentCompact: (narratorId: string, messageIds: string[]) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/segment-compact`, {
+		request<{
+			ok: boolean;
+			fallbackSummary?: boolean;
+			fallbackReason?: string;
+			summary?: string;
+			messageCount?: number;
+		}>(`/narrators/${narratorId}/segment-compact`, {
 			method: "POST",
 			body: JSON.stringify({ messageIds }),
 		}),

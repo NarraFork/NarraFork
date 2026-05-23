@@ -27,6 +27,7 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
 
@@ -133,6 +134,7 @@ export interface AgentSectionProps {
 export function AgentSection(props: AgentSectionProps) {
 	const { t } = useTranslation("settings");
 	const { t: tn } = useTranslation("narrator");
+	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
 
 	const handleRequestDumpToggle = (checked: boolean) => {
@@ -370,7 +372,13 @@ export function AgentSection(props: AgentSectionProps) {
 			<Text size="xs" c="dimmed">
 				{t("customRetryRulesDesc")}
 			</Text>
-			<RetryRuleEditor rules={props.customRetryRules} onChange={props.setCustomRetryRules} />
+			{settingsFeatureCapability.retryRules ? (
+				<RetryRuleEditor rules={props.customRetryRules} onChange={props.setCustomRetryRules} />
+			) : (
+				<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
+					{t("customRetryRulesUnsupported")}
+				</Alert>
+			)}
 			{/* WebFetch Proxy */}
 			<Title order={5} mt="sm">
 				{t("webFetchProxy")}

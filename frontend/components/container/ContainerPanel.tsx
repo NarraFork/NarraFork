@@ -30,6 +30,7 @@ import {
 	useStartContainers,
 	useStopContainers,
 } from "../../hooks/useContainers";
+import { useChapterContainersCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { CONTAINER_STATUS_COLORS } from "../../lib/constants";
 import { VolumeSnapshotPanel } from "./VolumeSnapshotPanel";
@@ -46,7 +47,13 @@ interface ContainerPanelProps {
 
 export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: ContainerPanelProps) {
 	const { t } = useTranslation("containers");
-	const { data: containers, isLoading } = useContainers(chapterId);
+	const containerCapability = useChapterContainersCapability();
+	const containerCapabilityReason = containerCapability.reason ?? t("capabilityUnsupported");
+	const canListContainers = containerCapability.supported && containerCapability.routes.list;
+	const canStartContainers = containerCapability.supported && containerCapability.routes.start;
+	const canStopContainers = containerCapability.supported && containerCapability.routes.stop;
+	const canReadLogs = containerCapability.supported && containerCapability.routes.logs;
+	const { data: containers, isLoading } = useContainers(canListContainers ? chapterId : "");
 	const { data: chapter } = useQuery({
 		queryKey: ["chapters", chapterId],
 		queryFn: () => api.getChapter(chapterId),
@@ -75,7 +82,7 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic container entity
 	const running = containers?.filter((c: any) => c.status === "running") ?? [];
 	const hasInstances = (containers?.length ?? 0) > 0;
-	const runtimeLogsEnabled = hasInstances && !starting && logsOpen;
+	const runtimeLogsEnabled = canReadLogs && hasInstances && !starting && logsOpen;
 
 	const { data: logData, isLoading: logsLoading } = useContainerLogs(
 		chapterId,
@@ -122,6 +129,11 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 
 	return (
 		<Stack gap="xs" p="xs">
+			{!canListContainers && (
+				<Alert icon={<IconAlertTriangle size={14} />} color="yellow" variant="light">
+					<Text size="xs">{containerCapabilityReason}</Text>
+				</Alert>
+			)}
 			{showProxyDomainHint && (
 				<Alert icon={<IconAlertTriangle size={14} />} color="yellow" variant="light">
 					<Text size="xs">{t("proxyDomainMissingHint")}</Text>
@@ -254,8 +266,12 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 							variant="light"
 							color="red"
 							leftSection={<IconPlayerStop size={12} />}
-							onClick={() => stop.mutate(chapterId, { onError: onContainerError })}
+							onClick={() =>
+								canStopContainers && stop.mutate(chapterId, { onError: onContainerError })
+							}
 							loading={stop.isPending}
+							disabled={!canStopContainers}
+							title={!canStopContainers ? containerCapabilityReason : undefined}
 						>
 							{t("stop")}
 						</Button>
@@ -263,7 +279,9 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 							size="compact-xs"
 							variant="light"
 							leftSection={<IconScript size={12} />}
-							onClick={() => setLogsOpen((open) => !open)}
+							onClick={() => canReadLogs && setLogsOpen((open) => !open)}
+							disabled={!canReadLogs}
+							title={!canReadLogs ? containerCapabilityReason : undefined}
 						>
 							{logsOpen ? t("hideLogs") : t("showLogs")}
 						</Button>
@@ -274,9 +292,12 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 						variant="light"
 						color="green"
 						leftSection={<IconPlayerPlay size={12} />}
-						onClick={() => start.mutate(chapterId, { onError: onContainerError })}
+						onClick={() =>
+							canStartContainers && start.mutate(chapterId, { onError: onContainerError })
+						}
 						loading={start.isPending}
-						disabled={starting}
+						disabled={starting || !canStartContainers}
+						title={!canStartContainers ? containerCapabilityReason : undefined}
 					>
 						{t("start")}
 					</Button>

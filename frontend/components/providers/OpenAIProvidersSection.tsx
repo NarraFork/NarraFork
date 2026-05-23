@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Divider,
@@ -16,6 +17,12 @@ import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useCodexManagerParityCapability,
+	useProviderModelRefreshCapability,
+	useProviderQuotaCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -37,6 +44,7 @@ interface OpenAIProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	onSaveBeforeRefresh?: () => Promise<boolean>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
@@ -53,6 +61,7 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	onSaveBeforeRefresh,
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
@@ -60,6 +69,27 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 }: OpenAIProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const openaiRuntimeCapability = useProviderRuntimeCapability("openai");
+	const openaiRefreshCapability = useProviderModelRefreshCapability("openai");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const openaiRefreshReason =
+		openaiRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const openaiRoutesSupported = openaiRuntimeCapability?.routes?.supported !== false;
+	const canRefreshOpenAIProviderModels =
+		openaiRefreshCapability.supported &&
+		openaiRoutesSupported &&
+		openaiRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
+	const openaiRefreshUnsupportedReason = openaiRefreshCapability.supported
+		? providerRouteUnsupportedReason
+		: openaiRefreshReason;
+	const openaiQuotaCapability = useProviderQuotaCapability("openai");
+	const openaiQuotaUnsupportedReason = openaiQuotaCapability.supported
+		? undefined
+		: (openaiQuotaCapability.reason ?? t("providerQuotaUnsupported"));
+	const codexManagerParity = useCodexManagerParityCapability();
+	const showCodexParityWarning =
+		providers.some((p) => p.apiMode === "codex") &&
+		codexManagerParity?.tsCodexManagerEquivalent === false;
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
 	const handleRemoveProvider = useCallback(
@@ -85,9 +115,10 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
+			if (!canRefreshOpenAIProviderModels) return;
 			if (isProviderDirty?.(providerId)) {
-				notifications.show({ color: "yellow", title: t("refreshModelsSaveFirst"), message: "" });
-				return;
+				const saved = await onSaveBeforeRefresh?.();
+				if (!saved) return;
 			}
 			setRefreshingProvider(providerId);
 			try {
@@ -100,7 +131,7 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isProviderDirty],
+		[canRefreshOpenAIProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
 	);
 
 	return (
@@ -108,6 +139,18 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 			<Text size="sm" c="dimmed">
 				{t("openaiProvidersSectionDesc")}
 			</Text>
+
+			{openaiQuotaUnsupportedReason && (
+				<Alert color="yellow" variant="light" title={t("providerQuotaUnsupported")}>
+					{openaiQuotaUnsupportedReason}
+				</Alert>
+			)}
+
+			{showCodexParityWarning && (
+				<Alert color="yellow" variant="light" title={t("codexManagerParityWarning")}>
+					{t("codexManagerParityWarningDesc")}
+				</Alert>
+			)}
 
 			{providers.map((p, idx) => {
 				const pModels = providerModelsMap[p.id] ?? [];
@@ -228,7 +271,10 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 									variant="light"
 									leftSection={<IconRefresh size={14} />}
 									loading={refreshingProvider === p.id}
-									disabled={!p.apiKey}
+									disabled={!p.apiKey || !canRefreshOpenAIProviderModels}
+									title={
+										!canRefreshOpenAIProviderModels ? openaiRefreshUnsupportedReason : undefined
+									}
 									onClick={() => handleRefreshProviderModels(p.id)}
 								>
 									{refreshingProvider === p.id

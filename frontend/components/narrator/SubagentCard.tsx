@@ -29,6 +29,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
+import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
@@ -253,6 +254,13 @@ export const SubagentCard = memo(
 		const routeSearch = useSearch({ strict: false }) as any;
 		const fromParam = routeSearch?.from as string | undefined;
 		const input = toolCall.inputJson ?? {};
+		const subagentsCapability = useNarratorSubagentsCapability();
+		const subagentsSupported = subagentsCapability.supported;
+		const canViewSubagentSession = subagentsSupported && subagentsCapability.detachAttach;
+		const canDetachToBackground =
+			subagentsSupported && subagentsCapability.background && subagentsCapability.detachAttach;
+		const canCancelBackground = subagentsSupported && subagentsCapability.background;
+		const canResolveOverride = subagentsSupported && subagentsCapability.staleRecovery;
 		const isBackground = !!input.background || !!input.run_in_background;
 		const agentType = input.subagent_type ?? "agent";
 		const isBuiltinType = ["explore", "plan", "general", "agent"].includes(agentType);
@@ -543,6 +551,7 @@ export const SubagentCard = memo(
 		]);
 
 		const handleViewSession = useCallback(() => {
+			if (subagentNarratorId && !canViewSubagentSession) return;
 			if (subagentNarratorId) {
 				if (onViewSubagentSession) {
 					onViewSubagentSession(subagentNarratorId);
@@ -569,6 +578,7 @@ export const SubagentCard = memo(
 			}
 		}, [
 			subagentNarratorId,
+			canViewSubagentSession,
 			onViewSubagentSession,
 			swipe.closeSwipe,
 			navigate,
@@ -579,29 +589,33 @@ export const SubagentCard = memo(
 		const isForegroundWorking = !isTerminal && !isBackground && !isInitializing;
 
 		const handleDetach = useCallback(async () => {
-			if (!subagentNarratorId) return;
+			if (!subagentNarratorId || !canDetachToBackground) return;
 			try {
 				await api.detachSubagent(subagentNarratorId);
 			} catch {
 				// Ignore — the subagent may have already finished
 			}
-		}, [subagentNarratorId]);
+		}, [canDetachToBackground, subagentNarratorId]);
 
 		const handleCancelBackground = useCallback(async () => {
-			if (!subagentNarratorId) return;
+			if (!subagentNarratorId || !canCancelBackground) return;
 			try {
 				await api.cancelBackgroundTask(narratorId, subagentNarratorId);
 			} catch {
 				// Ignore — task may have already finished
 			}
-		}, [narratorId, subagentNarratorId]);
+		}, [canCancelBackground, narratorId, subagentNarratorId]);
 
 		const cardMenuItems = (
 			<>
-				<Menu.Item leftSection={<IconEye size={14} />} onClick={handleViewSession}>
+				<Menu.Item
+					leftSection={<IconEye size={14} />}
+					disabled={!!subagentNarratorId && !canViewSubagentSession}
+					onClick={handleViewSession}
+				>
 					{t("viewSubagentSession")}
 				</Menu.Item>
-				{isForegroundWorking && subagentNarratorId && (
+				{isForegroundWorking && subagentNarratorId && canDetachToBackground && (
 					<Menu.Item
 						leftSection={<IconCloudOff size={14} />}
 						onClick={() => {
@@ -612,7 +626,7 @@ export const SubagentCard = memo(
 						{t("detachToBackground")}
 					</Menu.Item>
 				)}
-				{isBackground && !isTerminal && subagentNarratorId && (
+				{isBackground && !isTerminal && subagentNarratorId && canCancelBackground && (
 					<Menu.Item
 						color="red"
 						leftSection={<IconPlayerStop size={14} />}
@@ -760,7 +774,7 @@ export const SubagentCard = memo(
 									<Text size="xs" c="yellow">
 										{t("subagentSuspended")}
 									</Text>
-									{subagentNarratorId && (
+									{subagentNarratorId && canResolveOverride && (
 										<Button
 											size="compact-xs"
 											variant="light"

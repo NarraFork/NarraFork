@@ -1,6 +1,7 @@
-import { Badge, Group, Modal, SegmentedControl, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Group, Modal, SegmentedControl, Stack, Text } from "@mantine/core";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useContentCapability } from "../../hooks/usePlatform";
 import { useProjectRoutines, useToggleProjectRoutine } from "../../hooks/useRoutines";
 
 function routineOverrideToAction(value: string): "enable" | "disable" | "reset" | null {
@@ -27,8 +28,15 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 	const { t: ts } = useTranslation("settings");
 	const { i18n } = useTranslation();
 	const isZh = i18n.language?.startsWith("zh");
+	const contentCapability = useContentCapability();
+	const routinesCapability = contentCapability.projectRoutines;
+	const routinesUnsupportedReason = routinesCapability.supported
+		? undefined
+		: (routinesCapability.reason ?? t("routinesUnsupportedDesc"));
 
-	const { data } = useProjectRoutines(opened ? projectId : undefined);
+	const { data } = useProjectRoutines(
+		opened && routinesCapability.supported ? projectId : undefined,
+	);
 	const toggle = useToggleProjectRoutine(projectId);
 
 	const routineGroups = useMemo(() => {
@@ -50,6 +58,12 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 				<Text size="sm" c="dimmed">
 					{t("routinesDesc")}
 				</Text>
+
+				{routinesUnsupportedReason && (
+					<Alert color="yellow" variant="light" title={t("routinesUnsupportedTitle")}>
+						{routinesUnsupportedReason}
+					</Alert>
+				)}
 
 				{routineGroups.map(({ category, routines }) => (
 					<Stack key={category} gap="xs">
@@ -83,7 +97,9 @@ export function ProjectRoutinesModal({ projectId, opened, onClose }: ProjectRout
 								<SegmentedControl
 									size="xs"
 									value={routine.override}
+									disabled={!routinesCapability.supported}
 									onChange={(val) => {
+										if (!routinesCapability.supported) return;
 										const action = routineOverrideToAction(val);
 										if (!action) return;
 										toggle.mutate({ id: routine.id, action });

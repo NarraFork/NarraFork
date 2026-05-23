@@ -29,7 +29,8 @@ import {
 	useSetBrowserSessionTtl,
 	useStopBrowserTracing,
 } from "../../hooks/useBrowserSessions";
-import { getToken } from "../../lib/api";
+import { useNarratorBrowserSessionsCapability } from "../../hooks/usePlatform";
+import { ApiError, getToken, readFetchError } from "../../lib/api";
 
 export function BrowserSessionBar({
 	narratorId,
@@ -39,10 +40,14 @@ export function BrowserSessionBar({
 	sessionCount?: number;
 }) {
 	const { t } = useTranslation("narrator");
+	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const [opened, setOpened] = useState(false);
 	// Only fetch full session list when the bar is expanded — avoids API call on page load.
 	// The parent provides sessionCount from WS events to show/hide the bar without fetching.
-	const { data: sessions } = useBrowserSessions(opened ? narratorId : "");
+	const { data: sessions } = useBrowserSessions(
+		browserSessionsCapability.supported === false || !opened ? "" : narratorId,
+	);
+	if (browserSessionsCapability.supported === false) return null;
 
 	// Show the bar if WS told us there are sessions, or if we already fetched them
 	const count = sessions?.length ?? sessionCount ?? 0;
@@ -136,6 +141,7 @@ function SessionCard({
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(false);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const revokedRef = useRef<string | null>(null);
 	const screenshotAbortRef = useRef<AbortController | null>(null);
 
@@ -163,12 +169,16 @@ function SessionCard({
 		screenshotAbortRef.current = controller;
 		setLoading(true);
 		setError(false);
+		setErrorMessage(null);
 		try {
 			const res = await fetch(
 				`/api/narrators/${narratorId}/browser-sessions/${session.id}/screenshot`,
 				{ headers: { Authorization: `Bearer ${token}` }, signal: controller.signal },
 			);
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			if (!res.ok) {
+				const error = await readFetchError(res, `HTTP ${res.status}`);
+				throw new ApiError(error.message, res.status, error.data);
+			}
 			const blob = await res.blob();
 			if (blob.size > MAX_SCREENSHOT_BLOB_BYTES) throw new Error("Screenshot too large");
 			const url = URL.createObjectURL(blob);
@@ -182,8 +192,11 @@ function SessionCard({
 			}
 			revokedRef.current = url;
 			setBlobUrl(url);
-		} catch {
-			if (!controller.signal.aborted) setError(true);
+		} catch (err) {
+			if (!controller.signal.aborted) {
+				setError(true);
+				setErrorMessage(err instanceof Error ? err.message : null);
+			}
 		} finally {
 			if (screenshotAbortRef.current === controller) screenshotAbortRef.current = null;
 			if (!controller.signal.aborted) setLoading(false);
@@ -396,7 +409,7 @@ function SessionCard({
 					) : error ? (
 						<Group gap={6}>
 							<Text size="xs" c="red">
-								{t("browser.screenshotFailed")}
+								{errorMessage ?? t("browser.screenshotFailed")}
 							</Text>
 							<ActionIcon variant="subtle" size="sm" color="gray" onClick={handleRefresh}>
 								<IconRefresh size={12} />

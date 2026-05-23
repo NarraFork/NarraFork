@@ -29,7 +29,13 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useStorageCapability } from "../../hooks/usePlatform";
+import {
+	useDatabaseCapability,
+	useStorageCapability,
+	useStorageCleanupOperationCapabilities,
+	useStorageDatabaseCleanupCapabilities,
+	useStorageDatabasePreviewCapability,
+} from "../../hooks/usePlatform";
 import {
 	api,
 	type DatabaseCleanupApiRequestSample,
@@ -56,6 +62,15 @@ function formatBytes(bytes: number): string {
 function formatDateTime(value: string | null | undefined): string {
 	if (!value) return "—";
 	return new Date(value).toLocaleString();
+}
+
+function fallbackDiagnosticMessage(value?: {
+	reason?: string;
+	message?: string;
+	error?: string;
+	code?: string;
+}): string | undefined {
+	return value?.reason ?? value?.message ?? value?.error ?? value?.code;
 }
 
 function getDatabaseBreakdown(category?: StorageCategoryResult): DatabaseStorageBreakdown | null {
@@ -133,11 +148,26 @@ const CLEANUP_TARGETS: CleanupTarget[] = [
 export function StorageSection() {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
-	const {
-		vacuumSupported,
-		vacuumReason,
-		cleanup: storageCleanupCapability,
-	} = useStorageCapability();
+	const databaseCapability = useDatabaseCapability();
+	const databaseUnsupportedReason =
+		databaseCapability && databaseCapability.mainSchemaOwner !== "go-postgres"
+			? (databaseCapability.reason ?? t("storageDatabaseOwnershipDesc"))
+			: undefined;
+	const databaseCompatibilityInfo = databaseCapability
+		? t("storageDatabaseCompatibilityInfo", {
+				owner: databaseCapability.mainSchemaOwner ?? "—",
+				goMainMigrations: databaseCapability.goMainMigrations ? t("yes") : t("no"),
+				goEnsureColumns: databaseCapability.goEnsureColumns ? t("yes") : t("no"),
+				ftsRepair: databaseCapability.ftsRepair ? t("yes") : t("no"),
+			})
+		: null;
+	const databasePreviewDisabledReason = t("storageDatabasePreviewUnsupported");
+	const { scanSupported, scanReason, cachedSupported, vacuumSupported, vacuumReason } =
+		useStorageCapability();
+	const cleanupOperationCapabilities = useStorageCleanupOperationCapabilities();
+	const databaseCleanupCapabilities = useStorageDatabaseCleanupCapabilities();
+	const databasePreviewCapability = useStorageDatabasePreviewCapability();
+	const scanDisabledReason = scanReason ?? t("storageScanUnsupported");
 	const [scanResult, setScanResult] = useState<StorageScanResult | null>(null);
 	const [scanning, setScanning] = useState(false);
 	const [progressMsg, setProgressMsg] = useState("");
@@ -170,6 +200,7 @@ export function StorageSection() {
 	}, []);
 
 	useEffect(() => {
+		if (!cachedSupported) return;
 		let cancelled = false;
 		api
 			.getCachedStorage()
@@ -182,10 +213,16 @@ export function StorageSection() {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [cachedSupported]);
 
 	useEffect(() => {
 		if (!databaseTarget) return;
+		if (!databasePreviewCapability.supported) {
+			setDatabasePreview(null);
+			setDatabasePreviewLoading(false);
+			setDatabasePreviewError(databasePreviewDisabledReason);
+			return;
+		}
 		let cancelled = false;
 		setDatabasePreviewLoading(true);
 		setDatabasePreviewError(null);
@@ -216,10 +253,16 @@ export function StorageSection() {
 		return () => {
 			cancelled = true;
 		};
-	}, [databaseTarget, databaseOlderThanDays, t]);
+	}, [
+		databaseTarget,
+		databaseOlderThanDays,
+		databasePreviewCapability.supported,
+		databasePreviewDisabledReason,
+		t,
+	]);
 
 	const handleScan = async () => {
-		if (scanning) return;
+		if (scanning || !scanSupported) return;
 		setScanning(true);
 		setProgressMsg("");
 		abortRef.current = new AbortController();
@@ -248,7 +291,7 @@ export function StorageSection() {
 				console.error("Storage scan failed:", err);
 				notifications.show({
 					color: "red",
-					message: t("storageScanFailed"),
+					message: err instanceof Error && err.message ? err.message : t("storageScanFailed"),
 				});
 			}
 		} finally {
@@ -258,10 +301,30 @@ export function StorageSection() {
 		}
 	};
 
+	const usesRuntimeWorktreeCleanup = (target: CleanupTarget | undefined): boolean =>
+		target ? cleanupOperationCapabilities[target.target].route === "runtime" : false;
+
 	const handleCleanup = async (target: CleanupTarget) => {
+		const cleanupCap = cleanupOperationCapabilities[target.target];
+		if (cleanupCap.supported === false) return;
+		if (target.target === "uploads" && cleanupCap.preservesMessageImageRefs === false) return;
 		if (!(await confirm({ message: t("storageCleanupConfirm") }))) return;
 		setCleaningTarget(target.key);
 		try {
+			if (usesRuntimeWorktreeCleanup(target)) {
+				const res = await api.cleanupRuntime("worktrees");
+				if (res.ok) {
+					notifications.show({
+						message: t("storageCleanupWorktreesSuccess", {
+							count: res.removedCounts?.worktrees ?? 0,
+						}),
+						color: "green",
+					});
+					void handleScan();
+				}
+				return;
+			}
+
 			const res = await api.cleanupStorage(target.target);
 			if (res.ok) {
 				if (target.target === "containers") {
@@ -284,7 +347,7 @@ export function StorageSection() {
 			console.error("Cleanup failed:", err);
 			notifications.show({
 				color: "red",
-				message: t("storageCleanupFailed"),
+				message: err instanceof Error && err.message ? err.message : t("storageCleanupFailed"),
 			});
 		} finally {
 			setCleaningTarget(null);
@@ -292,6 +355,10 @@ export function StorageSection() {
 	};
 
 	const openDatabasePreview = (target: DatabaseCleanupTarget) => {
+		if (!databasePreviewCapability.supported) {
+			notifications.show({ color: "yellow", message: databasePreviewDisabledReason });
+			return;
+		}
 		setDatabaseTarget(target);
 		setDatabasePreview(null);
 		setDatabasePreviewError(null);
@@ -312,6 +379,14 @@ export function StorageSection() {
 
 	const handleDatabaseCleanup = async () => {
 		if (!databaseTarget) return;
+		const targetCapability = databaseCleanupCapabilities[databaseTarget];
+		if (targetCapability.supported === false) {
+			notifications.show({
+				color: "yellow",
+				message: targetCapability.reason ?? t("storageDatabaseCleanupUnsupported"),
+			});
+			return;
+		}
 		setDatabaseCleaning(true);
 		try {
 			const result = await api.cleanupDatabase({
@@ -340,7 +415,8 @@ export function StorageSection() {
 			console.error("Database cleanup failed:", err);
 			notifications.show({
 				color: "red",
-				message: t("storageDatabaseCleanupFailed"),
+				message:
+					err instanceof Error && err.message ? err.message : t("storageDatabaseCleanupFailed"),
 			});
 		} finally {
 			setDatabaseCleaning(false);
@@ -377,17 +453,27 @@ export function StorageSection() {
 		}
 	};
 
-	const cleanupCapability = (
-		target: CleanupTarget | undefined,
-	): { supported: boolean; reason?: string } => {
-		if (!target) return { supported: true };
-		return storageCleanupCapability[target.target];
+	const cleanupCapability = (target: CleanupTarget | undefined) => {
+		if (!target) {
+			return {
+				supported: true,
+				reason: undefined,
+				mode: undefined,
+				alternative: undefined,
+				preservesMessageImageRefs: undefined,
+				route: "storage" as const,
+			};
+		}
+		return cleanupOperationCapabilities[target.target];
 	};
 
 	const canCleanup = (key: string, target?: CleanupTarget): boolean => {
 		const cat = getCategory(key);
 		if (!cat) return false;
-		if (cleanupCapability(target).supported === false) return false;
+		const cleanupCap = cleanupCapability(target);
+		if (cleanupCap.supported === false) return false;
+		if (target?.target === "uploads" && cleanupCap.preservesMessageImageRefs === false)
+			return false;
 		if (key === "containers" && cat.details?.available === false) return false;
 		return cat.sizeBytes > 0;
 	};
@@ -431,6 +517,13 @@ export function StorageSection() {
 			: [];
 
 	const databasePreviewCount = databasePreview ? getDatabaseCleanupCount(databasePreview) : 0;
+	const databaseCleanupCapability = databaseTarget
+		? databaseCleanupCapabilities[databaseTarget]
+		: undefined;
+	const databaseCleanupDisabledReason =
+		databaseCleanupCapability?.supported === false
+			? (databaseCleanupCapability.reason ?? t("storageDatabaseCleanupUnsupported"))
+			: undefined;
 	const vacuumDisabledReason = vacuumReason ?? t("storageDatabaseVacuumDisabled");
 
 	return (
@@ -462,12 +555,30 @@ export function StorageSection() {
 							variant="light"
 							leftSection={scanning ? <Loader size={14} /> : <IconRefresh size={14} />}
 							onClick={handleScan}
-							disabled={scanning}
+							disabled={scanning || !scanSupported}
+							title={!scanSupported ? scanDisabledReason : undefined}
 						>
 							{scanning ? t("storageScanning") : scanResult ? t("storageRescan") : t("storageScan")}
 						</Button>
 					</Group>
 				</Group>
+
+				{databaseUnsupportedReason && (
+					<Alert color="yellow" variant="light" title={t("storageDatabaseOwnershipTitle")}>
+						{databaseUnsupportedReason}
+					</Alert>
+				)}
+				{databaseCompatibilityInfo && (
+					<Text size="xs" c="dimmed">
+						{databaseCompatibilityInfo}
+					</Text>
+				)}
+
+				{!scanSupported && (
+					<Alert color="yellow" variant="light" title={t("storageScanUnsupportedTitle")}>
+						{scanDisabledReason}
+					</Alert>
+				)}
 
 				{scanning && progressMsg && (
 					<Text size="xs" c="dimmed">
@@ -492,10 +603,17 @@ export function StorageSection() {
 							const subtext = getCategorySubtext(cat);
 							const cleanupTarget = CLEANUP_TARGETS.find((ct) => ct.key === key);
 							const cleanupCap = cleanupCapability(cleanupTarget);
+							const cleanupUsesRuntime = usesRuntimeWorktreeCleanup(cleanupTarget);
+							const cleanupUnsafeReason =
+								cleanupTarget?.target === "uploads" &&
+								cleanupCap.preservesMessageImageRefs === false
+									? (cleanupCap.reason ?? t("storageCleanupUploadsUnsafe"))
+									: null;
 							const cleanupUnsupportedReason =
 								cleanupCap.supported === false
 									? (cleanupCap.reason ?? t("storageCleanupUnsupported"))
-									: null;
+									: cleanupUnsafeReason;
+
 							const cleanupDisabled = !canCleanup(key, cleanupTarget) || cleaningTarget === key;
 							const isDatabase = key === "database";
 
@@ -527,7 +645,12 @@ export function StorageSection() {
 											</Group>
 											{cleanupTarget && (
 												<Tooltip
-													label={cleanupUnsupportedReason ?? t(cleanupTarget.labelKey as never)}
+													label={
+														cleanupUnsupportedReason ??
+														(cleanupUsesRuntime
+															? t("storageCleanupWorktreesRuntimeFallback")
+															: t(cleanupTarget.labelKey as never))
+													}
 												>
 													<span>
 														<ActionIcon
@@ -605,7 +728,7 @@ export function StorageSection() {
 																						})}
 																			</Text>
 																		</div>
-																		<Badge size="xs" variant="light" color="indigo">
+																		<Badge variant="light" color="blue">
 																			{formatBytes(category.totalBytes)}
 																		</Badge>
 																	</Group>
@@ -686,6 +809,12 @@ export function StorageSection() {
 																	size="xs"
 																	variant="light"
 																	onClick={() => openDatabasePreview(row.target)}
+																	disabled={!databasePreviewCapability.supported}
+																	title={
+																		!databasePreviewCapability.supported
+																			? databasePreviewDisabledReason
+																			: undefined
+																	}
 																>
 																	{t("storageDatabasePreview")}
 																</Button>
@@ -735,9 +864,27 @@ export function StorageSection() {
 						</Alert>
 					)}
 
+					{databaseCleanupDisabledReason && (
+						<Alert color="yellow" title={t("storageDatabaseCleanupUnsupportedTitle")}>
+							{databaseCleanupDisabledReason}
+						</Alert>
+					)}
+
+					{!databasePreviewCapability.supported && (
+						<Alert color="yellow" title={t("storageDatabasePreviewUnsupportedTitle")}>
+							{databasePreviewDisabledReason}
+						</Alert>
+					)}
+
 					{databasePreview?.warningCodes.includes("deletesUsageHistory") && (
 						<Alert color="orange" icon={<IconAlertTriangle size={16} />}>
 							{t("storageDatabaseWillDeleteUsageHistory")}
+						</Alert>
+					)}
+
+					{databasePreview?.fallback && fallbackDiagnosticMessage(databasePreview) && (
+						<Alert color="yellow" icon={<IconAlertTriangle size={16} />}>
+							{fallbackDiagnosticMessage(databasePreview)}
 						</Alert>
 					)}
 
@@ -843,7 +990,7 @@ export function StorageSection() {
 																</Text>
 																<Text size="xs" c="dimmed">
 																	{t("storageDatabaseMessageCount", {
-																		count: sample.messageCount,
+																		count: sample.messageCount ?? 0,
 																	})}
 																</Text>
 																{sample.descendantNarratorCount > 0 && (
@@ -854,9 +1001,14 @@ export function StorageSection() {
 																	</Text>
 																)}
 															</Group>
+															{fallbackDiagnosticMessage(sample) && (
+																<Text size="xs" c="orange" mt={4}>
+																	{fallbackDiagnosticMessage(sample)}
+																</Text>
+															)}
 														</div>
 														<Badge variant="light" color="blue">
-															{formatBytes(sample.approxBytes)}
+															{formatBytes(sample.approxBytes ?? 0)}
 														</Badge>
 													</Group>
 												</Paper>
@@ -879,6 +1031,11 @@ export function StorageSection() {
 																	})}
 																</Text>
 															</Group>
+															{fallbackDiagnosticMessage(sample) && (
+																<Text size="xs" c="orange" mt={4}>
+																	{fallbackDiagnosticMessage(sample)}
+																</Text>
+															)}
 														</div>
 														<Badge variant="light" color="blue">
 															{formatBytes(sample.approxBytes)}
@@ -931,7 +1088,8 @@ export function StorageSection() {
 									leftSection={<IconTrash size={16} />}
 									onClick={handleDatabaseCleanup}
 									loading={databaseCleaning}
-									disabled={databasePreviewCount === 0}
+									disabled={databasePreviewCount === 0 || !!databaseCleanupDisabledReason}
+									title={databaseCleanupDisabledReason}
 								>
 									{t("storageDatabaseCleanupAction")}
 								</Button>

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, getToken } from "../lib/api";
+import { api, getToken, readFetchError } from "../lib/api";
 import { useUpdateCapability } from "./usePlatform";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
@@ -92,6 +92,9 @@ export interface UpdateProgress {
 	totalBytes: number;
 	percent: number;
 	error?: string;
+	code?: string;
+	reason?: string;
+	message?: string;
 }
 
 export interface UpdateInstructions {
@@ -116,24 +119,65 @@ export interface UpdateDownloadResult {
 	manualOnly?: boolean;
 	instructions?: UpdateInstructions;
 	error?: string;
+	code?: string;
+	reason?: string;
+	message?: string;
 }
 
 function errorToMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-function createErrorProgress(error: string): UpdateProgress {
+interface UpdateFailureDiagnostic {
+	error: string;
+	code?: string;
+	reason?: string;
+	message?: string;
+}
+
+function createErrorProgress(error: string, diagnostic?: UpdateFailureDiagnostic): UpdateProgress {
 	return {
 		phase: "error",
 		bytesDownloaded: 0,
 		totalBytes: 0,
 		percent: 0,
 		error,
+		code: diagnostic?.code,
+		reason: diagnostic?.reason,
+		message: diagnostic?.message,
 	};
 }
 
-function createFailureResult(error: string, version?: string): UpdateDownloadResult {
-	return { success: false, error, version };
+function createFailureResult(
+	error: string,
+	version?: string,
+	diagnostic?: UpdateFailureDiagnostic,
+): UpdateDownloadResult {
+	return {
+		success: false,
+		error,
+		version,
+		code: diagnostic?.code,
+		reason: diagnostic?.reason,
+		message: diagnostic?.message,
+	};
+}
+
+export function extractUpdateFailureDiagnostic(
+	payload: Record<string, unknown>,
+	fallback = "Update download failed",
+): UpdateFailureDiagnostic {
+	return {
+		error:
+			(typeof payload.reason === "string" && payload.reason) ||
+			(typeof payload.message === "string" && payload.message) ||
+			(typeof payload.error === "string" && payload.error) ||
+			(typeof payload.code === "string" && payload.code) ||
+			fallback,
+		code: typeof payload.code === "string" ? payload.code : undefined,
+		reason: typeof payload.reason === "string" ? payload.reason : undefined,
+		message: typeof payload.message === "string" ? payload.message : undefined,
+	};
 }
 
 export function useUpdateCheck(intervalMs = 60 * 60_000) {
@@ -175,6 +219,7 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 }
 
 export function useUpdateDownload() {
+	const updateCapability = useUpdateCapability();
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [result, setResult] = useState<UpdateDownloadResult | null>(null);
 	const abortControllerRef = useRef<AbortController | null>(null);
@@ -187,6 +232,32 @@ export function useUpdateDownload() {
 			sha512: string;
 			files: Array<{ url: string; size: number; sha512: string }>;
 		}) => {
+			const failBeforeRequest = (error: string) => {
+				setProgress(createErrorProgress(error));
+				setResult(createFailureResult(error, releaseInfo.version));
+			};
+			if (!updateCapability.download.supported) {
+				failBeforeRequest(
+					updateCapability.download.reason ??
+						"Update downloads are not available in this backend/runtime.",
+				);
+				return;
+			}
+			if (!updateCapability.download.sse) {
+				failBeforeRequest("Update downloads require SSE progress support in this frontend.");
+				return;
+			}
+			const declaredBytes = releaseInfo.files.reduce((sum, file) => sum + (file.size || 0), 0);
+			if (
+				updateCapability.download.maxBytes != null &&
+				declaredBytes > updateCapability.download.maxBytes
+			) {
+				failBeforeRequest(
+					`Update download is ${declaredBytes} bytes, exceeding runtime limit ${updateCapability.download.maxBytes} bytes.`,
+				);
+				return;
+			}
+
 			setProgress({ phase: "checking", bytesDownloaded: 0, totalBytes: 0, percent: 0 });
 			setResult(null);
 
@@ -206,7 +277,11 @@ export function useUpdateDownload() {
 				});
 
 				if (!response.ok) {
-					throw new Error(`Download failed: ${response.status}`);
+					const failure = await readFetchError(response, "Download failed");
+					const diagnostic = extractUpdateFailureDiagnostic(failure.data, failure.message);
+					setProgress(createErrorProgress(diagnostic.error, diagnostic));
+					setResult(createFailureResult(diagnostic.error, releaseInfo.version, diagnostic));
+					return;
 				}
 
 				const reader = response.body?.getReader();
@@ -217,10 +292,11 @@ export function useUpdateDownload() {
 				let receivedTerminalResult = false;
 				const parser = createSseEventParser("");
 
-				const markFailure = (error: string) => {
+				const markFailure = (failure: UpdateFailureDiagnostic | string) => {
+					const diagnostic = typeof failure === "string" ? { error: failure } : failure;
 					receivedTerminalResult = true;
-					setProgress(createErrorProgress(error));
-					setResult(createFailureResult(error, releaseInfo.version));
+					setProgress(createErrorProgress(diagnostic.error, diagnostic));
+					setResult(createFailureResult(diagnostic.error, releaseInfo.version, diagnostic));
 				};
 
 				const markSuccess = (downloadResult: UpdateDownloadResult) => {
@@ -261,16 +337,14 @@ export function useUpdateDownload() {
 					}
 
 					const payload = parsed as Partial<UpdateProgress & UpdateDownloadResult>;
+					const payloadRecord = payload as Record<string, unknown>;
 					if (payload.phase) {
 						setProgress(payload as UpdateProgress);
 					}
 
-					const payloadError =
-						typeof payload.error === "string" && payload.error
-							? payload.error
-							: "Update download failed";
+					const diagnostic = extractUpdateFailureDiagnostic(payloadRecord);
 					if (eventName === "error" || payload.phase === "error") {
-						markFailure(payloadError);
+						markFailure(diagnostic);
 						return;
 					}
 
@@ -279,7 +353,7 @@ export function useUpdateDownload() {
 						if (downloadResult.success) {
 							markSuccess(downloadResult);
 						} else {
-							markFailure(payloadError);
+							markFailure(diagnostic);
 						}
 					}
 				};
@@ -326,7 +400,12 @@ export function useUpdateDownload() {
 				abortControllerRef.current = null;
 			}
 		},
-		[],
+		[
+			updateCapability.download.maxBytes,
+			updateCapability.download.reason,
+			updateCapability.download.sse,
+			updateCapability.download.supported,
+		],
 	);
 
 	const cancel = useCallback(() => {
@@ -362,6 +441,7 @@ export function useUpdateCleanup() {
 export function useUpdateApply() {
 	const updateCapability = useUpdateCapability();
 	const autoApplyAvailable =
+		updateCapability.apply.supported &&
 		updateCapability.selfUpdateAvailable &&
 		!updateCapability.manualOnly &&
 		updateCapability.canAutoRestart;
@@ -379,7 +459,9 @@ export function useUpdateApply() {
 			if (!autoApplyAvailable) {
 				const result = {
 					success: false,
-					error: "Automatic update apply is not available in this backend/runtime.",
+					error:
+						updateCapability.apply.reason ??
+						"Automatic update apply is not available in this backend/runtime.",
 				};
 				setApplyResult(result);
 				return result;
@@ -395,13 +477,13 @@ export function useUpdateApply() {
 				// If successful, the server will exit — isApplying stays true
 				return result;
 			} catch (err) {
-				const result = { success: false, error: String(err) };
+				const result = { success: false, error: errorToMessage(err) };
 				setApplyResult(result);
 				setIsApplying(false);
 				return result;
 			}
 		},
-		[autoApplyAvailable],
+		[autoApplyAvailable, updateCapability.apply.reason],
 	);
 
 	return { apply, isApplying, applyResult };

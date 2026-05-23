@@ -1,5 +1,40 @@
-import { ApiError, BASE, clearToken, getToken, request } from "./client";
+import {
+	ApiError,
+	BASE,
+	clearToken,
+	getErrorMessage,
+	getToken,
+	readFetchError,
+	request,
+} from "./client";
 import type { ApiEntity } from "./types";
+
+export interface ProjectGraphFallback {
+	feature: string;
+	reason?: string;
+	message?: string;
+	error?: string;
+	code?: string;
+	[key: string]: unknown;
+}
+
+export interface ProjectGraphCapabilities {
+	commitSync?: {
+		graphReadRefresh?: boolean;
+		[key: string]: unknown;
+	};
+	[key: string]: unknown;
+}
+
+export interface ProjectGraphResponse {
+	nodes: ApiEntity[];
+	edges: ApiEntity[];
+	explorationGroups?: ApiEntity[];
+	openedTerminals?: ApiEntity[];
+	capabilities?: ProjectGraphCapabilities;
+	degraded?: boolean;
+	fallbacks?: ProjectGraphFallback[];
+}
 
 export const projectsApi = {
 	listProjects: (status?: string) =>
@@ -26,81 +61,92 @@ export const projectsApi = {
 				headers,
 				body: JSON.stringify(data),
 			})
-				.then((response) => {
-					if (response.status === 401) {
-						clearToken();
-						reject(new ApiError("Unauthorized", 401));
-						return;
-					}
-					if (
-						!response.ok &&
-						!response.headers.get("content-type")?.includes("text/event-stream")
-					) {
-						response
-							.json()
-							.then((err) => reject(new ApiError(err.error ?? "Request failed", response.status)))
-							.catch(() => reject(new ApiError("Request failed", response.status)));
-						return;
-					}
+				.then(async (response) => {
+					try {
+						if (response.status === 401) {
+							clearToken();
+							const error = await readFetchError(response, "Unauthorized");
+							reject(new ApiError(error.message, 401, error.data));
+							return;
+						}
+						if (
+							!response.ok &&
+							!response.headers.get("content-type")?.includes("text/event-stream")
+						) {
+							const error = await readFetchError(response, "Request failed");
+							reject(new ApiError(error.message, response.status, error.data));
+							return;
+						}
 
-					const reader = response.body?.getReader();
-					if (!reader) {
-						reject(new ApiError("No response body", 500));
-						return;
-					}
+						const reader = response.body?.getReader();
+						if (!reader) {
+							reject(new ApiError("No response body", 500));
+							return;
+						}
 
-					const decoder = new TextDecoder();
-					let buffer = "";
+						const decoder = new TextDecoder();
+						let buffer = "";
 
-					const pump = (): void => {
-						reader
-							.read()
-							.then(({ done, value }) => {
-								if (done) {
-									reject(new ApiError("Stream ended without completion", 500));
-									return;
-								}
-								buffer += decoder.decode(value, { stream: true });
-								const lines = buffer.split("\n");
-								buffer = lines.pop() ?? "";
+						const pump = (): void => {
+							reader
+								.read()
+								.then(({ done, value }) => {
+									if (done) {
+										reject(new ApiError("Stream ended without completion", 500));
+										return;
+									}
+									buffer += decoder.decode(value, { stream: true });
+									const lines = buffer.split("\n");
+									buffer = lines.pop() ?? "";
 
-								let eventType = "";
-								for (const line of lines) {
-									if (line.startsWith("event:")) {
-										eventType = line.slice(6).trim();
-									} else if (line.startsWith("data:")) {
-										const jsonStr = line.slice(5).trim();
-										if (!jsonStr) continue;
-										try {
-											const parsed = JSON.parse(jsonStr);
-											if (eventType === "progress") {
-												onProgress(parsed.message);
-											} else if (eventType === "complete") {
-												reader.cancel().catch(() => {});
-												resolve(parsed);
-												return;
-											} else if (eventType === "credential_required") {
-												reader.cancel().catch(() => {});
-												if (onCredentialRequired) {
-													onCredentialRequired();
+									let eventType = "";
+									for (const line of lines) {
+										if (line.startsWith("event:")) {
+											eventType = line.slice(6).trim();
+										} else if (line.startsWith("data:")) {
+											const jsonStr = line.slice(5).trim();
+											if (!jsonStr) continue;
+											try {
+												const parsed = JSON.parse(jsonStr);
+												if (eventType === "progress") {
+													onProgress(parsed.message);
+												} else if (eventType === "complete") {
+													reader.cancel().catch(() => {});
+													resolve(parsed);
+													return;
+												} else if (eventType === "credential_required") {
+													reader.cancel().catch(() => {});
+													if (onCredentialRequired) {
+														onCredentialRequired();
+													}
+													reject(
+														new ApiError(
+															getErrorMessage(parsed, "Authentication required"),
+															401,
+															parsed,
+														),
+													);
+													return;
+												} else if (eventType === "error") {
+													reader.cancel().catch(() => {});
+													reject(
+														new ApiError(getErrorMessage(parsed, "Clone failed"), 500, parsed),
+													);
+													return;
 												}
-												reject(new ApiError(parsed.error ?? "Authentication required", 401));
-												return;
-											} else if (eventType === "error") {
-												reader.cancel().catch(() => {});
-												reject(new ApiError(parsed.error ?? "Clone failed", 500));
-												return;
+											} catch {
+												// skip malformed JSON
 											}
-										} catch {
-											// skip malformed JSON
 										}
 									}
-								}
-								pump();
-							})
-							.catch(reject);
-					};
-					pump();
+									pump();
+								})
+								.catch(reject);
+						};
+						pump();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					}
 				})
 				.catch(reject);
 		});
@@ -111,12 +157,7 @@ export const projectsApi = {
 
 	// Graph
 	getProjectGraph: (projectId: string) =>
-		request<{
-			nodes: ApiEntity[];
-			edges: ApiEntity[];
-			explorationGroups?: ApiEntity[];
-			openedTerminals?: ApiEntity[];
-		}>(`/projects/${projectId}/graph`),
+		request<ProjectGraphResponse>(`/projects/${projectId}/graph`),
 
 	// Graph positions
 	updateGraphPositions: (

@@ -15,6 +15,7 @@
 	"lines500": "500 lines",
 	"noLogs": "No logs available.",
 	"logsTruncated": "[Earlier log output hidden to keep the UI responsive.]",
+	"capabilityUnsupported": "Container operations are not supported by the current backend runtime.",
 	"proxyDomainMissingHint": "Container proxy is enabled globally, but this project has no proxy domain configured yet. Set a Proxy Domain in project settings to generate accessible proxy links.",
 	"config": "Config",
 	"cleanup": "Clean Up",

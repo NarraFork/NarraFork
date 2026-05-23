@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useProviderRuntimeCapability } from "../../hooks/usePlatform";
 import { api, type PublicCodexQuotaOverview, type PublicCodexQuotaSegment } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
@@ -109,6 +110,11 @@ export function CodexQuotaIndicator({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: ts } = useTranslation("settings");
+	const codexRuntimeCapability = useProviderRuntimeCapability("codex");
+	const codexRoutesSupported = codexRuntimeCapability?.routes?.supported !== false;
+	const canReadQuotaOverview =
+		codexRoutesSupported && codexRuntimeCapability?.routes?.quotaOverview !== false;
+	const queryEnabled = enabled && canReadQuotaOverview;
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
@@ -122,7 +128,7 @@ export function CodexQuotaIndicator({
 	} = useQuery({
 		queryKey: CODEX_QUOTA_QUERY_KEY,
 		queryFn: api.codexQuotaOverview,
-		enabled,
+		enabled: queryEnabled,
 		refetchOnMount: "always",
 		refetchOnReconnect: false,
 		refetchOnWindowFocus: false,
@@ -130,7 +136,7 @@ export function CodexQuotaIndicator({
 	});
 
 	useEffect(() => {
-		if (!enabled) return;
+		if (!queryEnabled) return;
 		const handle = narratorWSManager.addListener(
 			{ types: ["codex_quota_overview_updated"] },
 			(data) => {
@@ -140,7 +146,7 @@ export function CodexQuotaIndicator({
 			},
 		);
 		return () => narratorWSManager.removeListener(handle);
-	}, [enabled, queryClient]);
+	}, [queryEnabled, queryClient]);
 
 	useEffect(() => {
 		return () => {
@@ -148,7 +154,7 @@ export function CodexQuotaIndicator({
 		};
 	}, []);
 
-	if (!enabled) return null;
+	if (!queryEnabled) return null;
 
 	const segments = overview?.segments ?? [];
 	const useReadableText = compact || isMobile;

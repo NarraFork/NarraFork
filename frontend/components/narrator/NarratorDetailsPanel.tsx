@@ -43,6 +43,10 @@ import {
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import { usePermissions } from "../../hooks/usePermissions";
+import {
+	useNarratorBrowserSessionsCapability,
+	useNarratorContainerBrowserToolAutoEnableCapability,
+} from "../../hooks/usePlatform";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import type {
 	ApiEntity,
@@ -188,11 +192,19 @@ export function NarratorDetailsPanel({
 	const { data: chapter } = useChapter(opened ? chapterId : "");
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
 	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
-	const updateCwdMutation = useUpdateCwd();
-	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
+	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
+	const browserSessionsSupported = browserSessionsCapability.supported !== false;
+	const browserSessionsDefaultOff = browserSessionsCapability.defaultEnabled === false;
+	const browserSessionsReason = browserSessionsCapability.reason;
+	const browserToolAutoEnableCapability = useNarratorContainerBrowserToolAutoEnableCapability();
+	const browserToolAutoEnableDefaultOff = browserToolAutoEnableCapability?.defaultEnabled === false;
+	const browserToolAutoEnableReason =
+		browserToolAutoEnableCapability?.reason ?? t("details.browserToolAutoEnableDisabled");
+	const { data: browserSessions } = useBrowserSessions(
+		opened && browserSessionsSupported ? narratorId : "",
+	);
 	const { data: terminals } = useNarratorTerminals(opened ? narratorId : "");
 	const { data: pendingPermissions } = usePermissions(opened ? narratorId : "");
-	const { data: browserSessions } = useBrowserSessions(opened ? narratorId : "");
 	const { data: whitelistDirs } = useWhitelistDirs(opened ? narratorId : "");
 	const { data: blacklistDirs } = useBlacklistDirs(opened ? narratorId : "");
 	const { data: cmdWhitelist } = useCmdWhitelist(opened ? narratorId : "");
@@ -234,6 +246,8 @@ export function NarratorDetailsPanel({
 	const clearSubagentModelsMutation = useClearSubagentModelRestriction();
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
 	const clearDisabledToolsMutation = useClearDisabledTools();
+	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
+	const updateCwdMutation = useUpdateCwd();
 	const [modelPools, setModelPools] = useState<Record<string, string[]>>({
 		explore: [],
 		plan: [],
@@ -891,24 +905,49 @@ export function NarratorDetailsPanel({
 				<DetailRow
 					label={t("details.browserSessions")}
 					value={
-						browserSessions?.length ? (
-							<Stack gap={6} align="flex-end">
-								{browserSessions.map((session) => (
-									<Group key={session.id} gap={6} justify="flex-end">
-										<Badge variant="outline">{session.id.slice(0, 8)}</Badge>
-										<Text size="sm" ff="monospace" truncate maw={220} title={session.url}>
-											{session.url}
+						browserSessionsSupported ? (
+							browserSessions?.length ? (
+								<Stack gap={6} align="flex-end">
+									{browserSessions.map((session) => (
+										<Group key={session.id} gap={6} justify="flex-end">
+											<Badge variant="outline">{session.id.slice(0, 8)}</Badge>
+											<Text size="sm" ff="monospace" truncate maw={220} title={session.url}>
+												{session.url}
+											</Text>
+										</Group>
+									))}
+								</Stack>
+							) : (
+								<Stack gap={2} align="flex-end">
+									<Text size="sm" c="dimmed">
+										{t("details.none")}
+									</Text>
+									{browserSessionsDefaultOff && browserSessionsReason && (
+										<Text size="xs" c="dimmed" ta="right" maw={360}>
+											{browserSessionsReason}
 										</Text>
-									</Group>
-								))}
-							</Stack>
+									)}
+								</Stack>
+							)
 						) : (
 							<Text size="sm" c="dimmed">
-								{t("details.none")}
+								{t("details.browserSessionsUnsupported")}
 							</Text>
 						)
 					}
 				/>
+
+				{browserToolAutoEnableDefaultOff && (
+					<DetailRow
+						label={t("details.browserToolAutoEnable")}
+						value={
+							<Text size="sm" c="dimmed">
+								{browserToolAutoEnableReason}
+							</Text>
+						}
+					/>
+				)}
+
 				<DetailRow
 					label={t("details.pendingPermissions")}
 					value={

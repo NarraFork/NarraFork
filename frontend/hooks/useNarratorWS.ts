@@ -8,6 +8,43 @@ import {
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
 
+function eventDiagnosticMessage(data: Record<string, unknown>, fallback = "Unknown error"): string {
+	for (const key of ["reason", "message", "error", "code"]) {
+		const value = data[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	return fallback;
+}
+
+export interface CommitSyncErrorEvent {
+	chapterId: string;
+	code?: string;
+	reason?: string;
+	error?: string;
+	message?: string;
+	fallback?: boolean;
+	fatal?: boolean;
+	backgroundSync?: boolean;
+	[key: string]: unknown;
+}
+
+export function coerceCommitSyncErrorEvent(
+	data: Record<string, unknown>,
+): CommitSyncErrorEvent | null {
+	if (typeof data.chapterId !== "string" || !data.chapterId) return null;
+	return {
+		...data,
+		chapterId: data.chapterId,
+		code: typeof data.code === "string" ? data.code : undefined,
+		reason: typeof data.reason === "string" ? data.reason : undefined,
+		error: typeof data.error === "string" ? data.error : undefined,
+		message: typeof data.message === "string" ? data.message : undefined,
+		fallback: typeof data.fallback === "boolean" ? data.fallback : undefined,
+		fatal: typeof data.fatal === "boolean" ? data.fatal : undefined,
+		backgroundSync: typeof data.backgroundSync === "boolean" ? data.backgroundSync : undefined,
+	};
+}
+
 interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -202,6 +239,7 @@ interface NarratorWSCallbacks {
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
+	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
 		taskNarratorId: string,
 		toolUseId: string,
@@ -732,7 +770,7 @@ export function useNarratorWS(
 						break;
 					case "narrator_error":
 						callbacksRef.current.onNarratorError?.(
-							data.error as string,
+							eventDiagnosticMessage(data),
 							data.errorCode as string | undefined,
 						);
 						break;
@@ -809,6 +847,11 @@ export function useNarratorWS(
 							);
 						}
 						break;
+					case "commit_sync_error": {
+						const event = coerceCommitSyncErrorEvent(data);
+						if (event) callbacksRef.current.onCommitSyncError?.(event);
+						break;
+					}
 					case "background_task_started":
 						callbacksRef.current.onBackgroundTaskStarted?.(
 							data.taskNarratorId as string,
@@ -870,7 +913,7 @@ export function useNarratorWS(
 						callbacksRef.current.onBackgroundTaskFailed?.(
 							data.taskNarratorId as string,
 							data.toolUseId as string,
-							data.error as string,
+							eventDiagnosticMessage(data),
 						);
 						break;
 					case "background_task_cancelled":

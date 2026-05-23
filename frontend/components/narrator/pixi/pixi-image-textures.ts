@@ -1,4 +1,4 @@
-import { getAvatarUrl, getToken } from "@frontend/lib/api";
+import { ApiError, getAvatarUrl, getToken, readFetchError } from "@frontend/lib/api";
 import { Texture } from "pixi.js";
 
 export type PixiImageTextureStatus = "idle" | "loading" | "ready" | "failed";
@@ -176,7 +176,10 @@ async function loadTextureFromSource(
 		let loadUrl = source;
 		if (authenticated) {
 			const response = await fetch(source, { headers: authHeaders() });
-			if (!response.ok) throw new Error(`${response.status} ${response.statusText}`.trim());
+			if (!response.ok) {
+				const error = await readFetchError(response, `HTTP ${response.status}`);
+				throw new ApiError(error.message, response.status, error.data);
+			}
 			const blob = await response.blob();
 			if (!blob.type.startsWith("image/")) throw new Error(blob.type || "response is not image");
 			if (blob.size > MAX_IMAGE_SOURCE_BLOB_BYTES) throw new Error("image blob too large");
@@ -238,8 +241,10 @@ function requestTexture(
 export function getPixiAvatarTexture(
 	userId: string | null | undefined,
 	avatarImageId: string | null | undefined,
+	avatarServingSupported = true,
 ): PixiImageTextureResult {
-	if (!userId || !avatarImageId) return { texture: null, status: "idle" };
+	if (!avatarServingSupported || !userId || !avatarImageId)
+		return { texture: null, status: "idle" };
 	return requestTexture(
 		`avatar:${userId}:${avatarImageId}`,
 		getAvatarUrl(userId, avatarImageId),
@@ -250,7 +255,11 @@ export function getPixiAvatarTexture(
 export function getPixiUploadImageTexture(
 	narratorId: string | null | undefined,
 	imageId: string | null | undefined,
+	narratorImageServingSupported = true,
 ): PixiImageTextureResult {
+	if (!narratorImageServingSupported) {
+		return { texture: null, status: "failed", error: "image serving unavailable" };
+	}
 	if (!narratorId || !imageId) return { texture: null, status: "idle" };
 	return requestTexture(
 		`upload:${narratorId}:${imageId}`,
@@ -267,11 +276,8 @@ export function getPixiPreviewImageTexture(url: string | null | undefined): Pixi
 export function getPixiGeneratedImageTexture(opts: {
 	result?: string | null;
 	savedPath?: string | null;
+	fsPreviewSupported?: boolean;
 }): PixiImageTextureResult {
-	if (opts.savedPath) {
-		const url = `/api/fs/preview?path=${encodeURIComponent(opts.savedPath)}`;
-		return requestTexture(`generated-path:${opts.savedPath}`, url, true);
-	}
 	if (opts.result) {
 		const dataUrl = normalizeGeneratedImageDataUrl(opts.result);
 		if (!dataUrl) return { texture: null, status: "failed", error: "image data too large" };
@@ -280,6 +286,13 @@ export function getPixiGeneratedImageTexture(opts: {
 			dataUrl,
 			false,
 		);
+	}
+	if (opts.savedPath) {
+		if (opts.fsPreviewSupported === false) {
+			return { texture: null, status: "failed", error: "file preview unavailable" };
+		}
+		const url = `/api/fs/preview?path=${encodeURIComponent(opts.savedPath)}`;
+		return requestTexture(`generated-path:${opts.savedPath}`, url, true);
 	}
 	return { texture: null, status: "idle" };
 }

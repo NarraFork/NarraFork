@@ -1,6 +1,7 @@
 import { useChapterGitStatus } from "@frontend/hooks/useChapterGitStatus";
 import { useChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useContainers } from "@frontend/hooks/useContainers";
+import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
 import {
@@ -71,7 +72,12 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const navigate = useNavigate();
 	const { data: chapter } = useChapter(chapterId);
 	const { data: gitStatus } = useChapterGitStatus(chapterId);
-	const { data: containers } = useContainers(chapterId);
+	const containerCapability = useChapterContainersCapability();
+	const containerUnsupportedReason =
+		containerCapability.reason ?? tn("chapterBar.containersUnsupported");
+	const { data: containers } = useContainers(
+		containerCapability.supported && containerCapability.routes.list ? chapterId : "",
+	);
 	const qc = useQueryClient();
 	const updateChapter = useUpdateChapter();
 	const dormantChapter = useMutation({
@@ -230,12 +236,20 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 					</Menu>
 
 					{/* Container toggle + menu */}
-					<Tooltip label={tn("chapterBar.containers")}>
+					<Tooltip
+						label={
+							containerCapability.supported
+								? tn("chapterBar.containers")
+								: containerUnsupportedReason
+						}
+					>
 						<ActionIcon
 							variant={containerPanelOpen ? "light" : "subtle"}
 							color={runningContainers.length > 0 ? "green" : "gray"}
 							size="sm"
+							disabled={!containerCapability.supported}
 							onClick={() => {
+								if (!containerCapability.supported) return;
 								if (hasContainers) {
 									setContainerPanelOpen(!containerPanelOpen);
 								} else {
@@ -302,7 +316,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			</Group>
 
 			{/* Container panel collapse */}
-			<Collapse in={containerPanelOpen && hasContainers}>
+			<Collapse in={containerCapability.supported && containerPanelOpen && hasContainers}>
 				<div
 					style={{
 						borderBottom: "1px solid var(--mantine-color-default-border)",
@@ -351,7 +365,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 					/>
 				</Suspense>
 			)}
-			{containerConfigOpen && (
+			{containerCapability.supported && containerConfigOpen && (
 				<Suspense fallback={null}>
 					<ContainerConfigModal
 						chapterId={chapterId}
@@ -361,7 +375,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 					/>
 				</Suspense>
 			)}
-			{podmanInstallOpen && (
+			{containerCapability.supported && podmanInstallOpen && (
 				<Suspense fallback={null}>
 					<PodmanInstallModal
 						opened={podmanInstallOpen}

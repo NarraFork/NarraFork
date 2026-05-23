@@ -15,6 +15,7 @@
 	"lines500": "500 行",
 	"noLogs": "暂无日志。",
 	"logsTruncated": "[较早的日志输出已隐藏以保持界面响应。]",
+	"capabilityUnsupported": "当前后端运行时不支持容器操作。",
 	"proxyDomainMissingHint": "全局容器代理已启用，但项目尚未配置代理域名。请到项目设置中填写“代理域名”，否则无法生成可访问的代理链接。",
 	"config": "配置",
 	"cleanup": "清理容器",

@@ -72,9 +72,14 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useInterruptNarrator, useToolCallDetail } from "../../hooks/useNarrator";
-import { usePlatform } from "../../hooks/usePlatform";
+import {
+	useFileSystemCapability,
+	useNarratorPermissionsCapability,
+	usePlatform,
+	useShareCapability,
+} from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { api, getToken, type SideCarRecord } from "../../lib/api";
+import { ApiError, api, getToken, readFetchError, type SideCarRecord } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
@@ -1785,8 +1790,11 @@ function FilePreviewModal({
 	onClose: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const fsCapability = useFileSystemCapability();
+	const previewCapability = fsCapability.preview;
 	const previewType = getFilePreviewType(filePath);
 	const [error, setError] = useState(false);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [textContent, setTextContent] = useState<string | null>(null);
 	const [textPreviewTruncated, setTextPreviewTruncated] = useState(false);
@@ -1798,6 +1806,7 @@ function FilePreviewModal({
 	// biome-ignore lint/correctness/useExhaustiveDependencies: filePath changes must clear stale preview state before the next fetch completes
 	useEffect(() => {
 		setError(false);
+		setErrorMessage(null);
 		setTextContent(null);
 		setTextPreviewTruncated(false);
 		setBlobUrl(null);
@@ -1813,7 +1822,7 @@ function FilePreviewModal({
 
 	// Fetch file content when modal opens
 	useEffect(() => {
-		if (!opened) return;
+		if (!opened || !previewCapability.supported) return;
 		let cancelled = false;
 		const controller = new AbortController();
 		setLoading(true);
@@ -1824,8 +1833,11 @@ function FilePreviewModal({
 
 		if (previewType === "text") {
 			fetch(url, { headers, signal: controller.signal })
-				.then((r) => {
-					if (!r.ok) throw new Error(r.statusText);
+				.then(async (r) => {
+					if (!r.ok) {
+						const error = await readFetchError(r, "Request failed");
+						throw new ApiError(error.message, r.status, error.data);
+					}
 					return readTextPreview(r, MAX_FILE_PREVIEW_TEXT_CHARS);
 				})
 				.then((preview) => {
@@ -1833,8 +1845,11 @@ function FilePreviewModal({
 					setTextContent(preview.text);
 					setTextPreviewTruncated(preview.truncated);
 				})
-				.catch(() => {
-					if (!cancelled) setError(true);
+				.catch((err) => {
+					if (!cancelled) {
+						setError(true);
+						setErrorMessage(err instanceof Error ? err.message : null);
+					}
 				})
 				.finally(() => {
 					if (!cancelled) setLoading(false);
@@ -1842,8 +1857,11 @@ function FilePreviewModal({
 		} else {
 			// Image or PDF: fetch as blob and create object URL
 			fetch(url, { headers, signal: controller.signal })
-				.then((r) => {
-					if (!r.ok) throw new Error(r.statusText);
+				.then(async (r) => {
+					if (!r.ok) {
+						const error = await readFetchError(r, "Request failed");
+						throw new ApiError(error.message, r.status, error.data);
+					}
 					return r.blob();
 				})
 				.then((blob) => {
@@ -1855,8 +1873,11 @@ function FilePreviewModal({
 					}
 					setBlobUrl(nextUrl);
 				})
-				.catch(() => {
-					if (!cancelled) setError(true);
+				.catch((err) => {
+					if (!cancelled) {
+						setError(true);
+						setErrorMessage(err instanceof Error ? err.message : null);
+					}
 				})
 				.finally(() => {
 					if (!cancelled) setLoading(false);
@@ -1866,7 +1887,7 @@ function FilePreviewModal({
 			cancelled = true;
 			controller.abort();
 		};
-	}, [opened, previewType, filePath]);
+	}, [opened, previewCapability.supported, previewType, filePath]);
 
 	return (
 		<Modal
@@ -1887,10 +1908,17 @@ function FilePreviewModal({
 					</Text>
 				</Group>
 			)}
+			{!previewCapability.supported && (
+				<Box p="md">
+					<Text c="dimmed" size="sm">
+						{previewCapability.reason ?? t("filePreview_unsupported")}
+					</Text>
+				</Box>
+			)}
 			{error && (
 				<Box p="md">
 					<Text c="red" size="sm">
-						{t("filePreview_loadError")}
+						{errorMessage ?? t("filePreview_loadError")}
 					</Text>
 				</Box>
 			)}
@@ -2708,6 +2736,7 @@ function ShareFilePreview({
 function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
 	const clipboard = useClipboard({ timeout: 2000 });
+	const shareCapability = useShareCapability();
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 
 	const filename = (meta?.filename as string) ?? "file";
@@ -2722,6 +2751,14 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const preview = meta?.preview as boolean | undefined;
 	const previewType = meta?.previewType as string | undefined;
 	const previewUrl = meta?.previewUrl as string | undefined;
+	const previewSupported = shareCapability.previewSupported;
+	const usesEscapedHtmlPreview =
+		previewType === "html" && shareCapability.previewHtmlMode === "escaped-pre";
+	const htmlPreviewWarning = shareCapability.previewReason ?? t("shareFile.escapedHtmlPreviewDesc");
+	const showSharePersistenceWarning =
+		!shareCapability.ephemeralOnlySupported || shareCapability.ephemeralOnlyFallback;
+	const sharePersistenceWarning =
+		shareCapability.ephemeralOnlyReason ?? t("shareFile.persistenceWarning");
 
 	const expiresLabel = useMemo(() => {
 		if (!expiresAt) return null;
@@ -2783,15 +2820,35 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 									{t("shareFile.fileCount", { count: fileCount })}
 								</Badge>
 							)}
-							{preview && previewType && (
+							{preview && previewType && previewSupported && (
 								<Badge size="xs" variant="light" color="teal">
 									{t("shareFile.preview")}
 								</Badge>
 							)}
+							{usesEscapedHtmlPreview && (
+								<Tooltip label={htmlPreviewWarning} withArrow multiline maw={360}>
+									<Badge size="xs" variant="light" color="gray">
+										{t("shareFile.escapedHtmlPreview")}
+									</Badge>
+								</Tooltip>
+							)}
+							{preview && previewType && !previewSupported && (
+								<Badge size="xs" variant="light" color="orange">
+									{t("shareFile.previewUnavailable")}
+								</Badge>
+							)}
+
 							{expiresLabel && (
 								<Tooltip label={`Expires: ${expiresLabel}`} withArrow>
 									<Badge size="xs" variant="light" color="yellow">
 										{expiryHours}h
+									</Badge>
+								</Tooltip>
+							)}
+							{showSharePersistenceWarning && (
+								<Tooltip label={sharePersistenceWarning} withArrow multiline maw={360}>
+									<Badge size="xs" variant="light" color="orange">
+										{t("shareFile.diskFallback")}
 									</Badge>
 								</Tooltip>
 							)}
@@ -2824,8 +2881,13 @@ function ShareFileDetail({ toolCall }: { toolCall: ToolCallData }) {
 						</Button>
 					</Tooltip>
 				</Group>
-				{preview && previewUrl && previewType && (
+				{preview && previewUrl && previewType && previewSupported && (
 					<ShareFilePreview previewUrl={previewUrl} previewType={previewType} filename={filename} />
+				)}
+				{preview && previewUrl && previewType && !previewSupported && (
+					<Text size="xs" c="dimmed" mt="xs">
+						{t("shareFile.previewUnavailableDesc")}
+					</Text>
 				)}
 			</Paper>
 		</Box>
@@ -4114,6 +4176,9 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 });
 
 function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { t } = useTranslation("narrator");
+	const fsCapability = useFileSystemCapability();
+	const previewCapability = fsCapability.preview;
 	const fp = getFilePath(toolCall.inputJson);
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 	const isImage = meta?.isImage === true;
@@ -4124,16 +4189,23 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const filePath = isImage ? ((meta?.filePath as string) ?? fp) : undefined;
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
 	const [loadError, setLoadError] = useState(false);
+	const [loadErrorMessage, setLoadErrorMessage] = useState<string | null>(null);
+	const previewUnsupported = !!filePath && !previewCapability.supported;
 
 	useEffect(() => {
-		if (!filePath) return;
+		if (!filePath || !previewCapability.supported) return;
 		let cancelled = false;
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
+		setLoadError(false);
+		setLoadErrorMessage(null);
 		fetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, { headers })
-			.then((r) => {
-				if (!r.ok) throw new Error(r.statusText);
+			.then(async (r) => {
+				if (!r.ok) {
+					const error = await readFetchError(r, "Request failed");
+					throw new ApiError(error.message, r.status, error.data);
+				}
 				return r.blob();
 			})
 			.then((blob) => {
@@ -4142,13 +4214,16 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 					setBlobUrl(URL.createObjectURL(blob));
 				}
 			})
-			.catch(() => {
-				if (!cancelled) setLoadError(true);
+			.catch((err) => {
+				if (!cancelled) {
+					setLoadError(true);
+					setLoadErrorMessage(err instanceof Error ? err.message : null);
+				}
 			});
 		return () => {
 			cancelled = true;
 		};
-	}, [filePath]);
+	}, [filePath, previewCapability.supported]);
 
 	// Cleanup blob URL on unmount
 	useEffect(() => {
@@ -4185,9 +4260,11 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 						}}
 					/>
 				)}
-				{loadError && (
+				{(loadError || previewUnsupported) && (
 					<Text size="xs" c="dimmed">
-						{outputText}
+						{previewUnsupported
+							? (previewCapability.reason ?? t("filePreview_unsupported"))
+							: (loadErrorMessage ?? outputText)}
 					</Text>
 				)}
 			</Box>
@@ -4397,6 +4474,7 @@ function canPersistPermissionDraft(feedback: string, editedPlan: string | null):
 
 export function InlinePermission({
 	permission,
+	readOnly,
 	onDecision,
 	onQuestionSubmit,
 	onQuestionReflect,
@@ -4404,6 +4482,7 @@ export function InlinePermission({
 	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
+	readOnly?: boolean;
 	onDecision?: (
 		requestId: string,
 		decision: "allow" | "deny",
@@ -4418,6 +4497,12 @@ export function InlinePermission({
 }) {
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const permissionCapability = useNarratorPermissionsCapability();
+	const permissionDecisionsSupported =
+		permissionCapability.supported && permissionCapability.approveDeny;
+	const permissionInputSupported =
+		permissionCapability.supported && permissionCapability.updatedInput;
+	const effectiveReadOnly = readOnly === true || !permissionDecisionsSupported;
 	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
@@ -4460,6 +4545,11 @@ export function InlinePermission({
 	useEffect(() => {
 		if (isActivePermission) setHasFeedback(!!feedback);
 	}, [feedback, setHasFeedback, isActivePermission]);
+	useEffect(() => {
+		if (!isActivePermission || !effectiveReadOnly) return;
+		setButtonCount(0);
+		registerActions([]);
+	}, [effectiveReadOnly, isActivePermission, registerActions, setButtonCount]);
 
 	// Feedback confirmation dialog state (must be before early returns)
 	const [feedbackConfirmOpen, setFeedbackConfirmOpen] = useState(false);
@@ -4494,6 +4584,7 @@ export function InlinePermission({
 				<AskUserQuestionBanner
 					requestId={permission.id}
 					questions={askQuestions}
+					readOnly={effectiveReadOnly || !permissionInputSupported}
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
 					onReflect={(reqId) => onQuestionReflect?.(reqId)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}
@@ -4562,6 +4653,7 @@ export function InlinePermission({
 					autosize
 					minRows={8}
 					maxRows={30}
+					disabled={effectiveReadOnly || !permissionInputSupported}
 					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
 				/>
 			)}
@@ -4587,65 +4679,72 @@ export function InlinePermission({
 				minRows={1}
 				maxRows={3}
 				mb="xs"
+				disabled={effectiveReadOnly}
 			/>
-			<PermButtonBar
-				focusIndex={isActivePermission ? focusIndex : null}
-				buttons={(() => {
-					const btns: PermButton[] = [];
-					if (!editing) {
-						btns.push({
-							label: isExitPlan ? t("planExecute") : tc("allow"),
-							color: "green",
-							onClick: () => handleAllow(),
-						});
-					}
-					if (!editing && isExitPlan) {
-						btns.push({
-							label: t("acceptAndResetContext"),
-							color: "teal",
-							variant: "light",
-							onClick: () => handleAllow(true),
-						});
-					}
-					if (isExitPlan && planText) {
-						btns.push({
-							label: editing ? t("planEditDone") : t("planEdit"),
-							color: "indigo",
-							variant: "light",
-							onClick: () => {
-								if (editing) setEditing(false);
-								else handleStartEdit();
-							},
-						});
-					}
-					if (planEdited || editing) {
-						btns.push({
-							label: t("planEditReset"),
-							color: "gray",
-							variant: "subtle",
-							onClick: () => {
-								setEditedPlan(null);
-								setEditing(false);
-							},
-						});
-					}
-					if (!editing) {
-						btns.push({
-							label: isExitPlan && feedback.trim() ? t("planRevise") : tc("deny"),
-							color: "red",
-							variant: "light",
-							onClick: () => {
-								sessionStorage.removeItem(draftKey);
-								onDecision?.(permission.id, "deny", feedback || undefined);
-							},
-						});
-					}
-					return btns;
-				})()}
-				setButtonCount={isActivePermission ? setButtonCount : noop}
-				registerActions={isActivePermission ? registerActions : noop}
-				suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
-			/>
+			{effectiveReadOnly ? (
+				<Text size="xs" c="dimmed">
+					{t("permissionActionsUnavailable")}
+				</Text>
+			) : (
+				<PermButtonBar
+					focusIndex={isActivePermission ? focusIndex : null}
+					buttons={(() => {
+						const btns: PermButton[] = [];
+						if (!editing) {
+							btns.push({
+								label: isExitPlan ? t("planExecute") : tc("allow"),
+								color: "green",
+								onClick: () => handleAllow(),
+							});
+						}
+						if (!editing && isExitPlan) {
+							btns.push({
+								label: t("acceptAndResetContext"),
+								color: "teal",
+								variant: "light",
+								onClick: () => handleAllow(true),
+							});
+						}
+						if (isExitPlan && planText && permissionInputSupported) {
+							btns.push({
+								label: editing ? t("planEditDone") : t("planEdit"),
+								color: "indigo",
+								variant: "light",
+								onClick: () => {
+									if (editing) setEditing(false);
+									else handleStartEdit();
+								},
+							});
+						}
+						if ((planEdited || editing) && permissionInputSupported) {
+							btns.push({
+								label: t("planEditReset"),
+								color: "gray",
+								variant: "subtle",
+								onClick: () => {
+									setEditedPlan(null);
+									setEditing(false);
+								},
+							});
+						}
+						if (!editing) {
+							btns.push({
+								label: isExitPlan && feedback.trim() ? t("planRevise") : tc("deny"),
+								color: "red",
+								variant: "light",
+								onClick: () => {
+									sessionStorage.removeItem(draftKey);
+									onDecision?.(permission.id, "deny", feedback || undefined);
+								},
+							});
+						}
+						return btns;
+					})()}
+					setButtonCount={isActivePermission ? setButtonCount : noop}
+					registerActions={isActivePermission ? registerActions : noop}
+					suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
+				/>
+			)}
 			{isExitPlan && (
 				<Modal
 					opened={feedbackConfirmOpen}
@@ -4967,6 +5066,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 		if (!pendingPermission && planPreviewOverride) setPlanPreviewOverride(null);
 	}, [pendingPermission, planPreviewOverride]);
 
+	const permissionCapability = useNarratorPermissionsCapability();
+	const permissionDecisionsSupported =
+		permissionCapability.supported && permissionCapability.approveDeny;
 	const reflection = getToolCallReflection(toolCall, pendingPermission);
 	const permissionUI =
 		reflection && reflection.status !== "awaiting_user" ? (
@@ -4978,6 +5080,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		) : pendingPermission ? (
 			<InlinePermission
 				permission={pendingPermission}
+				readOnly={!permissionDecisionsSupported}
 				onDecision={onPermissionDecision}
 				onQuestionSubmit={onQuestionSubmit}
 				onQuestionReflect={onQuestionReflect}

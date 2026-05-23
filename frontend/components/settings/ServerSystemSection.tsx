@@ -15,6 +15,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconCertificate, IconRefresh, IconSearch } from "@tabler/icons-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { PathInput } from "../common/PathInput";
 import type { UpdateModalData } from "../UpdateModal";
@@ -88,6 +89,8 @@ export function ServerSystemSection({
 	setUpdateAutoDownload,
 }: ServerSystemSectionProps) {
 	const { t } = useTranslation("settings");
+	const settingsFeatureCapability = useSettingsFeatureCapability();
+	const tlsGenerationDisabledReason = t("tlsGenerationUnsupported");
 	const [checking, setChecking] = useState(false);
 	const [checkResult, setCheckResult] = useState<string | null>(null);
 	const [generating, setGenerating] = useState(false);
@@ -100,6 +103,22 @@ export function ServerSystemSection({
 		<Stack>
 			{/* Server */}
 			<Title order={5}>{t("serverSubSection")}</Title>
+			{settingsFeatureCapability.storagePath && (
+				<Alert color="blue" variant="light" py={6} title={t("settingsStoragePathTitle")}>
+					{t("settingsStoragePathDesc", { path: settingsFeatureCapability.storagePath })}
+				</Alert>
+			)}
+			{!settingsFeatureCapability.secretMasking && (
+				<Alert
+					color="red"
+					icon={<IconAlertTriangle size={16} />}
+					variant="light"
+					py={6}
+					title={t("settingsSecretMaskingUnsupportedTitle")}
+				>
+					{t("settingsSecretMaskingUnsupportedDesc")}
+				</Alert>
+			)}
 			<NumberInput
 				label={t("serverPort")}
 				value={port}
@@ -147,7 +166,13 @@ export function ServerSystemSection({
 					color="green"
 					size="xs"
 					loading={generating}
+					disabled={!settingsFeatureCapability.tlsGeneration}
+					title={!settingsFeatureCapability.tlsGeneration ? tlsGenerationDisabledReason : undefined}
 					onClick={async () => {
+						if (!settingsFeatureCapability.tlsGeneration) {
+							setGenerateResult(tlsGenerationDisabledReason);
+							return;
+						}
 						setGenerating(true);
 						setGenerateResult(null);
 						try {
@@ -155,7 +180,16 @@ export function ServerSystemSection({
 							setTlsCertFile(result.certPath);
 							setTlsKeyFile(result.keyPath);
 							setTlsEnabled(true);
-							setGenerateResult(t("tlsGenerateSuccess"));
+							if (result.serverRestarting && result.newUrl) {
+								setGenerateResult(t("tlsGenerateSuccess"));
+								setTimeout(() => {
+									window.location.href = result.newUrl;
+								}, 1000);
+							} else if (result.manualRestartRequired) {
+								setGenerateResult(t("serverRestartRequired"));
+							} else {
+								setGenerateResult(t("tlsGenerateSuccess"));
+							}
 						} catch {
 							setGenerateResult(t("tlsGenerateError"));
 						} finally {
@@ -171,6 +205,11 @@ export function ServerSystemSection({
 					</Text>
 				)}
 			</Group>
+			{!settingsFeatureCapability.tlsGeneration && (
+				<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
+					{tlsGenerationDisabledReason}
+				</Alert>
+			)}
 			<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
 				{t("tlsGenerateWarning")}
 			</Alert>

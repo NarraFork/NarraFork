@@ -22,10 +22,10 @@ import { IconDeviceFloppy, IconPlus, IconQrcode, IconTrash } from "@tabler/icons
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useGatewayCapability } from "../../hooks/usePlatform";
+import { type GatewayPlatform, useGatewayCapability } from "../../hooks/usePlatform";
 import { miscApi } from "../../lib/api/misc";
 
-type Platform = "telegram" | "discord" | "slack" | "feishu" | "webhook" | "weixin" | "qqbot";
+type Platform = GatewayPlatform;
 
 interface PlatformConfig {
 	platform: Platform;
@@ -109,9 +109,24 @@ function normalizeGatewayPermissionMode(value: unknown): string {
 
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
-	const { persistentRuntimes } = useGatewayCapability();
+	const {
+		persistentRuntimes,
+		supportedPlatforms,
+		webhookSupported,
+		isPlatformSupported,
+		platformUnsupportedReason,
+	} = useGatewayCapability();
 	const persistentRuntimeDisabledReason = t("gatewayPersistentRuntimesUnsupported");
-	const addablePlatforms = persistentRuntimes ? ALL_PLATFORMS : (["webhook"] as Platform[]);
+	const unsupportedRuntimeReason = t("gatewayUnsupportedPlatform", {
+		defaultValue: "This platform is not supported by the current backend runtime.",
+	});
+	const addablePlatforms = supportedPlatforms?.length
+		? ALL_PLATFORMS.filter((platform) => isPlatformSupported(platform))
+		: persistentRuntimes
+			? ALL_PLATFORMS.filter((platform) => isPlatformSupported(platform))
+			: webhookSupported
+				? (["webhook"] as Platform[])
+				: [];
 	const [config, setConfig] = useState<GatewayConfig>({});
 	const [inited, setInited] = useState(false);
 	const [saving, setSaving] = useState(false);
@@ -187,7 +202,8 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 				// Global settings changed but no specific platform — full reload
 				await miscApi.gatewayReload();
 			} else if (changedPlatforms.length > 0) {
-				await miscApi.gatewayReload(changedPlatforms);
+				const reloadablePlatforms = changedPlatforms.filter(isPlatformSupported);
+				if (reloadablePlatforms.length > 0) await miscApi.gatewayReload(reloadablePlatforms);
 			}
 
 			serverSnapshot.current = config;
@@ -200,7 +216,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 		} finally {
 			setSaving(false);
 		}
-	}, [config, updateUserPref, getChangedPlatforms, t]);
+	}, [config, updateUserPref, getChangedPlatforms, isPlatformSupported, t]);
 
 	const updateField = useCallback(
 		<K extends keyof GatewayConfig>(key: K, value: GatewayConfig[K]) => {
@@ -213,7 +229,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 
 	const addPlatform = useCallback(
 		(platform: Platform) => {
-			if (!persistentRuntimes && platform !== "webhook") return;
+			if (!isPlatformSupported(platform)) return;
 			const existing = platforms.find((p) => p.platform === platform);
 			if (existing) return;
 			setConfig((prev) => ({
@@ -221,7 +237,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 				platforms: [...(prev.platforms ?? []), { platform, enabled: true }],
 			}));
 		},
-		[persistentRuntimes, platforms],
+		[isPlatformSupported, platforms],
 	);
 
 	const removePlatform = useCallback((index: number) => {
@@ -254,6 +270,14 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 					{persistentRuntimeDisabledReason}
 				</Text>
 			)}
+			{supportedPlatforms?.length && supportedPlatforms.length < ALL_PLATFORMS.length ? (
+				<Text size="xs" c="orange">
+					{t("gatewaySupportedPlatformsLimited", {
+						defaultValue: "Current backend supports only: {{platforms}}.",
+						platforms: supportedPlatforms.map((platform) => PLATFORM_LABELS[platform]).join(", "),
+					})}
+				</Text>
+			) : null}
 
 			<Switch
 				label={t("gatewayEnabled")}
@@ -355,8 +379,11 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 							onUpdate={updatePlatform}
 							onRemove={removePlatform}
 							disabledReason={
-								!persistentRuntimes && platform.platform !== "webhook"
-									? persistentRuntimeDisabledReason
+								!isPlatformSupported(platform.platform)
+									? (platformUnsupportedReason(platform.platform) ??
+										(!persistentRuntimes && platform.platform !== "webhook"
+											? persistentRuntimeDisabledReason
+											: unsupportedRuntimeReason))
 									: undefined
 							}
 						/>
@@ -682,7 +709,7 @@ function WeixinFields({
 					} else if (poll.status === "error") {
 						stopPolling();
 						setQrStatus("error");
-						setQrError(poll.message ?? "Unknown error");
+						setQrError(poll.reason ?? poll.message ?? poll.error ?? poll.code ?? "Unknown error");
 						setQrUrl(null);
 					}
 					// "wait" → keep polling

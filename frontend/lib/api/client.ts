@@ -43,8 +43,19 @@ function toErrorData(value: unknown, fallback: string): Record<string, unknown> 
 	return { error: typeof value === "string" && value ? value : fallback };
 }
 
-function getErrorMessage(data: Record<string, unknown>, fallback: string): string {
-	return typeof data.error === "string" && data.error ? data.error : fallback;
+export function getErrorMessage(data: Record<string, unknown>, fallback: string): string {
+	for (const key of ["reason", "message", "error"]) {
+		const value = data[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	const nestedError = data.error;
+	if (nestedError && typeof nestedError === "object" && !Array.isArray(nestedError)) {
+		const nestedMessage = (nestedError as Record<string, unknown>).message;
+		if (typeof nestedMessage === "string" && nestedMessage.trim()) return nestedMessage;
+	}
+	const code = data.code;
+	if (typeof code === "string" && code.trim()) return code;
+	return fallback;
 }
 
 async function readResponseTextPreview(
@@ -91,6 +102,24 @@ async function readErrorData(
 	const { text, truncated } = await readResponseTextPreview(response);
 	const value = truncated ? `${text}\n…` : (tryParseJson(text) ?? text);
 	return toErrorData(value, fallback);
+}
+
+export async function readFetchError(
+	response: Response,
+	fallback = response.statusText || "Request failed",
+): Promise<{ message: string; data: Record<string, unknown> }> {
+	if (response.status === 401) {
+		clearToken();
+	}
+	const data = await readErrorData(response, fallback);
+	return { message: getErrorMessage(data, fallback), data };
+}
+
+export async function readFetchErrorMessage(
+	response: Response,
+	fallback = response.statusText || "Request failed",
+): Promise<string> {
+	return (await readFetchError(response, fallback)).message;
 }
 
 export async function request<T>(

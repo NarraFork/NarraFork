@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { getAvatarUrl, getToken } from "../lib/api";
+import { clearToken, getAvatarUrl, getToken } from "../lib/api";
+import { useUploadCapability } from "./usePlatform";
 
 interface CacheEntry {
 	blobUrl: string;
@@ -27,7 +28,7 @@ function scheduleUnreferencedCleanup(key: string) {
 	}, 0);
 }
 
-function fetchAvatar(userId: string, avatarImageId: string): Promise<string | null> {
+export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promise<string | null> {
 	const key = cacheKey(userId, avatarImageId);
 
 	const existing = pending.get(key);
@@ -38,7 +39,13 @@ function fetchAvatar(userId: string, avatarImageId: string): Promise<string | nu
 	if (token) headers.Authorization = `Bearer ${token}`;
 
 	const promise = fetch(getAvatarUrl(userId, avatarImageId), { headers })
-		.then((res) => (res.ok ? res.blob() : null))
+		.then(async (res) => {
+			if (!res.ok) {
+				if (res.status === 401) clearToken();
+				return null;
+			}
+			return res.blob();
+		})
 		.then((blob) => {
 			pending.delete(key);
 			if (!blob || blob.size > MAX_AVATAR_BLOB_BYTES) return null;
@@ -108,6 +115,8 @@ export function useAvatarBlobUrl(
 	userId: string | null | undefined,
 	avatarImageId: string | null | undefined,
 ): string | null {
+	const uploadCapability = useUploadCapability();
+	const avatarServingSupported = uploadCapability.serveAvatars.supported;
 	const [blobUrl, setBlobUrl] = useState<string | null>(() => {
 		if (!userId || !avatarImageId) return null;
 		return cache.get(cacheKey(userId, avatarImageId))?.blobUrl ?? null;
@@ -117,7 +126,7 @@ export function useAvatarBlobUrl(
 		// Clear immediately on key change to prevent stale avatar flash
 		setBlobUrl(null);
 
-		if (!userId || !avatarImageId) return;
+		if (!userId || !avatarImageId || !avatarServingSupported) return;
 
 		const currentUserId = userId;
 		const currentAvatarId = avatarImageId;
@@ -133,7 +142,7 @@ export function useAvatarBlobUrl(
 			return () => release(currentUserId, currentAvatarId);
 		}
 
-		fetchAvatar(currentUserId, currentAvatarId).then((url) => {
+		fetchAvatarBlobUrl(currentUserId, currentAvatarId).then((url) => {
 			if (cancelled) return; // cleanup already ran — nothing to release (refCount wasn't bumped)
 			if (url) {
 				acquire(currentUserId, currentAvatarId);
@@ -148,7 +157,7 @@ export function useAvatarBlobUrl(
 				release(currentUserId, currentAvatarId);
 			}
 		};
-	}, [userId, avatarImageId]);
+	}, [userId, avatarImageId, avatarServingSupported]);
 
 	return blobUrl;
 }

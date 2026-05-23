@@ -1,5 +1,7 @@
+import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { ensurePrefix } from "../components/providers/types";
 import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
@@ -159,6 +161,7 @@ function makeDefaults(): InstanceSettingsState {
 }
 
 export function useInstanceSettings(): UseInstanceSettingsReturn {
+	const { t } = useTranslation("settings");
 	const { data: settings, isLoading } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -357,11 +360,20 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				onSuccess: (data) => {
 					serverSnapshot.current = normalizedState;
 					setState(normalizedState);
-					const resp = data as { serverRestarting?: boolean; newUrl?: string };
+					const resp = data as {
+						serverRestarting?: boolean;
+						manualRestartRequired?: boolean;
+						newUrl?: string;
+					};
 					if (resp.serverRestarting && resp.newUrl) {
 						setTimeout(() => {
 							window.location.href = resp.newUrl as string;
 						}, 1000);
+					} else if (resp.manualRestartRequired) {
+						notifications.show({
+							message: t("serverRestartRequired"),
+							color: "yellow",
+						});
 					}
 				},
 			},
