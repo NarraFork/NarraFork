@@ -167,6 +167,95 @@ describe("CodexManager usage quota state", () => {
 		expect(entry?.email).toBe("access-only@example.com");
 	});
 
+	test("导入 at 标记行时从原始名称提取邮箱且不把 token 作为显示名", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		const rawLine = "line-user@example.com----password-----at----opaque-access-token";
+
+		const result = manager.importCredentials([
+			{ accessToken: "opaque-access-token", displayName: rawLine },
+		]);
+		const entry = manager.snapshot().entries[0];
+
+		expect(result).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		expect(entry?.email).toBe("line-user@example.com");
+		expect(entry?.displayName).toBe("line-user@example.com");
+		expect(entry?.displayName).not.toContain("opaque-access-token");
+	});
+
+	test("加载已保存的 at 原始显示名时清理 token", () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("stored-raw", {
+			accessToken: "stored-access-token",
+			displayName: "stored-user@example.com----password----at----stored-access-token",
+		});
+		tempHomes.push(tmpHome);
+		const entry = manager.snapshot().entries[0];
+
+		expect(entry?.email).toBe("stored-user@example.com");
+		expect(entry?.displayName).toBe("stored-user@example.com");
+		expect(entry?.displayName).not.toContain("stored-access-token");
+	});
+
+	test("删除凭据后可重新导入相同 token", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+
+		expect(
+			manager.importCredentials([{ accessToken: "reimport-token", displayName: "Reimport" }]),
+		).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		const entry = manager.snapshot().entries[0];
+		if (!entry) throw new Error("Expected imported entry");
+
+		manager.removeCredential(entry.id);
+
+		expect(
+			manager.importCredentials([{ accessToken: "reimport-token", displayName: "Reimport" }]),
+		).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		const snapshot = manager.snapshot();
+		expect(snapshot.entries).toHaveLength(1);
+		expect(snapshot.currentId).toBe(snapshot.entries[0]?.id);
+	});
+
+	test("批量删除所有凭据会清空 currentId", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		manager.importCredentials([
+			{ accessToken: "batch-token-1", displayName: "Batch Token 1" },
+			{ accessToken: "batch-token-2", displayName: "Batch Token 2" },
+		]);
+		const ids = manager.snapshot().entries.map((entry) => entry.id);
+
+		expect(manager.removeCredentials(ids).removed).toEqual(ids);
+		expect(manager.snapshot().currentId).toBe("");
+	});
+
+	test("删除分页末尾凭据后快照页码会回退到有效页", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+
+		manager.importCredentials([
+			{ accessToken: "page-token-1", displayName: "Page Token 1" },
+			{ accessToken: "page-token-2", displayName: "Page Token 2" },
+			{ accessToken: "page-token-3", displayName: "Page Token 3" },
+		]);
+		const lastPageEntry = manager.snapshot({ availablePage: 2, pageSize: 2 }).entries[0];
+		expect(lastPageEntry?.displayName).toBe("Page Token 3");
+		if (!lastPageEntry) throw new Error("Expected last page entry");
+
+		manager.removeCredential(lastPageEntry.id);
+		const snapshot = manager.snapshot({ availablePage: 2, pageSize: 2 });
+
+		expect(snapshot.availableTotal).toBe(2);
+		expect(snapshot.entries.map((entry) => entry.displayName)).toEqual([
+			"Page Token 1",
+			"Page Token 2",
+		]);
+	});
+
 	test("只有 access_token 且明确过期时跳过该凭据而不是刷新", async () => {
 		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
 		tempHomes.push(tmpHome);

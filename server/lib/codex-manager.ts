@@ -231,8 +231,37 @@ function sha256Hex(input: string): string {
 	return createHash("sha256").update(input).digest("hex");
 }
 
+const EMAIL_SEARCH_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const AT_MARKER_DISPLAY_PATTERN = /(?:^|-{4,})\s*at\s*(?:-{4,}|$)/i;
+const REFRESH_TOKEN_DISPLAY_PATTERN = /rt_[A-Za-z0-9._-]+/;
+
 function normalizeOptionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function extractEmailFromString(value: unknown): string | undefined {
+	const text = normalizeOptionalString(value);
+	return text?.match(EMAIL_SEARCH_PATTERN)?.[0];
+}
+
+function isSerializedCodexCredentialLabel(value: unknown): boolean {
+	const text = normalizeOptionalString(value);
+	if (!text?.includes("----")) return false;
+	return AT_MARKER_DISPLAY_PATTERN.test(text) || REFRESH_TOKEN_DISPLAY_PATTERN.test(text);
+}
+
+function safeCredentialDisplayName(value: unknown): string | undefined {
+	const text = normalizeOptionalString(value);
+	if (!text || isSerializedCodexCredentialLabel(text)) return undefined;
+	return text;
+}
+
+function firstSafeCredentialDisplayName(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		const normalized = safeCredentialDisplayName(value);
+		if (normalized) return normalized;
+	}
+	return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -343,6 +372,11 @@ function createCredentialFromImport(
 		nestedCredentials.email,
 		extra.email,
 		tokenInfo.email,
+		extractEmailFromString(input.displayName),
+		extractEmailFromString(input.display_name),
+		extractEmailFromString(input.name),
+		extractEmailFromString(nestedCredentials.displayName),
+		extractEmailFromString(nestedCredentials.display_name),
 	);
 	const sub = firstOptionalString(
 		input.sub,
@@ -352,11 +386,13 @@ function createCredentialFromImport(
 		tokenInfo.sub,
 	);
 	const displayName = firstOptionalString(
-		input.displayName,
-		input.display_name,
-		input.name,
-		nestedCredentials.displayName,
-		nestedCredentials.display_name,
+		firstSafeCredentialDisplayName(
+			input.displayName,
+			input.display_name,
+			input.name,
+			nestedCredentials.displayName,
+			nestedCredentials.display_name,
+		),
 		email,
 		accountId,
 	);
@@ -994,9 +1030,12 @@ export class CodexManager {
 
 		const mapEntry = (e: CodexCredential): CredentialSnapshot => {
 			const stats = this.stats.get(e.id);
+			const displayName = isSerializedCodexCredentialLabel(e.displayName)
+				? firstOptionalString(e.email, e.accountId)
+				: e.displayName;
 			return {
 				id: e.id,
-				displayName: e.displayName,
+				displayName,
 				accountId: e.accountId,
 				email: e.email,
 				priority: e.priority,
@@ -1019,7 +1058,9 @@ export class CodexManager {
 
 		const slicePage = (arr: CodexCredential[], page?: number): CodexCredential[] => {
 			if (!isPaged || !page || page < 1) return arr;
-			const start = (page - 1) * pageSize;
+			const maxPage = Math.max(1, Math.ceil(arr.length / pageSize));
+			const safePage = Math.min(page, maxPage);
+			const start = (safePage - 1) * pageSize;
 			return arr.slice(start, start + pageSize);
 		};
 
@@ -1121,8 +1162,8 @@ export class CodexManager {
 		this.usageRefreshPromises.delete(id);
 		this.usageSchedulerRetryAfter.delete(id);
 		this.evictSessionsByCredential(id);
-		if (this.currentId === id && this.entries.length > 0) {
-			this.currentId = this.entries[0].id;
+		if (this.currentId === id) {
+			this.currentId = this.entries[0]?.id ?? "";
 		}
 		this.saveCredentials();
 		this.saveStats();
@@ -1146,12 +1187,8 @@ export class CodexManager {
 			this.evictSessionsByCredential(id);
 			removed.push(id);
 		}
-		if (
-			this.currentId &&
-			!this.entries.find((e) => e.id === this.currentId) &&
-			this.entries.length > 0
-		) {
-			this.currentId = this.entries[0].id;
+		if (this.currentId && !this.entries.find((e) => e.id === this.currentId)) {
+			this.currentId = this.entries[0]?.id ?? "";
 		}
 		if (removed.length > 0) {
 			this.saveCredentials();
@@ -1558,6 +1595,9 @@ export class CodexManager {
 		}
 
 		if (added > 0) {
+			if (!this.currentId || !this.entries.find((e) => e.id === this.currentId)) {
+				this.currentId = this.entries[0]?.id ?? "";
+			}
 			this.saveCredentials();
 			// Enqueue usage fetch for newly added credentials via serial queue.
 			codexUsageQueue.enqueueMany(addedIds);
@@ -1595,6 +1635,10 @@ export class CodexManager {
 					credential.accountId ??= info.accountId;
 					credential.email ??= info.email;
 					credential.sub ??= info.sub;
+				}
+				credential.email ??= extractEmailFromString(credential.displayName);
+				if (isSerializedCodexCredentialLabel(credential.displayName)) {
+					credential.displayName = firstOptionalString(credential.email, credential.accountId);
 				}
 
 				const keys = getCredentialDedupeKeys(credential);

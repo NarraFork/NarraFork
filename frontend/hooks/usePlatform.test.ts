@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	getBenchmarkContainerExecutionCapability,
+	getChapterBatchMergeCapability,
 	getChapterContainersCapability,
 	getChapterSplitCapability,
 	getCodexManagerParityCapability,
@@ -18,10 +19,12 @@ import {
 	getNarratorBrowserSessionsCapability,
 	getNarratorCompactCapability,
 	getNarratorContainerBrowserToolAutoEnableCapability,
+	getNarratorDeleteCapability,
 	getNarratorPermissionsCapability,
 	getNarratorPlanModeCapability,
 	getNarratorRetryRecoveryCapability,
 	getNarratorReviewToolsCapability,
+	getNarratorRollbackEditRegenerateCapability,
 	getNarratorSubagentsCapability,
 	getNarratorToolInventoryCapability,
 	getProviderAgentModeCapability,
@@ -48,6 +51,25 @@ describe("getTerminalCapability", () => {
 	test("defaults to supported with no terminal runtime detail metadata", () => {
 		expect(getTerminalCapability(undefined)).toEqual({
 			supported: true,
+			reason: undefined,
+			dtachSupported: undefined,
+			dtachAvailable: undefined,
+			detachedReattach: undefined,
+			orphanRecovery: undefined,
+			scrollbackReplay: undefined,
+			scrollbackReplayMode: undefined,
+			bufferStateReplay: undefined,
+			bufferStateMode: undefined,
+			xtermSerializedReplay: undefined,
+			xtermSerializedReplayReason: undefined,
+			multiClientResizeMode: undefined,
+			processTree: undefined,
+		});
+	});
+
+	test("requires explicit terminal support when capability payload is present", () => {
+		expect(getTerminalCapability({})).toEqual({
+			supported: false,
 			reason: undefined,
 			dtachSupported: undefined,
 			dtachAvailable: undefined,
@@ -141,6 +163,21 @@ describe("getFileSystemCapability", () => {
 		});
 	});
 
+	test("requires explicit filesystem support when capability metadata is present", () => {
+		expect(getFileSystemCapability({ fs: {} })).toEqual({
+			browse: { supported: false, reason: undefined },
+			shortcuts: { supported: false, reason: undefined },
+			mkdir: { supported: false, reason: undefined },
+			preview: {
+				supported: false,
+				reason: undefined,
+				maxTextBytes: undefined,
+				maxBinaryBytes: undefined,
+			},
+			reveal: { supported: false, reason: undefined },
+		});
+	});
+
 	test("preserves explicit unsupported filesystem route capabilities", () => {
 		const capabilities: RuntimeCapabilities = {
 			fs: {
@@ -172,12 +209,116 @@ describe("getFileSystemCapability", () => {
 	});
 });
 
-describe("getChapterSplitCapability", () => {
-	test("defaults to supported when split capability is absent", () => {
-		const result = getChapterSplitCapability(undefined);
+describe("getChapterBatchMergeCapability", () => {
+	test("defaults to supported when batch merge capability is absent", () => {
+		const result = getChapterBatchMergeCapability(undefined);
 
 		expect(result.supported).toBe(true);
-		expect(result.reason).toBeUndefined();
+		expect(result.startRouteSupported).toBe(true);
+		expect(result.sessionRouteSupported).toBe(true);
+		expect(result.mergeSessionIdResponse).toBe(true);
+		expect(result.decisionWs).toBe(true);
+		expect(result.events).toEqual([]);
+	});
+
+	test("requires explicit batch merge route and response support when metadata is present", () => {
+		const result = getChapterBatchMergeCapability({
+			chapters: {
+				batchMerge: {
+					supported: true,
+					routes: { start: true },
+				},
+			},
+		});
+
+		expect(result.supported).toBe(true);
+		expect(result.startRouteSupported).toBe(true);
+		expect(result.sessionRouteSupported).toBe(false);
+		expect(result.mergeSessionIdResponse).toBe(false);
+		expect(result.targetChapterIdResponse).toBe(false);
+		expect(result.createdTargetResponse).toBe(false);
+		expect(result.statusResponse).toBe(false);
+		expect(result.decisionWs).toBe(false);
+		expect(result.staleSessionCleanup).toBe(false);
+		expect(result.createdTargetRollback).toBe(false);
+	});
+
+	test("respects explicit unsupported batch merge capability", () => {
+		const capabilities: RuntimeCapabilities = {
+			chapters: {
+				batchMerge: {
+					supported: false,
+					reason: "batch merge unavailable",
+					routes: { start: true, session: true },
+				},
+			},
+		};
+
+		const result = getChapterBatchMergeCapability(capabilities);
+
+		expect(result.supported).toBe(false);
+		expect(result.reason).toBe("batch merge unavailable");
+		expect(result.startRouteSupported).toBe(false);
+		expect(result.sessionRouteSupported).toBe(false);
+		expect(result.mergeSessionIdResponse).toBe(false);
+		expect(result.decisionWs).toBe(false);
+	});
+
+	test("preserves Go async merge-session capability details", () => {
+		const result = getChapterBatchMergeCapability({
+			chapters: {
+				batchMerge: {
+					supported: true,
+					fallback: false,
+					mode: "async-merge-session",
+					routes: { start: true, session: true },
+					response: {
+						mergeSessionId: true,
+						targetChapterId: true,
+						createdTarget: true,
+						status: true,
+					},
+					events: ["merge:started", "merge:conflict", "merge:completed"],
+					decisionWs: true,
+					staleSessionCleanup: true,
+					createdTargetRollback: true,
+					frontendCompletionMode: "progress-event-or-session-poll",
+				},
+			},
+		});
+
+		expect(result).toEqual({
+			supported: true,
+			reason: undefined,
+			mode: "async-merge-session",
+			startRouteSupported: true,
+			sessionRouteSupported: true,
+			mergeSessionIdResponse: true,
+			targetChapterIdResponse: true,
+			createdTargetResponse: true,
+			statusResponse: true,
+			decisionWs: true,
+			staleSessionCleanup: true,
+			createdTargetRollback: true,
+			frontendCompletionMode: "progress-event-or-session-poll",
+			events: ["merge:started", "merge:conflict", "merge:completed"],
+		});
+	});
+});
+
+describe("getChapterSplitCapability", () => {
+	test("defaults to unsupported when split capability is absent", () => {
+		const result = getChapterSplitCapability(undefined);
+
+		expect(result).toEqual({
+			supported: false,
+			reason: undefined,
+			mode: undefined,
+			compressedAISummarySupported: false,
+			compressedAISummaryFallback: false,
+			compressedAISummaryMode: undefined,
+			compressedAISummaryReason: undefined,
+		});
 	});
 
 	test("respects explicit unsupported split capability", () => {
@@ -195,7 +336,8 @@ describe("getChapterSplitCapability", () => {
 		expect(result).toEqual({
 			supported: false,
 			reason: "split unavailable",
-			compressedAISummarySupported: true,
+			mode: undefined,
+			compressedAISummarySupported: false,
 			compressedAISummaryFallback: false,
 			compressedAISummaryMode: undefined,
 			compressedAISummaryReason: undefined,
@@ -218,7 +360,76 @@ describe("getChapterSplitCapability", () => {
 		expect(result).toEqual({
 			supported: false,
 			reason: "split route disabled",
-			compressedAISummarySupported: true,
+			mode: undefined,
+			compressedAISummarySupported: false,
+			compressedAISummaryFallback: false,
+			compressedAISummaryMode: undefined,
+			compressedAISummaryReason: undefined,
+		});
+	});
+
+	test("requires explicit split support even when splitAtCommit route metadata is present", () => {
+		const result = getChapterSplitCapability({
+			chapters: {
+				split: {
+					mode: "split-at-commit",
+					routes: { splitAtCommit: true },
+				},
+			},
+		});
+
+		expect(result).toEqual({
+			supported: false,
+			reason: undefined,
+			mode: "split-at-commit",
+			compressedAISummarySupported: false,
+			compressedAISummaryFallback: false,
+			compressedAISummaryMode: undefined,
+			compressedAISummaryReason: undefined,
+		});
+	});
+
+	test("disables split when splitAtCommit route metadata is absent", () => {
+		const capabilities: RuntimeCapabilities = {
+			chapters: {
+				split: {
+					supported: true,
+					mode: "split-at-commit",
+				},
+			},
+		};
+
+		const result = getChapterSplitCapability(capabilities);
+
+		expect(result).toEqual({
+			supported: false,
+			reason: undefined,
+			mode: "split-at-commit",
+			compressedAISummarySupported: false,
+			compressedAISummaryFallback: false,
+			compressedAISummaryMode: undefined,
+			compressedAISummaryReason: undefined,
+		});
+	});
+
+	test("does not assume compressed summary support when partial metadata is absent", () => {
+		const capabilities: RuntimeCapabilities = {
+			chapters: {
+				split: {
+					supported: true,
+					mode: "split-at-commit",
+					routes: { splitAtCommit: true },
+				},
+			},
+		};
+
+		const result = getChapterSplitCapability(capabilities);
+
+		expect(result).toEqual({
+			supported: true,
+			reason: undefined,
+			mode: "split-at-commit",
+			compressedAISummarySupported: false,
 			compressedAISummaryFallback: false,
 			compressedAISummaryMode: undefined,
 			compressedAISummaryReason: undefined,
@@ -230,6 +441,7 @@ describe("getChapterSplitCapability", () => {
 			chapters: {
 				split: {
 					supported: true,
+					mode: "split-at-commit",
 					routes: { splitAtCommit: true },
 					partials: {
 						compressedAISummary: {
@@ -248,6 +460,7 @@ describe("getChapterSplitCapability", () => {
 		expect(result).toEqual({
 			supported: true,
 			reason: undefined,
+			mode: "split-at-commit",
 			compressedAISummarySupported: false,
 			compressedAISummaryFallback: true,
 			compressedAISummaryMode: "deterministic-summary-placeholder",
@@ -267,6 +480,27 @@ describe("getChapterContainersCapability", () => {
 		expect(result.routes.stop).toBe(true);
 		expect(result.routes.logs).toBe(true);
 		expect(result.runtime.backgroundStart).toBeUndefined();
+		expect(result.ports.legacyHostPortAllocation).toBeUndefined();
+		expect(result.proxy.reverseProxyServer).toBeUndefined();
+	});
+
+	test("requires explicit chapter container route support when metadata is present", () => {
+		const result = getChapterContainersCapability({
+			chapters: {
+				containers: {
+					supported: true,
+					routes: { list: true, logs: true },
+				},
+			},
+		});
+
+		expect(result.supported).toBe(true);
+		expect(result.routes.list).toBe(true);
+		expect(result.routes.logs).toBe(true);
+		expect(result.routes.start).toBe(false);
+		expect(result.routes.stop).toBe(false);
+		expect(result.routes.pause).toBe(false);
+		expect(result.routes.remove).toBe(false);
 	});
 
 	test("respects explicit unsupported chapter container capability", () => {
@@ -288,6 +522,8 @@ describe("getChapterContainersCapability", () => {
 		expect(result.routes.stop).toBe(false);
 		expect(result.routes.logs).toBe(false);
 		expect(result.runtime.backgroundStart).toBeUndefined();
+		expect(result.ports.portRelease).toBeUndefined();
+		expect(result.proxy.http).toBeUndefined();
 	});
 
 	test("preserves per-route chapter container capabilities", () => {
@@ -312,6 +548,19 @@ describe("getChapterContainersCapability", () => {
 						streamingLogs: true,
 						perChapterLock: true,
 					},
+					ports: {
+						legacyHostPortAllocation: true,
+						portRelease: true,
+					},
+					proxy: {
+						metadataSupported: true,
+						requiresPastaPasst: true,
+						overridePortsReset: true,
+						reverseProxyServer: true,
+						http: true,
+						websocket: true,
+						dynamicSettingsHook: true,
+					},
 				},
 			},
 		});
@@ -322,7 +571,7 @@ describe("getChapterContainersCapability", () => {
 		expect(result.routes.stop).toBe(true);
 		expect(result.routes.logs).toBe(false);
 		expect(result.routes.remove).toBe(false);
-		expect(result.routes.pause).toBe(true);
+		expect(result.routes.pause).toBe(false);
 		expect(result.runtime).toEqual({
 			podmanCompose: true,
 			podmanComposeFallbackCommand: true,
@@ -333,6 +582,16 @@ describe("getChapterContainersCapability", () => {
 			streamingLogs: true,
 			perChapterLock: true,
 		});
+		expect(result.ports).toEqual({ legacyHostPortAllocation: true, portRelease: true });
+		expect(result.proxy).toEqual({
+			metadataSupported: true,
+			requiresPastaPasst: true,
+			overridePortsReset: true,
+			reverseProxyServer: true,
+			http: true,
+			websocket: true,
+			dynamicSettingsHook: true,
+		});
 	});
 });
 
@@ -342,6 +601,15 @@ describe("getProviderModelRefreshCapability", () => {
 
 		expect(result.supported).toBe(true);
 		expect(result.reason).toBeUndefined();
+	});
+
+	test("requires explicit model refresh support when provider metadata is present", () => {
+		const result = getProviderModelRefreshCapability(
+			{ providers: { openai: { models: {} } } },
+			"openai",
+		);
+
+		expect(result).toEqual({ supported: false, reason: undefined });
 	});
 
 	test("respects explicit unsupported refresh capability", () => {
@@ -387,6 +655,28 @@ describe("getVNetCapability", () => {
 			mode: undefined,
 			ws: true,
 			peerCleanup: true,
+			udpRendezvous: false,
+			udpRendezvousReason: undefined,
+		});
+	});
+
+	test("requires explicit VNet relay support when capability payload is present", () => {
+		expect(getVNetCapability({})).toEqual({
+			supported: false,
+			reason: undefined,
+			mode: undefined,
+			ws: false,
+			peerCleanup: false,
+			udpRendezvous: false,
+			udpRendezvousReason: undefined,
+		});
+
+		expect(getVNetCapability({ vnet: { supported: true, ws: true } })).toEqual({
+			supported: true,
+			reason: undefined,
+			mode: undefined,
+			ws: true,
+			peerCleanup: false,
 			udpRendezvous: false,
 			udpRendezvousReason: undefined,
 		});
@@ -438,6 +728,50 @@ describe("getUpdateCapability", () => {
 		});
 	});
 
+	test("requires explicit update download/apply support when capability payload is present", () => {
+		expect(getUpdateCapability({})).toEqual({
+			selfUpdateAvailable: false,
+			manualOnly: false,
+			canAutoRestart: false,
+			download: {
+				supported: false,
+				reason: undefined,
+				sse: false,
+				sha512: false,
+				maxBytes: undefined,
+				trustMode: undefined,
+			},
+			apply: {
+				supported: false,
+				reason: undefined,
+				handoff: undefined,
+			},
+		});
+
+		expect(
+			getUpdateCapability({
+				update: { download: { supported: true, sse: true } },
+			}),
+		).toEqual({
+			selfUpdateAvailable: false,
+			manualOnly: false,
+			canAutoRestart: false,
+			download: {
+				supported: true,
+				reason: undefined,
+				sse: true,
+				sha512: false,
+				maxBytes: undefined,
+				trustMode: undefined,
+			},
+			apply: {
+				supported: false,
+				reason: undefined,
+				handoff: undefined,
+			},
+		});
+	});
+
 	test("preserves manual-only update fallback", () => {
 		const capabilities: RuntimeCapabilities = {
 			update: {
@@ -449,7 +783,7 @@ describe("getUpdateCapability", () => {
 					sse: true,
 					sha512: true,
 					maxBytes: 512,
-					trustMode: "client-or-env-manifest-url",
+					trustMode: "server-configured-trusted-source",
 				},
 				apply: {
 					supported: false,
@@ -468,11 +802,43 @@ describe("getUpdateCapability", () => {
 				sse: true,
 				sha512: true,
 				maxBytes: 512,
-				trustMode: "client-or-env-manifest-url",
+				trustMode: "server-configured-trusted-source",
 			},
 			apply: {
 				supported: false,
 				reason: "no handoff manager",
+				handoff: undefined,
+			},
+		});
+	});
+
+	test("treats partial manual-only update metadata as non-auto-applicable", () => {
+		const capabilities: RuntimeCapabilities = {
+			update: {
+				manualOnly: true,
+				download: {
+					supported: true,
+					sse: true,
+					sha512: true,
+				},
+			},
+		};
+
+		expect(getUpdateCapability(capabilities)).toEqual({
+			selfUpdateAvailable: false,
+			manualOnly: true,
+			canAutoRestart: false,
+			download: {
+				supported: true,
+				reason: undefined,
+				sse: true,
+				sha512: true,
+				maxBytes: undefined,
+				trustMode: undefined,
+			},
+			apply: {
+				supported: false,
+				reason: undefined,
 				handoff: undefined,
 			},
 		});
@@ -491,10 +857,37 @@ describe("getGatewayCapability", () => {
 		expect(result.platformUnsupportedReason("weixin")).toBeUndefined();
 	});
 
+	test("requires explicit gateway platform support when capability payload is present", () => {
+		const result = getGatewayCapability({});
+
+		expect(result.persistentRuntimes).toBe(false);
+		expect(result.weixinQrSupported).toBe(false);
+		expect(result.webhookSupported).toBe(false);
+		expect(result.isPlatformSupported("webhook")).toBe(false);
+		expect(result.isPlatformSupported("telegram")).toBe(false);
+		expect(result.isPlatformSupported("weixin")).toBe(false);
+	});
+
+	test("does not assume persistent runtimes or Weixin QR when gateway metadata is partial", () => {
+		const result = getGatewayCapability({
+			gateway: {
+				webhook: { supported: true },
+			},
+		});
+
+		expect(result.persistentRuntimes).toBe(false);
+		expect(result.weixinQrSupported).toBe(false);
+		expect(result.webhookSupported).toBe(true);
+		expect(result.isPlatformSupported("webhook")).toBe(true);
+		expect(result.isPlatformSupported("telegram")).toBe(false);
+		expect(result.isPlatformSupported("weixin")).toBe(false);
+	});
+
 	test("preserves Go gateway platform limits and disabled Weixin QR metadata", () => {
 		const capabilities: RuntimeCapabilities = {
 			gateway: {
 				persistentRuntimes: true,
+				webhook: { supported: true },
 				supportedPlatforms: ["telegram", "webhook"],
 				unsupportedPlatforms: { weixin: "QR/runtime not implemented" },
 				weixinQr: { supported: false, reason: "QR runtime unavailable" },
@@ -517,7 +910,9 @@ describe("getGatewayCapability", () => {
 	});
 
 	test("falls back to webhook only when persistent runtimes are disabled", () => {
-		const result = getGatewayCapability({ gateway: { persistentRuntimes: false } });
+		const result = getGatewayCapability({
+			gateway: { persistentRuntimes: false, webhook: { supported: true } },
+		});
 
 		expect(result.persistentRuntimes).toBe(false);
 		expect(result.webhookSupported).toBe(true);
@@ -544,6 +939,29 @@ describe("getNarratorBrowserSessionsCapability", () => {
 	test("defaults browser sessions to supported", () => {
 		expect(getNarratorBrowserSessionsCapability(undefined)).toEqual({
 			supported: true,
+			reason: undefined,
+			defaultEnabled: undefined,
+			runtime: undefined,
+			storage: undefined,
+			cutover: undefined,
+			rollback: undefined,
+			narratorBound: undefined,
+			lifecycleEvents: undefined,
+			artifactPersistence: undefined,
+			resourceLimits: undefined,
+			requiresChrome: undefined,
+		});
+	});
+
+	test("requires explicit browser session support when narrator capability metadata is present", () => {
+		expect(
+			getNarratorBrowserSessionsCapability({
+				narrator: {
+					planMode: { supported: true },
+				},
+			}),
+		).toEqual({
+			supported: false,
 			reason: undefined,
 			defaultEnabled: undefined,
 			runtime: undefined,
@@ -654,6 +1072,16 @@ describe("getProviderRouteCapability", () => {
 		});
 	});
 
+	test("requires explicit provider route support when provider metadata is present", () => {
+		expect(
+			getProviderRouteCapability(
+				{ providers: { codex: { routes: { supported: true } } } },
+				"codex",
+				"credentialDelete",
+			),
+		).toEqual({ supported: false, reason: undefined });
+	});
+
 	test("disables a route when the provider route group is unsupported", () => {
 		expect(
 			getProviderRouteCapability(
@@ -689,8 +1117,23 @@ describe("getProviderRouteCapability", () => {
 			reason: undefined,
 		});
 		expect(getProviderRouteCapability(capabilities, "codex", "status")).toEqual({
-			supported: true,
-			reason: undefined,
+			supported: false,
+			reason: "usage route unavailable",
+		});
+	});
+
+	test("uses route-specific unsupported reasons when present", () => {
+		const capabilities: RuntimeCapabilities = {
+			providers: {
+					routes: {
+						supported: true,
+						chat: false,
+					},
+				},
+			},
+		};
+
+			supported: false,
 		});
 	});
 });
@@ -780,6 +1223,16 @@ describe("getNarratorPlanModeCapability", () => {
 		});
 	});
 
+	test("requires explicit plan mode support when capability metadata is present", () => {
+		expect(getNarratorPlanModeCapability({ narrator: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			api: undefined,
+			toolReflection: undefined,
+			previousModeRestore: undefined,
+		});
+	});
+
 	test("preserves unsupported plan mode metadata", () => {
 		const capabilities: RuntimeCapabilities = {
 			narrator: {
@@ -803,6 +1256,130 @@ describe("getNarratorPlanModeCapability", () => {
 	});
 });
 
+describe("getNarratorDeleteCapability", () => {
+	test("defaults narrator deletion to supported for older backends", () => {
+		expect(getNarratorDeleteCapability(undefined)).toEqual({
+			supported: true,
+			reason: undefined,
+			code: undefined,
+			feature: undefined,
+		});
+	});
+
+	test("requires explicit delete support when narrator capability metadata is present", () => {
+		const capabilities: RuntimeCapabilities = {
+			narrator: {
+				planMode: { supported: true },
+			},
+		};
+
+		expect(getNarratorDeleteCapability(capabilities)).toEqual({
+			supported: false,
+			reason: undefined,
+			code: undefined,
+			feature: undefined,
+		});
+	});
+
+	test("preserves disabled narrator deletion metadata", () => {
+		const capabilities: RuntimeCapabilities = {
+			narrator: {
+				delete: {
+					supported: false,
+					code: "FEATURE_DISABLED",
+					feature: "narrators.delete",
+					reason: "safe deletion unavailable",
+				},
+			},
+		};
+
+		expect(getNarratorDeleteCapability(capabilities)).toEqual({
+			supported: false,
+			reason: "safe deletion unavailable",
+			code: "FEATURE_DISABLED",
+			feature: "narrators.delete",
+		});
+	});
+});
+
+describe("getNarratorRollbackEditRegenerateCapability", () => {
+	test("defaults rollback/edit-regenerate to supported for older backends", () => {
+		expect(getNarratorRollbackEditRegenerateCapability(undefined)).toEqual({
+			supported: true,
+			reason: undefined,
+			rollback: undefined,
+			editAndRegenerate: undefined,
+			copyOnWrite: undefined,
+			messageRefTruncation: undefined,
+			fileStateRebuild: undefined,
+			toolCallInvalidation: undefined,
+			agentRerun: undefined,
+			optionalFileRevert: undefined,
+			optionalAgentRerun: undefined,
+			wsEvents: undefined,
+		});
+	});
+
+	test("requires explicit rollback/edit-regenerate support when narrator metadata is present", () => {
+		expect(
+			getNarratorRollbackEditRegenerateCapability({
+				narrator: {
+					planMode: { supported: true },
+				},
+			}),
+		).toEqual({
+			supported: false,
+			reason: undefined,
+			rollback: undefined,
+			editAndRegenerate: undefined,
+			copyOnWrite: undefined,
+			messageRefTruncation: undefined,
+			fileStateRebuild: undefined,
+			toolCallInvalidation: undefined,
+			agentRerun: undefined,
+			optionalFileRevert: undefined,
+			optionalAgentRerun: undefined,
+			wsEvents: undefined,
+		});
+	});
+
+	test("preserves supported rollback/edit-regenerate metadata", () => {
+		expect(
+			getNarratorRollbackEditRegenerateCapability({
+				narrator: {
+					rollbackEditRegenerate: {
+						supported: true,
+						reason: "active rollback routes",
+						rollback: true,
+						editAndRegenerate: true,
+						copyOnWrite: true,
+						messageRefTruncation: true,
+						fileStateRebuild: true,
+						toolCallInvalidation: true,
+						agentRerun: true,
+						optionalFileRevert: true,
+						optionalAgentRerun: true,
+						wsEvents: true,
+					},
+				},
+			}),
+		).toEqual({
+			supported: true,
+			reason: "active rollback routes",
+			rollback: true,
+			editAndRegenerate: true,
+			copyOnWrite: true,
+			messageRefTruncation: true,
+			fileStateRebuild: true,
+			toolCallInvalidation: true,
+			agentRerun: true,
+			optionalFileRevert: true,
+			optionalAgentRerun: true,
+			wsEvents: true,
+		});
+	});
+});
+
 describe("getNarratorRetryRecoveryCapability", () => {
 	test("defaults to supported when retry recovery capability is absent", () => {
 		expect(getNarratorRetryRecoveryCapability(undefined)).toEqual({
@@ -814,6 +1391,36 @@ describe("getNarratorRetryRecoveryCapability", () => {
 			manualOverride: undefined,
 			rollback: undefined,
 			editAndRegenerate: undefined,
+		});
+	});
+
+	test("requires explicit retry recovery support and action flags when metadata is present", () => {
+		expect(
+			getNarratorRetryRecoveryCapability({
+				narrator: {
+					retryRecovery: { supported: true, retry: true },
+				},
+			}),
+		).toEqual({
+			supported: true,
+			reason: undefined,
+			retry: true,
+			continue: false,
+			interrupt: false,
+			manualOverride: false,
+			rollback: false,
+			editAndRegenerate: false,
+		});
+
+		expect(getNarratorRetryRecoveryCapability({ narrator: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			retry: false,
+			continue: false,
+			interrupt: false,
+			manualOverride: false,
+			rollback: false,
+			editAndRegenerate: false,
 		});
 	});
 
@@ -859,6 +1466,34 @@ describe("getNarratorPermissionsCapability", () => {
 		});
 	});
 
+	test("requires explicit narrator permission support and actions when metadata is present", () => {
+		expect(getNarratorPermissionsCapability({ narrator: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			modes: [],
+			approveDeny: false,
+			updatedInput: false,
+			pauseResume: undefined,
+			reflections: [],
+		});
+
+		expect(
+			getNarratorPermissionsCapability({
+				narrator: {
+					permissions: { supported: true, modes: ["default"], approveDeny: true },
+				},
+			}),
+		).toEqual({
+			supported: true,
+			reason: undefined,
+			modes: ["default"],
+			approveDeny: true,
+			updatedInput: false,
+			pauseResume: undefined,
+			reflections: [],
+		});
+	});
+
 	test("preserves explicit permission mode restrictions", () => {
 		const capabilities: RuntimeCapabilities = {
 			narrator: {
@@ -897,6 +1532,36 @@ describe("getNarratorReviewToolsCapability", () => {
 			dismiss: true,
 			convertToSubagent: true,
 			staleMergeGuard: true,
+		});
+	});
+
+	test("requires explicit review tool support and actions when metadata is present", () => {
+		expect(getNarratorReviewToolsCapability({ narrator: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			concludeReview: false,
+			feedbackInjection: false,
+			promote: false,
+			dismiss: false,
+			convertToSubagent: false,
+			staleMergeGuard: false,
+		});
+
+		expect(
+			getNarratorReviewToolsCapability({
+				narrator: {
+					reviewTools: { supported: true, concludeReview: true, promote: true },
+				},
+			}),
+		).toEqual({
+			supported: true,
+			reason: undefined,
+			concludeReview: true,
+			feedbackInjection: false,
+			promote: true,
+			dismiss: false,
+			convertToSubagent: false,
+			staleMergeGuard: false,
 		});
 	});
 
@@ -949,6 +1614,54 @@ describe("getNarratorSubagentsCapability", () => {
 			reattachReason: undefined,
 			backgroundResultInjection: true,
 			staleRecovery: true,
+		});
+	});
+
+	test("requires explicit subagent support and runtime actions when metadata is present", () => {
+		expect(getNarratorSubagentsCapability({ narrator: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			foreground: false,
+			background: false,
+			awaitAgent: false,
+			awaitBash: false,
+			awaitBashWaitForText: false,
+			awaitBashReason: undefined,
+			send: false,
+			teamStatus: false,
+			detachAttach: false,
+			detachUnblocksParent: false,
+			reattachBlocksParent: false,
+			reattachFallback: false,
+			reattachReason: undefined,
+			backgroundResultInjection: false,
+			staleRecovery: false,
+		});
+
+		expect(
+			getNarratorSubagentsCapability({
+				narrator: {
+					subagents: { supported: true, foreground: true, background: true },
+				},
+			}),
+		).toEqual({
+			supported: true,
+			reason: undefined,
+			foreground: true,
+			background: true,
+			awaitAgent: false,
+			awaitBash: false,
+			awaitBashWaitForText: false,
+			awaitBashReason: undefined,
+			send: false,
+			teamStatus: false,
+			detachAttach: false,
+			detachUnblocksParent: false,
+			reattachBlocksParent: false,
+			reattachFallback: false,
+			reattachReason: undefined,
+			backgroundResultInjection: false,
+			staleRecovery: false,
 		});
 	});
 
@@ -1026,6 +1739,15 @@ describe("getProviderAgentModeCapability", () => {
 		expect(result.reason).toBeUndefined();
 	});
 
+	test("requires explicit provider agent mode support when provider metadata is present", () => {
+		const result = getProviderAgentModeCapability(
+			{ providers: { openai: { agentMode: {} } } },
+			"openai",
+		);
+
+		expect(result).toEqual({ supported: false, reason: undefined });
+	});
+
 	test("respects explicit unsupported provider agent mode capability", () => {
 		const capabilities: RuntimeCapabilities = {
 			providers: {
@@ -1052,6 +1774,12 @@ describe("getProviderQuotaCapability", () => {
 		expect(result.reason).toBeUndefined();
 	});
 
+	test("requires explicit provider quota support when provider metadata is present", () => {
+		const result = getProviderQuotaCapability({ providers: { nug: { quota: {} } } }, "nug");
+
+		expect(result).toEqual({ supported: false, reason: undefined });
+	});
+
 	test("respects explicit unsupported provider quota capability", () => {
 		const capabilities: RuntimeCapabilities = {
 			providers: {
@@ -1074,6 +1802,16 @@ describe("getNarratorCompactCapability", () => {
 	test("defaults to supported when compact capability is absent", () => {
 		expect(getNarratorCompactCapability(undefined)).toEqual({
 			supported: true,
+			reason: undefined,
+			mode: undefined,
+			fallbackSummary: undefined,
+			fallbackReason: undefined,
+		});
+	});
+
+	test("requires explicit compact support when narrator metadata is present", () => {
+		expect(getNarratorCompactCapability({ narrator: {} })).toEqual({
+			supported: false,
 			reason: undefined,
 			mode: undefined,
 			fallbackSummary: undefined,
@@ -1117,6 +1855,46 @@ describe("getNarratorToolInventoryCapability", () => {
 		expect(result.browser.traceFileOutput).toBe(true);
 	});
 
+	test("requires explicit tool inventory and optional tool support when metadata is present", () => {
+		expect(getNarratorToolInventoryCapability({ narrator: {} })).toMatchObject({
+			supported: false,
+			supportedOptionalTools: [],
+			unsupportedOptionalTools: [],
+			webFetch: { supported: false },
+			browser: {
+				supported: false,
+				sharePreview: false,
+				imageContentBlock: false,
+				fileOutput: false,
+				traceShare: false,
+				traceFileOutput: false,
+			},
+		});
+
+		expect(
+			getNarratorToolInventoryCapability({
+				narrator: {
+					toolInventory: {
+						supported: true,
+						webFetch: { supported: true },
+						browser: { supported: true, fileOutput: true },
+					},
+				},
+			}),
+		).toMatchObject({
+			supported: true,
+			webFetch: { supported: true },
+			browser: {
+				supported: true,
+				sharePreview: false,
+				imageContentBlock: false,
+				fileOutput: true,
+				traceShare: false,
+				traceFileOutput: false,
+			},
+		});
+	});
+
 	test("preserves supported and unsupported optional tool lists", () => {
 		const capabilities: RuntimeCapabilities = {
 			narrator: {
@@ -1138,6 +1916,7 @@ describe("getNarratorToolInventoryCapability", () => {
 		const capabilities: RuntimeCapabilities = {
 			narrator: {
 				toolInventory: {
+					supported: true,
 					webFetch: {
 						supported: true,
 						parity: "partial",
@@ -1172,6 +1951,7 @@ describe("getNarratorToolInventoryCapability", () => {
 		const result = getNarratorToolInventoryCapability({
 			narrator: {
 				toolInventory: {
+					supported: true,
 					browser: {
 						supported: true,
 						parity: "partial",
@@ -1215,6 +1995,13 @@ describe("getMcpServerSettingsStorageCapability", () => {
 		});
 	});
 
+	test("requires explicit MCP server settings storage support when MCP metadata is present", () => {
+		expect(getMcpServerSettingsStorageCapability({ mcp: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+		});
+	});
+
 	test("preserves disabled MCP server settings storage metadata", () => {
 		expect(
 			getMcpServerSettingsStorageCapability({
@@ -1233,6 +2020,16 @@ describe("getMcpExternalToolsCapability", () => {
 	test("defaults external MCP tools injection to supported", () => {
 		expect(getMcpExternalToolsCapability(undefined)).toEqual({
 			supported: true,
+			reason: undefined,
+			parity: undefined,
+			transport: undefined,
+			lifecycle: undefined,
+		});
+	});
+
+	test("requires explicit external MCP tools injection support when MCP metadata is present", () => {
+		expect(getMcpExternalToolsCapability({ mcp: {} })).toEqual({
+			supported: false,
 			reason: undefined,
 			parity: undefined,
 			transport: undefined,
@@ -1274,6 +2071,16 @@ describe("getMcpExternalServerManagementCapability", () => {
 		});
 	});
 
+	test("requires explicit external server management support when MCP metadata is present", () => {
+		expect(getMcpExternalServerManagementCapability({ mcp: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			storage: undefined,
+			permissions: false,
+			import: false,
+		});
+	});
+
 	test("preserves disabled server management metadata", () => {
 		const capabilities: RuntimeCapabilities = {
 			mcp: {
@@ -1309,6 +2116,20 @@ describe("getMcpProtocolCapability", () => {
 			},
 			toolsList: { supported: true, reason: undefined, source: undefined },
 			toolsCall: { supported: true, reason: undefined, scope: undefined },
+		});
+	});
+
+	test("requires explicit MCP protocol/list/call support when MCP metadata is present", () => {
+		expect(getMcpProtocolCapability({ mcp: {} })).toEqual({
+			builtinProtocol: {
+				supported: false,
+				reason: undefined,
+				initialize: undefined,
+				toolsList: undefined,
+				toolsCall: undefined,
+			},
+			toolsList: { supported: false, reason: undefined, source: undefined },
+			toolsCall: { supported: false, reason: undefined, scope: undefined },
 		});
 	});
 
@@ -1365,6 +2186,15 @@ describe("getMcpBuiltinToolsCapability", () => {
 		});
 	});
 
+	test("requires explicit built-in MCP tools support when MCP metadata is present", () => {
+		expect(getMcpBuiltinToolsCapability({ mcp: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+			parity: undefined,
+			missing: [],
+		});
+	});
+
 	test("preserves partial parity missing built-in MCP tool fields", () => {
 		const capabilities: RuntimeCapabilities = {
 			mcp: {
@@ -1389,6 +2219,16 @@ describe("getMcpExternalAgentCapability", () => {
 	test("defaults to supported when external agent capability is absent", () => {
 		expect(getMcpExternalAgentCapability(undefined)).toEqual({
 			supported: true,
+			reason: undefined,
+			parity: undefined,
+			transport: undefined,
+			lifecycle: undefined,
+		});
+	});
+
+	test("requires explicit external MCP agent injection support when MCP metadata is present", () => {
+		expect(getMcpExternalAgentCapability({ mcp: {} })).toEqual({
+			supported: false,
 			reason: undefined,
 			parity: undefined,
 			transport: undefined,
@@ -1429,6 +2269,20 @@ describe("getMcpTransportsCapability", () => {
 		expect(result.streamableHttp.supported).toBe(true);
 	});
 
+	test("requires explicit MCP transport support when capability metadata is present", () => {
+		const capabilities: RuntimeCapabilities = {
+			mcp: {
+				builtinProtocol: { supported: true },
+			},
+		};
+
+		const result = getMcpTransportsCapability(capabilities);
+
+		expect(result.stdio).toEqual({ supported: false, reason: undefined });
+		expect(result.sse).toEqual({ supported: false, reason: undefined });
+		expect(result.streamableHttp).toEqual({ supported: false, reason: undefined });
+	});
+
 	test("preserves unsupported SSE and streamable HTTP transport capabilities", () => {
 		const capabilities: RuntimeCapabilities = {
 			mcp: {
@@ -1460,6 +2314,18 @@ describe("getSettingsFeatureCapability", () => {
 			providerModelAugmentation: true,
 			tlsGeneration: true,
 			retryRules: true,
+		});
+	});
+
+	test("requires explicit settings feature support when capability metadata is present", () => {
+		expect(getSettingsFeatureCapability({ settings: {} })).toEqual({
+			storageSupported: false,
+			storagePath: undefined,
+			patchSupported: false,
+			secretMasking: false,
+			providerModelAugmentation: false,
+			tlsGeneration: false,
+			retryRules: false,
 		});
 	});
 
@@ -1525,6 +2391,13 @@ describe("getBenchmarkContainerExecutionCapability", () => {
 		});
 	});
 
+	test("requires explicit benchmark container execution support when benchmark metadata is present", () => {
+		expect(getBenchmarkContainerExecutionCapability({ benchmark: {} })).toEqual({
+			supported: false,
+			reason: undefined,
+		});
+	});
+
 	test("preserves disabled benchmark container execution metadata", () => {
 		expect(
 			getBenchmarkContainerExecutionCapability({
@@ -1551,6 +2424,18 @@ describe("getRuntimeMaintenanceCapability", () => {
 		expect(result.cleanup.containers.supported).toBe(true);
 		expect(result.cleanup.browsers.supported).toBe(true);
 		expect(result.cleanup.worktrees.supported).toBe(true);
+	});
+
+	test("requires explicit runtime maintenance support when runtime metadata is present", () => {
+		const result = getRuntimeMaintenanceCapability({ runtime: { backend: "go" } });
+
+		expect(result.backend).toBe("go");
+		expect(result.scanSupported).toBe(false);
+		expect(result.cachedSupported).toBe(false);
+		expect(result.cleanup.terminals.supported).toBe(false);
+		expect(result.cleanup.containers.supported).toBe(false);
+		expect(result.cleanup.browsers.supported).toBe(false);
+		expect(result.cleanup.worktrees.supported).toBe(false);
 	});
 
 	test("respects explicit unsupported runtime maintenance capabilities", () => {
@@ -1586,7 +2471,7 @@ describe("getRuntimeMaintenanceCapability", () => {
 			reason: "browser cleanup disabled",
 			mode: "preview",
 		});
-		expect(result.cleanup.containers.supported).toBe(true);
+		expect(result.cleanup.containers.supported).toBe(false);
 		expect(result.cleanup.worktrees.supported).toBe(false);
 		expect(result.cleanup.worktrees.reason).toBe("worktree cleanup disabled");
 	});
@@ -1595,6 +2480,13 @@ describe("getRuntimeMaintenanceCapability", () => {
 describe("getStorageDatabasePreviewCapability", () => {
 	test("defaults database preview to supported for older backends", () => {
 		expect(getStorageDatabasePreviewCapability(undefined)).toEqual({ supported: true });
+	});
+
+	test("requires explicit database preview support when storage metadata is present", () => {
+		expect(getStorageDatabasePreviewCapability({ storage: {} })).toEqual({ supported: false });
+		expect(
+			getStorageDatabasePreviewCapability({ storage: { database: { preview: true } } }),
+		).toEqual({ supported: true });
 	});
 
 	test("respects explicit unsupported database preview capability", () => {
@@ -1613,6 +2505,16 @@ describe("getStorageDatabaseCleanupCapabilities", () => {
 		expect(result.archivedSessions.supported).toBe(true);
 		expect(result.staleSessions.supported).toBe(true);
 		expect(result.apiRequestDumps.supported).toBe(true);
+	});
+
+	test("requires explicit database cleanup target support when storage metadata is present", () => {
+		const result = getStorageDatabaseCleanupCapabilities({
+			storage: { database: { cleanup: true } },
+		});
+
+		expect(result.archivedSessions.supported).toBe(false);
+		expect(result.staleSessions.supported).toBe(false);
+		expect(result.apiRequestDumps.supported).toBe(false);
 	});
 
 	test("preserves per-target disabled cleanup capabilities", () => {
@@ -1723,6 +2625,68 @@ describe("getStorageCleanupOperationCapabilities", () => {
 		expect(result.containers.alternative).toBe("runtime.cleanup.containers");
 	});
 
+	test("consumes Go storage cleanup fallback capabilities without enabling unsafe storage actions", () => {
+		const capabilities: RuntimeCapabilities = {
+			storage: {
+				cleanup: {
+					uploads: {
+						supported: true,
+						preservesMessageImageRefs: true,
+					},
+					shares: { supported: true },
+					worktrees: {
+						supported: false,
+						fallback: true,
+						reason: "use chapter/runtime cleanup",
+						alternative: "runtime.cleanup.worktrees",
+					},
+					containers: {
+						supported: false,
+						fallback: true,
+						reason: "podman prune disabled",
+						alternative: "runtime.cleanup.containers",
+					},
+				},
+			},
+			runtime: {
+				cleanup: {
+					worktrees: { supported: true, mode: "go-extension" },
+					containers: { supported: true, mode: "stop-running-db-records" },
+				},
+			},
+		};
+
+		const result = getStorageCleanupOperationCapabilities(capabilities);
+
+		expect(result.uploads.route).toBe("storage");
+		expect(result.uploads.supported).toBe(true);
+		expect(result.uploads.preservesMessageImageRefs).toBe(true);
+		expect(result.worktrees.route).toBe("runtime");
+		expect(result.worktrees.runtimeTarget).toBe("worktrees");
+		expect(result.worktrees.supported).toBe(true);
+		expect(result.worktrees.mode).toBe("go-extension");
+		expect(result.containers.route).toBe("storage");
+		expect(result.containers.supported).toBe(false);
+		expect(result.containers.alternative).toBe("runtime.cleanup.containers");
+		expect(result.containers.reason).toBe("podman prune disabled");
+	});
+
+	test("keeps worktree cleanup disabled when runtime cleanup metadata is absent", () => {
+		const capabilities: RuntimeCapabilities = {
+			storage: {
+				cleanup: {
+					worktrees: { supported: false, reason: "storage disabled" },
+				},
+			},
+		};
+
+		const result = getStorageCleanupOperationCapabilities(capabilities);
+
+		expect(result.worktrees.route).toBe("storage");
+		expect(result.worktrees.supported).toBe(false);
+		expect(result.worktrees.reason).toBe("storage disabled");
+	});
+
 	test("keeps worktree cleanup disabled when both storage and runtime are unsupported", () => {
 		const capabilities: RuntimeCapabilities = {
 			storage: {
@@ -1754,6 +2718,17 @@ describe("getStorageCapability", () => {
 		expect(result.vacuumSupported).toBe(false);
 		expect(result.cleanup.uploads.supported).toBe(true);
 		expect(result.cleanup.uploads.preservesMessageImageRefs).toBeUndefined();
+	});
+
+	test("requires explicit storage support when storage metadata is present", () => {
+		const result = getStorageCapability({ storage: {} });
+
+		expect(result.scanSupported).toBe(false);
+		expect(result.cachedSupported).toBe(false);
+		expect(result.cleanup.uploads.supported).toBe(false);
+		expect(result.cleanup.shares.supported).toBe(false);
+		expect(result.cleanup.worktrees.supported).toBe(false);
+		expect(result.cleanup.containers.supported).toBe(false);
 	});
 
 	test("preserves upload cleanup safety metadata", () => {
@@ -1798,6 +2773,27 @@ describe("getUploadCapability", () => {
 		});
 	});
 
+	test("requires explicit upload serving support when capability payload is present", () => {
+		expect(getUploadCapability({ uploads: {} })).toEqual({
+			serveNarratorImages: { supported: false, reason: undefined },
+			serveAvatars: { supported: false, reason: undefined },
+			cleanupPreservesMessageImageRefs: { supported: false, reason: undefined },
+		});
+
+		expect(
+			getUploadCapability({
+				uploads: {
+					serveNarratorImages: { supported: true },
+					cleanupPreservesMessageImageRefs: { supported: true },
+				},
+			}),
+		).toEqual({
+			serveNarratorImages: { supported: true, reason: undefined },
+			serveAvatars: { supported: false, reason: undefined },
+			cleanupPreservesMessageImageRefs: { supported: true, reason: undefined },
+		});
+	});
+
 	test("preserves explicit unsupported upload serving capabilities", () => {
 		const capabilities: RuntimeCapabilities = {
 			uploads: {
@@ -1835,9 +2831,39 @@ describe("getShareCapability", () => {
 		});
 	});
 
+	test("requires explicit share support when capability payload is present", () => {
+		expect(getShareCapability({ shares: {} })).toEqual({
+			createSupported: false,
+			publicDownloadSupported: false,
+			previewSupported: false,
+			previewHtmlMode: undefined,
+			previewReason: undefined,
+			ephemeralOnlySupported: false,
+			ephemeralOnlyFallback: false,
+			ephemeralOnlyReason: undefined,
+		});
+
+		expect(
+			getShareCapability({
+				shares: { create: { supported: true }, preview: { supported: true } },
+			}),
+		).toEqual({
+			createSupported: true,
+			publicDownloadSupported: false,
+			previewSupported: true,
+			previewHtmlMode: undefined,
+			previewReason: undefined,
+			ephemeralOnlySupported: false,
+			ephemeralOnlyFallback: false,
+			ephemeralOnlyReason: undefined,
+		});
+	});
+
 	test("preserves disk fallback metadata for non-ephemeral shares", () => {
 		const capabilities: RuntimeCapabilities = {
 			shares: {
+				create: { supported: true },
+				publicDownload: { supported: true },
 				ephemeralOnly: {
 					supported: false,
 					fallback: true,
@@ -1870,6 +2896,22 @@ describe("getContentCapability", () => {
 
 		expect(result.projectRoutines.supported).toBe(true);
 		expect(result.projectSkills.supported).toBe(true);
+	});
+
+	test("requires explicit project content support when capability payload is present", () => {
+		expect(getContentCapability({ content: {} })).toEqual({
+			projectRoutines: { supported: false, reason: undefined, storage: undefined },
+			projectSkills: { supported: false, reason: undefined, storage: undefined },
+		});
+
+		expect(
+			getContentCapability({
+				content: { projectRoutines: { supported: true, storage: "db" } },
+			}),
+		).toEqual({
+			projectRoutines: { supported: true, reason: undefined, storage: "db" },
+			projectSkills: { supported: false, reason: undefined, storage: undefined },
+		});
 	});
 
 	test("preserves explicit unsupported project content capabilities", () => {

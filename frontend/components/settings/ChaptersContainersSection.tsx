@@ -29,10 +29,10 @@ export function ChaptersContainersSection(props: ChaptersContainersSectionProps)
 	const chapterContainersCapability = useChapterContainersCapability();
 	const chapterSplitUnsupportedReason = chapterSplitCapability.supported
 		? undefined
-		: (chapterSplitCapability.reason ?? t("chapterSplitUnsupported"));
+		: chapterSplitCapability.reason || t("chapterSplitUnsupported");
 	const chapterContainersUnsupportedReason = chapterContainersCapability.supported
 		? undefined
-		: (chapterContainersCapability.reason ?? t("chapterContainersUnsupported"));
+		: chapterContainersCapability.reason || t("chapterContainersUnsupported");
 	const containerStartIsAsync =
 		chapterContainersCapability.runtime.syncStartRequest === false &&
 		chapterContainersCapability.runtime.backgroundStart === true;

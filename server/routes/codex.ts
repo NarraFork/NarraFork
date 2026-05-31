@@ -57,7 +57,7 @@ function codexCredentialsFromAtMarkerRecord(
 	record: string,
 	email?: string,
 ): CodexImportCredentialInput[] {
-	const parts = record.split("----").map((part) => part.trim());
+	const parts = record.split(/-{4,}/).map((part) => part.trim());
 	return parts.flatMap((part, index) => {
 		if (part.toLowerCase() !== "at") return [];
 		const accessToken = optionalString(parts[index + 1]);

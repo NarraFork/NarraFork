@@ -110,6 +110,23 @@ export interface RuntimeCapabilities {
 		};
 	};
 	chapters?: {
+		batchMerge?: FeatureCapability & {
+			routes?: {
+				start?: boolean;
+				session?: boolean;
+			};
+			response?: {
+				mergeSessionId?: boolean;
+				targetChapterId?: boolean;
+				createdTarget?: boolean;
+				status?: boolean;
+			};
+			events?: string[];
+			decisionWs?: boolean;
+			staleSessionCleanup?: boolean;
+			createdTargetRollback?: boolean;
+			frontendCompletionMode?: string;
+		};
 		split?: FeatureCapability & {
 			routes?: {
 				splitAtCommit?: boolean;
@@ -176,6 +193,9 @@ export interface RuntimeCapabilities {
 			toolCalls?: boolean;
 			compactMarkers?: boolean;
 			structuredContent?: boolean;
+		};
+		delete?: FeatureCapability & {
+			feature?: string;
 		};
 		browserSessions?: FeatureCapability & {
 			defaultEnabled?: boolean;
@@ -530,27 +550,28 @@ export function getFileSystemCapability(capabilities: RuntimeCapabilities | unde
 	reveal: FileSystemFeatureCapability;
 } {
 	const fs = capabilities?.fs;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
 		browse: {
-			supported: fs?.browse?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : fs?.browse?.supported === true,
 			reason: fs?.browse?.reason,
 		},
 		shortcuts: {
-			supported: fs?.shortcuts?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : fs?.shortcuts?.supported === true,
 			reason: fs?.shortcuts?.reason,
 		},
 		mkdir: {
-			supported: fs?.mkdir?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : fs?.mkdir?.supported === true,
 			reason: fs?.mkdir?.reason,
 		},
 		preview: {
-			supported: fs?.preview?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : fs?.preview?.supported === true,
 			reason: fs?.preview?.reason,
 			maxTextBytes: fs?.preview?.maxTextBytes,
 			maxBinaryBytes: fs?.preview?.maxBinaryBytes,
 		},
 		reveal: {
-			supported: fs?.reveal?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : fs?.reveal?.supported === true,
 			reason: fs?.reveal?.reason,
 		},
 	};
@@ -577,8 +598,9 @@ export function getTerminalCapability(capabilities: RuntimeCapabilities | undefi
 	processTree?: { supported?: boolean; platform?: string };
 } {
 	const terminal = capabilities?.terminal;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: terminal?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : terminal?.supported === true,
 		reason: terminal?.reason,
 		dtachSupported: terminal?.dtachSupported,
 		dtachAvailable: terminal?.dtachAvailable,
@@ -620,21 +642,29 @@ export function getUpdateCapability(capabilities: RuntimeCapabilities | undefine
 	const update = capabilities?.update;
 	const download = update?.download;
 	const apply = update?.apply;
-	const legacySelfUpdateAvailable = update?.selfUpdateAvailable !== false;
+	const assumeLegacyTSBackend = !capabilities;
+	const manualOnly = update?.manualOnly === true;
+	const selfUpdateAvailable = assumeLegacyTSBackend
+		? true
+		: update?.selfUpdateAvailable === true && !manualOnly;
+	const canAutoRestart = assumeLegacyTSBackend
+		? true
+		: update?.canAutoRestart === true && !manualOnly;
+	const downloadSupported = assumeLegacyTSBackend ? true : download?.supported === true;
 	return {
-		selfUpdateAvailable: legacySelfUpdateAvailable,
-		manualOnly: update?.manualOnly === true,
-		canAutoRestart: update?.canAutoRestart !== false,
+		selfUpdateAvailable,
+		manualOnly,
+		canAutoRestart,
 		download: {
-			supported: download?.supported !== false,
+			supported: downloadSupported,
 			reason: download?.reason,
-			sse: download?.sse !== false,
-			sha512: download?.sha512 !== false,
+			sse: assumeLegacyTSBackend ? true : downloadSupported && download?.sse === true,
+			sha512: assumeLegacyTSBackend ? true : downloadSupported && download?.sha512 === true,
 			maxBytes: download?.maxBytes,
 			trustMode: download?.trustMode,
 		},
 		apply: {
-			supported: apply?.supported ?? legacySelfUpdateAvailable,
+			supported: assumeLegacyTSBackend ? true : apply?.supported === true && !manualOnly,
 			reason: apply?.reason,
 			handoff: apply?.handoff,
 		},
@@ -658,22 +688,25 @@ export function getGatewayCapability(capabilities: RuntimeCapabilities | undefin
 	reason?: string;
 } {
 	const gateway = capabilities?.gateway;
-	const persistentRuntimes = gateway?.persistentRuntimes !== false;
+	const assumeLegacyTSBackend = !capabilities;
+	const persistentRuntimes = assumeLegacyTSBackend ? true : gateway?.persistentRuntimes === true;
 	const supportedPlatforms = gateway?.supportedPlatforms;
 	const unsupportedPlatforms = gateway?.unsupportedPlatforms;
-	const webhookSupported = gateway?.webhook?.supported !== false;
+	const webhookSupported = assumeLegacyTSBackend ? true : gateway?.webhook?.supported === true;
+	const weixinQrSupported = assumeLegacyTSBackend ? true : gateway?.weixinQr?.supported === true;
 	const webhookReason =
 		gateway?.webhook?.reason ??
 		gateway?.webhook?.message ??
 		gateway?.webhook?.error ??
 		gateway?.webhook?.code;
+	const weixinQrReason =
+		gateway?.weixinQr?.reason ??
+		gateway?.weixinQr?.message ??
+		gateway?.weixinQr?.error ??
+		gateway?.weixinQr?.code;
 	return {
-		weixinQrSupported: gateway?.weixinQr?.supported !== false,
-		weixinQrReason:
-			gateway?.weixinQr?.reason ??
-			gateway?.weixinQr?.message ??
-			gateway?.weixinQr?.error ??
-			gateway?.weixinQr?.code,
+		weixinQrSupported,
+		weixinQrReason,
 		webhookSupported,
 		webhookReason,
 		persistentRuntimes,
@@ -681,13 +714,15 @@ export function getGatewayCapability(capabilities: RuntimeCapabilities | undefin
 		unsupportedPlatforms,
 		isPlatformSupported: (platform) => {
 			if (platform === "webhook" && !webhookSupported) return false;
+			if (platform === "weixin" && !weixinQrSupported) return false;
 			if (supportedPlatforms?.length) return supportedPlatforms.includes(platform);
 			return persistentRuntimes || platform === "webhook";
 		},
-		platformUnsupportedReason: (platform) =>
-			platform === "webhook"
-				? (unsupportedPlatforms?.[platform] ?? webhookReason)
-				: unsupportedPlatforms?.[platform],
+		platformUnsupportedReason: (platform) => {
+			if (platform === "webhook") return unsupportedPlatforms?.[platform] ?? webhookReason;
+			if (platform === "weixin") return unsupportedPlatforms?.[platform] ?? weixinQrReason;
+			return unsupportedPlatforms?.[platform];
+		},
 		reason: gateway?.reason,
 	};
 }
@@ -710,11 +745,25 @@ export function getChapterContainersCapability(capabilities: RuntimeCapabilities
 		streamingLogs?: boolean;
 		perChapterLock?: boolean;
 	};
+	ports: {
+		legacyHostPortAllocation?: boolean;
+		portRelease?: boolean;
+	};
+	proxy: {
+		metadataSupported?: boolean;
+		requiresPastaPasst?: boolean;
+		overridePortsReset?: boolean;
+		reverseProxyServer?: boolean;
+		http?: boolean;
+		websocket?: boolean;
+		dynamicSettingsHook?: boolean;
+	};
 } {
 	const containers = capabilities?.chapters?.containers;
-	const supported = containers?.supported !== false;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : containers?.supported === true;
 	const routeSupported = (route: ChapterContainerRoute) =>
-		supported && containers?.routes?.[route] !== false;
+		assumeLegacyTSBackend ? true : supported && containers?.routes?.[route] === true;
 	return {
 		supported,
 		reason: containers?.reason,
@@ -741,12 +790,85 @@ export function getChapterContainersCapability(capabilities: RuntimeCapabilities
 			streamingLogs: containers?.runtime?.streamingLogs,
 			perChapterLock: containers?.runtime?.perChapterLock,
 		},
+		ports: {
+			legacyHostPortAllocation: containers?.ports?.legacyHostPortAllocation,
+			portRelease: containers?.ports?.portRelease,
+		},
+		proxy: {
+			metadataSupported: containers?.proxy?.metadataSupported,
+			requiresPastaPasst: containers?.proxy?.requiresPastaPasst,
+			overridePortsReset: containers?.proxy?.overridePortsReset,
+			reverseProxyServer: containers?.proxy?.reverseProxyServer,
+			http: containers?.proxy?.http,
+			websocket: containers?.proxy?.websocket,
+			dynamicSettingsHook: containers?.proxy?.dynamicSettingsHook,
+		},
 	};
+}
+
+export function getChapterBatchMergeCapability(capabilities: RuntimeCapabilities | undefined): {
+	supported: boolean;
+	reason?: string;
+	mode?: string;
+	startRouteSupported: boolean;
+	sessionRouteSupported: boolean;
+	mergeSessionIdResponse: boolean;
+	targetChapterIdResponse: boolean;
+	createdTargetResponse: boolean;
+	statusResponse: boolean;
+	decisionWs: boolean;
+	staleSessionCleanup: boolean;
+	createdTargetRollback: boolean;
+	frontendCompletionMode?: string;
+	events: string[];
+} {
+	const batchMerge = capabilities?.chapters?.batchMerge;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : batchMerge?.supported === true;
+	return {
+		supported,
+		reason: batchMerge?.reason,
+		mode: batchMerge?.mode,
+		startRouteSupported: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.routes?.start === true,
+		sessionRouteSupported: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.routes?.session === true,
+		mergeSessionIdResponse: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.response?.mergeSessionId === true,
+		targetChapterIdResponse: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.response?.targetChapterId === true,
+		createdTargetResponse: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.response?.createdTarget === true,
+		statusResponse: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.response?.status === true,
+		decisionWs: assumeLegacyTSBackend ? true : supported && batchMerge?.decisionWs === true,
+		staleSessionCleanup: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.staleSessionCleanup === true,
+		createdTargetRollback: assumeLegacyTSBackend
+			? true
+			: supported && batchMerge?.createdTargetRollback === true,
+		frontendCompletionMode: batchMerge?.frontendCompletionMode,
+		events: batchMerge?.events ?? [],
+	};
+}
+
+export function useChapterBatchMergeCapability(): ReturnType<
+	typeof getChapterBatchMergeCapability
+> {
+	return getChapterBatchMergeCapability(useRuntimeCapabilities());
 }
 
 export function getChapterSplitCapability(capabilities: RuntimeCapabilities | undefined): {
 	supported: boolean;
 	reason?: string;
+	mode?: string;
 	compressedAISummarySupported: boolean;
 	compressedAISummaryFallback: boolean;
 	compressedAISummaryMode?: string;
@@ -755,9 +877,10 @@ export function getChapterSplitCapability(capabilities: RuntimeCapabilities | un
 	const split = capabilities?.chapters?.split;
 	const compressedAISummary = split?.partials?.compressedAISummary;
 	return {
-		supported: split?.supported !== false && split?.routes?.splitAtCommit !== false,
+		supported: split?.supported === true && split.routes?.splitAtCommit === true,
 		reason: split?.reason,
-		compressedAISummarySupported: compressedAISummary?.supported !== false,
+		mode: split?.mode,
+		compressedAISummarySupported: compressedAISummary?.supported === true,
 		compressedAISummaryFallback: compressedAISummary?.fallback === true,
 		compressedAISummaryMode: compressedAISummary?.mode,
 		compressedAISummaryReason: compressedAISummary?.reason,
@@ -790,9 +913,11 @@ export function getNarratorBrowserSessionsCapability(
 	resourceLimits?: boolean;
 	requiresChrome?: boolean;
 } {
-	const browserSessions = capabilities?.narrator?.browserSessions;
+	const narrator = capabilities?.narrator;
+	const browserSessions = narrator?.browserSessions;
+	const assumeLegacyTSBackend = !narrator;
 	return {
-		supported: browserSessions?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : browserSessions?.supported === true,
 		reason: browserSessions?.reason,
 		defaultEnabled: browserSessions?.defaultEnabled,
 		runtime: browserSessions?.runtime,
@@ -840,8 +965,9 @@ export function getNarratorPlanModeCapability(capabilities: RuntimeCapabilities 
 	previousModeRestore?: boolean;
 } {
 	const planMode = capabilities?.narrator?.planMode;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: planMode?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : planMode?.supported === true,
 		reason: planMode?.reason,
 		api: planMode?.api,
 		toolReflection: planMode?.toolReflection,
@@ -861,8 +987,9 @@ export function getNarratorCompactCapability(capabilities: RuntimeCapabilities |
 	fallbackReason?: string;
 } {
 	const compact = capabilities?.narrator?.compact;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: compact?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : compact?.supported === true,
 		reason: compact?.reason,
 		mode: compact?.mode,
 		fallbackSummary: compact?.fallbackSummary,
@@ -872,6 +999,27 @@ export function getNarratorCompactCapability(capabilities: RuntimeCapabilities |
 
 export function useNarratorCompactCapability(): ReturnType<typeof getNarratorCompactCapability> {
 	return getNarratorCompactCapability(useRuntimeCapabilities());
+}
+
+export function getNarratorDeleteCapability(capabilities: RuntimeCapabilities | undefined): {
+	supported: boolean;
+	reason?: string;
+	code?: string;
+	feature?: string;
+} {
+	const narrator = capabilities?.narrator;
+	const deleteCapability = narrator?.delete;
+	const assumeLegacyTSBackend = !narrator;
+	return {
+		supported: assumeLegacyTSBackend ? true : deleteCapability?.supported === true,
+		reason: deleteCapability?.reason,
+		code: deleteCapability?.code,
+		feature: deleteCapability?.feature,
+	};
+}
+
+export function useNarratorDeleteCapability(): ReturnType<typeof getNarratorDeleteCapability> {
+	return getNarratorDeleteCapability(useRuntimeCapabilities());
 }
 
 export function getNarratorRetryRecoveryCapability(capabilities: RuntimeCapabilities | undefined): {
@@ -885,15 +1033,29 @@ export function getNarratorRetryRecoveryCapability(capabilities: RuntimeCapabili
 	editAndRegenerate?: boolean;
 } {
 	const retryRecovery = capabilities?.narrator?.retryRecovery;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : retryRecovery?.supported === true;
 	return {
-		supported: retryRecovery?.supported !== false,
+		supported,
 		reason: retryRecovery?.reason,
-		retry: retryRecovery?.retry,
-		continue: retryRecovery?.continue,
-		interrupt: retryRecovery?.interrupt,
-		manualOverride: retryRecovery?.manualOverride,
-		rollback: retryRecovery?.rollback,
-		editAndRegenerate: retryRecovery?.editAndRegenerate,
+		retry: assumeLegacyTSBackend
+			? retryRecovery?.retry
+			: supported && retryRecovery?.retry === true,
+		continue: assumeLegacyTSBackend
+			? retryRecovery?.continue
+			: supported && retryRecovery?.continue === true,
+		interrupt: assumeLegacyTSBackend
+			? retryRecovery?.interrupt
+			: supported && retryRecovery?.interrupt === true,
+		manualOverride: assumeLegacyTSBackend
+			? retryRecovery?.manualOverride
+			: supported && retryRecovery?.manualOverride === true,
+		rollback: assumeLegacyTSBackend
+			? retryRecovery?.rollback
+			: supported && retryRecovery?.rollback === true,
+		editAndRegenerate: assumeLegacyTSBackend
+			? retryRecovery?.editAndRegenerate
+			: supported && retryRecovery?.editAndRegenerate === true,
 	};
 }
 
@@ -901,6 +1063,47 @@ export function useNarratorRetryRecoveryCapability(): ReturnType<
 	typeof getNarratorRetryRecoveryCapability
 > {
 	return getNarratorRetryRecoveryCapability(useRuntimeCapabilities());
+}
+
+export function getNarratorRollbackEditRegenerateCapability(
+	capabilities: RuntimeCapabilities | undefined,
+): {
+	supported: boolean;
+	reason?: string;
+	rollback?: boolean;
+	editAndRegenerate?: boolean;
+	copyOnWrite?: boolean;
+	messageRefTruncation?: boolean;
+	fileStateRebuild?: boolean;
+	toolCallInvalidation?: boolean;
+	agentRerun?: boolean;
+	optionalFileRevert?: boolean;
+	optionalAgentRerun?: boolean;
+	wsEvents?: boolean;
+} {
+	const narrator = capabilities?.narrator;
+	const capability = narrator?.rollbackEditRegenerate;
+	const assumeLegacyTSBackend = !narrator;
+	return {
+		supported: assumeLegacyTSBackend ? true : capability?.supported === true,
+		reason: capability?.reason,
+		rollback: capability?.rollback,
+		editAndRegenerate: capability?.editAndRegenerate,
+		copyOnWrite: capability?.copyOnWrite,
+		messageRefTruncation: capability?.messageRefTruncation,
+		fileStateRebuild: capability?.fileStateRebuild,
+		toolCallInvalidation: capability?.toolCallInvalidation,
+		agentRerun: capability?.agentRerun,
+		optionalFileRevert: capability?.optionalFileRevert,
+		optionalAgentRerun: capability?.optionalAgentRerun,
+		wsEvents: capability?.wsEvents,
+	};
+}
+
+export function useNarratorRollbackEditRegenerateCapability(): ReturnType<
+	typeof getNarratorRollbackEditRegenerateCapability
+> {
+	return getNarratorRollbackEditRegenerateCapability(useRuntimeCapabilities());
 }
 
 const DEFAULT_NARRATOR_PERMISSION_MODES = [
@@ -922,18 +1125,28 @@ export function getNarratorPermissionsCapability(capabilities: RuntimeCapabiliti
 	reflections: string[];
 } {
 	const permissions = capabilities?.narrator?.permissions;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : permissions?.supported === true;
 	return {
-		supported: permissions?.supported !== false,
+		supported,
 		reason: permissions?.reason,
 		modes: Array.isArray(permissions?.modes)
 			? permissions.modes
-			: DEFAULT_NARRATOR_PERMISSION_MODES,
-		approveDeny: permissions?.approveDeny !== false,
-		updatedInput: permissions?.updatedInput !== false,
+			: assumeLegacyTSBackend
+				? DEFAULT_NARRATOR_PERMISSION_MODES
+				: [],
+		approveDeny: assumeLegacyTSBackend
+			? permissions?.approveDeny !== false
+			: supported && permissions?.approveDeny === true,
+		updatedInput: assumeLegacyTSBackend
+			? permissions?.updatedInput !== false
+			: supported && permissions?.updatedInput === true,
 		pauseResume: permissions?.pauseResume,
 		reflections: Array.isArray(permissions?.reflections)
 			? permissions.reflections
-			: DEFAULT_NARRATOR_PERMISSION_REFLECTIONS,
+			: assumeLegacyTSBackend
+				? DEFAULT_NARRATOR_PERMISSION_REFLECTIONS
+				: [],
 	};
 }
 
@@ -954,15 +1167,29 @@ export function getNarratorReviewToolsCapability(capabilities: RuntimeCapabiliti
 	staleMergeGuard: boolean;
 } {
 	const reviewTools = capabilities?.narrator?.reviewTools;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : reviewTools?.supported === true;
 	return {
-		supported: reviewTools?.supported !== false,
+		supported,
 		reason: reviewTools?.reason,
-		concludeReview: reviewTools?.concludeReview !== false,
-		feedbackInjection: reviewTools?.feedbackInjection !== false,
-		promote: reviewTools?.promote !== false,
-		dismiss: reviewTools?.dismiss !== false,
-		convertToSubagent: reviewTools?.convertToSubagent !== false,
-		staleMergeGuard: reviewTools?.staleMergeGuard !== false,
+		concludeReview: assumeLegacyTSBackend
+			? reviewTools?.concludeReview !== false
+			: supported && reviewTools?.concludeReview === true,
+		feedbackInjection: assumeLegacyTSBackend
+			? reviewTools?.feedbackInjection !== false
+			: supported && reviewTools?.feedbackInjection === true,
+		promote: assumeLegacyTSBackend
+			? reviewTools?.promote !== false
+			: supported && reviewTools?.promote === true,
+		dismiss: assumeLegacyTSBackend
+			? reviewTools?.dismiss !== false
+			: supported && reviewTools?.dismiss === true,
+		convertToSubagent: assumeLegacyTSBackend
+			? reviewTools?.convertToSubagent !== false
+			: supported && reviewTools?.convertToSubagent === true,
+		staleMergeGuard: assumeLegacyTSBackend
+			? reviewTools?.staleMergeGuard !== false
+			: supported && reviewTools?.staleMergeGuard === true,
 	};
 }
 
@@ -992,24 +1219,48 @@ export function getNarratorSubagentsCapability(capabilities: RuntimeCapabilities
 	staleRecovery: boolean;
 } {
 	const subagents = capabilities?.narrator?.subagents;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : subagents?.supported === true;
 	return {
-		supported: subagents?.supported !== false,
+		supported,
 		reason: subagents?.reason,
-		foreground: subagents?.foreground !== false,
-		background: subagents?.background !== false,
-		awaitAgent: subagents?.awaitAgent !== false,
-		awaitBash: subagents?.awaitBash !== false,
-		awaitBashWaitForText: subagents?.awaitBashWaitForText !== false,
+		foreground: assumeLegacyTSBackend
+			? subagents?.foreground !== false
+			: supported && subagents?.foreground === true,
+		background: assumeLegacyTSBackend
+			? subagents?.background !== false
+			: supported && subagents?.background === true,
+		awaitAgent: assumeLegacyTSBackend
+			? subagents?.awaitAgent !== false
+			: supported && subagents?.awaitAgent === true,
+		awaitBash: assumeLegacyTSBackend
+			? subagents?.awaitBash !== false
+			: supported && subagents?.awaitBash === true,
+		awaitBashWaitForText: assumeLegacyTSBackend
+			? subagents?.awaitBashWaitForText !== false
+			: supported && subagents?.awaitBashWaitForText === true,
 		awaitBashReason: subagents?.awaitBashReason,
-		send: subagents?.send !== false,
-		teamStatus: subagents?.teamStatus !== false,
-		detachAttach: subagents?.detachAttach !== false,
-		detachUnblocksParent: subagents?.detachUnblocksParent !== false,
-		reattachBlocksParent: subagents?.reattachBlocksParent !== false,
+		send: assumeLegacyTSBackend ? subagents?.send !== false : supported && subagents?.send === true,
+		teamStatus: assumeLegacyTSBackend
+			? subagents?.teamStatus !== false
+			: supported && subagents?.teamStatus === true,
+		detachAttach: assumeLegacyTSBackend
+			? subagents?.detachAttach !== false
+			: supported && subagents?.detachAttach === true,
+		detachUnblocksParent: assumeLegacyTSBackend
+			? subagents?.detachUnblocksParent !== false
+			: supported && subagents?.detachUnblocksParent === true,
+		reattachBlocksParent: assumeLegacyTSBackend
+			? subagents?.reattachBlocksParent !== false
+			: supported && subagents?.reattachBlocksParent === true,
 		reattachFallback: subagents?.reattachFallback === true,
 		reattachReason: subagents?.reattachReason,
-		backgroundResultInjection: subagents?.backgroundResultInjection !== false,
-		staleRecovery: subagents?.staleRecovery !== false,
+		backgroundResultInjection: assumeLegacyTSBackend
+			? subagents?.backgroundResultInjection !== false
+			: supported && subagents?.backgroundResultInjection === true,
+		staleRecovery: assumeLegacyTSBackend
+			? subagents?.staleRecovery !== false
+			: supported && subagents?.staleRecovery === true,
 	};
 }
 
@@ -1053,13 +1304,21 @@ export function getNarratorToolInventoryCapability(capabilities: RuntimeCapabili
 	const inventory = capabilities?.narrator?.toolInventory;
 	const webFetch = inventory?.webFetch;
 	const browser = inventory?.browser;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : inventory?.supported === true;
+	const webFetchSupported = assumeLegacyTSBackend
+		? webFetch?.supported !== false
+		: supported && webFetch?.supported === true;
+	const browserSupported = assumeLegacyTSBackend
+		? browser?.supported !== false
+		: supported && browser?.supported === true;
 	return {
-		supported: inventory?.supported !== false,
+		supported,
 		supportedOptionalTools: inventory?.supportedOptionalTools ?? [],
 		unsupportedOptionalTools: inventory?.unsupportedOptionalTools ?? [],
 		reason: inventory?.reason,
 		webFetch: {
-			supported: webFetch?.supported !== false,
+			supported: webFetchSupported,
 			reason: webFetch?.reason,
 			parity: webFetch?.parity,
 			mode: webFetch?.mode,
@@ -1070,17 +1329,27 @@ export function getNarratorToolInventoryCapability(capabilities: RuntimeCapabili
 			policy: webFetch?.policy,
 		},
 		browser: {
-			supported: browser?.supported !== false,
+			supported: browserSupported,
 			reason: browser?.reason,
 			parity: browser?.parity,
 			runtime: browser?.runtime,
 			screenshotPreviewMode: browser?.screenshotPreviewMode,
-			sharePreview: browser?.sharePreview !== false,
-			imageContentBlock: browser?.imageContentBlock !== false,
-			fileOutput: browser?.fileOutput !== false,
+			sharePreview: assumeLegacyTSBackend
+				? browser?.sharePreview !== false
+				: browserSupported && browser?.sharePreview === true,
+			imageContentBlock: assumeLegacyTSBackend
+				? browser?.imageContentBlock !== false
+				: browserSupported && browser?.imageContentBlock === true,
+			fileOutput: assumeLegacyTSBackend
+				? browser?.fileOutput !== false
+				: browserSupported && browser?.fileOutput === true,
 			traceFormat: browser?.traceFormat,
-			traceShare: browser?.traceShare !== false,
-			traceFileOutput: browser?.traceFileOutput !== false,
+			traceShare: assumeLegacyTSBackend
+				? browser?.traceShare !== false
+				: browserSupported && browser?.traceShare === true,
+			traceFileOutput: assumeLegacyTSBackend
+				? browser?.traceFileOutput !== false
+				: browserSupported && browser?.traceFileOutput === true,
 			traceShareUrl: browser?.traceShareUrl,
 		},
 	};
@@ -1102,13 +1371,15 @@ export function getVNetCapability(capabilities: RuntimeCapabilities | undefined)
 	udpRendezvousReason?: string;
 } {
 	const vnet = capabilities?.vnet;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend ? true : vnet?.supported === true;
 	return {
-		supported: vnet?.supported !== false,
+		supported,
 		reason: vnet?.reason,
 		mode: vnet?.mode,
-		ws: vnet?.ws !== false,
-		peerCleanup: vnet?.peerCleanup !== false,
-		udpRendezvous: vnet?.udpRendezvous === true,
+		ws: assumeLegacyTSBackend ? true : supported && vnet?.ws === true,
+		peerCleanup: assumeLegacyTSBackend ? true : supported && vnet?.peerCleanup === true,
+		udpRendezvous: supported && vnet?.udpRendezvous === true,
 		udpRendezvousReason: vnet?.udpRendezvousReason,
 	};
 }
@@ -1124,8 +1395,9 @@ export function getMcpBuiltinToolsCapability(capabilities: RuntimeCapabilities |
 	missing: string[];
 } {
 	const builtinTools = capabilities?.mcp?.builtinTools;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: builtinTools?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : builtinTools?.supported === true,
 		reason: builtinTools?.reason,
 		parity: builtinTools?.parity,
 		missing: Array.isArray(builtinTools?.missing) ? builtinTools.missing : [],
@@ -1148,21 +1420,22 @@ export function getMcpProtocolCapability(capabilities: RuntimeCapabilities | und
 	toolsCall: { supported: boolean; reason?: string; scope?: string };
 } {
 	const mcp = capabilities?.mcp;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
 		builtinProtocol: {
-			supported: mcp?.builtinProtocol?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : mcp?.builtinProtocol?.supported === true,
 			reason: mcp?.builtinProtocol?.reason,
 			initialize: mcp?.builtinProtocol?.initialize,
 			toolsList: mcp?.builtinProtocol?.toolsList,
 			toolsCall: mcp?.builtinProtocol?.toolsCall,
 		},
 		toolsList: {
-			supported: mcp?.toolsList?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : mcp?.toolsList?.supported === true,
 			reason: mcp?.toolsList?.reason,
 			source: mcp?.toolsList?.source,
 		},
 		toolsCall: {
-			supported: mcp?.toolsCall?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : mcp?.toolsCall?.supported === true,
 			reason: mcp?.toolsCall?.reason,
 			scope: mcp?.toolsCall?.scope,
 		},
@@ -1177,8 +1450,9 @@ export function getMcpExternalToolsCapability(capabilities: RuntimeCapabilities 
 	lifecycle?: string;
 } {
 	const externalTools = capabilities?.mcp?.externalToolsInjection;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: externalTools?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : externalTools?.supported === true,
 		reason: externalTools?.reason,
 		parity: externalTools?.parity,
 		transport: externalTools?.transport,
@@ -1198,8 +1472,9 @@ export function getMcpExternalAgentCapability(capabilities: RuntimeCapabilities 
 	lifecycle?: string;
 } {
 	const externalAgent = capabilities?.mcp?.externalAgentInjection;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: externalAgent?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : externalAgent?.supported === true,
 		reason: externalAgent?.reason,
 		parity: externalAgent?.parity,
 		transport: externalAgent?.transport,
@@ -1218,8 +1493,9 @@ export function getMcpServerSettingsStorageCapability(
 	reason?: string;
 } {
 	const storage = capabilities?.mcp?.serverSettingsStorage;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: storage?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : storage?.supported === true,
 		reason: storage?.reason,
 	};
 }
@@ -1240,12 +1516,13 @@ export function getMcpExternalServerManagementCapability(
 	import: boolean;
 } {
 	const management = capabilities?.mcp?.externalServerManagement;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: management?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : management?.supported === true,
 		reason: management?.reason,
 		storage: management?.storage,
-		permissions: management?.permissions !== false,
-		import: management?.import !== false,
+		permissions: assumeLegacyTSBackend ? true : management?.permissions === true,
+		import: assumeLegacyTSBackend ? true : management?.import === true,
 	};
 }
 
@@ -1260,18 +1537,20 @@ export function getMcpTransportsCapability(capabilities: RuntimeCapabilities | u
 	sse: { supported: boolean; reason?: string };
 	streamableHttp: { supported: boolean; reason?: string };
 } {
-	const transports = capabilities?.mcp?.transports;
+	const mcp = capabilities?.mcp;
+	const transports = mcp?.transports;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
 		stdio: {
-			supported: transports?.stdio?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : transports?.stdio?.supported === true,
 			reason: transports?.stdio?.reason,
 		},
 		sse: {
-			supported: transports?.sse?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : transports?.sse?.supported === true,
 			reason: transports?.sse?.reason,
 		},
 		streamableHttp: {
-			supported: transports?.streamableHttp?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : transports?.streamableHttp?.supported === true,
 			reason: transports?.streamableHttp?.reason,
 		},
 	};
@@ -1286,14 +1565,15 @@ export function getContentCapability(capabilities: RuntimeCapabilities | undefin
 	projectSkills: { supported: boolean; reason?: string; storage?: string };
 } {
 	const content = capabilities?.content;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
 		projectRoutines: {
-			supported: content?.projectRoutines?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : content?.projectRoutines?.supported === true,
 			reason: content?.projectRoutines?.reason,
 			storage: content?.projectRoutines?.storage,
 		},
 		projectSkills: {
-			supported: content?.projectSkills?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : content?.projectSkills?.supported === true,
 			reason: content?.projectSkills?.reason,
 			storage: content?.projectSkills?.storage,
 		},
@@ -1310,17 +1590,20 @@ export function getUploadCapability(capabilities: RuntimeCapabilities | undefine
 	cleanupPreservesMessageImageRefs: { supported: boolean; reason?: string };
 } {
 	const uploads = capabilities?.uploads;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
 		serveNarratorImages: {
-			supported: uploads?.serveNarratorImages?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : uploads?.serveNarratorImages?.supported === true,
 			reason: uploads?.serveNarratorImages?.reason,
 		},
 		serveAvatars: {
-			supported: uploads?.serveAvatars?.supported !== false,
+			supported: assumeLegacyTSBackend ? true : uploads?.serveAvatars?.supported === true,
 			reason: uploads?.serveAvatars?.reason,
 		},
 		cleanupPreservesMessageImageRefs: {
-			supported: uploads?.cleanupPreservesMessageImageRefs?.supported !== false,
+			supported: assumeLegacyTSBackend
+				? true
+				: uploads?.cleanupPreservesMessageImageRefs?.supported === true,
 			reason: uploads?.cleanupPreservesMessageImageRefs?.reason,
 		},
 	};
@@ -1341,13 +1624,18 @@ export function getShareCapability(capabilities: RuntimeCapabilities | undefined
 	ephemeralOnlyReason?: string;
 } {
 	const shares = capabilities?.shares;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		createSupported: shares?.create?.supported !== false,
-		publicDownloadSupported: shares?.publicDownload?.supported !== false,
-		previewSupported: shares?.preview?.supported !== false,
+		createSupported: assumeLegacyTSBackend ? true : shares?.create?.supported === true,
+		publicDownloadSupported: assumeLegacyTSBackend
+			? true
+			: shares?.publicDownload?.supported === true,
+		previewSupported: assumeLegacyTSBackend ? true : shares?.preview?.supported === true,
 		previewHtmlMode: shares?.preview?.htmlMode,
 		previewReason: shares?.preview?.reason,
-		ephemeralOnlySupported: shares?.ephemeralOnly?.supported !== false,
+		ephemeralOnlySupported: assumeLegacyTSBackend
+			? true
+			: shares?.ephemeralOnly?.supported === true,
 		ephemeralOnlyFallback: shares?.ephemeralOnly?.fallback === true,
 		ephemeralOnlyReason: shares?.ephemeralOnly?.reason,
 	};
@@ -1379,11 +1667,16 @@ export function getProviderRouteCapability(
 	provider: ProviderCapabilityKey,
 	route: string,
 ): { supported: boolean; reason?: string } {
-	const routes = getProviderRuntimeCapability(capabilities, provider)?.routes;
-	const supported = routes?.supported !== false && routes?.[route] !== false;
+	const providerRuntime = getProviderRuntimeCapability(capabilities, provider);
+	const routes = providerRuntime?.routes;
+	const assumeLegacyTSBackend = !capabilities;
+	const supported = assumeLegacyTSBackend
+		? true
+		: routes?.supported !== false && routes?.[route] === true;
+	const routeReason = routes?.[`${route}Reason`];
 	return {
 		supported,
-		reason: supported ? undefined : routes?.reason,
+		reason: supported ? undefined : typeof routeReason === "string" ? routeReason : routes?.reason,
 	};
 }
 
@@ -1409,8 +1702,9 @@ export function getProviderModelRefreshCapability(
 	provider: ProviderCapabilityKey,
 ): { supported: boolean; reason?: string } {
 	const models = capabilities?.providers?.[provider]?.models;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: models?.refreshSupported !== false,
+		supported: assumeLegacyTSBackend ? true : models?.refreshSupported === true,
 		reason: models?.reason,
 	};
 }
@@ -1420,8 +1714,9 @@ export function getProviderQuotaCapability(
 	provider: ProviderCapabilityKey,
 ): { supported: boolean; reason?: string } {
 	const quota = capabilities?.providers?.[provider]?.quota;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: quota?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : quota?.supported === true,
 		reason: quota?.reason,
 	};
 }
@@ -1431,8 +1726,9 @@ export function getProviderAgentModeCapability(
 	provider: ProviderCapabilityKey,
 ): { supported: boolean; reason?: string } {
 	const agentMode = capabilities?.providers?.[provider]?.agentMode;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: agentMode?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : agentMode?.supported === true,
 		reason: agentMode?.reason,
 	};
 }
@@ -1490,14 +1786,17 @@ export function getSettingsFeatureCapability(capabilities: RuntimeCapabilities |
 	retryRules: boolean;
 } {
 	const settings = capabilities?.settings;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		storageSupported: settings?.storage?.supported !== false,
+		storageSupported: assumeLegacyTSBackend ? true : settings?.storage?.supported === true,
 		storagePath: settings?.storage?.path,
-		patchSupported: settings?.patch?.supported !== false,
-		secretMasking: settings?.secretMasking !== false,
-		providerModelAugmentation: settings?.providerModelAugmentation !== false,
-		tlsGeneration: settings?.tlsGeneration !== false,
-		retryRules: settings?.retryRules !== false,
+		patchSupported: assumeLegacyTSBackend ? true : settings?.patch?.supported === true,
+		secretMasking: assumeLegacyTSBackend ? true : settings?.secretMasking === true,
+		providerModelAugmentation: assumeLegacyTSBackend
+			? true
+			: settings?.providerModelAugmentation === true,
+		tlsGeneration: assumeLegacyTSBackend ? true : settings?.tlsGeneration === true,
+		retryRules: assumeLegacyTSBackend ? true : settings?.retryRules === true,
 	};
 }
 
@@ -1511,9 +1810,11 @@ export function getBenchmarkContainerExecutionCapability(
 	supported: boolean;
 	reason?: string;
 } {
-	const containerExecution = capabilities?.benchmark?.containerExecution;
+	const benchmark = capabilities?.benchmark;
+	const containerExecution = benchmark?.containerExecution;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: containerExecution?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : containerExecution?.supported === true,
 		reason: containerExecution?.reason,
 	};
 }
@@ -1543,17 +1844,18 @@ export function getRuntimeMaintenanceCapability(capabilities: RuntimeCapabilitie
 } {
 	const runtime = capabilities?.runtime;
 	const cleanup = runtime?.cleanup;
+	const assumeLegacyTSBackend = !capabilities;
 	const cleanupCapability = (target: RuntimeCleanupTarget): RuntimeCleanupCapability => ({
-		supported: cleanup?.[target]?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : cleanup?.[target]?.supported === true,
 		reason: cleanup?.[target]?.reason,
 		mode: cleanup?.[target]?.mode,
 	});
 	return {
 		backend: runtime?.backend,
 		buildChannel: runtime?.buildChannel,
-		scanSupported: runtime?.scan?.supported !== false,
+		scanSupported: assumeLegacyTSBackend ? true : runtime?.scan?.supported === true,
 		scanReason: runtime?.scan?.reason,
-		cachedSupported: runtime?.cached?.supported !== false,
+		cachedSupported: assumeLegacyTSBackend ? true : runtime?.cached?.supported === true,
 		cachedReason: runtime?.cached?.reason,
 		cleanup: {
 			terminals: cleanupCapability("terminals"),
@@ -1589,21 +1891,23 @@ export function getStorageCapability(capabilities: RuntimeCapabilities | undefin
 	vacuumReason?: string;
 	cleanup: Record<StorageCleanupTarget, StorageCleanupRuntimeCapability>;
 } {
-	const scan = capabilities?.storage?.scan;
-	const cached = capabilities?.storage?.cached;
-	const vacuum = capabilities?.storage?.vacuum;
-	const cleanup = capabilities?.storage?.cleanup;
+	const storage = capabilities?.storage;
+	const scan = storage?.scan;
+	const cached = storage?.cached;
+	const vacuum = storage?.vacuum;
+	const cleanup = storage?.cleanup;
+	const assumeLegacyTSBackend = !capabilities;
 	const cleanupCapability = (target: StorageCleanupTarget): StorageCleanupRuntimeCapability => ({
-		supported: cleanup?.[target]?.supported !== false,
+		supported: assumeLegacyTSBackend ? true : cleanup?.[target]?.supported === true,
 		reason: cleanup?.[target]?.reason,
 		mode: cleanup?.[target]?.mode,
 		alternative: cleanup?.[target]?.alternative,
 		preservesMessageImageRefs: cleanup?.[target]?.preservesMessageImageRefs,
 	});
 	return {
-		scanSupported: scan?.supported !== false,
+		scanSupported: assumeLegacyTSBackend ? true : scan?.supported === true,
 		scanReason: scan?.reason,
-		cachedSupported: cached?.supported !== false,
+		cachedSupported: assumeLegacyTSBackend ? true : cached?.supported === true,
 		cachedReason: cached?.reason,
 		// Safe default: TS/older backends without an explicit capability should keep the
 		// dangerous VACUUM entry disabled rather than exposing a misleading action.
@@ -1628,8 +1932,9 @@ export function getStorageDatabasePreviewCapability(
 	supported: boolean;
 } {
 	const database = capabilities?.storage?.database;
+	const assumeLegacyTSBackend = !capabilities;
 	return {
-		supported: database?.preview !== false,
+		supported: assumeLegacyTSBackend ? true : database?.preview === true,
 	};
 }
 
@@ -1650,12 +1955,16 @@ export function getStorageDatabaseCleanupCapabilities(
 	capabilities: RuntimeCapabilities | undefined,
 ): Record<StorageDatabaseCleanupTarget, StorageDatabaseCleanupCapability> {
 	const database = capabilities?.storage?.database;
+	const assumeLegacyTSBackend = !capabilities;
 	const targetCapability = (
 		target: StorageDatabaseCleanupTarget,
 	): StorageDatabaseCleanupCapability => {
 		const capability = database?.cleanupTargets?.[target];
+		const cleanupSupported = assumeLegacyTSBackend
+			? database?.cleanup !== false && capability?.supported !== false
+			: database?.cleanup === true && capability?.supported === true;
 		return {
-			supported: database?.cleanup !== false && capability?.supported !== false,
+			supported: cleanupSupported,
 			reason: capability?.reason,
 			code: capability?.code,
 			fallback: capability?.fallback,

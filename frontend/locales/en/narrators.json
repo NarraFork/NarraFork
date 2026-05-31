@@ -26,6 +26,7 @@
 	"backToNarrators": "Back to Narrators",
 	"noArchivedNarrators": "No archived narrators.",
 	"deleteNarrator": "Delete",
+	"deleteNarratorUnsupported": "Narrator deletion is not available in this backend/runtime.",
 	"deleteNarratorConfirmTitle": "Delete Narrator",
 	"deleteNarratorConfirm": "Permanently delete \"{{name}}\" and all its messages? This cannot be undone.",
 	"sortBy": "Sort by",

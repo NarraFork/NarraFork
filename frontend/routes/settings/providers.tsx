@@ -402,6 +402,7 @@ function SettingsProvidersPage() {
 		openaiByProvider,
 		anthropicByProvider,
 		clineByProvider,
+		nugByProvider,
 	} = useAllModels();
 
 	const providerModelsMap = useMemo(() => {
@@ -548,6 +549,7 @@ function SettingsProvidersPage() {
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of nugByProvider) for (const m of g.models) addModel(g.prefix, m);
 
 		// Add custom models to their respective prefixes
 		for (const m of state.customModels) {
@@ -588,6 +590,7 @@ function SettingsProvidersPage() {
 		openaiByProvider,
 		anthropicByProvider,
 		clineByProvider,
+		nugByProvider,
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,

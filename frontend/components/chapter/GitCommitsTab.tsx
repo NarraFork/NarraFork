@@ -33,7 +33,7 @@ export function GitCommitsTab({ chapterId }: { chapterId: string }) {
 	const chapterSplitCapability = useChapterSplitCapability();
 	const splitUnsupportedReason = chapterSplitCapability.supported
 		? undefined
-		: (chapterSplitCapability.reason ?? t("splitUnsupported"));
+		: chapterSplitCapability.reason || t("splitUnsupported");
 	const [skip, setSkip] = useState(0);
 	const [splitTarget, setSplitTarget] = useState<{ sha: string; message: string } | null>(null);
 	const { data: commits, isLoading } = useGitLog(chapterId, LIMIT, skip);

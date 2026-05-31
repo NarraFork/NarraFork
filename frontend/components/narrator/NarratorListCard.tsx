@@ -112,6 +112,8 @@ interface ActiveNarratorListCardProps extends BaseNarratorListCardProps {
 interface ArchivedNarratorListCardProps extends BaseNarratorListCardProps {
 	variant: "archived";
 	unarchiveLoading?: boolean;
+	deleteSupported?: boolean;
+	deleteUnsupportedReason?: string;
 	onUnarchive: (narratorId: string) => void;
 	onDelete: (narrator: NarratorListItem) => void;
 }
@@ -432,10 +434,15 @@ function ArchivedNarratorCard({
 	localQuery,
 	defaultModelValue,
 	unarchiveLoading,
+	deleteSupported = true,
+	deleteUnsupportedReason,
 	onUnarchive,
 	onDelete,
 }: ArchivedNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
+	const deleteTooltip = deleteSupported
+		? t("deleteNarrator")
+		: (deleteUnsupportedReason ?? t("deleteNarratorUnsupported"));
 	return (
 		<Link
 			to="/narrators/$narratorId"
@@ -476,14 +483,18 @@ function ArchivedNarratorCard({
 								<IconArchiveOff size={16} />
 							</ActionIcon>
 						</Tooltip>
-						<Tooltip label={t("deleteNarrator")}>
+						<Tooltip label={deleteTooltip}>
 							<ActionIcon
 								size="sm"
 								color="red"
 								variant="subtle"
+								aria-disabled={!deleteSupported}
+								title={deleteTooltip}
+								style={!deleteSupported ? { opacity: 0.5, cursor: "not-allowed" } : undefined}
 								onClick={(e: MouseEvent) => {
 									e.preventDefault();
 									e.stopPropagation();
+									if (!deleteSupported) return;
 									onDelete(narrator);
 								}}
 							>

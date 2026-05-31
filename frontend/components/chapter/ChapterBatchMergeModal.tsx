@@ -2,6 +2,7 @@ import { Alert, Button, Checkbox, Modal, Select, Stack, Text, TextInput } from "
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useChapterBatchMergeCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 
 const MAX_CHAPTER_BATCH_MERGE_LABEL_CHARS = 500;
@@ -26,6 +27,9 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	const qc = useQueryClient();
 	const { t } = useTranslation("chapters");
 	const { t: tc } = useTranslation("common");
+	const batchMergeCapability = useChapterBatchMergeCapability();
+	const batchMergeSupported =
+		batchMergeCapability.supported && batchMergeCapability.startRouteSupported;
 
 	const resetState = () => {
 		setSelected([]);
@@ -40,16 +44,21 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 	};
 
 	const batchMerge = useMutation({
-		mutationFn: () =>
-			api.batchMerge({
+		mutationFn: () => {
+			if (!batchMergeSupported) {
+				throw new Error(batchMergeCapability.reason ?? t("batchMergeUnsupported"));
+			}
+			return api.batchMerge({
 				baseChapterId: baseChapterId ?? "",
 				sourceChapterIds: selected,
 				title: title.trim(),
 				strategy,
-			}),
+			});
+		},
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
+			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			handleClose();
 		},
 	});
@@ -130,7 +139,10 @@ export function ChapterBatchMergeModal({ chapters, opened, onClose }: ChapterBat
 					color="green"
 					onClick={() => batchMerge.mutate()}
 					loading={batchMerge.isPending}
-					disabled={!baseChapterId || selected.length === 0 || !title.trim()}
+					disabled={
+						!batchMergeSupported || !baseChapterId || selected.length === 0 || !title.trim()
+					}
+					title={batchMergeSupported ? undefined : batchMergeCapability.reason}
 				>
 					{t("mergeCount", { count: selected.length })}
 				</Button>

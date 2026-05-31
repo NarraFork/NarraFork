@@ -144,7 +144,7 @@ import {
 	useNarratorPermissionsCapability,
 	useNarratorPlanModeCapability,
 	useNarratorRetryRecoveryCapability,
-	useRuntimeCapabilities,
+	useNarratorRollbackEditRegenerateCapability,
 } from "../../hooks/usePlatform";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
@@ -1969,7 +1969,6 @@ export function NarratorPanel({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: ts } = useTranslation("settings");
-	const runtimeCapabilities = useRuntimeCapabilities();
 	const narratorPermissionsCapability = useNarratorPermissionsCapability();
 	const availablePermissionModes = narratorPermissionsCapability.supported
 		? narratorPermissionsCapability.modes
@@ -1999,10 +1998,10 @@ export function NarratorPanel({
 	const compactFallbackSummaryReason =
 		compactCapability.fallbackReason ?? t("compactFallbackSummaryDesc");
 	const compactUnsupportedReason = compactCapability.reason ?? t("compactUnsupported");
-	const rollbackEditRegenerateCapability = runtimeCapabilities?.narrator?.rollbackEditRegenerate;
-	const rollbackEditRegenerateSupported = rollbackEditRegenerateCapability?.supported !== false;
+	const rollbackEditRegenerateCapability = useNarratorRollbackEditRegenerateCapability();
+	const rollbackEditRegenerateSupported = rollbackEditRegenerateCapability.supported;
 	const rollbackEditRegenerateUnsupportedReason =
-		rollbackEditRegenerateCapability?.reason ?? t("rollbackEditRegenerateUnsupported");
+		rollbackEditRegenerateCapability.reason ?? t("rollbackEditRegenerateUnsupported");
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();

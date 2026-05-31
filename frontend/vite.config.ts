@@ -181,6 +181,11 @@ export default defineConfig(({ mode, command }) => {
 		server: {
 			port: vitePort,
 			host: "0.0.0.0",
+			allowedHosts: [
+				"narraforkhotreloadorigin.narrafork.dev",
+				"nfgotest1.narrafork.dev",
+				"nfgocf1.narrafork.dev",
+			],
 			proxy: {
 				"/api": {
 					target: `http://localhost:${backendPort}`,

@@ -47,6 +47,15 @@
 		"mergeInto": "合并到",
 		"mergeNewTitle": "合并：{{titles}}",
 		"mergeSuccess": "合并完成",
+		"mergeStarted": "合并会话已启动",
+		"mergeCancelled": "合并已取消",
+		"mergeConflictTitle": "合并冲突",
+		"mergeConflict": "冲突文件：{{files}}",
+		"mergeDecisionContinue": "让 AI 继续",
+		"mergeDecisionCancel": "取消合并",
+		"mergeDecisionContinueSent": "已发送继续合并并由 AI 解决的决策",
+		"mergeDecisionCancelSent": "已发送取消合并决策",
+		"mergeDecisionFailed": "无法发送合并决策；WebSocket 已断开。",
 		"mergeFailed": "合并失败：{{message}}",
 		"newTerminal": "新建终端"
 	},
@@ -64,7 +73,8 @@
 	"mergeDraft": {
 		"titlePlaceholder": "合并提交标题",
 		"descriptionPlaceholder": "合并说明…",
-		"failed": "合并失败：{{message}}"
+		"failed": "合并失败：{{message}}",
+		"unsupported": "当前后端运行时不支持批量合并。"
 	},
 	"terminal": {
 		"minimize": "最小化终端",

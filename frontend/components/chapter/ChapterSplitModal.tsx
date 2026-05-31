@@ -51,7 +51,7 @@ export function ChapterSplitModal({
 	const chapterSplitCapability = useChapterSplitCapability();
 	const splitUnsupportedReason = chapterSplitCapability.supported
 		? undefined
-		: (chapterSplitCapability.reason ?? t("splitUnsupported"));
+		: chapterSplitCapability.reason || t("splitUnsupported");
 	const commitShortSha = commitSha?.slice(0, 8) ?? "";
 	const messagePreview = useMemo(
 		() => truncate(firstLine(commitMessage), MAX_SPLIT_MESSAGE_PREVIEW_CHARS),
@@ -80,7 +80,7 @@ export function ChapterSplitModal({
 		mutationFn: () => {
 			if (!commitSha) throw new Error(t("splitMissingCommit"));
 			if (!chapterSplitCapability.supported) {
-				throw new Error(splitUnsupportedReason ?? t("splitUnsupported"));
+				throw new Error(splitUnsupportedReason || t("splitUnsupported"));
 			}
 			return api.splitChapter(chapterId, {
 				commitSha,
@@ -138,7 +138,7 @@ export function ChapterSplitModal({
 		inheritMode === "compressed" &&
 		(chapterSplitCapability.compressedAISummaryFallback ||
 			!chapterSplitCapability.compressedAISummarySupported);
-	const canSubmit = !!commitSha && title.trim().length > 0 && !splitUnsupportedReason;
+	const canSubmit = !!commitSha && title.trim().length > 0 && chapterSplitCapability.supported;
 
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("splitChapterTitle")} centered>

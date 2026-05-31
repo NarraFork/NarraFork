@@ -47,6 +47,15 @@
 		"mergeInto": "Merge into",
 		"mergeNewTitle": "Merged: {{titles}}",
 		"mergeSuccess": "Merge completed",
+		"mergeStarted": "Merge session started",
+		"mergeCancelled": "Merge cancelled",
+		"mergeConflictTitle": "Merge conflict",
+		"mergeConflict": "Conflicting files: {{files}}",
+		"mergeDecisionContinue": "Continue with AI",
+		"mergeDecisionCancel": "Cancel merge",
+		"mergeDecisionContinueSent": "Continuing merge with AI resolution",
+		"mergeDecisionCancelSent": "Merge cancellation sent",
+		"mergeDecisionFailed": "Unable to send merge decision; WebSocket is disconnected.",
 		"mergeFailed": "Merge failed: {{message}}",
 		"newTerminal": "New Terminal"
 	},
@@ -64,7 +73,8 @@
 	"mergeDraft": {
 		"titlePlaceholder": "Merge commit title",
 		"descriptionPlaceholder": "Merge description...",
-		"failed": "Merge failed: {{message}}"
+		"failed": "Merge failed: {{message}}",
+		"unsupported": "Batch merge is unavailable in this backend runtime."
 	},
 	"terminal": {
 		"minimize": "Minimize terminal",

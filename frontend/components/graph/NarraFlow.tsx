@@ -20,8 +20,9 @@ import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useNarraFlow } from "@frontend/hooks/useNarraFlow";
-import { useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
+import { type NarratorListWSEvent, useNarratorsListWS } from "@frontend/hooks/useNarratorWS";
 import {
+	useChapterBatchMergeCapability,
 	useFsRevealCapability,
 	useNarratorReviewToolsCapability,
 } from "@frontend/hooks/usePlatform";
@@ -29,12 +30,14 @@ import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
+import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import {
 	Alert,
 	Box,
 	Button,
 	Group,
 	Modal,
+	Paper,
 	Stack,
 	Text,
 	useMantineColorScheme,
@@ -82,6 +85,29 @@ function areStringArraysEqual(a?: readonly string[] | null, b?: readonly string[
 	if (left.length !== right.length) return false;
 	return left.every((value, index) => value === right[index]);
 }
+
+type MergeProgressEvent = {
+	type: string;
+	mergeSessionId?: string;
+	projectId?: string;
+	targetChapterId?: string;
+	sourceChapterId?: string;
+	sourceChapterIds?: string[];
+	currentIndex?: number;
+	mergedCount?: number;
+	totalCount?: number;
+	conflictFiles?: string[];
+	error?: string;
+	message?: string;
+};
+
+type MergeDecision = "continue" | "cancel";
+
+type PendingMergeSession = {
+	draftNodeId?: string;
+	sourceChapterIds: string[];
+	targetChapterId?: string;
+};
 
 interface ContextMenuState {
 	x: number;
@@ -231,6 +257,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const queryClient = useQueryClient();
 	const reviewToolsCapability = useNarratorReviewToolsCapability();
 	const fsRevealCapability = useFsRevealCapability();
+	const batchMergeCapability = useChapterBatchMergeCapability();
+	const batchMergeSupported =
+		batchMergeCapability.supported && batchMergeCapability.startRouteSupported;
 	const reviewActions = useMemo(
 		() => ({
 			request: reviewToolsCapability.supported,
@@ -682,7 +711,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const liveStatuses = useMemo(() => liveStatusesRef.current, [liveStatusesTick]);
 
 	const handleNarratorWSUpdate = useCallback(
-		(narratorId: string, event: { type: string; status?: string; substatus?: string[] }) => {
+		(narratorId: string, event: NarratorListWSEvent) => {
 			if (event.type !== "status") return;
 			const chapterId = narratorIdMap.get(narratorId);
 			if (!chapterId) return;
@@ -701,7 +730,159 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		[narratorIdMap],
 	);
 
-	useNarratorsListWS(narratorIdsForWS, handleNarratorWSUpdate);
+	const notifiedMergeSessionsRef = useRef(new Map<string, string>());
+	const pendingMergeSessionsRef = useRef(new Map<string, PendingMergeSession>());
+	useEffect(() => {
+		if (!projectId) return;
+		notifiedMergeSessionsRef.current.clear();
+		pendingMergeSessionsRef.current.clear();
+	}, [projectId]);
+	const sendMergeDecision = useCallback(
+		(mergeSessionId: string, decision: MergeDecision, notificationId: string) => {
+			const sent = narratorWSManager.send({
+				type: "merge_decision",
+				mergeSessionId,
+				decision,
+			});
+			if (sent) {
+				notifications.hide(notificationId);
+				notifications.show({
+					message:
+						decision === "continue"
+							? t("selection.mergeDecisionContinueSent")
+							: t("selection.mergeDecisionCancelSent"),
+					color: decision === "continue" ? "blue" : "yellow",
+				});
+			} else {
+				notifications.show({
+					message: t("selection.mergeDecisionFailed"),
+					color: "red",
+				});
+			}
+		},
+		[t],
+	);
+
+	const removePendingDraftNode = useCallback(
+		(draftNodeId: string) => {
+			const nextNodes = nodesRef.current.filter((n) => n.id !== draftNodeId);
+			nodesRef.current = nextNodes;
+			setNodes(nextNodes);
+			recomputeEdges(nextNodes, { full: true });
+		},
+		[recomputeEdges],
+	);
+
+	const mergeEventBelongsToCurrentProject = useCallback(
+		(event: MergeProgressEvent) => {
+			if (event.projectId) return event.projectId === projectId;
+			if (event.mergeSessionId && pendingMergeSessionsRef.current.has(event.mergeSessionId)) {
+				return true;
+			}
+			const eventChapterIds = [
+				event.targetChapterId,
+				event.sourceChapterId,
+				...(event.sourceChapterIds ?? []),
+			].filter((value): value is string => typeof value === "string" && value.length > 0);
+			if (eventChapterIds.length === 0) return false;
+			const currentChapterIds = new Set(nodesRef.current.map((node) => node.id));
+			return eventChapterIds.some((id) => currentChapterIds.has(id));
+		},
+		[projectId],
+	);
+
+	const handleMergeProgressEvent = useCallback(
+		(event: MergeProgressEvent) => {
+			if (!event.mergeSessionId || !mergeEventBelongsToCurrentProject(event)) return;
+			const pending = pendingMergeSessionsRef.current.get(event.mergeSessionId);
+			const notificationKey = `${event.mergeSessionId}:${event.type}:${event.currentIndex ?? ""}:${event.sourceChapterId ?? ""}`;
+			if (notifiedMergeSessionsRef.current.get(event.mergeSessionId) === notificationKey) return;
+			notifiedMergeSessionsRef.current.set(event.mergeSessionId, notificationKey);
+
+			if (event.type === "merge:completed") {
+				if (pending?.draftNodeId) removePendingDraftNode(pending.draftNodeId);
+				const targetId = event.targetChapterId ?? pending?.targetChapterId;
+				const sourceIds = pending?.sourceChapterIds ?? event.sourceChapterIds ?? [];
+				if (targetId || sourceIds.length) {
+					setExpandedNodes((prev) => {
+						const next = new Set(prev);
+						for (const id of sourceIds) {
+							next.delete(id);
+							panelSizesRef.current.delete(id);
+						}
+						if (targetId) next.add(targetId);
+						return next;
+					});
+				}
+				pendingMergeSessionsRef.current.delete(event.mergeSessionId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["chapters"] });
+				notifications.show({
+					message: t("selection.mergeSuccess"),
+					color: "green",
+				});
+			} else if (event.type === "merge:cancelled") {
+				pendingMergeSessionsRef.current.delete(event.mergeSessionId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["chapters"] });
+				notifications.show({
+					message: t("selection.mergeCancelled"),
+					color: "yellow",
+				});
+			} else if (event.type === "merge:error") {
+				pendingMergeSessionsRef.current.delete(event.mergeSessionId);
+				queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+				queryClient.invalidateQueries({ queryKey: ["chapters"] });
+				notifications.show({
+					message: t("selection.mergeFailed", {
+						message: event.error ?? event.message ?? "unknown",
+					}),
+					color: "red",
+				});
+			} else if (event.type === "merge:conflict") {
+				const notificationId = `merge-conflict-${event.mergeSessionId}`;
+				const files = event.conflictFiles?.join(", ") || "unknown";
+				notifications.show({
+					id: notificationId,
+					title: t("selection.mergeConflictTitle"),
+					message: (
+						<Paper bg="transparent" shadow="none">
+							<Text size="sm" mb="xs">
+								{t("selection.mergeConflict", { files })}
+							</Text>
+							<Group gap="xs">
+								<Button
+									size="xs"
+									onClick={() =>
+										sendMergeDecision(event.mergeSessionId ?? "", "continue", notificationId)
+									}
+								>
+									{t("selection.mergeDecisionContinue")}
+								</Button>
+								<Button
+									size="xs"
+									variant="light"
+									color="red"
+									onClick={() =>
+										sendMergeDecision(event.mergeSessionId ?? "", "cancel", notificationId)
+									}
+								>
+									{t("selection.mergeDecisionCancel")}
+								</Button>
+							</Group>
+						</Paper>
+					),
+					color: "yellow",
+					autoClose: false,
+				});
+			}
+		},
+		[mergeEventBelongsToCurrentProject, queryClient, removePendingDraftNode, sendMergeDecision, t],
+	);
+
+	useNarratorsListWS(narratorIdsForWS, handleNarratorWSUpdate, (event) => {
+		if (event.type.startsWith("merge:")) handleMergeProgressEvent(event as MergeProgressEvent);
+	});
 
 	// Clean up liveStatuses entries for chapters no longer in the graph
 	useEffect(() => {
@@ -1347,6 +1528,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						});
 					});
 			} else if (payload.mode === "merge" && payload.sourceChapterIds?.length) {
+				if (!batchMergeSupported) {
+					notifications.show({
+						message: batchMergeCapability.reason ?? t("mergeDraft.unsupported"),
+						color: "yellow",
+					});
+					return;
+				}
 				// For merge-new: first source is base, rest are sources
 				// For merge-into: targetChapterId is base, all sourceChapterIds are sources
 				const baseId = payload.targetChapterId ?? payload.sourceChapterIds[0];
@@ -1364,10 +1552,26 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 						title: payload.title,
 					})
 					.then((res) => {
+						if (res?.mergeSessionId) {
+							pendingMergeSessionsRef.current.set(res.mergeSessionId, {
+								draftNodeId,
+								sourceChapterIds: allSourceIds,
+								targetChapterId: res.targetChapterId,
+							});
+							notifications.show({
+								message: t("selection.mergeStarted"),
+								color: "blue",
+							});
+							setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+							return;
+						}
 						removeDraft(draftNodeId);
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 						queryClient.invalidateQueries({ queryKey: ["chapters"] });
-						notifications.show({ message: t("selection.mergeSuccess"), color: "green" });
+						notifications.show({
+							message: t("selection.mergeSuccess"),
+							color: "green",
+						});
 						setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
 
 						// Collapse merged source nodes, expand the target node
@@ -1394,7 +1598,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					});
 			}
 		},
-		[queryClient, t, removeDraft],
+		[batchMergeCapability.reason, batchMergeSupported, queryClient, t, removeDraft],
 	);
 
 	/** Compute bounding box center-bottom for a set of node IDs */
@@ -1550,6 +1754,14 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const handleMergeNew = useCallback(
 		(nodeIds: string[]) => {
 			if (nodeIds.length < 2) return;
+			if (!batchMergeSupported) {
+				notifications.show({
+					message: batchMergeCapability.reason ?? t("mergeDraft.unsupported"),
+					color: "yellow",
+				});
+				setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+				return;
+			}
 			const titles = nodeIds
 				.map((id) => {
 					const n = nodesRef.current.find((nd) => nd.id === id);
@@ -1565,12 +1777,20 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			// Clear selection so toolbar hides
 			setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
 		},
-		[spawnDraft, getBboxBottom, t],
+		[batchMergeCapability.reason, batchMergeSupported, spawnDraft, getBboxBottom, t],
 	);
 
 	const handleMergeInto = useCallback(
 		(sourceNodeIds: string[], targetNodeId: string) => {
 			if (sourceNodeIds.length === 0) return;
+			if (!batchMergeSupported) {
+				notifications.show({
+					message: batchMergeCapability.reason ?? t("mergeDraft.unsupported"),
+					color: "yellow",
+				});
+				setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+				return;
+			}
 
 			// Merge directly into the existing target chapter — no draft node, no new chapter
 			api
@@ -1579,10 +1799,25 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					sourceChapterIds: sourceNodeIds,
 					targetChapterId: targetNodeId,
 				})
-				.then(() => {
+				.then((res) => {
+					if (res?.mergeSessionId) {
+						pendingMergeSessionsRef.current.set(res.mergeSessionId, {
+							sourceChapterIds: sourceNodeIds,
+							targetChapterId: targetNodeId,
+						});
+						notifications.show({
+							message: t("selection.mergeStarted"),
+							color: "blue",
+						});
+						setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+						return;
+					}
 					queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
 					queryClient.invalidateQueries({ queryKey: ["chapters"] });
-					notifications.show({ message: t("selection.mergeSuccess"), color: "green" });
+					notifications.show({
+						message: t("selection.mergeSuccess"),
+						color: "green",
+					});
 					setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
 
 					// Collapse merged source nodes, expand the target node
@@ -1605,7 +1840,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					});
 				});
 		},
-		[queryClient, t],
+		[batchMergeCapability.reason, batchMergeSupported, queryClient, t],
 	);
 
 	const handleSetRole = useCallback(

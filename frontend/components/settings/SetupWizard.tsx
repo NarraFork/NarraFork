@@ -93,6 +93,9 @@ export function SetupWizard({
 		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
 			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
 		)?.length ?? 0) +
+		(settings?.nugProviders?.filter(
+			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
+		)?.length ?? 0) +
 		(settings?.clineProviders?.filter(
 			(p: { baseUrl?: string; accessToken?: string }) => p.baseUrl && p.accessToken,
 		)?.length ?? 0) +

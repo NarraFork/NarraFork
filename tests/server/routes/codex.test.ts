@@ -206,6 +206,26 @@ describe("codex routes validation", () => {
 		expect(saveSettingsCalls).toBe(0);
 	});
 
+	it("extracts email from at-marker import text", async () => {
+		const res = await app.request("/import", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				importText: "user@example.com----password-----at----access-token-from-line",
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ added: 1, duplicates: 0, skipped: 0 });
+		expect(codexImportedCredentials).toEqual([
+			{
+				accessToken: "access-token-from-line",
+				email: "user@example.com",
+				displayName: "user@example.com",
+			},
+		]);
+	});
+
 	it("expands sub2api account exports during import", async () => {
 		const res = await app.request("/import", {
 			method: "POST",

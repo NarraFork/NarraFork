@@ -246,7 +246,7 @@ export function CommitDetailModal({
 	const chapterSplitCapability = useChapterSplitCapability();
 	const splitUnsupportedReason = chapterSplitCapability.supported
 		? undefined
-		: (chapterSplitCapability.reason ?? t("splitUnsupported"));
+		: chapterSplitCapability.reason || t("splitUnsupported");
 	const [splitOpened, setSplitOpened] = useState(false);
 
 	const { data, isLoading } = useQuery({

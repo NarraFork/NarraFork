@@ -593,7 +593,7 @@ export const miscApi = {
 		}>("/cline/models/refresh", { method: "POST" }),
 	clineRefreshProviderModels: (providerId: string) =>
 		request<{
-			models: Array<{ id: string; name?: string }>;
+			count: number;
 			fromCache: boolean;
 		}>(`/cline/providers/${providerId}/models/refresh`, { method: "POST" }),
 	clineBalance: () => request<{ balance: number; userId: string }>("/cline/balance"),
@@ -798,6 +798,13 @@ export const miscApi = {
 						toolCalls?: boolean;
 						compactMarkers?: boolean;
 						structuredContent?: boolean;
+					};
+					delete?: {
+						supported?: boolean;
+						fallback?: boolean;
+						code?: string;
+						reason?: string;
+						feature?: string;
 					};
 					planMode?: {
 						supported?: boolean;

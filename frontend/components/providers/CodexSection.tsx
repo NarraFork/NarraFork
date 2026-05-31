@@ -145,8 +145,37 @@ function normalizeExpiresAt(value: unknown): number | undefined {
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+const EMAIL_SEARCH_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const AT_MARKER_DISPLAY_PATTERN = /(?:^|-{4,})\s*at\s*(?:-{4,}|$)/i;
+const REFRESH_TOKEN_DISPLAY_PATTERN = /rt_[A-Za-z0-9._-]+/;
+
 function optionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function extractEmailFromString(value: unknown): string | undefined {
+	const text = optionalString(value);
+	return text?.match(EMAIL_SEARCH_PATTERN)?.[0];
+}
+
+function isSerializedCodexCredentialLabel(value: unknown): boolean {
+	const text = optionalString(value);
+	if (!text?.includes("----")) return false;
+	return AT_MARKER_DISPLAY_PATTERN.test(text) || REFRESH_TOKEN_DISPLAY_PATTERN.test(text);
+}
+
+function safeCredentialDisplayName(value: unknown): string | undefined {
+	const text = optionalString(value);
+	if (!text || isSerializedCodexCredentialLabel(text)) return undefined;
+	return text;
+}
+
+function firstSafeCredentialDisplayName(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		const normalized = safeCredentialDisplayName(value);
+		if (normalized) return normalized;
+	}
+	return undefined;
 }
 
 function optionalPriority(value: unknown): number | undefined {
@@ -195,7 +224,16 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 			nestedCredentials.accessToken,
 	);
 	if (!refreshToken && !accessToken) return null;
-	const email = firstOptionalString(record.email, nestedCredentials.email, extra.email);
+	const email = firstOptionalString(
+		record.email,
+		nestedCredentials.email,
+		extra.email,
+		extractEmailFromString(record.displayName),
+		extractEmailFromString(record.display_name),
+		extractEmailFromString(record.name),
+		extractEmailFromString(nestedCredentials.displayName),
+		extractEmailFromString(nestedCredentials.display_name),
+	);
 	const accountId = firstOptionalString(
 		record.account_id,
 		record.accountId,
@@ -211,14 +249,13 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 		nestedCredentials.chatgptUserId,
 	);
 	const displayName =
-		email ??
-		firstOptionalString(
+		firstSafeCredentialDisplayName(
 			record.displayName,
 			record.display_name,
 			record.name,
 			nestedCredentials.displayName,
 			nestedCredentials.display_name,
-		);
+		) ?? email;
 	const priority = firstOptionalPriority(record.priority, nestedCredentials.priority);
 	const expiresAt = normalizeExpiresAt(
 		record.expires_at ??
@@ -239,7 +276,7 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 }
 
 function credentialsFromAtMarkerRecord(record: string, email?: string): CodexImportCredential[] {
-	const parts = record.split("----").map((part) => part.trim());
+	const parts = record.split(/-{4,}/).map((part) => part.trim());
 	return parts.flatMap((part, index) => {
 		if (part.toLowerCase() !== "at") return [];
 		const accessToken = normalizeAccessToken(parts[index + 1]);
@@ -443,6 +480,13 @@ export const CodexSection = React.memo(function CodexSection({
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
 	const lastBrowserAuthError = status?.lastBrowserAuthError;
+
+	useEffect(() => {
+		const maxAvailablePage = Math.max(1, Math.ceil(availableTotal / PAGE_SIZE));
+		const maxUnavailablePage = Math.max(1, Math.ceil(unavailableTotal / PAGE_SIZE));
+		if (availablePage > maxAvailablePage) setAvailablePage(maxAvailablePage);
+		if (unavailablePage > maxUnavailablePage) setUnavailablePage(maxUnavailablePage);
+	}, [availableTotal, unavailableTotal, availablePage, unavailablePage]);
 
 	useEffect(() => {
 		if (!status) return;

@@ -28,6 +28,7 @@ import {
 	useNarratorsPaginated,
 	useUnarchiveNarrator,
 } from "../../hooks/useNarrator";
+import { useNarratorDeleteCapability } from "../../hooks/usePlatform";
 
 export const Route = createFileRoute("/narrators/archived")({
 	component: ArchivedNarratorsPage,
@@ -71,25 +72,29 @@ function ArchivedNarratorsPage() {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
 	const { defaultModelValue } = useAllModels();
+	const narratorDeleteCapability = useNarratorDeleteCapability();
+	const deleteSupported = narratorDeleteCapability.supported;
+	const deleteUnsupportedReason = narratorDeleteCapability.reason ?? t("deleteNarratorUnsupported");
 
 	const [deleteOpened, { open: openDelete, close: closeDelete }] = useDisclosure(false);
 	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
 
 	const handleDelete = useCallback(
 		(narrator: NarratorListItem) => {
+			if (!deleteSupported) return;
 			setDeleteTarget({
 				id: narrator.id,
 				title: narrator.title || narrator.id.slice(0, 8),
 			});
 			openDelete();
 		},
-		[openDelete],
+		[deleteSupported, openDelete],
 	);
 
 	const confirmDelete = useCallback(() => {
-		if (!deleteTarget) return;
+		if (!deleteSupported || !deleteTarget) return;
 		deleteNarrator.mutate(deleteTarget.id, { onSuccess: closeDelete });
-	}, [deleteTarget, deleteNarrator, closeDelete]);
+	}, [deleteSupported, deleteTarget, deleteNarrator, closeDelete]);
 
 	const sentinelRef = useNarratorInfiniteScroll({
 		disabled: !!localQuery.trim(),
@@ -160,6 +165,8 @@ function ArchivedNarratorsPage() {
 							localQuery={localQuery}
 							defaultModelValue={defaultModelValue}
 							unarchiveLoading={unarchiveNarrator.isPending}
+							deleteSupported={deleteSupported}
+							deleteUnsupportedReason={deleteUnsupportedReason}
 							onUnarchive={(narratorId) => unarchiveNarrator.mutate(narratorId)}
 							onDelete={handleDelete}
 						/>
@@ -195,7 +202,13 @@ function ArchivedNarratorsPage() {
 						<Button variant="subtle" onClick={closeDelete}>
 							{tc("cancel")}
 						</Button>
-						<Button color="red" onClick={confirmDelete} loading={deleteNarrator.isPending}>
+						<Button
+							color="red"
+							onClick={confirmDelete}
+							loading={deleteNarrator.isPending}
+							disabled={!deleteSupported}
+							title={!deleteSupported ? deleteUnsupportedReason : undefined}
+						>
 							{t("deleteNarrator")}
 						</Button>
 					</Group>

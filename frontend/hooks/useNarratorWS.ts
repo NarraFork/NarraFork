@@ -1197,9 +1197,9 @@ export function useNarratorsListWS(
 
 	// Mount-only: global event listener + connection tracking, cleanup on unmount
 	useEffect(() => {
-		// Separate listener for global "user:*" events (not narrator-scoped)
+		// Separate listener for global events (not narrator-scoped).
 		globalListenerHandleRef.current = narratorWSManager.addListener(
-			{ typePrefixes: ["user:"] },
+			{ typePrefixes: ["user:", "merge:"] },
 			(data) => {
 				onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
 			},

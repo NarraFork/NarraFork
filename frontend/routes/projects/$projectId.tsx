@@ -18,6 +18,7 @@ import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router"
 import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useChapters, useCreateChapter } from "../../hooks/useChapters";
+import { useChapterBatchMergeCapability } from "../../hooks/usePlatform";
 import { useDeleteProject, useProject } from "../../hooks/useProjects";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 
@@ -83,6 +84,7 @@ function ProjectDetailPage() {
 	const { data: chapters } = useChapters(projectId);
 	const createChapter = useCreateChapter();
 	const deleteProject = useDeleteProject();
+	const batchMergeCapability = useChapterBatchMergeCapability();
 	const [opened, { open, close }] = useDisclosure(false);
 	const [cleanupOpened, { open: openCleanup, close: closeCleanup }] = useDisclosure(false);
 	const [batchMergeOpened, { open: openBatchMerge, close: closeBatchMerge }] = useDisclosure(false);
@@ -114,6 +116,8 @@ function ProjectDetailPage() {
 	if (!project) return <Text>{tp("projectNotFound")}</Text>;
 
 	const hasGitPath = !!project.gitPath;
+	const batchMergeSupported =
+		batchMergeCapability.supported && batchMergeCapability.startRouteSupported;
 
 	const handleCreate = () => {
 		if (!title.trim()) return;
@@ -176,7 +180,8 @@ function ProjectDetailPage() {
 						color="green"
 						size="xs"
 						onClick={openBatchMerge}
-						disabled={!chapters?.length}
+						disabled={!chapters?.length || !batchMergeSupported}
+						title={batchMergeSupported ? undefined : batchMergeCapability.reason}
 					>
 						{t("batchMerge")}
 					</Button>
