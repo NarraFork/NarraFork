@@ -551,8 +551,10 @@ export const miscApi = {
 		}>(`/nug/providers/${providerId}/usage/summary?range=${range}`),
 	nugRefreshProviderModels: (providerId: string) =>
 		request<{
-			models: Array<{ id: string; owned_by?: string }>;
+			models: Array<{ id: string; owned_by?: string; contextLength?: number; contextWindow?: number }>;
 			fromCache: boolean;
+			modelHash?: string;
+			modelContextWindows?: Record<string, number>;
 		}>(`/nug/providers/${providerId}/models/refresh`, { method: "POST" }),
 	nugOAuthStart: (providerId: string) =>
 		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),

@@ -3,12 +3,13 @@ import { notifications } from "@mantine/notifications";
 import { IconGitCommit, IconMessage, IconMinimize } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Handle, type NodeProps, NodeResizeControl, Position } from "@xyflow/react";
-import { memo, useCallback, useRef, useState } from "react";
+import { memo, Suspense, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api } from "../../lib/api";
 import { CHAPTER_ROLE_ICONS, CHAPTER_STATUS_COLORS, statusRegistry } from "../../lib/constants";
 import { NarratorPanel } from "../narrator/NarratorPanel";
+import { NarratorPanelSkeleton } from "../narrator/NarratorPanelSkeleton";
 
 export interface ChapterNodeData {
 	title: string;
@@ -305,13 +306,15 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 							borderTop: "1px solid var(--mantine-color-dark-4)",
 						}}
 					>
-						<NarratorPanel
-							key={d.narratorId}
-							narratorId={d.narratorId}
-							compact
-							isResizing={isResizing}
-							onForkFromMessage={handleForkFromMessage}
-						/>
+						<Suspense fallback={<NarratorPanelSkeleton />}>
+							<NarratorPanel
+								key={d.narratorId}
+								narratorId={d.narratorId}
+								compact
+								isResizing={isResizing}
+								onForkFromMessage={handleForkFromMessage}
+							/>
+						</Suspense>
 					</div>
 				)}
 			</Card>

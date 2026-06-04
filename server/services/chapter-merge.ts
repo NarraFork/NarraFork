@@ -39,10 +39,16 @@ export interface MergeResult {
 	warning?: string;
 }
 
+export interface InteractiveMergeResult extends MergeResult {
+	/** User-visible prompt to send to the target narrator when conflict markers are preserved. */
+	conflictPrompt?: string;
+}
+
 export interface AiResolveResult {
 	resolved: boolean;
 	mergeResult?: MergeResult;
 	error?: string;
+	remainingFiles?: string[];
 }
 
 type ChapterRow = typeof chapters.$inferSelect;
@@ -387,6 +393,199 @@ export const chapterMerge = {
 		});
 	},
 
+	async startInteractiveConflictMerge(
+		sourceChapterId: string,
+		input: MergeChapterInput,
+		locale: Locale = "en",
+		userId?: string,
+	): Promise<InteractiveMergeResult> {
+		const source = await db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+		});
+		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, input.targetChapterId),
+		});
+		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
+		if (sourceChapterId === input.targetChapterId) {
+			throw new ValidationError("Cannot merge a chapter into itself");
+		}
+		if (source.status !== "active" && source.status !== "dormant") {
+			throw new ValidationError("Source chapter must be active or dormant");
+		}
+		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+		if (source.projectId !== target.projectId) {
+			throw new ValidationError("Cannot merge chapters from different projects");
+		}
+
+		const gitPath = await getProjectGitPath(source.projectId);
+		const strategy = input.strategy ?? "merge";
+		if (strategy === "cherry-pick") {
+			throw new ValidationError(
+				"Interactive conflict resolution is not supported for cherry-pick batch merges yet",
+			);
+		}
+		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
+		const targetWorktree = target.worktreePath;
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, source.projectId),
+		});
+		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
+		await prepareSourceBeforeMerge(
+			source,
+			target,
+			gitPath,
+			chapterSettings?.requireReviewBeforeMerge === true,
+		);
+
+		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
+			(err) => {
+				logger.warn("Failed to collect pre-merge context for interactive merge (non-fatal)", {
+					sourceChapterId,
+					error: String(err),
+				});
+				return { commits: [] as string[], diffStat: "" };
+			},
+		);
+
+		return worktreeLock.acquire(targetWorktree, async () => {
+			const preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+			const mergeResult = await gitService.mergeNoCommit(targetWorktree, source.branch, strategy);
+			if (!mergeResult.hasConflicts) {
+				const commitSha = await gitService.autoCommit(targetWorktree, message);
+				const resolved = await this.markMergedResult(
+					sourceChapterId,
+					input.targetChapterId,
+					strategy,
+					commitSha ?? undefined,
+					userId,
+					mergeContext,
+					preMergeTargetSha,
+				);
+				return { success: true, commitSha: resolved.mergeResult?.commitSha };
+			}
+
+			const conflictFiles = mergeResult.conflictFiles;
+			try {
+				await chapterEdgeService.createMergeEdge(
+					source.projectId,
+					sourceChapterId,
+					input.targetChapterId,
+					{
+						strategy,
+						status: "pending",
+					},
+				);
+			} catch (err) {
+				logger.warn("Failed to create pending merge edge (non-fatal)", {
+					sourceChapterId,
+					targetChapterId: input.targetChapterId,
+					error: String(err),
+				});
+			}
+			return {
+				success: false,
+				conflictFiles,
+				conflictPrompt: buildConflictResolutionPrompt(
+					conflictFiles,
+					source.branch,
+					target.branch,
+					locale,
+					mergeContext,
+				),
+			};
+		});
+	},
+
+	async ensurePendingMergeEdge(
+		sourceChapterId: string,
+		targetChapterId: string,
+		strategy: "merge" | "squash" | "cherry-pick" = "merge",
+	): Promise<void> {
+		const source = await db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+		});
+		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+		await chapterEdgeService.createMergeEdge(source.projectId, sourceChapterId, targetChapterId, {
+			strategy,
+			status: "pending",
+		});
+	},
+
+	async completeInteractiveConflictMerge(
+		sourceChapterId: string,
+		input: MergeChapterInput,
+		userId?: string,
+	): Promise<AiResolveResult> {
+		const source = await db.query.chapters.findFirst({
+			where: eq(chapters.id, sourceChapterId),
+		});
+		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
+		const target = await db.query.chapters.findFirst({
+			where: eq(chapters.id, input.targetChapterId),
+		});
+		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
+		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
+		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+		if (source.projectId !== target.projectId) {
+			throw new ValidationError("Cannot merge chapters from different projects");
+		}
+
+		const strategy = input.strategy ?? "merge";
+		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
+		const targetWorktree = target.worktreePath;
+		const gitPath = await getProjectGitPath(source.projectId);
+		const mergeContext = await collectMergeContext(gitPath, source.branch, source.baseBranch).catch(
+			(err) => {
+				logger.warn("Failed to collect merge context while completing interactive merge", {
+					sourceChapterId,
+					error: String(err),
+				});
+				return { commits: [] as string[], diffStat: "" };
+			},
+		);
+
+		return worktreeLock.acquire(targetWorktree, async () => {
+			const remainingFiles = await gitService.getConflictFiles(targetWorktree);
+			if (remainingFiles.length > 0) {
+				return {
+					resolved: false,
+					error: `Merge conflicts remain: ${remainingFiles.join(", ")}`,
+					remainingFiles,
+				};
+			}
+
+			let preMergeTargetSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+			let commitSha = await gitService.autoCommit(targetWorktree, message);
+			if (!commitSha) {
+				const status = await gitService.getStatus(targetWorktree);
+				if (status.trim()) {
+					return {
+						resolved: false,
+						error:
+							"No resolved merge changes were available to commit. Resolve the conflicts without committing, then continue again.",
+					};
+				}
+				commitSha = (await gitService.getHeadCommit(targetWorktree)).trim();
+				preMergeTargetSha = (
+					await gitService
+						.getRefCommit(targetWorktree, `${commitSha}^1`)
+						.catch(() => preMergeTargetSha)
+				).trim();
+			}
+			return this.markMergedResult(
+				sourceChapterId,
+				input.targetChapterId,
+				strategy,
+				commitSha,
+				userId,
+				mergeContext,
+				preMergeTargetSha,
+			);
+		});
+	},
+
 	async aiResolveConflicts(
 		sourceChapterId: string,
 		input: MergeChapterInput,
@@ -592,6 +791,7 @@ export const chapterMerge = {
 					{
 						mergeCommitSha: commitSha,
 						strategy: strategy as string,
+						status: "completed",
 					},
 				);
 			} catch (err) {

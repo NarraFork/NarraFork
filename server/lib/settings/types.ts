@@ -82,6 +82,8 @@ export interface OpenAIProviderConfig {
 	codexWebSocket?: boolean;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
+	/** Internal: additional request headers injected by provider adapters such as NUG. */
+	extraHeaders?: Record<string, string>;
 }
 
 export interface AnthropicProviderConfig {
@@ -119,6 +121,8 @@ export interface AnthropicProviderConfig {
 	 * third-party proxy/relay services.
 	 */
 	officialApi?: boolean;
+	/** Internal: additional request headers injected by provider adapters such as NUG. */
+	extraHeaders?: Record<string, string>;
 }
 
 	/** Unique short ID (8 chars). */

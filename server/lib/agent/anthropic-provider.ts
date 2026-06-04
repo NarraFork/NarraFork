@@ -588,7 +588,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (this.proxy) {
 			extra.proxy = this.proxy;
 		}
-		if (!this.tlsRejectUnauthorized) {
+		if (this.tlsRejectUnauthorized === false) {
 			extra.tls = { rejectUnauthorized: false };
 		}
 		if (Object.keys(extra).length > 0) {
@@ -598,7 +598,15 @@ export class AnthropicProvider implements ProviderAdapter {
 		return fetch(input, init);
 	}
 
+	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
+		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
+			if (value) headers[key] = value;
+		}
+		return headers;
+	}
+
 	/** Get the effective base URL, using cached resolution if available. */
+
 	private getBaseUrl(): string {
 		if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
 		return (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -944,6 +952,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["x-api-key"] = apiKey;
 			reqHeaders["user-agent"] = getHttpUserAgent();
 		}
+		this.applyExtraHeaders(reqHeaders);
 
 		params.requestDump?.setRequest({
 			transport: "http",
@@ -1240,6 +1249,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			headers["x-api-key"] = apiKey;
 			headers["user-agent"] = getHttpUserAgent();
 		}
+		this.applyExtraHeaders(headers);
 
 		const response = await this.fetchWithV1Fallback("/messages", {
 			method: "POST",
@@ -1316,6 +1326,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			genHeaders["x-api-key"] = apiKey;
 			genHeaders["user-agent"] = getHttpUserAgent();
 		}
+		this.applyExtraHeaders(genHeaders);
 
 		const body: {
 			model: string;

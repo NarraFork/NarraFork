@@ -225,6 +225,10 @@ export const terminalService = {
 		const chapterId: string | undefined = opts.chapterId;
 		const narratorId: string | undefined = opts.narratorId;
 
+		if (chapterId && narratorId) {
+			throw new ValidationError("Only one of chapterId or narratorId may be provided");
+		}
+
 		if (chapterId) {
 			const chapter = await db.query.chapters.findFirst({
 				where: eq(chapters.id, chapterId),
@@ -262,7 +266,8 @@ export const terminalService = {
 				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
 			}
 		} else {
-			throw new ValidationError("Either chapterId or narratorId is required");
+			// Standalone terminals are used by global flows such as setup wizard dependency installs.
+			cwd = getHome();
 		}
 
 		const id = generateId();

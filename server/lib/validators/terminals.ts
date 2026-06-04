@@ -8,8 +8,8 @@ export const createTerminalSchema = z
 		cols: z.number().int().min(10).max(500).optional(),
 		rows: z.number().int().min(2).max(200).optional(),
 	})
-	.refine((d) => (d.chapterId || d.narratorId) && !(d.chapterId && d.narratorId), {
-		message: "Exactly one of chapterId or narratorId is required",
+	.refine((d) => !(d.chapterId && d.narratorId), {
+		message: "Only one of chapterId or narratorId may be provided",
 	});
 
 export const updateTerminalGraphStateSchema = z.object({

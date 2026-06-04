@@ -96,8 +96,24 @@ class ChapterEdgeService {
 		projectId: string,
 		sourceId: string,
 		targetId: string,
-		metadata: { mergeCommitSha?: string; strategy: string },
+		metadata: { mergeCommitSha?: string; strategy: string; status?: "pending" | "completed" },
 	) {
+		const existing = await db.query.chapterEdges.findFirst({
+			where: and(
+				eq(chapterEdges.sourceId, sourceId),
+				eq(chapterEdges.targetId, targetId),
+				eq(chapterEdges.type, "merge"),
+			),
+		});
+		if (existing) {
+			const [edge] = await db
+				.update(chapterEdges)
+				.set({ metadata })
+				.where(eq(chapterEdges.id, existing.id))
+				.returning();
+			return edge;
+		}
+
 		const id = generateId();
 		const now = new Date().toISOString();
 

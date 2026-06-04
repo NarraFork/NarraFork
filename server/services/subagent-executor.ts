@@ -20,6 +20,7 @@ import type { CustomSubagentDef } from "./custom-subagent-service";
 import type { EventHandlerContext, EventHooks } from "./narrator-event-handler";
 import { executeAgentLoop } from "./narrator-executor";
 import {
+	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
@@ -647,9 +648,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				transientRetries = 0;
 				// Continue to the restart-after-compact flow below
 			} else {
+				const failure = getContextOverflowFailureError(overflow.reason);
 				hasError = true;
 				contextLengthExceeded = true;
-				finalText = "Error: context length exceeded and compact failed";
+				finalText = `Error: ${failure.message}`;
 				break;
 			}
 		}

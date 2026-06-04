@@ -26,6 +26,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 	const termRef = useRef<Terminal | null>(null);
 	const fitAddonRef = useRef<FitAddon | null>(null);
 	const [terminalId, setTerminalId] = useState<string | undefined>();
+	const [startError, setStartError] = useState<string | null>(null);
 	const commandSentRef = useRef(false);
 	const doneRef = useRef(false);
 	const writingRef = useRef(false);
@@ -49,6 +50,7 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 	useEffect(() => {
 		if (!terminalSupported) return;
 		let cancelled = false;
+		setStartError(null);
 		api
 			.createTerminal({ name: "dep-install" })
 			.then((t) => {
@@ -58,7 +60,10 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 				}
 				setTerminalId(t.id);
 			})
-			.catch(() => {});
+			.catch((err) => {
+				if (cancelled) return;
+				setStartError((err as Error)?.message ?? String(err));
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -169,6 +174,16 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 			<Box py="xl" style={{ textAlign: "center" }}>
 				<Text size="xs" c="dimmed">
 					{terminalUnsupportedReason}
+				</Text>
+			</Box>
+		);
+	}
+
+	if (startError) {
+		return (
+			<Box py="xl" style={{ textAlign: "center" }}>
+				<Text size="xs" c="red">
+					{startError}
 				</Text>
 			</Box>
 		);

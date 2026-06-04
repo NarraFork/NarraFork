@@ -2,6 +2,7 @@ import {
 	Badge,
 	Box,
 	Button,
+	type ComboboxItemGroup,
 	Group,
 	Modal,
 	SegmentedControl,
@@ -29,6 +30,7 @@ import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
@@ -367,6 +369,16 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const { groupedModels, visibleModels } = useAllModels();
+	const groupedModelsWithoutFollowDefault = useMemo(
+		() =>
+			groupedModels.filter(
+				(g) =>
+					!(g as ComboboxItemGroup).items?.some?.(
+						(i) => (typeof i === "string" ? i : i.value) === FOLLOW_DEFAULT_MODEL,
+					),
+			),
+		[groupedModels],
+	);
 
 	// Validate initial model values — clear if the model's provider isn't configured
 	const availableValues = useMemo(
@@ -429,7 +441,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 			<Select
 				label={t("defaultModel")}
 				placeholder={t("wizardSelectModel")}
-				data={groupedModels}
+				data={groupedModelsWithoutFollowDefault}
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}

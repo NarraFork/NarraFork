@@ -56,7 +56,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
 	if (path.startsWith("/projects/")) {
-		return ["common", "nav", "projects", "chapters", "graph", "settings"];
+		return ["common", "nav", "projects", "chapters", "graph", "narrator", "settings", "terminal"];
 	}
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];

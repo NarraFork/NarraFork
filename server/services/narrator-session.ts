@@ -74,6 +74,7 @@ import {
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
+	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
 	getMaxTransientRetries,
 	getRetryBackoffCeilMs,
@@ -1721,15 +1722,19 @@ export async function runAgentLoop(
 				}
 
 				// All attempts failed
-				logger.error("Context length exceeded after max retries", { narratorId });
+				const failure = getContextOverflowFailureError(overflow.reason);
+				logger.error("Context length exceeded after recovery failed", {
+					narratorId,
+					reason: overflow.reason,
+				});
 				await narratorService.updateStatus(narratorId, "idle", {
 					substatus: ["error"],
-					errorMessage: "Context too long, compact failed",
-					errorCode: "context_too_long_compact_failed",
+					errorMessage: failure.message,
+					errorCode: failure.errorCode,
 				});
 				active.events.emit("event", {
 					type: "error",
-					data: { message: "Context too long, compact failed" },
+					data: { message: failure.message, errorCode: failure.errorCode },
 				});
 				loopHadError = true;
 				break;

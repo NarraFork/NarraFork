@@ -13,6 +13,15 @@ export function localizeNarratorError(
 	if (errorCode === "context_too_long_compact_failed") {
 		return t("contextTooLongCompactFailed");
 	}
+	if (errorCode === "context_too_long_no_compact_boundary") {
+		return t("contextTooLongNoCompactBoundary");
+	}
+	if (errorCode === "context_too_long_recovery_exhausted") {
+		return t("contextTooLongRecoveryExhausted");
+	}
+	if (errorCode === "context_too_long_compact_noop") {
+		return t("contextTooLongCompactNoop");
+	}
 
 	if (errorCode === "empty_response") {
 		const match = errorMessage.match(EMPTY_RESPONSE_RE);

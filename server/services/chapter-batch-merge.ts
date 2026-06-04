@@ -1,14 +1,16 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import { mergeSessions } from "../db/schema";
+import { mergeSessions, narrators } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import type { Locale } from "../lib/prompt-i18n";
+import { getUserReplyInLanguage, type Locale } from "../lib/prompt-i18n";
 import { chapterFork } from "./chapter-fork";
 import { chapterMerge } from "./chapter-merge";
 import { chapterService } from "./chapter-service";
+import { narratorService } from "./narrator-service";
+import { sendMessage } from "./narrator-session";
 
 export interface BatchMergeInput {
 	/** The chapter to fork from as the merge base */
@@ -27,8 +29,22 @@ export interface BatchMergeInput {
 
 export type MergeDecision = "continue" | "cancel";
 
-const DECISION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const DECISION_POLL_INTERVAL_MS = 1000; // 1 second
+type MergeStrategy = "merge" | "squash" | "cherry-pick";
+type MergeSessionRow = typeof mergeSessions.$inferSelect;
+
+interface ProcessQueueInput {
+	mergeSessionId: string;
+	projectId: string;
+	targetChapterId: string;
+	sourceChapterIds: string[];
+	strategy: MergeStrategy;
+	isExistingTarget: boolean;
+	locale?: Locale | null;
+	userId?: string;
+	startIndex?: number;
+	mergedCount?: number;
+	preserveTargetOnFailure?: boolean;
+}
 
 /**
  * Resolve a pending merge conflict decision.
@@ -38,58 +54,21 @@ export async function resolveMergeDecision(
 	mergeSessionId: string,
 	decision: MergeDecision,
 ): Promise<void> {
-	const now = new Date().toISOString();
-	const [updated] = await db
-		.update(mergeSessions)
-		.set({
-			status: decision === "continue" ? "running" : "cancelled",
-			updatedAt: now,
-		})
-		.where(eq(mergeSessions.id, mergeSessionId))
-		.returning();
-
-	if (!updated) {
-		logger.warn("Merge decision for unknown session", { mergeSessionId });
-	}
+	await chapterBatchMerge.resolveDecision(mergeSessionId, decision);
 }
 
-/**
- * Wait for a user decision on a merge conflict by polling DB.
- * Returns "cancel" on timeout.
- */
-async function waitForDecision(mergeSessionId: string): Promise<MergeDecision> {
-	const startTime = Date.now();
-	while (Date.now() - startTime < DECISION_TIMEOUT_MS) {
-		const session = await db.query.mergeSessions.findFirst({
-			where: eq(mergeSessions.id, mergeSessionId),
-		});
-		if (!session) return "cancel";
-		if (session.status === "running") return "continue";
-		if (session.status === "cancelled") return "cancel";
-		// Still waiting_decision — poll again
-		await new Promise((r) => setTimeout(r, DECISION_POLL_INTERVAL_MS));
-	}
-	// Timeout — mark as cancelled
-	const now = new Date().toISOString();
-	await db
-		.update(mergeSessions)
-		.set({ status: "cancelled", error: "Decision timeout", updatedAt: now })
-		.where(eq(mergeSessions.id, mergeSessionId));
-	return "cancel";
+function sourceIdAt(session: MergeSessionRow): string | null {
+	return session.currentSourceChapterId ?? session.sourceChapterIds[session.currentIndex] ?? null;
 }
 
 export const chapterBatchMerge = {
 	/**
 	 * Orchestrate a batch merge:
-	 * 1. Fork base chapter into a new chapter
+	 * 1. Fork base chapter into a new chapter (unless merging into an existing target)
 	 * 2. Sequentially merge each source chapter into it
-	 * 3. On conflict: broadcast event, wait for user decision
-	 *    - continue → AI resolve, then next
-	 *    - cancel → delete the forked chapter, stop
-	 * 4. On completion: broadcast merge:completed
-	 *
-	 * Runs in the background (fire-and-forget from the HTTP handler).
-	 * All progress is communicated via eventBus → WebSocket and persisted to DB.
+	 * 3. On conflict: keep the target worktree conflicted, start the target narrator,
+	 *    then pause the session until the user chooses continue/cancel
+	 * 4. On continue: verify conflicts are resolved, commit, mark the source merged, then resume
 	 */
 	async run(input: BatchMergeInput): Promise<{ mergeSessionId: string; targetChapterId: string }> {
 		const mergeSessionId = generateId();
@@ -97,6 +76,9 @@ export const chapterBatchMerge = {
 		// Deduplicate source chapters while preserving order
 		const sourceChapterIds = [...new Set(input.sourceChapterIds)];
 
+		const base = await chapterService.getById(input.baseChapterId);
+		if (!base) throw new NotFoundError("Chapter", input.baseChapterId);
+		const projectId = base.projectId;
 		let targetChapterId: string;
 
 		if (input.targetChapterId) {
@@ -105,9 +87,7 @@ export const chapterBatchMerge = {
 			if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 			if (target.status !== "active") throw new ValidationError("Target chapter must be active");
 			if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
-			// Ensure target belongs to the same project as the base chapter
-			const base = await chapterService.getById(input.baseChapterId);
-			if (base && target.projectId !== base.projectId) {
+			if (target.projectId !== projectId) {
 				throw new ValidationError("Target chapter must be in the same project as the base chapter");
 			}
 			targetChapterId = target.id;
@@ -139,21 +119,22 @@ export const chapterBatchMerge = {
 		eventBus.emit({
 			type: "merge:started",
 			mergeSessionId,
+			projectId,
 			targetChapterId,
 			sourceChapterIds,
 		});
 
 		// Step 2: Process merges in background (fire-and-forget)
-		const isExistingTarget = !!input.targetChapterId;
-		this.processQueue(
+		this.processQueue({
 			mergeSessionId,
+			projectId,
 			targetChapterId,
 			sourceChapterIds,
 			strategy,
-			isExistingTarget,
-			input.locale,
-			input.userId,
-		).catch((err) => {
+			isExistingTarget: !!input.targetChapterId,
+			locale: input.locale,
+			userId: input.userId,
+		}).catch((err) => {
 			logger.error("Batch merge processQueue unhandled error", {
 				mergeSessionId,
 				error: String(err),
@@ -163,44 +144,37 @@ export const chapterBatchMerge = {
 		return { mergeSessionId, targetChapterId };
 	},
 
-	/** Internal: process the merge queue sequentially */
-	async processQueue(
-		mergeSessionId: string,
-		targetChapterId: string,
-		sourceChapterIds: string[],
-		strategy: "merge" | "squash" | "cherry-pick",
-		isExistingTarget: boolean,
-		locale?: Locale,
-		userId?: string,
-	): Promise<void> {
-		const total = sourceChapterIds.length;
-		let mergedCount = 0;
+	/** Internal: process the merge queue sequentially until complete or paused on conflict. */
+	async processQueue(input: ProcessQueueInput): Promise<void> {
+		const total = input.sourceChapterIds.length;
+		let mergedCount = input.mergedCount ?? 0;
 		let currentSourceId = "";
 
 		try {
-			for (let i = 0; i < total; i++) {
-				const sourceId = sourceChapterIds[i];
+			for (let i = input.startIndex ?? 0; i < total; i++) {
+				const sourceId = input.sourceChapterIds[i];
 				currentSourceId = sourceId;
 				const now = new Date().toISOString();
 
-				// Update progress in DB
 				await db
 					.update(mergeSessions)
 					.set({
+						status: "running",
 						currentIndex: i,
 						currentSourceChapterId: sourceId,
+						error: null,
 						updatedAt: now,
 					})
-					.where(eq(mergeSessions.id, mergeSessionId));
+					.where(eq(mergeSessions.id, input.mergeSessionId));
 
-				// Try merge
-				const result = await chapterMerge.merge(
+				const result = await chapterMerge.startInteractiveConflictMerge(
 					sourceId,
 					{
-						targetChapterId,
-						strategy,
+						targetChapterId: input.targetChapterId,
+						strategy: input.strategy,
 					},
-					userId,
+					input.locale ?? undefined,
+					input.userId,
 				);
 
 				if (result.success) {
@@ -209,14 +183,18 @@ export const chapterBatchMerge = {
 					await db
 						.update(mergeSessions)
 						.set({
+							status: "running",
 							mergedCount,
+							conflictFiles: null,
 							updatedAt: stepNow,
 						})
-						.where(eq(mergeSessions.id, mergeSessionId));
+						.where(eq(mergeSessions.id, input.mergeSessionId));
 
 					eventBus.emit({
 						type: "merge:step_ok",
-						mergeSessionId,
+						mergeSessionId: input.mergeSessionId,
+						projectId: input.projectId,
+						targetChapterId: input.targetChapterId,
 						sourceChapterId: sourceId,
 						index: i,
 						total,
@@ -225,106 +203,59 @@ export const chapterBatchMerge = {
 					continue;
 				}
 
-				// Conflict — persist state and broadcast, then wait for decision
+				const conflictFiles = result.conflictFiles ?? [];
 				const conflictNow = new Date().toISOString();
 				await db
 					.update(mergeSessions)
 					.set({
 						status: "waiting_decision",
-						conflictFiles: result.conflictFiles ?? [],
+						conflictFiles,
 						updatedAt: conflictNow,
 					})
-					.where(eq(mergeSessions.id, mergeSessionId));
+					.where(eq(mergeSessions.id, input.mergeSessionId));
+
+				let narratorId: string | undefined;
+				if (result.conflictPrompt) {
+					try {
+						narratorId = await this.startConflictNarrator(
+							input.targetChapterId,
+							result.conflictPrompt,
+							input.locale ?? undefined,
+							input.userId,
+						);
+					} catch (err) {
+						logger.error("Failed to start conflict resolution narrator; preserving merge chapter", {
+							mergeSessionId: input.mergeSessionId,
+							targetChapterId: input.targetChapterId,
+							error: String(err),
+						});
+					}
+				}
 
 				eventBus.emit({
 					type: "merge:conflict",
-					mergeSessionId,
+					mergeSessionId: input.mergeSessionId,
+					projectId: input.projectId,
+					targetChapterId: input.targetChapterId,
 					sourceChapterId: sourceId,
 					index: i,
 					total,
-					conflictFiles: result.conflictFiles ?? [],
+					conflictFiles,
+					narratorId,
 				});
-
-				const decision = await waitForDecision(mergeSessionId);
-
-				if (decision === "cancel") {
-					// Rollback: delete the forked chapter entirely (skip if merging into existing)
+				if (narratorId) {
 					eventBus.emit({
-						type: "merge:cancelled",
-						mergeSessionId,
-						reason: "User cancelled on conflict",
-					});
-					await this.rollback(mergeSessionId, targetChapterId, "User cancelled", isExistingTarget);
-					return;
-				}
-
-				// User chose continue — AI resolve
-				const aiNow = new Date().toISOString();
-				await db
-					.update(mergeSessions)
-					.set({
-						status: "ai_resolving",
-						updatedAt: aiNow,
-					})
-					.where(eq(mergeSessions.id, mergeSessionId));
-
-				eventBus.emit({
-					type: "merge:ai_resolving",
-					mergeSessionId,
-					sourceChapterId: sourceId,
-				});
-
-				const aiResult = await chapterMerge.aiResolveConflicts(
-					sourceId,
-					{ targetChapterId, strategy },
-					locale,
-					userId,
-				);
-
-				if (!aiResult.resolved) {
-					eventBus.emit({
-						type: "merge:error",
-						mergeSessionId,
+						type: "merge:ai_resolving",
+						mergeSessionId: input.mergeSessionId,
+						projectId: input.projectId,
+						targetChapterId: input.targetChapterId,
 						sourceChapterId: sourceId,
-						error: aiResult.error ?? "AI resolution failed",
+						narratorId,
 					});
-					eventBus.emit({
-						type: "merge:cancelled",
-						mergeSessionId,
-						reason: aiResult.error ?? "AI resolution failed",
-					});
-					await this.rollback(
-						mergeSessionId,
-						targetChapterId,
-						aiResult.error ?? "AI resolution failed",
-						isExistingTarget,
-					);
-					return;
 				}
-
-				mergedCount++;
-				const resolvedNow = new Date().toISOString();
-				await db
-					.update(mergeSessions)
-					.set({
-						status: "running",
-						mergedCount,
-						conflictFiles: null,
-						updatedAt: resolvedNow,
-					})
-					.where(eq(mergeSessions.id, mergeSessionId));
-
-				eventBus.emit({
-					type: "merge:step_ok",
-					mergeSessionId,
-					sourceChapterId: sourceId,
-					index: i,
-					total,
-					commitSha: aiResult.mergeResult?.commitSha,
-				});
+				return;
 			}
 
-			// All merges completed
 			const doneNow = new Date().toISOString();
 			await db
 				.update(mergeSessions)
@@ -332,31 +263,189 @@ export const chapterBatchMerge = {
 					status: "completed",
 					mergedCount,
 					currentIndex: total,
+					currentSourceChapterId: null,
+					conflictFiles: null,
+					error: null,
 					updatedAt: doneNow,
 				})
-				.where(eq(mergeSessions.id, mergeSessionId));
+				.where(eq(mergeSessions.id, input.mergeSessionId));
 
 			eventBus.emit({
 				type: "merge:completed",
-				mergeSessionId,
-				targetChapterId,
+				mergeSessionId: input.mergeSessionId,
+				projectId: input.projectId,
+				targetChapterId: input.targetChapterId,
 				mergedCount,
 			});
 		} catch (err) {
 			logger.error("Batch merge unexpected error", {
-				mergeSessionId,
+				mergeSessionId: input.mergeSessionId,
 				sourceChapterId: currentSourceId,
 				error: String(err),
 			});
 			eventBus.emit({
 				type: "merge:error",
-				mergeSessionId,
+				mergeSessionId: input.mergeSessionId,
+				projectId: input.projectId,
+				targetChapterId: input.targetChapterId,
 				sourceChapterId: currentSourceId,
 				error: String(err),
 			});
-			// Rollback: delete the forked chapter (skip if merging into existing)
-			await this.rollback(mergeSessionId, targetChapterId, String(err), isExistingTarget);
+			await this.rollback(
+				input.mergeSessionId,
+				input.targetChapterId,
+				String(err),
+				input.isExistingTarget || input.preserveTargetOnFailure === true,
+			);
 		}
+	},
+
+	async startConflictNarrator(
+		targetChapterId: string,
+		prompt: string,
+		locale?: Locale,
+		userId?: string,
+	): Promise<string> {
+		const target = await chapterService.getById(targetChapterId);
+		if (!target) throw new NotFoundError("Chapter", targetChapterId);
+		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
+
+		let narrator = await db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
+		});
+		if (!narrator) {
+			narrator = await narratorService.create({
+				chapterId: targetChapterId,
+				type: "primary",
+				cwd: target.worktreePath,
+				permissionMode: "default",
+			});
+		}
+
+		const replyInUserLanguage = userId ? await getUserReplyInLanguage(userId) : false;
+		await sendMessage(narrator.id, prompt, [], locale ?? "en", replyInUserLanguage, null, userId);
+		return narrator.id;
+	},
+
+	async resolveDecision(mergeSessionId: string, decision: MergeDecision): Promise<void> {
+		const session = await db.query.mergeSessions.findFirst({
+			where: eq(mergeSessions.id, mergeSessionId),
+		});
+		if (!session) {
+			logger.warn("Merge decision for unknown session", { mergeSessionId });
+			return;
+		}
+
+		const target = await chapterService.getById(session.targetChapterId);
+		if (!target) throw new NotFoundError("Chapter", session.targetChapterId);
+		const projectId = target.projectId;
+		const sourceId = sourceIdAt(session);
+		if (!sourceId) {
+			throw new ValidationError("Merge session has no current source chapter");
+		}
+
+		if (decision === "cancel") {
+			const now = new Date().toISOString();
+			await db
+				.update(mergeSessions)
+				.set({ status: "cancelled", error: "User cancelled on conflict", updatedAt: now })
+				.where(eq(mergeSessions.id, mergeSessionId));
+			eventBus.emit({
+				type: "merge:cancelled",
+				mergeSessionId,
+				projectId,
+				targetChapterId: session.targetChapterId,
+				reason: "User cancelled on conflict",
+			});
+			return;
+		}
+
+		if (session.status !== "waiting_decision") {
+			logger.warn("Merge continue decision ignored for non-waiting session", {
+				mergeSessionId,
+				status: session.status,
+			});
+			return;
+		}
+
+		const result = await chapterMerge.completeInteractiveConflictMerge(
+			sourceId,
+			{
+				targetChapterId: session.targetChapterId,
+				strategy: session.strategy,
+			},
+			undefined,
+		);
+		if (!result.resolved) {
+			const remainingFiles = result.remainingFiles ?? [];
+			await chapterMerge.ensurePendingMergeEdge(
+				sourceId,
+				session.targetChapterId,
+				session.strategy,
+			);
+			const now = new Date().toISOString();
+			await db
+				.update(mergeSessions)
+				.set({
+					status: "waiting_decision",
+					conflictFiles: remainingFiles,
+					error: result.error ?? "Merge conflicts remain",
+					updatedAt: now,
+				})
+				.where(eq(mergeSessions.id, mergeSessionId));
+			eventBus.emit({
+				type: "merge:conflict",
+				mergeSessionId,
+				projectId,
+				targetChapterId: session.targetChapterId,
+				sourceChapterId: sourceId,
+				index: session.currentIndex,
+				total: session.sourceChapterIds.length,
+				conflictFiles: remainingFiles,
+			});
+			return;
+		}
+
+		const mergedCount = session.mergedCount + 1;
+		const now = new Date().toISOString();
+		await db
+			.update(mergeSessions)
+			.set({
+				status: "running",
+				mergedCount,
+				conflictFiles: null,
+				error: null,
+				updatedAt: now,
+			})
+			.where(eq(mergeSessions.id, mergeSessionId));
+		eventBus.emit({
+			type: "merge:step_ok",
+			mergeSessionId,
+			projectId,
+			targetChapterId: session.targetChapterId,
+			sourceChapterId: sourceId,
+			index: session.currentIndex,
+			total: session.sourceChapterIds.length,
+			commitSha: result.mergeResult?.commitSha,
+		});
+
+		this.processQueue({
+			mergeSessionId,
+			projectId,
+			targetChapterId: session.targetChapterId,
+			sourceChapterIds: session.sourceChapterIds,
+			strategy: session.strategy,
+			isExistingTarget: true,
+			locale: session.locale as Locale | null,
+			startIndex: session.currentIndex + 1,
+			mergedCount,
+			preserveTargetOnFailure: true,
+		}).catch((err) => {
+			logger.error("Batch merge resume unhandled error", {
+				mergeSessionId,
+				error: String(err),
+			});
+		});
 	},
 
 	/** Delete the forked chapter on cancellation/failure and update session status.
@@ -379,7 +468,7 @@ export const chapterBatchMerge = {
 				});
 			}
 		} else {
-			logger.info("Batch merge into existing chapter failed, skipping chapter deletion", {
+			logger.info("Batch merge failed, preserving target chapter", {
 				mergeSessionId,
 				targetChapterId,
 			});
@@ -399,7 +488,7 @@ export const chapterBatchMerge = {
 	},
 
 	/**
-	 * Mark stale sessions (running/ai_resolving) as error on server startup.
+	 * Mark stale sessions (running/ai_resolving/waiting_decision) as error on server startup.
 	 * These sessions were interrupted by a server restart.
 	 */
 	async cleanupStaleSessions(): Promise<void> {

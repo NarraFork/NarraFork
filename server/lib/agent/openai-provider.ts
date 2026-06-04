@@ -1093,6 +1093,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				headers["ChatGPT-Account-Id"] = accountId;
 			}
 		}
+		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
+			if (value) headers[key] = value;
+		}
 		return headers;
 	}
 

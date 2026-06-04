@@ -64,11 +64,46 @@ interface OverflowCompacted extends OverflowResultBase {
 	newConversationId: ReturnType<typeof randomUUID>;
 }
 
+export type ContextOverflowFailureReason =
+	| "max_retries_exceeded"
+	| "no_compact_boundary"
+	| "compact_noop"
+	| "compact_failed";
+
 interface OverflowFailed extends OverflowResultBase {
 	action: "failed";
+	reason: ContextOverflowFailureReason;
 }
 
 export type OverflowResult = OverflowPruned | OverflowCompacted | OverflowFailed;
+
+export function getContextOverflowFailureError(reason: ContextOverflowFailureReason): {
+	message: string;
+	errorCode: string;
+} {
+	switch (reason) {
+		case "max_retries_exceeded":
+			return {
+				message: "Context is still too long after automatic recovery attempts",
+				errorCode: "context_too_long_recovery_exhausted",
+			};
+		case "no_compact_boundary":
+			return {
+				message: "Context is too long, but there is not enough older conversation to compact",
+				errorCode: "context_too_long_no_compact_boundary",
+			};
+		case "compact_noop":
+			return {
+				message: "Context is too long, but compact did not reduce the conversation",
+				errorCode: "context_too_long_compact_noop",
+			};
+		case "compact_failed":
+			return {
+				message: "Context too long, compact failed",
+				errorCode: "context_too_long_compact_failed",
+			};
+	}
+}
 
 /**
  * Handle a context-length-exceeded situation with aggressive prune → compact
@@ -96,7 +131,7 @@ export async function handleContextOverflow(opts: {
 	overflowRetries++;
 
 	if (overflowRetries > opts.maxRetries) {
-		return { action: "failed", overflowRetries };
+		return { action: "failed", overflowRetries, reason: "max_retries_exceeded" };
 	}
 
 	logger.warn("Context length exceeded, attempting emergency recovery", {
@@ -217,7 +252,7 @@ export async function handleContextOverflow(opts: {
 	);
 	if (!boundaryMessageId) {
 		logger.warn("No compact boundary found", { narratorId });
-		return { action: "failed", overflowRetries };
+		return { action: "failed", overflowRetries, reason: "no_compact_boundary" };
 	}
 
 	try {
@@ -232,14 +267,14 @@ export async function handleContextOverflow(opts: {
 			narratorId,
 			boundaryMessageId,
 		});
+		return { action: "failed", overflowRetries, reason: "compact_noop" };
 	} catch (compactErr) {
 		logger.error("Emergency compact failed", {
 			narratorId,
 			error: String(compactErr),
 		});
+		return { action: "failed", overflowRetries, reason: "compact_failed" };
 	}
-
-	return { action: "failed", overflowRetries };
 }
 
 // ── Transient error retry ────────────────────────────────────────────────────

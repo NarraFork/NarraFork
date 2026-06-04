@@ -444,6 +444,12 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 		broadcastToNarrator(event.narratorId, event.message);
 	});
 
+	// === Batch merge progress broadcast ===
+	eventBus.onAny((event) => {
+		if (!event.type.startsWith("merge:")) return;
+		broadcastToAll(event as unknown as Record<string, unknown>);
+	});
+
 	// === Codex quota overview broadcast ===
 	eventBus.on("codex:quota_overview_updated", (event) => {
 		broadcastToAll({ type: "codex_quota_overview_updated", overview: event.overview });

@@ -7,8 +7,8 @@ import {
 	getNugCachedModelsByProvider,
 	type NugModelInfo,
 	saveAllCachedNugModels,
-	setNugCachedModels,
 } from "../lib/nug-model-cache";
+import { applyNugModelCatalogUpdate } from "../lib/nug-model-sync";
 import {
 	type NUGProviderConfig,
 	nugProviderPrefix,
@@ -212,7 +212,9 @@ registerNugModelLister(() => {
 });
 
 /** Fetch models from NUG service (/v1/models endpoint). */
-async function fetchNugModels(config: NUGProviderConfig): Promise<NugModelInfo[]> {
+async function fetchNugModels(
+	config: NUGProviderConfig,
+): Promise<{ models: NugModelInfo[]; modelHash?: string }> {
 	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
 	if (!baseUrl) {
 		throw new Error(`NUG base URL not configured for provider "${config.name}"`);
@@ -224,6 +226,12 @@ async function fetchNugModels(config: NUGProviderConfig): Promise<NugModelInfo[]
 	const provider = new NugProvider(config);
 	const json = await provider.getModels();
 	const models = (json.models ?? []) as NugModelInfo[];
+	const modelHash =
+		typeof json.modelHash === "string"
+			? json.modelHash
+			: typeof json.hash === "string"
+				? json.hash
+				: undefined;
 
 	const seen = new Set<string>();
 	const unique = models.filter((m) => {
@@ -237,7 +245,7 @@ async function fetchNugModels(config: NUGProviderConfig): Promise<NugModelInfo[]
 		const bId = String(b.id ?? "");
 		return aId.localeCompare(bId);
 	});
-	return unique;
+	return { models: unique, modelHash };
 }
 
 // === Routes ===
@@ -248,12 +256,23 @@ nugRoutes.get("/models", (c) => {
 
 nugRoutes.post("/models/refresh", async (c) => {
 	const providers = settings.nugProviders ?? [];
-	const results: Array<{ providerId: string; name: string; count: number; error?: string }> = [];
+	const results: Array<{
+		providerId: string;
+		name: string;
+		count: number;
+		modelHash?: string;
+		error?: string;
+	}> = [];
+	let changedContextWindows = false;
 	for (const p of providers) {
 		try {
-			const models = await fetchNugModels(p);
-			setNugCachedModels(p.id, models);
-			results.push({ providerId: p.id, name: p.name, count: models.length });
+			const { models, modelHash } = await fetchNugModels(p);
+			const applied = applyNugModelCatalogUpdate(p, models, modelHash, {
+				saveCache: false,
+				saveSettingsOnContextChange: false,
+			});
+			changedContextWindows = applied.changedContextWindows || changedContextWindows;
+			results.push({ providerId: p.id, name: p.name, count: applied.models.length, modelHash });
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
 			logger.error("NUG listModels refresh failed", { error: msg, provider: p.name });
@@ -261,7 +280,13 @@ nugRoutes.post("/models/refresh", async (c) => {
 		}
 	}
 	saveAllCachedNugModels();
-	return c.json({ results, models: getNugCachedModels(), fromCache: false });
+	if (changedContextWindows) saveSettings(settings);
+	return c.json({
+		results,
+		models: getNugCachedModels(),
+		fromCache: false,
+		modelContextWindows: settings.agent.modelContextWindows ?? {},
+	});
 });
 
 nugRoutes.get("/providers/:id/models", (c) => {
@@ -277,10 +302,14 @@ nugRoutes.post("/providers/:id/models/refresh", async (c) => {
 		return c.json({ error: `Provider "${id}" not found` }, 404);
 	}
 	try {
-		const models = await fetchNugModels(config);
-		setNugCachedModels(id, models);
-		saveAllCachedNugModels();
-		return c.json({ models, fromCache: false });
+		const { models, modelHash } = await fetchNugModels(config);
+		const applied = applyNugModelCatalogUpdate(config, models, modelHash);
+		return c.json({
+			models: applied.models,
+			fromCache: false,
+			modelHash: applied.modelHash,
+			modelContextWindows: settings.agent.modelContextWindows ?? {},
+		});
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG listModels refresh failed", { error: msg, provider: config.name });

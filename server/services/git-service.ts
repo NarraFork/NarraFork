@@ -74,8 +74,30 @@ export interface GitStatusSummary {
 	linesRemoved: number;
 }
 
+const MAX_GIT_FAILURE_OUTPUT_CHARS = 4000;
+
 function stripTrailingLineBreaks(text: string): string {
 	return text.replace(/[\r\n]+$/, "");
+}
+
+function combinedCommandOutput(result: ExecResult): string {
+	return [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n");
+}
+
+function truncateGitFailureOutput(output: string): string {
+	if (output.length <= MAX_GIT_FAILURE_OUTPUT_CHARS) return output;
+	return `${output.slice(0, MAX_GIT_FAILURE_OUTPUT_CHARS)}\n...[truncated]`;
+}
+
+function gitFailureMessage(prefix: string, result: ExecResult): string {
+	const output = combinedCommandOutput(result);
+	if (!output) return `${prefix} (exit code ${result.exitCode})`;
+	return `${prefix}: ${truncateGitFailureOutput(output)}`;
+}
+
+function commandOutputMentionsConflict(result: ExecResult): boolean {
+	const output = combinedCommandOutput(result).toLowerCase();
+	return output.includes("conflict") || output.includes("冲突");
 }
 
 function normalizeExecOptions(options: boolean | ExecOptions = {}): Required<ExecOptions> {
@@ -101,7 +123,8 @@ async function exec(
 			logger.error("git command failed", {
 				args: args.join(" "),
 				cwd,
-				stderr: trimmedStderr,
+				stdout: trimmedStdout ? truncateGitFailureOutput(trimmedStdout) : undefined,
+				stderr: trimmedStderr ? truncateGitFailureOutput(trimmedStderr) : undefined,
 				exitCode: result.exitCode,
 				optionalLocks,
 			});
@@ -126,6 +149,25 @@ async function exec(
 
 function execRead(args: string[], cwd: string, silent = false): Promise<ExecResult> {
 	return exec(args, cwd, { silent, optionalLocks: false });
+}
+
+async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
+	const statusResult = await execRead(
+		["diff", "--name-only", "--diff-filter=U"],
+		worktreePath,
+		true,
+	);
+	if (statusResult.exitCode !== 0) return [];
+	return statusResult.stdout.split("\n").filter(Boolean);
+}
+
+async function detectConflictFilesAfterFailedGitCommand(
+	worktreePath: string,
+	result: ExecResult,
+): Promise<string[] | null> {
+	const conflictFiles = await detectUnmergedFiles(worktreePath);
+	if (conflictFiles.length > 0) return conflictFiles;
+	return commandOutputMentionsConflict(result) ? [] : null;
 }
 
 interface LineStats {
@@ -482,42 +524,30 @@ export const gitService = {
 				const fallbackArgs = ["merge", "--no-ff", "-m", message, sourceBranch];
 				const fallbackResult = await exec(fallbackArgs, worktreePath);
 				if (fallbackResult.exitCode !== 0) {
-					if (
-						fallbackResult.stdout.includes("CONFLICT") ||
-						fallbackResult.stderr.includes("CONFLICT")
-					) {
-						const statusResult = await execRead(
-							["diff", "--name-only", "--diff-filter=U"],
-							worktreePath,
-						);
-						const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
-						return { success: false, conflictFiles };
-					}
-					throw new GitError(`Merge failed: ${fallbackResult.stderr}`);
+					const conflictFiles = await detectConflictFilesAfterFailedGitCommand(
+						worktreePath,
+						fallbackResult,
+					);
+					if (conflictFiles) return { success: false, conflictFiles };
+					throw new GitError(gitFailureMessage("Merge failed", fallbackResult));
 				}
 				if (strategy === "squash") {
 					const commitResult = await exec(["commit", "-m", message], worktreePath);
 					if (commitResult.exitCode !== 0)
-						throw new GitError(`Squash commit failed: ${commitResult.stderr}`);
+						throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 				}
 				const sha = await this.getHeadCommit(worktreePath);
 				return { success: true, commitSha: sha, isFastForward: false };
 			}
-			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
-				const statusResult = await execRead(
-					["diff", "--name-only", "--diff-filter=U"],
-					worktreePath,
-				);
-				const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
-				return { success: false, conflictFiles };
-			}
-			throw new GitError(`Merge failed: ${result.stderr}`);
+			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
+			if (conflictFiles) return { success: false, conflictFiles };
+			throw new GitError(gitFailureMessage("Merge failed", result));
 		}
 
 		if (strategy === "squash") {
 			const commitResult = await exec(["commit", "-m", message], worktreePath);
 			if (commitResult.exitCode !== 0)
-				throw new GitError(`Squash commit failed: ${commitResult.stderr}`);
+				throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 		}
 
 		const sha = await this.getHeadCommit(worktreePath);
@@ -543,16 +573,12 @@ export const gitService = {
 		for (const commit of commits) {
 			const result = await exec(["cherry-pick", commit], worktreePath);
 			if (result.exitCode !== 0) {
-				if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
-					const statusResult = await execRead(
-						["diff", "--name-only", "--diff-filter=U"],
-						worktreePath,
-					);
-					const conflictFiles = statusResult.stdout.split("\n").filter(Boolean);
+				const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
+				if (conflictFiles) {
 					await exec(["cherry-pick", "--abort"], worktreePath);
 					return { success: false, conflictFiles };
 				}
-				throw new GitError(`Cherry-pick failed: ${result.stderr}`);
+				throw new GitError(gitFailureMessage("Cherry-pick failed", result));
 			}
 		}
 
@@ -576,13 +602,14 @@ export const gitService = {
 	}> {
 		const result = await exec(["rebase", ontoBranch], worktreePath);
 		if (result.exitCode !== 0) {
-			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
+			if (conflictFiles) {
 				return {
 					success: false,
 					conflictFiles: await this.getConflictFilesWithLines(worktreePath),
 				};
 			}
-			throw new GitError(`Rebase failed: ${result.stderr}`);
+			throw new GitError(gitFailureMessage("Rebase failed", result));
 		}
 		const sha = await this.getHeadCommit(worktreePath);
 		return { success: true, commitSha: sha };
@@ -601,13 +628,14 @@ export const gitService = {
 		await exec(["add", "-A"], worktreePath);
 		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath);
 		if (result.exitCode !== 0) {
-			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
+			if (conflictFiles) {
 				return {
 					success: false,
 					conflictFiles: await this.getConflictFilesWithLines(worktreePath),
 				};
 			}
-			throw new GitError(`Rebase continue failed: ${result.stderr}`);
+			throw new GitError(gitFailureMessage("Rebase continue failed", result));
 		}
 		const sha = await this.getHeadCommit(worktreePath);
 		return { success: true, commitSha: sha };
@@ -647,19 +675,16 @@ export const gitService = {
 
 		const result = await exec(args, worktreePath);
 		if (result.exitCode !== 0) {
-			if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
-				const conflictFiles = await this.getConflictFiles(worktreePath);
-				return { hasConflicts: true, conflictFiles };
-			}
-			throw new GitError(`Merge failed: ${result.stderr}`);
+			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
+			if (conflictFiles) return { hasConflicts: true, conflictFiles };
+			throw new GitError(gitFailureMessage("Merge failed", result));
 		}
 		return { hasConflicts: false, conflictFiles: [] };
 	},
 
 	/** Get list of files with unresolved merge conflicts */
 	async getConflictFiles(worktreePath: string): Promise<string[]> {
-		const result = await execRead(["diff", "--name-only", "--diff-filter=U"], worktreePath);
-		return result.stdout.split("\n").filter(Boolean);
+		return detectUnmergedFiles(worktreePath);
 	},
 
 	async getStatus(worktreePath: string): Promise<string> {
@@ -1201,18 +1226,11 @@ export const gitService = {
 		return withWorktreeLock(worktreePath, async () => {
 			const result = await exec(["stash", "pop"], worktreePath, true);
 			if (result.exitCode !== 0) {
-				// Check for conflicts via string matching + porcelain status fallback
-				if (result.stdout.includes("CONFLICT") || result.stderr.includes("CONFLICT")) {
+				const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
+				if (hasUnmerged || commandOutputMentionsConflict(result)) {
 					return { hasConflicts: true };
 				}
-				const statusResult = await execRead(["status", "--porcelain"], worktreePath, true);
-				const hasUnmerged = statusResult.stdout
-					.split("\n")
-					.some((l) => l.startsWith("UU") || l.startsWith("AA") || l.startsWith("DD"));
-				if (hasUnmerged) {
-					return { hasConflicts: true };
-				}
-				throw new GitError(`git stash pop failed: ${result.stderr}`);
+				throw new GitError(gitFailureMessage("git stash pop failed", result));
 			}
 			return { hasConflicts: false };
 		});

@@ -94,9 +94,12 @@ type MergeProgressEvent = {
 	sourceChapterId?: string;
 	sourceChapterIds?: string[];
 	currentIndex?: number;
+	index?: number;
 	mergedCount?: number;
 	totalCount?: number;
+	total?: number;
 	conflictFiles?: string[];
+	narratorId?: string;
 	error?: string;
 	message?: string;
 };
@@ -795,8 +798,10 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		(event: MergeProgressEvent) => {
 			if (!event.mergeSessionId || !mergeEventBelongsToCurrentProject(event)) return;
 			const pending = pendingMergeSessionsRef.current.get(event.mergeSessionId);
-			const notificationKey = `${event.mergeSessionId}:${event.type}:${event.currentIndex ?? ""}:${event.sourceChapterId ?? ""}`;
-			if (notifiedMergeSessionsRef.current.get(event.mergeSessionId) === notificationKey) return;
+			const notificationKey = `${event.mergeSessionId}:${event.type}:${event.index ?? event.currentIndex ?? ""}:${event.sourceChapterId ?? ""}`;
+			const isDuplicate =
+				notifiedMergeSessionsRef.current.get(event.mergeSessionId) === notificationKey;
+			if (isDuplicate && event.type !== "merge:conflict") return;
 			notifiedMergeSessionsRef.current.set(event.mergeSessionId, notificationKey);
 
 			if (event.type === "merge:completed") {
@@ -839,9 +844,43 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					}),
 					color: "red",
 				});
+			} else if (event.type === "merge:ai_resolving") {
+				const targetId = event.targetChapterId ?? pending?.targetChapterId;
+				if (targetId) {
+					setExpandedNodes((prev) => {
+						const next = new Set(prev);
+						next.add(targetId);
+						return next;
+					});
+				}
+				notifications.show({
+					message: t("selection.mergeAiResolving"),
+					color: "blue",
+				});
 			} else if (event.type === "merge:conflict") {
 				const notificationId = `merge-conflict-${event.mergeSessionId}`;
 				const files = event.conflictFiles?.join(", ") || "unknown";
+				const targetId = event.targetChapterId ?? pending?.targetChapterId;
+				const openTargetChapter = () => {
+					if (pending?.draftNodeId) {
+						removePendingDraftNode(pending.draftNodeId);
+						pendingMergeSessionsRef.current.set(event.mergeSessionId ?? "", {
+							...pending,
+							draftNodeId: undefined,
+							targetChapterId: targetId ?? pending.targetChapterId,
+						});
+					}
+					if (targetId) {
+						setExpandedNodes((prev) => {
+							const next = new Set(prev);
+							next.add(targetId);
+							return next;
+						});
+					}
+					queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+					queryClient.invalidateQueries({ queryKey: ["chapters"] });
+				};
+				openTargetChapter();
 				notifications.show({
 					id: notificationId,
 					title: t("selection.mergeConflictTitle"),
@@ -851,6 +890,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 								{t("selection.mergeConflict", { files })}
 							</Text>
 							<Group gap="xs">
+								<Button size="xs" variant="light" onClick={openTargetChapter}>
+									{t("selection.mergeConflictOpen")}
+								</Button>
 								<Button
 									size="xs"
 									onClick={() =>
@@ -1991,32 +2033,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
-			{(graphRuntimeStatus.graphReadRefresh || graphRuntimeStatus.degraded) && (
+			{graphRuntimeStatus.degraded && (
 				<Stack gap="xs" p="sm" style={{ flex: "none" }}>
-					{graphRuntimeStatus.graphReadRefresh && (
-						<Alert color="blue" variant="light" title={t("runtimeStatusTitle")}>
-							<Text size="sm">{t("runtimeRefreshDesc")}</Text>
-						</Alert>
-					)}
-					{graphRuntimeStatus.degraded && (
-						<Alert color="yellow" variant="light" title={t("runtimeDegradedTitle")}>
-							<Stack gap={4}>
-								<Text size="sm">{t("runtimeDegradedDesc")}</Text>
-								{graphRuntimeStatus.fallbackMessages.length > 0 && (
-									<Stack gap={2}>
-										<Text size="xs" fw={600}>
-											{t("runtimeFallbacksTitle")}
-										</Text>
-										{graphRuntimeStatus.fallbackMessages.map((message) => (
-											<Text key={message} size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-												{message}
-											</Text>
-										))}
-									</Stack>
-								)}
-							</Stack>
-						</Alert>
-					)}
+					<Alert color="yellow" variant="light" title={t("runtimeDegradedTitle")}>
+						<Text size="sm">{t("runtimeDegradedDesc")}</Text>
+					</Alert>
 				</Stack>
 			)}
 			<Box ref={flowWrapperRef} style={{ flex: 1, position: "relative", minHeight: 0 }}>

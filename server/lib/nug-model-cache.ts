@@ -14,6 +14,8 @@ export interface NugModelInfo extends Record<string, unknown> {
 	channel?: string;
 	channelType?: NugChannelType;
 	available?: boolean;
+	contextLength?: number;
+	contextWindow?: number;
 }
 
 export interface ResolvedNugModelMeta {
@@ -32,10 +34,28 @@ export interface NugModelsGroup {
 	providerId: string;
 	providerName: string;
 	models: NugModelInfo[];
+	modelHash?: string;
+}
+
+export interface NugModelCacheEntry {
+	models: NugModelInfo[];
+	modelHash?: string;
+	fetchedAt?: number;
 }
 
 const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
+const cachedModelHashByProvider = new Map<string, string>();
+const cachedModelsFetchedAtByProvider = new Map<string, number>();
 
+
+function numericModelField(raw: Record<string, unknown>, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const value = raw[key];
+		const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+		if (Number.isFinite(n) && n > 0) return Math.trunc(n);
+	}
+	return undefined;
+}
 
 function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 	const id = String(raw.id ?? "").trim();
@@ -46,6 +66,16 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 	if (raw.channel != null) info.channel = String(raw.channel);
 	if (raw.channelType != null) info.channelType = String(raw.channelType);
 	if (typeof raw.available === "boolean") info.available = raw.available;
+	const contextLength = numericModelField(raw, [
+		"contextLength",
+		"contextWindow",
+		"context_length",
+		"context_window",
+	]);
+	if (contextLength != null) {
+		info.contextLength = contextLength;
+		info.contextWindow = contextLength;
+	}
 	return info;
 }
 
@@ -62,16 +92,40 @@ function normalizeModels(models: Array<Record<string, unknown>>): NugModelInfo[]
 	return out;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeModelHash(value: unknown): string | undefined {
+	const hash = typeof value === "string" ? value.trim() : "";
+	return hash || undefined;
+}
+
+function loadProviderCacheEntry(providerId: string, value: unknown): void {
+	if (Array.isArray(value)) {
+		cachedModelsByProvider.set(providerId, normalizeModels(value as Array<Record<string, unknown>>));
+		return;
+	}
+	if (!isRecord(value)) return;
+	const rawModels = Array.isArray(value.models) ? value.models : [];
+	cachedModelsByProvider.set(providerId, normalizeModels(rawModels as Array<Record<string, unknown>>));
+	const modelHash = normalizeModelHash(value.modelHash ?? value.hash);
+	if (modelHash) cachedModelHashByProvider.set(providerId, modelHash);
+	const fetchedAt = typeof value.fetchedAt === "number" ? value.fetchedAt : undefined;
+	if (fetchedAt != null) cachedModelsFetchedAtByProvider.set(providerId, fetchedAt);
+}
+
 export function loadAllCachedNugModels(): void {
 	try {
 		if (!existsSync(cachePath)) return;
-		const data = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<
-			string,
-			Array<Record<string, unknown>>
-		>;
+		const data = JSON.parse(readFileSync(cachePath, "utf-8")) as unknown;
 		cachedModelsByProvider.clear();
-		for (const [id, models] of Object.entries(data)) {
-			cachedModelsByProvider.set(id, normalizeModels(models));
+		cachedModelHashByProvider.clear();
+		cachedModelsFetchedAtByProvider.clear();
+		const providers = isRecord(data) && isRecord(data.providers) ? data.providers : data;
+		if (!isRecord(providers)) return;
+		for (const [id, value] of Object.entries(providers)) {
+			loadProviderCacheEntry(id, value);
 		}
 	} catch {
 		// Corrupt cache is non-critical.
@@ -81,11 +135,15 @@ export function loadAllCachedNugModels(): void {
 export function saveAllCachedNugModels(): void {
 	try {
 		mkdirSync(cacheDir, { recursive: true });
-		const data: Record<string, NugModelInfo[]> = {};
+		const providers: Record<string, NugModelCacheEntry> = {};
 		for (const [id, models] of cachedModelsByProvider) {
-			data[id] = models;
+			providers[id] = {
+				models,
+				modelHash: cachedModelHashByProvider.get(id),
+				fetchedAt: cachedModelsFetchedAtByProvider.get(id),
+			};
 		}
-		writeFileSync(cachePath, JSON.stringify(data));
+		writeFileSync(cachePath, JSON.stringify({ version: 1, providers }));
 	} catch {
 		// Non-critical.
 	}
@@ -94,18 +152,42 @@ export function saveAllCachedNugModels(): void {
 export function setNugCachedModels(
 	providerId: string,
 	models: Array<Record<string, unknown>>,
+	modelHash?: string | null,
 ): NugModelInfo[] {
 	const normalized = normalizeModels(models);
 	cachedModelsByProvider.set(providerId, normalized);
+	const normalizedHash = normalizeModelHash(modelHash);
+	if (normalizedHash) {
+		cachedModelHashByProvider.set(providerId, normalizedHash);
+		cachedModelsFetchedAtByProvider.set(providerId, Date.now());
+	} else {
+		cachedModelHashByProvider.delete(providerId);
+		cachedModelsFetchedAtByProvider.delete(providerId);
+	}
 	return normalized;
 }
 
 export function deleteNugCachedModels(providerId: string): boolean {
-	return cachedModelsByProvider.delete(providerId);
+	const deletedModels = cachedModelsByProvider.delete(providerId);
+	const deletedHash = cachedModelHashByProvider.delete(providerId);
+	const deletedFetchedAt = cachedModelsFetchedAtByProvider.delete(providerId);
+	return deletedModels || deletedHash || deletedFetchedAt;
 }
 
 export function getNugCachedModelsByProvider(providerId: string): NugModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];
+}
+
+export function getNugCachedModelHash(providerId: string): string | undefined {
+	return cachedModelHashByProvider.get(providerId);
+}
+
+export function getNugCachedModelsEntry(providerId: string): NugModelCacheEntry {
+	return {
+		models: getNugCachedModelsByProvider(providerId),
+		modelHash: cachedModelHashByProvider.get(providerId),
+		fetchedAt: cachedModelsFetchedAtByProvider.get(providerId),
+	};
 }
 
 export function getNugCachedModels(): NugModelInfo[] {
@@ -129,6 +211,7 @@ export function getNugCachedModelsGrouped(providers: NUGProviderConfig[] = []): 
 			providerId: p.id,
 			providerName: p.name,
 			models: cachedModelsByProvider.get(p.id) ?? [],
+			modelHash: cachedModelHashByProvider.get(p.id),
 		}));
 }
 

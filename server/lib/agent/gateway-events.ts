@@ -22,6 +22,11 @@ import type { ParsedStreamEvent } from "./provider";
 /** Gateway event type names injected by the unified gateway. */
 const QUEUE_EVENT = "queueEvent";
 const QUOTA_BALANCE_EVENT = "quotaBalanceEvent";
+const MODEL_CATALOG_EVENT = "modelCatalogEvent";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value != null && typeof value === "object" && !Array.isArray(value);
+}
 
 /**
  * Try to parse a gateway-injected event from an SSE `event:` type + `data:` JSON pair.
@@ -56,6 +61,20 @@ export function parseGatewaySSEEvent(
 		};
 	}
 
+	if (eventType === MODEL_CATALOG_EVENT) {
+		if (!Array.isArray(data.models)) {
+			return null;
+		}
+		const modelHash =
+			typeof data.modelHash === "string"
+				? data.modelHash
+				: typeof data.hash === "string"
+					? data.hash
+					: undefined;
+		const models = data.models.filter(isRecord);
+		return { nugModelCatalog: { modelHash, models } };
+	}
+
 	return null;
 }
 
@@ -76,5 +95,9 @@ export function parseGatewayDataEvent(data: Record<string, unknown>): ParsedStre
  * Used by SSE parsers to skip normal parsing for gateway events.
  */
 export function isGatewayEventType(eventType: string): boolean {
-	return eventType === QUEUE_EVENT || eventType === QUOTA_BALANCE_EVENT;
+	return (
+		eventType === QUEUE_EVENT ||
+		eventType === QUOTA_BALANCE_EVENT ||
+		eventType === MODEL_CATALOG_EVENT
+	);
 }

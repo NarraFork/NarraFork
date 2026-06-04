@@ -90,6 +90,8 @@ export interface ParsedStreamEvent {
 	quotaBalance?: string | null;
 	/** Optional multiline quota details to show in the quota tooltip. */
 	detailedQuotaBalance?: string | null;
+	/** NUG model catalog update sent when the client's cached model hash is stale. */
+	nugModelCatalog?: { modelHash?: string; models: Array<Record<string, unknown>> };
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

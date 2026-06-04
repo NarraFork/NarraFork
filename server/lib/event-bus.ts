@@ -48,12 +48,15 @@ export type NarraForkEvent =
 	| {
 			type: "merge:started";
 			mergeSessionId: string;
+			projectId: string;
 			targetChapterId: string;
 			sourceChapterIds: string[];
 	  }
 	| {
 			type: "merge:step_ok";
 			mergeSessionId: string;
+			projectId: string;
+			targetChapterId: string;
 			sourceChapterId: string;
 			index: number;
 			total: number;
@@ -62,30 +65,41 @@ export type NarraForkEvent =
 	| {
 			type: "merge:conflict";
 			mergeSessionId: string;
+			projectId: string;
+			targetChapterId: string;
 			sourceChapterId: string;
 			index: number;
 			total: number;
 			conflictFiles: string[];
+			narratorId?: string;
 	  }
 	| {
 			type: "merge:ai_resolving";
 			mergeSessionId: string;
+			projectId: string;
+			targetChapterId: string;
 			sourceChapterId: string;
+			narratorId?: string;
 	  }
 	| {
 			type: "merge:completed";
 			mergeSessionId: string;
+			projectId: string;
 			targetChapterId: string;
 			mergedCount: number;
 	  }
 	| {
 			type: "merge:cancelled";
 			mergeSessionId: string;
+			projectId: string;
+			targetChapterId: string;
 			reason: string;
 	  }
 	| {
 			type: "merge:error";
 			mergeSessionId: string;
+			projectId: string;
+			targetChapterId: string;
 			sourceChapterId: string;
 			error: string;
 	  }
