@@ -1,0 +1,6 @@
+{
+	"version": "0.4.18",
+	"date": "2026-06-04",
+	"en": "## Bug Fixes\n\n- Stabilized Go backend beta parity across narrator runtime flows, WebSocket events, recent tabs, user preferences, terminals, containers, and compatibility routes.\n- Improved Go backend agent streaming so tool progress, runtime output, and partial tool arguments stay consistent with the frontend contract.\n- Preserved NUG model catalog snapshot consistency by accepting model hashes only with the matching model list.\n- Reduced provider settings overhead by loading NUG usage records only after the usage panel is expanded.\n- Hardened batch merge and conflict recovery with better merge context, rollback behavior, and merge session events.\n- Added Go backend container packaging assets for local container-based beta deployments.",
+	"zh-CN": "## 修复\n\n- 稳定 Go 后端 beta 在叙述者运行流程、WebSocket 事件、最近访问标签、用户偏好、终端、容器和兼容路由上的一致性。\n- 改善 Go 后端 Agent 流式输出，使工具进度、运行时输出和部分工具参数与前端契约保持一致。\n- 保持 NUG 模型目录快照一致性，只在模型列表同时到达时接受对应的模型 hash。\n- 降低 Provider 设置页开销，NUG 使用记录仅在展开面板后加载。\n- 强化批量合并和冲突恢复，补充合并上下文、回滚行为和合并会话事件。\n- 增加 Go 后端容器打包资产，便于本地容器化 beta 部署。"
+}
