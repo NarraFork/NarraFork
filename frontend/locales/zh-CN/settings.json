@@ -241,6 +241,7 @@
 	"nugChannelHealth": "渠道健康状态",
 	"nugConcurrency": "并发：{{current}}/{{max}}",
 	"nugUsageTitle": "使用记录",
+	"nugUsageCollapsedHint": "展开后加载使用记录",
 	"nugRange_today": "今天",
 	"nugRange_7days": "7 天",
 	"nugRange_30days": "30 天",

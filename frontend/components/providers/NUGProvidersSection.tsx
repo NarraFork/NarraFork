@@ -20,6 +20,8 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
+	IconChevronDown,
+	IconChevronRight,
 	IconEye,
 	IconEyeOff,
 	IconLogin,
@@ -403,6 +405,33 @@ function NUGChannelHealth({ providerId }: { providerId: string }) {
 
 function NUGUsagePanel({ providerId }: { providerId: string }) {
 	const { t } = useTranslation("settings");
+	const [opened, setOpened] = useState(false);
+
+	return (
+		<Paper withBorder p="xs">
+			<Group justify="space-between" mb={opened ? "xs" : 0}>
+				<Button
+					variant="subtle"
+					size="compact-xs"
+					leftSection={opened ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+					onClick={() => setOpened((value) => !value)}
+					aria-expanded={opened}
+				>
+					{t("nugUsageTitle")}
+				</Button>
+				{!opened && (
+					<Text size="xs" c="dimmed">
+						{t("nugUsageCollapsedHint")}
+					</Text>
+				)}
+			</Group>
+			{opened && <NUGUsageRecords providerId={providerId} />}
+		</Paper>
+	);
+}
+
+function NUGUsageRecords({ providerId }: { providerId: string }) {
+	const { t } = useTranslation("settings");
 	const [range, setRange] = useState<TimeRange>("today");
 	const [summary, setSummary] = useState<UsageSummary | null>(null);
 	const [events, setEvents] = useState<UsageEvent[]>([]);
@@ -440,22 +469,17 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 		: 0;
 
 	return (
-		<Paper withBorder p="xs">
-			<Group justify="space-between" mb="xs">
-				<Text size="sm" fw={500}>
-					{t("nugUsageTitle")}
-				</Text>
-				<Group gap="xs">
-					<SegmentedControl
-						size="xs"
-						value={range}
-						onChange={(v) => setRange(v as TimeRange)}
-						data={TIME_RANGES.map((r) => ({ value: r, label: t(`nugRange_${r}`) }))}
-					/>
-					<ActionIcon variant="subtle" size="sm" loading={loading} onClick={fetchUsage}>
-						<IconRefresh size={14} />
-					</ActionIcon>
-				</Group>
+		<>
+			<Group justify="flex-end" mb="xs">
+				<SegmentedControl
+					size="xs"
+					value={range}
+					onChange={(v) => setRange(v as TimeRange)}
+					data={TIME_RANGES.map((r) => ({ value: r, label: t(`nugRange_${r}`) }))}
+				/>
+				<ActionIcon variant="subtle" size="sm" loading={loading} onClick={fetchUsage}>
+					<IconRefresh size={14} />
+				</ActionIcon>
 			</Group>
 
 			{summary && (
@@ -599,7 +623,7 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 					)}
 				</Table.Tbody>
 			</Table>
-		</Paper>
+		</>
 	);
 }
 

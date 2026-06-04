@@ -241,6 +241,7 @@
 	"nugChannelHealth": "Channel Health",
 	"nugConcurrency": "Concurrency: {{current}}/{{max}}",
 	"nugUsageTitle": "Usage",
+	"nugUsageCollapsedHint": "Expand to load usage records",
 	"nugRange_today": "Today",
 	"nugRange_7days": "7 Days",
 	"nugRange_30days": "30 Days",
