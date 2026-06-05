@@ -351,6 +351,82 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	}
 });
 
+/** Proxy billing config from NUG service. */
+nugRoutes.get("/providers/:id/billing/config", async (c) => {
+	const id = c.req.param("id");
+	const entry = getNugProvider(id);
+	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	try {
+		const data = await entry.provider.getBillingConfig();
+		cachedQuotaByProvider.set(id, {
+			balance: data.balance,
+			totalGranted: data.totalGranted,
+			fetchedAt: Date.now(),
+		});
+		return c.json(data);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NUG billing config fetch failed", { error: msg, provider: entry.config.name });
+		return c.json({ error: msg }, 502);
+	}
+});
+
+/** Create a NUG billing order using the configured provider API key. */
+nugRoutes.post("/providers/:id/billing/orders", async (c) => {
+	const entry = getNugProvider(c.req.param("id"));
+	if (!entry) return c.json({ error: `Provider "${c.req.param("id")}" not found` }, 404);
+	try {
+		const body = (await c.req.json()) as { amount?: number; provider?: string; channel?: string };
+		const amount = Number(body.amount);
+		if (!Number.isFinite(amount) || amount <= 0) {
+			return c.json({ error: "amount must be greater than 0" }, 400);
+		}
+		if (!body.provider) {
+			return c.json({ error: "provider is required" }, 400);
+		}
+		const data = await entry.provider.createBillingOrder({
+			amount,
+			provider: body.provider,
+			channel: body.channel,
+		});
+		return c.json(data, 201);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NUG billing order create failed", { error: msg, provider: entry.config.name });
+		return c.json({ error: msg }, 502);
+	}
+});
+
+/** Fetch a NUG billing order owned by the configured API-key user. */
+nugRoutes.get("/providers/:id/billing/orders/:orderId", async (c) => {
+	const id = c.req.param("id");
+	const entry = getNugProvider(id);
+	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	try {
+		const data = await entry.provider.getBillingOrder(c.req.param("orderId"));
+		return c.json(data);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NUG billing order fetch failed", { error: msg, provider: entry.config.name });
+		return c.json({ error: msg }, 502);
+	}
+});
+
+/** Refresh a pending NUG billing order pay URL. */
+nugRoutes.post("/providers/:id/billing/orders/:orderId/repay", async (c) => {
+	const id = c.req.param("id");
+	const entry = getNugProvider(id);
+	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
+	try {
+		const data = await entry.provider.repayBillingOrder(c.req.param("orderId"));
+		return c.json(data);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NUG billing order repay failed", { error: msg, provider: entry.config.name });
+		return c.json({ error: msg }, 502);
+	}
+});
+
 /** Proxy usage records from NUG service. */
 nugRoutes.get("/providers/:id/usage", async (c) => {
 	const entry = getNugProvider(c.req.param("id"));

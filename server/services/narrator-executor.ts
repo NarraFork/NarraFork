@@ -24,6 +24,15 @@ export interface ExecuteLoopResult {
 	/** Set when the error is transient and the caller should retry after a delay. */
 	retryableError?: string;
 	retryableErrorCode?: string;
+	/** Set when the provider rejected the request because the user's NUG balance is exhausted. */
+	paymentRequired?: {
+		message: string;
+		providerId?: string;
+		providerPrefix?: string;
+		balance?: number;
+		required?: number;
+		resumeAction: "retry" | "continue";
+	};
 	/** Retry without applying the normal transient retry limit (e.g. Codex account failover). */
 	bypassRetryLimit?: boolean;
 	/** Upstream socket closed quietly and the turn should end without recovery/error UI. */
@@ -66,6 +75,7 @@ export async function executeAgentLoop(
 	let contextLengthExceeded = false;
 	let retryableError: string | undefined;
 	let retryableErrorCode: string | undefined;
+	let paymentRequired: ExecuteLoopResult["paymentRequired"];
 	let bypassRetryLimit = false;
 	let silentDisconnect = false;
 	let aborted = false;
@@ -123,6 +133,17 @@ export async function executeAgentLoop(
 			bypassRetryLimit = event.bypassRetryLimit === true;
 			break;
 		}
+		if (event.type === "payment_required") {
+			paymentRequired = {
+				message: event.message,
+				providerId: event.providerId,
+				providerPrefix: event.providerPrefix,
+				balance: event.balance,
+				required: event.required,
+				resumeAction: event.resumeAction,
+			};
+			break;
+		}
 		if (event.type === "output_truncated") {
 			interrupted = true;
 		}
@@ -162,6 +183,7 @@ export async function executeAgentLoop(
 		contextLengthExceeded,
 		retryableError,
 		retryableErrorCode,
+		paymentRequired,
 		bypassRetryLimit,
 		silentDisconnect,
 		aborted,

@@ -15,6 +15,7 @@ import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import {
 	extractErrorMessage,
+	getPaymentRequiredErrorInfo,
 	isCompletionLimitReason,
 	isContextOverflowMessage,
 	isContextOverflowReason,
@@ -2892,6 +2893,27 @@ export async function* agentLoop(
 					return;
 				}
 				const msg = extractErrorMessage(err);
+				const nugProvider = (settings.nugProviders ?? []).find(
+					(p) => p.prefix === effectiveProvider || p.id === effectiveProvider,
+				);
+				const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
+				if (paymentRequired) {
+					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+					yield* finishRequest(msg);
+					yield {
+						type: "payment_required",
+						message: paymentRequired.message,
+						providerId: nugProvider?.id,
+						providerPrefix: nugProvider?.prefix ?? effectiveProvider,
+						balance: paymentRequired.balance,
+						required: paymentRequired.required,
+						resumeAction:
+							hasStartedEarlyToolExecution() || (initialToolResults?.length ?? 0) > 0
+								? "continue"
+								: "retry",
+					};
+					return;
+				}
 				if (
 					err &&
 					typeof err === "object" &&

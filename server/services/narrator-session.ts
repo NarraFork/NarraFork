@@ -1683,6 +1683,25 @@ export async function runAgentLoop(
 				break;
 			}
 
+			if (result.paymentRequired && active.alive) {
+				const partialId = active._partialMessageId;
+				active._partialMessageId = undefined;
+				if (partialId) {
+					await finalizeOrCleanupPartialMessage(partialId, narratorId);
+				}
+				await narratorService.updateStatus(narratorId, "idle", {
+					substatus: ["payment_required"],
+					errorCode: "payment_required",
+					errorMessage: JSON.stringify({ type: "payment_required", ...result.paymentRequired }),
+				});
+				active.events.emit("event", {
+					type: "payment_required",
+					data: result.paymentRequired,
+				});
+				loopHadError = true;
+				break;
+			}
+
 			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
 			if (result.contextLengthExceeded && active.alive) {
 				// Finalize or clean up the partial message from the failed turn.

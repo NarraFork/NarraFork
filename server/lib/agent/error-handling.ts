@@ -216,6 +216,59 @@ export function isContextWindowExceededError(err: unknown): boolean {
 	return false;
 }
 
+export interface PaymentRequiredErrorInfo {
+	balance?: number;
+	required?: number;
+	message: string;
+}
+
+function parseEmbeddedJSON(message: string): Record<string, unknown> | null {
+	const start = message.indexOf("{");
+	const end = message.lastIndexOf("}");
+	if (start < 0 || end <= start) return null;
+	try {
+		const parsed = JSON.parse(message.slice(start, end + 1));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function numberField(obj: Record<string, unknown> | undefined, key: string): number | undefined {
+	const value = obj?.[key];
+	const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	return Number.isFinite(n) ? n : undefined;
+}
+
+export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorInfo | null {
+	const message = extractErrorMessage(err);
+	const lower = message.toLowerCase();
+	const statusCodes =
+		err && typeof err === "object"
+			? collectStatusCodes(err as Record<string, unknown>)
+			: new Set<number>();
+	const looksLikePaymentRequired =
+		statusCodes.has(402) ||
+		lower.includes("insufficient_quota") ||
+		lower.includes("insufficient quota") ||
+		lower.includes("payment required");
+	if (!looksLikePaymentRequired) return null;
+
+	const parsed = parseEmbeddedJSON(message);
+	const parsedError = parsed?.error;
+	const errorObj =
+		parsedError && typeof parsedError === "object" && !Array.isArray(parsedError)
+			? (parsedError as Record<string, unknown>)
+			: undefined;
+	return {
+		message,
+		balance: numberField(errorObj, "balance"),
+		required: numberField(errorObj, "required"),
+	};
+}
+
 export function isRetryableError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;
 	// Stream stale timeout is always retryable

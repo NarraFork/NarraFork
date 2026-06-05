@@ -104,6 +104,8 @@ export interface NarratorPanelSnapshot {
 	todosJson?: TodoItem[] | null;
 	todosToolUseId?: string | null;
 	errorMessage?: string | null;
+	errorCode?: string | null;
+	substatus?: string[] | string | null;
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
 	turnStartedAt?: string | null;

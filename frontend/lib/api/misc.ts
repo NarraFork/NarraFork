@@ -509,6 +509,70 @@ export const miscApi = {
 		request<{ balance: number; totalGranted: number; username?: string; role?: string }>(
 			`/nug/providers/${providerId}/quota`,
 		),
+	nugGetBillingConfig: (providerId: string) =>
+		request<{
+			enabled: boolean;
+			providers: Array<{ name: string; displayName: string }>;
+			unitName: string;
+			quotaRate: number;
+			channelQuotaRates?: { alipay?: number; wechat?: number };
+			orderMinAmount: number;
+			orderMaxAmount: number;
+			balance: number;
+			totalGranted: number;
+			pollIntervalMs?: number;
+		}>(`/nug/providers/${providerId}/billing/config`),
+	nugCreateBillingOrder: (
+		providerId: string,
+		body: { amount: number; provider: string; channel?: "alipay" | "wechat" | string },
+	) =>
+		request<{
+			order: {
+				id: string;
+				amount: string;
+				quota_amount: string;
+				provider: string;
+				channel?: string;
+				status: string;
+				pay_url?: string;
+				created_at: string;
+			};
+			pollIntervalMs?: number;
+		}>(`/nug/providers/${providerId}/billing/orders`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	nugGetBillingOrder: (providerId: string, orderId: string) =>
+		request<{
+			order: {
+				id: string;
+				amount: string;
+				quota_amount: string;
+				provider: string;
+				channel?: string;
+				status: string;
+				pay_url?: string;
+				paid_at?: string;
+				created_at: string;
+			};
+			pollIntervalMs?: number;
+		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}`),
+	nugRepayBillingOrder: (providerId: string, orderId: string) =>
+		request<{
+			order: {
+				id: string;
+				amount: string;
+				quota_amount: string;
+				provider: string;
+				channel?: string;
+				status: string;
+				pay_url?: string;
+				created_at: string;
+			};
+			pollIntervalMs?: number;
+		}>(`/nug/providers/${providerId}/billing/orders/${encodeURIComponent(orderId)}/repay`, {
+			method: "POST",
+		}),
 	nugGetChannelsHealth: (providerId: string) =>
 		request<{
 			channels: Array<{
@@ -551,7 +615,12 @@ export const miscApi = {
 		}>(`/nug/providers/${providerId}/usage/summary?range=${range}`),
 	nugRefreshProviderModels: (providerId: string) =>
 		request<{
-			models: Array<{ id: string; owned_by?: string; contextLength?: number; contextWindow?: number }>;
+			models: Array<{
+				id: string;
+				owned_by?: string;
+				contextLength?: number;
+				contextWindow?: number;
+			}>;
 			fromCache: boolean;
 			modelHash?: string;
 			modelContextWindows?: Record<string, number>;

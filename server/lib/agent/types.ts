@@ -229,6 +229,15 @@ export type AgentEvent =
 	  }
 	| { type: "context_length_exceeded"; message: string }
 	| {
+			type: "payment_required";
+			message: string;
+			providerId?: string;
+			providerPrefix?: string;
+			balance?: number;
+			required?: number;
+			resumeAction: "retry" | "continue";
+	  }
+	| {
 			type: "stream_reasoning";
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;

@@ -83,6 +83,45 @@ export interface NugQuota {
 	totalGranted: number;
 }
 
+export interface NugBillingProviderInfo {
+	name: string;
+	displayName: string;
+}
+
+export interface NugBillingOrder {
+	id: string;
+	user_id?: string;
+	amount: string;
+	quota_amount: string;
+	provider: string;
+	channel?: string;
+	status: "pending" | "paid" | "failed" | "closed" | "refunded" | string;
+	external_order_id?: string;
+	pay_url?: string;
+	paid_at?: string;
+	refunded_at?: string;
+	pay_channel?: number;
+	created_at: string;
+}
+
+export interface NugBillingConfig {
+	enabled: boolean;
+	providers: NugBillingProviderInfo[];
+	unitName: string;
+	quotaRate: number;
+	channelQuotaRates?: { alipay?: number; wechat?: number };
+	orderMinAmount: number;
+	orderMaxAmount: number;
+	balance: number;
+	totalGranted: number;
+	pollIntervalMs?: number;
+}
+
+export interface NugBillingOrderResponse {
+	order: NugBillingOrder;
+	pollIntervalMs?: number;
+}
+
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 
@@ -274,7 +313,9 @@ export class NugProvider implements ProviderAdapter {
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
 		if (delegate) {
-			yield* this.filterModelCatalogEvents(delegate.chat({ ...params, model: this.modelForDelegate(meta) }));
+			yield* this.filterModelCatalogEvents(
+				delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
+			);
 			return;
 		}
 	}
@@ -645,6 +686,73 @@ export class NugProvider implements ProviderAdapter {
 			throw httpError(`NUG quota error ${response.status}: ${errText}`, response.status);
 		}
 		return (await response.json()) as NugQuota;
+	}
+
+	async getBillingConfig(): Promise<NugBillingConfig> {
+		const response = await fetch(`${this.baseUrl}/v1/billing/config`, {
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+		});
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw httpError(`NUG billing config error ${response.status}: ${errText}`, response.status);
+		}
+		return (await response.json()) as NugBillingConfig;
+	}
+
+	async createBillingOrder(body: {
+		amount: number;
+		provider: string;
+		channel?: "alipay" | "wechat" | string;
+	}): Promise<NugBillingOrderResponse> {
+		const response = await fetch(`${this.baseUrl}/v1/billing/orders`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${this.config.apiKey}`,
+				...this.modelHashHeaders(),
+			},
+			body: JSON.stringify(body),
+		});
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw httpError(
+				`NUG billing order create error ${response.status}: ${errText}`,
+				response.status,
+			);
+		}
+		return (await response.json()) as NugBillingOrderResponse;
+	}
+
+	async getBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
+		const response = await fetch(
+			`${this.baseUrl}/v1/billing/orders/${encodeURIComponent(orderId)}`,
+			{
+				headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+			},
+		);
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw httpError(`NUG billing order error ${response.status}: ${errText}`, response.status);
+		}
+		return (await response.json()) as NugBillingOrderResponse;
+	}
+
+	async repayBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
+		const response = await fetch(
+			`${this.baseUrl}/v1/billing/orders/${encodeURIComponent(orderId)}/repay`,
+			{
+				method: "POST",
+				headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
+			},
+		);
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw httpError(
+				`NUG billing order repay error ${response.status}: ${errText}`,
+				response.status,
+			);
+		}
+		return (await response.json()) as NugBillingOrderResponse;
 	}
 
 	async getUsage(limit = 50, offset = 0): Promise<{ events: NugUsageEvent[]; total: number }> {

@@ -212,6 +212,13 @@ interface NarratorWSCallbacks {
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
+	onPaymentRequired?: (info: {
+		providerId?: string;
+		providerPrefix?: string;
+		balance?: number;
+		required?: number;
+		resumeAction: "retry" | "continue";
+	}) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
@@ -742,6 +749,15 @@ export function useNarratorWS(
 						);
 						break;
 					}
+					case "payment_required":
+						callbacksRef.current.onPaymentRequired?.({
+							providerId: data.providerId as string | undefined,
+							providerPrefix: data.providerPrefix as string | undefined,
+							balance: data.balance as number | undefined,
+							required: data.required as number | undefined,
+							resumeAction: (data.resumeAction as "retry" | "continue") ?? "retry",
+						});
+						break;
 					case "queue_status":
 						callbacksRef.current.onQueueStatus?.(
 							data.position as number | undefined,

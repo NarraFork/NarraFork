@@ -3,12 +3,25 @@ import type { TFunction } from "i18next";
 const EMPTY_RESPONSE_RE =
 	/^(?:Error:\s*)?([^:]+): Provider returned an empty response\. This often indicates an API configuration error \(base URL, model, or credentials\)\.?$/;
 
+function isPaymentRequiredPayload(errorMessage: string): boolean {
+	try {
+		const parsed = JSON.parse(errorMessage) as Record<string, unknown>;
+		return parsed.type === "payment_required";
+	} catch {
+		return false;
+	}
+}
+
 export function localizeNarratorError(
 	errorMessage: string | null | undefined,
 	t: TFunction,
 	errorCode?: string,
 ): string | null | undefined {
 	if (!errorMessage) return errorMessage;
+
+	if (errorCode === "payment_required" || isPaymentRequiredPayload(errorMessage)) {
+		return t("recharge.paymentRequired");
+	}
 
 	if (errorCode === "context_too_long_compact_failed") {
 		return t("contextTooLongCompactFailed");

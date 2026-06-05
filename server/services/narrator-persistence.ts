@@ -930,8 +930,9 @@ export const narratorPersistence = {
 		const requestedSubstatus =
 			options?.substatus ?? (status === "working" || status === "waiting" ? [] : undefined);
 		const isError = requestedSubstatus?.includes("error");
+		const keepsErrorMessage = isError || requestedSubstatus?.includes("payment_required");
 		const now = new Date().toISOString();
-		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
+		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
 		const turnStartedAt = setTurnStart ? now : undefined;
 		let actualSubstatus = requestedSubstatus;
 		const writeStatus = async () => {

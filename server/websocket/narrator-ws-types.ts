@@ -109,6 +109,15 @@ export type NarratorServerMessage =
 	  }
 	| { type: "substatus_change"; narratorId: string; substatus: string[] }
 	| {
+			type: "payment_required";
+			narratorId: string;
+			providerId?: string;
+			providerPrefix?: string;
+			balance?: number;
+			required?: number;
+			resumeAction: "retry" | "continue";
+	  }
+	| {
 			type: "queued_new_narrator_created";
 			narratorId: string;
 			messageId: string;

@@ -1173,6 +1173,25 @@ export async function processEvent(
 			return null;
 		}
 
+		case "payment_required": {
+			logger.warn("NUG payment required", {
+				narratorId,
+				providerId: event.providerId,
+				providerPrefix: event.providerPrefix,
+				resumeAction: event.resumeAction,
+			});
+			dualBroadcast(ctx, {
+				type: "payment_required",
+				narratorId: broadcastTargetId,
+				providerId: event.providerId,
+				providerPrefix: event.providerPrefix,
+				balance: event.balance,
+				required: event.required,
+				resumeAction: event.resumeAction,
+			});
+			return null;
+		}
+
 		case "retrying": {
 			// In-loop transient retry — notify frontend via WS warning so the
 			// status bar can show retry progress.  No DB state changes needed.
