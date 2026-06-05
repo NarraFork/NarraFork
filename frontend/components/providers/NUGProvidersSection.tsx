@@ -76,6 +76,8 @@ interface ChannelHealth {
 interface QuotaInfo {
 	balance: number;
 	totalGranted: number;
+	detailedQuotaBalance?: string | null;
+	extra?: unknown;
 	username?: string;
 	role?: string;
 }
@@ -88,11 +90,15 @@ interface UsageEvent {
 	outputTokens: number;
 	cacheCreationInputTokens: number;
 	cacheReadInputTokens: number;
+	reasoningTokens?: number;
 	quotaCost: number;
 	meterUsage: number;
 	status: string;
 	durationMs: number;
 	createdAt: string;
+	extra?: Record<string, unknown> | string | null;
+	metadata?: Record<string, unknown> | string | null;
+	[key: string]: unknown;
 }
 
 interface UsageSummary {
@@ -157,6 +163,125 @@ function usageTime(record: Record<string, unknown>): string {
 	if (!createdAt) return "-";
 	const date = new Date(createdAt);
 	return Number.isNaN(date.getTime()) ? "-" : date.toLocaleTimeString();
+}
+
+function usageRecord(value: unknown): Record<string, unknown> | null {
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		return value as Record<string, unknown>;
+	}
+	if (typeof value === "string" && value.trim().startsWith("{")) {
+		try {
+			const parsed = JSON.parse(value) as unknown;
+			return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+				? (parsed as Record<string, unknown>)
+				: null;
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
+const USAGE_STANDARD_KEYS = new Set([
+	"id",
+	"requestId",
+	"request_id",
+	"channelType",
+	"channel_type",
+	"channel",
+	"provider",
+	"providerType",
+	"model",
+	"model_id",
+	"modelId",
+	"modelName",
+	"inputTokens",
+	"input_tokens",
+	"promptTokens",
+	"prompt_tokens",
+	"tokensIn",
+	"tokens_in",
+	"outputTokens",
+	"output_tokens",
+	"completionTokens",
+	"completion_tokens",
+	"cacheCreationInputTokens",
+	"cache_creation_input_tokens",
+	"cacheCreationTokens",
+	"cache_creation_tokens",
+	"cacheWriteInputTokens",
+	"cache_write_input_tokens",
+	"cacheWriteTokens",
+	"cache_write_tokens",
+	"cacheReadInputTokens",
+	"cache_read_input_tokens",
+	"cachedInputTokens",
+	"cached_input_tokens",
+	"cacheReadTokens",
+	"cache_read_tokens",
+	"reasoningTokens",
+	"reasoning_tokens",
+	"quotaCost",
+	"quota_cost",
+	"cost",
+	"quota",
+	"meterUsage",
+	"meter_usage",
+	"meter",
+	"usageAmount",
+	"status",
+	"state",
+	"durationMs",
+	"duration_ms",
+	"latencyMs",
+	"latency_ms",
+	"createdAt",
+	"created_at",
+	"timestamp",
+	"time",
+	"extra",
+	"metadata",
+	"usage",
+	"usageData",
+]);
+
+function formatUsageExtraValue(value: unknown): string {
+	if (value == null) return "null";
+	if (typeof value === "string") return value;
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return String(value);
+	}
+}
+
+function usageExtraDetails(record: Record<string, unknown>): string[] {
+	const details: string[] = [];
+	const seen = new Set<string>();
+	const addRecord = (source: Record<string, unknown> | null, prefix = "") => {
+		if (!source) return;
+		for (const [key, value] of Object.entries(source)) {
+			if (value == null || USAGE_STANDARD_KEYS.has(key)) continue;
+			const label = prefix ? `${prefix}.${key}` : key;
+			if (seen.has(label)) continue;
+			seen.add(label);
+			details.push(`${label}: ${formatUsageExtraValue(value)}`);
+		}
+	};
+	const extra = usageRecord(record.extra);
+	const metadata = usageRecord(record.metadata);
+	const usage = usageRecord(record.usage);
+	const usageData = usageRecord(record.usageData);
+	addRecord(extra);
+	addRecord(usageRecord(extra?.usage), "usage");
+	addRecord(usageRecord(extra?.metadata), "metadata");
+	addRecord(metadata, "metadata");
+	addRecord(usageRecord(metadata?.usage), "metadata.usage");
+	addRecord(usage);
+	addRecord(usageData, "usageData");
+	if (details.length === 0) addRecord(record);
+	return details;
 }
 
 /* ── NUG Login Modal ───────────────────────────────────── */
@@ -258,6 +383,7 @@ function NUGAccountInfo({
 	quotaRouteUnsupportedReason: string;
 }) {
 	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
 	const quotaCapability = useProviderQuotaCapability("nug");
 	const canReadQuota = quotaCapability.supported && quotaRouteSupported;
 	const quotaUnsupportedReason = quotaCapability.supported
@@ -272,12 +398,29 @@ function NUGAccountInfo({
 		try {
 			const res = await api.nugGetQuota(providerId);
 			setQuota(res);
+			qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+				const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+				const existing =
+					quotas[providerId] && typeof quotas[providerId] === "object"
+						? (quotas[providerId] as Record<string, unknown>)
+						: {};
+				return {
+					...quotas,
+					[providerId]: {
+						...existing,
+						balance: res.balance,
+						totalGranted: res.totalGranted,
+						detailedQuotaBalance: res.detailedQuotaBalance ?? null,
+						...(res.extra !== undefined ? { extra: res.extra } : {}),
+					},
+				};
+			});
 		} catch {
 			/* ignore */
 		} finally {
 			setLoading(false);
 		}
-	}, [providerId, canReadQuota]);
+	}, [providerId, canReadQuota, qc]);
 
 	useEffect(() => {
 		if (canReadQuota) fetchQuota();
@@ -512,6 +655,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 						<Table.Th>{t("nugColChannel")}</Table.Th>
 						<Table.Th>{t("nugColModel")}</Table.Th>
 						<Table.Th>{t("nugColTokens")}</Table.Th>
+						<Table.Th>{t("nugColExtra")}</Table.Th>
 						<Table.Th ta="right">{t("nugColMeterUsage")}</Table.Th>
 						<Table.Th ta="right">{t("nugColQuotaCost")}</Table.Th>
 						<Table.Th ta="center">{t("nugColStatus")}</Table.Th>
@@ -556,6 +700,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 						);
 						const model = usageString(record, ["model", "model_id", "modelId"], "-");
 						const status = usageString(record, ["status"], "unknown");
+						const reasoningTokens = usageNumber(record, ["reasoningTokens", "reasoning_tokens"]);
 						const meterUsage = usageNumber(record, ["meterUsage", "meter_usage"]);
 						const quotaCost = usageNumber(record, ["quotaCost", "quota_cost"]);
 						const normalInput = Math.max(
@@ -563,6 +708,8 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 							inputTokens - cacheCreationInputTokens - cacheReadInputTokens,
 						);
 						const hasCache = cacheCreationInputTokens > 0 || cacheReadInputTokens > 0;
+						const extraDetails = usageExtraDetails(record);
+						const extraPreview = extraDetails.slice(0, 3).join(" · ");
 						return (
 							<Table.Tr key={ev.id || `usage-${index}`}>
 								<Table.Td>{usageTime(record)}</Table.Td>
@@ -600,7 +747,31 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 											</Text>
 											<Text size="xs">{outputTokens.toLocaleString()}</Text>
 										</Group>
+										{reasoningTokens > 0 && (
+											<Group gap={4} wrap="nowrap">
+												<Text size="xs" c="dimmed" style={{ minWidth: 16 }}>
+													Rsn:
+												</Text>
+												<Text size="xs" c="violet">
+													{reasoningTokens.toLocaleString()}
+												</Text>
+											</Group>
+										)}
 									</Stack>
+								</Table.Td>
+								<Table.Td maw={220}>
+									{extraDetails.length > 0 ? (
+										<Tooltip label={extraDetails.join("\n")} multiline w={360} withArrow>
+											<Text size="xs" c="dimmed" truncate="end">
+												{extraPreview}
+												{extraDetails.length > 3 ? ` · +${extraDetails.length - 3}` : ""}
+											</Text>
+										</Tooltip>
+									) : (
+										<Text size="xs" c="dimmed">
+											{t("nugUsageExtraNone")}
+										</Text>
+									)}
 								</Table.Td>
 								<Table.Td ta="right">{meterUsage.toFixed(2)}</Table.Td>
 								<Table.Td ta="right">{quotaCost.toFixed(4)}</Table.Td>
@@ -614,7 +785,7 @@ function NUGUsageRecords({ providerId }: { providerId: string }) {
 					})}
 					{events.length === 0 && (
 						<Table.Tr>
-							<Table.Td colSpan={7} ta="center">
+							<Table.Td colSpan={8} ta="center">
 								<Text size="xs" c="dimmed">
 									{t("nugNoUsageData")}
 								</Text>

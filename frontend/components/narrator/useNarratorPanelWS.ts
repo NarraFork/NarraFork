@@ -267,6 +267,8 @@ export interface UseNarratorPanelWSOptions {
 	initialDetailedQuotaBalance?: string | null;
 	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
 	customApiProviderId?: string | null;
+	/** NUG provider ID for the current narrator model (used to sync quota back to NUG cache). */
+	nugProviderId?: string | null;
 	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
 	quotaProviderKey?: string | null;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
@@ -501,6 +503,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
 		customApiProviderId,
+		nugProviderId,
 		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
@@ -2588,6 +2591,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					};
 					qc.setQueryData(["settings"], updateSettingsQuota);
 					qc.setQueryData(["admin", "settings"], updateSettingsQuota);
+				}
+				if (nugProviderId && balance != null) {
+					const numericBalance = Number(balance);
+					if (Number.isFinite(numericBalance)) {
+						qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+							const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+							const existing =
+								quotas[nugProviderId] && typeof quotas[nugProviderId] === "object"
+									? (quotas[nugProviderId] as Record<string, unknown>)
+									: {};
+							return {
+								...quotas,
+								[nugProviderId]: {
+									...existing,
+									balance: numericBalance,
+									totalGranted: existing.totalGranted ?? null,
+									detailedQuotaBalance: detailedBalance ?? existing.detailedQuotaBalance ?? null,
+								},
+							};
+						});
+					}
 				}
 			},
 			onPaymentRequired: (info) => {

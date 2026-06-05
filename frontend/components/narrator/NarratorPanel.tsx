@@ -2122,6 +2122,53 @@ export function NarratorPanel({
 		placeholderData: { pruneStart: 95, compactStart: 99 },
 	});
 
+	const nugProviderConfig = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const nugProviders: Array<{ id: string; name?: string; prefix?: string; disabled?: boolean }> =
+			settingsData?.nugProviders ?? [];
+		return (
+			nugProviders.find((p) => !p.disabled && (p.prefix === prefix || p.id === prefix)) ?? null
+		);
+	}, [resolvedModel, settingsData?.nugProviders]);
+	const hasNugProviders = (settingsData?.nugProviders?.length ?? 0) > 0;
+	const { data: nugQuotasData } = useQuery({
+		queryKey: ["nug", "quotas"],
+		queryFn: api.nugGetQuotas,
+		enabled: hasNugProviders,
+		staleTime: 30_000,
+	});
+	const missingCurrentNugQuota = Boolean(
+		nugProviderConfig?.id && nugQuotasData && !nugQuotasData[nugProviderConfig.id],
+	);
+	const { data: currentNugQuotaData } = useQuery({
+		queryKey: ["nug", "quota", nugProviderConfig?.id],
+		queryFn: () => api.nugGetQuota(nugProviderConfig?.id ?? ""),
+		enabled: missingCurrentNugQuota,
+		staleTime: 30_000,
+	});
+
+	useEffect(() => {
+		if (!nugProviderConfig?.id || !currentNugQuotaData) return;
+		qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+			const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+			const existing =
+				quotas[nugProviderConfig.id] && typeof quotas[nugProviderConfig.id] === "object"
+					? (quotas[nugProviderConfig.id] as Record<string, unknown>)
+					: {};
+			return {
+				...quotas,
+				[nugProviderConfig.id]: {
+					...existing,
+					balance: currentNugQuotaData.balance,
+					totalGranted: currentNugQuotaData.totalGranted,
+					detailedQuotaBalance: currentNugQuotaData.detailedQuotaBalance ?? null,
+					...(currentNugQuotaData.extra !== undefined ? { extra: currentNugQuotaData.extra } : {}),
+				},
+			};
+		});
+	}, [currentNugQuotaData, nugProviderConfig?.id, qc]);
+
 	const codexCapableProviders = useMemo(() => {
 		const providers = new Set<string>();
 		if (settingsData?.codexAvailable) providers.add("codex");
@@ -2666,24 +2713,19 @@ export function NarratorPanel({
 	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.customApiQuotas]);
 
 	const nugProviderInfo = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const nugProviders: Array<{ id: string; name?: string; prefix?: string }> =
-			settingsData?.nugProviders ?? [];
-		const cfg = nugProviders.find((p) => p.prefix === prefix || p.id === prefix);
-		if (!cfg) return null;
-		const quotas = settingsData?.nugQuotas as
-			| Record<string, { balance: number | null; totalGranted?: number | null }>
-			| undefined;
-		const quota = quotas?.[cfg.id];
+		if (!nugProviderConfig) return null;
+		const quota = nugQuotasData?.[nugProviderConfig.id] ?? currentNugQuotaData;
+		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
+		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
 		return {
-			providerId: cfg.id,
-			providerPrefix: cfg.prefix,
-			name: cfg.name ?? cfg.prefix ?? cfg.id,
+			providerId: nugProviderConfig.id,
+			providerPrefix: nugProviderConfig.prefix,
+			name: nugProviderConfig.name ?? nugProviderConfig.prefix ?? nugProviderConfig.id,
 			quotaBalance: quota?.balance == null ? null : String(quota.balance),
 			totalGranted: quota?.totalGranted ?? null,
+			detailedQuotaBalance,
 		};
-	}, [resolvedModel, settingsData?.nugProviders, settingsData?.nugQuotas]);
+	}, [nugProviderConfig, nugQuotasData, currentNugQuotaData]);
 
 	const wsState = useNarratorPanelWS({
 		narratorId,
@@ -2698,8 +2740,10 @@ export function NarratorPanel({
 		isSubagent,
 		narratorSubstatus,
 		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
-		initialDetailedQuotaBalance: customApiProviderInfo?.detailedQuotaBalance,
+		initialDetailedQuotaBalance:
+			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
 		customApiProviderId: customApiProviderInfo?.providerId,
+		nugProviderId: nugProviderInfo?.providerId,
 		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
 		onDraftChanged: handleDraftChanged,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
@@ -2741,16 +2785,28 @@ export function NarratorPanel({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
+	const nugBalanceNumber =
+		nugProviderInfo?.providerId && quotaBalance != null ? Number(quotaBalance) : Number.NaN;
+	const shouldShowNugRechargeButton = Boolean(
+		nugProviderInfo?.providerId &&
+			(paymentRequired || !Number.isFinite(nugBalanceNumber) || nugBalanceNumber <= 0),
+	);
+	const shouldShowNugRechargeInQuotaDetails = Boolean(
+		nugProviderInfo?.providerId && Number.isFinite(nugBalanceNumber) && nugBalanceNumber > 0,
+	);
+	const quotaDetailsText = detailedQuotaBalance?.trim() ? detailedQuotaBalance : null;
+	const hasQuotaDetailsPopover = Boolean(quotaDetailsText || shouldShowNugRechargeInQuotaDetails);
+	const [quotaDetailsOpened, setQuotaDetailsOpened] = useState(false);
 
 	useEffect(() => {
 		if (paymentRequired) return;
 		if (!narratorSubstatus.includes("payment_required")) return;
 		const persisted = parsePersistedPaymentRequired(narrator?.errorMessage);
-		const providerId = persisted?.providerId ?? nugProviderInfo?.providerId;
+		const providerId = nugProviderInfo?.providerId ?? persisted?.providerId;
 		if (!providerId) return;
 		setPaymentRequired({
 			providerId,
-			providerPrefix: persisted?.providerPrefix ?? nugProviderInfo?.providerPrefix,
+			providerPrefix: nugProviderInfo?.providerPrefix ?? persisted?.providerPrefix,
 			balance: persisted?.balance,
 			required: persisted?.required,
 			resumeAction: persisted?.resumeAction ?? "retry",
@@ -6449,7 +6505,7 @@ export function NarratorPanel({
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
 						narratorId={narratorId}
-						providerId={paymentRequired?.providerId ?? nugProviderInfo?.providerId ?? null}
+						providerId={nugProviderInfo?.providerId ?? paymentRequired?.providerId ?? null}
 						providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
 						paymentRequired={paymentRequired}
 						onClose={closeNugRecharge}
@@ -7903,21 +7959,68 @@ export function NarratorPanel({
 										</Tooltip>
 									)}
 									{/* Generic gateway/API quota balance */}
-									{quotaBalance != null && (
-										<Tooltip
-											label={detailedQuotaBalance || t("quotaBalance", { balance: quotaBalance })}
-											styles={
-												detailedQuotaBalance
-													? {
-															tooltip: {
-																whiteSpace: "pre-wrap",
-																overflowWrap: "anywhere",
-																maxWidth: 360,
-															},
-														}
-													: undefined
-											}
-										>
+									{quotaBalance != null &&
+										(hasQuotaDetailsPopover ? (
+											<Popover
+												opened={quotaDetailsOpened}
+												onChange={setQuotaDetailsOpened}
+												position="top"
+												withArrow
+												withinPortal
+												shadow="md"
+											>
+												<Popover.Target>
+													<UnstyledButton
+														onClick={(event) => {
+															event.stopPropagation();
+															setQuotaDetailsOpened((opened) => !opened);
+														}}
+														onPointerEnter={() => {
+															if (!isMobileViewport) setQuotaDetailsOpened(true);
+														}}
+														style={{ flexShrink: 0, maxWidth: 120 }}
+													>
+														<Text
+															size="xs"
+															c="dimmed"
+															style={{
+																cursor: "pointer",
+																maxWidth: 120,
+																overflow: "hidden",
+																textOverflow: "ellipsis",
+																whiteSpace: "nowrap",
+															}}
+														>
+															{quotaBalance}
+														</Text>
+													</UnstyledButton>
+												</Popover.Target>
+												<Popover.Dropdown maw={360}>
+													<Stack gap={6}>
+														{quotaDetailsText && (
+															<Text
+																size="xs"
+																style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+															>
+																{quotaDetailsText}
+															</Text>
+														)}
+														{shouldShowNugRechargeInQuotaDetails && (
+															<Button
+																size="compact-xs"
+																variant="light"
+																onClick={() => {
+																	setQuotaDetailsOpened(false);
+																	openNugRecharge();
+																}}
+															>
+																{t("recharge.open")}
+															</Button>
+														)}
+													</Stack>
+												</Popover.Dropdown>
+											</Popover>
+										) : (
 											<Text
 												size="xs"
 												c="dimmed"
@@ -7932,9 +8035,8 @@ export function NarratorPanel({
 											>
 												{quotaBalance}
 											</Text>
-										</Tooltip>
-									)}
-									{nugProviderInfo?.providerId && (
+										))}
+									{shouldShowNugRechargeButton && (
 										<Button size="compact-xs" variant="subtle" onClick={openNugRecharge}>
 											{t("recharge.open")}
 										</Button>

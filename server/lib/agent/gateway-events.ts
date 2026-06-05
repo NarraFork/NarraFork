@@ -28,6 +28,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
+function formatExtraDetails(value: unknown): string | null {
+	if (value == null) return null;
+	if (typeof value === "string") return value.trim() || null;
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	if (isRecord(value)) {
+		const lines = Object.entries(value)
+			.filter(([, entryValue]) => entryValue != null)
+			.map(([key, entryValue]) => {
+				const formatted =
+					typeof entryValue === "string" ||
+					typeof entryValue === "number" ||
+					typeof entryValue === "boolean"
+						? String(entryValue)
+						: JSON.stringify(entryValue);
+				return `${key}: ${formatted}`;
+			});
+		return lines.length > 0 ? lines.join("\n") : null;
+	}
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Try to parse a gateway-injected event from an SSE `event:` type + `data:` JSON pair.
  * Returns a ParsedStreamEvent if the event type matches, or null otherwise.
@@ -57,7 +82,7 @@ export function parseGatewaySSEEvent(
 		const detailedBalance = data.detailedQuotaBalance;
 		return {
 			quotaBalance: balance != null ? String(balance) : null,
-			detailedQuotaBalance: detailedBalance != null ? String(detailedBalance) : null,
+			detailedQuotaBalance: formatExtraDetails(detailedBalance) ?? formatExtraDetails(data.extra),
 		};
 	}
 

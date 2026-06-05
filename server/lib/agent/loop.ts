@@ -2894,7 +2894,7 @@ export async function* agentLoop(
 				}
 				const msg = extractErrorMessage(err);
 				const nugProvider = (settings.nugProviders ?? []).find(
-					(p) => p.prefix === effectiveProvider || p.id === effectiveProvider,
+					(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
 				);
 				const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
 				if (paymentRequired) {

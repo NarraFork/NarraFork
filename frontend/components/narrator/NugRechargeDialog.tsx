@@ -42,7 +42,11 @@ interface NugRechargeDialogProps {
 	paymentRequired: PaymentRequiredInfo | null;
 	onClose: () => void;
 	onPaymentRequiredChange: (value: PaymentRequiredInfo | null) => void;
-	onQuotaUpdated?: (balance: string | null, totalGranted?: number | null) => void;
+	onQuotaUpdated?: (
+		balance: string | null,
+		totalGranted?: number | null,
+		detailedQuotaBalance?: string | null,
+	) => void;
 }
 
 function parseAmount(value: string | number | undefined): number {
@@ -159,7 +163,28 @@ export function NugRechargeDialog({
 		void (async () => {
 			try {
 				const quota = await api.nugGetQuota(providerId);
-				onQuotaUpdated?.(String(quota.balance), quota.totalGranted);
+				onQuotaUpdated?.(
+					String(quota.balance),
+					quota.totalGranted,
+					quota.detailedQuotaBalance ?? null,
+				);
+				qc.setQueryData(["nug", "quotas"], (old: unknown) => {
+					const quotas = old && typeof old === "object" ? (old as Record<string, unknown>) : {};
+					const existing =
+						quotas[providerId] && typeof quotas[providerId] === "object"
+							? (quotas[providerId] as Record<string, unknown>)
+							: {};
+					return {
+						...quotas,
+						[providerId]: {
+							...existing,
+							balance: quota.balance,
+							totalGranted: quota.totalGranted,
+							detailedQuotaBalance: quota.detailedQuotaBalance ?? null,
+							...(quota.extra !== undefined ? { extra: quota.extra } : {}),
+						},
+					};
+				});
 				qc.invalidateQueries({ queryKey: ["settings"] });
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				notifications.show({

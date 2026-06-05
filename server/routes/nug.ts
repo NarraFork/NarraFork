@@ -1,3 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Hono } from "hono";
 import { NugProvider } from "../lib/agent/nug-provider";
 import { logger } from "../lib/logger";
@@ -25,10 +29,172 @@ export const nugRoutes = new Hono();
 interface NugQuotaCache {
 	balance: number | null;
 	totalGranted: number | null;
+	detailedQuotaBalance: string | null;
+	extra?: unknown;
 	fetchedAt: number;
 }
 
 const cachedQuotaByProvider = new Map<string, NugQuotaCache>();
+const cacheDir = resolve(homedir(), ".narrafork");
+const quotaCachePath = resolve(cacheDir, "nug-quotas.json");
+const SAVE_DEBOUNCE_MS = 250;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let saveInFlight = false;
+let saveRequested = false;
+
+loadAllCachedQuotas();
+
+function normalizeNullableNumber(value: unknown): number | null {
+	if (value == null) return null;
+	const numericValue = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function normalizeNullableString(value: unknown): string | null {
+	if (value == null) return null;
+	const text = String(value).trim();
+	return text ? text : null;
+}
+
+function formatQuotaDetails(value: unknown): string | null {
+	if (value == null) return null;
+	if (typeof value === "string") return normalizeNullableString(value);
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		const lines = Object.entries(value as Record<string, unknown>)
+			.filter(([, entryValue]) => entryValue != null)
+			.map(([key, entryValue]) => {
+				const formatted =
+					typeof entryValue === "string" ||
+					typeof entryValue === "number" ||
+					typeof entryValue === "boolean"
+						? String(entryValue)
+						: JSON.stringify(entryValue);
+				return `${key}: ${formatted}`;
+			});
+		return lines.length > 0 ? lines.join("\n") : null;
+	}
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return null;
+	}
+}
+
+function nugQuotaDetailsFrom(value: unknown): string | null {
+	const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+	return formatQuotaDetails(record.detailedQuotaBalance) ?? formatQuotaDetails(record.extra);
+}
+
+function normalizeNugBaseUrl(baseUrl: string | undefined): string {
+	return (baseUrl ?? "")
+		.trim()
+		.replace(/\/+$/, "")
+		.replace(/\/(?:api\/v1|api|v1)$/i, "");
+}
+
+function normalizeNugQuotaResponse<T extends Record<string, unknown>>(
+	data: T,
+): T & {
+	balance: number;
+	totalGranted: number;
+	detailedQuotaBalance: string | null;
+} {
+	return {
+		...data,
+		balance: normalizeNullableNumber(data.balance ?? data.quotaBalance ?? data.remaining) ?? 0,
+		totalGranted:
+			normalizeNullableNumber(
+				data.totalGranted ?? data.quotaTotalGranted ?? data.total_granted ?? data.total,
+			) ?? 0,
+		detailedQuotaBalance: nugQuotaDetailsFrom(data),
+	};
+}
+
+function loadAllCachedQuotas(): void {
+	try {
+		if (!existsSync(quotaCachePath)) return;
+		const data = JSON.parse(readFileSync(quotaCachePath, "utf-8")) as Record<
+			string,
+			Partial<NugQuotaCache>
+		>;
+		for (const [providerId, cache] of Object.entries(data)) {
+			cachedQuotaByProvider.set(providerId, {
+				balance: normalizeNullableNumber(cache.balance),
+				totalGranted: normalizeNullableNumber(cache.totalGranted),
+				detailedQuotaBalance: normalizeNullableString(cache.detailedQuotaBalance),
+				...(cache.extra !== undefined ? { extra: cache.extra } : {}),
+				fetchedAt: typeof cache.fetchedAt === "number" ? cache.fetchedAt : 0,
+			});
+		}
+	} catch {
+		// Corrupt or unreadable cache — ignore; quota will refresh on the next NUG event/request.
+	}
+}
+
+function serializeCachedQuotas(): string {
+	const data: Record<string, NugQuotaCache> = {};
+	for (const [providerId, cache] of cachedQuotaByProvider) {
+		data[providerId] = cache;
+	}
+	return JSON.stringify(data);
+}
+
+async function flushCachedQuotas(): Promise<void> {
+	if (saveInFlight) return;
+	saveInFlight = true;
+	try {
+		while (saveRequested) {
+			saveRequested = false;
+			try {
+				await mkdir(cacheDir, { recursive: true });
+				await writeFile(quotaCachePath, serializeCachedQuotas());
+			} catch {
+				// Non-critical: failing to persist quota must not break active narrator runs.
+			}
+		}
+	} finally {
+		saveInFlight = false;
+	}
+}
+
+function scheduleSaveAllCachedQuotas(): void {
+	saveRequested = true;
+	if (saveTimer || saveInFlight) return;
+	saveTimer = setTimeout(() => {
+		saveTimer = null;
+		void flushCachedQuotas();
+	}, SAVE_DEBOUNCE_MS);
+	saveTimer.unref?.();
+}
+
+function buildNugQuotaCache(
+	data: {
+		balance?: unknown;
+		totalGranted?: unknown;
+		detailedQuotaBalance?: unknown;
+		extra?: unknown;
+	},
+	existing?: NugQuotaCache,
+): NugQuotaCache {
+	const detailedQuotaBalance = nugQuotaDetailsFrom(data) ?? existing?.detailedQuotaBalance ?? null;
+	return {
+		balance: normalizeNullableNumber(data.balance) ?? existing?.balance ?? null,
+		totalGranted: normalizeNullableNumber(data.totalGranted) ?? existing?.totalGranted ?? null,
+		detailedQuotaBalance,
+		...(data.extra !== undefined
+			? { extra: data.extra }
+			: existing?.extra !== undefined
+				? { extra: existing.extra }
+				: {}),
+		fetchedAt: Date.now(),
+	};
+}
+
+function setNugCachedQuota(providerId: string, cache: NugQuotaCache): void {
+	cachedQuotaByProvider.set(providerId, cache);
+	scheduleSaveAllCachedQuotas();
+}
 
 function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugProvider } | null {
 	const providers = settings.nugProviders ?? [];
@@ -39,41 +205,245 @@ function getNugProvider(id: string): { config: NUGProviderConfig; provider: NugP
 
 type NugUsageRecord = Record<string, unknown>;
 
+const USAGE_RESPONSE_STANDARD_KEYS = new Set([
+	"id",
+	"requestId",
+	"request_id",
+	"channelType",
+	"channel_type",
+	"channel",
+	"provider",
+	"providerType",
+	"model",
+	"model_id",
+	"modelId",
+	"modelName",
+	"inputTokens",
+	"input_tokens",
+	"promptTokens",
+	"prompt_tokens",
+	"tokensIn",
+	"tokens_in",
+	"outputTokens",
+	"output_tokens",
+	"completionTokens",
+	"completion_tokens",
+	"cacheCreationInputTokens",
+	"cache_creation_input_tokens",
+	"cacheCreationTokens",
+	"cache_creation_tokens",
+	"cacheWriteInputTokens",
+	"cache_write_input_tokens",
+	"cacheWriteTokens",
+	"cache_write_tokens",
+	"cacheReadInputTokens",
+	"cache_read_input_tokens",
+	"cachedInputTokens",
+	"cached_input_tokens",
+	"cacheReadTokens",
+	"cache_read_tokens",
+	"reasoningTokens",
+	"reasoning_tokens",
+	"quotaCost",
+	"quota_cost",
+	"cost",
+	"quota",
+	"meterUsage",
+	"meter_usage",
+	"meter",
+	"usageAmount",
+	"status",
+	"state",
+	"durationMs",
+	"duration_ms",
+	"latencyMs",
+	"latency_ms",
+	"createdAt",
+	"created_at",
+	"timestamp",
+	"time",
+	"extra",
+	"metadata",
+	"usage",
+	"usageData",
+]);
+
+const USAGE_EXTRA_MAX_FIELDS = 12;
+const USAGE_EXTRA_VALUE_MAX_CHARS = 300;
+const USAGE_EXTRA_KEY_MAX_CHARS = 80;
+
+function optionalRecord(value: unknown): NugUsageRecord | null {
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		return value as NugUsageRecord;
+	}
+	if (typeof value === "string" && value.trim().startsWith("{")) {
+		try {
+			const parsed = JSON.parse(value) as unknown;
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				return parsed as NugUsageRecord;
+			}
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
 function toRecord(value: unknown): NugUsageRecord {
-	return value && typeof value === "object" && !Array.isArray(value)
-		? (value as NugUsageRecord)
-		: {};
+	return optionalRecord(value) ?? {};
 }
 
-function numericField(record: NugUsageRecord, keys: string[], fallback = 0): number {
-	for (const key of keys) {
-		const value = record[key];
-		const numberValue =
-			typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-		if (Number.isFinite(numberValue)) return numberValue;
+function usageRecordSources(record: NugUsageRecord): NugUsageRecord[] {
+	const sources: NugUsageRecord[] = [record];
+	const append = (value: unknown) => {
+		const parsed = optionalRecord(value);
+		if (parsed) sources.push(parsed);
+		return parsed;
+	};
+	const extra = append(record.extra);
+	const metadata = append(record.metadata);
+	const usage = append(record.usage);
+	append(record.usageData);
+	append(extra?.usage);
+	append(extra?.metadata);
+	append(metadata?.usage);
+	append(metadata?.extra);
+	append(usage?.extra);
+	return sources;
+}
+
+function numericField(
+	records: NugUsageRecord | NugUsageRecord[],
+	keys: string[],
+	fallback = 0,
+): number {
+	const sources = Array.isArray(records) ? records : [records];
+	for (const record of sources) {
+		for (const key of keys) {
+			const value = record[key];
+			const numberValue =
+				typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+			if (Number.isFinite(numberValue)) return numberValue;
+		}
 	}
 	return fallback;
 }
 
-function stringField(record: NugUsageRecord, keys: string[], fallback = ""): string {
-	for (const key of keys) {
-		const value = record[key];
-		if (typeof value === "string" && value.length > 0) return value;
-		if (typeof value === "number" && Number.isFinite(value)) return String(value);
+function stringField(
+	records: NugUsageRecord | NugUsageRecord[],
+	keys: string[],
+	fallback = "",
+): string {
+	const sources = Array.isArray(records) ? records : [records];
+	for (const record of sources) {
+		for (const key of keys) {
+			const value = record[key];
+			if (typeof value === "string" && value.length > 0) return value;
+			if (typeof value === "number" && Number.isFinite(value)) return String(value);
+		}
 	}
 	return fallback;
+}
+
+function isSensitiveUsageExtraKey(key: string): boolean {
+	const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+	return [
+		"apikey",
+		"authorization",
+		"token",
+		"secret",
+		"password",
+		"credential",
+		"cookie",
+		"session",
+		"raw",
+		"dump",
+		"body",
+		"headers",
+		"prompt",
+		"completion",
+		"content",
+	].some((needle) => normalized.includes(needle));
+}
+
+function sanitizeUsageExtraValue(value: unknown): string | number | boolean | null {
+	if (value == null) return null;
+	if (typeof value === "number") return Number.isFinite(value) ? value : null;
+	if (typeof value === "boolean") return value;
+	let text: string;
+	if (typeof value === "string") {
+		text = value.trim();
+	} else {
+		try {
+			text = JSON.stringify(value);
+		} catch {
+			return null;
+		}
+	}
+	if (!text) return null;
+	return text.length > USAGE_EXTRA_VALUE_MAX_CHARS
+		? `${text.slice(0, USAGE_EXTRA_VALUE_MAX_CHARS)}…`
+		: text;
+}
+
+function collectSafeUsageExtra(
+	record: NugUsageRecord,
+): Record<string, string | number | boolean> | null {
+	const extra: Record<string, string | number | boolean> = {};
+	const addRecord = (source: NugUsageRecord | null, prefix = "") => {
+		if (!source || Object.keys(extra).length >= USAGE_EXTRA_MAX_FIELDS) return;
+		for (const [key, value] of Object.entries(source)) {
+			if (Object.keys(extra).length >= USAGE_EXTRA_MAX_FIELDS) break;
+			if (value == null || USAGE_RESPONSE_STANDARD_KEYS.has(key) || isSensitiveUsageExtraKey(key)) {
+				continue;
+			}
+			const label = (prefix ? `${prefix}.${key}` : key).slice(0, USAGE_EXTRA_KEY_MAX_CHARS);
+			if (extra[label] !== undefined) continue;
+			const sanitized = sanitizeUsageExtraValue(value);
+			if (sanitized != null) extra[label] = sanitized;
+		}
+	};
+	const parsedExtra = optionalRecord(record.extra);
+	const parsedMetadata = optionalRecord(record.metadata);
+	const parsedUsage = optionalRecord(record.usage);
+	addRecord(record);
+	addRecord(parsedExtra);
+	addRecord(optionalRecord(parsedExtra?.usage), "usage");
+	addRecord(optionalRecord(parsedExtra?.metadata), "metadata");
+	addRecord(parsedMetadata, "metadata");
+	addRecord(optionalRecord(parsedMetadata?.usage), "metadata.usage");
+	addRecord(parsedUsage, "usage");
+	addRecord(optionalRecord(record.usageData), "usageData");
+	return Object.keys(extra).length > 0 ? extra : null;
 }
 
 function normalizeNugUsageEvent(value: unknown, index: number): NugUsageRecord {
 	const record = toRecord(value);
+	const sources = usageRecordSources(record);
+	const safeExtra = collectSafeUsageExtra(record);
 	return {
-		...record,
-		id: stringField(record, ["id"], `usage-${index}`),
-		channelType: stringField(record, ["channelType", "channel_type", "channel"], "unknown"),
-		model: stringField(record, ["model", "model_id", "modelId"]),
-		inputTokens: numericField(record, ["inputTokens", "input_tokens", "tokensIn", "tokens_in"]),
-		outputTokens: numericField(record, ["outputTokens", "output_tokens", "completionTokens"]),
-		cacheCreationInputTokens: numericField(record, [
+		id: stringField(sources, ["id", "requestId", "request_id"], `usage-${index}`),
+		channelType: stringField(
+			sources,
+			["channelType", "channel_type", "channel", "provider", "providerType"],
+			"unknown",
+		),
+		model: stringField(sources, ["model", "model_id", "modelId", "modelName"]),
+		inputTokens: numericField(sources, [
+			"inputTokens",
+			"input_tokens",
+			"promptTokens",
+			"prompt_tokens",
+			"tokensIn",
+			"tokens_in",
+		]),
+		outputTokens: numericField(sources, [
+			"outputTokens",
+			"output_tokens",
+			"completionTokens",
+			"completion_tokens",
+		]),
+		cacheCreationInputTokens: numericField(sources, [
 			"cacheCreationInputTokens",
 			"cache_creation_input_tokens",
 			"cacheCreationTokens",
@@ -83,7 +453,7 @@ function normalizeNugUsageEvent(value: unknown, index: number): NugUsageRecord {
 			"cacheWriteTokens",
 			"cache_write_tokens",
 		]),
-		cacheReadInputTokens: numericField(record, [
+		cacheReadInputTokens: numericField(sources, [
 			"cacheReadInputTokens",
 			"cache_read_input_tokens",
 			"cachedInputTokens",
@@ -91,11 +461,13 @@ function normalizeNugUsageEvent(value: unknown, index: number): NugUsageRecord {
 			"cacheReadTokens",
 			"cache_read_tokens",
 		]),
-		quotaCost: numericField(record, ["quotaCost", "quota_cost"]),
-		meterUsage: numericField(record, ["meterUsage", "meter_usage"]),
-		status: stringField(record, ["status"], "unknown"),
-		durationMs: numericField(record, ["durationMs", "duration_ms"]),
-		createdAt: stringField(record, ["createdAt", "created_at", "timestamp"]),
+		reasoningTokens: numericField(sources, ["reasoningTokens", "reasoning_tokens"]),
+		quotaCost: numericField(sources, ["quotaCost", "quota_cost", "cost", "quota"]),
+		meterUsage: numericField(sources, ["meterUsage", "meter_usage", "meter", "usageAmount"]),
+		status: stringField(sources, ["status", "state"], "unknown"),
+		durationMs: numericField(sources, ["durationMs", "duration_ms", "latencyMs", "latency_ms"]),
+		createdAt: stringField(sources, ["createdAt", "created_at", "timestamp", "time"]),
+		...(safeExtra ? { extra: safeExtra } : {}),
 	};
 }
 
@@ -108,17 +480,19 @@ function normalizeNugUsageResponse(value: unknown): NugUsageRecord {
 			: [];
 	const events = rawEvents.map((event, index) => normalizeNugUsageEvent(event, index));
 	return {
-		...record,
 		events,
 		total: numericField(record, ["total", "count"], events.length),
 	};
 }
 
 /** Fetch quota from a single NUG provider. */
-async function fetchNugQuota(
-	config: NUGProviderConfig,
-): Promise<{ balance: number; totalGranted: number } | null> {
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+async function fetchNugQuota(config: NUGProviderConfig): Promise<{
+	balance: number;
+	totalGranted: number;
+	detailedQuotaBalance?: string | null;
+	extra?: unknown;
+} | null> {
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl || !config.apiKey) return null;
 	try {
 		const provider = new NugProvider(config);
@@ -135,11 +509,7 @@ export async function fetchAllNugQuotas(): Promise<void> {
 		providers.map(async (p) => {
 			const data = await fetchNugQuota(p);
 			if (data) {
-				cachedQuotaByProvider.set(p.id, {
-					balance: data.balance,
-					totalGranted: data.totalGranted,
-					fetchedAt: Date.now(),
-				});
+				setNugCachedQuota(p.id, buildNugQuotaCache(data, cachedQuotaByProvider.get(p.id)));
 				logger.debug("NUG quota fetched on startup", {
 					provider: p.name,
 					balance: data.balance,
@@ -150,16 +520,27 @@ export async function fetchAllNugQuotas(): Promise<void> {
 }
 
 /** Update cached quota balance for a provider identified by prefix. */
-export function updateNugQuotaByPrefix(prefix: string, quotaBalance: number | null): void {
+export function updateNugQuotaByPrefix(
+	prefix: string,
+	quotaBalance: number | null,
+	detailedQuotaBalance?: string | null,
+	extra?: unknown,
+): void {
 	const providers = settings.nugProviders ?? [];
-	const config = providers.find((p) => p.prefix === prefix);
+	const config = providers.find((p) => p.prefix === prefix || p.id === prefix);
 	if (!config) return;
 	const existing = cachedQuotaByProvider.get(config.id);
-	cachedQuotaByProvider.set(config.id, {
-		balance: quotaBalance,
-		totalGranted: existing?.totalGranted ?? null,
-		fetchedAt: Date.now(),
-	});
+	setNugCachedQuota(
+		config.id,
+		buildNugQuotaCache(
+			{
+				balance: quotaBalance,
+				detailedQuotaBalance,
+				...(extra !== undefined ? { extra } : {}),
+			},
+			existing,
+		),
+	);
 }
 
 /** Get cached quota for a provider by ID. */
@@ -170,13 +551,28 @@ export function getNugCachedQuota(providerId: string): NugQuotaCache | undefined
 /** Get all cached quotas keyed by provider ID. */
 export function getAllNugCachedQuotas(): Record<
 	string,
-	{ balance: number | null; totalGranted: number | null }
+	{
+		balance: number | null;
+		totalGranted: number | null;
+		detailedQuotaBalance: string | null;
+		extra?: unknown;
+	}
 > {
-	const result: Record<string, { balance: number | null; totalGranted: number | null }> = {};
+	const result: Record<
+		string,
+		{
+			balance: number | null;
+			totalGranted: number | null;
+			detailedQuotaBalance: string | null;
+			extra?: unknown;
+		}
+	> = {};
 	for (const [id, cache] of cachedQuotaByProvider) {
 		result[id] = {
 			balance: cache.balance,
 			totalGranted: cache.totalGranted,
+			detailedQuotaBalance: cache.detailedQuotaBalance,
+			...(cache.extra !== undefined ? { extra: cache.extra } : {}),
 		};
 	}
 	return result;
@@ -187,9 +583,12 @@ export function purgeNugProviderCache(removedIds: string[]): void {
 	let changed = false;
 	for (const id of removedIds) {
 		if (deleteNugCachedModels(id)) changed = true;
-		cachedQuotaByProvider.delete(id);
+		if (cachedQuotaByProvider.delete(id)) changed = true;
 	}
-	if (changed) saveAllCachedNugModels();
+	if (changed) {
+		saveAllCachedNugModels();
+		scheduleSaveAllCachedQuotas();
+	}
 }
 
 // Register model checker and lister
@@ -215,7 +614,7 @@ registerNugModelLister(() => {
 async function fetchNugModels(
 	config: NUGProviderConfig,
 ): Promise<{ models: NugModelInfo[]; modelHash?: string }> {
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl) {
 		throw new Error(`NUG base URL not configured for provider "${config.name}"`);
 	}
@@ -246,6 +645,17 @@ async function fetchNugModels(
 		return aId.localeCompare(bId);
 	});
 	return { models: unique, modelHash };
+}
+
+function nugUsagePeriod(range: string | undefined): string {
+	const periodMap: Record<string, string> = {
+		today: "today",
+		"7days": "7days",
+		"30days": "month",
+		month: "month",
+		all: "all",
+	};
+	return periodMap[range ?? ""] ?? "month";
 }
 
 // === Routes ===
@@ -337,13 +747,10 @@ nugRoutes.get("/providers/:id/quota", async (c) => {
 	const entry = getNugProvider(id);
 	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
 	try {
-		const data = await entry.provider.getQuota();
-		cachedQuotaByProvider.set(id, {
-			balance: data.balance,
-			totalGranted: data.totalGranted,
-			fetchedAt: Date.now(),
-		});
-		return c.json(data);
+		const data = (await entry.provider.getQuota()) as unknown as Record<string, unknown>;
+		const responseData = normalizeNugQuotaResponse(data);
+		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
+		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG quota fetch failed", { error: msg, provider: entry.config.name });
@@ -357,13 +764,10 @@ nugRoutes.get("/providers/:id/billing/config", async (c) => {
 	const entry = getNugProvider(id);
 	if (!entry) return c.json({ error: `Provider "${id}" not found` }, 404);
 	try {
-		const data = await entry.provider.getBillingConfig();
-		cachedQuotaByProvider.set(id, {
-			balance: data.balance,
-			totalGranted: data.totalGranted,
-			fetchedAt: Date.now(),
-		});
-		return c.json(data);
+		const data = (await entry.provider.getBillingConfig()) as unknown as Record<string, unknown>;
+		const responseData = normalizeNugQuotaResponse(data);
+		setNugCachedQuota(id, buildNugQuotaCache(responseData, cachedQuotaByProvider.get(id)));
+		return c.json(responseData);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("NUG billing config fetch failed", { error: msg, provider: entry.config.name });
@@ -433,8 +837,9 @@ nugRoutes.get("/providers/:id/usage", async (c) => {
 	if (!entry) return c.json({ error: `Provider "${c.req.param("id")}" not found` }, 404);
 	const limit = Math.min(Number(c.req.query("limit")) || 50, 200);
 	const offset = Math.max(Number(c.req.query("offset")) || 0, 0);
+	const period = nugUsagePeriod(c.req.query("range"));
 	try {
-		const data = await entry.provider.getUsage(limit, offset);
+		const data = await entry.provider.getUsage(limit, offset, period);
 		return c.json(normalizeNugUsageResponse(data));
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -484,7 +889,7 @@ nugRoutes.post("/providers/:id/login", async (c) => {
 	const config = providers.find((p) => p.id === id);
 	if (!config) return c.json({ error: `Provider "${id}" not found` }, 404);
 
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl) return c.json({ error: "Provider base URL not configured" }, 400);
 
 	const body = await c.req.json();
@@ -545,7 +950,7 @@ nugRoutes.post("/providers/:id/api-key", async (c) => {
 	const config = providers.find((p) => p.id === id);
 	if (!config) return c.json({ error: `Provider "${id}" not found` }, 404);
 
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl) return c.json({ error: "Provider base URL not configured" }, 400);
 
 	const body = await c.req.json();
@@ -604,7 +1009,7 @@ nugRoutes.get("/providers/:id/oauth/start", (c) => {
 	const config = providers.find((p) => p.id === id);
 	if (!config) return c.json({ error: `Provider "${id}" not found` }, 404);
 
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl) return c.json({ error: "Provider base URL not configured" }, 400);
 	if (!config.oauthClientId) return c.json({ error: "OAuth client ID not configured" }, 400);
 
@@ -670,7 +1075,7 @@ export async function handleNugOAuthCallback(c: import("hono").Context) {
 		return c.redirect(`/settings/providers?oauth_error=invalid_provider`);
 	}
 
-	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!config.oauthClientId || !config.oauthClientSecret) {
 		return c.redirect(`/settings/providers?oauth_error=oauth_not_configured`);
 	}

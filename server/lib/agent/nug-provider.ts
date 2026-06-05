@@ -81,6 +81,8 @@ export interface NugChannelHealthStatus {
 export interface NugQuota {
 	balance: number;
 	totalGranted: number;
+	detailedQuotaBalance?: string | null;
+	extra?: unknown;
 }
 
 export interface NugBillingProviderInfo {
@@ -141,7 +143,10 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	private get baseUrl(): string {
-		return this.config.baseUrl.replace(/\/+$/, "");
+		return this.config.baseUrl
+			.trim()
+			.replace(/\/+$/, "")
+			.replace(/\/(?:api\/v1|api|v1)$/i, "");
 	}
 
 	private modelHashHeaderValue(): string {
@@ -755,10 +760,15 @@ export class NugProvider implements ProviderAdapter {
 		return (await response.json()) as NugBillingOrderResponse;
 	}
 
-	async getUsage(limit = 50, offset = 0): Promise<{ events: NugUsageEvent[]; total: number }> {
+	async getUsage(
+		limit = 50,
+		offset = 0,
+		period?: string,
+	): Promise<{ events: NugUsageEvent[]; total: number }> {
 		const url = new URL(`${this.baseUrl}/v1/usage`);
 		url.searchParams.set("limit", String(limit));
 		url.searchParams.set("offset", String(offset));
+		if (period) url.searchParams.set("period", period);
 		const response = await fetch(url.toString(), {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});

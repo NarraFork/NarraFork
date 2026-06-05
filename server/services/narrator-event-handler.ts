@@ -1433,6 +1433,21 @@ export async function processEvent(
 					event.quotaBalance,
 					event.detailedQuotaBalance,
 				);
+				try {
+					const { updateNugQuotaByPrefix } = await import("../routes/nug");
+					if (event.quotaBalance != null) {
+						const numericBalance = Number(event.quotaBalance);
+						if (Number.isFinite(numericBalance)) {
+							updateNugQuotaByPrefix(
+								ctx.providerPrefix,
+								numericBalance,
+								event.detailedQuotaBalance ?? null,
+							);
+						}
+					}
+				} catch {
+					// nug module not loaded — ignore
+				}
 			}
 			return null;
 		}
