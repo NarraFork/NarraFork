@@ -31,6 +31,9 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
+export {
+	scanStorageStream,
+} from "./streams";
 export type {
 	ApiEntity,
 	BaseContentBlock,

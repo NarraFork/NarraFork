@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError } from "./client";
+import {
+	scanStorageStream,
+} from "./streams";
 
 	const g = globalThis as typeof globalThis & {
 		localStorage?: Storage;
@@ -44,6 +47,35 @@ import { ApiError } from "./client";
 		} catch (err) {
 			expect(err).toBeInstanceOf(ApiError);
 			expect((err as ApiError).status).toBe(503);
+		}
+	});
+
+		let fetched = false;
+		Object.defineProperty(g, "fetch", {
+			value: async () => {
+				fetched = true;
+				return new Response("");
+			},
+			configurable: true,
+		});
+
+		const capabilities = {
+			providers: {
+					routes: {
+						supported: true,
+						chat: false,
+					},
+				},
+			},
+		};
+
+		);
+		try {
+			await generator.next();
+		} catch (err) {
+			expect(err).toBeInstanceOf(ApiError);
+			expect((err as ApiError).status).toBe(501);
+			expect(fetched).toBe(false);
 		}
 	});
 

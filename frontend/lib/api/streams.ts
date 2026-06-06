@@ -84,6 +84,56 @@ async function enforceSseResidualLimit(
 	throw createSseResidualError();
 }
 
+	providers?: {
+			routes?: {
+				supported?: boolean;
+				chat?: boolean;
+				chatReason?: unknown;
+				reason?: unknown;
+			};
+		};
+	};
+}
+
+	supported: boolean;
+	reason?: string;
+} {
+	if (!capabilities) return { supported: true };
+	const supported = routes?.supported !== false && routes?.chat === true;
+	const routeReason = routes?.chatReason;
+	return {
+		supported,
+		reason: supported
+			? undefined
+			: typeof routeReason === "string"
+				? routeReason
+				: typeof routes?.reason === "string"
+					? routes.reason
+					: undefined,
+	};
+}
+
+	if (capability.supported) return;
+	throw new ApiError(reason, 501, {
+		ok: false,
+		code: "FEATURE_DISABLED",
+		supported: false,
+		fallback: true,
+		reason,
+		error: reason,
+		message: reason,
+	});
+}
+
+	text: string,
+	model?: string,
+	signal?: AbortSignal,
+): AsyncGenerator<string> {
+}
+
+/**
+ *
+ */
 	text: string,
 	model?: string,
 	signal?: AbortSignal,
