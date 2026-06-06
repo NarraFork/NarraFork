@@ -1,0 +1,6 @@
+{
+	"version": "0.4.19",
+	"date": "2026-06-06",
+	"en": "## New Features\n\n- Added a NUG recharge workflow so users can top up provider credit from the settings experience.\n\n## Bug Fixes\n\n- Stabilized NUG quota, usage, base URL, and metadata handling so usage dashboards stay consistent without exposing raw upstream data.\n- Hardened Go backend compatibility paths with explicit unsupported-flow failures and safer database ownership fallbacks.\n- Improved narrator reflection and Go parity flows so runtime decisions and compatibility behavior remain consistent across supported backends.",
+	"zh-CN": "## 新功能\n\n- 增加 NUG 充值流程，用户可在设置体验中为 Provider 额度充值。\n\n## 修复\n\n- 稳定 NUG 配额、用量、基础 URL 和元数据处理，让用量看板保持一致且不暴露上游原始数据。\n- 强化 Go 后端兼容路径，对未支持流程显式失败，并改进数据库所有权的安全回退。\n- 改善叙述者反思与 Go parity 流程，使运行时决策和兼容行为在受支持后端间保持一致。"
+}
