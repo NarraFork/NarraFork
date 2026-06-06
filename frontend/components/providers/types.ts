@@ -21,6 +21,8 @@ export interface CustomApiProviderState {
 	tlsRejectUnauthorized?: boolean;
 	codexAccountId: string;
 	codexWebSocket?: boolean;
+	codexWebSearch?: boolean;
+	codexImageGeneration?: boolean;
 	disabled?: boolean;
 }
 
@@ -36,6 +38,8 @@ export interface OpenAIProviderState {
 	apiMode?: "responses" | "completions" | "codex";
 	codexAccountId: string;
 	codexWebSocket?: boolean;
+	codexWebSearch?: boolean;
+	codexImageGeneration?: boolean;
 	disabled?: boolean;
 }
 

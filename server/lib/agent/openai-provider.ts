@@ -143,15 +143,34 @@ function hasNativeTool(tools: unknown[], type: string): boolean {
 	});
 }
 
+function removeNativeTool(tools: unknown[], type: string): void {
+	for (let i = tools.length - 1; i >= 0; i--) {
+		const tool = tools[i];
+		if (tool && typeof tool === "object" && (tool as { type?: unknown }).type === type) {
+			tools.splice(i, 1);
+		}
+	}
+}
+
 export function supportsCodexImageGeneration(model: string): boolean {
 	const bareModel = parseModelId(model).model;
 	const inputModalities = CODEX_MODEL_INPUT_MODALITIES[bareModel] ?? DEFAULT_CODEX_INPUT_MODALITIES;
 	return inputModalities.includes("image");
 }
 
-export function appendCodexNativeTools(tools: unknown[], model: string): void {
-	if (!hasNativeTool(tools, "web_search")) {
+export function appendCodexNativeTools(
+	tools: unknown[],
+	model: string,
+	options?: { webSearch?: boolean; imageGeneration?: boolean },
+): void {
+	if (options?.webSearch === false) {
+		removeNativeTool(tools, "web_search");
+	} else if (!hasNativeTool(tools, "web_search")) {
 		tools.push({ type: "web_search" });
+	}
+	if (options?.imageGeneration === false) {
+		removeNativeTool(tools, "image_generation");
+		return;
 	}
 	if (supportsCodexImageGeneration(model) && !hasNativeTool(tools, "image_generation")) {
 		tools.push({ type: "image_generation", output_format: "png" });
@@ -433,6 +452,14 @@ export class OpenAIProvider implements ProviderAdapter {
 		return usesResponsesFormat(this.apiMode);
 	}
 
+	private get codexWebSearchEnabled(): boolean {
+		return this.config.codexWebSearch ?? true;
+	}
+
+	private get codexImageGenerationEnabled(): boolean {
+		return this.config.codexImageGeneration ?? true;
+	}
+
 	/**
 	 * Proxy-aware fetch. When a proxy is configured, injects it into the request.
 	 */
@@ -635,7 +662,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, model);
+				appendCodexNativeTools(toolsArr, model, {
+					webSearch: this.codexWebSearchEnabled,
+					imageGeneration: this.codexImageGenerationEnabled,
+				});
 				body.tools = toolsArr;
 			}
 
@@ -1236,7 +1266,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, model);
+		appendCodexNativeTools(tools, model, {
+			webSearch: this.codexWebSearchEnabled,
+			imageGeneration: this.codexImageGenerationEnabled,
+		});
 		request.tools = tools;
 
 		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);

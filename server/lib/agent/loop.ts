@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
-import { resolveBooleanOverride } from "../boolean-override";
+import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import {
@@ -623,6 +623,78 @@ function formatDangerDetails(details: string[] | undefined, locale: Locale): str
 		: `\nDetails:\n${bulletList(details)}`;
 }
 
+function formatDangerReflectionLevelForPrompt(
+	level: Exclude<DangerReflectionLevel, "off">,
+	locale: Locale,
+): string {
+	if (locale === "zh-CN") {
+		switch (level) {
+			case "light":
+				return "宽松";
+			case "standard":
+				return "中等";
+			case "strict":
+				return "严格";
+		}
+	}
+	switch (level) {
+		case "light":
+			return "Light";
+		case "standard":
+			return "Medium";
+		case "strict":
+			return "Strict";
+	}
+}
+
+function buildDangerReflectionLevelGuidance(
+	level: Exclude<DangerReflectionLevel, "off">,
+	locale: Locale,
+): string {
+	if (locale === "zh-CN") {
+		switch (level) {
+			case "light":
+				return [
+					"当前为宽松档：通常只会拦截高风险或关键风险。",
+					"本轮反思应重点寻找真实的破坏性、状态变更、网络/供应链、权限提升、历史改写或外部路径风险。",
+					"如果操作与用户意图明确一致、范围清楚、收益必要且没有明显误操作迹象，可以确认；不要因为只是存在抽象风险就取消。",
+				].join("\n");
+			case "standard":
+				return [
+					"当前为中等档：对中风险及以上操作做平衡审查。",
+					"确认前必须同时满足：符合当前任务、仍有必要、目标范围明确、风险收益成立。",
+					"如果存在实质更安全且不会丢失任务目标的替代方案，或者必要性不清楚，应取消。",
+				].join("\n");
+			case "strict":
+				return [
+					"当前为严格档：低风险也可能触发反思，审查应更保守，但不要机械拒绝。",
+					"低影响、只读、边界明确且紧扣任务的操作可以确认；任何写入、删除、网络、供应链、外部路径或难以检查的副作用都需要更强的必要性证明。",
+					"若上下文不足、命令可能过期/误复制、或替代方案能显著降低风险，应取消。",
+				].join("\n");
+		}
+	}
+	switch (level) {
+		case "light":
+			return [
+				"Current level: Light. This level usually pauses only high or critical risks.",
+				"Focus on real destructive, state-changing, network/supply-chain, privilege, history-rewrite, or external-path risk.",
+				"If the operation clearly matches user intent, has a bounded scope, is necessary, and does not look accidental, you may confirm; do not cancel merely for abstract risk.",
+			].join("\n");
+		case "standard":
+			return [
+				"Current level: Medium. This level performs balanced review for medium and higher risks.",
+				"Confirm only when the operation matches the current task, remains necessary, has a clear target scope, and has a justified risk/reward tradeoff.",
+				"Cancel if a materially safer alternative preserves the task goal, or if necessity is unclear.",
+			].join("\n");
+		case "strict":
+			return [
+				"Current level: Strict. Even low-risk operations may pause, so be conservative but not mechanical.",
+				"Low-impact, read-only, bounded, task-aligned operations can be confirmed; writes, deletions, network/supply-chain actions, external paths, or hard-to-inspect side effects require stronger necessity.",
+				"Cancel when context is insufficient, the command may be stale/accidental, or a safer alternative materially reduces risk.",
+			].join("\n");
+	}
+}
+
 type DangerReflectionPermission = Extract<PermissionResult, { behavior: "dangerReflection" }>;
 
 function buildDangerReflectionPrompt(
@@ -631,10 +703,14 @@ function buildDangerReflectionPrompt(
 	input: Record<string, unknown>,
 	locale: Locale,
 ): string {
+	const reflectionLevel = pause.reflectionLevel ?? "standard";
 	return getPrompt("dangerReflection", locale)
 		.replaceAll("{requestId}", pause.requestId)
 		.replaceAll("{toolName}", toolName)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
+		.replaceAll("{severity}", pause.danger.severity)
+		.replaceAll("{reflectionLevel}", formatDangerReflectionLevelForPrompt(reflectionLevel, locale))
+		.replaceAll("{levelGuidance}", buildDangerReflectionLevelGuidance(reflectionLevel, locale))
 		.replaceAll("{summary}", pause.danger.summary)
 		.replaceAll("{detailsSection}", formatDangerDetails(pause.danger.details, locale))
 		.replaceAll("{consequencesList}", bulletList(pause.danger.consequences))

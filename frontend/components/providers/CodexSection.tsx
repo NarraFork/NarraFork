@@ -383,6 +383,8 @@ export const CodexSection = React.memo(function CodexSection({
 	const canSetGlobalProxy = isCodexRouteSupported("globalProxy");
 	const canSetDefaultReasoningEffort = isCodexRouteSupported("defaultReasoningEffort");
 	const canSetUseWebSocket = isCodexRouteSupported("useWebSocket");
+	const canSetUseWebSearch = isCodexRouteSupported("useWebSearch");
+	const canSetUseImageGeneration = isCodexRouteSupported("useImageGeneration");
 	const canSetTierOrder = isCodexRouteSupported("tierOrder");
 	const canQueryCredentialUsage = isCodexRouteSupported("credentialUsage");
 	const canEnableCredential = isCodexRouteSupported("credentialEnable");
@@ -421,6 +423,10 @@ export const CodexSection = React.memo(function CodexSection({
 	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
 	const [useWebSocket, setUseWebSocket] = useState(true);
 	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
+	const [useWebSearch, setUseWebSearch] = useState(true);
+	const [useWebSearchInitialized, setUseWebSearchInitialized] = useState(false);
+	const [useImageGeneration, setUseImageGeneration] = useState(true);
+	const [useImageGenerationInitialized, setUseImageGenerationInitialized] = useState(false);
 	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
 	const [tierOrderInitialized, setTierOrderInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
@@ -502,6 +508,14 @@ export const CodexSection = React.memo(function CodexSection({
 			setUseWebSocket(status.useWebSocket ?? true);
 			setUseWebSocketInitialized(true);
 		}
+		if (!useWebSearchInitialized) {
+			setUseWebSearch(status.useWebSearch ?? true);
+			setUseWebSearchInitialized(true);
+		}
+		if (!useImageGenerationInitialized) {
+			setUseImageGeneration(status.useImageGeneration ?? true);
+			setUseImageGenerationInitialized(true);
+		}
 		if (!tierOrderInitialized) {
 			setTierOrder(getDisplayTierOrder(status.tierOrder));
 			setTierOrderInitialized(true);
@@ -511,6 +525,8 @@ export const CodexSection = React.memo(function CodexSection({
 		globalProxyInitialized,
 		defaultReasoningInitialized,
 		useWebSocketInitialized,
+		useWebSearchInitialized,
+		useImageGenerationInitialized,
 		tierOrderInitialized,
 	]);
 
@@ -586,6 +602,20 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			notifications.show({ message: t("codexWebSocketUpdated"), color: "green" });
+		},
+	});
+	const useWebSearchMut = useMutation({
+		mutationFn: (useWebSearch: boolean) => api.codexSetUseWebSearch(useWebSearch),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({ message: t("codexWebSearchUpdated"), color: "green" });
+		},
+	});
+	const useImageGenerationMut = useMutation({
+		mutationFn: (useImageGeneration: boolean) => api.codexSetUseImageGeneration(useImageGeneration),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({ message: t("codexImageGenerationUpdated"), color: "green" });
 		},
 	});
 	const tierOrderMut = useMutation({
@@ -1041,6 +1071,58 @@ export const CodexSection = React.memo(function CodexSection({
 						loading={useWebSocketMut.isPending}
 						disabled={!canSetUseWebSocket}
 						title={!canSetUseWebSocket ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+				<Group align="flex-end">
+					<Stack gap={4} style={{ flex: 1 }}>
+						<Text size="xs" fw={500}>
+							{t("codexUseWebSearch")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexUseWebSearchDesc")}
+						</Text>
+					</Stack>
+					<Switch
+						size="sm"
+						checked={useWebSearch}
+						onChange={(e) => setUseWebSearch(e.currentTarget.checked)}
+						disabled={!canSetUseWebSearch}
+					/>
+					<Button
+						size="xs"
+						onClick={() => canSetUseWebSearch && useWebSearchMut.mutate(useWebSearch)}
+						loading={useWebSearchMut.isPending}
+						disabled={!canSetUseWebSearch}
+						title={!canSetUseWebSearch ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+				<Group align="flex-end">
+					<Stack gap={4} style={{ flex: 1 }}>
+						<Text size="xs" fw={500}>
+							{t("codexUseImageGeneration")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexUseImageGenerationDesc")}
+						</Text>
+					</Stack>
+					<Switch
+						size="sm"
+						checked={useImageGeneration}
+						onChange={(e) => setUseImageGeneration(e.currentTarget.checked)}
+						disabled={!canSetUseImageGeneration}
+					/>
+					<Button
+						size="xs"
+						onClick={() =>
+							canSetUseImageGeneration && useImageGenerationMut.mutate(useImageGeneration)
+						}
+						loading={useImageGenerationMut.isPending}
+						disabled={!canSetUseImageGeneration}
+						title={!canSetUseImageGeneration ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexSave")}
 					</Button>

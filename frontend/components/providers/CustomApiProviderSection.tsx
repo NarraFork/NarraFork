@@ -352,6 +352,20 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 							checked={!!provider.codexWebSocket}
 							onChange={(e) => updateProvider("codexWebSocket", e.currentTarget.checked)}
 						/>
+						<Switch
+							label={t("openaiCodexWebSearch")}
+							description={t("openaiCodexWebSearchDesc")}
+							size="xs"
+							checked={provider.codexWebSearch !== false}
+							onChange={(e) => updateProvider("codexWebSearch", e.currentTarget.checked)}
+						/>
+						<Switch
+							label={t("openaiCodexImageGeneration")}
+							description={t("openaiCodexImageGenerationDesc")}
+							size="xs"
+							checked={provider.codexImageGeneration !== false}
+							onChange={(e) => updateProvider("codexImageGeneration", e.currentTarget.checked)}
+						/>
 					</>
 				)}
 

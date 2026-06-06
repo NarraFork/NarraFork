@@ -12,6 +12,8 @@ import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
 	codexDefaultReasoningEffortSchema,
 	codexTierOrderSchema,
+	codexUseImageGenerationSchema,
+	codexUseWebSearchSchema,
 	codexUseWebSocketSchema,
 } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -156,6 +158,8 @@ codexRoutes.get("/status", (c) => {
 		effectiveTierOrder: snapshot.effectiveTierOrder,
 		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
 		useWebSocket: settings.codex?.useWebSocket ?? true,
+		useWebSearch: settings.codex?.useWebSearch ?? true,
+		useImageGeneration: settings.codex?.useImageGeneration ?? true,
 	});
 });
 
@@ -491,6 +495,42 @@ codexRoutes.post("/use-websocket", async (c) => {
 	saveSettings(settings);
 
 	return c.json({ ok: true, useWebSocket: settings.codex.useWebSocket ?? true });
+});
+
+/**
+ * POST /api/codex/use-web-search
+ * Set whether to inject the native web_search tool for Codex models.
+ */
+codexRoutes.post("/use-web-search", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexUseWebSearchSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	settings.codex = settings.codex || {};
+	settings.codex.useWebSearch = parsed.data.useWebSearch ?? true;
+	saveSettings(settings);
+
+	return c.json({ ok: true, useWebSearch: settings.codex.useWebSearch ?? true });
+});
+
+/**
+ * POST /api/codex/use-image-generation
+ * Set whether to inject the native image_generation tool for Codex models.
+ */
+codexRoutes.post("/use-image-generation", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexUseImageGenerationSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	settings.codex = settings.codex || {};
+	settings.codex.useImageGeneration = parsed.data.useImageGeneration ?? true;
+	saveSettings(settings);
+
+	return c.json({ ok: true, useImageGeneration: settings.codex.useImageGeneration ?? true });
 });
 
 /**

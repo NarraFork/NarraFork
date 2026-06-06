@@ -320,14 +320,16 @@ Do not call UpdateGoal from this reflection loop.`,
 不要在这个 reflection loop 中调用 UpdateGoal。`,
 	},
 	dangerReflection: {
-		en: `Danger reflection pause: a high-risk tool call is pending and has NOT executed yet.
+		en: `Danger reflection pause: a risky tool call is pending and has NOT executed yet.
 
 Pending request ID: {requestId}
 Original tool: {toolName}
 Original input:
 {inputJson}
 
-Detected high-risk operation:
+Detected risk:
+- Severity: {severity}
+- Reflection level: {reflectionLevel}
 - {summary}
 {detailsSection}
 
@@ -337,25 +339,30 @@ Possible consequences:
 Safer alternatives to consider:
 {alternativesList}
 
+Level-specific review policy:
+{levelGuidance}
+
 Reflect briefly. Use the conversation history available to this reflection loop: judge whether this exact operation matches the user's request and the current task, whether it is necessary enough to proceed, and whether it looks like an accidental or stale command.
 
 Judge the concrete input, not just the generic risk label. A syntactically risky wrapper (for example \`bun -e\`, \`node -e\`, or a shell chain) can still be acceptable when the visible payload is bounded, inspection-only, and does not write/delete files, install packages, fetch remote code, spawn subprocesses, modify environment/state, or access sensitive external paths.
 
 You have exactly one response, and you MUST call exactly one tool. Do not answer with plain text only.
-- Call DangerConfirm with an optional reflection after confirming the operation is intentional, contextually justified by the conversation/task, still useful, and the concrete visible input is low-impact/read-only enough for the risk to be acceptable.
-- Call DangerCancel with an optional reason if the operation does not clearly match the conversation/task, may be accidental, is no longer necessary, has meaningful destructive/state-changing/network/supply-chain/privilege/hard-to-inspect side-effect risk, or if a materially safer alternative preserves the task without losing important information.
-Do not cancel merely because some safer alternative might exist in theory, but do cancel if necessity is unclear.
+- Call DangerConfirm with an optional reflection after confirming the operation is intentional, contextually justified by the conversation/task, still useful, and acceptable under the current reflection level's review policy.
+- Call DangerCancel with an optional reason if the operation does not clearly match the conversation/task, may be accidental, is no longer necessary, has meaningful destructive/state-changing/network/supply-chain/privilege/hard-to-inspect side-effect risk that is not justified by necessity, or if a materially safer alternative preserves the task without losing important information.
+Do not cancel merely because some safer alternative might exist in theory, but do cancel if necessity is unclear or the current level-specific review policy is not satisfied.
 If a provider/tooling limitation prevents a tool call, output exactly one fallback tag instead: <DangerDecision>{"action":"confirm","reflection":"..."}</DangerDecision> or <DangerDecision>{"action":"cancel","reason":"..."}</DangerDecision>.
 If you do not call either tool or emit a valid fallback tag in this one response, the operation will be treated as cancelled.
 Do not call the original tool from this reflection loop.`,
-		"zh-CN": `危险反思暂停：一个高风险工具调用正在等待确认，尚未执行。
+		"zh-CN": `危险反思暂停：一个风险工具调用正在等待确认，尚未执行。
 
 待确认请求 ID：{requestId}
 原始工具：{toolName}
 原始输入：
 {inputJson}
 
-检测到的高风险操作：
+检测到的风险：
+- 风险等级：{severity}
+- 反思档位：{reflectionLevel}
 - {summary}
 {detailsSection}
 
@@ -365,16 +372,19 @@ Do not call the original tool from this reflection loop.`,
 可考虑的更安全替代方案：
 {alternativesList}
 
+当前档位审查策略：
+{levelGuidance}
+
 请简短反思。利用这个 reflection loop 能看到的会话历史：判断这个精确操作是否符合用户请求和当前任务，是否有足够必要性继续执行，以及它是否像误操作、过期命令或复制错的命令。
 
 判断具体输入，而不是只看通用风险标签。语法上高风险的包装（例如 \`bun -e\`、\`node -e\` 或 shell 串联）在可见 payload 有边界、仅用于检查/输出，并且不写入/删除文件、不安装包、不拉取远程代码、不派生子进程、不修改环境或状态、不访问敏感外部路径时，仍可以接受。
 
-权衡风险和必要性。低影响/只读的具体输入在符合任务时可以较容易确认。真正危险或会改变状态的操作也可以确认，但必须经过更严格审视：它需要明确符合用户意图，足够重要，没有能保留任务目标且实质更安全的替代方案，并且预期收益足以证明风险合理。
+权衡风险和必要性。低影响/只读的具体输入在符合任务时可以较容易确认。真正危险或会改变状态的操作也可以确认，但必须经过当前档位对应的审视：它需要明确符合用户意图，足够重要，没有能保留任务目标且实质更安全的替代方案，并且预期收益足以证明风险合理。
 
 你只有一次回复机会，并且必须且只能调用一个工具；不要只输出普通文本。
-- 在确认该操作是有意的、由会话/任务上下文支撑、仍然必要或有价值，并且结合必要性判断风险可以接受之后，调用 DangerConfirm，可附带可选的 reflection。这可以包括明确符合意图且再三考虑后非常必要的危险操作。
+- 在确认该操作是有意的、由会话/任务上下文支撑、仍然必要或有价值，并且满足当前档位审查策略之后，调用 DangerConfirm，可附带可选的 reflection。这可以包括明确符合意图且再三考虑后非常必要的危险操作。
 - 如果该操作不明确符合会话/任务、可能是误操作、已经不再必要、存在未被必要性证明的破坏性/状态变更/网络/供应链/提权/难以检查的副作用风险，或替代方案能在不丢失关键信息的前提下实质降低风险，调用 DangerCancel，可附带可选的 reason。
-不要仅仅因为理论上可能存在更安全替代方案就取消；但如果必要性不清楚，或风险收益权衡不成立，应取消。
+不要仅仅因为理论上可能存在更安全替代方案就取消；但如果必要性不清楚，或不满足当前档位审查策略，应取消。
 如果 provider/工具限制导致无法发出工具调用，则只能输出一个精确 fallback 标签：<DangerDecision>{"action":"confirm","reflection":"..."}</DangerDecision> 或 <DangerDecision>{"action":"cancel","reason":"..."}</DangerDecision>。
 如果你在这一次回复中没有调用任一工具，也没有输出有效 fallback 标签，该操作将被视为已取消。
 不要在这个反思 loop 中调用原始工具。`,

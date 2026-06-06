@@ -322,6 +322,8 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	if (provider === "codex") {
 		return new CodexProvider({
 			useWebSocket: settings.codex?.useWebSocket ?? true,
+			useWebSearch: settings.codex?.useWebSearch ?? true,
+			useImageGeneration: settings.codex?.useImageGeneration ?? true,
 		});
 	}
 

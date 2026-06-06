@@ -333,6 +333,8 @@ export const miscApi = {
 			globalProxy?: string;
 			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 			useWebSocket?: boolean;
+			useWebSearch?: boolean;
+			useImageGeneration?: boolean;
 			lastBrowserAuthError?: string;
 			usageCache: Record<string, CodexUsageData>;
 			usageSummary: CodexUsageSummary;
@@ -455,6 +457,16 @@ export const miscApi = {
 		request<{ ok: boolean; useWebSocket: boolean }>("/codex/use-websocket", {
 			method: "POST",
 			body: JSON.stringify({ useWebSocket }),
+		}),
+	codexSetUseWebSearch: (useWebSearch: boolean) =>
+		request<{ ok: boolean; useWebSearch: boolean }>("/codex/use-web-search", {
+			method: "POST",
+			body: JSON.stringify({ useWebSearch }),
+		}),
+	codexSetUseImageGeneration: (useImageGeneration: boolean) =>
+		request<{ ok: boolean; useImageGeneration: boolean }>("/codex/use-image-generation", {
+			method: "POST",
+			body: JSON.stringify({ useImageGeneration }),
 		}),
 	codexImportCredentials: (
 		credentials: Array<{

@@ -35,6 +35,14 @@ export const codexUseWebSocketSchema = z.object({
 	useWebSocket: z.boolean().optional(),
 });
 
+export const codexUseWebSearchSchema = z.object({
+	useWebSearch: z.boolean().optional(),
+});
+
+export const codexUseImageGenerationSchema = z.object({
+	useImageGeneration: z.boolean().optional(),
+});
+
 export const codexTierOrderSchema = z.object({
 	tierOrder: z.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"])).max(6),
 });

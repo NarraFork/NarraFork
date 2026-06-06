@@ -59,6 +59,8 @@ export {
 	batchDeleteBlocksSchema,
 	codexDefaultReasoningEffortSchema,
 	codexTierOrderSchema,
+	codexUseImageGenerationSchema,
+	codexUseWebSearchSchema,
 	codexUseWebSocketSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,

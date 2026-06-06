@@ -81,6 +81,8 @@ export const DEFAULTS: NarraForkSettings = {
 		// codex-reversed 显示官方默认 reasoning level 为 medium，避免默认 high 过快消耗额度。
 		defaultReasoningEffort: "medium",
 		useWebSocket: true,
+		useWebSearch: true,
+		useImageGeneration: true,
 	},
 	update: {
 		serverUrl: "https://narrafork-update.b.domexie.cn",
@@ -474,6 +476,14 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"codex.useWebSocket": {
 		desc: "使用 Responses WebSocket 而非 HTTP 连接到 Codex（实验性功能，默认开启，失败时会自动回退 HTTP）。",
+		type: "boolean",
+	},
+	"codex.useWebSearch": {
+		desc: "是否向 Codex 请求注入原生 web_search 网络搜索工具。关闭后不再发送该工具。默认开启。",
+		type: "boolean",
+	},
+	"codex.useImageGeneration": {
+		desc: "是否向 Codex 请求注入原生 image_generation 图像生成工具。关闭后不再发送该工具。默认开启。",
 		type: "boolean",
 	},
 

@@ -103,6 +103,8 @@ function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderStat
 		apiMode,
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
+		codexWebSearch: provider.codexWebSearch ?? true,
+		codexImageGeneration: provider.codexImageGeneration ?? true,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -157,6 +159,8 @@ function normalizeCustomApiProvider(
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
+		codexWebSearch: provider.codexWebSearch ?? true,
+		codexImageGeneration: provider.codexImageGeneration ?? true,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -185,6 +189,8 @@ function deriveCustomApiProvidersFromLegacy(
 				protocol: protocolFromAnthropic(provider.officialApi),
 				codexAccountId: existing?.codexAccountId ?? "",
 				codexWebSocket: existing?.codexWebSocket ?? false,
+				codexWebSearch: existing?.codexWebSearch ?? true,
+				codexImageGeneration: existing?.codexImageGeneration ?? true,
 			}),
 		);
 	}
@@ -241,6 +247,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				apiMode: p.apiMode,
 				codexAccountId: p.codexAccountId ?? "",
 				codexWebSocket: p.codexWebSocket ?? false,
+				codexWebSearch: p.codexWebSearch ?? true,
+				codexImageGeneration: p.codexImageGeneration ?? true,
 				disabled: p.disabled ?? false,
 			}));
 

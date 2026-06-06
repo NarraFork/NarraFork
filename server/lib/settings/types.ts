@@ -48,6 +48,10 @@ export interface CustomApiProviderConfig {
 	codexAccountId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP. */
 	codexWebSocket?: boolean;
+	/** Codex: allow the native web_search tool to be sent to the model. */
+	codexWebSearch?: boolean;
+	/** Codex: allow the native image_generation tool to be sent to the model. */
+	codexImageGeneration?: boolean;
 }
 
 export interface OpenAIProviderConfig {
@@ -82,6 +86,10 @@ export interface OpenAIProviderConfig {
 	codexAccountId?: string;
 	/** Codex: use Responses WebSocket instead of HTTP (experimental; falls back to HTTP when unavailable). */
 	codexWebSocket?: boolean;
+	/** Codex: allow the native web_search tool to be sent to the model. */
+	codexWebSearch?: boolean;
+	/** Codex: allow the native image_generation tool to be sent to the model. */
+	codexImageGeneration?: boolean;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
@@ -453,6 +461,10 @@ export interface NarraForkSettings {
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		/** Use WebSocket instead of HTTP for Codex connections (experimental, enabled by default). */
 		useWebSocket?: boolean;
+		/** Allow the native web_search tool to be sent to Codex models. Enabled by default. */
+		useWebSearch?: boolean;
+		/** Allow the native image_generation tool to be sent to Codex models. Enabled by default. */
+		useImageGeneration?: boolean;
 	};
 	/** Built-in routines configuration. */
 	routines: {

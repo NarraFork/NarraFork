@@ -78,6 +78,10 @@ const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 export interface CodexProviderOptions {
 	/** Use WebSocket instead of HTTP for streaming (experimental) */
 	useWebSocket?: boolean;
+	/** Allow the native web_search tool to be sent to Codex models. */
+	useWebSearch?: boolean;
+	/** Allow the native image_generation tool to be sent to Codex models. */
+	useImageGeneration?: boolean;
 }
 
 /**
@@ -90,6 +94,8 @@ export class CodexProvider implements ProviderAdapter {
 	private context: CallContext | null = null;
 	private contextSessionKey: string | undefined;
 	private useWebSocket: boolean;
+	private useWebSearch: boolean;
+	private useImageGeneration: boolean;
 	/** Cached dummy provider for synchronous operations (formatToolResult, pushUserTurn, etc.) */
 	private dummyProvider: OpenAIProvider;
 
@@ -100,6 +106,8 @@ export class CodexProvider implements ProviderAdapter {
 		}
 		this.manager.setTierOrder(settings.codex?.tierOrder);
 		this.useWebSocket = options?.useWebSocket ?? true;
+		this.useWebSearch = options?.useWebSearch ?? true;
+		this.useImageGeneration = options?.useImageGeneration ?? true;
 		// Create dummy provider once and reuse it
 		this.dummyProvider = new OpenAIProvider({
 			id: "codex",
@@ -109,6 +117,8 @@ export class CodexProvider implements ProviderAdapter {
 			baseUrl: CODEX_BASE_URL,
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
+			codexWebSearch: this.useWebSearch,
+			codexImageGeneration: this.useImageGeneration,
 		});
 	}
 
@@ -152,6 +162,8 @@ export class CodexProvider implements ProviderAdapter {
 				defaultModel: "gpt-5.3-codex",
 				apiMode: "codex",
 				codexAccountId: ctx.credential.accountId,
+				codexWebSearch: this.useWebSearch,
+				codexImageGeneration: this.useImageGeneration,
 			},
 			proxy,
 		);
@@ -352,6 +364,8 @@ export class CodexProvider implements ProviderAdapter {
 			baseUrl: CODEX_BASE_URL,
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
+			codexWebSearch: this.useWebSearch,
+			codexImageGeneration: this.useImageGeneration,
 		});
 		return dummy.formatTools(tools);
 	}
@@ -381,6 +395,8 @@ export class CodexProvider implements ProviderAdapter {
 			baseUrl: CODEX_BASE_URL,
 			defaultModel: "gpt-5.3-codex",
 			apiMode: "codex",
+			codexWebSearch: this.useWebSearch,
+			codexImageGeneration: this.useImageGeneration,
 		});
 		dummy.injectSystemPrompt(history, systemPrompt, model, locale);
 	}
@@ -687,7 +703,10 @@ export class CodexProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, model);
+		appendCodexNativeTools(tools, model, {
+			webSearch: this.useWebSearch,
+			imageGeneration: this.useImageGeneration,
+		});
 		request.tools = tools;
 
 		const reasoningEffort = normalizeCodexReasoningEffort(model, params.reasoningEffort);
