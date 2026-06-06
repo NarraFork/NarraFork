@@ -90,6 +90,36 @@ export * from "./types";
 export const narraforkDir = resolve(homedir(), ".narrafork");
 const settingsPath = resolve(narraforkDir, "settings.json");
 
+const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
+
+function normalizeDangerReflectionSettings(
+	merged: NarraForkSettings,
+	raw: Record<string, unknown>,
+): boolean {
+	const rawAgent =
+		raw.agent && typeof raw.agent === "object" && !Array.isArray(raw.agent)
+			? (raw.agent as Record<string, unknown>)
+			: undefined;
+	const rawLevel = rawAgent?.dangerReflectionLevel;
+	const hasValidLevel = typeof rawLevel === "string" && DANGER_REFLECTION_LEVELS.has(rawLevel);
+	const nextLevel = hasValidLevel
+		? (rawLevel as NarraForkSettings["agent"]["dangerReflectionLevel"])
+		: rawAgent?.dangerReflectionEnabled === false
+			? "off"
+			: "standard";
+	let changed = false;
+	if (merged.agent.dangerReflectionLevel !== nextLevel) {
+		merged.agent.dangerReflectionLevel = nextLevel;
+		changed = true;
+	}
+	const nextEnabled = nextLevel !== "off";
+	if (merged.agent.dangerReflectionEnabled !== nextEnabled) {
+		merged.agent.dangerReflectionEnabled = nextEnabled;
+		changed = true;
+	}
+	return changed;
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function deepMerge<T extends Record<string, any>>(
 	defaults: T,
@@ -174,6 +204,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	}
 	if (raw.agent?.yoloSkipReadOnlyConfirmations !== undefined) {
 		delete (merged.agent as Record<string, unknown>).yoloSkipReadOnlyConfirmations;
+		needsSave = true;
+	}
+
+	if (normalizeDangerReflectionSettings(merged, raw)) {
 		needsSave = true;
 	}
 

@@ -273,6 +273,14 @@ const NarratorDetailsPanel = lazy(() =>
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
 const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
 type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
+const DANGER_REFLECTION_LEVEL_VALUES = ["off", "light", "standard", "strict"] as const;
+type DangerReflectionLevel = (typeof DANGER_REFLECTION_LEVEL_VALUES)[number];
+const DANGER_REFLECTION_OVERRIDE_VALUES = [
+	"inherit",
+	"on",
+	...DANGER_REFLECTION_LEVEL_VALUES,
+] as const;
+type DangerReflectionOverride = (typeof DANGER_REFLECTION_OVERRIDE_VALUES)[number];
 
 type ContextThresholdsDraft = {
 	standard: { pruneStart: number; compactStart: number };
@@ -298,21 +306,44 @@ function normalizeBooleanOverride(value: unknown): BooleanOverride {
 		: "inherit";
 }
 
+function normalizeDangerReflectionLevel(
+	value: unknown,
+	legacyEnabled = true,
+): DangerReflectionLevel {
+	return DANGER_REFLECTION_LEVEL_VALUES.includes(value as DangerReflectionLevel)
+		? (value as DangerReflectionLevel)
+		: legacyEnabled
+			? "standard"
+			: "off";
+}
+
+function normalizeDangerReflectionOverride(value: unknown): DangerReflectionOverride {
+	return DANGER_REFLECTION_OVERRIDE_VALUES.includes(value as DangerReflectionOverride)
+		? (value as DangerReflectionOverride)
+		: "inherit";
+}
+
+function resolveDangerReflectionLevel(
+	override: unknown,
+	globalLevel: DangerReflectionLevel,
+): DangerReflectionLevel {
+	const normalizedOverride = normalizeDangerReflectionOverride(override);
+	if (normalizedOverride === "inherit") return globalLevel;
+	if (normalizedOverride === "on") return globalLevel === "off" ? "standard" : globalLevel;
+	return normalizedOverride;
+}
+
+function formatDangerReflectionLevel(
+	level: DangerReflectionLevel,
+	t: (key: string) => string,
+): string {
+	return t(`dangerReflectionLevel_${level}`);
+}
+
 function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean {
 	const override = normalizeBooleanOverride(value);
 	if (override === "inherit") return globalDefault;
 	return override === "on";
-}
-
-function formatOverrideStatus(
-	override: BooleanOverride,
-	effective: boolean,
-	t: (key: string) => string,
-): string {
-	if (override === "inherit") {
-		return `${t("override_inherit")} · ${effective ? t("details.on") : t("details.off")}`;
-	}
-	return override === "on" ? t("override_on") : t("override_off");
 }
 
 /** Number of queued messages before the queue collapses into a summary bar. */
@@ -766,12 +797,14 @@ function PermModeMenuItems({
 	unavailableReason,
 	onSelect,
 	t,
+	renderAfterMode,
 }: {
 	currentMode: string;
 	availableModes: string[];
 	unavailableReason?: string;
 	onSelect: (mode: string) => void;
 	t: (key: string) => string;
+	renderAfterMode?: (mode: string) => React.ReactNode;
 }) {
 	const modes = PERM_MODES.filter((mode) => availableModes.includes(mode));
 	if (modes.length === 0) {
@@ -787,71 +820,174 @@ function PermModeMenuItems({
 			{modes.map((mode) => {
 				const selected = currentMode === mode;
 				return (
-					<Menu.Item
-						key={mode}
-						leftSection={PERM_MODE_ICONS[mode]}
-						onClick={() => onSelect(mode)}
-						rightSection={
-							<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
-						}
-						fw={selected ? 600 : 400}
-					>
-						{t(`perm_${mode}`)}
-					</Menu.Item>
+					<span key={mode}>
+						<Menu.Item
+							leftSection={PERM_MODE_ICONS[mode]}
+							onClick={() => onSelect(mode)}
+							rightSection={
+								<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
+							}
+							fw={selected ? 600 : 400}
+						>
+							{t(`perm_${mode}`)}
+						</Menu.Item>
+						{renderAfterMode?.(mode)}
+					</span>
 				);
 			})}
 		</>
 	);
 }
 
-function OverrideControl({
-	label,
-	description,
-	value,
+function InlineOverrideActions({
+	visible,
+	disabled,
+	onFollowDefault,
+	onSetAsDefault,
+	t,
+}: {
+	visible: boolean;
+	disabled: boolean;
+	onFollowDefault: () => void;
+	onSetAsDefault: () => void;
+	t: (key: string) => string;
+}) {
+	if (!visible) return null;
+	const linkStyle = {
+		textDecoration: "underline",
+		opacity: disabled ? 0.45 : 1,
+		pointerEvents: disabled ? "none" : "auto",
+	} as const;
+	return (
+		<Group justify="space-between" mt={4} wrap="nowrap" style={{ width: "100%" }}>
+			<Anchor
+				component="button"
+				type="button"
+				size="xs"
+				c="dimmed"
+				style={linkStyle}
+				onClick={(event) => {
+					event.stopPropagation();
+					onFollowDefault();
+				}}
+			>
+				{t("override_followDefault")}
+			</Anchor>
+			<Anchor
+				component="button"
+				type="button"
+				size="xs"
+				c="dimmed"
+				style={linkStyle}
+				onClick={(event) => {
+					event.stopPropagation();
+					onSetAsDefault();
+				}}
+			>
+				{t("override_setAsDefault")}
+			</Anchor>
+		</Group>
+	);
+}
+
+function PlanReflectionMenuControl({
+	visible,
+	override,
 	effective,
 	globalDefault,
 	disabled,
 	onChange,
+	onFollowDefault,
+	onSetAsDefault,
 	t,
 }: {
-	label: string;
-	description: string;
-	value: BooleanOverride;
+	visible: boolean;
+	override: BooleanOverride;
 	effective: boolean;
 	globalDefault: boolean;
 	disabled: boolean;
 	onChange: (value: BooleanOverride) => void;
+	onFollowDefault: () => void;
+	onSetAsDefault: () => void;
 	t: (key: string) => string;
 }) {
+	if (!visible) return null;
 	return (
-		<Stack gap={4}>
-			<Group justify="space-between" align="center" wrap="nowrap">
+		<Box px="sm" py={6} onClick={(event) => event.stopPropagation()}>
+			<Group justify="space-between" align="center" wrap="nowrap" gap="sm">
 				<Text size="xs" fw={600}>
-					{label}
+					{t("planReflectionShort")}
 				</Text>
-				<Badge size="xs" variant="light" color={effective ? "teal" : "gray"}>
-					{effective ? t("details.on") : t("details.off")}
-				</Badge>
+				<Switch
+					size="xs"
+					checked={effective}
+					disabled={disabled}
+					onChange={(event) => {
+						const checked = event.currentTarget.checked;
+						onChange(checked === globalDefault ? "inherit" : checked ? "on" : "off");
+					}}
+				/>
 			</Group>
-			<Text size="xs" c="dimmed">
-				{description}
+			<InlineOverrideActions
+				visible={override !== "inherit"}
+				disabled={disabled}
+				onFollowDefault={onFollowDefault}
+				onSetAsDefault={onSetAsDefault}
+				t={t}
+			/>
+		</Box>
+	);
+}
+
+function DangerReflectionMenuControl({
+	visible,
+	override,
+	effectiveLevel,
+	globalLevel,
+	disabled,
+	onChange,
+	onFollowDefault,
+	onSetAsDefault,
+	t,
+}: {
+	visible: boolean;
+	override: DangerReflectionOverride;
+	effectiveLevel: DangerReflectionLevel;
+	globalLevel: DangerReflectionLevel;
+	disabled: boolean;
+	onChange: (value: DangerReflectionOverride) => void;
+	onFollowDefault: () => void;
+	onSetAsDefault: () => void;
+	t: (key: string) => string;
+}) {
+	if (!visible) return null;
+	return (
+		<Box px="sm" pb={8} onClick={(event) => event.stopPropagation()}>
+			<Text size="xs" fw={600} mb={4}>
+				{t("dangerReflectionShort")}
 			</Text>
 			<SegmentedControl
 				size="xs"
 				fullWidth
-				value={value}
-				onChange={(next) => onChange(next as BooleanOverride)}
+				value={effectiveLevel}
+				onChange={(value) => {
+					const level = value as DangerReflectionLevel;
+					onChange(level === globalLevel ? "inherit" : level);
+				}}
 				disabled={disabled}
-				data={[
-					{
-						value: "inherit",
-						label: `${t("override_inherit")} (${globalDefault ? t("details.on") : t("details.off")})`,
-					},
-					{ value: "on", label: t("override_on") },
-					{ value: "off", label: t("override_off") },
-				]}
+				data={DANGER_REFLECTION_LEVEL_VALUES.map((level) => ({
+					value: level,
+					label: formatDangerReflectionLevel(level, t),
+				}))}
 			/>
-		</Stack>
+			<InlineOverrideActions
+				visible={override !== "inherit"}
+				disabled={disabled}
+				onFollowDefault={onFollowDefault}
+				onSetAsDefault={onSetAsDefault}
+				t={t}
+			/>
+		</Box>
 	);
 }
 
@@ -869,10 +1005,18 @@ function PermissionMenuContent({
 	showPlanReflectionAutoApproveToggle,
 	planReflectionAutoApproveOverride,
 	planReflectionAutoApproveEffective,
+	planReflectionAutoApproveGlobal,
+	onPlanReflectionAutoApproveChange,
+	onFollowDefaultPlanReflection,
+	onSetPlanReflectionAsDefault,
 	showDangerReflectionToggle,
 	dangerReflectionOverride,
-	dangerReflectionEffective,
-	onOpenReflectionSettings,
+	dangerReflectionEffectiveLevel,
+	dangerReflectionGlobalLevel,
+	onDangerReflectionChange,
+	onFollowDefaultDangerReflection,
+	onSetDangerReflectionAsDefault,
+	reflectionSettingsDisabled,
 }: {
 	currentMode: string;
 	availablePermissionModes: string[];
@@ -887,12 +1031,19 @@ function PermissionMenuContent({
 	showPlanReflectionAutoApproveToggle: boolean;
 	planReflectionAutoApproveOverride: BooleanOverride;
 	planReflectionAutoApproveEffective: boolean;
+	planReflectionAutoApproveGlobal: boolean;
+	onPlanReflectionAutoApproveChange: (value: BooleanOverride) => void;
+	onFollowDefaultPlanReflection: () => void;
+	onSetPlanReflectionAsDefault: () => void;
 	showDangerReflectionToggle: boolean;
-	dangerReflectionOverride: BooleanOverride;
-	dangerReflectionEffective: boolean;
-	onOpenReflectionSettings: () => void;
+	dangerReflectionOverride: DangerReflectionOverride;
+	dangerReflectionEffectiveLevel: DangerReflectionLevel;
+	dangerReflectionGlobalLevel: DangerReflectionLevel;
+	onDangerReflectionChange: (value: DangerReflectionOverride) => void;
+	onFollowDefaultDangerReflection: () => void;
+	onSetDangerReflectionAsDefault: () => void;
+	reflectionSettingsDisabled: boolean;
 }) {
-	const hasReflectionSettings = showPlanReflectionAutoApproveToggle || showDangerReflectionToggle;
 	return (
 		<>
 			<Menu.Label>{t("permissionMode")}</Menu.Label>
@@ -902,6 +1053,21 @@ function PermissionMenuContent({
 				unavailableReason={permissionModesUnavailableReason}
 				onSelect={onSelectPermissionMode}
 				t={t}
+				renderAfterMode={(mode) =>
+					mode === "bypassPermissions" ? (
+						<DangerReflectionMenuControl
+							visible={showDangerReflectionToggle}
+							override={dangerReflectionOverride}
+							effectiveLevel={dangerReflectionEffectiveLevel}
+							globalLevel={dangerReflectionGlobalLevel}
+							disabled={reflectionSettingsDisabled}
+							onChange={onDangerReflectionChange}
+							onFollowDefault={onFollowDefaultDangerReflection}
+							onSetAsDefault={onSetDangerReflectionAsDefault}
+							t={t}
+						/>
+					) : null
+				}
 			/>
 			<Menu.Divider />
 			<Menu.Item
@@ -916,32 +1082,17 @@ function PermissionMenuContent({
 						? t("exitPlanMode")
 						: t("enterPlanMode")}
 			</Menu.Item>
-			{hasReflectionSettings && (
-				<>
-					<Menu.Divider />
-					<Menu.Item leftSection={<IconSettings size={14} />} onClick={onOpenReflectionSettings}>
-						<Stack gap={2}>
-							<Text size="sm">{t("sessionReflectionSettings")}</Text>
-							{showPlanReflectionAutoApproveToggle && (
-								<Text size="xs" c="dimmed">
-									{t("planReflectionShort")}:{" "}
-									{formatOverrideStatus(
-										planReflectionAutoApproveOverride,
-										planReflectionAutoApproveEffective,
-										t,
-									)}
-								</Text>
-							)}
-							{showDangerReflectionToggle && (
-								<Text size="xs" c="dimmed">
-									{t("dangerReflectionShort")}:{" "}
-									{formatOverrideStatus(dangerReflectionOverride, dangerReflectionEffective, t)}
-								</Text>
-							)}
-						</Stack>
-					</Menu.Item>
-				</>
-			)}
+			<PlanReflectionMenuControl
+				visible={showPlanReflectionAutoApproveToggle}
+				override={planReflectionAutoApproveOverride}
+				effective={planReflectionAutoApproveEffective}
+				globalDefault={planReflectionAutoApproveGlobal}
+				disabled={reflectionSettingsDisabled}
+				onChange={onPlanReflectionAutoApproveChange}
+				onFollowDefault={onFollowDefaultPlanReflection}
+				onSetAsDefault={onSetPlanReflectionAsDefault}
+				t={t}
+			/>
 		</>
 	);
 }
@@ -2034,9 +2185,14 @@ export function NarratorPanel({
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});
-	const dangerReflectionGlobal = settingsData?.agent?.dangerReflectionEnabled ?? true;
+	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
+		settingsData?.agent?.dangerReflectionLevel,
+		settingsData?.agent?.dangerReflectionEnabled ?? true,
+	);
+	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
-	const globalReflectionSettingsDisabled = !settingsData || updateSettingsMutation.isPending;
+	const reflectionSettingsDisabled =
+		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
 		const thresholds = settingsData?.agent?.contextThresholds ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT;
 		return {
@@ -2898,10 +3054,6 @@ export function NarratorPanel({
 		if (paymentRequired) openNugRecharge();
 	}, [openNugRecharge, paymentRequired]);
 	const [
-		reflectionSettingsOpened,
-		{ open: openReflectionSettings, close: closeReflectionSettings },
-	] = useDisclosure(false);
-	const [
 		contextThresholdSettingsOpened,
 		{ open: openContextThresholdSettingsModal, close: closeContextThresholdSettings },
 	] = useDisclosure(false);
@@ -2975,9 +3127,11 @@ export function NarratorPanel({
 			defaultModelValue,
 			planReflectionAutoApproveGlobal,
 			dangerReflectionGlobal,
+			dangerReflectionGlobalLevel,
 		}),
 		[
 			dangerReflectionGlobal,
+			dangerReflectionGlobalLevel,
 			defaultModelValue,
 			narrator,
 			narratorId,
@@ -3064,14 +3218,16 @@ export function NarratorPanel({
 	const planReflectionAutoApproveOverride = normalizeBooleanOverride(
 		narrator?.planReflectionAutoApproveOverride,
 	);
-	const dangerReflectionOverride = normalizeBooleanOverride(narrator?.dangerReflectionOverride);
+	const dangerReflectionOverride = normalizeDangerReflectionOverride(
+		narrator?.dangerReflectionOverride,
+	);
 	const planReflectionAutoApproveEffective = resolveBooleanOverride(
 		planReflectionAutoApproveOverride,
 		planReflectionAutoApproveGlobal,
 	);
-	const dangerReflectionEffective = resolveBooleanOverride(
+	const dangerReflectionEffectiveLevel = resolveDangerReflectionLevel(
 		dangerReflectionOverride,
-		dangerReflectionGlobal,
+		dangerReflectionGlobalLevel,
 	);
 	const togglePlanMode = useCallback(() => {
 		if (!narratorId || !planModeSupported) return;
@@ -3091,10 +3247,31 @@ export function NarratorPanel({
 		},
 		[narratorId, planReflectionSupported, reflectionOverridesMutation],
 	);
+	const handleFollowDefaultPlanReflection = useCallback(() => {
+		handlePlanReflectionAutoApproveOverride("inherit");
+	}, [handlePlanReflectionAutoApproveOverride]);
+	const handleSetPlanReflectionAsDefault = useCallback(() => {
+		if (!settingsData || !planReflectionSupported) return;
+		updateSettingsMutation.mutate({
+			agent: { planReflectionAutoApprove: planReflectionAutoApproveEffective },
+		});
+		reflectionOverridesMutation.mutate({
+			id: narratorId,
+			planReflectionAutoApproveOverride: "inherit",
+		});
+	}, [
+		narratorId,
+		planReflectionAutoApproveEffective,
+		planReflectionSupported,
+		reflectionOverridesMutation,
+		settingsData,
+		updateSettingsMutation,
+	]);
 	const handleDangerReflectionOverride = useCallback(
-		async (value: BooleanOverride) => {
+		async (value: DangerReflectionOverride) => {
 			if (!dangerReflectionSupported) return;
-			if (value === "off" && dangerReflectionEffective) {
+			const nextLevel = resolveDangerReflectionLevel(value, dangerReflectionGlobalLevel);
+			if (nextLevel === "off" && dangerReflectionEffectiveLevel !== "off") {
 				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
 				if (!ok) return;
 			}
@@ -3102,38 +3279,41 @@ export function NarratorPanel({
 		},
 		[
 			confirm,
-			dangerReflectionEffective,
+			dangerReflectionEffectiveLevel,
+			dangerReflectionGlobalLevel,
 			dangerReflectionSupported,
 			narratorId,
 			reflectionOverridesMutation,
 			t,
 		],
 	);
-	const handlePlanReflectionAutoApproveGlobal = useCallback(
-		(enabled: boolean) => {
-			if (!settingsData || !planReflectionSupported) return;
-			updateSettingsMutation.mutate({ agent: { planReflectionAutoApprove: enabled } });
-		},
-		[planReflectionSupported, settingsData, updateSettingsMutation],
-	);
-	const handleDangerReflectionGlobal = useCallback(
-		async (enabled: boolean) => {
-			if (!settingsData || !dangerReflectionSupported) return;
-			if (!enabled && dangerReflectionGlobal) {
-				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
-				if (!ok) return;
-			}
-			updateSettingsMutation.mutate({ agent: { dangerReflectionEnabled: enabled } });
-		},
-		[
-			confirm,
-			dangerReflectionGlobal,
-			dangerReflectionSupported,
-			settingsData,
-			t,
-			updateSettingsMutation,
-		],
-	);
+	const handleFollowDefaultDangerReflection = useCallback(() => {
+		handleDangerReflectionOverride("inherit");
+	}, [handleDangerReflectionOverride]);
+	const handleSetDangerReflectionAsDefault = useCallback(async () => {
+		if (!settingsData || !dangerReflectionSupported) return;
+		if (dangerReflectionEffectiveLevel === "off" && dangerReflectionGlobal) {
+			const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
+			if (!ok) return;
+		}
+		updateSettingsMutation.mutate({
+			agent: {
+				dangerReflectionLevel: dangerReflectionEffectiveLevel,
+				dangerReflectionEnabled: dangerReflectionEffectiveLevel !== "off",
+			},
+		});
+		reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: "inherit" });
+	}, [
+		confirm,
+		dangerReflectionEffectiveLevel,
+		dangerReflectionGlobal,
+		dangerReflectionSupported,
+		narratorId,
+		reflectionOverridesMutation,
+		settingsData,
+		t,
+		updateSettingsMutation,
+	]);
 	const handleOpenContextThresholdSettings = useCallback(() => {
 		setContextThresholdDraft(contextThresholdSettings);
 		openContextThresholdSettingsModal();
@@ -5759,7 +5939,7 @@ export function NarratorPanel({
 						fetchedNarrator?.planReflectionAutoApproveOverride ??
 							narrator?.planReflectionAutoApproveOverride,
 					),
-					dangerReflectionOverride: normalizeBooleanOverride(
+					dangerReflectionOverride: normalizeDangerReflectionOverride(
 						fetchedNarrator?.dangerReflectionOverride ?? narrator?.dangerReflectionOverride,
 					),
 					cwd: currentCwd,
@@ -7046,86 +7226,6 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
-					<Modal
-						opened={reflectionSettingsOpened}
-						onClose={closeReflectionSettings}
-						title={t("sessionReflectionSettings")}
-						centered
-						size="lg"
-					>
-						<Stack gap="md">
-							<Stack gap="sm">
-								<Text size="sm" fw={600}>
-									{t("sessionOverrides")}
-								</Text>
-								{planReflectionSupported &&
-									((narrator.permissionMode ?? "default") === "acceptEdits" ||
-										(narrator.permissionMode ?? "default") === "bypassPermissions") && (
-										<OverrideControl
-											label={t("sessionPlanReflectionAutoApprove")}
-											description={t("sessionPlanReflectionAutoApproveDesc")}
-											value={planReflectionAutoApproveOverride}
-											effective={planReflectionAutoApproveEffective}
-											globalDefault={planReflectionAutoApproveGlobal}
-											disabled={reflectionOverridesMutation.isPending}
-											onChange={handlePlanReflectionAutoApproveOverride}
-											t={t}
-										/>
-									)}
-								{dangerReflectionSupported &&
-									(narrator.permissionMode ?? "default") === "bypassPermissions" && (
-										<OverrideControl
-											label={t("sessionDangerReflection")}
-											description={t("sessionDangerReflectionDesc")}
-											value={dangerReflectionOverride}
-											effective={dangerReflectionEffective}
-											globalDefault={dangerReflectionGlobal}
-											disabled={reflectionOverridesMutation.isPending}
-											onChange={handleDangerReflectionOverride}
-											t={t}
-										/>
-									)}
-							</Stack>
-							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
-							<Stack gap="sm">
-								<Text size="sm" fw={600}>
-									{t("globalDefaults")}
-								</Text>
-								<Switch
-									label={t("globalPlanReflectionAutoApprove")}
-									description={t("globalPlanReflectionAutoApproveDesc")}
-									checked={planReflectionAutoApproveGlobal}
-									onChange={(event) =>
-										handlePlanReflectionAutoApproveGlobal(event.currentTarget.checked)
-									}
-									disabled={globalReflectionSettingsDisabled || !planReflectionSupported}
-								/>
-								<Switch
-									label={t("globalDangerReflection")}
-									description={t("globalDangerReflectionDesc")}
-									checked={dangerReflectionGlobal}
-									onChange={(event) => handleDangerReflectionGlobal(event.currentTarget.checked)}
-									disabled={globalReflectionSettingsDisabled || !dangerReflectionSupported}
-								/>
-							</Stack>
-							<Group justify="space-between">
-								<Anchor
-									component="button"
-									type="button"
-									size="xs"
-									onClick={() => navigate({ to: "/settings/agent" })}
-									style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
-								>
-									{t("globalAgentSettings")}
-									<IconExternalLink size={12} />
-								</Anchor>
-								<Button variant="default" onClick={closeReflectionSettings}>
-									{tc("close")}
-								</Button>
-							</Group>
-						</Stack>
-					</Modal>
-
 					{detailsOpened && !onToggleDetailsPanel && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
@@ -7137,6 +7237,7 @@ export function NarratorPanel({
 								defaultModelValue={defaultModelValue}
 								planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
 								dangerReflectionGlobal={dangerReflectionGlobal}
+								dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
 								displayMode="drawer"
 							/>
 						</Suspense>
@@ -8192,13 +8293,22 @@ export function NarratorPanel({
 																planReflectionAutoApproveEffective={
 																	planReflectionAutoApproveEffective
 																}
-																showDangerReflectionToggle={
-																	dangerReflectionSupported &&
-																	(narrator.permissionMode ?? "default") === "bypassPermissions"
+																planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
+																onPlanReflectionAutoApproveChange={
+																	handlePlanReflectionAutoApproveOverride
 																}
+																onFollowDefaultPlanReflection={handleFollowDefaultPlanReflection}
+																onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
+																showDangerReflectionToggle={dangerReflectionSupported}
 																dangerReflectionOverride={dangerReflectionOverride}
-																dangerReflectionEffective={dangerReflectionEffective}
-																onOpenReflectionSettings={openReflectionSettings}
+																dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
+																dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
+																onDangerReflectionChange={handleDangerReflectionOverride}
+																onFollowDefaultDangerReflection={
+																	handleFollowDefaultDangerReflection
+																}
+																onSetDangerReflectionAsDefault={handleSetDangerReflectionAsDefault}
+																reflectionSettingsDisabled={reflectionSettingsDisabled}
 															/>
 														</Menu.Dropdown>
 													</Menu>
@@ -8406,13 +8516,20 @@ export function NarratorPanel({
 															planReflectionAutoApproveEffective={
 																planReflectionAutoApproveEffective
 															}
-															showDangerReflectionToggle={
-																dangerReflectionSupported &&
-																(narrator.permissionMode ?? "default") === "bypassPermissions"
+															planReflectionAutoApproveGlobal={planReflectionAutoApproveGlobal}
+															onPlanReflectionAutoApproveChange={
+																handlePlanReflectionAutoApproveOverride
 															}
+															onFollowDefaultPlanReflection={handleFollowDefaultPlanReflection}
+															onSetPlanReflectionAsDefault={handleSetPlanReflectionAsDefault}
+															showDangerReflectionToggle={dangerReflectionSupported}
 															dangerReflectionOverride={dangerReflectionOverride}
-															dangerReflectionEffective={dangerReflectionEffective}
-															onOpenReflectionSettings={openReflectionSettings}
+															dangerReflectionEffectiveLevel={dangerReflectionEffectiveLevel}
+															dangerReflectionGlobalLevel={dangerReflectionGlobalLevel}
+															onDangerReflectionChange={handleDangerReflectionOverride}
+															onFollowDefaultDangerReflection={handleFollowDefaultDangerReflection}
+															onSetDangerReflectionAsDefault={handleSetDangerReflectionAsDefault}
+															reflectionSettingsDisabled={reflectionSettingsDisabled}
 														/>
 													</Menu.Dropdown>
 												</Menu>

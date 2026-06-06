@@ -243,7 +243,7 @@ export const narrators = sqliteTable(
 			.notNull()
 			.default("inherit"),
 		dangerReflectionOverride: text("danger_reflection_override", {
-			enum: ["inherit", "on", "off"],
+			enum: ["inherit", "on", "off", "light", "standard", "strict"],
 		})
 			.notNull()
 			.default("inherit"),

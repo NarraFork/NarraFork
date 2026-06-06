@@ -72,6 +72,7 @@ describe("executeTool permission guard", () => {
 				fingerprint: "fingerprint-test",
 				input: {},
 				danger: {
+					severity: "high",
 					summary: "dangerous test operation",
 					consequences: [],
 					saferAlternatives: [],

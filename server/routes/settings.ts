@@ -62,6 +62,8 @@ const proxyUrlSchema = z.preprocess(
 	z.string().optional(),
 );
 
+const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
+
 const webFetchProxyUrlSchema = z.preprocess(
 	(value) => (typeof value === "string" ? normalizeProxyUrl(value) : value),
 	z
@@ -216,6 +218,7 @@ const updateSettingsSchema = z
 				planReflectionAutoApprove: z.boolean(),
 				questionReflectionEnabled: z.boolean(),
 				questionReflectionTimeoutMs: z.number().int().min(10000).max(3600000),
+				dangerReflectionLevel: dangerReflectionLevelSchema,
 				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
@@ -416,6 +419,11 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 		}
 		if (!("dangerSkipReadOnlyConfirmations" in agent) && "yoloSkipReadOnlyConfirmations" in agent) {
 			agent.dangerSkipReadOnlyConfirmations = agent.yoloSkipReadOnlyConfirmations;
+		}
+		if ("dangerReflectionLevel" in agent) {
+			agent.dangerReflectionEnabled = agent.dangerReflectionLevel !== "off";
+		} else if ("dangerReflectionEnabled" in agent) {
+			agent.dangerReflectionLevel = agent.dangerReflectionEnabled === false ? "off" : "standard";
 		}
 		draft.agent = agent;
 	}

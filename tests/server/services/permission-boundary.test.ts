@@ -9,7 +9,9 @@ import {
 	classifyDanger,
 	extractToolPaths,
 	isInsideWorktree,
+	resolveDangerReflectionLevel,
 	resolvePermissionDecision,
+	shouldTriggerDangerReflection,
 } from "../../../server/services/narrator-session";
 
 const TRUNCATE_DIR = join(tmpdir(), "narrafork-tool-output");
@@ -918,6 +920,7 @@ describe("classifyDanger", () => {
 		);
 
 		expect(result?.summary).toContain("outside the safety allowlist");
+		expect(result?.severity).toBe("medium");
 	});
 
 	test("read-only skip does not suppress dangerous shell patterns", () => {
@@ -950,6 +953,7 @@ describe("classifyDanger", () => {
 		);
 
 		expect(result?.summary).toContain("dangerous execution patterns");
+		expect(result?.severity).toBe("high");
 	});
 
 	test("chapter git issues trigger danger reflection classification", () => {
@@ -976,5 +980,54 @@ describe("classifyDanger", () => {
 
 		expect(result?.summary).toContain("branch/worktree state");
 		expect(result?.details?.[0]).toContain("git worktree add");
+		expect(result?.severity).toBe("medium");
+	});
+
+	test("external read-only shell paths are low severity and only strict pauses them", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["ls", "/tmp"],
+					text: "ls /tmp",
+					fullText: "ls /tmp",
+				},
+			],
+			filePaths: ["/tmp"],
+			hasWriteOperation: false,
+		});
+
+		const result = classifyDanger("Bash", { command: "ls /tmp" }, CWD, analysis, [], [], false);
+
+		expect(result?.summary).toContain("outside the current working directory");
+		expect(result?.severity).toBe("low");
+		if (!result) throw new Error("Expected low-severity danger");
+		expect(shouldTriggerDangerReflection(result, "standard")).toBe(false);
+		expect(shouldTriggerDangerReflection(result, "strict")).toBe(true);
+	});
+
+	test("danger reflection levels map severity thresholds", () => {
+		const lowDanger = {
+			severity: "low" as const,
+			summary: "low",
+			consequences: [],
+			saferAlternatives: [],
+		};
+		const mediumDanger = { ...lowDanger, severity: "medium" as const, summary: "medium" };
+		const highDanger = { ...lowDanger, severity: "high" as const, summary: "high" };
+		const criticalDanger = { ...lowDanger, severity: "critical" as const, summary: "critical" };
+
+		expect(shouldTriggerDangerReflection(criticalDanger, "off")).toBe(false);
+		expect(shouldTriggerDangerReflection(mediumDanger, "light")).toBe(false);
+		expect(shouldTriggerDangerReflection(highDanger, "light")).toBe(true);
+		expect(shouldTriggerDangerReflection(lowDanger, "standard")).toBe(false);
+		expect(shouldTriggerDangerReflection(mediumDanger, "standard")).toBe(true);
+		expect(shouldTriggerDangerReflection(lowDanger, "strict")).toBe(true);
+	});
+
+	test("danger reflection override keeps legacy on/off semantics", () => {
+		expect(resolveDangerReflectionLevel("inherit", "light")).toBe("light");
+		expect(resolveDangerReflectionLevel("off", "strict")).toBe("off");
+		expect(resolveDangerReflectionLevel("on", "off")).toBe("standard");
+		expect(resolveDangerReflectionLevel("on", "light")).toBe("light");
 	});
 });

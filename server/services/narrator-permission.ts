@@ -13,13 +13,17 @@ import {
 	narratorWhitelistDirs,
 	projects,
 } from "../db/schema";
-import type { PermissionResult } from "../lib/agent";
+import type { DangerInfo, DangerSeverity, PermissionResult } from "../lib/agent";
 import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyze";
 import { detectShell } from "../lib/agent/shell";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
-import { resolveBooleanOverride } from "../lib/boolean-override";
+import {
+	type DangerReflectionLevel,
+	normalizeDangerReflectionLevel,
+	resolveDangerReflectionLevel,
+} from "../lib/boolean-override";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
@@ -27,6 +31,12 @@ import { isInsidePath, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+
+export {
+	normalizeDangerReflectionLevel,
+	resolveDangerReflectionLevel,
+} from "../lib/boolean-override";
+
 import { coerceAskQuestions, generateAskUserQuestionAnswers } from "./ask-user-question-reflection";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
@@ -875,13 +885,6 @@ function resolveProtectedPathDeny(
 
 const DANGER_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 
-export interface DangerInfo {
-	summary: string;
-	consequences: string[];
-	saferAlternatives: string[];
-	details?: string[];
-}
-
 function stableJson(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -1170,8 +1173,9 @@ function danger(
 	consequences: string[],
 	saferAlternatives: string[],
 	details?: string[],
+	severity: DangerSeverity = "medium",
 ): DangerInfo {
-	return { summary, consequences, saferAlternatives, details };
+	return { severity, summary, consequences, saferAlternatives, details };
 }
 
 function buildShellAnalysisFailureDanger(
@@ -1196,6 +1200,36 @@ function buildShellAnalysisFailureDanger(
 			...(command ? [`Command: ${command}`] : []),
 			`Analysis error: ${errorMessage}`,
 		],
+		"high",
+	);
+}
+
+function buildPlanModeSoftDenyDanger(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	baseDanger?: DangerInfo | null,
+): DangerInfo {
+	const details = [
+		`Tool: ${toolName}`,
+		...extractToolPaths(toolName, input).map((path) => `Target path: ${resolvePath(cwd, path)}`),
+		...(typeof input.command === "string" ? [`Command: ${input.command}`] : []),
+		...(baseDanger?.details ?? []),
+	];
+	return danger(
+		baseDanger?.summary ?? "Plan mode is about to be relaxed for a non-planning tool call.",
+		[
+			"The narrator is still in plan mode, but this approval will enable relaxed plan mode so edit-capable tools can run.",
+			"Implementation changes may begin before the plan has gone through the normal plan-mode approval path.",
+			...(baseDanger?.consequences ?? []),
+		],
+		[
+			"Continue read-only investigation and write only to the designated plan file.",
+			"Submit the complete plan first, then run implementation tools after approval.",
+			...(baseDanger?.saferAlternatives ?? []),
+		],
+		details,
+		baseDanger?.severity ?? "medium",
 	);
 }
 
@@ -1284,6 +1318,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			],
 			["Run git status and git diff first.", "Create a backup branch or stash before resetting."],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "clean") {
@@ -1295,6 +1330,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			],
 			["Run git clean -nd first to preview.", "Delete only specific paths if possible."],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "checkout" && checkoutRestoresPath(args)) {
@@ -1303,6 +1339,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			["Modified files can be reverted without preserving the previous content."],
 			["Inspect git diff first.", "Restore only the specific files that must be reverted."],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "restore") {
@@ -1311,6 +1348,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			["Affected files can be reverted without preserving the previous content."],
 			["Inspect git diff first.", "Restore only specific files rather than the whole tree."],
 			detail,
+			"high",
 		);
 	}
 	if (
@@ -1329,6 +1367,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				"If force is necessary, verify the remote branch and use --force-with-lease.",
 			],
 			detail,
+			"critical",
 		);
 	}
 	if (sub === "branch" && hasAny(["-d", "-D", "--delete"])) {
@@ -1337,6 +1376,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			["Commits reachable only from that branch can become difficult to find."],
 			["Check git branch --merged and note the commit hash before deleting."],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "worktree" && args.includes("remove")) {
@@ -1348,6 +1388,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				"Commit, stash, or copy important files before removal.",
 			],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "filter-branch" || sub === "filter-repo" || sub === "rebase") {
@@ -1359,6 +1400,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				"Prefer a new commit if history rewriting is not required.",
 			],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "rm") {
@@ -1367,6 +1409,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			["Files will be removed and staged for deletion."],
 			["Use git status first.", "Remove only specific intended files."],
 			detail,
+			"high",
 		);
 	}
 	if (sub === "reflog" && args.includes("expire")) {
@@ -1375,6 +1418,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 			["Future recovery from accidental resets or rebases may become impossible."],
 			["Avoid expiring reflogs during agent work unless explicitly required."],
 			detail,
+			"critical",
 		);
 	}
 	if (sub === "stash") {
@@ -1388,6 +1432,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				],
 				["Run git stash list first to inspect.", "Apply the stash before dropping it."],
 				detail,
+				"high",
 			);
 		}
 		if (stashSub === "clear") {
@@ -1399,6 +1444,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				],
 				["Run git stash list first to inspect.", "Apply or pop important stashes before clearing."],
 				detail,
+				"critical",
 			);
 		}
 	}
@@ -1411,6 +1457,7 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 				"Create a backup ref first if pruning is required.",
 			],
 			detail,
+			"high",
 		);
 	}
 	return null;
@@ -1450,6 +1497,7 @@ function classifyShellDanger(
 				],
 				["List the target paths first.", "Prefer moving files to a temporary trash directory."],
 				[`Command: ${cmd.text}`],
+				"high",
 			);
 		}
 		if (name === "find" && (args.includes("-delete") || args.includes("-exec"))) {
@@ -1462,6 +1510,7 @@ function classifyShellDanger(
 					"Apply changes to explicit paths.",
 				],
 				[`Command: ${cmd.text}`],
+				"high",
 			);
 		}
 	}
@@ -1491,6 +1540,7 @@ function classifyShellDanger(
 				"Break the command into read-only inspection and explicit execution steps.",
 			],
 			[...bashAnalysis.dangerousPatterns, "Environment variable injection detected"],
+			"high",
 		);
 	}
 	if (bashAnalysis.dangerousPatterns.length > 0 && !unsafeCommandsWhitelisted) {
@@ -1505,6 +1555,7 @@ function classifyShellDanger(
 				"Break the command into read-only inspection and explicit execution steps.",
 			],
 			bashAnalysis.dangerousPatterns,
+			"high",
 		);
 	}
 	if (bashAnalysis.nonWhitelisted.length > 0 && !unsafeCommandsWhitelisted) {
@@ -1545,6 +1596,7 @@ function classifyShellDanger(
 				"Use a narrower command scoped to explicit paths.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
+			bashAnalysis.hasWriteOperation ? "high" : "low",
 		);
 	}
 	return null;
@@ -1617,10 +1669,46 @@ export function classifyDanger(
 				"Use explicit user approval for external files.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
+			"high",
 		);
 	}
 
 	return null;
+}
+
+function dangerSeverityRank(severity: DangerSeverity): number {
+	switch (severity) {
+		case "low":
+			return 1;
+		case "medium":
+			return 2;
+		case "high":
+			return 3;
+		case "critical":
+			return 4;
+		default:
+			return 2;
+	}
+}
+
+function dangerReflectionThreshold(level: DangerReflectionLevel): number {
+	switch (level) {
+		case "off":
+			return Number.POSITIVE_INFINITY;
+		case "light":
+			return dangerSeverityRank("high");
+		case "standard":
+			return dangerSeverityRank("medium");
+		case "strict":
+			return dangerSeverityRank("low");
+	}
+}
+
+export function shouldTriggerDangerReflection(
+	danger: DangerInfo,
+	level: DangerReflectionLevel,
+): boolean {
+	return dangerSeverityRank(danger.severity) >= dangerReflectionThreshold(level);
 }
 
 type PermissionScopeNarrator = {
@@ -2144,11 +2232,144 @@ export async function handlePermission(
 		isRelaxedPlan,
 		narrator?.previousPermissionMode,
 	);
-	const dangerReflectionEnabled = resolveBooleanOverride(
-		narrator?.dangerReflectionOverride,
+	const globalDangerReflectionLevel = normalizeDangerReflectionLevel(
+		settings.agent.dangerReflectionLevel,
 		settings.agent.dangerReflectionEnabled,
 	);
-	if (decision === "allow" && effectiveMode === "bypassPermissions" && dangerReflectionEnabled) {
+	const dangerReflectionLevel = resolveDangerReflectionLevel(
+		narrator?.dangerReflectionOverride,
+		globalDangerReflectionLevel,
+	);
+	const startDangerReflectionPause = async (
+		danger: DangerInfo,
+		fingerprint: string,
+		opts: { planModeSoftDeny?: boolean; skipConfirmationCache?: boolean } = {},
+	): Promise<PermissionResult | null> => {
+		if (!opts.skipConfirmationCache && consumeDangerConfirmation(narratorId, fingerprint)) {
+			return null;
+		}
+		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+		});
+		if (!toolCallRecord) {
+			logger.error("Tool call record not found for danger reflection", {
+				narratorId,
+				toolName,
+				toolUseId,
+			});
+			return { behavior: "deny", message: "Internal error: tool call record not found" };
+		}
+		const requestId = toolCallRecord.id;
+		const startedAtMs = Date.now();
+		const now = new Date(startedAtMs).toISOString();
+		const suggestions = [
+			{
+				type: "danger_reflection",
+				status: "running",
+				requestId,
+				danger,
+				fingerprint,
+				startedAt: now,
+				...(opts.planModeSoftDeny ? { planModeSoftDeny: true } : {}),
+			},
+		];
+		logger.warn("Danger reflection: high-risk operation paused inside permission handler", {
+			narratorId,
+			toolName,
+			toolUseId,
+			fingerprint,
+			severity: danger.severity,
+			summary: danger.summary,
+		});
+
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "pending",
+				inputJson: effectiveInput,
+				permissionStartedAt: now,
+				permissionDecisionReason: `Danger reflection: ${danger.summary}`,
+				permissionSuggestions: suggestions,
+			})
+			.where(eq(narratorToolCalls.id, requestId));
+		await narratorService.updateStatus(narratorId, "waiting", {
+			substatus: ["silent_notification", "reflecting"],
+		});
+		if (wsTarget !== narratorId) {
+			await narratorService.updateStatus(wsTarget, "waiting", {
+				substatus: ["silent_notification", "reflecting"],
+			});
+		}
+		if (signal.aborted) {
+			await markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, {
+				danger,
+				fingerprint,
+				startedAt: startedAtMs,
+			});
+			return { behavior: "deny", message: "Narrator aborted" };
+		}
+
+		const decisionPromise = new Promise<PermissionResult>((resolve) => {
+			let cleanup = () => {};
+			const onAbort = () => {
+				void markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, undefined, {
+					cleanup: true,
+				}).catch((err) => {
+					logger.warn("Failed to mark danger reflection as aborted", {
+						error: err instanceof Error ? err.message : String(err),
+						narratorId,
+						requestId,
+					});
+				});
+				resolve({ behavior: "deny", message: "Narrator aborted" });
+			};
+			cleanup = () => {
+				signal.removeEventListener("abort", onAbort);
+				pendingDangerReflections.delete(requestId);
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			pendingDangerReflections.set(requestId, {
+				narratorId,
+				requestId,
+				toolCallId: requestId,
+				toolUseId,
+				toolName,
+				broadcastTargetId: wsTarget,
+				input: effectiveInput,
+				fingerprint,
+				danger,
+				startedAt: startedAtMs,
+				planModeSoftDeny: opts.planModeSoftDeny,
+				resolve,
+				cleanup,
+			});
+		});
+		broadcastToNarrator(wsTarget, {
+			type: "danger_reflection_started",
+			narratorId: wsTarget,
+			requestId,
+			toolUseId,
+			toolName,
+			danger,
+		});
+		return {
+			behavior: "dangerReflection",
+			requestId,
+			danger,
+			fingerprint,
+			reflectionLevel: dangerReflectionLevel === "off" ? undefined : dangerReflectionLevel,
+			input: effectiveInput,
+			decision: decisionPromise,
+		};
+	};
+	if (
+		decision === "allow" &&
+		effectiveMode === "bypassPermissions" &&
+		dangerReflectionLevel !== "off"
+	) {
 		const danger =
 			toolName === SHELL_TOOL_NAME && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
@@ -2161,129 +2382,10 @@ export async function handlePermission(
 						mergedCmdWhitelist,
 						settings.agent.dangerSkipReadOnlyConfirmations,
 					);
-		if (danger) {
+		if (danger && shouldTriggerDangerReflection(danger, dangerReflectionLevel)) {
 			const fingerprint = createDangerFingerprint(toolName, effectiveInput, cwd, bashAnalysis);
-			if (!consumeDangerConfirmation(narratorId, fingerprint)) {
-				const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-					where: and(
-						eq(narratorToolCalls.narratorId, narratorId),
-						eq(narratorToolCalls.toolUseId, toolUseId),
-					),
-				});
-				if (!toolCallRecord) {
-					logger.error("Tool call record not found for danger reflection", {
-						narratorId,
-						toolName,
-						toolUseId,
-					});
-					return { behavior: "deny", message: "Internal error: tool call record not found" };
-				}
-				const requestId = toolCallRecord.id;
-				const startedAtMs = Date.now();
-				const now = new Date(startedAtMs).toISOString();
-				const suggestions = [
-					{
-						type: "danger_reflection",
-						status: "running",
-						requestId,
-						danger,
-						fingerprint,
-						startedAt: now,
-					},
-				];
-				logger.warn("Danger reflection: high-risk operation paused inside permission handler", {
-					narratorId,
-					toolName,
-					toolUseId,
-					fingerprint,
-					summary: danger.summary,
-				});
-
-				await db
-					.update(narratorToolCalls)
-					.set({
-						status: "pending",
-						inputJson: effectiveInput,
-						permissionStartedAt: now,
-						permissionDecisionReason: `Danger reflection: ${danger.summary}`,
-						permissionSuggestions: suggestions,
-					})
-					.where(eq(narratorToolCalls.id, requestId));
-				await narratorService.updateStatus(narratorId, "waiting", {
-					substatus: ["silent_notification", "reflecting"],
-				});
-				if (wsTarget !== narratorId) {
-					await narratorService.updateStatus(wsTarget, "waiting", {
-						substatus: ["silent_notification", "reflecting"],
-					});
-				}
-				if (signal.aborted) {
-					await markDangerReflectionAborted(requestId, wsTarget, toolUseId, narratorId, {
-						danger,
-						fingerprint,
-						startedAt: startedAtMs,
-					});
-					return { behavior: "deny", message: "Narrator aborted" };
-				}
-
-				const decisionPromise = new Promise<PermissionResult>((resolve) => {
-					let cleanup = () => {};
-					const onAbort = () => {
-						void markDangerReflectionAborted(
-							requestId,
-							wsTarget,
-							toolUseId,
-							narratorId,
-							undefined,
-							{
-								cleanup: true,
-							},
-						).catch((err) => {
-							logger.warn("Failed to mark danger reflection as aborted", {
-								error: err instanceof Error ? err.message : String(err),
-								narratorId,
-								requestId,
-							});
-						});
-						resolve({ behavior: "deny", message: "Narrator aborted" });
-					};
-					cleanup = () => {
-						signal.removeEventListener("abort", onAbort);
-						pendingDangerReflections.delete(requestId);
-					};
-					signal.addEventListener("abort", onAbort, { once: true });
-					pendingDangerReflections.set(requestId, {
-						narratorId,
-						requestId,
-						toolCallId: requestId,
-						toolUseId,
-						toolName,
-						broadcastTargetId: wsTarget,
-						input: effectiveInput,
-						fingerprint,
-						danger,
-						startedAt: startedAtMs,
-						resolve,
-						cleanup,
-					});
-				});
-				broadcastToNarrator(wsTarget, {
-					type: "danger_reflection_started",
-					narratorId: wsTarget,
-					requestId,
-					toolUseId,
-					toolName,
-					danger,
-				});
-				return {
-					behavior: "dangerReflection",
-					requestId,
-					danger,
-					fingerprint,
-					input: effectiveInput,
-					decision: decisionPromise,
-				};
-			}
+			const pause = await startDangerReflectionPause(danger, fingerprint);
+			if (pause) return pause;
 		}
 	}
 
@@ -2354,6 +2456,32 @@ export async function handlePermission(
 			promotedPlanSoftDeny = true;
 			decision = "ask";
 		}
+	}
+	if (promotedPlanSoftDeny && permMode === "bypassPermissions" && dangerReflectionLevel !== "off") {
+		const baseDanger =
+			toolName === SHELL_TOOL_NAME && shellAnalysisError
+				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
+				: classifyDanger(
+						toolName,
+						effectiveInput,
+						cwd,
+						bashAnalysis,
+						mergedWhitelist,
+						mergedCmdWhitelist,
+						settings.agent.dangerSkipReadOnlyConfirmations,
+					);
+		const danger = buildPlanModeSoftDenyDanger(toolName, effectiveInput, cwd, baseDanger);
+		const fingerprint = `plan_mode_soft_deny:${createDangerFingerprint(
+			toolName,
+			effectiveInput,
+			cwd,
+			bashAnalysis,
+		)}`;
+		const pause = await startDangerReflectionPause(danger, fingerprint, {
+			planModeSoftDeny: true,
+			skipConfirmationCache: true,
+		});
+		if (pause) return pause;
 	}
 	if (decision === "deny") {
 		if (permMeta.blacklistReason) {
@@ -2633,6 +2761,25 @@ export interface ResolvePermissionOpts {
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto";
 
+async function enableRelaxedPlanAfterPlanSoftDeny(
+	narratorId: string,
+	broadcastTargetId: string,
+): Promise<void> {
+	try {
+		await narratorService.updateRelaxedPlan(narratorId, true);
+		broadcastToNarrator(broadcastTargetId, {
+			type: "relaxed_plan_changed",
+			narratorId,
+			relaxedPlan: true,
+		});
+	} catch (err) {
+		logger.warn("Failed to auto-enable relaxedPlan", {
+			narratorId,
+			error: String(err),
+		});
+	}
+}
+
 /** Cancel pending ExitPlanMode approvals for a narrator (e.g. manual plan-mode cancellation). */
 export async function cancelPendingExitPlanMode(
 	narratorId: string,
@@ -2779,21 +2926,9 @@ export async function resolvePermission(
 			}
 		}
 
-		// Plan mode soft deny → user allowed → auto-enable relaxed plan
+		// Plan mode soft deny → approval auto-enables relaxed plan.
 		if (pending.planModeSoftDeny) {
-			try {
-				await narratorService.updateRelaxedPlan(pending.narratorId, true);
-				broadcastToNarrator(pending.broadcastTargetId, {
-					type: "relaxed_plan_changed",
-					narratorId: pending.narratorId,
-					relaxedPlan: true,
-				});
-			} catch (err) {
-				logger.warn("Failed to auto-enable relaxedPlan", {
-					narratorId: pending.narratorId,
-					error: String(err),
-				});
-			}
+			await enableRelaxedPlanAfterPlanSoftDeny(pending.narratorId, pending.broadcastTargetId);
 		}
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
@@ -3144,6 +3279,9 @@ export async function confirmDangerReflection(
 			decision: "allow",
 			reason,
 		});
+		if (pause.planModeSoftDeny) {
+			await enableRelaxedPlanAfterPlanSoftDeny(pause.narratorId, pause.broadcastTargetId);
+		}
 		await narratorService.updateStatus(pause.narratorId, "working").catch(() => {});
 		if (pause.broadcastTargetId !== pause.narratorId) {
 			await narratorService.updateStatus(pause.broadcastTargetId, "working").catch(() => {});

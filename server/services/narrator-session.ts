@@ -18,7 +18,12 @@ import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
-import { type BooleanOverride, normalizeBooleanOverride } from "../lib/boolean-override";
+import {
+	type BooleanOverride,
+	type DangerReflectionOverride,
+	normalizeBooleanOverride,
+	normalizeDangerReflectionOverride,
+} from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError } from "../lib/errors";
@@ -171,6 +176,12 @@ function normalizeOptionalBooleanOverride(value: unknown): BooleanOverride | und
 	return value == null ? undefined : normalizeBooleanOverride(value);
 }
 
+function normalizeOptionalDangerReflectionOverride(
+	value: unknown,
+): DangerReflectionOverride | undefined {
+	return value == null ? undefined : normalizeDangerReflectionOverride(value);
+}
+
 async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -188,7 +199,7 @@ async function executeQueuedNewCommand(
 		planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
 			sourceNarrator.planReflectionAutoApproveOverride,
 		),
-		dangerReflectionOverride: normalizeOptionalBooleanOverride(
+		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
 		),
 		cwd: active.cwd,
@@ -4331,10 +4342,13 @@ export {
 	extractToolPaths,
 	handlePermission,
 	isInsideWorktree,
+	normalizeDangerReflectionLevel,
 	reprocessAllPendingPermissions,
+	resolveDangerReflectionLevel,
 	resolvePermission,
 	resolvePermissionDecision,
 	resolvePermissionOrDangerReflection,
+	shouldTriggerDangerReflection,
 } from "./narrator-permission";
 
 export type { BufferCreator, NarratorEvent } from "./narrator-session-state";

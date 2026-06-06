@@ -8,7 +8,7 @@ import {
 	users,
 } from "../db/schema";
 import { narratorSubstatusLock } from "../lib/async-mutex";
-import type { BooleanOverride } from "../lib/boolean-override";
+import type { BooleanOverride, DangerReflectionOverride } from "../lib/boolean-override";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -892,7 +892,7 @@ export const narratorPersistence = {
 		narratorId: string,
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
-			dangerReflectionOverride?: BooleanOverride;
+			dangerReflectionOverride?: DangerReflectionOverride;
 		},
 	) {
 		const now = new Date().toISOString();

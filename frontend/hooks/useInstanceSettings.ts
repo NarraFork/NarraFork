@@ -7,6 +7,8 @@ import type { SubagentAllowedModels } from "../components/settings/ModelsSection
 import { api } from "../lib/api";
 import { normalizeProxyUrl } from "../lib/proxy";
 
+export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
+
 export interface InstanceSettingsState {
 	// Server
 	port: number | undefined;
@@ -41,6 +43,7 @@ export interface InstanceSettingsState {
 	planReflectionAutoApprove: boolean;
 	questionReflectionEnabled: boolean;
 	questionReflectionTimeoutMs: number;
+	dangerReflectionLevel: DangerReflectionLevel;
 	dangerReflectionEnabled: boolean;
 	dangerSkipReadOnlyConfirmations: boolean;
 	maxTransientRetries: number;
@@ -127,6 +130,7 @@ function makeDefaults(): InstanceSettingsState {
 		planReflectionAutoApprove: false,
 		questionReflectionEnabled: false,
 		questionReflectionTimeoutMs: 300000,
+		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
@@ -212,6 +216,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
 				questionReflectionEnabled: settings.agent?.questionReflectionEnabled ?? false,
 				questionReflectionTimeoutMs: settings.agent?.questionReflectionTimeoutMs ?? 300000,
+				dangerReflectionLevel:
+					(settings.agent?.dangerReflectionLevel as DangerReflectionLevel | undefined) ??
+					(settings.agent?.dangerReflectionEnabled === false ? "off" : "standard"),
 				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
@@ -267,7 +274,11 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 
 	const save = () => {
 		const normalizedWebFetchProxyUrl = normalizeProxyUrl(state.webFetchProxyUrl) ?? "";
-		const normalizedState = { ...state, webFetchProxyUrl: normalizedWebFetchProxyUrl };
+		const normalizedState = {
+			...state,
+			dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
+			webFetchProxyUrl: normalizedWebFetchProxyUrl,
+		};
 		updateSettings.mutate(
 			{
 				server: {
@@ -303,7 +314,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
 					questionReflectionEnabled: state.questionReflectionEnabled,
 					questionReflectionTimeoutMs: state.questionReflectionTimeoutMs,
-					dangerReflectionEnabled: state.dangerReflectionEnabled,
+					dangerReflectionLevel: state.dangerReflectionLevel,
+					dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
 					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||

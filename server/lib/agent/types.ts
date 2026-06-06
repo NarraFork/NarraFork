@@ -111,7 +111,10 @@ export type ResolvedToolDefinition = ToolDefinition & { description: string };
 
 // === Permission ===
 
+export type DangerSeverity = "low" | "medium" | "high" | "critical";
+
 export interface DangerInfo {
+	severity: DangerSeverity;
 	summary: string;
 	consequences: string[];
 	saferAlternatives: string[];
@@ -137,6 +140,8 @@ export type PermissionResult =
 			requestId: string;
 			danger: DangerInfo;
 			fingerprint: string;
+			/** Effective danger reflection policy level that triggered this pause. */
+			reflectionLevel?: "light" | "standard" | "strict";
 			/** Effective input that should be reflected on and executed if confirmed. */
 			input: Record<string, unknown>;
 			decision: Promise<PermissionResult>;

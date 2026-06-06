@@ -185,7 +185,7 @@ interface NarratorWSCallbacks {
 	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onReflectionOverridesChanged?: (overrides: {
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-		dangerReflectionOverride?: "inherit" | "on" | "off";
+		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 	}) => void;
 	onCompacting?: (mode?: "blocking" | "background") => void;
 	onCompactDone?: (
@@ -675,6 +675,9 @@ export function useNarratorWS(
 								| "inherit"
 								| "on"
 								| "off"
+								| "light"
+								| "standard"
+								| "strict"
 								| undefined,
 						});
 						break;

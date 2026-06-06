@@ -25,7 +25,12 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
-import { type BooleanOverride, normalizeBooleanOverride } from "../lib/boolean-override";
+import {
+	type BooleanOverride,
+	type DangerReflectionOverride,
+	normalizeBooleanOverride,
+	normalizeDangerReflectionOverride,
+} from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -135,7 +140,7 @@ interface CreateNarratorInput {
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
-	dangerReflectionOverride?: BooleanOverride;
+	dangerReflectionOverride?: DangerReflectionOverride;
 	startInPlanMode?: boolean;
 	title?: string;
 }
@@ -1383,7 +1388,9 @@ export const narratorService = {
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					parent.planReflectionAutoApproveOverride,
 				),
-				dangerReflectionOverride: normalizeBooleanOverride(parent.dangerReflectionOverride),
+				dangerReflectionOverride: normalizeDangerReflectionOverride(
+					parent.dangerReflectionOverride,
+				),
 				title: opts?.title ?? undefined,
 			});
 			eventBus.emit({

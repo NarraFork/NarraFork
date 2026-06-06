@@ -126,6 +126,7 @@ export interface NarratorDetailsPanelExternalProps {
 	defaultModelValue?: string;
 	planReflectionAutoApproveGlobal?: boolean;
 	dangerReflectionGlobal?: boolean;
+	dangerReflectionGlobalLevel?: "off" | "light" | "standard" | "strict";
 }
 
 export interface NarratorPanelProps {

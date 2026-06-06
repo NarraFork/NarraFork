@@ -62,6 +62,16 @@ describe("agent error handling", () => {
 		}
 	});
 
+	test("does not retry invalidState hard quota messages even with retryable reasons", () => {
+		expect(
+			isRetryableInvalidStateReason(
+				"server_error",
+				"insufficient_quota: check your plan and billing details",
+			),
+		).toBe(false);
+		expect(isRetryableInvalidStateReason("internal_server_error", "payment required")).toBe(false);
+	});
+
 	test("requires retry/load keywords for invalidState 429 messages", () => {
 		expect(isRetryableInvalidStateReason("stream_initialization_failed", "status 429")).toBe(false);
 		expect(
@@ -79,5 +89,49 @@ describe("agent error handling", () => {
 		expect(isRetryableInvalidStateReason("stream_initialization_failed", "status 429: retry")).toBe(
 			true,
 		);
+	});
+
+	test("retries custom keyword-only rules for non-default API errors", () => {
+		expect(
+			isRetryableError({ status: 418, message: "Provider API error: shard warming" }, [
+				{ id: "r1", keyword: " shard warming ", enabled: true },
+			]),
+		).toBe(true);
+	});
+
+	test("retries custom keyword-only rules for primitive thrown errors", () => {
+		expect(
+			isRetryableError("vendor queue draining", [
+				{ id: "r1", keyword: "vendor queue draining", enabled: true },
+			]),
+		).toBe(true);
+	});
+
+	test("matches custom keyword rules against serialized API error fields", () => {
+		expect(
+			isRetryableError(
+				{
+					status: 418,
+					error: { message: "try later", code: "vendor_busy" },
+				},
+				[{ id: "r1", keyword: "vendor_busy", enabled: true }],
+			),
+		).toBe(true);
+	});
+
+	test("retries custom keyword rules for invalid_state messages", () => {
+		expect(
+			isRetryableInvalidStateReason("upstream_busy", "vendor queue draining", [
+				{ id: "r1", keyword: "queue draining", enabled: true },
+			]),
+		).toBe(true);
+	});
+
+	test("does not retry disabled custom keyword rules", () => {
+		expect(
+			isRetryableError({ status: 418, message: "Provider API error: shard warming" }, [
+				{ id: "r1", keyword: "shard warming", enabled: false },
+			]),
+		).toBe(false);
 	});
 });

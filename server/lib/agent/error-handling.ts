@@ -120,16 +120,49 @@ export function extractErrorMessage(err: unknown): string {
 	return String(err);
 }
 
+function numericStatus(value: unknown): number | undefined {
+	const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+	return Number.isInteger(n) && n >= 100 && n <= 599 ? n : undefined;
+}
+
 function collectStatusCodes(obj: Record<string, unknown>): Set<number> {
 	const statusCodes = new Set<number>();
-	for (const field of [obj, obj.error, obj.cause]) {
+	for (const field of [obj, obj.error, obj.cause, obj.response]) {
 		if (field && typeof field === "object") {
 			const f = field as Record<string, unknown>;
-			if (typeof f.status === "number") statusCodes.add(f.status);
-			if (typeof f.statusCode === "number") statusCodes.add(f.statusCode);
+			const status = numericStatus(f.status);
+			const statusCode = numericStatus(f.statusCode);
+			if (status) statusCodes.add(status);
+			if (statusCode) statusCodes.add(statusCode);
 		}
 	}
 	return statusCodes;
+}
+
+function safeSerializeForMatching(value: unknown): string | undefined {
+	const seen = new WeakSet<object>();
+	try {
+		const serialized = JSON.stringify(value, (_key, current) => {
+			if (!current || typeof current !== "object") return current;
+			if (seen.has(current)) return "[Circular]";
+			seen.add(current);
+			if (current instanceof Error) {
+				const result: Record<string, unknown> = {
+					name: current.name,
+					message: current.message,
+				};
+				for (const prop of Object.getOwnPropertyNames(current)) {
+					if (prop === "stack") continue;
+					result[prop] = (current as unknown as Record<string, unknown>)[prop];
+				}
+				return result;
+			}
+			return current;
+		});
+		return serialized ? serialized.slice(0, 50_000) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function has429Message(message: string): boolean {
@@ -149,20 +182,24 @@ function hasRetryable429(statusCodes: Set<number>, msgCandidates: string[]): boo
 	);
 }
 
-export function isRetryableInvalidStateReason(reason: string, message?: string): boolean {
+export function isRetryableInvalidStateReason(
+	reason: string,
+	message?: string,
+	customRetryRules = settings.agent.customRetryRules,
+): boolean {
+	const m = message?.toLowerCase();
+	if (m && NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
 	if (RETRYABLE_INVALID_STATE_REASONS.has(reason.toLowerCase())) return true;
 	// Also check the message for retryable patterns (e.g. "Too many requests",
 	// "status 429") — providers may use non-standard reason codes like
 	// "stream_initialization_failed" while the message contains the real cause.
-	if (message) {
-		const m = message.toLowerCase();
-		if (NON_RETRYABLE_PATTERNS.some((p) => m.includes(p))) return false;
+	if (m) {
 		if (isRetryable429Message(m)) return true;
 		// Plain 429 messages must not fall through to broader transient keywords.
 		if (has429Message(m)) {
 			const obj: Record<string, unknown> = { reason, message };
 			const msgCandidates = [reason, message ?? ""].filter(Boolean);
-			return matchesCustomRetryRules(obj, msgCandidates);
+			return matchesCustomRetryRules(obj, msgCandidates, undefined, customRetryRules);
 		}
 		if (RETRYABLE_PATTERNS.some((p) => m.includes(p))) return true;
 		// Check for HTTP status codes embedded in the message.
@@ -171,7 +208,7 @@ export function isRetryableInvalidStateReason(reason: string, message?: string):
 	// Check user-defined custom retry rules against the invalidState reason/message
 	const obj: Record<string, unknown> = { reason, message };
 	const msgCandidates = [reason, message ?? ""].filter(Boolean);
-	return matchesCustomRetryRules(obj, msgCandidates);
+	return matchesCustomRetryRules(obj, msgCandidates, undefined, customRetryRules);
 }
 
 export function isContextOverflowReason(reason: string): boolean {
@@ -269,10 +306,21 @@ export function getPaymentRequiredErrorInfo(err: unknown): PaymentRequiredErrorI
 	};
 }
 
-export function isRetryableError(err: unknown): boolean {
-	if (!err || typeof err !== "object") return false;
+export function isRetryableError(
+	err: unknown,
+	customRetryRules = settings.agent.customRetryRules,
+): boolean {
 	// Stream stale timeout is always retryable
 	if (err instanceof StreamStaleError) return true;
+	if (!err || typeof err !== "object") {
+		const message = extractErrorMessage(err).toLowerCase();
+		if (!message) return false;
+		if (NON_RETRYABLE_PATTERNS.some((p) => message.includes(p))) return false;
+		if (isRetryable429Message(message)) return true;
+		if (RETRYABLE_PATTERNS.some((p) => message.includes(p))) return true;
+		if (/\b(500|502|503|529)\b/.test(message)) return true;
+		return matchesCustomRetryRules({ message }, [message], undefined, customRetryRules);
+	}
 
 	const obj = err as Record<string, unknown>;
 	const nested = obj.error;
@@ -289,8 +337,9 @@ export function isRetryableError(err: unknown): boolean {
 		typeof nestedObj?.error === "string" ? nestedObj.error : undefined,
 		causeObj?.message,
 		typeof causeObj?.error === "string" ? causeObj.error : undefined,
+		safeSerializeForMatching(obj),
 	]
-		.filter((value): value is string => typeof value === "string")
+		.filter((value): value is string => typeof value === "string" && value.length > 0)
 		.map((value) => value.toLowerCase());
 	const statusCodes = collectStatusCodes(obj);
 
@@ -344,7 +393,7 @@ export function isRetryableError(err: unknown): boolean {
 	if (msgCandidates.some(isRetryable429Message)) return true;
 	// Plain 429 errors must not fall through to broader transient keywords.
 	if (statusCodes.has(429) || msgCandidates.some(has429Message)) {
-		return matchesCustomRetryRules(obj, msgCandidates);
+		return matchesCustomRetryRules(obj, msgCandidates, statusCodes, customRetryRules);
 	}
 
 	if (msgCandidates.some((msg) => RETRYABLE_PATTERNS.some((p) => msg.includes(p)))) {
@@ -352,18 +401,19 @@ export function isRetryableError(err: unknown): boolean {
 	}
 
 	// Check user-defined custom retry rules from settings
-	return matchesCustomRetryRules(obj, msgCandidates);
+	return matchesCustomRetryRules(obj, msgCandidates, statusCodes, customRetryRules);
 }
 
 /** Match error against user-defined custom retry rules (AND within rule, OR across rules). */
 export function matchesCustomRetryRules(
 	obj: Record<string, unknown>,
 	msgCandidates: string[],
+	statusCodesArg?: Set<number>,
+	rules = settings.agent.customRetryRules,
 ): boolean {
-	const rules = settings.agent.customRetryRules;
 	if (!rules?.length) return false;
 
-	const statusCodes = collectStatusCodes(obj);
+	const statusCodes = statusCodesArg ?? collectStatusCodes(obj);
 
 	const allText = msgCandidates.join(" ").toLowerCase();
 
@@ -372,17 +422,19 @@ export function matchesCustomRetryRules(
 		let matched = true;
 		let hasCondition = false;
 
-		if (rule.domain) {
+		const domain = rule.domain?.trim().toLowerCase();
+		const keyword = rule.keyword?.trim().toLowerCase();
+		if (domain) {
 			hasCondition = true;
-			if (!allText.includes(rule.domain.toLowerCase())) matched = false;
+			if (!allText.includes(domain)) matched = false;
 		}
 		if (matched && rule.statusCode) {
 			hasCondition = true;
 			if (!statusCodes.has(rule.statusCode)) matched = false;
 		}
-		if (matched && rule.keyword) {
+		if (matched && keyword) {
 			hasCondition = true;
-			if (!allText.includes(rule.keyword.toLowerCase())) matched = false;
+			if (!allText.includes(keyword)) matched = false;
 		}
 
 		if (hasCondition && matched) return true;

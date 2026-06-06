@@ -133,7 +133,7 @@ export const narratorsApi = {
 		fastMode?: boolean;
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-		dangerReflectionOverride?: "inherit" | "on" | "off";
+		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 		cwd?: string;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	archiveNarrator: (id: string) =>
@@ -453,7 +453,7 @@ export const narratorsApi = {
 		id: string,
 		data: {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-			dangerReflectionOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 		},
 	) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reflection-overrides`, {

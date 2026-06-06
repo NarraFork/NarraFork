@@ -233,7 +233,7 @@ export type NarratorServerMessage =
 			type: "reflection_overrides_changed";
 			narratorId: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-			dangerReflectionOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string; mode?: "blocking" | "background" }

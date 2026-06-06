@@ -42,7 +42,10 @@ import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	BOOLEAN_OVERRIDE_VALUES,
 	type BooleanOverride,
+	DANGER_REFLECTION_OVERRIDE_VALUES,
+	type DangerReflectionOverride,
 	normalizeBooleanOverride,
+	normalizeDangerReflectionOverride,
 } from "../lib/boolean-override";
 import { screenshot as browserScreenshot } from "../lib/browser/actions";
 import {
@@ -255,6 +258,18 @@ function parseBooleanOverride(value: unknown, field: string): BooleanOverride {
 		return value as BooleanOverride;
 	}
 	throw new ValidationError(`${field} must be one of: ${BOOLEAN_OVERRIDE_VALUES.join(", ")}`);
+}
+
+function parseDangerReflectionOverride(value: unknown, field: string): DangerReflectionOverride {
+	if (
+		typeof value === "string" &&
+		DANGER_REFLECTION_OVERRIDE_VALUES.includes(value as DangerReflectionOverride)
+	) {
+		return value as DangerReflectionOverride;
+	}
+	throw new ValidationError(
+		`${field} must be one of: ${DANGER_REFLECTION_OVERRIDE_VALUES.join(", ")}`,
+	);
 }
 
 function publicNarratorResponse<T extends { traits: unknown; substatus?: unknown }>(narrator: T) {
@@ -929,7 +944,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			planReflectionAutoApproveOverride: normalizeBooleanOverride(
 				narrator.planReflectionAutoApproveOverride,
 			),
-			dangerReflectionOverride: normalizeBooleanOverride(narrator.dangerReflectionOverride),
+			dangerReflectionOverride: normalizeDangerReflectionOverride(
+				narrator.dangerReflectionOverride,
+			),
 			cwd: currentCwd,
 		});
 		const locale = await getUserLanguage(userId);
@@ -1754,7 +1771,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const input = body as Record<string, unknown>;
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
-		dangerReflectionOverride?: BooleanOverride;
+		dangerReflectionOverride?: DangerReflectionOverride;
 	} = {};
 	if (Object.hasOwn(input, "planReflectionAutoApproveOverride")) {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
@@ -1763,7 +1780,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		);
 	}
 	if (Object.hasOwn(input, "dangerReflectionOverride")) {
-		updates.dangerReflectionOverride = parseBooleanOverride(
+		updates.dangerReflectionOverride = parseDangerReflectionOverride(
 			input.dangerReflectionOverride,
 			"dangerReflectionOverride",
 		);

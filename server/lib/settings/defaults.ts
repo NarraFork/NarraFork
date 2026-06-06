@@ -36,6 +36,7 @@ export const DEFAULTS: NarraForkSettings = {
 		planReflectionAutoApprove: false,
 		questionReflectionEnabled: false,
 		questionReflectionTimeoutMs: 300_000,
+		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
@@ -281,8 +282,12 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 		valid: "10000-3600000，默认 300000",
 	},
+	"agent.dangerReflectionLevel": {
+		desc: "全部允许模式下危险反思的全局档位：off 关闭；light 只拦截高风险/关键风险；standard 拦截中高风险；strict 拦截所有已分类风险。",
+		type: "off | light | standard | strict",
+	},
 	"agent.dangerReflectionEnabled": {
-		desc: "启用后，全部允许模式下的高风险操作会触发危险反思二次检查。关闭后这些二次检查会被跳过，但基础黑名单和灾难性命令保护仍保留。",
+		desc: "兼容旧配置的危险反思开关。新配置优先使用 dangerReflectionLevel；false 等价于 off，true 等价于 standard。",
 		type: "boolean",
 	},
 	"agent.dangerSkipReadOnlyConfirmations": {

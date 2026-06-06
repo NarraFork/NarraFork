@@ -27,6 +27,7 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { DangerReflectionLevel } from "../../hooks/useInstanceSettings";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
@@ -63,6 +64,8 @@ export interface AgentSectionProps {
 	setQuestionReflectionEnabled: (v: boolean) => void;
 	questionReflectionTimeoutMs: number;
 	setQuestionReflectionTimeoutMs: (v: number) => void;
+	dangerReflectionLevel: DangerReflectionLevel;
+	setDangerReflectionLevel: (v: DangerReflectionLevel) => void;
 	dangerReflectionEnabled: boolean;
 	setDangerReflectionEnabled: (v: boolean) => void;
 	dangerSkipReadOnlyConfirmations: boolean;
@@ -309,11 +312,21 @@ export function AgentSection(props: AgentSectionProps) {
 			<Title order={5} mt="sm">
 				{t("safetyGuardSettings")}
 			</Title>
-			<Switch
-				label={t("dangerReflectionEnabled")}
-				description={t("dangerReflectionEnabledDesc")}
-				checked={props.dangerReflectionEnabled}
-				onChange={(e) => props.setDangerReflectionEnabled(e.currentTarget.checked)}
+			<Select
+				label={t("dangerReflectionLevel")}
+				description={t("dangerReflectionLevelDesc")}
+				value={props.dangerReflectionLevel}
+				onChange={(value) => {
+					const level = (value ?? "standard") as DangerReflectionLevel;
+					props.setDangerReflectionLevel(level);
+					props.setDangerReflectionEnabled(level !== "off");
+				}}
+				data={[
+					{ value: "off", label: t("dangerReflectionLevel_off") },
+					{ value: "light", label: t("dangerReflectionLevel_light") },
+					{ value: "standard", label: t("dangerReflectionLevel_standard") },
+					{ value: "strict", label: t("dangerReflectionLevel_strict") },
+				]}
 			/>
 			<Switch
 				label={t("dangerSkipReadOnlyConfirmations")}

@@ -3,6 +3,14 @@ import { permissionModeSchema } from "../permission-modes";
 
 const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
+const dangerReflectionOverrideSchema = z.enum([
+	"inherit",
+	"on",
+	"off",
+	"light",
+	"standard",
+	"strict",
+]);
 
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
@@ -16,7 +24,7 @@ export const createNarratorSchema = z.object({
 	fastMode: z.boolean().optional(),
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
-	dangerReflectionOverride: booleanOverrideSchema.optional(),
+	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
 });
 
 export const codexDefaultReasoningEffortSchema = z.object({

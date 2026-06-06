@@ -70,6 +70,7 @@ export interface NarratorDetailsPanelProps {
 	defaultModelValue?: string;
 	planReflectionAutoApproveGlobal?: boolean;
 	dangerReflectionGlobal?: boolean;
+	dangerReflectionGlobalLevel?: DangerReflectionLevel;
 	/** Desktop route can embed this as a resizable sidebar; other contexts keep a drawer. */
 	displayMode?: "drawer" | "inline";
 }
@@ -133,6 +134,14 @@ function StatCard({
 
 const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
 type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
+const DANGER_REFLECTION_LEVEL_VALUES = ["off", "light", "standard", "strict"] as const;
+type DangerReflectionLevel = (typeof DANGER_REFLECTION_LEVEL_VALUES)[number];
+const DANGER_REFLECTION_OVERRIDE_VALUES = [
+	"inherit",
+	"on",
+	...DANGER_REFLECTION_LEVEL_VALUES,
+] as const;
+type DangerReflectionOverride = (typeof DANGER_REFLECTION_OVERRIDE_VALUES)[number];
 
 function normalizeBooleanOverride(value: unknown): BooleanOverride {
 	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
@@ -140,10 +149,30 @@ function normalizeBooleanOverride(value: unknown): BooleanOverride {
 		: "inherit";
 }
 
+function normalizeDangerReflectionOverride(value: unknown): DangerReflectionOverride {
+	return DANGER_REFLECTION_OVERRIDE_VALUES.includes(value as DangerReflectionOverride)
+		? (value as DangerReflectionOverride)
+		: "inherit";
+}
+
 function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean {
 	const override = normalizeBooleanOverride(value);
 	if (override === "inherit") return globalDefault;
 	return override === "on";
+}
+
+function resolveDangerReflectionLevel(
+	override: unknown,
+	globalLevel: DangerReflectionLevel,
+): DangerReflectionLevel {
+	const normalizedOverride = normalizeDangerReflectionOverride(override);
+	if (normalizedOverride === "inherit") return globalLevel;
+	if (normalizedOverride === "on") return globalLevel === "off" ? "standard" : globalLevel;
+	return normalizedOverride;
+}
+
+function formatDangerReflectionLevel(level: DangerReflectionLevel, t: (key: string) => string) {
+	return t(`dangerReflectionLevel_${level}`);
 }
 
 function RuleList({
@@ -175,6 +204,7 @@ export function NarratorDetailsPanel({
 	defaultModelValue,
 	planReflectionAutoApproveGlobal = false,
 	dangerReflectionGlobal = true,
+	dangerReflectionGlobalLevel,
 	displayMode = "drawer",
 }: NarratorDetailsPanelProps) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
@@ -230,14 +260,18 @@ export function NarratorDetailsPanel({
 	const planReflectionAutoApproveOverride = normalizeBooleanOverride(
 		narrator?.planReflectionAutoApproveOverride,
 	);
-	const dangerReflectionOverride = normalizeBooleanOverride(narrator?.dangerReflectionOverride);
+	const dangerReflectionOverride = normalizeDangerReflectionOverride(
+		narrator?.dangerReflectionOverride,
+	);
+	const resolvedDangerReflectionGlobalLevel: DangerReflectionLevel =
+		dangerReflectionGlobalLevel ?? (dangerReflectionGlobal ? "standard" : "off");
 	const planReflectionAutoApproveEffective = resolveBooleanOverride(
 		planReflectionAutoApproveOverride,
 		planReflectionAutoApproveGlobal,
 	);
-	const dangerReflectionEffective = resolveBooleanOverride(
+	const dangerReflectionEffectiveLevel = resolveDangerReflectionLevel(
 		dangerReflectionOverride,
-		dangerReflectionGlobal,
+		resolvedDangerReflectionGlobalLevel,
 	);
 	const [cwdValue, setCwdValue] = useState(String(narrator?.cwd ?? ""));
 	const [cwdDirty, setCwdDirty] = useState(false);
@@ -649,23 +683,24 @@ export function NarratorDetailsPanel({
 						<Stack gap={4} align="stretch">
 							<SegmentedControl
 								size="xs"
-								value={dangerReflectionOverride}
-								onChange={(value) =>
+								value={dangerReflectionEffectiveLevel}
+								onChange={(value) => {
+									const level = value as DangerReflectionLevel;
 									updateReflectionOverridesMutation.mutate({
 										id: narratorId,
-										dangerReflectionOverride: value as BooleanOverride,
-									})
-								}
+										dangerReflectionOverride:
+											level === resolvedDangerReflectionGlobalLevel ? "inherit" : level,
+									});
+								}}
 								disabled={updateReflectionOverridesMutation.isPending}
-								data={[
-									{ value: "inherit", label: t("override_inherit") },
-									{ value: "on", label: t("override_on") },
-									{ value: "off", label: t("override_off") },
-								]}
+								data={DANGER_REFLECTION_LEVEL_VALUES.map((level) => ({
+									value: level,
+									label: formatDangerReflectionLevel(level, t),
+								}))}
 							/>
 							<Text size="xs" c="dimmed" ta="right">
 								{t("details.effectiveBoolean", {
-									value: dangerReflectionEffective ? t("details.on") : t("details.off"),
+									value: formatDangerReflectionLevel(dangerReflectionEffectiveLevel, t),
 								})}
 							</Text>
 						</Stack>

@@ -431,7 +431,7 @@ export function useCreateNarrator() {
 			fastMode?: boolean;
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-			dangerReflectionOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			cwd?: string;
 		}) => {
 			let shouldUseLegacyFastModeDefault = false;
@@ -780,7 +780,7 @@ export function useUpdateReflectionOverrides() {
 		}: {
 			id: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
-			dangerReflectionOverride?: "inherit" | "on" | "off";
+			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 		}) => api.updateNarratorReflectionOverrides(id, data),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });

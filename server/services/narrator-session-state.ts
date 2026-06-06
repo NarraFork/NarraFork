@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
-import type { PermissionResult, ReasoningEffort } from "../lib/agent";
+import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
 import { hotSafe } from "../lib/hot-safe";
 import type { Locale } from "../lib/prompt-i18n";
 import type { ImageRef } from "../lib/uploads";
@@ -227,17 +227,14 @@ export interface PendingDangerReflection {
 	broadcastTargetId: string;
 	input: Record<string, unknown>;
 	fingerprint: string;
-	danger: {
-		summary: string;
-		consequences: string[];
-		saferAlternatives: string[];
-		details?: string[];
-	};
+	danger: DangerInfo;
 	startedAt: number;
 	/** Abort controller for the bounded automatic reflection loop only. */
 	reflectionAbortController?: AbortController;
 	/** True when the user stopped the automatic reflection loop but left permission pending. */
 	reflectionStoppedByUser?: boolean;
+	/** True when this danger reflection stands in for plan-mode soft-deny approval. */
+	planModeSoftDeny?: boolean;
 	resolve: (result: PermissionResult) => void;
 	cleanup: () => void;
 }

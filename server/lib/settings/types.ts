@@ -13,6 +13,8 @@ export interface ModelOption {
 	provider?: string;
 }
 
+export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
+
 export type CustomApiProtocol =
 	| "anthropic-official"
 	| "anthropic-compatible"
@@ -292,6 +294,8 @@ export interface NarraForkSettings {
 		questionReflectionEnabled: boolean;
 		/** Timeout in milliseconds before AskUserQuestion auto-answer reflection runs. */
 		questionReflectionTimeoutMs: number;
+		/** Danger reflection policy level for bypass-permissions operations. */
+		dangerReflectionLevel: DangerReflectionLevel;
 		/** Enable danger reflection secondary confirmations for high-risk bypass-permissions operations. */
 		dangerReflectionEnabled: boolean;
 		/** Skip danger reflection secondary confirmations for operations that are classified as read-only. */
