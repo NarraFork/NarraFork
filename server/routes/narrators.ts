@@ -1463,9 +1463,15 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
 	let interrupted = interruptNarrator(id);
 	if (!interrupted) {
-		// Fallback: try interrupting a foreground subagent
-		const { interruptForegroundSubagent } = await import("../services/narrator-subagent");
-		interrupted = interruptForegroundSubagent(id);
+		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
+		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).
+		const { cancelBackgroundTask, interruptForegroundSubagent } = await import(
+			"../services/narrator-subagent"
+		);
+		interrupted = interruptForegroundSubagent(id, { hard: true });
+		if (!interrupted) {
+			interrupted = await cancelBackgroundTask(id);
+		}
 	}
 	// Fallback: if no active loop found but DB status is still working/waiting,
 	// the narrator is a zombie (loop ended without updating status, e.g. after

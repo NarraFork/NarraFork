@@ -1,11 +1,18 @@
 // === Manual override state ===
 // When a foreground subagent is interrupted, the parent narrator blocks until
 // the user explicitly clicks "Update Conclusion" from the subagent page.
-// This map is ONLY resolved by the update-conclusion API endpoint, giving
-// the user full control over when to return results.
+// Normally this map is resolved by the update-conclusion API endpoint, giving
+// the user full control over when to return results. A user hard-interrupt may
+// also resolve it so the parent narrator does not remain blocked forever.
+
+export interface ManualOverrideResult {
+	finalText: string;
+	hasError: boolean;
+	interrupted?: boolean;
+}
 
 export interface ManualOverrideEntry {
-	resolve: (result: { finalText: string; hasError: boolean }) => void;
+	resolve: (result: ManualOverrideResult) => void;
 	parentSignal: AbortSignal;
 	parentNarratorId: string;
 	toolUseId: string;
@@ -54,8 +61,8 @@ export function waitForManualOverride(
 	parentSignal: AbortSignal,
 	parentNarratorId: string,
 	toolUseId: string,
-): Promise<{ finalText: string; hasError: boolean }> {
-	return new Promise<{ finalText: string; hasError: boolean }>((resolve) => {
+): Promise<ManualOverrideResult> {
+	return new Promise<ManualOverrideResult>((resolve) => {
 		// Shared cleanup: clear timeout and remove the abort listener to avoid leaks.
 		const cleanup = () => {
 			clearTimeout(timeoutId);
@@ -118,6 +125,19 @@ export function resolveManualOverride(
 	if (!entry) return false;
 	getManualOverrideMap().delete(subagentId);
 	entry.resolve({ finalText, hasError });
+	return true;
+}
+
+/** Hard-interrupt a manual-override subagent and unblock its parent tool call. */
+export function interruptManualOverride(subagentId: string): boolean {
+	const entry = getManualOverrideMap().get(subagentId);
+	if (!entry) return false;
+	getManualOverrideMap().delete(subagentId);
+	entry.resolve({
+		finalText: "Subagent interrupted by user",
+		hasError: false,
+		interrupted: true,
+	});
 	return true;
 }
 

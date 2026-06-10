@@ -43,6 +43,8 @@ export interface ExecuteLoopResult {
 	hadToolUses?: boolean;
 	/** Set when the provider explicitly reports output was cut off by completion token limits. */
 	interrupted?: boolean;
+	/** Set when the agent loop exhausted its configured max-turn budget. */
+	maxTurnsExceeded?: boolean;
 	/** Replay the tool-result request packet instead of sending a textual continue prompt. */
 	shouldReplayInterruptedToolResultTurn?: boolean;
 }
@@ -80,6 +82,7 @@ export async function executeAgentLoop(
 	let silentDisconnect = false;
 	let aborted = false;
 	let interrupted = false;
+	let maxTurnsExceeded = false;
 	const startedWithToolResults = (trailingToolResults?.length ?? 0) > 0;
 	let sawAssistantMessage = false;
 	let lastAssistantHadToolUses = false;
@@ -147,6 +150,12 @@ export async function executeAgentLoop(
 		if (event.type === "output_truncated") {
 			interrupted = true;
 		}
+		if (event.type === "max_turns_exceeded") {
+			maxTurnsExceeded = true;
+			finalText = `Error: Max turns (${event.maxTurns}) exceeded`;
+			hasError = true;
+			break;
+		}
 		if (event.type === "silent_disconnect") {
 			silentDisconnect = true;
 			break;
@@ -189,6 +198,7 @@ export async function executeAgentLoop(
 		aborted,
 		hadToolUses,
 		interrupted,
+		maxTurnsExceeded,
 		shouldReplayInterruptedToolResultTurn:
 			lastAssistantHadToolUses || (startedWithToolResults && !sawAssistantMessage),
 	};

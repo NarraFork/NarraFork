@@ -19,6 +19,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import {
+	coerceQuestions,
+	getCustomSavedAnswer,
+	getSelectedOptionValue,
+	isSavedOptionSelected,
+	type Question,
+	resolveSavedAnswer,
+} from "./ask-user-question-utils";
+
+export { coerceQuestions } from "./ask-user-question-utils";
 
 const DRAFT_KEY_PREFIX = "narrafork_ask_draft_";
 const ASK_DRAFT_STORAGE_MAX_CHARS = 256_000;
@@ -88,30 +98,6 @@ function persistAskDraft(
 			// ignore storage cleanup failures
 		}
 	}
-}
-
-interface Question {
-	question: string;
-	header: string;
-	multiSelect?: boolean;
-	options: { label: string; description: string }[];
-}
-
-/**
- * Coerce a possibly-stringified questions value into a Question[].
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON from various providers
-export function coerceQuestions(raw: any): Question[] {
-	if (Array.isArray(raw)) return raw;
-	if (typeof raw === "string") {
-		try {
-			const parsed = JSON.parse(raw);
-			if (Array.isArray(parsed)) return parsed;
-		} catch {
-			// not valid JSON — fall through
-		}
-	}
-	return [];
 }
 
 interface AskUserQuestionBannerProps {
@@ -234,23 +220,6 @@ export function AskUserQuestionBanner({
 		}
 	};
 
-	/** Check if a saved answer matches a specific option label (exact or within comma-separated list) */
-	const isOptionSelected = (question: string, optLabel: string) => {
-		const answer = savedAnswers?.[question];
-		if (!answer) return false;
-		return answer === optLabel || answer.split(", ").includes(optLabel);
-	};
-
-	/** Check if the saved answer is a custom (free-text) response not matching any option */
-	const getCustomAnswer = (q: Question) => {
-		const answer = savedAnswers?.[q.question];
-		if (!answer) return undefined;
-		const optionLabels = q.options.map((o) => o.label);
-		// If the answer doesn't match any option (or combination), it's custom
-		const parts = answer.split(", ");
-		if (parts.every((p) => optionLabels.includes(p))) return undefined;
-		return answer;
-	};
 	const alertColor = readOnly ? "gray" : "blue";
 
 	return (
@@ -258,8 +227,14 @@ export function AskUserQuestionBanner({
 			<Alert color={alertColor} radius="md">
 				<Stack gap="md">
 					{questions.map((q, questionIndex) => {
+						const allowSingleAnswerFallback = questions.length === 1;
 						const hasCustom = readOnly ? false : !!customInputs[q.question]?.trim();
-						const customAnswer = readOnly ? getCustomAnswer(q) : undefined;
+						const savedAnswer = readOnly
+							? resolveSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
+							: undefined;
+						const customAnswer = readOnly
+							? getCustomSavedAnswer(q, savedAnswers, { allowSingleAnswerFallback })
+							: undefined;
 						const questionKey = `${q.question}-${questionIndex}`;
 						return (
 							<Stack key={questionKey} gap="xs">
@@ -275,7 +250,13 @@ export function AskUserQuestionBanner({
 													label={opt.label}
 													description={opt.description}
 													disabled={readOnly || hasCustom}
-													checked={readOnly ? isOptionSelected(q.question, opt.label) : undefined}
+													checked={
+														readOnly
+															? isSavedOptionSelected(q, opt.label, savedAnswers, {
+																	allowSingleAnswerFallback,
+																})
+															: undefined
+													}
 													onChange={
 														readOnly
 															? undefined
@@ -294,9 +275,7 @@ export function AskUserQuestionBanner({
 											name={`${requestId}-question-${questionIndex}`}
 											value={
 												readOnly
-													? isOptionSelected(q.question, savedAnswers?.[q.question] ?? "")
-														? savedAnswers?.[q.question]
-														: ""
+													? getSelectedOptionValue(q, savedAnswers, { allowSingleAnswerFallback })
 													: hasCustom
 														? ""
 														: (selections[q.question] ?? "")
@@ -333,7 +312,7 @@ export function AskUserQuestionBanner({
 										maxRows={3}
 									/>
 								)}
-								{readOnly && savedAnswers?.[q.question] && (
+								{readOnly && savedAnswer && (
 									<Badge size="xs" color="teal" variant="light">
 										{t("answered")}
 									</Badge>

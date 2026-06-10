@@ -1274,10 +1274,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					sourceId: params.source,
 					targetId: params.target,
 					type: "dependency",
+					projectId,
 				});
 			}
 		},
-		[createEdge],
+		[createEdge, projectId],
 	);
 
 	const onPaneClick = useCallback(() => {

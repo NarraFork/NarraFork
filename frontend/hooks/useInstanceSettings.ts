@@ -173,7 +173,11 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	const qc = useQueryClient();
 	const updateSettings = useMutation({
 		mutationFn: api.updateSettings,
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+		onSuccess: (data) => {
+			// Use setQueryData to synchronously update the cache instead of
+			// invalidateQueries which triggers cascading refetches.
+			qc.setQueryData(["settings"], data);
+		},
 	});
 
 	const [state, setState] = useState<InstanceSettingsState>(makeDefaults);

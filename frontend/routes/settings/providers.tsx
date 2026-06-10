@@ -40,6 +40,7 @@ export const Route = createFileRoute("/settings/providers")({
 });
 
 const PROVIDER_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+const PROVIDER_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
 
 function getDirtyProviderIds<T extends { id: string }>(
 	currentProviders: T[],
@@ -124,6 +125,7 @@ function SettingsProvidersPage() {
 		queryKey: ["admin", "settings"],
 		queryFn: api.getSettings,
 		enabled: user?.role === "admin",
+		staleTime: PROVIDER_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: PROVIDER_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
@@ -231,11 +233,14 @@ function SettingsProvidersPage() {
 	// ── Save / Discard ──
 	const updateMutation = useMutation({
 		mutationFn: api.updateSettings,
-		onSuccess: () => {
+		onSuccess: (data) => {
 			savedSnapshot.current = pendingSnapshot.current ?? createSnapshot(state);
 			pendingSnapshot.current = null;
-			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
-			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Use setQueryData to synchronously update the cache instead of
+			// invalidateQueries which triggers cascading refetches across all
+			// mounted components that consume ["settings"].
+			qc.setQueryData(["admin", "settings"], data);
+			qc.setQueryData(["settings"], data);
 		},
 		onError: (error) => {
 			pendingSnapshot.current = null;

@@ -11,6 +11,7 @@ import { narratorService } from "./narrator-service";
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	abandonManualOverride,
+	interruptManualOverride,
 	isManualOverride,
 	resolveManualOverride,
 } from "./subagent-manual-override";
@@ -30,6 +31,19 @@ let _foregroundSubagentAbortControllers: Map<string, AbortController> | undefine
 export function getForegroundAbortControllers() {
 	if (!_foregroundSubagentAbortControllers) _foregroundSubagentAbortControllers = new Map();
 	return _foregroundSubagentAbortControllers;
+}
+
+let _hardInterruptedForegroundSubagents: Set<string> | undefined;
+function getHardInterruptedForegroundSubagents() {
+	if (!_hardInterruptedForegroundSubagents) _hardInterruptedForegroundSubagents = new Set();
+	return _hardInterruptedForegroundSubagents;
+}
+
+export function consumeForegroundSubagentHardInterrupt(subagentId: string): boolean {
+	const hardInterrupted = getHardInterruptedForegroundSubagents();
+	if (!hardInterrupted.has(subagentId)) return false;
+	hardInterrupted.delete(subagentId);
+	return true;
 }
 
 // === ProxyAbortController for detach/attach ===
@@ -104,13 +118,31 @@ export class ProxyAbortController {
 
 /**
  * Interrupt a running foreground subagent.
- * Returns true if the subagent was found and aborted.
+ *
+ * Soft interrupts (default) are used by Send({ doInterrupt: true }) to stop the
+ * current turn and continue with a buffered message/manual override. Hard
+ * interrupts are used by the UI Stop button and must fully end the subagent so
+ * the parent tool call cannot remain blocked while the subagent appears idle.
  */
-export function interruptForegroundSubagent(subagentId: string): boolean {
+export function interruptForegroundSubagent(
+	subagentId: string,
+	options?: { hard?: boolean },
+): boolean {
+	const hard = options?.hard === true;
 	const ctrl = getForegroundAbortControllers().get(subagentId);
-	if (!ctrl) return false;
-	ctrl.abort("Interrupted by user");
-	return true;
+	if (ctrl) {
+		if (hard) getHardInterruptedForegroundSubagents().add(subagentId);
+		ctrl.abort(hard ? "Hard interrupted by user" : "Interrupted by user");
+		return true;
+	}
+
+	if (hard && interruptManualOverride(subagentId)) {
+		getHardInterruptedForegroundSubagents().delete(subagentId);
+		return true;
+	}
+
+	if (hard) getHardInterruptedForegroundSubagents().delete(subagentId);
+	return false;
 }
 
 /**
@@ -157,6 +189,7 @@ export async function interruptForegroundSubagentsForParent(
 			entry.fgAbort.abort("Parent narrator interrupted");
 			entry.proxy.abort("Parent narrator interrupted");
 			abandonManualOverride(subagentId);
+			getHardInterruptedForegroundSubagents().delete(subagentId);
 			getForegroundAbortControllers().delete(subagentId);
 			await markInterrupted(subagentId, entry.toolUseId);
 		} catch (err) {

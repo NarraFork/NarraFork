@@ -54,6 +54,7 @@ import { useTranslation } from "react-i18next";
 import { getNarratorMessagesQueryKey } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
+import { recentTabsSnapshotRemovedProject } from "../../hooks/useProjects";
 import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
@@ -313,6 +314,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				lastRevisionRef.current = revision || Date.now();
 
 				const serverTabs = (event.tabs as RecentTab[]).map(normalizeRecentTab);
+				if (recentTabsSnapshotRemovedProject(tabsRef.current, serverTabs)) {
+					qc.invalidateQueries({ queryKey: ["projects"] });
+				}
 
 				// If the current page's tab was removed, navigate to dashboard
 				const currentPath = pathnameRef.current;

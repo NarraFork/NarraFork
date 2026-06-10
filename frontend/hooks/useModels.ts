@@ -17,6 +17,7 @@ import {
 } from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+const MODELS_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
 
 export interface ProviderModels {
 	prefix: string;
@@ -33,6 +34,7 @@ export function useAllModels() {
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const runtimeCapabilities = useRuntimeCapabilities();

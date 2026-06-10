@@ -590,8 +590,12 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			hooks,
 		});
 
-		finalText = result.contextLengthExceeded ? "Error: context length exceeded" : result.finalText;
-		hasError = result.hasError;
+		finalText = result.contextLengthExceeded
+			? "Error: context length exceeded"
+			: result.maxTurnsExceeded
+				? result.finalText || "Error: max turns exceeded"
+				: result.finalText;
+		hasError = result.hasError || result.maxTurnsExceeded === true;
 		aborted = aborted || result.aborted === true || signal.aborted;
 		if (result.retryableError && !result.hasError) {
 			// Don't mark as error yet — try transient retry below

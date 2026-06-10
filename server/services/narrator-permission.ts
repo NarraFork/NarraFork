@@ -1891,6 +1891,39 @@ export function resolveExitPlanModeInput(
 	return { ok: true, input: effectiveInput };
 }
 
+async function rejectInvalidAskUserQuestionInput(
+	narratorId: string,
+	toolUseId: string,
+	input: Record<string, unknown>,
+): Promise<PermissionResult | null> {
+	const tool = toolRegistry.get("AskUserQuestion");
+	const parsed = tool?.parameters.safeParse(input);
+	if (parsed?.success) return null;
+
+	const message = parsed
+		? `Invalid AskUserQuestion parameters: ${parsed.error.message}`
+		: "Invalid AskUserQuestion parameters: tool definition not found";
+	logger.warn("Rejecting invalid AskUserQuestion before permission prompt", {
+		narratorId,
+		toolUseId,
+		message,
+	});
+	await db
+		.update(narratorToolCalls)
+		.set({
+			status: "fail",
+			inputJson: input,
+			errorMessage: message,
+			permissionDecidedBy: "auto",
+			permissionDecidedAt: new Date().toISOString(),
+			permissionDecisionReason: "invalid_ask_user_question_input",
+		})
+		.where(
+			and(eq(narratorToolCalls.narratorId, narratorId), eq(narratorToolCalls.toolUseId, toolUseId)),
+		);
+	return { behavior: "deny", message, rawMessage: true };
+}
+
 export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
@@ -1997,6 +2030,15 @@ export async function handlePermission(
 		} else {
 			effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
 		}
+	}
+
+	if (toolName === "AskUserQuestion") {
+		const invalidAskUserQuestion = await rejectInvalidAskUserQuestionInput(
+			narratorId,
+			toolUseId,
+			effectiveInput,
+		);
+		if (invalidAskUserQuestion) return invalidAskUserQuestion;
 	}
 
 	// Load enabled whitelist/blacklist directories — three-layer merge

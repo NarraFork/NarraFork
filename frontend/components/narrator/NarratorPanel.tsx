@@ -2181,7 +2181,8 @@ export function NarratorPanel({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
 			qc.setQueryData(["settings"], data);
-			qc.invalidateQueries({ queryKey: ["settings"] });
+			// Only invalidate contextThresholds — settings cache is already
+			// updated via setQueryData above, no need to trigger a refetch.
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});

@@ -8,6 +8,9 @@ import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
+import { hasMarkdownMath, isSafeForFlowtokenAnimation } from "./markdown-detection";
+
+export { MD_PATTERN } from "./markdown-detection";
 
 /** Recursively extract plain text from React children */
 export function extractText(node: ReactNode): string {
@@ -19,29 +22,12 @@ export function extractText(node: ReactNode): string {
 	return "";
 }
 
-export const MD_PATTERN =
-	/(?:^#{1,6}\s|(?:^|\n)```|\*\*|__|\*(?!\s)|_(?!\s)|\[.+?\]\(.+?\)|^>\s|^[-*+]\s|^\d+\.\s|^\|.+\||!\[)/m;
-
-const DISPLAY_MATH_PATTERN = /(^|\n)\s*\$\$[\s\S]*?\$\$/;
-const INLINE_MATH_PATTERN = /(^|[^\\$])\$[^\s$](?:[^\n$]*[^\s$])?\$/;
-const PAREN_MATH_PATTERN = /\\\([\s\S]*?\\\)/;
-const BRACKET_MATH_PATTERN = /\\\[[\s\S]*?\\\]/;
-
 interface MathPlugins {
 	remarkMath: Pluggable;
 	rehypeKatex: Pluggable;
 }
 
 let mathPluginsPromise: Promise<MathPlugins | null> | null = null;
-
-function hasMarkdownMath(text: string): boolean {
-	return (
-		DISPLAY_MATH_PATTERN.test(text) ||
-		INLINE_MATH_PATTERN.test(text) ||
-		PAREN_MATH_PATTERN.test(text) ||
-		BRACKET_MATH_PATTERN.test(text)
-	);
-}
 
 function loadMathPlugins(): Promise<MathPlugins | null> {
 	if (!mathPluginsPromise) {
@@ -409,7 +395,11 @@ export const MarkdownContent = memo(function MarkdownContent({
 		typeof document !== "undefined" &&
 		document.documentElement.getAttribute("data-advanced-anim") === "true";
 
-	const shouldAnimate = canAnimateStreaming && advancedAnim;
+	const shouldAnimate =
+		canAnimateStreaming &&
+		advancedAnim &&
+		supportsLookbehind &&
+		isSafeForFlowtokenAnimation(trimmed);
 	const tooLargeForMarkdown = trimmed.length > STATIC_MARKDOWN_MAX_CHARS;
 	const usesStaticMarkdown =
 		!tooLargeForMarkdown &&

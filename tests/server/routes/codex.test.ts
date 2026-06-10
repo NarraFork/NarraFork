@@ -19,6 +19,7 @@ const settingsState: {
 
 let saveSettingsCalls = 0;
 let codexImportedCredentials: unknown[] = [];
+let codexRemoveUnhealthyCalls = 0;
 
 const actualSettingsModule = await import("../../../server/lib/settings");
 
@@ -40,6 +41,7 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			unavailableEntries: [],
 			availableTotal: 0,
 			unavailableTotal: 0,
+			unhealthyTotal: 0,
 			stickySessionCount: 0,
 			usageCache: {},
 			loadBalancingMode: "priority",
@@ -51,6 +53,10 @@ mock.module("../../../server/lib/codex-manager", () => ({
 		importCredentials: (credentials: unknown[]) => {
 			codexImportedCredentials = credentials;
 			return { added: credentials.length, duplicates: 0, skipped: 0 };
+		},
+		removeUnhealthyCredentials: () => {
+			codexRemoveUnhealthyCalls++;
+			return { removed: ["failed-1", "banned-1"], reasons: ["too_many_failures", "banned"] };
 		},
 	}),
 }));
@@ -102,6 +108,7 @@ beforeEach(() => {
 	settingsState.codex.tierOrder = undefined;
 	saveSettingsCalls = 0;
 	codexImportedCredentials = [];
+	codexRemoveUnhealthyCalls = 0;
 });
 
 describe("codex routes validation", () => {
@@ -266,5 +273,16 @@ describe("codex routes validation", () => {
 				}),
 			}),
 		]);
+	});
+
+	it("deletes all unhealthy Codex credentials across pages", async () => {
+		const res = await app.request("/credentials/unhealthy", { method: "DELETE" });
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			removed: ["failed-1", "banned-1"],
+			reasons: ["too_many_failures", "banned"],
+		});
+		expect(codexRemoveUnhealthyCalls).toBe(1);
 	});
 });

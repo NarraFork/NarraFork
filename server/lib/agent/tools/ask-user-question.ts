@@ -1,6 +1,14 @@
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 
+const INVALID_QUESTION_KEYS = new Set(["undefined", "null"]);
+
+const nonEmptyText = z.string().trim().min(1);
+const questionKey = nonEmptyText.refine(
+	(value) => !INVALID_QUESTION_KEYS.has(value.toLowerCase()),
+	"Question key must be meaningful",
+);
+
 export const askUserQuestionTool: ToolDefinition = {
 	name: "AskUserQuestion",
 	description:
@@ -34,13 +42,15 @@ export const askUserQuestionTool: ToolDefinition = {
 					properties: {
 						question: {
 							description:
-								'The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: "Which library should we use for date formatting?" If multiSelect is true, phrase it accordingly, e.g. "Which features do you want to enable?"',
+								'A stable, meaningful answer key for this question. Use a short unique identifier, not "undefined" or "null". Examples: "auth-method", "library-choice", "approach".',
 							type: "string",
+							minLength: 1,
 						},
 						header: {
 							description:
-								'Very short label displayed as a chip/tag (max 12 chars). Examples: "Auth method", "Library", "Approach".',
+								"The question text displayed to the user. It should be clear, specific, and end with a question mark when appropriate.",
 							type: "string",
+							minLength: 1,
 						},
 						options: {
 							description:
@@ -55,6 +65,7 @@ export const askUserQuestionTool: ToolDefinition = {
 										description:
 											"The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice.",
 										type: "string",
+										minLength: 1,
 									},
 									description: {
 										description:
@@ -78,7 +89,7 @@ export const askUserQuestionTool: ToolDefinition = {
 							type: "boolean",
 						},
 					},
-					required: ["question", "header", "options", "multiSelect"],
+					required: ["question", "header", "options"],
 					additionalProperties: false,
 				},
 			},
@@ -130,13 +141,14 @@ export const askUserQuestionTool: ToolDefinition = {
 		questions: z
 			.array(
 				z.object({
-					question: z.string().describe("A unique identifier / short key for this question"),
-					header: z.string().describe("The question text displayed to the user"),
+					question: questionKey.describe("A unique identifier / short key for this question"),
+					header: nonEmptyText.describe("The question text displayed to the user"),
 					options: z
 						.array(
 							z.object({
-								label: z.string().describe("Short label for the option"),
+								label: nonEmptyText.describe("Short label for the option"),
 								description: z.string().describe("Longer description shown below the label"),
+								preview: z.string().optional(),
 							}),
 						)
 						.describe("Available choices. Provide an empty array for free-form input"),

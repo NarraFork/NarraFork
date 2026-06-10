@@ -8,6 +8,7 @@ interface CacheEntry {
 }
 
 const MAX_AVATAR_BLOB_BYTES = 5 * 1024 * 1024;
+const AVATAR_FETCH_TIMEOUT_MS = 30_000;
 
 /** Shared cache: key = "userId:avatarImageId" → blob URL with ref counting. */
 const cache = new Map<string, CacheEntry>();
@@ -37,8 +38,10 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 	const token = getToken();
 	const headers: Record<string, string> = {};
 	if (token) headers.Authorization = `Bearer ${token}`;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), AVATAR_FETCH_TIMEOUT_MS);
 
-	const promise = fetch(getAvatarUrl(userId, avatarImageId), { headers })
+	const promise = fetch(getAvatarUrl(userId, avatarImageId), { headers, signal: controller.signal })
 		.then(async (res) => {
 			if (!res.ok) {
 				if (res.status === 401) clearToken();
@@ -47,7 +50,6 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 			return res.blob();
 		})
 		.then((blob) => {
-			pending.delete(key);
 			if (!blob || blob.size > MAX_AVATAR_BLOB_BYTES) return null;
 
 			// Race guard: another fetch may have populated the cache while this
@@ -62,9 +64,10 @@ export function fetchAvatarBlobUrl(userId: string, avatarImageId: string): Promi
 			scheduleUnreferencedCleanup(key);
 			return url;
 		})
-		.catch(() => {
+		.catch(() => null)
+		.finally(() => {
+			clearTimeout(timeout);
 			pending.delete(key);
-			return null;
 		});
 
 	pending.set(key, promise);

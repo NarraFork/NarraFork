@@ -122,6 +122,7 @@ const WS_STATUS_ID = "narrator-global";
  * Prevents unbounded growth when the user browses many narrators over time.
  */
 const MAX_LAST_MESSAGE_IDS = 100;
+const MAX_CATCH_UP_CURSORS = 100;
 /**
  * How long the tab must be hidden before we force a reconnect on return.
  * Matches the server heartbeat interval — if we missed at least one ping
@@ -207,6 +208,10 @@ class NarratorWSManager {
 		this._unlistenVisibility();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this.reconnectTimer = undefined;
+		this.pingTimeoutTimer = undefined;
+		this.pendingDispatchQueue = [];
+		this.dispatchScheduled = false;
 		removeWSStatus(WS_STATUS_ID);
 		const ws = this.ws;
 		this.ws = null;
@@ -444,14 +449,7 @@ class NarratorWSManager {
 		// Move to end (most recently used) by re-inserting
 		this.lastMessageIds.delete(narratorId);
 		this.lastMessageIds.set(narratorId, messageId);
-		// Evict oldest entries if over limit
-		while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
-			const oldest = this.lastMessageIds.keys().next().value;
-			if (oldest !== undefined) {
-				this.lastMessageIds.delete(oldest);
-				this.catchUpCursors.delete(oldest);
-			} else break;
-		}
+		this._trimCatchUpState();
 	}
 
 	updateCatchUpCursor(narratorId: string, cursor: CatchUpCursor | undefined): void {
@@ -461,11 +459,27 @@ class NarratorWSManager {
 			this.updateLastMessageId(narratorId, normalized.parentLastMessageId);
 		this.catchUpCursors.delete(narratorId);
 		this.catchUpCursors.set(narratorId, normalized);
+		this._trimCatchUpState();
 	}
 
 	clearCatchUpState(narratorId: string): void {
 		this.catchUpCursors.delete(narratorId);
 		this.lastMessageIds.delete(narratorId);
+	}
+
+	private _trimCatchUpState(): void {
+		while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
+			const oldest = this.lastMessageIds.keys().next().value;
+			if (oldest === undefined) break;
+			this.lastMessageIds.delete(oldest);
+			this.catchUpCursors.delete(oldest);
+		}
+		while (this.catchUpCursors.size > MAX_CATCH_UP_CURSORS) {
+			const oldest = this.catchUpCursors.keys().next().value;
+			if (oldest === undefined) break;
+			this.catchUpCursors.delete(oldest);
+			this.lastMessageIds.delete(oldest);
+		}
 	}
 
 	noteMessage(narratorId: string, message: MinimalTreeMessage | undefined): void {

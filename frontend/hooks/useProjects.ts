@@ -4,6 +4,48 @@ import { api } from "../lib/api";
 
 const PROJECT_QUERY_GC_TIME_MS = 60_000;
 
+export const PROJECT_CREATE_REFRESH_QUERY_KEYS = [["projects"]] as const;
+
+export const PROJECT_DELETE_REFRESH_QUERY_KEYS = [
+	["projects"],
+	["user-preferences", "recent-tabs"],
+] as const;
+
+type ProjectRefreshInvalidator = {
+	invalidateQueries: (filters: { queryKey: readonly unknown[] }) => unknown;
+};
+
+type RecentTabLike = {
+	type?: unknown;
+	id?: unknown;
+};
+
+export function invalidateProjectCreateQueries(queryClient: ProjectRefreshInvalidator) {
+	for (const queryKey of PROJECT_CREATE_REFRESH_QUERY_KEYS) {
+		queryClient.invalidateQueries({ queryKey });
+	}
+}
+
+export function invalidateProjectDeleteQueries(queryClient: ProjectRefreshInvalidator) {
+	for (const queryKey of PROJECT_DELETE_REFRESH_QUERY_KEYS) {
+		queryClient.invalidateQueries({ queryKey });
+	}
+}
+
+export function recentTabsSnapshotRemovedProject(
+	previousTabs: readonly RecentTabLike[],
+	nextTabs: readonly RecentTabLike[],
+): boolean {
+	const nextProjectIds = new Set(
+		nextTabs
+			.filter((tab) => tab.type === "project" && typeof tab.id === "string")
+			.map((tab) => tab.id),
+	);
+	return previousTabs.some(
+		(tab) => tab.type === "project" && typeof tab.id === "string" && !nextProjectIds.has(tab.id),
+	);
+}
+
 export function useProjects(status?: string) {
 	return useQuery({
 		queryKey: ["projects", { status }],
@@ -25,7 +67,7 @@ export function useCreateProject() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.createProject,
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
+		onSuccess: () => invalidateProjectCreateQueries(qc),
 	});
 }
 
@@ -69,7 +111,7 @@ export function useCreateProjectStream() {
 				)
 				.then(() => {
 					setIsPending(false);
-					qc.invalidateQueries({ queryKey: ["projects"] });
+					invalidateProjectCreateQueries(qc);
 					callbackRef.current.onSuccess?.();
 				})
 				.catch((err) => {
@@ -120,9 +162,6 @@ export function useDeleteProject() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.deleteProject,
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["projects"] });
-			qc.invalidateQueries({ queryKey: ["user-preferences", "recent-tabs"] });
-		},
+		onSuccess: () => invalidateProjectDeleteQueries(qc),
 	});
 }

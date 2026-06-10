@@ -232,6 +232,81 @@ describe("CodexManager usage quota state", () => {
 		expect(manager.snapshot().currentId).toBe("");
 	});
 
+	test("一键清理只删除错误过多和 banned 凭据", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const narraforkDir = join(tmpHome, ".narrafork");
+		mkdirSync(narraforkDir, { recursive: true });
+		const credentials = [
+			{ id: "ok", accessToken: "at-ok", priority: 0, disabled: false },
+			{
+				id: "manual",
+				accessToken: "at-manual",
+				priority: 1,
+				disabled: true,
+				disabledReason: "manual",
+			},
+			{
+				id: "quota",
+				accessToken: "at-quota",
+				priority: 2,
+				disabled: true,
+				disabledReason: "quota_exhausted",
+			},
+			{
+				id: "failed",
+				accessToken: "at-failed",
+				priority: 3,
+				disabled: true,
+				disabledReason: "too_many_failures",
+			},
+			{
+				id: "banned",
+				accessToken: "at-banned",
+				priority: 4,
+				disabled: true,
+				disabledReason: "banned",
+			},
+		];
+		writeFileSync(
+			join(narraforkDir, "codex-credentials.json"),
+			JSON.stringify(credentials, null, 2),
+		);
+		writeFileSync(
+			join(narraforkDir, "codex-stats.json"),
+			JSON.stringify(
+				Object.fromEntries(
+					credentials.map((credential) => [
+						credential.id,
+						{ successCount: 0, failureCount: credential.disabled ? 3 : 0 },
+					]),
+				),
+				null,
+				2,
+			),
+		);
+
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+		expect(manager.snapshot().unhealthyTotal).toBe(2);
+
+		expect(manager.removeUnhealthyCredentials()).toEqual({
+			removed: ["failed", "banned"],
+			reasons: ["too_many_failures", "banned"],
+		});
+
+		const snapshot = manager.snapshot();
+		expect(snapshot.entries.map((entry) => entry.id)).toEqual(["ok", "manual", "quota"]);
+		expect(snapshot.unhealthyTotal).toBe(0);
+		const persistedCredentials = JSON.parse(
+			readFileSync(join(narraforkDir, "codex-credentials.json"), "utf-8"),
+		) as Array<{ id: string }>;
+		expect(persistedCredentials.map((entry) => entry.id)).toEqual(["ok", "manual", "quota"]);
+		const persistedStats = JSON.parse(
+			readFileSync(join(narraforkDir, "codex-stats.json"), "utf-8"),
+		) as Record<string, unknown>;
+		expect(Object.keys(persistedStats).sort()).toEqual(["manual", "ok", "quota"]);
+	});
+
 	test("删除分页末尾凭据后快照页码会回退到有效页", () => {
 		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
 		tempHomes.push(tmpHome);

@@ -223,6 +223,7 @@ export type AgentEvent =
 	  }
 	| { type: "sidecars"; sideCars: AgentSideCar[] }
 	| { type: "turn_complete"; turnIndex: number }
+	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "error"; message: string }
 	| { type: "retryable_error"; message: string; code?: string; bypassRetryLimit?: boolean }
 	| {

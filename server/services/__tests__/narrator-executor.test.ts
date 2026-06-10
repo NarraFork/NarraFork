@@ -241,6 +241,37 @@ describe("executeAgentLoop result handling", () => {
 		expect(result.hasError).toBe(true);
 		expect(result.finalText).toContain("Provider returned an empty response");
 	});
+
+	test("surfaces max-turn exhaustion without running generic error cleanup", async () => {
+		const ac = new AbortController();
+		const cleanupMessages: string[] = [];
+
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+				hooks: {
+					onErrorCleanup: async (message) => {
+						cleanupMessages.push(message);
+					},
+				},
+			},
+			{
+				eventSource: makeEventSource([{ type: "max_turns_exceeded", maxTurns: 3 }]),
+				processEventFn: async (event, _eventContext, hooks) => {
+					if (event.type === "error") await hooks?.onErrorCleanup?.(event.message);
+					return null;
+				},
+			},
+		);
+
+		expect(result.maxTurnsExceeded).toBe(true);
+		expect(result.hasError).toBe(true);
+		expect(result.finalText).toBe("Error: Max turns (3) exceeded");
+		expect(cleanupMessages).toEqual([]);
+	});
 });
 
 describe("executeAgentLoop abort draining", () => {

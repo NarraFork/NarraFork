@@ -35,6 +35,7 @@ import {
 import { registerAndPersistSubagentAlias, registerTaskAlias } from "./subagent-alias";
 import {
 	attachSubagent,
+	consumeForegroundSubagentHardInterrupt,
 	type DetachSetupResult,
 	getAttachWaitersMap,
 	getBackgroundAbortControllers,
@@ -488,11 +489,20 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 				}
 				getForegroundAbortControllers().delete(subagentId);
 
+				const hardSubagentInterrupt = consumeForegroundSubagentHardInterrupt(subagentId);
+
 				// Check if we were detached during execution
 				if (detached) {
 					// Loop continues running in background mode.
 					// foregroundResolve was already called by detachSubagent().
 					// Continue to finally block for background completion.
+					break;
+				}
+
+				if (hardSubagentInterrupt && fgAbort.signal.aborted && !signal.aborted) {
+					wasInterrupted = true;
+					finalText = "Subagent interrupted by user";
+					hasError = false;
 					break;
 				}
 
@@ -542,6 +552,10 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 
 					finalText = overrideResult.finalText;
 					hasError = overrideResult.hasError;
+					if (overrideResult.interrupted) {
+						wasInterrupted = true;
+						hasError = false;
+					}
 					if (signal.aborted) {
 						wasInterrupted = true;
 						finalText = "Subagent interrupted because parent narrator was interrupted";
@@ -555,6 +569,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 			proxy.dispose();
 			getManualOverrideMap().delete(subagentId);
 			getForegroundAbortControllers().delete(subagentId);
+			consumeForegroundSubagentHardInterrupt(subagentId);
 
 			let detachSetupSucceeded = detached;
 			if (detached) {

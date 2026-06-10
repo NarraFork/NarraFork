@@ -61,6 +61,50 @@ describe("misc APIs", () => {
 		expect(response.searchMetadata?.fallbacks?.[0]?.reason).toBe("fts_query_failed");
 	});
 
+	test("preserves Go additive search metadata and entity arrays", async () => {
+		installEnvironment(
+			new Response(
+				JSON.stringify({
+					results: [
+						{
+							type: "chapter",
+							id: "c_search_large_title",
+							title: "auroraanchor Chapter North",
+							snippet: "auroraanchor ranking fixture",
+							matchField: "title",
+							matchScore: 999,
+						},
+					],
+					projects: [{ id: "p_search_fixture", name: "Search Fixture Project" }],
+					chapters: [{ id: "c_search_large_title", type: "chapter" }],
+					narrators: [],
+					degraded: false,
+					fallbacks: [],
+					searchMetadata: {
+						degraded: false,
+						mode: "fts5-with-like-fallback",
+						ftsReady: true,
+						shortQuery: false,
+						requestedEntities: ["chapters", "messages", "narrators"],
+						fallbacks: [],
+						goOnlyDiagnostic: "ignored-by-frontend",
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+
+		const response = await api.search("auroraanchor", "chapters,messages,narrators");
+		expect(response.results).toHaveLength(1);
+		expect(response.degraded).toBe(false);
+		expect(response.fallbacks).toEqual([]);
+		expect(response.searchMetadata?.ftsReady).toBe(true);
+		expect(response.searchMetadata?.goOnlyDiagnostic).toBe("ignored-by-frontend");
+		expect("projects" in response).toBe(true);
+		expect("chapters" in response).toBe(true);
+		expect("narrators" in response).toBe(true);
+	});
+
 	test("surfaces structured storage cleanup errors", async () => {
 		installEnvironment(
 			new Response(

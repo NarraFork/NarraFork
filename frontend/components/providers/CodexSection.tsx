@@ -393,6 +393,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const canUpdateCredential = isCodexRouteSupported("credentialUpdate");
 	const canDeleteCredential = isCodexRouteSupported("credentialDelete");
 	const canBatchDeleteCredentials = isCodexRouteSupported("credentialBatchDelete");
+	const canDeleteUnhealthyCredentials = isCodexRouteSupported("credentialDeleteUnhealthy");
 	const canImportCredentials = isCodexRouteSupported("import");
 	const canClearUsageQueue = usageQueueClearSupported && isCodexRouteSupported("usageQueueClear");
 	const canStartBrowserAuth = isCodexRouteSupported("browserAuth");
@@ -482,6 +483,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const unavailableEntries = status?.unavailableEntries ?? [];
 	const availableTotal = status?.availableTotal ?? 0;
 	const unavailableTotal = status?.unavailableTotal ?? 0;
+	const unhealthyTotal = status?.unhealthyTotal ?? 0;
 	const loadBalancingMode = status?.loadBalancingMode ?? "tier-balanced";
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
@@ -667,6 +669,17 @@ export const CodexSection = React.memo(function CodexSection({
 			});
 		},
 	});
+	const deleteUnhealthyMut = useMutation({
+		mutationFn: () => api.codexCredentialDeleteUnhealthy(),
+		onSuccess: (data) => {
+			setSelectedIds(new Set());
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			notifications.show({
+				message: t("codexDeleteUnhealthySuccess", { count: data.removed.length }),
+				color: "green",
+			});
+		},
+	});
 	const usageQueueClearMut = useMutation({
 		mutationFn: () => api.codexUsageQueueClear(),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
@@ -698,6 +711,13 @@ export const CodexSection = React.memo(function CodexSection({
 		if (!canBatchDeleteCredentials || selectedIds.size === 0) return;
 		if (await confirm({ message: t("codexBatchDeleteConfirm", { count: selectedIds.size }) })) {
 			batchDeleteMut.mutate([...selectedIds]);
+		}
+	};
+
+	const handleDeleteUnhealthy = async () => {
+		if (!canDeleteUnhealthyCredentials || unhealthyTotal === 0) return;
+		if (await confirm({ message: t("codexDeleteUnhealthyConfirm", { count: unhealthyTotal }) })) {
+			deleteUnhealthyMut.mutate();
 		}
 	};
 
@@ -1298,33 +1318,53 @@ export const CodexSection = React.memo(function CodexSection({
 			{/* Credentials list (responsive: cards on mobile, table on desktop) */}
 			{(status?.total ?? 0) > 0 && (
 				<Stack gap="xs">
+					<Group justify="space-between" align="center">
+						<Group gap="xs">
+							<Text size="sm" fw={500}>
+								{t("codexCredentials")}
+							</Text>
+							<Badge size="sm" color={availableTotal > 0 ? "green" : "red"}>
+								{availableTotal} / {status?.total ?? 0}
+							</Badge>
+						</Group>
+						<Group gap="xs">
+							{selectedIds.size > 0 && (
+								<Button
+									size="compact-xs"
+									color="red"
+									variant="light"
+									leftSection={<IconTrash size={14} />}
+									onClick={handleBatchDelete}
+									loading={batchDeleteMut.isPending}
+									disabled={!canBatchDeleteCredentials}
+									title={!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined}
+								>
+									{t("codexBatchDelete")} ({selectedIds.size})
+								</Button>
+							)}
+							<Button
+								size="compact-xs"
+								color="red"
+								variant="outline"
+								leftSection={<IconTrash size={14} />}
+								onClick={handleDeleteUnhealthy}
+								loading={deleteUnhealthyMut.isPending}
+								disabled={!canDeleteUnhealthyCredentials || unhealthyTotal === 0}
+								title={!canDeleteUnhealthyCredentials ? providerRouteUnsupportedReason : undefined}
+							>
+								{t("codexDeleteUnhealthy")} ({unhealthyTotal})
+							</Button>
+						</Group>
+					</Group>
 					{availableTotal > 0 && (
 						<Stack gap="xs">
 							<Group justify="space-between">
 								<Text size="sm" fw={500}>
 									{t("codexCredentialsAvailable")}
 								</Text>
-								<Group gap="xs">
-									{selectedIds.size > 0 && (
-										<Button
-											size="compact-xs"
-											color="red"
-											variant="light"
-											leftSection={<IconTrash size={14} />}
-											onClick={handleBatchDelete}
-											loading={batchDeleteMut.isPending}
-											disabled={!canBatchDeleteCredentials}
-											title={
-												!canBatchDeleteCredentials ? providerRouteUnsupportedReason : undefined
-											}
-										>
-											{t("codexBatchDelete")} ({selectedIds.size})
-										</Button>
-									)}
-									<Badge size="sm" color="green">
-										{availableTotal}
-									</Badge>
-								</Group>
+								<Badge size="sm" color="green">
+									{availableTotal}
+								</Badge>
 							</Group>
 							<CredentialList
 								entries={availableEntries}

@@ -222,6 +222,7 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 					/>
 					<Tooltip label={t("aiGenerate")}>
 						<ActionIcon
+							aria-label={t("aiGenerate")}
 							variant="subtle"
 							size="sm"
 							onClick={handleAiGenerate}

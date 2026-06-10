@@ -1877,6 +1877,20 @@ export async function runAgentLoop(
 				}
 			}
 
+			if (result.maxTurnsExceeded && active.alive && !loopHadError) {
+				const goalContinuationPrompt = await maybeStartGoalContinuation(
+					active,
+					freshNarrator,
+					false,
+				);
+				if (goalContinuationPrompt) {
+					await narratorService.updateStatus(narratorId, "working");
+					currentText = "";
+					currentImages = undefined;
+					continue;
+				}
+			}
+
 			if (result.hasError && active.alive && !loopHadError) {
 				const partialId = active._partialMessageId;
 				active._partialMessageId = undefined;

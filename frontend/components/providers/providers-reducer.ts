@@ -432,7 +432,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			if (willDisable) next.add(action.prefix);
 			else next.delete(action.prefix);
 
-			// Sync disabled field on multi-instance providers sharing this prefix
+			// Sync disabled field on multi-instance providers sharing this prefix.
+			// Only create new arrays for provider types that actually have a matching prefix.
 			const syncDisabled = <T extends { prefix: string; disabled?: boolean }>(
 				providers: T[],
 			): T[] => {
@@ -443,14 +444,31 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				);
 			};
 
-			return withDerivedCustomApiProviders(
-				{
-					...state,
-					disabledProviders: next,
-					nugProviders: syncDisabled(state.nugProviders),
-				},
-				syncDisabled(state.customApiProviders),
-			);
+			const nextCustomApi = syncDisabled(state.customApiProviders);
+			const nextNug = syncDisabled(state.nugProviders);
+			const customApiChanged = nextCustomApi !== state.customApiProviders;
+
+			// Only re-derive openai/anthropic arrays if customApiProviders actually changed.
+			// This avoids creating new array references for all provider types on every toggle.
+			let nextOpenai = state.openaiProviders;
+			let nextAnthropic = state.anthropicProviders;
+			if (customApiChanged) {
+				const normalized = nextCustomApi.map(normalizeCustomApiProvider);
+				const split = deriveSplitProviders(normalized);
+				nextOpenai = split.openai;
+				nextAnthropic = split.anthropic;
+			}
+
+			return {
+				...state,
+				customApiProviders: customApiChanged
+					? nextCustomApi.map(normalizeCustomApiProvider)
+					: state.customApiProviders,
+				openaiProviders: nextOpenai,
+				anthropicProviders: nextAnthropic,
+				nugProviders: nextNug,
+				disabledProviders: next,
+			};
 		}
 
 		case "RESTORE_FROM_SNAPSHOT": {

@@ -53,6 +53,9 @@ const USAGE_HISTORY_DEDUPE_WINDOW_MS = 60_000;
 export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted" | "banned";
 export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 
+const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = ["too_many_failures", "banned"];
+const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
+
 export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
 const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free", "other"];
 
@@ -93,6 +96,17 @@ export interface CredentialStats {
 	lastUsedAt?: string;
 }
 
+function isUnhealthyDisabledCredential(entry: {
+	disabled?: boolean;
+	disabledReason?: DisabledReason;
+}): boolean {
+	return (
+		!!entry.disabled &&
+		!!entry.disabledReason &&
+		UNHEALTHY_DISABLED_REASON_SET.has(entry.disabledReason)
+	);
+}
+
 export interface CredentialSnapshot {
 	id: string;
 	displayName?: string;
@@ -122,6 +136,7 @@ export interface ManagerSnapshot {
 	unavailableEntries: CredentialSnapshot[];
 	availableTotal: number;
 	unavailableTotal: number;
+	unhealthyTotal: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	tierOrder: CodexPlanTier[];
@@ -1052,6 +1067,7 @@ export class CodexManager {
 
 		const allAvailable = this.entries.filter((e) => !e.disabled);
 		const allUnavailable = this.entries.filter((e) => e.disabled);
+		const unhealthyTotal = this.entries.filter(isUnhealthyDisabledCredential).length;
 
 		const pageSize = opts?.pageSize ?? 0; // 0 = no pagination
 		const isPaged = pageSize > 0;
@@ -1085,6 +1101,7 @@ export class CodexManager {
 			unavailableEntries: unavailableSnapshots,
 			availableTotal: allAvailable.length,
 			unavailableTotal: allUnavailable.length,
+			unhealthyTotal,
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
 			tierOrder: [...this.tierOrder],
@@ -1197,6 +1214,12 @@ export class CodexManager {
 			this.schedulePublicQuotaOverviewBroadcast();
 		}
 		return { removed, notFound };
+	}
+
+	removeUnhealthyCredentials(): { removed: string[]; reasons: DisabledReason[] } {
+		const ids = this.entries.filter(isUnhealthyDisabledCredential).map((entry) => entry.id);
+		const result = this.removeCredentials(ids);
+		return { removed: result.removed, reasons: [...UNHEALTHY_DISABLED_REASONS] };
 	}
 
 	updateCredential(id: string, fields: { displayName?: string; priority?: number }): void {

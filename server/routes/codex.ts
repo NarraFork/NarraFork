@@ -310,6 +310,16 @@ codexRoutes.post("/credentials/:id/reset", (c) => {
 });
 
 /**
+ * DELETE /api/codex/credentials/unhealthy
+ * Remove all credentials disabled for too many failures or banned status.
+ */
+codexRoutes.delete("/credentials/unhealthy", (c) => {
+	const manager = getCodexManager();
+	const result = manager.removeUnhealthyCredentials();
+	return c.json(result);
+});
+
+/**
  * DELETE /api/codex/credentials/batch
  * Remove multiple credentials at once.
  */

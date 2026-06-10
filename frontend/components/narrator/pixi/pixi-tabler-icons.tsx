@@ -104,9 +104,11 @@ function iconForStatus(status?: string): Icon {
 }
 
 const textureCache = new Map<string, Texture>();
-const loadingCache = new Set<string>();
+const loadingCache = new Map<string, number>();
 const loadListeners = new Set<() => void>();
+const MAX_ICON_TEXTURE_CACHE_ENTRIES = 256;
 const MAX_IDLE_ICON_POOL_ITEMS = 128;
+let textureGeneration = 0;
 
 function notifyIconLoaded(): void {
 	for (const listener of loadListeners) listener();
@@ -122,7 +124,22 @@ function disposeTexture(texture: Texture): void {
 	texture.destroy(false);
 }
 
+function setCachedTexture(key: string, texture: Texture): void {
+	const previous = textureCache.get(key);
+	if (previous && previous !== texture) disposeTexture(previous);
+	textureCache.delete(key);
+	textureCache.set(key, texture);
+	while (textureCache.size > MAX_ICON_TEXTURE_CACHE_ENTRIES) {
+		const oldest = textureCache.entries().next().value;
+		if (!oldest) break;
+		const [oldestKey, oldestTexture] = oldest;
+		textureCache.delete(oldestKey);
+		disposeTexture(oldestTexture);
+	}
+}
+
 export function invalidatePixiTablerIconTextures(): void {
+	textureGeneration++;
 	for (const texture of textureCache.values()) {
 		disposeTexture(texture);
 	}
@@ -140,9 +157,14 @@ function textureForIcon(
 	const rasterSize = Math.max(size, size * dpr);
 	const key = `${cacheName}:${color}:${size}:${dpr}`;
 	const cached = textureCache.get(key);
-	if (cached) return cached;
-	if (!loadingCache.has(key)) {
-		loadingCache.add(key);
+	if (cached) {
+		textureCache.delete(key);
+		textureCache.set(key, cached);
+		return cached;
+	}
+	const generation = textureGeneration;
+	if (loadingCache.get(key) !== generation) {
+		loadingCache.set(key, generation);
 		const svg = renderToStaticMarkup(
 			createElement(IconComponent, {
 				size: rasterSize,
@@ -150,14 +172,26 @@ function textureForIcon(
 				color: hexColor(color),
 			}),
 		);
-		const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+		// Scope the data URL to the current generation so an in-flight load from a
+		// previous invalidation cannot share the same Pixi Assets texture object with
+		// the new generation and then destroy it when the stale promise resolves.
+		const generationScopedSvg = svg.replace(
+			/<\/svg>\s*$/,
+			`<metadata data-narrafork-generation="${generation}"></metadata></svg>`,
+		);
+		const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(generationScopedSvg)}`;
 		Assets.load<Texture>(url)
 			.then((texture) => {
-				textureCache.set(key, texture);
+				if (generation !== textureGeneration) {
+					disposeTexture(texture);
+					return;
+				}
+				setCachedTexture(key, texture);
 				notifyIconLoaded();
 			})
-			.catch(() => {
-				loadingCache.delete(key);
+			.catch(() => {})
+			.finally(() => {
+				if (loadingCache.get(key) === generation) loadingCache.delete(key);
 			});
 	}
 	return Texture.EMPTY;

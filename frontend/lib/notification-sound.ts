@@ -83,6 +83,22 @@ export function playBuiltinSound(name: string): void {
 	gainNode.gain.value = 0.3;
 
 	let offset = ctx.currentTime;
+	let activeOscillators = 0;
+	const cleanupOscillator = (osc: OscillatorNode) => {
+		try {
+			osc.disconnect();
+		} catch {
+			// Already disconnected.
+		}
+		activeOscillators--;
+		if (activeOscillators <= 0) {
+			try {
+				gainNode.disconnect();
+			} catch {
+				// Already disconnected.
+			}
+		}
+	};
 	for (const [freqMul, durMul] of def.notes) {
 		if (freqMul === 0) {
 			// silence gap
@@ -90,14 +106,21 @@ export function playBuiltinSound(name: string): void {
 			continue;
 		}
 		const osc = ctx.createOscillator();
+		activeOscillators++;
 		osc.type = def.type;
 		osc.frequency.value = def.freq * freqMul;
 		osc.connect(gainNode);
+		osc.addEventListener("ended", () => cleanupOscillator(osc), { once: true });
 
 		const noteDuration = (def.duration * durMul) / 1000;
 		osc.start(offset);
 		osc.stop(offset + noteDuration);
 		offset += noteDuration + 0.02; // small gap between notes
+	}
+
+	if (activeOscillators === 0) {
+		gainNode.disconnect();
+		return;
 	}
 
 	// Fade out gain at the end
@@ -152,8 +175,15 @@ export async function playCustomSound(url: string): Promise<void> {
 		}
 	}
 	const audio = new Audio(blobUrl);
+	const cleanup = () => {
+		audio.pause();
+		audio.removeAttribute("src");
+		audio.load();
+	};
 	audio.volume = 0.5;
-	audio.play().catch(() => {});
+	audio.addEventListener("ended", cleanup, { once: true });
+	audio.addEventListener("error", cleanup, { once: true });
+	audio.play().catch(cleanup);
 }
 
 // --- Unified playback ---

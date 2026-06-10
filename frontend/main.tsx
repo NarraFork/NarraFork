@@ -1,4 +1,5 @@
 import "@frontend/lib/hmr-guard";
+import "@frontend/lib/dom-mutation-guard";
 import { Center, createTheme, Loader, MantineProvider } from "@mantine/core";
 import "@mantine/core/styles.css";
 import { Notifications } from "@mantine/notifications";
