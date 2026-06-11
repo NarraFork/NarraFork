@@ -121,7 +121,10 @@ export const agentTool: ToolDefinition = {
 	get parameters() {
 		return buildParameters();
 	},
-	getRawJsonSchema(config: AgentConfig) {
+	get rawJsonSchema() {
+		return this.getRawJsonSchema();
+	},
+	getRawJsonSchema(config?: AgentConfig) {
 		return {
 			type: "object" as const,
 			properties: {
