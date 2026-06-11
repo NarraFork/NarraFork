@@ -43,6 +43,18 @@ export function useAllModels() {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
 		const providerOrder: string[] = settingsData?.agent?.providerOrder ?? [];
 		const disabledProviders = new Set<string>(settingsData?.agent?.disabledProviders ?? []);
+		const collectDisabledProviderPrefixes = (
+			providers?: Array<{ prefix?: string; disabled?: boolean }>,
+		) => {
+			for (const provider of providers ?? []) {
+				if (provider.disabled && provider.prefix) disabledProviders.add(provider.prefix);
+			}
+		};
+		collectDisabledProviderPrefixes(settingsData?.customApiProviders);
+		collectDisabledProviderPrefixes(settingsData?.openaiProviders);
+		collectDisabledProviderPrefixes(settingsData?.anthropicProviders);
+		collectDisabledProviderPrefixes(settingsData?.nugProviders);
+		collectDisabledProviderPrefixes(settingsData?.clineProviders);
 		const providerAgentModeSupported = (provider: ProviderCapabilityKey) =>
 			getProviderAgentModeCapability(runtimeCapabilities, provider).supported;
 
@@ -232,12 +244,17 @@ export function useAllModels() {
 		}
 
 		// --- Custom models ---
-		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
-			(m: { value: string; label: string; provider?: string }) => ({
+		const modelPrefix = (model: { value: string; provider?: string }) => {
+			if (model.provider) return model.provider;
+			const idx = model.value.indexOf(":");
+			return idx > 0 ? model.value.slice(0, idx) : "openai";
+		};
+		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? [])
+			.map((m: { value: string; label: string; provider?: string }) => ({
 				...m,
-				provider: m.provider ?? "openai",
-			}),
-		);
+				provider: modelPrefix(m),
+			}))
+			.filter((m: ModelOption) => !disabledProviders.has(modelPrefix(m)));
 
 		// --- Codex models (from backend hardcoded list) ---
 		// Only include codex models when codex credentials are available
@@ -310,11 +327,14 @@ export function useAllModels() {
 
 		// --- Model aggregations ---
 		const aggregations: ModelAggregation[] = settingsData?.agent?.modelAggregations ?? [];
-		const aggModels: ModelOption[] = aggregations.map((agg) => ({
-			value: `${AGG_MODEL_PREFIX}${agg.id}`,
-			label: agg.name,
-			provider: "__agg__",
-		}));
+		const availableModelValues = new Set(allModels.map((model) => model.value));
+		const aggModels: ModelOption[] = aggregations
+			.filter((agg) => agg.models.some((model) => availableModelValues.has(model)))
+			.map((agg) => ({
+				value: `${AGG_MODEL_PREFIX}${agg.id}`,
+				label: agg.name,
+				provider: "__agg__",
+			}));
 
 		// --- "Follow default" option ---
 		const defaultModelOption = visibleModels.find((m) => m.value === defaultModelValue);

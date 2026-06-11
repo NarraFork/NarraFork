@@ -46,8 +46,12 @@ export interface ToolContext {
 	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
-	/** Skill scan root — project gitPath or git root resolved from cwd */
+	/** Skill scan root — legacy project gitPath or git root resolved from cwd */
 	skillRoot?: string;
+	/** Project git path used to resolve project-level skills for this context. */
+	projectGitPath?: string | null;
+	/** Resolved skill summary cache scope key for this context. */
+	skillScopeKey?: string;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/** Request permission from the user. Returns true if allowed. */
@@ -282,6 +286,12 @@ export type AgentEvent =
 			status: string;
 			revisedPrompt?: string;
 			result?: string;
+			partialImageIndex?: number;
+			partialImageB64?: string;
+			partialSavedPath?: string;
+			savedPath?: string;
+			width?: number;
+			height?: number;
 			outputIndex?: number;
 	  }
 	| {
@@ -381,6 +391,9 @@ export type ContentBlock =
 			id: string;
 			revisedPrompt?: string;
 			result?: string;
+			savedPath?: string;
+			partialSavedPath?: string;
+			partialImageIndex?: number;
 			outputIndex?: number;
 			width?: number;
 			height?: number;
@@ -449,10 +462,16 @@ export interface AgentConfig {
 	planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 	/** Effective per-session/global value for ExitPlanMode reflection auto-approval. */
 	planReflectionAutoApprove?: boolean;
+	/** Allow ExitPlanMode plan reflection to auto-approve and reset context. */
+	planReflectionAllowAutoCompact?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit validation and ExitPlanMode */
 	planFileId?: string;
-	/** Skill scan root — project gitPath or git root resolved from cwd */
+	/** Skill scan root — legacy project gitPath or git root resolved from cwd */
 	skillRoot?: string;
+	/** Project git path used to resolve project-level skills for this context. */
+	projectGitPath?: string | null;
+	/** Resolved skill summary cache scope key for this context. */
+	skillScopeKey?: string;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */

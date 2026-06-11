@@ -12,10 +12,10 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api, type SideCarRecord } from "../../lib/api";
+import { useToolCallDetail } from "../../hooks/useNarrator";
+import type { SideCarRecord } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
 import { ContentViewer } from "./ContentViewer";
 import { SideCarNotice } from "./SideCarNotice";
@@ -324,13 +324,7 @@ export function ToolCallInspector({
 }: ToolCallInspectorProps) {
 	const { t } = useTranslation("narrator");
 	const enabled = opened && !!narratorId && !!toolUseId;
-	const { data, isLoading, isError } = useQuery({
-		queryKey: ["narrators", narratorId, "tool-calls", toolUseId, "inspector"],
-		queryFn: () => api.getToolCallDetail(narratorId, toolUseId as string),
-		enabled,
-		staleTime: 30 * 1000,
-		gcTime: 0,
-	});
+	const { data, isLoading, isError } = useToolCallDetail(narratorId, toolUseId ?? "", enabled);
 
 	const toolCall = useMemo<ToolCallLike | null>(() => {
 		if (!data) return initialToolCall ?? null;

@@ -175,7 +175,7 @@ async function simulateDeleteMessagesAfter(
 /**
  * Simulate the core logic of rollbackToBlock from narrator-session.ts.
  * Step 1: delete all messages after the target message.
- * Step 2: truncate blocks after blockIndex in the target message.
+ * Step 2: truncate blocks after the effective rollback boundary in the target message.
  */
 async function simulateRollbackToBlock(narratorId: string, messageId: string, blockIndex: number) {
 	const targetMsg = await db.query.narratorMessages.findFirst({
@@ -189,14 +189,16 @@ async function simulateRollbackToBlock(narratorId: string, messageId: string, bl
 		throw new Error(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
 	}
 
+	const effectiveBlockIndex = targetMsg.role === "user" ? blocks.length - 1 : blockIndex;
+
 	// Step 1: delete subsequent messages while preserving the API cache key.
 	const { deletedMessageIds } = await simulateDeleteMessagesAfter(narratorId, messageId, {
 		preserveConversationId: true,
 	});
 
-	// Step 2: truncate blocks after blockIndex
-	if (blockIndex < blocks.length - 1) {
-		const truncated = blocks.slice(0, blockIndex + 1);
+	// Step 2: truncate blocks after the effective rollback boundary
+	if (effectiveBlockIndex < blocks.length - 1) {
+		const truncated = blocks.slice(0, effectiveBlockIndex + 1);
 		const contentText = truncated
 			// biome-ignore lint/suspicious/noExplicitAny: test helper
 			.filter((b: any) => b.type === "text")
@@ -212,7 +214,7 @@ async function simulateRollbackToBlock(narratorId: string, messageId: string, bl
 			.run();
 	}
 
-	return { deletedMessageIds, truncatedBlocks: blocks.length - blockIndex - 1 };
+	return { deletedMessageIds, truncatedBlocks: blocks.length - effectiveBlockIndex - 1 };
 }
 
 /**
@@ -231,7 +233,7 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 
 	const targetMsg = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, messageId),
-		columns: { contentJson: true },
+		columns: { role: true, contentJson: true },
 	});
 	if (!targetMsg) throw new Error(`Message not found: ${messageId}`);
 
@@ -242,16 +244,18 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 		throw new Error(`Block index ${blockIndex} out of range (0..${blocks.length - 1})`);
 	}
 
-	// Collect tool_use IDs from blocks after blockIndex
+	const effectiveBlockIndex = targetMsg.role === "user" ? blocks.length - 1 : blockIndex;
+
+	// Collect tool_use IDs from blocks after the effective rollback boundary
 	const truncatedToolUseIds: string[] = [];
-	for (let i = blockIndex + 1; i < blocks.length; i++) {
+	for (let i = effectiveBlockIndex + 1; i < blocks.length; i++) {
 		const b = blocks[i];
 		if (b.type === "tool_use" && b.id) {
 			truncatedToolUseIds.push(b.id);
 		}
 	}
 
-	const deletedBlockCount = blocks.length - blockIndex - 1;
+	const deletedBlockCount = blocks.length - effectiveBlockIndex - 1;
 
 	// Find tool calls from subsequent messages
 	const subsequentToolCalls = db
@@ -450,6 +454,34 @@ describe("rollbackToBlock", () => {
 		expect(parsed).toHaveLength(2);
 	});
 
+	it("preserves complete multimodal user messages when clicked block is an image", async () => {
+		seedProject();
+		seedNarrator();
+
+		const blocks = [
+			{ type: "image", imageId: "img1", filename: "shot.png", mediaType: "image/png" },
+			{ type: "text", text: "Please inspect this image" },
+		];
+		seedMessage("m0", "n1", "user", "Please inspect this image", blocks);
+		seedRef("n1", "m0", 0);
+		seedMessage("m1", "n1", "assistant", "later response");
+		seedRef("n1", "m1", 1);
+
+		const result = await simulateRollbackToBlock("n1", "m0", 0);
+
+		expect(result.deletedMessageIds).toEqual(["m1"]);
+		expect(result.truncatedBlocks).toBe(0);
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, "m0"),
+		});
+		const parsed = msg?.contentJson as Block[];
+		expect(parsed).toHaveLength(2);
+		expect(parsed[0].type).toBe("image");
+		expect(parsed[1].text).toBe("Please inspect this image");
+		expect(msg?.contentText).toBe("Please inspect this image");
+	});
+
 	it("throws on out-of-range blockIndex", async () => {
 		seedProject();
 		seedNarrator();
@@ -587,6 +619,30 @@ describe("rollback-preview", () => {
 		expect(preview.deletedMessageCount).toBe(1);
 		expect(preview.affectedFilePaths).toContain("/a.ts");
 		expect(preview.toolCallCount).toBe(1);
+	});
+
+	it("reports no target-block deletion for multimodal user messages clicked on an image", async () => {
+		seedProject();
+		seedNarrator();
+
+		const blocks = [
+			{ type: "image", imageId: "img1", filename: "shot.png", mediaType: "image/png" },
+			{ type: "text", text: "Please inspect this image" },
+		];
+		seedMessage("m0", "n1", "user", "Please inspect this image", blocks);
+		seedRef("n1", "m0", 0);
+
+		const blocks2 = [{ type: "tool_use", id: "tu1", name: "Write", input: { file_path: "/a.ts" } }];
+		seedMessage("m1", "n1", "assistant", "", blocks2);
+		seedRef("n1", "m1", 1);
+		seedToolCall("tc1", "n1", "m1", "tu1", "Write", { file_path: "/a.ts" });
+
+		const preview = await simulateRollbackPreview("n1", "m0", 0);
+
+		expect(preview.deletedBlockCount).toBe(0);
+		expect(preview.deletedMessageCount).toBe(1);
+		expect(preview.toolCallCount).toBe(1);
+		expect(preview.affectedFilePaths).toContain("/a.ts");
 	});
 
 	it("returns empty affected files when no Write/Edit tool calls", async () => {

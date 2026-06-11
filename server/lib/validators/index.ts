@@ -105,6 +105,7 @@ export {
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "./settings";
+export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export {
 	createTerminalSchema,
 	createTerminalTabSchema,

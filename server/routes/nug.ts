@@ -7,7 +7,6 @@ import { NugProvider } from "../lib/agent/nug-provider";
 import { logger } from "../lib/logger";
 import {
 	deleteNugCachedModels,
-	getNugCachedModels,
 	getNugCachedModelsByProvider,
 	type NugModelInfo,
 	saveAllCachedNugModels,
@@ -591,9 +590,24 @@ export function purgeNugProviderCache(removedIds: string[]): void {
 	}
 }
 
+function getActiveNugCachedModels(): NugModelInfo[] {
+	const seen = new Set<string>();
+	const result: NugModelInfo[] = [];
+	for (const provider of settings.nugProviders ?? []) {
+		if (provider.disabled) continue;
+		for (const model of getNugCachedModelsByProvider(provider.id)) {
+			const id = String(model.id ?? "");
+			if (!id || seen.has(id)) continue;
+			seen.add(id);
+			result.push(model);
+		}
+	}
+	return result;
+}
+
 // Register model checker and lister
 registerNugModelChecker((model) => {
-	return getNugCachedModels().some((m) => String(m.id ?? "") === model);
+	return getActiveNugCachedModels().some((m) => String(m.id ?? "") === model);
 });
 
 registerNugModelLister(() => {
@@ -661,7 +675,7 @@ function nugUsagePeriod(range: string | undefined): string {
 // === Routes ===
 
 nugRoutes.get("/models", (c) => {
-	return c.json({ models: getNugCachedModels(), fromCache: true });
+	return c.json({ models: getActiveNugCachedModels(), fromCache: true });
 });
 
 nugRoutes.post("/models/refresh", async (c) => {
@@ -693,7 +707,7 @@ nugRoutes.post("/models/refresh", async (c) => {
 	if (changedContextWindows) saveSettings(settings);
 	return c.json({
 		results,
-		models: getNugCachedModels(),
+		models: getActiveNugCachedModels(),
 		fromCache: false,
 		modelContextWindows: settings.agent.modelContextWindows ?? {},
 	});

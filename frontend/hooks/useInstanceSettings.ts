@@ -41,6 +41,7 @@ export interface InstanceSettingsState {
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	planReflectionAutoApprove: boolean;
+	planReflectionAllowAutoCompact: boolean;
 	questionReflectionEnabled: boolean;
 	questionReflectionTimeoutMs: number;
 	dangerReflectionLevel: DangerReflectionLevel;
@@ -128,6 +129,7 @@ function makeDefaults(): InstanceSettingsState {
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		planReflectionAutoApprove: false,
+		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
 		questionReflectionTimeoutMs: 300000,
 		dangerReflectionLevel: "standard",
@@ -218,6 +220,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
+				planReflectionAllowAutoCompact: settings.agent?.planReflectionAllowAutoCompact ?? false,
 				questionReflectionEnabled: settings.agent?.questionReflectionEnabled ?? false,
 				questionReflectionTimeoutMs: settings.agent?.questionReflectionTimeoutMs ?? 300000,
 				dangerReflectionLevel:
@@ -316,6 +319,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
+					planReflectionAllowAutoCompact: state.planReflectionAllowAutoCompact,
 					questionReflectionEnabled: state.questionReflectionEnabled,
 					questionReflectionTimeoutMs: state.questionReflectionTimeoutMs,
 					dangerReflectionLevel: state.dangerReflectionLevel,

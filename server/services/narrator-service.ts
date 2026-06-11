@@ -19,7 +19,6 @@ import {
 	narratorToolCalls,
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
-	projects,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -337,40 +336,28 @@ export async function handleLoadSkillCommand(
 ): Promise<
 	{ found: true; skillName: string; content: string } | { found: false; skillName: string }
 > {
-	const { join } = await import("node:path");
-	const { loadAllSkills } = await import("./skill-service");
+	const { dirname, join } = await import("node:path");
+	const {
+		loadSkillByNameForContext,
+		loadSkillSummariesForContext,
+		resolveSkillContextForNarrator,
+	} = await import("./skill-service");
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true },
-	});
-	let gitPath: string | null = null;
-	if (narrator?.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { projectId: true },
-		});
-		if (chapter) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { gitPath: true },
-			});
-			gitPath = project?.gitPath ?? null;
-		}
-	}
-
-	const allSkills = await loadAllSkills(gitPath);
-	const skills = allSkills.filter((s) => !s.disabled);
-	const found = skills.find((s) => s.name === cmdResult.loadSkill);
+	const skillContext = await resolveSkillContextForNarrator(narratorId);
+	const summaries = await loadSkillSummariesForContext(skillContext);
+	const found = await loadSkillByNameForContext(skillContext, cmdResult.loadSkill);
 
 	if (!found) {
-		const available = skills.map((s) => s.name).join(", ");
+		const available = summaries.skills
+			.filter((s) => !s.disabled)
+			.map((s) => s.name)
+			.join(", ");
 		const infoText = `⚠️ Skill "${cmdResult.loadSkill}" not found. Available: ${available || "(none)"}`;
 		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { found: false, skillName: cmdResult.loadSkill };
 	}
 
-	const skillDir = join(found.location, "..");
+	const skillDir = dirname(found.location);
 	const lines = [`<skill_content name="${escapeXmlAttr(found.name)}">`];
 	lines.push(`# Skill: ${found.name}`);
 	lines.push("");

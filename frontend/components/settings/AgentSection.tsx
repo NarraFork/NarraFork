@@ -60,6 +60,8 @@ export interface AgentSectionProps {
 	setDefaultRelaxedPlan: (v: boolean) => void;
 	planReflectionAutoApprove: boolean;
 	setPlanReflectionAutoApprove: (v: boolean) => void;
+	planReflectionAllowAutoCompact: boolean;
+	setPlanReflectionAllowAutoCompact: (v: boolean) => void;
 	questionReflectionEnabled: boolean;
 	setQuestionReflectionEnabled: (v: boolean) => void;
 	questionReflectionTimeoutMs: number;
@@ -287,6 +289,13 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("planReflectionAutoApproveDesc")}
 				checked={props.planReflectionAutoApprove}
 				onChange={(e) => props.setPlanReflectionAutoApprove(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("planReflectionAllowAutoCompact")}
+				description={t("planReflectionAllowAutoCompactDesc")}
+				checked={props.planReflectionAllowAutoCompact}
+				disabled={!props.planReflectionAutoApprove}
+				onChange={(e) => props.setPlanReflectionAllowAutoCompact(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("questionReflectionEnabled")}

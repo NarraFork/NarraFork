@@ -11,7 +11,10 @@ import {
 } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
-import { saveImageGenerationResult } from "../lib/agent/image-generation";
+import {
+	cleanupPartialImageGenerationResults,
+	saveImageGenerationResult,
+} from "../lib/agent/image-generation";
 import {
 	type ApiRequestHandle,
 	finishApiRequest,
@@ -178,6 +181,11 @@ export type SnapshotStreamingBlock =
 			status: string;
 			revisedPrompt?: string;
 			result?: string;
+			partialImageIndex?: number;
+			partialSavedPath?: string;
+			savedPath?: string;
+			width?: number;
+			height?: number;
 			outputIndex?: number;
 	  }
 	| { type: "text"; text: string; outputIndex?: number };
@@ -220,6 +228,21 @@ function findOrderedSnapshotInsertIndex(
 		if (currentOrder != null && currentOrder > outputIndex) return i;
 	}
 	return blocks.length;
+}
+
+function partialImageGenerationArtifactId(imageId: string, partialImageIndex?: number): string {
+	return `${imageId}_partial_${partialImageIndex ?? "latest"}`;
+}
+
+function cleanupPartialImageGenerationArtifacts(ctx: EventHandlerContext, imageId: string): void {
+	void cleanupPartialImageGenerationResults(ctx.conversationId ?? "unknown", imageId).catch(
+		(err) => {
+			logger.warn("Failed to clean up partial generated image artifacts", {
+				error: err,
+				imageId,
+			});
+		},
+	);
 }
 
 /** Retrieve the current streaming snapshot for a narrator (if any). */
@@ -806,6 +829,47 @@ export async function processEvent(
 						: {}),
 					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
 				});
+				if (savedPath) {
+					if (!ctx.parentToolUseId) {
+						const snap = getOrCreateSnapshot(broadcastTargetId);
+						const existingIdx = snap.streamingBlocks.findIndex(
+							(b) => b.type === "image_generation" && b.id === block.id,
+						);
+						const finalBlock: SnapshotStreamingBlock = {
+							type: "image_generation",
+							id: block.id,
+							status: "completed",
+							revisedPrompt: block.revisedPrompt,
+							savedPath,
+							...(imageWidth != null && imageHeight != null
+								? { width: imageWidth, height: imageHeight }
+								: {}),
+							...(block.outputIndex != null ? { outputIndex: block.outputIndex } : {}),
+						};
+						if (existingIdx !== -1) snap.streamingBlocks[existingIdx] = finalBlock;
+						else {
+							snap.streamingBlocks.splice(
+								findOrderedSnapshotInsertIndex(snap.streamingBlocks, block.outputIndex),
+								0,
+								finalBlock,
+							);
+						}
+					}
+					dualBroadcast(ctx, {
+						type: "image_generation",
+						narratorId: broadcastTargetId,
+						id: block.id,
+						status: "completed",
+						revisedPrompt: block.revisedPrompt,
+						outputIndex: block.outputIndex,
+						...(savedPath ? { savedPath } : {}),
+						...(imageWidth != null && imageHeight != null
+							? { width: imageWidth, height: imageHeight }
+							: {}),
+						...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+					});
+					cleanupPartialImageGenerationArtifacts(ctx, block.id);
+				}
 			}
 			return null;
 		}
@@ -1536,6 +1600,28 @@ export async function processEvent(
 		}
 
 		case "image_generation": {
+			let partialSavedPath = event.partialSavedPath;
+			let imageWidth = event.width;
+			let imageHeight = event.height;
+			if (event.partialImageB64) {
+				try {
+					const saved = await saveImageGenerationResult(
+						ctx.conversationId ?? "unknown",
+						partialImageGenerationArtifactId(event.id, event.partialImageIndex),
+						event.partialImageB64,
+					);
+					partialSavedPath = saved.filePath;
+					imageWidth = saved.width;
+					imageHeight = saved.height;
+				} catch (err) {
+					logger.warn("Failed to save partial generated image to disk", {
+						error: err,
+						imageId: event.id,
+						partialImageIndex: event.partialImageIndex,
+					});
+				}
+			}
+
 			// Snapshot: track image_generation in provider order (top-level only)
 			if (!ctx.parentToolUseId) {
 				const snap = getOrCreateSnapshot(broadcastTargetId);
@@ -1549,6 +1635,14 @@ export async function processEvent(
 						existing.status = event.status;
 						if (event.revisedPrompt) existing.revisedPrompt = event.revisedPrompt;
 						if (event.outputIndex != null) existing.outputIndex = event.outputIndex;
+						if (event.partialImageIndex != null)
+							existing.partialImageIndex = event.partialImageIndex;
+						if (partialSavedPath) existing.partialSavedPath = partialSavedPath;
+						if (event.savedPath) existing.savedPath = event.savedPath;
+						if (imageWidth != null && imageHeight != null) {
+							existing.width = imageWidth;
+							existing.height = imageHeight;
+						}
 					}
 				} else {
 					snap.streamingBlocks.splice(
@@ -1559,15 +1653,21 @@ export async function processEvent(
 							id: event.id,
 							status: event.status,
 							revisedPrompt: event.revisedPrompt,
+							...(event.partialImageIndex != null
+								? { partialImageIndex: event.partialImageIndex }
+								: {}),
+							...(partialSavedPath ? { partialSavedPath } : {}),
+							...(event.savedPath ? { savedPath: event.savedPath } : {}),
+							...(imageWidth != null && imageHeight != null
+								? { width: imageWidth, height: imageHeight }
+								: {}),
 							...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 						},
 					);
 				}
 			}
-			// Omit `result` (base64 image data, potentially several MB) from WS
-			// broadcast to avoid oversized WebSocket frames.  The frontend loads
-			// the image via /api/fs/preview using the savedPath persisted in the
-			// block_complete handler above.
+			// Omit raw base64 image data from WS broadcasts.  Partial previews and
+			// final images are loaded by the frontend via /api/fs/preview and saved paths.
 			dualBroadcast(ctx, {
 				type: "image_generation",
 				narratorId: broadcastTargetId,
@@ -1575,6 +1675,12 @@ export async function processEvent(
 				status: event.status as "in_progress" | "generating" | "completed",
 				revisedPrompt: event.revisedPrompt,
 				outputIndex: event.outputIndex,
+				...(event.partialImageIndex != null ? { partialImageIndex: event.partialImageIndex } : {}),
+				...(partialSavedPath ? { partialSavedPath } : {}),
+				...(event.savedPath ? { savedPath: event.savedPath } : {}),
+				...(imageWidth != null && imageHeight != null
+					? { width: imageWidth, height: imageHeight }
+					: {}),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 			});
 			return null;

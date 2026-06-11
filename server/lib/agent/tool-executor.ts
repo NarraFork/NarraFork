@@ -290,6 +290,8 @@ export async function executeTool(
 		chapterId: config.chapterId,
 		planFileId: config.planFileId,
 		skillRoot: config.skillRoot,
+		projectGitPath: config.projectGitPath,
+		skillScopeKey: config.skillScopeKey,
 		parentNarratorId: config.parentNarratorId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,

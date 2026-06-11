@@ -55,6 +55,8 @@ function SettingsAgentPage() {
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
 				planReflectionAutoApprove={is.planReflectionAutoApprove}
 				setPlanReflectionAutoApprove={is.setPlanReflectionAutoApprove}
+				planReflectionAllowAutoCompact={is.planReflectionAllowAutoCompact}
+				setPlanReflectionAllowAutoCompact={is.setPlanReflectionAllowAutoCompact}
 				questionReflectionEnabled={is.questionReflectionEnabled}
 				setQuestionReflectionEnabled={is.setQuestionReflectionEnabled}
 				questionReflectionTimeoutMs={is.questionReflectionTimeoutMs}

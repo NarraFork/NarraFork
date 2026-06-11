@@ -70,8 +70,10 @@ export interface ActiveNarrator {
 	_isInGitRepo?: boolean;
 	/** Cached project git path (for skill loading) */
 	_projectGitPath?: string | null;
-	/** Resolved skill scan root (projectGitPath or git root from cwd) */
+	/** Resolved skill scan root (legacy projectGitPath or git root from cwd) */
 	_skillRoot?: string | null;
+	/** Resolved skill summary cache scope key for current project/cwd context. */
+	_skillScopeKey?: string | null;
 	/** Optional tools enabled for this session (tool names, e.g. "Terminal") */
 	_enabledOptionalTools: Set<string>;
 	/** Tools disabled by narrator custom traits. */

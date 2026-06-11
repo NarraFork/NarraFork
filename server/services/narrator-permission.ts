@@ -1200,7 +1200,7 @@ function buildShellAnalysisFailureDanger(
 			...(command ? [`Command: ${command}`] : []),
 			`Analysis error: ${errorMessage}`,
 		],
-		"high",
+		"medium",
 	);
 }
 
@@ -1463,6 +1463,23 @@ function classifyGitDanger(cmdText: string, tokens: string[]): DangerInfo | null
 	return null;
 }
 
+function isUncertainShellDangerPattern(pattern: string): boolean {
+	const lower = pattern.toLowerCase();
+	return (
+		lower.startsWith("path execution:") ||
+		lower.includes("(unknown ") ||
+		lower.includes(" unknown ") ||
+		lower.includes("not in safe allowlist") ||
+		lower.includes("package not in allowlist") ||
+		lower.includes("flag not in safe allowlist") ||
+		lower.includes("argument not in safe allowlist")
+	);
+}
+
+function shellDangerPatternSeverity(patterns: string[]): DangerSeverity {
+	return patterns.length > 0 && patterns.every(isUncertainShellDangerPattern) ? "medium" : "high";
+}
+
 function classifyShellDanger(
 	input: Record<string, unknown>,
 	cwd: string,
@@ -1544,18 +1561,32 @@ function classifyShellDanger(
 		);
 	}
 	if (bashAnalysis.dangerousPatterns.length > 0 && !unsafeCommandsWhitelisted) {
+		const severity = shellDangerPatternSeverity(bashAnalysis.dangerousPatterns);
+		const uncertainOnly = severity === "medium";
 		return danger(
-			"Shell command contains dangerous execution patterns.",
-			[
-				"The command may execute downloaded, nested, or environment-injected code.",
-				"Side effects may be broader than the visible command line suggests.",
-			],
-			[
-				"Inspect the command source first.",
-				"Break the command into read-only inspection and explicit execution steps.",
-			],
+			uncertainOnly
+				? "Shell command includes unclassified execution patterns."
+				: "Shell command contains dangerous execution patterns.",
+			uncertainOnly
+				? [
+						"The command may execute a local script, unknown subcommand, or unallowlisted argument whose side effects are not classified.",
+						"In Bypass All mode this would otherwise execute without user approval.",
+					]
+				: [
+						"The command may execute downloaded, nested, or environment-injected code.",
+						"Side effects may be broader than the visible command line suggests.",
+					],
+			uncertainOnly
+				? [
+						"Use a dedicated NarraFork tool for read/write operations when possible.",
+						"Break the command into smaller inspected steps or add a narrow command whitelist rule if this exact command is trusted.",
+					]
+				: [
+						"Inspect the command source first.",
+						"Break the command into read-only inspection and explicit execution steps.",
+					],
 			bashAnalysis.dangerousPatterns,
-			"high",
+			severity,
 		);
 	}
 	if (bashAnalysis.nonWhitelisted.length > 0 && !unsafeCommandsWhitelisted) {

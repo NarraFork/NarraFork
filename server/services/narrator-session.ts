@@ -372,16 +372,15 @@ async function createNarrator(
 		settings.agent.defaultSystemPrompt,
 	);
 
-	// Resolve skill root for the Skill tool (projectGitPath or git root from cwd)
-	let skillRoot: string | null = null;
+	// Resolve and warm skill summaries for the Skill tool. This is context-based:
+	// global + project git path + current working directory/workspace.
+	let skillRoot: string | null = projectGitPath;
+	let skillScopeKey: string | null = null;
 	try {
 		const { resolveSkillRoot } = await import("./skill-service");
 		skillRoot = await resolveSkillRoot(projectGitPath, narratorCwd);
-		if (skillRoot) {
-			// Pre-populate skill cache so the tool description includes the skill list
-			const { warmSkillCache } = await import("../lib/agent/tools/skill");
-			await warmSkillCache(skillRoot);
-		}
+		const { warmSkillCacheForContext } = await import("../lib/agent/tools/skill");
+		skillScopeKey = await warmSkillCacheForContext({ projectGitPath, cwd: narratorCwd });
 	} catch {
 		// Skill root resolution failure is non-fatal
 	}
@@ -435,6 +434,7 @@ async function createNarrator(
 		_planFileId: planFileId,
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
+		_skillScopeKey: skillScopeKey,
 		_enabledOptionalTools: new Set(),
 		_disabledTools: getDisabledToolSet(narrator.traits),
 		_interruptCleanupDone: false,
@@ -553,6 +553,44 @@ export function notifyRunningNarratorGoalStateChanged(
 	if (!active?.alive || !active._loopRunning) return false;
 	active._pendingGoalStateNotice = `[System] The NarraFork goal list was changed externally while this turn was already running (action: ${action}). Treat the list below as the current source of truth. Do not call AddGoal for an objective that is already listed; continue according to the active goal and the latest user intent.\n\nCurrent goal list:\n${formatGoalNoticeList(goals)}`;
 	return true;
+}
+
+async function ensureSkillCacheFreshForActiveNarrator(active: ActiveNarrator): Promise<void> {
+	try {
+		const { warmSkillCacheForContext } = await import("../lib/agent/tools/skill");
+		active._skillScopeKey = await warmSkillCacheForContext({
+			projectGitPath: active._projectGitPath ?? null,
+			cwd: active.cwd,
+		});
+	} catch (err) {
+		logger.debug("Failed to refresh skill cache for active narrator", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+	}
+}
+
+export async function updateActiveNarratorCwdAndSkillContext(
+	narratorId: string,
+	cwd: string,
+): Promise<void> {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) return;
+	active.cwd = cwd;
+	try {
+		const { resolveSkillRoot } = await import("./skill-service");
+		active._skillRoot = await resolveSkillRoot(active._projectGitPath, cwd);
+	} catch {
+		active._skillRoot = active._projectGitPath ?? null;
+	}
+	if (!active._chapterId) {
+		try {
+			active._isInGitRepo = await gitService.isGitRepo(cwd);
+		} catch {
+			active._isInGitRepo = false;
+		}
+	}
+	await ensureSkillCacheFreshForActiveNarrator(active);
 }
 
 async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
@@ -1410,6 +1448,7 @@ export async function runAgentLoop(
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
+			await ensureSkillCacheFreshForActiveNarrator(active);
 
 			const config: import("../lib/agent").AgentConfig = {
 				narratorId,
@@ -1431,6 +1470,8 @@ export async function runAgentLoop(
 				),
 				planFileId: active._planFileId,
 				skillRoot: active._skillRoot ?? undefined,
+				projectGitPath: active._projectGitPath ?? undefined,
+				skillScopeKey: active._skillScopeKey ?? undefined,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
@@ -3114,10 +3155,24 @@ export async function continueNarrator(
 	return { ok: true };
 }
 
+export function normalizeRollbackBlockIndexForMessage(
+	role: string | null | undefined,
+	blockIndex: number,
+	blockCount: number,
+): number {
+	// User messages must remain atomic. Multimodal user messages are persisted as
+	// attachments first and text after them, so truncating at an image block would
+	// leave an image-only turn that providers can reject. Rolling back "to" a user
+	// message should preserve the complete user input and only remove later turns.
+	if (role === "user") return blockCount - 1;
+	return blockIndex;
+}
+
 /**
  * Rollback to a specific block within a message.
- * Deletes all blocks after the given blockIndex in the target message,
- * plus all subsequent messages. Does NOT re-run the agent loop.
+ * Deletes all blocks after the effective blockIndex in the target message,
+ * plus all subsequent messages. User messages are preserved as whole turns.
+ * Does NOT re-run the agent loop.
  * File changes are automatically reverted via snapshot system.
  */
 export async function rollbackToBlock(
@@ -3149,6 +3204,12 @@ export async function rollbackToBlock(
 		);
 	}
 
+	const effectiveBlockIndex = normalizeRollbackBlockIndexForMessage(
+		targetMsg.role,
+		blockIndex,
+		blocks.length,
+	);
+
 	// Step 1: Delete all messages after the target message (includes file revert)
 	const { deletedMessageIds } = await narratorService.deleteMessagesAfter(narratorId, messageId, {
 		preserveConversationId: true,
@@ -3161,9 +3222,9 @@ export async function rollbackToBlock(
 		});
 	}
 
-	// Step 2: Delete blocks after blockIndex in the target message
+	// Step 2: Delete blocks after the effective rollback boundary in the target message
 	const blocksToDelete: Array<{ messageId: string; blockIndex: number }> = [];
-	for (let i = blocks.length - 1; i > blockIndex; i--) {
+	for (let i = blocks.length - 1; i > effectiveBlockIndex; i--) {
 		blocksToDelete.push({ messageId, blockIndex: i });
 	}
 

@@ -22,6 +22,7 @@ export type PromptKey =
 	| "mergeSummary"
 	| "dangerReflection"
 	| "exitPlanReflection"
+	| "exitPlanReflectionAutoCompact"
 	| "goalCompletionReflection";
 export type BuiltinSubagentType = "explore" | "plan" | "general";
 export type SubagentType = string;
@@ -246,10 +247,10 @@ Prompt-based permissions requested:
 
 Review the plan for readiness before it reaches the user. Check that it is specific, actionable, scoped to the request, and does not contain unresolved choices that should have been clarified first.
 
-You have exactly one response, and you MUST call exactly one tool:
+You have exactly one response, and you MUST call exactly one allowed tool:
 - ExitPlanConfirm if the plan is ready to present to the user for approval.
 - ExitPlanRevise if the plan needs more detail, has unresolved decisions, or should be revised before user approval.
-If you do not call either tool in this one response, the plan submission will be treated as needing revision.
+If you do not call an allowed reflection tool in this one response, the plan submission will be treated as needing revision.
 Do not call ExitPlanMode from this reflection loop.`,
 		"zh-CN": `ExitPlanMode 反思：一个计划即将提交给用户审批。
 
@@ -265,11 +266,19 @@ Do not call ExitPlanMode from this reflection loop.`,
 
 请在计划触达用户前检查其是否已准备好：是否具体、可执行、范围匹配用户请求，并且没有本应提前澄清的未决选择。
 
-你只有一次回复机会，并且必须且只能调用一个工具：
+你只有一次回复机会，并且必须且只能调用一个允许的工具：
 - 如果计划已经可以提交给用户审批，调用 ExitPlanConfirm。
 - 如果计划还需要更多细节、存在未决选择，或应先修改再给用户审批，调用 ExitPlanRevise。
-如果你在这一次回复中没有调用任一工具，该计划提交将被视为需要修改。
+如果你在这一次回复中没有调用允许的 reflection 工具，该计划提交将被视为需要修改。
 不要在这个反思 loop 中调用 ExitPlanMode。`,
+	},
+	exitPlanReflectionAutoCompact: {
+		en: `Additional enabled capability: you may call ExitPlanConfirmAndCompact instead of ExitPlanConfirm when the plan is ready AND clearing the current conversation context before execution is beneficial.
+
+Use ExitPlanConfirmAndCompact only when the plan itself contains enough concrete implementation context to continue safely after the reset. Do not use it if important investigation details, unresolved assumptions, or user constraints would be lost.`,
+		"zh-CN": `额外启用能力：当计划已经就绪，并且在执行前清空当前会话上下文是有益的，你可以调用 ExitPlanConfirmAndCompact，而不是 ExitPlanConfirm。
+
+仅当计划本身已经包含足够具体的实现上下文，能在重置后安全继续执行时，才使用 ExitPlanConfirmAndCompact。如果重要调查细节、未决假设或用户约束会因此丢失，不要使用它。`,
 	},
 	goalCompletionReflection: {
 		en: `Goal-completion reflection: the narrator is attempting to mark a user-set goal complete.

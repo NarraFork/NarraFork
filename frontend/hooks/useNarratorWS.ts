@@ -233,6 +233,11 @@ interface NarratorWSCallbacks {
 		status: "in_progress" | "generating" | "completed",
 		revisedPrompt?: string,
 		outputIndex?: number,
+		partialImageIndex?: number,
+		partialSavedPath?: string,
+		savedPath?: string,
+		width?: number,
+		height?: number,
 		parentToolUseId?: string,
 	) => void;
 	onNarratorError?: (error: string, errorCode?: string) => void;
@@ -315,6 +320,11 @@ interface NarratorWSCallbacks {
 					status: string;
 					revisedPrompt?: string;
 					result?: string;
+					partialImageIndex?: number;
+					partialSavedPath?: string;
+					savedPath?: string;
+					width?: number;
+					height?: number;
 					outputIndex?: number;
 			  }
 			| { type: "text"; text: string; outputIndex?: number }
@@ -784,6 +794,11 @@ export function useNarratorWS(
 							data.status as "in_progress" | "generating" | "completed",
 							data.revisedPrompt as string | undefined,
 							data.outputIndex as number | undefined,
+							data.partialImageIndex as number | undefined,
+							data.partialSavedPath as string | undefined,
+							data.savedPath as string | undefined,
+							data.width as number | undefined,
+							data.height as number | undefined,
 							data.parentToolUseId as string | undefined,
 						);
 						break;

@@ -7,6 +7,8 @@ import {
 } from "../../../services/subagent-alias";
 import { settings } from "../../settings";
 import {
+	buildExitPlanReflectionPrompt,
+	getExitPlanReflectionAllowedTools,
 	shouldInjectRelaxedPlanToolReminder,
 	shouldRunExitPlanModeReflection,
 	shouldRunGoalCompletionReflection,
@@ -15,6 +17,7 @@ import { executeTool } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
+import { EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME } from "../tools/exit-plan-reflection";
 import { goalCompleteConfirmTool, goalCompleteReviseTool } from "../tools/goal-reflection";
 import {
 	type AgentConfig,
@@ -26,14 +29,20 @@ import {
 const TEST_TOOL_NAME = "__ExecutorGuardTest";
 
 const originalPlanReflectionAutoApprove = settings.agent.planReflectionAutoApprove;
+const originalPlanReflectionAllowAutoCompact = settings.agent.planReflectionAllowAutoCompact;
 
 function setPlanReflectionAutoApprove(value: boolean) {
 	settings.agent.planReflectionAutoApprove = value;
 }
 
+function setPlanReflectionAllowAutoCompact(value: boolean) {
+	settings.agent.planReflectionAllowAutoCompact = value;
+}
+
 afterEach(() => {
 	toolRegistry.unregister(TEST_TOOL_NAME);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
+	settings.agent.planReflectionAllowAutoCompact = originalPlanReflectionAllowAutoCompact;
 });
 
 function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentConfig {
@@ -162,6 +171,28 @@ describe("ExitPlanMode reflection gate", () => {
 				reflectionLoop: { allowedTools: [], context: { kind: "exitPlanMode" } },
 			}),
 		).toBe(false);
+	});
+
+	test("auto-compact reflection tool requires its setting", () => {
+		setPlanReflectionAllowAutoCompact(false);
+		expect(getExitPlanReflectionAllowedTools()).not.toContain(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
+
+		setPlanReflectionAllowAutoCompact(true);
+		expect(getExitPlanReflectionAllowedTools()).toContain(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
+	});
+
+	test("auto-compact prompt is appended only when enabled", () => {
+		const input = { plan: "Implement the approved change." };
+
+		setPlanReflectionAllowAutoCompact(false);
+		expect(buildExitPlanReflectionPrompt("req-1", input, "en")).not.toContain(
+			EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
+		);
+
+		setPlanReflectionAllowAutoCompact(true);
+		expect(buildExitPlanReflectionPrompt("req-1", input, "en")).toContain(
+			EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
+		);
 	});
 });
 

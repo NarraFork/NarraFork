@@ -209,6 +209,27 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(parsed?.messageId).toBe("msg_remote_2");
 	});
 
+	test("parseResponsesAPIEvent captures partial image previews", () => {
+		const events = parseResponsesAPIEvent(
+			{
+				type: "response.image_generation_call.partial_image",
+				item_id: "ig_partial",
+				output_index: 2,
+				partial_image_index: 1,
+				partial_image_b64: SAMPLE_PNG_BASE64,
+			},
+			new Map(),
+			new Map(),
+		);
+
+		const parsed = events.find((event) => event.imageGeneration);
+		expect(parsed?.imageGeneration?.id).toBe("ig_partial");
+		expect(parsed?.imageGeneration?.status).toBe("generating");
+		expect(parsed?.imageGeneration?.outputIndex).toBe(2);
+		expect(parsed?.imageGeneration?.partialImageIndex).toBe(1);
+		expect(parsed?.imageGeneration?.partialImageB64).toBe(SAMPLE_PNG_BASE64);
+	});
+
 	test("parseResponsesAPIEvent streams raw reasoning_text deltas without summary", () => {
 		const reasoningAccum = new Map();
 		parseResponsesAPIEvent(

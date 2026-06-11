@@ -240,6 +240,16 @@ describe("Codex Responses WebSocket helpers", () => {
 		).toBe(false);
 		expect(
 			shouldTreatCodexStreamEventAsYielded({
+				imageGeneration: {
+					id: "img_1",
+					status: "generating",
+					partialImageIndex: 0,
+					partialImageB64: "base64-preview",
+				},
+			}),
+		).toBe(true);
+		expect(
+			shouldTreatCodexStreamEventAsYielded({
 				imageGeneration: { id: "img_1", status: "completed", final: true, result: "base64" },
 			}),
 		).toBe(true);

@@ -122,6 +122,36 @@ export const narratorsApi = {
 				descriptionZh: string;
 			}>;
 		}>(`/narrators/${id}/commands`),
+	getNarratorSkills: (id: string, opts?: { refresh?: boolean }) => {
+		const params = new URLSearchParams();
+		if (opts?.refresh) params.set("refresh", "true");
+		const qs = params.toString();
+		return request<{
+			skills: Array<{
+				name: string;
+				description: string;
+				location: string;
+				files: string[];
+				disabled?: boolean;
+				source: "global" | "project" | "workspace";
+				rootKind: "global" | "project" | "workspace";
+				normalizedRootPath: string;
+			}>;
+			roots: Array<{
+				rootKind: "global" | "project" | "workspace";
+				rootPath: string;
+				normalizedRootPath: string;
+				scannedAt?: string | null;
+				lastAccessedAt?: string | null;
+				expiresAt?: string | null;
+				cacheHit: boolean;
+				refreshed: boolean;
+				cacheable: boolean;
+				skillCount: number;
+			}>;
+			scopeKey: string;
+		}>(`/narrators/${id}/skills${qs ? `?${qs}` : ""}`);
+	},
 	createNarrator: (data: {
 		chapterId?: string | null;
 		type?: string;

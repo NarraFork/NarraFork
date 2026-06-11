@@ -49,6 +49,7 @@ function capCommandPopoverText(text: string): string {
 /** Left color bar based on item type + source */
 function getBarColor(item: CommandItem): string {
 	if (item.type === "skill") {
+		if (item.source === "workspace") return "var(--mantine-color-cyan-6)";
 		return item.source === "project"
 			? "var(--mantine-color-teal-6)"
 			: "var(--mantine-color-violet-6)";
@@ -64,9 +65,17 @@ function getBarColor(item: CommandItem): string {
 
 function getSourceBadge(item: CommandItem, t: (key: string) => string) {
 	if (item.type === "skill") {
+		const color =
+			item.source === "workspace" ? "cyan" : item.source === "project" ? "teal" : "violet";
+		const label =
+			item.source === "workspace"
+				? t("commandSourceWorkspaceSkill")
+				: item.source === "project"
+					? t("commandSourceProjectSkill")
+					: t("commandSourceGlobalSkill");
 		return (
-			<Badge size="xs" variant="light" color={item.source === "project" ? "teal" : "violet"}>
-				{item.source === "project" ? t("commandSourceProjectSkill") : t("commandSourceGlobalSkill")}
+			<Badge size="xs" variant="light" color={color}>
+				{label}
 			</Badge>
 		);
 	}

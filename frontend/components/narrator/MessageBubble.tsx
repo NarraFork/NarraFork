@@ -600,13 +600,16 @@ interface ImageGenerationBlockData {
 	revisedPrompt?: string;
 	result?: string;
 	savedPath?: string;
+	partialSavedPath?: string;
+	partialImageIndex?: number;
 	outputIndex?: number;
 	width?: number;
 	height?: number;
 }
 
 function generatedImageFilename(block: ImageGenerationBlockData): string {
-	const savedName = block.savedPath?.split(/[\\/]/).pop();
+	const sourcePath = block.savedPath ?? block.partialSavedPath;
+	const savedName = sourcePath?.split(/[\\/]/).pop();
 	if (savedName?.trim()) return savedName.endsWith(".png") ? savedName : `${savedName}.png`;
 	const safeId = (block.id || "generated-image").replace(/[^A-Za-z0-9_-]/g, "_");
 	return `${safeId || "generated-image"}.png`;
@@ -670,15 +673,16 @@ function ImageGenerationBlock({
 		if (token) headers.Authorization = `Bearer ${token}`;
 		return headers;
 	}, []);
+	const previewPath = block.savedPath ?? block.partialSavedPath;
 
-	// Fetch image from savedPath via /api/fs/preview (blob URL)
+	// Fetch image from savedPath / partialSavedPath via /api/fs/preview (blob URL)
 	useEffect(() => {
-		if (!block.savedPath || !fsPreviewSupported) return;
+		if (!previewPath || !fsPreviewSupported) return;
 		let cancelled = false;
 		let objectUrl: string | null = null;
 		setLoadError(false);
 		setLoadErrorMessage(null);
-		fetch(`/api/fs/preview?path=${encodeURIComponent(block.savedPath)}`, {
+		fetch(`/api/fs/preview?path=${encodeURIComponent(previewPath)}`, {
 			headers: getPreviewHeaders(),
 		})
 			.then(async (r) => {
@@ -705,9 +709,9 @@ function ImageGenerationBlock({
 			cancelled = true;
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [block.savedPath, fsPreviewSupported, getPreviewHeaders]);
+	}, [previewPath, fsPreviewSupported, getPreviewHeaders]);
 
-	// Determine image source: savedPath blob > bounded inline base64 > none
+	// Determine image source: final savedPath blob > partial preview blob > bounded inline base64 > none
 	const inlineImageSrc =
 		block.result && block.result.length <= MAX_INLINE_IMAGE_RESULT_CHARS
 			? block.result.startsWith("data:")
@@ -716,13 +720,13 @@ function ImageGenerationBlock({
 			: null;
 	const imageSrc = blobUrl ?? inlineImageSrc;
 	const inlineResultUnavailable =
-		!block.savedPath && !!block.result && block.result.length > MAX_INLINE_IMAGE_RESULT_CHARS;
-	const savedPathPreviewUnavailable = !!block.savedPath && !fsPreviewSupported && !inlineImageSrc;
+		!previewPath && !!block.result && block.result.length > MAX_INLINE_IMAGE_RESULT_CHARS;
+	const savedPathPreviewUnavailable = !!previewPath && !fsPreviewSupported && !inlineImageSrc;
 	const imageUnavailable = loadError || inlineResultUnavailable || savedPathPreviewUnavailable;
 	const hasImage = !!imageSrc && !imageUnavailable;
 	const imageMetrics = getImageGenerationDisplayMetrics(block);
 	const shouldReserveImageFrame =
-		!!imageMetrics && (!!block.savedPath || !!block.result || imageUnavailable);
+		!!imageMetrics && (!!previewPath || !!block.result || imageUnavailable);
 	const imageFrameStyle: React.CSSProperties | undefined = imageMetrics
 		? {
 				width: `min(100%, ${imageMetrics.displayWidth}px)`,
@@ -735,8 +739,8 @@ function ImageGenerationBlock({
 				justifyContent: "center",
 			}
 		: undefined;
-	const canCopyImage = hasImage || (!!block.savedPath && fsPreviewSupported);
-	const canCopyImagePath = !!block.savedPath;
+	const canCopyImage = hasImage || (!!previewPath && fsPreviewSupported);
+	const canCopyImagePath = !!previewPath;
 	const canSaveImage = hasImage;
 	const hasMenuActions = !!(
 		canCopyImage ||
@@ -750,27 +754,27 @@ function ImageGenerationBlock({
 	);
 
 	const handleCopyImage = useCallback(async () => {
-		if (!imageSrc && (!block.savedPath || !fsPreviewSupported)) return;
+		if (!imageSrc && (!previewPath || !fsPreviewSupported)) return;
 		try {
 			await copyGeneratedImageToClipboard({
 				imageSrc,
-				savedPath: fsPreviewSupported ? block.savedPath : null,
+				savedPath: fsPreviewSupported ? previewPath : null,
 			});
 			notifications.show({ color: "teal", message: t("copyImageSuccess") });
 		} catch {
 			notifications.show({ color: "red", message: t("copyImageFailed") });
 		}
-	}, [block.savedPath, fsPreviewSupported, imageSrc, t]);
+	}, [fsPreviewSupported, imageSrc, previewPath, t]);
 
 	const handleCopyImagePath = useCallback(async () => {
-		if (!block.savedPath) return;
+		if (!previewPath) return;
 		try {
-			await navigator.clipboard.writeText(block.savedPath);
+			await navigator.clipboard.writeText(previewPath);
 			notifications.show({ color: "teal", message: t("copyImagePathSuccess") });
 		} catch {
 			notifications.show({ color: "red", message: t("copyImagePathFailed") });
 		}
-	}, [block.savedPath, t]);
+	}, [previewPath, t]);
 
 	const handleSaveImageAs = useCallback(() => {
 		if (!imageSrc) return;

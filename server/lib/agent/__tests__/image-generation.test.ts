@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
+	cleanupPartialImageGenerationResults,
 	decodeStandardBase64Image,
 	imageGenerationArtifactPath,
 	readPngImageDimensions,
@@ -29,5 +32,30 @@ describe("image generation artifacts", () => {
 		const bytes = Buffer.from(SAMPLE_PNG_BASE64, "base64");
 		expect(readPngImageDimensions(bytes)).toEqual({ width: 1, height: 1 });
 		expect(readPngImageDimensions(Buffer.from("not a png"))).toBeUndefined();
+	});
+
+	test("cleans up only partial artifacts for an image generation", async () => {
+		const sessionId = `cleanup-test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const imageId = "img_cleanup";
+		const finalPath = imageGenerationArtifactPath(sessionId, imageId);
+		const partialZeroPath = imageGenerationArtifactPath(sessionId, `${imageId}_partial_0`);
+		const partialOnePath = imageGenerationArtifactPath(sessionId, `${imageId}_partial_1`);
+		const sessionDir = dirname(finalPath);
+
+		try {
+			mkdirSync(sessionDir, { recursive: true });
+			writeFileSync(finalPath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+			writeFileSync(partialZeroPath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+			writeFileSync(partialOnePath, Buffer.from(SAMPLE_PNG_BASE64, "base64"));
+
+			const removed = await cleanupPartialImageGenerationResults(sessionId, imageId);
+
+			expect(removed).toBe(2);
+			expect(existsSync(finalPath)).toBe(true);
+			expect(existsSync(partialZeroPath)).toBe(false);
+			expect(existsSync(partialOnePath)).toBe(false);
+		} finally {
+			rmSync(sessionDir, { recursive: true, force: true });
+		}
 	});
 });

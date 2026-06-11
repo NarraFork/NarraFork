@@ -141,6 +141,16 @@ export interface ParsedStreamEvent {
 		revisedPrompt?: string;
 		/** Base64-encoded image data (available on completion) */
 		result?: string;
+		/** 0-based index for a streamed partial image preview. */
+		partialImageIndex?: number;
+		/** Base64-encoded complete preview image from partial_image events. */
+		partialImageB64?: string;
+		/** Saved partial image path after event handling. */
+		partialSavedPath?: string;
+		/** Saved final image path after event handling. */
+		savedPath?: string;
+		width?: number;
+		height?: number;
 		/** Provider-native ordering index for this image generation block. */
 		outputIndex?: number;
 		/** True when this event is the final output_item.done payload. */

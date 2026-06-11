@@ -102,8 +102,9 @@ export const miscApi = {
 				description: string;
 				location: string;
 				files: string[];
+				disabled?: boolean;
 			}>
-		>(`/skills?projectId=${projectId}`),
+		>(`/skills?projectId=${encodeURIComponent(projectId)}`),
 	getSkill: (projectId: string, name: string) =>
 		request<{
 			name: string;
@@ -111,7 +112,42 @@ export const miscApi = {
 			location: string;
 			content: string;
 			files: string[];
-		}>(`/skills/${encodeURIComponent(name)}?projectId=${projectId}`),
+			disabled?: boolean;
+		}>(`/skills/${encodeURIComponent(name)}?projectId=${encodeURIComponent(projectId)}`),
+	createProjectSkill: (
+		projectId: string,
+		data: { name: string; description: string; content: string },
+	) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>(`/skills?projectId=${encodeURIComponent(projectId)}`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updateProjectSkill: (
+		projectId: string,
+		currentName: string,
+		data: { name: string; description: string; content: string },
+	) =>
+		request<{
+			name: string;
+			description: string;
+			location: string;
+			content: string;
+			files: string[];
+		}>(`/skills/${encodeURIComponent(currentName)}?projectId=${encodeURIComponent(projectId)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deleteProjectSkill: (projectId: string, name: string) =>
+		request<{ ok: boolean }>(
+			`/skills/${encodeURIComponent(name)}?projectId=${encodeURIComponent(projectId)}`,
+			{ method: "DELETE" },
+		),
 
 	// Global Skills
 	listGlobalSkills: () =>

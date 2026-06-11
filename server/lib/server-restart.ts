@@ -71,6 +71,10 @@ export function registerGracefulShutdownHandler(fn: GracefulShutdownFn): void {
  * The delay allows the current HTTP response to be flushed before the server stops.
  */
 export function scheduleServerRestart(newHost: string, newPort: number): void {
+	if (process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART === "1") {
+		logger.warn("Server restart suppressed for contract harness", { newHost, newPort });
+		return;
+	}
 	if (!_restartFn) {
 		logger.error("Server restart requested but no restart handler registered");
 		return;

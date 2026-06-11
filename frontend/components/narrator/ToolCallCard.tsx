@@ -244,6 +244,8 @@ export interface ToolCallData {
 	_longRunning?: boolean;
 	/** Real-time streaming output from bash tool (updated via WS tool_output events) */
 	_streamingOutput?: string;
+	/** Frontend promoted a complete streaming output into outputJson on completion */
+	_streamedFullOutput?: boolean;
 	/** Resolved model name for subagent tool calls (set via WS subagent_started event) */
 	_resolvedModel?: string;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
@@ -578,6 +580,18 @@ function resolveDisplayText(val: any): string {
 	// Structured output from tools like Read/Edit: { _text, _metadata }
 	if (typeof val._text === "string") return capToolCardDisplayText(val._text);
 	return stringifyToolCardJsonPreview(val);
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function resolveFullDisplayText(val: any): string | undefined {
+	if (val === null || val === undefined || isTruncated(val)) return undefined;
+	if (typeof val === "string") return val;
+	if (typeof val._text === "string") return val._text;
+	try {
+		return JSON.stringify(val, null, 2);
+	} catch {
+		return String(val);
+	}
 }
 
 function collectToolCardTextPreview(value: unknown): string {
@@ -2102,13 +2116,16 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const lang = fp ? getShikiLang(fp) : undefined;
 
 	// For Write tool, display the written content from input instead of the result prompt
+	const writeFullContent =
+		isWrite && !inputIsTruncated ? String(toolCall.inputJson?.content ?? "") : undefined;
 	const writeContent = isWrite
 		? inputIsTruncated
 			? extractField(toolCall.inputJson, "content") || toolCall.inputJson.preview
-			: (toolCall.inputJson?.content ?? "")
+			: capToolCardDisplayText(writeFullContent ?? "")
 		: "";
 
 	const editStreamingPreview = isEdit ? getStreamingEditPreview(toolCall.inputJson) : null;
@@ -2175,6 +2192,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					)}
 					<ContentViewer
 						content={writeContent}
+						fullContent={writeFullContent}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Write"}
 						language={lang}
@@ -2189,6 +2207,7 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 					<ContentViewer
 						content={outputText}
+						fullContent={outputFullText}
 						style={codeStyle}
 						title={fp ? basename(fp) : "Output"}
 						language={lang}
@@ -2283,6 +2302,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const isAwaitMode = awaitParam && typeof awaitParam === "object";
 	const cmd = isAwaitMode ? null : extractField(toolCall.inputJson, "command");
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const isRunning = toolCall.status === "running" && !toolCall.outputJson;
 	const streamingOutput = toolCall._streamingOutput;
@@ -2356,6 +2376,7 @@ function BashDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 					<ContentViewer
 						content={outputText}
+						fullContent={outputFullText}
 						style={termStyle}
 						title={cmd ? `$ ${cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd}` : "Shell"}
 					/>
@@ -2375,6 +2396,7 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const pattern = extractField(toolCall.inputJson, "pattern", "glob");
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const searchPath = extractField(toolCall.inputJson, "path");
 
@@ -2396,7 +2418,12 @@ function SearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt={4} mb={2}>
 						{t("output")}
 					</Text>
-					<ContentViewer content={outputText} style={codeStyle} title={pattern || "Search"} />
+					<ContentViewer
+						content={outputText}
+						fullContent={outputFullText}
+						style={codeStyle}
+						title={pattern || "Search"}
+					/>
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
@@ -2409,6 +2436,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const query = extractField(toolCall.inputJson, "query");
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const raw = resolveDisplayText(toolCall.outputJson);
+	const rawFull = resolveFullDisplayText(toolCall.outputJson);
 
 	// Try to parse structured search results from the output
 	const results = useMemo(() => {
@@ -2465,6 +2493,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 						</Text>
 						<ContentViewer
 							content={raw}
+							fullContent={rawFull}
 							style={codeStyle}
 							title={query || "Web Search"}
 							markdown
@@ -2490,6 +2519,7 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const selector = extractField(toolCall.inputJson, "selector");
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const raw = resolveDisplayText(toolCall.outputJson);
+	const rawFull = resolveFullDisplayText(toolCall.outputJson);
 
 	// Localize known error messages
 	const localizedError = useLocalizedToolError(toolCall.errorMessage);
@@ -2532,6 +2562,7 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 					<ContentViewer
 						content={raw}
+						fullContent={rawFull}
 						style={codeStyle}
 						title={fetchUrl || "WebFetch"}
 						markdown={mode === "smart" || mode === "readability"}
@@ -2578,6 +2609,7 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const action = extractField(toolCall.inputJson, "action");
 	const terminalId = extractField(toolCall.inputJson, "terminal_id");
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	if (action === "write") {
@@ -2620,7 +2652,12 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 				)}
 				{toolCall.outputJson && (
 					<>
-						<ContentViewer content={outputText} style={termStyle} title="Terminal Buffer" />
+						<ContentViewer
+							content={outputText}
+							fullContent={outputFullText}
+							style={termStyle}
+							title="Terminal Buffer"
+						/>
 						{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 					</>
 				)}
@@ -2637,7 +2674,12 @@ function TerminalDetail({ toolCall }: { toolCall: ToolCallData }) {
 	return (
 		<Box mt="xs">
 			{toolCall.outputJson && (
-				<ContentViewer content={outputText} style={codeStyle} title="Terminals" />
+				<ContentViewer
+					content={outputText}
+					fullContent={outputFullText}
+					style={codeStyle}
+					title="Terminals"
+				/>
 			)}
 			{toolCall.errorMessage && !toolCall.outputJson && (
 				<Text size="xs" c="red" mt={4}>
@@ -3181,6 +3223,7 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const selector = extractField(toolCall.inputJson, "selector");
 	const sessionId = extractField(toolCall.inputJson, "session_id");
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 	const previewUrl = meta?.previewUrl as string | undefined;
@@ -3246,6 +3289,7 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 				<>
 					<ContentViewer
 						content={outputText}
+						fullContent={outputFullText}
 						style={codeStyle}
 						title={selector || "DOM"}
 						language="html"
@@ -3255,7 +3299,12 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 			)}
 			{!isScreenshot && action !== "dom" && outputText && (
 				<>
-					<ContentViewer content={outputText} style={codeStyle} title={action || "Browser"} />
+					<ContentViewer
+						content={outputText}
+						fullContent={outputFullText}
+						style={codeStyle}
+						title={action || "Browser"}
+					/>
 					{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
 				</>
 			)}
@@ -3292,7 +3341,9 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 		extractField(input, "wait_for_text") || (metadata?.waitForText as string | undefined);
 	const timeout = !isTruncated(input) ? input?.timeout : undefined;
 	const rawOutput = resolveDisplayText(toolCall.outputJson);
+	const rawFullOutput = resolveFullDisplayText(toolCall.outputJson);
 	const { subagentId, text: strippedOutput } = stripSubagentIdTag(rawOutput);
+	const strippedFullOutput = rawFullOutput ? stripSubagentIdTag(rawFullOutput).text : undefined;
 	const effectiveSubagentId = (metadata?.subagentId as string | undefined) ?? subagentId;
 
 	return (
@@ -3336,10 +3387,16 @@ function AwaitDetail({ toolCall }: { toolCall: ToolCallData }) {
 						{awaitType === "bash" ? "Output" : "Result"}
 					</Text>
 					{awaitType === "bash" ? (
-						<ContentViewer content={strippedOutput} style={termStyle} title="Await output" />
+						<ContentViewer
+							content={strippedOutput}
+							fullContent={strippedFullOutput}
+							style={termStyle}
+							title="Await output"
+						/>
 					) : (
 						<ContentViewer
 							content={strippedOutput}
+							fullContent={strippedFullOutput}
 							style={codeStyle}
 							title="Await result"
 							markdown
@@ -3368,6 +3425,7 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const targets = getSendTargetLabels(input);
 	const message = isTruncated(input) ? input.preview : (input?.message ?? "");
 	const rawOutput = resolveDisplayText(toolCall.outputJson);
+	const rawFullOutput = resolveFullDisplayText(toolCall.outputJson);
 	const isAwait = !isTruncated(input) ? !!input?.await : !!metadata?.await;
 	const doInterrupt = !isTruncated(input) ? !!input?.doInterrupt : !!metadata?.doInterrupt;
 	const targetMeta = Array.isArray(metadata?.targets) ? metadata.targets : [];
@@ -3427,7 +3485,13 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mt="xs" mb={2}>
 						{isAwait ? "Reply" : "Result"}
 					</Text>
-					<ContentViewer content={rawOutput} style={codeStyle} title="Send result" markdown />
+					<ContentViewer
+						content={rawOutput}
+						fullContent={rawFullOutput}
+						style={codeStyle}
+						title="Send result"
+						markdown
+					/>
 				</>
 			)}
 		</Box>
@@ -3634,8 +3698,10 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const format = extractField(toolCall.inputJson, "format") || "sections";
 	const maxChars = extractNumericField(toolCall.inputJson, "maxChars");
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 	const parsed = !isStart && outputText ? parsePipelineResultOutput(outputText) : null;
+	const parsedFull = !isStart && outputFullText ? parsePipelineResultOutput(outputFullText) : null;
 	const capturedEntries = parsePipelineCaptures(parsed?.captured ?? "");
 	const parsedAliases = parsed?.aliases && parsed.aliases !== "(none)" ? parsed.aliases : "";
 	const aliasList = parsedAliases
@@ -3731,7 +3797,12 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mb={2}>
 						{t("pipelineOutput")}
 					</Text>
-					<ContentViewer content={parsed.body} style={termStyle} title={t("pipelineResult")} />
+					<ContentViewer
+						content={parsed.body}
+						fullContent={parsedFull?.body}
+						style={termStyle}
+						title={t("pipelineResult")}
+					/>
 				</Box>
 			)}
 			{!isFailed && !parsed && outputText && isStart && (
@@ -3744,7 +3815,12 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 					<Text size="xs" fw={500} mb={2}>
 						{t("pipelineOutput")}
 					</Text>
-					<ContentViewer content={outputText} style={termStyle} title={t("pipelineOutput")} />
+					<ContentViewer
+						content={outputText}
+						fullContent={outputFullText}
+						style={termStyle}
+						title={t("pipelineOutput")}
+					/>
 				</Box>
 			)}
 			{outputIsTruncated && <TruncatedBadge fullLength={toolCall.outputJson.fullLength} />}
@@ -3755,7 +3831,9 @@ function PipelineDetail({ toolCall }: { toolCall: ToolCallData }) {
 function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
 	const inputText = resolveDisplayText(toolCall.inputJson);
+	const inputFullText = resolveFullDisplayText(toolCall.inputJson);
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const inputIsTruncated = isTruncated(toolCall.inputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
@@ -3764,7 +3842,12 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 			<Text size="xs" fw={500} mb={2}>
 				{t("input")}
 			</Text>
-			<ContentViewer content={inputText} style={codeStyle} title={`${toolCall.toolName} Input`} />
+			<ContentViewer
+				content={inputText}
+				fullContent={inputFullText}
+				style={codeStyle}
+				title={`${toolCall.toolName} Input`}
+			/>
 			{inputIsTruncated && <TruncatedBadge fullLength={toolCall.inputJson.fullLength} />}
 			{toolCall.outputJson && (
 				<>
@@ -3773,6 +3856,7 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 					<ContentViewer
 						content={outputText}
+						fullContent={outputFullText}
 						style={codeStyle}
 						title={`${toolCall.toolName} Output`}
 					/>
@@ -4183,6 +4267,7 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
 	const isImage = meta?.isImage === true;
 	const outputText = resolveDisplayText(toolCall.outputJson);
+	const outputFullText = resolveFullDisplayText(toolCall.outputJson);
 	const outputIsTruncated = isTruncated(toolCall.outputJson);
 
 	// Image preview: fetch via /api/fs/preview (same pattern as Codex image generation)
@@ -4283,6 +4368,7 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 				<>
 					<ContentViewer
 						content={outputText}
+						fullContent={outputFullText}
 						style={codeStyle}
 						title={fp || "Read"}
 						language={fp ? getShikiLang(fp) : undefined}
@@ -4844,6 +4930,7 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.outputJson !== n.outputJson ||
 		p._longRunning !== n._longRunning ||
 		p._streamingOutput !== n._streamingOutput ||
+		p._streamedFullOutput !== n._streamedFullOutput ||
 		p._timeoutMs !== n._timeoutMs ||
 		p._metadata !== n._metadata ||
 		p.sideCars !== n.sideCars ||
@@ -4939,27 +5026,27 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.
 	const isFailed = toolCall.status === "fail";
 	const isDeniedPlan = isFailed && toolCall.toolName === "ExitPlanMode";
-	// When data is truncated (loaded from history), default to collapsed to avoid
-	// triggering expensive detail-fetch API calls. The card will expand if the user
-	// clicks it or if it was just streamed in (streaming cards go through
-	// _streamingChars → completed, so they never hit this path on first render).
+	const shouldAutoOpenNonTruncated =
+		cat === "todo" ||
+		cat === "share" ||
+		cat === "recall" ||
+		cat === "send" ||
+		cat === "pipeline" ||
+		(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
+		(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
+		(cat === "plan" && !isDeniedPlan) ||
+		isEdit ||
+		(isFailed && !isEdit && !isDeniedPlan);
+	// Truncated history/live-completed cards default to collapsed so mounting a message page
+	// does not fan out into one detail API request per long tool call. Permission prompts
+	// still open automatically because the user must act on them.
 	const defaultOpen =
-		// Edit tools should be expanded during streaming so the chevron shows the
-		// correct state and there's no collapse flash when streaming ends.
 		(isStreaming && isEdit) ||
 		(!isStreaming &&
 			(!!pendingPermission ||
 				toolCall.status === "pending" ||
-				cat === "todo" ||
-				cat === "share" ||
-				cat === "recall" ||
-				cat === "send" ||
-				cat === "pipeline" ||
-				(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
-				(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
-				(cat === "plan" && !isDeniedPlan) ||
-				(isEdit && !isTruncated) ||
-				(isFailed && !isEdit && !isDeniedPlan && !isTruncated)));
+				toolCall._streamedFullOutput === true ||
+				(!isTruncated && shouldAutoOpenNonTruncated)));
 	const [opened, setOpened] = useState(defaultOpen);
 
 	// Clamp plan card height to 85% of the nearest scroll container.
@@ -4970,6 +5057,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 	useEffect(() => {
 		if (pendingPermission || toolCall.status === "pending") setOpened(true);
 	}, [pendingPermission, toolCall.status]);
+
+	// If the final 2KB completion payload was replaced with complete live output,
+	// keep the already-open streaming card open across the completed-state transition.
+	useEffect(() => {
+		if (toolCall._streamedFullOutput) setOpened(true);
+	}, [toolCall._streamedFullOutput]);
 
 	// Auto-expand bash card when streaming output arrives.
 	// Uses a ref guard: only setOpened once per streaming-output lifecycle.

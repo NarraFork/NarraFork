@@ -34,6 +34,7 @@ export const DEFAULTS: NarraForkSettings = {
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		planReflectionAutoApprove: false,
+		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
 		questionReflectionTimeoutMs: 300_000,
 		dangerReflectionLevel: "standard",
@@ -275,6 +276,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "启用后，在允许编辑/全部允许模式下，ExitPlanMode 会先运行计划反思；反思确认后自动批准计划并跳过人工审批。",
 		type: "boolean",
 	},
+	"agent.planReflectionAllowAutoCompact": {
+		desc: "启用后，ExitPlanMode 计划反思可以选择自动批准并重置上下文，将计划写入 Conversation Context 后开始执行。默认关闭。",
+		type: "boolean",
+	},
 	"agent.questionReflectionEnabled": {
 		desc: "启用后，AskUserQuestion 在全部允许模式下等待超时仍未回答时，会自动运行 question reflection 并提交答案。",
 		type: "boolean",
@@ -285,7 +290,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "10000-3600000，默认 300000",
 	},
 	"agent.dangerReflectionLevel": {
-		desc: "全部允许模式下危险反思的全局档位：off 关闭；light 只拦截高风险/关键风险；standard 拦截中高风险；strict 拦截所有已分类风险。",
+		desc: "全部允许模式下危险反思的全局档位：off 关闭；light 只拦截明确危险操作，放行未知/未分类 Bash；standard 拦截中高风险；strict 拦截所有已分类风险。",
 		type: "off | light | standard | strict",
 	},
 	"agent.dangerReflectionEnabled": {
@@ -293,7 +298,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.dangerSkipReadOnlyConfirmations": {
-		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；Write 覆盖、删除、危险执行模式和环境注入仍会保留安全暂停。",
+		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；删除、明确危险执行模式、环境注入、无法分析/未分类 Bash 和外部写入等仍按当前档位判断。",
 		type: "boolean",
 	},
 	"agent.maxTransientRetries": {

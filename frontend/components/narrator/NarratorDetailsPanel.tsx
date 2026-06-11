@@ -21,7 +21,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowLeft, IconInfoCircle } from "@tabler/icons-react";
+import { IconArrowLeft, IconInfoCircle, IconRefresh } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -35,7 +35,9 @@ import {
 	useCmdWhitelist,
 	useNarrator,
 	useNarratorCustomTraits,
+	useNarratorSkills,
 	useNarratorUsageStats,
+	useRefreshNarratorSkills,
 	useUpdateCwd,
 	useUpdateDisabledTools,
 	useUpdateReflectionOverrides,
@@ -239,6 +241,8 @@ export function NarratorDetailsPanel({
 	const { data: blacklistDirs } = useBlacklistDirs(opened ? narratorId : "");
 	const { data: cmdWhitelist } = useCmdWhitelist(opened ? narratorId : "");
 	const { data: cmdBlacklist } = useCmdBlacklist(opened ? narratorId : "");
+	const { data: narratorSkills } = useNarratorSkills(narratorId, opened);
+	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
 	const resolvedModel =
 		narrator?.model && narrator.model !== FOLLOW_DEFAULT_MODEL
@@ -384,6 +388,19 @@ export function NarratorDetailsPanel({
 		return translated === key ? status : translated;
 	};
 
+	const formatSkillSource = (source?: string | null) => {
+		if (!source) return t("details.notAvailable");
+		const key = `details.skillSource_${source}`;
+		const translated = t(key);
+		return translated === key ? source : translated;
+	};
+
+	const skillSourceColor = (source?: string | null) => {
+		if (source === "workspace") return "cyan";
+		if (source === "project") return "teal";
+		return "violet";
+	};
+
 	useEffect(() => {
 		setCwdValue(String(narrator?.cwd ?? ""));
 		setCwdDirty(false);
@@ -426,6 +443,23 @@ export function NarratorDetailsPanel({
 			notifications.show({
 				title: t("details.cwdUpdateErrorTitle"),
 				message: error instanceof Error ? error.message : t("details.cwdUpdateError"),
+				color: "red",
+			});
+		}
+	};
+
+	const handleRefreshSkills = async () => {
+		try {
+			await refreshNarratorSkillsMutation.mutateAsync(narratorId);
+			notifications.show({
+				title: t("details.skillsRefreshedTitle"),
+				message: t("details.skillsRefreshed"),
+				color: "teal",
+			});
+		} catch (error) {
+			notifications.show({
+				title: t("details.skillsRefreshErrorTitle"),
+				message: error instanceof Error ? error.message : t("details.skillsRefreshError"),
 				color: "red",
 			});
 		}
@@ -621,6 +655,89 @@ export function NarratorDetailsPanel({
 							</Text>
 						}
 					/>
+				) : null}
+			</DetailSection>
+
+			<DetailSection title={t("details.skills")}>
+				<Group justify="space-between" align="flex-start" gap="sm">
+					<Text size="sm" c="dimmed" style={{ flex: 1 }}>
+						{t("details.skillsDescription", {
+							count: narratorSkills?.skills.length ?? 0,
+						})}
+					</Text>
+					<Button
+						size="xs"
+						variant="default"
+						leftSection={<IconRefresh size={14} />}
+						loading={refreshNarratorSkillsMutation.isPending}
+						onClick={handleRefreshSkills}
+					>
+						{t("details.refreshSkills")}
+					</Button>
+				</Group>
+				{narratorSkills?.skills.length ? (
+					<Stack gap="xs">
+						{narratorSkills.skills.map((skill) => (
+							<Paper key={`${skill.source}-${skill.location}`} withBorder p="xs" radius="sm">
+								<Group justify="space-between" align="flex-start" gap="xs" wrap="nowrap">
+									<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+										<Group gap="xs" wrap="nowrap">
+											<Text size="sm" fw={600} truncate>
+												{skill.name}
+											</Text>
+											<Badge size="xs" variant="light" color={skillSourceColor(skill.source)}>
+												{formatSkillSource(skill.source)}
+											</Badge>
+										</Group>
+										<Text size="xs" c="dimmed" lineClamp={2}>
+											{skill.description}
+										</Text>
+										<Tooltip label={skill.location} multiline>
+											<Text size="xs" ff="monospace" c="dimmed" truncate>
+												{skill.location}
+											</Text>
+										</Tooltip>
+									</Stack>
+								</Group>
+							</Paper>
+						))}
+					</Stack>
+				) : (
+					<Text size="sm" c="dimmed">
+						{t("details.noSkills")}
+					</Text>
+				)}
+				{narratorSkills?.roots.length ? (
+					<>
+						<Divider />
+						<Stack gap={4}>
+							<Text size="xs" fw={700} c="dimmed">
+								{t("details.skillRoots")}
+							</Text>
+							{narratorSkills.roots.map((root) => (
+								<Group
+									key={`${root.rootKind}-${root.normalizedRootPath}`}
+									justify="space-between"
+									gap="xs"
+									wrap="nowrap"
+								>
+									<Badge size="xs" variant="light" color={skillSourceColor(root.rootKind)}>
+										{formatSkillSource(root.rootKind)}
+									</Badge>
+									<Tooltip label={root.normalizedRootPath} multiline>
+										<Text size="xs" ff="monospace" truncate style={{ flex: 1 }}>
+											{root.normalizedRootPath}
+										</Text>
+									</Tooltip>
+									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+										{t("details.skillRootScanned", {
+											time: formatDateTime(root.scannedAt),
+										})}
+									</Text>
+								</Group>
+							))}
+						</Stack>
+					</>
 				) : null}
 			</DetailSection>
 

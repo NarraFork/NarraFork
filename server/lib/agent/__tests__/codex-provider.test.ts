@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { CodexProvider, isCodexProviderExpected101WebSocketFailure } from "../codex-provider";
-import { OpenAIProvider, supportsCodexImageGeneration } from "../openai-provider";
+import {
+	CODEX_IMAGE_GENERATION_PARTIAL_IMAGES,
+	OpenAIProvider,
+	supportsCodexImageGeneration,
+} from "../openai-provider";
 
 describe("CodexProvider Responses WebSocket handling", () => {
 	test("detects expected 101 errors from wrapped runtime events", () => {
@@ -95,6 +99,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		const toolsJson = JSON.stringify(request.tools);
 		expect(toolsJson).not.toContain('"type":"web_search"');
 		expect(toolsJson).toContain('"type":"image_generation"');
+		expect(toolsJson).toContain(`"partial_images":${CODEX_IMAGE_GENERATION_PARTIAL_IMAGES}`);
 	});
 
 	test("OpenAI codex mode does not inject image_generation when disabled", () => {
@@ -187,6 +192,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		const toolsJson = JSON.stringify(request.tools);
 		expect(toolsJson).not.toContain('"type":"web_search"');
 		expect(toolsJson).toContain('"type":"image_generation"');
+		expect(toolsJson).toContain(`"partial_images":${CODEX_IMAGE_GENERATION_PARTIAL_IMAGES}`);
 	});
 
 	test("buildResponsesWebSocketRequest does not inject image_generation for spark", () => {
@@ -273,5 +279,6 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		expect(inputJson).toContain('"type":"input_image"');
 		expect(inputJson).toContain('"image_url":"data:image/png;base64,');
 		expect(toolsJson).toContain('"type":"image_generation"');
+		expect(toolsJson).toContain(`"partial_images":${CODEX_IMAGE_GENERATION_PARTIAL_IMAGES}`);
 	});
 });

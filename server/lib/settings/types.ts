@@ -298,6 +298,8 @@ export interface NarraForkSettings {
 		defaultRelaxedPlan: boolean;
 		/** Let ExitPlanMode plan reflection auto-approve plans in edit-capable permission modes. */
 		planReflectionAutoApprove: boolean;
+		/** Allow ExitPlanMode plan reflection to auto-approve and reset context. */
+		planReflectionAllowAutoCompact: boolean;
 		/** Let AskUserQuestion auto-answer with reflection after a timeout in bypass-permissions mode. */
 		questionReflectionEnabled: boolean;
 		/** Timeout in milliseconds before AskUserQuestion auto-answer reflection runs. */

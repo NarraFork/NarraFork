@@ -1,5 +1,4 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
 import {
 	api,
 	type BlacklistCmd,
@@ -15,6 +14,7 @@ import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
 const NARRATOR_DETAIL_QUERY_GC_TIME_MS = 60_000;
+const TOOL_CALL_DETAIL_QUERY_GC_TIME_MS = 5 * 60_000;
 
 export function useNarrators(opts?: {
 	chapterId?: string;
@@ -398,23 +398,12 @@ export function useNarratorMessages(narratorId: string, around?: NarratorMessage
 }
 
 export function useToolCallDetail(narratorId: string, toolUseId: string, enabled: boolean) {
-	const qc = useQueryClient();
-
-	// When disabled (e.g. card collapsed), remove cached data to free memory.
-	useEffect(() => {
-		if (!enabled && narratorId && toolUseId) {
-			qc.removeQueries({
-				queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
-			});
-		}
-	}, [enabled, qc, narratorId, toolUseId]);
-
 	return useQuery({
 		queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
 		queryFn: () => api.getToolCallDetail(narratorId, toolUseId),
 		enabled: !!narratorId && !!toolUseId && enabled,
-		staleTime: 5 * 60 * 1000,
-		gcTime: 0,
+		staleTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
+		gcTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -807,6 +796,29 @@ export function useUpdateCwd() {
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrator-commands", vars.id] });
+			qc.invalidateQueries({ queryKey: ["narrator-skills", vars.id] });
+		},
+	});
+}
+
+export function useNarratorSkills(id: string, enabled = true) {
+	return useQuery({
+		queryKey: ["narrator-skills", id],
+		queryFn: () => api.getNarratorSkills(id),
+		enabled: !!id && enabled,
+		staleTime: 15_000,
+		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useRefreshNarratorSkills() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.getNarratorSkills(id, { refresh: true }),
+		onSuccess: (_data, id) => {
+			qc.setQueryData(["narrator-skills", id], _data);
+			qc.invalidateQueries({ queryKey: ["narrator-commands", id] });
 		},
 	});
 }

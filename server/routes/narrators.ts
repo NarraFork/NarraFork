@@ -164,6 +164,7 @@ import {
 	interruptNarrator,
 	isCompactInProgress,
 	isNarratorActive,
+	normalizeRollbackBlockIndexForMessage,
 	notifyRunningNarratorGoalStateChanged,
 	pushBufferedMessage,
 	removeBufferedMessage,
@@ -180,6 +181,7 @@ import {
 	startGoalContinuationIfPossible,
 	toBufferSummary,
 	updateActiveDisabledTools,
+	updateActiveNarratorCwdAndSkillContext,
 	updateBufferedMessage,
 	updateNarratorModel,
 	updateNarratorPermissionMode,
@@ -191,6 +193,7 @@ import {
 	resetActiveUpstreamSession,
 } from "../services/narrator-session-state";
 import { generateTitle, persistTitle } from "../services/narrator-title";
+import { skillService } from "../services/skill-service";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
@@ -595,6 +598,22 @@ narratorRoutes.get("/:id/commands", async (c) => {
 	const userId = c.get("user").sub;
 	const result = await getSlashMenuItems(id, userId);
 	return c.json(result);
+});
+
+// Get skills available to this narrator's current project/cwd context.
+narratorRoutes.get("/:id/skills", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id);
+	const refresh = c.req.query("refresh") === "true";
+	const context = await skillService.resolveSkillContextForNarrator(id);
+	const result = await skillService.loadSkillSummariesForContext(context, {
+		forceRefresh: refresh,
+	});
+	return c.json({
+		skills: result.skills.filter((skill) => !skill.disabled),
+		roots: result.roots,
+		scopeKey: result.scopeKey,
+	});
 });
 
 function customTraitsResponse(traits: unknown) {
@@ -1852,6 +1871,7 @@ narratorRoutes.patch("/:id/cwd", async (c) => {
 	}
 
 	await narratorService.updateCwd(id, cwd);
+	await updateActiveNarratorCwdAndSkillContext(id, cwd);
 
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
@@ -2721,7 +2741,7 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 
 	const targetMsg = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, messageId),
-		columns: { contentJson: true },
+		columns: { role: true, contentJson: true },
 	});
 	if (!targetMsg) return c.json({ error: "Message not found" }, 404);
 
@@ -2732,16 +2752,22 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 		return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
 	}
 
-	// Collect tool_use IDs from blocks after blockIndex in the target message
+	const effectiveBlockIndex = normalizeRollbackBlockIndexForMessage(
+		targetMsg.role,
+		blockIndex,
+		blocks.length,
+	);
+
+	// Collect tool_use IDs from blocks after the effective boundary in the target message
 	const truncatedToolUseIds: string[] = [];
-	for (let i = blockIndex + 1; i < blocks.length; i++) {
+	for (let i = effectiveBlockIndex + 1; i < blocks.length; i++) {
 		const b = blocks[i];
 		if (b.type === "tool_use" && b.id) {
 			truncatedToolUseIds.push(b.id);
 		}
 	}
 
-	const deletedBlockCount = blocks.length - blockIndex - 1;
+	const deletedBlockCount = blocks.length - effectiveBlockIndex - 1;
 
 	// Find tool calls from subsequent messages (seq > targetRef.seq)
 	const subsequentToolCalls = await db

@@ -22,6 +22,26 @@ export const projects = sqliteTable("projects", {
 	updatedAt: text("updated_at").notNull(),
 });
 
+// === skill_directory_caches ===
+export const skillDirectoryCaches = sqliteTable(
+	"skill_directory_caches",
+	{
+		id: text("id").primaryKey(),
+		rootKind: text("root_kind", { enum: ["global", "project", "workspace"] }).notNull(),
+		normalizedRootPath: text("normalized_root_path").notNull(),
+		skillsJson: text("skills_json", { mode: "json" }).notNull(),
+		signatureJson: text("signature_json", { mode: "json" }).notNull(),
+		scannedAt: text("scanned_at").notNull(),
+		lastAccessedAt: text("last_accessed_at").notNull(),
+		expiresAt: text("expires_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_skill_dir_cache_root").on(table.rootKind, table.normalizedRootPath),
+		index("idx_skill_dir_cache_last_accessed").on(table.lastAccessedAt),
+		index("idx_skill_dir_cache_expires").on(table.expiresAt),
+	],
+);
+
 // === exploration_groups ===
 export const explorationGroups = sqliteTable("exploration_groups", {
 	id: text("id").primaryKey(),

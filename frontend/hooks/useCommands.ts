@@ -12,7 +12,7 @@ export function useNarratorCommands(narratorId: string | undefined) {
 		queryKey: ["narrator-commands", narratorId],
 		queryFn: () => api.getNarratorCommands(narratorId as string),
 		enabled: !!narratorId,
-		staleTime: 30_000,
+		staleTime: 10_000,
 		gcTime: NARRATOR_COMMANDS_GC_TIME_MS,
 		select: (data): CommandItem[] => {
 			const commands: CommandItem[] = [

@@ -88,6 +88,65 @@ describe("shouldRefreshProjectGraphForEvent", () => {
 		).toBe(true);
 	});
 
+	test("refreshes merge lifecycle events for the current project", () => {
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:merged",
+				projectId: "project-1",
+				sourceId: "source",
+				targetId: "target",
+			}),
+		).toBe(true);
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:merged",
+				projectId: "project-2",
+				sourceId: "source",
+				targetId: "target",
+			}),
+		).toBe(false);
+	});
+
+	test("refreshes batch merge completion progress for the current project", () => {
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "merge:completed",
+				projectId: "project-1",
+				mergeSessionId: "merge-session-1",
+				targetChapterId: "target",
+				mergedCount: 2,
+			}),
+		).toBe(true);
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "merge:completed",
+				projectId: "project-2",
+				mergeSessionId: "merge-session-2",
+				targetChapterId: "target",
+				mergedCount: 2,
+			}),
+		).toBe(false);
+	});
+
+	test("refreshes unmerge wake lifecycle events for the current project", () => {
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:woken",
+				projectId: "project-1",
+				chapterId: "source",
+				mergeCommitSha: "merge-sha",
+			}),
+		).toBe(true);
+		expect(
+			shouldRefreshProjectGraphForEvent("project-1", {
+				type: "chapter:woken",
+				projectId: "project-2",
+				chapterId: "source",
+				mergeCommitSha: "merge-sha",
+			}),
+		).toBe(false);
+	});
+
 	test("ignores unrelated WS events", () => {
 		expect(
 			shouldRefreshProjectGraphForEvent("project-1", {

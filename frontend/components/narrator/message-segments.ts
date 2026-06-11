@@ -453,6 +453,11 @@ export type StreamingBlock =
 			status: string;
 			revisedPrompt?: string;
 			result?: string;
+			partialImageIndex?: number;
+			partialSavedPath?: string;
+			savedPath?: string;
+			width?: number;
+			height?: number;
 			outputIndex?: number;
 	  }
 	| { type: "text"; text: string; outputIndex?: number };
@@ -498,6 +503,11 @@ export function buildStreamingMsg(opts: {
 					status: sb.status,
 					revisedPrompt: sb.revisedPrompt,
 					result: sb.result,
+					partialImageIndex: sb.partialImageIndex,
+					partialSavedPath: sb.partialSavedPath,
+					savedPath: sb.savedPath,
+					width: sb.width,
+					height: sb.height,
 				} as ContentBlock);
 			} else if (sb.type === "text") {
 				blocks.push({

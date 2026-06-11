@@ -3,6 +3,7 @@ import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition } from "../types";
 
 export const EXIT_PLAN_CONFIRM_TOOL_NAME = "ExitPlanConfirm";
+export const EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME = "ExitPlanConfirmAndCompact";
 export const EXIT_PLAN_REVISE_TOOL_NAME = "ExitPlanRevise";
 export const EXIT_PLAN_REFLECTION_TOOLS = new Set([
 	EXIT_PLAN_CONFIRM_TOOL_NAME,
@@ -19,6 +20,7 @@ export type PlanReflectionStatus =
 
 export type ExitPlanReflectionDecision =
 	| { action: "confirm"; reflection?: string }
+	| { action: "confirm_compact"; reflection?: string }
 	| { action: "revise"; feedback: string };
 
 interface ExitPlanReflectionMeta {
@@ -55,6 +57,7 @@ function planReflectionSuggestions(
 	pending: Pick<ExitPlanReflectionPending, "requestId" | "startedAt">,
 	status: PlanReflectionStatus,
 	reason?: string,
+	compactAfter?: boolean,
 ) {
 	return [
 		{
@@ -66,6 +69,7 @@ function planReflectionSuggestions(
 				? { resolvedAt: new Date().toISOString() }
 				: {}),
 			...(reason ? { reason } : {}),
+			...(compactAfter ? { compactAfter: true } : {}),
 		},
 	];
 }
@@ -115,6 +119,7 @@ async function markExitPlanReflectionStatus(
 	pending: ExitPlanReflectionPending,
 	status: PlanReflectionStatus,
 	reason?: string,
+	compactAfter?: boolean,
 ): Promise<void> {
 	const message = statusReason(status, reason);
 	try {
@@ -134,7 +139,7 @@ async function markExitPlanReflectionStatus(
 								: "fail",
 					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
-					permissionSuggestions: planReflectionSuggestions(pending, status, message),
+					permissionSuggestions: planReflectionSuggestions(pending, status, message, compactAfter),
 					...(status !== "running" && status !== "awaiting_user"
 						? { permissionDecidedAt: new Date().toISOString() }
 						: {}),
@@ -231,7 +236,12 @@ async function resolveExitPlanReflection(
 	const pending = pendingExitPlanReflections.get(requestId);
 	if (!pending || pending.resolved || pending.reflectionStoppedByUser) return false;
 	pending.resolved = true;
-	await markExitPlanReflectionStatus(pending, status, reason);
+	await markExitPlanReflectionStatus(
+		pending,
+		status,
+		reason,
+		decision.action === "confirm_compact",
+	);
 	pendingExitPlanReflections.delete(requestId);
 	pending.resolve(decision);
 	return true;
@@ -246,6 +256,21 @@ export async function confirmExitPlanReflection(
 		{ action: "confirm", reflection },
 		"confirmed",
 		reflection,
+	);
+}
+
+export async function confirmAndCompactExitPlanReflection(
+	requestId: string,
+	reflection?: string,
+): Promise<boolean> {
+	const message =
+		reflection?.trim() ||
+		"Plan reflection confirmed the plan and requested a context reset before execution.";
+	return resolveExitPlanReflection(
+		requestId,
+		{ action: "confirm_compact", reflection: message },
+		"confirmed",
+		message,
 	);
 }
 
@@ -310,6 +335,42 @@ export const exitPlanConfirmTool: ToolDefinition = {
 		return {
 			output: ok
 				? "ExitPlanMode reflection confirmed. The plan will now be submitted for user approval."
+				: "The ExitPlanMode reflection was already resolved by another decision path.",
+			isError: !ok,
+		};
+	},
+};
+
+export const exitPlanConfirmAndCompactTool: ToolDefinition = {
+	name: EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
+	reflectionOnly: true,
+	description:
+		"Confirm that the ExitPlanMode plan is ready and should be approved with a context reset. " +
+		"Use this only when the plan contains enough detail to continue safely after clearing prior conversation context.",
+	parameters: z.object({
+		confirm: z.literal(true).describe("Must be true to confirm and reset context."),
+		reflection: z
+			.string()
+			.optional()
+			.describe(
+				"Brief explanation of why the plan is ready and safe to execute after a context reset.",
+			),
+	}),
+	execute: async (args, ctx) => {
+		const requestId = getActiveExitPlanReflectionRequestId(ctx);
+		if (!requestId) {
+			return {
+				output: "No ExitPlanMode reflection is active for this reflection loop.",
+				isError: true,
+			};
+		}
+		const ok = await confirmAndCompactExitPlanReflection(
+			requestId,
+			typeof args.reflection === "string" ? args.reflection : undefined,
+		);
+		return {
+			output: ok
+				? "ExitPlanMode reflection confirmed. The plan will be approved and context will be reset before execution."
 				: "The ExitPlanMode reflection was already resolved by another decision path.",
 			isError: !ok,
 		};

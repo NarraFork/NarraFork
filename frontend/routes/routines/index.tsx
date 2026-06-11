@@ -34,6 +34,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
+import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
 import {
 	type CustomSubagentDef,
 	useCreateCustomSubagent,
@@ -78,7 +79,6 @@ import {
 	useDeleteGlobalSkill,
 	useGlobalSkills,
 	useGlobalSkillsRefresh,
-	useSkills,
 	useToggleGlobalSkill,
 	useUpdateGlobalSkill,
 } from "../../hooks/useSkills";
@@ -1487,13 +1487,6 @@ function ProjectSkillsTab() {
 		: (skillsCapability.reason ?? t("projectSkillsUnsupportedDesc"));
 	const { data: projects } = useProjects();
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-	const { data: skills, isLoading } = useSkills(
-		selectedProjectId ?? "",
-		!!selectedProjectId && skillsCapability.supported,
-	);
-	const { data: globalSkills } = useGlobalSkills(skillsCapability.supported);
-
-	const globalNames = new Set(globalSkills?.map((s) => s.name) ?? []);
 
 	const projectOptions =
 		projects?.map((p: { id: string; name: string }) => ({
@@ -1527,48 +1520,13 @@ function ProjectSkillsTab() {
 				</Text>
 			)}
 
-			{selectedProjectId && isLoading && (
-				<Text size="sm" c="dimmed">
-					Loading...
-				</Text>
+			{selectedProjectId && (
+				<ProjectSkillsManager
+					projectId={selectedProjectId}
+					enabled={skillsCapability.supported}
+					disabledReason={skillsUnsupportedReason}
+				/>
 			)}
-
-			{selectedProjectId && !isLoading && (!skills || skills.length === 0) && (
-				<Text size="sm" c="dimmed">
-					{t("noProjectSkills")}
-				</Text>
-			)}
-
-			{skills?.map((skill) => {
-				const source = getSourceLabel(skill.location);
-				const overridesGlobal = globalNames.has(skill.name);
-				return (
-					<Paper key={skill.name} withBorder p="sm">
-						<div style={{ minWidth: 0 }}>
-							<Group gap="xs">
-								<Text size="sm" fw={600}>
-									{skill.name}
-								</Text>
-								<Badge size="xs" variant="light" color={getSourceColor(source)}>
-									{source}
-								</Badge>
-								{overridesGlobal && (
-									<Badge size="xs" variant="outline" color="yellow">
-										{t("overriddenByProject")}
-									</Badge>
-								)}
-							</Group>
-							<Text size="xs" c="dimmed" truncate="end">
-								{formatRoutineTextPreview(skill.description, MAX_ROUTINE_LIST_TEXT_PREVIEW_CHARS)}
-							</Text>
-
-							<Text size="xs" c="dimmed" truncate="end" mt={2}>
-								{skill.location}
-							</Text>
-						</div>
-					</Paper>
-				);
-			})}
 		</Stack>
 	);
 }

@@ -570,16 +570,16 @@ function SettingsProvidersPage() {
 
 		return [...byPrefix].map(([prefix, models]) => {
 			const isPlatform = platformPrefixes.has(prefix);
-			const disabled = state.disabledProviders.has(prefix);
 
-			// Find provider ID for multi-instance providers
-			let providerId: string | undefined;
-			if (!isPlatform) {
-				const match =
-					state.customApiProviders.find((p) => p.prefix === prefix) ??
-					state.nugProviders.find((p) => p.prefix === prefix);
-				providerId = match?.id;
-			}
+			// Find provider config for multi-instance providers so local detail toggles
+			// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
+			const match = !isPlatform
+				? (state.customApiProviders.find((p) => p.prefix === prefix) ??
+					state.nugProviders.find((p) => p.prefix === prefix))
+				: undefined;
+			const providerId = match?.id;
+			const disabled = state.disabledProviders.has(prefix) || !!match?.disabled;
+
 			return {
 				prefix,
 				providerId,

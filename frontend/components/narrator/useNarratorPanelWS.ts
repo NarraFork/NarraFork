@@ -360,6 +360,35 @@ interface ToolOutputPreviewState {
 	timer: ReturnType<typeof setTimeout> | null;
 }
 
+interface TruncatedToolOutput {
+	_truncated: true;
+	preview: string;
+	fullLength: number;
+}
+
+function isTruncatedToolOutput(value: unknown): value is TruncatedToolOutput {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { _truncated?: unknown })._truncated === true &&
+		typeof (value as { preview?: unknown }).preview === "string" &&
+		typeof (value as { fullLength?: unknown }).fullLength === "number"
+	);
+}
+
+function preserveCompleteStreamedOutput(
+	completedOutput: unknown,
+	streamedOutput?: string,
+): { output: unknown; preserved: boolean } {
+	if (!isTruncatedToolOutput(completedOutput) || typeof streamedOutput !== "string") {
+		return { output: completedOutput, preserved: false };
+	}
+	if (streamedOutput.length < completedOutput.fullLength) {
+		return { output: completedOutput, preserved: false };
+	}
+	return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
+}
+
 function appendStreamingTextPreview(current: string, delta: string): string {
 	const next = current + delta;
 	if (next.length <= STREAMING_TEXT_PREVIEW_MAX_CHARS) return next;
@@ -943,6 +972,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._metadata && { _metadata: ext._metadata }),
 						...(chunk.metadata && { _metadata: chunk.metadata }),
 						...(ext._longRunning && { _longRunning: true }),
+						...(ext._streamedFullOutput && { _streamedFullOutput: true }),
 
 						...(ext._streamingOutput && { _streamingOutput: ext._streamingOutput }),
 					};
@@ -1603,7 +1633,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string,
 				sideCars?: SideCarRecord[],
 			) => {
-				// Discard any pending RAF chunk/output preview and accumulated raw input for this tool
+				const streamedOutput = toolOutputPreviewRef.current.get(toolUseId)?.preview;
+				const completedOutput = preserveCompleteStreamedOutput(output, streamedOutput);
+
+				// Discard any pending RAF chunk/output preview and accumulated raw input for this tool.
+				// Read streamedOutput before this cleanup so a complete live response can be promoted
+				// into the persisted frontend cache instead of being replaced by a 2KB final preview.
 				pendingToolChunkRef.current.delete(toolUseId);
 				toolStreamingFieldRef.current.delete(toolUseId);
 				clearToolOutputPreviewState(toolUseId);
@@ -1621,11 +1656,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 							_input: updatedInput ?? (streamingEntry as any)._input,
 							_status: status,
-							_output: output,
+							_output: completedOutput.output,
 							_durationMs: durationMs,
 							_metadata: metadata,
 							_sideCars: sideCars,
 							_streamingOutput: undefined,
+							_streamedFullOutput: completedOutput.preserved || undefined,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
 						bumpTopLevelStreamingChunksVersion((v) => v + 1);
@@ -1638,14 +1674,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						old,
 						toolUseId,
 						status,
-						output,
+						completedOutput.output,
 						toolUseIndexRef.current,
 						durationMs,
 					);
 					result = mergeFieldsByIndex(
 						result,
 						toolUseId,
-						{ _streamingOutput: undefined },
+						{
+							_streamingOutput: undefined,
+							...(completedOutput.preserved && { _streamedFullOutput: true }),
+						},
 						toolUseIndexRef.current,
 					);
 					if (updatedInput && result) {
@@ -2650,7 +2689,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 				flushStreamingVersion();
 			},
-			onImageGeneration: (id, status, revisedPrompt, outputIndex, parentToolUseId) => {
+			onImageGeneration: (
+				id,
+				status,
+				revisedPrompt,
+				outputIndex,
+				partialImageIndex,
+				partialSavedPath,
+				savedPath,
+				width,
+				height,
+				parentToolUseId,
+			) => {
 				// Subagent native image generation events should stay out of the parent's
 				// top-level streaming message; the subagent page receives an unlinked copy.
 				if (parentToolUseId) return;
@@ -2662,6 +2712,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						existing.status = status;
 						if (revisedPrompt) existing.revisedPrompt = revisedPrompt;
 						if (outputIndex != null) existing.outputIndex = outputIndex;
+						if (partialImageIndex != null) existing.partialImageIndex = partialImageIndex;
+						if (partialSavedPath) existing.partialSavedPath = partialSavedPath;
+						if (savedPath) existing.savedPath = savedPath;
+						if (width != null && height != null) {
+							existing.width = width;
+							existing.height = height;
+						}
 					}
 				} else {
 					blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
@@ -2669,6 +2726,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						id,
 						status,
 						revisedPrompt,
+						...(partialImageIndex != null ? { partialImageIndex } : {}),
+						...(partialSavedPath ? { partialSavedPath } : {}),
+						...(savedPath ? { savedPath } : {}),
+						...(width != null && height != null ? { width, height } : {}),
 						...(outputIndex != null ? { outputIndex } : {}),
 					});
 				}

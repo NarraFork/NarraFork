@@ -220,6 +220,7 @@ const updateSettingsSchema = z
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
+				planReflectionAllowAutoCompact: z.boolean(),
 				questionReflectionEnabled: z.boolean(),
 				questionReflectionTimeoutMs: z.number().int().min(10000).max(3600000),
 				dangerReflectionLevel: dangerReflectionLevelSchema,
@@ -485,6 +486,68 @@ function checkSummaryModelAvailable(summaryModel: string): boolean {
 	}
 }
 
+function buildSettingsResponse(
+	source: NarraForkSettings,
+	extra?: { serverRestarting?: boolean; newUrl?: string },
+) {
+	const codexManager = getCodexManager();
+	return {
+		...source,
+		// Mask TLS passphrase
+		server: {
+			...source.server,
+			tls: source.server.tls
+				? {
+						...source.server.tls,
+						passphrase: source.server.tls.passphrase ? "********" : undefined,
+					}
+				: undefined,
+		},
+		auth: { ...source.auth, jwtSecret: undefined },
+		// Multi-provider — mask all keys
+		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		openaiProviders: (source.openaiProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		anthropicProviders: (source.anthropicProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		nugProviders: (source.nugProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
+		})),
+		clineProviders: (source.clineProviders ?? []).map((p) => ({
+			...p,
+			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
+		})),
+		vnet: maskVNetSettings(source.vnet),
+		openaiModels: getOpenaiCachedModels(),
+		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
+		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
+		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
+		clineModelsGrouped: getClineEnabledModelsGrouped(),
+		customApiQuotas: getAllCustomApiCachedQuotas(),
+		codexAvailable: codexManager.snapshot().available > 0,
+		codexModels: getBuiltinCodexModels(),
+		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
+		lanAddresses: getLanAddresses(),
+		summaryModelAvailable: checkSummaryModelAvailable(source.agent.summaryModel),
+		...(extra?.serverRestarting && {
+			serverRestarting: true,
+			newUrl: extra.newUrl,
+		}),
+	};
+}
+
 /** Return IDs present in `oldList` but absent from `newList`. */
 function getRemovedProviderIds(
 	oldList: { id: string }[] | undefined,
@@ -646,57 +709,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 }
 
 settingsRoutes.get("/", (c) => {
-	const s = settings;
-	const codexManager = getCodexManager();
-	const result = {
-		...s,
-		// Mask TLS passphrase
-		server: {
-			...s.server,
-			tls: s.server.tls
-				? { ...s.server.tls, passphrase: s.server.tls.passphrase ? "********" : undefined }
-				: undefined,
-		},
-		auth: { ...s.auth, jwtSecret: undefined },
-		// Multi-provider — mask all keys
-		customApiProviders: (s.customApiProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		openaiProviders: (s.openaiProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		anthropicProviders: (s.anthropicProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		nugProviders: (s.nugProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
-		})),
-		clineProviders: (s.clineProviders ?? []).map((p) => ({
-			...p,
-			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
-		})),
-		vnet: maskVNetSettings(s.vnet),
-		openaiModels: getOpenaiCachedModels(),
-		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
-		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
-		nugModelsGrouped: getNugCachedModelsGrouped(s.nugProviders ?? []),
-		clineModelsGrouped: getClineEnabledModelsGrouped(),
-		customApiQuotas: getAllCustomApiCachedQuotas(),
-		codexAvailable: codexManager.snapshot().available > 0,
-		codexModels: getBuiltinCodexModels(),
-		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
-		lanAddresses: getLanAddresses(),
-		summaryModelAvailable: checkSummaryModelAvailable(s.agent.summaryModel),
-	};
-	return c.json(result);
+	return c.json(buildSettingsResponse(settings));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -993,52 +1006,18 @@ settingsRoutes.patch("/", async (c) => {
 		scheduleServerRestart(newHost, newPort);
 	}
 
-	// Mask sensitive fields before returning (same logic as GET)
-	const result = {
-		...merged,
-		// Mask TLS passphrase
-		server: {
-			...merged.server,
-			tls: merged.server.tls
-				? {
-						...merged.server.tls,
-						passphrase: merged.server.tls.passphrase ? "********" : undefined,
-					}
-				: undefined,
-		},
-		auth: { ...merged.auth, jwtSecret: undefined },
-		customApiProviders: (merged.customApiProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		openaiProviders: (merged.openaiProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		anthropicProviders: (merged.anthropicProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
-		nugProviders: (merged.nugProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
-		})),
-		clineProviders: (merged.clineProviders ?? []).map((p) => ({
-			...p,
-			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
-		})),
-		vnet: maskVNetSettings(merged.vnet),
-		// Signal to the frontend that the server is restarting at a new address
-		...(needsRestart && {
-			serverRestarting: true,
-			newUrl: `${newTls?.enabled ? "https" : "http"}://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
+	const newUrl = needsRestart
+		? `${newTls?.enabled ? "https" : "http"}://${
+				newHost === "0.0.0.0" ? "localhost" : newHost
+			}:${newPort}`
+		: undefined;
+
+	return c.json(
+		buildSettingsResponse(merged, {
+			serverRestarting: needsRestart,
+			newUrl,
 		}),
-	};
-	return c.json(result);
+	);
 });
 
 // Generate a self-signed TLS certificate and enable HTTPS

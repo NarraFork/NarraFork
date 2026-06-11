@@ -79,6 +79,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
+	type SetStateAction,
 	Suspense,
 	startTransition,
 	useCallback,
@@ -181,6 +182,11 @@ import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import {
+	clearDraftImageAttachments,
+	loadDraftImageAttachments,
+	saveDraftImageAttachments,
+} from "./draft-image-attachments";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	COMPACTING_MARKER_ATTR,
@@ -2705,9 +2711,95 @@ export function NarratorPanel({
 		};
 	}, [appendInputRef]);
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
+	const attachedImagesRef = useRef<File[]>(attachedImages);
+	attachedImagesRef.current = attachedImages;
+	const imageDraftHydratedNarratorIdRef = useRef<string | null>(null);
+	const imageDraftSaveSeqRef = useRef(0);
+	const imageDraftLocalVersionRef = useRef(0);
 	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
+	const warnDraftImagesPersistenceFailure = useCallback((action: string, err: unknown) => {
+		if (import.meta.env.DEV) {
+			console.warn(`[NarratorPanel] Failed to ${action} draft images:`, err);
+		}
+	}, []);
+	const updateAttachedImages = useCallback((next: SetStateAction<File[]>) => {
+		imageDraftLocalVersionRef.current++;
+		setAttachedImages((prev) => {
+			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
+			attachedImagesRef.current = resolved;
+			return resolved;
+		});
+	}, []);
+	const persistCurrentDraftImages = useCallback(
+		(targetNarratorId: string) => {
+			const seq = ++imageDraftSaveSeqRef.current;
+			void saveDraftImageAttachments(targetNarratorId, attachedImagesRef.current).catch((err) => {
+				if (seq === imageDraftSaveSeqRef.current) {
+					warnDraftImagesPersistenceFailure("save", err);
+				}
+			});
+		},
+		[warnDraftImagesPersistenceFailure],
+	);
+	const clearAttachedImagesAndDraft = useCallback(() => {
+		imageDraftLocalVersionRef.current++;
+		attachedImagesRef.current = [];
+		setAttachedImages([]);
+		const seq = ++imageDraftSaveSeqRef.current;
+		void clearDraftImageAttachments(narratorId).catch((err) => {
+			if (seq === imageDraftSaveSeqRef.current) {
+				warnDraftImagesPersistenceFailure("clear", err);
+			}
+		});
+	}, [narratorId, warnDraftImagesPersistenceFailure]);
+
+	useEffect(() => {
+		let cancelled = false;
+		const localVersionAtRequest = imageDraftLocalVersionRef.current;
+		imageDraftHydratedNarratorIdRef.current = null;
+		attachedImagesRef.current = [];
+		setAttachedImages([]);
+
+		const persistLocalChanges = () => {
+			if (imageDraftLocalVersionRef.current !== localVersionAtRequest) {
+				persistCurrentDraftImages(narratorId);
+			}
+		};
+
+		void loadDraftImageAttachments(narratorId)
+			.then((files) => {
+				if (cancelled) return;
+				imageDraftHydratedNarratorIdRef.current = narratorId;
+				if (imageDraftLocalVersionRef.current === localVersionAtRequest) {
+					attachedImagesRef.current = files;
+					setAttachedImages(files);
+				} else {
+					persistLocalChanges();
+				}
+			})
+			.catch((err) => {
+				if (cancelled) return;
+				warnDraftImagesPersistenceFailure("load", err);
+				imageDraftHydratedNarratorIdRef.current = narratorId;
+				persistLocalChanges();
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [narratorId, persistCurrentDraftImages, warnDraftImagesPersistenceFailure]);
+
+	useEffect(() => {
+		if (imageDraftHydratedNarratorIdRef.current !== narratorId) return;
+		const seq = ++imageDraftSaveSeqRef.current;
+		void saveDraftImageAttachments(narratorId, attachedImages).catch((err) => {
+			if (seq === imageDraftSaveSeqRef.current) {
+				warnDraftImagesPersistenceFailure("save", err);
+			}
+		});
+	}, [attachedImages, narratorId, warnDraftImagesPersistenceFailure]);
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -5876,7 +5968,7 @@ export function NarratorPanel({
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		clearInputAndDraft();
-		setAttachedImages([]);
+		clearAttachedImagesAndDraft();
 		setAttachedTextFiles([]);
 		try {
 			const result = await api.sendNarratorMessage(
@@ -5896,7 +5988,7 @@ export function NarratorPanel({
 		} catch (err) {
 			// Restore input and attachments on error
 			setInput(msg);
-			if (images.length > 0) setAttachedImages(images);
+			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) setAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
 		}
@@ -5922,7 +6014,7 @@ export function NarratorPanel({
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
 				clearInputAndDraft();
-				setAttachedImages([]);
+				clearAttachedImagesAndDraft();
 				setAttachedTextFiles([]);
 
 				const currentCwd =
@@ -5967,13 +6059,13 @@ export function NarratorPanel({
 			const images = [...attachedImages];
 			const textFiles = [...attachedTextFiles];
 			clearInputAndDraft();
-			setAttachedImages([]);
+			clearAttachedImagesAndDraft();
 			setAttachedTextFiles([]);
 			await submitMessage(msg, images, textFiles);
 		} catch (err) {
 			if (restoreOnError) {
 				setInput(restoreOnError.msg);
-				if (restoreOnError.images.length > 0) setAttachedImages(restoreOnError.images);
+				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) setAttachedTextFiles(restoreOnError.textFiles);
 			}
 			notifications.show({
@@ -6245,7 +6337,7 @@ export function NarratorPanel({
 				processed.push(f); // fallback to original on error
 			}
 		}
-		setAttachedImages((prev) => [...prev, ...processed]);
+		updateAttachedImages((prev) => [...prev, ...processed]);
 	};
 
 	const addTextFiles = (files: File[]) => {
@@ -7583,7 +7675,7 @@ export function NarratorPanel({
 										variant="filled"
 										color="dark"
 										style={{ position: "absolute", top: -6, right: -6 }}
-										onClick={() => setAttachedImages((prev) => prev.filter((_, j) => j !== i))}
+										onClick={() => updateAttachedImages((prev) => prev.filter((_, j) => j !== i))}
 										title={t("removeImage")}
 									/>
 								</Box>

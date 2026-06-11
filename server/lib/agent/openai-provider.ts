@@ -121,6 +121,7 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 
 type CodexInputModality = "text" | "image";
 
+export const CODEX_IMAGE_GENERATION_PARTIAL_IMAGES = 2;
 const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
 
 const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
@@ -152,6 +153,18 @@ function removeNativeTool(tools: unknown[], type: string): void {
 	}
 }
 
+function applyCodexImageGenerationDefaults(tools: unknown[]): void {
+	for (const tool of tools) {
+		if (!tool || typeof tool !== "object") continue;
+		const record = tool as Record<string, unknown>;
+		if (record.type !== "image_generation") continue;
+		if (record.output_format === undefined) record.output_format = "png";
+		if (record.partial_images === undefined) {
+			record.partial_images = CODEX_IMAGE_GENERATION_PARTIAL_IMAGES;
+		}
+	}
+}
+
 export function supportsCodexImageGeneration(model: string): boolean {
 	const bareModel = parseModelId(model).model;
 	const inputModalities = CODEX_MODEL_INPUT_MODALITIES[bareModel] ?? DEFAULT_CODEX_INPUT_MODALITIES;
@@ -172,9 +185,16 @@ export function appendCodexNativeTools(
 		removeNativeTool(tools, "image_generation");
 		return;
 	}
-	if (supportsCodexImageGeneration(model) && !hasNativeTool(tools, "image_generation")) {
-		tools.push({ type: "image_generation", output_format: "png" });
+	if (!supportsCodexImageGeneration(model)) return;
+	if (!hasNativeTool(tools, "image_generation")) {
+		tools.push({
+			type: "image_generation",
+			output_format: "png",
+			partial_images: CODEX_IMAGE_GENERATION_PARTIAL_IMAGES,
+		});
+		return;
 	}
+	applyCodexImageGenerationDefaults(tools);
 }
 
 export function normalizeCodexReasoningEffort(
@@ -1545,6 +1565,10 @@ export interface ResponsesAPIChunk {
 	content_index?: number;
 	/** Present on reasoning_summary_text.delta / reasoning_summary_part.added */
 	summary_index?: number;
+	/** Present on response.image_generation_call.partial_image events. */
+	partial_image_index?: number;
+	partial_image_b64?: string;
+	sequence_number?: number;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic API response
 	response?: any;
 }
@@ -1755,12 +1779,13 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 	if (type === "response.image_generation_call.partial_image") {
-		// Partial image events — treat as still generating
 		results.push({
 			imageGeneration: {
 				id: chunk.item_id ?? "",
 				status: "generating",
 				outputIndex: chunk.output_index,
+				partialImageIndex: chunk.partial_image_index,
+				partialImageB64: chunk.partial_image_b64,
 			},
 		});
 		return results;

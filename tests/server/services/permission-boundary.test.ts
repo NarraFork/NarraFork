@@ -956,6 +956,29 @@ describe("classifyDanger", () => {
 		expect(result?.severity).toBe("high");
 	});
 
+	test("light danger reflection skips unclassified shell execution patterns", () => {
+		const analysis = makeBashAnalysis({
+			commands: [
+				{
+					tokens: ["./scripts/local-task.sh"],
+					text: "./scripts/local-task.sh",
+					fullText: "./scripts/local-task.sh",
+				},
+			],
+			allWhitelisted: false,
+			nonWhitelisted: ["./scripts/local-task.sh"],
+			dangerousPatterns: ["path execution: ./scripts/local-task.sh"],
+		});
+
+		const result = classifyDanger("Bash", { command: "./scripts/local-task.sh" }, CWD, analysis);
+
+		expect(result?.summary).toContain("unclassified execution patterns");
+		expect(result?.severity).toBe("medium");
+		if (!result) throw new Error("Expected medium-severity danger");
+		expect(shouldTriggerDangerReflection(result, "light")).toBe(false);
+		expect(shouldTriggerDangerReflection(result, "standard")).toBe(true);
+	});
+
 	test("chapter git issues trigger danger reflection classification", () => {
 		const analysis = makeBashAnalysis({
 			commands: [

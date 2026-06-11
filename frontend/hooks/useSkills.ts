@@ -21,6 +21,59 @@ export function useSkill(projectId: string, name: string, enabled = true) {
 	});
 }
 
+export function useCreateProjectSkill(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data: { name: string; description: string; content: string }) =>
+			api.createProjectSkill(projectId, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["skills", projectId] });
+		},
+	});
+}
+
+export function useUpdateProjectSkill(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			currentName,
+			...data
+		}: {
+			currentName: string;
+			name: string;
+			description: string;
+			content: string;
+		}) => api.updateProjectSkill(projectId, currentName, data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["skills", projectId] });
+			qc.invalidateQueries({ queryKey: ["skill", projectId] });
+		},
+	});
+}
+
+export function useDeleteProjectSkill(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (name: string) => api.deleteProjectSkill(projectId, name),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["skills", projectId] });
+			qc.invalidateQueries({ queryKey: ["skill", projectId] });
+		},
+	});
+}
+
+export function useProjectSkillsRefresh(projectId: string) {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: async () => {
+			await api.listSkills(projectId);
+		},
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["skills", projectId] });
+		},
+	});
+}
+
 export function useGlobalSkills(enabled = true) {
 	return useQuery({
 		queryKey: ["global-skills"],

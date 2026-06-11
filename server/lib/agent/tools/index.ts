@@ -7,7 +7,11 @@ import { browserTool } from "./browser";
 import { concludeReviewTool } from "./conclude-review";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { editTool } from "./edit";
-import { exitPlanConfirmTool, exitPlanReviseTool } from "./exit-plan-reflection";
+import {
+	exitPlanConfirmAndCompactTool,
+	exitPlanConfirmTool,
+	exitPlanReviseTool,
+} from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
@@ -84,6 +88,7 @@ const coreProvider: ToolProvider = {
 			dangerConfirmTool,
 			dangerCancelTool,
 			exitPlanConfirmTool,
+			exitPlanConfirmAndCompactTool,
 			exitPlanReviseTool,
 			goalCompleteConfirmTool,
 			goalCompleteReviseTool,

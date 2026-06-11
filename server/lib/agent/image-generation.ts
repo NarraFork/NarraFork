@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -78,6 +78,38 @@ export async function saveImageGenerationResult(
 	await mkdir(dirname(filePath), { recursive: true });
 	await writeFile(filePath, bytes);
 	return { filePath, ...(dimensions ?? {}) };
+}
+
+export async function cleanupPartialImageGenerationResults(
+	sessionId: string,
+	imageId: string,
+): Promise<number> {
+	const sessionDir = join(
+		imageGenerationArtifactsRoot(),
+		sanitizeImageGenerationPathPart(sessionId),
+	);
+	const partialPrefix = `${sanitizeImageGenerationPathPart(imageId)}_partial_`;
+	let entries: import("node:fs").Dirent[];
+	try {
+		entries = await readdir(sessionDir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+
+	let removed = 0;
+	await Promise.all(
+		entries.map(async (entry) => {
+			if (!entry.isFile()) return;
+			if (!entry.name.startsWith(partialPrefix) || !entry.name.endsWith(".png")) return;
+			try {
+				await rm(join(sessionDir, entry.name), { force: true });
+				removed++;
+			} catch {
+				// Best-effort cleanup only.
+			}
+		}),
+	);
+	return removed;
 }
 
 export function buildImageGenerationSavedPathInstruction(savedPath: string): string {

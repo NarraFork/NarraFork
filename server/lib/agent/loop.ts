@@ -38,6 +38,7 @@ import {
 	cancelExitPlanReflection,
 	cleanupExitPlanReflection,
 	createExitPlanReflectionDecision,
+	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
 	isExitPlanReflectionWaitingForUser,
@@ -729,17 +730,38 @@ function formatAllowedPrompts(value: unknown): string {
 	return items.length > 0 ? items.join("\n") : "- (none)";
 }
 
-function buildExitPlanReflectionPrompt(
+type ExitPlanReflectionAutoCompactConfig = Pick<AgentConfig, "planReflectionAllowAutoCompact">;
+
+export function shouldAllowExitPlanReflectionAutoCompact(
+	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
+): boolean {
+	return config.planReflectionAllowAutoCompact ?? settings.agent.planReflectionAllowAutoCompact;
+}
+
+export function getExitPlanReflectionAllowedTools(
+	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
+): string[] {
+	const allowedTools = [...EXIT_PLAN_REFLECTION_TOOLS];
+	if (shouldAllowExitPlanReflectionAutoCompact(config)) {
+		allowedTools.push(EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME);
+	}
+	return allowedTools;
+}
+
+export function buildExitPlanReflectionPrompt(
 	requestId: string,
 	input: Record<string, unknown>,
 	locale: Locale,
+	config: Partial<ExitPlanReflectionAutoCompactConfig> = {},
 ): string {
 	const planText = typeof input.plan === "string" ? input.plan : "";
-	return getPrompt("exitPlanReflection", locale)
+	const basePrompt = getPrompt("exitPlanReflection", locale)
 		.replaceAll("{requestId}", requestId)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
 		.replaceAll("{planText}", planText)
 		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
+	if (!shouldAllowExitPlanReflectionAutoCompact(config)) return basePrompt;
+	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
 }
 
 function buildGoalCompletionReflectionPrompt(
@@ -1015,9 +1037,9 @@ async function runExitPlanModeReflectionLoop(
 	await runReflectionLoop({
 		parentConfig,
 		history,
-		prompt: buildExitPlanReflectionPrompt(requestId, input, locale),
+		prompt: buildExitPlanReflectionPrompt(requestId, input, locale, parentConfig),
 		reflectionLoop: {
-			allowedTools: [...EXIT_PLAN_REFLECTION_TOOLS],
+			allowedTools: getExitPlanReflectionAllowedTools(parentConfig),
 			context: {
 				kind: "exitPlanMode",
 				requestId,
@@ -1426,15 +1448,34 @@ async function executeToolAfterReflections(
 ): Promise<ToolExecResult> {
 	if (tu.name === "ExitPlanMode" && shouldRunExitPlanModeReflection(config)) {
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
-		tu.input = reflected.input;
 		if (reflected.decision.action === "manual") {
+			tu.input = reflected.input;
 			return executeTool(tu, config);
 		}
-		if (reflected.decision.action !== "confirm") {
+		if (
+			reflected.decision.action !== "confirm" &&
+			reflected.decision.action !== "confirm_compact"
+		) {
 			return buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
 		}
-		// Reflection confirmed — skip user approval and execute directly
-		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
+
+		const shouldCompact = reflected.decision.action === "confirm_compact";
+		if (shouldCompact) {
+			const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
+			pendingPlanCompact.add(config.narratorId);
+		}
+
+		// Reflection confirmed — skip user approval and execute directly.  Keep tu.input as the
+		// original model input so executeTool emits updatedInput and the event handler persists
+		// the resolved plan before onExitPlanMode reads it for optional plan compact.
+		const result = await executeTool(tu, config, {
+			preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
+		});
+		if (shouldCompact && result.isError) {
+			const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
+			pendingPlanCompact.delete(config.narratorId);
+		}
+		return result;
 	}
 	if (tu.name === "UpdateGoal" && shouldRunGoalCompletionReflection(config)) {
 		const reflected = await resolveGoalCompletionReflection(config, history, tu);
@@ -2697,7 +2738,12 @@ export async function* agentLoop(
 						const contextWindow =
 							parsed.usage.contextWindow ??
 							getModelContextWindow(effectiveModel, effectiveProvider);
-						if (contextWindow) {
+						// Guard: only emit context_usage when promptTokens > 0.
+						// Some Anthropic-compatible APIs (e.g. Xiaomi Mimo) send
+						// { input_tokens: 0, output_tokens: 0 } in message_start and
+						// defer real usage to message_delta. Emitting 0% context usage
+						// causes the UI to briefly flash "0%" before showing the real value.
+						if (contextWindow && parsed.usage.promptTokens > 0) {
 							const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
 							requestContextPercent = Math.min(percentage, 100);
 							yield {
@@ -2781,6 +2827,8 @@ export async function* agentLoop(
 							status: ig.status,
 							revisedPrompt: ig.revisedPrompt,
 							result: ig.result,
+							partialImageIndex: ig.partialImageIndex,
+							partialImageB64: ig.partialImageB64,
 							outputIndex: acc.outputIndex,
 						};
 					}

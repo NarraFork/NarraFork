@@ -237,7 +237,8 @@ export function shouldTreatCodexStreamEventAsYielded(event: ParsedStreamEvent): 
 			(event.toolUses?.length ?? 0) > 0 ||
 			event.toolUseChunk != null ||
 			event.webSearch?.final === true ||
-			event.imageGeneration?.final === true,
+			event.imageGeneration?.final === true ||
+			typeof event.imageGeneration?.partialImageB64 === "string",
 	);
 }
 
