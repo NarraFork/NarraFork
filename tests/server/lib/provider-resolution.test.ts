@@ -28,6 +28,7 @@ function restoreFromSnapshot(snapshot: ReturnType<typeof cloneSettingsSnapshot>)
 function resetProviders(): void {
 	settings.openaiProviders = [];
 	settings.anthropicProviders = [];
+	settings.nugProviders = [];
 	settings.clineProviders = [];
 	settings.codex = undefined;
 	if (settings.agent) {
