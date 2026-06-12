@@ -82,6 +82,23 @@ function tabKeys(tabs: Array<Record<string, unknown>>) {
 	return tabs.map((tab) => `${tab.type}:${tab.id}`);
 }
 
+describe("recent tabs upsert validation", () => {
+	it("accepts frontend-normalized long titles and subtitles", async () => {
+		const longText = "x".repeat(1_000);
+
+		const tabs = await upsertRecentTab({
+			type: "narrator",
+			id: "n-long",
+			title: longText,
+			subtitle: longText,
+			lastVisitedAt: 110,
+		});
+
+		expect(tabs[0]?.title).toBe(longText);
+		expect(tabs[0]?.subtitle).toBe(longText);
+	});
+});
+
 describe("recent tabs pinned ordering", () => {
 	it("keeps pinned tabs above newly opened top-level tabs", async () => {
 		seedRecentTabs([
@@ -150,6 +167,38 @@ describe("recent tabs pinned ordering", () => {
 			"project:older-project",
 		]);
 		expect(tabs[1]?.title).toBe("Revisited again");
+	});
+
+	it("prefers keeping regular narrator tabs over unpinned subagents when trimming the list", async () => {
+		const existingTabs = Array.from({ length: 19 }, (_, i) => ({
+			type: "narrator",
+			id: `n-${i}`,
+			title: `Narrator ${i}`,
+			lastVisitedAt: 100 - i,
+		}));
+		seedRecentTabs([
+			...existingTabs,
+			{
+				type: "subagent",
+				id: "old-subagent",
+				title: "Old subagent",
+				lastVisitedAt: 1,
+			},
+		]);
+
+		const tabs = await upsertRecentTab({
+			type: "subagent",
+			id: "new-subagent",
+			title: "New subagent",
+			lastVisitedAt: 120,
+		});
+
+		expect(tabs).toHaveLength(20);
+		expect(tabKeys(tabs)).toContain("subagent:new-subagent");
+		expect(tabKeys(tabs)).not.toContain("subagent:old-subagent");
+		for (const tab of existingTabs) {
+			expect(tabKeys(tabs)).toContain(`${tab.type}:${tab.id}`);
+		}
 	});
 
 	it("keeps workspace children attached when a workspace is revisited behind pinned tabs", async () => {

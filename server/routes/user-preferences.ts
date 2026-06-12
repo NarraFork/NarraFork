@@ -167,6 +167,27 @@ function insertTopLevelTabRespectingPins(
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
+function trimRecentTabs(tabs: Record<string, unknown>[], max: number): Record<string, unknown>[] {
+	if (tabs.length <= max) return tabs;
+	const result = [...tabs];
+	const removeFirstMatching = (predicate: (tab: Record<string, unknown>) => boolean): boolean => {
+		for (let i = result.length - 1; i >= 0; i--) {
+			if (predicate(result[i])) {
+				result.splice(i, 1);
+				return true;
+			}
+		}
+		return false;
+	};
+
+	while (result.length > max) {
+		if (removeFirstMatching((tab) => tab.type === "subagent" && !tab.pinned)) continue;
+		if (removeFirstMatching((tab) => !tab.pinned)) continue;
+		result.pop();
+	}
+	return result;
+}
+
 userPreferencesRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
 	const pref = await db.query.userPreferences.findFirst({
@@ -498,7 +519,7 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 				insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
 			}
 		}
-		tabs = tabs.slice(0, MAX_RECENT_TABS);
+		tabs = trimRecentTabs(tabs, MAX_RECENT_TABS) as (typeof tab)[];
 		regroupWorkspaces(tabs);
 
 		const tabsJson = JSON.stringify(tabs);

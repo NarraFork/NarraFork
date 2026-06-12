@@ -41,10 +41,11 @@ export interface RecentTab {
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
-const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
+export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
 
-export function clampRecentTabText(value: string | undefined): string | undefined {
+export function clampRecentTabText(value: string | null | undefined): string | undefined {
+	if (value == null) return undefined;
 	if (!value) return value;
 	return value.length > RECENT_TAB_TEXT_MAX_CHARS
 		? value.slice(0, RECENT_TAB_TEXT_MAX_CHARS)
@@ -406,13 +407,10 @@ export function addRecentTab(
 	const { updateOnly: explicitUpdateOnly, ...rest } = tab;
 	const entry = normalizeRecentTab({ ...rest, lastVisitedAt: rest.lastVisitedAt ?? Date.now() });
 
-	// Auto-detect: if updateOnly is not explicitly set, check if tab already exists
-	let updateOnly = explicitUpdateOnly;
-	if (updateOnly === undefined) {
-		const currentTabs = globalQC.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
-		const exists = currentTabs.some((t) => t.type === entry.type && t.id === entry.id);
-		updateOnly = exists;
-	}
+	// Default to a real upsert. Some route effects are the first opportunity to
+	// add a tab to a user's persisted list; silently converting those calls to
+	// update-only based on local cache state can make ordinary narrator opens no-op.
+	const updateOnly = explicitUpdateOnly ?? false;
 
 	api.upsertRecentTab({ ...entry, updateOnly }).catch((err) => {
 		if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", err);

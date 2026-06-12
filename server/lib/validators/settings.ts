@@ -98,14 +98,16 @@ export const updateUserPreferencesSchema = z.object({
 	gatewayConfig: gatewayConfigSchema.optional(),
 });
 
+const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
+
 export const recentTabSchema = z.object({
 	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
 	workspaceId: z.string().min(1).max(50).nullish(),
-	title: z.string().max(200),
-	subtitle: z.string().max(200).optional(),
+	title: z.string().max(RECENT_TAB_TEXT_MAX_CHARS),
+	subtitle: z.string().max(RECENT_TAB_TEXT_MAX_CHARS).optional(),
 	status: z.string().max(50).optional(),
 	lastVisitedAt: z.number(),
 	pinned: z.boolean().optional(),

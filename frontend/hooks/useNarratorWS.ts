@@ -250,6 +250,7 @@ interface NarratorWSCallbacks {
 	onModelChanged?: (model: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
+	onSyncOk?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
 	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
@@ -860,6 +861,7 @@ export function useNarratorWS(
 						if (typeof data.version === "number") {
 							narratorWSManager.updateMessageVersion(subscribedId, data.version as number);
 						}
+						callbacksRef.current.onSyncOk?.();
 						break;
 					case "messages_deleted":
 						if (data.deletedMessageIds) {

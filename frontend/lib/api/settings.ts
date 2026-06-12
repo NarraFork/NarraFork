@@ -60,9 +60,10 @@ export const settingsApi = {
 			notifyFeishuWebhook: string;
 			notifyFeishuSecret: string;
 			recentTabs: Array<{
-				type: "chapter" | "narrator" | "project" | "workspace";
+				type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
 				id: string;
 				narratorId?: string;
+				parentNarratorId?: string;
 				workspaceId?: string | null;
 				title: string;
 				subtitle?: string;
@@ -146,6 +147,7 @@ export const settingsApi = {
 		type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
 		id: string;
 		narratorId?: string;
+		parentNarratorId?: string;
 		workspaceId?: string | null;
 		title: string;
 		subtitle?: string;

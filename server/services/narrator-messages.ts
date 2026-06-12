@@ -988,7 +988,7 @@ export const narratorMessageQueries = {
 		return row?.messageVersion ?? 0;
 	},
 
-	async getMessagesAfter(narratorId: string, after: string | CatchUpCursor, limit = 40) {
+	async getMessagesAfter(narratorId: string, after: string | CatchUpCursor, limit = 200) {
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 		const inputCursor: CatchUpCursor = isCatchUpCursor(after)
 			? after
@@ -1068,39 +1068,15 @@ export const narratorMessageQueries = {
 			return { topLevel: [], orphanChildren: [], hitLimit: true };
 		}
 
-		let parentCount = 0;
-		if (parentAnchorSeq != null) {
-			const countConditions = [
-				eq(narratorMessageRefs.narratorId, narratorId),
-				gt(narratorMessageRefs.seq, parentAnchorSeq),
-				isNull(narratorMessageRefs.segmentCompactId),
-			];
-			if (!isSubagent) countConditions.push(sql`${narratorMessages.parentToolUseId} IS NULL`);
-			const [{ cnt }] = await db
-				.select({ cnt: sql<number>`count(*)` })
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(and(...countConditions));
-			parentCount = cnt;
-		}
-
-		let childCount = 0;
 		const childWhere = combineOrConditions(
 			[...resolvedChildAnchors.values()].map((anchor) => childCatchUpCondition(anchor)),
 		);
-		if (childWhere) {
-			const [{ cnt }] = await db
-				.select({ cnt: sql<number>`count(*)` })
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(childWhere);
-			childCount = cnt;
-		}
 
-		if (parentCount + childCount > limit) {
-			return { topLevel: [], orphanChildren: [], hitLimit: true };
-		}
-
+		// Fetch ref rows directly with LIMIT (limit + 1) instead of running a
+		// full count(*) first. If either stream returns more than `limit` rows we
+		// already know we're over the threshold, so we can short-circuit to a
+		// full reload without reading any large message payloads. This avoids the
+		// expensive count(*) range scan when the catch-up anchor is far behind.
 		let refRows: Array<{ messageId: string; seq: number }> = [];
 		if (parentAnchorSeq != null) {
 			const rowConditions = [
@@ -1118,7 +1094,7 @@ export const narratorMessageQueries = {
 				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 				.where(and(...rowConditions))
 				.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-				.limit(10_000);
+				.limit(limit + 1);
 		}
 
 		const childRefRows: Array<{ messageId: string; seq: number }> = childWhere
@@ -1131,7 +1107,7 @@ export const narratorMessageQueries = {
 					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
 					.where(childWhere)
 					.orderBy(sql`${narratorMessageRefs.seq} ASC`)
-					.limit(10_000)
+					.limit(limit + 1)
 			: [];
 
 		if (refRows.length === 0 && childRefRows.length === 0) {
@@ -1142,6 +1118,13 @@ export const narratorMessageQueries = {
 				childMessages: [],
 			});
 			return { topLevel: [], orphanChildren: [], hitLimit: false, cursor };
+		}
+
+		// Either stream returning more than `limit` rows means we're past the
+		// catch-up threshold. Short-circuit to a full reload before reading any
+		// large message payloads (content_json / input_json / output_json).
+		if (refRows.length + childRefRows.length > limit) {
+			return { topLevel: [], orphanChildren: [], hitLimit: true };
 		}
 
 		const allRefRows = [...refRows, ...childRefRows];

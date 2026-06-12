@@ -1268,6 +1268,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const firstPageHasMoreAfter = messagesData?.pages?.[0]?.hasMoreAfter ?? false;
 
+	// Tracks whether the first catch-up response for the current narratorId
+	// subscription has been received (catch_up / sync_ok / full_reload). Used by
+	// onFullReload to distinguish the initial subscribe (where the REST first
+	// page already holds the latest messages, so invalidate is redundant) from a
+	// reconnect / fell-behind full_reload (where invalidate is required).
+	const firstCatchUpDoneRef = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
+	useEffect(() => {
+		firstCatchUpDoneRef.current = false;
+	}, [narratorId]);
+
 	// --- lastMessageId for WS catch-up ---
 	const lastMessageId = useMemo(() => {
 		if (firstPageHasMoreAfter) return undefined;
@@ -2863,6 +2874,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
+				// First catch-up response for this narratorId subscription received.
+				firstCatchUpDoneRef.current = true;
 				// Clean up any residual streaming chunks from before the disconnect
 				cancelPendingToolChunks(true, true);
 				removeStreamingChunksMsg(qc, messagesQueryKey);
@@ -2938,7 +2951,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				streamingBlocksRef.current = [];
 				clearStreamingState();
+				// If this is the FIRST catch-up response for this narratorId
+				// subscription (i.e. we just switched to this narrator), the REST
+				// first page — fetched with cursor=undefined — already holds the
+				// latest DESC page, which is exactly what a full reload would
+				// produce. Skip the redundant invalidate to avoid a second REST
+				// round-trip and the flicker it causes.
+				if (!firstCatchUpDoneRef.current) {
+					firstCatchUpDoneRef.current = true;
+					return;
+				}
+				// Otherwise (reconnect / fell too far behind after staying on the
+				// page) we must reload to backfill missed messages.
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
+			},
+			onSyncOk: () => {
+				// First catch-up response for this narratorId subscription received
+				// (server confirmed we are already in sync).
+				firstCatchUpDoneRef.current = true;
 			},
 			onMessagesDeleted: (deletedMessageIds: string[]) => {
 				// Remove deleted messages from cache

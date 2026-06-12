@@ -1,5 +1,9 @@
 import { z } from "zod/v4";
 import { logger } from "../../logger";
+import {
+	getFirstNugProvider,
+	hasConfiguredNugProvider,
+} from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
 function isAbortError(err: unknown): boolean {
@@ -9,6 +13,30 @@ function isAbortError(err: unknown): boolean {
 			err instanceof DOMException &&
 			err.name === "AbortError")
 	);
+}
+
+/** Call MCP search via NUG provider. */
+async function nugMcpSearch(query: string, signal?: AbortSignal): Promise<McpResponse> {
+	const config = getFirstNugProvider();
+	if (!config) throw new Error("No NUG provider configured");
+
+	const baseUrl = config.baseUrl.replace(/\/+$/, "");
+	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${config.apiKey}`,
+		},
+		body: JSON.stringify({ query }),
+		signal,
+	});
+
+	if (!response.ok) {
+		const errText = await response.text().catch(() => "");
+		throw new Error(`NUG MCP search error ${response.status}: ${errText}`);
+	}
+
+	return (await response.json()) as McpResponse;
 }
 
 
@@ -85,6 +113,7 @@ export const webSearchTool: ToolDefinition = {
 	async execute(args, ctx): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
+		const nugUp = hasConfiguredNugProvider();
 
 			return {
 				output:
@@ -99,8 +128,31 @@ export const webSearchTool: ToolDefinition = {
 			// that must unwind immediately so the agent loop can clean up.
 			let response: McpResponse | undefined;
 				try {
+					if (nugUp) {
+						});
+						try {
+							response = await nugMcpSearch(query, ctx.signal);
+						} catch (nugErr) {
+							if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
+									error: nugErr instanceof Error ? nugErr.message : String(nugErr),
+								});
+							} else {
+								throw nugErr;
+							}
+						}
 						});
 					} else {
+					}
+				}
+			} else if (nugUp) {
+				try {
+					response = await nugMcpSearch(query, ctx.signal);
+				} catch (nugErr) {
+					if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
+							error: nugErr instanceof Error ? nugErr.message : String(nugErr),
+						});
+					} else {
+						throw nugErr;
 					}
 				}
 			} else {

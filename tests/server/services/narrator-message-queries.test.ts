@@ -339,6 +339,42 @@ describe("narratorService message query regressions", () => {
 		expect(second.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-orphan"]);
 	});
 
+	it("getMessagesAfter 父流新增消息超过 limit 时短路返回 hitLimit", async () => {
+		seedBase();
+
+		insertMessage({
+			id: "m-anchor",
+			seq: 0,
+			contentJson: [{ type: "text", text: "anchor" }],
+		});
+
+		// Insert more top-level messages than the small limit we'll pass in.
+		for (let i = 1; i <= 5; i++) {
+			insertMessage({
+				id: `m-${i}`,
+				seq: i,
+				contentJson: [{ type: "text", text: `msg ${i}` }],
+			});
+		}
+
+		// limit = 3, but 5 new messages exist after the anchor → hitLimit.
+		const result = await narratorService.getMessagesAfter("n1", "m-anchor", 3);
+		expect(result.hitLimit).toBe(true);
+		expect(result.topLevel).toEqual([]);
+		expect(result.orphanChildren).toEqual([]);
+
+		// limit = 5 exactly covers the 5 new messages → no hitLimit.
+		const within = await narratorService.getMessagesAfter("n1", "m-anchor", 5);
+		expect(within.hitLimit).toBe(false);
+		expect(within.topLevel.map((m: { id: string }) => m.id)).toEqual([
+			"m-1",
+			"m-2",
+			"m-3",
+			"m-4",
+			"m-5",
+		]);
+	});
+
 	it("getMessagesAfter 复合 cursor 同时补拉 child stream 和父流新增消息", async () => {
 		seedBase();
 		db.insert(narrators)
