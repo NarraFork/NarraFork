@@ -466,7 +466,9 @@ export class NugProvider implements ProviderAdapter {
 			);
 			return;
 		}
+		// not camelCase "reasoningContent".
 				content: text || "",
+				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 				...(toolUses.length > 0
 					? {
 							toolUses: toolUses.map((tu) => ({
