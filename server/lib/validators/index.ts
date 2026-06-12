@@ -67,6 +67,7 @@ export {
 	createNarratorSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
+	editAssistantMessageSchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,

@@ -3466,6 +3466,113 @@ export async function editAndRegenerate(
 }
 
 /**
+ * Replace the editable text of an assistant message while preserving all other
+ * blocks (thinking / tool_use / etc.) in their original order. The new text is
+ * written into the first text block; if none exists, a text block is appended.
+ */
+function buildEditedAssistantContentJson(
+	contentJson: unknown,
+	newContent: string,
+): Array<Record<string, unknown>> {
+	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
+	const newBlocks: Array<Record<string, unknown>> = [];
+	let replacedText = false;
+
+	for (const block of blocks) {
+		if (block.type === "text") {
+			if (!replacedText) {
+				newBlocks.push({ ...block, text: newContent });
+				replacedText = true;
+			}
+			// Drop any additional text blocks — the edited text is consolidated
+			// into the first one (matches the single-textarea edit UI).
+			continue;
+		}
+		newBlocks.push(block);
+	}
+
+	if (!replacedText) {
+		newBlocks.push({ type: "text", text: newContent });
+	}
+
+	return newBlocks;
+}
+
+/**
+ * Edit the text content of an assistant message for display purposes only.
+ *
+ * Unlike editing a user message, this does NOT truncate following messages or
+ * re-run the agent loop. The new text is persisted and used when assembling the
+ * history for subsequent turns, but the "edited" metadata (editedAt / editedBy /
+ * originalContentJson) lives on the message row — never inside contentJson — so
+ * it is never sent to the AI provider.
+ *
+ * Copy-on-write protects fork sources: if the message is shared by multiple
+ * narrators (ref count > 1), a private copy is created for this narrator only.
+ */
+export async function editAssistantMessage(
+	narratorId: string,
+	messageId: string,
+	newContent: string,
+	editedBy?: string | null,
+): Promise<{ ok: boolean }> {
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+	});
+	if (!targetRef) throw new NotFoundError("Message", messageId);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (!targetMsg) throw new NotFoundError("Message", messageId);
+	if (targetMsg.role !== "assistant") {
+		throw new NotFoundError("Can only edit assistant messages", messageId);
+	}
+
+	const newContentJson = buildEditedAssistantContentJson(targetMsg.contentJson, newContent);
+	const now = new Date().toISOString();
+
+	// Preserve the original content the first time a message is edited so the
+	// front-end can always reveal the unedited version.
+	const overrides: Partial<typeof narratorMessages.$inferInsert> = {
+		contentJson: newContentJson,
+		contentText: newContent,
+		editedAt: now,
+		editedBy: editedBy ?? null,
+	};
+	if (!targetMsg.editedAt) {
+		overrides.originalContentJson = targetMsg.contentJson;
+	}
+
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		messageId,
+		overrides,
+	);
+
+	// Broadcast the updated message. If copy-on-write changed the message ID,
+	// force a reload so the client replaces the old shared row with the private copy.
+	const updatedMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, privateMessageId),
+	});
+	if (updatedMsg) {
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: updatedMsg,
+		});
+		if (privateMessageId !== messageId) {
+			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+		}
+	}
+
+	return { ok: true };
+}
+
+/**
  * Start or feed a message into a narrator.
  * Yields NarratorEvent objects for consumption (used by chapter-merge).
  */

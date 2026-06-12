@@ -1,8 +1,9 @@
-import { and, eq, gte, inArray, like, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, like, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorMessageRefs,
 	narratorMessages,
+	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 	users,
@@ -1342,6 +1343,30 @@ export const narratorPersistence = {
 						narratorId,
 						messageId: newMessageId,
 						createdAt: now,
+					})),
+				);
+			}
+
+			const originalToolUseIds = originalToolCalls.map((tc) => tc.toolUseId);
+			const originalSideCars = await tx.query.narratorSidecars.findMany({
+				where:
+					originalToolUseIds.length > 0
+						? or(
+								eq(narratorSidecars.messageId, messageId),
+								and(
+									eq(narratorSidecars.narratorId, original.narratorId),
+									inArray(narratorSidecars.toolUseId, originalToolUseIds),
+								),
+							)
+						: eq(narratorSidecars.messageId, messageId),
+			});
+			if (originalSideCars.length > 0) {
+				await tx.insert(narratorSidecars).values(
+					originalSideCars.map((sideCar) => ({
+						...sideCar,
+						id: generateId(),
+						narratorId,
+						messageId: newMessageId,
 					})),
 				);
 			}

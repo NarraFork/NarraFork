@@ -139,26 +139,6 @@ function getPinnedSectionEndIndex(tabs: Record<string, unknown>[]): number {
 	return idx;
 }
 
-/**
- * Move an existing top-level tab (or workspace group) to the front of the unpinned section.
- * Pinned tabs keep their manual order, and workspace children stay attached to their header.
- */
-function promoteTopLevelTabRespectingPins(tabs: Record<string, unknown>[], idx: number): void {
-	const tab = tabs[idx];
-	if (!tab || tab.workspaceId || tab.pinned) return;
-
-	let movedGroup: Record<string, unknown>[];
-	if (tab.type === "workspace") {
-		let end = idx + 1;
-		while (end < tabs.length && tabs[end].workspaceId === tab.id) end++;
-		movedGroup = tabs.splice(idx, end - idx);
-	} else {
-		movedGroup = tabs.splice(idx, 1);
-	}
-
-	tabs.splice(getPinnedSectionEndIndex(tabs), 0, ...movedGroup);
-}
-
 /** Insert a new top-level tab at the front of the unpinned section. */
 function insertTopLevelTabRespectingPins(
 	tabs: Record<string, unknown>[],
@@ -492,8 +472,10 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 				}
 				tabs[idx] = { ...tabs[idx], ...patch };
 			} else {
+				// Tab already exists: merge fields in place but keep its current position.
+				// Re-visiting an existing tab must not reorder the list — only manual
+				// moves/pins change order. Only brand-new tabs are inserted at the top.
 				tabs[idx] = { ...tabs[idx], ...tab };
-				promoteTopLevelTabRespectingPins(tabs as Record<string, unknown>[], idx);
 			}
 		} else if (updateOnly) {
 			return tabs;

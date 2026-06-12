@@ -42,6 +42,7 @@ import {
 	IconLanguage,
 	IconListCheck,
 	IconMessageQuestion,
+	IconPencil,
 	IconPhoto,
 	IconRepeat,
 	IconTrash,
@@ -109,6 +110,7 @@ const MAX_INLINE_IMAGE_RESULT_CHARS = MAX_INLINE_IMAGE_SOURCE_CHARS;
 const GENERATED_IMAGE_MAX_DISPLAY_WIDTH = 512;
 const MAX_USER_MESSAGE_DISPLAY_CHARS = 120_000;
 const MAX_USER_MESSAGE_EDIT_CHARS = 200_000;
+const MAX_ASSISTANT_MESSAGE_EDIT_CHARS = 100_000;
 
 function collectTextBlocksPreview(
 	blocks: Array<{ type?: string; text?: unknown }>,
@@ -247,6 +249,11 @@ interface MessageBubbleProps {
 		messageUuid?: string | null;
 		commandText?: string | null;
 		createdAt?: string | null;
+		/** Set when this assistant message's text was manually edited (display-only). */
+		editedAt?: string | null;
+		editedBy?: string | null;
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		originalContentJson?: any[] | null;
 		creator?: {
 			id: string;
 			username: string;
@@ -275,6 +282,8 @@ interface MessageBubbleProps {
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	/** Edit an assistant message's text content (display-only, no regeneration). */
+	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	/** Whether this is the last user message in the conversation */
 	isLastUserMessage?: boolean;
 	/** Whether the narrator is bound to a chapter (has git support) */
@@ -310,6 +319,8 @@ function sameMessagePayload(prev: MessageBubbleMessage, next: MessageBubbleMessa
 			prev.messageUuid === next.messageUuid &&
 			prev.commandText === next.commandText &&
 			prev.createdAt === next.createdAt &&
+			prev.editedAt === next.editedAt &&
+			prev.originalContentJson === next.originalContentJson &&
 			prev._blockOriginalIndices === next._blockOriginalIndices &&
 			sameMessageCreator(prev.creator, next.creator))
 	);
@@ -329,9 +340,73 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.onDeleteBlock === next.onDeleteBlock &&
 		prev.onRollbackToBlock === next.onRollbackToBlock &&
 		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
+		prev.onEditAssistantMessage === next.onEditAssistantMessage &&
 		prev.isLastUserMessage === next.isLastUserMessage &&
 		prev.hasChapter === next.hasChapter &&
 		sameMessagePayload(prev.message, next.message)
+	);
+}
+
+/**
+ * Small "edited" badge shown above an assistant message whose text was manually
+ * edited. Clicking it opens a modal that reveals the original (unedited) text.
+ * This metadata is display-only and is never sent to the AI provider.
+ */
+function EditedBadge({
+	originalContentJson,
+	editedAt,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	originalContentJson?: any[] | null;
+	editedAt: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const [opened, { open, close }] = useDisclosure(false);
+	const originalText = useMemo(() => {
+		if (!Array.isArray(originalContentJson)) return "";
+		return originalContentJson
+			.filter((b: { type?: string }) => b?.type === "text")
+			.map((b: { text?: string }) => b.text ?? "")
+			.join("\n\n");
+	}, [originalContentJson]);
+
+	const editedTime = useMemo(() => {
+		try {
+			return new Date(editedAt).toLocaleString();
+		} catch {
+			return editedAt;
+		}
+	}, [editedAt]);
+
+	const canViewOriginal = originalText.trim().length > 0;
+
+	return (
+		<>
+			<Tooltip label={canViewOriginal ? t("viewOriginal") : editedTime} withArrow>
+				<Badge
+					size="xs"
+					variant="light"
+					color="gray"
+					leftSection={<IconPencil size={10} />}
+					style={{ cursor: canViewOriginal ? "pointer" : "default", textTransform: "none" }}
+					onClick={canViewOriginal ? open : undefined}
+				>
+					{t("messageEdited")}
+				</Badge>
+			</Tooltip>
+			<Modal opened={opened} onClose={close} title={t("originalContentTitle")} size="lg" centered>
+				<Stack gap="xs">
+					<Text size="xs" c="dimmed">
+						{t("editedAtLabel", { time: editedTime })}
+					</Text>
+					<Paper p="sm" radius="md" withBorder>
+						<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+							{originalText}
+						</Text>
+					</Paper>
+				</Stack>
+			</Modal>
+		</>
 	);
 }
 
@@ -2884,6 +2959,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onDeleteBlock,
 	onRollbackToBlock,
 	onEditAndRegenerate,
+	onEditAssistantMessage,
 	isLastUserMessage,
 	hasChapter,
 }: MessageBubbleProps) {
@@ -2904,14 +2980,15 @@ export const MessageBubble = memo(function MessageBubble({
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
-		const editPreview = collectTextBlocksPreview(blocks, MAX_USER_MESSAGE_EDIT_CHARS);
+		const maxEditChars = isUser ? MAX_USER_MESSAGE_EDIT_CHARS : MAX_ASSISTANT_MESSAGE_EDIT_CHARS;
+		const editPreview = collectTextBlocksPreview(blocks, maxEditChars);
 		if (editPreview.truncated) {
 			notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
 			return;
 		}
 		setEditContent(editPreview.text);
 		setIsEditing(true);
-	}, [blocks, t]);
+	}, [blocks, isUser, t]);
 
 	const cancelEditing = useCallback(() => {
 		setIsEditing(false);
@@ -2921,6 +2998,14 @@ export const MessageBubble = memo(function MessageBubble({
 
 	const handleConfirmClick = useCallback(() => {
 		if (!editContent.trim()) return;
+		// Assistant messages: display-only edit, never truncates following messages.
+		if (!isUser) {
+			if (!message.id || !onEditAssistantMessage) return;
+			onEditAssistantMessage(message.id, editContent.trim());
+			setIsEditing(false);
+			setEditContent("");
+			return;
+		}
 		// If this is the last user message, no confirmation needed
 		if (isLastUserMessage) {
 			if (!message.id || !onEditAndRegenerate) return;
@@ -2930,7 +3015,14 @@ export const MessageBubble = memo(function MessageBubble({
 			return;
 		}
 		setShowConfirmModal(true);
-	}, [editContent, isLastUserMessage, message.id, onEditAndRegenerate]);
+	}, [
+		editContent,
+		isUser,
+		isLastUserMessage,
+		message.id,
+		onEditAndRegenerate,
+		onEditAssistantMessage,
+	]);
 
 	const submitEdit = useCallback(
 		(rollback: boolean) => {
@@ -3026,17 +3118,28 @@ export const MessageBubble = memo(function MessageBubble({
 		if (isUser && msgId && onEditAndRegenerate) {
 			actions.onEditMessage = startEditing;
 		}
+		// Assistant messages: allow display-only text edits when there is editable text.
+		if (
+			!isUser &&
+			msgId &&
+			onEditAssistantMessage &&
+			blocks.some((b: { type?: string }) => b.type === "text")
+		) {
+			actions.onEditMessage = startEditing;
+		}
 		return actions;
 	}, [
 		isUser,
 		message.id,
 		message.messageUuid,
+		blocks,
 		onForkFromMessage,
 		onAskInPassing,
 		onCompactBeforeMessage,
 		onDeleteBlock,
 		onRollbackToBlock,
 		onEditAndRegenerate,
+		onEditAssistantMessage,
 		startEditing,
 	]);
 
@@ -3507,9 +3610,48 @@ export const MessageBubble = memo(function MessageBubble({
 	// Assistant messages — wrap in context provider so all ContentViewers
 	// (including those inside ToolCallCard) can access message-level actions
 	const isStreaming = message.id === "__streaming__";
+
+	// Assistant edit mode UI (display-only text edit, no regeneration)
+	if (isEditing && !isUser) {
+		return (
+			<Paper p="sm" radius="md" withBorder>
+				<Stack gap="xs">
+					<Text size="xs" fw={600} c="dimmed">
+						{t("editAssistantTitle")}
+					</Text>
+					<Textarea
+						value={editContent}
+						onChange={(e) => setEditContent(e.currentTarget.value)}
+						onKeyDown={handleEditKeyDown}
+						autosize
+						minRows={3}
+						maxRows={16}
+					/>
+					<Text size="xs" c="dimmed">
+						{t("editAssistantHint")}
+					</Text>
+					<Group gap="xs" justify="flex-end">
+						<Button size="xs" variant="subtle" onClick={cancelEditing}>
+							{t("editCancel")}
+						</Button>
+						<Button size="xs" onClick={handleConfirmClick} disabled={!editContent.trim()}>
+							{t("editAssistantSubmit")}
+						</Button>
+					</Group>
+				</Stack>
+			</Paper>
+		);
+	}
+
 	return (
 		<MessageContextMenuCtx.Provider value={ctxActions}>
 			<Stack gap={4} style={{ minWidth: 0 }}>
+				{message.editedAt && (
+					<EditedBadge
+						originalContentJson={message.originalContentJson}
+						editedAt={message.editedAt}
+					/>
+				)}
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 				{blocks.map((block: any, i: number) => {
 					const key = blockKeys[i];

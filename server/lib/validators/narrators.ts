@@ -200,3 +200,8 @@ export const forkFromMessagesSchema = z.object({
 	messageIds: z.array(z.string().min(1)).min(1).max(500),
 	title: z.string().max(200).optional(),
 });
+
+// Edit an assistant message's text content (display-only).
+export const editAssistantMessageSchema = z.object({
+	content: z.string().min(1).max(100000),
+});

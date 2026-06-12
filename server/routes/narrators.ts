@@ -102,6 +102,7 @@ import {
 	createNarratorSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
+	editAssistantMessageSchema,
 	forkNarratorSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
@@ -160,6 +161,7 @@ import {
 	closeNarrator,
 	continueNarrator,
 	editAndRegenerate,
+	editAssistantMessage,
 	getBufferedMessages,
 	interruptNarrator,
 	isCompactInProgress,
@@ -1203,6 +1205,33 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		replyInUserLanguage,
 		!!rollback,
 	);
+	return c.json(result);
+});
+
+// Edit an assistant message's text content (display-only, no regeneration).
+// The edited text is used for subsequent history assembly, but the "edited"
+// metadata is never sent to the AI provider.
+narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
+	const id = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	const body = await c.req.json();
+	const { content } = editAssistantMessageSchema.parse(body);
+
+	const narrator = await narratorService.getById(id);
+
+	if (
+		isSubagentVariant(narrator.variant) &&
+		(narrator.status === "working" || narrator.status === "waiting")
+	) {
+		throw new ValidationError("Cannot edit on a running subagent");
+	}
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const userId = c.get("user").sub;
+	const result = await editAssistantMessage(id, messageId, content, userId);
 	return c.json(result);
 });
 

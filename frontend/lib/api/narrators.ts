@@ -555,6 +555,11 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify({ content, rollback }),
 		}),
+	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-message/${messageId}`, {
+			method: "POST",
+			body: JSON.stringify({ content }),
+		}),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
 		request<{ ok: boolean; fallbackSummary?: boolean; fallbackReason?: string; summary?: string }>(
 			`/narrators/${narratorId}/compact`,

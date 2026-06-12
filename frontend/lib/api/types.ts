@@ -477,6 +477,11 @@ export interface TreeMessage {
 	meterUnit?: string | null;
 	subagentModel?: string | null;
 	commandText?: string | null;
+	/** Set when this assistant message's text was manually edited (display-only). */
+	editedAt?: string | null;
+	editedBy?: string | null;
+	/** Original contentJson captured on first edit, so the UI can reveal the unedited text. */
+	originalContentJson?: ContentBlock[] | null;
 	creator?: {
 		id: string;
 		username: string;

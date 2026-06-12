@@ -208,6 +208,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const preparedCommand =
 		effectiveResult?.instructions?.command ??
 		(preparedBinaryPath ? `"${preparedBinaryPath}"` : undefined);
+	// Command 仅在与二进制路径实质不同时才单独展示（去掉首尾引号后比较，避免仅因引号而重复显示）
+	const stripQuotes = (value: string) => value.replace(/^"(.*)"$/, "$1");
+	const commandDiffersFromPath =
+		!!preparedCommand &&
+		(!preparedBinaryPath || stripQuotes(preparedCommand) !== stripQuotes(preparedBinaryPath));
 	const canRestartIntoUpdate =
 		autoApplyAvailable &&
 		effectiveResult?.success &&
@@ -421,7 +426,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							</Group>
 						)}
 
-						{preparedCommand && preparedCommand !== preparedBinaryPath && (
+						{preparedCommand && commandDiffersFromPath && (
 							<Group gap="xs" align="flex-start">
 								<Code block style={{ flex: 1, fontSize: "0.75rem", whiteSpace: "pre-wrap" }}>
 									{preparedCommand}

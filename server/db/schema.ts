@@ -387,6 +387,12 @@ export const narratorMessages = sqliteTable(
 		commandText: text("command_text"),
 		// 发送此消息的用户 ID（仅 role="user" 时有值）
 		createdBy: text("created_by").references(() => users.id),
+		// 最近一次手动编辑此消息内容的时间戳（有值即表示已被编辑，仅展示用，不发送给 AI）
+		editedAt: text("edited_at"),
+		// 编辑此消息的用户 ID
+		editedBy: text("edited_by").references(() => users.id),
+		// 首次编辑时保存的原始 contentJson（再次编辑不覆盖），用于前端查看原文
+		originalContentJson: text("original_content_json", { mode: "json" }),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
