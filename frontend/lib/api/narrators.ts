@@ -560,6 +560,10 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify({ content }),
 		}),
+	restoreAssistantMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/restore-message/${messageId}`, {
+			method: "POST",
+		}),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
 		request<{ ok: boolean; fallbackSummary?: boolean; fallbackReason?: string; summary?: string }>(
 			`/narrators/${narratorId}/compact`,

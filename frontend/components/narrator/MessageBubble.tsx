@@ -249,7 +249,7 @@ interface MessageBubbleProps {
 		messageUuid?: string | null;
 		commandText?: string | null;
 		createdAt?: string | null;
-		/** Set when this assistant message's text was manually edited (display-only). */
+		/** Set when this assistant message's text was manually edited and persisted. */
 		editedAt?: string | null;
 		editedBy?: string | null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -282,8 +282,10 @@ interface MessageBubbleProps {
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
-	/** Edit an assistant message's text content (display-only, no regeneration). */
+	/** Edit assistant message text without deleting later messages or regenerating. */
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
+	/** Restore an edited assistant message back to its original text, clearing the edit marker. */
+	onRestoreAssistantMessage?: (messageId: string) => void;
 	/** Whether this is the last user message in the conversation */
 	isLastUserMessage?: boolean;
 	/** Whether the narrator is bound to a chapter (has git support) */
@@ -341,6 +343,7 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.onRollbackToBlock === next.onRollbackToBlock &&
 		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
 		prev.onEditAssistantMessage === next.onEditAssistantMessage &&
+		prev.onRestoreAssistantMessage === next.onRestoreAssistantMessage &&
 		prev.isLastUserMessage === next.isLastUserMessage &&
 		prev.hasChapter === next.hasChapter &&
 		sameMessagePayload(prev.message, next.message)
@@ -350,15 +353,18 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 /**
  * Small "edited" badge shown above an assistant message whose text was manually
  * edited. Clicking it opens a modal that reveals the original (unedited) text.
- * This metadata is display-only and is never sent to the AI provider.
+ * The edited text is persisted and used for later history; only this edit marker
+ * and original-text metadata stay outside the AI provider payload.
  */
 function EditedBadge({
 	originalContentJson,
 	editedAt,
+	onRestore,
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	originalContentJson?: any[] | null;
 	editedAt: string;
+	onRestore?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const [opened, { open, close }] = useDisclosure(false);
@@ -379,6 +385,12 @@ function EditedBadge({
 	}, [editedAt]);
 
 	const canViewOriginal = originalText.trim().length > 0;
+
+	const handleRestore = useCallback(() => {
+		if (!onRestore) return;
+		onRestore();
+		close();
+	}, [onRestore, close]);
 
 	return (
 		<>
@@ -404,6 +416,18 @@ function EditedBadge({
 							{originalText}
 						</Text>
 					</Paper>
+					{onRestore && (
+						<Group justify="flex-end">
+							<Button
+								size="xs"
+								variant="light"
+								leftSection={<IconArrowBackUp size={14} />}
+								onClick={handleRestore}
+							>
+								{t("restoreOriginal")}
+							</Button>
+						</Group>
+					)}
 				</Stack>
 			</Modal>
 		</>
@@ -2960,6 +2984,7 @@ export const MessageBubble = memo(function MessageBubble({
 	onRollbackToBlock,
 	onEditAndRegenerate,
 	onEditAssistantMessage,
+	onRestoreAssistantMessage,
 	isLastUserMessage,
 	hasChapter,
 }: MessageBubbleProps) {
@@ -2998,7 +3023,7 @@ export const MessageBubble = memo(function MessageBubble({
 
 	const handleConfirmClick = useCallback(() => {
 		if (!editContent.trim()) return;
-		// Assistant messages: display-only edit, never truncates following messages.
+		// Assistant messages: persist the edited text without truncating later messages or regenerating.
 		if (!isUser) {
 			if (!message.id || !onEditAssistantMessage) return;
 			onEditAssistantMessage(message.id, editContent.trim());
@@ -3118,7 +3143,7 @@ export const MessageBubble = memo(function MessageBubble({
 		if (isUser && msgId && onEditAndRegenerate) {
 			actions.onEditMessage = startEditing;
 		}
-		// Assistant messages: allow display-only text edits when there is editable text.
+		// Assistant messages: allow persisted text edits when there is editable text.
 		if (
 			!isUser &&
 			msgId &&
@@ -3611,7 +3636,7 @@ export const MessageBubble = memo(function MessageBubble({
 	// (including those inside ToolCallCard) can access message-level actions
 	const isStreaming = message.id === "__streaming__";
 
-	// Assistant edit mode UI (display-only text edit, no regeneration)
+	// Assistant edit mode UI: save edited text without deleting later messages or regenerating.
 	if (isEditing && !isUser) {
 		return (
 			<Paper p="sm" radius="md" withBorder>
@@ -3650,6 +3675,11 @@ export const MessageBubble = memo(function MessageBubble({
 					<EditedBadge
 						originalContentJson={message.originalContentJson}
 						editedAt={message.editedAt}
+						onRestore={
+							message.id && onRestoreAssistantMessage
+								? () => onRestoreAssistantMessage(message.id as string)
+								: undefined
+						}
 					/>
 				)}
 				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}

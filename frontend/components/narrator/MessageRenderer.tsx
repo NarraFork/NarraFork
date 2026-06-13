@@ -254,6 +254,7 @@ export function renderTreeMessages(
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void,
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void,
+	onRestoreAssistantMessage?: (messageId: string) => void,
 	lastUserMessageId?: string,
 	hasChapter?: boolean,
 	onViewSubagentSession?: (narratorId: string) => void,
@@ -337,6 +338,7 @@ export function renderTreeMessages(
 					onRollbackToBlock={onRollbackToBlock}
 					onEditAndRegenerate={onEditAndRegenerate}
 					onEditAssistantMessage={onEditAssistantMessage}
+					onRestoreAssistantMessage={onRestoreAssistantMessage}
 					isLastUserMessage={targetMsg.id === lastUserMessageId}
 					hasChapter={hasChapter}
 				/>

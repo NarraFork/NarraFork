@@ -387,7 +387,7 @@ export const narratorMessages = sqliteTable(
 		commandText: text("command_text"),
 		// 发送此消息的用户 ID（仅 role="user" 时有值）
 		createdBy: text("created_by").references(() => users.id),
-		// 最近一次手动编辑此消息内容的时间戳（有值即表示已被编辑，仅展示用，不发送给 AI）
+		// 最近一次手动编辑此消息内容的时间戳（编辑后的文本会进入后续历史；本元数据不发送给 AI）
 		editedAt: text("edited_at"),
 		// 编辑此消息的用户 ID
 		editedBy: text("edited_by").references(() => users.id),

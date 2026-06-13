@@ -174,6 +174,7 @@ import {
 	reprocessAllPendingPermissions,
 	requestBufferedMessageSoftStop,
 	resolvePermissionOrDangerReflection,
+	restoreAssistantMessage,
 	retryLastMessage,
 	rollbackToBlock,
 	runCustomCompact,
@@ -1208,9 +1209,10 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	return c.json(result);
 });
 
-// Edit an assistant message's text content (display-only, no regeneration).
-// The edited text is used for subsequent history assembly, but the "edited"
-// metadata is never sent to the AI provider.
+// Edit an assistant message's text without deleting later messages or regenerating.
+// The edited text is persisted for display and subsequent history assembly, while
+// edit metadata (editedAt/editedBy/originalContentJson) stays outside contentJson
+// and is never sent to the AI provider.
 narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
@@ -1232,6 +1234,29 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 
 	const userId = c.get("user").sub;
 	const result = await editAssistantMessage(id, messageId, content, userId);
+	return c.json(result);
+});
+
+// Restore an edited assistant message back to its original text, clearing the
+// edit metadata so the message looks like it was never edited.
+narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
+	const id = c.req.param("id");
+	const messageId = c.req.param("messageId");
+
+	const narrator = await narratorService.getById(id);
+
+	if (
+		isSubagentVariant(narrator.variant) &&
+		(narrator.status === "working" || narrator.status === "waiting")
+	) {
+		throw new ValidationError("Cannot restore on a running subagent");
+	}
+
+	if (narrator.status === "archived") {
+		await narratorService.updateStatus(id, "idle");
+	}
+
+	const result = await restoreAssistantMessage(id, messageId);
 	return c.json(result);
 });
 

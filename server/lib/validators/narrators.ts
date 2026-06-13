@@ -201,7 +201,7 @@ export const forkFromMessagesSchema = z.object({
 	title: z.string().max(200).optional(),
 });
 
-// Edit an assistant message's text content (display-only).
+// Edit assistant message text without deleting later messages or regenerating.
 export const editAssistantMessageSchema = z.object({
 	content: z.string().min(1).max(100000),
 });

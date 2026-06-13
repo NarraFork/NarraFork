@@ -3499,7 +3499,7 @@ function buildEditedAssistantContentJson(
 }
 
 /**
- * Edit the text content of an assistant message for display purposes only.
+ * Edit the text content of an assistant message without regenerating.
  *
  * Unlike editing a user message, this does NOT truncate following messages or
  * re-run the agent loop. The new text is persisted and used when assembling the
@@ -3555,6 +3555,79 @@ export async function editAssistantMessage(
 
 	// Broadcast the updated message. If copy-on-write changed the message ID,
 	// force a reload so the client replaces the old shared row with the private copy.
+	const updatedMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, privateMessageId),
+	});
+	if (updatedMsg) {
+		broadcastToNarrator(narratorId, {
+			type: "message_updated",
+			narratorId,
+			message: updatedMsg,
+		});
+		if (privateMessageId !== messageId) {
+			broadcastToNarrator(narratorId, { type: "full_reload", narratorId });
+		}
+	}
+
+	return { ok: true };
+}
+
+/**
+ * Restore an assistant message to its original (pre-edit) text.
+ *
+ * Reverts contentJson/contentText to the captured originalContentJson and clears
+ * all edit metadata (editedAt / editedBy / originalContentJson) so the message
+ * looks like it was never edited and the "edited" badge disappears.
+ *
+ * Copy-on-write protects fork sources, mirroring editAssistantMessage.
+ */
+export async function restoreAssistantMessage(
+	narratorId: string,
+	messageId: string,
+): Promise<{ ok: boolean }> {
+	const targetRef = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, messageId),
+		),
+	});
+	if (!targetRef) throw new NotFoundError("Message", messageId);
+
+	const targetMsg = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, messageId),
+	});
+	if (!targetMsg) throw new NotFoundError("Message", messageId);
+	if (targetMsg.role !== "assistant") {
+		throw new NotFoundError("Can only restore assistant messages", messageId);
+	}
+
+	// Nothing to restore if the message was never edited.
+	if (!targetMsg.editedAt) {
+		return { ok: true };
+	}
+
+	const originalContentJson = Array.isArray(targetMsg.originalContentJson)
+		? (targetMsg.originalContentJson as Array<Record<string, unknown>>)
+		: [];
+	const originalText = originalContentJson
+		.filter((b) => b?.type === "text")
+		.map((b) => (typeof b.text === "string" ? b.text : ""))
+		.join("\n\n");
+
+	const overrides: Partial<typeof narratorMessages.$inferInsert> = {
+		contentJson: originalContentJson,
+		contentText: originalText,
+		editedAt: null,
+		editedBy: null,
+		originalContentJson: null,
+	};
+
+	const privateMessageId = await narratorService.copyOnWriteMessage(
+		narratorId,
+		messageId,
+		overrides,
+	);
+
 	const updatedMsg = await db.query.narratorMessages.findFirst({
 		where: eq(narratorMessages.id, privateMessageId),
 	});
