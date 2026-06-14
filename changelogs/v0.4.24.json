@@ -1,0 +1,6 @@
+{
+	"version": "0.4.24",
+	"date": "2026-06-13",
+	"en": "## New Features\n\n- Edit the text of an AI reply without deleting later messages or regenerating; the saved text flows into subsequent conversation history while the edit marker stays out of the AI payload.\n- Restore an edited AI reply back to its original text in one click, which clears the \"edited\" badge so the message looks like it was never changed.",
+	"zh-CN": "## 新功能\n\n- 支持直接编辑 AI 回复的文本，不会删除后续消息或重新生成；保存后的内容会用于后续对话历史，而「已编辑」标记不会发送给 AI。\n- 编辑过的 AI 回复可一键恢复原文，恢复后「已编辑」标记消失，效果等同从未编辑。"
+}

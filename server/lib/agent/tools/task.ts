@@ -110,6 +110,61 @@ function usesNativeWebSearch(provider: string): boolean {
 	return false;
 }
 
+function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+	return {
+		type: "object" as const,
+		properties: {
+			description: {
+				description:
+					"A short (3-5 word) description of the task (required when launching a new agent)",
+				type: "string",
+			},
+			subagent_type: {
+				description:
+					'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "general". Custom types are also supported.',
+				type: "string",
+			},
+			run_in_background: {
+				description:
+					"Set to true to run this agent in the background. You will be notified when it completes.",
+				type: "boolean",
+			},
+			model: {
+				description: getModelParameterDescription(config),
+				type: "string",
+			},
+			reasoning_effort: {
+				description: REASONING_EFFORT_DESCRIPTION,
+				type: "string",
+				enum: REASONING_EFFORT_VALUES,
+			},
+			workdir: {
+				description:
+					"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
+				type: "string",
+			},
+			alias: {
+				description:
+					'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
+					"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
+					"Use this alias with Await or Send to reference the task later.",
+				type: "string",
+			},
+			stop: {
+				description:
+					"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
+				type: "string",
+			},
+			prompt: {
+				description: "The task for the agent to perform (required when launching a new agent)",
+				type: "string",
+			},
+		},
+		required: [] as string[],
+		additionalProperties: false,
+	};
+}
+
 export const agentTool: ToolDefinition = {
 	name: "Agent",
 	description(config: AgentConfig) {
@@ -122,61 +177,10 @@ export const agentTool: ToolDefinition = {
 		return buildParameters();
 	},
 	get rawJsonSchema() {
-		return this.getRawJsonSchema();
+		return buildRawJsonSchema();
 	},
 	getRawJsonSchema(config?: AgentConfig) {
-		return {
-			type: "object" as const,
-			properties: {
-				description: {
-					description:
-						"A short (3-5 word) description of the task (required when launching a new agent)",
-					type: "string",
-				},
-				subagent_type: {
-					description:
-						'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "general". Custom types are also supported.',
-					type: "string",
-				},
-				run_in_background: {
-					description:
-						"Set to true to run this agent in the background. You will be notified when it completes.",
-					type: "boolean",
-				},
-				model: {
-					description: getModelParameterDescription(config),
-					type: "string",
-				},
-				reasoning_effort: {
-					description: REASONING_EFFORT_DESCRIPTION,
-					type: "string",
-					enum: REASONING_EFFORT_VALUES,
-				},
-				workdir: {
-					description:
-						"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
-					type: "string",
-				},
-				alias: {
-					description:
-						'A short human-readable alias for this background task (e.g. "run-tests", "build-frontend"). ' +
-						"Must be unique within the current session. If omitted, an alias is auto-generated from the description. " +
-						"Use this alias with Await or Send to reference the task later.",
-					type: "string",
-				},
-				stop: {
-					description:
-						"Stop a running background agent task by its ID or alias. When provided, no new agent is launched.",
-					type: "string",
-				},
-				prompt: {
-					description: "The task for the agent to perform (required when launching a new agent)",
-					type: "string",
-				},
-			},
-			required: [] as string[],
-			additionalProperties: false,
-		};
+		return buildRawJsonSchema(config);
 	},
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {

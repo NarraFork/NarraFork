@@ -424,6 +424,7 @@ export const narratorMessageRefs = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_narrator_refs_unique").on(table.narratorId, table.messageId),
 		index("idx_narrator_refs_seq").on(table.narratorId, table.seq),
+		index("idx_narrator_refs_compact_seq").on(table.narratorId, table.isCompact, table.seq),
 		index("idx_narrator_refs_message").on(table.messageId),
 		index("idx_narrator_refs_segment_compact").on(table.segmentCompactId),
 	],
@@ -509,6 +510,11 @@ export const narratorToolCalls = sqliteTable(
 		index("idx_toolcalls_message").on(table.messageId),
 		index("idx_toolcalls_tool_use_id").on(table.toolUseId),
 		index("idx_toolcalls_status").on(table.narratorId, table.status),
+		index("idx_toolcalls_status_narrator_created").on(
+			table.status,
+			table.narratorId,
+			table.createdAt,
+		),
 		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
 	],
 );
