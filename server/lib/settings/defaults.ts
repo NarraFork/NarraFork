@@ -33,6 +33,7 @@ export const DEFAULTS: NarraForkSettings = {
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
+		defaultPruneEnabled: false,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
@@ -270,6 +271,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.defaultRelaxedPlan": {
 		desc: "新建叙述者的 relaxed plan 默认值。启用时 plan 模式下工具保持完全可用；禁用时 plan 模式限制为只读工具集合。",
+		type: "boolean",
+	},
+	"agent.defaultPruneEnabled": {
+		desc: "新建叙述者的自动裁剪默认值。默认关闭；开启可能导致提示词缓存失效、计费变贵。",
 		type: "boolean",
 	},
 	"agent.planReflectionAutoApprove": {

@@ -219,6 +219,7 @@ const updateSettingsSchema = z
 				requestDumpEnabled: z.boolean(),
 				requestDumpErrorsOnly: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
+				defaultPruneEnabled: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),
 				planReflectionAllowAutoCompact: z.boolean(),
 				questionReflectionEnabled: z.boolean(),

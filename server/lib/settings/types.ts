@@ -296,6 +296,8 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
+		/** Default value for the auto-prune toggle on new narrators. */
+		defaultPruneEnabled: boolean;
 		/** Let ExitPlanMode plan reflection auto-approve plans in edit-capable permission modes. */
 		planReflectionAutoApprove: boolean;
 		/** Allow ExitPlanMode plan reflection to auto-approve and reset context. */

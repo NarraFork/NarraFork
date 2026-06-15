@@ -58,6 +58,8 @@ export interface AgentSectionProps {
 	setDefaultStartInPlanMode: (v: boolean) => void;
 	defaultRelaxedPlan: boolean;
 	setDefaultRelaxedPlan: (v: boolean) => void;
+	defaultPruneEnabled: boolean;
+	setDefaultPruneEnabled: (v: boolean) => void;
 	planReflectionAutoApprove: boolean;
 	setPlanReflectionAutoApprove: (v: boolean) => void;
 	planReflectionAllowAutoCompact: boolean;
@@ -283,6 +285,12 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("defaultRelaxedPlanDesc")}
 				checked={props.defaultRelaxedPlan}
 				onChange={(e) => props.setDefaultRelaxedPlan(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("defaultPruneEnabled")}
+				description={t("defaultPruneEnabledDesc")}
+				checked={props.defaultPruneEnabled}
+				onChange={(e) => props.setDefaultPruneEnabled(e.currentTarget.checked)}
 			/>
 			<Switch
 				label={t("planReflectionAutoApprove")}

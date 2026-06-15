@@ -138,6 +138,7 @@ interface CreateNarratorInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
+	pruneEnabled?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
 	startInPlanMode?: boolean;
@@ -667,6 +668,7 @@ export const narratorService = {
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: input.fastMode ?? false,
 				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+				pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 				dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
 				cwd: input.cwd ?? null,
@@ -733,6 +735,7 @@ export const narratorService = {
 				reasoningEffort: resolvedReasoningEffort,
 				fastMode: parent.fastMode ?? false,
 				relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
@@ -1006,6 +1009,7 @@ export const narratorService = {
 					reasoningEffort: parent.reasoningEffort ?? null,
 					fastMode: parent.fastMode ?? false,
 					relaxedPlan: parent.relaxedPlan ?? false,
+					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					parentNarratorId,
@@ -1214,6 +1218,7 @@ export const narratorService = {
 					reasoningEffort: resolvedReasoningEffort,
 					fastMode: parent.fastMode ?? false,
 					relaxedPlan: parent.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
 					parentNarratorId,

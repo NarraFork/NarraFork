@@ -2198,6 +2198,9 @@ export function NarratorPanel({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
+	const pruneEnabledGlobal = settingsData?.agent?.defaultPruneEnabled ?? false;
+	const pruneEnabledEffective = narrator?.pruneEnabled ?? pruneEnabledGlobal;
+	const pruneDiffersFromDefault = pruneEnabledEffective !== pruneEnabledGlobal;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -6677,17 +6680,59 @@ export function NarratorPanel({
 				<Menu.Divider />
 				<Tooltip label={t("pruneEnabledTooltip")} multiline w={260} withArrow position="top">
 					<Menu.Label>
-						<Switch
-							size="xs"
-							label={t("pruneEnabled")}
-							checked={narrator.pruneEnabled ?? true}
-							onChange={(e) => {
-								pruneEnabledMutation.mutate({
-									id: narratorId,
-									pruneEnabled: e.currentTarget.checked,
-								});
-							}}
-						/>
+						<Stack gap={4}>
+							<Switch
+								size="xs"
+								label={t("pruneEnabled")}
+								checked={pruneEnabledEffective}
+								onChange={(e) => {
+									pruneEnabledMutation.mutate({
+										id: narratorId,
+										pruneEnabled: e.currentTarget.checked,
+									});
+								}}
+							/>
+							{pruneEnabledEffective && (
+								<Text size="xs" c="orange">
+									{t("pruneEnabledWarning")}
+								</Text>
+							)}
+							{pruneDiffersFromDefault && (
+								<Group justify="space-between" wrap="nowrap" style={{ width: "100%" }}>
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={(event) => {
+											event.stopPropagation();
+											pruneEnabledMutation.mutate({
+												id: narratorId,
+												pruneEnabled: pruneEnabledGlobal,
+											});
+										}}
+									>
+										{t("pruneEnabledResetDefault")}
+									</Anchor>
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={(event) => {
+											event.stopPropagation();
+											updateSettingsMutation.mutate({
+												agent: { defaultPruneEnabled: pruneEnabledEffective },
+											});
+										}}
+									>
+										{t("pruneEnabledSetDefault")}
+									</Anchor>
+								</Group>
+							)}
+						</Stack>
 					</Menu.Label>
 				</Tooltip>
 				<Menu.Divider />

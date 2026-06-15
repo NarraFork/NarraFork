@@ -835,7 +835,7 @@ export function NarratorDetailsPanel({
 				</Group>
 				<DetailRow
 					label={t("details.pruneEnabled")}
-					value={<Text size="sm">{formatBoolean(narrator?.pruneEnabled ?? true)}</Text>}
+					value={<Text size="sm">{formatBoolean(narrator?.pruneEnabled ?? false)}</Text>}
 				/>
 				<DetailRow
 					label={t("details.planMode")}

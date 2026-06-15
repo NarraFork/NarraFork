@@ -362,6 +362,8 @@
 	"defaultStartInPlanModeDesc": "为新建叙述者默认启用计划模式 trait。权限模式仍是独立的安全策略。",
 	"defaultRelaxedPlan": "默认宽松规划",
 	"defaultRelaxedPlanDesc": "启用后，新叙述者默认开启宽松规划模式。宽松规划模式下，规划时工具仍然可用，不会被禁用。",
+	"defaultPruneEnabled": "默认自动裁剪",
+	"defaultPruneEnabledDesc": "启用后，新叙述者默认开启工具调用自动裁剪。该选项默认关闭，因为裁剪可能导致提示词缓存失效、计费变贵。",
 	"planReflectionAutoApprove": "全局默认自动批准计划",
 	"planReflectionAutoApproveDesc": "所有继承全局的会话，在 ExitPlanMode 计划反思确认后会跳过人工审批。",
 	"planReflectionAllowAutoCompact": "允许计划反思重置上下文",

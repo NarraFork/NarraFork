@@ -24,7 +24,7 @@ import type { Locale } from "../lib/i18n";
 import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
 import { pendingPermissions } from "../services/narrator-session-state";
@@ -603,7 +603,7 @@ class Gateway {
 			permissionMode: this.config?.defaultPermissionMode ?? "default",
 			messageCount: 0,
 			totalCostUsd: 0,
-			pruneEnabled: true,
+			pruneEnabled: settings.agent.defaultPruneEnabled,
 			fastMode: false,
 			relaxedPlan: false,
 			planMode: false,

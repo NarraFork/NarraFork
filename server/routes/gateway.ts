@@ -18,7 +18,7 @@ import { WebhookAdapter } from "../gateway/platforms/webhook";
 import type { WebhookConfig } from "../gateway/types";
 import { GATEWAY_PLATFORMS } from "../gateway/types";
 import { generateId } from "../lib/id";
-import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import { sendMessage } from "../services/narrator-session";
 
 export const gatewayRoutes = new Hono();
@@ -130,7 +130,7 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 			permissionMode: config.defaultPermissionMode ?? "default",
 			messageCount: 0,
 			totalCostUsd: 0,
-			pruneEnabled: true,
+			pruneEnabled: settings.agent.defaultPruneEnabled,
 			fastMode: false,
 			relaxedPlan: false,
 			planMode: false,

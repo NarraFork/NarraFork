@@ -287,7 +287,7 @@ export const narrators = sqliteTable(
 			(): any => narratorMessages.id,
 		),
 		prunedPercent: integer("pruned_percent"),
-		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(true),
+		pruneEnabled: integer("prune_enabled", { mode: "boolean" }).notNull().default(false),
 		/** JSON array of optional tool names explicitly enabled for this narrator */
 		enabledTools: text("enabled_tools", { mode: "json" }).$type<string[]>(),
 		/**
