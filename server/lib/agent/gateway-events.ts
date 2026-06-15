@@ -23,6 +23,7 @@ import type { ParsedStreamEvent } from "./provider";
 const QUEUE_EVENT = "queueEvent";
 const QUOTA_BALANCE_EVENT = "quotaBalanceEvent";
 const MODEL_CATALOG_EVENT = "modelCatalogEvent";
+const IMAGE_CACHE_ACK_EVENT = "imageCacheAckEvent";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return value != null && typeof value === "object" && !Array.isArray(value);
@@ -100,6 +101,14 @@ export function parseGatewaySSEEvent(
 		return { nugModelCatalog: { modelHash, models } };
 	}
 
+	if (eventType === IMAGE_CACHE_ACK_EVENT) {
+		if (!Array.isArray(data.refs)) {
+			return null;
+		}
+		const refs = data.refs.filter((ref): ref is string => typeof ref === "string" && ref !== "");
+		return { nugImageCacheAck: { refs } };
+	}
+
 	return null;
 }
 
@@ -123,6 +132,7 @@ export function isGatewayEventType(eventType: string): boolean {
 	return (
 		eventType === QUEUE_EVENT ||
 		eventType === QUOTA_BALANCE_EVENT ||
-		eventType === MODEL_CATALOG_EVENT
+		eventType === MODEL_CATALOG_EVENT ||
+		eventType === IMAGE_CACHE_ACK_EVENT
 	);
 }

@@ -2,6 +2,7 @@ import { ActionIcon, Box, Group, Text, TextInput, Tooltip } from "@mantine/core"
 import { IconCheck, IconExternalLink, IconWorld, IconX } from "@tabler/icons-react";
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { normalizeHttpUrlProtocol } from "../../lib/url";
 import type { WebviewLeafConfig } from "./split-tree";
 
 interface WebviewPanelProps {
@@ -12,14 +13,6 @@ interface WebviewPanelProps {
 	onHeaderPointerDown?: (e: React.PointerEvent) => void;
 	/** Called when the user edits the URL or title. */
 	onConfigChange?: (config: WebviewLeafConfig) => void;
-}
-
-/** Ensure the URL has a protocol prefix. */
-function normalizeUrl(raw: string): string {
-	const trimmed = raw.trim();
-	if (!trimmed) return "";
-	if (/^https?:\/\//i.test(trimmed)) return trimmed;
-	return `https://${trimmed}`;
 }
 
 /**
@@ -39,8 +32,15 @@ export function WebviewPanel({
 	const inputRef = useRef<HTMLInputElement>(null);
 
 	const commitUrl = useCallback(() => {
+		const trimmedUrl = editUrl.trim();
+		const url = normalizeHttpUrlProtocol(trimmedUrl) ?? "";
+		if (trimmedUrl && !url) {
+			setEditUrl(trimmedUrl);
+			setEditing(true);
+			return;
+		}
+
 		setEditing(false);
-		const url = normalizeUrl(editUrl);
 		if (url && url !== config.url) {
 			onConfigChange?.({ ...config, url });
 		} else if (!url && !config.url) {

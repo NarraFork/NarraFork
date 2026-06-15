@@ -24,6 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type GatewayPlatform, useGatewayCapability } from "../../hooks/usePlatform";
 import { miscApi } from "../../lib/api/misc";
+import { normalizeUrlProtocol } from "../../lib/url";
 
 type Platform = GatewayPlatform;
 
@@ -107,6 +108,21 @@ function normalizeGatewayPermissionMode(value: unknown): string {
 	return GATEWAY_DEFAULT_PERMISSION_MODE;
 }
 
+function normalizeGatewayConfigUrls(config: GatewayConfig): GatewayConfig {
+	return {
+		...config,
+		platforms: config.platforms?.map((platform) => ({
+			...platform,
+			stt: platform.stt
+				? {
+						...platform.stt,
+						baseUrl: normalizeUrlProtocol(platform.stt.baseUrl) || undefined,
+					}
+				: platform.stt,
+		})),
+	};
+}
+
 export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProps) {
 	const { t } = useTranslation("settings");
 	const {
@@ -154,49 +170,54 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 	}, [inited, config]);
 
 	// Compute which platforms changed (for targeted reload)
-	const getChangedPlatforms = useCallback((): Platform[] => {
-		const oldPlatforms = serverSnapshot.current.platforms ?? [];
-		const newPlatforms = config.platforms ?? [];
-		const changed = new Set<Platform>();
+	const getChangedPlatforms = useCallback(
+		(nextConfig: GatewayConfig = config): Platform[] => {
+			const oldPlatforms = serverSnapshot.current.platforms ?? [];
+			const newPlatforms = nextConfig.platforms ?? [];
+			const changed = new Set<Platform>();
 
-		// Platforms that were added or modified
-		for (const np of newPlatforms) {
-			const op = oldPlatforms.find((p) => p.platform === np.platform);
-			if (!op || JSON.stringify(op) !== JSON.stringify(np)) {
-				changed.add(np.platform);
+			// Platforms that were added or modified
+			for (const np of newPlatforms) {
+				const op = oldPlatforms.find((p) => p.platform === np.platform);
+				if (!op || JSON.stringify(op) !== JSON.stringify(np)) {
+					changed.add(np.platform);
+				}
 			}
-		}
-		// Platforms that were removed
-		for (const op of oldPlatforms) {
-			if (!newPlatforms.find((p) => p.platform === op.platform)) {
-				changed.add(op.platform);
+			// Platforms that were removed
+			for (const op of oldPlatforms) {
+				if (!newPlatforms.find((p) => p.platform === op.platform)) {
+					changed.add(op.platform);
+				}
 			}
-		}
-		return Array.from(changed);
-	}, [config]);
+			return Array.from(changed);
+		},
+		[config],
+	);
 
 	const handleSave = useCallback(async () => {
+		const configToSave = normalizeGatewayConfigUrls(config);
+		if (JSON.stringify(configToSave) !== JSON.stringify(config)) setConfig(configToSave);
 		setSaving(true);
 		try {
 			await new Promise<void>((resolve, reject) => {
 				updateUserPref.mutate(
-					{ gatewayConfig: config },
+					{ gatewayConfig: configToSave },
 					{ onSuccess: () => resolve(), onError: (err) => reject(err) },
 				);
 			});
 
 			// Determine which platforms need reload
-			const changedPlatforms = getChangedPlatforms();
+			const changedPlatforms = getChangedPlatforms(configToSave);
 
 			// Also check if global gateway settings changed (enabled, streaming, etc.)
 			const globalChanged =
-				serverSnapshot.current.enabled !== config.enabled ||
-				serverSnapshot.current.streaming !== config.streaming ||
-				serverSnapshot.current.defaultPermissionMode !== config.defaultPermissionMode ||
-				serverSnapshot.current.defaultProjectId !== config.defaultProjectId ||
-				serverSnapshot.current.defaultChapterId !== config.defaultChapterId ||
-				serverSnapshot.current.sessionIdleMinutes !== config.sessionIdleMinutes ||
-				serverSnapshot.current.rateLimitPerMinute !== config.rateLimitPerMinute;
+				serverSnapshot.current.enabled !== configToSave.enabled ||
+				serverSnapshot.current.streaming !== configToSave.streaming ||
+				serverSnapshot.current.defaultPermissionMode !== configToSave.defaultPermissionMode ||
+				serverSnapshot.current.defaultProjectId !== configToSave.defaultProjectId ||
+				serverSnapshot.current.defaultChapterId !== configToSave.defaultChapterId ||
+				serverSnapshot.current.sessionIdleMinutes !== configToSave.sessionIdleMinutes ||
+				serverSnapshot.current.rateLimitPerMinute !== configToSave.rateLimitPerMinute;
 
 			if (globalChanged && changedPlatforms.length === 0) {
 				// Global settings changed but no specific platform — full reload
@@ -206,7 +227,7 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 				if (reloadablePlatforms.length > 0) await miscApi.gatewayReload(reloadablePlatforms);
 			}
 
-			serverSnapshot.current = config;
+			serverSnapshot.current = configToSave;
 			notifications.show({ message: t("gatewaySaveSuccess"), color: "green" });
 		} catch (err) {
 			notifications.show({
@@ -997,7 +1018,11 @@ function QQBotFields({
 						value={sttBaseUrl}
 						placeholder="https://open.bigmodel.cn/api/coding/paas/v4"
 						onChange={(e) => setSttBaseUrl(e.currentTarget.value)}
-						onBlur={() => saveStt({ baseUrl: sttBaseUrl || undefined })}
+						onBlur={() => {
+							const normalizedBaseUrl = normalizeUrlProtocol(sttBaseUrl) ?? "";
+							setSttBaseUrl(normalizedBaseUrl);
+							saveStt({ baseUrl: normalizedBaseUrl || undefined });
+						}}
 					/>
 					<TextInput
 						label={t("gatewayQQBotSttModel")}

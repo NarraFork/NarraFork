@@ -93,6 +93,11 @@ export interface ActiveNarrator {
 	_substatus: Set<string>;
 	/** One-shot reset for reusable upstream provider sessions before the next request. */
 	_resetUpstreamSessionOnNextRequest?: boolean;
+	/**
+	 * Latest history compact seq that has completed while this narrator is alive,
+	 * but has not yet been consumed by a rebuilt in-memory agent history.
+	 */
+	_pendingHistoryCompactSeq?: number;
 	/** Goal accounting baseline at the start of the current turn. */
 	_goalTurnStartedAtMs?: number;
 	_goalTokenUsageBaseline?: TokenUsageSnapshot;
@@ -196,6 +201,35 @@ export function resetActiveUpstreamSession(narratorId: string): boolean {
 	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
 	return true;
+}
+
+/**
+ * Mark that a completed history compact still needs to be picked up by the
+ * active agent loop's in-memory history/system prompt before more auto-compact
+ * triggers are allowed.
+ */
+export function markActiveHistoryCompactPending(narratorId: string, seq?: number | null): boolean {
+	const active = activeNarrators.get(narratorId);
+	if (!active?.alive) return false;
+	const nextSeq = typeof seq === "number" ? seq : 0;
+	active._pendingHistoryCompactSeq = Math.max(active._pendingHistoryCompactSeq ?? 0, nextSeq);
+	return true;
+}
+
+/**
+ * Whether a completed history compact is still waiting to be reflected in the
+ * active agent loop's in-memory history. While true, additional auto-compact
+ * triggers must be suppressed to avoid compacting the same stale context twice.
+ */
+export function hasPendingHistoryCompact(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	return active?._pendingHistoryCompactSeq != null;
+}
+
+/** Clear the pending-history-compact marker once the active history has caught up. */
+export function clearActiveHistoryCompactPending(narratorId: string): void {
+	const active = activeNarrators.get(narratorId);
+	if (active) active._pendingHistoryCompactSeq = undefined;
 }
 
 export const narratorCreationLocks = hotSafe<Map<string, Promise<ActiveNarrator>>>(

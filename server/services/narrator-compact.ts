@@ -12,6 +12,7 @@ import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-ses
 import {
 	activeNarrators,
 	compactLocks,
+	markActiveHistoryCompactPending,
 	pruneLocks,
 	resetActiveUpstreamSession,
 } from "./narrator-session-state";
@@ -317,6 +318,12 @@ async function doRunCustomCompact(
 
 		await narratorService.clearPruneBoundary(narratorId);
 		resetActiveUpstreamSession(narratorId);
+		// Record that a history compact has completed but the active agent loop
+		// has not yet rebuilt its in-memory history from the new summary. This
+		// guards against a second background compact firing on the same (stale)
+		// context before the first one is consumed, which previously dropped a
+		// large chunk of context.
+		markActiveHistoryCompactPending(narratorId, compactedMsg?.seq ?? null);
 
 		let contextPercentAfter = contextPercent;
 		if (compactedMsg) {

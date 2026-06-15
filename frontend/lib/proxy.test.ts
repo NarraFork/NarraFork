@@ -4,6 +4,8 @@ import { normalizeProxyUrl, summarizeWebFetchProxyPolicy } from "./proxy";
 describe("proxy helpers", () => {
 	test("normalizes proxy URLs without schemes", () => {
 		expect(normalizeProxyUrl("proxy.example.test:8080")).toBe("http://proxy.example.test:8080");
+		expect(normalizeProxyUrl("127.0.0.1:8080")).toBe("http://127.0.0.1:8080");
+		expect(normalizeProxyUrl("localhost:8080")).toBe("http://localhost:8080");
 		expect(normalizeProxyUrl("socks5://proxy.example.test:1080")).toBe(
 			"socks5://proxy.example.test:1080",
 		);

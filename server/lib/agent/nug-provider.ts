@@ -12,6 +12,17 @@ import { AnthropicProvider } from "./anthropic-provider";
 import {
 	extractImageFileName,
 	parseSSEStream,
+import {
+	BoundedConfirmedRefSet,
+	type ConfirmedRefSet,
+	type DedupResult,
+	dedupAnthropicHistoryImages,
+	dedupOpenAIHistoryImages,
+	type ImagePayloadMap,
+	isImageCacheMissError,
+	restoreAnthropicHistoryImages,
+	restoreOpenAIHistoryImages,
+} from "./nug-image-dedup";
 import { OpenAIProvider } from "./openai-provider";
 import type {
 	ChatParams,
@@ -31,6 +42,25 @@ function httpError(message: string, status: number): Error {
 	const err = new Error(message);
 	(err as Error & { status: number }).status = status;
 	return err;
+}
+
+/**
+ * Image refs the NUG gateway has confirmed are cached, keyed by gateway identity
+ * (baseUrl + apiKey). Shared across NugProvider instances in this process so the
+ * confirmation survives the per-request provider re-creation done by
+ * resolveProviderAndModel(). A ref is only added after the gateway emits an
+ * `imageCacheAckEvent`, and is dropped on a cache miss so the next request resends
+ * the image inline.
+ */
+const confirmedImageRefsByGateway = new Map<string, ConfirmedRefSet>();
+
+function confirmedRefSetFor(key: string): ConfirmedRefSet {
+	let set = confirmedImageRefsByGateway.get(key);
+	if (!set) {
+		set = new BoundedConfirmedRefSet(MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY);
+		confirmedImageRefsByGateway.set(key, set);
+	}
+	return set;
 }
 
 function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
@@ -126,6 +156,7 @@ export interface NugBillingOrderResponse {
 
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
+const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
 
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
@@ -241,11 +272,34 @@ export class NugProvider implements ProviderAdapter {
 		return true;
 	}
 
+	/** Stable key identifying this gateway for the shared confirmed-ref cache. */
+	private get gatewayKey(): string {
+		return `${this.baseUrl}\u0000${this.config.apiKey}`;
+	}
+
+	/** The set of image refs this gateway has confirmed are cached. */
+	private get confirmedImageRefs(): ConfirmedRefSet {
+		return confirmedRefSetFor(this.gatewayKey);
+	}
+
+	/**
+	 * Record gateway image-cache acknowledgements. Returns true if the event was an
+	 * ack (and should not be forwarded to the agent loop).
+	 */
+	private consumeImageCacheAckEvent(event: ParsedStreamEvent): boolean {
+		const ack = event.nugImageCacheAck;
+		if (!ack) return false;
+		const confirmed = this.confirmedImageRefs;
+		for (const ref of ack.refs) confirmed.add(ref);
+		return true;
+	}
+
 	private async *filterModelCatalogEvents(
 		stream: AsyncIterable<ParsedStreamEvent>,
 	): AsyncGenerator<ParsedStreamEvent> {
 		for await (const event of stream) {
 			if (this.consumeModelCatalogEvent(event)) continue;
+			if (this.consumeImageCacheAckEvent(event)) continue;
 			yield event;
 		}
 	}
@@ -317,12 +371,69 @@ export class NugProvider implements ProviderAdapter {
 		const delegate = this.createDelegate(meta);
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
-		if (delegate) {
-			yield* this.filterModelCatalogEvents(
-				delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
-			);
+
+		// Image dedup: every history image is tagged with a content-hash `imageRef`.
+		// Only images whose ref the gateway has already acknowledged as cached are
+		// sent ref-only (payload stripped); all others keep their inline payload so
+		// the gateway can cache them and emit an `imageCacheAckEvent` we record.
+		//
+		// The agent loop reuses this same history array across turns and retries,
+		// so any stripped payload is restored once this attempt finishes (success,
+		// failure, or early close) to avoid leaving the persistent history empty.
+		//
+		// The history shape depends on the channel: anthropic uses Messages-API
+		const history = Array.isArray(params.history) ? params.history : undefined;
+		const confirmed = this.confirmedImageRefs;
+		const dedupHistory = (h: unknown[]): DedupResult => {
+			if (meta.channelType === "anthropic") return dedupAnthropicHistoryImages(h, confirmed);
+			if (delegate) return dedupOpenAIHistoryImages(h, confirmed);
+		};
+		const restoreHistory = (h: unknown[], p: ImagePayloadMap): void => {
+			if (meta.channelType === "anthropic") restoreAnthropicHistoryImages(h, p);
+			else if (delegate) restoreOpenAIHistoryImages(h, p);
+		};
+		const dedup: DedupResult | undefined = history ? dedupHistory(history) : undefined;
+		let restored = false;
+		const restore = (): void => {
+			if (restored || !history || !dedup || dedup.stripped.size === 0) return;
+			restored = true;
+			restoreHistory(history, dedup.stripped);
+		};
+
+		const runOnce = (): AsyncGenerator<ParsedStreamEvent> =>
+			delegate
+				? this.filterModelCatalogEvents(
+						delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
+					)
+
+		let yielded = false;
+		let cacheMiss = false;
+		try {
+			for await (const event of runOnce()) {
+				yielded = true;
+				yield event;
+			}
 			return;
+		} catch (err) {
+			// A cache miss can only occur before any stream event (the gateway
+			// rejects during body resolution). If we already streamed events, or
+			// nothing was stripped, propagate the error.
+			if (yielded || !dedup || dedup.stripped.size === 0 || !isImageCacheMissError(err)) {
+				throw err;
+			}
+			// The gateway no longer has these payloads: forget the confirmation so
+			// future turns resend them inline, restore the originals, and retry once.
+			for (const ref of dedup.stripped.keys()) confirmed.delete(ref);
+			cacheMiss = true;
+		} finally {
+			// Always restore stripped payloads so the reused history keeps full bytes.
+			restore();
 		}
+
+		if (!cacheMiss) return;
+
+		// Retry once with full inline payloads restored.
+		yield* runOnce();
 	}
 
 		params: ChatParams,

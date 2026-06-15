@@ -6,6 +6,7 @@ import { ensurePrefix } from "../components/providers/types";
 import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
 import { normalizeProxyUrl } from "../lib/proxy";
+import { normalizeUrlProtocol } from "../lib/url";
 
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 
@@ -283,10 +284,12 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	}, [isDirty]);
 
 	const save = () => {
+		const normalizedUpdateServerUrl = normalizeUrlProtocol(state.updateServerUrl) ?? "";
 		const normalizedWebFetchProxyUrl = normalizeProxyUrl(state.webFetchProxyUrl) ?? "";
 		const normalizedState = {
 			...state,
 			dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
+			updateServerUrl: normalizedUpdateServerUrl,
 			webFetchProxyUrl: normalizedWebFetchProxyUrl,
 		};
 		updateSettings.mutate(
@@ -375,7 +378,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						null,
 				},
 				update: {
-					serverUrl: state.updateServerUrl || undefined,
+					serverUrl: normalizedUpdateServerUrl || undefined,
 					channel: state.updateChannel,
 					autoDownload: state.updateAutoDownload,
 				},

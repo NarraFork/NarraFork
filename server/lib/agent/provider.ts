@@ -92,6 +92,8 @@ export interface ParsedStreamEvent {
 	detailedQuotaBalance?: string | null;
 	/** NUG model catalog update sent when the client's cached model hash is stale. */
 	nugModelCatalog?: { modelHash?: string; models: Array<Record<string, unknown>> };
+	/** NUG image-cache confirmation: these refs are cached and can be sent as ref-only later. */
+	nugImageCacheAck?: { refs: string[] };
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

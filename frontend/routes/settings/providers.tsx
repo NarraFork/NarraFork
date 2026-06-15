@@ -34,6 +34,7 @@ import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { normalizeProxyUrl } from "../../lib/proxy";
+import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/settings/providers")({
 	component: SettingsProvidersPage,
@@ -81,11 +82,20 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 
 	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 		...provider,
+		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
 		proxy: normalizeProxyUrl(provider.proxy) ?? "",
+	}));
+		...provider,
+		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
+	}));
+	const normalizedNugProviders = state.nugProviders.map((provider) => ({
+		...provider,
+		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
 	}));
 	const normalizedState: ProvidersState = {
 		...state,
 		customApiProviders: normalizedCustomApiProviders,
+		nugProviders: normalizedNugProviders,
 		modelContextWindows: migratedWindows,
 	};
 	const snapshot = createSnapshot(normalizedState);
@@ -95,7 +105,7 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		snapshot,
 		payload: {
 			customApiProviders: normalizedCustomApiProviders,
-			nugProviders: state.nugProviders,
+			nugProviders: normalizedNugProviders,
 			agent: {
 				hiddenModels: [...state.hiddenModels],
 				customModels: state.customModels,

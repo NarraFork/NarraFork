@@ -125,7 +125,9 @@ import type {
 import {
 	activeNarrators,
 	bufferedMessages,
+	clearActiveHistoryCompactPending,
 	compactLocks,
+	hasPendingHistoryCompact,
 	narratorCreationLocks,
 	pendingFeedback,
 	pendingPermissions,
@@ -782,6 +784,20 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	} = opts;
 
 	const onContextUsage = (percentage: number) => {
+		// If a history compact has completed but the active loop has not yet
+		// rebuilt its in-memory history from the new summary, this percentage is
+		// still measured against the stale (pre-compact) context. Acting on it
+		// would trigger a second compact on context that is about to shrink,
+		// dropping a large chunk of conversation. Skip until the rebuild lands.
+		if (hasPendingHistoryCompact(narratorId)) {
+			const active = activeNarrators.get(narratorId);
+			if (active) active._contextUsagePct = undefined;
+			logger.debug("Skipping context-usage compact trigger: prior compact not yet applied", {
+				narratorId,
+				contextPct: percentage,
+			});
+			return;
+		}
 		const thresholds = getContextThresholds(getModel(), getProvider());
 		const pruningWindowEnabled = isDynamicPruningWindowEnabled(thresholds);
 
@@ -916,6 +932,9 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	) => {
 		setPruneBoundary(boundary);
 		const rawMsgs = await narratorService.getMessagesSinceLastCompact(narratorId);
+		// The in-memory history is now rebuilt from the latest (post-compact)
+		// messages, so any pending-compact guard can be released.
+		clearActiveHistoryCompactPending(narratorId);
 		// Subagent messages all have parentToolUseId set — clear it so
 		// buildHistory treats them as top-level (same as loadSubagentHistory).
 		const msgs = isSubagentNarrator
@@ -1024,6 +1043,9 @@ export async function runAgentLoop(
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
 			const rawMessages = await narratorService.getMessagesSinceLastCompact(narratorId);
+			// History below is rebuilt from the latest post-compact messages, so any
+			// pending-compact guard set by a background compact can be released here.
+			clearActiveHistoryCompactPending(narratorId);
 
 			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
 			const freshNarrator = await narratorService.getById(narratorId);
@@ -2121,6 +2143,13 @@ export async function runAgentLoop(
 				active.provider,
 			);
 			const postTurnThresholds = getContextThresholds(postModel, postProvider);
+			if (active._contextUsagePct != null && hasPendingHistoryCompact(narratorId)) {
+				logger.debug("Dropping stale post-turn context usage: prior compact not yet applied", {
+					narratorId,
+					contextPct: active._contextUsagePct,
+				});
+				active._contextUsagePct = undefined;
+			}
 			if (active._contextUsagePct != null && !compactLocks.has(narratorId)) {
 				const postTurnContextPct = active._contextUsagePct;
 				active._contextUsagePct = undefined;

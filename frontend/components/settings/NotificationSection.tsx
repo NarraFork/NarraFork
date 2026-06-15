@@ -21,6 +21,7 @@ import {
 	playBuiltinSound,
 	playCustomSound,
 } from "../../lib/notification-sound";
+import { normalizeUrlProtocol } from "../../lib/url";
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
 type AnyPrefs = any;
@@ -90,8 +91,10 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 	const handleTestDingtalk = async () => {
 		setTestingDingtalk(true);
 		setTestResult(null);
+		const webhook = normalizeUrlProtocol(dingtalkWebhook) ?? "";
+		if (webhook !== dingtalkWebhook) setDingtalkWebhook(webhook);
 		try {
-			const res = await api.testDingtalkWebhook(dingtalkWebhook, dingtalkSecret);
+			const res = await api.testDingtalkWebhook(webhook, dingtalkSecret);
 			setTestResult({
 				type: "dingtalk",
 				ok: res.ok,
@@ -110,8 +113,10 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 	const handleTestFeishu = async () => {
 		setTestingFeishu(true);
 		setTestResult(null);
+		const webhook = normalizeUrlProtocol(feishuWebhook) ?? "";
+		if (webhook !== feishuWebhook) setFeishuWebhook(webhook);
 		try {
-			const res = await api.testFeishuWebhook(feishuWebhook, feishuSecret);
+			const res = await api.testFeishuWebhook(webhook, feishuSecret);
 			setTestResult({
 				type: "feishu",
 				ok: res.ok,
@@ -129,7 +134,12 @@ export function NotificationSection({ userPrefs, updateUserPref }: NotificationS
 
 	const saveWebhookField = (field: string, value: string) => {
 		if (value.startsWith("*")) return;
-		updateUserPref.mutate({ [field]: value || "" });
+		const normalizedValue = field.endsWith("Webhook")
+			? (normalizeUrlProtocol(value) ?? "")
+			: value || "";
+		if (field === "notifyDingtalkWebhook") setDingtalkWebhook(normalizedValue);
+		if (field === "notifyFeishuWebhook") setFeishuWebhook(normalizedValue);
+		updateUserPref.mutate({ [field]: normalizedValue });
 	};
 
 	return (

@@ -85,6 +85,7 @@ import {
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
+import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/routines/")({
 	component: RoutinesPage,
@@ -357,7 +358,9 @@ function HooksTab() {
 		};
 		if (draft.type === "command") payload.command = draft.command;
 		if (draft.type === "http") {
-			payload.url = draft.url;
+			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
+			payload.url = normalizedUrl;
+			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
 			if (draft.headers.trim()) {
 				try {
 					payload.headers = JSON.parse(draft.headers);
@@ -1746,7 +1749,7 @@ function McpToolsTab() {
 				.filter(Boolean);
 			if (d.cwd.trim()) payload.cwd = d.cwd.trim();
 		} else {
-			payload.url = d.url.trim();
+			payload.url = normalizeUrlProtocol(d.url) ?? "";
 			const hdrs = d.headers.filter((h) => h.key.trim());
 			if (hdrs.length > 0) {
 				payload.headers = Object.fromEntries(hdrs.map((h) => [h.key.trim(), h.value]));
@@ -1766,6 +1769,10 @@ function McpToolsTab() {
 
 	const handleSave = useCallback(() => {
 		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
+		if (draft.transport !== "stdio") {
+			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
+			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
+		}
 		const payload = draftToPayload(draft, Boolean(editingId));
 		if (!mcpServerPermissionsSupported) delete payload.defaultBehavior;
 		if (!payload.name) return;
@@ -1789,6 +1796,10 @@ function McpToolsTab() {
 
 	const handleTest = useCallback(() => {
 		if (!mcpServerManagementSupported || draftTransportUnsupportedReason) return;
+		if (draft.transport !== "stdio") {
+			const normalizedUrl = normalizeUrlProtocol(draft.url) ?? "";
+			if (normalizedUrl !== draft.url) setDraft((d) => ({ ...d, url: normalizedUrl }));
+		}
 		testMutation.mutate(draftToPayload(draft));
 	}, [
 		draft,

@@ -319,9 +319,9 @@ const CODEX_IDENTITY: Record<string, string> = {
 
 export type OAIContentPart =
 	| { type: "text"; text: string }
-	| { type: "image_url"; image_url: { url: string } }
+	| { type: "image_url"; image_url: { url: string }; imageRef?: string }
 	| { type: "input_text"; text: string }
-	| { type: "input_image"; image_url: string }
+	| { type: "input_image"; image_url: string; imageRef?: string }
 	| { type: "output_text"; text: string };
 
 interface ResponsesToolImage {
@@ -3233,7 +3233,11 @@ export function convertHistoryToResponsesApi(messages: OAIMessage[]): OAIMessage
 									return { type: "input_text", text: part.text };
 								}
 								if (part.type === "image_url") {
-									return { type: "input_image", image_url: part.image_url.url };
+									return {
+										type: "input_image",
+										image_url: part.image_url.url,
+										...(part.imageRef ? { imageRef: part.imageRef } : {}),
+									};
 								}
 								return part;
 							})

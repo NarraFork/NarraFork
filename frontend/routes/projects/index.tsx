@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { usePlatform } from "../../hooks/usePlatform";
 import { useCreateProject, useCreateProjectStream, useProjects } from "../../hooks/useProjects";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
+import { normalizeUrlProtocol } from "../../lib/url";
 
 const DirectoryPicker = lazy(() =>
 	import("../../components/common/DirectoryPicker").then((module) => ({
@@ -152,7 +153,9 @@ function ProjectListPage() {
 		};
 
 		if (repoMode === "clone") {
-			data.cloneUrl = cloneUrl.trim() || undefined;
+			const normalizedCloneUrl = normalizeUrlProtocol(cloneUrl) ?? "";
+			setCloneUrl(normalizedCloneUrl);
+			data.cloneUrl = normalizedCloneUrl || undefined;
 			data.cloneBranch = cloneBranch.trim() || undefined;
 
 			createProjectStream.mutate(data, {

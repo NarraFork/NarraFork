@@ -8,7 +8,11 @@ import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
-import { hasMarkdownMath, isSafeForFlowtokenAnimation } from "./markdown-detection";
+import {
+	hasMarkdownMath,
+	isSafeForFlowtokenAnimation,
+	normalizeMathDelimiters,
+} from "./markdown-detection";
 
 export { MD_PATTERN } from "./markdown-detection";
 
@@ -415,6 +419,14 @@ export const MarkdownContent = memo(function MarkdownContent({
 		return mathPlugins ? [mathPlugins.rehypeKatex] : [];
 	}, [mathPlugins]);
 
+	// Rewrite `\(...\)` / `\[...\]` to `$...$` / `$$...$$` so remark-math can
+	// parse formulas emitted by models that use backslash-delimited LaTeX.
+	// Only run when math plugins are active to avoid touching non-math content.
+	const markdownSource = useMemo(
+		() => (mathPlugins ? normalizeMathDelimiters(trimmed) : trimmed),
+		[mathPlugins, trimmed],
+	);
+
 	const plainFallback = (
 		<Text
 			size="sm"
@@ -456,7 +468,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 					rehypePlugins={rehypePlugins}
 					components={staticComponents}
 				>
-					{trimmed}
+					{markdownSource}
 				</Markdown>
 			</div>
 		</MarkdownErrorBoundary>

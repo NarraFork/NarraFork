@@ -35,6 +35,7 @@ import {
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { normalizeUrlProtocol } from "../../lib/url";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 
@@ -338,7 +339,12 @@ export const ClineSection = React.memo(function ClineSection({
 							size="xs"
 							variant="light"
 							leftSection={<IconLink size={14} />}
-							onClick={() => canImportCallback && importCallbackMutation.mutate(callbackUrl)}
+							onClick={() => {
+								if (!canImportCallback) return;
+								const normalizedCallbackUrl = normalizeUrlProtocol(callbackUrl) ?? "";
+								setCallbackUrl(normalizedCallbackUrl);
+								importCallbackMutation.mutate(normalizedCallbackUrl);
+							}}
 							loading={importCallbackMutation.isPending}
 							disabled={!callbackUrl.trim() || !canImportCallback}
 							title={!canImportCallback ? providerRouteUnsupportedReason : undefined}
