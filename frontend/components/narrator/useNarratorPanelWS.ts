@@ -325,6 +325,7 @@ export interface UseNarratorPanelWSReturn {
 	detailedQuotaBalance: string | null;
 	// Browser sessions
 	browserSessionCount: number;
+	browserVisualChange: { sessionId: string; seq: number } | null;
 	// Retry
 	retryInfo: RetryInfo | null;
 	paymentRequired: PaymentRequiredInfo | null;
@@ -818,6 +819,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[statusState.contextPercent],
 	);
 	const [browserSessionCount, setBrowserSessionCount] = useState(0);
+	// Carries a monotonic seq alongside the sessionId so consecutive visual
+	// changes to the SAME session still produce a new object reference and
+	// trigger the screenshot auto-refresh (a bare string would bail out of
+	// React state updates when unchanged).
+	const [browserVisualChange, setBrowserVisualChange] = useState<{
+		sessionId: string;
+		seq: number;
+	} | null>(null);
 	);
 	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
 	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
@@ -2674,6 +2683,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setBrowserSessionCount(count);
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
 			},
+			onBrowserSessionVisualChange: (sessionId) => {
+				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
+			},
 			onWebSearch: (id, status, query, queries, outputIndex, parentToolUseId) => {
 				// Subagent native searches are delivered to the parent for bookkeeping,
 				// but must not populate the parent's top-level streaming message.
@@ -3371,6 +3383,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
+			browserVisualChange,
 			retryInfo,
 			paymentRequired,
 			setPaymentRequired,
@@ -3413,6 +3426,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
+			browserVisualChange,
 			retryInfo,
 			paymentRequired,
 			currentTodos,

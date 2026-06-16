@@ -434,6 +434,11 @@ export type NarratorServerMessage =
 			activeBrowserSessions: number;
 	  }
 	| {
+			type: "browser_session_visual_change";
+			narratorId: string;
+			sessionId: string;
+	  }
+	| {
 			type: "container_status_changed";
 			narratorId: string;
 			chapterId: string;

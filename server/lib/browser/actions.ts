@@ -6,7 +6,7 @@ import type { KeyInput, Page } from "puppeteer-core";
 import { cleanHtml } from "../web-fetch/dom";
 import { serializeBrowserValue } from "./serialization";
 import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
-import { drainConsoleCaptures, touchSession } from "./session";
+import { drainConsoleCaptures, touchSession, touchSessionVisual } from "./session";
 
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_ACTION_TIMEOUT = 10_000;
@@ -158,7 +158,7 @@ export async function navigate(
 	session: BrowserSession,
 	opts: { url?: string; direction?: "back" | "forward" },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const { page } = session;
 
 	if (opts.direction === "back") {
@@ -178,7 +178,7 @@ export async function click(
 	selector: string,
 	opts?: { coordinate?: { x: number; y: number }; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const { page } = session;
 
 	// Set up a navigation listener BEFORE clicking — if the click triggers a
@@ -209,7 +209,7 @@ export async function fill(
 	value: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	// Click to focus, Ctrl+A to select all (works for both inputs and textareas),
 	// then Backspace to clear, then type new value.
 	await session.page.click(selector);
@@ -228,7 +228,7 @@ export async function select(
 	value: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	await session.page.select(selector, value);
 	return { snapshot: await snapshot(session.page) };
 }
@@ -238,7 +238,7 @@ export async function type(
 	session: BrowserSession,
 	opts: { selector?: string; value?: string; key?: string; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const { page } = session;
 
 	if (opts.key) {
@@ -265,7 +265,7 @@ export async function hover(
 	selector: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	await session.page.hover(selector);
 	return { snapshot: await snapshot(session.page) };
 }
@@ -416,7 +416,7 @@ export async function evaluate(
 	expression: string,
 	opts?: { maxLength?: number; timeout?: number; signal?: AbortSignal },
 ): Promise<{ result: string; snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
 
 	const raw = await runWithTimeout(session.page.evaluate(expression), {
@@ -451,7 +451,7 @@ export async function evaluateCapture(
 		signal?: AbortSignal;
 	},
 ): Promise<EvaluateCaptureResult> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const maxLength = opts?.maxLength ?? DEFAULT_MAX_LENGTH;
 	await drainConsoleCaptures(session);
 	if (opts?.clear ?? true) {
@@ -504,7 +504,7 @@ export async function wait(
 	session: BrowserSession,
 	opts: { selector?: string; state?: "visible" | "hidden" | "attached"; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const { page } = session;
 	const timeout = opts.timeout ?? DEFAULT_ACTION_TIMEOUT;
 
@@ -534,7 +534,7 @@ export async function scroll(
 		coordinate?: { x: number; y: number };
 	},
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSession(session);
+	touchSessionVisual(session);
 	const { page } = session;
 	const amount = opts.amount ?? 500;
 	const deltaY = opts.direction === "up" ? -amount : amount;

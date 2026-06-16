@@ -164,6 +164,54 @@ export const updateNarratorModelSchema = z.object({
 	model: z.union([z.literal("__default__"), z.string().min(1).max(200)]),
 });
 
+// === Browser session interaction ===
+
+const browserCoordinateSchema = z.object({
+	x: z.number().finite(),
+	y: z.number().finite(),
+});
+
+const browserKeyEntrySchema = z
+	.object({
+		text: z.string().optional(),
+		key: z.string().optional(),
+	})
+	.refine((v) => v.text !== undefined || v.key !== undefined, {
+		message: "each keys entry must include text or key",
+	});
+
+export const browserInteractSchema = z
+	.object({
+		action: z.enum(["click", "scroll", "drag", "type"]),
+		coordinate: browserCoordinateSchema.optional(),
+		endCoordinate: browserCoordinateSchema.optional(),
+		direction: z.enum(["up", "down"]).optional(),
+		amount: z.number().finite().positive().max(100000).optional(),
+		text: z.string().optional(),
+		key: z.string().optional(),
+		keys: z.array(browserKeyEntrySchema).min(1).max(200).optional(),
+	})
+	.superRefine((v, ctx) => {
+		if (v.action !== "type" && !v.coordinate) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				message: "coordinate is required for this action",
+			});
+		}
+		if (v.action === "drag" && !v.endCoordinate) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				message: "coordinate and endCoordinate are required for drag action",
+			});
+		}
+		if (v.action === "type" && v.text === undefined && v.key === undefined && !v.keys) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				message: "text, key, or keys is required for type action",
+			});
+		}
+	});
+
 // === Narrator suggest answers ===
 
 export const suggestAnswersSchema = z.object({

@@ -179,6 +179,7 @@ export type NarraForkEvent =
 	| { type: "browser:session_created"; sessionId: string; narratorId: string; url: string }
 	| { type: "browser:session_closed"; sessionId: string; narratorId: string }
 	| { type: "browser:session_updated"; sessionId: string; narratorId: string }
+	| { type: "browser:session_visual_change"; sessionId: string; narratorId: string }
 	// Terminal lifecycle
 	| {
 			type: "terminal:created";

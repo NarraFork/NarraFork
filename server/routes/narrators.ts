@@ -47,7 +47,13 @@ import {
 	normalizeBooleanOverride,
 	normalizeDangerReflectionOverride,
 } from "../lib/boolean-override";
-import { screenshot as browserScreenshot } from "../lib/browser/actions";
+import {
+	click as browserClick,
+	screenshot as browserScreenshot,
+	scroll as browserScroll,
+	type as browserType,
+} from "../lib/browser/actions";
+import { DEFAULT_VIEWPORT } from "../lib/browser/pool";
 import {
 	closeSession as closeBrowserSession,
 	getSession as getBrowserSession,
@@ -56,6 +62,7 @@ import {
 	MIN_SESSION_TTL_MS,
 	setSessionTtl as setBrowserSessionTtl,
 	stopTracing as stopBrowserTracing,
+	touchSessionVisual,
 } from "../lib/browser/session";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
@@ -97,6 +104,7 @@ import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploa
 import {
 	askInPassingSchema,
 	askInPassingStartSchema,
+	browserInteractSchema,
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
@@ -3323,7 +3331,8 @@ narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 
 narratorRoutes.get("/:id/browser-sessions", (c) => {
 	const narratorId = c.req.param("id");
-	return c.json(listBrowserSessions(narratorId));
+	const sessions = listBrowserSessions(narratorId);
+	return c.json(sessions.map((s) => ({ ...s, viewport: DEFAULT_VIEWPORT })));
 });
 
 narratorRoutes.patch("/:id/browser-sessions/:sessionId/ttl", async (c) => {
@@ -3398,6 +3407,73 @@ narratorRoutes.get("/:id/browser-sessions/:sessionId/screenshot", async (c) => {
 	const sessionId = c.req.param("sessionId");
 	const session = getBrowserSession(narratorId, sessionId);
 	if (!session) throw new NotFoundError("BrowserSession", sessionId);
+	const result = await browserScreenshot(session);
+	const buffer = Buffer.from(result.base64, "base64");
+	return new Response(buffer, {
+		headers: {
+			"Content-Type": "image/png",
+			"Cache-Control": "no-store",
+		},
+	});
+});
+
+narratorRoutes.post("/:id/browser-sessions/:sessionId/interact", async (c) => {
+	const narratorId = c.req.param("id");
+	const sessionId = c.req.param("sessionId");
+	const session = getBrowserSession(narratorId, sessionId);
+	if (!session) throw new NotFoundError("BrowserSession", sessionId);
+
+	const rawBody = await c.req.json().catch(() => ({}));
+	const parsed = browserInteractSchema.safeParse(rawBody);
+	if (!parsed.success) {
+		return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid interact request" }, 400);
+	}
+	const { action, coordinate, endCoordinate, direction, amount, text, key, keys } = parsed.data;
+
+	const { page } = session;
+
+	switch (action) {
+		case "click":
+			await browserClick(session, "", { coordinate });
+			break;
+		case "scroll": {
+			const scrollDirection = direction ?? "down";
+			const scrollAmount = amount ?? 300;
+			await browserScroll(session, {
+				direction: scrollDirection,
+				amount: scrollAmount,
+				coordinate,
+			});
+			break;
+		}
+		case "drag": {
+			// Presence of coordinate/endCoordinate is guaranteed by the schema.
+			if (!coordinate || !endCoordinate) break;
+			touchSessionVisual(session);
+			await page.mouse.move(coordinate.x, coordinate.y);
+			await page.mouse.down();
+			await page.mouse.move(endCoordinate.x, endCoordinate.y, { steps: 10 });
+			await page.mouse.up();
+			break;
+		}
+		case "type": {
+			if (keys) {
+				// Batch: execute a sequence of key/text inputs in order
+				for (const item of keys) {
+					if (item.key) {
+						await browserType(session, { key: item.key });
+					} else if (item.text) {
+						await browserType(session, { value: item.text });
+					}
+				}
+			} else {
+				await browserType(session, { value: text, key });
+			}
+			break;
+		}
+	}
+
+	// Return fresh screenshot after the interaction
 	const result = await browserScreenshot(session);
 	const buffer = Buffer.from(result.base64, "base64");
 	return new Response(buffer, {

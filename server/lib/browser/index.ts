@@ -19,4 +19,5 @@ export {
 	stopNetworkCapture,
 	stopTracing,
 	touchSession,
+	touchSessionVisual,
 } from "./session";

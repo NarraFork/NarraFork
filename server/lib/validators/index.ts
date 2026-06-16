@@ -57,6 +57,7 @@ export {
 	askInPassingSchema,
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,
+	browserInteractSchema,
 	codexDefaultReasoningEffortSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,

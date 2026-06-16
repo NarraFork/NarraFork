@@ -792,6 +792,7 @@ export const narratorsApi = {
 				tracing: { active: boolean; startedAt: number } | null;
 				networkRequestCount: number;
 				networkCaptureEnabled: boolean;
+				viewport: { width: number; height: number };
 			}[]
 		>(`/narrators/${narratorId}/browser-sessions`),
 	closeBrowserSession: (narratorId: string, sessionId: string) =>
@@ -804,5 +805,30 @@ export const narratorsApi = {
 	stopBrowserTracing: (narratorId: string, sessionId: string) =>
 		request(`/narrators/${narratorId}/browser-sessions/${sessionId}/stop-tracing`, {
 			method: "POST",
+		}),
+	interactBrowserSession: (
+		narratorId: string,
+		sessionId: string,
+		params: {
+			action: "click" | "scroll" | "drag" | "type";
+			coordinate?: { x: number; y: number };
+			endCoordinate?: { x: number; y: number };
+			direction?: "up" | "down";
+			amount?: number;
+			text?: string;
+			key?: string;
+			keys?: Array<{ text?: string; key?: string }>;
+		},
+	) =>
+		fetch(`/api/narrators/${narratorId}/browser-sessions/${sessionId}/interact`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${getToken()}`,
+			},
+			body: JSON.stringify(params),
+		}).then(async (res) => {
+			if (!res.ok) throw new Error(`interact failed: ${res.status}`);
+			return res.blob();
 		}),
 };

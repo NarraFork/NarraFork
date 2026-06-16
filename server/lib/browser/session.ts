@@ -64,6 +64,8 @@ export interface BrowserNetworkRequest {
 
 export interface BrowserSession {
 	id: string;
+	/** The narrator that owns this session. */
+	narratorId: string;
 	context: BrowserContext;
 	/** The currently active page. */
 	page: Page;
@@ -362,6 +364,19 @@ export function touchSession(session: BrowserSession): void {
 	session.lastActivity = Date.now();
 }
 
+/**
+ * Touch a session AND emit a visual-change event.
+ * Call this for actions that modify the visible page state (click, fill, navigate, scroll, etc.).
+ */
+export function touchSessionVisual(session: BrowserSession): void {
+	session.lastActivity = Date.now();
+	eventBus.emit({
+		type: "browser:session_visual_change",
+		sessionId: session.id,
+		narratorId: session.narratorId,
+	});
+}
+
 /** Create a new browser session for a narrator. */
 export async function createSession(
 	narratorId: string,
@@ -382,6 +397,7 @@ export async function createSession(
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
 		id: sessionId,
+		narratorId,
 		context,
 		page,
 		url,

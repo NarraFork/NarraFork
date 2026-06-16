@@ -176,7 +176,7 @@ import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
-import { BrowserSessionBar } from "./BrowserSessionBar";
+import { BrowserPanel } from "./BrowserPanel";
 import { ChapterBar } from "./ChapterBar";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
@@ -8033,8 +8033,12 @@ export function NarratorPanel({
 					{/* Chapter bar */}
 					{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
-					{/* Browser sessions bar */}
-					<BrowserSessionBar narratorId={narratorId} sessionCount={wsState.browserSessionCount} />
+					{/* Browser sessions panel */}
+					<BrowserPanel
+						narratorId={narratorId}
+						sessionCount={wsState.browserSessionCount}
+						visualChange={wsState.browserVisualChange}
+					/>
 
 					{/* Status bar */}
 					<Group

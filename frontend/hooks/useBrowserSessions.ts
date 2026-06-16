@@ -51,3 +51,26 @@ export function useStopBrowserTracing() {
 		},
 	});
 }
+
+export function useInteractBrowserSession() {
+	return useMutation({
+		mutationFn: ({
+			narratorId,
+			sessionId,
+			params,
+		}: {
+			narratorId: string;
+			sessionId: string;
+			params: {
+				action: "click" | "scroll" | "drag" | "type";
+				coordinate?: { x: number; y: number };
+				endCoordinate?: { x: number; y: number };
+				direction?: "up" | "down";
+				amount?: number;
+				text?: string;
+				key?: string;
+				keys?: Array<{ text?: string; key?: string }>;
+			};
+		}) => api.interactBrowserSession(narratorId, sessionId, params),
+	});
+}

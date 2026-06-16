@@ -322,6 +322,27 @@ function debouncedBrowserSessionCount(narratorId: string) {
 	);
 }
 
+// === Browser session visual change listener ===
+
+const pendingBrowserVisualBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
+
+function debouncedBrowserVisualChange(narratorId: string, sessionId: string) {
+	const key = `${narratorId}:${sessionId}`;
+	const existing = pendingBrowserVisualBroadcasts.get(key);
+	if (existing) clearTimeout(existing);
+	pendingBrowserVisualBroadcasts.set(
+		key,
+		setTimeout(() => {
+			pendingBrowserVisualBroadcasts.delete(key);
+			broadcastToNarrator(narratorId, {
+				type: "browser_session_visual_change",
+				narratorId,
+				sessionId,
+			});
+		}, 300),
+	);
+}
+
 // === Container status change listener ===
 // When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
 // and broadcast to subscribers of the chapter's narrator. Debounced per-chapter.
@@ -400,6 +421,10 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 	eventBus.on("browser:session_updated", (event) => {
 		debouncedBrowserSessionCount(event.narratorId);
+	});
+
+	eventBus.on("browser:session_visual_change", (event) => {
+		debouncedBrowserVisualChange(event.narratorId, event.sessionId);
 	});
 
 	eventBus.on("container:started", (event) => {
