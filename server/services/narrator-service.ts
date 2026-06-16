@@ -1087,7 +1087,12 @@ export const narratorService = {
 				systemPrompt = `${parent.systemPrompt}\n\n## Previous Context Summary\n\nThis session continues from a previous conversation. Here is a summary of the prior context:\n\n${contextSummary}`;
 			}
 		} else if (inheritMode === "full") {
-			apiConversationId = parent.apiConversationId ?? null;
+			// Do NOT inherit apiConversationId: forked narrators must use their
+			// own upstream session to avoid sharing a sticky routing slot in NUG
+			// (which causes queue contention and unintended co-migration on
+			// credential switches). The first request will establish a fresh
+			// upstream session automatically.
+			apiConversationId = null;
 			contextSummary = parent.contextSummary ?? null;
 		}
 
