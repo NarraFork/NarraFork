@@ -9,6 +9,7 @@ import {
 	type ModelOption,
 	mergeModels,
 	modelValue,
+	nugChannelTypeLabel,
 } from "../lib/constants";
 import {
 	getProviderAgentModeCapability,
@@ -233,7 +234,7 @@ export function useAllModels() {
 				const channelType = String(m.channelType ?? channel);
 				models.push({
 					value: `${prefix}:${id}`,
-					label: `${String(m.name ?? bareModel)} · ${channel} / ${channelType}`,
+					label: `${String(m.name ?? bareModel)} · ${channel} / ${nugChannelTypeLabel(channelType)}`,
 					provider: prefix,
 					channel,
 					channelType,

@@ -103,12 +103,18 @@ function normalizeModelHash(value: unknown): string | undefined {
 
 function loadProviderCacheEntry(providerId: string, value: unknown): void {
 	if (Array.isArray(value)) {
-		cachedModelsByProvider.set(providerId, normalizeModels(value as Array<Record<string, unknown>>));
+		cachedModelsByProvider.set(
+			providerId,
+			normalizeModels(value as Array<Record<string, unknown>>),
+		);
 		return;
 	}
 	if (!isRecord(value)) return;
 	const rawModels = Array.isArray(value.models) ? value.models : [];
-	cachedModelsByProvider.set(providerId, normalizeModels(rawModels as Array<Record<string, unknown>>));
+	cachedModelsByProvider.set(
+		providerId,
+		normalizeModels(rawModels as Array<Record<string, unknown>>),
+	);
 	const modelHash = normalizeModelHash(value.modelHash ?? value.hash);
 	if (modelHash) cachedModelHashByProvider.set(providerId, modelHash);
 	const fetchedAt = typeof value.fetchedAt === "number" ? value.fetchedAt : undefined;

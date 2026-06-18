@@ -1,9 +1,5 @@
-import {
-	saveAllCachedNugModels,
-	setNugCachedModels,
-	type NugModelInfo,
-} from "./nug-model-cache";
-import { nugProviderPrefix, saveSettings, settings, type NUGProviderConfig } from "./settings";
+import { type NugModelInfo, saveAllCachedNugModels, setNugCachedModels } from "./nug-model-cache";
+import { type NUGProviderConfig, nugProviderPrefix, saveSettings, settings } from "./settings";
 
 export interface NugModelCatalogApplyResult {
 	models: NugModelInfo[];

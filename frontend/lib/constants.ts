@@ -21,6 +21,22 @@ export type ModelOption = {
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
+/** Human-readable label for a NUG model's channelType (request protocol). */
+export function nugChannelTypeLabel(channelType?: string): string {
+	switch (channelType) {
+		case "codex":
+			return "codex 兼容";
+		case "responses":
+			return "responses 兼容";
+		case "openai":
+			return "openai 兼容";
+		case "anthropic":
+			return "anthropic";
+		default:
+			return channelType ?? "";
+	}
+}
+
 /** Prefix for model aggregation values. */
 export const AGG_MODEL_PREFIX = "__agg__:";
 

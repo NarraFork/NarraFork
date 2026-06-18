@@ -450,7 +450,9 @@ export function usesStatefulApi(prefix?: string): boolean {
 
 export function usesStatefulModel(prefix?: string, model?: string): boolean {
 	if (usesStatefulApi(prefix)) return true;
-	return usesCodexModel(prefix, model);
+	if (usesCodexModel(prefix, model)) return true;
+	// NUG "responses" channel models use the stateful /responses endpoint too.
+	return resolveNugChannelType(prefix, model) === "responses";
 }
 
 export function isAnthropicProvider(prefix?: string): boolean {
