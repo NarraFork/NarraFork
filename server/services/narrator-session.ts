@@ -3356,12 +3356,39 @@ type EditableUserContentBlock =
 			filename: string;
 			mediaType: string;
 			uploadNarratorId?: string;
-	  };
+	  }
+	| { type: "text_file"; filename: string; size: number; filePath: string };
+
+/**
+ * Extract persisted text-file attachment blocks as TextFileRefs so the edited
+ * prompt can re-inject the <attached_files> hint. The underlying files already
+ * live in the worktree, so we only need their metadata.
+ */
+function extractTextFileRefs(contentJson: unknown): TextFileRef[] {
+	const refs: TextFileRef[] = [];
+	if (!Array.isArray(contentJson)) return refs;
+	for (const block of contentJson as Array<Record<string, unknown>>) {
+		if (
+			block.type === "text_file" &&
+			typeof block.filename === "string" &&
+			typeof block.filePath === "string" &&
+			typeof block.size === "number"
+		) {
+			refs.push({
+				filename: block.filename,
+				filePath: block.filePath,
+				size: block.size,
+			});
+		}
+	}
+	return refs;
+}
 
 /**
  * Replace editable text while preserving the persisted attachment block order.
- * New user messages are stored as images first, then text; editing must not move
- * those image blocks or history replay/front-end fetches can target the wrong shape.
+ * New user messages are stored as images/text_files first, then text; editing
+ * must not move or drop those attachment blocks or history replay/front-end
+ * fetches can target the wrong shape (and attachments would silently vanish).
  */
 function buildEditedUserContentJson(
 	contentJson: unknown,
@@ -3397,6 +3424,21 @@ function buildEditedUserContentJson(
 				filename: block.filename,
 				mediaType: block.mediaType,
 				...(uploadNarratorId ? { uploadNarratorId } : {}),
+			});
+			continue;
+		}
+
+		if (
+			block.type === "text_file" &&
+			typeof block.filename === "string" &&
+			typeof block.filePath === "string" &&
+			typeof block.size === "number"
+		) {
+			newBlocks.push({
+				type: "text_file",
+				filename: block.filename,
+				size: block.size,
+				filePath: block.filePath,
 			});
 		}
 	}
@@ -3454,9 +3496,15 @@ export async function editAndRegenerate(
 		targetMsg.narratorId,
 	);
 	const existingImages = extractImageRefs(targetMsg.contentJson, targetMsg.narratorId);
+	const existingTextFiles = extractTextFileRefs(targetMsg.contentJson);
+
+	// Re-inject the attached-files hint so the regenerated turn keeps access to
+	// any text-file attachments (contentText feeds the AI prompt + FTS index,
+	// while contentJson keeps the raw user text for display).
+	const effectivePrompt = newContent + buildAttachedFilesHint(existingTextFiles);
 
 	const privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
-		contentText: newContent,
+		contentText: effectivePrompt,
 		contentJson: newContentJson,
 	});
 
@@ -3498,7 +3546,7 @@ export async function editAndRegenerate(
 	active._turnStartedAt = new Date().toISOString();
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
-	runAgentLoop(active, newContent, imageRefs.length > 0 ? imageRefs : undefined).catch(
+	runAgentLoop(active, effectivePrompt, imageRefs.length > 0 ? imageRefs : undefined).catch(
 		async (err) => {
 			logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 				narratorId,
