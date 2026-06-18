@@ -25,7 +25,7 @@ let port: number;
 try {
 	const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
 	jwtSecret = raw.auth?.jwtSecret;
-	port = Number(process.env.PORT) || raw.server?.port ?? 7778;
+	port = (Number(process.env.PORT) || raw.server?.port) ?? 7778;
 	if (!jwtSecret) {
 		console.error("No JWT secret found in settings. Has the server been started at least once?");
 		process.exit(1);
@@ -43,9 +43,9 @@ const approvedIds = new Set<string>();
 async function getToken(): Promise<string> {
 	// We need a real user ID — the auth middleware verifies the user exists in the DB.
 	const sqlite = new Database(dbPath, { readonly: true });
-	const admin = sqlite
-		.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1")
-		.get() as { id: string } | null;
+	const admin = sqlite.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get() as {
+		id: string;
+	} | null;
 	sqlite.close();
 	if (!admin) {
 		console.error("No admin user found in the database. Please create one first.");
