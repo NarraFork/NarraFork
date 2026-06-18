@@ -3,14 +3,8 @@ import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import {
-	getAnthropicProviderConfig,
-	getModelContextWindow,
-	isAnthropicProvider,
-	settings,
-	usesCodexModel,
-	usesStatefulModel,
-} from "../settings";
+import { shouldUseNativeSearch } from "../search/native";
+import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import {
@@ -1568,12 +1562,9 @@ export async function* agentLoop(
 		providerName: string,
 		modelName: string,
 	): ResolvedToolDefinition[] {
-		// Codex and official Anthropic providers use native server-side web_search —
-		// remove the WebSearch function tool to avoid duplicate search capabilities.
-		// Non-official (proxy) Anthropic providers keep the WebSearch function tool.
-		const isOfficialAnthropic =
-			isAnthropicProvider(providerName) && !!getAnthropicProviderConfig(providerName)?.officialApi;
-		if (usesCodexModel(providerName, modelName) || isOfficialAnthropic) {
+		// Providers only hide the function-style WebSearch when the unified native-search
+		// channel is currently enabled as the first search channel for this model.
+		if (shouldUseNativeSearch(providerName, modelName)) {
 			return allTools.filter((t) => t.name !== "WebSearch");
 		}
 		return allTools;

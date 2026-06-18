@@ -29,6 +29,14 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify({ model, prompt }),
 		}),
+	testSearchChannel: (data: { channelId?: string; query: string; purpose?: string }) =>
+		request<{ text: string; channelId: string; channelLabel: string; attempts?: unknown[] }>(
+			"/settings/search/test",
+			{
+				method: "POST",
+				body: JSON.stringify(data),
+			},
+		),
 
 	// User Preferences
 	getUserPreferences: () =>

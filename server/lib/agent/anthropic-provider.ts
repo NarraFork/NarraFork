@@ -3,6 +3,7 @@ import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
+import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
 import { getModelContextWindow, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
@@ -894,9 +895,10 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		body.system = systemBlocks;
 
-		// Tools: official API appends server-side web_search after user tools;
-		// proxy mode uses function tools only.
-		if (isOfficial) {
+		// Tools: official API appends server-side web_search only when the unified
+		// native-search channel is enabled for this provider/model; proxy mode uses
+		// function tools only.
+		if (isOfficial && shouldUseNativeSearch(this.config.prefix, model)) {
 			const serverTools: Record<string, unknown>[] = [
 				{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES },
 			];

@@ -12,6 +12,7 @@ import {
 	IconPalette,
 	IconPlayerPlay,
 	IconReceipt2,
+	IconSearch,
 	IconServer,
 	IconShield,
 	IconTerminal2,
@@ -65,6 +66,7 @@ function MobileSettingsNav() {
 
 	const instanceItems = [
 		{ to: "/settings/providers", label: t("providersSection"), icon: <IconCloud size={20} /> },
+		{ to: "/settings/search", label: t("searchSection"), icon: <IconSearch size={20} /> },
 		{
 			to: "/settings/proxy",
 			label: t("proxyManagementSection"),

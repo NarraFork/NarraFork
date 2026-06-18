@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
+import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
@@ -683,7 +684,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (this.apiMode === "codex") {
 				const toolsArr = (body.tools ?? []) as unknown[];
 				appendCodexNativeTools(toolsArr, model, {
-					webSearch: this.codexWebSearchEnabled,
+					webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
 				body.tools = toolsArr;
@@ -1287,7 +1288,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		appendCodexNativeTools(tools, model, {
-			webSearch: this.codexWebSearchEnabled,
+			webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
 			imageGeneration: this.codexImageGenerationEnabled,
 		});
 		request.tools = tools;

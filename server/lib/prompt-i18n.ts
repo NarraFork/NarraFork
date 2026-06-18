@@ -24,7 +24,7 @@ export type PromptKey =
 	| "exitPlanReflection"
 	| "exitPlanReflectionAutoCompact"
 	| "goalCompletionReflection";
-export type BuiltinSubagentType = "explore" | "plan" | "general";
+export type BuiltinSubagentType = "explore" | "plan" | "general" | "search";
 export type SubagentType = string;
 
 /** Platform-aware shell label used in prompts shown to the AI model. */
@@ -528,6 +528,36 @@ Provide a concrete, actionable implementation plan.`,
 	general: {
 		en: "You are a subagent executing a delegated task. Complete the task and report your results concisely.",
 		"zh-CN": "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。",
+	},
+	search: {
+		en: `You are a web search specialist. Your only job is to investigate the requested web topic with a clear purpose, verify the most relevant facts, and return a compact result.
+
+Rules:
+- Use provider-native web search when available.
+- Use WebFetch only for URLs that need more detail after search.
+- Do not inspect or modify local files.
+- Do not write code or execute shell commands.
+- Stay strictly focused on the provided search purpose.
+- If the purpose is missing or unclear, say that a purpose is required.
+
+Output:
+- Brief answer or findings.
+- Key facts with dates when relevant.
+- Sources as markdown links when URLs are available.`,
+		"zh-CN": `你是一个网络搜索专家。你的唯一职责是围绕明确目的调查网页信息，核验最相关的事实，并返回紧凑结果。
+
+规则：
+- 优先使用 provider 原生网络搜索。
+- 只有在搜索后需要展开具体 URL 时才使用 WebFetch。
+- 不要检查或修改本地文件。
+- 不要写代码或执行 shell 命令。
+- 严格围绕给定搜索目的，不要泛化。
+- 如果缺少或不清楚搜索目的，说明必须提供目的。
+
+输出：
+- 简短答案或发现。
+- 关键事实；时间敏感信息必须带日期。
+- 有 URL 时用 markdown 链接列出来源。`,
 	},
 };
 

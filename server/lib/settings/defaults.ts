@@ -19,11 +19,13 @@ export const DEFAULTS: NarraForkSettings = {
 		subagentModels: {
 			explore: "",
 			plan: "",
+			search: "",
 		},
 		subagentAllowedModels: {
 			explore: [],
 			plan: [],
 			general: [],
+			search: [],
 		},
 		legacyEncoding: false,
 		freshShellEnv: false,
@@ -85,6 +87,15 @@ export const DEFAULTS: NarraForkSettings = {
 		useWebSocket: true,
 		useWebSearch: true,
 		useImageGeneration: true,
+	},
+	search: {
+		channels: [
+			{ id: "native", kind: "native", enabled: true },
+			{ id: "subagent", kind: "subagent", enabled: false, maxTurns: 4 },
+		],
+		customProviders: [],
+		defaultTimeoutMs: 60_000,
+		maxOutputChars: 24_000,
 	},
 	update: {
 		serverUrl: "https://narrafork-update.b.domexie.cn",
@@ -226,7 +237,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 	},
 	"agent.subagentModels.plan": {
-		desc: "plan 子代理的默认模型。空字符串表示使用全局 defaultModel。",
+		desc: "plan 子代理默认模型。空字符串表示继承父叙述者/全局默认模型。",
+		type: "string",
+	},
+	"agent.subagentModels.search": {
+		desc: "search 子代理默认模型。空字符串表示继承父叙述者/全局默认模型。",
 		type: "string",
 	},
 	"agent.subagentAllowedModels.explore": {
@@ -239,6 +254,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.subagentAllowedModels.general": {
 		desc: "general 子代理允许的模型池。空数组表示无限制。",
+		type: "string[]",
+	},
+	"agent.subagentAllowedModels.search": {
+		desc: "search 子代理允许的模型池。空数组表示无限制。",
 		type: "string[]",
 	},
 	"agent.legacyEncoding": {
@@ -495,6 +514,24 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"codex.useImageGeneration": {
 		desc: "是否向 Codex 请求注入原生 image_generation 图像生成工具。关闭后不再发送该工具。默认开启。",
 		type: "boolean",
+	},
+
+	// ── search ──────────────────────────────────────────────────────────
+	"search.channels": {
+		desc: "统一网络搜索渠道列表。按顺序尝试；native 原生搜索只在支持的模型上作为最高优先级生效。",
+		type: "array",
+	},
+	"search.customProviders": {
+		desc: "自定义搜索 API provider 列表，独立于模型 provider。",
+		type: "array",
+	},
+	"search.defaultTimeoutMs": {
+		desc: "单次搜索渠道调用默认超时时间（毫秒）。",
+		type: "number",
+	},
+	"search.maxOutputChars": {
+		desc: "搜索工具返回给模型的最大字符数，防止结果过大。",
+		type: "number",
 	},
 
 	// ── update ──────────────────────────────────────────────────────────

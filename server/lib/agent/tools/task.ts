@@ -1,11 +1,7 @@
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
-import {
-	getAnthropicProviderConfig,
-	getVisibleModels,
-	isAnthropicProvider,
-	settings,
-} from "../../settings";
+import { shouldUseNativeSearch } from "../../search/native";
+import { getVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
@@ -103,11 +99,8 @@ function buildParameters() {
 	});
 }
 
-function usesNativeWebSearch(provider: string): boolean {
-	if (provider === "codex") return true;
-	if (isAnthropicProvider(provider) && !!getAnthropicProviderConfig(provider)?.officialApi)
-		return true;
-	return false;
+function usesNativeWebSearch(config: AgentConfig): boolean {
+	return shouldUseNativeSearch(config.provider, config.model);
 }
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
@@ -121,7 +114,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			},
 			subagent_type: {
 				description:
-					'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "general". Custom types are also supported.',
+					'The type of specialized agent to use for this task. Built-in types: "explore", "plan", "search", "general". Custom types are also supported.',
 				type: "string",
 			},
 			run_in_background: {
@@ -168,7 +161,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 export const agentTool: ToolDefinition = {
 	name: "Agent",
 	description(config: AgentConfig) {
-		if (usesNativeWebSearch(config.provider)) {
+		if (usesNativeWebSearch(config)) {
 			return baseDescription.replaceAll("WebSearch", "web_search (native)");
 		}
 		return baseDescription;

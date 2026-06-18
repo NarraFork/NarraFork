@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
-import { getAnthropicProviderConfig, isAnthropicProvider } from "../../settings";
+import { shouldUseNativeSearch } from "../../search/native";
 import { createShare, getShareDir } from "../../shares";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
@@ -24,17 +24,10 @@ const WEB_FETCH_BODY =
 	"- max_length (optional): Maximum output length in characters (default: 20000, not applicable to screenshot mode)\n" +
 	"- purpose (optional): What information you are looking for (smart mode only). When provided, the AI summarizer will prioritize extracting content relevant to this goal instead of producing a generic summary.";
 
-function usesNativeWebSearch(provider: string): boolean {
-	if (provider === "codex") return true;
-	if (isAnthropicProvider(provider) && !!getAnthropicProviderConfig(provider)?.officialApi)
-		return true;
-	return false;
-}
-
 export const webFetchTool: ToolDefinition = {
 	name: "WebFetch",
 	description(config: AgentConfig) {
-		const intro = usesNativeWebSearch(config.provider)
+		const intro = shouldUseNativeSearch(config.provider, config.model)
 			? "Fetch and extract content from a web page URL. Use this after the native web_search tool to get detailed content from specific URLs."
 			: "Fetch and extract content from a web page URL. Use this after WebSearch to get detailed content from specific URLs.";
 		return `${intro}\n\n${WEB_FETCH_BODY}`;

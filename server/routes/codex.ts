@@ -8,6 +8,7 @@ import {
 import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
+import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "../lib/search/settings";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
 	codexDefaultReasoningEffortSchema,
@@ -518,8 +519,13 @@ codexRoutes.post("/use-web-search", async (c) => {
 		throw new ValidationError(parsed.error.message);
 	}
 
+	const useWebSearch = parsed.data.useWebSearch ?? true;
 	settings.codex = settings.codex || {};
-	settings.codex.useWebSearch = parsed.data.useWebSearch ?? true;
+	settings.codex.useWebSearch = useWebSearch;
+	settings.search = settings.search ?? { channels: [], customProviders: [] };
+	settings.search.channels = getNormalizedSearchChannels(settings).map((channel) =>
+		channel.id === SEARCH_NATIVE_CHANNEL_ID ? { ...channel, enabled: useWebSearch } : channel,
+	);
 	saveSettings(settings);
 
 	return c.json({ ok: true, useWebSearch: settings.codex.useWebSearch ?? true });

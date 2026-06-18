@@ -7,7 +7,7 @@ import { getVisibleModels, resolveAllowedModelCandidate, settings } from "./sett
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
 export const DISABLED_TOOLS_TRAIT_PREFIX = "custom-disabled-tools:";
 
-const BUILTIN_SUBAGENT_POOL_KEYS = new Set(["explore", "plan", "general"]);
+const BUILTIN_SUBAGENT_POOL_KEYS = new Set(["explore", "plan", "search", "general"]);
 const MAX_MODEL_LENGTH = 200;
 const MAX_PURPOSE_LENGTH = 1000;
 const MAX_MODELS_PER_POOL = 50;
@@ -214,7 +214,10 @@ export function resolveEffectiveSubagentModelPolicy(
 ): EffectiveSubagentModelPolicy {
 	const restriction = parseSubagentModelRestrictionTrait(parentTraits);
 	const poolKey =
-		subagentType === "explore" || subagentType === "plan" || subagentType === "general"
+		subagentType === "explore" ||
+		subagentType === "plan" ||
+		subagentType === "search" ||
+		subagentType === "general"
 			? subagentType
 			: "general";
 	if (restriction) {
@@ -223,7 +226,8 @@ export function resolveEffectiveSubagentModelPolicy(
 	}
 
 	const settingsPool =
-		settings.agent.subagentAllowedModels?.[poolKey as "explore" | "plan" | "general"] ?? [];
+		settings.agent.subagentAllowedModels?.[poolKey as "explore" | "plan" | "search" | "general"] ??
+		[];
 	if (settingsPool.length === 0) {
 		return { source: "none", poolKey, models: [], isExplicitEmpty: false };
 	}
@@ -265,7 +269,7 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 	if (!restriction) return null;
 	const parts: string[] = [];
 	const keys = Object.keys(restriction.pools).sort((a, b) => {
-		const order = ["explore", "plan", "general"];
+		const order = ["explore", "plan", "search", "general"];
 		return (
 			(order.indexOf(a) === -1 ? 99 : order.indexOf(a)) -
 			(order.indexOf(b) === -1 ? 99 : order.indexOf(b))

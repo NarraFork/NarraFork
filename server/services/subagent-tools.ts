@@ -21,6 +21,9 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	"Send",
 ]);
 
+/** Tools available to search subagents. Native web_search is provider-side; WebFetch is for follow-up URLs. */
+const SEARCH_TOOLS = new Set(["WebFetch", "TaskCreate", "TeamStatus", "Await", "Send"]);
+
 /** Tools that are never available inside subagents. */
 const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);
 
@@ -104,6 +107,7 @@ const BUILTIN_TOOL_FILTERS: Record<string, (tool: ToolDefinition) => boolean> = 
 		isBuiltinToolAllowedForSubagent(tool.name) &&
 		(GENERAL_TOOLS.has(tool.name) ||
 			(isMcpTool(tool) && isMcpToolAllowedForSubagent(tool, "general"))),
+	search: (tool) => isBuiltinToolAllowedForSubagent(tool.name) && SEARCH_TOOLS.has(tool.name),
 };
 
 /**

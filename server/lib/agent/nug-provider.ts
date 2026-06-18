@@ -6,6 +6,7 @@ import {
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { getToolMessage, type Locale } from "../prompt-i18n";
+import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
@@ -241,6 +242,17 @@ export class NugProvider implements ProviderAdapter {
 					apiMode: "completions",
 					extraHeaders,
 				});
+			case "responses":
+				return new OpenAIProvider({
+					id: this.config.id,
+					name: this.config.name,
+					prefix: this.config.prefix,
+					apiKey: this.config.apiKey,
+					baseUrl: `${this.baseUrl}/v1`,
+					defaultModel: meta.routedModel,
+					apiMode: "responses",
+					extraHeaders,
+				});
 			case "anthropic":
 				return new AnthropicProvider({
 					id: this.config.id,
@@ -309,7 +321,8 @@ export class NugProvider implements ProviderAdapter {
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		if (this.activeDelegate) {
 			const effectiveTools =
-				this.activeMeta?.channelType === "codex"
+				this.activeMeta?.channelType === "codex" &&
+				shouldUseNativeSearch(this.config.prefix, this.activeMeta.routedModel)
 					? tools.filter((tool) => tool.name !== "WebSearch")
 					: tools;
 			return this.activeDelegate.formatTools(effectiveTools);

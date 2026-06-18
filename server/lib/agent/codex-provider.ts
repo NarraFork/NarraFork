@@ -5,6 +5,7 @@
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
+import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import {
@@ -704,7 +705,7 @@ export class CodexProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
 		appendCodexNativeTools(tools, model, {
-			webSearch: this.useWebSearch,
+			webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
 			imageGeneration: this.useImageGeneration,
 		});
 		request.tools = tools;

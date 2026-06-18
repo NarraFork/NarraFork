@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
+import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
@@ -354,6 +355,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (normalizeSearchSettings(merged, raw)) {
+		needsSave = true;
+	}
+
 	if (needsSave) saveSettings(merged);
 
 	return merged;
@@ -491,6 +496,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeCustomApiProviderSettings(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
+	normalizeSearchSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true });
 	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
 	settingsRevision++;

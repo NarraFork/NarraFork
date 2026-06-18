@@ -14,6 +14,8 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
+import { executeSearch } from "../lib/search/router";
+import { normalizeSearchSettings } from "../lib/search/settings";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	customApiProvidersToAnthropic,
@@ -167,6 +169,36 @@ const clineProviderSchema = z.object({
 	disabled: z.boolean().optional(),
 });
 
+const searchChannelSchema = z.object({
+	id: z.string().min(1),
+	enabled: z.boolean(),
+	providerId: z.string().optional(),
+	model: z.string().optional(),
+	reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+	maxTurns: z.number().int().min(1).max(10).optional(),
+	timeoutMs: z.number().int().min(1000).max(300000).optional(),
+});
+
+const customSearchProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	disabled: z.boolean().optional(),
+	protocol: z.literal("narrafork-search-v1"),
+	baseUrl: z.string(),
+	apiKey: z.string().optional(),
+	headers: z.record(z.string(), z.string()).optional(),
+	timeoutMs: z.number().int().min(1000).max(300000).optional(),
+});
+
+const searchSettingsSchema = z
+	.object({
+		channels: z.array(searchChannelSchema).max(100).optional(),
+		customProviders: z.array(customSearchProviderSchema).max(50).optional(),
+		defaultTimeoutMs: z.number().int().min(1000).max(300000).optional(),
+		maxOutputChars: z.number().int().min(1000).max(100000).optional(),
+	})
+	.partial();
+
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
 const updateSettingsSchema = z
 	.object({
@@ -204,6 +236,7 @@ const updateSettingsSchema = z
 					.object({
 						explore: z.string(),
 						plan: z.string(),
+						search: z.string(),
 					})
 					.partial(),
 				subagentAllowedModels: z
@@ -211,6 +244,7 @@ const updateSettingsSchema = z
 						explore: z.array(z.string()),
 						plan: z.array(z.string()),
 						general: z.array(z.string()),
+						search: z.array(z.string()),
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),
@@ -366,6 +400,7 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		search: searchSettingsSchema.optional(),
 		routines: z
 			.object({
 				disabledRoutines: z.array(z.string()),
@@ -455,6 +490,27 @@ function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["v
 	};
 }
 
+function isSensitiveHeaderName(name: string): boolean {
+	return /^(authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)$/i.test(name.trim());
+}
+
+function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSettings["search"] {
+	if (!search) return undefined;
+	return {
+		...search,
+		customProviders: (search.customProviders ?? []).map((provider) => ({
+			...provider,
+			apiKey: provider.apiKey ? maskApiKey(provider.apiKey) : "",
+			headers: Object.fromEntries(
+				Object.entries(provider.headers ?? {}).map(([key, value]) => [
+					key,
+					isSensitiveHeaderName(key) && value ? maskApiKey(value) : value,
+				]),
+			),
+		})),
+	};
+}
+
 /** Get RFC 1918 private IPv4 addresses from network interfaces. */
 function getLanAddresses(): string[] {
 	const nets = networkInterfaces();
@@ -531,6 +587,7 @@ function buildSettingsResponse(
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
 		vnet: maskVNetSettings(source.vnet),
+		search: maskSearchSettings(source.search),
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
@@ -754,6 +811,34 @@ settingsRoutes.post("/test-model", async (c) => {
 	}
 });
 
+const testSearchSchema = z.object({
+	query: z.string().min(2).max(1000),
+	purpose: z.string().max(1000).optional(),
+	channelId: z.string().optional(),
+});
+
+settingsRoutes.post("/search/test", async (c) => {
+	const body = await c.req.json();
+	const parsed = testSearchSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.issues.map((i) => i.message).join(", "));
+	}
+	try {
+		const result = await executeSearch({
+			query: parsed.data.query,
+			purpose: parsed.data.purpose,
+			channelId: parsed.data.channelId,
+			locale: "zh-CN",
+			signal: c.req.raw.signal,
+		});
+		return c.json(result);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logger.warn("Search channel test failed", { error: message, channelId: parsed.data.channelId });
+		return c.json({ error: message }, 502);
+	}
+});
+
 settingsRoutes.patch("/", async (c) => {
 	const body = normalizeLegacySettingsPatch(await c.req.json());
 	const parsed = updateSettingsSchema.safeParse(body);
@@ -930,6 +1015,24 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real API keys and sensitive headers for custom search providers.
+	if (validated.search?.customProviders) {
+		const currentProviders = current.search?.customProviders ?? [];
+		for (const p of validated.search.customProviders) {
+			const existing = currentProviders.find((cp) => cp.id === p.id);
+			if (p.apiKey?.startsWith("*")) {
+				p.apiKey = existing?.apiKey ?? "";
+			}
+			if (p.headers) {
+				for (const [key, value] of Object.entries(p.headers)) {
+					if (isSensitiveHeaderName(key) && value.startsWith("*")) {
+						p.headers[key] = existing?.headers?.[key] ?? "";
+					}
+				}
+			}
+		}
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
@@ -961,6 +1064,7 @@ settingsRoutes.patch("/", async (c) => {
 	}
 
 	normalizeCustomApiProviderSettings(merged);
+	normalizeSearchSettings(merged);
 
 	// Apply container proxy runtime changes first, then persist settings.
 	// This keeps persisted config and runtime state consistent if start/restart fails.

@@ -21,6 +21,7 @@ export interface SubagentAllowedModels {
 	explore: string[];
 	plan: string[];
 	general: string[];
+	search?: string[];
 }
 
 export interface ModelsSectionProps {
@@ -190,6 +191,16 @@ export function ModelsSection({
 					placeholder={t("subagentAllowedModelsPlaceholder")}
 					value={subagentAllowedModels.general}
 					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, general: v })}
+				/>
+				<MultiSelect
+					label={t("subagentAllowedModelsSearch")}
+					data={prefixedModels}
+					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
+					clearable
+					placeholder={t("subagentAllowedModelsPlaceholder")}
+					value={subagentAllowedModels.search ?? []}
+					onChange={(v) => setSubagentAllowedModels({ ...subagentAllowedModels, search: v })}
 				/>
 			</Stack>
 			<Select

@@ -702,7 +702,10 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 
 	// Load custom subagent definition once for non-builtin types
 	const isBuiltin =
-		subagentType === "explore" || subagentType === "plan" || subagentType === "general";
+		subagentType === "explore" ||
+		subagentType === "plan" ||
+		subagentType === "search" ||
+		subagentType === "general";
 	const customDef = isBuiltin ? null : await customSubagentService.loadByName(subagentType);
 
 	const rebuildSystemPrompt = (contextSummary?: string | null) =>
@@ -717,7 +720,7 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 
 	// Resolve model: explicit param > per-type setting / custom default > parent model > global default
 	let subagentPref: string | undefined;
-	if (subagentType === "explore" || subagentType === "plan") {
+	if (subagentType === "explore" || subagentType === "plan" || subagentType === "search") {
 		subagentPref = settings.agent.subagentModels?.[subagentType] || undefined;
 	} else if (customDef) {
 		subagentPref = customDef.defaultModel || undefined;

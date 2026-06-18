@@ -1,6 +1,6 @@
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { getAnthropicProviderConfig, isAnthropicProvider, usesCodexModel } from "../settings";
+import { shouldUseNativeSearch } from "../search/native";
 import {
 	capturePipelineOutput,
 	clipText,
@@ -97,17 +97,12 @@ export async function executeTool(
 	const tool = toolRegistry.get(tu.name);
 	const locale = (config.locale as Locale) ?? "en";
 
-	// Defense-in-depth: Codex and official Anthropic use native server-side web_search.
-	// The WebSearch function tool is filtered from the API request (line ~407), but the
-	// non-official codex endpoint may not validate tool names strictly — the model could
-	// still invoke "WebSearch" based on training data / tool descriptions. Block execution
-	const isOfficialAnthropic =
-		isAnthropicProvider(config.provider) &&
-		!!getAnthropicProviderConfig(config.provider)?.officialApi;
-	if (
-		tu.name === "WebSearch" &&
-		(usesCodexModel(config.provider, config.model) || isOfficialAnthropic)
-	) {
+	// Defense-in-depth: when unified native search is enabled for this provider/model,
+	// the WebSearch function tool is filtered from the API request. Some upstreams may
+	// still emit a learned function call; block it so the configured native channel remains
+	// the single source of truth. If native search is disabled, WebSearch remains available
+	// for managed/custom/subagent fallback channels.
+	if (tu.name === "WebSearch" && shouldUseNativeSearch(config.provider, config.model)) {
 		logger.warn("Blocked WebSearch function tool for native-search provider", {
 			provider: config.provider,
 			model: config.model,
