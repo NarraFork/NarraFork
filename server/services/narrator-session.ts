@@ -69,6 +69,7 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
+import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -1306,8 +1307,11 @@ export async function runAgentLoop(
 								if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 								active._gitTrackTimer = setTimeout(() => {
 									active._gitTrackTimer = undefined;
+									// File changes just happened → invalidate then read through
+									// the shared cache so co-located narrators reuse one query.
+									invalidateStatus(worktreePath);
 									Promise.all([
-										gitService.getStatusSummary(worktreePath),
+										getStatusSummaryCached(worktreePath, { ttlMs: 0 }),
 										baseBranch
 											? gitService.getCommitsAhead(worktreePath, baseBranch)
 											: Promise.resolve({ count: 0, baseBranch: "" }),
@@ -1404,6 +1408,27 @@ export async function runAgentLoop(
 											} catch {
 												return null;
 											}
+										});
+									}
+
+									// Attribute Bash-driven changes to this narrator.
+									try {
+										const { recordAttributions } = await import("./file-attribution-service");
+										await recordAttributions(
+											{
+												workspacePath: cwd,
+												narratorId,
+												action: "bash",
+												toolName: SHELL_TOOL_NAME,
+												toolUseId,
+											},
+											changedFiles,
+										);
+									} catch (err) {
+										logger.debug("Bash attribution failed", {
+											narratorId,
+											toolUseId,
+											error: String(err),
 										});
 									}
 								})

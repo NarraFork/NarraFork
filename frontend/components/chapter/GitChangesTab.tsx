@@ -15,13 +15,16 @@ import { IconCheck, IconMinus, IconPlus, IconSparkles } from "@tabler/icons-reac
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	type FileAttributionSummary,
 	useGitAiCommitMessage,
+	useGitAttributions,
 	useGitCommit,
 	useGitDiscard,
 	useGitStage,
 	useGitStatus,
 	useGitUnstage,
 } from "../../hooks/useGit";
+import { useNarrators } from "../../hooks/useNarrator";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { GitFileDiff } from "./GitFileDiff";
 
@@ -39,6 +42,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const { t } = useTranslation("git");
 	const confirm = useConfirmDialog();
 	const { data: status, isLoading } = useGitStatus(chapterId);
+	const { data: attributions } = useGitAttributions(chapterId);
+	const { data: narrators } = useNarrators({ chapterId });
 	const stage = useGitStage(chapterId);
 	const unstage = useGitUnstage(chapterId);
 	const commit = useGitCommit(chapterId);
@@ -48,6 +53,12 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 	const [message, setMessage] = useState("");
 	const [diffFile, setDiffFile] = useState<string | null>(null);
 	const [diffStaged, setDiffStaged] = useState(false);
+
+	// path → attribution summary, and narratorId → display label.
+	const attrByPath = new Map((attributions ?? []).map((a) => [a.filePath, a]));
+	const narratorLabel = new Map(
+		(narrators ?? []).map((n) => [n.id, n.title || t("attributionUnnamed")]),
+	);
 
 	if (isLoading) {
 		return <Loader size="sm" />;
@@ -149,6 +160,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 									setDiffFile(f.path);
 									setDiffStaged(true);
 								}}
+								attribution={attrByPath.get(f.path)}
+								narratorLabel={narratorLabel}
 								t={t}
 							/>
 						))}
@@ -197,6 +210,8 @@ export function GitChangesTab({ chapterId }: { chapterId: string }) {
 									setDiffFile(f.path);
 									setDiffStaged(false);
 								}}
+								attribution={attrByPath.get(f.path)}
+								narratorLabel={narratorLabel}
 								t={t}
 							/>
 						))}
@@ -258,6 +273,8 @@ function FileRow({
 	action,
 	onAction,
 	onClick,
+	attribution,
+	narratorLabel,
 	t,
 }: {
 	file: {
@@ -269,7 +286,9 @@ function FileRow({
 	action: "stage" | "unstage";
 	onAction: () => void;
 	onClick: () => void;
-	t: (key: string) => string;
+	attribution?: FileAttributionSummary;
+	narratorLabel: Map<string, string>;
+	t: (key: string, opts?: Record<string, unknown>) => string;
 }) {
 	const statusChar = file.status.replace(/\s/g, "") || "M";
 	const color = statusRegistry.gitFileStatus(statusChar).color;
@@ -289,6 +308,7 @@ function FileRow({
 			<Text size="xs" lineClamp={1} style={{ flex: 1, minWidth: 0 }} ff="monospace">
 				{clampGitFilePath(file.path)}
 			</Text>
+			<AttributionBadge attribution={attribution} narratorLabel={narratorLabel} t={t} />
 			{(file.displayLinesAdded > 0 || file.displayLinesRemoved > 0) && (
 				<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
 					{file.displayLinesAdded > 0 && (
@@ -316,5 +336,59 @@ function FileRow({
 				</ActionIcon>
 			</Tooltip>
 		</Group>
+	);
+}
+
+/** Compact badge showing who last changed a file, with a contributor tooltip. */
+function AttributionBadge({
+	attribution,
+	narratorLabel,
+	t,
+}: {
+	attribution?: FileAttributionSummary;
+	narratorLabel: Map<string, string>;
+	t: (key: string, opts?: Record<string, unknown>) => string;
+}) {
+	if (!attribution) return null;
+
+	const labelFor = (id: string | null): string =>
+		id ? (narratorLabel.get(id) ?? t("attributionUnknown")) : t("attributionExternal");
+
+	const lastLabel = attribution.lastNarratorId
+		? labelFor(attribution.lastNarratorId)
+		: attribution.hasExternal
+			? t("attributionExternal")
+			: t("attributionUnknown");
+
+	// Contributors other than the last modifier.
+	const others = attribution.contributorNarratorIds.filter(
+		(id) => id !== attribution.lastNarratorId,
+	);
+
+	const tooltipLines: string[] = [
+		t("attributionLastModified", { name: lastLabel }),
+		...others.map((id) => t("attributionAlsoModified", { name: labelFor(id) })),
+	];
+	if (attribution.hasExternal && attribution.lastNarratorId) {
+		tooltipLines.push(t("attributionHasExternal"));
+	}
+
+	const extraCount = others.length + (attribution.hasExternal ? 1 : 0);
+
+	return (
+		<Tooltip label={tooltipLines.join("\n")} multiline withinPortal>
+			<Badge
+				size="xs"
+				variant="light"
+				color={attribution.lastNarratorId ? "indigo" : "gray"}
+				style={{ flexShrink: 0, maxWidth: 110, cursor: "default", textTransform: "none" }}
+				onClick={(e) => e.stopPropagation()}
+			>
+				<Text size="xs" lineClamp={1} component="span">
+					{lastLabel}
+					{extraCount > 0 ? ` +${extraCount}` : ""}
+				</Text>
+			</Badge>
+		</Tooltip>
 	);
 }

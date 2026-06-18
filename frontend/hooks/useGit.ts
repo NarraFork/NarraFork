@@ -40,6 +40,28 @@ export interface GitStashEntry {
 	date: string;
 }
 
+export type AttributionAction = "write" | "edit" | "bash" | "external";
+
+export interface AttributionEvent {
+	id: string;
+	narratorId: string | null;
+	subagentType: string | null;
+	action: AttributionAction;
+	toolName: string | null;
+	toolUseId: string | null;
+	changedAt: string;
+}
+
+export interface FileAttributionSummary {
+	filePath: string;
+	lastNarratorId: string | null;
+	lastAction: AttributionAction;
+	lastChangedAt: string;
+	contributorNarratorIds: string[];
+	hasExternal: boolean;
+	timeline: AttributionEvent[];
+}
+
 // Queries
 
 const GIT_QUERY_GC_TIME_MS = 60_000;
@@ -48,6 +70,16 @@ export function useGitStatus(chapterId: string | undefined | null) {
 	return useQuery<GitStatusSummary>({
 		queryKey: ["gitStatus", chapterId],
 		queryFn: () => api.getGitStatus(chapterId as string),
+		enabled: !!chapterId,
+		refetchInterval: 30_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+	});
+}
+
+export function useGitAttributions(chapterId: string | undefined | null) {
+	return useQuery<FileAttributionSummary[]>({
+		queryKey: ["gitAttributions", chapterId],
+		queryFn: () => api.getGitAttributions(chapterId as string) as Promise<FileAttributionSummary[]>,
 		enabled: !!chapterId,
 		refetchInterval: 30_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,

@@ -23,6 +23,7 @@ import type { Locale } from "../lib/prompt-i18n";
 import { isNativeWatcherEnabled, ParcelRecursiveWatcher } from "../lib/watcher/parcel-watcher";
 import { commitSyncService } from "./commit-sync-service";
 import { gitService } from "./git-service";
+import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 
 /** Debounce interval for file change events (ms). */
 const DEBOUNCE_MS = 1500;
@@ -355,7 +356,10 @@ export const worktreeWatcher = {
 	async _processChange(worktreePath: string, entry: WatcherEntry): Promise<void> {
 		const { chapterId, narratorIds } = entry;
 
-		const statusSummary = await gitService.getStatusSummary(worktreePath);
+		// Files changed on disk → the cached status is stale. Invalidate then
+		// read through the shared cache so concurrent narrators reuse one query.
+		invalidateStatus(worktreePath);
+		const statusSummary = await getStatusSummaryCached(worktreePath, { ttlMs: 0 });
 		const currentHead = statusSummary.headSha;
 		const previousHead = entry.lastHeadSha;
 		const statusSignature = getStatusSignature(statusSummary);

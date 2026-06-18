@@ -1,8 +1,5 @@
-import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
-import { chapters } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { ValidationError } from "../lib/errors";
 import {
 	gitCommitSchema,
 	gitDiffQuerySchema,
@@ -14,18 +11,26 @@ import {
 	gitUnstageSchema,
 } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
+import { getAttributions } from "../services/file-attribution-service";
 import { gitService } from "../services/git-service";
+import { getStatusSummaryCached, invalidateStatus } from "../services/git-status-cache";
+import { resolveWorkspaceFromChapter } from "../services/git-workspace";
 
 export const gitRoutes = new Hono();
 
 /** Resolve chapter → worktreePath, throwing if not available. */
 async function resolveWorktree(chapterId: string) {
-	const ch = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-	});
-	if (!ch) throw new NotFoundError("Chapter", chapterId);
-	if (!ch.worktreePath) throw new ValidationError("Chapter has no active worktree");
-	return { chapter: ch, worktreePath: ch.worktreePath };
+	const ws = await resolveWorkspaceFromChapter(chapterId);
+	return { chapter: { id: chapterId }, worktreePath: ws.rawPath };
+}
+
+/**
+ * Fetch a status summary through the shared cache.
+ * After write operations, callers should `invalidateStatus(worktreePath)`
+ * first so the next read reflects the mutation.
+ */
+function statusSummary(worktreePath: string) {
+	return getStatusSummaryCached(worktreePath);
 }
 
 /** Validate file paths to prevent path traversal attacks. */
@@ -41,8 +46,17 @@ function validateFilePaths(files: string[]): void {
 
 gitRoutes.get("/:chapterId/git/status", async (c) => {
 	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
-	const summary = await gitService.getStatusSummary(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json(summary);
+});
+
+// --- Attributions: who/which session changed each file ---
+
+gitRoutes.get("/:chapterId/git/attributions", async (c) => {
+	const { worktreePath } = await resolveWorktree(c.req.param("chapterId"));
+	const file = c.req.query("file");
+	const attributions = await getAttributions(worktreePath, file || undefined);
+	return c.json(attributions);
 });
 
 // --- Stage ---
@@ -56,7 +70,8 @@ gitRoutes.post("/:chapterId/git/stage", async (c) => {
 		validateFilePaths(body.files);
 		await gitService.stageFiles(worktreePath, body.files);
 	}
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json(summary);
 });
 
@@ -71,7 +86,8 @@ gitRoutes.post("/:chapterId/git/unstage", async (c) => {
 		validateFilePaths(body.files);
 		await gitService.unstageFiles(worktreePath, body.files);
 	}
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json(summary);
 });
 
@@ -96,7 +112,8 @@ gitRoutes.post("/:chapterId/git/commit", async (c) => {
 		// Non-fatal — commit already happened
 	}
 
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json({ commitSha: sha, status: summary });
 });
 
@@ -111,7 +128,8 @@ gitRoutes.post("/:chapterId/git/discard", async (c) => {
 		validateFilePaths(body.files);
 		await gitService.discardFiles(worktreePath, body.files);
 	}
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json(summary);
 });
 
@@ -144,7 +162,8 @@ gitRoutes.post("/:chapterId/git/stash", async (c) => {
 		case "pop": {
 			const result = await gitService.stashPop(worktreePath);
 			if (result.hasConflicts) {
-				const summary = await gitService.getStatusSummary(worktreePath);
+				invalidateStatus(worktreePath);
+				const summary = await statusSummary(worktreePath);
 				return c.json({ hasConflicts: true, status: summary });
 			}
 			break;
@@ -154,7 +173,8 @@ gitRoutes.post("/:chapterId/git/stash", async (c) => {
 			break;
 	}
 
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json({ hasConflicts: false, status: summary });
 });
 
@@ -187,7 +207,8 @@ gitRoutes.post("/:chapterId/git/reset", async (c) => {
 		// Non-fatal
 	}
 
-	const summary = await gitService.getStatusSummary(worktreePath);
+	invalidateStatus(worktreePath);
+	const summary = await statusSummary(worktreePath);
 	return c.json(summary);
 });
 

@@ -59,7 +59,7 @@ export const writeTool: ToolDefinition = {
 
 			mkdirSync(dirname(resolvedPath), { recursive: true });
 			await writeFileText(resolvedPath, content, existingEncoding);
-			await trackFileChange(ctx, resolvedPath);
+			await trackFileChange(ctx, resolvedPath, "write");
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {
 			return {

@@ -3,6 +3,10 @@ import type { ApiEntity } from "./types";
 
 export const gitApi = {
 	getGitStatus: (chapterId: string) => request<ApiEntity>(`/chapters/${chapterId}/git/status`),
+	getGitAttributions: (chapterId: string, file?: string) =>
+		request<ApiEntity[]>(
+			`/chapters/${chapterId}/git/attributions${file ? `?file=${encodeURIComponent(file)}` : ""}`,
+		),
 	gitStage: (chapterId: string, body: { files?: string[]; all?: boolean }) =>
 		request<ApiEntity>(`/chapters/${chapterId}/git/stage`, {
 			method: "POST",

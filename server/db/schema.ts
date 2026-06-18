@@ -1202,3 +1202,37 @@ export const backgroundTasks = sqliteTable(
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 	],
 );
+
+// === file_attributions ===
+// Records every file modification attributed to a narrator/subagent (or an
+// external/terminal change). Keyed by normalized workspace path so it works
+// for chapters AND standalone narrators sharing the same directory. Powers the
+// "who changed this file" timeline in the Git panel.
+export const fileAttributions = sqliteTable(
+	"file_attributions",
+	{
+		id: text("id").primaryKey(),
+		/** Normalized absolute workspace path (forward slashes, platform-folded). */
+		workspacePath: text("workspace_path").notNull(),
+		/** Repo-relative file path as reported by git / the tool input. */
+		filePath: text("file_path").notNull(),
+		/** Narrator that performed the change. Null for purely external edits. */
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		/** Subagent type if the narrator was a subagent (explore/plan/general/review/...). */
+		subagentType: text("subagent_type"),
+		/** How the change was made. */
+		action: text("action", {
+			enum: ["write", "edit", "bash", "external"],
+		}).notNull(),
+		/** Tool name that produced the change (Write/Edit/Bash), if any. */
+		toolName: text("tool_name"),
+		/** Tool-use id linking back to narrator_tool_calls, if any. */
+		toolUseId: text("tool_use_id"),
+		changedAt: text("changed_at").notNull(),
+	},
+	(table) => [
+		index("idx_file_attr_workspace_file").on(table.workspacePath, table.filePath, table.changedAt),
+		index("idx_file_attr_narrator").on(table.narratorId),
+		index("idx_file_attr_workspace").on(table.workspacePath, table.changedAt),
+	],
+);

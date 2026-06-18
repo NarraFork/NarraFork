@@ -39,5 +39,11 @@
 	"commitEmpty": "No commits yet",
 	"splitHere": "Split chapter here",
 	"splitUnsupported": "Chapter split is not available in this backend runtime.",
-	"loadMore": "Load More"
+	"loadMore": "Load More",
+	"attributionLastModified": "Last modified by {{name}}",
+	"attributionAlsoModified": "Also modified by {{name}}",
+	"attributionHasExternal": "Also has external/terminal changes",
+	"attributionExternal": "External",
+	"attributionUnknown": "Unknown",
+	"attributionUnnamed": "Untitled session"
 }

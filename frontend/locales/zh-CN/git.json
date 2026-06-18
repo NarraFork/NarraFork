@@ -39,5 +39,11 @@
 	"commitEmpty": "暂无提交",
 	"splitHere": "在此拆分章节",
 	"splitUnsupported": "当前后端运行时不支持章节拆分。",
-	"loadMore": "加载更多"
+	"loadMore": "加载更多",
+	"attributionLastModified": "最后由 {{name}} 修改",
+	"attributionAlsoModified": "{{name}} 也参与修改",
+	"attributionHasExternal": "另有外部/终端改动",
+	"attributionExternal": "外部",
+	"attributionUnknown": "未知",
+	"attributionUnnamed": "未命名会话"
 }
