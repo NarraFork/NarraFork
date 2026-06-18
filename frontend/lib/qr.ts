@@ -223,13 +223,18 @@ function drawFormatBits(modules: boolean[][]): void {
 	const size = modules.length;
 	const bits = formatBits();
 	const get = (i: number) => ((bits >>> i) & 1) !== 0;
-	for (let i = 0; i <= 5; i++) modules[8][i] = get(i);
-	modules[8][7] = get(6);
+
+	// Format information is placed around the top-left finder and duplicated
+	// along the top-right / bottom-left timing areas. Coordinates here are
+	// matrix[row][col]; keep them in QR spec order so scanners can read the
+	// error-correction level and mask pattern.
+	for (let i = 0; i <= 5; i++) modules[i][8] = get(i);
+	modules[7][8] = get(6);
 	modules[8][8] = get(7);
-	modules[7][8] = get(8);
-	for (let i = 9; i < 15; i++) modules[14 - i][8] = get(i);
-	for (let i = 0; i < 8; i++) modules[size - 1 - i][8] = get(i);
-	for (let i = 8; i < 15; i++) modules[8][size - 15 + i] = get(i);
+	modules[8][7] = get(8);
+	for (let i = 9; i < 15; i++) modules[8][14 - i] = get(i);
+	for (let i = 0; i < 8; i++) modules[8][size - 1 - i] = get(i);
+	for (let i = 8; i < 15; i++) modules[size - 15 + i][8] = get(i);
 	modules[8][size - 8] = true;
 }
 
