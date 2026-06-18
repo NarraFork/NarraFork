@@ -16,6 +16,7 @@ export type ModelOption = {
 	channelType?: string;
 	bareModel?: string;
 	rateMultiplier?: number;
+	effortLevels?: string[];
 };
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */

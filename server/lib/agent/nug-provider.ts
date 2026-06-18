@@ -189,7 +189,7 @@ export class NugProvider implements ProviderAdapter {
 		return { [NUG_MODEL_HASH_HEADER]: this.modelHashHeaderValue() };
 	}
 
-	private chatHeaders(conversationId?: string): Record<string, string> {
+	private chatHeaders(conversationId?: string, effort?: string): Record<string, string> {
 		const h: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${this.config.apiKey}`,
@@ -198,6 +198,9 @@ export class NugProvider implements ProviderAdapter {
 		};
 		if (conversationId) {
 			h["X-Conversation-ID"] = conversationId;
+		}
+		// additionalModelRequestFields based on this and the model's effort schema.
+		// Mirror the Go backend's whitelist so only valid effort levels are sent.
 		}
 		return h;
 	}
@@ -454,7 +457,7 @@ export class NugProvider implements ProviderAdapter {
 	): AsyncGenerator<ParsedStreamEvent> {
 
 		const body = { model: meta.routedModel, ...request };
-		const headers = this.chatHeaders(conversationId);
+		const headers = this.chatHeaders(conversationId, params.reasoningEffort);
 		params.requestDump?.setRequest({
 			transport: "http",
 			headers: sanitizeHeaders(headers),

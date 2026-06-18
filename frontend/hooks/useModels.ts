@@ -232,6 +232,9 @@ export function useAllModels() {
 				const bareModel = String(rawBareModel || id);
 				const channel = String(m.channel ?? id.split(":")[0] ?? "");
 				const channelType = String(m.channelType ?? channel);
+				const effortLevels = Array.isArray(m.effortLevels)
+					? m.effortLevels.filter((l): l is string => typeof l === "string")
+					: undefined;
 				models.push({
 					value: `${prefix}:${id}`,
 					label: `${String(m.name ?? bareModel)} · ${channel} / ${nugChannelTypeLabel(channelType)}`,
@@ -239,6 +242,7 @@ export function useAllModels() {
 					channel,
 					channelType,
 					bareModel,
+					...(effortLevels && effortLevels.length > 0 ? { effortLevels } : {}),
 				});
 			}
 			nugByProvider.push({ prefix, name, models, agentProviderType: "nug" });

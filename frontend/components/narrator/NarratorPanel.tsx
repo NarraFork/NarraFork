@@ -1562,6 +1562,24 @@ function getCodexReasoningEffortOptions(
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
 }
 
+/**
+ * onto the UI's unified enum. Upstream "max" is presented as "xhigh" (the
+ * wire). Always prepends "none" so the user can disable thinking.
+ */
+	modelOption?: ModelOption,
+): readonly ReasoningEffortValue[] | undefined {
+	const levels = modelOption?.effortLevels;
+	if (!levels || levels.length === 0) return undefined;
+	const order: ReasoningEffortValue[] = ["low", "medium", "high", "xhigh"];
+	const present = new Set<ReasoningEffortValue>();
+	for (const level of levels) {
+		const mapped = level === "max" ? "xhigh" : (level as ReasoningEffortValue);
+		if (order.includes(mapped)) present.add(mapped);
+	}
+	const ordered = order.filter((l) => present.has(l));
+	return ["none", ...ordered];
+}
+
 function isDeepSeekModel(model?: string): boolean {
 	if (!model) return false;
 	return model.toLowerCase().includes("deepseek");
@@ -2386,6 +2404,7 @@ export function NarratorPanel({
 		if (!resolvedModel) return DEFAULT_REASONING_EFFORT_OPTIONS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
+		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
 			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
