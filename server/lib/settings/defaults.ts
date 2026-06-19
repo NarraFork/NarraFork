@@ -49,6 +49,7 @@ export const DEFAULTS: NarraForkSettings = {
 		firstTokenTimeoutMs: 60_000,
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
+		minPruneRatio: 30,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -414,6 +415,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "最大裁剪百分比。已裁剪消息占总消息数达到此值时，强制启动后台上下文压缩；低于此值时继续渐进式裁剪。",
 		type: "number",
 		valid: "0-100, 默认 80",
+	},
+	"agent.minPruneRatio": {
+		desc: "最小裁剪比例。每次裁剪边界推进时，至少裁掉剩余可裁剪消息的该比例。值越大，单次裁剪幅度越大、裁剪次数越少，从而减少 prompt 缓存前缀失效、降低计费；代价是单次丢弃更多上下文。",
+		type: "number",
+		valid: "0-100, 默认 30",
 	},
 
 	// ── chapters ────────────────────────────────────────────────────────

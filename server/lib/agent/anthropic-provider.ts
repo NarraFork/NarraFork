@@ -47,6 +47,14 @@ const WEB_SEARCH_MAX_USES = 8;
 const ANTHROPIC_BETA_FLAGS =
 	"claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07,adaptive-thinking-2026-01-28,prompt-caching-scope-2026-01-05,effort-2025-11-24,redact-thinking-2026-02-12,context-management-2025-06-27";
 
+/**
+ * Minimal beta flags for non-official Anthropic-compatible relays.
+ * Only the flags required for the effort parameter to be honored — we avoid
+ * sending the full Claude-Code-specific flag set (claude-code-*, context-1m,
+ * context-management, etc.) to generic relays that may reject unknown betas.
+ */
+const ANTHROPIC_EFFORT_BETA_FLAGS = "adaptive-thinking-2026-01-28,effort-2025-11-24";
+
 /** Claude Code CLI version used for billing header fingerprint. */
 const CC_CLI_VERSION = "2.1.88";
 
@@ -333,19 +341,21 @@ function buildThinkingConfig(
  * Map reasoning effort to Anthropic effort parameter value.
  * Only for models that support the effort API (Opus 4.6, Sonnet 4.6).
  *
- * Mapping: low → low, medium → medium, high → high, xhigh → high
+ * Mapping: low → low, medium → medium, high → high, xhigh → high, max → max
  * "none" is not mapped (thinking is disabled, effort is irrelevant).
- * Anthropic does not expose an xhigh tier, so we clamp to high.
+ * Anthropic does not expose an xhigh tier (only low/medium/high/max), so xhigh
+ * clamps to high; max is sent through as the highest tier.
  */
 function mapEffortParam(
 	reasoningEffort: string | undefined,
-): "low" | "medium" | "high" | undefined {
+): "low" | "medium" | "high" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	const map: Record<string, "low" | "medium" | "high"> = {
+	const map: Record<string, "low" | "medium" | "high" | "max"> = {
 		low: "low",
 		medium: "medium",
 		high: "high",
 		xhigh: "high",
+		max: "max",
 	};
 	return map[reasoningEffort];
 }
@@ -878,8 +888,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			body.temperature = 1;
 		}
 
-		// Effort parameter: official API only (proxies may not support output_config)
-		if (isOfficial && supportsEffort(model) && thinkingEnabled) {
+		// Effort parameter: official Anthropic API and Anthropic-compatible relays
+		// (e.g. Claude Code proxies) both accept output_config.effort. Sent for any
+		// effort-capable model regardless of officialApi.
+		if (supportsEffort(model) && thinkingEnabled) {
 			const effort = mapEffortParam(params.reasoningEffort);
 			body.output_config = { effort: effort ?? "medium" };
 		}
@@ -953,6 +965,14 @@ export class AnthropicProvider implements ProviderAdapter {
 		} else {
 			reqHeaders["x-api-key"] = apiKey;
 			reqHeaders["user-agent"] = getHttpUserAgent();
+			// Anthropic-compatible relays (Claude Code proxies) accept the CC beta
+			// flags; declare effort/adaptive-thinking so output_config.effort is honored.
+			// Only send these when the model actually supports effort — generic
+			// Anthropic-compatible relays may reject unknown beta flags, so we avoid
+			// sending the full CC flag set and only opt in the minimal effort betas.
+			if (supportsEffort(model)) {
+				reqHeaders["anthropic-beta"] = ANTHROPIC_EFFORT_BETA_FLAGS;
+			}
 		}
 		this.applyExtraHeaders(reqHeaders);
 

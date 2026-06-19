@@ -1,75 +1,24 @@
 import { agentGenerateWithHistory } from "@server/lib/agent";
 import { getToolMessage, type Locale } from "@server/lib/prompt-i18n";
+import {
+	type AskQuestionInput,
+	type AskQuestionOption,
+	coerceAskQuestions,
+} from "./ask-user-question-coerce";
 import { narratorService } from "./narrator-service";
 
-export interface AskQuestionOption {
-	label: string;
-	description: string;
-	preview?: string;
-}
-
-export interface AskQuestionInput {
-	question: string;
-	header: string;
-	options: AskQuestionOption[];
-	multiSelect?: boolean;
-}
+export type { AskQuestionInput, AskQuestionOption };
+// Re-export the pure coercion module's public API so existing import paths
+// (`./ask-user-question-reflection`) keep working. The coercion logic itself
+// now lives in `ask-user-question-coerce.ts`, which has no side-effect imports
+// so unit tests can exercise it without booting the db/agent stack.
+export { coerceAskQuestions };
 
 const MAX_CONVERSATION_CONTEXT_CHARS = 24_000;
-const INVALID_QUESTION_KEYS = new Set(["undefined", "null"]);
 const DEFAULT_FREE_TEXT_ANSWER: Record<Locale, string> = {
 	en: "No special preference; please use your best judgment.",
 	"zh-CN": "无特别偏好，请按最佳判断执行。",
 };
-
-function normalizeQuestionText(value: unknown): string {
-	return typeof value === "string" ? value.trim() : "";
-}
-
-function isUsableQuestionKey(value: string): boolean {
-	return value.length > 0 && !INVALID_QUESTION_KEYS.has(value.toLowerCase());
-}
-
-export function coerceAskQuestions(raw: unknown): AskQuestionInput[] {
-	let value = raw;
-	if (typeof value === "string") {
-		try {
-			value = JSON.parse(value);
-		} catch {
-			return [];
-		}
-	}
-	if (!Array.isArray(value)) return [];
-	const questions: AskQuestionInput[] = [];
-	for (const item of value) {
-		if (!item || typeof item !== "object") continue;
-		const record = item as Record<string, unknown>;
-		const question = normalizeQuestionText(record.question);
-		const header = normalizeQuestionText(record.header);
-		if (!isUsableQuestionKey(question) || !header) continue;
-		const rawOptions = Array.isArray(record.options) ? record.options : [];
-		const options = rawOptions
-			.map((option) => {
-				if (!option || typeof option !== "object") return null;
-				const optionRecord = option as Record<string, unknown>;
-				const label = normalizeQuestionText(optionRecord.label);
-				if (!label) return null;
-				return {
-					label,
-					description: typeof optionRecord.description === "string" ? optionRecord.description : "",
-					...(typeof optionRecord.preview === "string" ? { preview: optionRecord.preview } : {}),
-				};
-			})
-			.filter((option): option is AskQuestionOption => option !== null);
-		questions.push({
-			question,
-			header,
-			options,
-			multiSelect: record.multiSelect === true,
-		});
-	}
-	return questions;
-}
 
 function trimFromEnd(value: string, maxChars: number): string {
 	if (value.length <= maxChars) return value;

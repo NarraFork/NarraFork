@@ -8,6 +8,17 @@ export {
 	TOOL_CALL_STATUS_COLORS,
 } from "./status-registry";
 
+export type ModelPricingInfo = {
+	billingMode?: string;
+	unitName?: string;
+	tokenUnit?: number;
+	input?: number | string;
+	output?: number | string;
+	cacheCreationInput?: number | string;
+	cacheReadInput?: number | string;
+	credit?: number | string;
+};
+
 export type ModelOption = {
 	value: string;
 	label: string;
@@ -17,6 +28,16 @@ export type ModelOption = {
 	bareModel?: string;
 	rateMultiplier?: number;
 	effortLevels?: string[];
+	/** NUG model pricing info (only present for NUG models that have configured
+	 * prices). Used for the model-info price popup. */
+	pricing?: ModelPricingInfo;
+	officialInputUsd?: number;
+	officialOutputUsd?: number;
+	officialCacheCreationInputUsd?: number;
+	officialCacheReadInputUsd?: number;
+	channelMultiplier?: number;
+	contextWindow?: number;
+	usdRate?: number;
 };
 
 /** Sentinel value stored in DB to mean "follow the default model from settings". */

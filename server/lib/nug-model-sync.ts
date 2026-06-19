@@ -46,10 +46,19 @@ export function applyNugModelCatalogUpdate(
 	config: NUGProviderConfig,
 	models: Array<Record<string, unknown>>,
 	modelHash?: string | null,
-	options: { saveCache?: boolean; saveSettingsOnContextChange?: boolean } = {},
+	options: {
+		saveCache?: boolean;
+		saveSettingsOnContextChange?: boolean;
+		usdRate?: number | null;
+	} = {},
 ): NugModelCatalogApplyResult {
 	const normalizedHash = normalizeModelHash(modelHash);
-	const normalized = setNugCachedModels(config.id, models, normalizedHash ?? null);
+	const normalized = setNugCachedModels(
+		config.id,
+		models,
+		normalizedHash ?? null,
+		options.usdRate ?? null,
+	);
 	if (options.saveCache !== false) {
 		saveAllCachedNugModels();
 	}

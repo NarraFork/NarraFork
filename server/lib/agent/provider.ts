@@ -186,8 +186,7 @@ export interface ChatParams {
 	stickySessionKey?: string;
 	/** Base64-encoded images to attach to the current user message */
 	images?: Array<{ format: string; base64: string }>;
-	/** Reasoning effort level — maps to thinking config (Anthropic) or reasoning config (Codex) */
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */

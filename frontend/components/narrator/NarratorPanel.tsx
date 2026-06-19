@@ -210,6 +210,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "./MessageSelectionCtx";
+import { ModelPriceModal } from "./ModelPriceModal";
 import { getRenderableMessageOrder } from "./message-order-utils";
 import { useNarratorMessageRendererMode } from "./message-renderer-mode";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
@@ -297,6 +298,7 @@ type ContextManagementDraft = {
 	contextThresholds: ContextThresholdsDraft;
 	autoCompactKeepPairs: number;
 	autoCompactPruneThreshold: number;
+	minPruneRatio: number;
 };
 
 const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = {
@@ -305,6 +307,7 @@ const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = {
 };
 const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
 const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
+const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 function normalizeBooleanOverride(value: unknown): BooleanOverride {
 	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
@@ -609,12 +612,14 @@ function ModelMenuItems({
 	currentModel,
 	totalCostUsd,
 	onSelect,
+	onShowPrice,
 	label,
 }: {
 	allModels: ModelOption[];
 	currentModel: string | null | undefined;
 	totalCostUsd: number | null | undefined;
 	onSelect: (model: string) => void;
+	onShowPrice?: (model: ModelOption) => void;
 	label?: string;
 }) {
 	const { t } = useTranslation("narrator");
@@ -691,6 +696,24 @@ function ModelMenuItems({
 												<Badge size="xs" variant="outline" color="gray">
 													×{m.rateMultiplier}
 												</Badge>
+											)}
+											{m.pricing && (
+												<ActionIcon
+													component="div"
+													role="button"
+													tabIndex={0}
+													variant="subtle"
+													color="gray"
+													size="sm"
+													aria-label={t("viewModelPrice")}
+													onClick={(e) => {
+														e.stopPropagation();
+														e.preventDefault();
+														onShowPrice?.(m);
+													}}
+												>
+													<IconInfoCircle size={14} />
+												</ActionIcon>
 											)}
 											<IconCheck
 												size={14}
@@ -1505,7 +1528,7 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 	);
 }
 
-type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh";
+type ReasoningEffortValue = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 const DEFAULT_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"none",
@@ -1519,6 +1542,19 @@ const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"none",
 	"high",
 	"xhigh",
+];
+
+/**
+ * Anthropic effort API tiers (Opus 4.6 / Sonnet 4.6 and Anthropic-compatible
+ * relays). Anthropic has no "xhigh" tier — it exposes low/medium/high/max, plus
+ * "none" to disable thinking.
+ */
+const ANTHROPIC_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+	"none",
+	"low",
+	"medium",
+	"high",
+	"max",
 ];
 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
@@ -1563,21 +1599,20 @@ function getCodexReasoningEffortOptions(
 }
 
 /**
- * onto the UI's unified enum. Upstream "max" is presented as "xhigh" (the
- * wire). Always prepends "none" so the user can disable thinking.
+ * onto the UI's unified enum. Levels are shown exactly as the gateway reports
+ * disable thinking). Returns undefined when the model advertises no effort.
  */
 	modelOption?: ModelOption,
 ): readonly ReasoningEffortValue[] | undefined {
 	const levels = modelOption?.effortLevels;
 	if (!levels || levels.length === 0) return undefined;
-	const order: ReasoningEffortValue[] = ["low", "medium", "high", "xhigh"];
+	const order: ReasoningEffortValue[] = ["low", "medium", "high", "xhigh", "max"];
 	const present = new Set<ReasoningEffortValue>();
 	for (const level of levels) {
-		const mapped = level === "max" ? "xhigh" : (level as ReasoningEffortValue);
-		if (order.includes(mapped)) present.add(mapped);
+		if ((order as string[]).includes(level)) present.add(level as ReasoningEffortValue);
 	}
 	const ordered = order.filter((l) => present.has(l));
-	return ["none", ...ordered];
+	return ordered.length > 0 ? ordered : undefined;
 }
 
 function isDeepSeekModel(model?: string): boolean {
@@ -2060,6 +2095,14 @@ export function NarratorPanel({
 	const [messageRenderPhase, setMessageRenderPhase] = useState<"tail" | "full">(() =>
 		highlightMessageId ? "full" : "tail",
 	);
+	// Shared model price popup state. Hoisted here (a stable ancestor outside any
+	// Menu.Dropdown) so opening the popup is not unmounted when the model menu closes.
+	const [priceModel, setPriceModel] = useState<ModelOption | null>(null);
+	// Controlled open state for the two model-selector menus (desktop + mobile).
+	// While the price popup is open, ignore close requests so dismissing the
+	// popup (a click outside the menu) does not also close the model menu.
+	const [modelMenuOpenDesktop, setModelMenuOpenDesktop] = useState(false);
+	const [modelMenuOpenMobile, setModelMenuOpenMobile] = useState(false);
 	useEffect(() => {
 		if (highlightMessageId) setMessageRenderPhase("full");
 	}, [highlightMessageId]);
@@ -2243,6 +2286,7 @@ export function NarratorPanel({
 				settingsData?.agent?.autoCompactKeepPairs ?? DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
 			autoCompactPruneThreshold:
 				settingsData?.agent?.autoCompactPruneThreshold ?? DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
+			minPruneRatio: settingsData?.agent?.minPruneRatio ?? DEFAULT_MIN_PRUNE_RATIO,
 		};
 	}, [settingsData?.agent]);
 	const forceCompactPruneThreshold = contextThresholdSettings.autoCompactPruneThreshold;
@@ -2382,6 +2426,10 @@ export function NarratorPanel({
 		const providerPrefix = resolvedModel?.split(":")[0];
 		if (!providerPrefix) return false;
 		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
+		if (
+		) {
+			return true;
+		}
 		// Check Anthropic providers
 		const anthropicProviders = settingsData?.anthropicProviders ?? [];
 		if (anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
@@ -2396,6 +2444,7 @@ export function NarratorPanel({
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,
+		resolvedModelOption,
 		settingsData?.anthropicProviders,
 		settingsData?.openaiProviders,
 		resolvedModel,
@@ -2409,13 +2458,34 @@ export function NarratorPanel({
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
 			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);
 		}
+		// Anthropic (official, compatible/cc relay, or NUG anthropic channel):
+		// low/medium/high/max plus none. No xhigh tier upstream.
+		const isAnthropic =
+			resolvedModelOption?.channelType === "anthropic" ||
+			(!!providerPrefix &&
+				(settingsData?.anthropicProviders ?? []).some(
+					(p: { prefix?: string }) => p.prefix === providerPrefix,
+				));
+		if (isAnthropic) {
+			return ANTHROPIC_REASONING_EFFORT_OPTIONS;
+		}
 		return DEFAULT_REASONING_EFFORT_OPTIONS;
-	}, [codexCapableProviders, isCodexChannelModel, resolvedModel, resolvedModelOption]);
+	}, [
+		codexCapableProviders,
+		isCodexChannelModel,
+		resolvedModel,
+		resolvedModelOption,
+		settingsData?.anthropicProviders,
+	]);
 
-	const displayedReasoningEffort = useMemo(
-		() => normalizeReasoningEffortForModel(resolvedModel, narrator?.reasoningEffort),
-		[resolvedModel, narrator?.reasoningEffort],
-	);
+	const displayedReasoningEffort = useMemo(() => {
+		const normalized = normalizeReasoningEffortForModel(resolvedModel, narrator?.reasoningEffort);
+		// "" means "auto / follow default" and is always valid. If a stored value
+		// is not among the current model's available tiers (e.g. a legacy "none"
+		// so the menu shows the auto entry highlighted instead of nothing.
+		if (!normalized) return "";
+		return (reasoningEffortOptions as readonly string[]).includes(normalized) ? normalized : "";
+	}, [resolvedModel, narrator?.reasoningEffort, reasoningEffortOptions]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -3492,6 +3562,7 @@ export function NarratorPanel({
 				0,
 				Math.min(100, Math.round(contextThresholdDraft.autoCompactPruneThreshold)),
 			),
+			minPruneRatio: Math.max(0, Math.min(100, Math.round(contextThresholdDraft.minPruneRatio))),
 		};
 		updateSettingsMutation.mutate(
 			{
@@ -3499,6 +3570,7 @@ export function NarratorPanel({
 					contextThresholds: normalized.contextThresholds,
 					autoCompactKeepPairs: normalized.autoCompactKeepPairs,
 					autoCompactPruneThreshold: normalized.autoCompactPruneThreshold,
+					minPruneRatio: normalized.minPruneRatio,
 				},
 			},
 			{
@@ -7279,6 +7351,23 @@ export function NarratorPanel({
 									suffix="%"
 								/>
 							</Group>
+							<Group grow>
+								<NumberInput
+									label={ts("minPruneRatio")}
+									description={ts("minPruneRatioDesc")}
+									value={contextThresholdDraft.minPruneRatio}
+									onChange={(value) =>
+										setContextThresholdDraft((prev) => ({
+											...prev,
+											minPruneRatio: typeof value === "number" ? value : DEFAULT_MIN_PRUNE_RATIO,
+										}))
+									}
+									min={0}
+									max={100}
+									allowDecimal={false}
+									suffix="%"
+								/>
+							</Group>
 							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
 							<Stack gap="xs">
 								<Text size="sm" fw={600}>
@@ -8335,7 +8424,15 @@ export function NarratorPanel({
 									{!compact && (
 										<Group gap={6} wrap="nowrap" visibleFrom="sm">
 											<Tooltip label={t("modelTooltip")}>
-												<Menu position="top-end">
+												<Menu
+													position="top-end"
+													opened={modelMenuOpenDesktop}
+													onChange={(o) => {
+														// Don't let the price popup's outside-click close the menu.
+														if (!o && priceModel != null) return;
+														setModelMenuOpenDesktop(o);
+													}}
+												>
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
@@ -8368,6 +8465,7 @@ export function NarratorPanel({
 															currentModel={narrator.model}
 															totalCostUsd={narrator.totalCostUsd}
 															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+															onShowPrice={setPriceModel}
 														/>
 													</Menu.Dropdown>
 												</Menu>
@@ -8584,7 +8682,15 @@ export function NarratorPanel({
 									{/* Mobile: model & permission */}
 									<Group gap={4} wrap="nowrap" {...(compact ? {} : { hiddenFrom: "sm" as const })}>
 										<Tooltip label={t("modelTooltip")}>
-											<Menu position="bottom-end" withinPortal>
+											<Menu
+												position="bottom-end"
+												withinPortal
+												opened={modelMenuOpenMobile}
+												onChange={(o) => {
+													if (!o && priceModel != null) return;
+													setModelMenuOpenMobile(o);
+												}}
+											>
 												<Menu.Target>
 													<ActionIcon variant="subtle" color="gray" size="sm">
 														<Text size="xs" fw={600}>
@@ -8603,6 +8709,7 @@ export function NarratorPanel({
 														currentModel={narrator.model}
 														totalCostUsd={narrator.totalCostUsd}
 														onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
+														onShowPrice={setPriceModel}
 														label={t("modelTooltip")}
 													/>
 												</Menu.Dropdown>
@@ -8629,6 +8736,7 @@ export function NarratorPanel({
 																	medium: "M",
 																	high: "H",
 																	xhigh: "X",
+																	max: "MX",
 																};
 																return (
 																	effortMap[displayedReasoningEffort as keyof typeof effortMap] ??
@@ -9049,6 +9157,11 @@ export function NarratorPanel({
 				pendingRollback={pendingRollback}
 				onConfirm={confirmRollback}
 				onCancel={() => setPendingRollback(null)}
+			/>
+			<ModelPriceModal
+				model={priceModel}
+				opened={priceModel != null}
+				onClose={() => setPriceModel(null)}
 			/>
 		</PermEnterHintCtx.Provider>
 	);

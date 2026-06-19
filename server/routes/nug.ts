@@ -627,7 +627,7 @@ registerNugModelLister(() => {
 /** Fetch models from NUG service (/v1/models endpoint). */
 async function fetchNugModels(
 	config: NUGProviderConfig,
-): Promise<{ models: NugModelInfo[]; modelHash?: string }> {
+): Promise<{ models: NugModelInfo[]; modelHash?: string; usdRate?: number }> {
 	const baseUrl = normalizeNugBaseUrl(config.baseUrl);
 	if (!baseUrl) {
 		throw new Error(`NUG base URL not configured for provider "${config.name}"`);
@@ -645,6 +645,7 @@ async function fetchNugModels(
 			: typeof json.hash === "string"
 				? json.hash
 				: undefined;
+	const usdRate = typeof json.usdRate === "number" ? json.usdRate : undefined;
 
 	const seen = new Set<string>();
 	const unique = models.filter((m) => {
@@ -658,7 +659,7 @@ async function fetchNugModels(
 		const bId = String(b.id ?? "");
 		return aId.localeCompare(bId);
 	});
-	return { models: unique, modelHash };
+	return { models: unique, modelHash, usdRate };
 }
 
 function nugUsagePeriod(range: string | undefined): string {
@@ -690,10 +691,11 @@ nugRoutes.post("/models/refresh", async (c) => {
 	let changedContextWindows = false;
 	for (const p of providers) {
 		try {
-			const { models, modelHash } = await fetchNugModels(p);
+			const { models, modelHash, usdRate } = await fetchNugModels(p);
 			const applied = applyNugModelCatalogUpdate(p, models, modelHash, {
 				saveCache: false,
 				saveSettingsOnContextChange: false,
+				usdRate,
 			});
 			changedContextWindows = applied.changedContextWindows || changedContextWindows;
 			results.push({ providerId: p.id, name: p.name, count: applied.models.length, modelHash });
@@ -726,8 +728,8 @@ nugRoutes.post("/providers/:id/models/refresh", async (c) => {
 		return c.json({ error: `Provider "${id}" not found` }, 404);
 	}
 	try {
-		const { models, modelHash } = await fetchNugModels(config);
-		const applied = applyNugModelCatalogUpdate(config, models, modelHash);
+		const { models, modelHash, usdRate } = await fetchNugModels(config);
+		const applied = applyNugModelCatalogUpdate(config, models, modelHash, { usdRate });
 		return c.json({
 			models: applied.models,
 			fromCache: false,

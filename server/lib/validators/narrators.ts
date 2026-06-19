@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { permissionModeSchema } from "../permission-modes";
 
-const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh"]);
+const reasoningEffortSchema = z.enum(["none", "low", "medium", "high", "xhigh", "max"]);
 const booleanOverrideSchema = z.enum(["inherit", "on", "off"]);
 const dangerReflectionOverrideSchema = z.enum([
 	"inherit",
@@ -28,7 +28,8 @@ export const createNarratorSchema = z.object({
 });
 
 export const codexDefaultReasoningEffortSchema = z.object({
-	reasoningEffort: reasoningEffortSchema.nullable().optional(),
+	// Codex has no "max" tier — restrict to the codex-supported levels.
+	reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).nullable().optional(),
 });
 
 export const codexUseWebSocketSchema = z.object({

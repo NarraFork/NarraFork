@@ -463,7 +463,7 @@ export function isAnthropicProvider(prefix?: string): boolean {
 export function resolveDefaultReasoningEffort(
 	provider?: string,
 	model?: string,
-): "none" | "low" | "medium" | "high" | "xhigh" | undefined {
+): "none" | "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	if (usesCodexModel(provider, model)) {
 		return s().codex?.defaultReasoningEffort ?? s().agent.defaultReasoningEffort;
 	}
@@ -768,6 +768,7 @@ export const DEFAULT_CONTEXT_THRESHOLDS = {
 
 export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
 export const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
+export const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 /**
  * Resolve the summary model's effective context window (tokens).
@@ -806,6 +807,19 @@ export function getAutoCompactPruneThreshold(): number {
 		return DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD;
 	}
 	return Math.max(0, Math.min(100, Math.floor(configured)));
+}
+
+/**
+ * Minimum fraction (0–1) of remaining prunable messages to prune per pass.
+ * Larger steps reduce prompt-cache prefix invalidations (lower cost) at the
+ * expense of dropping more context at once.
+ */
+export function getMinPruneRatio(): number {
+	const configured = s().agent.minPruneRatio;
+	if (typeof configured !== "number" || !Number.isFinite(configured)) {
+		return DEFAULT_MIN_PRUNE_RATIO / 100;
+	}
+	return Math.max(0, Math.min(100, Math.floor(configured))) / 100;
 }
 
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {

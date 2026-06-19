@@ -135,7 +135,7 @@ interface CreateNarratorInput {
 	systemPrompt?: string;
 	permissionMode?: string;
 	cwd?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	fastMode?: boolean;
 	relaxedPlan?: boolean;
 	pruneEnabled?: boolean;
@@ -152,7 +152,7 @@ interface CreateSubagentInput {
 	title?: string;
 	permissionMode?: string;
 	model?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	systemPrompt?: string;
 	inheritedTraits?: string[];
 }

@@ -925,6 +925,7 @@ export class NugProvider implements ProviderAdapter {
 		models: Array<Record<string, unknown>>;
 		modelHash?: string;
 		hash?: string;
+		usdRate?: number;
 	}> {
 		const response = await fetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
@@ -937,6 +938,7 @@ export class NugProvider implements ProviderAdapter {
 			models?: Array<Record<string, unknown>>;
 			modelHash?: string;
 			hash?: string;
+			usdRate?: number;
 		};
 		const headerHash = response.headers.get("X-NUG-Model-Hash")?.trim();
 		if (!data.modelHash && headerHash) {
@@ -945,6 +947,7 @@ export class NugProvider implements ProviderAdapter {
 		if (!data.hash && data.modelHash) {
 			data.hash = data.modelHash;
 		}
-		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash };
+		const usdRate = typeof data.usdRate === "number" ? data.usdRate : undefined;
+		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash, usdRate };
 	}
 }

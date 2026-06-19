@@ -206,6 +206,13 @@ export function normalizeCodexReasoningEffort(
 	if (reasoningEffort === "none") return reasoningEffort;
 	const bareModel = parseModelId(model).model;
 	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel];
+	// Codex has no "max" tier; degrade it to the model's highest available tier.
+	if (reasoningEffort === "max") {
+		if (!supported) return "xhigh";
+		if (supported.includes("xhigh")) return "xhigh";
+		if (supported.includes("high")) return "high";
+		return supported[supported.length - 1] ?? "high";
+	}
 	if (!supported || supported.includes(reasoningEffort)) return reasoningEffort;
 	if (reasoningEffort === "xhigh" && supported.includes("high")) return "high";
 	if (reasoningEffort === "low" && supported.includes("medium")) return "medium";

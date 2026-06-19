@@ -112,6 +112,8 @@ export interface AgentSectionProps {
 	setAutoCompactKeepPairs: (v: number) => void;
 	autoCompactPruneThreshold: number;
 	setAutoCompactPruneThreshold: (v: number) => void;
+	minPruneRatio: number;
+	setMinPruneRatio: (v: number) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -455,6 +457,18 @@ export function AgentSection(props: AgentSectionProps) {
 					description={t("autoCompactPruneThresholdDesc")}
 					value={props.autoCompactPruneThreshold}
 					onChange={(v) => props.setAutoCompactPruneThreshold(typeof v === "number" ? v : 80)}
+					min={0}
+					max={100}
+					allowDecimal={false}
+					suffix="%"
+				/>
+			</Group>
+			<Group grow>
+				<NumberInput
+					label={t("minPruneRatio")}
+					description={t("minPruneRatioDesc")}
+					value={props.minPruneRatio}
+					onChange={(v) => props.setMinPruneRatio(typeof v === "number" ? v : 30)}
 					min={0}
 					max={100}
 					allowDecimal={false}

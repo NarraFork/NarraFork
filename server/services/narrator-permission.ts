@@ -1922,37 +1922,82 @@ export function resolveExitPlanModeInput(
 	return { ok: true, input: effectiveInput };
 }
 
-async function rejectInvalidAskUserQuestionInput(
+/**
+ * Validate AskUserQuestion input, repairing recoverable issues before giving up.
+ *
+ * Providers sometimes omit a question's `question` key, send a placeholder key,
+ * or stringify the whole `questions` array. The UI already repairs these (so the
+ * call looks fine on screen), which means strict server-side validation would fail
+ * a call the user can answer normally. We mirror the UI repair here via
+ * `coerceAskQuestions`, then re-validate. Only truly unrecoverable input (no usable
+ * questions at all) is rejected.
+ *
+ * Returns `{ deny }` to reject the call, or `{ repairedInput }` (possibly identical
+ * to the original) to continue. When a repair changed the payload, `repairedInput`
+ * carries the normalized questions so the persisted/broadcast input stays consistent
+ * with what the answer-mapping logic expects.
+ */
+async function validateOrRepairAskUserQuestionInput(
 	narratorId: string,
 	toolUseId: string,
 	input: Record<string, unknown>,
-): Promise<PermissionResult | null> {
+): Promise<{ deny: PermissionResult } | { repairedInput: Record<string, unknown> }> {
 	const tool = toolRegistry.get("AskUserQuestion");
-	const parsed = tool?.parameters.safeParse(input);
-	if (parsed?.success) return null;
 
-	const message = parsed
-		? `Invalid AskUserQuestion parameters: ${parsed.error.message}`
-		: "Invalid AskUserQuestion parameters: tool definition not found";
-	logger.warn("Rejecting invalid AskUserQuestion before permission prompt", {
-		narratorId,
-		toolUseId,
-		message,
-	});
-	await db
-		.update(narratorToolCalls)
-		.set({
-			status: "fail",
-			inputJson: input,
-			errorMessage: message,
-			permissionDecidedBy: "auto",
-			permissionDecidedAt: new Date().toISOString(),
-			permissionDecisionReason: "invalid_ask_user_question_input",
-		})
-		.where(
-			and(eq(narratorToolCalls.narratorId, narratorId), eq(narratorToolCalls.toolUseId, toolUseId)),
-		);
-	return { behavior: "deny", message, rawMessage: true };
+	const deny = async (message: string): Promise<{ deny: PermissionResult }> => {
+		logger.warn("Rejecting invalid AskUserQuestion before permission prompt", {
+			narratorId,
+			toolUseId,
+			message,
+		});
+		await db
+			.update(narratorToolCalls)
+			.set({
+				status: "fail",
+				inputJson: input,
+				errorMessage: message,
+				permissionDecidedBy: "auto",
+				permissionDecidedAt: new Date().toISOString(),
+				permissionDecisionReason: "invalid_ask_user_question_input",
+			})
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+			);
+		return { deny: { behavior: "deny", message, rawMessage: true } };
+	};
+
+	if (!tool) {
+		return deny("Invalid AskUserQuestion parameters: tool definition not found");
+	}
+
+	// Fast path: already valid, no repair needed.
+	if (tool.parameters.safeParse(input).success) {
+		return { repairedInput: input };
+	}
+
+	// Attempt to repair recoverable issues (missing/placeholder keys, stringified array).
+	const repairedQuestions = coerceAskQuestions(input.questions);
+	if (repairedQuestions.length > 0) {
+		const repairedInput = { ...input, questions: repairedQuestions };
+		const reparsed = tool.parameters.safeParse(repairedInput);
+		if (reparsed.success) {
+			logger.info("Repaired malformed AskUserQuestion input before permission prompt", {
+				narratorId,
+				toolUseId,
+				questionCount: repairedQuestions.length,
+			});
+			return { repairedInput };
+		}
+	}
+
+	const parsed = tool.parameters.safeParse(input);
+	const message = parsed.success
+		? "Invalid AskUserQuestion parameters"
+		: `Invalid AskUserQuestion parameters: ${parsed.error.message}`;
+	return deny(message);
 }
 
 export async function handlePermission(
@@ -2064,12 +2109,13 @@ export async function handlePermission(
 	}
 
 	if (toolName === "AskUserQuestion") {
-		const invalidAskUserQuestion = await rejectInvalidAskUserQuestionInput(
+		const askResult = await validateOrRepairAskUserQuestionInput(
 			narratorId,
 			toolUseId,
 			effectiveInput,
 		);
-		if (invalidAskUserQuestion) return invalidAskUserQuestion;
+		if ("deny" in askResult) return askResult.deny;
+		effectiveInput = askResult.repairedInput;
 	}
 
 	// Load enabled whitelist/blacklist directories — three-layer merge

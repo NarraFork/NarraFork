@@ -213,6 +213,7 @@ export function useAllModels() {
 			providerId: string;
 			providerName: string;
 			models: Array<Record<string, unknown>>;
+			usdRate?: number;
 		}> = settingsData?.nugModelsGrouped ?? [];
 
 		const serverNugProviders: Array<{ id: string; prefix?: string; name?: string }> =
@@ -224,6 +225,7 @@ export function useAllModels() {
 			const prefix = cfg?.prefix ?? "nug";
 			const name = group.providerName || cfg?.name || prefix;
 			providerLabels[prefix] = name;
+			const groupUsdRate = typeof group.usdRate === "number" ? group.usdRate : undefined;
 			const models: ModelOption[] = [];
 			for (const m of group.models) {
 				const id = String(m.id ?? "");
@@ -235,6 +237,15 @@ export function useAllModels() {
 				const effortLevels = Array.isArray(m.effortLevels)
 					? m.effortLevels.filter((l): l is string => typeof l === "string")
 					: undefined;
+				const pricing =
+					m.pricing != null && typeof m.pricing === "object" && !Array.isArray(m.pricing)
+						? (m.pricing as ModelOption["pricing"])
+						: undefined;
+				const numField = (key: string): number | undefined => {
+					const v = (m as Record<string, unknown>)[key];
+					const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+					return Number.isFinite(n) ? n : undefined;
+				};
 				models.push({
 					value: `${prefix}:${id}`,
 					label: `${String(m.name ?? bareModel)} · ${channel} / ${nugChannelTypeLabel(channelType)}`,
@@ -243,6 +254,30 @@ export function useAllModels() {
 					channelType,
 					bareModel,
 					...(effortLevels && effortLevels.length > 0 ? { effortLevels } : {}),
+					...(pricing ? { pricing } : {}),
+					...(numField("officialInputUsd") != null
+						? { officialInputUsd: numField("officialInputUsd") }
+						: {}),
+					...(numField("officialOutputUsd") != null
+						? { officialOutputUsd: numField("officialOutputUsd") }
+						: {}),
+					...(numField("officialCacheCreationInputUsd") != null
+						? {
+								officialCacheCreationInputUsd: numField("officialCacheCreationInputUsd"),
+							}
+						: {}),
+					...(numField("officialCacheReadInputUsd") != null
+						? { officialCacheReadInputUsd: numField("officialCacheReadInputUsd") }
+						: {}),
+					...(numField("channelMultiplier") != null
+						? { channelMultiplier: numField("channelMultiplier") }
+						: {}),
+					...(numField("contextWindow") != null || numField("contextLength") != null
+						? {
+								contextWindow: numField("contextWindow") ?? numField("contextLength"),
+							}
+						: {}),
+					...(groupUsdRate != null ? { usdRate: groupUsdRate } : {}),
 				});
 			}
 			nugByProvider.push({ prefix, name, models, agentProviderType: "nug" });
@@ -348,6 +383,30 @@ export function useAllModels() {
 			value: FOLLOW_DEFAULT_MODEL,
 			label: defaultModelLabel,
 			provider: "__default__",
+			// Carry the resolved default model's pricing/metadata so the model
+			// price popup works on the "follow default" entry too.
+			...(defaultModelOption?.pricing ? { pricing: defaultModelOption.pricing } : {}),
+			...(defaultModelOption?.officialInputUsd != null
+				? { officialInputUsd: defaultModelOption.officialInputUsd }
+				: {}),
+			...(defaultModelOption?.officialOutputUsd != null
+				? { officialOutputUsd: defaultModelOption.officialOutputUsd }
+				: {}),
+			...(defaultModelOption?.officialCacheCreationInputUsd != null
+				? {
+						officialCacheCreationInputUsd: defaultModelOption.officialCacheCreationInputUsd,
+					}
+				: {}),
+			...(defaultModelOption?.officialCacheReadInputUsd != null
+				? { officialCacheReadInputUsd: defaultModelOption.officialCacheReadInputUsd }
+				: {}),
+			...(defaultModelOption?.channelMultiplier != null
+				? { channelMultiplier: defaultModelOption.channelMultiplier }
+				: {}),
+			...(defaultModelOption?.contextWindow != null
+				? { contextWindow: defaultModelOption.contextWindow }
+				: {}),
+			...(defaultModelOption?.usdRate != null ? { usdRate: defaultModelOption.usdRate } : {}),
 		};
 
 		// Prepend follow-default and aggregations to visible models for grouped select

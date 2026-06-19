@@ -672,7 +672,7 @@ export interface RunSubagentInput {
 	signal: AbortSignal;
 	locale: string;
 	model?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	background?: boolean;
 	alias?: string;
 }

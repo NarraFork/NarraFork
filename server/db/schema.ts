@@ -253,7 +253,7 @@ export const narrators = sqliteTable(
 		/** Persistent ID for the designated .narrafork/plan-{id}.md file while in plan mode. */
 		planFileId: text("plan_file_id"),
 		reasoningEffort: text("reasoning_effort", {
-			enum: ["none", "low", "medium", "high", "xhigh"],
+			enum: ["none", "low", "medium", "high", "xhigh", "max"],
 		}),
 		fastMode: integer("fast_mode", { mode: "boolean" }).notNull().default(false),
 		relaxedPlan: integer("relaxed_plan", { mode: "boolean" }).notNull().default(false),

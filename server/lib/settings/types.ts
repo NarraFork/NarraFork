@@ -39,7 +39,7 @@ export interface CustomApiProviderConfig {
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
 	/** Anthropic: optional HTTPS proxy URL for all requests to this provider. */
 	proxy?: string;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
@@ -118,7 +118,7 @@ export interface AnthropicProviderConfig {
 	 * Default reasoning effort for Anthropic models when narrator reasoningEffort is unset.
 	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
-	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
 	/** Optional HTTPS proxy URL for all requests to this provider. */
 	proxy?: string;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
@@ -210,7 +210,7 @@ export interface SearchChannelConfig {
 	enabled: boolean;
 	providerId?: string;
 	model?: string;
-	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	maxTurns?: number;
 	timeoutMs?: number;
 }
@@ -459,6 +459,15 @@ export interface NarraForkSettings {
 		autoCompactKeepPairs?: number;
 		/** Pruned message percentage at which automatic background compact is forced. */
 		autoCompactPruneThreshold?: number;
+		/**
+		 * Minimum prune ratio (percentage, 0–100) applied per prune pass.
+		 * Each time pruning advances, it prunes at least this fraction of the
+		 * remaining prunable messages. Larger values prune in bigger steps,
+		 * reducing how often the prompt-cache prefix is invalidated (which keeps
+		 * cache hits high and cost low) at the expense of dropping more context
+		 * at once. Default 30.
+		 */
+		minPruneRatio?: number;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

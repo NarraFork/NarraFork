@@ -17,6 +17,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { PermissionMode } from "../lib/permission-modes";
+import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -864,7 +865,7 @@ export const narratorPersistence = {
 
 	async updateReasoningEffort(
 		narratorId: string,
-		reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null,
+		reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null,
 	) {
 		const now = new Date().toISOString();
 		await db
@@ -1817,10 +1818,15 @@ export const narratorPersistence = {
 		}
 
 		const maxPruneThisPass = Math.max(1, Math.floor(remaining * 0.5));
-		const additionalPrune = Math.min(
-			maxPruneThisPass,
-			Math.max(1, Math.floor(pruneRatio * remaining)),
-		);
+		const curveStep = Math.min(maxPruneThisPass, Math.max(1, Math.floor(pruneRatio * remaining)));
+		// Enforce a minimum prune step so each pass drops at least `minPruneRatio`
+		// of the remaining prunable messages. Pruning in larger steps means the
+		// prune boundary moves less often, which keeps the prompt-cache prefix
+		// stable for longer and reduces billing from repeated cache invalidation.
+		// The minimum is allowed to exceed the 50% soft cap above, since the whole
+		// point is to prune in fewer, bigger steps.
+		const minStep = Math.max(1, Math.ceil(getMinPruneRatio() * remaining));
+		const additionalPrune = Math.min(remaining, Math.max(curveStep, minStep));
 		const newBoundaryIdx = alreadyPruned + additionalPrune - 1;
 
 		const boundaryMessageId = prunableRefs[newBoundaryIdx].messageId;

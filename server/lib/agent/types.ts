@@ -427,7 +427,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 
 // === Agent config ===
 
-export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface RuntimeSettingsOverride {
 	model?: string | null;
@@ -577,11 +577,11 @@ export function isDeepSeekModel(model: string): boolean {
 
 /**
  * Map reasoning effort to DeepSeek effort value.
- * DeepSeek supports "high" and "max" — low/medium map to high, xhigh maps to max.
+ * DeepSeek supports "high" and "max" — low/medium map to high, xhigh/max map to max.
  */
 export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	if (reasoningEffort === "xhigh") return "max";
+	if (reasoningEffort === "xhigh" || reasoningEffort === "max") return "max";
 	return "high";
 }
 

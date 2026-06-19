@@ -1809,7 +1809,7 @@ narratorRoutes.post("/:id/plan-mode/exit", async (c) => {
 narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	const id = c.req.param("id");
 	const { reasoningEffort } = await c.req.json();
-	const validEfforts = ["none", "low", "medium", "high", "xhigh"];
+	const validEfforts = ["none", "low", "medium", "high", "xhigh", "max"];
 	if (
 		reasoningEffort !== null &&
 		reasoningEffort !== undefined &&
