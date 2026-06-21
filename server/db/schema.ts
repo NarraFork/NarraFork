@@ -1028,7 +1028,7 @@ export const hooks = sqliteTable(
 		id: text("id").primaryKey(),
 		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
 		event: text("event", {
-			enum: ["PreToolUse", "PostToolUse"],
+			enum: ["PreToolUse", "PostToolUse", "Stop"],
 		}).notNull(),
 		matcher: text("matcher").notNull().default(""),
 		type: text("type", { enum: ["command", "http"] }).notNull(),

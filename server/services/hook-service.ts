@@ -8,7 +8,7 @@ import { logger } from "../lib/logger";
 
 // === Types ===
 
-export type HookEvent = "PreToolUse" | "PostToolUse";
+export type HookEvent = "PreToolUse" | "PostToolUse" | "Stop";
 
 export interface HookInput {
 	hook_event_name: HookEvent;
@@ -22,6 +22,13 @@ export interface HookInput {
 	// PostToolUse extras
 	tool_output?: string;
 	tool_is_error?: boolean;
+	// Stop extras
+	/** How the response turn ended. */
+	stop_reason?: "done" | "error" | "aborted" | "max_turns";
+	/** Whether the response turn ended with an error. */
+	stop_error?: boolean;
+	/** Text of the final assistant message (or error message), truncated. */
+	last_assistant_text?: string;
 }
 
 export interface HookResult {
@@ -195,7 +202,7 @@ export const hookService = {
 
 	/**
 	 * Run all matching hooks for an event. For PreToolUse (blocking),
-	 * returns the first blocking result. For PostToolUse (non-blocking),
+	 * returns the first blocking result. For PostToolUse and Stop (non-blocking),
 	 * runs all hooks and returns success.
 	 *
 	 * Return value semantics:

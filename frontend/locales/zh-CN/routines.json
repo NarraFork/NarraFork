@@ -244,5 +244,6 @@
 	"hookDeleteConfirm": "确定要删除此钩子吗？",
 	"hookDeleteConfirmTitle": "删除钩子",
 	"hookEventPreToolUse": "工具执行前",
-	"hookEventPostToolUse": "工具执行后"
+	"hookEventPostToolUse": "工具执行后",
+	"hookEventStop": "应答结束时"
 }

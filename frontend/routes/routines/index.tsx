@@ -283,7 +283,7 @@ function CommandsTab() {
 
 // === Tab: Hooks ===
 
-const HOOK_EVENTS = ["PreToolUse", "PostToolUse"];
+const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"];
 const HOOK_TYPES = ["command", "http"];
 
 interface HookDraft {
@@ -487,17 +487,26 @@ function HooksTab() {
 							label: eventLabel(e),
 						}))}
 						value={draft.event}
-						onChange={(v) => setDraft((d) => ({ ...d, event: v ?? "PreToolUse" }))}
+						onChange={(v) =>
+							setDraft((d) => ({
+								...d,
+								event: v ?? "PreToolUse",
+								// Stop hooks are not tied to a tool — clear any matcher
+								matcher: v === "Stop" ? "" : d.matcher,
+							}))
+						}
 					/>
-					<TextInput
-						label={t("hookMatcher")}
-						placeholder={t("hookMatcherPlaceholder")}
-						value={draft.matcher}
-						onChange={(e) => {
-							const val = e.currentTarget.value;
-							setDraft((d) => ({ ...d, matcher: val }));
-						}}
-					/>
+					{draft.event !== "Stop" && (
+						<TextInput
+							label={t("hookMatcher")}
+							placeholder={t("hookMatcherPlaceholder")}
+							value={draft.matcher}
+							onChange={(e) => {
+								const val = e.currentTarget.value;
+								setDraft((d) => ({ ...d, matcher: val }));
+							}}
+						/>
+					)}
 					<Select
 						label={t("hookType")}
 						data={HOOK_TYPES.map((tp) => ({

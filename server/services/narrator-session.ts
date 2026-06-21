@@ -1008,6 +1008,10 @@ export async function runAgentLoop(
 	let loopHadError = false;
 	/** Whether the loop was interrupted by the user (abort signal). */
 	let loopWasInterrupted = false;
+	/** Final assistant text (or error message) from the most recent agent-loop pass, for Stop hooks. */
+	let stopHookFinalText = "";
+	/** Whether the most recent agent-loop pass ended by exceeding the max-turns limit (for Stop hooks). */
+	let loopHitMaxTurns = false;
 	/** How many times we've retried after emergency compact in this runAgentLoop call. */
 	let contextOverflowRetries = 0;
 
@@ -1750,6 +1754,19 @@ export async function runAgentLoop(
 				hooks,
 			});
 
+			// Track the latest pass's final text for the Stop hook (set on every pass,
+			// so the most recent assistant text / error message wins regardless of how
+			// the loop ultimately terminates).
+			if (result.finalText) {
+				stopHookFinalText = result.finalText;
+			}
+
+			// Track whether the latest pass ended by hitting the max-turns limit.
+			// Refreshed every pass (unconditionally) so that if the loop continues
+			// afterwards — e.g. goal continuation or a buffered message — and ends
+			// normally, this is cleared back to false before the Stop hook fires.
+			loopHitMaxTurns = result.maxTurnsExceeded === true;
+
 			await accountGoalUsageForTurn(active).catch((err) => {
 				logger.warn("Failed to account goal usage", { narratorId, error: String(err) });
 			});
@@ -2445,7 +2462,51 @@ export async function runAgentLoop(
 			});
 		}
 
-		// --- Resolve conclusion watcher ---
+		// --- Stop hooks ---
+		// Fire once per completed response turn for the MAIN narrator only (not
+		// subagents). Covers every termination path: normal done, error, and
+		// user interrupt. Non-blocking and fire-and-forget — hook failures never
+		// affect narrator state.
+		if (saParentNarratorId === undefined) {
+			void (async () => {
+				try {
+					const narr = await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { variant: true },
+					});
+					if (narr && isSubagentVariant(narr.variant)) return;
+
+					const stopReason = loopHadError
+						? "error"
+						: loopWasInterrupted
+							? "aborted"
+							: loopHitMaxTurns
+								? "max_turns"
+								: "done";
+					const { hookService } = await import("./hook-service");
+					await hookService.runHooks(
+						"Stop",
+						{
+							hook_event_name: "Stop",
+							narrator_id: narratorId,
+							chapter_id: active._chapterId,
+							project_id: active._projectId,
+							cwd: active.cwd,
+							stop_reason: stopReason,
+							stop_error: loopHadError,
+							last_assistant_text: stopHookFinalText.slice(0, 2000),
+						},
+						active._projectId,
+					);
+				} catch (err) {
+					logger.warn("Stop hook execution failed", {
+						narratorId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			})();
+		}
+
 		// When a subagent narrator completes (from the subagent page), check if
 		// there's a conclusion watcher registered for post-completion updates.
 		try {

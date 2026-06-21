@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const hookEventEnum = z.enum(["PreToolUse", "PostToolUse"]);
+export const hookEventEnum = z.enum(["PreToolUse", "PostToolUse", "Stop"]);
 
 export const hookTypeEnum = z.enum(["command", "http"]);
 
