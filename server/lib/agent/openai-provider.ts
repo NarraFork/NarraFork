@@ -2989,8 +2989,14 @@ async function buildResponsesHistory(
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
 			const text = textParts.join("\n") || msg.contentText || "";
+			// Emit sys context as a user-role input item rather than a developer
+			// message. Developer/system items get hoisted into top-level
+			// `instructions` (and, on Gemini-translating proxies, into
+			// `system_instruction`), which can leave the conversation `input`
+			// empty on turns whose only new content is a sys message (e.g. goal
+			// continuation). Keeping it as a user turn guarantees non-empty input.
 			if (text) {
-				history.push({ role: "developer", content: text } as unknown as OAIMessage);
+				history.push(buildResponsesUserMessage(text));
 			}
 		}
 	}
@@ -3167,8 +3173,14 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
 			const text = textParts.join("\n") || msg.contentText || "";
+			// Emit sys context as a user-role message rather than a system message.
+			// Gemini-translating proxies hoist every system message into
+			// `system_instruction`, which can leave `contents` empty on turns
+			// whose only new content is a sys message (e.g. goal continuation) and
+			// trigger "contents is not specified". A user turn keeps it visible to
+			// the model while guaranteeing non-empty conversation content.
 			if (text) {
-				history.push({ role: "system", content: text });
+				history.push({ role: "user", content: text });
 			}
 		}
 	}

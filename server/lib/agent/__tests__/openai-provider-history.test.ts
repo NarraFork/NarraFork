@@ -670,4 +670,65 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(historyJson).not.toContain('"type":"function_call"');
 		expect(result.trailingToolResults).toEqual([]);
 	});
+
+	test("buildHistory emits sys context as user input on responses format (not developer)", async () => {
+		const provider = new OpenAIProvider(TEST_PROVIDER);
+		const dbMessages: DbMessage[] = [
+			{
+				id: "sys-goal",
+				role: "sys",
+				contentJson: [{ type: "text", text: "Continue working toward the active goal." }],
+				contentText: "Continue working toward the active goal.",
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+			makeAssistantMessage({
+				id: "assistant-after-sys",
+				contentJson: [{ type: "text", text: "On it." }],
+				contentText: "On it.",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		// The sys message must land in the conversation input as a user turn so
+		// Gemini-translating proxies do not hoist it into system_instruction and
+		// leave `contents` empty (which triggers "contents is not specified").
+		const userItem = (result.history as Array<{ role?: string }>).find(
+			(item) => item.role === "user",
+		);
+		expect(userItem).toBeDefined();
+		expect(JSON.stringify(userItem)).toContain("Continue working toward the active goal.");
+		expect(JSON.stringify(result.history)).not.toContain('"role":"developer"');
+	});
+
+	test("buildHistory emits sys context as user message on completions format (not system)", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
+		const dbMessages: DbMessage[] = [
+			{
+				id: "sys-goal",
+				role: "sys",
+				contentJson: [{ type: "text", text: "Continue working toward the active goal." }],
+				contentText: "Continue working toward the active goal.",
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+			makeAssistantMessage({
+				id: "assistant-after-sys",
+				contentJson: [{ type: "text", text: "On it." }],
+				contentText: "On it.",
+			}),
+		];
+
+		const result = await provider.buildHistory(dbMessages, "openai:gpt-5");
+		const userItem = (result.history as Array<{ role?: string; content?: unknown }>).find(
+			(item) => item.role === "user",
+		);
+		expect(userItem).toBeDefined();
+		expect(userItem?.content).toBe("Continue working toward the active goal.");
+		expect((result.history as Array<{ role?: string }>).some((m) => m.role === "system")).toBe(
+			false,
+		);
+	});
 });
