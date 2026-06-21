@@ -55,6 +55,8 @@ function SettingsAgentPage() {
 				setDefaultRelaxedPlan={is.setDefaultRelaxedPlan}
 				defaultPruneEnabled={is.defaultPruneEnabled}
 				setDefaultPruneEnabled={is.setDefaultPruneEnabled}
+				planModeAllowInlinePlan={is.planModeAllowInlinePlan}
+				setPlanModeAllowInlinePlan={is.setPlanModeAllowInlinePlan}
 				planReflectionAutoApprove={is.planReflectionAutoApprove}
 				setPlanReflectionAutoApprove={is.setPlanReflectionAutoApprove}
 				planReflectionAllowAutoCompact={is.planReflectionAllowAutoCompact}

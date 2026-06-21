@@ -5,6 +5,8 @@ import type {
 	BlacklistCmd,
 	BlacklistDir,
 	BufferMessageSummary,
+	ChunkManifest,
+	ChunkRangeResult,
 	MessagesAroundOptions,
 	NarratorGoal,
 	NarratorGoalStatus,
@@ -205,6 +207,25 @@ export const narratorsApi = {
 		}
 		const qs = params.toString();
 		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
+	},
+	// Chunk virtualization: lightweight manifest of structural fingerprints.
+	getChunkManifest: (id: string, since?: number) => {
+		const params = new URLSearchParams();
+		if (since != null) params.set("since", String(since));
+		const qs = params.toString();
+		return request<ChunkManifest>(`/narrators/${id}/chunk-manifest${qs ? `?${qs}` : ""}`);
+	},
+	// Chunk virtualization: fetch a contiguous range of chunks (full trees).
+	getNarratorChunks: (
+		id: string,
+		opts?: { fromSeq?: number; direction?: "older" | "newer"; count?: number },
+	) => {
+		const params = new URLSearchParams();
+		if (opts?.fromSeq != null) params.set("fromSeq", String(opts.fromSeq));
+		if (opts?.direction) params.set("direction", opts.direction);
+		if (opts?.count != null) params.set("count", String(opts.count));
+		const qs = params.toString();
+		return request<ChunkRangeResult>(`/narrators/${id}/chunks${qs ? `?${qs}` : ""}`);
 	},
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),

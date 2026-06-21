@@ -598,4 +598,82 @@ describe("narratorService message query regressions", () => {
 			"shared-child",
 		]);
 	});
+
+	describe("getChunksByRange 边界标志", () => {
+		// CHUNK_SIZE = 20; seed 50 top-level messages (seq 0..49) so a count=1
+		// window (rowLimit 20) leaves content on both sides for paging.
+		function seedManyMessages(n: number) {
+			seedBase("n1");
+			for (let i = 0; i < n; i++) {
+				insertMessage({
+					id: `m${i}`,
+					seq: i,
+					contentJson: [{ type: "text", text: `msg ${i}` }],
+				});
+			}
+		}
+
+		it("尾部窗口 hasOlder 为真、hasNewer 为假", async () => {
+			seedManyMessages(50);
+			const res = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			// Tail window: newest 20 messages, seq 30..49.
+			expect(res.minSeq).toBe(30);
+			expect(res.maxSeq).toBe(49);
+			expect(res.hasOlder).toBe(true);
+			expect(res.hasNewer).toBe(false);
+		});
+
+		it("向更早分页时两侧标志都精确（中间窗口）", async () => {
+			seedManyMessages(50);
+			const tail = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			// Page older from the tail's min seq (30): expect seq 10..29.
+			const older = await narratorService.getChunksByRange("n1", {
+				direction: "older",
+				count: 1,
+				fromSeq: tail.minSeq ?? undefined,
+			});
+			expect(older.minSeq).toBe(10);
+			expect(older.maxSeq).toBe(29);
+			// Still older content below seq 10, and newer content above seq 29.
+			expect(older.hasOlder).toBe(true);
+			expect(older.hasNewer).toBe(true);
+		});
+
+		it("到达最早一页时 hasOlder 为假、hasNewer 为真", async () => {
+			seedManyMessages(50);
+			// Page older starting just past the head so the window lands on seq 0..9.
+			const head = await narratorService.getChunksByRange("n1", {
+				direction: "older",
+				count: 1,
+				fromSeq: 10,
+			});
+			expect(head.minSeq).toBe(0);
+			expect(head.maxSeq).toBe(9);
+			expect(head.hasOlder).toBe(false);
+			expect(head.hasNewer).toBe(true);
+		});
+
+		it("向更新分页时两侧标志都精确", async () => {
+			seedManyMessages(50);
+			// Newer than seq 9 → seq 10..29 (rowLimit 20).
+			const newer = await narratorService.getChunksByRange("n1", {
+				direction: "newer",
+				count: 1,
+				fromSeq: 9,
+			});
+			expect(newer.minSeq).toBe(10);
+			expect(newer.maxSeq).toBe(29);
+			expect(newer.hasOlder).toBe(true);
+			expect(newer.hasNewer).toBe(true);
+		});
+
+		it("消息数不足一个窗口时两侧标志均为假", async () => {
+			seedManyMessages(5);
+			const res = await narratorService.getChunksByRange("n1", { direction: "older", count: 1 });
+			expect(res.minSeq).toBe(0);
+			expect(res.maxSeq).toBe(4);
+			expect(res.hasOlder).toBe(false);
+			expect(res.hasNewer).toBe(false);
+		});
+	});
 });

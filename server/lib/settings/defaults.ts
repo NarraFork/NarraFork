@@ -36,6 +36,7 @@ export const DEFAULTS: NarraForkSettings = {
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		defaultPruneEnabled: false,
+		planModeAllowInlinePlan: true,
 		planReflectionAutoApprove: false,
 		planReflectionAllowAutoCompact: false,
 		questionReflectionEnabled: false,
@@ -295,6 +296,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.defaultPruneEnabled": {
 		desc: "新建叙述者的自动裁剪默认值。默认关闭；开启可能导致提示词缓存失效、计费变贵。",
+		type: "boolean",
+	},
+	"agent.planModeAllowInlinePlan": {
+		desc: "是否允许 plan mode 内联计划（ExitPlanMode 的 plan 参数）。关闭后仅支持 plan 文件形式，ExitPlanMode 的工具 schema、描述与计划模式系统提示会同步移除内联选项，计划内容只从指定的 plan 文件读取。默认开启。",
 		type: "boolean",
 	},
 	"agent.planReflectionAutoApprove": {

@@ -70,6 +70,7 @@ function dbInsertBuffered(
 	creator?: BufferCreator | null,
 	savedFiles?: SavedBufferedFile[],
 	priority = false,
+	bashCommand?: string | null,
 ): void {
 	db.insert(narratorBufferedMessages)
 		.values({
@@ -80,6 +81,7 @@ function dbInsertBuffered(
 			bufferedAt,
 			imagesJson: images?.length ? JSON.stringify(images) : null,
 			commandText: commandText ?? null,
+			bashCommand: bashCommand ?? null,
 			createdBy: createdBy ?? null,
 			creatorJson: creator ? JSON.stringify(creator) : null,
 			textFilePathsJson: savedFiles?.length ? JSON.stringify(savedFiles) : null,
@@ -110,6 +112,7 @@ export async function pushBufferedMessage(
 	creator?: BufferCreator | null,
 	textFiles?: File[],
 	position: "back" | "front" = "back",
+	bashCommand?: string | null,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	if (!activeNarrators.has(narratorId)) {
 		return { ok: false, bufferedAt: "", id: "" };
@@ -134,6 +137,7 @@ export async function pushBufferedMessage(
 		textFiles,
 		bufferedAt,
 		commandText,
+		bashCommand: bashCommand ?? null,
 		createdBy,
 		creator,
 		priority,
@@ -160,6 +164,7 @@ export async function pushBufferedMessage(
 				creator,
 				savedFiles,
 				priority,
+				bashCommand,
 			);
 		})();
 	} else {
@@ -176,6 +181,7 @@ export async function pushBufferedMessage(
 			creator,
 			savedFiles,
 			priority,
+			bashCommand,
 		);
 	}
 	bufferedMessages.set(narratorId, queue);

@@ -1018,6 +1018,7 @@ export const narratorBufferedMessages = sqliteTable(
 		text: text("text").notNull(),
 		imagesJson: text("images_json"), // JSON: ImageRef[] | null
 		commandText: text("command_text"),
+		bashCommand: text("bash_command"), // runBashFirst command to execute before the prompt
 		createdBy: text("created_by"),
 		creatorJson: text("creator_json"), // JSON: BufferCreator | null
 		textFilePathsJson: text("text_file_paths_json"), // JSON: SavedBufferedFile[] | null

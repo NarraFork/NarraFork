@@ -1879,6 +1879,7 @@ export function resolveExitPlanModeInput(
 	| { ok: false; message: string; input: Record<string, unknown> } {
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
+	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
 	let effectiveInput = input;
 	let resolvedFromFile = false;
 	if (planFileId) {
@@ -1896,11 +1897,17 @@ export function resolveExitPlanModeInput(
 			// Ignore read errors
 		}
 	}
-	if (!resolvedFromFile) {
+	// Inline plan is only used as a fallback when the instance allows it. When
+	// inline plans are disabled, the plan must come from the designated plan file.
+	if (!resolvedFromFile && allowInlinePlan) {
 		const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
 		if (inlinePlan) {
 			effectiveInput = { ...effectiveInput, plan: inlinePlan };
 		}
+	} else if (!allowInlinePlan && typeof effectiveInput.plan === "string" && !resolvedFromFile) {
+		// Strip any inline plan the model may have passed despite the disabled schema.
+		const { plan: _ignored, ...rest } = effectiveInput;
+		effectiveInput = rest;
 	}
 
 	const planValue = effectiveInput.plan;

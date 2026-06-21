@@ -397,34 +397,41 @@ export async function handleBashCommand(
 	command: string,
 	rawCommand: string,
 	userId?: string,
+	options?: { skipUserMessage?: boolean },
 ): Promise<{ type: "bash"; id: string; output: string; isError: boolean }> {
 	const narrator = await narratorService.getById(narratorId);
 	const cwd = narrator.cwd ?? process.cwd();
 
 	// 1. Persist and broadcast the user-visible /bash command immediately.
-	const userMsg = await narratorService.persistUserMessage(
-		narratorId,
-		rawCommand,
-		[{ type: "bash_command", command }],
-		rawCommand,
-		userId,
-	);
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: {
-			id: userMsg.id,
+	// When skipUserMessage is set (runBashFirst flow), the user's slash command was
+	// already persisted as a separate message, so we skip the extra "$ cmd" bubble
+	// and only render the Bash tool card below.
+	let userMsg: Awaited<ReturnType<typeof narratorService.persistUserMessage>> | undefined;
+	if (!options?.skipUserMessage) {
+		userMsg = await narratorService.persistUserMessage(
 			narratorId,
-			role: "user",
-			contentJson: userMsg.contentJson,
-			contentText: userMsg.contentText,
-			commandText: rawCommand,
-			createdAt: userMsg.createdAt,
-			seq: userMsg.seq,
-			children: [],
-			creator: userMsg.creator ?? null,
-		},
-	});
+			rawCommand,
+			[{ type: "bash_command", command }],
+			rawCommand,
+			userId,
+		);
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: {
+				id: userMsg.id,
+				narratorId,
+				role: "user",
+				contentJson: userMsg.contentJson,
+				contentText: userMsg.contentText,
+				commandText: rawCommand,
+				createdAt: userMsg.createdAt,
+				seq: userMsg.seq,
+				children: [],
+				creator: userMsg.creator ?? null,
+			},
+		});
+	}
 
 	const { bashTool } = await import("../lib/agent/tools/bash");
 	const toolUseId = `toolu_bash_${generateId()}`;
@@ -594,7 +601,7 @@ export async function handleBashCommand(
 
 	return {
 		type: "bash" as const,
-		id: userMsg.id,
+		id: userMsg?.id ?? assistantMsgId,
 		output: result.output,
 		isError: result.isError ?? false,
 	};
@@ -1530,6 +1537,8 @@ export const narratorService = {
 	getRecentMessages: narratorMessageQueries.getRecentMessages.bind(narratorMessageQueries),
 	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
 	getMessagesCursor: narratorMessageQueries.getMessagesCursor.bind(narratorMessageQueries),
+	getChunkManifest: narratorMessageQueries.getChunkManifest.bind(narratorMessageQueries),
+	getChunksByRange: narratorMessageQueries.getChunksByRange.bind(narratorMessageQueries),
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
 	getMessagesAround: narratorMessageQueries.getMessagesAround.bind(narratorMessageQueries),

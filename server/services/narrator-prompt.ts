@@ -22,6 +22,8 @@ export interface BuildPromptOptions {
 	planMode?: boolean;
 	/** Plan file ID for plan mode (locks Write/Edit to .narrafork/plan-{id}.md) */
 	planFileId?: string;
+	/** Whether plan mode accepts inline plans. When false, only the file-based flow is shown. */
+	planAllowInlinePlan?: boolean;
 	/** Whether to force language instruction even for English locale */
 	replyInUserLanguage?: boolean;
 	/** Global default system prompt (used when basePrompt is null) */
@@ -50,6 +52,7 @@ export async function buildEffectiveSystemPrompt(
 		contextSummary,
 		planMode,
 		planFileId,
+		planAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
 	} = options;
@@ -157,7 +160,7 @@ export async function buildEffectiveSystemPrompt(
 	if (planMode) {
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
-		prompt = `${base}${sep}${getPlanModeSystemReminder(locale, planFileId)}`;
+		prompt = `${base}${sep}${getPlanModeSystemReminder(locale, planFileId, planAllowInlinePlan !== false)}`;
 	}
 
 	return { prompt, usedCompactSummary };

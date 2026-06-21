@@ -90,7 +90,7 @@ import {
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
 } from "./narrator-recovery";
-import { narratorService } from "./narrator-service";
+import { handleBashCommand, narratorService } from "./narrator-service";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import {
 	generateAndSetTitle,
@@ -294,6 +294,7 @@ async function buildSystemPrompt(
 		contextSummary: narrator.contextSummary,
 		planMode,
 		planFileId,
+		planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
 	});
@@ -1517,6 +1518,7 @@ export async function runAgentLoop(
 				previousPermissionMode:
 					active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined,
 				relaxedPlan: !!freshNarrator.relaxedPlan,
+				planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
 				),
@@ -2393,6 +2395,21 @@ export async function runAgentLoop(
 					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
 					active.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "working");
+					// runBashFirst flow: run the Bash command as an assistant tool card after the
+					// user message, then replay it as the current turn (empty text) so the model
+					// sees: user prompt → Bash tool call/result → reply.
+					if (buffered.bashCommand) {
+						await handleBashCommand(
+							narratorId,
+							buffered.bashCommand,
+							`/bash ${buffered.bashCommand}`,
+							buffered.createdBy ?? undefined,
+							{ skipUserMessage: true },
+						);
+						currentText = "";
+						currentImages = undefined;
+						continue;
+					}
 					currentText = effectiveBufferedText;
 					currentImages = buffered.images;
 					continue;
@@ -2744,6 +2761,7 @@ export async function runAgentLoop(
 						first.commandText,
 						first.createdBy,
 						first.textFiles,
+						first.bashCommand,
 					)
 						.then(({ userMsg }) => {
 							broadcastToNarrator(narratorId, {
@@ -2805,6 +2823,7 @@ async function feedMessage(
 	commandText?: string | null,
 	userId?: string | null,
 	rawTextFiles?: File[],
+	preBashCommand?: string | null,
 ): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	active._goalContinuationSuppressed = false;
@@ -2904,6 +2923,35 @@ async function feedMessage(
 		active._provisionalTitle =
 			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
+	}
+
+	// runBashFirst flow: after persisting the user message, run the Bash command as
+	// an assistant tool card, then start the loop with empty text. buildHistory
+	// reconstructs the Bash tool_result as the current user turn, so the model sees
+	// the order: user prompt → Bash tool call/result → model reply.
+	if (preBashCommand) {
+		await handleBashCommand(
+			narratorId,
+			preBashCommand,
+			`/bash ${preBashCommand}`,
+			userId ?? undefined,
+			{
+				skipUserMessage: true,
+			},
+		);
+		runAgentLoop(active, "", undefined).catch(async (err) => {
+			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err) });
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { active, userMsg };
 	}
 
 	// Start agent loop in background
@@ -3024,6 +3072,7 @@ export async function sendMessage(
 	commandText?: string | null,
 	userId?: string | null,
 	textFiles?: File[],
+	preBashCommand?: string | null,
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const { userMsg } = await feedMessage(
 		narratorId,
@@ -3034,6 +3083,7 @@ export async function sendMessage(
 		commandText,
 		userId,
 		textFiles,
+		preBashCommand,
 	);
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
@@ -4629,6 +4679,7 @@ export async function recoverOnStartup(): Promise<void> {
 				textFiles: textFiles?.length ? textFiles : undefined,
 				bufferedAt: row.bufferedAt,
 				commandText: row.commandText,
+				bashCommand: row.bashCommand,
 				createdBy: row.createdBy,
 				creator,
 				priority: row.priority,

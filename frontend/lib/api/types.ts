@@ -520,6 +520,38 @@ export interface PaginatedMessages {
 	prunedPercent?: number | null;
 }
 
+// ── Chunk virtualization (manifest + range) ────────────────────────────────
+
+export interface ChunkManifestEntry {
+	/** = first message id in the chunk (stable across compact/seq shifts) */
+	id: string;
+	firstSeq: number;
+	lastSeq: number;
+	count: number;
+	/** structural fingerprint (changes on insert/delete/reorder) */
+	hash: string;
+}
+
+export type ChunkManifest =
+	| { unchanged: true; messageVersion: number }
+	| {
+			unchanged: false;
+			messageVersion: number;
+			total: number;
+			chunks: ChunkManifestEntry[];
+	  };
+
+export interface ChunkRangeResult {
+	messages: TreeMessage[];
+	minSeq: number | null;
+	maxSeq: number | null;
+	hasOlder: boolean;
+	hasNewer: boolean;
+	messageVersion: number;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
+}
+
 export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
 export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
 export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";

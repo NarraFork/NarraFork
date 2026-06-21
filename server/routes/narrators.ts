@@ -1008,16 +1008,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const modelOverride =
 		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
 
-	// Running narrator: buffer the message for execution after the current turn.
-	// Commands that execute Bash before the prompt are intentionally not queued: the Bash
-	// command may have side effects, and executing it now would break the expected order
-	// if the prompt only runs after the current turn.
-	if (prePromptBashCommand && (narrator.status === "working" || narrator.status === "waiting")) {
-		throw new ValidationError(
-			"Commands with Run Bash first cannot be queued while the narrator is working. Please wait for the current turn to finish and run the command again.",
-		);
-	}
-
 	if (queuedNewCommand && !(narrator.status === "working" || narrator.status === "waiting")) {
 		const currentCwd = narrator.cwd ?? undefined;
 		const newNarrator = await narratorService.create({
@@ -1104,6 +1094,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			creator,
 			textFiles.length > 0 ? textFiles : undefined,
 			priority ? "front" : undefined,
+			prePromptBashCommand,
 		);
 		if (result.ok) {
 			const messages = toBufferSummary(getBufferedMessages(id));
@@ -1132,10 +1123,6 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Narrator not active in memory — fall through to normal send
 	}
 
-	if (prePromptBashCommand) {
-		await handleBashCommand(id, prePromptBashCommand, `/bash ${prePromptBashCommand}`, userId);
-	}
-
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
@@ -1151,6 +1138,8 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		await narratorService.updateModel(id, modelOverride.model);
 	}
 
+	// prePromptBashCommand (runBashFirst) is passed to sendMessage so the order is:
+	// user prompt message → Bash tool card → model reply (handled inside feedMessage).
 	const userMsg = await sendMessage(
 		id,
 		finalMessage,
@@ -1160,6 +1149,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		commandText,
 		userId,
 		textFiles,
+		prePromptBashCommand,
 	);
 
 	// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
@@ -1394,6 +1384,53 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	clearBufferedMessages(id);
 	broadcastToNarrator(id, { type: "buffer_set", narratorId: id, messages: [] });
 	return c.json({ ok: true });
+});
+
+// Chunk manifest for the virtualized message list (lightweight fingerprints).
+// `since` short-circuits with { unchanged: true } when the structure version
+// has not changed.
+narratorRoutes.get("/:id/chunk-manifest", async (c) => {
+	const id = c.req.param("id");
+	const sinceRaw = c.req.query("since");
+	const since = sinceRaw != null ? Number.parseInt(sinceRaw, 10) : undefined;
+	const result = await narratorService.getChunkManifest(
+		id,
+		since != null && !Number.isNaN(since) ? since : undefined,
+	);
+	return c.json(result);
+});
+
+// Fetch a contiguous range of chunks (full message trees) for the virtualized
+// list. Replaces the legacy 20/50 + around triple-path on the chunk codepath.
+narratorRoutes.get("/:id/chunks", async (c) => {
+	const id = c.req.param("id");
+	const fromSeqRaw = c.req.query("fromSeq");
+	const fromSeq = fromSeqRaw != null ? Number.parseInt(fromSeqRaw, 10) : undefined;
+	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
+	const countRaw = c.req.query("count");
+	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
+	const [result, narratorMeta] = await Promise.all([
+		narratorService.getChunksByRange(id, {
+			fromSeq: fromSeq != null && !Number.isNaN(fromSeq) ? fromSeq : undefined,
+			direction,
+			count: count != null && !Number.isNaN(count) ? count : undefined,
+		}),
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: {
+				pruneBoundaryMessageId: true,
+				prunedPercent: true,
+				messageVersion: true,
+			},
+		}),
+	]);
+	if (!narratorMeta) throw new NotFoundError("Narrator", id);
+	return c.json({
+		...result,
+		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
+		prunedPercent: narratorMeta.prunedPercent ?? null,
+		messageVersion: narratorMeta.messageVersion ?? 0,
+	});
 });
 
 // Get message history (cursor-based pagination, newest first)

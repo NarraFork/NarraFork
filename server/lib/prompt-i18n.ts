@@ -653,8 +653,8 @@ export function getReplyLanguageInstruction(locale: Locale): string {
 
 // --- Plan mode system reminder (injected into system prompt) ---
 
-const planModeSystemReminder: Record<Locale, (planFile: string) => string> = {
-	en: (planFile) => `<system-reminder>
+const planModeSystemReminder: Record<Locale, (planFile: string, allowInline: boolean) => string> = {
+	en: (planFile, allowInline) => `<system-reminder>
 # Plan Mode
 
 CRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files.
@@ -675,7 +675,9 @@ Think, read, search, and construct a well-formed plan that accomplishes the user
 4. **Clarify** — Ask the user questions when weighing tradeoffs or facing ambiguity
 5. **Present** — Call ExitPlanMode to submit your plan
 
-## Plan Submission — Two Modes
+${
+	allowInline
+		? `## Plan Submission — Two Modes
 
 You have two ways to submit your plan (choose ONE):
 
@@ -684,15 +686,21 @@ Call ExitPlanMode with the \`plan\` parameter containing your complete plan text
 
 ### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode WITHOUT the \`plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.
+2. When done, call ExitPlanMode WITHOUT the \`plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.`
+		: `## Plan Submission — File-based only
 
-**IMPORTANT**: The plan (whether inline or in the file) must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
+Inline plans are disabled in this instance. You MUST submit your plan via the designated plan file:
+1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
+2. When done, call ExitPlanMode (it takes no \`plan\` parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
+}
+
+**IMPORTANT**: The plan must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
 
 Do NOT make large assumptions about user intent. Ask clarifying questions when needed.
 
 Your turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.
 </system-reminder>`,
-	"zh-CN": (planFile) => `<system-reminder>
+	"zh-CN": (planFile, allowInline) => `<system-reminder>
 # 计划模式
 
 关键约束：计划模式已激活 — 你处于项目文件只读阶段。
@@ -713,7 +721,9 @@ Your turn should only end with either asking the user a question or calling Exit
 4. **澄清** — 在权衡取舍或面临歧义时向用户提问
 5. **提交** — 调用 ExitPlanMode 提交完整计划
 
-## 计划提交 — 两种模式
+${
+	allowInline
+		? `## 计划提交 — 两种模式
 
 你有两种方式提交计划（选择其一）：
 
@@ -722,9 +732,15 @@ Your turn should only end with either asking the user a question or calling Exit
 
 ### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，直接调用 ExitPlanMode，不需要传 \`plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。
+2. 完成后，直接调用 ExitPlanMode，不需要传 \`plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+		: `## 计划提交 — 仅支持文件模式
 
-**重要**：计划（无论内联还是文件形式）必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
+本实例已禁用内联计划。你必须通过指定的计划文件提交计划：
+1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
+2. 完成后，直接调用 ExitPlanMode（它不接受 \`plan\` 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+}
+
+**重要**：计划必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
 
 不要对用户意图做大量假设。需要时请提出澄清问题。
 
@@ -732,11 +748,15 @@ Your turn should only end with either asking the user a question or calling Exit
 </system-reminder>`,
 };
 
-export function getPlanModeSystemReminder(locale: Locale = "en", planFileId?: string): string {
+export function getPlanModeSystemReminder(
+	locale: Locale = "en",
+	planFileId?: string,
+	allowInline = true,
+): string {
 	const fileId = planFileId ?? "unknown";
 	const planFile = `.narrafork/plan-${fileId}.md`;
 	const fn = planModeSystemReminder[locale] ?? planModeSystemReminder.en;
-	return fn(planFile);
+	return fn(planFile, allowInline);
 }
 
 // mergeSummaryLabels, MergeSummaryLabelKey, getMergeSummaryLabel

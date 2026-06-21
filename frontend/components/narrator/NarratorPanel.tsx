@@ -90,6 +90,7 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNamedNarrators } from "../../hooks/useChatGroup";
+import { useChunkedListEnabled } from "../../hooks/useChunkedListFlag";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
 import { useAllModels } from "../../hooks/useModels";
@@ -176,6 +177,7 @@ import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserPanel } from "./BrowserPanel";
 import { ChapterBar } from "./ChapterBar";
+import { ChunkedMessageList } from "./ChunkedMessageList";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -2142,6 +2144,7 @@ export function NarratorPanel({
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
+	const chunkedListEnabled = useChunkedListEnabled();
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
@@ -7497,6 +7500,12 @@ export function NarratorPanel({
 															))}
 														</Box>
 													</Box>
+												) : chunkedListEnabled ? (
+													<ChunkedMessageList
+														narratorId={narratorId}
+														permCb={renderPermCb}
+														hasChapter={hasChapter}
+													/>
 												) : usePixiRenderer ? (
 													<NarratorPixiMessageList
 														ref={virtualListRef}

@@ -780,6 +780,7 @@ export const handleNarratorWS = {
 				// Resolve slash commands before buffering
 				let bufferText = msg.text;
 				let commandText: string | null = null;
+				let preBashCommand: string | null = null;
 				const userId = ws.data.userId;
 				if (userId) {
 					try {
@@ -812,6 +813,9 @@ export const handleNarratorWS = {
 						if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
 							commandText = msg.text;
 							bufferText = cmdResult.expandedPrompt;
+							if ("bashCommand" in cmdResult && cmdResult.bashCommand) {
+								preBashCommand = cmdResult.bashCommand;
+							}
 						}
 					} catch (err) {
 						logger.warn("Failed to resolve command in buffer message", {
@@ -830,6 +834,10 @@ export const handleNarratorWS = {
 					undefined,
 					commandText,
 					userId,
+					undefined,
+					undefined,
+					undefined,
+					preBashCommand,
 				);
 				// Fallback: try buffering for a running foreground subagent
 				let usedSubagent = false;

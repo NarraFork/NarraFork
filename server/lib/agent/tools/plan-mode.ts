@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { getToolMessage, type Locale } from "../../prompt-i18n";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 export const enterPlanModeTool: ToolDefinition = {
 	name: "EnterPlanMode",
@@ -79,18 +79,59 @@ export const enterPlanModeTool: ToolDefinition = {
 	},
 };
 
-export const exitPlanModeTool: ToolDefinition = {
-	name: "ExitPlanMode",
+const EXIT_PLAN_PLAN_PARAM_DESCRIPTION =
+	"The COMPLETE implementation plan in markdown format. " +
+	"Must contain the full plan with all steps, file changes, and reasoning. " +
+	"This content will be shown to the user for approval. Cannot be empty. " +
+	"Omit this parameter if you already wrote the plan to the designated plan file — " +
+	"the system will read the file automatically.";
+
+const EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA = {
 	description:
-		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n" +
-		"## How This Tool Works\n\n" +
-		"You have two ways to submit your plan:\n\n" +
-		"### Mode A: Inline plan (for short/medium plans)\n" +
-		"Pass the complete plan text in the `plan` parameter.\n\n" +
-		"### Mode B: File-based plan (for long/complex plans)\n" +
-		"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `plan` parameter. " +
-		"The system will automatically read the plan file content and present it to the user.\n" +
-		"Do NOT put a file reference like 'Plan written to xxx' in the `plan` parameter — just omit `plan` entirely and the system handles the rest.\n\n" +
+		"Optional notes for the ExitPlanMode readiness self-check about command categories the plan may require. These do not grant permissions after approval.",
+	type: "array",
+	items: {
+		type: "object",
+		properties: {
+			tool: {
+				description: "The tool this prompt applies to",
+				type: "string",
+				enum: ["Bash"],
+			},
+			prompt: {
+				description: 'Semantic description of the action, e.g. "run tests", "install dependencies"',
+				type: "string",
+			},
+		},
+		required: ["tool", "prompt"],
+		additionalProperties: false,
+	},
+} as const;
+
+/** Inline plan is allowed unless the instance setting explicitly disables it. */
+function isInlinePlanAllowed(config?: AgentConfig): boolean {
+	return config?.planAllowInlinePlan !== false;
+}
+
+function buildExitPlanModeDescription(config?: AgentConfig): string {
+	const allowInline = isInlinePlanAllowed(config);
+	const header =
+		"Use this tool when you are in plan mode and have finished designing your implementation plan and are ready for user approval.\n\n";
+	const howItWorks = allowInline
+		? "## How This Tool Works\n\n" +
+			"You have two ways to submit your plan:\n\n" +
+			"### Mode A: Inline plan (for short/medium plans)\n" +
+			"Pass the complete plan text in the `plan` parameter.\n\n" +
+			"### Mode B: File-based plan (for long/complex plans)\n" +
+			"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `plan` parameter. " +
+			"The system will automatically read the plan file content and present it to the user.\n" +
+			"Do NOT put a file reference like 'Plan written to xxx' in the `plan` parameter — just omit `plan` entirely and the system handles the rest.\n\n"
+		: "## How This Tool Works\n\n" +
+			"Inline plans are disabled in this instance — only the file-based plan flow is supported.\n\n" +
+			"### File-based plan (the only supported mode)\n" +
+			"Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode (this tool takes no `plan` parameter). " +
+			"The system will automatically read the plan file content and present it to the user.\n\n";
+	const rest =
 		"## When to Use This Tool\n" +
 		"IMPORTANT: Only use this tool when the task requires planning the implementation steps of a task that requires writing code. For research tasks where you're gathering information, searching files, reading files or in general trying to understand the codebase - do NOT use this tool.\n\n" +
 		"## Before Using This Tool\n" +
@@ -101,55 +142,36 @@ export const exitPlanModeTool: ToolDefinition = {
 		"## Examples\n\n" +
 		'1. Initial task: "Search for and understand the implementation of vim mode in the codebase" - Do not use the exit plan mode tool because you are not planning the implementation steps of a task.\n' +
 		'2. Initial task: "Help me implement yank mode for vim" - Use the exit plan mode tool after you have finished planning the implementation steps of the task.\n' +
-		'3. Initial task: "Add a new feature to handle user authentication" - If unsure about auth method (OAuth, JWT, etc.), use AskUserQuestion first, then use exit plan mode tool after clarifying the approach.',
-	rawJsonSchema: {
+		'3. Initial task: "Add a new feature to handle user authentication" - If unsure about auth method (OAuth, JWT, etc.), use AskUserQuestion first, then use exit plan mode tool after clarifying the approach.';
+	return header + howItWorks + rest;
+}
+
+function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> {
+	const allowInline = isInlinePlanAllowed(config);
+	const properties: Record<string, unknown> = {
+		allowedPrompts: EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA,
+	};
+	if (allowInline) {
+		properties.plan = {
+			description: EXIT_PLAN_PLAN_PARAM_DESCRIPTION,
+			type: "string",
+		};
+	}
+	return {
 		type: "object",
-		properties: {
-			plan: {
-				description:
-					"The COMPLETE implementation plan in markdown format. " +
-					"Must contain the full plan with all steps, file changes, and reasoning. " +
-					"This content will be shown to the user for approval. Cannot be empty. " +
-					"Omit this parameter if you already wrote the plan to the designated plan file — " +
-					"the system will read the file automatically.",
-				type: "string",
-			},
-			allowedPrompts: {
-				description:
-					"Optional notes for the ExitPlanMode readiness self-check about command categories the plan may require. These do not grant permissions after approval.",
-				type: "array",
-				items: {
-					type: "object",
-					properties: {
-						tool: {
-							description: "The tool this prompt applies to",
-							type: "string",
-							enum: ["Bash"],
-						},
-						prompt: {
-							description:
-								'Semantic description of the action, e.g. "run tests", "install dependencies"',
-							type: "string",
-						},
-					},
-					required: ["tool", "prompt"],
-					additionalProperties: false,
-				},
-			},
-		},
+		properties,
 		additionalProperties: {},
-	},
+	};
+}
+
+export const exitPlanModeTool: ToolDefinition = {
+	name: "ExitPlanMode",
+	description: (config) => buildExitPlanModeDescription(config),
+	getRawJsonSchema: (config) => buildExitPlanModeSchema(config),
+	// Static fallback schema (inline allowed) for contexts without a resolved config.
+	rawJsonSchema: buildExitPlanModeSchema(),
 	parameters: z.object({
-		plan: z
-			.string()
-			.optional()
-			.describe(
-				"The COMPLETE implementation plan in markdown format. " +
-					"Must contain the full plan with all steps, file changes, and reasoning. " +
-					"This content will be shown to the user for approval. Cannot be empty. " +
-					"Omit this parameter if you already wrote the plan to the designated plan file — " +
-					"the system will read the file automatically.",
-			),
+		plan: z.string().optional().describe(EXIT_PLAN_PLAN_PARAM_DESCRIPTION),
 		allowedPrompts: z
 			.array(
 				z.object({

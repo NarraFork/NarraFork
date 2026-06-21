@@ -655,6 +655,86 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 	});
 }
 
+/**
+ * Build a fully-hydrated message tree from a set of top-level ref rows
+ * (messageId + seq). Shared by getMessagesCursor and getChunksByRange so the
+ * exact same enrichment pipeline (seqs, subagent children, sidecars, tool IO
+ * truncation, exit-plan filtering) is applied consistently.
+ *
+ * `refRows` must already be ordered ascending by seq.
+ */
+async function buildTreeFromTopLevelRefs(
+	refRows: Array<{ messageId: string; seq: number }>,
+	isSubagent: boolean,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+): Promise<any[]> {
+	if (refRows.length === 0) return [];
+
+	const messageIds = refRows.map((r) => r.messageId);
+	const topMessages = await db.query.narratorMessages.findMany({
+		where: inArray(narratorMessages.id, messageIds),
+		with: { toolCalls: true, sideCars: true, creator: true },
+	});
+
+	const seqMap = new Map(refRows.map((r) => [r.messageId, r.seq]));
+	topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+	attachMessageSeqs(topMessages, seqMap);
+
+	if (isSubagent) {
+		for (const msg of topMessages) {
+			msg.parentToolUseId = null;
+		}
+	}
+
+	const parentToolUseIds = collectToolUseIds(topMessages);
+	const childMessages =
+		parentToolUseIds.length > 0
+			? await db.query.narratorMessages.findMany({
+					where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+					with: { toolCalls: true, sideCars: true, creator: true },
+					orderBy: (m, { asc }) => [asc(m.createdAt)],
+					limit: 500,
+				})
+			: [];
+
+	await attachSubagentModels(childMessages);
+	await hydrateToolUseSideCars([...topMessages, ...childMessages]);
+
+	return enrichToolUseBlocks(
+		filterExitPlanBeforePlanCompact(
+			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
+		),
+	);
+}
+
+// ── Chunk manifest helpers ─────────────────────────────────────────────────
+
+/** Number of top-level messages per chunk. Keep in sync with the frontend. */
+export const CHUNK_SIZE = 20;
+
+/**
+ * Compute a cheap structural fingerprint for a chunk. Changes whenever the
+ * chunk's boundaries, size, or last message identity change — which covers
+ * insert / delete / reorder. Content edits (which keep structure intact) are
+ * handled separately via the message_updated WS event, so they intentionally
+ * do not alter this hash.
+ */
+function computeChunkHash(
+	firstSeq: number,
+	lastSeq: number,
+	count: number,
+	lastMessageId: string,
+): string {
+	// djb2 — small, fast, allocation-light. Not cryptographic; only needs to
+	// detect change, not resist collisions.
+	let h = 5381;
+	const s = `${firstSeq}:${lastSeq}:${count}:${lastMessageId}`;
+	for (let i = 0; i < s.length; i++) {
+		h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+	}
+	return (h >>> 0).toString(36);
+}
+
 // ── narratorMessages object ────────────────────────────────────────────────
 
 export const narratorMessageQueries = {
@@ -933,41 +1013,7 @@ export const narratorMessageQueries = {
 			};
 		}
 
-		const messageIds = pageRows.map((r) => r.messageId);
-		const topMessages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, messageIds),
-			with: { toolCalls: true, sideCars: true, creator: true },
-		});
-
-		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
-		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		attachMessageSeqs(topMessages, seqMap);
-
-		if (isSubagent) {
-			for (const msg of topMessages) {
-				msg.parentToolUseId = null;
-			}
-		}
-
-		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childMessages =
-			parentToolUseIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, sideCars: true, creator: true },
-						orderBy: (m, { asc }) => [asc(m.createdAt)],
-						limit: 500,
-					})
-				: [];
-
-		await attachSubagentModels(childMessages);
-		await hydrateToolUseSideCars([...topMessages, ...childMessages]);
-
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(
-				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
-			),
-		);
+		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
 
 		return {
 			messages: tree,
@@ -987,6 +1033,195 @@ export const narratorMessageQueries = {
 			columns: { messageVersion: true },
 		});
 		return row?.messageVersion ?? 0;
+	},
+
+	/**
+	 * Lightweight chunk manifest for the virtualized message list.
+	 *
+	 * Reads ONLY the narrow narrator_message_refs join (indexed by seq), never
+	 * the large content_json/output_json payloads. Returns one fingerprint per
+	 * CHUNK_SIZE top-level messages so the client can detect which chunks changed
+	 * without refetching content. When `sinceVersion` matches the current
+	 * messageVersion, short-circuits with `{ unchanged: true }`.
+	 */
+	async getChunkManifest(
+		narratorId: string,
+		sinceVersion?: number,
+	): Promise<
+		| { unchanged: true; messageVersion: number }
+		| {
+				unchanged: false;
+				messageVersion: number;
+				total: number;
+				chunks: Array<{
+					id: string;
+					firstSeq: number;
+					lastSeq: number;
+					count: number;
+					hash: string;
+				}>;
+		  }
+	> {
+		const messageVersion = await this.getMessageVersion(narratorId);
+		if (sinceVersion != null && sinceVersion === messageVersion) {
+			return { unchanged: true, messageVersion };
+		}
+
+		const isSubagent = await this.isSubagentNarrator(narratorId);
+
+		// Narrow query: seq + messageId only, ordered by seq. No large columns,
+		// no COUNT(*). Uses idx_narrator_refs_seq.
+		const refRows = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
+			)
+			.orderBy(narratorMessageRefs.seq);
+
+		const chunks: Array<{
+			id: string;
+			firstSeq: number;
+			lastSeq: number;
+			count: number;
+			hash: string;
+		}> = [];
+		for (let i = 0; i < refRows.length; i += CHUNK_SIZE) {
+			const slice = refRows.slice(i, i + CHUNK_SIZE);
+			const first = slice[0];
+			const last = slice[slice.length - 1];
+			chunks.push({
+				id: first.messageId,
+				firstSeq: first.seq,
+				lastSeq: last.seq,
+				count: slice.length,
+				hash: computeChunkHash(first.seq, last.seq, slice.length, last.messageId),
+			});
+		}
+
+		return {
+			unchanged: false,
+			messageVersion,
+			total: refRows.length,
+			chunks,
+		};
+	},
+
+	/**
+	 * Fetch a contiguous range of top-level messages (with full child trees) for
+	 * the virtualized list. Replaces the legacy 20/50 + around triple-path.
+	 *
+	 * - direction "older": messages with seq < fromSeq (descending then reversed)
+	 * - direction "newer": messages with seq > fromSeq (ascending)
+	 * - fromSeq omitted: the latest tail
+	 *
+	 * `count` is expressed in chunks; the row limit is count * CHUNK_SIZE. Uses
+	 * LIMIT n+1 for the queried direction and a separate indexed LIMIT 1 existence
+	 * probe for the opposite edge, so hasOlder/hasNewer are exact without a COUNT(*).
+	 */
+	async getChunksByRange(
+		narratorId: string,
+		opts: { fromSeq?: number; direction?: "older" | "newer"; count?: number } = {},
+	) {
+		const direction = opts.direction ?? "older";
+		const chunkCount = Math.min(Math.max(opts.count ?? 7, 1), 20);
+		const rowLimit = chunkCount * CHUNK_SIZE;
+		const isSubagent = await this.isSubagentNarrator(narratorId);
+
+		// Base predicate shared by the window query and the opposite-edge existence
+		// probe below. Excludes the seq cursor so it can be reused for either side.
+		const baseConditions = [
+			eq(narratorMessageRefs.narratorId, narratorId),
+			isNull(narratorMessageRefs.segmentCompactId),
+			...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
+		];
+		const conditions = [...baseConditions];
+		if (opts.fromSeq != null && Number.isFinite(opts.fromSeq)) {
+			conditions.push(
+				direction === "newer"
+					? gt(narratorMessageRefs.seq, opts.fromSeq)
+					: lt(narratorMessageRefs.seq, opts.fromSeq),
+			);
+		}
+
+		const refRows = await db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(
+				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
+			)
+			.limit(rowLimit + 1);
+
+		const hasMoreInDirection = refRows.length > rowLimit;
+		const pageRows = hasMoreInDirection ? refRows.slice(0, rowLimit) : refRows;
+		if (direction === "older") {
+			pageRows.reverse();
+		}
+
+		const messageVersion = await this.getMessageVersion(narratorId);
+
+		if (pageRows.length === 0) {
+			return {
+				messages: [],
+				minSeq: null,
+				maxSeq: null,
+				hasOlder: false,
+				hasNewer: false,
+				messageVersion,
+			};
+		}
+
+		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
+		const minSeq = pageRows[0].seq;
+		const maxSeq = pageRows[pageRows.length - 1].seq;
+
+		// hasOlder/hasNewer relative to the returned window. For the direction we
+		// queried, hasMoreInDirection answers it directly. For the opposite side,
+		// probe for the existence of a single row beyond the window edge — a small,
+		// indexed LIMIT 1 lookup, not a heuristic based on seq sign/anchor presence.
+		const existsBeyond = async (op: "older" | "newer", edgeSeq: number): Promise<boolean> => {
+			const row = await db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						...baseConditions,
+						op === "newer"
+							? gt(narratorMessageRefs.seq, edgeSeq)
+							: lt(narratorMessageRefs.seq, edgeSeq),
+					),
+				)
+				.limit(1);
+			return row.length > 0;
+		};
+
+		const hasOlder =
+			direction === "older" ? hasMoreInDirection : await existsBeyond("older", minSeq);
+		const hasNewer =
+			direction === "newer" ? hasMoreInDirection : await existsBeyond("newer", maxSeq);
+
+		return {
+			messages: tree,
+			minSeq,
+			maxSeq,
+			hasOlder,
+			hasNewer,
+			messageVersion,
+		};
 	},
 
 	async getMessagesAfter(narratorId: string, after: string | CatchUpCursor, limit = 200) {

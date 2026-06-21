@@ -155,6 +155,8 @@ export interface BufferedMessage {
 	textFiles?: File[];
 	bufferedAt: string;
 	commandText?: string | null;
+	/** runBashFirst command to execute before the prompt when this message is consumed. */
+	bashCommand?: string | null;
 	createdBy?: string | null;
 	creator?: BufferCreator | null;
 	/** True when this queued message was inserted with priority/cut-in-line semantics. */
