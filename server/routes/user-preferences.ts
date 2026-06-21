@@ -11,6 +11,7 @@ import {
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	removeRecentTabSchema,
+	restoreRecentTabsSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
@@ -736,6 +737,40 @@ userPreferencesRoutes.post("/recent-tabs/clear", async (c) => {
 	});
 
 	const enriched = await broadcastTabsSnapshot(userId, filtered);
+	return c.json(enriched);
+});
+
+/** Restore the full recent-tabs list (e.g. undo a recent clear) */
+userPreferencesRoutes.post("/recent-tabs/restore", async (c) => {
+	const userId = c.get("user").sub;
+	const body = await c.req.json();
+	const parsed = restoreRecentTabsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const now = new Date().toISOString();
+	const id = generateId();
+
+	const tabs = await userPreferencesLock.acquire(userId, async () => {
+		// Zod already stripped runtime-only fields; normalize ordering/grouping/limits
+		// the same way the other write paths do.
+		const tabs = parsed.data.tabs as Record<string, unknown>[];
+		migrateTabTypes(tabs);
+		regroupWorkspaces(tabs);
+		const trimmed = trimRecentTabs(tabs, MAX_RECENT_TABS);
+
+		const tabsJson = JSON.stringify(trimmed);
+		sqlite.run(
+			`INSERT INTO user_preferences (id, user_id, recent_tabs, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (user_id) DO UPDATE SET
+			   recent_tabs = ?,
+			   updated_at = ?`,
+			[id, userId, tabsJson, now, now, tabsJson, now],
+		);
+		return trimmed;
+	});
+
+	const enriched = await broadcastTabsSnapshot(userId, tabs);
 	return c.json(enriched);
 });
 

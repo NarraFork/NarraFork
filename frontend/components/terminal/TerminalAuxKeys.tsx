@@ -1,6 +1,7 @@
 import { ActionIcon, Menu } from "@mantine/core";
 import { IconDotsVertical, IconSwitchHorizontal } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef } from "react";
+import { Z } from "../../lib/z-index";
 
 export interface Modifiers {
 	ctrl: boolean;
@@ -143,7 +144,7 @@ export function TerminalAuxKeys({ onKey, mods, onToggleMod }: TerminalAuxKeysPro
 				flexShrink: 0,
 				backgroundColor: "#15161e",
 				borderTop: "1px solid #2a2b3d",
-				zIndex: 1000,
+				zIndex: Z.popover,
 			}}
 		>
 			<div style={gridRow}>

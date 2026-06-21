@@ -165,7 +165,18 @@ export const narratorsApi = {
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 		cwd?: string;
+		makeNamed?: boolean;
+		handle?: string;
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
+	// Named narrators (@handle mention targets)
+	listNamedNarrators: () => request<ApiEntity[]>("/narrators/named"),
+	getNarratorByHandle: (handle: string) =>
+		request<ApiEntity>(`/narrators/by-handle/${encodeURIComponent(handle)}`),
+	updateNarratorHandle: (id: string, handle: string | null) =>
+		request<ApiEntity>(`/narrators/${id}/handle`, {
+			method: "PATCH",
+			body: JSON.stringify({ handle }),
+		}),
 	archiveNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/archive`, { method: "PATCH" }),
 	unarchiveNarrator: (id: string) =>
@@ -572,9 +583,14 @@ export const narratorsApi = {
 				body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
 			},
 		),
-	clearContext: (narratorId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/clear-context`, {
+	cancelCompact: (narratorId: string) =>
+		request<{ ok: boolean; reason?: string }>(`/narrators/${narratorId}/compact/cancel`, {
 			method: "POST",
+		}),
+	clearContext: (narratorId: string, beforeMessageId?: string) =>
+		request<{ ok: boolean; messageId?: string }>(`/narrators/${narratorId}/clear-context`, {
+			method: "POST",
+			body: JSON.stringify(beforeMessageId ? { beforeMessageId } : {}),
 		}),
 	createPlan: (narratorId: string, content: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/plan`, {

@@ -48,8 +48,6 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronUp,
-	IconCode,
-	IconCodeOff,
 	IconCopy,
 	IconEraser,
 	IconExternalLink,
@@ -66,7 +64,6 @@ import {
 	IconPencil,
 	IconPhoto,
 	IconSearch,
-	IconSearchOff,
 	IconSettings,
 	IconShield,
 	IconSparkles,
@@ -92,6 +89,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
+import { useNamedNarrators } from "../../hooks/useChatGroup";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
 import { useAllModels } from "../../hooks/useModels";
@@ -168,7 +166,7 @@ import {
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
-import { compactSnippet, normalizeSearchText } from "../../lib/search-utils";
+import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
@@ -188,6 +186,7 @@ import {
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
+import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
 	COMPACTING_MARKER_ATTR,
 	CompactSummaryModal,
@@ -495,48 +494,6 @@ type BufferedSendResult = {
 	id?: string;
 	bufferedAt?: string;
 };
-
-const MESSAGE_SEARCH_TEXT_BUDGET_CHARS = 80_000;
-const MESSAGE_SEARCH_MAX_RESULTS = 500;
-
-function appendMessageSearchPart(parts: string[], value: unknown, budget: { remaining: number }) {
-	if (typeof value !== "string" || value.length === 0 || budget.remaining <= 0) return;
-	const chunk = value.length > budget.remaining ? value.slice(0, budget.remaining) : value;
-	parts.push(chunk);
-	budget.remaining -= chunk.length;
-}
-
-function collectMessageSearchText(message: TreeMessage): string {
-	const budget = { remaining: MESSAGE_SEARCH_TEXT_BUDGET_CHARS };
-	const parts: string[] = [];
-	appendMessageSearchPart(parts, message.contentText, budget);
-	appendMessageSearchPart(parts, message.commandText, budget);
-	appendMessageSearchPart(parts, message.role, budget);
-	for (const block of message.contentJson ?? []) {
-		if (budget.remaining <= 0) break;
-		if (!block || typeof block !== "object") continue;
-		const record = block as Record<string, unknown>;
-		for (const key of ["text", "content", "summary", "name", "input", "query", "command"]) {
-			appendMessageSearchPart(parts, record[key], budget);
-			if (budget.remaining <= 0) break;
-		}
-	}
-	for (const toolCall of message.toolCalls ?? []) {
-		if (budget.remaining <= 0) break;
-		appendMessageSearchPart(parts, toolCall.toolName, budget);
-	}
-	return parts.join("\n");
-}
-
-function flattenMessagesForSearch(messages: TreeMessage[] | undefined): TreeMessage[] {
-	const result: TreeMessage[] = [];
-	const visit = (message: TreeMessage) => {
-		result.push(message);
-		for (const child of message.children ?? []) visit(child);
-	};
-	for (const message of messages ?? []) visit(message);
-	return result;
-}
 
 function getMessageViewportScrollBottom(scroller: HTMLElement) {
 	return Math.max(0, scroller.scrollHeight - scroller.clientHeight);
@@ -2817,6 +2774,56 @@ export function NarratorPanel({
 	const closeCommandPopover = useCallback(() => {
 		clearInputAndDraft();
 	}, [clearInputAndDraft]);
+
+	// === @mention of named narrators ===========================================
+	const { data: namedNarrators } = useNamedNarrators();
+	const [mentionCaret, setMentionCaret] = useState<number | null>(null);
+	const mentionQuery = useMemo(() => {
+		if (mentionCaret === null) return null;
+		// Don't compete with the slash-command popover.
+		if (input.startsWith("/")) return null;
+		return getMentionQuery(input, mentionCaret);
+	}, [input, mentionCaret]);
+	const mentionCandidates = useMemo<MentionCandidate[]>(() => {
+		if (!namedNarrators) return [];
+		return namedNarrators
+			.filter((n: { handle?: string | null }) => !!n.handle)
+			.map((n: { id: string; handle: string; title?: string | null; status?: string }) => ({
+				id: n.id,
+				handle: n.handle,
+				title: n.title,
+				status: n.status,
+			}));
+	}, [namedNarrators]);
+	const mentionPopoverVisible =
+		mentionQuery !== null && !inputHistory.isBrowsing && mentionCandidates.length > 0;
+	const handleMentionSelect = useCallback(
+		(candidate: MentionCandidate) => {
+			const caret = mentionCaret;
+			if (caret === null) return;
+			const upto = input.slice(0, caret);
+			const at = upto.lastIndexOf("@");
+			if (at === -1) return;
+			const before = input.slice(0, at);
+			const after = input.slice(caret);
+			const insert = `@${candidate.handle} `;
+			const next = before + insert + after;
+			setInput(next);
+			// Move caret to just after the inserted handle.
+			const nextCaret = before.length + insert.length;
+			requestAnimationFrame(() => {
+				const ta = textareaRef.current;
+				if (ta) {
+					ta.focus();
+					ta.setSelectionRange(nextCaret, nextCaret);
+				}
+				setMentionCaret(nextCaret);
+			});
+		},
+		[input, mentionCaret],
+	);
+	const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
+
 	useEffect(() => {
 		if (appendInputRef) {
 			appendInputRef.current = (text: string) =>
@@ -3143,8 +3150,6 @@ export function NarratorPanel({
 		todosToolUseId,
 		expandedToolUseId,
 		setExpandedToolUseId,
-		editExpandOverride,
-		setEditExpandOverride,
 		unreadCount,
 		setUnreadCount,
 		viewers,
@@ -3230,6 +3235,38 @@ export function NarratorPanel({
 			compactFallbackSummaryReason,
 			t,
 		],
+	);
+
+	const handleClearContextBefore = useCallback(
+		(messageId: string) => {
+			api.clearContext(narratorId, messageId).catch((err) => {
+				handleCompactError(err);
+			});
+		},
+		[narratorId, handleCompactError],
+	);
+
+	// Manual summarize: insert an empty compact marker before the message, then
+	// open its summary editor so the user can write the summary by hand.
+	const handleManualSummarize = useCallback(
+		(messageId: string) => {
+			api
+				.clearContext(narratorId, messageId)
+				.then((res) => {
+					if (res.messageId) {
+						setCompactSummaryModalTarget({
+							kind: "context",
+							narratorId,
+							messageId: res.messageId,
+							autoEdit: true,
+						});
+					}
+				})
+				.catch((err) => {
+					handleCompactError(err);
+				});
+		},
+		[narratorId, handleCompactError],
 	);
 
 	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
@@ -4024,10 +4061,6 @@ export function NarratorPanel({
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
 	const virtualListRef = useRef<BroadMessageListHandle>(null);
-	const [messageSearchOpen, setMessageSearchOpen] = useState(false);
-	const [messageSearchQuery, setMessageSearchQuery] = useState("");
-	const [activeMessageSearchIndex, setActiveMessageSearchIndex] = useState(0);
-	const messageSearchAutoJumpKeyRef = useRef<string | null>(null);
 
 	const clearHighlightTimers = useCallback(() => {
 		if (highlightStartTimerRef.current != null) {
@@ -4610,7 +4643,7 @@ export function NarratorPanel({
 		// Build a secondary cache key for render-affecting props outside the page
 		// message references themselves.
 		const permsKey = `${renderPermCb.pendingPermsMap.size}:${[...renderPermCb.pendingPermsMap.keys()].join(",")}`;
-		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${planModeSupported}|${retryRecoverySupported}|${compactSupported}|${rollbackEditRegenerateSupported}|${permsKey}`;
+		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${planModeSupported}|${retryRecoverySupported}|${compactSupported}|${rollbackEditRegenerateSupported}|${permsKey}`;
 
 		for (let ri = 0; ri < reversed.length; ri++) {
 			const { page, pageParam } = reversed[ri];
@@ -4653,11 +4686,12 @@ export function NarratorPanel({
 					highlightedId,
 					renderPermCb,
 					expandedToolUseId,
-					editExpandOverride,
 					showTokenUsage,
 					pruneBoundaryMessageId,
 					pruneDividerLabel,
 					compactSupported ? handleCompactBefore : undefined,
+					compactSupported ? handleClearContextBefore : undefined,
+					compactSupported ? handleManualSummarize : undefined,
 					handleDeleteBlock,
 					rollbackEditRegenerateSupported ? handleRollback : undefined,
 					rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
@@ -4790,13 +4824,14 @@ export function NarratorPanel({
 		forkHandler,
 		renderPermCb,
 		expandedToolUseId,
-		editExpandOverride,
 		highlightedId,
 		highlightMessageId,
 		showTokenUsage,
 		getStableRenderElementKey,
 		handleDeleteBlock,
 		handleCompactBefore,
+		handleClearContextBefore,
+		handleManualSummarize,
 		planModeSupported,
 		retryRecoverySupported,
 		compactSupported,
@@ -5152,95 +5187,6 @@ export function NarratorPanel({
 			shouldWindowMessages,
 		],
 	);
-
-	const messageSearchResults = useMemo(() => {
-		const normalizedQuery = normalizeSearchText(messageSearchQuery);
-		if (!normalizedQuery || !deferredMessagesData?.pages?.length) return [];
-		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
-		const results: Array<{
-			id: string;
-			role: string;
-			createdAt: string;
-			snippet: string;
-			index: number;
-		}> = [];
-		for (const message of flattenMessagesForSearch(orderedMessages)) {
-			const index = targetIndexMap.get(message.id) ?? -1;
-			if (index < 0) continue;
-			const text = collectMessageSearchText(message);
-			if (!normalizeSearchText(text).includes(normalizedQuery)) continue;
-			results.push({
-				id: message.id,
-				role: message.role,
-				createdAt: message.createdAt,
-				snippet: compactSnippet(text, messageSearchQuery, 72),
-				index,
-			});
-			if (results.length >= MESSAGE_SEARCH_MAX_RESULTS) break;
-		}
-		return results.sort((a, b) => a.index - b.index);
-	}, [deferredMessagesData, messageSearchQuery, targetIndexMap]);
-	const messageSearchTotalLabel =
-		messageSearchResults.length >= MESSAGE_SEARCH_MAX_RESULTS
-			? `${MESSAGE_SEARCH_MAX_RESULTS}+`
-			: messageSearchResults.length;
-
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reset active search item when the query/session changes
-	useEffect(() => {
-		setActiveMessageSearchIndex(0);
-	}, [messageSearchQuery, narratorId]);
-
-	useEffect(() => {
-		if (activeMessageSearchIndex >= messageSearchResults.length) {
-			setActiveMessageSearchIndex(Math.max(0, messageSearchResults.length - 1));
-		}
-	}, [activeMessageSearchIndex, messageSearchResults.length]);
-
-	const jumpToMessageSearchResult = useCallback(
-		(index: number) => {
-			const result = messageSearchResults[index];
-			if (!result) return;
-			scrollToFullIndex(result.index, {
-				align: "center",
-				domIds: [`msg-${result.id}`],
-				highlightId: result.id,
-				highlightDelayMs: 120,
-			});
-			setActiveMessageSearchIndex(index);
-		},
-		[messageSearchResults, scrollToFullIndex],
-	);
-
-	const jumpMessageSearch = useCallback(
-		(direction: 1 | -1) => {
-			if (!messageSearchResults.length) return;
-			const next =
-				(activeMessageSearchIndex + direction + messageSearchResults.length) %
-				messageSearchResults.length;
-			jumpToMessageSearchResult(next);
-		},
-		[activeMessageSearchIndex, jumpToMessageSearchResult, messageSearchResults.length],
-	);
-
-	const messageSearchResultKey = useMemo(
-		() => messageSearchResults.map((result) => result.id).join("|"),
-		[messageSearchResults],
-	);
-
-	useEffect(() => {
-		if (!messageSearchOpen || messageSearchResults.length === 0 || !messageSearchResultKey) return;
-		const autoJumpKey = `${narratorId}|${messageSearchQuery}|${messageSearchResultKey}`;
-		if (messageSearchAutoJumpKeyRef.current === autoJumpKey) return;
-		messageSearchAutoJumpKeyRef.current = autoJumpKey;
-		jumpToMessageSearchResult(0);
-	}, [
-		jumpToMessageSearchResult,
-		messageSearchOpen,
-		messageSearchQuery,
-		messageSearchResultKey,
-		messageSearchResults.length,
-		narratorId,
-	]);
 
 	// --- User message markers for scrollbar minimap ---
 	const userMessageMarkers = useMemo(() => {
@@ -6559,6 +6505,9 @@ export function NarratorPanel({
 		// but still allow Enter to reach our send handler (CommandPopover
 		// calls stopPropagation when it consumes Enter for selection).
 		if (commandPopoverVisible && e.key !== "Enter") return;
+		// Same for the @mention popover: it consumes arrow/tab/escape/enter via a
+		// capture-phase listener; guard here so navigation keys don't double-handle.
+		if (mentionPopoverVisible && e.key !== "Enter") return;
 
 		const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
 
@@ -7095,45 +7044,6 @@ export function NarratorPanel({
 						</Group>
 						{!isWorkspacePreview && (
 							<Group gap="xs">
-								<Tooltip
-									label={messageSearchOpen ? t("closeMessageSearch") : t("openMessageSearch")}
-								>
-									<ActionIcon
-										size="sm"
-										variant={messageSearchOpen ? "light" : "subtle"}
-										color={messageSearchOpen ? "indigo" : "gray"}
-										onClick={() =>
-											setMessageSearchOpen((open) => {
-												const next = !open;
-												if (!next) {
-													setMessageSearchQuery("");
-													messageSearchAutoJumpKeyRef.current = null;
-												}
-												return next;
-											})
-										}
-									>
-										{messageSearchOpen ? <IconSearchOff size={16} /> : <IconSearch size={16} />}
-									</ActionIcon>
-								</Tooltip>
-								<Tooltip
-									label={editExpandOverride === false ? t("expandEdits") : t("collapseEdits")}
-								>
-									<ActionIcon
-										size="sm"
-										variant="subtle"
-										color="gray"
-										onClick={() =>
-											setEditExpandOverride((prev) => (prev === true ? false : prev === false))
-										}
-									>
-										{editExpandOverride === false ? (
-											<IconCode size={16} />
-										) : (
-											<IconCodeOff size={16} />
-										)}
-									</ActionIcon>
-								</Tooltip>
 								<BackgroundTasksDrawer narratorId={narratorId} />
 								<Tooltip
 									label={usePixiRenderer ? t("switchToReactRenderer") : t("switchToPixiRenderer")}
@@ -7193,78 +7103,6 @@ export function NarratorPanel({
 							</Group>
 						)}
 					</Group>
-
-					{messageSearchOpen && !isWorkspacePreview && (
-						<Group
-							gap="xs"
-							px="md"
-							py={6}
-							wrap="nowrap"
-							style={{
-								borderBottom: "1px solid var(--mantine-color-default-border)",
-								flexShrink: 0,
-							}}
-						>
-							<TextInput
-								autoFocus
-								size="xs"
-								leftSection={<IconSearch size={14} />}
-								placeholder={t("messageSearchPlaceholder")}
-								value={messageSearchQuery}
-								onChange={(e) => setMessageSearchQuery(e.currentTarget.value)}
-								onKeyDown={(e) => {
-									if (e.key === "Enter") jumpMessageSearch(e.shiftKey ? -1 : 1);
-									if (e.key === "Escape") {
-										setMessageSearchOpen(false);
-										setMessageSearchQuery("");
-									}
-								}}
-								style={{ flex: 1 }}
-							/>
-							<Text size="xs" c="dimmed" style={{ whiteSpace: "nowrap" }}>
-								{messageSearchQuery.trim()
-									? t("messageSearchCount", {
-											current: messageSearchResults.length ? activeMessageSearchIndex + 1 : 0,
-											total: messageSearchTotalLabel,
-										})
-									: t("messageSearchLoaded", { count: totalMessageCount })}
-							</Text>
-							<ActionIcon
-								size="sm"
-								variant="subtle"
-								disabled={!messageSearchResults.length}
-								onClick={() => jumpMessageSearch(-1)}
-							>
-								<IconChevronUp size={16} />
-							</ActionIcon>
-							<ActionIcon
-								size="sm"
-								variant="subtle"
-								disabled={!messageSearchResults.length}
-								onClick={() => jumpMessageSearch(1)}
-							>
-								<IconChevronDown size={16} />
-							</ActionIcon>
-							<CloseButton
-								size="sm"
-								onClick={() => {
-									setMessageSearchOpen(false);
-									setMessageSearchQuery("");
-								}}
-							/>
-							{messageSearchQuery.trim() &&
-								messageSearchResults[activeMessageSearchIndex]?.snippet && (
-									<Text size="xs" c="dimmed" truncate style={{ flexBasis: "100%" }}>
-										{messageSearchResults[activeMessageSearchIndex].snippet}
-									</Text>
-								)}
-							{messageSearchQuery.trim() && hasNextPage && (
-								<Text size="xs" c="dimmed" style={{ flexBasis: "100%" }}>
-									{t("messageSearchMoreHint")}
-								</Text>
-							)}
-						</Group>
-					)}
 
 					<Modal
 						opened={archiveConfirmOpened}
@@ -7518,7 +7356,10 @@ export function NarratorPanel({
 					)}
 
 					{/* Messages */}
-					<Box pos="relative" style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+					<Box
+						pos="relative"
+						style={{ flex: 1, minHeight: 0, overflow: "hidden", isolation: "isolate" }}
+					>
 						{isFetchingNextPage && (
 							<Box pos="absolute" top={0} left={0} right={0} style={{ zIndex: 1 }}>
 								<RenderProgress indeterminate />
@@ -7676,6 +7517,10 @@ export function NarratorPanel({
 														onCompactBeforeMessage={
 															compactSupported ? handleCompactBefore : undefined
 														}
+														onClearContextBefore={
+															compactSupported ? handleClearContextBefore : undefined
+														}
+														onManualSummarize={compactSupported ? handleManualSummarize : undefined}
 														onDeleteBlock={handleDeleteBlock}
 														onRollbackToBlock={
 															rollbackEditRegenerateSupported ? handleRollback : undefined
@@ -7725,7 +7570,7 @@ export function NarratorPanel({
 									right: 16,
 									top: selectionToolbarTop ?? "50%",
 									transform: "translateY(-50%)",
-									zIndex: 1000,
+									zIndex: Z.popover,
 									pointerEvents: "auto",
 									transition: "top 80ms ease-out",
 								}}
@@ -8978,6 +8823,13 @@ export function NarratorPanel({
 										onSelect={handleCommandSelect}
 										onClose={closeCommandPopover}
 									/>
+									<MentionPopover
+										candidates={mentionCandidates}
+										query={mentionQuery}
+										visible={mentionPopoverVisible}
+										onSelect={handleMentionSelect}
+										onClose={closeMentionPopover}
+									/>
 									{matchedCommand && (
 										<CommandParamHelper
 											command={matchedCommand}
@@ -8991,9 +8843,13 @@ export function NarratorPanel({
 										value={input}
 										onChange={(e) => {
 											setInput(e.currentTarget.value);
+											setMentionCaret(e.currentTarget.selectionStart);
 											inputHistory.reset();
 										}}
 										onKeyDown={handleKeyDown}
+										onKeyUp={(e) => setMentionCaret(e.currentTarget.selectionStart)}
+										onClick={(e) => setMentionCaret(e.currentTarget.selectionStart)}
+										onBlur={() => setMentionCaret(null)}
 										onPaste={handlePaste}
 										autosize
 										minRows={1}

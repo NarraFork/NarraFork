@@ -29,6 +29,7 @@ const SOURCE_META: Record<string, { color: string; key: string }> = {
 	bg_bash: { color: "blue", key: "bg_bash" },
 	team_message: { color: "grape", key: "team_message" },
 	buffered_user: { color: "gray", key: "buffered_user" },
+	group_message: { color: "grape", key: "group_message" },
 };
 
 const SIDECAR_DETAIL_MAX_CHARS = 120_000;

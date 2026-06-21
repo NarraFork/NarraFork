@@ -15,7 +15,7 @@
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 
 const ROOT = join(import.meta.dir, "..");
 const PKG_PATH = join(ROOT, "package.json");
@@ -118,14 +118,32 @@ if (!uploadOnly) {
 
 if (!uploadOnly && !dryRun) {
 	try {
-		// Check if there are changes to commit
-		const status = execSync("git status --porcelain package.json", {
+		// Files to include in the release commit: always package.json, plus the
+		// changelog for this version when present so it never gets left behind
+		// as an untracked file (the changelog must ship with the release).
+		const commitPaths = ["package.json"];
+		if (existsSync(changelogPath)) {
+			const relChangelog = relative(ROOT, changelogPath);
+			// Only stage the changelog when it lives inside the repo; a custom
+			// --changelog path outside ROOT can't be committed here.
+			if (relChangelog && !relChangelog.startsWith("..") && !isAbsolute(relChangelog)) {
+				commitPaths.push(relChangelog);
+			} else {
+				console.warn(
+					`⚠ Changelog ${changelogPath} is outside the repo; not adding it to the release commit`,
+				);
+			}
+		}
+		const quotedPaths = commitPaths.map((p) => `"${p}"`).join(" ");
+
+		// Check if any of those files have pending changes to commit
+		const status = execSync(`git status --porcelain ${quotedPaths}`, {
 			cwd: ROOT,
 			encoding: "utf-8",
 		}).trim();
 
 		if (status) {
-			execSync(`git add package.json && git commit -m "release: v${version}"`, {
+			execSync(`git add ${quotedPaths} && git commit -m "release: v${version}"`, {
 				cwd: ROOT,
 				stdio: "inherit",
 			});

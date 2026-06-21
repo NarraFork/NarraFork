@@ -1,6 +1,7 @@
 import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
+import { Z } from "../../lib/z-index";
 
 const MAX_NODE_CONTEXT_TITLE_CHARS = 500;
 
@@ -84,7 +85,7 @@ export function NodeContextMenu({
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay to capture clicks */}
 			<div
-				style={{ position: "fixed", inset: 0, zIndex: 999 }}
+				style={{ position: "fixed", inset: 0, zIndex: Z.contextMenuBackdrop }}
 				onClick={onClose}
 				onContextMenu={(e) => {
 					e.preventDefault();
@@ -101,7 +102,7 @@ export function NodeContextMenu({
 					position: "fixed",
 					left: x,
 					top: y,
-					zIndex: 1000,
+					zIndex: Z.contextMenu,
 					minWidth: 180,
 				}}
 			>

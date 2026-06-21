@@ -1,5 +1,8 @@
+import { Button } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { type ComponentType, createElement, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { queryClient as globalQC } from "../lib/query-client";
 
@@ -13,7 +16,7 @@ export interface RecentTabViewer {
 }
 
 export interface RecentTab {
-	type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
+	type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
 	id: string;
 	/** Primary narrator ID — used for WS subscriptions */
 	narratorId?: string;
@@ -43,6 +46,42 @@ export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
 const RECENT_TABS_QUERY_GC_TIME_MS = 60_000;
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
+
+/** Notification id for the "tabs cleared" undo toast — reused so a newer clear replaces the older toast. */
+const CLEAR_UNDO_NOTIFICATION_ID = "recent-tabs-clear-undo";
+/** How long the undo toast stays visible (ms). */
+const CLEAR_UNDO_AUTO_CLOSE_MS = 6_000;
+
+/** Persisted fields of a recent tab — runtime-enriched fields are stripped before sending to the server. */
+type PersistedRecentTab = Pick<
+	RecentTab,
+	| "type"
+	| "id"
+	| "narratorId"
+	| "parentNarratorId"
+	| "workspaceId"
+	| "title"
+	| "subtitle"
+	| "status"
+	| "lastVisitedAt"
+	| "pinned"
+>;
+
+function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
+	const persisted: PersistedRecentTab = {
+		type: tab.type,
+		id: tab.id,
+		title: tab.title,
+		lastVisitedAt: tab.lastVisitedAt,
+	};
+	if (tab.narratorId !== undefined) persisted.narratorId = tab.narratorId;
+	if (tab.parentNarratorId !== undefined) persisted.parentNarratorId = tab.parentNarratorId;
+	if (tab.workspaceId !== undefined) persisted.workspaceId = tab.workspaceId;
+	if (tab.subtitle !== undefined) persisted.subtitle = tab.subtitle;
+	if (tab.status !== undefined) persisted.status = tab.status;
+	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
+	return persisted;
+}
 
 export function clampRecentTabText(value: string | null | undefined): string | undefined {
 	if (value == null) return undefined;
@@ -199,6 +238,7 @@ export function applyRecentTabMove(
 
 export function useRecentTabs() {
 	const qc = useQueryClient();
+	const { t } = useTranslation("nav");
 
 	const { data: tabs = [] } = useQuery({
 		queryKey: RECENT_TABS_QUERY_KEY,
@@ -284,6 +324,27 @@ export function useRecentTabs() {
 		},
 	});
 
+	// --- Restore the full tab list (optimistic) — used to undo a clear ---
+	const restoreMutation = useMutation({
+		mutationFn: (snapshot: RecentTab[]) =>
+			api.restoreRecentTabs(snapshot.map(toPersistedRecentTab)),
+		onMutate: async (snapshot) => {
+			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
+			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
+			qc.setQueryData(RECENT_TABS_QUERY_KEY, snapshot);
+			return { prev };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		},
+		// No onSuccess — WS snapshot will deliver the authoritative list
+	});
+
+	const restore = useCallback(
+		(snapshot: RecentTab[]) => restoreMutation.mutate(snapshot),
+		[restoreMutation],
+	);
+
 	// --- Clear tabs by scope (optimistic) ---
 	const clearMutation = useMutation({
 		mutationFn: ({
@@ -297,19 +358,21 @@ export function useRecentTabs() {
 			await qc.cancelQueries({ queryKey: RECENT_TABS_QUERY_KEY });
 			const prev = qc.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? [];
 			const isKept = (t: RecentTab) => (keepTabKey ? `${t.type}:${t.id}` === keepTabKey : false);
+			let nextLength = prev.length;
 			if (scope === "all") {
 				for (const tab of prev) {
 					if (!isKept(tab)) evictTabCache(qc, tab);
 				}
-				qc.setQueryData(RECENT_TABS_QUERY_KEY, keepTabKey ? prev.filter(isKept) : []);
+				const next = keepTabKey ? prev.filter(isKept) : [];
+				nextLength = next.length;
+				qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			} else if (scope === "projects") {
 				for (const tab of prev) {
 					if (tab.type === "project" && !isKept(tab)) evictTabCache(qc, tab);
 				}
-				qc.setQueryData(
-					RECENT_TABS_QUERY_KEY,
-					prev.filter((t) => t.type !== "project" || isKept(t)),
-				);
+				const next = prev.filter((t) => t.type !== "project" || isKept(t));
+				nextLength = next.length;
+				qc.setQueryData(RECENT_TABS_QUERY_KEY, next);
 			} else {
 				// inactive_narrators — keep projects + active tabs + kept tab
 				// Workspace-aware: keep entire workspace if any child is active
@@ -359,12 +422,57 @@ export function useRecentTabs() {
 						evictTabCache(qc, tab);
 					}
 				}
+				nextLength = kept.length;
 				qc.setQueryData(RECENT_TABS_QUERY_KEY, kept);
 			}
-			return { prev };
+			// Number of tabs actually removed — used to decide whether to offer undo.
+			const removedCount = prev.length - nextLength;
+			return { prev, removedCount };
 		},
 		onError: (_err, _vars, ctx) => {
 			if (ctx?.prev) qc.setQueryData(RECENT_TABS_QUERY_KEY, ctx.prev);
+		},
+		onSuccess: (_data, _vars, ctx) => {
+			// Only offer undo when a clear actually removed tabs.
+			if (!ctx || ctx.removedCount <= 0 || ctx.prev.length === 0) return;
+			const snapshot = ctx.prev;
+			notifications.show({
+				id: CLEAR_UNDO_NOTIFICATION_ID,
+				color: "gray",
+				autoClose: CLEAR_UNDO_AUTO_CLOSE_MS,
+				withCloseButton: true,
+				withBorder: true,
+				// Inline message with an "Undo" button on the right.
+				message: createElement(
+					"div",
+					{
+						style: {
+							display: "flex",
+							alignItems: "center",
+							justifyContent: "space-between",
+							gap: 12,
+						},
+					},
+					createElement("span", null, t("tabsCleared", { count: ctx.removedCount })),
+					createElement(
+						Button as ComponentType<{
+							size?: string;
+							variant?: string;
+							onClick?: () => void;
+							children?: React.ReactNode;
+						}>,
+						{
+							size: "compact-xs",
+							variant: "light",
+							onClick: () => {
+								notifications.hide(CLEAR_UNDO_NOTIFICATION_ID);
+								restore(snapshot);
+							},
+						},
+						t("undo"),
+					),
+				),
+			});
 		},
 	});
 
@@ -387,6 +495,7 @@ export function useRecentTabs() {
 				clearMutation.mutate({ scope, keepTabKey }),
 			[clearMutation],
 		),
+		restoreTabs: restore,
 	};
 }
 

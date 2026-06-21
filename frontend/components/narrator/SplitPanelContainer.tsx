@@ -850,6 +850,7 @@ export function DirectorPanelLayout({
 			h="100%"
 			style={{
 				position: "relative",
+				isolation: "isolate",
 				overflow: "hidden",
 				minWidth: 0,
 				minHeight: 0,

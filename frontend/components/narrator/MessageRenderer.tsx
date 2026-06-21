@@ -22,10 +22,11 @@ import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
 export interface RenderToolRunOptions {
 	expandedToolUseId?: string | null;
 	highlightedId?: string | null;
-	editExpandOverride?: boolean | null;
 	onForkFromMessage?: (uuid: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
+	onClearContextBefore?: (messageId: string) => void;
+	onManualSummarize?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onViewSubagentSession?: (narratorId: string) => void;
@@ -103,10 +104,11 @@ export function renderToolRun(
 	const {
 		expandedToolUseId,
 		highlightedId,
-		editExpandOverride,
 		onForkFromMessage,
 		onAskInPassing,
 		onCompactBeforeMessage,
+		onClearContextBefore,
+		onManualSummarize,
 		onDeleteBlock,
 		onRollbackToBlock,
 		onViewSubagentSession,
@@ -145,6 +147,12 @@ export function renderToolRun(
 		if (msgId && onCompactBeforeMessage) {
 			ctxActions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
+		if (msgId && onClearContextBefore) {
+			ctxActions.onClearContextBefore = () => onClearContextBefore(msgId);
+		}
+		if (msgId && onManualSummarize) {
+			ctxActions.onManualSummarize = () => onManualSummarize(msgId);
+		}
 		if (msgId && onDeleteBlock) {
 			ctxActions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
@@ -174,7 +182,6 @@ export function renderToolRun(
 								isLast={idx === total - 1}
 								isSoleInRun={soleSubagent}
 								permCb={permCb}
-								editExpandOverride={editExpandOverride}
 								onViewSubagentSession={onViewSubagentSession}
 								blockIndex={item.blockIndex}
 							/>
@@ -202,7 +209,6 @@ export function renderToolRun(
 							onQuestionReflect={permCb.onQuestionReflect}
 							onQuestionDeny={permCb.onQuestionDeny}
 							forceExpand={expandedToolUseId === item.tc.toolUseId}
-							editExpandOverride={editExpandOverride}
 							blockIndex={item.blockIndex}
 						/>
 					</div>,
@@ -245,11 +251,12 @@ export function renderTreeMessages(
 	highlightedId: string | null,
 	permCb: PermissionCallbacks,
 	expandedToolUseId?: string | null,
-	editExpandOverride?: boolean | null,
 	showTokenUsage?: boolean,
 	pruneBoundaryMessageId?: string | null,
 	pruneDividerLabel?: string,
 	onCompactBeforeMessage?: (messageId: string) => void,
+	onClearContextBefore?: (messageId: string) => void,
+	onManualSummarize?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void,
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
@@ -334,6 +341,8 @@ export function renderTreeMessages(
 					onQuestionReflect={permCb.onQuestionReflect}
 					onQuestionDeny={permCb.onQuestionDeny}
 					onCompactBeforeMessage={onCompactBeforeMessage}
+					onClearContextBefore={onClearContextBefore}
+					onManualSummarize={onManualSummarize}
 					onDeleteBlock={onDeleteBlock}
 					onRollbackToBlock={onRollbackToBlock}
 					onEditAndRegenerate={onEditAndRegenerate}
@@ -422,10 +431,11 @@ export function renderTreeMessages(
 		const el = renderToolRun(seg.items, runKey, narratorId, permCb, {
 			expandedToolUseId,
 			highlightedId,
-			editExpandOverride,
 			onForkFromMessage,
 			onAskInPassing,
 			onCompactBeforeMessage,
+			onClearContextBefore,
+			onManualSummarize,
 			onDeleteBlock,
 			onRollbackToBlock,
 			onViewSubagentSession,

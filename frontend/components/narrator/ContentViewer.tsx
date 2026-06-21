@@ -3,7 +3,6 @@ import { useDisclosure } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconArrowsMaximize,
-	IconArrowsMinimize,
 	IconCode,
 	IconCopy,
 	IconDeviceMobileRotated,
@@ -36,7 +35,9 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
+import { Z } from "../../lib/z-index";
 import { AutoFollowScroll } from "./AutoFollowScroll";
+import { CompactMenuSub } from "./CompactMenuSub";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
@@ -629,7 +630,7 @@ export const ContentViewer = memo(
 									left: pos.left,
 									top: pos.top,
 									transform: "translateY(-50%)",
-									zIndex: 1000,
+									zIndex: Z.popover,
 									transition: swipe.swipeMenuTransition,
 									pointerEvents: swipe.swipeClosing ? "none" : "auto",
 									opacity: swipe.swipeClosing ? 0 : 1,
@@ -735,15 +736,12 @@ export const ContentViewer = memo(
 											</Menu.Item>
 										)}
 										{msgCtx.onCompactBeforeMessage && (
-											<Menu.Item
-												leftSection={<IconArrowsMinimize size={14} />}
-												onClick={() => {
-													msgCtx.onCompactBeforeMessage?.();
-													swipe.closeSwipe();
-												}}
-											>
-												{tNarrator("contextMenu_compactBefore")}
-											</Menu.Item>
+											<CompactMenuSub
+												onCompact={msgCtx.onCompactBeforeMessage}
+												onClearContext={msgCtx.onClearContextBefore}
+												onManualSummarize={msgCtx.onManualSummarize}
+												onClose={() => swipe.closeSwipe()}
+											/>
 										)}
 										{msgCtx.onDeleteBlock && blockIndex != null && (
 											<Menu.Item
@@ -951,12 +949,12 @@ export const ContentViewer = memo(
 								</Menu.Item>
 							)}
 							{msgCtx.onCompactBeforeMessage && (
-								<Menu.Item
-									leftSection={<IconArrowsMinimize size={14} />}
-									onClick={msgCtx.onCompactBeforeMessage}
-								>
-									{tNarrator("contextMenu_compactBefore")}
-								</Menu.Item>
+								<CompactMenuSub
+									onCompact={msgCtx.onCompactBeforeMessage}
+									onClearContext={msgCtx.onClearContextBefore}
+									onManualSummarize={msgCtx.onManualSummarize}
+									onClose={() => swipe.setCtxMenuOpened(false)}
+								/>
 							)}
 							{msgCtx.onDeleteBlock && blockIndex != null && (
 								<Menu.Item

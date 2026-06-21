@@ -13,6 +13,12 @@
 	"compacted": "上下文已压缩",
 	"compactSummaryTitle": "压缩摘要",
 	"triggerCompact": "立即压缩",
+	"cancelCompactTitle": "取消压缩",
+	"cancelCompactConfirmDesc": "确定要取消正在进行的上下文压缩吗？本次压缩将被中断，上下文会保持压缩前的状态。",
+	"cancelCompactConfirm": "取消压缩",
+	"cancelCompactKeep": "继续压缩",
+	"cancelCompactFailed": "取消压缩失败",
+	"cancelCompactFailedDesc": "无法取消本次压缩，可能已经完成或发生错误。",
 	"clearContext": "清空上下文",
 	"thresholdSettings": "阈值设置",
 	"activeThresholds": "开始裁剪 {{prune}}% · 最大裁剪 {{force}}% · 开始压缩 {{compact}}%",
@@ -29,6 +35,10 @@
 	"plan": "计划",
 	"back": "返回",
 	"sendPlaceholder": "发送消息...",
+	"mentionPopoverTitle": "提及一个命名叙述者",
+	"groupMessageBadge": "群聊",
+	"proxyApprovedBadge": "由叙述者代审",
+	"proxyApprovedTooltip": "此权限由群聊中具有控制权的命名叙述者代为决策",
 	"sendFailed": "发送消息失败",
 	"chapterMergedHint": "本章节已合并，需重新唤醒后才能继续编辑。",
 	"interrupt": "中断",
@@ -257,7 +267,9 @@
 	"branchRenamed": "分支已重命名",
 	"contextMenu_branch": "从此处创建对话分支",
 	"contextMenu_fork": "从此处分叉",
-	"contextMenu_compactBefore": "压缩到此消息前",
+	"contextMenu_compactBefore": "压缩到此",
+	"contextMenu_clearContextBefore": "清空到此",
+	"contextMenu_manualSummarize": "手动总结",
 	"contextMenu_fullscreen": "全屏展示",
 	"contextMenu_toggleWrap": "切换自动换行",
 	"contextMenu_copyBlock": "复制此块",
@@ -354,8 +366,6 @@
 	"dismiss": "忽略",
 	"segmentCompactConfirm": "压缩选中的 {{count}} 条消息？原始消息将被隐藏并替换为摘要。",
 	"viewSubagentSession": "查看会话",
-	"expandEdits": "展开编辑",
-	"collapseEdits": "折叠编辑",
 	"acceptAndResetContext": "接受并重置上下文",
 	"planEdit": "编辑计划",
 	"planEditDone": "完成编辑",
@@ -586,6 +596,9 @@
 	"details.activity": "运行状态",
 	"details.rules": "访问规则",
 	"details.contextSummary": "上下文摘要",
+	"details.groups": "群聊",
+	"details.groupsEmpty": "尚未加入任何群聊。",
+	"details.groupUntitled": "群聊",
 	"details.skills": "技能",
 	"details.skillsDescription": "当前会话可从全局、项目和工作目录根加载 {{count}} 个技能。",
 	"details.refreshSkills": "刷新技能",
@@ -720,7 +733,8 @@
 			"bg_agent": "后台代理通知",
 			"bg_bash": "后台命令通知",
 			"team_message": "团队消息",
-			"buffered_user": "缓冲用户消息"
+			"buffered_user": "缓冲用户消息",
+			"group_message": "群聊消息"
 		}
 	},
 	"toolCallInspector": {
@@ -748,11 +762,5 @@
 			"permissionWait": "权限等待 {{duration}}",
 			"execution": "执行 {{duration}}"
 		}
-	},
-	"openMessageSearch": "搜索已加载消息",
-	"closeMessageSearch": "关闭消息搜索",
-	"messageSearchPlaceholder": "搜索已加载消息...",
-	"messageSearchCount": "{{current}} / {{total}}",
-	"messageSearchLoaded": "已加载 {{count}} 条",
-	"messageSearchMoreHint": "当前只搜索已加载消息。加载更早消息后可搜索更多历史。"
+	}
 }

@@ -328,6 +328,13 @@ export interface CompactLock {
 	promise: Promise<CompactLockResult>;
 	/** Whether this compact blocks the active turn or runs alongside it. */
 	mode?: CompactMode;
+	/**
+	 * Controller to cancel the in-progress summary generation. Present on the
+	 * real history-compact lock (not the wrapper history_probe lock). Aborting
+	 * it cancels the upstream summary model request so the user can cancel a
+	 * long-running compact.
+	 */
+	abortController?: AbortController;
 }
 
 /** Per-narrator lock to prevent concurrent compact operations. */

@@ -1,5 +1,6 @@
 import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
+import { chatGroupsApi } from "./chat-groups";
 import { BASE } from "./client";
 import { gitApi } from "./git";
 import { miscApi } from "./misc";
@@ -21,8 +22,10 @@ export const api = {
 	...settingsApi,
 	...gitApi,
 	...miscApi,
+	...chatGroupsApi,
 };
 
+export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";
 export {
 	ApiError,
 	clearToken,

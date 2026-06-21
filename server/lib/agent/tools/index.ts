@@ -17,6 +17,7 @@ import { globTool } from "./glob";
 import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflection";
 import { grepTool } from "./grep";
+import { groupControlTool } from "./group-control";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { endPipelineTool, startPipelineTool } from "./pipeline";
@@ -48,6 +49,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["Browser", browserTool],
 	["ForkNarrator", forkNarratorTool],
 	["NarraForkAdmin", narraforkAdminTool],
+	["GroupControl", groupControlTool],
 ]);
 
 /**

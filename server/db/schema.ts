@@ -298,9 +298,15 @@ export const narrators = sqliteTable(
 		variant: text("variant").notNull().default("primary"),
 		/**
 		 * Stackable permanent attribute tags (JSON string[]).
-		 * Possible values: "standalone", "ask-in-passing", "background"
+		 * Possible values: "standalone", "ask-in-passing", "background", "named"
 		 */
 		traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/**
+		 * Globally-unique, human-friendly handle for "named narrators".
+		 * Only set when traits includes "named". Used for @handle mentions across
+		 * any session. Stored lowercase; format [a-z0-9_-]. Null for regular narrators.
+		 */
+		handle: text("handle"),
 		// Background task fields
 		isBackground: integer("is_background", { mode: "boolean" }).notNull().default(false),
 		backgroundStatus: text("background_status", {
@@ -320,6 +326,7 @@ export const narrators = sqliteTable(
 	(table) => [
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		uniqueIndex("idx_narrators_handle").on(table.handle),
 	],
 );
 
@@ -1235,4 +1242,86 @@ export const fileAttributions = sqliteTable(
 		index("idx_file_attr_narrator").on(table.narratorId),
 		index("idx_file_attr_workspace").on(table.workspacePath, table.changedAt),
 	],
+);
+
+// === chat_groups ===
+// A multi-party conversation created when a narrator/user @mentions one or more
+// named narrators. Members = the originating session's narrator + the user(s) +
+// the mentioned named narrator(s). Messages are the source of truth and are
+// delivered into each narrator member's own session (wake if idle, sidecar if working).
+export const chatGroups = sqliteTable(
+	"chat_groups",
+	{
+		id: text("id").primaryKey(),
+		title: text("title"),
+		/** The narrator whose session originated this group (the "origin" member). */
+		originNarratorId: text("origin_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		/** Optional project scope (inherited from the origin narrator's chapter, if any). */
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_chat_groups_origin").on(table.originNarratorId),
+		index("idx_chat_groups_project").on(table.projectId),
+		index("idx_chat_groups_status").on(table.status, table.updatedAt),
+	],
+);
+
+// === chat_group_members ===
+export const chatGroupMembers = sqliteTable(
+	"chat_group_members",
+	{
+		id: text("id").primaryKey(),
+		groupId: text("group_id")
+			.notNull()
+			.references(() => chatGroups.id, { onDelete: "cascade" }),
+		memberType: text("member_type", { enum: ["user", "narrator"] }).notNull(),
+		userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		/** Role within the group: origin (the source session), named (a mentioned narrator), or participant. */
+		role: text("role", { enum: ["origin", "named", "participant"] })
+			.notNull()
+			.default("participant"),
+		/**
+		 * Whether this member can control other members' narrators (send messages,
+		 * proxy-approve permission requests, interrupt). Granted to named narrators.
+		 */
+		canControl: integer("can_control", { mode: "boolean" }).notNull().default(false),
+		joinedAt: text("joined_at").notNull(),
+	},
+	(table) => [
+		index("idx_chat_group_members_group").on(table.groupId),
+		index("idx_chat_group_members_narrator").on(table.narratorId),
+		uniqueIndex("idx_chat_group_members_group_narrator").on(table.groupId, table.narratorId),
+		uniqueIndex("idx_chat_group_members_group_user").on(table.groupId, table.userId),
+	],
+);
+
+// === chat_group_messages ===
+// Source of truth for group conversation. Each row is delivered to narrator members.
+export const chatGroupMessages = sqliteTable(
+	"chat_group_messages",
+	{
+		id: text("id").primaryKey(),
+		groupId: text("group_id")
+			.notNull()
+			.references(() => chatGroups.id, { onDelete: "cascade" }),
+		senderType: text("sender_type", { enum: ["user", "narrator", "system"] }).notNull(),
+		senderUserId: text("sender_user_id").references(() => users.id, { onDelete: "set null" }),
+		senderNarratorId: text("sender_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		content: text("content").notNull(),
+		/** When true, delivery to working members triggers a soft interrupt instead of a passive sidecar. */
+		urgent: integer("urgent", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_chat_group_messages_group").on(table.groupId, table.createdAt)],
 );

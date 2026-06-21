@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -24,6 +24,7 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
+import { narratorHandleLock } from "../lib/async-mutex";
 import {
 	type BooleanOverride,
 	type DangerReflectionOverride,
@@ -143,6 +144,10 @@ interface CreateNarratorInput {
 	dangerReflectionOverride?: DangerReflectionOverride;
 	startInPlanMode?: boolean;
 	title?: string;
+	/** When true, create a "named narrator": standalone, long-lived, @handle-mentionable. Requires `handle`. */
+	makeNamed?: boolean;
+	/** Globally-unique mention handle. Only used when makeNamed is true. */
+	handle?: string;
 }
 
 interface CreateSubagentInput {
@@ -651,36 +656,68 @@ export const narratorService = {
 		const traits: string[] = chapterId === null ? ["standalone"] : [];
 		if (startInPlanMode) traits.push("plan");
 
-		const [narrator] = await db
-			.insert(narrators)
-			.values({
-				id,
-				chapterId,
-				type,
-				variant: "primary",
-				traits,
-				model: storedModel,
-				systemPrompt: input.systemPrompt,
-				permissionMode: resolvedPermMode,
-				previousPermissionMode,
-				planFileId,
-				planMode: startInPlanMode,
-				reasoningEffort: resolvedReasoningEffort,
-				fastMode: input.fastMode ?? false,
-				relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
-				pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
-				planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
-				dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
-				cwd: input.cwd ?? null,
-				inheritMode: "fresh",
-				status: "idle",
-				title: input.title ?? null,
-				createdAt: now,
-				updatedAt: now,
-			})
-			.returning();
+		// Named narrator: validate + reserve the handle atomically. Named narrators
+		// must be standalone (no chapter binding) so they are long-lived and
+		// independent of any single chapter's lifecycle.
+		const makeNamed = input.makeNamed ?? false;
+		let normalizedHandle: string | null = null;
+		if (makeNamed) {
+			if (!input.handle) {
+				throw new ValidationError("handle is required when creating a named narrator");
+			}
+			if (chapterId !== null) {
+				throw new ValidationError("Named narrators must be standalone (no chapterId)");
+			}
+			normalizedHandle = input.handle.trim().toLowerCase();
+			traits.push("named");
+		}
 
-		logger.info("Narrator created", { id, chapterId, type });
+		const insertNarrator = async () =>
+			(
+				await db
+					.insert(narrators)
+					.values({
+						id,
+						chapterId,
+						type,
+						variant: "primary",
+						traits,
+						handle: normalizedHandle,
+						// Named narrators get the GroupControl optional tool by default so
+						// they can oversee fellow chat-group members out of the box.
+						enabledTools: makeNamed ? ["GroupControl"] : undefined,
+						model: storedModel,
+						systemPrompt: input.systemPrompt,
+						permissionMode: resolvedPermMode,
+						previousPermissionMode,
+						planFileId,
+						planMode: startInPlanMode,
+						reasoningEffort: resolvedReasoningEffort,
+						fastMode: input.fastMode ?? false,
+						relaxedPlan: input.relaxedPlan ?? settings.agent.defaultRelaxedPlan,
+						pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
+						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
+						dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+						cwd: input.cwd ?? null,
+						inheritMode: "fresh",
+						status: "idle",
+						title: input.title ?? null,
+						createdAt: now,
+						updatedAt: now,
+					})
+					.returning()
+			)[0];
+
+		// Reserve the handle under a global lock so concurrent creates can't both
+		// pass the uniqueness check before either inserts.
+		const narrator = normalizedHandle
+			? await narratorHandleLock.acquire("handle", async () => {
+					await this.assertHandleAvailable(normalizedHandle as string);
+					return insertNarrator();
+				})
+			: await insertNarrator();
+
+		logger.info("Narrator created", { id, chapterId, type, handle: normalizedHandle });
 		return narrator;
 	},
 
@@ -812,6 +849,72 @@ export const narratorService = {
 		});
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		return narrator;
+	},
+
+	// ── Named narrators (handle-based @mention targets) ─────────────────────────
+
+	/**
+	 * Look up a named narrator by its handle (case-insensitive). Returns null if
+	 * no narrator owns the handle. Does not throw.
+	 */
+	async getByHandle(handle: string) {
+		const normalized = handle.trim().toLowerCase();
+		if (!normalized) return null;
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.handle, normalized),
+		});
+		return narrator ?? null;
+	},
+
+	/**
+	 * Throw a ValidationError if the handle is already taken by another narrator.
+	 * `excludeNarratorId` lets a narrator keep its own handle when re-validating.
+	 */
+	async assertHandleAvailable(handle: string, excludeNarratorId?: string) {
+		const existing = await this.getByHandle(handle);
+		if (existing && existing.id !== excludeNarratorId) {
+			throw new ValidationError(`Handle "@${handle}" is already taken`);
+		}
+	},
+
+	/** List all named narrators (traits include "named"), most recent first. */
+	async listNamed() {
+		const rows = await db.query.narrators.findMany({
+			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
+			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
+		});
+		// Defensive: only return those actually flagged as named.
+		return rows.filter((n) => parseTraits(n.traits).includes("named"));
+	},
+
+	/**
+	 * Assign, change, or clear a narrator's handle. Passing null clears it and
+	 * removes the "named" trait. Uniqueness is enforced under a global lock.
+	 */
+	async setHandle(narratorId: string, handle: string | null) {
+		return narratorHandleLock.acquire("handle", async () => {
+			const narrator = await this.getById(narratorId);
+			if (isSubagentVariant(narrator.variant)) {
+				throw new ValidationError("Subagents cannot be named");
+			}
+			const normalized = handle === null ? null : handle.trim().toLowerCase();
+			if (normalized) {
+				if (narrator.chapterId !== null) {
+					throw new ValidationError("Only standalone narrators can be named");
+				}
+				await this.assertHandleAvailable(normalized, narratorId);
+			}
+			const currentTraits = parseTraits(narrator.traits);
+			const nextTraits = currentTraits.filter((t) => t !== "named");
+			if (normalized) nextTraits.push("named");
+			const [updated] = await db
+				.update(narrators)
+				.set({ handle: normalized, traits: nextTraits, updatedAt: new Date().toISOString() })
+				.where(eq(narrators.id, narratorId))
+				.returning();
+			logger.info("Narrator handle updated", { narratorId, handle: normalized });
+			return updated;
+		});
 	},
 
 	async listByChapter(chapterId: string) {
@@ -1451,6 +1554,7 @@ export const narratorService = {
 	persistCompactingMessage: narratorPersistence.persistCompactingMessage.bind(narratorPersistence),
 	persistPlanMessage: narratorPersistence.persistPlanMessage.bind(narratorPersistence),
 	clearContext: narratorPersistence.clearContext.bind(narratorPersistence),
+	clearContextBefore: narratorPersistence.clearContextBefore.bind(narratorPersistence),
 	finalizeCompactingMessage:
 		narratorPersistence.finalizeCompactingMessage.bind(narratorPersistence),
 	persistAssistantMessage: narratorPersistence.persistAssistantMessage.bind(narratorPersistence),

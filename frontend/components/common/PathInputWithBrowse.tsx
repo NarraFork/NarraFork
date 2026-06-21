@@ -3,6 +3,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { IconFolderOpen } from "@tabler/icons-react";
 import { lazy, Suspense, useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 import { PathInput } from "./PathInput";
 
 const DirectoryBrowser = lazy(() =>
@@ -43,7 +44,7 @@ export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBro
 				onClose={close}
 				title={t("selectDirectory")}
 				size="lg"
-				zIndex={400}
+				zIndex={Z.modal}
 				styles={{ body: { padding: 0 } }}
 			>
 				{opened && (

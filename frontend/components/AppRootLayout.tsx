@@ -31,6 +31,7 @@ import {
 	IconPlus,
 	IconSearch,
 	IconSettings,
+	IconUsers,
 	IconWand,
 	IconX,
 } from "@tabler/icons-react";
@@ -561,6 +562,7 @@ function AuthenticatedLayout() {
 				style={{
 					display: "flex",
 					flexDirection: "column",
+					isolation: "isolate",
 					transition: "padding 150ms ease",
 				}}
 			>
@@ -706,6 +708,16 @@ function AuthenticatedLayout() {
 					</Box>
 				)}
 				<Box>
+					<Tooltip label={t("groups")} position="right" disabled={!navCollapsed}>
+						<NavLink
+							component={Link}
+							to="/groups"
+							label={navCollapsed ? undefined : t("groups")}
+							active={pathname.startsWith("/groups")}
+							leftSection={<IconUsers size={16} />}
+							onClick={closeNavForLink}
+						/>
+					</Tooltip>
 					<Tooltip label={t("routines")} position="right" disabled={!navCollapsed}>
 						<NavLink
 							component={Link}

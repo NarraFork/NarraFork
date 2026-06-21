@@ -62,5 +62,8 @@ export const narratorTraitsLock = new AsyncMutex();
 /** Per-narrator mutex — guards read-modify-write updates to narrator substatus. */
 export const narratorSubstatusLock = new AsyncMutex();
 
+/** Global mutex — guards uniqueness check + assignment of named-narrator handles. */
+export const narratorHandleLock = new AsyncMutex();
+
 /** Per-user mutex — guards read-modify-write updates to user preference JSON blobs. */
 export const userPreferencesLock = new AsyncMutex();

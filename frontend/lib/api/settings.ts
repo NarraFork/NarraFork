@@ -68,7 +68,7 @@ export const settingsApi = {
 			notifyFeishuWebhook: string;
 			notifyFeishuSecret: string;
 			recentTabs: Array<{
-				type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
+				type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
 				id: string;
 				narratorId?: string;
 				parentNarratorId?: string;
@@ -152,7 +152,7 @@ export const settingsApi = {
 
 	// Recent Tabs
 	upsertRecentTab: (tab: {
-		type: "chapter" | "narrator" | "project" | "workspace" | "subagent";
+		type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
 		id: string;
 		narratorId?: string;
 		parentNarratorId?: string;
@@ -168,7 +168,7 @@ export const settingsApi = {
 			body: JSON.stringify(tab),
 		}),
 	removeRecentTab: (
-		type: "chapter" | "narrator" | "project" | "workspace" | "subagent",
+		type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group",
 		id: string,
 	) =>
 		request<ApiEntity[]>(`/user-preferences/recent-tabs/${type}/${id}`, {
@@ -188,6 +188,24 @@ export const settingsApi = {
 		request<ApiEntity[]>("/user-preferences/recent-tabs/clear", {
 			method: "POST",
 			body: JSON.stringify({ scope, keepTabKey }),
+		}),
+	restoreRecentTabs: (
+		tabs: Array<{
+			type: "chapter" | "narrator" | "project" | "workspace" | "subagent" | "group";
+			id: string;
+			narratorId?: string;
+			parentNarratorId?: string;
+			workspaceId?: string | null;
+			title: string;
+			subtitle?: string;
+			status?: string;
+			lastVisitedAt: number;
+			pinned?: boolean;
+		}>,
+	) =>
+		request<ApiEntity[]>("/user-preferences/recent-tabs/restore", {
+			method: "POST",
+			body: JSON.stringify({ tabs }),
 		}),
 	saveGraphViewport: (
 		projectId: string,

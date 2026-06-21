@@ -2874,11 +2874,16 @@ export interface ResolvePermissionOpts {
 	compactAfter?: boolean;
 	updatedPlan?: string;
 	userId?: string;
-	decidedBy?: "user" | "auto" | "reflection";
+	/**
+	 * Who decided this permission. `"user"`/`"auto"`/`"reflection"` are the built-in
+	 * deciders; `narrator:<id>` marks a proxy approval by a controlling named narrator
+	 * (chat-group "full control"). The value is persisted to permissionDecidedBy.
+	 */
+	decidedBy?: "user" | "auto" | "reflection" | `narrator:${string}`;
 	exitPlanCancelled?: boolean;
 }
 
-type DangerReflectionDecidedBy = "reflection" | "user" | "auto";
+type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
 
 async function enableRelaxedPlanAfterPlanSoftDeny(
 	narratorId: string,
@@ -2959,6 +2964,14 @@ export async function resolvePermission(
 		updatedInput = { ...pending.input, plan: updatedPlan };
 	}
 
+	// When a controlling named narrator proxy-decided, resolve its handle for the UI.
+	let decidedByNarrator: { id: string; handle: string | null } | undefined;
+	if (decidedBy.startsWith("narrator:")) {
+		const proxyId = decidedBy.slice("narrator:".length);
+		const proxy = await narratorService.getById(proxyId).catch(() => null);
+		decidedByNarrator = { id: proxyId, handle: proxy?.handle ?? null };
+	}
+
 	broadcastToNarrator(pending.broadcastTargetId, {
 		type: "permission_resolved",
 		narratorId: pending.broadcastTargetId,
@@ -2969,6 +2982,7 @@ export async function resolvePermission(
 			? { subagentNarratorId: pending.narratorId }
 			: {}),
 		...(updatedInput ? { updatedInput } : {}),
+		...(decidedByNarrator ? { decidedByNarrator } : {}),
 		...(decision === "deny" && (denyMessage || feedbackText?.trim())
 			? { feedbackText: denyMessage || feedbackText?.trim() }
 			: {}),
@@ -3100,6 +3114,61 @@ export async function resolvePermissionOrDangerReflection(
 	}
 
 	return resolvePermission(requestId, decision, opts);
+}
+
+/**
+ * Proxy-resolve a pending permission request on behalf of a controlling named
+ * narrator (chat-group "full control"). Validates that the caller shares an
+ * active chat group with the request's target narrator AND has canControl, then
+ * resolves the request exactly like a user decision would (same recovery path),
+ * recording the decider as `narrator:<callerId>` for audit.
+ *
+ * Returns { ok, reason } — ok=false with a human-readable reason when the caller
+ * is not authorized or the request no longer exists.
+ */
+export async function resolvePermissionAsNarrator(
+	requestId: string,
+	callerNarratorId: string,
+	decision: "allow" | "deny",
+	opts: { denyMessage?: string; feedbackText?: string } = {},
+): Promise<{ ok: boolean; reason?: string }> {
+	// Locate the target narrator for this request (pending permission or danger reflection).
+	const pendingPerm = pendingPermissions.get(requestId);
+	const pendingDanger = pendingPerm ? undefined : pendingDangerReflections.get(requestId);
+	const targetNarratorId = pendingPerm?.narratorId ?? pendingDanger?.narratorId;
+	if (!targetNarratorId) {
+		return { ok: false, reason: "Permission request not found or already resolved." };
+	}
+	if (targetNarratorId === callerNarratorId) {
+		return { ok: false, reason: "Cannot proxy-approve your own permission request." };
+	}
+
+	// Authorize: caller must share an active chat group with the target and have canControl.
+	const { chatGroupService } = await import("./chat-group-service");
+	const authorized = await chatGroupService.canControlNarrator(callerNarratorId, targetNarratorId);
+	if (!authorized) {
+		return {
+			ok: false,
+			reason:
+				"Not authorized: you must be a controlling member of a chat group that includes the target narrator.",
+		};
+	}
+
+	const resolved = await resolvePermissionOrDangerReflection(requestId, decision, {
+		denyMessage: opts.denyMessage,
+		feedbackText: opts.feedbackText,
+		decidedBy: `narrator:${callerNarratorId}`,
+	});
+	if (!resolved) {
+		return { ok: false, reason: "Permission request not found or already resolved." };
+	}
+	logger.info("Permission proxy-resolved by narrator", {
+		requestId,
+		callerNarratorId,
+		targetNarratorId,
+		decision,
+	});
+	return { ok: true };
 }
 
 function dangerReflectionSuggestions(

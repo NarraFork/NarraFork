@@ -15,6 +15,7 @@ import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from "
 import { useTranslation } from "react-i18next";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import { Z } from "../../lib/z-index";
 
 const TerminalPanel = lazy(() =>
 	import("../terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
@@ -284,7 +285,7 @@ function ConfirmCloseModal({
 			onClose={onClose}
 			title={t("terminal.closeConfirmTitle")}
 			centered
-			zIndex={2000}
+			zIndex={Z.modal}
 		>
 			<Stack>
 				<Text size="sm">{t("terminal.closeConfirmMessage")}</Text>

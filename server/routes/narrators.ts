@@ -67,6 +67,7 @@ import {
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { extractMentions, hasMention } from "../lib/mentions";
 import {
 	DISABLED_TOOLS_TRAIT_PREFIX,
 	getConfigurableTools,
@@ -122,6 +123,7 @@ import {
 	updateBufferedMessageSchema,
 	updateNarratorCwdSchema,
 	updateNarratorDraftSchema,
+	updateNarratorHandleSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
@@ -130,6 +132,7 @@ import {
 } from "../lib/validators";
 import { generateAskUserQuestionAnswers } from "../services/ask-user-question-reflection";
 import { chapterFork } from "../services/chapter-fork";
+import { chatGroupService } from "../services/chat-group-service";
 import type {
 	BashCommandResult,
 	GoalCommandResult,
@@ -164,6 +167,7 @@ import {
 } from "../services/narrator-service";
 import {
 	type BufferCreator,
+	cancelCompact,
 	cancelPendingExitPlanMode,
 	clearBufferedMessages,
 	closeNarrator,
@@ -537,10 +541,33 @@ narratorRoutes.post("/", async (c) => {
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
+// Resolve a named narrator by its handle (case-insensitive). Used by @mention.
+// Must be registered before "/:id" so "by-handle" is not captured as an id.
+narratorRoutes.get("/by-handle/:handle", async (c) => {
+	const handle = c.req.param("handle");
+	const narrator = await narratorService.getByHandle(handle);
+	if (!narrator) throw new NotFoundError("Named narrator", handle);
+	return c.json(publicNarratorResponse(narrator));
+});
+
+// List all named narrators (handle-based @mention targets).
+narratorRoutes.get("/named", async (c) => {
+	const named = await narratorService.listNamed();
+	return c.json(named.map((n) => publicNarratorResponse(n)));
+});
+
 // Get narrator
 narratorRoutes.get("/:id", async (c) => {
 	const narrator = await narratorService.getById(c.req.param("id"));
 	return c.json(publicNarratorResponse(narrator));
+});
+
+// List active chat groups a narrator participates in
+narratorRoutes.get("/:id/groups", async (c) => {
+	const id = c.req.param("id");
+	await narratorService.getById(id); // 404 if missing
+	const groups = await chatGroupService.listGroupsForNarrator(id);
+	return c.json({ groups });
 });
 
 function draftResponse(traits: unknown) {
@@ -865,6 +892,36 @@ narratorRoutes.delete("/:id/goals", async (c) => {
 	return c.json(result);
 });
 
+/**
+ * Resolve @handle mentions of named narrators and bring them into a chat group
+ * with this session. Fire-and-forget: never blocks or fails the message request,
+ * and runs regardless of whether the message was sent immediately (idle) or
+ * buffered (the narrator was working). Resolves locale internally because the
+ * buffered path does not compute it.
+ */
+function dispatchMentions(originNarratorId: string, content: string, userId: string): void {
+	if (!hasMention(content)) return;
+	const handles = extractMentions(content);
+	if (handles.length === 0) return;
+	void (async () => {
+		const locale = await getUserLanguage(userId);
+		await chatGroupService.handleMentions({
+			originNarratorId,
+			handles,
+			content,
+			createdBy: userId,
+			projectId: null,
+			locale,
+			fromUser: true,
+		});
+	})().catch((err) => {
+		logger.warn("Failed to handle @mentions", {
+			narratorId: originNarratorId,
+			error: String(err),
+		});
+	});
+}
+
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
@@ -1061,6 +1118,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			if (priority) {
 				requestBufferedMessageSoftStop(id);
 			}
+			// Resolve @handle mentions even when the message was buffered (the
+			// narrator was working/waiting); otherwise mentioning a busy named
+			// narrator would never create the chat group.
+			if (!queuedNewCommand) {
+				dispatchMentions(id, message, userId);
+			}
 			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
 		}
 		if (result.full) {
@@ -1102,6 +1165,13 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Broadcast model change to frontend (ensureNarrator already picked up the new model from DB)
 	if (modelOverride?.model) {
 		updateNarratorModel(id, modelOverride.model);
+	}
+
+	// Resolve @handle mentions of named narrators: bring them into a chat group
+	// with this session. Fire-and-forget so the HTTP response isn't blocked by
+	// delivery/wake of the mentioned narrators.
+	if (!queuedNewCommand) {
+		dispatchMentions(id, message, userId);
 	}
 
 	return c.json(userMsg, 201);
@@ -1459,15 +1529,34 @@ narratorRoutes.post("/:id/compact", async (c) => {
 	return c.json({ ok: true });
 });
 
-// Clear context — insert an empty compact marker so subsequent queries start fresh
+// Cancel an in-progress compact — aborts the summary-model request and rolls
+// back the placeholder marker. Rollback + WS broadcasts happen inside
+// doRunCustomCompact's abort branch once the aborted request rejects.
+narratorRoutes.post("/:id/compact/cancel", async (c) => {
+	const narratorId = c.req.param("id");
+	await narratorService.getById(narratorId);
+	const cancelled = cancelCompact(narratorId);
+	if (!cancelled) {
+		return c.json({ ok: false, reason: "no_compact_in_progress" }, 409);
+	}
+	return c.json({ ok: true });
+});
+
+// Clear context — insert an empty compact marker so subsequent queries start fresh.
+// When `beforeMessageId` is provided, the marker is positioned before that message
+// (discarding earlier context up to that point); otherwise it is appended at the end.
 narratorRoutes.post("/:id/clear-context", async (c) => {
 	const narratorId = c.req.param("id");
 	await narratorService.getById(narratorId);
-	const msg = await narratorService.clearContext(narratorId);
+	const body = await c.req.json().catch(() => ({}));
+	const beforeMessageId = body.beforeMessageId ?? undefined;
+	const msg = beforeMessageId
+		? await narratorService.clearContextBefore(narratorId, beforeMessageId)
+		: await narratorService.clearContext(narratorId);
 	resetActiveUpstreamSession(narratorId);
 	broadcastToNarrator(narratorId, { type: "message", narratorId, message: msg });
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-	return c.json({ ok: true });
+	return c.json({ ok: true, messageId: msg.id });
 });
 
 // Create a plan compact message
@@ -1901,6 +1990,15 @@ narratorRoutes.patch("/:id/title", async (c) => {
 	await narratorService.getById(id);
 	await persistTitle(id, parsed.data.title);
 	return c.json({ ok: true, title: parsed.data.title });
+});
+
+// Assign, change, or clear a narrator's @handle (named narrator). null clears it.
+narratorRoutes.patch("/:id/handle", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateNarratorHandleSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const updated = await narratorService.setHandle(id, parsed.data.handle);
+	return c.json(publicNarratorResponse(updated));
 });
 
 // Update narrator working directory

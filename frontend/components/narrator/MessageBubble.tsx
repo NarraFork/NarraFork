@@ -74,8 +74,10 @@ import {
 	readFetchError,
 	type SideCarRecord,
 } from "../../lib/api";
+import { Z } from "../../lib/z-index";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
+import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import {
 	copyGeneratedImageToClipboard,
@@ -186,6 +188,8 @@ export interface CompactSummaryModalTarget {
 	narratorId: string;
 	messageId: string;
 	onDelete?: () => void;
+	/** Open directly in edit mode (e.g. for the manual summarize flow). */
+	autoEdit?: boolean;
 }
 
 export const CompactSummaryModalCtx = createContext<{
@@ -279,6 +283,8 @@ interface MessageBubbleProps {
 	onQuestionReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
+	onClearContextBefore?: (messageId: string) => void;
+	onManualSummarize?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
@@ -339,6 +345,8 @@ function messageBubbleAreEqual(prev: MessageBubbleProps, next: MessageBubbleProp
 		prev.onQuestionReflect === next.onQuestionReflect &&
 		prev.onQuestionDeny === next.onQuestionDeny &&
 		prev.onCompactBeforeMessage === next.onCompactBeforeMessage &&
+		prev.onClearContextBefore === next.onClearContextBefore &&
+		prev.onManualSummarize === next.onManualSummarize &&
 		prev.onDeleteBlock === next.onDeleteBlock &&
 		prev.onRollbackToBlock === next.onRollbackToBlock &&
 		prev.onEditAndRegenerate === next.onEditAndRegenerate &&
@@ -556,15 +564,12 @@ function WebSearchBlock({
 						</Menu.Item>
 					)}
 					{msgCtx.onCompactBeforeMessage && (
-						<Menu.Item
-							leftSection={<IconArrowsMinimize size={14} />}
-							onClick={() => {
-								msgCtx.onCompactBeforeMessage?.();
-								swipe.closeSwipe();
-							}}
-						>
-							{t("contextMenu_compactBefore")}
-						</Menu.Item>
+						<CompactMenuSub
+							onCompact={msgCtx.onCompactBeforeMessage}
+							onClearContext={msgCtx.onClearContextBefore}
+							onManualSummarize={msgCtx.onManualSummarize}
+							onClose={() => swipe.closeSwipe()}
+						/>
 					)}
 					{msgCtx.onDeleteBlock && blockIndex != null && (
 						<Menu.Item
@@ -631,7 +636,7 @@ function WebSearchBlock({
 						left: pos.left,
 						top: pos.top,
 						transform: "translateY(-50%)",
-						zIndex: 1000,
+						zIndex: Z.popover,
 						transition: swipe.swipeMenuTransition,
 						pointerEvents: swipe.swipeClosing ? "none" : "auto",
 						opacity: swipe.swipeClosing ? 0 : 1,
@@ -1061,15 +1066,12 @@ function ImageGenerationBlock({
 							</Menu.Item>
 						)}
 						{msgCtx.onCompactBeforeMessage && (
-							<Menu.Item
-								leftSection={<IconArrowsMinimize size={14} />}
-								onClick={() => {
-									msgCtx.onCompactBeforeMessage?.();
-									closeMenu();
-								}}
-							>
-								{t("contextMenu_compactBefore")}
-							</Menu.Item>
+							<CompactMenuSub
+								onCompact={msgCtx.onCompactBeforeMessage}
+								onClearContext={msgCtx.onClearContextBefore}
+								onManualSummarize={msgCtx.onManualSummarize}
+								onClose={closeMenu}
+							/>
 						)}
 						{msgCtx.onDeleteBlock && blockIndex != null && (
 							<Menu.Item
@@ -1190,12 +1192,12 @@ function BlockMenuWrapper({
 							</Menu.Item>
 						)}
 						{msgCtx.onCompactBeforeMessage && (
-							<Menu.Item
-								leftSection={<IconArrowsMinimize size={14} />}
-								onClick={() => msgCtx.onCompactBeforeMessage?.()}
-							>
-								{t("contextMenu_compactBefore")}
-							</Menu.Item>
+							<CompactMenuSub
+								onCompact={msgCtx.onCompactBeforeMessage}
+								onClearContext={msgCtx.onClearContextBefore}
+								onManualSummarize={msgCtx.onManualSummarize}
+								onClose={() => setCtxMenuOpened(false)}
+							/>
 						)}
 						{msgCtx.onDeleteBlock && blockIndex != null && (
 							<Menu.Item
@@ -1573,15 +1575,12 @@ export const ReasoningBlock = memo(
 					</Menu.Item>
 				)}
 				{msgCtx.onCompactBeforeMessage && (
-					<Menu.Item
-						leftSection={<IconArrowsMinimize size={14} />}
-						onClick={() => {
-							msgCtx.onCompactBeforeMessage?.();
-							swipe.closeSwipe();
-						}}
-					>
-						{t("contextMenu_compactBefore")}
-					</Menu.Item>
+					<CompactMenuSub
+						onCompact={msgCtx.onCompactBeforeMessage}
+						onClearContext={msgCtx.onClearContextBefore}
+						onManualSummarize={msgCtx.onManualSummarize}
+						onClose={() => swipe.closeSwipe()}
+					/>
 				)}
 				{msgCtx.onDeleteBlock && blockIndex != null && (
 					<Menu.Item
@@ -1648,7 +1647,7 @@ export const ReasoningBlock = memo(
 							left: pos.left,
 							top: pos.top,
 							transform: "translateY(-50%)",
-							zIndex: 1000,
+							zIndex: Z.popover,
 							transition: swipe.swipeMenuTransition,
 							pointerEvents: swipe.swipeClosing ? "none" : "auto",
 							opacity: swipe.swipeClosing ? 0 : 1,
@@ -1958,6 +1957,14 @@ export function CompactSummaryModal({
 		setSaving(false);
 	}, [targetKey]);
 
+	// Manual-summarize flow: open directly in edit mode once the (usually empty)
+	// summary has loaded.
+	useEffect(() => {
+		if (!target?.autoEdit || isLoading) return;
+		setEditText(data?.summary ?? "");
+		setEditing(true);
+	}, [target?.autoEdit, isLoading, data?.summary]);
+
 	const handleClose = () => {
 		onClose();
 		setEditing(false);
@@ -2110,9 +2117,39 @@ function CompactIndicator({
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
 	const [saving, setSaving] = useState(false);
+	const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
+	const [cancelling, setCancelling] = useState(false);
 	const queryClient = useQueryClient();
 
 	const canClick = !isCompacting && !!narratorId && !!messageId;
+	// While compacting, the indicator is clickable to cancel the in-progress compact.
+	const canCancel = isCompacting && !!narratorId;
+
+	const handleCancel = useCallback(async () => {
+		if (!narratorId) return;
+		setCancelling(true);
+		try {
+			const res = await api.cancelCompact(narratorId);
+			// Rollback + UI reset arrive via WS (messages_deleted / compact_done).
+			if (!res.ok) {
+				notifications.show({
+					message: t("cancelCompactFailedDesc"),
+					color: "yellow",
+					autoClose: 4000,
+				});
+			}
+			setCancelConfirmOpen(false);
+		} catch {
+			notifications.show({
+				title: t("cancelCompactFailed"),
+				message: t("cancelCompactFailedDesc"),
+				color: "red",
+				autoClose: 5000,
+			});
+		} finally {
+			setCancelling(false);
+		}
+	}, [narratorId, t]);
 
 	const handleOpen = useCallback(() => {
 		if (!narratorId || !messageId) return;
@@ -2182,18 +2219,47 @@ function CompactIndicator({
 				py={4}
 				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "context" } : {})}
 				{...(messageId ? { "data-message-id": messageId } : {})}
-				style={canClick ? { cursor: "pointer" } : undefined}
-				onClick={canClick ? handleOpen : undefined}
+				style={canClick || canCancel ? { cursor: "pointer" } : undefined}
+				onClick={canCancel ? () => setCancelConfirmOpen(true) : canClick ? handleOpen : undefined}
+				title={canCancel ? t("cancelCompactTitle") : undefined}
 			>
 				{isCompacting ? (
 					<Loader size={14} color="orange" />
 				) : (
 					<IconArrowsMinimize size={14} style={{ color: "var(--mantine-color-orange-6)" }} />
 				)}
-				<Text size="xs" c="orange" td={canClick ? "underline" : undefined}>
+				<Text size="xs" c="orange" td={canClick || canCancel ? "underline" : undefined}>
 					{isCompacting ? t("compacting") : t("compacted")}
 				</Text>
+				{canCancel && <IconX size={12} style={{ color: "var(--mantine-color-orange-6)" }} />}
 			</Group>
+
+			{canCancel && (
+				<Modal
+					opened={cancelConfirmOpen}
+					onClose={() => setCancelConfirmOpen(false)}
+					title={
+						<Group gap="xs">
+							<IconX size={18} style={{ color: "var(--mantine-color-orange-6)" }} />
+							<Text fw={600}>{t("cancelCompactTitle")}</Text>
+						</Group>
+					}
+					centered
+					size="sm"
+				>
+					<Stack gap="md">
+						<Text size="sm">{t("cancelCompactConfirmDesc")}</Text>
+						<Group justify="flex-end" gap="xs">
+							<Button variant="subtle" size="xs" onClick={() => setCancelConfirmOpen(false)}>
+								{t("cancelCompactKeep")}
+							</Button>
+							<Button color="orange" size="xs" loading={cancelling} onClick={handleCancel}>
+								{t("cancelCompactConfirm")}
+							</Button>
+						</Group>
+					</Stack>
+				</Modal>
+			)}
 
 			{!compactSummaryModal && (
 				<Modal
@@ -2980,6 +3046,8 @@ export const MessageBubble = memo(function MessageBubble({
 	onQuestionReflect,
 	onQuestionDeny,
 	onCompactBeforeMessage,
+	onClearContextBefore,
+	onManualSummarize,
 	onDeleteBlock,
 	onRollbackToBlock,
 	onEditAndRegenerate,
@@ -3134,6 +3202,12 @@ export const MessageBubble = memo(function MessageBubble({
 		if (msgId && onCompactBeforeMessage) {
 			actions.onCompactBeforeMessage = () => onCompactBeforeMessage(msgId);
 		}
+		if (msgId && onClearContextBefore) {
+			actions.onClearContextBefore = () => onClearContextBefore(msgId);
+		}
+		if (msgId && onManualSummarize) {
+			actions.onManualSummarize = () => onManualSummarize(msgId);
+		}
 		if (msgId && onDeleteBlock) {
 			actions.onDeleteBlock = (blockIndex: number) => onDeleteBlock(msgId, blockIndex);
 		}
@@ -3161,6 +3235,8 @@ export const MessageBubble = memo(function MessageBubble({
 		onForkFromMessage,
 		onAskInPassing,
 		onCompactBeforeMessage,
+		onClearContextBefore,
+		onManualSummarize,
 		onDeleteBlock,
 		onRollbackToBlock,
 		onEditAndRegenerate,
@@ -3331,7 +3407,7 @@ export const MessageBubble = memo(function MessageBubble({
 			return (
 				<CompactIndicator
 					isCompacting={isCompacting}
-					narratorId={canNavigate ? narratorId : undefined}
+					narratorId={narratorId}
 					messageId={message.id}
 					onDelete={canNavigate ? invalidateMessages : undefined}
 				/>

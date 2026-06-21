@@ -19,6 +19,7 @@ import {
 	Select,
 	Stack,
 	Text,
+	TextInput,
 	Tooltip,
 } from "@mantine/core";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
@@ -149,6 +150,8 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	const [cwd, setCwd] = useState("");
 	const [selectedModel, setSelectedModel] = useState("");
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
+	const [makeNamed, setMakeNamed] = useState(false);
+	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
 
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -191,6 +194,9 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				...(cwd ? { cwd } : {}),
 				model: selectedModel || FOLLOW_DEFAULT_MODEL,
 				...(startInPlanMode ? { startInPlanMode: true } : {}),
+				...(makeNamed && handle.trim()
+					? { makeNamed: true, handle: handle.trim().toLowerCase() }
+					: {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -212,6 +218,8 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 		setCwd("");
 		setSelectedModel("");
 		setStartInPlanMode(false);
+		setMakeNamed(false);
+		setHandle("");
 	};
 
 	return (
@@ -322,6 +330,8 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 					comboboxProps={{
 						withinPortal: true,
 						position: "bottom-start",
+						// 该 Select 位于 Mantine Modal 内,沿用 Mantine 自管层级体系
+						// (略高于 Popover 默认 300),不使用全局 Z token,避免破坏 Modal 内叠放。
 						zIndex: 320,
 					}}
 				/>
@@ -333,7 +343,29 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 					onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
 				/>
 
-				<Button onClick={handleCreate} loading={createNarrator.isPending}>
+				<Checkbox
+					label={t("makeNamed")}
+					description={t("makeNamedHint")}
+					checked={makeNamed}
+					onChange={(e) => setMakeNamed(e.currentTarget.checked)}
+				/>
+				{makeNamed && (
+					<TextInput
+						label={t("handle")}
+						description={t("handleHint")}
+						placeholder="alice"
+						leftSection="@"
+						value={handle}
+						onChange={(e) => setHandle(e.currentTarget.value)}
+						maxLength={32}
+					/>
+				)}
+
+				<Button
+					onClick={handleCreate}
+					loading={createNarrator.isPending}
+					disabled={makeNamed && handle.trim().length < 2}
+				>
 					{t("createNarrator")}
 				</Button>
 			</Stack>

@@ -17,6 +17,8 @@
 	"clearAll": "Clear",
 	"clearProjects": "Clear narraflows",
 	"clearNarrators": "Clear idle narrators",
+	"tabsCleared": "Cleared {{count}} tab(s)",
+	"undo": "Undo",
 	"newNarrator": "New narrator",
 	"noRecentTabs": "No recent tabs",
 	"closeTab": "Close tab",
@@ -34,5 +36,9 @@
 	"requestDumpEnabledBadge": "Dump on",
 	"requestDumpEnabledTooltip": "Every AI request is being dumped. Click to open this setting.",
 	"requestDumpErrorsOnlyTooltip": "Only failed AI requests are being dumped. Click to open this setting.",
-	"licenses": "Licenses"
+	"licenses": "Licenses",
+	"groupChat": "Group chat",
+	"groups": "Group chats",
+	"groupCreatedTitle": "Group chat created",
+	"groupCreatedMessage": "Created {{title}}. Click to open."
 }

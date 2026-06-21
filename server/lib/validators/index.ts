@@ -24,6 +24,11 @@ export {
 	updateGraphPositionsSchema,
 } from "./chapters";
 export {
+	addGroupMemberSchema,
+	createGroupSchema,
+	postGroupMessageSchema,
+} from "./chat-groups";
+export {
 	blacklistDirEntrySchema,
 	commandBlacklistEntrySchema,
 	commandSchema,
@@ -71,6 +76,7 @@ export {
 	editAssistantMessageSchema,
 	forkFromMessagesSchema,
 	forkNarratorSchema,
+	narratorHandleSchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	segmentCompactSchema,
@@ -81,6 +87,7 @@ export {
 	updateBufferedMessageSchema,
 	updateNarratorCwdSchema,
 	updateNarratorDraftSchema,
+	updateNarratorHandleSchema,
 	updateNarratorModelSchema,
 	updateNarratorTitleSchema,
 	updateSegmentCompactSummarySchema,
@@ -103,6 +110,7 @@ export {
 	recentTabSchema,
 	removeRecentTabSchema,
 	reorderFavoriteDirectoriesSchema,
+	restoreRecentTabsSchema,
 	updateFavoriteDirectorySchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,

@@ -6,6 +6,8 @@ export interface MessageContextMenuActions {
 	onForkFromMessage?: () => void;
 	onAskInPassing?: () => void;
 	onCompactBeforeMessage?: () => void;
+	onClearContextBefore?: () => void;
+	onManualSummarize?: () => void;
 	onDeleteBlock?: (blockIndex: number) => void;
 	onRollbackToBlock?: (blockIndex: number) => void;
 	onEditMessage?: () => void;

@@ -180,6 +180,8 @@ export type NarratorServerMessage =
 			updatedInput?: Record<string, unknown>;
 			feedbackText?: string;
 			subagentNarratorId?: string;
+			/** Set when a controlling named narrator proxy-decided this request. */
+			decidedByNarrator?: { id: string; handle: string | null };
 	  }
 	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
 	| { type: "goals_set"; narratorId: string; goals: unknown[] }
@@ -574,4 +576,28 @@ export type NarratorServerMessage =
 			type: "subagent_attached";
 			narratorId: string;
 			subagentNarratorId: string;
+	  }
+	| {
+			/** A new message was posted in a chat group this narrator belongs to. */
+			type: "group_message";
+			/** The narrator member this broadcast is routed to (WS subscription key). */
+			narratorId: string;
+			groupId: string;
+			message: {
+				id: string;
+				groupId: string;
+				senderType: "user" | "narrator" | "system";
+				senderNarratorId: string | null;
+				senderUserId: string | null;
+				senderLabel: string;
+				content: string;
+				urgent: boolean;
+				createdAt: string;
+			};
+	  }
+	| {
+			/** A chat group was fully set up; sent only to the initiating user. */
+			type: "group:ready";
+			groupId: string;
+			title: string;
 	  };

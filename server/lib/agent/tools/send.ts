@@ -4,8 +4,9 @@ import type { ToolDefinition, ToolResult } from "../types";
 export const sendTool: ToolDefinition = {
 	name: "Send",
 	description:
-		"Send a message to one or more accessible subagents. " +
+		"Send a message to one or more accessible subagents or fellow chat-group members. " +
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
+		"If you are a named narrator in a chat group, you may send to fellow group members by their @handle, id, or name. " +
 		"Set doInterrupt=true to interrupt an active foreground child subagent; this is only allowed from a primary narrator to its own child subagent. " +
 		"Set await=true to wait for the target subagent's response.",
 	parameters: z.object({

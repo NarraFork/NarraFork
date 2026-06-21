@@ -1,5 +1,6 @@
 import { useReactFlow } from "@xyflow/react";
 import { useEffect, useRef, useState } from "react";
+import { Z } from "../../lib/z-index";
 
 interface Point {
 	x: number;
@@ -262,7 +263,7 @@ export function LassoSelection({ pcDragMode, onSelect }: LassoSelectionProps) {
 						width: "100vw",
 						height: "100vh",
 						pointerEvents: "none",
-						zIndex: 1000,
+						zIndex: Z.graphOverlay,
 					}}
 				>
 					<path

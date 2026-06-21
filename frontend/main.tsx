@@ -15,6 +15,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { getInitialNamespaces, initI18n } from "./lib/i18n";
 import { queryClient } from "./lib/query-client";
+import { Z } from "./lib/z-index";
 import { routeTree } from "./routeTree.gen";
 
 const theme = createTheme({
@@ -52,7 +53,7 @@ async function bootstrap() {
 		<React.StrictMode>
 			<MantineProvider theme={theme} defaultColorScheme="auto">
 				<ConfirmDialogProvider>
-					<Notifications position="top-right" />
+					<Notifications position="top-right" zIndex={Z.toast} />
 					<QueryClientProvider client={queryClient}>
 						<React.Suspense
 							fallback={

@@ -16,6 +16,7 @@ import { type RulerData, type RulerSegment, useRulerData } from "../../hooks/use
 import { useRulerChapterActivity } from "../../hooks/useRulerChapterActivity";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api } from "../../lib/api";
+import { Z } from "../../lib/z-index";
 import { NarratorPanel } from "../narrator/NarratorPanel";
 import {
 	COLLAPSED_GAP,
@@ -2653,6 +2654,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				height: "100%",
 				overflow: "hidden",
 				position: "relative",
+				isolation: "isolate",
 				touchAction: "none",
 			}}
 			onPointerDown={handlePointerDown}
@@ -2924,7 +2926,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 					style={{
 						position: "fixed",
 						inset: 0,
-						zIndex: 999,
+						zIndex: Z.contextMenuBackdrop,
 					}}
 					onPointerDown={(e) => {
 						e.stopPropagation();

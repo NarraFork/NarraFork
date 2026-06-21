@@ -13,6 +13,12 @@
 	"compacted": "Context compacted",
 	"compactSummaryTitle": "Compact Summary",
 	"triggerCompact": "Compact now",
+	"cancelCompactTitle": "Cancel compaction",
+	"cancelCompactConfirmDesc": "Cancel the compaction in progress? It will be aborted and the context will stay as it was before compaction started.",
+	"cancelCompactConfirm": "Cancel compaction",
+	"cancelCompactKeep": "Keep compacting",
+	"cancelCompactFailed": "Failed to cancel compaction",
+	"cancelCompactFailedDesc": "Could not cancel this compaction — it may have already finished or errored.",
 	"clearContext": "Clear context",
 	"thresholdSettings": "Threshold settings",
 	"activeThresholds": "Start pruning {{prune}}% · Max prune {{force}}% · Start compacting {{compact}}%",
@@ -29,6 +35,10 @@
 	"plan": "Plan",
 	"back": "Back",
 	"sendPlaceholder": "Send a message...",
+	"mentionPopoverTitle": "Mention a named narrator",
+	"groupMessageBadge": "Group",
+	"proxyApprovedBadge": "by narrator",
+	"proxyApprovedTooltip": "This permission was decided by a controlling named narrator in a chat group",
 	"sendFailed": "Failed to send message",
 	"chapterMergedHint": "This chapter has been merged. Wake it up to continue editing.",
 	"interrupt": "Interrupt",
@@ -258,7 +268,9 @@
 	"branchRenamed": "Branch renamed",
 	"contextMenu_branch": "Branch from here",
 	"contextMenu_fork": "Fork from here",
-	"contextMenu_compactBefore": "Compact before this message",
+	"contextMenu_compactBefore": "Compact to here",
+	"contextMenu_clearContextBefore": "Clear to here",
+	"contextMenu_manualSummarize": "Manual summary",
 	"contextMenu_fullscreen": "Fullscreen",
 	"contextMenu_toggleWrap": "Toggle word wrap",
 	"contextMenu_copyBlock": "Copy this block",
@@ -355,8 +367,6 @@
 	"dismiss": "Dismiss",
 	"segmentCompactConfirm": "Compact {{count}} selected message(s)? The original messages will be hidden and replaced with a summary.",
 	"viewSubagentSession": "View session",
-	"expandEdits": "Expand edits",
-	"collapseEdits": "Collapse edits",
 	"acceptAndResetContext": "Accept & Reset Context",
 	"planEdit": "Edit Plan",
 	"planEditDone": "Done Editing",
@@ -587,6 +597,9 @@
 	"details.activity": "Activity",
 	"details.rules": "Access rules",
 	"details.contextSummary": "Context summary",
+	"details.groups": "Group chats",
+	"details.groupsEmpty": "Not in any group chat yet.",
+	"details.groupUntitled": "Group chat",
 	"details.skills": "Skills",
 	"details.skillsDescription": "{{count}} skill(s) are available from global, project, and current working-directory roots.",
 	"details.refreshSkills": "Refresh skills",
@@ -721,7 +734,8 @@
 			"bg_agent": "Background agent",
 			"bg_bash": "Background command",
 			"team_message": "Team message",
-			"buffered_user": "Buffered user message"
+			"buffered_user": "Buffered user message",
+			"group_message": "Group message"
 		}
 	},
 	"toolCallInspector": {
@@ -749,11 +763,5 @@
 			"permissionWait": "Permission wait {{duration}}",
 			"execution": "Execution {{duration}}"
 		}
-	},
-	"openMessageSearch": "Search loaded messages",
-	"closeMessageSearch": "Close message search",
-	"messageSearchPlaceholder": "Search loaded messages...",
-	"messageSearchCount": "{{current}} / {{total}}",
-	"messageSearchLoaded": "{{count}} loaded",
-	"messageSearchMoreHint": "Only loaded messages are searched. Load older messages to search more history."
+	}
 }

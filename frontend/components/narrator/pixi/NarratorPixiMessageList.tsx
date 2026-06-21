@@ -1,10 +1,10 @@
 import { clearCache as clearPretextCache, setLocale as setPretextLocale } from "@chenglou/pretext";
 import i18n from "@frontend/lib/i18n";
+import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	IconArrowBackUp,
-	IconArrowsMinimize,
 	IconCopy,
 	IconGitFork,
 	IconMessageQuestion,
@@ -29,6 +29,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../../hooks/useLocalPref";
 import { useFileSystemCapability, useUploadCapability } from "../../../hooks/usePlatform";
+import { CompactMenuSub } from "../CompactMenuSub";
 import { copyGeneratedImageToClipboard } from "../image-clipboard";
 import { BLOCK_ID_ATTR, useMessageSelection } from "../MessageSelectionCtx";
 import { getRenderableMessageOrder } from "../message-order-utils";
@@ -90,6 +91,8 @@ interface NarratorPixiMessageListProps {
 	onForkFromMessage?: (uuid: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
 	onCompactBeforeMessage?: (messageId: string) => void;
+	onClearContextBefore?: (messageId: string) => void;
+	onManualSummarize?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	scrollRef: RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
@@ -291,6 +294,8 @@ export const NarratorPixiMessageList = forwardRef<
 		onForkFromMessage,
 		onAskInPassing,
 		onCompactBeforeMessage,
+		onClearContextBefore,
+		onManualSummarize,
 		onDeleteBlock,
 		onRollbackToBlock,
 		scrollRef,
@@ -1680,16 +1685,13 @@ export const NarratorPixiMessageList = forwardRef<
 					>
 						{t("contextMenu_askInPassing")}
 					</Menu.Item>
-					<Menu.Item
-						leftSection={<IconArrowsMinimize size={14} />}
+					<CompactMenuSub
 						disabled={!messageId || !onCompactBeforeMessage}
-						onClick={() => {
-							if (messageId) onCompactBeforeMessage?.(messageId);
-							close();
-						}}
-					>
-						{t("contextMenu_compactBefore")}
-					</Menu.Item>
+						onCompact={messageId ? () => onCompactBeforeMessage?.(messageId) : undefined}
+						onClearContext={messageId ? () => onClearContextBefore?.(messageId) : undefined}
+						onManualSummarize={messageId ? () => onManualSummarize?.(messageId) : undefined}
+						onClose={close}
+					/>
 					<Menu.Divider />
 					<Menu.Item
 						color="red"
@@ -1712,6 +1714,8 @@ export const NarratorPixiMessageList = forwardRef<
 			fsPreviewSupported,
 			onAskInPassing,
 			onCompactBeforeMessage,
+			onClearContextBefore,
+			onManualSummarize,
 			onDeleteBlock,
 			onForkFromMessage,
 			onRollbackToBlock,
@@ -1850,6 +1854,7 @@ export const NarratorPixiMessageList = forwardRef<
 				height: "100%",
 				overflow: "hidden",
 				position: "relative",
+				isolation: "isolate",
 			}}
 		>
 			<div
@@ -1987,7 +1992,7 @@ export const NarratorPixiMessageList = forwardRef<
 							top: messageMenuPosition.y,
 							transform: messageMenu.mode === "swipe" ? "translateY(-50%)" : undefined,
 							transition: messageMenu.dragging ? "none" : "left 200ms ease, transform 200ms ease",
-							zIndex: 10000,
+							zIndex: Z.popover,
 						}}
 					>
 						{messageMenu.mode === "swipe" ? (

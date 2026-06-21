@@ -1277,6 +1277,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {

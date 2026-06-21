@@ -78,6 +78,32 @@ export function isCompactInProgress(narratorId: string): boolean {
 	return compactLocks.has(narratorId);
 }
 
+/** Check whether an error is an abort/cancellation error from a cancelled compact. */
+function isCompactAbortError(err: unknown): boolean {
+	if (err instanceof DOMException && err.name === "AbortError") return true;
+	if (err instanceof Error && err.name === "AbortError") return true;
+	return false;
+}
+
+/**
+ * Cancel an in-progress history compact for the given narrator.
+ *
+ * Aborts the underlying summary-model request via the lock's AbortController.
+ * The rollback (removing the placeholder marker, resetting context state,
+ * clearing the transient substatus) is performed by `doRunCustomCompact`'s
+ * abort branch once the aborted request rejects.
+ *
+ * Returns true if a cancellable compact was found and aborted, false otherwise.
+ */
+export function cancelCompact(narratorId: string): boolean {
+	const lock = compactLocks.get(narratorId);
+	if (!lock?.abortController) return false;
+	if (lock.abortController.signal.aborted) return true;
+	logger.info("Cancelling in-progress compact", { narratorId, kind: lock.kind });
+	lock.abortController.abort();
+	return true;
+}
+
 // Re-export locks so narrator-session can access them
 export { compactLocks, pruneLocks };
 
@@ -232,13 +258,16 @@ export async function runCustomCompact(
 		});
 	}
 
+	const abortController = new AbortController();
 	let compactTimer: ReturnType<typeof setTimeout>;
 	const compactPromise: Promise<CompactLockResult> = Promise.race([
-		doRunCustomCompact(narratorId, locale, beforeMessageId, mode).then((compacted) => ({
-			kind: "history" as const,
-			compacted,
-			mode: currentHistoryCompactMode(narratorId, mode),
-		})),
+		doRunCustomCompact(narratorId, locale, beforeMessageId, mode, abortController.signal).then(
+			(compacted) => ({
+				kind: "history" as const,
+				compacted,
+				mode: currentHistoryCompactMode(narratorId, mode),
+			}),
+		),
 		new Promise<CompactLockResult>((_, reject) => {
 			compactTimer = setTimeout(
 				() => reject(new Error("Compact operation timed out after 5 minutes")),
@@ -246,7 +275,12 @@ export async function runCustomCompact(
 			);
 		}),
 	]);
-	const compactLock: CompactLock = { kind: "history", promise: compactPromise, mode };
+	const compactLock: CompactLock = {
+		kind: "history",
+		promise: compactPromise,
+		mode,
+		abortController,
+	};
 	compactLocks.set(narratorId, compactLock);
 	try {
 		const result = await compactPromise;
@@ -271,6 +305,7 @@ async function doRunCustomCompact(
 	locale: Locale,
 	beforeMessageId: string | undefined,
 	mode: CompactMode,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	logger.info("Starting custom compact", { narratorId, beforeMessageId, mode });
 
@@ -305,6 +340,7 @@ async function doRunCustomCompact(
 			locale,
 			messages,
 			pruneBoundaryMessageId,
+			signal,
 		);
 
 		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
@@ -352,6 +388,40 @@ async function doRunCustomCompact(
 		return true;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);
+
+		// Cancelled by the user — silently roll back the in-progress compact:
+		// remove the placeholder marker, reset context state, and clear the
+		// transient substatus WITHOUT marking the narrator as errored.
+		if (isCompactAbortError(err)) {
+			logger.info("Custom compact cancelled by user", {
+				narratorId,
+				messageId: compactingMsg.id,
+			});
+			await narratorService.deleteCompactMessage(narratorId, compactingMsg.id).catch((e) => {
+				logger.warn("Failed to remove compacting placeholder after cancel", {
+					narratorId,
+					messageId: compactingMsg.id,
+					error: String(e),
+				});
+			});
+			broadcastToNarrator(narratorId, {
+				type: "messages_deleted",
+				narratorId,
+				deletedMessageIds: [compactingMsg.id],
+			});
+			await setCompactingSubstatus(
+				narratorId,
+				currentHistoryCompactMode(narratorId, mode),
+				false,
+			).catch(() => {});
+			broadcastToNarrator(narratorId, {
+				type: "compact_done",
+				narratorId,
+				mode: currentHistoryCompactMode(narratorId, mode),
+			});
+			throw err;
+		}
+
 		logger.error("Custom compact failed after retries", {
 			narratorId,
 			messageId: compactingMsg.id,

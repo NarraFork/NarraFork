@@ -3,6 +3,7 @@ import { IconCopy, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { collectSelectionTextPreview } from "../../lib/dom-text";
+import { Z } from "../../lib/z-index";
 
 interface SelectionPopoverProps {
 	containerRef: React.RefObject<HTMLElement | null>;
@@ -153,7 +154,7 @@ export function SelectionPopover({
 					position: "fixed",
 					top: position.top,
 					left: position.left,
-					zIndex: 1000,
+					zIndex: Z.popover,
 				}}
 			>
 				<Group gap={4}>

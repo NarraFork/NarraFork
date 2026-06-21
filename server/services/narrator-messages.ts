@@ -641,6 +641,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				permissionDenyMessage: tc.permissionDenyMessage,
 				permissionSuggestions: tc.permissionSuggestions,
 				permissionDecidedAt: tc.permissionDecidedAt,
+				permissionDecidedBy: tc.permissionDecidedBy,
 				tcId: tc.id,
 				tcCreatedAt: tc.createdAt,
 				...(_metadata && { _metadata }),

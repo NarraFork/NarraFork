@@ -660,7 +660,7 @@ function NarratorDetailPage() {
 			h="calc(100dvh - 60px)"
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
-			style={{ display: "flex", flexDirection: "row", position: "relative" }}
+			style={{ display: "flex", flexDirection: "row", position: "relative", isolation: "isolate" }}
 		>
 			{/* Chat panel */}
 			<Box style={{ flex: 1, minWidth: MIN_PANEL_WIDTH, overflow: "hidden" }}>

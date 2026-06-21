@@ -2,6 +2,7 @@ import { IconGripVertical, IconPlus, IconTerminal2 } from "@tabler/icons-react";
 import { useReactFlow } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 
 export interface TerminalBubble {
 	id: string;
@@ -323,7 +324,7 @@ export function SelectionToolbar({
 					width: "100vw",
 					height: "100vh",
 					pointerEvents: "none",
-					zIndex: 999,
+					zIndex: Z.graphOverlay - 1,
 				}}
 			>
 				<rect
@@ -350,7 +351,7 @@ export function SelectionToolbar({
 						width: "100vw",
 						height: "100vh",
 						pointerEvents: "none",
-						zIndex: 1001,
+						zIndex: Z.graphOverlay + 1,
 					}}
 				>
 					<line
@@ -383,7 +384,7 @@ export function SelectionToolbar({
 						width: "100vw",
 						height: "100vh",
 						pointerEvents: "none",
-						zIndex: 1001,
+						zIndex: Z.graphOverlay + 1,
 					}}
 				>
 					<line
@@ -412,7 +413,7 @@ export function SelectionToolbar({
 					left: toolbarPos.x,
 					top: toolbarPos.y,
 					transform: "translateX(-50%)",
-					zIndex: 1000,
+					zIndex: Z.graphOverlay,
 					display: "flex",
 					alignItems: "center",
 					gap: 8,
@@ -460,7 +461,7 @@ export function SelectionToolbar({
 						left: termSidebarX,
 						top: termSidebarY,
 						transform: "translateY(-50%)",
-						zIndex: 1000,
+						zIndex: Z.graphOverlay,
 						display: "flex",
 						flexDirection: "column",
 						alignItems: "flex-start",

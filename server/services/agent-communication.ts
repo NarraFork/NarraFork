@@ -343,10 +343,103 @@ export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
 	return (await awaitAgentResultDetailed(opts)).formatted;
 }
 
+/**
+ * Resolve a single selector to a fellow chat-group member narrator of the caller.
+ * Matches by exact id, handle, slugified title, or title. Returns the member's
+ * narrator id and the shared group id, or null if the selector is not a fellow
+ * group member.
+ */
+async function resolveGroupMemberSelector(
+	callerNarratorId: string,
+	selector: string,
+): Promise<{ narratorId: string; groupId: string } | null> {
+	const { chatGroupService } = await import("./chat-group-service");
+	const groups = await chatGroupService.listGroupsForNarrator(callerNarratorId);
+	if (groups.length === 0) return null;
+
+	for (const group of groups) {
+		const members = await chatGroupService.listNarratorMembers(group.id);
+		for (const member of members) {
+			if (!member.narratorId || member.narratorId === callerNarratorId) continue;
+			const narrator = await narratorService.getById(member.narratorId).catch(() => null);
+			if (!narrator) continue;
+			if (
+				narrator.id === selector ||
+				narrator.handle === selector.toLowerCase() ||
+				subagentMatchesSelector(narrator, selector)
+			) {
+				return { narratorId: narrator.id, groupId: group.id };
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Attempt to route a Send via a chat group. Returns a result if every selector
+ * resolves to a fellow group member; returns null if no selector matches a group
+ * member (so the caller can fall through to the subagent-team path).
+ */
+async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubagentResult | null> {
+	const selectors = getSelectors(input);
+	if (selectors.length === 0) return null;
+
+	const { chatGroupService } = await import("./chat-group-service");
+	const resolved: { selector: string; narratorId: string; groupId: string }[] = [];
+	for (const selector of selectors) {
+		const match = await resolveGroupMemberSelector(input.callerNarratorId, selector);
+		if (match) resolved.push({ selector, ...match });
+	}
+	// If none of the selectors are group members, this isn't a group send.
+	if (resolved.length === 0) return null;
+
+	const targetResults: SendTargetResult[] = [];
+	const sections: string[] = [];
+	const postedGroups = new Set<string>();
+	for (const { selector, groupId } of resolved) {
+		try {
+			// Post once per distinct group (a single message reaches all members).
+			if (!postedGroups.has(groupId)) {
+				await chatGroupService.postMessage({
+					groupId,
+					content: input.message,
+					senderType: "narrator",
+					senderNarratorId: input.callerNarratorId,
+					locale: input.locale as Locale,
+				});
+				postedGroups.add(groupId);
+			}
+			targetResults.push({ id: selector, status: "completed" });
+			sections.push(`Delivered to group member "${selector}".`);
+		} catch (err) {
+			targetResults.push({
+				id: selector,
+				status: "failed",
+				error: err instanceof Error ? err.message : String(err),
+			});
+			sections.push(
+				`Failed to deliver to "${selector}": ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+	}
+
+	return { output: sections.join("\n"), targets: targetResults };
+}
+
 export async function sendSubagentMessageDetailed(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
 	const scope = await getCommunicationScope(input.callerNarratorId);
+
+	// Chat-group routing: if the caller is a primary narrator and the selector(s)
+	// resolve to fellow chat-group member narrators, deliver via the group instead
+	// of the subagent-team path. This is how named narrators converse across
+	// sessions. Subagents continue to use the team path exclusively.
+	if (!scope.callerIsSubagent && !input.doInterrupt) {
+		const groupResult = await tryRouteViaChatGroup(input);
+		if (groupResult) return groupResult;
+	}
+
 	if (input.doInterrupt && scope.callerIsSubagent) {
 		throw new Error("doInterrupt is only supported from a primary narrator to its child subagents");
 	}

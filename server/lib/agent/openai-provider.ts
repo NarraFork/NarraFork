@@ -954,7 +954,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				body.stream = true;
 			}
 			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body);
+			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal);
 		}
 
 		// Completions: POST /chat/completions
@@ -972,6 +972,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {
@@ -1083,11 +1084,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		baseUrl: string,
 		apiKey: string,
 		body: Record<string, unknown>,
+		signal?: AbortSignal,
 	): Promise<GenerateMetaResult> {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify(body),
+			signal,
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");

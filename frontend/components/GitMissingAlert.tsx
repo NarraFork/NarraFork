@@ -16,9 +16,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, getToken } from "../lib/api";
+import { Z } from "../lib/z-index";
 
-const OVERLAY_Z_INDEX = 10000;
-const MODAL_Z_INDEX = OVERLAY_Z_INDEX + 1;
+const OVERLAY_Z_INDEX = Z.criticalOverlay;
+const MODAL_Z_INDEX = Z.criticalModal;
 
 /**
  * Full-screen overlay shown when the backend reports git is not installed.

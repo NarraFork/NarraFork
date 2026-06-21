@@ -16,6 +16,7 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { getEffectiveNarratorDisplay, statusRegistry } from "@frontend/lib/status-registry";
+import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
 	Avatar,
@@ -45,6 +46,7 @@ import {
 	IconRobot,
 	IconTargetArrow,
 	IconTerminal2,
+	IconUsers,
 	IconX,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -134,6 +136,7 @@ type PrefetchMessagePageParam =
 function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
 	if (tab.type === "chapter") return tab.narratorId ?? null;
+	// group tabs have no single narrator (multi-party)
 	return null;
 }
 
@@ -173,6 +176,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 	const { tabs } = useRecentTabs();
 	const qc = useQueryClient();
 	const navigate = useNavigate();
+	const { t } = useTranslation("nav");
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const { data: userPrefs } = useUserPreferences();
 	const tabsRef = useRef(tabs);
@@ -308,6 +312,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 	const handleGlobalEvent = useCallback(
 		(event: { type: string; [key: string]: unknown }) => {
+			if (event.type === "group:ready" && typeof event.groupId === "string") {
+				// Backend targeted this only to the initiating user — add a tab + notify.
+				const groupId = event.groupId as string;
+				const title = (event.title as string) || t("groupChat");
+				addRecentTab({ type: "group", id: groupId, title });
+				notifications.show({
+					title: t("groupCreatedTitle"),
+					message: t("groupCreatedMessage", { title }),
+					color: "grape",
+					autoClose: 6000,
+					style: { cursor: "pointer" },
+					onClick: () => navigate({ to: "/groups/$groupId", params: { groupId } }),
+				});
+				return;
+			}
 			if (event.type === "user:recent_tabs_snapshot" && Array.isArray(event.tabs)) {
 				const revision = (event.revision as number) ?? 0;
 				if (revision > 0 && revision < lastRevisionRef.current) return;
@@ -352,7 +371,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				});
 			}
 		},
-		[qc, navigate],
+		[qc, navigate, t],
 	);
 
 	const handleReconnect = useCallback(() => {
@@ -1164,6 +1183,7 @@ function TabIcon({
 			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
 		);
 	} else if (tab.type === "subagent") icon = <IconRobot size={size} color={iconColor} />;
+	else if (tab.type === "group") icon = <IconUsers size={size} color={iconColor} />;
 	else {
 		icon = filledStatus ? (
 			<IconMessageCircleFilled size={size} color={iconColor} />
@@ -1261,6 +1281,9 @@ export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	}
 	if (tab.type === "workspace") {
 		return pathname === `/narrators/workspace/${tab.id}`;
+	}
+	if (tab.type === "group") {
+		return pathname === `/groups/${tab.id}`;
 	}
 	// narrator and subagent both route to /narrators/:id
 	return pathname === `/narrators/${tab.id}`;
@@ -1547,7 +1570,9 @@ const SortableTabItem = React.memo(function SortableTabItem({
 				? `/narrators/${tab.narratorId}`
 				: tab.type === "workspace"
 					? `/narrators/workspace/${tab.id}`
-					: `/narrators/${tab.id}`;
+					: tab.type === "group"
+						? `/groups/${tab.id}`
+						: `/narrators/${tab.id}`;
 	const iconColor = getRecentTabIconColor(tab);
 	const filledStatus = isFilledRecentTabStatus(tab);
 
@@ -1923,7 +1948,7 @@ function TabContextMenu({
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay */}
 			<div
-				style={{ position: "fixed", inset: 0, zIndex: 999 }}
+				style={{ position: "fixed", inset: 0, zIndex: Z.contextMenuBackdrop }}
 				onClick={onClose}
 				onContextMenu={(e) => {
 					e.preventDefault();
@@ -1940,7 +1965,7 @@ function TabContextMenu({
 					position: "fixed",
 					left: x,
 					top: y,
-					zIndex: 1000,
+					zIndex: Z.contextMenu,
 					minWidth: 140,
 				}}
 			>

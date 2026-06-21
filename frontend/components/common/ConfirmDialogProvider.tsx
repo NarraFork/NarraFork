@@ -1,6 +1,7 @@
 import { Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { createContext, type ReactNode, useCallback, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 
 interface ConfirmOptions {
 	message: ReactNode;
@@ -52,7 +53,7 @@ export function ConfirmDialogProvider({ children }: { children: ReactNode }) {
 				title={pending?.title ?? t("confirmTitle")}
 				size="sm"
 				centered
-				zIndex={1000}
+				zIndex={Z.modal}
 			>
 				{pending && (
 					<Stack>

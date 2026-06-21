@@ -22,7 +22,6 @@ import {
 import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
-	IconArrowsMinimize,
 	IconBan,
 	IconCheck,
 	IconChevronDown,
@@ -51,6 +50,7 @@ import {
 	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
+	IconUsers,
 	IconWand,
 	IconWorldSearch,
 	IconWorldWww,
@@ -83,8 +83,10 @@ import { ApiError, api, getToken, readFetchError, type SideCarRecord } from "../
 import { formatDurationText } from "../../lib/format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
+import { Z } from "../../lib/z-index";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { AutoFollowScroll } from "./AutoFollowScroll";
+import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
 import { LazyCollapse } from "./LazyCollapse";
@@ -234,6 +236,8 @@ export interface ToolCallData {
 	errorMessage?: string;
 	permissionDenyMessage?: string | null;
 	permissionDecisionReason?: string | null;
+	/** Who decided this permission. `narrator:<id>` marks a proxy approval by a controlling named narrator. */
+	permissionDecidedBy?: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	permissionSuggestions?: any[] | null;
 	/** Timestamp (Date.now()) when the tool started running — used for live elapsed timer */
@@ -284,8 +288,6 @@ interface ToolCallCardProps {
 	onQuestionDeny?: (requestId: string) => void;
 	/** Force expand this card from outside (e.g. when navigating to it) */
 	forceExpand?: boolean;
-	/** Override expand state for edit tools (true=expand all, false=collapse all, undefined=default) */
-	editExpandOverride?: boolean | null;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
 }
@@ -1564,6 +1566,13 @@ const ToolHeader = memo(
 						</Text>
 					))
 				)}
+				{toolCall.permissionDecidedBy?.startsWith("narrator:") && (
+					<Tooltip label={t("proxyApprovedTooltip")}>
+						<Badge size="xs" variant="light" color="grape" leftSection={<IconUsers size={10} />}>
+							{t("proxyApprovedBadge")}
+						</Badge>
+					</Tooltip>
+				)}
 			</Group>
 		);
 
@@ -2048,7 +2057,7 @@ function EditDiffBlock({
 					{filePath}
 				</Text>
 			)}
-			<Box pos="relative">
+			<Box pos="relative" style={{ isolation: "isolate" }}>
 				<ContentViewer
 					content={content}
 					title={title}
@@ -4946,7 +4955,6 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		prev.inRun !== next.inRun ||
 		prev.isLast !== next.isLast ||
 		prev.forceExpand !== next.forceExpand ||
-		prev.editExpandOverride !== next.editExpandOverride ||
 		prev.blockIndex !== next.blockIndex ||
 		prev.pendingPermission !== next.pendingPermission ||
 		prev.onPermissionDecision !== next.onPermissionDecision ||
@@ -4970,7 +4978,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	onQuestionReflect,
 	onQuestionDeny,
 	forceExpand,
-	editExpandOverride,
 	blockIndex,
 }: ToolCallCardProps) {
 	const cat = getCategory(toolCall.toolName);
@@ -5120,11 +5127,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	useEffect(() => {
 		if (forceExpand) setOpened(true);
 	}, [forceExpand]);
-
-	// Respond to global edit expand/collapse override
-	useEffect(() => {
-		if (isEdit && editExpandOverride != null) setOpened(editExpandOverride);
-	}, [isEdit, editExpandOverride]);
 
 	const isRunning =
 		toolCall.status === "running" ||
@@ -5321,15 +5323,12 @@ export const ToolCallCard = memo(function ToolCallCard({
 				</Menu.Item>
 			)}
 			{msgCtx.onCompactBeforeMessage && (
-				<Menu.Item
-					leftSection={<IconArrowsMinimize size={14} />}
-					onClick={() => {
-						msgCtx.onCompactBeforeMessage?.();
-						swipe.closeSwipe();
-					}}
-				>
-					{tNarrator("contextMenu_compactBefore")}
-				</Menu.Item>
+				<CompactMenuSub
+					onCompact={msgCtx.onCompactBeforeMessage}
+					onClearContext={msgCtx.onClearContextBefore}
+					onManualSummarize={msgCtx.onManualSummarize}
+					onClose={() => swipe.closeSwipe()}
+				/>
 			)}
 			{msgCtx.onDeleteBlock && blockIndex != null && (
 				<Menu.Item
@@ -5415,7 +5414,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 						left: pos.left,
 						top: pos.top,
 						transform: "translateY(-50%)",
-						zIndex: 1000,
+						zIndex: Z.popover,
 						transition: swipe.swipeMenuTransition,
 						pointerEvents: swipe.swipeClosing ? "none" : "auto",
 					}}

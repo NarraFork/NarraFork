@@ -14,7 +14,6 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
-	IconArrowsMinimize,
 	IconChevronDown,
 	IconChevronRight,
 	IconCloudOff,
@@ -33,8 +32,10 @@ import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
 import { formatDurationText } from "../../lib/format";
+import { Z } from "../../lib/z-index";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId } from "./blur-in-ids";
+import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import { LazyCollapse } from "./LazyCollapse";
 
@@ -229,7 +230,6 @@ export interface SubagentCardProps {
 	isLast?: boolean;
 	isSoleInRun?: boolean;
 	permCb?: PermissionCallbacks;
-	editExpandOverride?: boolean | null;
 	onViewSubagentSession?: (narratorId: string) => void;
 	/** Block index within the parent message's contentJson array */
 	blockIndex?: number;
@@ -244,7 +244,6 @@ export const SubagentCard = memo(
 		isLast,
 		isSoleInRun,
 		permCb,
-		editExpandOverride,
 		onViewSubagentSession,
 		blockIndex,
 	}: SubagentCardProps) {
@@ -661,15 +660,12 @@ export const SubagentCard = memo(
 					</Menu.Item>
 				)}
 				{parentMsgCtx.onCompactBeforeMessage && (
-					<Menu.Item
-						leftSection={<IconArrowsMinimize size={14} />}
-						onClick={() => {
-							parentMsgCtx.onCompactBeforeMessage?.();
-							swipe.closeSwipe();
-						}}
-					>
-						{t("contextMenu_compactBefore")}
-					</Menu.Item>
+					<CompactMenuSub
+						onCompact={parentMsgCtx.onCompactBeforeMessage}
+						onClearContext={parentMsgCtx.onClearContextBefore}
+						onManualSummarize={parentMsgCtx.onManualSummarize}
+						onClose={() => swipe.closeSwipe()}
+					/>
 				)}
 				{parentMsgCtx.onDeleteBlock && blockIndex != null && (
 					<Menu.Item
@@ -910,7 +906,6 @@ export const SubagentCard = memo(
 																				childMessages={subCh ?? []}
 																				narratorId={narratorId}
 																				permCb={permCb}
-																				editExpandOverride={editExpandOverride}
 																				onViewSubagentSession={onViewSubagentSession}
 																			/>
 																		</div>
@@ -975,7 +970,6 @@ export const SubagentCard = memo(
 																							onQuestionSubmit={permCb?.onQuestionSubmit}
 																							onQuestionReflect={permCb?.onQuestionReflect}
 																							onQuestionDeny={permCb?.onQuestionDeny}
-																							editExpandOverride={editExpandOverride}
 																						/>
 																					</div>
 																				</BlurInOnAppear>
@@ -1013,7 +1007,6 @@ export const SubagentCard = memo(
 																				onQuestionSubmit={permCb?.onQuestionSubmit}
 																				onQuestionReflect={permCb?.onQuestionReflect}
 																				onQuestionDeny={permCb?.onQuestionDeny}
-																				editExpandOverride={editExpandOverride}
 																			/>
 																		</div>
 																	</BlurInOnAppear>,
@@ -1068,7 +1061,7 @@ export const SubagentCard = memo(
 							left: pos.left,
 							top: pos.top,
 							transform: "translateY(-50%)",
-							zIndex: 1000,
+							zIndex: Z.popover,
 							transition: swipe.swipeMenuTransition,
 							pointerEvents: swipe.swipeClosing ? "none" : "auto",
 							opacity: swipe.swipeClosing ? 0 : 1,
@@ -1200,7 +1193,6 @@ export const SubagentCard = memo(
 		prev.inRun === next.inRun &&
 		prev.isLast === next.isLast &&
 		prev.isSoleInRun === next.isSoleInRun &&
-		prev.editExpandOverride === next.editExpandOverride &&
 		prev.onViewSubagentSession === next.onViewSubagentSession &&
 		prev.permCb?.pendingPermsMap === next.permCb?.pendingPermsMap,
 );

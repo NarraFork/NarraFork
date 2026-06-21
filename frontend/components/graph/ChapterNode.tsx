@@ -198,6 +198,7 @@ function ChapterNodeInner({ data, id }: NodeProps) {
 					borderWidth: isRoot ? 2 : 1,
 					opacity: isFrozen ? 0.6 : 1,
 					position: "relative",
+					isolation: "isolate",
 					display: "flex",
 					flexDirection: "column",
 					overflow: "hidden",

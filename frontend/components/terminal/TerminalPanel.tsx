@@ -18,6 +18,7 @@ import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useTerminalWS } from "../../hooks/useTerminalWS";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
+import { Z } from "../../lib/z-index";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { setupOsc52Handler } from "./osc52-handler";
 import { type Modifiers, TerminalAuxKeys } from "./TerminalAuxKeys";
@@ -872,6 +873,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						backgroundColor: themeBg,
 						padding: 4,
 						position: "relative",
+						isolation: "isolate",
 						overscrollBehavior: "contain",
 					}}
 				>
@@ -927,7 +929,7 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 								position: "fixed",
 								top: Math.max(4, pastePopover.top - 40),
 								left: Math.max(4, Math.min(window.innerWidth - 160, pastePopover.left)),
-								zIndex: 1000,
+								zIndex: Z.popover,
 							}}
 						>
 							<Group gap={4}>

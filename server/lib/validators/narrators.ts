@@ -12,6 +12,21 @@ const dangerReflectionOverrideSchema = z.enum([
 	"strict",
 ]);
 
+/**
+ * Handle for "named narrators": globally-unique, human-friendly mention target.
+ * Stored lowercase. Allowed chars: a-z 0-9 _ - (must start with a letter/digit).
+ * Length 2-32. Case-insensitive (normalized to lowercase here).
+ */
+export const narratorHandleSchema = z
+	.string()
+	.trim()
+	.min(2)
+	.max(32)
+	.transform((s) => s.toLowerCase())
+	.refine((s) => /^[a-z0-9][a-z0-9_-]*$/.test(s), {
+		message: "handle must start with a letter or digit and contain only a-z, 0-9, _ or -",
+	});
+
 export const createNarratorSchema = z.object({
 	chapterId: z.string().min(1).nullish(),
 	type: z.enum(["primary"]).optional(),
@@ -25,6 +40,16 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	// Named narrator: when makeNamed is true, handle is required and the narrator
+	// gets the "named" trait. Named narrators are standalone, long-lived, and
+	// mentionable via @handle in any session.
+	makeNamed: z.boolean().optional(),
+	handle: narratorHandleSchema.optional(),
+});
+
+/** Update a narrator's handle (rename / claim / clear a named narrator handle). */
+export const updateNarratorHandleSchema = z.object({
+	handle: narratorHandleSchema.nullable(),
 });
 
 export const codexDefaultReasoningEffortSchema = z.object({

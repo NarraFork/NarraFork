@@ -101,7 +101,7 @@ export const updateUserPreferencesSchema = z.object({
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 
 export const recentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent"]),
+	type: z.enum(["chapter", "narrator", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 	narratorId: z.string().min(1).max(50).optional(),
 	parentNarratorId: z.string().min(1).max(50).optional(),
@@ -119,7 +119,7 @@ export const upsertRecentTabSchema = recentTabSchema.extend({
 });
 
 export const removeRecentTabSchema = z.object({
-	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent"]),
+	type: z.enum(["chapter", "narrator", "session", "project", "workspace", "subagent", "group"]),
 	id: z.string().min(1).max(50),
 });
 
@@ -143,6 +143,11 @@ export const clearRecentTabsSchema = z.object({
 	scope: z.enum(["all", "projects", "inactive_narrators"]),
 	/** Optional tab key ("type:id") to keep even if it would otherwise be cleared */
 	keepTabKey: z.string().optional(),
+});
+
+export const restoreRecentTabsSchema = z.object({
+	/** Full recent-tabs list to restore (e.g. undo a clear). Runtime-only fields are stripped. */
+	tabs: z.array(recentTabSchema).max(50),
 });
 
 // === Favorite Directories ===

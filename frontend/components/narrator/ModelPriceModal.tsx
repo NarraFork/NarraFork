@@ -1,5 +1,6 @@
 import { Badge, Group, Modal, Stack, Text } from "@mantine/core";
 import type { ModelOption } from "../../lib/constants";
+import { Z } from "../../lib/z-index";
 
 /** Format a per-1M-token RMB price, trimming trailing zeros (max 6 decimals). */
 function fmtPrice(value: number | string | undefined, unit: string): string {
@@ -74,7 +75,7 @@ export function ModelPriceModal({
 			title={model?.label ?? "模型价格"}
 			centered
 			size="md"
-			zIndex={1100}
+			zIndex={Z.modal}
 		>
 			{!model || !pricing ? (
 				<Text size="sm" c="dimmed">

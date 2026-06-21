@@ -297,6 +297,7 @@ export interface BaseContentBlock {
 	permissionDecisionReason?: string | null;
 	permissionSuggestions?: unknown[] | null;
 	permissionDecidedAt?: string | null;
+	permissionDecidedBy?: string | null;
 	tcId?: string;
 	tcCreatedAt?: string;
 	subtype?: string;

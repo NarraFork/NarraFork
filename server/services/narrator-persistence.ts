@@ -405,6 +405,62 @@ export const narratorPersistence = {
 		return { ...msg, seq };
 	},
 
+	/**
+	 * Insert an empty compact marker positioned *before* the given message, so
+	 * subsequent context builds start fresh from that point (discarding earlier
+	 * context) without running an AI summary. Mirrors `clearContext` but anchors
+	 * the marker at a specific message instead of appending at the end.
+	 */
+	async clearContextBefore(narratorId: string, beforeMessageId: string) {
+		const id = generateId();
+		const now = new Date().toISOString();
+
+		const [msg] = await db
+			.insert(narratorMessages)
+			.values({
+				id,
+				narratorId,
+				role: "system",
+				contentJson: [{ type: "compact", status: "compacted", summary: "" }],
+				contentText: "[Context cleared]",
+				createdAt: now,
+			})
+			.returning();
+
+		const seq = await db.transaction(async (tx) => {
+			const targetRef = await tx.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, beforeMessageId),
+				),
+			});
+			if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
+			await tx
+				.update(narratorMessageRefs)
+				.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gte(narratorMessageRefs.seq, targetRef.seq),
+					),
+				);
+			await tx.insert(narratorMessageRefs).values({
+				id: generateId(),
+				narratorId,
+				messageId: id,
+				seq: targetRef.seq,
+				isCompact: 1,
+			});
+			await tx
+				.update(narrators)
+				.set({ apiConversationId: null, updatedAt: now })
+				.where(eq(narrators.id, narratorId));
+			return targetRef.seq;
+		});
+
+		return { ...msg, seq };
+	},
+
 	async finalizeCompactingMessage(
 		messageId: string,
 		narratorId: string,

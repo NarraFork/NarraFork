@@ -112,7 +112,7 @@ export function useRecentTabsWS(
 		);
 
 		const globalListenerHandle: ListenerHandle = narratorWSManager.addListener(
-			{ typePrefixes: ["user:"] },
+			{ typePrefixes: ["user:", "group:"] },
 			(data) => {
 				onGlobalEventRef.current?.(data as { type: string; [key: string]: unknown });
 			},

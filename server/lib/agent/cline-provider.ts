@@ -354,6 +354,7 @@ export class ClineProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || DEFAULT_CLINE_API_BASE).replace(/\/+$/, "");
@@ -375,6 +376,7 @@ export class ClineProvider implements ProviderAdapter {
 				messages,
 				stream: true,
 			}),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {

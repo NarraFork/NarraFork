@@ -2666,17 +2666,29 @@ export async function* agentLoop(
 					}
 					if (parsed.contextUsagePercentage != null) {
 						receivedUsage = true;
-						// Estimate token count from conversation content (char-based heuristic)
+						// raw token counts. Derive the estimated prompt token count from
+						// percentage × context window (consistent with the percentage the
+						// UI shows), and estimate output tokens from the assistant text.
 						const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
-						const estimatedPromptTokens =
-							estimateTokens(JSON.stringify(history)) +
-							estimateTokens(config.systemPrompt ?? "") +
-							estimateTokens(content) +
-							estimateTokens(assistantText);
+						const clampedPct = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
+						requestContextPercent = clampedPct;
+						const estimatedPromptTokens = ctxWin
+							? Math.round((clampedPct / 100) * ctxWin)
+							: undefined;
+						const estimatedCompletionTokens = estimateTokens(assistantText);
+						// Store percent-derived usage so api_request_end reports the same
+						// estimate rather than the char-heuristic fallback below.
+						requestUsage = {
+							inputTokens: estimatedPromptTokens,
+							promptTokens: estimatedPromptTokens,
+							completionTokens: estimatedCompletionTokens,
+						};
 						yield {
 							type: "context_usage",
 							percentage: parsed.contextUsagePercentage,
 							promptTokens: estimatedPromptTokens,
+							inputTokens: estimatedPromptTokens,
+							completionTokens: estimatedCompletionTokens,
 							contextWindow: ctxWin ?? undefined,
 							isEstimated: true,
 						};

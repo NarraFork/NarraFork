@@ -1,6 +1,7 @@
 import { Badge, Group, Paper, ScrollArea, Stack, Text } from "@mantine/core";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 import type { CommandItem, CommandParam } from "./CommandPopover";
 
 interface CommandParamHelperProps {
@@ -125,7 +126,7 @@ export function CommandParamHelper({ command, input, visible }: CommandParamHelp
 				left: 0,
 				right: 0,
 				marginBottom: 4,
-				zIndex: 999,
+				zIndex: Z.dropdown,
 			}}
 		>
 			<Stack gap={0}>

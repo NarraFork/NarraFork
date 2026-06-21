@@ -17,6 +17,8 @@
 	"clearAll": "清空",
 	"clearProjects": "清空叙事线",
 	"clearNarrators": "清空空闲叙述者",
+	"tabsCleared": "已清理 {{count}} 个标签",
+	"undo": "撤回",
 	"newNarrator": "新建会话",
 	"noRecentTabs": "暂无最近访问",
 	"closeTab": "关闭标签",
@@ -34,5 +36,9 @@
 	"requestDumpEnabledBadge": "Dump 已开启",
 	"requestDumpEnabledTooltip": "正在记录每条 AI 请求，点击跳转到设置",
 	"requestDumpErrorsOnlyTooltip": "仅记录报错 AI 请求 dump，点击跳转到设置",
-	"licenses": "开源协议"
+	"licenses": "开源协议",
+	"groupChat": "群聊",
+	"groups": "群聊",
+	"groupCreatedTitle": "已创建群聊",
+	"groupCreatedMessage": "已创建 {{title}}，点击进入。"
 }

@@ -68,6 +68,7 @@ import {
 	drainCompletedBackgroundSubagents,
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
+import { drainGroupMessagesForNarrator, formatGroupMessages } from "./chat-group-queue";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import {
@@ -1617,6 +1618,16 @@ export async function runAgentLoop(
 							target: "user_message",
 							source: "bg_bash",
 							content: lines.join("\n\n"),
+						});
+					}
+
+					// Drain queued chat-group messages (delivered to a working narrator)
+					const groupMsgs = drainGroupMessagesForNarrator(narratorId);
+					if (groupMsgs.length > 0) {
+						sideCars.push({
+							target: "user_message",
+							source: "group_message",
+							content: formatGroupMessages(groupMsgs),
 						});
 					}
 
@@ -4735,6 +4746,7 @@ export {
 	updateBufferedMessage,
 } from "./narrator-buffer";
 export {
+	cancelCompact,
 	compactLocks,
 	isCompactInProgress,
 	markCompactAsBlocking,

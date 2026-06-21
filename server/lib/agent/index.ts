@@ -160,6 +160,13 @@ let lastSummaryErrorBroadcast = 0;
 const SUMMARY_UNAVAILABLE_DEBOUNCE_MS = 30_000;
 const SUMMARY_GENERATE_OPTIONS: GenerateOptions = { reasoningEffort: "none" };
 
+/** Check whether an error is an abort/cancellation error. */
+function isAbortError(err: unknown): boolean {
+	if (err instanceof DOMException && err.name === "AbortError") return true;
+	if (err instanceof Error && err.name === "AbortError") return true;
+	return false;
+}
+
 /**
  * Check whether an error indicates the summary model's provider is unavailable
  * (not configured, not available, disabled, etc.).
@@ -216,14 +223,24 @@ async function broadcastSummaryError(error: string): Promise<void> {
  * Retry wrapper for summary model calls.
  * Retries transient errors with exponential backoff; immediately re-throws
  * provider-unavailable errors after broadcasting a WS event.
+ * When a `signal` is provided, retries stop as soon as it is aborted and the
+ * abort error is re-thrown without broadcasting a summary-model error.
  */
-async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
+async function withSummaryRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
 	let lastErr: unknown;
 	for (let attempt = 0; attempt <= SUMMARY_MAX_TRANSIENT_RETRIES; attempt++) {
+		if (signal?.aborted) {
+			throw new DOMException("Summary generation aborted", "AbortError");
+		}
 		try {
 			return await fn();
 		} catch (err) {
 			lastErr = err;
+			// Aborted by caller (e.g. compact cancellation) — propagate without
+			// retrying or broadcasting a summary-model error.
+			if (isAbortError(err) || signal?.aborted) {
+				throw err;
+			}
 			const errMsg = err instanceof Error ? err.message : String(err);
 			if (isSummaryProviderError(err)) {
 				logger.warn("Summary model unavailable, broadcasting to clients", {
@@ -262,20 +279,28 @@ async function withSummaryRetry<T>(fn: () => Promise<T>): Promise<T> {
  * Generate text using the summary model (with meta).
  * Retries transient errors with exponential backoff.
  * On provider-unavailable errors, broadcasts a WS event and re-throws.
+ * When `signal` is provided, the underlying request can be cancelled (e.g.
+ * when the user cancels an in-progress compact).
  */
 export async function summaryGenerate(
 	text: string,
 	systemInstruction?: string,
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
+	signal?: AbortSignal,
 ): Promise<import("./provider").GenerateMetaResult> {
-	return withSummaryRetry(() =>
-		agentGenerateWithMeta(
-			text,
-			settings.agent.summaryModel,
-			systemInstruction,
-			SUMMARY_GENERATE_OPTIONS,
-			tracking,
-		),
+	const generateOptions: GenerateOptions = signal
+		? { ...SUMMARY_GENERATE_OPTIONS, signal }
+		: SUMMARY_GENERATE_OPTIONS;
+	return withSummaryRetry(
+		() =>
+			agentGenerateWithMeta(
+				text,
+				settings.agent.summaryModel,
+				systemInstruction,
+				generateOptions,
+				tracking,
+			),
+		signal,
 	);
 }
 

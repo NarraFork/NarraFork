@@ -31,6 +31,7 @@ import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import { Z } from "../../lib/z-index";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
@@ -233,7 +234,7 @@ function WizardFab({ minimized, onRestore }: { minimized: boolean; onRestore: ()
 				onTransitionEnd={handleTransitionEnd}
 				style={{
 					position: "fixed",
-					zIndex: 1000,
+					zIndex: Z.toast,
 					bottom: atCenter ? "calc(50% - 24px)" : 24,
 					left: atCenter ? "calc(50% - 24px)" : 24,
 					transform: atCenter ? "scale(1.4)" : "scale(1)",

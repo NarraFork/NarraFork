@@ -181,6 +181,7 @@ export function resolveAllToolCallsFromMsg(
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
 			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,
+			permissionDecidedBy: block.permissionDecidedBy ?? tc?.permissionDecidedBy,
 			permissionSuggestions: block.permissionSuggestions ?? tc?.permissionSuggestions,
 			startedAt,
 			resultMessageId:

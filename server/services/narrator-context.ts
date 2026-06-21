@@ -200,6 +200,7 @@ export const narratorContext = {
 		locale: Locale = "en",
 		providedMessages?: CompactMessage[],
 		pruneBoundaryMessageId?: string | null,
+		signal?: AbortSignal,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const messages =
 			providedMessages ?? (await narratorService.getMessagesSinceLastCompact(narratorId));
@@ -276,6 +277,7 @@ export const narratorContext = {
 			baseFixedTokens,
 			tokenBudget,
 			0,
+			signal,
 		);
 	},
 
@@ -288,6 +290,7 @@ export const narratorContext = {
 		baseFixedTokens: number,
 		tokenBudget: number,
 		depth: number,
+		signal?: AbortSignal,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		let rollingSummary = initialSummary;
 		let lastContextPercent: number | undefined;
@@ -314,6 +317,7 @@ export const narratorContext = {
 				baseFixedTokens,
 				tokenBudget,
 				depth,
+				signal,
 			);
 
 			rollingSummary = result.summary;
@@ -341,6 +345,7 @@ export const narratorContext = {
 		baseFixedTokens: number,
 		tokenBudget: number,
 		depth: number,
+		signal?: AbortSignal,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		try {
 			return await this._summarizeChunk(
@@ -351,6 +356,7 @@ export const narratorContext = {
 				compactSuffix,
 				baseFixedTokens,
 				tokenBudget,
+				signal,
 			);
 		} catch (err) {
 			if (!isCompactContextOverflowError(err) || depth >= COMPACT_CONTEXT_OVERFLOW_MAX_DEPTH) {
@@ -382,6 +388,7 @@ export const narratorContext = {
 				baseFixedTokens,
 				tokenBudget,
 				depth + 1,
+				signal,
 			);
 		}
 	},
@@ -398,6 +405,7 @@ export const narratorContext = {
 		compactSuffix: string,
 		baseFixedTokens: number,
 		tokenBudget: number,
+		signal?: AbortSignal,
 	): Promise<{ summary: string; contextPercent?: number }> {
 		const previousSummaryPrefix = previousSummary
 			? `[Previous context summary]:\n${previousSummary}\n\n---\n\n`
@@ -489,11 +497,19 @@ export const narratorContext = {
 
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= COMPACT_MAX_RETRIES; attempt++) {
+			if (signal?.aborted) {
+				throw new DOMException("Compact summary aborted", "AbortError");
+			}
 			try {
-				const result = await summaryGenerate(compactUserText, compactSystemPrompt, {
-					narratorId,
-					kind: "compact",
-				});
+				const result = await summaryGenerate(
+					compactUserText,
+					compactSystemPrompt,
+					{
+						narratorId,
+						kind: "compact",
+					},
+					signal,
+				);
 				if (!result.text?.trim()) {
 					throw new Error("Compact summary model returned empty output");
 				}
@@ -503,6 +519,14 @@ export const narratorContext = {
 				};
 			} catch (err) {
 				lastError = err;
+				// Cancelled by the user — stop retrying and propagate the abort.
+				if (
+					(err instanceof DOMException && err.name === "AbortError") ||
+					(err instanceof Error && err.name === "AbortError") ||
+					signal?.aborted
+				) {
+					throw err;
+				}
 				if (isCompactContextOverflowError(err)) {
 					logger.warn("Compact summary request exceeded summary model context", {
 						narratorId,

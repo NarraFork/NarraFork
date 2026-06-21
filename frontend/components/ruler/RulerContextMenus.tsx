@@ -11,6 +11,7 @@ import {
 } from "@tabler/icons-react";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 
 /** Adjust menu position so it stays within the viewport. */
 function useMenuPosition(x: number, y: number) {
@@ -68,7 +69,7 @@ export function TickContextMenu({
 				position: "fixed",
 				left: pos.left,
 				top: pos.top,
-				zIndex: 1000,
+				zIndex: Z.contextMenu,
 				background: "light-dark(var(--mantine-color-white), var(--mantine-color-dark-6))",
 				border: "1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 				borderRadius: 8,
@@ -208,7 +209,7 @@ export function ChapterContextMenu({
 				position: "fixed",
 				left: pos.left,
 				top: pos.top,
-				zIndex: 1000,
+				zIndex: Z.contextMenu,
 				background: "light-dark(var(--mantine-color-white), var(--mantine-color-dark-6))",
 				border: "1px solid light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))",
 				borderRadius: 8,

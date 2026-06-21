@@ -3,6 +3,7 @@ import { IconPlugConnectedX, IconRefresh } from "@tabler/icons-react";
 import { useEffect, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import { getDisconnected, hasDisconnected, onWSStatusChange } from "../lib/ws-status";
+import { Z } from "../lib/z-index";
 
 function subscribe(cb: () => void) {
 	return onWSStatusChange(cb);
@@ -54,7 +55,7 @@ export function WSConnectionAlert() {
 				top: 8,
 				left: "50%",
 				transform: "translateX(-50%)",
-				zIndex: 1000,
+				zIndex: Z.toast,
 				maxWidth: 500,
 				width: "calc(100% - 32px)",
 			}}

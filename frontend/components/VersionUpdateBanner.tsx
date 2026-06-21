@@ -2,6 +2,7 @@ import { Alert, Button, Group, Text } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { useVersionCheck } from "../hooks/useVersionCheck";
+import { Z } from "../lib/z-index";
 
 export function VersionUpdateBanner() {
 	const { t } = useTranslation("common");
@@ -20,7 +21,7 @@ export function VersionUpdateBanner() {
 				top: 8,
 				left: "50%",
 				transform: "translateX(-50%)",
-				zIndex: 1000,
+				zIndex: Z.toast,
 				maxWidth: 500,
 				width: "calc(100% - 32px)",
 				borderRadius: "var(--mantine-radius-sm)",

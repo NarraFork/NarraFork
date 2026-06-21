@@ -660,6 +660,7 @@ export class NugProvider implements ProviderAdapter {
 		const body = { model: meta.routedModel, ...request };
 			method: "POST",
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {

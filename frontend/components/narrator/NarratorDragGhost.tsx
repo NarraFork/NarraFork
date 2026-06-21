@@ -5,6 +5,7 @@ import {
 	onNarratorDragEnd,
 	onNarratorDragMove,
 } from "../../lib/narrator-drag";
+import { Z } from "../../lib/z-index";
 
 /** Floating ghost that follows the cursor during a narrator drag. */
 export function NarratorDragGhost() {
@@ -27,7 +28,7 @@ export function NarratorDragGhost() {
 				position: "fixed",
 				left: state.x + 12,
 				top: state.y + 12,
-				zIndex: 10000,
+				zIndex: Z.dragGhost,
 				pointerEvents: "none",
 				maxWidth: 200,
 			}}

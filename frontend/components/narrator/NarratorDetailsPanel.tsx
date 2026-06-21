@@ -21,12 +21,13 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowLeft, IconInfoCircle, IconRefresh } from "@tabler/icons-react";
+import { IconArrowLeft, IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useBrowserSessions } from "../../hooks/useBrowserSessions";
 import { useChapter } from "../../hooks/useChapters";
+import { useNarratorGroups } from "../../hooks/useChatGroup";
 import {
 	useBlacklistDirs,
 	useClearDisabledTools,
@@ -242,6 +243,16 @@ export function NarratorDetailsPanel({
 	const { data: cmdWhitelist } = useCmdWhitelist(opened ? narratorId : "");
 	const { data: cmdBlacklist } = useCmdBlacklist(opened ? narratorId : "");
 	const { data: narratorSkills } = useNarratorSkills(narratorId, opened);
+	// Named narrators can participate in chat groups — surface them here.
+	// biome-ignore lint/suspicious/noExplicitAny: narrator is loosely typed (ApiEntity)
+	const isNamed = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: loose
+			((narrator as any).traits as string[]).includes("named")
+		: false;
+	const { data: narratorGroupsData } = useNarratorGroups(
+		opened && isNamed ? narratorId : undefined,
+	);
+	const narratorGroups = narratorGroupsData?.groups ?? [];
 	const refreshNarratorSkillsMutation = useRefreshNarratorSkills();
 
 	const resolvedModel =
@@ -657,6 +668,31 @@ export function NarratorDetailsPanel({
 					/>
 				) : null}
 			</DetailSection>
+
+			{isNamed ? (
+				<DetailSection title={t("details.groups")}>
+					{narratorGroups.length === 0 ? (
+						<Text size="sm" c="dimmed">
+							{t("details.groupsEmpty")}
+						</Text>
+					) : (
+						<Stack gap="xs">
+							{narratorGroups.map((g) => (
+								<Button
+									key={g.id}
+									variant="default"
+									size="xs"
+									justify="flex-start"
+									leftSection={<IconUsers size={14} />}
+									onClick={() => navigate({ to: "/groups/$groupId", params: { groupId: g.id } })}
+								>
+									{g.title || t("details.groupUntitled")}
+								</Button>
+							))}
+						</Stack>
+					)}
+				</DetailSection>
+			) : null}
 
 			<DetailSection title={t("details.skills")}>
 				<Group justify="space-between" align="flex-start" gap="sm">

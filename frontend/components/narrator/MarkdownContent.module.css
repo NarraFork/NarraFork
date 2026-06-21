@@ -67,6 +67,7 @@
 
 .codeBlock {
 	position: relative;
+	isolation: isolate;
 	margin-top: 0.35em;
 	margin-bottom: 0;
 	min-width: 0;

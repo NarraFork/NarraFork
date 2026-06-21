@@ -1,5 +1,6 @@
 import { Divider, Paper, Stack, Text, UnstyledButton } from "@mantine/core";
 import { useTranslation } from "react-i18next";
+import { Z } from "../../lib/z-index";
 
 interface TerminalContextMenuProps {
 	x: number;
@@ -28,7 +29,7 @@ export function TerminalContextMenu({
 		<>
 			{/* biome-ignore lint/a11y/noStaticElementInteractions: backdrop overlay to capture clicks */}
 			<div
-				style={{ position: "fixed", inset: 0, zIndex: 999 }}
+				style={{ position: "fixed", inset: 0, zIndex: Z.contextMenuBackdrop }}
 				onClick={onClose}
 				onContextMenu={(e) => {
 					e.preventDefault();
@@ -45,7 +46,7 @@ export function TerminalContextMenu({
 					position: "fixed",
 					left: x,
 					top: y,
-					zIndex: 1000,
+					zIndex: Z.contextMenu,
 					minWidth: 180,
 				}}
 			>
