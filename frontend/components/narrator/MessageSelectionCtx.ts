@@ -43,6 +43,26 @@ export function shouldIgnoreMessageBlockSelection(target: EventTarget | null): b
  */
 export const NestedBlockCtx = createContext<string | null>(null);
 
+export interface BlockMeta {
+	blockId: string;
+	messageId: string;
+	blockIndex: number;
+}
+
+export interface CollectedSelectedText {
+	text: string;
+	truncated: boolean;
+}
+
+export type MaybePromise<T> = T | Promise<T>;
+
+export interface MessageSelectionResolver {
+	resolveRange?: (anchorBlockId: string, targetBlockId: string) => MaybePromise<Set<string> | null>;
+	resolveSelectedMeta?: (selectedIds: Set<string>) => BlockMeta[];
+	resolveSelectedMessageIds?: (selectedIds: Set<string>) => string[];
+	collectSelectedText?: (selectedIds: Set<string>) => CollectedSelectedText;
+}
+
 export interface MessageSelectionState {
 	selectionMode: boolean;
 	selectedBlockIds: Set<string>;
@@ -53,12 +73,11 @@ export interface MessageSelectionState {
 	rangeSelectTo: (blockId: string) => void;
 }
 
-export interface CollectedSelectedText {
-	text: string;
-	truncated: boolean;
-}
+export const MAX_COLLECTED_SELECTED_TEXT_CHARS = 200_000;
 
-const MAX_COLLECTED_SELECTED_TEXT_CHARS = 200_000;
+export function makeMessageBlockSelectionId(messageId: string, blockIndex: number): string {
+	return `msg-${messageId}-${blockIndex}`;
+}
 
 const DEFAULT_STATE: MessageSelectionState = {
 	selectionMode: false,
@@ -114,12 +133,6 @@ export function resolveBlockRange(
 // ---------------------------------------------------------------------------
 // DOM helpers for batch operations — extract metadata from selected blocks.
 // ---------------------------------------------------------------------------
-
-export interface BlockMeta {
-	blockId: string;
-	messageId: string;
-	blockIndex: number;
-}
 
 /**
  * Walk the container's `[data-block-id]` elements in DOM order and return

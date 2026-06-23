@@ -6,6 +6,7 @@ import type {
 	NUGProviderConfig,
 	SearchChannelConfig,
 } from "../settings/types";
+import { executeCustomSearchProvider, isCustomSearchProviderUsable } from "./adapters";
 import { supportsNativeSearch } from "./native";
 import {
 	DEFAULT_SEARCH_MAX_OUTPUT_CHARS,
@@ -14,12 +15,7 @@ import {
 	SEARCH_NATIVE_CHANNEL_ID,
 } from "./settings";
 import { isAbortError, withSearchTimeout } from "./timeout";
-import type {
-	SearchChannelResult,
-	SearchExecutionResult,
-	SearchRequest,
-	SearchResultItem,
-} from "./types";
+import type { SearchChannelResult, SearchExecutionResult, SearchRequest } from "./types";
 
 function textFromMcpResponse(response: McpResponse): { text: string; isError?: boolean } {
 	if (response.error) {
@@ -72,18 +68,6 @@ function findCustomProvider(
 	);
 }
 
-function searchPayload(request: SearchRequest): Record<string, unknown> {
-	return {
-		query: request.query,
-		...(request.purpose ? { purpose: request.purpose } : {}),
-		...(request.allowedDomains?.length ? { allowedDomains: request.allowedDomains } : {}),
-		...(request.blockedDomains?.length ? { blockedDomains: request.blockedDomains } : {}),
-		...(request.recencyDays != null ? { recencyDays: request.recencyDays } : {}),
-		...(request.maxResults != null ? { maxResults: request.maxResults } : {}),
-		...(request.locale ? { locale: request.locale } : {}),
-	};
-}
-
 async function nugMcpSearch(
 	channel: SearchChannelConfig,
 	request: SearchRequest,
@@ -134,86 +118,6 @@ async function nugMcpSearch(
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
-}
-
-function normalizeCustomApiResponse(body: unknown): { text: string; results?: SearchResultItem[] } {
-	if (typeof body === "string") return { text: body };
-	if (!body || typeof body !== "object") return { text: "No results found" };
-	const data = body as Record<string, unknown>;
-	if (Array.isArray(data.content)) {
-		const text = data.content
-			.filter(
-				(content): content is { type: string; text: string } =>
-					typeof content === "object" &&
-					content !== null &&
-					(content as { type?: unknown }).type === "text" &&
-					typeof (content as { text?: unknown }).text === "string",
-			)
-			.map((content) => content.text)
-			.join("\n\n");
-		return { text: text || "No results found" };
-	}
-	const results = Array.isArray(data.results)
-		? data.results
-				.filter(
-					(item): item is Record<string, unknown> => typeof item === "object" && item !== null,
-				)
-				.map((item) => ({
-					title: typeof item.title === "string" ? item.title : undefined,
-					url: typeof item.url === "string" ? item.url : undefined,
-					snippet: typeof item.snippet === "string" ? item.snippet : undefined,
-					publishedAt: typeof item.publishedAt === "string" ? item.publishedAt : undefined,
-					source: typeof item.source === "string" ? item.source : undefined,
-				}))
-		: undefined;
-	const answer = typeof data.answer === "string" ? data.answer : undefined;
-	const text =
-		answer ??
-		results
-			?.map((item, index) => {
-				const title = item.title ?? item.url ?? `Result ${index + 1}`;
-				const url = item.url ? `\n${item.url}` : "";
-				const snippet = item.snippet ? `\n${item.snippet}` : "";
-				return `${title}${url}${snippet}`;
-			})
-			.join("\n\n") ??
-		"No results found";
-	return { text, results };
-}
-
-async function customApiSearch(
-	channel: SearchChannelConfig,
-	request: SearchRequest,
-	signal: AbortSignal,
-): Promise<SearchChannelResult> {
-	const provider = findCustomProvider(channel);
-	if (!provider || provider.disabled || !provider.baseUrl) {
-		throw new Error("Custom search provider is not configured or is disabled");
-	}
-	const baseUrl = provider.baseUrl.replace(/\/+$/, "");
-	const headers: Record<string, string> = {
-		"Content-Type": "application/json",
-		...(provider.headers ?? {}),
-	};
-	if (provider.apiKey) headers.Authorization = headers.Authorization ?? `Bearer ${provider.apiKey}`;
-	const response = await fetch(`${baseUrl}/v1/search`, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(searchPayload(request)),
-		signal,
-	});
-	if (!response.ok) {
-		const errText = await response.text().catch(() => "");
-		throw new Error(`Custom search API error ${response.status}: ${errText}`);
-	}
-	const parsed = normalizeCustomApiResponse(await response.json());
-	return {
-		channelId: channel.id,
-		channelLabel: channelLabel(channel),
-		text: parsed.text,
-		results: parsed.results,
-		sources: parsed.results,
-	};
 }
 
 	channel: SearchChannelConfig,
@@ -275,7 +179,14 @@ async function searchSubagent(
 }
 
 function channelTimeout(channel: SearchChannelConfig): number {
-	return channel.timeoutMs ?? settings.search?.defaultTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS;
+	const providerTimeout =
+		channel.kind === "custom-api" ? findCustomProvider(channel)?.timeoutMs : undefined;
+	return (
+		channel.timeoutMs ??
+		providerTimeout ??
+		settings.search?.defaultTimeoutMs ??
+		DEFAULT_SEARCH_TIMEOUT_MS
+	);
 }
 
 async function runChannel(
@@ -297,12 +208,22 @@ async function runChannel(
 				request.signal,
 				channelTimeout(channel),
 			);
-		case "custom-api":
+		case "custom-api": {
+			const provider = findCustomProvider(channel);
+			if (!provider) throw new Error("Custom search provider is not configured");
 			return withSearchTimeout(
 				request.signal,
-				(signal) => customApiSearch(channel, request, signal),
+				(signal) =>
+					executeCustomSearchProvider({
+						channel,
+						channelLabel: channelLabel(channel),
+						provider,
+						request,
+						signal,
+					}),
 				channelTimeout(channel),
 			);
+		}
 		case "subagent":
 			return searchSubagent(channel, request);
 		case "native":
@@ -321,7 +242,7 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 		}
 		case "custom-api": {
 			const provider = findCustomProvider(channel);
-			return !!provider && !provider.disabled && !!provider.baseUrl;
+			return isCustomSearchProviderUsable(provider);
 		}
 		case "subagent":
 			return isSubagentChannelUsable(channel);

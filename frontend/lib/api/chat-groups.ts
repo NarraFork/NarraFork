@@ -20,9 +20,11 @@ export interface ChatGroupMember {
 	role: "origin" | "named" | "participant";
 	canControl: boolean;
 	joinedAt: string;
-	/** Narrator members are hydrated with a handle/title for display (GET /:groupId). */
+	/** Narrator members are hydrated with display/status data (GET /:groupId). */
 	handle?: string | null;
 	title?: string | null;
+	status?: string | null;
+	substatus?: string[] | null;
 }
 
 export interface ChatGroupMessage {

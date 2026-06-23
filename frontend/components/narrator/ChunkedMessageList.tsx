@@ -1,190 +1,1425 @@
 import { Box } from "@mantine/core";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { notifications } from "@mantine/notifications";
+import {
+	forwardRef,
+	isValidElement,
+	memo,
+	type RefObject,
+	useCallback,
+	useEffect,
+	useImperativeHandle,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
+import { api } from "../../lib/api";
+import { resolveScrollTargetIndex } from "./chunk-scroll-utils";
 import { renderTreeMessages } from "./MessageRenderer";
-import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
-import { useNarratorChunks } from "./useNarratorChunks";
+import {
+	type BlockMeta,
+	type CollectedSelectedText,
+	MAX_COLLECTED_SELECTED_TEXT_CHARS,
+	type MessageSelectionResolver,
+	makeMessageBlockSelectionId,
+} from "./MessageSelectionCtx";
+import { filterChildrenByToolUse } from "./message-segments";
+import { findMsgByToolUseIdInTree } from "./message-tree-utils";
+import {
+	type ContentBlock,
+	type NarratorMsg,
+	type PermissionCallbacks,
+	STREAMING_CHUNKS_MSG_ID,
+} from "./narrator-panel-types";
+import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
+import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
 
 /**
- * Phase 0 verification skeleton for the chunk-virtualized message list.
+ * Chunk-virtualized message list (route 1: manifest-driven).
  *
- * Goal: measure (1) manifest query cost and (2) DOM node count + browser scroll
- * anchoring behavior when mounting ±3 chunks (worst case: chunks with large
- * subagent trees), across browsers including iOS Safari.
+ * The full chunk set comes from the manifest, so the scroll container is sized
+ * to the entire history and the native scrollbar maps to real positions. Chunk
+ * content is loaded sparsely on demand; the visible window (center ±
+ * PRELOAD_DISTANCE) is mounted as real DOM, everything else is a height spacer.
  *
- * Deliberately minimal: native scrollbar, no custom scrollbar, no
- * chunks_dirty reconciliation, no safe-boundary segmentation. Render chunks
- * are derived by slicing the contiguous loaded messages on CHUNK_SIZE
- * boundaries from the manifest's seq ranges.
+ * Scrollbar jumps (drag) are handled by binary-searching the cumulative chunk
+ * heights to find the chunk under the viewport, jumping the center there, and
+ * ensuring that band's content is loaded — which per-chunk advancement alone
+ * could not do.
  *
- * Three-section layout:
- *   [top spacer: Σ heights of unmounted chunks above]
- *   [mounted region: real renderTreeMessages output]
- *   [bottom spacer: Σ heights of unmounted chunks below]
+ * Performance:
+ *  - Each mounted chunk is a React.memo subcomponent that memoizes its
+ *    renderTreeMessages output, so scrolling never re-renders unchanged chunks.
+ *  - Heights are measured via ResizeObserver into a ref and flushed at most once
+ *    per frame, never in a measure→setState loop.
  *
- * Position stability relies on the browser's native scroll anchoring; mounting
- * /unmounting always happens ≥3 chunks away from the viewport, so the anchor
- * node stays visible and the browser compensates for height changes above it.
+ * Position stability on prepend/mount relies on native scroll anchoring; mount/
+ * unmount happens ≥PRELOAD_DISTANCE chunks from the viewport.
  */
 
-const CHUNK_SIZE = 20;
 const PRELOAD_DISTANCE = 3;
-const ESTIMATED_CHUNK_HEIGHT = 20 * 120; // 20 msgs × ~120px rough seed
+const DATA_RETAIN_DISTANCE = 10;
+const PER_MESSAGE_ESTIMATE = 120; // px, rough seed for unmeasured chunks
+const BOTTOM_PIN_THRESHOLD = 48;
+const FOLLOW_USER_SCROLL_UP_TOLERANCE = 2;
+const JUMP_LOAD_RADIUS = 3;
+const SOFT_RANGE_SELECT_CHUNKS = 30;
+const HARD_RANGE_SELECT_CHUNKS = 120;
+/** Matches BroadMessageList ITEM_GAP / previous Stack gap="sm". */
+const ITEM_GAP = 12;
+const CONTENT_PADDING = "var(--mantine-spacing-md) var(--mantine-spacing-md) 0";
 
-interface RenderChunk {
-	id: string;
-	startSeq: number;
-	messages: NarratorMsg[];
+type ResolvePermFn = NonNullable<Parameters<typeof renderTreeMessages>[21]>;
+type ExternalScrollRef = RefObject<HTMLElement | null> | ((node: HTMLDivElement | null) => void);
+interface FollowTailOptions {
+	force?: boolean;
+	immediate?: boolean;
 }
+
+function getScrollBottomTarget(el: HTMLElement): number {
+	return Math.max(0, el.scrollHeight - el.clientHeight);
+}
+
+function getDistanceFromBottom(el: HTMLElement): number {
+	return Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+}
+
+export interface ChunkedMessageListHandle {
+	scrollToMessageTarget: (args: {
+		domIds: string[];
+		targetIds: string[];
+		highlightId?: string;
+	}) => void;
+	scrollToBottom: (instant?: boolean) => void;
+	refreshStructure: (mode?: "diff" | "full") => void;
+}
+
+export interface ChunkTailMeta {
+	lastRealMessage: { id: string; role: NarratorMsg["role"] } | null;
+	lastUserMessageId?: string;
+}
+
+function isErrorSystemMessage(msg: NarratorMsg): boolean {
+	return (
+		msg.role === "system" &&
+		Array.isArray(msg.contentJson) &&
+		msg.contentJson.some((block: { type?: unknown }) => block?.type === "error")
+	);
+}
+
+function buildChunkTailMeta(chunks: ChunkData[]): ChunkTailMeta {
+	let lastRealMessage: ChunkTailMeta["lastRealMessage"] = null;
+	let lastUserMessageId: string | undefined;
+	for (let chunkIndex = chunks.length - 1; chunkIndex >= 0; chunkIndex--) {
+		const messages = chunks[chunkIndex]?.messages;
+		if (!messages?.length) continue;
+		for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+			const msg = messages[messageIndex] as NarratorMsg;
+			const id = typeof msg.id === "string" ? msg.id : undefined;
+			if (!id) continue;
+			if (!lastRealMessage && id !== STREAMING_CHUNKS_MSG_ID && !isErrorSystemMessage(msg)) {
+				lastRealMessage = { id, role: msg.role };
+			}
+			if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
+				lastUserMessageId = id;
+			}
+			if (lastRealMessage && lastUserMessageId) return { lastRealMessage, lastUserMessageId };
+		}
+	}
+	return { lastRealMessage, lastUserMessageId };
+}
+
+function assignExternalRef<T>(
+	ref: RefObject<T | null> | ((node: T | null) => void) | undefined,
+	node: T | null,
+) {
+	if (!ref) return;
+	if (typeof ref === "function") {
+		ref(node);
+		return;
+	}
+	(ref as { current: T | null }).current = node;
+}
+
+function assignScrollRef(ref: ExternalScrollRef | undefined, node: HTMLDivElement | null) {
+	if (!ref) return;
+	if (typeof ref === "function") {
+		ref(node);
+		return;
+	}
+	(ref as { current: HTMLElement | null }).current = node;
+}
+
+function findMessageById(messages: NarratorMsg[], messageId: string): NarratorMsg | null {
+	for (const msg of messages) {
+		if (msg.id === messageId) return msg;
+		if (msg.children?.length) {
+			const child = findMessageById(msg.children, messageId);
+			if (child) return child;
+		}
+	}
+	return null;
+}
+
+function getMessageSeq(msg: NarratorMsg | null | undefined): number | null {
+	const seq = msg?.seq;
+	return typeof seq === "number" && Number.isFinite(seq) ? seq : null;
+}
+
+function waitAnimationFrame(): Promise<void> {
+	return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+interface SelectionEntry extends BlockMeta {
+	seq: number;
+	chunkIndex: number;
+	copyText: string;
+}
+
+interface SelectionIndex {
+	entries: SelectionEntry[];
+	byBlockId: Map<string, SelectionEntry>;
+}
+
+function stableStringify(value: unknown, maxChars = 4000): string {
+	if (value == null) return "";
+	try {
+		const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+		return text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+	} catch {
+		return String(value);
+	}
+}
+
+function getBlockCopyText(block: ContentBlock): string {
+	if (typeof block.text === "string") return block.text;
+	if (typeof block.thinking === "string") return block.thinking;
+	if (block.type === "text_file") {
+		return [block.filename, typeof block.size === "number" ? `${block.size} bytes` : null]
+			.filter(Boolean)
+			.join(" ");
+	}
+	if (block.type === "web_search") {
+		const query = typeof block.query === "string" ? block.query : undefined;
+		const queries = Array.isArray(block.queries) ? block.queries.map(String).join(", ") : undefined;
+		return ["Web search", query ?? queries, block.status].filter(Boolean).join(": ");
+	}
+	if (block.type === "image_generation") {
+		return ["Image generation", block.revisedPrompt, block.savedPath ?? block.partialSavedPath]
+			.filter(Boolean)
+			.join("\n");
+	}
+	if (block.type === "image") return "[Image]";
+	if (block.type === "tool_use") {
+		return [`Tool: ${block.name ?? block.id ?? "unknown"}`, stableStringify(block.input)]
+			.filter(Boolean)
+			.join("\n");
+	}
+	return stableStringify(block);
+}
+
+function isSubagentTool(msg: NarratorMsg, block: ContentBlock): boolean {
+	if (block.type !== "tool_use" || typeof block.id !== "string") return false;
+	if (block.name === "Agent") return true;
+	const children = filterChildrenByToolUse(msg.children ?? [], block.id);
+	return children.length > 0;
+}
+
+function isSelectableBlock(block: ContentBlock): boolean {
+	if (block.type === "text") return !!block.text?.trim();
+	if (block.type === "reasoning" || block.type === "thinking") {
+		return !!(block.text?.trim() || block.thinking?.trim());
+	}
+	return block.type === "web_search" || block.type === "tool_use";
+}
+
+function getUserMessageCopyText(msg: NarratorMsg): string {
+	if (msg.contentText?.trim()) return msg.contentText;
+	const parts: string[] = [];
+	for (const block of (msg.contentJson ?? []) as ContentBlock[]) {
+		if (block.type === "text" && block.text?.trim()) parts.push(block.text);
+	}
+	return parts.join("\n\n");
+}
+
+function addSelectionAlias(
+	index: SelectionIndex,
+	alias: string | undefined,
+	entry: SelectionEntry,
+) {
+	if (alias) index.byBlockId.set(alias, entry);
+}
+
+function buildSelectionIndex(chunks: ChunkData[]): SelectionIndex {
+	const index: SelectionIndex = { entries: [], byBlockId: new Map() };
+	for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+		const messages = chunks[chunkIndex]?.messages ?? [];
+		for (const msg of messages) {
+			const seq = getMessageSeq(msg);
+			if (!msg.id || seq == null || !Array.isArray(msg.contentJson)) continue;
+			const userCopyText = msg.role === "user" ? getUserMessageCopyText(msg) : "";
+			for (let blockIndex = 0; blockIndex < msg.contentJson.length; blockIndex++) {
+				const block = msg.contentJson[blockIndex] as ContentBlock;
+				if (!block || typeof block !== "object") continue;
+				if (msg.role === "user" && blockIndex > 0) continue;
+				if (msg.role !== "user" && !isSelectableBlock(block)) continue;
+				const isTool = block.type === "tool_use" && typeof block.id === "string";
+				const primaryId = isTool
+					? isSubagentTool(msg, block)
+						? `sa-${block.id}`
+						: `tc-${block.id}`
+					: makeMessageBlockSelectionId(msg.id, blockIndex);
+				const entry: SelectionEntry = {
+					blockId: primaryId,
+					messageId: msg.id,
+					blockIndex,
+					seq,
+					chunkIndex,
+					copyText: msg.role === "user" ? userCopyText : getBlockCopyText(block),
+				};
+				index.entries.push(entry);
+				index.byBlockId.set(primaryId, entry);
+				index.byBlockId.set(makeMessageBlockSelectionId(msg.id, blockIndex), entry);
+				if (isTool) {
+					addSelectionAlias(index, `tc-${block.id}`, entry);
+					addSelectionAlias(index, `sa-${block.id}`, entry);
+				}
+			}
+		}
+	}
+	index.entries.sort((a, b) => a.seq - b.seq || a.blockIndex - b.blockIndex);
+	return index;
+}
+
+function entriesToBlockMeta(entries: SelectionEntry[], selectedIds: Set<string>): BlockMeta[] {
+	const seen = new Set<string>();
+	const out: BlockMeta[] = [];
+	for (const entry of entries) {
+		if (!selectedIds.has(entry.blockId)) continue;
+		const key = `${entry.messageId}:${entry.blockIndex}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push({ blockId: entry.blockId, messageId: entry.messageId, blockIndex: entry.blockIndex });
+	}
+	return out;
+}
+
+function entriesToMessageIds(entries: SelectionEntry[], selectedIds: Set<string>): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const entry of entries) {
+		if (!selectedIds.has(entry.blockId) || seen.has(entry.messageId)) continue;
+		seen.add(entry.messageId);
+		out.push(entry.messageId);
+	}
+	return out;
+}
+
+function readMountedBlockMeta(blockId: string): BlockMeta | null {
+	const nodes = document.querySelectorAll<HTMLElement>("[data-block-id]");
+	for (const node of nodes) {
+		if (node.getAttribute("data-block-id") !== blockId) continue;
+		const messageId = node.getAttribute("data-message-id");
+		const blockIndexText = node.getAttribute("data-block-index");
+		const blockIndex = blockIndexText == null ? Number.NaN : Number(blockIndexText);
+		if (!messageId || !Number.isInteger(blockIndex) || blockIndex < 0) return null;
+		return { blockId, messageId, blockIndex };
+	}
+	return null;
+}
+
+function entriesToText(entries: SelectionEntry[], selectedIds: Set<string>): CollectedSelectedText {
+	const parts: string[] = [];
+	let remaining = MAX_COLLECTED_SELECTED_TEXT_CHARS;
+	let truncated = false;
+	for (const entry of entries) {
+		if (!selectedIds.has(entry.blockId)) continue;
+		const text = entry.copyText.trim();
+		if (!text) continue;
+		const separator = parts.length > 0 ? "\n\n" : "";
+		const available = remaining - separator.length;
+		if (available <= 0) {
+			truncated = true;
+			break;
+		}
+		parts.push(separator);
+		if (text.length > available) {
+			parts.push(text.slice(0, available));
+			truncated = true;
+			break;
+		}
+		parts.push(text);
+		remaining -= separator.length + text.length;
+	}
+	return { text: parts.join(""), truncated };
+}
+
+// ── Permission keying (fine-grained, avoids re-render on unrelated perm churn) ──
+
+function collectToolUseIds(messages: NarratorMsg[], out: Set<string>): void {
+	for (const msg of messages) {
+		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		for (const b of blocks) {
+			if (b?.type === "tool_use" && typeof b.id === "string") out.add(b.id);
+		}
+		for (const tc of msg.toolCalls ?? []) {
+			if (tc.toolUseId) out.add(tc.toolUseId);
+		}
+		if (msg.children?.length) collectToolUseIds(msg.children, out);
+	}
+}
+
+function getPermissionSignature(permCb: PermissionCallbacks): string {
+	const single = permCb.pendingPermission?.toolUseId ?? "";
+	const keys = [...permCb.pendingPermsMap.keys()];
+	if (keys.length === 0 && !single) return "";
+	keys.sort();
+	return `${single}|${keys.join(",")}`;
+}
+
+function computePermKey(messages: NarratorMsg[], permCb: PermissionCallbacks): string {
+	const map = permCb.pendingPermsMap;
+	const single = permCb.pendingPermission?.toolUseId;
+	if (map.size === 0 && !single) return "";
+	const ids = new Set<string>();
+	collectToolUseIds(messages, ids);
+	if (ids.size === 0) return "";
+	const hits: string[] = [];
+	for (const id of ids) {
+		if (map.has(id) || id === single) hits.push(id);
+	}
+	if (hits.length === 0) return "";
+	hits.sort();
+	return hits.join(",");
+}
+
+// ── Mounted chunk (memoized) ───────────────────────────────────────────────
+
+interface MountedChunkProps {
+	chunkId: string;
+	messages: NarratorMsg[];
+	narratorId: string;
+	permCb: PermissionCallbacks;
+	permKey: string;
+	hasChapter?: boolean;
+	onForkFromMessage?: (uuid: string) => void;
+	highlightedId?: string | null;
+	expandedToolUseId?: string | null;
+	showTokenUsage?: boolean;
+	pruneBoundaryMessageId?: string | null;
+	pruneDividerLabel?: string;
+	onCompactBeforeMessage?: (messageId: string) => void;
+	onClearContextBefore?: (messageId: string) => void;
+	onManualSummarize?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
+	onRestoreAssistantMessage?: (messageId: string) => void;
+	lastUserMessageId?: string;
+	onViewSubagentSession?: (narratorId: string) => void;
+	resolvePerm?: ResolvePermFn;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
+	/** Synthetic streaming message injected into the tail render-chunk only. */
+	streamingMsg?: NarratorMsg | null;
+	onMeasure: (chunkId: string, height: number) => void;
+}
+
+const MountedChunk = memo(function MountedChunk({
+	chunkId,
+	messages,
+	narratorId,
+	permCb,
+	permKey,
+	hasChapter,
+	onForkFromMessage,
+	highlightedId,
+	expandedToolUseId,
+	showTokenUsage,
+	pruneBoundaryMessageId,
+	pruneDividerLabel,
+	onCompactBeforeMessage,
+	onClearContextBefore,
+	onManualSummarize,
+	onDeleteBlock,
+	onRollbackToBlock,
+	onEditAndRegenerate,
+	onEditAssistantMessage,
+	onRestoreAssistantMessage,
+	lastUserMessageId,
+	onViewSubagentSession,
+	resolvePerm,
+	onAskInPassing,
+	streamingMsg,
+	onMeasure,
+}: MountedChunkProps) {
+	const ref = useRef<HTMLDivElement>(null);
+	const onMeasureRef = useRef(onMeasure);
+	onMeasureRef.current = onMeasure;
+	const permCbRef = useRef(permCb);
+	permCbRef.current = permCb;
+
+	// Render once per stable `messages` reference; re-render only when this chunk's
+	// render-affecting props change. `permKey` captures permission relevance
+	// without making every chunk rerender on unrelated permission churn.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: permCb read via ref; permKey captures permission relevance
+	const elements = useMemo(
+		() =>
+			renderTreeMessages(
+				messages,
+				narratorId,
+				onForkFromMessage,
+				highlightedId ?? null,
+				permCbRef.current,
+				expandedToolUseId,
+				showTokenUsage,
+				pruneBoundaryMessageId,
+				pruneDividerLabel,
+				onCompactBeforeMessage,
+				onClearContextBefore,
+				onManualSummarize,
+				onDeleteBlock,
+				onRollbackToBlock,
+				onEditAndRegenerate,
+				onEditAssistantMessage,
+				onRestoreAssistantMessage,
+				lastUserMessageId,
+				hasChapter,
+				onViewSubagentSession,
+				streamingMsg ?? null,
+				resolvePerm,
+				onAskInPassing,
+				false,
+			).elements,
+		[
+			messages,
+			narratorId,
+			onForkFromMessage,
+			highlightedId,
+			permKey,
+			expandedToolUseId,
+			showTokenUsage,
+			pruneBoundaryMessageId,
+			pruneDividerLabel,
+			onCompactBeforeMessage,
+			onClearContextBefore,
+			onManualSummarize,
+			onDeleteBlock,
+			onRollbackToBlock,
+			onEditAndRegenerate,
+			onEditAssistantMessage,
+			onRestoreAssistantMessage,
+			lastUserMessageId,
+			hasChapter,
+			onViewSubagentSession,
+			streamingMsg,
+			resolvePerm,
+			onAskInPassing,
+		],
+	);
+
+	useEffect(() => {
+		const node = ref.current;
+		if (!node) return;
+		const report = () => {
+			const h = node.getBoundingClientRect().height;
+			if (h > 0) onMeasureRef.current(chunkId, h);
+		};
+		report();
+		const ro = new ResizeObserver(report);
+		ro.observe(node);
+		return () => ro.disconnect();
+	}, [chunkId]);
+
+	return (
+		<div ref={ref}>
+			{elements.map((element, index) => (
+				<div
+					key={isValidElement(element) && element.key != null ? element.key : index}
+					style={{ paddingBottom: ITEM_GAP }}
+				>
+					{element}
+				</div>
+			))}
+		</div>
+	);
+});
+
+// ── List ───────────────────────────────────────────────────────────────────
 
 interface ChunkedMessageListProps {
 	narratorId: string;
+	/** True when this list renders a subagent's OWN page (messages carry a
+	 * parentToolUseId pointing at the parent narrator's tool_use, but must be
+	 * treated as top-level here — mirrors the server's isSubagent flattening). */
+	isSubagent?: boolean;
 	permCb: PermissionCallbacks;
 	hasChapter?: boolean;
+	onForkFromMessage?: (uuid: string) => void;
+	highlightedId?: string | null;
+	highlightMessageId?: string;
+	onHighlightTarget?: (id: string, delayMs: number) => void;
+	expandedToolUseId?: string | null;
+	showTokenUsage?: boolean;
+	pruneBoundaryMessageId?: string | null;
+	pruneDividerLabel?: string;
+	onCompactBeforeMessage?: (messageId: string) => void;
+	onClearContextBefore?: (messageId: string) => void;
+	onManualSummarize?: (messageId: string) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
+	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
+	onRestoreAssistantMessage?: (messageId: string) => void;
+	lastUserMessageId?: string;
+	onViewSubagentSession?: (narratorId: string) => void;
+	resolvePerm?: ResolvePermFn;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
+	scrollRef?: ExternalScrollRef;
+	contentRef?: RefObject<HTMLDivElement | null>;
+	onSelectionResolverChange?: (resolver: MessageSelectionResolver | null) => void;
+	onAtBottomChange?: (atBottom: boolean) => void;
+	onUnreadCountChange?: (count: number) => void;
+	onTailMetaChange?: (meta: ChunkTailMeta) => void;
 }
 
-export function ChunkedMessageList({ narratorId, permCb, hasChapter }: ChunkedMessageListProps) {
-	const { state, loadOlder, loadNewer } = useNarratorChunks(narratorId);
-	const heightsRef = useRef<Map<string, number>>(new Map());
-	const [, forceRender] = useState(0);
-	const bumpRender = useCallback(() => forceRender((n) => n + 1), []);
+const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessageListProps>(
+	function ChunkedMessageList(
+		{
+			narratorId,
+			isSubagent,
+			permCb,
+			hasChapter,
+			onForkFromMessage,
+			highlightedId,
+			highlightMessageId,
+			onHighlightTarget,
+			expandedToolUseId,
+			showTokenUsage,
+			pruneBoundaryMessageId,
+			pruneDividerLabel,
+			onCompactBeforeMessage,
+			onClearContextBefore,
+			onManualSummarize,
+			onDeleteBlock,
+			onRollbackToBlock,
+			onEditAndRegenerate,
+			onEditAssistantMessage,
+			onRestoreAssistantMessage,
+			lastUserMessageId,
+			onViewSubagentSession,
+			resolvePerm,
+			onAskInPassing,
+			scrollRef,
+			contentRef,
+			onSelectionResolverChange,
+			onAtBottomChange,
+			onUnreadCountChange,
+			onTailMetaChange,
+		},
+		ref,
+	) {
+		// Follow the tail when a new message lands and the viewport is pinned to the
+		// bottom. WS can fire before React commits DOM, so the actual controller below
+		// is also driven by ResizeObserver/MutationObserver on the rendered content.
+		const scrollerRef = useRef<HTMLDivElement>(null);
+		const contentNodeRef = useRef<HTMLDivElement>(null);
+		const setScrollerNode = useCallback(
+			(node: HTMLDivElement | null) => {
+				scrollerRef.current = node;
+				assignScrollRef(scrollRef, node);
+			},
+			[scrollRef],
+		);
+		const setContentNode = useCallback(
+			(node: HTMLDivElement | null) => {
+				contentNodeRef.current = node;
+				assignExternalRef(contentRef, node);
+			},
+			[contentRef],
+		);
+		const setIsAtBottomRef = useRef<(atBottom: boolean) => void>(() => {});
+		const pinnedToBottomRef = useRef(true);
+		const followRafRef = useRef(0);
+		const followingRef = useRef(false);
+		const lastFollowScrollTopRef = useRef(0);
+		const scheduleFollowTailRef = useRef<(options?: FollowTailOptions) => void>(() => {});
+		const stopFollowTailRef = useRef<() => void>(() => {});
+		const followTail = useCallback(() => {
+			scheduleFollowTailRef.current();
+		}, []);
+		const {
+			chunks,
+			loading,
+			ensureLoaded,
+			ensureLoadedRange,
+			retainChunkRange,
+			refreshStructure,
+			streamingMsg,
+			tailChunkId,
+			setIsAtBottom,
+			unreadCount,
+			resetUnread,
+		} = useNarratorChunks(narratorId, { onTailFollow: followTail, isSubagent });
+		const tailMetaNarratorIdRef = useRef(narratorId);
+		const tailMetaSwitchingNarrator = tailMetaNarratorIdRef.current !== narratorId;
+		if (tailMetaSwitchingNarrator) tailMetaNarratorIdRef.current = narratorId;
+		const tailMeta = useMemo<ChunkTailMeta>(
+			() => (tailMetaSwitchingNarrator ? { lastRealMessage: null } : buildChunkTailMeta(chunks)),
+			[chunks, tailMetaSwitchingNarrator],
+		);
+		useEffect(() => {
+			onTailMetaChange?.(tailMeta);
+		}, [onTailMetaChange, tailMeta]);
+		const heightsRef = useRef<Map<string, number>>(new Map());
+		// Running per-message height derived from measured chunks. Unmeasured
+		// chunks are seeded with this (when available) instead of the fixed
+		// PER_MESSAGE_ESTIMATE, so tall histories (big tool outputs / subagent
+		// cards) don't systematically under-size the top spacer — which would
+		// otherwise let the scroll position bottom-out before the earliest chunks
+		// are reachable.
+		const measuredPerMsgRef = useRef<number | null>(null);
 
-	// Group the contiguous loaded messages into render chunks on CHUNK_SIZE
-	// boundaries. Chunk id = first message id (matches manifest id semantics).
-	const chunks = useMemo<RenderChunk[]>(() => {
-		const result: RenderChunk[] = [];
-		const msgs = state.messages;
-		for (let i = 0; i < msgs.length; i += CHUNK_SIZE) {
-			const slice = msgs.slice(i, i + CHUNK_SIZE);
-			if (slice.length === 0) continue;
-			result.push({
-				id: slice[0].id,
-				startSeq: slice[0].seq ?? i,
-				messages: slice,
+		const estimateHeight = useCallback((chunk: ChunkData) => {
+			const measured = heightsRef.current.get(chunk.id);
+			if (measured != null) return measured;
+			const perMsg = measuredPerMsgRef.current ?? PER_MESSAGE_ESTIMATE;
+			return chunk.count * perMsg;
+		}, []);
+
+		// Center of the mounted window, anchored by chunk ID so it survives the
+		// manifest growing/shifting. `null` = follow the tail (newest chunk).
+		const [centerChunkId, setCenterChunkId] = useState<string | null>(null);
+		const chunkIndexById = useMemo(() => {
+			const m = new Map<string, number>();
+			for (let i = 0; i < chunks.length; i++) m.set(chunks[i].id, i);
+			return m;
+		}, [chunks]);
+		const chunkIndexByIdRef = useRef(chunkIndexById);
+		chunkIndexByIdRef.current = chunkIndexById;
+		const centerIndex =
+			centerChunkId != null && chunkIndexById.has(centerChunkId)
+				? (chunkIndexById.get(centerChunkId) as number)
+				: Math.max(0, chunks.length - 1);
+
+		const mountedRange = useMemo(() => {
+			const start = Math.max(0, centerIndex - PRELOAD_DISTANCE);
+			const end = Math.min(chunks.length - 1, centerIndex + PRELOAD_DISTANCE);
+			return { start, end };
+		}, [centerIndex, chunks.length]);
+		useEffect(() => {
+			if (chunks.length === 0) return;
+			retainChunkRange(
+				Math.max(0, centerIndex - DATA_RETAIN_DISTANCE),
+				Math.min(chunks.length - 1, centerIndex + DATA_RETAIN_DISTANCE),
+			);
+		}, [centerIndex, chunks, retainChunkRange]);
+
+		// Measurement flush: write heights into ref, bump a version at most once per
+		// frame so spacer heights / prefix sums recompute without a measure loop.
+		const [heightVersion, setHeightVersion] = useState(0);
+		const flushRafRef = useRef(0);
+		const pendingFlushRef = useRef(false);
+		const onMeasure = useCallback((chunkId: string, height: number) => {
+			const prev = heightsRef.current.get(chunkId);
+			if (prev != null && Math.abs(prev - height) < 1) return;
+			heightsRef.current.set(chunkId, height);
+			// Recompute the running per-message height from all measured chunks so
+			// unmeasured chunks get a realistic estimate (see measuredPerMsgRef).
+			{
+				let totalHeight = 0;
+				let totalCount = 0;
+				const byId = chunkIndexByIdRef.current;
+				const list = chunksRef.current;
+				for (const [id, h] of heightsRef.current) {
+					const idx = byId.get(id);
+					const count = idx != null ? list[idx]?.count : undefined;
+					if (count && count > 0) {
+						totalHeight += h;
+						totalCount += count;
+					}
+				}
+				if (totalCount > 0) measuredPerMsgRef.current = totalHeight / totalCount;
+			}
+			if (pendingFlushRef.current) return;
+			pendingFlushRef.current = true;
+			flushRafRef.current = requestAnimationFrame(() => {
+				pendingFlushRef.current = false;
+				setHeightVersion((v) => v + 1);
+				if (pinnedToBottomRef.current) scheduleFollowTailRef.current();
 			});
-		}
-		return result;
-	}, [state.messages]);
+		}, []);
+		useEffect(() => () => cancelAnimationFrame(flushRafRef.current), []);
 
-	// Which chunk indices are currently mounted (real DOM). Center is the last
-	// chunk initially (tail); preload ±PRELOAD_DISTANCE around the center.
-	const [centerIndex, setCenterIndex] = useState(0);
-	useEffect(() => {
-		// On first load, center on the tail (last chunk).
-		if (chunks.length > 0) setCenterIndex(chunks.length - 1);
-	}, [chunks.length]);
+		// Prefix sums of chunk heights for O(log n) scroll→chunk lookup and exact
+		// spacer sizing. Recomputed when chunks or measured heights change.
+		// biome-ignore lint/correctness/useExhaustiveDependencies: heightVersion forces recompute after a measurement flush
+		const prefix = useMemo(() => {
+			const arr = new Array(chunks.length + 1);
+			arr[0] = 0;
+			for (let i = 0; i < chunks.length; i++) arr[i + 1] = arr[i] + estimateHeight(chunks[i]);
+			return arr as number[];
+		}, [chunks, estimateHeight, heightVersion]);
 
-	const mountedRange = useMemo(() => {
-		const start = Math.max(0, centerIndex - PRELOAD_DISTANCE);
-		const end = Math.min(chunks.length - 1, centerIndex + PRELOAD_DISTANCE);
-		return { start, end };
-	}, [centerIndex, chunks.length]);
+		const topSpacer = prefix[mountedRange.start] ?? 0;
+		const bottomSpacer = (prefix[chunks.length] ?? 0) - (prefix[mountedRange.end + 1] ?? 0);
 
-	const estimateHeight = useCallback((chunk: RenderChunk) => {
-		const measured = heightsRef.current.get(chunk.id);
-		if (measured != null) return measured;
-		return (chunk.messages.length / CHUNK_SIZE) * ESTIMATED_CHUNK_HEIGHT;
-	}, []);
+		const chunksRef = useRef(chunks);
+		chunksRef.current = chunks;
+		const prefixRef = useRef(prefix);
+		prefixRef.current = prefix;
+		const ensureLoadedRef = useRef(ensureLoaded);
+		ensureLoadedRef.current = ensureLoaded;
+		const updateAtBottom = useCallback(
+			(atBottom: boolean) => {
+				setIsAtBottom(atBottom);
+				onAtBottomChange?.(atBottom);
+			},
+			[onAtBottomChange, setIsAtBottom],
+		);
+		setIsAtBottomRef.current = updateAtBottom;
+		const stopFollowTail = useCallback(() => {
+			followingRef.current = false;
+			if (followRafRef.current) {
+				cancelAnimationFrame(followRafRef.current);
+				followRafRef.current = 0;
+			}
+		}, []);
+		stopFollowTailRef.current = stopFollowTail;
+		const setPinnedToBottom = useCallback(
+			(pinned: boolean) => {
+				pinnedToBottomRef.current = pinned;
+				updateAtBottom(pinned);
+			},
+			[updateAtBottom],
+		);
+		const scheduleFollowTail = useCallback(
+			(options: FollowTailOptions = {}) => {
+				const el = scrollerRef.current;
+				if (!el) return;
+				const force = options.force === true;
+				if (force) {
+					setCenterChunkId(null);
+					setPinnedToBottom(true);
+					resetUnread();
+					onUnreadCountChange?.(0);
+				} else if (!pinnedToBottomRef.current && getDistanceFromBottom(el) > BOTTOM_PIN_THRESHOLD) {
+					return;
+				} else {
+					setPinnedToBottom(true);
+				}
+				if (followingRef.current) {
+					if (!force) return;
+					stopFollowTail();
+				}
+				followingRef.current = true;
+				lastFollowScrollTopRef.current = el.scrollTop;
 
-	const topSpacer = useMemo(() => {
-		let h = 0;
-		for (let i = 0; i < mountedRange.start; i++) h += estimateHeight(chunks[i]);
-		return h;
-	}, [chunks, mountedRange.start, estimateHeight]);
+				const step = () => {
+					const node = scrollerRef.current;
+					if (!node) {
+						followingRef.current = false;
+						followRafRef.current = 0;
+						return;
+					}
+					const distance = getDistanceFromBottom(node);
+					if (
+						node.scrollTop < lastFollowScrollTopRef.current - FOLLOW_USER_SCROLL_UP_TOLERANCE &&
+						distance > BOTTOM_PIN_THRESHOLD
+					) {
+						followingRef.current = false;
+						followRafRef.current = 0;
+						setPinnedToBottom(false);
+						return;
+					}
+					if (!pinnedToBottomRef.current && distance > BOTTOM_PIN_THRESHOLD) {
+						followingRef.current = false;
+						followRafRef.current = 0;
+						return;
+					}
+					const target = getScrollBottomTarget(node);
+					const gap = target - node.scrollTop;
+					if (gap <= 1) {
+						node.scrollTop = target;
+						lastFollowScrollTopRef.current = target;
+						followingRef.current = false;
+						followRafRef.current = 0;
+						setPinnedToBottom(true);
+						return;
+					}
+					node.scrollTop = options.immediate ? target : node.scrollTop + Math.max(gap * 0.35, 2);
+					lastFollowScrollTopRef.current = node.scrollTop;
+					followRafRef.current = requestAnimationFrame(step);
+				};
 
-	const bottomSpacer = useMemo(() => {
-		let h = 0;
-		for (let i = mountedRange.end + 1; i < chunks.length; i++) h += estimateHeight(chunks[i]);
-		return h;
-	}, [chunks, mountedRange.end, estimateHeight]);
+				followRafRef.current = requestAnimationFrame(step);
+			},
+			[onUnreadCountChange, resetUnread, setPinnedToBottom, stopFollowTail],
+		);
+		scheduleFollowTailRef.current = scheduleFollowTail;
+		useEffect(() => () => stopFollowTail(), [stopFollowTail]);
+		useEffect(() => {
+			onUnreadCountChange?.(unreadCount);
+		}, [onUnreadCountChange, unreadCount]);
+		const permissionSignature = useMemo(() => getPermissionSignature(permCb), [permCb]);
+		const permKeyCacheRef = useRef(
+			new Map<string, { messages: NarratorMsg[]; signature: string; key: string }>(),
+		);
+		useEffect(() => {
+			const loadedIds = new Set(chunks.filter((chunk) => chunk.messages).map((chunk) => chunk.id));
+			for (const chunkId of permKeyCacheRef.current.keys()) {
+				if (!loadedIds.has(chunkId)) permKeyCacheRef.current.delete(chunkId);
+			}
+		}, [chunks]);
+		const getChunkPermKey = useCallback(
+			(chunk: ChunkData) => {
+				const messages = chunk.messages;
+				if (!messages || !permissionSignature) return "";
+				const cached = permKeyCacheRef.current.get(chunk.id);
+				if (cached?.messages === messages && cached.signature === permissionSignature) {
+					return cached.key;
+				}
+				const key = computePermKey(messages, permCb);
+				permKeyCacheRef.current.set(chunk.id, { messages, signature: permissionSignature, key });
+				return key;
+			},
+			[permCb, permissionSignature],
+		);
+		const selectionIndexRef = useRef<SelectionIndex>({ entries: [], byBlockId: new Map() });
+		const selectionIndexChunksRef = useRef<ChunkData[] | null>(null);
+		useEffect(() => {
+			void chunks;
+			selectionIndexChunksRef.current = null;
+			selectionIndexRef.current = { entries: [], byBlockId: new Map() };
+		}, [chunks]);
+		const getSelectionIndex = useCallback((force = false) => {
+			const currentChunks = chunksRef.current;
+			if (force || selectionIndexChunksRef.current !== currentChunks) {
+				selectionIndexRef.current = buildSelectionIndex(currentChunks);
+				selectionIndexChunksRef.current = currentChunks;
+			}
+			return selectionIndexRef.current;
+		}, []);
 
-	// IntersectionObserver sentinels: observe each mounted chunk; when a chunk
-	// near the mounted edge becomes visible, shift the center and load data.
-	const scrollerRef = useRef<HTMLDivElement>(null);
-	const sentinelRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+		const scrollDomIdsIntoView = useCallback(
+			(domIds: string[], highlightId?: string) => {
+				for (const domId of domIds) {
+					const el = document.getElementById(domId);
+					if (!el) continue;
+					el.scrollIntoView({ behavior: "smooth", block: "center" });
+					if (highlightId) onHighlightTarget?.(highlightId, 400);
+					return true;
+				}
+				return false;
+			},
+			[onHighlightTarget],
+		);
 
-	useEffect(() => {
-		const root = scrollerRef.current;
-		if (!root) return;
-		const observer = new IntersectionObserver(
-			(entries) => {
-				for (const entry of entries) {
-					if (!entry.isIntersecting) continue;
-					const idxAttr = (entry.target as HTMLElement).dataset.chunkIndex;
-					if (idxAttr == null) continue;
-					const idx = Number.parseInt(idxAttr, 10);
-					if (Number.isNaN(idx)) continue;
-					// Recenter toward the visible chunk so the mounted window follows.
-					setCenterIndex((prev) => (prev === idx ? prev : idx));
-					// Extend loaded data when approaching either end.
-					if (idx <= mountedRange.start + 1 && state.hasOlder) loadOlder();
-					if (idx >= mountedRange.end - 1 && state.hasNewer) loadNewer();
+		const getChunkIndexForSeq = useCallback((seq: number) => {
+			const list = chunksRef.current;
+			return list.findIndex((chunk) => seq >= chunk.firstSeq && seq <= chunk.lastSeq);
+		}, []);
+
+		const findLoadedTargetSeq = useCallback((targetIds: string[]): number | null => {
+			for (const targetId of targetIds) {
+				for (const chunk of chunksRef.current) {
+					const messages = chunk.messages ?? [];
+					const byId = findMessageById(messages, targetId);
+					const byIdSeq = getMessageSeq(byId);
+					if (byIdSeq != null) return byIdSeq;
+					const byTool = findMsgByToolUseIdInTree(messages, targetId) as NarratorMsg | null;
+					const byToolSeq = getMessageSeq(byTool);
+					if (byToolSeq != null) return byToolSeq;
+				}
+			}
+			return null;
+		}, []);
+
+		const resolveMessageSeq = useCallback(
+			async (messageId: string): Promise<number | null> => {
+				const around = await api.getNarratorMessages(narratorId, {
+					around: { messageId, before: 0, after: 0 },
+				});
+				const exact = findMessageById(around.messages as NarratorMsg[], messageId);
+				return getMessageSeq(exact);
+			},
+			[narratorId],
+		);
+
+		const resolveTargetSeq = useCallback(
+			async (targetIds: string[]): Promise<number | null> => {
+				const loaded = findLoadedTargetSeq(targetIds);
+				if (loaded != null) return loaded;
+				for (const targetId of targetIds) {
+					try {
+						const seq = await resolveMessageSeq(targetId);
+						if (seq != null) return seq;
+					} catch {
+						// Not a message id (or not visible in this narrator); try as a tool id below.
+					}
+					try {
+						const detail = await api.getToolCallDetail(narratorId, targetId);
+						const messageId = typeof detail?.messageId === "string" ? detail.messageId : undefined;
+						if (!messageId) continue;
+						const seq = await resolveMessageSeq(messageId);
+						if (seq != null) return seq;
+					} catch {
+						// Ignore unresolved ids; another targetId may resolve.
+					}
+				}
+				return null;
+			},
+			[findLoadedTargetSeq, narratorId, resolveMessageSeq],
+		);
+
+		const resolveSelectionEntry = useCallback(
+			async (blockId: string): Promise<SelectionEntry | null> => {
+				const index = getSelectionIndex();
+				const direct = index.byBlockId.get(blockId);
+				if (direct) return direct;
+
+				const mounted = readMountedBlockMeta(blockId);
+				if (mounted) {
+					const stableId = makeMessageBlockSelectionId(mounted.messageId, mounted.blockIndex);
+					const loaded = index.byBlockId.get(stableId);
+					if (loaded) return loaded;
+					const seq = await resolveMessageSeq(mounted.messageId).catch(() => null);
+					const chunkIndex = seq == null ? -1 : getChunkIndexForSeq(seq);
+					if (seq != null && chunkIndex >= 0) return { ...mounted, seq, chunkIndex, copyText: "" };
+				}
+
+				const toolUseId =
+					blockId.startsWith("tc-") || blockId.startsWith("sa-") ? blockId.slice(3) : null;
+				if (!toolUseId) return null;
+				try {
+					const detail = await api.getToolCallDetail(narratorId, toolUseId);
+					const messageId = typeof detail?.messageId === "string" ? detail.messageId : undefined;
+					if (!messageId) return null;
+					const around = await api.getNarratorMessages(narratorId, {
+						around: { messageId, before: 0, after: 0 },
+					});
+					const msg = findMessageById(around.messages as NarratorMsg[], messageId);
+					const seq = getMessageSeq(msg);
+					const blockIndex = Array.isArray(msg?.contentJson)
+						? msg.contentJson.findIndex(
+								(block) => block?.type === "tool_use" && block.id === toolUseId,
+							)
+						: -1;
+					const chunkIndex = seq == null ? -1 : getChunkIndexForSeq(seq);
+					if (seq == null || blockIndex < 0 || chunkIndex < 0) return null;
+					return { blockId, messageId, blockIndex, seq, chunkIndex, copyText: "" };
+				} catch {
+					return null;
 				}
 			},
-			{ root, rootMargin: "200px 0px 200px 0px", threshold: 0 },
+			[getChunkIndexForSeq, getSelectionIndex, narratorId, resolveMessageSeq],
 		);
-		for (const el of sentinelRefs.current.values()) observer.observe(el);
-		return () => observer.disconnect();
-	}, [mountedRange.start, mountedRange.end, state.hasOlder, state.hasNewer, loadOlder, loadNewer]);
 
-	const measureChunk = useCallback(
-		(chunkId: string, node: HTMLDivElement | null) => {
-			if (!node) return;
-			const h = node.getBoundingClientRect().height;
-			if (h > 0 && heightsRef.current.get(chunkId) !== h) {
-				heightsRef.current.set(chunkId, h);
-				bumpRender();
-			}
-		},
-		[bumpRender],
-	);
+		const resolveSelectionRange = useCallback(
+			async (anchorBlockId: string, targetBlockId: string): Promise<Set<string> | null> => {
+				const anchor = await resolveSelectionEntry(anchorBlockId);
+				const target = await resolveSelectionEntry(targetBlockId);
+				if (!anchor || !target) return null;
 
-	return (
-		<Box
-			ref={scrollerRef}
-			style={{ height: "100%", overflowY: "auto", overflowX: "hidden", overflowAnchor: "auto" }}
-		>
-			{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
-			{chunks.map((chunk, idx) => {
-				const mounted = idx >= mountedRange.start && idx <= mountedRange.end;
-				if (!mounted) {
-					return <div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />;
+				const startChunk = Math.min(anchor.chunkIndex, target.chunkIndex);
+				const endChunk = Math.max(anchor.chunkIndex, target.chunkIndex);
+				const chunkCount = endChunk - startChunk + 1;
+				if (chunkCount > HARD_RANGE_SELECT_CHUNKS) {
+					notifications.show({
+						color: "yellow",
+						message: `Selection spans ${chunkCount} chunks. Please narrow the range.`,
+					});
+					return null;
 				}
-				const { elements } = renderTreeMessages(
-					chunk.messages,
-					narratorId,
-					undefined,
-					null,
-					permCb,
-					undefined,
-					false,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					hasChapter,
-				);
-				return (
-					<div
-						key={chunk.id}
-						data-chunk-index={idx}
-						ref={(node) => {
-							if (node) sentinelRefs.current.set(idx, node);
-							else sentinelRefs.current.delete(idx);
-							measureChunk(chunk.id, node);
-						}}
-					>
-						{elements}
+				if (chunkCount > SOFT_RANGE_SELECT_CHUNKS) {
+					const ok = window.confirm(
+						`This selection spans ${chunkCount} chunks and may load more history. Continue?`,
+					);
+					if (!ok) return null;
+				}
+
+				await ensureLoadedRange(startChunk, endChunk);
+				await waitAnimationFrame();
+				await waitAnimationFrame();
+
+				const index = getSelectionIndex(true);
+				const refreshedAnchor = index.byBlockId.get(anchorBlockId) ?? anchor;
+				const refreshedTarget = index.byBlockId.get(targetBlockId) ?? target;
+				const anchorBeforeTarget =
+					refreshedAnchor.seq < refreshedTarget.seq ||
+					(refreshedAnchor.seq === refreshedTarget.seq &&
+						refreshedAnchor.blockIndex <= refreshedTarget.blockIndex);
+				const start = anchorBeforeTarget ? refreshedAnchor : refreshedTarget;
+				const end = anchorBeforeTarget ? refreshedTarget : refreshedAnchor;
+				const selected = new Set<string>();
+				for (const entry of index.entries) {
+					if (entry.seq < start.seq || entry.seq > end.seq) continue;
+					if (entry.seq === start.seq && entry.blockIndex < start.blockIndex) continue;
+					if (entry.seq === end.seq && entry.blockIndex > end.blockIndex) continue;
+					selected.add(entry.blockId);
+				}
+				return selected.size > 0 ? selected : null;
+			},
+			[ensureLoadedRange, getSelectionIndex, resolveSelectionEntry],
+		);
+
+		const selectionResolver = useMemo<MessageSelectionResolver>(
+			() => ({
+				resolveRange: resolveSelectionRange,
+				resolveSelectedMeta: (selectedIds) =>
+					entriesToBlockMeta(getSelectionIndex().entries, selectedIds),
+				resolveSelectedMessageIds: (selectedIds) =>
+					entriesToMessageIds(getSelectionIndex().entries, selectedIds),
+				collectSelectedText: (selectedIds) =>
+					entriesToText(getSelectionIndex().entries, selectedIds),
+			}),
+			[getSelectionIndex, resolveSelectionRange],
+		);
+
+		useEffect(() => {
+			onSelectionResolverChange?.(selectionResolver);
+			return () => onSelectionResolverChange?.(null);
+		}, [onSelectionResolverChange, selectionResolver]);
+
+		const scrollToSeqTarget = useCallback(
+			async (seq: number, domIds: string[], highlightId?: string) => {
+				const chunkIndex = getChunkIndexForSeq(seq);
+				if (chunkIndex < 0) return false;
+				const chunk = chunksRef.current[chunkIndex];
+				if (!chunk) return false;
+				setCenterChunkId(chunkIndex === chunksRef.current.length - 1 ? null : chunk.id);
+				const el = scrollerRef.current;
+				if (el) {
+					const top = prefixRef.current[chunkIndex] ?? 0;
+					el.scrollTop = Math.max(0, top - el.clientHeight / 2);
+				}
+				await ensureLoadedRef.current(chunk.id, JUMP_LOAD_RADIUS);
+				for (let i = 0; i < 4; i++) {
+					await waitAnimationFrame();
+					if (scrollDomIdsIntoView(domIds, highlightId)) return true;
+				}
+				if (highlightId) onHighlightTarget?.(highlightId, 300);
+				return false;
+			},
+			[getChunkIndexForSeq, onHighlightTarget, scrollDomIdsIntoView],
+		);
+
+		const scrollToMessageTarget = useCallback(
+			({
+				domIds,
+				targetIds,
+				highlightId,
+			}: {
+				domIds: string[];
+				targetIds: string[];
+				highlightId?: string;
+			}) => {
+				if (scrollDomIdsIntoView(domIds, highlightId)) return;
+				void (async () => {
+					const seq = await resolveTargetSeq(targetIds);
+					if (seq == null) return;
+					await scrollToSeqTarget(seq, domIds, highlightId);
+				})();
+			},
+			[resolveTargetSeq, scrollDomIdsIntoView, scrollToSeqTarget],
+		);
+
+		const scrollToBottom = useCallback(
+			(instant?: boolean) => {
+				void (async () => {
+					setCenterChunkId(null);
+					scheduleFollowTail({ force: true, immediate: instant ?? true });
+					const tail = chunksRef.current[chunksRef.current.length - 1];
+					if (tail) await ensureLoadedRef.current(tail.id, PRELOAD_DISTANCE);
+					for (let i = 0; i < 4; i++) await waitAnimationFrame();
+					scheduleFollowTail({ force: true, immediate: instant ?? true });
+				})();
+			},
+			[scheduleFollowTail],
+		);
+
+		useImperativeHandle(ref, () => ({ scrollToMessageTarget, scrollToBottom, refreshStructure }), [
+			refreshStructure,
+			scrollToBottom,
+			scrollToMessageTarget,
+		]);
+		// Set once the initial scroll-to-bottom has settled; until then the scroll
+		// handler must not recenter (the programmatic scroll + unsettled heights
+		// could otherwise yank the window off the tail).
+		const initialScrollDoneRef = useRef(false);
+		useEffect(() => {
+			const root = scrollerRef.current;
+			const content = contentNodeRef.current;
+			if (!root || !content) return;
+			let followRaf = 0;
+			const scheduleFromDomChange = () => {
+				if (!initialScrollDoneRef.current || !pinnedToBottomRef.current) return;
+				cancelAnimationFrame(followRaf);
+				followRaf = requestAnimationFrame(() => {
+					followRaf = 0;
+					scheduleFollowTailRef.current();
+				});
+			};
+			const contentResizeObserver = new ResizeObserver(scheduleFromDomChange);
+			contentResizeObserver.observe(content);
+			const viewportResizeObserver = new ResizeObserver(scheduleFromDomChange);
+			viewportResizeObserver.observe(root);
+			const mutationObserver = new MutationObserver(scheduleFromDomChange);
+			mutationObserver.observe(content, {
+				childList: true,
+				subtree: true,
+				characterData: true,
+			});
+			return () => {
+				cancelAnimationFrame(followRaf);
+				contentResizeObserver.disconnect();
+				viewportResizeObserver.disconnect();
+				mutationObserver.disconnect();
+			};
+		}, []);
+
+		// Ensure the mounted band's content is loaded whenever the window moves.
+		useEffect(() => {
+			const centerChunk = chunks[centerIndex];
+			if (centerChunk) ensureLoadedRef.current(centerChunk.id, PRELOAD_DISTANCE);
+		}, [chunks, centerIndex]);
+
+		// Scroll handler: binary-search the chunk under the viewport center and jump
+		// the mounted window there (+ load its band). This handles both continuous
+		// scrolling and arbitrary scrollbar-drag jumps uniformly.
+		useEffect(() => {
+			const root = scrollerRef.current;
+			if (!root) return;
+			let ticking = false;
+			const onScroll = () => {
+				if (ticking) return;
+				ticking = true;
+				requestAnimationFrame(() => {
+					ticking = false;
+					const el = scrollerRef.current;
+					if (!el) return;
+					if (!initialScrollDoneRef.current) return; // don't fight the initial scroll
+					const list = chunksRef.current;
+					if (list.length === 0) return;
+					const pre = prefixRef.current;
+					// Binary-search the chunk under the viewport center, with deterministic
+					// edge clamping so the first/last chunks are always reachable even when
+					// estimated heights drift from real ones (see resolveScrollTargetIndex).
+					const target = resolveScrollTargetIndex(
+						pre,
+						list.length,
+						el.scrollTop,
+						el.clientHeight,
+						el.scrollHeight,
+					);
+					const targetChunk = list[target];
+					if (!targetChunk) return;
+					const isTail = target === list.length - 1;
+					setCenterChunkId(isTail ? null : targetChunk.id);
+					ensureLoadedRef.current(targetChunk.id, JUMP_LOAD_RADIUS);
+					// Track bottom pin with a narrow threshold so a deliberate scroll-up is not
+					// pulled back down by streaming height changes. While our follow loop is
+					// scrolling downward, its own scroll events may still be far from the final
+					// bottom; do not interpret those as user detaches unless scrollTop decreases.
+					if (followingRef.current) {
+						const userScrolledUp =
+							el.scrollTop < lastFollowScrollTopRef.current - FOLLOW_USER_SCROLL_UP_TOLERANCE;
+						if (userScrolledUp) {
+							pinnedToBottomRef.current = false;
+							stopFollowTailRef.current();
+							setIsAtBottomRef.current(false);
+						} else {
+							pinnedToBottomRef.current = true;
+							setIsAtBottomRef.current(true);
+						}
+						return;
+					}
+					const atBottom = getDistanceFromBottom(el) <= BOTTOM_PIN_THRESHOLD;
+					pinnedToBottomRef.current = atBottom;
+					if (!atBottom) stopFollowTailRef.current();
+					setIsAtBottomRef.current(atBottom);
+				});
+			};
+			root.addEventListener("scroll", onScroll, { passive: true });
+			return () => root.removeEventListener("scroll", onScroll);
+		}, []);
+
+		// Initial scroll-to-bottom: follow-tail center + scroll the container to the
+		// end so the newest messages are visible on open.
+		const lastNarratorRef = useRef(narratorId);
+		if (lastNarratorRef.current !== narratorId) {
+			lastNarratorRef.current = narratorId;
+			initialScrollDoneRef.current = false;
+			pinnedToBottomRef.current = true;
+			setCenterChunkId(null);
+			// Reset measured heights so the per-message average and spacer sizing
+			// start fresh for the new narrator (chunk ids are message ids, so stale
+			// entries wouldn't collide, but the running average must not carry over).
+			heightsRef.current.clear();
+			measuredPerMsgRef.current = null;
+		}
+		const tailLoaded =
+			tailChunkId != null && chunks.length > 0 && chunks[chunks.length - 1]?.messages != null;
+		useLayoutEffect(() => {
+			if (initialScrollDoneRef.current) return;
+			const el = scrollerRef.current;
+			if (!el || loading || chunks.length === 0 || !tailLoaded) return;
+			setCenterChunkId(null);
+			pinnedToBottomRef.current = true;
+			el.scrollTop = getScrollBottomTarget(el);
+			setIsAtBottomRef.current(true);
+			initialScrollDoneRef.current = true;
+			scheduleFollowTail({ force: true, immediate: true });
+		}, [loading, chunks.length, tailLoaded, scheduleFollowTail]);
+
+		const lastHighlightTargetRef = useRef<string | null>(null);
+		useEffect(() => {
+			if (!highlightMessageId || chunks.length === 0) return;
+			const key = `${narratorId}:${highlightMessageId}`;
+			if (lastHighlightTargetRef.current === key) return;
+			lastHighlightTargetRef.current = key;
+			scrollToMessageTarget({
+				domIds: [`msg-${highlightMessageId}`],
+				targetIds: [highlightMessageId],
+				highlightId: highlightMessageId,
+			});
+		}, [chunks.length, highlightMessageId, narratorId, scrollToMessageTarget]);
+
+		const mountedChunks = chunks.slice(mountedRange.start, mountedRange.end + 1);
+		// Inject the synthetic streaming message into the tail render-chunk only,
+		// and only when that chunk is actually mounted (it is kept resident).
+		const tailMounted = mountedChunks.some((c) => c.id === tailChunkId && c.messages != null);
+		const firstManifestSeq = chunks[0]?.firstSeq ?? 0;
+		const totalSeqCount =
+			chunks.length > 0
+				? (chunks[chunks.length - 1]?.lastSeq ?? firstManifestSeq) - firstManifestSeq + 1
+				: 0;
+		const userMessageMarkers = useMemo(() => {
+			if (totalSeqCount <= 0) return [];
+			const markers: { index: number; id: string }[] = [];
+			for (const chunk of chunks) {
+				for (const msg of chunk.messages ?? []) {
+					const seq = getMessageSeq(msg);
+					if (msg.role === "user" && msg.id && seq != null) {
+						markers.push({ index: seq - firstManifestSeq, id: msg.id });
+					}
+				}
+			}
+			return markers;
+		}, [chunks, firstManifestSeq, totalSeqCount]);
+		const handleUserMarkerJump = useCallback(
+			(index: number) => {
+				const seq = firstManifestSeq + index;
+				let messageId: string | undefined;
+				for (const chunk of chunksRef.current) {
+					for (const msg of chunk.messages ?? []) {
+						if (msg.role !== "user" || getMessageSeq(msg) !== seq) continue;
+						messageId = msg.id;
+						break;
+					}
+					if (messageId) break;
+				}
+				void scrollToSeqTarget(seq, messageId ? [`msg-${messageId}`] : [], messageId);
+			},
+			[firstManifestSeq, scrollToSeqTarget],
+		);
+
+		return (
+			<Box style={{ height: "100%", position: "relative", overflow: "hidden" }}>
+				<Box
+					ref={setScrollerNode}
+					style={{
+						height: "100%",
+						overflowY: "auto",
+						overflowX: "hidden",
+						overflowAnchor: "auto",
+					}}
+				>
+					<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
+						{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
+						{mountedChunks.map((chunk) =>
+							chunk.messages ? (
+								<MountedChunk
+									key={chunk.id}
+									chunkId={chunk.id}
+									messages={chunk.messages}
+									narratorId={narratorId}
+									permCb={permCb}
+									permKey={getChunkPermKey(chunk)}
+									hasChapter={hasChapter}
+									onForkFromMessage={onForkFromMessage}
+									highlightedId={highlightedId}
+									expandedToolUseId={expandedToolUseId}
+									showTokenUsage={showTokenUsage}
+									pruneBoundaryMessageId={pruneBoundaryMessageId}
+									pruneDividerLabel={pruneDividerLabel}
+									onCompactBeforeMessage={onCompactBeforeMessage}
+									onClearContextBefore={onClearContextBefore}
+									onManualSummarize={onManualSummarize}
+									onDeleteBlock={onDeleteBlock}
+									onRollbackToBlock={onRollbackToBlock}
+									onEditAndRegenerate={onEditAndRegenerate}
+									onEditAssistantMessage={onEditAssistantMessage}
+									onRestoreAssistantMessage={onRestoreAssistantMessage}
+									lastUserMessageId={lastUserMessageId}
+									onViewSubagentSession={onViewSubagentSession}
+									resolvePerm={resolvePerm}
+									onAskInPassing={onAskInPassing}
+									streamingMsg={chunk.id === tailChunkId ? streamingMsg : null}
+									onMeasure={onMeasure}
+								/>
+							) : (
+								// Mounted but content not yet loaded — reserve estimated height
+								// so layout/scroll position stays stable until it arrives.
+								<div key={chunk.id} style={{ height: estimateHeight(chunk) }} aria-hidden />
+							),
+						)}
+						{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
+						{/* Empty narrator: render streaming output even before any chunk exists. */}
+						{!tailMounted && streamingMsg && chunks.length === 0 && (
+							<MountedChunk
+								key="__streaming_only__"
+								chunkId="__streaming_only__"
+								messages={[]}
+								narratorId={narratorId}
+								permCb={permCb}
+								permKey=""
+								hasChapter={hasChapter}
+								onForkFromMessage={onForkFromMessage}
+								highlightedId={highlightedId}
+								expandedToolUseId={expandedToolUseId}
+								showTokenUsage={showTokenUsage}
+								pruneBoundaryMessageId={pruneBoundaryMessageId}
+								pruneDividerLabel={pruneDividerLabel}
+								onCompactBeforeMessage={onCompactBeforeMessage}
+								onClearContextBefore={onClearContextBefore}
+								onManualSummarize={onManualSummarize}
+								onDeleteBlock={onDeleteBlock}
+								onRollbackToBlock={onRollbackToBlock}
+								onEditAndRegenerate={onEditAndRegenerate}
+								onEditAssistantMessage={onEditAssistantMessage}
+								onRestoreAssistantMessage={onRestoreAssistantMessage}
+								lastUserMessageId={lastUserMessageId}
+								onViewSubagentSession={onViewSubagentSession}
+								resolvePerm={resolvePerm}
+								onAskInPassing={onAskInPassing}
+								streamingMsg={streamingMsg}
+								onMeasure={onMeasure}
+							/>
+						)}
 					</div>
-				);
-			})}
-			{bottomSpacer > 0 && <div style={{ height: bottomSpacer }} aria-hidden />}
-		</Box>
-	);
-}
+				</Box>
+				<ScrollbarUserMarkers
+					markers={userMessageMarkers}
+					totalCount={totalSeqCount}
+					onJump={handleUserMarkerJump}
+					scrollContainerRef={scrollerRef}
+				/>
+			</Box>
+		);
+	},
+);
+ChunkedMessageListImpl.displayName = "ChunkedMessageList";
+
+export const ChunkedMessageList = memo(ChunkedMessageListImpl);
+ChunkedMessageList.displayName = "ChunkedMessageList";

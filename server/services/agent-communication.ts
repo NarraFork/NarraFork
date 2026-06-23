@@ -349,6 +349,11 @@ export async function awaitAgentResult(opts: AwaitAgentInput): Promise<string> {
  * narrator id and the shared group id, or null if the selector is not a fellow
  * group member.
  */
+function normalizeGroupMemberSelector(selector: string): string {
+	const trimmed = selector.trim();
+	return trimmed.startsWith("@") ? trimmed.slice(1).trim() : trimmed;
+}
+
 async function resolveGroupMemberSelector(
 	callerNarratorId: string,
 	selector: string,
@@ -357,6 +362,10 @@ async function resolveGroupMemberSelector(
 	const groups = await chatGroupService.listGroupsForNarrator(callerNarratorId);
 	if (groups.length === 0) return null;
 
+	const rawSelector = selector.trim();
+	const normalizedSelector = normalizeGroupMemberSelector(selector);
+	const normalizedHandle = normalizedSelector.toLowerCase();
+
 	for (const group of groups) {
 		const members = await chatGroupService.listNarratorMembers(group.id);
 		for (const member of members) {
@@ -364,9 +373,11 @@ async function resolveGroupMemberSelector(
 			const narrator = await narratorService.getById(member.narratorId).catch(() => null);
 			if (!narrator) continue;
 			if (
-				narrator.id === selector ||
-				narrator.handle === selector.toLowerCase() ||
-				subagentMatchesSelector(narrator, selector)
+				narrator.id === rawSelector ||
+				narrator.id === normalizedSelector ||
+				narrator.handle === normalizedHandle ||
+				subagentMatchesSelector(narrator, rawSelector) ||
+				subagentMatchesSelector(narrator, normalizedSelector)
 			) {
 				return { narratorId: narrator.id, groupId: group.id };
 			}
@@ -392,6 +403,22 @@ async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubag
 	}
 	// If none of the selectors are group members, this isn't a group send.
 	if (resolved.length === 0) return null;
+	if (resolved.length !== selectors.length) {
+		const resolvedSelectors = new Set(resolved.map((item) => item.selector));
+		const targets = selectors.map((selector) => ({
+			id: selector,
+			status: "failed" as const,
+			error: resolvedSelectors.has(selector)
+				? "Mixed group and non-group Send targets are not delivered together; split this into separate Send calls."
+				: "Target is not a fellow chat-group member.",
+		}));
+		return {
+			output: targets
+				.map((target) => `Failed to deliver to "${target.id}": ${target.error}`)
+				.join("\n"),
+			targets,
+		};
+	}
 
 	const targetResults: SendTargetResult[] = [];
 	const sections: string[] = [];

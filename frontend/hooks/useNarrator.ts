@@ -362,8 +362,13 @@ type MessagePageParam =
 	  }
 	| undefined;
 
-export function useNarratorMessages(narratorId: string, around?: NarratorMessagesAroundOptions) {
+export function useNarratorMessages(
+	narratorId: string,
+	around?: NarratorMessagesAroundOptions,
+	options?: { enabled?: boolean },
+) {
 	const normalizedAround = normalizeAroundOptions(around);
+	const enabled = options?.enabled ?? true;
 	return useInfiniteQuery({
 		queryKey: getNarratorMessagesQueryKey(narratorId, normalizedAround),
 		queryFn: ({ pageParam }: { pageParam: MessagePageParam }) => {
@@ -387,7 +392,7 @@ export function useNarratorMessages(narratorId: string, around?: NarratorMessage
 			firstPage.hasMoreAfter && firstPage.prevCursor
 				? { cursor: firstPage.prevCursor, direction: "newer" as const }
 				: undefined,
-		enabled: !!narratorId,
+		enabled: !!narratorId && enabled,
 		// Messages are kept up-to-date via WebSocket (setQueryData), so background
 		// refetch on remount is unnecessary. A high staleTime prevents TanStack Query
 		// from refetching ALL cached pages when the component remounts, which would

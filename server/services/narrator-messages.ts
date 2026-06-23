@@ -712,27 +712,49 @@ async function buildTreeFromTopLevelRefs(
 /** Number of top-level messages per chunk. Keep in sync with the frontend. */
 export const CHUNK_SIZE = 20;
 
+/** Compact manifest chunk tuple: [id, firstSeq, lastSeq, count]. */
+type ManifestChunkTuple = [string, number, number, number];
+
+interface ComputedManifest {
+	messageVersion: number;
+	total: number;
+	chunks: ManifestChunkTuple[];
+}
+
 /**
- * Compute a cheap structural fingerprint for a chunk. Changes whenever the
- * chunk's boundaries, size, or last message identity change — which covers
- * insert / delete / reorder. Content edits (which keep structure intact) are
- * handled separately via the message_updated WS event, so they intentionally
- * do not alter this hash.
+ * Per-narrator manifest cache, keyed by narratorId and validated by
+ * messageVersion. Because the manifest is a pure function of the ref table at a
+ * given messageVersion, a cached entry whose version still matches is exact —
+ * so even a first load (no client `since`) of a recently-viewed narrator skips
+ * the full ref scan. Bounded LRU to cap memory.
+ *
+ * On off-threading: the remaining cost on a cache MISS is a single synchronous
+ * indexed ref scan (~17-23ms on the largest histories) plus ~4ms of JS slicing.
+ * That is one-time per (narrator, version) and below the threshold where a
+ * worker + separate DB connection would pay for its complexity/risk. If a
+ * pathological narrator (far beyond ~30k messages) ever makes the first-open
+ * scan visibly block, revisit moving the scan to a worker then.
  */
-function computeChunkHash(
-	firstSeq: number,
-	lastSeq: number,
-	count: number,
-	lastMessageId: string,
-): string {
-	// djb2 — small, fast, allocation-light. Not cryptographic; only needs to
-	// detect change, not resist collisions.
-	let h = 5381;
-	const s = `${firstSeq}:${lastSeq}:${count}:${lastMessageId}`;
-	for (let i = 0; i < s.length; i++) {
-		h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+const MANIFEST_CACHE_LIMIT = 64;
+const manifestCache = new Map<string, ComputedManifest>();
+
+function getCachedManifest(narratorId: string, version: number): ComputedManifest | null {
+	const hit = manifestCache.get(narratorId);
+	if (!hit || hit.messageVersion !== version) return null;
+	// LRU touch.
+	manifestCache.delete(narratorId);
+	manifestCache.set(narratorId, hit);
+	return hit;
+}
+
+function setCachedManifest(narratorId: string, entry: ComputedManifest): void {
+	manifestCache.delete(narratorId);
+	manifestCache.set(narratorId, entry);
+	while (manifestCache.size > MANIFEST_CACHE_LIMIT) {
+		const oldest = manifestCache.keys().next().value;
+		if (oldest === undefined) break;
+		manifestCache.delete(oldest);
 	}
-	return (h >>> 0).toString(36);
 }
 
 // ── narratorMessages object ────────────────────────────────────────────────
@@ -1053,13 +1075,8 @@ export const narratorMessageQueries = {
 				unchanged: false;
 				messageVersion: number;
 				total: number;
-				chunks: Array<{
-					id: string;
-					firstSeq: number;
-					lastSeq: number;
-					count: number;
-					hash: string;
-				}>;
+				/** Compact tuples: [id, firstSeq, lastSeq, count]. */
+				chunks: Array<[string, number, number, number]>;
 		  }
 	> {
 		const messageVersion = await this.getMessageVersion(narratorId);
@@ -1067,50 +1084,79 @@ export const narratorMessageQueries = {
 			return { unchanged: true, messageVersion };
 		}
 
+		// Serve from cache when the structure version still matches — exact, and
+		// avoids the full ref scan even on a first load (no client `since`).
+		const cached = getCachedManifest(narratorId, messageVersion);
+		if (cached) {
+			return {
+				unchanged: false,
+				messageVersion: cached.messageVersion,
+				total: cached.total,
+				chunks: cached.chunks,
+			};
+		}
+
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 
 		// Narrow query: seq + messageId only, ordered by seq. No large columns,
 		// no COUNT(*). Uses idx_narrator_refs_seq.
-		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		//
+		// Primary narrators never have refs pointing to child (parent_tool_use_id
+		// IS NOT NULL) messages — children are not referenced in the junction
+		// table — so the join to narrator_messages would filter nothing and is
+		// pure overhead (≈4x slower on large histories). Skip it entirely and
+		// query the narrow refs table alone. Subagent narrators legitimately hold
+		// child refs as top-level, so they keep the (cheap, small) join path.
+		const refRows = isSubagent
+			? await db
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq)
+			: await db
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+					})
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							isNull(narratorMessageRefs.segmentCompactId),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq);
 
-		const chunks: Array<{
-			id: string;
-			firstSeq: number;
-			lastSeq: number;
-			count: number;
-			hash: string;
-		}> = [];
+		// Compact tuple payload: [id, firstSeq, lastSeq, count]. Tuples avoid
+		// repeating object keys ~1.5k times (≈60% smaller wire/parse than an
+		// array of objects). The structural fingerprint (hash) is intentionally
+		// omitted here — it is only needed by the (not-yet-built) chunks_dirty
+		// incremental reconciliation, and would otherwise cost wire bytes + a
+		// djb2 pass per chunk for no current consumer.
+		const chunks: Array<[string, number, number, number]> = [];
 		for (let i = 0; i < refRows.length; i += CHUNK_SIZE) {
 			const slice = refRows.slice(i, i + CHUNK_SIZE);
 			const first = slice[0];
 			const last = slice[slice.length - 1];
-			chunks.push({
-				id: first.messageId,
-				firstSeq: first.seq,
-				lastSeq: last.seq,
-				count: slice.length,
-				hash: computeChunkHash(first.seq, last.seq, slice.length, last.messageId),
-			});
+			chunks.push([first.messageId, first.seq, last.seq, slice.length]);
 		}
+
+		const total = refRows.length;
+		setCachedManifest(narratorId, { messageVersion, total, chunks });
 
 		return {
 			unchanged: false,
 			messageVersion,
-			total: refRows.length,
+			total,
 			chunks,
 		};
 	},

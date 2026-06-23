@@ -122,7 +122,7 @@ function insertChildAtPath(
 	return { messages: updated, changed: true };
 }
 
-function insertChildIntoMessages(
+export function insertChildIntoMessages(
 	messages: TreeMessage[],
 	childMsg: TreeMessage,
 ): { messages: TreeMessage[]; changed: boolean } {
@@ -714,7 +714,7 @@ function upsertStreamingChildOnMsg(
 	return updated;
 }
 
-function upsertStreamingChildInMessages(
+export function upsertStreamingChildInMessages(
 	messages: TreeMessage[],
 	parentToolUseId: string,
 	syntheticId: string,
@@ -880,7 +880,7 @@ function removeStreamingChildAtPath(
 	return { messages: updated, changed: true };
 }
 
-function removeStreamingChildInMessages(
+export function removeStreamingChildInMessages(
 	messages: TreeMessage[],
 	parentToolUseId: string,
 	syntheticId: string,

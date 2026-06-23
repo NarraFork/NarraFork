@@ -913,10 +913,24 @@ export const narratorService = {
 			}
 			const currentTraits = parseTraits(narrator.traits);
 			const nextTraits = currentTraits.filter((t) => t !== "named");
-			if (normalized) nextTraits.push("named");
+			let nextEnabledTools = narrator.enabledTools;
+			if (normalized) {
+				nextTraits.push("named");
+				const currentTools = Array.isArray(narrator.enabledTools)
+					? narrator.enabledTools.filter((tool): tool is string => typeof tool === "string")
+					: [];
+				if (!currentTools.includes("GroupControl")) {
+					nextEnabledTools = [...currentTools, "GroupControl"];
+				}
+			}
 			const [updated] = await db
 				.update(narrators)
-				.set({ handle: normalized, traits: nextTraits, updatedAt: new Date().toISOString() })
+				.set({
+					handle: normalized,
+					traits: nextTraits,
+					enabledTools: nextEnabledTools,
+					updatedAt: new Date().toISOString(),
+				})
 				.where(eq(narrators.id, narratorId))
 				.returning();
 			logger.info("Narrator handle updated", { narratorId, handle: normalized });

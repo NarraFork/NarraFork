@@ -39,13 +39,17 @@ interface SearchChannelConfig {
 	timeoutMs?: number;
 }
 
+type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
+
 interface CustomSearchProviderConfig {
 	id: string;
 	name: string;
 	disabled?: boolean;
-	protocol: "narrafork-search-v1";
+	protocol: CustomSearchProviderProtocol;
 	baseUrl: string;
 	apiKey?: string;
+	headers?: Record<string, string>;
+	options?: Record<string, unknown>;
 	timeoutMs?: number;
 }
 
@@ -69,13 +73,33 @@ function shortId(): string {
 	return Math.random().toString(36).slice(2, 10);
 }
 
+const PROTOCOL_BASE_URLS: Record<CustomSearchProviderProtocol, string> = {
+	"zhipu-web-search-v1": "https://open.bigmodel.cn/api/paas/v4",
+	"tavily-mcp": "https://mcp.tavily.com/mcp/",
+};
+
+function normalizeProtocol(value: unknown): CustomSearchProviderProtocol {
+	return value === "tavily-mcp" ? "tavily-mcp" : "zhipu-web-search-v1";
+}
+
+function normalizeProvider(provider: CustomSearchProviderConfig): CustomSearchProviderConfig {
+	const protocol = normalizeProtocol(provider.protocol);
+	return {
+		...provider,
+		protocol,
+		baseUrl: provider.baseUrl || PROTOCOL_BASE_URLS[protocol],
+	};
+}
+
 function normalizeSearchSettings(
 	settings: SearchSettingsResponse | undefined,
 ): SearchSettingsState {
 	const search = settings?.search ?? {};
 	return {
 		channels: Array.isArray(search.channels) ? search.channels : [],
-		customProviders: Array.isArray(search.customProviders) ? search.customProviders : [],
+		customProviders: Array.isArray(search.customProviders)
+			? search.customProviders.map(normalizeProvider)
+			: [],
 		defaultTimeoutMs: search.defaultTimeoutMs ?? 60000,
 		maxOutputChars: search.maxOutputChars ?? 24000,
 	};
@@ -175,6 +199,18 @@ function SettingsSearchPage() {
 	if (isLoading || !state) return <Text>{tc("loading")}</Text>;
 
 	const settingsRecord = asSearchSettingsResponse(settingsData);
+	const protocolOptions = [
+		{ value: "zhipu-web-search-v1", label: t("searchProtocolZhipu") },
+		{ value: "tavily-mcp", label: t("searchProtocolTavily") },
+	];
+	const protocolDescription = (protocol: CustomSearchProviderProtocol): string => {
+		switch (protocol) {
+			case "zhipu-web-search-v1":
+				return t("searchProtocolZhipuDesc");
+			case "tavily-mcp":
+				return t("searchProtocolTavilyDesc");
+		}
+	};
 	const updateChannel = (id: string, patch: Partial<SearchChannelConfig>) => {
 		setState((prev) =>
 			prev
@@ -210,8 +246,8 @@ function SettingsSearchPage() {
 							{
 								id,
 								name: t("searchCustomProviderDefaultName"),
-								protocol: "narrafork-search-v1",
-								baseUrl: "",
+								protocol: "zhipu-web-search-v1",
+								baseUrl: PROTOCOL_BASE_URLS["zhipu-web-search-v1"],
 							},
 						],
 						channels: [
@@ -230,6 +266,25 @@ function SettingsSearchPage() {
 						customProviders: prev.customProviders.map((provider) =>
 							provider.id === id ? { ...provider, ...patch } : provider,
 						),
+					}
+				: prev,
+		);
+	};
+	const updateCustomProviderProtocol = (id: string, protocol: CustomSearchProviderProtocol) => {
+		setState((prev) =>
+			prev
+				? {
+						...prev,
+						customProviders: prev.customProviders.map((provider) => {
+							if (provider.id !== id) return provider;
+							const oldDefault = PROTOCOL_BASE_URLS[normalizeProtocol(provider.protocol)];
+							const shouldReplaceBaseUrl = !provider.baseUrl || provider.baseUrl === oldDefault;
+							return {
+								...provider,
+								protocol,
+								baseUrl: shouldReplaceBaseUrl ? PROTOCOL_BASE_URLS[protocol] : provider.baseUrl,
+							};
+						}),
 					}
 				: prev,
 		);
@@ -451,6 +506,14 @@ function SettingsSearchPage() {
 											updateCustomProvider(provider.id, { name: event.currentTarget.value })
 										}
 									/>
+									<Select
+										label={t("searchCustomProviderProtocol")}
+										data={protocolOptions}
+										value={normalizeProtocol(provider.protocol)}
+										onChange={(value) =>
+											updateCustomProviderProtocol(provider.id, normalizeProtocol(value))
+										}
+									/>
 									<TextInput
 										label={t("searchCustomProviderBaseUrl")}
 										value={provider.baseUrl}
@@ -459,6 +522,9 @@ function SettingsSearchPage() {
 										}
 									/>
 								</Group>
+								<Text size="xs" c="dimmed">
+									{protocolDescription(normalizeProtocol(provider.protocol))}
+								</Text>
 								<Group grow align="flex-end">
 									<PasswordInput
 										label={t("searchCustomProviderApiKey")}

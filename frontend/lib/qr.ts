@@ -206,7 +206,7 @@ function reserveFormatAreas(reserved: boolean[][]): void {
 		}
 	}
 	for (let i = 0; i < 8; i++) reserved[size - 1 - i][8] = true;
-	for (let i = 0; i < 7; i++) reserved[8][size - 1 - i] = true;
+	for (let i = 0; i < 8; i++) reserved[8][size - 1 - i] = true;
 }
 
 function formatBits(): number {
@@ -224,18 +224,24 @@ function drawFormatBits(modules: boolean[][]): void {
 	const bits = formatBits();
 	const get = (i: number) => ((bits >>> i) & 1) !== 0;
 
-	// Format information is placed around the top-left finder and duplicated
-	// along the top-right / bottom-left timing areas. Coordinates here are
-	// matrix[row][col]; keep them in QR spec order so scanners can read the
-	// error-correction level and mask pattern.
+	// Format information surrounds the top-left finder and is duplicated along
+	// the top-right (horizontal) and bottom-left (vertical) edges. These exact
+	// coordinates are verified against a reference encoder (qrencode, ECC L) so
+	// scanners can read the error-correction level and mask pattern. Layout is
+	// matrix[row][col]; do not transpose.
+	// First copy: vertical strip down the left of the top-left finder, then
+	// horizontal strip along the top.
 	for (let i = 0; i <= 5; i++) modules[i][8] = get(i);
 	modules[7][8] = get(6);
 	modules[8][8] = get(7);
 	modules[8][7] = get(8);
 	for (let i = 9; i < 15; i++) modules[8][14 - i] = get(i);
+	// Second copy: horizontal strip along the top-right, then vertical strip up
+	// the bottom-left.
 	for (let i = 0; i < 8; i++) modules[8][size - 1 - i] = get(i);
 	for (let i = 8; i < 15; i++) modules[size - 15 + i][8] = get(i);
-	modules[8][size - 8] = true;
+	// The fixed dark module lives at modules[size - 8][8]; it is already set as a
+	// function pattern in drawFunctionPatterns, so nothing extra is written here.
 }
 
 function versionBits(version: number): number {

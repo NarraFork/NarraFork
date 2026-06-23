@@ -34,6 +34,8 @@ import { parseTraits } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	formatGroupMessageForInjection,
+	markGroupMessagesConsumedForReply,
+	type PendingGroupMember,
 	type PendingGroupMessage,
 	pushGroupMessageForNarrator,
 } from "./chat-group-queue";
@@ -88,10 +90,56 @@ async function resolveSenderLabel(
 	return "user";
 }
 
+async function buildNarratorMemberContext(groupId: string): Promise<PendingGroupMember[]> {
+	const members = await db.query.chatGroupMembers.findMany({
+		where: eq(chatGroupMembers.groupId, groupId),
+		orderBy: (m, { asc }) => [asc(m.joinedAt)],
+	});
+	const context: PendingGroupMember[] = [];
+	for (const member of members) {
+		if (member.memberType !== "narrator" || !member.narratorId) continue;
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(narrators.id, member.narratorId),
+			columns: {
+				id: true,
+				handle: true,
+				title: true,
+				status: true,
+				substatus: true,
+			},
+		});
+		if (!narrator) continue;
+		context.push({
+			narratorId: narrator.id,
+			handle: narrator.handle,
+			title: narrator.title,
+			role: member.role,
+			canControl: member.canControl,
+			status: narrator.status,
+			substatus: narrator.substatus,
+		});
+	}
+	return context;
+}
+
 export const chatGroupService = {
 	async getById(groupId: string): Promise<ChatGroupRow | null> {
 		const row = await db.query.chatGroups.findFirst({ where: eq(chatGroups.id, groupId) });
 		return row ?? null;
+	},
+
+	async canUserAccessGroup(groupId: string, userId: string): Promise<boolean> {
+		const group = await db.query.chatGroups.findFirst({
+			where: eq(chatGroups.id, groupId),
+			columns: { createdBy: true, status: true },
+		});
+		if (!group || group.status !== "active") return false;
+		if (group.createdBy === userId) return true;
+		const member = await db.query.chatGroupMembers.findFirst({
+			where: and(eq(chatGroupMembers.groupId, groupId), eq(chatGroupMembers.userId, userId)),
+			columns: { id: true },
+		});
+		return !!member;
 	},
 
 	async listMembers(groupId: string): Promise<ChatGroupMemberRow[]> {
@@ -345,6 +393,7 @@ export const chatGroupService = {
 
 		// Fan out to narrator members + WS. Group membership is intentionally small.
 		const members = await this.listNarratorMembers(input.groupId);
+		const memberContext = await buildNarratorMemberContext(input.groupId);
 		const skip = new Set(input.skipNarratorIds ?? []);
 		const groupTitle = group.title || "untitled";
 		for (const member of members) {
@@ -381,8 +430,11 @@ export const chatGroupService = {
 			await this.deliverToNarrator(targetNarratorId, {
 				groupId: input.groupId,
 				groupTitle,
+				groupMessageId: id,
 				senderLabel,
+				senderType: input.senderType,
 				content: capped,
+				members: memberContext,
 				urgent,
 				locale: input.locale,
 			});
@@ -409,8 +461,12 @@ export const chatGroupService = {
 		const pending: PendingGroupMessage = {
 			groupId: msg.groupId,
 			groupTitle: msg.groupTitle,
+			groupMessageId: msg.groupMessageId,
 			senderLabel: msg.senderLabel,
+			senderType: msg.senderType,
 			content: msg.content,
+			members: msg.members,
+			locale: msg.locale,
 		};
 
 		const isBusy = narrator.status === "working" || narrator.status === "waiting";
@@ -452,6 +508,7 @@ export const chatGroupService = {
 				null,
 				null,
 			);
+			markGroupMessagesConsumedForReply(narratorId, [pending]);
 		} catch (err) {
 			// If waking fails (race: narrator just went busy), fall back to the queue.
 			logger.warn("Failed to wake narrator for group message; queueing instead", {

@@ -25,9 +25,11 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import type { Locale } from "../lib/prompt-i18n";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
+import { drainPendingGroupReplyContexts } from "./chat-group-queue";
 import {
 	enrichToolUseBlocks,
 	narratorService,
@@ -293,6 +295,63 @@ function dualBroadcast(ctx: EventHandlerContext, message: NarratorServerMessage)
 			selfMsg.message = { ...selfMsg.message, parentToolUseId: null };
 		}
 		broadcastToNarrator(ctx.narratorId, selfMsg);
+	}
+}
+
+async function maybeBackflowGroupReply(opts: {
+	narratorId: string;
+	text: string;
+	toolUses: Array<{ name: string }>;
+	locale?: Locale;
+}): Promise<void> {
+	const usedExplicitSend = opts.toolUses.some((toolUse) => toolUse.name === "Send");
+	if (usedExplicitSend) {
+		// Explicit Send is already the authoritative group reply path; clear pending
+		// contexts so a later natural-text turn does not duplicate that response.
+		drainPendingGroupReplyContexts(opts.narratorId);
+		return;
+	}
+
+	// Tool-using assistant turns are often a preamble ("I'll check...") followed
+	// by a later final assistant turn. Keep the context until the no-tool final
+	// text arrives, otherwise the group would receive process text instead of the
+	// answer.
+	if (opts.toolUses.length > 0) return;
+
+	const text = opts.text.trim();
+	if (!text) {
+		// A final assistant event with no natural-language text should not leave a
+		// stale auto-reply context that could capture a later unrelated response.
+		drainPendingGroupReplyContexts(opts.narratorId);
+		return;
+	}
+
+	const contexts = drainPendingGroupReplyContexts(opts.narratorId);
+	if (contexts.length === 0) return;
+
+	const byGroup = new Map<string, (typeof contexts)[number]>();
+	for (const context of contexts) {
+		if (!byGroup.has(context.groupId)) byGroup.set(context.groupId, context);
+	}
+
+	const { chatGroupService } = await import("./chat-group-service");
+	for (const context of byGroup.values()) {
+		try {
+			await chatGroupService.postMessage({
+				groupId: context.groupId,
+				content: text,
+				senderType: "narrator",
+				senderNarratorId: opts.narratorId,
+				locale: opts.locale,
+			});
+		} catch (error) {
+			logger.warn("Failed to auto-backflow group reply", {
+				narratorId: opts.narratorId,
+				groupId: context.groupId,
+				groupMessageId: context.groupMessageId,
+				error: String(error),
+			});
+		}
 	}
 }
 
@@ -1025,6 +1084,12 @@ export async function processEvent(
 				message: broadcastMessage,
 			});
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
+			await maybeBackflowGroupReply({
+				narratorId,
+				text: event.text ?? "",
+				toolUses: event.toolUses,
+				locale: ctx.locale === "zh-CN" ? "zh-CN" : "en",
+			});
 
 			// Main narrator: clear compact summary after first response
 			if (hooks?.onClearCompactSummary) {

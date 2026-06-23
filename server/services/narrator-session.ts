@@ -2763,12 +2763,14 @@ export async function runAgentLoop(
 						first.textFiles,
 						first.bashCommand,
 					)
-						.then(({ userMsg }) => {
-							broadcastToNarrator(narratorId, {
-								type: "user_message",
-								narratorId,
-								message: userMsg,
-							});
+						.then(({ userMsg, userBroadcasted }) => {
+							if (!userBroadcasted) {
+								broadcastToNarrator(narratorId, {
+									type: "user_message",
+									narratorId,
+									message: userMsg,
+								});
+							}
 						})
 						.catch(async (err) => {
 							logger.error("Auto-resume after interrupt failed", {
@@ -2824,7 +2826,11 @@ async function feedMessage(
 	userId?: string | null,
 	rawTextFiles?: File[],
 	preBashCommand?: string | null,
-): Promise<{ active: ActiveNarrator; userMsg: typeof narratorMessages.$inferSelect }> {
+): Promise<{
+	active: ActiveNarrator;
+	userMsg: typeof narratorMessages.$inferSelect;
+	userBroadcasted?: boolean;
+}> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	active._goalContinuationSuppressed = false;
 	active._goalContinuationNoToolCount = 0;
@@ -2930,6 +2936,14 @@ async function feedMessage(
 	// reconstructs the Bash tool_result as the current user turn, so the model sees
 	// the order: user prompt → Bash tool call/result → model reply.
 	if (preBashCommand) {
+		// Broadcast the persisted user message before Bash starts. In chunk mode the
+		// frontend renders directly from WS events (not the query optimistic cache),
+		// so delaying this until sendMessage() returns would show the Bash card first.
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: userMsg,
+		});
 		await handleBashCommand(
 			narratorId,
 			preBashCommand,
@@ -2951,7 +2965,7 @@ async function feedMessage(
 				error: String(err),
 			});
 		});
-		return { active, userMsg };
+		return { active, userMsg, userBroadcasted: true };
 	}
 
 	// Start agent loop in background
@@ -3074,7 +3088,7 @@ export async function sendMessage(
 	textFiles?: File[],
 	preBashCommand?: string | null,
 ): Promise<typeof narratorMessages.$inferSelect> {
-	const { userMsg } = await feedMessage(
+	const { userMsg, userBroadcasted } = await feedMessage(
 		narratorId,
 		prompt,
 		images,
@@ -3085,11 +3099,13 @@ export async function sendMessage(
 		textFiles,
 		preBashCommand,
 	);
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: userMsg,
-	});
+	if (!userBroadcasted) {
+		broadcastToNarrator(narratorId, {
+			type: "user_message",
+			narratorId,
+			message: userMsg,
+		});
+	}
 	return userMsg;
 }
 

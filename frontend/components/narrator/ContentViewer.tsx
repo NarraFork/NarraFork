@@ -43,6 +43,7 @@ import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
+	makeMessageBlockSelectionId,
 	NestedBlockCtx,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
@@ -236,7 +237,11 @@ export const ContentViewer = memo(
 		const instanceId = useRef(nextInstanceId++);
 		const isMobile = contentViewerEnv.isMobile;
 		const nested = useContext(NestedBlockCtx);
-		const blockIdStr = nested ? undefined : `cv-${instanceId.current}`;
+		const stableBlockId =
+			!nested && msgCtx.messageId && blockIndex != null
+				? makeMessageBlockSelectionId(msgCtx.messageId, blockIndex)
+				: undefined;
+		const blockIdStr = nested ? undefined : (stableBlockId ?? `cv-${instanceId.current}`);
 		const selection = useMessageSelection();
 		// The effective ID for multi-select: own ID, or parent ToolCallCard's ID when nested + selecting
 		const effectiveSelectionId = nested && selection.selectionMode ? nested : blockIdStr;

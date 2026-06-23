@@ -463,6 +463,30 @@ export type StreamingBlock =
 	  }
 	| { type: "text"; text: string; outputIndex?: number };
 
+/** Read a streaming block's provider output index, if any. */
+export function getStreamingBlockOutputIndex(block: StreamingBlock): number | undefined {
+	return "outputIndex" in block && typeof block.outputIndex === "number"
+		? block.outputIndex
+		: undefined;
+}
+
+/**
+ * Find the array index at which a new streaming block with the given output
+ * index should be inserted so blocks stay ordered by provider output index.
+ * Blocks without an output index always append to the end.
+ */
+export function findStreamingInsertIndex(
+	blocks: StreamingBlock[],
+	outputIndex: number | undefined,
+): number {
+	if (outputIndex == null) return blocks.length;
+	for (let i = 0; i < blocks.length; i++) {
+		const currentOrder = getStreamingBlockOutputIndex(blocks[i]);
+		if (currentOrder != null && currentOrder > outputIndex) return i;
+	}
+	return blocks.length;
+}
+
 export function buildStreamingMsg(opts: {
 	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;

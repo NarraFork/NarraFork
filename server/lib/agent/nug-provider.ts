@@ -495,7 +495,7 @@ export class NugProvider implements ProviderAdapter {
 			throw new Error("NUG returned no response body");
 		}
 
-		yield* parseSSEStream(response.body);
+		yield* parseSSEStream(response.body, { parseTextToolCalls: params.tools.length > 0 });
 		if (responseTextPromise) {
 			params.requestDump?.setResponseBodyText(await responseTextPromise);
 		}

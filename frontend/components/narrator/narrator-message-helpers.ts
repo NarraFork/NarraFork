@@ -1,5 +1,12 @@
 import type { QueryClient } from "@tanstack/react-query";
-import type { MessagesQueryData, NarratorMsg, PendingPermission } from "./narrator-panel-types";
+import type { SideCarRecord, ToolCallRecord } from "../../lib/api";
+import { upsertStreamingToolBlock } from "./message-tree-utils";
+import type {
+	ContentBlock,
+	MessagesQueryData,
+	NarratorMsg,
+	PendingPermission,
+} from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
@@ -148,6 +155,331 @@ export function revokeContentBlockPreviewUrls(
 			URL.revokeObjectURL(block.previewUrl);
 		}
 	}
+}
+
+const STREAMING_TEXT_PREVIEW_MAX_CHARS = 120_000;
+
+/**
+ * Append a streaming text delta to an accumulated preview, capping the total
+ * length so a runaway stream cannot grow an unbounded string in memory (keeps
+ * the most recent tail). Shared by both the legacy panel WS path and the chunk
+ * data layer so they stay byte-for-byte identical.
+ */
+export function appendStreamingTextPreview(current: string, delta: string): string {
+	const next = current + delta;
+	if (next.length <= STREAMING_TEXT_PREVIEW_MAX_CHARS) return next;
+	return next.slice(-STREAMING_TEXT_PREVIEW_MAX_CHARS);
+}
+
+// --- Streaming tool output / field preview bounds ------------------------------
+// Shared by the legacy panel WS path and the chunk data layer so the live
+// (untruncated) tool output / streaming-field previews stay byte-for-byte
+// identical between the two list implementations.
+
+export const STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS = 16_000;
+export const STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS = 16_000;
+
+interface TruncatedToolOutput {
+	_truncated: true;
+	preview: string;
+	fullLength: number;
+}
+
+function isTruncatedToolOutput(value: unknown): value is TruncatedToolOutput {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		(value as { _truncated?: unknown })._truncated === true &&
+		typeof (value as { preview?: unknown }).preview === "string" &&
+		typeof (value as { fullLength?: unknown }).fullLength === "number"
+	);
+}
+
+/**
+ * When a tool completes with a truncated output payload but we streamed the
+ * complete response live, promote the streamed string into the persisted cache
+ * instead of replacing it with the (much shorter) final 2KB preview.
+ */
+export function preserveCompleteStreamedOutput(
+	completedOutput: unknown,
+	streamedOutput?: string,
+): { output: unknown; preserved: boolean } {
+	if (!isTruncatedToolOutput(completedOutput) || typeof streamedOutput !== "string") {
+		return { output: completedOutput, preserved: false };
+	}
+	if (streamedOutput.length < completedOutput.fullLength) {
+		return { output: completedOutput, preserved: false };
+	}
+	return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
+}
+
+/** Keep only the trailing window of a streamed tool output preview. */
+export function getToolOutputPreview(output: string): string {
+	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
+	return output.slice(-STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS);
+}
+
+/** Keep only the trailing window of a streamed tool field preview. */
+export function getStreamingFieldPreview(value: string): string {
+	if (value.length <= STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS) return value;
+	return value.slice(-STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS);
+}
+
+/**
+ * Append user-targeted side-car records to the latest assistant message (depth
+ * first, deepest/last first) under the matching parentToolUseId scope. Returns
+ * `{ changed: false }` when no assistant message matched (caller keeps refs).
+ */
+export function appendSideCarsToLatestAssistant(
+	messages: NarratorMsg[],
+	sideCars: SideCarRecord[],
+	parentToolUseId?: string,
+): { messages: NarratorMsg[]; changed: boolean } {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.children?.length) {
+			const childResult = appendSideCarsToLatestAssistant(msg.children, sideCars, parentToolUseId);
+			if (childResult.changed) {
+				const updated = [...messages];
+				updated[i] = { ...msg, children: childResult.messages };
+				return { messages: updated, changed: true };
+			}
+		}
+		const matchesParent = parentToolUseId
+			? msg.parentToolUseId === parentToolUseId
+			: !msg.parentToolUseId;
+		if (msg.role === "assistant" && matchesParent) {
+			const updated = [...messages];
+			updated[i] = { ...msg, sideCars: mergeSideCarLists(sideCars, msg.sideCars) };
+			return { messages: updated, changed: true };
+		}
+	}
+	return { messages, changed: false };
+}
+
+/**
+ * A top-level streaming-tool chunk accumulator entry. While a tool is streaming
+ * its input we render a shimmer indicator; once promoted (`_started`) we render
+ * a real tool-call card with the resolved input/status/output.
+ */
+export interface TopLevelStreamingChunk {
+	toolUseId: string;
+	toolName: string;
+	inputCharsTotal: number;
+	extractedFilePath?: string;
+	contentCharsReceived?: number;
+	extractedFields?: Record<string, string>;
+	metadata?: Record<string, unknown>;
+	streamingFieldName?: string;
+	streamingFieldValue?: string;
+	// Sentinel fields set once the tool is promoted to started/completed.
+	_started?: boolean;
+	_input?: Record<string, unknown>;
+	_status?: string;
+	_startedAt?: number;
+	_output?: unknown;
+	_durationMs?: number;
+	_metadata?: Record<string, unknown>;
+	_sideCars?: SideCarRecord[];
+	_longRunning?: boolean;
+	_streamedFullOutput?: boolean;
+	_streamingOutput?: string;
+}
+
+/**
+ * Build the synthetic STREAMING_CHUNKS_MSG_ID assistant message that surfaces
+ * the currently-streaming top-level tool calls. Pure function shared by the
+ * legacy panel WS memo and the chunk data layer so both render identical cards.
+ * Returns null when there are no active top-level streaming chunks.
+ */
+export function buildTopLevelStreamingChunksMsg(
+	chunks: TopLevelStreamingChunk[],
+	narratorId: string,
+	createdAt: string | null,
+): NarratorMsg | null {
+	if (chunks.length === 0) return null;
+
+	let blocks: ContentBlock[] = [];
+	let toolCalls = [] as NonNullable<NarratorMsg["toolCalls"]>;
+	for (const chunk of chunks) {
+		if (chunk._started) {
+			// Tool promoted to started/completed — render as a real card.
+			const inputJson = chunk._input ?? {};
+			const next = upsertStreamingToolBlock(
+				blocks,
+				toolCalls,
+				chunk.toolUseId,
+				chunk.toolName,
+				inputJson,
+			);
+			blocks = next.blocks;
+			toolCalls = next.toolCalls;
+			const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (tcIdx !== -1) {
+				toolCalls[tcIdx] = {
+					...toolCalls[tcIdx],
+					status: chunk._status ?? "running",
+					...(chunk._startedAt && { startedAt: chunk._startedAt }),
+					...(chunk._output !== undefined && { outputJson: chunk._output }),
+					...(chunk._durationMs != null && { durationMs: chunk._durationMs }),
+					...(chunk._sideCars && { sideCars: chunk._sideCars }),
+					...(chunk._metadata && { _metadata: chunk._metadata }),
+					...(chunk.metadata && { _metadata: chunk.metadata }),
+					...(chunk._longRunning && { _longRunning: true }),
+					...(chunk._streamedFullOutput && { _streamedFullOutput: true }),
+					...(chunk._streamingOutput && { _streamingOutput: chunk._streamingOutput }),
+				} as (typeof toolCalls)[number];
+			}
+		} else {
+			const next = upsertStreamingToolBlock(blocks, toolCalls, chunk.toolUseId, chunk.toolName, {
+				_streamingChars: chunk.inputCharsTotal,
+				...(chunk.extractedFilePath && { _streamingFilePath: chunk.extractedFilePath }),
+				...(chunk.contentCharsReceived != null && {
+					_streamingContentChars: chunk.contentCharsReceived,
+				}),
+				...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
+				...(chunk.metadata && { _streamingMetadata: chunk.metadata }),
+				...(chunk.streamingFieldName && { _streamingFieldName: chunk.streamingFieldName }),
+				...(chunk.streamingFieldValue && { _streamingFieldValue: chunk.streamingFieldValue }),
+			});
+			blocks = next.blocks;
+			toolCalls = next.toolCalls;
+			const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
+			if (tcIdx !== -1 && chunk.metadata) {
+				toolCalls[tcIdx] = {
+					...toolCalls[tcIdx],
+					_metadata: chunk.metadata,
+				} as (typeof toolCalls)[number];
+			}
+		}
+	}
+
+	return {
+		id: STREAMING_CHUNKS_MSG_ID,
+		narratorId,
+		parentToolUseId: null,
+		role: "assistant",
+		contentJson: blocks,
+		contentText: null,
+		toolCalls,
+		createdAt: createdAt ?? new Date().toISOString(),
+		children: [],
+	} as NarratorMsg;
+}
+
+/**
+ * Insert a top-level message into a seq-ascending array at its correct slot.
+ * Falls back to appending when seq is missing or it belongs at the tail.
+ */
+export function insertTopLevelMessageBySeq(
+	messages: NarratorMsg[],
+	newMsg: NarratorMsg,
+): NarratorMsg[] {
+	const seq =
+		typeof newMsg.seq === "number" && Number.isFinite(newMsg.seq) ? newMsg.seq : undefined;
+	if (seq == null) return [...messages, newMsg];
+
+	const insertIdx = messages.findIndex(
+		(msg) => typeof msg.seq === "number" && Number.isFinite(msg.seq) && msg.seq > seq,
+	);
+	if (insertIdx === -1) return [...messages, newMsg];
+
+	const updated = [...messages];
+	updated.splice(insertIdx, 0, newMsg);
+	return updated;
+}
+
+function sideCarMergeKey(sideCar: SideCarRecord): string {
+	return [
+		sideCar.target,
+		sideCar.source,
+		sideCar.toolUseId ?? "",
+		sideCar.orderIndex ?? "",
+		sideCar.content,
+	].join("\u0000");
+}
+
+export function mergeSideCarLists(
+	incoming?: SideCarRecord[] | null,
+	existing?: SideCarRecord[] | null,
+): SideCarRecord[] | undefined {
+	const merged: SideCarRecord[] = [];
+	const seen = new Set<string>();
+	for (const list of [incoming, existing]) {
+		for (const sideCar of list ?? []) {
+			const key = sideCarMergeKey(sideCar);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			merged.push(sideCar);
+		}
+	}
+	return merged.length > 0 ? merged : undefined;
+}
+
+function collectToolSideCars(message: NarratorMsg): Map<string, SideCarRecord[]> {
+	const result = new Map<string, SideCarRecord[]>();
+	const add = (toolUseId: unknown, sideCars: unknown) => {
+		if (typeof toolUseId !== "string" || !Array.isArray(sideCars) || sideCars.length === 0) {
+			return;
+		}
+		const previous = result.get(toolUseId);
+		result.set(toolUseId, mergeSideCarLists(sideCars as SideCarRecord[], previous) ?? []);
+	};
+	for (const toolCall of message.toolCalls ?? []) {
+		add(toolCall.toolUseId, toolCall.sideCars);
+	}
+	for (const block of message.contentJson ?? []) {
+		if (block.type === "tool_use") {
+			add(block.id, block.sideCars);
+		}
+	}
+	return result;
+}
+
+/**
+ * Merge live side-car records from an existing cached message into an incoming
+ * replacement so streamed side-cars survive a server-sent message refresh.
+ * Returns `incoming` unchanged when nothing merged (preserves reference).
+ */
+export function preserveLiveSideCars(
+	existing: NarratorMsg | undefined,
+	incoming: NarratorMsg,
+): NarratorMsg {
+	if (!existing) return incoming;
+
+	const sideCars = mergeSideCarLists(incoming.sideCars, existing.sideCars);
+	const existingToolSideCars = collectToolSideCars(existing);
+	let changed = sideCars !== incoming.sideCars;
+
+	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
+		const merged = mergeSideCarLists(
+			toolCall.sideCars,
+			existingToolSideCars.get(toolCall.toolUseId),
+		);
+		if (merged === toolCall.sideCars) return toolCall;
+		changed = true;
+		return { ...toolCall, sideCars: merged } as ToolCallRecord;
+	});
+
+	const toolCallSideCars = new Map<string, SideCarRecord[]>();
+	for (const toolCall of toolCalls) {
+		if (toolCall.toolUseId && toolCall.sideCars?.length) {
+			toolCallSideCars.set(toolCall.toolUseId, toolCall.sideCars);
+		}
+	}
+
+	const contentJson = (incoming.contentJson ?? []).map((block) => {
+		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
+		const merged = mergeSideCarLists(
+			Array.isArray(block.sideCars) ? (block.sideCars as SideCarRecord[]) : undefined,
+			toolCallSideCars.get(block.id),
+		);
+		if (!merged || merged === block.sideCars) return block;
+		changed = true;
+		return { ...block, sideCars: merged };
+	});
+
+	return changed ? { ...incoming, sideCars, toolCalls, contentJson } : incoming;
 }
 
 export function removeStreamingChunksMsg(

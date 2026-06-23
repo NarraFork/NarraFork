@@ -10,6 +10,8 @@ export const SEARCH_NATIVE_CHANNEL_ID = "native";
 export const SEARCH_SUBAGENT_CHANNEL_ID = "subagent";
 export const DEFAULT_SEARCH_TIMEOUT_MS = 60_000;
 export const DEFAULT_SEARCH_MAX_OUTPUT_CHARS = 24_000;
+export const ZHIPU_WEB_SEARCH_DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
+export const TAVILY_MCP_DEFAULT_BASE_URL = "https://mcp.tavily.com/mcp/";
 
 export function nugSearchChannelId(providerId: string): string {
 	return `nug:${providerId}`;
@@ -80,6 +82,21 @@ export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchCh
 	return catalog;
 }
 
+function normalizeCustomSearchProviderProtocol(
+	protocol: unknown,
+): CustomSearchProviderConfig["protocol"] {
+	return protocol === "tavily-mcp" ? "tavily-mcp" : "zhipu-web-search-v1";
+}
+
+function defaultCustomSearchBaseUrl(protocol: CustomSearchProviderConfig["protocol"]): string {
+	switch (protocol) {
+		case "zhipu-web-search-v1":
+			return ZHIPU_WEB_SEARCH_DEFAULT_BASE_URL;
+		case "tavily-mcp":
+			return TAVILY_MCP_DEFAULT_BASE_URL;
+	}
+}
+
 function normalizeCustomSearchProviders(
 	providers: CustomSearchProviderConfig[] | undefined,
 ): CustomSearchProviderConfig[] {
@@ -89,6 +106,7 @@ function normalizeCustomSearchProviders(
 		const id = String(provider.id || "").trim();
 		if (!id || seen.has(id)) continue;
 		seen.add(id);
+		const protocol = normalizeCustomSearchProviderProtocol(provider.protocol);
 		const normalizedHeaders: Record<string, string> = {};
 		for (const [key, value] of Object.entries(provider.headers ?? {})) {
 			const header = key.trim();
@@ -99,8 +117,8 @@ function normalizeCustomSearchProviders(
 			...provider,
 			id,
 			name: provider.name?.trim() || id,
-			protocol: "narrafork-search-v1",
-			baseUrl: provider.baseUrl?.trim() ?? "",
+			protocol,
+			baseUrl: provider.baseUrl?.trim() || defaultCustomSearchBaseUrl(protocol),
 			timeoutMs: sanitizeTimeoutMs(provider.timeoutMs),
 			...(Object.keys(normalizedHeaders).length > 0 ? { headers: normalizedHeaders } : {}),
 		});

@@ -9,11 +9,14 @@ import {
 	type BufferMessageSummary,
 	type NarratorGoal,
 	type SideCarRecord,
-	type ToolCallRecord,
 } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
-import { clearToolBlockCache, type StreamingBlock } from "./message-segments";
+import {
+	clearToolBlockCache,
+	findStreamingInsertIndex,
+	type StreamingBlock,
+} from "./message-segments";
 import {
 	evictOldestPages,
 	findMsgByToolUseIdInTree,
@@ -23,12 +26,19 @@ import {
 	removeSubagentStreamingChunk,
 	updateToolCallByIndex,
 	updateToolUseIndex,
-	upsertStreamingToolBlock,
 	upsertSubagentStreamingChunk,
 } from "./message-tree-utils";
 import {
+	appendSideCarsToLatestAssistant,
+	appendStreamingTextPreview,
+	buildTopLevelStreamingChunksMsg,
+	getStreamingFieldPreview,
+	getToolOutputPreview,
+	insertTopLevelMessageBySeq,
 	isActiveReflectionPermissionLike,
 	isReflectionPermissionLike,
+	preserveCompleteStreamedOutput,
+	preserveLiveSideCars,
 	removeStreamingChunksMsg,
 	revokeContentBlockPreviewUrls,
 } from "./narrator-message-helpers";
@@ -83,24 +93,6 @@ function usePageVisibility(): boolean {
 	return visible;
 }
 
-function getStreamingBlockOutputIndex(block: StreamingBlock): number | undefined {
-	return "outputIndex" in block && typeof block.outputIndex === "number"
-		? block.outputIndex
-		: undefined;
-}
-
-function findStreamingInsertIndex(
-	blocks: StreamingBlock[],
-	outputIndex: number | undefined,
-): number {
-	if (outputIndex == null) return blocks.length;
-	for (let i = 0; i < blocks.length; i++) {
-		const currentOrder = getStreamingBlockOutputIndex(blocks[i]);
-		if (currentOrder != null && currentOrder > outputIndex) return i;
-	}
-	return blocks.length;
-}
-
 function numericUsageField(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -117,142 +109,14 @@ function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number |
 	);
 }
 
-function insertTopLevelMessageBySeq(messages: NarratorMsg[], newMsg: NarratorMsg): NarratorMsg[] {
-	const seq =
-		typeof newMsg.seq === "number" && Number.isFinite(newMsg.seq) ? newMsg.seq : undefined;
-	if (seq == null) return [...messages, newMsg];
-
-	const insertIdx = messages.findIndex(
-		(msg) => typeof msg.seq === "number" && Number.isFinite(msg.seq) && msg.seq > seq,
-	);
-	if (insertIdx === -1) return [...messages, newMsg];
-
-	const updated = [...messages];
-	updated.splice(insertIdx, 0, newMsg);
-	return updated;
-}
-
-function sideCarMergeKey(sideCar: SideCarRecord): string {
-	return [
-		sideCar.target,
-		sideCar.source,
-		sideCar.toolUseId ?? "",
-		sideCar.orderIndex ?? "",
-		sideCar.content,
-	].join("\u0000");
-}
-
-function mergeSideCarLists(
-	incoming?: SideCarRecord[] | null,
-	existing?: SideCarRecord[] | null,
-): SideCarRecord[] | undefined {
-	const merged: SideCarRecord[] = [];
-	const seen = new Set<string>();
-	for (const list of [incoming, existing]) {
-		for (const sideCar of list ?? []) {
-			const key = sideCarMergeKey(sideCar);
-			if (seen.has(key)) continue;
-			seen.add(key);
-			merged.push(sideCar);
-		}
-	}
-	return merged.length > 0 ? merged : undefined;
-}
-
-function collectToolSideCars(message: NarratorMsg): Map<string, SideCarRecord[]> {
-	const result = new Map<string, SideCarRecord[]>();
-	const add = (toolUseId: unknown, sideCars: unknown) => {
-		if (typeof toolUseId !== "string" || !Array.isArray(sideCars) || sideCars.length === 0) {
-			return;
-		}
-		const previous = result.get(toolUseId);
-		result.set(toolUseId, mergeSideCarLists(sideCars as SideCarRecord[], previous) ?? []);
-	};
-	for (const toolCall of message.toolCalls ?? []) {
-		add(toolCall.toolUseId, toolCall.sideCars);
-	}
-	for (const block of message.contentJson ?? []) {
-		if (block.type === "tool_use") {
-			add(block.id, block.sideCars);
-		}
-	}
-	return result;
-}
-
-function preserveLiveSideCars(
-	existing: NarratorMsg | undefined,
-	incoming: NarratorMsg,
-): NarratorMsg {
-	if (!existing) return incoming;
-
-	const sideCars = mergeSideCarLists(incoming.sideCars, existing.sideCars);
-	const existingToolSideCars = collectToolSideCars(existing);
-	let changed = sideCars !== incoming.sideCars;
-
-	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
-		const merged = mergeSideCarLists(
-			toolCall.sideCars,
-			existingToolSideCars.get(toolCall.toolUseId),
-		);
-		if (merged === toolCall.sideCars) return toolCall;
-		changed = true;
-		return { ...toolCall, sideCars: merged } as ToolCallRecord;
-	});
-
-	const toolCallSideCars = new Map<string, SideCarRecord[]>();
-	for (const toolCall of toolCalls) {
-		if (toolCall.toolUseId && toolCall.sideCars?.length) {
-			toolCallSideCars.set(toolCall.toolUseId, toolCall.sideCars);
-		}
-	}
-
-	const contentJson = (incoming.contentJson ?? []).map((block) => {
-		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
-		const merged = mergeSideCarLists(
-			Array.isArray(block.sideCars) ? (block.sideCars as SideCarRecord[]) : undefined,
-			toolCallSideCars.get(block.id),
-		);
-		if (!merged || merged === block.sideCars) return block;
-		changed = true;
-		return { ...block, sideCars: merged };
-	});
-
-	return changed ? { ...incoming, sideCars, toolCalls, contentJson } : incoming;
-}
-
-function appendSideCarsToLatestAssistant(
-	messages: NarratorMsg[],
-	sideCars: SideCarRecord[],
-	parentToolUseId?: string,
-): { messages: NarratorMsg[]; changed: boolean } {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.children?.length) {
-			const childResult = appendSideCarsToLatestAssistant(msg.children, sideCars, parentToolUseId);
-			if (childResult.changed) {
-				const updated = [...messages];
-				updated[i] = { ...msg, children: childResult.messages };
-				return { messages: updated, changed: true };
-			}
-		}
-		const matchesParent = parentToolUseId
-			? msg.parentToolUseId === parentToolUseId
-			: !msg.parentToolUseId;
-		if (msg.role === "assistant" && matchesParent) {
-			const updated = [...messages];
-			updated[i] = { ...msg, sideCars: mergeSideCarLists(sideCars, msg.sideCars) };
-			return { messages: updated, changed: true };
-		}
-	}
-	return { messages, changed: false };
-}
-
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
 	narratorErrorMessage?: string | null;
 	messagesData?: { pages: MessagesPage[] };
 	messagesQueryKey: readonly unknown[];
+	/** Disable legacy message-cache / streaming-render updates when chunk mode owns messages. */
+	legacyMessageCacheUpdatesEnabled?: boolean;
 	/** Ref to isAtBottom state for unread tracking */
 	isAtBottomRef: React.RefObject<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
@@ -345,9 +209,6 @@ export interface UseNarratorPanelWSReturn {
 
 /** Max messages to keep in cache while the user is at the bottom. */
 const MAX_LIVE_MESSAGES = 200;
-const STREAMING_TEXT_PREVIEW_MAX_CHARS = 120_000;
-const STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS = 16_000;
-const STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS = 16_000;
 const STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS = 12_000;
 const STREAMING_TOOL_OUTPUT_THROTTLE_MS = 250;
 const CACHE_UPDATE_FALLBACK_MS = 250;
@@ -357,51 +218,6 @@ interface ToolOutputPreviewState {
 	lastFlushedPreview: string;
 	lastFlushAt: number;
 	timer: ReturnType<typeof setTimeout> | null;
-}
-
-interface TruncatedToolOutput {
-	_truncated: true;
-	preview: string;
-	fullLength: number;
-}
-
-function isTruncatedToolOutput(value: unknown): value is TruncatedToolOutput {
-	return (
-		!!value &&
-		typeof value === "object" &&
-		(value as { _truncated?: unknown })._truncated === true &&
-		typeof (value as { preview?: unknown }).preview === "string" &&
-		typeof (value as { fullLength?: unknown }).fullLength === "number"
-	);
-}
-
-function preserveCompleteStreamedOutput(
-	completedOutput: unknown,
-	streamedOutput?: string,
-): { output: unknown; preserved: boolean } {
-	if (!isTruncatedToolOutput(completedOutput) || typeof streamedOutput !== "string") {
-		return { output: completedOutput, preserved: false };
-	}
-	if (streamedOutput.length < completedOutput.fullLength) {
-		return { output: completedOutput, preserved: false };
-	}
-	return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
-}
-
-function appendStreamingTextPreview(current: string, delta: string): string {
-	const next = current + delta;
-	if (next.length <= STREAMING_TEXT_PREVIEW_MAX_CHARS) return next;
-	return next.slice(-STREAMING_TEXT_PREVIEW_MAX_CHARS);
-}
-
-function getToolOutputPreview(output: string): string {
-	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
-	return output.slice(-STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS);
-}
-
-function getStreamingFieldPreview(value: string): string {
-	if (value.length <= STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS) return value;
-	return value.slice(-STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS);
 }
 
 // --- Reducer for co-updated state ---
@@ -523,6 +339,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorErrorMessage,
 		messagesData,
 		messagesQueryKey,
+		legacyMessageCacheUpdatesEnabled = true,
 		isAtBottomRef,
 		scrollToBottom,
 		narratorTodosJson,
@@ -558,13 +375,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// RAF-based throttle: coalesce rapid streaming updates into one render per frame
 	const streamingRafRef = useRef(0);
 	const flushStreamingVersion = useCallback(() => {
+		if (!legacyMessageCacheUpdatesEnabled) return;
 		if (!streamingRafRef.current) {
 			streamingRafRef.current = requestAnimationFrame(() => {
 				streamingRafRef.current = 0;
 				setStreamingVersion((v) => v + 1);
 			});
 		}
-	}, []);
+	}, [legacyMessageCacheUpdatesEnabled]);
 
 	// RAF-based throttle for tool_use_chunk cache updates
 	const pendingToolChunkRef = useRef<
@@ -629,46 +447,56 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			streamingRafRef.current = 0;
 		}
 		clearToolBlockCache();
-		setStreamingVersion((v) => v + 1);
-	}, []);
+		if (legacyMessageCacheUpdatesEnabled) {
+			setStreamingVersion((v) => v + 1);
+		}
+	}, [legacyMessageCacheUpdatesEnabled]);
+	const bumpLegacyTopLevelStreamingChunksVersion = useCallback(() => {
+		if (legacyMessageCacheUpdatesEnabled) {
+			bumpTopLevelStreamingChunksVersion((v) => v + 1);
+		}
+	}, [legacyMessageCacheUpdatesEnabled]);
 
 	// Helper: cancel any pending tool chunk RAF and clear temporary streaming tool state.
 	// Only clears top-level chunks by default — subagent pending chunks (those with
 	// parentToolUseId) are preserved so concurrent subagents don't lose their streaming
 	// state when the parent narrator's assistant message arrives or another subagent
 	// completes. Pass includeSubagent=true for terminal cleanup (status change, error).
-	const cancelPendingToolChunks = useCallback((notify = true, includeSubagent = false) => {
-		if (includeSubagent) {
-			pendingToolChunkRef.current.clear();
-			toolStreamingFieldRef.current.clear();
-			for (const state of toolOutputPreviewRef.current.values()) {
-				if (state.timer) clearTimeout(state.timer);
-			}
-			toolOutputPreviewRef.current.clear();
-		} else {
-			// Only remove top-level entries; keep subagent chunks intact.
-			// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
-			for (const [key, chunk] of pendingToolChunkRef.current) {
-				if (!chunk.parentToolUseId) {
-					pendingToolChunkRef.current.delete(key);
-					toolStreamingFieldRef.current.delete(key);
+	const cancelPendingToolChunks = useCallback(
+		(notify = true, includeSubagent = false) => {
+			if (includeSubagent) {
+				pendingToolChunkRef.current.clear();
+				toolStreamingFieldRef.current.clear();
+				for (const state of toolOutputPreviewRef.current.values()) {
+					if (state.timer) clearTimeout(state.timer);
+				}
+				toolOutputPreviewRef.current.clear();
+			} else {
+				// Only remove top-level entries; keep subagent chunks intact.
+				// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
+				for (const [key, chunk] of pendingToolChunkRef.current) {
+					if (!chunk.parentToolUseId) {
+						pendingToolChunkRef.current.delete(key);
+						toolStreamingFieldRef.current.delete(key);
+					}
 				}
 			}
-		}
-		const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
-		topLevelStreamingChunkRef.current.clear();
-		topLevelStreamingCreatedAtRef.current = null;
-		// Only cancel the RAF if no subagent chunks remain to be flushed.
-		// When subagent chunks survive, the next RAF tick will consume them
-		// normally (the RAF callback calls pending.clear() after processing).
-		if (toolChunkRafRef.current && pendingToolChunkRef.current.size === 0) {
-			cancelAnimationFrame(toolChunkRafRef.current);
-			toolChunkRafRef.current = 0;
-		}
-		if (notify && hadTopLevelChunks) {
-			bumpTopLevelStreamingChunksVersion((v) => v + 1);
-		}
-	}, []);
+			const hadTopLevelChunks = topLevelStreamingChunkRef.current.size > 0;
+			topLevelStreamingChunkRef.current.clear();
+			topLevelStreamingCreatedAtRef.current = null;
+			// Only cancel the RAF if no subagent chunks remain to be flushed.
+			// When subagent chunks survive, the next RAF tick will consume them
+			// normally (the RAF callback calls pending.clear() after processing).
+			if (toolChunkRafRef.current && pendingToolChunkRef.current.size === 0) {
+				cancelAnimationFrame(toolChunkRafRef.current);
+				toolChunkRafRef.current = 0;
+			}
+			if (notify && hadTopLevelChunks) {
+				bumpLegacyTopLevelStreamingChunksVersion();
+			}
+		},
+		[bumpLegacyTopLevelStreamingChunksVersion],
+	);
 
 	// --- RAF-batched cache update queue for messagesQueryKey ---
 	// Instead of calling qc.setQueryData(messagesQueryKey, fn) on every WS event,
@@ -694,6 +522,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		const fns = pendingCacheUpdatesRef.current;
 		if (fns.length === 0) return;
 		pendingCacheUpdatesRef.current = [];
+		if (!legacyMessageCacheUpdatesEnabled) return;
 		qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 			let result: MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] } =
 				old;
@@ -702,9 +531,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			}
 			return result;
 		});
-	}, [qc, messagesQueryKey]);
+	}, [legacyMessageCacheUpdatesEnabled, qc, messagesQueryKey]);
 	const scheduleCacheUpdate = useCallback(
 		(fn: CacheUpdater) => {
+			if (!legacyMessageCacheUpdatesEnabled) return;
 			pendingCacheUpdatesRef.current.push(fn);
 			if (pageVisible && !cacheUpdateRafRef.current) {
 				cacheUpdateRafRef.current = requestAnimationFrame(() => {
@@ -719,7 +549,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}, CACHE_UPDATE_FALLBACK_MS);
 			}
 		},
-		[flushCacheUpdatesSync, pageVisible],
+		[flushCacheUpdatesSync, legacyMessageCacheUpdatesEnabled, pageVisible],
 	);
 
 	const flushToolOutputPreview = useCallback(
@@ -944,85 +774,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const topLevelStreamingChunks: NarratorMsg | null = useMemo(() => {
 		// topLevelChunksVersion triggers recalculation when chunks are added/cleared
 		void topLevelChunksVersion;
-		const chunks = [...topLevelStreamingChunkRef.current.values()];
-		if (chunks.length === 0) return null;
-
-		let blocks: ContentBlock[] = [];
-		let toolCalls = [] as NonNullable<NarratorMsg["toolCalls"]>;
-		for (const chunk of chunks) {
-			// biome-ignore lint/suspicious/noExplicitAny: extended sentinel fields
-			const ext = chunk as any;
-			if (ext._started) {
-				// Tool has been promoted to "started" or "completed" — render as a real
-				// tool call card with actual input instead of the streaming indicator.
-				const inputJson = ext._input ?? {};
-				const next = upsertStreamingToolBlock(
-					blocks,
-					toolCalls,
-					chunk.toolUseId,
-					chunk.toolName,
-					inputJson,
-				);
-				blocks = next.blocks;
-				toolCalls = next.toolCalls;
-				// Patch status, timing, and output so the card reflects real state
-				const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
-				if (tcIdx !== -1) {
-					toolCalls[tcIdx] = {
-						...toolCalls[tcIdx],
-						status: ext._status ?? "running",
-						...(ext._startedAt && { startedAt: ext._startedAt }),
-						...(ext._output !== undefined && { outputJson: ext._output }),
-						...(ext._durationMs != null && { durationMs: ext._durationMs }),
-						...(ext._sideCars && { sideCars: ext._sideCars }),
-						...(ext._metadata && { _metadata: ext._metadata }),
-						...(chunk.metadata && { _metadata: chunk.metadata }),
-						...(ext._longRunning && { _longRunning: true }),
-						...(ext._streamedFullOutput && { _streamedFullOutput: true }),
-
-						...(ext._streamingOutput && { _streamingOutput: ext._streamingOutput }),
-					};
-				}
-			} else {
-				const next = upsertStreamingToolBlock(blocks, toolCalls, chunk.toolUseId, chunk.toolName, {
-					_streamingChars: chunk.inputCharsTotal,
-					...(chunk.extractedFilePath && { _streamingFilePath: chunk.extractedFilePath }),
-					...(chunk.contentCharsReceived != null && {
-						_streamingContentChars: chunk.contentCharsReceived,
-					}),
-					...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
-					...(chunk.metadata && { _streamingMetadata: chunk.metadata }),
-					...(chunk.streamingFieldName && {
-						_streamingFieldName: chunk.streamingFieldName,
-					}),
-					...(chunk.streamingFieldValue && {
-						_streamingFieldValue: chunk.streamingFieldValue,
-					}),
-				});
-				blocks = next.blocks;
-				toolCalls = next.toolCalls;
-				const tcIdx = toolCalls.findIndex((tc) => tc.toolUseId === chunk.toolUseId);
-				if (tcIdx !== -1 && chunk.metadata) {
-					toolCalls[tcIdx] = {
-						...toolCalls[tcIdx],
-						_metadata: chunk.metadata,
-					} as (typeof toolCalls)[number];
-				}
-			}
-		}
-
-		return {
-			id: STREAMING_CHUNKS_MSG_ID,
+		if (!legacyMessageCacheUpdatesEnabled) return null;
+		return buildTopLevelStreamingChunksMsg(
+			[...topLevelStreamingChunkRef.current.values()],
 			narratorId,
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: blocks,
-			contentText: null,
-			toolCalls,
-			createdAt: topLevelStreamingCreatedAtRef.current ?? new Date().toISOString(),
-			children: [],
-		};
-	}, [topLevelChunksVersion, narratorId]);
+			topLevelStreamingCreatedAtRef.current,
+		);
+	}, [legacyMessageCacheUpdatesEnabled, topLevelChunksVersion, narratorId]);
 
 	// --- Permission decision refs ---
 	const sendPermissionDecisionRef = useRef<
@@ -1354,6 +1112,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (!ev.delta?.text) {
 					return;
 				}
+				if (!legacyMessageCacheUpdatesEnabled) {
+					clearQueueMessage();
+					clearRetryIfActive();
+					return;
+				}
 				if (ev.delta.type === "text_delta") {
 					// A real upstream event means queue-only explanatory text is no longer current.
 					clearQueueMessage();
@@ -1559,8 +1322,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								const updated = [...firstPage.messages];
 								const om = updated[optimisticIdx];
 								revokeContentBlockPreviewUrls(om.contentJson);
-								updated[optimisticIdx] = newMsg;
-								firstPage.messages = updated;
+								updated.splice(optimisticIdx, 1);
+								firstPage.messages = insertTopLevelMessageBySeq(updated, newMsg);
 							} else {
 								firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
 							}
@@ -1583,8 +1346,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					// intermediate frame where the message list is empty (no flicker).
 					if (needsStreamingVersionBump) {
 						flushCacheUpdatesSync();
-						setStreamingVersion((v) => v + 1);
-						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						if (legacyMessageCacheUpdatesEnabled) {
+							setStreamingVersion((v) => v + 1);
+						}
+						bumpLegacyTopLevelStreamingChunksVersion();
 					}
 				} else {
 					qc.invalidateQueries({ queryKey: messagesQueryKey });
@@ -1626,8 +1391,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						const om = updated[optimisticIdx];
 						revokeContentBlockPreviewUrls(om.contentJson);
 
-						updated[optimisticIdx] = newMsg;
-						firstPage.messages = updated;
+						updated.splice(optimisticIdx, 1);
+						firstPage.messages = insertTopLevelMessageBySeq(updated, newMsg);
 					} else {
 						firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, newMsg);
 					}
@@ -1681,7 +1446,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							_streamedFullOutput: completedOutput.preserved || undefined,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
-						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						bumpLegacyTopLevelStreamingChunksVersion();
 					}
 				}
 
@@ -1761,7 +1526,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							_longRunning: true,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
-						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						bumpLegacyTopLevelStreamingChunksVersion();
 					}
 				}
 
@@ -1778,7 +1543,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onToolOutput: (toolUseId: string, output: string, _parentToolUseId?: string) => {
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				// Store only a bounded live preview in React Query while preserving final outputJson
+
 				// semantics when tool_completed arrives.
 				const preview = getToolOutputPreview(output);
 				const shouldThrottle = output.length >= STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS;
@@ -1846,7 +1613,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							_startedAt: streamStartedAt,
 							// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 						} as any);
-						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						bumpLegacyTopLevelStreamingChunksVersion();
 					}
 				}
 
@@ -1998,6 +1765,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				metadata?: Record<string, unknown>,
 				streamingField?: { name: string; delta: string },
 			) => {
+				if (!legacyMessageCacheUpdatesEnabled) return;
 				// Accumulate streaming field value across frames (not cleared per RAF)
 				if (streamingField) {
 					const prev = toolStreamingFieldRef.current.get(toolUseId);
@@ -2075,7 +1843,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							topLevelChanged = true;
 						}
 						if (topLevelChanged) {
-							bumpTopLevelStreamingChunksVersion((v) => v + 1);
+							bumpLegacyTopLevelStreamingChunksVersion();
 						}
 					});
 				}
@@ -2686,8 +2454,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onWebSearch: (id, status, query, queries, outputIndex, parentToolUseId) => {
 				// Subagent native searches are delivered to the parent for bookkeeping,
 				// but must not populate the parent's top-level streaming message.
-				if (parentToolUseId) return;
+				if (parentToolUseId || !legacyMessageCacheUpdatesEnabled) return;
 				const blocks = streamingBlocksRef.current;
+
 				const existingIdx = blocks.findIndex((b) => b.type === "web_search" && b.id === id);
 				if (existingIdx !== -1) {
 					const existing = blocks[existingIdx];
@@ -2723,7 +2492,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) => {
 				// Subagent native image generation events should stay out of the parent's
 				// top-level streaming message; the subagent page receives an unlinked copy.
-				if (parentToolUseId) return;
+				if (parentToolUseId || !legacyMessageCacheUpdatesEnabled) return;
 				const blocks = streamingBlocksRef.current;
 				const existingIdx = blocks.findIndex((b) => b.type === "image_generation" && b.id === id);
 				if (existingIdx !== -1) {
@@ -3140,12 +2909,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						}
 					}
 					if (topLevelChanged) {
-						bumpTopLevelStreamingChunksVersion((v) => v + 1);
+						bumpLegacyTopLevelStreamingChunksVersion();
 					}
 				}
 			},
 		},
 		lastMessageId,
+		{ trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled },
 	);
 
 	// Keep refs in sync
@@ -3161,6 +2931,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// effect below — no need to duplicate here.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only effect — intentionally runs once
 	useEffect(() => {
+		if (!legacyMessageCacheUpdatesEnabled) return;
 		const cached = qc.getQueryData(messagesQueryKey) as MessagesQueryData | undefined;
 		if (!cached?.pages?.length) return; // first load — nothing to sync
 		if (firstPageHasMoreAfter) return; // around-mode (deep link) — skip
@@ -3227,7 +2998,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			streamingBlocksRef.current = [];
 			cancelPendingToolChunks(true, true);
 			clearStreamingState();
-			qc.invalidateQueries({ queryKey: messagesQueryKey });
+			if (legacyMessageCacheUpdatesEnabled) {
+				qc.invalidateQueries({ queryKey: messagesQueryKey });
+			}
 		}
 
 		api
@@ -3246,9 +3019,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						}
 						return next;
 					});
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-						applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-					);
+					if (legacyMessageCacheUpdatesEnabled) {
+						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+						);
+					}
 				}
 			})
 			.catch(() => {});
@@ -3256,7 +3031,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			.getBufferedMessages(narratorId)
 			.then((msgs) => setQueuedMessages(msgs ?? []))
 			.catch(() => {});
-	}, [narratorId, connected]);
+	}, [narratorId, connected, legacyMessageCacheUpdatesEnabled]);
 
 	// --- Fallback polling for permissions ---
 	useEffect(() => {
@@ -3280,9 +3055,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							}
 							return next;
 						});
-						qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
-							applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
-						);
+						if (legacyMessageCacheUpdatesEnabled) {
+							qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) =>
+								applyPendingPermissionsToCache(old, perms, toolUseIndexRef.current),
+							);
+						}
 					}
 				})
 				.catch(() => {});
@@ -3293,7 +3070,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			cancelled = true;
 			clearInterval(timer);
 		};
-	}, [narratorId, narratorStatus, pendingPermsMap.size, messagesQueryKey, qc]);
+	}, [
+		narratorId,
+		narratorStatus,
+		pendingPermsMap.size,
+		messagesQueryKey,
+		qc,
+		legacyMessageCacheUpdatesEnabled,
+	]);
 
 	// --- Mark "done" narrator as read ---
 	// With substatus refactor, "done" is now idle + substatus includes "unread".

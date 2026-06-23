@@ -8,6 +8,7 @@ import {
 	Loader,
 	Paper,
 	ScrollArea,
+	Select,
 	Stack,
 	Text,
 	Textarea,
@@ -19,14 +20,16 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	useAddChatGroupMember,
 	useApplyIncomingGroupMessage,
 	useChatGroup,
 	useChatGroupMessages,
+	useNamedNarrators,
 	usePostChatGroupMessage,
 } from "../../hooks/useChatGroup";
 import { useChatGroupWS } from "../../hooks/useChatGroupWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
-import type { ChatGroupMessage } from "../../lib/api";
+import type { ChatGroupMember, ChatGroupMessage } from "../../lib/api";
 
 export const Route = createFileRoute("/groups/$groupId")({
 	component: GroupChatPage,
@@ -40,6 +43,53 @@ function senderColor(label: string): string {
 	return palette[hash % palette.length];
 }
 
+function memberLabel(member: ChatGroupMember): string {
+	return member.handle
+		? `@${member.handle}`
+		: (member.title ?? member.narratorId?.slice(0, 6) ?? "?");
+}
+
+function memberRoleColor(role: ChatGroupMember["role"]): string {
+	if (role === "named") return "grape";
+	if (role === "origin") return "indigo";
+	return "gray";
+}
+
+function memberStatusColor(status?: string | null): string {
+	switch (status) {
+		case "working":
+			return "blue";
+		case "waiting":
+			return "yellow";
+		case "error":
+			return "red";
+		case "archived":
+			return "gray";
+		default:
+			return "green";
+	}
+}
+
+function memberStatusLabel(
+	t: (key: string, options?: Record<string, string>) => string,
+	status?: string | null,
+): string {
+	switch (status) {
+		case "working":
+			return t("groupMemberStatusWorking");
+		case "waiting":
+			return t("groupMemberStatusWaiting");
+		case "archived":
+			return t("groupMemberStatusArchived");
+		case "error":
+			return t("groupMemberStatusError");
+		case "idle":
+			return t("groupMemberStatusIdle");
+		default:
+			return status ? t("groupMemberStatusOther", { status }) : t("groupMemberStatusUnknown");
+	}
+}
+
 function GroupChatPage() {
 	const { groupId } = Route.useParams();
 	const navigate = useNavigate();
@@ -48,6 +98,8 @@ function GroupChatPage() {
 	const { data: groupData, isLoading } = useChatGroup(groupId);
 	const messagesQuery = useChatGroupMessages(groupId);
 	const postMessage = usePostChatGroupMessage(groupId);
+	const addMember = useAddChatGroupMember(groupId);
+	const { data: namedNarrators } = useNamedNarrators();
 	const applyIncoming = useApplyIncomingGroupMessage();
 
 	// Register a recent tab on visit (fallback discovery path).
@@ -61,12 +113,29 @@ function GroupChatPage() {
 		});
 	}, [groupId, groupData, groupTitle, t]);
 
-	const memberNarratorIds = useMemo(
-		() =>
-			(groupData?.members ?? [])
-				.filter((m) => m.memberType === "narrator" && m.narratorId)
-				.map((m) => m.narratorId as string),
+	const narratorMembers = useMemo(
+		() => (groupData?.members ?? []).filter((m) => m.memberType === "narrator"),
 		[groupData?.members],
+	);
+	const memberNarratorIds = useMemo(
+		() => narratorMembers.filter((m) => m.narratorId).map((m) => m.narratorId as string),
+		[narratorMembers],
+	);
+	const memberNarratorIdSet = useMemo(() => new Set(memberNarratorIds), [memberNarratorIds]);
+	const addMemberOptions = useMemo(
+		() =>
+			(namedNarrators ?? [])
+				.filter((n: { id: string; handle?: string | null }) => {
+					return !!n.handle && !memberNarratorIdSet.has(n.id);
+				})
+				.map((n: { handle?: string | null; title?: string | null }) => {
+					const handle = n.handle as string;
+					return {
+						value: handle,
+						label: n.title ? `@${handle} · ${n.title}` : `@${handle}`,
+					};
+				}),
+		[memberNarratorIdSet, namedNarrators],
 	);
 
 	const handleIncoming = useCallback(
@@ -116,6 +185,29 @@ function GroupChatPage() {
 		);
 	}, [input, urgent, postMessage, t]);
 
+	const handleAddMember = useCallback(
+		(handle: string | null) => {
+			if (!handle) return;
+			addMember.mutate(handle, {
+				onSuccess: () => {
+					notifications.show({
+						color: "grape",
+						title: t("groupAddMemberSuccessTitle"),
+						message: t("groupAddMemberSuccessMessage", { handle: `@${handle}` }),
+					});
+				},
+				onError: (err) => {
+					notifications.show({
+						color: "red",
+						title: t("groupAddMemberFailed"),
+						message: err instanceof Error ? err.message : String(err),
+					});
+				},
+			});
+		},
+		[addMember, t],
+	);
+
 	if (isLoading) {
 		return (
 			<Center h="calc(100dvh - 60px)">
@@ -132,8 +224,7 @@ function GroupChatPage() {
 		);
 	}
 
-	const { group, members } = groupData;
-	const narratorMembers = members.filter((m) => m.memberType === "narrator");
+	const { group } = groupData;
 
 	return (
 		<Box
@@ -153,20 +244,55 @@ function GroupChatPage() {
 						{group.title || t("groupUntitled")}
 					</Text>
 				</Group>
-				<Group gap={4} wrap="nowrap">
-					{narratorMembers.map((m) => {
-						const label = m.handle ? `@${m.handle}` : (m.title ?? m.narratorId?.slice(0, 6) ?? "?");
-						return (
-							<Badge
-								key={m.id}
-								size="sm"
-								variant="light"
-								color={m.role === "named" ? "grape" : "gray"}
-							>
-								{label}
-							</Badge>
-						);
-					})}
+				<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+					<Select
+						size="xs"
+						w={220}
+						placeholder={
+							addMemberOptions.length > 0 ? t("groupAddMember") : t("groupNoMoreNamedMembers")
+						}
+						data={addMemberOptions}
+						value={null}
+						onChange={handleAddMember}
+						searchable
+						disabled={addMemberOptions.length === 0 || addMember.isPending}
+						comboboxProps={{ withinPortal: true }}
+					/>
+					<Group gap={4} wrap="nowrap" style={{ minWidth: 0, overflow: "hidden" }}>
+						{narratorMembers.map((m) => {
+							const label = memberLabel(m);
+							const statusLabel = memberStatusLabel(t, m.status);
+							return (
+								<Tooltip key={m.id} label={t("groupOpenNarrator")}>
+									<Badge
+										size="sm"
+										variant="light"
+										color={memberRoleColor(m.role)}
+										rightSection={
+											<Box
+												w={6}
+												h={6}
+												style={{
+													borderRadius: 999,
+													background: `var(--mantine-color-${memberStatusColor(m.status)}-5)`,
+												}}
+											/>
+										}
+										style={{ cursor: m.narratorId ? "pointer" : undefined, flexShrink: 0 }}
+										onClick={() => {
+											if (!m.narratorId) return;
+											navigate({
+												to: "/narrators/$narratorId",
+												params: { narratorId: m.narratorId },
+											});
+										}}
+									>
+										{label} · {statusLabel}
+									</Badge>
+								</Tooltip>
+							);
+						})}
+					</Group>
 				</Group>
 			</Group>
 

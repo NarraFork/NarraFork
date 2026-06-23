@@ -93,6 +93,7 @@ import {
 } from "./MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
+	makeMessageBlockSelectionId,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
 } from "./MessageSelectionCtx";
@@ -460,7 +461,10 @@ function WebSearchBlock({
 
 	// --- Block ID, selection, swipe & context menu state ---
 	const wsInstanceId = useRef(nextWsInstanceId++);
-	const blockIdStr = `ws-${wsInstanceId.current}`;
+	const blockIdStr =
+		messageId && blockIndex != null
+			? makeMessageBlockSelectionId(messageId, blockIndex)
+			: `ws-${wsInstanceId.current}`;
 	const rootRef = useRef<HTMLDivElement>(null);
 	const selection = useMessageSelection();
 	const msgCtx = useMessageContextMenu();
@@ -1370,7 +1374,10 @@ export const ReasoningBlock = memo(
 
 		// --- Block ID, selection, swipe & context menu state ---
 		const rbInstanceId = useRef(nextRbInstanceId++);
-		const blockIdStr = `rb-${rbInstanceId.current}`;
+		const blockIdStr =
+			messageId && blockIndex != null
+				? makeMessageBlockSelectionId(messageId, blockIndex)
+				: `rb-${rbInstanceId.current}`;
 		const rootRef = useRef<HTMLDivElement>(null);
 		const selection = useMessageSelection();
 		const msgCtx = useMessageContextMenu();

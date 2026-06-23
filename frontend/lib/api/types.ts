@@ -522,15 +522,17 @@ export interface PaginatedMessages {
 
 // ── Chunk virtualization (manifest + range) ────────────────────────────────
 
+/** Decoded manifest entry (after expanding the compact wire tuple). */
 export interface ChunkManifestEntry {
 	/** = first message id in the chunk (stable across compact/seq shifts) */
 	id: string;
 	firstSeq: number;
 	lastSeq: number;
 	count: number;
-	/** structural fingerprint (changes on insert/delete/reorder) */
-	hash: string;
 }
+
+/** Compact wire tuple: [id, firstSeq, lastSeq, count]. */
+export type ChunkManifestTuple = [string, number, number, number];
 
 export type ChunkManifest =
 	| { unchanged: true; messageVersion: number }
@@ -538,7 +540,8 @@ export type ChunkManifest =
 			unchanged: false;
 			messageVersion: number;
 			total: number;
-			chunks: ChunkManifestEntry[];
+			/** Compact tuples on the wire; decode with decodeChunkManifestTuple. */
+			chunks: ChunkManifestTuple[];
 	  };
 
 export interface ChunkRangeResult {

@@ -177,7 +177,11 @@ import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserPanel } from "./BrowserPanel";
 import { ChapterBar } from "./ChapterBar";
-import { ChunkedMessageList } from "./ChunkedMessageList";
+import {
+	ChunkedMessageList,
+	type ChunkedMessageListHandle,
+	type ChunkTailMeta,
+} from "./ChunkedMessageList";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
@@ -206,6 +210,7 @@ import {
 	BLOCK_ID_ATTR,
 	collectSelectedText,
 	MessageSelectionCtx,
+	type MessageSelectionResolver,
 	type MessageSelectionState,
 	resolveBlockRange,
 	resolveSelectedBlockMeta,
@@ -218,7 +223,11 @@ import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { NugRechargeDialog } from "./NugRechargeDialog";
-import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
+import {
+	insertTopLevelMessageBySeq,
+	resolvePendingPerm,
+	revokeContentBlockPreviewUrls,
+} from "./narrator-message-helpers";
 import type {
 	ContentBlock,
 	MessagesPage,
@@ -2028,6 +2037,10 @@ export function NarratorPanel({
 	const removeGoalMutation = useRemoveNarratorGoal(narratorId);
 	const clearGoalsMutation = useClearNarratorGoals(narratorId);
 	const reorderGoalsMutation = useReorderNarratorGoals(narratorId);
+	const chunkedListEnabled = useChunkedListEnabled();
+	const isWorkspacePreview = workspacePreview === true;
+	const usesChunkMessageList = chunkedListEnabled && !isWorkspacePreview;
+	const legacyMessagesEnabled = !usesChunkMessageList;
 
 	const aroundOptions = useMemo(
 		() =>
@@ -2049,7 +2062,7 @@ export function NarratorPanel({
 		hasPreviousPage,
 		fetchPreviousPage,
 		isFetchingPreviousPage,
-	} = useNarratorMessages(narratorId, aroundOptions);
+	} = useNarratorMessages(narratorId, aroundOptions, { enabled: legacyMessagesEnabled });
 	const [messageRenderReady, setMessageRenderReady] = useState(false);
 	const [messageRenderPhase, setMessageRenderPhase] = useState<"tail" | "full">(() =>
 		highlightMessageId ? "full" : "tail",
@@ -2081,10 +2094,13 @@ export function NarratorPanel({
 		};
 	}, []);
 	const hasMessagePageData = !!messagesData?.pages?.length;
-	const canRenderMessages =
-		!messagesLoading && (messageRenderReady || (!highlightMessageId && hasMessagePageData));
+	const canRenderLegacyMessages =
+		legacyMessagesEnabled &&
+		!messagesLoading &&
+		(messageRenderReady || (!highlightMessageId && hasMessagePageData));
+	const canRenderMessageArea = usesChunkMessageList ? true : canRenderLegacyMessages;
 	useEffect(() => {
-		if (!canRenderMessages || highlightMessageId || messageRenderPhase !== "tail") return;
+		if (!canRenderLegacyMessages || highlightMessageId || messageRenderPhase !== "tail") return;
 		let cancelled = false;
 		let timeoutId: number | null = null;
 		let idleId: number | null = null;
@@ -2108,9 +2124,9 @@ export function NarratorPanel({
 			if (idleId != null) window.cancelIdleCallback(idleId);
 			if (timeoutId != null) window.clearTimeout(timeoutId);
 		};
-	}, [canRenderMessages, highlightMessageId, messageRenderPhase]);
+	}, [canRenderLegacyMessages, highlightMessageId, messageRenderPhase]);
 	const deferredMessagesData = useMemo(() => {
-		if (!canRenderMessages) return undefined;
+		if (!canRenderLegacyMessages) return undefined;
 		if (highlightMessageId || messageRenderPhase === "full") return messagesData;
 		const firstPage = messagesData?.pages?.[0];
 		if (!messagesData || !firstPage) return messagesData;
@@ -2119,7 +2135,7 @@ export function NarratorPanel({
 			pages: [firstPage],
 			pageParams: messagesData.pageParams?.slice(0, 1) ?? [undefined],
 		};
-	}, [canRenderMessages, highlightMessageId, messageRenderPhase, messagesData]);
+	}, [canRenderLegacyMessages, highlightMessageId, messageRenderPhase, messagesData]);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
@@ -2144,7 +2160,6 @@ export function NarratorPanel({
 	const updateUserPrefs = useUpdateUserPreferences();
 	const fastModeDefault = userPrefs?.fastModeDefault ?? false;
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
-	const chunkedListEnabled = useChunkedListEnabled();
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
 	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	const fastModeUsesTapSettings = isMobileViewport || isCoarsePointer;
@@ -2282,7 +2297,6 @@ export function NarratorPanel({
 	}, [promoteMutation, narratorId, t, navigate]);
 
 	const displayTitle = narrator?.title || t("untitled");
-	const isWorkspacePreview = workspacePreview === true;
 	// Resolve the effective model: when following default, use the actual default model value
 	const resolvedModel = useMemo(() => {
 		const m = narrator?.model;
@@ -2463,6 +2477,21 @@ export function NarratorPanel({
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
 	const handleDeleteBlock = useCallback(
 		async (messageId: string, blockIndex: number) => {
+			if (usesChunkMessageList) {
+				try {
+					await api.deleteMessageBlock(narratorId, messageId, blockIndex);
+					chunkListRef.current?.refreshStructure("full");
+				} catch {
+					notifications.show({
+						title: t("deleteMessageFailed"),
+						message: t("deleteMessageFailedDesc"),
+						color: "red",
+						autoClose: 5000,
+					});
+				}
+				return;
+			}
+
 			const prev = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length) return old;
@@ -2492,7 +2521,7 @@ export function NarratorPanel({
 				});
 			}
 		},
-		[qc, messagesQueryKey, narratorId, t],
+		[qc, messagesQueryKey, narratorId, t, usesChunkMessageList],
 	);
 
 	const [pendingRollback, setPendingRollback] = useState<{
@@ -2931,6 +2960,7 @@ export function NarratorPanel({
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
+	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
 	const isAtBottomRef = useRef(isAtBottom);
 	isAtBottomRef.current = isAtBottom;
 	const isTailRenderWindowRef = useRef(true);
@@ -3002,6 +3032,10 @@ export function NarratorPanel({
 
 	const scrollToBottom = useCallback(
 		(instant?: boolean) => {
+			if (usesChunkMessageList) {
+				chunkListRef.current?.scrollToBottom(instant);
+				return;
+			}
 			const vp = viewportRef.current;
 			if (!vp) return;
 			if (isTailRenderWindowRef.current) {
@@ -3018,7 +3052,7 @@ export function NarratorPanel({
 				startFollowing();
 			}
 		},
-		[startFollowing],
+		[usesChunkMessageList, startFollowing],
 	);
 	scrollToBottomRef.current = scrollToBottom;
 	const wasWorkspacePreviewRef = useRef(isWorkspacePreview);
@@ -3108,6 +3142,7 @@ export function NarratorPanel({
 		narratorErrorMessage: narrator?.errorMessage ?? null,
 		messagesData: deferredMessagesData,
 		messagesQueryKey,
+		legacyMessageCacheUpdatesEnabled: legacyMessagesEnabled,
 		isAtBottomRef,
 		scrollToBottom,
 		narratorTodosJson: narrator?.todosJson,
@@ -3954,6 +3989,23 @@ export function NarratorPanel({
 		});
 		return () => cancelAnimationFrame(id);
 	}, []);
+	const [chunkTailMeta, setChunkTailMeta] = useState<ChunkTailMeta>({ lastRealMessage: null });
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	useEffect(() => {
+		setChunkTailMeta({ lastRealMessage: null });
+	}, [narratorId]);
+	const handleChunkTailMetaChange = useCallback((meta: ChunkTailMeta) => {
+		setChunkTailMeta((prev) => {
+			if (
+				prev.lastRealMessage?.id === meta.lastRealMessage?.id &&
+				prev.lastRealMessage?.role === meta.lastRealMessage?.role &&
+				prev.lastUserMessageId === meta.lastUserMessageId
+			) {
+				return prev;
+			}
+			return meta;
+		});
+	}, []);
 
 	// Lightweight derived values — avoid full reverse().flatMap() on every update.
 	const totalMessageCount = useMemo(() => {
@@ -3981,23 +4033,24 @@ export function NarratorPanel({
 	}, [hydrated, deferredMessagesData]);
 
 	const narratorIsIdle = narrator?.status === "idle";
+	const effectiveLastMessage = usesChunkMessageList ? chunkTailMeta.lastRealMessage : lastMessage;
 
 	const canRetryLastUserMessage =
-		!!lastMessage &&
-		lastMessage.role === "user" &&
-		!String(lastMessage.id).startsWith("optimistic-") &&
+		!!effectiveLastMessage &&
+		effectiveLastMessage.role === "user" &&
+		!String(effectiveLastMessage.id).startsWith("optimistic-") &&
 		narratorIsIdle &&
 		retryRecoveryAllowsRetry;
 
 	const canContinueNarrator =
-		!!lastMessage &&
-		lastMessage.role === "assistant" &&
-		!String(lastMessage.id).startsWith("optimistic-") &&
+		!!effectiveLastMessage &&
+		effectiveLastMessage.role === "assistant" &&
+		!String(effectiveLastMessage.id).startsWith("optimistic-") &&
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
 
 	// Find the last user message ID for edit confirmation logic
-	const lastUserMessageId = useMemo(() => {
+	const legacyLastUserMessageId = useMemo(() => {
 		if (!hydrated || !deferredMessagesData?.pages) return undefined;
 		const orderedMessages = getRenderableMessageOrder(deferredMessagesData.pages).messages;
 		for (let i = orderedMessages.length - 1; i >= 0; i--) {
@@ -4008,6 +4061,9 @@ export function NarratorPanel({
 		}
 		return undefined;
 	}, [hydrated, deferredMessagesData]);
+	const lastUserMessageId = usesChunkMessageList
+		? chunkTailMeta.lastUserMessageId
+		: legacyLastUserMessageId;
 
 	const hasChapter = !!narrator?.chapterId;
 
@@ -4035,9 +4091,11 @@ export function NarratorPanel({
 
 	// --- Ask in passing handler ---
 	const startAskInPassingMutation = useStartAskInPassing();
+	const startAskInPassingMutationRef = useRef(startAskInPassingMutation);
+	startAskInPassingMutationRef.current = startAskInPassingMutation;
 	const handleAskInPassing = useCallback(
 		(messageUuid: string | null, messageId: string) => {
-			startAskInPassingMutation.mutate(
+			startAskInPassingMutationRef.current.mutate(
 				{
 					narratorId,
 					sourceMessageId: messageId,
@@ -4054,7 +4112,7 @@ export function NarratorPanel({
 				},
 			);
 		},
-		[narratorId, startAskInPassingMutation],
+		[narratorId],
 	);
 	// --- Message rendering setup ---
 	const highlightScrolledRef = useRef(false);
@@ -4187,6 +4245,8 @@ export function NarratorPanel({
 	const [selectionMode, setSelectionMode] = useState(false);
 	const [selectedBlockIds, setSelectedBlockIds] = useState<Set<string>>(new Set());
 	const [anchorBlockId, setAnchorBlockId] = useState<string | null>(null);
+	const [chunkSelectionResolver, setChunkSelectionResolver] =
+		useState<MessageSelectionResolver | null>(null);
 
 	const exitSelection = useCallback(() => {
 		setSelectionMode(false);
@@ -4231,11 +4291,42 @@ export function NarratorPanel({
 		});
 	}, []);
 
+	const applyRangeSelection = useCallback(
+		(anchor: string, target: string, updateAnchor = false) => {
+			const applyDomFallback = () => {
+				const container = contentRef.current;
+				if (!container) return;
+				const range = resolveBlockRange(container, anchor, target);
+				if (!range) return;
+				setSelectionMode(true);
+				setSelectedBlockIds(range);
+				if (updateAnchor) setAnchorBlockId(anchor);
+			};
+
+			const resolver = usesChunkMessageList ? chunkSelectionResolver : null;
+			const resolved = resolver?.resolveRange?.(anchor, target);
+			if (!resolved) {
+				applyDomFallback();
+				return;
+			}
+			Promise.resolve(resolved)
+				.then((range) => {
+					if (!range) {
+						applyDomFallback();
+						return;
+					}
+					setSelectionMode(true);
+					setSelectedBlockIds(range);
+					if (updateAnchor) setAnchorBlockId(anchor);
+				})
+				.catch(applyDomFallback);
+		},
+		[chunkSelectionResolver, usesChunkMessageList],
+	);
+
 	// Desktop: Shift+Click range-selects from anchor to target
 	const rangeSelectTo = useCallback(
 		(blockId: string) => {
-			const container = contentRef.current;
-			if (!container) return;
 			const anchor = anchorBlockId;
 			if (!anchor) {
 				// No anchor yet — treat as single toggle
@@ -4244,29 +4335,18 @@ export function NarratorPanel({
 				setAnchorBlockId(blockId);
 				return;
 			}
-			const range = resolveBlockRange(container, anchor, blockId);
-			if (!range) return;
-			setSelectionMode(true);
-			setSelectedBlockIds(range);
+			applyRangeSelection(anchor, blockId);
 		},
-		[anchorBlockId],
+		[anchorBlockId, applyRangeSelection],
 	);
 
 	// Register the global range-selection callback so useSwipeMenu instances
 	// can trigger multi-select without prop drilling.
 	useEffect(() => {
-		const handler = (anchor: string, target: string) => {
-			const container = contentRef.current;
-			if (!container) return;
-			const range = resolveBlockRange(container, anchor, target);
-			if (!range) return;
-			setSelectionMode(true);
-			setSelectedBlockIds(range);
-			setAnchorBlockId(anchor);
-		};
+		const handler = (anchor: string, target: string) => applyRangeSelection(anchor, target, true);
 		setGlobalOnSelectionRange(handler);
 		return () => setGlobalOnSelectionRange(null);
-	}, []);
+	}, [applyRangeSelection]);
 
 	// Register toggle callback so useSwipeMenu can add/remove blocks
 	// from the selection when multi-select mode is already active.
@@ -4354,9 +4434,16 @@ export function NarratorPanel({
 
 	// --- Batch copy ---
 	const handleBatchCopy = useCallback(async () => {
-		const container = contentRef.current;
-		if (!container || selectedBlockIds.size === 0) return;
-		const selectedText = collectSelectedText(container, selectedBlockIds, handleRegistry);
+		if (selectedBlockIds.size === 0) return;
+		let selectedText =
+			usesChunkMessageList && chunkSelectionResolver?.collectSelectedText
+				? chunkSelectionResolver.collectSelectedText(selectedBlockIds)
+				: contentRef.current
+					? collectSelectedText(contentRef.current, selectedBlockIds, handleRegistry)
+					: { text: "", truncated: false };
+		if (!selectedText.text && contentRef.current) {
+			selectedText = collectSelectedText(contentRef.current, selectedBlockIds, handleRegistry);
+		}
 		if (!selectedText.text) return;
 		try {
 			await navigator.clipboard.writeText(selectedText.text);
@@ -4370,19 +4457,26 @@ export function NarratorPanel({
 			// Fallback: some browsers block clipboard in non-secure contexts
 		}
 		exitSelection();
-	}, [selectedBlockIds, exitSelection, t]);
+	}, [selectedBlockIds, usesChunkMessageList, chunkSelectionResolver, exitSelection, t]);
 
 	// --- Batch delete ---
 	const handleBatchDelete = useCallback(async () => {
-		const container = contentRef.current;
-		if (!container || selectedBlockIds.size === 0) return;
-		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
+		if (selectedBlockIds.size === 0) return;
+		let metas =
+			usesChunkMessageList && chunkSelectionResolver?.resolveSelectedMeta
+				? chunkSelectionResolver.resolveSelectedMeta(selectedBlockIds)
+				: contentRef.current
+					? resolveSelectedBlockMeta(contentRef.current, selectedBlockIds)
+					: [];
+		if (metas.length === 0 && contentRef.current) {
+			metas = resolveSelectedBlockMeta(contentRef.current, selectedBlockIds);
+		}
 		if (metas.length === 0) return;
 		// Confirm
 		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
 		if (!ok) return;
 		// Optimistic update: remove blocks from cache
-		const prevData = qc.getQueryData(messagesQueryKey);
+		const prevData = usesChunkMessageList ? undefined : qc.getQueryData(messagesQueryKey);
 		if (prevData) {
 			// Build a set of messageId:blockIndex for quick lookup
 			const toDelete = new Set(metas.map((m) => `${m.messageId}:${m.blockIndex}`));
@@ -4417,32 +4511,48 @@ export function NarratorPanel({
 			);
 			// Always re-fetch from server to ensure consistency (best-effort delete
 			// may have partially succeeded, so optimistic cache may be inaccurate)
-			qc.invalidateQueries({ queryKey: messagesQueryKey });
+			if (usesChunkMessageList) {
+				chunkListRef.current?.refreshStructure("full");
+			} else {
+				qc.invalidateQueries({ queryKey: messagesQueryKey });
+			}
 			if (res.failed > 0) {
 				notifications.show({ message: t("batchDeleteFailed"), color: "orange" });
 			}
 		} catch {
 			// Network / unexpected error — re-fetch to reflect whatever actually happened
-			qc.invalidateQueries({ queryKey: messagesQueryKey });
+			if (usesChunkMessageList) {
+				chunkListRef.current?.refreshStructure("full");
+			} else {
+				qc.invalidateQueries({ queryKey: messagesQueryKey });
+			}
 			notifications.show({ message: t("batchDeleteFailed"), color: "red" });
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, messagesQueryKey, qc, t, confirm]);
+	}, [
+		selectedBlockIds,
+		usesChunkMessageList,
+		chunkSelectionResolver,
+		exitSelection,
+		narratorId,
+		messagesQueryKey,
+		qc,
+		t,
+		confirm,
+	]);
 
 	// --- Batch fork ---
 	const handleBatchFork = useCallback(async () => {
-		const container = contentRef.current;
-		if (!container || selectedBlockIds.size === 0) return;
-		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
-		if (metas.length === 0) return;
-		// Deduplicate messageIds preserving DOM order
-		const seen = new Set<string>();
-		const messageIds: string[] = [];
-		for (const m of metas) {
-			if (!seen.has(m.messageId)) {
-				seen.add(m.messageId);
-				messageIds.push(m.messageId);
-			}
+		if (selectedBlockIds.size === 0) return;
+		let messageIds =
+			usesChunkMessageList && chunkSelectionResolver?.resolveSelectedMessageIds
+				? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
+				: contentRef.current
+					? resolveSelectedMessageIds(contentRef.current, selectedBlockIds)
+					: [];
+		if (messageIds.length === 0 && contentRef.current) {
+			messageIds = resolveSelectedMessageIds(contentRef.current, selectedBlockIds);
 		}
+		if (messageIds.length === 0) return;
 		exitSelection();
 		try {
 			const newNarrator = await api.forkFromMessages(narratorId, messageIds);
@@ -4454,7 +4564,15 @@ export function NarratorPanel({
 		} catch {
 			notifications.show({ message: t("batchForkFailed"), color: "red" });
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, navigate, t]);
+	}, [
+		selectedBlockIds,
+		usesChunkMessageList,
+		chunkSelectionResolver,
+		exitSelection,
+		narratorId,
+		navigate,
+		t,
+	]);
 
 	// --- Segment compact ---
 	const handleSegmentCompact = useCallback(async () => {
@@ -4466,9 +4584,16 @@ export function NarratorPanel({
 			});
 			return;
 		}
-		const container = contentRef.current;
-		if (!container || selectedBlockIds.size === 0) return;
-		const messageIds = resolveSelectedMessageIds(container, selectedBlockIds);
+		if (selectedBlockIds.size === 0) return;
+		let messageIds =
+			usesChunkMessageList && chunkSelectionResolver?.resolveSelectedMessageIds
+				? chunkSelectionResolver.resolveSelectedMessageIds(selectedBlockIds)
+				: contentRef.current
+					? resolveSelectedMessageIds(contentRef.current, selectedBlockIds)
+					: [];
+		if (messageIds.length === 0 && contentRef.current) {
+			messageIds = resolveSelectedMessageIds(contentRef.current, selectedBlockIds);
+		}
 		if (messageIds.length === 0) return;
 		const segmentCompactConfirmMessage = compactUsesFallbackSummary
 			? `${t("segmentCompactConfirm", { count: messageIds.length })}\n\n${compactFallbackSummaryReason}`
@@ -4490,6 +4615,8 @@ export function NarratorPanel({
 	}, [
 		selectedBlockIds,
 		exitSelection,
+		usesChunkMessageList,
+		chunkSelectionResolver,
 		narratorId,
 		t,
 		confirm,
@@ -4613,7 +4740,7 @@ export function NarratorPanel({
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
 	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
-		if (isResizing || !deferredMessagesData?.pages) {
+		if (usesChunkMessageList || isResizing || !deferredMessagesData?.pages) {
 			return {
 				flatElements: [],
 				flatKeys: [],
@@ -4821,6 +4948,7 @@ export function NarratorPanel({
 			flatTargets: allTargets,
 		};
 	}, [
+		usesChunkMessageList,
 		isResizing,
 		deferredMessagesData,
 		narratorId,
@@ -4970,6 +5098,9 @@ export function NarratorPanel({
 		activeMessageRenderWindow != null &&
 		activeMessageRenderWindow.end < finalElements.length;
 	isTailRenderWindowRef.current = !hasHiddenNewerLoadedWindow;
+	const showScrollToBottomButton = usesChunkMessageList
+		? !isAtBottom || unreadCount > 0
+		: !isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow;
 	useLayoutEffect(() => {
 		if (hasHiddenNewerLoadedWindow) {
 			detachFromFullBottom();
@@ -5246,6 +5377,7 @@ export function NarratorPanel({
 		shouldWindowMessages && (activeMessageRenderWindow?.start ?? 0) > 0;
 	useEffect(() => {
 		if (
+			usesChunkMessageList ||
 			!autoLoadEnabled ||
 			!hasNextPage ||
 			!initialScrollDone ||
@@ -5282,6 +5414,7 @@ export function NarratorPanel({
 		return () => vp.removeEventListener("scroll", check);
 	}, [
 		autoLoadEnabled,
+		usesChunkMessageList,
 		hasHiddenOlderLoadedWindow,
 		hasNextPage,
 		initialScrollDone,
@@ -5292,6 +5425,7 @@ export function NarratorPanel({
 	handleLoadNewerRef.current = handleLoadNewer;
 	useEffect(() => {
 		if (
+			usesChunkMessageList ||
 			!autoLoadEnabled ||
 			!hasPreviousPage ||
 			!initialScrollDone ||
@@ -5314,6 +5448,7 @@ export function NarratorPanel({
 		return () => vp.removeEventListener("scroll", check);
 	}, [
 		autoLoadEnabled,
+		usesChunkMessageList,
 		hasHiddenNewerLoadedWindow,
 		hasPreviousPage,
 		initialScrollDone,
@@ -5326,6 +5461,12 @@ export function NarratorPanel({
 	const userScrollIntentExpiresAtRef = useRef(0);
 	const scrollbarDragRef = useRef(false);
 	const cleanupRef = useRef<(() => void) | null>(null);
+	const chunkViewportRef = useCallback((node: HTMLDivElement | null) => {
+		cleanupRef.current?.();
+		cleanupRef.current = null;
+		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
+	}, []);
+
 	const viewportCallbackRef = useCallback((node: HTMLDivElement | null) => {
 		cleanupRef.current?.();
 		cleanupRef.current = null;
@@ -5460,6 +5601,7 @@ export function NarratorPanel({
 	// --- Initial scroll ---
 	// biome-ignore lint/correctness/useExhaustiveDependencies: renderDone is a state trigger — effect must re-run when it flips to true
 	useEffect(() => {
+		if (usesChunkMessageList) return;
 		if (
 			!initialScrollDoneRef.current &&
 			totalMessageCount > 0 &&
@@ -5480,7 +5622,7 @@ export function NarratorPanel({
 			initialScrollDoneRef.current = true;
 			setInitialScrollDone(true);
 		}
-	}, [totalMessageCount, renderDone, scrollToBottom, highlightMessageId]);
+	}, [totalMessageCount, renderDone, scrollToBottom, highlightMessageId, usesChunkMessageList]);
 
 	// --- Auto-scroll via MutationObserver + ResizeObserver ---
 	// MutationObserver detects DOM changes (new messages added) in the scroll
@@ -5488,6 +5630,7 @@ export function NarratorPanel({
 	// handles viewport resize (e.g. DevTools toggle).
 	// biome-ignore lint/correctness/useExhaustiveDependencies: initialScrollDone is a trigger dep, not read inside
 	useEffect(() => {
+		if (usesChunkMessageList) return;
 		const vp = viewportRef.current;
 		if (!vp) return;
 
@@ -5596,7 +5739,7 @@ export function NarratorPanel({
 			vp.removeEventListener("subagent-auto-expand", onSubagentExpand);
 			stopFollowing();
 		};
-	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing]);
+	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing, usesChunkMessageList]);
 
 	const scrollToMessageTarget = useCallback(
 		({
@@ -5620,6 +5763,12 @@ export function NarratorPanel({
 					return true;
 				}
 			}
+			if (usesChunkMessageList) {
+				const handle = chunkListRef.current;
+				if (!handle) return false;
+				handle.scrollToMessageTarget({ domIds, targetIds, highlightId });
+				return true;
+			}
 			const targetIndex = targetIds
 				.map((targetId) => targetIndexMap.get(targetId))
 				.find((index): index is number => index != null);
@@ -5633,7 +5782,7 @@ export function NarratorPanel({
 			}
 			return false;
 		},
-		[scheduleHighlight, scrollToFullIndex, targetIndexMap],
+		[usesChunkMessageList, scheduleHighlight, scrollToFullIndex, targetIndexMap],
 	);
 
 	const compactingMarkerInfo = useMemo(() => {
@@ -5982,14 +6131,15 @@ export function NarratorPanel({
 					const firstPage = { ...pages[0] };
 					const idx = firstPage.messages.findIndex((m: NarratorMsg) => m.id === optimisticId);
 					if (idx !== -1) {
-						// Optimistic message still present — replace it
+						// Optimistic message still present — replace it by seq so any concurrently
+						// broadcast tool cards stay after the real user message.
 						const updated = [...firstPage.messages];
 						revokeContentBlockPreviewUrls(updated[idx].contentJson);
-						updated[idx] = serverMsg;
-						firstPage.messages = updated;
+						updated.splice(idx, 1);
+						firstPage.messages = insertTopLevelMessageBySeq(updated, serverMsg);
 					} else if (!firstPage.messages.some((m: NarratorMsg) => m.id === serverMsg.id)) {
 						// Optimistic was already replaced by WS, but server msg not yet in cache
-						firstPage.messages = [...firstPage.messages, serverMsg];
+						firstPage.messages = insertTopLevelMessageBySeq(firstPage.messages, serverMsg);
 					}
 					pages[0] = firstPage;
 					return { ...old, pages };
@@ -7435,7 +7585,7 @@ export function NarratorPanel({
 									<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
 										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
 											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-												{!canRenderMessages ? (
+												{!canRenderMessageArea ? (
 													<Box h="100%" py="sm" px="md">
 														<Stack gap="md">
 															<Group align="flex-start" gap="sm">
@@ -7500,11 +7650,47 @@ export function NarratorPanel({
 															))}
 														</Box>
 													</Box>
-												) : chunkedListEnabled ? (
+												) : usesChunkMessageList ? (
 													<ChunkedMessageList
+														ref={chunkListRef}
 														narratorId={narratorId}
+														isSubagent={isSubagent}
 														permCb={renderPermCb}
 														hasChapter={hasChapter}
+														onForkFromMessage={forkHandler}
+														highlightedId={highlightedId}
+														highlightMessageId={highlightMessageId}
+														onHighlightTarget={scheduleHighlight}
+														expandedToolUseId={expandedToolUseId}
+														showTokenUsage={showTokenUsage}
+														pruneBoundaryMessageId={pruneBoundaryMessageId}
+														pruneDividerLabel={pruneDividerLabel}
+														onCompactBeforeMessage={
+															compactSupported ? handleCompactBefore : undefined
+														}
+														onClearContextBefore={
+															compactSupported ? handleClearContextBefore : undefined
+														}
+														onManualSummarize={compactSupported ? handleManualSummarize : undefined}
+														onDeleteBlock={handleDeleteBlock}
+														onRollbackToBlock={
+															rollbackEditRegenerateSupported ? handleRollback : undefined
+														}
+														onEditAndRegenerate={
+															rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined
+														}
+														onEditAssistantMessage={handleEditAssistantMessage}
+														onRestoreAssistantMessage={handleRestoreAssistantMessage}
+														lastUserMessageId={lastUserMessageId}
+														onViewSubagentSession={onViewSubagentSession}
+														resolvePerm={resolvePermForRender}
+														onAskInPassing={handleAskInPassing}
+														scrollRef={chunkViewportRef}
+														contentRef={contentRef}
+														onSelectionResolverChange={setChunkSelectionResolver}
+														onAtBottomChange={setIsAtBottom}
+														onUnreadCountChange={setUnreadCount}
+														onTailMetaChange={handleChunkTailMetaChange}
 													/>
 												) : usePixiRenderer ? (
 													<NarratorPixiMessageList
@@ -7553,7 +7739,7 @@ export function NarratorPanel({
 									</FileModDrawerCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
-							{!isWorkspacePreview && (
+							{!usesChunkMessageList && !isWorkspacePreview && (
 								<ScrollbarUserMarkers
 									markers={userMessageMarkers}
 									totalCount={finalElements.length}
@@ -7633,14 +7819,10 @@ export function NarratorPanel({
 									bottom: 12,
 									right: 24,
 									zIndex: 10,
-									transform:
-										!isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow
-											? "translateY(0)"
-											: "translateY(80px)",
-									opacity: !isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow ? 1 : 0,
+									transform: showScrollToBottomButton ? "translateY(0)" : "translateY(80px)",
+									opacity: showScrollToBottomButton ? 1 : 0,
 									transition: "transform 200ms ease, opacity 200ms ease",
-									pointerEvents:
-										!isAtBottom || hasPreviousPage || hasHiddenNewerLoadedWindow ? "auto" : "none",
+									pointerEvents: showScrollToBottomButton ? "auto" : "none",
 								}}
 							>
 								{unreadCount > 0 && (
@@ -7664,9 +7846,17 @@ export function NarratorPanel({
 									color="gray"
 									radius="xl"
 									size="lg"
-									onClick={() =>
-										hasPreviousPage ? revealLatestMessages() : scrollToLatestMessageWindow(true)
-									}
+									onClick={() => {
+										if (usesChunkMessageList) {
+											chunkListRef.current?.scrollToBottom(true);
+											return;
+										}
+										if (hasPreviousPage) {
+											void revealLatestMessages();
+											return;
+										}
+										scrollToLatestMessageWindow(true);
+									}}
 									title={
 										unreadCount > 0
 											? t("scrollToBottomWithCount", { count: unreadCount })
@@ -8023,8 +8213,17 @@ export function NarratorPanel({
 								disabled={isRetrying || !activeTodo}
 								onClick={async () => {
 									if (isRetrying || !activeTodo || !todosToolUseId) return;
+									if (usesChunkMessageList) {
+										setExpandedToolUseId(todosToolUseId);
+										scrollToMessageTarget({
+											domIds: [`tool-use-${todosToolUseId}`],
+											targetIds: [todosToolUseId],
+										});
+										return;
+									}
 									// Search across all pages without flattening
 									let msg: NarratorMsg | null = null;
+
 									for (const page of messagesData?.pages ?? []) {
 										msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
 										if (msg) break;

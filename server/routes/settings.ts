@@ -179,14 +179,17 @@ const searchChannelSchema = z.object({
 	timeoutMs: z.number().int().min(1000).max(300000).optional(),
 });
 
+const customSearchProviderProtocolSchema = z.enum(["zhipu-web-search-v1", "tavily-mcp"]);
+
 const customSearchProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
 	disabled: z.boolean().optional(),
-	protocol: z.literal("narrafork-search-v1"),
+	protocol: customSearchProviderProtocolSchema,
 	baseUrl: z.string(),
 	apiKey: z.string().optional(),
 	headers: z.record(z.string(), z.string()).optional(),
+	options: z.record(z.string(), z.unknown()).optional(),
 	timeoutMs: z.number().int().min(1000).max(300000).optional(),
 });
 
@@ -496,12 +499,46 @@ function isSensitiveHeaderName(name: string): boolean {
 	return /^(authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie)$/i.test(name.trim());
 }
 
+function maskSearchProviderBaseUrl(
+	provider: NonNullable<NarraForkSettings["search"]>["customProviders"][number],
+): string {
+	if (provider.protocol !== "tavily-mcp" || !provider.baseUrl) return provider.baseUrl;
+	try {
+		const url = new URL(provider.baseUrl);
+		const key = url.searchParams.get("tavilyApiKey");
+		if (key) url.searchParams.set("tavilyApiKey", maskApiKey(key));
+		return url.toString();
+	} catch {
+		return provider.baseUrl;
+	}
+}
+
+function restoreMaskedSearchProviderBaseUrl(
+	provider: NonNullable<NarraForkSettings["search"]>["customProviders"][number],
+	existing: NonNullable<NarraForkSettings["search"]>["customProviders"][number] | undefined,
+): void {
+	if (provider.protocol !== "tavily-mcp" || !provider.baseUrl || !existing?.baseUrl) return;
+	try {
+		const nextUrl = new URL(provider.baseUrl);
+		const nextKey = nextUrl.searchParams.get("tavilyApiKey");
+		if (!nextKey?.startsWith("*")) return;
+		const existingUrl = new URL(existing.baseUrl);
+		const existingKey = existingUrl.searchParams.get("tavilyApiKey");
+		if (!existingKey) return;
+		nextUrl.searchParams.set("tavilyApiKey", existingKey);
+		provider.baseUrl = nextUrl.toString();
+	} catch {
+		// Leave malformed URLs untouched; validation/normalization handles them later.
+	}
+}
+
 function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSettings["search"] {
 	if (!search) return undefined;
 	return {
 		...search,
 		customProviders: (search.customProviders ?? []).map((provider) => ({
 			...provider,
+			baseUrl: maskSearchProviderBaseUrl(provider),
 			apiKey: provider.apiKey ? maskApiKey(provider.apiKey) : "",
 			headers: Object.fromEntries(
 				Object.entries(provider.headers ?? {}).map(([key, value]) => [
@@ -1032,6 +1069,7 @@ settingsRoutes.patch("/", async (c) => {
 					}
 				}
 			}
+			restoreMaskedSearchProviderBaseUrl(p, existing);
 		}
 	}
 

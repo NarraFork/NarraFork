@@ -2,6 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
+	Button,
 	Center,
 	Group,
 	Loader,
@@ -41,9 +42,14 @@ function GroupsListPage() {
 				</Center>
 			) : groups.length === 0 ? (
 				<Center py="xl">
-					<Text c="dimmed" size="sm">
-						{t("groupsListEmpty")}
-					</Text>
+					<Stack gap="xs" align="center">
+						<Text c="dimmed" size="sm" ta="center">
+							{t("groupsListEmpty")}
+						</Text>
+						<Button size="xs" variant="light" onClick={() => navigate({ to: "/narrators" })}>
+							{t("groupsCreateNamedCta")}
+						</Button>
+					</Stack>
 				</Center>
 			) : (
 				<Stack gap="xs">
