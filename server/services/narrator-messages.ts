@@ -657,9 +657,9 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 
 /**
  * Build a fully-hydrated message tree from a set of top-level ref rows
- * (messageId + seq). Shared by getMessagesCursor and getChunksByRange so the
- * exact same enrichment pipeline (seqs, subagent children, sidecars, tool IO
- * truncation, exit-plan filtering) is applied consistently.
+ * (messageId + seq). Shared by chunk range and catch-up paths so the exact same
+ * enrichment pipeline (seqs, subagent children, sidecars, tool IO truncation,
+ * exit-plan filtering) is applied consistently.
  *
  * `refRows` must already be ordered ascending by seq.
  */
@@ -979,82 +979,98 @@ export const narratorMessageQueries = {
 		return narrator != null && isSubagentVariant(narrator.variant);
 	},
 
-	async getMessagesCursor(
-		narratorId: string,
-		limit = 50,
-		cursor?: string,
-		direction: "older" | "newer" = "older",
-	) {
-		const isSubagent = await this.isSubagentNarrator(narratorId);
-
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const cursorConditions: any[] = [eq(narratorMessageRefs.narratorId, narratorId)];
-		if (cursor) {
-			const cursorSeq = Number.parseInt(cursor, 10);
-			if (!Number.isNaN(cursorSeq)) {
-				cursorConditions.push(
-					direction === "newer"
-						? gt(narratorMessageRefs.seq, cursorSeq)
-						: lt(narratorMessageRefs.seq, cursorSeq),
-				);
-			}
-		}
-
-		const refRows = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					...cursorConditions,
-					...(isSubagent ? [] : [isNull(narratorMessages.parentToolUseId)]),
-					isNull(narratorMessageRefs.segmentCompactId),
-				),
-			)
-			.orderBy(
-				direction === "newer" ? narratorMessageRefs.seq : sql`${narratorMessageRefs.seq} DESC`,
-			)
-			.limit(limit + 1);
-
-		const hasMoreInDirection = refRows.length > limit;
-		const pageRows = hasMoreInDirection ? refRows.slice(0, limit) : refRows;
-		if (direction === "older") {
-			pageRows.reverse();
-		}
-
-		if (pageRows.length === 0) {
-			return {
-				messages: [],
-				hasMore: false,
-				nextCursor: null,
-				hasMoreAfter: false,
-				prevCursor: null,
-			};
-		}
-
-		const tree = await buildTreeFromTopLevelRefs(pageRows, isSubagent);
-
-		return {
-			messages: tree,
-			hasMore: direction === "older" ? hasMoreInDirection : false,
-			nextCursor: direction === "older" && hasMoreInDirection ? String(pageRows[0].seq) : null,
-			hasMoreAfter: direction === "newer" ? hasMoreInDirection : false,
-			prevCursor:
-				direction === "newer" && hasMoreInDirection
-					? String(pageRows[pageRows.length - 1].seq)
-					: null,
-		};
-	},
-
 	async getMessageVersion(narratorId: string): Promise<number> {
 		const row = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { messageVersion: true },
 		});
 		return row?.messageVersion ?? 0;
+	},
+
+	/**
+	 * Resolve a message id to the top-level seq used by the chunk manifest.
+	 *
+	 * This is the lightweight replacement for the old around-window query: it only
+	 * reads narrow indexed columns and never returns content_json/message trees.
+	 * For primary narrators, child messages are resolved by walking parent
+	 * tool-use ownership until a referenced top-level message is found. For a
+	 * subagent narrator, its own refs are already top-level from that page's point
+	 * of view, even when messages carry parentToolUseId pointing to the parent
+	 * narrator.
+	 */
+	async getMessageLocation(
+		narratorId: string,
+		messageId: string,
+	): Promise<{
+		messageId: string;
+		topLevelMessageId: string;
+		seq: number;
+	}> {
+		const [isSubagent, target] = await Promise.all([
+			this.isSubagentNarrator(narratorId),
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { id: true, parentToolUseId: true },
+			}),
+		]);
+		if (!target) throw new NotFoundError("Message", messageId);
+
+		const findVisibleRef = async (candidateMessageId: string) =>
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, candidateMessageId),
+					isNull(narratorMessageRefs.segmentCompactId),
+				),
+				columns: { seq: true },
+			});
+
+		const directRef = await findVisibleRef(target.id);
+		if (directRef && (isSubagent || !target.parentToolUseId)) {
+			return { messageId: target.id, topLevelMessageId: target.id, seq: directRef.seq };
+		}
+
+		let parentToolUseId = target.parentToolUseId;
+		for (let depth = 0; parentToolUseId && depth < 32; depth++) {
+			const candidates = await db
+				.select({
+					messageId: narratorToolCalls.messageId,
+					parentToolUseId: narratorMessages.parentToolUseId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorToolCalls)
+				.innerJoin(narratorMessages, eq(narratorToolCalls.messageId, narratorMessages.id))
+				.innerJoin(
+					narratorMessageRefs,
+					and(
+						eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
+						eq(narratorMessageRefs.narratorId, narratorId),
+						isNull(narratorMessageRefs.segmentCompactId),
+					),
+				)
+				.where(eq(narratorToolCalls.toolUseId, parentToolUseId))
+				.orderBy(narratorMessageRefs.seq)
+				.limit(10);
+			if (candidates.length === 0) break;
+
+			let nextParentToolUseId: string | null = null;
+			for (const candidate of candidates) {
+				if (candidate.parentToolUseId) {
+					nextParentToolUseId = candidate.parentToolUseId;
+					continue;
+				}
+				return {
+					messageId: target.id,
+					topLevelMessageId: candidate.messageId,
+					seq: candidate.seq,
+				};
+			}
+			parentToolUseId = nextParentToolUseId;
+		}
+
+		if (directRef)
+			return { messageId: target.id, topLevelMessageId: target.id, seq: directRef.seq };
+		throw new NotFoundError("Message", messageId);
 	},
 
 	/**
@@ -1483,159 +1499,6 @@ export const narratorMessageQueries = {
 			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
 			hitLimit: false,
 			cursor,
-		};
-	},
-
-	async getMessagesAround(
-		narratorId: string,
-		messageId: string,
-		opts: { before?: number; after?: number } = {},
-	) {
-		const before = Math.max(0, opts.before ?? 5);
-		const after = Math.max(0, opts.after ?? 20);
-		const fallbackLimit = Math.max(before + after + 1, 10);
-		const [isSubagent, targetRef, target] = await Promise.all([
-			this.isSubagentNarrator(narratorId),
-			db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-				columns: { seq: true },
-			}),
-			db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { id: true, parentToolUseId: true },
-			}),
-		]);
-		if (!targetRef) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-		if (!target) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-
-		let anchorMessageId = target.id;
-		if (!isSubagent && target.parentToolUseId) {
-			const [parentTc] = await db
-				.select({ messageId: narratorToolCalls.messageId })
-				.from(narratorToolCalls)
-				.innerJoin(
-					narratorMessageRefs,
-					eq(narratorToolCalls.messageId, narratorMessageRefs.messageId),
-				)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorToolCalls.toolUseId, target.parentToolUseId),
-					),
-				)
-				.limit(1);
-			if (parentTc) anchorMessageId = parentTc.messageId;
-		}
-
-		const anchorRef =
-			anchorMessageId === target.id
-				? targetRef
-				: await db.query.narratorMessageRefs.findFirst({
-						where: and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, anchorMessageId),
-						),
-						columns: { seq: true },
-					});
-		if (!anchorRef) {
-			return this.getMessagesCursor(narratorId, fallbackLimit);
-		}
-
-		const topLevelFilter = isSubagent ? undefined : isNull(narratorMessages.parentToolUseId);
-
-		const [olderRefRows, newerRefRows] = await Promise.all([
-			db
-				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						lt(narratorMessageRefs.seq, anchorRef.seq),
-						isNull(narratorMessageRefs.segmentCompactId),
-						...(topLevelFilter ? [topLevelFilter] : []),
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(before + 1),
-			db
-				.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						gt(narratorMessageRefs.seq, anchorRef.seq),
-						isNull(narratorMessageRefs.segmentCompactId),
-						...(topLevelFilter ? [topLevelFilter] : []),
-					),
-				)
-				.orderBy(narratorMessageRefs.seq)
-				.limit(after + 1),
-		]);
-
-		const hasMore = olderRefRows.length > before;
-		const olderRows = hasMore ? olderRefRows.slice(0, before) : olderRefRows;
-		olderRows.reverse();
-
-		const hasMoreAfter = newerRefRows.length > after;
-		const newerRows = hasMoreAfter ? newerRefRows.slice(0, after) : newerRefRows;
-
-		const allRows = [
-			...olderRows,
-			{ messageId: anchorMessageId, seq: anchorRef.seq },
-			...newerRows,
-		];
-		const allIds = allRows.map((r) => r.messageId);
-		const seqMap = new Map<string, number>(allRows.map((r) => [r.messageId, r.seq]));
-
-		const topMessages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, allIds),
-			with: { toolCalls: true, sideCars: true, creator: true },
-		});
-		topMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
-		attachMessageSeqs(topMessages, seqMap);
-
-		if (isSubagent) {
-			for (const msg of topMessages) {
-				msg.parentToolUseId = null;
-			}
-		}
-
-		const parentToolUseIds = collectToolUseIds(topMessages);
-		const childMessages =
-			parentToolUseIds.length > 0
-				? await db.query.narratorMessages.findMany({
-						where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
-						with: { toolCalls: true, sideCars: true, creator: true },
-						orderBy: (m, { asc }) => [asc(m.createdAt)],
-						limit: 500,
-					})
-				: [];
-
-		await attachSubagentModels(childMessages);
-		await hydrateToolUseSideCars([...topMessages, ...childMessages]);
-
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(
-				truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
-			),
-		);
-		return {
-			messages: tree,
-			hasMore,
-			nextCursor: hasMore ? String(olderRows[0]?.seq ?? anchorRef.seq) : null,
-			hasMoreAfter,
-			prevCursor: hasMoreAfter
-				? String(newerRows[newerRows.length - 1]?.seq ?? anchorRef.seq)
-				: null,
 		};
 	},
 

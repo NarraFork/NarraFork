@@ -1433,44 +1433,12 @@ narratorRoutes.get("/:id/chunks", async (c) => {
 	});
 });
 
-// Get message history (cursor-based pagination, newest first)
-narratorRoutes.get("/:id/messages", async (c) => {
+// Resolve a message id to the chunk coordinate used by the virtualized list.
+narratorRoutes.get("/:id/message-location/:messageId", async (c) => {
 	const id = c.req.param("id");
-	const around = c.req.query("around") || undefined;
-	if (around) {
-		const parseWindowSize = (raw: string | undefined, fallback: number) => {
-			const parsed = Number.parseInt(raw ?? "", 10);
-			if (Number.isNaN(parsed)) return fallback;
-			return Math.min(Math.max(parsed, 0), 100);
-		};
-		const result = await narratorService.getMessagesAround(id, around, {
-			before: parseWindowSize(c.req.query("before"), 5),
-			after: parseWindowSize(c.req.query("after"), 20),
-		});
-		return c.json(result);
-	}
-	const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
-	const limit = Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 200);
-	const cursor = c.req.query("cursor") || undefined;
-	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
-	const [result, narratorMeta] = await Promise.all([
-		narratorService.getMessagesCursor(id, limit, cursor, direction),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: {
-				pruneBoundaryMessageId: true,
-				prunedPercent: true,
-				messageVersion: true,
-			},
-		}),
-	]);
-	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	return c.json({
-		...result,
-		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
-		prunedPercent: narratorMeta.prunedPercent ?? null,
-		messageVersion: narratorMeta.messageVersion ?? 0,
-	});
+	const messageId = c.req.param("messageId");
+	const location = await narratorService.getMessageLocation(id, messageId);
+	return c.json(location);
 });
 
 // Get full tool call detail (untruncated inputJson/outputJson)

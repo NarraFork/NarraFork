@@ -216,7 +216,7 @@ describe("narratorService message query regressions", () => {
 		]);
 	});
 
-	it("getMessagesCursor 构建树、截断大输出并过滤 ExitPlan→plan compact 包装消息", async () => {
+	it("getChunksByRange 构建树、截断大输出并过滤 ExitPlan→plan compact 包装消息", async () => {
 		seedBase();
 
 		insertMessage({
@@ -261,9 +261,9 @@ describe("narratorService message query regressions", () => {
 			contentJson: [{ type: "text", text: "child response" }],
 		});
 
-		const result = await narratorService.getMessagesCursor("n1", 10);
-		expect(result.hasMore).toBe(false);
-		expect(result.nextCursor).toBeNull();
+		const result = await narratorService.getChunksByRange("n1", { count: 1 });
+		expect(result.hasOlder).toBe(false);
+		expect(result.hasNewer).toBe(false);
 		expect(result.messages.map((m: { id: string }) => m.id)).toEqual(["m-plan", "m-read"]);
 		expect(result.messages.map((m: { seq?: number }) => m.seq)).toEqual([1, 2]);
 
@@ -492,19 +492,9 @@ describe("narratorService message query regressions", () => {
 		expect(result.orphanChildren.map((m: { id: string }) => m.id)).toEqual(["c-first"]);
 	});
 
-	it("getMessagesAround 以子消息所属顶层消息为锚点并返回有界上下文窗口", async () => {
+	it("getMessageLocation 以 primary 子消息所属顶层消息为 chunk 坐标", async () => {
 		seedBase();
 
-		insertMessage({
-			id: "m-older-0",
-			seq: 0,
-			contentJson: [{ type: "text", text: "older0" }],
-		});
-		insertMessage({
-			id: "m-older-1",
-			seq: 1,
-			contentJson: [{ type: "text", text: "older1" }],
-		});
 		insertMessage({
 			id: "m-parent",
 			seq: 2,
@@ -522,34 +512,23 @@ describe("narratorService message query regressions", () => {
 			parentToolUseId: "tu-parent",
 			contentJson: [{ type: "text", text: "child target" }],
 		});
-		insertMessage({
-			id: "m-newer-0",
-			seq: 4,
-			contentJson: [{ type: "text", text: "newer0" }],
-		});
-		insertMessage({
-			id: "m-newer-1",
-			seq: 5,
-			contentJson: [{ type: "text", text: "newer1" }],
+
+		const childLocation = await narratorService.getMessageLocation("n1", "c-target");
+		expect(childLocation).toEqual({
+			messageId: "c-target",
+			topLevelMessageId: "m-parent",
+			seq: 2,
 		});
 
-		const around = await narratorService.getMessagesAround("n1", "c-target", {
-			before: 1,
-			after: 1,
+		const parentLocation = await narratorService.getMessageLocation("n1", "m-parent");
+		expect(parentLocation).toEqual({
+			messageId: "m-parent",
+			topLevelMessageId: "m-parent",
+			seq: 2,
 		});
-		expect(around.hasMore).toBe(true);
-		expect(around.nextCursor).toBe("1");
-		expect(around.hasMoreAfter).toBe(true);
-		expect(around.messages.map((m: { id: string }) => m.id)).toEqual([
-			"m-older-1",
-			"m-parent",
-			"m-newer-0",
-		]);
-		expect(around.messages.map((m: { seq?: number }) => m.seq)).toEqual([1, 2, 4]);
-		expect(around.messages[1]?.children?.map((c: { id: string }) => c.id)).toEqual(["c-target"]);
 	});
 
-	it("getMessagesAround 支持通过 refs 定位 fork 继承的共享消息", async () => {
+	it("getMessageLocation 支持通过 refs 定位 fork 继承的共享子消息", async () => {
 		seedBase("n1");
 		db.insert(narrators)
 			.values({
@@ -589,14 +568,98 @@ describe("narratorService message query regressions", () => {
 			])
 			.run();
 
-		const around = await narratorService.getMessagesAround("n2", "shared-child", {
-			before: 0,
-			after: 0,
+		const location = await narratorService.getMessageLocation("n2", "shared-child");
+		expect(location).toEqual({
+			messageId: "shared-child",
+			topLevelMessageId: "shared-parent",
+			seq: 0,
 		});
-		expect(around.messages.map((m: { id: string }) => m.id)).toEqual(["shared-parent"]);
-		expect(around.messages[0]?.children?.map((c: { id: string }) => c.id)).toEqual([
-			"shared-child",
-		]);
+	});
+
+	it("getMessageLocation 在重复 toolUseId 时只使用当前 narrator 可见父消息", async () => {
+		seedBase("n1");
+		db.insert(narrators)
+			.values({
+				id: "n2",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+
+		insertMessage({
+			id: "wrong-parent",
+			seq: 0,
+			narratorId: "n1",
+			contentJson: [{ type: "tool_use", id: "tu-dup", name: "Task", input: {} }],
+		});
+		insertMessage({
+			id: "right-parent",
+			seq: 4,
+			narratorId: "n2",
+			contentJson: [{ type: "tool_use", id: "tu-dup", name: "Task", input: {} }],
+		});
+		insertMessage({
+			id: "right-child",
+			seq: 5,
+			narratorId: "n2",
+			parentToolUseId: "tu-dup",
+			contentJson: [{ type: "text", text: "child in n2" }],
+		});
+		db.insert(narratorToolCalls)
+			.values([
+				{
+					id: "tc-wrong-dup",
+					narratorId: "n1",
+					messageId: "wrong-parent",
+					toolUseId: "tu-dup",
+					toolName: "Task",
+					status: "running",
+					createdAt: ts(),
+				},
+				{
+					id: "tc-right-dup",
+					narratorId: "n2",
+					messageId: "right-parent",
+					toolUseId: "tu-dup",
+					toolName: "Task",
+					status: "running",
+					createdAt: ts(),
+				},
+			])
+			.run();
+
+		const location = await narratorService.getMessageLocation("n2", "right-child");
+		expect(location).toEqual({
+			messageId: "right-child",
+			topLevelMessageId: "right-parent",
+			seq: 4,
+		});
+	});
+
+	it("getMessageLocation 在 subagent 自身页面按自身 refs 定位", async () => {
+		seedBase("n-sub");
+		db.update(narrators)
+			.set({ type: "subagent", subagentType: "general", variant: "subagent:general" })
+			.where(eq(narrators.id, "n-sub"))
+			.run();
+
+		insertMessage({
+			id: "s-child",
+			seq: 7,
+			narratorId: "n-sub",
+			parentToolUseId: "tu-parent",
+			contentJson: [{ type: "text", text: "subagent child as top-level" }],
+		});
+
+		const location = await narratorService.getMessageLocation("n-sub", "s-child");
+		expect(location).toEqual({
+			messageId: "s-child",
+			topLevelMessageId: "s-child",
+			seq: 7,
+		});
 	});
 
 	describe("getChunksByRange 边界标志", () => {

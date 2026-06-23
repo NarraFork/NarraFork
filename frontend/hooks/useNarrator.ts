@@ -3,7 +3,6 @@ import {
 	api,
 	type BlacklistCmd,
 	type BlacklistDir,
-	type MessagesAroundOptions,
 	type NarratorGoalStatus,
 	type PaginatedNarrators,
 	type WhitelistCmd,
@@ -239,41 +238,6 @@ export function usePromoteNarrator() {
 	});
 }
 
-export const DEFAULT_MESSAGES_AROUND_BEFORE = 5;
-export const DEFAULT_MESSAGES_AROUND_AFTER = 20;
-
-export interface NarratorMessagesAroundOptions extends MessagesAroundOptions {}
-
-function normalizeAroundOptions(
-	around?: NarratorMessagesAroundOptions,
-): NarratorMessagesAroundOptions | undefined {
-	if (!around?.messageId) return undefined;
-	return {
-		messageId: around.messageId,
-		before: around.before ?? DEFAULT_MESSAGES_AROUND_BEFORE,
-		after: around.after ?? DEFAULT_MESSAGES_AROUND_AFTER,
-	};
-}
-
-export function getNarratorMessagesQueryKey(
-	narratorId: string,
-	around?: NarratorMessagesAroundOptions,
-) {
-	const normalizedAround = normalizeAroundOptions(around);
-	return [
-		"narrators",
-		narratorId,
-		"messages",
-		normalizedAround
-			? {
-					around: normalizedAround.messageId,
-					before: normalizedAround.before,
-					after: normalizedAround.after,
-				}
-			: { around: undefined },
-	] as const;
-}
-
 export function useNarratorGoals(narratorId: string) {
 	return useQuery({
 		queryKey: ["narrators", narratorId, "goals"],
@@ -350,55 +314,6 @@ export function useNarratorUsageStats(narratorId: string, includeSubagents = tru
 		enabled: !!narratorId && enabled,
 		staleTime: 15_000,
 		gcTime: 60_000,
-	});
-}
-
-const NARRATOR_MESSAGES_GC_TIME_MS = 5 * 60_000;
-
-type MessagePageParam =
-	| {
-			cursor: string;
-			direction: "older" | "newer";
-	  }
-	| undefined;
-
-export function useNarratorMessages(
-	narratorId: string,
-	around?: NarratorMessagesAroundOptions,
-	options?: { enabled?: boolean },
-) {
-	const normalizedAround = normalizeAroundOptions(around);
-	const enabled = options?.enabled ?? true;
-	return useInfiniteQuery({
-		queryKey: getNarratorMessagesQueryKey(narratorId, normalizedAround),
-		queryFn: ({ pageParam }: { pageParam: MessagePageParam }) => {
-			// First page: use the bounded around-window when deep-linking to a message,
-			// otherwise fetch the latest page.
-			if (!pageParam && normalizedAround) {
-				return api.getNarratorMessages(narratorId, { around: normalizedAround });
-			}
-			return api.getNarratorMessages(narratorId, {
-				limit: pageParam ? 50 : 20,
-				cursor: pageParam?.cursor,
-				direction: pageParam?.direction,
-			});
-		},
-		initialPageParam: undefined as MessagePageParam,
-		getNextPageParam: (lastPage) =>
-			lastPage.hasMore && lastPage.nextCursor
-				? { cursor: lastPage.nextCursor, direction: "older" as const }
-				: undefined,
-		getPreviousPageParam: (firstPage) =>
-			firstPage.hasMoreAfter && firstPage.prevCursor
-				? { cursor: firstPage.prevCursor, direction: "newer" as const }
-				: undefined,
-		enabled: !!narratorId && enabled,
-		// Messages are kept up-to-date via WebSocket (setQueryData), so background
-		// refetch on remount is unnecessary. A high staleTime prevents TanStack Query
-		// from refetching ALL cached pages when the component remounts, which would
-		// cause a cascade of API calls proportional to the number of loaded pages.
-		staleTime: Infinity,
-		gcTime: NARRATOR_MESSAGES_GC_TIME_MS,
 	});
 }
 

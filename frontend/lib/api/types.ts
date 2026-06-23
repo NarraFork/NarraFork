@@ -504,22 +504,6 @@ export interface PaginatedNarrators {
 	totalCount: number;
 }
 
-export interface MessagesAroundOptions {
-	messageId: string;
-	before?: number;
-	after?: number;
-}
-
-export interface PaginatedMessages {
-	messages: TreeMessage[];
-	hasMore: boolean;
-	nextCursor: string | null;
-	hasMoreAfter?: boolean;
-	prevCursor?: string | null;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
-}
-
 // ── Chunk virtualization (manifest + range) ────────────────────────────────
 
 /** Decoded manifest entry (after expanding the compact wire tuple). */
@@ -553,6 +537,12 @@ export interface ChunkRangeResult {
 	messageVersion: number;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;
+}
+
+export interface MessageLocationResult {
+	messageId: string;
+	topLevelMessageId: string;
+	seq: number;
 }
 
 export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";

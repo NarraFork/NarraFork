@@ -53,7 +53,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getNarratorMessagesQueryKey } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
 import { recentTabsSnapshotRemovedProject } from "../../hooks/useProjects";
@@ -71,7 +70,7 @@ import {
 import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
-import { api, type PaginatedMessages } from "../../lib/api";
+import { api } from "../../lib/api";
 import {
 	endNarratorDrag,
 	moveNarratorDrag,
@@ -125,13 +124,6 @@ const CONTAINER_STATUS_I18N: Record<string, string> = {
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 const SWIPE_THRESHOLD = 80;
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
-
-type PrefetchMessagePageParam =
-	| {
-			cursor: string;
-			direction: "older" | "newer";
-	  }
-	| undefined;
 
 function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
@@ -475,31 +467,6 @@ export function RecentTabList({
 					queryKey: narratorKey,
 					queryFn: () => api.getNarrator(narratorId),
 					staleTime: 30_000,
-					gcTime: PREFETCH_QUERY_GC_TIME_MS,
-				});
-			}
-
-			const messagesKey = getNarratorMessagesQueryKey(narratorId);
-			if (
-				!qc.getQueryData(messagesKey) &&
-				qc.getQueryState(messagesKey)?.fetchStatus !== "fetching"
-			) {
-				void qc.prefetchInfiniteQuery({
-					queryKey: messagesKey,
-					queryFn: ({ pageParam }) => {
-						const typedPageParam = pageParam as PrefetchMessagePageParam;
-						return api.getNarratorMessages(narratorId, {
-							limit: typedPageParam ? 50 : 20,
-							cursor: typedPageParam?.cursor,
-							direction: typedPageParam?.direction,
-						});
-					},
-					initialPageParam: undefined as PrefetchMessagePageParam,
-					getNextPageParam: (lastPage: PaginatedMessages) =>
-						lastPage.hasMore && lastPage.nextCursor
-							? { cursor: lastPage.nextCursor, direction: "older" as const }
-							: undefined,
-					staleTime: Infinity,
 					gcTime: PREFETCH_QUERY_GC_TIME_MS,
 				});
 			}

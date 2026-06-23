@@ -467,8 +467,6 @@
 	"showTokenUsageDesc": "Display input/output token counts after each conversation turn",
 	"showOutputStats": "Show real-time AI output rate",
 	"showOutputStatsDesc": "Display a live chars/sec indicator in the header bar, averaged over a 3-second window",
-	"experimentalChunkedList": "Experimental: chunked message list",
-	"experimentalChunkedListDesc": "Use the new chunk-virtualized message list (Phase 0 verification). May be unstable. Takes effect when you reopen a narrator.",
 	"terminalSection": "Terminal",
 	"terminalTheme": "Terminal Theme",
 	"terminalThemeAuto": "Auto (follow system)",

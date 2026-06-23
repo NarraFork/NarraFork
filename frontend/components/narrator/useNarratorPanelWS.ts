@@ -109,12 +109,21 @@ function promptTokensFromTurnUsage(turnUsage: Record<string, unknown>): number |
 	);
 }
 
+interface InitialMessageStatus {
+	statusReady?: boolean;
+	contextPercent?: number | null;
+	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
 	narratorErrorMessage?: string | null;
 	messagesData?: { pages: MessagesPage[] };
 	messagesQueryKey: readonly unknown[];
+	initialMessageStatus?: InitialMessageStatus;
 	/** Disable legacy message-cache / streaming-render updates when chunk mode owns messages. */
 	legacyMessageCacheUpdatesEnabled?: boolean;
 	/** Ref to isAtBottom state for unread tracking */
@@ -339,6 +348,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorErrorMessage,
 		messagesData,
 		messagesQueryKey,
+		initialMessageStatus,
 		legacyMessageCacheUpdatesEnabled = true,
 		isAtBottomRef,
 		scrollToBottom,
@@ -701,48 +711,72 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		return () => clearTimeout(timer);
 	}, [expandedToolUseId]);
 
-	// --- Initialize contextPercent from initial data ---
+	// --- Initialize context/prune state from initial message data ---
 	const contextInitRef = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
 	useEffect(() => {
-		if (contextInitRef.current || !messagesData?.pages?.length) return;
-		const firstPage = messagesData.pages[0];
+		contextInitRef.current = false;
+	}, [narratorId]);
+	useEffect(() => {
+		if (contextInitRef.current) return;
 		const patch: Partial<StatusState> = {};
-		if (firstPage?.pruneBoundaryMessageId) {
-			patch.pruneBoundaryMessageId = firstPage.pruneBoundaryMessageId;
-		}
-		if (firstPage?.prunedPercent != null) {
-			patch.prunedPercent = firstPage.prunedPercent;
-		}
-		const msgs = firstPage?.messages;
-		if (!msgs?.length) {
-			if (Object.keys(patch).length > 0) {
-				dispatchStatus({ type: "patch", payload: patch });
+		let hasInitialSource = false;
+
+		const applyTurnUsage = (turnUsageJson: Record<string, unknown> | null | undefined) => {
+			if (!turnUsageJson) return;
+			const restoredPromptTokens = promptTokensFromTurnUsage(turnUsageJson);
+			if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
+			if (turnUsageJson.context_window != null) {
+				patch.contextWindow = turnUsageJson.context_window as number;
 			}
-			return;
-		}
-		for (let i = msgs.length - 1; i >= 0; i--) {
-			const m = msgs[i] as unknown as Record<string, unknown>;
-			const cp = m.contextPercent;
-			if (cp != null) {
-				patch.contextPercent = cp as number;
-				// Restore promptTokens / contextWindow / isEstimated from turnUsageJson
-				const tu = m.turnUsageJson as Record<string, unknown> | null | undefined;
-				if (tu) {
-					const restoredPromptTokens = promptTokensFromTurnUsage(tu);
-					if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
-					if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
-					patch.isEstimated = !!tu.is_estimated;
-				} else if (m.tokensIn != null) {
-					patch.promptTokens = m.tokensIn as number;
+			patch.isEstimated = !!turnUsageJson.is_estimated;
+		};
+
+		if (messagesData?.pages?.length) {
+			hasInitialSource = true;
+			const firstPage = messagesData.pages[0];
+			if (firstPage?.pruneBoundaryMessageId) {
+				patch.pruneBoundaryMessageId = firstPage.pruneBoundaryMessageId;
+			}
+			if (firstPage?.prunedPercent != null) {
+				patch.prunedPercent = firstPage.prunedPercent;
+			}
+			const msgs = firstPage?.messages;
+			for (let i = (msgs?.length ?? 0) - 1; i >= 0; i--) {
+				const m = msgs?.[i] as unknown as Record<string, unknown> | undefined;
+				if (!m) continue;
+				const cp = m.contextPercent;
+				if (cp != null) {
+					patch.contextPercent = cp as number;
+					applyTurnUsage(m.turnUsageJson as Record<string, unknown> | null | undefined);
+					if (patch.promptTokens == null && m.tokensIn != null) {
+						patch.promptTokens = m.tokensIn as number;
+					}
+					break;
 				}
-				break;
+			}
+		} else if (initialMessageStatus?.statusReady) {
+			hasInitialSource = true;
+			if (initialMessageStatus.pruneBoundaryMessageId !== undefined) {
+				patch.pruneBoundaryMessageId = initialMessageStatus.pruneBoundaryMessageId ?? null;
+			}
+			if (initialMessageStatus.prunedPercent !== undefined) {
+				patch.prunedPercent = initialMessageStatus.prunedPercent ?? null;
+			}
+			if (initialMessageStatus.contextPercent != null) {
+				patch.contextPercent = initialMessageStatus.contextPercent;
+				applyTurnUsage(
+					initialMessageStatus.turnUsageJson as Record<string, unknown> | null | undefined,
+				);
 			}
 		}
+
+		if (!hasInitialSource) return;
 		if (Object.keys(patch).length > 0) {
 			dispatchStatus({ type: "patch", payload: patch });
 		}
 		contextInitRef.current = true;
-	}, [messagesData]);
+	}, [initialMessageStatus, messagesData]);
 
 	// --- Initialize messageVersion from initial data ---
 	const versionInitRef = useRef(false);
@@ -2920,61 +2954,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// Keep refs in sync
 	sendPermissionDecisionRef.current = sendPermissionDecision;
-
-	// --- Sync on page navigation (mount with existing cache) ---
-	// When the user navigates away and back, the global WS stays connected but
-	// the component unmounts/remounts.  staleTime=Infinity means React Query
-	// won't refetch, and the WS catch-up may not fire (lastMessageId was
-	// cleared on unsubscribe).  Fix: on mount, if we already have cached data
-	// (i.e. returning to the page), fetch the latest page and merge it.
-	// NOTE: permissions and buffered messages are synced by the mount/reconnect
-	// effect below — no need to duplicate here.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: mount-only effect — intentionally runs once
-	useEffect(() => {
-		if (!legacyMessageCacheUpdatesEnabled) return;
-		const cached = qc.getQueryData(messagesQueryKey) as MessagesQueryData | undefined;
-		if (!cached?.pages?.length) return; // first load — nothing to sync
-		if (firstPageHasMoreAfter) return; // around-mode (deep link) — skip
-
-		let cancelled = false;
-
-		// Fetch latest page and merge into cache
-		api
-			.getNarratorMessages(narratorId, { limit: 20 })
-			.then((latestPage) => {
-				if (cancelled) return;
-				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-					if (!old?.pages?.length) return old;
-					const pages = [...old.pages];
-					const firstPage = { ...pages[0] };
-					const existingMap = new Map(firstPage.messages.map((m: NarratorMsg) => [m.id, m]));
-
-					// Update existing messages with fresh data (children, tool status, etc.)
-					const updatedMessages = firstPage.messages.map((existing: NarratorMsg) => {
-						// Preserve synthetic messages
-						if (existing.id === STREAMING_CHUNKS_MSG_ID) return existing;
-						const fresh = latestPage.messages.find((m: NarratorMsg) => m.id === existing.id);
-						if (!fresh) return existing;
-						return { ...fresh, children: fresh.children ?? existing.children ?? [] };
-					});
-
-					// Append genuinely new messages
-					const newMsgs = latestPage.messages
-						.filter((m: NarratorMsg) => m.id && !existingMap.has(m.id))
-						.map((m: NarratorMsg) => ({ ...m, children: m.children ?? [] }));
-
-					firstPage.messages =
-						newMsgs.length > 0 ? [...updatedMessages, ...newMsgs] : updatedMessages;
-					pages[0] = firstPage;
-					return { ...old, pages };
-				});
-			})
-			.catch(() => {});
-
-		return () => {
-			cancelled = true;
-		};
-	}, []);
 
 	// --- Load pending permissions on mount/reconnect ---
 	const prevConnectedRef = useRef(false);

@@ -27,7 +27,6 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { setChunkedListEnabled, useChunkedListEnabled } from "../../hooks/useChunkedListFlag";
 import type { DangerReflectionLevel } from "../../hooks/useInstanceSettings";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { CmdListEditor } from "../common/CmdListEditor";
@@ -148,7 +147,6 @@ export function AgentSection(props: AgentSectionProps) {
 	const { t: tn } = useTranslation("narrator");
 	const settingsFeatureCapability = useSettingsFeatureCapability();
 	const [dumpWarningOpen, setDumpWarningOpen] = useState(false);
-	const chunkedListEnabled = useChunkedListEnabled();
 
 	const handleRequestDumpToggle = (checked: boolean) => {
 		if (checked && !props.requestDumpEnabled) {
@@ -611,12 +609,6 @@ export function AgentSection(props: AgentSectionProps) {
 						showOutputStats: e.currentTarget.checked,
 					})
 				}
-			/>
-			<Switch
-				label={t("experimentalChunkedList")}
-				description={t("experimentalChunkedListDesc")}
-				checked={chunkedListEnabled}
-				onChange={(e) => setChunkedListEnabled(e.currentTarget.checked)}
 			/>
 			{/* Directory Access Control */}
 			<Title order={5} mt="sm">

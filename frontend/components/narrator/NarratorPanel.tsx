@@ -90,14 +90,10 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useNamedNarrators } from "../../hooks/useChatGroup";
-import { useChunkedListEnabled } from "../../hooks/useChunkedListFlag";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory } from "../../hooks/useInputHistory";
 import { useAllModels } from "../../hooks/useModels";
 import {
-	DEFAULT_MESSAGES_AROUND_AFTER,
-	DEFAULT_MESSAGES_AROUND_BEFORE,
-	getNarratorMessagesQueryKey,
 	useArchiveNarrator,
 	useBlacklistDirs,
 	useClearNarratorGoals,
@@ -118,7 +114,6 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	useNarratorGoals,
-	useNarratorMessages,
 	usePromoteNarrator,
 	useRemoveNarratorGoal,
 	useReorderNarratorGoals,
@@ -174,7 +169,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
-import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
+import type { BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserPanel } from "./BrowserPanel";
 import { ChapterBar } from "./ChapterBar";
 import {
@@ -218,7 +213,6 @@ import {
 } from "./MessageSelectionCtx";
 import { ModelPriceModal } from "./ModelPriceModal";
 import { getRenderableMessageOrder } from "./message-order-utils";
-import { useNarratorMessageRendererMode } from "./message-renderer-mode";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
@@ -234,6 +228,7 @@ import type {
 	MessagesQueryData,
 	NarratorMsg,
 	NarratorPanelProps,
+	PermissionCallbacks,
 	TodoItem,
 } from "./narrator-panel-types";
 import {
@@ -247,8 +242,6 @@ import {
 	PERM_MODES,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
-import { NarratorPixiMessageList } from "./pixi/NarratorPixiMessageList";
-import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
 	getGlobalCloseSwipe,
@@ -258,7 +251,13 @@ import {
 	setGlobalSwipeAnchor,
 	setGlobalToggleBlock,
 } from "./swipeState";
-import { FileModDrawerCtx, LatestTodosToolUseIdCtx, PermEnterHintCtx } from "./ToolCallCard";
+import {
+	FileModDrawerCtx,
+	LatestTodosToolUseIdCtx,
+	PermEnterHintCtx,
+	type ToolCallData,
+} from "./ToolCallCard";
+import { useNarratorChunks } from "./useNarratorChunks";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
@@ -279,6 +278,107 @@ function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredI
 	} catch {
 		return null;
 	}
+}
+
+interface WorkspaceChunkPreviewProps {
+	narratorId: string;
+	isSubagent?: boolean;
+	permCb: PermissionCallbacks;
+	expandedToolUseId?: string | null;
+	showTokenUsage?: boolean;
+	pruneBoundaryMessageId?: string | null;
+	pruneDividerLabel?: string;
+	lastUserMessageId?: string;
+	hasChapter?: boolean;
+	resolvePerm?: (tc: ToolCallData) => ReturnType<typeof resolvePendingPerm>;
+	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
+}
+
+function WorkspaceChunkPreview({
+	narratorId,
+	isSubagent,
+	permCb,
+	expandedToolUseId,
+	showTokenUsage,
+	pruneBoundaryMessageId,
+	pruneDividerLabel,
+	lastUserMessageId,
+	hasChapter,
+	resolvePerm,
+	onAskInPassing,
+}: WorkspaceChunkPreviewProps) {
+	const { chunks, streamingMsg } = useNarratorChunks(narratorId, { isSubagent });
+	const rendered = useMemo(() => {
+		const tailMessages = (chunks[chunks.length - 1]?.messages ?? []) as NarratorMsg[];
+		const messages = tailMessages.slice(-8);
+		if (messages.length === 0 && !streamingMsg) return { elements: [], keys: [] };
+		return renderTreeMessagesWithKeys(
+			messages,
+			narratorId,
+			undefined,
+			null,
+			permCb,
+			expandedToolUseId,
+			showTokenUsage,
+			pruneBoundaryMessageId,
+			pruneDividerLabel,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			lastUserMessageId,
+			hasChapter,
+			undefined,
+			streamingMsg,
+			resolvePerm,
+			onAskInPassing,
+			false,
+		);
+	}, [
+		chunks,
+		expandedToolUseId,
+		hasChapter,
+		lastUserMessageId,
+		narratorId,
+		onAskInPassing,
+		permCb,
+		pruneBoundaryMessageId,
+		pruneDividerLabel,
+		resolvePerm,
+		showTokenUsage,
+		streamingMsg,
+	]);
+
+	return (
+		<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
+			<Box
+				px="md"
+				pt="md"
+				style={{
+					position: "absolute",
+					left: 0,
+					right: 0,
+					bottom: 0,
+					display: "flex",
+					flexDirection: "column",
+					gap: 12,
+				}}
+			>
+				{rendered.elements.map((element, index) => (
+					<Box
+						key={rendered.keys[index] ?? `preview-${index}`}
+						style={{ flex: "0 0 auto", minWidth: 0 }}
+					>
+						{element}
+					</Box>
+				))}
+			</Box>
+		</Box>
+	);
 }
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
@@ -2037,33 +2137,42 @@ export function NarratorPanel({
 	const removeGoalMutation = useRemoveNarratorGoal(narratorId);
 	const clearGoalsMutation = useClearNarratorGoals(narratorId);
 	const reorderGoalsMutation = useReorderNarratorGoals(narratorId);
-	const chunkedListEnabled = useChunkedListEnabled();
 	const isWorkspacePreview = workspacePreview === true;
-	const usesChunkMessageList = chunkedListEnabled && !isWorkspacePreview;
-	const legacyMessagesEnabled = !usesChunkMessageList;
-
-	const aroundOptions = useMemo(
-		() =>
-			highlightMessageId
-				? {
-						messageId: highlightMessageId,
-						before: DEFAULT_MESSAGES_AROUND_BEFORE,
-						after: DEFAULT_MESSAGES_AROUND_AFTER,
-					}
-				: undefined,
-		[highlightMessageId],
-	);
-	const {
-		data: messagesData,
-		isLoading: messagesLoading,
-		hasNextPage,
-		fetchNextPage,
-		isFetchingNextPage,
-		hasPreviousPage,
-		fetchPreviousPage,
-		isFetchingPreviousPage,
-	} = useNarratorMessages(narratorId, aroundOptions, { enabled: legacyMessagesEnabled });
-	const [messageRenderReady, setMessageRenderReady] = useState(false);
+	// Chunk mode is now the only live message-list implementation. Workspace
+	// previews use a separate lightweight tail-chunk query below instead of the
+	// old Query page model.
+	const usesChunkMessageList = true;
+	const messagesData = useMemo<MessagesQueryData | undefined>(() => undefined, []);
+	const deferredMessagesData = messagesData;
+	const hasNextPage = false;
+	const hasPreviousPage = false;
+	const isFetchingNextPage = false;
+	const isFetchingPreviousPage = false;
+	const fetchNextPage = useCallback(async () => undefined, []);
+	const fetchPreviousPage = useCallback(async () => undefined, []);
+	const canRenderMessageArea = true;
+	const [chunkTailMeta, setChunkTailMeta] = useState<ChunkTailMeta>({ lastRealMessage: null });
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	useEffect(() => {
+		setChunkTailMeta({ lastRealMessage: null });
+	}, [narratorId]);
+	const handleChunkTailMetaChange = useCallback((meta: ChunkTailMeta) => {
+		setChunkTailMeta((prev) => {
+			if (
+				prev.statusReady === meta.statusReady &&
+				prev.lastRealMessage?.id === meta.lastRealMessage?.id &&
+				prev.lastRealMessage?.role === meta.lastRealMessage?.role &&
+				prev.lastUserMessageId === meta.lastUserMessageId &&
+				prev.contextPercent === meta.contextPercent &&
+				prev.turnUsageJson === meta.turnUsageJson &&
+				prev.pruneBoundaryMessageId === meta.pruneBoundaryMessageId &&
+				prev.prunedPercent === meta.prunedPercent
+			) {
+				return prev;
+			}
+			return meta;
+		});
+	}, []);
 	const [messageRenderPhase, setMessageRenderPhase] = useState<"tail" | "full">(() =>
 		highlightMessageId ? "full" : "tail",
 	);
@@ -2078,64 +2187,6 @@ export function NarratorPanel({
 	useEffect(() => {
 		if (highlightMessageId) setMessageRenderPhase("full");
 	}, [highlightMessageId]);
-	useEffect(() => {
-		let cancelled = false;
-		let timeoutId: number | null = null;
-		const rafId = requestAnimationFrame(() => {
-			timeoutId = window.setTimeout(() => {
-				if (cancelled) return;
-				startTransition(() => setMessageRenderReady(true));
-			}, 0);
-		});
-		return () => {
-			cancelled = true;
-			cancelAnimationFrame(rafId);
-			if (timeoutId != null) window.clearTimeout(timeoutId);
-		};
-	}, []);
-	const hasMessagePageData = !!messagesData?.pages?.length;
-	const canRenderLegacyMessages =
-		legacyMessagesEnabled &&
-		!messagesLoading &&
-		(messageRenderReady || (!highlightMessageId && hasMessagePageData));
-	const canRenderMessageArea = usesChunkMessageList ? true : canRenderLegacyMessages;
-	useEffect(() => {
-		if (!canRenderLegacyMessages || highlightMessageId || messageRenderPhase !== "tail") return;
-		let cancelled = false;
-		let timeoutId: number | null = null;
-		let idleId: number | null = null;
-		const expandToFull = () => {
-			if (cancelled) return;
-			const wasAtBottom = isAtBottomRef.current;
-			startTransition(() => setMessageRenderPhase("full"));
-			if (wasAtBottom) {
-				requestAnimationFrame(() => {
-					requestAnimationFrame(() => scrollToBottomRef.current(true));
-				});
-			}
-		};
-		if (typeof window.requestIdleCallback === "function") {
-			idleId = window.requestIdleCallback(expandToFull, { timeout: 1000 });
-		} else {
-			timeoutId = window.setTimeout(expandToFull, 800);
-		}
-		return () => {
-			cancelled = true;
-			if (idleId != null) window.cancelIdleCallback(idleId);
-			if (timeoutId != null) window.clearTimeout(timeoutId);
-		};
-	}, [canRenderLegacyMessages, highlightMessageId, messageRenderPhase]);
-	const deferredMessagesData = useMemo(() => {
-		if (!canRenderLegacyMessages) return undefined;
-		if (highlightMessageId || messageRenderPhase === "full") return messagesData;
-		const firstPage = messagesData?.pages?.[0];
-		if (!messagesData || !firstPage) return messagesData;
-		return {
-			...messagesData,
-			pages: [firstPage],
-			pageParams: messagesData.pageParams?.slice(0, 1) ?? [undefined],
-		};
-	}, [canRenderLegacyMessages, highlightMessageId, messageRenderPhase, messagesData]);
 	const interruptMutation = useInterruptNarrator();
 	const archiveMutation = useArchiveNarrator();
 	const permModeMutation = useUpdatePermissionMode();
@@ -2469,8 +2520,8 @@ export function NarratorPanel({
 	);
 
 	const messagesQueryKey = useMemo(
-		() => getNarratorMessagesQueryKey(narratorId, aroundOptions),
-		[narratorId, aroundOptions],
+		() => ["narrators", narratorId, "messages", "legacy-disabled"] as const,
+		[narratorId],
 	);
 
 	// --- Message operations ---
@@ -2521,7 +2572,7 @@ export function NarratorPanel({
 				});
 			}
 		},
-		[qc, messagesQueryKey, narratorId, t, usesChunkMessageList],
+		[qc, messagesQueryKey, narratorId, t],
 	);
 
 	const [pendingRollback, setPendingRollback] = useState<{
@@ -3052,7 +3103,7 @@ export function NarratorPanel({
 				startFollowing();
 			}
 		},
-		[usesChunkMessageList, startFollowing],
+		[startFollowing],
 	);
 	scrollToBottomRef.current = scrollToBottom;
 	const wasWorkspacePreviewRef = useRef(isWorkspacePreview);
@@ -3140,9 +3191,10 @@ export function NarratorPanel({
 		narratorId,
 		narratorStatus: narrator?.status,
 		narratorErrorMessage: narrator?.errorMessage ?? null,
-		messagesData: deferredMessagesData,
+		messagesData: undefined,
 		messagesQueryKey,
-		legacyMessageCacheUpdatesEnabled: legacyMessagesEnabled,
+		legacyMessageCacheUpdatesEnabled: false,
+		initialMessageStatus: chunkTailMeta,
 		isAtBottomRef,
 		scrollToBottom,
 		narratorTodosJson: narrator?.todosJson,
@@ -3989,24 +4041,6 @@ export function NarratorPanel({
 		});
 		return () => cancelAnimationFrame(id);
 	}, []);
-	const [chunkTailMeta, setChunkTailMeta] = useState<ChunkTailMeta>({ lastRealMessage: null });
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
-	useEffect(() => {
-		setChunkTailMeta({ lastRealMessage: null });
-	}, [narratorId]);
-	const handleChunkTailMetaChange = useCallback((meta: ChunkTailMeta) => {
-		setChunkTailMeta((prev) => {
-			if (
-				prev.lastRealMessage?.id === meta.lastRealMessage?.id &&
-				prev.lastRealMessage?.role === meta.lastRealMessage?.role &&
-				prev.lastUserMessageId === meta.lastUserMessageId
-			) {
-				return prev;
-			}
-			return meta;
-		});
-	}, []);
-
 	// Lightweight derived values — avoid full reverse().flatMap() on every update.
 	const totalMessageCount = useMemo(() => {
 		if (!hydrated || !deferredMessagesData?.pages) return 0;
@@ -4121,6 +4155,7 @@ export function NarratorPanel({
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
+	const usePixiRenderer = false;
 	const virtualListRef = useRef<BroadMessageListHandle>(null);
 
 	const clearHighlightTimers = useCallback(() => {
@@ -4321,7 +4356,7 @@ export function NarratorPanel({
 				})
 				.catch(applyDomFallback);
 		},
-		[chunkSelectionResolver, usesChunkMessageList],
+		[chunkSelectionResolver],
 	);
 
 	// Desktop: Shift+Click range-selects from anchor to target
@@ -4457,7 +4492,7 @@ export function NarratorPanel({
 			// Fallback: some browsers block clipboard in non-secure contexts
 		}
 		exitSelection();
-	}, [selectedBlockIds, usesChunkMessageList, chunkSelectionResolver, exitSelection, t]);
+	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, t]);
 
 	// --- Batch delete ---
 	const handleBatchDelete = useCallback(async () => {
@@ -4530,7 +4565,6 @@ export function NarratorPanel({
 		}
 	}, [
 		selectedBlockIds,
-		usesChunkMessageList,
 		chunkSelectionResolver,
 		exitSelection,
 		narratorId,
@@ -4564,15 +4598,7 @@ export function NarratorPanel({
 		} catch {
 			notifications.show({ message: t("batchForkFailed"), color: "red" });
 		}
-	}, [
-		selectedBlockIds,
-		usesChunkMessageList,
-		chunkSelectionResolver,
-		exitSelection,
-		narratorId,
-		navigate,
-		t,
-	]);
+	}, [selectedBlockIds, chunkSelectionResolver, exitSelection, narratorId, navigate, t]);
 
 	// --- Segment compact ---
 	const handleSegmentCompact = useCallback(async () => {
@@ -4615,7 +4641,6 @@ export function NarratorPanel({
 	}, [
 		selectedBlockIds,
 		exitSelection,
-		usesChunkMessageList,
 		chunkSelectionResolver,
 		narratorId,
 		t,
@@ -4649,57 +4674,6 @@ export function NarratorPanel({
 
 	// --- Flat message elements ---
 	const showTokenUsage = userPrefs?.showTokenUsage ?? false;
-	const [messageRendererMode, setMessageRendererMode] = useNarratorMessageRendererMode();
-	const usePixiRenderer = messageRendererMode === "pixi" && !isWorkspacePreview;
-	const rendererScrollSnapshotRef = useRef<{
-		mode: typeof messageRendererMode;
-		distanceFromBottom: number;
-		ratio: number;
-		atBottom: boolean;
-	} | null>(null);
-	const captureRendererScrollSnapshot = useCallback(() => {
-		const vp = viewportRef.current;
-		if (!vp) return;
-		const maxScrollTop = getMessageViewportScrollBottom(vp);
-		const distanceFromBottom = Math.max(0, maxScrollTop - vp.scrollTop);
-		rendererScrollSnapshotRef.current = {
-			mode: messageRendererMode,
-			distanceFromBottom,
-			ratio: maxScrollTop > 0 ? vp.scrollTop / maxScrollTop : 1,
-			atBottom: distanceFromBottom < 30,
-		};
-	}, [messageRendererMode]);
-
-	useLayoutEffect(() => {
-		const snapshot = rendererScrollSnapshotRef.current;
-		if (!snapshot || snapshot.mode === messageRendererMode) return;
-		let cancelled = false;
-		const restore = () => {
-			if (cancelled) return;
-			const vp = viewportRef.current;
-			if (!vp) {
-				requestAnimationFrame(restore);
-				return;
-			}
-			const maxScrollTop = getMessageViewportScrollBottom(vp);
-			const target = snapshot.atBottom
-				? maxScrollTop
-				: Math.min(maxScrollTop, Math.max(0, maxScrollTop - snapshot.distanceFromBottom));
-			const fallbackTarget = Math.min(maxScrollTop, Math.max(0, maxScrollTop * snapshot.ratio));
-			programmaticScrollRef.current = true;
-			vp.scrollTop = Number.isFinite(target) ? target : fallbackTarget;
-			if (virtualListRef.current?.scrollToOffset) {
-				virtualListRef.current.scrollToOffset(vp.scrollTop);
-			}
-			isAtBottomRef.current = snapshot.atBottom;
-			setIsAtBottom(snapshot.atBottom);
-			rendererScrollSnapshotRef.current = null;
-		};
-		requestAnimationFrame(() => requestAnimationFrame(restore));
-		return () => {
-			cancelled = true;
-		};
-	}, [messageRendererMode]);
 	// Keep message element wrappers stable across narrator status changes.
 	// Re-enabling blur-in when a user sends a message changes the rendered element
 	// tree for existing history and can make the broad list lose its scroll anchor.
@@ -4739,7 +4713,7 @@ export function NarratorPanel({
 	// objects even when the message list for that page is unchanged.
 	const pruneDividerLabel = t("pruneBoundaryLabel");
 
-	const { flatElements, flatKeys, flatTargets } = useMemo(() => {
+	const { flatElements, flatTargets } = useMemo(() => {
 		if (usesChunkMessageList || isResizing || !deferredMessagesData?.pages) {
 			return {
 				flatElements: [],
@@ -4948,7 +4922,6 @@ export function NarratorPanel({
 			flatTargets: allTargets,
 		};
 	}, [
-		usesChunkMessageList,
 		isResizing,
 		deferredMessagesData,
 		narratorId,
@@ -5032,25 +5005,17 @@ export function NarratorPanel({
 	}, [
 		showManualLoadOlder,
 		flatElements,
-		isFetchingNextPage,
 		t,
 		showConclusionBtn,
 		narratorId,
 		updateConclusionMutation,
 	]);
-	const finalKeys = useMemo(() => {
-		if (!showManualLoadOlder && !showConclusionBtn) return flatKeys;
-		const keys = showManualLoadOlder ? ["__load-older-btn__", ...flatKeys] : [...flatKeys];
-		if (showConclusionBtn) keys.push("__update-conclusion-btn__");
-		return keys;
-	}, [showManualLoadOlder, flatKeys, showConclusionBtn]);
 	const finalTargets = useMemo(() => {
 		if (!showManualLoadOlder && !showConclusionBtn) return flatTargets;
 		const targets = showManualLoadOlder ? [[], ...flatTargets] : [...flatTargets];
 		if (showConclusionBtn) targets.push([]);
 		return targets;
 	}, [showManualLoadOlder, flatTargets, showConclusionBtn]);
-	const previewMessageCount = 5;
 	const [messageRenderWindow, setMessageRenderWindow] = useState<MessageRenderWindow>(() =>
 		getTailMessageRenderWindow(0),
 	);
@@ -5138,65 +5103,6 @@ export function NarratorPanel({
 		},
 		[messageRenderPhase, scrollToBottom],
 	);
-
-	const handleShowOlderLoadedMessages = useCallback(() => {
-		if (messageRenderPhase !== "full") {
-			startTransition(() => setMessageRenderPhase("full"));
-		}
-		detachFromFullBottom();
-		setMessageRenderWindow((current) => {
-			const currentStart = activeMessageRenderWindow?.start ?? current.start;
-			const newStart = Math.max(0, currentStart - MESSAGE_RENDER_WINDOW_SIZE);
-			const newEnd = Math.min(finalElements.length, newStart + MESSAGE_RENDER_WINDOW_SIZE);
-			const nextWindow: MessageRenderWindow = { start: newStart, end: newEnd, reason: "manual" };
-			return isSameMessageRenderWindow(current, nextWindow) ? current : nextWindow;
-		});
-	}, [
-		activeMessageRenderWindow?.start,
-		detachFromFullBottom,
-		finalElements.length,
-		messageRenderPhase,
-	]);
-
-	const renderedElements = useMemo(() => {
-		if (isWorkspacePreview) {
-			return finalElements.slice(Math.max(0, finalElements.length - previewMessageCount));
-		}
-		if (!shouldWindowMessages || !activeMessageRenderWindow) return finalElements;
-		const windowedElements = finalElements.slice(
-			activeMessageRenderWindow.start,
-			activeMessageRenderWindow.end,
-		);
-		if (activeMessageRenderWindow.start <= 0) return windowedElements;
-		return [
-			<Box ta="center" py={4} key="__show-loaded-older-btn__">
-				<Button size="compact-xs" variant="light" onClick={handleShowOlderLoadedMessages}>
-					{t("loadOlderMessages")}
-				</Button>
-			</Box>,
-			...windowedElements,
-		];
-	}, [
-		activeMessageRenderWindow,
-		finalElements,
-		handleShowOlderLoadedMessages,
-		isWorkspacePreview,
-		shouldWindowMessages,
-		t,
-	]);
-	const renderedKeys = useMemo(() => {
-		if (isWorkspacePreview) {
-			return finalKeys.slice(Math.max(0, finalKeys.length - previewMessageCount));
-		}
-		if (!shouldWindowMessages || !activeMessageRenderWindow) return finalKeys;
-		const windowedKeys = finalKeys.slice(
-			activeMessageRenderWindow.start,
-			activeMessageRenderWindow.end,
-		);
-		return activeMessageRenderWindow.start > 0
-			? ["__show-loaded-older-btn__", ...windowedKeys]
-			: windowedKeys;
-	}, [activeMessageRenderWindow, finalKeys, isWorkspacePreview, shouldWindowMessages]);
 
 	const fullIndexToVisibleIndexMap = useMemo(() => {
 		const indexMap = new Map<number, number>();
@@ -5322,29 +5228,6 @@ export function NarratorPanel({
 		],
 	);
 
-	// --- User message markers for scrollbar minimap ---
-	const userMessageMarkers = useMemo(() => {
-		if (!deferredMessagesData?.pages) return [];
-		const markers: { index: number; id: string }[] = [];
-		for (const page of deferredMessagesData.pages) {
-			for (const msg of page.messages ?? []) {
-				if (msg.role === "user" && msg.id) {
-					const idx = targetIndexMap.get(msg.id);
-					if (idx != null) markers.push({ index: idx, id: msg.id });
-				}
-			}
-		}
-		markers.sort((a, b) => a.index - b.index);
-		return markers;
-	}, [deferredMessagesData, targetIndexMap]);
-
-	const handleMarkerJump = useCallback(
-		(elementIndex: number) => {
-			scrollToFullIndex(elementIndex, { align: "center" });
-		},
-		[scrollToFullIndex],
-	);
-
 	// --- Load older / newer ---
 	const handleLoadOlder = useCallback(() => {
 		if (isFetchingNextPage) return;
@@ -5352,13 +5235,13 @@ export function NarratorPanel({
 			startTransition(() => setMessageRenderPhase("full"));
 		}
 		fetchNextPage();
-	}, [fetchNextPage, isFetchingNextPage, messageRenderPhase]);
+	}, [fetchNextPage, messageRenderPhase]);
 	loadOlderBtnRef.current = handleLoadOlder;
 
 	const handleLoadNewer = useCallback(async () => {
 		if (isFetchingPreviousPage) return;
 		await fetchPreviousPage();
-	}, [fetchPreviousPage, isFetchingPreviousPage]);
+	}, [fetchPreviousPage]);
 
 	const revealLatestMessages = useCallback(async () => {
 		for (let attempt = 0; attempt < 20; attempt++) {
@@ -5412,14 +5295,7 @@ export function NarratorPanel({
 		check();
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
-	}, [
-		autoLoadEnabled,
-		usesChunkMessageList,
-		hasHiddenOlderLoadedWindow,
-		hasNextPage,
-		initialScrollDone,
-		isFetchingNextPage,
-	]);
+	}, [autoLoadEnabled, hasHiddenOlderLoadedWindow, initialScrollDone]);
 
 	const handleLoadNewerRef = useRef(handleLoadNewer);
 	handleLoadNewerRef.current = handleLoadNewer;
@@ -5446,156 +5322,14 @@ export function NarratorPanel({
 		};
 		vp.addEventListener("scroll", check, { passive: true });
 		return () => vp.removeEventListener("scroll", check);
-	}, [
-		autoLoadEnabled,
-		usesChunkMessageList,
-		hasHiddenNewerLoadedWindow,
-		hasPreviousPage,
-		initialScrollDone,
-		isFetchingPreviousPage,
-	]);
+	}, [autoLoadEnabled, hasHiddenNewerLoadedWindow, initialScrollDone]);
 
-	// --- Scroll state: user-input driven ---
-	const lastTouchYRef = useRef(0);
-	const userScrollIntentRef = useRef<"up" | "down" | null>(null);
-	const userScrollIntentExpiresAtRef = useRef(0);
-	const scrollbarDragRef = useRef(false);
+	// --- Scroll state ---
 	const cleanupRef = useRef<(() => void) | null>(null);
 	const chunkViewportRef = useCallback((node: HTMLDivElement | null) => {
 		cleanupRef.current?.();
 		cleanupRef.current = null;
 		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
-	}, []);
-
-	const viewportCallbackRef = useCallback((node: HTMLDivElement | null) => {
-		cleanupRef.current?.();
-		cleanupRef.current = null;
-		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
-		if (!node) return;
-
-		const markUserScrollIntent = (direction: "up" | "down") => {
-			userScrollIntentRef.current = direction;
-			userScrollIntentExpiresAtRef.current = performance.now() + 500;
-			loadOlderArmedRef.current = direction === "up";
-		};
-		const hasRecentUpwardUserIntent = () => {
-			if (scrollbarDragRef.current) return true;
-			if (userScrollIntentRef.current !== "up") return false;
-			if (performance.now() <= userScrollIntentExpiresAtRef.current) return true;
-			userScrollIntentRef.current = null;
-			return false;
-		};
-		const checkAtBottom = () => {
-			const atBottom =
-				isTailRenderWindowRef.current && getMessageViewportDistanceFromBottom(node) < 30;
-			if (atBottom && !isAtBottomRef.current) {
-				isAtBottomRef.current = true;
-				setIsAtBottom(true);
-				setUnreadCountRef.current?.(0);
-			}
-		};
-		const detachFromBottom = () => {
-			if (isAtBottomRef.current) {
-				isAtBottomRef.current = false;
-				setIsAtBottom(false);
-			}
-		};
-
-		const onWheel = (e: WheelEvent) => {
-			if (e.deltaY < 0) {
-				markUserScrollIntent("up");
-				detachFromBottom();
-			} else if (e.deltaY > 0) {
-				markUserScrollIntent("down");
-			}
-		};
-		const onTouchStart = (e: TouchEvent) => {
-			if (e.touches.length > 0) lastTouchYRef.current = e.touches[0].clientY;
-		};
-		const onTouchMove = (e: TouchEvent) => {
-			if (e.touches.length === 0) return;
-			const cur = e.touches[0].clientY;
-			const delta = lastTouchYRef.current - cur;
-			lastTouchYRef.current = cur;
-			if (delta < 0) {
-				markUserScrollIntent("up");
-				detachFromBottom();
-			} else if (delta > 0) {
-				markUserScrollIntent("down");
-			}
-		};
-		const onPointerDown = (e: PointerEvent) => {
-			const verticalScrollbarWidth = node.offsetWidth - node.clientWidth;
-			if (verticalScrollbarWidth <= 0) return;
-			const rect = node.getBoundingClientRect();
-			if (e.clientX >= rect.right - verticalScrollbarWidth) {
-				scrollbarDragRef.current = true;
-				loadOlderArmedRef.current = true;
-			}
-		};
-		const onPointerUp = () => {
-			scrollbarDragRef.current = false;
-		};
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (["ArrowUp", "PageUp", "Home"].includes(e.key) || (e.key === " " && e.shiftKey)) {
-				markUserScrollIntent("up");
-				detachFromBottom();
-			} else if (["ArrowDown", "PageDown", "End", " "].includes(e.key)) {
-				markUserScrollIntent("down");
-			}
-		};
-
-		let lastScrollTop = node.scrollTop;
-		const onScroll = () => {
-			const cur = node.scrollTop;
-			// During a viewport resize, suppress all detach checks — multiple
-			// programmatic scrollTop writes fire multiple scroll events and a
-			// one-shot flag can't cover them all.
-			if (resizingRef.current) {
-				lastScrollTop = cur;
-				return;
-			}
-			// One-shot suppression for individual programmatic scrollTop writes
-			// outside of a resize (e.g. scrollToBottom instant).
-			if (programmaticScrollRef.current) {
-				programmaticScrollRef.current = false;
-				lastScrollTop = cur;
-				return;
-			}
-			// A negative scrollTop delta can also be produced by scroll anchoring or
-			// content re-measurement. Only treat it as leaving the
-			// bottom-following mode when it is tied to explicit upward user input.
-			if (!followingRef.current && cur < lastScrollTop && hasRecentUpwardUserIntent()) {
-				detachFromBottom();
-			}
-			lastScrollTop = cur;
-		};
-		const onScrollEnd = () => {
-			if (followingRef.current || resizingRef.current) return;
-			checkAtBottom();
-		};
-
-		node.addEventListener("wheel", onWheel, { passive: true });
-		node.addEventListener("touchstart", onTouchStart, { passive: true });
-		node.addEventListener("touchmove", onTouchMove, { passive: true });
-		node.addEventListener("pointerdown", onPointerDown, { passive: true });
-		node.addEventListener("keydown", onKeyDown);
-		node.addEventListener("scroll", onScroll, { passive: true });
-		node.addEventListener("scrollend", onScrollEnd, { passive: true });
-		window.addEventListener("pointerup", onPointerUp);
-		window.addEventListener("pointercancel", onPointerUp);
-		cleanupRef.current = () => {
-			node.removeEventListener("wheel", onWheel);
-			node.removeEventListener("touchstart", onTouchStart);
-			node.removeEventListener("touchmove", onTouchMove);
-			node.removeEventListener("pointerdown", onPointerDown);
-			node.removeEventListener("keydown", onKeyDown);
-			node.removeEventListener("scroll", onScroll);
-			node.removeEventListener("scrollend", onScrollEnd);
-			window.removeEventListener("pointerup", onPointerUp);
-			window.removeEventListener("pointercancel", onPointerUp);
-			scrollbarDragRef.current = false;
-		};
 	}, []);
 
 	// --- Initial scroll ---
@@ -5782,7 +5516,7 @@ export function NarratorPanel({
 			}
 			return false;
 		},
-		[usesChunkMessageList, scheduleHighlight, scrollToFullIndex, targetIndexMap],
+		[scheduleHighlight, scrollToFullIndex, targetIndexMap],
 	);
 
 	const compactingMarkerInfo = useMemo(() => {
@@ -5949,7 +5683,6 @@ export function NarratorPanel({
 		shouldWindowMessages,
 		t,
 		targetIndexMap,
-		usePixiRenderer,
 	]);
 
 	// --- Scroll to highlighted message ---
@@ -7198,21 +6931,6 @@ export function NarratorPanel({
 						{!isWorkspacePreview && (
 							<Group gap="xs">
 								<BackgroundTasksDrawer narratorId={narratorId} />
-								<Tooltip
-									label={usePixiRenderer ? t("switchToReactRenderer") : t("switchToPixiRenderer")}
-								>
-									<ActionIcon
-										size="sm"
-										variant={usePixiRenderer ? "light" : "subtle"}
-										color={usePixiRenderer ? "indigo" : "gray"}
-										onClick={() => {
-											captureRendererScrollSnapshot();
-											setMessageRendererMode(usePixiRenderer ? "react" : "pixi");
-										}}
-									>
-										<IconPhoto size={16} />
-									</ActionIcon>
-								</Tooltip>
 								<Tooltip label={t("fileMod_title")}>
 									<ActionIcon
 										size="sm"
@@ -7626,31 +7344,20 @@ export function NarratorPanel({
 														</Stack>
 													</Box>
 												) : isWorkspacePreview ? (
-													<Box h="100%" style={{ position: "relative", overflow: "hidden" }}>
-														<Box
-															px="md"
-															pt="md"
-															style={{
-																position: "absolute",
-																left: 0,
-																right: 0,
-																bottom: 0,
-																display: "flex",
-																flexDirection: "column",
-																gap: 12,
-															}}
-														>
-															{renderedElements.map((element, index) => (
-																<Box
-																	key={renderedKeys[index] ?? `preview-${index}`}
-																	style={{ flex: "0 0 auto", minWidth: 0 }}
-																>
-																	{element}
-																</Box>
-															))}
-														</Box>
-													</Box>
-												) : usesChunkMessageList ? (
+													<WorkspaceChunkPreview
+														narratorId={narratorId}
+														isSubagent={isSubagent}
+														permCb={renderPermCb}
+														expandedToolUseId={expandedToolUseId}
+														showTokenUsage={showTokenUsage}
+														pruneBoundaryMessageId={pruneBoundaryMessageId}
+														pruneDividerLabel={pruneDividerLabel}
+														lastUserMessageId={lastUserMessageId}
+														hasChapter={hasChapter}
+														resolvePerm={resolvePermForRender}
+														onAskInPassing={handleAskInPassing}
+													/>
+												) : (
 													<ChunkedMessageList
 														ref={chunkListRef}
 														narratorId={narratorId}
@@ -7692,61 +7399,12 @@ export function NarratorPanel({
 														onUnreadCountChange={setUnreadCount}
 														onTailMetaChange={handleChunkTailMetaChange}
 													/>
-												) : usePixiRenderer ? (
-													<NarratorPixiMessageList
-														ref={virtualListRef}
-														messagesData={deferredMessagesData}
-														narratorId={narratorId}
-														streamingMsg={streamingMsg}
-														pruneBoundaryMessageId={pruneBoundaryMessageId}
-														pruneDividerLabel={pruneDividerLabel}
-														showManualLoadOlder={showManualLoadOlder}
-														showConclusionButton={showConclusionBtn}
-														showTokenUsage={showTokenUsage}
-														highlightedId={highlightedId}
-														pendingPermission={renderPermCb.pendingPermission}
-														pendingPermsMap={renderPermCb.pendingPermsMap}
-														onPermissionDecision={renderPermCb.onPermissionDecision}
-														onForkFromMessage={forkHandler}
-														onAskInPassing={handleAskInPassing}
-														onCompactBeforeMessage={
-															compactSupported ? handleCompactBefore : undefined
-														}
-														onClearContextBefore={
-															compactSupported ? handleClearContextBefore : undefined
-														}
-														onManualSummarize={compactSupported ? handleManualSummarize : undefined}
-														onDeleteBlock={handleDeleteBlock}
-														onRollbackToBlock={
-															rollbackEditRegenerateSupported ? handleRollback : undefined
-														}
-														scrollRef={viewportCallbackRef}
-														contentRef={contentRef}
-														shift={isFetchingNextPage}
-													/>
-												) : (
-													<BroadMessageList
-														ref={virtualListRef}
-														elements={renderedElements}
-														elementKeys={renderedKeys}
-														scrollRef={viewportCallbackRef}
-														contentRef={contentRef}
-														shift={isFetchingNextPage}
-													/>
 												)}
 											</EditingMessageCtx.Provider>
 										</LatestTodosToolUseIdCtx.Provider>
 									</FileModDrawerCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
-							{!usesChunkMessageList && !isWorkspacePreview && (
-								<ScrollbarUserMarkers
-									markers={userMessageMarkers}
-									totalCount={finalElements.length}
-									onJump={handleMarkerJump}
-									scrollContainerRef={viewportRef}
-								/>
-							)}
 						</Box>
 
 						{/* Off-screen swipe/compacting anchor overlay — cloned message preview */}

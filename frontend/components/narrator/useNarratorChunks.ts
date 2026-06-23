@@ -1,5 +1,10 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChunkManifestEntry, ChunkManifestTuple, TreeMessage } from "../../lib/api";
+import type {
+	ChunkManifestEntry,
+	ChunkManifestTuple,
+	ChunkRangeResult,
+	TreeMessage,
+} from "../../lib/api";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import type { NarratorMsg } from "./narrator-panel-types";
@@ -76,6 +81,8 @@ export interface NarratorChunksState {
 	manifest: ChunkManifestEntry[];
 	total: number;
 	messageVersion: number;
+	pruneBoundaryMessageId: string | null;
+	prunedPercent: number | null;
 	/** chunkId -> loaded messages. Sparse: only fetched chunks are present. */
 	loaded: Map<string, TreeMessage[]>;
 }
@@ -99,6 +106,15 @@ const MAX_CHUNKS_PER_RANGE_REQUEST = 20;
 const CHUNK_EVICT_DELAY_MS = 30_000;
 type ReconcileMode = "diff" | "full";
 
+type ChunkRangeMeta = Pick<ChunkRangeResult, "pruneBoundaryMessageId" | "prunedPercent">;
+
+function getChunkRangeMeta(range: ChunkRangeMeta): ChunkRangeMeta {
+	return {
+		pruneBoundaryMessageId: range.pruneBoundaryMessageId ?? null,
+		prunedPercent: range.prunedPercent ?? null,
+	};
+}
+
 /** Deepest last descendant id of a message (skips synthetic streaming ids). */
 function deepestLastChildId(message: TreeMessage | undefined): string | undefined {
 	if (!message?.id || message.id === STREAMING_CHUNKS_MSG_ID) return undefined;
@@ -114,6 +130,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		manifest: [],
 		total: 0,
 		messageVersion: 0,
+		pruneBoundaryMessageId: null,
+		prunedPercent: null,
 		loaded: new Map(),
 	});
 	const [loading, setLoading] = useState(true);
@@ -201,13 +219,13 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	);
 
 	const mergeLoaded = useCallback(
-		(incoming: Map<string, TreeMessage[]>) => {
-			if (incoming.size === 0) return;
+		(incoming: Map<string, TreeMessage[]>, meta?: ChunkRangeMeta | null) => {
+			if (incoming.size === 0 && !meta) return;
 			for (const chunkId of incoming.keys()) cancelEviction(chunkId);
 			setState((prev) => {
-				const loaded = new Map(prev.loaded);
+				const loaded = incoming.size > 0 ? new Map(prev.loaded) : prev.loaded;
 				for (const [chunkId, msgs] of incoming) loaded.set(chunkId, msgs);
-				return { ...prev, loaded };
+				return { ...prev, ...(meta ? getChunkRangeMeta(meta) : {}), loaded };
 			});
 		},
 		[cancelEviction],
@@ -294,6 +312,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			manifest: [],
 			total: 0,
 			messageVersion: 0,
+			pruneBoundaryMessageId: null,
+			prunedPercent: null,
 			loaded: new Map(),
 		});
 		inFlightRef.current.clear();
@@ -318,10 +338,13 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				const manifestChunks = manifest.unchanged ? [] : decodeManifestTuples(manifest.chunks);
 				manifestRef.current = manifestChunks;
 				const loaded = regroup(range.messages);
+				const meta = getChunkRangeMeta(range);
 				setState({
 					manifest: manifestChunks,
 					total: manifest.unchanged ? 0 : manifest.total,
 					messageVersion: range.messageVersion,
+					pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? null,
+					prunedPercent: meta.prunedPercent ?? null,
 					loaded,
 				});
 				// Seed the WS manager's tracked version so reconnect catch-up diffs work.
@@ -372,7 +395,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					count: bandChunkCount,
 				});
 				if (generation !== loadGenerationRef.current) return;
-				mergeLoaded(regroup(range.messages));
+				mergeLoaded(regroup(range.messages), getChunkRangeMeta(range));
 			} finally {
 				for (let i = start; i <= end; i++) inFlightRef.current.delete(manifest[i].id);
 			}
@@ -403,9 +426,10 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			manifestChunks: ChunkManifestEntry[],
 			ranges: Array<{ start: number; end: number }>,
 			generation: number,
-		): Promise<Map<string, TreeMessage[]> | null> => {
+		): Promise<{ incoming: Map<string, TreeMessage[]>; meta: ChunkRangeMeta | null } | null> => {
 			const incoming = new Map<string, TreeMessage[]>();
-			if (manifestChunks.length === 0 || ranges.length === 0) return incoming;
+			let meta: ChunkRangeMeta | null = null;
+			if (manifestChunks.length === 0 || ranges.length === 0) return { incoming, meta };
 
 			const merged = [...ranges]
 				.filter((r) => r.start <= r.end)
@@ -436,12 +460,13 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						count: subEnd - subStart + 1,
 					});
 					if (generation !== loadGenerationRef.current) return null;
+					meta = getChunkRangeMeta(range);
 					for (const [chunkId, messages] of regroup(range.messages)) {
 						incoming.set(chunkId, messages);
 					}
 				}
 			}
-			return incoming;
+			return { incoming, meta };
 		},
 		[narratorId, regroup],
 	);
@@ -492,6 +517,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							manifest: [],
 							total: 0,
 							messageVersion: manifestVersion,
+							pruneBoundaryMessageId: null,
+							prunedPercent: null,
 							loaded: new Map(),
 						});
 						narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
@@ -534,8 +561,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 						});
 					}
 
-					const incoming = await loadManifestBands(manifestChunks, ranges, generation);
-					if (!incoming || generation !== loadGenerationRef.current) return;
+					const bandResult = await loadManifestBands(manifestChunks, ranges, generation);
+					if (!bandResult || generation !== loadGenerationRef.current) return;
 
 					setState((prev) => {
 						const loaded = new Map<string, TreeMessage[]>();
@@ -546,11 +573,15 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 								if (idx != null && idx < dirtyStart) loaded.set(chunkId, messages);
 							}
 						}
-						for (const [chunkId, messages] of incoming) loaded.set(chunkId, messages);
+						for (const [chunkId, messages] of bandResult.incoming) loaded.set(chunkId, messages);
+						const meta = bandResult.meta ? getChunkRangeMeta(bandResult.meta) : null;
 						return {
 							manifest: manifestChunks,
 							total: nextTotal,
 							messageVersion: manifestVersion,
+							pruneBoundaryMessageId:
+								meta?.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId ?? null,
+							prunedPercent: meta?.prunedPercent ?? prev.prunedPercent ?? null,
 							loaded,
 						};
 					});
@@ -595,9 +626,9 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				for (let i = range.start; i <= range.end; i++) inFlightRef.current.add(manifest[i].id);
 			}
 			try {
-				const incoming = await loadManifestBands(manifest, missingRanges, generation);
-				if (!incoming || generation !== loadGenerationRef.current) return;
-				mergeLoaded(incoming);
+				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
+				if (!bandResult || generation !== loadGenerationRef.current) return;
+				mergeLoaded(bandResult.incoming, bandResult.meta);
 			} finally {
 				for (const range of missingRanges) {
 					for (let i = range.start; i <= range.end; i++) inFlightRef.current.delete(manifest[i].id);
@@ -704,6 +735,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		chunks,
 		total: state.total,
 		messageVersion: state.messageVersion,
+		pruneBoundaryMessageId: state.pruneBoundaryMessageId,
+		prunedPercent: state.prunedPercent,
 		loading,
 		ensureLoaded,
 		ensureLoadedRange,

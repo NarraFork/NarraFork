@@ -7,10 +7,9 @@ import type {
 	BufferMessageSummary,
 	ChunkManifest,
 	ChunkRangeResult,
-	MessagesAroundOptions,
+	MessageLocationResult,
 	NarratorGoal,
 	NarratorGoalStatus,
-	PaginatedMessages,
 	PaginatedNarrators,
 	WhitelistCmd,
 	WhitelistDir,
@@ -186,28 +185,6 @@ export const narratorsApi = {
 	deleteNarrator: (id: string) => request<ApiEntity>(`/narrators/${id}`, { method: "DELETE" }),
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
-	getNarratorMessages: (
-		id: string,
-		opts?: {
-			limit?: number;
-			cursor?: string;
-			direction?: "older" | "newer";
-			around?: MessagesAroundOptions;
-		},
-	) => {
-		const params = new URLSearchParams();
-		if (opts?.around) {
-			params.set("around", opts.around.messageId);
-			if (opts.around.before != null) params.set("before", String(opts.around.before));
-			if (opts.around.after != null) params.set("after", String(opts.around.after));
-		} else {
-			if (opts?.limit) params.set("limit", String(opts.limit));
-			if (opts?.cursor) params.set("cursor", opts.cursor);
-			if (opts?.direction === "newer") params.set("direction", "newer");
-		}
-		const qs = params.toString();
-		return request<PaginatedMessages>(`/narrators/${id}/messages${qs ? `?${qs}` : ""}`);
-	},
 	// Chunk virtualization: lightweight manifest of structural fingerprints.
 	getChunkManifest: (id: string, since?: number) => {
 		const params = new URLSearchParams();
@@ -227,6 +204,11 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<ChunkRangeResult>(`/narrators/${id}/chunks${qs ? `?${qs}` : ""}`);
 	},
+	// Chunk virtualization: resolve a message to its top-level seq coordinate.
+	getMessageLocation: (id: string, messageId: string) =>
+		request<MessageLocationResult>(
+			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
+		),
 	getToolCallDetail: (narratorId: string, toolUseId: string) =>
 		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
 	interruptNarrator: (id: string) =>

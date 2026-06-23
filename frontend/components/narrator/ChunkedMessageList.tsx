@@ -95,8 +95,13 @@ export interface ChunkedMessageListHandle {
 }
 
 export interface ChunkTailMeta {
+	statusReady?: boolean;
 	lastRealMessage: { id: string; role: NarratorMsg["role"] } | null;
 	lastUserMessageId?: string;
+	contextPercent?: number | null;
+	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
+	pruneBoundaryMessageId?: string | null;
+	prunedPercent?: number | null;
 }
 
 function isErrorSystemMessage(msg: NarratorMsg): boolean {
@@ -107,9 +112,16 @@ function isErrorSystemMessage(msg: NarratorMsg): boolean {
 	);
 }
 
-function buildChunkTailMeta(chunks: ChunkData[]): ChunkTailMeta {
+function buildChunkTailMeta(
+	chunks: ChunkData[],
+	statusReady: boolean,
+	pruneBoundaryMessageId: string | null,
+	prunedPercent: number | null,
+): ChunkTailMeta {
 	let lastRealMessage: ChunkTailMeta["lastRealMessage"] = null;
 	let lastUserMessageId: string | undefined;
+	let contextPercent: number | null | undefined;
+	let turnUsageJson: NarratorMsg["turnUsageJson"] | null | undefined;
 	for (let chunkIndex = chunks.length - 1; chunkIndex >= 0; chunkIndex--) {
 		const messages = chunks[chunkIndex]?.messages;
 		if (!messages?.length) continue;
@@ -123,10 +135,32 @@ function buildChunkTailMeta(chunks: ChunkData[]): ChunkTailMeta {
 			if (!lastUserMessageId && msg.role === "user" && !id.startsWith("optimistic-")) {
 				lastUserMessageId = id;
 			}
-			if (lastRealMessage && lastUserMessageId) return { lastRealMessage, lastUserMessageId };
+			if (contextPercent == null && msg.contextPercent != null) {
+				contextPercent = msg.contextPercent;
+				turnUsageJson = msg.turnUsageJson ?? null;
+			}
+			if (lastRealMessage && lastUserMessageId && contextPercent != null) {
+				return {
+					statusReady,
+					lastRealMessage,
+					lastUserMessageId,
+					contextPercent,
+					turnUsageJson,
+					pruneBoundaryMessageId,
+					prunedPercent,
+				};
+			}
 		}
 	}
-	return { lastRealMessage, lastUserMessageId };
+	return {
+		statusReady,
+		lastRealMessage,
+		lastUserMessageId,
+		contextPercent,
+		turnUsageJson,
+		pruneBoundaryMessageId,
+		prunedPercent,
+	};
 }
 
 function assignExternalRef<T>(
@@ -657,6 +691,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			refreshStructure,
 			streamingMsg,
 			tailChunkId,
+			pruneBoundaryMessageId: chunkPruneBoundaryMessageId,
+			prunedPercent: chunkPrunedPercent,
 			setIsAtBottom,
 			unreadCount,
 			resetUnread,
@@ -664,9 +700,27 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const tailMetaNarratorIdRef = useRef(narratorId);
 		const tailMetaSwitchingNarrator = tailMetaNarratorIdRef.current !== narratorId;
 		if (tailMetaSwitchingNarrator) tailMetaNarratorIdRef.current = narratorId;
+		const tailLoadedForMeta =
+			tailChunkId == null
+				? !loading
+				: chunks.length > 0 && chunks[chunks.length - 1]?.messages != null;
 		const tailMeta = useMemo<ChunkTailMeta>(
-			() => (tailMetaSwitchingNarrator ? { lastRealMessage: null } : buildChunkTailMeta(chunks)),
-			[chunks, tailMetaSwitchingNarrator],
+			() =>
+				tailMetaSwitchingNarrator
+					? { statusReady: false, lastRealMessage: null }
+					: buildChunkTailMeta(
+							chunks,
+							tailLoadedForMeta,
+							chunkPruneBoundaryMessageId,
+							chunkPrunedPercent,
+						),
+			[
+				chunks,
+				tailMetaSwitchingNarrator,
+				tailLoadedForMeta,
+				chunkPruneBoundaryMessageId,
+				chunkPrunedPercent,
+			],
 		);
 		useEffect(() => {
 			onTailMetaChange?.(tailMeta);
@@ -937,11 +991,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 
 		const resolveMessageSeq = useCallback(
 			async (messageId: string): Promise<number | null> => {
-				const around = await api.getNarratorMessages(narratorId, {
-					around: { messageId, before: 0, after: 0 },
-				});
-				const exact = findMessageById(around.messages as NarratorMsg[], messageId);
-				return getMessageSeq(exact);
+				const location = await api.getMessageLocation(narratorId, messageId);
+				return typeof location.seq === "number" && Number.isFinite(location.seq)
+					? location.seq
+					: null;
 			},
 			[narratorId],
 		);
@@ -995,19 +1048,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					const detail = await api.getToolCallDetail(narratorId, toolUseId);
 					const messageId = typeof detail?.messageId === "string" ? detail.messageId : undefined;
 					if (!messageId) return null;
-					const around = await api.getNarratorMessages(narratorId, {
-						around: { messageId, before: 0, after: 0 },
-					});
-					const msg = findMessageById(around.messages as NarratorMsg[], messageId);
-					const seq = getMessageSeq(msg);
-					const blockIndex = Array.isArray(msg?.contentJson)
-						? msg.contentJson.findIndex(
-								(block) => block?.type === "tool_use" && block.id === toolUseId,
-							)
-						: -1;
+					const seq = await resolveMessageSeq(messageId);
 					const chunkIndex = seq == null ? -1 : getChunkIndexForSeq(seq);
-					if (seq == null || blockIndex < 0 || chunkIndex < 0) return null;
-					return { blockId, messageId, blockIndex, seq, chunkIndex, copyText: "" };
+					if (seq == null || chunkIndex < 0) return null;
+					// The exact block index will be refreshed from the loaded chunk after
+					// ensureLoadedRange(). Use 0 only as a temporary ordering fallback.
+					return { blockId, messageId, blockIndex: 0, seq, chunkIndex, copyText: "" };
 				} catch {
 					return null;
 				}

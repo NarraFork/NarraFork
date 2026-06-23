@@ -467,8 +467,6 @@
 	"showTokenUsageDesc": "每轮对话结束后显示输入/输出 Token 数量",
 	"showOutputStats": "显示实时 AI 输出速率",
 	"showOutputStatsDesc": "在标题栏显示实时字符/秒指示器，基于 3 秒滑动窗口平均计算",
-	"experimentalChunkedList": "实验：分块消息列表",
-	"experimentalChunkedListDesc": "启用新的 chunk 虚拟化消息列表（Phase 0 验证），可能不稳定。重新打开叙述者后生效。",
 	"terminalSection": "终端",
 	"terminalTheme": "终端主题",
 	"terminalThemeAuto": "自动（跟随系统）",
