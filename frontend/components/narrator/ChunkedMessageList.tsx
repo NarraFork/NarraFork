@@ -14,7 +14,7 @@ import {
 	useState,
 } from "react";
 import { api } from "../../lib/api";
-import { resolveScrollTargetIndex } from "./chunk-scroll-utils";
+import { estimateSeqCenteredScrollTop, resolveScrollTargetIndex } from "./chunk-scroll-utils";
 import { renderTreeMessages } from "./MessageRenderer";
 import {
 	type BlockMeta,
@@ -63,6 +63,7 @@ const PER_MESSAGE_ESTIMATE = 120; // px, rough seed for unmeasured chunks
 const BOTTOM_PIN_THRESHOLD = 48;
 const FOLLOW_USER_SCROLL_UP_TOLERANCE = 2;
 const JUMP_LOAD_RADIUS = 3;
+const JUMP_TARGET_TIMEOUT_MS = 3000;
 const SOFT_RANGE_SELECT_CHUNKS = 30;
 const HARD_RANGE_SELECT_CHUNKS = 120;
 /** Matches BroadMessageList ITEM_GAP / previous Stack gap="sm". */
@@ -75,6 +76,13 @@ interface FollowTailOptions {
 	force?: boolean;
 	immediate?: boolean;
 }
+
+interface JumpTargetResolution {
+	domIds: string[];
+	highlightId?: string;
+}
+
+type JumpTargetResolver = () => JumpTargetResolution;
 
 function getScrollBottomTarget(el: HTMLElement): number {
 	return Math.max(0, el.scrollHeight - el.clientHeight);
@@ -89,7 +97,7 @@ export interface ChunkedMessageListHandle {
 		domIds: string[];
 		targetIds: string[];
 		highlightId?: string;
-	}) => void;
+	}) => Promise<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
 	refreshStructure: (mode?: "diff" | "full") => void;
 }
@@ -198,6 +206,15 @@ function findMessageById(messages: NarratorMsg[], messageId: string): NarratorMs
 function getMessageSeq(msg: NarratorMsg | null | undefined): number | null {
 	const seq = msg?.seq;
 	return typeof seq === "number" && Number.isFinite(seq) ? seq : null;
+}
+
+function findUserMessageIdBySeq(chunks: ChunkData[], seq: number): string | undefined {
+	for (const chunk of chunks) {
+		for (const msg of chunk.messages ?? []) {
+			if (msg.role === "user" && msg.id && getMessageSeq(msg) === seq) return msg.id;
+		}
+	}
+	return undefined;
 }
 
 function waitAnimationFrame(): Promise<void> {
@@ -954,6 +971,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			}
 			return selectionIndexRef.current;
 		}, []);
+		const jumpTokenRef = useRef(0);
 
 		const scrollDomIdsIntoView = useCallback(
 			(domIds: string[], highlightId?: string) => {
@@ -967,6 +985,56 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				return false;
 			},
 			[onHighlightTarget],
+		);
+
+		const waitForJumpTarget = useCallback(
+			(resolveTarget: JumpTargetResolver, token: number, timeoutMs = JUMP_TARGET_TIMEOUT_MS) =>
+				new Promise<boolean>((resolve) => {
+					const start = performance.now();
+					let rafId = 0;
+					let done = false;
+					let observer: MutationObserver | null = null;
+
+					const cleanup = () => {
+						if (rafId) cancelAnimationFrame(rafId);
+						observer?.disconnect();
+					};
+					const finish = (ok: boolean) => {
+						if (done) return;
+						done = true;
+						cleanup();
+						resolve(ok);
+					};
+					const schedule = () => {
+						if (done || rafId) return;
+						rafId = requestAnimationFrame(check);
+					};
+					const check = () => {
+						rafId = 0;
+						if (token !== jumpTokenRef.current) {
+							finish(false);
+							return;
+						}
+						const target = resolveTarget();
+						if (scrollDomIdsIntoView(target.domIds, target.highlightId)) {
+							finish(true);
+							return;
+						}
+						if (performance.now() - start >= timeoutMs) {
+							finish(false);
+							return;
+						}
+						schedule();
+					};
+
+					const content = contentNodeRef.current;
+					if (content) {
+						observer = new MutationObserver(schedule);
+						observer.observe(content, { childList: true, subtree: true });
+					}
+					schedule();
+				}),
+			[scrollDomIdsIntoView],
 		);
 
 		const getChunkIndexForSeq = useCallback((seq: number) => {
@@ -1128,30 +1196,40 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		}, [onSelectionResolverChange, selectionResolver]);
 
 		const scrollToSeqTarget = useCallback(
-			async (seq: number, domIds: string[], highlightId?: string) => {
+			async (seq: number, resolveTarget: JumpTargetResolver, token = ++jumpTokenRef.current) => {
 				const chunkIndex = getChunkIndexForSeq(seq);
 				if (chunkIndex < 0) return false;
 				const chunk = chunksRef.current[chunkIndex];
 				if (!chunk) return false;
+
+				stopFollowTailRef.current();
+				setPinnedToBottom(false);
 				setCenterChunkId(chunkIndex === chunksRef.current.length - 1 ? null : chunk.id);
+
 				const el = scrollerRef.current;
 				if (el) {
-					const top = prefixRef.current[chunkIndex] ?? 0;
-					el.scrollTop = Math.max(0, top - el.clientHeight / 2);
+					el.scrollTop = estimateSeqCenteredScrollTop(
+						prefixRef.current,
+						chunkIndex,
+						chunk,
+						seq,
+						el.clientHeight,
+					);
 				}
-				await ensureLoadedRef.current(chunk.id, JUMP_LOAD_RADIUS);
-				for (let i = 0; i < 4; i++) {
-					await waitAnimationFrame();
-					if (scrollDomIdsIntoView(domIds, highlightId)) return true;
+
+				try {
+					await ensureLoadedRef.current(chunk.id, JUMP_LOAD_RADIUS);
+				} catch {
+					return false;
 				}
-				if (highlightId) onHighlightTarget?.(highlightId, 300);
-				return false;
+				if (token !== jumpTokenRef.current) return false;
+				return waitForJumpTarget(resolveTarget, token);
 			},
-			[getChunkIndexForSeq, onHighlightTarget, scrollDomIdsIntoView],
+			[getChunkIndexForSeq, setPinnedToBottom, waitForJumpTarget],
 		);
 
 		const scrollToMessageTarget = useCallback(
-			({
+			async ({
 				domIds,
 				targetIds,
 				highlightId,
@@ -1160,12 +1238,11 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				targetIds: string[];
 				highlightId?: string;
 			}) => {
-				if (scrollDomIdsIntoView(domIds, highlightId)) return;
-				void (async () => {
-					const seq = await resolveTargetSeq(targetIds);
-					if (seq == null) return;
-					await scrollToSeqTarget(seq, domIds, highlightId);
-				})();
+				const token = ++jumpTokenRef.current;
+				if (scrollDomIdsIntoView(domIds, highlightId)) return true;
+				const seq = await resolveTargetSeq(targetIds).catch(() => null);
+				if (seq == null || token !== jumpTokenRef.current) return false;
+				return scrollToSeqTarget(seq, () => ({ domIds, highlightId }), token);
 			},
 			[resolveTargetSeq, scrollDomIdsIntoView, scrollToSeqTarget],
 		);
@@ -1324,10 +1401,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			const key = `${narratorId}:${highlightMessageId}`;
 			if (lastHighlightTargetRef.current === key) return;
 			lastHighlightTargetRef.current = key;
-			scrollToMessageTarget({
+			void scrollToMessageTarget({
 				domIds: [`msg-${highlightMessageId}`],
 				targetIds: [highlightMessageId],
 				highlightId: highlightMessageId,
+			}).then((ok) => {
+				if (!ok && lastHighlightTargetRef.current === key) lastHighlightTargetRef.current = null;
 			});
 		}, [chunks.length, highlightMessageId, narratorId, scrollToMessageTarget]);
 
@@ -1356,16 +1435,13 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const handleUserMarkerJump = useCallback(
 			(index: number) => {
 				const seq = firstManifestSeq + index;
-				let messageId: string | undefined;
-				for (const chunk of chunksRef.current) {
-					for (const msg of chunk.messages ?? []) {
-						if (msg.role !== "user" || getMessageSeq(msg) !== seq) continue;
-						messageId = msg.id;
-						break;
-					}
-					if (messageId) break;
-				}
-				void scrollToSeqTarget(seq, messageId ? [`msg-${messageId}`] : [], messageId);
+				void scrollToSeqTarget(seq, () => {
+					const messageId = findUserMessageIdBySeq(chunksRef.current, seq);
+					return {
+						domIds: messageId ? [`msg-${messageId}`] : [],
+						highlightId: messageId,
+					};
+				});
 			},
 			[firstManifestSeq, scrollToSeqTarget],
 		);

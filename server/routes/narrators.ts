@@ -1462,6 +1462,12 @@ narratorRoutes.delete("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	const result = await narratorService.deleteCompactMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true, ...result });
 });
 
@@ -1618,6 +1624,11 @@ narratorRoutes.delete("/:id/segment-compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.deleteSegmentCompact(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
 	broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 	return c.json({ ok: true });
 });

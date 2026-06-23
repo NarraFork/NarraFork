@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { resolveScrollTargetIndex } from "../../frontend/components/narrator/chunk-scroll-utils";
+import {
+	estimateSeqCenteredScrollTop,
+	resolveScrollTargetIndex,
+} from "../../frontend/components/narrator/chunk-scroll-utils";
 
 /**
  * Builds a cumulative-height prefix array (length n+1) from per-chunk heights.
@@ -11,6 +14,33 @@ function buildPrefix(heights: number[]): number[] {
 	for (let i = 0; i < heights.length; i++) prefix[i + 1] = prefix[i] + heights[i];
 	return prefix;
 }
+
+describe("estimateSeqCenteredScrollTop", () => {
+	const prefix = buildPrefix([1000, 2000, 1000]);
+	const chunk = { firstSeq: 100, lastSeq: 119, count: 20 };
+	const clientHeight = 500;
+
+	test("lands near the middle of the chunk for a middle seq", () => {
+		const target = estimateSeqCenteredScrollTop(prefix, 1, chunk, 109, clientHeight);
+		// chunkTop=1000, ratio=(109-100+0.5)/20=0.475 → 1000+950-250
+		expect(target).toBe(1700);
+	});
+
+	test("tail seq estimates near the chunk tail instead of the chunk start", () => {
+		const target = estimateSeqCenteredScrollTop(prefix, 1, chunk, 119, clientHeight);
+		expect(target).toBeGreaterThan(2500);
+		expect(target).toBeLessThan(3000);
+	});
+
+	test("out-of-range seq is clamped to the chunk range", () => {
+		const before = estimateSeqCenteredScrollTop(prefix, 1, chunk, 20, clientHeight);
+		const first = estimateSeqCenteredScrollTop(prefix, 1, chunk, 100, clientHeight);
+		const after = estimateSeqCenteredScrollTop(prefix, 1, chunk, 999, clientHeight);
+		const last = estimateSeqCenteredScrollTop(prefix, 1, chunk, 119, clientHeight);
+		expect(before).toBe(first);
+		expect(after).toBe(last);
+	});
+});
 
 describe("resolveScrollTargetIndex — edge clamping", () => {
 	// Simulate the failing case: top chunks are SEVERELY under-estimated (tall

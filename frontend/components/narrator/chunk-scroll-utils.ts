@@ -52,3 +52,39 @@ export function resolveScrollTargetIndex(
 	if (distanceFromBottom <= edgeThreshold) return chunkCount - 1;
 	return target;
 }
+
+export interface SeqChunkRange {
+	firstSeq: number;
+	lastSeq: number;
+	count: number;
+}
+
+/**
+ * Estimate a centered scrollTop for a message seq within a chunk.
+ *
+ * Jumping to the chunk's first pixel creates a visible two-step motion (chunk
+ * start first, exact message later). This estimates the seq's relative position
+ * inside the chunk so the first programmatic scroll lands near the target before
+ * the DOM node exists; a later scrollIntoView only performs a small correction.
+ */
+export function estimateSeqCenteredScrollTop(
+	prefix: number[],
+	chunkIndex: number,
+	chunk: SeqChunkRange,
+	seq: number,
+	clientHeight: number,
+): number {
+	const chunkTop = prefix[chunkIndex] ?? 0;
+	const chunkBottom = prefix[chunkIndex + 1] ?? chunkTop;
+	const chunkHeight = Math.max(0, chunkBottom - chunkTop);
+	if (chunkHeight <= 0) return Math.max(0, chunkTop - clientHeight / 2);
+
+	const firstSeq = Math.min(chunk.firstSeq, chunk.lastSeq);
+	const lastSeq = Math.max(chunk.firstSeq, chunk.lastSeq);
+	const clampedSeq = Math.max(firstSeq, Math.min(lastSeq, seq));
+	const seqSpan = Math.max(1, lastSeq - firstSeq + 1);
+	const rawRatio =
+		chunk.count <= 1 ? 0.5 : (clampedSeq - firstSeq + 0.5) / Math.max(seqSpan, chunk.count);
+	const ratio = Math.max(0, Math.min(1, rawRatio));
+	return Math.max(0, chunkTop + chunkHeight * ratio - clientHeight / 2);
+}

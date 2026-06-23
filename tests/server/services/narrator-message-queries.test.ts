@@ -282,6 +282,71 @@ describe("narratorService message query regressions", () => {
 		expect(readBlock?.outputJson?._truncated).toBe(true);
 	});
 
+	it("compact 标记写入和完成时应更新 chunk manifest 版本并保持顺序", async () => {
+		seedBase();
+
+		insertMessage({
+			id: "m0",
+			seq: 0,
+			role: "user",
+			contentJson: [{ type: "text", text: "before" }],
+			contentText: "before",
+		});
+		insertMessage({
+			id: "m1",
+			seq: 1,
+			role: "user",
+			contentJson: [{ type: "text", text: "target" }],
+			contentText: "target",
+		});
+
+		const compacting = await narratorService.persistCompactingMessage("n1", "m1");
+		expect(compacting.seq).toBe(1);
+
+		const afterInsert = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(afterInsert?.messageVersion).toBe(1);
+
+		const refsAfterInsert = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, "n1"))
+			.orderBy(narratorMessageRefs.seq)
+			.all();
+		expect(refsAfterInsert).toEqual([
+			{ messageId: "m0", seq: 0 },
+			{ messageId: compacting.id, seq: 1 },
+			{ messageId: "m1", seq: 2 },
+		]);
+
+		const manifestAfterInsert = await narratorService.getChunkManifest("n1", 0);
+		expect(manifestAfterInsert.unchanged).toBe(false);
+		if (!manifestAfterInsert.unchanged) {
+			expect(manifestAfterInsert.messageVersion).toBe(1);
+			expect(manifestAfterInsert.total).toBe(3);
+		}
+
+		let range = await narratorService.getChunksByRange("n1", { count: 1 });
+		expect(range.messages.map((m: { id: string }) => m.id)).toEqual(["m0", compacting.id, "m1"]);
+		let compactBlock = range.messages
+			.find((m: { id: string }) => m.id === compacting.id)
+			?.contentJson?.find((b: { type?: string }) => b.type === "compact");
+		expect(compactBlock?.status).toBe("compacting");
+
+		await narratorService.finalizeCompactingMessage(compacting.id, "n1", "summary");
+		const afterFinalize = await db.query.narrators.findFirst({ where: eq(narrators.id, "n1") });
+		expect(afterFinalize?.messageVersion).toBe(2);
+
+		const manifestAfterFinalize = await narratorService.getChunkManifest("n1", 1);
+		expect(manifestAfterFinalize.unchanged).toBe(false);
+		expect(manifestAfterFinalize.messageVersion).toBe(2);
+
+		range = await narratorService.getChunksByRange("n1", { count: 1 });
+		compactBlock = range.messages
+			.find((m: { id: string }) => m.id === compacting.id)
+			?.contentJson?.find((b: { type?: string }) => b.type === "compact");
+		expect(compactBlock?.status).toBe("compacted");
+	});
+
 	it("getMessagesAfter 可通过 legacy parent anchor 补拉遗漏的 child 消息", async () => {
 		seedBase();
 

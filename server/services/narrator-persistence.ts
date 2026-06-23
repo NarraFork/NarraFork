@@ -278,53 +278,70 @@ export const narratorPersistence = {
 		mode: "blocking" | "background" = "blocking",
 	) {
 		const id = generateId();
-
-		let seq: number;
-		if (beforeMessageId) {
-			seq = await db.transaction(async (tx) => {
-				const targetRef = await tx.query.narratorMessageRefs.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, beforeMessageId),
-					),
-				});
-				if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
-				await tx
-					.update(narratorMessageRefs)
-					.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							gte(narratorMessageRefs.seq, targetRef.seq),
-						),
-					);
-				return targetRef.seq;
-			});
-		} else {
-			seq = await db.transaction(async (tx) => {
-				const result = await tx
-					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
-					.from(narratorMessageRefs)
-					.where(eq(narratorMessageRefs.narratorId, narratorId));
-				return (result[0]?.maxSeq ?? -1) + 1;
-			});
-		}
-
 		const createdAt = new Date().toISOString();
-		const [msg] = await db
-			.insert(narratorMessages)
-			.values({
-				id,
-				narratorId,
-				role: "system",
-				contentJson: [{ type: "compact", status: "compacting", mode }],
-				contentText: "[Compacting]",
-				createdAt,
-			})
-			.returning();
 
-		await insertMessageRef(narratorId, id, seq);
-		return { ...msg, seq };
+		return withDbRetry(
+			() =>
+				db.transaction(async (tx) => {
+					let seq: number;
+					if (beforeMessageId) {
+						const targetRef = await tx.query.narratorMessageRefs.findFirst({
+							where: and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, beforeMessageId),
+							),
+						});
+						if (!targetRef) throw new NotFoundError("Message", beforeMessageId);
+						seq = targetRef.seq;
+						await tx
+							.update(narratorMessageRefs)
+							.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, narratorId),
+									gte(narratorMessageRefs.seq, seq),
+								),
+							);
+					} else {
+						const result = await tx
+							.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
+							.from(narratorMessageRefs)
+							.where(eq(narratorMessageRefs.narratorId, narratorId));
+						seq = (result[0]?.maxSeq ?? -1) + 1;
+					}
+
+					const [msg] = await tx
+						.insert(narratorMessages)
+						.values({
+							id,
+							narratorId,
+							role: "system",
+							contentJson: [{ type: "compact", status: "compacting", mode }],
+							contentText: "[Compacting]",
+							createdAt,
+						})
+						.returning();
+
+					await tx.insert(narratorMessageRefs).values({
+						id: generateId(),
+						narratorId,
+						messageId: id,
+						seq,
+						isCompact: 0,
+					});
+
+					await tx
+						.update(narrators)
+						.set({
+							messageVersion: sql`${narrators.messageVersion} + 1`,
+							updatedAt: createdAt,
+						})
+						.where(eq(narrators.id, narratorId));
+
+					return { ...msg, seq };
+				}),
+			{ label: "persistCompactingMessage", maxRetries: 5 },
+		);
 	},
 
 	async persistPlanMessage(narratorId: string, content: string) {
@@ -358,7 +375,12 @@ export const narratorPersistence = {
 			});
 			await tx
 				.update(narrators)
-				.set({ contextSummary: content, apiConversationId: null, updatedAt: now })
+				.set({
+					contextSummary: content,
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
 				.where(eq(narrators.id, narratorId));
 			return seq;
 		});
@@ -397,7 +419,12 @@ export const narratorPersistence = {
 			});
 			await tx
 				.update(narrators)
-				.set({ contextSummary: null, apiConversationId: null, updatedAt: now })
+				.set({
+					contextSummary: null,
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
 				.where(eq(narrators.id, narratorId));
 			return seq;
 		});
@@ -453,7 +480,11 @@ export const narratorPersistence = {
 			});
 			await tx
 				.update(narrators)
-				.set({ apiConversationId: null, updatedAt: now })
+				.set({
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
 				.where(eq(narrators.id, narratorId));
 			return targetRef.seq;
 		});
@@ -501,12 +532,14 @@ export const narratorPersistence = {
 					),
 				);
 
-			if (status === "compacted") {
-				await tx
-					.update(narrators)
-					.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-					.where(eq(narrators.id, narratorId));
-			}
+			await tx
+				.update(narrators)
+				.set({
+					...(status === "compacted" ? { contextSummary: summary, apiConversationId: null } : {}),
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
 
 			const ref = await tx.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -1566,6 +1599,14 @@ export const narratorPersistence = {
 						inArray(narratorMessageRefs.messageId, targetMessageIds),
 					),
 				);
+
+			await tx
+				.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: now,
+				})
+				.where(eq(narrators.id, narratorId));
 		});
 
 		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));

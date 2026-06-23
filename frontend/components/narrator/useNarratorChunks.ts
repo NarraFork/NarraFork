@@ -135,8 +135,9 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		loaded: new Map(),
 	});
 	const [loading, setLoading] = useState(true);
-	// In-flight chunk loads, keyed by chunk id, to dedupe concurrent requests.
-	const inFlightRef = useRef<Set<string>>(new Set());
+	// In-flight chunk loads, keyed by chunk id. The promise lets jump/selection
+	// callers wait for an existing range request instead of racing React commits.
+	const inFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	// Bumped whenever the manifest coordinate system is rebuilt; stale range
 	// requests from an older generation are ignored on arrival.
 	const loadGenerationRef = useRef(0);
@@ -362,7 +363,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 
 	/**
 	 * Ensure the given chunk (and `radius` neighbours on each side) are loaded.
-	 * Cheap no-op when everything in range is already present or in flight.
+	 * Cheap no-op when everything in range is already present; waits for any
+	 * existing in-flight range request that covers missing chunks.
 	 */
 	const ensureLoaded = useCallback(
 		async (chunkId: string, radius = INITIAL_RADIUS) => {
@@ -374,21 +376,34 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			const start = Math.max(0, centerIdx - radius);
 			const end = Math.min(manifest.length - 1, centerIdx + radius);
 
-			// Find a contiguous sub-range that is missing and not in flight.
+			// Find chunks that are missing. If they are already loading, wait for the
+			// existing promise instead of returning early; jump callers depend on this
+			// promise resolving before they start looking for the target DOM node.
 			const loaded = loadedRef.current;
 			const missing: ChunkManifestEntry[] = [];
+			const existingLoads = new Set<Promise<void>>();
 			for (let i = start; i <= end; i++) {
 				const c = manifest[i];
-				if (!isChunkComplete(loaded, c) && !inFlightRef.current.has(c.id)) missing.push(c);
+				if (isChunkComplete(loaded, c)) continue;
+				const inFlight = inFlightRef.current.get(c.id);
+				if (inFlight) {
+					existingLoads.add(inFlight);
+				} else {
+					missing.push(c);
+				}
 			}
-			if (missing.length === 0) return;
+			if (missing.length === 0) {
+				await Promise.all(existingLoads);
+				return;
+			}
 
 			// Load the whole [start,end] band in one request anchored just before
 			// the first chunk's firstSeq (direction newer ⇒ seq >= firstSeq).
 			const firstSeq = manifest[start].firstSeq;
 			const bandChunkCount = end - start + 1;
-			for (let i = start; i <= end; i++) inFlightRef.current.add(manifest[i].id);
-			try {
+			const ownedChunkIds: string[] = [];
+			for (let i = start; i <= end; i++) ownedChunkIds.push(manifest[i].id);
+			const loadPromise = (async () => {
 				const range = await api.getNarratorChunks(narratorId, {
 					direction: "newer",
 					fromSeq: firstSeq - 1,
@@ -396,8 +411,17 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 				});
 				if (generation !== loadGenerationRef.current) return;
 				mergeLoaded(regroup(range.messages), getChunkRangeMeta(range));
+			})();
+			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
+			try {
+				// This request covers the whole band, including chunks that may already
+				// have another load in flight. A stale neighbouring request should not make
+				// this caller fail after the fresh band load succeeds.
+				await loadPromise;
 			} finally {
-				for (let i = start; i <= end; i++) inFlightRef.current.delete(manifest[i].id);
+				for (const id of ownedChunkIds) {
+					if (inFlightRef.current.get(id) === loadPromise) inFlightRef.current.delete(id);
+				}
 			}
 		},
 		[narratorId, regroup, mergeLoaded, isChunkComplete],
@@ -609,29 +633,41 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 
 			const loaded = loadedRef.current;
 			const missingRanges: Array<{ start: number; end: number }> = [];
+			const existingLoads = new Set<Promise<void>>();
 			let rangeStart: number | null = null;
 			for (let i = start; i <= end; i++) {
 				const chunk = manifest[i];
 				const missing = !isChunkComplete(loaded, chunk);
-				if (missing && rangeStart == null) rangeStart = i;
-				if ((!missing || i === end) && rangeStart != null) {
-					missingRanges.push({ start: rangeStart, end: missing ? i : i - 1 });
+				const inFlight = missing ? inFlightRef.current.get(chunk.id) : undefined;
+				if (inFlight) existingLoads.add(inFlight);
+				const shouldLoad = missing && !inFlight;
+				if (shouldLoad && rangeStart == null) rangeStart = i;
+				if ((!shouldLoad || i === end) && rangeStart != null) {
+					missingRanges.push({ start: rangeStart, end: shouldLoad ? i : i - 1 });
 					rangeStart = null;
 				}
 			}
-			if (missingRanges.length === 0) return;
+			if (missingRanges.length === 0) {
+				await Promise.all(existingLoads);
+				return;
+			}
 
 			const generation = loadGenerationRef.current;
+			const ownedChunkIds: string[] = [];
 			for (const range of missingRanges) {
-				for (let i = range.start; i <= range.end; i++) inFlightRef.current.add(manifest[i].id);
+				for (let i = range.start; i <= range.end; i++) ownedChunkIds.push(manifest[i].id);
 			}
-			try {
+			const loadPromise = (async () => {
 				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
 				if (!bandResult || generation !== loadGenerationRef.current) return;
 				mergeLoaded(bandResult.incoming, bandResult.meta);
+			})();
+			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
+			try {
+				await Promise.all([...existingLoads, loadPromise]);
 			} finally {
-				for (const range of missingRanges) {
-					for (let i = range.start; i <= range.end; i++) inFlightRef.current.delete(manifest[i].id);
+				for (const id of ownedChunkIds) {
+					if (inFlightRef.current.get(id) === loadPromise) inFlightRef.current.delete(id);
 				}
 			}
 		},

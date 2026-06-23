@@ -181,6 +181,78 @@ function mergeUpdatedMessageById(
 	return changed ? { messages: next, changed: true } : { messages, changed: false };
 }
 
+function loadedContainsMessageId(loaded: Map<string, TreeMessage[]>, messageId: string): boolean {
+	for (const messages of loaded.values()) {
+		if (findMessageById(messages, messageId)) return true;
+	}
+	return false;
+}
+
+function findMessageById(messages: TreeMessage[], messageId: string): TreeMessage | null {
+	for (const msg of messages) {
+		if (msg.id === messageId) return msg;
+		if (msg.children?.length) {
+			const child = findMessageById(msg.children, messageId);
+			if (child) return child;
+		}
+	}
+	return null;
+}
+
+export function applyUpdatedMessageById(
+	state: ChunkMutState,
+	updatedMsg: TreeMessage,
+): ChunkMutState {
+	for (const [chunkId, messages] of state.loaded) {
+		const result = mergeUpdatedMessageById(messages, updatedMsg);
+		if (!result.changed) continue;
+		const loaded = new Map(state.loaded);
+		loaded.set(chunkId, result.messages);
+		return { ...state, loaded };
+	}
+	return state;
+}
+
+function removeMessagesById(
+	messages: TreeMessage[],
+	deletedIds: Set<string>,
+): { messages: TreeMessage[]; changed: boolean } {
+	let changed = false;
+	const next: TreeMessage[] = [];
+	for (const msg of messages) {
+		if (msg.id && deletedIds.has(msg.id)) {
+			changed = true;
+			continue;
+		}
+		if (msg.children?.length) {
+			const childResult = removeMessagesById(msg.children, deletedIds);
+			if (childResult.changed) {
+				changed = true;
+				next.push({ ...msg, children: childResult.messages });
+				continue;
+			}
+		}
+		next.push(msg);
+	}
+	return changed ? { messages: next, changed: true } : { messages, changed: false };
+}
+
+export function removeDeletedMessagesFromLoaded(
+	state: ChunkMutState,
+	deletedMessageIds: string[],
+): ChunkMutState {
+	if (deletedMessageIds.length === 0) return state;
+	const deletedIds = new Set(deletedMessageIds);
+	let loaded: Map<string, TreeMessage[]> | null = null;
+	for (const [chunkId, messages] of state.loaded) {
+		const result = removeMessagesById(messages, deletedIds);
+		if (!result.changed) continue;
+		if (!loaded) loaded = new Map(state.loaded);
+		loaded.set(chunkId, result.messages);
+	}
+	return loaded ? { ...state, loaded } : state;
+}
+
 /** Append / replace a top-level message into the chunk that owns its seq. */
 function applyTopLevelMessage(
 	state: ChunkMutState,
@@ -320,6 +392,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		lastMessageId,
 		scheduleChunkUpdate,
 		flushChunkUpdatesSync,
+		loadedRef,
 		isAtBottomRef,
 		onUnread,
 		onStructuralDirty,
@@ -581,10 +654,18 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				}
 
 				// Mid-history structural inserts (compact / ask_in_passing) shift every
-				// downstream seq — defer to a manifest reconcile instead of an in-place
-				// edit that would desync the chunk coordinate system.
+				// downstream seq — reconcile the manifest. If this is a same-id update for
+				// an already-loaded structural marker (e.g. compacting → compacted/failed),
+				// merge it immediately first; manifest tuples do not include a content hash,
+				// so a diff reconcile alone may correctly find no dirty chunk to reload.
 				if (isStructuralInsert(newMsg)) {
-					onStructuralDirty();
+					const alreadyLoaded = loadedContainsMessageId(loadedRef.current, newMsg.id);
+					if (alreadyLoaded) {
+						scheduleChunkUpdate((state) => applyUpdatedMessageById(state, newMsg));
+						flushChunkUpdatesSync();
+					}
+					onStructuralDirty(alreadyLoaded ? "diff" : "full");
+					if (isAtBottomRef.current) onTailFollow();
 					return;
 				}
 
@@ -694,13 +775,14 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						if (msg.parentToolUseId) continue;
 						if (isStructuralInsert(msg)) {
 							structural = true;
+							next = applyUpdatedMessageById(next, msg);
 							continue;
 						}
 						next = applyTopLevelMessage(next, msg, isAtBottomRef.current ?? false, onUnread);
 					}
 					return next;
 				});
-				if (structural) onStructuralDirty();
+				if (structural) onStructuralDirty("full");
 				if (isAtBottomRef.current) onTailFollow();
 			},
 			onFullReload: () => {
@@ -713,21 +795,16 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				// Server confirmed we are in sync; messageVersion is tracked by the
 				// WS manager. Nothing to reconcile.
 			},
-			onMessagesDeleted: () => {
+			onMessagesDeleted: (deletedMessageIds) => {
+				if (deletedMessageIds.length > 0) {
+					scheduleChunkUpdate((state) => removeDeletedMessagesFromLoaded(state, deletedMessageIds));
+					flushChunkUpdatesSync();
+				}
 				onStructuralDirty();
 			},
 			onMessageUpdated: (updatedMsg) => {
 				if (!updatedMsg?.id) return;
-				scheduleChunkUpdate((state) => {
-					for (const [chunkId, messages] of state.loaded) {
-						const result = mergeUpdatedMessageById(messages, updatedMsg);
-						if (!result.changed) continue;
-						const loaded = new Map(state.loaded);
-						loaded.set(chunkId, result.messages);
-						return { ...state, loaded };
-					}
-					return state;
-				});
+				scheduleChunkUpdate((state) => applyUpdatedMessageById(state, updatedMsg));
 			},
 			onSegmentCompactHide: () => {
 				onStructuralDirty();
@@ -736,7 +813,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				streamingBlocksRef.current = [];
 				cancelPendingToolChunks(true, true);
 				bumpStreamingVersion();
-				onStructuralDirty();
+				onStructuralDirty("full");
 			},
 			// --- Tool lifecycle ---------------------------------------------------
 			onToolCompleted: (
