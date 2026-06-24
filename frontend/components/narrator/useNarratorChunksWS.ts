@@ -9,6 +9,8 @@ import {
 	clearToolBlockCache,
 	findStreamingInsertIndex,
 	type StreamingBlock,
+	upsertStreamingImageGenerationBlock,
+	upsertStreamingWebSearchBlock,
 } from "./message-segments";
 import {
 	findMsgByToolUseIdInTree,
@@ -515,6 +517,25 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 		[bumpTopLevelChunksVersion],
 	);
 
+	// Discard all synthetic streaming state when the session stops working
+	// (interrupted / error / done). The chunk list renders directly from these
+	// refs, so leftover streaming text blocks and top-level tool chunks would
+	// otherwise linger on screen after an interrupt until a full reload. Mirrors
+	// the legacy useNarratorPanelWS.onStatusChange cleanup for this layer.
+	const clearStreamingOnSessionEnd = useCallback(() => {
+		if (streamingBlocksRef.current.length > 0) {
+			streamingBlocksRef.current = [];
+			if (streamingRafRef.current) {
+				cancelAnimationFrame(streamingRafRef.current);
+				streamingRafRef.current = 0;
+			}
+			bumpStreamingVersion();
+		}
+		clearToolBlockCache();
+		// Include subagent chunks: the entire session is no longer working.
+		cancelPendingToolChunks(true, true);
+	}, [bumpStreamingVersion, cancelPendingToolChunks]);
+
 	// Flush a bounded tool-output preview into the chunk that owns the tool.
 	const flushToolOutputPreview = useCallback(
 		(toolUseId: string, preview: string) => {
@@ -814,6 +835,49 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				cancelPendingToolChunks(true, true);
 				bumpStreamingVersion();
 				onStructuralDirty("full");
+			},
+			onWebSearch: (id, status, query, queries, outputIndex, rawParentToolUseId) => {
+				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
+				// Subagent native searches are delivered to the parent for bookkeeping,
+				// but must not populate the parent's top-level streaming message.
+				if (parentToolUseId) return;
+				upsertStreamingWebSearchBlock(streamingBlocksRef.current, {
+					id,
+					status,
+					query,
+					queries,
+					outputIndex,
+				});
+				flushStreamingVersion();
+			},
+			onImageGeneration: (
+				id,
+				status,
+				revisedPrompt,
+				outputIndex,
+				partialImageIndex,
+				partialSavedPath,
+				savedPath,
+				width,
+				height,
+				rawParentToolUseId,
+			) => {
+				const parentToolUseId = isSubagent ? undefined : rawParentToolUseId;
+				// Subagent native image-generation events are delivered to the parent for
+				// bookkeeping, but should render only in the subagent's own top-level stream.
+				if (parentToolUseId) return;
+				upsertStreamingImageGenerationBlock(streamingBlocksRef.current, {
+					id,
+					status,
+					revisedPrompt,
+					outputIndex,
+					partialImageIndex,
+					partialSavedPath,
+					savedPath,
+					width,
+					height,
+				});
+				flushStreamingVersion();
 			},
 			// --- Tool lifecycle ---------------------------------------------------
 			onToolCompleted: (
@@ -1558,6 +1622,17 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 				if (topLevelChanged) {
 					bumpTopLevelChunksVersion();
 				}
+			},
+			// --- Session lifecycle ------------------------------------------------
+			// When the narrator stops working (interrupted / done / error), discard
+			// any half-streamed text blocks and top-level tool chunks so they don't
+			// linger on screen after an interrupt.
+			onStatusChange: (status) => {
+				if (status === "working" || status === "waiting") return;
+				clearStreamingOnSessionEnd();
+			},
+			onNarratorError: () => {
+				clearStreamingOnSessionEnd();
 			},
 		},
 		lastMessageId,

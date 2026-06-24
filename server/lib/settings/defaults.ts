@@ -47,7 +47,7 @@ export const DEFAULTS: NarraForkSettings = {
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		retryBackoffCeilMs: 20_000,
-		firstTokenTimeoutMs: 60_000,
+		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
@@ -347,9 +347,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "正整数，默认 20000",
 	},
 	"agent.firstTokenTimeoutMs": {
-		desc: "首 token 超时时间（毫秒）。AI API 请求发起后，若在此时间内未收到 text/tool/reasoning/web_search/image_generation/queueEvent 等实质事件，则中断本次请求并按可恢复错误规则重试。0 表示禁用。默认 60000（60 秒）。",
+		desc: "首 token 超时时间（毫秒）。AI API 请求发起后，若在此时间内未收到 text/tool/reasoning/web_search/image_generation/queueEvent 等实质事件，则中断本次请求并按可恢复错误规则重试。0 表示禁用。默认 300000（5 分钟）。",
 		type: "number",
-		valid: "0-600000，0 = 禁用，默认 60000",
+		valid: "0-600000，0 = 禁用，默认 300000",
 	},
 	"agent.customRetryRules": {
 		desc: "用户自定义可重试错误规则。匹配到的错误视为 transient 进行重试。每项含 id、domain(域名关键字)、statusCode、keyword、enabled、note。",

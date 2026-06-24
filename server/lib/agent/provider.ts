@@ -459,7 +459,6 @@ export function resolveProviderAndModel(
 	const requestedProvider = resolveProvider(requestedModel);
 
 			throw new Error(
-					`Please choose a different model or remove the environment variable.`,
 			);
 		}
 

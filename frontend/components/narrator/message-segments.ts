@@ -487,6 +487,97 @@ export function findStreamingInsertIndex(
 	return blocks.length;
 }
 
+export type StreamingWebSearchBlock = Extract<StreamingBlock, { type: "web_search" }>;
+export type StreamingImageGenerationBlock = Extract<StreamingBlock, { type: "image_generation" }>;
+
+export interface StreamingWebSearchUpdate {
+	id: string;
+	status: string;
+	query?: string;
+	queries?: string[];
+	outputIndex?: number;
+}
+
+export interface StreamingImageGenerationUpdate {
+	id: string;
+	status: string;
+	revisedPrompt?: string;
+	result?: string;
+	partialImageIndex?: number;
+	partialSavedPath?: string;
+	savedPath?: string;
+	width?: number;
+	height?: number;
+	outputIndex?: number;
+}
+
+function replaceOrInsertStreamingBlock(
+	blocks: StreamingBlock[],
+	idx: number,
+	next: StreamingBlock,
+) {
+	if (idx === -1) {
+		blocks.splice(findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(next)), 0, next);
+		return;
+	}
+
+	const current = blocks[idx];
+	const currentOrder = getStreamingBlockOutputIndex(current);
+	const nextOrder = getStreamingBlockOutputIndex(next);
+	if (currentOrder === nextOrder) {
+		blocks[idx] = next;
+		return;
+	}
+
+	blocks.splice(idx, 1);
+	blocks.splice(findStreamingInsertIndex(blocks, nextOrder), 0, next);
+}
+
+export function upsertStreamingWebSearchBlock(
+	blocks: StreamingBlock[],
+	update: StreamingWebSearchUpdate,
+): void {
+	if (!update.id) return;
+	const idx = blocks.findIndex((block) => block.type === "web_search" && block.id === update.id);
+	const existing = idx === -1 ? null : blocks[idx];
+	const next: StreamingWebSearchBlock = {
+		...(existing?.type === "web_search" ? existing : {}),
+		type: "web_search",
+		id: update.id,
+		status: update.status,
+	};
+	if (update.query !== undefined) next.query = update.query;
+	if (update.queries !== undefined) next.queries = update.queries;
+	if (update.outputIndex !== undefined) next.outputIndex = update.outputIndex;
+	replaceOrInsertStreamingBlock(blocks, idx, next);
+}
+
+export function upsertStreamingImageGenerationBlock(
+	blocks: StreamingBlock[],
+	update: StreamingImageGenerationUpdate,
+): void {
+	if (!update.id) return;
+	const idx = blocks.findIndex(
+		(block) => block.type === "image_generation" && block.id === update.id,
+	);
+	const existing = idx === -1 ? null : blocks[idx];
+	const next: StreamingImageGenerationBlock = {
+		...(existing?.type === "image_generation" ? existing : {}),
+		type: "image_generation",
+		id: update.id,
+		status: update.status,
+	};
+	if (update.revisedPrompt !== undefined) next.revisedPrompt = update.revisedPrompt;
+	if (update.result !== undefined) next.result = update.result;
+	if (update.partialImageIndex !== undefined) next.partialImageIndex = update.partialImageIndex;
+	if (update.partialSavedPath !== undefined) next.partialSavedPath = update.partialSavedPath;
+	if (update.savedPath !== undefined) next.savedPath = update.savedPath;
+	if (update.width !== undefined) next.width = update.width;
+	if (update.height !== undefined) next.height = update.height;
+	if (update.outputIndex !== undefined) next.outputIndex = update.outputIndex;
+	replaceOrInsertStreamingBlock(blocks, idx, next);
+}
+
 export function buildStreamingMsg(opts: {
 	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;

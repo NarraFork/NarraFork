@@ -519,14 +519,14 @@ function SettingsProvidersPage() {
 				const bareModel = String(rawBareModel || id);
 				models.push({
 					value: `${prefix}:${id}`,
-					label: `${String(
+					label: `${channel} · ${String(
 						m.model_short_name ??
 							m.modelShortName ??
 							m.model_name ??
 							m.modelName ??
 							m.name ??
 							bareModel,
-					)} · ${channel} / ${channelType}`,
+					)}`,
 					provider: prefix,
 					channel,
 					channelType,

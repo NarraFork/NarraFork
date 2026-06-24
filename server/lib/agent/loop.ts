@@ -2009,7 +2009,7 @@ export async function* agentLoop(
 			usesStatefulModel(effectiveProvider, effectiveModel) ? 0 : maxConfiguredRetries;
 		const maxFirstTokenRetries = maxConfiguredRetries;
 		const backoffCeil = config.retryBackoffCeilMs ?? 20_000;
-		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 60_000);
+		const firstTokenTimeoutMs = Math.max(0, config.firstTokenTimeoutMs ?? 300_000);
 		let chatRetryCount = 0;
 		let emptyResponseRetries = 0;
 		/** Set when a mimo model returns "..." as reasoning — triggers a retry. */

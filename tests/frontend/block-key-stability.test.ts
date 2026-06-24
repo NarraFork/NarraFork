@@ -3,6 +3,9 @@ import {
 	buildStreamingMsg,
 	clearToolBlockCache,
 	generateBlockKeys,
+	type StreamingBlock,
+	upsertStreamingImageGenerationBlock,
+	upsertStreamingWebSearchBlock,
 } from "../../frontend/components/narrator/message-segments";
 import type { ContentBlock } from "../../frontend/lib/api";
 
@@ -189,6 +192,71 @@ describe("buildStreamingMsg — stable block IDs", () => {
 			.filter((block) => block.type === "web_search")
 			.map((block) => block.id);
 		expect(wsIds).toEqual(["ws-1", "ws-2"]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Native streaming tool upserts — chunk-mode realtime rendering
+// ---------------------------------------------------------------------------
+
+describe("native streaming tool upserts", () => {
+	test("web_search upsert inserts in output order and updates existing block", () => {
+		const blocks: StreamingBlock[] = [
+			{ type: "reasoning", text: "thinking", outputIndex: 0 },
+			{ type: "text", text: "answer", outputIndex: 3 },
+		];
+
+		upsertStreamingWebSearchBlock(blocks, {
+			id: "ws-1",
+			status: "searching",
+			query: "weather",
+			outputIndex: 2,
+		});
+
+		expect(blocks.map((block) => block.type)).toEqual(["reasoning", "web_search", "text"]);
+		upsertStreamingWebSearchBlock(blocks, {
+			id: "ws-1",
+			status: "completed",
+			query: "weather in sf",
+		});
+
+		const searches = blocks.filter((block) => block.type === "web_search");
+		expect(searches).toHaveLength(1);
+		expect(searches[0]?.status).toBe("completed");
+		expect(searches[0]?.query).toBe("weather in sf");
+		expect(searches[0]?.outputIndex).toBe(2);
+	});
+
+	test("image_generation upsert promotes partial preview to final saved image", () => {
+		const blocks: StreamingBlock[] = [{ type: "text", text: "before", outputIndex: 0 }];
+
+		upsertStreamingImageGenerationBlock(blocks, {
+			id: "ig-1",
+			status: "generating",
+			revisedPrompt: "a tiny blue square",
+			partialImageIndex: 0,
+			partialSavedPath: "/tmp/partial.png",
+			width: 256,
+			height: 256,
+			outputIndex: 1,
+		});
+		upsertStreamingImageGenerationBlock(blocks, {
+			id: "ig-1",
+			status: "completed",
+			savedPath: "/tmp/final.png",
+			width: 512,
+			height: 384,
+		});
+
+		const images = blocks.filter((block) => block.type === "image_generation");
+		expect(images).toHaveLength(1);
+		expect(images[0]?.status).toBe("completed");
+		expect(images[0]?.revisedPrompt).toBe("a tiny blue square");
+		expect(images[0]?.partialSavedPath).toBe("/tmp/partial.png");
+		expect(images[0]?.savedPath).toBe("/tmp/final.png");
+		expect(images[0]?.width).toBe(512);
+		expect(images[0]?.height).toBe(384);
+		expect(images[0]?.outputIndex).toBe(1);
 	});
 });
 

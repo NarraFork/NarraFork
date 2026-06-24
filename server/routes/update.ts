@@ -47,10 +47,12 @@ updateRoutes.get("/version", (c) => {
  */
 updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 	let requestedVersion: string | undefined;
+	let retry = false;
 	try {
 		const body = await c.req.json();
 		const version = body?.releaseInfo?.version;
 		if (typeof version === "string" && version.trim()) requestedVersion = version.trim();
+		retry = body?.retry === true;
 	} catch {
 		// Empty body is OK — we'll re-check and use server-side release metadata.
 	}
@@ -81,7 +83,7 @@ updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
 			});
 		};
 
-		const result = await downloadUpdate(releaseInfo, onProgress);
+		const result = await downloadUpdate(releaseInfo, onProgress, { forceDownload: retry });
 
 		if (result.success && result.updatePath) {
 			const instructions = getUpdateInstructions(result.updatePath, result.newBinaryPath);

@@ -30,8 +30,11 @@ import { applyZstdPatch, type ZstdPatchMeta } from "../lib/zstd-patch";
  * - Checks system PATH first.
  * - Falls back to a NarraFork-managed helper binary cached under ~/.narrafork/bin.
  * Returns the path to zstd binary, or null if unavailable.
+ *
+ * When `forceDownload` is true (explicit user retry), the recent-failure cache
+ * is bypassed so a previous network timeout does not short-circuit the attempt.
  */
-async function getZstdCliPath(): Promise<string | null> {
+async function getZstdCliPath(forceDownload = false): Promise<string | null> {
 	try {
 		const result = Bun.spawnSync(["zstd", "--version"], {
 			stdout: "pipe",
@@ -77,7 +80,10 @@ async function getZstdCliPath(): Promise<string | null> {
 		return null;
 	}
 
-	return downloadHelperBinary({ toolName, cachedName, displayName: "zstd CLI" });
+	return downloadHelperBinary(
+		{ toolName, cachedName, displayName: "zstd CLI" },
+		{ bypassFailureCache: forceDownload },
+	);
 }
 
 export interface ReleaseInfo {
@@ -515,6 +521,7 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 export async function downloadUpdate(
 	releaseInfo: ReleaseInfo,
 	onProgress?: (progress: UpdateProgress) => void,
+	options: { forceDownload?: boolean } = {},
 ): Promise<{
 	success: boolean;
 	error?: string;
@@ -523,6 +530,7 @@ export async function downloadUpdate(
 	newBinaryPath?: string;
 	placed?: boolean;
 }> {
+	const forceDownload = options.forceDownload ?? false;
 	const serverUrl = getServerBaseUrl();
 	if (!serverUrl) {
 		return { success: false, error: "Update server not configured" };
@@ -598,7 +606,7 @@ export async function downloadUpdate(
 								// For patch-from mode, we need zstd CLI
 								let zstdCliPath: string | undefined;
 								if (meta.mode === "patch-from") {
-									const cli = await getZstdCliPath();
+									const cli = await getZstdCliPath(forceDownload);
 									if (!cli) {
 										logger.warn("Zstd CLI not available for patch-from mode, skipping");
 										zstdCliMissing = true;
@@ -686,7 +694,7 @@ export async function downloadUpdate(
 
 						let zstdCliPath: string | undefined;
 						if (meta.mode === "patch-from") {
-							const cli = await getZstdCliPath();
+							const cli = await getZstdCliPath(forceDownload);
 							if (!cli) {
 								zstdCliMissing = true;
 								throw new Error("zstd CLI required for patch-from mode");
@@ -1040,6 +1048,7 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			env,
 			detached: true,
 			stdio: ["ignore", "ignore", "ignore"],
+			windowsHide: process.platform === "win32",
 		});
 		(proc as { unref?: () => void }).unref?.();
 

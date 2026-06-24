@@ -4318,6 +4318,7 @@ export function NarratorPanel({
 					return next;
 				}
 			} else {
+				chunkListRef.current?.detachFromBottom();
 				next.add(blockId);
 				setSelectionMode(true);
 				setAnchorBlockId(blockId);
@@ -4333,6 +4334,7 @@ export function NarratorPanel({
 				if (!container) return;
 				const range = resolveBlockRange(container, anchor, target);
 				if (!range) return;
+				chunkListRef.current?.detachFromBottom();
 				setSelectionMode(true);
 				setSelectedBlockIds(range);
 				if (updateAnchor) setAnchorBlockId(anchor);
@@ -4350,6 +4352,7 @@ export function NarratorPanel({
 						applyDomFallback();
 						return;
 					}
+					chunkListRef.current?.detachFromBottom();
 					setSelectionMode(true);
 					setSelectedBlockIds(range);
 					if (updateAnchor) setAnchorBlockId(anchor);
@@ -4365,6 +4368,7 @@ export function NarratorPanel({
 			const anchor = anchorBlockId;
 			if (!anchor) {
 				// No anchor yet — treat as single toggle
+				chunkListRef.current?.detachFromBottom();
 				setSelectionMode(true);
 				setSelectedBlockIds(new Set([blockId]));
 				setAnchorBlockId(blockId);

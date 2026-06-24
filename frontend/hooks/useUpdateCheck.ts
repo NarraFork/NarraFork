@@ -225,13 +225,16 @@ export function useUpdateDownload() {
 	const abortControllerRef = useRef<AbortController | null>(null);
 
 	const download = useCallback(
-		async (releaseInfo: {
-			version: string;
-			releaseDate: string;
-			path: string;
-			sha512: string;
-			files: Array<{ url: string; size: number; sha512: string }>;
-		}) => {
+		async (
+			releaseInfo: {
+				version: string;
+				releaseDate: string;
+				path: string;
+				sha512: string;
+				files: Array<{ url: string; size: number; sha512: string }>;
+			},
+			options?: { retry?: boolean },
+		) => {
 			const failBeforeRequest = (error: string) => {
 				setProgress(createErrorProgress(error));
 				setResult(createFailureResult(error, releaseInfo.version));
@@ -272,7 +275,7 @@ export function useUpdateDownload() {
 						"Content-Type": "application/json",
 						...(token ? { Authorization: `Bearer ${token}` } : {}),
 					},
-					body: JSON.stringify({ releaseInfo }),
+					body: JSON.stringify({ releaseInfo, retry: options?.retry === true }),
 					signal: controller.signal,
 				});
 

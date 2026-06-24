@@ -144,7 +144,7 @@ function makeDefaults(): InstanceSettingsState {
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		retryBackoffCeilMs: 20000,
-		firstTokenTimeoutMs: 60000,
+		firstTokenTimeoutMs: 300000,
 		customRetryRules: [],
 		contextThresholds: {
 			standard: { pruneStart: 95, compactStart: 99 },
@@ -241,7 +241,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
-				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 60000,
+				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 300000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
 				contextThresholds: settings.agent?.contextThresholds ?? {
 					standard: { pruneStart: 95, compactStart: 99 },

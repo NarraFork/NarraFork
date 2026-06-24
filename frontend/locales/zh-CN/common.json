@@ -264,6 +264,7 @@
 	"updateRunNewBinary": "运行新的二进制文件：",
 	"updateZstdMissingTitle": "未找到 zstd 工具",
 	"updateZstdMissingDesc": "增量更新需要 zstd 命令行工具，但在当前系统上未找到。请安装 zstd 后重试。",
+	"updateZstdMissingDescWindows": "增量更新需要 zstd 命令行工具，系统会自动从更新服务器下载，但这次下载失败了（通常是网络超时）。请检查网络连接后点击重试。",
 	"updateZstdInstallCmd": "# macOS\nbrew install zstd\n\n# Debian / Ubuntu\nsudo apt install zstd\n\n# Fedora / RHEL\nsudo dnf install zstd",
 
 	"gitNotInstalled": "未检测到 Git",

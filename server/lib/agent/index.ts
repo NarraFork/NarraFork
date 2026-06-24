@@ -2,7 +2,7 @@ import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tra
 import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import { isRetryableError } from "./loop";
-import { type GenerateOptions, resolveProviderAndModel } from "./provider";
+import { type BuiltHistory, type GenerateOptions, resolveProviderAndModel } from "./provider";
 import "./tools";
 import { initTruncateCleanup } from "./truncate";
 
@@ -46,7 +46,7 @@ export async function buildHistory(
 	dbMessages: import("./provider").DbMessage[],
 	model: string,
 	narratorId?: string,
-): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+): Promise<BuiltHistory> {
 	const requestedModel = model || settings.agent.defaultModel;
 	const parsed = parseModelId(requestedModel);
 	const prefixedModel = parsed.provider

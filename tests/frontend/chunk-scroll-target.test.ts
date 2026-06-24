@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	estimateSeqCenteredScrollTop,
+	resolveBottomPinAction,
 	resolveScrollTargetIndex,
 } from "../../frontend/components/narrator/chunk-scroll-utils";
 
@@ -90,5 +91,30 @@ describe("resolveScrollTargetIndex — edge clamping", () => {
 		const shortPrefix = buildPrefix(shortHeights);
 		const target = resolveScrollTargetIndex(shortPrefix, 2, 0, 800, 600);
 		expect(target).toBe(0);
+	});
+});
+
+describe("resolveBottomPinAction — no-threshold bottom follow", () => {
+	// Deliberate user scroll-ups are handled synchronously by input handlers, NOT
+	// here. This function must never detach. It only:
+	//  - pins at the real bottom (distance === 0)
+	//  - refollows any positive gap while already pinned
+	//  - leaves detached views detached until they truly reach the bottom
+
+	test("real bottom pins, regardless of prior pin state", () => {
+		expect(resolveBottomPinAction(0, true)).toBe("pin");
+		expect(resolveBottomPinAction(0, false)).toBe("pin");
+	});
+
+	test("PINNED view refollows any positive gap, with no height threshold", () => {
+		expect(resolveBottomPinAction(1, true)).toBe("refollow");
+		expect(resolveBottomPinAction(48, true)).toBe("refollow");
+		expect(resolveBottomPinAction(2000, true)).toBe("refollow");
+	});
+
+	test("DETACHED view does not re-pin until real bottom", () => {
+		expect(resolveBottomPinAction(1, false)).toBe("none");
+		expect(resolveBottomPinAction(48, false)).toBe("none");
+		expect(resolveBottomPinAction(500, false)).toBe("none");
 	});
 });

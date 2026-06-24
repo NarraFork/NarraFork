@@ -264,6 +264,7 @@
 	"updateRunNewBinary": "Run the new binary:",
 	"updateZstdMissingTitle": "zstd tool not found",
 	"updateZstdMissingDesc": "Incremental updates require the zstd command-line tool, but it was not found on this system. Please install zstd and try again.",
+	"updateZstdMissingDescWindows": "Incremental updates require the zstd command-line tool, which is downloaded automatically from the update server. The download failed this time (usually a network timeout). Please check your connection and retry.",
 	"updateZstdInstallCmd": "# macOS\nbrew install zstd\n\n# Debian / Ubuntu\nsudo apt install zstd\n\n# Fedora / RHEL\nsudo dnf install zstd",
 
 	"gitNotInstalled": "Git is not installed",

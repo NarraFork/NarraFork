@@ -1098,7 +1098,7 @@ export async function runAgentLoop(
 				pruneToolCalls(dbMessages, active._pruneBoundaryMessageId);
 			}
 
-			const { history, trailingToolResults } = await buildHistory(
+			const { history, trailingToolResults, trailingUserText } = await buildHistory(
 				dbMessages,
 				resolved.model,
 				resolved.provider,
@@ -1749,10 +1749,18 @@ export async function runAgentLoop(
 
 			// Run one agent loop pass
 
+			// When the provider history builder has fresh trailing user-like context
+			// as the current turn instead of leaving the model with an empty/dot prompt.
+			const currentTurnText = trailingUserText?.trim()
+				? currentText.trim()
+					? `${trailingUserText}\n\n${currentText}`
+					: trailingUserText
+				: currentText;
+
 			// When replaying a pure tool-result turn, preserve the original packet shape:
 			// no synthetic user text.
-			const isPureToolResultReplay = !currentText.trim() && trailingToolResults.length > 0;
-			const effectiveText = isPureToolResultReplay ? "" : currentText;
+			const isPureToolResultReplay = !currentTurnText.trim() && trailingToolResults.length > 0;
+			const effectiveText = isPureToolResultReplay ? "" : currentTurnText;
 
 			active._goalTurnStartedAtMs = Date.now();
 			active._goalTokenUsageBaseline = active._lastTokenUsage;

@@ -455,6 +455,7 @@ export class NugProvider implements ProviderAdapter {
 		params: ChatParams,
 		meta: ResolvedNugModelMeta,
 	): AsyncGenerator<ParsedStreamEvent> {
+		);
 
 		const body = { model: meta.routedModel, ...request };
 		const headers = this.chatHeaders(conversationId, params.reasoningEffort);

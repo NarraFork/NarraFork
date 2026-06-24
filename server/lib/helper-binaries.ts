@@ -12,7 +12,7 @@ import { logger } from "./logger";
 import { narraforkDir, settings } from "./settings";
 
 const DEFAULT_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 15_000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_BINARY_BYTES = 128 * 1024 * 1024;
 const DOWNLOAD_FAILURE_CACHE_MS = 60_000;
 
@@ -58,6 +58,12 @@ export interface DownloadHelperBinaryOptions {
 	maxBytes?: number;
 	/** Allow downloads without an expectedSha256 value. Defaults to true for legacy update flow. */
 	allowUnsignedDownload?: boolean;
+	/**
+	 * Ignore (and clear) the recent-failure cache for this download. Used by
+	 * explicit user retries so a previous timeout does not short-circuit the
+	 * next attempt. Defaults to false.
+	 */
+	bypassFailureCache?: boolean;
 }
 
 function rememberDownloadFailure(cacheKey: string): void {
@@ -92,7 +98,11 @@ export async function downloadHelperBinary(
 	const serverUrl = getHelperBinaryServerBaseUrl();
 	if (!serverUrl) return null;
 	const cacheKey = `${serverUrl}\u0000${spec.toolName}`;
-	if (isDownloadFailureCached(cacheKey)) return null;
+	if (options.bypassFailureCache) {
+		downloadFailureCache.delete(cacheKey);
+	} else if (isDownloadFailureCached(cacheKey)) {
+		return null;
+	}
 
 	const allowUnsignedDownload = options.allowUnsignedDownload ?? true;
 	if (!spec.expectedSha256 && !allowUnsignedDownload) {

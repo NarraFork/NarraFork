@@ -23,7 +23,7 @@ import {
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { useUpdateCapability } from "../hooks/usePlatform";
+import { usePlatform, useUpdateCapability } from "../hooks/usePlatform";
 import {
 	type UpdateDownloadResult,
 	type UpdateInstructions,
@@ -102,6 +102,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 	const { download, cancel, reset, progress, result, isDownloading } = useUpdateDownload();
 	const { apply, isApplying, applyResult } = useUpdateApply();
 	const updateCapability = useUpdateCapability();
+	const platform = usePlatform();
 	const downloadAvailable = updateCapability.download.supported && updateCapability.download.sse;
 	const downloadUnavailableReason = !updateCapability.download.supported
 		? (updateCapability.download.reason ?? t("updateDownloadUnavailable"))
@@ -132,9 +133,9 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		staleTime: 0,
 	});
 
-	const handleDownload = () => {
+	const handleDownload = (options?: { retry?: boolean }) => {
 		if (!downloadAvailable || !releaseInfo) return;
-		download(releaseInfo);
+		download(releaseInfo, options);
 	};
 
 	const handleApply = async () => {
@@ -320,7 +321,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 					<Button
 						fullWidth
 						leftSection={<IconDownload size={16} />}
-						onClick={handleDownload}
+						onClick={() => handleDownload()}
 						loading={isCheckingPreparedStatus}
 						disabled={!downloadAvailable}
 						title={downloadUnavailableReason}
@@ -364,10 +365,16 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 						<Text size="sm" fw={500} mb={4}>
 							{t("updateZstdMissingTitle")}
 						</Text>
-						<Text size="sm">{t("updateZstdMissingDesc")}</Text>
-						<Code block mt={8} style={{ fontSize: "0.75rem" }}>
-							{t("updateZstdInstallCmd")}
-						</Code>
+						{platform === "windows" ? (
+							<Text size="sm">{t("updateZstdMissingDescWindows")}</Text>
+						) : (
+							<>
+								<Text size="sm">{t("updateZstdMissingDesc")}</Text>
+								<Code block mt={8} style={{ fontSize: "0.75rem" }}>
+									{t("updateZstdInstallCmd")}
+								</Code>
+							</>
+						)}
 						<Button
 							variant="light"
 							color="orange"
@@ -377,7 +384,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 							title={downloadUnavailableReason}
 							onClick={() => {
 								reset();
-								handleDownload();
+								handleDownload({ retry: true });
 							}}
 						>
 							{t("retry")}

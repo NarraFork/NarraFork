@@ -88,3 +88,30 @@ export function estimateSeqCenteredScrollTop(
 	const ratio = Math.max(0, Math.min(1, rawRatio));
 	return Math.max(0, chunkTop + chunkHeight * ratio - clientHeight / 2);
 }
+
+/**
+ * What the (rAF-throttled, direction-agnostic) scroll handler should do, given
+ * only the distance from the bottom and the current pinned state.
+ *
+ * Deliberate user scroll-ups are NOT handled here — they are detached
+ * synchronously in the wheel/touch/key event handlers so the follow loop stops
+ * fighting the user immediately (otherwise the user "can't scroll"). This
+ * handler only covers the two no-direction cases:
+ *  - `"pin"`     — the view is at/again-near the bottom; (re)attach to the tail.
+ *  - `"refollow"`— still pinned but the distance grew (streaming output / async
+ *                  height re-measure / scroll anchoring pushed us off the
+ *                  bottom); keep following instead of silently detaching.
+ *  - `"none"`    — already detached; nothing to do (a real scroll-up already
+ *                  detached us via the input handlers).
+ */
+export type BottomPinAction = "pin" | "refollow" | "none";
+
+export function resolveBottomPinAction(
+	distanceFromBottom: number,
+	pinned: boolean,
+): BottomPinAction {
+	// No height threshold: detached views only re-pin at the real bottom, while
+	// pinned views always keep following any positive bottom gap.
+	if (distanceFromBottom <= 0) return "pin";
+	return pinned ? "refollow" : "none";
+}
