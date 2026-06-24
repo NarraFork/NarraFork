@@ -1082,15 +1082,26 @@ export const narratorPersistence = {
 				try {
 					const errText = normalizedErrorMessage ?? "Unknown error";
 					const msgId = generateId();
-					await db.insert(narratorMessages).values({
-						id: msgId,
-						narratorId,
-						role: "system",
-						contentJson: [{ type: "error", message: errText }],
-						contentText: `[Error] ${errText}`,
-						createdAt: now,
-					});
-					await appendMessageRef(narratorId, msgId);
+					// Insert the message and its ref atomically so broadcast only
+					// fires when both are committed — prevents the message from
+					// appearing in the frontend cache without a ref, which causes
+					// "Message not found" when the user clicks dismiss after a
+					// page refresh (the ref-less message disappears on reload).
+					await withDbRetry(
+						() =>
+							db.transaction(async (tx) => {
+								await tx.insert(narratorMessages).values({
+									id: msgId,
+									narratorId,
+									role: "system",
+									contentJson: [{ type: "error", message: errText }],
+									contentText: `[Error] ${errText}`,
+									createdAt: now,
+								});
+								await appendMessageRefTx(tx, narratorId, msgId);
+							}),
+						{ label: "persistErrorSystemMessage", maxRetries: 5 },
+					);
 					broadcastToNarrator(narratorId, {
 						type: "message",
 						narratorId,

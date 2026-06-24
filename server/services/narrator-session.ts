@@ -126,6 +126,7 @@ import type {
 } from "./narrator-session-state";
 import {
 	activeNarrators,
+	activeSubagentSettings,
 	bufferedMessages,
 	clearActiveHistoryCompactPending,
 	compactLocks,
@@ -139,6 +140,8 @@ import {
 	planModeAskedOnce,
 	pruneLocks,
 	resetActiveUpstreamSession,
+	updateActiveSubagentModel,
+	updateActiveSubagentReasoningEffort,
 } from "./narrator-session-state";
 
 // === Imported from extracted modules ===
@@ -4315,6 +4318,18 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
+	} else if (updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))) {
+		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
+		const effectiveModel = resolveEffectiveModel(model);
+		const sa = activeSubagentSettings.get(narratorId);
+		broadcastToNarrator(narratorId, {
+			type: "model_settings_changed",
+			narratorId,
+			model: effectiveModel,
+			reasoningEffort: sa?.reasoningEffort ?? null,
+			status: "pending",
+			applyAt: "next_model_request",
+		});
 	}
 }
 
@@ -4337,6 +4352,17 @@ export function updateNarratorReasoningEffort(
 			reasoningEffort: active.reasoningEffort,
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
+		});
+	} else if (updateActiveSubagentReasoningEffort(narratorId, reasoningEffort)) {
+		// Subagent: update lightweight settings map; loop picks it up via getRuntimeSettingsOverride
+		const sa = activeSubagentSettings.get(narratorId);
+		broadcastToNarrator(narratorId, {
+			type: "model_settings_changed",
+			narratorId,
+			model: sa?.model ?? "",
+			reasoningEffort,
+			status: "pending",
+			applyAt: "next_model_request",
 		});
 	}
 }

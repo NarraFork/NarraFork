@@ -694,6 +694,10 @@ Inline plans are disabled in this instance. You MUST submit your plan via the de
 2. When done, call ExitPlanMode (it takes no \`plan\` parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
 }
 
+## Revising a Rejected File-based Plan
+
+If a plan submitted from the designated plan file is rejected, keep using that same file. For small feedback-driven changes, prefer Edit to patch the existing plan file and resubmit; only use Write or a complete rewrite when the plan needs a substantial restructure.
+
 **IMPORTANT**: The plan must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.
 
 Do NOT make large assumptions about user intent. Ask clarifying questions when needed.
@@ -739,6 +743,10 @@ ${
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
 2. 完成后，直接调用 ExitPlanMode（它不接受 \`plan\` 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 }
+
+## 修改被拒绝的文件模式计划
+
+如果通过指定计划文件提交的计划被用户拒绝，请继续使用同一个计划文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并重新提交；只有在计划需要大幅重构时，才使用 Write 或整体重写。
 
 **重要**：计划必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。
 

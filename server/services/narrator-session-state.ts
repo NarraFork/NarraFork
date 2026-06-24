@@ -125,6 +125,7 @@ export interface PendingPermission {
 	locale: Locale;
 	signal: AbortSignal;
 	planModeSoftDeny?: boolean;
+	planSubmittedFromFile?: boolean;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -243,6 +244,50 @@ export const pendingPermissions = hotSafe<Map<string, PendingPermission>>(
 	"narrafork.pendingPermissions",
 	() => new Map(),
 );
+
+// === Active subagent runtime settings (lightweight, for getRuntimeSettingsOverride) ===
+
+export interface ActiveSubagentSettings {
+	model: string;
+	reasoningEffort: ReasoningEffort | null;
+}
+
+export const activeSubagentSettings = hotSafe<Map<string, ActiveSubagentSettings>>(
+	"narrafork.activeSubagentSettings",
+	() => new Map(),
+);
+
+export function registerActiveSubagent(
+	narratorId: string,
+	model: string,
+	reasoningEffort: ReasoningEffort | null | undefined,
+): void {
+	activeSubagentSettings.set(narratorId, {
+		model,
+		reasoningEffort: reasoningEffort ?? null,
+	});
+}
+
+export function unregisterActiveSubagent(narratorId: string): void {
+	activeSubagentSettings.delete(narratorId);
+}
+
+export function updateActiveSubagentModel(narratorId: string, model: string): boolean {
+	const s = activeSubagentSettings.get(narratorId);
+	if (!s) return false;
+	s.model = model;
+	return true;
+}
+
+export function updateActiveSubagentReasoningEffort(
+	narratorId: string,
+	reasoningEffort: ReasoningEffort | null,
+): boolean {
+	const s = activeSubagentSettings.get(narratorId);
+	if (!s) return false;
+	s.reasoningEffort = reasoningEffort;
+	return true;
+}
 
 export interface PendingDangerConfirmation {
 	narratorId: string;

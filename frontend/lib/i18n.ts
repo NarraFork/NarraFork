@@ -93,6 +93,64 @@ function normalizeNamespace(namespace: string): Namespace {
 	throw new Error(`Unsupported i18n namespace: ${namespace}`);
 }
 
+/**
+ * Memoize i18next's per-lookup language resolution.
+ *
+ * `t()` calls `languageUtils.toResolveHierarchy(lng, fallback)` on EVERY
+ * invocation, which calls `formatLanguageCode(code)` for each code in the
+ * hierarchy. `formatLanguageCode` runs `Intl.getCanonicalLocales` (~2.8µs each)
+ * for any code containing a hyphen (e.g. "zh-CN"). With hundreds of `t()` calls
+ * per mounted message during fast scroll, this becomes a measurable hot path
+ * (~480ms of `formatLanguageCode` + ~210ms of `toResolveHierarchy` in a 42s
+ * fast-scroll production trace).
+ *
+ * Both functions are pure w.r.t. their inputs (the runtime options they read —
+ * lowerCaseLng/cleanCode/load/fallbackLng/supportedLngs — are fixed after init),
+ * so we wrap them with a Map cache. The cache returns a frozen array snapshot
+ * for toResolveHierarchy to prevent callers from mutating the shared result.
+ */
+function installLanguageResolutionCache(): void {
+	const lu = (i18n as { services?: { languageUtils?: Record<string, unknown> } }).services
+		?.languageUtils as
+		| {
+				formatLanguageCode?: (code: string) => string;
+				toResolveHierarchy?: (code: string, fallbackCode?: unknown) => string[];
+				__nfCached?: boolean;
+		  }
+		| undefined;
+	if (!lu || lu.__nfCached) return;
+
+	if (typeof lu.formatLanguageCode === "function") {
+		const orig = lu.formatLanguageCode.bind(lu);
+		const cache = new Map<string, string>();
+		lu.formatLanguageCode = (code: string) => {
+			const cached = cache.get(code);
+			if (cached !== undefined) return cached;
+			const result = orig(code);
+			cache.set(code, result);
+			return result;
+		};
+	}
+
+	if (typeof lu.toResolveHierarchy === "function") {
+		const orig = lu.toResolveHierarchy.bind(lu);
+		const cache = new Map<string, string[]>();
+		lu.toResolveHierarchy = (code: string, fallbackCode?: unknown) => {
+			// Only cache the common case (no per-call fallback override), which is
+			// what `t()` uses. Anything passing an explicit fallbackCode bypasses.
+			if (fallbackCode !== undefined) return orig(code, fallbackCode);
+			const key = String(code);
+			const cached = cache.get(key);
+			if (cached !== undefined) return cached.slice();
+			const result = orig(code);
+			cache.set(key, result.slice());
+			return result;
+		};
+	}
+
+	lu.__nfCached = true;
+}
+
 function uniqueNamespaces(ns: readonly Namespace[]): Namespace[] {
 	return Array.from(new Set(ns));
 }
@@ -221,6 +279,7 @@ export function initI18n(initialNamespaces: readonly Namespace[]): Promise<typeo
 			},
 		})
 		.then(async () => {
+			installLanguageResolutionCache();
 			await ensureI18nNamespaces(initialNs);
 			setDocumentLanguage(i18n.resolvedLanguage ?? i18n.language);
 			return i18n;

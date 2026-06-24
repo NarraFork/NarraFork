@@ -1875,8 +1875,8 @@ export function resolveExitPlanModeInput(
 	input: Record<string, unknown>,
 	locale: Locale = "en",
 ):
-	| { ok: true; input: Record<string, unknown> }
-	| { ok: false; message: string; input: Record<string, unknown> } {
+	| { ok: true; input: Record<string, unknown>; resolvedFromFile: boolean }
+	| { ok: false; message: string; input: Record<string, unknown>; resolvedFromFile: boolean } {
 	const active = activeNarrators.get(narratorId);
 	const planFileId = active?._planFileId;
 	const allowInlinePlan = settings.agent.planModeAllowInlinePlan;
@@ -1920,13 +1920,14 @@ export function resolveExitPlanModeInput(
 		return {
 			ok: false,
 			input: effectiveInput,
+			resolvedFromFile,
 			message: getToolMessageWithParams("exitPlanModeEmptyPlan", locale, {
 				planFile: planFilePath,
 			}),
 		};
 	}
 
-	return { ok: true, input: effectiveInput };
+	return { ok: true, input: effectiveInput, resolvedFromFile };
 }
 
 /**
@@ -2038,11 +2039,13 @@ export async function handlePermission(
 	const isChapter = !!narrator?.chapterId;
 
 	let effectiveInput = input;
+	let exitPlanResolvedFromFile = false;
 
 	// ExitPlanMode: resolve plan content from the designated plan file
 	if (toolName === "ExitPlanMode") {
 		const resolved = resolveExitPlanModeInput(narratorId, cwd, input, locale);
 		effectiveInput = resolved.input;
+		exitPlanResolvedFromFile = resolved.resolvedFromFile;
 		if (!resolved.ok) {
 			return {
 				behavior: "deny",
@@ -2866,6 +2869,8 @@ export async function handlePermission(
 			locale,
 			signal,
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
+			planSubmittedFromFile:
+				toolName === "ExitPlanMode" && exitPlanResolvedFromFile ? true : undefined,
 		};
 		pendingPermissions.set(toolCallId, pendingEntry);
 		if (toolName === "AskUserQuestion") {
@@ -3086,11 +3091,17 @@ export async function resolvePermission(
 			if (exitPlanCancelled && userFeedback) {
 				pending.resolve({ behavior: "deny", message: userFeedback, rawMessage: true });
 			} else {
+				const denyKey = pending.planSubmittedFromFile
+					? "exitPlanModeDeniedFile"
+					: "exitPlanModeDenied";
+				const denyWithMessageKey = pending.planSubmittedFromFile
+					? "exitPlanModeDeniedFileWithMessage"
+					: "exitPlanModeDeniedWithMessage";
 				const planDenyMsg = userFeedback
-					? getToolMessageWithParams("exitPlanModeDeniedWithMessage", locale, {
+					? getToolMessageWithParams(denyWithMessageKey, locale, {
 							message: userFeedback,
 						})
-					: getToolMessage("exitPlanModeDenied", locale);
+					: getToolMessage(denyKey, locale);
 				pending.resolve({ behavior: "deny", message: planDenyMsg, rawMessage: true });
 			}
 		} else {

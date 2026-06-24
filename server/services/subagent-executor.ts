@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { type AgentConfig, buildHistory } from "../lib/agent";
+import { type AgentConfig, buildHistory, type RuntimeSettingsOverride } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -37,6 +37,11 @@ import {
 	pruneToolCalls,
 	toBufferSummary,
 } from "./narrator-session";
+import {
+	activeSubagentSettings,
+	registerActiveSubagent,
+	unregisterActiveSubagent,
+} from "./narrator-session-state";
 import {
 	deleteConclusionFileId,
 	resolveConclusionFilePath,
@@ -409,6 +414,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 	let narratorFastMode = initialNarrator.fastMode ?? false;
 	const disabledTools = getDisabledToolSet(initialNarrator.traits);
 
+	// Register in the active subagent settings map so that model/reasoningEffort
+	// updates from the UI are picked up via getRuntimeSettingsOverride.
+	registerActiveSubagent(narratorId, model, narratorReasoningEffort);
+
 	// Resolve tool filter for this subagent type using pre-loaded customDef
 	const baseToolFilter = resolveToolFilter(subagentType, opts.customDef);
 	const toolFilter = (tool: import("../lib/agent").ToolDefinition) =>
@@ -489,6 +498,20 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					parentNarratorId,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
+			getRuntimeSettingsOverride: () => {
+				const sa = activeSubagentSettings.get(narratorId);
+				if (!sa) return null;
+				const override: RuntimeSettingsOverride = {};
+				if (sa.model !== config.model) {
+					override.model = sa.model;
+				}
+				const effectiveReasoningEffort =
+					sa.reasoningEffort ?? resolveDefaultReasoningEffort(resolvedProvider, sa.model);
+				if (effectiveReasoningEffort !== (config.reasoningEffort ?? null)) {
+					override.reasoningEffort = effectiveReasoningEffort;
+				}
+				return Object.keys(override).length > 0 ? override : null;
+			},
 			sideCarInitialCompletedToolCount: todoReminderCompletedToolCount,
 			onSideCarCompletedToolCount: (count) => {
 				todoReminderCompletedToolCount = count;
@@ -767,6 +790,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		narratorReasoningEffort = freshNarrator.reasoningEffort ?? undefined;
 		narratorFastMode = freshNarrator.fastMode ?? false;
 
+		// Sync model from the active subagent settings map (may have been changed via UI)
+		const saSettings = activeSubagentSettings.get(narratorId);
+		if (saSettings && saSettings.model !== model) {
+			model = saSettings.model;
+			provider = resolveProvider(model);
+		}
+
 		// Rebuild system prompt with new contextSummary
 		if (opts.rebuildSystemPrompt) {
 			systemPrompt = await opts.rebuildSystemPrompt(freshNarrator.contextSummary);
@@ -801,5 +831,6 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		}
 	}
 
+	unregisterActiveSubagent(narratorId);
 	return { finalText, hasError, contextLengthExceeded, aborted: aborted || signal.aborted };
 }

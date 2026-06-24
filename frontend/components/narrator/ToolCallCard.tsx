@@ -1534,10 +1534,15 @@ const ToolHeader = memo(
 				toolCall.status === "initializing");
 
 		const statusNode = (
-			<Group gap={4} wrap="nowrap" align="center">
-				<Box c={statusColor} style={{ display: "flex", alignItems: "center" }}>
+			<span className={toolCardClasses.headerStatusRow}>
+				<span
+					className={toolCardClasses.headerStatusIcon}
+					style={{
+						color: `var(--mantine-color-${statusColor}-text, var(--mantine-color-${statusColor}-6))`,
+					}}
+				>
 					<StatusIcon status={toolCall.status} />
-				</Box>
+				</span>
 				{showElapsedTimer ? (
 					<ElapsedTimer
 						startedAt={startedAt}
@@ -1578,38 +1583,34 @@ const ToolHeader = memo(
 						</Badge>
 					</Tooltip>
 				)}
-			</Group>
+			</span>
 		);
 
 		const content = (
-			<Group gap={5} wrap="nowrap" align="center" style={{ flex: 1, minWidth: 0 }}>
-				<ThemeIcon size={16} variant="light" color={color} radius="sm">
+			<span className={toolCardClasses.headerMainRow}>
+				<span
+					className={toolCardClasses.headerCategoryIcon}
+					style={
+						{
+							"--tool-header-icon-bg": `var(--mantine-color-${color}-light, var(--mantine-color-${color}-1))`,
+							"--tool-header-icon-color": `var(--mantine-color-${color}-light-color, var(--mantine-color-${color}-6))`,
+						} as CSSProperties
+					}
+				>
 					<Icon size={10} />
-				</ThemeIcon>
+				</span>
 				<span
 					className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed} ${toolCardClasses.fw600} ${toolCardClasses.noShrink}`}
 				>
 					{displayName}
 				</span>
 				{searchPathSuffix ? (
-					<Box
-						component="span"
-						ff="monospace"
-						style={{
-							flex: 1,
-							minWidth: 0,
-							fontSize: 12,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-						}}
-						title={summary}
-					>
+					<span className={toolCardClasses.headerSearchSummary} title={summary}>
 						<span>{extractField(toolCall.inputJson, "pattern", "glob")}</span>
 						<span style={{ color: "var(--mantine-color-dimmed)", marginLeft: 4 }}>
 							in {searchPathSuffix}
 						</span>
-					</Box>
+					</span>
 				) : (
 					<span
 						className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.truncate}`}
@@ -1618,7 +1619,7 @@ const ToolHeader = memo(
 						{summary}
 					</span>
 				)}
-				<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
+				<span className={toolCardClasses.headerTrailingRow}>
 					{timingTooltipLabel ? (
 						<Tooltip label={timingTooltipLabel} position="top" withArrow fz="xs">
 							{statusNode}
@@ -1626,11 +1627,11 @@ const ToolHeader = memo(
 					) : (
 						statusNode
 					)}
-					<Box style={{ display: "flex", alignItems: "center" }}>
+					<span className={toolCardClasses.headerChevron}>
 						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
-					</Box>
-				</Group>
-			</Group>
+					</span>
+				</span>
+			</span>
 		);
 
 		const handleClick = useCallback(
@@ -1644,17 +1645,14 @@ const ToolHeader = memo(
 		);
 
 		return (
-			<UnstyledButton
+			<button
+				type="button"
 				onClick={handleClick}
-				w="100%"
-				style={{
-					...(onToggle ? {} : { cursor: "default", pointerEvents: "none" as const }),
-					display: "flex",
-					alignItems: "center",
-				}}
+				aria-expanded={opened}
+				className={`${toolCardClasses.headerButton}${onToggle ? "" : ` ${toolCardClasses.headerButtonStatic}`}`}
 			>
 				{content}
-			</UnstyledButton>
+			</button>
 		);
 	},
 	(prev, next) => {

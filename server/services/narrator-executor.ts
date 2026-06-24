@@ -90,12 +90,22 @@ export async function executeAgentLoop(
 
 	for await (const event of eventSource) {
 		const drainingAfterAbort = config.signal.aborted;
-		// When aborted, still drain tool_result and error events so:
+		// When aborted, still drain the following events so:
 		// - tool_result: status is persisted to the DB (running → success/fail)
+		// - block_complete: the agent loop flushes accumulated text/reasoning as
+		//   block_complete on abort (see loop.ts flushPartialContent). Text blocks
+		//   are NOT persisted incrementally during streaming — they only live in
+		//   memory until flushed at turn end — so dropping this event would lose any
+		//   completed text/reasoning when the user interrupts mid-tool-call.
 		// - error("Aborted"): onErrorCleanup is called to clean up orphaned tool calls
 		// If we stop after the first post-abort event, pending-permission aborts and
 		// long-running tools can leave the narrator stuck in thinking/waiting.
-		if (drainingAfterAbort && event.type !== "tool_result" && event.type !== "error") {
+		if (
+			drainingAfterAbort &&
+			event.type !== "tool_result" &&
+			event.type !== "block_complete" &&
+			event.type !== "error"
+		) {
 			continue;
 		}
 

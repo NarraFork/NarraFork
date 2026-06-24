@@ -710,6 +710,11 @@ export const SubagentCard = memo(
 										{resolvedModel}
 									</Badge>
 								)}
+								{input.reasoning_effort && (
+									<Badge size="xs" variant="light" color="grape">
+										{input.reasoning_effort}
+									</Badge>
+								)}
 								<Box style={{ flex: 1, minWidth: 0 }} />
 								<Group
 									gap={4}

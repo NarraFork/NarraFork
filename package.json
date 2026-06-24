@@ -112,6 +112,7 @@
 		"dev:all": "bun server/dev-all.ts",
 		"dev:cold": "bun server/dev-all.ts --cold",
 		"dev:go": "bun server/dev-all.ts --backend=go",
+		"dev:go:isolated": "bun scripts/dev-go-isolated.ts",
 		"dev:ts": "bun server/dev-all.ts --backend=ts",
 		"dev:frontend": "bunx vite --config frontend/vite.config.ts",
 		"format": "bunx @biomejs/biome check --write .",

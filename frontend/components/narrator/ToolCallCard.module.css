@@ -37,3 +37,80 @@
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
+
+.headerButton {
+	width: 100%;
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	line-height: inherit;
+	text-align: left;
+	padding: 0;
+	margin: 0;
+	display: flex;
+	align-items: center;
+	cursor: pointer;
+}
+
+.headerButtonStatic {
+	cursor: default;
+	pointer-events: none;
+}
+
+.headerMainRow {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	flex-wrap: nowrap;
+	gap: 5px;
+}
+
+.headerStatusRow {
+	display: flex;
+	align-items: center;
+	flex-wrap: nowrap;
+	gap: 4px;
+}
+
+.headerTrailingRow {
+	flex-shrink: 0;
+	display: flex;
+	align-items: center;
+	flex-wrap: nowrap;
+	gap: 4px;
+}
+
+.headerStatusIcon {
+	display: flex;
+	align-items: center;
+}
+
+.headerChevron {
+	display: flex;
+	align-items: center;
+}
+
+.headerCategoryIcon {
+	width: 16px;
+	height: 16px;
+	min-width: 16px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: var(--mantine-radius-sm);
+	background: var(--tool-header-icon-bg);
+	color: var(--tool-header-icon-color);
+}
+
+.headerSearchSummary {
+	flex: 1;
+	min-width: 0;
+	font-family: var(--mantine-font-family-monospace);
+	font-size: var(--mantine-font-size-xs);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

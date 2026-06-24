@@ -378,4 +378,39 @@ describe("executeAgentLoop abort draining", () => {
 		expect(result.aborted).toBe(true);
 		expect(result.hasError).toBe(false);
 	});
+
+	test("drains block_complete after abort so flushed text is persisted", async () => {
+		const ac = new AbortController();
+		ac.abort();
+		const processed: string[] = [];
+
+		// On abort the agent loop flushes accumulated text/reasoning as
+		// block_complete (see loop.ts). Text blocks are only persisted at flush
+		// time, so the executor must not drop block_complete during abort draining.
+		const result = await executeAgentLoop(
+			{
+				config: makeConfig(ac.signal),
+				userText: "",
+				history: [],
+				eventContext: {} as EventHandlerContext,
+			},
+			{
+				eventSource: makeEventSource([
+					{
+						type: "block_complete",
+						block: { type: "text", text: "completed text before interrupt" },
+					},
+					{ type: "error", message: "Aborted" },
+				]),
+				processEventFn: async (event) => {
+					processed.push(event.type === "error" ? `error:${event.message}` : event.type);
+					return null;
+				},
+			},
+		);
+
+		expect(processed).toEqual(["block_complete", "error:Aborted"]);
+		expect(result.aborted).toBe(true);
+		expect(result.hasError).toBe(false);
+	});
 });

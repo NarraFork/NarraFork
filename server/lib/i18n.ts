@@ -114,6 +114,16 @@ Latest TODO list from narrator state:
 		"zh-CN":
 			"[计划模式] 用户拒绝了你的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改你的计划，然后再次调用 ExitPlanMode 提交。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
+	"tool.exitPlanModeDeniedFile": {
+		en: "[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again without the 'plan' parameter so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		"zh-CN":
+			"[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'plan' 参数），让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+	},
+	"tool.exitPlanModeDeniedFileWithMessage": {
+		en: "[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again without the 'plan' parameter so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		"zh-CN":
+			"[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'plan' 参数），让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+	},
 	"tool.exitPlanModeEmptyPlan": {
 		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'plan' parameter.",
 		"zh-CN":
@@ -533,6 +543,8 @@ export type ToolMessageKey =
 	| "permissionDeniedPlanMode"
 	| "exitPlanModeDenied"
 	| "exitPlanModeDeniedWithMessage"
+	| "exitPlanModeDeniedFile"
+	| "exitPlanModeDeniedFileWithMessage"
 	| "exitPlanModeEmptyPlan"
 	| "exitPlanModeEmptyPlanFallback"
 	| "planModeSoftDenyAskReason"
