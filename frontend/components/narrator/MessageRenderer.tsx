@@ -219,7 +219,7 @@ export function renderToolRun(
 
 	const isMultiRun = items.length >= 2;
 	return (
-		<Box
+		<div
 			key={`tool-run-${runKey}`}
 			data-tool-run
 			className={containerClassName}
@@ -236,7 +236,7 @@ export function renderToolRun(
 			}}
 		>
 			{items.map((item, idx) => renderItem(item, idx, items.length))}
-		</Box>
+		</div>
 	);
 }
 
@@ -309,7 +309,7 @@ export function renderTreeMessages(
 		const mobileTurnUsageLine2 = mobileTurnUsageLine2Parts.join(" · ");
 
 		const content = (
-			<Box
+			<div
 				key={key}
 				id={domId}
 				style={{
@@ -380,7 +380,7 @@ export function renderTreeMessages(
 							</Box>
 						</>
 					)}
-			</Box>
+			</div>
 		);
 		const userAnimationId =
 			enableBlurIn && targetMsg.role === "user"

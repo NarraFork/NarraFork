@@ -3753,7 +3753,14 @@ export const MessageBubble = memo(function MessageBubble({
 
 	return (
 		<MessageContextMenuCtx.Provider value={ctxActions}>
-			<Stack gap={4} style={{ minWidth: 0 }}>
+			<div
+				style={{
+					minWidth: 0,
+					display: "flex",
+					flexDirection: "column",
+					gap: "calc(0.25rem * var(--mantine-scale))",
+				}}
+			>
 				{message.editedAt && (
 					<EditedBadge
 						originalContentJson={message.originalContentJson}
@@ -3881,7 +3888,7 @@ export const MessageBubble = memo(function MessageBubble({
 						<SideCarNotice sideCars={userSideCars} />
 					) : null;
 				})()}
-			</Stack>
+			</div>
 		</MessageContextMenuCtx.Provider>
 	);
 }, messageBubbleAreEqual);

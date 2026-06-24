@@ -535,9 +535,16 @@ export const ContentViewer = memo(
 					{text}
 				</Code>
 			) : (
-				<Box px="xs" py={4} style={{ minWidth: 0, ...extraStyle }}>
+				<div
+					style={{
+						minWidth: 0,
+						paddingInline: "var(--mantine-spacing-xs)",
+						paddingBlock: "calc(0.25rem * var(--mantine-scale))",
+						...extraStyle,
+					}}
+				>
 					<MarkdownContent text={text} wordWrap={wordWrap} streaming={streaming} />
-				</Box>
+				</div>
 			);
 
 		const contentNode = renderContent
