@@ -9,6 +9,140 @@
 	margin-top: 0;
 }
 
+/* ── Native markdown elements (visual parity with Mantine Text/Title) ─────────
+   These replace per-element Mantine components (Text/Title/...) in the
+   react-markdown mapping. Mantine's Text/Title each run useProps + useStyles +
+   polymorphicFactory at runtime; for chat history with thousands of inline
+   nodes that mount cost dominates scrolling. Native tags + these scoped rules
+   render identically with zero per-node React/runtime overhead.
+   Values mirror Mantine v7 defaults (size="sm" → 14px / line-height 1.45).
+   Scoped to BOTH wrap roots so streaming (.rootNoWrap) matches static (.root). */
+:is(.root, .rootNoWrap) :is(p, .mdParagraph) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-weight: normal;
+	margin: 0.35em 0 0;
+	padding: 0;
+	color: inherit;
+}
+
+:is(.root, .rootNoWrap) :is(strong, .mdStrong) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-weight: 700;
+	color: inherit;
+}
+
+:is(.root, .rootNoWrap) :is(em, .mdEm) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	font-style: italic;
+	font-weight: normal;
+	color: inherit;
+}
+
+/* ASCII-art / diagram paragraphs must not word-wrap. */
+:is(.root, .rootNoWrap) p.mdDiagram {
+	white-space: pre;
+	overflow-x: auto;
+	word-break: normal;
+}
+
+/* Inline code — visual parity with Mantine <Code fz="xs"> (dark theme).
+   Uses Mantine vars so it follows theme / OLED overrides. */
+:is(.root, .rootNoWrap) code.mdCode {
+	font-family: var(--mantine-font-family-monospace);
+	font-size: var(--mantine-font-size-xs);
+	line-height: var(--mantine-line-height);
+	padding: 2px calc(var(--mantine-spacing-xs) / 2);
+	border-radius: var(--mantine-radius-sm);
+	background-color: var(--mantine-color-dark-5);
+	color: var(--mantine-color-white);
+	word-break: break-word;
+	overflow-wrap: break-word;
+}
+
+:root[data-mantine-color-scheme="light"] :is(.root, .rootNoWrap) code.mdCode {
+	background-color: var(--mantine-color-gray-1);
+	color: var(--mantine-color-black);
+}
+
+/* ── Native list / heading / anchor / blockquote (r2b) ───────────────────────
+   Replace Mantine <List>/<List.Item>/<Title>/<Anchor>/<Blockquote> in the
+   markdown mapping with native tags. List.Item renders li>div>span (3 nodes +
+   a Box component); native <li> is 1 node. Values mirror Mantine v7 defaults
+   (size="sm" 14px/1.45; Title per-order vars; anchor color var). Marker/padding
+   for ul/ol already set above; here add only typography/margins. */
+:is(.root, .rootNoWrap) :is(ul, ol) {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	margin-top: 0.35em;
+	margin-bottom: 0;
+}
+
+:is(.root, .rootNoWrap) li {
+	margin: 0;
+	line-height: var(--mantine-line-height-sm);
+}
+
+:is(.root, .rootNoWrap) :is(h1, h2, h3, h4, h5, h6) {
+	font-family: var(--mantine-font-family-headings, inherit);
+	font-weight: 700;
+	margin-top: 0.4em;
+	margin-bottom: 0;
+	color: inherit;
+}
+:is(.root, .rootNoWrap) h1 {
+	font-size: var(--mantine-h1-font-size);
+	line-height: var(--mantine-h1-line-height);
+}
+:is(.root, .rootNoWrap) h2 {
+	font-size: var(--mantine-h2-font-size);
+	line-height: var(--mantine-h2-line-height);
+}
+:is(.root, .rootNoWrap) h3 {
+	font-size: var(--mantine-h3-font-size);
+	line-height: var(--mantine-h3-line-height);
+}
+:is(.root, .rootNoWrap) h4 {
+	font-size: var(--mantine-h4-font-size);
+	line-height: var(--mantine-h4-line-height);
+}
+:is(.root, .rootNoWrap) h5 {
+	font-size: var(--mantine-h5-font-size);
+	line-height: var(--mantine-h5-line-height);
+}
+:is(.root, .rootNoWrap) h6 {
+	font-size: var(--mantine-h6-font-size);
+	line-height: var(--mantine-h6-line-height);
+}
+
+:is(.root, .rootNoWrap) a.mdLink {
+	font-size: var(--mantine-font-size-sm);
+	line-height: var(--mantine-line-height-sm);
+	color: var(--mantine-color-anchor);
+	text-decoration: none;
+	overflow-wrap: anywhere;
+}
+@media (hover: hover) {
+	:is(.root, .rootNoWrap) a.mdLink:hover {
+		text-decoration: underline;
+	}
+}
+
+:is(.root, .rootNoWrap) blockquote.mdQuote {
+	position: relative;
+	margin: 0;
+	padding: var(--mantine-spacing-xs);
+	border-inline-start: 3px solid var(--mantine-primary-color-filled);
+	border-start-end-radius: var(--mantine-radius-default);
+	border-end-end-radius: var(--mantine-radius-default);
+	background-color: rgba(59, 91, 219, 0.06);
+}
+:root[data-mantine-color-scheme="light"] :is(.root, .rootNoWrap) blockquote.mdQuote {
+	background-color: rgba(76, 110, 245, 0.07);
+}
+
 /* Fix flowtoken animated token spans.
    1. inline-block prevents mid-token wrapping → override to inline.
    2. pre-wrap inside list items preserves stray \n between items as visible

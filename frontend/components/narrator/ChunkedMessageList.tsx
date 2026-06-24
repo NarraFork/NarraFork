@@ -12,9 +12,14 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useTransition,
 } from "react";
 import { api } from "../../lib/api";
-import { estimateSeqCenteredScrollTop, resolveScrollTargetIndex } from "./chunk-scroll-utils";
+import {
+	estimateSeqCenteredScrollTop,
+	resolveBottomPinAction,
+	resolveScrollTargetIndex,
+} from "./chunk-scroll-utils";
 import { renderTreeMessages } from "./MessageRenderer";
 import {
 	type BlockMeta,
@@ -60,8 +65,10 @@ import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
 const PRELOAD_DISTANCE = 3;
 const DATA_RETAIN_DISTANCE = 10;
 const PER_MESSAGE_ESTIMATE = 120; // px, rough seed for unmeasured chunks
-const BOTTOM_PIN_THRESHOLD = 48;
-const FOLLOW_USER_SCROLL_UP_TOLERANCE = 2;
+/** No height tolerance: repin only at the real bottom; pinned always follows any gap. */
+const BOTTOM_DISTANCE_ZERO = 0;
+/** Firefox/overlay scrollbars may report zero layout width until hovered. */
+const SCROLLBAR_HIT_TARGET_PX = 18;
 const JUMP_LOAD_RADIUS = 3;
 const JUMP_TARGET_TIMEOUT_MS = 3000;
 const SOFT_RANGE_SELECT_CHUNKS = 30;
@@ -100,6 +107,7 @@ export interface ChunkedMessageListHandle {
 	}) => Promise<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
 	refreshStructure: (mode?: "diff" | "full") => void;
+	detachFromBottom: () => void;
 }
 
 export interface ChunkTailMeta {
@@ -693,9 +701,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const pinnedToBottomRef = useRef(true);
 		const followRafRef = useRef(0);
 		const followingRef = useRef(false);
-		const lastFollowScrollTopRef = useRef(0);
 		const scheduleFollowTailRef = useRef<(options?: FollowTailOptions) => void>(() => {});
 		const stopFollowTailRef = useRef<() => void>(() => {});
+		/** Synchronously detach from the bottom (stop the follow loop + unpin).
+		 * Called directly from wheel/touch/key input handlers so a deliberate
+		 * scroll-up takes effect immediately instead of waiting for the rAF-throttled
+		 * scroll handler — otherwise the follow loop keeps yanking scrollTop back to
+		 * the bottom and the user "can't scroll up". */
+		const detachFromBottomRef = useRef<() => void>(() => {});
 		const followTail = useCallback(() => {
 			scheduleFollowTailRef.current();
 		}, []);
@@ -761,6 +774,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// Center of the mounted window, anchored by chunk ID so it survives the
 		// manifest growing/shifting. `null` = follow the tail (newest chunk).
 		const [centerChunkId, setCenterChunkId] = useState<string | null>(null);
+		// Continuous-scroll center updates mount a whole chunk band (~CHUNK_SIZE
+		// heavy messages) in one commit, which blocks the main thread for ~2s when
+		// crossing unmounted history. Mark *only the scroll-driven* recenter as a
+		// transition so React can time-slice that band render and keep scrolling
+		// responsive. Jump/follow/init recenter stay synchronous (need immediate
+		// positioning). Tradeoff: during fast scroll the band may show its
+		// height-reserved spacer until the transition commits.
+		const [, startCenterTransition] = useTransition();
 		const chunkIndexById = useMemo(() => {
 			const m = new Map<string, number>();
 			for (let i = 0; i < chunks.length; i++) m.set(chunks[i].id, i);
@@ -864,6 +885,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			},
 			[updateAtBottom],
 		);
+		// Synchronous detach used by the input handlers. Idempotent: a no-op once
+		// already detached, so repeated wheel ticks don't thrash state.
+		const detachFromBottom = useCallback(() => {
+			if (!pinnedToBottomRef.current && !followingRef.current) return;
+			stopFollowTail();
+			setPinnedToBottom(false);
+		}, [setPinnedToBottom, stopFollowTail]);
+		detachFromBottomRef.current = detachFromBottom;
 		const scheduleFollowTail = useCallback(
 			(options: FollowTailOptions = {}) => {
 				const el = scrollerRef.current;
@@ -874,7 +903,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					setPinnedToBottom(true);
 					resetUnread();
 					onUnreadCountChange?.(0);
-				} else if (!pinnedToBottomRef.current && getDistanceFromBottom(el) > BOTTOM_PIN_THRESHOLD) {
+				} else if (!pinnedToBottomRef.current && getDistanceFromBottom(el) > BOTTOM_DISTANCE_ZERO) {
 					return;
 				} else {
 					setPinnedToBottom(true);
@@ -884,7 +913,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					stopFollowTail();
 				}
 				followingRef.current = true;
-				lastFollowScrollTopRef.current = el.scrollTop;
 
 				const step = () => {
 					const node = scrollerRef.current;
@@ -894,16 +922,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 						return;
 					}
 					const distance = getDistanceFromBottom(node);
-					if (
-						node.scrollTop < lastFollowScrollTopRef.current - FOLLOW_USER_SCROLL_UP_TOLERANCE &&
-						distance > BOTTOM_PIN_THRESHOLD
-					) {
-						followingRef.current = false;
-						followRafRef.current = 0;
-						setPinnedToBottom(false);
-						return;
-					}
-					if (!pinnedToBottomRef.current && distance > BOTTOM_PIN_THRESHOLD) {
+					// Deliberate scroll-ups detach synchronously in the input handlers
+					// (which cancel this loop), so we do NOT detach on a scrollTop decrease
+					// here — that would misread browser scroll-anchoring (after an
+					// above-viewport height re-measure) as a user scroll-up. The only exit
+					// is "someone unpinned us" (e.g. the synchronous detach just ran).
+					if (!pinnedToBottomRef.current && distance > BOTTOM_DISTANCE_ZERO) {
 						followingRef.current = false;
 						followRafRef.current = 0;
 						return;
@@ -912,14 +936,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					const gap = target - node.scrollTop;
 					if (gap <= 1) {
 						node.scrollTop = target;
-						lastFollowScrollTopRef.current = target;
 						followingRef.current = false;
 						followRafRef.current = 0;
 						setPinnedToBottom(true);
 						return;
 					}
 					node.scrollTop = options.immediate ? target : node.scrollTop + Math.max(gap * 0.35, 2);
-					lastFollowScrollTopRef.current = node.scrollTop;
 					followRafRef.current = requestAnimationFrame(step);
 				};
 
@@ -1261,11 +1283,11 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			[scheduleFollowTail],
 		);
 
-		useImperativeHandle(ref, () => ({ scrollToMessageTarget, scrollToBottom, refreshStructure }), [
-			refreshStructure,
-			scrollToBottom,
-			scrollToMessageTarget,
-		]);
+		useImperativeHandle(
+			ref,
+			() => ({ scrollToMessageTarget, scrollToBottom, refreshStructure, detachFromBottom }),
+			[refreshStructure, scrollToBottom, scrollToMessageTarget, detachFromBottom],
+		);
 		// Set once the initial scroll-to-bottom has settled; until then the scroll
 		// handler must not recenter (the programmatic scroll + unsettled heights
 		// could otherwise yank the window off the tail).
@@ -1314,6 +1336,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			const root = scrollerRef.current;
 			if (!root) return;
 			let ticking = false;
+			// True while the user is actively driving the scroll — holding the scrollbar
+			// thumb OR mid touch-gesture. Suppresses the scroll handler's auto
+			// pin/refollow so the follow loop can't fight the drag; pointerup / touchend
+			// re-evaluate once when the gesture ends.
+			let pointerDownOnScrollbar = false;
+			let touchActive = false;
 			const onScroll = () => {
 				if (ticking) return;
 				ticking = true;
@@ -1338,33 +1366,169 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					const targetChunk = list[target];
 					if (!targetChunk) return;
 					const isTail = target === list.length - 1;
-					setCenterChunkId(isTail ? null : targetChunk.id);
+					startCenterTransition(() => setCenterChunkId(isTail ? null : targetChunk.id));
 					ensureLoadedRef.current(targetChunk.id, JUMP_LOAD_RADIUS);
-					// Track bottom pin with a narrow threshold so a deliberate scroll-up is not
-					// pulled back down by streaming height changes. While our follow loop is
-					// scrolling downward, its own scroll events may still be far from the final
-					// bottom; do not interpret those as user detaches unless scrollTop decreases.
-					if (followingRef.current) {
-						const userScrolledUp =
-							el.scrollTop < lastFollowScrollTopRef.current - FOLLOW_USER_SCROLL_UP_TOLERANCE;
-						if (userScrolledUp) {
-							pinnedToBottomRef.current = false;
-							stopFollowTailRef.current();
-							setIsAtBottomRef.current(false);
-						} else {
+					// During active manual gestures, keep virtual-window updates above but skip
+					// all auto pin/refollow decisions so follow never fights the user's drag.
+					if (pointerDownOnScrollbar || touchActive) return;
+					// While the follow loop is animating toward the bottom, leave pin state
+					// to it. (Deliberate scroll-ups already stopped the loop synchronously in
+					// the input handlers, so if we're here and still following, this is the
+					// loop's own downward motion.)
+					if (followingRef.current) return;
+					// Otherwise decide from DISTANCE only — never from a scrollTop decrease.
+					// Deliberate scroll-ups are detached synchronously by the input handlers;
+					// here a scrollTop decrease would just be browser scroll-anchoring after a
+					// height re-measure, which must NOT detach. Remaining cases:
+					//  - reached the bottom (e.g. scrollbar drag down) ⇒ re-pin
+					//  - still pinned but content growth pushed us off the bottom ⇒ re-follow
+					const action = resolveBottomPinAction(
+						getDistanceFromBottom(el),
+						pinnedToBottomRef.current,
+					);
+					switch (action) {
+						case "pin":
 							pinnedToBottomRef.current = true;
 							setIsAtBottomRef.current(true);
-						}
-						return;
+							break;
+						case "refollow":
+							// Still pinned but the distance grew (streaming output / height
+							// re-measure / anchoring). Re-follow instead of silently detaching.
+							scheduleFollowTailRef.current();
+							break;
+						default:
+							// Detached and not at the bottom: a real scroll-up already handled it.
+							break;
 					}
-					const atBottom = getDistanceFromBottom(el) <= BOTTOM_PIN_THRESHOLD;
-					pinnedToBottomRef.current = atBottom;
-					if (!atBottom) stopFollowTailRef.current();
-					setIsAtBottomRef.current(atBottom);
 				});
 			};
 			root.addEventListener("scroll", onScroll, { passive: true });
-			return () => root.removeEventListener("scroll", onScroll);
+			// Deliberate user inputs that mean "leave the bottom" detach SYNCHRONOUSLY
+			// (stop the follow loop + unpin) so the follow loop stops yanking scrollTop
+			// back to the bottom on the same frame — otherwise the user can't scroll up.
+			// Only directional inputs (wheel up, scroll-up keys, touch drag, scrollbar
+			// grab) qualify; a wheel-DOWN at the bottom must keep following.
+			const onWheel = (e: WheelEvent) => {
+				if (e.deltaY < 0) detachFromBottomRef.current();
+			};
+			// Touch gestures drive the scroll directly, so handle them like the
+			// scrollbar grab: a finger moving DOWN drags content down = scrolls UP, so
+			// detach immediately (even while pinned) — otherwise the follow loop fights
+			// the finger and the user can't scroll. `touchActive` suppresses the scroll
+			// handler's auto pin/refollow for the gesture's duration; touchend re-pins
+			// if it ended back at the bottom (or the touch never really moved).
+			let touchStartX = 0;
+			let lastTouchY = 0;
+			const onTouchStart = (e: TouchEvent) => {
+				touchActive = true;
+				const touch = e.touches[0];
+				touchStartX = touch?.clientX ?? 0;
+				lastTouchY = touch?.clientY ?? 0;
+			};
+			const onTouchMove = (e: TouchEvent) => {
+				const touch = e.touches[0];
+				const x = touch?.clientX ?? touchStartX;
+				const y = touch?.clientY ?? lastTouchY;
+				// finger DOWN = content scrolls UP; finger LEFT = reveal left-swipe menu.
+				// Both are user inspection gestures and must immediately release pinned.
+				if (y > lastTouchY || touchStartX - x > 10) detachFromBottomRef.current();
+				lastTouchY = y;
+			};
+			const onTouchEnd = () => {
+				if (!touchActive) return;
+				touchActive = false;
+				const el = scrollerRef.current;
+				if (!el) return;
+				// Pin-only re-evaluation (no follow loop / no snap) so we never fight
+				// momentum: if the gesture ended at the real bottom, re-pin;
+				// otherwise stay detached. With momentum still rolling, the scroll handler
+				// (re-enabled now that touchActive is false) keeps re-evaluating frame by
+				// frame and pins exactly when it settles at the bottom — or leaves it
+				// detached if momentum stops higher up.
+				if (getDistanceFromBottom(el) <= BOTTOM_DISTANCE_ZERO) {
+					pinnedToBottomRef.current = true;
+					setIsAtBottomRef.current(true);
+				}
+			};
+			const onKeyDown = (e: KeyboardEvent) => {
+				if (
+					e.key === "ArrowUp" ||
+					e.key === "PageUp" ||
+					e.key === "Home" ||
+					(e.key === " " && e.shiftKey)
+				) {
+					detachFromBottomRef.current();
+				}
+			};
+			// Grabbing the scrollbar thumb means the user is taking over scrolling, so
+			// detach immediately — even while pinned at the bottom. Otherwise the follow
+			// loop keeps yanking scrollTop back to the bottom every frame and the thumb
+			// won't drag. Firefox/overlay scrollbars can report layout width 0 until
+			// hovered, so use a right-edge hit target fallback instead of trusting
+			// offsetWidth-clientWidth alone. `pointerup` re-pins only if the drag ended at
+			// the real bottom.
+			const isVerticalScrollbarHit = (clientX: number) => {
+				if (root.scrollHeight <= root.clientHeight) return false;
+				const rect = root.getBoundingClientRect();
+				const scrollbarWidth = Math.max(
+					root.offsetWidth - root.clientWidth,
+					SCROLLBAR_HIT_TARGET_PX,
+				);
+				return clientX >= rect.right - scrollbarWidth && clientX <= rect.right;
+			};
+			const onScrollbarPress = (clientX: number) => {
+				if (!isVerticalScrollbarHit(clientX)) return;
+				pointerDownOnScrollbar = true;
+				detachFromBottomRef.current();
+			};
+			const onPointerDown = (e: PointerEvent) => onScrollbarPress(e.clientX);
+			const onMouseDown = (e: MouseEvent) => onScrollbarPress(e.clientX);
+			const onPointerUp = () => {
+				if (!pointerDownOnScrollbar) return;
+				pointerDownOnScrollbar = false;
+				const el = scrollerRef.current;
+				if (el && getDistanceFromBottom(el) <= BOTTOM_DISTANCE_ZERO) {
+					scheduleFollowTailRef.current({ force: true, immediate: true });
+				}
+			};
+			const onContextMenu = () => detachFromBottomRef.current();
+			const onSelectionChange = () => {
+				const selection = document.getSelection();
+				if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
+				const range = selection.getRangeAt(0);
+				const container = range.commonAncestorContainer;
+				const node = container.nodeType === Node.ELEMENT_NODE ? container : container.parentNode;
+				if (node && root.contains(node)) detachFromBottomRef.current();
+			};
+			root.addEventListener("wheel", onWheel, { passive: true });
+			root.addEventListener("touchstart", onTouchStart, { passive: true });
+			root.addEventListener("touchmove", onTouchMove, { passive: true });
+			root.addEventListener("keydown", onKeyDown);
+			root.addEventListener("pointerdown", onPointerDown);
+			root.addEventListener("mousedown", onMouseDown);
+			root.addEventListener("contextmenu", onContextMenu, true);
+			document.addEventListener("selectionchange", onSelectionChange);
+			window.addEventListener("pointerup", onPointerUp);
+			window.addEventListener("pointercancel", onPointerUp);
+			window.addEventListener("mouseup", onPointerUp);
+			window.addEventListener("touchend", onTouchEnd);
+			window.addEventListener("touchcancel", onTouchEnd);
+			return () => {
+				root.removeEventListener("scroll", onScroll);
+				root.removeEventListener("wheel", onWheel);
+				root.removeEventListener("touchstart", onTouchStart);
+				root.removeEventListener("touchmove", onTouchMove);
+				root.removeEventListener("keydown", onKeyDown);
+				root.removeEventListener("pointerdown", onPointerDown);
+				root.removeEventListener("mousedown", onMouseDown);
+				root.removeEventListener("contextmenu", onContextMenu, true);
+				document.removeEventListener("selectionchange", onSelectionChange);
+				window.removeEventListener("pointerup", onPointerUp);
+				window.removeEventListener("pointercancel", onPointerUp);
+				window.removeEventListener("mouseup", onPointerUp);
+				window.removeEventListener("touchend", onTouchEnd);
+				window.removeEventListener("touchcancel", onTouchEnd);
+			};
 		}, []);
 
 		// Initial scroll-to-bottom: follow-tail center + scroll the container to the

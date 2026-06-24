@@ -1,0 +1,39 @@
+/* ToolHeader native-element styles — visual parity with the Mantine
+   <Text size="xs"> variants used in the collapsed tool-card header.
+   Replacing per-card Mantine <Text> (each runs useProps + useStyles +
+   polymorphicFactory) with native <span> + these classes cuts the dominant
+   component-instance source in tool-heavy conversations, with zero visual
+   change. size="xs" → 12px; line-height follows Mantine default 1.55. */
+
+.headerText {
+	font-size: var(--mantine-font-size-xs);
+	line-height: var(--mantine-line-height);
+	color: inherit;
+	margin: 0;
+	padding: 0;
+}
+
+.mono {
+	font-family: var(--mantine-font-family-monospace);
+}
+
+.dimmed {
+	color: var(--mantine-color-dimmed);
+}
+
+.fw600 {
+	font-weight: 600;
+}
+
+.noShrink {
+	flex-shrink: 0;
+}
+
+/* Mantine <Text truncate> equivalent. */
+.truncate {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}

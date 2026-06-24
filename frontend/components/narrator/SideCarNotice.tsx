@@ -17,7 +17,7 @@ import {
 	IconCopy,
 	IconInfoCircle,
 } from "@tabler/icons-react";
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { SideCarRecord } from "../../lib/api";
 import { LazyCollapse } from "./LazyCollapse";
@@ -42,6 +42,20 @@ function previewContent(content: string): string {
 	const compact = content.replace(/\s+/g, " ").trim();
 	if (!compact) return "";
 	return compact.length > 120 ? `${compact.slice(0, 120)}…` : compact;
+}
+
+/**
+ * True when at least one side-car has non-empty content (matches the internal
+ * `visibleSideCars` filter). Call sites use this to skip rendering an empty
+ * `<SideCarNotice>` entirely, avoiding the component's hooks for the common
+ * null case (most messages/tools have no side-cars).
+ */
+export function hasVisibleSideCars(sideCars?: SideCarRecord[] | null): boolean {
+	if (!sideCars || sideCars.length === 0) return false;
+	for (const sideCar of sideCars) {
+		if (sideCar.content?.trim()) return true;
+	}
+	return false;
 }
 
 function detailContent(content: string, truncatedLabel: string): string {
@@ -142,7 +156,7 @@ function SideCarItem({ sideCar, detail }: { sideCar: SideCarRecord; detail?: boo
 	);
 }
 
-export function SideCarNotice({
+const SideCarNoticeImpl = function SideCarNotice({
 	sideCars,
 	mode = "inline",
 	initiallyOpen = false,
@@ -216,4 +230,6 @@ export function SideCarNotice({
 			</LazyCollapse>
 		</Box>
 	);
-}
+};
+
+export const SideCarNotice = memo(SideCarNoticeImpl);

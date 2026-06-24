@@ -99,7 +99,7 @@ import {
 } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
 import { useRenderLod } from "./RenderLodCtx";
-import { SideCarNotice } from "./SideCarNotice";
+import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -3873,11 +3873,14 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					return null;
 				})}
-				<SideCarNotice
-					sideCars={message.sideCars?.filter(
+				{(() => {
+					const userSideCars = message.sideCars?.filter(
 						(sideCar: SideCarRecord) => sideCar.target === "user_message",
-					)}
-				/>
+					);
+					return hasVisibleSideCars(userSideCars) ? (
+						<SideCarNotice sideCars={userSideCars} />
+					) : null;
+				})()}
 			</Stack>
 		</MessageContextMenuCtx.Provider>
 	);

@@ -103,7 +103,8 @@ import {
 	type ReflectionSuggestion,
 } from "./narrator-message-helpers";
 import { useRenderLod } from "./RenderLodCtx";
-import { SideCarNotice } from "./SideCarNotice";
+import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
+import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
@@ -1553,17 +1554,21 @@ const ToolHeader = memo(
 							toolUseId={toolCall.toolUseId}
 							isRunning={false}
 						>
-							<Text size="xs" c="dimmed" ff="monospace">
+							<span
+								className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+							>
 								{formatDurationText(displayDurationMs, { style: "precise" })}
 								<span style={{ opacity: 0.5 }}>
 									/ {formatDurationText(effectiveTimeoutMs, { style: "timeout" })}
 								</span>
-							</Text>
+							</span>
 						</TimeoutPopover>
 					) : (
-						<Text size="xs" c="dimmed" ff="monospace">
+						<span
+							className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed}`}
+						>
 							{formatDurationText(displayDurationMs, { style: "precise" })}
-						</Text>
+						</span>
 					))
 				)}
 				{toolCall.permissionDecidedBy?.startsWith("narrator:") && (
@@ -1581,9 +1586,11 @@ const ToolHeader = memo(
 				<ThemeIcon size={16} variant="light" color={color} radius="sm">
 					<Icon size={10} />
 				</ThemeIcon>
-				<Text size="xs" fw={600} c="dimmed" ff="monospace" style={{ flexShrink: 0 }}>
+				<span
+					className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.dimmed} ${toolCardClasses.fw600} ${toolCardClasses.noShrink}`}
+				>
 					{displayName}
-				</Text>
+				</span>
 				{searchPathSuffix ? (
 					<Box
 						component="span"
@@ -1604,9 +1611,12 @@ const ToolHeader = memo(
 						</span>
 					</Box>
 				) : (
-					<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }} title={summary}>
+					<span
+						className={`${toolCardClasses.headerText} ${toolCardClasses.mono} ${toolCardClasses.truncate}`}
+						title={summary}
+					>
 						{summary}
-					</Text>
+					</span>
 				)}
 				<Group gap={4} wrap="nowrap" align="center" style={{ flexShrink: 0 }}>
 					{timingTooltipLabel ? (
@@ -5378,7 +5388,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onToggle={handleToggle}
 				narratorId={narratorId}
 			/>
-			<SideCarNotice sideCars={toolCall.sideCars} />
+			{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (

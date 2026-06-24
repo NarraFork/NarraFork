@@ -1,4 +1,4 @@
-import { Anchor, Blockquote, Code, Divider, List, Table, Text, Title } from "@mantine/core";
+import { Code, Divider, Table, Text } from "@mantine/core";
 import { AnimatedMarkdown } from "flowtoken";
 import "flowtoken/dist/styles.css";
 import { Component, memo, type ReactNode, useEffect, useMemo, useState } from "react";
@@ -76,15 +76,6 @@ function useMathPlugins(enabled: boolean): MathPlugins | null {
 const DIAGRAM_PATTERN =
 	/[─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┘├┤┬┴┼╋╔╗╚╝╠╣╦╩╬║═╒╓╕╖╘╙╛╜╞╟╡╢╤╥╧╨╪╫]|[┌┐└┘├┤┬┴┼│─]|[╭╮╯╰]|[+\-|]{3,}.*[+\-|]{3,}/;
 
-const HEADING_ORDER: Record<string, 1 | 2 | 3 | 4 | 5 | 6> = {
-	h1: 1,
-	h2: 2,
-	h3: 3,
-	h4: 4,
-	h5: 5,
-	h6: 6,
-};
-
 // biome-ignore lint/suspicious/noExplicitAny: flowtoken animateText signature
 type AnimateTextFn = (children: any) => any;
 
@@ -98,13 +89,9 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 
 	// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
 	function headingComponent({ children, node }: any) {
-		const tag = node?.tagName ?? "h3";
-		const order = HEADING_ORDER[tag] ?? 3;
-		return (
-			<Title order={order} mt="0.4em" mb={0}>
-				{at(children)}
-			</Title>
-		);
+		const tag = (node?.tagName ?? "h3") as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
+		const Tag = tag;
+		return <Tag>{at(children)}</Tag>;
 	}
 
 	return {
@@ -112,20 +99,9 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 			const text = extractText(children);
 			const isDiagram = DIAGRAM_PATTERN.test(text);
 			return (
-				<Text
-					size="sm"
-					style={{
-						marginTop: "0.35em",
-						marginBottom: 0,
-						...(isDiagram && {
-							whiteSpace: "pre",
-							overflowX: "auto",
-							wordBreak: "normal",
-						}),
-					}}
-				>
+				<p className={isDiagram ? classes.mdDiagram : undefined}>
 					{isDiagram ? children : at(children)}
-				</Text>
+				</p>
 			);
 		},
 		h1: headingComponent,
@@ -135,41 +111,23 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 		h5: headingComponent,
 		h6: headingComponent,
 		ul({ children }) {
-			return (
-				<List size="sm" type="unordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
-					{children}
-				</List>
-			);
+			return <ul>{children}</ul>;
 		},
 		ol({ children }) {
-			return (
-				<List size="sm" type="ordered" style={{ marginTop: "0.35em", marginBottom: 0 }}>
-					{children}
-				</List>
-			);
+			return <ol>{children}</ol>;
 		},
 		li({ children }) {
-			return <List.Item style={{ margin: 0 }}>{at(children)}</List.Item>;
+			return <li>{at(children)}</li>;
 		},
 		a({ href, children }) {
 			return (
-				<Anchor
-					href={href}
-					target="_blank"
-					rel="noopener noreferrer"
-					size="sm"
-					style={{ overflowWrap: "anywhere" }}
-				>
+				<a className={classes.mdLink} href={href} target="_blank" rel="noopener noreferrer">
 					{at(children)}
-				</Anchor>
+				</a>
 			);
 		},
 		blockquote({ children }) {
-			return (
-				<Blockquote p="xs" my={0}>
-					{children}
-				</Blockquote>
-			);
+			return <blockquote className={classes.mdQuote}>{children}</blockquote>;
 		},
 		// Code blocks: no text animation — code content should not be split/animated
 		code({ children, className }) {
@@ -196,11 +154,7 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 				}
 				return <MarkdownCodeBlock language={lang ?? "text"}>{children}</MarkdownCodeBlock>;
 			}
-			return (
-				<Code fz="xs" style={{ wordBreak: "break-word", overflowWrap: "break-word" }}>
-					{children}
-				</Code>
-			);
+			return <code className={classes.mdCode}>{children}</code>;
 		},
 		pre({ children }) {
 			// For fenced code blocks without a language tag, react-markdown renders
@@ -263,18 +217,10 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 			return <Table.Td>{at(children)}</Table.Td>;
 		},
 		strong({ children }) {
-			return (
-				<Text span fw={700} size="sm">
-					{at(children)}
-				</Text>
-			);
+			return <strong>{at(children)}</strong>;
 		},
 		em({ children }) {
-			return (
-				<Text span fs="italic" size="sm">
-					{at(children)}
-				</Text>
-			);
+			return <em>{at(children)}</em>;
 		},
 	};
 }
