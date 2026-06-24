@@ -1,0 +1,6 @@
+{
+	"version": "0.4.30",
+	"date": "2026-06-24",
+	"en": "## Bug Fixes\n\n- Preserved completed text when interrupting a run mid-tool-call so flushed output is no longer lost on abort.\n- Fixed a race where error messages could appear without a reference and report \"Message not found\" after a page refresh.\n\n## New Features\n\n- Subagents can now switch model and reasoning effort at runtime, picked up on the next request.\n- Rejecting a file-based plan now shows tailored guidance to revise the plan file instead of rewriting inline.\n\n## Performance\n\n- Slimmed down the tool-call card header with native elements and added aria-expanded for better accessibility.\n- Cached i18n language resolution hot paths to reduce overhead during fast scrolling.",
+	"zh-CN": "## 修复\n\n- 在工具调用中途打断时保留已完成文本，中断不再丢失已 flush 的输出。\n- 修复错误消息可能缺少引用、刷新页面后报“Message not found”的竞态问题。\n\n## 新功能\n\n- 子代理支持运行时切换模型和推理强度，在下次请求时生效。\n- 拒绝文件模式计划时显示针对性提示，引导修改计划文件而非内联重写。\n\n## 性能优化\n\n- 使用原生元素精简工具调用卡片头部，并补充 aria-expanded 提升可访问性。\n- 缓存 i18n 语言解析热路径，降低快速滚动时的开销。"
+}
