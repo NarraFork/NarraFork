@@ -804,4 +804,72 @@ describe("narratorService message query regressions", () => {
 			expect(res.hasNewer).toBe(false);
 		});
 	});
+
+	describe("getChunkManifest 窗口化", () => {
+		// CHUNK_SIZE = 20; seed 50 top-level messages (seq 0..49) → 3 chunks:
+		// [0..19], [20..39], [40..49].
+		function seedManyMessages(n: number) {
+			seedBase("n1");
+			for (let i = 0; i < n; i++) {
+				insertMessage({
+					id: `m${i}`,
+					seq: i,
+					contentJson: [{ type: "text", text: `msg ${i}` }],
+				});
+			}
+		}
+
+		it("limitChunks 只返回最新 N 个 chunk，total 仍为全量", async () => {
+			seedManyMessages(50);
+			const manifest = await narratorService.getChunkManifest("n1", undefined, { limitChunks: 2 });
+			expect(manifest.unchanged).toBe(false);
+			if (manifest.unchanged) return;
+			// Newest 2 chunks: [20..39] and [40..49].
+			expect(manifest.chunks.map((c) => [c[1], c[2]])).toEqual([
+				[20, 39],
+				[40, 49],
+			]);
+			expect(manifest.total).toBe(50);
+			expect(manifest.windowFirstIndex).toBe(1);
+			expect(manifest.hasOlderChunks).toBe(true);
+		});
+
+		it("beforeSeq 向更早翻页，取紧邻的更旧 chunk", async () => {
+			seedManyMessages(50);
+			// Older than the tail window (firstSeq 20) → expect chunk [0..19].
+			const older = await narratorService.getChunkManifest("n1", undefined, {
+				limitChunks: 10,
+				beforeSeq: 20,
+			});
+			expect(older.unchanged).toBe(false);
+			if (older.unchanged) return;
+			expect(older.chunks.map((c) => [c[1], c[2]])).toEqual([[0, 19]]);
+			expect(older.windowFirstIndex).toBe(0);
+			expect(older.hasOlderChunks).toBe(false);
+			expect(older.total).toBe(50);
+		});
+
+		it("limitChunks 覆盖全部时返回完整 manifest 且 hasOlderChunks 为假", async () => {
+			seedManyMessages(50);
+			const manifest = await narratorService.getChunkManifest("n1", undefined, {
+				limitChunks: 100,
+			});
+			expect(manifest.unchanged).toBe(false);
+			if (manifest.unchanged) return;
+			expect(manifest.chunks.length).toBe(3);
+			expect(manifest.windowFirstIndex).toBe(0);
+			expect(manifest.hasOlderChunks).toBe(false);
+		});
+
+		it("不传 window 时返回完整 manifest（向后兼容）", async () => {
+			seedManyMessages(50);
+			const manifest = await narratorService.getChunkManifest("n1");
+			expect(manifest.unchanged).toBe(false);
+			if (manifest.unchanged) return;
+			expect(manifest.chunks.length).toBe(3);
+			expect(manifest.windowFirstIndex).toBe(0);
+			expect(manifest.hasOlderChunks).toBe(false);
+			expect(manifest.total).toBe(50);
+		});
+	});
 });

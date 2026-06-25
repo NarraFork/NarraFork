@@ -1082,35 +1082,15 @@ export const narratorMessageQueries = {
 	 * without refetching content. When `sinceVersion` matches the current
 	 * messageVersion, short-circuits with `{ unchanged: true }`.
 	 */
-	async getChunkManifest(
-		narratorId: string,
-		sinceVersion?: number,
-	): Promise<
-		| { unchanged: true; messageVersion: number }
-		| {
-				unchanged: false;
-				messageVersion: number;
-				total: number;
-				/** Compact tuples: [id, firstSeq, lastSeq, count]. */
-				chunks: Array<[string, number, number, number]>;
-		  }
-	> {
-		const messageVersion = await this.getMessageVersion(narratorId);
-		if (sinceVersion != null && sinceVersion === messageVersion) {
-			return { unchanged: true, messageVersion };
-		}
-
-		// Serve from cache when the structure version still matches — exact, and
-		// avoids the full ref scan even on a first load (no client `since`).
+	/**
+	 * Compute (or read from cache) the FULL manifest for a narrator at the given
+	 * messageVersion. The full chunk array is the cheap part (one indexed ref
+	 * scan + JS slicing) and stays cached so windowed reads never rescan. Pure
+	 * function of the ref table at this version, so a cached hit is exact.
+	 */
+	async computeFullManifest(narratorId: string, messageVersion: number): Promise<ComputedManifest> {
 		const cached = getCachedManifest(narratorId, messageVersion);
-		if (cached) {
-			return {
-				unchanged: false,
-				messageVersion: cached.messageVersion,
-				total: cached.total,
-				chunks: cached.chunks,
-			};
-		}
+		if (cached) return cached;
 
 		const isSubagent = await this.isSubagentNarrator(narratorId);
 
@@ -1158,7 +1138,7 @@ export const narratorMessageQueries = {
 		// omitted here — it is only needed by the (not-yet-built) chunks_dirty
 		// incremental reconciliation, and would otherwise cost wire bytes + a
 		// djb2 pass per chunk for no current consumer.
-		const chunks: Array<[string, number, number, number]> = [];
+		const chunks: ManifestChunkTuple[] = [];
 		for (let i = 0; i < refRows.length; i += CHUNK_SIZE) {
 			const slice = refRows.slice(i, i + CHUNK_SIZE);
 			const first = slice[0];
@@ -1166,13 +1146,81 @@ export const narratorMessageQueries = {
 			chunks.push([first.messageId, first.seq, last.seq, slice.length]);
 		}
 
-		const total = refRows.length;
-		setCachedManifest(narratorId, { messageVersion, total, chunks });
+		const entry: ComputedManifest = { messageVersion, total: refRows.length, chunks };
+		setCachedManifest(narratorId, entry);
+		return entry;
+	},
+
+	/**
+	 * Lightweight chunk manifest for the virtualized message list.
+	 *
+	 * Reads ONLY the narrow narrator_message_refs join (indexed by seq), never
+	 * the large content_json/output_json payloads. Returns one fingerprint per
+	 * CHUNK_SIZE top-level messages so the client can detect which chunks changed
+	 * without refetching content. When `sinceVersion` matches the current
+	 * messageVersion, short-circuits with `{ unchanged: true }`.
+	 *
+	 * Windowing: the client opens with only the newest `limitChunks` chunks and
+	 * walks older bands via `beforeSeq` (reverse infinite scroll). The full chunk
+	 * array is still computed/cached server-side (cheap), but only the requested
+	 * window is sent on the wire. `total` is always the full top-level count so
+	 * callers know the true history size; `windowFirstIndex`/`hasOlderChunks`
+	 * locate the window inside the full history.
+	 */
+	async getChunkManifest(
+		narratorId: string,
+		sinceVersion?: number,
+		window?: { limitChunks?: number; beforeSeq?: number },
+	): Promise<
+		| { unchanged: true; messageVersion: number }
+		| {
+				unchanged: false;
+				messageVersion: number;
+				total: number;
+				/** Index of the first returned chunk within the full history. */
+				windowFirstIndex: number;
+				/** True when chunks older than the returned window exist. */
+				hasOlderChunks: boolean;
+				/** Compact tuples: [id, firstSeq, lastSeq, count]. */
+				chunks: Array<[string, number, number, number]>;
+		  }
+	> {
+		const messageVersion = await this.getMessageVersion(narratorId);
+		if (sinceVersion != null && sinceVersion === messageVersion) {
+			return { unchanged: true, messageVersion };
+		}
+
+		const full = await this.computeFullManifest(narratorId, messageVersion);
+		const allChunks = full.chunks;
+
+		// Resolve the window [windowFirstIndex, windowEnd) over the full chunk
+		// array. `beforeSeq` walks older: take the chunks whose firstSeq < beforeSeq,
+		// keeping the newest `limit` of them. No `beforeSeq` → newest `limit`.
+		const limit =
+			window?.limitChunks != null && Number.isFinite(window.limitChunks)
+				? Math.min(Math.max(Math.trunc(window.limitChunks), 1), 200)
+				: allChunks.length;
+		let windowEnd = allChunks.length; // exclusive
+		if (window?.beforeSeq != null && Number.isFinite(window.beforeSeq)) {
+			// First chunk index whose firstSeq >= beforeSeq; everything before it is older.
+			let idx = allChunks.length;
+			for (let i = 0; i < allChunks.length; i++) {
+				if (allChunks[i][1] >= window.beforeSeq) {
+					idx = i;
+					break;
+				}
+			}
+			windowEnd = idx;
+		}
+		const windowFirstIndex = Math.max(0, windowEnd - limit);
+		const chunks = allChunks.slice(windowFirstIndex, windowEnd);
 
 		return {
 			unchanged: false,
 			messageVersion,
-			total,
+			total: full.total,
+			windowFirstIndex,
+			hasOlderChunks: windowFirstIndex > 0,
 			chunks,
 		};
 	},

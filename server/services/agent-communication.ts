@@ -174,6 +174,52 @@ function formatSubagentResult(subagentId: string, finalText: string | null | und
 	return `<subagent_id>${subagentId}</subagent_id>\n\n${finalText || "(no output)"}`;
 }
 
+/**
+ * Output placeholders that carry no real subagent result. When the wait ends
+ * without a final result (aborted/timeout), these stand-ins must not be shown
+ * as if they were the subagent's output.
+ */
+const EMPTY_AWAIT_OUTPUTS = new Set([
+	"",
+	"(no output)",
+	"Await aborted.",
+	"Subagent is still running.",
+]);
+
+/**
+ * Format the result text an Await sees for an agent target.
+ *
+ * Non-terminal statuses (aborted/running/timeout) only mean the *wait* ended —
+ * the subagent keeps running in the background with its own abort controller.
+ * The wording makes this explicit so the model does not assume the subagent was
+ * killed, and reminds it that Await can be called again with the same id.
+ */
+export function formatAgentAwaitResult(id: string, status: string, output: string | null): string {
+	const trimmed = output?.trim() ?? "";
+	const partial = EMPTY_AWAIT_OUTPUTS.has(trimmed) ? "" : trimmed;
+	const tag = `<subagent_id>${id}</subagent_id>`;
+	switch (status) {
+		case "aborted":
+			return (
+				`${tag}\n\n` +
+				`Await on agent ${id} was interrupted — only this wait was canceled, not the subagent. ` +
+				`The subagent is still running in the background. Call Await again with the same id to ` +
+				`keep waiting for its result.` +
+				(partial ? `\n\nPartial output so far:\n${partial}` : "")
+			);
+		case "running":
+		case "timeout":
+			return (
+				`${tag}\n\n` +
+				`Agent ${id} is still running — the wait timed out but the subagent has not stopped. ` +
+				`Call Await again with the same id to keep waiting for its result.` +
+				(partial ? `\n\nPartial output so far:\n${partial}` : "")
+			);
+		default:
+			return `Agent ${id} status: ${status}\n\n${formatSubagentResult(id, output)}`;
+	}
+}
+
 function settledSubagentStatus(narrator: Narrator, fallback = "completed"): string {
 	const substatus = parseSubstatus(narrator.substatus);
 	if (substatus.includes("error") || narrator.errorMessage) return "failed";
@@ -283,12 +329,11 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<AwaitAgentResult> {
 	const background = await awaitBackgroundAgentTask(opts);
 	if (background) {
-		const output = formatSubagentResult(background.id, background.output);
 		return {
 			id: background.id,
 			status: background.status,
 			output: background.output ?? "(no output)",
-			formatted: `Agent ${background.id} status: ${background.status}\n\n${output}`,
+			formatted: formatAgentAwaitResult(background.id, background.status, background.output),
 		};
 	}
 
@@ -296,21 +341,23 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	const target = await resolveOneTarget(opts.id, scope);
 	if (target.isBackground && target.backgroundStatus === "running") {
 		const waited = await waitForBackgroundTask(target.id, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-		const output = formatSubagentResult(target.id, waited.result);
 		return {
 			id: target.id,
 			status: waited.status,
 			output: waited.result ?? "(no output)",
-			formatted: `Agent ${target.id} status: ${waited.status}\n\n${output}`,
+			formatted: formatAgentAwaitResult(target.id, waited.status, waited.result),
 		};
 	}
 	if (target.isBackground && target.backgroundStatus) {
-		const output = formatSubagentResult(target.id, target.backgroundResult);
 		return {
 			id: target.id,
 			status: target.backgroundStatus,
 			output: target.backgroundResult ?? "(no output)",
-			formatted: `Agent ${target.id} status: ${target.backgroundStatus}\n\n${output}`,
+			formatted: formatAgentAwaitResult(
+				target.id,
+				target.backgroundStatus,
+				target.backgroundResult,
+			),
 		};
 	}
 	if (target.status === "working" || target.status === "waiting") {
@@ -320,22 +367,20 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			timeoutMs: opts.timeoutMs,
 			signal: opts.signal,
 		});
-		const output = formatSubagentResult(target.id, waited.output);
 		return {
 			id: target.id,
 			status: waited.status,
 			output: waited.output,
-			formatted: `Agent ${target.id} status: ${waited.status}\n\n${output}`,
+			formatted: formatAgentAwaitResult(target.id, waited.status, waited.output),
 		};
 	}
 	const finalText = await getSubagentFinalText(target.id);
-	const output = formatSubagentResult(target.id, finalText);
 	const status = settledSubagentStatus(target);
 	return {
 		id: target.id,
 		status,
 		output: finalText,
-		formatted: `Agent ${target.id} status: ${status}\n\n${output}`,
+		formatted: formatAgentAwaitResult(target.id, status, finalText),
 	};
 }
 

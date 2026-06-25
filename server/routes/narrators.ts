@@ -1393,9 +1393,22 @@ narratorRoutes.get("/:id/chunk-manifest", async (c) => {
 	const id = c.req.param("id");
 	const sinceRaw = c.req.query("since");
 	const since = sinceRaw != null ? Number.parseInt(sinceRaw, 10) : undefined;
+	const limitRaw = c.req.query("limitChunks");
+	const limitChunks = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
+	const beforeSeqRaw = c.req.query("beforeSeq");
+	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
+	const window =
+		(limitChunks != null && !Number.isNaN(limitChunks)) ||
+		(beforeSeq != null && !Number.isNaN(beforeSeq))
+			? {
+					limitChunks: limitChunks != null && !Number.isNaN(limitChunks) ? limitChunks : undefined,
+					beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
+				}
+			: undefined;
 	const result = await narratorService.getChunkManifest(
 		id,
 		since != null && !Number.isNaN(since) ? since : undefined,
+		window,
 	);
 	return c.json(result);
 });

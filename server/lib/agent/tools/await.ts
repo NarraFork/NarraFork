@@ -123,13 +123,14 @@ export const awaitTool: ToolDefinition = {
 	},
 };
 
-function formatResult(taskId: string, status: string, output: string | null): string {
+export function formatResult(taskId: string, status: string, output: string | null): string {
 	switch (status) {
 		case "running":
 		case "timeout":
 			return (
-				`Background task ${taskId} is still running (timeout reached).` +
-				(output ? `\n\nPartial output:\n${output}` : "")
+				`Background task ${taskId} is still running — the wait timed out but the task has not stopped. ` +
+				`Call Await again with the same id to keep waiting.` +
+				(output ? `\n\nPartial output so far:\n${output}` : "")
 			);
 		case "completed":
 			return `Background task ${taskId} completed.\n\nOutput:\n${output ?? "(no output)"}`;
@@ -144,7 +145,11 @@ function formatResult(taskId: string, status: string, output: string | null): st
 				`Output so far:\n${output ?? ""}`
 			);
 		case "aborted":
-			return `Background task ${taskId} await was aborted.${output ? `\n\nPartial output:\n${output}` : ""}`;
+			return (
+				`Await on background task ${taskId} was interrupted — only this wait was canceled, not the task. ` +
+				`It is still running in the background. Call Await again with the same id to keep waiting.` +
+				(output ? `\n\nPartial output so far:\n${output}` : "")
+			);
 		default:
 			return `Background task ${taskId} status: ${status}`;
 	}

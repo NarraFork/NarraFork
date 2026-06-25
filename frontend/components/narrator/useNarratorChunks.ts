@@ -1,12 +1,8 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-	ChunkManifestEntry,
-	ChunkManifestTuple,
-	ChunkRangeResult,
-	TreeMessage,
-} from "../../lib/api";
+import type { ChunkManifestEntry, ChunkRangeResult, TreeMessage } from "../../lib/api";
 import { api } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { decodeManifestTuples, firstDirtyManifestIndex } from "./chunk-manifest-utils";
 import type { NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { type ChunkMutState, type ChunkUpdater, useNarratorChunksWS } from "./useNarratorChunksWS";
@@ -14,11 +10,11 @@ import { type ChunkMutState, type ChunkUpdater, useNarratorChunksWS } from "./us
 /**
  * Data layer for the chunk-virtualized message list.
  *
- * The manifest defines the full coordinate system — every chunk that exists,
- * with its seq range and message count — so the scroll container can be sized
- * to the entire history and the scrollbar maps to real positions. Chunk
- * *content* is loaded sparsely on demand into `loaded` (a Map keyed by chunk
- * id), so the user can jump the scrollbar anywhere and we fetch just that band.
+ * The manifest is a tail-anchored window over the history: on open only the
+ * newest chunks' coordinates (id + seq range + count) are loaded, and older
+ * bands are fetched lazily as the user scrolls toward the top (reverse infinite
+ * scroll). Chunk *content* is loaded sparsely on demand into `loaded` (a Map
+ * keyed by chunk id) on top of whatever manifest window is currently loaded.
  *
  * Phase 1 makes this layer the single source of truth for messages: it owns the
  * WebSocket subscription (via `useNarratorChunksWS`) and applies new messages /
@@ -33,45 +29,6 @@ import { type ChunkMutState, type ChunkUpdater, useNarratorChunksWS } from "./us
  * (top-level only, no segment-compacted refs, subagent-aware), so seqs align.
  */
 
-/** Expand a compact wire tuple [id, firstSeq, lastSeq, count] into an entry. */
-function decodeManifestTuples(tuples: ChunkManifestTuple[]): ChunkManifestEntry[] {
-	const out = new Array<ChunkManifestEntry>(tuples.length);
-	for (let i = 0; i < tuples.length; i++) {
-		const t = tuples[i];
-		out[i] = { id: t[0], firstSeq: t[1], lastSeq: t[2], count: t[3] };
-	}
-	return out;
-}
-
-function sameManifestEntry(a: ChunkManifestEntry | undefined, b: ChunkManifestEntry | undefined) {
-	return (
-		a != null &&
-		b != null &&
-		a.id === b.id &&
-		a.firstSeq === b.firstSeq &&
-		a.lastSeq === b.lastSeq &&
-		a.count === b.count
-	);
-}
-
-/**
- * First manifest index that may need content reload. The manifest currently does
- * not carry a per-chunk content hash, so when a tuple changes at i we step back
- * one chunk to cover within-chunk insert/delete cases whose first id stayed the
- * same but whose tail was pulled from the next chunk.
- */
-function firstDirtyManifestIndex(
-	prev: ChunkManifestEntry[],
-	next: ChunkManifestEntry[],
-): number | null {
-	const len = Math.min(prev.length, next.length);
-	for (let i = 0; i < len; i++) {
-		if (!sameManifestEntry(prev[i], next[i])) return Math.max(0, i - 1);
-	}
-	if (prev.length === next.length) return null;
-	return Math.max(0, len - 1);
-}
-
 export interface ChunkData extends ChunkManifestEntry {
 	/** Loaded top-level messages for this chunk, or undefined if not yet loaded. */
 	messages?: TreeMessage[];
@@ -83,6 +40,9 @@ export interface NarratorChunksState {
 	messageVersion: number;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	/** True when older chunks exist beyond the loaded manifest window (reverse
+	 * infinite scroll: more manifest can be fetched toward the top). */
+	hasOlderChunks: boolean;
 	/** chunkId -> loaded messages. Sparse: only fetched chunks are present. */
 	loaded: Map<string, TreeMessage[]>;
 }
@@ -99,6 +59,12 @@ const INITIAL_RADIUS = 3; // center ±3 chunks
 const INITIAL_BAND_CHUNKS = INITIAL_RADIUS * 2 + 1;
 const INITIAL_CONTENT_CHUNKS = 1;
 const INITIAL_LOAD_MAX_ATTEMPTS = 3;
+/** Newest chunks whose manifest is loaded on open. The rest of the history's
+ * manifest is fetched lazily as the user scrolls toward the top (reverse
+ * infinite scroll), so opening a huge narrator no longer ships ~1.5k tuples. */
+const INITIAL_MANIFEST_CHUNKS = 10;
+/** Chunks of manifest fetched per upward expansion step. */
+const OLDER_MANIFEST_BATCH_CHUNKS = 10;
 const CHUNK_UPDATE_FALLBACK_MS = 250;
 /** Server clamps /narrators/:id/chunks `count` to at most 20 chunks. */
 const MAX_CHUNKS_PER_RANGE_REQUEST = 20;
@@ -132,6 +98,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		messageVersion: 0,
 		pruneBoundaryMessageId: null,
 		prunedPercent: null,
+		hasOlderChunks: false,
 		loaded: new Map(),
 	});
 	const [loading, setLoading] = useState(true);
@@ -149,6 +116,13 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	loadedRef.current = state.loaded;
 	const messageVersionRef = useRef(state.messageVersion);
 	messageVersionRef.current = state.messageVersion;
+	// True while an upward manifest expansion is in flight, so scroll-driven
+	// triggers don't stack duplicate requests for the same band.
+	const olderManifestInFlightRef = useRef(false);
+	const hasOlderChunksRef = useRef(state.hasOlderChunks);
+	hasOlderChunksRef.current = state.hasOlderChunks;
+	const totalRef = useRef(state.total);
+	totalRef.current = state.total;
 
 	const onTailFollowRef = useRef(options?.onTailFollow);
 	onTailFollowRef.current = options?.onTailFollow;
@@ -302,7 +276,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		};
 	}, []);
 
-	// Initial load: manifest + newest tail chunk; neighbours are warmed after first paint.
+	// Initial load: newest manifest window + newest tail chunk; older manifest is
+	// fetched lazily as the user scrolls up (see loadOlderManifest).
 	useEffect(() => {
 		let cancelled = false;
 		const generation = loadGenerationRef.current + 1;
@@ -315,6 +290,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			messageVersion: 0,
 			pruneBoundaryMessageId: null,
 			prunedPercent: null,
+			hasOlderChunks: false,
 			loaded: new Map(),
 		});
 		inFlightRef.current.clear();
@@ -322,7 +298,9 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		(async () => {
 			for (let attempt = 0; attempt < INITIAL_LOAD_MAX_ATTEMPTS; attempt++) {
 				const [manifest, range] = await Promise.all([
-					api.getChunkManifest(narratorId),
+					api.getChunkManifest(narratorId, undefined, {
+						limitChunks: INITIAL_MANIFEST_CHUNKS,
+					}),
 					api.getNarratorChunks(narratorId, {
 						direction: "older",
 						count: INITIAL_CONTENT_CHUNKS,
@@ -346,6 +324,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					messageVersion: range.messageVersion,
 					pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? null,
 					prunedPercent: meta.prunedPercent ?? null,
+					hasOlderChunks: manifest.unchanged ? false : manifest.hasOlderChunks,
 					loaded,
 				});
 				// Seed the WS manager's tracked version so reconnect catch-up diffs work.
@@ -427,8 +406,78 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		[narratorId, regroup, mergeLoaded, isChunkComplete],
 	);
 
-	// --- Tail-resident guarantee ---
-	// The last manifest chunk must always be loaded so new messages / streaming
+	/**
+	 * Expand the loaded manifest window upward (reverse infinite scroll). Fetches
+	 * the band of chunks immediately older than the current oldest loaded chunk,
+	 * prepends their tuples to the manifest, and loads their content so the newly
+	 * revealed band renders immediately. No-op when there is nothing older or an
+	 * expansion is already in flight. Returns the number of chunks prepended (0
+	 * when nothing was added) so the view can decide whether to keep going.
+	 */
+	const loadOlderManifest = useCallback(async (): Promise<number> => {
+		if (olderManifestInFlightRef.current) return 0;
+		if (!hasOlderChunksRef.current) return 0;
+		const manifest = manifestRef.current;
+		if (manifest.length === 0) return 0;
+		const beforeSeq = manifest[0].firstSeq;
+		const generation = loadGenerationRef.current;
+		olderManifestInFlightRef.current = true;
+		try {
+			const manifestResult = await api.getChunkManifest(narratorId, undefined, {
+				limitChunks: OLDER_MANIFEST_BATCH_CHUNKS,
+				beforeSeq,
+			});
+			if (generation !== loadGenerationRef.current) return 0;
+			if (manifestResult.unchanged) return 0;
+			const olderChunks = decodeManifestTuples(manifestResult.chunks);
+			// Drop any chunk that already overlaps the current window (defensive
+			// against a concurrent reconcile having shifted seqs).
+			const existingFirstSeqs = new Set(manifestRef.current.map((c) => c.firstSeq));
+			const newChunks = olderChunks.filter((c) => !existingFirstSeqs.has(c.firstSeq));
+			if (newChunks.length === 0) {
+				// Nothing new to add but the server may still report older history;
+				// trust its flag so we don't loop forever.
+				setState((prev) =>
+					prev.hasOlderChunks === manifestResult.hasOlderChunks
+						? prev
+						: { ...prev, hasOlderChunks: manifestResult.hasOlderChunks },
+				);
+				return 0;
+			}
+
+			const nextManifest = [...newChunks, ...manifestRef.current];
+			manifestRef.current = nextManifest;
+
+			// Load the prepended band's content in one request.
+			const firstSeq = newChunks[0].firstSeq;
+			const range = await api.getNarratorChunks(narratorId, {
+				direction: "newer",
+				fromSeq: firstSeq - 1,
+				count: newChunks.length,
+			});
+			if (generation !== loadGenerationRef.current) return 0;
+			const incoming = regroup(range.messages);
+			const meta = getChunkRangeMeta(range);
+			setState((prev) => {
+				const loaded = new Map(prev.loaded);
+				for (const [chunkId, msgs] of incoming) loaded.set(chunkId, msgs);
+				return {
+					...prev,
+					manifest: nextManifest,
+					hasOlderChunks: manifestResult.hasOlderChunks,
+					pruneBoundaryMessageId: meta.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId,
+					prunedPercent: meta.prunedPercent ?? prev.prunedPercent,
+					loaded,
+				};
+			});
+			return newChunks.length;
+		} catch {
+			return 0;
+		} finally {
+			olderManifestInFlightRef.current = false;
+		}
+	}, [narratorId, regroup]);
+
 	// have a landing spot and `lastMessageId` can be computed. Whenever the
 	// manifest changes and the tail isn't loaded, fetch it.
 	useEffect(() => {
@@ -506,9 +555,15 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			(async () => {
 				try {
 					const previousManifest = manifestRef.current;
+					// Preserve the window the user has expanded to: re-fetch the newest
+					// N chunks where N matches the current window size, so a structural
+					// change doesn't collapse it back to the initial window (nor creep it
+					// larger on every reconcile). Older history stays lazily loadable.
+					const windowChunks = Math.max(INITIAL_MANIFEST_CHUNKS, previousManifest.length);
 					const manifest = await api.getChunkManifest(
 						narratorId,
 						mode === "diff" ? messageVersionRef.current : undefined,
+						{ limitChunks: windowChunks },
 					);
 					const manifestVersion = manifest.messageVersion;
 
@@ -525,9 +580,10 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 					const manifestChunks = manifest.unchanged
 						? previousManifest
 						: decodeManifestTuples(manifest.chunks);
-					const nextTotal = manifest.unchanged
-						? manifestChunks.reduce((sum, chunk) => sum + chunk.count, 0)
-						: manifest.total;
+					const nextTotal = manifest.unchanged ? totalRef.current : manifest.total;
+					const nextHasOlder = manifest.unchanged
+						? hasOlderChunksRef.current
+						: manifest.hasOlderChunks;
 					const generation = loadGenerationRef.current + 1;
 					loadGenerationRef.current = generation;
 					inFlightRef.current.clear();
@@ -543,6 +599,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							messageVersion: manifestVersion,
 							pruneBoundaryMessageId: null,
 							prunedPercent: null,
+							hasOlderChunks: false,
 							loaded: new Map(),
 						});
 						narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
@@ -574,6 +631,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 								manifest: manifestChunks,
 								total: nextTotal,
 								messageVersion: manifestVersion,
+								hasOlderChunks: nextHasOlder,
 							}));
 							narratorWSManager.updateMessageVersion(narratorId, manifestVersion);
 							return;
@@ -606,6 +664,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 							pruneBoundaryMessageId:
 								meta?.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId ?? null,
 							prunedPercent: meta?.prunedPercent ?? prev.prunedPercent ?? null,
+							hasOlderChunks: nextHasOlder,
 							loaded,
 						};
 					});
@@ -778,6 +837,9 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		ensureLoadedRange,
 		retainChunkRange,
 		refreshStructure,
+		// Windowed manifest (reverse infinite scroll toward the top)
+		hasOlderChunks: state.hasOlderChunks,
+		loadOlderManifest,
 		// Streaming / live state
 		streamingMsg: streamingMsg as NarratorMsg | null,
 		tailChunkId,

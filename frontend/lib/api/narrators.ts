@@ -186,9 +186,17 @@ export const narratorsApi = {
 	markNarratorRead: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/mark-read`, { method: "PATCH" }),
 	// Chunk virtualization: lightweight manifest of structural fingerprints.
-	getChunkManifest: (id: string, since?: number) => {
+	// `window` walks older bands: `limitChunks` caps the returned chunk count and
+	// `beforeSeq` requests the band of chunks immediately older than that seq.
+	getChunkManifest: (
+		id: string,
+		since?: number,
+		window?: { limitChunks?: number; beforeSeq?: number },
+	) => {
 		const params = new URLSearchParams();
 		if (since != null) params.set("since", String(since));
+		if (window?.limitChunks != null) params.set("limitChunks", String(window.limitChunks));
+		if (window?.beforeSeq != null) params.set("beforeSeq", String(window.beforeSeq));
 		const qs = params.toString();
 		return request<ChunkManifest>(`/narrators/${id}/chunk-manifest${qs ? `?${qs}` : ""}`);
 	},

@@ -70,6 +70,9 @@ const BOTTOM_DISTANCE_ZERO = 0;
 /** Firefox/overlay scrollbars may report zero layout width until hovered. */
 const SCROLLBAR_HIT_TARGET_PX = 18;
 const JUMP_LOAD_RADIUS = 3;
+/** Scroll distance from the top within which an upward manifest expansion is
+ * triggered (reverse infinite scroll). */
+const OLDER_LOAD_TRIGGER_PX = 600;
 const JUMP_TARGET_TIMEOUT_MS = 3000;
 const SOFT_RANGE_SELECT_CHUNKS = 30;
 const HARD_RANGE_SELECT_CHUNKS = 120;
@@ -721,6 +724,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			refreshStructure,
 			streamingMsg,
 			tailChunkId,
+			hasOlderChunks,
+			loadOlderManifest,
 			pruneBoundaryMessageId: chunkPruneBoundaryMessageId,
 			prunedPercent: chunkPrunedPercent,
 			setIsAtBottom,
@@ -862,6 +867,13 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		prefixRef.current = prefix;
 		const ensureLoadedRef = useRef(ensureLoaded);
 		ensureLoadedRef.current = ensureLoaded;
+		const hasOlderChunksRef = useRef(hasOlderChunks);
+		hasOlderChunksRef.current = hasOlderChunks;
+		const loadOlderManifestRef = useRef(loadOlderManifest);
+		loadOlderManifestRef.current = loadOlderManifest;
+		// Guards an upward manifest expansion + its scroll-position compensation,
+		// so a single trigger doesn't stack while the prepended band mounts.
+		const expandingOlderRef = useRef(false);
 		const updateAtBottom = useCallback(
 			(atBottom: boolean) => {
 				setIsAtBottom(atBottom);
@@ -1219,7 +1231,23 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 
 		const scrollToSeqTarget = useCallback(
 			async (seq: number, resolveTarget: JumpTargetResolver, token = ++jumpTokenRef.current) => {
-				const chunkIndex = getChunkIndexForSeq(seq);
+				// The target may be older than the currently loaded manifest window.
+				// Expand the window upward until it covers `seq` (or no older history
+				// remains). The window is tail-anchored, so a seq below the window's
+				// first chunk means we must pull more older manifest.
+				let chunkIndex = getChunkIndexForSeq(seq);
+				let guard = 0;
+				while (
+					chunkIndex < 0 &&
+					hasOlderChunksRef.current &&
+					(chunksRef.current[0]?.firstSeq ?? 0) > seq &&
+					guard++ < 200
+				) {
+					const added = await loadOlderManifestRef.current();
+					if (token !== jumpTokenRef.current) return false;
+					if (added <= 0) break;
+					chunkIndex = getChunkIndexForSeq(seq);
+				}
 				if (chunkIndex < 0) return false;
 				const chunk = chunksRef.current[chunkIndex];
 				if (!chunk) return false;
@@ -1329,6 +1357,40 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			if (centerChunk) ensureLoadedRef.current(centerChunk.id, PRELOAD_DISTANCE);
 		}, [chunks, centerIndex]);
 
+		// Reverse infinite scroll: expand the manifest window toward the top when the
+		// user scrolls near the start of the loaded history. Compensates scrollTop by
+		// the height the prepended band adds so the viewport stays visually anchored
+		// (native scroll anchoring is unreliable across the spacer/measure churn here).
+		const maybeLoadOlder = useCallback(() => {
+			if (expandingOlderRef.current) return;
+			if (!hasOlderChunksRef.current) return;
+			const el = scrollerRef.current;
+			if (!el || el.scrollTop > OLDER_LOAD_TRIGGER_PX) return;
+			expandingOlderRef.current = true;
+			const prevScrollTop = el.scrollTop;
+			const prevScrollHeight = el.scrollHeight;
+			void (async () => {
+				try {
+					const added = await loadOlderManifestRef.current();
+					if (added <= 0) return;
+					// After React commits the prepended band, restore the visual position
+					// by adding the height delta to scrollTop.
+					await waitAnimationFrame();
+					await waitAnimationFrame();
+					const node = scrollerRef.current;
+					if (!node) return;
+					const delta = node.scrollHeight - prevScrollHeight;
+					if (delta > 0) node.scrollTop = prevScrollTop + delta;
+				} finally {
+					expandingOlderRef.current = false;
+				}
+			})();
+		}, []);
+		// Stable ref so the `[]` scroll-handler effect can call it without
+		// re-subscribing (it accesses all live values through refs).
+		const maybeLoadOlderRef = useRef(maybeLoadOlder);
+		maybeLoadOlderRef.current = maybeLoadOlder;
+
 		// Scroll handler: binary-search the chunk under the viewport center and jump
 		// the mounted window there (+ load its band). This handles both continuous
 		// scrolling and arbitrary scrollbar-drag jumps uniformly.
@@ -1352,6 +1414,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (!initialScrollDoneRef.current) return; // don't fight the initial scroll
 					const list = chunksRef.current;
 					if (list.length === 0) return;
+					// Reverse infinite scroll: expand older manifest when near the top.
+					maybeLoadOlderRef.current();
 					const pre = prefixRef.current;
 					// Binary-search the chunk under the viewport center, with deterministic
 					// edge clamping so the first/last chunks are always reachable even when

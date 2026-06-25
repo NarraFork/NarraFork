@@ -524,6 +524,10 @@ export type ChunkManifest =
 			unchanged: false;
 			messageVersion: number;
 			total: number;
+			/** Index of the first returned chunk within the full history. */
+			windowFirstIndex: number;
+			/** True when chunks older than the returned window exist. */
+			hasOlderChunks: boolean;
 			/** Compact tuples on the wire; decode with decodeChunkManifestTuple. */
 			chunks: ChunkManifestTuple[];
 	  };
