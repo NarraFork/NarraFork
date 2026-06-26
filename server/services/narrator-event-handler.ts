@@ -1342,6 +1342,20 @@ export async function processEvent(
 			return null;
 		}
 
+		case "stream_reset": {
+			// A reasoning-only dead turn was discarded. Clear the streaming snapshot
+			// (which still holds the live reasoning that will not be persisted) and
+			// tell the frontend to drop the streaming blocks it is currently showing.
+			clearStreamingSnapshot(broadcastTargetId);
+			dualBroadcast(ctx, {
+				type: "streaming_reset",
+				narratorId: broadcastTargetId,
+				...(ctx.parentToolUseId ? { parentToolUseId: ctx.parentToolUseId } : {}),
+			});
+			ctx.sseEmitter?.emit("event", { type: "streaming_reset" });
+			return null;
+		}
+
 		case "stream_reasoning": {
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {

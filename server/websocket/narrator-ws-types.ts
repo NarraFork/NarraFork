@@ -512,6 +512,7 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
+	| { type: "streaming_reset"; narratorId: string; parentToolUseId?: string }
 	| {
 			type: "model_switched";
 			narratorId: string;

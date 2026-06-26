@@ -649,6 +649,19 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					flushStreamingVersion();
 				}
 			},
+			onStreamingReset: (parentToolUseId) => {
+				// A reasoning-only dead turn was discarded server-side. Drop any live
+				// streaming blocks for this page so stale reasoning that will never be
+				// persisted does not linger. The owning page (top-level narrator, or the
+				// subagent's own page where dualBroadcast strips parentToolUseId) receives
+				// it without parentToolUseId; the parent-page duplicate keeps it set and is
+				// skipped here since subagent streaming lives in the message cache.
+				if (parentToolUseId) return;
+				if (streamingBlocksRef.current.length > 0) {
+					streamingBlocksRef.current = [];
+					flushStreamingVersion();
+				}
+			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
 				const message = wsData.message;
 				if (!message?.id || !message?.createdAt) return;

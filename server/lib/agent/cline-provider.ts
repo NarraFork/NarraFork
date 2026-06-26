@@ -334,7 +334,7 @@ export class ClineProvider implements ProviderAdapter {
 		_messageId?: string,
 	): void {
 		const h = history as ClineMessage[];
-		const msg: ClineMessage = { role: "assistant", content: text || null };
+		const msg: ClineMessage = { role: "assistant", content: text || "" };
 		if (toolUses.length > 0) {
 			msg.tool_calls = toolUses.map((tu) => ({
 				id: tu.toolUseId,
@@ -508,7 +508,7 @@ export class ClineProvider implements ProviderAdapter {
 					continue;
 				}
 
-				const assistantMsg: ClineMessage = { role: "assistant", content: hasText ? text : null };
+				const assistantMsg: ClineMessage = { role: "assistant", content: hasText ? text : "" };
 				if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
 				history.push(assistantMsg);
 

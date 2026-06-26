@@ -898,7 +898,11 @@ export class OpenAIProvider implements ProviderAdapter {
 				h.push(item as any);
 			}
 		} else {
-			const msg: OAIMessage = { role: "assistant", content: text || null };
+			// Use empty string instead of null: although the official OpenAI spec
+			// allows content:null when tool_calls is present, many OpenAI-compatible
+			// endpoints (local inference servers, translating proxies/gateways) reject
+			// null content outright. An empty string is accepted everywhere.
+			const msg: OAIMessage = { role: "assistant", content: text || "" };
 			if (toolUses.length > 0) {
 				msg.tool_calls = toolUses.map((tu) => ({
 					id: tu.toolUseId,
@@ -3124,8 +3128,10 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			}
 
 			// OpenAI requires assistant messages to have content (string|null) or tool_calls.
-			// Always set content explicitly to avoid sending {role:"assistant"} with no fields.
-			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : null };
+			// Use an empty string rather than null: many OpenAI-compatible endpoints
+			// (local inference servers, translating proxies/gateways) reject null content
+			// even though the official spec permits it when tool_calls is present.
+			const assistantMsg: OAIMessage = { role: "assistant", content: hasText ? text : "" };
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
 			// Attach reasoning blocks and plain-text fallback for Responses API history.
 			if (reasoningBlocks.length > 0) {

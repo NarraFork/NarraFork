@@ -347,6 +347,8 @@ interface NarratorWSCallbacks {
 	}) => void;
 	onBrowserSessionCount?: (count: number) => void;
 	onBrowserSessionVisualChange?: (sessionId: string) => void;
+	/** A reasoning-only dead turn was discarded — drop any live streaming blocks. */
+	onStreamingReset?: (parentToolUseId?: string) => void;
 }
 
 function getDeepestMessageId(message: TreeMessage | undefined): string | undefined {
@@ -1042,6 +1044,9 @@ export function useNarratorWS(
 						break;
 					case "browser_session_visual_change":
 						callbacksRef.current.onBrowserSessionVisualChange?.(data.sessionId as string);
+						break;
+					case "streaming_reset":
+						callbacksRef.current.onStreamingReset?.(data.parentToolUseId as string | undefined);
 						break;
 				}
 			},

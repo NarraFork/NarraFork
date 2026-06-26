@@ -19,24 +19,52 @@ const MAX_TOOL_CALL_OUTPUT = 4000;
 
 // --- Cached prepared statements (lazy-initialized) ---
 // Avoids creating a new Statement object on every Recall tool invocation.
+// Search statements vary along three axes (mode × kind × time filter), so they
+// are cached in a single Map keyed by a composite string instead of dozens of
+// individually-named slots.
 
-let _searchFts: Statement | null = null;
-let _searchFtsWithFrom: Statement | null = null;
-let _searchFtsWithTo: Statement | null = null;
-let _searchFtsWithRange: Statement | null = null;
-let _searchLike: Statement | null = null;
-let _searchLikeWithFrom: Statement | null = null;
-let _searchLikeWithTo: Statement | null = null;
-let _searchLikeWithRange: Statement | null = null;
+const _searchStmtCache = new Map<string, Statement>();
 let _getNarrator: Statement | null = null;
 let _getRefSeq: Statement | null = null;
 let _msgsAround: Statement | null = null;
 let _msgsLatest: Statement | null = null;
 let _getToolCall: Statement | null = null;
+let _getToolCallAny: Statement | null = null;
 
-function prepareSearchFtsStmt(whereSuffix = "") {
-	return sqlite.prepare(
-		`SELECT m.id, r.narrator_id, m.role, m.created_at,
+function timeWhereSuffix(filter: TimeFilter): string {
+	if (filter.from && filter.to) return " AND m.created_at >= ? AND m.created_at <= ?";
+	if (filter.from) return " AND m.created_at >= ?";
+	if (filter.to) return " AND m.created_at <= ?";
+	return "";
+}
+
+function timeFilterKey(filter: TimeFilter): string {
+	if (filter.from && filter.to) return "range";
+	if (filter.from) return "from";
+	if (filter.to) return "to";
+	return "none";
+}
+
+/**
+ * Build the FTS search statement.
+ * - scoped (allNarrators=false): join narrator_message_refs and filter by the
+ *   current narrator, so fork-shared messages remain visible to this narrator.
+ * - global (allNarrators=true): join on the owning narrator (narrator_id column)
+ *   like search-service, deduplicating fork-shared messages to their origin.
+ */
+function buildSearchFtsSql(allNarrators: boolean, whereSuffix: string): string {
+	if (allNarrators) {
+		return `SELECT m.id, n.id AS narrator_id, m.role, m.created_at,
+		        n.title AS narrator_title, n.chapter_id,
+		        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
+		 FROM narrator_messages_fts
+		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+		 JOIN narrators n ON n.id = m.narrator_id
+		 WHERE narrator_messages_fts MATCH ?${whereSuffix}
+		 ORDER BY rank
+		 LIMIT ?`;
+	}
+	return `SELECT m.id, r.narrator_id, m.role, m.created_at,
 		        n.title AS narrator_title, n.chapter_id,
 		        snippet(narrator_messages_fts, 0, '>>>', '<<<', '...', 64) AS snippet
 		 FROM narrator_messages_fts
@@ -45,28 +73,21 @@ function prepareSearchFtsStmt(whereSuffix = "") {
 		 JOIN narrators n ON n.id = r.narrator_id
 		 WHERE narrator_messages_fts MATCH ? AND r.narrator_id = ?${whereSuffix}
 		 ORDER BY rank
-		 LIMIT ?`,
-	);
+		 LIMIT ?`;
 }
-function searchFtsStmt(filter: TimeFilter): Statement {
-	if (filter.from && filter.to) {
-		_searchFtsWithRange ??= prepareSearchFtsStmt(" AND m.created_at >= ? AND m.created_at <= ?");
-		return _searchFtsWithRange;
+
+function buildSearchLikeSql(allNarrators: boolean, whereSuffix: string): string {
+	if (allNarrators) {
+		return `SELECT m.id, n.id AS narrator_id, m.role, m.created_at,
+		        n.title AS narrator_title, n.chapter_id,
+		        substr(m.content_text, 1, ?) AS snippet
+		 FROM narrator_messages m
+		 JOIN narrators n ON n.id = m.narrator_id
+		 WHERE m.content_text LIKE ?${whereSuffix}
+		 ORDER BY m.created_at DESC
+		 LIMIT ?`;
 	}
-	if (filter.from) {
-		_searchFtsWithFrom ??= prepareSearchFtsStmt(" AND m.created_at >= ?");
-		return _searchFtsWithFrom;
-	}
-	if (filter.to) {
-		_searchFtsWithTo ??= prepareSearchFtsStmt(" AND m.created_at <= ?");
-		return _searchFtsWithTo;
-	}
-	_searchFts ??= prepareSearchFtsStmt();
-	return _searchFts;
-}
-function prepareSearchLikeStmt(whereSuffix = "") {
-	return sqlite.prepare(
-		`SELECT m.id, r.narrator_id, m.role, m.created_at,
+	return `SELECT m.id, r.narrator_id, m.role, m.created_at,
 		        n.title AS narrator_title, n.chapter_id,
 		        substr(m.content_text, 1, ?) AS snippet
 		 FROM narrator_messages m
@@ -74,24 +95,22 @@ function prepareSearchLikeStmt(whereSuffix = "") {
 		 JOIN narrators n ON n.id = r.narrator_id
 		 WHERE m.content_text LIKE ? AND r.narrator_id = ?${whereSuffix}
 		 ORDER BY m.created_at DESC
-		 LIMIT ?`,
-	);
+		 LIMIT ?`;
 }
-function searchLikeStmt(filter: TimeFilter): Statement {
-	if (filter.from && filter.to) {
-		_searchLikeWithRange ??= prepareSearchLikeStmt(" AND m.created_at >= ? AND m.created_at <= ?");
-		return _searchLikeWithRange;
+
+function searchStmt(kind: "fts" | "like", allNarrators: boolean, filter: TimeFilter): Statement {
+	const cacheKey = `${kind}:${allNarrators ? "global" : "scoped"}:${timeFilterKey(filter)}`;
+	let stmt = _searchStmtCache.get(cacheKey);
+	if (!stmt) {
+		const suffix = timeWhereSuffix(filter);
+		const sql =
+			kind === "fts"
+				? buildSearchFtsSql(allNarrators, suffix)
+				: buildSearchLikeSql(allNarrators, suffix);
+		stmt = sqlite.prepare(sql);
+		_searchStmtCache.set(cacheKey, stmt);
 	}
-	if (filter.from) {
-		_searchLikeWithFrom ??= prepareSearchLikeStmt(" AND m.created_at >= ?");
-		return _searchLikeWithFrom;
-	}
-	if (filter.to) {
-		_searchLikeWithTo ??= prepareSearchLikeStmt(" AND m.created_at <= ?");
-		return _searchLikeWithTo;
-	}
-	_searchLike ??= prepareSearchLikeStmt();
-	return _searchLike;
+	return stmt;
 }
 function getNarratorStmt() {
 	if (!_getNarrator) {
@@ -147,21 +166,37 @@ function getToolCallStmt() {
 	}
 	return _getToolCall;
 }
+function getToolCallAnyStmt() {
+	if (!_getToolCallAny) {
+		_getToolCallAny = sqlite.prepare(
+			`SELECT tc.tool_use_id, tc.tool_name, tc.status, tc.input_json, tc.output_json,
+			        tc.duration_ms, tc.error_message, tc.created_at,
+			        tc.narrator_id, n.title AS narrator_title
+			 FROM narrator_tool_calls tc
+			 JOIN narrators n ON n.id = tc.narrator_id
+			 WHERE tc.tool_use_id = ?`,
+		);
+	}
+	return _getToolCallAny;
+}
 
 export const recallTool: ToolDefinition = {
 	name: "Recall",
 	description:
-		"Search and browse the current narrator conversation in NarraFork. " +
+		"Search and browse narrator conversations stored in NarraFork. " +
 		"By default this tool is self-scoped: search, conversation reads, and tool-call reads " +
 		"can only access the narrator that is currently running this tool.\n\n" +
+		"Set `all_narrators: true` to search and read across ALL narrators in NarraFork " +
+		"instead of just the current one. This wider access requires user approval unless " +
+		'the narrator is in "allow all" (bypass) permission mode, where it is granted automatically.\n\n' +
 		"Three actions are available:\n" +
-		'- "search": Full-text search across the current narrator messages. Returns matching snippets with metadata. ' +
+		'- "search": Full-text search across narrator messages. Returns matching snippets with metadata. ' +
 		"Pass an array of strings to `query` to run multiple searches in one call. " +
 		"Optionally restrict by absolute time (`from`, `to`) or relative time (`time_range`, e.g. 24h, 7d).\n" +
-		'- "read_conversation": Read messages from the current narrator session. ' +
+		'- "read_conversation": Read messages from a narrator session. ' +
 		"Each assistant message includes a summary of its tool calls (tool name + key params). " +
 		"Optionally center around a specific message ID (e.g. from a search result).\n" +
-		'- "read_tool_call": Read the full input/output of a tool call in the current narrator by its toolUseId ' +
+		'- "read_tool_call": Read the full input/output of a tool call by its toolUseId ' +
 		"(obtained from read_conversation results).",
 	parameters: z.object({
 		action: z
@@ -178,7 +213,16 @@ export const recallTool: ToolDefinition = {
 			.string()
 			.optional()
 			.describe(
-				'Optional narrator ID for action "read_conversation"; if provided it must match the current narrator.',
+				'Optional narrator ID for action "read_conversation". When `all_narrators` is false ' +
+					"it must match the current narrator; when `all_narrators` is true it may be any narrator.",
+			),
+		all_narrators: z
+			.boolean()
+			.optional()
+			.describe(
+				"When true, search and read across ALL narrators instead of only the current one. " +
+					'Requires user approval unless the narrator is in "allow all" (bypass) permission mode. ' +
+					"Defaults to false (self-scoped).",
 			),
 		message_id: z
 			.string()
@@ -219,18 +263,31 @@ export const recallTool: ToolDefinition = {
 
 	async execute(args, ctx): Promise<ToolResult> {
 		const currentNarratorId = ctx.narratorId;
-		const { action, query, narrator_id, message_id, tool_call_id, limit, from, to, time_range } =
-			args as {
-				action: "search" | "read_conversation" | "read_tool_call";
-				query?: string | string[];
-				narrator_id?: string;
-				message_id?: string;
-				tool_call_id?: string;
-				limit?: number;
-				from?: string;
-				to?: string;
-				time_range?: string;
-			};
+		const {
+			action,
+			query,
+			narrator_id,
+			message_id,
+			tool_call_id,
+			limit,
+			from,
+			to,
+			time_range,
+			all_narrators,
+		} = args as {
+			action: "search" | "read_conversation" | "read_tool_call";
+			query?: string | string[];
+			narrator_id?: string;
+			message_id?: string;
+			tool_call_id?: string;
+			limit?: number;
+			from?: string;
+			to?: string;
+			time_range?: string;
+			all_narrators?: boolean;
+		};
+
+		const allNarrators = all_narrators === true;
 
 		if (action === "search") {
 			const timeFilterResult = buildTimeFilter({ from, to, timeRange: time_range });
@@ -238,7 +295,7 @@ export const recallTool: ToolDefinition = {
 			const timeFilter = timeFilterResult.filter;
 			const queries = Array.isArray(query) ? query : [query];
 			if (queries.length === 1) {
-				return handleSearch(queries[0], limit, timeFilter, currentNarratorId);
+				return handleSearch(queries[0], limit, timeFilter, currentNarratorId, allNarrators);
 			}
 			if (queries.length > MAX_BATCH_QUERIES) {
 				return {
@@ -252,7 +309,7 @@ export const recallTool: ToolDefinition = {
 			const queryList: string[] = [];
 			let errorCount = 0;
 			for (const q of queries) {
-				const result = handleSearch(q, limit, timeFilter, currentNarratorId);
+				const result = handleSearch(q, limit, timeFilter, currentNarratorId, allNarrators);
 				if (result.isError) errorCount++;
 				sections.push(result.output);
 				// Collect structured results from each sub-search
@@ -273,9 +330,9 @@ export const recallTool: ToolDefinition = {
 			};
 		}
 		if (action === "read_tool_call") {
-			return handleReadToolCall(tool_call_id, currentNarratorId);
+			return handleReadToolCall(tool_call_id, currentNarratorId, allNarrators);
 		}
-		return handleReadConversation(narrator_id, message_id, limit, currentNarratorId);
+		return handleReadConversation(narrator_id, message_id, limit, currentNarratorId, allNarrators);
 	},
 };
 
@@ -510,6 +567,7 @@ function handleSearch(
 	limit: number | undefined,
 	timeFilter: TimeFilter | undefined,
 	currentNarratorId: string,
+	allNarrators: boolean,
 ): ToolResult {
 	if (!query) {
 		return { output: 'Parameter "query" is required for action "search".', isError: true };
@@ -530,10 +588,16 @@ function handleSearch(
 	const timeParams = timeFilterParams(filter);
 	if (useFts) {
 		const ftsExpr = buildFtsQuery(safeQuery);
-		rows = searchFtsStmt(filter).all(ftsExpr, currentNarratorId, ...timeParams, cap);
+		const stmt = searchStmt("fts", allNarrators, filter);
+		rows = allNarrators
+			? stmt.all(ftsExpr, ...timeParams, cap)
+			: stmt.all(ftsExpr, currentNarratorId, ...timeParams, cap);
 	} else {
 		const like = `%${safeQuery}%`;
-		rows = searchLikeStmt(filter).all(SNIPPET_CHARS, like, currentNarratorId, ...timeParams, cap);
+		const stmt = searchStmt("like", allNarrators, filter);
+		rows = allNarrators
+			? stmt.all(SNIPPET_CHARS, like, ...timeParams, cap)
+			: stmt.all(SNIPPET_CHARS, like, currentNarratorId, ...timeParams, cap);
 	}
 
 	if (rows.length === 0) {
@@ -593,11 +657,14 @@ function handleReadConversation(
 	messageId: string | undefined,
 	limit: number | undefined,
 	currentNarratorId: string,
+	allNarrators: boolean,
 ): ToolResult {
 	const targetNarratorId = narratorId ?? currentNarratorId;
-	if (targetNarratorId !== currentNarratorId) {
+	if (!allNarrators && targetNarratorId !== currentNarratorId) {
 		return {
-			output: `Recall is scoped to the current narrator (${currentNarratorId}); narrator "${targetNarratorId}" is not accessible.`,
+			output:
+				`Recall is scoped to the current narrator (${currentNarratorId}); narrator "${targetNarratorId}" is not accessible. ` +
+				"Pass `all_narrators: true` to read other narrators (may require user approval).",
 			isError: true,
 		};
 	}
@@ -725,7 +792,11 @@ function handleReadConversation(
 // read_tool_call
 // ---------------------------------------------------------------------------
 
-function handleReadToolCall(toolCallId: string | undefined, currentNarratorId: string): ToolResult {
+function handleReadToolCall(
+	toolCallId: string | undefined,
+	currentNarratorId: string,
+	allNarrators: boolean,
+): ToolResult {
 	if (!toolCallId) {
 		return {
 			output: 'Parameter "tool_call_id" is required for action "read_tool_call".',
@@ -733,7 +804,11 @@ function handleReadToolCall(toolCallId: string | undefined, currentNarratorId: s
 		};
 	}
 
-	const tc = getToolCallStmt().get(toolCallId, currentNarratorId) as
+	const tc = (
+		allNarrators
+			? getToolCallAnyStmt().get(toolCallId)
+			: getToolCallStmt().get(toolCallId, currentNarratorId)
+	) as
 		| {
 				tool_use_id: string;
 				tool_name: string;
@@ -750,7 +825,10 @@ function handleReadToolCall(toolCallId: string | undefined, currentNarratorId: s
 
 	if (!tc) {
 		return {
-			output: `Tool call "${toolCallId}" not found in the current narrator.`,
+			output: allNarrators
+				? `Tool call "${toolCallId}" not found.`
+				: `Tool call "${toolCallId}" not found in the current narrator. ` +
+					"Pass `all_narrators: true` to look it up across all narrators (may require user approval).",
 			isError: true,
 		};
 	}

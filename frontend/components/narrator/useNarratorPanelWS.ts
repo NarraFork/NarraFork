@@ -2878,6 +2878,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPresenceUpdate: (v) => {
 				setViewers(v);
 			},
+			onStreamingReset: (parentToolUseId) => {
+				// A reasoning-only dead turn was discarded server-side. Drop any live
+				// top-level streaming blocks (e.g. the reasoning being shown) so the UI
+				// does not keep stale reasoning that will never be persisted.
+				// Subagent (parentToolUseId) streaming lives in the message cache and is
+				// handled by the chunks WS hook, so only clear top-level state here.
+				if (parentToolUseId) return;
+				const hadStreaming = streamingBlocksRef.current.length > 0;
+				streamingBlocksRef.current = [];
+				cancelPendingToolChunks(true, false);
+				if (hadStreaming) {
+					clearStreamingState();
+				}
+			},
 			onStreamingSnapshot: (snapshot) => {
 				// Restore ordered streaming blocks from server snapshot
 				if (snapshot.streamingBlocks.length > 0) {

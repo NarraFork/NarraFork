@@ -71,6 +71,7 @@ import { useRecentTabsWS } from "../../hooks/useRecentTabsWS";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
 import {
 	endNarratorDrag,
 	moveNarratorDrag,
@@ -258,22 +259,50 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			else return;
 
 			// Trigger client-side notifications for done(unread)/waiting
-			if (event.type === "status" && userPrefsRef.current) {
+			if (event.type === "status") {
+				// Reflection gates briefly flip a narrator to "waiting" while an
+				// automated check runs — those carry silent_notification/reflecting.
+				// They get a purple favicon dot (not a waiting/unread alert) that
+				// disappears on its own once the reflection ends.
+				const isReflecting =
+					event.substatus?.includes("reflecting") ||
+					event.substatus?.includes("silent_notification");
 				const shouldNotify =
-					!event.substatus?.includes("silent_notification") &&
-					(event.status === "waiting" || event.substatus?.includes("unread"));
-				if (shouldNotify) {
-					const tab = tabsRef.current.find(
-						(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
-					);
-					if (tab) {
-						triggerNotification(
-							narratorId,
-							tab.title,
-							event.status === "waiting" ? "waiting" : "unread",
-							userPrefsRef.current,
+					!isReflecting && (event.status === "waiting" || event.substatus?.includes("unread"));
+				if (isReflecting) {
+					// Purple "reflecting" favicon dot — lowest severity, auto-clears
+					// when the reflection resolves to a normal status below.
+					setFaviconAlert(narratorId, "reflecting");
+				} else if (shouldNotify) {
+					// Flag the browser tab favicon until the user reads the change.
+					// Independent of notification prefs so it works even when PWA /
+					// sound notifications are disabled.  The dot color reflects the
+					// kind of change: error (red) > waiting (yellow) > unread (green).
+					const alertKind = event.substatus?.includes("error")
+						? "error"
+						: event.status === "waiting"
+							? "waiting"
+							: "unread";
+					setFaviconAlert(narratorId, alertKind);
+
+					if (userPrefsRef.current) {
+						const tab = tabsRef.current.find(
+							(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 						);
+						if (tab) {
+							triggerNotification(
+								narratorId,
+								tab.title,
+								event.status === "waiting" ? "waiting" : "unread",
+								userPrefsRef.current,
+							);
+						}
 					}
+				} else if (event.status !== undefined) {
+					// Any other resolved status (working / idle / end of reflection)
+					// means this narrator no longer has a pending change — clear its
+					// favicon alert so the icon disappears once reflection ends.
+					clearFaviconAlert(narratorId);
 				}
 			}
 

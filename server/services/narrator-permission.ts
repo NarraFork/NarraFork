@@ -446,6 +446,13 @@ export function resolvePermissionDecision(
 	if (effectiveMode === "bypassPermissions") return "allow";
 	if (effectiveMode === "dontAsk") return "deny";
 
+	// Recall: self-scoped reads are always safe (read-only on own conversation).
+	// Cross-narrator reads (all_narrators) require approval outside bypass mode.
+	if (toolName === "Recall") {
+		if (input.all_narrators !== true) return "allow";
+		return "ask";
+	}
+
 	// Conclusion file: always allow Write/Edit targeting the designated conclusion file,
 	// regardless of permission mode. This handles the fallback case where the conclusion
 	// file lives outside cwd (e.g. ~/.narrafork/conclusions/) because cwd is read-only.

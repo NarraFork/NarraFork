@@ -295,6 +295,9 @@ const EMPTY_RESPONSE_MESSAGE =
 /** Max retries specifically for empty responses (request succeeded but no content). */
 const MAX_EMPTY_RESPONSE_RETRIES = 3;
 
+const REASONING_ONLY_MESSAGE =
+	"Provider returned only reasoning with no answer or tool call. Retrying.";
+
 function dedupeToolUsesInPlace(
 	toolUses: AgentToolUse[],
 	provider: string,
@@ -1679,6 +1682,11 @@ export async function* agentLoop(
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
 
+	// Retries for "reasoning-only" dead turns (model produced only reasoning, no text
+	// and no tool calls). Declared at function scope so the ceiling is shared across
+	// the turn boundary when a dead turn is recovered by injecting a "continue" turn.
+	let reasoningOnlyRetries = 0;
+
 	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
 
 	function applyHistoryReplacement(replacement: {
@@ -1783,7 +1791,7 @@ export async function* agentLoop(
 		}
 	}
 
-	while (turnIndex < maxTurns) {
+	turnLoop: while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
 			yield { type: "error", message: "Aborted" };
 			return;
@@ -2017,6 +2025,7 @@ export async function* agentLoop(
 		const resetRetryStateAfterModelSwitch = () => {
 			chatRetryCount = 0;
 			emptyResponseRetries = 0;
+			reasoningOnlyRetries = 0;
 			lastRetryErrorMessage = undefined;
 		};
 
@@ -3325,6 +3334,98 @@ export async function* agentLoop(
 			// stop here instead of proceeding with normal post-chat logic.
 			if (sawErrorEvent) {
 				return;
+			}
+
+			// ── Reasoning-only dead turn ──
+			// The model produced reasoning but no answer text, no tool calls, and no
+			// other meaningful output (web search / image generation). Such a turn must
+			// not be persisted — the trailing reasoning would become a dangling
+			// assistant message (content:null) that breaks history replay.
+			// We drop the reasoning (do NOT flush it to the DB), reset the frontend's
+			// streaming snapshot, and recover based on what the previous block was.
+			const hasMeaningfulOutput =
+				assistantText.trim().length > 0 ||
+				toolUses.length > 0 ||
+				!!collectCompletedWebSearches(webSearchAccum) ||
+				!!collectCompletedImageGenerations(imageGenAccum);
+			const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
+			if (!hasMeaningfulOutput && hasReasoning) {
+				// Drop accumulated reasoning so flushPartialContent won't persist it.
+				reasoningBlockMap.clear();
+				redactedThinkingBlocks.length = 0;
+				// Tell the frontend to discard the live streaming reasoning it is showing.
+				yield { type: "stream_reset" };
+				yield* finishRequest(REASONING_ONLY_MESSAGE);
+
+				// Shared retry ceiling with empty responses to avoid infinite loops.
+				if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES || config.signal.aborted) {
+					if (hasPendingRuntimeSettingsOverride()) {
+						const switchEvent = await applyPendingRuntimeSettings("retry");
+						if (switchEvent) {
+							yield switchEvent;
+							resetRetryStateAfterModelSwitch();
+							continue;
+						}
+					}
+					logger.warn("Provider returned only reasoning, retries exhausted", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+					});
+					const message = `${effectiveProvider}: ${REASONING_ONLY_MESSAGE}`;
+					yield { type: "invalid_state", reason: "empty_response", message };
+					return;
+				}
+				reasoningOnlyRetries++;
+				const delayMs = Math.min(
+					TRANSIENT_RETRY_BASE_MS * 2 ** (reasoningOnlyRetries - 1),
+					backoffCeil,
+				);
+				logger.warn("Provider returned only reasoning, recovering", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					attempt: reasoningOnlyRetries,
+					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+					isFirstTurn,
+					pendingToolResults: pendingToolResults.length,
+				});
+				yield {
+					type: "retrying",
+					message: REASONING_ONLY_MESSAGE,
+					attempt: reasoningOnlyRetries,
+					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+					delayMs,
+				};
+				await abortableSleep(delayMs, config.signal);
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+
+				// Recover based on what the previous (already-committed) block is.
+				// The dead turn itself is discarded entirely — nothing is pushed to
+				// history, so no content:null assistant message can be created.
+				//
+				// If the request that produced the dead turn still has pending input
+				// that has NOT been committed to history yet — i.e. the first-turn user
+				// message, a mid-loop user nudge (non-empty `content`), or tool results
+				// (`pendingToolResults`) — then the previous block is a user/tool block.
+				// Re-send the exact same request by retrying the chat() call in place
+				// (same turn: history, content and toolResults are all unchanged).
+				if (isFirstTurn || content.length > 0 || pendingToolResults.length > 0) {
+					continue;
+				}
+
+				// Otherwise the previous committed block is an assistant message and
+				// there is no pending input to re-send. Open a fresh turn that nudges
+				// the model to continue, so the loop can make progress.
+				yield { type: "turn_complete", turnIndex };
+				turnIndex++;
+				nextTurnContent = getToolMessage("userContinue", locale);
+				continue turnLoop;
 			}
 
 			// Chat call succeeded — break out of the retry loop
