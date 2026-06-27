@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { isRetryableError, isRetryableInvalidStateReason } from "../error-handling";
+import {
+	isContextWindowExceededError,
+	isRetryableError,
+	isRetryableInvalidStateReason,
+} from "../error-handling";
 
 describe("agent error handling", () => {
 	test("treats truncated Responses API streams as retryable", () => {
@@ -133,5 +137,21 @@ describe("agent error handling", () => {
 				{ id: "r1", keyword: "shard warming", enabled: false },
 			]),
 		).toBe(false);
+	});
+
+	test("classifies OpenAI 400 input-token-count errors as context overflow", () => {
+		expect(
+			isContextWindowExceededError(
+				new Error(
+					"OpenAI API error 400: The input token count exceeds the maximum number of tokens allowed (262144).",
+				),
+			),
+		).toBe(true);
+		expect(
+			isContextWindowExceededError({
+				status: 400,
+				message: "The input token count exceeds the maximum number of tokens allowed (262144).",
+			}),
+		).toBe(true);
 	});
 });

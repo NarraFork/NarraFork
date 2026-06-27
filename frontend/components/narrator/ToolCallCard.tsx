@@ -5481,6 +5481,23 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onToggle={handleToggle}
 				narratorId={narratorId}
 			/>
+				<Tooltip
+					multiline
+					w={260}
+					label={tNarrator("leakedToolCaptureTooltip")}
+					events={{ hover: true, focus: true, touch: true }}
+				>
+					<Badge
+						size="xs"
+						variant="light"
+						color="grape"
+						leftSection={<IconInfoCircle size={11} />}
+						style={{ marginInlineStart: 4, marginTop: 2, cursor: "help" }}
+					>
+						{tNarrator("leakedToolCaptureBadge")}
+					</Badge>
+				</Tooltip>
+			)}
 			{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />

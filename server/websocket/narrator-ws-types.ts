@@ -406,6 +406,20 @@ export type NarratorServerMessage =
 			maxRetries?: number;
 			delayMs?: number;
 	  }
+	| {
+			/**
+			 * uses it to mark stream-captured tool calls and to prompt downloading the raw SSE
+			 * dump when capture failed. `apiRequestId` points at the persisted api_requests row
+			 * for the leaked-tool-dump download endpoint.
+			 */
+			type: "leaked_tool_call_notice";
+			narratorId: string;
+			phase: "stream_captured" | "recovered" | "unrecovered";
+			apiRequestId: string;
+			toolUseIds?: string[];
+			toolNames?: string[];
+			snippet?: string;
+	  }
 	| { type: "context_length_exceeded"; narratorId: string }
 	| { type: "full_reload"; narratorId: string }
 	| {

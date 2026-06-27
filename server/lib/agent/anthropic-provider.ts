@@ -5,10 +5,11 @@ import { logger } from "../logger";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
-import { getModelContextWindow, parseModelId, settings } from "../settings";
+import { getModelContextWindow, getSettingsRevision, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
 import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
+import { isConnectionClosedError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
 	ChatParams,
@@ -71,6 +72,50 @@ const CACHE_CONTROL_GLOBAL = {
 
 /** Default Anthropic API base URL (includes /v1 path). */
 const DEFAULT_BASE_URL = "https://api.anthropic.com/v1";
+
+/**
+ * Process-wide cache of base URLs that have been resolved to need a `/v1`
+ * suffix. Keyed by the normalized (trailing-slash-stripped) base URL.
+ *
+ * AnthropicProvider instances are created fresh per chat turn (see
+ * createProviderByName), so an instance-level cache would be lost between
+ * messages — every message in a long session would pay the fallback cost
+ * (e.g. a multi-second connection RST against the wrong path) again. This
+ * module-level cache ensures each base URL only pays that cost once per
+ * process. The stored settings revision invalidates the entry if the user
+ * later edits provider settings.
+ */
+const v1FallbackCache = new Map<string, { revision: number }>();
+
+/** Debounce window for the base-URL fix suggestion broadcast (per base URL). */
+const BASEURL_FIX_BROADCAST_DEBOUNCE_MS = 30_000;
+/** Last broadcast timestamp keyed by normalized base URL. */
+const lastBaseUrlFixBroadcast = new Map<string, number>();
+
+/**
+ * Broadcast a `provider_baseurl_fix_suggested` event to all WS clients
+ * (debounced per base URL). Fired whenever a `/v1` fallback succeeds for a
+ * base URL that lacks `/v1`, so the frontend can offer to persist the fix.
+ * Lazy-imports narrator-ws to avoid a circular dependency.
+ */
+async function broadcastBaseUrlFixSuggested(info: {
+	providerId: string;
+	providerPrefix: string;
+	providerName: string;
+	currentBaseUrl: string;
+	suggestedBaseUrl: string;
+}): Promise<void> {
+	const now = Date.now();
+	const last = lastBaseUrlFixBroadcast.get(info.currentBaseUrl) ?? 0;
+	if (now - last < BASEURL_FIX_BROADCAST_DEBOUNCE_MS) return;
+	lastBaseUrlFixBroadcast.set(info.currentBaseUrl, now);
+	try {
+		const { broadcastToAll } = await import("../../websocket/narrator-ws");
+		broadcastToAll({ type: "provider_baseurl_fix_suggested", ...info });
+	} catch {
+		// WS module not loaded yet — ignore
+	}
+}
 
 /**
  * Stable device ID — generated once per process lifetime.
@@ -620,7 +665,17 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	private getBaseUrl(): string {
 		if (this.resolvedBaseUrl) return this.resolvedBaseUrl;
-		return (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+		const normalized = (this.config.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+		// Honor a prior process-wide /v1 resolution for this base URL (unless the
+		// user changed settings since, which bumps the revision).
+		if (!AnthropicProvider.hasV1Suffix(normalized)) {
+			const cached = v1FallbackCache.get(normalized);
+			if (cached && cached.revision === getSettingsRevision()) {
+				this.resolvedBaseUrl = `${normalized}/v1`;
+				return this.resolvedBaseUrl;
+			}
+		}
+		return normalized;
 	}
 
 	/** Whether a base URL already ends with /v1 (case-insensitive). */
@@ -629,9 +684,40 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	/**
+	 * Record a successful `/v1` fallback: cache it both on this instance and
+	 * process-wide, and suggest the user persist the fix.
+	 *
+	 * @param originalBaseUrl - The normalized base URL that lacked `/v1`.
+	 * @param retryBase - The working base URL (originalBaseUrl + "/v1").
+	 */
+	private recordV1Fallback(originalBaseUrl: string, retryBase: string): void {
+		this.resolvedBaseUrl = retryBase;
+		v1FallbackCache.set(originalBaseUrl, { revision: getSettingsRevision() });
+		const suggestedBaseUrl = retryBase;
+		void broadcastBaseUrlFixSuggested({
+			providerId: this.config.id,
+			providerPrefix: this.config.prefix,
+			providerName: this.config.name || this.config.prefix,
+			currentBaseUrl: this.config.baseUrl || originalBaseUrl,
+			suggestedBaseUrl,
+		});
+	}
+
+	/**
 	 * Fetch with automatic /v1 suffix fallback.
-	 * If the initial request fails and the base URL doesn't already end with /v1,
-	 * retries with /v1 appended. Caches the successful base URL for future calls.
+	 *
+	 * Triggers the `/v1` retry in two cases when the base URL lacks `/v1`:
+	 *   1. The initial request returns a non-ok HTTP response (e.g. 404). This
+	 *      is what small requests hit — the gateway answers quickly.
+	 *   2. The initial request THROWS a connection-closed error (ECONNRESET /
+	 *      "socket connection was closed unexpectedly"). Large request bodies on
+	 *      a wrong path can make the gateway RST the connection before sending
+	 *      any response, so case 1 never fires. Without this branch the error
+	 *      propagates as a retryable error and the agent loop retries forever
+	 *      against the same wrong path (observed as 0% success on long sessions).
+	 *
+	 * On a successful fallback the resolved base URL is cached (instance- and
+	 * process-wide) and a fix suggestion is broadcast to clients.
 	 */
 	private async fetchWithV1Fallback(
 		path: string,
@@ -641,9 +727,30 @@ export class AnthropicProvider implements ProviderAdapter {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
 		const doFetch = useProxy ? this.pfetch.bind(this) : fetch;
-		const response = await doFetch(url, init);
+		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
-		if (!response.ok && !AnthropicProvider.hasV1Suffix(baseUrl)) {
+		let response: Response;
+		try {
+			response = await doFetch(url, init);
+		} catch (err) {
+			// Connection reset before any response — retry with /v1 if possible.
+			if (canFallback && isConnectionClosedError(err)) {
+				const retryBase = `${baseUrl}/v1`;
+				logger.debug("Anthropic request connection closed, retrying with /v1 suffix", {
+					originalUrl: url,
+					retryUrl: `${retryBase}${path}`,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				const retryResponse = await doFetch(`${retryBase}${path}`, init);
+				if (retryResponse.ok) {
+					this.recordV1Fallback(baseUrl, retryBase);
+				}
+				return retryResponse;
+			}
+			throw err;
+		}
+
+		if (!response.ok && canFallback) {
 			const retryBase = `${baseUrl}/v1`;
 			const retryUrl = `${retryBase}${path}`;
 			logger.debug("Anthropic request failed, retrying with /v1 suffix", {
@@ -655,7 +762,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			await response.text().catch(() => {});
 			const retryResponse = await doFetch(retryUrl, init);
 			if (retryResponse.ok) {
-				this.resolvedBaseUrl = retryBase;
+				this.recordV1Fallback(baseUrl, retryBase);
 			}
 			return retryResponse;
 		}

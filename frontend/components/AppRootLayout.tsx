@@ -61,6 +61,7 @@ import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
+import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
@@ -820,6 +821,7 @@ function AuthenticatedLayout() {
 			)}
 
 			<SummaryModelPickerHost />
+			<ProviderBaseUrlFixHost />
 
 			{createNarratorOpened && (
 				<Suspense fallback={null}>

@@ -641,6 +641,20 @@ class NarratorWSManager {
 					);
 					return;
 				}
+				if (data.type === "provider_baseurl_fix_suggested") {
+					window.dispatchEvent(
+						new CustomEvent("narrafork:provider-baseurl-fix", {
+							detail: {
+								providerId: data.providerId,
+								providerPrefix: data.providerPrefix,
+								providerName: data.providerName,
+								currentBaseUrl: data.currentBaseUrl,
+								suggestedBaseUrl: data.suggestedBaseUrl,
+							},
+						}),
+					);
+					return;
+				}
 				this._dispatch(data);
 			} catch {
 				if (import.meta.env.DEV) {

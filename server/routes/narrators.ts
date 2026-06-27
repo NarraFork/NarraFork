@@ -21,6 +21,7 @@ import {
 import { Hono } from "hono";
 import { db } from "../db";
 import {
+	apiRequests,
 	chapters,
 	containerInstances,
 	narratorBlacklistCmds,
@@ -569,6 +570,59 @@ narratorRoutes.get("/:id/groups", async (c) => {
 	await narratorService.getById(id); // 404 if missing
 	const groups = await chatGroupService.listGroupsForNarrator(id);
 	return c.json({ groups });
+});
+
+// Download the raw SSE request/response dump for a leaked-tool-call diagnostic.
+// Narrator-scoped so non-admin users participating in debugging can fetch the data,
+// with an ownership check preventing access to other narrators' requests.
+narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
+	const id = c.req.param("id");
+	const requestId = c.req.param("requestId");
+	await narratorService.getById(id); // 404 if narrator missing
+
+	const [row] = await db
+		.select({
+			id: apiRequests.id,
+			narratorId: apiRequests.narratorId,
+			provider: apiRequests.provider,
+			model: apiRequests.model,
+			createdAt: apiRequests.createdAt,
+			errorMessage: apiRequests.errorMessage,
+			rawDumpJson: apiRequests.rawDumpJson,
+		})
+		.from(apiRequests)
+		.where(eq(apiRequests.id, requestId));
+
+	if (!row || row.narratorId !== id) {
+		// Treat a mismatched owner the same as missing to avoid leaking existence.
+		return c.json({ error: "Request dump not found for this narrator" }, 404);
+	}
+	if (!row.rawDumpJson) {
+		return c.json(
+			{
+				error:
+					"No raw dump stored for this request. Raw SSE data is only retained when a leak is detected or request dumping is enabled.",
+			},
+			404,
+		);
+	}
+
+	let rawDump: unknown;
+	try {
+		rawDump = JSON.parse(row.rawDumpJson);
+	} catch {
+		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
+	}
+
+	return c.json({
+		id: row.id,
+		narratorId: row.narratorId,
+		provider: row.provider,
+		model: row.model,
+		createdAt: row.createdAt,
+		errorMessage: row.errorMessage,
+		rawDump,
+	});
 });
 
 function draftResponse(traits: unknown) {

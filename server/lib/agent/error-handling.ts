@@ -91,6 +91,9 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	"input is too long",
 	"prompt is too long",
 	"too many tokens",
+	"exceeds the maximum number of tokens",
+	"input token count exceeds",
+	"maximum number of tokens allowed",
 ];
 
 /** HTTP status codes that indicate transient server-side issues without extra message checks. */
@@ -118,6 +121,40 @@ export function extractErrorMessage(err: unknown): string {
 		if (typeof obj.error === "string" && obj.error) return obj.error;
 	}
 	return String(err);
+}
+
+/** Error codes / message fragments that indicate the TCP connection was closed/reset mid-request. */
+const CONNECTION_CLOSED_CODES = new Set([
+	"ECONNRESET",
+	"EPIPE",
+	"CONNECTIONRESET",
+	"CONNECTIONABORTED",
+]);
+const CONNECTION_CLOSED_PATTERNS = [
+	"socket connection was closed unexpectedly",
+	"connection was closed unexpectedly",
+	"socket hang up",
+	"connection reset",
+	"econnreset",
+];
+
+/**
+ * Detect whether an error represents the connection being closed/reset before a
+ * response was received (as opposed to an HTTP error response). Used to trigger
+ * the `/v1` base-URL fallback: when a gateway RSTs a large request on a wrong
+ * path, `fetch()` throws instead of returning a non-ok response, so the normal
+ * status-based fallback never runs.
+ */
+export function isConnectionClosedError(err: unknown): boolean {
+	if (err && typeof err === "object") {
+		const code = (err as { code?: unknown }).code;
+		if (typeof code === "string" && CONNECTION_CLOSED_CODES.has(code.toUpperCase())) {
+			return true;
+		}
+	}
+	const message = extractErrorMessage(err).toLowerCase();
+	if (!message) return false;
+	return CONNECTION_CLOSED_PATTERNS.some((p) => message.includes(p));
 }
 
 function numericStatus(value: unknown): number | undefined {

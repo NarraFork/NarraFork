@@ -113,6 +113,20 @@ export interface EventHandlerContext {
 	apiRequestsMap?: Map<string, ApiRequestHandle>;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
+	/**
+	 * Leaked XML tool-call diagnostics buffered by loop requestId until the matching
+	 * api_request_end persists the row and yields the real api_requests.id, which the
+	 * frontend needs to download the raw SSE dump.
+	 */
+	pendingLeakedToolCalls?: Map<
+		string,
+		Array<{
+			phase: "stream_captured" | "recovered" | "unrecovered";
+			toolUseIds?: string[];
+			toolNames?: string[];
+			snippet?: string;
+		}>
+	>;
 }
 
 /**
@@ -1802,6 +1816,22 @@ export async function processEvent(
 			return null;
 		}
 
+		case "leaked_tool_call": {
+			// Buffer the diagnostic keyed by loop requestId. It is broadcast (with the real
+			// persisted api_requests.id) once api_request_end records the row, so the frontend
+			// download endpoint can resolve the raw SSE dump.
+			if (!ctx.pendingLeakedToolCalls) ctx.pendingLeakedToolCalls = new Map();
+			const list = ctx.pendingLeakedToolCalls.get(event.requestId) ?? [];
+			list.push({
+				phase: event.phase,
+				toolUseIds: event.toolUseIds,
+				toolNames: event.toolNames,
+				snippet: event.snippet,
+			});
+			ctx.pendingLeakedToolCalls.set(event.requestId, list);
+			return null;
+		}
+
 		case "api_request_end": {
 			// Create API request record in database
 			const requestInfo = ctx.apiRequestsMap?.get(event.requestId);
@@ -1833,10 +1863,34 @@ export async function processEvent(
 					meterUnit: event.meterUnit ?? null,
 					errorMessage: event.errorMessage ?? null,
 					rawDump: event.rawDump,
+					// Leaked-tool detection forces the raw SSE dump to persist so it stays
+					// downloadable even when error-only dumping is enabled. We intentionally do
+					// NOT synthesize an errorMessage here: that would mark a successful request
+					// as errored and skip assistant-message binding. The notice below carries
+					// the apiRequestId for the download endpoint instead.
+					forceDumpPersist: event.forceDumpPersist,
 				});
 				if (!event.errorMessage) {
 					if (!ctx.pendingApiRequestIds) ctx.pendingApiRequestIds = [];
 					ctx.pendingApiRequestIds.push(apiRequestId);
+				}
+
+				// Flush buffered leaked-tool diagnostics now that the persisted api_requests.id
+				// is known. The notice is transient (not persisted) — the frontend uses it to
+				// mark stream-captured tool calls or prompt downloading the raw dump.
+				const leaked = ctx.pendingLeakedToolCalls?.get(event.requestId);
+				if (leaked?.length) {
+					for (const signal of leaked) {
+						dualBroadcast(ctx, {
+							type: "leaked_tool_call_notice",
+							narratorId: broadcastTargetId,
+							phase: signal.phase,
+							apiRequestId,
+							toolUseIds: signal.toolUseIds,
+							toolNames: signal.toolNames,
+							snippet: signal.snippet,
+						});
+					}
 				}
 			} catch (error) {
 				logger.error("Failed to create API request record", {
@@ -1848,6 +1902,7 @@ export async function processEvent(
 			} finally {
 				// Clean up in-progress request info after persistence attempt.
 				ctx.apiRequestsMap?.delete(event.requestId);
+				ctx.pendingLeakedToolCalls?.delete(event.requestId);
 			}
 			return null;
 		}

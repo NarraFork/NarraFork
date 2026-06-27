@@ -43,6 +43,12 @@ export interface ApiRequestFinishOptions {
 	meterUnit?: string | null;
 	rawDump?: unknown;
 	errorMessage?: string | null;
+	/**
+	 * Force-persist the raw dump regardless of the `requestDumpErrorsOnly` setting.
+	 * Used when leaked XML tool calls are detected so the raw SSE data is always
+	 * downloadable for debugging, even when error-only dumping is enabled.
+	 */
+	forceDumpPersist?: boolean;
 }
 
 export function startApiRequest(options: ApiRequestStartOptions): ApiRequestHandle {
@@ -60,6 +66,8 @@ function hasErrorMessage(errorMessage: string | null | undefined): boolean {
 
 function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
 	if (options.rawDump == null) return false;
+	// Leak detection forces persistence ahead of the errors-only gate.
+	if (options.forceDumpPersist) return true;
 	if (!settings.agent.requestDumpErrorsOnly) return true;
 	return hasErrorMessage(options.errorMessage);
 }

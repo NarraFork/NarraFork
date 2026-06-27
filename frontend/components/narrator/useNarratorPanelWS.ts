@@ -76,6 +76,14 @@ export interface PaymentRequiredInfo {
 	resumeAction: "retry" | "continue";
 }
 
+/** Leaked XML tool-call diagnostic surfaced for the recovered/unrecovered dialog. */
+export interface LeakedToolEvent {
+	phase: "recovered" | "unrecovered";
+	apiRequestId: string;
+	toolNames?: string[];
+	snippet?: string;
+}
+
 function isPageVisible(): boolean {
 	return typeof document === "undefined" || document.visibilityState === "visible";
 }
@@ -203,6 +211,8 @@ export interface UseNarratorPanelWSReturn {
 	retryInfo: RetryInfo | null;
 	paymentRequired: PaymentRequiredInfo | null;
 	setPaymentRequired: React.Dispatch<React.SetStateAction<PaymentRequiredInfo | null>>;
+	leakedToolEvent: LeakedToolEvent | null;
+	setLeakedToolEvent: React.Dispatch<React.SetStateAction<LeakedToolEvent | null>>;
 	// Todos
 	currentTodos: TodoItem[] | null;
 	todosToolUseId: string | null;
@@ -681,6 +691,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
+	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
 	const retryInfoRef = useRef<RetryInfo | null>(null);
 	const clearRetryIfActive = useCallback(() => {
 		if (retryInfoRef.current) {
@@ -2680,6 +2691,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 10000,
 				});
 			},
+			onLeakedToolCall: (info) => {
+				// the recovered/unrecovered phases need the download dialog.
+				if (info.phase === "stream_captured") return;
+				setLeakedToolEvent({
+					phase: info.phase,
+					apiRequestId: info.apiRequestId,
+					toolNames: info.toolNames,
+					snippet: info.snippet,
+				});
+			},
 			onModelChanged: (model) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, model } : old,
@@ -3161,6 +3182,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			retryInfo,
 			paymentRequired,
 			setPaymentRequired,
+			leakedToolEvent,
+			setLeakedToolEvent,
 			currentTodos,
 			todosToolUseId,
 			expandedToolUseId,
@@ -3201,6 +3224,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			browserVisualChange,
 			retryInfo,
 			paymentRequired,
+			leakedToolEvent,
 			currentTodos,
 			todosToolUseId,
 			expandedToolUseId,

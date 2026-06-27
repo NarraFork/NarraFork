@@ -16,6 +16,11 @@ export interface ApiRequestDump {
 	};
 }
 
+/** Default byte cap for a persisted raw dump's response body / events (1 MB). */
+export const DEFAULT_DUMP_MAX_BYTES = 1024 * 1024;
+/** Hard cap on the number of stored SSE events in a raw dump. */
+export const MAX_DUMP_EVENT_COUNT = 2000;
+
 const SENSITIVE_HEADER_PATTERNS = [
 	/^authorization$/i,
 	/^x-api-key$/i,
@@ -106,6 +111,39 @@ export class ApiRequestDumpCollector {
 
 	setResponseEvents(events: unknown[]): void {
 		this.setResponseMeta({ events: toJsonSafe(events) });
+	}
+
+	/**
+	 * Store response events with a hard cap on both element count and serialized byte
+	 * size, so force-persisting a dump on leak detection cannot buffer an unbounded SSE
+	 * stream (see CLAUDE.md backend memory rules). When the cap is exceeded, the head
+	 * elements are kept and a truncation marker is appended.
+	 */
+	setResponseEventsWithLimit(events: unknown[], maxCount: number, maxBytes: number): void {
+		const safe = toJsonSafe(events);
+		if (!Array.isArray(safe)) {
+			this.setResponseMeta({ events: safe });
+			return;
+		}
+
+		let kept = maxCount >= 0 && safe.length > maxCount ? safe.slice(0, maxCount) : safe;
+		let droppedForCount = safe.length - kept.length;
+
+		// Enforce byte cap by trimming from the tail until under the limit.
+		if (maxBytes >= 0) {
+			while (kept.length > 0 && JSON.stringify(kept).length > maxBytes) {
+				kept = kept.slice(0, -1);
+				droppedForCount++;
+			}
+		}
+
+		if (droppedForCount > 0) {
+			this.setResponseMeta({
+				events: [...kept, { _truncated: droppedForCount }],
+			});
+			return;
+		}
+		this.setResponseMeta({ events: kept });
 	}
 
 	setResponseError(error: unknown): void {

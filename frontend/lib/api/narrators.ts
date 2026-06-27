@@ -869,4 +869,18 @@ export const narratorsApi = {
 			if (!res.ok) throw new Error(`interact failed: ${res.status}`);
 			return res.blob();
 		}),
+	/**
+	 * Fetch the raw SSE request/response dump for a leaked-tool-call diagnostic.
+	 * Narrator-scoped so non-admin users can download the data while debugging.
+	 */
+	getLeakedToolDump: (narratorId: string, apiRequestId: string) =>
+		request<{
+			id: string;
+			narratorId: string;
+			provider: string;
+			model: string;
+			createdAt: string;
+			errorMessage: string | null;
+			rawDump: unknown;
+		}>(`/narrators/${narratorId}/leaked-tool-dump/${apiRequestId}`),
 };

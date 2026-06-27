@@ -229,6 +229,24 @@ export type AgentEvent =
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "stream_reset" }
+	| {
+			/**
+			 * - `stream_captured`: the streaming accumulator lifted a `<invoke>` block out of
+			 * - `recovered`: the streaming layer missed it, but the post-turn stateless safety
+			 *   net extracted a complete block from the finished assistant text.
+			 * - `unrecovered`: leaked `<invoke` text remained that could not be parsed into a
+			 *   tool call (a closing tag may be missing or the block was malformed).
+			 * `requestId` is the loop-level request id; the event handler maps it to the
+			 * persisted api_requests.id before broadcasting a notice to the frontend.
+			 */
+			type: "leaked_tool_call";
+			phase: "stream_captured" | "recovered" | "unrecovered";
+			requestId: string;
+			toolUseIds?: string[];
+			toolNames?: string[];
+			/** For `unrecovered`: a truncated snippet of the leaked `<invoke` text. */
+			snippet?: string;
+	  }
 	| { type: "error"; message: string }
 	| { type: "retryable_error"; message: string; code?: string; bypassRetryLimit?: boolean }
 	| {
@@ -330,6 +348,8 @@ export type AgentEvent =
 			meterUnit?: string;
 			rawDump?: unknown;
 			errorMessage?: string;
+			/** Force raw-dump persistence regardless of the errors-only setting. */
+			forceDumpPersist?: boolean;
 	  }
 	| { type: "silent_disconnect" }
 	| { type: "done" };

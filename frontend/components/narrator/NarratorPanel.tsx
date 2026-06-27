@@ -189,6 +189,7 @@ import {
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
+import { LeakedToolCallModal } from "./LeakedToolCallModal";
 import { getMentionQuery, type MentionCandidate, MentionPopover } from "./MentionPopover";
 import {
 	COMPACTING_MARKER_ATTR,
@@ -3241,6 +3242,8 @@ export function NarratorPanel({
 		retryInfo,
 		paymentRequired,
 		setPaymentRequired,
+		leakedToolEvent,
+		setLeakedToolEvent,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,
@@ -7033,6 +7036,12 @@ export function NarratorPanel({
 							</Group>
 						)}
 					</Group>
+
+					<LeakedToolCallModal
+						narratorId={narratorId}
+						event={leakedToolEvent}
+						onClose={() => setLeakedToolEvent(null)}
+					/>
 
 					<Modal
 						opened={archiveConfirmOpened}
