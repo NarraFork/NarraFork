@@ -3455,9 +3455,14 @@ export async function* agentLoop(
 		// Emit API request end event
 		yield* finishRequest();
 
-		// Reset retry counter after a successful turn so the next turn's
+		// Reset retry counters after a successful turn so the next turn's
 		// backoff starts from the base delay instead of the ceiling.
+		// reasoningOnlyRetries lives at function scope (so the ceiling is shared
+		// across the turn boundary while recovering a single dead turn via a
+		// "continue" nudge); reset it here so non-consecutive dead turns spread
+		// across a long session don't accumulate toward the fatal ceiling.
 		chatRetryCount = 0;
+		reasoningOnlyRetries = 0;
 
 		// ── Fallback: estimate context usage when the provider reported nothing ──
 		if (!receivedUsage) {
