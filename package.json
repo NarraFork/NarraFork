@@ -65,7 +65,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.12",
-		"@tanstack/router-plugin": "^1.167.22",
+		"@tanstack/router-plugin": "1.168.18",
 		"@types/archiver": "^7.0.0",
 		"@types/bun": "^1.3.13",
 		"@types/dagre": "^0.7.54",

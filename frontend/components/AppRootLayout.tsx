@@ -24,6 +24,7 @@ import {
 	IconBook2,
 	IconClearAll,
 	IconDashboard,
+	IconDatabase,
 	IconFolders,
 	IconLogout,
 	IconMessageChatbot,
@@ -734,6 +735,15 @@ function AuthenticatedLayout() {
 							to="/learn"
 							label={navCollapsed ? undefined : t("learning")}
 							leftSection={<IconBook2 size={16} />}
+							onClick={closeNavForLink}
+						/>
+					</Tooltip>
+					<Tooltip label={t("knowledge")} position="right" disabled={!navCollapsed}>
+						<NavLink
+							component={Link}
+							to="/knowledge"
+							label={navCollapsed ? undefined : t("knowledge")}
+							leftSection={<IconDatabase size={16} />}
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>

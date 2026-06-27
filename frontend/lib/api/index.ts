@@ -3,6 +3,7 @@ import { chaptersApi } from "./chapters";
 import { chatGroupsApi } from "./chat-groups";
 import { BASE } from "./client";
 import { gitApi } from "./git";
+import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
 import { projectsApi } from "./projects";
@@ -23,6 +24,7 @@ export const api = {
 	...gitApi,
 	...miscApi,
 	...chatGroupsApi,
+	...knowledgeApi,
 };
 
 export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";
@@ -34,6 +36,41 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
+export type {
+	CreateEntryInput,
+	CreateEntryLinkInput,
+	UpdateEntryAclInput,
+} from "./knowledge";
+export type {
+	FindingSeverity,
+	KnowledgeCollection,
+	KnowledgeDraft,
+	KnowledgeDraftDiff,
+	KnowledgeDraftStatus,
+	KnowledgeEntry,
+	KnowledgeEntryLink,
+	KnowledgeFinding,
+	KnowledgeFormat,
+	KnowledgeGrant,
+	KnowledgeGrantType,
+	KnowledgeGraph,
+	KnowledgeGraphEdge,
+	KnowledgeGraphNode,
+	KnowledgeLevel,
+	KnowledgeLinkDirection,
+	KnowledgeLinkEndpoint,
+	KnowledgeLinkType,
+	KnowledgeReviewResult,
+	KnowledgeRevision,
+	KnowledgeSearchResult,
+	KnowledgeSubmission,
+	KnowledgeSubmissionDetail,
+	KnowledgeSubmissionStatus,
+	KnowledgeTag,
+	KnowledgeTagType,
+	KnowledgeUserAcl,
+	KnowledgeVerdict,
+} from "./knowledge-types";
 export {
 	scanStorageStream,
 } from "./streams";

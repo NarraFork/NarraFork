@@ -28,6 +28,15 @@ NarraFork 借鉴 Fulcrum 的以下架构模式：
 
 NarraFork 面向小团队私有部署。所有用户共享项目和 Chapter 数据，无用户级数据隔离。认证系统用于身份识别和管理权限，而非数据权限分割。
 
+### 1.4 扩展能力文档
+
+以下为本起始文档之外、独立演进的通用平台能力设计（均为领域无关的平台能力，不绑定具体业务）：
+
+- `docs/KNOWLEDGE_BASE.md` — 知识库：结构化、可检索、可引用、可版本化、可授权的知识资源（DB 表 + FTS5 + 写时复制版本 + ACL + 关键词注入），与现有 skills 互补。
+- `docs/OPEN_API.md` — 开放 API：API Token 鉴权 + 程序化叙述者（带 `origin`/自定义 `metadata`）+ 知识库读写，供 NarraFork 之外的程序驱动。
+
+> 这两项能力适用于广泛场景；其首批消费方之一是机器人远程诊断系统（见 `robot_assistant_next/docs/remote_diagnosis/`），但设计本身不含任何业务语义。
+
 ---
 
 ## 2. 技术栈

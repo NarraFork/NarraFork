@@ -18,6 +18,7 @@ import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflection";
 import { grepTool } from "./grep";
 import { groupControlTool } from "./group-control";
+import { knowledgeDraftTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { endPipelineTool, startPipelineTool } from "./pipeline";
@@ -87,6 +88,9 @@ const coreProvider: ToolProvider = {
 			teamStatusTool,
 			askUserQuestionTool,
 			skillTool,
+			knowledgeSearchTool,
+			knowledgeReadTool,
+			knowledgeDraftTool,
 			dangerConfirmTool,
 			dangerCancelTool,
 			exitPlanConfirmTool,

@@ -28,6 +28,7 @@ export const namespaces = [
 	"settings",
 	"terminal",
 	"routines",
+	"knowledge",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 
@@ -72,6 +73,9 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	if (path === "/settings/terminals") {
 		return ["common", "nav", "settings", "terminal"];
 	}
+	if (path === "/settings/users") {
+		return ["common", "nav", "settings", "knowledge"];
+	}
 	if (path === "/settings" || path.startsWith("/settings/")) {
 		return ["common", "nav", "settings"];
 	}
@@ -79,6 +83,9 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 		return ["common", "nav", "routines", "settings"];
 	}
 	if (path === "/learn") return ["common", "nav", "learning"];
+	if (path === "/knowledge" || path.startsWith("/knowledge/")) {
+		return ["common", "nav", "knowledge"];
+	}
 	if (path === "/search") return ["common", "nav", "search"];
 
 	return ["common", "nav"];

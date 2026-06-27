@@ -59,6 +59,30 @@ export {
 } from "./git";
 export { createHookSchema, hookEventEnum, hookTypeEnum, updateHookSchema } from "./hooks";
 export {
+	addKnowledgeRevisionSchema,
+	createKnowledgeCollectionSchema,
+	createKnowledgeDraftSchema,
+	createKnowledgeEntrySchema,
+	createKnowledgeGrantSchema,
+	createKnowledgeLevelSchema,
+	createKnowledgeLinkSchema,
+	createKnowledgeTagSchema,
+	createKnowledgeTagTypeSchema,
+	knowledgeGraphQuerySchema,
+	knowledgeSearchQuerySchema,
+	listKnowledgeLinksQuerySchema,
+	resolveKnowledgeConflictSchema,
+	reviewKnowledgeSubmissionSchema,
+	setUserAclSchema,
+	submitKnowledgeDraftSchema,
+	updateKnowledgeCollectionSchema,
+	updateKnowledgeDraftSchema,
+	updateKnowledgeEntryAclSchema,
+	updateKnowledgeEntrySchema,
+	updateKnowledgeTagSchema,
+	updateKnowledgeTagTypeSchema,
+} from "./knowledge";
+export {
 	askInPassingSchema,
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,

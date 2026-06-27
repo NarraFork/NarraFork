@@ -229,6 +229,15 @@ frontend/
 
 `DESIGN.md` 文件（中文编写）包含完整的项目规格说明，涵盖全部 5 个开发阶段、详细的数据库 schema、API 契约和 UI 线框图。需求和架构决策请参阅该文件。
 
+## 扩展能力设计文档（docs/）
+
+以下为独立演进的**通用平台能力**设计草案（领域无关，未实现）。涉及相关改动时先阅读：
+
+- `docs/KNOWLEDGE_BASE.md` — 知识库：新增 `knowledge_collections`/`knowledge_entries`/`knowledge_revisions`/`knowledge_levels`/`knowledge_tags`/`knowledge_entry_tags`/`knowledge_grants`/`knowledge_entry_links` 表 + `knowledge_entries_fts`（FTS5），写时复制版本、**分级（密级）+ 分 tag（受控标签）双轴授权**、条目间有向链接（条目级关联 + 正文内容级内联引用 `[[...]]`，构成知识图谱）、**条件内容块按 viewContext（如产品版本/受众）裁剪同一条目**（block 是内容适配非访问控制，先 ACL 后裁剪）、关键词自动注入；与现有 skills 机制互补。
+- `docs/OPEN_API.md` — 开放 API：新增 `api_tokens` 表 + 双模式 `requireAuth`（JWT / API token）+ `requireScope`；`narrators` 表追加 `origin`/`originTokenId`/`metadataJson`，复用现有 standalone 叙述者创建路径，支持程序化创建 + metadata 过滤 + 可选结果回调。
+
+> 这两项是通用能力，首批消费方之一是机器人远程诊断（`robot_assistant_next/docs/remote_diagnosis/`），但设计不含业务语义——领域信息一律走 `metadataJson` 与知识库 tag。新增表/路由/校验遵循既有范式：`schema.ts` → `bun run db:generate` → `bun run db:migrate`，FTS5 改 `server/db/fts.ts`，Zod schema 进 `server/lib/validators/`（按资源拆分目录），路由 `new Hono()` + `app.route`。
+
 ## 国际化（i18n）
 
 前端国际化使用 `react-i18next` 配合 `i18next-browser-languagedetector`。

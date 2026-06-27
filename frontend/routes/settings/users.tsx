@@ -13,12 +13,13 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconPencil, IconTrash } from "@tabler/icons-react";
+import { IconLock, IconPencil, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
+import { UserAclModal } from "../../components/knowledge/UserAclModal";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 
@@ -31,12 +32,14 @@ const SETTINGS_USERS_QUERY_GC_TIME_MS = 60_000;
 function SettingsUsersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("common");
+	const { t: tk } = useTranslation("knowledge");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 
 	const [editingUser, setEditingUser] = useState<{ id: string; username: string } | null>(null);
 	const [editUsername, setEditUsername] = useState("");
 	const [editPassword, setEditPassword] = useState("");
+	const [aclUser, setAclUser] = useState<{ id: string; username: string } | null>(null);
 
 	const { data: users, isLoading: usersLoading } = useQuery({
 		queryKey: ["admin", "users"],
@@ -162,6 +165,14 @@ function SettingsUsersPage() {
 										</Table.Td>
 										<Table.Td>
 											<Group gap="xs">
+												<ActionIcon
+													color="grape"
+													variant="subtle"
+													title={tk("userAclTitle")}
+													onClick={() => setAclUser(u)}
+												>
+													<IconLock size={16} />
+												</ActionIcon>
 												<ActionIcon color="blue" variant="subtle" onClick={() => openEditModal(u)}>
 													<IconPencil size={16} />
 												</ActionIcon>
@@ -221,6 +232,20 @@ function SettingsUsersPage() {
 						</Button>
 					</Group>
 				</Stack>
+			</Modal>
+
+			<Modal
+				opened={!!aclUser}
+				onClose={() => setAclUser(null)}
+				title={tk("userAclTitle")}
+				size="lg"
+			>
+				<UserAclModal
+					userId={aclUser?.id ?? null}
+					username={aclUser?.username ?? ""}
+					opened={!!aclUser}
+					onClose={() => setAclUser(null)}
+				/>
 			</Modal>
 		</Stack>
 	);
