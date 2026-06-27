@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
 import { ValidationError } from "../lib/errors";
@@ -15,6 +15,7 @@ import {
 	isManualOverride,
 	resolveManualOverride,
 } from "./subagent-manual-override";
+import { clearTakenOver, isTakenOver } from "./subagent-takeover";
 
 // === In-memory state ===
 // Use `let` + lazy getter to avoid TDZ issues under Bun --hot reload,
@@ -189,8 +190,19 @@ export async function interruptForegroundSubagentsForParent(
 			entry.fgAbort.abort("Parent narrator interrupted");
 			entry.proxy.abort("Parent narrator interrupted");
 			abandonManualOverride(subagentId);
+			// Clear any takeover state BEFORE markInterrupted so
+			// preserveTakenOverSubstatus does not re-add the taken_over tag.
+			const wasTakenOver = isTakenOver(subagentId);
+			clearTakenOver(subagentId);
 			getHardInterruptedForegroundSubagents().delete(subagentId);
 			getForegroundAbortControllers().delete(subagentId);
+			// If the user was operating this subagent via its own independent loop
+			// (takeover), abort that loop too so it does not keep running orphaned.
+			if (wasTakenOver) {
+				import("./narrator-session")
+					.then(({ interruptNarrator }) => interruptNarrator(subagentId))
+					.catch(() => {});
+			}
 			await markInterrupted(subagentId, entry.toolUseId);
 		} catch (err) {
 			logger.warn("Failed to interrupt foreground subagent for parent", {
@@ -203,17 +215,26 @@ export async function interruptForegroundSubagentsForParent(
 
 	// Reconcile any stale foreground children that no longer have an in-memory
 	// controller but are still persisted as active. Background tasks are excluded:
-	// they intentionally outlive the parent narrator.
-	const staleChildren = await db.query.narrators.findMany({
-		where: and(
-			eq(narrators.parentNarratorId, parentNarratorId),
-			eq(narrators.isBackground, false),
-			inArray(narrators.status, ["working", "waiting"]),
-		),
-		columns: { id: true },
+	// they intentionally outlive the parent narrator. Taken-over children (any
+	// status, isBackground already cleared) are also swept so their in-memory
+	// takeover state and taken_over tag do not leak when the parent is interrupted.
+	const reconcileChildren = await db.query.narrators.findMany({
+		where: and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, false)),
+		columns: { id: true, status: true },
 	});
-	for (const child of staleChildren) {
+	for (const child of reconcileChildren) {
+		const childTakenOver = isTakenOver(child.id);
+		const childActive = child.status === "working" || child.status === "waiting";
+		if (!childTakenOver && !childActive) continue;
 		try {
+			if (childTakenOver) {
+				// Clear takeover state first so preserveTakenOverSubstatus does not
+				// re-add taken_over, and abort the subagent's independent loop.
+				clearTakenOver(child.id);
+				import("./narrator-session")
+					.then(({ interruptNarrator }) => interruptNarrator(child.id))
+					.catch(() => {});
+			}
 			await markInterrupted(child.id);
 		} catch (err) {
 			logger.warn("Failed to mark stale foreground subagent interrupted", {

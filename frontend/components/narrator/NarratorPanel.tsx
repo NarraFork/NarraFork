@@ -119,6 +119,8 @@ import {
 	useReorderNarratorGoals,
 	useRollbackPreview,
 	useStartAskInPassing,
+	useStopTakeoverSubagent,
+	useTakeoverSubagent,
 	useUpdateBlacklistDir,
 	useUpdateCmdBlacklist,
 	useUpdateCmdWhitelist,
@@ -252,6 +254,7 @@ import {
 	setGlobalToggleBlock,
 } from "./swipeState";
 import {
+	AllowRetryCtx,
 	FileModDrawerCtx,
 	LatestTodosToolUseIdCtx,
 	PermEnterHintCtx,
@@ -2131,6 +2134,8 @@ export function NarratorPanel({
 	const forkNarratorMutation = useForkNarrator();
 	const createNarratorMutation = useCreateNarrator();
 	const updateConclusionMutation = useUpdateSubagentConclusion();
+	const takeoverMutation = useTakeoverSubagent();
+	const stopTakeoverMutation = useStopTakeoverSubagent();
 	const { data: goalsData } = useNarratorGoals(narratorId);
 	const goals = goalsData?.goals ?? [];
 	const updateGoalMutation = useUpdateNarratorGoal(narratorId);
@@ -3257,6 +3262,21 @@ export function NarratorPanel({
 	const quotaDetailsText = detailedQuotaBalance?.trim() ? detailedQuotaBalance : null;
 	const hasQuotaDetailsPopover = Boolean(quotaDetailsText || shouldShowNugRechargeInQuotaDetails);
 	const [quotaDetailsOpened, setQuotaDetailsOpened] = useState(false);
+	const quotaDetailsCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const cancelQuotaDetailsClose = useCallback(() => {
+		if (quotaDetailsCloseTimer.current) {
+			clearTimeout(quotaDetailsCloseTimer.current);
+			quotaDetailsCloseTimer.current = null;
+		}
+	}, []);
+	const scheduleQuotaDetailsClose = useCallback(() => {
+		cancelQuotaDetailsClose();
+		quotaDetailsCloseTimer.current = setTimeout(() => {
+			setQuotaDetailsOpened(false);
+			quotaDetailsCloseTimer.current = null;
+		}, 150);
+	}, [cancelQuotaDetailsClose]);
+	useEffect(() => () => cancelQuotaDetailsClose(), [cancelQuotaDetailsClose]);
 
 	useEffect(() => {
 		if (paymentRequired) return;
@@ -3548,6 +3568,11 @@ export function NarratorPanel({
 	const isWorking = narrator?.status === "working";
 	const isActive = narrator?.status === "working" || narrator?.status === "waiting";
 	const isWaiting = narrator?.status === "waiting";
+	// Takeover: the user is operating this subagent directly while the parent
+	// tool call stays blocked. canTakeover is shown only while the subagent is
+	// running and not already taken over.
+	const isTakenOver = isSubagent && substatus.includes("taken_over");
+	const canTakeover = isSubagent && isActive && !isTakenOver && retryRecoveryAllowsInterrupt;
 	const hasPlanTrait = Array.isArray(narrator?.traits)
 		? narrator.traits.includes("plan")
 		: !!narrator?.planMode;
@@ -4966,6 +4991,7 @@ export function NarratorPanel({
 		isSubagent &&
 		narrator &&
 		narrator.status === "idle" &&
+		!isTakenOver &&
 		(substatus.includes("unread") ||
 			substatus.includes("error") ||
 			substatus.includes("manual_override")) &&
@@ -6147,6 +6173,35 @@ export function NarratorPanel({
 		}
 	};
 
+	const handleAllowRetryToolCall = useCallback(
+		async (toolUseId: string) => {
+			try {
+				await api.allowRetryToolCall(narratorId, toolUseId);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to re-execute tool call";
+				notifications.show({ title: "Error", message, color: "red" });
+			}
+		},
+		[narratorId],
+	);
+
+	// Allow-retry context: a denied tool call in the latest assistant turn may be
+	// re-executed only while the narrator is idle (no live loop running).
+	const allowRetryLatestAssistantMessageId =
+		narratorIsIdle &&
+		effectiveLastMessage?.role === "assistant" &&
+		!String(effectiveLastMessage.id).startsWith("optimistic-")
+			? effectiveLastMessage.id
+			: null;
+	const allowRetryCtxValue = useMemo(
+		() => ({
+			enabled: narratorIsIdle && !!allowRetryLatestAssistantMessageId,
+			latestAssistantMessageId: allowRetryLatestAssistantMessageId,
+			onAllowRetry: handleAllowRetryToolCall,
+		}),
+		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
+	);
+
 	const [goalsExpanded, setGoalsExpanded] = useState(false);
 	useEffect(() => {
 		if (goals.length <= QUEUE_COLLAPSE_THRESHOLD) setGoalsExpanded(false);
@@ -7304,109 +7359,115 @@ export function NarratorPanel({
 						>
 							<CompactSummaryModalCtx.Provider value={compactSummaryModalCtxValue}>
 								<MessageSelectionCtx.Provider value={selectionCtxValue}>
-									<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
-										<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
-											<EditingMessageCtx.Provider value={editingMessageCtxValue}>
-												{!canRenderMessageArea ? (
-													<Box h="100%" py="sm" px="md">
-														<Stack gap="md">
-															<Group align="flex-start" gap="sm">
-																<Skeleton height={28} width={28} circle />
-																<Box style={{ flex: 1 }}>
-																	<Skeleton height={14} width={60} mb={6} radius="sm" />
-																	<Skeleton height={36} radius="sm" />
-																</Box>
-															</Group>
-															<Group align="flex-start" gap="sm">
-																<Skeleton height={28} width={28} circle />
-																<Box style={{ flex: 1 }}>
-																	<Skeleton height={14} width={80} mb={6} radius="sm" />
-																	<Skeleton height={16} width="95%" mb={4} radius="sm" />
-																	<Skeleton height={16} width="88%" mb={4} radius="sm" />
-																	<Skeleton height={16} width="72%" mb={4} radius="sm" />
-																	<Skeleton height={80} width="100%" mt={8} radius="sm" />
-																	<Skeleton height={16} width="90%" mt={8} radius="sm" />
-																	<Skeleton height={16} width="60%" radius="sm" />
-																</Box>
-															</Group>
-															<Group align="flex-start" gap="sm">
-																<Skeleton height={28} width={28} circle />
-																<Box style={{ flex: 1 }}>
-																	<Skeleton height={14} width={60} mb={6} radius="sm" />
-																	<Skeleton height={24} width="70%" radius="sm" />
-																</Box>
-															</Group>
-															<Group align="flex-start" gap="sm">
-																<Skeleton height={28} width={28} circle />
-																<Box style={{ flex: 1 }}>
-																	<Skeleton height={14} width={80} mb={6} radius="sm" />
-																	<Skeleton height={16} width="92%" mb={4} radius="sm" />
-																	<Skeleton height={16} width="85%" mb={4} radius="sm" />
-																	<Skeleton height={16} width="45%" radius="sm" />
-																</Box>
-															</Group>
-														</Stack>
-													</Box>
-												) : isWorkspacePreview ? (
-													<WorkspaceChunkPreview
-														narratorId={narratorId}
-														isSubagent={isSubagent}
-														permCb={renderPermCb}
-														expandedToolUseId={expandedToolUseId}
-														showTokenUsage={showTokenUsage}
-														pruneBoundaryMessageId={pruneBoundaryMessageId}
-														pruneDividerLabel={pruneDividerLabel}
-														lastUserMessageId={lastUserMessageId}
-														hasChapter={hasChapter}
-														resolvePerm={resolvePermForRender}
-														onAskInPassing={handleAskInPassing}
-													/>
-												) : (
-													<ChunkedMessageList
-														ref={chunkListRef}
-														narratorId={narratorId}
-														isSubagent={isSubagent}
-														permCb={renderPermCb}
-														hasChapter={hasChapter}
-														onForkFromMessage={forkHandler}
-														highlightedId={highlightedId}
-														highlightMessageId={highlightMessageId}
-														onHighlightTarget={scheduleHighlight}
-														expandedToolUseId={expandedToolUseId}
-														showTokenUsage={showTokenUsage}
-														pruneBoundaryMessageId={pruneBoundaryMessageId}
-														pruneDividerLabel={pruneDividerLabel}
-														onCompactBeforeMessage={
-															compactSupported ? handleCompactBefore : undefined
-														}
-														onClearContextBefore={
-															compactSupported ? handleClearContextBefore : undefined
-														}
-														onManualSummarize={compactSupported ? handleManualSummarize : undefined}
-														onDeleteBlock={handleDeleteBlock}
-														onRollbackToBlock={
-															rollbackEditRegenerateSupported ? handleRollback : undefined
-														}
-														onEditAndRegenerate={
-															rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined
-														}
-														onEditAssistantMessage={handleEditAssistantMessage}
-														onRestoreAssistantMessage={handleRestoreAssistantMessage}
-														lastUserMessageId={lastUserMessageId}
-														onViewSubagentSession={onViewSubagentSession}
-														resolvePerm={resolvePermForRender}
-														onAskInPassing={handleAskInPassing}
-														scrollRef={chunkViewportRef}
-														contentRef={contentRef}
-														onSelectionResolverChange={setChunkSelectionResolver}
-														onAtBottomChange={setIsAtBottom}
-														onUnreadCountChange={setUnreadCount}
-														onTailMetaChange={handleChunkTailMetaChange}
-													/>
-												)}
-											</EditingMessageCtx.Provider>
-										</LatestTodosToolUseIdCtx.Provider>
-									</FileModDrawerCtx.Provider>
+									<AllowRetryCtx.Provider value={allowRetryCtxValue}>
+										<FileModDrawerCtx.Provider value={fileModDrawerCtxValue}>
+											<LatestTodosToolUseIdCtx.Provider value={todosCtxValue}>
+												<EditingMessageCtx.Provider value={editingMessageCtxValue}>
+													{!canRenderMessageArea ? (
+														<Box h="100%" py="sm" px="md">
+															<Stack gap="md">
+																<Group align="flex-start" gap="sm">
+																	<Skeleton height={28} width={28} circle />
+																	<Box style={{ flex: 1 }}>
+																		<Skeleton height={14} width={60} mb={6} radius="sm" />
+																		<Skeleton height={36} radius="sm" />
+																	</Box>
+																</Group>
+																<Group align="flex-start" gap="sm">
+																	<Skeleton height={28} width={28} circle />
+																	<Box style={{ flex: 1 }}>
+																		<Skeleton height={14} width={80} mb={6} radius="sm" />
+																		<Skeleton height={16} width="95%" mb={4} radius="sm" />
+																		<Skeleton height={16} width="88%" mb={4} radius="sm" />
+																		<Skeleton height={16} width="72%" mb={4} radius="sm" />
+																		<Skeleton height={80} width="100%" mt={8} radius="sm" />
+																		<Skeleton height={16} width="90%" mt={8} radius="sm" />
+																		<Skeleton height={16} width="60%" radius="sm" />
+																	</Box>
+																</Group>
+																<Group align="flex-start" gap="sm">
+																	<Skeleton height={28} width={28} circle />
+																	<Box style={{ flex: 1 }}>
+																		<Skeleton height={14} width={60} mb={6} radius="sm" />
+																		<Skeleton height={24} width="70%" radius="sm" />
+																	</Box>
+																</Group>
+																<Group align="flex-start" gap="sm">
+																	<Skeleton height={28} width={28} circle />
+																	<Box style={{ flex: 1 }}>
+																		<Skeleton height={14} width={80} mb={6} radius="sm" />
+																		<Skeleton height={16} width="92%" mb={4} radius="sm" />
+																		<Skeleton height={16} width="85%" mb={4} radius="sm" />
+																		<Skeleton height={16} width="45%" radius="sm" />
+																	</Box>
+																</Group>
+															</Stack>
+														</Box>
+													) : isWorkspacePreview ? (
+														<WorkspaceChunkPreview
+															narratorId={narratorId}
+															isSubagent={isSubagent}
+															permCb={renderPermCb}
+															expandedToolUseId={expandedToolUseId}
+															showTokenUsage={showTokenUsage}
+															pruneBoundaryMessageId={pruneBoundaryMessageId}
+															pruneDividerLabel={pruneDividerLabel}
+															lastUserMessageId={lastUserMessageId}
+															hasChapter={hasChapter}
+															resolvePerm={resolvePermForRender}
+															onAskInPassing={handleAskInPassing}
+														/>
+													) : (
+														<ChunkedMessageList
+															ref={chunkListRef}
+															narratorId={narratorId}
+															isSubagent={isSubagent}
+															permCb={renderPermCb}
+															hasChapter={hasChapter}
+															onForkFromMessage={forkHandler}
+															highlightedId={highlightedId}
+															highlightMessageId={highlightMessageId}
+															onHighlightTarget={scheduleHighlight}
+															expandedToolUseId={expandedToolUseId}
+															showTokenUsage={showTokenUsage}
+															pruneBoundaryMessageId={pruneBoundaryMessageId}
+															pruneDividerLabel={pruneDividerLabel}
+															onCompactBeforeMessage={
+																compactSupported ? handleCompactBefore : undefined
+															}
+															onClearContextBefore={
+																compactSupported ? handleClearContextBefore : undefined
+															}
+															onManualSummarize={
+																compactSupported ? handleManualSummarize : undefined
+															}
+															onDeleteBlock={handleDeleteBlock}
+															onRollbackToBlock={
+																rollbackEditRegenerateSupported ? handleRollback : undefined
+															}
+															onEditAndRegenerate={
+																rollbackEditRegenerateSupported
+																	? handleEditAndRegenerate
+																	: undefined
+															}
+															onEditAssistantMessage={handleEditAssistantMessage}
+															onRestoreAssistantMessage={handleRestoreAssistantMessage}
+															lastUserMessageId={lastUserMessageId}
+															onViewSubagentSession={onViewSubagentSession}
+															resolvePerm={resolvePermForRender}
+															onAskInPassing={handleAskInPassing}
+															scrollRef={chunkViewportRef}
+															contentRef={contentRef}
+															onSelectionResolverChange={setChunkSelectionResolver}
+															onAtBottomChange={setIsAtBottom}
+															onUnreadCountChange={setUnreadCount}
+															onTailMetaChange={handleChunkTailMetaChange}
+														/>
+													)}
+												</EditingMessageCtx.Provider>
+											</LatestTodosToolUseIdCtx.Provider>
+										</FileModDrawerCtx.Provider>
+									</AllowRetryCtx.Provider>
 								</MessageSelectionCtx.Provider>
 							</CompactSummaryModalCtx.Provider>
 						</Box>
@@ -8067,10 +8128,17 @@ export function NarratorPanel({
 													<UnstyledButton
 														onClick={(event) => {
 															event.stopPropagation();
+															cancelQuotaDetailsClose();
 															setQuotaDetailsOpened((opened) => !opened);
 														}}
 														onPointerEnter={() => {
-															if (!isMobileViewport) setQuotaDetailsOpened(true);
+															if (!isMobileViewport) {
+																cancelQuotaDetailsClose();
+																setQuotaDetailsOpened(true);
+															}
+														}}
+														onPointerLeave={() => {
+															if (!isMobileViewport) scheduleQuotaDetailsClose();
 														}}
 														style={{ flexShrink: 0, maxWidth: 120 }}
 													>
@@ -8089,7 +8157,15 @@ export function NarratorPanel({
 														</Text>
 													</UnstyledButton>
 												</Popover.Target>
-												<Popover.Dropdown maw={360}>
+												<Popover.Dropdown
+													maw={360}
+													onPointerEnter={() => {
+														if (!isMobileViewport) cancelQuotaDetailsClose();
+													}}
+													onPointerLeave={() => {
+														if (!isMobileViewport) scheduleQuotaDetailsClose();
+													}}
+												>
 													<Stack gap={6}>
 														{quotaDetailsText && (
 															<Text
@@ -8729,124 +8805,175 @@ export function NarratorPanel({
 								{(() => {
 									const hasInput = !!input.trim();
 									const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0;
-									const showInterrupt =
-										isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
 
-									const hasCutInMessage = !!queuedMessages[0]?.priority;
-									const showRetry =
-										!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
-									const showContinue =
-										!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
-									// When a message is being edited, the send/retry button
-									// should trigger the edit submit instead.
-									if (editingMessageState && !showInterrupt) {
+									// Takeover button: shown while a subagent is running and not yet
+									// taken over. Clicking it interrupts the current turn and hands
+									// direct control to the user (parent tool call stays blocked).
+									if (canTakeover && !hasInput && !hasAttachments && !editingMessageState) {
 										return (
 											<Button
-												key="edit-submit"
-												onClick={editingMessageState.submit}
-												disabled={!editingMessageState.canSubmit}
-											>
-												{t("editSubmit")}
-											</Button>
-										);
-									}
-									if (showInterrupt) {
-										return (
-											<Button
-												key="interrupt"
-												ref={interruptBtnRef}
-												color="red"
+												key="takeover"
+												color="grape"
 												variant="light"
-												onMouseDown={startInterruptPress}
-												onMouseUp={handleInterruptMouseUp}
-												onMouseLeave={clearInterruptTimer}
-												onContextMenu={(e) => e.preventDefault()}
-												loading={interruptMutation.isPending}
-												style={{
-													position: "relative",
-													overflow: "hidden",
-													userSelect: "none",
-													touchAction: "none",
-												}}
+												onClick={() => takeoverMutation.mutate(narratorId)}
+												loading={takeoverMutation.isPending}
 											>
-												{interruptProgress > 0 && interruptProgress < 1 && (
-													<div
-														style={{
-															position: "absolute",
-															inset: 0,
-															background: "var(--mantine-color-red-filled)",
-															opacity: 0.25,
-															transformOrigin: "left",
-															transform: `scaleX(${interruptProgress})`,
-															pointerEvents: "none",
-														}}
-													/>
-												)}
-												<span style={{ position: "relative" }}>
-													{hasCutInMessage ? t("interruptCutInLine") : t("interrupt")}
-												</span>
+												{t("takeover")}
 											</Button>
 										);
 									}
-									if (showRetry) {
-										return (
-											<Button key="retry" onClick={handleRetry}>
-												{t("retry")}
-											</Button>
-										);
-									}
-									if (showContinue) {
-										return (
-											<Button key="continue" onClick={handleContinue}>
-												{t("continue")}
-											</Button>
-										);
-									}
-									return isActive ? (
-										<Tooltip label={t("queueHoldToCutInLine")} position="top">
+
+									// The primary action button (send / interrupt / retry / continue /
+									// queue / edit-submit). Extracted so it can be reused inside the
+									// takeover two-button layout.
+									const renderPrimaryActionButton = () => {
+										const showInterrupt =
+											isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
+
+										const hasCutInMessage = !!queuedMessages[0]?.priority;
+										const showRetry =
+											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
+										const showContinue =
+											!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
+										// When a message is being edited, the send/retry button
+										// should trigger the edit submit instead.
+										if (editingMessageState && !showInterrupt) {
+											return (
+												<Button
+													key="edit-submit"
+													onClick={editingMessageState.submit}
+													disabled={!editingMessageState.canSubmit}
+												>
+													{t("editSubmit")}
+												</Button>
+											);
+										}
+										if (showInterrupt) {
+											return (
+												<Button
+													key="interrupt"
+													ref={interruptBtnRef}
+													color="red"
+													variant="light"
+													onMouseDown={startInterruptPress}
+													onMouseUp={handleInterruptMouseUp}
+													onMouseLeave={clearInterruptTimer}
+													onContextMenu={(e) => e.preventDefault()}
+													loading={interruptMutation.isPending}
+													style={{
+														position: "relative",
+														overflow: "hidden",
+														userSelect: "none",
+														touchAction: "none",
+													}}
+												>
+													{interruptProgress > 0 && interruptProgress < 1 && (
+														<div
+															style={{
+																position: "absolute",
+																inset: 0,
+																background: "var(--mantine-color-red-filled)",
+																opacity: 0.25,
+																transformOrigin: "left",
+																transform: `scaleX(${interruptProgress})`,
+																pointerEvents: "none",
+															}}
+														/>
+													)}
+													<span style={{ position: "relative" }}>
+														{hasCutInMessage ? t("interruptCutInLine") : t("interrupt")}
+													</span>
+												</Button>
+											);
+										}
+										if (showRetry) {
+											return (
+												<Button key="retry" onClick={handleRetry}>
+													{t("retry")}
+												</Button>
+											);
+										}
+										if (showContinue) {
+											return (
+												<Button key="continue" onClick={handleContinue}>
+													{t("continue")}
+												</Button>
+											);
+										}
+										return isActive ? (
+											<Tooltip label={t("queueHoldToCutInLine")} position="top">
+												<Button
+													key="send-priority"
+													ref={sendPriorityBtnRef}
+													disabled={!hasInput && !hasAttachments}
+													onMouseDown={(e) => {
+														if (!hasInput && !hasAttachments) return;
+														startSendPriorityPress(e);
+													}}
+													onMouseUp={handleSendPriorityMouseUp}
+													onMouseLeave={clearSendPriorityTimer}
+													onContextMenu={(e) => e.preventDefault()}
+													style={{
+														position: "relative",
+														overflow: "hidden",
+														userSelect: "none",
+														touchAction: "none",
+													}}
+												>
+													{sendPriorityProgress > 0 && sendPriorityProgress < 1 && (
+														<div
+															style={{
+																position: "absolute",
+																inset: 0,
+																background: "var(--mantine-color-indigo-filled)",
+																opacity: 0.25,
+																transformOrigin: "left",
+																transform: `scaleX(${sendPriorityProgress})`,
+																pointerEvents: "none",
+															}}
+														/>
+													)}
+													<span style={{ position: "relative" }}>
+														{queuedMessages.length > 0
+															? `${t("queue")} (${queuedMessages.length})`
+															: t("queue")}
+													</span>
+												</Button>
+											</Tooltip>
+										) : (
 											<Button
-												key="send-priority"
-												ref={sendPriorityBtnRef}
+												key="send"
+												onClick={handleSend}
 												disabled={!hasInput && !hasAttachments}
-												onMouseDown={(e) => {
-													if (!hasInput && !hasAttachments) return;
-													startSendPriorityPress(e);
-												}}
-												onMouseUp={handleSendPriorityMouseUp}
-												onMouseLeave={clearSendPriorityTimer}
-												onContextMenu={(e) => e.preventDefault()}
-												style={{
-													position: "relative",
-													overflow: "hidden",
-													userSelect: "none",
-													touchAction: "none",
-												}}
 											>
-												{sendPriorityProgress > 0 && sendPriorityProgress < 1 && (
-													<div
-														style={{
-															position: "absolute",
-															inset: 0,
-															background: "var(--mantine-color-indigo-filled)",
-															opacity: 0.25,
-															transformOrigin: "left",
-															transform: `scaleX(${sendPriorityProgress})`,
-															pointerEvents: "none",
-														}}
-													/>
-												)}
-												<span style={{ position: "relative" }}>
-													{queuedMessages.length > 0
-														? `${t("queue")} (${queuedMessages.length})`
-														: t("queue")}
-												</span>
+												{tc("send")}
 											</Button>
-										</Tooltip>
-									) : (
-										<Button key="send" onClick={handleSend} disabled={!hasInput && !hasAttachments}>
-											{tc("send")}
-										</Button>
-									);
+										);
+									};
+
+									// Takeover mode: the user operates the subagent like an
+									// independent narrator (send/interrupt/queue/continue) plus a
+									// dedicated "Stop takeover" button to hand the result back.
+									if (isTakenOver) {
+										return (
+											<Group gap="xs" align="end" wrap="nowrap">
+												{renderPrimaryActionButton()}
+												<Tooltip label={t("stopTakeoverHint")} position="top">
+													<Button
+														key="stop-takeover"
+														color="grape"
+														variant="outline"
+														onClick={() => stopTakeoverMutation.mutate(narratorId)}
+														loading={stopTakeoverMutation.isPending}
+													>
+														{t("stopTakeover")}
+													</Button>
+												</Tooltip>
+											</Group>
+										);
+									}
+
+									return renderPrimaryActionButton();
 								})()}
 							</Group>
 						</Box>

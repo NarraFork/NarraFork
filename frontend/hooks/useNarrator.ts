@@ -422,6 +422,26 @@ export function useUpdateSubagentConclusion() {
 	});
 }
 
+export function useTakeoverSubagent() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.takeoverSubagent(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+		},
+	});
+}
+
+export function useStopTakeoverSubagent() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.stopTakeoverSubagent(id),
+		onSuccess: (_data, id) => {
+			qc.invalidateQueries({ queryKey: ["narrators", id] });
+		},
+	});
+}
+
 export function useUpdatePermissionMode() {
 	const qc = useQueryClient();
 	return useMutation({

@@ -483,6 +483,7 @@ export const SubagentCard = memo(
 			}
 		}, [saNarrator?.substatus]);
 		const saIsReasoning = saSubstatus.includes("reasoning");
+		const isTakenOverSa = saSubstatus.includes("taken_over");
 		const isSuspended =
 			saSubstatus.includes("suspended") || saSubstatus.includes("manual_override");
 
@@ -770,7 +771,26 @@ export const SubagentCard = memo(
 								</Group>
 							</Group>
 							{/* Line 2: description (truncated when collapsed) */}
-							{isSuspended ? (
+							{isTakenOverSa ? (
+								<Group gap={6} mt={2} ml={21}>
+									<Text size="xs" c="grape">
+										{t("subagentTakenOver")}
+									</Text>
+									{subagentNarratorId && canViewSubagentSession && (
+										<Button
+											size="compact-xs"
+											variant="light"
+											color="grape"
+											onClick={(e: React.MouseEvent) => {
+												e.stopPropagation();
+												handleViewSession();
+											}}
+										>
+											{t("openSubagentSession")}
+										</Button>
+									)}
+								</Group>
+							) : isSuspended ? (
 								<Group gap={6} mt={2} ml={21}>
 									<Text size="xs" c="yellow">
 										{t("subagentSuspended")}

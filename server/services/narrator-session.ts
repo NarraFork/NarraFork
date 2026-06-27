@@ -90,7 +90,12 @@ import {
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
 } from "./narrator-recovery";
-import { handleBashCommand, narratorService } from "./narrator-service";
+import {
+	enrichToolUseBlocks,
+	handleBashCommand,
+	narratorService,
+	truncateToolIO,
+} from "./narrator-service";
 import { clearAliasRegistry, clearTeamFileChanges } from "./narrator-subagent";
 import {
 	generateAndSetTitle,
@@ -110,6 +115,12 @@ import {
 	removeConclusionWatcher,
 	resolveManualOverride,
 } from "./subagent-manual-override";
+import {
+	clearTakenOver,
+	consumePendingBackgroundFinalize,
+	consumePendingStopTakeover,
+	isTakenOver,
+} from "./subagent-takeover";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
 import { buildTodoToolResultReminder } from "./todo-reminder";
 import { worktreeWatcher } from "./worktree-watcher";
@@ -480,6 +491,78 @@ async function createNarrator(
 	return active;
 }
 
+/**
+ * Broadcast a kept partial assistant message after an interrupt so the
+ * frontend can replace its optimistic streaming text with the persisted
+ * message in the same render. Without this, the frontend's `onStatusChange`
+ * (interrupted) clears the streaming blocks but never receives the real
+ * message, so the already-streamed text disappears until the next catch-up.
+ *
+ * Mirrors the `assistant_message` broadcast in narrator-event-handler so the
+ * WS payload is shaped identically to the normal completion path.
+ */
+async function broadcastInterruptedPartialMessage(
+	narratorId: string,
+	partialId: string,
+): Promise<void> {
+	try {
+		const fullMessage = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialId),
+			with: { toolCalls: true, sideCars: true },
+		});
+		if (!fullMessage) return;
+
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, partialId),
+			),
+			columns: { seq: true },
+		});
+
+		const processed = enrichToolUseBlocks(truncateToolIO([{ ...fullMessage, seq: ref?.seq }]))[0];
+
+		// Subagent dual-broadcast: also surface this message on the parent
+		// narrator's page (as a child of the spawning tool_use) so the
+		// SubagentCard's transcript stays consistent with the subagent page.
+		// Mirror the eventContext resolution: prefer the takeover watcher, then
+		// fall back to the narrator record's parentNarratorId.
+		const parentToolUseId = fullMessage.parentToolUseId ?? undefined;
+		if (parentToolUseId) {
+			const watcher = getConclusionWatcher(narratorId);
+			let parentNarratorId = watcher?.parentNarratorId;
+			if (!parentNarratorId) {
+				const self = await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { parentNarratorId: true },
+				});
+				parentNarratorId = self?.parentNarratorId ?? undefined;
+			}
+			if (parentNarratorId && parentNarratorId !== narratorId) {
+				broadcastToNarrator(parentNarratorId, {
+					type: "message",
+					narratorId: parentNarratorId,
+					message: processed,
+				});
+			}
+		}
+
+		// Primary broadcast to this narrator's own subscribers. Strip
+		// parentToolUseId so the subagent page treats it as a top-level message.
+		broadcastToNarrator(narratorId, {
+			type: "message",
+			narratorId,
+			message: { ...processed, parentToolUseId: null },
+		});
+	} catch (err) {
+		logger.warn("Failed to broadcast interrupted partial message", {
+			narratorId,
+			partialId,
+			error: String(err),
+		});
+	}
+}
+
 async function finalizeInterruptedRun(
 	active: ActiveNarrator,
 	narratorId: string,
@@ -505,7 +588,13 @@ async function finalizeInterruptedRun(
 			// where the finalizer sees only "initializing" tool calls and deletes the
 			// whole message, making already-visible tool calls disappear from history.
 			await markInterruptedToolCallsForMessage(narratorId, partialId, active.locale);
-			await finalizeOrCleanupPartialMessage(partialId, narratorId);
+			const kept = await finalizeOrCleanupPartialMessage(partialId, narratorId);
+			// Broadcast the kept message so the frontend swaps its optimistic
+			// streaming text for the persisted message immediately, instead of
+			// dropping it until the next catch-up reload.
+			if (kept) {
+				await broadcastInterruptedPartialMessage(narratorId, partialId);
+			}
 		} catch (err) {
 			logger.warn("Failed to finalize interrupted partial message", {
 				narratorId,
@@ -2580,19 +2669,55 @@ export async function runAgentLoop(
 					lastFinalText = await getSubagentFinalText(narratorId);
 				}
 
-				const watcher = getConclusionWatcher(narratorId);
-				if (watcher) {
-					removeConclusionWatcher(narratorId);
-					// Resolve the last assistant message ID for result binding
-					const resultMsgId = await getSubagentResultMessageId(narratorId);
-					await updateToolCallConclusion({
-						subagentId: narratorId,
-						parentNarratorId: watcher.parentNarratorId,
-						toolUseId: watcher.toolUseId,
-						finalText: lastFinalText,
-						hasError: loopHadError,
-						resultMessageId: resultMsgId,
-					});
+				// --- Takeover handoff ---
+				// While the subagent is taken over, the parent stays blocked in
+				// waitForManualOverride (foreground) or holds a background_task_id
+				// (background). When an intermediate loop finishes but the user has
+				// NOT stopped takeover, do nothing (keep the takeover active; the
+				// subagent waits idle[taken_over] for the next user action).
+				if (consumePendingBackgroundFinalize(narratorId)) {
+					// Background takeover stopped while still working — finalize as a
+					// background completion so the parent learns the result.
+					const { finalizeTakenOverBackgroundSubagent } = await import("./subagent-runner");
+					const watcher = getConclusionWatcher(narratorId);
+					const parentId = saParentNarratorId ?? narr.parentNarratorId ?? "";
+					const tuid = watcher?.toolUseId ?? saParentToolUseId ?? "";
+					clearTakenOver(narratorId);
+					if (parentId) {
+						await finalizeTakenOverBackgroundSubagent(
+							narratorId,
+							parentId,
+							tuid,
+							loopHadError,
+							lastFinalText,
+							locale,
+						);
+					}
+				} else if (consumePendingStopTakeover(narratorId)) {
+					// Foreground takeover stopped while still working — resolve the
+					// parent's blocked Promise exactly once so the parent's
+					// runForegroundLoop finalizer returns the result (no double-write).
+					clearTakenOver(narratorId);
+					if (getManualOverrideMap().has(narratorId)) {
+						resolveManualOverride(narratorId, lastFinalText, loopHadError);
+					}
+				} else if (isTakenOver(narratorId)) {
+					// Still taken over — keep blocked/held, no handoff.
+				} else {
+					const watcher = getConclusionWatcher(narratorId);
+					if (watcher) {
+						removeConclusionWatcher(narratorId);
+						// Resolve the last assistant message ID for result binding
+						const resultMsgId = await getSubagentResultMessageId(narratorId);
+						await updateToolCallConclusion({
+							subagentId: narratorId,
+							parentNarratorId: watcher.parentNarratorId,
+							toolUseId: watcher.toolUseId,
+							finalText: lastFinalText,
+							hasError: loopHadError,
+							resultMessageId: resultMsgId,
+						});
+					}
 				}
 			}
 		} catch (err) {
@@ -2905,16 +3030,28 @@ async function feedMessage(
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
 
-	// --- Resolve manual_override if active ---
+	// --- Resolve manual_override if active (legacy implicit path) ---
 	// When the user sends a message directly on a subagent page while the parent
 	// narrator is blocked in waitForManualOverride, we must resolve that Promise
 	// first. Otherwise the parent stays blocked forever while the subagent runs
 	// independently via narrator-session. We also register a ConclusionWatcher so
 	// the parent's tool_call result is updated when this independent run finishes.
+	//
+	// EXCEPTION — explicit takeover: while taken over, the parent intentionally
+	// stays blocked for the entire takeover. The user can send/interrupt/continue
+	// freely; the result is only handed back when the user stops takeover. So we
+	// do NOT resolve the override or register a watcher here. We still set up the
+	// conclusion file for explore/plan subagents so Write/Edit redirect works.
 	const narrator = await narratorService.getById(narratorId);
 	if (isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		const currentSubstatus = parseSubstatus(narrator.substatus);
-		if (currentSubstatus.includes("manual_override")) {
+		const takenOver = isTakenOver(narratorId);
+		if (takenOver) {
+			if (isReadOnlySubagentVariant(narrator.variant)) {
+				setConclusionFileId(narratorId, generateWordSlug(), active.cwd);
+			}
+			// Parent stays blocked — do not resolve, do not register a watcher.
+		} else if (currentSubstatus.includes("manual_override")) {
 			const overrideEntry = getManualOverrideMap().get(narratorId);
 			if (overrideEntry) {
 				const currentFinalText = await getSubagentFinalText(narratorId);
@@ -3355,6 +3492,333 @@ export async function continueNarrator(
 		});
 	});
 
+	return { ok: true };
+}
+
+/**
+ * Tool calls that are not real executable tools (control / UI tools) and must
+ * never be re-executed via the "allow and execute" path. ExitPlanMode and
+ * AskUserQuestion are interactive control tools handled inside the loop; the
+ * rest carry no file/side effects worth replaying.
+ */
+const NON_RERUNNABLE_TOOL_NAMES = new Set([
+	"ExitPlanMode",
+	"EnterPlanMode",
+	"AskUserQuestion",
+	"TodoWrite",
+	"TaskCreate",
+	"StartPipeline",
+	"EndPipeline",
+]);
+
+/** permissionDecidedBy values that mark a tool call as "stopped at the permission gate". */
+const RERUNNABLE_DECIDED_BY = new Set(["user", "aborted"]);
+
+export type ReExecuteDeniedReason =
+	| "not_found"
+	| "not_denied"
+	| "not_latest_turn"
+	| "not_rerunnable_tool"
+	| "narrator_busy";
+
+export type ReExecuteDeniedResult = { ok: true } | { ok: false; reason: ReExecuteDeniedReason };
+
+/**
+ * Pure precondition check for re-executing a denied tool call. Returns null when
+ * the tool call may be re-run, or a failure reason otherwise. Kept separate from
+ * the DB/execution side effects so the decision logic is unit-testable.
+ */
+export function evaluateRerunnableToolCall(
+	toolCall: {
+		toolName: string;
+		status: string;
+		permissionDecidedBy?: string | null;
+		messageId: string;
+	} | null,
+	latestAssistantMessageId: string | null,
+): ReExecuteDeniedReason | null {
+	if (!toolCall) return "not_found";
+	if (NON_RERUNNABLE_TOOL_NAMES.has(toolCall.toolName)) return "not_rerunnable_tool";
+	// Only tool calls stopped at the permission gate (user deny or interrupt-
+	// cancelled) are safe to re-run: they never executed, so there is no partial
+	// side effect to worry about.
+	if (
+		toolCall.status !== "fail" ||
+		!toolCall.permissionDecidedBy ||
+		!RERUNNABLE_DECIDED_BY.has(toolCall.permissionDecidedBy)
+	) {
+		return "not_denied";
+	}
+	// The tool call must belong to the latest top-level assistant message so
+	// re-running it does not reorder history relative to later turns.
+	if (!latestAssistantMessageId || latestAssistantMessageId !== toolCall.messageId) {
+		return "not_latest_turn";
+	}
+	return null;
+}
+
+/**
+ * Re-execute a tool call that was denied by the user (or whose pending
+ * permission was cancelled by an interrupt) in the latest assistant turn.
+ *
+ * The denied tool_use block is still present in the assistant message's
+ * contentJson, and its tool_result is reconstructed from the narrator_tool_calls
+ * row at history-build time. So "un-denying" a tool only requires:
+ *   1. reset the tool call row (fail → pending, clear deny/output fields),
+ *   2. execute the tool directly with a pre-granted permission (the in-memory
+ *      pendingPermissions entry is gone after the interrupt, so resolvePermission
+ *      cannot be used),
+ *   3. write the fresh result back into the row,
+ *   4. continue the loop so the model sees the new result and resumes.
+ */
+export async function reExecuteDeniedToolCall(
+	narratorId: string,
+	toolUseId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<ReExecuteDeniedResult> {
+	const narrator = await narratorService.getById(narratorId);
+	if (narrator.status === "working" || narrator.status === "waiting") {
+		return { ok: false, reason: "narrator_busy" };
+	}
+	if (isNarratorActive(narratorId)) {
+		// A live agent loop is still running for this narrator — refuse to avoid
+		// racing the loop's own tool execution / history rebuild.
+		return { ok: false, reason: "narrator_busy" };
+	}
+
+	const toolCall = await db.query.narratorToolCalls.findFirst({
+		where: and(
+			eq(narratorToolCalls.narratorId, narratorId),
+			eq(narratorToolCalls.toolUseId, toolUseId),
+		),
+	});
+
+	// The tool call must belong to the latest top-level assistant message so
+	// re-running it does not reorder history relative to later turns.
+	const isSubagent = isSubagentVariant(narrator.variant);
+	const lastRef = await db
+		.select({ messageId: narratorMessageRefs.messageId })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				isSubagent ? undefined : isNull(narratorMessages.parentToolUseId),
+				inArray(narratorMessages.role, ["user", "assistant"]),
+			),
+		)
+		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+		.limit(1);
+	const latestAssistantMessageId = lastRef.length ? lastRef[0].messageId : null;
+
+	const rejectReason = evaluateRerunnableToolCall(toolCall ?? null, latestAssistantMessageId);
+	if (rejectReason) {
+		return { ok: false, reason: rejectReason };
+	}
+	// evaluateRerunnableToolCall guarantees toolCall is non-null past this point.
+	if (!toolCall) return { ok: false, reason: "not_found" };
+
+	const toolInput =
+		toolCall.inputJson &&
+		typeof toolCall.inputJson === "object" &&
+		!Array.isArray(toolCall.inputJson)
+			? (toolCall.inputJson as Record<string, unknown>)
+			: {};
+
+	// Reset the row so buildHistory no longer treats it as a completed failure.
+	await db
+		.update(narratorToolCalls)
+		.set({
+			status: "pending",
+			outputJson: null,
+			errorMessage: null,
+			permissionDenyMessage: null,
+			permissionDecidedBy: null,
+			permissionDecidedAt: null,
+			permissionDecisionReason: null,
+			permissionSuggestions: null,
+			completedAt: null,
+			durationMs: null,
+			executionStartedAt: null,
+		})
+		.where(eq(narratorToolCalls.id, toolCall.id));
+
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+
+	broadcastToNarrator(narratorId, {
+		type: "tool_started",
+		narratorId,
+		toolUseId,
+		toolName: toolCall.toolName,
+		input: toolInput,
+	});
+
+	const { executeTool } = await import("../lib/agent/tool-executor");
+	const toolName = toolCall.toolName;
+
+	// Minimal AgentConfig sufficient for executeTool. Nested permission requests
+	// (e.g. narrafork-admin) still flow through the normal handler; the top-level
+	// call is pre-granted because the user just explicitly allowed it.
+	const config: import("../lib/agent").AgentConfig = {
+		narratorId,
+		conversationId: active.conversationId,
+		model: active.model,
+		provider: active.provider,
+		cwd: active.cwd,
+		locale,
+		signal: active.abortController.signal,
+		chapterId: active._chapterId,
+		planFileId: active._planFileId,
+		skillRoot: active._skillRoot ?? undefined,
+		projectGitPath: active._projectGitPath ?? undefined,
+		skillScopeKey: active._skillScopeKey ?? undefined,
+		disabledTools: active._disabledTools,
+		permissionHandler: (tName, input, tUseId) =>
+			handlePermission(
+				narratorId,
+				active.abortController.signal,
+				tName,
+				input,
+				tUseId,
+				active.cwd,
+				locale,
+			),
+		onEvent: (event) => {
+			if (event.type === "tool_output") {
+				broadcastToNarrator(narratorId, {
+					type: "tool_output",
+					narratorId,
+					toolUseId: event.toolUseId,
+					output: event.output,
+				});
+			} else if (event.type === "tool_progress") {
+				broadcastToNarrator(narratorId, {
+					type: "tool_progress",
+					narratorId,
+					toolUseId: event.toolUseId,
+					elapsed: event.elapsed,
+				});
+			} else if (event.type === "tool_long_running") {
+				broadcastToNarrator(narratorId, {
+					type: "tool_long_running",
+					narratorId,
+					toolUseId: event.toolUseId,
+					elapsed: event.elapsed,
+				});
+			}
+		},
+	};
+
+	// Bash mutates tracked files directly, so capture a before-status snapshot to
+	// mirror the loop's onSnapshotBefore/After hooks (Write/Edit snapshot inside
+	// their own execute()).
+	const isShellTool = toolName === SHELL_TOOL_NAME;
+	let bashBeforeFiles: Set<string> | undefined;
+	if (isShellTool && active._isInGitRepo) {
+		try {
+			bashBeforeFiles = parsePorcelainFiles(await gitService.getStatus(active.cwd));
+		} catch (err) {
+			logger.debug("Bash rerun before-status failed", {
+				narratorId,
+				toolUseId,
+				error: String(err),
+			});
+		}
+	}
+
+	try {
+		const result = await executeTool({ name: toolName, input: toolInput, toolUseId }, config, {
+			preGrantedPermission: { behavior: "allow" },
+		});
+
+		await narratorService.updateToolCallResult(toolUseId, {
+			output: result.metadata
+				? { _text: result.output, _metadata: result.metadata }
+				: result.output,
+			status: result.isError ? "fail" : "success",
+			errorMessage: result.isError ? result.output : undefined,
+			durationMs: result.durationMs,
+			permissionStartedAt: result.permissionStartedAt,
+			executionStartedAt: result.executionStartedAt,
+			completedAt: result.completedAt,
+		});
+		if (result.updatedInput) {
+			await narratorService.overwriteToolCallInput(toolUseId, result.updatedInput);
+		}
+
+		broadcastToNarrator(narratorId, {
+			type: "tool_completed",
+			narratorId,
+			toolUseId,
+			toolName,
+			status: result.isError ? "fail" : "success",
+			output: result.metadata
+				? { _text: result.output, _metadata: result.metadata }
+				: result.output,
+			durationMs: result.durationMs,
+			...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
+			...(result.metadata ? { metadata: result.metadata } : {}),
+		});
+
+		// Capture file snapshots for Bash-modified tracked files so later rollback
+		// can restore the pre-rerun content.
+		if (isShellTool && active._isInGitRepo && bashBeforeFiles) {
+			try {
+				const afterFiles = parsePorcelainFiles(await gitService.getStatus(active.cwd));
+				const changedFiles = [...afterFiles].filter((f) => !bashBeforeFiles?.has(f));
+				if (changedFiles.length > 0) {
+					const { ensureFileSnapshot } = await import("./file-snapshot-service");
+					const cwd = active.cwd;
+					for (const filePath of changedFiles) {
+						await ensureFileSnapshot(narratorId, filePath, async () => {
+							try {
+								return await gitService.getFileAtHead(cwd, filePath);
+							} catch {
+								return null;
+							}
+						});
+					}
+				}
+			} catch (err) {
+				logger.debug("Bash rerun after-snapshot failed", {
+					narratorId,
+					toolUseId,
+					error: String(err),
+				});
+			}
+		}
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		logger.error("Failed to re-execute denied tool call", {
+			narratorId,
+			toolUseId,
+			error: message,
+		});
+		await narratorService
+			.updateToolCallResult(toolUseId, {
+				output: `Re-execution failed: ${message}`,
+				status: "fail",
+				errorMessage: `Re-execution failed: ${message}`,
+				completedAt: Date.now(),
+			})
+			.catch(() => {});
+		broadcastToNarrator(narratorId, {
+			type: "tool_completed",
+			narratorId,
+			toolUseId,
+			toolName,
+			status: "fail",
+			output: `Re-execution failed: ${message}`,
+		});
+		await narratorService.updateStatus(narratorId, "idle", { substatus: ["error"] });
+		return { ok: true };
+	}
+
+	// Auto-continue: replay the freshly produced tool result so the model resumes
+	// from where it was interrupted.
+	await continueNarrator(narratorId, locale, replyInUserLanguage);
 	return { ok: true };
 }
 

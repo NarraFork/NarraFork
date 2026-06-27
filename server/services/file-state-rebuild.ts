@@ -26,10 +26,17 @@ export interface OrderedToolCall {
 /**
  * Query all Write/Edit tool calls for a narrator, ordered by message seq then createdAt.
  * Optionally limited to tool calls whose message seq <= maxSeq.
+ *
+ * `filePathOnly` extracts just `inputJson.file_path` at the SQL layer instead of
+ * loading the full inputJson (which for Write contains the entire file content).
+ * Callers that only need to group/attribute by file (e.g. the file-modifications
+ * timeline) should set it to avoid pulling large file bodies into memory. The
+ * returned `inputJson` is then a minimal `{ file_path }` placeholder.
  */
 export async function queryOrderedToolCalls(
 	narratorId: string,
 	maxSeq?: number,
+	opts?: { filePathOnly?: boolean },
 ): Promise<OrderedToolCall[]> {
 	const conditions = [
 		eq(narratorToolCalls.narratorId, narratorId),
@@ -38,6 +45,43 @@ export async function queryOrderedToolCalls(
 	];
 	if (maxSeq !== undefined) {
 		conditions.push(lte(narratorMessageRefs.seq, maxSeq));
+	}
+
+	if (opts?.filePathOnly) {
+		const rows = await db
+			.select({
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				// input_json is always valid JSON (stored via Drizzle json mode); guard
+				// anyway so a malformed row yields NULL instead of throwing.
+				filePath: sql<
+					string | null
+				>`CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN json_extract(${narratorToolCalls.inputJson}, '$.file_path') END`,
+				status: narratorToolCalls.status,
+				messageId: narratorToolCalls.messageId,
+				seq: narratorMessageRefs.seq,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(and(...conditions))
+			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt));
+
+		return rows.map((row) => ({
+			toolUseId: row.toolUseId,
+			toolName: row.toolName,
+			inputJson: row.filePath != null ? { file_path: row.filePath } : null,
+			status: row.status,
+			messageId: row.messageId,
+			seq: row.seq,
+			createdAt: row.createdAt,
+		}));
 	}
 
 	return db

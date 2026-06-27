@@ -9,6 +9,7 @@ import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { interruptForegroundSubagent } from "./subagent-detach";
 import { pushSubagentBufferedMessage } from "./subagent-executor";
 import { continueSubagent, waitForBackgroundTask } from "./subagent-runner";
+import { isTakenOver } from "./subagent-takeover";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -49,7 +50,15 @@ export interface AwaitAgentResult {
 export interface SendTargetResult {
 	id: string;
 	title?: string | null;
-	status: "queued" | "started" | "completed" | "failed" | "timeout" | "aborted" | "cancelled";
+	status:
+		| "queued"
+		| "started"
+		| "completed"
+		| "failed"
+		| "timeout"
+		| "aborted"
+		| "cancelled"
+		| "taken_over";
 	interrupted?: boolean;
 	awaited?: boolean;
 	error?: string;
@@ -215,12 +224,23 @@ export function formatAgentAwaitResult(id: string, status: string, output: strin
 				`Call Await again with the same id to keep waiting for its result.` +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
 			);
+		case "taken_over":
+			return (
+				`${tag}\n\n` +
+				`Agent ${id} is being taken over by the user. The user is operating it directly; ` +
+				`its result will be returned only when the user stops the takeover. ` +
+				`Call Await again later with the same id to retrieve the final result.` +
+				(partial ? `\n\nOutput so far:\n${partial}` : "")
+			);
 		default:
 			return `Agent ${id} status: ${status}\n\n${formatSubagentResult(id, output)}`;
 	}
 }
 
 function settledSubagentStatus(narrator: Narrator, fallback = "completed"): string {
+	// A taken-over subagent is being operated directly by the user. Its result
+	// is not final until the user stops takeover, so report it distinctly.
+	if (isTakenOver(narrator.id)) return "taken_over";
 	const substatus = parseSubstatus(narrator.substatus);
 	if (substatus.includes("error") || narrator.errorMessage) return "failed";
 	if (substatus.includes("interrupted")) return "cancelled";
@@ -361,6 +381,17 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		};
 	}
 	if (target.status === "working" || target.status === "waiting") {
+		// If the subagent is being taken over by the user, do not block waiting for
+		// a result that only arrives when takeover ends. Report it immediately.
+		if (isTakenOver(target.id)) {
+			const finalText = await getSubagentFinalText(target.id);
+			return {
+				id: target.id,
+				status: "taken_over",
+				output: finalText,
+				formatted: formatAgentAwaitResult(target.id, "taken_over", finalText),
+			};
+		}
 		const waited = await waitForSubagentResult({
 			subagentId: target.id,
 			parentNarratorId: target.parentNarratorId as string,
@@ -530,6 +561,22 @@ export async function sendSubagentMessageDetailed(
 				throw new Error("Target subagent is archived");
 			}
 
+			// If the user has taken over this subagent, the parent must not drive it.
+			// Report the takeover so the agent waits for the user to finish.
+			if (isTakenOver(fresh.id)) {
+				sections.push(
+					`Agent ${fresh.id} is being taken over by the user and cannot be driven right now. ` +
+						`Its result will be available after the user stops the takeover.`,
+				);
+				targetResults.push({
+					id: fresh.id,
+					title: fresh.title,
+					status: "taken_over",
+					awaited: input.shouldAwait,
+				});
+				continue;
+			}
+
 			if (fresh.status === "working" || fresh.status === "waiting") {
 				const buffered = pushSubagentBufferedMessage(
 					fresh.id,
@@ -652,7 +699,8 @@ function normalizeSendStatus(status: string): SendTargetResult["status"] {
 		status === "failed" ||
 		status === "timeout" ||
 		status === "aborted" ||
-		status === "cancelled"
+		status === "cancelled" ||
+		status === "taken_over"
 	) {
 		return status;
 	}

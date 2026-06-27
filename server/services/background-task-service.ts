@@ -411,8 +411,51 @@ class BackgroundTaskService {
 		this.abortControllers.set(taskId, ctrl);
 	}
 
+	/**
+	 * Silently end a background task row because the user took it over.
+	 * Unlike markCancelled, this emits NO cancellation events/broadcasts — the
+	 * subagent is now driven directly by the user (its narrator carries the
+	 * taken_over state). Sets the row to "cancelled" so the await/background
+	 * paths fall through to narrator-state handling and report it as taken over.
+	 */
+	async markTakenOver(taskId: string): Promise<void> {
+		const now = new Date().toISOString();
+		await db
+			.update(backgroundTasks)
+			.set({ status: "cancelled", completedAt: now, updatedAt: now })
+			.where(and(eq(backgroundTasks.id, taskId), eq(backgroundTasks.status, "running")));
+		this.cleanupRuntime(taskId);
+	}
+
 	unregisterAbortController(taskId: string): void {
 		this.abortControllers.delete(taskId);
+	}
+
+	/**
+	 * Restore a taken-over background task row to its terminal result after the
+	 * user stops takeover. The row was set to "cancelled" by markTakenOver during
+	 * takeover; this rewrites it to completed/failed with the real output so the
+	 * parent's Await path returns the actual result instead of a stale cancel.
+	 * Emits NO events/broadcasts — the completion notification is pushed by
+	 * finalizeTakenOverBackgroundSubagent.
+	 */
+	async finalizeTakenOver(taskId: string, hasError: boolean, output: string): Promise<void> {
+		const now = new Date().toISOString();
+		const outputBytes = Buffer.byteLength(output, "utf-8");
+		const truncated = outputBytes > MAX_OUTPUT_BYTES;
+		const storedOutput = truncated ? truncateToBytes(output, MAX_OUTPUT_BYTES) : output;
+		await db
+			.update(backgroundTasks)
+			.set({
+				status: hasError ? "failed" : "completed",
+				output: storedOutput,
+				outputBytes,
+				outputTruncated: truncated,
+				completedAt: now,
+				updatedAt: now,
+			})
+			.where(eq(backgroundTasks.id, taskId));
+		this.cleanupRuntime(taskId);
 	}
 
 	registerKillHandler(taskId: string, handler: () => void): void {

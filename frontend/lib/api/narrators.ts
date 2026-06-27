@@ -223,6 +223,12 @@ export const narratorsApi = {
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	detachSubagent: (id: string) =>
 		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
+	takeoverSubagent: (id: string) =>
+		request<{ takenOver: boolean }>(`/narrators/${id}/takeover`, { method: "POST" }),
+	stopTakeoverSubagent: (id: string) =>
+		request<{ stopped: boolean; deferred?: boolean }>(`/narrators/${id}/stop-takeover`, {
+			method: "POST",
+		}),
 	cancelBackgroundTask: (narratorId: string, taskId: string) =>
 		request<{ success: boolean }>(`/narrators/${narratorId}/background-tasks/${taskId}/cancel`, {
 			method: "POST",
@@ -567,6 +573,11 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	continueNarrator: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/continue`, { method: "POST" }),
+	allowRetryToolCall: (narratorId: string, toolUseId: string) =>
+		request<{ ok: boolean }>(
+			`/narrators/${narratorId}/tool-calls/${encodeURIComponent(toolUseId)}/allow-retry`,
+			{ method: "POST" },
+		),
 	rollbackToBlock: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/rollback/${messageId}`, {
 			method: "POST",

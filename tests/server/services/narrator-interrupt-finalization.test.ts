@@ -86,6 +86,9 @@ sqlite.exec(`
 		commit_sha TEXT,
 		command_text TEXT,
 		created_by TEXT,
+		edited_at TEXT,
+		edited_by TEXT,
+		original_content_json TEXT,
 		created_at TEXT NOT NULL
 	);
 	CREATE TABLE narrator_message_refs (

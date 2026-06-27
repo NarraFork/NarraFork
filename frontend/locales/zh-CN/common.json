@@ -189,6 +189,7 @@
 		"narratorRetrying": "重试中",
 		"narratorQueued": "排队中",
 		"narratorManualOverride": "手动接管",
+		"narratorTakenOver": "用户接管中",
 		"containerCreated": "已创建",
 		"containerRunning": "运行中",
 		"containerPaused": "已暂停",

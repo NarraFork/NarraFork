@@ -189,6 +189,7 @@
 		"narratorRetrying": "Retrying",
 		"narratorQueued": "Queued",
 		"narratorManualOverride": "Manual Override",
+		"narratorTakenOver": "Taken over",
 		"containerCreated": "Created",
 		"containerRunning": "Running",
 		"containerPaused": "Paused",

@@ -6,6 +6,60 @@ import type { ToolDefinition, ToolResult } from "../types";
 
 export { isRgAvailable };
 
+/** Maximum bytes to retain from ripgrep stdout before truncating + killing the process. */
+const MAX_GREP_OUTPUT_BYTES = 10 * 1024 * 1024;
+/** Hard timeout for a single ripgrep invocation. Kills the process when elapsed. */
+const GREP_TIMEOUT_MS = 30_000;
+
+/**
+ * Drain a byte stream up to `maxBytes`, invoking `onLimit` once the cap is hit
+ * so the caller can kill the producer process. The stream is always read to
+ * completion (or until the reader is released by a kill) to avoid pipe-buffer
+ * deadlocks. Raw bytes are preserved (no decoding) so charset detection can run
+ * on the result.
+ */
+async function drainBytesWithLimit(
+	stream: ReadableStream<Uint8Array>,
+	maxBytes: number,
+	onLimit: () => void,
+): Promise<{ bytes: Uint8Array; truncated: boolean }> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	let truncated = false;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			if (truncated) continue; // keep draining to let the process exit, but discard
+			if (total + value.byteLength <= maxBytes) {
+				chunks.push(value);
+				total += value.byteLength;
+			} else {
+				const remaining = maxBytes - total;
+				if (remaining > 0) {
+					chunks.push(value.subarray(0, remaining));
+					total += remaining;
+				}
+				truncated = true;
+				onLimit();
+			}
+		}
+	} catch {
+		// Reader released (e.g. process killed) — return what we have.
+	} finally {
+		reader.releaseLock();
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { bytes, truncated };
+}
+
 const DESCRIPTION = `A powerful search tool built on ripgrep
 
   Usage:
@@ -253,34 +307,72 @@ export const grepTool: ToolDefinition = {
 				signal: ctx.signal,
 			});
 
-			// When legacy encoding is enabled with --encoding none, rg outputs raw
-			// bytes. We read as a buffer first and attempt charset detection so that
-			// non-UTF-8 content (e.g. GBK grep results) is decoded correctly.
-			const [stdoutBuf, stderr] = await Promise.all([
-				new Response(proc.stdout).arrayBuffer(),
-				new Response(proc.stderr).text(),
-			]);
-			const exitCode = await proc.exited;
+			// Hard timeout: kill the process if it runs too long (e.g. pathological
+			// regex on a huge tree). Cleared in finally.
+			let timedOut = false;
+			const killProc = () => {
+				try {
+					proc.kill();
+				} catch {
+					// already exited
+				}
+			};
+			const timeoutTimer = setTimeout(() => {
+				timedOut = true;
+				killProc();
+			}, GREP_TIMEOUT_MS);
 
 			let stdout: string;
-			if (settings.agent.legacyEncoding) {
-				const buf = Buffer.from(stdoutBuf);
-				const chardet = await import("chardet");
-				const results = chardet.default.analyse(buf);
-				const best = results[0];
-				if (
-					best &&
-					best.confidence >= 70 &&
-					best.name.toLowerCase() !== "utf-8" &&
-					best.name.toLowerCase() !== "ascii"
-				) {
-					const iconv = await import("iconv-lite");
-					stdout = iconv.default.decode(buf, best.name);
-				} else {
-					stdout = new TextDecoder().decode(stdoutBuf);
+			let stderr: string;
+			let exitCode: number;
+			let outputTruncatedByBytes = false;
+			try {
+				// When legacy encoding is enabled with --encoding none, rg outputs raw
+				// bytes. We read as raw bytes first and attempt charset detection so that
+				// non-UTF-8 content (e.g. GBK grep results) is decoded correctly.
+				// Stdout is bounded to MAX_GREP_OUTPUT_BYTES; exceeding it kills rg so a
+				// runaway search cannot pin the event loop or exhaust memory.
+				const [stdoutResult, stderrResult] = await Promise.all([
+					drainBytesWithLimit(
+						proc.stdout as ReadableStream<Uint8Array>,
+						MAX_GREP_OUTPUT_BYTES,
+						killProc,
+					),
+					new Response(proc.stderr).text(),
+				]);
+				const stdoutBytes = stdoutResult.bytes;
+				outputTruncatedByBytes = stdoutResult.truncated;
+				stderr = stderrResult;
+				exitCode = await proc.exited;
+
+				if (timedOut) {
+					return {
+						output: `ripgrep timed out after ${GREP_TIMEOUT_MS / 1000}s and was terminated. Narrow your search (add a path, glob, or type filter).`,
+						isError: true,
+					};
 				}
-			} else {
-				stdout = new TextDecoder().decode(stdoutBuf);
+
+				if (settings.agent.legacyEncoding) {
+					const buf = Buffer.from(stdoutBytes);
+					const chardet = await import("chardet");
+					const results = chardet.default.analyse(buf);
+					const best = results[0];
+					if (
+						best &&
+						best.confidence >= 70 &&
+						best.name.toLowerCase() !== "utf-8" &&
+						best.name.toLowerCase() !== "ascii"
+					) {
+						const iconv = await import("iconv-lite");
+						stdout = iconv.default.decode(buf, best.name);
+					} else {
+						stdout = new TextDecoder().decode(stdoutBytes);
+					}
+				} else {
+					stdout = new TextDecoder().decode(stdoutBytes);
+				}
+			} finally {
+				clearTimeout(timeoutTimer);
 			}
 
 			// Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)
@@ -312,6 +404,12 @@ export const grepTool: ToolDefinition = {
 			// Split output into lines
 			const rawLines = stdout.trimEnd().split(/\r?\n/);
 
+			// If stdout was cut off at the byte cap, the final line may be partial —
+			// drop it so we never emit a corrupted match line.
+			if (outputTruncatedByBytes && rawLines.length > 1) {
+				rawLines.pop();
+			}
+
 			// Apply offset and head_limit
 			let lines = rawLines;
 			if (offset > 0) {
@@ -337,6 +435,11 @@ export const grepTool: ToolDefinition = {
 					`\n(Results limited to ${headLimit} entries. ${rawLines.length - offset - headLimit} more available.)`,
 				);
 			}
+			if (outputTruncatedByBytes) {
+				suffix.push(
+					`\n(Output exceeded ${MAX_GREP_OUTPUT_BYTES / (1024 * 1024)}MB and was truncated. Narrow your search with a path, glob, or type filter.)`,
+				);
+			}
 			if (hasErrors) {
 				suffix.push("\n(Some paths were inaccessible and skipped)");
 			}
@@ -346,7 +449,7 @@ export const grepTool: ToolDefinition = {
 				title: pattern,
 				metadata: {
 					matches: rawLines.length,
-					truncated,
+					truncated: truncated || outputTruncatedByBytes,
 				},
 			};
 		} catch (err) {

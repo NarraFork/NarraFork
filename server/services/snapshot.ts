@@ -16,6 +16,10 @@ import { safeSpawn } from "../lib/spawn";
 
 const SNAPSHOTS_DIR = resolve(homedir(), ".narrafork", "snapshots");
 
+/** Hard timeout for shadow-repo git commands. Local ops are fast; this guards
+ * against a hung git (e.g. stale lock) blocking snapshot/fork/diff flows. */
+const SNAPSHOT_GIT_TIMEOUT_MS = 60_000;
+
 export interface PatchInfo {
 	beforeHash: string;
 	afterHash: string;
@@ -42,6 +46,9 @@ async function execGit(
 ): Promise<ExecResult> {
 	const result = await safeSpawn({
 		cmd: ["git", "--git-dir", gitDir, "--work-tree", workTree, ...args],
+		// Shadow-repo git ops are local and fast; a hung git (e.g. stale index.lock)
+		// must not block the caller indefinitely. safeSpawn already caps output at 10MB.
+		timeout: SNAPSHOT_GIT_TIMEOUT_MS,
 	});
 	if (result.exitCode !== 0 && !silent) {
 		logger.error("snapshot git command failed", {

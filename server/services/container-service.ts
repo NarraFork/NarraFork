@@ -355,6 +355,11 @@ function cleanStderr(raw: string): string {
 		.trim();
 }
 
+/** Hard timeout for quick (non-streaming) podman commands. */
+const PODMAN_EXEC_TIMEOUT_MS = 120_000;
+/** Default `--tail` applied to container logs when the caller does not specify one. */
+const DEFAULT_LOG_TAIL_LINES = 2000;
+
 async function exec(
 	args: string[],
 	cwd: string,
@@ -365,6 +370,10 @@ async function exec(
 		cmd: ["podman", ...args],
 		cwd,
 		env: { ...process.env, ...env },
+		// Quick podman ops only (ps/inspect/down/pause/stop/logs). Long-running
+		// builds go through execStreaming (10min timeout), never here. Guard against
+		// a hung podman pinning the caller.
+		timeout: PODMAN_EXEC_TIMEOUT_MS,
 	});
 	const stderr = cleanStderr(result.stderr);
 	if (result.exitCode !== 0) {
@@ -1148,7 +1157,10 @@ export const containerService = {
 		if (!composeFile) return "";
 
 		const args = ["compose", "-f", composeFile, "logs"];
-		if (opts.tail) args.push("--tail", String(opts.tail));
+		// Always bound log volume: an unbounded `logs` on a long-running container
+		// can return a huge payload. Callers may pass a larger explicit tail.
+		const tail = opts.tail ?? DEFAULT_LOG_TAIL_LINES;
+		args.push("--tail", String(tail));
 		if (opts.service) args.push(opts.service);
 
 		const result = await exec(args, chapter.worktreePath);

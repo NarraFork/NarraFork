@@ -51,6 +51,13 @@ import {
 	type SubagentExecOptions,
 } from "./subagent-executor";
 import { getManualOverrideMap, waitForManualOverride } from "./subagent-manual-override";
+import {
+	clearTakenOver,
+	consumePendingTakeover,
+	isBackgroundTakenOver,
+	isTakenOver,
+	markTakenOver,
+} from "./subagent-takeover";
 import { clearTeamInbox } from "./subagent-team";
 import { buildSubagentSystemPrompt } from "./subagent-tools";
 
@@ -158,6 +165,161 @@ async function isBackgroundTaskCancelled(taskId: string): Promise<boolean> {
 	return task?.status === "cancelled";
 }
 
+/**
+ * Finalize a subagent that was taken over while it had been a background task.
+ * Restores background completion semantics so the parent (which holds the
+ * background_task_id) can retrieve the result via Await / completion sidecar.
+ * Pushes the completion notification directly (the background task row was
+ * silently ended during takeover, so the normal task-row transition is skipped).
+ */
+export async function finalizeTakenOverBackgroundSubagent(
+	narratorId: string,
+	parentNarratorId: string,
+	toolUseId: string,
+	hasError: boolean,
+	finalText: string,
+	locale: Locale = "en",
+): Promise<void> {
+	const now = new Date().toISOString();
+	await db
+		.update(narrators)
+		.set({
+			isBackground: true,
+			backgroundStatus: hasError ? "failed" : "completed",
+			backgroundResult: finalText || "(no output)",
+			backgroundCompletedAt: now,
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, narratorId));
+
+	// Restore the background task row (set to "cancelled" during takeover) to its
+	// real terminal result so the parent's Await path returns the actual output
+	// instead of a stale cancellation. The task id equals the subagent narrator id.
+	await backgroundTaskService.finalizeTakenOver(narratorId, hasError, finalText || "(no output)");
+
+	const title = (await narratorService.getById(narratorId).catch(() => null))?.title ?? narratorId;
+	const resultPreview = (finalText || "").slice(0, 500);
+
+	if (hasError) {
+		eventBus.emit({
+			type: "narrator:background_task_failed",
+			narratorId: parentNarratorId,
+			parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			error: finalText,
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "background_task_failed",
+			narratorId: parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			error: finalText,
+		});
+		pushBgCompletionNotification(parentNarratorId, {
+			id: narratorId,
+			title,
+			status: "failed",
+			resultPreview,
+			result: finalText,
+		});
+	} else {
+		eventBus.emit({
+			type: "narrator:background_task_completed",
+			narratorId: parentNarratorId,
+			parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			resultPreview,
+		});
+		broadcastToNarrator(parentNarratorId, {
+			type: "background_task_completed",
+			narratorId: parentNarratorId,
+			taskNarratorId: narratorId,
+			toolUseId,
+			resultPreview,
+		});
+		pushBgCompletionNotification(parentNarratorId, {
+			id: narratorId,
+			title,
+			status: "completed",
+			resultPreview,
+			result: finalText,
+		});
+	}
+
+	startBackgroundCompletionContinuationIfPossible(parentNarratorId, locale).catch((err) => {
+		logger.warn("Failed to start parent narrator for taken-over background completion", {
+			parentNarratorId,
+			taskNarratorId: narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	});
+}
+
+/**
+ * Transition a background subagent that was just taken over into the idle
+ * takeover state: leave background mode (so the user can operate it via the
+ * normal narrator-session engine), keep the taken_over substatus, and stop
+ * tracking it as a background task. The parent is NOT notified of completion —
+ * results are returned only when the user stops takeover.
+ */
+async function transitionBackgroundTakenOverToIdle(
+	narratorId: string,
+	parentNarratorId: string,
+	toolUseId: string,
+): Promise<void> {
+	const now = new Date().toISOString();
+	const subNarrator = await narratorService.getById(narratorId).catch(() => null);
+	const updatedTraits = subNarrator
+		? parseTraits(subNarrator.traits).filter((t) => t !== "background")
+		: undefined;
+	await db
+		.update(narrators)
+		.set({
+			isBackground: false,
+			backgroundStatus: null,
+			backgroundResult: null,
+			backgroundCompletedAt: null,
+			...(updatedTraits ? { traits: updatedTraits } : {}),
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, narratorId));
+
+	// idle[taken_over] — preserveTakenOverSubstatus keeps the tag because the
+	// in-memory takeover Set is still set.
+	await narratorService.updateStatus(narratorId, "idle", {
+		substatus: ["taken_over"],
+		skipErrorMessage: true,
+	});
+
+	// Stop tracking as a background task (silently — no cancellation broadcast).
+	getBackgroundAbortControllers().delete(narratorId);
+	backgroundTaskService.unregisterAbortController(narratorId);
+	await backgroundTaskService.markTakenOver(narratorId).catch(() => {});
+
+	// Notify the parent's SubagentCard + the subagent page that it is now taken over.
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_suspended",
+		narratorId: parentNarratorId,
+		subagentNarratorId: narratorId,
+		toolUseId,
+	});
+	broadcastToNarrator(parentNarratorId, {
+		type: "subagent_status_changed",
+		narratorId: parentNarratorId,
+		subagentNarratorId: narratorId,
+		status: "idle",
+		substatus: ["taken_over"],
+	});
+	broadcastToNarrator(narratorId, {
+		type: "status_change",
+		narratorId,
+		status: "idle",
+		substatus: ["taken_over"],
+	});
+}
+
 /** Broadcast subagent_started event. */
 export function broadcastSubagentStarted(
 	subagentId: string,
@@ -208,6 +370,14 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 
 		if (await isBackgroundTaskCancelled(narratorId)) return;
 
+		// Background takeover: the loop was interrupted by a user takeover. Do not
+		// finalize/notify as completed/failed — transition to the idle takeover
+		// state so the user can operate the subagent directly.
+		if (isBackgroundTakenOver(narratorId)) {
+			await transitionBackgroundTakenOverToIdle(narratorId, parentNarratorId, toolUseId);
+			return;
+		}
+
 		// Finalize the subagent narrator status
 		await finalizeSubagent(
 			narratorId,
@@ -227,6 +397,12 @@ export async function executeBackgroundTask(opts: SubagentExecOptions): Promise<
 		);
 	} catch (err) {
 		if (await isBackgroundTaskCancelled(narratorId)) return;
+
+		// Background takeover during execution — same as above.
+		if (isBackgroundTakenOver(narratorId)) {
+			await transitionBackgroundTakenOverToIdle(narratorId, parentNarratorId, toolUseId);
+			return;
+		}
 
 		const errorText = err instanceof Error ? err.message : String(err);
 		logger.error("Background task execution failed", { narratorId, error: errorText });
@@ -526,9 +702,19 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 				}
 				// Detect subagent-only interrupt (not parent abort)
 				if (!hasError && fgAbort.signal.aborted && !signal.aborted) {
-					// --- Manual override: block until user clicks "Update Conclusion" ---
+					// --- Suspend: block until the user resolves (Update Conclusion)
+					// or, for an explicit takeover, until the user stops takeover. ---
+					// If this interrupt was triggered by a takeover request, mark the
+					// subagent taken over and use the taken_over substatus so the
+					// parent tool call stays running ("user is operating") instead of
+					// showing a plain manual_override suspension.
+					const isTakeover = consumePendingTakeover(subagentId);
+					if (isTakeover) {
+						markTakenOver(subagentId);
+					}
+					const suspendSubstatus = isTakeover ? ["taken_over"] : ["manual_override"];
 					await narratorService.updateStatus(subagentId, "idle", {
-						substatus: ["manual_override"],
+						substatus: suspendSubstatus,
 					});
 					broadcastToNarrator(parentNarratorId, {
 						type: "subagent_suspended",
@@ -540,7 +726,7 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 						type: "status_change",
 						narratorId: subagentId,
 						status: "idle",
-						substatus: ["manual_override"],
+						substatus: suspendSubstatus,
 					});
 
 					const overrideResult = await waitForManualOverride(
@@ -561,6 +747,12 @@ export async function runForegroundLoop(input: ForegroundLoopInput): Promise<str
 						finalText = "Subagent interrupted because parent narrator was interrupted";
 						hasError = false;
 					}
+				} else if (consumePendingTakeover(subagentId) || isTakenOver(subagentId)) {
+					// A takeover was requested but this turn ended with an error (or
+					// otherwise did not enter the suspend branch), so finalizeSubagent
+					// will return to the parent. Clear takeover state so it does not
+					// leak (which would strand the taken_over tag and block Send/Await).
+					clearTakenOver(subagentId);
 				}
 				break;
 			}

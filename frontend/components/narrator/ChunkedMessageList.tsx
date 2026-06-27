@@ -1,4 +1,4 @@
-import { Box } from "@mantine/core";
+import { Box, Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	forwardRef,
@@ -14,6 +14,8 @@ import {
 	useState,
 	useTransition,
 } from "react";
+import { useTranslation } from "react-i18next";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
 	estimateSeqCenteredScrollTop,
@@ -715,6 +717,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		const followTail = useCallback(() => {
 			scheduleFollowTailRef.current();
 		}, []);
+		const { t } = useTranslation("narrator");
+		const { data: userPrefs } = useUserPreferences();
+		// When auto-load is disabled, scrolling to the top no longer fetches older
+		// history; a manual "load older" button is shown instead (see maybeLoadOlder
+		// and the top-of-list button below).
+		const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 		const {
 			chunks,
 			loading,
@@ -874,6 +882,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// Guards an upward manifest expansion + its scroll-position compensation,
 		// so a single trigger doesn't stack while the prepended band mounts.
 		const expandingOlderRef = useRef(false);
+		// Drives the manual "load older" button's loading state (only meaningful
+		// when auto-load is disabled).
+		const [loadingOlder, setLoadingOlder] = useState(false);
 		const updateAtBottom = useCallback(
 			(atBottom: boolean) => {
 				setIsAtBottom(atBottom);
@@ -1361,12 +1372,13 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		// user scrolls near the start of the loaded history. Compensates scrollTop by
 		// the height the prepended band adds so the viewport stays visually anchored
 		// (native scroll anchoring is unreliable across the spacer/measure churn here).
-		const maybeLoadOlder = useCallback(() => {
+		const expandOlderWindow = useCallback(() => {
 			if (expandingOlderRef.current) return;
 			if (!hasOlderChunksRef.current) return;
 			const el = scrollerRef.current;
-			if (!el || el.scrollTop > OLDER_LOAD_TRIGGER_PX) return;
+			if (!el) return;
 			expandingOlderRef.current = true;
+			setLoadingOlder(true);
 			const prevScrollTop = el.scrollTop;
 			const prevScrollHeight = el.scrollHeight;
 			void (async () => {
@@ -1383,9 +1395,20 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (delta > 0) node.scrollTop = prevScrollTop + delta;
 				} finally {
 					expandingOlderRef.current = false;
+					setLoadingOlder(false);
 				}
 			})();
 		}, []);
+		// Scroll-driven trigger. Gated on the auto-load preference: when disabled the
+		// user must use the manual "load older" button at the top of the list.
+		const autoLoadEnabledRef = useRef(autoLoadEnabled);
+		autoLoadEnabledRef.current = autoLoadEnabled;
+		const maybeLoadOlder = useCallback(() => {
+			if (!autoLoadEnabledRef.current) return;
+			const el = scrollerRef.current;
+			if (!el || el.scrollTop > OLDER_LOAD_TRIGGER_PX) return;
+			expandOlderWindow();
+		}, [expandOlderWindow]);
 		// Stable ref so the `[]` scroll-handler effect can call it without
 		// re-subscribing (it accesses all live values through refs).
 		const maybeLoadOlderRef = useRef(maybeLoadOlder);
@@ -1686,6 +1709,18 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					}}
 				>
 					<div ref={setContentNode} style={{ padding: CONTENT_PADDING }}>
+						{!autoLoadEnabled && hasOlderChunks && (
+							<Box ta="center" py={4}>
+								<Button
+									size="compact-xs"
+									variant="light"
+									onClick={expandOlderWindow}
+									loading={loadingOlder}
+								>
+									{t("loadOlderMessages")}
+								</Button>
+							</Box>
+						)}
 						{topSpacer > 0 && <div style={{ height: topSpacer }} aria-hidden />}
 						{mountedChunks.map((chunk) =>
 							chunk.messages ? (

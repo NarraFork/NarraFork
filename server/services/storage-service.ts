@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narratorMessages, narrators, projects } from "../db/schema";
 import { logger } from "../lib/logger";
@@ -291,9 +291,14 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 		.from(narrators)
 		.all()
 		.map((n) => n.id);
+	// Only messages that contain an image block can pin an upload dir. Pre-filter
+	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
+	// which requires the literal `"type":"image"`) so we avoid loading every
+	// message's content_json into memory. The exact check below stays authoritative.
 	const uploadMessageOwners = db
 		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
 		.from(narratorMessages)
+		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
 		.all();
 	const preservedOwnerIds = buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
 

@@ -190,6 +190,24 @@ export const FileModDrawerCtx = createContext<{
 	openForApproval: () => void;
 }>({ openForApproval: () => {} });
 
+/**
+ * Context that lets a denied tool call in the latest assistant turn offer an
+ * "allow and execute" action. Only enabled when the narrator is idle/interrupted
+ * (no live loop running) so re-execution does not race the agent loop.
+ */
+export const AllowRetryCtx = createContext<{
+	/** True when the narrator is idle/interrupted and re-execution is permitted. */
+	enabled: boolean;
+	/** The latest top-level assistant message ID — only its tool calls may retry. */
+	latestAssistantMessageId: string | null;
+	/** Trigger re-execution of a denied tool call by its toolUseId. */
+	onAllowRetry: (toolUseId: string) => void;
+}>({
+	enabled: false,
+	latestAssistantMessageId: null,
+	onAllowRetry: () => {},
+});
+
 const noop = () => {};
 
 /**
@@ -322,6 +340,35 @@ const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
+
+/**
+ * Tools that cannot be re-executed via "allow and execute" (control / UI tools
+ * with no replayable side effects). Must mirror the backend
+ * NON_RERUNNABLE_TOOL_NAMES set in narrator-session.ts.
+ */
+const NON_RERUNNABLE_TOOL_NAMES = new Set([
+	"ExitPlanMode",
+	"EnterPlanMode",
+	"AskUserQuestion",
+	"TodoWrite",
+	"TaskCreate",
+	"StartPipeline",
+	"EndPipeline",
+]);
+
+/** permissionDecidedBy values that mark a tool call as re-runnable (stopped at the gate). */
+const RERUNNABLE_DECIDED_BY = new Set(["user", "aborted"]);
+
+/** Whether a failed tool call can offer an "allow and execute" action. */
+export function canAllowRetryToolCall(toolCall: ToolCallData): boolean {
+	return (
+		toolCall.status === "fail" &&
+		!!toolCall.toolUseId &&
+		!NON_RERUNNABLE_TOOL_NAMES.has(toolCall.toolName) &&
+		!!toolCall.permissionDecidedBy &&
+		RERUNNABLE_DECIDED_BY.has(toolCall.permissionDecidedBy)
+	);
+}
 
 export type ToolCategory =
 	| "read"
@@ -4534,6 +4581,44 @@ function PermButtonBar({
 	);
 }
 
+// --- Inline allow-and-retry UI for denied tool calls ---
+
+/**
+ * Renders an "allow and execute" button for a tool call that was denied (or
+ * whose pending permission was cancelled by an interrupt) in the latest
+ * assistant turn. Clicking re-executes the tool and auto-continues the loop.
+ */
+function InlineAllowRetry({
+	toolUseId,
+	onAllowRetry,
+}: {
+	toolUseId: string;
+	onAllowRetry: (toolUseId: string) => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [submitting, setSubmitting] = useState(false);
+	return (
+		<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
+			<Text size="xs" c="dimmed" mb={4}>
+				{t("allowRetryHint")}
+			</Text>
+			<Button
+				size="xs"
+				color="green"
+				variant="light"
+				leftSection={<IconPlayerPlay size={12} />}
+				loading={submitting}
+				onClick={() => {
+					setSubmitting(true);
+					onAllowRetry(toolUseId);
+				}}
+			>
+				{t("allowAndExecute")}
+			</Button>
+		</Box>
+	);
+}
+
 // --- Inline permission UI rendered inside the tool call card ---
 
 const PERMISSION_DRAFT_STORAGE_MAX_CHARS = 256_000;
@@ -5172,6 +5257,15 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const permissionCapability = useNarratorPermissionsCapability();
 	const permissionDecisionsSupported =
 		permissionCapability.supported && permissionCapability.approveDeny;
+	const allowRetryCtx = useContext(AllowRetryCtx);
+	const msgCtx = useMessageContextMenu();
+	const canOfferAllowRetry =
+		!pendingPermission &&
+		permissionDecisionsSupported &&
+		allowRetryCtx.enabled &&
+		canAllowRetryToolCall(toolCall) &&
+		!!msgCtx.messageId &&
+		msgCtx.messageId === allowRetryCtx.latestAssistantMessageId;
 	const reflection = getToolCallReflection(toolCall, pendingPermission);
 	const permissionUI =
 		reflection && reflection.status !== "awaiting_user" ? (
@@ -5190,6 +5284,8 @@ export const ToolCallCard = memo(function ToolCallCard({
 				onQuestionDeny={onQuestionDeny}
 				onPlanPreviewChange={handlePlanPreviewChange}
 			/>
+		) : canOfferAllowRetry && toolCall.toolUseId ? (
+			<InlineAllowRetry toolUseId={toolCall.toolUseId} onAllowRetry={allowRetryCtx.onAllowRetry} />
 		) : null;
 
 	const handleToggle = isStreaming || !interactionEnabled ? undefined : () => setOpened((o) => !o);
@@ -5209,7 +5305,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const [inspectorOpened, setInspectorOpened] = useState(false);
 
 	// --- Message-level context menu actions (branch / fork / compact / delete) ---
-	const msgCtx = useMessageContextMenu();
 	const { t: tNarrator } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const hasMessageActions = !!(

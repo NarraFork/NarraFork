@@ -19,6 +19,7 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import type { PermissionMode } from "../lib/permission-modes";
 import { getMinPruneRatio } from "../lib/settings/provider";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import { preserveTakenOverSubstatus } from "./subagent-takeover";
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -1036,6 +1037,10 @@ export const narratorPersistence = {
 					parseSubstatus(row?.substatus),
 					requestedSubstatus,
 				);
+				// Keep the taken_over tag alive across loop-completion overwrites
+				// (finalizeSubagent / status transitions) while the in-memory
+				// takeover state is active.
+				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
 			}
 			await db
 				.update(narrators)
@@ -1162,6 +1167,7 @@ export const narratorPersistence = {
 					parseSubstatus(row?.substatus),
 					requestedSubstatus,
 				);
+				actualSubstatus = preserveTakenOverSubstatus(narratorId, actualSubstatus);
 			}
 			const substatusJson =
 				actualSubstatus !== undefined ? JSON.stringify(actualSubstatus) : undefined;

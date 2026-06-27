@@ -82,13 +82,31 @@ export {
 	cancelBackgroundTask,
 	continueSubagent,
 	executeBackgroundTask,
+	finalizeTakenOverBackgroundSubagent,
 	getBackgroundTaskStatus,
 	type RunSubagentInput,
 	runForegroundLoop,
 	runSubagent,
 	waitForBackgroundTask,
 } from "./subagent-runner";
-
+// Takeover state
+export {
+	clearPendingTakeover,
+	clearTakenOver,
+	consumePendingBackgroundFinalize,
+	consumePendingStopTakeover,
+	consumePendingTakeover,
+	hydrateTakeoverState,
+	isBackgroundTakenOver,
+	isPendingStopTakeover,
+	isTakenOver,
+	markPendingBackgroundFinalize,
+	markPendingStopTakeover,
+	markPendingTakeover,
+	markTakenOver,
+	preserveTakenOverSubstatus,
+	TAKEN_OVER_SUBSTATUS,
+} from "./subagent-takeover";
 // Team collaboration
 export {
 	clearTeamFileChanges,
