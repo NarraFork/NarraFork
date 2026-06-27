@@ -3,24 +3,51 @@ import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
-const narraforkDir = resolve(homedir(), ".narrafork");
+/**
+ * Resolve the NarraFork data directory.
+ *
+ * Honors the `NARRAFORK_HOME` environment variable (same convention used by the
+ * gateway weixin modules) so tests and advanced setups can point the SQLite
+ * database at an isolated location instead of the real `~/.narrafork`. Resolved
+ * lazily on every call so the env var can be set after module load (e.g. in a
+ * test preload).
+ */
+function resolveNarraforkDir(): string {
+	const override = process.env.NARRAFORK_HOME;
+	if (override) return resolve(override);
+	return resolve(homedir(), ".narrafork");
+}
 
 export function getDbDir(): string {
-	return narraforkDir;
+	return resolveNarraforkDir();
 }
 
 export function getDbPath(): string {
-	return resolve(narraforkDir, "narrafork.db");
+	return resolve(resolveNarraforkDir(), "narrafork.db");
 }
 
 /** Open a SQLite connection with standard NarraFork PRAGMA settings. */
 export function openDatabase(dbPath?: string): Database {
-	mkdirSync(narraforkDir, { recursive: true });
+	mkdirSync(resolveNarraforkDir(), { recursive: true });
 	const conn = new Database(dbPath ?? getDbPath());
+	// WAL: concurrent readers + single writer; readers don't block the writer.
 	conn.run("PRAGMA journal_mode = WAL");
+	// NORMAL is crash-safe under WAL (only fsyncs at checkpoint, not every commit).
+	// Committed transactions can only be lost on power loss, never on app crash —
+	// a worthwhile trade for avoiding an fsync on every write.
+	conn.run("PRAGMA synchronous = NORMAL");
 	conn.run("PRAGMA foreign_keys = ON");
 	// Keep SQLite lock waits short: bun:sqlite executes synchronously on the JS thread,
 	// so multi-second busy waits make the whole HTTP/WS server appear frozen.
+	// SQLITE_BUSY is handled at the application layer via withDbRetry (async backoff).
 	conn.run("PRAGMA busy_timeout = 250");
+	// 16 MB page cache (negative value = KiB) to reduce disk reads on hot pages.
+	conn.run("PRAGMA cache_size = -16000");
+	// Keep temp tables / indexes in memory instead of spilling to disk.
+	conn.run("PRAGMA temp_store = MEMORY");
+	// Memory-map up to 256 MB of the database to cut read() syscalls.
+	conn.run("PRAGMA mmap_size = 268435456");
+	// Auto-checkpoint when the WAL reaches ~1000 pages (~4 MB) to bound its growth.
+	conn.run("PRAGMA wal_autocheckpoint = 1000");
 	return conn;
 }
