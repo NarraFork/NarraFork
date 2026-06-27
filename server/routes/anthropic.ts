@@ -129,7 +129,18 @@ interface FetchAnthropicModelsResult {
 	resolvedBaseUrl?: string;
 }
 
-/** Fetch models from Anthropic API. */
+/**
+ * Fetch the model list for an Anthropic-compatible provider.
+ *
+ * Background: the official Anthropic Messages API has **no model-list
+ * endpoint** — `GET /v1/models` is an OpenAI convention. Third-party relays
+ * that speak the Anthropic protocol therefore expose their model list at the
+ * OpenAI-style `/v1/models` path, which often lives at the host root rather
+ * than under the Anthropic messages base path. For example xiaomi serves
+ * messages at `https://host/anthropic/v1` but its model list at
+ * `https://host/v1/models`. Because of this we try a series of candidate base
+ * URLs (including the host origin) until one returns a valid list.
+ */
 async function fetchAnthropicModels(
 	config: AnthropicProviderConfig,
 ): Promise<FetchAnthropicModelsResult> {
@@ -152,38 +163,57 @@ async function fetchAnthropicModels(
 	let response = await fetch(`${baseUrl}/models`, { headers });
 	let resolvedBaseUrl: string | undefined;
 
-	// If failed and baseUrl doesn't already end with /v1, retry with /v1 appended
-	if (!response.ok && !/\/v1\/?$/i.test(baseUrl)) {
-		logger.debug("Anthropic models fetch failed, retrying with /v1 suffix", {
-			originalUrl: `${baseUrl}/models`,
-			status: response.status,
-		});
-		response = await fetch(`${baseUrl}/v1/models`, { headers });
-		if (response.ok) {
-			resolvedBaseUrl = `${baseUrl}/v1`;
-		}
-	}
+	if (!response.ok) {
+		// Build an ordered list of fallback base URLs to try for the /models
+		// endpoint. Different relays expose the model list at different paths.
+		// `suggest` marks whether the candidate is also a valid *messages* base
+		// URL worth surfacing to the user as a correction. Origin-based
+		// candidates are NOT suggested: the model list may live at the host root
+		// while messages stay under a sub-path (e.g. xiaomi serves messages at
+		// https://host/anthropic/v1 but the model list at https://host/v1), so
+		// rewriting the messages baseUrl to the origin would break chat.
+		const candidates: Array<{ base: string; suggest: boolean }> = [];
+		const seenCandidates = new Set<string>([baseUrl]);
+		const pushCandidate = (b: string, suggest: boolean) => {
+			if (b && !seenCandidates.has(b)) {
+				seenCandidates.add(b);
+				candidates.push({ base: b, suggest });
+			}
+		};
 
-	// If still failed and baseUrl ends with a known gateway suffix (e.g. /anthropic),
-	// retry with the suffix stripped. Common for third-party proxies like
-	// https://api.deepseek.com/anthropic or https://token-plan-cn.xiaomimimo.com/anthropic
-	if (!response.ok && /\/[a-z][\w-]*$/i.test(baseUrl)) {
-		const strippedUrl = baseUrl.replace(/\/[a-z][\w-]*$/i, "");
-		if (strippedUrl !== baseUrl && strippedUrl.length > 0) {
-			logger.debug("Anthropic models fetch failed, retrying with suffix stripped", {
+		if (!/\/v1\/?$/i.test(baseUrl)) pushCandidate(`${baseUrl}/v1`, true);
+
+		// Strip a trailing gateway path segment (e.g. /anthropic or /v1).
+		if (/\/[a-z][\w-]*$/i.test(baseUrl)) {
+			const stripped = baseUrl.replace(/\/[a-z][\w-]*$/i, "");
+			if (stripped.length > 0) {
+				pushCandidate(stripped, true);
+				if (!/\/v1\/?$/i.test(stripped)) pushCandidate(`${stripped}/v1`, true);
+			}
+		}
+
+		// Host root + /v1 (and bare host root). Since the model list is an
+		// OpenAI-style endpoint (Anthropic has none), relays commonly serve it at
+		// `{origin}/v1/models` regardless of where the Anthropic messages base
+		// path points. NOT suggested as a messages baseUrl for the same reason.
+		try {
+			const origin = new URL(baseUrl).origin;
+			pushCandidate(`${origin}/v1`, false);
+			pushCandidate(origin, false);
+		} catch {
+			// baseUrl not a valid absolute URL — skip origin-based candidates
+		}
+
+		for (const candidate of candidates) {
+			logger.debug("Anthropic models fetch retry", {
 				originalUrl: `${baseUrl}/models`,
-				strippedUrl: `${strippedUrl}/models`,
+				retryUrl: `${candidate.base}/models`,
 				status: response.status,
 			});
-			response = await fetch(`${strippedUrl}/models`, { headers });
+			response = await fetch(`${candidate.base}/models`, { headers });
 			if (response.ok) {
-				resolvedBaseUrl = strippedUrl;
-			} else if (!/\/v1\/?$/i.test(strippedUrl)) {
-				// Also try stripped + /v1
-				response = await fetch(`${strippedUrl}/v1/models`, { headers });
-				if (response.ok) {
-					resolvedBaseUrl = `${strippedUrl}/v1`;
-				}
+				resolvedBaseUrl = candidate.suggest ? candidate.base : undefined;
+				break;
 			}
 		}
 	}

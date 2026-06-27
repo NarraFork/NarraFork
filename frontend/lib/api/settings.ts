@@ -24,6 +24,14 @@ export const settingsApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	fixProviderBaseUrl: (providerId: string) =>
+		request<{ ok: boolean; providerId: string; baseUrl: string }>(
+			"/settings/fix-provider-baseurl",
+			{
+				method: "POST",
+				body: JSON.stringify({ providerId }),
+			},
+		),
 	testModel: (model: string, prompt: string) =>
 		request<{ text: string }>("/settings/test-model", {
 			method: "POST",

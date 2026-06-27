@@ -1232,3 +1232,61 @@ settingsRoutes.post("/retry-rules", async (c) => {
 
 	return c.json(rule, 201);
 });
+
+const fixProviderBaseUrlSchema = z.object({
+	providerId: z.string().min(1),
+});
+
+/**
+ * Append a `/v1` suffix to a custom API provider's base URL.
+ *
+ * Triggered from the frontend when a `/v1` fallback succeeded at runtime
+ * (broadcast `provider_baseurl_fix_suggested`). The provider is located by its
+ * stable `providerId`; the suggested URL is recomputed server-side from the
+ * provider's CURRENT base URL (we never trust a client-supplied URL). Persists
+ * to `customApiProviders` and re-derives the legacy openai/anthropic arrays so
+ * all three stay consistent.
+ */
+settingsRoutes.post("/fix-provider-baseurl", async (c) => {
+	const body = await c.req.json();
+	const parsed = fixProviderBaseUrlSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+
+	const current = settings;
+	const customApiProviders =
+		current.customApiProviders ??
+		deriveCustomApiProvidersFromLegacy(current.openaiProviders, current.anthropicProviders);
+
+	const target = customApiProviders.find((p) => p.id === parsed.data.providerId);
+	if (!target) {
+		throw new ValidationError(`Provider "${parsed.data.providerId}" not found.`);
+	}
+
+	const normalized = (target.baseUrl || "").replace(/\/+$/, "");
+	if (/\/v1\/?$/i.test(normalized)) {
+		// Already has /v1 — nothing to fix (idempotent).
+		return c.json({ ok: true, providerId: target.id, baseUrl: target.baseUrl });
+	}
+	const newBaseUrl = `${normalized}/v1`;
+
+	const nextCustomApiProviders = customApiProviders.map((p) =>
+		p.id === target.id ? { ...p, baseUrl: newBaseUrl } : p,
+	);
+
+	const merged: NarraForkSettings = {
+		...current,
+		customApiProviders: nextCustomApiProviders,
+		openaiProviders: customApiProvidersToOpenAI(nextCustomApiProviders),
+		anthropicProviders: customApiProvidersToAnthropic(nextCustomApiProviders),
+	};
+	saveSettings(merged);
+
+	logger.info("Provider base URL fixed with /v1 suffix", {
+		providerId: target.id,
+		prefix: target.prefix,
+		oldBaseUrl: target.baseUrl,
+		newBaseUrl,
+	});
+
+	return c.json({ ok: true, providerId: target.id, baseUrl: newBaseUrl });
+});
