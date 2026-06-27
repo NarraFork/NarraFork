@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { scanToolOutputForKnowledge } from "../../services/knowledge-injection";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
@@ -1582,6 +1583,8 @@ export async function* agentLoop(
 	const countedToolUseIds = new Set<string>();
 	const sideCarCheckedToolUseIds = new Set<string>();
 	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
+	// Knowledge-base entry ids already injected this run (point B de-dup; shared across tool outputs).
+	const knowledgeInjectedEntryIds = new Set<string>();
 
 	function cacheToolResultSideCars(toolUseId: string, sideCars: AgentSideCar[]): AgentSideCar[] {
 		toolResultSideCarCache.set(toolUseId, sideCars);
@@ -1625,6 +1628,36 @@ export async function* agentLoop(
 				orderIndex: 20,
 				toolUseId: tu.toolUseId,
 			});
+		}
+		// Point B: scan this tool's output for relevant knowledge and inject a reminder.
+		// Skip the knowledge tools themselves to avoid self-amplification.
+		if (
+			!tu.name.startsWith("Knowledge") &&
+			typeof result.output === "string" &&
+			result.output.length > 0
+		) {
+			try {
+				const block = await scanToolOutputForKnowledge(
+					config.userId,
+					result.output,
+					knowledgeInjectedEntryIds,
+				);
+				if (block) {
+					sideCars.push({
+						target: "tool_result",
+						source: "knowledge_base_hint",
+						content: block,
+						orderIndex: 30,
+						toolUseId: tu.toolUseId,
+					});
+				}
+			} catch (err) {
+				logger.warn("Knowledge injection (tool output) failed", {
+					narratorId: config.narratorId,
+					toolUseId: tu.toolUseId,
+					error: String(err),
+				});
+			}
 		}
 		if (!countedToolUseIds.has(tu.toolUseId)) {
 			countedToolUseIds.add(tu.toolUseId);

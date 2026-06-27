@@ -1326,3 +1326,296 @@ export const chatGroupMessages = sqliteTable(
 	},
 	(table) => [index("idx_chat_group_messages_group").on(table.groupId, table.createdAt)],
 );
+
+// === knowledge_collections ===
+// Knowledge base namespace/grouping. Project-scoped (projectId set) or global (null).
+export const knowledgeCollections = sqliteTable(
+	"knowledge_collections",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull(),
+		slug: text("slug").notNull(),
+		description: text("description"),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		// Default classification level (knowledge_levels.name) inherited by entries; public = no clearance gate.
+		defaultLevel: text("default_level").notNull().default("public"),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_kc_project_slug").on(table.projectId, table.slug),
+		index("idx_kc_project").on(table.projectId),
+	],
+);
+
+// === knowledge_entries ===
+// A stable knowledge item: metadata + pointer to current revision + redundant current content (for FTS).
+export const knowledgeEntries = sqliteTable(
+	"knowledge_entries",
+	{
+		id: text("id").primaryKey(),
+		collectionId: text("collection_id")
+			.notNull()
+			.references(() => knowledgeCollections.id, { onDelete: "cascade" }),
+		title: text("title").notNull(),
+		slug: text("slug").notNull(),
+		// Points to the latest revision (copy-on-write history lives in knowledge_revisions).
+		currentRevisionId: text("current_revision_id"),
+		// Redundant copy of the current revision's body, maintained by the service layer on addRevision.
+		// FTS triggers read this column so they don't need to join the revisions table.
+		currentContent: text("current_content"),
+		// MVP: tags stored as a JSON string[] on the entry (no separate tag table yet).
+		tagsJson: text("tags_json", { mode: "json" }),
+		metadataJson: text("metadata_json", { mode: "json" }),
+		// Classification level (knowledge_levels.name); null = inherit collection.defaultLevel.
+		classificationLevel: text("classification_level"),
+		// Controlled tag ids (knowledge_tags where controlled=true) required to read this entry (compartment axis).
+		controlledTagsJson: text("controlled_tags_json", { mode: "json" }),
+		// Tag ids a reviewer must hold (via review grant) to review changes to this entry.
+		reviewTagsJson: text("review_tags_json", { mode: "json" }),
+		// Entry owner — may write to main directly and may review.
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_ke_collection_slug").on(table.collectionId, table.slug),
+		index("idx_ke_collection").on(table.collectionId),
+		index("idx_ke_status").on(table.status),
+	],
+);
+
+// === knowledge_revisions ===
+// Immutable copy-on-write body snapshots. Each edit appends a new revision.
+export const knowledgeRevisions = sqliteTable(
+	"knowledge_revisions",
+	{
+		id: text("id").primaryKey(),
+		entryId: text("entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		// Monotonically increasing per-entry version (service computes max+1 in a transaction).
+		version: integer("version").notNull(),
+		format: text("format", { enum: ["markdown", "text", "json"] })
+			.notNull()
+			.default("markdown"),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		changeNote: text("change_note"),
+		authorUserId: text("author_user_id").references(() => users.id, { onDelete: "set null" }),
+		// When this revision was produced by merging a reviewed draft, the draft's fork point
+		// (the main revision it was based on). null = direct main write.
+		baseRevisionId: text("base_revision_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_kr_entry_version").on(table.entryId, table.version),
+		index("idx_kr_entry").on(table.entryId),
+	],
+);
+
+// === knowledge_drafts ===
+// Per-user working copy forked from an entry's current revision. Edited privately; the
+// global (main) revision is untouched until a submission is reviewed and merged.
+export const knowledgeDrafts = sqliteTable(
+	"knowledge_drafts",
+	{
+		id: text("id").primaryKey(),
+		entryId: text("entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		authorUserId: text("author_user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		name: text("name"),
+		// The main revision this draft was forked from (three-way merge base).
+		baseRevisionId: text("base_revision_id"),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		format: text("format", { enum: ["markdown", "text", "json"] })
+			.notNull()
+			.default("markdown"),
+		// Active states: draft / pending_review / changes_requested. Terminal: merged / abandoned.
+		// Service enforces "at most one active draft per (entry, author)".
+		status: text("status", {
+			enum: ["draft", "pending_review", "changes_requested", "merged", "abandoned"],
+		})
+			.notNull()
+			.default("draft"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_kd_entry_author").on(table.entryId, table.authorUserId),
+		index("idx_kd_entry").on(table.entryId),
+		index("idx_kd_author").on(table.authorUserId),
+	],
+);
+
+// === knowledge_submissions ===
+// A draft submitted for review. Carries the proposed content + reviewer verdict + merge result.
+export const knowledgeSubmissions = sqliteTable(
+	"knowledge_submissions",
+	{
+		id: text("id").primaryKey(),
+		draftId: text("draft_id")
+			.notNull()
+			.references(() => knowledgeDrafts.id, { onDelete: "cascade" }),
+		entryId: text("entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		submitterUserId: text("submitter_user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "set null" }),
+		baseRevisionId: text("base_revision_id"),
+		proposedContent: text("proposed_content").notNull(),
+		changeNote: text("change_note"),
+		status: text("status", {
+			enum: ["pending", "approved", "rejected", "changes_requested", "conflict"],
+		})
+			.notNull()
+			.default("pending"),
+		reviewerUserId: text("reviewer_user_id").references(() => users.id, { onDelete: "set null" }),
+		verdict: text("verdict", { enum: ["approve", "request_changes", "comment_only"] }),
+		findingsJson: text("findings_json", { mode: "json" }),
+		reviewedAt: text("reviewed_at"),
+		// The main revision produced when this submission was merged.
+		mergedRevisionId: text("merged_revision_id"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_ks_entry").on(table.entryId),
+		index("idx_ks_status").on(table.status),
+		index("idx_ks_submitter").on(table.submitterUserId),
+	],
+);
+
+// === knowledge_levels ===
+// Classification level ladder (etag axis). Higher rank = higher secrecy.
+export const knowledgeLevels = sqliteTable(
+	"knowledge_levels",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull().unique(),
+		rank: integer("rank").notNull(),
+		label: text("label"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_klevel_rank").on(table.rank)],
+);
+
+// === knowledge_tag_types ===
+// Categories for tags (e.g. organization / position / permission / other). Global, editable.
+// Builtin types are seeded on startup and cannot be deleted.
+export const knowledgeTagTypes = sqliteTable(
+	"knowledge_tag_types",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull().unique(),
+		builtin: integer("builtin", { mode: "boolean" }).notNull().default(false),
+		sortOrder: integer("sort_order").notNull().default(0),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_ktagtype_sort").on(table.sortOrder)],
+);
+
+// === knowledge_tags ===
+// Tags. controlled=true tags act as access compartments (horizontal axis).
+export const knowledgeTags = sqliteTable(
+	"knowledge_tags",
+	{
+		id: text("id").primaryKey(),
+		collectionId: text("collection_id").references(() => knowledgeCollections.id, {
+			onDelete: "cascade",
+		}),
+		// Optional category (knowledge_tag_types.id). null = uncategorized.
+		typeId: text("type_id").references(() => knowledgeTagTypes.id, { onDelete: "set null" }),
+		name: text("name").notNull(),
+		controlled: integer("controlled", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_ktag_collection_name").on(table.collectionId, table.name),
+		index("idx_ktag_controlled").on(table.controlled),
+		index("idx_ktag_type").on(table.typeId),
+	],
+);
+
+// === knowledge_grants ===
+// Credentials granted to a principal: clearance (level), tag (compartment), or review (per tag).
+export const knowledgeGrants = sqliteTable(
+	"knowledge_grants",
+	{
+		id: text("id").primaryKey(),
+		collectionId: text("collection_id").references(() => knowledgeCollections.id, {
+			onDelete: "cascade",
+		}),
+		principalType: text("principal_type", { enum: ["user", "role"] }).notNull(),
+		principalId: text("principal_id").notNull(),
+		grantType: text("grant_type", { enum: ["clearance", "tag", "review"] }).notNull(),
+		// grantType=clearance → knowledge_levels.name (max readable rank)
+		clearanceLevel: text("clearance_level"),
+		// grantType=tag|review → knowledge_tags.id
+		tagId: text("tag_id").references(() => knowledgeTags.id, { onDelete: "cascade" }),
+		canWrite: integer("can_write", { mode: "boolean" }).notNull().default(false),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_kgrant_principal").on(table.principalType, table.principalId),
+		index("idx_kgrant_tag").on(table.tagId),
+	],
+);
+
+// === knowledge_entry_links ===
+// Directed, typed associations between entries (the knowledge graph). This table models the
+// entry-level scope only (A↔B whole-entry relations, declared by a human/agent). Inline (body
+// position) references — scope=inline in the design — are not implemented yet.
+export const knowledgeEntryLinks = sqliteTable(
+	"knowledge_entry_links",
+	{
+		id: text("id").primaryKey(),
+		// Source entry → target entry (directed).
+		fromEntryId: text("from_entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		toEntryId: text("to_entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		// Relation type (generic, domain-agnostic):
+		//   related     — see also / related (weak association)
+		//   expands     — expands / details (from is overview, to is detail)
+		//   supersedes  — from supersedes to (marks the old entry stale)
+		//   depends_on  — depends on (understanding from needs to first)
+		//   parent      — parent / belongs-to (from's parent is to)
+		//   mention     — mention (reserved; inline default type, unused at entry scope)
+		//   custom      — other, paired with label
+		linkType: text("link_type", {
+			enum: ["related", "expands", "supersedes", "depends_on", "parent", "mention", "custom"],
+		}).notNull(),
+		// Custom relation name (when linkType=custom) or supplementary note.
+		label: text("label"),
+		// Optional: pin the link to a specific target revision (stable reference); null = follow current.
+		toRevisionId: text("to_revision_id").references(() => knowledgeRevisions.id, {
+			onDelete: "set null",
+		}),
+		// Creator (user or programmatic agent).
+		createdByUserId: text("created_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Entry scope: the same (from, to, type) triple is not duplicated.
+		uniqueIndex("idx_kelink_entry_from_to_type").on(
+			table.fromEntryId,
+			table.toEntryId,
+			table.linkType,
+		),
+		index("idx_kelink_from").on(table.fromEntryId), // forward: from's out-links
+		index("idx_kelink_to").on(table.toEntryId), // reverse: to's in-links ("who links to me")
+	],
+);

@@ -7,6 +7,7 @@ import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
 import { saveSettings, settings } from "../lib/settings";
 import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
+import { knowledgeAcl } from "../services/knowledge-acl";
 import { terminalService } from "../services/terminal-service";
 import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
@@ -118,6 +119,8 @@ adminRoutes.delete("/users/:id", async (c) => {
 
 	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
+	// Cascade: remove this user's knowledge-base grants (clearance/tags/review).
+	await knowledgeAcl.purgeUserGrants(id);
 	return c.json({ ok: true });
 });
 

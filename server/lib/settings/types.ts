@@ -304,6 +304,19 @@ export interface NarraForkSettings {
 		tls?: TlsConfig;
 	};
 	paths: { defaultProjectDir: string };
+	/** Knowledge base: how knowledge is auto-injected into agent context. */
+	knowledge: {
+		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */
+		injectMode: "summary" | "off";
+		/** Max entries auto-injected per turn (caps context growth). */
+		maxInjectedEntries: number;
+		/** Minimum keyword length to attempt a match (aligns with trigram >= 3). */
+		minKeywordLen: number;
+		/** Scan tool outputs (e.g. logs) for knowledge hits and inject reminders. */
+		scanToolOutput: boolean;
+		/** Truncate tool output to this many chars before scanning (performance guard). */
+		maxToolOutputScanChars: number;
+	};
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;

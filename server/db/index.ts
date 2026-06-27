@@ -192,6 +192,55 @@ ensureColumns(sqlite);
 	}
 }
 
+// Knowledge base seed: default classification levels + builtin tag types.
+// Idempotent — only inserts when the respective table is empty, so user edits are never overwritten.
+try {
+	const hasKTables = (
+		sqlite
+			.prepare(
+				"SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name IN ('knowledge_levels','knowledge_tag_types')",
+			)
+			.get() as { c: number }
+	).c;
+	if (hasKTables === 2) {
+		const nowIso = new Date().toISOString();
+		const levelCount = (
+			sqlite.prepare("SELECT COUNT(*) AS c FROM knowledge_levels").get() as { c: number }
+		).c;
+		if (levelCount === 0) {
+			const insLevel = sqlite.prepare(
+				"INSERT INTO knowledge_levels (id, name, rank, label, created_at) VALUES (?, ?, ?, ?, ?)",
+			);
+			const seedLevels: [string, string, number, string][] = [
+				["klvl_public", "public", 0, "Public"],
+				["klvl_internal", "internal", 10, "Internal"],
+				["klvl_confidential", "confidential", 20, "Confidential"],
+				["klvl_secret", "secret", 30, "Secret"],
+			];
+			for (const [id, name, rank, label] of seedLevels) insLevel.run(id, name, rank, label, nowIso);
+			logger.info("Seeded default knowledge classification levels", { count: seedLevels.length });
+		}
+		const typeCount = (
+			sqlite.prepare("SELECT COUNT(*) AS c FROM knowledge_tag_types").get() as { c: number }
+		).c;
+		if (typeCount === 0) {
+			const insType = sqlite.prepare(
+				"INSERT INTO knowledge_tag_types (id, name, builtin, sort_order, created_at) VALUES (?, ?, 1, ?, ?)",
+			);
+			const seedTypes: [string, string, number][] = [
+				["ktt_org", "组织", 0],
+				["ktt_position", "岗位", 1],
+				["ktt_permission", "权限", 2],
+				["ktt_other", "其他", 3],
+			];
+			for (const [id, name, sort] of seedTypes) insType.run(id, name, sort, nowIso);
+			logger.info("Seeded builtin knowledge tag types", { count: seedTypes.length });
+		}
+	}
+} catch (err) {
+	logger.warn("Knowledge base seed failed (non-fatal)", { error: String(err) });
+}
+
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite, { skipUncleanShutdownRebuild: isHotReload });
 dbLifecycle.initialized = true;

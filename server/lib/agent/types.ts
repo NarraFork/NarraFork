@@ -54,6 +54,12 @@ export interface ToolContext {
 	skillScopeKey?: string;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
+	/**
+	 * The user who triggered the current agent-loop turn (sent the message / continued the task).
+	 * Used to resolve knowledge-base ACL caps for this turn. null/undefined → anonymous (public only).
+	 * NarraFork narrators have no fixed owner, so authority is per-trigger, not per-narrator.
+	 */
+	userId?: string | null;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -480,6 +486,8 @@ export interface AgentConfig {
 	projectGitPath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
+	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */
+	userId?: string | null;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */

@@ -7,6 +7,7 @@
 	"admin": "Admin",
 	"routines": "Routines",
 	"learning": "Learning",
+	"knowledge": "Knowledge Base",
 	"logout": "Logout",
 	"logoutConfirmTitle": "Confirm Logout",
 	"logoutConfirmMessage": "Are you sure you want to log out?",

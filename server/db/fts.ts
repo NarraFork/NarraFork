@@ -60,6 +60,24 @@ export function ensureFts(
 		)
 	`);
 
+	// knowledge_entries_fts is created conditionally — the table may not exist yet on
+	// older databases that haven't run the knowledge-base migration. Guarded below.
+	const hasKnowledgeEntries =
+		(
+			sqlite
+				.prepare(
+					"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='knowledge_entries'",
+				)
+				.get() as { c: number }
+		).c === 1;
+	if (hasKnowledgeEntries) {
+		sqlite.run(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
+				title, current_content, content='knowledge_entries', content_rowid=rowid, tokenize='trigram'
+			)
+		`);
+	}
+
 	// --- Sync triggers: chapters ---
 	sqlite.run(`
 		CREATE TRIGGER IF NOT EXISTS chapters_fts_insert AFTER INSERT ON chapters BEGIN
@@ -130,6 +148,30 @@ export function ensureFts(
 		END
 	`);
 
+	// --- Sync triggers: knowledge_entries (title + current_content) ---
+	if (hasKnowledgeEntries) {
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_insert AFTER INSERT ON knowledge_entries BEGIN
+				INSERT INTO knowledge_entries_fts(rowid, title, current_content)
+				VALUES (NEW.rowid, NEW.title, NEW.current_content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_update AFTER UPDATE ON knowledge_entries BEGIN
+				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content)
+				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content);
+				INSERT INTO knowledge_entries_fts(rowid, title, current_content)
+				VALUES (NEW.rowid, NEW.title, NEW.current_content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_delete AFTER DELETE ON knowledge_entries BEGIN
+				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content)
+				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content);
+			END
+		`);
+	}
+
 	// --- Rebuild FTS indexes if needed ---
 	// Rebuild after migration (tokenizer change) or unclean shutdown (trigram indexes
 	// can silently corrupt on crash, causing "malformed" errors on UPDATE).
@@ -145,6 +187,9 @@ export function ensureFts(
 			sqlite.run("INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')");
 			sqlite.run("INSERT INTO chapters_fts(chapters_fts) VALUES ('rebuild')");
 			sqlite.run("INSERT INTO narrator_messages_fts(narrator_messages_fts) VALUES ('rebuild')");
+			if (hasKnowledgeEntries) {
+				sqlite.run("INSERT INTO knowledge_entries_fts(knowledge_entries_fts) VALUES ('rebuild')");
+			}
 			logger.info("FTS indexes rebuilt on startup", {
 				reason: ftsTablesRecreated.length > 0 ? "migration" : "unclean_shutdown",
 			});

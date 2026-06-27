@@ -71,6 +71,7 @@ import {
 import { drainGroupMessagesForNarrator, formatGroupMessages } from "./chat-group-queue";
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
+import { knowledgeInjection } from "./knowledge-injection";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -1009,6 +1010,8 @@ export async function runAgentLoop(
 	active._loopRunning = true;
 	let shouldUpdateTitle = false;
 	let currentText = text;
+	// Knowledge entries already injected this run (de-dup across passes & tool outputs).
+	const knowledgeInjectedIds = new Set<string>();
 	let currentImages = images;
 	let loopHadError = false;
 	/** Whether the loop was interrupted by the user (abort signal). */
@@ -1529,6 +1532,7 @@ export async function runAgentLoop(
 				skillRoot: active._skillRoot ?? undefined,
 				projectGitPath: active._projectGitPath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
+				userId: active._currentUserId ?? null,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
@@ -1763,7 +1767,33 @@ export async function runAgentLoop(
 			// When replaying a pure tool-result turn, preserve the original packet shape:
 			// no synthetic user text.
 			const isPureToolResultReplay = !currentTurnText.trim() && trailingToolResults.length > 0;
-			const effectiveText = isPureToolResultReplay ? "" : currentTurnText;
+			let effectiveText = isPureToolResultReplay ? "" : currentTurnText;
+
+			// Passive knowledge injection (point A): when this turn carries real user text,
+			// surface relevant knowledge-base entries the triggering user may read.
+			// ACL is resolved by the loop-triggering user (active._currentUserId), not the narrator.
+			if (effectiveText.trim()) {
+				try {
+					const hits = await knowledgeInjection.resolveInjections(
+						active._currentUserId,
+						effectiveText,
+						{ already: knowledgeInjectedIds },
+					);
+					if (hits.length > 0) {
+						for (const h of hits) knowledgeInjectedIds.add(h.entryId);
+						const block = knowledgeInjection.formatInjections(
+							hits,
+							"Relevant knowledge-base entries were found for this request:",
+						);
+						if (block) effectiveText = `${effectiveText}\n\n${block}`;
+					}
+				} catch (err) {
+					logger.warn("Knowledge injection (user message) failed", {
+						narratorId,
+						error: String(err),
+					});
+				}
+			}
 
 			active._goalTurnStartedAtMs = Date.now();
 			active._goalTokenUsageBaseline = active._lastTokenUsage;
@@ -2845,6 +2875,8 @@ async function feedMessage(
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	active._goalContinuationSuppressed = false;
 	active._goalContinuationNoToolCount = 0;
+	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
+	active._currentUserId = userId ?? null;
 
 	// Save text files to worktree (now that we have active.cwd)
 	const savedTextFiles: TextFileRef[] = [];

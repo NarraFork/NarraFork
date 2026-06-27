@@ -10,6 +10,13 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 export const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778, host: "localhost", openBrowser: "browser" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
+	knowledge: {
+		injectMode: "summary",
+		maxInjectedEntries: 3,
+		minKeywordLen: 3,
+		scanToolOutput: true,
+		maxToolOutputScanChars: 8000,
+	},
 	agent: {
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
@@ -167,6 +174,28 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"paths.defaultProjectDir": {
 		desc: "默认项目目录。新建项目时的默认父目录。",
 		type: "string",
+	},
+
+	// ── knowledge ───────────────────────────────────────────────────────
+	"knowledge.injectMode": {
+		desc: '知识库被动注入模式。"summary"=自动注入命中条目摘要；"off"=关闭被动注入。',
+		type: "string",
+	},
+	"knowledge.maxInjectedEntries": {
+		desc: "每轮自动注入的最大知识条目数（控制上下文增长）。",
+		type: "number",
+	},
+	"knowledge.minKeywordLen": {
+		desc: "触发匹配的最小关键词长度（与 trigram >= 3 对齐）。",
+		type: "number",
+	},
+	"knowledge.scanToolOutput": {
+		desc: "是否扫描工具输出（如日志）以匹配知识库并注入提醒。",
+		type: "boolean",
+	},
+	"knowledge.maxToolOutputScanChars": {
+		desc: "扫描工具输出前截断到的最大字符数（性能保护）。",
+		type: "number",
 	},
 
 	// ── vnet ────────────────────────────────────────────────────────────

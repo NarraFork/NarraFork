@@ -87,6 +87,12 @@ export interface ActiveNarrator {
 	_interruptCleanupDone?: boolean;
 	/** Whether the agent loop is currently running for this narrator. */
 	_loopRunning?: boolean;
+	/**
+	 * The user who triggered the current loop turn (set on each runAgentLoop / message feed).
+	 * Flows into ToolContext.userId for per-turn knowledge-base ACL. null when triggered by
+	 * a background/system continuation (→ anonymous, public-only knowledge access).
+	 */
+	_currentUserId?: string | null;
 	/** Immediate title derived from the first user message while model title generation runs. */
 	_provisionalTitle?: string;
 	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
