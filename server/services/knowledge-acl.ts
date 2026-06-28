@@ -1,6 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
+	knowledgeCollections,
+	knowledgeEntries,
 	knowledgeGrants,
 	knowledgeLevels,
 	knowledgeTags,
@@ -73,8 +75,15 @@ export function invalidateLevelCache(): void {
 
 async function rankOf(levelName: string | null | undefined): Promise<number> {
 	const map = await levelRankMap();
+	// No level specified → public baseline (0). This is the documented default
+	// for entries/collections that never set a classification.
 	if (!levelName) return 0;
-	return map.get(levelName) ?? 0;
+	const rank = map.get(levelName);
+	// Fail-CLOSED: an unknown level name (deleted level, typo, stale reference)
+	// must NOT silently downgrade to public. Treat it as maximally restricted so
+	// only admins/owners (who short-circuit canRead) can read it.
+	if (rank === undefined) return Number.POSITIVE_INFINITY;
+	return rank;
 }
 
 /** Resolve a principal's aggregated capabilities from all applicable grants. */
@@ -234,10 +243,40 @@ async function createLevel(input: { name: string; rank: number; label?: string }
 	return row;
 }
 
-async function deleteLevel(id: string) {
+async function deleteLevel(
+	id: string,
+): Promise<{ ok: true } | { ok: false; reason: string; refs?: number }> {
+	const level = await db.query.knowledgeLevels.findFirst({
+		where: eq(knowledgeLevels.id, id),
+	});
+	if (!level) return { ok: false, reason: "not_found" };
+	// "public" is the baseline level relied on throughout the ACL logic.
+	if (level.name === "public") return { ok: false, reason: "builtin" };
+
+	// Reference check: levels are referenced BY NAME (not id) from three places.
+	// Deleting a still-referenced level would, under fail-closed rankOf, abruptly
+	// lock every referencing entry to admin-only — so refuse and surface the count.
+	const [entryRefs, collectionRefs, grantRefs] = await Promise.all([
+		db.query.knowledgeEntries.findFirst({
+			where: eq(knowledgeEntries.classificationLevel, level.name),
+			columns: { id: true },
+		}),
+		db.query.knowledgeCollections.findFirst({
+			where: eq(knowledgeCollections.defaultLevel, level.name),
+			columns: { id: true },
+		}),
+		db.query.knowledgeGrants.findFirst({
+			where: eq(knowledgeGrants.clearanceLevel, level.name),
+			columns: { id: true },
+		}),
+	]);
+	if (entryRefs || collectionRefs || grantRefs) {
+		return { ok: false, reason: "in_use" };
+	}
+
 	await db.delete(knowledgeLevels).where(eq(knowledgeLevels.id, id));
 	invalidateLevelCache();
-	return { ok: true as const };
+	return { ok: true };
 }
 
 async function listTags(collectionId?: string) {

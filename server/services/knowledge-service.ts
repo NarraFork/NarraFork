@@ -10,6 +10,7 @@ import {
 	canRead,
 	canWriteMain,
 	type Principal,
+	type PrincipalCaps,
 	resolvePrincipalCaps,
 } from "./knowledge-acl";
 
@@ -35,6 +36,52 @@ function toAclEntry(e: {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+/**
+ * Load an entry + its collection and assert the principal may READ it.
+ * Throws NotFoundError (not a 403) on any miss so we never leak existence of
+ * entries the caller cannot see. Returns the loaded entry row + resolved caps
+ * so callers can reuse them (e.g. for a subsequent write check).
+ */
+async function loadReadableEntry(
+	entryId: string,
+	principal: Principal,
+): Promise<{ entry: typeof knowledgeEntries.$inferSelect; caps: PrincipalCaps }> {
+	const entry = await db.query.knowledgeEntries.findFirst({
+		where: eq(knowledgeEntries.id, entryId),
+	});
+	if (!entry) throw new NotFoundError("Knowledge entry", entryId);
+	const collection = await db.query.knowledgeCollections.findFirst({
+		where: eq(knowledgeCollections.id, entry.collectionId),
+	});
+	const caps = await resolvePrincipalCaps(principal);
+	const aclCol: AclCollection = {
+		id: entry.collectionId,
+		defaultLevel: collection?.defaultLevel ?? "public",
+	};
+	if (!(await canRead(caps, toAclEntry(entry), aclCol))) {
+		throw new NotFoundError("Knowledge entry", entryId);
+	}
+	return { entry, caps };
+}
+
+/**
+ * Like loadReadableEntry but additionally asserts WRITE-main capability
+ * (admin / owner / write grant). Used by metadata edit + delete paths so a
+ * read-only or unauthorized principal cannot mutate an entry.
+ */
+async function loadWritableEntry(
+	entryId: string,
+	principal: Principal,
+): Promise<typeof knowledgeEntries.$inferSelect> {
+	const { entry, caps } = await loadReadableEntry(entryId, principal);
+	if (!canWriteMain(caps, toAclEntry(entry))) {
+		throw new ValidationError(
+			"You do not have permission to modify this entry; submit a draft for review instead",
+		);
+	}
+	return entry;
 }
 
 function hashContent(content: string): string {
@@ -266,8 +313,9 @@ async function updateEntryMeta(
 		metadata?: Record<string, unknown>;
 		status?: "active" | "archived";
 	},
+	principal: Principal,
 ) {
-	await getEntry(id);
+	await loadWritableEntry(id, principal);
 	await db
 		.update(knowledgeEntries)
 		.set({
@@ -278,11 +326,11 @@ async function updateEntryMeta(
 			updatedAt: nowIso(),
 		})
 		.where(eq(knowledgeEntries.id, id));
-	return getEntry(id, { withContent: true });
+	return getEntry(id, { withContent: true, principal });
 }
 
-async function deleteEntry(id: string) {
-	await getEntry(id);
+async function deleteEntry(id: string, principal: Principal) {
+	await loadWritableEntry(id, principal);
 	await db.delete(knowledgeEntries).where(eq(knowledgeEntries.id, id));
 	return { ok: true as const };
 }
@@ -382,19 +430,23 @@ async function addRevision(
 	return { entryId, revisionId, version: nextVersion };
 }
 
-async function listRevisions(entryId: string) {
-	await getEntry(entryId);
+async function listRevisions(entryId: string, principal: Principal) {
+	// Enforces dual-axis read ACL on the parent entry (throws NotFound if unreadable).
+	await loadReadableEntry(entryId, principal);
 	return db.query.knowledgeRevisions.findMany({
 		where: eq(knowledgeRevisions.entryId, entryId),
 		orderBy: [desc(knowledgeRevisions.version)],
 	});
 }
 
-async function getRevision(revisionId: string) {
+async function getRevision(revisionId: string, principal: Principal) {
 	const rev = await db.query.knowledgeRevisions.findFirst({
 		where: eq(knowledgeRevisions.id, revisionId),
 	});
 	if (!rev) throw new NotFoundError("Knowledge revision", revisionId);
+	// A revision is only readable if its parent entry is readable. Enforce ACL on
+	// the entry; unreadable → NotFound (don't leak the revision's existence/content).
+	await loadReadableEntry(rev.entryId, principal);
 	return rev;
 }
 

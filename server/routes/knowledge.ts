@@ -51,14 +51,14 @@ knowledgeRoutes.post("/collections", async (c) => {
 	return c.json(await knowledgeService.createCollection(parsed.data), 201);
 });
 
-knowledgeRoutes.patch("/collections/:id", async (c) => {
+knowledgeRoutes.patch("/collections/:id", requireAdmin, async (c) => {
 	const parsed = updateKnowledgeCollectionSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeService.updateCollection(c.req.param("id"), parsed.data));
+	return c.json(await knowledgeService.updateCollection(c.req.param("id") ?? "", parsed.data));
 });
 
-knowledgeRoutes.delete("/collections/:id", async (c) => {
-	return c.json(await knowledgeService.deleteCollection(c.req.param("id")));
+knowledgeRoutes.delete("/collections/:id", requireAdmin, async (c) => {
+	return c.json(await knowledgeService.deleteCollection(c.req.param("id") ?? ""));
 });
 
 // ─── Entries ──────────────────────────────────────────────────────────
@@ -94,11 +94,13 @@ knowledgeRoutes.get("/entries/:id", async (c) => {
 knowledgeRoutes.patch("/entries/:id", async (c) => {
 	const parsed = updateKnowledgeEntrySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeService.updateEntryMeta(c.req.param("id"), parsed.data));
+	return c.json(
+		await knowledgeService.updateEntryMeta(c.req.param("id"), parsed.data, principalOf(c)),
+	);
 });
 
 knowledgeRoutes.delete("/entries/:id", async (c) => {
-	return c.json(await knowledgeService.deleteEntry(c.req.param("id")));
+	return c.json(await knowledgeService.deleteEntry(c.req.param("id"), principalOf(c)));
 });
 
 // Set entry ACL attributes (classification level, controlled/review tags, owner) — admin only.
@@ -124,11 +126,11 @@ knowledgeRoutes.post("/entries/:id/revisions", async (c) => {
 });
 
 knowledgeRoutes.get("/entries/:id/revisions", async (c) => {
-	return c.json(await knowledgeService.listRevisions(c.req.param("id")));
+	return c.json(await knowledgeService.listRevisions(c.req.param("id"), principalOf(c)));
 });
 
 knowledgeRoutes.get("/revisions/:id", async (c) => {
-	return c.json(await knowledgeService.getRevision(c.req.param("id")));
+	return c.json(await knowledgeService.getRevision(c.req.param("id"), principalOf(c)));
 });
 
 // ─── Entry links (entry-scope knowledge graph) ──────────────────────────
@@ -269,9 +271,19 @@ knowledgeRoutes.post("/levels", requireAdmin, async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await knowledgeAcl.createLevel(parsed.data), 201);
 });
-knowledgeRoutes.delete("/levels/:id", requireAdmin, async (c) =>
-	c.json(await knowledgeAcl.deleteLevel(c.req.param("id") ?? "")),
-);
+knowledgeRoutes.delete("/levels/:id", requireAdmin, async (c) => {
+	const result = await knowledgeAcl.deleteLevel(c.req.param("id") ?? "");
+	if (!result.ok) {
+		const msg =
+			result.reason === "in_use"
+				? "Level is still referenced by entries, collections, or grants and cannot be deleted"
+				: result.reason === "builtin"
+					? "The public level cannot be deleted"
+					: "Level not found";
+		throw new ValidationError(msg);
+	}
+	return c.json(result);
+});
 
 knowledgeRoutes.get("/tags", async (c) =>
 	c.json(await knowledgeAcl.listTags(c.req.query("collectionId") || undefined)),
