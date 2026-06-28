@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import { knowledgeCollections, knowledgeEntries, knowledgeRevisions } from "../db/schema";
+import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
@@ -36,6 +37,12 @@ function toAclEntry(e: {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+/** True for SQLite UNIQUE-constraint violations (used to convert TOCTOU slug/version races). */
+function isUniqueConstraintError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg);
 }
 
 /**
@@ -155,19 +162,26 @@ async function createCollection(input: {
 
 	const id = generateId();
 	const now = nowIso();
-	const [created] = await db
-		.insert(knowledgeCollections)
-		.values({
-			id,
-			name: input.name,
-			slug,
-			description: input.description ?? null,
-			projectId: input.projectId ?? null,
-			createdAt: now,
-			updatedAt: now,
-		})
-		.returning();
-	return created;
+	try {
+		const [created] = await db
+			.insert(knowledgeCollections)
+			.values({
+				id,
+				name: input.name,
+				slug,
+				description: input.description ?? null,
+				projectId: input.projectId ?? null,
+				createdAt: now,
+				updatedAt: now,
+			})
+			.returning();
+		return created;
+	} catch (err) {
+		if (isUniqueConstraintError(err)) {
+			throw new ValidationError(`Collection slug already exists: ${slug}`);
+		}
+		throw err;
+	}
 }
 
 async function getCollection(id: string) {
@@ -268,39 +282,48 @@ async function createEntry(input: {
 	const content = input.content ?? "";
 	const format = input.format ?? "markdown";
 
-	db.transaction((tx) => {
-		// Insert the entry first: revisions.entryId has an FK to entries, and
-		// entries.currentRevisionId has no FK (avoids a circular dependency), so this order
-		// satisfies both constraints.
-		tx.insert(knowledgeEntries)
-			.values({
-				id: entryId,
-				collectionId: input.collectionId,
-				title: input.title,
-				slug,
-				currentRevisionId: revisionId,
-				currentContent: content,
-				tagsJson: input.tags ?? [],
-				metadataJson: input.metadata ?? null,
-				status: "active",
-				createdAt: now,
-				updatedAt: now,
-			})
-			.run();
-		tx.insert(knowledgeRevisions)
-			.values({
-				id: revisionId,
-				entryId,
-				version: 1,
-				format,
-				content,
-				contentHash: hashContent(content),
-				changeNote: input.changeNote ?? null,
-				authorUserId: input.authorUserId ?? null,
-				createdAt: now,
-			})
-			.run();
-	});
+	try {
+		db.transaction((tx) => {
+			// Insert the entry first: revisions.entryId has an FK to entries, and
+			// entries.currentRevisionId has no FK (avoids a circular dependency), so this order
+			// satisfies both constraints.
+			tx.insert(knowledgeEntries)
+				.values({
+					id: entryId,
+					collectionId: input.collectionId,
+					title: input.title,
+					slug,
+					currentRevisionId: revisionId,
+					currentContent: content,
+					tagsJson: input.tags ?? [],
+					metadataJson: input.metadata ?? null,
+					status: "active",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.run();
+			tx.insert(knowledgeRevisions)
+				.values({
+					id: revisionId,
+					entryId,
+					version: 1,
+					format,
+					content,
+					contentHash: hashContent(content),
+					changeNote: input.changeNote ?? null,
+					authorUserId: input.authorUserId ?? null,
+					createdAt: now,
+				})
+				.run();
+		});
+	} catch (err) {
+		// Lost the slug race between the pre-check and insert → surface as a clean
+		// validation error instead of a raw SQLite constraint failure.
+		if (isUniqueConstraintError(err)) {
+			throw new ValidationError(`Entry slug already exists in collection: ${slug}`);
+		}
+		throw err;
+	}
 
 	return getEntry(entryId, { withContent: true });
 }
@@ -393,41 +416,53 @@ async function addRevision(
 		}
 	}
 
-	const latest = await db.query.knowledgeRevisions.findFirst({
-		where: eq(knowledgeRevisions.entryId, entryId),
-		orderBy: [desc(knowledgeRevisions.version)],
-	});
-	const nextVersion = (latest?.version ?? 0) + 1;
 	const revisionId = generateId();
 	const now = nowIso();
 	const format = input.format ?? "markdown";
 
-	db.transaction((tx) => {
-		tx.insert(knowledgeRevisions)
-			.values({
-				id: revisionId,
-				entryId,
-				version: nextVersion,
-				format,
-				content: input.content,
-				contentHash: hashContent(input.content),
-				changeNote: input.changeNote ?? null,
-				authorUserId: input.authorUserId ?? null,
-				baseRevisionId: null,
-				createdAt: now,
-			})
-			.run();
-		tx.update(knowledgeEntries)
-			.set({
-				currentRevisionId: revisionId,
-				currentContent: input.content,
-				updatedAt: now,
-			})
-			.where(eq(knowledgeEntries.id, entryId))
-			.run();
-	});
+	// Compute the next version INSIDE the transaction so the MAX(version) read and
+	// the insert are atomic — two concurrent writers can't both pick the same
+	// version. The unique index (entry_id, version) is the last line of defence;
+	// withDbRetry handles the rare lost race by retrying with a fresh max.
+	const version = await withDbRetry(
+		async () =>
+			db.transaction((tx) => {
+				const row = tx
+					.select({ v: knowledgeRevisions.version })
+					.from(knowledgeRevisions)
+					.where(eq(knowledgeRevisions.entryId, entryId))
+					.orderBy(desc(knowledgeRevisions.version))
+					.limit(1)
+					.get();
+				const nextVersion = (row?.v ?? 0) + 1;
+				tx.insert(knowledgeRevisions)
+					.values({
+						id: revisionId,
+						entryId,
+						version: nextVersion,
+						format,
+						content: input.content,
+						contentHash: hashContent(input.content),
+						changeNote: input.changeNote ?? null,
+						authorUserId: input.authorUserId ?? null,
+						baseRevisionId: null,
+						createdAt: now,
+					})
+					.run();
+				tx.update(knowledgeEntries)
+					.set({
+						currentRevisionId: revisionId,
+						currentContent: input.content,
+						updatedAt: now,
+					})
+					.where(eq(knowledgeEntries.id, entryId))
+					.run();
+				return nextVersion;
+			}),
+		{ label: "knowledge.addRevision", maxRetries: 5 },
+	);
 
-	return { entryId, revisionId, version: nextVersion };
+	return { entryId, revisionId, version };
 }
 
 async function listRevisions(entryId: string, principal: Principal) {

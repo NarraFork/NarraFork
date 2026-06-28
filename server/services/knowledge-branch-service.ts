@@ -9,6 +9,7 @@ import {
 	knowledgeRevisions,
 	knowledgeSubmissions,
 } from "../db/schema";
+import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
@@ -239,6 +240,14 @@ async function review(
 	if (sub.status !== "pending" && sub.status !== "conflict") {
 		throw new ValidationError(`Submission already ${sub.status}`);
 	}
+	// A conflicted submission cannot be re-approved through the normal path — the
+	// reviewer must supply resolved content via resolveConflict. Allowing approve
+	// here would re-run a three-way merge that already failed.
+	if (sub.status === "conflict" && input.verdict === "approve") {
+		throw new ValidationError(
+			"This submission is in conflict; use resolve (with merged content) instead of approve",
+		);
+	}
 	const { entry, collection } = await loadEntryAndCollection(sub.entryId);
 	const caps = await resolvePrincipalCaps(principal);
 	if (!canReview(caps, toAclEntry(entry))) {
@@ -256,8 +265,11 @@ async function review(
 		return approveAndMerge(sub, principal.userId, findings, now);
 	}
 
-	// request_changes or comment_only → bounce the draft back to changes_requested.
-	const newStatus = input.verdict === "request_changes" ? "changes_requested" : "rejected";
+	// request_changes → bounce the draft back so the author can revise.
+	// comment_only → record feedback WITHOUT changing the verdict/terminal state;
+	//   the submission stays pending (a pure comment is not a rejection).
+	const isRequestChanges = input.verdict === "request_changes";
+	const newStatus = isRequestChanges ? "changes_requested" : sub.status;
 	db.transaction((tx) => {
 		tx.update(knowledgeSubmissions)
 			.set({
@@ -269,10 +281,14 @@ async function review(
 			})
 			.where(eq(knowledgeSubmissions.id, submissionId))
 			.run();
-		tx.update(knowledgeDrafts)
-			.set({ status: "changes_requested", updatedAt: now })
-			.where(eq(knowledgeDrafts.id, sub.draftId))
-			.run();
+		// Only bounce the draft when changes are actually requested. A comment_only
+		// review leaves the draft untouched so the author can keep working.
+		if (isRequestChanges) {
+			tx.update(knowledgeDrafts)
+				.set({ status: "changes_requested", updatedAt: now })
+				.where(eq(knowledgeDrafts.id, sub.draftId))
+				.run();
+		}
 	});
 	return { submissionId, status: newStatus, verdict: input.verdict };
 }
@@ -304,7 +320,17 @@ async function approveAndMerge(
 
 	if (merged === false) {
 		// Conflict: cannot auto-merge. Mark and surface three-way content for manual resolve.
+		// Re-check status inside the transaction so a concurrent reviewer who already
+		// merged isn't overwritten back to "conflict".
 		db.transaction((tx) => {
+			const fresh = tx
+				.select({ status: knowledgeSubmissions.status })
+				.from(knowledgeSubmissions)
+				.where(eq(knowledgeSubmissions.id, sub.id))
+				.get();
+			if (!fresh || (fresh.status !== "pending" && fresh.status !== "conflict")) {
+				throw new ValidationError("Submission was already reviewed by someone else");
+			}
 			tx.update(knowledgeSubmissions)
 				.set({
 					status: "conflict",
@@ -354,46 +380,70 @@ async function commitMergedRevision(
 	reviewerUserId: string,
 	now: string,
 ): Promise<string> {
-	const latest = await db.query.knowledgeRevisions.findFirst({
-		where: eq(knowledgeRevisions.entryId, sub.entryId),
-		orderBy: [desc(knowledgeRevisions.version)],
-	});
-	const nextVersion = (latest?.version ?? 0) + 1;
 	const revisionId = generateId();
 
-	db.transaction((tx) => {
-		tx.insert(knowledgeRevisions)
-			.values({
-				id: revisionId,
-				entryId: sub.entryId,
-				version: nextVersion,
-				format: "markdown",
-				content,
-				contentHash: hashContent(content),
-				changeNote: sub.changeNote ?? null,
-				authorUserId: sub.submitterUserId,
-				baseRevisionId: sub.baseRevisionId,
-				createdAt: now,
-			})
-			.run();
-		tx.update(knowledgeEntries)
-			.set({ currentRevisionId: revisionId, currentContent: content, updatedAt: now })
-			.where(eq(knowledgeEntries.id, sub.entryId))
-			.run();
-		tx.update(knowledgeSubmissions)
-			.set({
-				status: "approved",
-				reviewerUserId,
-				reviewedAt: now,
-				mergedRevisionId: revisionId,
-			})
-			.where(eq(knowledgeSubmissions.id, sub.id))
-			.run();
-		tx.update(knowledgeDrafts)
-			.set({ status: "merged", updatedAt: now })
-			.where(eq(knowledgeDrafts.id, sub.draftId))
-			.run();
-	});
+	await withDbRetry(
+		async () =>
+			db.transaction((tx) => {
+				// Re-read the submission status INSIDE the transaction and refuse to proceed
+				// unless it is still claimable. bun:sqlite runs the transaction body
+				// synchronously under a write lock, so this select-check-update sequence is
+				// atomic w.r.t. other transactions — a concurrent reviewer who already merged
+				// flips the status to "approved", and this guard then aborts (no dup revision).
+				const fresh = tx
+					.select({ status: knowledgeSubmissions.status })
+					.from(knowledgeSubmissions)
+					.where(eq(knowledgeSubmissions.id, sub.id))
+					.get();
+				if (!fresh || (fresh.status !== "pending" && fresh.status !== "conflict")) {
+					throw new ValidationError("Submission was already reviewed by someone else");
+				}
+
+				// Version is computed inside the transaction so concurrent merges on the
+				// same entry can't pick the same version number.
+				const row = tx
+					.select({ v: knowledgeRevisions.version })
+					.from(knowledgeRevisions)
+					.where(eq(knowledgeRevisions.entryId, sub.entryId))
+					.orderBy(desc(knowledgeRevisions.version))
+					.limit(1)
+					.get();
+				const nextVersion = (row?.v ?? 0) + 1;
+
+				tx.insert(knowledgeRevisions)
+					.values({
+						id: revisionId,
+						entryId: sub.entryId,
+						version: nextVersion,
+						format: "markdown",
+						content,
+						contentHash: hashContent(content),
+						changeNote: sub.changeNote ?? null,
+						authorUserId: sub.submitterUserId,
+						baseRevisionId: sub.baseRevisionId,
+						createdAt: now,
+					})
+					.run();
+				tx.update(knowledgeEntries)
+					.set({ currentRevisionId: revisionId, currentContent: content, updatedAt: now })
+					.where(eq(knowledgeEntries.id, sub.entryId))
+					.run();
+				tx.update(knowledgeSubmissions)
+					.set({
+						status: "approved",
+						reviewerUserId,
+						reviewedAt: now,
+						mergedRevisionId: revisionId,
+					})
+					.where(eq(knowledgeSubmissions.id, sub.id))
+					.run();
+				tx.update(knowledgeDrafts)
+					.set({ status: "merged", updatedAt: now })
+					.where(eq(knowledgeDrafts.id, sub.draftId))
+					.run();
+			}),
+		{ label: "knowledge.commitMergedRevision", maxRetries: 5 },
+	);
 	return revisionId;
 }
 
