@@ -468,7 +468,13 @@ function SubmissionsTab({ entryId, mainContent }: { entryId: string; mainContent
 					<SubmissionReviewPanel
 						submission={detail.data}
 						currentContent={mainContent}
-						canReview={isAdmin || submissions.length > 0}
+						canReview={
+							// Backend listSubmissions only returns submissions the user may
+							// review (or everything for admins). A user may never review their
+							// OWN submission (the server rejects it), so exclude that case.
+							(isAdmin || submissions.some((s) => s.id === detail.data?.id)) &&
+							detail.data.submitterUserId !== user?.id
+						}
 						onDone={() => setSelectedId(null)}
 					/>
 				) : (
