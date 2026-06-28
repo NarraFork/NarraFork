@@ -562,6 +562,8 @@ function canUseFts(safe: string): boolean {
 function search(opts: {
 	q?: string;
 	collectionId?: string;
+	/** Restrict to collections in this project PLUS global (project_id IS NULL) collections. */
+	projectId?: string;
 	tag?: string;
 	limit?: number;
 	match?: "and" | "or";
@@ -570,11 +572,27 @@ function search(opts: {
 	const query = (opts.q ?? "").trim();
 	const safe = sanitizeQuery(query);
 
+	// Project-isolation clause: when a projectId is given, restrict entries to
+	// collections belonging to that project OR global collections (project_id IS NULL).
+	// Keeps a narrator from surfacing knowledge scoped to OTHER projects.
+	const projectClause = opts.projectId
+		? `AND e.collection_id IN (
+				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
+			)`
+		: "";
+
 	let rows: EntryRow[];
 
 	if (canUseFts(safe)) {
 		// FTS path: join FTS rowid back to the entries table.
 		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and");
+		const params: (string | number | null)[] = [
+			ftsQuery,
+			opts.collectionId ?? null,
+			opts.collectionId ?? null,
+		];
+		if (opts.projectId) params.push(opts.projectId);
+		params.push(limit);
 		rows = sqlite
 			.prepare(
 				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
@@ -584,9 +602,10 @@ function search(opts: {
 				 JOIN knowledge_entries e ON e.rowid = knowledge_entries_fts.rowid
 				 WHERE knowledge_entries_fts MATCH ?
 				   AND (? IS NULL OR e.collection_id = ?)
+				   ${projectClause}
 				 ORDER BY rank LIMIT ?`,
 			)
-			.all(ftsQuery, opts.collectionId ?? null, opts.collectionId ?? null, limit) as EntryRow[];
+			.all(...params) as EntryRow[];
 	} else {
 		// Short-query fallback (1-2 chars, e.g. a 2-character CJK term that the
 		// trigram index can't tokenize). We still match against current_content so
@@ -594,6 +613,15 @@ function search(opts: {
 		// unindexed scan can't run away on the main thread.
 		const fallbackLimit = Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT);
 		const like = `%${query}%`;
+		const params: (string | number | null)[] = [
+			query,
+			like,
+			like,
+			opts.collectionId ?? null,
+			opts.collectionId ?? null,
+		];
+		if (opts.projectId) params.push(opts.projectId);
+		params.push(fallbackLimit);
 		rows = sqlite
 			.prepare(
 				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
@@ -602,16 +630,10 @@ function search(opts: {
 				 FROM knowledge_entries e
 				 WHERE (? = '' OR e.title LIKE ? OR e.current_content LIKE ?)
 				   AND (? IS NULL OR e.collection_id = ?)
+				   ${projectClause}
 				 ORDER BY e.updated_at DESC LIMIT ?`,
 			)
-			.all(
-				query,
-				like,
-				like,
-				opts.collectionId ?? null,
-				opts.collectionId ?? null,
-				fallbackLimit,
-			) as EntryRow[];
+			.all(...params) as EntryRow[];
 	}
 
 	const mapped = rows.map(mapRow);

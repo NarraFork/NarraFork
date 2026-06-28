@@ -41,6 +41,7 @@ export const knowledgeSearchTool: ToolDefinition = {
 				q: query,
 				tag,
 				collectionId,
+				projectId: ctx.projectId ?? undefined,
 				limit: Math.min(limit ?? 10, 30),
 			});
 			const readable = await knowledgeService.filterReadable(principal, results);
@@ -65,6 +66,9 @@ export const knowledgeSearchTool: ToolDefinition = {
 };
 
 // ─── KnowledgeRead ───
+/** Max characters of entry body returned to the model — guards the context window. */
+const KNOWLEDGE_READ_MAX_CHARS = 24_000;
+
 export const knowledgeReadTool: ToolDefinition = {
 	name: "KnowledgeRead",
 	description:
@@ -82,7 +86,12 @@ export const knowledgeReadTool: ToolDefinition = {
 				principal,
 			})) as { title: string; currentContent?: string | null; tagsJson?: unknown };
 			const tags = Array.isArray(entry.tagsJson) ? (entry.tagsJson as string[]) : [];
-			const body = entry.currentContent ?? "(empty)";
+			const rawBody = entry.currentContent ?? "(empty)";
+			// Cap the body so a very large entry can't blow up the context window.
+			const truncated = rawBody.length > KNOWLEDGE_READ_MAX_CHARS;
+			const body = truncated
+				? `${rawBody.slice(0, KNOWLEDGE_READ_MAX_CHARS)}\n\n…[truncated ${rawBody.length - KNOWLEDGE_READ_MAX_CHARS} chars; the entry is longer than the read limit]`
+				: rawBody;
 			return {
 				output: `# ${entry.title}${tags.length ? `\nTags: ${tags.join(", ")}` : ""}\n\n${body}`,
 				title: `KnowledgeRead: ${entry.title}`,

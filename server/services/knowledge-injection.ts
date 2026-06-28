@@ -120,12 +120,13 @@ function extractKeywords(text: string, minLen: number): string {
  * Resolve knowledge entries relevant to `text` that the given user may read.
  * ACL is applied (dual-axis) — unreadable entries never surface.
  *   - userId: the user who triggered this loop turn (null → anonymous, public only)
+ *   - projectId: restrict to this project's collections + global ones (cross-project isolation)
  *   - returns at most settings.knowledge.maxInjectedEntries hits, excluding `already`
  */
 export async function resolveInjections(
 	userId: string | null | undefined,
 	text: string,
-	opts: { collectionId?: string; already?: InjectedSet } = {},
+	opts: { collectionId?: string; projectId?: string; already?: InjectedSet } = {},
 ): Promise<InjectionHit[]> {
 	const cfg = settings.knowledge;
 	if (cfg.injectMode === "off") return [];
@@ -144,6 +145,7 @@ export async function resolveInjections(
 		results = knowledgeService.search({
 			q: keywords,
 			collectionId: opts.collectionId,
+			projectId: opts.projectId,
 			limit,
 			match: "or",
 		}) as typeof results;
@@ -185,7 +187,7 @@ export async function scanToolOutputForKnowledge(
 	userId: string | null | undefined,
 	output: string,
 	already: InjectedSet,
-	opts: { collectionId?: string } = {},
+	opts: { collectionId?: string; projectId?: string } = {},
 ): Promise<string | null> {
 	const cfg = settings.knowledge;
 	if (cfg.injectMode === "off" || !cfg.scanToolOutput) return null;

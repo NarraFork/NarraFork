@@ -289,6 +289,7 @@ export async function executeTool(
 		skillScopeKey: config.skillScopeKey,
 		parentNarratorId: config.parentNarratorId,
 		userId: config.userId,
+		projectId: config.projectId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 		reflectionLoop: config.reflectionLoop?.context,

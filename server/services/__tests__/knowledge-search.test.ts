@@ -55,3 +55,68 @@ describe("knowledge search", () => {
 		expect(results.length).toBeGreaterThanOrEqual(1);
 	});
 });
+
+describe("project isolation (H3)", () => {
+	test("projectId filter returns this project's + global entries, hides other projects'", async () => {
+		const tag = Date.now();
+		const { db } = await import("../../db");
+		const { projects } = await import("../../db/schema");
+		const now = new Date().toISOString();
+		const projA = `proj-A-${tag}`;
+		const projB = `proj-B-${tag}`;
+		// Real project rows so the collection.projectId FK is satisfied.
+		await db.insert(projects).values([
+			{
+				id: projA,
+				name: `A-${tag}`,
+				status: "active",
+				flowMode: "classic",
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				id: projB,
+				name: `B-${tag}`,
+				status: "active",
+				flowMode: "classic",
+				createdAt: now,
+				updatedAt: now,
+			},
+		]);
+
+		// Project A collection + entry
+		const colA = await knowledgeService.createCollection({
+			name: `projA-${tag}`,
+			projectId: projA,
+		});
+		await knowledgeService.createEntry({
+			collectionId: colA.id,
+			title: `Alpha协议${tag}`,
+			content: "项目A 专属知识 协议规范",
+		});
+		// Project B collection + entry (same distinctive term)
+		const colB = await knowledgeService.createCollection({
+			name: `projB-${tag}`,
+			projectId: projB,
+		});
+		await knowledgeService.createEntry({
+			collectionId: colB.id,
+			title: `Beta协议${tag}`,
+			content: "项目B 专属知识 协议规范",
+		});
+		// Global collection (projectId null)
+		const colG = await knowledgeService.createCollection({ name: `global-${tag}` });
+		await knowledgeService.createEntry({
+			collectionId: colG.id,
+			title: `Gamma协议${tag}`,
+			content: "全局共享知识 协议规范",
+		});
+
+		// Search scoped to project A: should see Alpha (A) + Gamma (global), NOT Beta (B).
+		const scoped = knowledgeService.search({ q: "协议规范", projectId: projA });
+		const titles = scoped.map((r) => r.title);
+		expect(titles).toContain(`Alpha协议${tag}`);
+		expect(titles).toContain(`Gamma协议${tag}`);
+		expect(titles).not.toContain(`Beta协议${tag}`);
+	});
+});

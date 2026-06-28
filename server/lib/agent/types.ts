@@ -60,6 +60,11 @@ export interface ToolContext {
 	 * NarraFork narrators have no fixed owner, so authority is per-trigger, not per-narrator.
 	 */
 	userId?: string | null;
+	/**
+	 * Project the narrator belongs to. Scopes knowledge search/read to this
+	 * project's collections + global ones (cross-project isolation).
+	 */
+	projectId?: string | null;
 	/** Request permission from the user. Returns true if allowed. */
 	requestPermission: (
 		toolName: string,
@@ -508,6 +513,8 @@ export interface AgentConfig {
 	skillScopeKey?: string;
 	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */
 	userId?: string | null;
+	/** Project this narrator belongs to — scopes knowledge injection to this project + global. */
+	projectId?: string | null;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
