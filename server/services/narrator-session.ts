@@ -103,6 +103,11 @@ import {
 	generateQuickTitle,
 	setProvisionalTitleFromUserMessage,
 } from "./narrator-title";
+import {
+	drainParentInboundMessages,
+	formatParentInboundMessages,
+	type ParentInboundMessage,
+} from "./parent-inbound-queue";
 import { reviewService } from "./review-service";
 import {
 	deleteConclusionFileId,
@@ -783,6 +788,24 @@ async function drainAndPersistBackgroundCompletionNotice(
 				status: task.status,
 				resultPreview: task.resultPreview,
 				resultTruncated: task.resultTruncated ?? false,
+			})),
+		},
+	]);
+	return prompt;
+}
+
+async function drainAndPersistParentInboundNotice(active: ActiveNarrator): Promise<string | null> {
+	const inbound = drainParentInboundMessages(active.narratorId);
+	if (inbound.length === 0) return null;
+	const prompt = formatParentInboundMessages(inbound, active.locale);
+	await persistAndBroadcastSystemMessage(active.narratorId, prompt, [
+		{
+			type: "subagent_messages",
+			messages: inbound.map((message: ParentInboundMessage) => ({
+				fromId: message.fromId,
+				fromTitle: message.fromTitle,
+				fromType: message.fromType,
+				timestamp: message.timestamp,
 			})),
 		},
 	]);
@@ -1727,6 +1750,16 @@ export async function runAgentLoop(
 							target: "user_message",
 							source: "group_message",
 							content: formatGroupMessages(groupMsgs),
+						});
+					}
+
+					// Drain progress reports sent by child subagents via Send({ id: "parent" }).
+					const parentInbound = drainParentInboundMessages(narratorId);
+					if (parentInbound.length > 0) {
+						sideCars.push({
+							target: "user_message",
+							source: "subagent_message",
+							content: formatParentInboundMessages(parentInbound, locale),
 						});
 					}
 
@@ -3359,6 +3392,62 @@ export async function startBackgroundCompletionContinuationIfPossible(
 		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 		runAgentLoop(active, "").catch(async (err) => {
 			logger.error("runAgentLoop unhandled error (background completion)", {
+				narratorId,
+				error: String(err),
+			});
+			await narratorService.updateStatus(narratorId, "idle", {
+				substatus: ["error"],
+				errorMessage: String(err),
+			});
+			broadcastToNarrator(narratorId, {
+				type: "narrator_error",
+				narratorId,
+				error: String(err),
+			});
+		});
+		return { started: true };
+	});
+}
+
+/**
+ * Wake an idle parent narrator to consume progress reports sent by its child
+ * subagents via Send({ id: "parent" }). A working/waiting parent drains the
+ * queue at its next after_tools sidecar boundary, so this only acts on idle
+ * narrators. Plan-mode narrators are not auto-woken (mirrors goal continuation
+ * and chat-group delivery) — the message stays queued until their next activity.
+ *
+ * Reuses backgroundCompletionStartLock so it cannot race the background-task
+ * completion continuation into starting two concurrent loops.
+ */
+export async function startParentInboundContinuationIfPossible(
+	narratorId: string,
+	locale: Locale = "en",
+	replyInUserLanguage = false,
+): Promise<{ started: boolean }> {
+	return backgroundCompletionStartLock.acquire(narratorId, async () => {
+		const activeExisting = activeNarrators.get(narratorId);
+		if (activeExisting?.alive && activeExisting._loopRunning) return { started: false };
+
+		const narrator = await narratorService.getById(narratorId);
+		if (narrator.status !== "idle") return { started: false };
+		// Plan-mode narrators are not auto-woken; leave the report queued.
+		if (isPlanModeTrait(narrator.traits)) return { started: false };
+
+		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		if (active._loopRunning) return { started: false };
+
+		const prompt = await drainAndPersistParentInboundNotice(active);
+		if (!prompt) return { started: false };
+
+		active._goalContinuationSuppressed = false;
+		active._goalContinuationNoToolCount = 0;
+		active._lastTokenUsage = undefined;
+		active._ttftMs = undefined;
+		active._turnStartedAt = new Date().toISOString();
+
+		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+		runAgentLoop(active, "").catch(async (err) => {
+			logger.error("runAgentLoop unhandled error (subagent message)", {
 				narratorId,
 				error: String(err),
 			});

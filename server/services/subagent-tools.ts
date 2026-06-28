@@ -1,6 +1,11 @@
 import { SHELL_TOOL_NAME } from "@server/lib/agent/tools/bash";
 import type { ToolDefinition } from "@server/lib/agent/types";
-import { getSubagentPrompt, type Locale, type SubagentType } from "@server/lib/prompt-i18n";
+import {
+	getSubagentParentReportingHint,
+	getSubagentPrompt,
+	type Locale,
+	type SubagentType,
+} from "@server/lib/prompt-i18n";
 import { settings } from "@server/lib/settings";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
@@ -146,6 +151,12 @@ export function resolveToolFilter(
  * Build the effective system prompt for a subagent.
  * Optionally injects contextSummary (after compact).
  * Accepts an optional pre-loaded customPrompt to avoid redundant I/O.
+ *
+ * `canReportToParent` controls whether the parent-reporting hint is included.
+ * Only background subagents may report to the parent — a foreground subagent
+ * blocks the parent until it finishes, so its reports could never be read in
+ * time. Advertising the capability to foreground subagents would only cause
+ * rejected Send attempts.
  */
 export async function buildSubagentSystemPrompt(
 	subagentType: SubagentType,
@@ -153,6 +164,7 @@ export async function buildSubagentSystemPrompt(
 	locale: Locale,
 	contextSummary?: string | null,
 	customPrompt?: string | null,
+	canReportToParent = false,
 ): Promise<string> {
 	// Try built-in prompt first
 	let basePrompt = getSubagentPrompt(subagentType, locale);
@@ -173,6 +185,13 @@ export async function buildSubagentSystemPrompt(
 			locale === "zh-CN"
 				? "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。"
 				: "You are a subagent executing a delegated task. Complete the task and report your results concisely.";
+	}
+
+	// Background subagents run without blocking the parent, so tell them how to
+	// report interim progress to the narrator that launched them (the final
+	// result is still returned automatically when they finish).
+	if (canReportToParent) {
+		basePrompt = `${basePrompt}\n\n${getSubagentParentReportingHint(locale)}`;
 	}
 
 	const { prompt } = await buildEffectiveSystemPrompt({

@@ -572,6 +572,26 @@ export function getSubagentPrompt(type: SubagentType, locale: Locale = "en"): st
 	return entry[locale] ?? entry.en;
 }
 
+/**
+ * Guidance appended to every subagent system prompt: how to report progress
+ * back to the narrator that launched it. The final result is still returned
+ * automatically when the subagent finishes, so this is for interim updates.
+ */
+export function getSubagentParentReportingHint(locale: Locale = "en"): string {
+	if (locale === "zh-CN") {
+		return `与父叙述者通信：
+- 你可以使用 Send 工具向启动你的叙述者发送阶段性进展，例如 Send({ id: "parent", message: "已完成 X，正在做 Y" })。目标 "parent"（或 "main"）是指向父叙述者的保留关键字。
+- 适合用于：阐述阶段性工作进展、报告关键中间发现、说明遇到的阻碍。请保持简洁，不要刷屏。
+- 这不是必需的：你的最终结果在任务完成时会自动返回给父叙述者，无需用 Send 重复发送最终结论。
+- 你也可以用 Send 给同级子代理发消息，用 TeamStatus 查看同级状态。`;
+	}
+	return `Communicating with the parent narrator:
+- You can use the Send tool to report interim progress to the narrator that launched you, e.g. Send({ id: "parent", message: "Finished X, now working on Y" }). The target "parent" (or "main") is a reserved keyword for the parent narrator.
+- Good uses: explaining staged progress, reporting key intermediate findings, flagging blockers. Keep it concise — do not spam.
+- This is optional: your final result is returned to the parent automatically when you finish, so you do not need to Send your final conclusion.
+- You can also Send to sibling subagents and use TeamStatus to inspect siblings.`;
+}
+
 // --- Review narrator prompts ---
 
 const reviewPrompts: Record<Locale, string> = {

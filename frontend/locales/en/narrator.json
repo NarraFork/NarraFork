@@ -753,7 +753,8 @@
 			"bg_bash": "Background command",
 			"team_message": "Team message",
 			"buffered_user": "Buffered user message",
-			"group_message": "Group message"
+			"group_message": "Group message",
+			"subagent_message": "Subagent message"
 		}
 	},
 	"toolCallInspector": {

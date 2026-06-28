@@ -752,7 +752,8 @@
 			"bg_bash": "后台命令通知",
 			"team_message": "团队消息",
 			"buffered_user": "缓冲用户消息",
-			"group_message": "群聊消息"
+			"group_message": "群聊消息",
+			"subagent_message": "子代理消息"
 		}
 	},
 	"toolCallInspector": {

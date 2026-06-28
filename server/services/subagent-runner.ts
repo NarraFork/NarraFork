@@ -907,6 +907,9 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 			locale as Locale,
 			contextSummary,
 			customDef?.prompt,
+			// Only background subagents can report progress to the parent; a
+			// foreground subagent blocks the parent until it finishes.
+			background ?? false,
 		);
 	const systemPrompt = await rebuildSystemPrompt();
 
@@ -1180,6 +1183,10 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 			locale as Locale,
 			contextSummary,
 			customDef?.prompt,
+			// A continued subagent always runs in the foreground (it is converted
+			// out of background mode below), so it blocks the parent and must not
+			// advertise parent-reporting.
+			false,
 		);
 	const systemPrompt = await rebuildSystemPrompt(original.contextSummary);
 

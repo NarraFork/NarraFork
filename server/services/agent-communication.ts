@@ -1,10 +1,11 @@
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
-import { isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
+import { getSubagentType, isSubagentVariant, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
 import { backgroundTaskService } from "./background-task-service";
 import { narratorService } from "./narrator-service";
-import { getSubagentFinalText } from "./narrator-session";
+import { getSubagentFinalText, startParentInboundContinuationIfPossible } from "./narrator-session";
+import { pushParentInboundMessage } from "./parent-inbound-queue";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import { interruptForegroundSubagent } from "./subagent-detach";
 import { pushSubagentBufferedMessage } from "./subagent-executor";
@@ -529,6 +530,165 @@ async function tryRouteViaChatGroup(input: SendSubagentInput): Promise<SendSubag
 	return { output: sections.join("\n"), targets: targetResults };
 }
 
+/**
+ * Reserved selectors a subagent can use to address the narrator that launched
+ * it (its parent). Matched case-insensitively before sibling alias resolution.
+ */
+const PARENT_SELECTORS = new Set(["parent", "main", "@parent", "@main"]);
+
+function isParentSelector(selector: string): boolean {
+	return PARENT_SELECTORS.has(selector.trim().toLowerCase());
+}
+
+/** Subagent type label for a caller narrator (explore/plan/general/...). */
+function callerSubagentType(caller: Narrator): string {
+	return getSubagentType(caller.variant) ?? "subagent";
+}
+
+/**
+ * Prefix a sibling/child-bound message with a sender label so the recipient can
+ * tell who sent it. User-typed buffer messages (entered on the subagent page)
+ * bypass this path and are unaffected.
+ */
+function withSenderPrefix(
+	caller: Narrator,
+	callerIsSubagent: boolean,
+	message: string,
+	locale: Locale,
+): string {
+	const isZh = locale === "zh-CN";
+	if (callerIsSubagent) {
+		const name = caller.title?.trim() || caller.id.slice(0, 8);
+		const label = isZh
+			? `[来自同级子代理"${name}"（${callerSubagentType(caller)}）的消息]`
+			: `[Message from sibling subagent "${name}" (${callerSubagentType(caller)})]`;
+		return `${label}\n${message}`;
+	}
+	const label = isZh ? "[来自父叙述者的消息]" : "[Message from the parent narrator]";
+	return `${label}\n${message}`;
+}
+
+/**
+ * Deliver a subagent → parent progress report. The parent is always a primary
+ * narrator (subagents cannot spawn nested subagents). A working/waiting parent
+ * drains the report at its next sidecar boundary; an idle parent is woken.
+ */
+async function deliverSubagentMessageToParent(
+	input: SendSubagentInput,
+	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
+): Promise<SendTargetResult> {
+	const parentId = scope.teamParentId;
+	const parent = await narratorService.getById(parentId).catch(() => null);
+	if (!parent) {
+		return { id: parentId, status: "failed", error: "Parent narrator not found" };
+	}
+	// Defensive: nested subagents are impossible (createSubagent rejects them),
+	// so a subagent's parent must be a primary narrator. Guard anyway.
+	if (isSubagentVariant(parent.variant)) {
+		logger.warn("Subagent parent is unexpectedly a subagent; refusing parent delivery", {
+			callerNarratorId: input.callerNarratorId,
+			parentNarratorId: parentId,
+		});
+		return { id: parentId, status: "failed", error: "Parent is not a primary narrator" };
+	}
+	if (parent.status === "archived") {
+		return { id: parentId, title: parent.title, status: "failed", error: "Parent is archived" };
+	}
+
+	pushParentInboundMessage(parentId, {
+		fromId: scope.caller.id,
+		fromTitle: scope.caller.title,
+		fromType: callerSubagentType(scope.caller),
+		text: input.message,
+		timestamp: new Date().toISOString(),
+	});
+
+	// Wake the parent only when idle; a working/waiting parent drains the queue
+	// at its next after_tools sidecar boundary.
+	const wake = await startParentInboundContinuationIfPossible(
+		parentId,
+		input.locale as Locale,
+	).catch((err) => {
+		logger.warn("Failed to wake parent narrator for subagent message", {
+			parentNarratorId: parentId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return { started: false };
+	});
+
+	return {
+		id: parentId,
+		title: parent.title,
+		status: wake.started ? "started" : "queued",
+	};
+}
+
+/**
+ * Attempt to route a Send from a subagent to its parent narrator. Returns a
+ * result when every selector targets the parent; returns null when no selector
+ * is parent-bound (caller falls through to sibling routing). A mix of parent
+ * and non-parent selectors is rejected (mirrors chat-group mixed-target rules).
+ */
+async function tryRouteToParent(
+	input: SendSubagentInput,
+	scope: Awaited<ReturnType<typeof getCommunicationScope>>,
+): Promise<SendSubagentResult | null> {
+	if (!scope.callerIsSubagent) return null;
+	const selectors = getSelectors(input);
+	if (selectors.length === 0) return null;
+
+	const parentMatches = selectors.filter(
+		(selector) => isParentSelector(selector) || selector === scope.teamParentId,
+	);
+	if (parentMatches.length === 0) return null;
+	if (parentMatches.length !== selectors.length) {
+		return {
+			output:
+				"Mixed parent and sibling Send targets are not delivered together; " +
+				"split this into separate Send calls.",
+			targets: selectors.map((selector) => ({
+				id: selector,
+				status: "failed" as const,
+				error: "Mixed parent and sibling targets in one Send call.",
+			})),
+		};
+	}
+
+	// Only background subagents may report to the parent. A foreground subagent
+	// blocks the parent on the Task tool call that spawned it: the parent is not
+	// idle (so it can't be woken) and never reaches a sidecar boundary (so it
+	// can't drain the queue) until this subagent finishes — at which point the
+	// final result is already returned, making interim reports pointless.
+	if (!scope.caller.isBackground) {
+		return {
+			output:
+				"Cannot report to the parent narrator: you are a foreground subagent and the parent is " +
+				"blocked waiting for you to finish. Your final result is returned to the parent " +
+				"automatically when you complete. (Only background subagents can send interim progress " +
+				"reports to the parent.)",
+			targets: [
+				{
+					id: scope.teamParentId,
+					status: "failed",
+					error: "Foreground subagents block the parent and cannot send interim reports.",
+				},
+			],
+		};
+	}
+
+	const target = await deliverSubagentMessageToParent(input, scope);
+	const note =
+		target.status === "started"
+			? "Reported to the parent narrator (woke it to read the report)."
+			: target.status === "queued"
+				? "Reported to the parent narrator; it will see the report on its next turn."
+				: `Failed to report to the parent narrator: ${target.error}`;
+	const awaitNote = input.shouldAwait
+		? " (await is not supported for parent targets; the parent does not return a synchronous result.)"
+		: "";
+	return { output: `${note}${awaitNote}`, targets: [{ ...target, awaited: false }] };
+}
+
 export async function sendSubagentMessageDetailed(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
@@ -547,9 +707,24 @@ export async function sendSubagentMessageDetailed(
 		throw new Error("doInterrupt is only supported from a primary narrator to its child subagents");
 	}
 
+	// Subagent → parent routing: a subagent may report progress to the narrator
+	// that launched it via the reserved selector "parent"/"main" (or the parent's
+	// id). Intercept before sibling alias resolution so it cannot collide with a
+	// sibling's alias/title.
+	const parentResult = await tryRouteToParent(input, scope);
+	if (parentResult) return parentResult;
+
 	const targets = await resolveSubagentTargets(input);
 	const sections: string[] = [];
 	const targetResults: SendTargetResult[] = [];
+	// Prefix sibling/child-bound messages with a sender label so the recipient
+	// can tell who sent it (user-typed page messages bypass this path entirely).
+	const deliveredMessage = withSenderPrefix(
+		scope.caller,
+		scope.callerIsSubagent,
+		input.message,
+		input.locale as Locale,
+	);
 	for (const target of targets) {
 		try {
 			if (input.doInterrupt && target.parentNarratorId !== input.callerNarratorId) {
@@ -580,7 +755,7 @@ export async function sendSubagentMessageDetailed(
 			if (fresh.status === "working" || fresh.status === "waiting") {
 				const buffered = pushSubagentBufferedMessage(
 					fresh.id,
-					input.message,
+					deliveredMessage,
 					undefined,
 					input.doInterrupt ? "front" : "back",
 				);
@@ -640,7 +815,7 @@ export async function sendSubagentMessageDetailed(
 					subagentId: fresh.id,
 					parentNarratorId: fresh.parentNarratorId as string,
 					toolUseId: input.toolUseId,
-					prompt: input.message,
+					prompt: deliveredMessage,
 					signal: input.signal,
 					locale: input.locale as Locale,
 				});
@@ -659,7 +834,7 @@ export async function sendSubagentMessageDetailed(
 					subagentId: fresh.id,
 					parentNarratorId: fresh.parentNarratorId as string,
 					toolUseId: input.toolUseId,
-					prompt: input.message,
+					prompt: deliveredMessage,
 					signal: bgAbort.signal,
 					locale: input.locale as Locale,
 				}).catch((err) => {

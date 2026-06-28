@@ -6,11 +6,17 @@ export const sendTool: ToolDefinition = {
 	description:
 		"Send a message to one or more accessible subagents or fellow chat-group members. " +
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
+		'Subagents may also report progress to the narrator that launched them via the reserved target "parent" (or "main"), e.g. Send({ id: "parent", message: "..." }). ' +
 		"If you are a named narrator in a chat group, you may send to fellow group members by their @handle, id, or name. " +
 		"Set doInterrupt=true to interrupt an active foreground child subagent; this is only allowed from a primary narrator to its own child subagent. " +
-		"Set await=true to wait for the target subagent's response.",
+		"Set await=true to wait for the target subagent's response (not supported for the parent target).",
 	parameters: z.object({
-		id: z.string().optional().describe("Target subagent ID or alias."),
+		id: z
+			.string()
+			.optional()
+			.describe(
+				'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+			),
 		ids: z.array(z.string()).optional().describe("Target subagent IDs or aliases."),
 		name: z.string().optional().describe("Target subagent title, alias, or unique ID prefix."),
 		names: z
@@ -34,7 +40,11 @@ export const sendTool: ToolDefinition = {
 	rawJsonSchema: {
 		type: "object",
 		properties: {
-			id: { description: "Target subagent ID or alias.", type: "string" },
+			id: {
+				description:
+					'Target subagent ID or alias. Subagents may use "parent" to reach their parent narrator.',
+				type: "string",
+			},
 			ids: {
 				description: "Target subagent IDs or aliases.",
 				type: "array",
