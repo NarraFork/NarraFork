@@ -1386,6 +1386,8 @@ export const knowledgeEntries = sqliteTable(
 		uniqueIndex("idx_ke_collection_slug").on(table.collectionId, table.slug),
 		index("idx_ke_collection").on(table.collectionId),
 		index("idx_ke_status").on(table.status),
+		// Covers listEntries: filter by collection_id, sort by updated_at DESC.
+		index("idx_ke_collection_updated").on(table.collectionId, table.updatedAt),
 	],
 );
 
@@ -1491,6 +1493,9 @@ export const knowledgeSubmissions = sqliteTable(
 		index("idx_ks_entry").on(table.entryId),
 		index("idx_ks_status").on(table.status),
 		index("idx_ks_submitter").on(table.submitterUserId),
+		// Covers listSubmissions sort (created_at DESC) under entry/status filters.
+		index("idx_ks_entry_created").on(table.entryId, table.createdAt),
+		index("idx_ks_status_created").on(table.status, table.createdAt),
 	],
 );
 

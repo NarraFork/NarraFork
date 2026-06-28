@@ -42,7 +42,17 @@ async function loadEntryAndCollection(entryId: string) {
 	return { entry, collection };
 }
 
-function toAclEntry(entry: typeof knowledgeEntries.$inferSelect): AclEntry {
+function toAclEntry(
+	entry: Pick<
+		typeof knowledgeEntries.$inferSelect,
+		| "id"
+		| "collectionId"
+		| "ownerUserId"
+		| "classificationLevel"
+		| "controlledTagsJson"
+		| "reviewTagsJson"
+	>,
+): AclEntry {
 	return {
 		id: entry.id,
 		collectionId: entry.collectionId,
@@ -449,7 +459,13 @@ async function commitMergedRevision(
 
 // ─── Listing (reviewer view) ─────────────────────────────────────────────
 
-async function listSubmissions(principal: Principal, opts: { entryId?: string; status?: string }) {
+/** Hard cap on submission rows returned by the reviewer list. */
+const SUBMISSION_LIST_MAX = 200;
+
+async function listSubmissions(
+	principal: Principal,
+	opts: { entryId?: string; status?: string; limit?: number },
+) {
 	const statusFilter = opts.status as
 		| "pending"
 		| "approved"
@@ -457,6 +473,7 @@ async function listSubmissions(principal: Principal, opts: { entryId?: string; s
 		| "changes_requested"
 		| "conflict"
 		| undefined;
+	const limit = Math.min(opts.limit ?? SUBMISSION_LIST_MAX, SUBMISSION_LIST_MAX);
 	const rows = await db.query.knowledgeSubmissions.findMany({
 		where: (s, { and: a, eq: e }) => {
 			const conds = [];
@@ -464,19 +481,50 @@ async function listSubmissions(principal: Principal, opts: { entryId?: string; s
 			if (statusFilter) conds.push(e(s.status, statusFilter));
 			return conds.length ? a(...conds) : undefined;
 		},
+		// Exclude the large proposedContent blob from the list view — the diff is
+		// only needed in the single-submission detail (getSubmission).
+		columns: {
+			id: true,
+			draftId: true,
+			entryId: true,
+			submitterUserId: true,
+			baseRevisionId: true,
+			changeNote: true,
+			status: true,
+			verdict: true,
+			findingsJson: true,
+			reviewerUserId: true,
+			reviewedAt: true,
+			mergedRevisionId: true,
+			createdAt: true,
+		},
 		orderBy: (s, { desc: d }) => [d(s.createdAt)],
+		limit,
 	});
 	// Filter to entries the principal can review (or admin).
 	const caps = await resolvePrincipalCaps(principal);
 	if (caps.isAdmin) return rows;
-	const out: typeof rows = [];
-	for (const s of rows) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, s.entryId),
-		});
-		if (entry && canReview(caps, toAclEntry(entry))) out.push(s);
-	}
-	return out;
+	if (rows.length === 0) return rows;
+
+	// Batch-load the referenced entries (ACL fields only) in ONE query to avoid
+	// the previous per-row N+1 lookup, then decide reviewability in memory.
+	const entryIds = [...new Set(rows.map((s) => s.entryId))];
+	const entries = await db.query.knowledgeEntries.findMany({
+		where: (e, { inArray }) => inArray(e.id, entryIds),
+		columns: {
+			id: true,
+			collectionId: true,
+			ownerUserId: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			reviewTagsJson: true,
+		},
+	});
+	const entryById = new Map(entries.map((e) => [e.id, e]));
+	return rows.filter((s) => {
+		const entry = entryById.get(s.entryId);
+		return entry ? canReview(caps, toAclEntry(entry)) : false;
+	});
 }
 
 async function getSubmission(principal: Principal, submissionId: string) {

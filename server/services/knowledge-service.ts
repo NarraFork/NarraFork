@@ -215,15 +215,40 @@ async function deleteCollection(id: string) {
 // Entries + revisions
 // ═══════════════════════════════════════════════════════════════════════
 
-async function listEntries(opts: { collectionId?: string; tag?: string }) {
+/** Hard cap on rows returned by any single list query (main-thread safety). */
+const LIST_MAX_LIMIT = 200;
+const LIST_DEFAULT_LIMIT = 100;
+
+/** Columns safe to return in list views — explicitly EXCLUDES the large
+ *  currentContent / metadataJson blobs so they're never read off disk in bulk. */
+const ENTRY_LIST_COLUMNS = {
+	id: true,
+	collectionId: true,
+	title: true,
+	slug: true,
+	currentRevisionId: true,
+	tagsJson: true,
+	classificationLevel: true,
+	controlledTagsJson: true,
+	reviewTagsJson: true,
+	ownerUserId: true,
+	status: true,
+	createdAt: true,
+	updatedAt: true,
+} as const;
+
+async function listEntries(opts: { collectionId?: string; tag?: string; limit?: number }) {
+	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
 	const rows = await db.query.knowledgeEntries.findMany({
 		where: opts.collectionId ? eq(knowledgeEntries.collectionId, opts.collectionId) : undefined,
+		// SQL-layer column projection: the large currentContent/metadataJson blobs
+		// are never selected, so list views can't pull big bodies into the main thread.
+		columns: ENTRY_LIST_COLUMNS,
 		orderBy: (e, { desc: d }) => [d(e.updatedAt)],
+		limit,
 	});
 	const tag = opts.tag;
-	const filtered = tag ? rows.filter((r) => parseTags(r.tagsJson).includes(tag)) : rows;
-	// List view omits the (potentially large) currentContent body.
-	return filtered.map(({ currentContent: _omit, ...rest }) => rest);
+	return tag ? rows.filter((r) => parseTags(r.tagsJson).includes(tag)) : rows;
 }
 
 async function getEntry(id: string, opts: { withContent?: boolean; principal?: Principal } = {}) {
@@ -465,12 +490,18 @@ async function addRevision(
 	return { entryId, revisionId, version };
 }
 
-async function listRevisions(entryId: string, principal: Principal) {
+async function listRevisions(entryId: string, principal: Principal, opts: { limit?: number } = {}) {
 	// Enforces dual-axis read ACL on the parent entry (throws NotFound if unreadable).
 	await loadReadableEntry(entryId, principal);
+	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
+	// NOTE: `content` is still returned here because the frontend diff view reads
+	// it directly from the history list. Bounding the row count via LIMIT is the
+	// main-thread safeguard; moving to metadata-only + on-demand body fetch is a
+	// coordinated frontend change (tracked for the frontend phase).
 	return db.query.knowledgeRevisions.findMany({
 		where: eq(knowledgeRevisions.entryId, entryId),
 		orderBy: [desc(knowledgeRevisions.version)],
+		limit,
 	});
 }
 
@@ -515,6 +546,19 @@ function mapRow(row: EntryRow) {
 	};
 }
 
+/** Max rows any search call may return (hard cap on top of caller's limit). */
+const SEARCH_MAX_LIMIT = 100;
+/** Tighter cap for the unindexed short-query fallback to bound its scan cost. */
+const SHORT_QUERY_FALLBACK_LIMIT = 50;
+
+/** Whether a sanitized query can use the trigram FTS index.
+ *  The trigram tokenizer requires ≥3 characters to form a token — this holds
+ *  for CJK too (verified: 2 Han chars never match trigram FTS). Shorter queries
+ *  must use the LIKE fallback. */
+function canUseFts(safe: string): boolean {
+	return safe.length >= 3;
+}
+
 function search(opts: {
 	q?: string;
 	collectionId?: string;
@@ -522,13 +566,13 @@ function search(opts: {
 	limit?: number;
 	match?: "and" | "or";
 }) {
-	const limit = opts.limit ?? 30;
+	const limit = Math.min(opts.limit ?? 30, SEARCH_MAX_LIMIT);
 	const query = (opts.q ?? "").trim();
 	const safe = sanitizeQuery(query);
 
 	let rows: EntryRow[];
 
-	if (safe.length >= 3) {
+	if (canUseFts(safe)) {
 		// FTS path: join FTS rowid back to the entries table.
 		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and");
 		rows = sqlite
@@ -544,7 +588,11 @@ function search(opts: {
 			)
 			.all(ftsQuery, opts.collectionId ?? null, opts.collectionId ?? null, limit) as EntryRow[];
 	} else {
-		// LIKE fallback for short/empty queries.
+		// Short-query fallback (1-2 chars, e.g. a 2-character CJK term that the
+		// trigram index can't tokenize). We still match against current_content so
+		// short CJK terms find body matches, but with a TIGHT limit so the
+		// unindexed scan can't run away on the main thread.
+		const fallbackLimit = Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT);
 		const like = `%${query}%`;
 		rows = sqlite
 			.prepare(
@@ -562,7 +610,7 @@ function search(opts: {
 				like,
 				opts.collectionId ?? null,
 				opts.collectionId ?? null,
-				limit,
+				fallbackLimit,
 			) as EntryRow[];
 	}
 
