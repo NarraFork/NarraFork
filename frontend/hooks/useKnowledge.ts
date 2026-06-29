@@ -312,6 +312,22 @@ export function useCreateKnowledgeLevel() {
 	});
 }
 
+export function useUpdateKnowledgeLevel() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			name?: string;
+			rank?: number;
+			label?: string | null;
+		}) => api.updateKnowledgeLevel(id, data),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "levels"] }),
+	});
+}
+
 export function useDeleteKnowledgeLevel() {
 	const qc = useQueryClient();
 	return useMutation({
@@ -458,5 +474,15 @@ export function useSetUserAcl() {
 		}) => api.setUserAcl(userId, data),
 		onSuccess: (_r, { userId }) =>
 			qc.invalidateQueries({ queryKey: ["knowledge", "userAcl", userId] }),
+	});
+}
+
+// ─── Entry accessible users preview ───
+export function useEntryAccessibleUsers(entryId: string | undefined) {
+	return useQuery({
+		queryKey: ["knowledge", "entryAccessibleUsers", entryId],
+		queryFn: () => api.getEntryAccessibleUsers(entryId as string),
+		enabled: !!entryId,
+		staleTime: STALE,
 	});
 }

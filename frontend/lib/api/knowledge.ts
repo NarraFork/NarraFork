@@ -179,6 +179,14 @@ export const knowledgeApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	updateKnowledgeLevel: (
+		id: string,
+		data: { name?: string; rank?: number; label?: string | null },
+	) =>
+		request<KnowledgeLevel>(`/knowledge/levels/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
 	deleteKnowledgeLevel: (id: string) =>
 		request<{ ok: boolean }>(`/knowledge/levels/${id}`, { method: "DELETE" }),
 
@@ -253,4 +261,15 @@ export const knowledgeApi = {
 			method: "PUT",
 			body: JSON.stringify(data),
 		}),
+
+	// ─── Entry accessible users preview ───
+	getEntryAccessibleUsers: (entryId: string) =>
+		request<
+			{
+				userId: string;
+				username: string;
+				role: string;
+				reason: "admin" | "owner" | "grant";
+			}[]
+		>(`/knowledge/entries/${entryId}/accessible-users`),
 };

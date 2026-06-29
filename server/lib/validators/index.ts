@@ -65,6 +65,7 @@ export {
 	createKnowledgeEntrySchema,
 	createKnowledgeGrantSchema,
 	createKnowledgeLevelSchema,
+	updateKnowledgeLevelSchema,
 	createKnowledgeLinkSchema,
 	createKnowledgeTagSchema,
 	createKnowledgeTagTypeSchema,

@@ -23,6 +23,7 @@ import {
 	updateKnowledgeDraftSchema,
 	updateKnowledgeEntryAclSchema,
 	updateKnowledgeEntrySchema,
+	updateKnowledgeLevelSchema,
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
 } from "../lib/validators";
@@ -318,6 +319,11 @@ knowledgeRoutes.post("/levels", requireAdmin, async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await knowledgeAcl.createLevel(parsed.data), 201);
 });
+knowledgeRoutes.patch("/levels/:id", requireAdmin, async (c) => {
+	const parsed = updateKnowledgeLevelSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeAcl.updateLevel(c.req.param("id") ?? "", parsed.data));
+});
 knowledgeRoutes.delete("/levels/:id", requireAdmin, async (c) => {
 	const result = await knowledgeAcl.deleteLevel(c.req.param("id") ?? "");
 	if (!result.ok) {
@@ -396,4 +402,9 @@ knowledgeRoutes.post("/grants", requireAdmin, async (c) => {
 });
 knowledgeRoutes.delete("/grants/:id", requireAdmin, async (c) =>
 	c.json(await knowledgeAcl.deleteGrant(c.req.param("id") ?? "")),
+);
+
+// ─── Entry accessible users preview (admin only) ───
+knowledgeRoutes.get("/entries/:id/accessible-users", requireAdmin, async (c) =>
+	c.json(await knowledgeAcl.getEntryAccessibleUsers(c.req.param("id") ?? "")),
 );

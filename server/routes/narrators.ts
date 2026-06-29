@@ -1873,7 +1873,38 @@ narratorRoutes.post("/:id/takeover", async (c) => {
 		return c.json({ takenOver: true });
 	}
 
-	return c.json({ error: "Subagent cannot be taken over in its current state" }, 400);
+	// Session-engine driven subagent (e.g. continued from its page after a
+	// manual_override): its loop runs via narrator-session (activeNarrators),
+	// not the subagent foreground/background runner. Take over by interrupting
+	// the active loop. markTakenOver is set FIRST so the loop's post-turn
+	// takeover handoff sees isTakenOver and keeps the subagent held (rather than
+	// firing the conclusion watcher and returning the result to the parent).
+	if (isNarratorActive(id) || isLoopRunning(id)) {
+		markTakenOver(id);
+		const interrupted = interruptNarrator(id);
+		if (!interrupted) {
+			const { clearTakenOver } = await import("../services/narrator-subagent");
+			clearTakenOver(id);
+			return c.json({ error: "Failed to take over subagent" }, 400);
+		}
+		// finalizeInterruptedRun writes idle[interrupted]; preserveTakenOverSubstatus
+		// re-injects taken_over because markTakenOver already ran. Add the tag now so
+		// the frontend reflects the takeover immediately without waiting for the loop.
+		await narratorService.addSubstatus(id, "taken_over").catch(() => {});
+		broadcastToNarrator(narrator.parentNarratorId, {
+			type: "subagent_status_changed",
+			narratorId: narrator.parentNarratorId,
+			subagentNarratorId: id,
+			status: narrator.status,
+			substatus: [...parseSubstatus(narrator.substatus), "taken_over"],
+		});
+		return c.json({ takenOver: true });
+	}
+
+	// Genuine transient window: a foreground subagent caught between turns (its
+	// abort controller is momentarily absent while the loop decides what to do
+	// next). Ask the caller to retry shortly rather than failing hard.
+	return c.json({ error: "Subagent is between turns; retry shortly" }, 409);
 });
 
 // Stop taking over a subagent. Returns the result to the parent narrator: if the
@@ -1969,17 +2000,54 @@ narratorRoutes.post("/:id/stop-takeover", async (c) => {
 	// Idle — resolve the parent's blocked Promise immediately with the current result.
 	const finalText = await getSubagentFinalText(id);
 	const hasError = parseSubstatus(narrator.substatus).includes("error");
-	// If the foreground loop has not yet reached its suspension branch, the
-	// manual-override entry that resolves the parent does not exist yet. Keep all
-	// takeover state intact and ask the caller to retry once it suspends, rather
-	// than degrading to manual_override or stranding an unconsumed stop marker.
-	if (!isManualOverride(id)) {
-		return c.json({ error: "Subagent is still settling, retry shortly" }, 409);
+
+	// Foreground-loop takeover: the parent is blocked in waitForManualOverride.
+	// Resolve it directly; the parent's runForegroundLoop finalizer returns the
+	// result and cleans up status.
+	if (isManualOverride(id)) {
+		clearTakenOver(id);
+		await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
+		resolveManualOverride(id, finalText, hasError);
+		return c.json({ stopped: true, deferred: false });
 	}
-	clearTakenOver(id);
-	await narratorService.removeSubstatus(id, "taken_over").catch(() => {});
-	resolveManualOverride(id, finalText, hasError);
-	return c.json({ stopped: true, deferred: false });
+
+	// Session-engine takeover (e.g. continued from a manual_override): the parent
+	// was already unblocked when the user continued the subagent, and a conclusion
+	// watcher was registered to hand the result back. Trigger that handoff now.
+	const { getConclusionWatcher, removeConclusionWatcher } = await import(
+		"../services/narrator-subagent"
+	);
+	const watcher = getConclusionWatcher(id);
+	if (watcher) {
+		const { getSubagentResultMessageId, updateToolCallConclusion } = await import(
+			"../services/narrator-session"
+		);
+		removeConclusionWatcher(id);
+		const resultMsgId = await getSubagentResultMessageId(id);
+		// Clear takeover state BEFORE the status write so preserveTakenOverSubstatus
+		// does not re-inject the taken_over tag.
+		clearTakenOver(id);
+		await narratorService
+			.updateStatus(id, "idle", {
+				substatus: hasError ? ["error"] : ["unread"],
+				skipErrorMessage: true,
+			})
+			.catch(() => {});
+		await updateToolCallConclusion({
+			subagentId: id,
+			parentNarratorId: narrator.parentNarratorId,
+			toolUseId: watcher.toolUseId,
+			finalText,
+			hasError,
+			resultMessageId: resultMsgId,
+		});
+		return c.json({ stopped: true, deferred: false });
+	}
+
+	// Neither a blocked foreground loop nor a conclusion watcher: a foreground
+	// subagent that has not yet reached its suspension branch. Keep all takeover
+	// state intact and ask the caller to retry once it suspends.
+	return c.json({ error: "Subagent is still settling, retry shortly" }, 409);
 });
 
 // Update the conclusion of an already-completed subagent.

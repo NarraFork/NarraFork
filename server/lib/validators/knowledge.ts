@@ -103,6 +103,17 @@ export const createKnowledgeLevelSchema = z.object({
 	label: z.string().max(100).optional(),
 });
 
+export const updateKnowledgeLevelSchema = z.object({
+	name: z
+		.string()
+		.min(1)
+		.max(64)
+		.regex(/^[a-z0-9_-]+$/, "level name must be lowercase alphanumeric")
+		.optional(),
+	rank: z.number().int().min(0).max(1000).optional(),
+	label: z.string().max(100).nullable().optional(),
+});
+
 export const createKnowledgeTagSchema = z.object({
 	name: z.string().min(1).max(64),
 	collectionId: z.string().optional(),

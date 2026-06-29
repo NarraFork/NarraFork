@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
 	knowledgeCollections,
@@ -9,6 +9,7 @@ import {
 	knowledgeTagTypes,
 	users,
 } from "../db/schema";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 
 /** A user's role as stored on the JWT/users table. */
@@ -289,6 +290,74 @@ async function createLevel(input: { name: string; rank: number; label?: string }
 		})
 		.returning();
 	invalidateLevelCache();
+	return row;
+}
+
+async function updateLevel(
+	id: string,
+	input: { name?: string; rank?: number; label?: string | null },
+): Promise<typeof knowledgeLevels.$inferSelect> {
+	const existing = await db.query.knowledgeLevels.findFirst({
+		where: eq(knowledgeLevels.id, id),
+	});
+	if (!existing) throw new NotFoundError("Knowledge level", id);
+
+	const renaming = input.name !== undefined && input.name !== existing.name;
+	const reranking = input.rank !== undefined && input.rank !== existing.rank;
+
+	// Pre-check unique constraints (name + rank both have UNIQUE indexes) so we
+	// surface a clean 400 instead of leaking a raw SQLite constraint error as a 500.
+	if (renaming) {
+		const clash = await db.query.knowledgeLevels.findFirst({
+			where: and(eq(knowledgeLevels.name, input.name as string), ne(knowledgeLevels.id, id)),
+			columns: { id: true },
+		});
+		if (clash) throw new ValidationError(`Level name already in use: ${input.name}`);
+	}
+	if (reranking) {
+		const clash = await db.query.knowledgeLevels.findFirst({
+			where: and(eq(knowledgeLevels.rank, input.rank as number), ne(knowledgeLevels.id, id)),
+			columns: { id: true },
+		});
+		if (clash) throw new ValidationError(`Level rank already in use: ${input.rank}`);
+	}
+
+	const updates: Partial<typeof knowledgeLevels.$inferInsert> = {};
+	if (input.name !== undefined) updates.name = input.name;
+	if (input.rank !== undefined) updates.rank = input.rank;
+	if (input.label !== undefined) updates.label = input.label;
+
+	// Apply the level row update AND any reference renames in a SINGLE transaction.
+	// Levels are referenced BY NAME (not id) from entries/collections/grants, so a
+	// partial write (references renamed but the level row not, or vice versa) would
+	// make rankOf() fail-closed on the dangling name and abruptly lock those entries
+	// to admin-only. Atomicity keeps the name in lock-step with its references.
+	db.transaction((tx) => {
+		if (renaming) {
+			const newName = input.name as string;
+			tx.update(knowledgeEntries)
+				.set({ classificationLevel: newName })
+				.where(eq(knowledgeEntries.classificationLevel, existing.name))
+				.run();
+			tx.update(knowledgeCollections)
+				.set({ defaultLevel: newName })
+				.where(eq(knowledgeCollections.defaultLevel, existing.name))
+				.run();
+			tx.update(knowledgeCollections)
+				.set({ classificationLevel: newName })
+				.where(eq(knowledgeCollections.classificationLevel, existing.name))
+				.run();
+			tx.update(knowledgeGrants)
+				.set({ clearanceLevel: newName })
+				.where(eq(knowledgeGrants.clearanceLevel, existing.name))
+				.run();
+		}
+		tx.update(knowledgeLevels).set(updates).where(eq(knowledgeLevels.id, id)).run();
+	});
+
+	const row = await db.query.knowledgeLevels.findFirst({ where: eq(knowledgeLevels.id, id) });
+	invalidateLevelCache();
+	if (!row) throw new NotFoundError("Knowledge level", id);
 	return row;
 }
 
@@ -606,6 +675,127 @@ async function purgeUserGrants(userId: string): Promise<void> {
 		.where(and(eq(knowledgeGrants.principalType, "user"), eq(knowledgeGrants.principalId, userId)));
 }
 
+/**
+ * List users who can access an entry, along with the reason (admin / owner / dual-axis match).
+ * Returns at most 100 users to avoid unbounded queries.
+ */
+async function getEntryAccessibleUsers(entryId: string): Promise<
+	{
+		userId: string;
+		username: string;
+		role: string;
+		reason: "admin" | "owner" | "grant";
+	}[]
+> {
+	const entry = await db.query.knowledgeEntries.findFirst({
+		where: eq(knowledgeEntries.id, entryId),
+		columns: {
+			id: true,
+			collectionId: true,
+			ownerUserId: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+		},
+	});
+	if (!entry) return [];
+
+	const collection = await db.query.knowledgeCollections.findFirst({
+		where: eq(knowledgeCollections.id, entry.collectionId),
+		columns: {
+			id: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
+	});
+	if (!collection) return [];
+
+	const allUsers = await db.query.users.findMany({
+		columns: { id: true, username: true, role: true },
+	});
+
+	const aclCol: AclCollection = {
+		id: collection.id,
+		defaultLevel: collection.defaultLevel,
+		classificationLevel: collection.classificationLevel,
+		controlledTagsJson: collection.controlledTagsJson,
+		ownerUserId: collection.ownerUserId,
+	};
+	const aclEntry: AclEntry = {
+		id: entry.id,
+		collectionId: entry.collectionId,
+		ownerUserId: entry.ownerUserId,
+		classificationLevel: entry.classificationLevel,
+		controlledTagsJson: entry.controlledTagsJson,
+	};
+
+	const results: {
+		userId: string;
+		username: string;
+		role: string;
+		reason: "admin" | "owner" | "grant";
+	}[] = [];
+
+	// Load ALL grants once and aggregate caps in memory, instead of calling
+	// resolvePrincipalCaps per user (which issues one grants query each → N+1).
+	const allGrants = await db.query.knowledgeGrants.findMany();
+	const levels = await levelRankMap();
+	const userGrants = new Map<string, typeof allGrants>();
+	const roleGrants = new Map<string, typeof allGrants>();
+	for (const g of allGrants) {
+		const bucket = g.principalType === "user" ? userGrants : roleGrants;
+		const arr = bucket.get(g.principalId);
+		if (arr) arr.push(g);
+		else bucket.set(g.principalId, [g]);
+	}
+
+	// Reproduce resolvePrincipalCaps' aggregation over a user's grants ∪ role grants.
+	const capsFor = (userId: string, role: Role): PrincipalCaps => {
+		const caps: PrincipalCaps = {
+			userId,
+			role,
+			isAdmin: false,
+			clearanceRank: 0,
+			grantedTagIds: new Set(),
+			hasWriteGrant: false,
+			reviewTagIds: new Set(),
+		};
+		const applicable = [...(userGrants.get(userId) ?? []), ...(roleGrants.get(role) ?? [])];
+		for (const g of applicable) {
+			if (g.canWrite) caps.hasWriteGrant = true;
+			if (g.grantType === "clearance" && g.clearanceLevel) {
+				caps.clearanceRank = Math.max(caps.clearanceRank, levels.get(g.clearanceLevel) ?? 0);
+			} else if (g.grantType === "tag" && g.tagId) {
+				caps.grantedTagIds.add(g.tagId);
+			} else if (g.grantType === "review" && g.tagId) {
+				caps.reviewTagIds.add(g.tagId);
+			}
+		}
+		return caps;
+	};
+
+	for (const u of allUsers) {
+		if (results.length >= 100) break;
+		if (u.role === "admin") {
+			results.push({ userId: u.id, username: u.username, role: u.role, reason: "admin" });
+			continue;
+		}
+		const isOwner =
+			(entry.ownerUserId && entry.ownerUserId === u.id) ||
+			(collection.ownerUserId && collection.ownerUserId === u.id);
+		if (isOwner) {
+			results.push({ userId: u.id, username: u.username, role: u.role, reason: "owner" });
+			continue;
+		}
+		const caps = capsFor(u.id, u.role as Role);
+		if (await canRead(caps, aclEntry, aclCol)) {
+			results.push({ userId: u.id, username: u.username, role: u.role, reason: "grant" });
+		}
+	}
+	return results;
+}
+
 export const knowledgeAcl = {
 	resolvePrincipalCaps,
 	resolveCapsByUserId,
@@ -619,6 +809,7 @@ export const knowledgeAcl = {
 	invalidateLevelCache,
 	listLevels,
 	createLevel,
+	updateLevel,
 	deleteLevel,
 	updateCollectionAcl,
 	listTags,
@@ -635,4 +826,5 @@ export const knowledgeAcl = {
 	getUserAcl,
 	setUserAcl,
 	purgeUserGrants,
+	getEntryAccessibleUsers,
 };

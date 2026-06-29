@@ -2784,6 +2784,25 @@ export async function runAgentLoop(
 					clearTakenOver(narratorId);
 					if (getManualOverrideMap().has(narratorId)) {
 						resolveManualOverride(narratorId, lastFinalText, loopHadError);
+					} else {
+						// Session-engine takeover stopped while still working — the
+						// parent was already unblocked when the user continued the
+						// subagent, so hand the result back via the conclusion watcher
+						// and clear the lingering taken_over tag.
+						const watcher = getConclusionWatcher(narratorId);
+						if (watcher) {
+							removeConclusionWatcher(narratorId);
+							const resultMsgId = await getSubagentResultMessageId(narratorId);
+							await updateToolCallConclusion({
+								subagentId: narratorId,
+								parentNarratorId: watcher.parentNarratorId,
+								toolUseId: watcher.toolUseId,
+								finalText: lastFinalText,
+								hasError: loopHadError,
+								resultMessageId: resultMsgId,
+							});
+						}
+						await narratorService.removeSubstatus(narratorId, "taken_over").catch(() => {});
 					}
 				} else if (isTakenOver(narratorId)) {
 					// Still taken over — keep blocked/held, no handoff.
