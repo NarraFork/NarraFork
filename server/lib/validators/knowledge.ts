@@ -155,6 +155,19 @@ export const updateKnowledgeEntryAclSchema = z.object({
 	ownerUserId: z.string().nullable().optional(),
 });
 
+// === collection ACL metadata update (admin/owner) ===
+export const updateKnowledgeCollectionAclSchema = z.object({
+	classificationLevel: z.string().max(64).nullable().optional(),
+	controlledTags: z.array(z.string()).max(50).optional(),
+	ownerUserId: z.string().nullable().optional(),
+});
+
+// === ownership transfer (entry + collection share this shape) ===
+// null = abandon ownership (unowned); only an admin may pass null (enforced in the service).
+export const transferKnowledgeOwnerSchema = z.object({
+	ownerUserId: z.string().min(1).max(64).nullable(),
+});
+
 // === entry links (entry-scope only; inline references not implemented) ===
 const linkTypeSchema = z.enum([
 	"related",

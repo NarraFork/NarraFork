@@ -139,6 +139,9 @@ export async function resolveInjections(
 	if (!keywords) return [];
 
 	// FTS search (service sanitizes the query); over-fetch a bit then ACL-filter.
+	// Pass the triggering user as draftUserId so the passive hints reflect that user's
+	// personal working copy: entries they have an active draft on are matched/summarized
+	// from the draft, consistent with the KnowledgeSearch/KnowledgeRead tools.
 	const limit = Math.max(cfg.maxInjectedEntries * 3, cfg.maxInjectedEntries);
 	let results: Array<{ id: string; title: string; snippet: string; tags?: string[] }>;
 	try {
@@ -148,6 +151,7 @@ export async function resolveInjections(
 			projectId: opts.projectId,
 			limit,
 			match: "or",
+			draftUserId: userId ?? undefined,
 		}) as typeof results;
 	} catch {
 		return [];
@@ -156,7 +160,8 @@ export async function resolveInjections(
 
 	const caps = await knowledgeAcl.resolveCapsByUserId(userId);
 	const principal = { userId: caps.userId, role: caps.role };
-	const readable = await knowledgeService.filterReadable(principal, results);
+	// Reuse the caps we just resolved so filterReadable doesn't re-query grants.
+	const readable = await knowledgeService.filterReadable(principal, results, { caps });
 
 	const hits: InjectionHit[] = [];
 	for (const r of readable) {

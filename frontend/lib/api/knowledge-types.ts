@@ -25,6 +25,10 @@ export interface KnowledgeCollection {
 	description: string | null;
 	projectId: string | null;
 	defaultLevel: string;
+	/** Classification level gating access to the collection itself (null = public). */
+	classificationLevel: string | null;
+	/** Controlled tag ids required to read the collection. */
+	controlledTagsJson: string[] | null;
 	ownerUserId: string | null;
 	createdAt: string;
 	updatedAt: string;

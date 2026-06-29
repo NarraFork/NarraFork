@@ -486,7 +486,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			resetUpstreamSessionOnFirstRequest: resetUpstreamSessionForThisLoop,
 			disabledTools,
 			toolFilter,
-			permissionHandler: (toolName, permInput, permToolUseId) =>
+			permissionHandler: (toolName, permInput, permToolUseId, options) =>
 				handlePermission(
 					narratorId,
 					signal,
@@ -496,6 +496,7 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 					cwd,
 					locale as Locale,
 					parentNarratorId,
+					options,
 				),
 			onBeforeTurn: ctxMgmt.onBeforeTurn,
 			getRuntimeSettingsOverride: () => {

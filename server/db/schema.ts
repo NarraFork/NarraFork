@@ -1339,6 +1339,14 @@ export const knowledgeCollections = sqliteTable(
 		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
 		// Default classification level (knowledge_levels.name) inherited by entries; public = no clearance gate.
 		defaultLevel: text("default_level").notNull().default("public"),
+		// Classification level (knowledge_levels.name) gating access to the COLLECTION itself;
+		// null = public (no clearance gate). Distinct from defaultLevel: defaultLevel is the
+		// fallback an entry inherits when it has no own level, while classificationLevel is the
+		// gate to read/enter the collection at all.
+		classificationLevel: text("classification_level"),
+		// Controlled tag ids (knowledge_tags where controlled=true) required to access the collection
+		// (compartment axis). A principal must hold every one of these to read the collection.
+		controlledTagsJson: text("controlled_tags_json", { mode: "json" }),
 		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
@@ -1622,5 +1630,87 @@ export const knowledgeEntryLinks = sqliteTable(
 		),
 		index("idx_kelink_from").on(table.fromEntryId), // forward: from's out-links
 		index("idx_kelink_to").on(table.toEntryId), // reverse: to's in-links ("who links to me")
+	],
+);
+
+// === knowledge_packs ===
+// A pack is an archive (tar.gz/zip) bundling data, media, scripts and executables that an
+// agent extracts into an isolated temp dir (granted via narrator_whitelist_dirs) to run a
+// fixed-procedure operation alongside the knowledge base. A pack optionally links to a
+// knowledge entry — when linked, its access/activation ACL is inherited from that entry's
+// dual-axis attributes; otherwise the pack's own classificationLevel + controlledTags apply.
+export const knowledgePacks = sqliteTable(
+	"knowledge_packs",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull(),
+		slug: text("slug").notNull(),
+		description: text("description"),
+		// Ownership: project-scoped (projectId set) or global (null), like knowledge_collections.
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		// Optional link to a knowledge entry — when set, the pack inherits that entry's dual-axis
+		// ACL (classificationLevel + controlledTags). null → use the pack's own ACL fields below.
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "set null" }),
+		// === Pack's own ACL (only used when entryId is null; semantics mirror knowledge_entries) ===
+		classificationLevel: text("classification_level"), // null = public
+		controlledTagsJson: text("controlled_tags_json", { mode: "json" }),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		// === Archive file metadata ===
+		archiveFormat: text("archive_format", { enum: ["tar.gz", "zip"] }).notNull(),
+		// Stored as <id>.<ext> under ~/.narrafork/pack-archives/. Service derives the path; the
+		// absolute path is never persisted.
+		archiveSize: integer("archive_size").notNull(),
+		archiveHash: text("archive_hash").notNull(), // sha256: integrity / dedup / extract cache
+		// Total uncompressed size for zip-bomb guard; probed at upload. null = unknown.
+		uncompressedSize: integer("uncompressed_size"),
+		// Optional PACK.md-style manifest returned to the agent on activation as usage notes.
+		// { entrypoint?, files?, notes? }
+		manifestJson: text("manifest_json", { mode: "json" }),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_kpack_project_slug").on(table.projectId, table.slug),
+		index("idx_kpack_project").on(table.projectId),
+		index("idx_kpack_entry").on(table.entryId),
+		index("idx_kpack_status").on(table.status),
+	],
+);
+
+// === knowledge_pack_activations ===
+// An extraction instance: which narrator activated which pack, where it was extracted, and the
+// whitelist row that grants access. Used for idempotent activation, cleanup and audit. The
+// "at most one active activation per (narrator, pack)" rule is enforced in the service layer
+// (mirrors how knowledge_drafts enforces one active draft per entry/author).
+export const knowledgePackActivations = sqliteTable(
+	"knowledge_pack_activations",
+	{
+		id: text("id").primaryKey(),
+		packId: text("pack_id")
+			.notNull()
+			.references(() => knowledgePacks.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		// Absolute extraction dir (~/.narrafork/packs/<narratorId>/<packId>/).
+		extractDir: text("extract_dir").notNull(),
+		// The narrator_whitelist_dirs.id inserted for this activation, for precise removal.
+		whitelistDirId: text("whitelist_dir_id"),
+		// Archive hash at activation time — lets us detect a stale extract after the pack's
+		// archive is replaced (prompt re-activation).
+		archiveHash: text("archive_hash").notNull(),
+		status: text("status", { enum: ["active", "released"] })
+			.notNull()
+			.default("active"),
+		createdAt: text("created_at").notNull(),
+		releasedAt: text("released_at"),
+	},
+	(table) => [
+		index("idx_kpackact_narrator").on(table.narratorId),
+		index("idx_kpackact_pack").on(table.packId),
+		index("idx_kpackact_narrator_pack_status").on(table.narratorId, table.packId, table.status),
 	],
 );

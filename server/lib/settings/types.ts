@@ -316,6 +316,12 @@ export interface NarraForkSettings {
 		scanToolOutput: boolean;
 		/** Truncate tool output to this many chars before scanning (performance guard). */
 		maxToolOutputScanChars: number;
+		/** Max pack archive upload size in MB (zip/tar.gz). */
+		packMaxSizeMb: number;
+		/** Max total uncompressed size of an extracted pack in MB (zip-bomb guard). */
+		packMaxUncompressedMb: number;
+		/** Whether PackActivate requires explicit user permission (it changes the narrator's dir access). */
+		packActivateRequiresPermission: boolean;
 	};
 	agent: {
 		defaultModel: string;
@@ -338,6 +344,11 @@ export interface NarraForkSettings {
 			general: string[];
 			search?: string[];
 		};
+		/**
+		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write
+		 * and grep. Note: shell command output is auto-detected on Windows regardless
+		 * of this flag, because the OEM console code page commonly garbles CLI output.
+		 */
 		legacyEncoding: boolean;
 		/**
 		 * Per-model context window overrides (tokens).

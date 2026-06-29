@@ -118,6 +118,28 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionZh: "管理员设置管理 — 获取和修改所有 NarraFork 设置",
 		},
 	},
+	{
+		id: "knowledge_admin",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "KnowledgeAdmin",
+			descriptionEn:
+				"Knowledge ACL management (admin only) — levels, tags, tag types, grants, per-user/entry ACL",
+			descriptionZh: "知识库 ACL 管理（仅管理员）— 密级、标签、标签类型、授权、用户/条目 ACL",
+		},
+	},
+	{
+		id: "knowledge_review",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "KnowledgeReview",
+			descriptionEn:
+				"Knowledge review & write — review/merge submitted drafts, create entries, write to main",
+			descriptionZh: "知识库审阅与写入 — 审阅/合并草稿提交、新建条目、直接写主线",
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------

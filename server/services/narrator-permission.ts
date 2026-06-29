@@ -18,6 +18,10 @@ import { analyzeShellCommand, type BashAnalysis } from "../lib/agent/bash-analyz
 import { detectShell } from "../lib/agent/shell";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
+import {
+	isKnowledgeReadAction,
+	KNOWLEDGE_MERGE_ACTION_SET,
+} from "../lib/agent/tools/knowledge-actions";
 import { OUTPUT_DIR as TRUNCATE_OUTPUT_DIR } from "../lib/agent/truncate";
 import {
 	type DangerReflectionLevel,
@@ -578,6 +582,13 @@ const ALWAYS_ALLOW_TOOLS = [
 	"LearningGuide",
 	"GetGoals",
 	"UpdateGoal",
+	// Pack tools: PackList (read-only listing) and PackDeactivate (only shrinks access)
+	// are safe to auto-allow. PackActivate self-gates via ctx.requestPermission when
+	// settings.knowledge.packActivateRequiresPermission is true, so the loop-level check
+	// allows it through and the tool itself prompts (avoids double-prompting).
+	"PackList",
+	"PackActivate",
+	"PackDeactivate",
 ];
 
 const ACCEPT_EDITS_AUTO_ALLOW = ["Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"];
@@ -1689,6 +1700,33 @@ export function classifyDanger(
 		return null;
 	}
 
+	// Knowledge ACL / review tools: these perform no filesystem writes (so the path
+	// heuristics below never flag them), but their WRITE actions mutate shared
+	// knowledge or its access control. Classify write actions as dangerous so that
+	// under bypassPermissions they still trigger danger reflection; read actions
+	// (and a missing action) stay null. The read/write split is the single source
+	// of truth in knowledge-actions.ts, shared with the tool implementations.
+	if (toolName === "KnowledgeAdmin" || toolName === "KnowledgeReview") {
+		const action = typeof input.action === "string" ? input.action : "";
+		if (!action || isKnowledgeReadAction(action)) return null;
+		const isMerge = KNOWLEDGE_MERGE_ACTION_SET.has(action);
+		return danger(
+			`${toolName} performs a knowledge-base write action: ${action}.`,
+			[
+				"This changes shared project knowledge or its access-control configuration.",
+				isMerge
+					? "Merging or writing to main updates the globally-served knowledge version."
+					: "ACL changes affect who can read or modify knowledge entries.",
+			],
+			[
+				"Confirm the action and target ids are correct before proceeding.",
+				"For content changes, prefer the draft → review flow when unsure.",
+			],
+			[`Tool: ${toolName}`, `Action: ${action}`],
+			isMerge ? "high" : "medium",
+		);
+	}
+
 	if (READ_ONLY_TOOLS.includes(toolName)) {
 		return null;
 	}
@@ -2024,6 +2062,7 @@ export async function handlePermission(
 	cwd: string,
 	locale: Locale = "en",
 	broadcastTargetId?: string,
+	options?: { suppressAttention?: boolean },
 ): Promise<PermissionResult> {
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const narrator = await db.query.narrators.findFirst({
@@ -2432,11 +2471,11 @@ export async function handlePermission(
 			})
 			.where(eq(narratorToolCalls.id, requestId));
 		await narratorService.updateStatus(narratorId, "waiting", {
-			substatus: ["silent_notification", "reflecting"],
+			substatus: ["reflecting"],
 		});
 		if (wsTarget !== narratorId) {
 			await narratorService.updateStatus(wsTarget, "waiting", {
-				substatus: ["silent_notification", "reflecting"],
+				substatus: ["reflecting"],
 			});
 		}
 		if (signal.aborted) {
@@ -2798,6 +2837,12 @@ export async function handlePermission(
 		request: { id: toolCallId, toolName, toolUseId, inputJson: effectiveInput, decisionReason },
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
+	// A real permission request is waiting for the user — emit the semantic
+	// attention intent so notification consumers can alert the user. Suppressed
+	// when the caller (e.g. plan-reflection takeover fallback) drives this itself.
+	if (!options?.suppressAttention) {
+		eventBus.emit({ type: "narrator:attention", narratorId, reason: "waiting_permission" });
+	}
 	await narratorService.updateStatus(narratorId, "waiting");
 	if (broadcastTargetId && broadcastTargetId !== narratorId) {
 		await narratorService.updateStatus(broadcastTargetId, "waiting");
@@ -3443,11 +3488,11 @@ export async function stopDangerReflectionLoop(
 			reason: message,
 		});
 		await narratorService.updateStatus(pause.narratorId, "waiting", {
-			substatus: ["silent_notification"],
+			substatus: ["reflecting"],
 		});
 		if (pause.broadcastTargetId !== pause.narratorId) {
 			await narratorService.updateStatus(pause.broadcastTargetId, "waiting", {
-				substatus: ["silent_notification"],
+				substatus: ["reflecting"],
 			});
 		}
 	} catch (err) {
@@ -3616,6 +3661,10 @@ export function reprocessAllPendingPermissions(narratorId: string): number {
 			pending.cwd,
 			pending.locale,
 			pending.broadcastTargetId,
+			// Re-evaluating an already-pending request (e.g. on switch to
+			// bypassPermissions). The user was already notified when it first became
+			// pending, so suppress a duplicate attention notification.
+			{ suppressAttention: true },
 		)
 			.then(async (result) => {
 				if (result.behavior !== "dangerReflection") {

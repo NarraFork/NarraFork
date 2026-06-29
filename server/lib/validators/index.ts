@@ -75,6 +75,8 @@ export {
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
 	submitKnowledgeDraftSchema,
+	transferKnowledgeOwnerSchema,
+	updateKnowledgeCollectionAclSchema,
 	updateKnowledgeCollectionSchema,
 	updateKnowledgeDraftSchema,
 	updateKnowledgeEntryAclSchema,
@@ -82,6 +84,11 @@ export {
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
 } from "./knowledge";
+export {
+	createKnowledgePackSchema,
+	listKnowledgePacksQuerySchema,
+	updateKnowledgePackSchema,
+} from "./knowledge-packs";
 export {
 	askInPassingSchema,
 	askInPassingStartSchema,

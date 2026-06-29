@@ -16,6 +16,9 @@ export const DEFAULTS: NarraForkSettings = {
 		minKeywordLen: 3,
 		scanToolOutput: true,
 		maxToolOutputScanChars: 8000,
+		packMaxSizeMb: 100,
+		packMaxUncompressedMb: 500,
+		packActivateRequiresPermission: true,
 	},
 	agent: {
 		defaultPermissionMode: "acceptEdits",
@@ -196,6 +199,18 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"knowledge.maxToolOutputScanChars": {
 		desc: "扫描工具输出前截断到的最大字符数（性能保护）。",
 		type: "number",
+	},
+	"knowledge.packMaxSizeMb": {
+		desc: "Pack 归档上传的最大体积（MB，zip/tar.gz）。",
+		type: "number",
+	},
+	"knowledge.packMaxUncompressedMb": {
+		desc: "Pack 解压后总大小上限（MB，防 zip bomb）。",
+		type: "number",
+	},
+	"knowledge.packActivateRequiresPermission": {
+		desc: "PackActivate 是否需要用户显式批准（它会改变叙述者的目录访问范围）。",
+		type: "boolean",
 	},
 
 	// ── vnet ────────────────────────────────────────────────────────────

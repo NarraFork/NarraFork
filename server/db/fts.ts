@@ -33,7 +33,12 @@ export function ensureFts(
 
 	// Detect and drop old non-trigram FTS tables so they get recreated correctly
 	const ftsTablesRecreated: string[] = [];
-	for (const table of ["chapters_fts", "narrator_messages_fts", "narrators_fts"]) {
+	for (const table of [
+		"chapters_fts",
+		"narrator_messages_fts",
+		"narrators_fts",
+		"knowledge_drafts_fts",
+	]) {
 		const info = sqlite
 			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?")
 			.get(table) as { sql: string } | undefined;
@@ -74,6 +79,41 @@ export function ensureFts(
 		sqlite.run(`
 			CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
 				title, current_content, content='knowledge_entries', content_rowid=rowid, tokenize='trigram'
+			)
+		`);
+	}
+
+	// knowledge_drafts_fts indexes each author's personal draft (title + content) so the
+	// agent's KnowledgeSearch can surface a user's own uncommitted edits ("working copy").
+	// NOT an external-content table: the FTS rowid is bound to knowledge_drafts.rowid so all
+	// trigger maintenance is by rowid (O(log n)), never a scan over UNINDEXED columns.
+	// `title` is de-normalized from the parent entry (drafts only edit content, not title)
+	// and kept in sync by an entries-title trigger below.
+	const hasKnowledgeDrafts =
+		(
+			sqlite
+				.prepare(
+					"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='knowledge_drafts'",
+				)
+				.get() as { c: number }
+		).c === 1;
+	// Track whether the drafts FTS table is being created for the first time so it gets
+	// populated even on a clean startup (a brand-new empty FTS table won't otherwise be
+	// caught by the unclean-shutdown rebuild path).
+	let draftsFtsFreshlyCreated = false;
+	if (hasKnowledgeDrafts) {
+		const draftsFtsExists =
+			(
+				sqlite
+					.prepare(
+						"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='knowledge_drafts_fts'",
+					)
+					.get() as { c: number }
+			).c === 1;
+		draftsFtsFreshlyCreated = !draftsFtsExists;
+		sqlite.run(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_drafts_fts USING fts5(
+				title, content, tokenize='trigram'
 			)
 		`);
 	}
@@ -172,6 +212,51 @@ export function ensureFts(
 		`);
 	}
 
+	// --- Sync triggers: knowledge_drafts (rowid-bound; title de-normalized from entry) ---
+	if (hasKnowledgeDrafts) {
+		// INSERT: index the new draft, pulling title from its parent entry.
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_insert AFTER INSERT ON knowledge_drafts BEGIN
+				INSERT INTO knowledge_drafts_fts(rowid, title, content)
+				VALUES (
+					NEW.rowid,
+					(SELECT title FROM knowledge_entries WHERE id = NEW.entry_id),
+					NEW.content
+				);
+			END
+		`);
+		// UPDATE: delete+reinsert by rowid (content may change; title re-pulled in case
+		// the draft was somehow re-pointed — cheap and keeps it correct).
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_update AFTER UPDATE ON knowledge_drafts BEGIN
+				DELETE FROM knowledge_drafts_fts WHERE rowid = OLD.rowid;
+				INSERT INTO knowledge_drafts_fts(rowid, title, content)
+				VALUES (
+					NEW.rowid,
+					(SELECT title FROM knowledge_entries WHERE id = NEW.entry_id),
+					NEW.content
+				);
+			END
+		`);
+		// DELETE: drop the indexed row by rowid.
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_delete AFTER DELETE ON knowledge_drafts BEGIN
+				DELETE FROM knowledge_drafts_fts WHERE rowid = OLD.rowid;
+			END
+		`);
+		// entry title change → refresh de-normalized title on all its drafts. The subquery
+		// resolves rowids via idx_kd_entry (entry_id B-tree), then updates by rowid.
+		if (hasKnowledgeEntries) {
+			sqlite.run(`
+				CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_entry_title AFTER UPDATE OF title ON knowledge_entries BEGIN
+					UPDATE knowledge_drafts_fts
+					SET title = NEW.title
+					WHERE rowid IN (SELECT rowid FROM knowledge_drafts WHERE entry_id = NEW.id);
+				END
+			`);
+		}
+	}
+
 	// --- Rebuild FTS indexes if needed ---
 	// Rebuild after migration (tokenizer change) or unclean shutdown (trigram indexes
 	// can silently corrupt on crash, causing "malformed" errors on UPDATE).
@@ -195,6 +280,24 @@ export function ensureFts(
 			});
 		} catch (err) {
 			logger.warn("FTS rebuild failed on startup", { error: String(err) });
+		}
+	}
+
+	// Populate knowledge_drafts_fts when rebuilding OR when the table was just created
+	// (a brand-new empty table on a clean startup isn't covered by needsRebuild). It is a
+	// plain (non external-content) FTS table, so 'rebuild' is unavailable — refill manually
+	// with rowid bound to knowledge_drafts.rowid and title de-normalized from the entry.
+	if (hasKnowledgeDrafts && (needsRebuild || draftsFtsFreshlyCreated)) {
+		try {
+			sqlite.run("DELETE FROM knowledge_drafts_fts");
+			sqlite.run(`
+				INSERT INTO knowledge_drafts_fts(rowid, title, content)
+				SELECT d.rowid, e.title, d.content
+				FROM knowledge_drafts d
+				JOIN knowledge_entries e ON e.id = d.entry_id
+			`);
+		} catch (err) {
+			logger.warn("knowledge_drafts_fts populate failed on startup", { error: String(err) });
 		}
 	}
 

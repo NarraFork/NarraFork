@@ -19,8 +19,11 @@ import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflecti
 import { grepTool } from "./grep";
 import { groupControlTool } from "./group-control";
 import { knowledgeDraftTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
+import { knowledgeAdminTool } from "./knowledge-admin";
+import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
+import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { endPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
 import { readTool } from "./read";
@@ -51,6 +54,11 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["ForkNarrator", forkNarratorTool],
 	["NarraForkAdmin", narraforkAdminTool],
 	["GroupControl", groupControlTool],
+	["PackList", packListTool],
+	["PackActivate", packActivateTool],
+	["PackDeactivate", packDeactivateTool],
+	["KnowledgeAdmin", knowledgeAdminTool],
+	["KnowledgeReview", knowledgeReviewTool],
 ]);
 
 /**

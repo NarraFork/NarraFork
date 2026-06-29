@@ -539,6 +539,7 @@ export interface AgentConfig {
 		toolName: string,
 		input: Record<string, unknown>,
 		toolUseId: string,
+		options?: { suppressAttention?: boolean },
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
 	/**

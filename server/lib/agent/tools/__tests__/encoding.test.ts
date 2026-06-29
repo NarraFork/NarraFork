@@ -6,6 +6,7 @@ import { settings } from "@server/lib/settings";
 import iconv from "iconv-lite";
 import type { ToolContext } from "../../types";
 import { editTool } from "../edit";
+import { createStreamDecoder } from "../encoding";
 import { grepTool, isRgAvailable } from "../grep";
 import { readTool } from "../read";
 import { writeTool } from "../write";
@@ -145,4 +146,48 @@ describe("Legacy encoding support", () => {
 			expect(result.output).toContain("gbk-test.txt");
 		},
 	);
+});
+
+describe("Shell output stream decoder", () => {
+	test("decodes UTF-8 output when detection is enabled", () => {
+		settings.agent.legacyEncoding = true;
+		const dec = createStreamDecoder();
+		const buf = Buffer.from("你好世界 hello\n", "utf-8");
+		let out = dec.write(buf);
+		out += dec.end();
+		expect(out).toContain("你好世界");
+		expect(out).toContain("hello");
+	});
+
+	test("decodes GBK output when detection is enabled", () => {
+		settings.agent.legacyEncoding = true;
+		const dec = createStreamDecoder();
+		// Repeat to give chardet enough confidence on the GBK byte distribution.
+		const gbk = iconv.encode("Windows 命令行工具 这是GBK编码的输出内容\n".repeat(6), "gbk");
+		let out = dec.write(gbk);
+		out += dec.end();
+		expect(out).toContain("命令行工具");
+		expect(out).toContain("这是GBK编码的输出内容");
+	});
+
+	test("handles multibyte chars split across chunks (UTF-8)", () => {
+		settings.agent.legacyEncoding = true;
+		const dec = createStreamDecoder();
+		const full = Buffer.from("中文测试输出内容需要足够长以触发检测逻辑分支\n".repeat(4), "utf-8");
+		// Split at an arbitrary point that may land mid-codepoint.
+		const mid = 17;
+		let out = dec.write(full.subarray(0, mid));
+		out += dec.write(full.subarray(mid));
+		out += dec.end();
+		expect(out).toContain("中文测试输出内容");
+	});
+
+	test("plain UTF-8 fast path when detection disabled (non-Windows)", () => {
+		// On non-Windows with legacyEncoding off, behaves like StringDecoder("utf-8").
+		settings.agent.legacyEncoding = false;
+		const dec = createStreamDecoder();
+		let out = dec.write(Buffer.from("plain ascii output\n", "utf-8"));
+		out += dec.end();
+		expect(out).toBe("plain ascii output\n");
+	});
 });

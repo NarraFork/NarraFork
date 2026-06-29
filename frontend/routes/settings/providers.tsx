@@ -11,8 +11,10 @@ import { CodexSection } from "../../components/providers/CodexSection";
 import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
 	CustomApiProviderSection,
+	isAnthropicProtocol,
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
+import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import {
@@ -240,6 +242,24 @@ function SettingsProvidersPage() {
 		[RESERVED_PREFIXES, allPrefixToId, t],
 	);
 
+	// Generate a unique prefix derived from a base string. If the base is already
+	// taken (by another provider or a reserved prefix), append -2, -3, … until free.
+	const getUniquePrefix = useCallback(
+		(base: string, currentProviderId: string): string => {
+			const taken = (candidate: string): boolean => {
+				if (RESERVED_PREFIXES.has(candidate)) return true;
+				const ownerId = allPrefixToId.get(candidate);
+				return !!ownerId && ownerId !== currentProviderId;
+			};
+			if (!taken(base)) return base;
+			for (let i = 2; ; i++) {
+				const candidate = `${base}-${i}`;
+				if (!taken(candidate)) return candidate;
+			}
+		},
+		[RESERVED_PREFIXES, allPrefixToId],
+	);
+
 	// ── Save / Discard ──
 	const updateMutation = useMutation({
 		mutationFn: api.updateSettings,
@@ -284,8 +304,17 @@ function SettingsProvidersPage() {
 	);
 
 	const handleSave = useCallback(() => {
-		void saveProvidersState().catch(() => {});
+		void saveProvidersState()
+			.then(() => {
+				// After a successful manual save, auto-fetch models for the provider
+				// currently being edited and silently fill default context windows.
+				void autoFetchAndFillRef.current?.();
+			})
+			.catch(() => {});
 	}, [saveProvidersState]);
+
+	// Holds the latest auto-fetch implementation so handleSave keeps a stable identity.
+	const autoFetchAndFillRef = useRef<(() => Promise<void>) | null>(null);
 
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
@@ -633,6 +662,93 @@ function SettingsProvidersPage() {
 		providerLabels,
 	]);
 
+	// ── Auto-fetch models + fill default context windows after a manual save ──
+	// Triggered by handleSave (only when a provider is being edited). Refreshes the
+	// model list for the selected provider, then computes default token counts for
+	// recognized model families and silently saves them.
+	const autoFetchAndFill = useCallback(async () => {
+		const providerId = selectedProvider;
+		if (!providerId) return;
+
+		const customApi = state.customApiProviders.find((p) => p.id === providerId);
+		const nug = state.nugProviders.find((p) => p.id === providerId);
+
+		try {
+			if (customApi) {
+				if (!customApi.apiKey) return;
+				if (isAnthropicProtocol(customApi.protocol)) {
+					await api.anthropicRefreshProviderModels(providerId);
+				} else {
+					await api.openaiRefreshProviderModels(providerId);
+				}
+			} else if (nug) {
+				if (!nug.apiKey || !nug.baseUrl) return;
+				await api.nugRefreshProviderModels(providerId);
+			} else {
+				return;
+			}
+		} catch {
+			// Refresh failed (network/credentials) — skip auto-fill silently.
+			return;
+		}
+
+		// Fetch fresh settings so we can read the newly-refreshed grouped models.
+		let freshSettings: Record<string, unknown>;
+		try {
+			freshSettings = (await qc.fetchQuery({
+				queryKey: ["admin", "settings"],
+				queryFn: api.getSettings,
+			})) as Record<string, unknown>;
+			qc.setQueryData(["settings"], freshSettings);
+		} catch {
+			return;
+		}
+
+		// Resolve this provider's prefix and the list of model ids from grouped data.
+		if (!prefix) return;
+
+		const groupedKey = customApi
+			? isAnthropicProtocol(customApi.protocol)
+				? "anthropicModelsGrouped"
+				: "openaiModelsGrouped"
+				: "nugModelsGrouped";
+		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
+			providerId: string;
+			models: Array<Record<string, unknown>>;
+		}>;
+		const group = grouped.find((g) => g.providerId === providerId);
+		if (!group || group.models.length === 0) return;
+
+		const modelIds = group.models
+			.map((m) => String(m.id ?? m.model_id ?? m.modelId ?? ""))
+			.filter(Boolean);
+
+		// Compute default context windows for recognized model families only.
+		const existing = state.modelContextWindows;
+		const additions: Record<string, number> = {};
+		for (const id of modelIds) {
+			const key = `${prefix}:${id}`;
+			if (existing[key] != null) continue;
+			const def = getModelDefaultContextWindow(id);
+			if (def != null) additions[key] = def;
+		}
+		if (Object.keys(additions).length === 0) return;
+
+		// Silently persist the new context windows.
+		const nextState: ProvidersState = {
+			...state,
+			modelContextWindows: { ...state.modelContextWindows, ...additions },
+		};
+		dispatchers.mergeContextWindows(additions);
+		try {
+			await saveProvidersState(nextState);
+		} catch {
+			// Ignore — the values remain in local state for the user to save manually.
+		}
+	}, [selectedProvider, state, qc, dispatchers, saveProvidersState]);
+
+	autoFetchAndFillRef.current = autoFetchAndFill;
+
 	if (isLoading) return <Loader />;
 
 	// ── Render overview or config view ──
@@ -654,6 +770,7 @@ function SettingsProvidersPage() {
 						isCustomApiProviderDirty={isCustomApiProviderDirty}
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
+						getUniquePrefix={getUniquePrefix}
 						onTestModel={setTestingModel}
 						onServerContextWindowsMerge={handleServerContextWindowsMerge}
 						onSaveBeforeRefresh={confirmSaveBeforeRefresh}
@@ -775,6 +892,7 @@ interface ProviderSectionContentProps {
 	isCustomApiProviderDirty: (id: string) => boolean;
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
+	getUniquePrefix: (base: string, id: string) => string;
 	onTestModel: (model: string) => void;
 	onServerContextWindowsMerge?: (windows: Record<string, number>) => void;
 	onSaveBeforeRefresh: () => Promise<boolean>;
@@ -793,6 +911,7 @@ function ProviderSectionContent({
 	isCustomApiProviderDirty,
 	isNugProviderDirty,
 	getPrefixError,
+	getUniquePrefix,
 	onTestModel,
 	onServerContextWindowsMerge,
 	onSaveBeforeRefresh,
@@ -859,6 +978,7 @@ function ProviderSectionContent({
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
+				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
 			/>
@@ -872,6 +992,7 @@ function ProviderSectionContent({
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
+				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
 			/>
@@ -893,6 +1014,7 @@ function ProviderSectionContent({
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
+				getUniquePrefix={getUniquePrefix}
 				onTestModel={onTestModel}
 				onSaveBeforeRefresh={onSaveBeforeRefresh}
 				onSaveBeforeNugAction={onSaveBeforeNugAction}

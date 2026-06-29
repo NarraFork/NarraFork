@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { applyPatch, createPatch, structuredPatch } from "diff";
-import { desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
 	knowledgeCollections,
@@ -13,8 +13,10 @@ import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
+	type AclCollection,
 	type AclEntry,
 	canRead,
+	canReadCollection,
 	canReview,
 	type Principal,
 	resolvePrincipalCaps,
@@ -63,15 +65,26 @@ function toAclEntry(
 	};
 }
 
+/** Map a collection row to AclCollection with ALL gate fields (never drop to public). */
+function toAclCollection(
+	c: Pick<
+		typeof knowledgeCollections.$inferSelect,
+		"id" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
+	>,
+): AclCollection {
+	return {
+		id: c.id,
+		defaultLevel: c.defaultLevel,
+		classificationLevel: c.classificationLevel,
+		controlledTagsJson: c.controlledTagsJson,
+		ownerUserId: c.ownerUserId,
+	};
+}
+
 async function assertCanRead(principal: Principal, entryId: string) {
 	const { entry, collection } = await loadEntryAndCollection(entryId);
 	const caps = await resolvePrincipalCaps(principal);
-	if (
-		!(await canRead(caps, toAclEntry(entry), {
-			id: collection.id,
-			defaultLevel: collection.defaultLevel,
-		}))
-	) {
+	if (!(await canRead(caps, toAclEntry(entry), toAclCollection(collection)))) {
 		// Do not leak existence — treat as not found.
 		throw new NotFoundError("Knowledge entry", entryId);
 	}
@@ -84,36 +97,47 @@ async function assertCanRead(principal: Principal, entryId: string) {
 async function createDraft(principal: Principal, entryId: string, input: { name?: string }) {
 	const { entry } = await assertCanRead(principal, entryId);
 
-	const existingActive = await db.query.knowledgeDrafts.findFirst({
-		where: (d, { and: a, eq: e, inArray }) =>
-			a(
-				e(d.entryId, entryId),
-				e(d.authorUserId, principal.userId),
-				inArray(d.status, ACTIVE_DRAFT_STATUSES),
-			),
-	});
-	if (existingActive) return existingActive;
-
 	const id = generateId();
 	const now = nowIso();
 	const content = entry.currentContent ?? "";
-	const [draft] = await db
-		.insert(knowledgeDrafts)
-		.values({
-			id,
-			entryId,
-			authorUserId: principal.userId,
-			name: input.name ?? null,
-			baseRevisionId: entry.currentRevisionId ?? null,
-			content,
-			contentHash: hashContent(content),
-			format: "markdown",
-			status: "draft",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.returning();
-	return draft;
+
+	// Atomic "get-or-create": re-check for an active draft INSIDE the transaction
+	// so two concurrent createDraft calls can't both insert a second active draft.
+	// bun:sqlite runs the transaction body synchronously under a write lock.
+	return db.transaction((tx) => {
+		const existingActive = tx
+			.select()
+			.from(knowledgeDrafts)
+			.where(
+				and(
+					eq(knowledgeDrafts.entryId, entryId),
+					eq(knowledgeDrafts.authorUserId, principal.userId),
+					inArray(knowledgeDrafts.status, ACTIVE_DRAFT_STATUSES),
+				),
+			)
+			.limit(1)
+			.get();
+		if (existingActive) return existingActive;
+
+		const draft = tx
+			.insert(knowledgeDrafts)
+			.values({
+				id,
+				entryId,
+				authorUserId: principal.userId,
+				name: input.name ?? null,
+				baseRevisionId: entry.currentRevisionId ?? null,
+				content,
+				contentHash: hashContent(content),
+				format: "markdown",
+				status: "draft",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.returning()
+			.get();
+		return draft;
+	});
 }
 
 async function getMyDraft(principal: Principal, entryId: string) {
@@ -149,17 +173,32 @@ async function updateDraft(
 	if (draft.status === "merged" || draft.status === "abandoned") {
 		throw new ValidationError(`Draft is ${draft.status} and can no longer be edited`);
 	}
-	await db
-		.update(knowledgeDrafts)
-		.set({
-			content: input.content,
-			contentHash: hashContent(input.content),
-			...(input.name !== undefined ? { name: input.name } : {}),
-			// Editing a previously-submitted/changes-requested draft returns it to draft.
-			status: "draft",
-			updatedAt: nowIso(),
-		})
-		.where(eq(knowledgeDrafts.id, draftId));
+	const now = nowIso();
+	db.transaction((tx) => {
+		tx.update(knowledgeDrafts)
+			.set({
+				content: input.content,
+				contentHash: hashContent(input.content),
+				...(input.name !== undefined ? { name: input.name } : {}),
+				// Editing a previously-submitted/changes-requested draft returns it to draft.
+				status: "draft",
+				updatedAt: now,
+			})
+			.where(eq(knowledgeDrafts.id, draftId))
+			.run();
+		// Keep submission state consistent: any open (pending/conflict) submission for
+		// this draft is now stale because the proposed content changed. Mark it rejected
+		// so reviewers don't act on a superseded proposal (the author must re-submit).
+		tx.update(knowledgeSubmissions)
+			.set({ status: "rejected", verdict: "request_changes", reviewedAt: now })
+			.where(
+				and(
+					eq(knowledgeSubmissions.draftId, draftId),
+					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+				),
+			)
+			.run();
+	});
 	return db.query.knowledgeDrafts.findFirst({ where: eq(knowledgeDrafts.id, draftId) });
 }
 
@@ -203,6 +242,23 @@ async function submitForReview(
 	const now = nowIso();
 	let submission: typeof knowledgeSubmissions.$inferSelect | undefined;
 	db.transaction((tx) => {
+		// Guard against duplicate/concurrent submissions: refuse if this draft already
+		// has an open (pending/conflict) submission awaiting review. Checked inside the
+		// transaction so two concurrent submits can't both pass.
+		const open = tx
+			.select({ id: knowledgeSubmissions.id })
+			.from(knowledgeSubmissions)
+			.where(
+				and(
+					eq(knowledgeSubmissions.draftId, draftId),
+					inArray(knowledgeSubmissions.status, ["pending", "conflict"]),
+				),
+			)
+			.limit(1)
+			.get();
+		if (open) {
+			throw new ValidationError("This draft already has a submission awaiting review");
+		}
 		[submission] = tx
 			.insert(knowledgeSubmissions)
 			.values({
@@ -260,13 +316,17 @@ async function review(
 	}
 	const { entry, collection } = await loadEntryAndCollection(sub.entryId);
 	const caps = await resolvePrincipalCaps(principal);
+	// Collection gate first: the collection is an access boundary. Unreadable → NotFound
+	// (don't leak existence of submissions in restricted collections).
+	if (!(await canReadCollection(caps, toAclCollection(collection)))) {
+		throw new NotFoundError("Knowledge submission", submissionId);
+	}
 	if (!canReview(caps, toAclEntry(entry))) {
 		throw new ValidationError("You do not have permission to review this entry");
 	}
 	if (sub.submitterUserId === principal.userId && principal.role !== "admin") {
 		throw new ValidationError("You cannot review your own submission");
 	}
-	void collection;
 
 	const now = nowIso();
 	const findings = input.findings ?? [];
@@ -373,8 +433,11 @@ async function resolveConflict(
 	if (sub.status !== "conflict") {
 		throw new ValidationError(`Submission is ${sub.status}, not in conflict`);
 	}
-	const { entry } = await loadEntryAndCollection(sub.entryId);
+	const { entry, collection } = await loadEntryAndCollection(sub.entryId);
 	const caps = await resolvePrincipalCaps(principal);
+	if (!(await canReadCollection(caps, toAclCollection(collection)))) {
+		throw new NotFoundError("Knowledge submission", submissionId);
+	}
 	if (!canReview(caps, toAclEntry(entry))) {
 		throw new ValidationError("You do not have permission to review this entry");
 	}
@@ -521,18 +584,42 @@ async function listSubmissions(
 		},
 	});
 	const entryById = new Map(entries.map((e) => [e.id, e]));
-	return rows.filter((s) => {
-		const entry = entryById.get(s.entryId);
-		return entry ? canReview(caps, toAclEntry(entry)) : false;
+	// Batch-load the entries' collections so the collection gate can run (entries in a
+	// collection the principal cannot read must be hidden, even with a review grant).
+	const colIds = [...new Set(entries.map((e) => e.collectionId))];
+	const cols = await db.query.knowledgeCollections.findMany({
+		where: (c, { inArray }) => inArray(c.id, colIds),
+		columns: {
+			id: true,
+			defaultLevel: true,
+			classificationLevel: true,
+			controlledTagsJson: true,
+			ownerUserId: true,
+		},
 	});
+	const colById = new Map(cols.map((c) => [c.id, c]));
+	const out: typeof rows = [];
+	for (const s of rows) {
+		const entry = entryById.get(s.entryId);
+		if (!entry) continue;
+		const col = colById.get(entry.collectionId);
+		if (!col) continue;
+		if (!(await canReadCollection(caps, toAclCollection(col)))) continue;
+		if (canReview(caps, toAclEntry(entry))) out.push(s);
+	}
+	return out;
 }
 
 async function getSubmission(principal: Principal, submissionId: string) {
 	const sub = await loadSubmission(submissionId);
-	// Submitter can view their own submission; otherwise reviewer permission is required.
+	// Submitter can view their own submission; otherwise collection-read + reviewer
+	// permission are required.
 	if (sub.submitterUserId !== principal.userId) {
-		const { entry } = await loadEntryAndCollection(sub.entryId);
+		const { entry, collection } = await loadEntryAndCollection(sub.entryId);
 		const caps = await resolvePrincipalCaps(principal);
+		if (!(await canReadCollection(caps, toAclCollection(collection)))) {
+			throw new NotFoundError("Knowledge submission", submissionId);
+		}
 		if (!canReview(caps, toAclEntry(entry))) {
 			throw new NotFoundError("Knowledge submission", submissionId);
 		}

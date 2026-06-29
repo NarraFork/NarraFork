@@ -261,12 +261,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			// Trigger client-side notifications for done(unread)/waiting
 			if (event.type === "status") {
 				// Reflection gates briefly flip a narrator to "waiting" while an
-				// automated check runs — those carry silent_notification/reflecting.
-				// They get a purple favicon dot (not a waiting/unread alert) that
-				// disappears on its own once the reflection ends.
-				const isReflecting =
-					event.substatus?.includes("reflecting") ||
-					event.substatus?.includes("silent_notification");
+				// automated check runs — those carry the "reflecting" tag. They get a
+				// purple favicon dot (not a waiting/unread alert) that disappears on
+				// its own once the reflection ends.
+				const isReflecting = event.substatus?.includes("reflecting");
 				const shouldNotify =
 					!isReflecting && (event.status === "waiting" || event.substatus?.includes("unread"));
 				if (isReflecting) {

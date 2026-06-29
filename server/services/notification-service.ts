@@ -103,14 +103,12 @@ interface RecentTab {
 
 // --- Core notification logic ---
 
-async function handleStatusChanged(
-	narratorId: string,
-	status: string,
-	substatus?: string[],
-): Promise<void> {
-	if (substatus?.includes("silent_notification")) return;
-	const isUnread = status === "idle" && substatus?.includes("unread");
-	if (!isUnread && status !== "waiting") return;
+type AttentionReason = "waiting_permission" | "done" | "error";
+
+async function handleAttention(narratorId: string, reason: AttentionReason): Promise<void> {
+	// Server-side IM only alerts on done / waiting-for-permission. Errors are
+	// surfaced elsewhere (in-app + gateway); keep behavior as before and skip.
+	if (reason === "error") return;
 
 	// Fetch narrator + optional chapter info
 	const narrator = await db.query.narrators.findFirst({
@@ -128,7 +126,7 @@ async function handleStatusChanged(
 	}
 
 	const chapterLine = chapterName ? `\n\n> Chapter: ${chapterName}` : "";
-	const displayStatus = isUnread ? "done" : status;
+	const displayStatus = reason === "done" ? "done" : "waiting";
 	const markdownText = `**${narratorTitle}** status: **${displayStatus}**${chapterLine}`;
 
 	// Query all user preferences
@@ -148,9 +146,9 @@ async function handleStatusChanged(
 		);
 		if (!isRelevant) continue;
 
-		// Check per-status preference
-		if (isUnread && !pref.notifyOnDone) continue;
-		if (status === "waiting" && !pref.notifyOnWaiting) continue;
+		// Check per-reason preference
+		if (reason === "done" && !pref.notifyOnDone) continue;
+		if (reason === "waiting_permission" && !pref.notifyOnWaiting) continue;
 
 		const promises: Promise<void>[] = [];
 
@@ -192,9 +190,13 @@ async function handleStatusChanged(
 }
 
 // --- Register event listener (side-effect on import) ---
+//
+// Listens to the semantic `narrator:attention` intent instead of re-deriving
+// "should I notify?" from raw status/substatus. Reflection mid-states and
+// takeover fallbacks never emit attention, so they can never leak an IM.
 
-eventBus.on("narrator:status_changed", (event) => {
-	handleStatusChanged(event.narratorId, event.status, event.substatus).catch((err) => {
+eventBus.on("narrator:attention", (event) => {
+	handleAttention(event.narratorId, event.reason).catch((err) => {
 		logger.error("Notification handler error", {
 			narratorId: event.narratorId,
 			error: err instanceof Error ? err.message : String(err),

@@ -23,29 +23,44 @@ function getAvailableModelsList(): string {
 	return "(no models configured yet)";
 }
 
-/** When per-type pool restrictions are active, append a note to the model parameter description. */
-function getSubagentPoolNote(config?: AgentConfig): string {
-	if (config?.subagentModelRestrictionDescription) {
-		return `\n\n${config.subagentModelRestrictionDescription}`;
-	}
-	const pools = settings.agent.subagentAllowedModels;
-	if (!pools) return "";
-	const parts: string[] = [];
-	for (const type of ["explore", "plan", "general"] as const) {
-		const pool = pools[type];
-		if (pool && pool.length > 0) {
-			parts.push(`${type}: ${pool.join(", ")}`);
-		}
-	}
-	if (parts.length === 0) return "";
-	return `\n\nNote: Subagent model selection is restricted per type. Allowed models — ${parts.join("; ")}. Models outside the pool for a given type will be ignored.`;
-}
+const MODEL_PARAM_BASE =
+	"Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback).";
+
+const SUBAGENT_POOL_TYPES = ["explore", "plan", "search", "general"] as const;
 
 function getModelParameterDescription(config?: AgentConfig): string {
-	const list = config?.subagentModelRestrictionDescription
-		? "see custom restriction below"
-		: getAvailableModelsList();
-	return `Override the model for this subagent. If omitted, uses the per-type model preference from settings (or the parent narrator's model as fallback). Available models: ${list}${getSubagentPoolNote(config)}`;
+	// Per-narrator custom restriction trait takes precedence and already describes the pools.
+	if (config?.subagentModelRestrictionDescription) {
+		return `${MODEL_PARAM_BASE}\n\n${config.subagentModelRestrictionDescription}`;
+	}
+
+	// Global per-type pool restriction (settings.agent.subagentAllowedModels).
+	const pools = settings.agent.subagentAllowedModels;
+	const restrictedParts: string[] = [];
+	const unrestrictedTypes: string[] = [];
+	if (pools) {
+		for (const type of SUBAGENT_POOL_TYPES) {
+			const pool = pools[type];
+			if (pool && pool.length > 0) {
+				restrictedParts.push(`${type}: ${pool.join(", ")}`);
+			} else {
+				unrestrictedTypes.push(type);
+			}
+		}
+	}
+
+	// No restriction configured at all — list every visible model.
+	if (restrictedParts.length === 0) {
+		return `${MODEL_PARAM_BASE} Available models: ${getAvailableModelsList()}`;
+	}
+
+	// At least one type is restricted: describe the allowed pool per type instead of
+	// dumping every visible model (which would be misleading).
+	let note = `${MODEL_PARAM_BASE}\n\nNote: Subagent model selection is restricted per type. Allowed models — ${restrictedParts.join("; ")}. Models outside the pool for a given type will be ignored.`;
+	if (unrestrictedTypes.length > 0) {
+		note += ` For ${unrestrictedTypes.join(", ")} (not restricted), any available model may be used: ${getAvailableModelsList()}.`;
+	}
+	return note;
 }
 
 function buildParameters() {

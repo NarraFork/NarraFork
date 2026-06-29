@@ -888,7 +888,7 @@ class Gateway {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
 		eventBus.on("narrator:status_changed", async (event) => {
-			// 1. Handle the directly-bound narrator (deliver response)
+			// Handle the directly-bound narrator (deliver response on idle)
 			if (event.status === "idle") {
 				const consumer = this.streamConsumers.get(event.narratorId);
 				if (consumer) {
@@ -903,10 +903,14 @@ class Gateway {
 					await this.deliverToIM(event.narratorId);
 				}
 			}
+		});
 
-			// 2. Notify IM users whose recentTabs contain this narrator
-			//    (but it's NOT their currently-bound narrator)
-			await this.notifyRecentTabStatusChange(event.narratorId, event.status, event.substatus);
+		// Notify IM users whose recentTabs contain this narrator (but it's NOT
+		// their currently-bound narrator). Driven by the semantic attention intent
+		// rather than re-derived from status/substatus, so reflection mid-states
+		// and takeover fallbacks never trigger a spurious IM ping.
+		eventBus.on("narrator:attention", async (event) => {
+			await this.notifyRecentTabStatusChange(event.narratorId, event.reason);
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
@@ -1094,23 +1098,17 @@ class Gateway {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * Only notify for "interesting" transitions (idle+unread = done, idle+error, waiting).
-	 * Skip if the narrator is the user's currently-bound one (already handled
-	 * by deliverToIM / stream consumer).
+	 * Driven by the semantic `narrator:attention` intent (reason = done / error /
+	 * waiting_permission). Skip if the narrator is the user's currently-bound one
+	 * (already handled by deliverToIM / stream consumer).
 	 *
 	 * Optimized: uses an in-memory cache of recentTabs narrator IDs (TTL 60s)
 	 * to avoid repeated JSON parsing and DB queries on every status change.
 	 */
 	private async notifyRecentTabStatusChange(
 		narratorId: string,
-		status: string,
-		substatus?: string[],
+		reason: "waiting_permission" | "done" | "error",
 	): Promise<void> {
-		// Only notify for meaningful status changes
-		const isUnread = status === "idle" && substatus?.includes("unread");
-		const isError = status === "idle" && substatus?.includes("error");
-		if (!isUnread && !isError && status !== "waiting") return;
-
 		// No adapters → nothing to send
 		if (this.adapters.size === 0) return;
 
@@ -1201,13 +1199,13 @@ class Gateway {
 		// Send notifications
 		const shortId = narratorId.slice(0, 8);
 		const title = narrator.title || "(untitled)";
-		const statusEmoji = isUnread ? "✅" : isError ? "❌" : status === "waiting" ? "⏳" : "ℹ️";
-		const displayStatus = isUnread ? "done" : isError ? "error" : status;
+		const statusEmoji = reason === "done" ? "✅" : reason === "error" ? "❌" : "⏳";
+		const displayStatus = reason === "done" ? "done" : reason === "error" ? "error" : "waiting";
 		let message = `${statusEmoji} ${title} (${shortId}…) → ${displayStatus}`;
 
-		// When waiting, append the pending permission request details so the user
-		// can quote-reply to approve/deny from any IM session.
-		if (status === "waiting") {
+		// When waiting for permission, append the pending request details so the
+		// user can quote-reply to approve/deny from any IM session.
+		if (reason === "waiting_permission") {
 			const pending = this.findPendingPermissionForNarrator(narratorId);
 			if (pending) {
 				const summary = this.formatToolSummary(pending.toolName, pending.input);

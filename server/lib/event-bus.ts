@@ -109,6 +109,16 @@ export type NarraForkEvent =
 	| { type: "narrator:error"; narratorId: string; error: string }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
+	// Semantic "the user should be notified" intent — emitted only when a status
+	// change actually warrants alerting the user. Notification consumers (IM /
+	// gateway) listen to this instead of re-deriving intent from status+substatus.
+	// Reflection mid-states (danger/plan/goal) and takeover fallbacks never emit it.
+	| {
+			type: "narrator:attention";
+			narratorId: string;
+			reason: "waiting_permission" | "done" | "error";
+			detail?: string;
+	  }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
 	// Narrator fork
 	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }

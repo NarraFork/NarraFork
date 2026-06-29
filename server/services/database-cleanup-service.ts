@@ -84,6 +84,7 @@ const SESSION_OWNED_TABLES: TableSessionRelation[] = [
 	{ tableName: "narrator_blacklist_dirs", alias: "nbd", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_whitelist_cmds", alias: "nwc", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_blacklist_cmds", alias: "nbc", narratorColumn: "narrator_id" },
+	{ tableName: "knowledge_pack_activations", alias: "kpa", narratorColumn: "narrator_id" },
 	{ tableName: "gateway_session_mappings", alias: "gsm", narratorColumn: "narrator_id" },
 ];
 

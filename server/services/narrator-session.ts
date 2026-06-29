@@ -26,7 +26,7 @@ import {
 } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
-import { NotFoundError } from "../lib/errors";
+import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import {
 	formatSubagentModelRestrictionDescription,
@@ -1112,13 +1112,27 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 /**
  * Build AgentConfig, start the agent loop via executeAgentLoop(), and handle chained messages.
  * Runs in the background — kicked off by feedMessage().
+ *
+ * Returns `{ started: false }` when a loop is already running for this narrator.
+ * This is the single authoritative gate against concurrent loops: in JS's
+ * single-threaded model the test-and-set on `_loopRunning` is atomic, so it
+ * blocks any second loop that slips past the route-level admission check (e.g.
+ * when the DB `status` went stale to idle while the loop was still draining).
  */
 export async function runAgentLoop(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
-): Promise<void> {
+): Promise<{ started: boolean }> {
 	const { narratorId, locale } = active;
+	// Final guard against concurrent loops on the same ActiveNarrator. ensureNarrator
+	// reuses the same `active` object while it is alive, so a second runAgentLoop call
+	// here would otherwise drive a second `while (active.alive)` loop over shared state
+	// (abortController, history, _substatus) and corrupt the session.
+	if (active._loopRunning) {
+		logger.warn("runAgentLoop blocked: loop already running", { narratorId });
+		return { started: false };
+	}
 	active._loopRunning = true;
 	let shouldUpdateTitle = false;
 	let currentText = text;
@@ -1676,7 +1690,7 @@ export async function runAgentLoop(
 					}
 					return true;
 				},
-				permissionHandler: (toolName, input, toolUseId) =>
+				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,
 						active.abortController.signal,
@@ -1685,6 +1699,8 @@ export async function runAgentLoop(
 						toolUseId,
 						active.cwd,
 						locale,
+						undefined,
+						options,
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
@@ -2596,16 +2612,11 @@ export async function runAgentLoop(
 
 			// No buffered messages — now transition to idle/unread (triggers notifications)
 			if (!loopHadError) {
-				// Atomically transition working/waiting → idle with unread substatus.
-				// If status has already moved (e.g. another loop took over after
-				// hot reload, or user interrupted), the CAS is a no-op.
-				await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
-					substatus: ["unread"],
-				});
-
-				// Close the race where a background subagent completes after the post-turn
-				// drain but before this turn actually goes idle. If a notification is queued
-				// now, consume it in this loop instead of waiting for another user message.
+				// Drain any background-subagent completion notice FIRST, before flipping
+				// the DB status to idle. This closes the window where status is already
+				// idle (visible to clients / route admission) while this loop is still
+				// running and about to pick up more work. If a notice is queued, keep the
+				// status working and continue this loop instead of going idle at all.
 				const bgCompletionAfterIdle = await drainAndPersistBackgroundCompletionNotice(active);
 				if (bgCompletionAfterIdle) {
 					await narratorService.updateStatus(narratorId, "working");
@@ -2613,6 +2624,15 @@ export async function runAgentLoop(
 					currentImages = undefined;
 					continue;
 				}
+
+				// Nothing left to do — atomically transition working/waiting → idle with
+				// unread substatus. No awaited work runs between this and the break below,
+				// so the "DB idle but loop still running" window is minimal. If status has
+				// already moved (e.g. another loop took over after hot reload, or user
+				// interrupted), the CAS is a no-op.
+				await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+					substatus: ["unread"],
+				});
 			}
 
 			active.events.emit("event", { type: "done", data: null });
@@ -2993,6 +3013,8 @@ export async function runAgentLoop(
 			}
 		}
 	}
+
+	return { started: true };
 }
 
 // === Message feeding ===
@@ -3032,6 +3054,16 @@ async function feedMessage(
 	userBroadcasted?: boolean;
 }> {
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	// Final guard against a concurrent loop slipping past the route-level admission
+	// check (which should have buffered this message). ensureNarrator reuses the live
+	// `active`, so starting a second runAgentLoop here would corrupt the shared session.
+	// Throw BEFORE persisting the user message so we never leave a half-applied turn.
+	if (active._loopRunning) {
+		logger.warn("feedMessage blocked: loop already running", { narratorId });
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		throw new ValidationError("Narrator is already running");
+	}
 	active._goalContinuationSuppressed = false;
 	active._goalContinuationNoToolCount = 0;
 	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
@@ -3478,6 +3510,14 @@ export async function retryLastMessage(
 	// Check if this is a subagent — subagent messages all have parentToolUseId
 	// set, so we must not filter on isNull(parentToolUseId) for them.
 	const narrator = await narratorService.getById(narratorId);
+	// Guard before any destructive work (deleteMessagesAfter below): if a loop is
+	// already running, refuse rather than mutate history under a live session.
+	if (isLoopRunning(narratorId)) {
+		logger.warn("retryLastMessage blocked: loop already running", { narratorId });
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
 	const isSubagent = isSubagentVariant(narrator.variant);
 
 	// Find the last top-level message via refs
@@ -3568,6 +3608,14 @@ export async function continueNarrator(
 	// Subagent messages all have parentToolUseId set — clear it so
 	// getLastContinuableTopLevelMessage can find them (same as runAgentLoop).
 	const narrator = await narratorService.getById(narratorId);
+	// Guard: refuse to continue while a loop is already running (authoritative
+	// in-memory check, independent of a possibly-stale DB status).
+	if (isLoopRunning(narratorId)) {
+		logger.warn("continueNarrator blocked: loop already running", { narratorId });
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
 	const msgs = isSubagentVariant(narrator.variant)
 		? rawMsgs.map((m) => ({ ...m, parentToolUseId: null }))
 		: rawMsgs;
@@ -3706,6 +3754,8 @@ export async function reExecuteDeniedToolCall(
 	if (isNarratorActive(narratorId)) {
 		// A live agent loop is still running for this narrator — refuse to avoid
 		// racing the loop's own tool execution / history rebuild.
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
 		return { ok: false, reason: "narrator_busy" };
 	}
 
@@ -3799,7 +3849,7 @@ export async function reExecuteDeniedToolCall(
 		userId: active._currentUserId ?? null,
 		projectId: active._projectId ?? null,
 		disabledTools: active._disabledTools,
-		permissionHandler: (tName, input, tUseId) =>
+		permissionHandler: (tName, input, tUseId, options) =>
 			handlePermission(
 				narratorId,
 				active.abortController.signal,
@@ -3808,6 +3858,8 @@ export async function reExecuteDeniedToolCall(
 				tUseId,
 				active.cwd,
 				locale,
+				undefined,
+				options,
 			),
 		onEvent: (event) => {
 			if (event.type === "tool_output") {
@@ -4201,6 +4253,14 @@ export async function editAndRegenerate(
 	replyInUserLanguage = false,
 	rollback = false,
 ): Promise<{ ok: boolean }> {
+	// Guard before any destructive work (copy-on-write + deleteMessagesAfter below):
+	// refuse to edit/regenerate while a loop is already running on this narrator.
+	if (isLoopRunning(narratorId)) {
+		logger.warn("editAndRegenerate blocked: loop already running", { narratorId });
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(narratorId);
+		return { ok: false };
+	}
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -4861,6 +4921,52 @@ export function closeNarrator(narratorId: string): void {
 
 export function isNarratorActive(narratorId: string): boolean {
 	return activeNarrators.has(narratorId);
+}
+
+/**
+ * Whether an agent loop is actually executing for this narrator right now.
+ *
+ * This reads the authoritative in-memory `_loopRunning` flag rather than the DB
+ * `status` snapshot, which can lag behind reality (e.g. a turn that was set idle
+ * during post-turn drain, or an interrupt whose async abort has not yet finished
+ * cleanup). Route-level admission checks use this so that a stale idle status
+ * cannot let a second concurrent loop start.
+ */
+export function isLoopRunning(narratorId: string): boolean {
+	const active = activeNarrators.get(narratorId);
+	return active?.alive === true && active._loopRunning === true;
+}
+
+/**
+ * Reconcile a stale narrator status: when a loop is actually running in memory
+ * but the DB status wrongly shows a non-running state (idle/archived), flip it
+ * back to "working" and broadcast.
+ *
+ * This is called from every path that buffers or rejects a user action because
+ * a loop is already running. Without it, a stale idle status would leave the
+ * user stuck — the frontend hides the interrupt button when status is idle, so
+ * the user could neither continue (blocked) nor stop (no button).
+ *
+ * CAS only matches ["idle", "archived"]: it never overwrites a legitimate
+ * waiting/reflecting state, and is a no-op when status is already working. The
+ * transition clears stale substatus tags (unread/error) by design — the
+ * narrator is in fact running, so those tags no longer apply.
+ *
+ * Returns true only when an actual correction was made.
+ */
+export async function reconcileRunningStatus(narratorId: string): Promise<boolean> {
+	if (!isLoopRunning(narratorId)) return false;
+	const changed = await narratorService.compareAndSetStatus(
+		narratorId,
+		["idle", "archived"],
+		"working",
+	);
+	if (changed) {
+		logger.warn("Reconciled stale narrator status → working (loop was actually running)", {
+			narratorId,
+		});
+	}
+	return changed;
 }
 
 export function requestBufferedMessageSoftStop(narratorId: string): boolean {

@@ -1,3 +1,5 @@
+import { existsSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -38,6 +40,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { isSubagentVariant, parseTraits, subagentVariant } from "../lib/narrator-utils";
+import { getPacksExtractRoot } from "../lib/pack-archives";
 import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import {
@@ -129,6 +132,23 @@ async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean>
 	return sharedOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
+/**
+ * Remove a narrator's pack extraction subtree (~/.narrafork/packs/<narratorId>/).
+ * The activation + whitelist DB rows are cleared by FK cascade / explicit delete in
+ * remove(); this clears the on-disk temp dirs that the DB cascade can't reach.
+ */
+async function deleteNarratorPackExtractions(narratorId: string): Promise<void> {
+	try {
+		const dir = resolve(getPacksExtractRoot(), narratorId);
+		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+	} catch (err) {
+		logger.warn("Failed to remove narrator pack extractions", {
+			narratorId,
+			error: String(err),
+		});
+	}
+}
+
 interface CreateNarratorInput {
 	chapterId?: string | null;
 	type?: "primary";
@@ -167,6 +187,14 @@ function formatAvailableOptionalToolIds(): string {
 }
 
 /**
+ * Optional tools that may only be loaded by admin users. Non-admin /load attempts
+ * are rejected in handleLoadToolCommand. KnowledgeReview is intentionally NOT here:
+ * reviewers need not be admins, and per-action authority is enforced by the service
+ * layer (canReview / canWriteMain) at execution time.
+ */
+const ADMIN_ONLY_LOAD_TOOLS = new Set(["NarraForkAdmin", "KnowledgeAdmin"]);
+
+/**
  * Shared handler for `/load <tool>` commands.
  */
 export async function handleLoadToolCommand(
@@ -197,7 +225,7 @@ export async function handleLoadToolCommand(
 	}
 
 	// Admin-only tool check
-	if (toolName === "NarraForkAdmin") {
+	if (ADMIN_ONLY_LOAD_TOOLS.has(toolName)) {
 		const adminOnlyMsg =
 			locale === "zh-CN"
 				? "⛔ 只有管理员才能加载此工具"
@@ -1073,6 +1101,11 @@ export const narratorService = {
 		} else {
 			await deleteNarratorUploads(narratorId);
 		}
+
+		// Remove any pack extraction directories this narrator owned. The activation rows +
+		// whitelist rows are already gone (FK cascade / explicit delete above); this clears the
+		// on-disk temp dirs that DB cascade can't reach.
+		await deleteNarratorPackExtractions(narratorId);
 
 		logger.info("Narrator removed", { narratorId });
 	},

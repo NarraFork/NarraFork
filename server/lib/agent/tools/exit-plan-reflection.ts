@@ -154,12 +154,7 @@ async function markExitPlanReflectionStatus(
 	try {
 		const { narratorService } = await import("@server/services/narrator-service");
 		const nextStatus = status === "running" || status === "awaiting_user" ? "waiting" : "working";
-		const substatus =
-			status === "running"
-				? ["silent_notification", "reflecting"]
-				: status === "awaiting_user"
-					? ["silent_notification"]
-					: [];
+		const substatus = status === "running" ? ["reflecting"] : status === "awaiting_user" ? [] : [];
 		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
 		if (pending.broadcastTargetId !== pending.narratorId) {
 			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });

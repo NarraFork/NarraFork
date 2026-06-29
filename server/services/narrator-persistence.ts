@@ -1067,6 +1067,20 @@ export const narratorPersistence = {
 			status,
 			substatus: actualSubstatus,
 		});
+		// Emit the semantic attention intent for the two persistent, unambiguous
+		// "alert the user" states. `waiting` is intentionally excluded — its
+		// attention intent is decided by the producer (handlePermission), not
+		// re-derived here, because `waiting` is also reused for reflection states.
+		if (status === "idle" && actualSubstatus?.includes("unread")) {
+			eventBus.emit({ type: "narrator:attention", narratorId, reason: "done" });
+		} else if (actualSubstatus?.includes("error")) {
+			eventBus.emit({
+				type: "narrator:attention",
+				narratorId,
+				reason: "error",
+				detail: normalizedErrorMessage ?? undefined,
+			});
+		}
 		if (isError) {
 			eventBus.emit({
 				type: "narrator:error",
@@ -1197,6 +1211,19 @@ export const narratorPersistence = {
 			status: newStatus,
 			substatus: actualSubstatus,
 		});
+		// Emit the semantic attention intent for done/error (see updateStatus for
+		// why `waiting` is excluded). compareAndSetStatus is the path that marks a
+		// finished turn idle+unread, so this is the primary "done" emit point.
+		if (newStatus === "idle" && actualSubstatus?.includes("unread")) {
+			eventBus.emit({ type: "narrator:attention", narratorId, reason: "done" });
+		} else if (actualSubstatus?.includes("error")) {
+			eventBus.emit({
+				type: "narrator:attention",
+				narratorId,
+				reason: "error",
+				detail: normalizedErrorMessage ?? undefined,
+			});
+		}
 		if (isError) {
 			eventBus.emit({
 				type: "narrator:error",

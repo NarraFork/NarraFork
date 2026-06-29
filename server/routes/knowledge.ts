@@ -17,6 +17,8 @@ import {
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
 	submitKnowledgeDraftSchema,
+	transferKnowledgeOwnerSchema,
+	updateKnowledgeCollectionAclSchema,
 	updateKnowledgeCollectionSchema,
 	updateKnowledgeDraftSchema,
 	updateKnowledgeEntryAclSchema,
@@ -42,19 +44,43 @@ function principalOf(c: { get: (k: "user") => { sub: string; role: "admin" | "us
 
 knowledgeRoutes.get("/collections", async (c) => {
 	const projectId = c.req.query("projectId") || undefined;
-	return c.json(await knowledgeService.listCollections(projectId));
+	return c.json(await knowledgeService.listCollections(projectId, principalOf(c)));
 });
 
 knowledgeRoutes.post("/collections", async (c) => {
 	const parsed = createKnowledgeCollectionSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	return c.json(await knowledgeService.createCollection(parsed.data), 201);
+	// Record the creating user as owner so the owner short-circuit is meaningful.
+	return c.json(
+		await knowledgeService.createCollection({ ...parsed.data, ownerUserId: c.get("user").sub }),
+		201,
+	);
 });
 
 knowledgeRoutes.patch("/collections/:id", requireAdmin, async (c) => {
 	const parsed = updateKnowledgeCollectionSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	return c.json(await knowledgeService.updateCollection(c.req.param("id") ?? "", parsed.data));
+});
+
+// Set collection ACL attributes (classification level, controlled tags, owner) — admin only.
+knowledgeRoutes.patch("/collections/:id/acl", requireAdmin, async (c) => {
+	const parsed = updateKnowledgeCollectionAclSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeAcl.updateCollectionAcl(c.req.param("id") ?? "", parsed.data));
+});
+
+// Transfer collection ownership — admin OR current owner (enforced in the service; NOT requireAdmin).
+knowledgeRoutes.post("/collections/:id/transfer-owner", async (c) => {
+	const parsed = transferKnowledgeOwnerSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeService.transferCollectionOwner(
+			c.req.param("id") ?? "",
+			parsed.data.ownerUserId,
+			principalOf(c),
+		),
+	);
 });
 
 knowledgeRoutes.delete("/collections/:id", requireAdmin, async (c) => {
@@ -80,7 +106,15 @@ knowledgeRoutes.post("/entries", async (c) => {
 	const parsed = createKnowledgeEntrySchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
-	return c.json(await knowledgeService.createEntry({ ...parsed.data, authorUserId: userId }), 201);
+	// Pass principal so the collection write-gate (read + write the collection) is enforced.
+	return c.json(
+		await knowledgeService.createEntry({
+			...parsed.data,
+			authorUserId: userId,
+			principal: principalOf(c),
+		}),
+		201,
+	);
 });
 
 knowledgeRoutes.get("/entries/:id", async (c) => {
@@ -109,6 +143,19 @@ knowledgeRoutes.patch("/entries/:id/acl", requireAdmin, async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const id = c.req.param("id") ?? "";
 	return c.json(await knowledgeService.updateEntryAcl(id, parsed.data));
+});
+
+// Transfer entry ownership — admin OR current owner (enforced in the service; NOT requireAdmin).
+knowledgeRoutes.post("/entries/:id/transfer-owner", async (c) => {
+	const parsed = transferKnowledgeOwnerSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeService.transferEntryOwner(
+			c.req.param("id") ?? "",
+			parsed.data.ownerUserId,
+			principalOf(c),
+		),
+	);
 });
 
 // ─── Revisions (direct main write — gated to admin/owner/write-grant) ───

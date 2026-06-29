@@ -47,6 +47,12 @@ export interface AclEntry {
 export interface AclCollection {
 	id: string;
 	defaultLevel: string;
+	/** Classification level gating access to the collection ITSELF (null = public). */
+	classificationLevel?: string | null;
+	/** Controlled tag ids required to read the collection (compartment axis). */
+	controlledTagsJson?: unknown;
+	/** Collection owner — short-circuits read and may write/manage the collection. */
+	ownerUserId?: string | null;
 }
 
 function asStringArray(v: unknown): string[] {
@@ -161,8 +167,47 @@ export async function resolveCapsByUserId(
 }
 
 /**
- * Can the principal READ this entry? Dual-axis AND:
- *   clearance >= entry level  AND  entry controlled tags ⊆ granted tags.
+ * Can the principal READ this collection? Dual-axis AND (same shape as entry canRead):
+ *   clearance >= collection level  AND  collection controlled tags ⊆ granted tags.
+ * admin / collection owner short-circuit. A collection with no level (null → public)
+ * and no controlled tags is readable by everyone (backward-compatible default).
+ */
+export async function canReadCollection(
+	caps: PrincipalCaps,
+	collection: AclCollection,
+): Promise<boolean> {
+	if (caps.isAdmin) return true;
+	if (collection.ownerUserId && collection.ownerUserId === caps.userId) return true;
+
+	const need = await rankOf(collection.classificationLevel);
+	if (caps.clearanceRank < need) return false;
+
+	const controlled = asStringArray(collection.controlledTagsJson);
+	for (const t of controlled) {
+		if (!caps.grantedTagIds.has(t)) return false;
+	}
+	return true;
+}
+
+/** Can the principal WRITE into / create entries in this collection? admin / owner / write grant. */
+export function canWriteCollection(caps: PrincipalCaps, collection: AclCollection): boolean {
+	if (caps.isAdmin) return true;
+	if (collection.ownerUserId && collection.ownerUserId === caps.userId) return true;
+	return caps.hasWriteGrant;
+}
+
+/** Can the principal manage (rename / delete / set ACL on) the collection? admin / owner only. */
+export function isCollectionOwnerOrAdmin(caps: PrincipalCaps, collection: AclCollection): boolean {
+	if (caps.isAdmin) return true;
+	return !!collection.ownerUserId && collection.ownerUserId === caps.userId;
+}
+
+/**
+ * Can the principal READ this entry? Collection gate AND entry dual-axis AND:
+ *   1. canReadCollection (the collection is itself an access boundary), THEN
+ *   2. clearance >= entry level  AND  entry controlled tags ⊆ granted tags.
+ * The collection gate runs first: owning an entry does NOT bypass the collection's
+ * classification. admin short-circuits everything.
  */
 export async function canRead(
 	caps: PrincipalCaps,
@@ -170,6 +215,10 @@ export async function canRead(
 	collection: AclCollection,
 ): Promise<boolean> {
 	if (caps.isAdmin) return true;
+
+	// Collection is a prerequisite access boundary (decision: collection-first).
+	if (!(await canReadCollection(caps, collection))) return false;
+
 	if (entry.ownerUserId && entry.ownerUserId === caps.userId) return true;
 
 	const levelName = entry.classificationLevel ?? collection.defaultLevel;
@@ -253,10 +302,10 @@ async function deleteLevel(
 	// "public" is the baseline level relied on throughout the ACL logic.
 	if (level.name === "public") return { ok: false, reason: "builtin" };
 
-	// Reference check: levels are referenced BY NAME (not id) from three places.
+	// Reference check: levels are referenced BY NAME (not id) from these places.
 	// Deleting a still-referenced level would, under fail-closed rankOf, abruptly
-	// lock every referencing entry to admin-only — so refuse and surface the count.
-	const [entryRefs, collectionRefs, grantRefs] = await Promise.all([
+	// lock every referencing entry/collection to admin-only — so refuse and surface it.
+	const [entryRefs, collectionDefaultRefs, collectionClassRefs, grantRefs] = await Promise.all([
 		db.query.knowledgeEntries.findFirst({
 			where: eq(knowledgeEntries.classificationLevel, level.name),
 			columns: { id: true },
@@ -265,18 +314,54 @@ async function deleteLevel(
 			where: eq(knowledgeCollections.defaultLevel, level.name),
 			columns: { id: true },
 		}),
+		db.query.knowledgeCollections.findFirst({
+			where: eq(knowledgeCollections.classificationLevel, level.name),
+			columns: { id: true },
+		}),
 		db.query.knowledgeGrants.findFirst({
 			where: eq(knowledgeGrants.clearanceLevel, level.name),
 			columns: { id: true },
 		}),
 	]);
-	if (entryRefs || collectionRefs || grantRefs) {
+	if (entryRefs || collectionDefaultRefs || collectionClassRefs || grantRefs) {
 		return { ok: false, reason: "in_use" };
 	}
 
 	await db.delete(knowledgeLevels).where(eq(knowledgeLevels.id, id));
 	invalidateLevelCache();
 	return { ok: true };
+}
+
+/**
+ * Set a collection's ACL attributes (classification level, controlled tags, owner).
+ * Mirrors updateEntryAcl on the entry side. Caller is responsible for authorization
+ * (admin-only at the route/tool layer).
+ */
+async function updateCollectionAcl(
+	id: string,
+	input: {
+		classificationLevel?: string | null;
+		controlledTags?: string[];
+		ownerUserId?: string | null;
+	},
+) {
+	const existing = await db.query.knowledgeCollections.findFirst({
+		where: eq(knowledgeCollections.id, id),
+		columns: { id: true },
+	});
+	if (!existing) throw new Error("Knowledge collection not found");
+	await db
+		.update(knowledgeCollections)
+		.set({
+			...(input.classificationLevel !== undefined
+				? { classificationLevel: input.classificationLevel }
+				: {}),
+			...(input.controlledTags !== undefined ? { controlledTagsJson: input.controlledTags } : {}),
+			...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
+			updatedAt: nowIso(),
+		})
+		.where(eq(knowledgeCollections.id, id));
+	return db.query.knowledgeCollections.findFirst({ where: eq(knowledgeCollections.id, id) });
 }
 
 async function listTags(collectionId?: string) {
@@ -525,6 +610,9 @@ export const knowledgeAcl = {
 	resolvePrincipalCaps,
 	resolveCapsByUserId,
 	canRead,
+	canReadCollection,
+	canWriteCollection,
+	isCollectionOwnerOrAdmin,
 	canWriteMain,
 	canReview,
 	readableEntryFilter,
@@ -532,6 +620,7 @@ export const knowledgeAcl = {
 	listLevels,
 	createLevel,
 	deleteLevel,
+	updateCollectionAcl,
 	listTags,
 	createTag,
 	updateTag,

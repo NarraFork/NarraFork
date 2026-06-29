@@ -110,7 +110,13 @@ interface CustomApiProviderSectionProps {
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
+	getUniquePrefix?: (base: string, providerId: string) => string;
 	onTestModel?: (model: string) => void;
+}
+
+/** Sanitize a prefix value: any text except an ASCII colon is allowed. */
+function sanitizePrefix(value: string): string {
+	return value.replace(/:/g, "");
 }
 
 export const CustomApiProviderSection = React.memo(function CustomApiProviderSection({
@@ -128,6 +134,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
+	getUniquePrefix,
 	onTestModel,
 }: CustomApiProviderSectionProps) {
 	const { t } = useTranslation("settings");
@@ -183,6 +190,34 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 			);
 		},
 		[onProvidersChange, provider.id],
+	);
+
+	// Track whether the user has manually edited the prefix. New providers start
+	// with an empty prefix → name drives the prefix until the user edits it.
+	const [prefixManuallyEdited, setPrefixManuallyEdited] = useState(() => !!provider.prefix);
+
+	const handleNameChange = useCallback(
+		(name: string) => {
+			onProvidersChange((prev) =>
+				prev.map((p) => {
+					if (p.id !== provider.id) return p;
+					if (prefixManuallyEdited) return { ...p, name };
+					const base = sanitizePrefix(name.trim());
+					const nextPrefix = base ? (getUniquePrefix?.(base, p.id) ?? base) : "";
+					return { ...p, name, prefix: nextPrefix };
+				}),
+			);
+		},
+		[onProvidersChange, provider.id, prefixManuallyEdited, getUniquePrefix],
+	);
+
+	const handlePrefixChange = useCallback(
+		(value: string) => {
+			const next = sanitizePrefix(value);
+			setPrefixManuallyEdited(next.length > 0);
+			updateProvider("prefix", next);
+		},
+		[updateProvider],
 	);
 
 	const handleRemoveProvider = useCallback(() => {
@@ -277,7 +312,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					placeholder={t("customApiProviderNamePlaceholder")}
 					value={provider.name}
 					size="xs"
-					onChange={(e) => updateProvider("name", e.currentTarget.value)}
+					onChange={(e) => handleNameChange(e.currentTarget.value)}
 				/>
 				<TextInput
 					label={t("customApiProviderPrefix")}
@@ -286,12 +321,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					value={provider.prefix}
 					size="xs"
 					error={getPrefixError?.(provider.prefix, provider.id)}
-					onChange={(e) =>
-						updateProvider(
-							"prefix",
-							e.currentTarget.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
-						)
-					}
+					onChange={(e) => handlePrefixChange(e.currentTarget.value)}
 				/>
 				<PasswordInput
 					label={t("customApiKey")}

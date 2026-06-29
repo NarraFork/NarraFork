@@ -201,6 +201,32 @@ describe("recent tabs pinned ordering", () => {
 		}
 	});
 
+	it("keeps a freshly opened subagent even when the full list has no other subagent to evict", async () => {
+		// Regression: opening a background agent while the list is full would
+		// insert the new subagent at the top, then trimming evicted the first
+		// matching subagent — which was the just-added one (the only subagent),
+		// so it never showed up in recent tabs.
+		const existingTabs = Array.from({ length: 20 }, (_, i) => ({
+			type: "narrator",
+			id: `n-${i}`,
+			title: `Narrator ${i}`,
+			lastVisitedAt: 100 - i,
+		}));
+		seedRecentTabs(existingTabs);
+
+		const tabs = await upsertRecentTab({
+			type: "subagent",
+			id: "new-subagent",
+			title: "New subagent",
+			lastVisitedAt: 120,
+		});
+
+		expect(tabs).toHaveLength(20);
+		expect(tabKeys(tabs)).toContain("subagent:new-subagent");
+		// The oldest unpinned non-subagent tab is dropped instead.
+		expect(tabKeys(tabs)).not.toContain("narrator:n-19");
+	});
+
 	it("keeps workspace children attached when a workspace is revisited behind pinned tabs", async () => {
 		seedNarrator("narrator-1");
 		seedRecentTabs([

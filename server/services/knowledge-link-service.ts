@@ -9,6 +9,7 @@ import {
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import {
+	type AclCollection,
 	type AclEntry,
 	canRead,
 	type Principal,
@@ -74,6 +75,9 @@ export interface GraphResult {
 
 // Hard ceiling on graph traversal output to protect the event loop / response size.
 const MAX_GRAPH_NODES = 200;
+/** Per-hop cap on links pulled for the frontier, so a high-fan-out node can't
+ *  load an unbounded edge set into the main thread in a single hop. */
+const MAX_LINKS_PER_HOP = 1000;
 
 function nowIso(): string {
 	return new Date().toISOString();
@@ -94,6 +98,23 @@ function toEndpoint(entry: EntryRow): LinkEndpoint {
 	return { id: entry.id, title: entry.title, slug: entry.slug, collectionId: entry.collectionId };
 }
 
+/** Collection fields needed for the ACL collection gate. */
+type CollectionAclRow = Pick<
+	typeof knowledgeCollections.$inferSelect,
+	"id" | "defaultLevel" | "classificationLevel" | "controlledTagsJson" | "ownerUserId"
+>;
+
+/** Map a collection row to AclCollection with ALL gate fields (never drop to public). */
+function toAclCollection(c: CollectionAclRow): AclCollection {
+	return {
+		id: c.id,
+		defaultLevel: c.defaultLevel,
+		classificationLevel: c.classificationLevel,
+		controlledTagsJson: c.controlledTagsJson,
+		ownerUserId: c.ownerUserId,
+	};
+}
+
 /**
  * Batched readability resolver. Caches loaded entries/collections and canRead decisions so a
  * single listLinks/getGraph call never re-queries the same row. Used to enforce the rule that a
@@ -101,12 +122,12 @@ function toEndpoint(entry: EntryRow): LinkEndpoint {
  */
 class ReadResolver {
 	private entryCache = new Map<string, EntryRow | null>();
-	private defaultLevelByCol = new Map<string, string>();
+	private collectionById = new Map<string, CollectionAclRow>();
 	private readableCache = new Map<string, boolean>();
 
 	constructor(private caps: PrincipalCaps) {}
 
-	/** Preload a batch of entries + their collections' default levels in two queries. */
+	/** Preload a batch of entries + their collections (with ALL ACL gate fields) in two queries. */
 	async preload(entryIds: string[]): Promise<void> {
 		const missing = entryIds.filter((id) => !this.entryCache.has(id));
 		if (missing.length === 0) return;
@@ -118,13 +139,20 @@ class ReadResolver {
 		for (const id of missing) if (!this.entryCache.has(id)) this.entryCache.set(id, null);
 
 		const colIds = [
-			...new Set(rows.map((r) => r.collectionId).filter((c) => !this.defaultLevelByCol.has(c))),
+			...new Set(rows.map((r) => r.collectionId).filter((c) => !this.collectionById.has(c))),
 		];
 		if (colIds.length > 0) {
 			const cols = await db.query.knowledgeCollections.findMany({
 				where: inArray(knowledgeCollections.id, colIds),
+				columns: {
+					id: true,
+					defaultLevel: true,
+					classificationLevel: true,
+					controlledTagsJson: true,
+					ownerUserId: true,
+				},
 			});
-			for (const c of cols) this.defaultLevelByCol.set(c.id, c.defaultLevel);
+			for (const c of cols) this.collectionById.set(c.id, c);
 		}
 	}
 
@@ -141,11 +169,11 @@ class ReadResolver {
 			this.readableCache.set(entryId, false);
 			return false;
 		}
-		const defaultLevel = this.defaultLevelByCol.get(entry.collectionId) ?? "public";
-		const ok = await canRead(this.caps, toAclEntry(entry), {
-			id: entry.collectionId,
-			defaultLevel,
-		});
+		const col = this.collectionById.get(entry.collectionId);
+		const aclCol: AclCollection = col
+			? toAclCollection(col)
+			: { id: entry.collectionId, defaultLevel: "public" };
+		const ok = await canRead(this.caps, toAclEntry(entry), aclCol);
 		this.readableCache.set(entryId, ok);
 		return ok;
 	}
@@ -160,10 +188,10 @@ async function assertReadableEntry(caps: PrincipalCaps, entryId: string): Promis
 	const collection = await db.query.knowledgeCollections.findFirst({
 		where: eq(knowledgeCollections.id, entry.collectionId),
 	});
-	const ok = await canRead(caps, toAclEntry(entry), {
-		id: entry.collectionId,
-		defaultLevel: collection?.defaultLevel ?? "public",
-	});
+	const aclCol: AclCollection = collection
+		? toAclCollection(collection)
+		: { id: entry.collectionId, defaultLevel: "public" };
+	const ok = await canRead(caps, toAclEntry(entry), aclCol);
 	if (!ok) throw new NotFoundError("Knowledge entry", entryId);
 	return entry;
 }
@@ -334,12 +362,13 @@ async function getGraph(
 
 	for (let d = 0; d < depth && frontier.length > 0; d++) {
 		if (nodes.size >= MAX_GRAPH_NODES) break;
-		// Pull every link touching the frontier in one query.
+		// Pull every link touching the frontier in one query (bounded per hop).
 		const links = await db.query.knowledgeEntryLinks.findMany({
 			where: or(
 				inArray(knowledgeEntryLinks.fromEntryId, frontier),
 				inArray(knowledgeEntryLinks.toEntryId, frontier),
 			),
+			limit: MAX_LINKS_PER_HOP,
 		});
 		for (const id of frontier) expanded.add(id);
 

@@ -907,6 +907,12 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Clean up leftover pack extraction directories from previous server runs and mark any
+// still-"active" pack activations as released (their temp dirs don't survive a restart).
+import { packActivationService } from "./services/knowledge-pack-activation-service";
+
+packActivationService.cleanupStalePacks();
+
 // Periodically remove old per-directory skill summary caches.
 import { startSkillCacheCleanupTimer } from "./services/skill-service";
 

@@ -169,7 +169,7 @@ async function markGoalCompletionReflectionStatus(
 	try {
 		const { narratorService } = await import("@server/services/narrator-service");
 		const nextStatus = status === "running" ? "waiting" : "working";
-		const substatus = status === "running" ? ["silent_notification", "reflecting"] : [];
+		const substatus = status === "running" ? ["reflecting"] : [];
 		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
 		if (pending.broadcastTargetId !== pending.narratorId) {
 			await narratorService.updateStatus(pending.broadcastTargetId, nextStatus, { substatus });

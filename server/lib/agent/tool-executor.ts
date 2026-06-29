@@ -43,6 +43,9 @@ export interface ToolExecResult {
 
 interface ExecuteToolOptions {
 	preGrantedPermission?: AllowPermissionResult;
+	/** When true, a permission request raised for this tool must not trigger a
+	 *  user-facing attention notification (e.g. reflection-takeover fallback). */
+	suppressAttention?: boolean;
 }
 
 /** Max serialized size of tool_input passed to hooks (bytes). */
@@ -140,7 +143,9 @@ export async function executeTool(
 	const permissionStartedAt = Date.now();
 	const permission =
 		options.preGrantedPermission ??
-		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId));
+		(await config.permissionHandler(tu.name, tu.input, tu.toolUseId, {
+			suppressAttention: options.suppressAttention,
+		}));
 	if (permission.behavior === "deny") {
 		const userMessage =
 			permission.rawMessage && permission.message

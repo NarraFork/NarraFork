@@ -178,10 +178,12 @@ import {
 	getBufferedMessages,
 	interruptNarrator,
 	isCompactInProgress,
+	isLoopRunning,
 	isNarratorActive,
 	normalizeRollbackBlockIndexForMessage,
 	notifyRunningNarratorGoalStateChanged,
 	pushBufferedMessage,
+	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
 	removeBufferedMessage,
 	reorderBufferedMessages,
@@ -1063,7 +1065,14 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const modelOverride =
 		cmdResult.resolved && "command" in cmdResult ? cmdResult.command.modelOverride : undefined;
 
-	if (queuedNewCommand && !(narrator.status === "working" || narrator.status === "waiting")) {
+	// Busy = DB status says running OR a loop is actually running in memory. The
+	// in-memory check is authoritative: it catches the case where the DB status
+	// went stale to idle while the loop was still draining, which would otherwise
+	// let this message start a second concurrent loop instead of being buffered.
+	const narratorBusy =
+		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+
+	if (queuedNewCommand && !narratorBusy) {
 		const currentCwd = narrator.cwd ?? undefined;
 		const newNarrator = await narratorService.create({
 			chapterId: null,
@@ -1099,7 +1108,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	}
 
 	// Running narrator: buffer the message for execution after the current turn
-	if (narrator.status === "working" || narrator.status === "waiting") {
+	if (narratorBusy) {
 		if (isSubagentVariant(narrator.variant)) {
 			if (queuedNewCommand) {
 				throw new ValidationError("/new cannot be queued from a running subagent");
@@ -1128,6 +1137,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		}
 
 		// Primary narrator: push onto buffer queue (or unshift if priority).
+		// If the DB status was stale-idle while a loop is actually running, correct
+		// it so the user regains the interrupt button instead of being stuck.
+		await reconcileRunningStatus(id);
 		const user = await db.query.users.findFirst({
 			where: eq(users.id, userId),
 			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
@@ -1229,7 +1241,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 
 	if (
 		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting")
+		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
 	) {
 		throw new ValidationError("Cannot retry on a running subagent");
 	}
@@ -1251,7 +1263,11 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	const id = c.req.param("id");
 	const narrator = await narratorService.getById(id);
 
-	if (narrator.status === "working" || narrator.status === "waiting") {
+	// Busy = DB status running OR a loop actually running in memory (authoritative,
+	// catches a stale-idle DB status that would otherwise start a second loop).
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(id);
 		throw new ValidationError("Cannot continue while narrator is already running");
 	}
 
@@ -1276,7 +1292,9 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 	const toolUseId = c.req.param("toolUseId");
 	const narrator = await narratorService.getById(id);
 
-	if (narrator.status === "working" || narrator.status === "waiting") {
+	if (narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id)) {
+		// Correct a stale idle status so the user regains the interrupt button.
+		await reconcileRunningStatus(id);
 		throw new ValidationError("Cannot re-execute a tool call while narrator is already running");
 	}
 
@@ -1310,7 +1328,7 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 
 	if (
 		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting")
+		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
 	) {
 		throw new ValidationError("Cannot rollback on a running subagent");
 	}
@@ -1337,7 +1355,7 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 
 	if (
 		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting")
+		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
 	) {
 		throw new ValidationError("Cannot edit on a running subagent");
 	}
@@ -1375,7 +1393,7 @@ narratorRoutes.post("/:id/edit-message/:messageId", async (c) => {
 
 	if (
 		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting")
+		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
 	) {
 		throw new ValidationError("Cannot edit on a running subagent");
 	}
@@ -1399,7 +1417,7 @@ narratorRoutes.post("/:id/restore-message/:messageId", async (c) => {
 
 	if (
 		isSubagentVariant(narrator.variant) &&
-		(narrator.status === "working" || narrator.status === "waiting")
+		(narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id))
 	) {
 		throw new ValidationError("Cannot restore on a running subagent");
 	}

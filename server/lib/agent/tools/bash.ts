@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { backgroundTaskService } from "@server/services/background-task-service";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
@@ -12,6 +11,7 @@ import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
 import { buildMinimalEnv, detectShell, killTree } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
+import { createStreamDecoder } from "./encoding";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 86_400_000;
@@ -298,7 +298,7 @@ export const bashTool: ToolDefinition = {
 			let lastLiveEmitAt = 0;
 			let pendingLiveEmit = false;
 			let liveEmitTimer: ReturnType<typeof setTimeout> | null = null;
-			const decoder = new StringDecoder("utf-8");
+			const decoder = createStreamDecoder();
 			const getLiveOutputPreview = () =>
 				output.length > LIVE_OUTPUT_MAX_CHARS
 					? `...${output.length - LIVE_OUTPUT_MAX_CHARS} chars omitted...\n${output.slice(-LIVE_OUTPUT_MAX_CHARS)}`
@@ -444,6 +444,14 @@ export const bashTool: ToolDefinition = {
 				ctx.signal.removeEventListener("abort", abortHandler);
 			}
 
+			// Flush any bytes buffered inside the decoder (the legacy-encoding decoder
+			// holds back the first chunks until it can detect the charset, so short
+			// outputs may still be fully buffered at this point).
+			if (!outputTruncated) {
+				const tail = decoder.end();
+				if (tail) output += tail;
+			}
+
 			// Flush any pending live output before sending the final tool result.
 			if (pendingLiveEmit || output) flushLiveOutput();
 
@@ -580,7 +588,7 @@ async function _runInBackground(
 			const killFn = () => killTree(proc, { exited: exitedFn });
 			backgroundTaskService.registerKillHandler(taskId, () => void killFn());
 
-			const bgDecoder = new StringDecoder("utf-8");
+			const bgDecoder = createStreamDecoder();
 			const appendOutput = (chunk: Buffer) => {
 				if (outputTruncated) return;
 				const str = bgDecoder.write(chunk);
@@ -593,7 +601,7 @@ async function _runInBackground(
 					outputTruncated = true;
 					return;
 				}
-				backgroundTaskService.appendOutput(taskId, str);
+				if (str) backgroundTaskService.appendOutput(taskId, str);
 			};
 			proc.stdout?.on("data", appendOutput);
 			proc.stderr?.on("data", appendOutput);
@@ -634,6 +642,12 @@ async function _runInBackground(
 			} finally {
 				clearTimeout(timer);
 				bgAbort.signal.removeEventListener("abort", onAbort);
+			}
+
+			// Flush bytes buffered inside the decoder (see foreground path).
+			if (!outputTruncated) {
+				const tail = bgDecoder.end();
+				if (tail) backgroundTaskService.appendOutput(taskId, tail);
 			}
 
 			const exitCode = proc.exitCode ?? 1;

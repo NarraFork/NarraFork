@@ -299,6 +299,16 @@ const MAX_EMPTY_RESPONSE_RETRIES = 3;
 const REASONING_ONLY_MESSAGE =
 	"Provider returned only reasoning with no answer or tool call. Retrying.";
 
+/** Terminal message when reasoning-only retries are exhausted. Conveys how many
+ *  retries were already attempted so the failure is not mistaken for a pending retry. */
+function reasoningOnlyExhaustedMessage(retries: number): string {
+	const retryLabel = retries === 1 ? "retry" : "retries";
+	return (
+		"Provider returned only reasoning with no answer or tool call " +
+		`after ${retries} ${retryLabel}. Giving up.`
+	);
+}
+
 function dedupeToolUsesInPlace(
 	toolUses: AgentToolUse[],
 	provider: string,
@@ -1448,7 +1458,10 @@ async function executeToolAfterReflections(
 		const reflected = await resolveExitPlanModeReflection(config, history, tu);
 		if (reflected.decision.action === "manual") {
 			tu.input = reflected.input;
-			return executeTool(tu, config);
+			// User manually took over the plan reflection; the loop falls back to the
+			// normal ExitPlanMode approval. They are already driving this, so the
+			// fallback permission request must not raise a user-facing notification.
+			return executeTool(tu, config, { suppressAttention: true });
 		}
 		if (
 			reflected.decision.action !== "confirm" &&
@@ -1509,9 +1522,9 @@ export async function* agentLoop(
 	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
 	let permissionTail: Promise<void> = Promise.resolve();
-	config.permissionHandler = async (toolName, input, toolUseId) => {
+	config.permissionHandler = async (toolName, input, toolUseId, options) => {
 		const run = permissionTail.then(async () => {
-			const result = await originalPermissionHandler(toolName, input, toolUseId);
+			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
 			if (result.behavior !== "dangerReflection") return result;
 
 			return resolveDangerReflectionDecision(config, history, result, {
@@ -3455,8 +3468,9 @@ export async function* agentLoop(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						requestId,
+						retries: reasoningOnlyRetries,
 					});
-					const message = `${effectiveProvider}: ${REASONING_ONLY_MESSAGE}`;
+					const message = `${effectiveProvider}: ${reasoningOnlyExhaustedMessage(reasoningOnlyRetries)}`;
 					yield { type: "invalid_state", reason: "empty_response", message };
 					return;
 				}

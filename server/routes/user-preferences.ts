@@ -148,12 +148,27 @@ function insertTopLevelTabRespectingPins(
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
-function trimRecentTabs(tabs: Record<string, unknown>[], max: number): Record<string, unknown>[] {
+/**
+ * Trim the recent-tabs list down to `max` entries.
+ *
+ * Eviction order (least valuable first): unpinned subagents → other unpinned
+ * tabs → as a last resort, the final entry. `protectedKey` (in "type:id" form)
+ * shields a single tab from eviction — used to keep the tab the caller just
+ * upserted, so opening a fresh subagent while the list is full doesn't drop the
+ * very tab that was just added.
+ */
+function trimRecentTabs(
+	tabs: Record<string, unknown>[],
+	max: number,
+	protectedKey?: string,
+): Record<string, unknown>[] {
 	if (tabs.length <= max) return tabs;
 	const result = [...tabs];
+	const isProtected = (tab: Record<string, unknown>): boolean =>
+		protectedKey != null && `${tab.type}:${tab.id}` === protectedKey;
 	const removeFirstMatching = (predicate: (tab: Record<string, unknown>) => boolean): boolean => {
 		for (let i = result.length - 1; i >= 0; i--) {
-			if (predicate(result[i])) {
+			if (!isProtected(result[i]) && predicate(result[i])) {
 				result.splice(i, 1);
 				return true;
 			}
@@ -164,7 +179,12 @@ function trimRecentTabs(tabs: Record<string, unknown>[], max: number): Record<st
 	while (result.length > max) {
 		if (removeFirstMatching((tab) => tab.type === "subagent" && !tab.pinned)) continue;
 		if (removeFirstMatching((tab) => !tab.pinned)) continue;
-		result.pop();
+		// Last resort: drop the final entry unless it's the protected tab.
+		if (isProtected(result[result.length - 1]) && result.length > 1) {
+			result.splice(result.length - 2, 1);
+		} else {
+			result.pop();
+		}
 	}
 	return result;
 }
@@ -502,7 +522,10 @@ userPreferencesRoutes.put("/recent-tabs", async (c) => {
 				insertTopLevelTabRespectingPins(tabs as Record<string, unknown>[], tab);
 			}
 		}
-		tabs = trimRecentTabs(tabs, MAX_RECENT_TABS) as (typeof tab)[];
+		// Protect the tab we just upserted so a full list doesn't immediately
+		// evict it (subagents are evicted first, and a freshly opened subagent is
+		// often the only one in the list).
+		tabs = trimRecentTabs(tabs, MAX_RECENT_TABS, `${tab.type}:${tab.id}`) as (typeof tab)[];
 		regroupWorkspaces(tabs);
 
 		const tabsJson = JSON.stringify(tabs);

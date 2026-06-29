@@ -308,6 +308,131 @@ const emptyHookDraft: HookDraft = {
 	enabled: true,
 };
 
+// Common fields present in every hook payload.
+const HOOK_COMMON_FIELDS = [
+	["hook_event_name", "hookFieldHookEventName"],
+	["narrator_id", "hookFieldNarratorId"],
+	["chapter_id", "hookFieldChapterId"],
+	["project_id", "hookFieldProjectId"],
+	["cwd", "hookFieldCwd"],
+] as const;
+
+// Extra fields keyed by event.
+const HOOK_EVENT_FIELDS: Record<string, ReadonlyArray<readonly [string, string]>> = {
+	PreToolUse: [
+		["tool_name", "hookFieldToolName"],
+		["tool_input", "hookFieldToolInput"],
+		["tool_use_id", "hookFieldToolUseId"],
+	],
+	PostToolUse: [
+		["tool_name", "hookFieldToolName"],
+		["tool_input", "hookFieldToolInput"],
+		["tool_use_id", "hookFieldToolUseId"],
+		["tool_output", "hookFieldToolOutput"],
+		["tool_is_error", "hookFieldToolIsError"],
+	],
+	Stop: [
+		["stop_reason", "hookFieldStopReason"],
+		["stop_error", "hookFieldStopError"],
+		["last_assistant_text", "hookFieldLastAssistantText"],
+	],
+};
+
+function buildHookExample(event: string): string {
+	const base: Record<string, unknown> = {
+		hook_event_name: event,
+		narrator_id: "n_abc123",
+		chapter_id: "c_def456",
+		project_id: "p_ghi789",
+		cwd: "/home/user/project/.worktrees/feature",
+	};
+	if (event === "PreToolUse") {
+		base.tool_name = "Bash";
+		base.tool_input = { command: "ls -la", description: "List files" };
+		base.tool_use_id = "toolu_xyz";
+	} else if (event === "PostToolUse") {
+		base.tool_name = "Bash";
+		base.tool_input = { command: "ls -la" };
+		base.tool_use_id = "toolu_xyz";
+		base.tool_output = "total 24\ndrwxr-xr-x ...";
+		base.tool_is_error = false;
+	} else if (event === "Stop") {
+		base.stop_reason = "done";
+		base.stop_error = false;
+		base.last_assistant_text = "Done. I've updated the file.";
+	}
+	return JSON.stringify(base, null, 2);
+}
+
+function HookPayloadHelp({ event, type }: { event: string; type: string }) {
+	const { t } = useTranslation("routines");
+	const [opened, { toggle }] = useDisclosure(false);
+	const eventFields = HOOK_EVENT_FIELDS[event] ?? [];
+
+	return (
+		<Alert variant="light" color="gray" p="sm">
+			<Text size="xs">{type === "http" ? t("hookHttpHelp") : t("hookCommandHelp")}</Text>
+			<Button
+				variant="subtle"
+				size="compact-xs"
+				mt="xs"
+				leftSection={opened ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+				onClick={toggle}
+			>
+				{t("hookPayloadRefShow")}
+			</Button>
+			<Collapse in={opened}>
+				<Stack gap="xs" mt="xs">
+					<div>
+						<Text size="xs" fw={600} mb={4}>
+							{t("hookFieldsCommon")}
+						</Text>
+						<Stack gap={2}>
+							{HOOK_COMMON_FIELDS.map(([field, descKey]) => (
+								<Text key={field} size="xs" c="dimmed">
+									<Text span ff="monospace" c="bright">
+										{field}
+									</Text>{" "}
+									— {t(descKey)}
+								</Text>
+							))}
+						</Stack>
+					</div>
+					{eventFields.length > 0 && (
+						<div>
+							<Text size="xs" fw={600} mb={4}>
+								{t("hookFieldsEvent")}
+							</Text>
+							<Stack gap={2}>
+								{eventFields.map(([field, descKey]) => (
+									<Text key={field} size="xs" c="dimmed">
+										<Text span ff="monospace" c="bright">
+											{field}
+										</Text>{" "}
+										— {t(descKey)}
+									</Text>
+								))}
+							</Stack>
+						</div>
+					)}
+					<div>
+						<Text size="xs" fw={600} mb={4}>
+							{t("hookExampleLabel")}
+						</Text>
+						<Textarea
+							value={buildHookExample(event)}
+							readOnly
+							autosize
+							maxRows={16}
+							styles={{ input: { fontFamily: "monospace", fontSize: 11 } }}
+						/>
+					</div>
+				</Stack>
+			</Collapse>
+		</Alert>
+	);
+}
+
 function HooksTab() {
 	const { t } = useTranslation("routines");
 	const { data: hooksList, isLoading } = useHooks();
@@ -516,6 +641,8 @@ function HooksTab() {
 						value={draft.type}
 						onChange={(v) => setDraft((d) => ({ ...d, type: v ?? "command" }))}
 					/>
+
+					<HookPayloadHelp event={draft.event} type={draft.type} />
 
 					{draft.type === "command" && (
 						<TextInput
