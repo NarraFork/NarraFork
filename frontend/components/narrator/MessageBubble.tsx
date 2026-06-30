@@ -1230,6 +1230,254 @@ function BlockMenuWrapper({
 	);
 }
 
+// ---------------------------------------------------------------------------
+// SelectableSystemNotice — wraps a simple system-notice card (info /
+// goal_continuation) to give it the same affordances as content blocks:
+// right-click context menu (delete / rollback / fork / ask / compact),
+// single-select (Ctrl/Cmd+Click), range-select (Shift+Click) and mobile swipe.
+// Modeled on WebSearchBlock; it only renders the menu/selection chrome and
+// leaves the visual card to `children`.
+// ---------------------------------------------------------------------------
+let nextSnInstanceId = 0;
+function SelectableSystemNotice({
+	blockIndex,
+	messageId,
+	children,
+}: {
+	blockIndex?: number;
+	messageId?: string;
+	children: React.ReactNode;
+}) {
+	const { t } = useTranslation("narrator");
+	const { t: tc } = useTranslation("common");
+	const msgCtx = useMessageContextMenu();
+	const lod = useRenderLod();
+	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
+
+	const snInstanceId = useRef(nextSnInstanceId++);
+	const blockIdStr =
+		messageId && blockIndex != null
+			? makeMessageBlockSelectionId(messageId, blockIndex)
+			: `sn-${snInstanceId.current}`;
+	const rootRef = useRef<HTMLDivElement>(null);
+	const selection = useMessageSelection();
+
+	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
+
+	const handleDeselect = useCallback(() => {
+		selection.deselectBlock(blockIdStr);
+	}, [selection.deselectBlock, blockIdStr]);
+
+	const swipe = useSwipeMenu({
+		enabled: true,
+		externalBoxRef: rootRef,
+		excludeSelectors: [".mantine-Menu-dropdown"],
+		blockId: blockIdStr,
+		onSwipeRight: isSelected ? handleDeselect : undefined,
+	});
+
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const sel = window.getSelection();
+			if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
+			e.preventDefault();
+			e.stopPropagation();
+			const x = Math.min(e.clientX, window.innerWidth - 200);
+			const flipY = e.clientY > window.innerHeight - 300;
+			swipe.setCtxMenuPos({ x, y: e.clientY, flipY });
+			swipe.setCtxMenuOpened(true);
+		},
+		[isMobile, swipe],
+	);
+
+	const handleBlockClick = useCallback(
+		(e: React.MouseEvent) => {
+			if (isMobile) return;
+			const isModKey = e.metaKey || e.ctrlKey;
+			const isShift = e.shiftKey;
+			if (!isModKey && !isShift) return;
+			if (shouldIgnoreMessageBlockSelection(e.target)) return;
+			if (!selection.selectionMode) {
+				const sel = window.getSelection();
+				if (sel && sel.rangeCount > 0 && !sel.isCollapsed) return;
+			}
+			e.preventDefault();
+			if (isShift) {
+				window.getSelection()?.removeAllRanges();
+				selection.rangeSelectTo(blockIdStr);
+			} else {
+				selection.toggleBlock(blockIdStr);
+			}
+		},
+		[isMobile, blockIdStr, selection],
+	);
+
+	const SWIPE_REVEAL_WIDTH = 180;
+
+	const hasMenuActions = !!(
+		msgCtx.onForkFromMessage ||
+		msgCtx.onAskInPassing ||
+		msgCtx.onCompactBeforeMessage ||
+		msgCtx.onRollbackToBlock ||
+		msgCtx.onDeleteBlock
+	);
+
+	const menuItemsNode = (
+		<>
+			{hasMenuActions && (
+				<>
+					{msgCtx.onRollbackToBlock && blockIndex != null && (
+						<Menu.Item
+							leftSection={<IconArrowBackUp size={14} />}
+							onClick={() => {
+								msgCtx.onRollbackToBlock?.(blockIndex);
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_rollback")}
+						</Menu.Item>
+					)}
+					{msgCtx.onForkFromMessage && (
+						<Menu.Item
+							leftSection={<IconGitFork size={14} />}
+							onClick={() => {
+								msgCtx.onForkFromMessage?.();
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_fork")}
+						</Menu.Item>
+					)}
+					{msgCtx.onAskInPassing && (
+						<Menu.Item
+							leftSection={<IconMessageQuestion size={14} />}
+							onClick={() => {
+								msgCtx.onAskInPassing?.();
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_askInPassing")}
+						</Menu.Item>
+					)}
+					{msgCtx.onCompactBeforeMessage && (
+						<CompactMenuSub
+							onCompact={msgCtx.onCompactBeforeMessage}
+							onClearContext={msgCtx.onClearContextBefore}
+							onManualSummarize={msgCtx.onManualSummarize}
+							onClose={() => swipe.closeSwipe()}
+						/>
+					)}
+					{msgCtx.onDeleteBlock && blockIndex != null && (
+						<Menu.Item
+							color="red"
+							leftSection={<IconTrash size={14} />}
+							onClick={() => {
+								msgCtx.onDeleteBlock?.(blockIndex);
+								swipe.closeSwipe();
+							}}
+						>
+							{t("contextMenu_delete")}
+						</Menu.Item>
+					)}
+				</>
+			)}
+			<Menu.Divider />
+			<Menu.Item leftSection={<IconX size={14} />} onClick={() => swipe.closeSwipe()}>
+				{tc("cancel")}
+			</Menu.Item>
+		</>
+	);
+
+	const ctxMenu = (
+		<Menu
+			opened={swipe.ctxMenuOpened}
+			onChange={swipe.setCtxMenuOpened}
+			position="bottom-start"
+			withinPortal
+			transitionProps={FIXED_MENU_TRANSITION_PROPS}
+			styles={{
+				dropdown: {
+					position: "fixed",
+					left: swipe.ctxMenuPos.x,
+					...(swipe.ctxMenuPos.flipY
+						? { bottom: window.innerHeight - swipe.ctxMenuPos.y, top: "auto" }
+						: { top: swipe.ctxMenuPos.y }),
+				},
+			}}
+		>
+			<Menu.Target>
+				<div
+					style={{
+						position: "fixed",
+						left: swipe.ctxMenuPos.x,
+						top: swipe.ctxMenuPos.y,
+						pointerEvents: "none",
+					}}
+				/>
+			</Menu.Target>
+			<Menu.Dropdown>{menuItemsNode}</Menu.Dropdown>
+		</Menu>
+	);
+
+	const swipeMenu =
+		(swipe.swipeOffset > 0 || swipe.swipeClosing) &&
+		(() => {
+			const menuEl = swipe.swipeMenuRef.current;
+			const pos = swipe.getSwipeMenuPosition(menuEl?.offsetHeight);
+			return createPortal(
+				<Box
+					ref={swipe.swipeMenuRef}
+					style={{
+						position: "fixed",
+						left: pos.left,
+						top: pos.top,
+						transform: "translateY(-50%)",
+						zIndex: Z.popover,
+						transition: swipe.swipeMenuTransition,
+						pointerEvents: swipe.swipeClosing ? "none" : "auto",
+						opacity: swipe.swipeClosing ? 0 : 1,
+					}}
+				>
+					<Menu opened withinPortal={false} position="bottom-start">
+						<Menu.Dropdown style={{ position: "relative", width: SWIPE_REVEAL_WIDTH }}>
+							{menuItemsNode}
+						</Menu.Dropdown>
+					</Menu>
+				</Box>,
+				document.body,
+			);
+		})();
+
+	// preview LOD: render the bare card without interaction chrome.
+	if (lod === "preview") return <>{children}</>;
+
+	return (
+		<>
+			<Box
+				ref={rootRef}
+				data-content-block
+				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
+				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+				onContextMenu={handleContextMenu}
+				onClick={handleBlockClick}
+				style={{
+					outline: isSelected ? "2px solid var(--mantine-color-indigo-6)" : undefined,
+					outlineOffset: isSelected ? -2 : undefined,
+					borderRadius: isSelected ? 4 : undefined,
+					transform: swipe.swipeOffset > 0 ? `translateX(-${swipe.swipeOffset}px)` : undefined,
+					transition: swipe.swipeTransition,
+				}}
+			>
+				{children}
+			</Box>
+			{swipeMenu}
+			{ctxMenu}
+		</>
+	);
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
 	const { t } = useTranslation("narrator");
@@ -3650,19 +3898,29 @@ export const MessageBubble = memo(function MessageBubble({
 			);
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const goalBlock = blocks.find((b: any) => b.type === "goal_continuation");
+		const goalIndex = blocks.findIndex((b: any) => b.type === "goal_continuation");
+		const goalBlock = goalIndex >= 0 ? blocks[goalIndex] : undefined;
 		if (goalBlock) {
+			const goalRealIndex = message._blockOriginalIndices?.[goalIndex] ?? goalIndex;
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-teal-light)" }}>
-					<Group gap="xs" wrap="nowrap">
-						<Badge size="xs" color="teal" variant="light">
-							{t("goalContinuation")}
-						</Badge>
-						<Text size="xs" c="teal" truncate>
-							{goalBlock.objective ?? message.contentText}
-						</Text>
-					</Group>
-				</Paper>
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={goalRealIndex} messageId={message.id}>
+						<Paper
+							p="xs"
+							radius="sm"
+							style={{ backgroundColor: "var(--mantine-color-teal-light)" }}
+						>
+							<Group gap="xs" wrap="nowrap">
+								<Badge size="xs" color="teal" variant="light">
+									{t("goalContinuation")}
+								</Badge>
+								<Text size="xs" c="teal" truncate>
+									{goalBlock.objective ?? message.contentText}
+								</Text>
+							</Group>
+						</Paper>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -3678,14 +3936,20 @@ export const MessageBubble = memo(function MessageBubble({
 			);
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const infoBlock = blocks.find((b: any) => b.type === "info");
+		const infoIndex = blocks.findIndex((b: any) => b.type === "info");
+		const infoBlock = infoIndex >= 0 ? blocks[infoIndex] : undefined;
 		if (infoBlock) {
+			const infoRealIndex = message._blockOriginalIndices?.[infoIndex] ?? infoIndex;
 			return (
-				<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
-					<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
-						{infoBlock.message}
-					</Text>
-				</Paper>
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={infoRealIndex} messageId={message.id}>
+						<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
+							<Text size="xs" c="dimmed" style={{ whiteSpace: "pre-wrap" }}>
+								{infoBlock.message}
+							</Text>
+						</Paper>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 		return null;

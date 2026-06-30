@@ -1,16 +1,19 @@
 import { Box, Divider, Text } from "@mantine/core";
+import type { SideCarRecord } from "../../lib/api";
 import { BlurInOnAppear } from "./BlurInOnAppear";
 import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blur-in-ids";
 import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
 import {
 	collectSegmentTargetIds,
+	messageHasVisibleContentBlock,
 	type RenderSegment,
 	segmentMessages,
 	type ToolRunItem,
 } from "./message-segments";
 import { resolvePendingPerm } from "./narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "./narrator-panel-types";
+import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { SubagentCard } from "./SubagentCard";
 import type { ToolCallData } from "./ToolCallCard";
 import { TOOL_CARD_BG, ToolCallCard } from "./ToolCallCard";
@@ -218,6 +221,26 @@ export function renderToolRun(
 	};
 
 	const isMultiRun = items.length >= 2;
+
+	// Surface user_message side-cars (bg_agent / bg_bash / group_message /
+	// subagent_message / goal_update) attached to pure-tool source messages.
+	// Such messages have no visible content block, so they never produce a
+	// separate message segment for MessageBubble to render their side-cars.
+	// Messages that also carry visible content are rendered by MessageBubble,
+	// which already shows their user_message side-cars — skip them here to
+	// avoid duplication. Derive the unique source messages from the run items.
+	const seenSourceMsgIds = new Set<string>();
+	const userSideCars: SideCarRecord[] = [];
+	for (const item of items) {
+		const srcMsg = item.msg;
+		if (srcMsg.id && seenSourceMsgIds.has(srcMsg.id)) continue;
+		if (srcMsg.id) seenSourceMsgIds.add(srcMsg.id);
+		if (messageHasVisibleContentBlock(srcMsg)) continue;
+		for (const sc of srcMsg.sideCars ?? []) {
+			if (sc.target === "user_message") userSideCars.push(sc);
+		}
+	}
+
 	return (
 		<div
 			key={`tool-run-${runKey}`}
@@ -236,6 +259,11 @@ export function renderToolRun(
 			}}
 		>
 			{items.map((item, idx) => renderItem(item, idx, items.length))}
+			{hasVisibleSideCars(userSideCars) ? (
+				<div style={isMultiRun ? { padding: "var(--mantine-spacing-xs)" } : undefined}>
+					<SideCarNotice sideCars={userSideCars} />
+				</div>
+			) : null}
 		</div>
 	);
 }

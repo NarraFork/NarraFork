@@ -786,6 +786,9 @@
 		"sources": {
 			"silent_progress": "Progress reminder",
 			"todo_reminder": "TODO reminder",
+			"relaxed_plan": "Plan mode reminder",
+			"knowledge_base_hint": "Knowledge base hint",
+			"goal_update": "Goal update",
 			"bg_agent": "Background agent",
 			"bg_bash": "Background command",
 			"team_message": "Team message",

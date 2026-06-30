@@ -25,6 +25,9 @@ import { LazyCollapse } from "./LazyCollapse";
 const SOURCE_META: Record<string, { color: string; key: string }> = {
 	silent_progress: { color: "indigo", key: "silent_progress" },
 	todo_reminder: { color: "gray", key: "todo_reminder" },
+	relaxed_plan: { color: "gray", key: "relaxed_plan" },
+	knowledge_base_hint: { color: "teal", key: "knowledge_base_hint" },
+	goal_update: { color: "indigo", key: "goal_update" },
 	bg_agent: { color: "blue", key: "bg_agent" },
 	bg_bash: { color: "blue", key: "bg_bash" },
 	team_message: { color: "grape", key: "team_message" },

@@ -785,6 +785,9 @@
 		"sources": {
 			"silent_progress": "进度提醒",
 			"todo_reminder": "TODO 提醒",
+			"relaxed_plan": "计划模式提醒",
+			"knowledge_base_hint": "知识库提示",
+			"goal_update": "目标更新",
 			"bg_agent": "后台代理通知",
 			"bg_bash": "后台命令通知",
 			"team_message": "团队消息",

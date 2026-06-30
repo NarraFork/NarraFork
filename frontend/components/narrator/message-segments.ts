@@ -4,6 +4,7 @@
  * without any grouping / splitting logic of its own.
  */
 
+import type { SideCarRecord } from "../../lib/api";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
 
@@ -72,6 +73,19 @@ export function hasToolUse(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	return blocks.some((b: ContentBlock) => b.type === "tool_use");
+}
+
+/**
+ * True when the message has at least one visible *content* block (text, image,
+ * reasoning, etc.) and therefore yields a separate content/message segment that
+ * `MessageBubble` renders. Used by the tool-run renderer to decide whether a
+ * source message's `user_message` side-cars are already rendered elsewhere
+ * (via MessageBubble) or need to be surfaced inside the tool-run itself
+ * (pure-tool messages never reach MessageBubble).
+ */
+export function messageHasVisibleContentBlock(msg: NarratorMsg): boolean {
+	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	return blocks.some((b: ContentBlock) => isVisibleContentBlock(b));
 }
 
 /** True when every visible block is either tool_use or blank text. */
@@ -186,6 +200,11 @@ export function resolveAllToolCallsFromMsg(
 			startedAt,
 			resultMessageId:
 				(block.resultMessageId as string) ?? (tc?.resultMessageId as string) ?? undefined,
+			// Sidecar system injections attached to this tool result. The backend
+			// enriches the tool_use block with sideCars (see enrichToolUseBlocks),
+			// and the live WS path (mergeFieldsByIndex) writes sideCars onto both
+			// the block and the toolCalls row, so read block first then fall back.
+			sideCars: Array.isArray(block.sideCars) ? (block.sideCars as SideCarRecord[]) : tc?.sideCars,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_metadata: block._metadata ?? (tc as any)?._metadata,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
