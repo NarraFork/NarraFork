@@ -1765,20 +1765,36 @@ export const narratorMessageQueries = {
 	},
 
 	async dismissErrorMessage(narratorId: string, messageId: string) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
-		if (!ref) throw new NotFoundError("Message", messageId);
-
 		const msg = await db.query.narratorMessages.findFirst({
 			where: eq(narratorMessages.id, messageId),
 			columns: { role: true, contentJson: true },
 		});
+
+		// The message may already be gone (e.g. a historical "message without ref"
+		// orphan that disappeared on reload, or a double-dismiss). Treat that as an
+		// idempotent success: just clear the narrator-level error and notify, so the
+		// user never sees a spurious "Message not found" when clicking dismiss.
+		if (!msg) {
+			await db
+				.update(narrators)
+				.set({
+					errorMessage: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+				})
+				.where(eq(narrators.id, narratorId));
+			const narrator = await db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { status: true },
+			});
+			broadcastToNarrator(narratorId, {
+				type: "status_change",
+				narratorId,
+				status: narrator?.status ?? "idle",
+			});
+			return;
+		}
+
 		if (
-			!msg ||
 			msg.role !== "system" ||
 			!Array.isArray(msg.contentJson) ||
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1787,6 +1803,9 @@ export const narratorMessageQueries = {
 			throw new ValidationError("Message is not an error notice");
 		}
 
+		// Delete the ref (if any) and the orphaned message idempotently. A missing
+		// ref is NOT an error here: a non-atomic-write orphan still needs cleanup,
+		// and the user-facing dismiss must always succeed for a real error notice.
 		await db.transaction(async (tx) => {
 			await tx
 				.delete(narratorMessageRefs)

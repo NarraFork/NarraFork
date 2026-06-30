@@ -1101,26 +1101,55 @@ export const narratorPersistence = {
 				try {
 					const errText = normalizedErrorMessage ?? "Unknown error";
 					const msgId = generateId();
-					// Insert the message and its ref atomically so broadcast only
-					// fires when both are committed — prevents the message from
-					// appearing in the frontend cache without a ref, which causes
-					// "Message not found" when the user clicks dismiss after a
-					// page refresh (the ref-less message disappears on reload).
+					const contentJson = [{ type: "error", message: errText }];
+					const contentText = `[Error] ${errText}`;
+					// Insert the message and its ref atomically. We MUST use a
+					// synchronous native sqlite transaction here: bun:sqlite +
+					// Drizzle's `db.transaction(async (tx) => …)` only wraps the
+					// synchronous prefix before the first `await` in BEGIN/COMMIT,
+					// so awaited statements (the ref insert) run OUTSIDE the
+					// transaction. That left "message without ref" orphans whenever
+					// the ref insert hit a lock/error — the card showed up in the
+					// frontend (via the broadcast below) but `dismissErrorMessage`
+					// could not find the ref → "Message not found". A sync
+					// transaction commits both rows atomically.
 					await withDbRetry(
-						() =>
-							db.transaction(async (tx) => {
-								await tx.insert(narratorMessages).values({
-									id: msgId,
-									narratorId,
-									role: "system",
-									contentJson: [{ type: "error", message: errText }],
-									contentText: `[Error] ${errText}`,
-									createdAt: now,
-								});
-								await appendMessageRefTx(tx, narratorId, msgId);
-							}),
+						async () => {
+							const insertAtomic = sqlite.transaction(() => {
+								sqlite
+									.prepare(
+										`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at)
+										 VALUES (?, ?, 'system', ?, ?, ?)`,
+									)
+									.run(msgId, narratorId, JSON.stringify(contentJson), contentText, now);
+								const maxSeqRow = sqlite
+									.prepare(
+										"SELECT MAX(seq) AS maxSeq FROM narrator_message_refs WHERE narrator_id = ?",
+									)
+									.get(narratorId) as { maxSeq: number | null } | undefined;
+								const seq = (maxSeqRow?.maxSeq ?? -1) + 1;
+								const prunedRow = sqlite
+									.prepare("SELECT pruned_percent AS prunedPercent FROM narrators WHERE id = ?")
+									.get(narratorId) as { prunedPercent: number | null } | undefined;
+								sqlite
+									.prepare(
+										`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact, pruned_percent)
+										 VALUES (?, ?, ?, ?, 0, ?)`,
+									)
+									.run(generateId(), narratorId, msgId, seq, prunedRow?.prunedPercent ?? null);
+								sqlite
+									.prepare(
+										"UPDATE narrators SET message_version = message_version + 1 WHERE id = ?",
+									)
+									.run(narratorId);
+							});
+							insertAtomic();
+						},
 						{ label: "persistErrorSystemMessage", maxRetries: 5 },
 					);
+					// Broadcast only after the transaction has committed, so a
+					// visible error card always has a backing ref the user can
+					// dismiss.
 					broadcastToNarrator(narratorId, {
 						type: "message",
 						narratorId,
@@ -1128,8 +1157,8 @@ export const narratorPersistence = {
 							id: msgId,
 							narratorId,
 							role: "system",
-							contentJson: [{ type: "error", message: errText }],
-							contentText: `[Error] ${errText}`,
+							contentJson,
+							contentText,
 							createdAt: now,
 							children: [],
 						},
