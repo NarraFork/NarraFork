@@ -49,6 +49,7 @@ import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
+import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
@@ -149,6 +150,12 @@ app.post("/api/gateway/webhook", async (c) => {
 
 // Public: NUG OAuth callback (state-verified, no JWT — browser redirect from external provider)
 app.get("/api/nug/oauth/callback", handleNugOAuthCallback);
+
+// Public: SSO/OIDC. The callback is a browser redirect from the IdP (no JWT);
+// /providers, /:id/start and /exchange are public; /:id/link/start guards itself
+// with an inline requireAuth. All must be mounted before the global auth gate.
+app.get("/api/auth/sso/callback", handleSsoCallback);
+app.route("/api/auth/sso", ssoRoutes);
 
 // All routes below require authentication
 app.use("/api/*", requireAuth);

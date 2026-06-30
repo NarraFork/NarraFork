@@ -1,3 +1,4 @@
+import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import QRCode from "qrcode";
@@ -13,6 +14,11 @@ import { deleteAvatarImage, saveAvatarImage } from "../lib/uploads";
 import {
 	loginSchema,
 	mfaVerifySchema,
+	passkeyLoginOptionsSchema,
+	passkeyLoginVerifySchema,
+	passkeyMfaVerifySchema,
+	passkeyRegisterSchema,
+	passkeyRenameSchema,
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,
@@ -20,6 +26,8 @@ import {
 } from "../lib/validators";
 import { requireAuth } from "../middleware/auth";
 import { mfaService } from "../services/mfa-service";
+import { passkeyService } from "../services/passkey-service";
+import { ssoService } from "../services/sso-service";
 
 export const authRoutes = new Hono();
 
@@ -102,6 +110,98 @@ function clientIp(c: Context): string {
 	);
 }
 
+// === Passkey login (usernameless / passwordless) ===
+
+/** Issue authentication options for a discoverable-credential (usernameless) login. */
+authRoutes.post("/passkey/login/options", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = passkeyLoginOptionsSchema.safeParse(body);
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	// Usernameless: no allowCredentials, the authenticator picks the credential.
+	const options = await passkeyService.authenticationOptions({
+		userId: null,
+		originHeader: c.req.header("origin"),
+	});
+	return c.json(options);
+});
+
+/** Complete a passwordless passkey login and establish a session. */
+authRoutes.post("/passkey/login/verify", async (c) => {
+	const parsed = passkeyLoginVerifySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const result = await passkeyService.verifyAuthentication({
+		response: parsed.data.response as unknown as AuthenticationResponseJSON,
+		expectedUserId: null,
+		originHeader: c.req.header("origin"),
+	});
+	if (!result.ok || !result.userId) {
+		throw new AppError("Passkey authentication failed", 401, "PASSKEY_AUTH_FAILED");
+	}
+	const session = await buildSessionResult(result.userId);
+	return c.json(session);
+});
+
+// === Passkey as a second factor (after password) ===
+
+/** Issue authentication options for the passkey second-factor step. */
+authRoutes.post("/mfa/passkey/options", async (c) => {
+	const body = (await c.req.json().catch(() => ({}))) as { mfaToken?: string };
+	if (!body.mfaToken) throw new ValidationError("mfaToken is required");
+	const challenge = await verifyMfaToken(body.mfaToken);
+	if (!challenge) {
+		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
+	}
+	if (checkMfaLock(challenge.sub).locked) {
+		invalidateMfaToken(challenge);
+		throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+	}
+	const options = await passkeyService.authenticationOptions({
+		userId: challenge.sub,
+		originHeader: c.req.header("origin"),
+	});
+	return c.json(options);
+});
+
+/** Verify the passkey second factor and establish a session. */
+authRoutes.post("/mfa/passkey/verify", async (c) => {
+	const parsed = passkeyMfaVerifySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const challenge = await verifyMfaToken(parsed.data.mfaToken);
+	if (!challenge) {
+		throw new AppError("Invalid or expired verification session", 401, "MFA_TOKEN_INVALID");
+	}
+	const userId = challenge.sub;
+	if (checkMfaLock(userId).locked) {
+		invalidateMfaToken(challenge);
+		throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+	}
+
+	const result = await passkeyService.verifyAuthentication({
+		response: parsed.data.response as unknown as AuthenticationResponseJSON,
+		expectedUserId: userId,
+		originHeader: c.req.header("origin"),
+	});
+	if (!result.ok) {
+		const after = recordMfaFailure(userId);
+		logger.warn("Failed passkey MFA verification attempt", {
+			userId,
+			ip: clientIp(c),
+			remaining: after.remaining,
+			locked: after.locked,
+		});
+		if (after.locked) {
+			invalidateMfaToken(challenge);
+			throw new AppError("Too many attempts. Please try again later.", 429, "MFA_LOCKED");
+		}
+		throw new AppError("Passkey authentication failed", 401, "PASSKEY_AUTH_FAILED");
+	}
+
+	consumeMfaToken(challenge);
+	clearMfaFailures(userId);
+	const session = await buildSessionResult(userId);
+	return c.json(session);
+});
+
 authRoutes.get("/me", requireAuth, async (c) => {
 	const payload = c.get("user");
 	const user = await db.query.users.findFirst({
@@ -164,8 +264,11 @@ authRoutes.delete("/me/avatar", requireAuth, async (c) => {
 /** Current MFA status for the security settings page. */
 authRoutes.get("/me/security", requireAuth, async (c) => {
 	const payload = c.get("user");
-	const status = await mfaService.getStatus(payload.sub);
-	return c.json(status);
+	const [status, passkeys] = await Promise.all([
+		mfaService.getStatus(payload.sub),
+		passkeyService.list(payload.sub),
+	]);
+	return c.json({ ...status, passkeyCount: passkeys.length });
 });
 
 /**
@@ -243,5 +346,90 @@ authRoutes.delete("/me/totp", requireAuth, async (c) => {
 
 	await mfaService.disable(payload.sub);
 	logger.info("TOTP disabled", { userId: payload.sub });
+	return c.json({ ok: true });
+});
+
+// === Passkey management (authenticated) ===
+
+/** List the current user's registered passkeys. */
+authRoutes.get("/me/passkeys", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const passkeys = await passkeyService.list(payload.sub);
+	return c.json({ passkeys });
+});
+
+/** Issue registration options for adding a new passkey. */
+authRoutes.post("/me/passkeys/register/options", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, payload.sub),
+		columns: { username: true },
+	});
+	if (!user) throw new AppError("User not found", 404, "NOT_FOUND");
+	const options = await passkeyService.registrationOptions({
+		userId: payload.sub,
+		username: user.username,
+		originHeader: c.req.header("origin"),
+	});
+	return c.json(options);
+});
+
+/** Verify a registration response and store the new passkey. */
+authRoutes.post("/me/passkeys/register/verify", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const parsed = passkeyRegisterSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const result = await passkeyService.verifyRegistration({
+		userId: payload.sub,
+		response: parsed.data.response as unknown as RegistrationResponseJSON,
+		name: parsed.data.name,
+		originHeader: c.req.header("origin"),
+	});
+	if (!result.ok) {
+		throw new AppError("Passkey registration failed", 400, "PASSKEY_REGISTER_FAILED");
+	}
+	return c.json({ ok: true });
+});
+
+/** Rename a passkey. */
+authRoutes.patch("/me/passkeys/:id", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const id = c.req.param("id");
+	if (!id) throw new ValidationError("Passkey id is required");
+	const parsed = passkeyRenameSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+	const ok = await passkeyService.rename(payload.sub, id, parsed.data.name);
+	if (!ok) throw new AppError("Passkey not found", 404, "NOT_FOUND");
+	return c.json({ ok: true });
+});
+
+/** Delete a passkey. */
+authRoutes.delete("/me/passkeys/:id", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const id = c.req.param("id");
+	if (!id) throw new ValidationError("Passkey id is required");
+	const ok = await passkeyService.remove(payload.sub, id);
+	if (!ok) throw new AppError("Passkey not found", 404, "NOT_FOUND");
+	logger.info("Passkey removed", { userId: payload.sub });
+	return c.json({ ok: true });
+});
+
+// === Linked SSO identities (authenticated) ===
+
+/** List the current user's linked SSO identities. */
+authRoutes.get("/me/identities", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const identities = await ssoService.listIdentities(payload.sub);
+	return c.json({ identities });
+});
+
+/** Unlink an SSO identity from the current user. */
+authRoutes.delete("/me/identities/:id", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const id = c.req.param("id");
+	if (!id) throw new ValidationError("Identity id is required");
+	const ok = await ssoService.unlink(payload.sub, id);
+	if (!ok) throw new AppError("Identity not found", 404, "NOT_FOUND");
+	logger.info("SSO identity unlinked", { userId: payload.sub });
 	return c.json({ ok: true });
 });

@@ -28,11 +28,18 @@ export const api = {
 };
 
 export {
+	type AdminAuthConfig,
+	type AdminOidcProvider,
+	type AdminWebauthnConfig,
 	isMfaChallenge,
+	isPasskeySupported,
 	type LoginResult,
 	type LoginSession,
 	type MfaChallenge,
 	type MfaStatus,
+	type PasskeySummary,
+	type SsoIdentity,
+	type SsoProvider,
 	type TotpSetupResult,
 } from "./auth";
 export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";

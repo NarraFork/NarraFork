@@ -18,6 +18,7 @@ import {
 	IconCpu,
 	IconDatabase,
 	IconInfoCircle,
+	IconKey,
 	IconMessageCircle,
 	IconPalette,
 	IconPlayerPlay,
@@ -57,6 +58,7 @@ const ADMIN_PATHS = new Set([
 	"/settings/proxy",
 	"/settings/chapters",
 	"/settings/server",
+	"/settings/authentication",
 	"/settings/users",
 	"/settings/terminals",
 	"/settings/storage",
@@ -109,6 +111,11 @@ function SettingsLayout() {
 			icon: <IconBox size={18} />,
 		},
 		{ to: "/settings/server", label: t("serverAndSystemSection"), icon: <IconServer size={18} /> },
+		{
+			to: "/settings/authentication",
+			label: t("authenticationSection"),
+			icon: <IconKey size={18} />,
+		},
 		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={18} /> },
 		{
 			to: "/settings/terminals",

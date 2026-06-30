@@ -70,3 +70,82 @@ export const totpDisableSchema = z
 	.refine((d) => !!d.code || !!d.password, {
 		message: "A current code or your password is required",
 	});
+
+// === Passkey / WebAuthn ===
+
+/**
+ * The browser's WebAuthn response is a complex nested structure that the
+ * @simplewebauthn/server library validates strictly during verification, so the
+ * route layer only needs to confirm it is a non-null object.
+ */
+const webauthnResponseSchema = z.record(z.string(), z.unknown());
+
+/** Persist + name a freshly registered passkey. */
+export const passkeyRegisterSchema = z.object({
+	response: webauthnResponseSchema,
+	name: z.string().trim().max(60).optional(),
+});
+
+/** Usernameless passkey login: ask for options, optionally hinting a username. */
+export const passkeyLoginOptionsSchema = z.object({
+	username: z.string().trim().min(1).max(50).optional(),
+});
+
+/** Complete a usernameless passkey login. */
+export const passkeyLoginVerifySchema = z.object({
+	response: webauthnResponseSchema,
+});
+
+/** Complete a passkey second-factor step (after password). */
+export const passkeyMfaVerifySchema = z.object({
+	mfaToken: z.string().min(1),
+	response: webauthnResponseSchema,
+});
+
+/** Rename a passkey. */
+export const passkeyRenameSchema = z.object({
+	name: z.string().trim().min(1).max(60),
+});
+
+// === SSO / OIDC ===
+
+/** Exchange a single-use SSO code (from the callback redirect) for a session. */
+export const oidcExchangeSchema = z.object({
+	code: z.string().min(1).max(256),
+});
+
+// === Admin: instance auth configuration (OIDC providers + WebAuthn) ===
+
+/** A provider id usable as a stable key and URL path segment. */
+const providerIdSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(40)
+	.regex(/^[a-z0-9][a-z0-9_-]*$/, "Lowercase letters, digits, hyphens and underscores only");
+
+/** One OIDC provider as submitted by the admin UI. */
+export const oidcProviderInputSchema = z.object({
+	id: providerIdSchema,
+	name: z.string().trim().min(1).max(80),
+	issuer: z.string().trim().url().max(512),
+	clientId: z.string().trim().min(1).max(256),
+	// Optional on update: empty or a masked value means "keep the stored secret".
+	clientSecret: z.string().max(512).optional(),
+	scopes: z.array(z.string().trim().min(1).max(64)).max(20).optional(),
+	allowSignup: z.boolean().optional(),
+	allowedEmailDomains: z.array(z.string().trim().min(1).max(253)).max(50).optional(),
+	enabled: z.boolean().optional(),
+});
+
+/** Full admin auth-config payload. */
+export const adminAuthConfigSchema = z.object({
+	oidcProviders: z.array(oidcProviderInputSchema).max(20),
+	webauthn: z
+		.object({
+			rpID: z.string().trim().max(253).optional(),
+			rpName: z.string().trim().max(80).optional(),
+			origins: z.array(z.string().trim().url().max(512)).max(20).optional(),
+		})
+		.optional(),
+});

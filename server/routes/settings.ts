@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMeta } from "../lib/agent";
 import { resolveProviderAndModel } from "../lib/agent/provider";
+import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { getCodexManager } from "../lib/codex-manager";
 import {
 	getAllCustomApiCachedQuotas,
@@ -473,9 +474,7 @@ export const settingsRoutes = new Hono();
 
 /** Mask an API key for safe display (show last 4 chars). */
 function maskApiKey(key?: string): string {
-	if (!key) return "";
-	if (key.length <= 4) return "*".repeat(key.length);
-	return `${"*".repeat(8)}${key.slice(-4)}`;
+	return maskSecret(key);
 }
 
 function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["vnet"] {
@@ -590,7 +589,7 @@ function buildSettingsResponse(
 					}
 				: undefined,
 		},
-		auth: { ...source.auth, jwtSecret: undefined },
+		auth: maskAuthSettings(source.auth),
 		// Multi-provider — mask all keys
 		customApiProviders: (source.customApiProviders ?? []).map((p) => ({
 			...p,

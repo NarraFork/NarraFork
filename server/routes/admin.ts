@@ -2,10 +2,16 @@ import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
+import { isMaskedSecret, maskAuthSettings } from "../lib/auth-settings";
 import { AppError, formatZodError } from "../lib/errors";
 import { getEventLoopLagSnapshot } from "../lib/event-loop-monitor";
 import { saveSettings, settings } from "../lib/settings";
-import { adminUpdateSettingsSchema, adminUpdateUserSchema } from "../lib/validators";
+import type { OidcProviderConfig } from "../lib/settings/types";
+import {
+	adminAuthConfigSchema,
+	adminUpdateSettingsSchema,
+	adminUpdateUserSchema,
+} from "../lib/validators";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
 import { terminalService } from "../services/terminal-service";
@@ -132,6 +138,66 @@ adminRoutes.patch("/settings", async (c) => {
 	current.auth.registrationOpen = parsed.data.registrationOpen;
 	saveSettings(current);
 	return c.json({ registrationOpen: current.auth.registrationOpen });
+});
+
+// === Instance auth configuration (OIDC providers + WebAuthn) ===
+
+/** Admin: read the instance SSO/WebAuthn config (client secrets masked). */
+adminRoutes.get("/auth-config", (c) => {
+	const masked = maskAuthSettings(settings.auth);
+	return c.json({
+		oidcProviders: masked.oidcProviders ?? [],
+		webauthn: masked.webauthn ?? null,
+	});
+});
+
+/** Admin: replace the instance SSO/WebAuthn config. */
+adminRoutes.patch("/auth-config", async (c) => {
+	const parsed = adminAuthConfigSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
+
+	// Reject duplicate provider ids.
+	const ids = parsed.data.oidcProviders.map((p) => p.id);
+	if (new Set(ids).size !== ids.length) {
+		throw new AppError("Duplicate SSO provider id", 400, "DUPLICATE_PROVIDER_ID");
+	}
+
+	const current = settings;
+	const existingById = new Map((current.auth.oidcProviders ?? []).map((p) => [p.id, p]));
+
+	const providers: OidcProviderConfig[] = parsed.data.oidcProviders.map((p) => {
+		// Preserve the stored secret when the UI sends an empty or masked value.
+		const clientSecret = isMaskedSecret(p.clientSecret)
+			? (existingById.get(p.id)?.clientSecret ?? "")
+			: (p.clientSecret as string);
+		return {
+			id: p.id,
+			name: p.name,
+			issuer: p.issuer,
+			clientId: p.clientId,
+			clientSecret,
+			scopes: p.scopes,
+			allowSignup: p.allowSignup,
+			allowedEmailDomains: p.allowedEmailDomains,
+			enabled: p.enabled,
+		};
+	});
+
+	current.auth.oidcProviders = providers;
+	current.auth.webauthn = parsed.data.webauthn
+		? {
+				rpID: parsed.data.webauthn.rpID || undefined,
+				rpName: parsed.data.webauthn.rpName || undefined,
+				origins: parsed.data.webauthn.origins,
+			}
+		: undefined;
+	saveSettings(current);
+
+	const masked = maskAuthSettings(current.auth);
+	return c.json({
+		oidcProviders: masked.oidcProviders ?? [],
+		webauthn: masked.webauthn ?? null,
+	});
 });
 
 // === Terminal Management ===

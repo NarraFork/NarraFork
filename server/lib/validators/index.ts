@@ -1,10 +1,18 @@
 // Barrel re-export — keeps `import { … } from "@server/lib/validators"` working.
 
 export {
+	adminAuthConfigSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	loginSchema,
 	mfaVerifySchema,
+	oidcExchangeSchema,
+	oidcProviderInputSchema,
+	passkeyLoginOptionsSchema,
+	passkeyLoginVerifySchema,
+	passkeyMfaVerifySchema,
+	passkeyRegisterSchema,
+	passkeyRenameSchema,
 	registerSchema,
 	totpActivateSchema,
 	totpDisableSchema,

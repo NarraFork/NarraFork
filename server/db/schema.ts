@@ -742,6 +742,94 @@ export const userMfaBackupCodes = sqliteTable(
 	(table) => [index("idx_mfa_backup_codes_user").on(table.userId)],
 );
 
+// === user_passkeys (WebAuthn credentials) ===
+// One row per registered authenticator (passkey/security key). A user may have
+// many. credentialId is the base64url credential ID (unique); publicKey is the
+// base64url-encoded COSE public key; counter is the signature counter used to
+// detect cloned authenticators.
+export const userPasskeys = sqliteTable(
+	"user_passkeys",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** base64url credential ID returned by the authenticator. */
+		credentialId: text("credential_id").notNull(),
+		/** base64url-encoded COSE public key. */
+		publicKey: text("public_key").notNull(),
+		/** Signature counter (clone-detection). */
+		counter: integer("counter").notNull().default(0),
+		/** JSON string[] of transports (e.g. ["internal","hybrid"]). */
+		transports: text("transports", { mode: "json" }).$type<string[]>(),
+		/** "singleDevice" | "multiDevice" — whether the credential is backed up/syncable. */
+		deviceType: text("device_type"),
+		backedUp: integer("backed_up", { mode: "boolean" }).notNull().default(false),
+		/** User-friendly label (e.g. "MacBook Touch ID"). */
+		name: text("name"),
+		lastUsedAt: text("last_used_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_passkeys_credential").on(table.credentialId),
+		index("idx_passkeys_user").on(table.userId),
+	],
+);
+
+// === webauthn_challenges (short-lived registration/authentication challenges) ===
+// A WebAuthn ceremony is two round-trips: the server issues options (with a
+// random challenge) and later verifies the authenticator's response against
+// that exact challenge. We persist the pending challenge here between the two
+// calls. userId is null for usernameless (discoverable-credential) login, where
+// the user is only known after verification. Rows are single-use and expire.
+export const webauthnChallenges = sqliteTable(
+	"webauthn_challenges",
+	{
+		id: text("id").primaryKey(),
+		/** The base64url challenge string echoed back by the authenticator. */
+		challenge: text("challenge").notNull(),
+		/** "registration" | "authentication". */
+		type: text("type", { enum: ["registration", "authentication"] }).notNull(),
+		/** Known user for registration / 2FA; null for usernameless login. */
+		userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+		/** Epoch ms after which the challenge is invalid. */
+		expiresAt: integer("expires_at").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_webauthn_challenge").on(table.challenge),
+		index("idx_webauthn_challenge_expires").on(table.expiresAt),
+	],
+);
+
+// === user_identities (federated SSO / OIDC identity links) ===
+// Maps an external identity provider's subject to a local user. A user may link
+// several providers; each (provider, subject) pair maps to exactly one user.
+// `provider` is the configured OIDC provider id (settings.auth.oidcProviders[].id).
+export const userIdentities = sqliteTable(
+	"user_identities",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** Configured provider id (settings.auth.oidcProviders[].id). */
+		provider: text("provider").notNull(),
+		/** Stable subject claim ("sub") from the provider's id_token. */
+		subject: text("subject").notNull(),
+		/** Email claim at link time (informational; not an identity key). */
+		email: text("email"),
+		/** Display name claim at link time. */
+		displayName: text("display_name"),
+		lastLoginAt: text("last_login_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_user_identities_provider_subject").on(table.provider, table.subject),
+		index("idx_user_identities_user").on(table.userId),
+	],
+);
+
 // === user_favorite_directories ===
 export const userFavoriteDirectories = sqliteTable(
 	"user_favorite_directories",

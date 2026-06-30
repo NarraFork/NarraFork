@@ -1,4 +1,5 @@
 import {
+	ActionIcon,
 	Alert,
 	Badge,
 	Box,
@@ -17,21 +18,45 @@ import {
 	Stack,
 	Stepper,
 	Text,
+	TextInput,
 	Title,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconCheck, IconCopy, IconDownload, IconShieldLock } from "@tabler/icons-react";
+import {
+	IconCheck,
+	IconCopy,
+	IconDownload,
+	IconFingerprint,
+	IconKey,
+	IconPencil,
+	IconShieldLock,
+	IconTrash,
+} from "@tabler/icons-react";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import {
+	useDeletePasskey,
+	useIdentities,
+	usePasskeys,
+	useRegisterPasskey,
+	useRenamePasskey,
 	useSecurityStatus,
+	useSsoProviders,
 	useTotpActivate,
 	useTotpDisable,
 	useTotpSetup,
+	useUnlinkIdentity,
 } from "../../hooks/useAuth";
-import type { TotpSetupResult } from "../../lib/api/auth";
+import { api } from "../../lib/api";
+import {
+	isPasskeySupported,
+	isUserCancelledWebAuthn,
+	type PasskeySummary,
+	type SsoIdentity,
+	type TotpSetupResult,
+} from "../../lib/api/auth";
 
 export const Route = createFileRoute("/settings/security")({
 	component: SettingsSecurityPage,
@@ -82,6 +107,10 @@ function SettingsSecurityPage() {
 					)}
 				</Group>
 			</Card>
+
+			<PasskeySection />
+
+			<IdentitiesSection />
 
 			{enrolling && <EnrollModal onClose={() => setEnrolling(false)} />}
 		</Stack>
@@ -350,4 +379,275 @@ function downloadBackupCodes(codes: string[]) {
 	a.download = "narrafork-backup-codes.txt";
 	a.click();
 	URL.revokeObjectURL(url);
+}
+
+/** SSO identity management: link new providers, list and unlink existing ones. */
+function IdentitiesSection() {
+	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
+	const { data: providersData } = useSsoProviders();
+	const { data: identitiesData, isLoading } = useIdentities();
+	const unlink = useUnlinkIdentity();
+	const [linkingId, setLinkingId] = useState<string | null>(null);
+
+	const providers = providersData?.providers ?? [];
+	const identities = identitiesData?.identities ?? [];
+
+	// SSO is only relevant when at least one provider is configured.
+	if (providers.length === 0) return null;
+
+	const providerName = (id: string) => providers.find((p) => p.id === id)?.name ?? id;
+
+	const handleLink = async (providerId: string) => {
+		setLinkingId(providerId);
+		try {
+			const { authorizeUrl } = await api.ssoLinkStart(providerId);
+			// Navigate to the IdP; the callback returns to /settings/security.
+			window.location.href = authorizeUrl;
+		} catch (e) {
+			setLinkingId(null);
+			notifications.show({
+				color: "red",
+				message: (e as { message?: string })?.message || t("ssoLinkFailed"),
+			});
+		}
+	};
+
+	const handleUnlink = async (identity: SsoIdentity) => {
+		if (await confirm({ message: t("ssoUnlinkConfirm"), confirmColor: "red" })) {
+			unlink.mutate(identity.id);
+		}
+	};
+
+	return (
+		<Card withBorder padding="lg">
+			<Group wrap="nowrap" align="flex-start">
+				<IconKey size={28} />
+				<Box style={{ flex: 1 }}>
+					<Text fw={600}>{t("ssoTitle")}</Text>
+					<Text size="sm" c="dimmed" mt={4} maw={520}>
+						{t("ssoDescription")}
+					</Text>
+
+					{isLoading ? (
+						<Loader size="sm" mt="md" />
+					) : (
+						<Stack gap="xs" mt="md">
+							{providers.map((p) => {
+								const linked = identities.filter((i) => i.provider === p.id);
+								if (linked.length > 0) {
+									return linked.map((identity) => (
+										<Group key={identity.id} justify="space-between" wrap="nowrap">
+											<Box>
+												<Text size="sm">{p.name}</Text>
+												<Text size="xs" c="dimmed">
+													{identity.email || identity.displayName || t("ssoLinked")}
+												</Text>
+											</Box>
+											<Button
+												size="compact-sm"
+												variant="subtle"
+												color="red"
+												onClick={() => handleUnlink(identity)}
+											>
+												{t("ssoUnlink")}
+											</Button>
+										</Group>
+									));
+								}
+								return (
+									<Group key={p.id} justify="space-between" wrap="nowrap">
+										<Text size="sm">{p.name}</Text>
+										<Button
+											size="compact-sm"
+											variant="light"
+											loading={linkingId === p.id}
+											onClick={() => handleLink(p.id)}
+										>
+											{t("ssoLink")}
+										</Button>
+									</Group>
+								);
+							})}
+							{/* Identities whose provider is no longer configured. */}
+							{identities
+								.filter((i) => !providers.some((p) => p.id === i.provider))
+								.map((identity) => (
+									<Group key={identity.id} justify="space-between" wrap="nowrap">
+										<Box>
+											<Text size="sm">{providerName(identity.provider)}</Text>
+											<Text size="xs" c="dimmed">
+												{identity.email || t("ssoLinked")}
+											</Text>
+										</Box>
+										<Button
+											size="compact-sm"
+											variant="subtle"
+											color="red"
+											onClick={() => handleUnlink(identity)}
+										>
+											{t("ssoUnlink")}
+										</Button>
+									</Group>
+								))}
+						</Stack>
+					)}
+				</Box>
+			</Group>
+		</Card>
+	);
+}
+
+/** Passkey management: list, register, rename, delete. */
+function PasskeySection() {
+	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
+	const supported = isPasskeySupported();
+	const { data, isLoading } = usePasskeys();
+	const register = useRegisterPasskey();
+	const renameMut = useRenamePasskey();
+	const removeMut = useDeletePasskey();
+	const [error, setError] = useState("");
+	// Rename dialog state (replaces window.prompt for design-system consistency).
+	const [renaming, setRenaming] = useState<PasskeySummary | null>(null);
+	const [renameValue, setRenameValue] = useState("");
+
+	const passkeys = data?.passkeys ?? [];
+
+	const handleRegister = async () => {
+		setError("");
+		try {
+			await register.mutateAsync(undefined);
+			notifications.show({ color: "green", message: t("passkeyAddedSuccess") });
+		} catch (e) {
+			// User cancelled the browser prompt — not an error worth surfacing.
+			if (isUserCancelledWebAuthn(e)) return;
+			setError((e as { message?: string })?.message || t("passkeyAddFailed"));
+		}
+	};
+
+	const openRename = (pk: PasskeySummary) => {
+		setRenaming(pk);
+		setRenameValue(pk.name ?? "");
+	};
+
+	const submitRename = () => {
+		const name = renameValue.trim();
+		if (renaming && name) {
+			renameMut.mutate({ id: renaming.id, name });
+		}
+		setRenaming(null);
+	};
+
+	const handleDelete = async (pk: PasskeySummary) => {
+		if (await confirm({ message: t("passkeyDeleteConfirm"), confirmColor: "red" })) {
+			removeMut.mutate(pk.id);
+		}
+	};
+
+	return (
+		<Card withBorder padding="lg">
+			<Group justify="space-between" wrap="nowrap" align="flex-start">
+				<Group wrap="nowrap" align="flex-start">
+					<IconFingerprint size={28} />
+					<Box>
+						<Text fw={600}>{t("passkeyTitle")}</Text>
+						<Text size="sm" c="dimmed" mt={4} maw={520}>
+							{t("passkeyDescription")}
+						</Text>
+					</Box>
+				</Group>
+				<Button
+					onClick={handleRegister}
+					loading={register.isPending}
+					disabled={!supported}
+					title={!supported ? t("passkeyUnsupported") : undefined}
+				>
+					{t("passkeyAdd")}
+				</Button>
+			</Group>
+
+			{!supported && (
+				<Alert color="yellow" variant="light" mt="md">
+					{t("passkeyUnsupported")}
+				</Alert>
+			)}
+			{error && (
+				<Alert color="red" mt="md">
+					{error}
+				</Alert>
+			)}
+
+			{isLoading ? (
+				<Loader size="sm" mt="md" />
+			) : passkeys.length > 0 ? (
+				<Stack gap="xs" mt="md">
+					{passkeys.map((pk) => (
+						<Group key={pk.id} justify="space-between" wrap="nowrap">
+							<Box>
+								<Text size="sm">{pk.name || t("passkeyUnnamed")}</Text>
+								<Text size="xs" c="dimmed">
+									{t("passkeyAddedOn", { date: pk.createdAt.slice(0, 10) })}
+									{pk.lastUsedAt
+										? ` · ${t("passkeyLastUsed", { date: pk.lastUsedAt.slice(0, 10) })}`
+										: ""}
+								</Text>
+							</Box>
+							<Group gap={4} wrap="nowrap">
+								<ActionIcon
+									variant="subtle"
+									color="gray"
+									onClick={() => openRename(pk)}
+									aria-label={t("rename")}
+								>
+									<IconPencil size={16} />
+								</ActionIcon>
+								<ActionIcon
+									variant="subtle"
+									color="red"
+									onClick={() => handleDelete(pk)}
+									aria-label={t("delete")}
+								>
+									<IconTrash size={16} />
+								</ActionIcon>
+							</Group>
+						</Group>
+					))}
+				</Stack>
+			) : (
+				<Text size="sm" c="dimmed" mt="md">
+					{t("passkeyNone")}
+				</Text>
+			)}
+
+			<Modal
+				opened={renaming !== null}
+				onClose={() => setRenaming(null)}
+				title={t("passkeyRenameTitle")}
+				size="md"
+			>
+				<Stack>
+					<TextInput
+						label={t("passkeyName")}
+						value={renameValue}
+						onChange={(e) => setRenameValue(e.currentTarget.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter") submitRename();
+						}}
+						maxLength={60}
+						data-autofocus
+						autoFocus
+					/>
+					<Group justify="flex-end">
+						<Button variant="default" onClick={() => setRenaming(null)}>
+							{t("cancel")}
+						</Button>
+						<Button onClick={submitRename} disabled={!renameValue.trim()}>
+							{t("save")}
+						</Button>
+					</Group>
+				</Stack>
+			</Modal>
+		</Card>
+	);
 }

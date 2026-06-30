@@ -9,6 +9,7 @@ import {
 	IconCpu,
 	IconDatabase,
 	IconInfoCircle,
+	IconKey,
 	IconPalette,
 	IconPlayerPlay,
 	IconReceipt2,
@@ -83,6 +84,11 @@ function MobileSettingsNav() {
 			to: "/settings/server",
 			label: t("serverAndSystemSection"),
 			icon: <IconServer size={20} />,
+		},
+		{
+			to: "/settings/authentication",
+			label: t("authenticationSection"),
+			icon: <IconKey size={20} />,
 		},
 		{ to: "/settings/users", label: t("usersSection"), icon: <IconUsers size={20} /> },
 		{

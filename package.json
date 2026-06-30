@@ -17,6 +17,8 @@
 		"@modelcontextprotocol/sdk": "^1.29.0",
 		"@mozilla/readability": "^0.6.0",
 		"@parcel/watcher": "^2.5.6",
+		"@simplewebauthn/browser": "^13.3.0",
+		"@simplewebauthn/server": "^13.3.2",
 		"@slack/bolt": "^4.7.0",
 		"@tabler/icons-react": "^3.41.1",
 		"@tanstack/react-query": "^5.99.2",

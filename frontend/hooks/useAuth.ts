@@ -149,3 +149,124 @@ export function useTotpDisable() {
 		},
 	});
 }
+
+// === Passkeys ===
+
+export function usePasskeys() {
+	return useQuery({
+		queryKey: ["auth", "passkeys"],
+		queryFn: api.listPasskeys,
+		enabled: !!getToken(),
+		staleTime: 30_000,
+	});
+}
+
+export function useRegisterPasskey() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (name?: string) => api.registerPasskey(name),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "passkeys"] });
+			qc.invalidateQueries({ queryKey: ["auth", "security"] });
+		},
+	});
+}
+
+export function useRenamePasskey() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ id, name }: { id: string; name: string }) => api.renamePasskey(id, name),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["auth", "passkeys"] }),
+	});
+}
+
+export function useDeletePasskey() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.deletePasskey(id),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "passkeys"] });
+			qc.invalidateQueries({ queryKey: ["auth", "security"] });
+		},
+	});
+}
+
+/** Passwordless passkey login. */
+export function usePasskeyLogin() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: () => api.passkeyLogin(),
+		onSuccess: (data: LoginSession) => applySession(qc, data),
+	});
+}
+
+/** Passkey second-factor verification (after password). */
+export function usePasskeyMfaVerify() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (mfaToken: string) => api.passkeyMfaVerify(mfaToken),
+		onSuccess: (data: LoginSession) => applySession(qc, data),
+	});
+}
+
+// === SSO / OIDC ===
+
+/** Public list of enabled SSO providers (for the login page). */
+export function useSsoProviders() {
+	return useQuery({
+		queryKey: ["auth", "sso-providers"],
+		queryFn: api.listSsoProviders,
+		retry: false,
+		staleTime: 5 * 60_000,
+	});
+}
+
+/** Exchange a one-time SSO code (from the callback redirect) for a session. */
+export function useSsoExchange() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (code: string) => api.ssoExchange(code),
+		onSuccess: (data: LoginSession) => applySession(qc, data),
+	});
+}
+
+/** The current user's linked SSO identities. */
+export function useIdentities() {
+	return useQuery({
+		queryKey: ["auth", "identities"],
+		queryFn: api.listIdentities,
+		enabled: !!getToken(),
+		staleTime: 30_000,
+	});
+}
+
+export function useUnlinkIdentity() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (id: string) => api.unlinkIdentity(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["auth", "identities"] }),
+	});
+}
+
+// === Admin: instance auth configuration ===
+
+export function useAuthConfig(enabled: boolean) {
+	return useQuery({
+		queryKey: ["admin", "auth-config"],
+		queryFn: api.getAuthConfig,
+		enabled: enabled && !!getToken(),
+		staleTime: 30_000,
+	});
+}
+
+export function useUpdateAuthConfig() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: api.updateAuthConfig,
+		onSuccess: (data) => {
+			qc.setQueryData(["admin", "auth-config"], data);
+			// SSO provider list on the login page may have changed.
+			qc.invalidateQueries({ queryKey: ["auth", "sso-providers"] });
+		},
+	});
+}

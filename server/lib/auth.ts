@@ -3,6 +3,7 @@ import { sign, verify } from "hono/jwt";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
 import { mfaService } from "../services/mfa-service";
+import { passkeyService } from "../services/passkey-service";
 import { AppError } from "./errors";
 import { generateId } from "./id";
 import { issueMfaToken } from "./mfa";
@@ -131,7 +132,7 @@ export interface LoginSuccess {
 export interface MfaChallenge {
 	mfaRequired: true;
 	mfaToken: string;
-	methods: Array<"totp" | "backup_code">;
+	methods: Array<"totp" | "backup_code" | "passkey">;
 }
 
 /**
@@ -184,9 +185,16 @@ export async function loginUser(
 
 	// Gate on a second factor when one is enrolled. The real session token is
 	// only minted after the second factor is proven via /auth/mfa/verify.
-	if (await mfaService.isTotpActive(user.id)) {
+	const [totpActive, hasPasskey] = await Promise.all([
+		mfaService.isTotpActive(user.id),
+		passkeyService.hasAny(user.id),
+	]);
+	if (totpActive || hasPasskey) {
+		const methods: MfaChallenge["methods"] = [];
+		if (totpActive) methods.push("totp", "backup_code");
+		if (hasPasskey) methods.push("passkey");
 		const mfaToken = await issueMfaToken(user.id);
-		return { mfaRequired: true, mfaToken, methods: ["totp", "backup_code"] };
+		return { mfaRequired: true, mfaToken, methods };
 	}
 
 	return buildSessionResult(user.id);

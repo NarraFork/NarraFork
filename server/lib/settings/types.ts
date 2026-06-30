@@ -277,6 +277,30 @@ export interface TlsConfig {
 	caFile?: string;
 }
 
+/** A configured OpenID Connect identity provider for SSO. */
+export interface OidcProviderConfig {
+	/** Stable internal id (used as the `provider` key in user_identities). */
+	id: string;
+	/** Display name shown on the login button (e.g. "Company SSO"). */
+	name: string;
+	/** Issuer URL — its /.well-known/openid-configuration is auto-discovered. */
+	issuer: string;
+	clientId: string;
+	clientSecret: string;
+	/** OAuth scopes; "openid" is always included. Defaults to ["openid","profile","email"]. */
+	scopes?: string[];
+	/**
+	 * When true, a successful login with no matching identity auto-creates a
+	 * local user (subject to allowedEmailDomains). When false, the user must
+	 * already exist and have linked this provider. Defaults to false.
+	 */
+	allowSignup?: boolean;
+	/** Restrict auto-signup / login to these email domains (e.g. ["example.com"]). */
+	allowedEmailDomains?: string[];
+	/** Disable this provider without removing its config. */
+	enabled?: boolean;
+}
+
 export interface NarraForkSettings {
 	server: {
 		port: number;
@@ -507,6 +531,26 @@ export interface NarraForkSettings {
 	auth: {
 		jwtSecret: string;
 		registrationOpen: boolean;
+		/**
+		 * Optional WebAuthn / passkey configuration. When omitted, the relying
+		 * party ID and origin are derived from each request's Origin header, so
+		 * passkeys work out of the box on localhost and LAN hostnames without any
+		 * setup. Set these only to pin a specific domain in advanced deployments
+		 * (e.g. behind a reverse proxy on a fixed hostname).
+		 */
+		webauthn?: {
+			/** Relying Party ID (a domain, e.g. "narrafork.example.com"). */
+			rpID?: string;
+			/** Display name shown by authenticators. Defaults to "NarraFork". */
+			rpName?: string;
+			/** Allowed full origins (e.g. ["https://narrafork.example.com"]). */
+			origins?: string[];
+		};
+		/**
+		 * Configured OpenID Connect (OIDC) identity providers for SSO. Each entry
+		 * enables a "Sign in with …" option. Empty/omitted = SSO disabled.
+		 */
+		oidcProviders?: OidcProviderConfig[];
 	};
 		credentialsPath: string;
 		configPath: string;

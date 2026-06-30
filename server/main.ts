@@ -918,6 +918,11 @@ import { startSkillCacheCleanupTimer } from "./services/skill-service";
 
 startSkillCacheCleanupTimer();
 
+// Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
+import { startChallengeCleanupTimer } from "./lib/webauthn";
+
+startChallengeCleanupTimer();
+
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";
 
