@@ -19,6 +19,7 @@ export type ToolCategory =
 	| "recall"
 	| "skill"
 	| "browser"
+	| "knowledge"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -41,6 +42,14 @@ const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
+const KNOWLEDGE_TOOLS = new Set([
+	"KnowledgeSearch",
+	"KnowledgeRead",
+	"KnowledgeCreate",
+	"KnowledgeEdit",
+	"KnowledgeReview",
+	"KnowledgeAdmin",
+]);
 
 export function getCategory(name: string): ToolCategory {
 	if (READ_TOOLS.has(name)) return "read";
@@ -63,6 +72,7 @@ export function getCategory(name: string): ToolCategory {
 	if (RECALL_TOOLS.has(name)) return "recall";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
+	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
 	return "generic";
 }
 
@@ -110,6 +120,8 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "blue";
 		case "plan":
 		case "skill":
+			return "grape";
+		case "knowledge":
 			return "grape";
 		case "pipeline":
 			return "indigo";
@@ -248,6 +260,59 @@ function getSendTargetLabels(input: unknown): string[] {
 
 function short(value: string, max: number): string {
 	return value.length > max ? `${value.slice(0, Math.max(0, max - 3))}...` : value;
+}
+
+/**
+ * Header summary for the knowledge-base tool family. Shared by the DOM
+ * (ToolCallCard) and pixi renderers so both show the same one-line label.
+ * Reads from input first, then falls back to persisted metadata
+ * (outputJson._metadata) for fields like the resolved entry title.
+ */
+export function knowledgeSummary(
+	toolName: string,
+	input: unknown,
+	metadata?: Record<string, unknown>,
+): string {
+	const meta = metadata ?? {};
+	switch (toolName) {
+		case "KnowledgeSearch": {
+			const q = extractField(input, "query") || (meta.query as string) || "";
+			const count = typeof meta.resultCount === "number" ? meta.resultCount : undefined;
+			if (q) return count != null ? `${short(q, 48)} · ${count}` : short(q, 60);
+			return count != null ? `${count} results` : "Search";
+		}
+		case "KnowledgeRead": {
+			const title = (meta.title as string) || extractField(input, "entryId");
+			return title ? short(title, 60) : "Read entry";
+		}
+		case "KnowledgeCreate": {
+			const title = extractField(input, "title") || (meta.title as string) || "";
+			const direct = meta.direct === true;
+			if (title) return direct ? `${short(title, 52)} · global` : short(title, 60);
+			return "Create entry";
+		}
+		case "KnowledgeEdit": {
+			const action = extractField(input, "action") || (meta.action as string) || "edit";
+			const target =
+				extractField(input, "entryId") ||
+				extractField(input, "personalEntryId") ||
+				(meta.entryId as string) ||
+				(meta.personalEntryId as string) ||
+				"";
+			return target ? `${action} · ${short(target, 16)}` : action;
+		}
+		case "KnowledgeReview": {
+			const action = extractField(input, "action") || (meta.action as string) || "review";
+			const sub = extractField(input, "submissionId") || (meta.submissionId as string) || "";
+			return sub ? `${action} · ${short(sub, 16)}` : action;
+		}
+		case "KnowledgeAdmin": {
+			const action = extractField(input, "action") || (meta.action as string) || "admin";
+			return action;
+		}
+		default:
+			return toolName;
+	}
 }
 
 export function getSummary(
@@ -416,6 +481,8 @@ export function getSummary(
 			if (selector) return `${action || "Browser"}: ${short(selector, 40)}`;
 			return action || "Browser";
 		}
+		case "knowledge":
+			return knowledgeSummary(toolName, input, metadata);
 		default:
 			return toolName;
 	}

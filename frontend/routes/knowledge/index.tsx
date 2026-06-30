@@ -28,14 +28,17 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useCreateKnowledgeCollection,
 	useCreateKnowledgeEntry,
+	useCreatePersonalEntry,
 	useDeleteKnowledgeCollection,
 	useKnowledgeCollections,
 	useKnowledgeEntries,
 	useKnowledgeSubmissions,
+	useMyPersonalEntries,
 	useUpdateKnowledgeCollection,
 } from "../../hooks/useKnowledge";
 import type {
 	KnowledgeCollection,
+	KnowledgePersonalEntry,
 	KnowledgeSearchResult,
 	KnowledgeSubmission,
 } from "../../lib/api";
@@ -61,12 +64,16 @@ function KnowledgePage() {
 			<Tabs defaultValue="browse" keepMounted={false}>
 				<Tabs.List mb="md">
 					<Tabs.Tab value="browse">{t("tabEntries")}</Tabs.Tab>
+					<Tabs.Tab value="mylibrary">{t("tabMyLibrary")}</Tabs.Tab>
 					<Tabs.Tab value="review">{t("tabReview")}</Tabs.Tab>
 					{isAdmin ? <Tabs.Tab value="admin">{t("tabAdmin")}</Tabs.Tab> : null}
 				</Tabs.List>
 
 				<Tabs.Panel value="browse">
 					<BrowseTab />
+				</Tabs.Panel>
+				<Tabs.Panel value="mylibrary">
+					<MyLibraryTab />
 				</Tabs.Panel>
 				<Tabs.Panel value="review">
 					<ReviewCenterTab />
@@ -485,6 +492,133 @@ function CreateEntryModal({
 }
 
 type ReviewFilter = "all" | "pending" | "conflict";
+
+function MyLibraryTab() {
+	const { t } = useTranslation("knowledge");
+	const navigate = useNavigate();
+	const entries = useMyPersonalEntries({ status: "active" });
+	const collections = useKnowledgeCollections();
+	const create = useCreatePersonalEntry();
+	const [title, setTitle] = useState("");
+	const [content, setContent] = useState("");
+	const [target, setTarget] = useState<string | null>(null);
+
+	const collectionOptions = useMemo(
+		() => (collections.data ?? []).map((c) => ({ value: c.id, label: c.name })),
+		[collections.data],
+	);
+	const colName = useMemo(() => {
+		const m = new Map<string, string>();
+		for (const c of collections.data ?? []) m.set(c.id, c.name);
+		return m;
+	}, [collections.data]);
+
+	const save = () => {
+		if (!title.trim()) return;
+		create.mutate(
+			{
+				title: title.trim(),
+				content: content || undefined,
+				targetCollectionId: target ?? undefined,
+			},
+			{
+				onSuccess: () => {
+					setTitle("");
+					setContent("");
+					setTarget(null);
+				},
+			},
+		);
+	};
+
+	return (
+		<Stack>
+			<Text size="sm" c="dimmed">
+				{t("myLibraryDesc")}
+			</Text>
+
+			<Paper withBorder p="sm">
+				<Stack gap="xs">
+					<Text size="sm" fw={600}>
+						{t("newPersonalEntry")}
+					</Text>
+					<Group align="flex-end" gap="xs">
+						<TextInput
+							label={t("title_field")}
+							value={title}
+							onChange={(e) => setTitle(e.currentTarget.value)}
+							w={260}
+						/>
+						<Select
+							label={t("publishTarget")}
+							placeholder={t("noTargetCollection")}
+							clearable
+							data={collectionOptions}
+							value={target}
+							onChange={setTarget}
+							w={220}
+						/>
+						<Button onClick={save} disabled={!title.trim()} loading={create.isPending}>
+							{t("save")}
+						</Button>
+					</Group>
+					<Textarea
+						label={t("content")}
+						value={content}
+						onChange={(e) => setContent(e.currentTarget.value)}
+						autosize
+						minRows={3}
+						maxRows={12}
+					/>
+				</Stack>
+			</Paper>
+
+			{entries.isLoading ? (
+				<Text size="sm" c="dimmed">
+					{t("loading")}
+				</Text>
+			) : (entries.data?.length ?? 0) === 0 ? (
+				<Text size="sm" c="dimmed">
+					{t("noPersonalEntries")}
+				</Text>
+			) : (
+				<Stack gap="xs">
+					{(entries.data as KnowledgePersonalEntry[]).map((p) => (
+						<Card
+							key={p.id}
+							withBorder
+							padding="sm"
+							style={{ cursor: p.entryId ? "pointer" : "default" }}
+							onClick={() =>
+								p.entryId
+									? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
+									: undefined
+							}
+						>
+							<Group justify="space-between" wrap="nowrap">
+								<div style={{ flex: 1, minWidth: 0 }}>
+									<Text size="sm" fw={600} truncate="end">
+										{p.title ?? p.id.slice(0, 8)}
+									</Text>
+									<Text size="xs" c="dimmed" truncate="end">
+										{p.entryId
+											? t("personalEntryLinked")
+											: p.targetCollectionId
+												? `${t("publishTarget")}: ${colName.get(p.targetCollectionId) ?? p.targetCollectionId}`
+												: t("noTargetCollection")}
+									</Text>
+								</div>
+								<Badge size="xs" variant="light" color={p.entryId ? "blue" : "grape"}>
+									{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
+								</Badge>
+							</Group>
+						</Card>
+					))}
+				</Stack>
+			)}
+		</Stack>
+	);
+}
 
 function ReviewCenterTab() {
 	const { t } = useTranslation("knowledge");

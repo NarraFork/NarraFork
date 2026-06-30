@@ -17,6 +17,16 @@ function prefixLabels(data: ComboboxData): ComboboxData {
 	}));
 }
 
+/**
+ * Filter out option groups that contain any of the given sentinel values.
+ * Each sentinel ("__default__", "__summary__") lives in its own group.
+ */
+function filterSentinelGroups(data: ComboboxData, sentinels: string[]): ComboboxData {
+	return (data as ComboboxItemGroup[]).filter(
+		(g) => !g.items?.some?.((i) => sentinels.includes(typeof i === "string" ? i : i.value)),
+	);
+}
+
 export interface SubagentAllowedModels {
 	explore: string[];
 	plan: string[];
@@ -65,15 +75,17 @@ export function ModelsSection({
 	const { t: tn } = useTranslation("narrator");
 	const prefixedModels = useMemo(() => prefixLabels(groupedModels), [groupedModels]);
 
-	// For the default model selector, exclude the "follow default" option to prevent self-reference.
+	// Default model selector: exclude "follow default" (self-reference) and
+	// "follow summary" (would be circular, since summary follows default).
 	const prefixedModelsNoDefault = useMemo(
-		() =>
-			prefixedModels.filter(
-				(g) =>
-					!(g as ComboboxItemGroup).items?.some?.(
-						(i) => (typeof i === "string" ? i : i.value) === "__default__",
-					),
-			),
+		() => filterSentinelGroups(prefixedModels, ["__default__", "__summary__"]),
+		[prefixedModels],
+	);
+
+	// Summary model selector: exclude "follow summary" (self-reference). Keeping
+	// "follow default" is fine — summary following default resolves correctly.
+	const prefixedModelsNoSummary = useMemo(
+		() => filterSentinelGroups(prefixedModels, ["__summary__"]),
 		[prefixedModels],
 	);
 
@@ -122,7 +134,7 @@ export function ModelsSection({
 			/>
 			<Select
 				label={t("summaryModel")}
-				data={prefixedModels}
+				data={prefixedModelsNoSummary}
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}

@@ -4,7 +4,10 @@ export {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	loginSchema,
+	mfaVerifySchema,
 	registerSchema,
+	totpActivateSchema,
+	totpDisableSchema,
 	updateProfileSchema,
 } from "./auth";
 export {
@@ -65,13 +68,14 @@ export {
 	createKnowledgeEntrySchema,
 	createKnowledgeGrantSchema,
 	createKnowledgeLevelSchema,
-	updateKnowledgeLevelSchema,
 	createKnowledgeLinkSchema,
 	createKnowledgeTagSchema,
 	createKnowledgeTagTypeSchema,
+	createPersonalEntrySchema,
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
 	listKnowledgeLinksQuerySchema,
+	listPersonalEntriesQuerySchema,
 	resolveKnowledgeConflictSchema,
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
@@ -82,8 +86,10 @@ export {
 	updateKnowledgeDraftSchema,
 	updateKnowledgeEntryAclSchema,
 	updateKnowledgeEntrySchema,
+	updateKnowledgeLevelSchema,
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
+	updatePersonalEntryMetaSchema,
 } from "./knowledge";
 export {
 	createKnowledgePackSchema,

@@ -1,9 +1,19 @@
-import { Button, Code, Group, Modal, Select, Stack, Text } from "@mantine/core";
+import {
+	Button,
+	Code,
+	type ComboboxItemGroup,
+	Group,
+	Modal,
+	Select,
+	Stack,
+	Text,
+} from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
+import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -36,6 +46,16 @@ export function SummaryModelPickerModal({
 	const qc = useQueryClient();
 	const { groupedModels } = useAllModels();
 	const [selected, setSelected] = useState<string | null>(null);
+
+	// Exclude the "follow summary" sentinel — it would be self-referential here.
+	const summaryModelOptions = useMemo(
+		() =>
+			(groupedModels as ComboboxItemGroup[]).filter(
+				(g) =>
+					!g.items?.some?.((i) => (typeof i === "string" ? i : i.value) === FOLLOW_SUMMARY_MODEL),
+			),
+		[groupedModels],
+	);
 
 	const save = useMutation({
 		mutationFn: (summaryModel: string) => api.updateSettings({ agent: { summaryModel } }),
@@ -76,7 +96,7 @@ export function SummaryModelPickerModal({
 				</Stack>
 				<Select
 					label={t("summaryModel")}
-					data={groupedModels}
+					data={summaryModelOptions}
 					searchable
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					value={selected}

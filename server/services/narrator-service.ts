@@ -26,6 +26,10 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
+import {
+	KNOWLEDGE_KIND_PRELOAD_TOOLS,
+	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
+} from "../lib/agent/tools/index";
 import { narratorHandleLock } from "../lib/async-mutex";
 import {
 	type BooleanOverride,
@@ -39,10 +43,19 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
-import { isSubagentVariant, parseTraits, subagentVariant } from "../lib/narrator-utils";
+import {
+	isSubagentVariant,
+	KNOWLEDGE_KIND_TRAIT,
+	parseTraits,
+	subagentVariant,
+} from "../lib/narrator-utils";
 import { getPacksExtractRoot } from "../lib/pack-archives";
 import { normalizeLegacyPermissionMode } from "../lib/permission-modes";
-import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
+import {
+	buildKnowledgeStewardSystemPrompt,
+	getToolMessageWithParams,
+	type Locale,
+} from "../lib/prompt-i18n";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	resolveDefaultReasoningEffort,
@@ -168,6 +181,12 @@ interface CreateNarratorInput {
 	makeNamed?: boolean;
 	/** Globally-unique mention handle. Only used when makeNamed is true. */
 	handle?: string;
+	/** Specialized standalone narrator kind. "knowledge" → a Knowledge Steward (knowledge-base management). */
+	kind?: "knowledge";
+	/** Whether the creating user is an admin (gates KnowledgeAdmin preinstall for kind="knowledge"). */
+	creatorIsAdmin?: boolean;
+	/** Locale for generating the default kind-specific system prompt. */
+	locale?: Locale;
 }
 
 interface CreateSubagentInput {
@@ -691,6 +710,25 @@ export const narratorService = {
 		const traits: string[] = chapterId === null ? ["standalone"] : [];
 		if (startInPlanMode) traits.push("plan");
 
+		// Knowledge Steward: a specialized standalone narrator for knowledge-base management.
+		// Mark it with a trait, preinstall the knowledge tools (KnowledgeAdmin only for admins),
+		// and default its system prompt to the steward instructions when none was supplied.
+		// enabledTools from different specializations are merged (see below) so a narrator can be
+		// e.g. both a named narrator AND a knowledge steward without one clobbering the other.
+		const enabledToolsSet = new Set<string>();
+		let resolvedSystemPrompt = input.systemPrompt;
+		if (input.kind === "knowledge") {
+			if (chapterId !== null) {
+				throw new ValidationError("Knowledge Steward narrators must be standalone (no chapterId)");
+			}
+			traits.push(KNOWLEDGE_KIND_TRAIT);
+			for (const tool of KNOWLEDGE_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
+			if (input.creatorIsAdmin) enabledToolsSet.add(KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN);
+			if (!resolvedSystemPrompt) {
+				resolvedSystemPrompt = buildKnowledgeStewardSystemPrompt(input.locale ?? "en");
+			}
+		}
+
 		// Named narrator: validate + reserve the handle atomically. Named narrators
 		// must be standalone (no chapter binding) so they are long-lived and
 		// independent of any single chapter's lifecycle.
@@ -705,7 +743,13 @@ export const narratorService = {
 			}
 			normalizedHandle = input.handle.trim().toLowerCase();
 			traits.push("named");
+			// Named narrators get the GroupControl optional tool by default so they can
+			// oversee fellow chat-group members out of the box.
+			enabledToolsSet.add("GroupControl");
 		}
+
+		// Merge all specialization-driven optional tools (named ∪ knowledge ∪ …).
+		const enabledTools = enabledToolsSet.size > 0 ? [...enabledToolsSet] : undefined;
 
 		const insertNarrator = async () =>
 			(
@@ -718,11 +762,11 @@ export const narratorService = {
 						variant: "primary",
 						traits,
 						handle: normalizedHandle,
-						// Named narrators get the GroupControl optional tool by default so
-						// they can oversee fellow chat-group members out of the box.
-						enabledTools: makeNamed ? ["GroupControl"] : undefined,
+						// Specialization-driven optional tools, merged (named → GroupControl,
+						// knowledge steward → knowledge toolset). Both can apply at once.
+						enabledTools,
 						model: storedModel,
-						systemPrompt: input.systemPrompt,
+						systemPrompt: resolvedSystemPrompt,
 						permissionMode: resolvedPermMode,
 						previousPermissionMode,
 						planFileId,

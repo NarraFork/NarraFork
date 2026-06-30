@@ -14,17 +14,20 @@ import {
 	ActionIcon,
 	Button,
 	Checkbox,
+	Divider,
 	Group,
 	Modal,
+	ScrollArea,
 	Select,
 	Stack,
 	Text,
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { IconFolder, IconGripVertical, IconStar, IconStarFilled, IconX } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import {
@@ -64,14 +67,15 @@ function FavoriteItemContent({
 	isActive: boolean;
 }) {
 	return (
-		<Group gap="xs" wrap="nowrap">
+		<Group gap="xs" wrap="nowrap" miw={0}>
 			<span style={{ display: "flex", flexShrink: 0 }}>
 				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
 			</span>
 			<Button
 				variant={isActive ? "light" : "subtle"}
 				size="xs"
-				style={{ flex: 1, justifyContent: "flex-start" }}
+				style={{ flex: 1, minWidth: 0, justifyContent: "flex-start" }}
+				styles={{ label: { width: "100%", justifyContent: "flex-start" } }}
 			>
 				<Text size="xs" truncate>
 					{fav.label || fav.path}
@@ -107,7 +111,7 @@ function SortableFavoriteItem({
 	};
 
 	return (
-		<Group ref={setNodeRef} style={style} gap="xs" wrap="nowrap">
+		<Group ref={setNodeRef} style={style} gap="xs" wrap="nowrap" miw={0}>
 			<span
 				{...attributes}
 				{...listeners}
@@ -118,7 +122,8 @@ function SortableFavoriteItem({
 			<Button
 				variant={isActive ? "light" : "subtle"}
 				size="xs"
-				style={{ flex: 1, justifyContent: "flex-start" }}
+				style={{ flex: 1, minWidth: 0, justifyContent: "flex-start" }}
+				styles={{ label: { width: "100%", justifyContent: "flex-start" } }}
 				onClick={onSelect}
 			>
 				<Text size="xs" truncate>
@@ -134,6 +139,7 @@ function SortableFavoriteItem({
 
 export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
+	const { t: tc } = useTranslation("common");
 	const createNarrator = useCreateNarrator();
 	const { groupedModels } = useAllModels();
 	const { data: settings } = useQuery({
@@ -151,8 +157,43 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 	const [selectedModel, setSelectedModel] = useState("");
 	const [startInPlanMode, setStartInPlanMode] = useState(false);
 	const [makeNamed, setMakeNamed] = useState(false);
+	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
 	const [handle, setHandle] = useState("");
 	const [activeId, setActiveId] = useState<string | null>(null);
+
+	// Favorites list is a resizable region: defaults to ~5 rows, user can drag to adjust.
+	const FAV_LIST_DEFAULT_H = 165;
+	const FAV_LIST_MIN_H = 80;
+	const FAV_LIST_MAX_H = 400;
+	const [favListHeight, setFavListHeight] = useState(FAV_LIST_DEFAULT_H);
+	const resizeCleanupRef = useRef<(() => void) | null>(null);
+
+	const startFavResize = useCallback(
+		(e: React.MouseEvent) => {
+			e.preventDefault();
+			const startY = e.clientY;
+			const startH = favListHeight;
+			const onMove = (ev: MouseEvent) => {
+				const next = Math.min(
+					FAV_LIST_MAX_H,
+					Math.max(FAV_LIST_MIN_H, startH + (ev.clientY - startY)),
+				);
+				setFavListHeight(next);
+			};
+			const onUp = () => {
+				window.removeEventListener("mousemove", onMove);
+				window.removeEventListener("mouseup", onUp);
+				resizeCleanupRef.current = null;
+			};
+			window.addEventListener("mousemove", onMove);
+			window.addEventListener("mouseup", onUp);
+			resizeCleanupRef.current = onUp;
+		},
+		[favListHeight],
+	);
+
+	// Safety net: detach any dangling listeners if the modal unmounts mid-drag.
+	useEffect(() => () => resizeCleanupRef.current?.(), []);
 
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
@@ -197,6 +238,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				...(makeNamed && handle.trim()
 					? { makeNamed: true, handle: handle.trim().toLowerCase() }
 					: {}),
+				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -219,29 +261,62 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 		setSelectedModel("");
 		setStartInPlanMode(false);
 		setMakeNamed(false);
+		setKnowledgeSteward(false);
 		setHandle("");
 	};
 
-	return (
-		<Modal
-			opened={opened}
-			onClose={handleClose}
-			title={t("newNarratorModal")}
-			size="md"
-			styles={{
-				body: {
-					maxHeight: "90vh",
-					display: "flex",
-					flexDirection: "column",
-					overflow: "hidden",
-				},
-			}}
-		>
-			<Stack gap="md" style={{ flex: 1, minHeight: 0 }}>
-				<Text size="sm" c="dimmed">
-					{t("newNarratorDescription")}
-				</Text>
+	// Wide screens get a two-column layout: the left column is dedicated entirely to
+	// directory + favorites, the right column holds model/session options.
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
+	const favoritesDnd = favorites?.length ? (
+		<DndContext
+			sensors={sensors}
+			collisionDetection={closestCenter}
+			onDragStart={handleDragStart}
+			onDragEnd={handleDragEnd}
+			onDragCancel={handleDragCancel}
+		>
+			<SortableContext
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
+				items={favorites.map((f: any) => f.id)}
+				strategy={verticalListSortingStrategy}
+			>
+				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
+				{favorites.map((fav: any) => (
+					<SortableFavoriteItem
+						key={fav.id}
+						fav={fav}
+						isActive={cwd === fav.path}
+						onSelect={() => setCwd(fav.path)}
+						onRemove={() => removeFavorite.mutate(fav.id)}
+					/>
+				))}
+			</SortableContext>
+			{createPortal(
+				<DragOverlay dropAnimation={null}>
+					{activeFav && (
+						<div
+							style={{
+								backgroundColor: "var(--mantine-color-body)",
+								boxShadow: "var(--mantine-shadow-md)",
+								borderRadius: 4,
+							}}
+						>
+							<FavoriteItemContent fav={activeFav} isActive={cwd === activeFav.path} />
+						</div>
+					)}
+				</DragOverlay>,
+				document.body,
+			)}
+		</DndContext>
+	) : null;
+
+	const directorySection = (
+		<>
+			{/* DirectoryPicker's inner TextInput carries style={{flex:1}} (for horizontal layouts).
+			    Wrap it so that flex:1 cannot stretch it vertically inside the flex-column left pane. */}
+			<div style={{ flexShrink: 0 }}>
 				<DirectoryPicker
 					label={t("workingDirectory")}
 					description={t("workingDirectoryHint")}
@@ -267,100 +342,161 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 						) : null
 					}
 				/>
+			</div>
 
-				{favorites?.length ? (
-					<Stack gap="xs" style={{ flex: 1, minHeight: 0 }}>
-						<Text size="xs" fw={500} c="dimmed">
-							{t("favoriteDirectories")}
-						</Text>
-						<div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
-							<DndContext
-								sensors={sensors}
-								collisionDetection={closestCenter}
-								onDragStart={handleDragStart}
-								onDragEnd={handleDragEnd}
-								onDragCancel={handleDragCancel}
-							>
-								<SortableContext
-									// biome-ignore lint/suspicious/noExplicitAny: dynamic favorite directory shape
-									items={favorites.map((f: any) => f.id)}
-									strategy={verticalListSortingStrategy}
-								>
-									{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-									{favorites.map((fav: any) => (
-										<SortableFavoriteItem
-											key={fav.id}
-											fav={fav}
-											isActive={cwd === fav.path}
-											onSelect={() => setCwd(fav.path)}
-											onRemove={() => removeFavorite.mutate(fav.id)}
-										/>
-									))}
-								</SortableContext>
-								{createPortal(
-									<DragOverlay dropAnimation={null}>
-										{activeFav && (
-											<div
-												style={{
-													backgroundColor: "var(--mantine-color-body)",
-													boxShadow: "var(--mantine-shadow-md)",
-													borderRadius: 4,
-												}}
-											>
-												<FavoriteItemContent fav={activeFav} isActive={cwd === activeFav.path} />
-											</div>
-										)}
-									</DragOverlay>,
-									document.body,
-								)}
-							</DndContext>
-						</div>
+			{favorites?.length ? (
+				// Wide: favorites fills the rest of the column. Narrow: fixed height + drag-to-resize.
+				<Stack gap="xs" style={isWide ? { flex: 1, minHeight: 0 } : undefined}>
+					<Text size="xs" fw={500} c="dimmed">
+						{t("favoriteDirectories")}
+					</Text>
+					<div
+						style={
+							isWide
+								? { flex: 1, minHeight: 0, overflowY: "auto" }
+								: { height: favListHeight, overflowY: "auto" }
+						}
+					>
+						{favoritesDnd}
+					</div>
+					{!isWide && (
+						// Drag handle: resize the favorites list height (narrow layout only).
+						<button
+							type="button"
+							aria-label={t("resizeFavorites")}
+							title={t("resizeFavorites")}
+							onMouseDown={startFavResize}
+							style={{
+								height: 6,
+								padding: 0,
+								border: "none",
+								cursor: "ns-resize",
+								borderRadius: 3,
+								background: "var(--mantine-color-default-border)",
+								alignSelf: "stretch",
+							}}
+						/>
+					)}
+				</Stack>
+			) : null}
+		</>
+	);
+
+	const optionsSection = (
+		<>
+			<Select
+				label={t("model")}
+				description={t("modelHint")}
+				data={groupedModels}
+				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
+				value={selectedModel || FOLLOW_DEFAULT_MODEL}
+				onChange={(v) => setSelectedModel(v ?? "")}
+				maxDropdownHeight={320}
+				comboboxProps={{
+					withinPortal: true,
+					position: "bottom-start",
+					// 该 Select 位于 Mantine Modal 内,沿用 Mantine 自管层级体系
+					// (略高于 Popover 默认 300),不使用全局 Z token,避免破坏 Modal 内叠放。
+					zIndex: 320,
+				}}
+			/>
+
+			<Checkbox
+				label={t("startInPlanMode")}
+				description={t("startInPlanModeHint")}
+				checked={startInPlanMode}
+				onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
+			/>
+
+			<Divider label={t("sectionSessionType")} labelPosition="left" />
+
+			<Checkbox
+				label={t("makeNamed")}
+				description={t("makeNamedHint")}
+				checked={makeNamed}
+				onChange={(e) => setMakeNamed(e.currentTarget.checked)}
+			/>
+			{makeNamed && (
+				<TextInput
+					label={t("handle")}
+					description={t("handleHint")}
+					placeholder="alice"
+					leftSection="@"
+					value={handle}
+					onChange={(e) => setHandle(e.currentTarget.value)}
+					maxLength={32}
+				/>
+			)}
+
+			<Checkbox
+				label={t("knowledgeSteward")}
+				description={t("knowledgeStewardHint")}
+				checked={knowledgeSteward}
+				onChange={(e) => setKnowledgeSteward(e.currentTarget.checked)}
+			/>
+		</>
+	);
+
+	return (
+		<Modal
+			opened={opened}
+			onClose={handleClose}
+			title={t("newNarratorModal")}
+			size={isWide ? 880 : "md"}
+			styles={{
+				body: {
+					maxHeight: "85vh",
+					display: "flex",
+					flexDirection: "column",
+					overflow: "hidden",
+				},
+			}}
+		>
+			{isWide ? (
+				// Two columns: left dedicated to directory + favorites, right to options.
+				// Use an explicit viewport height (not a flex chain through Modal body, which
+				// is unreliable in Mantine modals) so the favorites list can fill the column.
+				<Group
+					align="stretch"
+					wrap="nowrap"
+					gap="lg"
+					h="calc(85vh - 150px)"
+					style={{ minHeight: 0 }}
+				>
+					<Stack gap="md" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+						{directorySection}
 					</Stack>
-				) : null}
+					<Divider orientation="vertical" />
+					<ScrollArea style={{ flex: 1, minWidth: 0 }} type="auto">
+						<Stack gap="md" pr="xs">
+							{optionsSection}
+						</Stack>
+					</ScrollArea>
+				</Group>
+			) : (
+				// Single column: everything stacked in one scroll region.
+				// Plain ScrollArea (not Autosize) avoids an inner flex wrapper that lacks
+				// min-width:0; combined with minWidth:0 here, long favorite paths truncate
+				// instead of forcing horizontal scroll on mobile.
+				<ScrollArea
+					mah="calc(85vh - 64px)"
+					style={{ flex: 1, minWidth: 0, minHeight: 0 }}
+					type="auto"
+				>
+					<Stack gap="md" pb="xs">
+						{directorySection}
+						{optionsSection}
+					</Stack>
+				</ScrollArea>
+			)}
 
-				<Select
-					label={t("model")}
-					description={t("modelHint")}
-					data={groupedModels}
-					searchable
-					limit={MODEL_SELECT_OPTION_LIMIT}
-					value={selectedModel || FOLLOW_DEFAULT_MODEL}
-					onChange={(v) => setSelectedModel(v ?? "")}
-					maxDropdownHeight={320}
-					comboboxProps={{
-						withinPortal: true,
-						position: "bottom-start",
-						// 该 Select 位于 Mantine Modal 内,沿用 Mantine 自管层级体系
-						// (略高于 Popover 默认 300),不使用全局 Z token,避免破坏 Modal 内叠放。
-						zIndex: 320,
-					}}
-				/>
-
-				<Checkbox
-					label={t("startInPlanMode")}
-					description={t("startInPlanModeHint")}
-					checked={startInPlanMode}
-					onChange={(e) => setStartInPlanMode(e.currentTarget.checked)}
-				/>
-
-				<Checkbox
-					label={t("makeNamed")}
-					description={t("makeNamedHint")}
-					checked={makeNamed}
-					onChange={(e) => setMakeNamed(e.currentTarget.checked)}
-				/>
-				{makeNamed && (
-					<TextInput
-						label={t("handle")}
-						description={t("handleHint")}
-						placeholder="alice"
-						leftSection="@"
-						value={handle}
-						onChange={(e) => setHandle(e.currentTarget.value)}
-						maxLength={32}
-					/>
-				)}
-
+			{/* Fixed footer — always visible, never scrolled out of reach. */}
+			<Divider mt="sm" />
+			<Group justify="flex-end" pt="sm">
+				<Button variant="default" onClick={handleClose}>
+					{tc("cancel")}
+				</Button>
 				<Button
 					onClick={handleCreate}
 					loading={createNarrator.isPending}
@@ -368,7 +504,7 @@ export function CreateNarratorModal({ opened, onClose, onCreated }: CreateNarrat
 				>
 					{t("createNarrator")}
 				</Button>
-			</Stack>
+			</Group>
 		</Modal>
 	);
 }

@@ -3,6 +3,7 @@ import type {
 	KnowledgeCollection,
 	KnowledgeDraft,
 	KnowledgeDraftDiff,
+	KnowledgeDraftDrift,
 	KnowledgeEntry,
 	KnowledgeEntryLink,
 	KnowledgeFinding,
@@ -11,6 +12,8 @@ import type {
 	KnowledgeLevel,
 	KnowledgeLinkDirection,
 	KnowledgeLinkType,
+	KnowledgePersonalEntry,
+	KnowledgeRebaseResult,
 	KnowledgeReviewResult,
 	KnowledgeRevision,
 	KnowledgeSearchResult,
@@ -140,16 +143,44 @@ export const knowledgeApi = {
 		}),
 	getMyKnowledgeDraft: (entryId: string) =>
 		request<KnowledgeDraft | null>(`/knowledge/entries/${entryId}/drafts/mine`),
+	getKnowledgeDraftDrift: (entryId: string) =>
+		request<KnowledgeDraftDrift>(`/knowledge/entries/${entryId}/drafts/mine/drift`),
 	updateKnowledgeDraft: (draftId: string, data: { content: string; name?: string }) =>
 		request<KnowledgeDraft>(`/knowledge/drafts/${draftId}`, {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
-	getKnowledgeDraftDiff: (draftId: string) =>
-		request<KnowledgeDraftDiff>(`/knowledge/drafts/${draftId}/diff`),
+	getKnowledgeDraftDiff: (draftId: string, against: "base" | "current" = "current") =>
+		request<KnowledgeDraftDiff>(`/knowledge/drafts/${draftId}/diff${qs({ against })}`),
+	rebaseKnowledgeDraft: (draftId: string) =>
+		request<KnowledgeRebaseResult>(`/knowledge/drafts/${draftId}/rebase`, { method: "POST" }),
 	submitKnowledgeDraft: (draftId: string, data: { changeNote?: string } = {}) =>
 		request<KnowledgeSubmission>(`/knowledge/drafts/${draftId}/submit`, {
 			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// ─── Personal library (standalone personal entries) ───
+	listMyPersonalEntries: (opts: { status?: "active" | "archived"; limit?: number } = {}) =>
+		request<KnowledgePersonalEntry[]>(
+			`/knowledge/personal-entries${qs({
+				status: opts.status,
+				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
+			})}`,
+		),
+	createPersonalEntry: (data: { title: string; content?: string; targetCollectionId?: string }) =>
+		request<KnowledgePersonalEntry>("/knowledge/personal-entries", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	getPersonalEntry: (id: string) =>
+		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`),
+	updatePersonalEntryMeta: (
+		id: string,
+		data: { title?: string; targetCollectionId?: string | null },
+	) =>
+		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`, {
+			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
 

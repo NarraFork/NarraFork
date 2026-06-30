@@ -18,8 +18,9 @@ import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
 import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflection";
 import { grepTool } from "./grep";
 import { groupControlTool } from "./group-control";
-import { knowledgeDraftTool, knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
+import { knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
 import { knowledgeAdminTool } from "./knowledge-admin";
+import { knowledgeCreateTool, knowledgeEditTool } from "./knowledge-edit";
 import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { narraforkAdminTool } from "./narrafork-admin";
@@ -57,8 +58,33 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["PackList", packListTool],
 	["PackActivate", packActivateTool],
 	["PackDeactivate", packDeactivateTool],
+	["KnowledgeCreate", knowledgeCreateTool],
+	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],
 	["KnowledgeReview", knowledgeReviewTool],
+]);
+
+/**
+ * Knowledge Steward narrators preinstall these optional tools (written into enabledTools at
+ * creation). KnowledgeAdmin is admin-only and added separately after an admin check.
+ */
+export const KNOWLEDGE_KIND_PRELOAD_TOOLS = [
+	"KnowledgeCreate",
+	"KnowledgeEdit",
+	"KnowledgeReview",
+] as const;
+export const KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN = "KnowledgeAdmin";
+
+/**
+ * Core tools a Knowledge Steward narrator does NOT need — denied in toolFilter for this kind.
+ * MUST contain ONLY clearly-unrelated content tools. NEVER include planning/reflection/goal
+ * control tools (plan mode, pipeline, danger/exit-plan/goal-complete reflection, goal tools,
+ * Task), or the agent loop would stall. A knowledge steward works against the local knowledge
+ * base, not the live web, so web search/fetch are dropped.
+ */
+export const KNOWLEDGE_KIND_DENY_CORE: ReadonlySet<string> = new Set<string>([
+	"WebSearch",
+	"WebFetch",
 ]);
 
 /**
@@ -98,7 +124,6 @@ const coreProvider: ToolProvider = {
 			skillTool,
 			knowledgeSearchTool,
 			knowledgeReadTool,
-			knowledgeDraftTool,
 			dangerConfirmTool,
 			dangerCancelTool,
 			exitPlanConfirmTool,

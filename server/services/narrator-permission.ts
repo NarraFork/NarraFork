@@ -1700,12 +1700,11 @@ export function classifyDanger(
 		return null;
 	}
 
-	// Knowledge ACL / review tools: these perform no filesystem writes (so the path
-	// heuristics below never flag them), but their WRITE actions mutate shared
-	// knowledge or its access control. Classify write actions as dangerous so that
-	// under bypassPermissions they still trigger danger reflection; read actions
-	// (and a missing action) stay null. The read/write split is the single source
-	// of truth in knowledge-actions.ts, shared with the tool implementations.
+	// Knowledge tools: these perform no filesystem writes (so the path heuristics below
+	// never flag them), but their WRITE actions mutate shared knowledge, a user's personal
+	// library, or access control. Classify writes as dangerous so that under bypassPermissions
+	// they still trigger danger reflection; reads (and missing actions) stay null. The
+	// read/write split is the single source of truth in knowledge-actions.ts.
 	if (toolName === "KnowledgeAdmin" || toolName === "KnowledgeReview") {
 		const action = typeof input.action === "string" ? input.action : "";
 		if (!action || isKnowledgeReadAction(action)) return null;
@@ -1715,15 +1714,58 @@ export function classifyDanger(
 			[
 				"This changes shared project knowledge or its access-control configuration.",
 				isMerge
-					? "Merging or writing to main updates the globally-served knowledge version."
-					: "ACL changes affect who can read or modify knowledge entries.",
+					? "Approving a publish updates the globally-served knowledge version."
+					: toolName === "KnowledgeReview"
+						? "Reviewing affects whether a contributor's proposal is published."
+						: "ACL changes affect who can read or modify knowledge entries.",
 			],
 			[
 				"Confirm the action and target ids are correct before proceeding.",
-				"For content changes, prefer the draft → review flow when unsure.",
+				"Prefer the personal-entry → publish → review flow for content changes when unsure.",
 			],
 			[`Tool: ${toolName}`, `Action: ${action}`],
 			isMerge ? "high" : "medium",
+		);
+	}
+
+	// KnowledgeCreate: creating a personal entry is medium; a direct global create is high.
+	if (toolName === "KnowledgeCreate") {
+		const isDirect = input.direct === true;
+		return danger(
+			isDirect
+				? "KnowledgeCreate creates an entry directly in the global knowledge base."
+				: "KnowledgeCreate creates an entry in your personal knowledge library.",
+			[
+				isDirect
+					? "A direct create publishes to the globally-served base without review."
+					: "Personal entries are private to you until published.",
+			],
+			["Confirm the title and target collection are correct before proceeding."],
+			[`Tool: KnowledgeCreate`, `Direct: ${isDirect}`],
+			isDirect ? "high" : "medium",
+		);
+	}
+
+	// KnowledgeEdit: publish and direct global writes are high; personal edits/metadata are medium.
+	if (toolName === "KnowledgeEdit") {
+		const action = typeof input.action === "string" ? input.action : "";
+		if (!action) return null;
+		const writesGlobal = action === "publish" || (action === "save" && input.direct === true);
+		return danger(
+			`KnowledgeEdit performs a knowledge action: ${action}.`,
+			[
+				writesGlobal
+					? "Publishing or a direct save changes the globally-served knowledge version."
+					: "This changes your personal entry, an entry's metadata, or ownership.",
+			],
+			[
+				"Confirm the action and target ids are correct before proceeding.",
+				action === "save"
+					? "A non-direct save only updates your private personal entry."
+					: "Use 'publish' to propose the change for review.",
+			],
+			[`Tool: KnowledgeEdit`, `Action: ${action}`],
+			writesGlobal ? "high" : "medium",
 		);
 	}
 
@@ -1934,7 +1976,13 @@ export function resolveExitPlanModeInput(
 			if (existsSync(absPath)) {
 				const content = readFileSync(absPath, "utf-8");
 				if (content.trim()) {
-					effectiveInput = { ...effectiveInput, plan: content };
+					// `_planFile` is a persisted display/provenance marker: it records which
+					// plan file the body came from so the UI can show the source path, and it
+					// later doubles as the signal that lets stripPlanBodyForModel replace the
+					// (large) plan body with a short path reference in model history. It is a
+					// non-schema key — ExitPlanMode's Zod object strips unknown keys on parse,
+					// and execute() only reads `plan`, so carrying it is safe.
+					effectiveInput = { ...effectiveInput, plan: content, _planFile: planFileName };
 					resolvedFromFile = true;
 				}
 			}

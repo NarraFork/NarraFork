@@ -1411,8 +1411,17 @@ function buildToolDetailBlocks(
 		}
 		case "plan": {
 			const plan = extractField(inputJson, "plan");
+			const planFile = extractField(inputJson, "_planFile");
 			const denied = String(meta.permissionDenyMessage ?? "");
 			if (denied) blocks.push({ kind: "text-line", text: denied, color: "yellow" });
+			if (plan && planFile) {
+				blocks.push({
+					kind: "text-line",
+					text: tNarrator("planSourceFile", `Plan from ${planFile}`, { file: planFile }),
+					muted: true,
+					mono: true,
+				});
+			}
 			if (plan) blocks.push({ kind: "code-panel", text: plan, maxLines: 14 });
 			else outputPanel(blocks, outputJson, "code-panel", "Output");
 			break;

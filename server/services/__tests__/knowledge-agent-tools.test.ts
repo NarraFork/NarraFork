@@ -23,6 +23,7 @@ import {
 	users,
 } from "../../db/schema";
 import { knowledgeAdminTool } from "../../lib/agent/tools/knowledge-admin";
+import { knowledgeCreateTool, knowledgeEditTool } from "../../lib/agent/tools/knowledge-edit";
 import { knowledgeReviewTool } from "../../lib/agent/tools/knowledge-review";
 import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
@@ -124,7 +125,7 @@ async function makeSubmission(entryId: string, submitterUserId: string): Promise
 		content: proposed,
 		contentHash: "y",
 		format: "markdown",
-		status: "pending_review",
+		status: "active",
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -260,13 +261,13 @@ describe("KnowledgeAdmin collections (build-from-zero entry point)", () => {
 		);
 		expect(listed.output).toContain(newCollectionId);
 
-		// 3. KnowledgeReview.create_entry can now target that collection — full chain closed.
-		const entry = await knowledgeReviewTool.execute(
+		// 3. KnowledgeCreate (direct) can now target that collection — full chain closed.
+		const entry = await knowledgeCreateTool.execute(
 			{
-				action: "create_entry",
 				collectionId: newCollectionId,
 				title: `Imported doc ${TAG}`,
 				content: "# Imported\n\nbody from md folder",
+				direct: true,
 			},
 			ctxFor(adminUserId),
 		);
@@ -345,19 +346,28 @@ describe("KnowledgeReview tool", () => {
 		expect(res.isError).toBe(true);
 	});
 
-	test("write_main is denied without write authority", async () => {
+	test("a non-writer's direct save falls back to a personal entry (no error)", async () => {
 		const entryId = await makeEntry({ title: "Writable A", ownerUserId: adminUserId });
-		const res = await knowledgeReviewTool.execute(
-			{ action: "write_main", entryId, content: "hijack" },
+		const res = await knowledgeEditTool.execute(
+			{ action: "save", entryId, content: "my proposed change", direct: true },
 			ctxFor(plainUserId),
 		);
-		expect(res.isError).toBe(true);
+		// New model: a user without write authority does NOT error — the direct flag is ignored
+		// and the edit becomes a private personal entry to be published later.
+		expect(res.isError).toBeUndefined();
+		expect(res.output).toContain("personal entry");
+		// Global main is untouched.
+		const entry = await db.query.knowledgeEntries.findFirst({
+			where: (e, { eq }) => eq(e.id, entryId),
+			columns: { currentContent: true },
+		});
+		expect(entry?.currentContent).not.toContain("my proposed change");
 	});
 
-	test("owner can write_main directly", async () => {
+	test("owner can save directly to global main", async () => {
 		const entryId = await makeEntry({ title: "Writable B", ownerUserId: reviewerUserId });
-		const res = await knowledgeReviewTool.execute(
-			{ action: "write_main", entryId, content: "owner update body" },
+		const res = await knowledgeEditTool.execute(
+			{ action: "save", entryId, content: "owner update body", direct: true },
 			ctxFor(reviewerUserId),
 		);
 		expect(res.isError).toBeUndefined();
@@ -369,8 +379,8 @@ describe("KnowledgeReview tool", () => {
 	});
 
 	test("anonymous user is refused write actions", async () => {
-		const res = await knowledgeReviewTool.execute(
-			{ action: "write_main", entryId: "whatever", content: "x" },
+		const res = await knowledgeEditTool.execute(
+			{ action: "save", entryId: "whatever", content: "x", direct: true },
 			ctxFor(null),
 		);
 		expect(res.isError).toBe(true);
@@ -418,19 +428,36 @@ describe("classifyDanger for knowledge tools (bypassPermissions reflection)", ()
 		);
 	});
 
-	test("merge/main-write actions are high severity", () => {
+	test("merge/global-write actions are high severity", () => {
 		expect(classifyDanger("KnowledgeReview", { action: "approve" }, cwd)?.severity).toBe("high");
-		expect(classifyDanger("KnowledgeReview", { action: "write_main" }, cwd)?.severity).toBe("high");
 		expect(classifyDanger("KnowledgeReview", { action: "resolve_conflict" }, cwd)?.severity).toBe(
 			"high",
 		);
+		// KnowledgeEdit: publish and a direct global save are high.
+		expect(classifyDanger("KnowledgeEdit", { action: "publish" }, cwd)?.severity).toBe("high");
+		expect(classifyDanger("KnowledgeEdit", { action: "save", direct: true }, cwd)?.severity).toBe(
+			"high",
+		);
+		// KnowledgeCreate: a direct global create is high.
+		expect(classifyDanger("KnowledgeCreate", { direct: true }, cwd)?.severity).toBe("high");
 	});
 
-	test("non-merge review write actions are medium severity", () => {
+	test("personal-scope knowledge actions are medium severity", () => {
+		// A non-direct save (personal entry) and a personal create are medium.
+		expect(classifyDanger("KnowledgeEdit", { action: "save" }, cwd)?.severity).toBe("medium");
+		expect(classifyDanger("KnowledgeCreate", {}, cwd)?.severity).toBe("medium");
+	});
+
+	test("non-merge review + non-global edit actions are medium severity", () => {
 		expect(classifyDanger("KnowledgeReview", { action: "request_changes" }, cwd)?.severity).toBe(
 			"medium",
 		);
-		expect(classifyDanger("KnowledgeReview", { action: "create_entry" }, cwd)?.severity).toBe(
+		expect(classifyDanger("KnowledgeReview", { action: "comment" }, cwd)?.severity).toBe("medium");
+		// KnowledgeEdit metadata/ownership actions are medium (no global content write).
+		expect(classifyDanger("KnowledgeEdit", { action: "update_meta" }, cwd)?.severity).toBe(
+			"medium",
+		);
+		expect(classifyDanger("KnowledgeEdit", { action: "transfer_owner" }, cwd)?.severity).toBe(
 			"medium",
 		);
 	});

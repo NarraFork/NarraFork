@@ -220,11 +220,71 @@ export function useUpdateKnowledgeDraft() {
 	});
 }
 
-export function useKnowledgeDraftDiff(draftId: string | undefined) {
+export function useKnowledgeDraftDiff(
+	draftId: string | undefined,
+	against: "base" | "current" = "current",
+) {
 	return useQuery({
-		queryKey: ["knowledge", "draftDiff", draftId],
-		queryFn: () => api.getKnowledgeDraftDiff(draftId as string),
+		queryKey: ["knowledge", "draftDiff", draftId, against],
+		queryFn: () => api.getKnowledgeDraftDiff(draftId as string, against),
 		enabled: !!draftId,
+	});
+}
+
+/** Whether the caller's active draft on this entry has drifted behind current main. */
+export function useKnowledgeDraftDrift(entryId: string | undefined) {
+	return useQuery({
+		queryKey: ["knowledge", "draftDrift", entryId],
+		queryFn: () => api.getKnowledgeDraftDrift(entryId as string),
+		enabled: !!entryId,
+	});
+}
+
+/** Rebase a drifted draft onto current main (three-way merge). Conflict → result.ok=false. */
+export function useRebaseKnowledgeDraft() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({ draftId }: { draftId: string; entryId: string }) =>
+			api.rebaseKnowledgeDraft(draftId),
+		onSuccess: (_r, { entryId }) => {
+			qc.invalidateQueries({ queryKey: ["knowledge", "draft", entryId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "draftDrift", entryId] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "draftDiff"] });
+			qc.invalidateQueries({ queryKey: ["knowledge", "submissions"] });
+		},
+	});
+}
+
+// ─── Personal library (standalone personal entries) ───
+export function useMyPersonalEntries(opts: { status?: "active" | "archived" } = {}) {
+	return useQuery({
+		queryKey: ["knowledge", "personalEntries", opts],
+		queryFn: () => api.listMyPersonalEntries(opts),
+		staleTime: 5_000,
+	});
+}
+
+export function useCreatePersonalEntry() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (data: { title: string; content?: string; targetCollectionId?: string }) =>
+			api.createPersonalEntry(data),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] }),
+	});
+}
+
+export function useUpdatePersonalEntryMeta() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			title?: string;
+			targetCollectionId?: string | null;
+		}) => api.updatePersonalEntryMeta(id, data),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] }),
 	});
 }
 

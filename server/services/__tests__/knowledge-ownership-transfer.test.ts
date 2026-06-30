@@ -14,7 +14,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../db";
 import { knowledgeTags, users } from "../../db/schema";
-import { knowledgeReviewTool } from "../../lib/agent/tools/knowledge-review";
+import { knowledgeEditTool } from "../../lib/agent/tools/knowledge-edit";
 import type { ToolContext } from "../../lib/agent/types";
 import { generateId } from "../../lib/id";
 import { knowledgeAcl, type Principal } from "../knowledge-acl";
@@ -213,10 +213,10 @@ describe("transferCollectionOwner (service)", () => {
 	});
 });
 
-describe("KnowledgeReview transfer agent actions", () => {
+describe("KnowledgeEdit transfer agent actions", () => {
 	test("owner transfers an entry via the tool (approval allowed)", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		const res = await knowledgeReviewTool.execute(
+		const res = await knowledgeEditTool.execute(
 			{ action: "transfer_owner", entryId, newOwnerUserId: bobId },
 			ctxFor(aliceId),
 		);
@@ -226,7 +226,7 @@ describe("KnowledgeReview transfer agent actions", () => {
 
 	test("denied approval blocks the transfer", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		const res = await knowledgeReviewTool.execute(
+		const res = await knowledgeEditTool.execute(
 			{ action: "transfer_owner", entryId, newOwnerUserId: bobId },
 			ctxFor(aliceId, async () => ({ behavior: "deny" })),
 		);
@@ -240,7 +240,7 @@ describe("KnowledgeReview transfer agent actions", () => {
 
 	test("anonymous user is refused", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		const res = await knowledgeReviewTool.execute(
+		const res = await knowledgeEditTool.execute(
 			{ action: "transfer_owner", entryId, newOwnerUserId: bobId },
 			ctxFor(null),
 		);
@@ -249,7 +249,7 @@ describe("KnowledgeReview transfer agent actions", () => {
 
 	test("non-owner via the tool is refused", async () => {
 		const entryId = await makeOwnedEntry(aliceId);
-		const res = await knowledgeReviewTool.execute(
+		const res = await knowledgeEditTool.execute(
 			{ action: "transfer_owner", entryId, newOwnerUserId: bobId },
 			ctxFor(lowId),
 		);
@@ -261,7 +261,7 @@ describe("KnowledgeReview transfer agent actions", () => {
 			name: `t-tcol-${TAG}-${generateId(4)}`,
 			ownerUserId: aliceId,
 		});
-		const res = await knowledgeReviewTool.execute(
+		const res = await knowledgeEditTool.execute(
 			{ action: "transfer_collection_owner", collectionTargetId: col.id, newOwnerUserId: bobId },
 			ctxFor(aliceId),
 		);
@@ -272,12 +272,12 @@ describe("KnowledgeReview transfer agent actions", () => {
 
 describe("classifyDanger for transfer actions", () => {
 	const cwd = "/tmp";
-	test("transfer actions are medium severity (write, not merge)", () => {
-		expect(classifyDanger("KnowledgeReview", { action: "transfer_owner" }, cwd)?.severity).toBe(
+	test("transfer actions are medium severity (write, not global merge)", () => {
+		expect(classifyDanger("KnowledgeEdit", { action: "transfer_owner" }, cwd)?.severity).toBe(
 			"medium",
 		);
 		expect(
-			classifyDanger("KnowledgeReview", { action: "transfer_collection_owner" }, cwd)?.severity,
+			classifyDanger("KnowledgeEdit", { action: "transfer_collection_owner" }, cwd)?.severity,
 		).toBe("medium");
 	});
 });

@@ -190,6 +190,56 @@ export const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 export const MAX_IMAGE_LONG_EDGE = 1568;
 export const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
+/**
+ * Downscale an image File so its longest edge fits within `maxEdge`, keeping
+ * aspect ratio. PNG stays PNG, other formats become JPEG. Returns the original
+ * file when it is already small enough or when canvas processing is unavailable.
+ */
+export function resizeImageIfNeeded(file: File, maxEdge: number): Promise<File> {
+	return new Promise((resolve, reject) => {
+		const img = document.createElement("img");
+		const url = URL.createObjectURL(file);
+		img.onload = () => {
+			URL.revokeObjectURL(url);
+			const { naturalWidth: w, naturalHeight: h } = img;
+			if (Math.max(w, h) <= maxEdge) {
+				resolve(file);
+				return;
+			}
+			const scale = maxEdge / Math.max(w, h);
+			const nw = Math.round(w * scale);
+			const nh = Math.round(h * scale);
+			const canvas = document.createElement("canvas");
+			canvas.width = nw;
+			canvas.height = nh;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) {
+				resolve(file);
+				return;
+			}
+			ctx.drawImage(img, 0, 0, nw, nh);
+			// Use the real content type for output (PNG stays PNG, others become JPEG)
+			const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
+			canvas.toBlob(
+				(blob) => {
+					if (!blob) {
+						resolve(file);
+						return;
+					}
+					resolve(new File([blob], file.name, { type: outputType }));
+				},
+				outputType,
+				0.85,
+			);
+		};
+		img.onerror = () => {
+			URL.revokeObjectURL(url);
+			reject(new Error("Failed to load image"));
+		};
+		img.src = url;
+	});
+}
+
 export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
 export { formatFileSize, isTextFile } from "@shared/text-file-types";

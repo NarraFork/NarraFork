@@ -9,6 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
 	Anchor,
@@ -28,6 +29,7 @@ import {
 	NumberInput,
 	Popover,
 	SegmentedControl,
+	Select,
 	Skeleton,
 	Stack,
 	Switch,
@@ -161,6 +163,7 @@ import {
 	type ModelOption,
 	NARRATOR_STATUS_COLORS,
 	parseAggModelValue,
+	resolveDisplayModel,
 } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
@@ -243,6 +246,7 @@ import {
 	MAX_TEXT_FILE_SIZE,
 	PERM_MODE_ICONS,
 	PERM_MODES,
+	resizeImageIfNeeded,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
@@ -686,6 +690,9 @@ function ModelMenuItems({
 	onSelect,
 	onShowPrice,
 	label,
+	providerLabels,
+	onEditDefaultModel,
+	onEditSummaryModel,
 }: {
 	allModels: ModelOption[];
 	currentModel: string | null | undefined;
@@ -693,6 +700,12 @@ function ModelMenuItems({
 	onSelect: (model: string) => void;
 	onShowPrice?: (model: ModelOption) => void;
 	label?: string;
+	/** Provider prefix → display name, used to label provider groups. */
+	providerLabels?: Record<string, string>;
+	/** When provided, an edit button on the "Default" group opens the global default model picker. */
+	onEditDefaultModel?: () => void;
+	/** When provided, an edit button on the "Summary" group opens the global summary model picker. */
+	onEditSummaryModel?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const [filter, setFilter] = useState("");
@@ -708,8 +721,10 @@ function ModelMenuItems({
 	}
 	const provLabels: Record<string, string> = {
 		openai: "OpenAI",
-		__default__: "Default",
-		__agg__: "Aggregations",
+		...providerLabels,
+		__default__: t("modelGroupDefault"),
+		__summary__: t("modelGroupSummary"),
+		__agg__: t("modelGroupAggregations"),
 	};
 	const entries = [...groups.entries()];
 	const normalizedFilter = filter.trim().toLowerCase();
@@ -749,58 +764,97 @@ function ModelMenuItems({
 					{t("noModelMatches")}
 				</Text>
 			) : (
-				filteredEntries.map(([prov, models], gi) => (
-					<span key={prov}>
-						{gi > 0 && <Menu.Divider />}
-						<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
-						{models.map((m) => {
-							// For aggregation items, check if the current model's aggId matches
-							const isAggItem = m.provider === "__agg__";
-							const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
-							const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
-							return (
-								<Menu.Item
-									key={m.value}
-									onClick={() => onSelect(m.value)}
-									rightSection={
-										<Group gap={4} wrap="nowrap">
-											{m.rateMultiplier != null && (
-												<Badge size="xs" variant="outline" color="gray">
-													×{m.rateMultiplier}
-												</Badge>
-											)}
-											{m.pricing && (
-												<ActionIcon
-													component="div"
-													role="button"
-													tabIndex={0}
-													variant="subtle"
-													color="gray"
-													size="sm"
-													aria-label={t("viewModelPrice")}
-													onClick={(e) => {
-														e.stopPropagation();
-														e.preventDefault();
-														onShowPrice?.(m);
-													}}
-												>
-													<IconInfoCircle size={14} />
-												</ActionIcon>
-											)}
-											<IconCheck
-												size={14}
-												style={{ visibility: selected ? "visible" : "hidden" }}
-											/>
-										</Group>
-									}
-									fw={selected ? 600 : 400}
+				filteredEntries.map(([prov, models], gi) => {
+					const isDefaultGroup = prov === "__default__";
+					const isSummaryGroup = prov === "__summary__";
+					const editHandler = isDefaultGroup
+						? onEditDefaultModel
+						: isSummaryGroup
+							? onEditSummaryModel
+							: undefined;
+					return (
+						<span key={prov}>
+							{gi > 0 && <Menu.Divider />}
+							{editHandler ? (
+								<Menu.Label
+									style={{
+										display: "flex",
+										alignItems: "center",
+										justifyContent: "space-between",
+										gap: 4,
+									}}
 								>
-									{m.label}
-								</Menu.Item>
-							);
-						})}
-					</span>
-				))
+									<span>{provLabels[prov] ?? prov}</span>
+									<ActionIcon
+										component="div"
+										role="button"
+										tabIndex={0}
+										variant="subtle"
+										color="gray"
+										size="sm"
+										aria-label={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
+										title={isDefaultGroup ? t("editDefaultModel") : t("editSummaryModel")}
+										onClick={(e) => {
+											e.stopPropagation();
+											e.preventDefault();
+											editHandler();
+										}}
+									>
+										<IconPencil size={12} />
+									</ActionIcon>
+								</Menu.Label>
+							) : (
+								<Menu.Label>{provLabels[prov] ?? prov}</Menu.Label>
+							)}
+							{models.map((m) => {
+								// For aggregation items, check if the current model's aggId matches
+								const isAggItem = m.provider === "__agg__";
+								const aggId = isAggItem ? m.value.slice(AGG_MODEL_PREFIX.length) : null;
+								const selected = isAggItem ? currentAgg?.aggId === aggId : currentModel === m.value;
+								return (
+									<Menu.Item
+										key={m.value}
+										onClick={() => onSelect(m.value)}
+										rightSection={
+											<Group gap={4} wrap="nowrap">
+												{m.rateMultiplier != null && (
+													<Badge size="xs" variant="outline" color="gray">
+														×{m.rateMultiplier}
+													</Badge>
+												)}
+												{m.pricing && (
+													<ActionIcon
+														component="div"
+														role="button"
+														tabIndex={0}
+														variant="subtle"
+														color="gray"
+														size="sm"
+														aria-label={t("viewModelPrice")}
+														onClick={(e) => {
+															e.stopPropagation();
+															e.preventDefault();
+															onShowPrice?.(m);
+														}}
+													>
+														<IconInfoCircle size={14} />
+													</ActionIcon>
+												)}
+												<IconCheck
+													size={14}
+													style={{ visibility: selected ? "visible" : "hidden" }}
+												/>
+											</Group>
+										}
+										fw={selected ? 600 : 400}
+									>
+										{m.label}
+									</Menu.Item>
+								);
+							})}
+						</span>
+					);
+				})
 			)}
 			<Menu.Divider />
 			<Box
@@ -836,6 +890,84 @@ function ModelMenuItems({
 				/>
 			</Box>
 		</>
+	);
+}
+
+/**
+ * Modal with a searchable Select to change the global default or summary model.
+ * Used from the per-narrator model menu so users with many models can filter by
+ * typing instead of scrolling. Excludes meta sentinels (follow-default /
+ * follow-summary) to avoid self/circular references.
+ */
+function SetGlobalModelModal({
+	opened,
+	mode,
+	groupedModels,
+	currentValue,
+	saving,
+	onClose,
+	onConfirm,
+}: {
+	opened: boolean;
+	mode: "default" | "summary" | null;
+	groupedModels: ComboboxData;
+	currentValue: string | null | undefined;
+	saving: boolean;
+	onClose: () => void;
+	onConfirm: (model: string) => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const [selected, setSelected] = useState<string | null>(null);
+
+	// Reset the selection to the current value whenever the modal (re)opens.
+	useEffect(() => {
+		if (opened) setSelected(currentValue ?? null);
+	}, [opened, currentValue]);
+
+	// Default picker must exclude both sentinels (summary follows default →
+	// circular); summary picker only excludes the summary sentinel.
+	const data = useMemo<ComboboxData>(() => {
+		const exclude =
+			mode === "default"
+				? ["__default__", "__summary__"]
+				: mode === "summary"
+					? ["__summary__"]
+					: [];
+		if (exclude.length === 0) return groupedModels;
+		return (groupedModels as ComboboxItemGroup[]).filter(
+			(g) => !g.items?.some?.((i) => exclude.includes(typeof i === "string" ? i : i.value)),
+		);
+	}, [groupedModels, mode]);
+
+	const title = mode === "summary" ? t("editSummaryModel") : t("editDefaultModel");
+
+	return (
+		<Modal opened={opened} onClose={onClose} title={title} centered size="md">
+			<Stack gap="md">
+				<Select
+					data={data}
+					searchable
+					limit={100}
+					placeholder={t("modelFilterPlaceholder")}
+					value={selected}
+					onChange={setSelected}
+					comboboxProps={{ withinPortal: true }}
+					nothingFoundMessage={t("noModelMatches")}
+				/>
+				<Group justify="flex-end">
+					<Button variant="default" onClick={onClose} disabled={saving}>
+						{t("cancel")}
+					</Button>
+					<Button
+						onClick={() => selected && onConfirm(selected)}
+						disabled={!selected || saving}
+						loading={saving}
+					>
+						{t("confirm")}
+					</Button>
+				</Group>
+			</Stack>
+		</Modal>
 	);
 }
 
@@ -1205,51 +1337,6 @@ const DENY_LEVELS = ["denyWrite", "denyAll"] as const;
  * Resize an image file using an offscreen canvas if its long edge exceeds maxEdge.
  * Returns the original file if no resize is needed.
  */
-function resizeImageIfNeeded(file: File, maxEdge: number): Promise<File> {
-	return new Promise((resolve, reject) => {
-		const img = document.createElement("img");
-		const url = URL.createObjectURL(file);
-		img.onload = () => {
-			URL.revokeObjectURL(url);
-			const { naturalWidth: w, naturalHeight: h } = img;
-			if (Math.max(w, h) <= maxEdge) {
-				resolve(file);
-				return;
-			}
-			const scale = maxEdge / Math.max(w, h);
-			const nw = Math.round(w * scale);
-			const nh = Math.round(h * scale);
-			const canvas = document.createElement("canvas");
-			canvas.width = nw;
-			canvas.height = nh;
-			const ctx = canvas.getContext("2d");
-			if (!ctx) {
-				resolve(file);
-				return;
-			}
-			ctx.drawImage(img, 0, 0, nw, nh);
-			// Use the real content type for output (PNG stays PNG, others become JPEG)
-			const outputType = file.type === "image/png" ? "image/png" : "image/jpeg";
-			canvas.toBlob(
-				(blob) => {
-					if (!blob) {
-						resolve(file);
-						return;
-					}
-					resolve(new File([blob], file.name, { type: outputType }));
-				},
-				outputType,
-				0.85,
-			);
-		};
-		img.onerror = () => {
-			URL.revokeObjectURL(url);
-			reject(new Error("Failed to load image"));
-		};
-		img.src = url;
-	});
-}
-
 function CmdPatternInput({
 	placeholder,
 	onConfirm,
@@ -2207,7 +2294,9 @@ export function NarratorPanel({
 	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const {
 		visibleWithDefault: allModels,
+		groupedModels,
 		defaultModelValue,
+		summaryModelValue,
 		settingsData,
 		aggregations,
 		providerLabels,
@@ -2285,6 +2374,38 @@ export function NarratorPanel({
 			qc.invalidateQueries({ queryKey: ["contextThresholds"] });
 		},
 	});
+	// Which global model the "edit" modal is targeting ("default" | "summary" | null).
+	const [globalModelEditTarget, setGlobalModelEditTarget] = useState<"default" | "summary" | null>(
+		null,
+	);
+	const handleSetDefaultModel = useCallback(
+		(model: string) => {
+			updateSettingsMutation.mutate(
+				{ agent: { defaultModel: model } },
+				{
+					onSuccess: () => {
+						notifications.show({ message: t("defaultModelUpdated") });
+						setGlobalModelEditTarget(null);
+					},
+				},
+			);
+		},
+		[updateSettingsMutation, t],
+	);
+	const handleSetSummaryModel = useCallback(
+		(model: string) => {
+			updateSettingsMutation.mutate(
+				{ agent: { summaryModel: model } },
+				{
+					onSuccess: () => {
+						notifications.show({ message: t("summaryModelUpdated") });
+						setGlobalModelEditTarget(null);
+					},
+				},
+			);
+		},
+		[updateSettingsMutation, t],
+	);
 	const dangerReflectionGlobalLevel = normalizeDangerReflectionLevel(
 		settingsData?.agent?.dangerReflectionLevel,
 		settingsData?.agent?.dangerReflectionEnabled ?? true,
@@ -2354,12 +2475,18 @@ export function NarratorPanel({
 	}, [promoteMutation, narratorId, t, navigate]);
 
 	const displayTitle = narrator?.title || t("untitled");
-	// Resolve the effective model: when following default, use the actual default model value
-	const resolvedModel = useMemo(() => {
-		const m = narrator?.model;
-		if (!m || m === FOLLOW_DEFAULT_MODEL) return defaultModelValue;
-		return m;
-	}, [narrator?.model, defaultModelValue]);
+	// Resolve the effective model: when following default, use the actual default
+	// model value; when using a model aggregation, resolve to a representative
+	// concrete member so capability/context-window lookups work (the backend
+	// resolves the actual member at request time).
+	const resolvedModel = useMemo(
+		() =>
+			resolveDisplayModel(narrator?.model, {
+				defaultModelValue,
+				aggregations,
+			}),
+		[narrator?.model, defaultModelValue, aggregations],
+	);
 
 	// Parse provider:model for context threshold lookup
 	const { resolvedProvider, resolvedBareModel } = useMemo(() => {
@@ -2628,7 +2755,12 @@ export function NarratorPanel({
 	]);
 
 	const handleEditAndRegenerate = useCallback(
-		async (messageId: string, newContent: string, rollback: boolean) => {
+		async (
+			messageId: string,
+			newContent: string,
+			rollback: boolean,
+			opts?: { keepImageIds: string[]; newImages: File[] },
+		) => {
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({
 					title: t("rollbackEditRegenerateUnsupportedTitle"),
@@ -2638,7 +2770,7 @@ export function NarratorPanel({
 				return;
 			}
 			try {
-				await api.editAndRegenerate(narratorId, messageId, newContent, rollback);
+				await api.editAndRegenerate(narratorId, messageId, newContent, rollback, opts);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit and regenerate";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -3233,6 +3365,7 @@ export function NarratorPanel({
 		promptTokens,
 		contextWindow,
 		isEstimated,
+		contextStale,
 		activePruneStart,
 		activeCompactStart,
 		pruneBoundaryMessageId,
@@ -6574,15 +6707,19 @@ export function NarratorPanel({
 	const contextIndicatorRadius = 9;
 	const contextIndicatorCirc = 2 * Math.PI * contextIndicatorRadius;
 	const contextIndicatorOffset = contextIndicatorCirc * (1 - contextIndicatorPercent / 100);
-	const contextIndicatorColor =
-		contextIndicatorPercent >= 99
+	const contextStaleColor = "light-dark(var(--mantine-color-black), var(--mantine-color-dark-0))";
+	const contextIndicatorColor = contextStale
+		? contextStaleColor
+		: contextIndicatorPercent >= 99
 			? "var(--mantine-color-red-6)"
 			: contextIndicatorPercent >= 95
 				? "var(--mantine-color-yellow-6)"
 				: "var(--mantine-color-blue-6)";
-	const contextIndicatorLabel = hasContextData
-		? `Context: ${contextPercent.toFixed(1)}%`
-		: "Context";
+	const contextIndicatorLabel = contextStale
+		? t("contextStaleHint")
+		: hasContextData
+			? `Context: ${contextPercent.toFixed(1)}%`
+			: "Context";
 	const contextRingNode = (
 		<Box
 			style={{
@@ -6619,6 +6756,19 @@ export function NarratorPanel({
 						style={{ transition: "stroke-dashoffset 0.3s ease" }}
 					/>
 				)}
+				{contextStale && (
+					<text
+						x={12}
+						y={12}
+						textAnchor="middle"
+						dominantBaseline="central"
+						fontSize={12}
+						fontWeight={700}
+						fill={contextStaleColor}
+					>
+						?
+					</text>
+				)}
 			</svg>
 		</Box>
 	);
@@ -6628,6 +6778,11 @@ export function NarratorPanel({
 		<Menu position="top-start">
 			<Menu.Target>{contextRingNode}</Menu.Target>
 			<Menu.Dropdown>
+				{contextStale && (
+					<Menu.Label c="orange" fz={10} style={{ maxWidth: 240, whiteSpace: "normal" }}>
+						{t("contextStaleHint")}
+					</Menu.Label>
+				)}
 				<Menu.Label c="dimmed" fz={10}>
 					{t("activeThresholds", {
 						prune: activePruneStart ?? modelThresholds?.pruneStart,
@@ -8266,6 +8421,9 @@ export function NarratorPanel({
 															totalCostUsd={narrator.totalCostUsd}
 															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
 															onShowPrice={setPriceModel}
+															providerLabels={providerLabels}
+															onEditDefaultModel={() => setGlobalModelEditTarget("default")}
+															onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
 														/>
 													</Menu.Dropdown>
 												</Menu>
@@ -8511,6 +8669,9 @@ export function NarratorPanel({
 														onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
 														onShowPrice={setPriceModel}
 														label={t("modelTooltip")}
+														providerLabels={providerLabels}
+														onEditDefaultModel={() => setGlobalModelEditTarget("default")}
+														onEditSummaryModel={() => setGlobalModelEditTarget("summary")}
 													/>
 												</Menu.Dropdown>
 											</Menu>
@@ -9024,6 +9185,17 @@ export function NarratorPanel({
 				model={priceModel}
 				opened={priceModel != null}
 				onClose={() => setPriceModel(null)}
+			/>
+			<SetGlobalModelModal
+				opened={globalModelEditTarget != null}
+				mode={globalModelEditTarget}
+				groupedModels={groupedModels}
+				currentValue={globalModelEditTarget === "summary" ? summaryModelValue : defaultModelValue}
+				saving={updateSettingsMutation.isPending}
+				onClose={() => setGlobalModelEditTarget(null)}
+				onConfirm={
+					globalModelEditTarget === "summary" ? handleSetSummaryModel : handleSetDefaultModel
+				}
 			/>
 		</PermEnterHintCtx.Provider>
 	);

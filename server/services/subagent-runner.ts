@@ -18,6 +18,7 @@ import {
 } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import {
+	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -936,7 +937,9 @@ export async function runSubagent(input: RunSubagentInput): Promise<string> {
 		candidates: candidateModels,
 	});
 	if (modelPolicy.source !== "none" && !resolvedModelInput) {
-		const allowedModels = modelPolicy.models.map((entry) => entry.model);
+		const allowedModels = expandAllowedPoolForDisplay(
+			modelPolicy.models.map((entry) => entry.model),
+		);
 		throw new ValidationError(
 			modelPolicy.isExplicitEmpty
 				? `No models are allowed for "${modelPolicy.poolKey}" subagents by this narrator's custom trait.`

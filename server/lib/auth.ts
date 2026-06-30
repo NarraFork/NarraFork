@@ -2,8 +2,10 @@ import { count, eq } from "drizzle-orm";
 import { sign, verify } from "hono/jwt";
 import { db } from "../db";
 import { userPreferences, users } from "../db/schema";
+import { mfaService } from "../services/mfa-service";
 import { AppError } from "./errors";
 import { generateId } from "./id";
+import { issueMfaToken } from "./mfa";
 import { settings } from "./settings";
 
 /** Read JWT secret lazily so it picks up the auto-generated value even when
@@ -47,7 +49,15 @@ export async function createToken(userId: string, role: string): Promise<string>
 }
 
 export async function verifyToken(token: string): Promise<JwtPayload> {
-	return verify(token, getJwtSecret(), "HS256") as unknown as Promise<JwtPayload>;
+	const payload = (await verify(token, getJwtSecret(), "HS256")) as unknown as JwtPayload & {
+		stage?: string;
+	};
+	// Reject intermediate tokens (e.g. MFA challenge tokens carry `stage`).
+	// Only fully-authenticated session tokens are accepted as credentials.
+	if (payload.stage) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	return payload;
 }
 
 export async function registerUser(username: string, password: string, language?: string) {
@@ -105,7 +115,61 @@ export async function registerUser(username: string, password: string, language?
 	return { user, token, language: resolvedLang };
 }
 
-export async function loginUser(username: string, password: string) {
+export interface LoginSuccess {
+	user: {
+		id: string;
+		username: string;
+		role: string;
+		avatarColor: string | null;
+		avatarImageId: string | null;
+		createdAt: string;
+	};
+	token: string;
+	language: string;
+}
+
+export interface MfaChallenge {
+	mfaRequired: true;
+	mfaToken: string;
+	methods: Array<"totp" | "backup_code">;
+}
+
+/**
+ * Build a fully-authenticated session result (real JWT + profile + language)
+ * for a user id. Shared by password login (no second factor) and the MFA
+ * verify step (after the second factor is proven).
+ */
+export async function buildSessionResult(userId: string): Promise<LoginSuccess> {
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, userId),
+		columns: {
+			id: true,
+			username: true,
+			role: true,
+			avatarColor: true,
+			avatarImageId: true,
+			createdAt: true,
+		},
+	});
+	if (!user) {
+		throw new AppError("User not found", 404, "NOT_FOUND");
+	}
+	const pref = await db.query.userPreferences.findFirst({
+		where: eq(userPreferences.userId, user.id),
+		columns: { language: true },
+	});
+	const token = await createToken(user.id, user.role);
+	return { user, token, language: pref?.language ?? "en" };
+}
+
+/**
+ * Verify username + password. When the account has an active second factor,
+ * return an MFA challenge (no session token yet) instead of a session result.
+ */
+export async function loginUser(
+	username: string,
+	password: string,
+): Promise<LoginSuccess | MfaChallenge> {
 	const user = await db.query.users.findFirst({
 		where: eq(users.username, username),
 	});
@@ -118,22 +182,12 @@ export async function loginUser(username: string, password: string) {
 		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
 	}
 
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, user.id),
-		columns: { language: true },
-	});
+	// Gate on a second factor when one is enrolled. The real session token is
+	// only minted after the second factor is proven via /auth/mfa/verify.
+	if (await mfaService.isTotpActive(user.id)) {
+		const mfaToken = await issueMfaToken(user.id);
+		return { mfaRequired: true, mfaToken, methods: ["totp", "backup_code"] };
+	}
 
-	const token = await createToken(user.id, user.role);
-	return {
-		user: {
-			id: user.id,
-			username: user.username,
-			role: user.role,
-			avatarColor: user.avatarColor,
-			avatarImageId: user.avatarImageId,
-			createdAt: user.createdAt,
-		},
-		token,
-		language: pref?.language ?? "en",
-	};
+	return buildSessionResult(user.id);
 }

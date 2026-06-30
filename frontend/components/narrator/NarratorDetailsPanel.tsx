@@ -214,6 +214,7 @@ export function NarratorDetailsPanel({
 	const navigate = useNavigate();
 	const { t, i18n } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const { t: tn } = useTranslation("narrators");
 	const localizedErrorMessage = localizeNarratorError(
 		typeof narrator?.errorMessage === "string" ? narrator.errorMessage : null,
 		t,
@@ -248,6 +249,11 @@ export function NarratorDetailsPanel({
 	const isNamed = Array.isArray((narrator as any)?.traits)
 		? // biome-ignore lint/suspicious/noExplicitAny: loose
 			((narrator as any).traits as string[]).includes("named")
+		: false;
+	// biome-ignore lint/suspicious/noExplicitAny: narrator is loosely typed (ApiEntity)
+	const isKnowledgeSteward = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: loose
+			((narrator as any).traits as string[]).includes("knowledge-steward")
 		: false;
 	const { data: narratorGroupsData } = useNarratorGroups(
 		opened && isNamed ? narratorId : undefined,
@@ -571,6 +577,21 @@ export function NarratorDetailsPanel({
 			</SimpleGrid>
 
 			<DetailSection title={t("details.basic")}>
+				{isKnowledgeSteward ? (
+					<DetailRow
+						label={tn("knowledgeStewardBadge")}
+						value={
+							<Group gap="xs">
+								<Badge color="grape" variant="light" leftSection="📚">
+									{tn("knowledgeStewardBadge")}
+								</Badge>
+								<Anchor size="sm" onClick={() => navigate({ to: "/knowledge" })}>
+									{tn("knowledgeStewardOpenBase")}
+								</Anchor>
+							</Group>
+						}
+					/>
+				) : null}
 				<DetailRow
 					label={t("details.status")}
 					value={

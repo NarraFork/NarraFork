@@ -1,13 +1,23 @@
 import { Code, Divider, Table, Text } from "@mantine/core";
 import { AnimatedMarkdown } from "flowtoken";
 import "flowtoken/dist/styles.css";
-import { Component, memo, type ReactNode, useEffect, useMemo, useState } from "react";
+import {
+	Component,
+	createContext,
+	memo,
+	type ReactNode,
+	useContext,
+	useEffect,
+	useMemo,
+	useState,
+} from "react";
 import type { Components } from "react-markdown";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Pluggable, PluggableList } from "unified";
 import { MarkdownCodeBlock } from "./MarkdownCodeBlock";
 import classes from "./MarkdownContent.module.css";
+import { MermaidDiagram } from "./MermaidDiagram";
 import {
 	hasMarkdownMath,
 	isSafeForFlowtokenAnimation,
@@ -15,6 +25,26 @@ import {
 } from "./markdown-detection";
 
 export { MD_PATTERN } from "./markdown-detection";
+
+/**
+ * Carries the live `streaming` flag down to the markdown `code` renderer so the
+ * mermaid block can decide whether to render a diagram. During streaming the
+ * fenced source is still incomplete, so calling mermaid.render on it would throw
+ * and flash errors — we keep showing it as a plain code block until streaming ends.
+ */
+export const MermaidStreamingCtx = createContext(false);
+
+/**
+ * Render a ```mermaid block as a diagram, or — while still streaming — as a
+ * normal code block (incomplete syntax must not reach mermaid.render).
+ */
+function MermaidOrCode({ code }: { code: string }) {
+	const streaming = useContext(MermaidStreamingCtx);
+	if (streaming) {
+		return <MarkdownCodeBlock language="mermaid">{code}</MarkdownCodeBlock>;
+	}
+	return <MermaidDiagram code={code} />;
+}
 
 /** Recursively extract plain text from React children */
 export function extractText(node: ReactNode): string {
@@ -135,6 +165,11 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 			const isBlock = className?.startsWith("language-");
 			if (isBlock) {
 				const text = extractText(children);
+				// Mermaid fenced blocks render as diagrams (checked before the ASCII
+				// diagram heuristic, since mermaid sources can contain arrow glyphs).
+				if (lang === "mermaid") {
+					return <MermaidOrCode code={text} />;
+				}
 				const isDiagram = DIAGRAM_PATTERN.test(text);
 				if (isDiagram) {
 					return (
@@ -391,32 +426,39 @@ export const MarkdownContent = memo(function MarkdownContent({
 	if (shouldAnimate) {
 		return (
 			<MarkdownErrorBoundary fallback={plainFallback}>
-				<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-					<AnimatedMarkdown
-						content={trimmed}
-						sep="diff"
-						animation="blurIn"
-						animationDuration="0.35s"
-						animationTimingFunction="ease-out"
-						customComponents={flowtokenCustomComponents}
-					/>
-				</div>
+				<MermaidStreamingCtx.Provider value={true}>
+					<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+						<AnimatedMarkdown
+							content={trimmed}
+							sep="diff"
+							animation="blurIn"
+							animationDuration="0.35s"
+							animationTimingFunction="ease-out"
+							customComponents={flowtokenCustomComponents}
+						/>
+					</div>
+				</MermaidStreamingCtx.Provider>
 			</MarkdownErrorBoundary>
 		);
 	}
 
-	// Static mode: react-markdown with the same Mantine components (no animation)
+	// Static mode: react-markdown with the same Mantine components (no animation).
+	// `streaming` can still be true here: content containing a mermaid fence always
+	// matches MD_PATTERN, so it is routed to this path (not flowtoken). We forward the
+	// real streaming flag so an incomplete fence is shown as code until streaming ends.
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
-			<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-				<Markdown
-					remarkPlugins={remarkPlugins}
-					rehypePlugins={rehypePlugins}
-					components={staticComponents}
-				>
-					{markdownSource}
-				</Markdown>
-			</div>
+			<MermaidStreamingCtx.Provider value={!!streaming}>
+				<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+					<Markdown
+						remarkPlugins={remarkPlugins}
+						rehypePlugins={rehypePlugins}
+						components={staticComponents}
+					>
+						{markdownSource}
+					</Markdown>
+				</div>
+			</MermaidStreamingCtx.Provider>
 		</MarkdownErrorBoundary>
 	);
 });

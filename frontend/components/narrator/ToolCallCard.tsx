@@ -23,16 +23,21 @@ import { useClipboard, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconBan,
+	IconBook,
+	IconBookUpload,
 	IconCheck,
 	IconChevronDown,
 	IconChevronRight,
 	IconClock,
 	IconCode,
 	IconCopy,
+	IconDatabaseEdit,
+	IconDatabaseSearch,
 	IconDownload,
 	IconEye,
 	IconFileCode,
 	IconFilter,
+	IconGavel,
 	IconGitFork,
 	IconHistory,
 	IconInfoCircle,
@@ -47,6 +52,7 @@ import {
 	IconSearch,
 	IconShare,
 	IconShield,
+	IconShieldLock,
 	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
@@ -89,6 +95,7 @@ import { AutoFollowScroll } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
 import { ContentViewer } from "./ContentViewer";
 import { DiffView } from "./DiffView";
+import { KnowledgeDetail } from "./KnowledgeToolDetail";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
 import {
@@ -106,6 +113,7 @@ import { useRenderLod } from "./RenderLodCtx";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
+import { knowledgeSummary } from "./tool-display";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 const LazyStreamingCode = lazy(() =>
@@ -340,6 +348,14 @@ const SHARE_TOOLS = new Set(["ShareFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
+const KNOWLEDGE_TOOLS = new Set([
+	"KnowledgeSearch",
+	"KnowledgeRead",
+	"KnowledgeCreate",
+	"KnowledgeEdit",
+	"KnowledgeReview",
+	"KnowledgeAdmin",
+]);
 
 /**
  * Tools that cannot be re-executed via "allow and execute" (control / UI tools
@@ -391,6 +407,7 @@ export type ToolCategory =
 	| "recall"
 	| "skill"
 	| "browser"
+	| "knowledge"
 	| "generic";
 
 export function isEditTool(name: string): boolean {
@@ -418,10 +435,11 @@ export function getCategory(name: string): ToolCategory {
 	if (RECALL_TOOLS.has(name)) return "recall";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
+	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
 	return "generic";
 }
 
-export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
+export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
 	switch (cat) {
 		case "read":
 			return IconEye;
@@ -463,8 +481,30 @@ export function getCategoryIcon(cat: ToolCategory, _toolName?: string) {
 			return IconWand;
 		case "browser":
 			return IconWorldWww;
+		case "knowledge":
+			return getKnowledgeIcon(toolName);
 		default:
 			return IconCode;
+	}
+}
+
+/** Per-tool icon for the knowledge family (same category, distinct glyphs). */
+function getKnowledgeIcon(toolName?: string) {
+	switch (toolName) {
+		case "KnowledgeSearch":
+			return IconDatabaseSearch;
+		case "KnowledgeRead":
+			return IconBook;
+		case "KnowledgeCreate":
+			return IconBookUpload;
+		case "KnowledgeEdit":
+			return IconDatabaseEdit;
+		case "KnowledgeReview":
+			return IconGavel;
+		case "KnowledgeAdmin":
+			return IconShieldLock;
+		default:
+			return IconBook;
 	}
 }
 
@@ -510,6 +550,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "grape";
 		case "browser":
 			return "teal";
+		case "knowledge":
+			return "grape";
 		default:
 			return "gray";
 	}
@@ -1073,6 +1115,8 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 					return action || "Browser";
 			}
 		}
+		case "knowledge":
+			return knowledgeSummary(toolName, input, metadata);
 		default:
 			return toolName;
 	}
@@ -1510,7 +1554,7 @@ const ToolHeader = memo(
 		narratorId?: string;
 	}) {
 		const cat = getCategory(toolCall.toolName);
-		const Icon = getCategoryIcon(cat);
+		const Icon = getCategoryIcon(cat, toolCall.toolName);
 		const color = getCategoryColor(cat);
 		const summary = useMemo(
 			() => getSummary(toolCall.toolName, toolCall.inputJson, toolCall._metadata),
@@ -4078,6 +4122,13 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 			? toolCall.inputJson.plan
 			: "";
 
+	// `_planFile` marks a file-based plan; show its provenance so the user can see
+	// which plan file the body came from (the model only gets a path reference).
+	const planFile =
+		toolCall.toolName === "ExitPlanMode" && typeof toolCall.inputJson?._planFile === "string"
+			? toolCall.inputJson._planFile
+			: "";
+
 	const isDenied = toolCall.status === "fail" && toolCall.toolName === "ExitPlanMode";
 	// User feedback is stored in permissionDenyMessage (raw user input, not the full system prompt)
 	const denyFeedback = isDenied ? (toolCall.permissionDenyMessage ?? undefined) : undefined;
@@ -4086,6 +4137,12 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 	if (!planText) {
 		return null;
 	}
+
+	const planSourceNotice = planFile ? (
+		<Text size="xs" c="dimmed" ff="monospace" mb={4} truncate title={planFile}>
+			{t("planSourceFile", { file: planFile })}
+		</Text>
+	) : null;
 
 	// Denied plan: show feedback + collapsed plan content
 	if (isDenied) {
@@ -4112,6 +4169,7 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 				</UnstyledButton>
 				<LazyCollapse in={planExpanded}>
 					<Box style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}>
+						{planSourceNotice}
 						<ContentViewer
 							content={planText}
 							markdown
@@ -4126,6 +4184,7 @@ function PlanDetail({ toolCall, maxHeight }: { toolCall: ToolCallData; maxHeight
 
 	return (
 		<Box mt="xs" style={{ flex: 1, minHeight: 0, maxHeight: maxHeight ?? 400, overflow: "auto" }}>
+			{planSourceNotice}
 			<ContentViewer
 				content={planText}
 				markdown
@@ -4492,6 +4551,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <RecallDetail toolCall={toolCall} />;
 		case "browser":
 			return <BrowserDetail toolCall={toolCall} />;
+		case "knowledge":
+			return <KnowledgeDetail toolCall={toolCall} />;
 		default:
 			return <GenericDetail toolCall={toolCall} />;
 	}
@@ -5126,6 +5187,10 @@ export const ToolCallCard = memo(function ToolCallCard({
 	// Denied ExitPlanMode defaults to collapsed — plan content is folded inside PlanDetail.
 	const isFailed = toolCall.status === "fail";
 	const isDeniedPlan = isFailed && toolCall.toolName === "ExitPlanMode";
+	// Read-only knowledge lookups carry the most useful payload (results / entry body),
+	// so auto-expand them like recall; knowledge writes stay collapsed.
+	const isKnowledgeLookup =
+		toolCall.toolName === "KnowledgeSearch" || toolCall.toolName === "KnowledgeRead";
 	const shouldAutoOpenNonTruncated =
 		cat === "todo" ||
 		cat === "share" ||
@@ -5134,6 +5199,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		cat === "pipeline" ||
 		(cat === "await" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
 		(cat === "bash" && (toolCall.outputJson != null || toolCall.startedAt != null)) ||
+		(isKnowledgeLookup && toolCall.outputJson != null) ||
 		(cat === "plan" && !isDeniedPlan) ||
 		isEdit ||
 		(isFailed && !isEdit && !isDeniedPlan);
@@ -5456,10 +5522,25 @@ export const ToolCallCard = memo(function ToolCallCard({
 
 	const planStyle =
 		isPlan && vpHeight ? { maxHeight: vpHeight, overflow: "hidden auto" as const } : undefined;
-	const effectivePlanPreviewOverride =
+	// Edit-mode preview takes priority. Otherwise, for a live ExitPlanMode prompt,
+	// fall back to the plan carried by the pending permission: file-based plans are
+	// resolved server-side into the permission payload but never make it into the
+	// streamed tool_use input, so toolCall.inputJson.plan is empty until a reload
+	// re-hydrates it from the DB. Without this fallback the plan body renders blank
+	// while the approval buttons (which read the permission directly) show normally.
+	const editPlanPreviewOverride =
 		planPreviewOverride && pendingPermission?.id === planPreviewOverride.requestId
 			? planPreviewOverride.plan
 			: null;
+	const pendingPlanFallback =
+		isPlan &&
+		pendingPermission?.toolName === "ExitPlanMode" &&
+		typeof pendingPermission.inputJson?.plan === "string" &&
+		pendingPermission.inputJson.plan.trim() &&
+		!(typeof toolCall.inputJson?.plan === "string" && toolCall.inputJson.plan.trim())
+			? (pendingPermission.inputJson.plan as string)
+			: null;
+	const effectivePlanPreviewOverride = editPlanPreviewOverride ?? pendingPlanFallback;
 
 	const shimmerClass = isStreaming
 		? "tool-card-shimmer"
@@ -5682,7 +5763,7 @@ interface ToolCallGroupProps {
 export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCallGroupProps) {
 	const [expanded, setExpanded] = useState(false);
 	const cat = getCategory(toolCalls[0].toolName);
-	const Icon = getCategoryIcon(cat);
+	const Icon = getCategoryIcon(cat, toolCalls[0].toolName);
 	const color = getCategoryColor(cat);
 	const allDone = toolCalls.every((tc) => tc.status === "success");
 	const anyFailed = toolCalls.some((tc) => tc.status === "fail");

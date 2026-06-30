@@ -16,7 +16,7 @@ import {
 import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
-import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
+import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
 import {
 	type BooleanOverride,
@@ -34,6 +34,7 @@ import {
 } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
+	isKnowledgeStewardNarrator,
 	isPlanModeTrait,
 	isReadOnlySubagentVariant,
 	isSubagentVariant,
@@ -462,8 +463,12 @@ async function createNarrator(
 		_skillScopeKey: skillScopeKey,
 		_enabledOptionalTools: new Set(),
 		_disabledTools: getDisabledToolSet(narrator.traits),
+		_narratorKind: isKnowledgeStewardNarrator(narrator.traits) ? "knowledge" : undefined,
 		_interruptCleanupDone: false,
 		_substatus: new Set(),
+		// Explicitly null so a rebuilt active never carries a stale/undefined user.
+		// Set per-trigger by feedMessage / continue / retry / re-execute paths.
+		_currentUserId: null,
 	};
 
 	// Auto-load optional tools whose routines are globally enabled
@@ -1687,6 +1692,11 @@ export async function runAgentLoop(
 					// MCP tools: exclude tools with "deny" behavior
 					if (tool.name.startsWith("mcp__")) {
 						return isMcpToolAllowedForNarrator(tool);
+					}
+					// Knowledge Steward: drop a few unrelated core tools (e.g. web search/fetch).
+					// Deny-list only — never touches planning/reflection/goal control tools.
+					if (active._narratorKind === "knowledge" && KNOWLEDGE_KIND_DENY_CORE.has(tool.name)) {
+						return false;
 					}
 					return true;
 				},
@@ -3525,6 +3535,7 @@ export async function retryLastMessage(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	userId?: string | null,
 ): Promise<{ ok: boolean }> {
 	// Check if this is a subagent — subagent messages all have parentToolUseId
 	// set, so we must not filter on isNull(parentToolUseId) for them.
@@ -3586,6 +3597,8 @@ export async function retryLastMessage(
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	// Restore the triggering user so knowledge-base ACL works after a rebuild.
+	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined).catch(async (err) => {
@@ -3619,6 +3632,7 @@ export async function continueNarrator(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	userId?: string | null,
 ): Promise<{ ok: boolean }> {
 	// If the last top-level message is a tool-call assistant turn, replay the
 	// tool-result request packet instead of appending a textual "continue".
@@ -3651,6 +3665,8 @@ export async function continueNarrator(
 			undefined,
 			locale,
 			replyInUserLanguage,
+			null,
+			userId,
 		);
 		broadcastToNarrator(narratorId, {
 			type: "user_message",
@@ -3661,6 +3677,9 @@ export async function continueNarrator(
 	}
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	// Restore the triggering user so knowledge-base ACL works after a rebuild
+	// (interrupt may have destroyed the prior active, leaving _currentUserId unset).
+	active._currentUserId = userId ?? active._currentUserId ?? null;
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();
@@ -3765,6 +3784,7 @@ export async function reExecuteDeniedToolCall(
 	toolUseId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	userId?: string | null,
 ): Promise<ReExecuteDeniedResult> {
 	const narrator = await narratorService.getById(narratorId);
 	if (narrator.status === "working" || narrator.status === "waiting") {
@@ -3836,6 +3856,10 @@ export async function reExecuteDeniedToolCall(
 		.where(eq(narratorToolCalls.id, toolCall.id));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	// Restore the triggering user so knowledge-base ACL works after a rebuild.
+	// The active may have been freshly recreated (interrupt destroyed the old one),
+	// in which case _currentUserId would otherwise be undefined → null.
+	active._currentUserId = userId ?? active._currentUserId ?? null;
 	await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
 
 	broadcastToNarrator(narratorId, {
@@ -4012,8 +4036,9 @@ export async function reExecuteDeniedToolCall(
 	}
 
 	// Auto-continue: replay the freshly produced tool result so the model resumes
-	// from where it was interrupted.
-	await continueNarrator(narratorId, locale, replyInUserLanguage);
+	// from where it was interrupted. Forward the triggering user so knowledge ACL
+	// keeps working through the continued loop.
+	await continueNarrator(narratorId, locale, replyInUserLanguage, userId);
 	return { ok: true };
 }
 
@@ -4197,36 +4222,39 @@ function extractTextFileRefs(contentJson: unknown): TextFileRef[] {
  * New user messages are stored as images/text_files first, then text; editing
  * must not move or drop those attachment blocks or history replay/front-end
  * fetches can target the wrong shape (and attachments would silently vanish).
+ *
+ * Image handling:
+ *   - `opts.keepImageIds === undefined` → keep ALL existing images (legacy
+ *     behaviour: callers that don't manage images never lose them).
+ *   - `opts.keepImageIds` provided → keep only existing images whose imageId is
+ *     in the set (images the user removed during editing are dropped).
+ *   - `opts.newImages` → appended as fresh image blocks (uploaded during editing).
  */
 function buildEditedUserContentJson(
 	contentJson: unknown,
 	newContent: string,
 	fallbackUploadNarratorId?: string | null,
+	opts?: { keepImageIds?: string[]; newImages?: ImageRef[] },
 ): EditableUserContentBlock[] {
 	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
-	const newBlocks: EditableUserContentBlock[] = [];
-	let insertedText = false;
+	const keepSet = opts?.keepImageIds ? new Set(opts.keepImageIds) : null;
+	const imageBlocks: EditableUserContentBlock[] = [];
+	const textFileBlocks: EditableUserContentBlock[] = [];
 
 	for (const block of blocks) {
-		if (block.type === "text") {
-			if (!insertedText) {
-				newBlocks.push({ type: "text", text: newContent });
-				insertedText = true;
-			}
-			continue;
-		}
-
 		if (
 			block.type === "image" &&
 			typeof block.imageId === "string" &&
 			typeof block.filename === "string" &&
 			typeof block.mediaType === "string"
 		) {
+			// Drop images the user removed during editing.
+			if (keepSet && !keepSet.has(block.imageId)) continue;
 			const uploadNarratorId =
 				typeof block.uploadNarratorId === "string"
 					? block.uploadNarratorId
 					: fallbackUploadNarratorId;
-			newBlocks.push({
+			imageBlocks.push({
 				type: "image",
 				imageId: block.imageId,
 				filename: block.filename,
@@ -4242,7 +4270,7 @@ function buildEditedUserContentJson(
 			typeof block.filePath === "string" &&
 			typeof block.size === "number"
 		) {
-			newBlocks.push({
+			textFileBlocks.push({
 				type: "text_file",
 				filename: block.filename,
 				size: block.size,
@@ -4251,11 +4279,24 @@ function buildEditedUserContentJson(
 		}
 	}
 
-	if (!insertedText) {
-		newBlocks.push({ type: "text", text: newContent });
+	// Newly uploaded images during editing — keep them after existing ones.
+	// Prefer the ref's own uploadNarratorId (the narrator the files were saved
+	// under), falling back to the editing narrator.
+	if (opts?.newImages?.length) {
+		for (const img of opts.newImages) {
+			const uploadNarratorId = img.uploadNarratorId ?? fallbackUploadNarratorId;
+			imageBlocks.push({
+				type: "image",
+				imageId: img.imageId,
+				filename: img.filename,
+				mediaType: img.mediaType,
+				...(uploadNarratorId ? { uploadNarratorId } : {}),
+			});
+		}
 	}
 
-	return newBlocks;
+	// Canonical order matches freshly sent messages: images, text_files, text.
+	return [...imageBlocks, ...textFileBlocks, { type: "text", text: newContent }];
 }
 
 /**
@@ -4263,6 +4304,10 @@ function buildEditedUserContentJson(
  * Updates the message content, deletes everything after it, and re-runs the agent loop.
  * If rollback is true and the narrator is bound to a chapter, resets git to the state
  * before the original message was sent.
+ *
+ * `opts.keepImageIds` / `opts.newImages` let the caller manage attached images during
+ * editing (keep a subset of existing images, drop the rest, and/or append new uploads).
+ * When `opts` is omitted, all existing images are preserved (backward compatible).
  */
 export async function editAndRegenerate(
 	narratorId: string,
@@ -4271,6 +4316,7 @@ export async function editAndRegenerate(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	rollback = false,
+	opts?: { keepImageIds?: string[]; newImages?: ImageRef[]; userId?: string | null },
 ): Promise<{ ok: boolean }> {
 	// Guard before any destructive work (copy-on-write + deleteMessagesAfter below):
 	// refuse to edit/regenerate while a loop is already running on this narrator.
@@ -4305,19 +4351,28 @@ export async function editAndRegenerate(
 		});
 	}
 
-	// Update the editable text while preserving existing image block order and ownership.
+	// Rebuild blocks: keep the user-selected subset of existing images, drop the
+	// rest, append any newly uploaded images, and replace the editable text.
 	const newContentJson = buildEditedUserContentJson(
 		targetMsg.contentJson,
 		newContent,
 		targetMsg.narratorId,
+		opts,
 	);
-	const existingImages = extractImageRefs(targetMsg.contentJson, targetMsg.narratorId);
+	// Derive the final image refs from the rebuilt blocks so kept + new images
+	// (and only those) are sent to the model on regeneration.
+	const existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
 	const existingTextFiles = extractTextFileRefs(targetMsg.contentJson);
+
+	// When the edited text is empty but images remain, inject a placeholder so
+	// providers that gate on non-empty content still include the image blocks.
+	const effectiveText =
+		!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
 
 	// Re-inject the attached-files hint so the regenerated turn keeps access to
 	// any text-file attachments (contentText feeds the AI prompt + FTS index,
 	// while contentJson keeps the raw user text for display).
-	const effectivePrompt = newContent + buildAttachedFilesHint(existingTextFiles);
+	const effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
 	const privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 		contentText: effectivePrompt,
@@ -4357,6 +4412,8 @@ export async function editAndRegenerate(
 	const imageRefs = existingImages;
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+	// Restore the triggering user so knowledge-base ACL works after a rebuild.
+	active._currentUserId = opts?.userId ?? active._currentUserId ?? null;
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;
 	active._turnStartedAt = new Date().toISOString();

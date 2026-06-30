@@ -3,6 +3,7 @@ import { OPTIONAL_TOOLS, REVIEW_TOOLS } from "./agent/tools/index";
 import type { ToolDefinition } from "./agent/types";
 import { parseTraits } from "./narrator-utils";
 import { getVisibleModels, resolveAllowedModelCandidate, settings } from "./settings";
+import { expandAllowedPoolForDisplay } from "./settings/provider";
 
 export const SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX = "custom-subagent-models:";
 export const DISABLED_TOOLS_TRAIT_PREFIX = "custom-disabled-tools:";
@@ -282,7 +283,12 @@ export function formatSubagentModelRestrictionDescription(traits: unknown): stri
 			continue;
 		}
 		parts.push(
-			`${key}: ${entries.map((entry) => (entry.purpose ? `${entry.model} — ${entry.purpose}` : entry.model)).join("; ")}`,
+			`${key}: ${entries
+				.map((entry) => {
+					const models = expandAllowedPoolForDisplay([entry.model]).join(", ") || entry.model;
+					return entry.purpose ? `${models} — ${entry.purpose}` : models;
+				})
+				.join("; ")}`,
 		);
 	}
 	if (parts.length === 0) return null;

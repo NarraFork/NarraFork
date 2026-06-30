@@ -214,26 +214,26 @@ export function ensureFts(
 
 	// --- Sync triggers: knowledge_drafts (rowid-bound; title de-normalized from entry) ---
 	if (hasKnowledgeDrafts) {
-		// INSERT: index the new draft, pulling title from its parent entry.
+		// INSERT: index the new personal entry. Title comes from its own `title` (standalone
+		// entry) or, when linked (entry_id set), the parent global entry's title.
 		sqlite.run(`
 			CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_insert AFTER INSERT ON knowledge_drafts BEGIN
 				INSERT INTO knowledge_drafts_fts(rowid, title, content)
 				VALUES (
 					NEW.rowid,
-					(SELECT title FROM knowledge_entries WHERE id = NEW.entry_id),
+					COALESCE((SELECT title FROM knowledge_entries WHERE id = NEW.entry_id), NEW.title, ''),
 					NEW.content
 				);
 			END
 		`);
-		// UPDATE: delete+reinsert by rowid (content may change; title re-pulled in case
-		// the draft was somehow re-pointed — cheap and keeps it correct).
+		// UPDATE: delete+reinsert by rowid (content may change; title re-resolved).
 		sqlite.run(`
 			CREATE TRIGGER IF NOT EXISTS knowledge_drafts_fts_update AFTER UPDATE ON knowledge_drafts BEGIN
 				DELETE FROM knowledge_drafts_fts WHERE rowid = OLD.rowid;
 				INSERT INTO knowledge_drafts_fts(rowid, title, content)
 				VALUES (
 					NEW.rowid,
-					(SELECT title FROM knowledge_entries WHERE id = NEW.entry_id),
+					COALESCE((SELECT title FROM knowledge_entries WHERE id = NEW.entry_id), NEW.title, ''),
 					NEW.content
 				);
 			END
@@ -292,9 +292,9 @@ export function ensureFts(
 			sqlite.run("DELETE FROM knowledge_drafts_fts");
 			sqlite.run(`
 				INSERT INTO knowledge_drafts_fts(rowid, title, content)
-				SELECT d.rowid, e.title, d.content
+				SELECT d.rowid, COALESCE(e.title, d.title, ''), d.content
 				FROM knowledge_drafts d
-				JOIN knowledge_entries e ON e.id = d.entry_id
+				LEFT JOIN knowledge_entries e ON e.id = d.entry_id
 			`);
 		} catch (err) {
 			logger.warn("knowledge_drafts_fts populate failed on startup", { error: String(err) });

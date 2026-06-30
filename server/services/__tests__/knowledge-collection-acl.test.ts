@@ -313,7 +313,7 @@ describe("review path collection gate (pinned gap)", () => {
 			content: "proposed body",
 			contentHash: "h",
 			format: "markdown",
-			status: "pending_review",
+			status: "active",
 			createdAt: now,
 			updatedAt: now,
 		});

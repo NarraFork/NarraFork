@@ -27,6 +27,14 @@ export const api = {
 	...knowledgeApi,
 };
 
+export {
+	isMfaChallenge,
+	type LoginResult,
+	type LoginSession,
+	type MfaChallenge,
+	type MfaStatus,
+	type TotpSetupResult,
+} from "./auth";
 export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";
 export {
 	ApiError,
@@ -60,6 +68,7 @@ export type {
 	KnowledgeLinkDirection,
 	KnowledgeLinkEndpoint,
 	KnowledgeLinkType,
+	KnowledgePersonalEntry,
 	KnowledgeReviewResult,
 	KnowledgeRevision,
 	KnowledgeSearchResult,

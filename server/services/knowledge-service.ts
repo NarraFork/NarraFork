@@ -728,6 +728,8 @@ interface EntryRow {
 	snippet?: string;
 	/** Set by the draft search branch — this row reflects the caller's own draft. */
 	fromDraft?: boolean;
+	/** Set by the draft search branch — 1 when the draft's fork point is behind main. */
+	drifted?: number | boolean;
 }
 
 function mapRow(row: EntryRow) {
@@ -742,6 +744,7 @@ function mapRow(row: EntryRow) {
 		updatedAt: row.updated_at,
 		snippet: row.snippet ?? "",
 		fromDraft: row.fromDraft ?? false,
+		drifted: !!row.drifted,
 	};
 }
 
@@ -749,8 +752,8 @@ function mapRow(row: EntryRow) {
 const SEARCH_MAX_LIMIT = 100;
 /** Tighter cap for the unindexed short-query fallback to bound its scan cost. */
 const SHORT_QUERY_FALLBACK_LIMIT = 50;
-/** Active draft statuses that shadow the main version (mirror of branch service). */
-const ACTIVE_DRAFT_STATUSES = ["draft", "pending_review", "changes_requested"] as const;
+/** Personal-entry status that shadows the main version (mirror of branch service). */
+const ACTIVE_DRAFT_STATUS = "active";
 /** Hard cap on how many of a user's drafts participate in a single shadowed search. */
 const DRAFT_SHADOW_MAX = 200;
 
@@ -767,10 +770,10 @@ function activeDraftEntryIds(draftUserId: string): string[] {
 	const rows = sqlite
 		.prepare(
 			`SELECT DISTINCT entry_id FROM knowledge_drafts
-			 WHERE author_user_id = ? AND status IN (?, ?, ?)
+			 WHERE author_user_id = ? AND status = ? AND entry_id IS NOT NULL
 			 LIMIT ?`,
 		)
-		.all(draftUserId, ...ACTIVE_DRAFT_STATUSES, DRAFT_SHADOW_MAX) as { entry_id: string }[];
+		.all(draftUserId, ACTIVE_DRAFT_STATUS, DRAFT_SHADOW_MAX) as { entry_id: string }[];
 	return rows.map((r) => r.entry_id);
 }
 
@@ -878,7 +881,7 @@ function searchDrafts(
 		const params: (string | number | null)[] = [
 			ftsQuery,
 			draftUserId,
-			...ACTIVE_DRAFT_STATUSES,
+			ACTIVE_DRAFT_STATUS,
 			opts.collectionId ?? null,
 			opts.collectionId ?? null,
 		];
@@ -888,13 +891,14 @@ function searchDrafts(
 			.prepare(
 				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 				  e.created_at, e.updated_at,
+				  (d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) as drifted,
 				  snippet(knowledge_drafts_fts, 1, '[', ']', '...', 96) as snippet
 				 FROM knowledge_drafts_fts
 				 JOIN knowledge_drafts d ON d.rowid = knowledge_drafts_fts.rowid
 				 JOIN knowledge_entries e ON e.id = d.entry_id
 				 WHERE knowledge_drafts_fts MATCH ?
 				   AND d.author_user_id = ?
-				   AND d.status IN (?, ?, ?)
+				   AND d.status = ?
 				   AND (? IS NULL OR e.collection_id = ?)
 				   ${projectClause}
 				 ORDER BY rank LIMIT ?`,
@@ -908,7 +912,7 @@ function searchDrafts(
 			like,
 			like,
 			draftUserId,
-			...ACTIVE_DRAFT_STATUSES,
+			ACTIVE_DRAFT_STATUS,
 			opts.collectionId ?? null,
 			opts.collectionId ?? null,
 		];
@@ -918,12 +922,13 @@ function searchDrafts(
 			.prepare(
 				`SELECT e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 				  e.created_at, e.updated_at,
+				  (d.base_revision_id IS NOT NULL AND d.base_revision_id != e.current_revision_id) as drifted,
 				  substr(COALESCE(d.content, e.title), 1, 240) as snippet
 				 FROM knowledge_drafts d
 				 JOIN knowledge_entries e ON e.id = d.entry_id
 				 WHERE (? = '' OR e.title LIKE ? ESCAPE '\\' OR d.content LIKE ? ESCAPE '\\')
 				   AND d.author_user_id = ?
-				   AND d.status IN (?, ?, ?)
+				   AND d.status = ?
 				   AND (? IS NULL OR e.collection_id = ?)
 				   ${projectClause}
 				 ORDER BY d.updated_at DESC LIMIT ?`,

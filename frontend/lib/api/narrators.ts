@@ -168,6 +168,7 @@ export const narratorsApi = {
 		cwd?: string;
 		makeNamed?: boolean;
 		handle?: string;
+		kind?: "knowledge";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	// Named narrators (@handle mention targets)
 	listNamedNarrators: () => request<ApiEntity[]>("/narrators/named"),
@@ -583,11 +584,53 @@ export const narratorsApi = {
 			method: "POST",
 			body: JSON.stringify({ blockIndex }),
 		}),
-	editAndRegenerate: (narratorId: string, messageId: string, content: string, rollback: boolean) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
+	editAndRegenerate: async (
+		narratorId: string,
+		messageId: string,
+		content: string,
+		rollback: boolean,
+		opts?: { keepImageIds?: string[]; newImages?: File[] },
+	) => {
+		const headers: Record<string, string> = {};
+		const token = getToken();
+		if (token) headers.Authorization = `Bearer ${token}`;
+
+		let body: BodyInit;
+		if (opts?.newImages?.length) {
+			// Multipart: text + kept-image ids + newly uploaded image files.
+			const formData = new FormData();
+			formData.append("content", content);
+			formData.append("rollback", rollback ? "true" : "false");
+			if (opts.keepImageIds) {
+				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
+			}
+			for (const img of opts.newImages) formData.append("images", img);
+			body = formData;
+		} else {
+			headers["Content-Type"] = "application/json";
+			body = JSON.stringify({
+				content,
+				rollback,
+				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+			});
+		}
+
+		const res = await fetch(`${BASE}/narrators/${narratorId}/edit-and-regenerate/${messageId}`, {
 			method: "POST",
-			body: JSON.stringify({ content, rollback }),
-		}),
+			headers,
+			body,
+		});
+		if (res.status === 401) {
+			clearToken();
+			const error = await readFetchError(res, "Unauthorized");
+			throw new ApiError(error.message, 401, error.data);
+		}
+		if (!res.ok) {
+			const error = await readFetchError(res, "Request failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return res.json() as Promise<{ ok: boolean }>;
+	},
 	editAssistantMessage: (narratorId: string, messageId: string, content: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/edit-message/${messageId}`, {
 			method: "POST",

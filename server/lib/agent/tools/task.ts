@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
 import { shouldUseNativeSearch } from "../../search/native";
-import { getVisibleModels, settings } from "../../settings";
+import { expandAllowedPoolForDisplay, getVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 
 type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -42,7 +42,7 @@ function getModelParameterDescription(config?: AgentConfig): string {
 		for (const type of SUBAGENT_POOL_TYPES) {
 			const pool = pools[type];
 			if (pool && pool.length > 0) {
-				restrictedParts.push(`${type}: ${pool.join(", ")}`);
+				restrictedParts.push(`${type}: ${expandAllowedPoolForDisplay(pool).join(", ")}`);
 			} else {
 				unrestrictedTypes.push(type);
 			}

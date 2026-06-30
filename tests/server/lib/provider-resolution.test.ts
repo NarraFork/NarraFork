@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { getProvider, resolveProviderAndModel } from "../../../server/lib/agent/provider";
 import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/codex-manager";
 import {
+	expandAllowedPoolForDisplay,
+	getContextThresholds,
+	getModelContextWindow,
+	LARGE_CONTEXT_BOUNDARY,
 	resolveAllowedModelCandidate,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -295,5 +299,196 @@ describe("resolveProviderAndModel behavior", () => {
 			"deepseek:model-b",
 		);
 		expect(resolveEffectiveModel("__default__")).toBe("deepseek:model-a");
+	});
+});
+
+describe("follow-summary sentinel (__summary__)", () => {
+	let snapshot: ReturnType<typeof cloneSettingsSnapshot>;
+
+	beforeEach(() => {
+		snapshot = cloneSettingsSnapshot();
+		resetProviders();
+		settings.agent.modelAggregations = [];
+		__setCodexManagerForTests(undefined);
+	});
+	afterEach(() => {
+		restoreFromSnapshot(snapshot);
+		__setCodexManagerForTests(undefined);
+		for (const dir of tempDirs.splice(0)) {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("resolveEffectiveModel 解析到配置的摘要模型", () => {
+		settings.agent.defaultModel = "deepseek:default-x";
+		settings.agent.summaryModel = "deepseek:summary-y";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:summary-y");
+	});
+
+	test("修改摘要模型设置后跟随变化", () => {
+		settings.agent.summaryModel = "deepseek:summary-a";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:summary-a");
+		settings.agent.summaryModel = "deepseek:summary-b";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:summary-b");
+	});
+
+	test("摘要模型未设置时回退到默认模型", () => {
+		settings.agent.defaultModel = "deepseek:default-z";
+		settings.agent.summaryModel = "";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:default-z");
+	});
+
+	test("摘要模型自引用时回退到默认模型，避免递归", () => {
+		settings.agent.defaultModel = "deepseek:default-z";
+		settings.agent.summaryModel = "__summary__";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:default-z");
+	});
+
+	test("摘要模型支持聚合并解析到成员模型", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "sumagg",
+				name: "Summary Agg",
+				models: ["deepseek:m-a", "deepseek:m-b"],
+				routingMode: "balanced",
+			},
+		];
+		settings.agent.summaryModel = "__agg__:sumagg";
+		expect(resolveEffectiveModel("__summary__")).toBe("deepseek:m-a");
+	});
+
+	test("allowed pool 含 __summary__ 时显式摘要目标模型可匹配", () => {
+		settings.agent.summaryModel = "deepseek:summary-y";
+		expect(resolveAllowedModelCandidate("deepseek:summary-y", ["__summary__"])).toBe(
+			"deepseek:summary-y",
+		);
+		// 传哨兵本身也匹配
+		expect(resolveAllowedModelCandidate("__summary__", ["__summary__"])).toBe("__summary__");
+		// 不相关模型不匹配
+		expect(resolveAllowedModelCandidate("deepseek:other", ["__summary__"])).toBeNull();
+	});
+
+	test("展示保留哨兵 token 并标注当前指向", () => {
+		settings.agent.summaryModel = "deepseek:summary-y";
+		expect(expandAllowedPoolForDisplay(["__summary__"])).toEqual([
+			"summary (currently deepseek:summary-y)",
+		]);
+	});
+
+	test("展示能区分 default 与 summary 两个哨兵", () => {
+		settings.agent.defaultModel = "deepseek:default-x";
+		settings.agent.summaryModel = "deepseek:summary-y";
+		expect(expandAllowedPoolForDisplay(["__default__", "__summary__"])).toEqual([
+			"default (currently deepseek:default-x)",
+			"summary (currently deepseek:summary-y)",
+		]);
+	});
+});
+
+describe("getModelContextWindow / getContextThresholds 解析元模型引用", () => {
+	let snapshot: ReturnType<typeof cloneSettingsSnapshot>;
+
+	beforeEach(() => {
+		snapshot = cloneSettingsSnapshot();
+		resetProviders();
+		settings.agent.modelAggregations = [];
+		settings.agent.modelContextWindows = {};
+		settings.agent.contextThresholds = undefined;
+		__setCodexManagerForTests(undefined);
+	});
+	afterEach(() => {
+		restoreFromSnapshot(snapshot);
+		} else {
+		}
+		__setCodexManagerForTests(undefined);
+		for (const dir of tempDirs.splice(0)) {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("聚合值(provider/model 被拆分)解析到成员模型的上下文窗口", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "agg1m",
+				name: "1M Agg",
+				models: ["anthropic:claude-sonnet-4.6"],
+				routingMode: "priority",
+			},
+		];
+		// 模拟前端把 "__agg__:agg1m" 拆成 provider="__agg__", model="agg1m"
+		expect(getModelContextWindow("agg1m", "__agg__")).toBe(1_000_000);
+		// 也支持未拆分的完整聚合值
+		expect(getModelContextWindow("__agg__:agg1m", "")).toBe(1_000_000);
+	});
+
+	test("聚合值不再静默回退到 128k 默认值", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "aggbig",
+				name: "Big Agg",
+				models: ["anthropic:claude-sonnet-4.6"],
+				routingMode: "priority",
+			},
+		];
+		// 修复前：provider="__agg__"、model="aggbig" 匹配不到 → 回落 128k
+		expect(getModelContextWindow("aggbig", "__agg__")).not.toBe(128_000);
+	});
+
+	test("pinned 聚合值解析到被钉住的成员", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "aggpin",
+				name: "Pinned Agg",
+				models: ["anthropic:claude-sonnet-4.6", "deepseek:deepseek-chat"],
+				routingMode: "priority",
+			},
+		];
+		expect(getModelContextWindow("aggpin:deepseek:deepseek-chat", "__agg__")).toBe(64_000);
+	});
+
+	test("follow-default 哨兵解析到默认模型的上下文窗口", () => {
+		settings.agent.defaultModel = "anthropic:claude-sonnet-4.6";
+		expect(getModelContextWindow("__default__", "")).toBe(1_000_000);
+	});
+
+	test("聚合大上下文模型选中 large 档阈值", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "agglarge",
+				name: "Large Agg",
+				models: ["anthropic:claude-sonnet-4.6"],
+				routingMode: "priority",
+			},
+		];
+		settings.agent.contextThresholds = {
+			standard: { pruneStart: 80, compactStart: 90 },
+			large: { pruneStart: 70, compactStart: 85 },
+		};
+		// 成员是 1M 模型，应越过 LARGE_CONTEXT_BOUNDARY 落 large 档
+		expect(LARGE_CONTEXT_BOUNDARY).toBe(600_000);
+		expect(getContextThresholds("agglarge", "__agg__")).toEqual({
+			pruneStart: 70,
+			compactStart: 85,
+		});
+	});
+
+	test("解析聚合上下文窗口不推进 balanced 轮询", () => {
+		settings.agent.modelAggregations = [
+			{
+				id: "aggbal",
+				name: "Balanced Agg",
+				models: ["anthropic:claude-sonnet-4.6", "deepseek:deepseek-chat"],
+				routingMode: "balanced",
+			},
+		];
+		// 多次查询窗口应保持稳定(取第一个成员)，且不影响后续 resolveEffectiveModel 轮询
+		expect(getModelContextWindow("aggbal", "__agg__")).toBe(1_000_000);
+		expect(getModelContextWindow("aggbal", "__agg__")).toBe(1_000_000);
+		expect(resolveEffectiveModel("__agg__:aggbal")).toBe("anthropic:claude-sonnet-4.6");
+	});
+
+	test("具体模型不受影响", () => {
+		expect(getModelContextWindow("claude-sonnet-4.6", "anthropic")).toBe(1_000_000);
+		expect(getModelContextWindow("deepseek-chat", "deepseek")).toBe(64_000);
 	});
 });

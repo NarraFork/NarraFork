@@ -342,6 +342,9 @@ export function useCreateNarrator() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			cwd?: string;
+			makeNamed?: boolean;
+			handle?: string;
+			kind?: "knowledge";
 		}) => {
 			let shouldUseLegacyFastModeDefault = false;
 			try {

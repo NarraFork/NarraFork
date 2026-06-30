@@ -25,6 +25,7 @@ import {
 	IconSearch,
 	IconServer,
 	IconShield,
+	IconShieldLock,
 	IconTerminal2,
 	IconUser,
 	IconUsers,
@@ -78,6 +79,7 @@ function SettingsLayout() {
 
 	const personalItems: NavItem[] = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={18} /> },
+		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={18} /> },
 		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={18} /> },
 		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={18} /> },
 		{

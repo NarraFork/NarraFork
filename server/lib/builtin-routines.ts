@@ -130,14 +130,36 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "knowledge_create",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "KnowledgeCreate",
+			descriptionEn:
+				"Knowledge create — add a new entry to your personal library (or directly to the global base with write permission)",
+			descriptionZh: "知识库创建 — 在个人知识库新建条目（有写权限时可直接写入全局库）",
+		},
+	},
+	{
+		id: "knowledge_edit",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "KnowledgeEdit",
+			descriptionEn:
+				"Knowledge edit — save/rebase/publish your personal entries, update entry metadata, transfer ownership",
+			descriptionZh: "知识库编辑 — 保存/变基/发布个人条目，更新条目元数据，转移所有权",
+		},
+	},
+	{
 		id: "knowledge_review",
 		type: "tool",
 		category: "tools",
 		tool: {
 			toolName: "KnowledgeReview",
 			descriptionEn:
-				"Knowledge review & write — review/merge submitted drafts, create entries, write to main",
-			descriptionZh: "知识库审阅与写入 — 审阅/合并草稿提交、新建条目、直接写主线",
+				"Knowledge review — review and approve/reject publish requests into the global base, resolve conflicts",
+			descriptionZh: "知识库审阅 — 审阅并批准/驳回发布到全局库的请求，解决冲突",
 		},
 	},
 ];

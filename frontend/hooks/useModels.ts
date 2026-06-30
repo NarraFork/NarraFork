@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import {
 	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
+	FOLLOW_SUMMARY_MODEL,
 	groupModelsByProvider,
 	type ModelAggregation,
 	type ModelOption,
@@ -375,44 +376,61 @@ export function useAllModels() {
 				provider: "__agg__",
 			}));
 
-		// --- "Follow default" option ---
-		const defaultModelOption = visibleModels.find((m) => m.value === defaultModelValue);
-		const defaultModelLabel = defaultModelOption?.label ?? defaultModelValue;
-		const followDefaultOption: ModelOption = {
-			value: FOLLOW_DEFAULT_MODEL,
-			label: defaultModelLabel,
-			provider: "__default__",
-			// Carry the resolved default model's pricing/metadata so the model
-			// price popup works on the "follow default" entry too.
-			...(defaultModelOption?.pricing ? { pricing: defaultModelOption.pricing } : {}),
-			...(defaultModelOption?.officialInputUsd != null
-				? { officialInputUsd: defaultModelOption.officialInputUsd }
-				: {}),
-			...(defaultModelOption?.officialOutputUsd != null
-				? { officialOutputUsd: defaultModelOption.officialOutputUsd }
-				: {}),
-			...(defaultModelOption?.officialCacheCreationInputUsd != null
-				? {
-						officialCacheCreationInputUsd: defaultModelOption.officialCacheCreationInputUsd,
-					}
-				: {}),
-			...(defaultModelOption?.officialCacheReadInputUsd != null
-				? { officialCacheReadInputUsd: defaultModelOption.officialCacheReadInputUsd }
-				: {}),
-			...(defaultModelOption?.channelMultiplier != null
-				? { channelMultiplier: defaultModelOption.channelMultiplier }
-				: {}),
-			...(defaultModelOption?.contextWindow != null
-				? { contextWindow: defaultModelOption.contextWindow }
-				: {}),
-			...(defaultModelOption?.usdRate != null ? { usdRate: defaultModelOption.usdRate } : {}),
+		// --- "Follow default" / "Follow summary" options ---
+		// Build a meta "follow" option that carries the resolved target model's
+		// pricing/metadata so price popups work on the follow entry too.
+		const buildFollowOption = (
+			value: string,
+			provider: string,
+			targetValue: string,
+		): ModelOption => {
+			const target = visibleModels.find((m) => m.value === targetValue);
+			return {
+				value,
+				label: target?.label ?? targetValue,
+				provider,
+				...(target?.pricing ? { pricing: target.pricing } : {}),
+				...(target?.officialInputUsd != null ? { officialInputUsd: target.officialInputUsd } : {}),
+				...(target?.officialOutputUsd != null
+					? { officialOutputUsd: target.officialOutputUsd }
+					: {}),
+				...(target?.officialCacheCreationInputUsd != null
+					? { officialCacheCreationInputUsd: target.officialCacheCreationInputUsd }
+					: {}),
+				...(target?.officialCacheReadInputUsd != null
+					? { officialCacheReadInputUsd: target.officialCacheReadInputUsd }
+					: {}),
+				...(target?.channelMultiplier != null
+					? { channelMultiplier: target.channelMultiplier }
+					: {}),
+				...(target?.contextWindow != null ? { contextWindow: target.contextWindow } : {}),
+				...(target?.usdRate != null ? { usdRate: target.usdRate } : {}),
+			};
 		};
 
-		// Prepend follow-default and aggregations to visible models for grouped select
-		const visibleWithDefault = [followDefaultOption, ...aggModels, ...visibleModels];
+		const followDefaultOption = buildFollowOption(
+			FOLLOW_DEFAULT_MODEL,
+			"__default__",
+			defaultModelValue,
+		);
+
+		const followSummaryOption = buildFollowOption(
+			FOLLOW_SUMMARY_MODEL,
+			"__summary__",
+			summaryModelValue,
+		);
+
+		// Prepend follow-default, follow-summary and aggregations to visible models for grouped select
+		const visibleWithDefault = [
+			followDefaultOption,
+			followSummaryOption,
+			...aggModels,
+			...visibleModels,
+		];
 		const groupedModels = groupModelsByProvider(visibleWithDefault, {
 			...providerLabels,
 			__default__: "Default",
+			__summary__: "Summary",
 			__agg__: "Aggregations",
 		});
 
@@ -427,8 +445,12 @@ export function useAllModels() {
 			groupedModels,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
+			/** The "follow summary" ModelOption. */
+			followSummaryOption,
 			/** The current default model value from settings. */
 			defaultModelValue,
+			/** The current summary model value from settings. */
+			summaryModelValue,
 			/** Model aggregations from settings. */
 			aggregations,
 			/** Codex models only. */

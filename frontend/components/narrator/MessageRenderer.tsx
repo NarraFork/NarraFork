@@ -259,7 +259,12 @@ export function renderTreeMessages(
 	onManualSummarize?: (messageId: string) => void,
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void,
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void,
-	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void,
+	onEditAndRegenerate?: (
+		messageId: string,
+		newContent: string,
+		rollback: boolean,
+		opts?: { keepImageIds: string[]; newImages: File[] },
+	) => void,
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void,
 	onRestoreAssistantMessage?: (messageId: string) => void,
 	lastUserMessageId?: string,

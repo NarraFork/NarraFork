@@ -61,7 +61,20 @@ export function parseSubstatus(raw: unknown): string[] {
 // Trait helpers
 // ---------------------------------------------------------------------------
 
-export type NarratorTrait = "standalone" | "ask-in-passing" | "background" | "plan";
+export type NarratorTrait =
+	| "standalone"
+	| "ask-in-passing"
+	| "background"
+	| "plan"
+	| "knowledge-steward";
+
+/** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */
+export const KNOWLEDGE_KIND_TRAIT = "knowledge-steward";
+
+/** Whether the given traits mark this narrator as a Knowledge Steward. */
+export function isKnowledgeStewardNarrator(raw: unknown): boolean {
+	return parseTraits(raw).includes(KNOWLEDGE_KIND_TRAIT);
+}
 
 export const NARRATOR_DRAFT_TRAIT_PREFIX = "draft:";
 

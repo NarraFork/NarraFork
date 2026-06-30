@@ -541,6 +541,21 @@ narratorRoutes.post("/", async (c) => {
 		if (pref?.fastModeDefault) input = { ...input, fastMode: true };
 	}
 
+	// For specialized kinds (e.g. knowledge steward), the service preinstalls tools and a
+	// system prompt. Pass the creator's admin status (server-trusted, never from the body)
+	// so admin-only tools like KnowledgeAdmin are only preinstalled for admins, plus the
+	// locale for the default kind-specific prompt.
+	if (input.kind) {
+		const user = c.get("user");
+		const locale = await getUserLanguage(user.sub);
+		const narrator = await narratorService.create({
+			...input,
+			creatorIsAdmin: user.role === "admin",
+			locale,
+		});
+		return c.json(publicNarratorResponse(narrator), 201);
+	}
+
 	const narrator = await narratorService.create(input);
 	return c.json(publicNarratorResponse(narrator), 201);
 });
@@ -1254,7 +1269,7 @@ narratorRoutes.post("/:id/retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await retryLastMessage(id, locale, replyInUserLanguage);
+	const result = await retryLastMessage(id, locale, replyInUserLanguage, userId);
 	return c.json(result);
 });
 
@@ -1279,7 +1294,7 @@ narratorRoutes.post("/:id/continue", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await continueNarrator(id, locale, replyInUserLanguage);
+	const result = await continueNarrator(id, locale, replyInUserLanguage, userId);
 	return c.json(result);
 });
 
@@ -1306,7 +1321,7 @@ narratorRoutes.post("/:id/tool-calls/:toolUseId/allow-retry", async (c) => {
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
 
-	const result = await reExecuteDeniedToolCall(id, toolUseId, locale, replyInUserLanguage);
+	const result = await reExecuteDeniedToolCall(id, toolUseId, locale, replyInUserLanguage, userId);
 	if (!result.ok) {
 		const statusCode = result.reason === "not_found" ? 404 : 400;
 		return c.json({ error: "Cannot re-execute tool call", reason: result.reason }, statusCode);
@@ -1341,13 +1356,59 @@ narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
 	return c.json(result);
 });
 
-// Edit a user message and regenerate the response
+// Edit a user message and regenerate the response.
+// Supports JSON (text-only / keep-image-subset) and multipart/form-data (when the
+// user adds new images during editing).
 narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
-	const { content, rollback } = await c.req.json();
 
-	if (!content || typeof content !== "string") {
+	let content: string;
+	let rollback = false;
+	// undefined => keep all existing images (legacy); array => keep only these ids.
+	let keepImageIds: string[] | undefined;
+	const newImages: ImageRef[] = [];
+
+	const contentType = c.req.header("content-type") ?? "";
+	if (contentType.includes("multipart/form-data")) {
+		const formData = await c.req.formData();
+		content = (formData.get("content") as string) ?? "";
+		rollback = formData.get("rollback") === "true";
+		const keepRaw = formData.get("keepImageIds");
+		if (typeof keepRaw === "string") {
+			try {
+				const parsed = JSON.parse(keepRaw);
+				if (Array.isArray(parsed)) {
+					keepImageIds = parsed.filter((v): v is string => typeof v === "string");
+				}
+			} catch {
+				throw new ValidationError("keepImageIds must be a JSON array of strings");
+			}
+		}
+		const imageFiles = formData.getAll("images") as File[];
+		const keepCount = keepImageIds?.length ?? 0;
+		if (keepCount + imageFiles.length > 10) {
+			throw new ValidationError("Maximum 10 images per message");
+		}
+		for (const file of imageFiles) {
+			const ref = await saveUploadedImage(id, file);
+			// Tag with the narrator the file was actually saved under so previews /
+			// base64 loading resolve correctly even when the message is shared/forked.
+			newImages.push({ ...ref, uploadNarratorId: id });
+		}
+	} else {
+		const body = await c.req.json();
+		content = typeof body.content === "string" ? body.content : "";
+		rollback = !!body.rollback;
+		if (Array.isArray(body.keepImageIds)) {
+			keepImageIds = body.keepImageIds.filter((v: unknown): v is string => typeof v === "string");
+		}
+	}
+
+	// Allow empty text only when at least one image remains (kept or newly added).
+	const hasImages =
+		(keepImageIds === undefined ? true : keepImageIds.length > 0) || newImages.length > 0;
+	if (!content.trim() && !hasImages) {
 		throw new ValidationError("content is required");
 	}
 
@@ -1374,7 +1435,12 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		content,
 		locale,
 		replyInUserLanguage,
-		!!rollback,
+		rollback,
+		{
+			keepImageIds,
+			newImages: newImages.length > 0 ? newImages : undefined,
+			userId,
+		},
 	);
 	return c.json(result);
 });

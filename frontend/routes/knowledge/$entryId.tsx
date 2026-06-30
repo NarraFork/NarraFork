@@ -1,10 +1,10 @@
 import {
 	ActionIcon,
+	Alert,
 	Anchor,
 	Badge,
 	Button,
 	Card,
-	Code,
 	Container,
 	Group,
 	Paper,
@@ -17,7 +17,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
-import { IconArrowLeft, IconTrash } from "@tabler/icons-react";
+import { IconArrowLeft, IconGitMerge, IconTrash } from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,6 +25,7 @@ import { EntryAclPanel } from "../../components/knowledge/EntryAclPanel";
 import { EntryMetaPanel } from "../../components/knowledge/EntryMetaPanel";
 import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { DiffView } from "../../components/narrator/DiffView";
+import { MarkdownContent } from "../../components/narrator/MarkdownContent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useAddKnowledgeRevision,
@@ -32,12 +33,14 @@ import {
 	useCreateKnowledgeDraft,
 	useDeleteEntryLink,
 	useEntryLinks,
+	useKnowledgeDraftDrift,
 	useKnowledgeEntries,
 	useKnowledgeEntry,
 	useKnowledgeRevisions,
 	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
 	useMyKnowledgeDraft,
+	useRebaseKnowledgeDraft,
 	useSubmitKnowledgeDraft,
 	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
@@ -214,9 +217,7 @@ function ContentTab({
 			) : (
 				<Paper withBorder p="md">
 					{content ? (
-						<Code block style={{ whiteSpace: "pre-wrap" }}>
-							{content}
-						</Code>
+						<MarkdownContent text={content} />
 					) : (
 						<Text c="dimmed" size="sm">
 							{t("noContent")}
@@ -296,11 +297,14 @@ function HistoryTab({ entryId }: { entryId: string }) {
 function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: string }) {
 	const { t } = useTranslation("knowledge");
 	const myDraft = useMyKnowledgeDraft(entryId);
+	const drift = useKnowledgeDraftDrift(entryId);
 	const createDraft = useCreateKnowledgeDraft();
 	const updateDraft = useUpdateKnowledgeDraft();
 	const submitDraft = useSubmitKnowledgeDraft();
+	const rebaseDraft = useRebaseKnowledgeDraft();
 	const [content, setContent] = useState("");
 	const [dirty, setDirty] = useState(false);
+	const [conflict, setConflict] = useState<{ theirs: string; yours: string } | null>(null);
 
 	const draft = myDraft.data;
 	useEffect(() => {
@@ -339,8 +343,76 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 		draft.status === "changes_requested" ||
 		draft.status === "pending_review";
 
+	const driftData = drift.data;
+	const isDrifted = !!driftData && driftData.hasDraft && driftData.drifted;
+	const versionsBehind = driftData?.hasDraft && driftData.drifted ? driftData.versionsBehind : 0;
+
+	const onRebase = () => {
+		setConflict(null);
+		rebaseDraft.mutate(
+			{ draftId: draft.id, entryId },
+			{
+				onSuccess: (res) => {
+					if (res.ok) {
+						// Merged content is now persisted; drop local edits so the fresh draft shows.
+						setDirty(false);
+					} else if (res.conflict) {
+						setConflict({ theirs: res.conflict.theirs, yours: res.conflict.yours });
+					}
+				},
+			},
+		);
+	};
+
 	return (
 		<Stack>
+			{isDrifted ? (
+				<Alert color="orange" title={t("driftBanner")} icon={<IconGitMerge size={16} />}>
+					<Stack gap="xs">
+						<Text size="sm">
+							{versionsBehind > 0 ? t("driftDesc", { count: versionsBehind }) : t("driftDesc_zero")}
+						</Text>
+						<Group>
+							<Button
+								size="xs"
+								color="orange"
+								leftSection={<IconGitMerge size={14} />}
+								loading={rebaseDraft.isPending}
+								onClick={onRebase}
+							>
+								{rebaseDraft.isPending ? t("rebasing") : t("rebaseDraft")}
+							</Button>
+							<Text size="xs" c="dimmed">
+								{t("rebaseHint")}
+							</Text>
+						</Group>
+					</Stack>
+				</Alert>
+			) : null}
+
+			{conflict ? (
+				<Alert
+					color="red"
+					title={t("rebaseConflict")}
+					withCloseButton
+					onClose={() => setConflict(null)}
+				>
+					<Stack gap="xs">
+						<Text size="sm">{t("rebaseConflictDesc")}</Text>
+						<Text size="xs" c="dimmed">
+							{t("rebaseConflictMain")} → {t("rebaseConflictYours")}
+						</Text>
+						<DiffView
+							oldStr={conflict.theirs}
+							newStr={conflict.yours}
+							language="markdown"
+							maxHeight={280}
+							wordWrap
+						/>
+					</Stack>
+				</Alert>
+			) : null}
+
 			<Group justify="space-between">
 				<Badge variant="light" color={draft.status === "pending_review" ? "blue" : "gray"}>
 					{t(`draftStatus_${draft.status}`)}
@@ -393,7 +465,7 @@ function DraftTab({ entryId, mainContent }: { entryId: string; mainContent: stri
 
 			<div>
 				<Text size="xs" c="dimmed" mb={4}>
-					{t("draftVsMain")}
+					{isDrifted ? t("mainVsDraft") : t("draftVsMain")}
 				</Text>
 				<DiffView
 					oldStr={mainContent}

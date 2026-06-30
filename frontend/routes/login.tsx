@@ -6,6 +6,7 @@ import {
 	Loader,
 	Paper,
 	PasswordInput,
+	PinInput,
 	Stack,
 	Tabs,
 	Text,
@@ -15,8 +16,9 @@ import {
 import { createFileRoute, Link, Navigate, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAuthStatus, useLogin, useRegister } from "../hooks/useAuth";
+import { useAuthStatus, useLogin, useMfaVerify, useRegister } from "../hooks/useAuth";
 import { type ApiError, getToken } from "../lib/api";
+import { isMfaChallenge } from "../lib/api/auth";
 
 /** Map backend error codes to i18n keys in the "common" namespace. */
 function mapAuthErrorCode(e: ApiError): string | null {
@@ -27,6 +29,9 @@ function mapAuthErrorCode(e: ApiError): string | null {
 		UNAUTHORIZED: "authRequired",
 		TOKEN_EXPIRED: "tokenExpired",
 		NOT_FOUND: "userNotFound",
+		MFA_CODE_INVALID: "mfaCodeInvalid",
+		MFA_TOKEN_INVALID: "mfaSessionExpired",
+		MFA_LOCKED: "mfaLocked",
 	};
 	return mapping[code] ?? null;
 }
@@ -40,11 +45,17 @@ function LoginPage() {
 	const { data: authStatus, isLoading: statusLoading } = useAuthStatus();
 	const login = useLogin();
 	const register = useRegister();
+	const mfaVerify = useMfaVerify();
 	const { t, i18n } = useTranslation("common");
 
 	const [username, setUsername] = useState("");
 	const [password, setPassword] = useState("");
 	const [error, setError] = useState("");
+
+	// MFA second-step state
+	const [mfaToken, setMfaToken] = useState<string | null>(null);
+	const [mfaCode, setMfaCode] = useState("");
+	const [useBackupCode, setUseBackupCode] = useState(false);
 
 	// If already logged in, redirect
 	if (getToken()) {
@@ -65,13 +76,54 @@ function LoginPage() {
 	const handleLogin = async () => {
 		setError("");
 		try {
-			await login.mutateAsync({ username, password });
+			const result = await login.mutateAsync({ username, password });
+			if (isMfaChallenge(result)) {
+				// Password verified; advance to the second factor.
+				setMfaToken(result.mfaToken);
+				setMfaCode("");
+				setUseBackupCode(false);
+				return;
+			}
 			navigate({ to: "/" });
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		} catch (e: any) {
 			const i18nKey = mapAuthErrorCode(e);
 			setError(i18nKey ? t(i18nKey) : e.message || t("unknownError"));
 		}
+	};
+
+	const handleMfaVerify = async (codeOverride?: string) => {
+		setError("");
+		if (!mfaToken) return;
+		const code = (codeOverride ?? mfaCode).trim();
+		if (!code) return;
+		try {
+			await mfaVerify.mutateAsync({
+				mfaToken,
+				method: useBackupCode ? "backup_code" : "totp",
+				code,
+			});
+			navigate({ to: "/" });
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		} catch (e: any) {
+			const code = (e?.data as Record<string, unknown> | undefined)?.code;
+			// When the challenge session is dead (expired or locked out), return to
+			// the password step so the user can start over.
+			if (code === "MFA_TOKEN_INVALID" || code === "MFA_LOCKED") {
+				setMfaToken(null);
+				setPassword("");
+			}
+			const i18nKey = mapAuthErrorCode(e);
+			setError(i18nKey ? t(i18nKey) : e.message || t("unknownError"));
+			setMfaCode("");
+		}
+	};
+
+	const cancelMfa = () => {
+		setMfaToken(null);
+		setMfaCode("");
+		setError("");
+		setPassword("");
 	};
 
 	const validateRegisterFields = (): string | null => {
@@ -114,7 +166,60 @@ function LoginPage() {
 							NarraFork
 						</Title>
 
-						{needsSetup ? (
+						{mfaToken ? (
+							<Stack>
+								<Text size="sm" c="dimmed" ta="center">
+									{useBackupCode ? t("mfaBackupPrompt") : t("mfaTotpPrompt")}
+								</Text>
+								{error && <Alert color="red">{error}</Alert>}
+								{useBackupCode ? (
+									<TextInput
+										label={t("mfaBackupCode")}
+										placeholder="xxxx-xxxx"
+										value={mfaCode}
+										onChange={(e) => setMfaCode(e.currentTarget.value)}
+										onKeyDown={(e) => handleKeyDown(e, () => handleMfaVerify())}
+										autoFocus
+									/>
+								) : (
+									<Center>
+										<PinInput
+											length={6}
+											type="number"
+											inputMode="numeric"
+											oneTimeCode
+											value={mfaCode}
+											onChange={setMfaCode}
+											onComplete={(value) => handleMfaVerify(value)}
+											autoFocus
+										/>
+									</Center>
+								)}
+								<Button
+									onClick={() => handleMfaVerify()}
+									loading={mfaVerify.isPending}
+									disabled={!mfaCode.trim()}
+								>
+									{t("mfaVerify")}
+								</Button>
+								<Anchor
+									component="button"
+									type="button"
+									size="xs"
+									ta="center"
+									onClick={() => {
+										setUseBackupCode((v) => !v);
+										setMfaCode("");
+										setError("");
+									}}
+								>
+									{useBackupCode ? t("mfaUseAuthenticator") : t("mfaUseBackupCode")}
+								</Anchor>
+								<Anchor component="button" type="button" size="xs" c="dimmed" onClick={cancelMfa}>
+									{t("mfaBackToLogin")}
+								</Anchor>
+							</Stack>
+						) : needsSetup ? (
 							<>
 								<Alert color="blue" variant="light" title={t("firstUserSetupTitle")}>
 									<Text size="sm">{t("firstUserSetupDescription")}</Text>

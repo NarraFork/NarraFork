@@ -118,6 +118,14 @@ export function registerClineModelLister(lister: () => string[]): void {
  */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
+/**
+ * Sentinel value indicating "follow the summary model from settings"
+ * (`settings.agent.summaryModel`). Like FOLLOW_DEFAULT_MODEL it is a meta
+ * reference that resolves dynamically, so it keeps following the user's
+ * summary-model setting rather than being pinned to a concrete model.
+ */
+export const FOLLOW_SUMMARY_MODEL = "__summary__";
+
 /** Hard fallback used if the configured default model is accidentally self-referential. */
 
 /**
@@ -241,6 +249,12 @@ function isFollowDefaultModelValue(model: string): boolean {
 	return !!parsed.provider && parsed.model === FOLLOW_DEFAULT_MODEL;
 }
 
+function isFollowSummaryModelValue(model: string): boolean {
+	if (model === FOLLOW_SUMMARY_MODEL) return true;
+	const parsed = parseModelId(model);
+	return !!parsed.provider && parsed.model === FOLLOW_SUMMARY_MODEL;
+}
+
 function sanitizeResolvedModelCandidate(model: string | null | undefined): string | null {
 	const trimmed = model?.trim();
 	if (!trimmed) return null;
@@ -266,14 +280,52 @@ function resolveConfiguredDefaultModel(stickyProvider?: string): string {
 	return configured;
 }
 
+function resolveConfiguredSummaryModel(stickyProvider?: string): string {
+	const configured = s().agent.summaryModel?.trim();
+	// Fall back to the default model when summary is unset/self-referential.
+	if (!configured || isFollowSummaryModelValue(configured)) {
+		return resolveConfiguredDefaultModel(stickyProvider);
+	}
+	if (isFollowDefaultModelValue(configured)) return resolveConfiguredDefaultModel(stickyProvider);
+
+	const agg = parseAggModelValue(configured);
+	if (agg) {
+		if (agg.pinnedModel) {
+			return sanitizeResolvedModelCandidate(agg.pinnedModel) ?? FALLBACK_DEFAULT_MODEL;
+		}
+		return (
+			sanitizeResolvedModelCandidate(resolveAggregation(agg.aggId, stickyProvider)) ??
+			FALLBACK_DEFAULT_MODEL
+		);
+	}
+
+	return configured;
+}
+
+/**
+ * Strip a trailing human-readable display annotation from a model reference,
+ * e.g. "default (currently S2A:gpt-5.5)" -> "default" or
+ * "__agg__:abc (→ x, y)" -> "__agg__:abc". This lets a caller pass back either
+ * the bare sentinel/token or the full annotated string shown in descriptions.
+ */
+function stripModelDisplayAnnotation(model: string): string {
+	return model.replace(/\s*\((?:currently|→)[^)]*\)\s*$/i, "").trim();
+}
+
 function normalizeModelReference(model: string | null | undefined): string | null {
-	const trimmed = model?.trim();
+	const trimmed = stripModelDisplayAnnotation(model?.trim() ?? "");
 	if (!trimmed) return null;
-	return trimmed === "default" ? FOLLOW_DEFAULT_MODEL : trimmed;
+	if (trimmed === "default") return FOLLOW_DEFAULT_MODEL;
+	if (trimmed === "summary") return FOLLOW_SUMMARY_MODEL;
+	return trimmed;
 }
 
 function isMetaModelReference(model: string): boolean {
-	return isFollowDefaultModelValue(model) || !!parseAggModelValue(model);
+	return (
+		isFollowDefaultModelValue(model) ||
+		isFollowSummaryModelValue(model) ||
+		!!parseAggModelValue(model)
+	);
 }
 
 function expandModelReferenceForMatching(
@@ -290,6 +342,13 @@ function expandModelReferenceForMatching(
 
 	if (isFollowDefaultModelValue(normalized)) {
 		for (const value of expandModelReferenceForMatching(s().agent.defaultModel, seen)) {
+			values.add(value);
+		}
+		return values;
+	}
+
+	if (isFollowSummaryModelValue(normalized)) {
+		for (const value of expandModelReferenceForMatching(s().agent.summaryModel, seen)) {
 			values.add(value);
 		}
 		return values;
@@ -348,12 +407,59 @@ export function resolveAllowedModelCandidate(
 	return null;
 }
 
+/**
+ * Format a pool of (possibly meta) model references for human/agent display.
+ *
+ * Meta references are kept as their token to preserve their "follow" semantics,
+ * but annotated with what they currently resolve to so the agent can pick
+ * correctly without guessing:
+ *   - follow-default sentinel  -> "default (currently <model>)"
+ *   - aggregation              -> "__agg__:<id> (currently <models>)"
+ * Concrete models are shown as-is. Order is preserved; duplicate tokens removed.
+ *
+ * Pass the resulting string (or just the bare token, e.g. "default") back as a
+ * model argument — `normalizeModelReference` strips the annotation.
+ */
+export function expandAllowedPoolForDisplay(pool: string[]): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const raw of pool) {
+		const normalized = normalizeModelReference(raw);
+		if (!normalized || seen.has(normalized)) continue;
+		seen.add(normalized);
+
+		if (!isMetaModelReference(normalized)) {
+			result.push(normalized);
+			continue;
+		}
+
+		// Meta reference: keep the token, annotate the current concrete target(s).
+		const concrete: string[] = [];
+		const concreteSeen = new Set<string>();
+		for (const value of expandModelReferenceForMatching(normalized)) {
+			if (!isMetaModelReference(value) && !concreteSeen.has(value)) {
+				concreteSeen.add(value);
+				concrete.push(value);
+			}
+		}
+		const token =
+			normalized === FOLLOW_DEFAULT_MODEL
+				? "default"
+				: normalized === FOLLOW_SUMMARY_MODEL
+					? "summary"
+					: normalized;
+		result.push(concrete.length > 0 ? `${token} (currently ${concrete.join(", ")})` : token);
+	}
+	return result;
+}
+
 export function resolveEffectiveModel(
 	model: string | null | undefined,
 	stickyProvider?: string,
 ): string {
 	const raw = model?.trim();
 	if (!raw || isFollowDefaultModelValue(raw)) return resolveConfiguredDefaultModel(stickyProvider);
+	if (isFollowSummaryModelValue(raw)) return resolveConfiguredSummaryModel(stickyProvider);
 
 	const agg = parseAggModelValue(raw);
 	if (agg) {
@@ -643,6 +749,35 @@ export function resolveProvider(model?: string): string {
 // Context window sizes
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve a meta-model reference (follow-default sentinel or aggregation value)
+ * to a representative concrete "provider:model" for capability/context-window
+ * lookups. Unlike `resolveEffectiveModel`/`resolveAggregation`, this is side
+ * effect free: balanced aggregations resolve to their first member instead of
+ * advancing the round-robin counter, since lookups must not perturb routing.
+ * Concrete or unknown values pass through unchanged.
+ */
+function resolveMetaModelForLookup(model: string, seen = new Set<string>()): string {
+	const raw = model?.trim();
+	if (!raw || seen.has(raw)) return raw ?? "";
+	seen.add(raw);
+
+	if (isFollowDefaultModelValue(raw)) {
+		const configured = s().agent.defaultModel?.trim();
+		if (!configured || isFollowDefaultModelValue(configured)) return FALLBACK_DEFAULT_MODEL;
+		return resolveMetaModelForLookup(configured, seen);
+	}
+
+	const agg = parseAggModelValue(raw);
+	if (!agg) return raw;
+
+	if (agg.pinnedModel) return resolveMetaModelForLookup(agg.pinnedModel, seen);
+
+	const first = getAggregation(agg.aggId)?.models[0];
+	if (!first) return raw;
+	return resolveMetaModelForLookup(first, seen);
+}
+
 interface ModelContextConfig {
 	contextLength: number;
 	maxCompletionTokens?: number;
@@ -731,6 +866,28 @@ export function getBuiltinModelContextWindows(
 }
 
 export function getModelContextWindow(model: string, provider: string): number | null {
+	// Defensive: callers may pass a meta-model reference instead of a concrete
+	// model — either the follow-default sentinel or an aggregation value. When an
+	// aggregation value (`__agg__:<id>`) is split into provider/model halves by a
+	// caller, it arrives as provider="__agg__", model="<id>". Resolve such meta
+	// references to a representative concrete model first, otherwise the lookup
+	// matches nothing and silently falls back to the 128k default (wrong tier for
+	// large-context models). Resolution here is side-effect free: it does not
+	// advance balanced-aggregation round-robin state.
+	const reconstructed = provider ? `${provider}:${model}` : model;
+	const metaRef = isMetaModelReference(reconstructed)
+		? reconstructed
+		: isMetaModelReference(model)
+			? model
+			: null;
+	if (metaRef) {
+		const concrete = resolveMetaModelForLookup(metaRef);
+		if (concrete && concrete !== metaRef) {
+			const parsed = parseModelId(concrete);
+			return getModelContextWindow(parsed.model, parsed.provider ?? "");
+		}
+	}
+
 	const bareModel = parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
 

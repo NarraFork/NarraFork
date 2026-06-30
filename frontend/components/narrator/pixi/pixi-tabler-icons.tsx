@@ -1,6 +1,7 @@
 import {
 	type Icon,
 	IconBan,
+	IconBook,
 	IconBrain,
 	IconCheck,
 	IconChevronDown,
@@ -76,6 +77,8 @@ function iconForCategory(category?: ToolCategory): Icon {
 			return IconWand;
 		case "browser":
 			return IconWorldWww;
+		case "knowledge":
+			return IconBook;
 		default:
 			return IconCode;
 	}

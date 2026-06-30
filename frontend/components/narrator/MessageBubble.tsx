@@ -98,6 +98,12 @@ import {
 	useMessageSelection,
 } from "./MessageSelectionCtx";
 import { generateBlockKeys } from "./message-segments";
+import {
+	ACCEPTED_TYPES,
+	MAX_IMAGE_LONG_EDGE,
+	MAX_IMAGE_SIZE,
+	resizeImageIfNeeded,
+} from "./narrator-panel-types";
 import { useRenderLod } from "./RenderLodCtx";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
@@ -288,7 +294,12 @@ interface MessageBubbleProps {
 	onManualSummarize?: (messageId: string) => void;
 	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
-	onEditAndRegenerate?: (messageId: string, newContent: string, rollback: boolean) => void;
+	onEditAndRegenerate?: (
+		messageId: string,
+		newContent: string,
+		rollback: boolean,
+		opts?: { keepImageIds: string[]; newImages: File[] },
+	) => void;
 	/** Edit assistant message text without deleting later messages or regenerating. */
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
 	/** Restore an edited assistant message back to its original text, clearing the edit marker. */
@@ -1296,6 +1307,129 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 				loading="lazy"
 				style={{ cursor: "pointer", maxWidth: "100%" }}
 				onClick={() => window.open(src, "_blank")}
+			/>
+		</Box>
+	);
+}
+
+/**
+ * Compact 60×60 thumbnail of an already-persisted image, used inside the user
+ * message edit mode so the editor can see (and remove) existing attachments.
+ * Reuses the same `/api/uploads/:narratorId/:imageId` blob fetch as ImageBlock.
+ */
+function EditExistingImageThumb({
+	block,
+	imageNarratorId,
+	onRemove,
+}: {
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
+	block: any;
+	imageNarratorId?: string;
+	onRemove: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const uploadCapability = useUploadCapability();
+	const narratorImageServing = uploadCapability.serveNarratorImages;
+	const [blobUrl, setBlobUrl] = useState<string | null>(null);
+	const uploadNarratorId =
+		typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : imageNarratorId;
+
+	useEffect(() => {
+		if (block.previewUrl || !narratorImageServing.supported || !uploadNarratorId || !block.imageId)
+			return;
+		const token = getToken();
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		let cancelled = false;
+		let objectUrl: string | null = null;
+		fetch(`/api/uploads/${uploadNarratorId}/${block.imageId}`, { headers })
+			.then((res) => {
+				if (!res.ok) {
+					if (res.status === 401) clearToken();
+					return null;
+				}
+				return res.blob();
+			})
+			.then((blob) => {
+				if (blob && !cancelled && blob.size <= MAX_MESSAGE_IMAGE_PREVIEW_BLOB_BYTES) {
+					objectUrl = URL.createObjectURL(blob);
+					setBlobUrl(objectUrl);
+				}
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+			if (objectUrl) URL.revokeObjectURL(objectUrl);
+		};
+	}, [uploadNarratorId, block.imageId, block.previewUrl, narratorImageServing.supported]);
+
+	const src = block.previewUrl ?? blobUrl;
+
+	return (
+		<Box pos="relative" style={{ display: "inline-block" }}>
+			{src ? (
+				<Image
+					src={src}
+					alt={block.filename ?? "image"}
+					radius="sm"
+					h={60}
+					w={60}
+					fit="cover"
+					style={{ cursor: "pointer" }}
+					onClick={() => window.open(src, "_blank")}
+				/>
+			) : (
+				<Skeleton h={60} w={60} radius="sm" />
+			)}
+			<CloseButton
+				size="xs"
+				radius="xl"
+				variant="filled"
+				color="dark"
+				style={{ position: "absolute", top: -6, right: -6 }}
+				onClick={onRemove}
+				title={t("removeImage")}
+			/>
+		</Box>
+	);
+}
+
+/**
+ * 60×60 preview of a freshly-selected (not yet uploaded) image File during edit
+ * mode. Manages its own object URL lifecycle.
+ */
+function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => void }) {
+	const { t } = useTranslation("narrator");
+	const [url, setUrl] = useState<string | null>(null);
+	useEffect(() => {
+		const objectUrl = URL.createObjectURL(file);
+		setUrl(objectUrl);
+		return () => URL.revokeObjectURL(objectUrl);
+	}, [file]);
+	return (
+		<Box pos="relative" style={{ display: "inline-block" }}>
+			{url ? (
+				<Image
+					src={url}
+					alt={file.name}
+					radius="sm"
+					h={60}
+					w={60}
+					fit="cover"
+					style={{ cursor: "pointer" }}
+					onClick={() => url && window.open(url, "_blank")}
+				/>
+			) : (
+				<Skeleton h={60} w={60} radius="sm" />
+			)}
+			<CloseButton
+				size="xs"
+				radius="xl"
+				variant="filled"
+				color="dark"
+				style={{ position: "absolute", top: -6, right: -6 }}
+				onClick={onRemove}
+				title={t("removeImage")}
 			/>
 		</Box>
 	);
@@ -3077,6 +3211,20 @@ export const MessageBubble = memo(function MessageBubble({
 	const [isEditing, setIsEditing] = useState(false);
 	const [editContent, setEditContent] = useState("");
 	const [showConfirmModal, setShowConfirmModal] = useState(false);
+	// Existing image blocks kept during editing (user can remove some) + newly
+	// added image files. Only meaningful for user messages.
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON image blocks
+	const [editKeptImages, setEditKeptImages] = useState<any[]>([]);
+	const [editNewImages, setEditNewImages] = useState<File[]>([]);
+	// Mirror the kept-image count in a ref so the async add-images flow reads the
+	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
+	// closure capture when computing remaining room.
+	const editKeptCountRef = useRef(0);
+	editKeptCountRef.current = editKeptImages.length;
+	const editFileInputRef = useRef<HTMLInputElement | null>(null);
+	const editImageNarratorId = message.narratorId ?? narratorId;
+	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
+	const canSubmitEdit = !!editContent.trim() || hasEditImages;
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
@@ -3087,6 +3235,18 @@ export const MessageBubble = memo(function MessageBubble({
 			return;
 		}
 		setEditContent(editPreview.text);
+		// Seed kept-images from the message's existing image blocks (user-only).
+		if (isUser) {
+			setEditKeptImages(
+				blocks.filter(
+					(b: { type?: string; imageId?: unknown }) =>
+						b.type === "image" && typeof b.imageId === "string",
+				),
+			);
+		} else {
+			setEditKeptImages([]);
+		}
+		setEditNewImages([]);
 		setIsEditing(true);
 	}, [blocks, isUser, t]);
 
@@ -3094,45 +3254,114 @@ export const MessageBubble = memo(function MessageBubble({
 		setIsEditing(false);
 		setEditContent("");
 		setShowConfirmModal(false);
+		setEditKeptImages([]);
+		setEditNewImages([]);
 	}, []);
 
+	const resetEditState = useCallback(() => {
+		setIsEditing(false);
+		setEditContent("");
+		setEditKeptImages([]);
+		setEditNewImages([]);
+	}, []);
+
+	const removeKeptImage = useCallback((imageId: string) => {
+		setEditKeptImages((prev) => prev.filter((b) => b.imageId !== imageId));
+	}, []);
+
+	const removeNewImage = useCallback((index: number) => {
+		setEditNewImages((prev) => prev.filter((_, i) => i !== index));
+	}, []);
+
+	const handleAddEditImages = useCallback(
+		async (files: File[]) => {
+			const valid = files.filter(
+				(f) => ACCEPTED_TYPES.includes(f.type) && f.size <= MAX_IMAGE_SIZE,
+			);
+			if (valid.length === 0) return;
+			const processed: File[] = [];
+			for (const f of valid) {
+				// GIF: skip resize (may be animated)
+				if (f.type === "image/gif") {
+					processed.push(f);
+					continue;
+				}
+				try {
+					processed.push(await resizeImageIfNeeded(f, MAX_IMAGE_LONG_EDGE));
+				} catch {
+					processed.push(f);
+				}
+			}
+			setEditNewImages((prev) => {
+				// Read the kept count from the ref so a removal during the await above
+				// is reflected here rather than using the stale closure value.
+				const room = Math.max(0, 10 - editKeptCountRef.current - prev.length);
+				if (processed.length > room) {
+					notifications.show({ color: "yellow", message: t("editTooManyImages") });
+				}
+				return [...prev, ...processed.slice(0, room)];
+			});
+		},
+		[t],
+	);
+
+	const buildEditImageOpts = useCallback(
+		() => ({
+			keepImageIds: editKeptImages
+				.map((b) => b.imageId)
+				.filter((id): id is string => typeof id === "string"),
+			newImages: editNewImages,
+		}),
+		[editKeptImages, editNewImages],
+	);
+
 	const handleConfirmClick = useCallback(() => {
-		if (!editContent.trim()) return;
 		// Assistant messages: persist the edited text without truncating later messages or regenerating.
 		if (!isUser) {
+			if (!editContent.trim()) return;
 			if (!message.id || !onEditAssistantMessage) return;
 			onEditAssistantMessage(message.id, editContent.trim());
 			setIsEditing(false);
 			setEditContent("");
 			return;
 		}
+		// User messages: allow submitting with text and/or at least one image.
+		if (!canSubmitEdit) return;
 		// If this is the last user message, no confirmation needed
 		if (isLastUserMessage) {
 			if (!message.id || !onEditAndRegenerate) return;
-			onEditAndRegenerate(message.id, editContent.trim(), false);
-			setIsEditing(false);
-			setEditContent("");
+			onEditAndRegenerate(message.id, editContent.trim(), false, buildEditImageOpts());
+			resetEditState();
 			return;
 		}
 		setShowConfirmModal(true);
 	}, [
 		editContent,
+		canSubmitEdit,
 		isUser,
 		isLastUserMessage,
 		message.id,
 		onEditAndRegenerate,
 		onEditAssistantMessage,
+		buildEditImageOpts,
+		resetEditState,
 	]);
 
 	const submitEdit = useCallback(
 		(rollback: boolean) => {
-			if (!message.id || !onEditAndRegenerate || !editContent.trim()) return;
-			onEditAndRegenerate(message.id, editContent.trim(), rollback);
-			setIsEditing(false);
-			setEditContent("");
+			if (!message.id || !onEditAndRegenerate || !canSubmitEdit) return;
+			onEditAndRegenerate(message.id, editContent.trim(), rollback, buildEditImageOpts());
+			resetEditState();
 			setShowConfirmModal(false);
 		},
-		[message.id, onEditAndRegenerate, editContent],
+		[
+			message.id,
+			onEditAndRegenerate,
+			editContent,
+			canSubmitEdit,
+			buildEditImageOpts,
+			resetEditState,
+		],
 	);
 
 	// Handle keyboard shortcuts in edit mode
@@ -3180,11 +3409,11 @@ export const MessageBubble = memo(function MessageBubble({
 		if (isEditing) {
 			editingCtx.register({
 				submit: () => handleConfirmClickRef.current(),
-				canSubmit: !!editContent.trim(),
+				canSubmit: canSubmitEdit,
 			});
 			return () => editingCtx.unregister();
 		}
-	}, [isEditing, editContent, editingCtx]);
+	}, [isEditing, canSubmitEdit, editingCtx]);
 
 	// Lightweight cache refresh for CompactIndicator/PlanCard — they already
 	// call their own delete API, so we only need to invalidate the messages
@@ -3537,13 +3766,57 @@ export const MessageBubble = memo(function MessageBubble({
 								minRows={2}
 								maxRows={10}
 							/>
-							<Group gap="xs" justify="flex-end">
-								<Button size="xs" variant="subtle" onClick={cancelEditing}>
-									{t("editCancel")}
-								</Button>
-								<Button size="xs" onClick={handleConfirmClick} disabled={!editContent.trim()}>
-									{t("editSubmit")}
-								</Button>
+							{hasEditImages && (
+								<Group gap="xs">
+									{editKeptImages.map((imgBlock) => (
+										<EditExistingImageThumb
+											key={`kept-${imgBlock.imageId}`}
+											block={imgBlock}
+											imageNarratorId={editImageNarratorId}
+											onRemove={() => removeKeptImage(imgBlock.imageId)}
+										/>
+									))}
+									{editNewImages.map((file, i) => (
+										<EditNewImageThumb
+											// biome-ignore lint/suspicious/noArrayIndexKey: new images have no stable id
+											key={`new-${i}-${file.name}-${file.size}`}
+											file={file}
+											onRemove={() => removeNewImage(i)}
+										/>
+									))}
+								</Group>
+							)}
+							<input
+								ref={editFileInputRef}
+								type="file"
+								accept={ACCEPTED_TYPES.join(",")}
+								multiple
+								style={{ display: "none" }}
+								onChange={(e) => {
+									const files = Array.from(e.target.files ?? []);
+									if (files.length > 0) void handleAddEditImages(files);
+									e.target.value = "";
+								}}
+							/>
+							<Group gap="xs" justify="space-between">
+								<Tooltip label={t("attachImage")}>
+									<ActionIcon
+										variant="subtle"
+										color="gray"
+										onClick={() => editFileInputRef.current?.click()}
+										aria-label={t("attachImage")}
+									>
+										<IconPhoto size={18} />
+									</ActionIcon>
+								</Tooltip>
+								<Group gap="xs">
+									<Button size="xs" variant="subtle" onClick={cancelEditing}>
+										{t("editCancel")}
+									</Button>
+									<Button size="xs" onClick={handleConfirmClick} disabled={!canSubmitEdit}>
+										{t("editSubmit")}
+									</Button>
+								</Group>
 							</Group>
 						</Stack>
 					</Paper>

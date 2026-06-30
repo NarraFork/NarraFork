@@ -93,6 +93,26 @@ export interface KnowledgeDraft {
 	updatedAt: string;
 }
 
+/**
+ * A personal-library entry (the knowledge_drafts row under the personal-library model).
+ * `entryId` null = standalone (no global counterpart yet); set = linked to a global entry.
+ */
+export interface KnowledgePersonalEntry {
+	id: string;
+	entryId: string | null;
+	authorUserId: string;
+	name: string | null;
+	title: string | null;
+	targetCollectionId: string | null;
+	baseRevisionId: string | null;
+	content: string;
+	contentHash: string;
+	format: KnowledgeFormat;
+	status: "active" | "archived";
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface KnowledgeFinding {
 	severity: FindingSeverity;
 	message: string;
@@ -123,9 +143,33 @@ export interface KnowledgeSubmissionDetail extends KnowledgeSubmission {
 
 export interface KnowledgeDraftDiff {
 	draftId: string;
+	against: "base" | "current";
 	baseRevisionId: string | null;
 	hunks: unknown[];
 	unified: string;
+}
+
+/** Whether the caller's active draft has drifted behind the entry's current main revision. */
+export type KnowledgeDraftDrift =
+	| { hasDraft: false }
+	| {
+			hasDraft: true;
+			drifted: boolean;
+			draftId: string;
+			status: KnowledgeDraftStatus;
+			baseRevisionId: string | null;
+			currentRevisionId: string | null;
+			versionsBehind: number;
+			base: string;
+			current: string;
+			draft: string;
+	  };
+
+export interface KnowledgeRebaseResult {
+	ok: boolean;
+	rebased?: boolean;
+	baseRevisionId?: string | null;
+	conflict?: { base: string; yours: string; theirs: string };
 }
 
 export interface KnowledgeReviewResult {

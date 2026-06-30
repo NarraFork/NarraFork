@@ -30,7 +30,7 @@ import { useTranslation } from "react-i18next";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 import { Z } from "../../lib/z-index";
 import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
@@ -370,12 +370,26 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const { groupedModels, visibleModels } = useAllModels();
+	// Default model selector: exclude "follow default" (self-reference) and
+	// "follow summary" (circular, since summary follows default).
 	const groupedModelsWithoutFollowDefault = useMemo(
 		() =>
 			groupedModels.filter(
 				(g) =>
+					!(g as ComboboxItemGroup).items?.some?.((i) => {
+						const v = typeof i === "string" ? i : i.value;
+						return v === FOLLOW_DEFAULT_MODEL || v === FOLLOW_SUMMARY_MODEL;
+					}),
+			),
+		[groupedModels],
+	);
+	// Summary model selector: exclude "follow summary" (self-reference).
+	const groupedModelsWithoutFollowSummary = useMemo(
+		() =>
+			groupedModels.filter(
+				(g) =>
 					!(g as ComboboxItemGroup).items?.some?.(
-						(i) => (typeof i === "string" ? i : i.value) === FOLLOW_DEFAULT_MODEL,
+						(i) => (typeof i === "string" ? i : i.value) === FOLLOW_SUMMARY_MODEL,
 					),
 			),
 		[groupedModels],
@@ -462,7 +476,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 				label={t("summaryModel")}
 				description={t("wizardSummaryModelDesc")}
 				placeholder={t("wizardSelectModel")}
-				data={groupedModels}
+				data={groupedModelsWithoutFollowSummary}
 				searchable
 				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}

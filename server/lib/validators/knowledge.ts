@@ -75,6 +75,24 @@ export const submitKnowledgeDraftSchema = z.object({
 	changeNote: z.string().max(2_000).optional(),
 });
 
+// === personal library (standalone personal entries) ===
+export const createPersonalEntrySchema = z.object({
+	title: z.string().min(1).max(200),
+	content: z.string().max(1_000_000).optional(),
+	targetCollectionId: z.string().optional(),
+	name: z.string().max(200).optional(),
+});
+
+export const updatePersonalEntryMetaSchema = z.object({
+	title: z.string().min(1).max(200).optional(),
+	targetCollectionId: z.string().nullable().optional(),
+});
+
+export const listPersonalEntriesQuerySchema = z.object({
+	status: z.enum(["active", "archived"]).optional(),
+	limit: z.coerce.number().int().positive().max(200).optional(),
+});
+
 // === review ===
 const findingSchema = z.object({
 	severity: z.enum(["critical", "major", "minor", "suggestion"]),

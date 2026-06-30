@@ -3,6 +3,7 @@ import { logger } from "../logger";
 import { parseModelId, settings } from "../settings";
 import { isRetryableError } from "./loop";
 import { type BuiltHistory, type GenerateOptions, resolveProviderAndModel } from "./provider";
+import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
 import { initTruncateCleanup } from "./truncate";
 
@@ -53,6 +54,11 @@ export async function buildHistory(
 		? requestedModel
 		: `${provider}:${parsed.model || "default"}`;
 	const resolved = resolveProviderAndModel(prefixedModel);
+	// Replace file-based ExitPlanMode plan bodies with a short path reference so
+	// the model history does not carry the full plan text on every rebuild. The
+	// persisted DB rows keep the full plan for the UI; this only mutates the
+	// in-memory copy passed to the provider adapter.
+	stripPlanBodyForModel(dbMessages);
 	return resolved.adapter.buildHistory(dbMessages, resolved.model, narratorId);
 }
 

@@ -10,9 +10,11 @@ import {
 	createKnowledgeLinkSchema,
 	createKnowledgeTagSchema,
 	createKnowledgeTagTypeSchema,
+	createPersonalEntrySchema,
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
 	listKnowledgeLinksQuerySchema,
+	listPersonalEntriesQuerySchema,
 	resolveKnowledgeConflictSchema,
 	reviewKnowledgeSubmissionSchema,
 	setUserAclSchema,
@@ -26,6 +28,7 @@ import {
 	updateKnowledgeLevelSchema,
 	updateKnowledgeTagSchema,
 	updateKnowledgeTagTypeSchema,
+	updatePersonalEntryMetaSchema,
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
 import { knowledgeAcl } from "../services/knowledge-acl";
@@ -231,6 +234,39 @@ knowledgeRoutes.delete("/links/:id", async (c) => {
 	return c.json(await knowledgeLinkService.removeLink(principalOf(c), id));
 });
 
+// ─── Personal library (standalone personal entries) ─────────────────────
+
+knowledgeRoutes.get("/personal-entries", async (c) => {
+	const parsed = listPersonalEntriesQuerySchema.safeParse({
+		status: c.req.query("status"),
+		limit: c.req.query("limit"),
+	});
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.listMine(principalOf(c), parsed.data));
+});
+
+knowledgeRoutes.post("/personal-entries", async (c) => {
+	const parsed = createPersonalEntrySchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(await knowledgeBranchService.createStandalone(principalOf(c), parsed.data), 201);
+});
+
+knowledgeRoutes.get("/personal-entries/:id", async (c) => {
+	return c.json(await knowledgeBranchService.getMine(principalOf(c), c.req.param("id")));
+});
+
+knowledgeRoutes.patch("/personal-entries/:id", async (c) => {
+	const parsed = updatePersonalEntryMetaSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	return c.json(
+		await knowledgeBranchService.updateStandaloneMeta(
+			principalOf(c),
+			c.req.param("id"),
+			parsed.data,
+		),
+	);
+});
+
 // ─── Drafts (personal working copies) ───────────────────────────────────
 
 knowledgeRoutes.post("/entries/:id/drafts", async (c) => {
@@ -248,6 +284,10 @@ knowledgeRoutes.get("/entries/:id/drafts/mine", async (c) => {
 	return c.json(await knowledgeBranchService.getMyDraft(principalOf(c), c.req.param("id")));
 });
 
+knowledgeRoutes.get("/entries/:id/drafts/mine/drift", async (c) => {
+	return c.json(await knowledgeBranchService.getDraftDrift(principalOf(c), c.req.param("id")));
+});
+
 knowledgeRoutes.patch("/drafts/:id", async (c) => {
 	const parsed = updateKnowledgeDraftSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
@@ -257,7 +297,15 @@ knowledgeRoutes.patch("/drafts/:id", async (c) => {
 });
 
 knowledgeRoutes.get("/drafts/:id/diff", async (c) => {
-	return c.json(await knowledgeBranchService.getDraftDiff(principalOf(c), c.req.param("id")));
+	// `against=current` (default) diffs vs current main; `against=base` vs the fork point.
+	const against = c.req.query("against") === "base" ? "base" : "current";
+	return c.json(
+		await knowledgeBranchService.getDraftDiff(principalOf(c), c.req.param("id"), { against }),
+	);
+});
+
+knowledgeRoutes.post("/drafts/:id/rebase", async (c) => {
+	return c.json(await knowledgeBranchService.rebaseDraft(principalOf(c), c.req.param("id")));
 });
 
 knowledgeRoutes.post("/drafts/:id/submit", async (c) => {

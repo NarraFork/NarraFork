@@ -15,6 +15,7 @@ import {
 	IconSearch,
 	IconServer,
 	IconShield,
+	IconShieldLock,
 	IconTerminal2,
 	IconUser,
 	IconUsers,
@@ -50,6 +51,7 @@ function MobileSettingsNav() {
 
 	const personalItems = [
 		{ to: "/settings/profile", label: t("profileSection"), icon: <IconUser size={20} /> },
+		{ to: "/settings/security", label: t("securitySection"), icon: <IconShieldLock size={20} /> },
 		{ to: "/settings/models", label: t("modelsSection"), icon: <IconCpu size={20} /> },
 		{ to: "/settings/agent", label: t("agentSection"), icon: <IconBrain size={20} /> },
 		{

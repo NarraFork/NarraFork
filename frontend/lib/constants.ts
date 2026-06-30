@@ -43,6 +43,9 @@ export type ModelOption = {
 /** Sentinel value stored in DB to mean "follow the default model from settings". */
 export const FOLLOW_DEFAULT_MODEL = "__default__";
 
+/** Sentinel value stored in DB to mean "follow the summary model from settings". */
+export const FOLLOW_SUMMARY_MODEL = "__summary__";
+
 /** Human-readable label for a NUG model's channelType (request protocol). */
 export function nugChannelTypeLabel(channelType?: string): string {
 	switch (channelType) {
@@ -92,6 +95,45 @@ export function parseAggModelValue(raw?: string | null): {
 export function buildAggModelValue(aggId: string, pinnedModel?: string): string {
 	if (pinnedModel) return `${AGG_MODEL_PREFIX}${aggId}:${pinnedModel}`;
 	return `${AGG_MODEL_PREFIX}${aggId}`;
+}
+
+/**
+ * Resolve a (possibly meta) model reference to a concrete "provider:model" value
+ * for display/capability lookups (context window, reasoning effort, codex controls).
+ *
+ * Handles:
+ *   - "follow default" sentinel  -> the configured default model value
+ *   - aggregation, pinned         -> the pinned member
+ *   - aggregation, auto           -> the first member (mirrors backend "priority"
+ *                                     routing default; the backend resolves the
+ *                                     actual member at request time)
+ *
+ * This intentionally does not honor the "balanced" round-robin order or
+ * provider-disabled filtering — it only needs a representative concrete model
+ * for client-side display. Concrete and unknown values pass through unchanged.
+ */
+export function resolveDisplayModel(
+	model: string | null | undefined,
+	options: { defaultModelValue?: string; aggregations?: ModelAggregation[] } = {},
+): string {
+	const { defaultModelValue, aggregations } = options;
+	const raw = model?.trim();
+	if (!raw || raw === FOLLOW_DEFAULT_MODEL) {
+		// Avoid infinite recursion if the default is itself a sentinel.
+		const fallback = defaultModelValue?.trim();
+		if (!fallback || fallback === FOLLOW_DEFAULT_MODEL) return raw ?? "";
+		return resolveDisplayModel(fallback, options);
+	}
+
+	const agg = parseAggModelValue(raw);
+	if (!agg) return raw;
+
+	if (agg.pinnedModel) return resolveDisplayModel(agg.pinnedModel, options);
+
+	const members = aggregations?.find((a) => a.id === agg.aggId)?.models ?? [];
+	const first = members[0];
+	if (!first) return raw;
+	return resolveDisplayModel(first, options);
 }
 
 /**

@@ -45,6 +45,9 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
+	// Specialized standalone narrator kind. "knowledge" → Knowledge Steward (knowledge-base mgmt):
+	// preinstalls the knowledge toolset and a steward system prompt. Must be standalone.
+	kind: z.enum(["knowledge"]).optional(),
 });
 
 /** Update a narrator's handle (rename / claim / clear a named narrator handle). */

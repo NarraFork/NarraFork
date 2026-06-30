@@ -1,19 +1,72 @@
 import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
 import type { ApiEntity } from "./types";
 
+/** Session result returned on a successful (single-factor or post-MFA) login. */
+export interface LoginSession {
+	user: ApiEntity;
+	token: string;
+	language: string;
+}
+
+/** Returned by /auth/login when the account has a second factor enrolled. */
+export interface MfaChallenge {
+	mfaRequired: true;
+	mfaToken: string;
+	methods: Array<"totp" | "backup_code">;
+}
+
+export type LoginResult = LoginSession | MfaChallenge;
+
+export function isMfaChallenge(r: LoginResult): r is MfaChallenge {
+	return "mfaRequired" in r && r.mfaRequired === true;
+}
+
+/** Current MFA status for the security settings page. */
+export interface MfaStatus {
+	totpEnabled: boolean;
+	backupCodesRemaining: number;
+}
+
+export interface TotpSetupResult {
+	secret: string;
+	uri: string;
+	qrDataUrl: string;
+}
+
 export const authApi = {
 	authStatus: () => request<{ hasUsers: boolean; registrationOpen: boolean }>("/auth/status"),
 	register: (data: { username: string; password: string; language?: string }) =>
-		request<{ user: ApiEntity; token: string; language: string }>("/auth/register", {
+		request<LoginSession>("/auth/register", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
 	login: (data: { username: string; password: string }) =>
-		request<{ user: ApiEntity; token: string; language: string }>("/auth/login", {
+		request<LoginResult>("/auth/login", {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
 	me: () => request<ApiEntity>("/auth/me"),
+
+	// MFA — login second step
+	mfaVerify: (data: { mfaToken: string; method: "totp" | "backup_code"; code: string }) =>
+		request<LoginSession>("/auth/mfa/verify", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+
+	// MFA — management (settings → security)
+	getSecurityStatus: () => request<MfaStatus>("/auth/me/security"),
+	totpSetup: () => request<TotpSetupResult>("/auth/me/totp/setup", { method: "POST" }),
+	totpActivate: (code: string) =>
+		request<{ ok: boolean; backupCodes: string[] }>("/auth/me/totp/activate", {
+			method: "POST",
+			body: JSON.stringify({ code }),
+		}),
+	totpDisable: (data: { code?: string; password?: string }) =>
+		request<{ ok: boolean }>("/auth/me/totp", {
+			method: "DELETE",
+			body: JSON.stringify(data),
+		}),
 
 	// Avatar
 	uploadAvatar: async (file: File) => {

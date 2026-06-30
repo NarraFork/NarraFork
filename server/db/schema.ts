@@ -702,6 +702,46 @@ export const users = sqliteTable("users", {
 	createdAt: text("created_at").notNull(),
 });
 
+// === user_totp (TOTP two-factor authenticator secrets) ===
+// One row per user. status="pending" while the user is mid-enrollment (secret
+// generated but not yet verified); status="active" once a valid code confirms
+// the authenticator. A pending row is overwritten when setup restarts.
+export const userTotp = sqliteTable(
+	"user_totp",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		/** Base32 TOTP shared secret. */
+		secret: text("secret").notNull(),
+		status: text("status", { enum: ["pending", "active"] })
+			.notNull()
+			.default("pending"),
+		activatedAt: text("activated_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_user_totp_user").on(table.userId)],
+);
+
+// === user_mfa_backup_codes (one-time recovery codes) ===
+// Generated when TOTP is activated. Stored only as bcrypt hashes; the plaintext
+// is shown to the user exactly once at activation. usedAt is set when a code is
+// redeemed (each code is single-use).
+export const userMfaBackupCodes = sqliteTable(
+	"user_mfa_backup_codes",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		codeHash: text("code_hash").notNull(),
+		usedAt: text("used_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_mfa_backup_codes_user").on(table.userId)],
+);
+
 // === user_favorite_directories ===
 export const userFavoriteDirectories = sqliteTable(
 	"user_favorite_directories",
@@ -1435,27 +1475,36 @@ export const knowledgeDrafts = sqliteTable(
 	"knowledge_drafts",
 	{
 		id: text("id").primaryKey(),
-		entryId: text("entry_id")
-			.notNull()
-			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		// Linked personal entry → references a global entry (the user's personal version of it,
+		// drift applies). NULL → a STANDALONE personal entry (no global counterpart yet).
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "cascade" }),
 		authorUserId: text("author_user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "cascade" }),
 		name: text("name"),
-		// The main revision this draft was forked from (three-way merge base).
+		// Own title for a standalone entry; NULL for a linked entry (inherits the global entry title).
+		title: text("title"),
+		// Standalone-only: which collection this entry is published into. Optional at create time,
+		// required before publish. NULL for linked entries (they target their existing entry).
+		targetCollectionId: text("target_collection_id").references(() => knowledgeCollections.id, {
+			onDelete: "set null",
+		}),
+		// The main revision this draft was forked from (three-way merge base). Linked entries only.
 		baseRevisionId: text("base_revision_id"),
 		content: text("content").notNull(),
 		contentHash: text("content_hash").notNull(),
 		format: text("format", { enum: ["markdown", "text", "json"] })
 			.notNull()
 			.default("markdown"),
-		// Active states: draft / pending_review / changes_requested. Terminal: merged / abandoned.
-		// Service enforces "at most one active draft per (entry, author)".
+		// Personal-entry lifecycle (the "draft" concept is retired): the publish-request
+		// lifecycle now lives on knowledge_submissions. `active` = in use (participates in
+		// shadow/drift/search); `archived` = retired (e.g. after a successful publish), kept
+		// for the record but no longer shadows.
 		status: text("status", {
-			enum: ["draft", "pending_review", "changes_requested", "merged", "abandoned"],
+			enum: ["active", "archived"],
 		})
 			.notNull()
-			.default("draft"),
+			.default("active"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -1467,7 +1516,8 @@ export const knowledgeDrafts = sqliteTable(
 );
 
 // === knowledge_submissions ===
-// A draft submitted for review. Carries the proposed content + reviewer verdict + merge result.
+// A personal entry submitted to be PUBLISHED into the global knowledge base. Carries the
+// proposed content + reviewer verdict + merge result. This is the publish-request lifecycle.
 export const knowledgeSubmissions = sqliteTable(
 	"knowledge_submissions",
 	{
@@ -1475,9 +1525,14 @@ export const knowledgeSubmissions = sqliteTable(
 		draftId: text("draft_id")
 			.notNull()
 			.references(() => knowledgeDrafts.id, { onDelete: "cascade" }),
-		entryId: text("entry_id")
-			.notNull()
-			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		// Target global entry for a LINKED personal entry (publish = merge into it). NULL when
+		// publishing a STANDALONE personal entry — a new global entry is created on approve.
+		entryId: text("entry_id").references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		// Standalone publish target: collection + title for the new global entry to be created.
+		collectionId: text("collection_id").references(() => knowledgeCollections.id, {
+			onDelete: "cascade",
+		}),
+		title: text("title"),
 		submitterUserId: text("submitter_user_id")
 			.notNull()
 			.references(() => users.id, { onDelete: "set null" }),

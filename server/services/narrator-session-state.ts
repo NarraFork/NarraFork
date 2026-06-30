@@ -52,6 +52,8 @@ export interface ActiveNarrator {
 	_projectId?: string;
 	/** Cached chapter role (trunk/branch/exploration/review) */
 	_chapterRole?: string;
+	/** Narrator kind for specialized standalone types (e.g. "knowledge" steward). */
+	_narratorKind?: "knowledge";
 	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
 	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plan-{id}.md */
