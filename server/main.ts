@@ -948,9 +948,6 @@ initContainerEventHandler();
 // Register chat-group event handler (notify controlling named narrators of permission requests)
 registerChatGroupEventListeners();
 
-	.catch((err) => {
-	});
-
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {
 	logger.warn("Container state reconciliation failed", { error: String(err) });

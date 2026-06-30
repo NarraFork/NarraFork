@@ -1,7 +1,6 @@
 import { db } from "@server/db";
 import { apiRequests, chapters, narrators } from "@server/db/schema";
 import { getCodexManager } from "@server/lib/codex-manager";
-import { settings } from "@server/lib/settings";
 import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
@@ -248,7 +247,6 @@ export class UsageHistoryService {
 				const snapshot = manager.snapshot();
 				const cred = snapshot.entries.find((c) => c.id === credentialId);
 				return cred?.displayName || cred?.email || cred?.accountId || credentialId;
-			}
 			}
 			// Anthropic and OpenAI don't have credential management
 		} catch {

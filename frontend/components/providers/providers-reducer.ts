@@ -279,15 +279,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const splitCustomApiProviders = deriveSplitProviders(customApiProviders);
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				id: p.id ?? "",
-				name: p.name ?? "",
-				apiKey: p.apiKey ?? "",
-				baseUrl: p.baseUrl ?? "",
-				defaultModel: p.defaultModel ?? "",
-				disabled: p.disabled ?? false,
-			}));
-
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const nug = (s.nugProviders ?? []).map((p: any) => ({
 				id: p.id ?? "",
 				name: p.name ?? "",
@@ -330,6 +321,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
 
 			// Sync: multi-instance providers with disabled=true → disabledProviders
+			for (const p of [...openai, ...anthropic, ...nug]) {
 				if (p.disabled && p.prefix) disabledProviders.add(p.prefix);
 			}
 
@@ -363,10 +355,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			return {
 				...state,
 				anthropicProviders: resolveUpdater(state.anthropicProviders, action.providers),
-			};
-
-			return {
-				...state,
 			};
 
 		case "SET_NUG_PROVIDERS":
@@ -518,7 +506,6 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 			JSON.stringify(state.customApiProviders) !== JSON.stringify(savedSnapshot.customApiProviders)
 		)
 			return true;
-			return true;
 		if (JSON.stringify(state.nugProviders) !== JSON.stringify(savedSnapshot.nugProviders))
 			return true;
 		if (
@@ -583,9 +570,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 				| AnthropicProviderState[]
 				| ((prev: AnthropicProviderState[]) => AnthropicProviderState[]),
 		) => dispatch({ type: "SET_ANTHROPIC_PROVIDERS", providers: updater }),
-		[dispatch],
-	);
-
 		[dispatch],
 	);
 

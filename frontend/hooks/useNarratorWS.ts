@@ -767,11 +767,6 @@ export function useNarratorWS(
 							);
 						}
 						break;
-						break;
-							data.position as number,
-							data.queueDepth as number,
-						);
-						break;
 					case "quota_balance": {
 						const quotaBalance = data.quotaBalance;
 						const detailedQuotaBalance = data.detailedQuotaBalance;

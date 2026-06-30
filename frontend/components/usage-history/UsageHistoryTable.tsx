@@ -169,7 +169,6 @@ function getProviderColor(provider: string | null) {
 			return "blue";
 		case "codex":
 			return "cyan";
-			return "grape";
 		default:
 			return "gray";
 	}

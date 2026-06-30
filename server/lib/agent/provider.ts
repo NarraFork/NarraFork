@@ -85,7 +85,9 @@ export interface ParsedStreamEvent {
 	metering?: { unit: string; unitPlural: string; usage: number };
 	invalidState?: { reason: string; message: string };
 	credentialId?: string;
+	/** Gateway-injected queue status (generic, for providers via unified gateway) */
 	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };
+	/** Gateway-injected quota balance (generic, for providers via unified gateway).
 	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
 	quotaBalance?: string | null;
 	/** Optional multiline quota details to show in the quota tooltip. */
@@ -352,8 +354,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new AnthropicProvider(anthropicConfig);
 	}
 
-	}
-
 	const nugConfig = getNugProviderConfig(provider);
 	if (nugConfig) {
 		return new NugProvider(nugConfig);
@@ -407,7 +407,6 @@ function defaultModelForProvider(provider: string): string | null {
 		getAnthropicProviderConfig(provider)?.defaultModel,
 	);
 	if (anthropicDefault) return anthropicDefault;
-
 
 	const nugDefault = prefixProviderModel(provider, getNugProviderConfig(provider)?.defaultModel);
 	if (nugDefault) return nugDefault;

@@ -277,6 +277,7 @@ class NarratorWSManager {
 		// When fullSubscribe is true (panel-level), always send subscribe to the
 		// server even if the ID was already ref-counted by a list-level subscriber.
 		// This ensures the server sends back the streaming snapshot (including
+		// cached gateway queue status) that the panel needs to restore UI state.
 		const idsToSend = opts?.fullSubscribe ? narratorIds : newIds;
 		if (idsToSend.length) {
 			if (this.ws?.readyState === WebSocket.OPEN) {

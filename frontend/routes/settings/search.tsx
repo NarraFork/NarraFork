@@ -112,7 +112,6 @@ function channelBadgeColor(kind: SearchChannelKind): string {
 			return "blue";
 		case "nug-mcp":
 			return "green";
-			return "cyan";
 		case "custom-api":
 			return "orange";
 		case "subagent":
@@ -130,7 +129,6 @@ function channelLabel(
 	if (channel.kind === "nug-mcp") {
 		const provider = settings?.nugProviders?.find((p) => p.id === providerId);
 		return `NUG: ${provider?.name ?? providerId ?? channel.id}`;
-	}
 	}
 	const provider = settings?.search?.customProviders?.find((p) => p.id === providerId);
 	return `Custom: ${provider?.name ?? providerId ?? channel.id}`;

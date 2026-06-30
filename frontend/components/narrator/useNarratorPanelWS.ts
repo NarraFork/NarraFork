@@ -685,7 +685,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sessionId: string;
 		seq: number;
 	} | null>(null);
-	);
 	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
 	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
 		initialDetailedQuotaBalance ?? null,
@@ -697,8 +696,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
 		setPaymentRequired(null);
 	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
-	useEffect(() => {
-		}
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
 	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
@@ -2429,20 +2426,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						prunedPercent: prunedPct,
 					},
 				});
-			},
-				// Sync back to settings cache so provider info stays up-to-date
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic settings shape
-					qc.setQueryData(["settings"], (old: any) => {
-						return {
-							...old,
-									quotaBalance: balance,
-								},
-							},
-						};
-					});
-				}
-			},
-				applyQueueStatus(position, queueDepth);
 			},
 			onQuotaBalance: (balance, detailedBalance) => {
 				setQuotaBalance(balance);

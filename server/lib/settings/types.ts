@@ -135,18 +135,6 @@ export interface AnthropicProviderConfig {
 	extraHeaders?: Record<string, string>;
 }
 
-	/** Unique short ID (8 chars). */
-	id: string;
-	name: string;
-	/** Whether this provider is disabled (keeps config but excluded from resolution). */
-	disabled?: boolean;
-	prefix: string;
-	apiKey: string;
-	baseUrl: string;
-	/** Default model (bare name without prefix). */
-	defaultModel: string;
-}
-
 export interface NUGProviderConfig {
 	/** Unique short ID (8 chars). */
 	id: string;
@@ -196,11 +184,6 @@ export interface ClineProviderConfig {
 	enabledModels?: string[];
 }
 
-export type SearchChannelKind =
-	| "native"
-	| "nug-mcp"
-	| "custom-api"
-	| "subagent";
 
 export type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
 

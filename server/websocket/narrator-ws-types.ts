@@ -461,15 +461,6 @@ export type NarratorServerMessage =
 			containerStatus: string | null;
 	  }
 	| {
-			narratorId: string;
-			quotaBalance: number | null;
-	  }
-	| {
-			narratorId: string;
-			position: number;
-			queueDepth: number;
-	  }
-	| {
 			type: "quota_balance";
 			narratorId: string;
 			quotaBalance: string | null;

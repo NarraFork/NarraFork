@@ -562,6 +562,8 @@
 	"splitDown": "Split down",
 	"closePanel": "Close panel",
 	"lastTurnDuration": "last turn {{duration}}",
+	"queuePosition": "queued #{{position}}",
+	"queuePositionWithDepth": "queued #{{position}} of {{queueDepth}}",
 	"fileMod_title": "File Modifications",
 	"fileMod_tabSummary": "Summary",
 	"fileMod_tabApproval": "Approval",

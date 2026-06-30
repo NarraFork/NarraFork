@@ -57,15 +57,6 @@ export interface AnthropicProviderState {
 	disabled?: boolean;
 }
 
-	id: string;
-	name: string;
-	prefix: string;
-	apiKey: string;
-	baseUrl: string;
-	defaultModel: string;
-	disabled?: boolean;
-}
-
 
 /** Ensure a model value has a "provider:" prefix. */
 export function ensurePrefix(val: string): string {

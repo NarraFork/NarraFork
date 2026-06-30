@@ -21,12 +21,6 @@ interface FeatureCapability {
 	mode?: string;
 }
 
-export type ProviderCapabilityKey =
-	| "openai"
-	| "anthropic"
-	| "nug"
-	| "codex"
-	| "cline";
 type ChapterContainerRoute =
 	| "setup"
 	| "podmanStatus"

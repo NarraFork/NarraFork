@@ -17,8 +17,6 @@ export function nugSearchChannelId(providerId: string): string {
 	return `nug:${providerId}`;
 }
 
-}
-
 export function customSearchChannelId(providerId: string): string {
 	return `custom:${providerId}`;
 }
@@ -65,7 +63,6 @@ export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchCh
 
 	for (const provider of settings.nugProviders ?? []) {
 		catalog.push(makeBaseChannel(nugSearchChannelId(provider.id), "nug-mcp", true, provider.id));
-	}
 	}
 	for (const provider of settings.search?.customProviders ?? []) {
 		catalog.push(

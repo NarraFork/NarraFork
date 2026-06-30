@@ -340,8 +340,6 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	for (const prov of merged.anthropicProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
 	for (const prov of merged.nugProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}

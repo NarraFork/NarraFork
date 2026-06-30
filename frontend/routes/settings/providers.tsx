@@ -87,9 +87,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
 		proxy: normalizeProxyUrl(provider.proxy) ?? "",
 	}));
-		...provider,
-		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
-	}));
 	const normalizedNugProviders = state.nugProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
@@ -199,7 +196,6 @@ function SettingsProvidersPage() {
 		() => getDirtyProviderIds(state.customApiProviders, savedProviderSnapshot.customApiProviders),
 		[state.customApiProviders, savedProviderSnapshot],
 	);
-	);
 	const nugDirtyProviderIds = useMemo(
 		() => getDirtyProviderIds(state.nugProviders, savedProviderSnapshot.nugProviders),
 		[state.nugProviders, savedProviderSnapshot],
@@ -207,7 +203,6 @@ function SettingsProvidersPage() {
 	const isCustomApiProviderDirty = useCallback(
 		(providerId: string) => customApiDirtyProviderIds.has(providerId),
 		[customApiDirtyProviderIds],
-	);
 	);
 	const isNugProviderDirty = useCallback(
 		(providerId: string) => nugDirtyProviderIds.has(providerId),
@@ -231,6 +226,7 @@ function SettingsProvidersPage() {
 			if (p.prefix) map.set(p.prefix, p.id);
 		}
 		return map;
+	}, [state.customApiProviders, state.nugProviders, clineProviderPrefixes]);
 	const getPrefixError = useCallback(
 		(prefix: string, currentProviderId: string): string | undefined => {
 			if (!prefix) return undefined;
@@ -338,9 +334,6 @@ function SettingsProvidersPage() {
 		(type: AddProviderType) => {
 			const id = Math.random().toString(36).slice(2, 10);
 			switch (type) {
-						...prev,
-					]);
-					break;
 				case "nug":
 					dispatchers.setNugProviders((prev) => [
 						...prev,
@@ -348,6 +341,7 @@ function SettingsProvidersPage() {
 					]);
 					break;
 				default: {
+					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
 						"anthropic-compatible": t("addProviderAnthropicCompatible"),
 						"anthropic-official": t("addProviderClaudeCode"),
 						"codex-native": t("addProviderCodex"),
@@ -497,32 +491,6 @@ function SettingsProvidersPage() {
 		return map;
 	}, [settings?.anthropicProviders, settings?.anthropicModelsGrouped]);
 
-		const map: Record<string, ModelOption[]> = {};
-		const prefixMap: Record<string, string> = {};
-			providerId: string;
-			models: Array<Record<string, unknown>>;
-		}>;
-			id: string;
-			prefix?: string;
-		}>) {
-		}
-		for (const group of groups) {
-			const models: ModelOption[] = [];
-			for (const m of group.models) {
-				const id = String(m.model_id ?? m.modelId ?? "");
-				if (!id) continue;
-				models.push({
-					value: `${prefix}:${id}`,
-					label: String(
-						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
-					),
-					provider: prefix,
-				});
-			}
-			map[group.providerId] = models;
-		}
-		return map;
-
 	const nugModelsMap = useMemo(() => {
 		const map: Record<string, ModelOption[]> = {};
 		const prefixMap: Record<string, string> = {};
@@ -655,12 +623,7 @@ function SettingsProvidersPage() {
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
 		return p?.name ?? "";
-	}, [
-		selectedProvider,
-		state.customApiProviders,
-		state.nugProviders,
-		providerLabels,
-	]);
+	}, [selectedProvider, state.customApiProviders, state.nugProviders, providerLabels]);
 
 	// ── Auto-fetch models + fill default context windows after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
@@ -705,13 +668,14 @@ function SettingsProvidersPage() {
 		}
 
 		// Resolve this provider's prefix and the list of model ids from grouped data.
+		const prefix = customApi?.prefix ?? nug?.prefix ?? "";
 		if (!prefix) return;
 
 		const groupedKey = customApi
 			? isAnthropicProtocol(customApi.protocol)
 				? "anthropicModelsGrouped"
 				: "openaiModelsGrouped"
-				: "nugModelsGrouped";
+			: "nugModelsGrouped";
 		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
 			providerId: string;
 			models: Array<Record<string, unknown>>;
@@ -975,20 +939,6 @@ function ProviderSectionContent({
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				isProviderDirty={isCustomApiProviderDirty}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				getPrefixError={getPrefixError}
-				getUniquePrefix={getUniquePrefix}
-				onTestModel={onTestModel}
-				onSaveBeforeRefresh={onSaveBeforeRefresh}
-			/>
-		);
-	}
-		return (
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}

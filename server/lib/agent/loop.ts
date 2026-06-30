@@ -2790,11 +2790,7 @@ export async function* agentLoop(
 							credentialId,
 						};
 					}
-					}
-						yield {
-						};
-					}
-					// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway)
+					// Generic gateway-injected queue/quota events (via unified gateway)
 					if (parsed.queueStatus) {
 						yield {
 							type: "queue_status",
@@ -3271,10 +3267,12 @@ export async function* agentLoop(
 			// We base this on what actually landed as persistable output, NOT on the
 			// optimistic `sawMeaningfulResponse` flag. `sawMeaningfulResponse` is set by
 			// `isMeaningfulStreamEvent` the moment any "interesting" stream event arrives
+			// (text/toolUseChunk/reasoning/webSearch/imageGeneration/queueStatus),
 			// but some of those events never produce committed content:
 			//   - a `toolUseChunk` carrying a toolUseId but no `name` never creates an
 			//     accumulator (loop ~L2285) and is never pushed to `toolUses`, so it leaves
 			//     no orphaned entry either;
+			//   - pure `queueStatus` status events carry no content at all.
 			// In those cases the optimistic flag would suppress the empty-response guard and
 			// the turn would silently persist an empty assistant message and go idle. Compute
 			// the real picture from the accumulators instead so the guard still fires.

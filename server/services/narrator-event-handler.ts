@@ -210,6 +210,10 @@ export interface StreamingSnapshot {
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
 	streamingBlocks: SnapshotStreamingBlock[];
 	toolChunks: Map<string, ToolChunkSnapshot>;
+	/** Cached gateway queue position (> 0 means queued). */
+	queuePosition?: number;
+	/** Cached gateway queue depth. */
+	queueDepth?: number;
 	/** Cached generic gateway queue message. */
 	queueMessage?: string;
 }
@@ -1534,37 +1538,14 @@ export async function processEvent(
 			return null;
 		}
 
-			dualBroadcast(ctx, {
-				narratorId: broadcastTargetId,
-				quotaBalance: event.quotaBalance,
-			});
-			// Update the global in-memory quota cache so the provider management page
-			// can display the latest balance without an extra network round-trip.
-			if (ctx.providerPrefix) {
-				try {
-				} catch {
-				}
-			}
-			return null;
-		}
-
-			// Cache queue position in the streaming snapshot so late-joining
-			// subscribers see it immediately via streaming_snapshot.
-			const qSnap = getOrCreateSnapshot(narratorId);
-			dualBroadcast(ctx, {
-				narratorId: broadcastTargetId,
-				position: event.position,
-				queueDepth: event.queueDepth,
-			});
-			return null;
-		}
-
-		// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway).
+		// Generic gateway-injected queue/quota events (providers via unified gateway).
 		case "queue_status": {
 			const qsSnap = getOrCreateSnapshot(narratorId);
 			if (event.position !== undefined) {
+				qsSnap.queuePosition = event.position;
 			}
 			if (event.queueDepth !== undefined) {
+				qsSnap.queueDepth = event.queueDepth;
 			}
 			qsSnap.queueMessage = event.queueMessage;
 			dualBroadcast(ctx, {

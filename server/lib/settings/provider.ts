@@ -94,8 +94,6 @@ export function registerCodexModelChecker(checker: (model: string) => boolean): 
 export function registerCodexModelLister(lister: () => string[]): void {
 	codexModelLister = lister;
 }
-}
-}
 export function registerNugModelChecker(checker: (model: string) => boolean): void {
 	nugModelChecker = checker;
 }
@@ -498,14 +496,6 @@ export function getVisibleModels(): string[] {
 	});
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [
-		...openai,
-		...anthropic,
-		...codex,
-		...nug,
-		...cline,
-		...custom,
-	]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
 		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;
@@ -596,13 +586,6 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
-	if (!prefix) return providers[0];
-	return providers.find((p) => p.prefix === prefix);
-}
-
-	return config.prefix;
-}
-
 export function getNugProviderConfig(prefix?: string): NUGProviderConfig | undefined {
 	const providers = (s().nugProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
@@ -649,11 +632,6 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
-	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
-}
-
-}
-
 export function hasConfiguredNugProvider(): boolean {
 	const providers = s().nugProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
@@ -681,8 +659,6 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
-	}
-		}
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {

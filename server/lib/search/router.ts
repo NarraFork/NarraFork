@@ -55,10 +55,6 @@ function findNugProvider(
 	return (config.nugProviders ?? []).find((provider) => provider.id === channel.providerId);
 }
 
-	channel: SearchChannelConfig,
-	config: NarraForkSettings = settings,
-}
-
 function findCustomProvider(
 	channel: SearchChannelConfig,
 	config: NarraForkSettings = settings,
@@ -90,30 +86,6 @@ async function nugMcpSearch(
 	if (!response.ok) {
 		const errText = await response.text().catch(() => "");
 		throw new Error(`NUG MCP search error ${response.status}: ${errText}`);
-	}
-	const mcp = (await response.json()) as McpResponse;
-	const parsed = textFromMcpResponse(mcp);
-	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
-}
-
-	channel: SearchChannelConfig,
-	request: SearchRequest,
-	signal: AbortSignal,
-): Promise<SearchChannelResult> {
-	if (!config || config.disabled || !config.apiKey || !config.baseUrl) {
-	}
-	const baseUrl = config.baseUrl.replace(/\/+$/, "");
-	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${config.apiKey}`,
-		},
-		body: JSON.stringify({ query: request.query }),
-		signal,
-	});
-	if (!response.ok) {
-		const errText = await response.text().catch(() => "");
 	}
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
@@ -204,10 +176,6 @@ async function runChannel(
 				(signal) => nugMcpSearch(channel, request, signal),
 				channelTimeout(channel),
 			);
-			return withSearchTimeout(
-				request.signal,
-				channelTimeout(channel),
-			);
 		case "custom-api": {
 			const provider = findCustomProvider(channel);
 			if (!provider) throw new Error("Custom search provider is not configured");
@@ -236,8 +204,6 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 	switch (channel.kind) {
 		case "nug-mcp": {
 			const provider = findNugProvider(channel);
-			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;
-		}
 			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;
 		}
 		case "custom-api": {

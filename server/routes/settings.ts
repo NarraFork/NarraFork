@@ -132,15 +132,6 @@ const anthropicProviderSchema = z.object({
 	disabled: z.boolean().optional(),
 });
 
-	id: z.string().min(1),
-	name: z.string(),
-	prefix: z.string().min(1),
-	apiKey: z.string(),
-	baseUrl: z.string(),
-	defaultModel: z.string(),
-	disabled: z.boolean().optional(),
-});
-
 const nugProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -613,9 +604,6 @@ function buildSettingsResponse(
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
 		nugProviders: (source.nugProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
@@ -739,8 +727,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn: purgeAnthropicProviderCache,
 		},
 		{
-		},
-		{
 			type: "nug",
 			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
 			fn: purgeNugProviderCache,
@@ -775,8 +761,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
-		{
-		},
 		{
 			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
 			providers: prev.nugProviders,
@@ -901,7 +885,6 @@ settingsRoutes.patch("/", async (c) => {
 				allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
 			}
 		}
-		}
 		for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
 			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
 		}
@@ -1018,13 +1001,6 @@ settingsRoutes.patch("/", async (c) => {
 			validated.openaiProviders ?? current.openaiProviders,
 			validated.anthropicProviders ?? current.anthropicProviders,
 		);
-	}
-
-			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
-			}
-		}
 	}
 
 	// Preserve real API keys and OAuth secrets for NUG providers

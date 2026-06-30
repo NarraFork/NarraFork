@@ -546,13 +546,6 @@ export const miscApi = {
 			resolvedBaseUrl?: string;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
 
-		request<{
-			models: Array<{ id: string; owned_by?: string }>;
-			fromCache: boolean;
-
-		request<{ quotaBalance: number; quotaTotalGranted: number }>(
-		),
-
 	// NUG
 	nugLogin: (providerId: string, body: { username: string; password: string }) =>
 		request<{ apiKey: string }>(`/nug/providers/${providerId}/login`, {

@@ -3279,16 +3279,6 @@ export function NarratorPanel({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		if (!cfg) return null;
-			| Record<string, { quotaBalance: number | null }>
-			| undefined;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quotas?.[cfg.id]?.quotaBalance ?? null,
-		};
-
 	// Resolve custom API provider info for initial generic quota balance
 	const customApiProviderInfo = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
@@ -3877,7 +3867,11 @@ export function NarratorPanel({
 	const isBlockingCompacting = substatus.includes("compacting");
 	const isBackgroundCompacting = substatus.includes("background_compacting");
 	const isCompacting = isBlockingCompacting || isBackgroundCompacting;
+	const queuePosition = substatus.find((s) => s.startsWith("queue_position:"));
+	const queueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
 	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
+	const queuePositionValue = queuePosition ? Number(queuePosition.split(":")[1]) : null;
+	const queueDepthValue = queueDepth ? Number(queueDepth.split(":")[1]) : null;
 	const queueMessageValue = queueMessage
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
 		: null;
@@ -8191,10 +8185,15 @@ export function NarratorPanel({
 																? t("backgroundCompacting")
 																: t("thinking")}
 									</Text>
+									{(queuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
 											{queueMessageValue ??
 												t(
+													queueDepthValue != null && queueDepthValue > 0
+														? "queuePositionWithDepth"
+														: "queuePosition",
+													{ position: queuePositionValue, queueDepth: queueDepthValue },
 												)}
 										</Text>
 									)}
@@ -8273,10 +8272,6 @@ export function NarratorPanel({
 										isAdmin={currentUser?.role === "admin"}
 										compact={isMobileViewport}
 									/>
-											<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
-											</Text>
-										</Tooltip>
-									)}
 									{/* Generic gateway/API quota balance */}
 									{quotaBalance != null &&
 										(hasQuotaDetailsPopover ? (

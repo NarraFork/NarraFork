@@ -152,31 +152,6 @@ export function useAllModels() {
 			anthropicByProvider.push({ prefix, name, models, agentProviderType: "anthropic" });
 		}
 
-			providerId: string;
-			providerName: string;
-			models: Array<Record<string, unknown>>;
-
-
-
-			const name = group.providerName || cfg?.name || prefix;
-			providerLabels[prefix] = name;
-			const models: ModelOption[] = [];
-			for (const m of group.models) {
-				const id = String(m.model_id ?? m.modelId ?? "");
-				if (!id) continue;
-				const rawRate = m.rate_multiplier ?? m.rateMultiplier;
-				const opt: ModelOption = {
-					value: `${prefix}:${id}`,
-					label: String(
-						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
-					),
-					provider: prefix,
-					rateMultiplier: typeof rawRate === "number" ? rawRate : undefined,
-				};
-				models.push(opt);
-			}
-		}
-
 		// --- Cline models (per-provider, OpenRouter-based) ---
 		const clineModelsGrouped: Array<{
 			providerId: string;
@@ -325,7 +300,6 @@ export function useAllModels() {
 			});
 		};
 
-			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of openaiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of anthropicByProvider)

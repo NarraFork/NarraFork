@@ -31,12 +31,7 @@ function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
 		result.auth = auth;
 	}
 	// Mask API keys in provider arrays
-	for (const key of [
-		"openaiProviders",
-		"anthropicProviders",
-		"nugProviders",
-		"clineProviders",
-	]) {
+	for (const key of ["openaiProviders", "anthropicProviders", "nugProviders", "clineProviders"]) {
 		const arr = result[key];
 		if (Array.isArray(arr)) {
 			result[key] = arr.map((p: Record<string, unknown>) => {
