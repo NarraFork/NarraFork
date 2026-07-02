@@ -13,6 +13,7 @@ import { buildTotpUri } from "../lib/totp";
 import { deleteAvatarImage, saveAvatarImage } from "../lib/uploads";
 import {
 	loginSchema,
+	mfaToggleSchema,
 	mfaVerifySchema,
 	passkeyLoginOptionsSchema,
 	passkeyLoginVerifySchema,
@@ -272,6 +273,33 @@ authRoutes.get("/me/security", requireAuth, async (c) => {
 });
 
 /**
+ * Toggle the login-time second-factor requirement. Enabling requires at least
+ * one usable factor (an active TOTP authenticator or a passkey), otherwise the
+ * user would lock themselves out. Disabling is always allowed from within an
+ * authenticated session.
+ */
+authRoutes.patch("/me/mfa", requireAuth, async (c) => {
+	const payload = c.get("user");
+	const parsed = mfaToggleSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(formatZodError(parsed.error));
+
+	if (parsed.data.enabled) {
+		const hasFactor = await mfaService.hasAnyFactor(payload.sub);
+		if (!hasFactor) {
+			throw new AppError(
+				"Add a second factor (an authenticator app or a passkey) before requiring two-factor sign-in",
+				400,
+				"MFA_NO_FACTOR",
+			);
+		}
+	}
+
+	await mfaService.setMfaEnabled(payload.sub, parsed.data.enabled);
+	logger.info("MFA requirement toggled", { userId: payload.sub, enabled: parsed.data.enabled });
+	return c.json({ ok: true, mfaEnabled: parsed.data.enabled });
+});
+
+/**
  * Begin TOTP enrollment. Returns the otpauth URI, a QR-code data URL and the
  * plaintext secret (for manual entry). Idempotent: re-calling regenerates the
  * pending secret. Fails if TOTP is already active.
@@ -345,7 +373,10 @@ authRoutes.delete("/me/totp", requireAuth, async (c) => {
 	}
 
 	await mfaService.disable(payload.sub);
-	logger.info("TOTP disabled", { userId: payload.sub });
+	// If this was the user's only factor, drop the MFA requirement so they
+	// aren't left with "MFA required" but nothing to satisfy it with.
+	const mfaDisabled = await mfaService.syncMfaEnabledAfterFactorChange(payload.sub);
+	logger.info("TOTP disabled", { userId: payload.sub, mfaRequirementCleared: mfaDisabled });
 	return c.json({ ok: true });
 });
 
@@ -410,7 +441,9 @@ authRoutes.delete("/me/passkeys/:id", requireAuth, async (c) => {
 	if (!id) throw new ValidationError("Passkey id is required");
 	const ok = await passkeyService.remove(payload.sub, id);
 	if (!ok) throw new AppError("Passkey not found", 404, "NOT_FOUND");
-	logger.info("Passkey removed", { userId: payload.sub });
+	// Clearing the last remaining factor should also drop the MFA requirement.
+	const mfaDisabled = await mfaService.syncMfaEnabledAfterFactorChange(payload.sub);
+	logger.info("Passkey removed", { userId: payload.sub, mfaRequirementCleared: mfaDisabled });
 	return c.json({ ok: true });
 });
 

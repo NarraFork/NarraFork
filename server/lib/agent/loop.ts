@@ -411,7 +411,7 @@ const PARALLEL_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 ]);
 
-const TODO_REMINDER_TOOL_INTERVAL = 4;
+const TODO_REMINDER_TOOL_INTERVAL = 15;
 const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
 
 const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
@@ -1596,8 +1596,11 @@ export async function* agentLoop(
 	const countedToolUseIds = new Set<string>();
 	const sideCarCheckedToolUseIds = new Set<string>();
 	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
-	// Knowledge-base entry ids already injected this run (point B de-dup; shared across tool outputs).
-	const knowledgeInjectedEntryIds = new Set<string>();
+	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
+	// across tool outputs). Prefer the session-provided shared set so point A (user message)
+	// and point B (tool output) de-dup together and the set survives across loop passes until
+	// a compact boundary clears it. Falls back to a local set for standalone/test callers.
+	const knowledgeInjectedEntryIds = config.knowledgeInjectedEntryIds ?? new Set<string>();
 
 	function cacheToolResultSideCars(toolUseId: string, sideCars: AgentSideCar[]): AgentSideCar[] {
 		toolResultSideCarCache.set(toolUseId, sideCars);

@@ -699,6 +699,14 @@ export const users = sqliteTable("users", {
 	avatarImageId: text("avatar_image_id"),
 	gitUsername: text("git_username"),
 	gitEmail: text("git_email"),
+	/**
+	 * Whether a second factor is REQUIRED at password login. Independent of
+	 * whether the user has any factor enrolled: registering a passkey or TOTP
+	 * does NOT flip this on — the user (or an explicit setup toggle) must opt in.
+	 * When off, an enrolled passkey still works as a passwordless login method
+	 * and TOTP simply stays dormant.
+	 */
+	mfaEnabled: integer("mfa_enabled", { mode: "boolean" }).notNull().default(false),
 	createdAt: text("created_at").notNull(),
 });
 
@@ -1501,8 +1509,15 @@ export const knowledgeEntries = sqliteTable(
 		// Redundant copy of the current revision's body, maintained by the service layer on addRevision.
 		// FTS triggers read this column so they don't need to join the revisions table.
 		currentContent: text("current_content"),
+		// Space-joined mirror of keywordsJson, maintained by the service layer alongside the entry.
+		// FTS triggers read this column to index the `keywords` column without touching the JSON.
+		currentKeywords: text("current_keywords"),
 		// MVP: tags stored as a JSON string[] on the entry (no separate tag table yet).
 		tagsJson: text("tags_json", { mode: "json" }),
+		// Author-declared keywords (string[]) that drive PASSIVE auto-injection: an entry is
+		// surfaced only when one of these keywords appears in the user message / tool output.
+		// Empty/absent → never auto-injected (still findable via the KnowledgeSearch tool).
+		keywordsJson: text("keywords_json", { mode: "json" }),
 		metadataJson: text("metadata_json", { mode: "json" }),
 		// Classification level (knowledge_levels.name); null = inherit collection.defaultLevel.
 		classificationLevel: text("classification_level"),
@@ -1579,6 +1594,10 @@ export const knowledgeDrafts = sqliteTable(
 		}),
 		// The main revision this draft was forked from (three-way merge base). Linked entries only.
 		baseRevisionId: text("base_revision_id"),
+		// Author-declared keywords for a STANDALONE personal entry (string[]). Carried through to
+		// the global entry on publish (approveStandalone). Linked entries inherit the global
+		// entry's keywords, so this stays null for them.
+		keywordsJson: text("keywords_json", { mode: "json" }),
 		content: text("content").notNull(),
 		contentHash: text("content_hash").notNull(),
 		format: text("format", { enum: ["markdown", "text", "json"] })
@@ -1626,6 +1645,9 @@ export const knowledgeSubmissions = sqliteTable(
 			.references(() => users.id, { onDelete: "set null" }),
 		baseRevisionId: text("base_revision_id"),
 		proposedContent: text("proposed_content").notNull(),
+		// Standalone publish only: keywords proposed for the new global entry, copied from the
+		// draft at submit time and applied to the created entry on approveStandalone.
+		keywordsJson: text("keywords_json", { mode: "json" }),
 		changeNote: text("change_note"),
 		status: text("status", {
 			enum: ["pending", "approved", "rejected", "changes_requested", "conflict"],

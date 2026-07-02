@@ -43,6 +43,8 @@ export interface KnowledgeEntry {
 	/** Present only on detail (getEntry withContent). */
 	currentContent?: string | null;
 	tagsJson: string[] | null;
+	/** Author-declared keywords driving passive auto-injection. */
+	keywordsJson: string[] | null;
 	metadataJson: Record<string, unknown> | null;
 	classificationLevel: string | null;
 	controlledTagsJson: string[] | null;
@@ -108,6 +110,8 @@ export interface KnowledgePersonalEntry {
 	content: string;
 	contentHash: string;
 	format: KnowledgeFormat;
+	/** Author-declared keywords (standalone personal entries) for passive auto-injection. */
+	keywordsJson: string[] | null;
 	status: "active" | "archived";
 	createdAt: string;
 	updatedAt: string;
@@ -122,7 +126,15 @@ export interface KnowledgeFinding {
 export interface KnowledgeSubmission {
 	id: string;
 	draftId: string;
-	entryId: string;
+	/**
+	 * Target global entry for a LINKED submission. NULL for a STANDALONE submission
+	 * (publishing a brand-new global entry) — those carry collectionId + title instead.
+	 */
+	entryId: string | null;
+	/** Standalone publish target collection (set only when entryId is null). */
+	collectionId: string | null;
+	/** Proposed title for the new global entry (standalone only). */
+	title: string | null;
 	submitterUserId: string;
 	baseRevisionId: string | null;
 	proposedContent: string;

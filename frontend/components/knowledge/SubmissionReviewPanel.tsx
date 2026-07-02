@@ -57,7 +57,6 @@ export function SubmissionReviewPanel({ submission, currentContent, canReview, o
 		reviewMut.mutate(
 			{
 				id: submission.id,
-				entryId: submission.entryId,
 				verdict,
 				findings: findings.filter((f) => f.message.trim()).map(({ key: _key, ...rest }) => rest),
 			},

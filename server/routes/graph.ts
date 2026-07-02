@@ -302,7 +302,7 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 		}
 	}
 
-	await db.transaction(async (tx) => {
+	db.transaction((tx) => {
 		for (const pos of parsed.data.positions) {
 			const updates: Record<string, unknown> = {
 				anchorCommitSha: pos.anchorCommitSha ?? null,
@@ -312,7 +312,7 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 			if (pos.panelExpanded !== undefined) updates.panelExpanded = pos.panelExpanded ? 1 : 0;
 			if (pos.panelWidth !== undefined) updates.panelWidth = pos.panelWidth;
 			if (pos.panelHeight !== undefined) updates.panelHeight = pos.panelHeight;
-			await tx.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId));
+			tx.update(chapters).set(updates).where(eq(chapters.id, pos.chapterId)).run();
 		}
 	});
 

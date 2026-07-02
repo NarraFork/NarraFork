@@ -2636,8 +2636,8 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 
 	const now = new Date().toISOString();
 	const msgId = generateId();
-	const msg = await db.transaction(async (tx) => {
-		const [insertedMsg] = await tx
+	const msg = db.transaction((tx) => {
+		const insertedMsg = tx
 			.insert(narratorMessages)
 			.values({
 				id: msgId,
@@ -2655,25 +2655,28 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 				createdBy: userId,
 				createdAt: now,
 			})
-			.returning();
+			.returning()
+			.get();
 
 		const insertSeq = ref.seq + 1;
-		await tx
-			.update(narratorMessageRefs)
+		tx.update(narratorMessageRefs)
 			.set({ seq: sql`${narratorMessageRefs.seq} + 1` })
-			.where(and(eq(narratorMessageRefs.narratorId, id), gte(narratorMessageRefs.seq, insertSeq)));
+			.where(and(eq(narratorMessageRefs.narratorId, id), gte(narratorMessageRefs.seq, insertSeq)))
+			.run();
 
-		await tx.insert(narratorMessageRefs).values({
-			id: generateId(),
-			narratorId: id,
-			messageId: msgId,
-			seq: insertSeq,
-		});
+		tx.insert(narratorMessageRefs)
+			.values({
+				id: generateId(),
+				narratorId: id,
+				messageId: msgId,
+				seq: insertSeq,
+			})
+			.run();
 
-		await tx
-			.update(narrators)
+		tx.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, id));
+			.where(eq(narrators.id, id))
+			.run();
 
 		return { ...insertedMsg, seq: insertSeq };
 	});
@@ -2748,16 +2751,16 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		},
 	];
 	const resolvedContentText = buildAskInPassingContentText(question);
-	const updatedMsg = await db.transaction(async (tx) => {
-		await tx
-			.update(narratorMessages)
+	const updatedMsg = db.transaction((tx) => {
+		tx.update(narratorMessages)
 			.set({ contentJson: resolvedContentJson, contentText: resolvedContentText })
-			.where(eq(narratorMessages.id, pendingMessageId));
+			.where(eq(narratorMessages.id, pendingMessageId))
+			.run();
 
-		await tx
-			.update(narrators)
+		tx.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, id));
+			.where(eq(narrators.id, id))
+			.run();
 
 		return {
 			...pendingMsg,
@@ -2789,27 +2792,29 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 		throw new ValidationError("Pending ask-in-passing message not found");
 	}
 
-	await db.transaction(async (tx) => {
-		await tx
-			.delete(narratorMessageRefs)
+	db.transaction((tx) => {
+		tx.delete(narratorMessageRefs)
 			.where(
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
 					eq(narratorMessageRefs.messageId, messageId),
 				),
-			);
+			)
+			.run();
 
-		const otherRef = await tx.query.narratorMessageRefs.findFirst({
-			where: eq(narratorMessageRefs.messageId, messageId),
-		});
+		const otherRef = tx.query.narratorMessageRefs
+			.findFirst({
+				where: eq(narratorMessageRefs.messageId, messageId),
+			})
+			.sync();
 		if (!otherRef) {
-			await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+			tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 		}
 
-		await tx
-			.update(narrators)
+		tx.update(narrators)
 			.set({ messageVersion: sql`${narrators.messageVersion} + 1` })
-			.where(eq(narrators.id, narratorId));
+			.where(eq(narrators.id, narratorId))
+			.run();
 	});
 
 	// Broadcast deletion

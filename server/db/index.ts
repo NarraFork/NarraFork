@@ -10,7 +10,7 @@ import { acquireInstanceLock, releaseInstanceLock } from "../lib/instance-lock";
 import { logger } from "../lib/logger";
 import { getDbPath, openDatabase } from "./connection";
 import { ensureColumns } from "./ensure-columns";
-import { ensureFts, markCleanShutdown } from "./fts";
+import { ensureFts, markCleanShutdown, readCleanShutdownState } from "./fts";
 import * as relations from "./relations";
 import { runMigrations } from "./run-migrations";
 import * as schema from "./schema";
@@ -31,27 +31,44 @@ const isHotReload = dbLifecycle.initialized;
 dbLifecycle.sqlite = sqlite;
 dbLifecycle.cleanMarked = false;
 
-// Startup integrity check — detect corruption early
-const integrity = checkIntegrity(sqlite);
-if (!integrity.ok) {
-	logger.error("Database integrity check failed on startup — attempting recovery", {
-		details: integrity.details,
-	});
-	const walOk = tryWalRecovery(sqlite);
-	if (walOk && checkIntegrity(sqlite).ok) {
-		logger.info("Database recovered after WAL checkpoint");
-	} else {
-		logger.warn("WAL recovery insufficient, attempting CLI .recover");
-		sqlite.close();
-		const recovered = recoverWithCli(dbPath);
-		sqlite = openDatabase();
-		dbLifecycle.sqlite = sqlite;
-		if (recovered && checkIntegrity(sqlite).ok) {
-			logger.info("Database recovered via sqlite3 CLI .recover");
+// Read the clean-shutdown marker BEFORE ensureFts resets it. This reflects how the
+// previous process exited and gates the expensive startup integrity check below.
+// ensureFts reads the same marker again to decide FTS rebuild — same value, consistent.
+const { wasClean } = readCleanShutdownState(sqlite);
+
+// Startup integrity check — detect corruption early.
+// A full `PRAGMA integrity_check` scans the entire database and can take ~15s on a
+// multi-GB DB, blocking the main thread (bun:sqlite is synchronous). Skip it when the
+// previous shutdown was clean: WAL + synchronous=NORMAL guarantees committed data
+// survives an app crash, and a clean marker means we wrote it on graceful exit. Only
+// run the full check after an unclean shutdown (crash/SIGKILL) or when forced via env.
+// The runtime malformed-error recovery path (recoverWithCli, below) remains as the
+// safety net for the rare case of external/on-disk corruption.
+const forceFullIntegrityCheck = process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1";
+if (wasClean && !forceFullIntegrityCheck) {
+	logger.info("Startup integrity check skipped (clean shutdown marker present)");
+} else {
+	const integrity = checkIntegrity(sqlite);
+	if (!integrity.ok) {
+		logger.error("Database integrity check failed on startup — attempting recovery", {
+			details: integrity.details,
+		});
+		const walOk = tryWalRecovery(sqlite);
+		if (walOk && checkIntegrity(sqlite).ok) {
+			logger.info("Database recovered after WAL checkpoint");
 		} else {
-			logger.error("Automatic recovery failed — manual repair needed", {
-				hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
-			});
+			logger.warn("WAL recovery insufficient, attempting CLI .recover");
+			sqlite.close();
+			const recovered = recoverWithCli(dbPath);
+			sqlite = openDatabase();
+			dbLifecycle.sqlite = sqlite;
+			if (recovered && checkIntegrity(sqlite).ok) {
+				logger.info("Database recovered via sqlite3 CLI .recover");
+			} else {
+				logger.error("Automatic recovery failed — manual repair needed", {
+					hint: `sqlite3 "${dbPath}" ".recover" | sqlite3 "${dbPath}.manual"`,
+				});
+			}
 		}
 	}
 }
@@ -252,7 +269,17 @@ const walCheckpointTimer = hotTimer("narrafork.walCheckpointTimer", () =>
 );
 dbLifecycle.walCheckpointTimer = walCheckpointTimer;
 
-export function markDatabaseCleanShutdown(): void {
+/**
+ * Write the clean-shutdown marker (application_id + WAL checkpoint) WITHOUT
+ * releasing the instance lock. Idempotent via dbLifecycle.cleanMarked.
+ *
+ * Call this EARLY in the graceful-shutdown sequence — before the terminal/MCP/
+ * browser teardown awaits that can hang — so the marker is persisted even if a
+ * later step stalls and the process is force-killed. The instance lock stays held
+ * (the DB may still be written by teardown, and an update-handoff replacement is
+ * waiting on the lock), and is released later by markDatabaseCleanShutdown().
+ */
+export function markDatabaseCleanShutdownEarly(): void {
 	if (dbLifecycle.walCheckpointTimer) {
 		clearInterval(dbLifecycle.walCheckpointTimer);
 		dbLifecycle.walCheckpointTimer = undefined;
@@ -264,7 +291,13 @@ export function markDatabaseCleanShutdown(): void {
 			dbLifecycle.cleanMarked = true;
 		}
 	} catch (err) {
-		logger.warn("Failed to mark database clean shutdown", { error: String(err) });
+		logger.warn("Failed to mark database clean shutdown (early)", { error: String(err) });
+	}
+}
+
+export function markDatabaseCleanShutdown(): void {
+	try {
+		markDatabaseCleanShutdownEarly();
 	} finally {
 		releaseInstanceLock();
 	}

@@ -411,5 +411,16 @@
 	"usageHistoryError": "错误",
 	"usageHistoryCopyError": "复制错误信息",
 	"usageHistoryDownloadRequestResponse": "下载请求/回复",
-	"usageHistoryDownloadFailed": "下载请求/回复失败"
+	"usageHistoryDownloadFailed": "下载请求/回复失败",
+	"imageViewer_zoomIn": "放大",
+	"imageViewer_zoomOut": "缩小",
+	"imageViewer_reset": "重置",
+	"imageViewer_rotateLeft": "向左旋转",
+	"imageViewer_rotateRight": "向右旋转",
+	"imageViewer_copy": "复制图片",
+	"imageViewer_download": "下载",
+	"imageViewer_close": "关闭",
+	"imageViewer_copySuccess": "图片已复制到剪贴板",
+	"imageViewer_copyFailed": "复制图片失败",
+	"imageViewer_downloadFailed": "下载图片失败"
 }

@@ -24,6 +24,8 @@ export function isMfaChallenge(r: LoginResult): r is MfaChallenge {
 
 /** Current MFA status for the security settings page. */
 export interface MfaStatus {
+	/** Whether a second factor is REQUIRED at login (the explicit opt-in switch). */
+	mfaEnabled: boolean;
 	totpEnabled: boolean;
 	backupCodesRemaining: number;
 	passkeyCount: number;
@@ -127,6 +129,12 @@ export const authApi = {
 
 	// MFA — management (settings → security)
 	getSecurityStatus: () => request<MfaStatus>("/auth/me/security"),
+	/** Toggle the login-time second-factor requirement. */
+	setMfaEnabled: (enabled: boolean) =>
+		request<{ ok: boolean; mfaEnabled: boolean }>("/auth/me/mfa", {
+			method: "PATCH",
+			body: JSON.stringify({ enabled }),
+		}),
 	totpSetup: () => request<TotpSetupResult>("/auth/me/totp/setup", { method: "POST" }),
 	totpActivate: (code: string) =>
 		request<{ ok: boolean; backupCodes: string[] }>("/auth/me/totp/activate", {

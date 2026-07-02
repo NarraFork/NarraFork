@@ -4,7 +4,7 @@ export const MAX_INLINE_IMAGE_SOURCE_CHARS = 16 * 1024 * 1024;
 export const MAX_IMAGE_CLIPBOARD_BLOB_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGE_CLIPBOARD_PIXELS = 32_000_000;
 
-interface CopyGeneratedImageOptions {
+export interface CopyGeneratedImageOptions {
 	imageSrc?: string | null;
 	savedPath?: string | null;
 }
@@ -67,7 +67,10 @@ function assertBlobSafe(blob: Blob): void {
 	}
 }
 
-async function fetchImageBlob({ imageSrc, savedPath }: CopyGeneratedImageOptions): Promise<Blob> {
+export async function fetchImageBlob({
+	imageSrc,
+	savedPath,
+}: CopyGeneratedImageOptions): Promise<Blob> {
 	const savedPathSource = getSavedPathPreviewSource(savedPath);
 	const source = savedPathSource ?? normalizeImageSrc(imageSrc);
 	if (!source) throw new Error("No image source");

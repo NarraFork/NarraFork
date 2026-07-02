@@ -5,6 +5,7 @@ import "@mantine/core/styles.css";
 import { Notifications } from "@mantine/notifications";
 import "@mantine/notifications/styles.css";
 import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
+import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
 import "@frontend/styles/oled.css";
 import "@frontend/styles/blur-anim.css";
 import "@frontend/styles/nav-collapsed.css";
@@ -53,18 +54,20 @@ async function bootstrap() {
 		<React.StrictMode>
 			<MantineProvider theme={theme} defaultColorScheme="auto">
 				<ConfirmDialogProvider>
-					<Notifications position="top-right" zIndex={Z.toast} />
-					<QueryClientProvider client={queryClient}>
-						<React.Suspense
-							fallback={
-								<Center h="100vh">
-									<Loader />
-								</Center>
-							}
-						>
-							<RouterProvider router={router} />
-						</React.Suspense>
-					</QueryClientProvider>
+					<ImageViewerProvider>
+						<Notifications position="top-right" zIndex={Z.toast} />
+						<QueryClientProvider client={queryClient}>
+							<React.Suspense
+								fallback={
+									<Center h="100vh">
+										<Loader />
+									</Center>
+								}
+							>
+								<RouterProvider router={router} />
+							</React.Suspense>
+						</QueryClientProvider>
+					</ImageViewerProvider>
 				</ConfirmDialogProvider>
 			</MantineProvider>
 		</React.StrictMode>,

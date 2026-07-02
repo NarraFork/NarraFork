@@ -1,6 +1,10 @@
 import { z } from "zod";
 
 const tagsSchema = z.array(z.string().min(1).max(64)).max(50).optional();
+// Author-declared keywords that drive passive auto-injection. Shape-only validation: a
+// lenient minimum-length floor is applied at the service layer (normalizeKeywords), not here
+// — keyword quality is steered by tool prompts, so nothing is hard-rejected on length.
+const keywordsSchema = z.array(z.string().min(1).max(64)).max(50).optional();
 const metadataSchema = z.record(z.string(), z.unknown()).optional();
 const formatSchema = z.enum(["markdown", "text", "json"]).optional();
 
@@ -35,6 +39,7 @@ export const createKnowledgeEntrySchema = z.object({
 	content: z.string().max(1_000_000).optional().default(""),
 	format: formatSchema,
 	tags: tagsSchema,
+	keywords: keywordsSchema,
 	metadata: metadataSchema,
 	changeNote: z.string().max(1_000).optional(),
 });
@@ -42,6 +47,7 @@ export const createKnowledgeEntrySchema = z.object({
 export const updateKnowledgeEntrySchema = z.object({
 	title: z.string().min(1).max(500).optional(),
 	tags: tagsSchema,
+	keywords: keywordsSchema,
 	metadata: metadataSchema,
 	status: z.enum(["active", "archived"]).optional(),
 });
@@ -81,11 +87,13 @@ export const createPersonalEntrySchema = z.object({
 	content: z.string().max(1_000_000).optional(),
 	targetCollectionId: z.string().optional(),
 	name: z.string().max(200).optional(),
+	keywords: keywordsSchema,
 });
 
 export const updatePersonalEntryMetaSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	targetCollectionId: z.string().nullable().optional(),
+	keywords: keywordsSchema,
 });
 
 export const listPersonalEntriesQuerySchema = z.object({

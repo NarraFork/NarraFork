@@ -5,6 +5,7 @@ export {
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	loginSchema,
+	mfaToggleSchema,
 	mfaVerifySchema,
 	oidcExchangeSchema,
 	oidcProviderInputSchema,

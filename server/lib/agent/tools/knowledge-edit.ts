@@ -39,7 +39,9 @@ export const knowledgeCreateTool: ToolDefinition = {
 		"library (private to you) that you can later publish into the shared global base via " +
 		"KnowledgeEdit (action 'publish'). If you have write permission on the target collection " +
 		"and pass direct:true, it creates the entry directly in the global base instead. " +
-		"Use this for brand-new entries; use KnowledgeEdit to change existing ones. Requires user permission.",
+		"Use this for brand-new entries; use KnowledgeEdit to change existing ones. " +
+		"Set `keywords` to the distinctive terms that should passively surface this entry in " +
+		"future sessions (see the keywords param guidance). Requires user permission.",
 	parameters: z.object({
 		title: z.string().describe("Entry title"),
 		content: z.string().optional().describe("Entry body content (markdown)"),
@@ -50,6 +52,17 @@ export const knowledgeCreateTool: ToolDefinition = {
 				"Target collection. For a direct global create this is required; for a personal entry it is the intended publish target (can be set later).",
 			),
 		tags: z.array(z.string()).optional().describe("Tags (direct global create only)"),
+		keywords: z
+			.array(z.string())
+			.optional()
+			.describe(
+				"Trigger terms for passive auto-injection: when one appears in a later user message " +
+					"or tool output, this entry's summary is surfaced automatically. Choose DISTINCTIVE, " +
+					"specific terms — proper nouns, error codes, API/function names, domain jargon. Avoid " +
+					"short (<3 char) or broad generic words (e.g. 'data', 'error', 'file'); they cause noisy, " +
+					"irrelevant injections. An entry with no keywords is never auto-injected (still findable " +
+					"via KnowledgeSearch). Prefer a few high-signal terms over many weak ones.",
+			),
 		direct: z
 			.boolean()
 			.optional()
@@ -64,6 +77,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 			content?: string;
 			collectionId?: string;
 			tags?: string[];
+			keywords?: string[];
 			direct?: boolean;
 			changeNote?: string;
 		};
@@ -91,6 +105,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 						title: a.title,
 						content: a.content,
 						tags: a.tags,
+						keywords: a.keywords,
 						changeNote: a.changeNote,
 					});
 					if (!parsed.success) return deny(`Invalid create input: ${parsed.error.message}`);
@@ -113,6 +128,7 @@ export const knowledgeCreateTool: ToolDefinition = {
 				title: a.title,
 				content: a.content,
 				targetCollectionId: a.collectionId,
+				keywords: a.keywords,
 			});
 			return {
 				output:
@@ -137,7 +153,7 @@ export const knowledgeEditTool: ToolDefinition = {
 		"- rebase: when your personal entry is based on an outdated main (drifted), three-way-merge the latest main into it. Conflict → returns both versions to redo manually.\n" +
 		"- publish: submit your personal entry to be published into the global base (review-gated).\n" +
 		"- set_target: set the target collection for a standalone personal entry (required before publish).\n" +
-		"- update_meta: change a global entry's title/tags/status (needs write permission).\n" +
+		"- update_meta: change a GLOBAL entry's title/tags/keywords/status (pass entryId; needs write permission), OR a standalone PERSONAL entry's title/keywords (pass personalEntryId).\n" +
 		"- transfer_owner / transfer_collection_owner: hand off ownership (admin or current owner).\n" +
 		"Requires user permission for all actions.",
 	parameters: z.object({
@@ -160,7 +176,9 @@ export const knowledgeEditTool: ToolDefinition = {
 		personalEntryId: z
 			.string()
 			.optional()
-			.describe("Personal entry id (save standalone / rebase / publish / set_target)"),
+			.describe(
+				"Personal entry id (save standalone / rebase / publish / set_target / update_meta)",
+			),
 		content: z.string().optional().describe("New content for save"),
 		direct: z
 			.boolean()
@@ -172,6 +190,15 @@ export const knowledgeEditTool: ToolDefinition = {
 		// update_meta
 		title: z.string().optional().describe("update_meta: new title"),
 		tags: z.array(z.string()).optional().describe("update_meta: new tags"),
+		keywords: z
+			.array(z.string())
+			.optional()
+			.describe(
+				"update_meta: replace the entry's auto-injection keywords. Use DISTINCTIVE, specific " +
+					"terms (proper nouns, error codes, API names, domain jargon); avoid short (<3 char) or " +
+					"broad generic words, which cause noisy injections. Empty array clears keywords (entry " +
+					"will no longer auto-inject).",
+			),
 		entryStatus: z.enum(["active", "archived"]).optional().describe("update_meta: entry status"),
 		// transfer
 		collectionTargetId: z.string().optional().describe("transfer_collection_owner: collection id"),
@@ -344,10 +371,41 @@ async function editUpdateMeta(
 	principal: Principal,
 	a: Record<string, unknown>,
 ): Promise<ToolResult> {
-	if (!a.entryId) return deny("update_meta requires 'entryId'.");
+	// Personal (standalone) entry: update its own title / keywords via the branch service.
+	// tags/status don't apply to personal entries (they only exist on global entries).
+	if (a.personalEntryId && !a.entryId) {
+		const patch: { title?: string; keywords?: string[] } = {};
+		if (a.title !== undefined) patch.title = a.title as string;
+		if (a.keywords !== undefined) {
+			if (!Array.isArray(a.keywords)) return deny("update_meta 'keywords' must be an array.");
+			patch.keywords = a.keywords as string[];
+		}
+		if (Object.keys(patch).length === 0) {
+			return deny("update_meta for a personal entry needs 'title' and/or 'keywords'.");
+		}
+		await knowledgeBranchService.updateStandaloneMeta(
+			principal,
+			a.personalEntryId as string,
+			patch,
+		);
+		return {
+			output: `Updated metadata for personal entry ${a.personalEntryId}.`,
+			title: "KnowledgeEdit: update_meta",
+			metadata: {
+				tool: "KnowledgeEdit",
+				action: "update_meta",
+				personalEntryId: a.personalEntryId,
+			},
+		};
+	}
+
+	if (!a.entryId) {
+		return deny("update_meta requires 'entryId' (global entry) or 'personalEntryId' (personal).");
+	}
 	const parsed = updateKnowledgeEntrySchema.safeParse({
 		title: a.title,
 		tags: a.tags,
+		keywords: a.keywords,
 		status: a.entryStatus,
 	});
 	if (!parsed.success) return deny(`Invalid update_meta input: ${parsed.error.message}`);

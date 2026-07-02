@@ -341,10 +341,10 @@ export const mergeSummaryService = {
 		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
 
 		// Delete refs first (FK), then messages
-		await db.transaction(async (tx) => {
+		db.transaction((tx) => {
 			for (const id of ids) {
-				await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id));
-				await tx.delete(narratorMessages).where(eq(narratorMessages.id, id));
+				tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id)).run();
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, id)).run();
 			}
 		});
 
@@ -387,10 +387,10 @@ export const mergeSummaryService = {
 			.where(inArray(narratorMessageRefs.messageId, ids));
 		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
 
-		await db.transaction(async (tx) => {
+		db.transaction((tx) => {
 			for (const id of ids) {
-				await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id));
-				await tx.delete(narratorMessages).where(eq(narratorMessages.id, id));
+				tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, id)).run();
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, id)).run();
 			}
 		});
 

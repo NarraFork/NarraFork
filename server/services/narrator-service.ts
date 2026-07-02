@@ -98,12 +98,14 @@ const REFS_INSERT_BATCH = 500;
 const MAX_INHERITED_FULL_FORK_REFS = 500;
 
 /** Batch-insert narratorMessageRefs rows, chunking to stay within SQLite's variable limit. */
-async function insertRefsBatched(
+function insertRefsBatched(
 	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
 	values: (typeof narratorMessageRefs.$inferInsert)[],
 ) {
 	for (let i = 0; i < values.length; i += REFS_INSERT_BATCH) {
-		await tx.insert(narratorMessageRefs).values(values.slice(i, i + REFS_INSERT_BATCH));
+		tx.insert(narratorMessageRefs)
+			.values(values.slice(i, i + REFS_INSERT_BATCH))
+			.run();
 	}
 }
 
@@ -1028,48 +1030,48 @@ export const narratorService = {
 
 		const preserveUploads = await hasSharedOwnedImageMessages(narratorId);
 
-		await db.transaction(async (tx) => {
-			await tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId));
-			await tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId));
-			await tx.delete(terminals).where(eq(terminals.narratorId, narratorId));
-			await tx
-				.delete(narratorBufferedMessages)
-				.where(eq(narratorBufferedMessages.narratorId, narratorId));
-			await tx.delete(narratorGoals).where(eq(narratorGoals.narratorId, narratorId));
-			await tx
-				.delete(narratorFileSnapshots)
-				.where(eq(narratorFileSnapshots.narratorId, narratorId));
-			await tx.delete(narratorPatches).where(eq(narratorPatches.narratorId, narratorId));
-			await tx
-				.delete(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, narratorId));
-			await tx
-				.delete(narratorBlacklistDirs)
-				.where(eq(narratorBlacklistDirs.narratorId, narratorId));
-			await tx
-				.delete(narratorWhitelistCmds)
-				.where(eq(narratorWhitelistCmds.narratorId, narratorId));
-			await tx
-				.delete(narratorBlacklistCmds)
-				.where(eq(narratorBlacklistCmds.narratorId, narratorId));
-			await tx.delete(apiRequests).where(eq(apiRequests.narratorId, narratorId));
-			await tx
-				.update(chapterCommits)
+		db.transaction((tx) => {
+			tx.delete(terminalViewState).where(eq(terminalViewState.narratorId, narratorId)).run();
+			tx.delete(terminalTabs).where(eq(terminalTabs.narratorId, narratorId)).run();
+			tx.delete(terminals).where(eq(terminals.narratorId, narratorId)).run();
+			tx.delete(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.run();
+			tx.delete(narratorGoals).where(eq(narratorGoals.narratorId, narratorId)).run();
+			tx.delete(narratorFileSnapshots)
+				.where(eq(narratorFileSnapshots.narratorId, narratorId))
+				.run();
+			tx.delete(narratorPatches).where(eq(narratorPatches.narratorId, narratorId)).run();
+			tx.delete(narratorWhitelistDirs)
+				.where(eq(narratorWhitelistDirs.narratorId, narratorId))
+				.run();
+			tx.delete(narratorBlacklistDirs)
+				.where(eq(narratorBlacklistDirs.narratorId, narratorId))
+				.run();
+			tx.delete(narratorWhitelistCmds)
+				.where(eq(narratorWhitelistCmds.narratorId, narratorId))
+				.run();
+			tx.delete(narratorBlacklistCmds)
+				.where(eq(narratorBlacklistCmds.narratorId, narratorId))
+				.run();
+			tx.delete(apiRequests).where(eq(apiRequests.narratorId, narratorId)).run();
+			tx.update(chapterCommits)
 				.set({ narratorId: null })
-				.where(eq(chapterCommits.narratorId, narratorId));
-			await tx
-				.update(benchmarkTaskResults)
+				.where(eq(chapterCommits.narratorId, narratorId))
+				.run();
+			tx.update(benchmarkTaskResults)
 				.set({ narratorId: null })
-				.where(eq(benchmarkTaskResults.narratorId, narratorId));
-			await tx
-				.delete(gatewaySessionMappings)
-				.where(eq(gatewaySessionMappings.narratorId, narratorId));
-			await tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId));
-			await tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId));
-			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId));
-			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
+				.where(eq(benchmarkTaskResults.narratorId, narratorId))
+				.run();
+			tx.delete(gatewaySessionMappings)
+				.where(eq(gatewaySessionMappings.narratorId, narratorId))
+				.run();
+			tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId)).run();
+			tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId)).run();
+			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).run();
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
 
-			const sharedRows = await tx
+			const sharedRows = tx
 				.select({
 					id: narratorMessages.id,
 					contentJson: narratorMessages.contentJson,
@@ -1089,17 +1091,18 @@ export const narratorService = {
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
 					),
-				);
+				)
+				.all();
 
 			for (const row of sharedRows) {
 				const contentJson = annotateImageBlocksWithUploadOwner(row.contentJson, narratorId);
-				await tx
-					.update(narratorMessages)
+				tx.update(narratorMessages)
 					.set({ narratorId: row.newOwnerId, contentJson })
-					.where(eq(narratorMessages.id, row.id));
+					.where(eq(narratorMessages.id, row.id))
+					.run();
 			}
 
-			const orphanRows = await tx
+			const orphanRows = tx
 				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(
@@ -1110,32 +1113,33 @@ export const narratorService = {
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
 					),
-				);
+				)
+				.all();
 			const orphanIds = orphanRows.map((r) => r.id);
 
 			if (orphanIds.length > 0) {
-				await tx
-					.update(narrators)
+				tx.update(narrators)
 					.set({ forkMessageId: null })
-					.where(inArray(narrators.forkMessageId, orphanIds));
-				await tx
-					.update(narrators)
+					.where(inArray(narrators.forkMessageId, orphanIds))
+					.run();
+				tx.update(narrators)
 					.set({ pruneBoundaryMessageId: null })
-					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
-				await tx
-					.update(chapterCommits)
+					.where(inArray(narrators.pruneBoundaryMessageId, orphanIds))
+					.run();
+				tx.update(chapterCommits)
 					.set({ narratorMessageId: null })
-					.where(inArray(chapterCommits.narratorMessageId, orphanIds));
-				await tx
-					.update(apiRequests)
+					.where(inArray(chapterCommits.narratorMessageId, orphanIds))
+					.run();
+				tx.update(apiRequests)
 					.set({ messageId: null })
-					.where(inArray(apiRequests.messageId, orphanIds));
-				await tx.delete(narratorPatches).where(inArray(narratorPatches.messageId, orphanIds));
-				await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-				await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+					.where(inArray(apiRequests.messageId, orphanIds))
+					.run();
+				tx.delete(narratorPatches).where(inArray(narratorPatches.messageId, orphanIds)).run();
+				tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds)).run();
+				tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds)).run();
 			}
 
-			await tx.delete(narrators).where(eq(narrators.id, narratorId));
+			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 		});
 
 		if (preserveUploads) {
@@ -1195,8 +1199,8 @@ export const narratorService = {
 			| "readOnly"
 			| "dontAsk";
 
-		const newNarrator = await db.transaction(async (tx) => {
-			const [created] = await tx
+		const newNarrator = db.transaction((tx) => {
+			const created = tx
 				.insert(narrators)
 				.values({
 					id,
@@ -1221,7 +1225,8 @@ export const narratorService = {
 					createdAt: now,
 					updatedAt: now,
 				})
-				.returning();
+				.returning()
+				.get();
 
 			const dupRefValues = parentRefs.map((row, i) => ({
 				id: generateId(),
@@ -1230,7 +1235,7 @@ export const narratorService = {
 				seq: i + 1,
 				isCompact: 0,
 			}));
-			await insertRefsBatched(tx, dupRefValues);
+			insertRefsBatched(tx, dupRefValues);
 
 			return created;
 		});
@@ -1409,8 +1414,8 @@ export const narratorService = {
 
 		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 
-		const newNarrator = await db.transaction(async (tx) => {
-			const [created] = await tx
+		const newNarrator = db.transaction((tx) => {
+			const created = tx
 				.insert(narrators)
 				.values({
 					id,
@@ -1438,7 +1443,8 @@ export const narratorService = {
 					createdAt: now,
 					updatedAt: now,
 				})
-				.returning();
+				.returning()
+				.get();
 
 			if (prefixRows.length > 0) {
 				const refValues = prefixRows.map((row, index) => ({
@@ -1450,7 +1456,7 @@ export const narratorService = {
 					prunedPercent: row.prunedPercent,
 					segmentCompactId: row.segmentCompactId,
 				}));
-				await insertRefsBatched(tx, refValues);
+				insertRefsBatched(tx, refValues);
 
 				if (parent.pruneBoundaryMessageId) {
 					const boundaryInPrefix = prefixRows.find(
@@ -1461,13 +1467,13 @@ export const narratorService = {
 						const inheritedPrunedPercent = Math.round(
 							((boundaryIdx + 1) / prefixRows.length) * 100,
 						);
-						await tx
-							.update(narrators)
+						tx.update(narrators)
 							.set({
 								pruneBoundaryMessageId: parent.pruneBoundaryMessageId,
 								prunedPercent: inheritedPrunedPercent,
 							})
-							.where(eq(narrators.id, id));
+							.where(eq(narrators.id, id))
+							.run();
 					}
 				}
 			}
@@ -1475,44 +1481,52 @@ export const narratorService = {
 			if (inheritMode === "compressed" && contextSummary) {
 				const compactMsgId = generateId();
 				const compactNow = new Date().toISOString();
-				await tx.insert(narratorMessages).values({
-					id: compactMsgId,
-					narratorId: id,
-					role: "system",
-					contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
-					contentText: `[Compressed context from parent conversation]`,
-					createdAt: compactNow,
-				});
-				const maxSeqResult = await tx
+				tx.insert(narratorMessages)
+					.values({
+						id: compactMsgId,
+						narratorId: id,
+						role: "system",
+						contentJson: [{ type: "compact", status: "compacted", summary: contextSummary }],
+						contentText: `[Compressed context from parent conversation]`,
+						createdAt: compactNow,
+					})
+					.run();
+				const maxSeqResult = tx
 					.select({ maxSeq: sql<number | null>`MAX(${narratorMessageRefs.seq})` })
 					.from(narratorMessageRefs)
-					.where(eq(narratorMessageRefs.narratorId, id));
+					.where(eq(narratorMessageRefs.narratorId, id))
+					.all();
 				const compactSeq = (maxSeqResult[0]?.maxSeq ?? -1) + 1;
-				await tx.insert(narratorMessageRefs).values({
-					id: generateId(),
-					narratorId: id,
-					messageId: compactMsgId,
-					seq: compactSeq,
-					isCompact: 1,
-				});
-			}
-
-			const parentWhitelistDirs = await tx
-				.select()
-				.from(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId));
-
-			if (parentWhitelistDirs.length > 0) {
-				await tx.insert(narratorWhitelistDirs).values(
-					parentWhitelistDirs.map((dir) => ({
+				tx.insert(narratorMessageRefs)
+					.values({
 						id: generateId(),
 						narratorId: id,
-						path: dir.path,
-						accessLevel: dir.accessLevel,
-						enabled: dir.enabled,
-						createdAt: now,
-					})),
-				);
+						messageId: compactMsgId,
+						seq: compactSeq,
+						isCompact: 1,
+					})
+					.run();
+			}
+
+			const parentWhitelistDirs = tx
+				.select()
+				.from(narratorWhitelistDirs)
+				.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId))
+				.all();
+
+			if (parentWhitelistDirs.length > 0) {
+				tx.insert(narratorWhitelistDirs)
+					.values(
+						parentWhitelistDirs.map((dir) => ({
+							id: generateId(),
+							narratorId: id,
+							path: dir.path,
+							accessLevel: dir.accessLevel,
+							enabled: dir.enabled,
+							createdAt: now,
+						})),
+					)
+					.run();
 			}
 
 			return created;

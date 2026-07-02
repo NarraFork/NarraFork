@@ -31,6 +31,7 @@ export interface CreateEntryInput {
 	slug?: string;
 	content?: string;
 	tags?: string[];
+	keywords?: string[];
 	metadata?: Record<string, unknown>;
 	changeNote?: string;
 }
@@ -94,6 +95,7 @@ export const knowledgeApi = {
 		data: {
 			title?: string;
 			tags?: string[];
+			keywords?: string[];
 			metadata?: Record<string, unknown>;
 			status?: "active" | "archived";
 		},
@@ -168,7 +170,12 @@ export const knowledgeApi = {
 				limit: opts.limit !== undefined ? String(opts.limit) : undefined,
 			})}`,
 		),
-	createPersonalEntry: (data: { title: string; content?: string; targetCollectionId?: string }) =>
+	createPersonalEntry: (data: {
+		title: string;
+		content?: string;
+		targetCollectionId?: string;
+		keywords?: string[];
+	}) =>
 		request<KnowledgePersonalEntry>("/knowledge/personal-entries", {
 			method: "POST",
 			body: JSON.stringify(data),
@@ -177,7 +184,7 @@ export const knowledgeApi = {
 		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`),
 	updatePersonalEntryMeta: (
 		id: string,
-		data: { title?: string; targetCollectionId?: string | null },
+		data: { title?: string; targetCollectionId?: string | null; keywords?: string[] },
 	) =>
 		request<KnowledgePersonalEntry>(`/knowledge/personal-entries/${id}`, {
 			method: "PATCH",

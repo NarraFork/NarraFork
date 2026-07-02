@@ -13,6 +13,7 @@ import {
 	Select,
 	Stack,
 	Tabs,
+	TagsInput,
 	Text,
 	Textarea,
 	TextInput,
@@ -24,6 +25,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AclAdminPanel } from "../../components/knowledge/AclAdminPanel";
+import { SubmissionReviewPanel } from "../../components/knowledge/SubmissionReviewPanel";
 import { useCurrentUser } from "../../hooks/useAuth";
 import {
 	useCreateKnowledgeCollection,
@@ -32,6 +34,7 @@ import {
 	useDeleteKnowledgeCollection,
 	useKnowledgeCollections,
 	useKnowledgeEntries,
+	useKnowledgeSubmission,
 	useKnowledgeSubmissions,
 	useMyPersonalEntries,
 	useUpdateKnowledgeCollection,
@@ -502,6 +505,7 @@ function MyLibraryTab() {
 	const [title, setTitle] = useState("");
 	const [content, setContent] = useState("");
 	const [target, setTarget] = useState<string | null>(null);
+	const [keywords, setKeywords] = useState<string[]>([]);
 
 	const collectionOptions = useMemo(
 		() => (collections.data ?? []).map((c) => ({ value: c.id, label: c.name })),
@@ -520,12 +524,14 @@ function MyLibraryTab() {
 				title: title.trim(),
 				content: content || undefined,
 				targetCollectionId: target ?? undefined,
+				keywords: keywords.length > 0 ? keywords : undefined,
 			},
 			{
 				onSuccess: () => {
 					setTitle("");
 					setContent("");
 					setTarget(null);
+					setKeywords([]);
 				},
 			},
 		);
@@ -569,6 +575,14 @@ function MyLibraryTab() {
 						autosize
 						minRows={3}
 						maxRows={12}
+					/>
+					<TagsInput
+						label={t("keywords")}
+						description={t("keywordsHint")}
+						placeholder={t("keywordsPlaceholder")}
+						value={keywords}
+						onChange={setKeywords}
+						clearable
 					/>
 				</Stack>
 			</Paper>
@@ -620,12 +634,27 @@ function MyLibraryTab() {
 	);
 }
 
+/**
+ * A review-center group is either a set of submissions targeting one existing global
+ * entry (linked) or a single new-entry proposal targeting a collection (standalone,
+ * entryId === null). Standalone proposals have no entry page yet, so they are reviewed
+ * inline via a modal instead of navigating away.
+ */
+type ReviewGroup =
+	| { kind: "entry"; key: string; entryId: string; subs: KnowledgeSubmission[] }
+	| { kind: "standalone"; key: string; sub: KnowledgeSubmission };
+
 function ReviewCenterTab() {
 	const { t } = useTranslation("knowledge");
 	const navigate = useNavigate();
+	const { data: user } = useCurrentUser();
+	const isAdmin = user?.role === "admin";
 	const [status, setStatus] = useState<ReviewFilter>("all");
 	const submissions = useKnowledgeSubmissions({ status: status === "all" ? undefined : status });
 	const entries = useKnowledgeEntries({});
+	const collections = useKnowledgeCollections();
+	// Standalone submission opened for inline review (no entry page exists yet).
+	const [reviewingId, setReviewingId] = useState<string | null>(null);
 
 	// Map entryId → title for readable entries (falls back to id prefix when not visible).
 	const titleById = useMemo(() => {
@@ -633,20 +662,38 @@ function ReviewCenterTab() {
 		for (const e of entries.data ?? []) m.set(e.id, e.title);
 		return m;
 	}, [entries.data]);
+	const collectionNameById = useMemo(() => {
+		const m = new Map<string, string>();
+		for (const c of collections.data ?? []) m.set(c.id, c.name);
+		return m;
+	}, [collections.data]);
 
-	// Group submissions by entry so reviewers see a per-entry to-do list.
-	const grouped = useMemo(() => {
-		const m = new Map<string, KnowledgeSubmission[]>();
+	// Group linked submissions by entry so reviewers see a per-entry to-do list; each
+	// standalone submission (entryId null) becomes its own group.
+	const grouped = useMemo<ReviewGroup[]>(() => {
+		const linked = new Map<string, KnowledgeSubmission[]>();
+		const groups: ReviewGroup[] = [];
 		for (const s of submissions.data ?? []) {
-			const arr = m.get(s.entryId);
-			if (arr) arr.push(s);
-			else m.set(s.entryId, [s]);
+			if (s.entryId) {
+				const arr = linked.get(s.entryId);
+				if (arr) arr.push(s);
+				else {
+					const list = [s];
+					linked.set(s.entryId, list);
+					groups.push({ kind: "entry", key: `entry:${s.entryId}`, entryId: s.entryId, subs: list });
+				}
+			} else {
+				groups.push({ kind: "standalone", key: `sub:${s.id}`, sub: s });
+			}
 		}
-		return [...m.entries()];
+		return groups;
 	}, [submissions.data]);
 
 	const goEntry = (entryId: string) =>
 		navigate({ to: "/knowledge/$entryId", params: { entryId }, hash: "submissions" });
+
+	const statusColor = (s: KnowledgeSubmission["status"]) =>
+		s === "conflict" ? "orange" : s === "pending" ? "blue" : "gray";
 
 	return (
 		<Stack>
@@ -681,67 +728,155 @@ function ReviewCenterTab() {
 				</Text>
 			) : (
 				<Stack gap="md">
-					{grouped.map(([entryId, subs]) => (
-						<Paper key={entryId} withBorder p="sm">
-							<Group justify="space-between" mb="xs" wrap="nowrap">
-								<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-									<Anchor
-										component="button"
-										type="button"
-										onClick={() => goEntry(entryId)}
-										style={{ minWidth: 0 }}
-									>
-										<Text size="sm" fw={600} truncate="end">
-											{titleById.get(entryId) ?? entryId.slice(0, 8)}
-										</Text>
-									</Anchor>
-									<Badge size="xs" variant="light" color="gray">
-										{subs.length}
-									</Badge>
+					{grouped.map((g) =>
+						g.kind === "entry" ? (
+							<Paper key={g.key} withBorder p="sm">
+								<Group justify="space-between" mb="xs" wrap="nowrap">
+									<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+										<Anchor
+											component="button"
+											type="button"
+											onClick={() => goEntry(g.entryId)}
+											style={{ minWidth: 0 }}
+										>
+											<Text size="sm" fw={600} truncate="end">
+												{titleById.get(g.entryId) ?? g.entryId.slice(0, 8)}
+											</Text>
+										</Anchor>
+										<Badge size="xs" variant="light" color="gray">
+											{g.subs.length}
+										</Badge>
+									</Group>
+									<Button size="compact-xs" variant="subtle" onClick={() => goEntry(g.entryId)}>
+										{t("reviewCenterViewEntry")}
+									</Button>
 								</Group>
-								<Button size="compact-xs" variant="subtle" onClick={() => goEntry(entryId)}>
-									{t("reviewCenterViewEntry")}
-								</Button>
-							</Group>
-							<Stack gap="xs">
-								{subs.map((s) => (
-									<Card
-										key={s.id}
-										withBorder
-										padding="xs"
-										style={{ cursor: "pointer" }}
-										onClick={() => goEntry(entryId)}
+								<Stack gap="xs">
+									{g.subs.map((s) => (
+										<Card
+											key={s.id}
+											withBorder
+											padding="xs"
+											style={{ cursor: "pointer" }}
+											onClick={() => goEntry(g.entryId)}
+										>
+											<Group justify="space-between" wrap="nowrap">
+												<div style={{ flex: 1, minWidth: 0 }}>
+													<Text size="xs" truncate="end">
+														{s.changeNote || s.id.slice(0, 8)}
+													</Text>
+													<Text size="xs" c="dimmed">
+														{new Date(s.createdAt).toLocaleString()}
+													</Text>
+												</div>
+												<Badge size="sm" variant="light" color={statusColor(s.status)}>
+													{t(`submissionStatus_${s.status}`)}
+												</Badge>
+											</Group>
+										</Card>
+									))}
+								</Stack>
+							</Paper>
+						) : (
+							<Paper key={g.key} withBorder p="sm">
+								<Group justify="space-between" mb="xs" wrap="nowrap">
+									<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+										<Text size="sm" fw={600} truncate="end">
+											{g.sub.title || t("reviewCenterUntitledEntry")}
+										</Text>
+										<Badge size="xs" variant="light" color="teal">
+											{t("reviewCenterNewEntry")}
+										</Badge>
+									</Group>
+									<Button
+										size="compact-xs"
+										variant="subtle"
+										onClick={() => setReviewingId(g.sub.id)}
 									>
-										<Group justify="space-between" wrap="nowrap">
-											<div style={{ flex: 1, minWidth: 0 }}>
-												<Text size="xs" truncate="end">
-													{s.changeNote || s.id.slice(0, 8)}
-												</Text>
-												<Text size="xs" c="dimmed">
-													{new Date(s.createdAt).toLocaleString()}
-												</Text>
-											</div>
-											<Badge
-												size="sm"
-												variant="light"
-												color={
-													s.status === "conflict"
-														? "orange"
-														: s.status === "pending"
-															? "blue"
-															: "gray"
-												}
-											>
-												{t(`submissionStatus_${s.status}`)}
-											</Badge>
-										</Group>
-									</Card>
-								))}
-							</Stack>
-						</Paper>
-					))}
+										{t("reviewCenterReview")}
+									</Button>
+								</Group>
+								<Card
+									withBorder
+									padding="xs"
+									style={{ cursor: "pointer" }}
+									onClick={() => setReviewingId(g.sub.id)}
+								>
+									<Group justify="space-between" wrap="nowrap">
+										<div style={{ flex: 1, minWidth: 0 }}>
+											<Text size="xs" truncate="end">
+												{g.sub.changeNote ||
+													(g.sub.collectionId
+														? collectionNameById.get(g.sub.collectionId)
+														: undefined) ||
+													g.sub.id.slice(0, 8)}
+											</Text>
+											<Text size="xs" c="dimmed">
+												{new Date(g.sub.createdAt).toLocaleString()}
+											</Text>
+										</div>
+										<Badge size="sm" variant="light" color={statusColor(g.sub.status)}>
+											{t(`submissionStatus_${g.sub.status}`)}
+										</Badge>
+									</Group>
+								</Card>
+							</Paper>
+						),
+					)}
 				</Stack>
 			)}
+
+			<StandaloneReviewModal
+				submissionId={reviewingId}
+				isAdmin={isAdmin}
+				currentUserId={user?.id}
+				onClose={() => setReviewingId(null)}
+			/>
 		</Stack>
+	);
+}
+
+/** Inline reviewer for a standalone (new-entry) submission, which has no entry page. */
+function StandaloneReviewModal({
+	submissionId,
+	isAdmin,
+	currentUserId,
+	onClose,
+}: {
+	submissionId: string | null;
+	isAdmin: boolean;
+	currentUserId?: string;
+	onClose: () => void;
+}) {
+	const { t } = useTranslation("knowledge");
+	const detail = useKnowledgeSubmission(submissionId ?? undefined);
+	const sub = detail.data;
+	// A new entry has no existing main content, so the diff's "old" side is empty.
+	const canReview = !!sub && sub.submitterUserId !== currentUserId;
+
+	return (
+		<Modal
+			opened={!!submissionId}
+			onClose={onClose}
+			size="xl"
+			title={sub?.title || t("reviewCenterUntitledEntry")}
+		>
+			{detail.isLoading ? (
+				<Text size="sm" c="dimmed">
+					{t("loading")}
+				</Text>
+			) : sub ? (
+				<SubmissionReviewPanel
+					submission={sub}
+					currentContent=""
+					canReview={isAdmin || canReview}
+					onDone={onClose}
+				/>
+			) : (
+				<Text size="sm" c="dimmed">
+					{t("selectSubmissionHint")}
+				</Text>
+			)}
+		</Modal>
 	);
 }

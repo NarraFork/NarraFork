@@ -160,6 +160,30 @@ function ErrorLine({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
+/** Render author-declared auto-injection keywords as key-icon badges. */
+function KeywordBadges({ keywords }: { keywords: string[] }) {
+	const { t } = useTranslation("narrator");
+	if (keywords.length === 0) return null;
+	return (
+		<Group gap={4} mt={2}>
+			<Text size="xs" c="dimmed">
+				{t("knowledge.keywords")}:
+			</Text>
+			{keywords.map((kw) => (
+				<Badge key={kw} size="xs" variant="light" color="grape" leftSection={<IconKey size={9} />}>
+					{kw}
+				</Badge>
+			))}
+		</Group>
+	);
+}
+
+/** Read a string[] field from a tool's inputJson (e.g. keywords passed by the agent). */
+function inputStringArray(toolCall: ToolCallData, field: string): string[] {
+	const raw = toolCall.inputJson?.[field];
+	return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === "string") : [];
+}
+
 interface KnowledgeSearchResultMeta {
 	id: string;
 	title: string;
@@ -264,6 +288,7 @@ function KnowledgeReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const entryId = asString(meta.entryId) || extractField(toolCall.inputJson, "entryId");
 	const title = asString(meta.title);
 	const tags = asStringArray(meta.tags);
+	const keywords = asStringArray(meta.keywords);
 	const isDraft = meta.isDraft === true;
 	const drift = (meta.drift ?? {}) as { drifted?: boolean; versionsBehind?: number };
 	const body = resolveDisplayText(toolCall.outputJson);
@@ -300,6 +325,7 @@ function KnowledgeReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 					))}
 				</Group>
 			)}
+			<KeywordBadges keywords={keywords} />
 			{body && (
 				<ContentViewer
 					content={body}
@@ -321,6 +347,7 @@ function KnowledgeCreateDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const entryId = asString(meta.entryId);
 	const personalEntryId = asString(meta.personalEntryId);
 	const title = extractField(toolCall.inputJson, "title") || asString(meta.title);
+	const keywords = inputStringArray(toolCall, "keywords");
 	const output = resolveDisplayText(toolCall.outputJson);
 
 	return (
@@ -344,8 +371,9 @@ function KnowledgeCreateDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 				)}
 			</Group>
+			<KeywordBadges keywords={keywords} />
 			{output && (
-				<Text size="xs" c="dimmed">
+				<Text size="xs" c="dimmed" mt={4}>
 					{output}
 				</Text>
 			)}
@@ -364,6 +392,7 @@ function KnowledgeEditDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const submissionId = asString(meta.submissionId);
 	const conflict = meta.conflict === true;
 	const rebased = meta.rebased === true;
+	const keywords = action === "update_meta" ? inputStringArray(toolCall, "keywords") : [];
 	const output = resolveDisplayText(toolCall.outputJson);
 
 	return (
@@ -394,6 +423,7 @@ function KnowledgeEditDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 				)}
 			</Group>
+			<KeywordBadges keywords={keywords} />
 			{output &&
 				(conflict ? (
 					<ContentViewer

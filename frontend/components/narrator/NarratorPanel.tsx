@@ -169,6 +169,7 @@ import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/d
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useImageViewer } from "../common/ImageViewerProvider";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
@@ -3055,6 +3056,7 @@ export function NarratorPanel({
 		};
 	}, [appendInputRef]);
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
+	const openImageViewer = useImageViewer();
 	const attachedImagesRef = useRef<File[]>(attachedImages);
 	attachedImagesRef.current = attachedImages;
 	const imageDraftHydratedNarratorIdRef = useRef<string | null>(null);
@@ -7773,7 +7775,13 @@ export function NarratorPanel({
 										w={60}
 										fit="cover"
 										style={{ cursor: "pointer" }}
-										onClick={() => window.open(imagePreviewUrls[i], "_blank")}
+										onClick={() =>
+											openImageViewer({
+												src: imagePreviewUrls[i],
+												filename: file.name,
+												alt: file.name,
+											})
+										}
 									/>
 									<CloseButton
 										size="xs"

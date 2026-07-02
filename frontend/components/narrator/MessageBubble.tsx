@@ -75,6 +75,7 @@ import {
 	type SideCarRecord,
 } from "../../lib/api";
 import { Z } from "../../lib/z-index";
+import { useImageViewer } from "../common/ImageViewerProvider";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
 import { CompactMenuSub } from "./CompactMenuSub";
@@ -774,6 +775,7 @@ function ImageGenerationBlock({
 	blockIndex?: number;
 }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const msgCtx = useMessageContextMenu();
 	const fsCapability = useFileSystemCapability();
 	const fsPreviewSupported = fsCapability.preview.supported;
@@ -904,6 +906,16 @@ function ImageGenerationBlock({
 		}
 	}, [block, imageSrc, t]);
 
+	const handleOpenViewer = useCallback(() => {
+		if (!hasImage || !imageSrc) return;
+		openImageViewer({
+			src: imageSrc,
+			savedPath: fsPreviewSupported ? previewPath : null,
+			filename: generatedImageFilename(block),
+			alt: block.revisedPrompt ?? "Generated image",
+		});
+	}, [block, fsPreviewSupported, hasImage, imageSrc, openImageViewer, previewPath]);
+
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
 			if (isMobile || lod === "preview" || !hasMenuActions) return;
@@ -957,7 +969,8 @@ function ImageGenerationBlock({
 								w="100%"
 								h="100%"
 								fit="contain"
-								style={{ display: "block" }}
+								style={{ display: "block", cursor: "pointer" }}
+								onClick={handleOpenViewer}
 							/>
 						) : imageUnavailable ? (
 							<Text size="xs" c="dimmed">
@@ -977,6 +990,8 @@ function ImageGenerationBlock({
 						radius="sm"
 						maw={512}
 						fit="contain"
+						style={{ cursor: "pointer" }}
+						onClick={handleOpenViewer}
 					/>
 				) : null}
 			</Paper>
@@ -1481,6 +1496,7 @@ function SelectableSystemNotice({
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const uploadCapability = useUploadCapability();
 	const narratorImageServing = uploadCapability.serveNarratorImages;
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
@@ -1554,7 +1570,7 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 				fit="contain"
 				loading="lazy"
 				style={{ cursor: "pointer", maxWidth: "100%" }}
-				onClick={() => window.open(src, "_blank")}
+				onClick={() => openImageViewer({ src, filename: block.filename, alt: block.filename })}
 			/>
 		</Box>
 	);
@@ -1576,6 +1592,7 @@ function EditExistingImageThumb({
 	onRemove: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const uploadCapability = useUploadCapability();
 	const narratorImageServing = uploadCapability.serveNarratorImages;
 	const [blobUrl, setBlobUrl] = useState<string | null>(null);
@@ -1624,7 +1641,7 @@ function EditExistingImageThumb({
 					w={60}
 					fit="cover"
 					style={{ cursor: "pointer" }}
-					onClick={() => window.open(src, "_blank")}
+					onClick={() => openImageViewer({ src, filename: block.filename, alt: block.filename })}
 				/>
 			) : (
 				<Skeleton h={60} w={60} radius="sm" />
@@ -1648,6 +1665,7 @@ function EditExistingImageThumb({
  */
 function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => void }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const [url, setUrl] = useState<string | null>(null);
 	useEffect(() => {
 		const objectUrl = URL.createObjectURL(file);
@@ -1665,7 +1683,7 @@ function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => voi
 					w={60}
 					fit="cover"
 					style={{ cursor: "pointer" }}
-					onClick={() => url && window.open(url, "_blank")}
+					onClick={() => url && openImageViewer({ src: url, filename: file.name, alt: file.name })}
 				/>
 			) : (
 				<Skeleton h={60} w={60} radius="sm" />

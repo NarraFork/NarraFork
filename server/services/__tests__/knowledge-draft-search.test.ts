@@ -18,7 +18,7 @@ import { db } from "../../db";
 import { users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { knowledgeBranchService } from "../knowledge-branch-service";
-import { resolveInjections } from "../knowledge-injection";
+import { resolveInjections, scanToolOutputForKnowledge } from "../knowledge-injection";
 import { knowledgeService } from "../knowledge-service";
 
 let collectionId: string;
@@ -143,38 +143,113 @@ describe("draft-shadow search", () => {
 	});
 });
 
-describe("passive injection reflects the triggering user's draft", () => {
-	test("a term only in the draft body surfaces as an injection hit for that user", async () => {
-		const injectTerm = `injectdraft${TAG}`;
+describe("passive injection matches author-declared keywords only", () => {
+	test("an entry surfaces when the input contains a declared keyword", async () => {
+		const kw = `injectkw${TAG}`;
 		const entry = await knowledgeService.createEntry({
 			collectionId,
 			title: `Epsilon ${TAG}`,
 			content: "baseline content without the special term",
-		});
-		const draft = await knowledgeBranchService.createDraft(principal, entry.id, {});
-		await knowledgeBranchService.updateDraft(principal, draft.id, {
-			content: `baseline content with ${injectTerm} added`,
+			keywords: [kw],
 		});
 
-		// Triggering user (draft author) — injection should find the entry via the draft.
-		const mine = await resolveInjections(userId, `please recall ${injectTerm} details`, {
+		const hits = await resolveInjections(userId, `please recall ${kw} details`, {
 			collectionId,
 		});
-		expect(mine.some((h) => h.entryId === entry.id)).toBe(true);
+		expect(hits.some((h) => h.entryId === entry.id)).toBe(true);
+	});
 
-		// A different user with no draft — the term lives only in the author's draft, so
-		// the committed version doesn't contain it and it must not surface.
-		const otherUserId = generateId();
-		await db.insert(users).values({
-			id: otherUserId,
-			username: `other-${TAG}`,
-			passwordHash: "x",
-			role: "user",
-			createdAt: new Date().toISOString(),
+	test("an entry with the term ONLY in its body (no keyword) is NOT injected", async () => {
+		const bodyTerm = `bodyonlyterm${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Zeta ${TAG}`,
+			content: `this body mentions ${bodyTerm} but declares no keywords`,
+			// no keywords → must never auto-inject
 		});
-		const theirs = await resolveInjections(otherUserId, `please recall ${injectTerm} details`, {
+
+		const hits = await resolveInjections(userId, `tell me about ${bodyTerm}`, {
 			collectionId,
 		});
-		expect(theirs.some((h) => h.entryId === entry.id)).toBe(false);
+		expect(hits.some((h) => h.entryId === entry.id)).toBe(false);
+
+		// Sanity: the entry IS still findable via the explicit full-text search path.
+		const found = knowledgeService.search({ q: bodyTerm, collectionId });
+		expect(found.some((r) => r.id === entry.id)).toBe(true);
+	});
+
+	test("updateEntryMeta keywords drive subsequent injection", async () => {
+		const kw = `latekw${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Eta ${TAG}`,
+			content: "no special markers here",
+			// Own the entry so updateEntryMeta (direct main write) is permitted below.
+			authorUserId: userId,
+		});
+		// Not injected before any keyword is declared.
+		const before = await resolveInjections(userId, `looking for ${kw}`, { collectionId });
+		expect(before.some((h) => h.entryId === entry.id)).toBe(false);
+
+		await knowledgeService.updateEntryMeta(entry.id, { keywords: [kw] }, principal);
+
+		const after = await resolveInjections(userId, `looking for ${kw}`, { collectionId });
+		expect(after.some((h) => h.entryId === entry.id)).toBe(true);
+	});
+});
+
+describe("injection de-dup within a compact cycle (shared `already` set)", () => {
+	test("the same entry is not re-injected while it stays in the shared set", async () => {
+		const kw = `dedupkw${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Theta ${TAG}`,
+			content: "body",
+			keywords: [kw],
+		});
+
+		// Simulate the cycle-scoped shared set used by the session runner (points A + B).
+		const already = new Set<string>();
+
+		// First scan finds and emits the entry, then records it in the shared set.
+		const first = await scanToolOutputForKnowledge(userId, `log mentions ${kw}`, already, {
+			collectionId,
+		});
+		expect(first).not.toBeNull();
+		expect(first).toContain(entry.id);
+		expect(already.has(entry.id)).toBe(true);
+
+		// Second scan with the SAME set must not re-surface the entry (de-dup).
+		const second = await scanToolOutputForKnowledge(userId, `again ${kw} here`, already, {
+			collectionId,
+		});
+		expect(second).toBeNull();
+
+		// A fresh set (simulating a crossed compact boundary) allows re-injection.
+		const freshCycle = new Set<string>();
+		const reinjected = await scanToolOutputForKnowledge(userId, `again ${kw} here`, freshCycle, {
+			collectionId,
+		});
+		expect(reinjected).not.toBeNull();
+		expect(reinjected).toContain(entry.id);
+	});
+
+	test("resolveInjections (point A) honours the same `already` set", async () => {
+		const kw = `dedupakw${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Iota ${TAG}`,
+			content: "body",
+			keywords: [kw],
+		});
+		const already = new Set<string>();
+
+		const first = await resolveInjections(userId, `need ${kw}`, { collectionId, already });
+		expect(first.some((h) => h.entryId === entry.id)).toBe(true);
+		// Caller records the hit (mirrors the session runner) — next call skips it.
+		for (const h of first) already.add(h.entryId);
+
+		const second = await resolveInjections(userId, `need ${kw}`, { collectionId, already });
+		expect(second.some((h) => h.entryId === entry.id)).toBe(false);
 	});
 });

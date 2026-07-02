@@ -160,6 +160,11 @@ export async function runMigrations(sqlite: Database): Promise<{
 	source: "filesystem" | "embedded";
 	folder: string;
 }> {
+	// Snapshot pre-migration schema state so post-migration data backfills can
+	// tell a genuine upgrade (column about to be added) from an already-migrated
+	// database. Captured before migrate() runs.
+	const hadMfaEnabledColumn = usersHasColumn(sqlite, "mfa_enabled");
+
 	const resolved = await resolveMigrationsFolder();
 	try {
 		const db = drizzle({ client: sqlite });
@@ -176,8 +181,57 @@ export async function runMigrations(sqlite: Database): Promise<{
 				throw err;
 			}
 		}
+		// Run one-time data backfills gated on the pre-migration snapshot. Safe to
+		// run from both the standalone `db:migrate` process and server startup —
+		// whichever adds the column first performs the backfill; the other sees the
+		// column already present and skips it.
+		if (!hadMfaEnabledColumn) {
+			backfillMfaEnabled(sqlite);
+		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
 		resolved.cleanup?.();
+	}
+}
+
+/** Whether the `users` table exists and already has the given column. */
+function usersHasColumn(sqlite: Database, column: string): boolean {
+	const usersTableExists = sqlite
+		.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'")
+		.get();
+	if (!usersTableExists) return true; // fresh DB — no legacy rows to backfill
+	const cols = sqlite.prepare("PRAGMA table_info('users')").all() as { name: string }[];
+	return cols.some((c) => c.name === column);
+}
+
+/**
+ * One-time backfill: preserve the pre-existing 2FA behavior for accounts that
+ * upgraded from a version without the `users.mfa_enabled` column. Before that
+ * column existed, holding ANY second factor (active TOTP or a passkey) forced a
+ * second step at login. We keep that promise for those users by turning the new
+ * opt-in flag on wherever a factor is already enrolled. Only ever runs on the
+ * first startup after the column is added, so a user who later turns 2FA off is
+ * never re-enrolled.
+ */
+function backfillMfaEnabled(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare(
+				`UPDATE users SET mfa_enabled = 1
+				 WHERE mfa_enabled = 0
+				   AND (
+				     EXISTS (SELECT 1 FROM user_totp t WHERE t.user_id = users.id AND t.status = 'active')
+				     OR EXISTS (SELECT 1 FROM user_passkeys p WHERE p.user_id = users.id)
+				   )`,
+			)
+			.run();
+		if (result.changes > 0) {
+			logger.info("Backfilled mfa_enabled for users with an enrolled second factor", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("mfa_enabled backfill failed (non-fatal)", { error: String(err) });
 	}
 }

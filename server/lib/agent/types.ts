@@ -515,6 +515,14 @@ export interface AgentConfig {
 	userId?: string | null;
 	/** Project this narrator belongs to — scopes knowledge injection to this project + global. */
 	projectId?: string | null;
+	/**
+	 * Shared de-dup set of knowledge-base entry ids already injected in the current compact
+	 * cycle. Passed in by the session runner so passive injection at the user-message point
+	 * (point A) and the tool-output scan point (point B) share one set across loop passes, and
+	 * so it can be cleared when a compact boundary is crossed. When omitted, the loop falls back
+	 * to a fresh per-call set (legacy behaviour for standalone/test callers).
+	 */
+	knowledgeInjectedEntryIds?: Set<string>;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */

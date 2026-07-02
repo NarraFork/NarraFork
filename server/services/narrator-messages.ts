@@ -65,25 +65,25 @@ function shouldHidePendingPermission(suggestions: unknown): boolean {
  *
  * Shared by deleteMessagesFromSeq and deleteMessagesFromSeqInclusive.
  */
-async function deleteOrphanedMessages(
+function deleteOrphanedMessages(
 	tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
 	orphanIds: string[],
-): Promise<void> {
+): void {
 	if (orphanIds.length === 0) return;
 
-	await tx
-		.update(narrators)
+	tx.update(narrators)
 		.set({ forkMessageId: null })
-		.where(inArray(narrators.forkMessageId, orphanIds));
-	await tx
-		.update(narrators)
+		.where(inArray(narrators.forkMessageId, orphanIds))
+		.run();
+	tx.update(narrators)
 		.set({ pruneBoundaryMessageId: null })
-		.where(inArray(narrators.pruneBoundaryMessageId, orphanIds));
+		.where(inArray(narrators.pruneBoundaryMessageId, orphanIds))
+		.run();
 
 	// Delete refs held by subagent narrators pointing to orphaned messages
-	await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.messageId, orphanIds));
-	await tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds));
-	await tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds));
+	tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.messageId, orphanIds)).run();
+	tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, orphanIds)).run();
+	tx.delete(narratorMessages).where(inArray(narratorMessages.id, orphanIds)).run();
 }
 
 /**
@@ -1654,13 +1654,12 @@ export const narratorMessageQueries = {
 					.limit(1)
 			: [];
 
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
-			await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId)).run();
+			tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 
 			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
+			tx.update(narrators)
 				.set({
 					contextSummary: null,
 					apiConversationId: null,
@@ -1669,7 +1668,8 @@ export const narratorMessageQueries = {
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
-				.where(eq(narrators.id, narratorId));
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 
 		return { previousCompactExists: prevCompact.length > 0 };
@@ -1704,10 +1704,10 @@ export const narratorMessageQueries = {
 
 		await revertPatchesForMessages(narratorId, messageIds);
 
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
-			const orphanRows = await tx
+			const orphanRows = tx
 				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(
@@ -1718,14 +1718,16 @@ export const narratorMessageQueries = {
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
 					),
-				);
+				)
+				.all();
 
 			const orphanIds = orphanRows.map((r) => r.id);
 			if (orphanIds.length > 0) {
-				const orphanMsgs = await tx
+				const orphanMsgs = tx
 					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds));
+					.where(inArray(narratorMessages.id, orphanIds))
+					.all();
 
 				const toolUseIds: string[] = [];
 				for (const msg of orphanMsgs) {
@@ -1738,19 +1740,19 @@ export const narratorMessageQueries = {
 				}
 
 				if (toolUseIds.length > 0) {
-					const childRows = await tx
+					const childRows = tx
 						.select({ id: narratorMessages.id })
 						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
+						.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+						.all();
 					for (const c of childRows) orphanIds.push(c.id);
 				}
 
-				await deleteOrphanedMessages(tx, orphanIds);
+				deleteOrphanedMessages(tx, orphanIds);
 			}
 
 			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
+			tx.update(narrators)
 				.set({
 					apiConversationId: null,
 					pruneBoundaryMessageId: null,
@@ -1758,7 +1760,8 @@ export const narratorMessageQueries = {
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
-				.where(eq(narrators.id, narratorId));
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 
 		return { deletedCount: refsToRemove.length };
@@ -1806,28 +1809,30 @@ export const narratorMessageQueries = {
 		// Delete the ref (if any) and the orphaned message idempotently. A missing
 		// ref is NOT an error here: a non-atomic-write orphan still needs cleanup,
 		// and the user-facing dismiss must always succeed for a real error notice.
-		await db.transaction(async (tx) => {
-			await tx
-				.delete(narratorMessageRefs)
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
 				.where(
 					and(
 						eq(narratorMessageRefs.narratorId, narratorId),
 						eq(narratorMessageRefs.messageId, messageId),
 					),
-				);
-			const otherRef = await tx.query.narratorMessageRefs.findFirst({
-				where: eq(narratorMessageRefs.messageId, messageId),
-			});
+				)
+				.run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({
+					where: eq(narratorMessageRefs.messageId, messageId),
+				})
+				.sync();
 			if (!otherRef) {
-				await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 			}
-			await tx
-				.update(narrators)
+			tx.update(narrators)
 				.set({
 					errorMessage: null,
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 				})
-				.where(eq(narrators.id, narratorId));
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 
 		const narrator = await db.query.narrators.findFirst({
@@ -1874,10 +1879,10 @@ export const narratorMessageQueries = {
 
 		await revertPatchesForMessages(narratorId, messageIds);
 
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds));
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs).where(inArray(narratorMessageRefs.id, refIds)).run();
 
-			const orphanRows = await tx
+			const orphanRows = tx
 				.select({ id: narratorMessages.id })
 				.from(narratorMessages)
 				.where(
@@ -1888,14 +1893,16 @@ export const narratorMessageQueries = {
 							WHERE nmr.message_id = ${narratorMessages.id}
 						)`,
 					),
-				);
+				)
+				.all();
 
 			const orphanIds = orphanRows.map((r) => r.id);
 			if (orphanIds.length > 0) {
-				const orphanMsgs = await tx
+				const orphanMsgs = tx
 					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
 					.from(narratorMessages)
-					.where(inArray(narratorMessages.id, orphanIds));
+					.where(inArray(narratorMessages.id, orphanIds))
+					.all();
 
 				const toolUseIds: string[] = [];
 				for (const msg of orphanMsgs) {
@@ -1908,19 +1915,19 @@ export const narratorMessageQueries = {
 				}
 
 				if (toolUseIds.length > 0) {
-					const childRows = await tx
+					const childRows = tx
 						.select({ id: narratorMessages.id })
 						.from(narratorMessages)
-						.where(inArray(narratorMessages.parentToolUseId, toolUseIds));
+						.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+						.all();
 					for (const c of childRows) orphanIds.push(c.id);
 				}
 
-				await deleteOrphanedMessages(tx, orphanIds);
+				deleteOrphanedMessages(tx, orphanIds);
 			}
 
 			const now = new Date().toISOString();
-			await tx
-				.update(narrators)
+			tx.update(narrators)
 				.set({
 					...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 					pruneBoundaryMessageId: null,
@@ -1928,7 +1935,8 @@ export const narratorMessageQueries = {
 					messageVersion: sql`${narrators.messageVersion} + 1`,
 					updatedAt: now,
 				})
-				.where(eq(narrators.id, narratorId));
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 
 		return { deletedCount: refsToRemove.length, deletedMessageIds: messageIds };
@@ -1975,21 +1983,22 @@ export const narratorMessageQueries = {
 
 		let messageDeleted = false;
 
-		await db.transaction(async (tx) => {
-			const cleanToolUseBlock = async (block: { type: string; id?: string }, msgId: string) => {
+		db.transaction((tx) => {
+			const cleanToolUseBlock = (block: { type: string; id?: string }, msgId: string) => {
 				if (block.type !== "tool_use" || !block.id) return;
-				await tx
-					.delete(narratorToolCalls)
+				tx.delete(narratorToolCalls)
 					.where(
 						and(eq(narratorToolCalls.messageId, msgId), eq(narratorToolCalls.toolUseId, block.id)),
-					);
-				const children = await tx
+					)
+					.run();
+				const children = tx
 					.select({ id: narratorMessages.id })
 					.from(narratorMessages)
-					.where(eq(narratorMessages.parentToolUseId, block.id));
+					.where(eq(narratorMessages.parentToolUseId, block.id))
+					.all();
 				if (children.length > 0) {
 					const childIds = children.map((c) => c.id);
-					const otherRefs = await tx
+					const otherRefs = tx
 						.select({ messageId: narratorMessageRefs.messageId })
 						.from(narratorMessageRefs)
 						.where(
@@ -1998,42 +2007,43 @@ export const narratorMessageQueries = {
 								ne(narratorMessageRefs.narratorId, narratorId),
 							),
 						)
-						.limit(1);
+						.limit(1)
+						.all();
 					if (otherRefs.length === 0) {
-						await tx
-							.delete(narratorToolCalls)
-							.where(inArray(narratorToolCalls.messageId, childIds));
-						await tx
-							.delete(narratorMessageRefs)
-							.where(inArray(narratorMessageRefs.messageId, childIds));
-						await tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds));
+						tx.delete(narratorToolCalls)
+							.where(inArray(narratorToolCalls.messageId, childIds))
+							.run();
+						tx.delete(narratorMessageRefs)
+							.where(inArray(narratorMessageRefs.messageId, childIds))
+							.run();
+						tx.delete(narratorMessages).where(inArray(narratorMessages.id, childIds)).run();
 					} else {
-						await tx
-							.delete(narratorMessageRefs)
+						tx.delete(narratorMessageRefs)
 							.where(
 								and(
 									eq(narratorMessageRefs.narratorId, narratorId),
 									inArray(narratorMessageRefs.messageId, childIds),
 								),
-							);
+							)
+							.run();
 					}
 				}
 			};
 
 			if (remaining.length === 0) {
 				messageDeleted = true;
-				await cleanToolUseBlock(removedBlock, messageId);
-				await tx
-					.delete(narratorMessageRefs)
+				cleanToolUseBlock(removedBlock, messageId);
+				tx.delete(narratorMessageRefs)
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, narratorId),
 							eq(narratorMessageRefs.messageId, messageId),
 						),
-					);
+					)
+					.run();
 				if (!isShared) {
-					await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId));
-					await tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+					tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, messageId)).run();
+					tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
 				}
 			} else if (isShared) {
 				const newId = generateId();
@@ -2042,39 +2052,41 @@ export const narratorMessageQueries = {
 					.map((b) => b.text ?? "")
 					.join("\n");
 
-				await tx.insert(narratorMessages).values({
-					id: newId,
-					narratorId: message.narratorId,
-					messageUuid: message.messageUuid,
-					parentToolUseId: message.parentToolUseId,
-					role: message.role,
-					contentJson: remaining,
-					contentText: contentText || null,
-					tokensIn: message.tokensIn,
-					costUsd: message.costUsd,
-					turnUsageJson: message.turnUsageJson,
-					contextPercent: message.contextPercent,
-					meterUsage: message.meterUsage,
-					meterUnit: message.meterUnit,
-					commitSha: message.commitSha,
-					createdAt: message.createdAt,
-				});
+				tx.insert(narratorMessages)
+					.values({
+						id: newId,
+						narratorId: message.narratorId,
+						messageUuid: message.messageUuid,
+						parentToolUseId: message.parentToolUseId,
+						role: message.role,
+						contentJson: remaining,
+						contentText: contentText || null,
+						tokensIn: message.tokensIn,
+						costUsd: message.costUsd,
+						turnUsageJson: message.turnUsageJson,
+						contextPercent: message.contextPercent,
+						meterUsage: message.meterUsage,
+						meterUnit: message.meterUnit,
+						commitSha: message.commitSha,
+						createdAt: message.createdAt,
+					})
+					.run();
 
-				await tx
-					.update(narratorMessageRefs)
+				tx.update(narratorMessageRefs)
 					.set({ messageId: newId })
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, narratorId),
 							eq(narratorMessageRefs.messageId, messageId),
 						),
-					);
+					)
+					.run();
 
 				const remainingToolUseIds = remaining
 					.filter((b): b is typeof b & { id: string } => b.type === "tool_use" && !!b.id)
 					.map((b) => b.id);
 				if (remainingToolUseIds.length > 0) {
-					const existingCalls = await tx
+					const existingCalls = tx
 						.select()
 						.from(narratorToolCalls)
 						.where(
@@ -2082,36 +2094,38 @@ export const narratorMessageQueries = {
 								eq(narratorToolCalls.messageId, messageId),
 								inArray(narratorToolCalls.toolUseId, remainingToolUseIds),
 							),
-						);
+						)
+						.all();
 					if (existingCalls.length > 0) {
-						await tx.insert(narratorToolCalls).values(
-							existingCalls.map((tc) => ({
-								...tc,
-								id: generateId(),
-								messageId: newId,
-							})),
-						);
+						tx.insert(narratorToolCalls)
+							.values(
+								existingCalls.map((tc) => ({
+									...tc,
+									id: generateId(),
+									messageId: newId,
+								})),
+							)
+							.run();
 					}
 				}
 
-				await cleanToolUseBlock(removedBlock, newId);
+				cleanToolUseBlock(removedBlock, newId);
 			} else {
 				const contentText = remaining
 					.filter((b) => b.type === "text")
 					.map((b) => b.text ?? "")
 					.join("\n");
 
-				await tx
-					.update(narratorMessages)
+				tx.update(narratorMessages)
 					.set({ contentJson: remaining, contentText: contentText || null })
-					.where(eq(narratorMessages.id, messageId));
+					.where(eq(narratorMessages.id, messageId))
+					.run();
 
-				await cleanToolUseBlock(removedBlock, messageId);
+				cleanToolUseBlock(removedBlock, messageId);
 			}
 
 			if (!opts?.skipNarratorUpdate) {
-				await tx
-					.update(narrators)
+				tx.update(narrators)
 					.set({
 						...(opts?.preserveConversationId ? {} : { apiConversationId: null }),
 						pruneBoundaryMessageId: null,
@@ -2119,7 +2133,8 @@ export const narratorMessageQueries = {
 						messageVersion: sql`${narrators.messageVersion} + 1`,
 						updatedAt: new Date().toISOString(),
 					})
-					.where(eq(narrators.id, narratorId));
+					.where(eq(narrators.id, narratorId))
+					.run();
 			}
 		});
 
@@ -2208,20 +2223,18 @@ export const narratorMessageQueries = {
 	},
 
 	async removeCompactingMessage(narratorId: string, messageId: string) {
-		await db.transaction(async (tx) => {
-			await tx
-				.delete(narratorMessageRefs)
+		db.transaction((tx) => {
+			tx.delete(narratorMessageRefs)
 				.where(
 					and(
 						eq(narratorMessageRefs.messageId, messageId),
 						eq(narratorMessageRefs.narratorId, narratorId),
 					),
-				);
-			await tx
-				.delete(narratorMessages)
-				.where(
-					and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-				);
+				)
+				.run();
+			tx.delete(narratorMessages)
+				.where(and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)))
+				.run();
 		});
 	},
 
@@ -2252,19 +2265,19 @@ export const narratorMessageQueries = {
 		const prefix = isPlan ? "[Plan]" : "[Compact]";
 		const now = new Date().toISOString();
 
-		await db.transaction(async (tx) => {
-			await tx
-				.update(narratorMessages)
+		db.transaction((tx) => {
+			tx.update(narratorMessages)
 				.set({
 					contentJson: [newBlock],
 					contentText: `${prefix} ${summary.slice(0, 200)}...`,
 				})
-				.where(eq(narratorMessages.id, messageId));
+				.where(eq(narratorMessages.id, messageId))
+				.run();
 
-			await tx
-				.update(narrators)
+			tx.update(narrators)
 				.set({ contextSummary: summary, apiConversationId: null, updatedAt: now })
-				.where(eq(narrators.id, narratorId));
+				.where(eq(narrators.id, narratorId))
+				.run();
 		});
 	},
 

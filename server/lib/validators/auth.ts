@@ -53,6 +53,11 @@ export const mfaVerifySchema = z.object({
 	code: z.string().trim().min(1).max(20),
 });
 
+/** Toggle the login-time second-factor requirement (settings → security). */
+export const mfaToggleSchema = z.object({
+	enabled: z.boolean(),
+});
+
 /** Confirm TOTP enrollment by submitting the first valid code. */
 export const totpActivateSchema = z.object({
 	code: totpCodeSchema,

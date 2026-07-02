@@ -11,7 +11,7 @@
  */
 import { randomInt } from "node:crypto";
 import { db } from "@server/db";
-import { userMfaBackupCodes, userTotp } from "@server/db/schema";
+import { userMfaBackupCodes, userPasskeys, users, userTotp } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
 import { generateTotpSecret, verifyTotpCode } from "@server/lib/totp";
 import { and, eq, isNull } from "drizzle-orm";
@@ -36,6 +36,8 @@ function randomBackupCode(): string {
 }
 
 export interface MfaStatus {
+	/** Whether a second factor is REQUIRED at login (the explicit opt-in switch). */
+	mfaEnabled: boolean;
 	totpEnabled: boolean;
 	/** Number of unused backup codes remaining. */
 	backupCodesRemaining: number;
@@ -51,20 +53,72 @@ export const mfaService = {
 		return !!row;
 	},
 
+	/** Whether the user has opted into requiring a second factor at login. */
+	async isMfaEnabled(userId: string): Promise<boolean> {
+		const row = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { mfaEnabled: true },
+		});
+		return !!row?.mfaEnabled;
+	},
+
+	/** Set the login-time second-factor requirement flag. */
+	async setMfaEnabled(userId: string, enabled: boolean): Promise<void> {
+		await db.update(users).set({ mfaEnabled: enabled }).where(eq(users.id, userId));
+	},
+
+	/**
+	 * Whether the user currently has any usable second factor enrolled (an active
+	 * TOTP authenticator or at least one passkey). Enforcing MFA without a factor
+	 * would lock the user out, so this gates enabling the switch.
+	 */
+	async hasAnyFactor(userId: string): Promise<boolean> {
+		const [totp, passkey] = await Promise.all([
+			db.query.userTotp.findFirst({
+				where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
+				columns: { id: true },
+			}),
+			db.query.userPasskeys.findFirst({
+				where: eq(userPasskeys.userId, userId),
+				columns: { id: true },
+			}),
+		]);
+		return !!totp || !!passkey;
+	},
+
+	/**
+	 * Turn the MFA requirement off automatically when the user no longer has any
+	 * usable second factor (e.g. after disabling TOTP and deleting all passkeys).
+	 * This prevents an "MFA required but no factor available" lockout. Returns
+	 * true when the flag was changed.
+	 */
+	async syncMfaEnabledAfterFactorChange(userId: string): Promise<boolean> {
+		const enabled = await this.isMfaEnabled(userId);
+		if (!enabled) return false;
+		if (await this.hasAnyFactor(userId)) return false;
+		await this.setMfaEnabled(userId, false);
+		return true;
+	},
+
 	/** Full MFA status for the security settings page. */
 	async getStatus(userId: string): Promise<MfaStatus> {
+		const user = await db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { mfaEnabled: true },
+		});
+		const mfaEnabled = !!user?.mfaEnabled;
 		const totp = await db.query.userTotp.findFirst({
 			where: and(eq(userTotp.userId, userId), eq(userTotp.status, "active")),
 			columns: { id: true },
 		});
 		if (!totp) {
-			return { totpEnabled: false, backupCodesRemaining: 0 };
+			return { mfaEnabled, totpEnabled: false, backupCodesRemaining: 0 };
 		}
 		const unused = await db.query.userMfaBackupCodes.findMany({
 			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
 			columns: { id: true },
 		});
-		return { totpEnabled: true, backupCodesRemaining: unused.length };
+		return { mfaEnabled, totpEnabled: true, backupCodesRemaining: unused.length };
 	},
 
 	/**
@@ -141,9 +195,9 @@ export const mfaService = {
 				createdAt: now,
 			})),
 		);
-		await db.transaction(async (tx) => {
-			await tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId));
-			await tx.insert(userMfaBackupCodes).values(rows);
+		db.transaction((tx) => {
+			tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId)).run();
+			tx.insert(userMfaBackupCodes).values(rows).run();
 		});
 		return codes;
 	},
@@ -183,9 +237,9 @@ export const mfaService = {
 
 	/** Fully disable TOTP and remove all backup codes. */
 	async disable(userId: string): Promise<void> {
-		await db.transaction(async (tx) => {
-			await tx.delete(userTotp).where(eq(userTotp.userId, userId));
-			await tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId));
+		db.transaction((tx) => {
+			tx.delete(userTotp).where(eq(userTotp.userId, userId)).run();
+			tx.delete(userMfaBackupCodes).where(eq(userMfaBackupCodes.userId, userId)).run();
 		});
 	},
 };

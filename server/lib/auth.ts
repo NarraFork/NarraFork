@@ -86,8 +86,8 @@ export async function registerUser(username: string, password: string, language?
 
 	const avatarColor = randomAvatarColor();
 
-	const [user] = await db.transaction(async (tx) => {
-		const [created] = await tx
+	const [user] = db.transaction((tx) => {
+		const created = tx
 			.insert(users)
 			.values({ id, username, passwordHash, role, avatarColor, createdAt: now })
 			.returning({
@@ -97,18 +97,21 @@ export async function registerUser(username: string, password: string, language?
 				avatarColor: users.avatarColor,
 				avatarImageId: users.avatarImageId,
 				createdAt: users.createdAt,
-			});
+			})
+			.all();
 
 		const resolvedLang = language || "en";
-		await tx.insert(userPreferences).values({
-			id: generateId(),
-			userId: created.id,
-			language: resolvedLang,
-			createdAt: new Date().toISOString(),
-			updatedAt: new Date().toISOString(),
-		});
+		tx.insert(userPreferences)
+			.values({
+				id: generateId(),
+				userId: created[0].id,
+				language: resolvedLang,
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			})
+			.run();
 
-		return [created];
+		return created;
 	});
 
 	const resolvedLang = language || "en";
@@ -183,18 +186,24 @@ export async function loginUser(
 		throw new AppError("Invalid credentials", 401, "INVALID_CREDENTIALS");
 	}
 
-	// Gate on a second factor when one is enrolled. The real session token is
-	// only minted after the second factor is proven via /auth/mfa/verify.
-	const [totpActive, hasPasskey] = await Promise.all([
-		mfaService.isTotpActive(user.id),
-		passkeyService.hasAny(user.id),
-	]);
-	if (totpActive || hasPasskey) {
+	// Gate on a second factor only when the user has opted into MFA. Merely
+	// having a passkey (a passwordless login method) or a dormant TOTP secret
+	// does NOT force a second step — `users.mfaEnabled` is the explicit switch.
+	// The available methods still depend on which factors are actually enrolled.
+	if (user.mfaEnabled) {
+		const [totpActive, hasPasskey] = await Promise.all([
+			mfaService.isTotpActive(user.id),
+			passkeyService.hasAny(user.id),
+		]);
 		const methods: MfaChallenge["methods"] = [];
 		if (totpActive) methods.push("totp", "backup_code");
 		if (hasPasskey) methods.push("passkey");
-		const mfaToken = await issueMfaToken(user.id);
-		return { mfaRequired: true, mfaToken, methods };
+		// Defensive: if MFA is flagged on but no usable factor remains, fall
+		// through to a normal session rather than locking the user out.
+		if (methods.length > 0) {
+			const mfaToken = await issueMfaToken(user.id);
+			return { mfaRequired: true, mfaToken, methods };
+		}
 	}
 
 	return buildSessionResult(user.id);

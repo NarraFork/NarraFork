@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
-import { db, markDatabaseCleanShutdown } from "./db";
+import { db, markDatabaseCleanShutdown, markDatabaseCleanShutdownEarly } from "./db";
 import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
 import { getCodexManager } from "./lib/codex-manager";
@@ -992,6 +992,36 @@ type GracefulShutdownResult = {
 let shutdownPromise: Promise<GracefulShutdownResult> | null = null;
 let killWindowsProcessTreeOnExit = true;
 
+/**
+ * Run a shutdown teardown step with a hard timeout so one hanging await can't
+ * stall the entire graceful-shutdown sequence. On timeout (or error) we log and
+ * continue — the clean marker is already written by this point, and the process
+ * must still be able to reach exit. Never rejects.
+ */
+async function shutdownStep(label: string, fn: () => unknown, timeoutMs = 4000): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const timeout = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		});
+		const result = await Promise.race([
+			Promise.resolve()
+				.then(fn)
+				.then(() => "done" as const)
+				.catch((err) => {
+					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
+					return "done" as const;
+				}),
+			timeout,
+		]);
+		if (result === "timeout") {
+			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
+		}
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 async function performGracefulShutdown(
 	options: GracefulShutdownOptions,
 ): Promise<GracefulShutdownResult> {
@@ -1004,29 +1034,43 @@ async function performGracefulShutdown(
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
-		await stopVNetUdpRendezvous().catch(() => {});
+
+		// Mark the DB clean FIRST — before the teardown awaits below, any of which can
+		// hang (terminal/MCP/browser/Codex-WS cleanup). If a later step stalls and the
+		// process is force-killed, the marker is already persisted, so the next startup
+		// is correctly recognized as clean and skips the ~15s integrity check + FTS
+		// rebuild. HTTP heartbeat is already stopped, so there is no concurrent writer
+		// racing the checkpoint. The instance lock is intentionally NOT released here —
+		// teardown may still touch the DB and an update-handoff replacement waits on it.
+		markDatabaseCleanShutdownEarly();
+
 		getCodexManager().stopUsageRefreshScheduler();
 		stopContainerProxy();
-		await terminalService.shutdownAll();
-		await killAllBashProcesses();
+		await shutdownStep("terminalService.shutdownAll", () => terminalService.shutdownAll());
+		await shutdownStep("killAllBashProcesses", () => killAllBashProcesses());
 		chapterCleanup.clearAllTimers();
 		worktreeWatcher.shutdown();
 		projectDbManager.closeAll();
-		await mcpManager.shutdown().catch(() => {});
+		await shutdownStep("vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+		await shutdownStep("mcpManager.shutdown", () => mcpManager.shutdown());
 		// Close browser pool if it was started
-		await import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()).catch(() => {});
+		await shutdownStep("browserPool.close", () =>
+			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
+		);
 		// Close Codex WebSocket session cache — active outbound WS
 		// connections keep the event loop alive and delay exit.
-		await import("./lib/agent/codex-websocket")
-			.then(({ clearCodexResponsesWebSocketSessions }) => clearCodexResponsesWebSocketSessions())
-			.catch(() => {});
+		await shutdownStep("codexWebSocket.clear", () =>
+			import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
+				clearCodexResponsesWebSocketSessions(),
+			),
+		);
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();
 		}
 
-		// Mark the main DB clean before reporting graceful shutdown complete.
-		// The update handoff starts the replacement process before this process exits,
-		// so relying on the process "exit" handler is too late for that path.
+		// Release the instance lock now that teardown is done. The clean marker was
+		// already written above; this call re-runs the (idempotent) marker write and
+		// then releases the lock so an update-handoff replacement can acquire it.
 		markDatabaseCleanShutdown();
 
 		// Explicitly stop the HTTP server so the port is released immediately.

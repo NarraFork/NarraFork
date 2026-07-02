@@ -281,13 +281,13 @@ export async function reorderGoals(
 		(goal) => goal.status === "active" || goal.status === "paused",
 	);
 	const now = new Date().toISOString();
-	await db.transaction(async (tx) => {
+	db.transaction((tx) => {
 		for (let i = 0; i < finalOrder.length; i++) {
 			const id = finalOrder[i];
-			await tx
-				.update(narratorGoals)
+			tx.update(narratorGoals)
 				.set({ sortOrder: i + 1, updatedAt: now })
-				.where(and(eq(narratorGoals.id, id), eq(narratorGoals.narratorId, narratorId)));
+				.where(and(eq(narratorGoals.id, id), eq(narratorGoals.narratorId, narratorId)))
+				.run();
 		}
 	});
 	if (!hadActiveOrPaused) await activateNextPendingGoal(narratorId);

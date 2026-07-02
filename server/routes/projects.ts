@@ -389,54 +389,54 @@ projectRoutes.delete("/:id", async (c) => {
 			allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
 		}
 
-		await db.transaction(async (tx) => {
+		db.transaction((tx) => {
 			if (allNarratorIds.length > 0) {
 				// Break narrator self-references
-				await tx
-					.update(narrators)
+				tx.update(narrators)
 					.set({ parentNarratorId: null, forkMessageId: null, pruneBoundaryMessageId: null })
-					.where(inArray(narrators.id, allNarratorIds));
+					.where(inArray(narrators.id, allNarratorIds))
+					.run();
 
 				// Delete tables referencing narrators / messages
-				await tx
-					.delete(terminalViewState)
-					.where(inArray(terminalViewState.narratorId, allNarratorIds));
-				await tx.delete(terminalTabs).where(inArray(terminalTabs.narratorId, allNarratorIds));
-				await tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds));
-				await tx
-					.delete(narratorToolCalls)
-					.where(inArray(narratorToolCalls.narratorId, allNarratorIds));
-				await tx
-					.delete(narratorMessageRefs)
-					.where(inArray(narratorMessageRefs.narratorId, allNarratorIds));
-				await tx
-					.delete(narratorMessages)
-					.where(inArray(narratorMessages.narratorId, allNarratorIds));
-				await tx.delete(narrators).where(inArray(narrators.id, allNarratorIds));
+				tx.delete(terminalViewState)
+					.where(inArray(terminalViewState.narratorId, allNarratorIds))
+					.run();
+				tx.delete(terminalTabs).where(inArray(terminalTabs.narratorId, allNarratorIds)).run();
+				tx.delete(terminals).where(inArray(terminals.narratorId, allNarratorIds)).run();
+				tx.delete(narratorToolCalls)
+					.where(inArray(narratorToolCalls.narratorId, allNarratorIds))
+					.run();
+				tx.delete(narratorMessageRefs)
+					.where(inArray(narratorMessageRefs.narratorId, allNarratorIds))
+					.run();
+				tx.delete(narratorMessages)
+					.where(inArray(narratorMessages.narratorId, allNarratorIds))
+					.run();
+				tx.delete(narrators).where(inArray(narrators.id, allNarratorIds)).run();
 			}
 
 			// Delete tables referencing chapters
-			await tx
-				.delete(terminalViewState)
-				.where(inArray(terminalViewState.chapterId, remainingChapterIds));
-			await tx.delete(terminalTabs).where(inArray(terminalTabs.chapterId, remainingChapterIds));
-			await tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds));
-			await tx
-				.delete(containerInstances)
-				.where(inArray(containerInstances.chapterId, remainingChapterIds));
-			await tx
-				.delete(portAllocations)
-				.where(inArray(portAllocations.chapterId, remainingChapterIds));
-			await tx
-				.delete(mergeSessions)
-				.where(inArray(mergeSessions.targetChapterId, remainingChapterIds));
+			tx.delete(terminalViewState)
+				.where(inArray(terminalViewState.chapterId, remainingChapterIds))
+				.run();
+			tx.delete(terminalTabs).where(inArray(terminalTabs.chapterId, remainingChapterIds)).run();
+			tx.delete(terminals).where(inArray(terminals.chapterId, remainingChapterIds)).run();
+			tx.delete(containerInstances)
+				.where(inArray(containerInstances.chapterId, remainingChapterIds))
+				.run();
+			tx.delete(portAllocations)
+				.where(inArray(portAllocations.chapterId, remainingChapterIds))
+				.run();
+			tx.delete(mergeSessions)
+				.where(inArray(mergeSessions.targetChapterId, remainingChapterIds))
+				.run();
 
 			// Break chapter self-references before deleting
-			await tx
-				.update(chapters)
+			tx.update(chapters)
 				.set({ parentChapterId: null, mergedIntoChapterId: null })
-				.where(inArray(chapters.id, remainingChapterIds));
-			await tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds));
+				.where(inArray(chapters.id, remainingChapterIds))
+				.run();
+			tx.delete(chapters).where(inArray(chapters.id, remainingChapterIds)).run();
 		});
 	}
 

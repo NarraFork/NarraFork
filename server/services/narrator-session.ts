@@ -1141,8 +1141,12 @@ export async function runAgentLoop(
 	active._loopRunning = true;
 	let shouldUpdateTitle = false;
 	let currentText = text;
-	// Knowledge entries already injected this run (de-dup across passes & tool outputs).
+	// Knowledge entries already injected in the CURRENT COMPACT CYCLE (de-dup across passes &
+	// tool outputs). `knowledgeInjectCycleSeq` tracks which compact cycle the set belongs to;
+	// when a compact boundary is crossed the set is cleared so the same entry may be re-injected
+	// into the fresh (post-compact) context. Shared with the agent loop (point B) via config.
 	const knowledgeInjectedIds = new Set<string>();
+	let knowledgeInjectCycleSeq = -1;
 	let currentImages = images;
 	let loopHadError = false;
 	/** Whether the loop was interrupted by the user (abort signal). */
@@ -1183,6 +1187,14 @@ export async function runAgentLoop(
 	try {
 		while (active.alive) {
 			const baselineCompactSeq = await narratorService.getLatestCompactSeq(narratorId);
+			// Knowledge-injection de-dup is scoped to a compact cycle: when the latest compact
+			// seq changes (a compact happened), the prior injections were summarized/dropped from
+			// context, so clear the set to allow re-injecting relevant entries into the new cycle.
+			const cycleSeq = baselineCompactSeq ?? -1;
+			if (cycleSeq !== knowledgeInjectCycleSeq) {
+				knowledgeInjectCycleSeq = cycleSeq;
+				knowledgeInjectedIds.clear();
+			}
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
@@ -1665,6 +1677,9 @@ export async function runAgentLoop(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: active._projectId ?? null,
+				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
+				// de-dups against the user-message injections (point A) and vice versa.
+				knowledgeInjectedEntryIds: knowledgeInjectedIds,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
@@ -4704,10 +4719,10 @@ export async function* startSession(
  */
 export async function cleanupPartialMessage(partialId: string, narratorId: string): Promise<void> {
 	try {
-		await db.transaction(async (tx) => {
-			await tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId));
-			await tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId));
-			await tx.delete(narratorMessages).where(eq(narratorMessages.id, partialId));
+		db.transaction((tx) => {
+			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, partialId)).run();
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, partialId)).run();
+			tx.delete(narratorMessages).where(eq(narratorMessages.id, partialId)).run();
 		});
 	} catch (err) {
 		logger.warn("Failed to clean up partial message on error", {
@@ -4751,11 +4766,13 @@ export async function finalizeOrCleanupPartialMessage(
 			// No tool was actually executed — but check if the message has
 			// meaningful text/reasoning content that should be preserved
 			// (e.g. user interrupted while the model was streaming a long text block).
-			const hasContent = await db.transaction(async (tx) => {
-				const msg = await tx.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, partialId),
-					columns: { contentJson: true },
-				});
+			const hasContent = db.transaction((tx) => {
+				const msg = tx.query.narratorMessages
+					.findFirst({
+						where: eq(narratorMessages.id, partialId),
+						columns: { contentJson: true },
+					})
+					.sync();
 				const blocks = Array.isArray(msg?.contentJson)
 					? (msg.contentJson as Array<Record<string, unknown>>)
 					: [];
@@ -4773,19 +4790,21 @@ export async function finalizeOrCleanupPartialMessage(
 				// Note: since executed.length === 0, toolCalls here are all unexecuted.
 				if (toolCalls.length > 0) {
 					const toolUseIds = new Set(toolCalls.map((tc) => tc.toolUseId));
-					await tx.delete(narratorToolCalls).where(
-						inArray(
-							narratorToolCalls.id,
-							toolCalls.map((tc) => tc.id),
-						),
-					);
+					tx.delete(narratorToolCalls)
+						.where(
+							inArray(
+								narratorToolCalls.id,
+								toolCalls.map((tc) => tc.id),
+							),
+						)
+						.run();
 					const filtered = blocks.filter(
 						(block) => block.type !== "tool_use" || !toolUseIds.has(block.id as string),
 					);
-					await tx
-						.update(narratorMessages)
+					tx.update(narratorMessages)
 						.set({ contentJson: filtered })
-						.where(eq(narratorMessages.id, partialId));
+						.where(eq(narratorMessages.id, partialId))
+						.run();
 				}
 
 				logger.info("Preserved partial message with streamed content (no tool execution)", {
@@ -4809,22 +4828,23 @@ export async function finalizeOrCleanupPartialMessage(
 		const unexecuted = toolCalls.filter((tc) => !executedStatuses.has(tc.status));
 		const unexecutedToolUseIds = new Set(unexecuted.map((tc) => tc.toolUseId));
 
-		await db.transaction(async (tx) => {
+		db.transaction((tx) => {
 			// Delete unexecuted tool_call records
 			if (unexecuted.length > 0) {
-				await tx.delete(narratorToolCalls).where(
-					inArray(
-						narratorToolCalls.id,
-						unexecuted.map((tc) => tc.id),
-					),
-				);
+				tx.delete(narratorToolCalls)
+					.where(
+						inArray(
+							narratorToolCalls.id,
+							unexecuted.map((tc) => tc.id),
+						),
+					)
+					.run();
 			}
 
 			// Mark running tool_calls as fail (interrupted by retry)
 			const running = executed.filter((tc) => tc.status === "running");
 			if (running.length > 0) {
-				await tx
-					.update(narratorToolCalls)
+				tx.update(narratorToolCalls)
 					.set({
 						status: "fail",
 						errorMessage: "Interrupted by API error during retry",
@@ -4834,23 +4854,26 @@ export async function finalizeOrCleanupPartialMessage(
 							narratorToolCalls.id,
 							running.map((tc) => tc.id),
 						),
-					);
+					)
+					.run();
 			}
 
 			// Remove unexecuted tool_use blocks from contentJson
 			if (unexecutedToolUseIds.size > 0) {
-				const msg = await tx.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, partialId),
-					columns: { contentJson: true },
-				});
+				const msg = tx.query.narratorMessages
+					.findFirst({
+						where: eq(narratorMessages.id, partialId),
+						columns: { contentJson: true },
+					})
+					.sync();
 				if (msg && Array.isArray(msg.contentJson)) {
 					const filtered = (msg.contentJson as Array<Record<string, unknown>>).filter(
 						(block) => block.type !== "tool_use" || !unexecutedToolUseIds.has(block.id as string),
 					);
-					await tx
-						.update(narratorMessages)
+					tx.update(narratorMessages)
 						.set({ contentJson: filtered })
-						.where(eq(narratorMessages.id, partialId));
+						.where(eq(narratorMessages.id, partialId))
+						.run();
 				}
 			}
 		});

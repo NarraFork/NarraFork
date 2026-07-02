@@ -126,6 +126,17 @@ export function useSecurityStatus() {
 	});
 }
 
+/** Toggle the login-time second-factor requirement. */
+export function useSetMfaEnabled() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: (enabled: boolean) => api.setMfaEnabled(enabled),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["auth", "security"] });
+		},
+	});
+}
+
 export function useTotpSetup() {
 	return useMutation({ mutationFn: api.totpSetup });
 }

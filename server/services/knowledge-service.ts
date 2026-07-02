@@ -5,6 +5,7 @@ import { knowledgeCollections, knowledgeEntries, knowledgeRevisions, users } fro
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { settings } from "../lib/settings";
 import {
 	type AclCollection,
 	type AclEntry,
@@ -137,18 +138,58 @@ function sanitizeQuery(query: string): string {
 
 /** Build an FTS5 prefix query from sanitized input.
  *  match="and" (default) requires all terms; match="or" matches any term
- *  (used for passive injection, where the input is a natural-language sentence). */
-function buildFtsQuery(safeQuery: string, match: "and" | "or" = "and"): string {
+ *  (used for passive injection, where the input is a natural-language sentence).
+ *  field, when set, restricts the match to a single FTS column (e.g. "current_keywords"
+ *  so passive injection only fires on author-declared keywords, never body text). */
+function buildFtsQuery(safeQuery: string, match: "and" | "or" = "and", field?: string): string {
 	const terms = safeQuery
 		.split(/\s+/)
 		.filter(Boolean)
 		.map((w) => `"${w}"*`);
-	return terms.join(match === "or" ? " OR " : " ");
+	if (terms.length === 0) return "";
+	const joined = terms.join(match === "or" ? " OR " : " ");
+	// FTS5 column filter: `{col} : (expr)` restricts the whole expression to one column.
+	return field ? `{${field}} : (${joined})` : joined;
 }
 
 function parseTags(tagsJson: unknown): string[] {
 	if (Array.isArray(tagsJson)) return tagsJson.filter((t): t is string => typeof t === "string");
 	return [];
+}
+
+/**
+ * Normalize author-declared keywords before persisting.
+ * Trims, drops empties/dupes (case-insensitive), and applies a LENIENT minimum length
+ * (latin < settings.knowledge.minKeywordLen, CJK < 2) purely to keep single-character
+ * noise out of passive injection. This is a soft floor, NOT a hard validation rule —
+ * keyword quality is steered by the tool prompts, so nothing here rejects a write.
+ */
+function normalizeKeywords(raw: unknown): string[] {
+	if (!Array.isArray(raw)) return [];
+	const minLatin = Math.max(settings.knowledge.minKeywordLen ?? 3, 2);
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const item of raw) {
+		if (typeof item !== "string") continue;
+		const kw = item.trim();
+		if (!kw) continue;
+		const key = kw.toLowerCase();
+		if (seen.has(key)) continue;
+		const hasCjk = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(kw);
+		if (hasCjk) {
+			if (kw.length < 2) continue;
+		} else if (kw.length < minLatin) {
+			continue;
+		}
+		seen.add(key);
+		out.push(kw);
+	}
+	return out;
+}
+
+/** Join normalized keywords into the space-separated mirror stored in current_keywords. */
+function keywordsMirror(keywords: string[]): string | null {
+	return keywords.length > 0 ? keywords.join(" ") : null;
 }
 
 /** Escape LIKE wildcards (% _) and the escape char itself so user-typed wildcards
@@ -386,6 +427,7 @@ async function createEntry(input: {
 	content?: string;
 	format?: Format;
 	tags?: string[];
+	keywords?: string[];
 	metadata?: Record<string, unknown>;
 	changeNote?: string;
 	authorUserId?: string;
@@ -425,6 +467,7 @@ async function createEntry(input: {
 	const now = nowIso();
 	const content = input.content ?? "";
 	const format = input.format ?? "markdown";
+	const keywords = normalizeKeywords(input.keywords);
 
 	try {
 		db.transaction((tx) => {
@@ -439,7 +482,9 @@ async function createEntry(input: {
 					slug,
 					currentRevisionId: revisionId,
 					currentContent: content,
+					currentKeywords: keywordsMirror(keywords),
 					tagsJson: input.tags ?? [],
+					keywordsJson: keywords,
 					metadataJson: input.metadata ?? null,
 					// Default the owner to the creator so they retain read/write/review
 					// authority over their own entry without a separate grant.
@@ -480,17 +525,22 @@ async function updateEntryMeta(
 	input: {
 		title?: string;
 		tags?: string[];
+		keywords?: string[];
 		metadata?: Record<string, unknown>;
 		status?: "active" | "archived";
 	},
 	principal: Principal,
 ) {
 	await loadWritableEntry(id, principal);
+	const keywords = input.keywords !== undefined ? normalizeKeywords(input.keywords) : undefined;
 	await db
 		.update(knowledgeEntries)
 		.set({
 			...(input.title !== undefined ? { title: input.title } : {}),
 			...(input.tags !== undefined ? { tagsJson: input.tags } : {}),
+			...(keywords !== undefined
+				? { keywordsJson: keywords, currentKeywords: keywordsMirror(keywords) }
+				: {}),
 			...(input.metadata !== undefined ? { metadataJson: input.metadata } : {}),
 			...(input.status !== undefined ? { status: input.status } : {}),
 			updatedAt: nowIso(),
@@ -793,6 +843,8 @@ type SearchOpts = {
 	tag?: string;
 	limit?: number;
 	match?: "and" | "or";
+	/** Restrict the FTS match to a single column (e.g. "current_keywords" for passive injection). */
+	field?: string;
 	/** When set, the caller's own active drafts shadow the main version (working-copy view). */
 	draftUserId?: string;
 };
@@ -809,7 +861,7 @@ function searchMain(
 	const { clause: excludeClause, params: excludeParams } = buildExcludeClause(excludeEntryIds);
 
 	if (canUseFts(safe)) {
-		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and");
+		const ftsQuery = buildFtsQuery(safe, opts.match ?? "and", opts.field);
 		const params: (string | number | null)[] = [
 			ftsQuery,
 			opts.collectionId ?? null,
@@ -835,17 +887,20 @@ function searchMain(
 	}
 
 	// Short-query fallback (1-2 chars, e.g. a 2-character CJK term that the trigram index
-	// can't tokenize). Matches title+current_content with a TIGHT limit so the unindexed
-	// scan can't run away on the main thread.
+	// can't tokenize). Matches with a TIGHT limit so the unindexed scan can't run away on
+	// the main thread. When field is restricted (passive injection → "current_keywords"),
+	// only that column is matched so body text never triggers a hit.
 	const fallbackLimit = Math.min(limit, SHORT_QUERY_FALLBACK_LIMIT);
 	const like = `%${escapeLike(query)}%`;
-	const params: (string | number | null)[] = [
-		query,
-		like,
-		like,
-		opts.collectionId ?? null,
-		opts.collectionId ?? null,
-	];
+	const matchExpr =
+		opts.field === "current_keywords"
+			? `e.current_keywords LIKE ? ESCAPE '\\'`
+			: `e.title LIKE ? ESCAPE '\\' OR e.current_content LIKE ? ESCAPE '\\'`;
+	const params: (string | number | null)[] = [query];
+	// One LIKE param for the keyword-only column, two for the title+content default.
+	if (opts.field === "current_keywords") params.push(like);
+	else params.push(like, like);
+	params.push(opts.collectionId ?? null, opts.collectionId ?? null);
 	if (opts.projectId) params.push(opts.projectId);
 	params.push(...excludeParams);
 	params.push(fallbackLimit);
@@ -855,7 +910,7 @@ function searchMain(
 			  e.created_at, e.updated_at,
 			  substr(COALESCE(e.current_content, e.title), 1, 240) as snippet
 			 FROM knowledge_entries e
-			 WHERE (? = '' OR e.title LIKE ? ESCAPE '\\' OR e.current_content LIKE ? ESCAPE '\\')
+			 WHERE (? = '' OR ${matchExpr})
 			   AND (? IS NULL OR e.collection_id = ?)
 			   ${projectClause}
 			   ${excludeClause}
@@ -952,7 +1007,10 @@ function search(opts: SearchOpts) {
 		: "";
 
 	// No draft context → plain main-version search (unchanged behaviour for routes/injection).
-	if (!opts.draftUserId) {
+	// A column-restricted match (field, e.g. passive injection on "current_keywords") also
+	// forces the main-only path: the drafts FTS has no keywords column and personal drafts
+	// are not subject to passive injection.
+	if (!opts.draftUserId || opts.field) {
 		const rows = searchMain(opts, limit, projectClause, []);
 		const mapped = rows.map(mapRow);
 		const tag = opts.tag;

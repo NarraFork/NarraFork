@@ -17,6 +17,7 @@ import {
 	SimpleGrid,
 	Stack,
 	Stepper,
+	Switch,
 	Text,
 	TextInput,
 	Title,
@@ -25,6 +26,7 @@ import { notifications } from "@mantine/notifications";
 import {
 	IconCheck,
 	IconCopy,
+	IconDeviceMobile,
 	IconDownload,
 	IconFingerprint,
 	IconKey,
@@ -43,6 +45,7 @@ import {
 	useRegisterPasskey,
 	useRenamePasskey,
 	useSecurityStatus,
+	useSetMfaEnabled,
 	useSsoProviders,
 	useTotpActivate,
 	useTotpDisable,
@@ -53,6 +56,7 @@ import { api } from "../../lib/api";
 import {
 	isPasskeySupported,
 	isUserCancelledWebAuthn,
+	type MfaStatus,
 	type PasskeySummary,
 	type SsoIdentity,
 	type TotpSetupResult,
@@ -70,63 +74,157 @@ function SettingsSecurityPage() {
 	if (isLoading) return <Loader />;
 
 	return (
-		<Stack>
+		<Stack gap="xl">
 			<Title order={3}>{t("securitySection")}</Title>
 
-			<Card withBorder padding="lg">
-				<Group justify="space-between" wrap="nowrap" align="flex-start">
-					<Group wrap="nowrap" align="flex-start">
-						<IconShieldLock size={28} />
-						<Box>
-							<Group gap="xs">
-								<Text fw={600}>{t("totpTitle")}</Text>
-								{status?.totpEnabled ? (
-									<Badge color="green" variant="light">
-										{t("totpEnabled")}
-									</Badge>
-								) : (
-									<Badge color="gray" variant="light">
-										{t("totpDisabled")}
-									</Badge>
-								)}
-							</Group>
-							<Text size="sm" c="dimmed" mt={4} maw={520}>
-								{t("totpDescription")}
-							</Text>
-							{status?.totpEnabled && (
-								<Text size="xs" c="dimmed" mt={6}>
-									{t("backupCodesRemaining", { count: status.backupCodesRemaining })}
-								</Text>
-							)}
-						</Box>
-					</Group>
-					{status?.totpEnabled ? (
-						<DisableButton />
-					) : (
-						<Button onClick={() => setEnrolling(true)}>{t("totpEnable")}</Button>
-					)}
-				</Group>
-			</Card>
+			{/* Sign-in methods — independent of the two-factor requirement. */}
+			<Stack gap="sm">
+				<Box>
+					<Title order={4}>{t("loginMethodsSection")}</Title>
+					<Text size="sm" c="dimmed" maw={620}>
+						{t("loginMethodsDescription")}
+					</Text>
+				</Box>
+				<PasskeySection />
+				<IdentitiesSection />
+			</Stack>
 
-			<PasskeySection />
+			{/* Two-factor authentication — the opt-in requirement + TOTP factor. */}
+			<Stack gap="sm">
+				<Box>
+					<Title order={4}>{t("mfaSection")}</Title>
+					<Text size="sm" c="dimmed" maw={620}>
+						{t("mfaSectionDescription")}
+					</Text>
+				</Box>
+				<MfaRequireCard status={status} />
+				<TotpCard status={status} onEnroll={() => setEnrolling(true)} />
+			</Stack>
 
-			<IdentitiesSection />
-
-			{enrolling && <EnrollModal onClose={() => setEnrolling(false)} />}
+			{enrolling && <EnrollModal status={status} onClose={() => setEnrolling(false)} />}
 		</Stack>
 	);
 }
 
+/**
+ * Master switch: whether a second factor is required at sign-in. Independent of
+ * enrolling a factor — adding a passkey or TOTP never flips this on by itself.
+ * Disabled (and hinted) until the user has at least one usable factor.
+ */
+function MfaRequireCard({ status }: { status?: MfaStatus }) {
+	const { t } = useTranslation("settings");
+	const setMfa = useSetMfaEnabled();
+	const hasFactor = !!status && (status.totpEnabled || status.passkeyCount > 0);
+	const enabled = !!status?.mfaEnabled;
+
+	const handleToggle = async (next: boolean) => {
+		try {
+			await setMfa.mutateAsync(next);
+			notifications.show({
+				color: "green",
+				message: next ? t("mfaEnabledSuccess") : t("mfaDisabledSuccess"),
+			});
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		} catch (e: any) {
+			notifications.show({ color: "red", message: e?.message || t("mfaToggleFailed") });
+		}
+	};
+
+	return (
+		<Card withBorder padding="lg">
+			<Group justify="space-between" wrap="nowrap" align="flex-start">
+				<Group wrap="nowrap" align="flex-start">
+					<IconShieldLock size={28} />
+					<Box>
+						<Group gap="xs">
+							<Text fw={600}>{t("mfaRequireTitle")}</Text>
+							<Badge color={enabled ? "green" : "gray"} variant="light">
+								{enabled ? t("mfaRequireEnabled") : t("mfaRequireDisabled")}
+							</Badge>
+						</Group>
+						<Text size="sm" c="dimmed" mt={4} maw={520}>
+							{t("mfaRequireDescription")}
+						</Text>
+						{!hasFactor ? (
+							<Text size="xs" c="orange" mt={6}>
+								{t("mfaNoFactorHint")}
+							</Text>
+						) : (
+							status.passkeyCount > 0 && (
+								<Text size="xs" c="dimmed" mt={6}>
+									{t("mfaFactorsHint")}
+								</Text>
+							)
+						)}
+					</Box>
+				</Group>
+				<Switch
+					size="lg"
+					checked={enabled}
+					disabled={!hasFactor || setMfa.isPending}
+					onChange={(e) => handleToggle(e.currentTarget.checked)}
+					aria-label={t("mfaRequireTitle")}
+				/>
+			</Group>
+		</Card>
+	);
+}
+
+/** Authenticator-app (TOTP) factor: enable via the enrollment wizard, or disable. */
+function TotpCard({ status, onEnroll }: { status?: MfaStatus; onEnroll: () => void }) {
+	const { t } = useTranslation("settings");
+	return (
+		<Card withBorder padding="lg">
+			<Group justify="space-between" wrap="nowrap" align="flex-start">
+				<Group wrap="nowrap" align="flex-start">
+					<IconDeviceMobile size={28} />
+					<Box>
+						<Group gap="xs">
+							<Text fw={600}>{t("totpTitle")}</Text>
+							{status?.totpEnabled ? (
+								<Badge color="green" variant="light">
+									{t("totpEnabled")}
+								</Badge>
+							) : (
+								<Badge color="gray" variant="light">
+									{t("totpDisabled")}
+								</Badge>
+							)}
+						</Group>
+						<Text size="sm" c="dimmed" mt={4} maw={520}>
+							{t("totpDescription")}
+						</Text>
+						{status?.totpEnabled && (
+							<Text size="xs" c="dimmed" mt={6}>
+								{t("backupCodesRemaining", { count: status.backupCodesRemaining })}
+							</Text>
+						)}
+					</Box>
+				</Group>
+				{status?.totpEnabled ? (
+					<DisableButton />
+				) : (
+					<Button onClick={onEnroll}>{t("totpEnable")}</Button>
+				)}
+			</Group>
+		</Card>
+	);
+}
+
 /** TOTP enrollment wizard: scan QR → verify code → save backup codes. */
-function EnrollModal({ onClose }: { onClose: () => void }) {
+function EnrollModal({ status, onClose }: { status?: MfaStatus; onClose: () => void }) {
 	const { t } = useTranslation("settings");
 	const setup = useTotpSetup();
 	const activate = useTotpActivate();
+	const setMfa = useSetMfaEnabled();
 	const [step, setStep] = useState(0);
 	const [setupData, setSetupData] = useState<TotpSetupResult | null>(null);
 	const [code, setCode] = useState("");
 	const [backupCodes, setBackupCodes] = useState<string[]>([]);
 	const [error, setError] = useState("");
+	// Explicit opt-in to require two-factor at sign-in once setup completes.
+	// Defaults on (the likely intent) but is never applied without this switch.
+	const [enableMfa, setEnableMfa] = useState(true);
 
 	// Kick off setup when the modal first opens.
 	const startSetup = async () => {
@@ -161,7 +259,16 @@ function EnrollModal({ onClose }: { onClose: () => void }) {
 		}
 	};
 
-	const finish = () => {
+	const finish = async () => {
+		// Only ever turns the requirement ON, and only when the user opted in.
+		// The wizard never silently disables an existing requirement.
+		if (enableMfa && !status?.mfaEnabled) {
+			try {
+				await setMfa.mutateAsync(true);
+			} catch {
+				// Non-fatal: TOTP is already enrolled; the toggle can be flipped later.
+			}
+		}
 		notifications.show({ color: "green", message: t("totpEnabledSuccess") });
 		onClose();
 	};
@@ -287,7 +394,17 @@ function EnrollModal({ onClose }: { onClose: () => void }) {
 						</Button>
 					</Group>
 					<Divider />
-					<Button onClick={finish}>{t("backupCodesDone")}</Button>
+					{!status?.mfaEnabled && (
+						<Switch
+							checked={enableMfa}
+							onChange={(e) => setEnableMfa(e.currentTarget.checked)}
+							label={t("totpEnrollEnableMfa")}
+							description={t("totpEnrollEnableMfaHint")}
+						/>
+					)}
+					<Button onClick={() => void finish()} loading={setMfa.isPending}>
+						{t("backupCodesDone")}
+					</Button>
 				</Stack>
 			)}
 		</Modal>

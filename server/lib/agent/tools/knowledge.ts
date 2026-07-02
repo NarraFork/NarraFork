@@ -121,8 +121,14 @@ export const knowledgeReadTool: ToolDefinition = {
 			const entry = (await knowledgeService.getEntry(entryId, {
 				withContent: true,
 				principal,
-			})) as { title: string; currentContent?: string | null; tagsJson?: unknown };
+			})) as {
+				title: string;
+				currentContent?: string | null;
+				tagsJson?: unknown;
+				keywordsJson?: unknown;
+			};
 			const tags = Array.isArray(entry.tagsJson) ? (entry.tagsJson as string[]) : [];
+			const keywords = Array.isArray(entry.keywordsJson) ? (entry.keywordsJson as string[]) : [];
 
 			// Working-copy overlay with drift awareness. The default view shadows the caller's
 			// own active PERSONAL entry, BUT only while it is based on the latest main revision.
@@ -180,6 +186,7 @@ export const knowledgeReadTool: ToolDefinition = {
 					entryId,
 					title: entry.title,
 					tags,
+					keywords,
 					isDraft,
 					truncated,
 					drift: { drifted, versionsBehind },

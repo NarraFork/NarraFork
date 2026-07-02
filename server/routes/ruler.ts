@@ -439,7 +439,7 @@ rulerRoutes.patch("/:id/ruler/positions", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { positions } = parsed.data;
 
-	await db.transaction(async (tx) => {
+	db.transaction((tx) => {
 		for (const pos of positions) {
 			const updates: Record<string, unknown> = {
 				anchorCommitSha: pos.anchorCommitSha,
@@ -448,10 +448,10 @@ rulerRoutes.patch("/:id/ruler/positions", async (c) => {
 			};
 			if (pos.width != null) updates.panelWidth = pos.width;
 			if (pos.height != null) updates.panelHeight = pos.height;
-			await tx
-				.update(chapters)
+			tx.update(chapters)
 				.set(updates)
-				.where(and(eq(chapters.id, pos.chapterId), eq(chapters.projectId, projectId)));
+				.where(and(eq(chapters.id, pos.chapterId), eq(chapters.projectId, projectId)))
+				.run();
 		}
 	});
 

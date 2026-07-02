@@ -118,6 +118,11 @@ function extractKeywords(text: string, minLen: number): string {
 
 /**
  * Resolve knowledge entries relevant to `text` that the given user may read.
+ *
+ * Matching is KEYWORD-ONLY: terms extracted from `text` are matched against each entry's
+ * author-declared keywords (the FTS `current_keywords` column), never the title or body.
+ * An entry surfaces only when the input actually contains one of its declared keywords, so
+ * entries with no keywords are never auto-injected (they remain findable via KnowledgeSearch).
  * ACL is applied (dual-axis) — unreadable entries never surface.
  *   - userId: the user who triggered this loop turn (null → anonymous, public only)
  *   - projectId: restrict to this project's collections + global ones (cross-project isolation)
@@ -133,15 +138,15 @@ export async function resolveInjections(
 	const raw = (text ?? "").trim();
 	if (raw.length < cfg.minKeywordLen) return [];
 
-	// Extract keywords for an OR-match query — the input is usually a sentence
-	// or a tool-output blob, so requiring all terms (AND) would rarely match.
+	// Extract candidate terms from the input for an OR-match query — the input is usually a
+	// sentence or a tool-output blob, so requiring all terms (AND) would rarely match.
 	const keywords = extractKeywords(raw, cfg.minKeywordLen);
 	if (!keywords) return [];
 
-	// FTS search (service sanitizes the query); over-fetch a bit then ACL-filter.
-	// Pass the triggering user as draftUserId so the passive hints reflect that user's
-	// personal working copy: entries they have an active draft on are matched/summarized
-	// from the draft, consistent with the KnowledgeSearch/KnowledgeRead tools.
+	// Keyword-column FTS search (service sanitizes the query); over-fetch a bit then ACL-filter.
+	// field="current_keywords" restricts the match to author-declared keywords (no body/title),
+	// which also forces the main-only path (drafts have no keyword index, and personal drafts
+	// are not subject to passive injection).
 	const limit = Math.max(cfg.maxInjectedEntries * 3, cfg.maxInjectedEntries);
 	let results: Array<{ id: string; title: string; snippet: string; tags?: string[] }>;
 	try {
@@ -151,7 +156,7 @@ export async function resolveInjections(
 			projectId: opts.projectId,
 			limit,
 			match: "or",
-			draftUserId: userId ?? undefined,
+			field: "current_keywords",
 		}) as typeof results;
 	} catch {
 		return [];

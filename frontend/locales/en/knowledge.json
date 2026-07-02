@@ -39,6 +39,9 @@
 	"content": "Content",
 	"tags": "Tags",
 	"tagsPlaceholder": "comma,separated,tags",
+	"keywords": "Keywords",
+	"keywordsPlaceholder": "add a keyword, press Enter",
+	"keywordsHint": "Distinctive terms that auto-surface this entry when they appear in a session. Prefer specific words (proper nouns, error codes, API names); avoid short or generic ones. No keywords = never auto-injected.",
 	"changeNote": "Change note",
 	"changeNotePlaceholder": "Briefly describe this change",
 
@@ -56,7 +59,7 @@
 	"tabSubmissions": "Submissions",
 	"tabSettings": "Settings",
 	"metaSettings": "Metadata",
-	"metaDesc": "Edit the entry's title, tags, and status.",
+	"metaDesc": "Edit the entry's title, tags, keywords, and status.",
 	"settingsReadOnlyHint": "You don't have write permission; submit a draft for review to propose changes.",
 	"controlledTagsHint": "Controlled tags required to read this entry (compartment).",
 	"reviewTagsHint": "Tags a reviewer must hold to review changes to this entry.",
@@ -219,6 +222,9 @@
 	"reviewCenterFilterLabel": "Filter",
 	"reviewCenterAll": "All",
 	"reviewCenterViewEntry": "Review entry",
+	"reviewCenterNewEntry": "New entry",
+	"reviewCenterUntitledEntry": "Untitled entry",
+	"reviewCenterReview": "Review",
 
 	"tabLinks": "Links",
 	"linkAdd": "Add link",

@@ -18,18 +18,21 @@ export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 
 	const [title, setTitle] = useState(entry.title);
 	const [tags, setTags] = useState<string[]>(entry.tagsJson ?? []);
+	const [keywords, setKeywords] = useState<string[]>(entry.keywordsJson ?? []);
 	const [status, setStatus] = useState<EntryStatus>(entry.status);
 
 	useEffect(() => {
 		setTitle(entry.title);
 		setTags(entry.tagsJson ?? []);
+		setKeywords(entry.keywordsJson ?? []);
 		setStatus(entry.status);
-	}, [entry.title, entry.tagsJson, entry.status]);
+	}, [entry.title, entry.tagsJson, entry.keywordsJson, entry.status]);
 
 	const dirty =
 		title !== entry.title ||
 		status !== entry.status ||
-		JSON.stringify(tags) !== JSON.stringify(entry.tagsJson ?? []);
+		JSON.stringify(tags) !== JSON.stringify(entry.tagsJson ?? []) ||
+		JSON.stringify(keywords) !== JSON.stringify(entry.keywordsJson ?? []);
 
 	return (
 		<Stack gap="sm">
@@ -51,6 +54,15 @@ export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 				placeholder={t("tagsPlaceholder")}
 				value={tags}
 				onChange={setTags}
+				clearable
+			/>
+
+			<TagsInput
+				label={t("keywords")}
+				description={t("keywordsHint")}
+				placeholder={t("keywordsPlaceholder")}
+				value={keywords}
+				onChange={setKeywords}
 				clearable
 			/>
 
@@ -76,6 +88,7 @@ export function EntryMetaPanel({ entry }: { entry: KnowledgeEntry }) {
 							id: entry.id,
 							title: title.trim(),
 							tags,
+							keywords,
 							status,
 						})
 					}

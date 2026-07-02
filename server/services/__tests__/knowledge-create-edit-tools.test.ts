@@ -186,6 +186,58 @@ describe("KnowledgeEdit", () => {
 		expect(res.output.toLowerCase()).toContain("rebas");
 	});
 
+	test("update_meta with personalEntryId edits a standalone entry's keywords", async () => {
+		const created = await knowledgeBranchService.createStandalone(
+			{ userId: plainId, role: "user" },
+			{ title: `Kw Personal ${TAG}`, keywords: ["initialkw"] },
+		);
+		const res = await knowledgeEditTool.execute(
+			{
+				action: "update_meta",
+				personalEntryId: created.id,
+				title: `Kw Personal Renamed ${TAG}`,
+				keywords: [`personalkw${TAG}`, "another"],
+			},
+			ctxFor(plainId),
+		);
+		expect(res.isError).toBeUndefined();
+		expect((res.metadata as { personalEntryId?: string }).personalEntryId).toBe(created.id);
+		const mine = await knowledgeBranchService.getMine(
+			{ userId: plainId, role: "user" },
+			created.id,
+		);
+		expect(mine.title).toBe(`Kw Personal Renamed ${TAG}`);
+		expect(mine.keywordsJson).toEqual([`personalkw${TAG}`, "another"]);
+	});
+
+	test("update_meta with neither entryId nor personalEntryId is rejected", async () => {
+		const res = await knowledgeEditTool.execute(
+			{ action: "update_meta", keywords: ["x"] },
+			ctxFor(plainId),
+		);
+		expect(res.isError).toBe(true);
+	});
+
+	test("update_meta with entryId edits a global entry's keywords (owner)", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Kw Global ${TAG}`,
+			content: "body",
+			authorUserId: ownerId,
+		});
+		const res = await knowledgeEditTool.execute(
+			{ action: "update_meta", entryId: entry.id, keywords: [`globalkw${TAG}`] },
+			ctxFor(ownerId),
+		);
+		expect(res.isError).toBeUndefined();
+		expect((res.metadata as { entryId?: string }).entryId).toBe(entry.id);
+		const fresh = await knowledgeService.getEntry(entry.id, {
+			withContent: true,
+			principal: { userId: ownerId, role: "user" },
+		});
+		expect((fresh as { keywordsJson?: string[] }).keywordsJson).toEqual([`globalkw${TAG}`]);
+	});
+
 	test("anonymous user cannot edit", async () => {
 		const res = await knowledgeEditTool.execute(
 			{ action: "save", personalEntryId: "x", content: "y" },

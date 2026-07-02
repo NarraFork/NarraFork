@@ -16,6 +16,22 @@ export function markCleanShutdown(sqlite: Database): void {
 	sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
+/**
+ * Read the clean-shutdown marker WITHOUT resetting it.
+ *
+ * Must be called before {@link ensureFts}, which resets `application_id` to 0
+ * after deciding whether to rebuild the FTS indexes. The value read here reflects
+ * how the *previous* process exited: `wasClean === true` means the last run wrote
+ * the clean marker on graceful shutdown (so the DB and FTS indexes are trustworthy
+ * and the expensive startup integrity check can be skipped).
+ */
+export function readCleanShutdownState(sqlite: Database): { wasClean: boolean } {
+	const appId =
+		(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
+			?.application_id ?? 0;
+	return { wasClean: appId === CLEAN_SHUTDOWN_MARKER };
+}
+
 export function ensureFts(
 	sqlite: Database,
 	options: { skipUncleanShutdownRebuild?: boolean } = {},
@@ -76,9 +92,27 @@ export function ensureFts(
 				.get() as { c: number }
 		).c === 1;
 	if (hasKnowledgeEntries) {
+		// Column-set migration: an older DB has knowledge_entries_fts with only
+		// (title, current_content). The `current_keywords` column was added for passive
+		// auto-injection — detect the stale shape and drop it so it is recreated with the
+		// new column (and rebuilt below via needsRebuild). The FTS column name must match
+		// the base-table column name (external-content tables resolve columns by name on
+		// 'rebuild'), hence `current_keywords` rather than `keywords`.
+		const keInfo = sqlite
+			.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge_entries_fts'")
+			.get() as { sql: string } | undefined;
+		if (keInfo && !keInfo.sql.includes("current_keywords")) {
+			sqlite.run("DROP TABLE IF EXISTS knowledge_entries_fts");
+			// The sync triggers reference the FTS column list, so drop them too — they are
+			// recreated (with the keywords column) by the CREATE TRIGGER calls below.
+			sqlite.run("DROP TRIGGER IF EXISTS knowledge_entries_fts_insert");
+			sqlite.run("DROP TRIGGER IF EXISTS knowledge_entries_fts_update");
+			sqlite.run("DROP TRIGGER IF EXISTS knowledge_entries_fts_delete");
+			ftsTablesRecreated.push("knowledge_entries_fts");
+		}
 		sqlite.run(`
 			CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_entries_fts USING fts5(
-				title, current_content, content='knowledge_entries', content_rowid=rowid, tokenize='trigram'
+				title, current_content, current_keywords, content='knowledge_entries', content_rowid=rowid, tokenize='trigram'
 			)
 		`);
 	}
@@ -188,26 +222,26 @@ export function ensureFts(
 		END
 	`);
 
-	// --- Sync triggers: knowledge_entries (title + current_content) ---
+	// --- Sync triggers: knowledge_entries (title + current_content + current_keywords) ---
 	if (hasKnowledgeEntries) {
 		sqlite.run(`
 			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_insert AFTER INSERT ON knowledge_entries BEGIN
-				INSERT INTO knowledge_entries_fts(rowid, title, current_content)
-				VALUES (NEW.rowid, NEW.title, NEW.current_content);
+				INSERT INTO knowledge_entries_fts(rowid, title, current_content, current_keywords)
+				VALUES (NEW.rowid, NEW.title, NEW.current_content, NEW.current_keywords);
 			END
 		`);
 		sqlite.run(`
 			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_update AFTER UPDATE ON knowledge_entries BEGIN
-				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content)
-				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content);
-				INSERT INTO knowledge_entries_fts(rowid, title, current_content)
-				VALUES (NEW.rowid, NEW.title, NEW.current_content);
+				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content, current_keywords)
+				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content, OLD.current_keywords);
+				INSERT INTO knowledge_entries_fts(rowid, title, current_content, current_keywords)
+				VALUES (NEW.rowid, NEW.title, NEW.current_content, NEW.current_keywords);
 			END
 		`);
 		sqlite.run(`
 			CREATE TRIGGER IF NOT EXISTS knowledge_entries_fts_delete AFTER DELETE ON knowledge_entries BEGIN
-				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content)
-				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content);
+				INSERT INTO knowledge_entries_fts(knowledge_entries_fts, rowid, title, current_content, current_keywords)
+				VALUES ('delete', OLD.rowid, OLD.title, OLD.current_content, OLD.current_keywords);
 			END
 		`);
 	}

@@ -81,6 +81,7 @@ export function useUpdateKnowledgeEntryMeta() {
 			id: string;
 			title?: string;
 			tags?: string[];
+			keywords?: string[];
 			metadata?: Record<string, unknown>;
 			status?: "active" | "archived";
 		}) => api.updateKnowledgeEntryMeta(id, data),
@@ -267,8 +268,12 @@ export function useMyPersonalEntries(opts: { status?: "active" | "archived" } = 
 export function useCreatePersonalEntry() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: (data: { title: string; content?: string; targetCollectionId?: string }) =>
-			api.createPersonalEntry(data),
+		mutationFn: (data: {
+			title: string;
+			content?: string;
+			targetCollectionId?: string;
+			keywords?: string[];
+		}) => api.createPersonalEntry(data),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] }),
 	});
 }
@@ -283,6 +288,7 @@ export function useUpdatePersonalEntryMeta() {
 			id: string;
 			title?: string;
 			targetCollectionId?: string | null;
+			keywords?: string[];
 		}) => api.updatePersonalEntryMeta(id, data),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["knowledge", "personalEntries"] }),
 	});
@@ -325,7 +331,6 @@ export function useReviewKnowledgeSubmission() {
 			...data
 		}: {
 			id: string;
-			entryId?: string;
 			verdict: KnowledgeVerdict;
 			findings?: KnowledgeFinding[];
 		}) => api.reviewKnowledgeSubmission(id, { verdict: data.verdict, findings: data.findings }),

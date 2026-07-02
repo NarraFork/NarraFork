@@ -182,7 +182,13 @@ async function loadOwnDraft(principal: Principal, draftId: string) {
  */
 async function createStandalone(
 	principal: Principal,
-	input: { title: string; content?: string; targetCollectionId?: string; name?: string },
+	input: {
+		title: string;
+		content?: string;
+		targetCollectionId?: string;
+		name?: string;
+		keywords?: string[];
+	},
 ) {
 	if (!principal.userId) throw new ValidationError("An authenticated user is required");
 	const title = input.title.trim();
@@ -200,6 +206,7 @@ async function createStandalone(
 			title,
 			targetCollectionId: input.targetCollectionId ?? null,
 			baseRevisionId: null,
+			keywordsJson: Array.isArray(input.keywords) ? input.keywords : null,
 			content,
 			contentHash: hashContent(content),
 			format: "markdown",
@@ -242,7 +249,7 @@ async function getMine(principal: Principal, draftId: string) {
 async function updateStandaloneMeta(
 	principal: Principal,
 	draftId: string,
-	input: { title?: string; targetCollectionId?: string | null },
+	input: { title?: string; targetCollectionId?: string | null; keywords?: string[] },
 ) {
 	const draft = await loadOwnDraft(principal, draftId);
 	if (draft.status === "archived") {
@@ -258,6 +265,9 @@ async function updateStandaloneMeta(
 		patch.title = t;
 	}
 	if (input.targetCollectionId !== undefined) patch.targetCollectionId = input.targetCollectionId;
+	if (input.keywords !== undefined) {
+		patch.keywordsJson = Array.isArray(input.keywords) ? input.keywords : null;
+	}
 	await db.update(knowledgeDrafts).set(patch).where(eq(knowledgeDrafts.id, draftId));
 	return loadOwnDraft(principal, draftId);
 }
@@ -568,6 +578,9 @@ async function submitForReview(
 				submitterUserId: principal.userId,
 				baseRevisionId: draft.baseRevisionId,
 				proposedContent: draft.content,
+				// Standalone publish carries the draft's keywords to the new global entry on
+				// approve; linked entries keep their existing global keywords (NULL here).
+				keywordsJson: draft.entryId ? null : (draft.keywordsJson ?? null),
 				changeNote: input.changeNote ?? null,
 				status: "pending",
 				createdAt: now,
@@ -766,6 +779,12 @@ async function approveStandalone(
 	const title = (sub.title ?? "").trim();
 	if (!title) throw new ValidationError("Standalone publish has no title");
 
+	// Keywords proposed at submit time (already shaped on the draft). Defensive filter to a
+	// clean string[] for the new global entry's keywordsJson + currentKeywords mirror.
+	const stdKeywords = Array.isArray(sub.keywordsJson)
+		? sub.keywordsJson.filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+		: [];
+
 	const entryId = generateId();
 	const revisionId = generateId();
 	const baseSlug = slugify(title);
@@ -810,6 +829,11 @@ async function approveStandalone(
 						currentRevisionId: revisionId,
 						currentContent: sub.proposedContent,
 						tagsJson: [],
+						// Carry the standalone draft's keywords onto the new global entry so it
+						// participates in passive injection (currentKeywords mirrors keywordsJson
+						// for the FTS keyword column).
+						keywordsJson: stdKeywords,
+						currentKeywords: stdKeywords.length > 0 ? stdKeywords.join(" ") : null,
 						ownerUserId: sub.submitterUserId,
 						status: "active",
 						createdAt: now,

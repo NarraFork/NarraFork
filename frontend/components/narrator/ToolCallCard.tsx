@@ -90,6 +90,7 @@ import { formatDurationText } from "../../lib/format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { getShikiLang } from "../../lib/shiki-lang";
 import { Z } from "../../lib/z-index";
+import { useImageViewer } from "../common/ImageViewerProvider";
 import { AskUserQuestionBanner, coerceQuestions } from "./AskUserQuestionBanner";
 import { AutoFollowScroll } from "./AutoFollowScroll";
 import { CompactMenuSub } from "./CompactMenuSub";
@@ -1912,6 +1913,7 @@ function FilePreviewModal({
 	onClose: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const fsCapability = useFileSystemCapability();
 	const previewCapability = fsCapability.preview;
 	const previewType = getFilePreviewType(filePath);
@@ -2046,15 +2048,25 @@ function FilePreviewModal({
 			)}
 			{!error && !loading && previewType === "image" && blobUrl && (
 				<Box p="xs" style={{ textAlign: "center" }}>
+					{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there */}
 					<img
 						src={blobUrl}
 						alt={fileName}
 						onError={() => setError(true)}
+						onClick={() =>
+							openImageViewer({
+								src: blobUrl,
+								savedPath: filePath,
+								filename: fileName,
+								alt: fileName,
+							})
+						}
 						style={{
 							maxWidth: "100%",
 							maxHeight: "80vh",
 							objectFit: "contain",
 							borderRadius: "var(--mantine-radius-sm)",
+							cursor: "pointer",
 						}}
 					/>
 				</Box>
@@ -2622,6 +2634,7 @@ function WebSearchDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("common");
+	const openImageViewer = useImageViewer();
 	const fetchUrl = extractField(toolCall.inputJson, "url");
 	const mode = extractField(toolCall.inputJson, "mode");
 	const selector = extractField(toolCall.inputJson, "selector");
@@ -2681,15 +2694,20 @@ function WebFetchDetail({ toolCall }: { toolCall: ToolCallData }) {
 			)}
 			{isScreenshot && screenshotPreviewUrl && (
 				<Box mt="xs">
+					{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there */}
 					<img
 						src={screenshotPreviewUrl}
 						alt={fetchUrl || "screenshot"}
+						onClick={() =>
+							openImageViewer({ src: screenshotPreviewUrl, filename: fetchUrl || "screenshot" })
+						}
 						style={{
 							maxWidth: "100%",
 							maxHeight: 400,
 							borderRadius: "var(--mantine-radius-sm)",
 							objectFit: "contain",
 							display: "block",
+							cursor: "pointer",
 						}}
 					/>
 					{raw && (
@@ -2808,6 +2826,7 @@ function ShareFilePreview({
 	filename: string;
 }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const [error, setError] = useState(false);
 
 	if (error) {
@@ -2821,16 +2840,19 @@ function ShareFilePreview({
 	if (previewType === "image") {
 		return (
 			<Box mt="xs">
+				{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there */}
 				<img
 					src={previewUrl}
 					alt={filename}
 					onError={() => setError(true)}
+					onClick={() => openImageViewer({ src: previewUrl, filename, alt: filename })}
 					style={{
 						maxWidth: "100%",
 						maxHeight: 400,
 						borderRadius: "var(--mantine-radius-sm)",
 						objectFit: "contain",
 						display: "block",
+						cursor: "pointer",
 					}}
 				/>
 			</Box>
@@ -3326,6 +3348,7 @@ function SkillDetail({ toolCall }: { toolCall: ToolCallData }) {
 
 function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const action = extractField(toolCall.inputJson, "action");
 	const url = extractField(toolCall.inputJson, "url");
 	const selector = extractField(toolCall.inputJson, "selector");
@@ -3370,15 +3393,24 @@ function BrowserDetail({ toolCall }: { toolCall: ToolCallData }) {
 			)}
 			{isScreenshot && previewUrl && (
 				<Box mt="xs">
+					{/* biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there */}
 					<img
 						src={previewUrl}
 						alt={t("browser.screenshotAlt")}
+						onClick={() =>
+							openImageViewer({
+								src: previewUrl,
+								filename: url || "screenshot",
+								alt: t("browser.screenshotAlt"),
+							})
+						}
 						style={{
 							maxWidth: "100%",
 							maxHeight: 400,
 							borderRadius: "var(--mantine-radius-sm)",
 							objectFit: "contain",
 							display: "block",
+							cursor: "pointer",
 						}}
 					/>
 					{typeof meta?.width === "number" && typeof meta?.height === "number" && (
@@ -4384,6 +4416,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 
 function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { t } = useTranslation("narrator");
+	const openImageViewer = useImageViewer();
 	const fsCapability = useFileSystemCapability();
 	const previewCapability = fsCapability.preview;
 	const fp = getFilePath(toolCall.inputJson);
@@ -4456,15 +4489,25 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 					</Text>
 				)}
 				{blobUrl && !loadError && (
+					// biome-ignore lint/a11y/useKeyWithClickEvents: opens fullscreen viewer; Escape/keys handled there
 					<img
 						src={blobUrl}
 						alt={fp || "image"}
+						onClick={() =>
+							openImageViewer({
+								src: blobUrl,
+								savedPath: filePath,
+								filename: (filePath || fp || "image").split(/[\\/]/).pop(),
+								alt: fp || "image",
+							})
+						}
 						style={{
 							maxWidth: "100%",
 							maxHeight: 400,
 							borderRadius: "var(--mantine-radius-sm)",
 							objectFit: "contain",
 							display: "block",
+							cursor: "pointer",
 						}}
 					/>
 				)}

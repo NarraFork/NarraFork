@@ -173,37 +173,45 @@ export const ssoService = {
 		const now = new Date().toISOString();
 		const username = await deriveUniqueUsername(claims);
 		const userId = generateId();
-		await db.transaction(async (tx) => {
-			await tx.insert(users).values({
-				id: userId,
-				username,
-				// SSO-only accounts have no usable password. Store a random,
-				// unguessable bcrypt hash so password login can never succeed.
-				passwordHash: await Bun.password.hash(randomBytes(32).toString("hex"), {
-					algorithm: "bcrypt",
-					cost: 10,
-				}),
-				role: "user",
-				avatarColor: randomAvatarColor(),
-				createdAt: now,
-			});
-			await tx.insert(userPreferences).values({
-				id: generateId(),
-				userId,
-				language: "en",
-				createdAt: now,
-				updatedAt: now,
-			});
-			await tx.insert(userIdentities).values({
-				id: generateId(),
-				userId,
-				provider: provider.id,
-				subject: claims.sub,
-				email: claims.email ?? null,
-				displayName: claims.name ?? null,
-				lastLoginAt: now,
-				createdAt: now,
-			});
+		// SSO-only accounts have no usable password. Precompute a random,
+		// unguessable bcrypt hash OUTSIDE the transaction (sync transactions
+		// cannot await) so password login can never succeed.
+		const passwordHash = await Bun.password.hash(randomBytes(32).toString("hex"), {
+			algorithm: "bcrypt",
+			cost: 10,
+		});
+		db.transaction((tx) => {
+			tx.insert(users)
+				.values({
+					id: userId,
+					username,
+					passwordHash,
+					role: "user",
+					avatarColor: randomAvatarColor(),
+					createdAt: now,
+				})
+				.run();
+			tx.insert(userPreferences)
+				.values({
+					id: generateId(),
+					userId,
+					language: "en",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.run();
+			tx.insert(userIdentities)
+				.values({
+					id: generateId(),
+					userId,
+					provider: provider.id,
+					subject: claims.sub,
+					email: claims.email ?? null,
+					displayName: claims.name ?? null,
+					lastLoginAt: now,
+					createdAt: now,
+				})
+				.run();
 		});
 		return userId;
 	},

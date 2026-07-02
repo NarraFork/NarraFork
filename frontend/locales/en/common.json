@@ -411,5 +411,16 @@
 	"usageHistoryError": "Error",
 	"usageHistoryCopyError": "Copy error message",
 	"usageHistoryDownloadRequestResponse": "Download request/response",
-	"usageHistoryDownloadFailed": "Failed to download request/response"
+	"usageHistoryDownloadFailed": "Failed to download request/response",
+	"imageViewer_zoomIn": "Zoom in",
+	"imageViewer_zoomOut": "Zoom out",
+	"imageViewer_reset": "Reset",
+	"imageViewer_rotateLeft": "Rotate left",
+	"imageViewer_rotateRight": "Rotate right",
+	"imageViewer_copy": "Copy image",
+	"imageViewer_download": "Download",
+	"imageViewer_close": "Close",
+	"imageViewer_copySuccess": "Image copied to clipboard",
+	"imageViewer_copyFailed": "Failed to copy image",
+	"imageViewer_downloadFailed": "Failed to download image"
 }
