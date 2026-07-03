@@ -8,7 +8,7 @@ import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import { getSummaryModelContextWindow } from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
-import { buildTodoCompactContext } from "./todo-reminder";
+import { buildSpecCompactContext } from "./spec-reminder";
 
 export { estimateTokens };
 
@@ -230,9 +230,9 @@ export const narratorContext = {
 		// ── Compute fixed overhead ──
 		const compactPrompt = getPrompt("compact", locale);
 		const todoSkipHint = getToolMessage("compactTodoSkip", locale);
-		const latestTodoContext = buildTodoCompactContext(narrator.todosJson, locale);
+		const latestSpecContext = await buildSpecCompactContext(narratorId, locale);
 		const compactSuffix = getPrompt("compactSuffix", locale);
-		const compactSystemPrompt = [compactPrompt, todoSkipHint, latestTodoContext]
+		const compactSystemPrompt = [compactPrompt, todoSkipHint, latestSpecContext]
 			.filter(Boolean)
 			.join("\n\n");
 

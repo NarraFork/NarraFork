@@ -1,6 +1,14 @@
 import { z } from "zod/v4";
+import {
+	buildSpecTasksDocumentFromLegacyTodos,
+	parseSpecTasksDocument,
+	type SpecTaskItem,
+	serializeSpecTasksDocument,
+} from "../../../services/spec-task-service";
+import { specVfsService } from "../../../services/spec-vfs-service";
 import { getToolMessageWithParams, type Locale } from "../../prompt-i18n";
 import type { ToolDefinition, ToolResult } from "../types";
+import { consumeTaskReflectionGrant } from "./task-reflection";
 
 const todoItemSchema = z.object({
 	id: z.string().describe("Short unique identifier for the todo item"),
@@ -16,11 +24,28 @@ const todoItemSchema = z.object({
 
 type TodoItem = { id: string; content: string; status: string; priority?: string };
 
+function specStatusToLegacyStatus(status: SpecTaskItem["status"]): string {
+	if (status === "done") return "completed";
+	if (status === "doing") return "in_progress";
+	if (status === "blocked") return "blocked";
+	return "pending";
+}
+
+function specTasksToLegacyTodos(tasks: SpecTaskItem[]): TodoItem[] {
+	return tasks.map((task, index) => ({
+		id: `spec-${index + 1}`,
+		content: task.text,
+		status: specStatusToLegacyStatus(task.status),
+		...(task.protected ? { priority: "high" } : {}),
+	}));
+}
+
 function formatTodos(todos: TodoItem[]): string {
 	if (!todos.length) return "No todos.";
 	const statusIcon: Record<string, string> = {
 		completed: "✓",
 		in_progress: "→",
+		blocked: "!",
 		pending: "○",
 	};
 	return todos
@@ -35,28 +60,55 @@ function formatTodos(todos: TodoItem[]): string {
 export const taskCreateTool: ToolDefinition = {
 	name: "TaskCreate",
 	description:
-		"Write the complete todo list for this session, replacing any existing todos. " +
-		"Pass the full list of todo items each time — this is a full replacement, not an incremental update. " +
-		"Use this to plan work, track progress, and mark tasks as completed.",
+		"Compatibility wrapper for the Living Work Spec task queue. " +
+		"Writes the complete task list to spec://tasks.json, replacing existing non-protected tasks. " +
+		"For new work, prefer editing spec://tasks.json directly with the minimal text/status/protected format.",
 	parameters: z.object({
 		todos: z.array(todoItemSchema).describe("The complete list of todo items"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		// DB persistence + WebSocket broadcast handled by session layer (assistant_message event).
-		// Tool execute only returns formatted confirmation for the model.
 		const { todos } = args as { todos: TodoItem[] };
 		const locale = (ctx?.locale as Locale) ?? "en";
-		const completed = todos.filter((t) => t.status === "completed").length;
-		const inProgress = todos.filter((t) => t.status === "in_progress").length;
-		const pending = todos.filter((t) => t.status === "pending").length;
+		let syncedTodos: TodoItem[] = todos;
+		try {
+			const current = await specVfsService.readTasksFileForNarrator(ctx.narratorId);
+			const currentDocument = parseSpecTasksDocument(current.content);
+			const nextDocument = buildSpecTasksDocumentFromLegacyTodos(todos, currentDocument);
+			const taskReflectionGranted = consumeTaskReflectionGrant(
+				ctx.narratorId,
+				ctx.currentToolUseId,
+			);
+			const written = await specVfsService.writeSpecFile(
+				ctx.narratorId,
+				"spec://tasks.json",
+				serializeSpecTasksDocument(nextDocument),
+				{
+					sourceToolUseId: ctx.currentToolUseId ?? null,
+					allowProtectedTaskMutation: taskReflectionGranted,
+				},
+			);
+			syncedTodos = specTasksToLegacyTodos(parseSpecTasksDocument(written.content).tasks);
+		} catch (err) {
+			return {
+				output: `Error updating spec://tasks.json: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+			};
+		}
+		const displayTodos = syncedTodos;
+		const completed = displayTodos.filter((t) => t.status === "completed").length;
+		const inProgress = displayTodos.filter((t) => t.status === "in_progress").length;
+		const pending = displayTodos.filter((t) => t.status === "pending").length;
+		const blocked = displayTodos.filter((t) => t.status === "blocked").length;
 		const header = getToolMessageWithParams("todoWriteOutput", locale, {
-			total: todos.length,
+			total: displayTodos.length,
 			completed,
 			inProgress,
 			pending,
+			blocked,
 		});
 		return {
-			output: `${header}\n\n${formatTodos(todos)}`,
+			output: `${header}\n\n${formatTodos(displayTodos)}\n\nUpdated spec://tasks.json.`,
+			metadata: { todos: syncedTodos },
 		};
 	},
 };

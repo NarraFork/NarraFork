@@ -42,6 +42,7 @@ import {
 	registerActiveSubagent,
 	unregisterActiveSubagent,
 } from "./narrator-session-state";
+import { buildSpecToolResultReminder } from "./spec-reminder";
 import {
 	deleteConclusionFileId,
 	resolveConclusionFilePath,
@@ -49,7 +50,6 @@ import {
 } from "./subagent-conclusion";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
-import { buildTodoToolResultReminder } from "./todo-reminder";
 
 // ---------------------------------------------------------------------------
 // Interfaces
@@ -519,13 +519,12 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			},
 			getSideCars: async (request) => {
 				if (request.phase === "tool_result") {
-					const row = await narratorService.getById(narratorId);
-					const reminder = buildTodoToolResultReminder(row.todosJson, locale as Locale);
+					const reminder = await buildSpecToolResultReminder(narratorId, locale as Locale);
 					if (!reminder) return [];
 					return [
 						{
 							target: "tool_result" as const,
-							source: "todo_reminder",
+							source: "living_work_spec",
 							content: reminder,
 							toolUseId: request.toolUseId,
 						},

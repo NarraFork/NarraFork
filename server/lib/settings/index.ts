@@ -95,6 +95,17 @@ const settingsPath = resolve(narraforkDir, "settings.json");
 
 const DANGER_REFLECTION_LEVELS = new Set(["off", "light", "standard", "strict"]);
 
+export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): boolean {
+	let changed = false;
+	for (const key of OBSOLETE_TOP_LEVEL_SETTINGS_KEYS) {
+		if (key in settings) {
+			delete settings[key];
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 function normalizeDangerReflectionSettings(
 	merged: NarraForkSettings,
 	raw: Record<string, unknown>,
@@ -181,8 +192,13 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	}
 	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
 	const merged = deepMerge(DEFAULTS, raw);
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
+	const mergedAny = merged as any;
 
 	let needsSave = false;
+	if (stripObsoleteSettingsKeys(mergedAny)) {
+		needsSave = true;
+	}
 
 	// Auto-generate JWT secret on first run
 	if (!merged.auth.jwtSecret) {
@@ -234,8 +250,6 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	}
 
 	// Migrate legacy single openai config → openaiProviders array
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON migration
-	const mergedAny = merged as any;
 	if (mergedAny.openai?.apiKey && !merged.openaiProviders?.length) {
 		const legacyId = generateMigrationId();
 		merged.openaiProviders = [
@@ -494,6 +508,7 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
 }
 
 export function saveSettings(newSettings: NarraForkSettings): void {
+	stripObsoleteSettingsKeys(newSettings as unknown as Record<string, unknown>);
 	normalizeCustomApiProviderSettings(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
@@ -501,6 +516,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	writeFileSync(settingsPath, JSON.stringify(newSettings, null, 2));
 	settingsRevision++;
 	if (_cache.current) {
+		stripObsoleteSettingsKeys(_cache.current as unknown as Record<string, unknown>);
 		for (const key of Object.keys(newSettings) as Array<keyof NarraForkSettings>) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(_cache.current as any)[key] = newSettings[key];

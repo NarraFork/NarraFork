@@ -4010,17 +4010,19 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }> = {
 	completed: { icon: IconCheck, color: "green" },
 	in_progress: { icon: IconPlayerPlay, color: "blue" },
+	blocked: { icon: IconBan, color: "orange" },
 	pending: { icon: IconChevronRight, color: "yellow" },
 };
 
 function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const { toolUseId: latestToolUseId, isThinking } = useContext(LatestTodosToolUseIdCtx);
 	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
+	const outputTodos = toolCall.outputJson?._metadata?.todos ?? toolCall.outputJson?.todos;
 	const raw = isTruncated(toolCall.inputJson)
 		? isTruncated(toolCall.outputJson)
 			? []
-			: toolCall.outputJson?.todos
-		: (toolCall.inputJson?.todos ?? toolCall.outputJson?.todos);
+			: outputTodos
+		: (outputTodos ?? toolCall.inputJson?.todos);
 	const todos: { content?: string; status?: string }[] = Array.isArray(raw) ? raw : [];
 
 	if (!todos.length) {

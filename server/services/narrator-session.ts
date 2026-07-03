@@ -110,6 +110,9 @@ import {
 	type ParentInboundMessage,
 } from "./parent-inbound-queue";
 import { reviewService } from "./review-service";
+import { buildSpecToolResultReminder } from "./spec-reminder";
+import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
+import { specVfsService } from "./spec-vfs-service";
 import {
 	deleteConclusionFileId,
 	getConclusionEntry,
@@ -129,7 +132,6 @@ import {
 	isTakenOver,
 } from "./subagent-takeover";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
-import { buildTodoToolResultReminder } from "./todo-reminder";
 import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
@@ -714,11 +716,116 @@ async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
 	active._goalTokenUsageBaseline = active._lastTokenUsage;
 }
 
+async function loadCompiledSpecForContinuation(narratorId: string) {
+	const file = await specVfsService.readTasksFileForNarrator(narratorId);
+	let document = parseSpecTasksDocument(file.content);
+	let compiled = compileSpecTasks(document);
+	if (!compiled.currentTask && compiled.nextTask) {
+		let promoted = false;
+		document = {
+			tasks: document.tasks.map((task) => {
+				if (!promoted && task.status === "todo") {
+					promoted = true;
+					return { ...task, status: "doing" as const };
+				}
+				return task;
+			}),
+		};
+		const content = `${JSON.stringify(document, null, "\t")}\n`;
+		await specVfsService.writeSpecFile(narratorId, "spec://tasks.json", content, {
+			createdBy: "system",
+			allowProtectedTaskMutation: true,
+		});
+		compiled = compileSpecTasks(document);
+	}
+	return compiled;
+}
+
+async function maybeStartSpecContinuation(
+	active: ActiveNarrator,
+	freshNarrator: { permissionMode?: string | null; traits?: unknown },
+	loopHadError: boolean,
+): Promise<string | null> {
+	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._goalContinuationSuppressed) {
+		return null;
+	}
+	let compiled: ReturnType<typeof compileSpecTasks>;
+	try {
+		compiled = await loadCompiledSpecForContinuation(active.narratorId);
+	} catch (err) {
+		logger.debug("Spec continuation skipped", {
+			narratorId: active.narratorId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return null;
+	}
+	const current = compiled.currentTask;
+	if (!current) {
+		const blocked = compiled.tasks.find((task) => task.status === "blocked");
+		if (!blocked) return null;
+		const prompt =
+			active.locale === "zh-CN"
+				? `Living Work Spec 阻塞提醒：当前有 blocked 任务仍处于活跃状态，不能视为完成。\n\n阻塞任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n请说明阻塞原因；如果需要用户决策或补充信息，请使用 AskUserQuestion 请求指导。收到指导后，再更新 spec://tasks.json。`
+				: `Living Work Spec blocked reminder: a blocked task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\nExplain the blocker. If user guidance or missing information is needed, use AskUserQuestion to request guidance. After guidance arrives, update spec://tasks.json.`;
+		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
+			{
+				type: "spec_blocked_continuation",
+				task: blocked.text,
+				protected: blocked.protected === true,
+			},
+		]);
+		broadcastToNarrator(active.narratorId, {
+			type: "message",
+			narratorId: active.narratorId,
+			message: {
+				id: msg.id,
+				narratorId: active.narratorId,
+				role: msg.role,
+				contentJson: msg.contentJson,
+				contentText: msg.contentText,
+				createdAt: msg.createdAt,
+				seq: msg.seq,
+				children: [],
+			},
+		});
+		active._goalContinuationTurn = true;
+		return prompt;
+	}
+	const protectedNote = current.protected
+		? "\nThis task is protected. Only mark it done after concrete completion evidence; protected completion requires taskReflection."
+		: "";
+	const prompt =
+		active.locale === "zh-CN"
+			? `Living Work Spec 自动续跑：继续当前 doing 任务。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请继续执行这个任务。完成或受阻时，更新 spec://tasks.json；如果没有 doing 任务但还有 todo，系统会自动切换到下一个 todo。不要要求用户再次确认是否继续。${current.protected ? "\n该任务是 protected task。只有在有具体验收证据时才能标记 done；完成 protected task 会触发 taskReflection。" : ""}`
+			: `Living Work Spec auto-continuation: continue the current doing task.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nContinue working on this task. When it is done or blocked, update spec://tasks.json. If there is no doing task but todo tasks remain, the system will automatically switch to the next todo. Do not ask the user whether to continue.${protectedNote}`;
+	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
+		{ type: "spec_continuation", task: current.text, protected: current.protected === true },
+	]);
+	broadcastToNarrator(active.narratorId, {
+		type: "message",
+		narratorId: active.narratorId,
+		message: {
+			id: msg.id,
+			narratorId: active.narratorId,
+			role: msg.role,
+			contentJson: msg.contentJson,
+			contentText: msg.contentText,
+			createdAt: msg.createdAt,
+			seq: msg.seq,
+			children: [],
+		},
+	});
+	active._goalContinuationTurn = true;
+	return prompt;
+}
+
 async function maybeStartGoalContinuation(
 	active: ActiveNarrator,
 	freshNarrator: { permissionMode?: string | null; traits?: unknown },
 	loopHadError: boolean,
 ): Promise<string | null> {
+	const specPrompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError);
+	if (specPrompt) return specPrompt;
 	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._goalContinuationSuppressed) {
 		return null;
 	}
@@ -1734,13 +1841,12 @@ export async function runAgentLoop(
 				},
 				getSideCars: async (request) => {
 					if (request.phase === "tool_result") {
-						const row = await narratorService.getById(narratorId);
-						const reminder = buildTodoToolResultReminder(row.todosJson, locale);
+						const reminder = await buildSpecToolResultReminder(narratorId, locale);
 						if (!reminder) return [];
 						return [
 							{
 								target: "tool_result" as const,
-								source: "todo_reminder",
+								source: "living_work_spec",
 								content: reminder,
 								toolUseId: request.toolUseId,
 							},
@@ -3408,9 +3514,6 @@ export async function startGoalContinuationIfPossible(
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status === "working" || narrator.status === "waiting") return { started: false };
 		if (isPlanModeTrait(narrator.traits)) return { started: false };
-		const goals = await narratorGoalService.listGoals(narratorId);
-		if (!goals.some((goal) => goal.status === "active")) return { started: false };
-
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 		active._goalContinuationSuppressed = false;

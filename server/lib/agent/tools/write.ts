@@ -2,8 +2,10 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
+import { specVfsService } from "../../../services/spec-vfs-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
+import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 
 export const writeTool: ToolDefinition = {
@@ -39,6 +41,24 @@ export const writeTool: ToolDefinition = {
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { file_path, content } = args as { file_path: string; content: string };
+		if (specVfsService.isSpecUri(file_path)) {
+			try {
+				const taskReflectionGranted = consumeTaskReflectionGrant(
+					ctx.narratorId,
+					ctx.currentToolUseId,
+				);
+				const file = await specVfsService.writeSpecFile(ctx.narratorId, file_path, content, {
+					sourceToolUseId: ctx.currentToolUseId ?? null,
+					allowProtectedTaskMutation: taskReflectionGranted,
+				});
+				return { output: `Wrote ${content.length} bytes to ${file.uri}`, title: file.uri };
+			} catch (err) {
+				return {
+					output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
 		const resolvedPath = resolve(ctx.cwd, file_path);
 		try {
 			// Detect existing file encoding before overwriting so we can preserve it

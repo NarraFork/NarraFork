@@ -828,7 +828,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				Math.max(0, centerIndex - DATA_RETAIN_DISTANCE),
 				Math.min(chunks.length - 1, centerIndex + DATA_RETAIN_DISTANCE),
 			);
-		}, [centerIndex, chunks, retainChunkRange]);
+		}, [centerIndex, chunks.length, retainChunkRange]);
 
 		// Measurement flush: write heights into ref, bump a version at most once per
 		// frame so spacer heights / prefix sums recompute without a measure loop.
@@ -1372,11 +1372,12 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			};
 		}, []);
 
+		const centerChunkForLoad = chunks[centerIndex];
+
 		// Ensure the mounted band's content is loaded whenever the window moves.
 		useEffect(() => {
-			const centerChunk = chunks[centerIndex];
-			if (centerChunk) ensureLoadedRef.current(centerChunk.id, PRELOAD_DISTANCE);
-		}, [chunks, centerIndex]);
+			if (centerChunkForLoad) ensureLoadedRef.current(centerChunkForLoad.id, PRELOAD_DISTANCE);
+		}, [centerChunkForLoad]);
 
 		// Reverse infinite scroll: expand the manifest window toward the top when the
 		// user scrolls near the start of the loaded history. Compensates scrollTop by

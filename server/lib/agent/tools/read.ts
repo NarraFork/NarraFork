@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { z } from "zod/v4";
+import { specVfsService } from "../../../services/spec-vfs-service";
 import { imageToBase64 } from "../../uploads";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText } from "./encoding";
@@ -119,6 +120,34 @@ export const readTool: ToolDefinition = {
 				: undefined;
 
 		const readAll = limit === -1;
+
+		if (specVfsService.isSpecUri(file_path)) {
+			try {
+				const file = await specVfsService.readSpecFile(ctx.narratorId, file_path);
+				const lines = file.content.split("\n");
+				const start = Math.max(0, (offset ?? 1) - 1);
+				const end = limit && limit !== -1 ? start + limit : lines.length;
+				const slice = lines.slice(start, end);
+				const numbered = formatNumberedLines(slice, start + 1);
+				return {
+					output: numbered || "(empty file)",
+					title: file.uri,
+					metadata: {
+						totalLines: lines.length,
+						readLines: slice.length,
+						readAll,
+						specPath: file.path,
+						readonly: file.readonly,
+						builtin: file.builtin,
+					},
+				};
+			} catch (err) {
+				return {
+					output: `Error reading ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
 
 		const resolvedPath = resolve(ctx.cwd, file_path);
 

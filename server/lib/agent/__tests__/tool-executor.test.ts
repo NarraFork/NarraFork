@@ -59,6 +59,34 @@ function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentC
 }
 
 describe("executeTool permission guard", () => {
+	test("treats spec task queue maintenance as read-only session state", () => {
+		expect(
+			resolvePermissionDecision({
+				toolName: "Write",
+				input: { file_path: "spec://tasks.json", content: "{}" },
+				permMode: "readOnly",
+				cwd: "/tmp/project",
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "Edit",
+				input: { file_path: "spec://tasks.json", old_string: "todo", new_string: "doing" },
+				permMode: "default",
+				cwd: "/tmp/project",
+				planMode: true,
+			}),
+		).toBe("allow");
+		expect(
+			resolvePermissionDecision({
+				toolName: "TaskCreate",
+				input: { todos: [] },
+				permMode: "readOnly",
+				cwd: "/tmp/project",
+			}),
+		).toBe("allow");
+	});
+
 	test("does not execute unresolved dangerReflection permission results", async () => {
 		let executed = false;
 		const testTool: ToolDefinition = {
@@ -218,6 +246,32 @@ describe("relaxed plan reminder classifier", () => {
 		await expect(
 			shouldInjectRelaxedPlanToolReminder(
 				{ toolUseId: "tu-read", name: "Read", input: { file_path: "x.ts" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-task-create", name: "TaskCreate", input: { todos: [] } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-task-write",
+					name: "Write",
+					input: { file_path: "spec://tasks.json", content: "{}" },
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-task-edit",
+					name: "Edit",
+					input: { file_path: "spec://tasks.json", old_string: "todo", new_string: "doing" },
+				},
 				relaxedPlanConfig,
 			),
 		).resolves.toBe(false);

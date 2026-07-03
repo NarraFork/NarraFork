@@ -27,6 +27,10 @@ import {
 	portAllocations,
 	projects,
 	reviewConclusions,
+	specFileRevisions,
+	specNamespaceFiles,
+	specNamespaces,
+	specProtectedTasks,
 	terminals,
 	terminalTabs,
 	terminalViewState,
@@ -133,6 +137,65 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	whitelistCmds: many(narratorWhitelistCmds),
 	blacklistCmds: many(narratorBlacklistCmds),
 	bufferedMessages: many(narratorBufferedMessages),
+	specNamespace: one(specNamespaces, {
+		fields: [narrators.id],
+		references: [specNamespaces.narratorId],
+	}),
+}));
+
+export const specNamespacesRelations = relations(specNamespaces, ({ one, many }) => ({
+	narrator: one(narrators, { fields: [specNamespaces.narratorId], references: [narrators.id] }),
+	forkedFrom: one(specNamespaces, {
+		fields: [specNamespaces.forkedFromNamespaceId],
+		references: [specNamespaces.id],
+		relationName: "specNamespaceFork",
+	}),
+	forks: many(specNamespaces, { relationName: "specNamespaceFork" }),
+	files: many(specNamespaceFiles),
+	revisions: many(specFileRevisions),
+	protectedTasks: many(specProtectedTasks),
+}));
+
+export const specNamespaceFilesRelations = relations(specNamespaceFiles, ({ one }) => ({
+	namespace: one(specNamespaces, {
+		fields: [specNamespaceFiles.namespaceId],
+		references: [specNamespaces.id],
+	}),
+	revision: one(specFileRevisions, {
+		fields: [specNamespaceFiles.revisionId],
+		references: [specFileRevisions.id],
+	}),
+}));
+
+export const specFileRevisionsRelations = relations(specFileRevisions, ({ one, many }) => ({
+	namespace: one(specNamespaces, {
+		fields: [specFileRevisions.namespaceId],
+		references: [specNamespaces.id],
+	}),
+	parentRevision: one(specFileRevisions, {
+		fields: [specFileRevisions.parentRevisionId],
+		references: [specFileRevisions.id],
+		relationName: "specRevisionParent",
+	}),
+	childRevisions: many(specFileRevisions, { relationName: "specRevisionParent" }),
+	currentFiles: many(specNamespaceFiles),
+}));
+
+export const specProtectedTasksRelations = relations(specProtectedTasks, ({ one }) => ({
+	namespace: one(specNamespaces, {
+		fields: [specProtectedTasks.namespaceId],
+		references: [specNamespaces.id],
+	}),
+	firstRevision: one(specFileRevisions, {
+		fields: [specProtectedTasks.firstRevisionId],
+		references: [specFileRevisions.id],
+		relationName: "specProtectedTaskFirstRevision",
+	}),
+	lastRevision: one(specFileRevisions, {
+		fields: [specProtectedTasks.lastRevisionId],
+		references: [specFileRevisions.id],
+		relationName: "specProtectedTaskLastRevision",
+	}),
 }));
 
 export const narratorBufferedMessagesRelations = relations(narratorBufferedMessages, ({ one }) => ({

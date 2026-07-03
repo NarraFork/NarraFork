@@ -80,6 +80,7 @@ import {
 	bumpParentNarratorMessageVersion,
 	narratorPersistence,
 } from "./narrator-persistence";
+import { specVfsService } from "./spec-vfs-service";
 
 export {
 	enrichToolUseBlocks,
@@ -1240,6 +1241,7 @@ export const narratorService = {
 			return created;
 		});
 
+		await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
 		return newNarrator;
 	},
 
@@ -1532,6 +1534,7 @@ export const narratorService = {
 			return created;
 		});
 
+		await specVfsService.forkSpecNamespace(parentNarratorId, id);
 		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
 		broadcastToNarrator(parentNarratorId, {
 			type: "narrator_forked",

@@ -73,6 +73,12 @@ const CHUNK_EVICT_DELAY_MS = 30_000;
 type ReconcileMode = "diff" | "full";
 
 type ChunkRangeMeta = Pick<ChunkRangeResult, "pruneBoundaryMessageId" | "prunedPercent">;
+type ChunkIndexRange = { start: number; end: number };
+
+interface MergeLoadedOptions {
+	/** Keep already-complete chunk message arrays by reference during lazy loads. */
+	preserveCompleteExisting?: boolean;
+}
 
 function getChunkRangeMeta(range: ChunkRangeMeta): ChunkRangeMeta {
 	return {
@@ -194,16 +200,87 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	);
 
 	const mergeLoaded = useCallback(
-		(incoming: Map<string, TreeMessage[]>, meta?: ChunkRangeMeta | null) => {
+		(
+			incoming: Map<string, TreeMessage[]>,
+			meta?: ChunkRangeMeta | null,
+			options?: MergeLoadedOptions,
+		) => {
 			if (incoming.size === 0 && !meta) return;
 			for (const chunkId of incoming.keys()) cancelEviction(chunkId);
 			setState((prev) => {
-				const loaded = incoming.size > 0 ? new Map(prev.loaded) : prev.loaded;
-				for (const [chunkId, msgs] of incoming) loaded.set(chunkId, msgs);
-				return { ...prev, ...(meta ? getChunkRangeMeta(meta) : {}), loaded };
+				let loaded = prev.loaded;
+				const preserveCompleteExisting = options?.preserveCompleteExisting === true;
+				const manifestById = preserveCompleteExisting
+					? new Map(manifestRef.current.map((chunk) => [chunk.id, chunk]))
+					: null;
+
+				for (const [chunkId, msgs] of incoming) {
+					const chunk = manifestById?.get(chunkId);
+					if (chunk && isChunkComplete(prev.loaded, chunk)) continue;
+					if (loaded === prev.loaded) loaded = new Map(prev.loaded);
+					loaded.set(chunkId, msgs);
+				}
+
+				const metaPatch = meta ? getChunkRangeMeta(meta) : null;
+				const metaUnchanged =
+					!metaPatch ||
+					(prev.pruneBoundaryMessageId === metaPatch.pruneBoundaryMessageId &&
+						prev.prunedPercent === metaPatch.prunedPercent);
+				if (loaded === prev.loaded && metaUnchanged) return prev;
+				return { ...prev, ...(metaPatch ?? {}), loaded };
 			});
 		},
-		[cancelEviction],
+		[cancelEviction, isChunkComplete],
+	);
+
+	const loadManifestBands = useCallback(
+		async (
+			manifestChunks: ChunkManifestEntry[],
+			ranges: ChunkIndexRange[],
+			generation: number,
+		): Promise<{ incoming: Map<string, TreeMessage[]>; meta: ChunkRangeMeta | null } | null> => {
+			const incoming = new Map<string, TreeMessage[]>();
+			let meta: ChunkRangeMeta | null = null;
+			if (manifestChunks.length === 0 || ranges.length === 0) return { incoming, meta };
+
+			const merged = [...ranges]
+				.filter((r) => r.start <= r.end)
+				.sort((a, b) => a.start - b.start)
+				.reduce<ChunkIndexRange[]>((acc, range) => {
+					const last = acc[acc.length - 1];
+					if (last && range.start <= last.end + 1) {
+						last.end = Math.max(last.end, range.end);
+					} else {
+						acc.push({ ...range });
+					}
+					return acc;
+				}, []);
+
+			manifestRef.current = manifestChunks;
+			for (const rangeIdx of merged) {
+				for (
+					let subStart = rangeIdx.start;
+					subStart <= rangeIdx.end;
+					subStart += MAX_CHUNKS_PER_RANGE_REQUEST
+				) {
+					const subEnd = Math.min(rangeIdx.end, subStart + MAX_CHUNKS_PER_RANGE_REQUEST - 1);
+					const firstSeq = manifestChunks[subStart]?.firstSeq;
+					if (firstSeq == null) continue;
+					const range = await api.getNarratorChunks(narratorId, {
+						direction: "newer",
+						fromSeq: firstSeq - 1,
+						count: subEnd - subStart + 1,
+					});
+					if (generation !== loadGenerationRef.current) return null;
+					meta = getChunkRangeMeta(range);
+					for (const [chunkId, messages] of regroup(range.messages)) {
+						incoming.set(chunkId, messages);
+					}
+				}
+			}
+			return { incoming, meta };
+		},
+		[narratorId, regroup],
 	);
 
 	// --- rAF-batched chunk-map updater (chunk-mode scheduleCacheUpdate) ---
@@ -355,55 +432,49 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			const start = Math.max(0, centerIdx - radius);
 			const end = Math.min(manifest.length - 1, centerIdx + radius);
 
-			// Find chunks that are missing. If they are already loading, wait for the
-			// existing promise instead of returning early; jump callers depend on this
-			// promise resolving before they start looking for the target DOM node.
+			// Find missing contiguous ranges. If a missing chunk is already loading,
+			// wait for that promise instead of issuing a duplicate request; jump callers
+			// depend on this promise resolving before looking for target DOM nodes.
 			const loaded = loadedRef.current;
-			const missing: ChunkManifestEntry[] = [];
+			const missingRanges: ChunkIndexRange[] = [];
 			const existingLoads = new Set<Promise<void>>();
+			let rangeStart: number | null = null;
 			for (let i = start; i <= end; i++) {
-				const c = manifest[i];
-				if (isChunkComplete(loaded, c)) continue;
-				const inFlight = inFlightRef.current.get(c.id);
-				if (inFlight) {
-					existingLoads.add(inFlight);
-				} else {
-					missing.push(c);
+				const chunk = manifest[i];
+				const missing = !isChunkComplete(loaded, chunk);
+				const inFlight = missing ? inFlightRef.current.get(chunk.id) : undefined;
+				if (inFlight) existingLoads.add(inFlight);
+				const shouldLoad = missing && !inFlight;
+				if (shouldLoad && rangeStart == null) rangeStart = i;
+				if ((!shouldLoad || i === end) && rangeStart != null) {
+					missingRanges.push({ start: rangeStart, end: shouldLoad ? i : i - 1 });
+					rangeStart = null;
 				}
 			}
-			if (missing.length === 0) {
+			if (missingRanges.length === 0) {
 				await Promise.all(existingLoads);
 				return;
 			}
 
-			// Load the whole [start,end] band in one request anchored just before
-			// the first chunk's firstSeq (direction newer ⇒ seq >= firstSeq).
-			const firstSeq = manifest[start].firstSeq;
-			const bandChunkCount = end - start + 1;
 			const ownedChunkIds: string[] = [];
-			for (let i = start; i <= end; i++) ownedChunkIds.push(manifest[i].id);
+			for (const range of missingRanges) {
+				for (let i = range.start; i <= range.end; i++) ownedChunkIds.push(manifest[i].id);
+			}
 			const loadPromise = (async () => {
-				const range = await api.getNarratorChunks(narratorId, {
-					direction: "newer",
-					fromSeq: firstSeq - 1,
-					count: bandChunkCount,
-				});
-				if (generation !== loadGenerationRef.current) return;
-				mergeLoaded(regroup(range.messages), getChunkRangeMeta(range));
+				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
+				if (!bandResult || generation !== loadGenerationRef.current) return;
+				mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
 			})();
 			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
 			try {
-				// This request covers the whole band, including chunks that may already
-				// have another load in flight. A stale neighbouring request should not make
-				// this caller fail after the fresh band load succeeds.
-				await loadPromise;
+				await Promise.all([...existingLoads, loadPromise]);
 			} finally {
 				for (const id of ownedChunkIds) {
 					if (inFlightRef.current.get(id) === loadPromise) inFlightRef.current.delete(id);
 				}
 			}
 		},
-		[narratorId, regroup, mergeLoaded, isChunkComplete],
+		[loadManifestBands, mergeLoaded, isChunkComplete],
 	);
 
 	/**
@@ -493,56 +564,6 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	// first dirty band plus the tail band. Full reload is kept as a hard fallback.
 	const reconcileInFlightRef = useRef(false);
 	const reconcilePendingModeRef = useRef<ReconcileMode | null>(null);
-
-	const loadManifestBands = useCallback(
-		async (
-			manifestChunks: ChunkManifestEntry[],
-			ranges: Array<{ start: number; end: number }>,
-			generation: number,
-		): Promise<{ incoming: Map<string, TreeMessage[]>; meta: ChunkRangeMeta | null } | null> => {
-			const incoming = new Map<string, TreeMessage[]>();
-			let meta: ChunkRangeMeta | null = null;
-			if (manifestChunks.length === 0 || ranges.length === 0) return { incoming, meta };
-
-			const merged = [...ranges]
-				.filter((r) => r.start <= r.end)
-				.sort((a, b) => a.start - b.start)
-				.reduce<Array<{ start: number; end: number }>>((acc, range) => {
-					const last = acc[acc.length - 1];
-					if (last && range.start <= last.end + 1) {
-						last.end = Math.max(last.end, range.end);
-					} else {
-						acc.push({ ...range });
-					}
-					return acc;
-				}, []);
-
-			manifestRef.current = manifestChunks;
-			for (const rangeIdx of merged) {
-				for (
-					let subStart = rangeIdx.start;
-					subStart <= rangeIdx.end;
-					subStart += MAX_CHUNKS_PER_RANGE_REQUEST
-				) {
-					const subEnd = Math.min(rangeIdx.end, subStart + MAX_CHUNKS_PER_RANGE_REQUEST - 1);
-					const firstSeq = manifestChunks[subStart]?.firstSeq;
-					if (firstSeq == null) continue;
-					const range = await api.getNarratorChunks(narratorId, {
-						direction: "newer",
-						fromSeq: firstSeq - 1,
-						count: subEnd - subStart + 1,
-					});
-					if (generation !== loadGenerationRef.current) return null;
-					meta = getChunkRangeMeta(range);
-					for (const [chunkId, messages] of regroup(range.messages)) {
-						incoming.set(chunkId, messages);
-					}
-				}
-			}
-			return { incoming, meta };
-		},
-		[narratorId, regroup],
-	);
 
 	const onStructuralDirty = useCallback(
 		(mode: ReconcileMode = "diff") => {
@@ -719,7 +740,7 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 			const loadPromise = (async () => {
 				const bandResult = await loadManifestBands(manifest, missingRanges, generation);
 				if (!bandResult || generation !== loadGenerationRef.current) return;
-				mergeLoaded(bandResult.incoming, bandResult.meta);
+				mergeLoaded(bandResult.incoming, bandResult.meta, { preserveCompleteExisting: true });
 			})();
 			for (const id of ownedChunkIds) inFlightRef.current.set(id, loadPromise);
 			try {
@@ -818,10 +839,34 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	});
 
 	// Expose chunks as the manifest full set, each with its loaded messages (if any).
-	const chunks = useMemo<ChunkData[]>(
-		() => state.manifest.map((c) => ({ ...c, messages: state.loaded.get(c.id) })),
-		[state.manifest, state.loaded],
-	);
+	// Reuse unchanged wrapper objects so ordinary loaded-map updates don't make
+	// every chunk look new to downstream memo/effect code.
+	const chunkDataCacheRef = useRef<Map<string, ChunkData>>(new Map());
+	const chunks = useMemo<ChunkData[]>(() => {
+		const cache = chunkDataCacheRef.current;
+		const liveIds = new Set<string>();
+		const next = state.manifest.map((entry) => {
+			liveIds.add(entry.id);
+			const messages = state.loaded.get(entry.id);
+			const cached = cache.get(entry.id);
+			if (
+				cached &&
+				cached.firstSeq === entry.firstSeq &&
+				cached.lastSeq === entry.lastSeq &&
+				cached.count === entry.count &&
+				cached.messages === messages
+			) {
+				return cached;
+			}
+			const chunk: ChunkData = { ...entry, messages };
+			cache.set(entry.id, chunk);
+			return chunk;
+		});
+		for (const id of cache.keys()) {
+			if (!liveIds.has(id)) cache.delete(id);
+		}
+		return next;
+	}, [state.manifest, state.loaded]);
 
 	const tailChunkId =
 		state.manifest.length > 0 ? state.manifest[state.manifest.length - 1].id : null;

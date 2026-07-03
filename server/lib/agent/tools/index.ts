@@ -33,6 +33,7 @@ import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
 import { agentTool } from "./task";
+import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
 import { taskCreateTool } from "./todo";
@@ -131,6 +132,8 @@ const coreProvider: ToolProvider = {
 			exitPlanReviseTool,
 			goalCompleteConfirmTool,
 			goalCompleteReviseTool,
+			taskReflectConfirmTool,
+			taskReflectReviseTool,
 		];
 	},
 };

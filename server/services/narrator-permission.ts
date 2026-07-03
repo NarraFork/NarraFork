@@ -57,6 +57,8 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 } from "./narrator-session-state";
+import { SPEC_TASKS_PATH } from "./spec-task-service";
+import { specVfsService } from "./spec-vfs-service";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
 import {
 	getConclusionEntry,
@@ -275,6 +277,21 @@ function resolveChapterGitIssueDecision(effectiveMode: string): "allow" | "deny"
 	return "ask";
 }
 
+function isSpecTasksPath(value: unknown): boolean {
+	if (!specVfsService.isSpecUri(value)) return false;
+	try {
+		return specVfsService.normalizeSpecPath(value) === SPEC_TASKS_PATH;
+	} catch {
+		return false;
+	}
+}
+
+function isTaskStateMaintenanceTool(toolName: string, input: Record<string, unknown>): boolean {
+	if (toolName === "TaskCreate") return true;
+	if (toolName !== "Write" && toolName !== "Edit") return false;
+	return isSpecTasksPath(input.file_path);
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -310,6 +327,10 @@ export function resolvePermissionDecision(
 		if (meta) meta.blacklistReason = protectedPathReason;
 		return "deny";
 	}
+
+	// Task queue maintenance is session metadata, not a project/worktree write. Keep it
+	// available in read-only/exploration flows just like the legacy TaskCreate/TodoWrite path.
+	if (isTaskStateMaintenanceTool(toolName, input)) return "allow";
 
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileId) {

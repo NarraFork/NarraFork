@@ -1,5 +1,12 @@
 import { resolve } from "node:path";
 import { scanToolOutputForKnowledge } from "../../services/knowledge-injection";
+import {
+	buildSpecTasksDocumentFromLegacyTodos,
+	parseSpecTasksDocument,
+	SPEC_TASKS_PATH,
+	serializeSpecTasksDocument,
+} from "../../services/spec-task-service";
+import { specVfsService } from "../../services/spec-vfs-service";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
 import { logger } from "../logger";
@@ -27,7 +34,7 @@ import { executeTool, sanitizeBrokenInput, type ToolExecResult } from "./tool-ex
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
-import { findReplaceMatch } from "./tools/edit";
+import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
 import {
 	cancelExitPlanReflection,
@@ -48,6 +55,14 @@ import {
 	grantGoalCompletionReflection,
 	markGoalCompletionReflectionStarted,
 } from "./tools/goal-reflection";
+import {
+	cleanupTaskReflection,
+	consumeTaskReflectionGrant,
+	createTaskReflectionDecision,
+	grantTaskReflection,
+	TASK_REFLECTION_TOOLS,
+	type TaskReflectionDecision,
+} from "./tools/task-reflection";
 import type {
 	AgentConfig,
 	AgentEvent,
@@ -433,12 +448,25 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 
 const RELAXED_PLAN_READ_ONLY_SUBAGENTS = new Set(["explore", "plan"]);
 
+function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
+	if (tu.name === "TaskCreate") return true;
+	if (tu.name !== "Write" && tu.name !== "Edit") return false;
+	const filePath = typeof tu.input.file_path === "string" ? tu.input.file_path : null;
+	if (!filePath || !specVfsService.isSpecUri(filePath)) return false;
+	try {
+		return specVfsService.normalizeSpecPath(filePath) === SPEC_TASKS_PATH;
+	} catch {
+		return false;
+	}
+}
+
 export async function shouldInjectRelaxedPlanToolReminder(
 	tu: AgentToolUse,
 	config: Pick<AgentConfig, "planMode" | "relaxedPlan" | "cwd" | "chapterId">,
 ): Promise<boolean> {
 	if (!config.planMode || !config.relaxedPlan) return false;
 	if (RELAXED_PLAN_READ_ONLY_TOOLS.has(tu.name)) return false;
+	if (isTaskStateMaintenanceToolUse(tu)) return false;
 
 	if (tu.name === "Agent" || tu.name === "Task") {
 		const subagentType =
@@ -491,6 +519,7 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"NarraForkAdmin",
 	"ForkNarrator",
 	"UpdateGoal",
+	"TaskCreate",
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
@@ -784,6 +813,18 @@ function buildGoalCompletionReflectionPrompt(
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
 		.replaceAll("{activeGoalJson}", JSON.stringify(activeGoal, null, 2))
 		.replaceAll("{goalsJson}", JSON.stringify(goals, null, 2));
+}
+
+function buildTaskReflectionPrompt(
+	requestId: string,
+	input: Record<string, unknown>,
+	mutations: unknown[],
+	locale: Locale,
+): string {
+	if (locale === "zh-CN") {
+		return `你正在进行 taskReflection。主叙述者准备修改 spec://tasks.json 中的 protected task。\n\n请求 ID：${requestId}\n\n工具输入：\n${JSON.stringify(input, null, 2)}\n\n受影响的 protected task：\n${JSON.stringify(mutations, null, 2)}\n\n请只调用一个工具：\n- 如果有具体证据证明这些 protected task 已完成，或删除/替换不会削弱用户意图，调用 TaskReflectConfirm。\n- 如果证据不足、任务未完成，或变更会削弱用户意图，调用 TaskReflectRevise。\n\n必须保守处理用户意愿：不能因为任务看起来麻烦就完成、删除或改写 protected task。`;
+	}
+	return `You are running taskReflection. The main narrator is about to change protected task(s) in spec://tasks.json.\n\nRequest ID: ${requestId}\n\nTool input:\n${JSON.stringify(input, null, 2)}\n\nAffected protected task mutations:\n${JSON.stringify(mutations, null, 2)}\n\nCall exactly one tool:\n- TaskReflectConfirm only if there is concrete evidence that the protected task is complete, or that the delete/replacement is necessary and does not weaken user intent.\n- TaskReflectRevise if evidence is missing, the task is not complete, or the change weakens user intent.\n\nBe conservative about user intent: protected tasks must not be completed, deleted, or rewritten merely because they are inconvenient.`;
 }
 
 export interface ReflectionLoopRunOptions {
@@ -1092,6 +1133,37 @@ async function runGoalCompletionReflectionLoop(
 		abortController: reflectionAbort,
 		maxTurns: 1,
 		label: "Goal-completion reflection loop",
+	});
+}
+
+async function runTaskReflectionLoop(
+	parentConfig: AgentConfig,
+	history: unknown[],
+	requestId: string,
+	toolUse: AgentToolUse,
+	input: Record<string, unknown>,
+	mutations: unknown[],
+	reflectionAbort: AbortController,
+): Promise<void> {
+	const locale = (parentConfig.locale as Locale) ?? "en";
+	await runReflectionLoop({
+		parentConfig,
+		history,
+		prompt: buildTaskReflectionPrompt(requestId, input, mutations, locale),
+		reflectionLoop: {
+			allowedTools: [...TASK_REFLECTION_TOOLS],
+			context: {
+				kind: "taskReflection",
+				requestId,
+				toolUseId: toolUse.toolUseId,
+				data: {
+					toolName: toolUse.name,
+				},
+			},
+		},
+		abortController: reflectionAbort,
+		maxTurns: 1,
+		label: "Task reflection loop",
 	});
 }
 
@@ -1404,6 +1476,70 @@ export function shouldRunGoalCompletionReflection(
 	return !config.reflectionLoop;
 }
 
+export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
+	return !config.reflectionLoop;
+}
+
+function normalizeEditText(text: string): string {
+	return text.replaceAll("\r\n", "\n");
+}
+
+async function buildSpecTasksCandidateContent(
+	narratorId: string,
+	toolUse: AgentToolUse,
+): Promise<string | null> {
+	const input = toolUse.input as Record<string, unknown>;
+	if (toolUse.name === "TaskCreate") {
+		const todos = Array.isArray(input.todos) ? input.todos : null;
+		if (!todos) return null;
+		try {
+			const current = await specVfsService.readTasksFileForNarrator(narratorId);
+			const currentDocument = parseSpecTasksDocument(current.content);
+			const nextDocument = buildSpecTasksDocumentFromLegacyTodos(todos, currentDocument);
+			return serializeSpecTasksDocument(nextDocument);
+		} catch (err) {
+			logger.debug("Skipping taskReflection preflight for TaskCreate candidate", {
+				toolUseId: toolUse.toolUseId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return null;
+		}
+	}
+	const filePath = typeof input.file_path === "string" ? input.file_path : null;
+	if (!filePath || !specVfsService.isSpecUri(filePath)) return null;
+	let specPath: string;
+	try {
+		specPath = specVfsService.normalizeSpecPath(filePath);
+	} catch {
+		return null;
+	}
+	if (specPath !== "tasks.json") return null;
+	if (toolUse.name === "Write") {
+		return typeof input.content === "string" ? input.content : null;
+	}
+	if (toolUse.name !== "Edit") return null;
+	const oldString = typeof input.old_string === "string" ? input.old_string : null;
+	const newString = typeof input.new_string === "string" ? input.new_string : null;
+	const replaceAll = input.replace_all === true;
+	if (oldString == null || newString == null) return null;
+	if (oldString === "") return normalizeEditText(newString);
+	try {
+		const current = await specVfsService.readSpecFile(narratorId, filePath);
+		return applyEditReplacement(
+			normalizeEditText(current.content),
+			normalizeEditText(oldString),
+			normalizeEditText(newString),
+			replaceAll,
+		).content;
+	} catch (err) {
+		logger.debug("Skipping taskReflection preflight because candidate edit could not be built", {
+			toolUseId: toolUse.toolUseId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return null;
+	}
+}
+
 function buildExitPlanReflectionDeniedToolResult(
 	decision: ExitPlanReflectionDecision,
 	locale: Locale,
@@ -1446,6 +1582,91 @@ function buildGoalCompletionReflectionDeniedToolResult(
 		durationMs: 0,
 		completedAt: Date.now(),
 	};
+}
+
+function buildTaskReflectionDeniedToolResult(
+	decision: TaskReflectionDecision,
+	locale: Locale,
+): ToolExecResult {
+	const feedback =
+		decision.action === "revise" && decision.feedback.trim()
+			? decision.feedback.trim()
+			: "Task reflection found that the protected task change is not justified.";
+	const nextSteps =
+		decision.action === "revise" && decision.nextSteps?.trim()
+			? decision.nextSteps.trim()
+			: "Continue working and only modify protected tasks after concrete evidence supports the change.";
+	const output =
+		locale === "zh-CN"
+			? `任务反思认为 protected task 不能这样修改。\n\n反馈：${feedback}\n\n下一步：${nextSteps}`
+			: `Task reflection decided the protected task change should not proceed.\n\nFeedback: ${feedback}\n\nNext steps: ${nextSteps}`;
+	return { output, isError: true, durationMs: 0, completedAt: Date.now() };
+}
+
+async function resolveTaskReflection(
+	config: AgentConfig,
+	history: unknown[],
+	toolUse: AgentToolUse,
+	candidateContent: string,
+): Promise<{ decision: TaskReflectionDecision; input: Record<string, unknown> } | null> {
+	const input = toolUse.input as Record<string, unknown>;
+	const filePath = typeof input.file_path === "string" ? input.file_path : "spec://tasks.json";
+	const analysis = await specVfsService.analyzeSpecWriteCandidate(
+		config.narratorId,
+		filePath,
+		candidateContent,
+	);
+	if (analysis.protectedMutations.length === 0) return null;
+
+	const requestId = `task_reflect_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const reflectionAbort = new AbortController();
+	const decisionPromise = createTaskReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: input,
+		mutations: analysis.protectedMutations,
+	});
+	let reflectionDone = false;
+	const reflectionPromise = runTaskReflectionLoop(
+		config,
+		history,
+		requestId,
+		toolUse,
+		input,
+		analysis.protectedMutations,
+		reflectionAbort,
+	)
+		.catch((err) => {
+			logger.warn("Task reflection loop ended unexpectedly", { err: String(err) });
+		})
+		.finally(() => {
+			reflectionDone = true;
+		});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise.then(async () => {
+			const alreadySettled = await Promise.race<TaskReflectionDecision | null>([
+				decisionPromise,
+				Promise.resolve(null),
+			]);
+			const fallbackDecision: TaskReflectionDecision = {
+				action: "revise",
+				feedback:
+					"taskReflection loop did not call TaskReflectConfirm or TaskReflectRevise in its single allowed response.",
+				nextSteps:
+					"Review the protected task, gather concrete evidence, and try the tasks.json change again only if it remains justified.",
+			};
+			return alreadySettled ?? fallbackDecision;
+		}),
+	]);
+	if (!reflectionDone) {
+		reflectionPromise.catch((err) => {
+			logger.warn("Task reflection loop cleanup failed", { err: String(err) });
+		});
+	}
+	cleanupTaskReflection(requestId);
+	return { decision, input };
 }
 
 async function executeToolAfterReflections(
@@ -1496,6 +1717,34 @@ async function executeToolAfterReflections(
 		}
 		grantGoalCompletionReflection(config.narratorId, tu.toolUseId);
 		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
+	}
+	if (
+		(tu.name === "Write" || tu.name === "Edit" || tu.name === "TaskCreate") &&
+		shouldRunTaskReflection(config)
+	) {
+		const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
+		if (candidateContent != null) {
+			try {
+				const reflected = await resolveTaskReflection(config, history, tu, candidateContent);
+				if (reflected) {
+					tu.input = reflected.input;
+					if (reflected.decision.action !== "confirm") {
+						return buildTaskReflectionDeniedToolResult(reflected.decision, locale);
+					}
+					grantTaskReflection(config.narratorId, tu.toolUseId);
+					try {
+						return await executeTool(tu, config);
+					} finally {
+						consumeTaskReflectionGrant(config.narratorId, tu.toolUseId);
+					}
+				}
+			} catch (err) {
+				logger.debug("Skipping taskReflection preflight", {
+					toolUseId: tu.toolUseId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 	}
 	return executeTool(tu, config);
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { deepMerge } from "../../../server/lib/settings";
+import { deepMerge, stripObsoleteSettingsKeys } from "../../../server/lib/settings";
 
 describe("settings deepMerge", () => {
 	it("merges nested objects", () => {
@@ -33,5 +33,22 @@ describe("settings deepMerge", () => {
 		expect(result.a).toBe(2);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect((result as any).unknown).toBe("foo");
+	});
+});
+
+describe("stripObsoleteSettingsKeys", () => {
+		const value: Record<string, unknown> = {
+			customApiProviders: [],
+			nugProviders: [],
+		};
+
+		expect(stripObsoleteSettingsKeys(value)).toBe(true);
+		expect(value).toEqual({ customApiProviders: [], nugProviders: [] });
+	});
+
+		const value: Record<string, unknown> = { customApiProviders: [] };
+
+		expect(stripObsoleteSettingsKeys(value)).toBe(false);
+		expect(value).toEqual({ customApiProviders: [] });
 	});
 });

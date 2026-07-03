@@ -33,6 +33,7 @@ import {
 	purgeStaleAgentModelRefs,
 	saveSettings,
 	settings,
+	stripObsoleteSettingsKeys,
 } from "../lib/settings";
 import {
 	blacklistDirEntrySchema,
@@ -450,6 +451,7 @@ const updateSettingsSchema = z
 function normalizeLegacySettingsPatch(body: unknown): unknown {
 	if (!body || typeof body !== "object" || Array.isArray(body)) return body;
 	const draft = { ...(body as Record<string, unknown>) };
+	stripObsoleteSettingsKeys(draft);
 	const rawAgent = draft.agent;
 	if (rawAgent && typeof rawAgent === "object" && !Array.isArray(rawAgent)) {
 		const agent = { ...(rawAgent as Record<string, unknown>) };
@@ -577,8 +579,10 @@ function buildSettingsResponse(
 	extra?: { serverRestarting?: boolean; newUrl?: string },
 ) {
 	const codexManager = getCodexManager();
+	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
+	stripObsoleteSettingsKeys(safeSource);
 	return {
-		...source,
+		...safeSource,
 		// Mask TLS passphrase
 		server: {
 			...source.server,

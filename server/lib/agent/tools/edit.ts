@@ -1,8 +1,10 @@
 import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
+import { specVfsService } from "../../../services/spec-vfs-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
+import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 
 // ── Replacer types & implementations ────────────────────────────
@@ -444,6 +446,58 @@ export const editTool: ToolDefinition = {
 			new_string: string;
 			replace_all?: boolean;
 		};
+
+		if (specVfsService.isSpecUri(file_path)) {
+			try {
+				if (old_string === new_string) {
+					return {
+						output: "No changes to apply: old_string and new_string are identical.",
+						isError: true,
+					};
+				}
+				const current =
+					old_string === "" ? null : await specVfsService.readSpecFile(ctx.narratorId, file_path);
+				const rawContent = current?.content ?? "";
+				const content = normalizeLineEndings(rawContent);
+				const normalizedOld = normalizeLineEndings(old_string);
+				const normalizedNew = normalizeLineEndings(new_string);
+				const result =
+					old_string === ""
+						? { content: normalizedNew, startLine: 1 }
+						: replace(content, normalizedOld, normalizedNew, replace_all);
+				const taskReflectionGranted = consumeTaskReflectionGrant(
+					ctx.narratorId,
+					ctx.currentToolUseId,
+				);
+				const written = await specVfsService.writeSpecFile(
+					ctx.narratorId,
+					file_path,
+					result.content,
+					{
+						sourceToolUseId: ctx.currentToolUseId ?? null,
+						allowProtectedTaskMutation: taskReflectionGranted,
+					},
+				);
+				const oldLines = normalizedOld.split("\n").length;
+				const newLines = normalizedNew.split("\n").length;
+				return {
+					output:
+						old_string === "" ? `Created/overwritten ${written.uri}` : `Edited ${written.uri}`,
+					title: written.uri,
+					metadata: {
+						startLine: result.startLine,
+						endLine: result.startLine + oldLines - 1,
+						newEndLine: result.startLine + newLines - 1,
+						specPath: written.path,
+					},
+				};
+			} catch (err) {
+				return {
+					output: `Error editing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
 
 		const resolvedPath = resolve(ctx.cwd, file_path);
 

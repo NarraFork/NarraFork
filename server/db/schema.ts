@@ -358,6 +358,112 @@ export const narratorGoals = sqliteTable(
 	],
 );
 
+// === spec_namespaces ===
+export const specNamespaces = sqliteTable(
+	"spec_namespaces",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		forkedFromNamespaceId: text("forked_from_namespace_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: self reference
+			(): any => specNamespaces.id,
+			{ onDelete: "set null" },
+		),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_spec_namespaces_narrator").on(table.narratorId),
+		index("idx_spec_namespaces_forked_from").on(table.forkedFromNamespaceId),
+	],
+);
+
+// === spec_file_revisions ===
+export const specFileRevisions = sqliteTable(
+	"spec_file_revisions",
+	{
+		id: text("id").primaryKey(),
+		namespaceId: text("namespace_id")
+			.notNull()
+			.references(() => specNamespaces.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		parentRevisionId: text("parent_revision_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: self reference
+			(): any => specFileRevisions.id,
+			{ onDelete: "set null" },
+		),
+		sourceToolUseId: text("source_tool_use_id"),
+		sourceMessageId: text("source_message_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
+			(): any => narratorMessages.id,
+			{ onDelete: "set null" },
+		),
+		createdBy: text("created_by", { enum: ["system", "user", "assistant"] })
+			.notNull()
+			.default("assistant"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_spec_file_revisions_namespace_path").on(table.namespaceId, table.path),
+		index("idx_spec_file_revisions_parent").on(table.parentRevisionId),
+	],
+);
+
+// === spec_namespace_files ===
+export const specNamespaceFiles = sqliteTable(
+	"spec_namespace_files",
+	{
+		id: text("id").primaryKey(),
+		namespaceId: text("namespace_id")
+			.notNull()
+			.references(() => specNamespaces.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		revisionId: text("revision_id").references(() => specFileRevisions.id, {
+			onDelete: "set null",
+		}),
+		deleted: integer("deleted", { mode: "boolean" }).notNull().default(false),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_spec_namespace_files_namespace_path").on(table.namespaceId, table.path),
+		index("idx_spec_namespace_files_revision").on(table.revisionId),
+	],
+);
+
+// === spec_protected_tasks ===
+export const specProtectedTasks = sqliteTable(
+	"spec_protected_tasks",
+	{
+		id: text("id").primaryKey(),
+		namespaceId: text("namespace_id")
+			.notNull()
+			.references(() => specNamespaces.id, { onDelete: "cascade" }),
+		textHash: text("text_hash").notNull(),
+		text: text("text").notNull(),
+		status: text("status", { enum: ["todo", "doing", "done", "blocked", "deleted"] })
+			.notNull()
+			.default("todo"),
+		firstRevisionId: text("first_revision_id").references(() => specFileRevisions.id, {
+			onDelete: "set null",
+		}),
+		lastRevisionId: text("last_revision_id").references(() => specFileRevisions.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		completedAt: text("completed_at"),
+		deletedAt: text("deleted_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_spec_protected_tasks_namespace_hash").on(table.namespaceId, table.textHash),
+		index("idx_spec_protected_tasks_namespace_status").on(table.namespaceId, table.status),
+	],
+);
+
 // === narrator_messages ===
 export const narratorMessages = sqliteTable(
 	"narrator_messages",

@@ -1,5 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
+import { specVfsService } from "../../../services/spec-vfs-service";
 import { isRgAvailable, RG_INSTALL_HINT, resolveRgPath } from "../../ripgrep";
 import { settings } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -10,6 +11,101 @@ export { isRgAvailable };
 const MAX_GREP_OUTPUT_BYTES = 10 * 1024 * 1024;
 /** Hard timeout for a single ripgrep invocation. Kills the process when elapsed. */
 const GREP_TIMEOUT_MS = 30_000;
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function matchesSimpleGlob(path: string, globPattern?: string): boolean {
+	if (!globPattern) return true;
+	const regex = new RegExp(
+		`^${escapeRegex(globPattern)
+			.replace(/\\\*\\\*/g, ".*")
+			.replace(/\\\*/g, "[^/]*")}$`,
+	);
+	return regex.test(path);
+}
+
+async function grepSpecFiles(args: {
+	narratorId: string;
+	pattern: string;
+	path?: string;
+	glob?: string;
+	outputMode: "content" | "files_with_matches" | "count";
+	showLineNumbers: boolean;
+	caseInsensitive?: boolean;
+	headLimit: number;
+	offset: number;
+	multiline?: boolean;
+}): Promise<ToolResult> {
+	let regex: RegExp;
+	try {
+		regex = new RegExp(
+			args.pattern,
+			`${args.caseInsensitive ? "i" : ""}${args.multiline ? "s" : ""}`,
+		);
+	} catch (err) {
+		return {
+			output: `Invalid regex: ${err instanceof Error ? err.message : String(err)}`,
+			isError: true,
+		};
+	}
+
+	let files = await specVfsService.listSpecFiles(args.narratorId);
+	if (args.path && args.path !== "spec://") {
+		const path = specVfsService.normalizeSpecPath(args.path);
+		files = files.filter((file) => file.path === path || file.path.startsWith(`${path}/`));
+	}
+	files = files.filter((file) => matchesSimpleGlob(file.path, args.glob));
+
+	const lines: string[] = [];
+	for (const file of files) {
+		if (args.multiline) {
+			const matched = regex.test(file.content);
+			regex.lastIndex = 0;
+			if (!matched) continue;
+			if (args.outputMode === "files_with_matches") lines.push(file.uri);
+			else if (args.outputMode === "count") lines.push(`${file.uri}:1`);
+			else lines.push(`${file.uri}:1:${file.content.split("\n")[0] ?? ""}`);
+			continue;
+		}
+
+		const fileLines = file.content.split(/\r?\n/);
+		const matches: string[] = [];
+		fileLines.forEach((line, index) => {
+			const matched = regex.test(line);
+			regex.lastIndex = 0;
+			if (!matched) return;
+			matches.push(
+				args.showLineNumbers ? `${file.uri}:${index + 1}:${line}` : `${file.uri}:${line}`,
+			);
+		});
+		if (matches.length === 0) continue;
+		if (args.outputMode === "files_with_matches") lines.push(file.uri);
+		else if (args.outputMode === "count") lines.push(`${file.uri}:${matches.length}`);
+		else lines.push(...matches);
+	}
+
+	let outputLines = lines;
+	if (args.offset > 0) outputLines = outputLines.slice(args.offset);
+	const truncated = args.headLimit > 0 && outputLines.length > args.headLimit;
+	if (args.headLimit > 0) outputLines = outputLines.slice(0, args.headLimit);
+	if (outputLines.length === 0) {
+		return {
+			output: "No matches found",
+			title: args.pattern,
+			metadata: { matches: 0, truncated: false },
+		};
+	}
+	const suffix = truncated
+		? `\n(Results limited to ${args.headLimit} entries. ${lines.length - args.offset - args.headLimit} more available.)`
+		: "";
+	return {
+		output: outputLines.join("\n") + suffix,
+		title: args.pattern,
+		metadata: { matches: lines.length, truncated },
+	};
+}
 
 /**
  * Drain a byte stream up to `maxBytes`, invoking `onLimit` once the cap is hit
@@ -202,11 +298,6 @@ export const grepTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const rgPath = await resolveRgPath();
-		if (!rgPath) {
-			return { output: RG_INSTALL_HINT, isError: true };
-		}
-
 		const {
 			pattern,
 			path: searchPathArg,
@@ -241,6 +332,26 @@ export const grepTool: ToolDefinition = {
 
 		if (!pattern) {
 			return { output: "pattern is required", isError: true };
+		}
+
+		if (searchPathArg && specVfsService.isSpecUri(searchPathArg)) {
+			return grepSpecFiles({
+				narratorId: ctx.narratorId,
+				pattern,
+				path: searchPathArg,
+				glob: globPattern,
+				outputMode,
+				showLineNumbers,
+				caseInsensitive,
+				headLimit,
+				offset,
+				multiline,
+			});
+		}
+
+		const rgPath = await resolveRgPath();
+		if (!rgPath) {
+			return { output: RG_INSTALL_HINT, isError: true };
 		}
 
 		let searchPath = searchPathArg ?? ctx.cwd;

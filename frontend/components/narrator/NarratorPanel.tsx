@@ -3999,7 +3999,10 @@ export function NarratorPanel({
 
 	const activeTodo = useMemo(() => {
 		if (!Array.isArray(currentTodos) || !currentTodos.length) return null;
-		return currentTodos.find((t: TodoItem) => t.status === "in_progress") ?? null;
+		return (
+			currentTodos.find((t: TodoItem) => t.status === "in_progress" || t.status === "blocked") ??
+			null
+		);
 	}, [currentTodos]);
 
 	// --- Image management ---
