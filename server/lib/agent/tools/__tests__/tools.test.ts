@@ -101,20 +101,27 @@ describe("Read", () => {
 		expect(result.isError).toBe(true);
 	});
 
-	test("limit=-1 bypasses loop truncation for large files", async () => {
+	test("limit=-1 bypasses the default large-file line cap", async () => {
 		const target = join(TEST_DIR, "read-force-full.txt");
-		const content = "0123456789".repeat(7000); // 70KB
-		writeFileSync(target, content);
+		// 3000 short lines — more than the 2000-line default auto-limit, but well
+		// under the ~100k char read-all cap. read-all must return every line
+		// without a line-count truncation suffix.
+		const lines = Array.from({ length: 3000 }, (_, i) => `row ${i}`);
+		writeFileSync(target, lines.join("\n"));
 
 		const result = await readTool.execute(
 			{ file_path: "read-force-full.txt", limit: -1 },
 			makeCtx(),
 		);
 		expect(result.isError).toBeFalsy();
-		expect(result.truncated).toBe(true);
-		expect(result.output).toContain("0123456789");
-		expect(result.output).not.toContain("truncated");
+		expect(result.output).toContain("row 0");
+		expect(result.output).toContain("row 2999");
+		// No per-line "[line truncated, … chars total]" marker (short lines) and no
+		// "output limited to N lines" suffix (read-all ignores the line cap).
+		expect(result.output).not.toContain("line truncated");
+		expect(result.output).not.toContain("output limited to");
 		expect(result.metadata?.readAll).toBe(true);
+		expect(result.metadata?.readLines).toBe(3000);
 	});
 
 	test("limit=-1 caps output at ~100k chars", async () => {
@@ -131,7 +138,7 @@ describe("Read", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.output.length).toBeLessThanOrEqual(110_000); // some slack for the suffix
 		expect(result.output).toContain("output capped at");
-		expect(result.output).toContain("Use offset/limit to read the rest");
+		expect(result.output).toContain("Use offset/limit to read a smaller range");
 	});
 
 	test("limit=-1 reads from offset to EOF", async () => {
@@ -143,9 +150,11 @@ describe("Read", () => {
 		expect(result.output).toContain("line two");
 		expect(result.output).toContain("line three");
 		expect(result.output).toContain("line four");
+		expect(result.output).toContain("line five");
 		expect(result.output).not.toContain("line one");
 		expect(result.truncated).toBe(true);
-		expect(result.metadata).toMatchObject({ readAll: true, readLines: 5 });
+		// offset=2 skips "line one", so read-all streams the remaining 4 lines.
+		expect(result.metadata).toMatchObject({ readAll: true, readLines: 4, startLine: 2 });
 	});
 });
 
@@ -1063,7 +1072,7 @@ describe("Agent tool rawJsonSchema", () => {
 		const props = schema.properties ?? {};
 		expect(props.reasoning_effort).toBeDefined();
 		expect(props.reasoning_effort?.type).toBe("string");
-		expect(props.reasoning_effort?.enum).toEqual(["none", "low", "medium", "high", "xhigh"]);
+		expect(props.reasoning_effort?.enum).toEqual(["none", "low", "medium", "high", "xhigh", "max"]);
 		expect(props.reasoning_effort?.description).toContain("ignored");
 	});
 
