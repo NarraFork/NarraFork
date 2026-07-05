@@ -148,7 +148,7 @@ function LicenseCards({ entries }: { entries: LicenseEntry[] }) {
 										</Text>
 									</Group>
 								</UnstyledButton>
-								<Collapse in={isOpen}>
+								<Collapse expanded={isOpen}>
 									{isOpen && (
 										<Box mt="xs">
 											<LicenseTextBlock text={dep.licenseText} />

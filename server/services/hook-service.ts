@@ -8,7 +8,10 @@ import { logger } from "../lib/logger";
 
 // === Types ===
 
-export type HookEvent = "PreToolUse" | "PostToolUse" | "Stop";
+export type HookEvent = "PreToolUse" | "PostToolUse" | "Stop" | "Attention" | "AttentionResolved";
+
+/** Reason carried by Attention / AttentionResolved events (mirrors event-bus). */
+export type AttentionReason = "waiting_permission" | "done" | "error";
 
 export interface HookInput {
 	hook_event_name: HookEvent;
@@ -29,6 +32,15 @@ export interface HookInput {
 	stop_error?: boolean;
 	/** Text of the final assistant message (or error message), truncated. */
 	last_assistant_text?: string;
+	/** Total wall-clock duration of the response turn, in milliseconds. */
+	duration_ms?: number;
+	/** Tokens consumed across the response turn (non-cached input + output). */
+	total_tokens?: number;
+	// Attention / AttentionResolved extras
+	/** Why the narrator needs (or needed) attention. Also used as the matcher key. */
+	attention_reason?: AttentionReason;
+	/** Extra context — e.g. the user's decision ("allow" / "deny") for a resolved permission. */
+	attention_detail?: string;
 }
 
 export interface HookResult {

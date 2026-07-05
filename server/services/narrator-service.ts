@@ -29,7 +29,7 @@ import {
 import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
 	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
-} from "../lib/agent/tools/index";
+} from "../lib/agent/tools/knowledge-kind";
 import { narratorHandleLock } from "../lib/async-mutex";
 import {
 	type BooleanOverride,
@@ -1642,6 +1642,8 @@ export const narratorService = {
 		narratorMessageQueries._getPostCompactTopLevelRefs.bind(narratorMessageQueries),
 	getCompactBoundaryMessage:
 		narratorMessageQueries.getCompactBoundaryMessage.bind(narratorMessageQueries),
+	getEmergencyCompactBoundaryMessage:
+		narratorMessageQueries.getEmergencyCompactBoundaryMessage.bind(narratorMessageQueries),
 	getRecentMessages: narratorMessageQueries.getRecentMessages.bind(narratorMessageQueries),
 	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
 	getChunkManifest: narratorMessageQueries.getChunkManifest.bind(narratorMessageQueries),

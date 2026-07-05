@@ -316,7 +316,7 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			</Group>
 
 			{/* Container panel collapse */}
-			<Collapse in={containerCapability.supported && containerPanelOpen && hasContainers}>
+			<Collapse expanded={containerCapability.supported && containerPanelOpen && hasContainers}>
 				<div
 					style={{
 						borderBottom: "1px solid var(--mantine-color-default-border)",

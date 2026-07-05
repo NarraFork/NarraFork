@@ -205,9 +205,10 @@ export async function runCustomCompact(
 	narratorId: string,
 	locale: Locale,
 	beforeMessageId?: string,
-	options?: { mode?: CompactMode },
+	options?: { mode?: CompactMode; appendHint?: string },
 ): Promise<boolean> {
 	const mode = options?.mode ?? "blocking";
+	const appendHint = options?.appendHint;
 	while (true) {
 		const existing = compactLocks.get(narratorId);
 		if (!existing) break;
@@ -261,13 +262,18 @@ export async function runCustomCompact(
 	const abortController = new AbortController();
 	let compactTimer: ReturnType<typeof setTimeout>;
 	const compactPromise: Promise<CompactLockResult> = Promise.race([
-		doRunCustomCompact(narratorId, locale, beforeMessageId, mode, abortController.signal).then(
-			(compacted) => ({
-				kind: "history" as const,
-				compacted,
-				mode: currentHistoryCompactMode(narratorId, mode),
-			}),
-		),
+		doRunCustomCompact(
+			narratorId,
+			locale,
+			beforeMessageId,
+			mode,
+			abortController.signal,
+			appendHint,
+		).then((compacted) => ({
+			kind: "history" as const,
+			compacted,
+			mode: currentHistoryCompactMode(narratorId, mode),
+		})),
 		new Promise<CompactLockResult>((_, reject) => {
 			compactTimer = setTimeout(
 				() => reject(new Error("Compact operation timed out after 5 minutes")),
@@ -306,6 +312,7 @@ async function doRunCustomCompact(
 	beforeMessageId: string | undefined,
 	mode: CompactMode,
 	signal?: AbortSignal,
+	appendHint?: string,
 ): Promise<boolean> {
 	logger.info("Starting custom compact", { narratorId, beforeMessageId, mode });
 
@@ -343,11 +350,15 @@ async function doRunCustomCompact(
 			signal,
 		);
 
+		// Append an optional emergency hint (e.g. context-overflow recovery) to the
+		// end of the summary so the next turn's system prompt carries it forward.
+		const finalSummary = appendHint ? `${summary}\n\n${appendHint}` : summary;
+
 		const finalizeMode = currentHistoryCompactMode(narratorId, mode);
 		const compactedMsg = await narratorService.finalizeCompactingMessage(
 			compactingMsg.id,
 			narratorId,
-			summary,
+			finalSummary,
 			contextPercent,
 			{ mode: finalizeMode },
 		);

@@ -161,7 +161,7 @@ function LearnPage() {
 				</Group>
 			</Paper>
 
-			<Grid gutter="md">
+			<Grid gap="md">
 				<Grid.Col span={{ base: 12, md: 4 }}>
 					<Card withBorder p={0} radius="lg" className="learn-panel learn-doc-list">
 						<Box p="md" pb="sm">

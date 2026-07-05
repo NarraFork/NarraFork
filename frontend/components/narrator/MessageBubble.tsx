@@ -49,7 +49,7 @@ import {
 	IconWorldSearch,
 	IconX,
 } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
 	createContext,
 	memo,
@@ -2137,7 +2137,7 @@ export const ReasoningBlock = memo(
 					expand/collapse animation with content unmount.
 				*/}
 					{!hasToggled.current && opened ? (
-						<Collapse in={opened}>{content}</Collapse>
+						<Collapse expanded={opened}>{content}</Collapse>
 					) : (
 						<LazyCollapse in={opened}>{content}</LazyCollapse>
 					)}
@@ -2157,6 +2157,29 @@ export const ReasoningBlock = memo(
 		);
 	},
 );
+
+type MessagesCacheMessage = { id?: string };
+type MessagesCachePage = { messages?: MessagesCacheMessage[] } & Record<string, unknown>;
+type MessagesCacheData = { pages?: MessagesCachePage[] } & Record<string, unknown>;
+
+function removeMessagesFromCache(qc: QueryClient, narratorId: string, deletedMessageIds: string[]) {
+	if (deletedMessageIds.length === 0) return;
+	const deletedSet = new Set(deletedMessageIds);
+	qc.setQueriesData({ queryKey: ["narrators", narratorId, "messages"] }, (old: unknown) => {
+		if (!old || typeof old !== "object") return old;
+		const data = old as MessagesCacheData;
+		if (!Array.isArray(data.pages)) return old;
+		let changed = false;
+		const pages = data.pages.map((page) => {
+			if (!Array.isArray(page.messages)) return page;
+			const messages = page.messages.filter((msg) => !msg.id || !deletedSet.has(msg.id));
+			if (messages.length === page.messages.length) return page;
+			changed = true;
+			return { ...page, messages };
+		});
+		return changed ? { ...data, pages } : old;
+	});
+}
 
 function ErrorNotice({
 	message,
@@ -2184,7 +2207,8 @@ function ErrorNotice({
 	const handleDismiss = async () => {
 		setDismissing(true);
 		try {
-			await api.dismissErrorMessage(narratorId, messageId);
+			const result = await api.dismissErrorMessage(narratorId, messageId);
+			removeMessagesFromCache(qc, narratorId, result.deletedMessageIds ?? [messageId]);
 			onDismiss?.();
 		} catch {
 			notifications.show({
@@ -2907,7 +2931,7 @@ function SegmentCompactIndicator({
 				)}
 			</Group>
 
-			<Collapse in={expanded}>
+			<Collapse expanded={expanded}>
 				<Paper
 					p="xs"
 					radius="sm"

@@ -56,6 +56,7 @@ import {
 	IconFile,
 	IconFileCode,
 	IconFolderPlus,
+	IconGitBranch,
 	IconGitFork,
 	IconGripVertical,
 	IconInfoCircle,
@@ -187,6 +188,7 @@ import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
 	loadDraftImageAttachments,
@@ -268,6 +270,9 @@ import {
 } from "./ToolCallCard";
 import { useNarratorChunks } from "./useNarratorChunks";
 import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
+
+type ModelComboboxItem = string | { value: string; label: string };
+type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
 
 function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
 	if (typeof value !== "string" || !value.trim()) return null;
@@ -935,7 +940,7 @@ function SetGlobalModelModal({
 					? ["__summary__"]
 					: [];
 		if (exclude.length === 0) return groupedModels;
-		return (groupedModels as ComboboxItemGroup[]).filter(
+		return (groupedModels as ModelComboboxItemGroup[]).filter(
 			(g) => !g.items?.some?.((i) => exclude.includes(typeof i === "string" ? i : i.value)),
 		);
 	}, [groupedModels, mode]);
@@ -2054,6 +2059,14 @@ function SortableQueuedMessageItem({
 					) : (
 						<Box w={16} h={16} style={{ flexShrink: 0 }} />
 					)}
+					{msg.imageCount > 0 && (
+						<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+							<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
+							<Text size="xs" c="blue">
+								{msg.imageCount}
+							</Text>
+						</Group>
+					)}
 					{msg.priority && (
 						<Badge
 							size="xs"
@@ -2068,14 +2081,6 @@ function SortableQueuedMessageItem({
 					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
 						{msg.text}
 					</Text>
-					{msg.imageCount > 0 && (
-						<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
-							<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
-							<Text size="xs" c="blue">
-								{msg.imageCount}
-							</Text>
-						</Group>
-					)}
 					<ActionIcon
 						size="xs"
 						variant="subtle"
@@ -2208,10 +2213,21 @@ export function NarratorPanel({
 	detailsPanelOpen,
 	onToggleDetailsPanel,
 	onDetailsPropsChange,
+	specPanelOpen,
+	onToggleSpecPanel,
 }: NarratorPanelProps) {
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+
+	// Unified dockview surface (optional): when present, the chat panel publishes
+	// its cross-panel state (file-mod / details / browser) into the context and
+	// bridges chat input to it, so sibling tool panels can consume it. Outside a
+	// provider these all fall back to the legacy prop callbacks.
+	const dock = useNarratorDockContext();
+	// Effective sidebar callbacks: prefer explicit props, else route through dock.
+	const effOnFileModPropsChange = onFileModPropsChange ?? dock?.setFileModProps;
+	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
 	const { data: chapterData } = useChapter(chapterId ?? "");
@@ -3047,14 +3063,18 @@ export function NarratorPanel({
 	const closeMentionPopover = useCallback(() => setMentionCaret(null), []);
 
 	useEffect(() => {
+		const append = (text: string) => setInput((prev) => (prev ? `${prev}\n${text}` : text));
 		if (appendInputRef) {
-			appendInputRef.current = (text: string) =>
-				setInput((prev) => (prev ? `${prev}\n${text}` : text));
+			appendInputRef.current = append;
 		}
+		// In dock mode also register the appender so a sibling terminal panel can
+		// push selected text into this chat input without a shared React parent.
+		const unregister = dock?.registerAppendChatInput(append);
 		return () => {
 			if (appendInputRef) appendInputRef.current = null;
+			unregister?.();
 		};
-	}, [appendInputRef]);
+	}, [appendInputRef, dock]);
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
 	const openImageViewer = useImageViewer();
 	const attachedImagesRef = useRef<File[]>(attachedImages);
@@ -3342,6 +3362,16 @@ export function NarratorPanel({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
 		},
 	});
+	// Publish browser session info to the dock so a sibling browser panel can
+	// render without being a child of this chat panel. No-op outside dock mode.
+	const dockSetBrowserInfo = dock?.setBrowserInfo;
+	useEffect(() => {
+		dockSetBrowserInfo?.({
+			sessionCount: wsState.browserSessionCount,
+			visualChange: wsState.browserVisualChange,
+		});
+	}, [dockSetBrowserInfo, wsState.browserSessionCount, wsState.browserVisualChange]);
+
 	const {
 		disconnected,
 		reconnect,
@@ -3523,17 +3553,29 @@ export function NarratorPanel({
 		useDisclosure(false);
 	const [internalDetailsOpened, { toggle: toggleInternalDetails, close: closeInternalDetails }] =
 		useDisclosure(false);
-	const detailsOpened = onToggleDetailsPanel ? (detailsPanelOpen ?? false) : internalDetailsOpened;
+	// Precedence for the details toggle: dock context (unified surface) > explicit
+	// prop callback (legacy desktop sidebar) > internal disclosure (workspace/graph).
+	const detailsOpened = dock
+		? dock.openToolTypes.has("details")
+		: onToggleDetailsPanel
+			? (detailsPanelOpen ?? false)
+			: internalDetailsOpened;
 	const detailsPanelOpenRef = useRef(detailsPanelOpen ?? false);
 	detailsPanelOpenRef.current = detailsPanelOpen ?? false;
-	const toggleDetails = onToggleDetailsPanel ?? toggleInternalDetails;
+	const toggleDetails = dock
+		? () => dock.toggleToolPanel("details")
+		: (onToggleDetailsPanel ?? toggleInternalDetails);
 	const closeDetails = useCallback(() => {
+		if (dock) {
+			dock.closeToolPanel("details");
+			return;
+		}
 		if (onToggleDetailsPanel) {
 			if (detailsPanelOpenRef.current) onToggleDetailsPanel();
 			return;
 		}
 		closeInternalDetails();
-	}, [closeInternalDetails, onToggleDetailsPanel]);
+	}, [dock, closeInternalDetails, onToggleDetailsPanel]);
 	useEffect(() => {
 		if (paymentRequired) openNugRecharge();
 	}, [openNugRecharge, paymentRequired]);
@@ -3625,17 +3667,22 @@ export function NarratorPanel({
 	);
 
 	useEffect(() => {
-		if (!detailsOpened || !onDetailsPropsChange || !narrator) return;
-		onDetailsPropsChange(detailsPanelExternalProps);
-	}, [detailsOpened, detailsPanelExternalProps, narrator, onDetailsPropsChange]);
+		if (!effOnDetailsPropsChange || !narrator) return;
+		// In dock mode publish unconditionally (the details panel may be mounted
+		// independently); in legacy prop mode keep the open-gated behaviour.
+		if (!dock && !detailsOpened) return;
+		effOnDetailsPropsChange(detailsPanelExternalProps);
+	}, [dock, detailsOpened, detailsPanelExternalProps, narrator, effOnDetailsPropsChange]);
 
 	// File modifications drawer/panel state
 	// When onToggleFileModPanel is provided (desktop sidebar mode), use external state;
 	// otherwise use internal state (mobile drawer / workspace fallback).
 	const [internalFileModOpen, setInternalFileModOpen] = useState(false);
-	const fileModDrawerOpened = onToggleFileModPanel
-		? (fileModPanelOpen ?? false)
-		: internalFileModOpen;
+	const fileModDrawerOpened = dock
+		? dock.openToolTypes.has("filemod")
+		: onToggleFileModPanel
+			? (fileModPanelOpen ?? false)
+			: internalFileModOpen;
 	const fileModPanelOpenRef = useRef(fileModPanelOpen ?? false);
 	fileModPanelOpenRef.current = fileModPanelOpen ?? false;
 	const externalSetFileModOpened = useCallback(
@@ -3650,9 +3697,44 @@ export function NarratorPanel({
 		},
 		[onToggleFileModPanel],
 	);
-	const setFileModDrawerOpened = onToggleFileModPanel
-		? externalSetFileModOpened
-		: setInternalFileModOpen;
+	const dockFileModToggle = useCallback(
+		(v: boolean | ((prev: boolean) => boolean)) => {
+			if (!dock) return;
+			const cur = dock.openToolTypes.has("filemod");
+			const next = typeof v === "function" ? v(cur) : v;
+			if (next !== cur) dock.toggleToolPanel("filemod");
+		},
+		[dock],
+	);
+	const setFileModDrawerOpened = dock
+		? dockFileModToggle
+		: onToggleFileModPanel
+			? externalSetFileModOpened
+			: setInternalFileModOpen;
+
+	// Spec toggle: dock context (unified surface) takes precedence over the
+	// legacy onToggleSpecPanel prop. `specToolAvailable` gates the toolbar button.
+	const specToolAvailable = !!dock || !!onToggleSpecPanel;
+	const specToolOpened = dock ? dock.openToolTypes.has("spec") : (specPanelOpen ?? false);
+	const toggleSpecTool = useCallback(() => {
+		if (dock) dock.toggleToolPanel("spec");
+		else onToggleSpecPanel?.();
+	}, [dock, onToggleSpecPanel]);
+	// Terminal toggle: dock context takes precedence over onToggleTerminal.
+	const terminalToolAvailable = !!dock || !!onToggleTerminal;
+	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
+	const toggleTerminalTool = useCallback(() => {
+		if (dock) dock.toggleToolPanel("terminal");
+		else onToggleTerminal?.();
+	}, [dock, onToggleTerminal]);
+	// Chat → terminal "send selection": prefer the explicit prop, else bridge
+	// through the dock context (writes to the terminal panel if one is open).
+	const dockWriteTerminalStdin = dock?.writeTerminalStdin;
+	const effSendToTerminal = useMemo<((text: string) => void) | undefined>(() => {
+		if (onSendToTerminal) return onSendToTerminal;
+		if (dock && terminalToolOpened && dockWriteTerminalStdin) return dockWriteTerminalStdin;
+		return undefined;
+	}, [onSendToTerminal, dock, terminalToolOpened, dockWriteTerminalStdin]);
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
 	// Get the first pending Write/Edit permission for the drawer
@@ -3667,8 +3749,8 @@ export function NarratorPanel({
 
 	// Expose file-mod panel props to parent for desktop sidebar rendering
 	useEffect(() => {
-		if (onFileModPropsChange) {
-			onFileModPropsChange({
+		if (effOnFileModPropsChange) {
+			effOnFileModPropsChange({
 				narratorId,
 				pendingPermission: firstEditPermission,
 				onPermissionDecision: renderPermCb.onPermissionDecision,
@@ -3685,7 +3767,7 @@ export function NarratorPanel({
 			});
 		}
 	}, [
-		onFileModPropsChange,
+		effOnFileModPropsChange,
 		narratorId,
 		firstEditPermission,
 		renderPermCb.onPermissionDecision,
@@ -6527,30 +6609,35 @@ export function NarratorPanel({
 		}
 	};
 
+	const isFileDragEvent = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
+
 	const handleDragEnter = (e: React.DragEvent) => {
+		if (!isFileDragEvent(e)) return;
 		e.preventDefault();
 		e.stopPropagation();
 		dragCounterRef.current++;
-		if (e.dataTransfer.types.includes("Files")) {
-			setIsDragging(true);
-		}
+		setIsDragging(true);
 	};
 
 	const handleDragLeave = (e: React.DragEvent) => {
+		if (!isFileDragEvent(e)) return;
 		e.preventDefault();
 		e.stopPropagation();
-		dragCounterRef.current--;
+		dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
 		if (dragCounterRef.current === 0) {
 			setIsDragging(false);
 		}
 	};
 
 	const handleDragOver = (e: React.DragEvent) => {
+		if (!isFileDragEvent(e)) return;
 		e.preventDefault();
 		e.stopPropagation();
+		e.dataTransfer.dropEffect = "copy";
 	};
 
 	const handleDrop = (e: React.DragEvent) => {
+		if (!isFileDragEvent(e)) return;
 		e.preventDefault();
 		e.stopPropagation();
 		dragCounterRef.current = 0;
@@ -7167,6 +7254,34 @@ export function NarratorPanel({
 										<IconInfoCircle size={16} />
 									</ActionIcon>
 								</Tooltip>
+								{specToolAvailable && (
+									<Tooltip
+										label={
+											specToolOpened ? t("spec.close", "Close Spec") : t("spec.open", "Open Spec")
+										}
+									>
+										<ActionIcon
+											size="sm"
+											variant={specToolOpened ? "light" : "subtle"}
+											color={specToolOpened ? "indigo" : "gray"}
+											onClick={toggleSpecTool}
+										>
+											<IconNotebook size={16} />
+										</ActionIcon>
+									</Tooltip>
+								)}
+								{dock && (
+									<Tooltip label={t("git.title", "Git")}>
+										<ActionIcon
+											size="sm"
+											variant={dock.openToolTypes.has("git") ? "light" : "subtle"}
+											color={dock.openToolTypes.has("git") ? "indigo" : "gray"}
+											onClick={() => dock.toggleToolPanel("git")}
+										>
+											<IconGitBranch size={16} />
+										</ActionIcon>
+									</Tooltip>
+								)}
 								<Tooltip label={t("archiveNarrator")}>
 									<ActionIcon
 										size="sm"
@@ -7431,7 +7546,12 @@ export function NarratorPanel({
 						</Stack>
 					</Modal>
 
-					{detailsOpened && !onToggleDetailsPanel && (
+					{/* Keep the Details drawer mounted (only gate on context, not on
+					    `detailsOpened`) so Mantine plays its slide in/out transition —
+					    driven by the `opened` prop, matching the terminal/spec drawers.
+					    All of the panel's data hooks are `opened`-gated, so a mounted-
+					    but-closed drawer fetches nothing. */}
+					{!dock && !onToggleDetailsPanel && (
 						<Suspense fallback={null}>
 							<NarratorDetailsPanel
 								opened={detailsOpened}
@@ -7689,10 +7809,10 @@ export function NarratorPanel({
 							</Box>
 						)}
 
-						{onSendToTerminal && (
+						{effSendToTerminal && (
 							<SelectionPopover
 								containerRef={contentRef}
-								onAction={onSendToTerminal}
+								onAction={effSendToTerminal}
 								label={tt("sendToTerminal")}
 							/>
 						)}
@@ -7981,6 +8101,14 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
+									{queuedMessages[0].imageCount > 0 && (
+										<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+											<IconPhoto size={14} color="var(--mantine-color-blue-5)" />
+											<Text size="xs" c="blue">
+												{queuedMessages[0].imageCount}
+											</Text>
+										</Group>
+									)}
 									{queuedMessages[0].priority && (
 										<Badge
 											size="xs"
@@ -8607,12 +8735,12 @@ export function NarratorPanel({
 													</ActionIcon>
 												</Tooltip>
 											)}
-											{(onToggleTerminal || onOpenTerminalPanel) && (
+											{(terminalToolAvailable || onOpenTerminalPanel) && (
 												<Tooltip
 													label={
 														onOpenTerminalPanel
 															? tt("openTerminal")
-															: terminalOpen
+															: terminalToolOpened
 																? tt("closeTerminal")
 																: tt("openTerminal")
 													}
@@ -8632,9 +8760,9 @@ export function NarratorPanel({
 													>
 														<ActionIcon
 															variant="subtle"
-															color={terminalOpen ? "blue" : "gray"}
+															color={terminalToolOpened ? "blue" : "gray"}
 															size="sm"
-															onClick={onOpenTerminalPanel ?? onToggleTerminal}
+															onClick={onOpenTerminalPanel ?? toggleTerminalTool}
 														>
 															<IconTerminal size={16} />
 														</ActionIcon>
@@ -8841,12 +8969,12 @@ export function NarratorPanel({
 												</ActionIcon>
 											</Tooltip>
 										)}
-										{(onToggleTerminal || onOpenTerminalPanel) && (
+										{(terminalToolAvailable || onOpenTerminalPanel) && (
 											<Tooltip
 												label={
 													onOpenTerminalPanel
 														? tt("openTerminal")
-														: terminalOpen
+														: terminalToolOpened
 															? tt("closeTerminal")
 															: tt("openTerminal")
 												}
@@ -8860,9 +8988,9 @@ export function NarratorPanel({
 												>
 													<ActionIcon
 														variant="subtle"
-														color={terminalOpen ? "blue" : "gray"}
+														color={terminalToolOpened ? "blue" : "gray"}
 														size="sm"
-														onClick={onOpenTerminalPanel ?? onToggleTerminal}
+														onClick={onOpenTerminalPanel ?? toggleTerminalTool}
 													>
 														<IconTerminal size={16} />
 													</ActionIcon>
@@ -9155,8 +9283,8 @@ export function NarratorPanel({
 						</Box>
 					)}
 
-					{/* Only render Drawer when NOT in external sidebar mode (i.e. mobile / workspace) */}
-					{!onToggleFileModPanel && (
+					{/* Only render Drawer when NOT in dock/external sidebar mode (i.e. mobile / workspace) */}
+					{!dock && !onToggleFileModPanel && (
 						<FileModificationsDrawer
 							narratorId={narratorId}
 							opened={fileModDrawerOpened}

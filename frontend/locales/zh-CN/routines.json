@@ -246,6 +246,13 @@
 	"hookEventPreToolUse": "工具执行前",
 	"hookEventPostToolUse": "工具执行后",
 	"hookEventStop": "应答结束时",
+	"hookEventAttention": "需要关注时",
+	"hookEventAttentionResolved": "关注解除时",
+	"hookAttentionReason": "原因",
+	"hookAttentionReasonAll": "全部原因",
+	"hookAttentionReason_waiting_permission": "等待授权",
+	"hookAttentionReason_done": "应答完成",
+	"hookAttentionReason_error": "出错",
 	"hookCommandHelp": "钩子触发时，会以 JSON 形式通过标准输入 (stdin) 把下方数据传给命令。命令工作目录为叙述者的 cwd。退出码 0 = 放行；工具执行前事件可用退出码 2 阻断工具执行，并把 stderr（或 stdout）作为阻断原因。",
 	"hookHttpHelp": "钩子触发时，会向该 URL 发送 POST 请求，请求体 (body) 为下方 JSON，Content-Type 为 application/json。返回 2xx 即放行；工具执行前事件可返回 {\"decision\": \"block\", \"reason\": \"...\"} 阻断工具执行。",
 	"hookPayloadRef": "数据字段参考",
@@ -253,7 +260,7 @@
 	"hookFieldsCommon": "通用字段（所有事件）",
 	"hookFieldsEvent": "本事件额外字段",
 	"hookExampleLabel": "示例载荷",
-	"hookFieldHookEventName": "事件名称（PreToolUse / PostToolUse / Stop）",
+	"hookFieldHookEventName": "事件名称（PreToolUse / PostToolUse / Stop / Attention / AttentionResolved）",
 	"hookFieldNarratorId": "叙述者 ID",
 	"hookFieldChapterId": "章节 ID（独立叙述者可能为空）",
 	"hookFieldProjectId": "项目 ID（全局叙述者可能为空）",
@@ -265,5 +272,9 @@
 	"hookFieldToolIsError": "工具是否出错",
 	"hookFieldStopReason": "结束原因（done / error / aborted / max_turns）",
 	"hookFieldStopError": "是否以错误结束",
-	"hookFieldLastAssistantText": "最后一条助手消息文本（截断）"
+	"hookFieldLastAssistantText": "最后一条助手消息文本（截断）",
+	"hookFieldDurationMs": "本轮总耗时（毫秒）",
+	"hookFieldTotalTokens": "本轮消耗 token 量（非缓存输入 + 输出）",
+	"hookFieldAttentionReason": "关注原因（waiting_permission / done / error）",
+	"hookFieldAttentionDetail": "附加上下文（如权限解除时用户的决定 \"allow\" / \"deny\"）"
 }

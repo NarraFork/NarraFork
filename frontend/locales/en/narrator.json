@@ -823,5 +823,45 @@
 			"permissionWait": "Permission wait {{duration}}",
 			"execution": "Execution {{duration}}"
 		}
+	},
+	"spec": {
+		"title": "Work Spec",
+		"open": "Open Spec",
+		"close": "Close Spec",
+		"save": "Save (Ctrl+S)",
+		"saved": "Saved",
+		"saveError": "Save failed",
+		"reload": "Discard changes",
+		"conflictTitle": "Conflict",
+		"conflictMessage": "File was modified externally. Reload to see changes.",
+		"addTask": "Add task",
+		"deleteTask": "Delete task",
+		"taskPlaceholder": "Task description",
+		"tabTasks": "Tasks",
+		"tabDocs": "Docs",
+		"readonly": "Read-only",
+		"changeStatus": "Change status",
+		"protectedHint": "Protected task. Its content is locked; the assistant needs task reflection to complete or remove it.",
+		"protectedCount": "{{count}} protected",
+		"hasBlocked": "Blocked",
+		"allDone": "All tasks done",
+		"progressLabel": "{{done}} / {{total}} done",
+		"noTasks": "No tasks yet. Add one to build the work plan.",
+		"unsavedTitle": "Unsaved changes",
+		"unsavedMessage": "You have unsaved changes. Discard them and switch?",
+		"discardConfirm": "Discard",
+		"keepEditing": "Keep editing",
+		"status": {
+			"todo": "Todo",
+			"doing": "Doing",
+			"done": "Done",
+			"blocked": "Blocked"
+		},
+		"group": {
+			"todo": "Todo",
+			"doing": "In progress",
+			"done": "Done",
+			"blocked": "Blocked"
+		}
 	}
 }

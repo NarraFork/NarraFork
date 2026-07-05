@@ -12,6 +12,7 @@ import { db } from "../db";
 import { narrators } from "../db/schema";
 import { TRANSIENT_RETRY_BASE_MS } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
+import { getToolMessage } from "../lib/i18n";
 import { logger } from "../lib/logger";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
@@ -246,21 +247,48 @@ export async function handleContextOverflow(opts: {
 	// generateCompactSummary now handles progressive input fitting internally
 	// (pruning tool calls + dropping old messages to fit the summary model's
 	// context window), so a single compact attempt with configured recent-turn retention suffices.
-	const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
+	let boundaryMessageId = await narratorService.getCompactBoundaryMessage(
 		narratorId,
 		getAutoCompactKeepPairs(),
 	);
+
+	// If the normal boundary is unavailable because there are too few messages to
+	// satisfy the configured keepPairs (e.g. a single oversized message blew the
+	// window), fall back to an emergency boundary that ignores keepPairs and keeps
+	// only the most recent message. Anything summarizable is better than failing.
+	let usedEmergencyBoundary = false;
+	if (!boundaryMessageId) {
+		boundaryMessageId = await narratorService.getEmergencyCompactBoundaryMessage(narratorId);
+		usedEmergencyBoundary = boundaryMessageId != null;
+		if (usedEmergencyBoundary) {
+			logger.warn("Falling back to emergency compact boundary (ignoring keepPairs)", {
+				narratorId,
+				boundaryMessageId,
+			});
+		}
+	}
+
 	if (!boundaryMessageId) {
 		logger.warn("No compact boundary found", { narratorId });
 		return { action: "failed", overflowRetries, reason: "no_compact_boundary" };
 	}
 
+	// When recovering from a context overflow, append an emergency hint to the
+	// summary so the next turn is warned against re-filling the window (e.g. by
+	// using the Read tool's read-all mode on very large files).
+	const appendHint = getToolMessage("compactContextOverflowHint", locale);
+
 	try {
-		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId);
+		const compacted = await runCustomCompact(narratorId, locale, boundaryMessageId, {
+			appendHint,
+		});
 		if (compacted) {
 			const newConversationId = randomUUID();
 			onBroadcast?.({ type: "compact_done", narratorId, mode: "blocking" });
-			logger.info("Emergency compact succeeded, retrying", { narratorId });
+			logger.info("Emergency compact succeeded, retrying", {
+				narratorId,
+				usedEmergencyBoundary,
+			});
 			return { action: "retry_compacted", newConversationId, overflowRetries };
 		}
 		logger.warn("Emergency compact completed without compacting", {

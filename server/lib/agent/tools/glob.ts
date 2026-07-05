@@ -26,6 +26,11 @@ export const globTool: ToolDefinition = {
 					'The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path if provided.',
 				type: "string",
 			},
+			dot: {
+				description:
+					"Whether to match dotfiles and dot-directories (paths starting with '.'). Defaults to false. Set to true to include hidden files/directories such as .env or .config.",
+				type: "boolean",
+			},
 		},
 		required: ["pattern"],
 		additionalProperties: false,
@@ -33,9 +38,17 @@ export const globTool: ToolDefinition = {
 	parameters: z.object({
 		pattern: z.string().describe("Glob pattern to match files, e.g. '**/*.ts' or 'src/*.json'"),
 		path: z.string().optional().describe("Base directory to search from. Defaults to cwd"),
+		dot: z
+			.boolean()
+			.optional()
+			.describe("Match hidden files/directories (paths starting with '.'). Defaults to false"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { pattern, path: pathArg } = args as { pattern: string; path?: string };
+		const {
+			pattern,
+			path: pathArg,
+			dot,
+		} = args as { pattern: string; path?: string; dot?: boolean };
 		// Resolve relative paths against the narrator's cwd
 		let cwd: string;
 		if (pathArg) {
@@ -46,7 +59,7 @@ export const globTool: ToolDefinition = {
 		try {
 			const glob = new Bun.Glob(pattern);
 			const results: string[] = [];
-			for await (const entry of glob.scan({ cwd, dot: false })) {
+			for await (const entry of glob.scan({ cwd, dot: dot ?? false })) {
 				// Normalise backslashes to forward slashes for consistent output
 				results.push(toForwardSlash(entry));
 				if (results.length >= MAX_RESULTS) break;

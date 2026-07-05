@@ -508,10 +508,13 @@ export async function getBackgroundTaskStatus(taskNarratorId: string): Promise<{
 /**
  * Wait for a background task to complete (with timeout).
  * Returns the task status when done or when timeout expires.
+ * An optional signal ends the wait early with status "aborted" when it fires
+ * (used by Await to support extendable timeouts and parent interrupts).
  */
 export function waitForBackgroundTask(
 	taskNarratorId: string,
 	timeoutMs = 30000,
+	signal?: AbortSignal,
 ): Promise<{ status: string; result: string | null }> {
 	return new Promise((resolve) => {
 		const timeout = setTimeout(() => {
@@ -534,10 +537,23 @@ export function waitForBackgroundTask(
 			});
 		};
 
+		const onAbort = () => {
+			cleanup();
+			resolve({ status: "aborted", result: null });
+		};
+
 		const cleanup = () => {
 			clearTimeout(timeout);
 			eventBus.offAny(handler);
+			signal?.removeEventListener("abort", onAbort);
 		};
+
+		if (signal?.aborted) {
+			clearTimeout(timeout);
+			resolve({ status: "aborted", result: null });
+			return;
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
 
 		// Check if already completed
 		getBackgroundTaskStatus(taskNarratorId).then((s) => {

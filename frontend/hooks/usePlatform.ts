@@ -2,6 +2,13 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
 
 type Platform = "windows" | "macos" | "linux";
+export interface RuntimeEnvironmentInfo {
+	android: boolean;
+	proot: boolean;
+	termux: boolean;
+	containerSupport: boolean;
+	containerUnsupportedReason?: string;
+}
 export type GatewayPlatform =
 	| "telegram"
 	| "discord"
@@ -519,6 +526,11 @@ export function useRuntimeCapabilities(): RuntimeCapabilities | undefined {
 	return data?.capabilities;
 }
 
+export function useRuntimeEnvironment(): RuntimeEnvironmentInfo | undefined {
+	const { data } = useHealthQuery();
+	return data?.runtimeEnvironment;
+}
+
 export function getDatabaseCapability(
 	capabilities: RuntimeCapabilities | undefined,
 ): RuntimeCapabilities["database"] | undefined {
@@ -888,7 +900,34 @@ export function useChapterSplitCapability(): ReturnType<typeof getChapterSplitCa
 export function useChapterContainersCapability(): ReturnType<
 	typeof getChapterContainersCapability
 > {
-	return getChapterContainersCapability(useRuntimeCapabilities());
+	const { data } = useHealthQuery();
+	const environment = data?.runtimeEnvironment;
+	if (environment && !environment.containerSupport) {
+		const reason =
+			environment.containerUnsupportedReason ??
+			"Local container management is unavailable in this runtime.";
+		return {
+			supported: false,
+			reason,
+			routes: {
+				setup: false,
+				podmanStatus: false,
+				podmanInstall: false,
+				composeInfo: false,
+				list: false,
+				start: false,
+				stop: false,
+				pause: false,
+				unpause: false,
+				logs: false,
+				remove: false,
+			},
+			runtime: {},
+			ports: {},
+			proxy: {},
+		};
+	}
+	return getChapterContainersCapability(data?.capabilities);
 }
 
 export function getNarratorBrowserSessionsCapability(

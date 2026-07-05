@@ -1687,7 +1687,12 @@ narratorRoutes.delete("/:id/error-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissErrorMessage(narratorId, messageId);
-	return c.json({ ok: true });
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
 });
 
 // Update a compact message summary

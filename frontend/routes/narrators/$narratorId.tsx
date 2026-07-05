@@ -1,4 +1,4 @@
-import { Box, Center, Drawer, Loader, Stack, Text } from "@mantine/core";
+import { Box, Center, Drawer, Group, Loader, Stack, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -8,33 +8,26 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
-import type {
-	FileModPanelExternalProps,
-	NarratorDetailsPanelExternalProps,
-} from "../../components/narrator/narrator-panel-types";
 import {
 	createBranch,
 	createLeafWith,
 	type SplitDirection,
 } from "../../components/narrator/split-tree";
 
-// Lazy-loaded heavy panels — not needed for first paint
+// Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
 const NarratorTerminal = lazy(() =>
 	import("../../components/terminal/NarratorTerminal").then((m) => ({
 		default: m.NarratorTerminal,
 	})),
 );
-const FileModificationsPanel = lazy(() =>
-	import("../../components/narrator/FileModificationsDrawer").then((m) => ({
-		default: m.FileModificationsPanel,
-	})),
-);
-const NarratorDetailsPanel = lazy(() =>
-	import("../../components/narrator/NarratorDetailsPanel").then((m) => ({
-		default: m.NarratorDetailsPanel,
+const SpecPanel = lazy(() =>
+	import("../../components/narrator/SpecPanel").then((m) => ({
+		default: m.SpecPanel,
 	})),
 );
 
+import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
+import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { usePageUnload } from "../../hooks/usePageUnload";
@@ -44,17 +37,15 @@ import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/use
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
-	type NarratorDragState,
-	onNarratorDragEnd,
-	onNarratorDragMove,
-} from "../../lib/narrator-drag";
+	isSyntheticSubjectId,
+	onPanelDragEnd,
+	onPanelDragMove,
+	type PanelDragState,
+} from "../../lib/panel-drag";
 
 export const Route = createFileRoute("/narrators/$narratorId")({
 	component: NarratorDetailPage,
 });
-
-const MIN_PANEL_WIDTH = 200;
-const DEFAULT_TERMINAL_RATIO = 0.4;
 
 /** Drop zone overlay styles for drag-to-split — static, no need to recreate per render. */
 const DROP_OVERLAY_STYLES: Record<string, React.CSSProperties> = {
@@ -64,9 +55,24 @@ const DROP_OVERLAY_STYLES: Record<string, React.CSSProperties> = {
 	bottom: { left: 0, bottom: 0, width: "100%", height: "50%" },
 };
 
-function terminalStorageKey(narratorId: string) {
-	return `narrafork_terminal_open_${narratorId}`;
-}
+/**
+ * Mobile tool drawers (terminal / spec) share the narrator header's chrome so
+ * every panel header is the same height: `py="xs"` (8px) + a `size="sm"` control
+ * (28px) + 1px border ≈ 45px. The body fills the rest. `NarratorDetailsPanel`'s
+ * own drawer mirrors these values.
+ */
+const MOBILE_DRAWER_HEADER_HEIGHT = 45;
+const MOBILE_DRAWER_STYLES = {
+	header: {
+		minHeight: MOBILE_DRAWER_HEADER_HEIGHT,
+		paddingTop: 8,
+		paddingBottom: 8,
+		paddingLeft: 16,
+		paddingRight: 16,
+		borderBottom: "1px solid var(--mantine-color-default-border)",
+	},
+	body: { height: `calc(100% - ${MOBILE_DRAWER_HEADER_HEIGHT}px)`, padding: 0 },
+} as const;
 
 function NarratorDetailPage() {
 	const { narratorId } = Route.useParams();
@@ -189,6 +195,11 @@ function NarratorDetailPage() {
 
 	// Terminal drawer for mobile
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
+	// Spec drawer for mobile
+	const [specDrawerOpened, { open: openSpecDrawer, close: closeSpecDrawer }] = useDisclosure(false);
+	// Save/reload controls reported up by the chromeless SpecPanel, rendered in
+	// the mobile drawer's header (mirrors the desktop dock's ToolPanelShell).
+	const [specActions, setSpecActions] = useState<React.ReactNode>(null);
 
 	// Intercept browser back button to close mobile terminal drawer instead of navigating away
 	const closedByPopState = useRef(false);
@@ -209,65 +220,6 @@ function NarratorDetailPage() {
 		};
 	}, [drawerOpened, closeDrawer]);
 
-	// Desktop terminal panel visibility — restore from localStorage if a running terminal exists
-	const [terminalOpen, setTerminalOpen] = useState(false);
-	const initializedForRef = useRef<string | null>(null);
-
-	useEffect(() => {
-		if (initializedForRef.current === narratorId) return;
-		const saved = localStorage.getItem(terminalStorageKey(narratorId));
-		if (saved === "true" && hasRunningTerminal) {
-			setTerminalOpen(true);
-			initializedForRef.current = narratorId;
-		} else if (existingTerminals !== undefined) {
-			// Data loaded but no saved state or no running terminal — reset panel
-			setTerminalOpen(saved === "true" && hasRunningTerminal);
-			initializedForRef.current = narratorId;
-		}
-	}, [narratorId, hasRunningTerminal, existingTerminals]);
-
-	// Terminal width for desktop (as ratio of container)
-	const [terminalRatio, setTerminalRatio] = useState(DEFAULT_TERMINAL_RATIO);
-	const containerRef = useRef<HTMLDivElement>(null);
-	const dragging = useRef(false);
-
-	// Desktop right-side utility panels
-	const [fileModOpen, setFileModOpen] = useState(false);
-	const [fileModPanelProps, setFileModPanelProps] = useState<FileModPanelExternalProps | null>(
-		null,
-	);
-	const [detailsOpen, setDetailsOpen] = useState(false);
-	const [detailsPanelProps, setDetailsPanelProps] =
-		useState<NarratorDetailsPanelExternalProps | null>(null);
-	// The right side shows whichever utility panel was opened last.
-	const handleToggleFileModPanel = useCallback(() => {
-		setFileModOpen((prev) => {
-			if (!prev) {
-				setTerminalOpen(false);
-				setDetailsOpen(false);
-				localStorage.setItem(terminalStorageKey(narratorId), "false");
-			}
-			return !prev;
-		});
-	}, [narratorId]);
-	const handleToggleDetailsPanel = useCallback(() => {
-		setDetailsOpen((prev) => {
-			if (!prev) {
-				setTerminalOpen(false);
-				setFileModOpen(false);
-				localStorage.setItem(terminalStorageKey(narratorId), "false");
-			}
-			return !prev;
-		});
-	}, [narratorId]);
-
-	useEffect(() => {
-		setFileModOpen(false);
-		setFileModPanelProps((prev) => (prev?.narratorId === narratorId ? prev : null));
-		setDetailsOpen(false);
-		setDetailsPanelProps((prev) => (prev?.narratorId === narratorId ? prev : null));
-	}, [narratorId]);
-
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {
 		if (terminalSupported && !hasRunningTerminal) {
@@ -278,38 +230,25 @@ function NarratorDetailPage() {
 	const writeToTerminalRef = useRef<((text: string) => void) | null>(null);
 	const appendInputRef = useRef<((text: string) => void) | null>(null);
 
-	// Terminal → Chat: append selected text to chat input
+	// Terminal → Chat: append selected text to chat input (mobile drawer)
 	const handleSendToChat = useCallback((text: string) => {
 		appendInputRef.current?.(text);
 	}, []);
 
-	// Chat → Terminal: write selected text to terminal
+	// Chat → Terminal: write selected text to terminal (mobile drawer)
 	const handleSendToTerminal = useCallback((text: string) => {
 		writeToTerminalRef.current?.(text);
 	}, []);
 
-	// Receive write function from NarratorTerminal
+	// Receive write function from NarratorTerminal (mobile drawer)
 	const handleWriteRef = useCallback((fn: ((text: string) => void) | null) => {
 		writeToTerminalRef.current = fn;
 	}, []);
 
-	// Toggle terminal and persist; auto-create a terminal when opening with none running
-	const toggleTerminal = useCallback(() => {
-		const willOpen = !terminalOpen;
-		setTerminalOpen(willOpen);
-		localStorage.setItem(terminalStorageKey(narratorId), String(willOpen));
-		if (willOpen && terminalSupported && !hasRunningTerminal) {
-			createTerminal.mutate({ name: "Terminal 1" });
-		}
-		// Close utility panels when opening terminal
-		if (willOpen) {
-			setFileModOpen(false);
-			setDetailsOpen(false);
-		}
-	}, [narratorId, terminalOpen, terminalSupported, hasRunningTerminal, createTerminal]);
-
 	const { t: tc } = useTranslation("chapters");
 	const { t: tCommon } = useTranslation("common");
+	const { t: tn } = useTranslation("narrator");
+	const { t: tt } = useTranslation("terminal");
 	const navigate = useNavigate();
 
 	// When navigated from narraflow graph, show minimize button to return to graph
@@ -416,14 +355,12 @@ function NarratorDetailPage() {
 		[chapterId, forkFromMessage],
 	);
 
-	// Auto-close terminal panel only when the last terminal exits
+	// Mobile drawer: auto-close when the last terminal exits
 	const handleTerminalExit = useCallback(() => {
-		if (runningCount <= 1) {
-			setTerminalOpen(false);
-			localStorage.setItem(terminalStorageKey(narratorId), "false");
-			if (isMobile) closeDrawer();
+		if (runningCount <= 1 && isMobile) {
+			closeDrawer();
 		}
-	}, [narratorId, isMobile, closeDrawer, runningCount]);
+	}, [isMobile, closeDrawer, runningCount]);
 
 	// ── Drag-to-split: drop zone for creating workspace ──
 	type DropSide = "left" | "right" | "top" | "bottom" | null;
@@ -443,9 +380,10 @@ function NarratorDetailPage() {
 			return "right"; // default to right split
 		};
 
-		const unsubMove = onNarratorDragMove((state: NarratorDragState) => {
-			// Don't allow dropping the same narrator
-			if (state.narratorId === narratorId) {
+		const unsubMove = onPanelDragMove((state: PanelDragState) => {
+			// Ignore self-drags and in-dock tool-panel rearrangements (synthetic
+			// subject ids like "__spec__" must not trigger a workspace split).
+			if (state.id === narratorId || isSyntheticSubjectId(state.id)) {
 				if (dropSideRef.current) {
 					dropSideRef.current = null;
 					setDropSide(null);
@@ -470,17 +408,17 @@ function NarratorDetailPage() {
 			}
 		});
 
-		const unsubEnd = onNarratorDragEnd((final: NarratorDragState | null) => {
+		const unsubEnd = onPanelDragEnd((final: PanelDragState | null) => {
 			const side = dropSideRef.current;
 			dropSideRef.current = null;
 			setDropSide(null);
-			if (!final || !side || final.narratorId === narratorId) return;
+			if (!final || !side || final.id === narratorId || isSyntheticSubjectId(final.id)) return;
 
 			// Create workspace with two panels
 			const direction: SplitDirection =
 				side === "left" || side === "right" ? "horizontal" : "vertical";
 			const currentLeaf = createLeafWith(narratorId);
-			const droppedLeaf = createLeafWith(final.narratorId);
+			const droppedLeaf = createLeafWith(final.id);
 			const children =
 				side === "left" || side === "top" ? [droppedLeaf, currentLeaf] : [currentLeaf, droppedLeaf];
 			const tree = createBranch(direction, children);
@@ -504,7 +442,7 @@ function NarratorDetailPage() {
 					});
 					addRecentTab({
 						type: "narrator",
-						id: final.narratorId,
+						id: final.id,
 						title: "",
 						workspaceId: ws.id,
 						updateOnly: true,
@@ -523,54 +461,8 @@ function NarratorDetailPage() {
 		};
 	}, [narratorId, navigate]);
 
-	// Desktop drag handle for resizing (mouse + touch)
-	const dragCleanupRef = useRef<(() => void) | null>(null);
-	const onDragStart = useCallback((e: React.MouseEvent | React.TouchEvent) => {
-		e.preventDefault();
-		dragging.current = true;
-
-		const getClientX = (ev: MouseEvent | TouchEvent) =>
-			"touches" in ev ? ev.touches[0].clientX : ev.clientX;
-
-		const onMove = (ev: MouseEvent | TouchEvent) => {
-			if (!dragging.current || !containerRef.current) return;
-			const rect = containerRef.current.getBoundingClientRect();
-			const terminalWidth = rect.right - getClientX(ev);
-			const ratio = terminalWidth / rect.width;
-			const minRatio = MIN_PANEL_WIDTH / rect.width;
-			setTerminalRatio(Math.max(minRatio, Math.min(1 - minRatio, ratio)));
-		};
-
-		const onEnd = () => {
-			dragging.current = false;
-			document.removeEventListener("mousemove", onMove);
-			document.removeEventListener("mouseup", onEnd);
-			document.removeEventListener("touchmove", onMove);
-			document.removeEventListener("touchend", onEnd);
-			document.body.style.cursor = "";
-			document.body.style.userSelect = "";
-			dragCleanupRef.current = null;
-		};
-
-		document.body.style.cursor = "col-resize";
-		document.body.style.userSelect = "none";
-		document.addEventListener("mousemove", onMove);
-		document.addEventListener("mouseup", onEnd);
-		document.addEventListener("touchmove", onMove, { passive: false });
-		document.addEventListener("touchend", onEnd);
-		dragCleanupRef.current = onEnd;
-	}, []);
-
-	// Cleanup drag listeners on unmount (in case user navigates mid-drag)
-	useEffect(() => {
-		return () => {
-			dragCleanupRef.current?.();
-		};
-	}, []);
-
-	// Merged ref for both terminal resize and drop zone detection
+	// Ref for drag-to-split drop zone detection
 	const mergedRef = useCallback((el: HTMLDivElement | null) => {
-		(containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
 		pageBoxRef.current = el;
 	}, []);
 
@@ -621,6 +513,8 @@ function NarratorDetailPage() {
 						}
 						onMinimize={showMinimize ? onMinimize : undefined}
 						onBack={isSubagent ? onBack : undefined}
+						specPanelOpen={specDrawerOpened}
+						onToggleSpecPanel={specDrawerOpened ? closeSpecDrawer : openSpecDrawer}
 					/>
 				</Box>
 
@@ -630,8 +524,13 @@ function NarratorDetailPage() {
 					onClose={closeDrawer}
 					position="right"
 					size="100%"
-					title="Terminal"
-					styles={{ body: { height: "calc(100% - 60px)", padding: 0 } }}
+					title={
+						<Text size="sm" fw={600} truncate>
+							{tt("terminal")}
+						</Text>
+					}
+					closeButtonProps={{ size: "sm" }}
+					styles={MOBILE_DRAWER_STYLES}
 				>
 					<Suspense
 						fallback={
@@ -648,11 +547,83 @@ function NarratorDetailPage() {
 						/>
 					</Suspense>
 				</Drawer>
+
+				{/* Mobile spec drawer — chromeless panel; title + save/reload live in
+				    the drawer header (mirrors the desktop dock). */}
+				<Drawer
+					opened={specDrawerOpened}
+					onClose={() => {
+						setSpecActions(null);
+						closeSpecDrawer();
+					}}
+					position="right"
+					size="100%"
+					title={
+						<Group gap="xs" wrap="nowrap" style={{ flex: 1 }}>
+							<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
+								{tn("spec.title")}
+							</Text>
+							{specActions}
+						</Group>
+					}
+					closeButtonProps={{ size: "sm" }}
+					styles={MOBILE_DRAWER_STYLES}
+				>
+					<Suspense
+						fallback={
+							<Center h="100%">
+								<Loader size="sm" />
+							</Center>
+						}
+					>
+						<SpecPanel
+							narratorId={narratorId}
+							onClose={closeSpecDrawer}
+							chromeless
+							onHeaderActionsChange={setSpecActions}
+						/>
+					</Suspense>
+				</Drawer>
 			</Box>
 		);
 	}
 
-	// Desktop layout: side by side
+	// Desktop layout: unified dockview surface (chat + tool panels as siblings).
+	// Subagents keep the simple single-panel layout (no chapter/tool panels).
+	if (isSubagent) {
+		return (
+			<Box
+				ref={mergedRef}
+				h="calc(100dvh - 60px)"
+				mx="calc(var(--mantine-spacing-md) * -1)"
+				my="calc(var(--mantine-spacing-md) * -1)"
+				style={{ position: "relative", overflow: "hidden" }}
+			>
+				<NarratorPanel
+					key={narratorId}
+					narratorId={narratorId}
+					narrator={narrator}
+					highlightMessageId={highlightMessageId}
+					onMinimize={showMinimize ? onMinimize : undefined}
+					onBack={onBack}
+				/>
+				{dropSide && (
+					<Box
+						style={{
+							position: "absolute",
+							...DROP_OVERLAY_STYLES[dropSide],
+							backgroundColor: "var(--mantine-color-indigo-9)",
+							opacity: 0.2,
+							borderRadius: 4,
+							pointerEvents: "none",
+							transition: "all 100ms ease",
+							zIndex: 100,
+						}}
+					/>
+				)}
+			</Box>
+		);
+	}
 
 	return (
 		<Box
@@ -660,166 +631,18 @@ function NarratorDetailPage() {
 			h="calc(100dvh - 60px)"
 			mx="calc(var(--mantine-spacing-md) * -1)"
 			my="calc(var(--mantine-spacing-md) * -1)"
-			style={{ display: "flex", flexDirection: "row", position: "relative", isolation: "isolate" }}
+			style={{ position: "relative", overflow: "hidden", isolation: "isolate" }}
 		>
-			{/* Chat panel */}
-			<Box style={{ flex: 1, minWidth: MIN_PANEL_WIDTH, overflow: "hidden" }}>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					narrator={narrator}
-					highlightMessageId={highlightMessageId}
-					onForkFromMessage={chapterId ? handleForkFromMessage : undefined}
-					onSendToTerminal={
-						isSubagent ? undefined : terminalOpen ? handleSendToTerminal : undefined
-					}
-					appendInputRef={isSubagent ? undefined : appendInputRef}
-					terminalOpen={isSubagent ? undefined : terminalOpen}
-					onToggleTerminal={isSubagent ? undefined : toggleTerminal}
-					onMinimize={showMinimize ? onMinimize : undefined}
-					onBack={isSubagent ? onBack : undefined}
-					fileModPanelOpen={isSubagent ? undefined : fileModOpen}
-					onToggleFileModPanel={isSubagent ? undefined : handleToggleFileModPanel}
-					onFileModPropsChange={isSubagent ? undefined : setFileModPanelProps}
-					detailsPanelOpen={detailsOpen}
-					onToggleDetailsPanel={handleToggleDetailsPanel}
-					onDetailsPropsChange={setDetailsPanelProps}
-				/>
-			</Box>
+			<NarratorDockProvider
+				key={narratorId}
+				narratorId={narratorId}
+				chapterId={chapterId}
+				onForkFromMessage={chapterId ? handleForkFromMessage : null}
+			>
+				<NarratorDock device="desktop" />
+			</NarratorDockProvider>
 
-			{!isSubagent && terminalOpen && (
-				<>
-					{/* Drag handle */}
-					<Box
-						onMouseDown={onDragStart}
-						onTouchStart={onDragStart}
-						style={{
-							position: "relative",
-							width: 6,
-							cursor: "col-resize",
-							flexShrink: 0,
-							borderLeft: "1px solid var(--mantine-color-default-border)",
-						}}
-					/>
-
-					{/* Terminal panel */}
-					<Box
-						style={{
-							width: `${terminalRatio * 100}%`,
-							minWidth: MIN_PANEL_WIDTH,
-							flexShrink: 0,
-							overflow: "hidden",
-							paddingLeft: 4,
-						}}
-					>
-						<Suspense
-							fallback={
-								<Center h="100%">
-									<Loader size="sm" />
-								</Center>
-							}
-						>
-							<NarratorTerminal
-								narratorId={narratorId}
-								onSendToChat={handleSendToChat}
-								onWriteRef={handleWriteRef}
-								onExit={handleTerminalExit}
-							/>
-						</Suspense>
-					</Box>
-				</>
-			)}
-
-			{!isSubagent && fileModOpen && !terminalOpen && (
-				<>
-					{/* Drag handle */}
-					<Box
-						onMouseDown={onDragStart}
-						onTouchStart={onDragStart}
-						style={{
-							position: "relative",
-							width: 6,
-							cursor: "col-resize",
-							flexShrink: 0,
-							borderLeft: "1px solid var(--mantine-color-default-border)",
-						}}
-					/>
-
-					{/* File modifications panel */}
-					<Box
-						style={{
-							width: `${terminalRatio * 100}%`,
-							minWidth: MIN_PANEL_WIDTH,
-							flexShrink: 0,
-							overflow: "hidden",
-							paddingLeft: 4,
-						}}
-					>
-						<Suspense
-							fallback={
-								<Center h="100%">
-									<Loader size="sm" />
-								</Center>
-							}
-						>
-							<FileModificationsPanel
-								narratorId={narratorId}
-								onClose={() => setFileModOpen(false)}
-								pendingPermission={fileModPanelProps?.pendingPermission}
-								onPermissionDecision={fileModPanelProps?.onPermissionDecision}
-								deletePreviewMessageId={fileModPanelProps?.deletePreviewMessageId}
-								onConfirmDelete={fileModPanelProps?.onConfirmDelete}
-								onCancelDelete={fileModPanelProps?.onCancelDelete}
-							/>
-						</Suspense>
-					</Box>
-				</>
-			)}
-
-			{detailsOpen && !terminalOpen && !fileModOpen && detailsPanelProps && (
-				<>
-					{/* Drag handle */}
-					<Box
-						onMouseDown={onDragStart}
-						onTouchStart={onDragStart}
-						style={{
-							position: "relative",
-							width: 6,
-							cursor: "col-resize",
-							flexShrink: 0,
-							borderLeft: "1px solid var(--mantine-color-default-border)",
-						}}
-					/>
-
-					{/* Session details panel */}
-					<Box
-						style={{
-							width: `${terminalRatio * 100}%`,
-							minWidth: Math.max(MIN_PANEL_WIDTH, 360),
-							flexShrink: 0,
-							overflow: "hidden",
-							paddingLeft: 4,
-						}}
-					>
-						<Suspense
-							fallback={
-								<Center h="100%">
-									<Loader size="sm" />
-								</Center>
-							}
-						>
-							<NarratorDetailsPanel
-								{...detailsPanelProps}
-								opened={detailsOpen}
-								onClose={() => setDetailsOpen(false)}
-								displayMode="inline"
-							/>
-						</Suspense>
-					</Box>
-				</>
-			)}
-
-			{/* Drop zone overlay for drag-to-split */}
+			{/* Drop zone overlay for drag-to-split (drag another narrator here) */}
 			{dropSide && (
 				<Box
 					style={{

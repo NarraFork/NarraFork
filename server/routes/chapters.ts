@@ -4,7 +4,7 @@ import { db } from "../db";
 import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
-import { supportsContainers } from "../lib/platform";
+import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
@@ -40,6 +40,14 @@ import { syncTitleToNarrator } from "../services/narrator-title";
 import { reviewService } from "../services/review-service";
 
 export const chapterRoutes = new Hono();
+
+function containerUnsupportedPayload() {
+	return {
+		error: getContainerUnsupportedReason() ?? "Container management is unsupported",
+		code: "CONTAINERS_UNSUPPORTED",
+		supported: false,
+	};
+}
 
 chapterRoutes.get("/", async (c) => {
 	const projectId = c.req.query("projectId");
@@ -226,15 +234,18 @@ chapterRoutes.post("/batch-merge", async (c) => {
 // === Podman ===
 
 chapterRoutes.get("/podman/status", async (c) => {
-	const status = await getPodmanStatus();
 	const platform =
 		process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
-	return c.json({ ...status, platform, supported: supportsContainers() });
+	if (!supportsContainers()) {
+		return c.json({ installed: false, platform, ...containerUnsupportedPayload() });
+	}
+	const status = await getPodmanStatus();
+	return c.json({ ...status, platform, supported: true });
 });
 
 chapterRoutes.post("/podman/install", requireAdmin, async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ ok: false, error: "Container management is only supported on Linux" }, 400);
+		return c.json({ ok: false, ...containerUnsupportedPayload() }, 400);
 	}
 	const platform = process.platform;
 	let cmd: string;
@@ -315,7 +326,7 @@ chapterRoutes.get("/:id/containers", async (c) => {
 
 chapterRoutes.post("/:id/containers/start", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	await containerService.startChapterContainers(id);
@@ -324,7 +335,7 @@ chapterRoutes.post("/:id/containers/start", async (c) => {
 
 chapterRoutes.post("/:id/containers/stop", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	await containerService.stopChapterContainers(id);
@@ -333,7 +344,7 @@ chapterRoutes.post("/:id/containers/stop", async (c) => {
 
 chapterRoutes.post("/:id/containers/pause", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	await containerService.pauseChapterContainers(id);
@@ -342,7 +353,7 @@ chapterRoutes.post("/:id/containers/pause", async (c) => {
 
 chapterRoutes.post("/:id/containers/unpause", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	await containerService.unpauseChapterContainers(id);
@@ -351,7 +362,7 @@ chapterRoutes.post("/:id/containers/unpause", async (c) => {
 
 chapterRoutes.get("/:id/containers/logs", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	const tail = c.req.query("tail");
@@ -365,7 +376,7 @@ chapterRoutes.get("/:id/containers/logs", async (c) => {
 
 chapterRoutes.post("/:id/containers/remove", async (c) => {
 	if (!supportsContainers()) {
-		return c.json({ error: "Container management is only supported on Linux" }, 400);
+		return c.json(containerUnsupportedPayload(), 400);
 	}
 	const id = c.req.param("id");
 	const body = await c.req.json().catch(() => ({}));

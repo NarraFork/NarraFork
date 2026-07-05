@@ -42,6 +42,7 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 	const platform = status?.platform ?? "linux";
 	const hint = INSTALL_HINTS[platform] ?? INSTALL_HINTS.linux;
 	const statusFallbackMessage = status?.reason ?? status?.message ?? status?.error ?? status?.code;
+	const showInstallHint = canReadPodmanStatus && status?.supported !== false;
 
 	return (
 		<Modal opened={opened} onClose={onClose} title={t("podman.title")} size="md">
@@ -78,14 +79,16 @@ export function PodmanInstallModal({ opened, onClose }: PodmanInstallModalProps)
 					</Group>
 				)}
 
-				<div>
-					<Text size="sm" fw={500} mb={4}>
-						{t("podman.installCommand")}
-					</Text>
-					<Code block style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
-						{hint}
-					</Code>
-				</div>
+				{showInstallHint && (
+					<div>
+						<Text size="sm" fw={500} mb={4}>
+							{t("podman.installCommand")}
+						</Text>
+						<Code block style={{ fontSize: 12, whiteSpace: "pre-wrap" }}>
+							{hint}
+						</Code>
+					</div>
+				)}
 
 				{install.isError && (
 					<Text size="sm" c="red">

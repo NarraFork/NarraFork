@@ -119,6 +119,16 @@ export type NarraForkEvent =
 			reason: "waiting_permission" | "done" | "error";
 			detail?: string;
 	  }
+	// Semantic "a previously-raised attention was resolved" intent — the mirror of
+	// `narrator:attention`. Emitted only when an attention that actually alerted the
+	// user is cleared (first scope: a pending permission request answered by the
+	// user via allow/deny). Consumers (hook bridge) can use it to close the loop.
+	| {
+			type: "narrator:attention_resolved";
+			narratorId: string;
+			reason: "waiting_permission" | "done" | "error";
+			detail?: string;
+	  }
 	| { type: "narrator:title_updated"; narratorId: string; title: string }
 	// Narrator fork
 	| { type: "narrator:forked"; narratorId: string; parentNarratorId: string }

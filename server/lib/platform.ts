@@ -6,6 +6,7 @@
  * hard-code Unix paths like `/dev/null`, `/tmp`, `/root`.
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 // ── Platform flags ──────────────────────────────────────────────────────────
@@ -13,6 +14,54 @@ import { homedir } from "node:os";
 export const IS_WINDOWS = process.platform === "win32";
 export const IS_MACOS = process.platform === "darwin";
 export const IS_LINUX = process.platform === "linux";
+
+const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
+
+function envFlag(name: string): boolean {
+	const value = process.env[name];
+	return value !== undefined && TRUE_VALUES.has(value.toLowerCase());
+}
+
+function pathLooksLikeTermux(path: string | undefined): boolean {
+	return !!path && path.includes("/com.termux/");
+}
+
+function fileIncludes(path: string, pattern: RegExp): boolean {
+	try {
+		return pattern.test(readFileSync(path, "utf-8"));
+	} catch {
+		return false;
+	}
+}
+
+function detectAndroidRuntime(): boolean {
+	if (!IS_LINUX) return false;
+	if (envFlag("NARRAFORK_ANDROID")) return true;
+	if (process.env.TERMUX_VERSION || process.env.TERMUX_APP__PACKAGE_NAME) return true;
+	if (pathLooksLikeTermux(process.env.PREFIX) || pathLooksLikeTermux(process.env.HOME)) return true;
+	if (process.env.ANDROID_ROOT && process.env.ANDROID_DATA && existsSync("/system/bin")) {
+		return true;
+	}
+	return fileIncludes("/proc/version", /android/i);
+}
+
+function detectProotRuntime(): boolean {
+	if (!IS_LINUX) return false;
+	if (envFlag("NARRAFORK_PROOT")) return true;
+	if (process.env.PROOT_TMP_DIR || process.env.PROOT_NO_SECCOMP) return true;
+	return fileIncludes("/proc/self/status", /TracerPid:\s*[1-9]/);
+}
+
+export const IS_ANDROID = detectAndroidRuntime();
+export const IS_PROOT = detectProotRuntime();
+
+export interface RuntimeEnvironmentInfo {
+	android: boolean;
+	proot: boolean;
+	termux: boolean;
+	containerSupport: boolean;
+	containerUnsupportedReason?: string;
+}
 
 // ── Path / env helpers ──────────────────────────────────────────────────────
 
@@ -36,9 +85,35 @@ export function supportsDtach(): boolean {
 	return !IS_WINDOWS;
 }
 
-/** Whether the platform can run Podman containers (rootless Linux only). */
+/** Human-readable reason for disabling local container management, if disabled. */
+export function getContainerUnsupportedReason(): string | undefined {
+	if (!IS_LINUX) return "Container management is only supported on Linux";
+	if (IS_ANDROID || IS_PROOT) {
+		return "Local Podman containers are not supported in Android/proot environments; use a remote container host instead.";
+	}
+	return undefined;
+}
+
+/** Whether the platform can run Podman containers (rootless Linux only, not proot). */
 export function supportsContainers(): boolean {
-	return IS_LINUX;
+	return getContainerUnsupportedReason() === undefined;
+}
+
+/** Runtime facts exposed to the frontend and setup scripts. */
+export function getRuntimeEnvironment(): RuntimeEnvironmentInfo {
+	const containerUnsupportedReason = getContainerUnsupportedReason();
+	return {
+		android: IS_ANDROID,
+		proot: IS_PROOT,
+		termux: !!(
+			process.env.TERMUX_VERSION ||
+			process.env.TERMUX_APP__PACKAGE_NAME ||
+			pathLooksLikeTermux(process.env.PREFIX) ||
+			pathLooksLikeTermux(process.env.HOME)
+		),
+		containerSupport: containerUnsupportedReason === undefined,
+		...(containerUnsupportedReason && { containerUnsupportedReason }),
+	};
 }
 
 // ── WSL flag ─────────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
+import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import type { ToolDefinition, ToolResult } from "../types";
 import { readFileText, writeFileText } from "./encoding";
@@ -51,6 +52,7 @@ export const writeTool: ToolDefinition = {
 					sourceToolUseId: ctx.currentToolUseId ?? null,
 					allowProtectedTaskMutation: taskReflectionGranted,
 				});
+				broadcastSpecChanged(ctx.narratorId, file, "tool");
 				return { output: `Wrote ${content.length} bytes to ${file.uri}`, title: file.uri };
 			} catch (err) {
 				return {

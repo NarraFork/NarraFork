@@ -1977,6 +1977,33 @@ async function shouldAutoAllowSendWithinScope(
 	}
 }
 
+/**
+ * Heuristic: does this inline plan text look like a file-path / location
+ * reference rather than an actual plan body? Models sometimes fill the inline
+ * plan param with things like `plan_path: E:/project/PLAN.md` or a bare path,
+ * which would otherwise be shown to the user as if it were the plan. We only
+ * flag SHORT, SINGLE-LINE content — any multi-line text is treated as a real
+ * plan (zero false positives on genuine plans).
+ */
+function looksLikePathReference(text: string): boolean {
+	const trimmed = text.trim();
+	// Multi-line content is a real plan; never flag it.
+	if (/[\r\n]/.test(trimmed)) return false;
+	// Long single-line content is unusual for a path but plausible for a terse
+	// plan; only treat short strings as suspicious.
+	if (trimmed.length > 200) return false;
+	// `plan_path:` / `path:` / `file:` style key-value reference.
+	if (/^\s*(plan[_-]?path|path|file|filepath|plan[_-]?file)\s*[:=]/i.test(trimmed)) return true;
+	// `.narrafork/plan-*.md` short reference.
+	if (/\.narrafork[/\\]plan-[^\s]*\.md\s*$/i.test(trimmed)) return true;
+	// Bare filesystem path pointing at a doc file: Windows drive (E:\ or E:/) or
+	// POSIX absolute (/…) ending in a doc extension, with no spaces mid-path
+	// beyond a leading label.
+	if (/^[a-z]:[/\\][^\r\n]*\.(md|markdown|txt)\s*$/i.test(trimmed)) return true;
+	if (/^[/~][^\r\n]*\.(md|markdown|txt)\s*$/i.test(trimmed)) return true;
+	return false;
+}
+
 export function resolveExitPlanModeInput(
 	narratorId: string,
 	cwd: string,
@@ -2003,7 +2030,9 @@ export function resolveExitPlanModeInput(
 					// (large) plan body with a short path reference in model history. It is a
 					// non-schema key — ExitPlanMode's Zod object strips unknown keys on parse,
 					// and execute() only reads `plan`, so carrying it is safe.
-					effectiveInput = { ...effectiveInput, plan: content, _planFile: planFileName };
+					// Drop any model-supplied inline_plan when resolving from file.
+					const { inline_plan: _inlineIgnored, ...restForFile } = effectiveInput;
+					effectiveInput = { ...restForFile, plan: content, _planFile: planFileName };
 					resolvedFromFile = true;
 				}
 			}
@@ -2013,14 +2042,45 @@ export function resolveExitPlanModeInput(
 	}
 	// Inline plan is only used as a fallback when the instance allows it. When
 	// inline plans are disabled, the plan must come from the designated plan file.
+	// The model-facing param is `inline_plan`; `plan` is accepted for backward
+	// compatibility. Either way it is normalized into the canonical `plan` field.
 	if (!resolvedFromFile && allowInlinePlan) {
-		const inlinePlan = typeof input.plan === "string" ? input.plan.trim() : "";
+		const rawInline =
+			typeof input.inline_plan === "string"
+				? input.inline_plan
+				: typeof input.plan === "string"
+					? input.plan
+					: "";
+		const inlinePlan = rawInline.trim();
 		if (inlinePlan) {
-			effectiveInput = { ...effectiveInput, plan: inlinePlan };
+			// Guard against the model passing a file path / location reference instead
+			// of the actual plan body. Reject with a corrective message so it retries.
+			if (looksLikePathReference(inlinePlan)) {
+				const activePfId = active?._planFileId;
+				const planFilePath = activePfId
+					? `.narrafork/plan-${activePfId}.md`
+					: ".narrafork/plan-<id>.md";
+				const { inline_plan: _drop, plan: _drop2, ...rest } = effectiveInput;
+				return {
+					ok: false,
+					input: rest,
+					resolvedFromFile,
+					message: getToolMessageWithParams("exitPlanModePathReference", locale, {
+						planFile: planFilePath,
+					}),
+				};
+			}
+			const { inline_plan: _inlineIgnored, ...rest } = effectiveInput;
+			effectiveInput = { ...rest, plan: inlinePlan };
+		} else {
+			// Nothing usable inline; strip the empty model field so it does not linger.
+			const { inline_plan: _inlineIgnored, ...rest } = effectiveInput;
+			effectiveInput = rest;
 		}
-	} else if (!allowInlinePlan && typeof effectiveInput.plan === "string" && !resolvedFromFile) {
-		// Strip any inline plan the model may have passed despite the disabled schema.
-		const { plan: _ignored, ...rest } = effectiveInput;
+	} else if (!allowInlinePlan && !resolvedFromFile) {
+		// Inline plans disabled: strip any inline content the model may have passed
+		// despite the disabled schema (both the canonical and model-facing fields).
+		const { plan: _ignored, inline_plan: _inlineIgnored, ...rest } = effectiveInput;
 		effectiveInput = rest;
 	}
 
@@ -2909,7 +2969,10 @@ export async function handlePermission(
 	// A real permission request is waiting for the user — emit the semantic
 	// attention intent so notification consumers can alert the user. Suppressed
 	// when the caller (e.g. plan-reflection takeover fallback) drives this itself.
-	if (!options?.suppressAttention) {
+	// Track whether we emitted so resolvePermission can fire the symmetric
+	// `narrator:attention_resolved` only when an attention was actually raised.
+	const attentionEmitted = !options?.suppressAttention;
+	if (attentionEmitted) {
 		eventBus.emit({ type: "narrator:attention", narratorId, reason: "waiting_permission" });
 	}
 	await narratorService.updateStatus(narratorId, "waiting");
@@ -2992,6 +3055,7 @@ export async function handlePermission(
 			planModeSoftDeny: promotedPlanSoftDeny || undefined,
 			planSubmittedFromFile:
 				toolName === "ExitPlanMode" && exitPlanResolvedFromFile ? true : undefined,
+			attentionEmitted,
 		};
 		pendingPermissions.set(toolCallId, pendingEntry);
 		if (toolName === "AskUserQuestion") {
@@ -3089,6 +3153,19 @@ export async function resolvePermission(
 	});
 
 	pending.cleanup();
+
+	// Mirror of the `narrator:attention` emit in handlePermission — fire the
+	// symmetric resolved intent only when an attention was actually raised for
+	// this request (never for suppressed/takeover paths, so the two events stay
+	// one-to-one). `detail` carries the user's decision.
+	if (pending.attentionEmitted) {
+		eventBus.emit({
+			type: "narrator:attention_resolved",
+			narratorId: pending.narratorId,
+			reason: "waiting_permission",
+			detail: decision,
+		});
+	}
 
 	let updatedInput: Record<string, unknown> | undefined;
 	if (answers) {

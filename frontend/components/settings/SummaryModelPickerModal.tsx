@@ -17,6 +17,9 @@ import { FOLLOW_SUMMARY_MODEL } from "../../lib/constants";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
+type ModelComboboxItem = string | { value: string; label: string };
+type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
+
 export type SummaryModelPickerErrorKind = "unavailable" | "error";
 
 export interface SummaryModelPickerModalProps {
@@ -50,7 +53,7 @@ export function SummaryModelPickerModal({
 	// Exclude the "follow summary" sentinel — it would be self-referential here.
 	const summaryModelOptions = useMemo(
 		() =>
-			(groupedModels as ComboboxItemGroup[]).filter(
+			(groupedModels as ModelComboboxItemGroup[]).filter(
 				(g) =>
 					!g.items?.some?.((i) => (typeof i === "string" ? i : i.value) === FOLLOW_SUMMARY_MODEL),
 			),

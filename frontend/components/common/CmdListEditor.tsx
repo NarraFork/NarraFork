@@ -147,7 +147,7 @@ export function CmdListEditor(props: CmdListEditorProps) {
 						</ActionIcon>
 					</Group>
 					{!isWhitelist(props) && (
-						<Collapse in={expandedIdx === idx}>
+						<Collapse expanded={expandedIdx === idx}>
 							<Textarea
 								size="xs"
 								mt={4}

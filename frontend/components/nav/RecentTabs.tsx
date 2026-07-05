@@ -72,15 +72,10 @@ import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
-import {
-	endNarratorDrag,
-	moveNarratorDrag,
-	startNarratorDrag,
-	startNarratorDragManual,
-} from "../../lib/narrator-drag";
 import { triggerNotification } from "../../lib/notification";
+import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
-import { addLeaf, parseWorkspaceLayout, serializeWorkspaceLayout } from "../narrator/split-tree";
+import { queuePendingPanel } from "../narrator/workspace/dockview-layout";
 import { UserAvatar } from "../UserAvatar";
 
 const CreateNarratorModal = React.lazy(() =>
@@ -679,7 +674,7 @@ export function RecentTabList({
 			const me = event.activatorEvent as MouseEvent | TouchEvent;
 			const x = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
 			const y = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
-			startNarratorDragManual(nId, tab.title, x, y);
+			startDragManual(nId, tab.title, x, y);
 		},
 		[],
 	);
@@ -698,7 +693,7 @@ export function RecentTabList({
 		const me = event.activatorEvent as MouseEvent | TouchEvent;
 		const baseX = "clientX" in me ? me.clientX : (me.touches?.[0]?.clientX ?? 0);
 		const baseY = "clientY" in me ? me.clientY : (me.touches?.[0]?.clientY ?? 0);
-		moveNarratorDrag(baseX + event.delta.x, baseY + event.delta.y);
+		moveDrag(baseX + event.delta.x, baseY + event.delta.y);
 	}, []);
 
 	// After a drop, suppress all sortable transitions for one frame so the
@@ -795,7 +790,7 @@ export function RecentTabList({
 		(event: DragEndEvent) => {
 			justDragged = true;
 			// End global narrator drag first — workspace drop handlers run synchronously
-			endNarratorDrag();
+			endDrag();
 
 			const { active, over } = event;
 			if (!over || active.id === over.id) {
@@ -951,7 +946,7 @@ export function RecentTabList({
 	}, [ctxMenu, fsRevealCapability.supported]);
 
 	const handleDragCancel = useCallback(() => {
-		endNarratorDrag();
+		endDrag();
 		setOptimisticTabs(null);
 		clearDragState();
 	}, [clearDragState]);
@@ -980,30 +975,16 @@ export function RecentTabList({
 				status: data.status,
 				workspaceId: wsId,
 			});
-			// Fetch current workspace tree, add the new leaf, persist
-			try {
-				const ws = (await api.getWorkspace(wsId)) as { tree?: string };
-				const layout = ws?.tree ? parseWorkspaceLayout(ws.tree) : parseWorkspaceLayout("");
-				const updated = addLeaf(layout.tree, data.id);
-				await api.updateWorkspace(wsId, {
-					tree: serializeWorkspaceLayout({
-						tree: updated,
-						presentation: layout.presentation,
-					}),
-				});
-				qc.invalidateQueries({ queryKey: ["workspace", wsId] });
-			} catch (err) {
-				notifications.show({
-					color: "yellow",
-					title: t("workspaceTreeUpdateFailed") ?? "Workspace layout update failed",
-					message: err instanceof Error ? err.message : String(err),
-				});
-			}
+			// Hand the new narrator off to the Dockview workspace as a pending panel.
+			// The DockviewWorkspace drains this on mount/activation and adds the
+			// panel via its own layout API, so the sidebar never needs to touch the
+			// layout serialization format.
+			queuePendingPanel(wsId, { panelType: "narrator", narratorId: data.id });
 			// Navigate to the workspace
 			navigate({ to: `/narrators/workspace/${wsId}` });
 			onNavigate?.();
 		},
-		[wsCreateTarget, qc, navigate, onNavigate, t],
+		[wsCreateTarget, navigate, onNavigate],
 	);
 
 	if (topLevel.length === 0) return null;
@@ -1706,7 +1687,7 @@ const SortableTabItem = React.memo(function SortableTabItem({
 			if (e.button !== 0 || !dragNarratorId) return;
 			e.stopPropagation();
 			e.preventDefault();
-			startNarratorDrag(dragNarratorId, tab.title, e.clientX, e.clientY);
+			startPointerDrag(dragNarratorId, tab.title, e.clientX, e.clientY);
 		},
 		[dragNarratorId, tab.title],
 	);

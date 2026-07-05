@@ -216,6 +216,62 @@ describe("narratorService message query regressions", () => {
 		]);
 	});
 
+	it("getEmergencyCompactBoundaryMessage 在消息过少时忽略 keepPairs 仍返回边界", async () => {
+		seedBase("n-few");
+
+		// Only 3 top-level messages — below the normal keepPairs=2 threshold
+		// (needs keepCount+2 = 6), so getCompactBoundaryMessage returns null.
+		insertMessage({
+			id: "f-m0",
+			seq: 0,
+			narratorId: "n-few",
+			role: "user",
+			contentJson: [{ type: "text", text: "huge pasted input" }],
+			contentText: "huge pasted input",
+		});
+		insertMessage({
+			id: "f-m1",
+			seq: 1,
+			narratorId: "n-few",
+			role: "assistant",
+			contentJson: [{ type: "text", text: "reply" }],
+			contentText: "reply",
+		});
+		insertMessage({
+			id: "f-m2",
+			seq: 2,
+			narratorId: "n-few",
+			role: "user",
+			contentJson: [{ type: "text", text: "another huge input" }],
+			contentText: "another huge input",
+		});
+
+		// Normal boundary bails out because there are too few messages.
+		const normal = await narratorService.getCompactBoundaryMessage("n-few", 2);
+		expect(normal).toBeNull();
+
+		// Emergency boundary keeps only the most recent message (f-m2) and
+		// compacts everything before it.
+		const emergency = await narratorService.getEmergencyCompactBoundaryMessage("n-few");
+		expect(emergency).toBe("f-m2");
+	});
+
+	it("getEmergencyCompactBoundaryMessage 在只有 1 条消息时返回 null", async () => {
+		seedBase("n-one");
+
+		insertMessage({
+			id: "o-m0",
+			seq: 0,
+			narratorId: "n-one",
+			role: "user",
+			contentJson: [{ type: "text", text: "only message" }],
+			contentText: "only message",
+		});
+
+		const emergency = await narratorService.getEmergencyCompactBoundaryMessage("n-one");
+		expect(emergency).toBeNull();
+	});
+
 	it("getChunksByRange 构建树、截断大输出并过滤 ExitPlan→plan compact 包装消息", async () => {
 		seedBase();
 

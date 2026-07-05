@@ -20,23 +20,56 @@ export interface ToolProvider {
  * Registry for agent tools.
  */
 export class ToolRegistry {
-	private tools = new Map<string, ToolDefinition>();
+	/** Tools registered individually (not via a provider). */
+	private directTools = new Map<string, ToolDefinition>();
 	private providers = new Map<string, ToolProvider>();
+	/**
+	 * Cache of the flattened tool set (direct + all providers'), rebuilt lazily.
+	 * Null means "needs (re)materialization".
+	 *
+	 * Provider tools are materialized LAZILY (on first read) rather than eagerly
+	 * at registerProvider() time. A provider's tools() closure typically
+	 * references module-level tool bindings (editTool, bashTool, …); calling it
+	 * during a re-entrant, import-time registration would read those bindings
+	 * while they are still in the temporal dead zone and throw. Deferring to the
+	 * first get()/all() — which only happens at request time, after all modules
+	 * have finished initializing — avoids that entirely.
+	 */
+	private materialized: Map<string, ToolDefinition> | null = null;
 
 	register(tool: ToolDefinition): void {
-		this.tools.set(tool.name, tool);
+		this.directTools.set(tool.name, tool);
+		this.materialized = null;
 	}
 
 	unregister(name: string): void {
-		this.tools.delete(name);
+		this.directTools.delete(name);
+		this.materialized = null;
+	}
+
+	private ensureMaterialized(): Map<string, ToolDefinition> {
+		if (this.materialized) return this.materialized;
+		const flat = new Map<string, ToolDefinition>();
+		// Providers first, then direct tools, so an explicitly registered tool
+		// wins over a provider tool of the same name.
+		for (const provider of this.providers.values()) {
+			for (const tool of provider.tools()) {
+				flat.set(tool.name, tool);
+			}
+		}
+		for (const [name, tool] of this.directTools) {
+			flat.set(name, tool);
+		}
+		this.materialized = flat;
+		return flat;
 	}
 
 	get(name: string): ToolDefinition | undefined {
-		return this.tools.get(name);
+		return this.ensureMaterialized().get(name);
 	}
 
 	all(): ToolDefinition[] {
-		return [...this.tools.values()];
+		return [...this.ensureMaterialized().values()];
 	}
 
 	registerProvider(provider: ToolProvider): void {
@@ -45,19 +78,16 @@ export class ToolRegistry {
 		}
 		this.providers.set(provider.name, provider);
 		provider.initialize?.();
-		for (const tool of provider.tools()) {
-			this.tools.set(tool.name, tool);
-		}
+		// Do NOT call provider.tools() here — see `materialized` doc comment.
+		this.materialized = null;
 	}
 
 	unregisterProvider(name: string): void {
 		const provider = this.providers.get(name);
 		if (!provider) return;
-		for (const tool of provider.tools()) {
-			this.tools.delete(tool.name);
-		}
 		provider.dispose?.();
 		this.providers.delete(name);
+		this.materialized = null;
 	}
 }
 

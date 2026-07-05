@@ -947,6 +947,29 @@ export const narratorMessageQueries = {
 		return boundaryRef.messageId;
 	},
 
+	/**
+	 * Emergency compact boundary used by context-overflow recovery.
+	 *
+	 * Unlike getCompactBoundaryMessage, this ignores the configured keepPairs and
+	 * compacts everything except the most recent top-level message so that even a
+	 * conversation with only a handful of messages (e.g. a single oversized
+	 * message that blew the context window) still has something to summarize.
+	 *
+	 * Returns null only when there is genuinely nothing to compact (0 or 1
+	 * post-compact messages), in which case no summary can reduce the context.
+	 */
+	async getEmergencyCompactBoundaryMessage(narratorId: string): Promise<string | null> {
+		const includeChildMessages = await this.isSubagentNarrator(narratorId);
+		const refs = await this._getPostCompactTopLevelRefs(narratorId, {
+			includeChildMessages,
+		});
+		// Need at least 2 messages: one to summarize + one to keep as the boundary.
+		if (refs.length < 2) return null;
+		// Keep only the most recent message; compact everything before it.
+		const boundaryRef = refs[refs.length - 1];
+		return boundaryRef.messageId;
+	},
+
 	async getRecentMessages(narratorId: string, limit = 4) {
 		const rows = await db
 			.select({

@@ -1220,6 +1220,7 @@ function ToolTimingTooltipLabel({
 }
 
 const DEFAULT_BASH_TIMEOUT_MS = 120_000;
+const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 
 /**
  * Popover for viewing/editing timeout on a running tool call.
@@ -1589,12 +1590,14 @@ const ToolHeader = memo(
 			return toolCall.toolName;
 		}, [cat, toolCall.toolName, toolCall.inputJson, t]);
 
-		// For Bash tools, resolve the effective timeout (from _timeoutMs, inputJson, or default)
+		// For Bash and Await tools, resolve the effective timeout (from _timeoutMs,
+		// inputJson, or a per-tool default). Both support live timeout editing.
 		const effectiveTimeoutMs = useMemo(() => {
-			if (cat !== "bash") return null;
+			if (cat !== "bash" && cat !== "await") return null;
 			if (toolCall._timeoutMs != null) return toolCall._timeoutMs;
 			const ms = extractNumericField(toolCall.inputJson, "timeout");
-			return ms ?? DEFAULT_BASH_TIMEOUT_MS;
+			if (ms != null) return ms;
+			return cat === "await" ? DEFAULT_AWAIT_TIMEOUT_MS : DEFAULT_BASH_TIMEOUT_MS;
 		}, [cat, toolCall._timeoutMs, toolCall.inputJson]);
 
 		// For Bash tools, prefer pure execution time (excludes streaming parse + permission wait)

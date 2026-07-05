@@ -135,6 +135,13 @@ export interface PendingPermission {
 	planModeSoftDeny?: boolean;
 	planSubmittedFromFile?: boolean;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Whether a user-facing `narrator:attention` (reason=waiting_permission) was
+	 * emitted for this request. Mirrors the emit in handlePermission so that
+	 * resolvePermission can emit the symmetric `narrator:attention_resolved` only
+	 * when an attention was actually raised (never for suppressed/takeover paths).
+	 */
+	attentionEmitted?: boolean;
 }
 
 // === BufferCreator interface ===

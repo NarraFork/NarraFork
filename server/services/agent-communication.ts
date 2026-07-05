@@ -39,6 +39,13 @@ export interface AwaitAgentInput {
 	id: string;
 	timeoutMs?: number;
 	signal: AbortSignal;
+	/**
+	 * Optional reschedulable-timeout signal (from the Await tool). When it fires
+	 * the wait ends with a "timeout" status rather than "aborted", so the UI can
+	 * distinguish a deadline from a real parent interrupt. Extending the timeout
+	 * mid-wait replaces the timer behind this signal.
+	 */
+	timeoutSignal?: AbortSignal;
 }
 
 export interface AwaitAgentResult {
@@ -310,6 +317,27 @@ export async function waitForSubagentResult(opts: {
 	});
 }
 
+/**
+ * Build the effective wait signal and a status relabeler for an Await call.
+ * When a reschedulable timeoutSignal is provided (from the Await tool), the wait
+ * is bounded by the union of the parent-interrupt signal and the timeout signal,
+ * and a plain "aborted" is relabeled to "timeout" when only the timeout fired.
+ */
+function buildAwaitTimeoutContext(opts: AwaitAgentInput): {
+	signal: AbortSignal;
+	relabel: (status: string) => string;
+} {
+	if (!opts.timeoutSignal) {
+		return { signal: opts.signal, relabel: (status) => status };
+	}
+	const timeoutSignal = opts.timeoutSignal;
+	return {
+		signal: AbortSignal.any([opts.signal, timeoutSignal]),
+		relabel: (status) =>
+			status === "aborted" && !opts.signal.aborted && timeoutSignal.aborted ? "timeout" : status,
+	};
+}
+
 async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	const resolvedId = resolveTaskAlias(opts.callerNarratorId, opts.id);
 	let task = await backgroundTaskService.getById(resolvedId);
@@ -333,14 +361,15 @@ async function awaitBackgroundAgentTask(opts: AwaitAgentInput) {
 	}
 
 	if (task.status === "running") {
+		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await backgroundTaskService.waitForCompletion(
 			task.id,
 			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-			opts.signal,
+			signal,
 		);
 		return {
 			id: subagentId,
-			status: waited.status,
+			status: relabel(waited.status),
 			output: waited.output,
 		};
 	}
@@ -361,12 +390,18 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 	const scope = await getCommunicationScope(opts.callerNarratorId);
 	const target = await resolveOneTarget(opts.id, scope);
 	if (target.isBackground && target.backgroundStatus === "running") {
-		const waited = await waitForBackgroundTask(target.id, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+		const { signal, relabel } = buildAwaitTimeoutContext(opts);
+		const waited = await waitForBackgroundTask(
+			target.id,
+			opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			signal,
+		);
+		const status = relabel(waited.status);
 		return {
 			id: target.id,
-			status: waited.status,
+			status,
 			output: waited.result ?? "(no output)",
-			formatted: formatAgentAwaitResult(target.id, waited.status, waited.result),
+			formatted: formatAgentAwaitResult(target.id, status, waited.result),
 		};
 	}
 	if (target.isBackground && target.backgroundStatus) {
@@ -393,17 +428,19 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 				formatted: formatAgentAwaitResult(target.id, "taken_over", finalText),
 			};
 		}
+		const { signal, relabel } = buildAwaitTimeoutContext(opts);
 		const waited = await waitForSubagentResult({
 			subagentId: target.id,
 			parentNarratorId: target.parentNarratorId as string,
 			timeoutMs: opts.timeoutMs,
-			signal: opts.signal,
+			signal,
 		});
+		const status = relabel(waited.status);
 		return {
 			id: target.id,
-			status: waited.status,
+			status,
 			output: waited.output,
-			formatted: formatAgentAwaitResult(target.id, waited.status, waited.output),
+			formatted: formatAgentAwaitResult(target.id, status, waited.output),
 		};
 	}
 	const finalText = await getSubagentFinalText(target.id);

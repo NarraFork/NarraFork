@@ -290,7 +290,9 @@ export const terminalService = {
 				onData: (text) => onData(id, buffer, text),
 			});
 		} else {
-			// Direct mode: platform-appropriate PTY
+			// Direct mode: platform-appropriate PTY. On some Linux-like runtimes
+			// (notably Android/proot), Bun.Terminal may be present but fail at spawn
+			// time, so keep the portable PTY as a Unix fallback too.
 			const spawnOpts: TerminalSpawnOptions = {
 				cmd: [DEFAULT_SHELL, "-l"],
 				cwd,
@@ -303,7 +305,18 @@ export const terminalService = {
 				rows,
 				onData: (data) => onData(id, buffer, data),
 			};
-			runtime = IS_WINDOWS ? spawnPortablePty(spawnOpts) : spawnBunTerminal(spawnOpts);
+			if (IS_WINDOWS) {
+				runtime = spawnPortablePty(spawnOpts);
+			} else {
+				try {
+					runtime = spawnBunTerminal(spawnOpts);
+				} catch (err) {
+					logger.warn("Bun.Terminal failed, falling back to portable PTY", {
+						error: String(err),
+					});
+					runtime = spawnPortablePty(spawnOpts);
+				}
+			}
 		}
 
 		activeTerminals.set(id, { runtime, terminalId: id, buffer, useDtach });

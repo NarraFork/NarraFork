@@ -25,6 +25,11 @@ export interface FileModificationsPanelProps {
 	deletePreviewMessageId?: string | null;
 	onConfirmDelete?: () => void;
 	onCancelDelete?: () => void;
+	/**
+	 * When true (dock surface), suppress this panel's own title bar — the dock's
+	 * ToolPanelShell provides the single header. This panel has no header actions.
+	 */
+	chromeless?: boolean;
 }
 
 /** Pure content panel — used as sidebar on desktop */
@@ -36,6 +41,7 @@ export function FileModificationsPanel({
 	deletePreviewMessageId,
 	onConfirmDelete,
 	onCancelDelete,
+	chromeless = false,
 }: FileModificationsPanelProps) {
 	const { t } = useTranslation("narrator");
 	const { data: narrator } = useNarrator(narratorId);
@@ -77,24 +83,26 @@ export function FileModificationsPanel({
 
 	return (
 		<Box h="100%" style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
-			{/* Header */}
-			<Group
-				gap={6}
-				px="xs"
-				py={3}
-				style={{
-					flexShrink: 0,
-					borderBottom: "1px solid var(--mantine-color-dark-4)",
-				}}
-			>
-				<IconFileCode size={14} />
-				<Text size="xs" fw={500} style={{ flex: 1 }}>
-					{t("fileMod_title")}
-				</Text>
-				<ActionIcon size="xs" variant="subtle" color="gray" onClick={onClose}>
-					<IconX size={12} />
-				</ActionIcon>
-			</Group>
+			{/* Header — hidden in the dock (ToolPanelShell provides it). */}
+			{!chromeless && (
+				<Group
+					gap={6}
+					px="xs"
+					py={3}
+					style={{
+						flexShrink: 0,
+						borderBottom: "1px solid var(--mantine-color-dark-4)",
+					}}
+				>
+					<IconFileCode size={14} />
+					<Text size="xs" fw={500} style={{ flex: 1 }}>
+						{t("fileMod_title")}
+					</Text>
+					<ActionIcon size="xs" variant="subtle" color="gray" onClick={onClose}>
+						<IconX size={12} />
+					</ActionIcon>
+				</Group>
+			)}
 
 			{/* Tabs content */}
 			<Tabs

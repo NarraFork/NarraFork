@@ -237,7 +237,7 @@ function SettingsTerminalsPage() {
 			)}
 
 			{/* Embedded terminal panel */}
-			<Collapse in={!!openTerminalId}>
+			<Collapse expanded={!!openTerminalId}>
 				{openTerminalId && (
 					<Paper withBorder p={0} style={{ overflow: "hidden" }}>
 						<Group

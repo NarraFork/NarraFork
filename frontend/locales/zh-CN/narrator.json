@@ -822,5 +822,45 @@
 			"permissionWait": "权限等待 {{duration}}",
 			"execution": "执行 {{duration}}"
 		}
+	},
+	"spec": {
+		"title": "工作规格",
+		"open": "打开 Spec",
+		"close": "关闭 Spec",
+		"save": "保存 (Ctrl+S)",
+		"saved": "已保存",
+		"saveError": "保存失败",
+		"reload": "放弃更改",
+		"conflictTitle": "冲突",
+		"conflictMessage": "文件已被外部修改，请重新加载以查看最新内容。",
+		"addTask": "添加任务",
+		"deleteTask": "删除任务",
+		"taskPlaceholder": "任务描述",
+		"tabTasks": "任务",
+		"tabDocs": "文档",
+		"readonly": "只读",
+		"changeStatus": "更改状态",
+		"protectedHint": "受保护任务。其内容已锁定；助手需经任务反思才能完成或删除。",
+		"protectedCount": "{{count}} 项受保护",
+		"hasBlocked": "有阻塞",
+		"allDone": "全部完成",
+		"progressLabel": "{{done}} / {{total}} 已完成",
+		"noTasks": "还没有任务。添加一项以构建工作计划。",
+		"unsavedTitle": "未保存的更改",
+		"unsavedMessage": "你有未保存的更改。放弃并切换吗？",
+		"discardConfirm": "放弃",
+		"keepEditing": "继续编辑",
+		"status": {
+			"todo": "待办",
+			"doing": "进行中",
+			"done": "完成",
+			"blocked": "阻塞"
+		},
+		"group": {
+			"todo": "待办",
+			"doing": "进行中",
+			"done": "已完成",
+			"blocked": "阻塞"
+		}
 	}
 }

@@ -1,0 +1,216 @@
+/**
+ * Global panel drag state — a framework-agnostic pointer-drag singleton used to
+ * drag "something" onto a Dockview surface: a sidebar recent tab (to create /
+ * focus a panel) or an existing panel header (to move / swap it).
+ *
+ * Two entry points:
+ * 1. Icon / header pointerdown → startPointerDrag / startPanelDrag
+ *    (registers document pointer listeners; the singleton owns the pointer)
+ * 2. @dnd-kit DndContext callbacks → startDragManual / moveDrag / endDrag
+ *    (no document listeners — @dnd-kit owns the pointer)
+ */
+
+export interface PanelDragState {
+	/**
+	 * The dragged subject id. For a sidebar tab this is the narrator id (or a
+	 * synthetic marker like `__terminal__` / `__webview__`); consumers that
+	 * create panels key off it. For an existing-panel drag, `panelId` is the
+	 * authoritative live panel id and this mirrors the subject.
+	 */
+	id: string;
+	title: string;
+	x: number;
+	y: number;
+	/** When drag originates from a workspace leaf panel, this is the leaf id. */
+	sourceLeafId?: string;
+	/**
+	 * When dragging an *existing* dockview panel (not a sidebar tab), this is
+	 * the live panel id. Consumers use it to move/swap the panel in place
+	 * instead of creating a new one.
+	 */
+	panelId?: string;
+	/** The dockview group id the dragged panel currently belongs to. */
+	sourceGroupId?: string;
+}
+
+type MoveListener = (state: PanelDragState) => void;
+type EndListener = (state: PanelDragState | null) => void;
+
+let _current: PanelDragState | null = null;
+/** Whether the drag was started via document pointer listeners (icon drag). */
+let _ownsPointer = false;
+const _moveListeners = new Set<MoveListener>();
+const _endListeners = new Set<EndListener>();
+
+/**
+ * Movement (px) the pointer must travel after pointerdown before a drag is
+ * actually activated. Below this, a pointerup is treated as a plain click, so
+ * clicking a draggable header (or its close button) never gets swallowed by an
+ * accidental zero-distance "drag".
+ */
+const DRAG_THRESHOLD_PX = 5;
+
+/** A pending, not-yet-activated pointer drag (armed on pointerdown). */
+interface PendingDrag {
+	state: PanelDragState;
+	startX: number;
+	startY: number;
+}
+let _pending: PendingDrag | null = null;
+
+export function getPanelDrag(): PanelDragState | null {
+	return _current;
+}
+
+/**
+ * Whether a drag subject id is a SYNTHETIC panel marker (e.g. `__terminal__`,
+ * `__spec__`, `__git__`) rather than a real narrator id.
+ *
+ * Synthetic ids identify tool panels being rearranged inside a dock surface.
+ * Consumers that only care about *narrators* being dragged in (e.g. the narrator
+ * page's drag-to-split "create workspace" drop zone) must ignore these, or they
+ * would create a bogus workspace leaf referencing a non-existent narrator.
+ */
+export function isSyntheticSubjectId(id: string): boolean {
+	return id.startsWith("__") && id.endsWith("__") && id.length >= 4;
+}
+
+// ── Entry point 1: pointerdown (registers document listeners) ──
+
+/**
+ * Arm a pointer drag WITHOUT activating it yet. Document listeners are added so
+ * we can watch for movement; the drag only becomes "live" (cursor changes,
+ * listeners are notified) once the pointer moves past DRAG_THRESHOLD_PX. If the
+ * pointer is released before then, it is a click — no drag, no drop.
+ */
+function beginPointerDrag(state: PanelDragState) {
+	// Clear any stale pending/live drag first.
+	teardownPointerListeners();
+	_pending = { state, startX: state.x, startY: state.y };
+	_current = null;
+	_ownsPointer = true;
+	document.addEventListener("pointermove", onDocPointerMove, true);
+	document.addEventListener("pointerup", onDocPointerUp, true);
+}
+
+/** Promote the pending drag to a live drag (first time the threshold is crossed). */
+function activatePendingDrag(x: number, y: number) {
+	if (!_pending) return;
+	_current = { ..._pending.state, x, y };
+	_pending = null;
+	document.body.style.userSelect = "none";
+	document.body.style.cursor = "grabbing";
+	emit();
+}
+
+function teardownPointerListeners() {
+	document.removeEventListener("pointermove", onDocPointerMove, true);
+	document.removeEventListener("pointerup", onDocPointerUp, true);
+}
+
+/**
+ * Start a pointer-driven drag of a subject (e.g. a sidebar recent tab). The
+ * singleton registers document listeners and owns the pointer until pointerup.
+ */
+export function startPointerDrag(
+	id: string,
+	title: string,
+	x: number,
+	y: number,
+	sourceLeafId?: string,
+) {
+	beginPointerDrag({ id, title, x, y, sourceLeafId });
+}
+
+/**
+ * Start dragging an existing dockview panel (identified by its live panel id).
+ * `id` may be a real narrator id or a synthetic marker for terminal/webview
+ * panels; consumers key off `panelId` for move/swap.
+ */
+export function startPanelDrag(args: {
+	panelId: string;
+	id: string;
+	title: string;
+	sourceGroupId?: string;
+	x: number;
+	y: number;
+}) {
+	beginPointerDrag({
+		id: args.id,
+		title: args.title,
+		x: args.x,
+		y: args.y,
+		panelId: args.panelId,
+		sourceGroupId: args.sourceGroupId,
+	});
+}
+
+function onDocPointerMove(e: PointerEvent) {
+	// Still pending: activate only once the pointer travels past the threshold.
+	if (_pending) {
+		const dx = e.clientX - _pending.startX;
+		const dy = e.clientY - _pending.startY;
+		if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+		activatePendingDrag(e.clientX, e.clientY);
+		return;
+	}
+	if (!_current) return;
+	_current = { ..._current, x: e.clientX, y: e.clientY };
+	emit();
+}
+
+function onDocPointerUp() {
+	teardownPointerListeners();
+	_ownsPointer = false;
+	// Released before crossing the threshold → this was a click, not a drag.
+	// Drop the pending drag silently so the native click can proceed.
+	if (_pending) {
+		_pending = null;
+		_current = null;
+		return;
+	}
+	document.body.style.userSelect = "";
+	document.body.style.cursor = "";
+	const final = _current;
+	_current = null;
+	for (const fn of _endListeners) fn(final);
+}
+
+// ── Entry point 2: @dnd-kit managed drag (no document listeners) ──
+
+export function startDragManual(id: string, title: string, x: number, y: number) {
+	_current = { id, title, x, y };
+	_ownsPointer = false;
+	emit();
+}
+
+export function moveDrag(x: number, y: number) {
+	if (!_current) return;
+	_current = { ..._current, x, y };
+	emit();
+}
+
+export function endDrag(): PanelDragState | null {
+	if (_ownsPointer) return null; // let document listener handle it
+	const final = _current;
+	_current = null;
+	for (const fn of _endListeners) fn(final);
+	return final;
+}
+
+// ── Shared ──
+
+function emit() {
+	if (!_current) return;
+	for (const fn of _moveListeners) fn(_current);
+}
+
+export function onPanelDragMove(fn: MoveListener): () => void {
+	_moveListeners.add(fn);
+	return () => _moveListeners.delete(fn);
+}
+
+export function onPanelDragEnd(fn: EndListener): () => void {
+	_endListeners.add(fn);
+	return () => _endListeners.delete(fn);
+}

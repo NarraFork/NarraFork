@@ -233,8 +233,8 @@
 	opacity: 1;
 }
 
-.codeBlockWithLang pre {
-	padding-top: calc(var(--mantine-spacing-xs) + 14px);
+.codeBlock.codeBlockWithLang pre {
+	padding-top: calc(var(--mantine-spacing-xs) + 12px);
 }
 
 /* KaTeX block-level formulas: horizontal scroll on overflow */
@@ -242,4 +242,44 @@
 .rootNoWrap .katex-display {
 	overflow-x: auto;
 	overflow-y: hidden;
+}
+
+/* ── Mermaid diagram container ───────────────────────────────────────────────
+   Toolbar (size toggle / fullscreen / export) sits top-right and fades in on
+   hover, matching the code-block copy button. */
+.mermaidToolbar {
+	opacity: 0;
+	transition: opacity 150ms ease;
+}
+
+.mermaidContainer:hover .mermaidToolbar,
+.mermaidToolbar:focus-within {
+	opacity: 1;
+}
+
+/* Diagram host. Sizing of the injected <svg> is done imperatively in JS
+   (MermaidDiagram) by rewriting the svg's inline width/height, because mermaid
+   emits its own inline `style="max-width:<natural>px"` that CSS can't reliably
+   beat without !important + specificity fights. These rules cover layout only. */
+.mermaidSvgHost {
+	display: flex;
+	justify-content: center;
+	/* Fill the container so the child svg's width:100% resolves against the full
+	   width instead of shrinking to the diagram's intrinsic size. */
+	width: 100%;
+	/* The whole diagram is a click target (opens fullscreen); prevent the click
+	   from selecting SVG text nodes. */
+	user-select: none;
+	-webkit-user-select: none;
+}
+
+/* Both size modes fill the container width; the toggle only changes the height
+   cap (applied inline in JS via applySvgSize). No per-mode layout rules needed —
+   the classes are kept as hooks in case mode-specific styling is added later. */
+
+.mermaidExportError {
+	position: absolute;
+	top: 6px;
+	left: 8px;
+	z-index: 1;
 }

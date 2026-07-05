@@ -1,9 +1,16 @@
 import "@frontend/lib/hmr-guard";
 import "@frontend/lib/dom-mutation-guard";
-import { Center, createTheme, Loader, MantineProvider } from "@mantine/core";
+import {
+	Center,
+	createTheme,
+	Loader,
+	MantineProvider,
+	v8CssVariablesResolver,
+} from "@mantine/core";
 import "@mantine/core/styles.css";
 import { Notifications } from "@mantine/notifications";
 import "@mantine/notifications/styles.css";
+import "@mantine/tiptap/styles.css";
 import { ConfirmDialogProvider } from "@frontend/components/common/ConfirmDialogProvider";
 import { ImageViewerProvider } from "@frontend/components/common/ImageViewerProvider";
 import "@frontend/styles/oled.css";
@@ -21,6 +28,7 @@ import { routeTree } from "./routeTree.gen";
 
 const theme = createTheme({
 	primaryColor: "indigo",
+	defaultRadius: "sm",
 	components: {
 		NavLink: {
 			styles: {
@@ -52,10 +60,14 @@ async function bootstrap() {
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists
 	ReactDOM.createRoot(document.getElementById("root")!).render(
 		<React.StrictMode>
-			<MantineProvider theme={theme} defaultColorScheme="auto">
+			<MantineProvider
+				theme={theme}
+				defaultColorScheme="auto"
+				cssVariablesResolver={v8CssVariablesResolver}
+			>
 				<ConfirmDialogProvider>
 					<ImageViewerProvider>
-						<Notifications position="top-right" zIndex={Z.toast} />
+						<Notifications position="top-right" zIndex={Z.toast} pauseResetOnHover="notification" />
 						<QueryClientProvider client={queryClient}>
 							<React.Suspense
 								fallback={

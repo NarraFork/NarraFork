@@ -38,19 +38,73 @@ interface BrowserPanelProps {
 	/** Latest visual-change event — triggers auto-refresh. The seq disambiguates
 	 *  repeated changes to the same session so each one re-runs the effect. */
 	visualChange?: { sessionId: string; seq: number } | null;
+	/**
+	 * When true (dock surface), render as a full panel: no collapsible toggle
+	 * header (the dock's ToolPanelShell provides title + count badge), sessions
+	 * are always shown and always fetched.
+	 */
+	chromeless?: boolean;
 }
 
-export function BrowserPanel({ narratorId, sessionCount, visualChange }: BrowserPanelProps) {
+export function BrowserPanel({
+	narratorId,
+	sessionCount,
+	visualChange,
+	chromeless = false,
+}: BrowserPanelProps) {
 	const { t } = useTranslation("narrator");
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const [opened, setOpened] = useState(false);
+	// In the dock the panel is always visible, so always fetch; as an embedded
+	// widget it only fetches once expanded.
+	const expanded = chromeless || opened;
 	const { data: sessions } = useBrowserSessions(
-		browserSessionsCapability.supported === false || !opened ? "" : narratorId,
+		browserSessionsCapability.supported === false || !expanded ? "" : narratorId,
 	);
 	if (browserSessionsCapability.supported === false) return null;
 
 	const count = sessions?.length ?? sessionCount ?? 0;
-	if (count === 0) return null;
+	// The dock always renders the panel shell; only the embedded widget hides
+	// itself when there are no sessions.
+	if (count === 0 && !chromeless) return null;
+
+	const sessionGrid = (
+		<Box
+			px="sm"
+			pb="xs"
+			style={{
+				maxHeight: chromeless ? undefined : 600,
+				overflowY: "auto",
+				display: "grid",
+				gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
+				gap: 8,
+			}}
+		>
+			{sessions?.map((session) => (
+				<BrowserSessionCard
+					key={session.id}
+					narratorId={narratorId}
+					session={session}
+					visualChange={visualChange}
+				/>
+			))}
+		</Box>
+	);
+
+	// Dock: no own header (shell provides it); content fills the panel.
+	if (chromeless) {
+		return (
+			<Box style={{ height: "100%", overflowY: "auto", paddingTop: 8 }}>
+				{count === 0 ? (
+					<Text size="xs" c="dimmed" ta="center" pt="md">
+						{t("browser.title")}
+					</Text>
+				) : (
+					sessionGrid
+				)}
+			</Box>
+		);
+	}
 
 	return (
 		<Box
@@ -77,28 +131,7 @@ export function BrowserPanel({ narratorId, sessionCount, visualChange }: Browser
 				</Group>
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</UnstyledButton>
-			<Collapse in={opened}>
-				<Box
-					px="sm"
-					pb="xs"
-					style={{
-						maxHeight: 600,
-						overflowY: "auto",
-						display: "grid",
-						gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))",
-						gap: 8,
-					}}
-				>
-					{sessions?.map((session) => (
-						<BrowserSessionCard
-							key={session.id}
-							narratorId={narratorId}
-							session={session}
-							visualChange={visualChange}
-						/>
-					))}
-				</Box>
-			</Collapse>
+			<Collapse expanded={opened}>{sessionGrid}</Collapse>
 		</Box>
 	);
 }

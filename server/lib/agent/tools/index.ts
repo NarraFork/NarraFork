@@ -66,15 +66,15 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 ]);
 
 /**
- * Knowledge Steward narrators preinstall these optional tools (written into enabledTools at
- * creation). KnowledgeAdmin is admin-only and added separately after an admin check.
+ * Knowledge Steward preload tool names live in a dependency-free leaf module so
+ * that narrator-service.ts can import them without pulling in tools/index.ts
+ * (which would re-form the circular-import chain). Re-exported here for
+ * backward compatibility with existing importers.
  */
-export const KNOWLEDGE_KIND_PRELOAD_TOOLS = [
-	"KnowledgeCreate",
-	"KnowledgeEdit",
-	"KnowledgeReview",
-] as const;
-export const KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN = "KnowledgeAdmin";
+export {
+	KNOWLEDGE_KIND_PRELOAD_TOOLS,
+	KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN,
+} from "./knowledge-kind";
 
 /**
  * Core tools a Knowledge Steward narrator does NOT need — denied in toolFilter for this kind.

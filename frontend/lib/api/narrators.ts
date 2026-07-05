@@ -674,9 +674,12 @@ export const narratorsApi = {
 			},
 		),
 	dismissErrorMessage: (narratorId: string, messageId: string) =>
-		request<{ ok: boolean }>(`/narrators/${narratorId}/error-messages/${messageId}`, {
-			method: "DELETE",
-		}),
+		request<{ ok: boolean; deletedMessageIds: string[] }>(
+			`/narrators/${narratorId}/error-messages/${messageId}`,
+			{
+				method: "DELETE",
+			},
+		),
 	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
 		request<{ ok: boolean; messageDeleted: boolean }>(
 			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}`,

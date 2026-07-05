@@ -27,12 +27,14 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
 			properties: Record<string, unknown>;
 		};
-		expect(schema.properties.plan).toBeDefined();
+		// Model-facing param is `inline_plan`; the ambiguous `plan` name is never exposed.
+		expect(schema.properties.inline_plan).toBeDefined();
+		expect(schema.properties.plan).toBeUndefined();
 		expect(schema.properties.allowedPrompts).toBeDefined();
 
 		const desc = resolveDescription(config);
 		expect(desc).toContain("Mode A");
-		expect(desc).toContain("`plan` parameter");
+		expect(desc).toContain("`inline_plan` parameter");
 	});
 
 	it("drops the inline plan param and Mode A when inline is disabled", () => {
@@ -40,6 +42,7 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
 			properties: Record<string, unknown>;
 		};
+		expect(schema.properties.inline_plan).toBeUndefined();
 		expect(schema.properties.plan).toBeUndefined();
 		expect(schema.properties.allowedPrompts).toBeDefined();
 
@@ -53,12 +56,12 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
 			properties: Record<string, unknown>;
 		};
-		expect(schema.properties.plan).toBeDefined();
+		expect(schema.properties.inline_plan).toBeDefined();
 		// Static fallback schema also keeps the inline param.
 		const fallback = exitPlanModeTool.rawJsonSchema as {
 			properties: Record<string, unknown>;
 		};
-		expect(fallback.properties.plan).toBeDefined();
+		expect(fallback.properties.inline_plan).toBeDefined();
 	});
 });
 

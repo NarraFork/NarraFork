@@ -170,6 +170,10 @@ export interface NarratorPanelProps {
 	onToggleDetailsPanel?: () => void;
 	/** Callback that NarratorPanel calls when details props change, so the parent can render the sidebar */
 	onDetailsPropsChange?: (props: NarratorDetailsPanelExternalProps) => void;
+	/** Whether the spec panel is open (desktop sidebar mode) */
+	specPanelOpen?: boolean;
+	/** Toggle the spec panel (desktop sidebar mode) */
+	onToggleSpecPanel?: () => void;
 }
 
 /** Props that NarratorPanel exposes for the external file-mod sidebar panel */

@@ -79,12 +79,13 @@ export const enterPlanModeTool: ToolDefinition = {
 	},
 };
 
-const EXIT_PLAN_PLAN_PARAM_DESCRIPTION =
-	"The COMPLETE implementation plan in markdown format. " +
-	"Must contain the full plan with all steps, file changes, and reasoning. " +
-	"This content will be shown to the user for approval. Cannot be empty. " +
-	"Omit this parameter if you already wrote the plan to the designated plan file — " +
-	"the system will read the file automatically.";
+const EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION =
+	"The COMPLETE implementation plan text itself, in markdown format. " +
+	"This must be the ACTUAL plan content (all steps, file changes, and reasoning) — " +
+	"NOT a file path, a location, or a reference like 'plan_path: ...' or 'see FILE.md'. " +
+	"The verbatim text you put here is what the user reviews and approves. Cannot be empty. " +
+	"Omit this parameter entirely if you already wrote the plan to the designated plan file — " +
+	"the system will read that file automatically. Do not put the file path here.";
 
 const EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA = {
 	description:
@@ -121,15 +122,16 @@ function buildExitPlanModeDescription(config?: AgentConfig): string {
 		? "## How This Tool Works\n\n" +
 			"You have two ways to submit your plan:\n\n" +
 			"### Mode A: Inline plan (for short/medium plans)\n" +
-			"Pass the complete plan text in the `plan` parameter.\n\n" +
+			"Pass the complete plan text in the `inline_plan` parameter. " +
+			"This must be the actual plan content, NOT a file path or a reference to one.\n\n" +
 			"### Mode B: File-based plan (for long/complex plans)\n" +
-			"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `plan` parameter. " +
+			"Write your plan to the designated plan file using Write/Edit tools, then call ExitPlanMode WITHOUT the `inline_plan` parameter. " +
 			"The system will automatically read the plan file content and present it to the user.\n" +
-			"Do NOT put a file reference like 'Plan written to xxx' in the `plan` parameter — just omit `plan` entirely and the system handles the rest.\n\n"
+			"Do NOT put a file reference like 'Plan written to xxx' in the `inline_plan` parameter — just omit it entirely and the system handles the rest.\n\n"
 		: "## How This Tool Works\n\n" +
 			"Inline plans are disabled in this instance — only the file-based plan flow is supported.\n\n" +
 			"### File-based plan (the only supported mode)\n" +
-			"Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode (this tool takes no `plan` parameter). " +
+			"Write your complete plan to the designated plan file using Write/Edit tools, then call ExitPlanMode (this tool takes no plan parameter). " +
 			"The system will automatically read the plan file content and present it to the user.\n\n";
 	const rest =
 		"## When to Use This Tool\n" +
@@ -152,8 +154,13 @@ function buildExitPlanModeSchema(config?: AgentConfig): Record<string, unknown> 
 		allowedPrompts: EXIT_PLAN_ALLOWED_PROMPTS_SCHEMA,
 	};
 	if (allowInline) {
-		properties.plan = {
-			description: EXIT_PLAN_PLAN_PARAM_DESCRIPTION,
+		// Model-facing param is `inline_plan` (never `plan`). The old `plan` name
+		// invited models to pass a file path / location reference; the explicit
+		// `inline_plan` name plus its description make clear this must be the plan
+		// body itself. The resolution layer normalizes it to the canonical `plan`
+		// field before execute() runs.
+		properties.inline_plan = {
+			description: EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION,
 			type: "string",
 		};
 	}
@@ -171,7 +178,13 @@ export const exitPlanModeTool: ToolDefinition = {
 	// Static fallback schema (inline allowed) for contexts without a resolved config.
 	rawJsonSchema: buildExitPlanModeSchema(),
 	parameters: z.object({
-		plan: z.string().optional().describe(EXIT_PLAN_PLAN_PARAM_DESCRIPTION),
+		// `plan` is the canonical field: the resolution layer (resolveExitPlanModeInput)
+		// writes the resolved plan body here before tool-executor's safeParse runs, so it
+		// must be accepted. `inline_plan` is what the model actually fills; it is normalized
+		// into `plan` (and stripped) by the resolution layer. Both are optional; Zod strips
+		// unknown keys, so carrying either is safe.
+		plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
+		inline_plan: z.string().optional().describe(EXIT_PLAN_INLINE_PLAN_PARAM_DESCRIPTION),
 		allowedPrompts: z
 			.array(
 				z.object({
@@ -185,13 +198,15 @@ export const exitPlanModeTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		// The session layer (narrator-session.ts handlePermission) resolves the plan
-		// content before this execute() is called — either from the inline `plan`
-		// parameter or by reading the designated plan file on disk.  By the time we
-		// get here, `plan` should already contain the resolved content.
+		// The session layer (narrator-permission.ts resolveExitPlanModeInput) resolves the
+		// plan content before this execute() is called — either from the model's inline
+		// `inline_plan` parameter or by reading the designated plan file on disk — and
+		// normalizes it into the canonical `plan` field. By the time we get here, `plan`
+		// should already contain the resolved content; `inline_plan` is a defensive fallback.
 		const locale = (ctx?.locale as Locale) ?? "en";
-		const { plan } = args as { plan?: string };
-		if (!plan?.trim()) {
+		const { plan, inline_plan } = args as { plan?: string; inline_plan?: string };
+		const resolved = plan ?? inline_plan;
+		if (!resolved?.trim()) {
 			return {
 				output: getToolMessage("exitPlanModeEmptyPlanFallback", locale),
 				isError: true,

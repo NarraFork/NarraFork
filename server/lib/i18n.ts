@@ -48,6 +48,11 @@ const messages: Messages = {
 		"zh-CN":
 			"注意：工具结果里的 TODO 提醒块是临时信息。请忽略消息历史中的 <todo_reminder> 块；只有在待办状态相关时，才使用下面的最新 TODO 列表。",
 	},
+	"tool.compactContextOverflowHint": {
+		en: "EMERGENCY NOTICE: the context window overflowed and had to be force-compacted. Avoid using the Read tool's read-all mode (limit=-1) or reading very large files/outputs unless strictly necessary — otherwise the context window may fill up again quickly.",
+		"zh-CN":
+			"紧急提示：上下文窗口已溢出并被强制压缩。请勿在非必要的时候使用 read_all（Read 工具 limit=-1 全量读取模式）或读取超大文件/输出，否则上下文窗口可能会再次快速占满。",
+	},
 	"tool.compactCurrentTodos": {
 		en: `<current_todos>
 Latest TODO list from narrator state:
@@ -115,24 +120,29 @@ Latest TODO list from narrator state:
 			"[计划模式] 用户拒绝了你的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改你的计划，然后再次调用 ExitPlanMode 提交。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	"tool.exitPlanModeDeniedFile": {
-		en: "[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again without the 'plan' parameter so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: "[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'plan' 参数），让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			"[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	"tool.exitPlanModeDeniedFileWithMessage": {
-		en: "[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again without the 'plan' parameter so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: "[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'plan' 参数），让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			"[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	"tool.exitPlanModeEmptyPlan": {
-		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'plan' parameter.",
+		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'inline_plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'inline_plan' parameter.",
 		"zh-CN":
-			"错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件（{planFile}）— 当你不传 'plan' 参数调用 ExitPlanMode 时，系统会自动读取该文件。",
+			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件（{planFile}）— 当你不传 'inline_plan' 参数调用 ExitPlanMode 时，系统会自动读取该文件。",
 	},
 	"tool.exitPlanModeEmptyPlanFallback": {
-		en: "Error: The plan content is empty. Provide a non-empty plan in the 'plan' parameter or write it to the designated plan file first.",
+		en: "Error: The plan content is empty. Provide a non-empty plan in the 'inline_plan' parameter or write it to the designated plan file first.",
 		"zh-CN":
-			"错误：计划内容为空。请在 'plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+	},
+	"tool.exitPlanModePathReference": {
+		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan', or write your plan to the designated plan file ({planFile}) and call ExitPlanMode WITHOUT the 'inline_plan' parameter so the system reads it automatically.",
+		"zh-CN":
+			"错误：'inline_plan' 参数看起来是一个文件路径或位置引用，而不是真正的计划内容。'inline_plan' 参数必须包含完整的计划正文本身（所有步骤、文件改动、推理）— 这是用户要审阅的内容。不要传入类似 'plan_path: ...' 的路径或文件引用。请将完整的计划正文粘贴到 'inline_plan' 中，或将计划写入指定的计划文件（{planFile}）后不带 'inline_plan' 参数调用 ExitPlanMode，让系统自动读取。",
 	},
 	"tool.planModeSoftDenyAskReason": {
 		en: "[Plan Mode] This operation is blocked by plan mode restrictions. Allow to enable relaxed plan mode (tools remain available during planning).",
@@ -529,6 +539,7 @@ export type ToolMessageKey =
 	| "titleAck"
 	| "titleReminder"
 	| "compactTodoSkip"
+	| "compactContextOverflowHint"
 	| "compactCurrentTodos"
 	| "enterPlanModeOutput"
 	| "exitPlanModeOutput"
@@ -547,6 +558,7 @@ export type ToolMessageKey =
 	| "exitPlanModeDeniedFileWithMessage"
 	| "exitPlanModeEmptyPlan"
 	| "exitPlanModeEmptyPlanFallback"
+	| "exitPlanModePathReference"
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
 	| "planModeFileRedirected"

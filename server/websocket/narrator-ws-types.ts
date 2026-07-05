@@ -606,4 +606,13 @@ export type NarratorServerMessage =
 			type: "group:ready";
 			groupId: string;
 			title: string;
+	  }
+	| {
+			type: "spec_changed";
+			narratorId: string;
+			uri: string;
+			path: string;
+			revisionId: string | null;
+			updatedBy: "user" | "assistant" | "system";
+			source: "ui" | "tool" | "task_create";
 	  };

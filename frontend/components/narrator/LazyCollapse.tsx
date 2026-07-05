@@ -91,7 +91,7 @@ export const LazyCollapse = memo(function LazyCollapse({
 	if (opened && !hasToggled) return <>{children}</>;
 
 	return (
-		<Collapse in={reveal} onTransitionEnd={handleTransitionEnd}>
+		<Collapse expanded={reveal} onTransitionEnd={handleTransitionEnd}>
 			{children}
 		</Collapse>
 	);

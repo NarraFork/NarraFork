@@ -3,6 +3,7 @@ import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { isRgAvailable, RG_INSTALL_HINT, resolveRgPath } from "../../ripgrep";
 import { settings } from "../../settings";
+import { vfsGrep } from "../../vfs-grep";
 import type { ToolDefinition, ToolResult } from "../types";
 
 export { isRgAvailable };
@@ -12,20 +13,10 @@ const MAX_GREP_OUTPUT_BYTES = 10 * 1024 * 1024;
 /** Hard timeout for a single ripgrep invocation. Kills the process when elapsed. */
 const GREP_TIMEOUT_MS = 30_000;
 
-function escapeRegex(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function matchesSimpleGlob(path: string, globPattern?: string): boolean {
-	if (!globPattern) return true;
-	const regex = new RegExp(
-		`^${escapeRegex(globPattern)
-			.replace(/\\\*\\\*/g, ".*")
-			.replace(/\\\*/g, "[^/]*")}$`,
-	);
-	return regex.test(path);
-}
-
+/**
+ * Grep the narrator's spec:// virtual files. Fetches the in-memory file list
+ * and delegates matching to the VFS-agnostic engine in vfs-grep.ts.
+ */
 async function grepSpecFiles(args: {
 	narratorId: string;
 	pattern: string;
@@ -38,72 +29,26 @@ async function grepSpecFiles(args: {
 	offset: number;
 	multiline?: boolean;
 }): Promise<ToolResult> {
-	let regex: RegExp;
-	try {
-		regex = new RegExp(
-			args.pattern,
-			`${args.caseInsensitive ? "i" : ""}${args.multiline ? "s" : ""}`,
-		);
-	} catch (err) {
-		return {
-			output: `Invalid regex: ${err instanceof Error ? err.message : String(err)}`,
-			isError: true,
-		};
-	}
+	const files = await specVfsService.listSpecFiles(args.narratorId);
+	const pathPrefix =
+		args.path && args.path !== "spec://" ? specVfsService.normalizeSpecPath(args.path) : undefined;
 
-	let files = await specVfsService.listSpecFiles(args.narratorId);
-	if (args.path && args.path !== "spec://") {
-		const path = specVfsService.normalizeSpecPath(args.path);
-		files = files.filter((file) => file.path === path || file.path.startsWith(`${path}/`));
-	}
-	files = files.filter((file) => matchesSimpleGlob(file.path, args.glob));
-
-	const lines: string[] = [];
-	for (const file of files) {
-		if (args.multiline) {
-			const matched = regex.test(file.content);
-			regex.lastIndex = 0;
-			if (!matched) continue;
-			if (args.outputMode === "files_with_matches") lines.push(file.uri);
-			else if (args.outputMode === "count") lines.push(`${file.uri}:1`);
-			else lines.push(`${file.uri}:1:${file.content.split("\n")[0] ?? ""}`);
-			continue;
-		}
-
-		const fileLines = file.content.split(/\r?\n/);
-		const matches: string[] = [];
-		fileLines.forEach((line, index) => {
-			const matched = regex.test(line);
-			regex.lastIndex = 0;
-			if (!matched) return;
-			matches.push(
-				args.showLineNumbers ? `${file.uri}:${index + 1}:${line}` : `${file.uri}:${line}`,
-			);
-		});
-		if (matches.length === 0) continue;
-		if (args.outputMode === "files_with_matches") lines.push(file.uri);
-		else if (args.outputMode === "count") lines.push(`${file.uri}:${matches.length}`);
-		else lines.push(...matches);
-	}
-
-	let outputLines = lines;
-	if (args.offset > 0) outputLines = outputLines.slice(args.offset);
-	const truncated = args.headLimit > 0 && outputLines.length > args.headLimit;
-	if (args.headLimit > 0) outputLines = outputLines.slice(0, args.headLimit);
-	if (outputLines.length === 0) {
-		return {
-			output: "No matches found",
-			title: args.pattern,
-			metadata: { matches: 0, truncated: false },
-		};
-	}
-	const suffix = truncated
-		? `\n(Results limited to ${args.headLimit} entries. ${lines.length - args.offset - args.headLimit} more available.)`
-		: "";
+	const result = vfsGrep(files, {
+		pattern: args.pattern,
+		pathPrefix,
+		glob: args.glob,
+		outputMode: args.outputMode,
+		showLineNumbers: args.showLineNumbers,
+		caseInsensitive: args.caseInsensitive,
+		multiline: args.multiline,
+		headLimit: args.headLimit,
+		offset: args.offset,
+	});
 	return {
-		output: outputLines.join("\n") + suffix,
-		title: args.pattern,
-		metadata: { matches: lines.length, truncated },
+		output: result.output,
+		isError: result.isError,
+		title: result.title,
+		metadata: result.metadata,
 	};
 }
 

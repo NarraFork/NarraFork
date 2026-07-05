@@ -163,6 +163,7 @@ export {
 	upsertRecentTabSchema,
 } from "./settings";
 export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
+export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export {
 	createTerminalSchema,
 	createTerminalTabSchema,

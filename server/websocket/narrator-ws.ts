@@ -3,6 +3,7 @@ import type { ServerWebSocket } from "bun";
 import { and, count as countFn, eq } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, narratorToolCalls, terminals } from "../db/schema";
+import { updateAwaitTimeout } from "../lib/agent/tools/await";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
@@ -1011,7 +1012,11 @@ export const handleNarratorWS = {
 				break;
 			}
 			case "update_timeout": {
-				const newMs = updateBashTimeout(msg.toolUseId, msg.timeoutMs);
+				// Bash and Await both maintain live-timeout registries keyed by toolUseId;
+				// only one will match a given running tool.
+				const newMs =
+					updateBashTimeout(msg.toolUseId, msg.timeoutMs) ??
+					updateAwaitTimeout(msg.toolUseId, msg.timeoutMs);
 				if (newMs != null) {
 					broadcastToNarrator(msg.narratorId, {
 						type: "timeout_updated",

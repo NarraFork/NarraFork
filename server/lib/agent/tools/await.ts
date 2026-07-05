@@ -1,7 +1,41 @@
 import { z } from "zod/v4";
+import { hotSafe } from "../../hot-safe";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_AWAIT_TIMEOUT_MS = 86_400_000; // 24h — matches the update_timeout WS validator cap
+
+export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
+
+// --- Live timeout management ---
+// Tracks running Await waits so the UI can extend their timeout mid-wait, mirroring
+// the Bash tool's runningBashProcesses map. Pinned to globalThis via hotSafe so hot
+// reloads don't lose references to in-flight timers.
+
+interface RunningAwaitEntry {
+	startedAt: number;
+	timeoutMs: number;
+	/** Reschedule the timeout to fire `newMs` after the wait started. */
+	reschedule: (newMs: number) => void;
+}
+
+const runningAwaits = hotSafe(
+	"narrafork:runningAwaits",
+	() => new Map<string, RunningAwaitEntry>(),
+);
+
+/**
+ * Update the timeout of a running Await wait.
+ * Returns the new effective timeoutMs, or null if the toolUseId is not found.
+ */
+export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): number | null {
+	const entry = runningAwaits.get(toolUseId);
+	if (!entry) return null;
+	const clamped = Math.min(Math.max(newTimeoutMs, 1000), MAX_AWAIT_TIMEOUT_MS);
+	entry.timeoutMs = clamped;
+	entry.reschedule(clamped);
+	return clamped;
+}
 
 export const awaitTool: ToolDefinition = {
 	name: "Await",
@@ -58,14 +92,46 @@ export const awaitTool: ToolDefinition = {
 		if (!id) return { output: "Error: id is required.", isError: true };
 		const timeoutMs = timeout ?? DEFAULT_TIMEOUT_MS;
 
+		// Reschedulable timeout: the wait is driven by our own AbortController so the
+		// UI can extend it mid-wait (mirrors the Bash tool's runningBashProcesses).
+		const toolUseId = ctx.currentToolUseId;
+		const startedAt = Date.now();
+		const timeoutController = new AbortController();
+		let timer: ReturnType<typeof setTimeout> = setTimeout(
+			() => timeoutController.abort(),
+			timeoutMs,
+		);
+		if (toolUseId) {
+			runningAwaits.set(toolUseId, {
+				startedAt,
+				timeoutMs,
+				reschedule: (newMs) => {
+					clearTimeout(timer);
+					const remaining = Math.max(newMs - (Date.now() - startedAt), 0);
+					timer = setTimeout(() => timeoutController.abort(), remaining);
+				},
+			});
+		}
+
+		// Distinguish a timeout abort from a real parent interrupt so we can label the
+		// result correctly: parent abort → "aborted", our timeout → "timeout".
+		const combinedSignal = AbortSignal.any([ctx.signal, timeoutController.signal]);
+		const relabel = (status: string): string =>
+			status === "aborted" && !ctx.signal.aborted && timeoutController.signal.aborted
+				? "timeout"
+				: status;
+
 		try {
 			if (type === "agent") {
 				const { awaitAgentResultDetailed } = await import("@server/services/agent-communication");
 				const result = await awaitAgentResultDetailed({
 					callerNarratorId: ctx.narratorId,
 					id,
-					timeoutMs,
+					// The reschedulable timeoutController drives the deadline; give the inner
+					// waits a large cap so their own timers never win first.
+					timeoutMs: MAX_AWAIT_TIMEOUT_MS,
 					signal: ctx.signal,
+					timeoutSignal: timeoutController.signal,
 				});
 				return {
 					output: result.formatted,
@@ -101,16 +167,26 @@ export const awaitTool: ToolDefinition = {
 			if (task.alias && task.id !== id) registerTaskAlias(ctx.narratorId, task.id, task.alias);
 
 			const result = wait_for_text
-				? await backgroundTaskService.waitForText(taskId, wait_for_text, timeoutMs, ctx.signal)
-				: await backgroundTaskService.waitForCompletion(taskId, timeoutMs, ctx.signal);
+				? await backgroundTaskService.waitForText(
+						taskId,
+						wait_for_text,
+						MAX_AWAIT_TIMEOUT_MS,
+						combinedSignal,
+					)
+				: await backgroundTaskService.waitForCompletion(
+						taskId,
+						MAX_AWAIT_TIMEOUT_MS,
+						combinedSignal,
+					);
+			const status = relabel(result.status);
 			return {
-				output: formatResult(taskId, result.status, result.output),
+				output: formatResult(taskId, status, result.output),
 				metadata: {
 					kind: "await",
 					awaitType: "bash",
 					targetId: id,
 					resolvedId: taskId,
-					status: result.status,
+					status,
 					waitForText: wait_for_text,
 				},
 			};
@@ -119,6 +195,9 @@ export const awaitTool: ToolDefinition = {
 				output: `Await error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
+		} finally {
+			clearTimeout(timer);
+			if (toolUseId) runningAwaits.delete(toolUseId);
 		}
 	},
 };

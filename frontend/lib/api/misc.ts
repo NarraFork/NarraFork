@@ -785,6 +785,13 @@ export const miscApi = {
 			commit: string;
 			platform: "windows" | "macos" | "linux";
 			gitAvailable: boolean;
+			runtimeEnvironment?: {
+				android: boolean;
+				proot: boolean;
+				termux: boolean;
+				containerSupport: boolean;
+				containerUnsupportedReason?: string;
+			};
 			capabilities?: {
 				database?: {
 					engine?: string;
@@ -1436,6 +1443,13 @@ export const miscApi = {
 		request<{
 			platform: "windows" | "macos" | "linux";
 			packageManager?: string;
+			runtimeEnvironment?: {
+				android: boolean;
+				proot: boolean;
+				termux: boolean;
+				containerSupport: boolean;
+				containerUnsupportedReason?: string;
+			};
 			dependencies: Array<{
 				name: string;
 				required: boolean;

@@ -8,6 +8,7 @@ import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
 import { projectsApi } from "./projects";
 import { settingsApi } from "./settings";
+import { specApi } from "./spec";
 import { terminalsApi } from "./terminals";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
@@ -25,6 +26,7 @@ export const api = {
 	...miscApi,
 	...chatGroupsApi,
 	...knowledgeApi,
+	...specApi,
 };
 
 export {

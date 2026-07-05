@@ -9,6 +9,7 @@ import {
 	useContext,
 	useEffect,
 	useMemo,
+	useRef,
 	useState,
 } from "react";
 import type { Components } from "react-markdown";
@@ -37,13 +38,39 @@ export const MermaidStreamingCtx = createContext(false);
 /**
  * Render a ```mermaid block as a diagram, or — while still streaming — as a
  * normal code block (incomplete syntax must not reach mermaid.render).
+ *
+ * While streaming we use a plain Mantine <Code block> instead of
+ * MarkdownCodeBlock: the latter lazy-loads Shiki and re-highlights on every
+ * token, so its Suspense fallback flickers between plain and highlighted text
+ * as the fence grows. A plain code block has no async highlight and stays
+ * visually stable until streaming ends and the real diagram renders.
  */
 function MermaidOrCode({ code }: { code: string }) {
 	const streaming = useContext(MermaidStreamingCtx);
+	// Track whether this diagram ever streamed live in this session. A diagram
+	// that appeared during streaming defaults to "actual" (tall) size so the
+	// user sees the fresh result at full height; diagrams loaded non-streaming
+	// (page refresh / history) default to "fit" (compact) to keep scrollback tidy.
+	const streamedRef = useRef(false);
+	if (streaming) streamedRef.current = true;
+
 	if (streaming) {
-		return <MarkdownCodeBlock language="mermaid">{code}</MarkdownCodeBlock>;
+		return (
+			<Code
+				block
+				fz="xs"
+				style={{
+					maxWidth: "100%",
+					overflowX: "auto",
+					whiteSpace: "pre",
+					wordBreak: "normal",
+				}}
+			>
+				{code}
+			</Code>
+		);
 	}
-	return <MermaidDiagram code={code} />;
+	return <MermaidDiagram code={code} defaultSizeMode={streamedRef.current ? "actual" : "fit"} />;
 }
 
 /** Recursively extract plain text from React children */
@@ -214,12 +241,25 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 					</Code>
 				);
 			}
-			// If the inner <code> already rendered a MarkdownCodeBlock (has language),
-			// just pass through. Otherwise wrap bare code in MarkdownCodeBlock.
-			const child = Array.isArray(children) ? children[0] : children;
-			// biome-ignore lint/suspicious/noExplicitAny: react-markdown children structure
-			const childType = child && typeof child === "object" && (child as any).type;
-			if (childType === MarkdownCodeBlock) {
+			// react-markdown renders fenced blocks as <pre><code class="language-x">…>.
+			// The inner <code> child is our own `code` component (see above), which has
+			// already produced the right element — a MermaidDiagram for ```mermaid, an
+			// ASCII <Code> for box-drawing art, or a MarkdownCodeBlock otherwise. We must
+			// NOT re-wrap it: comparing `child.type === MarkdownCodeBlock` never matches
+			// (the child's type is the `code` component function, not its return value),
+			// so the old check always fell through and flattened every block — including
+			// mermaid — back into a plain language="text" code block.
+			//
+			// Detect a fenced code child via its `language-*` className and pass it
+			// through untouched. Only genuinely bare children (no code element) get
+			// wrapped in MarkdownCodeBlock here.
+			const firstChild = Array.isArray(children) ? children[0] : children;
+			const childClassName =
+				firstChild && typeof firstChild === "object" && "props" in firstChild
+					? // biome-ignore lint/suspicious/noExplicitAny: react-markdown child element
+						((firstChild as any).props?.className as string | undefined)
+					: undefined;
+			if (typeof childClassName === "string" && childClassName.startsWith("language-")) {
 				return <>{children}</>;
 			}
 			return <MarkdownCodeBlock language="text">{text}</MarkdownCodeBlock>;

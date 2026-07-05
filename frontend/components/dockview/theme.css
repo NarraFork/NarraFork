@@ -1,0 +1,78 @@
+/**
+ * NarraFork Dockview theme — aligns dockview's CSS variables with the Mantine
+ * indigo dark theme used across the app. Apply via the `dockview-theme-narrafork`
+ * class on the DockviewReact container.
+ *
+ * Variable reference: node_modules/dockview-core/dist/styles/dockview.css
+ * We intentionally drive everything from Mantine CSS variables so light/dark
+ * color scheme switching stays consistent with the rest of the app.
+ */
+
+.dockview-theme-narrafork {
+	/* Core surfaces */
+	--dv-group-view-background-color: var(--mantine-color-body);
+	--dv-tabs-and-actions-container-background-color: var(--mantine-color-default);
+	--dv-tabs-and-actions-container-height: 34px;
+	--dv-tabs-and-actions-container-font-size: var(--mantine-font-size-xs);
+
+	/* Active group / visible tab */
+	--dv-activegroup-visiblepanel-tab-background-color: var(--mantine-color-body);
+	--dv-activegroup-visiblepanel-tab-color: var(--mantine-color-text);
+	--dv-activegroup-hiddenpanel-tab-background-color: var(--mantine-color-default);
+	--dv-activegroup-hiddenpanel-tab-color: var(--mantine-color-dimmed);
+
+	/* Inactive group */
+	--dv-inactivegroup-visiblepanel-tab-background-color: var(--mantine-color-body);
+	--dv-inactivegroup-visiblepanel-tab-color: var(--mantine-color-text);
+	--dv-inactivegroup-hiddenpanel-tab-background-color: var(--mantine-color-default);
+	--dv-inactivegroup-hiddenpanel-tab-color: var(--mantine-color-dimmed);
+
+	/* Dividers / separators / sashes */
+	--dv-tab-divider-color: var(--mantine-color-default-border);
+	--dv-separator-border: var(--mantine-color-default-border);
+	--dv-sash-color: transparent;
+	--dv-active-sash-color: var(--mantine-color-indigo-6);
+	--dv-paneview-header-border-color: var(--mantine-color-default-border);
+	--dv-paneview-active-outline-color: var(--mantine-color-indigo-6);
+
+	/* Drag & drop overlay — indigo accent */
+	--dv-drag-over-background-color: color-mix(
+		in srgb,
+		var(--mantine-color-indigo-9) 25%,
+		transparent
+	);
+	--dv-drag-over-border-color: var(--mantine-color-indigo-5);
+
+	/* Tab group accent line */
+	--dv-tab-group-line-opacity: 1;
+
+	/* Context menu (Dockview built-in) */
+	--dv-context-menu-background-color: var(--mantine-color-default);
+	--dv-context-menu-color: var(--mantine-color-text);
+
+	/* Icons */
+	--dv-icon-hover-background-color: var(--mantine-color-default-hover);
+
+	/* Radius aligned to Mantine sm */
+	--dv-border-radius: var(--mantine-radius-sm);
+	--dv-tab-border-radius: var(--mantine-radius-sm);
+
+	/* Floating groups */
+	--dv-floating-box-shadow: var(--mantine-shadow-md);
+	--dv-floating-group-border: 1px solid var(--mantine-color-default-border);
+
+	height: 100%;
+	width: 100%;
+}
+
+/*
+ * Single-tab groups: hide dockview's own tab strip entirely. Each NarraFork
+ * panel (narrator / terminal / webview) renders its own header bar which also
+ * doubles as the drag handle, so the dockview tab row is redundant noise when
+ * a group holds a single panel. Dockview toggles `.dv-single-tab` on the
+ * tabs-and-actions container whenever the group's tab count is exactly 1
+ * (see dockview-core tabsContainer.updateClassnames()).
+ */
+.dockview-theme-narrafork .dv-tabs-and-actions-container.dv-single-tab {
+	display: none;
+}

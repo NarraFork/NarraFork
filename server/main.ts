@@ -43,6 +43,7 @@ import {
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";

@@ -1,5 +1,4 @@
 import {
-	ActionIcon,
 	Anchor,
 	Badge,
 	Box,
@@ -21,7 +20,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowLeft, IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
+import { IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -76,6 +75,12 @@ export interface NarratorDetailsPanelProps {
 	dangerReflectionGlobalLevel?: DangerReflectionLevel;
 	/** Desktop route can embed this as a resizable sidebar; other contexts keep a drawer. */
 	displayMode?: "drawer" | "inline";
+	/**
+	 * When true (dock surface), suppress this panel's own title bar — the dock's
+	 * ToolPanelShell provides the single header and the status badge is hoisted
+	 * there. Only meaningful with displayMode="inline".
+	 */
+	chromeless?: boolean;
 }
 
 export type NarratorDetailsPanelExternalProps = Omit<
@@ -209,6 +214,7 @@ export function NarratorDetailsPanel({
 	dangerReflectionGlobal = true,
 	dangerReflectionGlobalLevel,
 	displayMode = "drawer",
+	chromeless = false,
 }: NarratorDetailsPanelProps) {
 	const isMobile = useMediaQuery("(max-width: 768px)") ?? false;
 	const navigate = useNavigate();
@@ -1311,14 +1317,19 @@ export function NarratorDetailsPanel({
 		</Stack>
 	);
 
-	if (!opened) return null;
-
+	// Drawer header: title + status badge, with the standard right-side × close
+	// (consistent with the terminal / spec mobile drawers). No left-arrow back.
+	// Header metrics match the narrator header: py=8 px=16, size="sm" controls,
+	// ~45px total, so every panel header aligns.
 	const title = (
-		<Group gap="xs" wrap="nowrap">
-			<ActionIcon variant="subtle" color="gray" onClick={onClose} aria-label={tc("close")}>
-				<IconArrowLeft size={18} />
-			</ActionIcon>
-			<Text fw={600}>{t("details.title")}</Text>
+		<Group gap="xs" wrap="nowrap" style={{ flex: 1 }}>
+			<IconInfoCircle size={16} color="var(--mantine-color-dimmed)" />
+			<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
+				{t("details.title")}
+			</Text>
+			<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"} variant="light">
+				{formatStatus(narrator?.status)}
+			</Badge>
 		</Group>
 	);
 
@@ -1329,15 +1340,19 @@ export function NarratorDetailsPanel({
 				onClose={onClose}
 				position="right"
 				size={isMobile ? "100%" : 480}
-				withCloseButton={false}
 				title={title}
+				closeButtonProps={{ size: "sm" }}
 				styles={{
 					header: {
-						borderBottom: "1px solid var(--mantine-color-default-border)",
+						minHeight: 45,
+						paddingTop: 8,
 						paddingBottom: 8,
+						paddingLeft: 16,
+						paddingRight: 16,
+						borderBottom: "1px solid var(--mantine-color-default-border)",
 					},
 					body: {
-						height: "calc(100% - 60px)",
+						height: "calc(100% - 45px)",
 						padding: 0,
 					},
 				}}
@@ -1354,32 +1369,40 @@ export function NarratorDetailsPanel({
 			w="100%"
 			h="100%"
 			style={{
-				borderLeft: "1px solid var(--mantine-color-default-border)",
+				// In the dock the ToolPanelShell owns the chrome (border, header);
+				// only draw our own border/background as a standalone sidebar.
+				borderLeft: chromeless ? undefined : "1px solid var(--mantine-color-default-border)",
 				display: "flex",
 				flexDirection: "column",
 				overflow: "hidden",
-				background: "var(--mantine-color-body)",
+				background: chromeless ? undefined : "var(--mantine-color-body)",
 			}}
 		>
-			<Group
-				gap="xs"
-				px="sm"
-				py={8}
-				wrap="nowrap"
-				style={{
-					flexShrink: 0,
-					borderBottom: "1px solid var(--mantine-color-default-border)",
-				}}
-			>
-				<IconInfoCircle size={16} color="var(--mantine-color-dimmed)" />
-				<Text size="sm" fw={600} style={{ flex: 1 }} truncate>
-					{t("details.title")}
-				</Text>
-				<Badge size="xs" color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"} variant="light">
-					{formatStatus(narrator?.status)}
-				</Badge>
-				<CloseButton size="sm" onClick={onClose} />
-			</Group>
+			{!chromeless && (
+				<Group
+					gap="xs"
+					px="sm"
+					py={8}
+					wrap="nowrap"
+					style={{
+						flexShrink: 0,
+						borderBottom: "1px solid var(--mantine-color-default-border)",
+					}}
+				>
+					<IconInfoCircle size={16} color="var(--mantine-color-dimmed)" />
+					<Text size="sm" fw={600} style={{ flex: 1 }} truncate>
+						{t("details.title")}
+					</Text>
+					<Badge
+						size="xs"
+						color={NARRATOR_STATUS_COLORS[narrator?.status] ?? "gray"}
+						variant="light"
+					>
+						{formatStatus(narrator?.status)}
+					</Badge>
+					<CloseButton size="sm" onClick={onClose} />
+				</Group>
+			)}
 			<ScrollArea style={{ flex: 1, minHeight: 0 }} p="sm">
 				{content}
 			</ScrollArea>

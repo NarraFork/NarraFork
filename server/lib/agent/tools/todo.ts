@@ -1,4 +1,5 @@
 import { z } from "zod/v4";
+import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import {
 	buildSpecTasksDocumentFromLegacyTodos,
 	parseSpecTasksDocument,
@@ -87,6 +88,7 @@ export const taskCreateTool: ToolDefinition = {
 					allowProtectedTaskMutation: taskReflectionGranted,
 				},
 			);
+			broadcastSpecChanged(ctx.narratorId, written, "task_create");
 			syncedTodos = specTasksToLegacyTodos(parseSpecTasksDocument(written.content).tasks);
 		} catch (err) {
 			return {

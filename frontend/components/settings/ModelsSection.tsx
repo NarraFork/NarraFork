@@ -6,9 +6,12 @@ import { useTranslation } from "react-i18next";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
+type ModelComboboxItem = string | { value: string; label: string };
+type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
+
 /** Prepend "group:" prefix to each item label so the selected value shows the provider. */
 function prefixLabels(data: ComboboxData): ComboboxData {
-	return (data as ComboboxItemGroup[]).map((g) => ({
+	return (data as ModelComboboxItemGroup[]).map((g) => ({
 		group: g.group,
 		items: g.items.map((item) => {
 			const it = typeof item === "string" ? { value: item, label: item } : item;
@@ -22,7 +25,7 @@ function prefixLabels(data: ComboboxData): ComboboxData {
  * Each sentinel ("__default__", "__summary__") lives in its own group.
  */
 function filterSentinelGroups(data: ComboboxData, sentinels: string[]): ComboboxData {
-	return (data as ComboboxItemGroup[]).filter(
+	return (data as ModelComboboxItemGroup[]).filter(
 		(g) => !g.items?.some?.((i) => sentinels.includes(typeof i === "string" ? i : i.value)),
 	);
 }
@@ -92,7 +95,7 @@ export function ModelsSection({
 	// Collect all valid model values from the grouped data.
 	const validValues = useMemo(() => {
 		const set = new Set<string>();
-		for (const g of groupedModels as ComboboxItemGroup[]) {
+		for (const g of groupedModels as ModelComboboxItemGroup[]) {
 			for (const item of g.items) {
 				const v = typeof item === "string" ? item : item.value;
 				set.add(v);

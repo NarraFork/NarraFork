@@ -488,7 +488,7 @@ export interface AgentConfig {
 	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
 	relaxedPlan?: boolean;
 	/**
-	 * Whether plan mode accepts inline plans (the `plan` parameter of ExitPlanMode).
+	 * Whether plan mode accepts inline plans (the `inline_plan` parameter of ExitPlanMode).
 	 * When false, the ExitPlanMode schema/description and the plan-mode system reminder
 	 * drop the inline option and only the file-based plan flow is supported.
 	 * Undefined is treated as true for backward compatibility (subagents/reflection loops).

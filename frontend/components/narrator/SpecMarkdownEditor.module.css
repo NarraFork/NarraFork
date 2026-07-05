@@ -1,0 +1,37 @@
+.root {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	min-height: 0;
+	border: none;
+}
+
+.content {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+/* Give the editable area comfortable padding and readable line height */
+.content :global(.ProseMirror) {
+	min-height: 100%;
+	padding: var(--mantine-spacing-sm);
+	font-size: var(--mantine-font-size-sm);
+	line-height: 1.6;
+}
+
+.content :global(.ProseMirror:focus) {
+	outline: none;
+}
+
+/* Tighten default heading spacing inside the compact panel */
+.content :global(.ProseMirror h1),
+.content :global(.ProseMirror h2),
+.content :global(.ProseMirror h3) {
+	margin-top: var(--mantine-spacing-sm);
+	margin-bottom: var(--mantine-spacing-xs);
+}
+
+.content :global(.ProseMirror p) {
+	margin: var(--mantine-spacing-xs) 0;
+}

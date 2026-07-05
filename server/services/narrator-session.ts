@@ -112,6 +112,7 @@ import {
 import { reviewService } from "./review-service";
 import { buildSpecToolResultReminder } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
+import { drainSpecUpdatesForNarrator, formatSpecUpdateSideCars } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
 import {
 	deleteConclusionFileId,
@@ -703,9 +704,14 @@ export async function updateActiveNarratorCwdAndSkillContext(
 	await ensureSkillCacheFreshForActiveNarrator(active);
 }
 
-async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
+/**
+ * Charge the active goal for the most recent pass's token/time usage and return
+ * the token delta that was charged (non-cached input + output). Callers can sum
+ * the returned value across passes to obtain a round-level token total.
+ */
+async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<number> {
 	const startedAt = active._goalTurnStartedAtMs;
-	if (!startedAt) return;
+	if (!startedAt) return 0;
 	const secondsDelta = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
 	const tokenDelta = Math.max(
 		0,
@@ -714,6 +720,7 @@ async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<void> {
 	await narratorGoalService.accountActiveGoalUsage(active.narratorId, tokenDelta, secondsDelta);
 	active._goalTurnStartedAtMs = Date.now();
 	active._goalTokenUsageBaseline = active._lastTokenUsage;
+	return tokenDelta;
 }
 
 async function loadCompiledSpecForContinuation(narratorId: string) {
@@ -1256,6 +1263,14 @@ export async function runAgentLoop(
 	let knowledgeInjectCycleSeq = -1;
 	let currentImages = images;
 	let loopHadError = false;
+	/** Wall-clock start of this response turn, for the Stop hook `duration_ms` field. */
+	const loopStartedAt = Date.now();
+	/**
+	 * Tokens consumed across every pass of this response turn (non-cached input +
+	 * output), for the Stop hook `total_tokens` field. Accumulated per pass using
+	 * the same delta the goal-usage accounting charges.
+	 */
+	let loopTotalTokens = 0;
 	/** Whether the loop was interrupted by the user (abort signal). */
 	let loopWasInterrupted = false;
 	/** Final assistant text (or error message) from the most recent agent-loop pass, for Stop hooks. */
@@ -1910,6 +1925,16 @@ export async function runAgentLoop(
 						});
 					}
 
+					// Drain pending spec updates from UI edits.
+					const specUpdates = drainSpecUpdatesForNarrator(narratorId);
+					if (specUpdates.length > 0) {
+						sideCars.push({
+							target: "user_message",
+							source: "spec_update",
+							content: formatSpecUpdateSideCars(specUpdates, locale),
+						});
+					}
+
 					return sideCars;
 				},
 				getRuntimeSettingsOverride: () => {
@@ -2091,8 +2116,9 @@ export async function runAgentLoop(
 			// normally, this is cleared back to false before the Stop hook fires.
 			loopHitMaxTurns = result.maxTurnsExceeded === true;
 
-			await accountGoalUsageForTurn(active).catch((err) => {
+			loopTotalTokens += await accountGoalUsageForTurn(active).catch((err) => {
 				logger.warn("Failed to account goal usage", { narratorId, error: String(err) });
+				return 0;
 			});
 			if (active._goalContinuationTurn) {
 				if (result.hadToolUses) {
@@ -2838,6 +2864,8 @@ export async function runAgentLoop(
 							stop_reason: stopReason,
 							stop_error: loopHadError,
 							last_assistant_text: stopHookFinalText.slice(0, 2000),
+							duration_ms: Date.now() - loopStartedAt,
+							total_tokens: loopTotalTokens,
 						},
 						active._projectId,
 					);

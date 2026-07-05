@@ -216,7 +216,7 @@ function FileDiffRow({
 					</Group>
 				</Group>
 			</UnstyledButton>
-			<Collapse in={expanded}>
+			<Collapse expanded={expanded}>
 				<Box px={8} pb={4}>
 					{isLoading && <Loader size="xs" my={4} />}
 					{resolvedDiff && <DiffBlock diff={resolvedDiff} />}

@@ -9,6 +9,7 @@ import { NotFoundError, PodmanNotFoundError, ValidationError } from "../lib/erro
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
 import { isInsidePath } from "../lib/platform-path";
 import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
@@ -43,6 +44,11 @@ interface ExecResult {
 let _verified = false;
 
 async function ensurePodman(): Promise<void> {
+	if (!supportsContainers()) {
+		throw new ValidationError(
+			getContainerUnsupportedReason() ?? "Container management is unsupported",
+		);
+	}
 	if (_verified) return;
 	try {
 		ensureRootlessEnv();
@@ -68,7 +74,7 @@ async function ensurePodman(): Promise<void> {
  * terminals) inherit the correct environment.
  */
 export function ensureRootlessEnv(): void {
-	if (process.platform !== "linux") return;
+	if (process.platform !== "linux" || !supportsContainers()) return;
 	const uid = process.getuid?.();
 	if (uid == null || uid === 0) return;
 
@@ -172,6 +178,7 @@ export function resetPodmanCache(): void {
 
 /** Return podman status: installed + version, or not installed. */
 export async function getPodmanStatus(): Promise<{ installed: boolean; version?: string }> {
+	if (!supportsContainers()) return { installed: false };
 	try {
 		const result = await safeSpawn({ cmd: ["podman", "--version"], timeout: 5000 });
 		if (result.exitCode !== 0) return { installed: false };
@@ -189,6 +196,9 @@ export interface ContainerSetupStatus {
 	passt: { ok: boolean; version?: string };
 	rootlessNetwork: { ok: boolean; backend?: string };
 	allReady: boolean;
+	supported?: boolean;
+	reason?: string;
+	code?: string;
 }
 
 /** Cached container setup status. */
@@ -197,6 +207,21 @@ let _setupCache: ContainerSetupStatus | null = null;
 /** Check all container prerequisites for rootless podman-compose. Uses cache unless refresh=true. */
 export async function getContainerSetupStatus(refresh = false): Promise<ContainerSetupStatus> {
 	if (_setupCache && !refresh) return _setupCache;
+
+	if (!supportsContainers()) {
+		_setupCache = {
+			podman: { ok: false },
+			podmanCompose: { ok: false },
+			composeProvider: { ok: false },
+			passt: { ok: false },
+			rootlessNetwork: { ok: false },
+			allReady: false,
+			supported: false,
+			reason: getContainerUnsupportedReason(),
+			code: "CONTAINERS_UNSUPPORTED",
+		};
+		return _setupCache;
+	}
 
 	ensureRootlessEnv();
 	const podman = await getPodmanStatus();

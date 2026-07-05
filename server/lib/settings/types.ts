@@ -370,7 +370,7 @@ export interface NarraForkSettings {
 		/** Default value for the auto-prune toggle on new narrators. */
 		defaultPruneEnabled: boolean;
 		/**
-		 * Whether plan mode accepts inline plans (the `plan` parameter of ExitPlanMode).
+		 * Whether plan mode accepts inline plans (the `inline_plan` parameter of ExitPlanMode).
 		 * When false, only the file-based plan flow is supported: the ExitPlanMode tool
 		 * schema, its description, and the plan-mode system reminder drop the inline option,
 		 * and plan resolution reads exclusively from the designated plan file.

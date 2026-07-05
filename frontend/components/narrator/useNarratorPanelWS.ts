@@ -1684,7 +1684,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (parentToolUseId && input) {
 						fields.inputJson = input;
 					}
-					// Extract timeout for bash tools so the timer can show elapsed/timeout
+					// Extract timeout for Bash/Await tools so the timer can show elapsed/timeout
 					if (input?.timeout != null && typeof input.timeout === "number") {
 						fields._timeoutMs = input.timeout;
 					}

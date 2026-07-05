@@ -7,7 +7,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { getRuntimeEnvironment, IS_ANDROID, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { findRgSync, getRgVersionSync } from "../lib/ripgrep";
 import { safeSpawn } from "../lib/spawn";
 import { refreshWindowsPath } from "../lib/win-env";
@@ -26,6 +26,7 @@ export interface DependencyInfo {
 export interface DependencyCheckResult {
 	platform: "windows" | "macos" | "linux";
 	packageManager?: string;
+	runtimeEnvironment: ReturnType<typeof getRuntimeEnvironment>;
 	dependencies: DependencyInfo[];
 	allRequiredMet: boolean;
 }
@@ -34,6 +35,8 @@ export interface DependencyCheckResult {
 
 const INSTALL_COMMANDS: Record<string, Record<string, string>> = {
 	git: {
+		termux: "pkg install git",
+		"apt-root": "apt-get update && apt-get install -y git",
 		apt: "sudo apt-get update && sudo apt-get install -y git",
 		dnf: "sudo dnf install -y git",
 		pacman: "sudo pacman -S --noconfirm git",
@@ -45,6 +48,8 @@ const INSTALL_COMMANDS: Record<string, Record<string, string>> = {
 		choco: "choco install git -y",
 	},
 	rg: {
+		termux: "pkg install ripgrep",
+		"apt-root": "apt-get update && apt-get install -y ripgrep",
 		apt: "sudo apt-get update && sudo apt-get install -y ripgrep",
 		dnf: "sudo dnf install -y ripgrep",
 		pacman: "sudo pacman -S --noconfirm ripgrep",
@@ -56,6 +61,8 @@ const INSTALL_COMMANDS: Record<string, Record<string, string>> = {
 		choco: "choco install ripgrep -y",
 	},
 	dtach: {
+		termux: "pkg install dtach",
+		"apt-root": "apt-get update && apt-get install -y dtach",
 		apt: "sudo apt-get update && sudo apt-get install -y dtach",
 		dnf: "sudo dnf install -y dtach",
 		pacman: "sudo pacman -S --noconfirm dtach",
@@ -95,6 +102,11 @@ function detectPackageManager(): string | undefined {
 		if (Bun.which("port")) return "port";
 		return undefined;
 	}
+	// Android/Termux host package manager.
+	if (IS_ANDROID && Bun.which("pkg")) return "termux";
+	// Linux rootfs (common in proot-distro): sudo is often unavailable because the
+	// guest shell already runs as root via proot UID/GID remapping.
+	if (process.getuid?.() === 0 && Bun.which("apt-get")) return "apt-root";
 	// Linux
 	for (const pm of ["apt-get", "dnf", "pacman", "zypper", "apk"]) {
 		if (Bun.which(pm)) return pm === "apt-get" ? "apt" : pm;
@@ -202,6 +214,7 @@ function checkAll(): DependencyCheckResult {
 	return {
 		platform: getPlatform(),
 		packageManager: pm,
+		runtimeEnvironment: getRuntimeEnvironment(),
 		dependencies: deps,
 		allRequiredMet: deps.filter((d) => d.required).every((d) => d.installed),
 	};

@@ -246,6 +246,13 @@
 	"hookEventPreToolUse": "Pre Tool Use",
 	"hookEventPostToolUse": "Post Tool Use",
 	"hookEventStop": "On Response End",
+	"hookEventAttention": "Needs Attention",
+	"hookEventAttentionResolved": "Attention Resolved",
+	"hookAttentionReason": "Reason",
+	"hookAttentionReasonAll": "All reasons",
+	"hookAttentionReason_waiting_permission": "Waiting for permission",
+	"hookAttentionReason_done": "Response done",
+	"hookAttentionReason_error": "Error",
 	"hookCommandHelp": "When the hook fires, the data below is passed to the command as JSON via standard input (stdin). The command runs in the narrator's cwd. Exit code 0 = allow; for Pre Tool Use, exit code 2 blocks the tool and uses stderr (or stdout) as the block reason.",
 	"hookHttpHelp": "When the hook fires, a POST request is sent to the URL with the JSON below as the body (Content-Type: application/json). A 2xx response allows the tool; for Pre Tool Use, returning {\"decision\": \"block\", \"reason\": \"...\"} blocks the tool.",
 	"hookPayloadRef": "Payload Reference",
@@ -253,7 +260,7 @@
 	"hookFieldsCommon": "Common fields (all events)",
 	"hookFieldsEvent": "Extra fields for this event",
 	"hookExampleLabel": "Example payload",
-	"hookFieldHookEventName": "Event name (PreToolUse / PostToolUse / Stop)",
+	"hookFieldHookEventName": "Event name (PreToolUse / PostToolUse / Stop / Attention / AttentionResolved)",
 	"hookFieldNarratorId": "Narrator ID",
 	"hookFieldChapterId": "Chapter ID (may be empty for standalone narrators)",
 	"hookFieldProjectId": "Project ID (may be empty for global narrators)",
@@ -265,5 +272,9 @@
 	"hookFieldToolIsError": "Whether the tool errored",
 	"hookFieldStopReason": "Stop reason (done / error / aborted / max_turns)",
 	"hookFieldStopError": "Whether the turn ended with an error",
-	"hookFieldLastAssistantText": "Final assistant message text (truncated)"
+	"hookFieldLastAssistantText": "Final assistant message text (truncated)",
+	"hookFieldDurationMs": "Total duration of this turn (milliseconds)",
+	"hookFieldTotalTokens": "Tokens consumed this turn (non-cached input + output)",
+	"hookFieldAttentionReason": "Attention reason (waiting_permission / done / error)",
+	"hookFieldAttentionDetail": "Extra context (e.g. the user's decision \"allow\" / \"deny\" for a resolved permission)"
 }

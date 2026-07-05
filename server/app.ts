@@ -8,6 +8,7 @@ import { users } from "./db/schema";
 import { AppError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
+import { getRuntimeEnvironment } from "./lib/platform";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
@@ -49,6 +50,7 @@ import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
+import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
@@ -110,6 +112,7 @@ app.get("/api/health", (c) => {
 		platform:
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
 		gitAvailable: gitOk,
+		runtimeEnvironment: getRuntimeEnvironment(),
 	});
 });
 
@@ -215,6 +218,7 @@ app.route("/api/chapters", chapterRoutes);
 app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/narrators", narratorRoutes);
+app.route("/api/narrators", specRoutes);
 app.route("/api/chat-groups", chatGroupRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);

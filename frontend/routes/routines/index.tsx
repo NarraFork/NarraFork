@@ -283,8 +283,18 @@ function CommandsTab() {
 
 // === Tab: Hooks ===
 
-const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"];
+const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop", "Attention", "AttentionResolved"];
 const HOOK_TYPES = ["command", "http"];
+
+// Events whose matcher filters by attention reason (a fixed enum) instead of a
+// free-form tool name. Each maps to the reason values it can meaningfully match.
+const ATTENTION_EVENTS = new Set(["Attention", "AttentionResolved"]);
+const ATTENTION_REASONS_BY_EVENT: Record<string, readonly string[]> = {
+	// Attention can fire for any of the three reasons.
+	Attention: ["waiting_permission", "done", "error"],
+	// First scope: AttentionResolved only fires for resolved permission requests.
+	AttentionResolved: ["waiting_permission"],
+};
 
 interface HookDraft {
 	event: string;
@@ -335,6 +345,16 @@ const HOOK_EVENT_FIELDS: Record<string, ReadonlyArray<readonly [string, string]>
 		["stop_reason", "hookFieldStopReason"],
 		["stop_error", "hookFieldStopError"],
 		["last_assistant_text", "hookFieldLastAssistantText"],
+		["duration_ms", "hookFieldDurationMs"],
+		["total_tokens", "hookFieldTotalTokens"],
+	],
+	Attention: [
+		["attention_reason", "hookFieldAttentionReason"],
+		["attention_detail", "hookFieldAttentionDetail"],
+	],
+	AttentionResolved: [
+		["attention_reason", "hookFieldAttentionReason"],
+		["attention_detail", "hookFieldAttentionDetail"],
 	],
 };
 
@@ -360,6 +380,13 @@ function buildHookExample(event: string): string {
 		base.stop_reason = "done";
 		base.stop_error = false;
 		base.last_assistant_text = "Done. I've updated the file.";
+		base.duration_ms = 12345;
+		base.total_tokens = 8192;
+	} else if (event === "Attention") {
+		base.attention_reason = "waiting_permission";
+	} else if (event === "AttentionResolved") {
+		base.attention_reason = "waiting_permission";
+		base.attention_detail = "allow";
 	}
 	return JSON.stringify(base, null, 2);
 }
@@ -381,7 +408,7 @@ function HookPayloadHelp({ event, type }: { event: string; type: string }) {
 			>
 				{t("hookPayloadRefShow")}
 			</Button>
-			<Collapse in={opened}>
+			<Collapse expanded={opened}>
 				<Stack gap="xs" mt="xs">
 					<div>
 						<Text size="xs" fw={600} mb={4}>
@@ -613,24 +640,51 @@ function HooksTab() {
 						}))}
 						value={draft.event}
 						onChange={(v) =>
-							setDraft((d) => ({
-								...d,
-								event: v ?? "PreToolUse",
-								// Stop hooks are not tied to a tool — clear any matcher
-								matcher: v === "Stop" ? "" : d.matcher,
-							}))
+							setDraft((d) => {
+								const nextEvent = v ?? "PreToolUse";
+								let matcher = d.matcher;
+								if (nextEvent === "Stop") {
+									// Stop hooks are not tied to a tool — clear any matcher.
+									matcher = "";
+								} else if (ATTENTION_EVENTS.has(nextEvent)) {
+									// Attention matcher is a reason enum — drop any value that
+									// isn't valid for the new event (e.g. a leftover tool name).
+									const valid = ATTENTION_REASONS_BY_EVENT[nextEvent] ?? [];
+									if (matcher && !valid.includes(matcher)) matcher = "";
+								} else if (ATTENTION_EVENTS.has(d.event)) {
+									// Switching from an attention event to a tool event — the
+									// old reason value is meaningless as a tool matcher.
+									matcher = "";
+								}
+								return { ...d, event: nextEvent, matcher };
+							})
 						}
 					/>
-					{draft.event !== "Stop" && (
-						<TextInput
-							label={t("hookMatcher")}
-							placeholder={t("hookMatcherPlaceholder")}
+					{ATTENTION_EVENTS.has(draft.event) ? (
+						<Select
+							label={t("hookAttentionReason")}
+							data={[
+								{ value: "", label: t("hookAttentionReasonAll") },
+								...(ATTENTION_REASONS_BY_EVENT[draft.event] ?? []).map((r) => ({
+									value: r,
+									label: t(`hookAttentionReason_${r}` as "hookAttentionReason_waiting_permission"),
+								})),
+							]}
 							value={draft.matcher}
-							onChange={(e) => {
-								const val = e.currentTarget.value;
-								setDraft((d) => ({ ...d, matcher: val }));
-							}}
+							onChange={(v) => setDraft((d) => ({ ...d, matcher: v ?? "" }))}
 						/>
+					) : (
+						draft.event !== "Stop" && (
+							<TextInput
+								label={t("hookMatcher")}
+								placeholder={t("hookMatcherPlaceholder")}
+								value={draft.matcher}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, matcher: val }));
+								}}
+							/>
+						)
 					)}
 					<Select
 						label={t("hookType")}
@@ -2132,7 +2186,7 @@ function McpToolsTab() {
 									{server.error}
 								</Text>
 							)}
-							<Collapse in={isExpanded}>
+							<Collapse expanded={isExpanded}>
 								<Stack gap={4} mt="xs">
 									{server.tools.length === 0 && (
 										<Text size="xs" c="dimmed">

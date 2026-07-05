@@ -105,7 +105,7 @@ export function CompactMenuSub({
 				</UnstyledButton>
 			</Box>
 
-			<Collapse in={expanded}>
+			<Collapse expanded={expanded}>
 				<Box pl="md">
 					<Menu.Item leftSection={<IconPencil size={14} />} onClick={runManualSummarize}>
 						{t("contextMenu_manualSummarize")}

@@ -39,6 +39,9 @@ const TOTAL_STEPS = 6;
 const SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
+type ModelComboboxItem = string | { value: string; label: string };
+type ModelComboboxItemGroup = ComboboxItemGroup<ModelComboboxItem, string>;
+
 // Inject pulse keyframes once
 if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
 	const style = document.createElement("style");
@@ -374,7 +377,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		() =>
 			groupedModels.filter(
 				(g) =>
-					!(g as ComboboxItemGroup).items?.some?.((i) => {
+					!(g as ModelComboboxItemGroup).items?.some?.((i) => {
 						const v = typeof i === "string" ? i : i.value;
 						return v === FOLLOW_DEFAULT_MODEL || v === FOLLOW_SUMMARY_MODEL;
 					}),
@@ -386,7 +389,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 		() =>
 			groupedModels.filter(
 				(g) =>
-					!(g as ComboboxItemGroup).items?.some?.(
+					!(g as ModelComboboxItemGroup).items?.some?.(
 						(i) => (typeof i === "string" ? i : i.value) === FOLLOW_SUMMARY_MODEL,
 					),
 			),

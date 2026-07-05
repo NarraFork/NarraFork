@@ -216,7 +216,7 @@ export function ContainerPanel({ chapterId, onOpenConfig, onContainerError }: Co
 
 			{/* Runtime logs (collapsible) */}
 			{hasInstances && !starting && (
-				<Collapse in={logsOpen}>
+				<Collapse expanded={logsOpen}>
 					<Stack gap="xs">
 						<Group gap="xs">
 							<Select

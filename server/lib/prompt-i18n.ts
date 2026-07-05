@@ -754,16 +754,16 @@ ${
 You have two ways to submit your plan (choose ONE):
 
 ### Mode A: Inline (for short/medium plans)
-Call ExitPlanMode with the \`plan\` parameter containing your complete plan text.
+Call ExitPlanMode with the \`inline_plan\` parameter containing your complete plan text itself. This must be the ACTUAL plan content — never a file path or a reference like \`plan_path: ...\`.
 
 ### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode WITHOUT the \`plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.`
+2. When done, call ExitPlanMode WITHOUT the \`inline_plan\` parameter. The system will automatically read \`${planFile}\` and present its content to the user.`
 		: `## Plan Submission — File-based only
 
 Inline plans are disabled in this instance. You MUST submit your plan via the designated plan file:
 1. Write your plan incrementally to \`${planFile}\` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path \`${planFile}\` — writes to other paths will be rejected.
-2. When done, call ExitPlanMode (it takes no \`plan\` parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
+2. When done, call ExitPlanMode (it takes no plan parameter). The system will automatically read \`${planFile}\` and present its content to the user.`
 }
 
 ## Revising a Rejected File-based Plan
@@ -804,16 +804,16 @@ ${
 你有两种方式提交计划（选择其一）：
 
 ### 模式 A：内联（适用于短/中等长度的计划）
-调用 ExitPlanMode，在 \`plan\` 参数中填入完整的计划文本。
+调用 ExitPlanMode，在 \`inline_plan\` 参数中填入完整的计划正文本身。这里必须是真正的计划内容 — 绝不能是文件路径或类似 \`plan_path: ...\` 的引用。
 
 ### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，直接调用 ExitPlanMode，不需要传 \`plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+2. 完成后，直接调用 ExitPlanMode，不需要传 \`inline_plan\` 参数。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 		: `## 计划提交 — 仅支持文件模式
 
 本实例已禁用内联计划。你必须通过指定的计划文件提交计划：
 1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 \`${planFile}\`。你必须使用准确的路径 \`${planFile}\` — 写入其他路径将被拒绝。
-2. 完成后，直接调用 ExitPlanMode（它不接受 \`plan\` 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
+2. 完成后，直接调用 ExitPlanMode（它不接受 plan 参数）。系统会自动读取 \`${planFile}\` 的内容并展示给用户。`
 }
 
 ## 修改被拒绝的文件模式计划

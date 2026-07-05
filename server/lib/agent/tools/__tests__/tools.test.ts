@@ -1144,7 +1144,11 @@ describe("Skill tool rawJsonSchema", () => {
 
 // WebFetch keeps mode optional at the raw provider-schema layer so callers may rely on the
 // runtime default even though zod-to-json-schema treats `.default("readability")` as required.
-const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch"]);
+// ExitPlanMode intentionally hides the canonical `plan` field from the model-facing schema:
+// the model only sees `inline_plan`, which the resolution layer normalizes into `plan` before
+// tool-executor's safeParse runs (so Zod must still accept `plan`). This is a deliberate
+// divergence, not a parity bug.
+const KNOWN_SCHEMA_MISMATCHES = new Set(["WebFetch", "ExitPlanMode"]);
 
 const toolsWithRawJsonSchema = [
 	agentTool,
@@ -1194,4 +1198,27 @@ describe("rawJsonSchema parity for all tools", () => {
 			}
 		});
 	}
+});
+
+describe("ExitPlanMode schema divergence (intentional)", () => {
+	test("model-facing schema exposes inline_plan and hides the canonical plan field", () => {
+		const raw = requireRawJsonSchema(exitPlanModeTool);
+		const props = raw.properties ?? {};
+		expect(props.inline_plan).toBeDefined();
+		// `plan` is an internal-only field populated by the resolution layer; the model
+		// must never be offered it, or it invites file-path/location junk.
+		expect(props.plan).toBeUndefined();
+	});
+
+	test("Zod schema still accepts the canonical plan field for post-resolution safeParse", () => {
+		// The resolution layer writes the resolved body into `plan`; tool-executor's
+		// safeParse(effectiveInput) must accept it.
+		const parsed = exitPlanModeTool.parameters.safeParse({ plan: "resolved plan body" });
+		expect(parsed.success).toBe(true);
+		// And it accepts the raw model field too.
+		const parsedInline = exitPlanModeTool.parameters.safeParse({
+			inline_plan: "model-supplied plan",
+		});
+		expect(parsedInline.success).toBe(true);
+	});
 });
