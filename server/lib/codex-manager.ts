@@ -648,8 +648,8 @@ export class CodexManager {
 		}
 
 		const promise = (async () => {
-			const { settings } = await import("./settings");
-			const proxy = settings.codex?.proxy;
+			const { getOutboundProxy } = await import("./net/proxy");
+			const proxy = getOutboundProxy();
 			const tokens = await refreshCodexToken(refreshToken, proxy);
 			return {
 				...cred,
@@ -1233,8 +1233,8 @@ export class CodexManager {
 	// ==================== OAuth Flows ====================
 
 	async startBrowserAuth(): Promise<{ authorizeUrl: string }> {
-		const { settings } = await import("./settings");
-		const proxy = settings.codex?.proxy;
+		const { getOutboundProxy } = await import("./net/proxy");
+		const proxy = getOutboundProxy();
 		const { authorizeUrl, tokenPromise } = await startBrowserOAuth(proxy);
 
 		// Clear previous error when a new flow starts
@@ -1263,8 +1263,8 @@ export class CodexManager {
 		// Cancel any existing flow
 		this.cancelDeviceAuth();
 
-		const { settings } = await import("./settings");
-		const proxy = settings.codex?.proxy;
+		const { getOutboundProxy } = await import("./net/proxy");
+		const proxy = getOutboundProxy();
 		const { deviceAuthId, userCode, verificationUrl, interval } = await startDeviceCodeFlow(proxy);
 
 		const abortController = new AbortController();
@@ -1474,8 +1474,8 @@ export class CodexManager {
 			throw new Error("Account ID not available for this credential");
 		}
 
-		const { settings } = await import("./settings");
-		const proxy = settings.codex?.proxy;
+		const { getOutboundProxy } = await import("./net/proxy");
+		const proxy = getOutboundProxy();
 
 		if (!entry.accessToken) {
 			throw new Error("Access token not available");

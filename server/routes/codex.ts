@@ -153,7 +153,8 @@ codexRoutes.get("/status", (c) => {
 
 	return c.json({
 		...snapshot,
-		globalProxy: settings.codex?.proxy,
+		// Backward-compat: surface the custom proxy URL from the global policy.
+		globalProxy: settings.proxy?.mode === "custom" ? settings.proxy.url : undefined,
 		loadBalancingMode: isCodexLoadBalancingMode(mode) ? mode : snapshot.loadBalancingMode,
 		tierOrder,
 		effectiveTierOrder: snapshot.effectiveTierOrder,
@@ -457,8 +458,10 @@ codexRoutes.post("/tier-order", async (c) => {
 codexRoutes.post("/global-proxy", async (c) => {
 	const body = (await c.req.json().catch(() => ({}))) as { proxy?: string };
 
-	settings.codex = settings.codex || {};
-	settings.codex.proxy = normalizeProxyUrl(body.proxy);
+	// Backward-compat: map the legacy per-provider proxy onto the unified global
+	// policy. A URL switches to "custom"; clearing it falls back to "system".
+	const normalized = normalizeProxyUrl(body.proxy);
+	settings.proxy = normalized ? { mode: "custom", url: normalized } : { mode: "system" };
 	saveSettings(settings);
 
 	return c.json({ ok: true });

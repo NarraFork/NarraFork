@@ -1,6 +1,6 @@
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ServerWebSocket } from "bun";
-import { and, count as countFn, eq } from "drizzle-orm";
+import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, narratorToolCalls, terminals } from "../db/schema";
 import { updateAwaitTimeout } from "../lib/agent/tools/await";
@@ -10,6 +10,7 @@ import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { parseSubstatus } from "../lib/narrator-utils";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
 import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
@@ -36,6 +37,13 @@ import {
 	updateBufferedMessage,
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
+import {
+	bufferRealtimeMessage,
+	type CatchUpBuffer,
+	collectMessageIds,
+	createCatchUpBuffer,
+	drainCatchUpBuffer,
+} from "./catch-up-buffer";
 import type { NarratorServerMessage } from "./narrator-ws-types";
 import type { WSData } from "./ws-handler";
 
@@ -49,11 +57,16 @@ export interface NarratorWSData {
 	lastPongAt: number;
 	subscribedNarrators: Set<string>;
 	subscribedStats?: boolean;
+	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
+	catchingUpNarrators: Map<string, number>;
+	catchUpBuffers: Map<string, CatchUpBuffer>;
 	userId?: string;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
 }
+
+type NarratorSubscriptionKind = "list" | "panel" | "messages";
 
 // Client → Server messages
 export type NarratorClientMessage =
@@ -63,6 +76,8 @@ export type NarratorClientMessage =
 			narratorIds: string[];
 			lastMessageId?: string;
 			catchUpCursor?: CatchUpCursor;
+			kind?: NarratorSubscriptionKind;
+			requestId?: string;
 	  }
 	| { type: "unsubscribe"; narratorIds: string[] }
 	| {
@@ -94,6 +109,8 @@ export type NarratorClientMessage =
 			version: number;
 			lastMessageId?: string;
 			catchUpCursor?: CatchUpCursor;
+			kind?: "messages";
+			requestId?: string;
 	  }
 	| { type: "update_timeout"; narratorId: string; toolUseId: string; timeoutMs: number };
 
@@ -199,6 +216,13 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	const payload = JSON.stringify(message);
 	for (const ws of connections) {
 		if (ws.data.subscribedNarrators.has(narratorId)) {
+			if (ws.data.catchingUpNarrators.has(narratorId)) {
+				const buffer = ws.data.catchUpBuffers.get(narratorId);
+				if (buffer) {
+					bufferRealtimeMessage(buffer, message, payload.length);
+					continue;
+				}
+			}
 			try {
 				ws.send(payload);
 			} catch {
@@ -208,6 +232,281 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	}
 	// Mirror to eventBus so non-WS consumers (e.g. IM gateway) can react.
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
+}
+
+function withSubscriptionRequestId<T extends Record<string, unknown>>(
+	message: T,
+	subscriptionRequestId?: string,
+): T & { subscriptionRequestId?: string } {
+	return subscriptionRequestId ? { ...message, subscriptionRequestId } : message;
+}
+
+function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
+	try {
+		ws.send(JSON.stringify(message));
+		return true;
+	} catch {
+		connections.delete(ws);
+		return false;
+	}
+}
+
+// Status snapshots are idempotent state consumed by several listener kinds
+// (panel, recent-tabs wildcard, ruler). They are intentionally sent WITHOUT a
+// requestId so every current subscriber for the narrator is refreshed — a
+// request-scoped status frame would be dropped by wildcard listeners that have
+// no subscriptionId, leaving the sidebar/timeline stale after (re)subscribe.
+async function sendStatusSnapshot(ws: NarratorWS, narratorIds: string[]): Promise<void> {
+	if (narratorIds.length === 0) return;
+	const rows = await db
+		.select({
+			id: narrators.id,
+			status: narrators.status,
+			substatus: narrators.substatus,
+			turnStartedAt: narrators.turnStartedAt,
+		})
+		.from(narrators)
+		.where(inArray(narrators.id, narratorIds));
+	for (const row of rows) {
+		if (!connections.has(ws)) return;
+		if (
+			!safeSend(ws, {
+				type: "status_change",
+				narratorId: row.id,
+				status: row.status,
+				substatus: parseSubstatus(row.substatus),
+				turnStartedAt: row.turnStartedAt ?? undefined,
+			})
+		) {
+			return;
+		}
+	}
+}
+
+function sendRuntimeSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
+	for (const id of narratorIds) {
+		const snap = getStreamingSnapshot(id);
+		const hasQueue = !!snap && (snap.queuePosition != null || !!snap.queueMessage);
+		if (hasQueue) {
+			if (
+				!safeSend(
+					ws,
+					withSubscriptionRequestId(
+						{
+							type: "queue_status",
+							narratorId: id,
+							position: snap.queuePosition,
+							queueDepth: snap.queueDepth ?? 0,
+							queueMessage: snap.queueMessage,
+						},
+						requestId,
+					),
+				)
+			) {
+				return;
+			}
+		}
+
+		const browserCount = listBrowserSessions(id).length;
+		if (browserCount > 0) {
+			if (
+				!safeSend(
+					ws,
+					withSubscriptionRequestId(
+						{
+							type: "browser_session_count",
+							narratorId: id,
+							activeBrowserSessions: browserCount,
+						},
+						requestId,
+					),
+				)
+			) {
+				return;
+			}
+		}
+	}
+}
+
+function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?: string): void {
+	for (const id of narratorIds) {
+		const snap = getStreamingSnapshot(id);
+		if (!snap) continue;
+		const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
+		if (!hasStreaming) continue;
+		if (
+			!safeSend(
+				ws,
+				withSubscriptionRequestId(
+					{
+						type: "streaming_snapshot",
+						narratorId: id,
+						streamingBlocks: snap.streamingBlocks,
+						toolChunks: [...snap.toolChunks.values()],
+					},
+					requestId,
+				),
+			)
+		) {
+			return;
+		}
+	}
+}
+
+function beginCatchUp(ws: NarratorWS, narratorId: string): void {
+	const depth = ws.data.catchingUpNarrators.get(narratorId) ?? 0;
+	ws.data.catchingUpNarrators.set(narratorId, depth + 1);
+	if (!ws.data.catchUpBuffers.has(narratorId)) {
+		ws.data.catchUpBuffers.set(narratorId, createCatchUpBuffer());
+	}
+}
+
+/**
+ * Decrement the catch-up refcount for this narrator. When the last in-flight
+ * catch-up completes, flush buffered realtime frames (skipping ids already sent
+ * via catch_up) and clear the buffer. Returns true when overflow forced a reload.
+ */
+function endCatchUp(ws: NarratorWS, narratorId: string, requestId?: string): boolean {
+	const depth = ws.data.catchingUpNarrators.get(narratorId) ?? 0;
+	if (depth > 1) {
+		ws.data.catchingUpNarrators.set(narratorId, depth - 1);
+		return false;
+	}
+	ws.data.catchingUpNarrators.delete(narratorId);
+	const buffer = ws.data.catchUpBuffers.get(narratorId);
+	ws.data.catchUpBuffers.delete(narratorId);
+	if (!buffer) return false;
+	// The client may have unsubscribed while the DB catch-up query was in flight.
+	// In that case drop the buffered realtime frames instead of resurrecting the
+	// subscription or sending events to a listener that no longer exists.
+	if (!ws.data.subscribedNarrators.has(narratorId)) return false;
+	const drained = drainCatchUpBuffer(buffer);
+	if (drained.overflow) {
+		safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
+		return true;
+	}
+	for (const message of drained.messages) {
+		if (!safeSend(ws, message as unknown as Record<string, unknown>)) return false;
+	}
+	return false;
+}
+
+function markCatchUpSent(ws: NarratorWS, narratorId: string, ids: Set<string>): void {
+	const buffer = ws.data.catchUpBuffers.get(narratorId);
+	if (!buffer) return;
+	for (const id of ids) buffer.sentMessageIds.add(id);
+}
+
+/**
+ * Force this narrator's catch-up window to resolve with a single `full_reload`.
+ * Used when catch-up itself hits the limit — endCatchUp then emits exactly one
+ * reload and drops buffered realtime frames (the client reloads from scratch),
+ * avoiding a redundant reload + stale buffered frames racing the refetch.
+ */
+function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
+	const buffer = ws.data.catchUpBuffers.get(narratorId);
+	if (buffer) buffer.overflowed = true;
+}
+
+async function sendCatchUpForAnchor(
+	ws: NarratorWS,
+	narratorId: string,
+	anchor: string | CatchUpCursor,
+	requestId?: string,
+	opts: { emptyResult: "sync_ok" | "full_reload" } = { emptyResult: "sync_ok" },
+): Promise<void> {
+	// Mark subscribed before the DB query starts so realtime broadcasts that happen
+	// during catch-up are buffered and replayed after the historical frame.
+	ws.data.subscribedNarrators.add(narratorId);
+	beginCatchUp(ws, narratorId);
+	try {
+		const [catchUpResult, version] = await Promise.all([
+			narratorService.getMessagesAfter(narratorId, anchor),
+			narratorService.getMessageVersion(narratorId),
+		]);
+		if (!connections.has(ws)) {
+			endCatchUp(ws, narratorId, requestId);
+			return;
+		}
+		if (!ws.data.subscribedNarrators.has(narratorId)) {
+			endCatchUp(ws, narratorId, requestId);
+			return;
+		}
+
+		const { topLevel, orphanChildren, hitLimit, cursor } = catchUpResult;
+		if (hitLimit) {
+			markCatchUpOverflow(ws, narratorId);
+			endCatchUp(ws, narratorId, requestId);
+			return;
+		}
+
+		const sentMessageIds = new Set<string>();
+		collectMessageIds(topLevel, sentMessageIds);
+		collectMessageIds(orphanChildren, sentMessageIds);
+		markCatchUpSent(ws, narratorId, sentMessageIds);
+
+		if (topLevel.length === 0 && orphanChildren.length === 0) {
+			if (opts.emptyResult === "full_reload") {
+				safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
+				endCatchUp(ws, narratorId, requestId);
+				return;
+			}
+			safeSend(ws, withSubscriptionRequestId({ type: "sync_ok", narratorId, version }, requestId));
+		} else {
+			safeSend(
+				ws,
+				withSubscriptionRequestId(
+					{
+						type: "catch_up",
+						narratorId,
+						orphanChildren,
+						topLevel,
+						cursor,
+						messageVersion: version,
+					},
+					requestId,
+				),
+			);
+		}
+
+		try {
+			const latestVersion = await narratorService.getMessageVersion(narratorId);
+			if (connections.has(ws) && latestVersion !== version && cursor) {
+				const delta = await narratorService.getMessagesAfter(narratorId, cursor);
+				if (connections.has(ws)) {
+					if (delta.hitLimit) {
+						markCatchUpOverflow(ws, narratorId);
+					} else if (delta.topLevel.length > 0 || delta.orphanChildren.length > 0) {
+						const deltaIds = new Set<string>();
+						collectMessageIds(delta.topLevel, deltaIds);
+						collectMessageIds(delta.orphanChildren, deltaIds);
+						markCatchUpSent(ws, narratorId, deltaIds);
+						safeSend(
+							ws,
+							withSubscriptionRequestId(
+								{
+									type: "catch_up",
+									narratorId,
+									orphanChildren: delta.orphanChildren,
+									topLevel: delta.topLevel,
+									cursor: delta.cursor,
+									messageVersion: latestVersion,
+								},
+								requestId,
+							),
+						);
+					}
+				}
+			}
+		} catch {
+			// Non-critical — buffered realtime frames and future sync_check will reconcile.
+		}
+
+		endCatchUp(ws, narratorId, requestId);
+	} catch (err) {
+		endCatchUp(ws, narratorId, requestId);
+		logger.warn("Failed to send catch-up messages", { error: String(err) });
+	}
 }
 
 /** Broadcast a message to all WS connections belonging to a specific user. */
@@ -541,161 +840,33 @@ export const handleNarratorWS = {
 				// Heartbeat response — lastPongAt already updated above
 				break;
 			case "subscribe": {
-				// Determine which narrator needs async catch-up so we can defer
-				// its subscription until after the catch-up is sent.  This prevents
-				// real-time broadcasts (permission_request, message, etc.) from
-				// arriving before the historical catch-up messages, which would
-				// cause the frontend to display messages out of order.
+				const kind = msg.kind ?? "messages";
+				const requestId = msg.requestId;
 				const catchUpAnchor =
-					msg.narratorIds.length === 1 ? (msg.catchUpCursor ?? msg.lastMessageId) : undefined;
+					kind === "messages" && msg.narratorIds.length === 1
+						? (msg.catchUpCursor ?? msg.lastMessageId)
+						: undefined;
 				const catchUpNarratorId = catchUpAnchor ? msg.narratorIds[0] : undefined;
 
 				for (const id of msg.narratorIds) {
-					if (id === catchUpNarratorId) continue; // deferred — added after catch-up
+					if (id === catchUpNarratorId) continue;
 					ws.data.subscribedNarrators.add(id);
 				}
-				// Send streaming snapshot: restore in-progress tool chunks + text
-				for (const id of msg.narratorIds) {
-					const snap = getStreamingSnapshot(id);
-					if (!snap) continue;
-					const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
-					const hasQueue = snap.queuePosition != null && snap.queuePosition > 0;
-					const hasQueueMessage = !!snap.queueMessage;
-					if (!hasStreaming && !hasQueue && !hasQueueMessage) continue;
-					try {
-						if (hasStreaming) {
-							ws.send(
-								JSON.stringify({
-									type: "streaming_snapshot",
-									narratorId: id,
-									streamingBlocks: snap.streamingBlocks,
-									toolChunks: [...snap.toolChunks.values()],
-								}),
-							);
-						}
-						if (hasQueueMessage || hasQueue) {
-							ws.send(
-								JSON.stringify({
-									type: "queue_status",
-									narratorId: id,
-									position: snap.queuePosition,
-									queueDepth: snap.queueDepth ?? 0,
-									queueMessage: snap.queueMessage,
-								}),
-							);
-						}
-					} catch {
-						connections.delete(ws);
-					}
+
+				if (kind === "list" || kind === "panel") {
+					await sendStatusSnapshot(ws, msg.narratorIds);
 				}
-				// Send initial browser session count so the bar shows after page refresh
-				for (const id of msg.narratorIds) {
-					const browserCount = listBrowserSessions(id).length;
-					if (browserCount > 0) {
-						try {
-							ws.send(
-								JSON.stringify({
-									type: "browser_session_count",
-									narratorId: id,
-									activeBrowserSessions: browserCount,
-								}),
-							);
-						} catch {
-							connections.delete(ws);
-						}
-					}
+				if (kind === "panel") {
+					sendRuntimeSnapshot(ws, msg.narratorIds, requestId);
 				}
-				// Catch-up: send messages the client missed while disconnected.
-				// The narrator is NOT yet in subscribedNarrators, so broadcastToNarrator
-				// won't send real-time events to this ws until catch-up completes.
+				if (kind === "messages") {
+					sendStreamingSnapshot(ws, msg.narratorIds, requestId);
+				}
+
 				if (catchUpNarratorId && catchUpAnchor) {
-					const narratorId = catchUpNarratorId;
-					const anchor = catchUpAnchor;
-					Promise.all([
-						narratorService.getMessagesAfter(narratorId, anchor),
-						narratorService.getMessageVersion(narratorId),
-					])
-						.then(async ([catchUpResult, version]) => {
-							const { topLevel, orphanChildren, hitLimit, cursor } = catchUpResult;
-							// Connection may have been removed while the async query ran
-							if (!connections.has(ws)) return;
-							// Too many missed messages or reference not found — tell client to reload
-							if (hitLimit) {
-								ws.data.subscribedNarrators.add(narratorId);
-								try {
-									ws.send(JSON.stringify({ type: "full_reload", narratorId }));
-								} catch {
-									connections.delete(ws);
-								}
-								return;
-							}
-
-							try {
-								if (topLevel.length === 0 && orphanChildren.length === 0) {
-									ws.send(
-										JSON.stringify({
-											type: "sync_ok",
-											narratorId,
-											version,
-										}),
-									);
-								} else {
-									ws.send(
-										JSON.stringify({
-											type: "catch_up",
-											narratorId,
-											orphanChildren,
-											topLevel,
-											cursor,
-											messageVersion: version,
-										}),
-									);
-								}
-							} catch {
-								connections.delete(ws);
-								return;
-							}
-
-							// Now subscribe to real-time broadcasts.
-							ws.data.subscribedNarrators.add(narratorId);
-
-							// Check if new messages arrived while the catch-up query ran.
-							// If the version changed, send an incremental catch-up from the
-							// compound cursor so child streams are not dropped.
-							try {
-								const latestVersion = await narratorService.getMessageVersion(narratorId);
-								if (!connections.has(ws)) return;
-								if (latestVersion !== version && cursor) {
-									const delta = await narratorService.getMessagesAfter(narratorId, cursor);
-									if (!connections.has(ws)) return;
-									if (delta.hitLimit) {
-										ws.send(JSON.stringify({ type: "full_reload", narratorId }));
-									} else if (delta.topLevel.length > 0 || delta.orphanChildren.length > 0) {
-										ws.send(
-											JSON.stringify({
-												type: "catch_up",
-												narratorId,
-												orphanChildren: delta.orphanChildren,
-												topLevel: delta.topLevel,
-												cursor: delta.cursor,
-												messageVersion: latestVersion,
-											}),
-										);
-									}
-								}
-							} catch {
-								// Non-critical — real-time broadcasts are now active,
-								// and the existing sync_check mechanism will reconcile.
-							}
-						})
-						.catch((err: unknown) => {
-							// Ensure the narrator is subscribed even on failure so
-							// subsequent real-time events are not silently dropped.
-							ws.data.subscribedNarrators.add(narratorId);
-							logger.warn("Failed to send catch-up messages", {
-								error: String(err),
-							});
-						});
+					sendCatchUpForAnchor(ws, catchUpNarratorId, catchUpAnchor, requestId).catch((err) => {
+						logger.warn("Failed to send catch-up messages", { error: String(err) });
+					});
 				}
 				break;
 			}
@@ -938,77 +1109,35 @@ export const handleNarratorWS = {
 			}
 			case "sync_check": {
 				const narratorId = msg.narratorId;
-				narratorService
+				const requestId = msg.requestId;
+				const serverVersion = await narratorService
 					.getMessageVersion(narratorId)
-					.then((serverVersion) => {
-						if (!connections.has(ws)) return;
-						if (serverVersion === msg.version) {
-							// In sync — cheap ack
-							try {
-								ws.send(
-									JSON.stringify({
-										type: "sync_ok",
-										narratorId,
-										version: serverVersion,
-									}),
-								);
-							} catch {
-								connections.delete(ws);
-							}
-							return;
-						}
-						// Out of sync — try catch-up if a compound cursor or legacy lastMessageId is provided
-						const catchUpAnchor = msg.catchUpCursor ?? msg.lastMessageId;
-						if (catchUpAnchor) {
-							narratorService
-								.getMessagesAfter(narratorId, catchUpAnchor)
-								.then(({ topLevel, orphanChildren, hitLimit, cursor }) => {
-									if (!connections.has(ws)) return;
-									if (hitLimit) {
-										try {
-											ws.send(JSON.stringify({ type: "full_reload", narratorId }));
-										} catch {
-											connections.delete(ws);
-										}
-										return;
-									}
-									if (topLevel.length === 0 && orphanChildren.length === 0) {
-										// Version mismatch but no new messages — likely a delete/update
-										try {
-											ws.send(JSON.stringify({ type: "full_reload", narratorId }));
-										} catch {
-											connections.delete(ws);
-										}
-										return;
-									}
-									try {
-										ws.send(
-											JSON.stringify({
-												type: "catch_up",
-												narratorId,
-												orphanChildren,
-												topLevel,
-												cursor,
-												messageVersion: serverVersion,
-											}),
-										);
-									} catch {
-										connections.delete(ws);
-									}
-								})
-								.catch((err: unknown) =>
-									logger.warn("sync_check catch-up failed", { error: String(err) }),
-								);
-						} else {
-							// No lastMessageId — full reload
-							try {
-								ws.send(JSON.stringify({ type: "full_reload", narratorId }));
-							} catch {
-								connections.delete(ws);
-							}
-						}
-					})
-					.catch((err: unknown) => logger.warn("sync_check failed", { error: String(err) }));
+					.catch((err: unknown) => {
+						logger.warn("sync_check failed", { error: String(err) });
+						return null;
+					});
+				if (serverVersion == null || !connections.has(ws)) return;
+				if (!ws.data.subscribedNarrators.has(narratorId)) break;
+				if (serverVersion === msg.version) {
+					safeSend(
+						ws,
+						withSubscriptionRequestId(
+							{ type: "sync_ok", narratorId, version: serverVersion },
+							requestId,
+						),
+					);
+					break;
+				}
+				const catchUpAnchor = msg.catchUpCursor ?? msg.lastMessageId;
+				if (catchUpAnchor) {
+					sendCatchUpForAnchor(ws, narratorId, catchUpAnchor, requestId, {
+						emptyResult: "full_reload",
+					}).catch((err: unknown) =>
+						logger.warn("sync_check catch-up failed", { error: String(err) }),
+					);
+				} else {
+					safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
+				}
 				break;
 			}
 			case "update_timeout": {
@@ -1057,6 +1186,8 @@ export const handleNarratorWS = {
 			removeStatsSubscriber();
 		}
 		removeAllPresence(ws);
+		ws.data.catchingUpNarrators?.clear();
+		ws.data.catchUpBuffers?.clear();
 		connections.delete(ws);
 	},
 };

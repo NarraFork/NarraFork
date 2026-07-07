@@ -22,8 +22,10 @@ import { MermaidDiagram } from "./MermaidDiagram";
 import {
 	hasMarkdownMath,
 	isSafeForFlowtokenAnimation,
+	isSafeForFlowtokenTail,
 	normalizeMathDelimiters,
 } from "./markdown-detection";
+import { hasUnclosedFence, splitStableAndTail } from "./streaming-markdown-split";
 
 export { MD_PATTERN } from "./markdown-detection";
 
@@ -396,6 +398,151 @@ class MarkdownErrorBoundary extends Component<
 }
 
 // ---------------------------------------------------------------------------
+// Static markdown tree (no wrapper element)
+// ---------------------------------------------------------------------------
+
+/**
+ * Renders one markdown string with react-markdown + our Mantine components.
+ * Emits ONLY the react-markdown output (a Fragment of block elements) with no
+ * wrapping div, so a caller can place several of these as direct children of a
+ * single `.root` container and have block spacing behave exactly as if the
+ * whole document were rendered once (see the split renderer below).
+ */
+function StaticMarkdownTree({
+	source,
+	remarkPlugins,
+	rehypePlugins,
+}: {
+	source: string;
+	remarkPlugins: PluggableList;
+	rehypePlugins: PluggableList;
+}) {
+	return (
+		<Markdown
+			remarkPlugins={remarkPlugins}
+			rehypePlugins={rehypePlugins}
+			components={staticComponents}
+		>
+			{source}
+		</Markdown>
+	);
+}
+
+/**
+ * Sealed leading blocks of a streaming message. Memoised on the prefix string
+ * so that — while the tail keeps growing every frame — this subtree is skipped
+ * entirely by React (no re-render, no reflow). The prefix is append-only, so a
+ * new string only ever means "more sealed blocks", never a rewrite of old ones.
+ */
+const StablePrefixMarkdown = memo(function StablePrefixMarkdown({
+	source,
+	remarkPlugins,
+	rehypePlugins,
+}: {
+	source: string;
+	remarkPlugins: PluggableList;
+	rehypePlugins: PluggableList;
+}) {
+	return (
+		<StaticMarkdownTree
+			source={source}
+			remarkPlugins={remarkPlugins}
+			rehypePlugins={rehypePlugins}
+		/>
+	);
+});
+
+/**
+ * The active (still-streaming) tail of a message. Re-rendered every frame, but
+ * the tail is short (at most the last couple of blocks), so its parse+render
+ * cost is bounded and constant instead of growing with the whole message.
+ *
+ * Animates the tail with flowtoken when it is safe to (advanced-anim on, no raw
+ * HTML/math, no unclosed fence); otherwise renders it statically.
+ */
+function ActiveTailMarkdown({
+	source,
+	animate,
+	remarkPlugins,
+	rehypePlugins,
+}: {
+	source: string;
+	animate: boolean;
+	remarkPlugins: PluggableList;
+	rehypePlugins: PluggableList;
+}) {
+	if (animate) {
+		return (
+			<AnimatedMarkdown
+				content={source}
+				sep="diff"
+				animation="blurIn"
+				animationDuration="0.35s"
+				animationTimingFunction="ease-out"
+				customComponents={flowtokenCustomComponents}
+			/>
+		);
+	}
+	return (
+		<StaticMarkdownTree
+			source={source}
+			remarkPlugins={remarkPlugins}
+			rehypePlugins={rehypePlugins}
+		/>
+	);
+}
+
+/**
+ * Streaming split renderer: keeps a stable, memoised prefix on top and an active
+ * tail below, both as direct children of the SAME `.root` container so block
+ * spacing across the boundary matches single-pass rendering (no reflow when a
+ * block "graduates" from tail to prefix).
+ */
+function StreamingSplitMarkdown({
+	text,
+	wordWrap,
+	tailAnimate,
+	remarkPlugins,
+	rehypePlugins,
+}: {
+	text: string;
+	wordWrap: boolean;
+	tailAnimate: boolean;
+	remarkPlugins: PluggableList;
+	rehypePlugins: PluggableList;
+}) {
+	// Remember the last stable prefix so the split stays monotonic (append-only):
+	// the prefix can only grow, never retreat, so already-rendered blocks above
+	// never jitter. Reset is handled inside splitStableAndTail.
+	const prevPrefixRef = useRef("");
+	const { stablePrefix, tail } = splitStableAndTail(text, prevPrefixRef.current);
+	prevPrefixRef.current = stablePrefix;
+
+	// Only animate the tail when it carries no unclosed fence this frame.
+	const animateTail = tailAnimate && !hasUnclosedFence(tail);
+
+	return (
+		<div className={wordWrap ? classes.root : classes.rootNoWrap}>
+			{stablePrefix && (
+				<StablePrefixMarkdown
+					source={stablePrefix}
+					remarkPlugins={remarkPlugins}
+					rehypePlugins={rehypePlugins}
+				/>
+			)}
+			{tail && (
+				<ActiveTailMarkdown
+					source={tail}
+					animate={animateTail}
+					remarkPlugins={remarkPlugins}
+					rehypePlugins={rehypePlugins}
+				/>
+			)}
+		</div>
+	);
+}
+
+// ---------------------------------------------------------------------------
 // MarkdownContent component
 // ---------------------------------------------------------------------------
 
@@ -420,17 +567,29 @@ export const MarkdownContent = memo(function MarkdownContent({
 		typeof document !== "undefined" &&
 		document.documentElement.getAttribute("data-advanced-anim") === "true";
 
+	// Whole-text plain animation (legacy fast path): the entire message is plain
+	// text short enough to animate as-is, with no markdown structure at all.
 	const shouldAnimate =
 		canAnimateStreaming &&
 		advancedAnim &&
 		supportsLookbehind &&
 		isSafeForFlowtokenAnimation(trimmed);
+
 	const tooLargeForMarkdown = trimmed.length > STATIC_MARKDOWN_MAX_CHARS;
-	const usesStaticMarkdown =
-		!tooLargeForMarkdown &&
-		!(streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) &&
-		!shouldAnimate;
-	const mathPlugins = useMathPlugins(usesStaticMarkdown && hasMarkdownMath(trimmed));
+	const streamingTooLarge = !!streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS;
+
+	// Streaming split path: while streaming a markdown message that is not the
+	// tiny plain-text animate case, seal completed leading blocks and only
+	// re-render the growing tail. Disabled for math (needs whole-document
+	// katex context) — those keep the single-pass static path.
+	const hasMath = hasMarkdownMath(trimmed);
+	const usesSplitStreaming =
+		!!streaming && !shouldAnimate && !streamingTooLarge && !tooLargeForMarkdown && !hasMath;
+
+	// Math plugins load for any static (non-split, non-animate) render that needs
+	// them. The split path excludes math, so it never needs katex.
+	const usesStaticMarkdown = !tooLargeForMarkdown && !streamingTooLarge && !shouldAnimate;
+	const mathPlugins = useMathPlugins(usesStaticMarkdown && !usesSplitStreaming && hasMath);
 	const remarkPlugins = useMemo<PluggableList>(() => {
 		const plugins: PluggableList = supportsLookbehind ? [remarkGfm] : [];
 		if (mathPlugins) plugins.push(mathPlugins.remarkMath);
@@ -448,6 +607,15 @@ export const MarkdownContent = memo(function MarkdownContent({
 		[mathPlugins, trimmed],
 	);
 
+	// Whether the tail may animate: advanced-anim on, lookbehind support, and the
+	// relaxed tail-safety check (allows markdown, blocks raw HTML/math).
+	const tailAnimate =
+		!!streaming &&
+		advancedAnim &&
+		supportsLookbehind &&
+		trimmed.length <= STREAMING_ANIM_MAX_CHARS &&
+		isSafeForFlowtokenTail(trimmed);
+
 	const plainFallback = (
 		<Text
 			size="sm"
@@ -457,12 +625,12 @@ export const MarkdownContent = memo(function MarkdownContent({
 		</Text>
 	);
 
-	if ((streaming && trimmed.length > STREAMING_MARKDOWN_MAX_CHARS) || tooLargeForMarkdown) {
+	if (streamingTooLarge || tooLargeForMarkdown) {
 		return plainFallback;
 	}
 
-	// Streaming mode: AnimatedMarkdown with our Mantine customComponents for
-	// consistent styling + flowtoken's per-word blur-in animation
+	// Streaming mode (whole-text plain animation): AnimatedMarkdown for the entire
+	// short plain-text message with flowtoken's per-word blur-in.
 	if (shouldAnimate) {
 		return (
 			<MarkdownErrorBoundary fallback={plainFallback}>
@@ -482,21 +650,35 @@ export const MarkdownContent = memo(function MarkdownContent({
 		);
 	}
 
+	// Streaming split mode: memoised stable prefix + active tail (see above).
+	if (usesSplitStreaming) {
+		return (
+			<MarkdownErrorBoundary fallback={plainFallback}>
+				<MermaidStreamingCtx.Provider value={true}>
+					<StreamingSplitMarkdown
+						text={trimmed}
+						wordWrap={wordWrap}
+						tailAnimate={tailAnimate}
+						remarkPlugins={remarkPlugins}
+						rehypePlugins={rehypePlugins}
+					/>
+				</MermaidStreamingCtx.Provider>
+			</MarkdownErrorBoundary>
+		);
+	}
+
 	// Static mode: react-markdown with the same Mantine components (no animation).
-	// `streaming` can still be true here: content containing a mermaid fence always
-	// matches MD_PATTERN, so it is routed to this path (not flowtoken). We forward the
-	// real streaming flag so an incomplete fence is shown as code until streaming ends.
+	// `streaming` can still be true here (e.g. a mermaid fence, or a math message),
+	// so we forward the real streaming flag (incomplete fence shown as code).
 	return (
 		<MarkdownErrorBoundary fallback={plainFallback}>
 			<MermaidStreamingCtx.Provider value={!!streaming}>
 				<div className={wordWrap ? classes.root : classes.rootNoWrap}>
-					<Markdown
+					<StaticMarkdownTree
+						source={markdownSource}
 						remarkPlugins={remarkPlugins}
 						rehypePlugins={rehypePlugins}
-						components={staticComponents}
-					>
-						{markdownSource}
-					</Markdown>
+					/>
 				</div>
 			</MermaidStreamingCtx.Provider>
 		</MarkdownErrorBoundary>

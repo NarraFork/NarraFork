@@ -145,7 +145,7 @@ export function useRecentTabsWS(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: idsKey is a stable memoized serialization of narratorIds
 	useEffect(() => {
 		if (!subHandleRef.current) {
-			subHandleRef.current = narratorWSManager.subscribe(narratorIds);
+			subHandleRef.current = narratorWSManager.subscribe(narratorIds, { kind: "list" });
 		} else {
 			narratorWSManager.updateSubscription(subHandleRef.current, narratorIds);
 		}

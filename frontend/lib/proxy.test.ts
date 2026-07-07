@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeProxyUrl, summarizeWebFetchProxyPolicy } from "./proxy";
+import { normalizeProxyUrl, summarizeOutboundProxyPolicy } from "./proxy";
 
 describe("proxy helpers", () => {
 	test("normalizes proxy URLs without schemes", () => {
@@ -12,37 +12,35 @@ describe("proxy helpers", () => {
 		expect(normalizeProxyUrl("  ")).toBeUndefined();
 	});
 
-	test("summarizes current WebFetch proxy object policy", () => {
-		expect(summarizeWebFetchProxyPolicy({ proxy: { mode: "direct" } })).toEqual({
+	test("summarizes the global outbound proxy policy", () => {
+		expect(summarizeOutboundProxyPolicy({ mode: "direct" })).toEqual({
 			mode: "direct",
 			url: "",
 			configured: false,
 		});
 		expect(
-			summarizeWebFetchProxyPolicy({
-				proxy: { mode: "custom", url: "http://proxy.example.test:8080" },
-			}),
+			summarizeOutboundProxyPolicy({ mode: "custom", url: "http://proxy.example.test:8080" }),
 		).toEqual({
 			mode: "custom",
 			url: "http://proxy.example.test:8080",
 			configured: true,
 		});
-		expect(summarizeWebFetchProxyPolicy({ proxy: { mode: "system" } })).toEqual({
+		expect(summarizeOutboundProxyPolicy({ mode: "system" })).toEqual({
 			mode: "system",
 			url: "",
 			configured: true,
 		});
 	});
 
-	test("keeps legacy WebFetch proxy string policy readable", () => {
-		expect(
-			summarizeWebFetchProxyPolicy({
-				proxy: "custom",
-				proxyUrl: "http://legacy-proxy.example.test",
-			}),
-		).toEqual({
-			mode: "custom",
-			url: "http://legacy-proxy.example.test",
+	test("defaults to system when policy is missing or malformed", () => {
+		expect(summarizeOutboundProxyPolicy(undefined)).toEqual({
+			mode: "system",
+			url: "",
+			configured: true,
+		});
+		expect(summarizeOutboundProxyPolicy({ mode: "bogus" })).toEqual({
+			mode: "system",
+			url: "",
 			configured: true,
 		});
 	});

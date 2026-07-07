@@ -25,7 +25,7 @@ import {
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
-import type { IDockviewPanelProps } from "dockview-react";
+import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
 import {
 	lazy,
 	type ReactNode,
@@ -39,12 +39,12 @@ import {
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
-import { startPanelDrag } from "../../../lib/panel-drag";
 import { GitPanel } from "../../chapter/GitPanel";
 import { BrowserPanel } from "../BrowserPanel";
 import { FileModificationsPanel } from "../FileModificationsDrawer";
 import { NarratorDetailsPanel } from "../NarratorDetailsPanel";
 import { NarratorPanel } from "../NarratorPanel";
+import { usePanelCompact, usePanelHeaderDrag, useSubagentStack } from "../panels/shared";
 import { SpecPanel } from "../SpecPanel";
 import type { NarratorDockPanelParams, NarratorDockPanelType } from "./dock-panel-types";
 import { useNarratorDockContext } from "./NarratorDockContext";
@@ -52,45 +52,6 @@ import { useNarratorDockContext } from "./NarratorDockContext";
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
 );
-
-const COMPACT_WIDTH_THRESHOLD = 640;
-
-/** Observe panel width to decide whether to use the compact chat toolbar. */
-function usePanelCompact(): { ref: (el: HTMLDivElement | null) => void; compact: boolean } {
-	const [compact, setCompact] = useState(true);
-	const roRef = useRef<ResizeObserver | null>(null);
-	const ref = useCallback((el: HTMLDivElement | null) => {
-		roRef.current?.disconnect();
-		if (!el) return;
-		const ro = new ResizeObserver((entries) => {
-			setCompact((entries[0]?.contentRect.width ?? 0) < COMPACT_WIDTH_THRESHOLD);
-		});
-		ro.observe(el);
-		roRef.current = ro;
-	}, []);
-	useEffect(() => () => roRef.current?.disconnect(), []);
-	return { ref, compact };
-}
-
-/** Begin dragging this panel via its header — drives swap/merge/split on drop. */
-function usePanelHeaderDrag(
-	props: IDockviewPanelProps<NarratorDockPanelParams>,
-	subjectId: string,
-): (e: React.PointerEvent) => void {
-	return useCallback(
-		(e: React.PointerEvent) => {
-			startPanelDrag({
-				panelId: props.api.id,
-				id: subjectId,
-				title: props.api.title || subjectId,
-				sourceGroupId: props.api.group?.id,
-				x: e.clientX,
-				y: e.clientY,
-			});
-		},
-		[props.api, subjectId],
-	);
-}
 
 /**
  * Shared header bar for tool panels — the SINGLE title bar for a docked panel.
@@ -167,7 +128,7 @@ function ToolPanelShell({
 	subjectId: string;
 	children: React.ReactNode;
 }) {
-	const onPointerDown = usePanelHeaderDrag(props, subjectId);
+	const onPointerDown = usePanelHeaderDrag(props, subjectId, "tool");
 	const close = useCallback(() => props.api.close(), [props.api]);
 	return (
 		<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -192,15 +153,13 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	// see B"). params only decides *which kind* of panel this is.
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const onForkFromMessage = dock?.onForkFromMessage ?? undefined;
+	// Deep-link / search-result jump target. Applies only to the primary
+	// narrator view, not the subagent stack overlay (which shows a different
+	// narrator's messages).
+	const highlightMessageId = dock?.highlightMessageId;
 	const { ref, compact } = usePanelCompact();
-	const [subagentStack, setSubagentStack] = useState<string[]>([]);
-	const currentNarratorId = subagentStack[subagentStack.length - 1] ?? narratorId;
-	const isSubagentView = subagentStack.length > 0;
-
-	const openSubagent = useCallback((subId: string) => {
-		setSubagentStack((prev) => (prev[prev.length - 1] === subId ? prev : [...prev, subId]));
-	}, []);
-	const restoreParent = useCallback(() => setSubagentStack((prev) => prev.slice(0, -1)), []);
+	const { currentNarratorId, isSubagentView, openSubagent, restoreParent } =
+		useSubagentStack(narratorId);
 	const onHeaderPointerDown = usePanelHeaderDrag(props, narratorId);
 
 	const { data: narratorData } = useNarrator(currentNarratorId);
@@ -227,6 +186,7 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 					onForkFromMessage={onForkFromMessage}
 					onHeaderPointerDown={onHeaderPointerDown}
 					onViewSubagentSession={openSubagent}
+					highlightMessageId={highlightMessageId}
 				/>
 			</Box>
 			{isSubagentView && (
@@ -246,12 +206,20 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 }
 
 // ── Terminal ──
-function TerminalDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function TerminalDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("terminal");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const close = useCallback(() => props.api.close(), [props.api]);
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("terminal");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
 
 	// Bridge: register terminal stdin writer so chat can push text to us.
 	const registerWrite = dock?.registerWriteTerminalStdin;
@@ -301,13 +269,21 @@ function TerminalDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) 
 }
 
 // ── Details ──
-function DetailsDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function DetailsDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	const detailsProps = dock?.detailsProps;
 	const close = useCallback(() => props.api.close(), [props.api]);
 	const title = t("details.title");
 	const icon = <IconInfoCircle size={16} color="var(--mantine-color-dimmed)" />;
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const titleValue = t("details.title");
+		if (titleValue && titleValue !== props.api.title) {
+			props.api.setTitle(titleValue);
+		}
+	}, [t, props.api]);
 
 	// Status badge is a small control → hoisted into the shell header. The
 	// narrator comes from the published details props (same source the panel uses).
@@ -355,13 +331,22 @@ function DetailsDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 }
 
 // ── File modifications ──
-function FileModDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function FileModDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const fileModProps = dock?.fileModProps;
 	const close = useCallback(() => props.api.close(), [props.api]);
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("fileMod_title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
 	return (
 		<ToolPanelShell
 			title={t("fileMod_title")}
@@ -384,12 +369,21 @@ function FileModDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 }
 
 // ── Spec ──
-function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
 	const close = useCallback(() => props.api.close(), [props.api]);
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("spec.title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
 	// Save/reload controls are small → hoisted into the shell header, reported
 	// up by SpecPanel while it has unsaved edits.
 	const [actions, setActions] = useState<ReactNode>(null);
@@ -412,12 +406,21 @@ function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 }
 
 // ── Git ──
-function GitDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function GitDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("git");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const chapterId = dock?.chapterId ?? props.params.chapterId;
 	const icon = <IconGitBranch size={16} color="var(--mantine-color-dimmed)" />;
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("panel.title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
 	if (!chapterId) {
 		return (
 			<ToolPanelShell title={t("panel.title")} icon={icon} props={props} subjectId="__git__">
@@ -437,11 +440,20 @@ function GitDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 }
 
 // ── Browser ──
-function BrowserDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+export function BrowserDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("browser.title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
 	// Session count is a small control → hoisted into the shell header.
 	const count = dock?.browserInfo.sessionCount ?? 0;
 	const actions =
@@ -481,4 +493,35 @@ export const narratorDockComponents: Record<
 	spec: SpecDockPanel,
 	git: GitDockPanel,
 	browser: BrowserDockPanel,
+};
+
+/**
+ * Close-less tab for the chat panel. The chat panel is the cluster's
+ * protagonist and must never be closed (focus-page rule), so its dockview tab
+ * renders the title only — no close action. Tool panels keep the default tab
+ * (with close). Note: when chat is alone in its group the tab strip is hidden
+ * entirely (`.dv-single-tab`); this matters only when a tool is dragged into
+ * chat's group, making the strip visible.
+ */
+function ChatTab(props: IDockviewPanelHeaderProps) {
+	const [title, setTitle] = useState(props.api.title ?? "");
+	useEffect(() => {
+		const d = props.api.onDidTitleChange(() => setTitle(props.api.title ?? ""));
+		return () => d.dispose();
+	}, [props.api]);
+	return (
+		<Box px="sm" style={{ display: "flex", alignItems: "center", height: "100%" }}>
+			<Text size="xs" fw={600} truncate>
+				{title}
+			</Text>
+		</Box>
+	);
+}
+
+/** Per-panel tab renderers for the focus dock (chat = close-less). */
+export const narratorDockTabComponents: Record<
+	string,
+	React.FunctionComponent<IDockviewPanelHeaderProps>
+> = {
+	chat: ChatTab,
 };

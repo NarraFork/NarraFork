@@ -3,16 +3,14 @@ import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useLocation, useNavigate, useSearch } from "@tanstack/react-router";
+import type { Direction } from "dockview-react";
 import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { clearHighlightCache } from "../../components/narrator/highlight-cache";
 import { NarratorPanel } from "../../components/narrator/NarratorPanel";
-import {
-	createBranch,
-	createLeafWith,
-	type SplitDirection,
-} from "../../components/narrator/split-tree";
+import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
+import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 
 // Lazy-loaded heavy panels — not needed for first paint (mobile drawers)
 const NarratorTerminal = lazy(() =>
@@ -37,7 +35,7 @@ import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/use
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import {
-	isSyntheticSubjectId,
+	isNarratorSubject,
 	onPanelDragEnd,
 	onPanelDragMove,
 	type PanelDragState,
@@ -381,9 +379,9 @@ function NarratorDetailPage() {
 		};
 
 		const unsubMove = onPanelDragMove((state: PanelDragState) => {
-			// Ignore self-drags and in-dock tool-panel rearrangements (synthetic
-			// subject ids like "__spec__" must not trigger a workspace split).
-			if (state.id === narratorId || isSyntheticSubjectId(state.id)) {
+			// Ignore self-drags and in-dock tool-panel rearrangements: only a real
+			// narrator dragged onto this page may create a workspace.
+			if (state.id === narratorId || !isNarratorSubject(state)) {
 				if (dropSideRef.current) {
 					dropSideRef.current = null;
 					setDropSide(null);
@@ -412,19 +410,19 @@ function NarratorDetailPage() {
 			const side = dropSideRef.current;
 			dropSideRef.current = null;
 			setDropSide(null);
-			if (!final || !side || final.id === narratorId || isSyntheticSubjectId(final.id)) return;
+			if (!final || !side || final.id === narratorId || !isNarratorSubject(final)) return;
 
-			// Create workspace with two panels
-			const direction: SplitDirection =
-				side === "left" || side === "right" ? "horizontal" : "vertical";
-			const currentLeaf = createLeafWith(narratorId);
-			const droppedLeaf = createLeafWith(final.id);
-			const children =
-				side === "left" || side === "top" ? [droppedLeaf, currentLeaf] : [currentLeaf, droppedLeaf];
-			const tree = createBranch(direction, children);
+			// Create a workspace seeded with two narrator panels. The dropped panel
+			// sits on the drop side; the current narrator takes the other half. We
+			// persist an api-free seed envelope (not a legacy split-tree) that the
+			// DockviewWorkspace materialises on mount.
+			const dropFirst = side === "left" || side === "top";
+			const direction: Direction = side === "left" || side === "right" ? "right" : "below";
+			const [firstId, secondId] = dropFirst ? [final.id, narratorId] : [narratorId, final.id];
+			const seed = twoNarratorWorkspaceSeed(firstId, secondId, direction);
 
 			api
-				.createWorkspace({ tree: JSON.stringify(tree) })
+				.createWorkspace({ tree: serializeSeedEnvelope(seed) })
 				.then((ws) => {
 					addRecentTab({
 						type: "workspace",
@@ -638,6 +636,7 @@ function NarratorDetailPage() {
 				narratorId={narratorId}
 				chapterId={chapterId}
 				onForkFromMessage={chapterId ? handleForkFromMessage : null}
+				highlightMessageId={highlightMessageId}
 			>
 				<NarratorDock device="desktop" />
 			</NarratorDockProvider>

@@ -6,6 +6,8 @@ import {
 	Button,
 	Card,
 	Container,
+	Divider,
+	Grid,
 	Group,
 	Paper,
 	ScrollArea,
@@ -16,8 +18,19 @@ import {
 	Textarea,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
-import { IconArrowLeft, IconGitMerge, IconTrash } from "@tabler/icons-react";
+import {
+	IconArrowLeft,
+	IconExternalLink,
+	IconFolder,
+	IconGitMerge,
+	IconKey,
+	IconLock,
+	IconTags,
+	IconTrash,
+	IconUser,
+} from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -44,7 +57,151 @@ import {
 	useSubmitKnowledgeDraft,
 	useUpdateKnowledgeDraft,
 } from "../../hooks/useKnowledge";
-import type { KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
+import type { KnowledgeEntry, KnowledgeEntryLink, KnowledgeLinkType } from "../../lib/api";
+
+function LinksSummary({ entryId }: { entryId: string }) {
+	const { t } = useTranslation("knowledge");
+	const navigate = useNavigate();
+	const links = useEntryLinks(entryId, "both");
+
+	const all = links.data ?? [];
+	if (all.length === 0) {
+		return (
+			<Text size="xs" c="dimmed">
+				{t("linkNoOutgoing")}
+			</Text>
+		);
+	}
+
+	return (
+		<Stack gap="xs">
+			{all.slice(0, 5).map((l) => {
+				const isOut = l.direction === "out";
+				const other = isOut ? l.toEntry : l.fromEntry;
+				return (
+					<Group key={l.id} wrap="nowrap" justify="space-between" gap="xs">
+						<Group gap={4} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
+							<Badge
+								size="xs"
+								variant="light"
+								color={isOut ? "blue" : "teal"}
+								style={{ flexShrink: 0 }}
+							>
+								{t(`linkType_${l.linkType}`)}
+							</Badge>
+							<Anchor
+								size="xs"
+								truncate="end"
+								onClick={() =>
+									navigate({ to: "/knowledge/$entryId", params: { entryId: other.id } })
+								}
+							>
+								{other.title}
+							</Anchor>
+						</Group>
+					</Group>
+				);
+			})}
+			{all.length > 5 && (
+				<Text size="xs" c="dimmed" fs="italic">
+					...
+				</Text>
+			)}
+		</Stack>
+	);
+}
+
+function ReadOnlyMetaView({ entry }: { entry: KnowledgeEntry }) {
+	const { t } = useTranslation("knowledge");
+
+	return (
+		<Stack gap="xs">
+			<Group gap="xs" wrap="nowrap">
+				<IconFolder size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("collections")}
+				</Text>
+				<Text size="xs" truncate fw={500}>
+					{entry.collectionId}
+				</Text>
+			</Group>
+
+			<Group gap="xs" wrap="nowrap">
+				<IconLock size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("classificationLevel")}
+				</Text>
+				{entry.classificationLevel ? (
+					<Badge size="xs" color="grape" variant="light">
+						{entry.classificationLevel}
+					</Badge>
+				) : (
+					<Text size="xs">-</Text>
+				)}
+			</Group>
+
+			<Group gap="xs" wrap="nowrap">
+				<IconUser size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("owner")}
+				</Text>
+				<Text size="xs" truncate>
+					{entry.ownerUserId || "-"}
+				</Text>
+			</Group>
+
+			<Group gap="xs" wrap="nowrap" align="flex-start">
+				<IconTags size={14} style={{ color: "var(--mantine-color-dimmed)", marginTop: 2 }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("tags")}
+				</Text>
+				<Group gap={4} wrap="wrap">
+					{(entry.tagsJson ?? []).length > 0 ? (
+						(entry.tagsJson ?? []).map((tag: string) => (
+							<Badge key={tag} size="xs" variant="light">
+								{tag}
+							</Badge>
+						))
+					) : (
+						<Text size="xs" c="dimmed">
+							-
+						</Text>
+					)}
+				</Group>
+			</Group>
+
+			<Group gap="xs" wrap="nowrap" align="flex-start">
+				<IconKey size={14} style={{ color: "var(--mantine-color-dimmed)", marginTop: 2 }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("keywords")}
+				</Text>
+				<Group gap={4} wrap="wrap">
+					{(entry.keywordsJson ?? []).length > 0 ? (
+						(entry.keywordsJson ?? []).map((k: string) => (
+							<Badge key={k} size="xs" variant="outline" color="indigo">
+								{k}
+							</Badge>
+						))
+					) : (
+						<Text size="xs" c="dimmed">
+							-
+						</Text>
+					)}
+				</Group>
+			</Group>
+
+			<Group gap="xs" wrap="nowrap">
+				<IconGitMerge size={14} style={{ color: "var(--mantine-color-dimmed)" }} />
+				<Text size="xs" c="dimmed" style={{ width: 80, flexShrink: 0 }}>
+					{t("status")}
+				</Text>
+				<Badge size="xs" variant="light" color={entry.status === "active" ? "green" : "gray"}>
+					{t(`statusActive`)}
+				</Badge>
+			</Group>
+		</Stack>
+	);
+}
 
 export const Route = createFileRoute("/knowledge/$entryId")({
 	component: EntryDetailPage,
@@ -57,6 +214,7 @@ function EntryDetailPage() {
 	const { data: user } = useCurrentUser();
 	const isAdmin = user?.role === "admin";
 	const entry = useKnowledgeEntry(entryId);
+	const [activeTab, setActiveTab] = useState<string | null>("content");
 
 	if (entry.isLoading) {
 		return (
@@ -108,48 +266,78 @@ function EntryDetailPage() {
 				</div>
 			</Group>
 
-			<Tabs defaultValue="content" keepMounted={false}>
-				<Tabs.List mb="md">
-					<Tabs.Tab value="content">{t("tabContent")}</Tabs.Tab>
-					<Tabs.Tab value="history">{t("tabHistory")}</Tabs.Tab>
-					<Tabs.Tab value="draft">{t("tabMyDraft")}</Tabs.Tab>
-					<Tabs.Tab value="submissions">{t("tabSubmissions")}</Tabs.Tab>
-					<Tabs.Tab value="links">{t("tabLinks")}</Tabs.Tab>
-					<Tabs.Tab value="settings">{t("tabSettings")}</Tabs.Tab>
-				</Tabs.List>
+			<Grid gap="lg">
+				{/* Left Column: Content, Draft, History, Submissions, Links tabs */}
+				<Grid.Col span={{ base: 12, md: 8, lg: 9 }}>
+					<Tabs value={activeTab} onChange={setActiveTab} keepMounted={false}>
+						<Tabs.List mb="md">
+							<Tabs.Tab value="content">{t("tabContent")}</Tabs.Tab>
+							<Tabs.Tab value="draft">{t("tabMyDraft")}</Tabs.Tab>
+							<Tabs.Tab value="history">{t("tabHistory")}</Tabs.Tab>
+							<Tabs.Tab value="submissions">{t("tabSubmissions")}</Tabs.Tab>
+							<Tabs.Tab value="links">{t("tabLinks")}</Tabs.Tab>
+						</Tabs.List>
 
-				<Tabs.Panel value="content">
-					<ContentTab
-						content={e.currentContent ?? ""}
-						canDirectWrite={canDirectWrite}
-						entryId={entryId}
-					/>
-				</Tabs.Panel>
-				<Tabs.Panel value="history">
-					<HistoryTab entryId={entryId} />
-				</Tabs.Panel>
-				<Tabs.Panel value="draft">
-					<DraftTab entryId={entryId} mainContent={e.currentContent ?? ""} />
-				</Tabs.Panel>
-				<Tabs.Panel value="submissions">
-					<SubmissionsTab entryId={entryId} mainContent={e.currentContent ?? ""} />
-				</Tabs.Panel>
-				<Tabs.Panel value="links">
-					<LinksTab entryId={entryId} collectionId={e.collectionId} />
-				</Tabs.Panel>
-				<Tabs.Panel value="settings">
-					<Stack gap="xl">
-						{canDirectWrite ? (
-							<EntryMetaPanel entry={e} />
-						) : (
-							<Text size="sm" c="dimmed">
-								{t("settingsReadOnlyHint")}
-							</Text>
+						<Tabs.Panel value="content">
+							<ContentTab
+								content={e.currentContent ?? ""}
+								canDirectWrite={canDirectWrite}
+								entryId={entryId}
+							/>
+						</Tabs.Panel>
+						<Tabs.Panel value="history">
+							<HistoryTab entryId={entryId} />
+						</Tabs.Panel>
+						<Tabs.Panel value="draft">
+							<DraftTab entryId={entryId} mainContent={e.currentContent ?? ""} />
+						</Tabs.Panel>
+						<Tabs.Panel value="submissions">
+							<SubmissionsTab entryId={entryId} mainContent={e.currentContent ?? ""} />
+						</Tabs.Panel>
+						<Tabs.Panel value="links">
+							<LinksTab entryId={entryId} collectionId={e.collectionId} />
+						</Tabs.Panel>
+					</Tabs>
+				</Grid.Col>
+
+				{/* Right Column: Sticky Sidebar with Meta, Link summary, ACL */}
+				<Grid.Col span={{ base: 12, md: 4, lg: 3 }}>
+					<Stack gap="md" style={{ position: "sticky", top: 80 }}>
+						<Paper withBorder p="md" radius="md">
+							<Stack gap="sm">
+								<Text size="xs" fw={700} c="dimmed" tt="uppercase">
+									{t("metaSettings")}
+								</Text>
+								<Divider />
+								{canDirectWrite ? <EntryMetaPanel entry={e} /> : <ReadOnlyMetaView entry={e} />}
+							</Stack>
+						</Paper>
+
+						<Paper withBorder p="md" radius="md">
+							<Stack gap="sm">
+								<Group justify="space-between" align="center">
+									<Text size="xs" fw={700} c="dimmed" tt="uppercase">
+										{t("tabLinks")}
+									</Text>
+									<Tooltip label={t("linkAdd")}>
+										<ActionIcon size="xs" variant="subtle" onClick={() => setActiveTab("links")}>
+											<IconExternalLink size={12} />
+										</ActionIcon>
+									</Tooltip>
+								</Group>
+								<Divider />
+								<LinksSummary entryId={entryId} />
+							</Stack>
+						</Paper>
+
+						{isAdmin && (
+							<Paper withBorder p="md" radius="md">
+								<EntryAclPanel entry={e} />
+							</Paper>
 						)}
-						{isAdmin ? <EntryAclPanel entry={e} /> : null}
 					</Stack>
-				</Tabs.Panel>
-			</Tabs>
+				</Grid.Col>
+			</Grid>
 		</Container>
 	);
 }

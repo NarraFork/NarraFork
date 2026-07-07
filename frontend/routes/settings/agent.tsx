@@ -97,10 +97,6 @@ function SettingsAgentPage() {
 				setGlobalCommandWhitelist={is.setGlobalCommandWhitelist}
 				globalCommandBlacklist={is.globalCommandBlacklist}
 				setGlobalCommandBlacklist={is.setGlobalCommandBlacklist}
-				webFetchProxyMode={is.webFetchProxyMode}
-				setWebFetchProxyMode={is.setWebFetchProxyMode}
-				webFetchProxyUrl={is.webFetchProxyUrl}
-				setWebFetchProxyUrl={is.setWebFetchProxyUrl}
 				userPrefs={userPrefs}
 				updateUserPref={updateUserPref}
 			/>

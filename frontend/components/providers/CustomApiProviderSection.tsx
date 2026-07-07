@@ -401,23 +401,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 
 				{usesAnthropic && (
 					<>
-						<TextInput
-							label={t("anthropicProxy")}
-							placeholder={t("anthropicProxyPlaceholder")}
-							description={t("anthropicProxyDesc")}
-							value={provider.proxy ?? ""}
+						<Switch
+							label={t("anthropicTlsRejectUnauthorized")}
+							description={t("anthropicTlsRejectUnauthorizedDesc")}
 							size="xs"
-							onChange={(e) => updateProvider("proxy", e.currentTarget.value)}
+							checked={provider.tlsRejectUnauthorized === false}
+							onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
 						/>
-						{provider.proxy && (
-							<Switch
-								label={t("anthropicTlsRejectUnauthorized")}
-								description={t("anthropicTlsRejectUnauthorizedDesc")}
-								size="xs"
-								checked={provider.tlsRejectUnauthorized === false}
-								onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
-							/>
-						)}
 						<Select
 							label={t("anthropicDefaultReasoningEffort")}
 							description={t("anthropicDefaultReasoningEffortDesc")}

@@ -262,6 +262,7 @@
 	"hookExampleLabel": "Example payload",
 	"hookFieldHookEventName": "Event name (PreToolUse / PostToolUse / Stop / Attention / AttentionResolved)",
 	"hookFieldNarratorId": "Narrator ID",
+	"hookFieldNarratorTitle": "Narrator title (may be empty before a title is generated)",
 	"hookFieldChapterId": "Chapter ID (may be empty for standalone narrators)",
 	"hookFieldProjectId": "Project ID (may be empty for global narrators)",
 	"hookFieldCwd": "Working directory",

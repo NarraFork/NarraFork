@@ -262,6 +262,7 @@
 	"hookExampleLabel": "示例载荷",
 	"hookFieldHookEventName": "事件名称（PreToolUse / PostToolUse / Stop / Attention / AttentionResolved）",
 	"hookFieldNarratorId": "叙述者 ID",
+	"hookFieldNarratorTitle": "叙述者标题（标题生成前可能为空）",
 	"hookFieldChapterId": "章节 ID（独立叙述者可能为空）",
 	"hookFieldProjectId": "项目 ID（全局叙述者可能为空）",
 	"hookFieldCwd": "工作目录",

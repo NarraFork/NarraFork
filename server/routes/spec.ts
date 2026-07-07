@@ -17,6 +17,7 @@ specRoutes.get("/:id/spec/files", async (c) => {
 			path: f.path,
 			uri: f.uri,
 			readonly: f.readonly,
+			uiEditable: f.uiEditable,
 			builtin: f.builtin,
 			revisionId: f.revisionId ?? null,
 		})),
@@ -37,6 +38,7 @@ specRoutes.get("/:id/spec/file", async (c) => {
 		uri: file.uri,
 		content: file.content,
 		readonly: file.readonly,
+		uiEditable: file.uiEditable,
 		builtin: file.builtin,
 		revisionId: file.revisionId ?? null,
 	});
@@ -87,6 +89,7 @@ specRoutes.put("/:id/spec/file", async (c) => {
 
 	const written = await specVfsService.writeSpecFile(narratorId, uri, content, {
 		createdBy: "user",
+		actor: "user",
 		allowProtectedTaskMutation: true,
 	});
 

@@ -34,6 +34,7 @@ const SOURCE_META: Record<string, { color: string; key: string }> = {
 	buffered_user: { color: "gray", key: "buffered_user" },
 	group_message: { color: "grape", key: "group_message" },
 	subagent_message: { color: "cyan", key: "subagent_message" },
+	spec_update: { color: "indigo", key: "spec_update" },
 };
 
 const SIDECAR_DETAIL_MAX_CHARS = 120_000;

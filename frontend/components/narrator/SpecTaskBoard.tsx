@@ -23,6 +23,7 @@ import {
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import type { SpecCompiledTasks, SpecTaskItem } from "../../lib/api/spec";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 
 export type SpecTaskStatus = SpecTaskItem["status"];
 
@@ -47,11 +48,13 @@ function TaskCard({
 	index,
 	onUpdate,
 	onRemove,
+	onUnlock,
 }: {
 	task: SpecTaskItem;
 	index: number;
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
+	onUnlock: (index: number) => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[task.status];
@@ -105,10 +108,17 @@ function TaskCard({
 					}}
 				/>
 
-				{/* Protected lock or delete */}
+				{/* Protected: click the lock to unlock; otherwise delete */}
 				{task.protected ? (
-					<Tooltip label={t("spec.protectedHint")} openDelay={200} multiline w={220}>
-						<ActionIcon size="sm" variant="subtle" color="yellow" mt={2} style={{ cursor: "help" }}>
+					<Tooltip label={t("spec.unlockProtected")} openDelay={200} multiline w={240}>
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="yellow"
+							mt={2}
+							onClick={() => onUnlock(index)}
+							aria-label={t("spec.unlockProtected")}
+						>
 							<IconLock size={14} />
 						</ActionIcon>
 					</Tooltip>
@@ -135,11 +145,13 @@ function StatusColumn({
 	tasks,
 	onUpdate,
 	onRemove,
+	onUnlock,
 }: {
 	status: SpecTaskStatus;
 	tasks: { task: SpecTaskItem; index: number }[];
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
+	onUnlock: (index: number) => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[status];
@@ -157,7 +169,14 @@ function StatusColumn({
 			</Group>
 			<Stack gap={4}>
 				{tasks.map(({ task, index }) => (
-					<TaskCard key={index} task={task} index={index} onUpdate={onUpdate} onRemove={onRemove} />
+					<TaskCard
+						key={index}
+						task={task}
+						index={index}
+						onUpdate={onUpdate}
+						onRemove={onRemove}
+						onUnlock={onUnlock}
+					/>
 				))}
 			</Stack>
 		</Stack>
@@ -166,12 +185,34 @@ function StatusColumn({
 
 export function SpecTaskBoard({ tasks, compiled, onChange }: SpecTaskBoardProps) {
 	const { t } = useTranslation("narrator");
+	const confirm = useConfirmDialog();
 
 	const updateTask = useCallback(
 		(index: number, patch: Partial<SpecTaskItem>) => {
 			onChange(tasks.map((task, i) => (i === index ? { ...task, ...patch } : task)));
 		},
 		[tasks, onChange],
+	);
+
+	const unlockTask = useCallback(
+		async (index: number) => {
+			const ok = await confirm({
+				title: t("spec.unlockConfirmTitle"),
+				message: t("spec.unlockConfirmMessage"),
+				confirmLabel: t("spec.unlockConfirmLabel"),
+				confirmColor: "yellow",
+			});
+			if (!ok) return;
+			// Drop the protected flag so the task becomes an ordinary editable/removable task.
+			onChange(
+				tasks.map((task, i) => {
+					if (i !== index) return task;
+					const { protected: _protected, ...rest } = task;
+					return rest;
+				}),
+			);
+		},
+		[tasks, onChange, confirm, t],
 	);
 
 	const removeTask = useCallback(
@@ -262,6 +303,7 @@ export function SpecTaskBoard({ tasks, compiled, onChange }: SpecTaskBoardProps)
 						tasks={grouped[status]}
 						onUpdate={updateTask}
 						onRemove={removeTask}
+						onUnlock={unlockTask}
 					/>
 				))
 			)}

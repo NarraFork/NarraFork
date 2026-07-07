@@ -10,6 +10,16 @@
  *    (no document listeners — @dnd-kit owns the pointer)
  */
 
+/**
+ * What kind of thing is being dragged. Consumers use this instead of parsing
+ * the subject id to decide behaviour:
+ *   - `narrator`: a real narrator (sidebar tab or a chat panel header). Only
+ *     these may seed a new workspace / be materialised as a narrator panel.
+ *   - `tool`: a resource/tool panel (spec/terminal/browser/git/…/webview) being
+ *     rearranged inside a surface. Never creates a workspace or a narrator panel.
+ */
+export type PanelDragSubjectKind = "narrator" | "tool";
+
 export interface PanelDragState {
 	/**
 	 * The dragged subject id. For a sidebar tab this is the narrator id (or a
@@ -18,6 +28,13 @@ export interface PanelDragState {
 	 * authoritative live panel id and this mirrors the subject.
 	 */
 	id: string;
+	/**
+	 * Explicit classification of the subject (set at drag start where the
+	 * semantic is known). Preferred over `isSyntheticSubjectId(id)` string
+	 * parsing. Optional for backward compatibility; when absent, consumers may
+	 * fall back to `isSyntheticSubjectId`.
+	 */
+	subjectKind?: PanelDragSubjectKind;
 	title: string;
 	x: number;
 	y: number;
@@ -75,6 +92,19 @@ export function isSyntheticSubjectId(id: string): boolean {
 	return id.startsWith("__") && id.endsWith("__") && id.length >= 4;
 }
 
+/**
+ * Whether a drag state represents a real narrator (vs a tool/resource panel).
+ * Prefers the explicit `subjectKind` set at drag start; falls back to id-shape
+ * inference for any drag started without a classification.
+ *
+ * Consumers that only act on narrators (create-workspace drop zone, sidebar
+ * narrator materialisation) should gate on this instead of parsing ids.
+ */
+export function isNarratorSubject(state: PanelDragState): boolean {
+	if (state.subjectKind) return state.subjectKind === "narrator";
+	return !isSyntheticSubjectId(state.id);
+}
+
 // ── Entry point 1: pointerdown (registers document listeners) ──
 
 /**
@@ -111,6 +141,8 @@ function teardownPointerListeners() {
 /**
  * Start a pointer-driven drag of a subject (e.g. a sidebar recent tab). The
  * singleton registers document listeners and owns the pointer until pointerup.
+ * Sidebar tabs are always narrators, so this defaults `subjectKind` to
+ * `"narrator"`.
  */
 export function startPointerDrag(
 	id: string,
@@ -119,19 +151,21 @@ export function startPointerDrag(
 	y: number,
 	sourceLeafId?: string,
 ) {
-	beginPointerDrag({ id, title, x, y, sourceLeafId });
+	beginPointerDrag({ id, title, x, y, sourceLeafId, subjectKind: "narrator" });
 }
 
 /**
  * Start dragging an existing dockview panel (identified by its live panel id).
- * `id` may be a real narrator id or a synthetic marker for terminal/webview
- * panels; consumers key off `panelId` for move/swap.
+ * `id` may be a real narrator id or a synthetic marker for tool/webview panels;
+ * consumers key off `panelId` for move/swap. Pass `subjectKind` explicitly so
+ * consumers don't have to parse the id.
  */
 export function startPanelDrag(args: {
 	panelId: string;
 	id: string;
 	title: string;
 	sourceGroupId?: string;
+	subjectKind?: PanelDragSubjectKind;
 	x: number;
 	y: number;
 }) {
@@ -142,6 +176,8 @@ export function startPanelDrag(args: {
 		y: args.y,
 		panelId: args.panelId,
 		sourceGroupId: args.sourceGroupId,
+		// Fall back to id-shape inference when the caller didn't classify.
+		subjectKind: args.subjectKind ?? (isSyntheticSubjectId(args.id) ? "tool" : "narrator"),
 	});
 }
 

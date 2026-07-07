@@ -12,7 +12,7 @@ import { DockviewSurface, type DropZoneThresholds } from "../../dockview";
 import { useNarratorDockContext } from "./NarratorDockContext";
 import type { DockDevice } from "./narrator-dock-layout";
 import { applyNarratorDockLayout, saveNarratorDockLayout } from "./narrator-dock-layout";
-import { narratorDockComponents } from "./panels";
+import { narratorDockComponents, narratorDockTabComponents } from "./panels";
 
 const SAVE_DEBOUNCE_MS = 400;
 
@@ -75,6 +75,7 @@ export function NarratorDock({ device, thresholds }: NarratorDockProps) {
 		<DockviewSurface
 			apiRef={apiRef}
 			components={narratorDockComponents}
+			tabComponents={narratorDockTabComponents}
 			onReady={handleReady}
 			thresholds={thresholds}
 			// Keep every panel's DOM + component instance alive when moved between

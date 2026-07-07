@@ -1,10 +1,10 @@
 import {
-	Anchor,
-	Badge,
+	Alert,
 	Button,
 	Card,
 	Group,
-	SimpleGrid,
+	List,
+	Select,
 	Stack,
 	Text,
 	TextInput,
@@ -12,13 +12,16 @@ import {
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useProviderRouteCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
-import { normalizeProxyUrl, summarizeWebFetchProxyPolicy } from "../../lib/proxy";
+import {
+	normalizeProxyUrl,
+	type OutboundProxyMode,
+	summarizeOutboundProxyPolicy,
+} from "../../lib/proxy";
 
 export const Route = createFileRoute("/settings/proxy")({
 	component: ProxyManagementPage,
@@ -41,150 +44,14 @@ function ProxyManagementPage() {
 				</Text>
 			</div>
 
-			<SimpleGrid cols={{ base: 1, md: 2 }} spacing="md">
-				<CodexProxyCard />
-				<AnthropicProxyCard />
-				<WebFetchProxyCard />
-			</SimpleGrid>
+			<OutboundProxyCard />
 		</Stack>
 	);
 }
 
+function OutboundProxyCard() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
-	const [proxy, setProxy] = useState("");
-	const [initialized, setInitialized] = useState(false);
-
-		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
-	});
-
-	useEffect(() => {
-			setInitialized(true);
-		}
-
-	const saveMut = useMutation({
-		onSuccess: () => {
-			notifications.show({ message: t("proxySaved"), color: "green" });
-		},
-	});
-
-	const handleSave = useCallback(() => {
-		const normalized = normalizeProxyUrl(proxy);
-		setProxy(normalized ?? "");
-		saveMut.mutate(normalized);
-
-	return (
-		<Card withBorder padding="md">
-			<Stack gap="xs">
-				<Group justify="space-between">
-					<Badge size="xs" color={proxy ? "green" : "gray"} variant="light">
-						{proxy ? t("proxyConfigured") : t("proxyNotConfigured")}
-					</Badge>
-				</Group>
-				<Text size="xs" c="dimmed">
-				</Text>
-				<Group align="flex-end" gap="xs">
-					<TextInput
-						size="xs"
-						placeholder={t("proxyPlaceholder")}
-						value={proxy}
-						onChange={(e) => setProxy(e.target.value)}
-						style={{ flex: 1 }}
-					/>
-					<Button
-						size="xs"
-						onClick={handleSave}
-						loading={saveMut.isPending}
-					>
-						{t("proxySave")}
-					</Button>
-				</Group>
-			</Stack>
-		</Card>
-	);
-}
-
-function CodexProxyCard() {
-	const { t } = useTranslation("settings");
-	const qc = useQueryClient();
-	const codexStatusRoute = useProviderRouteCapability("codex", "status");
-	const codexGlobalProxyRoute = useProviderRouteCapability("codex", "globalProxy");
-	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
-	const canReadCodexStatus = codexStatusRoute.supported;
-	const canSetCodexGlobalProxy = codexGlobalProxyRoute.supported;
-	const codexGlobalProxyUnsupportedReason =
-		codexGlobalProxyRoute.reason ?? providerRouteUnsupportedReason;
-	const [proxy, setProxy] = useState("");
-	const [initialized, setInitialized] = useState(false);
-
-	const { data: codexStatus } = useQuery({
-		queryKey: ["codex", "status"],
-		queryFn: () => api.codexStatus(),
-		enabled: canReadCodexStatus,
-		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
-	});
-
-	useEffect(() => {
-		if (codexStatus && !initialized) {
-			setProxy(codexStatus.globalProxy ?? "");
-			setInitialized(true);
-		}
-	}, [codexStatus, initialized]);
-
-	const saveMut = useMutation({
-		mutationFn: (p?: string) => api.codexSetGlobalProxy(p),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["codex", "status"] });
-			notifications.show({ message: t("proxySaved"), color: "green" });
-		},
-	});
-
-	const handleSave = useCallback(() => {
-		if (!canSetCodexGlobalProxy) return;
-		const normalized = normalizeProxyUrl(proxy);
-		setProxy(normalized ?? "");
-		saveMut.mutate(normalized);
-	}, [proxy, saveMut, canSetCodexGlobalProxy]);
-
-	return (
-		<Card withBorder padding="md">
-			<Stack gap="xs">
-				<Group justify="space-between">
-					<Text fw={600}>{t("proxyCodexTitle")}</Text>
-					<Badge size="xs" color={proxy ? "green" : "gray"} variant="light">
-						{proxy ? t("proxyConfigured") : t("proxyNotConfigured")}
-					</Badge>
-				</Group>
-				<Text size="xs" c="dimmed">
-					{t("proxyProviderDesc_codex")}
-				</Text>
-				<Group align="flex-end" gap="xs">
-					<TextInput
-						size="xs"
-						placeholder={t("proxyPlaceholder")}
-						value={proxy}
-						onChange={(e) => setProxy(e.target.value)}
-						style={{ flex: 1 }}
-						disabled={!canSetCodexGlobalProxy}
-					/>
-					<Button
-						size="xs"
-						onClick={handleSave}
-						loading={saveMut.isPending}
-						disabled={!canSetCodexGlobalProxy}
-						title={!canSetCodexGlobalProxy ? codexGlobalProxyUnsupportedReason : undefined}
-					>
-						{t("proxySave")}
-					</Button>
-				</Group>
-			</Stack>
-		</Card>
-	);
-}
-
-function AnthropicProxyCard() {
-	const { t } = useTranslation("settings");
 
 	const { data: settingsData } = useQuery({
 		queryKey: ["admin", "settings"],
@@ -193,89 +60,86 @@ function AnthropicProxyCard() {
 	});
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const providers = ((settingsData as any)?.anthropicProviders ?? []) as Array<{
-		id: string;
-		name: string;
-		proxy?: string;
-	}>;
-	const configuredCount = providers.filter((p) => p.proxy).length;
+	const currentPolicy = (settingsData as any)?.proxy;
+	const [mode, setMode] = useState<OutboundProxyMode>("system");
+	const [url, setUrl] = useState("");
+	const [initialized, setInitialized] = useState(false);
+
+	useEffect(() => {
+		if (settingsData && !initialized) {
+			const summary = summarizeOutboundProxyPolicy(currentPolicy);
+			setMode(summary.mode);
+			setUrl(summary.url);
+			setInitialized(true);
+		}
+	}, [settingsData, currentPolicy, initialized]);
+
+	const saveMut = useMutation({
+		mutationFn: (payload: { mode: OutboundProxyMode; url?: string }) =>
+			api.updateSettings({ proxy: payload }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+	});
+
+	const handleSave = useCallback(() => {
+		if (mode === "custom") {
+			const normalized = normalizeProxyUrl(url);
+			setUrl(normalized ?? "");
+			saveMut.mutate({ mode: "custom", url: normalized });
+		} else {
+			saveMut.mutate({ mode });
+		}
+	}, [mode, url, saveMut]);
 
 	return (
-		<Card withBorder padding="md">
-			<Stack gap="xs">
+		<Card withBorder padding="md" maw={640}>
+			<Stack gap="sm">
 				<Group justify="space-between">
-					<Text fw={600}>{t("proxyAnthropicTitle")}</Text>
-					<Badge size="xs" color={configuredCount > 0 ? "green" : "gray"} variant="light">
-						{configuredCount > 0
-							? `${configuredCount}/${providers.length} ${t("proxyConfigured")}`
-							: t("proxyNotConfigured")}
-					</Badge>
+					<Text fw={600}>{t("proxyOutboundTitle")}</Text>
 				</Group>
 				<Text size="xs" c="dimmed">
-					{t("proxyProviderDesc_anthropic")}
+					{t("proxyOutboundDesc")}
 				</Text>
-				{providers.length > 0 ? (
-					<Stack gap={4}>
-						{providers.map((p) => (
-							<Group key={p.id} gap="xs">
-								<Text size="xs" fw={500}>
-									{p.name}:
-								</Text>
-								<Text size="xs" c={p.proxy ? undefined : "dimmed"}>
-									{p.proxy || t("proxyDirectConnection")}
-								</Text>
-							</Group>
-						))}
-					</Stack>
-				) : (
-					<Text size="xs" c="dimmed" fs="italic">
-						{t("proxyNotConfigured")}
-					</Text>
+
+				<Select
+					label={t("proxyModeLabel")}
+					data={[
+						{ value: "system", label: t("proxyModeSystem") },
+						{ value: "direct", label: t("proxyModeDirect") },
+						{ value: "custom", label: t("proxyModeCustom") },
+					]}
+					value={mode}
+					onChange={(v) => setMode((v as OutboundProxyMode) ?? "system")}
+					allowDeselect={false}
+				/>
+
+				{mode === "custom" && (
+					<TextInput
+						label={t("proxyUrlLabel")}
+						placeholder={t("proxyPlaceholder")}
+						value={url}
+						onChange={(e) => setUrl(e.currentTarget.value)}
+					/>
 				)}
-				<Anchor component={Link} to="/settings/providers" size="xs">
-					{t("proxyGoToProviderSettings")}
-				</Anchor>
-			</Stack>
-		</Card>
-	);
-}
 
-function WebFetchProxyCard() {
-	const { t } = useTranslation("settings");
+				<Alert variant="light" color="gray" p="xs">
+					<Text size="xs" c="dimmed">
+						{t("proxyScopeNote")}
+					</Text>
+					<List size="xs" c="dimmed" mt={4}>
+						<List.Item>{t("proxyScopeAiProviders")}</List.Item>
+						<List.Item>{t("proxyScopeWebFetch")}</List.Item>
+						<List.Item>{t("proxyScopeLoopbackExempt")}</List.Item>
+					</List>
+				</Alert>
 
-	const { data: settingsData } = useQuery({
-		queryKey: ["admin", "settings"],
-		queryFn: api.getSettings,
-		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
-	});
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const agentSettings = (settingsData as any)?.agent;
-	const proxySummary = summarizeWebFetchProxyPolicy(agentSettings?.webFetchPolicy);
-
-	const displayValue =
-		proxySummary.mode === "direct"
-			? t("proxyDirectConnection")
-			: proxySummary.mode === "system"
-				? t("webFetchProxySystem")
-				: proxySummary.url || t("webFetchProxyCustom");
-
-	return (
-		<Card withBorder padding="md">
-			<Stack gap="xs">
-				<Group justify="space-between">
-					<Text fw={600}>{t("proxyWebFetchTitle")}</Text>
-					<Badge size="xs" color={proxySummary.configured ? "green" : "gray"} variant="light">
-						{proxySummary.configured ? t("proxyConfigured") : t("proxyNotConfigured")}
-					</Badge>
+				<Group justify="flex-end">
+					<Button size="xs" onClick={handleSave} loading={saveMut.isPending}>
+						{t("proxySave")}
+					</Button>
 				</Group>
-				<Text size="xs" c="dimmed">
-					{t("proxyProviderDesc_webfetch")}
-				</Text>
-				<Text size="xs">{displayValue}</Text>
-				<Anchor component={Link} to="/settings/agent" size="xs">
-					{t("proxyGoToAgentSettings")}
-				</Anchor>
 			</Stack>
 		</Card>
 	);

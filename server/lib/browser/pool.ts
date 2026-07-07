@@ -37,6 +37,8 @@ function buildLaunchArgs(headless: boolean): string[] {
 	const proxy = getWebFetchProxy();
 	if (proxy) {
 		args.push(`--proxy-server=${proxy}`);
+		// Always reach local targets directly, mirroring resolveProxyForUrl().
+		args.push("--proxy-bypass-list=<-loopback>;localhost;127.0.0.1;[::1]");
 	}
 	return args;
 }

@@ -8,6 +8,7 @@ import {
 	buildStreamingMsg,
 	clearToolBlockCache,
 	findStreamingInsertIndex,
+	mergeStreamingSnapshotBlocks,
 	type StreamingBlock,
 	upsertStreamingImageGenerationBlock,
 	upsertStreamingWebSearchBlock,
@@ -1574,8 +1575,12 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			// --- Streaming snapshot (reconnect restore) ---------------------------
 			onStreamingSnapshot: (snapshot) => {
 				if (snapshot.streamingBlocks.length > 0) {
-					streamingBlocksRef.current = [...snapshot.streamingBlocks];
-					flushStreamingVersion();
+					// Merge rather than replace: a snapshot may arrive slightly after a
+					// realtime delta on the same subscription, so it must fill gaps
+					// without letting already-shown streaming text/reasoning regress.
+					if (mergeStreamingSnapshotBlocks(streamingBlocksRef.current, snapshot.streamingBlocks)) {
+						flushStreamingVersion();
+					}
 				}
 				if (snapshot.toolChunks.length === 0) return;
 				let topLevelChanged = false;
@@ -1649,6 +1654,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 			},
 		},
 		lastMessageId,
+		{ kind: "messages" },
 	);
 
 	return useMemo(

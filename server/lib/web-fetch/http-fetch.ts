@@ -3,7 +3,7 @@
 
 import type { Page } from "puppeteer-core";
 import { logger } from "../logger";
-import { getWebFetchProxy } from "./proxy";
+import { getWebFetchProxyForUrl } from "./proxy";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const USER_AGENT =
@@ -50,7 +50,7 @@ export async function httpFetchHtml(url: string, timeout = DEFAULT_TIMEOUT_MS): 
 			return await res.text();
 		}
 
-		const proxy = getWebFetchProxy();
+		const proxy = getWebFetchProxyForUrl(url);
 		const res = await fetch(url, {
 			headers: {
 				"User-Agent": USER_AGENT,

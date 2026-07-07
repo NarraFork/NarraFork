@@ -5,6 +5,7 @@
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
+import { getOutboundProxy } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
@@ -151,7 +152,7 @@ export class CodexProvider implements ProviderAdapter {
 
 	/** Create a temporary OpenAIProvider with the current credential. */
 	private createProvider(ctx: CallContext): OpenAIProvider {
-		const proxy = settings.codex?.proxy;
+		const proxy = getOutboundProxy();
 
 		return new OpenAIProvider(
 			{
@@ -503,7 +504,7 @@ export class CodexProvider implements ProviderAdapter {
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
 					accountId: ctx.credential.accountId,
-					proxy: settings.codex?.proxy,
+					proxy: getOutboundProxy(),
 					sessionKey: params.stickySessionKey ?? params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,

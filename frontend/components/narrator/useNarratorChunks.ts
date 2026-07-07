@@ -116,6 +116,11 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	const loadGenerationRef = useRef(0);
 	const manifestRef = useRef<ChunkManifestEntry[]>([]);
 	manifestRef.current = state.manifest;
+	// Synchronous read of the live manifest window. loadOlderManifest advances
+	// manifestRef immediately (before React commits `chunks`), so jump logic that
+	// must make progress within a tight await-loop reads this instead of the
+	// committed `chunks` array to avoid stalling on stale coordinates.
+	const getManifestSnapshot = useCallback(() => manifestRef.current, []);
 	// Latest loaded map, read inside ensureLoaded to avoid stale-closure checks
 	// and to keep the callback referentially stable.
 	const loadedRef = useRef<Map<string, TreeMessage[]>>(state.loaded);
@@ -170,28 +175,34 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 	 * message's seq against the manifest ranges. Returns a map of chunkId ->
 	 * messages for every chunk that received at least one message.
 	 */
-	const regroup = useCallback((messages: TreeMessage[]): Map<string, TreeMessage[]> => {
-		const manifest = manifestRef.current;
-		const byChunk = new Map<string, TreeMessage[]>();
-		if (manifest.length === 0) return byChunk;
-		// Two-pointer walk: manifest is seq-ascending, messages are too.
-		let mi = 0;
-		for (const msg of messages) {
-			const seq = msg.seq ?? -1;
-			// Advance manifest pointer until msg falls within [firstSeq, lastSeq].
-			while (mi < manifest.length && seq > manifest[mi].lastSeq) mi++;
-			if (mi >= manifest.length) break;
-			const chunk = manifest[mi];
-			if (seq < chunk.firstSeq) continue; // gap (shouldn't happen with aligned filters)
-			let arr = byChunk.get(chunk.id);
-			if (!arr) {
-				arr = [];
-				byChunk.set(chunk.id, arr);
+	const regroup = useCallback(
+		(
+			messages: TreeMessage[],
+			manifestOverride?: ChunkManifestEntry[],
+		): Map<string, TreeMessage[]> => {
+			const manifest = manifestOverride ?? manifestRef.current;
+			const byChunk = new Map<string, TreeMessage[]>();
+			if (manifest.length === 0) return byChunk;
+			// Two-pointer walk: manifest is seq-ascending, messages are too.
+			let mi = 0;
+			for (const msg of messages) {
+				const seq = msg.seq ?? -1;
+				// Advance manifest pointer until msg falls within [firstSeq, lastSeq].
+				while (mi < manifest.length && seq > manifest[mi].lastSeq) mi++;
+				if (mi >= manifest.length) break;
+				const chunk = manifest[mi];
+				if (seq < chunk.firstSeq) continue; // gap (shouldn't happen with aligned filters)
+				let arr = byChunk.get(chunk.id);
+				if (!arr) {
+					arr = [];
+					byChunk.set(chunk.id, arr);
+				}
+				arr.push(msg);
 			}
-			arr.push(msg);
-		}
-		return byChunk;
-	}, []);
+			return byChunk;
+		},
+		[],
+	);
 
 	const isChunkComplete = useCallback(
 		(loaded: Map<string, TreeMessage[]>, chunk: ChunkManifestEntry) =>
@@ -549,6 +560,107 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		}
 	}, [narratorId, regroup]);
 
+	/**
+	 * Bulk-expand the manifest window upward until it covers `seq` (a jump target
+	 * older than the current window), then load that prepended range's content.
+	 *
+	 * Unlike loadOlderManifest (one 10-chunk scroll band at a time), this pulls
+	 * the whole gap in large manifest batches (server caps at 200 chunks/req) and
+	 * commits ONCE, so a deep search-result jump into a 30k-message history lands
+	 * in a couple of requests instead of ~150 — and without the synchronous-ref
+	 * vs committed-state race that stalled the old iterative loop.
+	 */
+	const ensureManifestCoversSeq = useCallback(
+		async (seq: number): Promise<boolean> => {
+			const generation = loadGenerationRef.current;
+			// Work against a LOCAL manifest copy, never manifestRef.current: the ref is
+			// reassigned to committed state on every render (`manifestRef.current =
+			// state.manifest`), so a concurrent re-render during any await below would
+			// clobber an in-place ref update. We build the full target window locally
+			// and assign the ref + setState together, synchronously, at the very end.
+			let working = manifestRef.current.slice();
+			const covers = (m: ChunkManifestEntry[]) =>
+				m.length > 0 && seq >= m[0].firstSeq && seq <= m[m.length - 1].lastSeq;
+			if (covers(working)) return true;
+			let hasOlder = hasOlderChunksRef.current;
+
+			// 1) Walk older manifest bands (metadata only, cheap) until the window's
+			//    first chunk reaches at/below the target seq.
+			let guard = 0;
+			while (!covers(working) && hasOlder && (working[0]?.firstSeq ?? 0) > seq && guard++ < 64) {
+				const beforeSeq = working[0].firstSeq;
+				const manifestResult = await api.getChunkManifest(narratorId, undefined, {
+					limitChunks: 200,
+					beforeSeq,
+				});
+				if (generation !== loadGenerationRef.current) return false;
+				if (manifestResult.unchanged) break;
+				const olderChunks = decodeManifestTuples(manifestResult.chunks);
+				const existingFirstSeqs = new Set(working.map((c) => c.firstSeq));
+				const newChunks = olderChunks.filter((c) => !existingFirstSeqs.has(c.firstSeq));
+				hasOlder = manifestResult.hasOlderChunks;
+				if (newChunks.length === 0) break;
+				working = [...newChunks, ...working];
+			}
+
+			const targetIdx = working.findIndex((c) => seq >= c.firstSeq && seq <= c.lastSeq);
+			if (targetIdx < 0) {
+				// Couldn't reach the target (no older history / server disagreement).
+				// Still surface whatever we expanded so the window grows.
+				manifestRef.current = working;
+				hasOlderChunksRef.current = hasOlder;
+				setState((prev) => ({ ...prev, manifest: working, hasOlderChunks: hasOlder }));
+				return false;
+			}
+
+			// 2) Load content for the target's chunk ± a small radius (so the jump
+			//    lands with neighbours mounted and height estimation near the target is
+			//    accurate). Skip chunks already loaded. Batched by
+			//    MAX_CHUNKS_PER_RANGE_REQUEST; merged into one state commit below.
+			const loaded = loadedRef.current;
+			let rangeStart = Math.max(0, targetIdx - 2);
+			let spanEnd = Math.min(working.length - 1, targetIdx + 2);
+			while (rangeStart < targetIdx && isChunkComplete(loaded, working[rangeStart])) rangeStart++;
+			while (spanEnd > targetIdx && isChunkComplete(loaded, working[spanEnd])) spanEnd--;
+
+			const incomingAll = new Map<string, TreeMessage[]>();
+			let meta: ChunkRangeMeta | null = null;
+			for (let i = rangeStart; i <= spanEnd; i += MAX_CHUNKS_PER_RANGE_REQUEST) {
+				const batchStart = working[i];
+				const batchCount = Math.min(MAX_CHUNKS_PER_RANGE_REQUEST, spanEnd - i + 1);
+				const range = await api.getNarratorChunks(narratorId, {
+					direction: "newer",
+					fromSeq: batchStart.firstSeq - 1,
+					count: batchCount,
+				});
+				if (generation !== loadGenerationRef.current) return false;
+				// Regroup against the LOCAL working manifest, not manifestRef.
+				const incoming = regroup(range.messages, working);
+				for (const [chunkId, msgs] of incoming) incomingAll.set(chunkId, msgs);
+				meta = getChunkRangeMeta(range);
+			}
+
+			// Atomic commit: assign the ref and enqueue state together so a render
+			// between here and the next commit can't observe a torn manifest.
+			manifestRef.current = working;
+			hasOlderChunksRef.current = hasOlder;
+			setState((prev) => {
+				const nextLoaded = new Map(prev.loaded);
+				for (const [chunkId, msgs] of incomingAll) nextLoaded.set(chunkId, msgs);
+				return {
+					...prev,
+					manifest: working,
+					hasOlderChunks: hasOlder,
+					pruneBoundaryMessageId: meta?.pruneBoundaryMessageId ?? prev.pruneBoundaryMessageId,
+					prunedPercent: meta?.prunedPercent ?? prev.prunedPercent,
+					loaded: nextLoaded,
+				};
+			});
+			return true;
+		},
+		[narratorId, regroup, isChunkComplete],
+	);
+
 	// have a landing spot and `lastMessageId` can be computed. Whenever the
 	// manifest changes and the tail isn't loaded, fetch it.
 	useEffect(() => {
@@ -885,6 +997,8 @@ export function useNarratorChunks(narratorId: string, options?: UseNarratorChunk
 		// Windowed manifest (reverse infinite scroll toward the top)
 		hasOlderChunks: state.hasOlderChunks,
 		loadOlderManifest,
+		getManifestSnapshot,
+		ensureManifestCoversSeq,
 		// Streaming / live state
 		streamingMsg: streamingMsg as NarratorMsg | null,
 		tailChunkId,

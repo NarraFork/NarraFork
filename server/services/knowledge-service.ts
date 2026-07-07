@@ -994,6 +994,169 @@ function searchDrafts(
 	return rows;
 }
 
+function parseStringArrayJson(raw: string | null): string[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw);
+		return Array.isArray(parsed)
+			? parsed.filter((value): value is string => typeof value === "string")
+			: [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Hard cap for the passive-injection dictionary scan. The scan reads only lightweight
+ * metadata + keyword JSON (never full content) and is project/collection scoped when
+ * possible. The compiled Aho-Corasick matcher is cached per scope (see
+ * knowledge-injection.ts) and only rebuilt when keywordInjectionCandidatesSignature
+ * changes, so this full read runs on cache-miss / candidate-set change, not per turn.
+ */
+const KEYWORD_INJECTION_CANDIDATE_LIMIT = 5000;
+
+function listKeywordInjectionCandidates(opts: { collectionId?: string; projectId?: string } = {}) {
+	const projectClause = opts.projectId
+		? `AND e.collection_id IN (
+				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
+			)`
+		: "";
+	const params: (string | number | null)[] = [opts.collectionId ?? null, opts.collectionId ?? null];
+	if (opts.projectId) params.push(opts.projectId);
+	params.push(KEYWORD_INJECTION_CANDIDATE_LIMIT);
+	const rows = sqlite
+		.prepare(
+			`SELECT e.id, e.collection_id, e.title, e.current_revision_id, e.tags_json, e.keywords_json, e.updated_at
+			 FROM knowledge_entries e
+			 WHERE e.status = 'active'
+			   AND e.current_keywords IS NOT NULL
+			   AND (? IS NULL OR e.collection_id = ?)
+			   ${projectClause}
+			 ORDER BY e.updated_at DESC LIMIT ?`,
+		)
+		.all(...params) as {
+		id: string;
+		collection_id: string;
+		title: string;
+		tags_json: string | null;
+		keywords_json: string | null;
+		updated_at: string;
+		current_revision_id: string | null;
+	}[];
+
+	return rows
+		.map((row) => ({
+			id: row.id,
+			collectionId: row.collection_id,
+			title: row.title,
+			entryRevisionId: row.current_revision_id,
+			tags: parseStringArrayJson(row.tags_json),
+			keywords: parseStringArrayJson(row.keywords_json),
+			updatedAt: row.updated_at,
+		}))
+		.filter((row) => row.keywords.length > 0);
+}
+
+/**
+ * Cheap change-detection signature for a scope's keyword-injection candidate set.
+ *
+ * Returns `count:maxUpdatedAt` computed with a single indexed aggregate (no row
+ * materialization, no JSON parse). Any insert/update/keyword change bumps
+ * `max(updated_at)`, and any delete/insert changes `count`, so callers can reuse a
+ * built Aho-Corasick matcher until this signature changes — keeping the hot passive
+ * injection path off the 5000-row read + trie rebuild on every tool output.
+ */
+function keywordInjectionCandidatesSignature(
+	opts: { collectionId?: string; projectId?: string } = {},
+): string {
+	const projectClause = opts.projectId
+		? `AND e.collection_id IN (
+				SELECT id FROM knowledge_collections WHERE project_id = ? OR project_id IS NULL
+			)`
+		: "";
+	const params: (string | null)[] = [opts.collectionId ?? null, opts.collectionId ?? null];
+	if (opts.projectId) params.push(opts.projectId);
+	const row = sqlite
+		.prepare(
+			`SELECT COUNT(*) as cnt, COALESCE(MAX(e.updated_at), '') as max_updated
+			 FROM knowledge_entries e
+			 WHERE e.status = 'active'
+			   AND e.current_keywords IS NOT NULL
+			   AND (? IS NULL OR e.collection_id = ?)
+			   ${projectClause}`,
+		)
+		.get(...params) as { cnt: number; max_updated: string };
+	return `${row.cnt}:${row.max_updated}`;
+}
+
+/** Fetch bounded snippets only for final injected hits, avoiding large-field reads in the scan. */
+const SNIPPETS_LOOKUP_MAX = 100;
+function snippetsByEntryIds(entryIds: string[]): Map<string, string> {
+	const out = new Map<string, string>();
+	const ids = entryIds.slice(0, SNIPPETS_LOOKUP_MAX);
+	if (ids.length === 0) return out;
+	const placeholders = ids.map(() => "?").join(",");
+	const rows = sqlite
+		.prepare(
+			`SELECT id, substr(COALESCE(current_content, title), 1, 512) as snippet
+			 FROM knowledge_entries WHERE id IN (${placeholders})`,
+		)
+		.all(...ids) as { id: string; snippet: string | null }[];
+	for (const row of rows) out.set(row.id, row.snippet ?? "");
+	return out;
+}
+
+type KnowledgeInjectionSource = "user_message" | "tool_output" | "system_continuation";
+
+function listInjectedEntryIds(narratorId: string, compactSeq: number): Set<string> {
+	const rows = sqlite
+		.prepare(
+			`SELECT entry_id FROM knowledge_injection_events
+			 WHERE narrator_id = ? AND compact_seq = ?`,
+		)
+		.all(narratorId, compactSeq) as { entry_id: string }[];
+	return new Set(rows.map((row) => row.entry_id));
+}
+
+function recordInjectionEvents(input: {
+	narratorId: string;
+	compactSeq: number;
+	source: KnowledgeInjectionSource;
+	triggerMessageId?: string | null;
+	triggerToolCallId?: string | null;
+	hits: Array<{
+		entryId: string;
+		entryRevisionId?: string | null;
+		summary?: string | null;
+	}>;
+}): void {
+	if (input.hits.length === 0) return;
+	const now = nowIso();
+	const stmt = sqlite.prepare(
+		`INSERT OR IGNORE INTO knowledge_injection_events
+		 (id, narrator_id, compact_seq, entry_id, entry_revision_id, source,
+		  trigger_message_id, trigger_tool_call_id, summary, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	);
+	const tx = sqlite.transaction(() => {
+		for (const hit of input.hits) {
+			stmt.run(
+				generateId(),
+				input.narratorId,
+				input.compactSeq,
+				hit.entryId,
+				hit.entryRevisionId ?? null,
+				input.source,
+				input.triggerMessageId ?? null,
+				input.triggerToolCallId ?? null,
+				hit.summary ?? null,
+				now,
+			);
+		}
+	});
+	tx();
+}
+
 function search(opts: SearchOpts) {
 	const limit = Math.min(opts.limit ?? 30, SEARCH_MAX_LIMIT);
 
@@ -1006,10 +1169,9 @@ function search(opts: SearchOpts) {
 			)`
 		: "";
 
-	// No draft context → plain main-version search (unchanged behaviour for routes/injection).
-	// A column-restricted match (field, e.g. passive injection on "current_keywords") also
-	// forces the main-only path: the drafts FTS has no keywords column and personal drafts
-	// are not subject to passive injection.
+	// No draft context → plain main-version search. A column-restricted match (field) also
+	// forces the main-only path: the drafts FTS has no matching column and personal drafts
+	// should not shadow searches over main-version-only indexes.
 	if (!opts.draftUserId || opts.field) {
 		const rows = searchMain(opts, limit, projectClause, []);
 		const mapped = rows.map(mapRow);
@@ -1109,5 +1271,10 @@ export const knowledgeService = {
 	listRevisions,
 	getRevision,
 	search,
+	listKeywordInjectionCandidates,
+	keywordInjectionCandidatesSignature,
+	snippetsByEntryIds,
+	listInjectedEntryIds,
+	recordInjectionEvents,
 	filterReadable,
 };

@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { scanToolOutputForKnowledge } from "../../services/knowledge-injection";
+import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import {
 	buildSpecTasksDocumentFromLegacyTodos,
 	parseSpecTasksDocument,
@@ -60,6 +60,8 @@ import {
 	consumeTaskReflectionGrant,
 	createTaskReflectionDecision,
 	grantTaskReflection,
+	markTaskReflectionStarted,
+	reviseTaskReflection,
 	TASK_REFLECTION_TOOLS,
 	type TaskReflectionDecision,
 } from "./tools/task-reflection";
@@ -1622,11 +1624,13 @@ async function resolveTaskReflection(
 	const reflectionAbort = new AbortController();
 	const decisionPromise = createTaskReflectionDecision(requestId, {
 		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: input,
 		mutations: analysis.protectedMutations,
 	});
+	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
 	const reflectionPromise = runTaskReflectionLoop(
 		config,
@@ -1646,16 +1650,23 @@ async function resolveTaskReflection(
 	const decision = await Promise.race([
 		decisionPromise.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async () => {
+			const fallbackMessage =
+				"taskReflection loop did not call TaskReflectConfirm or TaskReflectRevise in its single allowed response.";
+			const fallbackNextSteps =
+				"Review the protected task, gather concrete evidence, and try the tasks.json change again only if it remains justified.";
+			// Broadcast a resolved (cancelled) state so live clients converge instead of
+			// showing a perpetually-running reflection notice.
+			const cancelled = await reviseTaskReflection(requestId, fallbackMessage, fallbackNextSteps);
+			if (cancelled) return decisionPromise;
+
 			const alreadySettled = await Promise.race<TaskReflectionDecision | null>([
 				decisionPromise,
 				Promise.resolve(null),
 			]);
 			const fallbackDecision: TaskReflectionDecision = {
 				action: "revise",
-				feedback:
-					"taskReflection loop did not call TaskReflectConfirm or TaskReflectRevise in its single allowed response.",
-				nextSteps:
-					"Review the protected task, gather concrete evidence, and try the tasks.json change again only if it remains justified.",
+				feedback: fallbackMessage,
+				nextSteps: fallbackNextSteps,
 			};
 			return alreadySettled ?? fallbackDecision;
 		}),
@@ -1733,7 +1744,16 @@ async function executeToolAfterReflections(
 					}
 					grantTaskReflection(config.narratorId, tu.toolUseId);
 					try {
-						return await executeTool(tu, config);
+						const result = await executeTool(tu, config);
+						// Surface the reflection's conclusion back to the main model so it knows
+						// on what basis the protected task change was allowed to proceed.
+						if (!result.isError) {
+							return {
+								...result,
+								output: appendTaskReflectionConfirmation(result.output, reflected.decision, locale),
+							};
+						}
+						return result;
 					} finally {
 						consumeTaskReflectionGrant(config.narratorId, tu.toolUseId);
 					}
@@ -1902,19 +1922,27 @@ export async function* agentLoop(
 			result.output.length > 0
 		) {
 			try {
-				const block = await scanToolOutputForKnowledge(
+				const scan = await scanToolOutputForKnowledgeDetailed(
 					config.userId,
 					result.output,
 					knowledgeInjectedEntryIds,
-					{ projectId: config.projectId ?? undefined },
+					{
+						projectId: config.projectId ?? undefined,
+					},
 				);
-				if (block) {
+				if (scan) {
 					sideCars.push({
 						target: "tool_result",
 						source: "knowledge_base_hint",
-						content: block,
+						content: scan.content,
 						orderIndex: 30,
 						toolUseId: tu.toolUseId,
+						knowledgeInjection: {
+							narratorId: config.narratorId,
+							compactSeq: config.knowledgeInjectionCompactSeq ?? -1,
+							triggerToolCallId: tu.toolUseId,
+							hits: scan.hits,
+						},
 					});
 				}
 			} catch (err) {

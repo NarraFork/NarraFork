@@ -11,6 +11,11 @@
 
 import type { Direction, DockviewApi, SerializedDockview } from "dockview-react";
 import {
+	isSeedEnvelope,
+	type SeedEnvelope,
+	type PanelSpec as SharedPanelSpec,
+} from "../panels/layout-envelope";
+import {
 	getAllLeaves,
 	leafPanelType,
 	parseWorkspaceLayout,
@@ -18,6 +23,10 @@ import {
 	type SplitLeaf,
 	type SplitNode,
 } from "../split-tree";
+import {
+	DEFAULT_DIRECTOR_PRIMARY_RATIO,
+	normalizeDirectorPrimaryRatio,
+} from "./director-constants";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
 /** Current envelope schema version. */
@@ -27,11 +36,14 @@ export type WorkspaceDirectorState = {
 	mode: "grid" | "director";
 	/** Panel id promoted to primary in director mode. */
 	primaryPanelId: string | null;
+	/** Primary panel's share of the surface in director mode (0.55–0.85). */
+	primaryRatio: number;
 };
 
 export const DEFAULT_DIRECTOR_STATE: WorkspaceDirectorState = {
 	mode: "grid",
 	primaryPanelId: null,
+	primaryRatio: DEFAULT_DIRECTOR_PRIMARY_RATIO,
 };
 
 /** Versioned envelope persisted to `workspaces.tree`. */
@@ -43,18 +55,49 @@ export interface WorkspaceLayoutEnvelope {
 }
 
 /** A panel to (re)create when there is no valid Dockview layout to restore. */
-export interface PanelSpec {
-	id: string;
-	params: WorkspacePanelParams;
-	title: string;
-	/** How to place this panel relative to the previously-added one. */
-	placement: { kind: "first" } | { kind: "relative"; referenceId: string; direction: Direction };
-}
+export type PanelSpec = SharedPanelSpec<WorkspacePanelParams>;
+
+/** A workspace seed envelope (api-free initial layout, e.g. from a sidebar drag). */
+export type WorkspaceSeedEnvelope = SeedEnvelope<WorkspacePanelParams>;
 
 /** Result of resolving a stored tree string into something we can render. */
 export type ResolvedLayout =
 	| { kind: "dockview"; layout: SerializedDockview; director: WorkspaceDirectorState }
 	| { kind: "panels"; panels: PanelSpec[]; director: WorkspaceDirectorState };
+
+// ── Seed construction ──
+
+/**
+ * Build a workspace seed that places two narrator panels side by side (or
+ * stacked). Used by the sidebar / narrator page when a drag creates a fresh
+ * workspace before any DockviewApi exists — replaces emitting a legacy
+ * split-tree that the workspace then had to migrate on read.
+ */
+export function twoNarratorWorkspaceSeed(
+	firstNarratorId: string,
+	secondNarratorId: string,
+	direction: Direction,
+): WorkspaceSeedEnvelope {
+	const firstId = nextWorkspacePanelId();
+	const secondId = nextWorkspacePanelId();
+	return {
+		kind: "seed",
+		seed: [
+			{
+				id: firstId,
+				params: { panelType: "narrator", narratorId: firstNarratorId },
+				title: "Narrator",
+				placement: { kind: "first" },
+			},
+			{
+				id: secondId,
+				params: { panelType: "narrator", narratorId: secondNarratorId },
+				title: "Narrator",
+				placement: { kind: "relative", referenceId: firstId, direction },
+			},
+		],
+	};
+}
 
 // ── Serialization ──
 
@@ -94,8 +137,10 @@ function isSerializedDockview(value: unknown): value is SerializedDockview {
  * Order of precedence:
  *   1. Dockview envelope (current format) → restore verbatim.
  *   2. Raw SerializedDockview (defensive) → wrap with default director state.
- *   3. Legacy split-tree → migrate into a panel list ("extract & re-arrange").
- *   4. Anything else / parse failure → empty panel list.
+ *   3. Seed envelope (api-free initial layout, e.g. from a sidebar drag) →
+ *      materialise its panel list imperatively.
+ *   4. Legacy split-tree → migrate into a panel list ("extract & re-arrange").
+ *   5. Anything else / parse failure → empty panel list.
  */
 export function resolveWorkspaceLayout(treeJson: string | null | undefined): ResolvedLayout {
 	if (treeJson) {
@@ -110,6 +155,13 @@ export function resolveWorkspaceLayout(treeJson: string | null | undefined): Res
 			}
 			if (isSerializedDockview(parsed)) {
 				return { kind: "dockview", layout: parsed, director: DEFAULT_DIRECTOR_STATE };
+			}
+			if (isSeedEnvelope(parsed)) {
+				return {
+					kind: "panels",
+					panels: (parsed as WorkspaceSeedEnvelope).seed,
+					director: DEFAULT_DIRECTOR_STATE,
+				};
 			}
 		} catch {
 			// fall through to legacy handling
@@ -128,13 +180,26 @@ function normalizeDirector(value: unknown): WorkspaceDirectorState {
 	return {
 		mode: v.mode === "director" ? "director" : "grid",
 		primaryPanelId: typeof v.primaryPanelId === "string" ? v.primaryPanelId : null,
+		primaryRatio:
+			typeof v.primaryRatio === "number"
+				? normalizeDirectorPrimaryRatio(v.primaryRatio)
+				: DEFAULT_DIRECTOR_PRIMARY_RATIO,
 	};
 }
 
+// Monotonic counter appended to every generated panel id so ids never collide
+// even when several are created within the same millisecond (Date.now() alone
+// is not enough — two panels added back-to-back would otherwise share a base).
 let panelIdCounter = 0;
-function nextPanelId(): string {
+
+/** Generate a unique dockview panel id (collision-proof within a session). */
+export function nextWorkspacePanelId(): string {
 	panelIdCounter += 1;
-	return `dvp_${Date.now().toString(36)}_${panelIdCounter}`;
+	return `dvp_${Date.now().toString(36)}_${panelIdCounter.toString(36)}`;
+}
+
+function nextPanelId(): string {
+	return nextWorkspacePanelId();
 }
 
 /** Convert a legacy split-tree leaf into panel params (or null if unusable). */
@@ -236,6 +301,8 @@ export function componentForParams(params: WorkspacePanelParams): string {
 			return PANEL_COMPONENT.terminal;
 		case "webview":
 			return PANEL_COMPONENT.webview;
+		case "narrator-tool":
+			return PANEL_COMPONENT.narratorTool;
 		default:
 			return PANEL_COMPONENT.narrator;
 	}

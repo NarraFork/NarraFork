@@ -9,6 +9,7 @@ import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
 	server: { port: 7778, host: "localhost", openBrowser: "browser" },
+	proxy: { mode: "system" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	knowledge: {
 		injectMode: "summary",
@@ -170,6 +171,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"server.tls.caFile": {
 		desc: "CA 证书文件路径，覆盖系统默认信任的 CA。可选。",
+		type: "string",
+	},
+
+	// ── proxy ───────────────────────────────────────────────────────────
+	"proxy.mode": {
+		type: "string",
+		valid: '"system" | "direct" | "custom"',
+	},
+	"proxy.url": {
+		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。支持 http/https/socks5/socks5h/socks4 协议，仅填 host:port 时默认按 http 处理。',
 		type: "string",
 	},
 
@@ -431,15 +442,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "URL 关键词黑名单。优先级高于白名单。匹配的 URL 自动拒绝。每项含 pattern、enabled。",
 		type: "array",
 	},
-	"agent.webFetchPolicy.proxy.mode": {
-		desc: 'WebFetch 代理模式。"direct" 直连，"system" 从环境变量自动检测，"custom" 使用自定义 URL。',
-		type: "string",
-		valid: '"direct" | "system" | "custom"',
-	},
-	"agent.webFetchPolicy.proxy.url": {
-		desc: '自定义代理 URL，仅 mode 为 "custom" 时使用。',
-		type: "string",
-	},
 	"agent.contextThresholds.standard.pruneStart": {
 		desc: "标准模型(≤600k tokens)开始裁剪的上下文使用百分比(0-100)。",
 		type: "number",
@@ -539,10 +541,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── codex ───────────────────────────────────────────────────────────
-	"codex.proxy": {
-		desc: "所有 Codex 请求的 HTTPS 代理 URL。可选。",
-		type: "string",
-	},
 	"codex.loadBalancingMode": {
 		desc: '多凭证时的负载均衡策略。"priority" 使用最高优先级凭证，"balanced" 均衡选择，"tier-balanced" 先按账号等级排序、同等级内均衡选择。',
 		type: "string",

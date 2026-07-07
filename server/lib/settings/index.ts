@@ -365,6 +365,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (migrateGlobalProxy(merged, raw)) {
+		needsSave = true;
+	}
+
 	if (normalizeSettingsProxyUrls(merged)) {
 		needsSave = true;
 	}
@@ -479,17 +483,17 @@ export function normalizeProxyUrl(value: string | null | undefined): string | un
 	return `http://${trimmed}`;
 }
 
-function normalizeProxyField(target: { proxy?: string }): boolean {
-	const before = target.proxy;
-	const after = normalizeProxyUrl(before);
-	if (before === after) return false;
-	target.proxy = after;
-	return true;
-}
-
-function normalizeWebFetchProxyUrl(settings: NarraForkSettings): boolean {
-	const proxy = settings.agent.webFetchPolicy?.proxy;
+export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
+	const proxy = settings.proxy;
 	if (!proxy) return false;
+	if (proxy.mode !== "custom") {
+		// url is only meaningful in custom mode — drop stale values.
+		if (proxy.url !== undefined) {
+			delete proxy.url;
+			return true;
+		}
+		return false;
+	}
 	const before = proxy.url;
 	const after = normalizeProxyUrl(before);
 	if (before === after) return false;
@@ -497,13 +501,82 @@ function normalizeWebFetchProxyUrl(settings: NarraForkSettings): boolean {
 	return true;
 }
 
-export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean {
+/**
+ * Migrate the legacy per-provider proxy fields to the unified `settings.proxy`
+ * policy. Runs once when `raw.proxy` is absent, then clears the old fields.
+ *
+ * codex.proxy → first Anthropic provider's proxy. When no URL is found, the
+ * mode defaults to "system" (follow the OS/env proxy) unless the legacy
+ * WebFetch mode was explicitly "direct".
+ */
+export function migrateGlobalProxy(
+	settings: NarraForkSettings,
+	raw: Record<string, unknown>,
+): boolean {
+	const rawHasProxy =
+		raw.proxy && typeof raw.proxy === "object" && !Array.isArray(raw.proxy) && "mode" in raw.proxy;
+
+	// biome-ignore lint/suspicious/noExplicitAny: reading deprecated fields from raw for migration
+	const r = raw as any;
+	const legacyWebFetch = r.agent?.webFetchPolicy?.proxy as
+		| { mode?: string; url?: string }
+		| undefined;
+	const legacyCodex = r.codex?.proxy as string | undefined;
+	const legacyAnthropic = (Array.isArray(r.anthropicProviders) ? r.anthropicProviders : []).find(
+		(p: { proxy?: string }) => p?.proxy,
+	)?.proxy as string | undefined;
+	const legacyCustomApi = (Array.isArray(r.customApiProviders) ? r.customApiProviders : []).find(
+		(p: { proxy?: string }) => p?.proxy,
+	)?.proxy as string | undefined;
+
+	// biome-ignore lint/suspicious/noExplicitAny: mutating deprecated fields on merged settings
+	const s = settings as any;
+
 	let changed = false;
-	if (settings.codex) changed = normalizeProxyField(settings.codex) || changed;
-	for (const provider of settings.anthropicProviders ?? []) {
-		changed = normalizeProxyField(provider) || changed;
+
+	if (!rawHasProxy) {
+		const customUrl = normalizeProxyUrl(
+			(legacyWebFetch?.mode === "custom" ? legacyWebFetch.url : undefined) ||
+				legacyCodex ||
+				legacyAnthropic ||
+				legacyCustomApi,
+		);
+		if (customUrl) {
+			settings.proxy = { mode: "custom", url: customUrl };
+		} else if (legacyWebFetch?.mode === "direct") {
+			settings.proxy = { mode: "direct" };
+		} else {
+			settings.proxy = { mode: "system" };
+		}
+		changed = true;
 	}
-	changed = normalizeWebFetchProxyUrl(settings) || changed;
+
+	// Clear deprecated per-provider proxy fields regardless of migration path.
+		changed = true;
+	}
+	if (s.codex && "proxy" in s.codex) {
+		delete s.codex.proxy;
+		changed = true;
+	}
+	if (s.agent?.webFetchPolicy && "proxy" in s.agent.webFetchPolicy) {
+		delete s.agent.webFetchPolicy.proxy;
+		changed = true;
+	}
+	for (const provider of settings.anthropicProviders ?? []) {
+		if ("proxy" in provider) {
+			// biome-ignore lint/suspicious/noExplicitAny: deleting deprecated field
+			delete (provider as any).proxy;
+			changed = true;
+		}
+	}
+	for (const provider of settings.customApiProviders ?? []) {
+		if ("proxy" in provider) {
+			// biome-ignore lint/suspicious/noExplicitAny: deleting deprecated field
+			delete (provider as any).proxy;
+			changed = true;
+		}
+	}
+
 	return changed;
 }
 

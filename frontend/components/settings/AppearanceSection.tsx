@@ -200,14 +200,33 @@ export function AppearanceSection({
 				<Text size="xs" c="dimmed">
 					{t("sendModeDesc")}
 				</Text>
+				<Text size="xs" fw={500} mt={4}>
+					{t("enterKeyBehavior")}
+				</Text>
 				<SegmentedControl
-					value={userPrefs?.sendMode ?? "enter"}
-					onChange={(v) => updateUserPref.mutate({ sendMode: v })}
+					value={userPrefs?.enterQueueMode ?? "turn"}
+					onChange={(v) => updateUserPref.mutate({ enterQueueMode: v })}
 					data={[
-						{ value: "enter", label: t("sendModeEnter") },
-						{ value: "ctrl+enter", label: t("sendModeCtrlEnter") },
+						{ value: "turn", label: t("queueMode_turn") },
+						{ value: "tool", label: t("queueMode_tool") },
+						{ value: "interrupt", label: t("queueMode_interrupt") },
 					]}
 				/>
+				<Text size="xs" fw={500} mt={4}>
+					{t("ctrlEnterKeyBehavior")}
+				</Text>
+				<SegmentedControl
+					value={userPrefs?.ctrlEnterQueueMode ?? "tool"}
+					onChange={(v) => updateUserPref.mutate({ ctrlEnterQueueMode: v })}
+					data={[
+						{ value: "turn", label: t("queueMode_turn") },
+						{ value: "tool", label: t("queueMode_tool") },
+						{ value: "interrupt", label: t("queueMode_interrupt") },
+					]}
+				/>
+				<Text size="xs" c="dimmed" mt={4}>
+					{t("shiftEnterNewlineHint")}
+				</Text>
 			</Stack>
 		</Stack>
 	);

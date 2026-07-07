@@ -20,10 +20,13 @@ import { removeWSStatus, setWSStatus } from "./ws-status";
 // Types
 // ---------------------------------------------------------------------------
 
+export type NarratorSubscriptionKind = "list" | "panel" | "messages";
+
 /** Opaque handle returned by `subscribe()` — pass to `unsubscribe()`. */
 export interface SubscriptionHandle {
 	/** @internal */ _id: number;
 	/** @internal */ _narratorIds: string[];
+	/** @internal */ _kind: NarratorSubscriptionKind;
 }
 
 /** Opaque handle returned by `addListener()` — pass to `removeListener()`. */
@@ -40,6 +43,15 @@ export interface ListenerOptions {
 	typePrefixes?: string[];
 	/** Only receive messages whose `type` exactly matches one of these. */
 	types?: string[];
+	/** Receive request-scoped snapshot/catch-up frames for this subscription only. */
+	subscriptionId?: number;
+}
+
+interface SubscriptionRecord {
+	id: number;
+	narratorIds: string[];
+	kind: NarratorSubscriptionKind;
+	activeRequestIds: Set<string>;
 }
 
 interface ListenerEntry {
@@ -146,12 +158,8 @@ class NarratorWSManager {
 	// --- Subscription ref-counting ---
 	// narratorId → Set of subscription handle IDs
 	private narratorRefCounts = new Map<string, Set<number>>();
-
-	// --- Pending subscribes (queued while WS is not OPEN) ---
-	// Tracks narrator IDs whose subscribe message hasn't been sent yet.
-	// lastMessageId is already stored in this.lastMessageIds by subscribe(),
-	// so we only need to track the IDs themselves.
-	private pendingSubscribeIds = new Set<string>();
+	private subscriptions = new Map<number, SubscriptionRecord>();
+	private requestToSubscription = new Map<string, number>();
 
 	// --- Presence ref-counting ---
 	// narratorId → Set of handle IDs that requested presence
@@ -246,48 +254,36 @@ class NarratorWSManager {
 	 */
 	subscribe(
 		narratorIds: string[],
-		opts?: { lastMessageId?: string; fullSubscribe?: boolean },
+		opts?: { lastMessageId?: string; kind?: NarratorSubscriptionKind },
 	): SubscriptionHandle {
 		const id = this.nextId++;
-		const handle: SubscriptionHandle = { _id: id, _narratorIds: [...narratorIds] };
+		const kind = opts?.kind ?? "list";
+		const handle: SubscriptionHandle = { _id: id, _narratorIds: [...narratorIds], _kind: kind };
+		this.subscriptions.set(id, {
+			id,
+			narratorIds: [...narratorIds],
+			kind,
+			activeRequestIds: new Set(),
+		});
 
-		const newIds: string[] = [];
 		for (const nId of narratorIds) {
 			let refs = this.narratorRefCounts.get(nId);
 			if (!refs) {
 				refs = new Set();
 				this.narratorRefCounts.set(nId, refs);
-				newIds.push(nId);
 			}
 			refs.add(id);
 		}
 
-		if (opts?.lastMessageId && narratorIds.length === 1) {
+		if (kind === "messages" && opts?.lastMessageId && narratorIds.length === 1) {
 			this.lastMessageIds.delete(narratorIds[0]);
 			this.lastMessageIds.set(narratorIds[0], opts.lastMessageId);
-			while (this.lastMessageIds.size > MAX_LAST_MESSAGE_IDS) {
-				const oldest = this.lastMessageIds.keys().next().value;
-				if (oldest !== undefined) {
-					this.lastMessageIds.delete(oldest);
-					this.catchUpCursors.delete(oldest);
-				} else break;
-			}
+			this._trimCatchUpState();
 		}
 
-		// When fullSubscribe is true (panel-level), always send subscribe to the
-		// server even if the ID was already ref-counted by a list-level subscriber.
-		// This ensures the server sends back the streaming snapshot (including
-		// cached gateway queue status) that the panel needs to restore UI state.
-		const idsToSend = opts?.fullSubscribe ? narratorIds : newIds;
-		if (idsToSend.length) {
-			if (this.ws?.readyState === WebSocket.OPEN) {
-				this._sendSubscribe(idsToSend, opts?.lastMessageId);
-			} else {
-				for (const nId of idsToSend) {
-					this.pendingSubscribeIds.add(nId);
-				}
-			}
-		}
+		// Send the request in a microtask so hooks can register their listener in the
+		// same effect before request-scoped snapshots/catch-up frames can arrive.
+		this._scheduleSubscribe(handle, narratorIds, opts?.lastMessageId);
 
 		return handle;
 	}
@@ -298,16 +294,18 @@ class NarratorWSManager {
 	 */
 	unsubscribe(handle: SubscriptionHandle): void {
 		const removedIds: string[] = [];
+		this._clearRequestsForHandle(handle._id);
+		this.subscriptions.delete(handle._id);
 		for (const nId of handle._narratorIds) {
 			const refs = this.narratorRefCounts.get(nId);
 			if (!refs) continue;
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
-				this.pendingSubscribeIds.delete(nId);
 				this.messageVersions.delete(nId);
-				// Keep lastMessageId so that re-subscribe (page navigation back)
-				// can still trigger server-side catch-up.
+				// Keep lastMessageId + catchUpCursor so that re-subscribe (page
+				// navigation back) can still trigger server-side catch-up. Both
+				// maps are bounded by _trimCatchUpState so they never grow unbounded.
 				removedIds.push(nId);
 			}
 		}
@@ -335,40 +333,42 @@ class NarratorWSManager {
 			refs.delete(handle._id);
 			if (refs.size === 0) {
 				this.narratorRefCounts.delete(nId);
-				this.pendingSubscribeIds.delete(nId);
-				this.lastMessageIds.delete(nId);
-				this.catchUpCursors.delete(nId);
 				this.messageVersions.delete(nId);
+				// Keep lastMessageId + catchUpCursor (same as unsubscribe) so a later
+				// re-add can resume server-side catch-up; both are bounded by
+				// _trimCatchUpState so they never grow unbounded.
 				actuallyRemoved.push(nId);
 			}
 		}
 
 		// Add new
-		const actuallyAdded: string[] = [];
+		const toSubscribe: string[] = [];
 		for (const nId of toAdd) {
 			let refs = this.narratorRefCounts.get(nId);
 			if (!refs) {
 				refs = new Set();
 				this.narratorRefCounts.set(nId, refs);
-				actuallyAdded.push(nId);
 			}
 			refs.add(handle._id);
+			// A newly-added ID needs this handle's initial snapshot even when another
+			// handle already keeps the narrator subscribed.
+			toSubscribe.push(nId);
 		}
 
 		handle._narratorIds = [...newNarratorIds];
+		const record = this.subscriptions.get(handle._id);
+		if (record) record.narratorIds = [...newNarratorIds];
 
 		if (this.ws?.readyState === WebSocket.OPEN) {
 			if (actuallyRemoved.length) {
 				this.ws.send(JSON.stringify({ type: "unsubscribe", narratorIds: actuallyRemoved }));
 			}
-			if (actuallyAdded.length) {
-				this._sendSubscribe(actuallyAdded);
-			}
-		} else if (actuallyAdded.length) {
-			for (const nId of actuallyAdded) {
-				this.pendingSubscribeIds.add(nId);
+			if (toSubscribe.length) {
+				this._scheduleSubscribe(handle, toSubscribe);
 			}
 		}
+		// When the socket is not OPEN there is nothing to queue: `_restoreSubscriptions`
+		// re-sends every active handle from `subscriptions` on reconnect.
 	}
 
 	// -----------------------------------------------------------------------
@@ -483,6 +483,25 @@ class NarratorWSManager {
 		}
 	}
 
+	private _clearRequestsForHandle(handleId: number): void {
+		const record = this.subscriptions.get(handleId);
+		for (const requestId of record?.activeRequestIds ?? []) {
+			this.requestToSubscription.delete(requestId);
+		}
+		record?.activeRequestIds.clear();
+	}
+
+	private _registerRequest(handle: SubscriptionHandle): string | undefined {
+		if (handle._kind === "list") return undefined;
+		const record = this.subscriptions.get(handle._id);
+		if (!record) return undefined;
+		this._clearRequestsForHandle(handle._id);
+		const requestId = `${handle._kind}-${handle._id}-${Date.now()}-${this.nextId++}`;
+		record.activeRequestIds.add(requestId);
+		this.requestToSubscription.set(requestId, handle._id);
+		return requestId;
+	}
+
 	noteMessage(narratorId: string, message: MinimalTreeMessage | undefined): void {
 		if (!message || typeof message.id !== "string") return;
 		this.updateLastMessageId(narratorId, message.id);
@@ -525,13 +544,24 @@ class NarratorWSManager {
 	 */
 	checkSync(narratorId: string): void {
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
+		const handle = [...this.subscriptions.values()].find(
+			(record) => record.kind === "messages" && record.narratorIds.includes(narratorId),
+		);
+		if (!handle) return;
 		const version = this.messageVersions.get(narratorId) ?? 0;
 		const cursor = this.catchUpCursors.get(narratorId);
 		const lastMessageId = this.lastMessageIds.get(narratorId);
+		const requestId = this._registerRequest({
+			_id: handle.id,
+			_narratorIds: handle.narratorIds,
+			_kind: handle.kind,
+		});
 		const msg: Record<string, unknown> = {
 			type: "sync_check",
 			narratorId,
 			version,
+			kind: "messages",
+			...(requestId ? { requestId } : {}),
 		};
 		if (cursor) msg.catchUpCursor = cursor;
 		else if (lastMessageId) msg.lastMessageId = lastMessageId;
@@ -544,7 +574,12 @@ class NarratorWSManager {
 	 */
 	checkAllSubscribedSync(): void {
 		if (this.ws?.readyState !== WebSocket.OPEN) return;
-		for (const narratorId of this.narratorRefCounts.keys()) {
+		const ids = new Set<string>();
+		for (const record of this.subscriptions.values()) {
+			if (record.kind !== "messages") continue;
+			for (const narratorId of record.narratorIds) ids.add(narratorId);
+		}
+		for (const narratorId of ids) {
 			this.checkSync(narratorId);
 		}
 	}
@@ -746,12 +781,15 @@ class NarratorWSManager {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-		// Clear pending queue — everything in narratorRefCounts will be sent below
-		this.pendingSubscribeIds.clear();
-
-		// Subscribe narrators individually so each can carry its own catch-up cursor.
-		for (const [narratorId] of this.narratorRefCounts) {
-			this._sendSubscribe([narratorId]);
+		// Restore every handle, not just every narrator. Request-scoped snapshots
+		// (panel runtime / message catch-up) must be delivered to the consumer that
+		// asked for them, and multiple panels may watch the same narrator.
+		for (const record of this.subscriptions.values()) {
+			if (record.narratorIds.length === 0) continue;
+			this._scheduleSubscribe(
+				{ _id: record.id, _narratorIds: record.narratorIds, _kind: record.kind },
+				record.narratorIds,
+			);
 		}
 
 		// Presence
@@ -829,23 +867,59 @@ class NarratorWSManager {
 		this.checkAllSubscribedSync();
 	}
 
-	private _sendSubscribe(narratorIds: string[], lastMessageId?: string): void {
+	private _scheduleSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		lastMessageId?: string,
+	): void {
+		if (narratorIds.length === 0) return;
+		// When the socket isn't OPEN there's nothing to send now; reconnect replays
+		// every active handle via `_restoreSubscriptions`, so we simply drop this.
+		if (this.ws?.readyState !== WebSocket.OPEN) return;
+		queueMicrotask(() => this._sendSubscribe(handle, narratorIds, lastMessageId));
+	}
+
+	private _sendSubscribe(
+		handle: SubscriptionHandle,
+		narratorIds: string[],
+		lastMessageId?: string,
+	): void {
 		const ws = this.ws;
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		const record = this.subscriptions.get(handle._id);
+		if (!record) return;
+		const activeNarratorIds = narratorIds.filter((nId) => {
+			const refs = this.narratorRefCounts.get(nId);
+			return refs?.has(handle._id) && record.narratorIds.includes(nId);
+		});
+		if (activeNarratorIds.length === 0) return;
+		const kind = record.kind;
+		const requestId = this._registerRequest(handle);
 
-		if (narratorIds.length === 1) {
-			const narratorId = narratorIds[0];
+		if (kind === "messages" && activeNarratorIds.length === 1) {
+			const narratorId = activeNarratorIds[0];
 			const cursor = this.catchUpCursors.get(narratorId);
 			const legacyLastMessageId = lastMessageId ?? this.lastMessageIds.get(narratorId);
-			const msg: Record<string, unknown> = { type: "subscribe", narratorIds };
+			const msg: Record<string, unknown> = {
+				type: "subscribe",
+				narratorIds: activeNarratorIds,
+				kind,
+				...(requestId ? { requestId } : {}),
+			};
 			if (cursor) msg.catchUpCursor = cursor;
 			else if (legacyLastMessageId) msg.lastMessageId = legacyLastMessageId;
 			ws.send(JSON.stringify(msg));
 			return;
 		}
 
-		// For batch subscribes (no catch-up), send as one message
-		ws.send(JSON.stringify({ type: "subscribe", narratorIds }));
+		ws.send(
+			JSON.stringify({
+				type: "subscribe",
+				narratorIds: activeNarratorIds,
+				kind,
+				...(requestId ? { requestId } : {}),
+			}),
+		);
 	}
 
 	// Message types that are latency-sensitive and must be dispatched immediately
@@ -885,51 +959,87 @@ class NarratorWSManager {
 	}
 
 	private _dispatchImmediate(data: Record<string, unknown>): void {
-		const msgType = data.type as string | undefined;
-		const narratorId = data.narratorId as string | undefined;
+		const msgType = typeof data.type === "string" ? data.type : undefined;
+		const narratorId = typeof data.narratorId === "string" ? data.narratorId : undefined;
+		const subscriptionRequestId =
+			typeof data.subscriptionRequestId === "string" ? data.subscriptionRequestId : undefined;
+		const targetSubscriptionId = subscriptionRequestId
+			? this.requestToSubscription.get(subscriptionRequestId)
+			: undefined;
 
 		for (const entry of this.listeners.values()) {
-			if (this._matchesFilter(entry.opts, msgType, narratorId)) {
-				try {
-					entry.cb(data);
-				} catch {
-					// listener error — ignore
-				}
+			if (
+				!shouldDeliverToListener(
+					entry.opts,
+					msgType,
+					narratorId,
+					subscriptionRequestId,
+					targetSubscriptionId,
+				)
+			)
+				continue;
+			try {
+				entry.cb(data);
+			} catch {
+				// listener error — ignore
 			}
 		}
 	}
+}
 
-	private _matchesFilter(
-		opts: ListenerOptions,
-		msgType: string | undefined,
-		narratorId: string | undefined,
-	): boolean {
-		// Check type filters first (if specified)
-		if (opts.types && msgType) {
-			if (!opts.types.includes(msgType)) return false;
-		}
-		if (opts.typePrefixes && msgType) {
-			const matched = opts.typePrefixes.some((p) => msgType.startsWith(p));
-			if (!matched) return false;
-		}
-		// If both types and typePrefixes are unset, no type filtering
-
-		// Check narratorId filter
-		if (opts.narratorIds) {
-			if (opts.narratorIds === "*") return true;
-			if (!narratorId) {
-				// Message has no narratorId — only match if type filters already
-				// narrowed it down (e.g. typePrefixes: ["container:"] or types: ["output_stats"]).
-				// Without type filters, a specific-narrator listener should NOT
-				// receive unrelated broadcast messages.
-				return !!(opts.types || opts.typePrefixes);
-			}
-			return opts.narratorIds.includes(narratorId);
-		}
-
-		// No narratorId filter — match all
-		return true;
+/** Type/narrator filter used by both real-time and request-scoped dispatch. */
+export function matchesListenerFilter(
+	opts: ListenerOptions,
+	msgType: string | undefined,
+	narratorId: string | undefined,
+): boolean {
+	// Check type filters first (if specified)
+	if (opts.types && msgType) {
+		if (!opts.types.includes(msgType)) return false;
 	}
+	if (opts.typePrefixes && msgType) {
+		const matched = opts.typePrefixes.some((p) => msgType.startsWith(p));
+		if (!matched) return false;
+	}
+	// If both types and typePrefixes are unset, no type filtering
+
+	// Check narratorId filter
+	if (opts.narratorIds) {
+		if (opts.narratorIds === "*") return true;
+		if (!narratorId) {
+			// Message has no narratorId — only match if type filters already
+			// narrowed it down (e.g. typePrefixes: ["container:"] or types: ["output_stats"]).
+			// Without type filters, a specific-narrator listener should NOT
+			// receive unrelated broadcast messages.
+			return !!(opts.types || opts.typePrefixes);
+		}
+		return opts.narratorIds.includes(narratorId);
+	}
+
+	// No narratorId filter — match all
+	return true;
+}
+
+/**
+ * Decide whether a dispatched frame should reach a given listener.
+ *
+ * Request-scoped frames (snapshot / catch-up carrying `subscriptionRequestId`) are
+ * delivered ONLY to the listener bound to the subscription handle that issued the
+ * request, so a later panel/chunk mount cannot reset sibling consumers watching
+ * the same narrator on the same socket. Frames without a `subscriptionRequestId`
+ * fall back to the normal type/narrator filter.
+ */
+export function shouldDeliverToListener(
+	opts: ListenerOptions,
+	msgType: string | undefined,
+	narratorId: string | undefined,
+	subscriptionRequestId: string | undefined,
+	targetSubscriptionId: number | undefined,
+): boolean {
+	if (subscriptionRequestId) {
+		if (targetSubscriptionId == null || opts.subscriptionId !== targetSubscriptionId) return false;
+	}
+	return matchesListenerFilter(opts, msgType, narratorId);
 }
 
 export const narratorWSManager = new NarratorWSManager();

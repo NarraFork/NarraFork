@@ -90,7 +90,6 @@ export function anthropicProviderToCustomApi(
 		defaultContextWindow: provider.defaultContextWindow,
 		protocol: customApiProtocolFromAnthropic(provider.officialApi),
 		defaultReasoningEffort: provider.defaultReasoningEffort,
-		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
 	};
 }
@@ -157,7 +156,6 @@ export function customApiProviderToAnthropic(
 		defaultModel: provider.defaultModel,
 		defaultContextWindow: provider.defaultContextWindow,
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
-		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
 		officialApi: provider.protocol === "anthropic-official",
 	};
@@ -193,7 +191,6 @@ export function normalizeCustomApiProvider(
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
-		proxy: provider.proxy ?? "",
 	};
 }
 

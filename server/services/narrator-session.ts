@@ -73,6 +73,7 @@ import { drainGroupMessagesForNarrator, formatGroupMessages } from "./chat-group
 import { gitService } from "./git-service";
 import { getStatusSummaryCached, invalidateStatus } from "./git-status-cache";
 import { knowledgeInjection } from "./knowledge-injection";
+import { knowledgeService } from "./knowledge-service";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -152,6 +153,7 @@ import {
 	clearActiveHistoryCompactPending,
 	compactLocks,
 	hasPendingHistoryCompact,
+	knowledgeInjectionCycleStates,
 	narratorCreationLocks,
 	pendingFeedback,
 	pendingPermissions,
@@ -1255,12 +1257,15 @@ export async function runAgentLoop(
 	active._loopRunning = true;
 	let shouldUpdateTitle = false;
 	let currentText = text;
-	// Knowledge entries already injected in the CURRENT COMPACT CYCLE (de-dup across passes &
-	// tool outputs). `knowledgeInjectCycleSeq` tracks which compact cycle the set belongs to;
-	// when a compact boundary is crossed the set is cleared so the same entry may be re-injected
-	// into the fresh (post-compact) context. Shared with the agent loop (point B) via config.
-	const knowledgeInjectedIds = new Set<string>();
-	let knowledgeInjectCycleSeq = -1;
+	// Knowledge entries already injected in the CURRENT COMPACT CYCLE (de-dup across runAgentLoop
+	// calls, loop passes, and tool outputs). This is narratorId-scoped hotSafe state rather than
+	// ActiveNarrator state because ActiveNarrator is recreated between idle user turns.
+	let knowledgeCycleState = knowledgeInjectionCycleStates.get(narratorId);
+	if (!knowledgeCycleState) {
+		knowledgeCycleState = { seq: Number.NaN, ids: new Set<string>() };
+		knowledgeInjectionCycleStates.set(narratorId, knowledgeCycleState);
+	}
+	const knowledgeInjectedIds = knowledgeCycleState.ids;
 	let currentImages = images;
 	let loopHadError = false;
 	/** Wall-clock start of this response turn, for the Stop hook `duration_ms` field. */
@@ -1313,9 +1318,12 @@ export async function runAgentLoop(
 			// seq changes (a compact happened), the prior injections were summarized/dropped from
 			// context, so clear the set to allow re-injecting relevant entries into the new cycle.
 			const cycleSeq = baselineCompactSeq ?? -1;
-			if (cycleSeq !== knowledgeInjectCycleSeq) {
-				knowledgeInjectCycleSeq = cycleSeq;
+			if (cycleSeq !== knowledgeCycleState.seq) {
+				knowledgeCycleState.seq = cycleSeq;
 				knowledgeInjectedIds.clear();
+				for (const id of knowledgeService.listInjectedEntryIds(narratorId, cycleSeq)) {
+					knowledgeInjectedIds.add(id);
+				}
 			}
 			// Always use getMessagesSinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
@@ -1802,6 +1810,7 @@ export async function runAgentLoop(
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
+				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
@@ -2075,12 +2084,23 @@ export async function runAgentLoop(
 						{ already: knowledgeInjectedIds, projectId: active._projectId ?? undefined },
 					);
 					if (hits.length > 0) {
-						for (const h of hits) knowledgeInjectedIds.add(h.entryId);
 						const block = knowledgeInjection.formatInjections(
 							hits,
 							"Relevant knowledge-base entries were found for this request:",
 						);
-						if (block) effectiveText = `${effectiveText}\n\n${block}`;
+						if (block) {
+							await narratorService.persistSystemMessage(narratorId, block, [
+								knowledgeInjection.createKnowledgeHintBlock(hits, "user_message", cycleSeq),
+							]);
+							knowledgeService.recordInjectionEvents({
+								narratorId,
+								compactSeq: cycleSeq,
+								source: "user_message",
+								hits,
+							});
+							for (const h of hits) knowledgeInjectedIds.add(h.entryId);
+							effectiveText = `${effectiveText}\n\n${block}`;
+						}
 					}
 				} catch (err) {
 					logger.warn("Knowledge injection (user message) failed", {

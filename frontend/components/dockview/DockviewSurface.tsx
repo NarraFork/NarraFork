@@ -18,6 +18,7 @@ import {
 	DockviewReact,
 	type DockviewReadyEvent,
 	type DockviewWillDropEvent,
+	type IDockviewPanelHeaderProps,
 	type IDockviewPanelProps,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
@@ -30,6 +31,26 @@ import { type DockviewDropTarget, useDockviewDnd } from "./useDockviewDnd";
 
 /** Theme class that maps dockview CSS variables to Mantine (see theme.css). */
 export const DOCKVIEW_THEME_CLASS = "dockview-theme-narrafork";
+
+/**
+ * NarraFork's dockview theme descriptor.
+ *
+ * Dockview v7 applies a theme to an internal `.dv-shell` element and, when no
+ * `theme` is supplied, defaults to the dark `abyss` theme. That default sits
+ * INSIDE our `.dockview-theme-narrafork` wrapper, so its CSS variables shadow
+ * ours (e.g. inactive tabs render dark navy) and it forces a different tab-strip
+ * height. Supplying our own theme makes dockview stamp OUR class on the shell,
+ * so `theme.css` variables are authoritative and the strip metrics are ours.
+ *
+ * `tabGroupIndicator: "none"` disables dockview's built-in group underline (we
+ * render our own active-tab indicator in theme.css). `colorScheme` follows the
+ * app's Mantine light/dark scheme via the CSS variables, so it is left unset.
+ */
+const NARRAFORK_DOCKVIEW_THEME = {
+	name: "narrafork",
+	className: DOCKVIEW_THEME_CLASS,
+	tabGroupIndicator: "none",
+} as const;
 
 export interface DockviewSurfaceProps {
 	/** Panel component registry passed to DockviewReact. */
@@ -69,6 +90,12 @@ export interface DockviewSurfaceProps {
 	 * Leave unset to inherit dockview's default.
 	 */
 	defaultRenderer?: "always" | "onlyWhenVisible";
+	/**
+	 * Per-panel tab renderers, keyed by the `tabComponent` name a panel is added
+	 * with. Used e.g. to give the focus dock's chat panel a close-less tab so the
+	 * cluster protagonist can never be closed.
+	 */
+	tabComponents?: Record<string, React.FunctionComponent<IDockviewPanelHeaderProps>>;
 }
 
 export function DockviewSurface({
@@ -82,6 +109,7 @@ export function DockviewSurface({
 	themeless,
 	apiRef: externalApiRef,
 	defaultRenderer,
+	tabComponents,
 }: DockviewSurfaceProps) {
 	const internalApiRef = useRef<DockviewApi | null>(null);
 	const apiRef = externalApiRef ?? internalApiRef;
@@ -146,7 +174,13 @@ export function DockviewSurface({
 		<Box ref={rootRef} style={{ height: "100%", width: "100%", position: "relative" }}>
 			<DockviewReact
 				className={surfaceClass || undefined}
+				// Supply our own theme so dockview stamps OUR class on the internal
+				// shell instead of defaulting to the dark `abyss` theme (which would
+				// shadow our CSS variables from inside the wrapper). Skipped when the
+				// caller opts out of theming.
+				theme={themeless ? undefined : NARRAFORK_DOCKVIEW_THEME}
 				components={components}
+				tabComponents={tabComponents}
 				onReady={handleReady}
 				onDidDrop={handleDidDrop}
 				onWillDrop={handleWillDrop}

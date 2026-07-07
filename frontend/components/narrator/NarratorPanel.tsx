@@ -50,7 +50,9 @@ import {
 	IconCheck,
 	IconChevronDown,
 	IconChevronUp,
+	IconClock,
 	IconCopy,
+	IconDotsVertical,
 	IconEraser,
 	IconExternalLink,
 	IconFile,
@@ -66,11 +68,14 @@ import {
 	IconPaperclip,
 	IconPencil,
 	IconPhoto,
+	IconPlayerPlay,
+	IconPlayerTrackNext,
 	IconSearch,
 	IconSettings,
 	IconShield,
 	IconSparkles,
 	IconTerminal,
+	IconTool,
 	IconTrash,
 	IconUpload,
 	IconX,
@@ -1075,6 +1080,199 @@ function PermModeMenuItems({
 				);
 			})}
 		</>
+	);
+}
+
+const QUEUE_MODE_ICONS: Record<string, React.ReactNode> = {
+	turn: <IconClock size={14} />,
+	tool: <IconTool size={14} />,
+	interrupt: <IconPlayerTrackNext size={14} />,
+};
+
+type QueueMode = "turn" | "tool" | "interrupt";
+const QUEUE_MODES: QueueMode[] = ["turn", "tool", "interrupt"];
+
+/**
+ * A single queue-mode row: icon + label + description, with a right-side marker
+ * that is either a check (this mode is the current binding) or a play icon
+ * (clicking sends the current input with this mode right now).
+ */
+function QueueModeMenuItem({
+	mode,
+	selected,
+	action,
+	descriptionKey,
+	onClick,
+	t,
+}: {
+	mode: QueueMode;
+	selected: boolean;
+	/** "configure" shows a check on the active mode; "trigger" shows a play icon. */
+	action: "configure" | "trigger";
+	descriptionKey: string;
+	onClick: () => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<Menu.Item
+			leftSection={QUEUE_MODE_ICONS[mode]}
+			closeMenuOnClick
+			onClick={onClick}
+			rightSection={
+				action === "trigger" ? (
+					<IconPlayerPlay size={14} />
+				) : (
+					<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
+				)
+			}
+			fw={action === "configure" && selected ? 600 : 400}
+		>
+			<Stack gap={0}>
+				<Text size="sm">{t(`queueMode_${mode}`)}</Text>
+				<Text size="xs" c="dimmed">
+					{t(descriptionKey)}
+				</Text>
+			</Stack>
+		</Menu.Item>
+	);
+}
+
+/**
+ * Dropdown content for the send-options menu (the three-dots left segment of the
+ * split send button).
+ *
+ * - When the input is empty, it configures which queue behavior the Enter key
+ *   and the Ctrl/Cmd+Enter key are each bound to (two sections, check marks the
+ *   current binding). Shift+Enter always inserts a native newline.
+ * - When the input has content, it becomes a one-shot trigger: each queue mode
+ *   sends the current input with that behavior immediately (play icons).
+ */
+function SendOptionsMenuContent({
+	enterQueueMode,
+	ctrlEnterQueueMode,
+	hasInput,
+	onSelectEnterMode,
+	onSelectCtrlEnterMode,
+	onSendWithMode,
+	t,
+}: {
+	enterQueueMode: QueueMode;
+	ctrlEnterQueueMode: QueueMode;
+	hasInput: boolean;
+	onSelectEnterMode: (mode: QueueMode) => void;
+	onSelectCtrlEnterMode: (mode: QueueMode) => void;
+	onSendWithMode: (mode: QueueMode) => void;
+	t: (key: string) => string;
+}) {
+	if (hasInput) {
+		return (
+			<>
+				<Menu.Label>{t("sendCurrentInputSection")}</Menu.Label>
+				{QUEUE_MODES.map((mode) => (
+					<QueueModeMenuItem
+						key={mode}
+						mode={mode}
+						selected={false}
+						action="trigger"
+						descriptionKey={`queueMode_${mode}_desc`}
+						onClick={() => onSendWithMode(mode)}
+						t={t}
+					/>
+				))}
+			</>
+		);
+	}
+	return (
+		<>
+			<Menu.Label>{t("enterKeySection")}</Menu.Label>
+			{QUEUE_MODES.map((mode) => (
+				<QueueModeMenuItem
+					key={mode}
+					mode={mode}
+					selected={enterQueueMode === mode}
+					action="configure"
+					descriptionKey={`queueMode_${mode}_desc`}
+					onClick={() => onSelectEnterMode(mode)}
+					t={t}
+				/>
+			))}
+			<Menu.Divider />
+			<Menu.Label>{t("ctrlEnterKeySection")}</Menu.Label>
+			{QUEUE_MODES.map((mode) => (
+				<QueueModeMenuItem
+					key={mode}
+					mode={mode}
+					selected={ctrlEnterQueueMode === mode}
+					action="configure"
+					descriptionKey={`queueMode_${mode}_desc`}
+					onClick={() => onSelectCtrlEnterMode(mode)}
+					t={t}
+				/>
+			))}
+			<Menu.Divider />
+			<Menu.Item disabled>{t("shiftEnterNewlineHint")}</Menu.Item>
+		</>
+	);
+}
+
+/**
+ * The three-dots send-options trigger rendered as the LEFT segment of a split
+ * button that shares its border with the primary send/queue button. Uses
+ * `Button.Group` so the two segments merge into one control (inner corners
+ * squared, outer corners rounded, single shared border).
+ */
+function SendOptionsSplitButton({
+	primaryButton,
+	enterQueueMode,
+	ctrlEnterQueueMode,
+	hasInput,
+	color,
+	variant,
+	onSelectEnterMode,
+	onSelectCtrlEnterMode,
+	onSendWithMode,
+	t,
+}: {
+	primaryButton: React.ReactNode;
+	enterQueueMode: QueueMode;
+	ctrlEnterQueueMode: QueueMode;
+	hasInput: boolean;
+	/** Match the primary button's color/variant so the two segments look unified. */
+	color?: string;
+	variant?: string;
+	onSelectEnterMode: (mode: QueueMode) => void;
+	onSelectCtrlEnterMode: (mode: QueueMode) => void;
+	onSendWithMode: (mode: QueueMode) => void;
+	t: (key: string) => string;
+}) {
+	return (
+		<Button.Group>
+			<Menu position="top-end" withinPortal>
+				<Menu.Target>
+					<Button
+						color={color}
+						variant={variant}
+						px={6}
+						aria-label={t("sendOptions")}
+						onContextMenu={(e) => e.preventDefault()}
+					>
+						<IconDotsVertical size={16} />
+					</Button>
+				</Menu.Target>
+				<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto", maxWidth: 300 }}>
+					<SendOptionsMenuContent
+						enterQueueMode={enterQueueMode}
+						ctrlEnterQueueMode={ctrlEnterQueueMode}
+						hasInput={hasInput}
+						onSelectEnterMode={onSelectEnterMode}
+						onSelectCtrlEnterMode={onSelectCtrlEnterMode}
+						onSendWithMode={onSendWithMode}
+						t={t}
+					/>
+				</Menu.Dropdown>
+			</Menu>
+			{primaryButton}
+		</Button.Group>
 	);
 }
 
@@ -4257,24 +4455,6 @@ export function NarratorPanel({
 
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
 
-	// --- Long-press send button to cut in line (priority queue) ---
-	const [sendPriorityProgress, setSendPriorityProgress] = useState(0);
-	const sendPriorityTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-	const sendPriorityFiredRef = useRef(false);
-
-	const clearSendPriorityTimer = useCallback(() => {
-		if (sendPriorityTimerRef.current) {
-			clearInterval(sendPriorityTimerRef.current);
-			sendPriorityTimerRef.current = null;
-		}
-		setSendPriorityProgress(0);
-		sendPriorityFiredRef.current = false;
-	}, []);
-	const clearSendPriorityTimerRef = useRef(clearSendPriorityTimer);
-	clearSendPriorityTimerRef.current = clearSendPriorityTimer;
-
-	useEffect(() => clearSendPriorityTimer, [clearSendPriorityTimer]);
-
 	// --- Hydration & message counting ---
 	const [hydrated, setHydrated] = useState(false);
 	useEffect(() => {
@@ -6165,7 +6345,7 @@ export function NarratorPanel({
 	};
 
 	/** Shared logic for sending a buffered message (normal or priority). */
-	const doSendBuffered = async (msg: string, priority?: boolean) => {
+	const doSendBuffered = async (msg: string, priority?: boolean): Promise<boolean> => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		clearInputAndDraft();
@@ -6182,10 +6362,11 @@ export function NarratorPanel({
 			if (result?.goalCommand && Array.isArray(result.goals)) {
 				qc.setQueryData(["narrators", narratorId, "goals"], { goals: result.goals });
 			}
-			applyBufferedSendResult(result, msg, images.length, priority);
+			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
 			scrollToLatestMessageWindow(true);
+			return buffered;
 		} catch (err) {
 			// Restore input and attachments on error
 			setInput(msg);
@@ -6195,7 +6376,18 @@ export function NarratorPanel({
 		}
 	};
 
-	const handleSend = async () => {
+	/**
+	 * Core send handler. When the narrator is active, `mode` selects the queue
+	 * behavior:
+	 *   - "turn": normal queue — wait for the current turn to finish
+	 *   - "tool": priority queue — cut in after the current tool call completes
+	 *   - "interrupt": priority queue + immediate interrupt (auto-resume consumes it)
+	 * When the narrator is idle, `mode` is ignored and the message is sent
+	 * directly (an idle session is never interrupted). `/new` while active always
+	 * uses the normal queue regardless of mode — spawning a new narrator should
+	 * not interrupt the current turn.
+	 */
+	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
 		sendingRef.current = true;
@@ -6206,6 +6398,7 @@ export function NarratorPanel({
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
 				if (isActive) {
+					// /new while active: always normal queue (never interrupt to spawn).
 					await doSendBuffered(msg);
 					return;
 				}
@@ -6254,7 +6447,20 @@ export function NarratorPanel({
 			}
 
 			if (isActive) {
-				await doSendBuffered(msg);
+				if (mode === "turn") {
+					await doSendBuffered(msg, false);
+				} else if (mode === "tool") {
+					await doSendBuffered(msg, true);
+				} else {
+					// "interrupt": insert at the front (await success), then interrupt so
+					// the loop's auto-resume immediately consumes the queued message.
+					// Only interrupt when the message was actually buffered — if the
+					// backend fell through to a direct send (narrator went idle between
+					// the status check and this request), interrupting would abort the
+					// message we just sent.
+					const buffered = await doSendBuffered(msg, true);
+					if (buffered) interruptMutation.mutate(narratorId);
+				}
 				return;
 			}
 			const images = [...attachedImages];
@@ -6278,97 +6484,16 @@ export function NarratorPanel({
 			sendingRef.current = false;
 		}
 	};
+
+	/**
+	 * Default send action for the main send/queue button click.
+	 * Follows the queue behavior bound to the Enter key (`enterQueueMode`).
+	 */
+	const handleSend = async () => {
+		await handleSendWithMode(userPrefs?.enterQueueMode ?? "turn");
+	};
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
-
-	/** Send with priority=true (cut in line at the next safe request boundary). */
-	const handleSendPriority = async () => {
-		const msg = input.trim();
-		if (!msg || sendingRef.current) return;
-		sendingRef.current = true;
-		try {
-			inputHistory.push(msg);
-			// Send with priority=true — backend inserts at the front and waits for a safe boundary.
-			await doSendBuffered(msg, true);
-		} catch (err) {
-			// On error, restore input and attachments
-			setInput(msg);
-			notifications.show({
-				title: t("sendFailed"),
-				message: err instanceof Error ? err.message : String(err),
-				color: "red",
-			});
-		} finally {
-			sendingRef.current = false;
-		}
-	};
-	const handleSendPriorityRef = useRef(handleSendPriority);
-	handleSendPriorityRef.current = handleSendPriority;
-
-	const startSendPriorityPress = useCallback((_e: React.MouseEvent) => {
-		sendPriorityFiredRef.current = false;
-		const start = Date.now();
-		const duration = 600;
-		sendPriorityTimerRef.current = setInterval(() => {
-			const elapsed = Date.now() - start;
-			const pct = Math.min(elapsed / duration, 1);
-			setSendPriorityProgress(pct);
-			if (pct >= 1 && !sendPriorityFiredRef.current) {
-				sendPriorityFiredRef.current = true;
-				if (sendPriorityTimerRef.current != null) clearInterval(sendPriorityTimerRef.current);
-				sendPriorityTimerRef.current = null;
-				handleSendPriorityRef.current();
-			}
-		}, 16);
-	}, []);
-
-	const handleSendPriorityMouseUp = useCallback(() => {
-		if (!sendPriorityFiredRef.current && sendPriorityTimerRef.current) {
-			// Short click — normal queue send
-			clearSendPriorityTimer();
-			handleSendRef.current();
-			return;
-		}
-		clearSendPriorityTimer();
-	}, [clearSendPriorityTimer]);
-	const handleSendPriorityMouseUpRef = useRef(handleSendPriorityMouseUp);
-	handleSendPriorityMouseUpRef.current = handleSendPriorityMouseUp;
-
-	const sendPriorityBtnCleanupRef = useRef<(() => void) | null>(null);
-	const sendPriorityBtnRef = useCallback((btn: HTMLButtonElement | null) => {
-		if (sendPriorityBtnCleanupRef.current) {
-			sendPriorityBtnCleanupRef.current();
-			sendPriorityBtnCleanupRef.current = null;
-		}
-		if (!btn) return;
-		const onTouchStart = (e: TouchEvent) => {
-			e.preventDefault();
-			sendPriorityFiredRef.current = false;
-			const start = Date.now();
-			const duration = 600;
-			sendPriorityTimerRef.current = setInterval(() => {
-				const elapsed = Date.now() - start;
-				const pct = Math.min(elapsed / duration, 1);
-				setSendPriorityProgress(pct);
-				if (pct >= 1 && !sendPriorityFiredRef.current) {
-					sendPriorityFiredRef.current = true;
-					if (sendPriorityTimerRef.current != null) clearInterval(sendPriorityTimerRef.current);
-					sendPriorityTimerRef.current = null;
-					handleSendPriorityRef.current();
-				}
-			}, 16);
-		};
-		const onTouchEnd = () => handleSendPriorityMouseUpRef.current();
-		const onTouchCancel = () => clearSendPriorityTimerRef.current();
-		btn.addEventListener("touchstart", onTouchStart, { passive: false });
-		btn.addEventListener("touchend", onTouchEnd);
-		btn.addEventListener("touchcancel", onTouchCancel);
-		sendPriorityBtnCleanupRef.current = () => {
-			btn.removeEventListener("touchstart", onTouchStart);
-			btn.removeEventListener("touchend", onTouchEnd);
-			btn.removeEventListener("touchcancel", onTouchCancel);
-		};
-	}, []);
 
 	const handleRetry = async () => {
 		if (!canRetryLastUserMessage) return;
@@ -6676,8 +6801,6 @@ export function NarratorPanel({
 		// capture-phase listener; guard here so navigation keys don't double-handle.
 		if (mentionPopoverVisible && e.key !== "Enter") return;
 
-		const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
-
 		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 			// Permission shortcut: when input is empty and a permission is pending,
 			// the global keydown handler (useEffect above) handles Enter.
@@ -6687,30 +6810,16 @@ export function NarratorPanel({
 				return; // action handled by global handler
 			}
 
-			if (ctrlEnterMode) {
-				// Ctrl+Enter mode: Ctrl/Cmd+Enter sends, plain Enter inserts newline
-				if (e.ctrlKey || e.metaKey) {
+			// Enter and Ctrl/Cmd+Enter each send with their own configured queue
+			// behavior. Shift+Enter is left to the browser for a native newline.
+			if (e.ctrlKey || e.metaKey) {
+				if (!e.shiftKey) {
 					e.preventDefault();
-					handleSend();
+					void handleSendWithMode(userPrefs?.ctrlEnterQueueMode ?? "tool");
 				}
-			} else {
-				// Enter mode (default): Enter sends, Shift/Ctrl/Cmd+Enter inserts newline
-				if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-					e.preventDefault();
-					handleSend();
-				} else if (e.ctrlKey || e.metaKey) {
-					// Ctrl/Cmd+Enter: browsers don't insert a newline by default, do it manually
-					e.preventDefault();
-					const textarea = e.currentTarget as HTMLTextAreaElement;
-					const { selectionStart, selectionEnd } = textarea;
-					const before = input.slice(0, selectionStart);
-					const after = input.slice(selectionEnd);
-					const newValue = `${before}\n${after}`;
-					setInput(newValue);
-					requestAnimationFrame(() => {
-						textarea.selectionStart = textarea.selectionEnd = selectionStart + 1;
-					});
-				}
+			} else if (!e.shiftKey) {
+				e.preventDefault();
+				void handleSendWithMode(userPrefs?.enterQueueMode ?? "turn");
 			}
 			return;
 		}
@@ -9139,8 +9248,38 @@ export function NarratorPanel({
 											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
 										const showContinue =
 											!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
+
+										// Wrap a primary button as the right segment of the split
+										// send-options control (three-dots menu on the left). Used for
+										// every send-flow state so the queue-behavior menu is always
+										// reachable. Not used for the modal edit-submit sub-state.
+										const withSendOptions = (
+											primaryButton: React.ReactNode,
+											opts?: { color?: string; variant?: string },
+										) => (
+											<SendOptionsSplitButton
+												enterQueueMode={userPrefs?.enterQueueMode ?? "turn"}
+												ctrlEnterQueueMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
+												hasInput={hasInput || hasAttachments}
+												color={opts?.color}
+												variant={opts?.variant}
+												onSelectEnterMode={(mode) =>
+													updateUserPrefs.mutate({ enterQueueMode: mode })
+												}
+												onSelectCtrlEnterMode={(mode) =>
+													updateUserPrefs.mutate({ ctrlEnterQueueMode: mode })
+												}
+												onSendWithMode={(mode) => {
+													void handleSendWithMode(mode);
+												}}
+												t={t}
+												primaryButton={primaryButton}
+											/>
+										);
+
 										// When a message is being edited, the send/retry button
-										// should trigger the edit submit instead.
+										// should trigger the edit submit instead. No send options here —
+										// queue behaviors don't apply to editing a message.
 										if (editingMessageState && !showInterrupt) {
 											return (
 												<Button
@@ -9153,7 +9292,7 @@ export function NarratorPanel({
 											);
 										}
 										if (showInterrupt) {
-											return (
+											return withSendOptions(
 												<Button
 													key="interrupt"
 													ref={interruptBtnRef}
@@ -9187,72 +9326,51 @@ export function NarratorPanel({
 													<span style={{ position: "relative" }}>
 														{hasCutInMessage ? t("interruptCutInLine") : t("interrupt")}
 													</span>
-												</Button>
+												</Button>,
+												{ color: "red", variant: "light" },
 											);
 										}
 										if (showRetry) {
-											return (
+											return withSendOptions(
 												<Button key="retry" onClick={handleRetry}>
 													{t("retry")}
-												</Button>
+												</Button>,
 											);
 										}
 										if (showContinue) {
-											return (
+											return withSendOptions(
 												<Button key="continue" onClick={handleContinue}>
 													{t("continue")}
-												</Button>
+												</Button>,
 											);
 										}
-										return isActive ? (
-											<Tooltip label={t("queueHoldToCutInLine")} position="top">
-												<Button
-													key="send-priority"
-													ref={sendPriorityBtnRef}
-													disabled={!hasInput && !hasAttachments}
-													onMouseDown={(e) => {
-														if (!hasInput && !hasAttachments) return;
-														startSendPriorityPress(e);
-													}}
-													onMouseUp={handleSendPriorityMouseUp}
-													onMouseLeave={clearSendPriorityTimer}
-													onContextMenu={(e) => e.preventDefault()}
-													style={{
-														position: "relative",
-														overflow: "hidden",
-														userSelect: "none",
-														touchAction: "none",
-													}}
-												>
-													{sendPriorityProgress > 0 && sendPriorityProgress < 1 && (
-														<div
-															style={{
-																position: "absolute",
-																inset: 0,
-																background: "var(--mantine-color-indigo-filled)",
-																opacity: 0.25,
-																transformOrigin: "left",
-																transform: `scaleX(${sendPriorityProgress})`,
-																pointerEvents: "none",
-															}}
-														/>
-													)}
-													<span style={{ position: "relative" }}>
-														{queuedMessages.length > 0
-															? `${t("queue")} (${queuedMessages.length})`
-															: t("queue")}
-													</span>
-												</Button>
-											</Tooltip>
-										) : (
-											<Button
-												key="send"
-												onClick={handleSend}
-												disabled={!hasInput && !hasAttachments}
-											>
-												{tc("send")}
-											</Button>
-										);
+										return isActive
+											? withSendOptions(
+													<Tooltip
+														label={t(`queueMode_${userPrefs?.enterQueueMode ?? "turn"}`)}
+														position="top"
+													>
+														<Button
+															key="send-priority"
+															disabled={!hasInput && !hasAttachments}
+															onClick={handleSend}
+															onContextMenu={(e) => e.preventDefault()}
+														>
+															{queuedMessages.length > 0
+																? `${t("queue")} (${queuedMessages.length})`
+																: t("queue")}
+														</Button>
+													</Tooltip>,
+												)
+											: withSendOptions(
+													<Button
+														key="send"
+														onClick={handleSend}
+														disabled={!hasInput && !hasAttachments}
+													>
+														{tc("send")}
+													</Button>,
+												);
 									};
 
 									// Takeover mode: the user operates the subagent like an

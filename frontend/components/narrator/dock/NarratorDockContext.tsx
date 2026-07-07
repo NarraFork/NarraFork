@@ -33,6 +33,7 @@ import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import { resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
 	NARRATOR_DOCK_COMPONENT,
@@ -64,6 +65,14 @@ export interface NarratorDockContextValue {
 	 * threaded through context rather than params.
 	 */
 	onForkFromMessage: ((messageUuid: string) => void) | null;
+
+	/**
+	 * Message id to scroll to + highlight on open (from search-result / deep-link
+	 * navigation, e.g. `/narrators/$id#msg-<id>`). Consumed by the chat panel and
+	 * forwarded to the message list. Threaded through context because the dock
+	 * surface sits between the route and NarratorPanel.
+	 */
+	highlightMessageId: string | undefined;
 
 	/** Live dockview api ref (bound by the surface once ready). */
 	apiRef: RefObject<DockviewApi | null>;
@@ -102,18 +111,27 @@ export interface NarratorDockContextValue {
 	toggleToolPanel: (type: NarratorToolPanelType) => void;
 }
 
-const NarratorDockContext = createContext<NarratorDockContextValue | null>(null);
+/**
+ * The raw context. Exported so alternative surfaces (e.g. the multi-narrator
+ * workspace) can supply their own per-narrator `NarratorDockContextValue`
+ * without going through `NarratorDockProvider` (which owns a single narrator's
+ * dockview api). `NarratorPanel` and the tool-panel adapters read this via
+ * `useNarratorDockContext()`.
+ */
+export const NarratorDockContext = createContext<NarratorDockContextValue | null>(null);
 
 /** Provider that owns the shared state for one narrator dockview surface. */
 export function NarratorDockProvider({
 	narratorId,
 	chapterId,
 	onForkFromMessage = null,
+	highlightMessageId,
 	children,
 }: {
 	narratorId: string;
 	chapterId?: string | null;
 	onForkFromMessage?: ((messageUuid: string) => void) | null;
+	highlightMessageId?: string;
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
@@ -158,12 +176,58 @@ export function NarratorDockProvider({
 				existing.api.setActive();
 				return;
 			}
+
+			// A cluster keeps its chat panel as the protagonist and stacks every
+			// resource panel (spec/terminal/browser/…) as tabs in ONE secondary
+			// group beside it. Find that secondary group by locating any already-
+			// open tool panel (panelType !== "chat").
+			const existingTool = api.panels.find((p) => {
+				const params = p.params as NarratorDockPanelParams | undefined;
+				return params && params.panelType !== "chat";
+			});
 			const chatPanel = api.getPanel(dockPanelId("chat"));
+
+			const params: NarratorDockPanelParams = {
+				panelType: type,
+				narratorId,
+				chapterId: chapterIdRef.current,
+			};
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingTool?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
+
+			if (placement.mode === "within-secondary" && existingTool?.group) {
+				// Subsequent tool panels: add as a tab within the existing secondary
+				// group (omitting direction defaults to "within").
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT[type],
+					params,
+					position: { referenceGroup: existingTool.group },
+				});
+				return;
+			}
+
+			if (placement.mode === "split-right" && chatPanel) {
+				// First tool panel: open a new secondary group to the right of chat,
+				// sized to ~1/3 of the surface so main:secondary ≈ 2:1.
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT[type],
+					params,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+				return;
+			}
+
+			// Defensive fallback (no chat panel present).
 			api.addPanel<NarratorDockPanelParams>({
 				id,
 				component: NARRATOR_DOCK_COMPONENT[type],
-				params: { panelType: type, narratorId, chapterId: chapterIdRef.current },
-				position: chatPanel ? { referencePanel: chatPanel.id, direction: "right" } : undefined,
+				params,
 			});
 		},
 		[narratorId],
@@ -186,6 +250,7 @@ export function NarratorDockProvider({
 			narratorId,
 			chapterId,
 			onForkFromMessage,
+			highlightMessageId,
 			apiRef,
 			fileModProps,
 			setFileModProps,
@@ -221,6 +286,7 @@ export function NarratorDockProvider({
 		narratorId,
 		chapterId,
 		onForkFromMessage,
+		highlightMessageId,
 		fileModProps,
 		detailsProps,
 		browserInfo,

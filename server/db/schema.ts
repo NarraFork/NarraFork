@@ -779,10 +779,19 @@ export const userPreferences = sqliteTable("user_preferences", {
 	commands: text("commands").notNull().default("[]"),
 	// Graph viewport positions per project (JSON: { [projectId]: { x, y, zoom } })
 	graphViewports: text("graph_viewports").notNull().default("{}"),
-	// Send mode: "enter" = Enter sends, "ctrl+enter" = Ctrl+Enter sends
-	sendMode: text("send_mode", { enum: ["enter", "ctrl+enter"] })
+	// Queue behavior bound to the Enter key (and the send button click).
+	// "turn" = wait for the current turn to finish (normal queue),
+	// "tool" = cut in after the current tool call completes (priority soft-stop),
+	// "interrupt" = interrupt immediately and insert (priority + interrupt).
+	// NOTE: the DB column is still named `queue_mode` (repurposed from the old
+	// default-queue-behavior preference) to avoid a rename migration.
+	enterQueueMode: text("queue_mode", { enum: ["turn", "tool", "interrupt"] })
 		.notNull()
-		.default("enter"),
+		.default("turn"),
+	// Queue behavior bound to the Ctrl/Cmd+Enter key (same three modes as above).
+	ctrlEnterQueueMode: text("ctrl_enter_queue_mode", { enum: ["turn", "tool", "interrupt"] })
+		.notNull()
+		.default("tool"),
 	// Setup wizard
 	setupWizardCompleted: integer("setup_wizard_completed", { mode: "boolean" })
 		.notNull()
@@ -1674,6 +1683,43 @@ export const knowledgeRevisions = sqliteTable(
 	(table) => [
 		uniqueIndex("idx_kr_entry_version").on(table.entryId, table.version),
 		index("idx_kr_entry").on(table.entryId),
+	],
+);
+
+// === knowledge_injection_events ===
+// Persistent ledger for passive knowledge hints injected into narrator context. The unique
+// key enforces compact-cycle de-dup across process restarts; compact_seq is the latest compact
+// marker seq at injection time, or -1 before the first compact.
+export const knowledgeInjectionEvents = sqliteTable(
+	"knowledge_injection_events",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		compactSeq: integer("compact_seq").notNull(),
+		entryId: text("entry_id")
+			.notNull()
+			.references(() => knowledgeEntries.id, { onDelete: "cascade" }),
+		entryRevisionId: text("entry_revision_id").references(() => knowledgeRevisions.id, {
+			onDelete: "set null",
+		}),
+		source: text("source", {
+			enum: ["user_message", "tool_output", "system_continuation"],
+		}).notNull(),
+		triggerMessageId: text("trigger_message_id").references(() => narratorMessages.id, {
+			onDelete: "set null",
+		}),
+		triggerToolCallId: text("trigger_tool_call_id").references(() => narratorToolCalls.id, {
+			onDelete: "set null",
+		}),
+		summary: text("summary"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_kie_cycle_entry").on(table.narratorId, table.compactSeq, table.entryId),
+		index("idx_kie_narrator_cycle").on(table.narratorId, table.compactSeq),
+		index("idx_kie_entry").on(table.entryId),
 	],
 );
 

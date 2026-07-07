@@ -64,12 +64,43 @@ function hasErrorMessage(errorMessage: string | null | undefined): boolean {
 	return typeof errorMessage === "string" && errorMessage.trim().length > 0;
 }
 
-function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
+export function shouldPersistRawDump(options: ApiRequestFinishOptions): boolean {
 	if (options.rawDump == null) return false;
-	// Leak detection forces persistence ahead of the errors-only gate.
+	// Leak detection forces persistence ahead of every gate: the raw SSE must stay
+	// downloadable so leaked-XML-tool diagnostics remain actionable. These dumps are
+	// already bounded by the collector's *WithLimit helpers.
 	if (options.forceDumpPersist) return true;
+	// Master switch — never silently persist dumps unless an admin explicitly enabled
+	// them. The collector may still be created for leak diagnostics (see loop.ts), but a
+	// SUCCESSFUL request must not write a multi-MB dump when dumping is off. Aligns with
+	// the Go backend's api_request_end contract (requestDumpEnabled honored).
+	if (!settings.agent.requestDumpEnabled) return false;
 	if (!settings.agent.requestDumpErrorsOnly) return true;
 	return hasErrorMessage(options.errorMessage);
+}
+
+/**
+ * Serialize a raw dump for storage, enforcing the `requestDumpMaxSize` byte ceiling.
+ *
+ * Leak-detection dumps ({@link ApiRequestFinishOptions.forceDumpPersist}) are exempt from
+ * the cap because they're already bounded by the collector and their raw content is the
+ * whole point. For everything else, an oversized dump is replaced with valid truncation
+ * metadata rather than storing partial (invalid) JSON — matching the Go parity contract.
+ */
+export function serializeRawDump(options: ApiRequestFinishOptions): string | null {
+	const json = JSON.stringify(options.rawDump);
+	if (json == null) return null;
+	if (options.forceDumpPersist) return json;
+	const maxSize = settings.agent.requestDumpMaxSize;
+	if (maxSize >= 0 && json.length > maxSize) {
+		return JSON.stringify({
+			truncated: true,
+			originalBytes: json.length,
+			maxBytes: maxSize,
+			note: "Raw dump exceeded agent.requestDumpMaxSize and was dropped.",
+		});
+	}
+	return json;
 }
 
 export async function finishApiRequest(
@@ -78,7 +109,7 @@ export async function finishApiRequest(
 ): Promise<string> {
 	const usage = options.usage ?? null;
 	const cost = usage ? calculateCost(usage, handle.provider, handle.model) : null;
-	const rawDump = shouldPersistRawDump(options) ? JSON.stringify(options.rawDump) : null;
+	const rawDump = shouldPersistRawDump(options) ? serializeRawDump(options) : null;
 
 	await db.insert(apiRequests).values({
 		id: handle.id,

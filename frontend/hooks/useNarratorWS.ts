@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BufferMessageSummary, NarratorGoal, SideCarRecord, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,
+	type NarratorSubscriptionKind,
 	narratorWSManager,
 	type SubscriptionHandle,
 } from "../lib/narrator-ws-manager";
@@ -380,12 +381,13 @@ export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
 	lastMessageId?: string,
-	options?: { trackRealtimeMessageVersion?: boolean },
+	options?: { trackRealtimeMessageVersion?: boolean; kind?: NarratorSubscriptionKind },
 ) {
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
 	const trackRealtimeMessageVersionRef = useRef(options?.trackRealtimeMessageVersion ?? true);
 	trackRealtimeMessageVersionRef.current = options?.trackRealtimeMessageVersion ?? true;
+	const subscriptionKind = options?.kind ?? "messages";
 	const providedLastMessageIdRef = useRef(lastMessageId);
 	const lastMessageIdRef = useRef(lastMessageId);
 	useEffect(() => {
@@ -406,12 +408,9 @@ export function useNarratorWS(
 
 		const subscribedId = narratorId;
 
-		// Subscribe to this narrator (fullSubscribe ensures the server always
-		// sends back the streaming snapshot even when a list-level subscriber
-		// already holds a ref-count for this narrator ID).
 		const subHandle: SubscriptionHandle = narratorWSManager.subscribe([subscribedId], {
 			lastMessageId: lastMessageIdRef.current || undefined,
-			fullSubscribe: true,
+			kind: subscriptionKind,
 		});
 
 		// Join presence
@@ -419,7 +418,7 @@ export function useNarratorWS(
 
 		// Register message listener
 		const listenerHandle: ListenerHandle = narratorWSManager.addListener(
-			{ narratorIds: [subscribedId] },
+			{ narratorIds: [subscribedId], subscriptionId: subHandle._id },
 			(data) => {
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
@@ -1075,7 +1074,7 @@ export function useNarratorWS(
 			narratorWSManager.leavePresence(subscribedId, subHandle._id);
 			narratorWSManager.unsubscribe(subHandle);
 		};
-	}, [narratorId]);
+	}, [narratorId, subscriptionKind]);
 
 	const sendPermissionDecision = useCallback(
 		(
@@ -1200,7 +1199,7 @@ export function useNarratorsListWS(
 
 		// First mount or IDs changed — manage subscription
 		if (!subHandleRef.current) {
-			subHandleRef.current = narratorWSManager.subscribe(narratorIds);
+			subHandleRef.current = narratorWSManager.subscribe(narratorIds, { kind: "list" });
 		} else {
 			narratorWSManager.updateSubscription(subHandleRef.current, narratorIds);
 		}

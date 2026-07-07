@@ -4,6 +4,7 @@ export interface SpecFileMeta {
 	path: string;
 	uri: string;
 	readonly: boolean;
+	uiEditable: boolean;
 	builtin: boolean;
 	revisionId: string | null;
 }

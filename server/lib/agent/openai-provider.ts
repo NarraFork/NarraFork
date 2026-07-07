@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { logger } from "../logger";
+import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
@@ -489,12 +490,16 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Proxy-aware fetch. When a proxy is configured, injects it into the request.
+	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL so
+	 * all OpenAI-compatible providers (regular, Codex HTTP, NUG sub-providers)
+	 * uniformly follow the global proxy policy, with loopback/NO_PROXY exemptions.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-		if (this.proxy) {
+		const target = input instanceof Request ? input.url : input;
+		const proxy = resolveProxyForUrl(target);
+		if (proxy) {
 			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
-			return fetch(input, { ...init, proxy: this.proxy } as any);
+			return fetch(input, { ...init, proxy } as any);
 		}
 		return fetch(input, init);
 	}

@@ -597,6 +597,81 @@ export function upsertStreamingImageGenerationBlock(
 	replaceOrInsertStreamingBlock(blocks, idx, next);
 }
 
+/** Locate an existing streaming block matching a snapshot block's identity. */
+function findMatchingStreamingBlockIndex(
+	blocks: StreamingBlock[],
+	incoming: StreamingBlock,
+): number {
+	if (incoming.type === "web_search" || incoming.type === "image_generation") {
+		return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
+	}
+	if (incoming.type === "reasoning") {
+		const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
+		return blocks.findIndex((b) => {
+			if (b.type !== "reasoning") return false;
+			if (incoming.id) return b.id === incoming.id;
+			if (incomingOutputIndex != null)
+				return getStreamingBlockOutputIndex(b) === incomingOutputIndex;
+			return !b.id && getStreamingBlockOutputIndex(b) == null;
+		});
+	}
+	// text — prefer the provider output index, but legacy/providers without one
+	// still keep a single live text block that must merge with a reconnect snapshot
+	// instead of being inserted again and rendered twice.
+	const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
+	return blocks.findIndex((b) => {
+		if (b.type !== "text") return false;
+		const existingOutputIndex = getStreamingBlockOutputIndex(b);
+		if (incomingOutputIndex != null) return existingOutputIndex === incomingOutputIndex;
+		return existingOutputIndex == null;
+	});
+}
+
+/**
+ * Merge a server streaming snapshot into the live streaming blocks in place.
+ *
+ * A snapshot can arrive slightly after a realtime delta on the same subscription
+ * (e.g. right after reconnect / a second message-layer subscriber mounts). Blindly
+ * replacing the live blocks would let the UI regress to a shorter/older value, so
+ * this fills gaps and refreshes web_search / image_generation state while keeping
+ * whichever text/reasoning is already longer. Returns true when anything changed.
+ */
+export function mergeStreamingSnapshotBlocks(
+	blocks: StreamingBlock[],
+	snapshotBlocks: StreamingBlock[],
+): boolean {
+	let changed = false;
+	for (const incoming of snapshotBlocks) {
+		const idx = findMatchingStreamingBlockIndex(blocks, incoming);
+		if (idx === -1) {
+			blocks.splice(findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)), 0, {
+				...incoming,
+			});
+			changed = true;
+			continue;
+		}
+		const existing = blocks[idx];
+		if (
+			(existing.type === "text" && incoming.type === "text") ||
+			(existing.type === "reasoning" && incoming.type === "reasoning")
+		) {
+			// Keep whichever text is longer so a late snapshot cannot truncate live text.
+			if (incoming.text.length > existing.text.length) {
+				existing.text = incoming.text;
+				if (incoming.type === "reasoning" && existing.type === "reasoning" && incoming.id) {
+					existing.id = incoming.id;
+				}
+				changed = true;
+			}
+		} else {
+			// web_search / image_generation: adopt the fresher snapshot status/fields.
+			blocks[idx] = { ...existing, ...incoming };
+			changed = true;
+		}
+	}
+	return changed;
+}
+
 export function buildStreamingMsg(opts: {
 	streamingBlocks?: StreamingBlock[] | null;
 	toolChunksMsg?: NarratorMsg | null;

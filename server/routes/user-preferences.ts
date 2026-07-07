@@ -54,8 +54,10 @@ const DEFAULTS = {
 	notifyFeishuEnabled: false,
 	notifyFeishuWebhook: "",
 	notifyFeishuSecret: "",
-	// Slash commands
-	sendMode: "enter" as const,
+	// Queue behavior bound to the Enter key / send button
+	enterQueueMode: "turn" as const,
+	// Queue behavior bound to the Ctrl/Cmd+Enter key
+	ctrlEnterQueueMode: "tool" as const,
 	// Gateway
 	gatewayConfig: "{}",
 };
@@ -338,9 +340,9 @@ userPreferencesRoutes.patch("/", async (c) => {
 			notify_sound_enabled, notify_sound_type, notify_sound_builtin, notify_sound_file_id,
 			notify_dingtalk_enabled, notify_dingtalk_webhook, notify_dingtalk_secret,
 			notify_feishu_enabled, notify_feishu_webhook, notify_feishu_secret,
-			commands, send_mode, setup_wizard_completed, gateway_config,
+			commands, queue_mode, ctrl_enter_queue_mode, setup_wizard_completed, gateway_config,
 			created_at, updated_at
-		) VALUES (${Array(33).fill("?").join(", ")})
+		) VALUES (${Array(34).fill("?").join(", ")})
 		 ON CONFLICT (user_id) DO UPDATE SET
 		   auto_load_older_messages = COALESCE(?, auto_load_older_messages),
 		   fast_mode_default = COALESCE(?, fast_mode_default),
@@ -368,7 +370,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   notify_feishu_webhook = COALESCE(?, notify_feishu_webhook),
 		   notify_feishu_secret = COALESCE(?, notify_feishu_secret),
 		   commands = COALESCE(?, commands),
-		   send_mode = COALESCE(?, send_mode),
+		   queue_mode = COALESCE(?, queue_mode),
+		   ctrl_enter_queue_mode = COALESCE(?, ctrl_enter_queue_mode),
 		   setup_wizard_completed = COALESCE(?, setup_wizard_completed),
 		   gateway_config = COALESCE(?, gateway_config),
 		   updated_at = ?`,
@@ -402,7 +405,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook ?? DEFAULTS.notifyFeishuWebhook,
 			feishuSecret ?? DEFAULTS.notifyFeishuSecret,
 			commandsJson ?? "[]",
-			d.sendMode ?? DEFAULTS.sendMode,
+			d.enterQueueMode ?? DEFAULTS.enterQueueMode,
+			d.ctrlEnterQueueMode ?? DEFAULTS.ctrlEnterQueueMode,
 			d.setupWizardCompleted ? 1 : 0,
 			gatewayConfigJson ?? DEFAULTS.gatewayConfig,
 			now,
@@ -434,7 +438,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 			feishuWebhook,
 			feishuSecret,
 			commandsJson,
-			d.sendMode ?? null,
+			d.enterQueueMode ?? null,
+			d.ctrlEnterQueueMode ?? null,
 			d.setupWizardCompleted != null ? (d.setupWizardCompleted ? 1 : 0) : null,
 			gatewayConfigJson,
 			now,

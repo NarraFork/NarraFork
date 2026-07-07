@@ -23,6 +23,8 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		narratorIds: z.array(z.string().min(1)),
 		lastMessageId: z.string().min(1).optional(),
 		catchUpCursor: catchUpCursorSchema.optional(),
+		kind: z.enum(["list", "panel", "messages"]).optional(),
+		requestId: z.string().min(1).optional(),
 	}),
 	z.object({
 		type: z.literal("unsubscribe"),
@@ -79,6 +81,8 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 		version: z.number().int().min(0),
 		lastMessageId: z.string().min(1).optional(),
 		catchUpCursor: catchUpCursorSchema.optional(),
+		kind: z.enum(["messages"]).optional(),
+		requestId: z.string().min(1).optional(),
 	}),
 	z.object({
 		type: z.literal("update_timeout"),

@@ -175,6 +175,16 @@ export interface AgentSideCar {
 	content: string;
 	orderIndex?: number;
 	toolUseId?: string | null;
+	knowledgeInjection?: {
+		narratorId: string;
+		compactSeq: number;
+		triggerToolCallId?: string | null;
+		hits: Array<{
+			entryId: string;
+			entryRevisionId?: string | null;
+			summary?: string | null;
+		}>;
+	};
 }
 
 export interface AgentSideCarRequest {
@@ -523,6 +533,8 @@ export interface AgentConfig {
 	 * to a fresh per-call set (legacy behaviour for standalone/test callers).
 	 */
 	knowledgeInjectedEntryIds?: Set<string>;
+	/** Compact cycle seq used when persisting knowledge-injection ledger events. */
+	knowledgeInjectionCompactSeq?: number;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */

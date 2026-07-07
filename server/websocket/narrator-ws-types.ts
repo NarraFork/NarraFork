@@ -84,6 +84,25 @@ export type NarratorServerMessage =
 			nextSteps?: string;
 	  }
 	| {
+			type: "task_reflection_started";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson: unknown;
+			mutations: unknown;
+			reason?: string;
+	  }
+	| {
+			type: "task_reflection_resolved";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			decision: "allow" | "deny" | "aborted";
+			reason?: string;
+			nextSteps?: string;
+	  }
+	| {
 			type: "question_reflection_started";
 			narratorId: string;
 			requestId: string;

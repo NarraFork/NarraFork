@@ -21,6 +21,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { createRouter, RouterProvider } from "@tanstack/react-router";
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { cleanupStaleNarratorDockLayouts } from "./components/narrator/dock/narrator-dock-layout";
 import { getInitialNamespaces, initI18n } from "./lib/i18n";
 import { queryClient } from "./lib/query-client";
 import { Z } from "./lib/z-index";
@@ -55,6 +56,9 @@ declare module "@tanstack/react-router" {
 }
 
 async function bootstrap() {
+	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
+	cleanupStaleNarratorDockLayouts();
+
 	await initI18n(getInitialNamespaces(window.location.pathname));
 
 	// biome-ignore lint/style/noNonNullAssertion: root element always exists

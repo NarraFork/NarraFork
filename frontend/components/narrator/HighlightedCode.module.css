@@ -14,8 +14,10 @@
 		word-break: break-word;
 		overflow-wrap: break-word;
 		tab-size: 4;
-		/* Override shiki's inline background-color on <pre> */
-		background: transparent;
+		/* Shiki emits an inline background-color on <pre>; overriding it requires
+		   !important so the block's own .root background shows through. */
+		/* biome-ignore lint/complexity/noImportantStyles: shiki emits inline styles */
+		background: transparent !important;
 
 		code {
 			font-family: inherit;
@@ -27,4 +29,10 @@
 			}
 		}
 	}
+}
+
+/* Light mode: --mantine-color-body is white and blends into the message
+   background, so the code block loses its visible boundary. Use a subtle gray. */
+:root[data-mantine-color-scheme="light"] .root {
+	background-color: var(--mantine-color-gray-1);
 }

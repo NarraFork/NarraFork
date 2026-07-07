@@ -805,25 +805,45 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 
 function getBuiltinModelContextWindow(model: string): number | null {
 	const bareModel = parseModelId(model).model;
+	const candidateModels = [bareModel];
+	const channelIdx = bareModel.indexOf(":");
+	if (channelIdx > 0 && channelIdx < bareModel.length - 1) {
+		candidateModels.push(bareModel.slice(channelIdx + 1));
+	}
 
-	// Check built-in table (exact match)
-	const builtinConfig = BUILTIN_CONTEXT_WINDOWS[bareModel];
-	if (builtinConfig !== undefined) {
-		return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
+	for (const candidate of candidateModels) {
+		// Check built-in table (exact match)
+		const builtinConfig = BUILTIN_CONTEXT_WINDOWS[candidate];
+		if (builtinConfig !== undefined) {
+			return typeof builtinConfig === "number" ? builtinConfig : builtinConfig.contextLength;
+		}
 	}
 
 	// Fuzzy match
-	const normalizedBare = bareModel.toLowerCase();
 	const sortedEntries = Object.entries(BUILTIN_CONTEXT_WINDOWS).sort(
 		(a, b) => b[0].length - a[0].length,
 	);
-	for (const [pattern, config] of sortedEntries) {
-		if (normalizedBare.startsWith(pattern)) {
-			return typeof config === "number" ? config : config.contextLength;
+	for (const candidate of candidateModels) {
+		const normalizedBare = candidate.toLowerCase();
+		for (const [pattern, config] of sortedEntries) {
+			if (normalizedBare.startsWith(pattern)) {
+				return typeof config === "number" ? config : config.contextLength;
+			}
 		}
 	}
 
 	return null;
+}
+
+function getNugModelContextWindow(model: string, provider: string): number | null {
+	const config = getNugProviderConfig(provider);
+	if (!config) return null;
+	try {
+		const meta = resolveNugModelMeta(config.id, config.prefix, model);
+		return meta.contextWindow ?? getBuiltinModelContextWindow(meta.bareModel);
+	} catch {
+		return null;
+	}
 }
 
 export function getBuiltinModelContextWindows(
@@ -876,7 +896,13 @@ export function getModelContextWindow(model: string, provider: string): number |
 		return userOverrides[model];
 	}
 
-	// 1. Check provider configuration
+	// 1. Check NUG model-catalog metadata. NUG model ids often include a
+	// channel prefix (e.g. antigravity:claude-opus-4-6-thinking), so the
+	// built-in model table alone would otherwise miss them and fall back to 128k.
+	const nugContextWindow = getNugModelContextWindow(model, provider);
+	if (nugContextWindow) return nugContextWindow;
+
+	// 2. Check provider configuration
 		const oaiConfig = getOpenaiProviderConfig(provider);
 		if (oaiConfig?.defaultContextWindow) {
 			return oaiConfig.defaultContextWindow;
@@ -887,7 +913,7 @@ export function getModelContextWindow(model: string, provider: string): number |
 		}
 	}
 
-	// 2. Check built-in table and fuzzy matches
+	// 3. Check built-in table and fuzzy matches
 	return getBuiltinModelContextWindow(model) ?? 128_000;
 }
 

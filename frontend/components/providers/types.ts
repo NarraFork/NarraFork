@@ -17,7 +17,6 @@ export interface CustomApiProviderState {
 	protocol: CustomApiProtocol;
 	defaultContextWindow?: number;
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
-	proxy?: string;
 	tlsRejectUnauthorized?: boolean;
 	codexAccountId: string;
 	codexWebSocket?: boolean;
@@ -51,7 +50,6 @@ export interface AnthropicProviderState {
 	baseUrl: string;
 	defaultModel: string;
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
-	proxy?: string;
 	tlsRejectUnauthorized?: boolean;
 	officialApi?: boolean;
 	disabled?: boolean;

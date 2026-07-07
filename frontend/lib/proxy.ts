@@ -1,10 +1,11 @@
 const PROXY_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
-export type WebFetchProxyMode = "direct" | "system" | "custom";
+export type OutboundProxyMode = "system" | "direct" | "custom";
 
-export interface WebFetchProxySummary {
-	mode: WebFetchProxyMode;
+export interface OutboundProxySummary {
+	mode: OutboundProxyMode;
 	url: string;
+	/** True when the policy actively routes through a proxy (system or custom). */
 	configured: boolean;
 }
 
@@ -15,26 +16,18 @@ export function normalizeProxyUrl(value: string | null | undefined): string | un
 	return `http://${trimmed}`;
 }
 
-export function summarizeWebFetchProxyPolicy(policy: unknown): WebFetchProxySummary {
-	const proxyPolicy = isRecord(policy) ? policy.proxy : undefined;
-	if (isRecord(proxyPolicy)) {
-		const mode = normalizeWebFetchProxyMode(proxyPolicy.mode);
-		const url = typeof proxyPolicy.url === "string" ? proxyPolicy.url : "";
-		return { mode, url, configured: mode !== "direct" };
-	}
-	if (typeof proxyPolicy === "string") {
-		const mode = normalizeWebFetchProxyMode(proxyPolicy);
-		const legacyURL =
-			typeof (policy as { proxyUrl?: unknown }).proxyUrl === "string"
-				? (policy as { proxyUrl: string }).proxyUrl
-				: "";
-		return { mode, url: legacyURL, configured: mode !== "direct" };
-	}
-	return { mode: "direct", url: "", configured: false };
+function normalizeOutboundProxyMode(value: unknown): OutboundProxyMode {
+	return value === "system" || value === "custom" || value === "direct" ? value : "system";
 }
 
-function normalizeWebFetchProxyMode(value: unknown): WebFetchProxyMode {
-	return value === "system" || value === "custom" || value === "direct" ? value : "direct";
+/** Summarize the global outbound proxy policy (`settings.proxy`). */
+export function summarizeOutboundProxyPolicy(policy: unknown): OutboundProxySummary {
+	if (isRecord(policy)) {
+		const mode = normalizeOutboundProxyMode(policy.mode);
+		const url = typeof policy.url === "string" ? policy.url : "";
+		return { mode, url, configured: mode !== "direct" };
+	}
+	return { mode: "system", url: "", configured: true };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

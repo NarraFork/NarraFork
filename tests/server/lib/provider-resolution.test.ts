@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getProvider, resolveProviderAndModel } from "../../../server/lib/agent/provider";
 import { __setCodexManagerForTests, CodexManager } from "../../../server/lib/codex-manager";
+import { deleteNugCachedModels, setNugCachedModels } from "../../../server/lib/nug-model-cache";
 import {
 	expandAllowedPoolForDisplay,
 	getContextThresholds,
@@ -401,9 +402,43 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		} else {
 		}
 		__setCodexManagerForTests(undefined);
+		deleteNugCachedModels("nug-id");
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	test("NUG channel 模型优先使用模型目录中的上下文窗口", () => {
+		settings.nugProviders = [
+			{
+				id: "nug-id",
+				name: "NUG",
+				prefix: "nug",
+				apiKey: "test-key",
+				baseUrl: "https://nug.example.test",
+				defaultModel: "antigravity:claude-opus-4-6-thinking",
+			},
+		];
+		setNugCachedModels("nug-id", [
+			{
+				id: "antigravity:claude-opus-4-6-thinking",
+				model: "claude-opus-4-6-thinking",
+				channel: "antigravity",
+				contextWindow: 1_000_000,
+			},
+		]);
+
+		expect(getModelContextWindow("nug:antigravity:claude-opus-4-6-thinking", "nug")).toBe(
+			1_000_000,
+		);
+		expect(getContextThresholds("nug:antigravity:claude-opus-4-6-thinking", "nug")).toEqual({
+			pruneStart: 95,
+			compactStart: 99,
+		});
+	});
+
+	test("channel 前缀模型能回退到内置模型上下文窗口", () => {
+		expect(getModelContextWindow("antigravity:claude-opus-4-6-thinking", "nug")).toBe(1_000_000);
 	});
 
 	test("聚合值(provider/model 被拆分)解析到成员模型的上下文窗口", () => {

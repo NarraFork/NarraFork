@@ -15,7 +15,7 @@
  */
 import { beforeAll, describe, expect, test } from "bun:test";
 import { db } from "../../db";
-import { users } from "../../db/schema";
+import { narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { knowledgeBranchService } from "../knowledge-branch-service";
 import { resolveInjections, scanToolOutputForKnowledge } from "../knowledge-injection";
@@ -195,6 +195,122 @@ describe("passive injection matches author-declared keywords only", () => {
 
 		const after = await resolveInjections(userId, `looking for ${kw}`, { collectionId });
 		expect(after.some((h) => h.entryId === entry.id)).toBe(true);
+	});
+
+	test("CJK sentence matches a declared keyword appearing anywhere in the input", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `CJK ${TAG}`,
+			content: "charging diagnostics",
+			keywords: ["充电故障"],
+		});
+
+		const hits = await resolveInjections(userId, "机器人出现了充电故障怎么办", {
+			collectionId,
+		});
+		expect(hits.some((h) => h.entryId === entry.id)).toBe(true);
+	});
+
+	test("short CJK keywords are matched by dictionary scan", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Short CJK ${TAG}`,
+			content: "battery diagnostics",
+			keywords: ["电池"],
+		});
+
+		const hits = await resolveInjections(userId, "电池温度太高", { collectionId });
+		expect(hits.some((h) => h.entryId === entry.id)).toBe(true);
+	});
+
+	test("nearby CJK text does not falsely match a longer keyword", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `CJK False Positive ${TAG}`,
+			content: "charging diagnostics",
+			keywords: ["充电故障"],
+		});
+
+		const hits = await resolveInjections(userId, "这里是充电故意写错的句子", {
+			collectionId,
+		});
+		expect(hits.some((h) => h.entryId === entry.id)).toBe(false);
+	});
+
+	test("latin keywords require word boundaries", async () => {
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Latin Boundary ${TAG}`,
+			content: "cat diagnostics",
+			keywords: ["cat"],
+		});
+
+		const falseHits = await resolveInjections(userId, "please concatenate these strings", {
+			collectionId,
+		});
+		expect(falseHits.some((h) => h.entryId === entry.id)).toBe(false);
+
+		const trueHits = await resolveInjections(userId, "the cat sensor failed", { collectionId });
+		expect(trueHits.some((h) => h.entryId === entry.id)).toBe(true);
+	});
+
+	test("keyword late in a long tool output is still matched", async () => {
+		const kw = `tooltailkw${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Tool Tail ${TAG}`,
+			content: "tool output diagnostics",
+			keywords: [kw],
+		});
+		const already = new Set<string>();
+		const output = `${"noise ".repeat(300)}final marker ${kw}`;
+
+		const block = await scanToolOutputForKnowledge(userId, output, already, { collectionId });
+		expect(block).not.toBeNull();
+		expect(block).toContain(entry.id);
+	});
+});
+
+describe("persistent injection de-dup ledger", () => {
+	test("fresh in-memory sets can rebuild already-injected entries from DB", async () => {
+		const kw = `ledgerkw${TAG}`;
+		const entry = await knowledgeService.createEntry({
+			collectionId,
+			title: `Ledger ${TAG}`,
+			content: "body",
+			keywords: [kw],
+		});
+		const narratorId = generateId();
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+
+		const firstAlready = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		const first = await resolveInjections(userId, `need ${kw}`, {
+			collectionId,
+			already: firstAlready,
+		});
+		expect(first.some((h) => h.entryId === entry.id)).toBe(true);
+		knowledgeService.recordInjectionEvents({
+			narratorId,
+			compactSeq: -1,
+			source: "user_message",
+			hits: first,
+		});
+
+		const rebuiltAlready = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		expect(rebuiltAlready.has(entry.id)).toBe(true);
+		const second = await resolveInjections(userId, `need ${kw}`, {
+			collectionId,
+			already: rebuiltAlready,
+		});
+		expect(second.some((h) => h.entryId === entry.id)).toBe(false);
+
+		const nextCycleAlready = knowledgeService.listInjectedEntryIds(narratorId, 100);
+		const afterCompact = await resolveInjections(userId, `need ${kw}`, {
+			collectionId,
+			already: nextCycleAlready,
+		});
+		expect(afterCompact.some((h) => h.entryId === entry.id)).toBe(true);
 	});
 });
 

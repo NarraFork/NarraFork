@@ -1,5 +1,6 @@
 import { buildOpenRouterHeaders, getAccessToken } from "../cline-auth";
 import { logger } from "../logger";
+import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { ClineProviderConfig } from "../settings";
 import { parseModelId, settings } from "../settings";
@@ -105,6 +106,20 @@ export class ClineProvider implements ProviderAdapter {
 
 	constructor(config: ClineProviderConfig) {
 		this.config = config;
+	}
+
+	/**
+	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL
+	 * (Cline talks to external OpenRouter) with loopback/NO_PROXY exemptions.
+	 */
+	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		const target = input instanceof Request ? input.url : input;
+		const proxy = resolveProxyForUrl(target);
+		if (proxy) {
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			return fetch(input, { ...init, proxy } as any);
+		}
+		return fetch(input, init);
 	}
 
 	/**
@@ -242,7 +257,7 @@ export class ClineProvider implements ProviderAdapter {
 
 		const bodyText = JSON.stringify(body);
 		params.onRequestStart?.();
-		const response = await fetch(`${baseUrl}/chat/completions`, {
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers,
 			body: bodyText,
@@ -368,7 +383,7 @@ export class ClineProvider implements ProviderAdapter {
 
 		// Cline gateway may always return SSE even without stream:true,
 		// so we explicitly request streaming and collect the text from the SSE stream.
-		const response = await fetch(`${baseUrl}/chat/completions`, {
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({
@@ -420,7 +435,7 @@ export class ClineProvider implements ProviderAdapter {
 
 		// Cline gateway may always return SSE even without stream:true,
 		// so we explicitly request streaming and collect the text from the SSE stream.
-		const response = await fetch(`${baseUrl}/chat/completions`, {
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
 			body: JSON.stringify({

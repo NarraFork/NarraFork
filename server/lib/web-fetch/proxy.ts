@@ -1,38 +1,16 @@
-// WebFetch proxy resolution — reads settings and returns the proxy URL (or undefined).
+// WebFetch proxy resolution — delegates to the unified outbound proxy resolver.
 
-import { settings } from "../settings";
+import { getOutboundProxy, resolveProxyForUrl } from "../net/proxy";
 
 /**
- * Resolve the proxy URL for WebFetch based on the current settings.
- * - "direct" → undefined (no proxy)
- * - "system" → read HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
- * - "custom" → return the user-specified URL
- *
- * Default behaviour (when no proxy config exists) is "system".
+ * Resolve the proxy URL for WebFetch based on the global outbound proxy policy.
+ * Kept as a thin wrapper for backward compatibility with existing callers.
  */
 export function getWebFetchProxy(): string | undefined {
-	const cfg = settings.agent.webFetchPolicy?.proxy;
-	const mode = cfg?.mode ?? "system";
-
-	switch (mode) {
-		case "direct":
-			return undefined;
-		case "system":
-			return detectSystemProxy();
-		case "custom":
-			return cfg?.url || undefined;
-	}
+	return getOutboundProxy();
 }
 
-/** Detect proxy from standard environment variables (case-insensitive). */
-function detectSystemProxy(): string | undefined {
-	return (
-		process.env.HTTPS_PROXY ||
-		process.env.https_proxy ||
-		process.env.HTTP_PROXY ||
-		process.env.http_proxy ||
-		process.env.ALL_PROXY ||
-		process.env.all_proxy ||
-		undefined
-	);
+/** Resolve the proxy for a specific target URL (applies loopback/NO_PROXY exemptions). */
+export function getWebFetchProxyForUrl(target: string | URL): string | undefined {
+	return resolveProxyForUrl(target);
 }

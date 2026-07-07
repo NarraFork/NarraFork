@@ -64,3 +64,24 @@ export function isSafeForFlowtokenAnimation(text: string): boolean {
 		!RAW_HTML_TAG_PATTERN.test(text)
 	);
 }
+
+/**
+ * Relaxed safety check for the *active tail* of a split streaming message.
+ *
+ * Unlike `isSafeForFlowtokenAnimation` (which rejects ALL markdown so only plain
+ * text animates), the tail path is allowed to contain ordinary markdown
+ * (headings, bold, lists, inline code, links…): NarraFork overrides flowtoken's
+ * `code`/`pre` components with its own renderers, so flowtoken's crash-prone
+ * `react-syntax-highlighter` is never invoked. We still block two things:
+ *
+ *  1. **Raw HTML tags** — flowtoken hard-codes `rehype-raw`, which renders raw
+ *     HTML into real DOM. Animating AI-authored HTML would be a content-injection
+ *     surface, so HTML content must stay on the safe (rehype-raw-free) static path.
+ *  2. **Math** — needs remark-math/rehype-katex which flowtoken doesn't load.
+ *
+ * Fenced-code safety (incomplete ``` fences) is handled separately by the caller
+ * via `hasUnclosedFence`, so it is intentionally not checked here.
+ */
+export function isSafeForFlowtokenTail(text: string): boolean {
+	return !RAW_HTML_TAG_PATTERN.test(text) && !hasMarkdownMath(text);
+}

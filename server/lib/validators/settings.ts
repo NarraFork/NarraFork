@@ -90,8 +90,10 @@ export const updateUserPreferencesSchema = z.object({
 	notifyFeishuSecret: z.string().max(500).optional(),
 	// Slash commands
 	commands: z.array(commandSchema).max(100).optional(),
-	// Send mode
-	sendMode: z.enum(["enter", "ctrl+enter"]).optional(),
+	// Queue behavior bound to the Enter key / send button
+	enterQueueMode: z.enum(["turn", "tool", "interrupt"]).optional(),
+	// Queue behavior bound to the Ctrl/Cmd+Enter key
+	ctrlEnterQueueMode: z.enum(["turn", "tool", "interrupt"]).optional(),
 	// Setup wizard
 	setupWizardCompleted: z.boolean().optional(),
 	// Gateway configuration (per-user IM gateway settings)

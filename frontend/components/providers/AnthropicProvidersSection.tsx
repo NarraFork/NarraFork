@@ -239,25 +239,15 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 								size="xs"
 								onChange={(e) => updateProvider(p.id, "baseUrl", e.currentTarget.value)}
 							/>
-							<TextInput
-								label={t("anthropicProxy")}
-								placeholder={t("anthropicProxyPlaceholder")}
-								description={t("anthropicProxyDesc")}
-								value={p.proxy ?? ""}
+							<Switch
+								label={t("anthropicTlsRejectUnauthorized")}
+								description={t("anthropicTlsRejectUnauthorizedDesc")}
 								size="xs"
-								onChange={(e) => updateProvider(p.id, "proxy", e.currentTarget.value)}
+								checked={p.tlsRejectUnauthorized === false}
+								onChange={(e) =>
+									updateProvider(p.id, "tlsRejectUnauthorized", !e.currentTarget.checked)
+								}
 							/>
-							{p.proxy && (
-								<Switch
-									label={t("anthropicTlsRejectUnauthorized")}
-									description={t("anthropicTlsRejectUnauthorizedDesc")}
-									size="xs"
-									checked={p.tlsRejectUnauthorized === false}
-									onChange={(e) =>
-										updateProvider(p.id, "tlsRejectUnauthorized", !e.currentTarget.checked)
-									}
-								/>
-							)}
 							<Switch
 								label={t("anthropicOfficialApi")}
 								description={t("anthropicOfficialApiDesc")}

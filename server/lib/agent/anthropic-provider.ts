@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
 import { logger } from "../logger";
+import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { AnthropicProviderConfig } from "../settings";
@@ -458,7 +459,9 @@ interface AnthropicStreamEvent {
 		signature?: string;
 	};
 	usage?: AnthropicUsagePayload;
-	error?: { type?: string; message?: string };
+	error?: { type?: string; message?: string; code?: number | string };
+	/** Gateway-style top-level error code (e.g. writeSSEError emits {code, message, error}). */
+	code?: number | string;
 }
 
 // === Tool call accumulator ===
@@ -621,8 +624,6 @@ function calculateAnthropicContextPercent(
  */
 export class AnthropicProvider implements ProviderAdapter {
 	private config: AnthropicProviderConfig;
-	/** Optional proxy URL for all requests. */
-	private proxy?: string;
 	/** Whether to reject unauthorized TLS certs (default true). */
 	private tlsRejectUnauthorized: boolean;
 	/** Cached base URL after successful /v1 fallback resolution. */
@@ -632,17 +633,20 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
-		this.proxy = config.proxy;
 		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
 	}
 
 	/**
-	 * Proxy-aware fetch with optional TLS verification bypass.
+	 * Proxy-aware fetch with optional TLS verification bypass. Resolves the
+	 * global outbound proxy per target URL so every Anthropic request (streaming
+	 * and auxiliary summary/title calls alike) follows the global proxy policy.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		const target = input instanceof Request ? input.url : input;
+		const proxy = resolveProxyForUrl(target);
 		const extra: Record<string, unknown> = {};
-		if (this.proxy) {
-			extra.proxy = this.proxy;
+		if (proxy) {
+			extra.proxy = proxy;
 		}
 		if (this.tlsRejectUnauthorized === false) {
 			extra.tls = { rejectUnauthorized: false };
@@ -719,14 +723,12 @@ export class AnthropicProvider implements ProviderAdapter {
 	 * On a successful fallback the resolved base URL is cached (instance- and
 	 * process-wide) and a fix suggestion is broadcast to clients.
 	 */
-	private async fetchWithV1Fallback(
-		path: string,
-		init: RequestInit,
-		useProxy = false,
-	): Promise<Response> {
+	private async fetchWithV1Fallback(path: string, init: RequestInit): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
-		const doFetch = useProxy ? this.pfetch.bind(this) : fetch;
+		// All requests go through the proxy-aware fetch so streaming and auxiliary
+		// calls uniformly follow the global outbound proxy policy.
+		const doFetch = this.pfetch.bind(this);
 		const canFallback = !AnthropicProvider.hasV1Suffix(baseUrl);
 
 		let response: Response;
@@ -1118,16 +1120,12 @@ export class AnthropicProvider implements ProviderAdapter {
 		}
 
 		params.onRequestStart?.();
-		const response = await this.fetchWithV1Fallback(
-			reqPath,
-			{
-				method: "POST",
-				headers: reqHeaders,
-				body: bodyStr,
-				signal: params.signal,
-			},
-			true,
-		);
+		const response = await this.fetchWithV1Fallback(reqPath, {
+			method: "POST",
+			headers: reqHeaders,
+			body: bodyStr,
+			signal: params.signal,
+		});
 		const responseTextPromise = params.requestDump
 			? response
 					.clone()
@@ -1577,11 +1575,20 @@ export async function* parseAnthropicSSEStream(
 						continue;
 					}
 				}
+				const sseEventName = currentEventType;
 				currentEventType = "";
 				const gwEvt = parseGatewayDataEvent(data);
 				if (gwEvt) {
 					yield gwEvt;
 					continue;
+				}
+
+				// Some relays/gateways send an error as `event: error` whose data
+				// payload lacks a `type` field. Backfill it so extractAnthropicStreamError
+				// recognizes the error instead of dropping it (which would surface to the
+				// user as a misleading empty response). Mirrors the Responses parser.
+				if (sseEventName === "error" && typeof data.type !== "string") {
+					data.type = "error";
 				}
 
 				const event = data as unknown as AnthropicStreamEvent;
@@ -1664,6 +1671,53 @@ function isParsableJson(s: string): boolean {
 /** Accumulator for thinking block signature (keyed by content_block index). */
 type ThinkingAccumEntry = { signature: string; blockIndex: number };
 
+/**
+ * Robustly detect an error envelope in an Anthropic-protocol SSE event and, if
+ * present, extract a `{ reason, message }` for an invalidState event.
+ *
+ * The native Anthropic API sends `{ type: "error", error: { type, message } }`.
+ * But intermediaries (notably the narrafork unified gateway's writeSSEError, and
+ * other Anthropic-compatible relays) emit different shapes such as
+ * `{ code, message, error: { code, message } }` — sometimes WITHOUT a top-level
+ * `type: "error"`. The original parser only matched `type === "error"` with a
+ * nested `error.message`, so those gateway-style errors were silently dropped and
+ * surfaced to the user as a misleading "empty response". This helper recognizes
+ * all of those shapes.
+ *
+ * It reads fields off an untyped view of the event so a string `message` (error
+ * envelope) does not collide with the object `message` used by `message_start`.
+ * Normal streaming events (message_start/delta, content_block_*, ping,
+ * message_delta, …) carry neither a top-level `error` object nor a top-level
+ * `code` paired with a string `message`, so they are never misclassified.
+ */
+export function extractAnthropicStreamError(
+	event: AnthropicStreamEvent,
+): { reason: string; message: string } | null {
+	const raw = event as unknown as Record<string, unknown>;
+	const nested =
+		raw.error && typeof raw.error === "object" ? (raw.error as Record<string, unknown>) : undefined;
+	const topMessageIsString = typeof raw.message === "string";
+	const hasTopCode = raw.code != null;
+
+	const isError = raw.type === "error" || nested != null || (hasTopCode && topMessageIsString);
+	if (!isError) return null;
+
+	const nestedType = nested && nested.type != null ? nested.type : undefined;
+	const nestedCode = nested && nested.code != null ? nested.code : undefined;
+	const reasonCandidate =
+		nestedType ?? nestedCode ?? raw.code ?? (raw.type !== "error" ? raw.type : undefined);
+	const reason = reasonCandidate != null ? String(reasonCandidate) : "api_error";
+
+	const nestedMessage =
+		nested && typeof nested.message === "string" ? (nested.message as string) : undefined;
+	const message =
+		nestedMessage ??
+		(topMessageIsString ? (raw.message as string) : undefined) ??
+		"Anthropic API error";
+
+	return { reason: reason || "api_error", message };
+}
+
 export function parseAnthropicEvent(
 	event: AnthropicStreamEvent,
 	toolAccum: Map<number, ToolAccumEntry>,
@@ -1673,6 +1727,16 @@ export function parseAnthropicEvent(
 	usageAccum: AnthropicUsageAccum,
 	contextWindow?: number | null,
 ): ParsedStreamEvent[] {
+	// ── Error (checked first, before the `type` guard) ──
+	// Error envelopes may lack a top-level `type` (gateway/relay shapes), so detect
+	// them up front rather than relying on `type === "error"`. Without this, a
+	// type-less error event falls through the `if (!type) return []` guard below and
+	// is silently dropped, surfacing to the user as a misleading empty response.
+	const streamError = extractAnthropicStreamError(event);
+	if (streamError) {
+		return [{ invalidState: streamError }];
+	}
+
 	const type = event.type;
 	if (!type) return [];
 
@@ -1944,11 +2008,7 @@ export function parseAnthropicEvent(
 		return results;
 	}
 
-	// ── Error ──
-	if (type === "error") {
-		const errMsg = event.error?.message ?? "Anthropic API error";
-		return [{ invalidState: { reason: event.error?.type ?? "api_error", message: errMsg } }];
-	}
+	// Error events are handled up front by extractAnthropicStreamError above.
 
 	return [];
 }

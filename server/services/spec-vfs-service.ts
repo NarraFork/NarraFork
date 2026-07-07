@@ -36,7 +36,7 @@ Core files:
 
 - spec://index.md — overview and free-form planning notes.
 - spec://tasks.json — the minimal task queue used for task reminders and continuation.
-- spec://protected_requirements — read-only user intent and supervision principles.
+- spec://behavior_fence — behavior fence: user intent and supervision principles. Read-only to you; only the user edits it via the Spec panel. Propose changes instead of writing directly.
 - spec://HOW_TO_USE_SPEC.md — this help file.
 
 The public tasks.json format is intentionally small:
@@ -61,31 +61,50 @@ const DEFAULT_INDEX = `# Work Spec
 This is the root of the narrator's virtual Work Spec directory.
 
 - Task queue: spec://tasks.json
-- Protected requirements: spec://protected_requirements
+- Behavior fence: spec://behavior_fence
 - Usage guide: spec://HOW_TO_USE_SPEC.md
 
 Use additional spec://*.md files for design notes when the task becomes complex.
 `;
 
-const DEFAULT_PROTECTED_REQUIREMENTS = `# Protected Requirements
+const DEFAULT_BEHAVIOR_FENCE = `# Behavior Fence
 
-No protected requirements have been set for this narrator yet.
+No behavior fence has been set for this narrator yet.
 
-This file is read-only for the assistant. User- or system-provided supervision principles can be stored here in a future UI/API layer.
+This file is read-only for the assistant. Only the user can edit it via the Spec panel.
+User intent and supervision principles stored here are surfaced to the assistant as a sidecar reminder after the user saves.
 `;
 
-const BUILTIN_FILES: Record<string, { content: string; readonly: boolean }> = {
-	"HOW_TO_USE_SPEC.md": { content: HOW_TO_USE_SPEC, readonly: true },
-	protected_requirements: { content: DEFAULT_PROTECTED_REQUIREMENTS, readonly: true },
-	"index.md": { content: DEFAULT_INDEX, readonly: false },
-	[SPEC_TASKS_PATH]: { content: serializeSpecTasksDocument({ tasks: [] }), readonly: false },
+/**
+ * Built-in spec files. Two independent readonly axes:
+ * - `agentReadonly`: the assistant's Write/Edit tools cannot modify the file.
+ * - `uiEditable`: the file can be edited by the user through the Spec panel (UI route).
+ *
+ * `behavior_fence` is agent-readonly but UI-editable: it captures user intent /
+ * supervision principles that only the user may change, and edits notify the agent.
+ */
+const BUILTIN_FILES: Record<
+	string,
+	{ content: string; agentReadonly: boolean; uiEditable: boolean }
+> = {
+	"HOW_TO_USE_SPEC.md": { content: HOW_TO_USE_SPEC, agentReadonly: true, uiEditable: false },
+	behavior_fence: { content: DEFAULT_BEHAVIOR_FENCE, agentReadonly: true, uiEditable: true },
+	"index.md": { content: DEFAULT_INDEX, agentReadonly: false, uiEditable: true },
+	[SPEC_TASKS_PATH]: {
+		content: serializeSpecTasksDocument({ tasks: [] }),
+		agentReadonly: false,
+		uiEditable: true,
+	},
 };
 
 export interface SpecResolvedFile {
 	path: string;
 	uri: string;
 	content: string;
+	/** True when the assistant's Write/Edit tools cannot modify this file. */
 	readonly: boolean;
+	/** True when the user may edit this file via the Spec panel (UI route). */
+	uiEditable: boolean;
 	builtin: boolean;
 	revisionId?: string | null;
 	namespaceId: string;
@@ -96,6 +115,11 @@ export interface SpecWriteOptions {
 	sourceMessageId?: string | null;
 	createdBy?: "system" | "user" | "assistant";
 	allowProtectedTaskMutation?: boolean;
+	/**
+	 * Who is performing the write. `"agent"` (default) is subject to `agentReadonly`;
+	 * `"user"` (UI route) is subject to `uiEditable`.
+	 */
+	actor?: "agent" | "user";
 }
 
 export interface SpecCandidateAnalysis {
@@ -252,6 +276,17 @@ async function getRevision(revisionId: string | null | undefined) {
 	return db.query.specFileRevisions.findFirst({ where: eq(specFileRevisions.id, revisionId) });
 }
 
+/** Whether the assistant's Write/Edit tools are blocked for this path. */
+function isAgentReadonly(path: string): boolean {
+	return BUILTIN_FILES[path]?.agentReadonly ?? false;
+}
+
+/** Whether the user may edit this path via the Spec panel. Non-builtin files are always UI-editable. */
+function isUiEditable(path: string): boolean {
+	const builtin = BUILTIN_FILES[path];
+	return builtin ? builtin.uiEditable : true;
+}
+
 export async function readSpecFile(narratorId: string, uri: string): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
 	const namespace = await ensureNamespace(narratorId);
@@ -263,7 +298,8 @@ export async function readSpecFile(narratorId: string, uri: string): Promise<Spe
 			path,
 			uri: toSpecUri(path),
 			content: revision.content,
-			readonly: BUILTIN_FILES[path]?.readonly ?? false,
+			readonly: isAgentReadonly(path),
+			uiEditable: isUiEditable(path),
 			builtin: false,
 			revisionId: revision.id,
 			namespaceId: namespace.id,
@@ -275,7 +311,8 @@ export async function readSpecFile(narratorId: string, uri: string): Promise<Spe
 			path,
 			uri: toSpecUri(path),
 			content: builtin.content,
-			readonly: builtin.readonly,
+			readonly: builtin.agentReadonly,
+			uiEditable: builtin.uiEditable,
 			builtin: true,
 			revisionId: null,
 			namespaceId: namespace.id,
@@ -303,8 +340,17 @@ export async function writeSpecFile(
 	options: SpecWriteOptions = {},
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
-	if (BUILTIN_FILES[path]?.readonly) {
+	const actor = options.actor ?? "agent";
+	if (actor === "agent" && isAgentReadonly(path)) {
+		if (path === "behavior_fence") {
+			throw new Error(
+				`${toSpecUri(path)} is a read-only behavior fence. It captures user intent and supervision principles; only the user can edit it via the Spec panel. Propose changes to the user instead of writing directly.`,
+			);
+		}
 		throw new Error(`${toSpecUri(path)} is read-only`);
+	}
+	if (actor === "user" && !isUiEditable(path)) {
+		throw new Error(`${toSpecUri(path)} is not editable`);
 	}
 	if (content.length > MAX_SPEC_FILE_CHARS) {
 		throw new Error(`Spec file content must be at most ${MAX_SPEC_FILE_CHARS} characters`);
@@ -387,7 +433,10 @@ export async function writeSpecFile(
 
 export async function deleteSpecFile(narratorId: string, uri: string): Promise<void> {
 	const path = normalizeSpecPath(uri);
-	if (BUILTIN_FILES[path]?.readonly) throw new Error(`${toSpecUri(path)} is read-only`);
+	// Built-in files are never deletable: they would reappear in listSpecFiles,
+	// so deletion has no lasting effect and only causes confusion.
+	if (BUILTIN_FILES[path])
+		throw new Error(`${toSpecUri(path)} is a built-in file and cannot be deleted`);
 	const namespace = await ensureNamespace(narratorId);
 	const current = await getCurrentFile(namespace.id, path);
 	if (!current) return;
@@ -415,7 +464,8 @@ export async function listSpecFiles(narratorId: string): Promise<SpecResolvedFil
 			path: row.path,
 			uri: toSpecUri(row.path),
 			content: revision.content,
-			readonly: BUILTIN_FILES[row.path]?.readonly ?? false,
+			readonly: isAgentReadonly(row.path),
+			uiEditable: isUiEditable(row.path),
 			builtin: false,
 			revisionId: revision.id,
 			namespaceId: namespace.id,
@@ -427,7 +477,8 @@ export async function listSpecFiles(narratorId: string): Promise<SpecResolvedFil
 			path,
 			uri: toSpecUri(path),
 			content: builtin.content,
-			readonly: builtin.readonly,
+			readonly: builtin.agentReadonly,
+			uiEditable: builtin.uiEditable,
 			builtin: true,
 			revisionId: null,
 			namespaceId: namespace.id,

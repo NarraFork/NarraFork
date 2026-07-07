@@ -223,17 +223,43 @@ export function recoverWithCli(dbPath: string): boolean {
 }
 
 /**
+ * Refresh the query planner's statistics.
+ *
+ * `PRAGMA optimize` is cheap: it only re-runs ANALYZE on tables whose stats have gone
+ * stale since the last run (or are missing), so it's safe to call at startup and on a
+ * timer. Stale stats on large tables (e.g. narrator_messages / api_requests) can push
+ * the planner toward the wrong index; keeping them fresh avoids that without a full
+ * ANALYZE scan. `analysis_limit` bounds the work per index so a huge table can't turn
+ * this into a long main-thread stall (bun:sqlite is synchronous).
+ */
+export function optimizeDatabase(sqlite: Database): void {
+	try {
+		// Cap rows sampled per index so optimize stays fast even on multi-GB tables.
+		sqlite.run("PRAGMA analysis_limit = 1000");
+		sqlite.run("PRAGMA optimize");
+	} catch (err) {
+		logger.warn("PRAGMA optimize failed", { error: String(err) });
+	}
+}
+
+/**
  * Periodic WAL checkpoint to prevent WAL file from growing unbounded.
  */
 export function startWalCheckpointInterval(
 	sqlite: Database,
 	intervalMs = 5 * 60 * 1000,
 ): ReturnType<typeof setInterval> {
+	let ticks = 0;
 	return setInterval(() => {
 		try {
 			sqlite.run("PRAGMA wal_checkpoint(PASSIVE)");
 		} catch (err) {
 			logger.warn("Periodic WAL checkpoint failed", { error: String(err) });
+		}
+		// Refresh planner stats less often than the checkpoint (every ~6th tick, ~30 min).
+		ticks++;
+		if (ticks % 6 === 0) {
+			optimizeDatabase(sqlite);
 		}
 	}, intervalMs);
 }

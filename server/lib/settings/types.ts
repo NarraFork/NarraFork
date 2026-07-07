@@ -40,7 +40,7 @@ export interface CustomApiProviderConfig {
 	defaultContextWindow?: number;
 	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
-	/** Anthropic: optional HTTPS proxy URL for all requests to this provider. */
+	/** @deprecated Per-provider proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
 	proxy?: string;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
 	tlsRejectUnauthorized?: boolean;
@@ -119,7 +119,7 @@ export interface AnthropicProviderConfig {
 	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
-	/** Optional HTTPS proxy URL for all requests to this provider. */
+	/** @deprecated Per-provider proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
 	proxy?: string;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
 	tlsRejectUnauthorized?: boolean;
@@ -277,6 +277,25 @@ export interface TlsConfig {
 	caFile?: string;
 }
 
+/** Global outbound proxy mode shared by all outbound network channels. */
+export type OutboundProxyMode = "system" | "direct" | "custom";
+
+/**
+ * Unified outbound proxy policy applied to every outbound network channel
+ * Replaces the previous per-provider proxy fields.
+ */
+export interface OutboundProxyConfig {
+	/**
+	 * Proxy mode:
+	 * - "system": auto-detect from HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars (default)
+	 * - "direct": no proxy (direct connection)
+	 * - "custom": use the manually specified URL
+	 */
+	mode: OutboundProxyMode;
+	/** Proxy URL, only used when mode is "custom". */
+	url?: string;
+}
+
 /** A configured OpenID Connect identity provider for SSO. */
 export interface OidcProviderConfig {
 	/** Stable internal id (used as the `provider` key in user_identities). */
@@ -310,6 +329,12 @@ export interface NarraForkSettings {
 		/** Optional TLS configuration for HTTPS. */
 		tls?: TlsConfig;
 	};
+	/**
+	 * Unified outbound proxy policy applied to every outbound network channel.
+	 * Defaults to "system" (follow the OS/env proxy). Replaces the previous
+	 * agent.webFetchPolicy.proxy), which are kept only for migration.
+	 */
+	proxy?: OutboundProxyConfig;
 	paths: { defaultProjectDir: string };
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
@@ -471,16 +496,9 @@ export interface NarraForkSettings {
 			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
-			/** Proxy configuration for WebFetch HTTP requests and browser. */
+			/** @deprecated WebFetch proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
 			proxy?: {
-				/**
-				 * Proxy mode:
-				 * - "direct": no proxy
-				 * - "system": auto-detect from HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
-				 * - "custom": use the manually specified URL
-				 */
 				mode: "direct" | "system" | "custom";
-				/** Proxy URL, only used when mode is "custom". */
 				url?: string;
 			};
 		};
@@ -555,6 +573,7 @@ export interface NarraForkSettings {
 		credentialsPath: string;
 		configPath: string;
 		defaultModel?: string;
+		/** @deprecated Replaced by the global `settings.proxy` policy. Kept for migration only. */
 		proxy?: string;
 	};
 	/**
@@ -562,7 +581,7 @@ export interface NarraForkSettings {
 	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
 	 */
 	codex?: {
-		/** Default HTTPS proxy for all Codex requests (can be overridden per-credential). */
+		/** @deprecated Replaced by the global `settings.proxy` policy. Kept for migration only. */
 		proxy?: string;
 		/** Load balancing mode: priority, balanced, or tier-balanced. */
 		loadBalancingMode?: LoadBalancingMode;

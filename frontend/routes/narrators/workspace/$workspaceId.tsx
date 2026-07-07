@@ -7,14 +7,18 @@ import {
 	IconPencil,
 } from "@tabler/icons-react";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import type { DockviewApi } from "dockview-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { DockviewWorkspace } from "../../../components/narrator/workspace/DockviewWorkspace";
+import type { WebviewLeafConfig } from "../../../components/narrator/split-tree";
+import { DirectorLayout } from "../../../components/narrator/workspace/DirectorLayout";
 import {
-	applyDirectorMode,
-	exitDirectorMode,
-} from "../../../components/narrator/workspace/director";
+	type DirectorControl,
+	DockviewWorkspace,
+} from "../../../components/narrator/workspace/DockviewWorkspace";
+import {
+	DEFAULT_DIRECTOR_PRIMARY_RATIO,
+	type DirectorLeaf,
+} from "../../../components/narrator/workspace/director-constants";
 import type { WorkspaceDirectorState } from "../../../components/narrator/workspace/dockview-layout";
 import { addRecentTab, updateRecentTabLocal } from "../../../hooks/useRecentTabs";
 import { useUpdateWorkspace, useWorkspace } from "../../../hooks/useWorkspace";
@@ -55,31 +59,57 @@ function WorkspacePage() {
 		}
 	}, [editTitle, serverTitle, workspaceId]);
 
-	// ── Dockview api + director mode ──
-	const dockApiRef = useRef<DockviewApi | null>(null);
+	// ── Director mode ──
+	// DockviewWorkspace owns the dockview api + persistence; director mode is a
+	// pure overlay rendered here. We drive mutations through an imperative handle
+	// and mirror the persisted director state locally for the overlay + toolbar.
+	const directorControlRef = useRef<DirectorControl | null>(null);
 	const [directorMode, setDirectorMode] = useState(false);
-
-	const handleApiReady = useCallback((api: DockviewApi) => {
-		dockApiRef.current = api;
-	}, []);
+	const [directorLeaves, setDirectorLeaves] = useState<DirectorLeaf[]>([]);
+	const [primaryPanelId, setPrimaryPanelId] = useState<string | null>(null);
+	const [primaryRatio, setPrimaryRatio] = useState(DEFAULT_DIRECTOR_PRIMARY_RATIO);
+	// Live ratio while dragging the divider (not yet persisted).
+	const [ratioDraft, setRatioDraft] = useState<number | null>(null);
 
 	const handleDirectorStateChange = useCallback((state: WorkspaceDirectorState) => {
 		setDirectorMode(state.mode === "director");
+		setPrimaryPanelId(state.primaryPanelId);
+		setPrimaryRatio(state.primaryRatio);
+	}, []);
+
+	const handlePanelsChange = useCallback((leaves: DirectorLeaf[]) => {
+		setDirectorLeaves(leaves);
 	}, []);
 
 	const setMode = useCallback((mode: "grid" | "director") => {
-		const api = dockApiRef.current;
-		if (!api) return;
-		if (mode === "director") {
-			applyDirectorMode(api, {
-				mode: "director",
-				primaryPanelId: api.activePanel?.id ?? null,
-			});
-			setDirectorMode(true);
-		} else {
-			exitDirectorMode(api);
-			setDirectorMode(false);
-		}
+		directorControlRef.current?.setMode(mode);
+		setDirectorMode(mode === "director");
+	}, []);
+
+	const handleActivate = useCallback((panelId: string) => {
+		directorControlRef.current?.setPrimary(panelId);
+		setPrimaryPanelId(panelId);
+	}, []);
+
+	const handlePreviewRatio = useCallback((ratio: number) => {
+		setRatioDraft(ratio);
+	}, []);
+
+	const handleCommitRatio = useCallback((ratio: number) => {
+		setRatioDraft(null);
+		setPrimaryRatio(ratio);
+		directorControlRef.current?.setRatio(ratio);
+	}, []);
+
+	const handleClosePanel = useCallback((panelId: string) => {
+		directorControlRef.current?.closePanel(panelId);
+	}, []);
+
+	const handleUpdateWebviewConfig = useCallback((panelId: string, config: WebviewLeafConfig) => {
+		directorControlRef.current?.updatePanelParams(panelId, {
+			panelType: "webview",
+			webviewConfig: config,
+		});
 	}, []);
 
 	// ── Record recent tab ──
@@ -206,15 +236,28 @@ function WorkspacePage() {
 				</Group>
 			</Group>
 
-			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden" }}>
+			<Box style={{ flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", position: "relative" }}>
 				<DockviewWorkspace
 					workspaceId={workspaceId}
 					treeJson={treeJson}
 					serverUpdatedAt={serverUpdatedAt}
-					onApiReady={handleApiReady}
+					directorControlRef={directorControlRef}
 					onNarratorIdsChange={handleNarratorIdsChange}
+					onPanelsChange={handlePanelsChange}
 					onDirectorStateChange={handleDirectorStateChange}
 				/>
+				{directorMode && (
+					<DirectorLayout
+						leaves={directorLeaves}
+						primaryPanelId={primaryPanelId}
+						primaryRatio={ratioDraft ?? primaryRatio}
+						onActivate={handleActivate}
+						onPreviewRatio={handlePreviewRatio}
+						onCommitRatio={handleCommitRatio}
+						onClosePanel={handleClosePanel}
+						onUpdateWebviewConfig={handleUpdateWebviewConfig}
+					/>
+				)}
 			</Box>
 		</Box>
 	);

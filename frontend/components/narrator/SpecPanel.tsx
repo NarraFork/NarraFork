@@ -66,6 +66,13 @@ export function SpecPanel({
 	const { data: tasksData, isLoading: tasksLoading } = useSpecTasks(narratorId);
 	const updateFile = useUpdateSpecFile(narratorId);
 
+	// Look up UI-editability from the file list metadata so it is known even
+	// before the file content query resolves.
+	const selectedMeta = useMemo(
+		() => files?.find((f) => f.uri === selectedUri),
+		[files, selectedUri],
+	);
+
 	// Local editing state
 	const [editContent, setEditContent] = useState<string>("");
 	const [editTasks, setEditTasks] = useState<SpecTaskItem[]>([]);
@@ -74,7 +81,15 @@ export function SpecPanel({
 	// Bumped whenever we accept fresh server content, so the editor resets.
 	const [docRevisionKey, setDocRevisionKey] = useState<string>("");
 
-	const isReadonly = !isTasksFile && (fileData?.readonly ?? false);
+	// UI editability comes from the file metadata (available from the list even
+	// before the detail query resolves), falling back to the loaded file.
+	const uiEditable = fileData?.uiEditable ?? selectedMeta?.uiEditable ?? true;
+	// Agent-readonly: the assistant's tools can't write it (e.g. behavior_fence).
+	const isAgentReadonly = fileData?.readonly ?? selectedMeta?.readonly ?? false;
+	// Preview-only in the UI: not a task file and not UI-editable (e.g. HOW_TO_USE_SPEC.md).
+	const isPreviewOnly = !isTasksFile && !uiEditable;
+	// Show the behavior-fence hint: agent-readonly but the user may still edit it.
+	const showFenceEditHint = !isTasksFile && isAgentReadonly && uiEditable;
 
 	// Sync tasks from server (only when not dirty, to avoid clobbering local edits)
 	useEffect(() => {
@@ -119,7 +134,7 @@ export function SpecPanel({
 	);
 
 	const handleSave = useCallback(async () => {
-		if (isReadonly) return;
+		if (isPreviewOnly) return;
 		const content = isTasksFile
 			? `${JSON.stringify({ tasks: editTasks }, null, "\t")}\n`
 			: editContent;
@@ -128,6 +143,9 @@ export function SpecPanel({
 				uri: selectedUri,
 				content,
 				baseRevisionId: baseRevisionRef.current,
+				// Behavior-fence and other agent-readonly edits should always ping the
+				// agent via the sidecar so it re-aligns its plan.
+				notifyAgent: true,
 			});
 			baseRevisionRef.current = result.revisionId;
 			setDirty(false);
@@ -145,7 +163,7 @@ export function SpecPanel({
 				notifications.show({ title: t("spec.saveError"), message: msg, color: "red" });
 			}
 		}
-	}, [isReadonly, isTasksFile, editTasks, editContent, selectedUri, updateFile, t]);
+	}, [isPreviewOnly, isTasksFile, editTasks, editContent, selectedUri, updateFile, t]);
 
 	const handleReload = useCallback(() => {
 		setDirty(false);
@@ -167,7 +185,7 @@ export function SpecPanel({
 			"mod+s",
 			(e) => {
 				e.preventDefault();
-				if (dirty && !isReadonly) handleSave();
+				if (dirty && !isPreviewOnly) handleSave();
 			},
 		],
 	]);
@@ -178,7 +196,7 @@ export function SpecPanel({
 	useEffect(() => {
 		if (!chromeless || !onHeaderActionsChange) return;
 		const node =
-			dirty && !isReadonly ? (
+			dirty && !isPreviewOnly ? (
 				<>
 					<Tooltip label={t("spec.reload")}>
 						<ActionIcon size="sm" variant="subtle" color="gray" onClick={handleReload}>
@@ -204,7 +222,7 @@ export function SpecPanel({
 		chromeless,
 		onHeaderActionsChange,
 		dirty,
-		isReadonly,
+		isPreviewOnly,
 		updateFile.isPending,
 		handleSave,
 		handleReload,
@@ -237,12 +255,14 @@ export function SpecPanel({
 			},
 		];
 		for (const f of docFiles) {
+			const label =
+				f.path === "behavior_fence" ? t("spec.tabBehaviorFence") : f.path.replace(/\.md$/, "");
 			items.push({
 				value: f.uri,
 				label: (
 					<Group gap={4} wrap="nowrap">
 						{f.readonly ? <IconLock size={12} /> : <IconFileText size={13} />}
-						<span>{f.path.replace(/\.md$/, "")}</span>
+						<span>{label}</span>
 					</Group>
 				),
 			});
@@ -269,7 +289,7 @@ export function SpecPanel({
 						</Text>
 					</Group>
 					<Box style={{ flex: 1 }} />
-					{dirty && !isReadonly && (
+					{dirty && !isPreviewOnly && (
 						<>
 							<Tooltip label={t("spec.reload")}>
 								<ActionIcon size="sm" variant="subtle" color="gray" onClick={handleReload}>
@@ -314,7 +334,7 @@ export function SpecPanel({
 					<Center style={{ flex: 1 }}>
 						<Loader size="sm" />
 					</Center>
-				) : isReadonly ? (
+				) : isPreviewOnly ? (
 					<ScrollArea style={{ flex: 1 }} p="sm">
 						<MarkdownContent text={fileData?.content ?? ""} />
 					</ScrollArea>
@@ -327,19 +347,46 @@ export function SpecPanel({
 						/>
 					</ScrollArea>
 				) : (
-					<Suspense
-						fallback={
-							<Center style={{ flex: 1 }}>
-								<Loader size="sm" />
-							</Center>
-						}
-					>
-						<SpecMarkdownEditor
-							value={editContent}
-							revisionKey={docRevisionKey}
-							onChange={handleContentChange}
-						/>
-					</Suspense>
+					<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+						{showFenceEditHint && (
+							<Group
+								gap={6}
+								px="sm"
+								py={6}
+								wrap="nowrap"
+								align="flex-start"
+								style={{
+									flexShrink: 0,
+									borderBottom: "1px solid var(--mantine-color-dark-4)",
+									background: "var(--mantine-color-dark-6)",
+								}}
+							>
+								<IconLock
+									size={13}
+									color="var(--mantine-color-yellow-5)"
+									style={{ marginTop: 2 }}
+								/>
+								<Text size="xs" c="dimmed">
+									{t("spec.behaviorFenceEditHint")}
+								</Text>
+							</Group>
+						)}
+						<Box style={{ flex: 1, minHeight: 0, display: "flex" }}>
+							<Suspense
+								fallback={
+									<Center style={{ flex: 1 }}>
+										<Loader size="sm" />
+									</Center>
+								}
+							>
+								<SpecMarkdownEditor
+									value={editContent}
+									revisionKey={docRevisionKey}
+									onChange={handleContentChange}
+								/>
+							</Suspense>
+						</Box>
+					</Box>
 				)}
 			</Box>
 		</Box>

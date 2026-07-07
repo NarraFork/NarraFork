@@ -1,6 +1,7 @@
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import {
 	checkIntegrity,
+	optimizeDatabase,
 	recoverWithCli,
 	startWalCheckpointInterval,
 	tryWalRecovery,
@@ -261,6 +262,13 @@ try {
 // FTS5 virtual tables and triggers — managed outside Drizzle (which doesn't support FTS5)
 ensureFts(sqlite, { skipUncleanShutdownRebuild: isHotReload });
 dbLifecycle.initialized = true;
+
+// Refresh query-planner statistics once on a real startup (skip hot reloads — the stats
+// are process-independent and this avoids redundant work on every --hot cycle). Bounded
+// by analysis_limit so it stays fast even on large tables.
+if (!isHotReload) {
+	optimizeDatabase(sqlite);
+}
 
 // Periodic WAL checkpoint to prevent WAL file bloat and reduce corruption risk.
 // hotTimer clears the previous interval on Bun --hot reloads before creating a new one.

@@ -30,6 +30,7 @@ import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "..
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { drainPendingGroupReplyContexts } from "./chat-group-queue";
+import { knowledgeService } from "./knowledge-service";
 import {
 	enrichToolUseBlocks,
 	narratorService,
@@ -1250,6 +1251,16 @@ export async function processEvent(
 							createdAt: now,
 						})),
 					);
+					for (const sc of event.sideCars) {
+						if (!sc.knowledgeInjection) continue;
+						knowledgeService.recordInjectionEvents({
+							narratorId: sc.knowledgeInjection.narratorId,
+							compactSeq: sc.knowledgeInjection.compactSeq,
+							source: "tool_output",
+							triggerToolCallId: sc.knowledgeInjection.triggerToolCallId,
+							hits: sc.knowledgeInjection.hits,
+						});
+					}
 				} catch (err) {
 					logger.warn("Failed to persist tool-result sidecars", {
 						narratorId,

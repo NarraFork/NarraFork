@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { hooks } from "../db/schema";
+import { hooks, narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -16,6 +16,8 @@ export type AttentionReason = "waiting_permission" | "done" | "error";
 export interface HookInput {
 	hook_event_name: HookEvent;
 	narrator_id?: string;
+	/** Human-readable narrator title (resolved from the narrator record when available). */
+	narrator_title?: string;
 	chapter_id?: string;
 	project_id?: string;
 	cwd?: string;
@@ -231,6 +233,20 @@ export const hookService = {
 	): Promise<HookResult> {
 		const matchingHooks = await this.getMatchingHooks(event, projectId, toolName);
 		if (matchingHooks.length === 0) return { outcome: "success" };
+
+		// Resolve the narrator title lazily — only when hooks actually match — so
+		// the common no-hook path stays a single indexed lookup with no extra query.
+		if (input.narrator_id && input.narrator_title === undefined) {
+			try {
+				const narrator = await db.query.narrators.findFirst({
+					where: eq(narrators.id, input.narrator_id),
+					columns: { title: true },
+				});
+				if (narrator?.title) input.narrator_title = narrator.title;
+			} catch {
+				// Title is informational only — never block hook execution on lookup failure.
+			}
+		}
 
 		const isBlocking = event === "PreToolUse";
 		let lastError: HookResult | undefined;

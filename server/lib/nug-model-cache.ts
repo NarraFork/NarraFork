@@ -29,6 +29,7 @@ export interface ResolvedNugModelMeta {
 	bareModel: string;
 	name?: string;
 	available?: boolean;
+	contextWindow?: number;
 	effortLevels?: string[];
 }
 
@@ -291,6 +292,7 @@ export function resolveNugModelMeta(
 			bareModel,
 			name: hit.name,
 			available: hit.available,
+			contextWindow: hit.contextWindow ?? hit.contextLength,
 			effortLevels: hit.effortLevels,
 		};
 	}

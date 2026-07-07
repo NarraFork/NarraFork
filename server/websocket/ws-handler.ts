@@ -40,6 +40,8 @@ export function resolveWSData(
 			connectedAt: Date.now(),
 			lastPongAt: Date.now(),
 			subscribedNarrators: new Set(),
+			catchingUpNarrators: new Map(),
+			catchUpBuffers: new Map(),
 			userId: userInfo?.userId,
 			username: userInfo?.username,
 			avatarColor: userInfo?.avatarColor,

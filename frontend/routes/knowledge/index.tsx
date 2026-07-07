@@ -5,8 +5,10 @@ import {
 	Button,
 	Card,
 	Container,
+	Grid,
 	Group,
 	Modal,
+	NavLink,
 	Paper,
 	ScrollArea,
 	SegmentedControl,
@@ -17,10 +19,24 @@ import {
 	Text,
 	Textarea,
 	TextInput,
+	ThemeIcon,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconPencil, IconPlus, IconTrash } from "@tabler/icons-react";
+import {
+	IconBook2,
+	IconFileSymlink,
+	IconFileText,
+	IconFolder,
+	IconFolderOpen,
+	IconGitPullRequest,
+	IconNotebook,
+	IconPencil,
+	IconPlus,
+	IconSearch,
+	IconTrash,
+} from "@tabler/icons-react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -110,111 +126,7 @@ function BrowseTab() {
 		[collections.data],
 	);
 
-	return (
-		<Stack>
-			<Group justify="space-between" align="flex-end">
-				<Group gap="xs" align="flex-end">
-					<Select
-						label={t("collections")}
-						placeholder={t("allCollections")}
-						clearable
-						data={collectionOptions}
-						value={collectionId}
-						onChange={setCollectionId}
-						w={220}
-					/>
-					<TextInput
-						label={t("searchPlaceholder")}
-						placeholder={t("searchPlaceholder")}
-						value={q}
-						onChange={(e) => setQ(e.currentTarget.value)}
-						w={260}
-					/>
-				</Group>
-				<Group gap="xs">
-					<Button
-						size="xs"
-						variant="light"
-						leftSection={<IconPlus size={14} />}
-						onClick={colModalH.open}
-					>
-						{t("createCollection")}
-					</Button>
-					<Button
-						size="xs"
-						leftSection={<IconPlus size={14} />}
-						onClick={entryModalH.open}
-						disabled={(collections.data?.length ?? 0) === 0}
-					>
-						{t("createEntry")}
-					</Button>
-				</Group>
-			</Group>
-
-			<CollectionStrip />
-
-			{entries.isLoading ? (
-				<Text size="sm" c="dimmed">
-					{t("loading")}
-				</Text>
-			) : (entries.data?.length ?? 0) === 0 ? (
-				<Text size="sm" c="dimmed">
-					{t("noEntries")}
-				</Text>
-			) : (
-				<Stack gap="xs">
-					{(entries.data as KnowledgeSearchResult[]).map((e) => (
-						<Card
-							key={e.id}
-							withBorder
-							padding="sm"
-							style={{ cursor: "pointer" }}
-							onClick={() => navigate({ to: "/knowledge/$entryId", params: { entryId: e.id } })}
-						>
-							<Group justify="space-between" wrap="nowrap">
-								<div style={{ flex: 1, minWidth: 0 }}>
-									<Text size="sm" fw={600} truncate="end">
-										{e.title}
-									</Text>
-									{e.snippet ? (
-										<Text size="xs" c="dimmed" truncate="end">
-											{e.snippet}
-										</Text>
-									) : null}
-								</div>
-								<Group gap={4}>
-									{(e.tags ?? []).slice(0, 4).map((tag) => (
-										<Badge key={tag} size="xs" variant="light">
-											{tag}
-										</Badge>
-									))}
-								</Group>
-							</Group>
-						</Card>
-					))}
-				</Stack>
-			)}
-
-			<CreateCollectionModal opened={colModal} onClose={colModalH.close} />
-			<CreateEntryModal
-				opened={entryModal}
-				onClose={entryModalH.close}
-				collectionId={collectionId}
-				collectionOptions={collectionOptions}
-			/>
-		</Stack>
-	);
-}
-
-function CollectionStrip() {
-	const { t } = useTranslation("knowledge");
-	const collections = useKnowledgeCollections();
-	const entries = useKnowledgeEntries({});
-	const del = useDeleteKnowledgeCollection();
-	const [editing, setEditing] = useState<KnowledgeCollection | null>(null);
-	const [pendingDelete, setPendingDelete] = useState<KnowledgeCollection | null>(null);
-
-	// Count readable entries per collection (list view omits content, stays light).
+	// Count readable entries per collection
 	const countByCollection = useMemo(() => {
 		const m = new Map<string, number>();
 		for (const e of entries.data ?? []) {
@@ -223,41 +135,208 @@ function CollectionStrip() {
 		return m;
 	}, [entries.data]);
 
-	if ((collections.data?.length ?? 0) === 0) return null;
+	return (
+		<Grid gap="md">
+			{/* Left Column: Collection Navigation Sidebar */}
+			<Grid.Col span={{ base: 12, sm: 4, md: 3 }}>
+				<Paper withBorder p="sm" radius="md">
+					<Stack gap="xs">
+						<Group justify="space-between" align="center" mb={4}>
+							<Text size="xs" fw={700} c="dimmed" tt="uppercase">
+								{t("collections")}
+							</Text>
+							<Tooltip label={t("createCollection")}>
+								<ActionIcon size="sm" variant="subtle" onClick={colModalH.open}>
+									<IconPlus size={14} />
+								</ActionIcon>
+							</Tooltip>
+						</Group>
+
+						<NavLink
+							label={t("allCollections")}
+							leftSection={<IconFolderOpen size={16} />}
+							active={collectionId === null}
+							onClick={() => setCollectionId(null)}
+							variant="filled"
+							styles={{ label: { fontWeight: 500 } }}
+							rightSection={
+								<Badge size="xs" variant="light" color="gray">
+									{entries.data?.length ?? 0}
+								</Badge>
+							}
+						/>
+
+						<ScrollArea.Autosize mah={400} type="auto">
+							<Stack gap={2}>
+								{collections.data?.map((c) => (
+									<CollectionItem
+										key={c.id}
+										collection={c}
+										active={collectionId === c.id}
+										count={countByCollection.get(c.id) ?? 0}
+										onSelect={() => setCollectionId(c.id)}
+									/>
+								))}
+							</Stack>
+						</ScrollArea.Autosize>
+					</Stack>
+				</Paper>
+			</Grid.Col>
+
+			{/* Right Column: Entry Search and List */}
+			<Grid.Col span={{ base: 12, sm: 8, md: 9 }}>
+				<Stack gap="md">
+					<Paper withBorder p="sm" radius="md">
+						<Group justify="space-between" align="center" gap="xs">
+							<TextInput
+								placeholder={t("searchPlaceholder")}
+								value={q}
+								onChange={(e) => setQ(e.currentTarget.value)}
+								leftSection={<IconSearch size={16} />}
+								style={{ flex: 1 }}
+							/>
+							<Button
+								size="sm"
+								leftSection={<IconPlus size={14} />}
+								onClick={entryModalH.open}
+								disabled={(collections.data?.length ?? 0) === 0}
+							>
+								{t("createEntry")}
+							</Button>
+						</Group>
+					</Paper>
+
+					{entries.isLoading ? (
+						<Paper
+							withBorder
+							p="xl"
+							radius="md"
+							style={{ display: "flex", justifyContent: "center" }}
+						>
+							<Text size="sm" c="dimmed">
+								{t("loading")}
+							</Text>
+						</Paper>
+					) : (entries.data?.length ?? 0) === 0 ? (
+						<Paper withBorder p="xl" radius="md" ta="center">
+							<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
+								<IconFileText size={24} />
+							</ThemeIcon>
+							<Text size="sm" fw={600} c="dimmed">
+								{t("noEntries")}
+							</Text>
+						</Paper>
+					) : (
+						<Stack gap="xs">
+							{(entries.data as KnowledgeSearchResult[]).map((e) => (
+								<Card
+									key={e.id}
+									withBorder
+									padding="md"
+									radius="md"
+									style={{
+										cursor: "pointer",
+										transition: "transform 100ms ease, box-shadow 100ms ease",
+									}}
+									styles={{
+										root: {
+											"&:hover": {
+												transform: "translateY(-1px)",
+												boxShadow: "var(--mantine-shadow-xs)",
+											},
+										},
+									}}
+									onClick={() => navigate({ to: "/knowledge/$entryId", params: { entryId: e.id } })}
+								>
+									<Group justify="space-between" wrap="nowrap" align="flex-start">
+										<div style={{ flex: 1, minWidth: 0 }}>
+											<Group gap="xs" align="center" mb={4}>
+												<IconFileText size={16} style={{ color: "var(--mantine-color-blue-5)" }} />
+												<Text size="sm" fw={600} truncate="end">
+													{e.title}
+												</Text>
+											</Group>
+											{e.snippet ? (
+												<Text size="xs" c="dimmed" lineClamp={2} style={{ wordBreak: "break-all" }}>
+													{e.snippet}
+												</Text>
+											) : null}
+										</div>
+										<Group gap={4} style={{ flexShrink: 0 }}>
+											{(e.tags ?? []).slice(0, 4).map((tag) => (
+												<Badge key={tag} size="xs" variant="light">
+													{tag}
+												</Badge>
+											))}
+										</Group>
+									</Group>
+								</Card>
+							))}
+						</Stack>
+					)}
+				</Stack>
+			</Grid.Col>
+
+			<CreateCollectionModal opened={colModal} onClose={colModalH.close} />
+			<CreateEntryModal
+				opened={entryModal}
+				onClose={entryModalH.close}
+				collectionId={collectionId}
+				collectionOptions={collectionOptions}
+			/>
+		</Grid>
+	);
+}
+
+function CollectionItem({
+	collection,
+	active,
+	count,
+	onSelect,
+}: {
+	collection: KnowledgeCollection;
+	active: boolean;
+	count: number;
+	onSelect: () => void;
+}) {
+	const { t } = useTranslation("knowledge");
+	const del = useDeleteKnowledgeCollection();
+	const [editing, setEditing] = useState<KnowledgeCollection | null>(null);
+	const [pendingDelete, setPendingDelete] = useState<KnowledgeCollection | null>(null);
 
 	return (
 		<>
-			<ScrollArea type="auto">
-				<Group gap="xs" wrap="nowrap" py={4}>
-					{collections.data?.map((c) => (
-						<Paper key={c.id} withBorder px="xs" py={4}>
-							<Group gap={6} wrap="nowrap">
-								<Text size="xs">{c.name}</Text>
-								<Badge size="xs" variant="light" color="gray">
-									{t("collectionEntryCount", { count: countByCollection.get(c.id) ?? 0 })}
-								</Badge>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									onClick={() => setEditing(c)}
-									title={t("edit")}
-								>
-									<IconPencil size={12} />
-								</ActionIcon>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									color="red"
-									onClick={() => setPendingDelete(c)}
-									title={t("delete")}
-								>
-									<IconTrash size={12} />
-								</ActionIcon>
-							</Group>
-						</Paper>
-					))}
-				</Group>
-			</ScrollArea>
+			<NavLink
+				label={collection.name}
+				leftSection={active ? <IconFolderOpen size={16} /> : <IconFolder size={16} />}
+				active={active}
+				onClick={onSelect}
+				rightSection={
+					<Group gap={4} wrap="nowrap" onClick={(e) => e.stopPropagation()}>
+						<Badge size="xs" variant="light" color="gray">
+							{count}
+						</Badge>
+						<ActionIcon
+							size="xs"
+							variant="subtle"
+							color="gray"
+							onClick={() => setEditing(collection)}
+							title={t("edit")}
+						>
+							<IconPencil size={12} />
+						</ActionIcon>
+						<ActionIcon
+							size="xs"
+							variant="subtle"
+							color="red"
+							onClick={() => setPendingDelete(collection)}
+							title={t("delete")}
+						>
+							<IconTrash size={12} />
+						</ActionIcon>
+					</Group>
+				}
+			/>
 
 			<EditCollectionModal collection={editing} onClose={() => setEditing(null)} />
 			<DeleteCollectionConfirm
@@ -538,23 +617,28 @@ function MyLibraryTab() {
 	};
 
 	return (
-		<Stack>
-			<Text size="sm" c="dimmed">
-				{t("myLibraryDesc")}
-			</Text>
+		<Grid gap="lg">
+			{/* Left Column: Create New Personal Entry */}
+			<Grid.Col span={{ base: 12, md: 5 }}>
+				<Paper withBorder p="md" radius="md" bg="var(--mantine-color-body)">
+					<Stack gap="sm">
+						<div>
+							<Text size="sm" fw={600}>
+								{t("newPersonalEntry")}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("myLibraryDesc")}
+							</Text>
+						</div>
 
-			<Paper withBorder p="sm">
-				<Stack gap="xs">
-					<Text size="sm" fw={600}>
-						{t("newPersonalEntry")}
-					</Text>
-					<Group align="flex-end" gap="xs">
 						<TextInput
 							label={t("title_field")}
+							placeholder={t("title_field")}
 							value={title}
 							onChange={(e) => setTitle(e.currentTarget.value)}
-							w={260}
+							required
 						/>
+
 						<Select
 							label={t("publishTarget")}
 							placeholder={t("noTargetCollection")}
@@ -562,75 +646,125 @@ function MyLibraryTab() {
 							data={collectionOptions}
 							value={target}
 							onChange={setTarget}
-							w={220}
 						/>
-						<Button onClick={save} disabled={!title.trim()} loading={create.isPending}>
+
+						<Textarea
+							label={t("content")}
+							placeholder={t("content")}
+							value={content}
+							onChange={(e) => setContent(e.currentTarget.value)}
+							autosize
+							minRows={4}
+							maxRows={12}
+						/>
+
+						<TagsInput
+							label={t("keywords")}
+							description={t("keywordsHint")}
+							placeholder={t("keywordsPlaceholder")}
+							value={keywords}
+							onChange={setKeywords}
+							clearable
+						/>
+
+						<Button
+							onClick={save}
+							disabled={!title.trim()}
+							loading={create.isPending}
+							fullWidth
+							mt="xs"
+						>
 							{t("save")}
 						</Button>
-					</Group>
-					<Textarea
-						label={t("content")}
-						value={content}
-						onChange={(e) => setContent(e.currentTarget.value)}
-						autosize
-						minRows={3}
-						maxRows={12}
-					/>
-					<TagsInput
-						label={t("keywords")}
-						description={t("keywordsHint")}
-						placeholder={t("keywordsPlaceholder")}
-						value={keywords}
-						onChange={setKeywords}
-						clearable
-					/>
-				</Stack>
-			</Paper>
+					</Stack>
+				</Paper>
+			</Grid.Col>
 
-			{entries.isLoading ? (
-				<Text size="sm" c="dimmed">
-					{t("loading")}
-				</Text>
-			) : (entries.data?.length ?? 0) === 0 ? (
-				<Text size="sm" c="dimmed">
-					{t("noPersonalEntries")}
-				</Text>
-			) : (
-				<Stack gap="xs">
-					{(entries.data as KnowledgePersonalEntry[]).map((p) => (
-						<Card
-							key={p.id}
+			{/* Right Column: Personal Entry List */}
+			<Grid.Col span={{ base: 12, md: 7 }}>
+				<Stack gap="md">
+					<Text size="sm" fw={600} c="dimmed" tt="uppercase">
+						{t("tabMyLibrary")}
+					</Text>
+
+					{entries.isLoading ? (
+						<Paper
 							withBorder
-							padding="sm"
-							style={{ cursor: p.entryId ? "pointer" : "default" }}
-							onClick={() =>
-								p.entryId
-									? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
-									: undefined
-							}
+							p="xl"
+							radius="md"
+							style={{ display: "flex", justifyContent: "center" }}
 						>
-							<Group justify="space-between" wrap="nowrap">
-								<div style={{ flex: 1, minWidth: 0 }}>
-									<Text size="sm" fw={600} truncate="end">
-										{p.title ?? p.id.slice(0, 8)}
-									</Text>
-									<Text size="xs" c="dimmed" truncate="end">
-										{p.entryId
-											? t("personalEntryLinked")
-											: p.targetCollectionId
-												? `${t("publishTarget")}: ${colName.get(p.targetCollectionId) ?? p.targetCollectionId}`
-												: t("noTargetCollection")}
-									</Text>
-								</div>
-								<Badge size="xs" variant="light" color={p.entryId ? "blue" : "grape"}>
-									{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
-								</Badge>
-							</Group>
-						</Card>
-					))}
+							<Text size="sm" c="dimmed">
+								{t("loading")}
+							</Text>
+						</Paper>
+					) : (entries.data?.length ?? 0) === 0 ? (
+						<Paper withBorder p="xl" radius="md" ta="center">
+							<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
+								<IconNotebook size={24} />
+							</ThemeIcon>
+							<Text size="sm" fw={600} c="dimmed">
+								{t("noPersonalEntries")}
+							</Text>
+						</Paper>
+					) : (
+						<Stack gap="xs">
+							{(entries.data as KnowledgePersonalEntry[]).map((p) => (
+								<Card
+									key={p.id}
+									withBorder
+									padding="md"
+									radius="md"
+									style={{ cursor: p.entryId ? "pointer" : "default" }}
+									onClick={() =>
+										p.entryId
+											? navigate({ to: "/knowledge/$entryId", params: { entryId: p.entryId } })
+											: undefined
+									}
+								>
+									<Group justify="space-between" wrap="nowrap" align="center">
+										<div style={{ flex: 1, minWidth: 0 }}>
+											<Group gap="xs" align="center" mb={4}>
+												<IconBook2 size={16} style={{ color: "var(--mantine-color-grape-5)" }} />
+												<Text size="sm" fw={600} truncate="end">
+													{p.title ?? p.id.slice(0, 8)}
+												</Text>
+											</Group>
+											<Text size="xs" c="dimmed">
+												{p.entryId ? (
+													<Group gap={4} wrap="nowrap">
+														<IconFileSymlink size={12} />
+														<span>{t("personalEntryLinked")}</span>
+													</Group>
+												) : p.targetCollectionId ? (
+													<Group gap={4} wrap="nowrap">
+														<IconFolder size={12} />
+														<span>
+															{t("publishTarget")}:{" "}
+															{colName.get(p.targetCollectionId) ?? p.targetCollectionId}
+														</span>
+													</Group>
+												) : (
+													<span>{t("noTargetCollection")}</span>
+												)}
+											</Text>
+										</div>
+										<Badge
+											size="xs"
+											variant="light"
+											color={p.entryId ? "blue" : "grape"}
+											style={{ flexShrink: 0 }}
+										>
+											{p.entryId ? t("personalEntryLinked") : t("personalEntryStandalone")}
+										</Badge>
+									</Group>
+								</Card>
+							))}
+						</Stack>
+					)}
 				</Stack>
-			)}
-		</Stack>
+			</Grid.Col>
+		</Grid>
 	);
 }
 
@@ -696,134 +830,205 @@ function ReviewCenterTab() {
 		s === "conflict" ? "orange" : s === "pending" ? "blue" : "gray";
 
 	return (
-		<Stack>
-			<Group justify="space-between" align="flex-end" wrap="nowrap">
-				<Text size="sm" c="dimmed">
-					{t("reviewCenterDesc")}
-				</Text>
-				<div>
-					<Text size="xs" c="dimmed" mb={4}>
-						{t("reviewCenterFilterLabel")}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						value={status}
-						onChange={(v) => setStatus(v as ReviewFilter)}
-						data={[
-							{ value: "all", label: t("reviewCenterAll") },
-							{ value: "pending", label: t("submissionStatus_pending") },
-							{ value: "conflict", label: t("submissionStatus_conflict") },
-						]}
-					/>
-				</div>
-			</Group>
+		<Stack gap="md">
+			<Paper withBorder p="sm" radius="md">
+				<Group justify="space-between" align="center" gap="md" wrap="wrap">
+					<div>
+						<Text size="sm" fw={600}>
+							{t("reviewCenter")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("reviewCenterDesc")}
+						</Text>
+					</div>
+					<Group gap="xs" align="center">
+						<Text size="xs" c="dimmed">
+							{t("reviewCenterFilterLabel")}
+						</Text>
+						<SegmentedControl
+							size="xs"
+							value={status}
+							onChange={(v) => setStatus(v as ReviewFilter)}
+							data={[
+								{ value: "all", label: t("reviewCenterAll") },
+								{ value: "pending", label: t("submissionStatus_pending") },
+								{ value: "conflict", label: t("submissionStatus_conflict") },
+							]}
+						/>
+					</Group>
+				</Group>
+			</Paper>
 
 			{submissions.isLoading ? (
-				<Text size="sm" c="dimmed">
-					{t("loading")}
-				</Text>
+				<Paper withBorder p="xl" radius="md" style={{ display: "flex", justifyContent: "center" }}>
+					<Text size="sm" c="dimmed">
+						{t("loading")}
+					</Text>
+				</Paper>
 			) : grouped.length === 0 ? (
-				<Text size="sm" c="dimmed">
-					{t("noSubmissions")}
-				</Text>
+				<Paper withBorder p="xl" radius="md" ta="center">
+					<ThemeIcon variant="light" size="xl" radius="xl" color="gray" mb="xs">
+						<IconGitPullRequest size={24} />
+					</ThemeIcon>
+					<Text size="sm" fw={600} c="dimmed">
+						{t("noSubmissions")}
+					</Text>
+				</Paper>
 			) : (
-				<Stack gap="md">
-					{grouped.map((g) =>
-						g.kind === "entry" ? (
-							<Paper key={g.key} withBorder p="sm">
-								<Group justify="space-between" mb="xs" wrap="nowrap">
-									<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-										<Anchor
-											component="button"
-											type="button"
+				<Grid gap="md">
+					{grouped.map((g) => (
+						<Grid.Col key={g.key} span={{ base: 12, md: 6 }}>
+							{g.kind === "entry" ? (
+								<Paper
+									withBorder
+									p="md"
+									radius="md"
+									h="100%"
+									style={{ display: "flex", flexDirection: "column" }}
+								>
+									<Group justify="space-between" mb="xs" wrap="nowrap" align="center">
+										<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+											<IconBook2 size={16} style={{ color: "var(--mantine-color-blue-5)" }} />
+											<Anchor
+												component="button"
+												type="button"
+												onClick={() => goEntry(g.entryId)}
+												style={{ minWidth: 0, textAlign: "left" }}
+											>
+												<Text size="sm" fw={600} truncate="end">
+													{titleById.get(g.entryId) ?? g.entryId.slice(0, 8)}
+												</Text>
+											</Anchor>
+											<Badge size="xs" variant="light" color="gray" style={{ flexShrink: 0 }}>
+												{g.subs.length}
+											</Badge>
+										</Group>
+										<Button
+											size="compact-xs"
+											variant="light"
+											leftSection={<IconSearch size={12} />}
 											onClick={() => goEntry(g.entryId)}
-											style={{ minWidth: 0 }}
+											style={{ flexShrink: 0 }}
 										>
+											{t("reviewCenterViewEntry")}
+										</Button>
+									</Group>
+									<Stack gap="xs" style={{ flex: 1 }}>
+										{g.subs.map((s) => (
+											<Card
+												key={s.id}
+												withBorder
+												padding="xs"
+												radius="sm"
+												style={{
+													cursor: "pointer",
+													transition: "background 100ms ease",
+												}}
+												styles={{
+													root: {
+														"&:hover": {
+															background: "var(--mantine-color-dark-6)",
+														},
+													},
+												}}
+												onClick={() => goEntry(g.entryId)}
+											>
+												<Group justify="space-between" wrap="nowrap" align="center">
+													<div style={{ flex: 1, minWidth: 0 }}>
+														<Text size="xs" fw={500} truncate="end">
+															{s.changeNote || s.id.slice(0, 8)}
+														</Text>
+														<Text size="xs" c="dimmed">
+															{new Date(s.createdAt).toLocaleString()}
+														</Text>
+													</div>
+													<Badge
+														size="xs"
+														variant="light"
+														color={statusColor(s.status)}
+														style={{ flexShrink: 0 }}
+													>
+														{t(`submissionStatus_${s.status}`)}
+													</Badge>
+												</Group>
+											</Card>
+										))}
+									</Stack>
+								</Paper>
+							) : (
+								<Paper
+									withBorder
+									p="md"
+									radius="md"
+									h="100%"
+									style={{ display: "flex", flexDirection: "column" }}
+								>
+									<Group justify="space-between" mb="xs" wrap="nowrap" align="center">
+										<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
+											<IconFolder size={16} style={{ color: "var(--mantine-color-teal-5)" }} />
 											<Text size="sm" fw={600} truncate="end">
-												{titleById.get(g.entryId) ?? g.entryId.slice(0, 8)}
+												{g.sub.title || t("reviewCenterUntitledEntry")}
 											</Text>
-										</Anchor>
-										<Badge size="xs" variant="light" color="gray">
-											{g.subs.length}
-										</Badge>
-									</Group>
-									<Button size="compact-xs" variant="subtle" onClick={() => goEntry(g.entryId)}>
-										{t("reviewCenterViewEntry")}
-									</Button>
-								</Group>
-								<Stack gap="xs">
-									{g.subs.map((s) => (
-										<Card
-											key={s.id}
-											withBorder
-											padding="xs"
-											style={{ cursor: "pointer" }}
-											onClick={() => goEntry(g.entryId)}
+											<Badge size="xs" variant="light" color="teal" style={{ flexShrink: 0 }}>
+												{t("reviewCenterNewEntry")}
+											</Badge>
+										</Group>
+										<Button
+											size="compact-xs"
+											variant="light"
+											leftSection={<IconSearch size={12} />}
+											onClick={() => setReviewingId(g.sub.id)}
+											style={{ flexShrink: 0 }}
 										>
-											<Group justify="space-between" wrap="nowrap">
-												<div style={{ flex: 1, minWidth: 0 }}>
-													<Text size="xs" truncate="end">
-														{s.changeNote || s.id.slice(0, 8)}
-													</Text>
-													<Text size="xs" c="dimmed">
-														{new Date(s.createdAt).toLocaleString()}
-													</Text>
-												</div>
-												<Badge size="sm" variant="light" color={statusColor(s.status)}>
-													{t(`submissionStatus_${s.status}`)}
-												</Badge>
-											</Group>
-										</Card>
-									))}
-								</Stack>
-							</Paper>
-						) : (
-							<Paper key={g.key} withBorder p="sm">
-								<Group justify="space-between" mb="xs" wrap="nowrap">
-									<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
-										<Text size="sm" fw={600} truncate="end">
-											{g.sub.title || t("reviewCenterUntitledEntry")}
-										</Text>
-										<Badge size="xs" variant="light" color="teal">
-											{t("reviewCenterNewEntry")}
-										</Badge>
+											{t("reviewCenterReview")}
+										</Button>
 									</Group>
-									<Button
-										size="compact-xs"
-										variant="subtle"
+									<Card
+										withBorder
+										padding="xs"
+										radius="sm"
+										style={{
+											cursor: "pointer",
+											transition: "background 100ms ease",
+											flex: 1,
+										}}
+										styles={{
+											root: {
+												"&:hover": {
+													background: "var(--mantine-color-dark-6)",
+												},
+											},
+										}}
 										onClick={() => setReviewingId(g.sub.id)}
 									>
-										{t("reviewCenterReview")}
-									</Button>
-								</Group>
-								<Card
-									withBorder
-									padding="xs"
-									style={{ cursor: "pointer" }}
-									onClick={() => setReviewingId(g.sub.id)}
-								>
-									<Group justify="space-between" wrap="nowrap">
-										<div style={{ flex: 1, minWidth: 0 }}>
-											<Text size="xs" truncate="end">
-												{g.sub.changeNote ||
-													(g.sub.collectionId
-														? collectionNameById.get(g.sub.collectionId)
-														: undefined) ||
-													g.sub.id.slice(0, 8)}
-											</Text>
-											<Text size="xs" c="dimmed">
-												{new Date(g.sub.createdAt).toLocaleString()}
-											</Text>
-										</div>
-										<Badge size="sm" variant="light" color={statusColor(g.sub.status)}>
-											{t(`submissionStatus_${g.sub.status}`)}
-										</Badge>
-									</Group>
-								</Card>
-							</Paper>
-						),
-					)}
-				</Stack>
+										<Group justify="space-between" wrap="nowrap" align="center">
+											<div style={{ flex: 1, minWidth: 0 }}>
+												<Text size="xs" fw={500} truncate="end">
+													{g.sub.changeNote ||
+														(g.sub.collectionId
+															? collectionNameById.get(g.sub.collectionId)
+															: undefined) ||
+														g.sub.id.slice(0, 8)}
+												</Text>
+												<Text size="xs" c="dimmed">
+													{new Date(g.sub.createdAt).toLocaleString()}
+												</Text>
+											</div>
+											<Badge
+												size="xs"
+												variant="light"
+												color={statusColor(g.sub.status)}
+												style={{ flexShrink: 0 }}
+											>
+												{t(`submissionStatus_${g.sub.status}`)}
+											</Badge>
+										</Group>
+									</Card>
+								</Paper>
+							)}
+						</Grid.Col>
+					))}
+				</Grid>
 			)}
 
 			<StandaloneReviewModal

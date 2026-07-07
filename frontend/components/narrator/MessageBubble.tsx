@@ -41,7 +41,9 @@ import {
 	IconGitMerge,
 	IconLanguage,
 	IconListCheck,
+	IconLock,
 	IconMessageQuestion,
+	IconNotebook,
 	IconPencil,
 	IconPhoto,
 	IconRepeat,
@@ -50,6 +52,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 import {
 	createContext,
 	memo,
@@ -65,7 +68,6 @@ import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useFileSystemCapability, useUploadCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
-import { useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	ApiError,
 	api,
@@ -2181,6 +2183,58 @@ function removeMessagesFromCache(qc: QueryClient, narratorId: string, deletedMes
 	});
 }
 
+// KnowledgeHintNotice — renders the persisted passive knowledge-injection sys
+// message (blocks: [{type:"text"}, {type:"knowledge_hint", entries}]). The text
+// block is what the model actually received; here we surface a compact, dimmed
+// card listing the injected entries with links to their knowledge pages so the
+// injection isn't invisible to the user.
+function KnowledgeHintNotice({
+	entries,
+}: {
+	entries: Array<{ entryId: string; title?: string; summary?: string }>;
+}) {
+	const { t } = useTranslation("narrator");
+	const navigate = useNavigate();
+	if (entries.length === 0) return null;
+	return (
+		<Paper p="xs" radius="sm" style={{ backgroundColor: SYSTEM_MESSAGE_BG }}>
+			<Group gap={6} wrap="nowrap" align="flex-start">
+				<IconNotebook
+					size={14}
+					style={{ flexShrink: 0, marginTop: 2, color: "var(--mantine-color-dimmed)" }}
+				/>
+				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
+					<Text size="xs" c="dimmed" fw={600}>
+						{t("knowledgeHintHeading", { count: entries.length })}
+					</Text>
+					{entries.map((e) => (
+						<Tooltip
+							key={e.entryId}
+							label={e.summary || e.title || e.entryId}
+							multiline
+							maw={360}
+							withinPortal
+							openDelay={300}
+						>
+							<Text
+								size="xs"
+								c="indigo"
+								truncate
+								style={{ cursor: "pointer" }}
+								onClick={() =>
+									navigate({ to: "/knowledge/$entryId", params: { entryId: e.entryId } })
+								}
+							>
+								{e.title || e.entryId}
+							</Text>
+						</Tooltip>
+					))}
+				</Stack>
+			</Group>
+		</Paper>
+	);
+}
+
 function ErrorNotice({
 	message,
 	narratorId,
@@ -3494,9 +3548,6 @@ export const MessageBubble = memo(function MessageBubble({
 	const qc = useQueryClient();
 	const _msgId = message.id;
 
-	// User preferences for send mode
-	const { data: userPrefs } = useUserPreferences();
-
 	// Edit mode state for user messages
 	const [isEditing, setIsEditing] = useState(false);
 	const [editContent, setEditContent] = useState("");
@@ -3595,6 +3646,25 @@ export const MessageBubble = memo(function MessageBubble({
 		[t],
 	);
 
+	// Paste images directly into the edit textarea (user messages only).
+	const handleEditPaste = useCallback(
+		(e: React.ClipboardEvent) => {
+			if (!isUser) return;
+			const imageFiles: File[] = [];
+			for (const item of e.clipboardData.items) {
+				if (item.type.startsWith("image/")) {
+					const file = item.getAsFile();
+					if (file) imageFiles.push(file);
+				}
+			}
+			if (imageFiles.length > 0) {
+				e.preventDefault();
+				void handleAddEditImages(imageFiles);
+			}
+		},
+		[isUser, handleAddEditImages],
+	);
+
 	const buildEditImageOpts = useCallback(
 		() => ({
 			keepImageIds: editKeptImages
@@ -3654,40 +3724,17 @@ export const MessageBubble = memo(function MessageBubble({
 		],
 	);
 
-	// Handle keyboard shortcuts in edit mode
+	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
+	// semantics, so Enter and Ctrl/Cmd+Enter both submit; Shift+Enter inserts a
+	// native newline.
 	const handleEditKeyDown = useCallback(
 		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
 			if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
-
-			const ctrlEnterMode = (userPrefs?.sendMode ?? "enter") === "ctrl+enter";
-
-			if (ctrlEnterMode) {
-				// Ctrl+Enter mode: Ctrl/Cmd+Enter submits, plain Enter inserts newline
-				if (e.ctrlKey || e.metaKey) {
-					e.preventDefault();
-					handleConfirmClick();
-				}
-			} else {
-				// Enter mode (default): Enter submits, Shift/Ctrl/Cmd+Enter inserts newline
-				if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-					e.preventDefault();
-					handleConfirmClick();
-				} else if (e.ctrlKey || e.metaKey) {
-					// Ctrl/Cmd+Enter: browsers don't insert a newline by default, do it manually
-					e.preventDefault();
-					const textarea = e.currentTarget;
-					const { selectionStart, selectionEnd } = textarea;
-					const before = editContent.slice(0, selectionStart);
-					const after = editContent.slice(selectionEnd);
-					const newValue = `${before}\n${after}`;
-					setEditContent(newValue);
-					requestAnimationFrame(() => {
-						textarea.selectionStart = textarea.selectionEnd = selectionStart + 1;
-					});
-				}
-			}
+			if (e.shiftKey) return; // native newline
+			e.preventDefault();
+			handleConfirmClick();
 		},
-		[userPrefs?.sendMode, editContent, handleConfirmClick],
+		[handleConfirmClick],
 	);
 
 	// Register/unregister editing state with parent NarratorPanel so the
@@ -3965,6 +4012,49 @@ export const MessageBubble = memo(function MessageBubble({
 				</MessageContextMenuCtx.Provider>
 			);
 		}
+		// Spec task continuation / blocked reminders (Living Work Spec sidecar messages).
+		const specIndex = blocks.findIndex(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "spec_continuation" || b.type === "spec_blocked_continuation",
+		);
+		const specBlock = specIndex >= 0 ? blocks[specIndex] : undefined;
+		if (specBlock) {
+			const specRealIndex = message._blockOriginalIndices?.[specIndex] ?? specIndex;
+			const isBlocked = specBlock.type === "spec_blocked_continuation";
+			const color = isBlocked ? "orange" : "indigo";
+			const labelKey = isBlocked ? "specBlockedContinuation" : "specContinuation";
+			const taskText = specBlock.task ?? message.contentText;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={specRealIndex} messageId={message.id}>
+						<Paper
+							p="xs"
+							radius="sm"
+							style={{ backgroundColor: `var(--mantine-color-${color}-light)` }}
+						>
+							<Group gap="xs" wrap="nowrap">
+								<Badge size="xs" color={color} variant="light">
+									{t(labelKey)}
+								</Badge>
+								{specBlock.protected && (
+									<Badge
+										size="xs"
+										color="yellow"
+										variant="light"
+										leftSection={<IconLock size={10} />}
+									>
+										{t("specProtectedBadge")}
+									</Badge>
+								)}
+								<Text size="xs" c={color} truncate style={{ flex: 1 }}>
+									{taskText}
+								</Text>
+							</Group>
+						</Paper>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const errorBlock = blocks.find((b: any) => b.type === "error");
 		if (errorBlock && narratorId && message.id) {
@@ -3975,6 +4065,27 @@ export const MessageBubble = memo(function MessageBubble({
 					messageId={message.id}
 					onDismiss={invalidateMessages}
 				/>
+			);
+		}
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const knowledgeHintIndex = blocks.findIndex((b: any) => b.type === "knowledge_hint");
+		const knowledgeHintBlock = knowledgeHintIndex >= 0 ? blocks[knowledgeHintIndex] : undefined;
+		if (knowledgeHintBlock) {
+			const hintRealIndex =
+				message._blockOriginalIndices?.[knowledgeHintIndex] ?? knowledgeHintIndex;
+			const entries = Array.isArray(knowledgeHintBlock.entries)
+				? (knowledgeHintBlock.entries as Array<{
+						entryId: string;
+						title?: string;
+						summary?: string;
+					}>)
+				: [];
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={hintRealIndex} messageId={message.id}>
+						<KnowledgeHintNotice entries={entries} />
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
 			);
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4068,6 +4179,7 @@ export const MessageBubble = memo(function MessageBubble({
 								value={editContent}
 								onChange={(e) => setEditContent(e.currentTarget.value)}
 								onKeyDown={handleEditKeyDown}
+								onPaste={handleEditPaste}
 								autosize
 								minRows={2}
 								maxRows={10}

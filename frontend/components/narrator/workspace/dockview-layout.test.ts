@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { serializeSeedEnvelope } from "../panels/layout-envelope";
 import {
 	createBranch,
 	createLeafWith,
@@ -6,9 +7,12 @@ import {
 	createWebviewLeaf,
 	type SplitNode,
 } from "../split-tree";
+import { DEFAULT_DIRECTOR_PRIMARY_RATIO } from "./director-constants";
 import {
 	migrateLegacyTree,
+	nextWorkspacePanelId,
 	resolveWorkspaceLayout,
+	twoNarratorWorkspaceSeed,
 	WORKSPACE_LAYOUT_VERSION,
 } from "./dockview-layout";
 
@@ -106,7 +110,7 @@ describe("resolveWorkspaceLayout", () => {
 		}
 	});
 
-	test("dockview envelope → restored verbatim", () => {
+	test("dockview envelope → restored verbatim (legacy director without ratio → default)", () => {
 		const envelope = JSON.stringify({
 			version: WORKSPACE_LAYOUT_VERSION,
 			kind: "dockview",
@@ -119,12 +123,75 @@ describe("resolveWorkspaceLayout", () => {
 		const resolved = resolveWorkspaceLayout(envelope);
 		expect(resolved.kind).toBe("dockview");
 		if (resolved.kind === "dockview") {
-			expect(resolved.director).toEqual({ mode: "director", primaryPanelId: "p1" });
+			// Back-compat: older envelopes had no primaryRatio → filled with default.
+			expect(resolved.director).toEqual({
+				mode: "director",
+				primaryPanelId: "p1",
+				primaryRatio: DEFAULT_DIRECTOR_PRIMARY_RATIO,
+			});
+		}
+	});
+
+	test("dockview envelope → preserves an explicit primaryRatio", () => {
+		const envelope = JSON.stringify({
+			version: WORKSPACE_LAYOUT_VERSION,
+			kind: "dockview",
+			layout: {
+				grid: { root: {}, width: 100, height: 100, orientation: "HORIZONTAL" },
+				panels: {},
+			},
+			director: { mode: "director", primaryPanelId: "p1", primaryRatio: 0.8 },
+		});
+		const resolved = resolveWorkspaceLayout(envelope);
+		expect(resolved.kind).toBe("dockview");
+		if (resolved.kind === "dockview") {
+			expect(resolved.director.primaryRatio).toBe(0.8);
 		}
 	});
 
 	test("malformed JSON → falls back to empty panel list", () => {
 		const resolved = resolveWorkspaceLayout("{not valid json");
 		expect(resolved.kind).toBe("panels");
+	});
+
+	test("seed envelope → materialised panel list (no split-tree round-trip)", () => {
+		const seed = serializeSeedEnvelope(twoNarratorWorkspaceSeed("a", "b", "right"));
+		const resolved = resolveWorkspaceLayout(seed);
+		expect(resolved.kind).toBe("panels");
+		if (resolved.kind === "panels") {
+			expect(resolved.panels).toHaveLength(2);
+			expect(resolved.panels[0].params).toEqual({ panelType: "narrator", narratorId: "a" });
+			expect(resolved.panels[0].placement).toEqual({ kind: "first" });
+			expect(resolved.panels[1].params).toEqual({ panelType: "narrator", narratorId: "b" });
+			expect(resolved.panels[1].placement).toMatchObject({
+				kind: "relative",
+				direction: "right",
+			});
+		}
+	});
+});
+
+describe("twoNarratorWorkspaceSeed", () => {
+	test("stacks second narrator below the first when direction is below", () => {
+		const seed = twoNarratorWorkspaceSeed("first", "second", "below");
+		expect(seed.kind).toBe("seed");
+		expect(seed.seed).toHaveLength(2);
+		expect(seed.seed[1].placement).toMatchObject({ kind: "relative", direction: "below" });
+		// The two generated panel ids must be distinct.
+		expect(seed.seed[0].id).not.toBe(seed.seed[1].id);
+	});
+});
+
+describe("nextWorkspacePanelId", () => {
+	test("generates unique ids even within the same millisecond", () => {
+		// A monotonic counter (not Date.now() alone) guarantees uniqueness when
+		// several panels are added back-to-back in the same tick.
+		const ids = new Set<string>();
+		for (let i = 0; i < 1000; i++) ids.add(nextWorkspacePanelId());
+		expect(ids.size).toBe(1000);
+	});
+
+	test("ids carry the dvp_ prefix", () => {
+		expect(nextWorkspacePanelId().startsWith("dvp_")).toBe(true);
 	});
 });

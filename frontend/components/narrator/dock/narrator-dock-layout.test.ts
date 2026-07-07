@@ -3,7 +3,9 @@ import type { DockviewApi, SerializedDockview } from "dockview-react";
 import { dockPanelId } from "./dock-panel-types";
 import {
 	applyNarratorDockLayout,
+	cleanupStaleNarratorDockLayouts,
 	clearNarratorDockLayout,
+	DOCK_LAYOUT_MAX_AGE_MS,
 	loadNarratorDockLayout,
 	NARRATOR_DOCK_LAYOUT_VERSION,
 	saveNarratorDockLayout,
@@ -23,6 +25,12 @@ class MemoryStorage {
 	}
 	clear() {
 		this.store.clear();
+	}
+	get length() {
+		return this.store.size;
+	}
+	key(index: number) {
+		return [...this.store.keys()][index] ?? null;
 	}
 	get size() {
 		return this.store.size;
@@ -270,5 +278,48 @@ describe("saveNarratorDockLayout — identity stripping", () => {
 		// panelType is preserved; identity is gone.
 		expect(panels[dockPanelId("chat")].params).toEqual({ panelType: "chat" });
 		expect(panels[dockPanelId("git")].params).toEqual({ panelType: "git" });
+	});
+});
+
+describe("cleanupStaleNarratorDockLayouts", () => {
+	const NOW = 1_000_000_000_000;
+
+	function seed(narratorId: string, device: "desktop" | "mobile", lastOpenedAt?: number) {
+		const envelope = {
+			version: NARRATOR_DOCK_LAYOUT_VERSION,
+			layout: fakeLayout([dockPanelId("chat")]),
+			...(lastOpenedAt !== undefined ? { lastOpenedAt } : {}),
+		};
+		mem.setItem(`narrafork_ndock_${narratorId}_${device}`, JSON.stringify(envelope));
+	}
+
+	test("removes layouts older than the max age, keeps fresh ones", () => {
+		seed("stale", "desktop", NOW - DOCK_LAYOUT_MAX_AGE_MS - 1);
+		seed("fresh", "desktop", NOW - 1000);
+		const removed = cleanupStaleNarratorDockLayouts(NOW, DOCK_LAYOUT_MAX_AGE_MS, mem);
+		expect(removed).toBe(1);
+		expect(loadNarratorDockLayout("stale", "desktop")).toBeNull();
+		expect(loadNarratorDockLayout("fresh", "desktop")).not.toBeNull();
+	});
+
+	test("keeps age-unknown entries (no lastOpenedAt)", () => {
+		seed("legacy", "desktop"); // no lastOpenedAt
+		const removed = cleanupStaleNarratorDockLayouts(NOW, DOCK_LAYOUT_MAX_AGE_MS, mem);
+		expect(removed).toBe(0);
+		expect(loadNarratorDockLayout("legacy", "desktop")).not.toBeNull();
+	});
+
+	test("removes unparseable entries under the prefix", () => {
+		mem.setItem("narrafork_ndock_broken_desktop", "{not json");
+		const removed = cleanupStaleNarratorDockLayouts(NOW, DOCK_LAYOUT_MAX_AGE_MS, mem);
+		expect(removed).toBe(1);
+		expect(mem.getItem("narrafork_ndock_broken_desktop")).toBeNull();
+	});
+
+	test("ignores unrelated localStorage keys", () => {
+		mem.setItem("some_other_key", "value");
+		seed("stale", "desktop", NOW - DOCK_LAYOUT_MAX_AGE_MS - 1);
+		cleanupStaleNarratorDockLayouts(NOW, DOCK_LAYOUT_MAX_AGE_MS, mem);
+		expect(mem.getItem("some_other_key")).toBe("value");
 	});
 });

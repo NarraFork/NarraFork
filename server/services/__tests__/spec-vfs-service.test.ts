@@ -12,6 +12,7 @@ import { narrators, specProtectedTasks } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import {
 	analyzeSpecWriteCandidate,
+	deleteSpecFile,
 	forkSpecNamespace,
 	listSpecFiles,
 	readSpecFile,
@@ -56,13 +57,50 @@ describe("spec VFS built-ins", () => {
 
 		const files = await listSpecFiles(parentNarratorId);
 		expect(files.map((file) => file.uri)).toContain("spec://tasks.json");
-		expect(files.map((file) => file.uri)).toContain("spec://protected_requirements");
+		expect(files.map((file) => file.uri)).toContain("spec://behavior_fence");
 	});
 
-	test("rejects writes to read-only built-ins", async () => {
+	test("rejects agent writes to behavior_fence (agent-readonly)", async () => {
+		// Default actor is "agent"; behavior_fence is agent-readonly.
+		expect(writeSpecFile(parentNarratorId, "spec://behavior_fence", "overwrite")).rejects.toThrow(
+			/read-only behavior fence/,
+		);
+	});
+
+	test("behavior_fence exposes agent-readonly but UI-editable metadata", async () => {
+		const fence = await readSpecFile(parentNarratorId, "spec://behavior_fence");
+		expect(fence.readonly).toBe(true);
+		expect(fence.uiEditable).toBe(true);
+	});
+
+	test("allows user (UI) writes to behavior_fence and persists content", async () => {
+		const body = "# Behavior Fence\n\nDo not touch the auth module without approval.\n";
+		const written = await writeSpecFile(parentNarratorId, "spec://behavior_fence", body, {
+			actor: "user",
+			createdBy: "user",
+		});
+		expect(written.readonly).toBe(true);
+		expect(written.uiEditable).toBe(true);
+
+		const reread = await readSpecFile(parentNarratorId, "spec://behavior_fence");
+		expect(reread.content).toBe(body);
+		expect(reread.readonly).toBe(true);
+		expect(reread.uiEditable).toBe(true);
+	});
+
+	test("rejects user (UI) writes to HOW_TO_USE_SPEC.md (not UI-editable)", async () => {
 		expect(
-			writeSpecFile(parentNarratorId, "spec://protected_requirements", "overwrite"),
-		).rejects.toThrow(/read-only/);
+			writeSpecFile(parentNarratorId, "spec://HOW_TO_USE_SPEC.md", "overwrite", {
+				actor: "user",
+				createdBy: "user",
+			}),
+		).rejects.toThrow(/not editable/);
+	});
+
+	test("rejects deleting built-in behavior_fence", async () => {
+		expect(deleteSpecFile(parentNarratorId, "spec://behavior_fence")).rejects.toThrow(
+			/built-in file and cannot be deleted/,
+		);
 	});
 });
 

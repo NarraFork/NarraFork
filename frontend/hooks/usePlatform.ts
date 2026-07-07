@@ -1942,9 +1942,10 @@ export function getStorageCapability(capabilities: RuntimeCapabilities | undefin
 		scanReason: scan?.reason,
 		cachedSupported: assumeLegacyTSBackend ? true : cached?.supported === true,
 		cachedReason: cached?.reason,
-		// Safe default: TS/older backends without an explicit capability should keep the
-		// dangerous VACUUM entry disabled rather than exposing a misleading action.
-		vacuumSupported: vacuum?.supported === true,
+		// VACUUM is an explicit, admin-initiated maintenance action. Legacy TS backends
+		// don't report capabilities, so default to supported (matching scan/cached/cleanup);
+		// the Go backend can still gate it via an explicit vacuum.supported === false.
+		vacuumSupported: assumeLegacyTSBackend ? true : vacuum?.supported === true,
 		vacuumReason: vacuum?.reason,
 		cleanup: {
 			uploads: cleanupCapability("uploads"),

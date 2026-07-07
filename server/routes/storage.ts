@@ -152,17 +152,14 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 /**
  * POST /api/storage/database/vacuum — Run SQLite VACUUM to release reusable free pages.
  */
-storageRoutes.post("/database/vacuum", requireAdmin, (c) => {
+storageRoutes.post("/database/vacuum", requireAdmin, async (c) => {
 	// Full VACUUM rebuilds the SQLite file and can monopolize Bun's JS thread for
-	// a long time on multi-GB databases. It must be reintroduced as a background
-	// worker/subprocess job rather than running synchronously in this HTTP handler.
-	return c.json(
-		{
-			error: "SQLite VACUUM is disabled in the request path",
-			message:
-				"Full database compaction must run as a background maintenance job to avoid freezing the backend.",
-			vacuumRan: false,
-		},
-		409,
-	);
+	// a long time on multi-GB databases, blocking all other requests until it
+	// finishes. This is a deliberate, admin-initiated maintenance action: the
+	// operator explicitly clicks the button knowing the backend will pause. The
+	// service serializes it behind the database-maintenance lock and checkpoints
+	// the WAL before/after so the freed space is actually returned to disk.
+	const result = await databaseCleanupService.vacuumDatabase();
+	storageService.invalidateStorageCache();
+	return c.json(result);
 });

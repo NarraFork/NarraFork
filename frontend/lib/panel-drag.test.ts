@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+	isNarratorSubject,
 	isSyntheticSubjectId,
 	onPanelDragEnd,
 	onPanelDragMove,
+	type PanelDragState,
 	startPanelDrag,
 } from "./panel-drag";
 
@@ -48,6 +50,97 @@ describe("isSyntheticSubjectId", () => {
 
 	test("minimal valid fence '____' is synthetic (length 4)", () => {
 		expect(isSyntheticSubjectId("____")).toBe(true);
+	});
+});
+
+/**
+ * Coverage for the explicit subject classification (`subjectKind`) that
+ * supersedes id-shape parsing. Consumers gate workspace creation / narrator
+ * materialisation on `isNarratorSubject`.
+ */
+describe("isNarratorSubject", () => {
+	const state = (over: Partial<PanelDragState>): PanelDragState => ({
+		id: "narr_1",
+		title: "T",
+		x: 0,
+		y: 0,
+		...over,
+	});
+
+	test("explicit subjectKind wins over id shape", () => {
+		// A real-looking id explicitly marked as a tool is NOT a narrator.
+		expect(isNarratorSubject(state({ id: "narr_1", subjectKind: "tool" }))).toBe(false);
+		// A synthetic-looking id explicitly marked narrator IS a narrator.
+		expect(isNarratorSubject(state({ id: "__weird__", subjectKind: "narrator" }))).toBe(true);
+	});
+
+	test("falls back to id-shape inference when subjectKind is absent", () => {
+		expect(isNarratorSubject(state({ id: "narr_1" }))).toBe(true);
+		expect(isNarratorSubject(state({ id: "__spec__" }))).toBe(false);
+	});
+});
+
+describe("startPanelDrag subject classification", () => {
+	// Reuse the document stub pattern from the threshold suite.
+	type Handler = (e: unknown) => void;
+	let handlers: Map<string, Set<Handler>>;
+	// biome-ignore lint/suspicious/noExplicitAny: swapping the global document stub
+	let prevDocument: any;
+	const dispatch = (type: string, clientX: number, clientY: number) => {
+		for (const h of handlers.get(type) ?? []) h({ clientX, clientY });
+	};
+	beforeEach(() => {
+		handlers = new Map();
+		// biome-ignore lint/suspicious/noExplicitAny: reading the global for restore
+		prevDocument = (globalThis as any).document;
+		// biome-ignore lint/suspicious/noExplicitAny: minimal document stub
+		(globalThis as any).document = {
+			body: { style: {} as Record<string, string> },
+			addEventListener: (type: string, fn: Handler) => {
+				if (!handlers.has(type)) handlers.set(type, new Set());
+				handlers.get(type)?.add(fn);
+			},
+			removeEventListener: (type: string, fn: Handler) => {
+				handlers.get(type)?.delete(fn);
+			},
+		};
+	});
+	afterEach(() => {
+		// biome-ignore lint/suspicious/noExplicitAny: restore global
+		(globalThis as any).document = prevDocument;
+	});
+
+	test("explicit subjectKind=tool is carried into the drag state", () => {
+		let final: PanelDragState | null = null;
+		const offEnd = onPanelDragEnd((s) => {
+			final = s;
+		});
+		startPanelDrag({
+			panelId: "__spec__",
+			id: "__spec__",
+			title: "Spec",
+			x: 0,
+			y: 0,
+			subjectKind: "tool",
+		});
+		dispatch("pointermove", 40, 0); // cross threshold
+		dispatch("pointerup", 40, 0);
+		expect(final).not.toBeNull();
+		expect(final).toMatchObject({ subjectKind: "tool" });
+		if (final) expect(isNarratorSubject(final)).toBe(false);
+		offEnd();
+	});
+
+	test("omitted subjectKind is inferred from id shape (narrator id → narrator)", () => {
+		let final: PanelDragState | null = null;
+		const offEnd = onPanelDragEnd((s) => {
+			final = s;
+		});
+		startPanelDrag({ panelId: "p1", id: "narr_1", title: "T", x: 0, y: 0 });
+		dispatch("pointermove", 40, 0);
+		dispatch("pointerup", 40, 0);
+		expect(final).toMatchObject({ subjectKind: "narrator" });
+		offEnd();
 	});
 });
 

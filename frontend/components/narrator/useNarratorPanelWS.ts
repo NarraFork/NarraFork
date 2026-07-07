@@ -2707,6 +2707,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, model } : old,
 				);
 			},
+			// NOTE: the message-layer catch-up callbacks below — onCatchUp,
+			// onFullReload, onSyncOk, onStreamingSnapshot — are INERT under this
+			// hook's `kind: "panel"` subscription: the server only sends those
+			// frames to `kind: "messages"` subscribers (see narrator-ws.ts), and the
+			// chunks hook (useNarratorChunksWS) owns message-cache recovery. They are
+			// retained so a future `legacyMessageCacheUpdatesEnabled: true` panel
+			// still restores correctly; do not rely on them firing under panel kind.
 			onCatchUp: (orphanChildren, topLevel) => {
 				// First catch-up response for this narratorId subscription received.
 				firstCatchUpDoneRef.current = true;
@@ -2989,7 +2996,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 		},
 		lastMessageId,
-		{ trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled },
+		{ kind: "panel", trackRealtimeMessageVersion: legacyMessageCacheUpdatesEnabled },
 	);
 
 	// Keep refs in sync

@@ -187,13 +187,22 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		return ids;
 	}, [tabs]);
 
-	// RAF-batched tab updates: accumulate patches from rapid WS events and
-	// flush them as a single setQueryData call per animation frame.
+	// Batched tab updates: accumulate patches from rapid WS events and flush them
+	// once per frame while visible, with a timer fallback so hidden/throttled tabs
+	// still apply status changes promptly.
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
+	const tabPatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	const flushTabPatches = useCallback(() => {
-		tabPatchRafRef.current = 0;
+		if (tabPatchRafRef.current) {
+			cancelAnimationFrame(tabPatchRafRef.current);
+			tabPatchRafRef.current = 0;
+		}
+		if (tabPatchTimerRef.current) {
+			clearTimeout(tabPatchTimerRef.current);
+			tabPatchTimerRef.current = null;
+		}
 		const patches = pendingTabPatchesRef.current;
 		if (patches.size === 0) return;
 		pendingTabPatchesRef.current = new Map();
@@ -214,10 +223,20 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		});
 	}, [qc]);
 
-	// Cleanup RAF on unmount
+	const scheduleTabPatchFlush = useCallback(() => {
+		if (!tabPatchTimerRef.current) {
+			tabPatchTimerRef.current = setTimeout(flushTabPatches, 0);
+		}
+		if (document.visibilityState === "visible" && !tabPatchRafRef.current) {
+			tabPatchRafRef.current = requestAnimationFrame(flushTabPatches);
+		}
+	}, [flushTabPatches]);
+
+	// Cleanup scheduled flushes on unmount
 	useEffect(() => {
 		return () => {
 			if (tabPatchRafRef.current) cancelAnimationFrame(tabPatchRafRef.current);
+			if (tabPatchTimerRef.current) clearTimeout(tabPatchTimerRef.current);
 		};
 	}, []);
 
@@ -314,14 +333,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
-			// Merge patch into pending map and schedule a single RAF flush
+			// Merge patch into pending map and schedule one coalesced flush.
 			const existing = pendingTabPatchesRef.current.get(narratorId);
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
-			if (!tabPatchRafRef.current) {
-				tabPatchRafRef.current = requestAnimationFrame(flushTabPatches);
-			}
+			scheduleTabPatchFlush();
 		},
-		[flushTabPatches],
+		[scheduleTabPatchFlush],
 	);
 
 	const handleGlobalEvent = useCallback(
@@ -346,6 +363,10 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				if (revision > 0 && revision < lastRevisionRef.current) return;
 				lastRevisionRef.current = revision || Date.now();
 
+				// Apply any queued realtime patches first so they don't race the
+				// snapshot merge below and briefly resurrect a stale status.
+				flushTabPatches();
+
 				const serverTabs = (event.tabs as RecentTab[]).map(normalizeRecentTab);
 				if (recentTabsSnapshotRemovedProject(tabsRef.current, serverTabs)) {
 					qc.invalidateQueries({ queryKey: ["projects"] });
@@ -361,31 +382,36 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 
 				qc.setQueryData<RecentTab[]>(QUERY_KEY, (prev) => {
 					if (!prev) return serverTabs;
-					// Merge: server owns structure + order, preserve local runtime fields
-					const runtimeMap = new Map<
-						string,
-						Pick<
-							RecentTab,
-							"status" | "viewers" | "viewerCount" | "activeTerminalCount" | "containerStatus"
-						>
-					>();
+					// Server owns structure + order and enriches runtime fields. Only
+					// keep a local runtime field when the server snapshot omits it, so
+					// a fresh server status/substatus is never overwritten by stale local
+					// state (the root cause of "status stuck" after reconnect).
+					const localMap = new Map<string, RecentTab>();
 					for (const t of prev) {
-						runtimeMap.set(`${t.type}:${t.id}`, {
-							status: t.status,
-							viewers: t.viewers,
-							viewerCount: t.viewerCount,
-							activeTerminalCount: t.activeTerminalCount,
-							containerStatus: t.containerStatus,
-						});
+						localMap.set(`${t.type}:${t.id}`, t);
 					}
 					return serverTabs.map((t) => {
-						const runtime = runtimeMap.get(`${t.type}:${t.id}`);
-						return runtime ? { ...t, ...runtime } : t;
+						const local = localMap.get(`${t.type}:${t.id}`);
+						if (!local) return t;
+						const merged = { ...t };
+						if (merged.status === undefined && local.status !== undefined)
+							merged.status = local.status;
+						if (merged.substatus === undefined && local.substatus !== undefined)
+							merged.substatus = local.substatus;
+						if (merged.viewers === undefined && local.viewers !== undefined)
+							merged.viewers = local.viewers;
+						if (merged.viewerCount === undefined && local.viewerCount !== undefined)
+							merged.viewerCount = local.viewerCount;
+						if (merged.activeTerminalCount === undefined && local.activeTerminalCount !== undefined)
+							merged.activeTerminalCount = local.activeTerminalCount;
+						if (merged.containerStatus === undefined && local.containerStatus !== undefined)
+							merged.containerStatus = local.containerStatus;
+						return merged;
 					});
 				});
 			}
 		},
-		[qc, navigate, t],
+		[qc, navigate, t, flushTabPatches],
 	);
 
 	const handleReconnect = useCallback(() => {

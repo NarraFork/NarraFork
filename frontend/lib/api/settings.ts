@@ -102,7 +102,8 @@ export const settingsApi = {
 					mode: "temporary" | "permanent";
 				};
 			}>;
-			sendMode: "enter" | "ctrl+enter";
+			enterQueueMode: "turn" | "tool" | "interrupt";
+			ctrlEnterQueueMode: "turn" | "tool" | "interrupt";
 			setupWizardCompleted: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
@@ -148,8 +149,10 @@ export const settingsApi = {
 				mode: "temporary" | "permanent";
 			};
 		}>;
-		// Send mode
-		sendMode?: "enter" | "ctrl+enter";
+		// Queue behavior bound to the Enter key / send button
+		enterQueueMode?: "turn" | "tool" | "interrupt";
+		// Queue behavior bound to the Ctrl/Cmd+Enter key
+		ctrlEnterQueueMode?: "turn" | "tool" | "interrupt";
 		// Setup wizard
 		setupWizardCompleted?: boolean;
 	}) =>

@@ -59,7 +59,6 @@ import type {
 	CodexUsageTierStats,
 } from "../../lib/api/types";
 
-import { normalizeProxyUrl } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { CodexQuotaTrendChart as SharedCodexQuotaTrendChart } from "./CodexQuotaTrendChart";
@@ -380,7 +379,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const usageQueueClearSupported = codexManagerParity?.usageQueueClearSupported !== false;
 	const canReadCodexStatus = isCodexRouteSupported("status");
 	const canSetLoadBalancingMode = isCodexRouteSupported("loadBalancingMode");
-	const canSetGlobalProxy = isCodexRouteSupported("globalProxy");
 	const canSetDefaultReasoningEffort = isCodexRouteSupported("defaultReasoningEffort");
 	const canSetUseWebSocket = isCodexRouteSupported("useWebSocket");
 	const canSetUseWebSearch = isCodexRouteSupported("useWebSearch");
@@ -418,8 +416,6 @@ export const CodexSection = React.memo(function CodexSection({
 		displayName: string;
 		priority: number;
 	}>({ displayName: "", priority: 0 });
-	const [globalProxy, setGlobalProxy] = useState("");
-	const [globalProxyInitialized, setGlobalProxyInitialized] = useState(false);
 	const [defaultReasoningEffort, setDefaultReasoningEffort] = useState("");
 	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
 	const [useWebSocket, setUseWebSocket] = useState(true);
@@ -498,10 +494,6 @@ export const CodexSection = React.memo(function CodexSection({
 
 	useEffect(() => {
 		if (!status) return;
-		if (!globalProxyInitialized) {
-			setGlobalProxy(status.globalProxy ?? "");
-			setGlobalProxyInitialized(true);
-		}
 		if (!defaultReasoningInitialized) {
 			setDefaultReasoningEffort(status.defaultReasoningEffort ?? "");
 			setDefaultReasoningInitialized(true);
@@ -524,7 +516,6 @@ export const CodexSection = React.memo(function CodexSection({
 		}
 	}, [
 		status,
-		globalProxyInitialized,
 		defaultReasoningInitialized,
 		useWebSocketInitialized,
 		useWebSearchInitialized,
@@ -583,13 +574,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const lbModeMut = useMutation({
 		mutationFn: (mode: CodexLoadBalancingMode) => api.codexSetLoadBalancingMode(mode),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
-	});
-	const globalProxyMut = useMutation({
-		mutationFn: (proxy?: string) => api.codexSetGlobalProxy(proxy),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["codex", "status"] });
-			notifications.show({ message: t("codexProxyUpdated"), color: "green" });
-		},
 	});
 	const defaultReasoningMut = useMutation({
 		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null) =>
@@ -862,13 +846,6 @@ export const CodexSection = React.memo(function CodexSection({
 		updateMut.mutate({ id: editingId, data });
 	};
 
-	const handleSaveGlobalProxy = () => {
-		if (!canSetGlobalProxy) return;
-		const normalized = normalizeProxyUrl(globalProxy);
-		setGlobalProxy(normalized ?? "");
-		globalProxyMut.mutate(normalized);
-	};
-
 	const effectiveDefaultReasoningEffort = defaultReasoningInitialized
 		? defaultReasoningEffort
 		: (status?.defaultReasoningEffort ?? "");
@@ -1012,26 +989,9 @@ export const CodexSection = React.memo(function CodexSection({
 						</SortableContext>
 					</DndContext>
 				</Stack>
-				<Group align="flex-end">
-					<TextInput
-						size="xs"
-						label={t("codexGlobalProxy")}
-						description={t("codexGlobalProxyDesc")}
-						placeholder={t("codexProxyPlaceholder")}
-						value={globalProxy}
-						onChange={(e) => setGlobalProxy(e.target.value)}
-						style={{ flex: 1 }}
-					/>
-					<Button
-						size="xs"
-						onClick={handleSaveGlobalProxy}
-						loading={globalProxyMut.isPending}
-						disabled={!canSetGlobalProxy}
-						title={!canSetGlobalProxy ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
+				<Text size="xs" c="dimmed">
+					{t("proxyMovedToGlobalNote")}
+				</Text>
 				<Group align="flex-end">
 					<TextInput
 						size="xs"

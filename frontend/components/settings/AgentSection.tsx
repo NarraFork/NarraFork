@@ -134,10 +134,6 @@ export interface AgentSectionProps {
 	setGlobalCommandBlacklist: (
 		v: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>,
 	) => void;
-	webFetchProxyMode: string;
-	setWebFetchProxyMode: (v: string) => void;
-	webFetchProxyUrl: string;
-	setWebFetchProxyUrl: (v: string) => void;
 	userPrefs: AnyPrefs;
 	updateUserPref: AnyMutation;
 }
@@ -418,30 +414,6 @@ export function AgentSection(props: AgentSectionProps) {
 				<Alert color="yellow" icon={<IconAlertTriangle size={16} />} variant="light" py={6}>
 					{t("customRetryRulesUnsupported")}
 				</Alert>
-			)}
-			{/* WebFetch Proxy */}
-			<Title order={5} mt="sm">
-				{t("webFetchProxy")}
-			</Title>
-			<Text size="xs" c="dimmed">
-				{t("webFetchProxyDesc")}
-			</Text>
-			<Select
-				data={[
-					{ value: "system", label: t("webFetchProxySystem") },
-					{ value: "direct", label: t("webFetchProxyDirect") },
-					{ value: "custom", label: t("webFetchProxyCustom") },
-				]}
-				value={props.webFetchProxyMode}
-				onChange={(v) => props.setWebFetchProxyMode(v ?? "system")}
-			/>
-			{props.webFetchProxyMode === "custom" && (
-				<TextInput
-					label={t("webFetchProxyUrl")}
-					placeholder={t("webFetchProxyUrlPlaceholder")}
-					value={props.webFetchProxyUrl}
-					onChange={(e) => props.setWebFetchProxyUrl(e.currentTarget.value)}
-				/>
 			)}
 			{/* Context Thresholds */}
 			<Title order={5} mt="sm" id="contextThresholds">

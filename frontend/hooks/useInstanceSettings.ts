@@ -5,7 +5,6 @@ import { useTranslation } from "react-i18next";
 import { ensurePrefix } from "../components/providers/types";
 import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
-import { normalizeProxyUrl } from "../lib/proxy";
 import { normalizeUrlProtocol } from "../lib/url";
 
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
@@ -75,8 +74,6 @@ export interface InstanceSettingsState {
 	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
 	globalCommandWhitelist: Array<{ pattern: string; enabled?: boolean }>;
 	globalCommandBlacklist: Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>;
-	webFetchProxyMode: string;
-	webFetchProxyUrl: string;
 	// Chapters
 	maxWorktrees: number;
 	maxContainers: number;
@@ -159,8 +156,6 @@ function makeDefaults(): InstanceSettingsState {
 		globalBlacklistDirs: [],
 		globalCommandWhitelist: [],
 		globalCommandBlacklist: [],
-		webFetchProxyMode: "system",
-		webFetchProxyUrl: "",
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -256,8 +251,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
 				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
 				globalCommandBlacklist: settings.agent?.commandBlacklist ?? [],
-				webFetchProxyMode: settings.agent?.webFetchPolicy?.proxy?.mode ?? "system",
-				webFetchProxyUrl: settings.agent?.webFetchPolicy?.proxy?.url ?? "",
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -292,12 +285,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 
 	const save = () => {
 		const normalizedUpdateServerUrl = normalizeUrlProtocol(state.updateServerUrl) ?? "";
-		const normalizedWebFetchProxyUrl = normalizeProxyUrl(state.webFetchProxyUrl) ?? "";
 		const normalizedState = {
 			...state,
 			dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
 			updateServerUrl: normalizedUpdateServerUrl,
-			webFetchProxyUrl: normalizedWebFetchProxyUrl,
 		};
 		updateSettings.mutate(
 			{
@@ -356,14 +347,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,
 					commandBlacklist: state.globalCommandBlacklist,
-					webFetchPolicy: {
-						proxy: {
-							mode: state.webFetchProxyMode as "direct" | "system" | "custom",
-							...(state.webFetchProxyMode === "custom" && normalizedWebFetchProxyUrl
-								? { url: normalizedWebFetchProxyUrl }
-								: {}),
-						},
-					},
 				},
 				chapters: {
 					maxActiveWorktrees: state.maxWorktrees,

@@ -92,9 +92,32 @@ interface FollowTailOptions {
 interface JumpTargetResolution {
 	domIds: string[];
 	highlightId?: string;
+	/** Message id used as a fallback locator. A tool-only assistant message has
+	 *  no `msg-<id>` element — its blocks render as `tool-use-<toolUseId>` divs
+	 *  that carry `data-message-id`. When the id-based lookup misses, the jump
+	 *  falls back to `[data-message-id="<messageId>"]` so such messages still
+	 *  resolve. */
+	messageId?: string;
 }
 
 type JumpTargetResolver = () => JumpTargetResolution;
+
+/** Locate a jump target element by id (`msg-<id>` / `tool-use-<id>`) or, as a
+ *  fallback for tool-only messages that have no `msg-<id>` node, by the nearest
+ *  element carrying `data-message-id`. */
+function findJumpTargetEl(res: JumpTargetResolution): HTMLElement | null {
+	for (const domId of res.domIds) {
+		const el = document.getElementById(domId);
+		if (el) return el;
+	}
+	if (res.messageId) {
+		const escaped =
+			typeof CSS !== "undefined" && CSS.escape ? CSS.escape(res.messageId) : res.messageId;
+		const el = document.querySelector<HTMLElement>(`[data-message-id="${escaped}"]`);
+		if (el) return el;
+	}
+	return null;
+}
 
 function getScrollBottomTarget(el: HTMLElement): number {
 	return Math.max(0, el.scrollHeight - el.clientHeight);
@@ -744,6 +767,8 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 			tailChunkId,
 			hasOlderChunks,
 			loadOlderManifest,
+			getManifestSnapshot,
+			ensureManifestCoversSeq,
 			pruneBoundaryMessageId: chunkPruneBoundaryMessageId,
 			prunedPercent: chunkPrunedPercent,
 			setIsAtBottom,
@@ -889,6 +914,10 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		hasOlderChunksRef.current = hasOlderChunks;
 		const loadOlderManifestRef = useRef(loadOlderManifest);
 		loadOlderManifestRef.current = loadOlderManifest;
+		const getManifestSnapshotRef = useRef(getManifestSnapshot);
+		getManifestSnapshotRef.current = getManifestSnapshot;
+		const ensureManifestCoversSeqRef = useRef(ensureManifestCoversSeq);
+		ensureManifestCoversSeqRef.current = ensureManifestCoversSeq;
 		// Guards an upward manifest expansion + its scroll-position compensation,
 		// so a single trigger doesn't stack while the prepended band mounts.
 		const expandingOlderRef = useRef(false);
@@ -1028,20 +1057,6 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 		}, []);
 		const jumpTokenRef = useRef(0);
 
-		const scrollDomIdsIntoView = useCallback(
-			(domIds: string[], highlightId?: string) => {
-				for (const domId of domIds) {
-					const el = document.getElementById(domId);
-					if (!el) continue;
-					el.scrollIntoView({ behavior: "smooth", block: "center" });
-					if (highlightId) onHighlightTarget?.(highlightId, 400);
-					return true;
-				}
-				return false;
-			},
-			[onHighlightTarget],
-		);
-
 		const waitForJumpTarget = useCallback(
 			(resolveTarget: JumpTargetResolver, token: number, timeoutMs = JUMP_TARGET_TIMEOUT_MS) =>
 				new Promise<boolean>((resolve) => {
@@ -1049,6 +1064,20 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					let rafId = 0;
 					let done = false;
 					let observer: MutationObserver | null = null;
+					// Two-phase: first FIND the target (it mounts after the estimate-based
+					// scroll + band load), then SETTLE it. While the ~40 heavy messages in
+					// the mounted band measure their real heights, prefix sums + spacers
+					// recompute and the target drifts far off-screen. So once found we keep
+					// re-centering (instant) until its viewport position is stable across a
+					// few consecutive frames, or a settle deadline passes.
+					let found = false;
+					let settleStart = 0;
+					let lastTop = Number.NaN;
+					let stableFrames = 0;
+					const SETTLE_MS = 1200;
+					const STABLE_FRAMES_NEEDED = 4;
+					const STABLE_EPS = 2;
+					let highlighted = false;
 
 					const cleanup = () => {
 						if (rafId) cancelAnimationFrame(rafId);
@@ -1064,6 +1093,9 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 						if (done || rafId) return;
 						rafId = requestAnimationFrame(check);
 					};
+					const centerInstant = (el: HTMLElement) => {
+						el.scrollIntoView({ block: "center" });
+					};
 					const check = () => {
 						rafId = 0;
 						if (token !== jumpTokenRef.current) {
@@ -1071,12 +1103,49 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 							return;
 						}
 						const target = resolveTarget();
-						if (scrollDomIdsIntoView(target.domIds, target.highlightId)) {
-							finish(true);
+						const el = findJumpTargetEl(target);
+
+						if (!found) {
+							if (el) {
+								found = true;
+								settleStart = performance.now();
+								// Fire the highlight once, on first find.
+								if (target.highlightId && !highlighted) {
+									highlighted = true;
+									onHighlightTarget?.(target.highlightId, 400);
+								}
+								centerInstant(el);
+								schedule();
+								return;
+							}
+							if (performance.now() - start >= timeoutMs) {
+								finish(false);
+								return;
+							}
+							schedule();
 							return;
 						}
-						if (performance.now() - start >= timeoutMs) {
-							finish(false);
+
+						// Settle phase: element is mounted. Re-center until stable.
+						if (!el) {
+							// Got unmounted (recenter churn). Go back to finding.
+							found = false;
+							schedule();
+							return;
+						}
+						const top = el.getBoundingClientRect().top;
+						if (Number.isFinite(lastTop) && Math.abs(top - lastTop) <= STABLE_EPS) {
+							stableFrames++;
+						} else {
+							stableFrames = 0;
+						}
+						lastTop = top;
+						centerInstant(el);
+						if (
+							stableFrames >= STABLE_FRAMES_NEEDED ||
+							performance.now() - settleStart >= SETTLE_MS
+						) {
+							finish(true);
 							return;
 						}
 						schedule();
@@ -1089,7 +1158,7 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					}
 					schedule();
 				}),
-			[scrollDomIdsIntoView],
+			[onHighlightTarget],
 		);
 
 		const getChunkIndexForSeq = useCallback((seq: number) => {
@@ -1256,20 +1325,47 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				// Expand the window upward until it covers `seq` (or no older history
 				// remains). The window is tail-anchored, so a seq below the window's
 				// first chunk means we must pull more older manifest.
-				let chunkIndex = getChunkIndexForSeq(seq);
-				let guard = 0;
-				while (
-					chunkIndex < 0 &&
-					hasOlderChunksRef.current &&
-					(chunksRef.current[0]?.firstSeq ?? 0) > seq &&
-					guard++ < 200
-				) {
-					const added = await loadOlderManifestRef.current();
+				// Progress is tracked against the hook's SYNCHRONOUS manifest snapshot,
+				// not the committed `chunks`/`chunksRef` (which only update on the next
+				// React commit). loadOlderManifest advances manifestRef immediately, so
+				// gating the loop on committed state would stall after one batch: the
+				// stale window's firstSeq never moves within the loop and the next
+				// loadOlderManifest reports 0 new chunks (they're already in the ref),
+				// tripping the `added <= 0` break far above the target.
+				const manifestCoversSeq = () => {
+					const m = getManifestSnapshotRef.current();
+					if (m.length === 0) return false;
+					return seq >= m[0].firstSeq && seq <= m[m.length - 1].lastSeq;
+				};
+				const manifestFirstSeq = () => getManifestSnapshotRef.current()[0]?.firstSeq ?? 0;
+				// One bulk expansion loads every older chunk from the target seq down to
+				// the current window in as few requests as possible (server allows up to
+				// 200 chunks/req), updating state once. This replaces the previous
+				// per-10-chunk iterative loadOlderManifest loop, which both crawled
+				// (~155 round trips for a 31k-message history) and stalled on the
+				// synchronous-ref vs committed-state race.
+				if (!manifestCoversSeq() && hasOlderChunksRef.current && manifestFirstSeq() > seq) {
+					await ensureManifestCoversSeqRef.current(seq);
 					if (token !== jumpTokenRef.current) return false;
-					if (added <= 0) break;
-					chunkIndex = getChunkIndexForSeq(seq);
 				}
+				// Resolve the chunk index from the synchronous manifest; fall back to the
+				// committed chunks lookup once they align.
+				const snapshot = getManifestSnapshotRef.current();
+				let chunkIndex = snapshot.findIndex((c) => seq >= c.firstSeq && seq <= c.lastSeq);
+				if (chunkIndex < 0) chunkIndex = getChunkIndexForSeq(seq);
 				if (chunkIndex < 0) return false;
+				// The committed `chunks` array may still lag the manifest snapshot by one
+				// commit. Wait for it to catch up so setCenterChunkId + scroll math below
+				// operate on the same coordinate system the render uses.
+				{
+					let sync = 0;
+					while (getChunkIndexForSeq(seq) < 0 && token === jumpTokenRef.current && sync++ < 60) {
+						await waitAnimationFrame();
+					}
+					if (token !== jumpTokenRef.current) return false;
+					const committedIndex = getChunkIndexForSeq(seq);
+					if (committedIndex >= 0) chunkIndex = committedIndex;
+				}
 				const chunk = chunksRef.current[chunkIndex];
 				if (!chunk) return false;
 
@@ -1310,12 +1406,27 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 				highlightId?: string;
 			}) => {
 				const token = ++jumpTokenRef.current;
-				if (scrollDomIdsIntoView(domIds, highlightId)) return true;
+				// A tool-only assistant message renders under `tool-use-<id>` divs (no
+				// `msg-<id>` node), so the highlight/message id is carried as `messageId`
+				// for the data-message-id fallback locator.
+				const messageId =
+					highlightId ?? (domIds[0]?.startsWith("msg-") ? domIds[0].slice(4) : undefined);
+				const resolution: JumpTargetResolution = { domIds, highlightId, messageId };
+				// Fast path: already mounted. Detach from the bottom-follow loop first
+				// (otherwise, for a near-tail target, follow-tail re-pins to the bottom
+				// right after the settle centres it), then run the settle loop (not a
+				// one-shot smooth scroll) so height reconciliation of neighbouring chunks
+				// can't drift the target back off-screen.
+				if (findJumpTargetEl(resolution)) {
+					stopFollowTailRef.current();
+					setPinnedToBottom(false);
+					return waitForJumpTarget(() => resolution, token);
+				}
 				const seq = await resolveTargetSeq(targetIds).catch(() => null);
 				if (seq == null || token !== jumpTokenRef.current) return false;
-				return scrollToSeqTarget(seq, () => ({ domIds, highlightId }), token);
+				return scrollToSeqTarget(seq, () => resolution, token);
 			},
-			[resolveTargetSeq, scrollDomIdsIntoView, scrollToSeqTarget],
+			[resolveTargetSeq, scrollToSeqTarget, waitForJumpTarget, setPinnedToBottom],
 		);
 
 		const scrollToBottom = useCallback(

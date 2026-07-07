@@ -209,6 +209,16 @@ export const activeNarrators = hotSafe<Map<string, ActiveNarrator>>(
 	() => new Map(),
 );
 
+export interface KnowledgeInjectionCycleState {
+	seq: number;
+	ids: Set<string>;
+}
+
+export const knowledgeInjectionCycleStates = hotSafe<Map<string, KnowledgeInjectionCycleState>>(
+	"narrafork.knowledgeInjectionCycleStates",
+	() => new Map(),
+);
+
 /**
  * Reset reusable upstream provider/session state for the active narrator before
  * its next model request. Returns false when the narrator is not currently active.

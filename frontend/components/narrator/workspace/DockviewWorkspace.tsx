@@ -9,30 +9,52 @@
  */
 
 import { type DockviewApi, type DockviewDidDropEvent, positionToDirection } from "dockview-react";
-import { useCallback, useEffect, useRef } from "react";
+import { type RefObject, useCallback, useEffect, useRef } from "react";
 import { api as apiClient } from "../../../lib/api";
-import type { PanelDragState } from "../../../lib/panel-drag";
+import { isNarratorSubject, type PanelDragState } from "../../../lib/panel-drag";
 import {
 	type DockviewDropTarget,
 	DockviewSurface,
 	intentToDirection,
 	intentToPosition,
 } from "../../dockview";
-import { applyDirectorMode } from "./director";
+import type { DirectorLeaf } from "./director-constants";
 import { consumeWorkspaceDropPayload, WORKSPACE_DND_MIME } from "./dnd-bridge";
 import {
 	applyResolvedLayout,
 	collectNarratorIdsFromTree,
 	componentForParams,
+	DEFAULT_DIRECTOR_STATE,
 	drainPendingPanels,
+	nextWorkspacePanelId,
 	onPendingPanel,
 	resolveWorkspaceLayout,
 	serializeWorkspaceLayout,
 	type WorkspaceDirectorState,
 } from "./dockview-layout";
 import { type WorkspacePanelParams, workspacePanelComponents } from "./panels";
+import { createWorkspaceDockStore, WorkspaceDockProvider } from "./workspace-dock";
 
 const SAVE_DEBOUNCE_MS = 500;
+
+/**
+ * Imperative handle for driving director mode from outside the workspace.
+ *
+ * All mutations flow through here so the persisted `director` state (mode /
+ * primary panel / ratio) stays in sync with what the director overlay shows.
+ * `closePanel` is the only one that actually removes a dockview panel.
+ */
+export interface DirectorControl {
+	setMode: (mode: "grid" | "director") => void;
+	/** Promote a panel to primary in director mode. */
+	setPrimary: (panelId: string) => void;
+	/** Persist the primary/rail ratio. */
+	setRatio: (ratio: number) => void;
+	/** Close a dockview panel by id (goes through dockview's normal removal). */
+	closePanel: (panelId: string) => void;
+	/** Update a dockview panel's params (e.g. edited webview config). */
+	updatePanelParams: (panelId: string, params: WorkspacePanelParams) => void;
+}
 
 interface DockviewWorkspaceProps {
 	workspaceId: string;
@@ -42,10 +64,18 @@ interface DockviewWorkspaceProps {
 	serverUpdatedAt: number | undefined;
 	/** Notify parent when the live narrator id set changes (for recent-tab sync). */
 	onNarratorIdsChange?: (ids: string[]) => void;
+	/** Notify parent of the live panel list (for the director overlay). */
+	onPanelsChange?: (leaves: DirectorLeaf[]) => void;
 	/** Called once the DockviewApi is ready. */
 	onApiReady?: (api: DockviewApi) => void;
-	/** Director state changes (mode / primary panel) for toolbar reflection. */
+	/** Director state changes (mode / primary panel / ratio) for toolbar + overlay. */
 	onDirectorStateChange?: (state: WorkspaceDirectorState) => void;
+	/**
+	 * Imperative handle to drive director mode. Mutations here keep the internal
+	 * `directorRef` and layout persistence in sync; director mode is a pure
+	 * overlay and never mutates the dockview layout (except `closePanel`).
+	 */
+	directorControlRef?: RefObject<DirectorControl | null>;
 }
 
 /** Extract the live narrator ids from the current Dockview layout. */
@@ -58,18 +88,38 @@ function collectLiveNarratorIds(api: DockviewApi): string[] {
 	return ids;
 }
 
+/** Snapshot the live panels as director leaves (id + params + title). */
+function collectPanels(api: DockviewApi): DirectorLeaf[] {
+	const leaves: DirectorLeaf[] = [];
+	for (const panel of api.panels) {
+		const params = panel.params as WorkspacePanelParams | undefined;
+		if (!params) continue;
+		// Narrator-scoped tool panels are cluster resources, not top-level cells;
+		// director mode shows narrator/terminal/webview cells only.
+		if (params.panelType === "narrator-tool") continue;
+		leaves.push({ id: panel.api.id, params, title: panel.api.title ?? "" });
+	}
+	return leaves;
+}
+
 export function DockviewWorkspace({
 	workspaceId,
 	treeJson,
 	serverUpdatedAt,
 	onNarratorIdsChange,
+	onPanelsChange,
 	onApiReady,
 	onDirectorStateChange,
+	directorControlRef,
 }: DockviewWorkspaceProps) {
 	const apiRef = useRef<DockviewApi | null>(null);
+	// Per-workspace dock store (shards tool-panel coordination by narratorId).
+	// Created once, bound to this surface's api ref.
+	const dockStoreRef = useRef<ReturnType<typeof createWorkspaceDockStore> | null>(null);
+	if (!dockStoreRef.current) dockStoreRef.current = createWorkspaceDockStore(apiRef);
 	const apiDisposablesRef = useRef<Array<{ dispose(): void }>>([]);
 	const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-	const directorRef = useRef<WorkspaceDirectorState>({ mode: "grid", primaryPanelId: null });
+	const directorRef = useRef<WorkspaceDirectorState>({ ...DEFAULT_DIRECTOR_STATE });
 	const localEditRef = useRef(false);
 	const loadedAtRef = useRef<number | null>(null);
 	/** Narrator ids we have joined (via panels) and must leave on unmount. */
@@ -89,13 +139,79 @@ export function DockviewWorkspace({
 		}, SAVE_DEBOUNCE_MS);
 	}, [workspaceId]);
 
+	// ── Director mode (pure overlay; never mutates the dockview layout) ──
+	// All director mutations flow through the imperative handle so the persisted
+	// `director` state stays in sync. Entering/leaving director mode and picking
+	// a primary panel do NOT add/remove dockview panels, so they never trigger
+	// the "workspace empty → navigate away" path (only closePanel can).
+	const commitDirector = useCallback(
+		(next: WorkspaceDirectorState) => {
+			directorRef.current = next;
+			// Tell the dock store so the underlying panel adapters unmount their
+			// content while the director overlay hosts the live instances.
+			dockStoreRef.current?.setDirectorActive(next.mode === "director");
+			onDirectorStateChange?.(directorRef.current);
+			persist();
+		},
+		[persist, onDirectorStateChange],
+	);
+
+	const setMode = useCallback(
+		(mode: "grid" | "director") => {
+			const api = apiRef.current;
+			const primaryPanelId =
+				mode === "director"
+					? (directorRef.current.primaryPanelId ?? api?.activePanel?.id ?? null)
+					: directorRef.current.primaryPanelId;
+			commitDirector({ ...directorRef.current, mode, primaryPanelId });
+		},
+		[commitDirector],
+	);
+
+	const setPrimary = useCallback(
+		(panelId: string) => {
+			commitDirector({ ...directorRef.current, primaryPanelId: panelId });
+		},
+		[commitDirector],
+	);
+
+	const setRatio = useCallback(
+		(ratio: number) => {
+			commitDirector({ ...directorRef.current, primaryRatio: ratio });
+		},
+		[commitDirector],
+	);
+
+	const closePanel = useCallback((panelId: string) => {
+		apiRef.current?.getPanel(panelId)?.api.close();
+	}, []);
+
+	const updatePanelParams = useCallback((panelId: string, params: WorkspacePanelParams) => {
+		apiRef.current?.getPanel(panelId)?.api.updateParameters(params);
+	}, []);
+
+	useEffect(() => {
+		if (!directorControlRef) return;
+		directorControlRef.current = { setMode, setPrimary, setRatio, closePanel, updatePanelParams };
+		return () => {
+			directorControlRef.current = null;
+		};
+	}, [directorControlRef, setMode, setPrimary, setRatio, closePanel, updatePanelParams]);
+
 	const syncNarratorIds = useCallback(() => {
 		const api = apiRef.current;
 		if (!api) return;
+		// Close tool panels whose owning narrator cell is gone and reclaim dead
+		// sharded state before recomputing, so orphans don't linger or accumulate.
+		dockStoreRef.current?.pruneOrphanedClusters(api);
+		// Refresh each narrator's open-tool set so cluster toolbars reflect the
+		// live layout (open/close/drag of tool tabs).
+		dockStoreRef.current?.refreshOpenToolTypes(api);
 		const ids = collectLiveNarratorIds(api);
 		onNarratorIdsChange?.(ids);
+		onPanelsChange?.(collectPanels(api));
 		joinedNarratorIdsRef.current = new Set(ids);
-	}, [onNarratorIdsChange]);
+	}, [onNarratorIdsChange, onPanelsChange]);
 
 	/** Add any panels queued for this workspace (sidebar handoff). */
 	const drainPendingPanelsInto = useCallback(
@@ -112,8 +228,7 @@ export function DockviewWorkspace({
 						continue;
 					}
 				}
-				const id =
-					params.panelType === "narrator" ? params.narratorId : `dvp_${Date.now().toString(36)}`;
+				const id = params.panelType === "narrator" ? params.narratorId : nextWorkspacePanelId();
 				api.addPanel({ id, component: componentForParams(params), params });
 			}
 		},
@@ -127,6 +242,9 @@ export function DockviewWorkspace({
 
 			const resolved = resolveWorkspaceLayout(treeJsonRef.current);
 			directorRef.current = resolved.director;
+			// Seed the store's director flag from the restored state so underlying
+			// panels start unmounted when a workspace reopens in director mode.
+			dockStoreRef.current?.setDirectorActive(resolved.director.mode === "director");
 			try {
 				applyResolvedLayout(api, resolved);
 			} catch {
@@ -140,10 +258,8 @@ export function DockviewWorkspace({
 			// arrived before this instance mounted.
 			drainPendingPanelsInto(api);
 
-			// Restore director mode after layout is in place.
-			if (resolved.director.mode === "director") {
-				applyDirectorMode(api, resolved.director);
-			}
+			// Director mode is a pure overlay owned by the route; just report the
+			// restored state so the toolbar + overlay reflect it.
 			onDirectorStateChange?.(directorRef.current);
 			syncNarratorIds();
 			onApiReady?.(api);
@@ -185,7 +301,7 @@ export function DockviewWorkspace({
 		if (!payload) return;
 
 		const params = payload.params;
-		const id = payload.id ?? `dvp_${Date.now().toString(36)}`;
+		const id = payload.id ?? nextWorkspacePanelId();
 
 		// If a panel for this narrator already exists, just focus it.
 		if (params.panelType === "narrator") {
@@ -217,7 +333,9 @@ export function DockviewWorkspace({
 	const handleDropSubject = useCallback(
 		(drag: PanelDragState, target: DockviewDropTarget, api: DockviewApi) => {
 			const narratorId = drag.id;
-			if (!narratorId || narratorId === "__terminal__" || narratorId === "__webview__") return;
+			// Only a real narrator subject can be materialised as a narrator panel;
+			// tool/webview panel drags are handled generically by DockviewSurface.
+			if (!narratorId || !isNarratorSubject(drag)) return;
 			const group = api.groups.find((g) => g.id === target.groupId);
 			if (!group) return;
 
@@ -280,15 +398,17 @@ export function DockviewWorkspace({
 	}, [workspaceId]);
 
 	return (
-		<DockviewSurface
-			apiRef={apiRef}
-			components={workspacePanelComponents}
-			onReady={handleReady}
-			onDidDrop={handleDidDrop}
-			onDropSubject={handleDropSubject}
-			// Preserve panel component instances (live narrator sessions, terminals,
-			// webviews) when panels are dragged/rearranged across groups.
-			defaultRenderer="always"
-		/>
+		<WorkspaceDockProvider store={dockStoreRef.current}>
+			<DockviewSurface
+				apiRef={apiRef}
+				components={workspacePanelComponents}
+				onReady={handleReady}
+				onDidDrop={handleDidDrop}
+				onDropSubject={handleDropSubject}
+				// Preserve panel component instances (live narrator sessions, terminals,
+				// webviews) when panels are dragged/rearranged across groups.
+				defaultRenderer="always"
+			/>
+		</WorkspaceDockProvider>
 	);
 }
