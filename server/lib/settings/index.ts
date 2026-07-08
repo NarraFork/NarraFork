@@ -551,26 +551,29 @@ export function migrateGlobalProxy(
 		changed = true;
 	}
 
-	// Clear deprecated per-provider proxy fields regardless of migration path.
+	// Clear ONLY the legacy string-form per-location proxy fields. The new
+	// per-location ProxyOverride is an object ({ mode, url }); never delete it.
+	// biome-ignore lint/suspicious/noExplicitAny: probing deprecated field shape
+	const isLegacyStringProxy = (obj: any): boolean => typeof obj?.proxy === "string";
 		changed = true;
 	}
-	if (s.codex && "proxy" in s.codex) {
+	if (s.codex && isLegacyStringProxy(s.codex)) {
 		delete s.codex.proxy;
 		changed = true;
 	}
-	if (s.agent?.webFetchPolicy && "proxy" in s.agent.webFetchPolicy) {
+	if (s.agent?.webFetchPolicy && typeof s.agent.webFetchPolicy.proxy === "string") {
 		delete s.agent.webFetchPolicy.proxy;
 		changed = true;
 	}
 	for (const provider of settings.anthropicProviders ?? []) {
-		if ("proxy" in provider) {
+		if (isLegacyStringProxy(provider)) {
 			// biome-ignore lint/suspicious/noExplicitAny: deleting deprecated field
 			delete (provider as any).proxy;
 			changed = true;
 		}
 	}
 	for (const provider of settings.customApiProviders ?? []) {
-		if ("proxy" in provider) {
+		if (isLegacyStringProxy(provider)) {
 			// biome-ignore lint/suspicious/noExplicitAny: deleting deprecated field
 			delete (provider as any).proxy;
 			changed = true;

@@ -114,6 +114,13 @@ export interface ActiveNarrator {
 	_continuationNoToolCount?: number;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
+	/** Completed tool count when the tasks.json reminder was last injected. */
+	_lastTasksReminderCompletedToolCount?: number;
+	/** Completed tool count when the behavior fence was last injected. */
+	_lastFenceCompletedToolCount?: number;
+	/** Resolved tasks.json reminder injection interval for this turn. null/undefined = follow default;
+	 *  -1 = disabled; >0 = inject every N completed tool calls. */
+	_tasksReminderInterval?: number;
 	/** Resolved behavior-fence injection interval for this turn. null/undefined = follow default;
 	 *  -1 = disabled; >0 = inject every N completed tool calls. */
 	_fenceInterval?: number;

@@ -34,6 +34,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
+import { ProxyOverrideField } from "../../components/common/ProxyOverrideField";
 import { ProjectSkillsManager } from "../../components/project/ProjectSkillsManager";
 import {
 	type CustomSubagentDef,
@@ -66,7 +67,6 @@ import {
 	useMcpTransportsCapability,
 	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
-
 import { useProjects } from "../../hooks/useProjects";
 import {
 	useGlobalPrompt,
@@ -85,6 +85,7 @@ import {
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
+import type { ProxyOverride } from "../../lib/proxy";
 import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/routines/")({
@@ -303,6 +304,7 @@ interface HookDraft {
 	command: string;
 	url: string;
 	headers: string;
+	proxy?: ProxyOverride;
 	timeout: number;
 	enabled: boolean;
 }
@@ -314,6 +316,7 @@ const emptyHookDraft: HookDraft = {
 	command: "",
 	url: "",
 	headers: "",
+	proxy: undefined,
 	timeout: 30,
 	enabled: true,
 };
@@ -493,6 +496,9 @@ function HooksTab() {
 				command: hook.command ?? "",
 				url: hook.url ?? "",
 				headers: hook.headers ? JSON.stringify(hook.headers, null, 2) : "",
+				proxy: hook.proxyMode
+					? { mode: hook.proxyMode, url: hook.proxyUrl ?? undefined }
+					: undefined,
 				timeout: hook.timeout ?? 30,
 				enabled: hook.enabled ?? true,
 			});
@@ -524,6 +530,8 @@ function HooksTab() {
 					return;
 				}
 			}
+			payload.proxyMode = draft.proxy?.mode ?? null;
+			payload.proxyUrl = draft.proxy?.mode === "custom" ? (draft.proxy.url ?? null) : null;
 		}
 
 		if (editingId) {
@@ -737,6 +745,10 @@ function HooksTab() {
 								minRows={2}
 								maxRows={6}
 								styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
+							/>
+							<ProxyOverrideField
+								value={draft.proxy}
+								onChange={(next) => setDraft((d) => ({ ...d, proxy: next }))}
 							/>
 						</>
 					)}

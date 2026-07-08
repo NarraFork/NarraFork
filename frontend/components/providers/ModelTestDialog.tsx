@@ -3,11 +3,26 @@ import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
+import { ApiError } from "../../lib/api/client";
 
 interface ModelTestDialogProps {
 	opened: boolean;
 	onClose: () => void;
 	modelValue: string;
+}
+
+interface RequestUrl {
+	url: string;
+	method: string;
+}
+
+/** Extract captured request URLs from a failed test (error response body). */
+function requestUrlsFromError(error: unknown): RequestUrl[] {
+	if (error instanceof ApiError) {
+		const urls = error.data?.requestUrls;
+		if (Array.isArray(urls)) return urls as RequestUrl[];
+	}
+	return [];
 }
 
 const DEFAULT_PROMPT = "Please introduce yourself in one sentence. / 请用一句话介绍你自己。";
@@ -25,6 +40,11 @@ export function ModelTestDialog({ opened, onClose, modelValue }: ModelTestDialog
 			? testMut.data.text.slice(0, MAX_MODEL_TEST_RESULT_CHARS)
 			: testMut.data?.text;
 	const resultTruncated = !!testMut.data?.text && displayedResult !== testMut.data.text;
+
+	// Actual request URLs: from success payload, or from the error body on failure.
+	const requestUrls: RequestUrl[] = testMut.isSuccess
+		? (testMut.data?.requestUrls ?? [])
+		: requestUrlsFromError(testMut.error);
 
 	const handleTest = () => {
 		testMut.mutate();
@@ -79,6 +99,17 @@ export function ModelTestDialog({ opened, onClose, modelValue }: ModelTestDialog
 								{displayedResult}
 							</Code>
 						</ScrollArea.Autosize>
+					</Stack>
+				)}
+
+				{(testMut.isSuccess || testMut.isError) && requestUrls.length > 0 && (
+					<Stack gap="xs">
+						<Text size="sm" fw={500}>
+							{t("modelTestRequestUrls")}
+						</Text>
+						<Code block style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+							{requestUrls.map((r) => `${r.method} ${r.url}`).join("\n")}
+						</Code>
 					</Stack>
 				)}
 			</Stack>

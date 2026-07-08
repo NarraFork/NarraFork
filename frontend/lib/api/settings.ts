@@ -33,10 +33,13 @@ export const settingsApi = {
 			},
 		),
 	testModel: (model: string, prompt: string) =>
-		request<{ text: string }>("/settings/test-model", {
-			method: "POST",
-			body: JSON.stringify({ model, prompt }),
-		}),
+		request<{ text: string; requestUrls?: { url: string; method: string }[] }>(
+			"/settings/test-model",
+			{
+				method: "POST",
+				body: JSON.stringify({ model, prompt }),
+			},
+		),
 	testSearchChannel: (data: { channelId?: string; query: string; purpose?: string }) =>
 		request<{ text: string; channelId: string; channelLabel: string; attempts?: unknown[] }>(
 			"/settings/search/test",

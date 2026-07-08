@@ -58,9 +58,10 @@ import type {
 	CodexUsageSummary,
 	CodexUsageTierStats,
 } from "../../lib/api/types";
-
+import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { CodexQuotaTrendChart as SharedCodexQuotaTrendChart } from "./CodexQuotaTrendChart";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
@@ -370,6 +371,20 @@ export const CodexSection = React.memo(function CodexSection({
 	const { t: tn } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
+	const { data: codexSettingsData } = useQuery({
+		queryKey: ["admin", "settings"],
+		queryFn: api.getSettings,
+		gcTime: 60_000,
+	});
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
+	const codexProxy = (codexSettingsData as any)?.codex?.proxy as ProxyOverride | undefined;
+	const codexProxyMut = useMutation({
+		mutationFn: (proxy: ProxyOverride | undefined) => api.updateSettings({ codex: { proxy } }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+	});
 	const codexRuntimeCapability = useProviderRuntimeCapability("codex");
 	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
 	const codexRoutesSupported = codexRuntimeCapability?.routes?.supported !== false;
@@ -989,9 +1004,11 @@ export const CodexSection = React.memo(function CodexSection({
 						</SortableContext>
 					</DndContext>
 				</Stack>
-				<Text size="xs" c="dimmed">
-					{t("proxyMovedToGlobalNote")}
-				</Text>
+				<ProxyOverrideField
+					value={codexProxy}
+					onChange={(next) => codexProxyMut.mutate(next)}
+					disabled={codexProxyMut.isPending}
+				/>
 				<Group align="flex-end">
 					<TextInput
 						size="xs"

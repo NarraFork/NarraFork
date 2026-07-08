@@ -101,6 +101,7 @@ function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderStat
 		baseUrl: provider.baseUrl,
 		defaultModel: provider.defaultModel,
 		apiMode,
+		proxy: provider.proxy,
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
@@ -119,6 +120,7 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		baseUrl: provider.baseUrl,
 		defaultModel: provider.defaultModel,
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? null,
+		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		officialApi: provider.protocol === "anthropic-official",
 		disabled: provider.disabled ?? false,
@@ -154,6 +156,7 @@ function normalizeCustomApiProvider(
 		protocol: provider.protocol ?? "responses-compatible",
 		defaultContextWindow: provider.defaultContextWindow,
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? null,
+		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		codexAccountId: provider.codexAccountId ?? "",
 		codexWebSocket: provider.codexWebSocket ?? false,
@@ -247,6 +250,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				codexWebSocket: p.codexWebSocket ?? false,
 				codexWebSearch: p.codexWebSearch ?? true,
 				codexImageGeneration: p.codexImageGeneration ?? true,
+				proxy: p.proxy,
 				disabled: p.disabled ?? false,
 			}));
 
@@ -259,6 +263,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				baseUrl: p.baseUrl ?? "",
 				defaultModel: p.defaultModel ?? "",
 				defaultReasoningEffort: p.defaultReasoningEffort ?? null,
+				proxy: p.proxy,
 				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
 				officialApi: p.officialApi ?? false,
 				disabled: p.disabled ?? false,
@@ -289,6 +294,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				oauthClientId: p.oauthClientId,
 				oauthClientSecret: p.oauthClientSecret,
 				oauthDeviceId: p.oauthDeviceId,
+				proxy: p.proxy,
 			}));
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

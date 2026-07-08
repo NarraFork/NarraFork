@@ -5,7 +5,7 @@
 import { type CallContext, getCodexManager } from "../codex-manager";
 import { isUnauthorizedCodexUsageError } from "../codex-usage";
 import { logger } from "../logger";
-import { getOutboundProxy } from "../net/proxy";
+import { resolveOverride } from "../net/proxy";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
@@ -152,7 +152,11 @@ export class CodexProvider implements ProviderAdapter {
 
 	/** Create a temporary OpenAIProvider with the current credential. */
 	private createProvider(ctx: CallContext): OpenAIProvider {
-		const proxy = getOutboundProxy();
+		// Resolve codex's own proxy override (absent/"default" → global). The
+		// resolved string is passed to OpenAIProvider so it covers both HTTP
+		// (via pfetch precedence) and the WebSocket path, never falling back to
+		// the global policy and losing codex's override.
+		const proxy = resolveOverride(settings.codex?.proxy);
 
 		return new OpenAIProvider(
 			{
@@ -504,7 +508,7 @@ export class CodexProvider implements ProviderAdapter {
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
 					accountId: ctx.credential.accountId,
-					proxy: getOutboundProxy(),
+					proxy: resolveOverride(settings.codex?.proxy),
 					sessionKey: params.stickySessionKey ?? params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,

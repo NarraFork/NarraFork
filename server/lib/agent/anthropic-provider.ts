@@ -22,6 +22,7 @@ import type {
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
+import { recordRequestUrl } from "./request-url-tracker";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -651,12 +652,14 @@ export class AnthropicProvider implements ProviderAdapter {
 
 	/**
 	 * Proxy-aware fetch with optional TLS verification bypass. Resolves the
-	 * global outbound proxy per target URL so every Anthropic request (streaming
-	 * and auxiliary summary/title calls alike) follows the global proxy policy.
+	 * proxy per target URL, honouring this provider's own proxy override
+	 * (absent/"default" → global policy). Covers streaming and auxiliary
+	 * summary/title calls alike.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		const proxy = resolveProxyForUrl(target);
+		recordRequestUrl(String(target), init?.method);
+		const proxy = resolveProxyForUrl(target, this.config.proxy);
 		const extra: Record<string, unknown> = {};
 		if (proxy) {
 			extra.proxy = proxy;

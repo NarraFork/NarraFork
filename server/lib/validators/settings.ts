@@ -2,11 +2,20 @@ import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema } from "./common";
 
+/** Per-location proxy override: default (inherit global) / direct / system / custom. */
+const proxyOverrideSchema = z
+	.object({
+		mode: z.enum(["default", "direct", "system", "custom"]),
+		url: z.string().max(500).optional(),
+	})
+	.optional();
+
 // === Gateway per-user configuration ===
 
 const gatewayPlatformConfigSchema = z.object({
 	platform: z.enum(["telegram", "discord", "slack", "feishu", "webhook", "weixin", "qqbot"]),
 	enabled: z.boolean(),
+	proxy: proxyOverrideSchema,
 	// Telegram / Discord
 	token: z.string().max(500).optional(),
 	// Slack

@@ -1,4 +1,5 @@
 import type { ModelOption } from "../../lib/constants";
+import type { ProxyOverride } from "../../lib/proxy";
 
 export type CustomApiProtocol =
 	| "anthropic-official"
@@ -17,6 +18,7 @@ export interface CustomApiProviderState {
 	protocol: CustomApiProtocol;
 	defaultContextWindow?: number;
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
 	codexAccountId: string;
 	codexWebSocket?: boolean;
@@ -39,6 +41,7 @@ export interface OpenAIProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	proxy?: ProxyOverride;
 	disabled?: boolean;
 }
 
@@ -50,6 +53,7 @@ export interface AnthropicProviderState {
 	baseUrl: string;
 	defaultModel: string;
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | null;
+	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
 	officialApi?: boolean;
 	disabled?: boolean;

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { logger } from "../logger";
-import { resolveProxyForUrl } from "../net/proxy";
+import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
@@ -25,6 +25,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
+import { recordRequestUrl } from "./request-url-tracker";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -490,13 +491,19 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL so
-	 * all OpenAI-compatible providers (regular, Codex HTTP, NUG sub-providers)
-	 * uniformly follow the global proxy policy, with loopback/NO_PROXY exemptions.
+	 * Proxy-aware fetch. Precedence:
+	 *   1. `this.proxy` — an already-resolved fixed proxy string passed by the
+	 *      constructor (only Codex does this; reused for HTTP + WebSocket).
+	 *   2. otherwise `this.config.proxy` — this provider's own ProxyOverride
+	 *      (absent/"default" → global policy).
+	 * Both paths apply loopback/NO_PROXY exemptions per target URL.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		const proxy = resolveProxyForUrl(target);
+		recordRequestUrl(String(target), init?.method);
+		const proxy = this.proxy
+			? applyProxyExemptions(this.proxy, target)
+			: resolveProxyForUrl(target, this.config.proxy);
 		if (proxy) {
 			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
 			return fetch(input, { ...init, proxy } as any);

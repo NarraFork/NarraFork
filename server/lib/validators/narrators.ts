@@ -48,7 +48,26 @@ export const createNarratorSchema = z.object({
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
 	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
-	behaviorFenceIntervalOverride: z.number().int().min(-1).max(1000).nullable().optional(),
+	behaviorFenceIntervalOverride: z
+		.number()
+		.int()
+		.min(-1)
+		.max(1000)
+		.refine((v) => v === -1 || v >= 5, {
+			message: "Interval must be -1 or at least 5",
+		})
+		.nullable()
+		.optional(),
+	tasksReminderIntervalOverride: z
+		.number()
+		.int()
+		.min(-1)
+		.max(1000)
+		.refine((v) => v === -1 || v >= 5, {
+			message: "Interval must be -1 or at least 5",
+		})
+		.nullable()
+		.optional(),
 	behaviorFenceAttachOverride: booleanOverrideSchema.optional(),
 	// Named narrator: when makeNamed is true, handle is required and the narrator
 	// gets the "named" trait. Named narrators are standalone, long-lived, and

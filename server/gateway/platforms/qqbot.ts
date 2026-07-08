@@ -196,7 +196,7 @@ export class QQBotAdapter extends BaseAdapter {
 	}
 
 	private async refreshToken(): Promise<string> {
-		const proxy = resolveProxyForUrl(TOKEN_URL);
+		const proxy = resolveProxyForUrl(TOKEN_URL, this.config.proxy);
 		const resp = await fetch(TOKEN_URL, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -226,7 +226,7 @@ export class QQBotAdapter extends BaseAdapter {
 	private async getGatewayUrl(): Promise<string> {
 		const token = await this.ensureToken();
 		const gwUrl = `${this.apiBase}${GATEWAY_URL_PATH}`;
-		const proxy = resolveProxyForUrl(gwUrl);
+		const proxy = resolveProxyForUrl(gwUrl, this.config.proxy);
 		const resp = await fetch(gwUrl, {
 			headers: {
 				Authorization: `QQBot ${token}`,
@@ -254,7 +254,7 @@ export class QQBotAdapter extends BaseAdapter {
 	private async openWebSocket(gatewayUrl: string): Promise<void> {
 		// Resolve/create the proxy agent BEFORE cleanup+connect so the socket-pool
 		// reference lives on `this.wsAgent` and is destroyed on the next cleanup().
-		const proxy = resolveProxyForUrl(gatewayUrl);
+		const proxy = resolveProxyForUrl(gatewayUrl, this.config.proxy);
 		const agent = await createProxyAgent(proxy);
 		return new Promise<void>((resolve, reject) => {
 			this.cleanup();
@@ -749,7 +749,7 @@ export class QQBotAdapter extends BaseAdapter {
 	private async downloadMedia(url: string): Promise<ArrayBuffer | null> {
 		try {
 			const token = await this.ensureToken();
-			const proxy = resolveProxyForUrl(url);
+			const proxy = resolveProxyForUrl(url, this.config.proxy);
 			const resp = await fetch(url, {
 				headers: {
 					Authorization: `QQBot ${token}`,
@@ -808,7 +808,7 @@ export class QQBotAdapter extends BaseAdapter {
 			formData.append("model", this.sttConfig.model);
 
 			const sttUrl = `${this.sttConfig.baseUrl}/audio/transcriptions`;
-			const proxy = resolveProxyForUrl(sttUrl);
+			const proxy = resolveProxyForUrl(sttUrl, this.config.proxy);
 			const resp = await fetch(sttUrl, {
 				method: "POST",
 				headers: {
@@ -1144,7 +1144,7 @@ export class QQBotAdapter extends BaseAdapter {
 	): Promise<Record<string, unknown>> {
 		const token = await this.ensureToken();
 		const url = `${this.apiBase}${path}`;
-		const proxy = resolveProxyForUrl(url);
+		const proxy = resolveProxyForUrl(url, this.config.proxy);
 
 		const resp = await fetch(url, {
 			method,

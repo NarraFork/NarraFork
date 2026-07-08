@@ -10,18 +10,10 @@ import {
 	ScrollArea,
 	SegmentedControl,
 	Text,
-	Tooltip,
 } from "@mantine/core";
 import { useHotkeys } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import {
-	IconChecklist,
-	IconDeviceFloppy,
-	IconFileText,
-	IconLock,
-	IconRefresh,
-	IconX,
-} from "@tabler/icons-react";
+import { IconChecklist, IconFileText, IconLock, IconX } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -45,23 +37,14 @@ interface SpecPanelProps {
 	onClose: () => void;
 	/**
 	 * When true (dock surface), suppress this panel's own title bar — the dock's
-	 * ToolPanelShell provides the single header. The save/reload controls are
-	 * reported up via `onHeaderActionsChange` so they render in that shared
-	 * header; the file-tabs row stays as the content top row.
+	 * ToolPanelShell provides the single header. The file-tabs row stays as the content top row.
 	 */
 	chromeless?: boolean;
-	/** Report the header action controls (save/reload) to the dock shell. */
-	onHeaderActionsChange?: (node: React.ReactNode | null) => void;
 }
 
 const TASKS_URI = "spec://tasks.json";
 
-export function SpecPanel({
-	narratorId,
-	onClose,
-	chromeless = false,
-	onHeaderActionsChange,
-}: SpecPanelProps) {
+export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanelProps) {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const { data: files } = useSpecFiles(narratorId);
@@ -95,7 +78,7 @@ export function SpecPanel({
 	const uiEditable = fileData?.uiEditable ?? selectedMeta?.uiEditable ?? true;
 	// Agent-readonly: the assistant's tools can't write it (e.g. behavior_fence).
 	const isAgentReadonly = fileData?.readonly ?? selectedMeta?.readonly ?? false;
-	// Preview-only in the UI: not a task file and not UI-editable (e.g. HOW_TO_USE_SPEC.md).
+	// Preview-only in the UI: not a task file and not UI-editable.
 	const isPreviewOnly = !isTasksFile && !uiEditable;
 	// Show the behavior-fence hint: agent-readonly but the user may still edit it.
 	const showFenceEditHint = !isTasksFile && isAgentReadonly && uiEditable;
@@ -189,17 +172,6 @@ export function SpecPanel({
 		}
 	}, [isTasksFile, tasksData, fileData]);
 
-	// Stable wrappers so the hoisted header-actions node (below) does not change
-	// identity every render. `handleSave` depends on the react-query mutation
-	// object, which is a fresh reference each render; calling through refs keeps
-	// the reported node stable and avoids an infinite update loop in dock mode.
-	const handleSaveRef = useRef(handleSave);
-	handleSaveRef.current = handleSave;
-	const handleReloadRef = useRef(handleReload);
-	handleReloadRef.current = handleReload;
-	const stableSave = useCallback(() => handleSaveRef.current(), []);
-	const stableReload = useCallback(() => handleReloadRef.current(), []);
-
 	useHotkeys([
 		[
 			"mod+s",
@@ -209,42 +181,6 @@ export function SpecPanel({
 			},
 		],
 	]);
-
-	// The save/reload controls hoisted into the dock's shared header. Memoized so
-	// the node keeps a stable identity unless something that affects the buttons
-	// actually changes — using the stable* wrappers (not handleSave/handleReload,
-	// which change every render via the react-query mutation object).
-	const headerActionsNode = useMemo<React.ReactNode>(() => {
-		if (!chromeless || !(dirty && !isPreviewOnly)) return null;
-		return (
-			<>
-				<Tooltip label={t("spec.reload")}>
-					<ActionIcon size="sm" variant="subtle" color="gray" onClick={stableReload}>
-						<IconRefresh size={14} />
-					</ActionIcon>
-				</Tooltip>
-				<Tooltip label={t("spec.save")}>
-					<ActionIcon
-						size="sm"
-						variant="light"
-						color="green"
-						onClick={stableSave}
-						loading={updateFile.isPending}
-					>
-						<IconDeviceFloppy size={14} />
-					</ActionIcon>
-				</Tooltip>
-			</>
-		);
-	}, [chromeless, dirty, isPreviewOnly, updateFile.isPending, stableSave, stableReload, t]);
-
-	// In chromeless (dock) mode, hoist the controls into the dock's shared header
-	// via the reporting callback. Clears on unmount / when clean.
-	useEffect(() => {
-		if (!chromeless || !onHeaderActionsChange) return;
-		onHeaderActionsChange(headerActionsNode);
-		return () => onHeaderActionsChange(null);
-	}, [chromeless, onHeaderActionsChange, headerActionsNode]);
 
 	const handleTasksChange = useCallback((next: SpecTaskItem[]) => {
 		setEditTasks(next);
@@ -297,7 +233,7 @@ export function SpecPanel({
 					px="xs"
 					py={4}
 					wrap="nowrap"
-					style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-dark-4)" }}
+					style={{ flexShrink: 0, borderBottom: "1px solid var(--mantine-color-default-border)" }}
 				>
 					<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
 						<IconChecklist size={15} color="var(--mantine-color-indigo-4)" />
@@ -306,26 +242,6 @@ export function SpecPanel({
 						</Text>
 					</Group>
 					<Box style={{ flex: 1 }} />
-					{dirty && !isPreviewOnly && (
-						<>
-							<Tooltip label={t("spec.reload")}>
-								<ActionIcon size="sm" variant="subtle" color="gray" onClick={handleReload}>
-									<IconRefresh size={14} />
-								</ActionIcon>
-							</Tooltip>
-							<Tooltip label={t("spec.save")}>
-								<ActionIcon
-									size="sm"
-									variant="light"
-									color="green"
-									onClick={handleSave}
-									loading={updateFile.isPending}
-								>
-									<IconDeviceFloppy size={14} />
-								</ActionIcon>
-							</Tooltip>
-						</>
-					)}
 					<ActionIcon size="sm" variant="subtle" color="gray" onClick={onClose}>
 						<IconX size={14} />
 					</ActionIcon>
@@ -360,8 +276,13 @@ export function SpecPanel({
 						<AutoContinuationControl narratorId={narratorId} />
 						<SpecTaskBoard
 							tasks={editTasks}
+							originalTasks={tasksData?.document.tasks ?? []}
+							dirty={dirty}
 							compiled={tasksData?.compiled ?? null}
 							onChange={handleTasksChange}
+							onSave={handleSave}
+							onReload={handleReload}
+							isSaving={updateFile.isPending}
 						/>
 					</ScrollArea>
 				) : (
@@ -376,7 +297,7 @@ export function SpecPanel({
 								style={{
 									flexShrink: 0,
 									borderBottom:
-										"1px solid light-dark(var(--mantine-color-yellow-2), var(--mantine-color-dark-4))",
+										"1px solid light-dark(var(--mantine-color-yellow-2), var(--mantine-color-default-border))",
 									background:
 										"light-dark(var(--mantine-color-yellow-0), color-mix(in srgb, var(--mantine-color-yellow-9) 18%, var(--mantine-color-dark-6)))",
 								}}
@@ -412,6 +333,10 @@ export function SpecPanel({
 									value={editContent}
 									revisionKey={docRevisionKey}
 									onChange={handleContentChange}
+									dirty={dirty}
+									onSave={handleSave}
+									onReload={handleReload}
+									isSaving={updateFile.isPending}
 								/>
 							</Suspense>
 						</Box>
@@ -457,11 +382,20 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 	});
 	const { data: narrator } = useNarrator(narratorId);
 
+	const agentSettings = settingsData?.agent as Record<string, unknown> | undefined;
 	const globalMode: AutoContinuationMode =
-		((settingsData?.agent as Record<string, unknown> | undefined)
-			?.autoContinuationMode as AutoContinuationMode) ?? "always";
+		(agentSettings?.autoContinuationMode as AutoContinuationMode) ?? "always";
 	const override = normalizeAutoContinuationOverride(narrator?.autoContinuationOverride);
 	const effectiveMode = resolveAutoContinuationMode(override, globalMode);
+
+	const globalInterval =
+		typeof agentSettings?.tasksReminderInterval === "number"
+			? (agentSettings.tasksReminderInterval as number)
+			: 15;
+	const intervalOverrideRaw = narrator?.tasksReminderIntervalOverride;
+	const intervalOverride =
+		typeof intervalOverrideRaw === "number" ? (intervalOverrideRaw as number) : null;
+	const effectiveInterval = intervalOverride ?? globalInterval;
 
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const updateSettingsMutation = useMutation({
@@ -493,10 +427,41 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 		reflectionOverridesMutation.mutate({ id: narratorId, autoContinuationOverride: "inherit" });
 	}, [effectiveMode, narratorId, reflectionOverridesMutation, updateSettingsMutation]);
 
+	const handleIntervalChange = useCallback(
+		async (value: number) => {
+			const next = Number.isFinite(value) ? Math.trunc(value) : -1;
+			let clamped = Math.max(-1, Math.min(1000, next));
+			if (clamped >= 0 && clamped <= 4) {
+				if (effectiveInterval < clamped) {
+					clamped = 5;
+				} else {
+					clamped = -1;
+				}
+			}
+			if (clamped === effectiveInterval) return;
+			reflectionOverridesMutation.mutate({
+				id: narratorId,
+				tasksReminderIntervalOverride: clamped === globalInterval ? null : clamped,
+			});
+		},
+		[effectiveInterval, narratorId, globalInterval, reflectionOverridesMutation],
+	);
+
+	const handleFollowDefaultInterval = useCallback(() => {
+		reflectionOverridesMutation.mutate({ id: narratorId, tasksReminderIntervalOverride: null });
+	}, [narratorId, reflectionOverridesMutation]);
+
+	const handleSetIntervalAsDefault = useCallback(() => {
+		updateSettingsMutation.mutate({ agent: { tasksReminderInterval: effectiveInterval } });
+		reflectionOverridesMutation.mutate({ id: narratorId, tasksReminderIntervalOverride: null });
+	}, [effectiveInterval, narratorId, reflectionOverridesMutation, updateSettingsMutation]);
+
 	const isPending = reflectionOverridesMutation.isPending || updateSettingsMutation.isPending;
+	const intervalDiffers = intervalOverride !== null;
 
 	return (
-		<Box px="sm" py={6} style={{ borderBottom: "1px solid var(--mantine-color-dark-4)" }}>
+		<Box px="sm" py={6} style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
+			{/* Auto-continuation control */}
 			<Group justify="space-between" align="center" wrap="nowrap" gap="xs" mb={4}>
 				<Text size="xs" fw={600}>
 					{t("autoContinuation")}
@@ -512,9 +477,10 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 					value: mode,
 					label: t(`autoContinuationMode_${mode}`),
 				}))}
+				mb={intervalDiffers || override !== "inherit" ? 4 : 8}
 			/>
 			{override !== "inherit" && (
-				<Group justify="space-between" mt={4} wrap="nowrap" style={{ width: "100%" }}>
+				<Group justify="space-between" mt={4} mb={8} wrap="nowrap" style={{ width: "100%" }}>
 					<Anchor
 						component="button"
 						type="button"
@@ -532,6 +498,53 @@ function AutoContinuationControl({ narratorId }: { narratorId: string }) {
 						c="dimmed"
 						style={{ textDecoration: "underline", opacity: isPending ? 0.45 : 1 }}
 						onClick={handleSetAsDefault}
+					>
+						{t("override_setAsDefault")}
+					</Anchor>
+				</Group>
+			)}
+
+			{/* Periodic tasks reminder injection interval */}
+			<Group justify="space-between" align="center" wrap="nowrap" gap="xs" mt={8} mb={4}>
+				<Text size="xs" fw={600}>
+					{t("spec.tasksReminderIntervalLabel")}
+				</Text>
+				<NumberInput
+					size="xs"
+					w={110}
+					min={-1}
+					max={1000}
+					step={1}
+					allowDecimal={false}
+					value={effectiveInterval}
+					onChange={(v) => handleIntervalChange(typeof v === "number" ? v : -1)}
+					disabled={isPending}
+				/>
+			</Group>
+			<Text size="xs" c="dimmed" mb={intervalDiffers ? 2 : 4}>
+				{effectiveInterval > 0
+					? t("spec.tasksReminderIntervalOn", { count: effectiveInterval })
+					: t("spec.tasksReminderIntervalOff")}
+			</Text>
+			{intervalDiffers && (
+				<Group justify="space-between" mt={4} mb={4} wrap="nowrap" style={{ width: "100%" }}>
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						c="dimmed"
+						style={{ textDecoration: "underline", opacity: isPending ? 0.45 : 1 }}
+						onClick={handleFollowDefaultInterval}
+					>
+						{t("override_followDefault")}
+					</Anchor>
+					<Anchor
+						component="button"
+						type="button"
+						size="xs"
+						c="dimmed"
+						style={{ textDecoration: "underline", opacity: isPending ? 0.45 : 1 }}
+						onClick={handleSetIntervalAsDefault}
 					>
 						{t("override_setAsDefault")}
 					</Anchor>
@@ -562,7 +575,6 @@ function resolveFenceAttach(override: FenceAttachOverride, globalDefault: boolea
 function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
-	const confirm = useConfirmDialog();
 	const { data: settingsData } = useQuery<Record<string, unknown>>({
 		queryKey: ["settings"],
 		queryFn: () => api.getSettings(),
@@ -593,55 +605,36 @@ function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 	});
 	const isPending = fenceMutation.isPending || updateSettingsMutation.isPending;
 
-	// Ask for confirmation when a change turns on BOTH the periodic interval and the
-	// tasks-attach at the same time (they stack, so the fence would inject on two cadences).
-	const confirmIfBothEnabled = useCallback(
-		async (nextInterval: number, nextAttach: boolean): Promise<boolean> => {
-			if (nextInterval > 0 && nextAttach) {
-				return confirm({
-					title: t("spec.fenceBothTitle"),
-					message: t("spec.fenceBothMessage"),
-					confirmLabel: t("spec.fenceBothConfirm"),
-					cancelLabel: t("cancel"),
-				});
-			}
-			return true;
-		},
-		[confirm, t],
-	);
-
 	const handleIntervalChange = useCallback(
 		async (value: number) => {
 			const next = Number.isFinite(value) ? Math.trunc(value) : -1;
-			const clamped = Math.max(-1, Math.min(1000, next));
+			let clamped = Math.max(-1, Math.min(1000, next));
+			if (clamped >= 0 && clamped <= 4) {
+				if (effectiveInterval < clamped) {
+					clamped = 5;
+				} else {
+					clamped = -1;
+				}
+			}
 			if (clamped === effectiveInterval) return;
-			const ok = await confirmIfBothEnabled(clamped, effectiveAttach);
-			if (!ok) return;
 			// Store as override; if it equals the global default, fall back to "follow default".
 			fenceMutation.mutate({
 				id: narratorId,
 				behaviorFenceIntervalOverride: clamped === globalInterval ? null : clamped,
 			});
 		},
-		[
-			effectiveInterval,
-			effectiveAttach,
-			confirmIfBothEnabled,
-			fenceMutation,
-			narratorId,
-			globalInterval,
-		],
+		[effectiveInterval, fenceMutation, narratorId, globalInterval],
 	);
 
 	const handleAttachChange = useCallback(
 		async (value: string) => {
-			const override = normalizeFenceAttachOverride(value);
-			const nextAttach = resolveFenceAttach(override, globalAttach);
-			const ok = await confirmIfBothEnabled(effectiveInterval, nextAttach);
-			if (!ok) return;
+			const nextAttach = value === "on";
+			// If user picks the same as global default, store as "inherit"
+			const override: FenceAttachOverride =
+				nextAttach === globalAttach ? "inherit" : (value as "on" | "off");
 			fenceMutation.mutate({ id: narratorId, behaviorFenceAttachOverride: override });
 		},
-		[globalAttach, effectiveInterval, confirmIfBothEnabled, fenceMutation, narratorId],
+		[globalAttach, fenceMutation, narratorId],
 	);
 
 	const handleFollowDefaultInterval = useCallback(() => {
@@ -666,7 +659,7 @@ function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 	const attachDiffers = attachOverride !== "inherit";
 
 	return (
-		<Box px="sm" py={8} style={{ borderBottom: "1px solid var(--mantine-color-dark-4)" }}>
+		<Box px="sm" py={8} style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
 			{/* Periodic injection interval */}
 			<Group justify="space-between" align="center" wrap="nowrap" gap="xs" mb={4}>
 				<Text size="xs" fw={600}>
@@ -721,11 +714,10 @@ function BehaviorFenceControl({ narratorId }: { narratorId: string }) {
 				</Text>
 				<SegmentedControl
 					size="xs"
-					value={attachOverride}
+					value={effectiveAttach ? "on" : "off"}
 					onChange={handleAttachChange}
 					disabled={isPending}
 					data={[
-						{ value: "inherit", label: t("override_inherit") },
 						{ value: "on", label: t("override_on") },
 						{ value: "off", label: t("override_off") },
 					]}

@@ -26,7 +26,7 @@ export const DEFAULTS: NarraForkSettings = {
 		defaultStartInPlanMode: false,
 		customModels: [],
 		hiddenModels: [],
-		maxTurns: 200,
+		maxTurns: 1000,
 		subagentModels: {
 			explore: "",
 			plan: "",
@@ -59,6 +59,7 @@ export const DEFAULTS: NarraForkSettings = {
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		behaviorFenceInterval: -1,
+		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
@@ -290,7 +291,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.maxTurns": {
 		desc: "叙述者会话的最大轮次。达到后 agent loop 停止。范围 1-1000。在 80% 时会发送 wrap-up 提醒。",
 		type: "number",
-		valid: "1-1000, 默认 200",
+		valid: "1-1000, 默认 1000",
 	},
 	"agent.subagentModels.explore": {
 		desc: "explore 子代理的默认模型。空字符串表示使用全局 defaultModel。",
@@ -408,6 +409,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "行为护栏定期注入的全局默认间隔：每隔 N 个已完成工具调用，通过 sidecar 注入一次行为护栏内容。护栏内容为空时不注入。-1 表示关闭。叙述者可单独覆盖此默认值。",
 		type: "number",
 		valid: "-1 = 关闭，或正整数，默认 -1",
+	},
+	"agent.tasksReminderInterval": {
+		desc: "大纲（tasks.json）定期注入的全局默认间隔：每隔 N 个已完成工具调用，通过 sidecar 注入一次大纲内容。-1 表示关闭。叙述者可单独覆盖此默认值。",
+		type: "number",
+		valid: "-1 = 关闭，或正整数，默认 15",
 	},
 	"agent.behaviorFenceAttachTasks": {
 		desc: "行为护栏是否附着到 tasks.json 提醒的全局默认值：开启后，每当 tasks.json 任务提醒注入时一并注入行为护栏内容（护栏内容为空时不注入）。叙述者可单独覆盖此默认值。",

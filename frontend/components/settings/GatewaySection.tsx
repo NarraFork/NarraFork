@@ -24,13 +24,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type GatewayPlatform, useGatewayCapability } from "../../hooks/usePlatform";
 import { miscApi } from "../../lib/api/misc";
+import type { ProxyOverride } from "../../lib/proxy";
 import { normalizeUrlProtocol } from "../../lib/url";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 
 type Platform = GatewayPlatform;
 
 interface PlatformConfig {
 	platform: Platform;
 	enabled: boolean;
+	proxy?: ProxyOverride;
 	token?: string;
 	botToken?: string;
 	appToken?: string;
@@ -480,7 +483,13 @@ function PlatformCard({
 				)}
 
 				{platform.enabled && !disabledReason && (
-					<PlatformFields platform={platform} index={index} onUpdate={onUpdate} />
+					<>
+						<PlatformFields platform={platform} index={index} onUpdate={onUpdate} />
+						<ProxyOverrideField
+							value={platform.proxy}
+							onChange={(next) => onUpdate(index, { proxy: next })}
+						/>
+					</>
 				)}
 			</Stack>
 		</Paper>

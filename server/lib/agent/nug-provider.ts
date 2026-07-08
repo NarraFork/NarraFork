@@ -36,6 +36,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
+import { recordRequestUrl } from "./request-url-tracker";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -177,13 +178,15 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL so
-	 * NUG requests follow the global proxy policy; local gateways (127.0.0.1)
-	 * are auto-exempted via loopback/NO_PROXY, remote NUG hosts go through it.
+	 * Proxy-aware fetch. Resolves the proxy per target URL honouring this
+	 * provider's own proxy override (absent/"default" → global policy); local
+	 * gateways (127.0.0.1) are auto-exempted via loopback/NO_PROXY, remote NUG
+	 * hosts go through it.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		const proxy = resolveProxyForUrl(target);
+		recordRequestUrl(String(target), init?.method);
+		const proxy = resolveProxyForUrl(target, this.config.proxy);
 		if (proxy) {
 			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
 			return fetch(input, { ...init, proxy } as any);

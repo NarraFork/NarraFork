@@ -98,4 +98,34 @@ describe("spec:// Read/Write/Edit/Grep", () => {
 		expect(grepResult.output).toContain("spec://notes.md");
 		expect(grepResult.output).toContain("Needle phrase");
 	});
+
+	test("model-facing file tool descriptions advertise Dynamic Spec usage", () => {
+		const readSchema = readTool.rawJsonSchema as {
+			properties: { file_path: { description: string } };
+		};
+		const writeSchema = writeTool.rawJsonSchema as {
+			properties: { file_path: { description: string } };
+		};
+		const editSchema = editTool.rawJsonSchema as {
+			properties: { file_path: { description: string } };
+		};
+		const grepSchema = grepTool.rawJsonSchema as {
+			properties: { path: { description: string } };
+		};
+
+		expect(readTool.description).toContain("spec://tasks.json");
+		expect(readTool.description).not.toContain("spec://HOW_TO_USE_SPEC.md");
+		expect(readSchema.properties.file_path.description).toContain("spec://");
+
+		expect(writeTool.description).toContain("spec://tasks.json");
+		expect(writeTool.description).toContain("spec://behavior_fence");
+		expect(writeSchema.properties.file_path.description).toContain("spec://");
+
+		expect(editTool.description).toContain("spec://tasks.json");
+		expect(editTool.description).not.toContain("spec://HOW_TO_USE_SPEC.md");
+		expect(editSchema.properties.file_path.description).toContain("spec://");
+
+		expect(grepTool.description).toContain('path to "spec://"');
+		expect(grepSchema.properties.path.description).toContain("Dynamic Spec");
+	});
 });

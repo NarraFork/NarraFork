@@ -2305,6 +2305,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
 		autoContinuationOverride?: AutoContinuationOverride;
+		tasksReminderIntervalOverride?: number | null;
 	} = {};
 	if (Object.hasOwn(input, "planReflectionAutoApproveOverride")) {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
@@ -2324,10 +2325,29 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 			"autoContinuationOverride",
 		);
 	}
+	if (Object.hasOwn(input, "tasksReminderIntervalOverride")) {
+		const raw = input.tasksReminderIntervalOverride;
+		if (raw === null) {
+			updates.tasksReminderIntervalOverride = null;
+		} else if (
+			typeof raw === "number" &&
+			Number.isInteger(raw) &&
+			raw >= -1 &&
+			raw <= 1000 &&
+			!(raw >= 0 && raw <= 4)
+		) {
+			updates.tasksReminderIntervalOverride = raw;
+		} else {
+			throw new ValidationError(
+				"tasksReminderIntervalOverride must be null, -1, or an integer between 5 and 1000",
+			);
+		}
+	}
 	if (
 		!updates.planReflectionAutoApproveOverride &&
 		!updates.dangerReflectionOverride &&
-		!updates.autoContinuationOverride
+		!updates.autoContinuationOverride &&
+		!Object.hasOwn(updates, "tasksReminderIntervalOverride")
 	) {
 		throw new ValidationError("At least one override must be provided");
 	}
@@ -2353,11 +2373,17 @@ narratorRoutes.patch("/:id/behavior-fence", async (c) => {
 		const raw = input.behaviorFenceIntervalOverride;
 		if (raw === null) {
 			updates.behaviorFenceIntervalOverride = null;
-		} else if (typeof raw === "number" && Number.isInteger(raw) && raw >= -1 && raw <= 1000) {
+		} else if (
+			typeof raw === "number" &&
+			Number.isInteger(raw) &&
+			raw >= -1 &&
+			raw <= 1000 &&
+			!(raw >= 0 && raw <= 4)
+		) {
 			updates.behaviorFenceIntervalOverride = raw;
 		} else {
 			throw new ValidationError(
-				"behaviorFenceIntervalOverride must be null or an integer between -1 and 1000",
+				"behaviorFenceIntervalOverride must be null, -1, or an integer between 5 and 1000",
 			);
 		}
 	}

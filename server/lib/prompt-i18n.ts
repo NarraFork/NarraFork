@@ -671,6 +671,74 @@ export function getReplyLanguageInstruction(locale: Locale): string {
 	return languageInstructions[locale] ?? languageInstructions.en;
 }
 
+const dynamicSpecSystemReminder: Record<Locale, string> = {
+	en: `<system-reminder>
+# Dynamic Spec (\`spec://\`)
+
+NarraFork maintains a per-narrator Dynamic Spec as a virtual \`spec://\` directory. It is not part of the local filesystem and does not require absolute paths.
+
+Use \`Read\`, \`Write\`, \`Edit\`, and \`Grep\` directly with \`spec://...\` URIs:
+- Use \`spec://tasks.json\` as the minimal task queue; update it when task state changes.
+- Use \`spec://index.md\` or additional \`spec://*.md\` files for planning/design notes on complex work.
+- Use \`Grep\` with \`path: "spec://"\` to search Dynamic Spec files.
+
+Core files:
+- \`spec://tasks.json\` — task queue for reminders and auto-continuation.
+- \`spec://index.md\` — overview and free-form planning notes.
+- \`spec://behavior_fence\` — durable user behavior constraints. Treat it as read-only unless the user explicitly asks you to record a behavior; even then it can only be written on the first tool call of that user turn.
+
+\`tasks.json\` must stay small and use only this public shape:
+\`\`\`json
+{
+	"tasks": [
+		{ "text": "Do the current thing", "status": "doing" },
+		{ "text": "Do not bypass this requirement", "status": "todo", "protected": true }
+	]
+}
+\`\`\`
+Allowed statuses: \`todo\`, \`doing\`, \`done\`, \`blocked\`. Do not add IDs, timestamps, summaries, evidence, or runtime metadata to \`tasks.json\`.
+
+Protected tasks are commitments. Only mark them done, delete them, or replace them when you have concrete evidence; the system will run taskReflection for protected-task changes.
+
+Do not use Bash or Glob for \`spec://\` virtual files.
+</system-reminder>`,
+	"zh-CN": `<system-reminder>
+# Dynamic Spec（\`spec://\`）
+
+NarraFork 为每个叙述者维护一个 Dynamic Spec：它是一个虚拟的 \`spec://\` 目录，不属于本地文件系统，也不需要绝对路径。
+
+直接用 \`Read\`、\`Write\`、\`Edit\`、\`Grep\` 访问 \`spec://...\` URI：
+- 用 \`spec://tasks.json\` 作为最小任务队列；任务状态变化时要更新它。
+- 复杂工作可用 \`spec://index.md\` 或额外的 \`spec://*.md\` 保存规划/设计笔记。
+- 搜索 Dynamic Spec 文件时，用 \`Grep\` 并设置 \`path: "spec://"\`。
+
+核心文件：
+- \`spec://tasks.json\` — 用于提醒和自动续跑的任务队列。
+- \`spec://index.md\` — 总览和自由形式规划笔记。
+- \`spec://behavior_fence\` — 用户设定的持久行为约束。除非用户明确要求你记录某条行为，否则视为只读；即便用户明确要求，也只能在该用户回合的第一次工具调用中写入。
+
+\`tasks.json\` 必须保持很小，只使用以下公开结构：
+\`\`\`json
+{
+	"tasks": [
+		{ "text": "执行当前事项", "status": "doing" },
+		{ "text": "不能绕过的要求", "status": "todo", "protected": true }
+	]
+}
+\`\`\`
+允许的状态只有：\`todo\`、\`doing\`、\`done\`、\`blocked\`。不要向 \`tasks.json\` 添加 ID、时间戳、摘要、证据或运行时元数据。
+
+protected task 是承诺。只有在有具体证据时才能标记 done、删除或替换；系统会对 protected task 变更触发 taskReflection。
+
+不要用 Bash 或 Glob 访问 \`spec://\` 虚拟文件。
+</system-reminder>`,
+};
+
+/** Get the model-facing Dynamic Spec usage reminder. */
+export function getDynamicSpecSystemReminder(locale: Locale): string {
+	return dynamicSpecSystemReminder[locale] ?? dynamicSpecSystemReminder.en;
+}
+
 // toolMessages, ToolMessageKey, getToolMessage, getToolMessageWithParams
 // are now re-exported from ./i18n
 

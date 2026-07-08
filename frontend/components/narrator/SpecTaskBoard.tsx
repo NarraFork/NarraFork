@@ -1,6 +1,7 @@
 import {
 	ActionIcon,
 	Badge,
+	Button,
 	Group,
 	Menu,
 	Paper,
@@ -15,6 +16,7 @@ import {
 	IconCheck,
 	IconCircle,
 	IconCircleDot,
+	IconDeviceFloppy,
 	IconExclamationCircle,
 	IconLock,
 	IconPlus,
@@ -29,8 +31,13 @@ export type SpecTaskStatus = SpecTaskItem["status"];
 
 interface SpecTaskBoardProps {
 	tasks: SpecTaskItem[];
+	originalTasks: SpecTaskItem[];
+	dirty: boolean;
 	compiled: SpecCompiledTasks | null;
 	onChange: (tasks: SpecTaskItem[]) => void;
+	onSave: () => void;
+	onReload: () => void;
+	isSaving: boolean;
 }
 
 const STATUS_ORDER: SpecTaskStatus[] = ["doing", "todo", "blocked", "done"];
@@ -49,12 +56,18 @@ function TaskCard({
 	onUpdate,
 	onRemove,
 	onUnlock,
+	isModified,
+	onSave,
+	isSaving,
 }: {
 	task: SpecTaskItem;
 	index: number;
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
 	onUnlock: (index: number) => void;
+	isModified: boolean;
+	onSave: () => void;
+	isSaving: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[task.status];
@@ -108,6 +121,23 @@ function TaskCard({
 					}}
 				/>
 
+				{/* Save button if single task is modified */}
+				{isModified && (
+					<Tooltip label={t("spec.save")} openDelay={200}>
+						<ActionIcon
+							size="sm"
+							variant="filled"
+							color="green"
+							mt={2}
+							onClick={onSave}
+							loading={isSaving}
+							aria-label={t("spec.save")}
+						>
+							<IconDeviceFloppy size={14} />
+						</ActionIcon>
+					</Tooltip>
+				)}
+
 				{/* Protected: click the lock to unlock; otherwise delete */}
 				{task.protected ? (
 					<Tooltip label={t("spec.unlockProtected")} openDelay={200} multiline w={240}>
@@ -146,12 +176,18 @@ function StatusColumn({
 	onUpdate,
 	onRemove,
 	onUnlock,
+	isTaskModified,
+	onSave,
+	isSaving,
 }: {
 	status: SpecTaskStatus;
 	tasks: { task: SpecTaskItem; index: number }[];
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
 	onUnlock: (index: number) => void;
+	isTaskModified: (index: number) => boolean;
+	onSave: () => void;
+	isSaving: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[status];
@@ -176,6 +212,9 @@ function StatusColumn({
 						onUpdate={onUpdate}
 						onRemove={onRemove}
 						onUnlock={onUnlock}
+						isModified={isTaskModified(index)}
+						onSave={onSave}
+						isSaving={isSaving}
 					/>
 				))}
 			</Stack>
@@ -183,9 +222,29 @@ function StatusColumn({
 	);
 }
 
-export function SpecTaskBoard({ tasks, compiled, onChange }: SpecTaskBoardProps) {
+export function SpecTaskBoard({
+	tasks,
+	originalTasks,
+	dirty,
+	compiled,
+	onChange,
+	onSave,
+	onReload,
+	isSaving,
+}: SpecTaskBoardProps) {
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
+
+	const isTaskModified = useCallback(
+		(index: number) => {
+			const original = originalTasks[index];
+			if (!original) return true; // new task
+			const current = tasks[index];
+			if (!current) return false;
+			return current.text !== original.text || current.status !== original.status;
+		},
+		[originalTasks, tasks],
+	);
 
 	const updateTask = useCallback(
 		(index: number, patch: Partial<SpecTaskItem>) => {
@@ -304,22 +363,44 @@ export function SpecTaskBoard({ tasks, compiled, onChange }: SpecTaskBoardProps)
 						onUpdate={updateTask}
 						onRemove={removeTask}
 						onUnlock={unlockTask}
+						isTaskModified={isTaskModified}
+						onSave={onSave}
+						isSaving={isSaving}
 					/>
 				))
 			)}
 
-			{/* Add task */}
-			<ActionIcon
-				variant="light"
-				color="indigo"
-				size="md"
-				radius="sm"
-				onClick={addTask}
-				aria-label={t("spec.addTask")}
-				style={{ alignSelf: "flex-start" }}
-			>
-				<IconPlus size={16} />
-			</ActionIcon>
+			{/* Add task and general Save/Discard controls */}
+			<Group gap="xs" style={{ alignSelf: "flex-start" }}>
+				<ActionIcon
+					variant="light"
+					color="indigo"
+					size="md"
+					radius="sm"
+					onClick={addTask}
+					aria-label={t("spec.addTask")}
+				>
+					<IconPlus size={16} />
+				</ActionIcon>
+
+				{dirty && (
+					<>
+						<Button
+							size="xs"
+							variant="filled"
+							color="green"
+							onClick={onSave}
+							loading={isSaving}
+							leftSection={<IconDeviceFloppy size={14} />}
+						>
+							{t("spec.save")}
+						</Button>
+						<Button size="xs" variant="subtle" color="gray" onClick={onReload} disabled={isSaving}>
+							{t("spec.reload")}
+						</Button>
+					</>
+				)}
+			</Group>
 		</Stack>
 	);
 }

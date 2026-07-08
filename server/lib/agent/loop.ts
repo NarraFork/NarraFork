@@ -1799,12 +1799,6 @@ export async function* agentLoop(
 			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		sideCarCheckedToolUseIds.add(tu.toolUseId);
-		const extraInterval = config.sideCarToolResultInterval ?? 0;
-		const hitBuiltinCadence = completedToolCount % TODO_REMINDER_TOOL_INTERVAL === 0;
-		const hitExtraCadence = extraInterval > 0 && completedToolCount % extraInterval === 0;
-		if (!hitBuiltinCadence && !hitExtraCadence) {
-			return cacheToolResultSideCars(tu.toolUseId, sideCars);
-		}
 		try {
 			const collected = await config.getSideCars({
 				phase: "tool_result",

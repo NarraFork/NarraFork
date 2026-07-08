@@ -275,6 +275,9 @@ export const narrators = sqliteTable(
 		/** Behavior fence periodic-injection interval override. null = follow global default;
 		 *  -1 = disabled; >0 = inject the behavior-fence sidecar every N completed tool calls. */
 		behaviorFenceIntervalOverride: integer("behavior_fence_interval_override"),
+		/** Tasks.json reminder periodic-injection interval override. null = follow global default;
+		 *  -1 = disabled; >0 = inject the tasks.json reminder every N completed tool calls. */
+		tasksReminderIntervalOverride: integer("tasks_reminder_interval_override"),
 		/** Whether the behavior fence rides along with the tasks.json reminder. inherit = follow default. */
 		behaviorFenceAttachOverride: text("behavior_fence_attach_override", {
 			enum: ["inherit", "on", "off"],
@@ -1280,6 +1283,9 @@ export const hooks = sqliteTable(
 		// http type
 		url: text("url"),
 		headers: text("headers", { mode: "json" }).$type<Record<string, string>>(),
+		// http type: optional per-hook proxy override (null/"default" = follow global policy)
+		proxyMode: text("proxy_mode", { enum: ["default", "direct", "system", "custom"] }),
+		proxyUrl: text("proxy_url"),
 		// reserved for future prompt hook type
 		prompt: text("prompt"),
 		model: text("model"),

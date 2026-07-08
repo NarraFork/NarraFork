@@ -3,6 +3,7 @@
  */
 
 import type { PermissionMode } from "../lib/permission-modes";
+import type { ProxyOverride } from "../lib/settings/types";
 
 // ---------------------------------------------------------------------------
 // Platform identifiers
@@ -120,6 +121,8 @@ export interface PlatformAdapter {
 export interface GatewayPlatformConfig {
 	platform: GatewayPlatform;
 	enabled: boolean;
+	/** Optional per-platform proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 	/** Platform-specific credentials and settings */
 	[key: string]: unknown;
 }

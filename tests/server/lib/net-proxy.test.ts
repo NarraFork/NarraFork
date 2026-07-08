@@ -6,6 +6,7 @@ import {
 	detectSystemProxy,
 	getOutboundProxy,
 	isSocksProxy,
+	resolveOverride,
 	resolveProxyForUrl,
 } from "@server/lib/net/proxy";
 import { settings } from "@server/lib/settings";
@@ -81,6 +82,71 @@ describe("net/proxy resolver", () => {
 		expect(resolveProxyForUrl("https://api.example.com")).toBeUndefined();
 		expect(resolveProxyForUrl("https://svc.internal.net")).toBeUndefined();
 		expect(resolveProxyForUrl("https://api.anthropic.com")).toBe("http://custom:3128");
+	});
+});
+
+describe("net/proxy per-location override", () => {
+	let savedEnv: Record<string, string | undefined>;
+	let savedProxy: typeof settings.proxy;
+
+	beforeEach(() => {
+		savedEnv = {};
+		for (const k of ENV_KEYS) {
+			savedEnv[k] = process.env[k];
+			delete process.env[k];
+		}
+		savedProxy = settings.proxy;
+		// Global policy = custom, so "default" inheritance is observable.
+		settings.proxy = { mode: "custom", url: "http://global:3128" };
+	});
+
+	afterEach(() => {
+		for (const k of ENV_KEYS) {
+			if (savedEnv[k] === undefined) delete process.env[k];
+			else process.env[k] = savedEnv[k];
+		}
+		settings.proxy = savedProxy;
+	});
+
+	test("undefined / default override inherits the global policy", () => {
+		expect(resolveOverride(undefined)).toBe("http://global:3128");
+		expect(resolveOverride({ mode: "default" })).toBe("http://global:3128");
+	});
+
+	test("direct override forces no proxy even when global is set", () => {
+		expect(resolveOverride({ mode: "direct" })).toBeUndefined();
+		expect(resolveProxyForUrl("https://api.anthropic.com", { mode: "direct" })).toBeUndefined();
+	});
+
+	test("system override reads env vars regardless of global", () => {
+		process.env.HTTPS_PROXY = "http://sys:8080";
+		expect(resolveOverride({ mode: "system" })).toBe("http://sys:8080");
+	});
+
+	test("custom override uses its own url, not the global one", () => {
+		expect(resolveOverride({ mode: "custom", url: "http://ovr:9000" })).toBe("http://ovr:9000");
+		expect(
+			resolveProxyForUrl("https://api.anthropic.com", { mode: "custom", url: "http://ovr:9000" }),
+		).toBe("http://ovr:9000");
+	});
+
+	test("override still honours loopback exemption", () => {
+		expect(
+			resolveProxyForUrl("http://127.0.0.1:7790", { mode: "custom", url: "http://ovr:9000" }),
+		).toBeUndefined();
+	});
+
+	test("codex-style precedence: a resolved string wins over global override", () => {
+		// Mirrors OpenAIProvider.pfetch: an explicit resolved proxy string
+		// (codex passes resolveOverride(codex.proxy)) is applied directly with
+		// exemptions, independent of the global settings.proxy value.
+		const codexResolved = "http://codex:7000";
+		expect(
+			resolveProxyForUrl("http://127.0.0.1:1", { mode: "custom", url: codexResolved }),
+		).toBeUndefined();
+		expect(resolveProxyForUrl("https://chatgpt.com", { mode: "custom", url: codexResolved })).toBe(
+			codexResolved,
+		);
 	});
 });
 

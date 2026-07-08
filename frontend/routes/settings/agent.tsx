@@ -79,6 +79,8 @@ function SettingsAgentPage() {
 				setSilentToolCallThreshold={is.setSilentToolCallThreshold}
 				behaviorFenceInterval={is.behaviorFenceInterval}
 				setBehaviorFenceInterval={is.setBehaviorFenceInterval}
+				tasksReminderInterval={is.tasksReminderInterval}
+				setTasksReminderInterval={is.setTasksReminderInterval}
 				behaviorFenceAttachTasks={is.behaviorFenceAttachTasks}
 				setBehaviorFenceAttachTasks={is.setBehaviorFenceAttachTasks}
 				retryBackoffCeilMs={is.retryBackoffCeilMs}

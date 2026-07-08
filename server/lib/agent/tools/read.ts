@@ -37,10 +37,11 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const readTool: ToolDefinition = {
 	name: "Read",
 	description:
-		"Reads a file from the local filesystem. You can access any file directly by using this tool.\n" +
-		"Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
+		"Reads a file from the local filesystem or the narrator's Dynamic Spec virtual files. You can access any file directly by using this tool.\n" +
+		"Assume this tool is able to read all local files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\n" +
 		"Usage:\n" +
-		"- The file_path parameter must be an absolute path, not a relative path\n" +
+		"- The file_path parameter must be an absolute local path, or a spec:// URI for Dynamic Spec virtual files\n" +
+		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +
 		"- By default, it reads the entire file from the beginning\n" +
 		"- You can optionally specify a line offset and limit (especially handy for long files)\n" +
 		"- Set limit to -1 to force reading from the offset (or start) to EOF, bypassing output truncation (up to ~100k chars)\n" +
@@ -57,7 +58,7 @@ export const readTool: ToolDefinition = {
 		type: "object",
 		properties: {
 			file_path: {
-				description: "The absolute path to the file to read",
+				description: "The absolute local path or spec:// Dynamic Spec URI to read",
 				type: "string",
 			},
 			offset: {
@@ -80,7 +81,7 @@ export const readTool: ToolDefinition = {
 		additionalProperties: false,
 	},
 	parameters: z.object({
-		file_path: z.string().describe("The absolute path to the file to read"),
+		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to read"),
 		offset: z
 			.number()
 			.optional()

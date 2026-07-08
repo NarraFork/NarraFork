@@ -488,6 +488,7 @@ export const narratorsApi = {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
+			tasksReminderIntervalOverride?: number | null;
 		},
 	) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reflection-overrides`, {

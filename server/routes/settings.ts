@@ -4,6 +4,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { agentGenerateWithMeta } from "../lib/agent";
 import { resolveProviderAndModel } from "../lib/agent/provider";
+import { createUrlCapture } from "../lib/agent/request-url-tracker";
 import { maskAuthSettings, maskSecret } from "../lib/auth-settings";
 import { getCodexManager } from "../lib/codex-manager";
 import {
@@ -61,11 +62,6 @@ const modelOptionSchema = z.object({
 	channelType: z.string().optional(),
 });
 
-const proxyUrlSchema = z.preprocess(
-	(value) => (typeof value === "string" ? normalizeProxyUrl(value) : value),
-	z.string().optional(),
-);
-
 const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
 
 const webFetchProxyUrlSchema = z.preprocess(
@@ -75,6 +71,14 @@ const webFetchProxyUrlSchema = z.preprocess(
 		.regex(/^(https?|socks4|socks5h?):\/\//)
 		.optional(),
 );
+
+/** Per-location proxy override: default (inherit global) / direct / system / custom. */
+const proxyOverrideSchema = z
+	.object({
+		mode: z.enum(["default", "direct", "system", "custom"]),
+		url: webFetchProxyUrlSchema,
+	})
+	.optional();
 
 const customApiProtocolSchema = z.enum([
 	"anthropic-official",
@@ -94,7 +98,7 @@ const customApiProviderSchema = z.object({
 	protocol: customApiProtocolSchema,
 	defaultContextWindow: z.number().int().min(1).optional(),
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
-	proxy: proxyUrlSchema,
+	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	codexAccountId: z.string().optional(),
 	codexWebSocket: z.boolean().optional(),
@@ -117,6 +121,7 @@ const openaiProviderSchema = z.object({
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
+	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -128,7 +133,7 @@ const anthropicProviderSchema = z.object({
 	baseUrl: z.string(),
 	defaultModel: z.string(),
 	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
-	proxy: proxyUrlSchema,
+	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
 	disabled: z.boolean().optional(),
@@ -147,6 +152,7 @@ const nugProviderSchema = z.object({
 	oauthClientSecret: z.string().optional(),
 	oauthDeviceId: z.string().optional(),
 	oauthCallbackUrl: z.string().optional(),
+	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -159,6 +165,7 @@ const clineProviderSchema = z.object({
 	defaultModel: z.string(),
 	defaultContextWindow: z.number().int().min(1).optional(),
 	enabledModels: z.array(z.string()).optional(),
+	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -268,7 +275,22 @@ const updateSettingsSchema = z
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
-				behaviorFenceInterval: z.number().int().min(-1).max(1000),
+				behaviorFenceInterval: z
+					.number()
+					.int()
+					.min(-1)
+					.max(1000)
+					.refine((v) => v === -1 || v >= 5, {
+						message: "Interval must be -1 or at least 5",
+					}),
+				tasksReminderInterval: z
+					.number()
+					.int()
+					.min(-1)
+					.max(1000)
+					.refine((v) => v === -1 || v >= 5, {
+						message: "Interval must be -1 or at least 5",
+					}),
 				behaviorFenceAttachTasks: z.boolean(),
 				retryBackoffCeilMs: z.number().int().min(1000).max(300000),
 				firstTokenTimeoutMs: z.number().int().min(0).max(600000),
@@ -324,12 +346,7 @@ const updateSettingsSchema = z
 								}),
 							)
 							.optional(),
-						proxy: z
-							.object({
-								mode: z.enum(["direct", "system", "custom"]),
-								url: webFetchProxyUrlSchema,
-							})
-							.optional(),
+						proxy: proxyOverrideSchema,
 					})
 					.optional(),
 				defaultSystemPrompt: z.string().max(50000).optional(),
@@ -385,6 +402,11 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+			.object({
+				proxy: proxyOverrideSchema,
+			})
+			.partial()
+			.optional(),
 		customApiProviders: z.array(customApiProviderSchema).optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
@@ -392,7 +414,7 @@ const updateSettingsSchema = z
 		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
 			.object({
-				proxy: proxyUrlSchema,
+				proxy: proxyOverrideSchema,
 				loadBalancingMode: z.enum(["priority", "balanced", "tier-balanced"]).optional(),
 				tierOrder: z
 					.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"]))
@@ -834,15 +856,18 @@ settingsRoutes.post("/test-model", async (c) => {
 		return c.json({ error: err instanceof Error ? err.message : "Unknown provider or model" }, 400);
 	}
 
+	const capture = createUrlCapture();
 	try {
-		const result = await agentGenerateWithMeta(prompt, model, undefined, undefined, {
-			kind: "settings_test",
-		});
-		return c.json({ text: result.text });
+		const result = await capture.run(() =>
+			agentGenerateWithMeta(prompt, model, undefined, undefined, {
+				kind: "settings_test",
+			}),
+		);
+		return c.json({ text: result.text, requestUrls: capture.urls });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		logger.warn("Model test failed", { model, error: message });
-		return c.json({ error: message }, 502);
+		return c.json({ error: message, requestUrls: capture.urls }, 502);
 	}
 });
 

@@ -84,6 +84,8 @@ export interface AgentSectionProps {
 	setSilentToolCallThreshold: (v: number) => void;
 	behaviorFenceInterval: number;
 	setBehaviorFenceInterval: (v: number) => void;
+	tasksReminderInterval: number;
+	setTasksReminderInterval: (v: number) => void;
 	behaviorFenceAttachTasks: boolean;
 	setBehaviorFenceAttachTasks: (v: boolean) => void;
 	retryBackoffCeilMs: number;
@@ -214,7 +216,7 @@ export function AgentSection(props: AgentSectionProps) {
 				label={t("maxTurns")}
 				description={t("maxTurnsDesc")}
 				value={props.maxTurns}
-				onChange={(v) => props.setMaxTurns(typeof v === "number" ? v : 200)}
+				onChange={(v) => props.setMaxTurns(typeof v === "number" ? v : 1000)}
 				min={1}
 				max={1000}
 			/>
@@ -399,7 +401,47 @@ export function AgentSection(props: AgentSectionProps) {
 				label={t("behaviorFenceInterval")}
 				description={t("behaviorFenceIntervalDesc")}
 				value={props.behaviorFenceInterval}
-				onChange={(v) => props.setBehaviorFenceInterval(typeof v === "number" ? v : -1)}
+				onChange={(v) => {
+					if (typeof v === "number") {
+						const next = Math.trunc(v);
+						let clamped = Math.max(-1, Math.min(1000, next));
+						if (clamped >= 0 && clamped <= 4) {
+							if (props.behaviorFenceInterval < clamped) {
+								clamped = 5;
+							} else {
+								clamped = -1;
+							}
+						}
+						props.setBehaviorFenceInterval(clamped);
+					} else {
+						props.setBehaviorFenceInterval(-1);
+					}
+				}}
+				min={-1}
+				max={1000}
+				step={1}
+				decimalScale={0}
+			/>
+			<NumberInput
+				label={t("tasksReminderInterval")}
+				description={t("tasksReminderIntervalDesc")}
+				value={props.tasksReminderInterval}
+				onChange={(v) => {
+					if (typeof v === "number") {
+						const next = Math.trunc(v);
+						let clamped = Math.max(-1, Math.min(1000, next));
+						if (clamped >= 0 && clamped <= 4) {
+							if (props.tasksReminderInterval < clamped) {
+								clamped = 5;
+							} else {
+								clamped = -1;
+							}
+						}
+						props.setTasksReminderInterval(clamped);
+					} else {
+						props.setTasksReminderInterval(15);
+					}
+				}}
 				min={-1}
 				max={1000}
 				step={1}

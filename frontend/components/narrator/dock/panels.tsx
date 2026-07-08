@@ -27,16 +27,7 @@ import {
 	IconX,
 } from "@tabler/icons-react";
 import type { IDockviewPanelHeaderProps, IDockviewPanelProps } from "dockview-react";
-import {
-	lazy,
-	type ReactNode,
-	Suspense,
-	useCallback,
-	useEffect,
-	useLayoutEffect,
-	useRef,
-	useState,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
@@ -386,23 +377,14 @@ export function SpecDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams
 		}
 	}, [t, props.api]);
 
-	// Save/reload controls are small → hoisted into the shell header, reported
-	// up by SpecPanel while it has unsaved edits.
-	const [actions, setActions] = useState<ReactNode>(null);
 	return (
 		<ToolPanelShell
 			title={t("spec.title")}
 			icon={<IconNotebook size={16} color="var(--mantine-color-indigo-4)" />}
-			actions={actions}
 			props={props}
 			subjectId="__spec__"
 		>
-			<SpecPanel
-				narratorId={narratorId}
-				onClose={close}
-				chromeless
-				onHeaderActionsChange={setActions}
-			/>
+			<SpecPanel narratorId={narratorId} onClose={close} chromeless />
 		</ToolPanelShell>
 	);
 }

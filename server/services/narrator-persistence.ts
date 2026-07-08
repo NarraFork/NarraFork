@@ -1033,6 +1033,7 @@ export const narratorPersistence = {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
 			autoContinuationOverride?: AutoContinuationOverride;
+			tasksReminderIntervalOverride?: number | null;
 		},
 	) {
 		const now = new Date().toISOString();

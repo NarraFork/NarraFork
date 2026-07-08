@@ -48,7 +48,6 @@ import {
 	IconArrowsMinimize,
 	IconBolt,
 	IconCheck,
-	IconChecklist,
 	IconChevronDown,
 	IconChevronUp,
 	IconClock,
@@ -3838,7 +3837,6 @@ export function NarratorPanel({
 	// Dynamic Spec current task, for the compact status bar above the input.
 	const { data: specTasksData } = useSpecTasks(narratorId);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
-	const specTasksBlocked = specTasksData?.compiled.blocked ?? false;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
@@ -8008,49 +8006,6 @@ export function NarratorPanel({
 									/>
 								</Group>
 							))}
-						</Group>
-					)}
-
-					{/* Current task status bar (Dynamic Spec) */}
-					{currentSpecTask && (
-						<Group
-							component="button"
-							px="md"
-							py={4}
-							gap="xs"
-							wrap="nowrap"
-							bg={
-								specTasksBlocked
-									? "var(--mantine-color-orange-light)"
-									: "var(--mantine-color-teal-light)"
-							}
-							style={{
-								cursor: "pointer",
-								border: "none",
-								width: "100%",
-								textAlign: "left",
-								flexShrink: 0,
-								borderTop:
-									attachedImages.length > 0
-										? undefined
-										: "1px solid var(--mantine-color-default-border)",
-							}}
-							onClick={openSpecTool}
-							aria-label={t("spec.openCurrentTask", "Open task list")}
-							title={currentSpecTask.text}
-						>
-							<IconChecklist
-								size={14}
-								color={
-									specTasksBlocked ? "var(--mantine-color-orange-6)" : "var(--mantine-color-teal-6)"
-								}
-							/>
-							{currentSpecTask.protected && (
-								<IconLock size={11} color="var(--mantine-color-yellow-6)" />
-							)}
-							<Text size="xs" c={specTasksBlocked ? "orange" : "teal"} truncate style={{ flex: 1 }}>
-								{currentSpecTask.text}
-							</Text>
 						</Group>
 					)}
 

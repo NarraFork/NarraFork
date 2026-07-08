@@ -9,6 +9,7 @@
  */
 
 import { settings } from "../settings";
+import type { ProxyOverride } from "../settings/types";
 
 /**
  * Detect a proxy URL from standard environment variables (case-insensitive).
@@ -48,6 +49,29 @@ export function getOutboundProxy(): string | undefined {
 	}
 }
 
+/**
+ * Resolve a per-location proxy override to a proxy URL (ignoring per-target
+ * exemptions). When the override is absent or its mode is "default", falls back
+ * to the global outbound proxy policy.
+ * - "default" → global policy (getOutboundProxy)
+ * - "direct"  → undefined (no proxy)
+ * - "system"  → read HTTPS_PROXY / HTTP_PROXY / ALL_PROXY env vars
+ * - "custom"  → the override's url
+ */
+export function resolveOverride(override?: ProxyOverride): string | undefined {
+	const mode = override?.mode ?? "default";
+	switch (mode) {
+		case "direct":
+			return undefined;
+		case "system":
+			return detectSystemProxy();
+		case "custom":
+			return override?.url || undefined;
+		default:
+			return getOutboundProxy();
+	}
+}
+
 /** Hostnames that always bypass the proxy (loopback / this-host). */
 function isLoopbackHost(hostname: string): boolean {
 	const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
@@ -84,26 +108,40 @@ function matchesNoProxy(hostname: string, entries: string[]): boolean {
 }
 
 /**
- * Resolve the proxy URL for a specific target URL, applying loopback and
- * NO_PROXY exemptions. Returns undefined when the target should be reached
- * directly (no proxy). Use this in every per-request proxy-aware fetch so
- * local gateways (NUG/Cline/local compatible providers) are never proxied.
+ * Apply loopback and NO_PROXY exemptions to an already-resolved proxy URL for a
+ * given target. Returns undefined when the target should be reached directly.
  */
-export function resolveProxyForUrl(target: string | URL): string | undefined {
-	const proxy = getOutboundProxy();
+export function applyProxyExemptions(
+	proxy: string | undefined,
+	target: string | URL,
+): string | undefined {
 	if (!proxy) return undefined;
 
 	let hostname: string;
 	try {
 		hostname = typeof target === "string" ? new URL(target).hostname : target.hostname;
 	} catch {
-		// Unparseable target — fall back to the global proxy.
+		// Unparseable target — fall back to the resolved proxy.
 		return proxy;
 	}
 
 	if (isLoopbackHost(hostname)) return undefined;
 	if (matchesNoProxy(hostname, getNoProxyEntries())) return undefined;
 	return proxy;
+}
+
+/**
+ * Resolve the proxy URL for a specific target URL, applying loopback and
+ * NO_PROXY exemptions. An optional per-location override takes precedence over
+ * the global policy (absent/"default" → global). Returns undefined when the
+ * target should be reached directly (no proxy). Use this in every per-request
+ * proxy-aware fetch so local gateways are never proxied.
+ */
+export function resolveProxyForUrl(
+	target: string | URL,
+	override?: ProxyOverride,
+): string | undefined {
+	return applyProxyExemptions(resolveOverride(override), target);
 }
 
 /** Whether a proxy URL uses a SOCKS scheme (socks/socks4/socks4a/socks5/socks5h). */

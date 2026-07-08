@@ -33,3 +33,32 @@ export function summarizeOutboundProxyPolicy(policy: unknown): OutboundProxySumm
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
+
+/** Per-location proxy override mode (adds "default" = inherit global). */
+export type ProxyOverrideMode = "default" | "direct" | "system" | "custom";
+
+export interface ProxyOverride {
+	mode: ProxyOverrideMode;
+	url?: string;
+}
+
+export function normalizeProxyOverrideMode(value: unknown): ProxyOverrideMode {
+	return value === "direct" || value === "system" || value === "custom" || value === "default"
+		? value
+		: "default";
+}
+
+/**
+ * Build a ProxyOverride payload from UI state, or undefined when mode is
+ * "default" (so the field is omitted and the location inherits the global policy).
+ */
+export function buildProxyOverride(
+	mode: ProxyOverrideMode,
+	url: string | undefined,
+): ProxyOverride | undefined {
+	if (mode === "default") return undefined;
+	if (mode === "custom") {
+		return { mode: "custom", url: normalizeProxyUrl(url) };
+	}
+	return { mode };
+}

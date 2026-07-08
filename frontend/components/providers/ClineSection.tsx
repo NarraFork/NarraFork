@@ -35,7 +35,9 @@ import {
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
+import type { ProxyOverride } from "../../lib/proxy";
 import { normalizeUrlProtocol } from "../../lib/url";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 
@@ -223,7 +225,21 @@ export const ClineSection = React.memo(function ClineSection({
 		prefix?: string;
 		name?: string;
 		enabledModels?: string[];
+		proxy?: ProxyOverride;
 	}> = (settingsData?.clineProviders as typeof clineProviders) ?? [];
+	const clineProxy = clineProviders[0]?.proxy;
+
+	const setProxyMutation = useMutation({
+		mutationFn: (proxy: ProxyOverride | undefined) => {
+			// Persist onto every configured cline provider (usually one).
+			const next = clineProviders.map((p) => ({ ...p, proxy }));
+			return api.updateSettings({ clineProviders: next });
+		},
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+	});
 
 	const firstPrefix = clineProviders[0]?.prefix ?? "cline";
 	const enabledModels: string[] = clineProviders[0]?.enabledModels ?? [];
@@ -435,6 +451,13 @@ export const ClineSection = React.memo(function ClineSection({
 						)}
 					</Stack>
 				)}
+
+			{/* Proxy override */}
+			<ProxyOverrideField
+				value={clineProxy}
+				onChange={(next) => setProxyMutation.mutate(next)}
+				disabled={setProxyMutation.isPending}
+			/>
 
 			{/* Model pool: refresh + search */}
 			<Stack gap="xs">

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeHttpUrlProtocol, normalizeUrlProtocol } from "./url";
+import { extractPrimaryDomainLabel, normalizeHttpUrlProtocol, normalizeUrlProtocol } from "./url";
 
 describe("normalizeUrlProtocol", () => {
 	test("adds https to domain-like URLs without a protocol", () => {
@@ -53,5 +53,33 @@ describe("normalizeHttpUrlProtocol", () => {
 		expect(normalizeHttpUrlProtocol("git@github.com:owner/repo.git")).toBeUndefined();
 		expect(normalizeHttpUrlProtocol("/absolute/path")).toBeUndefined();
 		expect(normalizeHttpUrlProtocol("  ")).toBeUndefined();
+	});
+});
+
+describe("extractPrimaryDomainLabel", () => {
+	test("takes the second-to-last hostname label", () => {
+		expect(extractPrimaryDomainLabel("https://api.openai.com/v1")).toBe("openai");
+		expect(extractPrimaryDomainLabel("https://api.deepseek.com")).toBe("deepseek");
+		expect(extractPrimaryDomainLabel("https://open.bigmodel.cn")).toBe("bigmodel");
+		expect(extractPrimaryDomainLabel("https://dashscope.aliyuncs.com")).toBe("aliyuncs");
+		expect(extractPrimaryDomainLabel("https://openai.com")).toBe("openai");
+	});
+
+	test("works without an explicit protocol", () => {
+		expect(extractPrimaryDomainLabel("api.moonshot.cn/v1")).toBe("moonshot");
+		expect(extractPrimaryDomainLabel("example.com")).toBe("example");
+	});
+
+	test("returns empty string for hosts without a registrable label", () => {
+		expect(extractPrimaryDomainLabel("http://localhost:7779/api")).toBe("");
+		expect(extractPrimaryDomainLabel("http://127.0.0.1:8080")).toBe("");
+		expect(extractPrimaryDomainLabel("http://[::1]:7779")).toBe("");
+		expect(extractPrimaryDomainLabel("")).toBe("");
+		expect(extractPrimaryDomainLabel(undefined)).toBe("");
+		expect(extractPrimaryDomainLabel("   ")).toBe("");
+	});
+
+	test("ignores non-http schemes", () => {
+		expect(extractPrimaryDomainLabel("socks5://proxy.example.com:1080")).toBe("");
 	});
 });

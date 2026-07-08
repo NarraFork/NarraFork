@@ -8,7 +8,7 @@
 import type TelegramBot from "node-telegram-bot-api";
 import type { TelegramMessage } from "node-telegram-bot-api";
 import { logger } from "../../lib/logger";
-import { getOutboundProxy } from "../../lib/net/proxy";
+import { resolveOverride } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, TelegramConfig } from "../types";
 
@@ -29,9 +29,9 @@ export class TelegramAdapter extends BaseAdapter {
 		try {
 			const TelegramBotCtor = (await import("node-telegram-bot-api")).default;
 			// Telegram uses long-polling over HTTP; route all API traffic through the
-			// global outbound proxy when configured (underlying @cypress/request
-			// accepts a `proxy` URL). Empty proxy → default direct behaviour.
-			const proxy = getOutboundProxy();
+			// resolved proxy (this platform's override, else the global policy).
+			// Empty proxy → default direct behaviour.
+			const proxy = resolveOverride(this.config.proxy);
 			this.bot = new TelegramBotCtor(this.config.token, {
 				polling: true,
 				...(proxy ? { request: { proxy } } : {}),

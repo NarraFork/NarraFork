@@ -195,9 +195,6 @@ function NarratorDetailPage() {
 	const [drawerOpened, { open: openDrawer, close: closeDrawer }] = useDisclosure(false);
 	// Spec drawer for mobile
 	const [specDrawerOpened, { open: openSpecDrawer, close: closeSpecDrawer }] = useDisclosure(false);
-	// Save/reload controls reported up by the chromeless SpecPanel, rendered in
-	// the mobile drawer's header (mirrors the desktop dock's ToolPanelShell).
-	const [specActions, setSpecActions] = useState<React.ReactNode>(null);
 
 	// Intercept browser back button to close mobile terminal drawer instead of navigating away
 	const closedByPopState = useRef(false);
@@ -551,7 +548,6 @@ function NarratorDetailPage() {
 				<Drawer
 					opened={specDrawerOpened}
 					onClose={() => {
-						setSpecActions(null);
 						closeSpecDrawer();
 					}}
 					position="right"
@@ -561,7 +557,6 @@ function NarratorDetailPage() {
 							<Text size="sm" fw={600} truncate style={{ flex: 1 }}>
 								{tn("spec.title")}
 							</Text>
-							{specActions}
 						</Group>
 					}
 					closeButtonProps={{ size: "sm" }}
@@ -574,12 +569,7 @@ function NarratorDetailPage() {
 							</Center>
 						}
 					>
-						<SpecPanel
-							narratorId={narratorId}
-							onClose={closeSpecDrawer}
-							chromeless
-							onHeaderActionsChange={setSpecActions}
-						/>
+						<SpecPanel narratorId={narratorId} onClose={closeSpecDrawer} chromeless />
 					</Suspense>
 				</Drawer>
 			</Box>

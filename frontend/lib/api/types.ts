@@ -397,6 +397,8 @@ export interface HookApiRecord {
 	command: string | null;
 	url: string | null;
 	headers: Record<string, string> | null;
+	proxyMode: "default" | "direct" | "system" | "custom" | null;
+	proxyUrl: string | null;
 	prompt: string | null;
 	model: string | null;
 	timeout: number;

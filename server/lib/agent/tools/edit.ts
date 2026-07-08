@@ -398,9 +398,10 @@ function normalizeLineEndings(text: string): string {
 export const editTool: ToolDefinition = {
 	name: "Edit",
 	description:
-		"Performs exact string replacements in files.\n\n" +
+		"Performs exact string replacements in local files or the narrator's Dynamic Spec virtual files.\n\n" +
 		"Usage:\n" +
 		"- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. \n" +
+		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected.\n" +
 		"- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.\n" +
 		"- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n" +
 		"- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n" +
@@ -410,7 +411,7 @@ export const editTool: ToolDefinition = {
 		type: "object",
 		properties: {
 			file_path: {
-				description: "The absolute path to the file to modify",
+				description: "The absolute local path or spec:// Dynamic Spec URI to modify",
 				type: "string",
 			},
 			old_string: {
@@ -431,7 +432,7 @@ export const editTool: ToolDefinition = {
 		additionalProperties: false,
 	},
 	parameters: z.object({
-		file_path: z.string().describe("The absolute path to the file to modify"),
+		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to modify"),
 		old_string: z.string().describe("The text to replace"),
 		new_string: z
 			.string()

@@ -89,3 +89,43 @@ function isValidIpv6Address(value: string): boolean {
 		return false;
 	}
 }
+
+/**
+ * Extract the primary domain label from a base URL's hostname, suitable for
+ * use as a provider name/prefix seed. Takes the second-to-last hostname label.
+ *
+ * Examples:
+ *   https://api.openai.com/v1      → "openai"
+ *   https://api.deepseek.com       → "deepseek"
+ *   https://open.bigmodel.cn       → "bigmodel"
+ *   https://dashscope.aliyuncs.com → "aliyuncs"
+ *   https://openai.com             → "openai"
+ *
+ * Returns "" for single-label hosts (e.g. "localhost"), IP addresses, or
+ * anything that cannot be parsed. The result never contains an ASCII colon.
+ */
+export function extractPrimaryDomainLabel(value: string | null | undefined): string {
+	const normalized = normalizeHttpUrlProtocol(value);
+	if (!normalized) return "";
+
+	let hostname: string;
+	try {
+		hostname = new URL(normalized).hostname;
+	} catch {
+		return "";
+	}
+
+	hostname = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	if (!hostname || hostname === "localhost") return "";
+	if (isValidIpv4Address(hostname) || isValidIpv6Address(hostname)) return "";
+
+	const labels = hostname.split(".").filter(Boolean);
+	if (labels.length < 2) return "";
+
+	// Second-to-last label is the primary registrable label for the common
+	// "sub.domain.tld" shape (e.g. api.openai.com → openai). Multi-part suffixes
+	// like "aliyuncs.com" resolve to their registrable base
+	// (dashscope.aliyuncs.com → aliyuncs), matching the requested behavior.
+	const label = labels[labels.length - 2] ?? "";
+	return label.replace(/:/g, "");
+}

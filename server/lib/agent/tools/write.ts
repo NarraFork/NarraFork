@@ -13,18 +13,21 @@ import { trackFileChange } from "./track-file-change";
 export const writeTool: ToolDefinition = {
 	name: "Write",
 	description:
-		"Writes a file to the local filesystem.\n\n" +
+		"Writes a file to the local filesystem or the narrator's Dynamic Spec virtual files.\n\n" +
 		"Usage:\n" +
 		"- This tool will overwrite the existing file if there is one at the provided path.\n" +
 		"- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n" +
 		"- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n" +
+		"- Dynamic Spec support: file_path may be a spec:// URI such as spec://tasks.json or spec://index.md. Keep spec://tasks.json to only tasks[].text/status/protected; do not add IDs, timestamps, summaries, evidence, or runtime metadata.\n" +
+		"- spec://behavior_fence is normally read-only for the assistant; only write it when the user explicitly asks you to record a behavior, and only as the first tool call of that user turn.\n" +
 		"- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n" +
 		"- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
 			file_path: {
-				description: "The absolute path to the file to write (must be absolute, not relative)",
+				description:
+					"The absolute local path or spec:// Dynamic Spec URI to write (local paths must be absolute, not relative)",
 				type: "string",
 			},
 			content: {
@@ -38,7 +41,9 @@ export const writeTool: ToolDefinition = {
 	parameters: z.object({
 		file_path: z
 			.string()
-			.describe("The absolute path to the file to write (must be absolute, not relative)"),
+			.describe(
+				"The absolute local path or spec:// Dynamic Spec URI to write (local paths must be absolute, not relative)",
+			),
 		content: z.string().describe("The content to write to the file"),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {

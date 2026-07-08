@@ -17,7 +17,7 @@ import {
 import { notifications } from "@mantine/notifications";
 import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useProviderModelRefreshCapability,
@@ -25,6 +25,8 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import { extractPrimaryDomainLabel } from "../../lib/url";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -192,12 +194,30 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		[onProvidersChange, provider.id],
 	);
 
-	// Track whether the user has manually edited the prefix. New providers start
-	// with an empty prefix → name drives the prefix until the user edits it.
+	// Track whether the user has manually edited the prefix / name. New providers
+	// start with an empty prefix and a localized default name (both treated as
+	// "not edited"), so the name — and later the base URL domain — can seed the
+	// prefix until the user takes over either field.
 	const [prefixManuallyEdited, setPrefixManuallyEdited] = useState(() => !!provider.prefix);
+	const [nameManuallyEdited, setNameManuallyEdited] = useState(() => !!provider.prefix);
+
+	// On open, seed an empty prefix from the current name so users see a prefix
+	// immediately without having to touch the name field. Runs once per mount.
+	const seededOnOpenRef = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: seed once on mount only
+	useEffect(() => {
+		if (seededOnOpenRef.current) return;
+		seededOnOpenRef.current = true;
+		if (provider.prefix) return;
+		const base = sanitizePrefix(provider.name.trim());
+		if (!base) return;
+		const nextPrefix = getUniquePrefix?.(base, provider.id) ?? base;
+		if (nextPrefix) updateProvider("prefix", nextPrefix);
+	}, []);
 
 	const handleNameChange = useCallback(
 		(name: string) => {
+			setNameManuallyEdited(true);
 			onProvidersChange((prev) =>
 				prev.map((p) => {
 					if (p.id !== provider.id) return p;
@@ -218,6 +238,34 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 			updateProvider("prefix", next);
 		},
 		[updateProvider],
+	);
+
+	// When neither name nor prefix has been touched, derive both from the base
+	// URL's primary domain label as the user types it.
+	const handleBaseUrlChange = useCallback(
+		(value: string) => {
+			if (nameManuallyEdited || prefixManuallyEdited) {
+				updateProvider("baseUrl", value);
+				return;
+			}
+			const label = extractPrimaryDomainLabel(value);
+			onProvidersChange((prev) =>
+				prev.map((p) => {
+					if (p.id !== provider.id) return p;
+					if (!label) return { ...p, baseUrl: value };
+					const nextPrefix = getUniquePrefix?.(label, p.id) ?? label;
+					return { ...p, baseUrl: value, name: label, prefix: nextPrefix };
+				}),
+			);
+		},
+		[
+			nameManuallyEdited,
+			prefixManuallyEdited,
+			onProvidersChange,
+			provider.id,
+			getUniquePrefix,
+			updateProvider,
+		],
 	);
 
 	const handleRemoveProvider = useCallback(() => {
@@ -336,7 +384,12 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					placeholder={t("customApiBaseUrlPlaceholder")}
 					value={provider.baseUrl}
 					size="xs"
-					onChange={(e) => updateProvider("baseUrl", e.currentTarget.value)}
+					onChange={(e) => handleBaseUrlChange(e.currentTarget.value)}
+				/>
+
+				<ProxyOverrideField
+					value={provider.proxy}
+					onChange={(next) => updateProvider("proxy", next)}
 				/>
 
 				<Stack gap={4}>

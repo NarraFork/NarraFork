@@ -11,7 +11,8 @@ export const globTool: ToolDefinition = {
 		"- Fast file pattern matching tool that works with any codebase size\n" +
 		'- Supports glob patterns like "**/*.js" or "src/**/*.ts"\n' +
 		"- Returns matching file paths sorted by modification time\n" +
-		"- Use this tool when you need to find files by name patterns\n" +
+		"- Use this tool when you need to find local filesystem files by name patterns\n" +
+		'- This tool does not enumerate spec:// Dynamic Spec virtual files; use Grep with path "spec://" or Read known spec:// files instead\n' +
 		"- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead\n" +
 		"- You can call multiple tools in a single response. It is always better to speculatively perform multiple searches in parallel if they are potentially useful.",
 	rawJsonSchema: {

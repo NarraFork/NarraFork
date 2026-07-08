@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
 import { resolveProxyForUrl } from "../../lib/net/proxy";
+import type { ProxyOverride } from "../../lib/settings/types";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, WeixinConfig } from "../types";
 
@@ -172,12 +173,13 @@ async function ilinkPost(
 	payload: Record<string, unknown>,
 	token: string | null,
 	timeoutMs: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	const body = JSON.stringify({ ...payload, base_info: baseInfo() });
 	const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
-	const proxy = resolveProxyForUrl(url);
+	const proxy = resolveProxyForUrl(url, proxyOverride);
 	try {
 		const resp = await fetch(url, {
 			method: "POST",
@@ -200,11 +202,12 @@ export async function ilinkGet(
 	baseUrl: string,
 	endpoint: string,
 	timeoutMs: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
-	const proxy = resolveProxyForUrl(url);
+	const proxy = resolveProxyForUrl(url, proxyOverride);
 	try {
 		const resp = await fetch(url, {
 			method: "GET",
@@ -233,9 +236,17 @@ async function getUpdates(
 	token: string,
 	syncBuf: string,
 	timeoutMs: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	try {
-		return await ilinkPost(baseUrl, EP_GET_UPDATES, { get_updates_buf: syncBuf }, token, timeoutMs);
+		return await ilinkPost(
+			baseUrl,
+			EP_GET_UPDATES,
+			{ get_updates_buf: syncBuf },
+			token,
+			timeoutMs,
+			proxyOverride,
+		);
 	} catch {
 		// Timeout → return empty result with original sync_buf
 		return { ret: 0, msgs: [], get_updates_buf: syncBuf };
@@ -249,6 +260,7 @@ async function sendTextMessage(
 	text: string,
 	contextToken: string | null,
 	clientId: string,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	const msg: Record<string, unknown> = {
 		from_user_id: "",
@@ -259,7 +271,7 @@ async function sendTextMessage(
 		item_list: [{ type: ITEM_TEXT, text_item: { text } }],
 	};
 	if (contextToken) msg.context_token = contextToken;
-	return ilinkPost(baseUrl, EP_SEND_MESSAGE, { msg }, token, API_TIMEOUT_MS);
+	return ilinkPost(baseUrl, EP_SEND_MESSAGE, { msg }, token, API_TIMEOUT_MS, proxyOverride);
 }
 
 async function sendMediaMessage(
@@ -269,6 +281,7 @@ async function sendMediaMessage(
 	itemList: unknown[],
 	contextToken: string | null,
 	clientId: string,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	const msg: Record<string, unknown> = {
 		from_user_id: "",
@@ -279,7 +292,7 @@ async function sendMediaMessage(
 		item_list: itemList,
 	};
 	if (contextToken) msg.context_token = contextToken;
-	return ilinkPost(baseUrl, EP_SEND_MESSAGE, { msg }, token, API_TIMEOUT_MS);
+	return ilinkPost(baseUrl, EP_SEND_MESSAGE, { msg }, token, API_TIMEOUT_MS, proxyOverride);
 }
 
 async function sendTypingRequest(
@@ -288,6 +301,7 @@ async function sendTypingRequest(
 	toUserId: string,
 	typingTicket: string,
 	status: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<void> {
 	await ilinkPost(
 		baseUrl,
@@ -295,6 +309,7 @@ async function sendTypingRequest(
 		{ ilink_user_id: toUserId, typing_ticket: typingTicket, status },
 		token,
 		CONFIG_TIMEOUT_MS,
+		proxyOverride,
 	);
 }
 
@@ -303,10 +318,11 @@ async function getConfig(
 	token: string,
 	userId: string,
 	contextToken: string | null,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	const payload: Record<string, unknown> = { ilink_user_id: userId };
 	if (contextToken) payload.context_token = contextToken;
-	return ilinkPost(baseUrl, EP_GET_CONFIG, payload, token, CONFIG_TIMEOUT_MS);
+	return ilinkPost(baseUrl, EP_GET_CONFIG, payload, token, CONFIG_TIMEOUT_MS, proxyOverride);
 }
 
 async function getUploadUrl(
@@ -319,6 +335,7 @@ async function getUploadUrl(
 	rawfilemd5: string,
 	filesize: number,
 	aeskeyHex: string,
+	proxyOverride?: ProxyOverride,
 ): Promise<Record<string, unknown>> {
 	return ilinkPost(
 		baseUrl,
@@ -335,6 +352,7 @@ async function getUploadUrl(
 		},
 		token,
 		API_TIMEOUT_MS,
+		proxyOverride,
 	);
 }
 
@@ -358,10 +376,14 @@ function assertWeixinCdnUrl(url: string): void {
 	}
 }
 
-async function uploadCiphertext(ciphertext: Buffer, uploadUrl: string): Promise<string> {
+async function uploadCiphertext(
+	ciphertext: Buffer,
+	uploadUrl: string,
+	proxyOverride?: ProxyOverride,
+): Promise<string> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 120_000);
-	const proxy = resolveProxyForUrl(uploadUrl);
+	const proxy = resolveProxyForUrl(uploadUrl, proxyOverride);
 	try {
 		const resp = await fetch(uploadUrl, {
 			method: "POST",
@@ -392,6 +414,7 @@ async function downloadAndDecryptMedia(
 	aesKeyB64: string | null,
 	fullUrl: string | null,
 	timeoutSeconds: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<Buffer> {
 	let url: string;
 	if (encryptedQueryParam) {
@@ -405,7 +428,7 @@ async function downloadAndDecryptMedia(
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
-	const proxy = resolveProxyForUrl(url);
+	const proxy = resolveProxyForUrl(url, proxyOverride);
 	try {
 		const resp = await fetch(url, {
 			signal: controller.signal,
@@ -627,6 +650,7 @@ async function uploadMediaFile(
 	toUserId: string,
 	fileData: Buffer,
 	mediaType: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<UploadedMedia> {
 	const aesKey = randomBytes(16);
 	const rawsize = fileData.length;
@@ -644,6 +668,7 @@ async function uploadMediaFile(
 		rawfilemd5,
 		filesize,
 		aesKey.toString("hex"),
+		proxyOverride,
 	);
 
 	const ciphertext = aes128EcbEncrypt(fileData, aesKey);
@@ -660,7 +685,7 @@ async function uploadMediaFile(
 		throw new Error("getUploadUrl returned neither upload_param nor upload_full_url");
 	}
 
-	const encryptQueryParam = await uploadCiphertext(ciphertext, targetUrl);
+	const encryptQueryParam = await uploadCiphertext(ciphertext, targetUrl, proxyOverride);
 
 	// iLink expects aes_key as base64(hex_string), NOT base64(raw_bytes)
 	const aesKeyForApi = Buffer.from(aesKey.toString("hex"), "ascii").toString("base64");
@@ -769,6 +794,7 @@ function mediaReference(item: Record<string, unknown>, key: string): Record<stri
 async function downloadInboundImage(
 	cdnBase: string,
 	item: Record<string, unknown>,
+	proxyOverride?: ProxyOverride,
 ): Promise<{ data: Buffer; filename: string } | null> {
 	const imageItem = item.image_item as Record<string, unknown> | undefined;
 	if (!imageItem) return null;
@@ -788,6 +814,7 @@ async function downloadInboundImage(
 			aesKeyB64,
 			String(media.full_url ?? "") || null,
 			30,
+			proxyOverride,
 		);
 		return { data, filename: `image_${Date.now()}.jpg` };
 	} catch (err) {
@@ -802,6 +829,7 @@ async function downloadInboundImage(
 async function downloadInboundFile(
 	cdnBase: string,
 	item: Record<string, unknown>,
+	proxyOverride?: ProxyOverride,
 ): Promise<{ data: Buffer; filename: string; mediaType: string } | null> {
 	const fileItem = item.file_item as Record<string, unknown> | undefined;
 	if (!fileItem) return null;
@@ -823,6 +851,7 @@ async function downloadInboundFile(
 			aesKeyB64,
 			String(media.full_url ?? "") || null,
 			60, // longer timeout for files
+			proxyOverride,
 		);
 
 		// Guess MIME type from filename extension
@@ -990,7 +1019,13 @@ export class WeixinAdapter extends BaseAdapter {
 
 		while (this.running) {
 			try {
-				const response = await getUpdates(this.baseUrl, this.token, syncBuf, timeoutMs);
+				const response = await getUpdates(
+					this.baseUrl,
+					this.token,
+					syncBuf,
+					timeoutMs,
+					this.config.proxy,
+				);
 
 				const suggestedTimeout = response.longpolling_timeout_ms;
 				if (typeof suggestedTimeout === "number" && suggestedTimeout > 0) {
@@ -1110,7 +1145,7 @@ export class WeixinAdapter extends BaseAdapter {
 			if (!item || typeof item !== "object") continue;
 			const it = item as Record<string, unknown>;
 			if (it.type === ITEM_IMAGE) {
-				const result = await downloadInboundImage(this.cdnBaseUrl, it);
+				const result = await downloadInboundImage(this.cdnBaseUrl, it, this.config.proxy);
 				if (result) {
 					const tmpPath = saveTempImage(result.data, result.filename);
 					images.push({
@@ -1124,7 +1159,7 @@ export class WeixinAdapter extends BaseAdapter {
 			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
 			const refItem = refMsg?.message_item as Record<string, unknown> | undefined;
 			if (refItem?.type === ITEM_IMAGE) {
-				const result = await downloadInboundImage(this.cdnBaseUrl, refItem);
+				const result = await downloadInboundImage(this.cdnBaseUrl, refItem, this.config.proxy);
 				if (result) {
 					const tmpPath = saveTempImage(result.data, result.filename);
 					images.push({
@@ -1142,7 +1177,7 @@ export class WeixinAdapter extends BaseAdapter {
 			if (!item || typeof item !== "object") continue;
 			const it = item as Record<string, unknown>;
 			if (it.type === ITEM_FILE) {
-				const result = await downloadInboundFile(this.cdnBaseUrl, it);
+				const result = await downloadInboundFile(this.cdnBaseUrl, it, this.config.proxy);
 				if (result) {
 					files.push({
 						data: result.data,
@@ -1155,7 +1190,7 @@ export class WeixinAdapter extends BaseAdapter {
 			const refMsg = it.ref_msg as Record<string, unknown> | undefined;
 			const refItem = refMsg?.message_item as Record<string, unknown> | undefined;
 			if (refItem?.type === ITEM_FILE) {
-				const result = await downloadInboundFile(this.cdnBaseUrl, refItem);
+				const result = await downloadInboundFile(this.cdnBaseUrl, refItem, this.config.proxy);
 				if (result) {
 					files.push({
 						data: result.data,
@@ -1185,7 +1220,13 @@ export class WeixinAdapter extends BaseAdapter {
 	private async fetchTypingTicket(userId: string, contextToken: string | null): Promise<void> {
 		if (this.typingCache.get(userId)) return;
 		try {
-			const resp = await getConfig(this.baseUrl, this.token, userId, contextToken);
+			const resp = await getConfig(
+				this.baseUrl,
+				this.token,
+				userId,
+				contextToken,
+				this.config.proxy,
+			);
 			const ticket = String(resp.typing_ticket ?? "").trim();
 			if (ticket) this.typingCache.set(userId, ticket);
 		} catch {
@@ -1222,6 +1263,7 @@ export class WeixinAdapter extends BaseAdapter {
 					chunk,
 					contextToken,
 					clientId,
+					this.config.proxy,
 				);
 
 				const ret = (resp.ret as number) ?? 0;
@@ -1267,6 +1309,7 @@ export class WeixinAdapter extends BaseAdapter {
 			chatId,
 			imageData,
 			MEDIA_IMAGE,
+			this.config.proxy,
 		);
 		const contextToken = this.tokenStore.get(this.accountId, chatId);
 		const clientId = `narrafork-wx-${randomUUID().replace(/-/g, "")}`;
@@ -1277,6 +1320,7 @@ export class WeixinAdapter extends BaseAdapter {
 			[buildImageItem(media)],
 			contextToken,
 			clientId,
+			this.config.proxy,
 		);
 	}
 
@@ -1288,6 +1332,7 @@ export class WeixinAdapter extends BaseAdapter {
 			chatId,
 			fileData,
 			MEDIA_FILE,
+			this.config.proxy,
 		);
 		const contextToken = this.tokenStore.get(this.accountId, chatId);
 		const clientId = `narrafork-wx-${randomUUID().replace(/-/g, "")}`;
@@ -1298,6 +1343,7 @@ export class WeixinAdapter extends BaseAdapter {
 			[buildFileItem(media, filename)],
 			contextToken,
 			clientId,
+			this.config.proxy,
 		);
 	}
 
@@ -1309,7 +1355,14 @@ export class WeixinAdapter extends BaseAdapter {
 		const ticket = this.typingCache.get(chatId);
 		if (!ticket) return;
 		try {
-			await sendTypingRequest(this.baseUrl, this.token, chatId, ticket, TYPING_START);
+			await sendTypingRequest(
+				this.baseUrl,
+				this.token,
+				chatId,
+				ticket,
+				TYPING_START,
+				this.config.proxy,
+			);
 		} catch {
 			// non-fatal
 		}

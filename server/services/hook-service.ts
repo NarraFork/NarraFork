@@ -6,6 +6,7 @@ import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { resolveProxyForUrl } from "../lib/net/proxy";
+import type { ProxyOverride, ProxyOverrideMode } from "../lib/settings/types";
 
 // === Types ===
 
@@ -90,6 +91,8 @@ export const hookService = {
 		command?: string;
 		url?: string;
 		headers?: Record<string, string>;
+		proxyMode?: ProxyOverrideMode;
+		proxyUrl?: string;
 		timeout?: number;
 		enabled?: boolean;
 		sortOrder?: number;
@@ -105,6 +108,8 @@ export const hookService = {
 			command: data.command ?? null,
 			url: data.url ?? null,
 			headers: data.headers ?? null,
+			proxyMode: data.proxyMode ?? null,
+			proxyUrl: data.proxyUrl ?? null,
 			prompt: null,
 			model: null,
 			timeout: data.timeout ?? 30,
@@ -125,6 +130,8 @@ export const hookService = {
 			command: string | null;
 			url: string | null;
 			headers: Record<string, string> | null;
+			proxyMode: ProxyOverrideMode | null;
+			proxyUrl: string | null;
 			timeout: number;
 			enabled: boolean;
 			sortOrder: number;
@@ -180,7 +187,13 @@ export const hookService = {
 					result = await executeCommandHook(hook.command ?? "", input, hook.timeout);
 					break;
 				case "http":
-					result = await executeHttpHook(hook.url ?? "", input, hook.headers, hook.timeout);
+					result = await executeHttpHook(
+						hook.url ?? "",
+						input,
+						hook.headers,
+						hook.timeout,
+						hook.proxyMode ? { mode: hook.proxyMode, url: hook.proxyUrl ?? undefined } : undefined,
+					);
 					break;
 				default:
 					result = { outcome: "error", reason: `Unknown hook type: ${hook.type}` };
@@ -331,10 +344,11 @@ async function executeHttpHook(
 	input: HookInput,
 	headers?: Record<string, string> | null,
 	timeout?: number,
+	proxyOverride?: ProxyOverride,
 ): Promise<HookResult> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), (timeout ?? 30) * 1000);
-	const proxy = resolveProxyForUrl(url);
+	const proxy = resolveProxyForUrl(url, proxyOverride);
 
 	try {
 		const response = await fetch(url, {

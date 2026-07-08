@@ -42,8 +42,8 @@ export interface CustomApiProviderConfig {
 	defaultContextWindow?: number;
 	/** Anthropic: default reasoning effort when narrator reasoningEffort is unset. */
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
-	/** @deprecated Per-provider proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
-	proxy?: string;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 	/** Anthropic: skip TLS certificate verification for MITM proxies or self-signed certs. */
 	tlsRejectUnauthorized?: boolean;
 	/** Codex: ChatGPT account ID sent as ChatGPT-Account-Id header. */
@@ -94,6 +94,8 @@ export interface OpenAIProviderConfig {
 	codexImageGeneration?: boolean;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
 }
@@ -121,8 +123,8 @@ export interface AnthropicProviderConfig {
 	 * Maps to thinking config (adaptive/disabled) and effort parameter for supported models.
 	 */
 	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
-	/** @deprecated Per-provider proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
-	proxy?: string;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 	/** Skip TLS certificate verification (for use with MITM proxies or self-signed certs). */
 	tlsRejectUnauthorized?: boolean;
 	/**
@@ -163,6 +165,8 @@ export interface NUGProviderConfig {
 	oauthDeviceId?: string;
 	/** Override OAuth callback URL (auto-detected from request headers by default). */
 	oauthCallbackUrl?: string;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 }
 
 export interface ClineProviderConfig {
@@ -184,6 +188,8 @@ export interface ClineProviderConfig {
 	defaultContextWindow?: number;
 	/** User-selected models from the OpenRouter pool. Only these are available for use. */
 	enabledModels?: string[];
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
 }
 
 
@@ -284,7 +290,7 @@ export type OutboundProxyMode = "system" | "direct" | "custom";
 
 /**
  * Unified outbound proxy policy applied to every outbound network channel
- * Replaces the previous per-provider proxy fields.
+ * unless a per-location {@link ProxyOverride} overrides it.
  */
 export interface OutboundProxyConfig {
 	/**
@@ -294,6 +300,23 @@ export interface OutboundProxyConfig {
 	 * - "custom": use the manually specified URL
 	 */
 	mode: OutboundProxyMode;
+	/** Proxy URL, only used when mode is "custom". */
+	url?: string;
+}
+
+/**
+ * Per-location proxy override mode. Adds "default" (inherit the global
+ * {@link OutboundProxyConfig}) on top of the three global modes.
+ */
+export type ProxyOverrideMode = "default" | "direct" | "system" | "custom";
+
+/**
+ * Optional per-location proxy override. When absent or mode === "default",
+ * the location follows the global outbound proxy policy. Otherwise it uses
+ * its own mode: "direct" (no proxy), "system" (env vars), or "custom" (url).
+ */
+export interface ProxyOverride {
+	mode: ProxyOverrideMode;
 	/** Proxy URL, only used when mode is "custom". */
 	url?: string;
 }
@@ -438,6 +461,8 @@ export interface NarraForkSettings {
 		silentToolCallThreshold: number;
 		/** Global default for behavior-fence periodic injection interval (completed tool calls). -1 = disabled. */
 		behaviorFenceInterval: number;
+		/** Global default for tasks.json reminder periodic injection interval (completed tool calls). -1 = disabled. */
+		tasksReminderInterval: number;
 		/** Global default for whether the behavior fence rides along with the tasks.json reminder. */
 		behaviorFenceAttachTasks: boolean;
 		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */
@@ -504,11 +529,8 @@ export interface NarraForkSettings {
 			whitelist?: Array<{ pattern: string; enabled?: boolean }>;
 			/** URL keyword blacklist — matching URLs are auto-denied (priority over whitelist). */
 			blacklist?: Array<{ pattern: string; enabled?: boolean }>;
-			/** @deprecated WebFetch proxy replaced by the global `settings.proxy` policy. Kept for migration only. */
-			proxy?: {
-				mode: "direct" | "system" | "custom";
-				url?: string;
-			};
+			/** Optional WebFetch/browser proxy override. Absent/"default" = follow the global policy. */
+			proxy?: ProxyOverride;
 		};
 		/**
 		 * Context window management thresholds (percentage, 0–100).
@@ -581,16 +603,16 @@ export interface NarraForkSettings {
 		credentialsPath: string;
 		configPath: string;
 		defaultModel?: string;
-		/** @deprecated Replaced by the global `settings.proxy` policy. Kept for migration only. */
-		proxy?: string;
+		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+		proxy?: ProxyOverride;
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.
 	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
 	 */
 	codex?: {
-		/** @deprecated Replaced by the global `settings.proxy` policy. Kept for migration only. */
-		proxy?: string;
+		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+		proxy?: ProxyOverride;
 		/** Load balancing mode: priority, balanced, or tier-balanced. */
 		loadBalancingMode?: LoadBalancingMode;
 		/** Account tier order used by tier-balanced mode. */

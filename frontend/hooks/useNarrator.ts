@@ -657,6 +657,7 @@ export function useUpdateReflectionOverrides() {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
+			tasksReminderIntervalOverride?: number | null;
 		}) => api.updateNarratorReflectionOverrides(id, data),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });

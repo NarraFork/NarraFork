@@ -6,7 +6,7 @@
  */
 
 import { logger } from "../../lib/logger";
-import { createProxyAgent, getOutboundProxy } from "../../lib/net/proxy";
+import { createProxyAgent, resolveOverride } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
@@ -67,7 +67,7 @@ export class FeishuAdapter extends BaseAdapter {
 			// agent fields explicitly (agent when proxied, undefined when not) so a
 			// later reconnect after switching from custom/system to direct clears a
 			// previously-attached agent instead of leaving it stale on the singleton.
-			const proxy = getOutboundProxy();
+			const proxy = resolveOverride(this.config.proxy);
 			const agent = await createProxyAgent(proxy);
 			if (proxy) {
 				logger.warn(

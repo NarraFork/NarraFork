@@ -53,13 +53,16 @@ beforeAll(async () => {
 
 describe("spec VFS built-ins", () => {
 	test("reads built-in files and lists them", async () => {
-		const help = await readSpecFile(parentNarratorId, "spec://HOW_TO_USE_SPEC.md");
-		expect(help.readonly).toBe(true);
-		expect(help.content).toContain("tasks.json");
+		const index = await readSpecFile(parentNarratorId, "spec://index.md");
+		expect(index.readonly).toBe(false);
+		expect(index.content).toContain("tasks.json");
 
 		const files = await listSpecFiles(parentNarratorId);
-		expect(files.map((file) => file.uri)).toContain("spec://tasks.json");
-		expect(files.map((file) => file.uri)).toContain("spec://behavior_fence");
+		const uris = files.map((file) => file.uri);
+		expect(uris).toContain("spec://index.md");
+		expect(uris).toContain("spec://tasks.json");
+		expect(uris).toContain("spec://behavior_fence");
+		expect(uris).not.toContain("spec://HOW_TO_USE_SPEC.md");
 	});
 
 	test("rejects agent writes to behavior_fence without a mutation grant", async () => {
@@ -106,15 +109,6 @@ describe("spec VFS built-ins", () => {
 		expect(reread.content).toBe(body);
 		expect(reread.readonly).toBe(true);
 		expect(reread.uiEditable).toBe(true);
-	});
-
-	test("rejects user (UI) writes to HOW_TO_USE_SPEC.md (not UI-editable)", async () => {
-		expect(
-			writeSpecFile(parentNarratorId, "spec://HOW_TO_USE_SPEC.md", "overwrite", {
-				actor: "user",
-				createdBy: "user",
-			}),
-		).rejects.toThrow(/not editable/);
 	});
 
 	test("rejects deleting built-in behavior_fence", async () => {

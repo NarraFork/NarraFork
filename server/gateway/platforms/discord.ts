@@ -9,7 +9,7 @@ import { logger } from "../../lib/logger";
 import {
 	closeUndiciDispatcher,
 	createUndiciProxyDispatcher,
-	getOutboundProxy,
+	resolveOverride,
 	type UndiciDispatcherLike,
 } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
@@ -70,11 +70,11 @@ export class DiscordAdapter extends BaseAdapter {
 		try {
 			const { Client, GatewayIntentBits } = await import("discord.js");
 
-			// Route Discord REST traffic through the global outbound proxy when
-			// configured. discord.js REST `agent` expects an undici Dispatcher.
-			// NOTE: this covers REST (sending/editing messages); the Gateway
-			// WebSocket has no proxy entry point and is not routed through it.
-			const proxy = getOutboundProxy();
+			// Route Discord REST traffic through the resolved proxy (this platform's
+			// override, else the global policy). discord.js REST `agent` expects an
+			// undici Dispatcher. NOTE: this covers REST (sending/editing messages);
+			// the Gateway WebSocket has no proxy entry point and is not routed.
+			const proxy = resolveOverride(this.config.proxy);
 			this.restAgent = (await createUndiciProxyDispatcher(proxy)) ?? null;
 			if (proxy) {
 				logger.warn(

@@ -514,6 +514,8 @@ class Gateway {
 							/* non-fatal */
 						}
 					} else {
+						// Downloading user-referenced remote content (not a platform API
+						// call); follows the global outbound proxy policy.
 						const imgProxy = resolveProxyForUrl(img.url);
 						const resp = await fetch(img.url, imgProxy ? { proxy: imgProxy } : undefined);
 						if (!resp.ok) {

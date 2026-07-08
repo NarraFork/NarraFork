@@ -28,41 +28,12 @@ const specWriteLock = new AsyncMutex();
 
 type DbTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
-const HOW_TO_USE_SPEC = `# HOW TO USE SPEC
-
-You can use spec:// files with Read, Write, Edit and Grep.
-
-Core files:
-
-- spec://index.md — overview and free-form planning notes.
-- spec://tasks.json — the minimal task queue used for task reminders and continuation.
-- spec://behavior_fence — behavior fence: durable behavior constraints the user wants you to obey. Normally maintained by the user via the Spec panel. When the user explicitly tells you a behavior to obey, you MAY record it here — but only on your first tool call of the current user turn; later writes in the same turn are rejected. Empty by default.
-- spec://HOW_TO_USE_SPEC.md — this help file.
-
-The public tasks.json format is intentionally small:
-
-\`\`\`json
-{
-	"tasks": [
-		{ "text": "Do the current thing", "status": "doing" },
-		{ "text": "Do not bypass this requirement", "status": "todo", "protected": true }
-	]
-}
-\`\`\`
-
-Allowed task statuses: todo, doing, done, blocked.
-Only task fields text/status/protected are allowed. Do not add summary, ids, timestamps, evidence, or runtime metadata to tasks.json.
-
-Protected tasks may be created by the assistant, but after creation their content is locked. Completing or deleting a protected task requires taskReflection.
-`;
-
 const DEFAULT_INDEX = `# Work Spec
 
 This is the root of the narrator's virtual Work Spec directory.
 
 - Task queue: spec://tasks.json
 - Behavior fence: spec://behavior_fence
-- Usage guide: spec://HOW_TO_USE_SPEC.md
 
 Use additional spec://*.md files for design notes when the task becomes complex.
 `;
@@ -82,7 +53,6 @@ const BUILTIN_FILES: Record<
 	string,
 	{ content: string; agentReadonly: boolean; uiEditable: boolean }
 > = {
-	"HOW_TO_USE_SPEC.md": { content: HOW_TO_USE_SPEC, agentReadonly: true, uiEditable: false },
 	behavior_fence: { content: DEFAULT_BEHAVIOR_FENCE, agentReadonly: true, uiEditable: true },
 	"index.md": { content: DEFAULT_INDEX, agentReadonly: false, uiEditable: true },
 	[SPEC_TASKS_PATH]: {

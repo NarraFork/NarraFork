@@ -13,12 +13,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import {
-	buildHistory,
-	type ReasoningEffort,
-	resolveProviderAndModel,
-	TODO_REMINDER_TOOL_INTERVAL,
-} from "../lib/agent";
+import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
@@ -1488,6 +1483,13 @@ export async function runAgentLoop(
 				settings.agent.behaviorFenceAttachTasks,
 			);
 
+			// Resolve tasks.json reminder injection settings for this turn (narrator override → global default).
+			const tasksReminderIntervalOverride = freshNarrator.tasksReminderIntervalOverride;
+			active._tasksReminderInterval =
+				tasksReminderIntervalOverride == null
+					? settings.agent.tasksReminderInterval
+					: tasksReminderIntervalOverride;
+
 			// Apply dynamic pruning — strip tool calls from messages at or before the
 			// persisted boundary so the context stays within budget. When compactStart
 			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
@@ -1992,9 +1994,21 @@ export async function runAgentLoop(
 					if (request.phase === "tool_result") {
 						const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
 						const count = request.completedToolCount ?? 0;
-						const atTasksCadence = count % TODO_REMINDER_TOOL_INTERVAL === 0;
+						const tasksInterval = active._tasksReminderInterval ?? 15;
+						let lastTasksCount = active._lastTasksReminderCompletedToolCount;
+						if (lastTasksCount === undefined) {
+							lastTasksCount = active._todoReminderCompletedToolCount ?? 0;
+							active._lastTasksReminderCompletedToolCount = lastTasksCount;
+						}
+						const atTasksCadence = tasksInterval > 0 && count - lastTasksCount >= tasksInterval;
+
 						const fenceInterval = active._fenceInterval ?? -1;
-						const atFenceCadence = fenceInterval > 0 && count % fenceInterval === 0;
+						let lastFenceCount = active._lastFenceCompletedToolCount;
+						if (lastFenceCount === undefined) {
+							lastFenceCount = active._todoReminderCompletedToolCount ?? 0;
+							active._lastFenceCompletedToolCount = lastFenceCount;
+						}
+						const atFenceCadence = fenceInterval > 0 && count - lastFenceCount >= fenceInterval;
 						const tasksReminder = atTasksCadence
 							? await buildSpecToolResultReminder(narratorId, locale)
 							: null;
@@ -2005,6 +2019,7 @@ export async function runAgentLoop(
 								content: tasksReminder,
 								toolUseId: request.toolUseId,
 							});
+							active._lastTasksReminderCompletedToolCount = count;
 						}
 						// Inject the behavior fence when its own cadence hits, or when it is
 						// attached to a tasks reminder that is being injected this cycle.
@@ -2019,6 +2034,7 @@ export async function runAgentLoop(
 									orderIndex: 16,
 									toolUseId: request.toolUseId,
 								});
+								active._lastFenceCompletedToolCount = count;
 							}
 						}
 						return sideCars;

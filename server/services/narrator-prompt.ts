@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { detectShell } from "../lib/agent/shell";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
+	getDynamicSpecSystemReminder,
 	getPlanModeSystemReminder,
 	getReplyLanguageInstruction,
 	type Locale,
@@ -37,7 +38,8 @@ export interface BuildPromptResult {
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → AGENT.md/CLAUDE.md → ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → plan mode.
+ * context summary → CWD → Dynamic Spec → AGENT.md/CLAUDE.md →
+ * ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
  * optional fields (contextSummary, planMode) to get a minimal prompt.
@@ -103,6 +105,13 @@ export async function buildEffectiveSystemPrompt(
 			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows.`;
 		}
 		prompt = `${base}${sep}${cwdSection}`;
+	}
+
+	// 2b. Inject Dynamic Spec usage so models know spec:// exists even before tasks do.
+	{
+		const base = prompt ?? "";
+		const sep = base ? "\n\n" : "";
+		prompt = `${base}${sep}${getDynamicSpecSystemReminder(locale)}`;
 	}
 
 	// 3. Inject AGENT.md (fallback to CLAUDE.md) if present

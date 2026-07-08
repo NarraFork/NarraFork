@@ -358,7 +358,6 @@ function SettingsProvidersPage() {
 							protocol: type,
 							codexAccountId: "",
 							codexWebSocket: false,
-							proxy: "",
 							tlsRejectUnauthorized: true,
 						},
 					]);

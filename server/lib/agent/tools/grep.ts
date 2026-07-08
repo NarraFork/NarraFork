@@ -108,6 +108,7 @@ const DESCRIPTION = `A powerful search tool built on ripgrep
   - Supports full regex syntax (e.g., "log.*Error", "function\\s+\\w+")
   - Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
   - Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
+  - Dynamic Spec support: set path to "spec://" (or a spec:// subpath) to search the narrator's virtual Dynamic Spec files
   - Use Agent tool for open-ended searches requiring multiple rounds
   - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use \`interface\\{\\}\` to find \`interface{}\` in Go code)
   - Multiline matching: By default patterns match within single lines only. For cross-line patterns like \`struct \\{[\\s\\S]*?field\`, use \`multiline: true\``;
@@ -124,7 +125,7 @@ export const grepTool: ToolDefinition = {
 			},
 			path: {
 				description:
-					"File or directory to search in (rg PATH). Defaults to current working directory.",
+					'File or directory to search in (rg PATH), or "spec://" to search Dynamic Spec virtual files. Defaults to current working directory.',
 				type: "string",
 			},
 			glob: {
@@ -194,7 +195,9 @@ export const grepTool: ToolDefinition = {
 		path: z
 			.string()
 			.optional()
-			.describe("File or directory to search in (rg PATH). Defaults to current working directory."),
+			.describe(
+				'File or directory to search in (rg PATH), or "spec://" to search Dynamic Spec virtual files. Defaults to current working directory.',
+			),
 		glob: z
 			.string()
 			.optional()

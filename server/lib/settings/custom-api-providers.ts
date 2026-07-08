@@ -69,6 +69,7 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		defaultModel: provider.defaultModel,
 		defaultContextWindow: provider.defaultContextWindow,
 		protocol: customApiProtocolFromOpenAI(provider),
+		proxy: provider.proxy,
 		codexAccountId: provider.codexAccountId,
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
@@ -90,6 +91,7 @@ export function anthropicProviderToCustomApi(
 		defaultContextWindow: provider.defaultContextWindow,
 		protocol: customApiProtocolFromAnthropic(provider.officialApi),
 		defaultReasoningEffort: provider.defaultReasoningEffort,
+		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
 	};
 }
@@ -135,6 +137,7 @@ export function customApiProviderToOpenAI(
 		defaultModel: provider.defaultModel,
 		defaultContextWindow: provider.defaultContextWindow,
 		apiMode,
+		proxy: provider.proxy,
 		codexAccountId: provider.codexAccountId,
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
@@ -156,6 +159,7 @@ export function customApiProviderToAnthropic(
 		defaultModel: provider.defaultModel,
 		defaultContextWindow: provider.defaultContextWindow,
 		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
+		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
 		officialApi: provider.protocol === "anthropic-official",
 	};

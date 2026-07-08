@@ -1,8 +1,11 @@
+import { ActionIcon, Tooltip } from "@mantine/core";
 import { RichTextEditor } from "@mantine/tiptap";
+import { IconDeviceFloppy, IconRefresh } from "@tabler/icons-react";
 import { Markdown } from "@tiptap/markdown";
 import { useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import classes from "./SpecMarkdownEditor.module.css";
 
 interface SpecMarkdownEditorProps {
@@ -11,13 +14,26 @@ interface SpecMarkdownEditorProps {
 	/** Distinguishes reloads: when this changes, editor content is reset. */
 	revisionKey: string;
 	onChange: (markdown: string) => void;
+	dirty: boolean;
+	onSave: () => void;
+	onReload: () => void;
+	isSaving: boolean;
 }
 
 /**
  * WYSIWYG markdown editor built on Tiptap + Mantine RichTextEditor.
  * Content round-trips through the official @tiptap/markdown extension.
  */
-export function SpecMarkdownEditor({ value, revisionKey, onChange }: SpecMarkdownEditorProps) {
+export function SpecMarkdownEditor({
+	value,
+	revisionKey,
+	onChange,
+	dirty,
+	onSave,
+	onReload,
+	isSaving,
+}: SpecMarkdownEditorProps) {
+	const { t } = useTranslation("narrator");
 	const onChangeRef = useRef(onChange);
 	onChangeRef.current = onChange;
 	// Track the revision we last synced so external reloads reset the doc, but
@@ -80,6 +96,34 @@ export function SpecMarkdownEditor({ value, revisionKey, onChange }: SpecMarkdow
 					<RichTextEditor.Undo />
 					<RichTextEditor.Redo />
 				</RichTextEditor.ControlsGroup>
+				{dirty && (
+					<RichTextEditor.ControlsGroup>
+						<Tooltip label={t("spec.save")} openDelay={200}>
+							<ActionIcon
+								variant="filled"
+								color="green"
+								onClick={onSave}
+								loading={isSaving}
+								size="sm"
+								style={{ height: 26, width: 26 }}
+							>
+								<IconDeviceFloppy size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("spec.reload")} openDelay={200}>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								onClick={onReload}
+								disabled={isSaving}
+								size="sm"
+								style={{ height: 26, width: 26 }}
+							>
+								<IconRefresh size={14} />
+							</ActionIcon>
+						</Tooltip>
+					</RichTextEditor.ControlsGroup>
+				)}
 			</RichTextEditor.Toolbar>
 			<RichTextEditor.Content className={classes.content} />
 		</RichTextEditor>

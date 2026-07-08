@@ -31,7 +31,7 @@ import {
 	IconUser,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useProviderModelRefreshCapability,
@@ -40,6 +40,9 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import type { ProxyOverride } from "../../lib/proxy";
+import { extractPrimaryDomainLabel } from "../../lib/url";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 
@@ -58,6 +61,7 @@ export interface NUGProviderState {
 	oauthClientId?: string;
 	oauthClientSecret?: string;
 	oauthDeviceId?: string;
+	proxy?: ProxyOverride;
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
@@ -861,15 +865,45 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 		[onProvidersChange],
 	);
 
-	// Track which providers have a manually-edited prefix (keyed by id). A provider
-	// that already has a prefix is treated as locked; new ones start name-driven.
+	// Track which providers have a manually-edited prefix / name (keyed by id). A
+	// provider that already has a prefix is treated as locked; new ones start
+	// name-driven and can also be seeded from the base URL domain.
 	const [manualPrefixIds, setManualPrefixIds] = useState<Set<string>>(
 		() => new Set(providers.filter((p) => p.prefix).map((p) => p.id)),
 	);
+	const [manualNameIds, setManualNameIds] = useState<Set<string>>(
+		() => new Set(providers.filter((p) => p.prefix).map((p) => p.id)),
+	);
+
+	// On mount, seed an empty prefix from the current name for each provider so a
+	// prefix shows up immediately. Tracked per id to avoid re-seeding after the
+	// user clears a prefix.
+	const seededIdsRef = useRef<Set<string>>(new Set());
+	useEffect(() => {
+		const toSeed = providers.filter(
+			(p) => !seededIdsRef.current.has(p.id) && !p.prefix && p.name.trim(),
+		);
+		for (const p of providers) seededIdsRef.current.add(p.id);
+		if (toSeed.length === 0) return;
+		onProvidersChange((prev) =>
+			prev.map((p) => {
+				if (!toSeed.some((s) => s.id === p.id)) return p;
+				const base = sanitizePrefix(p.name.trim());
+				if (!base) return p;
+				const nextPrefix = getUniquePrefix?.(base, p.id) ?? base;
+				return nextPrefix ? { ...p, prefix: nextPrefix } : p;
+			}),
+		);
+	}, [providers, onProvidersChange, getUniquePrefix]);
 
 	const handleNameChange = useCallback(
 		(id: string, name: string) => {
 			const manual = manualPrefixIds.has(id);
+			setManualNameIds((prev) => {
+				const updated = new Set(prev);
+				updated.add(id);
+				return updated;
+			});
 			onProvidersChange((prev) =>
 				prev.map((p) => {
 					if (p.id !== id) return p;
@@ -895,6 +929,27 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 			updateProvider(id, { prefix: next });
 		},
 		[updateProvider],
+	);
+
+	// Derive name + prefix from the base URL's primary domain label while neither
+	// the name nor the prefix has been manually edited for this provider.
+	const handleBaseUrlChange = useCallback(
+		(id: string, value: string) => {
+			if (manualNameIds.has(id) || manualPrefixIds.has(id)) {
+				updateProvider(id, { baseUrl: value });
+				return;
+			}
+			const label = extractPrimaryDomainLabel(value);
+			onProvidersChange((prev) =>
+				prev.map((p) => {
+					if (p.id !== id) return p;
+					if (!label) return { ...p, baseUrl: value };
+					const nextPrefix = getUniquePrefix?.(label, p.id) ?? label;
+					return { ...p, baseUrl: value, name: label, prefix: nextPrefix };
+				}),
+			);
+		},
+		[manualNameIds, manualPrefixIds, onProvidersChange, updateProvider, getUniquePrefix],
 	);
 
 	const toggleProviderDisabled = useCallback(
@@ -1026,7 +1081,11 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 								label={t("nugBaseUrl")}
 								placeholder="http://localhost:7800"
 								value={p.baseUrl}
-								onChange={(e) => updateProvider(p.id, { baseUrl: e.currentTarget.value })}
+								onChange={(e) => handleBaseUrlChange(p.id, e.currentTarget.value)}
+							/>
+							<ProxyOverrideField
+								value={p.proxy}
+								onChange={(next) => updateProvider(p.id, { proxy: next })}
 							/>
 							<Group gap="xs" align="flex-end">
 								<PasswordInput

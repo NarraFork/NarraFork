@@ -14,6 +14,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
+import { recordRequestUrl } from "./request-url-tracker";
 import {
 	appendSideCarsForApi,
 	outputToText,
@@ -109,12 +110,14 @@ export class ClineProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL
-	 * (Cline talks to external OpenRouter) with loopback/NO_PROXY exemptions.
+	 * Proxy-aware fetch. Resolves the proxy per target URL honouring this
+	 * provider's own proxy override (absent/"default" → global policy), with
+	 * loopback/NO_PROXY exemptions. Cline talks to external OpenRouter.
 	 */
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
 		const target = input instanceof Request ? input.url : input;
-		const proxy = resolveProxyForUrl(target);
+		recordRequestUrl(String(target), init?.method);
+		const proxy = resolveProxyForUrl(target, this.config.proxy);
 		if (proxy) {
 			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
 			return fetch(input, { ...init, proxy } as any);
