@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { type AgentConfig, buildHistory, type RuntimeSettingsOverride } from "../lib/agent";
+import {
+	type AgentConfig,
+	buildHistory,
+	type RuntimeSettingsOverride,
+	TODO_REMINDER_TOOL_INTERVAL,
+} from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -440,6 +445,10 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 		const resolvedServiceTier =
 			narratorFastMode && usesCodexModel(resolvedProvider, model) ? "priority" : undefined;
 		let todoReminderCompletedToolCount = 0;
+		// Completed-tool count when the spec reminder was last injected for this
+		// subagent loop. Gates buildSpecToolResultReminder to the same cadence the
+		// agent loop used to enforce, so we don't hit the DB on every tool result.
+		let lastTasksReminderCount = 0;
 		const resetUpstreamSessionForThisLoop = resetUpstreamSessionOnNextRequest;
 		resetUpstreamSessionOnNextRequest = false;
 		const config: AgentConfig = {
@@ -498,8 +507,13 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 			},
 			getSideCars: async (request) => {
 				if (request.phase === "tool_result") {
+					// Throttle to every TODO_REMINDER_TOOL_INTERVAL completed tool calls
+					// so the spec file is not re-read from SQLite on every tool result.
+					const count = request.completedToolCount ?? 0;
+					if (count - lastTasksReminderCount < TODO_REMINDER_TOOL_INTERVAL) return [];
 					const reminder = await buildSpecToolResultReminder(narratorId, locale as Locale);
 					if (!reminder) return [];
+					lastTasksReminderCount = count;
 					return [
 						{
 							target: "tool_result" as const,

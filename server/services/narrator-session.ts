@@ -1981,8 +1981,6 @@ export async function runAgentLoop(
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
-				sideCarToolResultInterval:
-					active._fenceInterval && active._fenceInterval > 0 ? active._fenceInterval : 0,
 				onSideCarCompletedToolCount: (count) => {
 					active._todoReminderCompletedToolCount = count;
 					// The behavior-fence edit window only covers the first tool call of a user
@@ -2009,6 +2007,11 @@ export async function runAgentLoop(
 							active._lastFenceCompletedToolCount = lastFenceCount;
 						}
 						const atFenceCadence = fenceInterval > 0 && count - lastFenceCount >= fenceInterval;
+						// Advance the cadence markers whenever the cadence is hit, regardless of
+						// whether a reminder is actually produced. Otherwise, when there are no
+						// open tasks (reminder === null) the cadence would stay "due" and re-read
+						// the spec file from SQLite on every subsequent tool result.
+						if (atTasksCadence) active._lastTasksReminderCompletedToolCount = count;
 						const tasksReminder = atTasksCadence
 							? await buildSpecToolResultReminder(narratorId, locale)
 							: null;
@@ -2019,12 +2022,14 @@ export async function runAgentLoop(
 								content: tasksReminder,
 								toolUseId: request.toolUseId,
 							});
-							active._lastTasksReminderCompletedToolCount = count;
 						}
 						// Inject the behavior fence when its own cadence hits, or when it is
 						// attached to a tasks reminder that is being injected this cycle.
 						const wantFence = atFenceCadence || (!!active._fenceAttach && !!tasksReminder);
 						if (wantFence) {
+							// Same rationale as tasks: advance on cadence hit even if the fence is
+							// empty, so an empty fence does not re-read the spec file every tool call.
+							if (atFenceCadence) active._lastFenceCompletedToolCount = count;
 							const fenceReminder = await buildBehaviorFenceReminder(narratorId, locale);
 							if (fenceReminder) {
 								sideCars.push({
@@ -2034,7 +2039,6 @@ export async function runAgentLoop(
 									orderIndex: 16,
 									toolUseId: request.toolUseId,
 								});
-								active._lastFenceCompletedToolCount = count;
 							}
 						}
 						return sideCars;

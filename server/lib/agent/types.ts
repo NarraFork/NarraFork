@@ -594,12 +594,6 @@ export interface AgentConfig {
 	/** Called whenever the sidecar cadence counter advances. */
 	onSideCarCompletedToolCount?: (completedToolCount: number) => void;
 	/**
-	 * Extra tool_result sidecar cadence (completed tool calls). When > 0, the loop also
-	 * queries getSideCars({phase:"tool_result"}) every N tools, in addition to the built-in
-	 * cadence. The session decides which sidecars to emit for each hit.
-	 */
-	sideCarToolResultInterval?: number;
-	/**
 	 * Called before each non-first turn/retry to check if runtime settings should be switched.
 	 * Changes are applied at the safe point before the next provider API request, so running
 	 * tools are not interrupted while the next model request uses fresh settings.
