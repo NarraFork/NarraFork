@@ -1043,12 +1043,17 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
+		const detachReplacement = process.platform !== "win32";
+		// Windows child processes already outlive their parent. Do not use `detached`
+		// here: DETACHED_PROCESS starts NarraFork without a console, causing later
+		// console tools (rg/node/git/bash) to allocate their own visible windows.
+		// A normal Windows spawn inherits the old console, or creates one for the
+		// replacement process if the old process has none, so tool children reuse it.
 		const proc = Bun.spawn([newExecPath, ...process.argv.slice(2)], {
 			cwd: process.cwd(),
 			env,
-			detached: true,
+			detached: detachReplacement,
 			stdio: ["ignore", "ignore", "ignore"],
-			windowsHide: process.platform === "win32",
 		});
 		(proc as { unref?: () => void }).unref?.();
 

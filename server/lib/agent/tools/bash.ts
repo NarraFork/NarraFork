@@ -22,13 +22,6 @@ const LIVE_OUTPUT_MAX_CHARS = 100_000;
 const WATCHDOG_INTERVAL_MS = 15_000;
 const LONG_RUNNING_THRESHOLD_MS = 60_000;
 
-// After Windows update handoff NarraFork can run without a visible parent console.
-// Hide spawned shell windows explicitly so each command does not flash a cmd.exe window.
-function withHiddenWindows<T extends object>(options: T): T & { windowsHide?: boolean } {
-	if (process.platform !== "win32") return options;
-	return { ...options, windowsHide: true };
-}
-
 export { DEFAULT_TIMEOUT_MS };
 
 // --- Live timeout management ---
@@ -279,7 +272,6 @@ export const bashTool: ToolDefinition = {
 				];
 			}
 
-			spawnArgs[2] = withHiddenWindows(spawnArgs[2]);
 			clearInheritableHandlesBeforeSpawn();
 			const proc = spawn(...spawnArgs);
 
@@ -578,7 +570,6 @@ async function _runInBackground(
 				];
 			}
 
-			spawnArgs[2] = withHiddenWindows(spawnArgs[2]);
 			clearInheritableHandlesBeforeSpawn();
 			const proc = spawn(...spawnArgs);
 			let exited = false;

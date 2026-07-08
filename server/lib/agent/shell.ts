@@ -25,11 +25,7 @@ export async function killTree(
 			await Bun.sleep(SIGKILL_DELAY_MS);
 			if (!opts?.exited?.()) {
 				try {
-					execSync(`taskkill /T /F /PID ${pid}`, {
-						stdio: "ignore",
-						timeout: 5000,
-						windowsHide: true,
-					});
+					execSync(`taskkill /T /F /PID ${pid}`, { stdio: "ignore", timeout: 5000 });
 				} catch {
 					/* best effort */
 				}

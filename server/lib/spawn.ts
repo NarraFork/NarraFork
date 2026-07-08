@@ -151,7 +151,6 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			env: opts.env,
 			stdout: "pipe",
 			stderr: "pipe",
-			windowsHide: process.platform === "win32",
 		});
 	} catch (err) {
 		// ENOENT means the executable was not found in PATH (e.g. git not installed)
@@ -186,7 +185,6 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			try {
 				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
 					stdio: ["ignore", "ignore", "ignore"],
-					windowsHide: true,
 				});
 			} catch {
 				/* best effort */
