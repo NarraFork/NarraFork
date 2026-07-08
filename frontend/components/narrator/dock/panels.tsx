@@ -21,6 +21,7 @@ import {
 	IconGitBranch,
 	IconInfoCircle,
 	IconNotebook,
+	IconRobot,
 	IconTerminal2,
 	IconWorldWww,
 	IconX,
@@ -40,6 +41,7 @@ import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import { GitPanel } from "../../chapter/GitPanel";
+import { BackgroundTasksPanel } from "../BackgroundTasksDrawer";
 import { BrowserPanel } from "../BrowserPanel";
 import { FileModificationsPanel } from "../FileModificationsDrawer";
 import { NarratorDetailsPanel } from "../NarratorDetailsPanel";
@@ -480,6 +482,34 @@ export function BrowserDockPanel(props: IDockviewPanelProps<NarratorDockPanelPar
 	);
 }
 
+// ── Background tasks ──
+export function TasksDockPanel(props: IDockviewPanelProps<NarratorDockPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+	const icon = <IconRobot size={16} color="var(--mantine-color-dimmed)" />;
+
+	// Sync Dockview tab title with localization
+	useLayoutEffect(() => {
+		const title = t("backgroundTasks.title");
+		if (title && title !== props.api.title) {
+			props.api.setTitle(title);
+		}
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("backgroundTasks.title")}
+			icon={icon}
+			props={props}
+			subjectId="__tasks__"
+		>
+			<BackgroundTasksPanel narratorId={narratorId} chromeless />
+		</ToolPanelShell>
+	);
+}
+
 /** Component registry passed to <DockviewSurface components={...} />. */
 export const narratorDockComponents: Record<
 	NarratorDockPanelType,
@@ -493,6 +523,7 @@ export const narratorDockComponents: Record<
 	spec: SpecDockPanel,
 	git: GitDockPanel,
 	browser: BrowserDockPanel,
+	tasks: TasksDockPanel,
 };
 
 /**

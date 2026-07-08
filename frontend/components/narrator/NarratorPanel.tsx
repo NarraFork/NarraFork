@@ -71,6 +71,7 @@ import {
 	IconPhoto,
 	IconPlayerPlay,
 	IconPlayerTrackNext,
+	IconRobot,
 	IconSearch,
 	IconSettings,
 	IconShield,
@@ -172,7 +173,7 @@ import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
-import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
+import { BackgroundTasksDrawer, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
 import type { BroadMessageListHandle } from "./BroadMessageList";
 import { ChapterBar } from "./ChapterBar";
 import {
@@ -3819,6 +3820,21 @@ export function NarratorPanel({
 		else if (!specToolOpened) onToggleSpecPanel?.();
 	}, [dock, onToggleSpecPanel, specToolOpened]);
 
+	// Background tasks: on the dock surface the tasks list is a dockview sibling
+	// tab (toggled from the toolbar); off-dock (mobile) it falls back to a Drawer.
+	// Dock tool panels are scoped to the base narrator in context; hide the button
+	// for pushed subagent views so the badge and opened panel never disagree.
+	const tasksPanelMatchesCurrentNarrator = !dock || dock.narratorId === narratorId;
+	const tasksButtonEnabled = !isWorkspacePreview && tasksPanelMatchesCurrentNarrator;
+	const { supported: tasksSupported, runningCount: tasksRunningCount } = useBackgroundTasksButton(
+		narratorId,
+		tasksButtonEnabled,
+	);
+	const tasksToolOpened = dock ? dock.openToolTypes.has("tasks") : false;
+	const toggleTasksTool = useCallback(() => {
+		dock?.toggleToolPanel("tasks");
+	}, [dock]);
+
 	// Dynamic Spec current task, for the compact status bar above the input.
 	const { data: specTasksData } = useSpecTasks(narratorId);
 	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
@@ -7206,7 +7222,37 @@ export function NarratorPanel({
 						</Group>
 						{!isWorkspacePreview && (
 							<Group gap="xs">
-								<BackgroundTasksDrawer narratorId={narratorId} />
+								{dock ? (
+									tasksSupported && (
+										<Tooltip label={t("backgroundTasks.title")}>
+											<Indicator
+												inline
+												size={8}
+												color="blue"
+												processing
+												disabled={tasksRunningCount === 0}
+												offset={3}
+												zIndex={1}
+												style={{
+													height: "var(--ai-size-sm)",
+													display: "flex",
+													alignItems: "center",
+												}}
+											>
+												<ActionIcon
+													size="sm"
+													variant={tasksToolOpened ? "light" : "subtle"}
+													color={tasksToolOpened ? "indigo" : "gray"}
+													onClick={toggleTasksTool}
+												>
+													<IconRobot size={16} />
+												</ActionIcon>
+											</Indicator>
+										</Tooltip>
+									)
+								) : (
+									<BackgroundTasksDrawer narratorId={narratorId} />
+								)}
 								<Tooltip label={t("fileMod_title")}>
 									<ActionIcon
 										size="sm"

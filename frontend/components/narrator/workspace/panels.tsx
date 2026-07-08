@@ -21,6 +21,7 @@ import {
 	FileModDockPanel as FileModToolAdapter,
 	GitDockPanel as GitToolAdapter,
 	SpecDockPanel as SpecToolAdapter,
+	TasksDockPanel as TasksToolAdapter,
 	TerminalDockPanel as TerminalToolAdapter,
 } from "../dock/panels";
 import { NarratorPanel } from "../NarratorPanel";
@@ -194,6 +195,9 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 			break;
 		case "browser":
 			inner = <BrowserToolAdapter {...toolProps} />;
+			break;
+		case "tasks":
+			inner = <TasksToolAdapter {...toolProps} />;
 			break;
 		default:
 			inner = null;

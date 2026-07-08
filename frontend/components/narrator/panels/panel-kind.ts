@@ -23,7 +23,7 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  *
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
- * - `details` / `filemod` / `spec` / `git` / `browser` — narrator resource panels.
+ * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` — narrator resource panels.
  * - `webview`  — a standalone webview (workspace only).
  */
 export type PanelKind =
@@ -34,6 +34,7 @@ export type PanelKind =
 	| "spec"
 	| "git"
 	| "browser"
+	| "tasks"
 	| "webview";
 
 /** Resource panels of a cluster — everything except the primary `chat` panel. */
@@ -90,6 +91,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	spec: "spec",
 	git: "git",
 	browser: "browser",
+	tasks: "tasks",
 	webview: "webview",
 };
 
@@ -108,5 +110,6 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	spec: "Spec",
 	git: "Git",
 	browser: "Browser",
+	tasks: "Tasks",
 	webview: "Webview",
 };

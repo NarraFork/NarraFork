@@ -33,6 +33,7 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	spec: PANEL_COMPONENT.spec,
 	git: PANEL_COMPONENT.git,
 	browser: PANEL_COMPONENT.browser,
+	tasks: PANEL_COMPONENT.tasks,
 };
 
 /** Stable dockview panel id for a given panel type within one narrator surface. */
@@ -49,4 +50,5 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	spec: PANEL_DEFAULT_TITLE.spec,
 	git: PANEL_DEFAULT_TITLE.git,
 	browser: PANEL_DEFAULT_TITLE.browser,
+	tasks: PANEL_DEFAULT_TITLE.tasks,
 };
