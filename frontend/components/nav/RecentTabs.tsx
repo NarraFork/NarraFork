@@ -315,14 +315,21 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
-			// When a narrator starts working, ask server to promote it above idle tabs.
-			// If the tab belongs to a workspace, promote the workspace header instead
-			// so the entire group moves together.
+			// When a narrator transitions INTO working, ask server to promote it above
+			// idle tabs. If the tab belongs to a workspace, promote the workspace header
+			// instead so the entire group moves together.
+			//
+			// Guard against idempotent re-emits: subscribing to a narrator (e.g. opening
+			// its page) makes the server send a status snapshot that re-emits the current
+			// "working" status. `tabsRef.current` still holds the pre-event status here, so
+			// only promote when the tab was NOT already working — otherwise re-viewing a
+			// working tab would re-run `above_idle`, which reinserts it just above the first
+			// idle tab and thus demotes it below any other working tabs.
 			if (event.type === "status" && event.status === "working") {
 				const tab = tabsRef.current.find(
 					(t) => (t.type === "narrator" && t.id === narratorId) || t.narratorId === narratorId,
 				);
-				if (tab) {
+				if (tab && tab.status !== "working") {
 					const moveKey = tab.workspaceId
 						? `workspace:${tab.workspaceId}`
 						: `${tab.type}:${tab.id}`;

@@ -57,15 +57,25 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
 	if (path.startsWith("/projects/")) {
-		return ["common", "nav", "projects", "chapters", "graph", "narrator", "settings", "terminal"];
+		return [
+			"common",
+			"nav",
+			"projects",
+			"chapters",
+			"graph",
+			"narrator",
+			"settings",
+			"terminal",
+			"git",
+		];
 	}
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];
 	if (path.startsWith("/narrators/workspace/")) {
-		return ["common", "nav", "narrators", "narrator", "terminal"];
+		return ["common", "nav", "narrators", "narrator", "terminal", "git"];
 	}
 	if (path.startsWith("/narrators/")) {
-		return ["common", "nav", "narrators", "narrator", "chapters", "settings", "terminal"];
+		return ["common", "nav", "narrators", "narrator", "chapters", "settings", "terminal", "git"];
 	}
 	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
 		return ["common", "nav", "settings", "narrator"];
