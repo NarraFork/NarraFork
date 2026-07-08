@@ -399,6 +399,15 @@ export interface ReasoningProviderMetadata {
 		/** Signature for thinking block verification (must be echoed back in subsequent turns) */
 		signature?: string;
 	};
+	/**
+	 * Stable identity ("provider:channel") of the upstream that minted this
+	 * block's thinking signature. Signatures are only valid against the server
+	 * that produced them, so on replay we compare this against the current
+	 * provider's source and drop the signature when they differ (see
+	 * `reasoning-source.ts`). Absent on messages persisted before this field
+	 * existed.
+	 */
+	signatureSource?: string;
 }
 
 /** A fully-streamed content block within an assistant message. */
@@ -411,7 +420,7 @@ export type ContentBlock =
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
 	  }
-	| { type: "redacted_thinking"; data: string; outputIndex?: number }
+	| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 	| {
 			type: "tool_use";
 			toolUseId: string;
@@ -452,7 +461,6 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Grep",
 	"WebSearch",
 	"WebFetch",
-	"TaskCreate",
 	"EnterPlanMode",
 	"ExitPlanMode",
 	"StartPipeline",
@@ -585,6 +593,12 @@ export interface AgentConfig {
 	sideCarInitialCompletedToolCount?: number;
 	/** Called whenever the sidecar cadence counter advances. */
 	onSideCarCompletedToolCount?: (completedToolCount: number) => void;
+	/**
+	 * Extra tool_result sidecar cadence (completed tool calls). When > 0, the loop also
+	 * queries getSideCars({phase:"tool_result"}) every N tools, in addition to the built-in
+	 * cadence. The session decides which sidecars to emit for each hit.
+	 */
+	sideCarToolResultInterval?: number;
 	/**
 	 * Called before each non-first turn/retry to check if runtime settings should be switched.
 	 * Changes are applied at the safe point before the next provider API request, so running

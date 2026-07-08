@@ -1249,7 +1249,7 @@ function BlockMenuWrapper({
 
 // ---------------------------------------------------------------------------
 // SelectableSystemNotice — wraps a simple system-notice card (info /
-// goal_continuation) to give it the same affordances as content blocks:
+// spec_continuation) to give it the same affordances as content blocks:
 // right-click context menu (delete / rollback / fork / ask / compact),
 // single-select (Ctrl/Cmd+Click), range-select (Shift+Click) and mobile swipe.
 // Modeled on WebSearchBlock; it only renders the menu/selection chrome and
@@ -3986,33 +3986,7 @@ export const MessageBubble = memo(function MessageBubble({
 				/>
 			);
 		}
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const goalIndex = blocks.findIndex((b: any) => b.type === "goal_continuation");
-		const goalBlock = goalIndex >= 0 ? blocks[goalIndex] : undefined;
-		if (goalBlock) {
-			const goalRealIndex = message._blockOriginalIndices?.[goalIndex] ?? goalIndex;
-			return (
-				<MessageContextMenuCtx.Provider value={ctxActions}>
-					<SelectableSystemNotice blockIndex={goalRealIndex} messageId={message.id}>
-						<Paper
-							p="xs"
-							radius="sm"
-							style={{ backgroundColor: "var(--mantine-color-teal-light)" }}
-						>
-							<Group gap="xs" wrap="nowrap">
-								<Badge size="xs" color="teal" variant="light">
-									{t("goalContinuation")}
-								</Badge>
-								<Text size="xs" c="teal" truncate>
-									{goalBlock.objective ?? message.contentText}
-								</Text>
-							</Group>
-						</Paper>
-					</SelectableSystemNotice>
-				</MessageContextMenuCtx.Provider>
-			);
-		}
-		// Spec task continuation / blocked reminders (Living Work Spec sidecar messages).
+		// Spec task continuation / blocked reminders (Dynamic Spec sidecar messages).
 		const specIndex = blocks.findIndex(
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(b: any) => b.type === "spec_continuation" || b.type === "spec_blocked_continuation",

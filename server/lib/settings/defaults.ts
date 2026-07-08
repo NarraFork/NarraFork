@@ -55,8 +55,11 @@ export const DEFAULTS: NarraForkSettings = {
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
+		autoContinuationMode: "always",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
+		behaviorFenceInterval: -1,
+		behaviorFenceAttachTasks: true,
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
@@ -386,6 +389,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "危险反思模式下跳过只读操作的二次确认；Edit 视为可恢复操作，不触发安全暂停；删除、明确危险执行模式、环境注入、无法分析/未分类 Bash 和外部写入等仍按当前档位判断。",
 		type: "boolean",
 	},
+	"agent.autoContinuationMode": {
+		desc: "自动续跑模式：每轮结束后如果 spec 任务仍未完成，是否自动继续。always=总是续跑；blockStop=只剩 blocked 任务时停止；protectedOnly=仅当有未完成的 protected 任务时续跑；off=从不续跑。叙述者可单独覆盖此默认值。",
+		type: "string",
+		valid: "always / blockStop / protectedOnly / off，默认 always",
+	},
 	"agent.maxTransientRetries": {
 		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试。有状态提供商（Responses/Codex）不支持重试。",
 		type: "number",
@@ -395,6 +403,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "模型连续执行工具但未输出可见文本达到此次数时，通过 sidecar 要求其简短说明当前工作。-1 表示关闭。",
 		type: "number",
 		valid: "-1 = 关闭，默认 20",
+	},
+	"agent.behaviorFenceInterval": {
+		desc: "行为护栏定期注入的全局默认间隔：每隔 N 个已完成工具调用，通过 sidecar 注入一次行为护栏内容。护栏内容为空时不注入。-1 表示关闭。叙述者可单独覆盖此默认值。",
+		type: "number",
+		valid: "-1 = 关闭，或正整数，默认 -1",
+	},
+	"agent.behaviorFenceAttachTasks": {
+		desc: "行为护栏是否附着到 tasks.json 提醒的全局默认值：开启后，每当 tasks.json 任务提醒注入时一并注入行为护栏内容（护栏内容为空时不注入）。叙述者可单独覆盖此默认值。",
+		type: "boolean",
+		valid: "true / false，默认 true",
 	},
 	"agent.retryBackoffCeilMs": {
 		desc: "可恢复错误重试退避时间上限（毫秒）。指数退避不会超过此值。默认 20000（20 秒）。",

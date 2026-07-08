@@ -13,7 +13,6 @@ import {
 	narratorBlacklistDirs,
 	narratorBufferedMessages,
 	narratorFileSnapshots,
-	narratorGoals,
 	narratorMessageRefs,
 	narratorMessages,
 	narratorPatches,
@@ -32,8 +31,10 @@ import {
 } from "../lib/agent/tools/knowledge-kind";
 import { narratorHandleLock } from "../lib/async-mutex";
 import {
+	type AutoContinuationOverride,
 	type BooleanOverride,
 	type DangerReflectionOverride,
+	normalizeAutoContinuationOverride,
 	normalizeBooleanOverride,
 	normalizeDangerReflectionOverride,
 } from "../lib/boolean-override";
@@ -178,6 +179,9 @@ interface CreateNarratorInput {
 	pruneEnabled?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
+	autoContinuationOverride?: AutoContinuationOverride;
+	behaviorFenceIntervalOverride?: number | null;
+	behaviorFenceAttachOverride?: BooleanOverride;
 	startInPlanMode?: boolean;
 	title?: string;
 	/** When true, create a "named narrator": standalone, long-lived, @handle-mentionable. Requires `handle`. */
@@ -780,6 +784,9 @@ export const narratorService = {
 						pruneEnabled: input.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 						planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride ?? "inherit",
 						dangerReflectionOverride: input.dangerReflectionOverride ?? "inherit",
+						autoContinuationOverride: input.autoContinuationOverride ?? "inherit",
+						behaviorFenceIntervalOverride: input.behaviorFenceIntervalOverride ?? null,
+						behaviorFenceAttachOverride: input.behaviorFenceAttachOverride ?? "inherit",
 						cwd: input.cwd ?? null,
 						inheritMode: "fresh",
 						status: "idle",
@@ -857,6 +864,9 @@ export const narratorService = {
 				pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 				planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 				dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+				autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+				behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				inheritMode: "fresh",
@@ -1038,7 +1048,6 @@ export const narratorService = {
 			tx.delete(narratorBufferedMessages)
 				.where(eq(narratorBufferedMessages.narratorId, narratorId))
 				.run();
-			tx.delete(narratorGoals).where(eq(narratorGoals.narratorId, narratorId)).run();
 			tx.delete(narratorFileSnapshots)
 				.where(eq(narratorFileSnapshots.narratorId, narratorId))
 				.run();
@@ -1218,6 +1227,9 @@ export const narratorService = {
 					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
 					inheritMode: "full",
 					status: "idle",
@@ -1434,6 +1446,9 @@ export const narratorService = {
 					pruneEnabled: parent.pruneEnabled ?? settings.agent.defaultPruneEnabled,
 					planReflectionAutoApproveOverride: parent.planReflectionAutoApproveOverride ?? "inherit",
 					dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+					autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+					behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
 					forkMessageId: resolvedForkMessageId,
 					inheritMode,
@@ -1606,6 +1621,11 @@ export const narratorService = {
 				dangerReflectionOverride: normalizeDangerReflectionOverride(
 					parent.dangerReflectionOverride,
 				),
+				autoContinuationOverride: normalizeAutoContinuationOverride(
+					parent.autoContinuationOverride,
+				),
+				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+				behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
 				title: opts?.title ?? undefined,
 			});
 			eventBus.emit({
@@ -1695,13 +1715,14 @@ export const narratorService = {
 	updateRelaxedPlan: narratorPersistence.updateRelaxedPlan.bind(narratorPersistence),
 	updateReflectionOverrides:
 		narratorPersistence.updateReflectionOverrides.bind(narratorPersistence),
+	updateBehaviorFenceSettings:
+		narratorPersistence.updateBehaviorFenceSettings.bind(narratorPersistence),
 	updatePruneEnabled: narratorPersistence.updatePruneEnabled.bind(narratorPersistence),
 	updateStatus: narratorPersistence.updateStatus.bind(narratorPersistence),
 	compareAndSetStatus: narratorPersistence.compareAndSetStatus.bind(narratorPersistence),
 	updateSubstatus: narratorPersistence.updateSubstatus.bind(narratorPersistence),
 	addSubstatus: narratorPersistence.addSubstatus.bind(narratorPersistence),
 	removeSubstatus: narratorPersistence.removeSubstatus.bind(narratorPersistence),
-	updateTodos: narratorPersistence.updateTodos.bind(narratorPersistence),
 	updateToolCallResult: narratorPersistence.updateToolCallResult.bind(narratorPersistence),
 	isMessageSharedByMultipleNarrators:
 		narratorPersistence.isMessageSharedByMultipleNarrators.bind(narratorPersistence),

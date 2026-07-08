@@ -20,6 +20,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "../../lib/logger";
+import { resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, WeixinConfig } from "../types";
 
@@ -176,12 +177,14 @@ async function ilinkPost(
 	const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	const proxy = resolveProxyForUrl(url);
 	try {
 		const resp = await fetch(url, {
 			method: "POST",
 			headers: ilinkHeaders(token, body),
 			body,
 			signal: controller.signal,
+			...(proxy ? { proxy } : {}),
 		});
 		const text = await resp.text();
 		if (!resp.ok)
@@ -201,6 +204,7 @@ export async function ilinkGet(
 	const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	const proxy = resolveProxyForUrl(url);
 	try {
 		const resp = await fetch(url, {
 			method: "GET",
@@ -209,6 +213,7 @@ export async function ilinkGet(
 				"iLink-App-ClientVersion": ILINK_APP_CLIENT_VERSION,
 			},
 			signal: controller.signal,
+			...(proxy ? { proxy } : {}),
 		});
 		const text = await resp.text();
 		if (!resp.ok)
@@ -356,12 +361,14 @@ function assertWeixinCdnUrl(url: string): void {
 async function uploadCiphertext(ciphertext: Buffer, uploadUrl: string): Promise<string> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), 120_000);
+	const proxy = resolveProxyForUrl(uploadUrl);
 	try {
 		const resp = await fetch(uploadUrl, {
 			method: "POST",
 			headers: { "Content-Type": "application/octet-stream" },
 			body: new Uint8Array(ciphertext),
 			signal: controller.signal,
+			...(proxy ? { proxy } : {}),
 		});
 		if (resp.status === 200) {
 			const encryptedParam = resp.headers.get("x-encrypted-param");
@@ -398,8 +405,12 @@ async function downloadAndDecryptMedia(
 
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+	const proxy = resolveProxyForUrl(url);
 	try {
-		const resp = await fetch(url, { signal: controller.signal });
+		const resp = await fetch(url, {
+			signal: controller.signal,
+			...(proxy ? { proxy } : {}),
+		});
 		if (!resp.ok) throw new Error(`CDN download HTTP ${resp.status}`);
 		const raw = Buffer.from(await resp.arrayBuffer());
 		if (aesKeyB64) {

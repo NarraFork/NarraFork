@@ -105,3 +105,83 @@ export function resolveProxyForUrl(target: string | URL): string | undefined {
 	if (matchesNoProxy(hostname, getNoProxyEntries())) return undefined;
 	return proxy;
 }
+
+/** Whether a proxy URL uses a SOCKS scheme (socks/socks4/socks4a/socks5/socks5h). */
+export function isSocksProxy(proxyUrl: string): boolean {
+	return /^socks(4a?|5h?)?:\/\//i.test(proxyUrl.trim());
+}
+
+/**
+ * A node `http.Agent`-compatible proxy agent. Kept loose (`unknown`-ish) because
+ * https-proxy-agent and socks-proxy-agent expose slightly different types but
+ * both satisfy the `agent` option of ws / axios / node http(s).
+ */
+export interface ProxyAgentLike {
+	destroy?: () => void;
+}
+
+/**
+ * Create an http(s)-compatible proxy agent for the given proxy URL, choosing the
+ * right implementation by scheme: SOCKS URLs use socks-proxy-agent, everything
+ * else (http/https) uses https-proxy-agent. Returns undefined for a falsy URL.
+ *
+ * Use this for libraries that accept a node `http.Agent` (ws, axios, @slack/bolt,
+ * node-fetch). For undici-based clients (discord.js REST) use
+ * {@link createUndiciProxyDispatcher} instead.
+ *
+ * Callers that create an agent per connection MUST keep the reference and call
+ * `.destroy?.()` on teardown/reconnect to avoid leaking socket pools.
+ */
+export async function createProxyAgent(
+	proxyUrl: string | undefined,
+): Promise<ProxyAgentLike | undefined> {
+	if (!proxyUrl) return undefined;
+	if (isSocksProxy(proxyUrl)) {
+		const { SocksProxyAgent } = await import("socks-proxy-agent");
+		return new SocksProxyAgent(proxyUrl) as unknown as ProxyAgentLike;
+	}
+	const { HttpsProxyAgent } = await import("https-proxy-agent");
+	return new HttpsProxyAgent(proxyUrl) as unknown as ProxyAgentLike;
+}
+
+/** An undici dispatcher whose teardown methods may be absent under Bun's undici shim. */
+export interface UndiciDispatcherLike {
+	close?: () => Promise<void> | void;
+	destroy?: () => Promise<void> | void;
+}
+
+/**
+ * Create an undici `Dispatcher` (ProxyAgent) for the given proxy URL, for clients
+ * built on undici (e.g. discord.js REST). undici's ProxyAgent only supports
+ * http/https proxies — for a SOCKS URL this logs a warning and returns undefined
+ * (the caller then connects directly rather than crashing). Returns undefined for
+ * a falsy URL. Keep the reference and call {@link closeUndiciDispatcher} on
+ * teardown to avoid leaks (Bun's undici shim may not expose close/destroy).
+ */
+export async function createUndiciProxyDispatcher(
+	proxyUrl: string | undefined,
+): Promise<UndiciDispatcherLike | undefined> {
+	if (!proxyUrl) return undefined;
+	if (isSocksProxy(proxyUrl)) {
+		const { logger } = await import("../logger");
+		logger.warn(
+			"[proxy] SOCKS proxy is not supported for this channel (undici REST); connecting directly. Use an http(s) proxy to route it.",
+		);
+		return undefined;
+	}
+	const { ProxyAgent } = await import("undici");
+	return new ProxyAgent(proxyUrl) as unknown as UndiciDispatcherLike;
+}
+
+/** Best-effort teardown of an undici dispatcher (close → destroy → noop). */
+export async function closeUndiciDispatcher(
+	dispatcher: UndiciDispatcherLike | null | undefined,
+): Promise<void> {
+	if (!dispatcher) return;
+	try {
+		if (typeof dispatcher.close === "function") await dispatcher.close();
+		else if (typeof dispatcher.destroy === "function") await dispatcher.destroy();
+	} catch {
+		/* ignore teardown errors */
+	}
+}

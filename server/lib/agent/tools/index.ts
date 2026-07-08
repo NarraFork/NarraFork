@@ -14,8 +14,6 @@ import {
 } from "./exit-plan-reflection";
 import { forkNarratorTool } from "./fork-narrator";
 import { globTool } from "./glob";
-import { addGoalTool, getGoalsTool, updateGoalTool } from "./goal";
-import { goalCompleteConfirmTool, goalCompleteReviseTool } from "./goal-reflection";
 import { grepTool } from "./grep";
 import { groupControlTool } from "./group-control";
 import { knowledgeReadTool, knowledgeSearchTool } from "./knowledge";
@@ -36,7 +34,6 @@ import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
-import { taskCreateTool } from "./todo";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
@@ -78,10 +75,10 @@ export {
 
 /**
  * Core tools a Knowledge Steward narrator does NOT need — denied in toolFilter for this kind.
- * MUST contain ONLY clearly-unrelated content tools. NEVER include planning/reflection/goal
- * control tools (plan mode, pipeline, danger/exit-plan/goal-complete reflection, goal tools,
- * Task), or the agent loop would stall. A knowledge steward works against the local knowledge
- * base, not the live web, so web search/fetch are dropped.
+ * MUST contain ONLY clearly-unrelated content tools. NEVER include planning/reflection
+ * control tools (plan mode, pipeline, danger/exit-plan/task reflection, Task), or the agent
+ * loop would stall. A knowledge steward works against the local knowledge base, not the live
+ * web, so web search/fetch are dropped.
  */
 export const KNOWLEDGE_KIND_DENY_CORE: ReadonlySet<string> = new Set<string>([
 	"WebSearch",
@@ -109,10 +106,6 @@ const coreProvider: ToolProvider = {
 			webSearchTool,
 			webFetchTool,
 			learningGuideTool,
-			getGoalsTool,
-			addGoalTool,
-			updateGoalTool,
-			taskCreateTool,
 			enterPlanModeTool,
 			exitPlanModeTool,
 			startPipelineTool,
@@ -130,8 +123,6 @@ const coreProvider: ToolProvider = {
 			exitPlanConfirmTool,
 			exitPlanConfirmAndCompactTool,
 			exitPlanReviseTool,
-			goalCompleteConfirmTool,
-			goalCompleteReviseTool,
 			taskReflectConfirmTool,
 			taskReflectReviseTool,
 		];

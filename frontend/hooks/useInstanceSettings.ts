@@ -8,6 +8,7 @@ import { api } from "../lib/api";
 import { normalizeUrlProtocol } from "../lib/url";
 
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
+export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
 export interface InstanceSettingsState {
 	// Server
@@ -49,8 +50,11 @@ export interface InstanceSettingsState {
 	dangerReflectionLevel: DangerReflectionLevel;
 	dangerReflectionEnabled: boolean;
 	dangerSkipReadOnlyConfirmations: boolean;
+	autoContinuationMode: AutoContinuationMode;
 	maxTransientRetries: number;
 	silentToolCallThreshold: number;
+	behaviorFenceInterval: number;
+	behaviorFenceAttachTasks: boolean;
 	retryBackoffCeilMs: number;
 	firstTokenTimeoutMs: number;
 	customRetryRules: Array<{
@@ -138,8 +142,11 @@ function makeDefaults(): InstanceSettingsState {
 		dangerReflectionLevel: "standard",
 		dangerReflectionEnabled: true,
 		dangerSkipReadOnlyConfirmations: false,
+		autoContinuationMode: "always",
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
+		behaviorFenceInterval: -1,
+		behaviorFenceAttachTasks: true,
 		retryBackoffCeilMs: 20000,
 		firstTokenTimeoutMs: 300000,
 		customRetryRules: [],
@@ -233,8 +240,12 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					(settings.agent?.dangerReflectionEnabled === false ? "off" : "standard"),
 				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
+				autoContinuationMode:
+					(settings.agent?.autoContinuationMode as AutoContinuationMode | undefined) ?? "always",
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
+				behaviorFenceInterval: settings.agent?.behaviorFenceInterval ?? -1,
+				behaviorFenceAttachTasks: settings.agent?.behaviorFenceAttachTasks ?? true,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 300000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
@@ -331,6 +342,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					dangerReflectionLevel: state.dangerReflectionLevel,
 					dangerReflectionEnabled: state.dangerReflectionLevel !== "off",
 					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
+					autoContinuationMode: state.autoContinuationMode,
+					behaviorFenceInterval: state.behaviorFenceInterval,
+					behaviorFenceAttachTasks: state.behaviorFenceAttachTasks,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
 						undefined,

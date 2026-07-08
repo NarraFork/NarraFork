@@ -6,6 +6,12 @@
  */
 
 import { logger } from "../../lib/logger";
+import {
+	closeUndiciDispatcher,
+	createUndiciProxyDispatcher,
+	getOutboundProxy,
+	type UndiciDispatcherLike,
+} from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { DiscordConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
@@ -51,6 +57,8 @@ export class DiscordAdapter extends BaseAdapter {
 	override readonly supportsEdit = true;
 
 	private client: DiscordClientLike | null = null;
+	/** undici ProxyAgent (dispatcher) for REST; closed on disconnect to avoid leaks. */
+	private restAgent: UndiciDispatcherLike | null = null;
 	private config: DiscordConfig;
 
 	constructor(config: DiscordConfig) {
@@ -62,6 +70,18 @@ export class DiscordAdapter extends BaseAdapter {
 		try {
 			const { Client, GatewayIntentBits } = await import("discord.js");
 
+			// Route Discord REST traffic through the global outbound proxy when
+			// configured. discord.js REST `agent` expects an undici Dispatcher.
+			// NOTE: this covers REST (sending/editing messages); the Gateway
+			// WebSocket has no proxy entry point and is not routed through it.
+			const proxy = getOutboundProxy();
+			this.restAgent = (await createUndiciProxyDispatcher(proxy)) ?? null;
+			if (proxy) {
+				logger.warn(
+					"[discord] Outbound proxy applies to REST only; the Gateway WebSocket is not proxied. In a locked-down network the bot may send but not receive events.",
+				);
+			}
+
 			this.client = new Client({
 				intents: [
 					GatewayIntentBits.Guilds,
@@ -69,6 +89,8 @@ export class DiscordAdapter extends BaseAdapter {
 					GatewayIntentBits.DirectMessages,
 					GatewayIntentBits.MessageContent,
 				],
+				// biome-ignore lint/suspicious/noExplicitAny: rest.agent typed as undici Dispatcher
+				...(this.restAgent ? { rest: { agent: this.restAgent as any } } : {}),
 			}) as DiscordClientLike;
 
 			this.client.on("messageCreate", (msg) => this.handleDiscordMessage(msg));
@@ -98,6 +120,8 @@ export class DiscordAdapter extends BaseAdapter {
 			await this.client.destroy();
 			this.client = null;
 		}
+		await closeUndiciDispatcher(this.restAgent);
+		this.restAgent = null;
 		this.connected = false;
 	}
 

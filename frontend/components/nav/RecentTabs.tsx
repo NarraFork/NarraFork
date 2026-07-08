@@ -44,7 +44,6 @@ import {
 	IconPinnedOff,
 	IconPlus,
 	IconRobot,
-	IconTargetArrow,
 	IconTerminal2,
 	IconUsers,
 	IconX,
@@ -253,7 +252,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					| "activeTerminalCount"
 					| "containerStatus"
 					| "hasDraft"
-					| "hasActiveGoal"
 				>
 			> = {};
 			if (event.type === "title" && event.title) patch.title = clampRecentTabText(event.title);
@@ -269,7 +267,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				patch.activeTerminalCount = event.activeTerminalCount;
 			else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
-			else if (event.type === "goals") patch.hasActiveGoal = !!event.hasActiveGoal;
 			else return;
 
 			// Trigger client-side notifications for done(unread)/waiting
@@ -1196,9 +1193,8 @@ function TabIcon({
 	const canShowMarker =
 		tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
-	const showActiveGoal = !!tab.hasActiveGoal && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
-	if (!showDraft && !showActiveGoal && !showReasoning) return icon;
+	if (!showDraft && !showReasoning) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
@@ -1245,28 +1241,6 @@ function TabIcon({
 					}}
 				>
 					<IconPencil size={7} stroke={2.5} />
-				</Box>
-			)}
-			{showActiveGoal && (
-				<Box
-					component="span"
-					style={{
-						position: "absolute",
-						right: -4,
-						bottom: -4,
-						width: 11,
-						height: 11,
-						borderRadius: "50%",
-						background: "var(--mantine-color-teal-6)",
-						border: "1px solid var(--mantine-color-body)",
-						display: "inline-flex",
-						alignItems: "center",
-						justifyContent: "center",
-						color: "var(--mantine-color-white)",
-						pointerEvents: "none",
-					}}
-				>
-					<IconTargetArrow size={7} stroke={2.5} />
 				</Box>
 			)}
 		</Box>

@@ -749,7 +749,8 @@ function layoutSpecialBlock(
 		case "merge_summary":
 		case "review_feedback":
 			return { lines: [], height: 30 };
-		case "goal_continuation":
+		case "spec_continuation":
+		case "spec_blocked_continuation":
 			return { lines: [], height: 28 };
 		default:
 			return null;

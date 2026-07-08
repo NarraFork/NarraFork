@@ -20,6 +20,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
+import { signatureSourcesCompatible } from "./reasoning-source";
 import { sanitizeHeaders } from "./request-dump";
 import {
 	appendSideCarsForApi,
@@ -630,10 +631,22 @@ export class AnthropicProvider implements ProviderAdapter {
 	private resolvedBaseUrl?: string;
 	/** Stable session ID — one per provider instance (≈ per narrator session). */
 	private readonly sessionId = generateId();
+	/**
+	 * Reasoning-signature source identity to report instead of the configured
+	 * prefix. Set by NUG when this provider is used as an `anthropic`-channel
+	 * delegate so signatures are tagged with the NUG channel (e.g.
+	 * `nug:anthropic`) rather than a bare `anthropic`.
+	 */
+	private reasoningSourceOverride?: string;
 
 	constructor(config: AnthropicProviderConfig) {
 		this.config = config;
 		this.tlsRejectUnauthorized = config.tlsRejectUnauthorized !== false;
+	}
+
+	/** Override the reasoning-signature source identity (used by NUG delegates). */
+	setReasoningSourceOverride(source: string | undefined): void {
+		this.reasoningSourceOverride = source;
 	}
 
 	/**
@@ -790,7 +803,15 @@ export class AnthropicProvider implements ProviderAdapter {
 		_model: string,
 		_narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildAnthropicHistory(dbMessages);
+		return buildAnthropicHistory(dbMessages, this.getActiveReasoningSource());
+	}
+
+	getActiveReasoningSource(): string | undefined {
+		// A direct Anthropic-family provider is one upstream server, identified
+		// by its configured prefix. Reasoning-signature source override lets NUG
+		// reuse this provider as a delegate while tagging signatures with the NUG
+		// channel identity instead.
+		return this.reasoningSourceOverride ?? this.config.prefix;
 	}
 
 	injectSystemPrompt(
@@ -1262,7 +1283,11 @@ export class AnthropicProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
+		redactedThinkingBlocks?: Array<{
+			data: string;
+			outputIndex?: number;
+			signatureSource?: string;
+		}>,
 	): void {
 		const h = history as AnthropicMessage[];
 
@@ -2015,7 +2040,10 @@ export function parseAnthropicEvent(
 
 // === History builder ===
 
-function buildAnthropicHistory(dbMessages: DbMessage[]): {
+function buildAnthropicHistory(
+	dbMessages: DbMessage[],
+	currentReasoningSource?: string,
+): {
 	history: AnthropicMessage[];
 	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
 	trailingUserText?: string;
@@ -2108,24 +2136,48 @@ function buildAnthropicHistory(dbMessages: DbMessage[]): {
 					id?: string;
 					name?: string;
 					input?: Record<string, unknown>;
-					providerMetadata?: { anthropic?: { signature?: string } };
+					signatureSource?: string;
+					providerMetadata?: { anthropic?: { signature?: string }; signatureSource?: string };
 				};
 				if (block.type === "thinking" && block.thinking) {
+					// Legacy shape: signature stored on the block directly, with the
+					// source (if any) on providerMetadata. Only echo the signature
+					// back when it was minted by the current upstream.
+					const sig = signatureSourcesCompatible(
+						block.providerMetadata?.signatureSource,
+						currentReasoningSource,
+					)
+						? (block.signature ?? "")
+						: "";
 					parts.push({
 						type: "thinking",
 						thinking: block.thinking,
-						signature: block.signature ?? "",
+						signature: sig,
 					});
 				} else if (block.type === "reasoning" && block.text) {
-					// DB stores thinking as "reasoning" blocks with signature in providerMetadata
-					const sig = block.providerMetadata?.anthropic?.signature ?? "";
+					// DB stores thinking as "reasoning" blocks with signature in providerMetadata.
+					// Drop the signature when it belongs to a different upstream server
+					// (e.g. a different NUG channel), since replaying it would fail
+					// signature verification. The thinking text is still preserved.
+					const sig = signatureSourcesCompatible(
+						block.providerMetadata?.signatureSource,
+						currentReasoningSource,
+					)
+						? (block.providerMetadata?.anthropic?.signature ?? "")
+						: "";
 					parts.push({
 						type: "thinking",
 						thinking: block.text,
 						signature: sig,
 					});
 				} else if (block.type === "redacted_thinking" && block.data) {
-					parts.push({ type: "redacted_thinking", data: block.data });
+					// Encrypted thinking is server-specific — only replay it to the
+					// upstream that produced it. When the source does not match (or is
+					// unknown on legacy messages), drop the block entirely rather than
+					// echo an opaque payload the current server cannot validate.
+					if (signatureSourcesCompatible(block.signatureSource, currentReasoningSource)) {
+						parts.push({ type: "redacted_thinking", data: block.data });
+					}
 				} else if (block.type === "text" && block.text) {
 					parts.push({ type: "text", text: block.text });
 				} else if (block.type === "tool_use" && block.id) {

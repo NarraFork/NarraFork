@@ -15,6 +15,8 @@ export interface ModelOption {
 
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 
+export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
+
 export type CustomApiProtocol =
 	| "anthropic-official"
 	| "anthropic-compatible"
@@ -415,6 +417,8 @@ export interface NarraForkSettings {
 		dangerReflectionEnabled: boolean;
 		/** Skip danger reflection secondary confirmations for operations that are classified as read-only. */
 		dangerSkipReadOnlyConfirmations: boolean;
+		/** Auto-continuation mode: controls whether/when the agent auto-continues after a turn. */
+		autoContinuationMode: AutoContinuationMode;
 		/**
 		 * Global default reasoning effort — lowest priority fallback.
 		 * Fallback chain: narrator.reasoningEffort → provider.defaultReasoningEffort → agent.defaultReasoningEffort.
@@ -432,6 +436,10 @@ export interface NarraForkSettings {
 		maxTransientRetries: number;
 		/** Tool-call count without visible text before asking the model for a short progress update. -1 = disabled. */
 		silentToolCallThreshold: number;
+		/** Global default for behavior-fence periodic injection interval (completed tool calls). -1 = disabled. */
+		behaviorFenceInterval: number;
+		/** Global default for whether the behavior fence rides along with the tasks.json reminder. */
+		behaviorFenceAttachTasks: boolean;
 		/** Maximum backoff delay (ms) for transient-error retries. Default 20000 (20s). */
 		retryBackoffCeilMs: number;
 		/** Time to wait for the first meaningful AI API event before aborting and retrying. 0 = disabled. */

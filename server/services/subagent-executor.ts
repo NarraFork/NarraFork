@@ -434,27 +434,6 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 
 		const hooks: EventHooks = {
 			onContextUsage: ctxMgmt.onContextUsage,
-			onTodoWrite: async (todos, todoToolUseId) => {
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				await narratorService.updateTodos(narratorId, todos as any[], todoToolUseId);
-				// Broadcast to subagent's own subscribers
-				broadcastToNarrator(narratorId, {
-					type: "todos_updated",
-					narratorId,
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					todos: todos as any[],
-					toolUseId: todoToolUseId,
-				});
-				// Also notify parent narrator so SubagentCard can update
-				broadcastToNarrator(parentNarratorId, {
-					type: "subagent_todos_updated",
-					narratorId: parentNarratorId,
-					subagentNarratorId: narratorId,
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					todos: todos as any[],
-					toolUseId: todoToolUseId,
-				});
-			},
 		};
 
 		const resolvedProvider = resolveProvider(model);

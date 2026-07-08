@@ -43,6 +43,7 @@ import {
 	IconInfoCircle,
 	IconListCheck,
 	IconLoader2,
+	IconLock,
 	IconMap,
 	IconMessageQuestion,
 	IconPencil,
@@ -53,7 +54,6 @@ import {
 	IconShare,
 	IconShield,
 	IconShieldLock,
-	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
 	IconUsers,
@@ -114,7 +114,7 @@ import { useRenderLod } from "./RenderLodCtx";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
-import { knowledgeSummary } from "./tool-display";
+import { isSpecTasksToolUse, knowledgeSummary } from "./tool-display";
 import { useNearestScrollContainerHeight } from "./useNearestScrollContainerHeight";
 
 const LazyStreamingCode = lazy(() =>
@@ -184,15 +184,18 @@ function StreamingCodeLazy({ code, lang, style }: StreamingCodeLazyProps) {
 }
 
 /**
- * Context carrying the toolUseId of the narrator's latest TaskCreate call
- * and whether the narrator is currently thinking.
- * TodoDetail uses this to decide whether in_progress items should animate —
- * spinning only makes sense while the narrator is actively working.
+ * Context carrying whether the narrator is currently thinking, plus the
+ * tool-use id of the latest spec://tasks.json write. SpecTasksDetail uses these
+ * to decide whether a doing task should animate — spinning only makes sense
+ * while the narrator is actively working AND this card is the most recent tasks
+ * snapshot (so historical task cards stay static rather than showing a false
+ * "active" spinner). A null latest id means "unknown" → fall back to isThinking
+ * alone so the live/streaming case still animates.
  */
 export const LatestTodosToolUseIdCtx = createContext<{
-	toolUseId: string | null;
 	isThinking: boolean;
-}>({ toolUseId: null, isThinking: false });
+	latestSpecTasksToolUseId?: string | null;
+}>({ isThinking: false, latestSpecTasksToolUseId: null });
 
 /** Context for opening the file modifications drawer from within tool call cards */
 export const FileModDrawerCtx = createContext<{
@@ -335,8 +338,6 @@ const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
-const TODO_TOOLS = new Set(["TaskCreate"]);
-const GOAL_TOOLS = new Set(["GetGoals", "AddGoal", "UpdateGoal"]);
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 const AWAIT_TOOLS = new Set(["Await"]);
@@ -367,8 +368,6 @@ const NON_RERUNNABLE_TOOL_NAMES = new Set([
 	"ExitPlanMode",
 	"EnterPlanMode",
 	"AskUserQuestion",
-	"TodoWrite",
-	"TaskCreate",
 	"StartPipeline",
 	"EndPipeline",
 ]);
@@ -394,8 +393,7 @@ export type ToolCategory =
 	| "search"
 	| "webSearch"
 	| "webFetch"
-	| "todo"
-	| "goal"
+	| "tasks"
 	| "taskOutput"
 	| "agent"
 	| "await"
@@ -415,15 +413,15 @@ export function isEditTool(name: string): boolean {
 	return EDIT_TOOLS.has(name);
 }
 
-export function getCategory(name: string): ToolCategory {
+export function getCategory(name: string, input?: unknown): ToolCategory {
+	// Spec task-queue file operations render as a task list, not a raw file diff.
+	if (input !== undefined && isSpecTasksToolUse(name, input)) return "tasks";
 	if (READ_TOOLS.has(name)) return "read";
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
-	if (TODO_TOOLS.has(name)) return "todo";
-	if (GOAL_TOOLS.has(name)) return "goal";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
@@ -454,10 +452,8 @@ export function getCategoryIcon(cat: ToolCategory, toolName?: string) {
 			return IconWorldSearch;
 		case "webFetch":
 			return IconWorldWww;
-		case "todo":
+		case "tasks":
 			return IconListCheck;
-		case "goal":
-			return IconTargetArrow;
 		case "taskOutput":
 			return IconRobot;
 		case "agent":
@@ -523,10 +519,8 @@ export function getCategoryColor(cat: ToolCategory) {
 			return "teal";
 		case "webFetch":
 			return "teal";
-		case "todo":
+		case "tasks":
 			return "teal";
-		case "goal":
-			return "green";
 		case "taskOutput":
 			return "indigo";
 		case "agent":
@@ -883,7 +877,7 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 		}
 		return chars > 0 ? `${chars} chars` : "";
 	}
-	const cat = getCategory(toolName);
+	const cat = getCategory(toolName, input);
 	switch (cat) {
 		case "read": {
 			const fp = getFilePath(input);
@@ -938,15 +932,8 @@ function getSummary(toolName: string, input: any, metadata?: Record<string, unkn
 			const short = fetchUrl.length > 50 ? `${fetchUrl.slice(0, 47)}...` : fetchUrl;
 			return fetchMode ? `${fetchMode}: ${short}` : short;
 		}
-		case "todo":
-			return "Update todos";
-		case "goal": {
-			if (toolName === "GetGoals") return "List goals";
-			if (toolName === "UpdateGoal") return "Complete active goal";
-			const objective = extractField(input, "objective");
-			if (objective) return objective.length > 80 ? `${objective.slice(0, 77)}...` : objective;
-			return toolName;
-		}
+		case "tasks":
+			return toolName === "Read" ? "Read tasks" : "Update tasks";
 		case "taskOutput": {
 			const taskId = extractField(input, "task_id");
 			return taskId ? `Check ${taskId}` : "Check task output";
@@ -1405,9 +1392,10 @@ function ReflectionNotice({
 	const isDanger = reflection.kind === "danger_reflection";
 	const isPlan = reflection.kind === "plan_reflection";
 	const isQuestion = reflection.kind === "question_reflection";
+	const isTask = reflection.kind === "task_reflection";
 	const summary =
 		reflection.reason || reflection.danger?.summary || toolCall.permissionDecisionReason;
-	const titleKeyPrefix = isDanger ? "danger" : isPlan ? "plan" : isQuestion ? "question" : "goal";
+	const titleKeyPrefix = isDanger ? "danger" : isPlan ? "plan" : isQuestion ? "question" : "task";
 	const title = (() => {
 		if (running) return t(`${titleKeyPrefix}ReflectionRunning`);
 		if (reflection.status === "awaiting_user") return t(`${titleKeyPrefix}ReflectionAwaitingUser`);
@@ -1438,6 +1426,7 @@ function ReflectionNotice({
 		try {
 			if (isDanger) await api.stopDangerReflection(reflectionRequestId);
 			else if (isPlan) await api.stopPlanReflection(reflectionRequestId);
+			else if (isTask) await api.stopTaskReflection(reflectionRequestId);
 		} finally {
 			setTakingOver(false);
 		}
@@ -1505,7 +1494,7 @@ function ReflectionNotice({
 							{t("reflectionNextSteps", { nextSteps: reflection.nextSteps })}
 						</Text>
 					)}
-					{running && reflectionRequestId && (isDanger || isPlan) && (
+					{running && reflectionRequestId && (isDanger || isPlan || isTask) && (
 						<Group gap="xs" mt="xs">
 							<Button
 								size="xs"
@@ -1555,7 +1544,7 @@ const ToolHeader = memo(
 		onToggle?: () => void;
 		narratorId?: string;
 	}) {
-		const cat = getCategory(toolCall.toolName);
+		const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 		const Icon = getCategoryIcon(cat, toolCall.toolName);
 		const color = getCategoryColor(cat);
 		const summary = useMemo(
@@ -3641,145 +3630,6 @@ function SendDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-interface GoalView {
-	id?: string;
-	objective?: string;
-	status?: string;
-	tokensUsed?: number;
-	timeUsedSeconds?: number;
-}
-
-function parseGoalToolPayload(value: unknown): Record<string, unknown> | null {
-	if (!value) return null;
-	const raw = collectToolCardTextPreview(value);
-	if (!raw && typeof value === "object" && !Array.isArray(value)) {
-		return value as Record<string, unknown>;
-	}
-	if (!raw.trim()) return null;
-	try {
-		return JSON.parse(raw) as Record<string, unknown>;
-	} catch {
-		return null;
-	}
-}
-
-function coerceGoal(value: unknown): GoalView | null {
-	if (!value || typeof value !== "object") return null;
-	const goal = value as Record<string, unknown>;
-	return {
-		id: typeof goal.id === "string" ? goal.id : undefined,
-		objective: typeof goal.objective === "string" ? goal.objective : undefined,
-		status: typeof goal.status === "string" ? goal.status : undefined,
-		tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : undefined,
-		timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : undefined,
-	};
-}
-
-function goalStatusColor(status?: string): string {
-	switch (status) {
-		case "active":
-			return "green";
-		case "pending":
-			return "yellow";
-		case "paused":
-			return "orange";
-		case "complete":
-			return "blue";
-		case "cancelled":
-			return "gray";
-		default:
-			return "gray";
-	}
-}
-
-function GoalRow({ goal, index }: { goal: GoalView; index?: number }) {
-	return (
-		<Group gap="xs" wrap="nowrap" align="flex-start">
-			{index != null && (
-				<Text size="xs" c="dimmed" ff="monospace" style={{ width: 18, flexShrink: 0 }}>
-					{index + 1}.
-				</Text>
-			)}
-			<Badge
-				size="xs"
-				variant="light"
-				color={goalStatusColor(goal.status)}
-				style={{ flexShrink: 0 }}
-			>
-				{goal.status ?? "goal"}
-			</Badge>
-			<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
-				<Text size="xs" style={{ whiteSpace: "pre-wrap" }}>
-					{goal.objective ?? "—"}
-				</Text>
-				{(goal.timeUsedSeconds != null || goal.tokensUsed != null) && (
-					<Text size="xs" c="dimmed">
-						{goal.timeUsedSeconds ?? 0}s · {goal.tokensUsed ?? 0} tokens
-					</Text>
-				)}
-			</Stack>
-		</Group>
-	);
-}
-
-function GoalDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const payload = parseGoalToolPayload(toolCall.outputJson);
-	const goals = Array.isArray(payload?.goals)
-		? payload.goals.map(coerceGoal).filter((goal): goal is GoalView => Boolean(goal))
-		: [];
-	const active = coerceGoal(payload?.active);
-	const added = coerceGoal(payload?.added);
-	const completed = coerceGoal(payload?.completed);
-
-	if (!payload && goals.length === 0 && !active && !added && !completed) {
-		return <GenericDetail toolCall={toolCall} />;
-	}
-
-	return (
-		<Box mt="xs">
-			<Stack gap="xs">
-				{toolCall.toolName === "AddGoal" && (
-					<GoalRow goal={added ?? { objective: extractField(toolCall.inputJson, "objective") }} />
-				)}
-				{toolCall.toolName === "UpdateGoal" && completed && (
-					<>
-						<Text size="xs" fw={600} c="dimmed">
-							Completed
-						</Text>
-						<GoalRow goal={completed} />
-					</>
-				)}
-				{toolCall.toolName === "GetGoals" && active && (
-					<>
-						<Text size="xs" fw={600} c="dimmed">
-							Active
-						</Text>
-						<GoalRow goal={active} />
-					</>
-				)}
-				{goals.length > 0 ? (
-					<>
-						<Text size="xs" fw={600} c="dimmed">
-							Goal list
-						</Text>
-						<Stack gap={6}>
-							{goals.map((goal, index) => (
-								<GoalRow key={goal.id ?? index} goal={goal} index={index} />
-							))}
-						</Stack>
-					</>
-				) : (
-					toolCall.toolName === "GetGoals" && (
-						<Text size="xs" c="dimmed">
-							No open goals.
-						</Text>
-					)
-				)}
-			</Stack>
-		</Box>
-	);
-}
-
 interface ParsedPipelineResult {
 	aliases: string;
 	captured: string;
@@ -4010,38 +3860,70 @@ function GenericDetail({ toolCall }: { toolCall: ToolCallData }) {
 	);
 }
 
-const TODO_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }> = {
-	completed: { icon: IconCheck, color: "green" },
-	in_progress: { icon: IconPlayerPlay, color: "blue" },
+// Dynamic Spec task statuses (spec://tasks.json): todo/doing/done/blocked.
+const SPEC_TASK_STATUS_ICON: Record<string, { icon: typeof IconCheck; color: string }> = {
+	done: { icon: IconCheck, color: "green" },
+	doing: { icon: IconPlayerPlay, color: "blue" },
 	blocked: { icon: IconBan, color: "orange" },
-	pending: { icon: IconChevronRight, color: "yellow" },
+	todo: { icon: IconChevronRight, color: "yellow" },
 };
 
-function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
-	const { toolUseId: latestToolUseId, isThinking } = useContext(LatestTodosToolUseIdCtx);
-	const isLatest = !!toolCall.toolUseId && toolCall.toolUseId === latestToolUseId;
-	const outputTodos = toolCall.outputJson?._metadata?.todos ?? toolCall.outputJson?.todos;
-	const raw = isTruncated(toolCall.inputJson)
-		? isTruncated(toolCall.outputJson)
-			? []
-			: outputTodos
-		: (outputTodos ?? toolCall.inputJson?.todos);
-	const todos: { content?: string; status?: string }[] = Array.isArray(raw) ? raw : [];
+interface SpecTaskEntry {
+	text?: string;
+	status?: string;
+	protected?: boolean;
+}
 
-	if (!todos.length) {
+/** Best-effort extraction of the spec task list from a tool call's input/output. */
+function extractSpecTasks(toolCall: ToolCallData): SpecTaskEntry[] | null {
+	const tryParse = (raw: unknown): SpecTaskEntry[] | null => {
+		if (typeof raw !== "string") return null;
+		try {
+			const doc = JSON.parse(raw);
+			return Array.isArray(doc?.tasks) ? (doc.tasks as SpecTaskEntry[]) : null;
+		} catch {
+			return null;
+		}
+	};
+	// Write: full document in input.content. Read: document in output.
+	if (!isTruncated(toolCall.inputJson)) {
+		const fromInput = tryParse(toolCall.inputJson?.content);
+		if (fromInput) return fromInput;
+	}
+	if (!isTruncated(toolCall.outputJson)) {
+		const out = toolCall.outputJson;
+		const fromOutput = tryParse(typeof out === "string" ? out : out?.content);
+		if (fromOutput) return fromOutput;
+	}
+	return null;
+}
+
+function SpecTasksDetail({ toolCall }: { toolCall: ToolCallData }) {
+	const { isThinking, latestSpecTasksToolUseId } = useContext(LatestTodosToolUseIdCtx);
+	const tasks = extractSpecTasks(toolCall);
+
+	// Only the most recent tasks snapshot reflects the live task state; older
+	// snapshots must not spin. When the latest id is unknown (null), fall back to
+	// isThinking alone so the streaming/live card still animates.
+	const isLatestTasksCard =
+		latestSpecTasksToolUseId == null || toolCall.toolUseId === latestSpecTasksToolUseId;
+
+	// Edit and other partial updates may not carry the full document — fall back
+	// to the generic (diff/text) detail rather than showing an empty list.
+	if (!tasks || tasks.length === 0) {
 		return <GenericDetail toolCall={toolCall} />;
 	}
 
 	return (
 		<Box mt="xs">
 			<List spacing={4} size="xs" center>
-				{todos.map((todo, i) => {
-					const entry = TODO_STATUS_ICON[todo.status ?? "pending"] ?? TODO_STATUS_ICON.pending;
-					const spinning = isLatest && isThinking && todo.status === "in_progress";
+				{tasks.map((task, i) => {
+					const entry = SPEC_TASK_STATUS_ICON[task.status ?? "todo"] ?? SPEC_TASK_STATUS_ICON.todo;
+					const spinning = isThinking && isLatestTasksCard && task.status === "doing";
 					const StatusIconComp = spinning ? IconLoader2 : entry.icon;
 					return (
 						<List.Item
-							// biome-ignore lint/suspicious/noArrayIndexKey: todo items lack unique IDs
+							// biome-ignore lint/suspicious/noArrayIndexKey: spec tasks lack unique IDs
 							key={i}
 							icon={
 								<ThemeIcon size={16} variant="light" color={entry.color} radius="xl">
@@ -4052,9 +3934,12 @@ function TodoDetail({ toolCall }: { toolCall: ToolCallData }) {
 								</ThemeIcon>
 							}
 						>
-							<Text size="xs" c={todo.status === "completed" ? "dimmed" : undefined}>
-								{todo.content ?? "—"}
-							</Text>
+							<Group gap={4} wrap="nowrap">
+								{task.protected && <IconLock size={11} color="var(--mantine-color-yellow-6)" />}
+								<Text size="xs" c={task.status === "done" ? "dimmed" : undefined}>
+									{task.text ?? "—"}
+								</Text>
+							</Group>
 						</List.Item>
 					);
 				})}
@@ -4269,7 +4154,7 @@ const StreamingInputDetail = memo(function StreamingInputDetail({
 	const fields = toolCall.inputJson?._streamingFields as Record<string, string> | undefined;
 	const sfName = toolCall.inputJson?._streamingFieldName as string | undefined;
 	const sfValue = toolCall.inputJson?._streamingFieldValue as string | undefined;
-	const cat = getCategory(toolCall.toolName);
+	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 	const filePath =
 		(toolCall.inputJson?._streamingFilePath as string | undefined) ?? fields?.file_path;
 	const lang = filePath ? getShikiLang(filePath) : undefined;
@@ -4557,7 +4442,7 @@ function ReadDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
-	const cat = getCategory(toolCall.toolName);
+	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 	switch (cat) {
 		case "read":
 			return <ReadDetail toolCall={toolCall} />;
@@ -4571,10 +4456,8 @@ function DetailRenderer({ toolCall }: { toolCall: ToolCallData }) {
 			return <WebSearchDetail toolCall={toolCall} />;
 		case "webFetch":
 			return <WebFetchDetail toolCall={toolCall} />;
-		case "todo":
-			return <TodoDetail toolCall={toolCall} />;
-		case "goal":
-			return <GoalDetail toolCall={toolCall} />;
+		case "tasks":
+			return <SpecTasksDetail toolCall={toolCall} />;
 		case "taskOutput":
 			return <TaskOutputDetail toolCall={toolCall} />;
 		case "agent":
@@ -5182,7 +5065,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	forceExpand,
 	blockIndex,
 }: ToolCallCardProps) {
-	const cat = getCategory(toolCall.toolName);
+	const cat = getCategory(toolCall.toolName, toolCall.inputJson);
 	const isEdit = isEditTool(toolCall.toolName);
 	const isPlan = cat === "plan";
 	// Streaming tool chunks (still being generated) — not expandable
@@ -5240,7 +5123,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isKnowledgeLookup =
 		toolCall.toolName === "KnowledgeSearch" || toolCall.toolName === "KnowledgeRead";
 	const shouldAutoOpenNonTruncated =
-		cat === "todo" ||
+		cat === "tasks" ||
 		cat === "share" ||
 		cat === "recall" ||
 		cat === "send" ||
@@ -5307,7 +5190,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 			const shouldOpen =
 				!!pendingPermission ||
 				toolCall.status === "pending" ||
-				cat === "todo" ||
+				cat === "tasks" ||
 				cat === "share" ||
 				cat === "recall" ||
 				cat === "send" ||
@@ -5810,7 +5693,7 @@ interface ToolCallGroupProps {
 
 export const ToolCallGroup = memo(function ToolCallGroup({ toolCalls }: ToolCallGroupProps) {
 	const [expanded, setExpanded] = useState(false);
-	const cat = getCategory(toolCalls[0].toolName);
+	const cat = getCategory(toolCalls[0].toolName, toolCalls[0].inputJson);
 	const Icon = getCategoryIcon(cat, toolCalls[0].toolName);
 	const color = getCategoryColor(cat);
 	const allDone = toolCalls.every((tc) => tc.status === "success");

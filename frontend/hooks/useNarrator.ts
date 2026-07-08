@@ -3,7 +3,6 @@ import {
 	api,
 	type BlacklistCmd,
 	type BlacklistDir,
-	type NarratorGoalStatus,
 	type PaginatedNarrators,
 	type WhitelistCmd,
 	type WhitelistDir,
@@ -235,62 +234,6 @@ export function usePromoteNarrator() {
 			qc.invalidateQueries({ queryKey: ["chapters"] });
 			qc.invalidateQueries({ queryKey: ["graph"] });
 		},
-	});
-}
-
-export function useNarratorGoals(narratorId: string) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "goals"],
-		queryFn: () => api.getGoals(narratorId),
-		enabled: !!narratorId,
-		gcTime: NARRATOR_DETAIL_QUERY_GC_TIME_MS,
-	});
-}
-
-export function useAddNarratorGoal(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (objective: string) => api.addGoal(narratorId, objective),
-		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
-	});
-}
-
-export function useUpdateNarratorGoal(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: ({
-			goalId,
-			...data
-		}: {
-			goalId: string;
-			objective?: string;
-			status?: NarratorGoalStatus;
-		}) => api.updateGoal(narratorId, goalId, data),
-		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
-	});
-}
-
-export function useRemoveNarratorGoal(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (goalId: string) => api.removeGoal(narratorId, goalId),
-		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
-	});
-}
-
-export function useClearNarratorGoals(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: () => api.clearGoals(narratorId),
-		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
-	});
-}
-
-export function useReorderNarratorGoals(narratorId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (orderedIds: string[]) => api.reorderGoals(narratorId, orderedIds),
-		onSuccess: (data) => qc.setQueryData(["narrators", narratorId, "goals"], { goals: data.goals }),
 	});
 }
 
@@ -713,7 +656,26 @@ export function useUpdateReflectionOverrides() {
 			id: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 		}) => api.updateNarratorReflectionOverrides(id, data),
+		onSuccess: (_data, vars) => {
+			qc.invalidateQueries({ queryKey: ["narrators"] });
+			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });
+		},
+	});
+}
+
+export function useUpdateBehaviorFence() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			id,
+			...data
+		}: {
+			id: string;
+			behaviorFenceIntervalOverride?: number | null;
+			behaviorFenceAttachOverride?: "inherit" | "on" | "off";
+		}) => api.updateNarratorBehaviorFence(id, data),
 		onSuccess: (_data, vars) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			qc.invalidateQueries({ queryKey: ["narrators", vars.id] });

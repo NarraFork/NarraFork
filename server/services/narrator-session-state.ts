@@ -106,17 +106,19 @@ export interface ActiveNarrator {
 	 * but has not yet been consumed by a rebuilt in-memory agent history.
 	 */
 	_pendingHistoryCompactSeq?: number;
-	/** Goal accounting baseline at the start of the current turn. */
-	_goalTurnStartedAtMs?: number;
-	_goalTokenUsageBaseline?: TokenUsageSnapshot;
-	/** Guard against infinite goal continuation when continuation turns make no tool progress. */
-	_goalContinuationSuppressed?: boolean;
-	_goalContinuationTurn?: boolean;
-	_goalContinuationNoToolCount?: number;
-	/** One-shot sidecar injected when goals change while the current loop is already running. */
-	_pendingGoalStateNotice?: string;
-	/** Completed non-TaskCreate tool count used to keep TODO reminder cadence across loop runs. */
+	/** Token usage baseline at the start of the current turn (for round token totals). */
+	_tokenUsageBaseline?: TokenUsageSnapshot;
+	/** Guard against infinite auto-continuation when continuation turns make no tool progress. */
+	_continuationSuppressed?: boolean;
+	_continuationTurn?: boolean;
+	_continuationNoToolCount?: number;
+	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
+	/** Resolved behavior-fence injection interval for this turn. null/undefined = follow default;
+	 *  -1 = disabled; >0 = inject every N completed tool calls. */
+	_fenceInterval?: number;
+	/** Resolved whether the behavior fence rides along with the tasks.json reminder for this turn. */
+	_fenceAttach?: boolean;
 }
 
 // === PendingPermission interface ===

@@ -281,8 +281,8 @@ export class NugProvider implements ProviderAdapter {
 					apiMode: "responses",
 					extraHeaders,
 				});
-			case "anthropic":
-				return new AnthropicProvider({
+			case "anthropic": {
+				const delegate = new AnthropicProvider({
 					id: this.config.id,
 					name: this.config.name,
 					prefix: this.config.prefix,
@@ -292,9 +292,26 @@ export class NugProvider implements ProviderAdapter {
 					officialApi: false,
 					extraHeaders,
 				});
+				// Tag thinking signatures with the NUG channel identity (e.g.
+				// `nug:anthropic`) so they are not confused with a direct
+				// anthropic upstream or another NUG channel.
+				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
+				return delegate;
+			}
 			default:
 				return null;
 		}
+	}
+
+	/**
+	 * Stable `provider:channel` identity for the upstream that mints thinking
+	 * and the `anthropic` delegate) produce signatures; other channels
+	 * (codex/openai/responses) return `undefined`.
+	 */
+	private reasoningSourceForMeta(meta: ResolvedNugModelMeta): string | undefined {
+			return `${this.config.prefix}:${meta.channel}`;
+		}
+		return undefined;
 	}
 
 	private ensureDelegateForModel(model: string): ProviderAdapter | null {
@@ -372,8 +389,23 @@ export class NugProvider implements ProviderAdapter {
 		this.activeMeta = meta;
 		this.activeDelegate = this.createDelegate(meta);
 		if (this.activeDelegate) {
+			// Delegate carries its own reasoning-source (the anthropic delegate was
+			// given the NUG channel override in createDelegate; others mint no
+			// signatures), so no extra source plumbing is needed here.
 			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
 		}
+			dbMessages,
+			meta.bareModel,
+			narratorId,
+			this.getActiveReasoningSource(),
+		);
+	}
+
+	getActiveReasoningSource(): string | undefined {
+		if (this.activeDelegate?.getActiveReasoningSource) {
+			return this.activeDelegate.getActiveReasoningSource();
+		}
+		return this.activeMeta ? this.reasoningSourceForMeta(this.activeMeta) : undefined;
 	}
 
 	injectSystemPrompt(
@@ -606,7 +638,11 @@ export class NugProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
+		redactedThinkingBlocks?: Array<{
+			data: string;
+			outputIndex?: number;
+			signatureSource?: string;
+		}>,
 	): void {
 		if (this.activeDelegate) {
 			this.activeDelegate.pushAssistantTurn(
@@ -623,6 +659,10 @@ export class NugProvider implements ProviderAdapter {
 			return;
 		}
 		// not camelCase "reasoningContent".
+			reasoningBlocks,
+			redactedThinkingBlocks,
+			this.getActiveReasoningSource(),
+		);
 				content: text || "",
 				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 				...(toolUses.length > 0

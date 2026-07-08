@@ -14,7 +14,6 @@ import type { ToolCallData } from "./ToolCallCard";
 
 const LEGACY_TOOL_NAMES: Record<string, string> = {
 	Task: "Agent",
-	TodoWrite: "TaskCreate",
 	CheckBackgroundTask: "TaskOutput",
 	CancelBackgroundTask: "Agent",
 	TaskStop: "Agent",

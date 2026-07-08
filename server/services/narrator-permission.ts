@@ -595,14 +595,11 @@ function resolveBlacklistDecision(
 }
 
 const ALWAYS_ALLOW_TOOLS = [
-	"TaskCreate",
 	"EnterPlanMode",
 	"WebSearch",
 	"Await",
 	"Skill",
 	"LearningGuide",
-	"GetGoals",
-	"UpdateGoal",
 	// Pack tools: PackList (read-only listing) and PackDeactivate (only shrinks access)
 	// are safe to auto-allow. PackActivate self-gates via ctx.requestPermission when
 	// settings.knowledge.packActivateRequiresPermission is true, so the loop-level check
@@ -3327,6 +3324,26 @@ export async function resolvePermissionOrDangerReflection(
 
 		const reason = opts.denyMessage?.trim() || opts.feedbackText?.trim() || undefined;
 		return cancelDangerReflection(requestId, reason, opts.decidedBy ?? "user");
+	}
+
+	// Task reflection taken over by the user: their approve/deny resolves the
+	// reflection decision (allow → confirm/execute, deny → revise/feedback).
+	const { hasPendingTaskReflection, confirmTaskReflection, reviseTaskReflection } = await import(
+		"@server/lib/agent/tools/task-reflection"
+	);
+	if (hasPendingTaskReflection(requestId)) {
+		if (decision === "allow") {
+			const evidence =
+				opts.feedbackText?.trim() || "User approved the protected task change via takeover.";
+			return confirmTaskReflection(requestId, evidence, undefined, "user");
+		}
+		const feedback =
+			opts.denyMessage?.trim() ||
+			opts.feedbackText?.trim() ||
+			"User rejected the protected task change.";
+		const nextSteps =
+			"The user declined this protected task change. Do not retry it without new instructions.";
+		return reviseTaskReflection(requestId, feedback, nextSteps, "user");
 	}
 
 	return resolvePermission(requestId, decision, opts);

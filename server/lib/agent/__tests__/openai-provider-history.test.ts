@@ -675,10 +675,10 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		const provider = new OpenAIProvider(TEST_PROVIDER);
 		const dbMessages: DbMessage[] = [
 			{
-				id: "sys-goal",
+				id: "sys-spec",
 				role: "sys",
-				contentJson: [{ type: "text", text: "Continue working toward the active goal." }],
-				contentText: "Continue working toward the active goal.",
+				contentJson: [{ type: "text", text: "Continue working on the current Dynamic Spec task." }],
+				contentText: "Continue working on the current Dynamic Spec task.",
 				parentToolUseId: null,
 				messageUuid: null,
 				toolCalls: [],
@@ -698,7 +698,9 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 			(item) => item.role === "user",
 		);
 		expect(userItem).toBeDefined();
-		expect(JSON.stringify(userItem)).toContain("Continue working toward the active goal.");
+		expect(JSON.stringify(userItem)).toContain(
+			"Continue working on the current Dynamic Spec task.",
+		);
 		expect(JSON.stringify(result.history)).not.toContain('"role":"developer"');
 	});
 
@@ -706,10 +708,10 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
 		const dbMessages: DbMessage[] = [
 			{
-				id: "sys-goal",
+				id: "sys-spec",
 				role: "sys",
-				contentJson: [{ type: "text", text: "Continue working toward the active goal." }],
-				contentText: "Continue working toward the active goal.",
+				contentJson: [{ type: "text", text: "Continue working on the current Dynamic Spec task." }],
+				contentText: "Continue working on the current Dynamic Spec task.",
 				parentToolUseId: null,
 				messageUuid: null,
 				toolCalls: [],
@@ -726,7 +728,7 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 			(item) => item.role === "user",
 		);
 		expect(userItem).toBeDefined();
-		expect(userItem?.content).toBe("Continue working toward the active goal.");
+		expect(userItem?.content).toBe("Continue working on the current Dynamic Spec task.");
 		expect((result.history as Array<{ role?: string }>).some((m) => m.role === "system")).toBe(
 			false,
 		);

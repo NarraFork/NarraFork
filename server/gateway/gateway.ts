@@ -24,6 +24,7 @@ import type { Locale } from "../lib/i18n";
 import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 import { FOLLOW_DEFAULT_MODEL, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
@@ -513,7 +514,8 @@ class Gateway {
 							/* non-fatal */
 						}
 					} else {
-						const resp = await fetch(img.url);
+						const imgProxy = resolveProxyForUrl(img.url);
+						const resp = await fetch(img.url, imgProxy ? { proxy: imgProxy } : undefined);
 						if (!resp.ok) {
 							logger.warn("[gateway] Failed to download image", {
 								url: img.url,

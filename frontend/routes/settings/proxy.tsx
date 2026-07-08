@@ -131,6 +131,9 @@ function OutboundProxyCard() {
 					<List size="xs" c="dimmed" mt={4}>
 						<List.Item>{t("proxyScopeAiProviders")}</List.Item>
 						<List.Item>{t("proxyScopeWebFetch")}</List.Item>
+						<List.Item>{t("proxyScopeImGateway")}</List.Item>
+						<List.Item>{t("proxyScopeHooks")}</List.Item>
+						<List.Item>{t("proxyScopeImWsLimit")}</List.Item>
 						<List.Item>{t("proxyScopeLoopbackExempt")}</List.Item>
 					</List>
 				</Alert>

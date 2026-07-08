@@ -6,6 +6,7 @@
  */
 
 import { logger } from "../../lib/logger";
+import { createProxyAgent, getOutboundProxy } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { FeishuConfig, GatewayPlatform, InboundMessage, SendResult } from "../types";
 
@@ -55,10 +56,38 @@ export class FeishuAdapter extends BaseAdapter {
 		try {
 			const lark = await import("@larksuiteoapi/node-sdk");
 
+			// Route Feishu REST traffic through the global outbound proxy when
+			// configured. Reuse the SDK's own defaultHttpInstance (an axios
+			// instance) so its request/response interceptors are preserved, and
+			// only attach an https agent — passing a bare axios instance would drop
+			// those interceptors and break response parsing.
+			// NOTE: this covers REST; the event WSClient has no proxy entry point
+			// and is not routed through the proxy.
+			// `defaultHttpInstance` is a process-wide shared singleton. Always set the
+			// agent fields explicitly (agent when proxied, undefined when not) so a
+			// later reconnect after switching from custom/system to direct clears a
+			// previously-attached agent instead of leaving it stale on the singleton.
+			const proxy = getOutboundProxy();
+			const agent = await createProxyAgent(proxy);
+			if (proxy) {
+				logger.warn(
+					"[feishu] Outbound proxy applies to REST only; the event WSClient is not proxied. In a locked-down network the bot may send but not receive events.",
+				);
+			}
+			// biome-ignore lint/suspicious/noExplicitAny: axios instance defaults are loosely typed here
+			const inst = lark.defaultHttpInstance as any;
+			inst.defaults.httpsAgent = agent;
+			inst.defaults.httpAgent = agent;
+			// Disable axios's own env-based proxy so the agent (or direct) is used exclusively.
+			inst.defaults.proxy = false;
+			const httpInstance: unknown = inst;
+
 			this.client = new lark.Client({
 				appId: this.config.appId,
 				appSecret: this.config.appSecret,
 				appType: lark.AppType.SelfBuild,
+				// biome-ignore lint/suspicious/noExplicitAny: httpInstance typed as lark HttpInstance
+				...(httpInstance ? { httpInstance: httpInstance as any } : {}),
 			}) as unknown as FeishuClientLike;
 
 			// Create WebSocket client for event subscription

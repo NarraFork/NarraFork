@@ -81,7 +81,6 @@
 	"chapterLabel": "章节：{{title}}",
 	"projectLabel": "项目：{{name}}",
 	"activeTerminals": "{{count}} 个终端",
-	"activeGoal": "目标",
 	"viewingNow": "正在查看",
 	"filterHasTerminals": "有活跃终端",
 	"filterHasContainers": "有容器",

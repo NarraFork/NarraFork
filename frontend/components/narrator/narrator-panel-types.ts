@@ -45,13 +45,6 @@ if (typeof document !== "undefined") {
 	}
 }
 
-export interface TodoItem {
-	id?: string;
-	content?: string;
-	status?: string;
-	activeForm?: string;
-}
-
 export type MessagesPage = {
 	messages: NarratorMsg[];
 	hasMore: boolean;
@@ -101,8 +94,6 @@ export interface NarratorPanelSnapshot {
 	permissionMode: string | null;
 	traits?: string[] | null;
 	planMode?: boolean;
-	todosJson?: TodoItem[] | null;
-	todosToolUseId?: string | null;
 	errorMessage?: string | null;
 	errorCode?: string | null;
 	substatus?: string[] | string | null;

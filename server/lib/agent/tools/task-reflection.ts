@@ -15,7 +15,14 @@ export type TaskReflectionDecision =
 
 export const TASK_REFLECTION_TYPE = "task_reflection";
 
-export type TaskReflectionStatus = "running" | "confirmed" | "cancelled" | "aborted";
+export type TaskReflectionStatus =
+	| "running"
+	| "awaiting_user"
+	| "confirmed"
+	| "cancelled"
+	| "aborted";
+
+export type TaskReflectionDecidedBy = "reflection" | "user";
 
 interface TaskReflectionMeta {
 	narratorId: string;
@@ -25,12 +32,14 @@ interface TaskReflectionMeta {
 	inputJson: Record<string, unknown>;
 	mutations: unknown[];
 	toolCallId?: string;
+	abortController?: AbortController;
 }
 
 interface PendingTaskReflection extends TaskReflectionMeta {
 	requestId: string;
 	resolve: (decision: TaskReflectionDecision) => void;
 	resolved: boolean;
+	reflectionStoppedByUser?: boolean;
 	startedAt: number;
 }
 
@@ -89,17 +98,15 @@ function taskReflectionSuggestions(
 	];
 }
 
-function statusReason(
-	status: TaskReflectionStatus,
-	reason?: string,
-	nextSteps?: string,
-): string {
+function statusReason(status: TaskReflectionStatus, reason?: string, nextSteps?: string): string {
 	if (reason?.trim() && nextSteps?.trim())
 		return `${reason.trim()}\n\nNext steps: ${nextSteps.trim()}`;
 	if (reason?.trim()) return reason.trim();
 	switch (status) {
 		case "running":
 			return "Task reflection is checking the protected task change";
+		case "awaiting_user":
+			return "Task reflection stopped; awaiting user decision";
 		case "confirmed":
 			return "Task reflection confirmed the protected task change";
 		case "cancelled":
@@ -150,11 +157,18 @@ async function markTaskReflectionStatus(
 			await db
 				.update(narratorToolCalls)
 				.set({
-					status: status === "confirmed" ? "running" : status === "running" ? "pending" : "fail",
+					status:
+						status === "confirmed"
+							? "running"
+							: status === "running" || status === "awaiting_user"
+								? "pending"
+								: "fail",
 					inputJson: pending.inputJson,
 					permissionDecisionReason: message,
 					permissionSuggestions: taskReflectionSuggestions(pending, status, reason, nextSteps),
-					...(status !== "running" ? { permissionDecidedAt: new Date().toISOString() } : {}),
+					...(status !== "running" && status !== "awaiting_user"
+						? { permissionDecidedAt: new Date().toISOString() }
+						: {}),
 					...(status === "cancelled" || status === "aborted" ? { errorMessage: message } : {}),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
@@ -165,7 +179,9 @@ async function markTaskReflectionStatus(
 
 	try {
 		const { narratorService } = await import("@server/services/narrator-service");
-		const nextStatus = status === "running" ? "waiting" : "working";
+		const nextStatus = status === "running" || status === "awaiting_user" ? "waiting" : "working";
+		// While the AI is reflecting we show a "reflecting" substatus; once we hand
+		// control to the user (awaiting_user) we clear it so the UI shows a plain wait.
 		const substatus = status === "running" ? ["reflecting"] : [];
 		await narratorService.updateStatus(pending.narratorId, nextStatus, { substatus });
 		if (pending.broadcastTargetId !== pending.narratorId) {
@@ -180,6 +196,17 @@ async function markTaskReflectionStatus(
 		if (status === "running") {
 			broadcastToNarrator(pending.broadcastTargetId, {
 				type: "task_reflection_started",
+				narratorId: pending.broadcastTargetId,
+				requestId: pending.requestId,
+				toolUseId: pending.toolUseId,
+				toolName: pending.toolName,
+				inputJson: pending.inputJson,
+				mutations: pending.mutations,
+				reason: message,
+			});
+		} else if (status === "awaiting_user") {
+			broadcastToNarrator(pending.broadcastTargetId, {
+				type: "task_reflection_stopped",
 				narratorId: pending.broadcastTargetId,
 				requestId: pending.requestId,
 				toolUseId: pending.toolUseId,
@@ -229,12 +256,16 @@ export async function markTaskReflectionStarted(requestId: string): Promise<bool
 async function resolveTaskReflection(
 	requestId: string,
 	decision: TaskReflectionDecision,
-	status: Exclude<TaskReflectionStatus, "running" | "aborted">,
-	reason?: string,
-	nextSteps?: string,
+	status: Exclude<TaskReflectionStatus, "running" | "awaiting_user" | "aborted">,
+	reason: string | undefined,
+	nextSteps: string | undefined,
+	decidedBy: TaskReflectionDecidedBy,
 ): Promise<boolean> {
 	const pending = pendingTaskReflections.get(requestId);
 	if (!pending || pending.resolved) return false;
+	// Once the user has taken over, the AI reflection loop must not resolve the
+	// decision — only the user's approve/deny may. (Mirrors danger reflection.)
+	if (decidedBy === "reflection" && pending.reflectionStoppedByUser) return false;
 	pending.resolved = true;
 	await markTaskReflectionStatus(pending, status, reason, nextSteps);
 	pendingTaskReflections.delete(requestId);
@@ -246,10 +277,16 @@ export function cleanupTaskReflection(requestId: string): void {
 	pendingTaskReflections.delete(requestId);
 }
 
+/** Whether a task reflection is still pending (used to route user approve/deny). */
+export function hasPendingTaskReflection(requestId: string): boolean {
+	return pendingTaskReflections.has(requestId);
+}
+
 export async function confirmTaskReflection(
 	requestId: string,
 	evidence: string,
 	reflection?: string,
+	decidedBy: TaskReflectionDecidedBy = "reflection",
 ): Promise<boolean> {
 	const reason = reflection?.trim() || evidence.trim();
 	return resolveTaskReflection(
@@ -257,6 +294,8 @@ export async function confirmTaskReflection(
 		{ action: "confirm", evidence, reflection },
 		"confirmed",
 		reason,
+		undefined,
+		decidedBy,
 	);
 }
 
@@ -264,6 +303,7 @@ export async function reviseTaskReflection(
 	requestId: string,
 	feedback: string,
 	nextSteps?: string,
+	decidedBy: TaskReflectionDecidedBy = "reflection",
 ): Promise<boolean> {
 	return resolveTaskReflection(
 		requestId,
@@ -271,7 +311,26 @@ export async function reviseTaskReflection(
 		"cancelled",
 		feedback,
 		nextSteps,
+		decidedBy,
 	);
+}
+
+/**
+ * User takes over the AI reflection: stop the reflection loop and leave the
+ * decision pending for the user to approve/deny (mirrors danger/plan takeover).
+ */
+export async function takeOverTaskReflection(requestId: string, reason?: string): Promise<boolean> {
+	const pending = pendingTaskReflections.get(requestId);
+	if (!pending || pending.resolved) return false;
+	const message = reason?.trim() || "Task reflection stopped; awaiting user decision";
+	pending.reflectionStoppedByUser = true;
+	pending.abortController?.abort(new Error(message));
+	await markTaskReflectionStatus(pending, "awaiting_user", message);
+	return true;
+}
+
+export function isTaskReflectionWaitingForUser(requestId: string): boolean {
+	return pendingTaskReflections.get(requestId)?.reflectionStoppedByUser === true;
 }
 
 export const taskReflectConfirmTool: ToolDefinition = {

@@ -104,13 +104,19 @@ describe("AnthropicProvider thinking continuation", () => {
 					{
 						type: "reasoning",
 						text: "first",
-						providerMetadata: { anthropic: { blockIndex: 0, signature: "sig-1" } },
+						providerMetadata: {
+							anthropic: { blockIndex: 0, signature: "sig-1" },
+							signatureSource: "anthropic",
+						},
 					},
 					{ type: "text", text: "ok" },
 					{
 						type: "reasoning",
 						text: "second",
-						providerMetadata: { anthropic: { blockIndex: 2, signature: "sig-2" } },
+						providerMetadata: {
+							anthropic: { blockIndex: 2, signature: "sig-2" },
+							signatureSource: "anthropic",
+						},
 					},
 					{ type: "tool_use", id: "toolu_1" },
 				],
@@ -139,6 +145,67 @@ describe("AnthropicProvider thinking continuation", () => {
 			{ type: "text", text: "ok" },
 			{ type: "thinking", thinking: "second", signature: "sig-2" },
 			{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/tmp/a" } },
+		]);
+	});
+
+	it("drops signatures minted by a different upstream but keeps thinking text", async () => {
+		const provider = new AnthropicProvider({
+			id: "test",
+			name: "Test",
+			prefix: "anthropic",
+			apiKey: "test-key",
+			baseUrl: "https://api.anthropic.com/v1",
+			defaultModel: "claude-sonnet-4-5",
+		});
+		const dbMessages: DbMessage[] = [
+			{
+				id: "u1",
+				role: "user",
+				contentJson: [{ type: "text", text: "run" }],
+				contentText: "run",
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			{
+				id: "a1",
+				role: "assistant",
+				contentJson: [
+					// Minted by a NUG channel — must not be replayed to a direct anthropic upstream.
+					{
+						type: "reasoning",
+						text: "foreign",
+						providerMetadata: {
+							anthropic: { blockIndex: 0, signature: "sig-foreign" },
+							signatureSource: "nug:antigravity",
+						},
+					},
+					// Legacy block with no recorded source — also dropped, conservatively.
+					{
+						type: "reasoning",
+						text: "legacy",
+						providerMetadata: { anthropic: { blockIndex: 1, signature: "sig-legacy" } },
+					},
+					{ type: "redacted_thinking", data: "opaque", signatureSource: "nug:antigravity" },
+					{ type: "text", text: "answer" },
+				],
+				contentText: "answer",
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+		];
+
+		const { history } = await provider.buildHistory(dbMessages, "claude-sonnet-4-5");
+		const assistant = (history as Array<{ role: string; content: unknown }>).find(
+			(message) => message.role === "assistant",
+		);
+
+		// Signatures are blanked, the cross-source redacted block is dropped
+		// entirely, and thinking text survives.
+		expect(assistant?.content).toEqual([
+			{ type: "thinking", thinking: "foreign", signature: "" },
+			{ type: "thinking", thinking: "legacy", signature: "" },
+			{ type: "text", text: "answer" },
 		]);
 	});
 

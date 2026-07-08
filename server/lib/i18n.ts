@@ -171,23 +171,6 @@ You are still in relaxed plan mode. This non-read-only tool call was allowed onl
 		en: "Plan mode was cancelled by the user. Do not submit or execute this plan unless the user asks you to plan again.",
 		"zh-CN": "计划模式已被用户取消。除非用户再次要求规划，否则不要提交或执行此计划。",
 	},
-	"tool.todoWriteOutput": {
-		en: "Updated todos: {total} total ({completed} completed, {inProgress} in progress, {pending} pending)",
-		"zh-CN":
-			"已更新待办事项：共 {total} 项（{completed} 已完成，{inProgress} 进行中，{pending} 待处理）",
-	},
-	"tool.todoReminder": {
-		en: `<todo_reminder>
-Current active todos:
-{todos}
-If any todo state changes, call TaskCreate with the complete updated list.
-</todo_reminder>`,
-		"zh-CN": `<todo_reminder>
-当前未完成待办：
-{todos}
-如果待办状态发生变化，请调用 TaskCreate 并传入完整更新后的列表。
-</todo_reminder>`,
-	},
 	"tool.suggestAnswerSystem": {
 		en: "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the full conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences.",
 		"zh-CN":
@@ -564,8 +547,6 @@ export type ToolMessageKey =
 	| "planModeFileRedirected"
 	| "relaxedPlanToolReminder"
 	| "planModeCancelled"
-	| "todoWriteOutput"
-	| "todoReminder"
 	| "suggestAnswerSystem"
 	| "questionReflectionSystem"
 	| "turnNudge"

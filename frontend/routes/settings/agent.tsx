@@ -71,10 +71,16 @@ function SettingsAgentPage() {
 				setDangerReflectionEnabled={is.setDangerReflectionEnabled}
 				dangerSkipReadOnlyConfirmations={is.dangerSkipReadOnlyConfirmations}
 				setDangerSkipReadOnlyConfirmations={is.setDangerSkipReadOnlyConfirmations}
+				autoContinuationMode={is.autoContinuationMode}
+				setAutoContinuationMode={is.setAutoContinuationMode}
 				maxTransientRetries={is.maxTransientRetries}
 				setMaxTransientRetries={is.setMaxTransientRetries}
 				silentToolCallThreshold={is.silentToolCallThreshold}
 				setSilentToolCallThreshold={is.setSilentToolCallThreshold}
+				behaviorFenceInterval={is.behaviorFenceInterval}
+				setBehaviorFenceInterval={is.setBehaviorFenceInterval}
+				behaviorFenceAttachTasks={is.behaviorFenceAttachTasks}
+				setBehaviorFenceAttachTasks={is.setBehaviorFenceAttachTasks}
 				retryBackoffCeilMs={is.retryBackoffCeilMs}
 				setRetryBackoffCeilMs={is.setRetryBackoffCeilMs}
 				firstTokenTimeoutMs={is.firstTokenTimeoutMs}

@@ -1,11 +1,6 @@
 import { resolve } from "node:path";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
-import {
-	buildSpecTasksDocumentFromLegacyTodos,
-	parseSpecTasksDocument,
-	SPEC_TASKS_PATH,
-	serializeSpecTasksDocument,
-} from "../../services/spec-task-service";
+import { SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
@@ -47,19 +42,11 @@ import {
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
 import {
-	cancelGoalCompletionReflection,
-	cleanupGoalCompletionReflection,
-	createGoalCompletionReflectionDecision,
-	GOAL_COMPLETION_REFLECTION_TOOLS,
-	type GoalCompletionReflectionDecision,
-	grantGoalCompletionReflection,
-	markGoalCompletionReflectionStarted,
-} from "./tools/goal-reflection";
-import {
 	cleanupTaskReflection,
 	consumeTaskReflectionGrant,
 	createTaskReflectionDecision,
 	grantTaskReflection,
+	isTaskReflectionWaitingForUser,
 	markTaskReflectionStarted,
 	reviseTaskReflection,
 	TASK_REFLECTION_TOOLS,
@@ -249,8 +236,6 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	WebFetch: { short: ["url", "mode"], large: [] },
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
-	GoalCompleteConfirm: { short: ["confirm"], large: ["evidence", "reflection"] },
-	GoalCompleteRevise: { short: ["confirm"], large: ["feedback", "nextSteps"] },
 	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
 	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
@@ -428,7 +413,9 @@ const PARALLEL_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 ]);
 
-const TODO_REMINDER_TOOL_INTERVAL = 15;
+// Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
+// Named for the legacy todo reminder it replaced; still the spec-reminder interval.
+export const TODO_REMINDER_TOOL_INTERVAL = 15;
 const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
 
 const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
@@ -440,7 +427,6 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Await",
 	"ShareFile",
 	"LearningGuide",
-	"GetGoals",
 	"StartPipeline",
 	"EndPipeline",
 	"AskUserQuestion",
@@ -451,7 +437,6 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 const RELAXED_PLAN_READ_ONLY_SUBAGENTS = new Set(["explore", "plan"]);
 
 function isTaskStateMaintenanceToolUse(tu: AgentToolUse): boolean {
-	if (tu.name === "TaskCreate") return true;
 	if (tu.name !== "Write" && tu.name !== "Edit") return false;
 	const filePath = typeof tu.input.file_path === "string" ? tu.input.file_path : null;
 	if (!filePath || !specVfsService.isSpecUri(filePath)) return false;
@@ -520,8 +505,6 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"ShareFile",
 	"NarraForkAdmin",
 	"ForkNarrator",
-	"UpdateGoal",
-	"TaskCreate",
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
@@ -557,6 +540,23 @@ function reasoningBlockKey(event: {
 	if (anthropicBlockIndex != null) return `anthropic:${anthropicBlockIndex}`;
 
 	return "__default";
+}
+
+/**
+ * Stamp the current upstream identity onto reasoning metadata that carries an
+ * Anthropic thinking signature, so on replay we can tell which server minted it
+ * and avoid echoing a signature to a different server (which fails
+ * verification). Only anthropic-family channels produce signatures; for others
+ * `source` is undefined and we leave the metadata untouched.
+ */
+function stampReasoningSource(
+	metadata: ReasoningProviderMetadata | undefined,
+	source: string | undefined,
+): ReasoningProviderMetadata | undefined {
+	if (!metadata || !source) return metadata;
+	if (!metadata.anthropic?.signature) return metadata;
+	if (metadata.signatureSource === source) return metadata;
+	return { ...metadata, signatureSource: source };
 }
 
 /** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
@@ -801,20 +801,6 @@ export function buildExitPlanReflectionPrompt(
 		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
 	if (!shouldAllowExitPlanReflectionAutoCompact(config)) return basePrompt;
 	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
-}
-
-function buildGoalCompletionReflectionPrompt(
-	requestId: string,
-	input: Record<string, unknown>,
-	activeGoal: unknown,
-	goals: unknown,
-	locale: Locale,
-): string {
-	return getPrompt("goalCompletionReflection", locale)
-		.replaceAll("{requestId}", requestId)
-		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
-		.replaceAll("{activeGoalJson}", JSON.stringify(activeGoal, null, 2))
-		.replaceAll("{goalsJson}", JSON.stringify(goals, null, 2));
 }
 
 function buildTaskReflectionPrompt(
@@ -1106,38 +1092,6 @@ async function runExitPlanModeReflectionLoop(
 	});
 }
 
-async function runGoalCompletionReflectionLoop(
-	parentConfig: AgentConfig,
-	history: unknown[],
-	requestId: string,
-	toolUse: AgentToolUse,
-	input: Record<string, unknown>,
-	activeGoal: unknown,
-	goals: unknown,
-	reflectionAbort: AbortController,
-): Promise<void> {
-	const locale = (parentConfig.locale as Locale) ?? "en";
-	await runReflectionLoop({
-		parentConfig,
-		history,
-		prompt: buildGoalCompletionReflectionPrompt(requestId, input, activeGoal, goals, locale),
-		reflectionLoop: {
-			allowedTools: [...GOAL_COMPLETION_REFLECTION_TOOLS],
-			context: {
-				kind: "goalCompletion",
-				requestId,
-				toolUseId: toolUse.toolUseId,
-				data: {
-					toolName: toolUse.name,
-				},
-			},
-		},
-		abortController: reflectionAbort,
-		maxTurns: 1,
-		label: "Goal-completion reflection loop",
-	});
-}
-
 async function runTaskReflectionLoop(
 	parentConfig: AgentConfig,
 	history: unknown[],
@@ -1279,11 +1233,6 @@ interface ExitPlanReflectionGateResult {
 	input: Record<string, unknown>;
 }
 
-interface GoalCompletionReflectionGateResult {
-	decision: GoalCompletionReflectionDecision;
-	input: Record<string, unknown>;
-}
-
 async function resolveExitPlanModeReflection(
 	config: AgentConfig,
 	history: unknown[],
@@ -1363,87 +1312,6 @@ async function resolveExitPlanModeReflection(
 	return { decision, input: resolvedInput.input };
 }
 
-async function resolveGoalCompletionReflection(
-	config: AgentConfig,
-	history: unknown[],
-	toolUse: AgentToolUse,
-): Promise<GoalCompletionReflectionGateResult> {
-	const { narratorGoalService } = await import("@server/services/narrator-goal-service");
-	const goals = await narratorGoalService.listGoals(config.narratorId);
-	const activeGoal = goals.find((goal) => goal.status === "active") ?? null;
-	if (!activeGoal) {
-		return {
-			decision: {
-				action: "revise",
-				feedback: "No active goal exists to complete.",
-				nextSteps: "Add or resume an active goal before trying to mark a goal complete.",
-			},
-			input: toolUse.input,
-		};
-	}
-
-	const requestId = `goal_complete_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-	const reflectionAbort = new AbortController();
-	const decisionPromise = createGoalCompletionReflectionDecision(requestId, {
-		narratorId: config.narratorId,
-		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
-		toolUseId: toolUse.toolUseId,
-		toolName: toolUse.name,
-		inputJson: toolUse.input,
-		activeGoal,
-	});
-	await markGoalCompletionReflectionStarted(requestId);
-	let reflectionDone = false;
-	const reflectionPromise = runGoalCompletionReflectionLoop(
-		config,
-		history,
-		requestId,
-		toolUse,
-		toolUse.input,
-		activeGoal,
-		goals,
-		reflectionAbort,
-	)
-		.catch((err) => {
-			logger.warn("Goal-completion reflection loop ended unexpectedly", { err: String(err) });
-		})
-		.finally(() => {
-			reflectionDone = true;
-		});
-	const decision = await Promise.race([
-		decisionPromise.finally(() => reflectionAbort.abort()),
-		reflectionPromise.then(async () => {
-			const fallbackMessage =
-				"Goal-completion reflection loop did not call GoalCompleteConfirm or GoalCompleteRevise in its single allowed response";
-			const cancelled = await cancelGoalCompletionReflection(
-				requestId,
-				fallbackMessage,
-				"Review the active goal, gather concrete completion evidence, and try UpdateGoal again only after every requirement is verified.",
-			);
-			if (cancelled) return decisionPromise;
-
-			const alreadySettled = await Promise.race<GoalCompletionReflectionDecision | null>([
-				decisionPromise,
-				Promise.resolve(null),
-			]);
-			const fallbackDecision: GoalCompletionReflectionDecision = {
-				action: "revise",
-				feedback: fallbackMessage,
-				nextSteps:
-					"Review the active goal, gather concrete completion evidence, and try UpdateGoal again only after every requirement is verified.",
-			};
-			return alreadySettled ?? fallbackDecision;
-		}),
-	]);
-	if (!reflectionDone) {
-		reflectionPromise.catch((err) => {
-			logger.warn("Goal-completion reflection loop cleanup failed", { err: String(err) });
-		});
-	}
-	cleanupGoalCompletionReflection(requestId);
-	return { decision, input: toolUse.input };
-}
-
 function resolvePlanReflectionAutoApprove(
 	config: Pick<AgentConfig, "planReflectionAutoApprove" | "planReflectionAutoApproveOverride">,
 ): boolean {
@@ -1472,12 +1340,6 @@ export function shouldRunExitPlanModeReflection(
 	);
 }
 
-export function shouldRunGoalCompletionReflection(
-	config: Pick<AgentConfig, "reflectionLoop">,
-): boolean {
-	return !config.reflectionLoop;
-}
-
 export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
 	return !config.reflectionLoop;
 }
@@ -1491,22 +1353,6 @@ async function buildSpecTasksCandidateContent(
 	toolUse: AgentToolUse,
 ): Promise<string | null> {
 	const input = toolUse.input as Record<string, unknown>;
-	if (toolUse.name === "TaskCreate") {
-		const todos = Array.isArray(input.todos) ? input.todos : null;
-		if (!todos) return null;
-		try {
-			const current = await specVfsService.readTasksFileForNarrator(narratorId);
-			const currentDocument = parseSpecTasksDocument(current.content);
-			const nextDocument = buildSpecTasksDocumentFromLegacyTodos(todos, currentDocument);
-			return serializeSpecTasksDocument(nextDocument);
-		} catch (err) {
-			logger.debug("Skipping taskReflection preflight for TaskCreate candidate", {
-				toolUseId: toolUse.toolUseId,
-				error: err instanceof Error ? err.message : String(err),
-			});
-			return null;
-		}
-	}
 	const filePath = typeof input.file_path === "string" ? input.file_path : null;
 	if (!filePath || !specVfsService.isSpecUri(filePath)) return null;
 	let specPath: string;
@@ -1562,30 +1408,6 @@ function buildExitPlanReflectionDeniedToolResult(
 	};
 }
 
-function buildGoalCompletionReflectionDeniedToolResult(
-	decision: GoalCompletionReflectionDecision,
-	locale: Locale,
-): ToolExecResult {
-	const feedback =
-		decision.action === "revise" && decision.feedback.trim()
-			? decision.feedback.trim()
-			: "Goal-completion reflection found that the active goal is not proven complete.";
-	const nextSteps =
-		decision.action === "revise" && decision.nextSteps?.trim()
-			? decision.nextSteps.trim()
-			: "Continue working, gather concrete verification evidence, and try UpdateGoal again only after every material requirement is satisfied.";
-	const output =
-		locale === "zh-CN"
-			? `目标完成反思认为当前目标还不能标记为完成。\n\n反馈：${feedback}\n\n下一步：${nextSteps}`
-			: `Goal-completion reflection decided the active goal is not ready to mark complete.\n\nFeedback: ${feedback}\n\nNext steps: ${nextSteps}`;
-	return {
-		output,
-		isError: true,
-		durationMs: 0,
-		completedAt: Date.now(),
-	};
-}
-
 function buildTaskReflectionDeniedToolResult(
 	decision: TaskReflectionDecision,
 	locale: Locale,
@@ -1603,6 +1425,28 @@ function buildTaskReflectionDeniedToolResult(
 			? `任务反思认为 protected task 不能这样修改。\n\n反馈：${feedback}\n\n下一步：${nextSteps}`
 			: `Task reflection decided the protected task change should not proceed.\n\nFeedback: ${feedback}\n\nNext steps: ${nextSteps}`;
 	return { output, isError: true, durationMs: 0, completedAt: Date.now() };
+}
+
+/**
+ * Append the task-reflection confirmation (evidence + optional reflection) to a
+ * successful tool output so the main model sees why the protected change was allowed.
+ */
+function appendTaskReflectionConfirmation(
+	output: string,
+	decision: TaskReflectionDecision,
+	locale: Locale,
+): string {
+	if (decision.action !== "confirm") return output;
+	const evidence = decision.evidence.trim();
+	const reflection = decision.reflection?.trim();
+	const lines =
+		locale === "zh-CN"
+			? [`[taskReflection] 已确认此 protected task 变更。`, `证据：${evidence}`]
+			: [`[taskReflection] Confirmed this protected task change.`, `Evidence: ${evidence}`];
+	if (reflection) {
+		lines.push(locale === "zh-CN" ? `说明：${reflection}` : `Reflection: ${reflection}`);
+	}
+	return `${output}\n\n${lines.join("\n")}`;
 }
 
 async function resolveTaskReflection(
@@ -1629,6 +1473,7 @@ async function resolveTaskReflection(
 		toolName: toolUse.name,
 		inputJson: input,
 		mutations: analysis.protectedMutations,
+		abortController: reflectionAbort,
 	});
 	await markTaskReflectionStarted(requestId);
 	let reflectionDone = false;
@@ -1650,6 +1495,10 @@ async function resolveTaskReflection(
 	const decision = await Promise.race([
 		decisionPromise.finally(() => reflectionAbort.abort()),
 		reflectionPromise.then(async () => {
+			// The user took over: hand the decision to their approve/deny instead of
+			// letting the AI reflection fall back (mirrors danger/plan takeover).
+			if (isTaskReflectionWaitingForUser(requestId)) return decisionPromise;
+
 			const fallbackMessage =
 				"taskReflection loop did not call TaskReflectConfirm or TaskReflectRevise in its single allowed response.";
 			const fallbackNextSteps =
@@ -1720,19 +1569,7 @@ async function executeToolAfterReflections(
 		}
 		return result;
 	}
-	if (tu.name === "UpdateGoal" && shouldRunGoalCompletionReflection(config)) {
-		const reflected = await resolveGoalCompletionReflection(config, history, tu);
-		tu.input = reflected.input;
-		if (reflected.decision.action !== "confirm") {
-			return buildGoalCompletionReflectionDeniedToolResult(reflected.decision, locale);
-		}
-		grantGoalCompletionReflection(config.narratorId, tu.toolUseId);
-		return executeTool(tu, config, { preGrantedPermission: { behavior: "allow" } });
-	}
-	if (
-		(tu.name === "Write" || tu.name === "Edit" || tu.name === "TaskCreate") &&
-		shouldRunTaskReflection(config)
-	) {
+	if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 		const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
 		if (candidateContent != null) {
 			try {
@@ -1902,7 +1739,7 @@ export async function* agentLoop(
 			}
 		}
 
-		if (result.broken || result.fatal || tu.name === "TaskCreate") {
+		if (result.broken || result.fatal) {
 			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
@@ -1962,7 +1799,10 @@ export async function* agentLoop(
 			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		sideCarCheckedToolUseIds.add(tu.toolUseId);
-		if (completedToolCount % TODO_REMINDER_TOOL_INTERVAL !== 0) {
+		const extraInterval = config.sideCarToolResultInterval ?? 0;
+		const hitBuiltinCadence = completedToolCount % TODO_REMINDER_TOOL_INTERVAL === 0;
+		const hitExtraCadence = extraInterval > 0 && completedToolCount % extraInterval === 0;
+		if (!hitBuiltinCadence && !hitExtraCadence) {
 			return cacheToolResultSideCars(tu.toolUseId, sideCars);
 		}
 		try {
@@ -2943,6 +2783,10 @@ export async function* agentLoop(
 					if (parsed.reasoning) {
 						const itemKey = reasoningBlockKey(parsed);
 						const existing = reasoningBlockMap.get(itemKey);
+						const stampedMetadata = stampReasoningSource(
+							parsed.reasoningMetadata,
+							provider.getActiveReasoningSource?.(),
+						);
 						// Separator prefix for multiple delimited reasoning segments that share a provider item.
 						let prefix = "";
 						if (existing) {
@@ -2951,8 +2795,8 @@ export async function* agentLoop(
 								existing._needsSeparator = false;
 							}
 							existing.text += prefix + parsed.reasoning;
-							if (parsed.reasoningMetadata) {
-								existing.providerMetadata = parsed.reasoningMetadata;
+							if (stampedMetadata) {
+								existing.providerMetadata = stampedMetadata;
 							}
 							if (parsed.reasoningOutputIndex != null) {
 								existing.outputIndex = parsed.reasoningOutputIndex;
@@ -2960,14 +2804,14 @@ export async function* agentLoop(
 						} else {
 							reasoningBlockMap.set(itemKey, {
 								text: parsed.reasoning,
-								providerMetadata: parsed.reasoningMetadata,
+								providerMetadata: stampedMetadata,
 								outputIndex: parsed.reasoningOutputIndex,
 							});
 						}
 						yield {
 							type: "stream_reasoning",
 							text: prefix + parsed.reasoning,
-							providerMetadata: parsed.reasoningMetadata,
+							providerMetadata: stampedMetadata,
 							outputIndex: parsed.reasoningOutputIndex,
 						};
 					} else if (parsed.reasoningMetadata) {
@@ -2977,8 +2821,12 @@ export async function* agentLoop(
 						// Mark the entry so the next reasoning delta inserts a separator.
 						const itemKey = reasoningBlockKey(parsed);
 						const existing = reasoningBlockMap.get(itemKey);
+						const stampedMetadata = stampReasoningSource(
+							parsed.reasoningMetadata,
+							provider.getActiveReasoningSource?.(),
+						);
 						if (existing) {
-							existing.providerMetadata = parsed.reasoningMetadata;
+							existing.providerMetadata = stampedMetadata;
 							if (parsed.reasoningOutputIndex != null) {
 								existing.outputIndex = parsed.reasoningOutputIndex;
 							}
@@ -2991,7 +2839,7 @@ export async function* agentLoop(
 							// Metadata arrived before any text — create an empty-text entry
 							reasoningBlockMap.set(itemKey, {
 								text: "",
-								providerMetadata: parsed.reasoningMetadata,
+								providerMetadata: stampedMetadata,
 								outputIndex: parsed.reasoningOutputIndex,
 							});
 						}
@@ -3017,6 +2865,7 @@ export async function* agentLoop(
 					}
 
 					if (parsed.redactedThinking) {
+						const redactedSource = provider.getActiveReasoningSource?.();
 						redactedThinkingBlocks.push({
 							data: parsed.redactedThinking.data,
 							outputIndex: parsed.redactedThinking.outputIndex,
@@ -3027,6 +2876,7 @@ export async function* agentLoop(
 								type: "redacted_thinking",
 								data: parsed.redactedThinking.data,
 								outputIndex: parsed.redactedThinking.outputIndex,
+								...(redactedSource ? { signatureSource: redactedSource } : {}),
 							},
 						};
 					}

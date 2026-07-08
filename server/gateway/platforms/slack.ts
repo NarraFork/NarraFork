@@ -6,6 +6,7 @@
  */
 
 import { logger } from "../../lib/logger";
+import { createProxyAgent, getOutboundProxy } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, SendResult, SlackConfig } from "../types";
 
@@ -51,10 +52,23 @@ export class SlackAdapter extends BaseAdapter {
 		try {
 			const { App } = await import("@slack/bolt");
 
+			// Route Slack web-api (REST) traffic through the global outbound proxy
+			// when configured. NOTE: the `agent` reliably applies to REST calls
+			// (chat.postMessage etc.); Socket Mode's event WebSocket does NOT honour
+			// it — see the warning below.
+			const proxy = getOutboundProxy();
+			const agent = await createProxyAgent(proxy);
+			if (proxy) {
+				logger.warn(
+					"[slack] Outbound proxy applies to REST (web-api) only; Socket Mode's event WebSocket is not proxied. In a locked-down network the bot may send but not receive events.",
+				);
+			}
 			this.app = new App({
 				token: this.config.botToken,
 				appToken: this.config.appToken,
 				socketMode: true,
+				// biome-ignore lint/suspicious/noExplicitAny: proxy agents are real http.Agent subclasses at runtime
+				...(agent ? { agent: agent as any } : {}),
 			}) as unknown as SlackAppLike;
 
 			// Listen for messages

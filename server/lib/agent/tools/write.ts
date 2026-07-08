@@ -5,6 +5,7 @@ import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import type { ToolDefinition, ToolResult } from "../types";
+import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
 import { readFileText, writeFileText } from "./encoding";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
@@ -48,9 +49,13 @@ export const writeTool: ToolDefinition = {
 					ctx.narratorId,
 					ctx.currentToolUseId,
 				);
+				const allowFenceMutation = isBehaviorFencePath(file_path)
+					? consumeBehaviorFenceEditGrant(ctx.narratorId)
+					: false;
 				const file = await specVfsService.writeSpecFile(ctx.narratorId, file_path, content, {
 					sourceToolUseId: ctx.currentToolUseId ?? null,
 					allowProtectedTaskMutation: taskReflectionGranted,
+					allowFenceMutation,
 				});
 				broadcastSpecChanged(ctx.narratorId, file, "tool");
 				return { output: `Wrote ${content.length} bytes to ${file.uri}`, title: file.uri };

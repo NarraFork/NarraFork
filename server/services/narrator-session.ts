@@ -13,16 +13,28 @@ import {
 	narratorToolCalls,
 	projects,
 } from "../db/schema";
-import { buildHistory, type ReasoningEffort, resolveProviderAndModel } from "../lib/agent";
+import {
+	buildHistory,
+	type ReasoningEffort,
+	resolveProviderAndModel,
+	TODO_REMINDER_TOOL_INTERVAL,
+} from "../lib/agent";
 import { clearPipelineStateIfActive } from "../lib/agent/pipeline-state";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
+import {
+	clearBehaviorFenceEditGrant,
+	grantBehaviorFenceEdit,
+} from "../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS, REVIEW_TOOLS } from "../lib/agent/tools/index";
 import { AsyncMutex } from "../lib/async-mutex";
 import {
 	type BooleanOverride,
 	type DangerReflectionOverride,
+	normalizeAutoContinuationMode,
 	normalizeBooleanOverride,
 	normalizeDangerReflectionOverride,
+	resolveAutoContinuationMode,
+	resolveBooleanOverride,
 } from "../lib/boolean-override";
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
@@ -111,7 +123,8 @@ import {
 	type ParentInboundMessage,
 } from "./parent-inbound-queue";
 import { reviewService } from "./review-service";
-import { buildSpecToolResultReminder } from "./spec-reminder";
+import { broadcastSpecChanged } from "./spec-broadcast";
+import { buildBehaviorFenceReminder, buildSpecToolResultReminder } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator, formatSpecUpdateSideCars } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
@@ -138,7 +151,6 @@ import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
 
-import { type NarratorGoalDTO, narratorGoalService } from "./narrator-goal-service";
 import type {
 	ActiveNarrator,
 	BufferCreator,
@@ -192,14 +204,28 @@ import {
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
-const MAX_GOAL_CONTINUATION_NO_TOOL_TURNS = 3;
-const goalContinuationStartLock = new AsyncMutex();
+const MAX_CONTINUATION_NO_TOOL_TURNS = 3;
 
 function parseQueuedNewCommand(message: string, commandText?: string | null) {
 	const raw = commandText?.trim().startsWith("/new") ? commandText.trim() : message.trim();
 	const match = raw.match(/^\/new(?:\s+([\s\S]*))?$/);
 	if (!match) return null;
 	return { rawCommand: raw, initialMessage: match[1]?.trim() ?? "" };
+}
+
+/**
+ * Recognize a buffered `/goal <objective>` command. When the narrator was busy,
+ * the route queues the raw command instead of appending the protected task
+ * immediately; on consumption we parse it here and run executeQueuedGoalCommand.
+ * Returns null (fall through to a normal model turn) when there is no objective.
+ */
+export function parseQueuedGoalCommand(message: string, commandText?: string | null) {
+	const raw = commandText?.trim().startsWith("/goal") ? commandText.trim() : message.trim();
+	const match = raw.match(/^\/goal(?:\s+([\s\S]*))?$/);
+	if (!match) return null;
+	const objective = match[1]?.trim() ?? "";
+	if (!objective) return null;
+	return { rawCommand: raw, objective };
 }
 
 function normalizeOptionalBooleanOverride(value: unknown): BooleanOverride | undefined {
@@ -249,6 +275,121 @@ async function executeQueuedNewCommand(
 	}
 
 	return newNarrator.id;
+}
+
+/**
+ * Execute a buffered `/goal` command: persist it as the canonical user message
+ * (so it stays visible in the conversation) and append the protected task to
+ * spec://tasks.json. Runs when a queued /goal is consumed after the turn that
+ * was busy at submit time. Does not start a model turn.
+ */
+async function executeQueuedGoalCommand(
+	narratorId: string,
+	buffered: BufferedMessage,
+	objective: string,
+): Promise<void> {
+	const rawCommand = buffered.commandText?.trim() || buffered.text;
+	const userMsg = await narratorService.persistUserMessage(
+		narratorId,
+		rawCommand,
+		[{ type: "text", text: rawCommand }],
+		rawCommand,
+		buffered.createdBy,
+	);
+	broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+	const { added, written } = await specVfsService.appendProtectedSpecTask(narratorId, objective);
+	if (added) {
+		broadcastSpecChanged(
+			narratorId,
+			{ uri: written.uri, path: written.path, revisionId: written.revisionId },
+			"ui",
+			"user",
+		);
+	}
+}
+
+/**
+ * Consume the next buffered message after an interrupted loop and dispatch it.
+ * `/new` and `/goal` are terminal (no model turn), so after handling them we
+ * recurse to keep draining any messages queued behind them — otherwise a plain
+ * message queued after a `/goal` would sit in the buffer until the user sends
+ * again. A normal message goes through feedMessage, whose own loop drains the
+ * rest at its next safe boundary. Returns after scheduling the first message.
+ */
+function resumeNextBufferedMessage(active: ActiveNarrator, locale: Locale): void {
+	const narratorId = active.narratorId;
+	if ((bufferedMessages.get(narratorId)?.length ?? 0) === 0) return;
+	const queue = bufferedMessages.get(narratorId);
+	const first = queue?.shift();
+	if (!queue || !first) return;
+	if (queue.length === 0) bufferedMessages.delete(narratorId);
+	dbConsumeBuffered(first.id);
+	broadcastToNarrator(narratorId, {
+		type: "buffer_consumed",
+		narratorId,
+		messageId: first.id,
+		remaining: toBufferSummary(getBufferedMessages(narratorId)),
+	});
+
+	const settleAfterTerminalCommand = async () => {
+		// More queued behind this terminal command → keep draining; else settle idle.
+		if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) {
+			resumeNextBufferedMessage(active, locale);
+			return;
+		}
+		await narratorService
+			.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", { substatus: ["unread"] })
+			.catch(() => {});
+	};
+	const handleTerminalCommandError = async (label: string, err: unknown) => {
+		logger.error(`Queued ${label} execution after interrupt failed`, {
+			narratorId,
+			error: String(err),
+		});
+		await narratorService
+			.updateStatus(narratorId, "idle", { substatus: ["error"], errorMessage: String(err) })
+			.catch(() => {});
+		broadcastToNarrator(narratorId, { type: "narrator_error", narratorId, error: String(err) });
+	};
+
+	const newCommand = parseQueuedNewCommand(first.text, first.commandText);
+	const goalCommand = parseQueuedGoalCommand(first.text, first.commandText);
+	if (newCommand) {
+		executeQueuedNewCommand(active, first, newCommand.initialMessage)
+			.then(async (newNarratorId) => {
+				broadcastToNarrator(narratorId, {
+					type: "queued_new_narrator_created",
+					narratorId,
+					messageId: first.id,
+					newNarratorId,
+				});
+				await settleAfterTerminalCommand();
+			})
+			.catch((err) => handleTerminalCommandError("/new", err));
+	} else if (goalCommand) {
+		// Queued /goal: append the protected task now (no model turn), then drain/settle.
+		executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
+			.then(() => settleAfterTerminalCommand())
+			.catch((err) => handleTerminalCommandError("/goal", err));
+	} else {
+		feedMessage(
+			narratorId,
+			first.text,
+			first.images,
+			locale,
+			active._replyInUserLanguage ?? false,
+			first.commandText,
+			first.createdBy,
+			first.textFiles,
+			first.bashCommand,
+		)
+			.then(({ userMsg, userBroadcasted }) => {
+				if (!userBroadcasted) {
+					broadcastToNarrator(narratorId, { type: "user_message", narratorId, message: userMsg });
+				}
+			})
+			.catch((err) => handleTerminalCommandError("auto-resume message", err));
+	}
 }
 
 const backgroundCompletionStartLock = new AsyncMutex();
@@ -648,24 +789,14 @@ async function finalizeInterruptedRun(
 
 // === Agent loop execution ===
 
+/** Sum non-cached input + output tokens from a usage snapshot (for round token totals). */
 function tokenUsageValue(usage?: TokenUsageSnapshot): number {
-	return narratorGoalService.goalTokenDeltaForUsage(usage);
-}
-
-function formatGoalNoticeList(goals: NarratorGoalDTO[]): string {
-	if (goals.length === 0) return "(empty)";
-	return goals.map((goal, index) => `${index + 1}. [${goal.status}] ${goal.objective}`).join("\n");
-}
-
-export function notifyRunningNarratorGoalStateChanged(
-	narratorId: string,
-	action: string,
-	goals: NarratorGoalDTO[],
-): boolean {
-	const active = activeNarrators.get(narratorId);
-	if (!active?.alive || !active._loopRunning) return false;
-	active._pendingGoalStateNotice = `[System] The NarraFork goal list was changed externally while this turn was already running (action: ${action}). Treat the list below as the current source of truth. Do not call AddGoal for an objective that is already listed; continue according to the active goal and the latest user intent.\n\nCurrent goal list:\n${formatGoalNoticeList(goals)}`;
-	return true;
+	if (!usage) return 0;
+	const nonCachedInput = Math.max(0, (usage.inputTokens ?? 0) - (usage.cachedInputTokens ?? 0));
+	if (usage.inputTokens != null || usage.completionTokens != null) {
+		return nonCachedInput + Math.max(0, usage.completionTokens ?? 0);
+	}
+	return Math.max(0, usage.promptTokens ?? 0) + Math.max(0, usage.completionTokens ?? 0);
 }
 
 async function ensureSkillCacheFreshForActiveNarrator(active: ActiveNarrator): Promise<void> {
@@ -707,21 +838,16 @@ export async function updateActiveNarratorCwdAndSkillContext(
 }
 
 /**
- * Charge the active goal for the most recent pass's token/time usage and return
- * the token delta that was charged (non-cached input + output). Callers can sum
- * the returned value across passes to obtain a round-level token total.
+ * Compute the most recent pass's token delta (non-cached input + output) and
+ * reset the per-pass baseline. Callers sum the returned value across passes to
+ * obtain a round-level token total for the Stop hook.
  */
-async function accountGoalUsageForTurn(active: ActiveNarrator): Promise<number> {
-	const startedAt = active._goalTurnStartedAtMs;
-	if (!startedAt) return 0;
-	const secondsDelta = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+function accountTokenUsageForTurn(active: ActiveNarrator): number {
 	const tokenDelta = Math.max(
 		0,
-		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._goalTokenUsageBaseline),
+		tokenUsageValue(active._lastTokenUsage) - tokenUsageValue(active._tokenUsageBaseline),
 	);
-	await narratorGoalService.accountActiveGoalUsage(active.narratorId, tokenDelta, secondsDelta);
-	active._goalTurnStartedAtMs = Date.now();
-	active._goalTokenUsageBaseline = active._lastTokenUsage;
+	active._tokenUsageBaseline = active._lastTokenUsage;
 	return tokenDelta;
 }
 
@@ -752,12 +878,24 @@ async function loadCompiledSpecForContinuation(narratorId: string) {
 
 async function maybeStartSpecContinuation(
 	active: ActiveNarrator,
-	freshNarrator: { permissionMode?: string | null; traits?: unknown },
+	freshNarrator: {
+		permissionMode?: string | null;
+		traits?: unknown;
+		autoContinuationOverride?: string | null;
+	},
 	loopHadError: boolean,
 ): Promise<string | null> {
-	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._goalContinuationSuppressed) {
+	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._continuationSuppressed) {
 		return null;
 	}
+	// Resolve the effective auto-continuation mode (narrator override → global default)
+	const globalMode = normalizeAutoContinuationMode(settings.agent.autoContinuationMode);
+	const effectiveMode = resolveAutoContinuationMode(
+		freshNarrator.autoContinuationOverride,
+		globalMode,
+	);
+	if (effectiveMode === "off") return null;
+
 	let compiled: ReturnType<typeof compileSpecTasks>;
 	try {
 		compiled = await loadCompiledSpecForContinuation(active.narratorId);
@@ -768,14 +906,22 @@ async function maybeStartSpecContinuation(
 		});
 		return null;
 	}
+
+	// "protectedOnly": only continue if there are protected tasks still open
+	if (effectiveMode === "protectedOnly" && compiled.protectedOpenCount === 0) {
+		return null;
+	}
+
 	const current = compiled.currentTask;
 	if (!current) {
+		// Only blocked tasks remain
+		if (effectiveMode === "blockStop") return null;
 		const blocked = compiled.tasks.find((task) => task.status === "blocked");
 		if (!blocked) return null;
 		const prompt =
 			active.locale === "zh-CN"
-				? `Living Work Spec 阻塞提醒：当前有 blocked 任务仍处于活跃状态，不能视为完成。\n\n阻塞任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n请说明阻塞原因；如果需要用户决策或补充信息，请使用 AskUserQuestion 请求指导。收到指导后，再更新 spec://tasks.json。`
-				: `Living Work Spec blocked reminder: a blocked task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\nExplain the blocker. If user guidance or missing information is needed, use AskUserQuestion to request guidance. After guidance arrives, update spec://tasks.json.`;
+				? `Dynamic Spec 阻塞提醒：当前有 blocked 任务仍处于活跃状态，不能视为完成。\n\n阻塞任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n请说明阻塞原因；如果需要用户决策或补充信息，请使用 AskUserQuestion 请求指导。收到指导后，再更新 spec://tasks.json。`
+				: `Dynamic Spec blocked reminder: a blocked task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\nExplain the blocker. If user guidance or missing information is needed, use AskUserQuestion to request guidance. After guidance arrives, update spec://tasks.json.`;
 		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 			{
 				type: "spec_blocked_continuation",
@@ -797,7 +943,7 @@ async function maybeStartSpecContinuation(
 				children: [],
 			},
 		});
-		active._goalContinuationTurn = true;
+		active._continuationTurn = true;
 		return prompt;
 	}
 	const protectedNote = current.protected
@@ -805,8 +951,8 @@ async function maybeStartSpecContinuation(
 		: "";
 	const prompt =
 		active.locale === "zh-CN"
-			? `Living Work Spec 自动续跑：继续当前 doing 任务。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请继续执行这个任务。完成或受阻时，更新 spec://tasks.json；如果没有 doing 任务但还有 todo，系统会自动切换到下一个 todo。不要要求用户再次确认是否继续。${current.protected ? "\n该任务是 protected task。只有在有具体验收证据时才能标记 done；完成 protected task 会触发 taskReflection。" : ""}`
-			: `Living Work Spec auto-continuation: continue the current doing task.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nContinue working on this task. When it is done or blocked, update spec://tasks.json. If there is no doing task but todo tasks remain, the system will automatically switch to the next todo. Do not ask the user whether to continue.${protectedNote}`;
+			? `Dynamic Spec 自动续跑：继续当前 doing 任务。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请继续执行这个任务。完成或受阻时，更新 spec://tasks.json；如果没有 doing 任务但还有 todo，系统会自动切换到下一个 todo。不要要求用户再次确认是否继续。${current.protected ? "\n该任务是 protected task。只有在有具体验收证据时才能标记 done；完成 protected task 会触发 taskReflection。" : ""}`
+			: `Dynamic Spec auto-continuation: continue the current doing task.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nContinue working on this task. When it is done or blocked, update spec://tasks.json. If there is no doing task but todo tasks remain, the system will automatically switch to the next todo. Do not ask the user whether to continue.${protectedNote}`;
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 		{ type: "spec_continuation", task: current.text, protected: current.protected === true },
 	]);
@@ -824,49 +970,24 @@ async function maybeStartSpecContinuation(
 			children: [],
 		},
 	});
-	active._goalContinuationTurn = true;
+	active._continuationTurn = true;
 	return prompt;
 }
 
-async function maybeStartGoalContinuation(
+/**
+ * Start an auto-continuation turn if the Dynamic Spec has an active/blocked
+ * task that warrants continuing. Returns the injected prompt, or null when there
+ * is nothing to continue.
+ */
+async function maybeStartContinuation(
 	active: ActiveNarrator,
 	freshNarrator: { permissionMode?: string | null; traits?: unknown },
 	loopHadError: boolean,
 ): Promise<string | null> {
-	const specPrompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError);
-	if (specPrompt) return specPrompt;
-	if (loopHadError || isPlanModeTrait(freshNarrator.traits) || active._goalContinuationSuppressed) {
-		return null;
-	}
-	const goals = await narratorGoalService.listGoals(active.narratorId);
-	const activeGoal = goals.find((goal) => goal.status === "active");
-	if (!activeGoal) return null;
-	const prompt = narratorGoalService.buildGoalContinuationPrompt(activeGoal, goals, {
-		noToolContinuationCount: active._goalContinuationNoToolCount ?? 0,
-	});
-	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
-		{ type: "goal_continuation", goalId: activeGoal.id, objective: activeGoal.objective },
-	]);
-	broadcastToNarrator(active.narratorId, {
-		type: "message",
-		narratorId: active.narratorId,
-		message: {
-			id: msg.id,
-			narratorId: active.narratorId,
-			role: msg.role,
-			contentJson: msg.contentJson,
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			seq: msg.seq,
-			children: [],
-		},
-	});
-	broadcastToNarrator(active.narratorId, {
-		type: "goal_continuation",
-		narratorId: active.narratorId,
-		goal: activeGoal,
-	});
-	active._goalContinuationTurn = true;
+	const prompt = await maybeStartSpecContinuation(active, freshNarrator, loopHadError);
+	// A continuation turn is not the user's turn — never let it write the behavior fence,
+	// even if the preceding user turn ran zero tools and left the grant open.
+	if (prompt) clearBehaviorFenceEditGrant(active.narratorId);
 	return prompt;
 }
 
@@ -1356,6 +1477,17 @@ export async function runAgentLoop(
 			const resolved = resolveProviderAndModel(active.model, active.provider);
 			active.provider = resolved.provider;
 
+			// Resolve behavior-fence injection settings for this turn (narrator override → global default).
+			const fenceIntervalOverride = freshNarrator.behaviorFenceIntervalOverride;
+			active._fenceInterval =
+				fenceIntervalOverride == null
+					? settings.agent.behaviorFenceInterval
+					: fenceIntervalOverride;
+			active._fenceAttach = resolveBooleanOverride(
+				freshNarrator.behaviorFenceAttachOverride,
+				settings.agent.behaviorFenceAttachTasks,
+			);
+
 			// Apply dynamic pruning — strip tool calls from messages at or before the
 			// persisted boundary so the context stays within budget. When compactStart
 			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
@@ -1501,21 +1633,8 @@ export async function runAgentLoop(
 					);
 					return { titleUpdate };
 				},
-				onTodoWrite: async (todos, toolUseId) => {
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					await narratorService.updateTodos(narratorId, todos as any[], toolUseId);
-					broadcastToNarrator(narratorId, {
-						type: "todos_updated",
-						narratorId,
-						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-						todos: todos as any[],
-						toolUseId,
-					});
-				},
 				onEnterPlanMode: async () => {
-					const planState = await enterNarratorPlanMode(narratorId, {
-						autoRelaxedPlanForActiveGoal: true,
-					});
+					const planState = await enterNarratorPlanMode(narratorId);
 					active._planFileId = planState.planFileId;
 					active._previousPermissionMode = planState.previousPermissionMode;
 					if (!planState.wasPlanMode) {
@@ -1860,34 +1979,52 @@ export async function runAgentLoop(
 					),
 				onBeforeTurn: ctxMgmt.onBeforeTurn,
 				sideCarInitialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
+				sideCarToolResultInterval:
+					active._fenceInterval && active._fenceInterval > 0 ? active._fenceInterval : 0,
 				onSideCarCompletedToolCount: (count) => {
 					active._todoReminderCompletedToolCount = count;
+					// The behavior-fence edit window only covers the first tool call of a user
+					// turn. Once any tool completes (counter advances past its initial value),
+					// close the window so later tool calls in the same turn cannot write the fence.
+					clearBehaviorFenceEditGrant(narratorId);
 				},
 				getSideCars: async (request) => {
 					if (request.phase === "tool_result") {
-						const reminder = await buildSpecToolResultReminder(narratorId, locale);
-						if (!reminder) return [];
-						return [
-							{
-								target: "tool_result" as const,
+						const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
+						const count = request.completedToolCount ?? 0;
+						const atTasksCadence = count % TODO_REMINDER_TOOL_INTERVAL === 0;
+						const fenceInterval = active._fenceInterval ?? -1;
+						const atFenceCadence = fenceInterval > 0 && count % fenceInterval === 0;
+						const tasksReminder = atTasksCadence
+							? await buildSpecToolResultReminder(narratorId, locale)
+							: null;
+						if (tasksReminder) {
+							sideCars.push({
+								target: "tool_result",
 								source: "living_work_spec",
-								content: reminder,
+								content: tasksReminder,
 								toolUseId: request.toolUseId,
-							},
-						];
+							});
+						}
+						// Inject the behavior fence when its own cadence hits, or when it is
+						// attached to a tasks reminder that is being injected this cycle.
+						const wantFence = atFenceCadence || (!!active._fenceAttach && !!tasksReminder);
+						if (wantFence) {
+							const fenceReminder = await buildBehaviorFenceReminder(narratorId, locale);
+							if (fenceReminder) {
+								sideCars.push({
+									target: "tool_result",
+									source: "behavior_fence",
+									content: fenceReminder,
+									orderIndex: 16,
+									toolUseId: request.toolUseId,
+								});
+							}
+						}
+						return sideCars;
 					}
 					// phase === "after_tools"
 					const sideCars: import("../lib/agent/types").AgentSideCar[] = [];
-
-					if (active._pendingGoalStateNotice) {
-						sideCars.push({
-							target: "user_message",
-							source: "goal_update",
-							content: active._pendingGoalStateNotice,
-							orderIndex: 0,
-						});
-						active._pendingGoalStateNotice = undefined;
-					}
 
 					// Drain completed background subagent tasks
 					const subDone = drainCompletedBackgroundSubagents(narratorId);
@@ -2110,8 +2247,7 @@ export async function runAgentLoop(
 				}
 			}
 
-			active._goalTurnStartedAtMs = Date.now();
-			active._goalTokenUsageBaseline = active._lastTokenUsage;
+			active._tokenUsageBaseline = active._lastTokenUsage;
 			active._interruptCleanupDone = false;
 			const result = await executeAgentLoop({
 				config,
@@ -2136,23 +2272,23 @@ export async function runAgentLoop(
 			// normally, this is cleared back to false before the Stop hook fires.
 			loopHitMaxTurns = result.maxTurnsExceeded === true;
 
-			loopTotalTokens += await accountGoalUsageForTurn(active).catch((err) => {
-				logger.warn("Failed to account goal usage", { narratorId, error: String(err) });
-				return 0;
-			});
-			if (active._goalContinuationTurn) {
+			loopTotalTokens += accountTokenUsageForTurn(active);
+
+			// Track no-tool continuation turns to suppress runaway auto-continuation
+			// when the model stops making progress (no tool calls) on a continuation pass.
+			if (active._continuationTurn) {
 				if (result.hadToolUses) {
-					active._goalContinuationNoToolCount = 0;
-					active._goalContinuationSuppressed = false;
+					active._continuationNoToolCount = 0;
+					active._continuationSuppressed = false;
 				} else {
-					active._goalContinuationNoToolCount = (active._goalContinuationNoToolCount ?? 0) + 1;
-					active._goalContinuationSuppressed =
-						active._goalContinuationNoToolCount >= MAX_GOAL_CONTINUATION_NO_TOOL_TURNS;
+					active._continuationNoToolCount = (active._continuationNoToolCount ?? 0) + 1;
+					active._continuationSuppressed =
+						active._continuationNoToolCount >= MAX_CONTINUATION_NO_TOOL_TURNS;
 				}
-				active._goalContinuationTurn = false;
+				active._continuationTurn = false;
 			} else {
-				active._goalContinuationNoToolCount = 0;
-				active._goalContinuationSuppressed = false;
+				active._continuationNoToolCount = 0;
+				active._continuationSuppressed = false;
 			}
 
 			if (
@@ -2353,12 +2489,8 @@ export async function runAgentLoop(
 			}
 
 			if (result.maxTurnsExceeded && active.alive && !loopHadError) {
-				const goalContinuationPrompt = await maybeStartGoalContinuation(
-					active,
-					freshNarrator,
-					false,
-				);
-				if (goalContinuationPrompt) {
+				const continuationPrompt = await maybeStartContinuation(active, freshNarrator, false);
+				if (continuationPrompt) {
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = "";
 					currentImages = undefined;
@@ -2701,6 +2833,23 @@ export async function runAgentLoop(
 						}
 						break;
 					}
+					// A queued /goal appends its protected task now (no model turn). Keep
+					// draining the buffer if more messages remain, else settle to idle.
+					const goalCommand = parseQueuedGoalCommand(buffered.text, buffered.commandText);
+					if (goalCommand) {
+						await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
+						if ((bufferedMessages.get(narratorId)?.length ?? 0) > 0) {
+							loopWasInterrupted = true;
+						} else {
+							await narratorService.compareAndSetStatus(
+								narratorId,
+								["working", "waiting"],
+								"idle",
+								{ substatus: ["unread"] },
+							);
+						}
+						break;
+					}
 					// Save buffered text files to worktree
 					const savedBufferedTextFiles: TextFileRef[] = [];
 					if (buffered.textFiles?.length) {
@@ -2773,12 +2922,8 @@ export async function runAgentLoop(
 				}
 			}
 
-			const goalContinuationPrompt = await maybeStartGoalContinuation(
-				active,
-				freshNarrator,
-				loopHadError,
-			);
-			if (goalContinuationPrompt) {
+			const continuationPrompt = await maybeStartContinuation(active, freshNarrator, loopHadError);
+			if (continuationPrompt) {
 				await narratorService.updateStatus(narratorId, "working");
 				// The continuation prompt was persisted as a system message; the next
 				// provider call only needs an empty turn to advance the conversation.
@@ -3122,93 +3267,11 @@ export async function runAgentLoop(
 		active._provisionalTitle = undefined;
 
 		// Auto-resume: when the loop was interrupted and buffered messages remain,
-		// schedule a new agent loop to consume them. This makes priority messages
-		// run at the next safe boundary without waiting for manual input.
-		if (
-			loopWasInterrupted &&
-			!loopHadError &&
-			(bufferedMessages.get(narratorId)?.length ?? 0) > 0
-		) {
-			const queue = bufferedMessages.get(narratorId);
-			const first = queue?.shift();
-			if (queue && first) {
-				if (queue.length === 0) bufferedMessages.delete(narratorId);
-				dbConsumeBuffered(first.id);
-				broadcastToNarrator(narratorId, {
-					type: "buffer_consumed",
-					narratorId,
-					messageId: first.id,
-					remaining: toBufferSummary(getBufferedMessages(narratorId)),
-				});
-
-				const newCommand = parseQueuedNewCommand(first.text, first.commandText);
-				if (newCommand) {
-					executeQueuedNewCommand(active, first, newCommand.initialMessage)
-						.then((newNarratorId) => {
-							broadcastToNarrator(narratorId, {
-								type: "queued_new_narrator_created",
-								narratorId,
-								messageId: first.id,
-								newNarratorId,
-							});
-						})
-						.catch(async (err) => {
-							logger.error("Queued /new execution after interrupt failed", {
-								narratorId,
-								error: String(err),
-							});
-							await narratorService
-								.updateStatus(narratorId, "idle", {
-									substatus: ["error"],
-									errorMessage: String(err),
-								})
-								.catch(() => {});
-							broadcastToNarrator(narratorId, {
-								type: "narrator_error",
-								narratorId,
-								error: String(err),
-							});
-						});
-				} else {
-					feedMessage(
-						narratorId,
-						first.text,
-						first.images,
-						locale,
-						active._replyInUserLanguage ?? false,
-						first.commandText,
-						first.createdBy,
-						first.textFiles,
-						first.bashCommand,
-					)
-						.then(({ userMsg, userBroadcasted }) => {
-							if (!userBroadcasted) {
-								broadcastToNarrator(narratorId, {
-									type: "user_message",
-									narratorId,
-									message: userMsg,
-								});
-							}
-						})
-						.catch(async (err) => {
-							logger.error("Auto-resume after interrupt failed", {
-								narratorId,
-								error: String(err),
-							});
-							await narratorService
-								.updateStatus(narratorId, "idle", {
-									substatus: ["error"],
-									errorMessage: String(err),
-								})
-								.catch(() => {});
-							broadcastToNarrator(narratorId, {
-								type: "narrator_error",
-								narratorId,
-								error: String(err),
-							});
-						});
-				}
-			}
+		// consume them. This makes priority messages run at the next safe boundary
+		// without waiting for manual input. Terminal commands (/new, /goal) run no
+		// model turn, so resumeNextBufferedMessage keeps draining behind them.
+		if (loopWasInterrupted && !loopHadError) {
+			resumeNextBufferedMessage(active, locale);
 		}
 	}
 
@@ -3262,10 +3325,14 @@ async function feedMessage(
 		await reconcileRunningStatus(narratorId);
 		throw new ValidationError("Narrator is already running");
 	}
-	active._goalContinuationSuppressed = false;
-	active._goalContinuationNoToolCount = 0;
+	active._continuationSuppressed = false;
+	active._continuationNoToolCount = 0;
 	// Record the user who triggered this turn → flows into ToolContext.userId for knowledge ACL.
 	active._currentUserId = userId ?? null;
+	// Open the one-shot behavior-fence edit window for this user turn. It is consumed by the
+	// first behavior_fence write and cleared once the first tool call completes, so the agent
+	// can only record a fence on its first tool call and only when the user asked for it.
+	grantBehaviorFenceEdit(narratorId);
 
 	// Save text files to worktree (now that we have active.cwd)
 	const savedTextFiles: TextFileRef[] = [];
@@ -3553,45 +3620,6 @@ export async function sendMessage(
 	return userMsg;
 }
 
-export async function startGoalContinuationIfPossible(
-	narratorId: string,
-	locale: Locale = "en",
-	replyInUserLanguage = false,
-): Promise<{ started: boolean }> {
-	return goalContinuationStartLock.acquire(narratorId, async () => {
-		const narrator = await narratorService.getById(narratorId);
-		if (narrator.status === "working" || narrator.status === "waiting") return { started: false };
-		if (isPlanModeTrait(narrator.traits)) return { started: false };
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-		if (active._loopRunning) return { started: false };
-		active._goalContinuationSuppressed = false;
-		active._goalContinuationNoToolCount = 0;
-		active._lastTokenUsage = undefined;
-		active._ttftMs = undefined;
-		active._turnStartedAt = new Date().toISOString();
-
-		const prompt = await maybeStartGoalContinuation(active, narrator, false);
-		if (!prompt) return { started: false };
-		await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-		runAgentLoop(active, "").catch(async (err) => {
-			logger.error("runAgentLoop unhandled error (goal continuation)", {
-				narratorId,
-				error: String(err),
-			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
-		});
-		return { started: true };
-	});
-}
-
 export async function startBackgroundCompletionContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
@@ -3610,8 +3638,8 @@ export async function startBackgroundCompletionContinuationIfPossible(
 		const prompt = await drainAndPersistBackgroundCompletionNotice(active);
 		if (!prompt) return { started: false };
 
-		active._goalContinuationSuppressed = false;
-		active._goalContinuationNoToolCount = 0;
+		active._continuationSuppressed = false;
+		active._continuationNoToolCount = 0;
 		active._lastTokenUsage = undefined;
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
@@ -3666,8 +3694,8 @@ export async function startParentInboundContinuationIfPossible(
 		const prompt = await drainAndPersistParentInboundNotice(active);
 		if (!prompt) return { started: false };
 
-		active._goalContinuationSuppressed = false;
-		active._goalContinuationNoToolCount = 0;
+		active._continuationSuppressed = false;
+		active._continuationNoToolCount = 0;
 		active._lastTokenUsage = undefined;
 		active._ttftMs = undefined;
 		active._turnStartedAt = new Date().toISOString();
@@ -3879,8 +3907,6 @@ const NON_RERUNNABLE_TOOL_NAMES = new Set([
 	"ExitPlanMode",
 	"EnterPlanMode",
 	"AskUserQuestion",
-	"TodoWrite",
-	"TaskCreate",
 	"StartPipeline",
 	"EndPipeline",
 ]);
@@ -5388,7 +5414,7 @@ const HOT_RELOAD_GUARD = Symbol.for("narrafork.narrator.initialized");
 const REFLECTION_SUGGESTION_TYPES = new Set([
 	"danger_reflection",
 	"plan_reflection",
-	"goal_reflection",
+	"task_reflection",
 	"question_reflection",
 ]);
 const ACTIVE_REFLECTION_SUGGESTION_STATUSES = new Set(["running", "awaiting_user"]);

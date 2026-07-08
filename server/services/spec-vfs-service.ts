@@ -36,7 +36,7 @@ Core files:
 
 - spec://index.md — overview and free-form planning notes.
 - spec://tasks.json — the minimal task queue used for task reminders and continuation.
-- spec://behavior_fence — behavior fence: user intent and supervision principles. Read-only to you; only the user edits it via the Spec panel. Propose changes instead of writing directly.
+- spec://behavior_fence — behavior fence: durable behavior constraints the user wants you to obey. Normally maintained by the user via the Spec panel. When the user explicitly tells you a behavior to obey, you MAY record it here — but only on your first tool call of the current user turn; later writes in the same turn are rejected. Empty by default.
 - spec://HOW_TO_USE_SPEC.md — this help file.
 
 The public tasks.json format is intentionally small:
@@ -67,21 +67,16 @@ This is the root of the narrator's virtual Work Spec directory.
 Use additional spec://*.md files for design notes when the task becomes complex.
 `;
 
-const DEFAULT_BEHAVIOR_FENCE = `# Behavior Fence
-
-No behavior fence has been set for this narrator yet.
-
-This file is read-only for the assistant. Only the user can edit it via the Spec panel.
-User intent and supervision principles stored here are surfaced to the assistant as a sidecar reminder after the user saves.
-`;
+const DEFAULT_BEHAVIOR_FENCE = "";
 
 /**
  * Built-in spec files. Two independent readonly axes:
  * - `agentReadonly`: the assistant's Write/Edit tools cannot modify the file.
  * - `uiEditable`: the file can be edited by the user through the Spec panel (UI route).
  *
- * `behavior_fence` is agent-readonly but UI-editable: it captures user intent /
- * supervision principles that only the user may change, and edits notify the agent.
+ * `behavior_fence` is agent-readonly (UI-editable) by default: it captures durable
+ * behavior constraints the user wants obeyed. The assistant may write it only through
+ * a one-shot grant (first tool call of a user turn), passed via `allowFenceMutation`.
  */
 const BUILTIN_FILES: Record<
 	string,
@@ -115,6 +110,12 @@ export interface SpecWriteOptions {
 	sourceMessageId?: string | null;
 	createdBy?: "system" | "user" | "assistant";
 	allowProtectedTaskMutation?: boolean;
+	/**
+	 * One-shot grant that lets an `agent` actor write `spec://behavior_fence` despite it
+	 * being agent-readonly. Set by Write/Edit tools when the current tool call is the first
+	 * of a user turn (see behavior-fence-grant). Ignored for non-fence paths.
+	 */
+	allowFenceMutation?: boolean;
 	/**
 	 * Who is performing the write. `"agent"` (default) is subject to `agentReadonly`;
 	 * `"user"` (UI route) is subject to `uiEditable`.
@@ -341,10 +342,11 @@ export async function writeSpecFile(
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
 	const actor = options.actor ?? "agent";
-	if (actor === "agent" && isAgentReadonly(path)) {
+	const fenceMutationAllowed = path === "behavior_fence" && options.allowFenceMutation === true;
+	if (actor === "agent" && isAgentReadonly(path) && !fenceMutationAllowed) {
 		if (path === "behavior_fence") {
 			throw new Error(
-				`${toSpecUri(path)} is a read-only behavior fence. It captures user intent and supervision principles; only the user can edit it via the Spec panel. Propose changes to the user instead of writing directly.`,
+				`${toSpecUri(path)} may only be written on your first tool call of the current user turn, and only when the user explicitly asked you to record a behavior. It is otherwise read-only — propose changes to the user instead of writing directly.`,
 			);
 		}
 		throw new Error(`${toSpecUri(path)} is read-only`);
@@ -547,6 +549,37 @@ export async function readTasksFileForNarrator(narratorId: string): Promise<Spec
 	return readSpecFile(narratorId, toSpecUri(SPEC_TASKS_PATH));
 }
 
+/**
+ * Append a protected task to spec://tasks.json (used by the /goal command).
+ * Idempotent: if a task with the same trimmed text already exists, it is left
+ * untouched and no new task is added. Written as the user, so the protected-task
+ * lock is created without requiring taskReflection.
+ */
+export async function appendProtectedSpecTask(
+	narratorId: string,
+	objective: string,
+): Promise<{ added: boolean; written: SpecResolvedFile }> {
+	const text = objective.trim();
+	if (!text) throw new Error("objective must not be empty");
+	const current = await readTasksFileForNarrator(narratorId);
+	const document = parseSpecTasksDocument(current.content);
+	const existing = document.tasks.find((task) => task.text.trim() === text);
+	if (existing) {
+		// A task with this text already exists — leave it as-is, don't duplicate.
+		return { added: false, written: current };
+	}
+	const nextDocument: SpecTasksDocument = {
+		tasks: [...document.tasks, { text, status: "todo", protected: true }],
+	};
+	const written = await writeSpecFile(
+		narratorId,
+		toSpecUri(SPEC_TASKS_PATH),
+		serializeSpecTasksDocument(nextDocument),
+		{ actor: "user", createdBy: "user", allowProtectedTaskMutation: true },
+	);
+	return { added: true, written };
+}
+
 export const specVfsService = {
 	isSpecUri,
 	toSpecUri,
@@ -559,4 +592,5 @@ export const specVfsService = {
 	analyzeSpecWriteCandidate,
 	forkSpecNamespace,
 	readTasksFileForNarrator,
+	appendProtectedSpecTask,
 };

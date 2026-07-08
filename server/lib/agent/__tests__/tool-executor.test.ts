@@ -11,14 +11,12 @@ import {
 	getExitPlanReflectionAllowedTools,
 	shouldInjectRelaxedPlanToolReminder,
 	shouldRunExitPlanModeReflection,
-	shouldRunGoalCompletionReflection,
 } from "../loop";
 import { executeTool } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
 import { browserTool } from "../tools/browser";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import { EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME } from "../tools/exit-plan-reflection";
-import { goalCompleteConfirmTool, goalCompleteReviseTool } from "../tools/goal-reflection";
 import {
 	type AgentConfig,
 	type PermissionResult,
@@ -75,14 +73,6 @@ describe("executeTool permission guard", () => {
 				permMode: "default",
 				cwd: "/tmp/project",
 				planMode: true,
-			}),
-		).toBe("allow");
-		expect(
-			resolvePermissionDecision({
-				toolName: "TaskCreate",
-				input: { todos: [] },
-				permMode: "readOnly",
-				cwd: "/tmp/project",
 			}),
 		).toBe("allow");
 	});
@@ -224,17 +214,6 @@ describe("ExitPlanMode reflection gate", () => {
 	});
 });
 
-describe("Goal completion reflection gate", () => {
-	test("runs outside reflection loops regardless of permission mode", () => {
-		expect(shouldRunGoalCompletionReflection({})).toBe(true);
-		expect(
-			shouldRunGoalCompletionReflection({
-				reflectionLoop: { allowedTools: [], context: { kind: "goalCompletion" } },
-			}),
-		).toBe(false);
-	});
-});
-
 describe("relaxed plan reminder classifier", () => {
 	const relaxedPlanConfig = {
 		planMode: true,
@@ -246,12 +225,6 @@ describe("relaxed plan reminder classifier", () => {
 		await expect(
 			shouldInjectRelaxedPlanToolReminder(
 				{ toolUseId: "tu-read", name: "Read", input: { file_path: "x.ts" } },
-				relaxedPlanConfig,
-			),
-		).resolves.toBe(false);
-		await expect(
-			shouldInjectRelaxedPlanToolReminder(
-				{ toolUseId: "tu-task-create", name: "TaskCreate", input: { todos: [] } },
 				relaxedPlanConfig,
 			),
 		).resolves.toBe(false);
@@ -379,40 +352,6 @@ describe("LearningGuide permission integration", () => {
 		expect(resolvePermissionDecision({ ...base, permMode: "readOnly" })).toBe("allow");
 		expect(resolvePermissionDecision({ ...base, permMode: "acceptEdits" })).toBe("allow");
 		expect(PLAN_MODE_ALLOWED_TOOLS.has("LearningGuide")).toBe(true);
-	});
-});
-
-describe("goal completion reflection tools", () => {
-	test("GoalCompleteConfirm requires concrete evidence", () => {
-		expect(
-			goalCompleteConfirmTool.parameters.safeParse({ confirm: true, evidence: "too short" })
-				.success,
-		).toBe(false);
-		expect(
-			goalCompleteConfirmTool.parameters.safeParse({
-				confirm: true,
-				evidence: "Verified every requested requirement with concrete tool output.",
-			}).success,
-		).toBe(true);
-	});
-
-	test("GoalCompleteRevise requires feedback and next steps", () => {
-		expect(
-			goalCompleteReviseTool.parameters.safeParse({ confirm: true, feedback: "" }).success,
-		).toBe(false);
-		expect(
-			goalCompleteReviseTool.parameters.safeParse({
-				confirm: true,
-				feedback: "Need to run the requested verification first.",
-			}).success,
-		).toBe(false);
-		expect(
-			goalCompleteReviseTool.parameters.safeParse({
-				confirm: true,
-				feedback: "Need to run the requested verification first.",
-				nextSteps: "Run the missing verification, then call UpdateGoal if it passes.",
-			}).success,
-		).toBe(true);
 	});
 });
 

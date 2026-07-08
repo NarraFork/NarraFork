@@ -9,12 +9,13 @@ import type {
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
+import { isSpecTasksToolUse } from "./tool-display";
 
 export type ReflectionKind =
 	| "danger_reflection"
 	| "plan_reflection"
-	| "goal_reflection"
-	| "question_reflection";
+	| "question_reflection"
+	| "task_reflection";
 export type ReflectionStatus = "running" | "awaiting_user" | "confirmed" | "cancelled" | "aborted";
 
 export interface ReflectionSuggestion {
@@ -23,7 +24,6 @@ export interface ReflectionSuggestion {
 	reason?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic suggestion payload
 	danger?: any;
-	activeGoal?: unknown;
 	nextSteps?: string;
 	requestId?: string;
 }
@@ -31,8 +31,8 @@ export interface ReflectionSuggestion {
 const REFLECTION_KINDS = new Set<ReflectionKind>([
 	"danger_reflection",
 	"plan_reflection",
-	"goal_reflection",
 	"question_reflection",
+	"task_reflection",
 ]);
 const ACTIVE_REFLECTION_STATUSES = new Set<ReflectionStatus>(["running", "awaiting_user"]);
 
@@ -47,7 +47,6 @@ export function getReflectionSuggestion(
 			status?: unknown;
 			reason?: unknown;
 			danger?: unknown;
-			activeGoal?: unknown;
 			nextSteps?: unknown;
 			requestId?: unknown;
 		};
@@ -68,7 +67,6 @@ export function getReflectionSuggestion(
 			status,
 			reason: typeof record.reason === "string" ? record.reason : undefined,
 			danger: record.danger,
-			activeGoal: record.activeGoal,
 			nextSteps: typeof record.nextSteps === "string" ? record.nextSteps : undefined,
 			requestId: typeof record.requestId === "string" ? record.requestId : undefined,
 		};
@@ -498,4 +496,29 @@ export function removeStreamingChunksMsg(
 		};
 		return { ...old, pages };
 	});
+}
+
+/**
+ * Find the tool-use id of the LAST spec://tasks.json operation across an ordered
+ * message list (Read/Write/Edit). Only this snapshot reflects the live task
+ * state, so SpecTasksDetail animates a "doing" row only on this card. Scans both
+ * the assistant `contentJson` tool_use blocks and the `toolCalls` records, in
+ * message order, and returns the id seen last. Returns null when there is none.
+ */
+export function findLatestSpecTasksToolUseId(messages: NarratorMsg[]): string | null {
+	let latest: string | null = null;
+	for (const msg of messages) {
+		for (const block of msg.contentJson ?? []) {
+			if (block.type !== "tool_use") continue;
+			const id = typeof block.id === "string" ? block.id : null;
+			const name = typeof block.name === "string" ? block.name : null;
+			if (id && name && isSpecTasksToolUse(name, block.input)) latest = id;
+		}
+		for (const tc of msg.toolCalls ?? []) {
+			if (tc.toolUseId && isSpecTasksToolUse(tc.toolName, tc.inputJson)) {
+				latest = tc.toolUseId;
+			}
+		}
+	}
+	return latest;
 }

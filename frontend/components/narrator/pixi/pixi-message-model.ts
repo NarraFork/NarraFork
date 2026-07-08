@@ -384,8 +384,10 @@ function specialLabel(type: string): string {
 			return "Review feedback";
 		case "ask_in_passing":
 			return "Ask in passing";
-		case "goal_continuation":
-			return "Goal";
+		case "spec_continuation":
+			return "Task";
+		case "spec_blocked_continuation":
+			return "Blocked task";
 		case "bash_command":
 			return "Bash";
 		case "tool_loaded":
@@ -407,7 +409,12 @@ function specialLabel(type: string): string {
 
 function colorForBlock(type: string): PixiMessageBlockModel["color"] {
 	if (type === "error") return "red";
-	if (type === "compact" || type === "segment_compact" || type === "goal_continuation")
+	if (
+		type === "compact" ||
+		type === "segment_compact" ||
+		type === "spec_continuation" ||
+		type === "spec_blocked_continuation"
+	)
 		return "teal";
 	if (type === "merge_summary") return "indigo";
 	if (type === "review_feedback") return "green";
@@ -788,20 +795,6 @@ function metadataFrom(
 	);
 }
 
-function parseJsonRecord(value: unknown): Record<string, unknown> | null {
-	const normalized = parsePossiblyStringifiedJson(value);
-	const record = asRecord(normalized);
-	if (record) return record;
-	const raw = pixiResolveDisplayText(normalized).trim();
-	if (!raw) return null;
-	try {
-		const parsed = JSON.parse(raw);
-		return asRecord(parsed);
-	} catch {
-		return null;
-	}
-}
-
 function parseJsonArray(value: unknown): Array<Record<string, unknown>> {
 	const normalized = parsePossiblyStringifiedJson(value);
 	if (Array.isArray(normalized)) {
@@ -1047,7 +1040,7 @@ function buildToolDetailBlocks(
 	metadata?: Record<string, unknown>,
 	errorMessage?: string,
 ): PixiToolDetailBlockModel[] {
-	const category = getCategory(toolName);
+	const category = getCategory(toolName, inputJson);
 	const blocks: PixiToolDetailBlockModel[] = [];
 	const streamingFile = category === "file" ? getStreamingFileInput(inputJson) : null;
 	const filePath = streamingFile?.filePath ?? getFilePath(inputJson);
@@ -1243,46 +1236,31 @@ function buildToolDetailBlocks(
 			else outputPanel(blocks, outputJson, "code-panel", "Output");
 			break;
 		}
-		case "todo": {
-			const todos = objectValue(inputJson, "todos") ?? objectValue(outputJson, "todos");
-			if (Array.isArray(todos)) {
-				for (const todo of todos.slice(0, 8)) {
-					const record = asRecord(todo) ?? {};
+		case "tasks": {
+			// spec://tasks.json document: { tasks: [{ text, status, protected }] }
+			const parseTasks = (raw: unknown): unknown[] | null => {
+				if (typeof raw !== "string") return null;
+				try {
+					const doc = JSON.parse(raw);
+					return Array.isArray(doc?.tasks) ? doc.tasks : null;
+				} catch {
+					return null;
+				}
+			};
+			const content = extractField(inputJson, "content");
+			const tasks =
+				parseTasks(content) ?? parseTasks(typeof outputJson === "string" ? outputJson : undefined);
+			if (Array.isArray(tasks)) {
+				for (const task of tasks.slice(0, 8)) {
+					const record = asRecord(task) ?? {};
 					blocks.push({
 						kind: "todo-row",
-						text: String(record.content ?? "—"),
-						status: String(record.status ?? "pending"),
+						text: String(record.text ?? "—"),
+						status: String(record.status ?? "todo"),
 					});
 				}
-				if (todos.length > 8)
-					blocks.push({ kind: "text-line", text: `+ ${todos.length - 8} more…`, muted: true });
-			}
-			break;
-		}
-		case "goal": {
-			const payload = parseJsonRecord(outputJson);
-			const goals = Array.isArray(payload?.goals) ? payload.goals : [];
-			const objective =
-				extractField(inputJson, "objective") ||
-				String(asRecord(payload?.active)?.objective ?? asRecord(payload?.added)?.objective ?? "");
-			if (objective)
-				blocks.push({
-					kind: "result-card",
-					title: "Goal",
-					subtitle: String(
-						asRecord(payload?.active)?.status ?? asRecord(payload?.added)?.status ?? "",
-					),
-					text: objective,
-					color: "teal",
-				});
-			for (const goal of goals.slice(0, 6)) {
-				const g = asRecord(goal) ?? {};
-				blocks.push({
-					kind: "result-card",
-					title: String(g.status ?? "goal"),
-					text: String(g.objective ?? "—"),
-					color: "gray",
-				});
+				if (tasks.length > 8)
+					blocks.push({ kind: "text-line", text: `+ ${tasks.length - 8} more…`, muted: true });
 			}
 			break;
 		}
@@ -1508,7 +1486,7 @@ function buildToolDetailLines(
 	inputJson: unknown,
 	outputJson: unknown,
 ): PixiToolDetailLineModel[] {
-	const category = getCategory(toolName);
+	const category = getCategory(toolName, inputJson);
 	const lines: PixiToolDetailLineModel[] = [];
 	const filePath = getFilePath(inputJson);
 	switch (category) {
@@ -1587,15 +1565,15 @@ function buildToolDetailLines(
 			addOutputLines(lines, outputJson);
 			break;
 		}
-		case "todo": {
-			const todos = objectValue(inputJson, "todos");
-			if (Array.isArray(todos)) lines.push({ text: `${todos.length} todo item(s)`, kind: "muted" });
-			break;
-		}
-		case "goal": {
-			const objective = extractField(inputJson, "objective");
-			if (objective) lines.push({ label: "goal", text: objective, kind: "text" });
-			addOutputLines(lines, outputJson);
+		case "tasks": {
+			const content = extractField(inputJson, "content");
+			try {
+				const doc = content ? JSON.parse(content) : null;
+				if (Array.isArray(doc?.tasks))
+					lines.push({ text: `${doc.tasks.length} task(s)`, kind: "muted" });
+			} catch {
+				// Not a full document (e.g. Edit) — no summary line.
+			}
 			break;
 		}
 		case "await":
@@ -1626,7 +1604,7 @@ function buildToolUseBlock(
 	resolveToolExpanded?: BuildPixiMessageItemsOptions["resolveToolExpanded"],
 ): PixiMessageBlockModel {
 	const status = item.tc.status ?? "running";
-	const category = getCategory(item.tc.toolName);
+	const category = getCategory(item.tc.toolName, item.tc.inputJson);
 	const pendingPermission = resolvePermission?.({
 		id: item.tc.id,
 		toolName: item.tc.toolName,
@@ -1647,7 +1625,7 @@ function buildToolUseBlock(
 		: !isStreaming &&
 			(!!pendingPermission ||
 				item.tc.status === "pending" ||
-				category === "todo" ||
+				category === "tasks" ||
 				category === "share" ||
 				category === "recall" ||
 				category === "send" ||

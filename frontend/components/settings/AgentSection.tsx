@@ -27,7 +27,7 @@ import {
 import type { UseMutationResult } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { DangerReflectionLevel } from "../../hooks/useInstanceSettings";
+import type { AutoContinuationMode, DangerReflectionLevel } from "../../hooks/useInstanceSettings";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { CmdListEditor } from "../common/CmdListEditor";
 import { DirListEditor } from "../common/DirListEditor";
@@ -76,10 +76,16 @@ export interface AgentSectionProps {
 	setDangerReflectionEnabled: (v: boolean) => void;
 	dangerSkipReadOnlyConfirmations: boolean;
 	setDangerSkipReadOnlyConfirmations: (v: boolean) => void;
+	autoContinuationMode: AutoContinuationMode;
+	setAutoContinuationMode: (v: AutoContinuationMode) => void;
 	maxTransientRetries: number;
 	setMaxTransientRetries: (v: number) => void;
 	silentToolCallThreshold: number;
 	setSilentToolCallThreshold: (v: number) => void;
+	behaviorFenceInterval: number;
+	setBehaviorFenceInterval: (v: number) => void;
+	behaviorFenceAttachTasks: boolean;
+	setBehaviorFenceAttachTasks: (v: boolean) => void;
 	retryBackoffCeilMs: number;
 	setRetryBackoffCeilMs: (v: number) => void;
 	firstTokenTimeoutMs: number;
@@ -357,6 +363,20 @@ export function AgentSection(props: AgentSectionProps) {
 				checked={props.dangerSkipReadOnlyConfirmations}
 				onChange={(e) => props.setDangerSkipReadOnlyConfirmations(e.currentTarget.checked)}
 			/>
+			<Select
+				label={t("autoContinuationMode")}
+				description={t("autoContinuationModeDesc")}
+				value={props.autoContinuationMode}
+				onChange={(value) => {
+					props.setAutoContinuationMode((value ?? "always") as AutoContinuationMode);
+				}}
+				data={[
+					{ value: "always", label: t("autoContinuationMode_always") },
+					{ value: "blockStop", label: t("autoContinuationMode_blockStop") },
+					{ value: "protectedOnly", label: t("autoContinuationMode_protectedOnly") },
+					{ value: "off", label: t("autoContinuationMode_off") },
+				]}
+			/>
 			<NumberInput
 				label={t("maxTransientRetries")}
 				description={t("maxTransientRetriesDesc")}
@@ -374,6 +394,22 @@ export function AgentSection(props: AgentSectionProps) {
 				max={1000}
 				step={1}
 				decimalScale={0}
+			/>
+			<NumberInput
+				label={t("behaviorFenceInterval")}
+				description={t("behaviorFenceIntervalDesc")}
+				value={props.behaviorFenceInterval}
+				onChange={(v) => props.setBehaviorFenceInterval(typeof v === "number" ? v : -1)}
+				min={-1}
+				max={1000}
+				step={1}
+				decimalScale={0}
+			/>
+			<Switch
+				label={t("behaviorFenceAttachTasks")}
+				description={t("behaviorFenceAttachTasksDesc")}
+				checked={props.behaviorFenceAttachTasks}
+				onChange={(e) => props.setBehaviorFenceAttachTasks(e.currentTarget.checked)}
 			/>
 			<NumberInput
 				label={t("retryBackoffCeil")}

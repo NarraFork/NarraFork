@@ -12,6 +12,7 @@
 
 import WebSocket from "ws";
 import { logger } from "../../lib/logger";
+import { createProxyAgent, type ProxyAgentLike, resolveProxyForUrl } from "../../lib/net/proxy";
 import { BaseAdapter } from "../base-adapter";
 import type { GatewayPlatform, InboundMessage, QQBotConfig, SendResult } from "../types";
 
@@ -67,6 +68,8 @@ export class QQBotAdapter extends BaseAdapter {
 
 	// WebSocket
 	private ws: WebSocket | null = null;
+	/** Proxy agent for the gateway WS; destroyed in cleanup() to avoid leaking on reconnect. */
+	private wsAgent: ProxyAgentLike | null = null;
 	private sessionId: string | null = null;
 	private lastSeq: number | null = null;
 	private heartbeatInterval = 30_000;
@@ -160,6 +163,14 @@ export class QQBotAdapter extends BaseAdapter {
 			}
 			this.ws = null;
 		}
+		if (this.wsAgent) {
+			try {
+				this.wsAgent.destroy?.();
+			} catch {
+				/* ignore */
+			}
+			this.wsAgent = null;
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -185,6 +196,7 @@ export class QQBotAdapter extends BaseAdapter {
 	}
 
 	private async refreshToken(): Promise<string> {
+		const proxy = resolveProxyForUrl(TOKEN_URL);
 		const resp = await fetch(TOKEN_URL, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -193,6 +205,7 @@ export class QQBotAdapter extends BaseAdapter {
 				clientSecret: this.config.clientSecret,
 			}),
 			signal: AbortSignal.timeout(DEFAULT_API_TIMEOUT),
+			...(proxy ? { proxy } : {}),
 		});
 
 		if (!resp.ok) {
@@ -212,12 +225,15 @@ export class QQBotAdapter extends BaseAdapter {
 
 	private async getGatewayUrl(): Promise<string> {
 		const token = await this.ensureToken();
-		const resp = await fetch(`${this.apiBase}${GATEWAY_URL_PATH}`, {
+		const gwUrl = `${this.apiBase}${GATEWAY_URL_PATH}`;
+		const proxy = resolveProxyForUrl(gwUrl);
+		const resp = await fetch(gwUrl, {
 			headers: {
 				Authorization: `QQBot ${token}`,
 				"User-Agent": "NarraFork-QQBot/1.0",
 			},
 			signal: AbortSignal.timeout(DEFAULT_API_TIMEOUT),
+			...(proxy ? { proxy } : {}),
 		});
 
 		if (!resp.ok) {
@@ -235,14 +251,21 @@ export class QQBotAdapter extends BaseAdapter {
 	// WebSocket lifecycle
 	// -----------------------------------------------------------------------
 
-	private openWebSocket(gatewayUrl: string): Promise<void> {
+	private async openWebSocket(gatewayUrl: string): Promise<void> {
+		// Resolve/create the proxy agent BEFORE cleanup+connect so the socket-pool
+		// reference lives on `this.wsAgent` and is destroyed on the next cleanup().
+		const proxy = resolveProxyForUrl(gatewayUrl);
+		const agent = await createProxyAgent(proxy);
 		return new Promise<void>((resolve, reject) => {
 			this.cleanup();
 			this.listenActive = true;
+			this.wsAgent = agent ?? null;
 
 			const ws = new WebSocket(gatewayUrl, {
 				headers: { "User-Agent": "NarraFork-QQBot/1.0" },
 				handshakeTimeout: 20_000,
+				// biome-ignore lint/suspicious/noExplicitAny: ws Agent type differs across proxy agents
+				...(agent ? { agent: agent as any } : {}),
 			});
 
 			let resolved = false;
@@ -726,12 +749,14 @@ export class QQBotAdapter extends BaseAdapter {
 	private async downloadMedia(url: string): Promise<ArrayBuffer | null> {
 		try {
 			const token = await this.ensureToken();
+			const proxy = resolveProxyForUrl(url);
 			const resp = await fetch(url, {
 				headers: {
 					Authorization: `QQBot ${token}`,
 					"User-Agent": "NarraFork-QQBot/1.0",
 				},
 				signal: AbortSignal.timeout(30_000),
+				...(proxy ? { proxy } : {}),
 			});
 			if (!resp.ok) {
 				logger.warn(`[qqbot] Media download failed: ${resp.status} for ${url.slice(0, 80)}`);
@@ -782,13 +807,16 @@ export class QQBotAdapter extends BaseAdapter {
 			formData.append("file", blob, filename.replace(/\.\w+$/, ".wav"));
 			formData.append("model", this.sttConfig.model);
 
-			const resp = await fetch(`${this.sttConfig.baseUrl}/audio/transcriptions`, {
+			const sttUrl = `${this.sttConfig.baseUrl}/audio/transcriptions`;
+			const proxy = resolveProxyForUrl(sttUrl);
+			const resp = await fetch(sttUrl, {
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${this.sttConfig.apiKey}`,
 				},
 				body: formData,
 				signal: AbortSignal.timeout(30_000),
+				...(proxy ? { proxy } : {}),
 			});
 
 			if (!resp.ok) {
@@ -1116,6 +1144,7 @@ export class QQBotAdapter extends BaseAdapter {
 	): Promise<Record<string, unknown>> {
 		const token = await this.ensureToken();
 		const url = `${this.apiBase}${path}`;
+		const proxy = resolveProxyForUrl(url);
 
 		const resp = await fetch(url, {
 			method,
@@ -1126,6 +1155,7 @@ export class QQBotAdapter extends BaseAdapter {
 			},
 			body: body ? JSON.stringify(body) : undefined,
 			signal: AbortSignal.timeout(DEFAULT_API_TIMEOUT),
+			...(proxy ? { proxy } : {}),
 		});
 
 		const data = (await resp.json()) as Record<string, unknown>;

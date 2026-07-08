@@ -48,6 +48,7 @@ import {
 	IconArrowsMinimize,
 	IconBolt,
 	IconCheck,
+	IconChecklist,
 	IconChevronDown,
 	IconChevronUp,
 	IconClock,
@@ -78,6 +79,7 @@ import {
 	IconTool,
 	IconTrash,
 	IconUpload,
+	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -104,7 +106,6 @@ import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useBlacklistDirs,
-	useClearNarratorGoals,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useCreateBlacklistDir,
@@ -121,10 +122,7 @@ import {
 	useForkNarrator,
 	useInterruptNarrator,
 	useNarrator,
-	useNarratorGoals,
 	usePromoteNarrator,
-	useRemoveNarratorGoal,
-	useReorderNarratorGoals,
 	useRollbackPreview,
 	useStartAskInPassing,
 	useStopTakeoverSubagent,
@@ -134,7 +132,6 @@ import {
 	useUpdateCmdWhitelist,
 	useUpdateFastMode,
 	useUpdateModel,
-	useUpdateNarratorGoal,
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
@@ -145,22 +142,17 @@ import {
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
 import {
+	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
 	useNarratorPermissionsCapability,
 	useNarratorPlanModeCapability,
 	useNarratorRetryRecoveryCapability,
 	useNarratorRollbackEditRegenerateCapability,
 } from "../../hooks/usePlatform";
+import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
-import {
-	ApiError,
-	api,
-	type BufferMessageSummary,
-	type NarratorGoal,
-	type NarratorGoalStatus,
-	type TreeMessage,
-} from "../../lib/api";
+import { ApiError, api, type BufferMessageSummary, type TreeMessage } from "../../lib/api";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
@@ -182,7 +174,6 @@ import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import type { BroadMessageListHandle } from "./BroadMessageList";
-import { BrowserPanel } from "./BrowserPanel";
 import { ChapterBar } from "./ChapterBar";
 import {
 	ChunkedMessageList,
@@ -228,7 +219,7 @@ import {
 import { ModelPriceModal } from "./ModelPriceModal";
 import { getRenderableMessageOrder } from "./message-order-utils";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
-import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { evictOldestPages } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import { NugRechargeDialog } from "./NugRechargeDialog";
 import {
@@ -243,7 +234,6 @@ import type {
 	NarratorMsg,
 	NarratorPanelProps,
 	PermissionCallbacks,
-	TodoItem,
 } from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
@@ -2025,115 +2015,6 @@ function ReasoningEffortMenuItems({
 	);
 }
 
-function formatGoalUsage(goal: NarratorGoal): string {
-	const seconds = Math.max(0, goal.timeUsedSeconds);
-	const time =
-		seconds < 60
-			? `${seconds}s`
-			: seconds < 3600
-				? `${Math.floor(seconds / 60)}m`
-				: `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-	const tokens =
-		goal.tokensUsed >= 1000 ? `${(goal.tokensUsed / 1000).toFixed(1)}K` : String(goal.tokensUsed);
-	return `${time} · ${tokens} tok`;
-}
-
-function goalStatusColor(status: NarratorGoalStatus): string {
-	if (status === "active") return "green";
-	if (status === "paused") return "yellow";
-	if (status === "complete") return "gray";
-	if (status === "cancelled") return "red";
-	return "teal";
-}
-
-function SortableGoalItem({
-	goal,
-	index,
-	onComplete,
-	onCancel,
-	t,
-}: {
-	goal: NarratorGoal;
-	index: number;
-	onComplete: (goalId: string) => void;
-	onCancel: (goalId: string) => void;
-	t: (key: string, opts?: Record<string, unknown>) => string;
-}) {
-	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-		id: goal.id,
-	});
-	const style = {
-		transform: CSS.Transform.toString(transform),
-		transition,
-		opacity: isDragging ? 0.5 : 1,
-	};
-	return (
-		<Group
-			ref={setNodeRef}
-			style={style}
-			px="md"
-			py={4}
-			gap="xs"
-			wrap="nowrap"
-			bg="var(--mantine-color-teal-light)"
-		>
-			<div
-				{...attributes}
-				{...listeners}
-				style={{
-					cursor: "grab",
-					display: "flex",
-					alignItems: "center",
-					flexShrink: 0,
-					touchAction: "none",
-					minWidth: 24,
-					minHeight: 24,
-					justifyContent: "center",
-				}}
-			>
-				<IconGripVertical size={14} color="var(--mantine-color-dimmed)" />
-			</div>
-			{goal.creator ? (
-				<UserAvatar
-					username={goal.creator.username}
-					avatarColor={goal.creator.avatarColor}
-					avatarImageId={goal.creator.avatarImageId}
-					userId={goal.creator.id}
-					size={16}
-					showTooltip={false}
-				/>
-			) : (
-				<Text size="xs" c="dimmed" w={16} ta="center" style={{ flexShrink: 0 }}>
-					{index + 1}
-				</Text>
-			)}
-			<Badge
-				size="xs"
-				color={goalStatusColor(goal.status)}
-				variant="light"
-				style={{ flexShrink: 0 }}
-			>
-				{t(`goalStatus_${goal.status}`)}
-			</Badge>
-			<Text size="xs" c="teal" truncate style={{ flex: 1 }}>
-				{goal.objective}
-			</Text>
-			<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-				{formatGoalUsage(goal)}
-			</Text>
-			<ActionIcon
-				size="xs"
-				variant="subtle"
-				color={goal.status === "active" ? "green" : "red"}
-				onClick={() => (goal.status === "active" ? onComplete(goal.id) : onCancel(goal.id))}
-				title={goal.status === "active" ? t("completeGoal") : t("removeGoal")}
-			>
-				{goal.status === "active" ? <IconCheck size={12} /> : <IconX size={12} />}
-			</ActionIcon>
-		</Group>
-	);
-}
-
 function SortableQueuedMessageItem({
 	msg,
 	index,
@@ -2439,12 +2320,6 @@ export function NarratorPanel({
 	const updateConclusionMutation = useUpdateSubagentConclusion();
 	const takeoverMutation = useTakeoverSubagent();
 	const stopTakeoverMutation = useStopTakeoverSubagent();
-	const { data: goalsData } = useNarratorGoals(narratorId);
-	const goals = goalsData?.goals ?? [];
-	const updateGoalMutation = useUpdateNarratorGoal(narratorId);
-	const removeGoalMutation = useRemoveNarratorGoal(narratorId);
-	const clearGoalsMutation = useClearNarratorGoals(narratorId);
-	const reorderGoalsMutation = useReorderNarratorGoals(narratorId);
 	const isWorkspacePreview = workspacePreview === true;
 	// Chunk mode is now the only live message-list implementation. Workspace
 	// previews use a separate lightweight tail-chunk query below instead of the
@@ -2474,7 +2349,8 @@ export function NarratorPanel({
 				prev.contextPercent === meta.contextPercent &&
 				prev.turnUsageJson === meta.turnUsageJson &&
 				prev.pruneBoundaryMessageId === meta.pruneBoundaryMessageId &&
-				prev.prunedPercent === meta.prunedPercent
+				prev.prunedPercent === meta.prunedPercent &&
+				prev.latestSpecTasksToolUseId === meta.latestSpecTasksToolUseId
 			) {
 				return prev;
 			}
@@ -2577,6 +2453,7 @@ export function NarratorPanel({
 	const rollbackEditRegenerateSupported = rollbackEditRegenerateCapability.supported;
 	const rollbackEditRegenerateUnsupportedReason =
 		rollbackEditRegenerateCapability.reason ?? t("rollbackEditRegenerateUnsupported");
+	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
@@ -3545,8 +3422,6 @@ export function NarratorPanel({
 		initialMessageStatus: chunkTailMeta,
 		isAtBottomRef,
 		scrollToBottom,
-		narratorTodosJson: narrator?.todosJson,
-		narratorTodosToolUseId: narrator?.todosToolUseId,
 		isSubagent,
 		narratorSubstatus,
 		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
@@ -3569,6 +3444,28 @@ export function NarratorPanel({
 			visualChange: wsState.browserVisualChange,
 		});
 	}, [dockSetBrowserInfo, wsState.browserSessionCount, wsState.browserVisualChange]);
+
+	// Auto-open the browser dock panel when a NEW session appears (count rises).
+	// The first observed value only seeds the ref so an initial load / reconnect
+	// with pre-existing sessions doesn't force the panel open — only a genuine
+	// increase (a freshly created session) triggers it. Opening an already-open
+	// panel just re-activates it, which is fine when a second session starts.
+	const dockOpenToolPanel = dock?.openToolPanel;
+	const prevBrowserSessionCountRef = useRef<number | undefined>(undefined);
+	useEffect(() => {
+		const prev = prevBrowserSessionCountRef.current;
+		const cur = wsState.browserSessionCount;
+		prevBrowserSessionCountRef.current = cur;
+		if (prev === undefined) return;
+		if (cur > prev && !isWorkspacePreview && browserSessionsCapability.supported !== false) {
+			dockOpenToolPanel?.("browser");
+		}
+	}, [
+		dockOpenToolPanel,
+		wsState.browserSessionCount,
+		isWorkspacePreview,
+		browserSessionsCapability.supported,
+	]);
 
 	const {
 		disconnected,
@@ -3597,10 +3494,7 @@ export function NarratorPanel({
 		setPaymentRequired,
 		leakedToolEvent,
 		setLeakedToolEvent,
-		currentTodos,
-		todosToolUseId,
 		expandedToolUseId,
-		setExpandedToolUseId,
 		unreadCount,
 		setUnreadCount,
 		viewers,
@@ -3918,6 +3812,17 @@ export function NarratorPanel({
 		if (dock) dock.toggleToolPanel("spec");
 		else onToggleSpecPanel?.();
 	}, [dock, onToggleSpecPanel]);
+	// Open (not toggle) the spec panel — used by the current-task status bar so a
+	// click always reveals the task list rather than closing an open panel.
+	const openSpecTool = useCallback(() => {
+		if (dock) dock.openToolPanel("spec");
+		else if (!specToolOpened) onToggleSpecPanel?.();
+	}, [dock, onToggleSpecPanel, specToolOpened]);
+
+	// Dynamic Spec current task, for the compact status bar above the input.
+	const { data: specTasksData } = useSpecTasks(narratorId);
+	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
+	const specTasksBlocked = specTasksData?.compiled.blocked ?? false;
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
@@ -4188,8 +4093,11 @@ export function NarratorPanel({
 	}, [turnElapsed]);
 
 	const todosCtxValue = useMemo(
-		() => ({ toolUseId: todosToolUseId, isThinking: !!isWorking }),
-		[todosToolUseId, isWorking],
+		() => ({
+			isThinking: !!isWorking,
+			latestSpecTasksToolUseId: chunkTailMeta.latestSpecTasksToolUseId ?? null,
+		}),
+		[isWorking, chunkTailMeta.latestSpecTasksToolUseId],
 	);
 
 	const fileModDrawerCtxValue = useMemo(
@@ -4276,14 +4184,6 @@ export function NarratorPanel({
 		const id = setInterval(tick, 1000);
 		return () => clearInterval(id);
 	}, [retryInfo]);
-
-	const activeTodo = useMemo(() => {
-		if (!Array.isArray(currentTodos) || !currentTodos.length) return null;
-		return (
-			currentTodos.find((t: TodoItem) => t.status === "in_progress" || t.status === "blocked") ??
-			null
-		);
-	}, [currentTodos]);
 
 	// --- Image management ---
 	const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
@@ -6247,9 +6147,9 @@ export function NarratorPanel({
 					return { ...old, pages };
 				});
 				scrollToLatestMessageWindow(true);
-			} else if (result?.goalCommand) {
-				// /goal commands persist a display-only message and broadcast goals via WS,
-				// so the optimistic user entry must be removed instead of lingering in history.
+			} else if (result?.specGoal) {
+				// /goal added a protected task; the real user message arrives via WS, so
+				// drop the optimistic bubble.
 				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 					if (!old?.pages?.length) return old;
 					const pages = [...old.pages];
@@ -6258,10 +6158,11 @@ export function NarratorPanel({
 					pages[0] = firstPage;
 					return { ...old, pages };
 				});
-				if (Array.isArray(result.goals)) {
-					qc.setQueryData(["narrators", narratorId, "goals"], { goals: result.goals });
-				}
-				setTimeout(() => narratorWSManager.checkSync(narratorId), 500);
+				notifications.show({
+					message: result.added ? t("spec.specGoalAdded") : t("spec.specGoalExists"),
+					color: result.added ? "green" : "yellow",
+					autoClose: 2000,
+				});
 				scrollToLatestMessageWindow(true);
 			} else if (result?.buffered) {
 				// Message was buffered — remove optimistic chat history entry and show it
@@ -6359,9 +6260,6 @@ export function NarratorPanel({
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
 			);
-			if (result?.goalCommand && Array.isArray(result.goals)) {
-				qc.setQueryData(["narrators", narratorId, "goals"], { goals: result.goals });
-			}
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
@@ -6542,40 +6440,6 @@ export function NarratorPanel({
 			onAllowRetry: handleAllowRetryToolCall,
 		}),
 		[narratorIsIdle, allowRetryLatestAssistantMessageId, handleAllowRetryToolCall],
-	);
-
-	const [goalsExpanded, setGoalsExpanded] = useState(false);
-	useEffect(() => {
-		if (goals.length <= QUEUE_COLLAPSE_THRESHOLD) setGoalsExpanded(false);
-	}, [goals.length]);
-
-	const handleCompleteGoal = (goalId: string) => {
-		updateGoalMutation.mutate({ goalId, status: "complete" });
-	};
-	const handleCancelGoal = (goalId: string) => {
-		removeGoalMutation.mutate(goalId);
-	};
-	const handleClearGoals = () => {
-		clearGoalsMutation.mutate();
-	};
-	const handleDragEndGoals = useCallback(
-		(event: DragEndEvent) => {
-			const { active, over } = event;
-			if (!over || active.id === over.id) return;
-			const oldIndex = goals.findIndex((goal) => goal.id === active.id);
-			const newIndex = goals.findIndex((goal) => goal.id === over.id);
-			if (oldIndex === -1 || newIndex === -1) return;
-			const newOrder = [...goals];
-			const [moved] = newOrder.splice(oldIndex, 1);
-			newOrder.splice(newIndex, 0, moved);
-			const optimisticGoals = newOrder.map((goal, index) => ({
-				...goal,
-				sortOrder: index + 1,
-			}));
-			qc.setQueryData(["narrators", narratorId, "goals"], { goals: optimisticGoals });
-			reorderGoalsMutation.mutate(newOrder.map((goal) => goal.id));
-		},
-		[goals, narratorId, qc, reorderGoalsMutation],
 	);
 
 	const handleCancelAllQueued = () => {
@@ -7366,7 +7230,9 @@ export function NarratorPanel({
 								{specToolAvailable && (
 									<Tooltip
 										label={
-											specToolOpened ? t("spec.close", "Close Spec") : t("spec.open", "Open Spec")
+											specToolOpened
+												? t("spec.close", "Close Outline")
+												: t("spec.open", "Open Outline")
 										}
 									>
 										<ActionIcon
@@ -7389,6 +7255,27 @@ export function NarratorPanel({
 										>
 											<IconGitBranch size={16} />
 										</ActionIcon>
+									</Tooltip>
+								)}
+								{dock && browserSessionsCapability.supported !== false && (
+									<Tooltip label={t("browser.title")}>
+										<Indicator
+											size={14}
+											offset={4}
+											label={wsState.browserSessionCount}
+											color="teal"
+											disabled={wsState.browserSessionCount === 0}
+											style={{ display: "flex", alignItems: "center" }}
+										>
+											<ActionIcon
+												size="sm"
+												variant={dock.openToolTypes.has("browser") ? "light" : "subtle"}
+												color={dock.openToolTypes.has("browser") ? "indigo" : "gray"}
+												onClick={() => dock.toggleToolPanel("browser")}
+											>
+												<IconWorldWww size={16} />
+											</ActionIcon>
+										</Indicator>
 									</Tooltip>
 								)}
 								<Tooltip label={t("archiveNarrator")}>
@@ -8078,106 +7965,47 @@ export function NarratorPanel({
 						</Group>
 					)}
 
-					{/* Goal list indicator */}
-					{goals.length > 0 && (
-						<Stack
-							gap={0}
+					{/* Current task status bar (Dynamic Spec) */}
+					{currentSpecTask && (
+						<Group
+							component="button"
+							px="md"
+							py={4}
+							gap="xs"
+							wrap="nowrap"
+							bg={
+								specTasksBlocked
+									? "var(--mantine-color-orange-light)"
+									: "var(--mantine-color-teal-light)"
+							}
 							style={{
+								cursor: "pointer",
+								border: "none",
+								width: "100%",
+								textAlign: "left",
+								flexShrink: 0,
 								borderTop:
 									attachedImages.length > 0
 										? undefined
 										: "1px solid var(--mantine-color-default-border)",
-								flexShrink: 0,
 							}}
+							onClick={openSpecTool}
+							aria-label={t("spec.openCurrentTask", "Open task list")}
+							title={currentSpecTask.text}
 						>
-							{goals.length > QUEUE_COLLAPSE_THRESHOLD && !goalsExpanded ? (
-								<Group
-									component="button"
-									px="md"
-									py={4}
-									gap="xs"
-									wrap="nowrap"
-									bg="var(--mantine-color-teal-light)"
-									style={{ cursor: "pointer", border: "none", width: "100%", textAlign: "left" }}
-									onClick={() => setGoalsExpanded(true)}
-									aria-expanded={false}
-									aria-label={t("goalsCount", { count: goals.length })}
-								>
-									<IconChevronUp size={14} color="var(--mantine-color-teal-5)" />
-									<Text size="xs" c="teal" fw={500} style={{ flexShrink: 0 }}>
-										{t("goalsCount", { count: goals.length })}
-									</Text>
-									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
-										{goals[0].objective}
-									</Text>
-									<Button
-										size="compact-xs"
-										variant="subtle"
-										color="red"
-										onClick={(e) => {
-											e.stopPropagation();
-											handleClearGoals();
-										}}
-									>
-										{t("clearAllGoals")}
-									</Button>
-								</Group>
-							) : (
-								<>
-									<DndContext
-										sensors={sensors}
-										collisionDetection={closestCenter}
-										onDragEnd={handleDragEndGoals}
-									>
-										<SortableContext
-											items={goals.map((goal) => goal.id)}
-											strategy={verticalListSortingStrategy}
-										>
-											{goals.map((goal, index) => (
-												<SortableGoalItem
-													key={goal.id}
-													goal={goal}
-													index={index}
-													onComplete={handleCompleteGoal}
-													onCancel={handleCancelGoal}
-													t={t}
-												/>
-											))}
-										</SortableContext>
-									</DndContext>
-									{goals.length > 1 && (
-										<Group
-											px="md"
-											py={2}
-											justify="flex-end"
-											gap="xs"
-											style={{ backgroundColor: "var(--mantine-color-teal-light)" }}
-										>
-											{goals.length > QUEUE_COLLAPSE_THRESHOLD && (
-												<Button
-													size="compact-xs"
-													variant="subtle"
-													color="teal"
-													onClick={() => setGoalsExpanded(false)}
-													leftSection={<IconChevronDown size={12} />}
-													style={{ marginRight: "auto" }}
-												>
-													{t("collapseGoals")}
-												</Button>
-											)}
-											<Button
-												size="compact-xs"
-												variant="subtle"
-												color="red"
-												onClick={handleClearGoals}
-											>
-												{t("clearAllGoals")}
-											</Button>
-										</Group>
-									)}
-								</>
+							<IconChecklist
+								size={14}
+								color={
+									specTasksBlocked ? "var(--mantine-color-orange-6)" : "var(--mantine-color-teal-6)"
+								}
+							/>
+							{currentSpecTask.protected && (
+								<IconLock size={11} color="var(--mantine-color-yellow-6)" />
 							)}
-						</Stack>
+							<Text size="xs" c={specTasksBlocked ? "orange" : "teal"} truncate style={{ flex: 1 }}>
+								{currentSpecTask.text}
+							</Text>
+						</Group>
 					)}
 
 					{/* Queued messages indicator */}
@@ -8314,13 +8142,6 @@ export function NarratorPanel({
 					{/* Chapter bar */}
 					{narrator.chapterId && <ChapterBar chapterId={narrator.chapterId} />}
 
-					{/* Browser sessions panel */}
-					<BrowserPanel
-						narratorId={narratorId}
-						sessionCount={wsState.browserSessionCount}
-						visualChange={wsState.browserVisualChange}
-					/>
-
 					{/* Status bar */}
 					<Group
 						px="md"
@@ -8331,7 +8152,7 @@ export function NarratorPanel({
 						wrap="nowrap"
 						style={{
 							borderTop:
-								attachedImages.length > 0 || goals.length > 0 || queuedMessages.length > 0
+								attachedImages.length > 0 || queuedMessages.length > 0
 									? undefined
 									: "1px solid var(--mantine-color-default-border)",
 							flexShrink: 0,
@@ -8339,43 +8160,12 @@ export function NarratorPanel({
 					>
 						{showWorkIndicator && !isWorkspacePreview ? (
 							<UnstyledButton
-								disabled={isRetrying || !activeTodo}
-								onClick={async () => {
-									if (isRetrying || !activeTodo || !todosToolUseId) return;
-									if (usesChunkMessageList) {
-										setExpandedToolUseId(todosToolUseId);
-										scrollToMessageTarget({
-											domIds: [`tool-use-${todosToolUseId}`],
-											targetIds: [todosToolUseId],
-										});
-										return;
-									}
-									// Search across all pages without flattening
-									let msg: NarratorMsg | null = null;
-
-									for (const page of messagesData?.pages ?? []) {
-										msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
-										if (msg) break;
-									}
-									if (!msg) {
-										try {
-											await qc.refetchQueries({ queryKey: messagesQueryKey });
-											const freshData = qc.getQueryData<MessagesQueryData>(messagesQueryKey);
-											for (const page of freshData?.pages ?? []) {
-												msg = findMsgByToolUseIdInTree(page.messages, todosToolUseId);
-												if (msg) break;
-											}
-										} catch {
-											return;
-										}
-									}
-									if (!msg) return;
-									setExpandedToolUseId(todosToolUseId);
-									scrollToMessageTarget({
-										domIds: [`tool-use-${todosToolUseId}`, `msg-${msg.id}`],
-										targetIds: [todosToolUseId, msg.id],
-										highlightId: msg.id,
-									});
+								disabled={isRetrying || !currentSpecTask}
+								onClick={() => {
+									if (isRetrying || !currentSpecTask) return;
+									// Task state lives in the Dynamic Spec (spec://tasks.json); open the
+									// Spec panel instead of jumping to a (now-removed) todo tool call.
+									openSpecTool();
 								}}
 								style={{ minWidth: 0, flex: 1 }}
 							>
@@ -8423,8 +8213,8 @@ export function NarratorPanel({
 													})
 											: isBlockingCompacting
 												? t("compacting")
-												: activeTodo
-													? activeTodo.content || activeTodo.activeForm
+												: currentSpecTask
+													? currentSpecTask.text
 													: isWaiting
 														? t("status_waiting")
 														: isPlanning

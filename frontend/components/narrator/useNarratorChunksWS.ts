@@ -1420,7 +1420,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					}),
 				);
 			},
-			onGoalReflectionStarted: ({ requestId, toolUseId, inputJson, activeGoal, reason }) => {
+			onTaskReflectionStarted: ({ requestId, toolUseId, inputJson, mutations, reason }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) =>
 						mergeFieldsByIndex(
@@ -1429,9 +1429,9 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 							{
 								status: "pending",
 								...(inputJson ? { inputJson } : {}),
-								permissionDecisionReason: reason ?? "Goal completion reflection in progress",
+								permissionDecisionReason: reason ?? "Task reflection in progress",
 								permissionSuggestions: [
-									{ type: "goal_reflection", status: "running", requestId, reason, activeGoal },
+									{ type: "task_reflection", status: "running", requestId, reason, mutations },
 								],
 							},
 							EMPTY_INDEX,
@@ -1439,7 +1439,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 					),
 				);
 			},
-			onGoalReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
+			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
 				scheduleChunkUpdate((state) =>
 					applyToChunkContaining(state, toolUseId, (w) => {
 						const status = decision === "allow" ? "running" : "fail";
@@ -1453,7 +1453,7 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 								permissionDecisionReason: reason ?? null,
 								permissionSuggestions: [
 									{
-										type: "goal_reflection",
+										type: "task_reflection",
 										status:
 											decision === "allow"
 												? "confirmed"
@@ -1470,6 +1470,33 @@ export function useNarratorChunksWS(opts: UseNarratorChunksWSOptions): UseNarrat
 						);
 					}),
 				);
+			},
+			onTaskReflectionStopped: ({ requestId, toolUseId, mutations, inputJson, reason }) => {
+				scheduleChunkUpdate((state) =>
+					applyToChunkContaining(state, toolUseId, (w) =>
+						mergeFieldsByIndex(
+							w,
+							toolUseId,
+							{
+								status: "pending",
+								...(inputJson ? { inputJson } : {}),
+								permissionDecisionReason:
+									reason ?? "Task reflection stopped; awaiting user decision",
+								permissionSuggestions: [
+									{
+										type: "task_reflection",
+										status: "awaiting_user",
+										requestId,
+										reason,
+										mutations,
+									},
+								],
+							},
+							EMPTY_INDEX,
+						),
+					),
+				);
+				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onQuestionReflectionStarted: ({ requestId, toolUseId, inputJson, reason }) => {
 				scheduleChunkUpdate((state) =>

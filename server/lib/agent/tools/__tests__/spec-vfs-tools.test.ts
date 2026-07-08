@@ -1,5 +1,5 @@
 /**
- * Tool-layer integration tests for spec:// Living Work Spec files.
+ * Tool-layer integration tests for spec:// Dynamic Spec files.
  *
  * Run with an isolated data dir, for example:
  * NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$HOME/.narrafork/perf-isolation/spec-tools-test \
@@ -13,7 +13,6 @@ import type { ToolContext } from "../../types";
 import { editTool } from "../edit";
 import { grepTool } from "../grep";
 import { readTool } from "../read";
-import { taskCreateTool } from "../todo";
 import { writeTool } from "../write";
 
 const TAG = Date.now();
@@ -98,81 +97,5 @@ describe("spec:// Read/Write/Edit/Grep", () => {
 		expect(grepResult.isError).toBeFalsy();
 		expect(grepResult.output).toContain("spec://notes.md");
 		expect(grepResult.output).toContain("Needle phrase");
-	});
-});
-
-describe("TaskCreate compatibility", () => {
-	test("TaskCreate writes the Living Work Spec task queue", async () => {
-		const result = await taskCreateTool.execute(
-			{
-				todos: [
-					{ id: "a", content: "Legacy pending", status: "pending" },
-					{ id: "b", content: "Legacy active", status: "in_progress" },
-				],
-			},
-			ctx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("Updated spec://tasks.json");
-
-		const readResult = await readTool.execute({ file_path: "spec://tasks.json" }, ctx());
-		expect(readResult.output).toContain("Legacy pending");
-		expect(readResult.output).toContain('"status": "doing"');
-	});
-
-	test("TaskCreate preserves omitted protected tasks while replacing normal tasks", async () => {
-		await writeTool.execute(
-			{
-				file_path: "spec://tasks.json",
-				content: tasksContent({
-					tasks: [
-						{ text: "Protected via tools", status: "doing", protected: true },
-						{ text: "Old normal", status: "todo" },
-					],
-				}),
-			},
-			ctx(),
-		);
-
-		const result = await taskCreateTool.execute(
-			{
-				todos: [{ id: "n", content: "New normal", status: "pending" }],
-			},
-			ctx(),
-		);
-		expect(result.isError).toBeFalsy();
-		expect(result.output).toContain("Protected via tools");
-		expect(result.metadata?.todos).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ content: "Protected via tools", status: "in_progress" }),
-			]),
-		);
-
-		const readResult = await readTool.execute({ file_path: "spec://tasks.json" }, ctx());
-		expect(readResult.output).toContain("Protected via tools");
-		expect(readResult.output).toContain('"protected": true');
-		expect(readResult.output).toContain("New normal");
-		expect(readResult.output).not.toContain("Old normal");
-	});
-
-	test("TaskCreate cannot silently complete a protected task", async () => {
-		await writeTool.execute(
-			{
-				file_path: "spec://tasks.json",
-				content: tasksContent({
-					tasks: [{ text: "Protected via tools", status: "doing", protected: true }],
-				}),
-			},
-			ctx(),
-		);
-
-		const result = await taskCreateTool.execute(
-			{
-				todos: [{ id: "p", content: "Protected via tools", status: "completed" }],
-			},
-			ctx(),
-		);
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("requires taskReflection");
 	});
 });

@@ -98,15 +98,6 @@ export function useRecentTabsWS(
 						type: "draft",
 						hasDraft: !!data.hasDraft,
 					});
-				} else if (data.type === "goals_set") {
-					const goals = Array.isArray(data.goals)
-						? (data.goals as NonNullable<NarratorListWSEvent["goals"]>)
-						: [];
-					onUpdateRef.current(nId, {
-						type: "goals",
-						goals,
-						hasActiveGoal: goals.some((goal) => goal.status === "active"),
-					});
 				}
 			},
 		);

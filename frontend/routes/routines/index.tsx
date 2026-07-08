@@ -1394,7 +1394,6 @@ const AVAILABLE_TOOLS = [
 	"Skill",
 	"ShareFile",
 	"Terminal",
-	"TaskCreate",
 ];
 
 interface SubagentDraft {

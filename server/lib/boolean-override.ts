@@ -53,3 +53,44 @@ export function resolveDangerReflectionLevel(
 	if (normalizedOverride === "on") return globalLevel === "off" ? "standard" : globalLevel;
 	return normalizedOverride;
 }
+
+// === Auto-continuation mode ===
+
+export const AUTO_CONTINUATION_MODE_VALUES = [
+	"always",
+	"blockStop",
+	"protectedOnly",
+	"off",
+] as const;
+export type AutoContinuationMode = (typeof AUTO_CONTINUATION_MODE_VALUES)[number];
+
+export const AUTO_CONTINUATION_OVERRIDE_VALUES = [
+	"inherit",
+	...AUTO_CONTINUATION_MODE_VALUES,
+] as const;
+export type AutoContinuationOverride = (typeof AUTO_CONTINUATION_OVERRIDE_VALUES)[number];
+
+const AUTO_CONTINUATION_MODE_SET = new Set<string>(AUTO_CONTINUATION_MODE_VALUES);
+const AUTO_CONTINUATION_OVERRIDE_SET = new Set<string>(AUTO_CONTINUATION_OVERRIDE_VALUES);
+
+export function normalizeAutoContinuationMode(value: unknown): AutoContinuationMode {
+	if (typeof value === "string" && AUTO_CONTINUATION_MODE_SET.has(value)) {
+		return value as AutoContinuationMode;
+	}
+	return "always";
+}
+
+export function normalizeAutoContinuationOverride(value: unknown): AutoContinuationOverride {
+	return typeof value === "string" && AUTO_CONTINUATION_OVERRIDE_SET.has(value)
+		? (value as AutoContinuationOverride)
+		: "inherit";
+}
+
+export function resolveAutoContinuationMode(
+	override: unknown,
+	globalMode: AutoContinuationMode,
+): AutoContinuationMode {
+	const normalizedOverride = normalizeAutoContinuationOverride(override);
+	if (normalizedOverride === "inherit") return globalMode;
+	return normalizedOverride;
+}

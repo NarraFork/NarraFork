@@ -32,6 +32,7 @@ import {
 } from "./MessageSelectionCtx";
 import { filterChildrenByToolUse } from "./message-segments";
 import { findMsgByToolUseIdInTree } from "./message-tree-utils";
+import { findLatestSpecTasksToolUseId } from "./narrator-message-helpers";
 import {
 	type ContentBlock,
 	type NarratorMsg,
@@ -146,6 +147,8 @@ export interface ChunkTailMeta {
 	turnUsageJson?: NarratorMsg["turnUsageJson"] | null;
 	pruneBoundaryMessageId?: string | null;
 	prunedPercent?: number | null;
+	/** Tool-use id of the most recent spec://tasks.json op; drives SpecTasksDetail spinner. */
+	latestSpecTasksToolUseId?: string | null;
 }
 
 function isErrorSystemMessage(msg: NarratorMsg): boolean {
@@ -156,12 +159,28 @@ function isErrorSystemMessage(msg: NarratorMsg): boolean {
 	);
 }
 
+/**
+ * Latest spec://tasks.json tool-use id across chunks. Scans chunks tail-first and
+ * stops at the first chunk that contains any tasks op (returning the last match
+ * within it), so a long history is not fully traversed on every tail refresh.
+ */
+function findLatestSpecTasksToolUseIdInChunks(chunks: ChunkData[]): string | null {
+	for (let chunkIndex = chunks.length - 1; chunkIndex >= 0; chunkIndex--) {
+		const messages = chunks[chunkIndex]?.messages as NarratorMsg[] | undefined;
+		if (!messages?.length) continue;
+		const found = findLatestSpecTasksToolUseId(messages);
+		if (found) return found;
+	}
+	return null;
+}
+
 function buildChunkTailMeta(
 	chunks: ChunkData[],
 	statusReady: boolean,
 	pruneBoundaryMessageId: string | null,
 	prunedPercent: number | null,
 ): ChunkTailMeta {
+	const latestSpecTasksToolUseId = findLatestSpecTasksToolUseIdInChunks(chunks);
 	let lastRealMessage: ChunkTailMeta["lastRealMessage"] = null;
 	let lastUserMessageId: string | undefined;
 	let contextPercent: number | null | undefined;
@@ -192,6 +211,7 @@ function buildChunkTailMeta(
 					turnUsageJson,
 					pruneBoundaryMessageId,
 					prunedPercent,
+					latestSpecTasksToolUseId,
 				};
 			}
 		}
@@ -203,6 +223,7 @@ function buildChunkTailMeta(
 		contextPercent,
 		turnUsageJson,
 		pruneBoundaryMessageId,
+		latestSpecTasksToolUseId,
 		prunedPercent,
 	};
 }

@@ -167,8 +167,6 @@ CREATE TABLE IF NOT EXISTS narrators (
 	plan_mode INTEGER NOT NULL DEFAULT 0,
 	cwd TEXT,
 	error_message TEXT,
-	todos_json TEXT,
-	todos_tool_use_id TEXT,
 	prune_boundary_message_id TEXT,
 	pruned_percent INTEGER,
 	created_at TEXT NOT NULL,

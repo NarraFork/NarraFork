@@ -20,7 +20,6 @@ import {
 	IconRobot,
 	IconSearch,
 	IconShare,
-	IconTargetArrow,
 	IconTerminal2,
 	IconWand,
 	IconWorldSearch,
@@ -50,10 +49,8 @@ function iconForCategory(category?: ToolCategory): Icon {
 			return IconWorldSearch;
 		case "webFetch":
 			return IconWorldWww;
-		case "todo":
+		case "tasks":
 			return IconListCheck;
-		case "goal":
-			return IconTargetArrow;
 		case "taskOutput":
 			return IconRobot;
 		case "agent":

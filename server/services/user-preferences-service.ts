@@ -1,12 +1,6 @@
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import {
-	containerInstances,
-	narratorGoals,
-	narrators,
-	terminals,
-	userPreferences,
-} from "../db/schema";
+import { containerInstances, narrators, terminals, userPreferences } from "../db/schema";
 import { userPreferencesLock } from "../lib/async-mutex";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { parseDraftTrait, parseSubstatus } from "../lib/narrator-utils";
@@ -167,7 +161,7 @@ export async function enrichTabs(
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
-		// Narrator status + draft/active-goal markers
+		// Narrator status + draft markers
 		const rows = await db
 			.select({
 				id: narrators.id,
@@ -177,15 +171,7 @@ export async function enrichTabs(
 			})
 			.from(narrators)
 			.where(inArray(narrators.id, narratorIds));
-		const activeGoalRows = await db
-			.select({ narratorId: narratorGoals.narratorId })
-			.from(narratorGoals)
-			.where(
-				and(inArray(narratorGoals.narratorId, narratorIds), eq(narratorGoals.status, "active")),
-			)
-			.groupBy(narratorGoals.narratorId);
 		const narratorMap = new Map(rows.map((r) => [r.id, r]));
-		const activeGoalNarratorIds = new Set(activeGoalRows.map((row) => row.narratorId));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
 			const row = nId ? narratorMap.get(nId) : undefined;
@@ -194,12 +180,9 @@ export async function enrichTabs(
 				tab.substatus = parseSubstatus(row.substatus);
 				if (parseDraftTrait(row.traits)) tab.hasDraft = true;
 				else delete tab.hasDraft;
-				if (activeGoalNarratorIds.has(row.id)) tab.hasActiveGoal = true;
-				else delete tab.hasActiveGoal;
 			} else {
 				delete tab.substatus;
 				delete tab.hasDraft;
-				delete tab.hasActiveGoal;
 			}
 		}
 

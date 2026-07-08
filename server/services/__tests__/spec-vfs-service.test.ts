@@ -1,5 +1,5 @@
 /**
- * Integration tests for the Living Work Spec VFS.
+ * Integration tests for the Dynamic Spec VFS.
  *
  * Run with an isolated data dir, for example:
  * NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$HOME/.narrafork/perf-isolation/spec-vfs-test \
@@ -12,10 +12,12 @@ import { narrators, specProtectedTasks } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import {
 	analyzeSpecWriteCandidate,
+	appendProtectedSpecTask,
 	deleteSpecFile,
 	forkSpecNamespace,
 	listSpecFiles,
 	readSpecFile,
+	readTasksFileForNarrator,
 	writeSpecFile,
 } from "../spec-vfs-service";
 
@@ -60,11 +62,29 @@ describe("spec VFS built-ins", () => {
 		expect(files.map((file) => file.uri)).toContain("spec://behavior_fence");
 	});
 
-	test("rejects agent writes to behavior_fence (agent-readonly)", async () => {
-		// Default actor is "agent"; behavior_fence is agent-readonly.
+	test("rejects agent writes to behavior_fence without a mutation grant", async () => {
+		// Default actor is "agent"; behavior_fence is agent-readonly unless allowFenceMutation is set.
 		expect(writeSpecFile(parentNarratorId, "spec://behavior_fence", "overwrite")).rejects.toThrow(
-			/read-only behavior fence/,
+			/first tool call of the current user turn/,
 		);
+	});
+
+	test("allows agent writes to behavior_fence when allowFenceMutation is granted", async () => {
+		const body = "# Behavior Fence\n\nAlways run the linter before committing.\n";
+		const written = await writeSpecFile(parentNarratorId, "spec://behavior_fence", body, {
+			allowFenceMutation: true,
+		});
+		expect(written.content).toBe(body);
+		const reread = await readSpecFile(parentNarratorId, "spec://behavior_fence");
+		expect(reread.content).toBe(body);
+	});
+
+	test("behavior_fence default content is empty", async () => {
+		// A fresh narrator's behavior_fence must be empty so nothing is injected by default.
+		const freshId = generateId();
+		await createNarrator(freshId);
+		const fence = await readSpecFile(freshId, "spec://behavior_fence");
+		expect(fence.content).toBe("");
 	});
 
 	test("behavior_fence exposes agent-readonly but UI-editable metadata", async () => {
@@ -167,6 +187,45 @@ describe("spec VFS tasks.json writes", () => {
 		expect(
 			locks.some((lock) => lock.text === "Must verify before completion" && lock.status === "done"),
 		).toBe(true);
+	});
+});
+
+describe("appendProtectedSpecTask (/goal command)", () => {
+	test("appends a protected todo task and creates a protected lock", async () => {
+		const narratorId = `spec-goal-${TAG}`;
+		await createNarrator(narratorId);
+
+		const { added, written } = await appendProtectedSpecTask(narratorId, "  Ship the release  ");
+		expect(added).toBe(true);
+
+		const doc = JSON.parse(written.content);
+		const task = doc.tasks.find((t: { text: string }) => t.text === "Ship the release");
+		expect(task).toMatchObject({ text: "Ship the release", status: "todo", protected: true });
+
+		const locks = await db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, written.namespaceId),
+		});
+		expect(locks.some((lock) => lock.text === "Ship the release")).toBe(true);
+	});
+
+	test("is idempotent — does not duplicate an existing task", async () => {
+		const narratorId = `spec-goal-dup-${TAG}`;
+		await createNarrator(narratorId);
+
+		await appendProtectedSpecTask(narratorId, "Only once");
+		const second = await appendProtectedSpecTask(narratorId, "Only once");
+		expect(second.added).toBe(false);
+
+		const file = await readTasksFileForNarrator(narratorId);
+		const doc = JSON.parse(file.content);
+		const matches = doc.tasks.filter((t: { text: string }) => t.text === "Only once");
+		expect(matches).toHaveLength(1);
+	});
+
+	test("rejects an empty objective", async () => {
+		const narratorId = `spec-goal-empty-${TAG}`;
+		await createNarrator(narratorId);
+		expect(appendProtectedSpecTask(narratorId, "   ")).rejects.toThrow(/must not be empty/);
 	});
 });
 

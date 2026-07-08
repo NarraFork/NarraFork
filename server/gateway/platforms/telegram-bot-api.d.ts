@@ -13,7 +13,14 @@ declare module "node-telegram-bot-api" {
 	}
 
 	class TelegramBot {
-		constructor(token: string, options?: { polling?: boolean });
+		constructor(
+			token: string,
+			options?: {
+				polling?: boolean;
+				/** Options forwarded to the underlying HTTP client (@cypress/request). */
+				request?: { url?: string; proxy?: string };
+			},
+		);
 		on(event: "message", callback: (msg: TelegramMessage) => void): void;
 		on(event: "polling_error", callback: (err: Error) => void): void;
 		on(event: string, callback: (payload: unknown) => void): void;

@@ -65,25 +65,6 @@ export type NarratorServerMessage =
 			reason?: string;
 	  }
 	| {
-			type: "goal_reflection_started";
-			narratorId: string;
-			requestId: string;
-			toolUseId: string;
-			toolName: string;
-			inputJson: unknown;
-			activeGoal: unknown;
-			reason?: string;
-	  }
-	| {
-			type: "goal_reflection_resolved";
-			narratorId: string;
-			requestId: string;
-			toolUseId: string;
-			decision: "allow" | "deny" | "aborted";
-			reason?: string;
-			nextSteps?: string;
-	  }
-	| {
 			type: "task_reflection_started";
 			narratorId: string;
 			requestId: string;
@@ -101,6 +82,16 @@ export type NarratorServerMessage =
 			decision: "allow" | "deny" | "aborted";
 			reason?: string;
 			nextSteps?: string;
+	  }
+	| {
+			type: "task_reflection_stopped";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+			toolName: string;
+			inputJson: unknown;
+			mutations: unknown;
+			reason?: string;
 	  }
 	| {
 			type: "question_reflection_started";
@@ -202,9 +193,6 @@ export type NarratorServerMessage =
 			/** Set when a controlling named narrator proxy-decided this request. */
 			decidedByNarrator?: { id: string; handle: string | null };
 	  }
-	| { type: "todos_updated"; narratorId: string; todos: unknown[]; toolUseId?: string }
-	| { type: "goals_set"; narratorId: string; goals: unknown[] }
-	| { type: "goal_continuation"; narratorId: string; goal: unknown }
 	| {
 			type: "buffer_set";
 			narratorId: string;
@@ -255,6 +243,12 @@ export type NarratorServerMessage =
 			narratorId: string;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+	  }
+	| {
+			type: "behavior_fence_settings_changed";
+			narratorId: string;
+			behaviorFenceIntervalOverride?: number | null;
+			behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 	  }
 	| { type: "user_message"; narratorId: string; message: unknown }
 	| { type: "compacting"; narratorId: string; mode?: "blocking" | "background" }
@@ -556,13 +550,6 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			status: string;
 			substatus?: string[];
-	  }
-	| {
-			type: "subagent_todos_updated";
-			narratorId: string;
-			subagentNarratorId: string;
-			todos: unknown[];
-			toolUseId?: string;
 	  }
 	| {
 			type: "subagent_warning";

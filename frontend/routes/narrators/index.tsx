@@ -136,7 +136,6 @@ function NarratorsPage() {
 						...(event.title !== undefined ? { title: event.title } : {}),
 						...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
 						...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
-						...(event.hasActiveGoal !== undefined ? { hasActiveGoal: event.hasActiveGoal } : {}),
 						updatedAt: new Date().toISOString(),
 					};
 				}),

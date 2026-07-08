@@ -38,8 +38,6 @@ export interface RecentTab {
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
-	/** Runtime-enriched marker: this narrator has an active goal. */
-	hasActiveGoal?: boolean;
 }
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];

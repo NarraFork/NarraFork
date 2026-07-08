@@ -74,7 +74,6 @@ const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
 interface SubagentNarratorData {
 	status?: string;
 	substatus?: string | string[];
-	todosJson?: { id?: string; content?: string; status?: string; activeForm?: string }[] | null;
 	/** Client-only field injected by onSubagentWarning, cleared by onSubagentConclusionUpdated */
 	_retryInfo?: {
 		message: string;
@@ -491,11 +490,6 @@ export const SubagentCard = memo(
 		const saStatus = saNarrator?.status;
 		const saIsWorking = saStatus === "working";
 		const saIsWaiting = saStatus === "waiting";
-		const saTodos = saNarrator?.todosJson;
-		const saActiveTodo = useMemo(() => {
-			if (!Array.isArray(saTodos) || !saTodos.length) return null;
-			return saTodos.find((td) => td.status === "in_progress") ?? null;
-		}, [saTodos]);
 		const saRetryInfo = saNarrator?._retryInfo;
 		const saIsRetrying = !!saRetryInfo;
 
@@ -533,22 +527,10 @@ export const SubagentCard = memo(
 						? t("retryingCountdown", { count, max, seconds: saRetryCountdown })
 						: t("retryingNow", { count, max });
 				}
-				if (saActiveTodo) {
-					return saActiveTodo.content || saActiveTodo.activeForm || null;
-				}
 				if (saIsWaiting) return t("status_waiting");
 			}
 			return null;
-		}, [
-			isTerminal,
-			isInitializing,
-			saIsRetrying,
-			saRetryInfo,
-			saRetryCountdown,
-			saActiveTodo,
-			saIsWaiting,
-			t,
-		]);
+		}, [isTerminal, isInitializing, saIsRetrying, saRetryInfo, saRetryCountdown, saIsWaiting, t]);
 
 		const handleViewSession = useCallback(() => {
 			if (subagentNarratorId && !canViewSubagentSession) return;

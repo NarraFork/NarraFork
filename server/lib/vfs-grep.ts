@@ -2,7 +2,7 @@
  * A minimal, VFS-agnostic grep over an in-memory list of files.
  *
  * This is the search engine behind grepping virtual paths (e.g. the `spec://`
- * Living Work Spec files) where there is no real filesystem for ripgrep to walk.
+ * Dynamic Spec files) where there is no real filesystem for ripgrep to walk.
  * It operates on an already-materialized `{ path, uri, content }[]` list, so it
  * has no dependency on any particular VFS backend and is easy to unit test.
  *

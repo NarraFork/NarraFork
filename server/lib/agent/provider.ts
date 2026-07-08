@@ -242,6 +242,16 @@ export interface ProviderAdapter {
 	/** Convert DB messages to provider history + trailing tool results */
 	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
 
+	/**
+	 * Stable identity ("provider:channel") of the upstream this provider is
+	 * currently routed to, used to gate thinking-signature replay across
+	 * servers. Returns `undefined` for providers that never mint Anthropic-style
+	 * signatures (openai/codex/cline) — such blocks carry no signature so there
+	 * is nothing to gate. For NUG this reflects the active channel (e.g.
+	 * `prepareForModel`/`buildHistory` has resolved the model.
+	 */
+	getActiveReasoningSource?(): string | undefined;
+
 	/** Inject system prompt into the history array (mutates in place) */
 	injectSystemPrompt(
 		history: unknown[],
@@ -297,7 +307,11 @@ export interface ProviderAdapter {
 		/** Provider-native content block index for the text block (for interleaved ordering). */
 		textOutputIndex?: number,
 		/** Anthropic redacted thinking blocks to preserve during a tool-use trajectory. */
-		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
+		redactedThinkingBlocks?: Array<{
+			data: string;
+			outputIndex?: number;
+			signatureSource?: string;
+		}>,
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

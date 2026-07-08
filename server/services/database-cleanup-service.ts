@@ -77,7 +77,6 @@ const SESSION_OWNED_TABLES: TableSessionRelation[] = [
 	{ tableName: "terminal_tabs", alias: "tt", narratorColumn: "narrator_id" },
 	{ tableName: "terminals", alias: "t", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_buffered_messages", alias: "nbm", narratorColumn: "narrator_id" },
-	{ tableName: "narrator_goals", alias: "ng", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_file_snapshots", alias: "nfs", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_patches", alias: "np", narratorColumn: "narrator_id" },
 	{ tableName: "narrator_whitelist_dirs", alias: "nwd", narratorColumn: "narrator_id" },
@@ -331,7 +330,6 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 	if (
 		[
 			"narrators",
-			"narrator_goals",
 			"narrator_messages",
 			"narrator_message_refs",
 			"narrator_sidecars",

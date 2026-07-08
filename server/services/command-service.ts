@@ -76,13 +76,10 @@ export interface BashCommandResult {
 	rawCommand: string;
 }
 
-export type GoalCommandAction = "list" | "add" | "pause" | "resume" | "complete" | "clear";
-
-export interface GoalCommandResult {
+export interface SpecGoalCommandResult {
 	resolved: true;
-	goalCommand: true;
-	action: GoalCommandAction;
-	objective?: string;
+	specGoal: true;
+	objective: string;
 	rawCommand: string;
 }
 
@@ -95,7 +92,7 @@ export type ResolveResult =
 	| UnloadToolNotFound
 	| LoadSkillResult
 	| BashCommandResult
-	| GoalCommandResult;
+	| SpecGoalCommandResult;
 
 /** Parse a user prompt that starts with `/commandName ...rest`. */
 function parseCommandInput(prompt: string): { name: string; input: string } | null {
@@ -302,30 +299,11 @@ export async function resolveCommand(
 		return { resolved: true, bashCommand, rawCommand: prompt };
 	}
 
-	// Handle /goal — manage narrator goal backlog without sending a model turn.
+	// Handle /goal <objective> — add a protected task to spec://tasks.json.
 	if (parsed.name.toLowerCase() === "goal") {
-		const input = parsed.input.trim();
-		const lower = input.toLowerCase();
-		if (!input) return { resolved: true, goalCommand: true, action: "list", rawCommand: prompt };
-		if (lower === "pause") {
-			return { resolved: true, goalCommand: true, action: "pause", rawCommand: prompt };
-		}
-		if (lower === "resume") {
-			return { resolved: true, goalCommand: true, action: "resume", rawCommand: prompt };
-		}
-		if (lower === "done" || lower === "complete") {
-			return { resolved: true, goalCommand: true, action: "complete", rawCommand: prompt };
-		}
-		if (lower === "clear") {
-			return { resolved: true, goalCommand: true, action: "clear", rawCommand: prompt };
-		}
-		return {
-			resolved: true,
-			goalCommand: true,
-			action: "add",
-			objective: input,
-			rawCommand: prompt,
-		};
+		const objective = parsed.input.trim();
+		if (!objective) return { resolved: false };
+		return { resolved: true, specGoal: true, objective, rawCommand: prompt };
 	}
 
 	const commands = await getAvailableCommands(narratorId, userId);
@@ -403,7 +381,7 @@ export async function getSlashMenuItems(
 		{
 			name: "goal",
 			prompt: "/goal <objective>",
-			description: "Add or manage long-running goals",
+			description: "Add a protected task to the task list",
 			source: "user",
 		},
 		...customCommands,

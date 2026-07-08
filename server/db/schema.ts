@@ -267,6 +267,20 @@ export const narrators = sqliteTable(
 		})
 			.notNull()
 			.default("inherit"),
+		autoContinuationOverride: text("auto_continuation_override", {
+			enum: ["inherit", "always", "blockStop", "protectedOnly", "off"],
+		})
+			.notNull()
+			.default("inherit"),
+		/** Behavior fence periodic-injection interval override. null = follow global default;
+		 *  -1 = disabled; >0 = inject the behavior-fence sidecar every N completed tool calls. */
+		behaviorFenceIntervalOverride: integer("behavior_fence_interval_override"),
+		/** Whether the behavior fence rides along with the tasks.json reminder. inherit = follow default. */
+		behaviorFenceAttachOverride: text("behavior_fence_attach_override", {
+			enum: ["inherit", "on", "off"],
+		})
+			.notNull()
+			.default("inherit"),
 		messageCount: integer("message_count").default(0),
 		totalCostUsd: real("total_cost_usd").default(0),
 		lastMessageAt: text("last_message_at"),
@@ -280,8 +294,6 @@ export const narrators = sqliteTable(
 		planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
 		cwd: text("cwd"),
 		errorMessage: text("error_message"),
-		todosJson: text("todos_json", { mode: "json" }),
-		todosToolUseId: text("todos_tool_use_id"),
 		pruneBoundaryMessageId: text("prune_boundary_message_id").references(
 			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narratorMessages
 			(): any => narratorMessages.id,
@@ -327,34 +339,6 @@ export const narrators = sqliteTable(
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		uniqueIndex("idx_narrators_handle").on(table.handle),
-	],
-);
-
-// === narrator_goals ===
-export const narratorGoals = sqliteTable(
-	"narrator_goals",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id, { onDelete: "cascade" }),
-		objective: text("objective").notNull(),
-		status: text("status", {
-			enum: ["pending", "active", "paused", "complete", "cancelled"],
-		})
-			.notNull()
-			.default("pending"),
-		sortOrder: integer("sort_order").notNull().default(0),
-		tokensUsed: integer("tokens_used").notNull().default(0),
-		timeUsedSeconds: integer("time_used_seconds").notNull().default(0),
-		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
-		completedAt: text("completed_at"),
-		createdAt: text("created_at").notNull(),
-		updatedAt: text("updated_at").notNull(),
-	},
-	(table) => [
-		index("idx_narrator_goals_narrator_order").on(table.narratorId, table.sortOrder),
-		index("idx_narrator_goals_status").on(table.narratorId, table.status),
 	],
 );
 

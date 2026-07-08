@@ -5,6 +5,7 @@ import { hooks, narrators } from "../db/schema";
 import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 
 // === Types ===
 
@@ -333,6 +334,7 @@ async function executeHttpHook(
 ): Promise<HookResult> {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), (timeout ?? 30) * 1000);
+	const proxy = resolveProxyForUrl(url);
 
 	try {
 		const response = await fetch(url, {
@@ -343,6 +345,7 @@ async function executeHttpHook(
 			},
 			body: JSON.stringify(input),
 			signal: controller.signal,
+			...(proxy ? { proxy } : {}),
 		});
 
 		clearTimeout(timer);

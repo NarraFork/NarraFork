@@ -11,7 +11,7 @@ import { initTruncateCleanup } from "./truncate";
 initTruncateCleanup();
 
 export type { ReflectionLoopRunOptions } from "./loop";
-export { agentLoop, runReflectionLoop } from "./loop";
+export { agentLoop, runReflectionLoop, TODO_REMINDER_TOOL_INTERVAL } from "./loop";
 export type {
 	DbMessage,
 	DbToolCall,

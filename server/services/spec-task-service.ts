@@ -18,12 +18,6 @@ export interface SpecTasksDocument {
 	tasks: SpecTaskItem[];
 }
 
-export interface LegacyTodoLike {
-	content?: unknown;
-	text?: unknown;
-	status?: unknown;
-}
-
 export interface CompiledSpecTasks {
 	tasks: SpecTaskItem[];
 	currentTask: SpecTaskItem | null;
@@ -62,50 +56,6 @@ function normalizeTaskStatus(value: unknown): SpecTaskStatus {
 		return value;
 	}
 	throw new Error(`Invalid task status: ${String(value)}`);
-}
-
-function legacyTodoToSpecTask(raw: LegacyTodoLike, index: number): SpecTaskItem {
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-		throw new Error(`todos[${index}] must be an object`);
-	}
-	const textSource = typeof raw.content === "string" ? raw.content : raw.text;
-	if (typeof textSource !== "string" || !textSource.trim()) {
-		throw new Error(`todos[${index}].content must be a non-empty string`);
-	}
-	const text = textSource.trim();
-	if ([...text].length > TASK_TEXT_MAX_CHARS) {
-		throw new Error(`todos[${index}].content must be at most ${TASK_TEXT_MAX_CHARS} characters`);
-	}
-	return { text, status: normalizeTaskStatus(raw.status ?? "todo") };
-}
-
-export function buildSpecTasksDocumentFromLegacyTodos(
-	todos: LegacyTodoLike[],
-	existingDocument: SpecTasksDocument = { tasks: [] },
-): SpecTasksDocument {
-	const protectedTasks = existingDocument.tasks.filter((task) => task.protected);
-	const protectedByHash = new Map(
-		protectedTasks.map((task) => [taskTextHash(task.text), task] as const),
-	);
-	const protectedStatusOverrides = new Map<string, SpecTaskStatus>();
-	const replacementTasks: SpecTaskItem[] = [];
-
-	for (const [index, todo] of todos.entries()) {
-		const task = legacyTodoToSpecTask(todo, index);
-		const hash = taskTextHash(task.text);
-		if (protectedByHash.has(hash)) {
-			protectedStatusOverrides.set(hash, task.status);
-			continue;
-		}
-		replacementTasks.push(task);
-	}
-
-	const preservedProtectedTasks = protectedTasks.map((task) => {
-		const overrideStatus = protectedStatusOverrides.get(taskTextHash(task.text));
-		return overrideStatus ? { ...task, status: overrideStatus, protected: true as const } : task;
-	});
-
-	return { tasks: [...preservedProtectedTasks, ...replacementTasks] };
 }
 
 function parseTask(raw: unknown, index: number): SpecTaskItem {
@@ -355,7 +305,6 @@ export const specTaskService = {
 	parseSpecTasksDocument,
 	serializeSpecTasksDocument,
 	compileSpecTasks,
-	buildSpecTasksDocumentFromLegacyTodos,
 	validateSpecTasksWrite,
 	analyzeSpecTasksCandidate,
 	compileTasksForNamespace,

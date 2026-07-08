@@ -18,6 +18,11 @@ import {
 } from "node:fs";
 import { join, relative } from "node:path";
 import { Worker } from "node:worker_threads";
+import {
+	type BinaryMetadata,
+	formatChecksumsReport,
+	formatSha256Sums,
+} from "./lib/binary-metadata";
 
 const ROOT = join(import.meta.dir, "..");
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
@@ -317,6 +322,7 @@ console.log(`\n✓ All ${selectedPlatforms.length} platforms compiled in ${compi
 
 interface WorkerResult {
 	latestYml: { name: string; content: string };
+	metadata?: BinaryMetadata;
 }
 
 function runPostProcessWorker(
@@ -329,16 +335,25 @@ function runPostProcessWorker(
 				distDir: DIST_DIR,
 				root: ROOT,
 				version: VERSION,
+				commit: commitHash,
 			},
 		});
 
-		worker.on("message", (msg: { type: string; message?: string; latestYml?: WorkerResult["latestYml"] }) => {
-			if (msg.type === "log") {
-				console.log(`  [${platform.platformId}] ${msg.message}`);
-			} else if (msg.type === "done") {
-				resolve({ latestYml: msg.latestYml! });
-			}
-		});
+		worker.on(
+			"message",
+			(msg: {
+				type: string;
+				message?: string;
+				latestYml?: WorkerResult["latestYml"];
+				metadata?: BinaryMetadata;
+			}) => {
+				if (msg.type === "log") {
+					console.log(`  [${platform.platformId}] ${msg.message}`);
+				} else if (msg.type === "done") {
+					resolve({ latestYml: msg.latestYml!, metadata: msg.metadata });
+				}
+			},
+		);
 
 		worker.on("error", reject);
 		worker.on("exit", (code) => {
@@ -361,8 +376,40 @@ for (const result of results) {
 }
 console.log(`\n✓ Post-processing completed in ${postMs}ms`);
 
+// Write aggregate checksum files (verifiable provenance for every binary).
+// Best-effort: a failure here must not fail the build.
+const metadataEntries = results
+	.map((r) => r.metadata)
+	.filter((m): m is BinaryMetadata => m !== undefined);
+
+const aggregateFiles: string[] = [];
+if (metadataEntries.length > 0) {
+	try {
+		const sumsName = `narrafork-${VERSION}-SHA256SUMS`;
+		const reportName = `narrafork-${VERSION}-checksums.txt`;
+		writeFileSync(join(DIST_DIR, sumsName), formatSha256Sums(metadataEntries));
+		writeFileSync(join(DIST_DIR, reportName), formatChecksumsReport(VERSION, metadataEntries));
+		aggregateFiles.push(sumsName, reportName);
+		console.log(
+			`✓ Wrote aggregate checksums for ${metadataEntries.length} binaries (${sumsName}, ${reportName})`,
+		);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.warn(`⚠ Failed to write aggregate checksum files: ${message}`);
+	}
+} else {
+	console.warn("⚠ No per-binary metadata collected; skipping aggregate checksum files");
+}
+
 console.log("\n✅ All builds completed!");
 console.log("\nBuilt executables:");
 for (const platform of selectedPlatforms) {
 	console.log(`  - dist/${platform.name}`);
+	console.log(`      dist/${platform.name}.metadata.json`);
+}
+if (aggregateFiles.length > 0) {
+	console.log("\nChecksum files:");
+	for (const name of aggregateFiles) {
+		console.log(`  - dist/${name}`);
+	}
 }

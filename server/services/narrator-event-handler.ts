@@ -137,8 +137,6 @@ export interface EventHandlerContext {
 export interface EventHooks {
 	/** Title tracking after assistant_message */
 	onTitleCheck?: (savedId: string) => Promise<{ titleUpdate?: boolean } | null>;
-	/** Successful TaskCreate tool result */
-	onTodoWrite?: (todos: unknown[], toolUseId: string) => Promise<void>;
 	/** EnterPlanMode tool call */
 	onEnterPlanMode?: () => Promise<void>;
 	/** ExitPlanMode completed successfully */
@@ -155,23 +153,6 @@ export interface EventHooks {
 	onContextUsage?: (percentage: number) => void;
 	/** Error cleanup (partial message removal, orphaned tool calls) */
 	onErrorCleanup?: (message: string) => Promise<void>;
-}
-
-async function loadTaskCreateTodos(
-	narratorId: string,
-	toolUseId: string,
-): Promise<unknown[] | null> {
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { inputJson: true },
-	});
-	const input = row?.inputJson;
-	if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-	const todos = (input as Record<string, unknown>).todos;
-	return Array.isArray(todos) ? todos : null;
 }
 
 // === Streaming snapshot: track in-progress streaming state per narrator ===
@@ -869,6 +850,7 @@ export async function processEvent(
 					type: "redacted_thinking",
 					data: block.data,
 					outputIndex: block.outputIndex,
+					signatureSource: block.signatureSource,
 				});
 			} else if (block.type === "tool_use") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -1078,8 +1060,7 @@ export async function processEvent(
 				}
 			}
 
-			// Main narrator hooks: EnterPlanMode. TaskCreate is synced after a successful
-			// tool_result so failed/protected-task-denied writes do not update legacy todo UI.
+			// Main narrator hooks: EnterPlanMode.
 			for (const tu of event.toolUses) {
 				if (tu.name === "EnterPlanMode" && hooks?.onEnterPlanMode) {
 					await hooks.onEnterPlanMode();
@@ -1283,17 +1264,6 @@ export async function processEvent(
 			// Main narrator: ExitPlanMode
 			if (!event.isError && event.toolName === "ExitPlanMode" && hooks?.onExitPlanMode) {
 				await hooks.onExitPlanMode(event.toolUseId);
-			}
-
-			// Legacy todo state is still used by existing UI surfaces. Sync it only after
-			// TaskCreate succeeds so protected-task reflection denials and write failures
-			// cannot make the UI claim the task list was updated.
-			if (!event.isError && event.toolName === "TaskCreate" && hooks?.onTodoWrite) {
-				const metadataTodos = event.metadata?.todos;
-				const todos = Array.isArray(metadataTodos)
-					? metadataTodos
-					: await loadTaskCreateTodos(narratorId, event.toolUseId);
-				if (todos) await hooks.onTodoWrite(todos, event.toolUseId);
 			}
 			return null;
 		}

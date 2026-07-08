@@ -11,6 +11,13 @@ const dangerReflectionOverrideSchema = z.enum([
 	"standard",
 	"strict",
 ]);
+const autoContinuationOverrideSchema = z.enum([
+	"inherit",
+	"always",
+	"blockStop",
+	"protectedOnly",
+	"off",
+]);
 
 /**
  * Handle for "named narrators": globally-unique, human-friendly mention target.
@@ -40,6 +47,9 @@ export const createNarratorSchema = z.object({
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),
+	autoContinuationOverride: autoContinuationOverrideSchema.optional(),
+	behaviorFenceIntervalOverride: z.number().int().min(-1).max(1000).nullable().optional(),
+	behaviorFenceAttachOverride: booleanOverrideSchema.optional(),
 	// Named narrator: when makeNamed is true, handle is required and the narrator
 	// gets the "named" trait. Named narrators are standalone, long-lived, and
 	// mentionable via @handle in any session.

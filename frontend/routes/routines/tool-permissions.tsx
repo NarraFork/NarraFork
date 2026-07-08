@@ -52,7 +52,6 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Agent", descKey: "tpToolDescAgent", category: "default" },
 	{ name: "EnterPlanMode", descKey: "tpToolDescEnterPlanMode", category: "always-allow" },
 	{ name: "ExitPlanMode", descKey: "tpToolDescExitPlanMode", category: "always-ask" },
-	{ name: "TaskCreate", descKey: "tpToolDescTaskCreate", category: "always-allow" },
 	{ name: "AskUserQuestion", descKey: "tpToolDescAskUserQuestion", category: "always-ask" },
 	{ name: "Skill", descKey: "tpToolDescSkill", category: "always-allow" },
 	{ name: "Await", descKey: "tpToolDescAwait", category: "always-allow" },

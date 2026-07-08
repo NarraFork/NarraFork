@@ -10,7 +10,7 @@ import { settings } from "@server/lib/settings";
 import { type CustomSubagentDef, customSubagentService } from "./custom-subagent-service";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 
-/** Tools available to explore/plan subagents (read + search + shell + conclusion file write + todos) */
+/** Tools available to explore/plan subagents (read + search + shell + conclusion file write) */
 const EXPLORE_PLAN_TOOLS = new Set([
 	"Read",
 	"Glob",
@@ -20,14 +20,13 @@ const EXPLORE_PLAN_TOOLS = new Set([
 	SHELL_TOOL_NAME,
 	"Write",
 	"Edit",
-	"TaskCreate",
 	"TeamStatus",
 	"Await",
 	"Send",
 ]);
 
 /** Tools available to search subagents. Native web_search is provider-side; WebFetch is for follow-up URLs. */
-const SEARCH_TOOLS = new Set(["WebFetch", "TaskCreate", "TeamStatus", "Await", "Send"]);
+const SEARCH_TOOLS = new Set(["WebFetch", "TeamStatus", "Await", "Send"]);
 
 /** Tools that are never available inside subagents. */
 const DISALLOWED_SUBAGENT_TOOLS = new Set(["AskUserQuestion"]);

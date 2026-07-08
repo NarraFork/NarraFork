@@ -39,12 +39,16 @@ import {
 	users,
 } from "../db/schema";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
+import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
+	AUTO_CONTINUATION_OVERRIDE_VALUES,
+	type AutoContinuationOverride,
 	BOOLEAN_OVERRIDE_VALUES,
 	type BooleanOverride,
 	DANGER_REFLECTION_OVERRIDE_VALUES,
 	type DangerReflectionOverride,
+	normalizeAutoContinuationOverride,
 	normalizeBooleanOverride,
 	normalizeDangerReflectionOverride,
 } from "../lib/boolean-override";
@@ -136,10 +140,10 @@ import { chapterFork } from "../services/chapter-fork";
 import { chatGroupService } from "../services/chat-group-service";
 import type {
 	BashCommandResult,
-	GoalCommandResult,
 	LoadSkillResult,
 	LoadToolNotFound,
 	LoadToolResult,
+	SpecGoalCommandResult,
 	UnloadToolNotFound,
 	UnloadToolResult,
 } from "../services/command-service";
@@ -153,7 +157,6 @@ import {
 	rebuildFileStatesExcluding,
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
-import { type NarratorGoalStatus, narratorGoalService } from "../services/narrator-goal-service";
 import {
 	reflectPendingAskUserQuestion,
 	stopDangerReflectionLoop,
@@ -181,7 +184,6 @@ import {
 	isLoopRunning,
 	isNarratorActive,
 	normalizeRollbackBlockIndexForMessage,
-	notifyRunningNarratorGoalStateChanged,
 	pushBufferedMessage,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
@@ -197,7 +199,6 @@ import {
 	runSegmentCompact,
 	sendMessage,
 	setTemporaryModelRestore,
-	startGoalContinuationIfPossible,
 	toBufferSummary,
 	updateActiveDisabledTools,
 	updateActiveNarratorCwdAndSkillContext,
@@ -214,6 +215,8 @@ import {
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { skillService } from "../services/skill-service";
 import { resolveNarratorCwd } from "../services/snapshot-revert";
+import { broadcastSpecChanged } from "../services/spec-broadcast";
+import { appendProtectedSpecTask } from "../services/spec-vfs-service";
 import { usageHistoryService } from "../services/usage-history-service";
 import { syncNarratorDraftToRecentTabs } from "../services/user-preferences-service";
 import {
@@ -291,6 +294,18 @@ function parseDangerReflectionOverride(value: unknown, field: string): DangerRef
 	}
 	throw new ValidationError(
 		`${field} must be one of: ${DANGER_REFLECTION_OVERRIDE_VALUES.join(", ")}`,
+	);
+}
+
+function parseAutoContinuationOverride(value: unknown, field: string): AutoContinuationOverride {
+	if (
+		typeof value === "string" &&
+		AUTO_CONTINUATION_OVERRIDE_VALUES.includes(value as AutoContinuationOverride)
+	) {
+		return value as AutoContinuationOverride;
+	}
+	throw new ValidationError(
+		`${field} must be one of: ${AUTO_CONTINUATION_OVERRIDE_VALUES.join(", ")}`,
 	);
 }
 
@@ -502,10 +517,8 @@ narratorRoutes.get("/", async (c) => {
 			}
 		}
 
-		// Batch fetch presence and goal state
+		// Batch fetch presence
 		const presenceMap = getNarratorPresenceBatch(narratorIds);
-		const activeGoalNarratorIds =
-			await narratorGoalService.getNarratorIdsWithActiveGoals(narratorIds);
 
 		const items = rawItems.map((n) => ({
 			...publicNarratorResponse(n),
@@ -514,7 +527,6 @@ narratorRoutes.get("/", async (c) => {
 			containerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.total ?? 0) : 0,
 			runningContainerCount: n.chapterId ? (containerCounts.get(n.chapterId)?.running ?? 0) : 0,
 			viewers: presenceMap.get(n.id) ?? [],
-			hasActiveGoal: activeGoalNarratorIds.has(n.id),
 		}));
 
 		return c.json({ items, hasMore, nextCursor, totalCount });
@@ -815,155 +827,6 @@ narratorRoutes.delete("/:id/custom-traits/disabled-tools", async (c) => {
 	});
 });
 
-function parseGoalStatus(value: unknown): NarratorGoalStatus | undefined {
-	if (value == null) return undefined;
-	if (["pending", "active", "paused", "complete", "cancelled"].includes(String(value))) {
-		return String(value) as NarratorGoalStatus;
-	}
-	throw new ValidationError("Invalid goal status");
-}
-
-async function persistGoalDisplayMessage(narratorId: string, text: string) {
-	return narratorService.persistDisplayMessage(narratorId, text);
-}
-
-function notifyGoalStateIfRunning(
-	narratorId: string,
-	action: string,
-	result: { goals?: Awaited<ReturnType<typeof narratorGoalService.listGoals>> },
-) {
-	if (!result.goals) return;
-	notifyRunningNarratorGoalStateChanged(narratorId, action, result.goals);
-}
-
-async function handleGoalCommand(narratorId: string, cmd: GoalCommandResult, userId: string) {
-	switch (cmd.action) {
-		case "list":
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				goals: await narratorGoalService.listGoals(narratorId),
-			};
-		case "add":
-			if (!cmd.objective) throw new ValidationError("Goal objective is required");
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				...(await narratorGoalService.createGoal(narratorId, cmd.objective, userId)),
-			};
-		case "pause": {
-			const active = await narratorGoalService.getActiveGoal(narratorId);
-			if (!active) return { goalCommand: true, action: cmd.action, goal: null, goals: [] };
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				...(await narratorGoalService.updateGoal(narratorId, active.id, { status: "paused" })),
-			};
-		}
-		case "resume": {
-			const goals = await narratorGoalService.listGoals(narratorId);
-			const paused = goals.find((goal) => goal.status === "paused");
-			if (paused) {
-				return {
-					goalCommand: true,
-					action: cmd.action,
-					...(await narratorGoalService.updateGoal(narratorId, paused.id, { status: "active" })),
-				};
-			}
-			await narratorGoalService.activateNextPendingGoal(narratorId);
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				goals: await narratorGoalService.listGoals(narratorId),
-			};
-		}
-		case "complete":
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				...(await narratorGoalService.completeActiveGoal(narratorId)),
-			};
-		case "clear":
-			return {
-				goalCommand: true,
-				action: cmd.action,
-				...(await narratorGoalService.clearOpenGoals(narratorId)),
-			};
-	}
-}
-
-narratorRoutes.get("/:id/goals", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	return c.json({ goals: await narratorGoalService.listGoals(id) });
-});
-
-narratorRoutes.post("/:id/goals", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	const body = (await c.req.json()) as { objective?: string };
-	if (!body.objective) throw new ValidationError("objective is required");
-	const userId = c.get("user").sub;
-	const result = await narratorGoalService.createGoal(id, body.objective, userId);
-	notifyGoalStateIfRunning(id, result.created ? "add" : "add_existing", result);
-	await persistGoalDisplayMessage(id, body.objective);
-	const locale = await getUserLanguage(userId);
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
-	return c.json(result, 201);
-});
-
-narratorRoutes.patch("/:id/goals/:goalId", async (c) => {
-	const id = c.req.param("id");
-	const goalId = c.req.param("goalId");
-	await narratorService.getById(id);
-	const body = (await c.req.json()) as { objective?: string; status?: string };
-	const status = parseGoalStatus(body.status);
-	const result = await narratorGoalService.updateGoal(id, goalId, {
-		objective: body.objective,
-		status,
-	});
-	notifyGoalStateIfRunning(id, status ? `update:${status}` : "update", result);
-	if (status === "active") {
-		const userId = c.get("user").sub;
-		const locale = await getUserLanguage(userId);
-		const replyInUserLanguage = await getUserReplyInLanguage(userId);
-		await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
-	}
-	return c.json(result);
-});
-
-narratorRoutes.delete("/:id/goals/:goalId", async (c) => {
-	const id = c.req.param("id");
-	const goalId = c.req.param("goalId");
-	await narratorService.getById(id);
-	const result = await narratorGoalService.removeGoal(id, goalId);
-	notifyGoalStateIfRunning(id, "remove", result);
-	return c.json(result);
-});
-
-narratorRoutes.put("/:id/goals/reorder", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	const body = (await c.req.json()) as { orderedIds?: string[] };
-	if (!Array.isArray(body.orderedIds)) throw new ValidationError("orderedIds is required");
-	const result = await narratorGoalService.reorderGoals(id, body.orderedIds);
-	notifyGoalStateIfRunning(id, "reorder", result);
-	const userId = c.get("user").sub;
-	const locale = await getUserLanguage(userId);
-	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
-	return c.json(result);
-});
-
-narratorRoutes.delete("/:id/goals", async (c) => {
-	const id = c.req.param("id");
-	await narratorService.getById(id);
-	const result = await narratorGoalService.clearOpenGoals(id);
-	notifyGoalStateIfRunning(id, "clear", result);
-	return c.json(result);
-});
-
 /**
  * Resolve @handle mentions of named narrators and bring them into a chat group
  * with this session. Fire-and-forget: never blocks or fails the message request,
@@ -1055,19 +918,55 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		);
 		return c.json(bashResult, 201);
 	}
-	if (cmdResult.resolved && "goalCommand" in cmdResult) {
-		const goalCommand = cmdResult as GoalCommandResult;
-		const result = await handleGoalCommand(id, goalCommand, userId);
-		if (goalCommand.action !== "list") {
-			notifyGoalStateIfRunning(id, goalCommand.action, result);
+	// Handle /goal <objective> — add a protected task to spec://tasks.json.
+	// When the narrator is busy the command is queued like any other message and
+	// the protected task is appended once the buffered command is consumed
+	// (see executeQueuedGoalCommand); this avoids mutating tasks.json mid-turn.
+	if (cmdResult.resolved && "specGoal" in cmdResult) {
+		const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
+		const goalNarratorBusy =
+			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+		if (!goalNarratorBusy) {
+			// Idle: persist the typed /goal command as the canonical user message and
+			// append the protected task immediately.
+			const userMsg = await narratorService.persistUserMessage(
+				id,
+				rawCommand,
+				[{ type: "text", text: rawCommand }],
+				rawCommand,
+				userId,
+			);
+			broadcastToNarrator(id, {
+				type: "user_message",
+				narratorId: id,
+				message: {
+					id: userMsg.id,
+					narratorId: id,
+					role: "user",
+					contentJson: userMsg.contentJson,
+					contentText: userMsg.contentText,
+					commandText: rawCommand,
+					createdAt: userMsg.createdAt,
+					seq: userMsg.seq,
+					children: [],
+					creator: userMsg.creator ?? null,
+				},
+			});
+			const { added, written } = await appendProtectedSpecTask(id, objective);
+			if (added) {
+				broadcastSpecChanged(
+					id,
+					{ uri: written.uri, path: written.path, revisionId: written.revisionId },
+					"ui",
+					"user",
+				);
+			}
+			return c.json({ specGoal: true, added, objective }, 200);
 		}
-		await persistGoalDisplayMessage(id, goalCommand.rawCommand);
-		if (["add", "resume", "complete"].includes(goalCommand.action)) {
-			const locale = await getUserLanguage(userId);
-			const replyInUserLanguage = await getUserReplyInLanguage(userId);
-			await startGoalContinuationIfPossible(id, locale, replyInUserLanguage);
-		}
-		return c.json(result, 200);
+		// Busy: fall through to the shared buffer path. Carry the raw command so the
+		// buffer consumer recognizes it as a /goal and appends the task then.
+		finalMessage = rawCommand;
+		commandText = rawCommand;
 	}
 	let prePromptBashCommand: string | undefined;
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -1102,6 +1001,9 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			),
 			dangerReflectionOverride: normalizeDangerReflectionOverride(
 				narrator.dangerReflectionOverride,
+			),
+			autoContinuationOverride: normalizeAutoContinuationOverride(
+				narrator.autoContinuationOverride,
 			),
 			cwd: currentCwd,
 		});
@@ -2402,6 +2304,7 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 	const updates: {
 		planReflectionAutoApproveOverride?: BooleanOverride;
 		dangerReflectionOverride?: DangerReflectionOverride;
+		autoContinuationOverride?: AutoContinuationOverride;
 	} = {};
 	if (Object.hasOwn(input, "planReflectionAutoApproveOverride")) {
 		updates.planReflectionAutoApproveOverride = parseBooleanOverride(
@@ -2415,12 +2318,64 @@ narratorRoutes.patch("/:id/reflection-overrides", async (c) => {
 			"dangerReflectionOverride",
 		);
 	}
-	if (!updates.planReflectionAutoApproveOverride && !updates.dangerReflectionOverride) {
-		throw new ValidationError("At least one reflection override must be provided");
+	if (Object.hasOwn(input, "autoContinuationOverride")) {
+		updates.autoContinuationOverride = parseAutoContinuationOverride(
+			input.autoContinuationOverride,
+			"autoContinuationOverride",
+		);
+	}
+	if (
+		!updates.planReflectionAutoApproveOverride &&
+		!updates.dangerReflectionOverride &&
+		!updates.autoContinuationOverride
+	) {
+		throw new ValidationError("At least one override must be provided");
 	}
 	await narratorService.getById(id);
 	await narratorService.updateReflectionOverrides(id, updates);
 	broadcastToNarrator(id, { type: "reflection_overrides_changed", narratorId: id, ...updates });
+	return c.json({ ok: true });
+});
+
+// Update per-narrator behavior-fence injection settings (interval + tasks-attach override)
+narratorRoutes.patch("/:id/behavior-fence", async (c) => {
+	const id = c.req.param("id");
+	const body = (await c.req.json()) as unknown;
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		throw new ValidationError("Request body must be an object");
+	}
+	const input = body as Record<string, unknown>;
+	const updates: {
+		behaviorFenceIntervalOverride?: number | null;
+		behaviorFenceAttachOverride?: BooleanOverride;
+	} = {};
+	if (Object.hasOwn(input, "behaviorFenceIntervalOverride")) {
+		const raw = input.behaviorFenceIntervalOverride;
+		if (raw === null) {
+			updates.behaviorFenceIntervalOverride = null;
+		} else if (typeof raw === "number" && Number.isInteger(raw) && raw >= -1 && raw <= 1000) {
+			updates.behaviorFenceIntervalOverride = raw;
+		} else {
+			throw new ValidationError(
+				"behaviorFenceIntervalOverride must be null or an integer between -1 and 1000",
+			);
+		}
+	}
+	if (Object.hasOwn(input, "behaviorFenceAttachOverride")) {
+		updates.behaviorFenceAttachOverride = parseBooleanOverride(
+			input.behaviorFenceAttachOverride,
+			"behaviorFenceAttachOverride",
+		);
+	}
+	if (
+		!Object.hasOwn(updates, "behaviorFenceIntervalOverride") &&
+		!updates.behaviorFenceAttachOverride
+	) {
+		throw new ValidationError("At least one behavior-fence setting must be provided");
+	}
+	await narratorService.getById(id);
+	await narratorService.updateBehaviorFenceSettings(id, updates);
+	broadcastToNarrator(id, { type: "behavior_fence_settings_changed", narratorId: id, ...updates });
 	return c.json({ ok: true });
 });
 
@@ -2965,6 +2920,16 @@ narratorRoutes.post("/permissions/:requestId/stop-plan-reflection", async (c) =>
 	const reason = typeof body.reason === "string" ? body.reason : undefined;
 	const stopped = await takeOverExitPlanReflection(requestId, reason);
 	if (!stopped) return c.json({ error: "Plan reflection request not found" }, 404);
+	return c.json({ ok: true });
+});
+
+// Stop automatic task reflection and leave the protected-task change pending for user decision
+narratorRoutes.post("/permissions/:requestId/stop-task-reflection", async (c) => {
+	const requestId = c.req.param("requestId");
+	const body = await c.req.json().catch(() => ({}));
+	const reason = typeof body.reason === "string" ? body.reason : undefined;
+	const stopped = await takeOverTaskReflection(requestId, reason);
+	if (!stopped) return c.json({ error: "Task reflection request not found" }, 404);
 	return c.json({ ok: true });
 });
 

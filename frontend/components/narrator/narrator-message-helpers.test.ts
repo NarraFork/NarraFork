@@ -1,7 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { getReflectionSuggestion, resolvePendingPerm } from "./narrator-message-helpers";
-import type { PendingPermission } from "./narrator-panel-types";
+import {
+	findLatestSpecTasksToolUseId,
+	getReflectionSuggestion,
+	resolvePendingPerm,
+} from "./narrator-message-helpers";
+import type { NarratorMsg, PendingPermission } from "./narrator-panel-types";
 import type { ToolCallData } from "./ToolCallCard";
+
+function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
+	return {
+		id: "m1",
+		narratorId: "n1",
+		parentToolUseId: null,
+		role: "assistant",
+		contentJson: [],
+		contentText: null,
+		toolCalls: [],
+		children: [],
+		createdAt: "2026-01-01T00:00:00.000Z",
+		...overrides,
+	} as NarratorMsg;
+}
 
 function toolCall(overrides: Partial<ToolCallData> = {}): ToolCallData {
 	return {
@@ -66,31 +85,84 @@ describe("resolvePendingPerm", () => {
 		expect(resolved).toBeNull();
 	});
 
-	test("recognizes goal reflection suggestions without making resolved ones actionable", () => {
+	test("recognizes task reflection suggestions without making resolved ones actionable", () => {
 		expect(
 			getReflectionSuggestion([
 				{
-					type: "goal_reflection",
+					type: "task_reflection",
 					status: "running",
-					requestId: "goal-reflection-1",
-					reason: "Checking completion evidence",
-					nextSteps: "Run the missing verification.",
+					requestId: "task-reflection-1",
+					reason: "Checking protected task change",
+					nextSteps: "Gather concrete evidence.",
 				},
 			]),
 		).toMatchObject({
-			kind: "goal_reflection",
+			kind: "task_reflection",
 			status: "running",
-			requestId: "goal-reflection-1",
-			nextSteps: "Run the missing verification.",
+			requestId: "task-reflection-1",
+			nextSteps: "Gather concrete evidence.",
 		});
 
 		const resolved = resolvePendingPerm(
 			toolCall({
-				permissionSuggestions: [{ type: "goal_reflection", status: "confirmed" }],
+				permissionSuggestions: [{ type: "task_reflection", status: "confirmed" }],
 			}),
 			null,
 		);
 
 		expect(resolved).toBeNull();
+	});
+});
+
+describe("findLatestSpecTasksToolUseId", () => {
+	const tasksBlock = (id: string) => ({
+		type: "tool_use" as const,
+		id,
+		name: "Write",
+		input: { file_path: "spec://tasks.json", content: "{}" },
+	});
+
+	test("returns the last spec tasks tool-use id from contentJson", () => {
+		const messages = [
+			msg({ id: "m1", contentJson: [tasksBlock("t1")] as never }),
+			msg({ id: "m2", contentJson: [tasksBlock("t2")] as never }),
+		];
+		expect(findLatestSpecTasksToolUseId(messages)).toBe("t2");
+	});
+
+	test("ignores non-tasks file operations", () => {
+		const messages = [
+			msg({
+				contentJson: [
+					{
+						type: "tool_use",
+						id: "other",
+						name: "Write",
+						input: { file_path: "src/index.ts", content: "x" },
+					},
+				] as never,
+			}),
+		];
+		expect(findLatestSpecTasksToolUseId(messages)).toBeNull();
+	});
+
+	test("reads spec tasks ops from toolCalls records too", () => {
+		const messages = [
+			msg({
+				toolCalls: [
+					{
+						toolUseId: "tc-tasks",
+						toolName: "Read",
+						inputJson: { file_path: "spec://tasks.json" },
+					},
+				] as never,
+			}),
+		];
+		expect(findLatestSpecTasksToolUseId(messages)).toBe("tc-tasks");
+	});
+
+	test("returns null when there are no spec tasks ops", () => {
+		expect(findLatestSpecTasksToolUseId([msg(), msg()])).toBeNull();
+		expect(findLatestSpecTasksToolUseId([])).toBeNull();
 	});
 });

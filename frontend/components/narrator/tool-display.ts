@@ -5,8 +5,7 @@ export type ToolCategory =
 	| "search"
 	| "webSearch"
 	| "webFetch"
-	| "todo"
-	| "goal"
+	| "tasks"
 	| "taskOutput"
 	| "agent"
 	| "await"
@@ -28,9 +27,18 @@ const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
 const WEB_FETCH_TOOLS = new Set(["WebFetch"]);
-const TODO_TOOLS = new Set(["TaskCreate"]);
-const GOAL_TOOLS = new Set(["GetGoals", "AddGoal", "UpdateGoal"]);
+const SPEC_TASKS_URI = "spec://tasks.json";
 const TASK_OUTPUT_TOOLS = new Set(["TaskOutput"]);
+
+/**
+ * Whether a file tool operates on the Dynamic Spec task queue
+ * (spec://tasks.json). Used to render task-list details instead of a raw file diff.
+ */
+export function isSpecTasksToolUse(name: string, input: unknown): boolean {
+	if (name !== "Read" && name !== "Write" && name !== "Edit") return false;
+	const fp = getFilePath(input);
+	return fp === SPEC_TASKS_URI;
+}
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 const AWAIT_TOOLS = new Set(["Await"]);
 const SEND_TOOLS = new Set(["Send"]);
@@ -51,15 +59,15 @@ const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeAdmin",
 ]);
 
-export function getCategory(name: string): ToolCategory {
+export function getCategory(name: string, input?: unknown): ToolCategory {
+	// Spec task-queue file operations render as a task list, not a raw file diff.
+	if (input !== undefined && isSpecTasksToolUse(name, input)) return "tasks";
 	if (READ_TOOLS.has(name)) return "read";
 	if (FILE_TOOLS.has(name)) return "file";
 	if (BASH_TOOLS.has(name)) return "bash";
 	if (SEARCH_TOOLS.has(name)) return "search";
 	if (WEB_SEARCH_TOOLS.has(name)) return "webSearch";
 	if (WEB_FETCH_TOOLS.has(name)) return "webFetch";
-	if (TODO_TOOLS.has(name)) return "todo";
-	if (GOAL_TOOLS.has(name)) return "goal";
 	if (TASK_OUTPUT_TOOLS.has(name)) return "taskOutput";
 	if (AGENT_TOOLS.has(name)) return "agent";
 	if (AWAIT_TOOLS.has(name)) return "await";
@@ -105,9 +113,8 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 		case "webFetch":
 		case "browser":
 			return "teal";
-		case "todo":
+		case "tasks":
 			return "teal";
-		case "goal":
 		case "share":
 			return "green";
 		case "taskOutput":
@@ -343,7 +350,7 @@ export function getSummary(
 		if (filePath) return `${basename(filePath)} (${chars} chars)`;
 		return chars > 0 ? `${chars} chars` : "";
 	}
-	const cat = getCategory(toolName);
+	const cat = getCategory(toolName, input);
 	switch (cat) {
 		case "read": {
 			const fp = getFilePath(input);
@@ -385,14 +392,8 @@ export function getSummary(
 			if (!url) return mode || "WebFetch";
 			return mode ? `${mode}: ${short(url, 50)}` : short(url, 50);
 		}
-		case "todo":
-			return "Update todos";
-		case "goal": {
-			if (toolName === "GetGoals") return "List goals";
-			if (toolName === "UpdateGoal") return "Complete active goal";
-			const objective = extractField(input, "objective");
-			return objective ? short(objective, 80) : toolName;
-		}
+		case "tasks":
+			return toolName === "Read" ? "Read tasks" : "Update tasks";
 		case "taskOutput": {
 			const taskId = extractField(input, "task_id");
 			return taskId ? `Check ${taskId}` : "Check task output";

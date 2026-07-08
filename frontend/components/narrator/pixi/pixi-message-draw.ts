@@ -1178,9 +1178,11 @@ function drawReviewFeedbackBlock(opts: DrawSpecialBlockOptions) {
 	);
 }
 
-function drawGoalContinuationBlock(opts: DrawSpecialBlockOptions) {
+function drawSpecContinuationBlock(opts: DrawSpecialBlockOptions) {
 	const { textPool, gfx, block, bx, by, theme } = opts;
-	const label = `🎯 Goal: ${compactText(block.text, 100)}`;
+	const blocked = block.type === "spec_blocked_continuation";
+	const prefix = blocked ? "⛔ Blocked task" : "📋 Task";
+	const label = `${prefix}: ${compactText(block.text, 100)}`;
 	const width = Math.min(block.width, Math.max(120, textWidth(label, SMALL_STYLE) + 22));
 	gfx.roundRect(bx, by, width, block.height, 14);
 	gfx.fill({ color: theme.teal, alpha: 0.13 });
@@ -2010,8 +2012,9 @@ function drawSpecialBlock(opts: DrawSpecialBlockOptions): boolean {
 		case "review_feedback":
 			drawReviewFeedbackBlock(opts);
 			return true;
-		case "goal_continuation":
-			drawGoalContinuationBlock(opts);
+		case "spec_continuation":
+		case "spec_blocked_continuation":
+			drawSpecContinuationBlock(opts);
 			return true;
 		default:
 			return false;

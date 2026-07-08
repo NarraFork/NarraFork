@@ -212,12 +212,12 @@ async function syncNarrator(narratorId: string): Promise<void> {
 		(id, chapter_id, api_conversation_id, fork_message_id, type, subagent_type,
 		 title, inherit_mode, parent_narrator_id, context_summary, model, system_prompt,
 		 permission_mode, message_count, total_cost_usd, last_message_at, status,
-		 plan_mode, cwd, error_message, todos_json, todos_tool_use_id,
+		 plan_mode, cwd, error_message,
 		 prune_boundary_message_id, pruned_percent, created_at, substatus, variant, traits,
 		 is_background, background_status, background_result, background_completed_at,
 		 is_ask_in_passing, turn_started_at, message_version, prune_enabled, fast_mode,
 		 relaxed_plan, reasoning_effort, previous_permission_mode, plan_file_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			narrator.id,
 			narrator.chapterId,
@@ -239,8 +239,6 @@ async function syncNarrator(narratorId: string): Promise<void> {
 			Array.isArray(narrator.traits) && narrator.traits.includes("plan") ? 1 : 0,
 			narrator.cwd,
 			narrator.errorMessage,
-			jsonCol(narrator.todosJson),
-			narrator.todosToolUseId,
 			narrator.pruneBoundaryMessageId,
 			narrator.prunedPercent,
 			narrator.createdAt,

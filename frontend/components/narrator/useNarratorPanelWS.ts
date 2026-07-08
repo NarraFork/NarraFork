@@ -4,12 +4,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useTranslation } from "react-i18next";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import {
-	api,
-	type BufferMessageSummary,
-	type NarratorGoal,
-	type SideCarRecord,
-} from "../../lib/api";
+import { api, type BufferMessageSummary, type SideCarRecord } from "../../lib/api";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { localizeNarratorError } from "./error-localization";
 import {
@@ -49,7 +44,6 @@ import type {
 	NarratorMsg,
 	PendingPermission,
 	PermissionCallbacks,
-	TodoItem,
 } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 
@@ -137,9 +131,6 @@ export interface UseNarratorPanelWSOptions {
 	/** Ref to isAtBottom state for unread tracking */
 	isAtBottomRef: React.RefObject<boolean>;
 	scrollToBottom: (instant?: boolean) => void;
-	/** Narrator prop for initial todos */
-	narratorTodosJson?: TodoItem[] | null;
-	narratorTodosToolUseId?: string | null;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
 	/** Initial generic gateway/API quota balance from settings cache. */
@@ -220,9 +211,6 @@ export interface UseNarratorPanelWSReturn {
 	setPaymentRequired: React.Dispatch<React.SetStateAction<PaymentRequiredInfo | null>>;
 	leakedToolEvent: LeakedToolEvent | null;
 	setLeakedToolEvent: React.Dispatch<React.SetStateAction<LeakedToolEvent | null>>;
-	// Todos
-	currentTodos: TodoItem[] | null;
-	todosToolUseId: string | null;
 	// Tool expand
 	expandedToolUseId: string | null;
 	setExpandedToolUseId: React.Dispatch<React.SetStateAction<string | null>>;
@@ -370,8 +358,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		legacyMessageCacheUpdatesEnabled = true,
 		isAtBottomRef,
 		scrollToBottom,
-		narratorTodosJson,
-		narratorTodosToolUseId,
 		isSubagent,
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
@@ -710,15 +696,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Viewers ---
 	const [viewers, setViewers] = useState<ViewerInfo[]>([]);
-
-	// --- Todos ---
-	const [currentTodos, setCurrentTodos] = useState<TodoItem[] | null>(narratorTodosJson ?? null);
-	const [todosToolUseId, setTodosToolUseId] = useState<string | null>(
-		narratorTodosToolUseId ?? null,
-	);
-	useEffect(() => {
-		if (narratorTodosJson) setCurrentTodos(narratorTodosJson);
-	}, [narratorTodosJson]);
 
 	// --- Tool expand ---
 	const [expandedToolUseId, setExpandedToolUseId] = useState<string | null>(null);
@@ -1733,18 +1710,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
 			},
-			onSubagentTodosUpdated: (
-				subagentNarratorId: string,
-				todos: unknown[],
-				_toolUseId?: string,
-			) => {
-				// Update the subagent narrator query cache with new todos
-				qc.setQueryData(
-					["narrators", subagentNarratorId],
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator shape
-					(old: any) => (old ? { ...old, todosJson: todos } : old),
-				);
-			},
 			onSubagentWarning: (
 				subagentNarratorId: string,
 				info: {
@@ -2150,7 +2115,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
-			onGoalReflectionStarted: ({ requestId, toolUseId, inputJson, activeGoal, reason }) => {
+			onTaskReflectionStarted: ({ requestId, toolUseId, inputJson, mutations, reason }) => {
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					return mergeFieldsByIndex(
@@ -2159,16 +2124,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						{
 							status: "pending",
 							...(inputJson ? { inputJson } : {}),
-							permissionDecisionReason: reason ?? "Goal completion reflection in progress",
+							permissionDecisionReason: reason ?? "Task reflection in progress",
 							permissionSuggestions: [
-								{ type: "goal_reflection", status: "running", requestId, reason, activeGoal },
+								{ type: "task_reflection", status: "running", requestId, reason, mutations },
 							],
 						},
 						toolUseIndexRef.current,
 					);
 				});
 			},
-			onGoalReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
+			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
@@ -2182,7 +2147,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							permissionDecisionReason: reason ?? null,
 							permissionSuggestions: [
 								{
-									type: "goal_reflection",
+									type: "task_reflection",
 									status:
 										decision === "allow"
 											? "confirmed"
@@ -2198,6 +2163,52 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						toolUseIndexRef.current,
 					);
 				});
+			},
+			onTaskReflectionStopped: ({
+				requestId,
+				toolUseId,
+				toolName,
+				inputJson,
+				mutations,
+				reason,
+			}) => {
+				// User took over the reflection: surface a normal approve/deny permission
+				// for this protected-task change (mirrors danger reflection takeover).
+				setPendingPermsMap((prev) => {
+					const next = new Map(prev);
+					const existing =
+						next.get(toolUseId) ?? [...next.values()].find((perm) => perm.id === requestId);
+					if (existing) next.delete(existing.toolUseId ?? toolUseId);
+					next.set(toolUseId, {
+						...(existing ?? {}),
+						id: requestId,
+						toolName,
+						toolUseId,
+						inputJson: existing?.inputJson ?? inputJson ?? {},
+						decisionReason: reason ?? existing?.decisionReason,
+						suggestions: [
+							{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
+						],
+					});
+					return next;
+				});
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Task reflection stopped; awaiting user decision",
+							permissionSuggestions: [
+								{ type: "task_reflection", status: "awaiting_user", requestId, reason, mutations },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
 			},
 			onQuestionReflectionStarted: ({ requestId, toolUseId, toolName, inputJson, reason }) => {
 				setPendingPermsMap((prev) => {
@@ -2342,10 +2353,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onTitleUpdated: () => {
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
-			onTodosUpdated: (todos, toolUseId) => {
-				setCurrentTodos(todos);
-				if (toolUseId) setTodosToolUseId(toolUseId);
-			},
 			onBufferSet: (messages) => {
 				setQueuedMessages(messages);
 			},
@@ -2371,9 +2378,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					color: "yellow",
 					autoClose: 6000,
 				});
-			},
-			onGoalsSet: (goals: NarratorGoal[]) => {
-				qc.setQueryData(["narrators", narratorId, "goals"], { goals });
 			},
 			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -3197,8 +3201,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			setPaymentRequired,
 			leakedToolEvent,
 			setLeakedToolEvent,
-			currentTodos,
-			todosToolUseId,
 			expandedToolUseId,
 			setExpandedToolUseId,
 			unreadCount,
@@ -3239,8 +3241,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			retryInfo,
 			paymentRequired,
 			leakedToolEvent,
-			currentTodos,
-			todosToolUseId,
 			expandedToolUseId,
 			unreadCount,
 			viewers,

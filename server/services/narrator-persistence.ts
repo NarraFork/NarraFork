@@ -9,7 +9,11 @@ import {
 	users,
 } from "../db/schema";
 import { narratorSubstatusLock } from "../lib/async-mutex";
-import type { BooleanOverride, DangerReflectionOverride } from "../lib/boolean-override";
+import type {
+	AutoContinuationOverride,
+	BooleanOverride,
+	DangerReflectionOverride,
+} from "../lib/boolean-override";
 import { withDbRetry } from "../lib/db-resilience";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -757,7 +761,7 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
-			| { type: "redacted_thinking"; data: string; outputIndex?: number }
+			| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 			| {
 					type: "tool_use";
 					id: string;
@@ -798,7 +802,7 @@ export const narratorPersistence = {
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
-			| { type: "redacted_thinking"; data: string; outputIndex?: number }
+			| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 			| {
 					type: "tool_use";
 					id: string;
@@ -1028,6 +1032,21 @@ export const narratorPersistence = {
 		updates: {
 			planReflectionAutoApproveOverride?: BooleanOverride;
 			dangerReflectionOverride?: DangerReflectionOverride;
+			autoContinuationOverride?: AutoContinuationOverride;
+		},
+	) {
+		const now = new Date().toISOString();
+		await db
+			.update(narrators)
+			.set({ ...updates, updatedAt: now })
+			.where(eq(narrators.id, narratorId));
+	},
+
+	async updateBehaviorFenceSettings(
+		narratorId: string,
+		updates: {
+			behaviorFenceIntervalOverride?: number | null;
+			behaviorFenceAttachOverride?: BooleanOverride;
 		},
 	) {
 		const now = new Date().toISOString();
@@ -1377,15 +1396,6 @@ export const narratorPersistence = {
 			});
 			return updated;
 		});
-	},
-
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	async updateTodos(narratorId: string, todos: any[], toolUseId?: string) {
-		const now = new Date().toISOString();
-		await db
-			.update(narrators)
-			.set({ todosJson: todos, todosToolUseId: toolUseId ?? null, updatedAt: now })
-			.where(eq(narrators.id, narratorId));
 	},
 
 	async updateToolCallResult(

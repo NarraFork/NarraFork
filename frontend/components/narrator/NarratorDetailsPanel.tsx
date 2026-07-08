@@ -21,6 +21,7 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { IconInfoCircle, IconRefresh, IconUsers } from "@tabler/icons-react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -57,6 +58,7 @@ import type {
 	WhitelistCmd,
 	WhitelistDir,
 } from "../../lib/api";
+import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL, NARRATOR_STATUS_COLORS } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
 import { UserAvatar } from "../UserAvatar";
@@ -308,6 +310,13 @@ export function NarratorDetailsPanel({
 	const updateDisabledToolsMutation = useUpdateDisabledTools();
 	const clearDisabledToolsMutation = useClearDisabledTools();
 	const updateReflectionOverridesMutation = useUpdateReflectionOverrides();
+	const qc = useQueryClient();
+	const updateSettingsMutation = useMutation({
+		mutationFn: api.updateSettings,
+		onSuccess: (data) => {
+			qc.setQueryData(["settings"], data);
+		},
+	});
 	const updateCwdMutation = useUpdateCwd();
 	const [modelPools, setModelPools] = useState<Record<string, string[]>>({
 		explore: [],
@@ -835,25 +844,66 @@ export function NarratorDetailsPanel({
 						<Stack gap={4} align="stretch">
 							<SegmentedControl
 								size="xs"
-								value={planReflectionAutoApproveOverride}
-								onChange={(value) =>
+								fullWidth
+								value={planReflectionAutoApproveEffective ? "on" : "off"}
+								onChange={(value) => {
+									const checked = value === "on";
+									const override =
+										checked === planReflectionAutoApproveGlobal
+											? "inherit"
+											: checked
+												? "on"
+												: "off";
 									updateReflectionOverridesMutation.mutate({
 										id: narratorId,
-										planReflectionAutoApproveOverride: value as BooleanOverride,
-									})
-								}
+										planReflectionAutoApproveOverride: override as BooleanOverride,
+									});
+								}}
 								disabled={updateReflectionOverridesMutation.isPending}
 								data={[
-									{ value: "inherit", label: t("override_inherit") },
 									{ value: "on", label: t("override_on") },
 									{ value: "off", label: t("override_off") },
 								]}
 							/>
-							<Text size="xs" c="dimmed" ta="right">
-								{t("details.effectiveBoolean", {
-									value: planReflectionAutoApproveEffective ? t("details.on") : t("details.off"),
-								})}
-							</Text>
+							{planReflectionAutoApproveOverride !== "inherit" && (
+								<Group justify="space-between" mt={2} wrap="nowrap">
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={() =>
+											updateReflectionOverridesMutation.mutate({
+												id: narratorId,
+												planReflectionAutoApproveOverride: "inherit",
+											})
+										}
+									>
+										{t("override_followDefault")}
+									</Anchor>
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={() => {
+											updateSettingsMutation.mutate({
+												agent: {
+													planReflectionAutoApprove: planReflectionAutoApproveEffective,
+												},
+											});
+											updateReflectionOverridesMutation.mutate({
+												id: narratorId,
+												planReflectionAutoApproveOverride: "inherit",
+											});
+										}}
+									>
+										{t("override_setAsDefault")}
+									</Anchor>
+								</Group>
+							)}
 						</Stack>
 					}
 				/>
@@ -863,6 +913,7 @@ export function NarratorDetailsPanel({
 						<Stack gap={4} align="stretch">
 							<SegmentedControl
 								size="xs"
+								fullWidth
 								value={dangerReflectionEffectiveLevel}
 								onChange={(value) => {
 									const level = value as DangerReflectionLevel;
@@ -878,24 +929,49 @@ export function NarratorDetailsPanel({
 									label: formatDangerReflectionLevel(level, t),
 								}))}
 							/>
-							<Text size="xs" c="dimmed" ta="right">
-								{t("details.effectiveBoolean", {
-									value: formatDangerReflectionLevel(dangerReflectionEffectiveLevel, t),
-								})}
-							</Text>
+							{dangerReflectionOverride !== "inherit" && (
+								<Group justify="space-between" mt={2} wrap="nowrap">
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={() =>
+											updateReflectionOverridesMutation.mutate({
+												id: narratorId,
+												dangerReflectionOverride: "inherit",
+											})
+										}
+									>
+										{t("override_followDefault")}
+									</Anchor>
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline" }}
+										onClick={() => {
+											updateSettingsMutation.mutate({
+												agent: {
+													dangerReflectionLevel: dangerReflectionEffectiveLevel,
+													dangerReflectionEnabled: dangerReflectionEffectiveLevel !== "off",
+												},
+											});
+											updateReflectionOverridesMutation.mutate({
+												id: narratorId,
+												dangerReflectionOverride: "inherit",
+											});
+										}}
+									>
+										{t("override_setAsDefault")}
+									</Anchor>
+								</Group>
+							)}
 						</Stack>
 					}
 				/>
-				<Group justify="flex-end" mt={-6}>
-					<Anchor
-						component="button"
-						type="button"
-						size="xs"
-						onClick={() => navigate({ to: "/settings/agent" })}
-					>
-						{t("globalAgentSettings")}
-					</Anchor>
-				</Group>
 				<DetailRow
 					label={t("details.pruneEnabled")}
 					value={<Text size="sm">{formatBoolean(narrator?.pruneEnabled ?? false)}</Text>}

@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { detectSystemProxy, getOutboundProxy, resolveProxyForUrl } from "@server/lib/net/proxy";
+import {
+	closeUndiciDispatcher,
+	createProxyAgent,
+	createUndiciProxyDispatcher,
+	detectSystemProxy,
+	getOutboundProxy,
+	isSocksProxy,
+	resolveProxyForUrl,
+} from "@server/lib/net/proxy";
 import { settings } from "@server/lib/settings";
 
 const ENV_KEYS = [
@@ -73,5 +81,58 @@ describe("net/proxy resolver", () => {
 		expect(resolveProxyForUrl("https://api.example.com")).toBeUndefined();
 		expect(resolveProxyForUrl("https://svc.internal.net")).toBeUndefined();
 		expect(resolveProxyForUrl("https://api.anthropic.com")).toBe("http://custom:3128");
+	});
+});
+
+describe("net/proxy agent factory", () => {
+	test("isSocksProxy recognizes socks schemes", () => {
+		expect(isSocksProxy("socks://h:1080")).toBe(true);
+		expect(isSocksProxy("socks4://h:1080")).toBe(true);
+		expect(isSocksProxy("socks4a://h:1080")).toBe(true);
+		expect(isSocksProxy("socks5://h:1080")).toBe(true);
+		expect(isSocksProxy("socks5h://h:1080")).toBe(true);
+		expect(isSocksProxy("SOCKS5://h:1080")).toBe(true);
+		expect(isSocksProxy("  socks5://h:1080  ")).toBe(true);
+	});
+
+	test("isSocksProxy rejects http(s) schemes", () => {
+		expect(isSocksProxy("http://h:8080")).toBe(false);
+		expect(isSocksProxy("https://h:8080")).toBe(false);
+		expect(isSocksProxy("socksfoo://h")).toBe(false);
+	});
+
+	test("createProxyAgent returns undefined for a falsy url", async () => {
+		expect(await createProxyAgent(undefined)).toBeUndefined();
+		expect(await createProxyAgent("")).toBeUndefined();
+	});
+
+	test("createProxyAgent builds a SocksProxyAgent for socks urls", async () => {
+		const agent = await createProxyAgent("socks5://127.0.0.1:1080");
+		expect(agent).toBeDefined();
+		expect(agent?.constructor.name).toBe("SocksProxyAgent");
+	});
+
+	test("createProxyAgent builds an HttpsProxyAgent for http urls", async () => {
+		const agent = await createProxyAgent("http://127.0.0.1:3128");
+		expect(agent).toBeDefined();
+		expect(agent?.constructor.name).toBe("HttpsProxyAgent");
+	});
+
+	test("createUndiciProxyDispatcher returns undefined for socks (unsupported) and falsy", async () => {
+		expect(await createUndiciProxyDispatcher(undefined)).toBeUndefined();
+		expect(await createUndiciProxyDispatcher("socks5://127.0.0.1:1080")).toBeUndefined();
+	});
+
+	test("createUndiciProxyDispatcher builds a dispatcher for http urls", async () => {
+		const dispatcher = await createUndiciProxyDispatcher("http://127.0.0.1:3128");
+		expect(dispatcher).toBeDefined();
+		// close/destroy may be absent under Bun's undici shim — teardown must be safe.
+		await closeUndiciDispatcher(dispatcher);
+	});
+
+	test("closeUndiciDispatcher tolerates undefined and missing teardown methods", async () => {
+		await closeUndiciDispatcher(undefined);
+		await closeUndiciDispatcher(null);
+		await closeUndiciDispatcher({});
 	});
 });

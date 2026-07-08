@@ -1,11 +1,10 @@
 /**
- * Unit tests for Living Work Spec task parsing/compilation.
+ * Unit tests for Dynamic Spec task parsing/compilation.
  *
  * These are pure tests and do not touch the database.
  */
 import { describe, expect, test } from "bun:test";
 import {
-	buildSpecTasksDocumentFromLegacyTodos,
 	compileSpecTasks,
 	parseSpecTasksDocument,
 	serializeSpecTasksDocument,
@@ -112,27 +111,5 @@ describe("spec task compilation", () => {
 			'{\n\t"tasks": [\n\t\t{\n\t\t\t"text": "A",\n\t\t\t"status": "todo"\n\t\t}\n\t]\n}\n',
 		);
 		expect(taskTextHash("  same text  ")).toBe(taskTextHash("same text"));
-	});
-});
-
-describe("legacy TaskCreate compatibility", () => {
-	test("replaces non-protected tasks while preserving protected tasks", () => {
-		const doc = buildSpecTasksDocumentFromLegacyTodos(
-			[
-				{ content: "Replacement", status: "pending" },
-				{ content: "Protected", status: "in_progress" },
-			],
-			{
-				tasks: [
-					{ text: "Protected", status: "todo", protected: true },
-					{ text: "Old normal", status: "todo" },
-				],
-			},
-		);
-
-		expect(doc.tasks).toEqual([
-			{ text: "Protected", status: "doing", protected: true },
-			{ text: "Replacement", status: "todo" },
-		]);
 	});
 });

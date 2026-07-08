@@ -1,7 +1,7 @@
 import type { PendingPermission } from "@frontend/types/narrator";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { BufferMessageSummary, NarratorGoal, SideCarRecord, TreeMessage } from "../lib/api";
+import type { BufferMessageSummary, SideCarRecord, TreeMessage } from "../lib/api";
 import {
 	type ListenerHandle,
 	type NarratorSubscriptionKind,
@@ -99,20 +99,28 @@ interface NarratorWSCallbacks {
 		inputJson?: Record<string, unknown>;
 		reason?: string;
 	}) => void;
-	onGoalReflectionStarted?: (data: {
+	onTaskReflectionStarted?: (data: {
 		requestId: string;
 		toolUseId: string;
 		toolName: string;
 		inputJson?: Record<string, unknown>;
-		activeGoal?: unknown;
+		mutations?: unknown;
 		reason?: string;
 	}) => void;
-	onGoalReflectionResolved?: (data: {
+	onTaskReflectionResolved?: (data: {
 		requestId: string;
 		toolUseId: string;
 		decision: "allow" | "deny" | "aborted";
 		reason?: string;
 		nextSteps?: string;
+	}) => void;
+	onTaskReflectionStopped?: (data: {
+		requestId: string;
+		toolUseId: string;
+		toolName: string;
+		inputJson?: Record<string, unknown>;
+		mutations?: unknown;
+		reason?: string;
 	}) => void;
 	onQuestionReflectionStarted?: (data: {
 		requestId: string;
@@ -162,17 +170,11 @@ interface NarratorWSCallbacks {
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
 	onTitleUpdated?: (title: string) => void;
-	onTodosUpdated?: (
-		todos: { id?: string; content?: string; status?: string }[],
-		toolUseId?: string,
-	) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
 	onQueuedNewNarratorCreated?: (messageId: string, newNarratorId: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onBufferPreserved?: (messages: BufferMessageSummary[]) => void;
-	onGoalsSet?: (goals: NarratorGoal[]) => void;
-	onGoalContinuation?: (goal: NarratorGoal) => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
 	onPlanModeChanged?: (planMode: boolean, traits?: string[]) => void;
 	onCustomTraitsChanged?: (traits?: string[]) => void;
@@ -272,11 +274,6 @@ interface NarratorWSCallbacks {
 		subagentNarratorId: string,
 		status: string,
 		substatus?: string[],
-	) => void;
-	onSubagentTodosUpdated?: (
-		subagentNarratorId: string,
-		todos: { id?: string; content?: string; status?: string }[],
-		toolUseId?: string,
 	) => void;
 	onSubagentWarning?: (
 		subagentNarratorId: string,
@@ -520,23 +517,33 @@ export function useNarratorWS(
 							reason: data.reason as string | undefined,
 						});
 						break;
-					case "goal_reflection_started":
-						callbacksRef.current.onGoalReflectionStarted?.({
+					case "task_reflection_started":
+						callbacksRef.current.onTaskReflectionStarted?.({
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							toolName: data.toolName as string,
 							inputJson: data.inputJson as Record<string, unknown> | undefined,
-							activeGoal: data.activeGoal,
+							mutations: data.mutations,
 							reason: data.reason as string | undefined,
 						});
 						break;
-					case "goal_reflection_resolved":
-						callbacksRef.current.onGoalReflectionResolved?.({
+					case "task_reflection_resolved":
+						callbacksRef.current.onTaskReflectionResolved?.({
 							requestId: data.requestId as string,
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
 							reason: data.reason as string | undefined,
 							nextSteps: data.nextSteps as string | undefined,
+						});
+						break;
+					case "task_reflection_stopped":
+						callbacksRef.current.onTaskReflectionStopped?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
+							toolName: data.toolName as string,
+							inputJson: data.inputJson as Record<string, unknown> | undefined,
+							mutations: data.mutations,
+							reason: data.reason as string | undefined,
 						});
 						break;
 					case "question_reflection_started":
@@ -629,12 +636,6 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
-					case "todos_updated":
-						callbacksRef.current.onTodosUpdated?.(
-							data.todos as { id?: string; content?: string; status?: string }[],
-							data.toolUseId as string | undefined,
-						);
-						break;
 					case "title_updated":
 						callbacksRef.current.onTitleUpdated?.(data.title as string);
 						break;
@@ -660,12 +661,6 @@ export function useNarratorWS(
 						break;
 					case "buffer_preserved":
 						callbacksRef.current.onBufferPreserved?.(data.messages as BufferMessageSummary[]);
-						break;
-					case "goals_set":
-						callbacksRef.current.onGoalsSet?.(data.goals as NarratorGoal[]);
-						break;
-					case "goal_continuation":
-						callbacksRef.current.onGoalContinuation?.(data.goal as NarratorGoal);
 						break;
 					case "permission_mode_changed":
 						callbacksRef.current.onPermissionModeChanged?.(data.permissionMode as string);
@@ -940,13 +935,6 @@ export function useNarratorWS(
 							data.substatus as string[] | undefined,
 						);
 						break;
-					case "subagent_todos_updated":
-						callbacksRef.current.onSubagentTodosUpdated?.(
-							data.subagentNarratorId as string,
-							data.todos as { id?: string; content?: string; status?: string }[],
-							data.toolUseId as string | undefined,
-						);
-						break;
 					case "subagent_warning":
 						callbacksRef.current.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
@@ -1144,8 +1132,7 @@ export interface NarratorListWSEvent {
 		| "presence"
 		| "terminalCount"
 		| "containerStatus"
-		| "draft"
-		| "goals";
+		| "draft";
 	status?: string;
 	substatus?: string[];
 	title?: string;
@@ -1159,8 +1146,6 @@ export interface NarratorListWSEvent {
 	activeTerminalCount?: number;
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
-	hasActiveGoal?: boolean;
-	goals?: NarratorGoal[];
 }
 
 export function useNarratorsListWS(
@@ -1217,7 +1202,6 @@ export function useNarratorsListWS(
 					"title_updated",
 					"permission_mode_changed",
 					"presence_update",
-					"goals_set",
 				],
 			},
 			(data) => {
@@ -1249,15 +1233,6 @@ export function useNarratorsListWS(
 							type: "presence",
 							viewers: data.viewers as NarratorListWSEvent["viewers"],
 						});
-				} else if (data.type === "goals_set") {
-					if (nId) {
-						const goals = Array.isArray(data.goals) ? (data.goals as NarratorGoal[]) : [];
-						onUpdateRef.current(nId, {
-							type: "goals",
-							goals,
-							hasActiveGoal: goals.some((goal) => goal.status === "active"),
-						});
-					}
 				}
 			},
 		);

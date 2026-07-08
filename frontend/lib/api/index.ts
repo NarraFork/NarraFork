@@ -134,8 +134,6 @@ export type {
 	LearningSearchResponse,
 	LearningSection,
 	MessageLocationResult,
-	NarratorGoal,
-	NarratorGoalStatus,
 	PaginatedNarrators,
 	PublicCodexPlanTier,
 	PublicCodexQuotaOverview,

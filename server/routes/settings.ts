@@ -264,9 +264,12 @@ const updateSettingsSchema = z
 				dangerReflectionLevel: dangerReflectionLevelSchema,
 				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
+				autoContinuationMode: z.enum(["always", "blockStop", "protectedOnly", "off"]),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
+				behaviorFenceInterval: z.number().int().min(-1).max(1000),
+				behaviorFenceAttachTasks: z.boolean(),
 				retryBackoffCeilMs: z.number().int().min(1000).max(300000),
 				firstTokenTimeoutMs: z.number().int().min(0).max(600000),
 				customRetryRules: z

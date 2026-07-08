@@ -237,10 +237,10 @@ describe("resolvePermissionDecision", () => {
 
 	// --- Always-allow tools ---
 
-	test("TaskCreate is always allowed regardless of mode", () => {
+	test("Skill is always allowed regardless of mode", () => {
 		expect(
 			resolvePermissionDecision({
-				toolName: "TaskCreate",
+				toolName: "Skill",
 				input: {},
 				permMode: "default",
 				cwd: CWD,
@@ -248,7 +248,7 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 		expect(
 			resolvePermissionDecision({
-				toolName: "TaskCreate",
+				toolName: "Skill",
 				input: {},
 				permMode: "dontAsk",
 				cwd: CWD,
@@ -256,7 +256,7 @@ describe("resolvePermissionDecision", () => {
 		).toBe("allow");
 		expect(
 			resolvePermissionDecision({
-				toolName: "TaskCreate",
+				toolName: "Skill",
 				input: {},
 				permMode: "acceptEdits",
 				cwd: CWD,

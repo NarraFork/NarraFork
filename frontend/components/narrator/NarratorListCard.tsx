@@ -13,7 +13,6 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
-	IconTargetArrow,
 	IconTerminal2,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -91,7 +90,6 @@ export interface NarratorListItem {
 	activeTerminalCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
-	hasActiveGoal?: boolean | null;
 	chapter?: NarratorListChapter | null;
 	viewers?: NarratorListViewer[] | null;
 }
@@ -190,23 +188,11 @@ function NarratorBadges({
 	narrator: NarratorListItem;
 	mobile?: boolean;
 }) {
-	const { t } = useTranslation("narrators");
 	const activeTerminals = narrator.activeTerminalCount ?? 0;
 	const containers = narrator.containerCount ?? 0;
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
 		<>
-			{narrator.hasActiveGoal && (
-				<Badge
-					size="xs"
-					variant="light"
-					color="teal"
-					leftSection={<IconTargetArrow size={10} />}
-					style={mobile ? { flexShrink: 0 } : undefined}
-				>
-					{t("activeGoal")}
-				</Badge>
-			)}
 			{activeTerminals > 0 && (
 				<Badge
 					size="xs"

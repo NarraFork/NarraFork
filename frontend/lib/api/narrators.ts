@@ -8,8 +8,6 @@ import type {
 	ChunkManifest,
 	ChunkRangeResult,
 	MessageLocationResult,
-	NarratorGoal,
-	NarratorGoalStatus,
 	PaginatedNarrators,
 	WhitelistCmd,
 	WhitelistDir,
@@ -165,6 +163,9 @@ export const narratorsApi = {
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
+		behaviorFenceIntervalOverride?: number | null;
+		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
 		makeNamed?: boolean;
 		handle?: string;
@@ -272,37 +273,6 @@ export const narratorsApi = {
 		}),
 	leaveNarrator: (id: string) =>
 		request<{ ok: boolean }>(`/narrators/${id}/leave`, { method: "POST" }),
-	getGoals: (id: string) => request<{ goals: NarratorGoal[] }>(`/narrators/${id}/goals`),
-	addGoal: (id: string, objective: string) =>
-		request<{ goal: NarratorGoal; goals: NarratorGoal[] }>(`/narrators/${id}/goals`, {
-			method: "POST",
-			body: JSON.stringify({ objective }),
-		}),
-	updateGoal: (
-		narratorId: string,
-		goalId: string,
-		data: { objective?: string; status?: NarratorGoalStatus },
-	) =>
-		request<{ goal: NarratorGoal | null; goals: NarratorGoal[] }>(
-			`/narrators/${narratorId}/goals/${goalId}`,
-			{ method: "PATCH", body: JSON.stringify(data) },
-		),
-	removeGoal: (narratorId: string, goalId: string) =>
-		request<{ removed: boolean; goals: NarratorGoal[] }>(
-			`/narrators/${narratorId}/goals/${goalId}`,
-			{
-				method: "DELETE",
-			},
-		),
-	clearGoals: (id: string) =>
-		request<{ cleared: number; goals: NarratorGoal[] }>(`/narrators/${id}/goals`, {
-			method: "DELETE",
-		}),
-	reorderGoals: (narratorId: string, orderedIds: string[]) =>
-		request<{ ok: boolean; goals: NarratorGoal[] }>(`/narrators/${narratorId}/goals/reorder`, {
-			method: "PUT",
-			body: JSON.stringify({ orderedIds }),
-		}),
 	getBufferedMessages: (id: string) => request<BufferMessageSummary[]>(`/narrators/${id}/buffer`),
 	updateBufferedMessage: (narratorId: string, messageId: string, text: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
@@ -348,6 +318,10 @@ export const narratorsApi = {
 		}),
 	stopPlanReflection: (requestId: string) =>
 		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-plan-reflection`, {
+			method: "POST",
+		}),
+	stopTaskReflection: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-task-reflection`, {
 			method: "POST",
 		}),
 	updateNarratorTitle: (id: string, title: string) =>
@@ -513,9 +487,21 @@ export const narratorsApi = {
 		data: {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 		},
 	) =>
 		request<{ ok: boolean }>(`/narrators/${id}/reflection-overrides`, {
+			method: "PATCH",
+			body: JSON.stringify(data),
+		}),
+	updateNarratorBehaviorFence: (
+		id: string,
+		data: {
+			behaviorFenceIntervalOverride?: number | null;
+			behaviorFenceAttachOverride?: "inherit" | "on" | "off";
+		},
+	) =>
+		request<{ ok: boolean }>(`/narrators/${id}/behavior-fence`, {
 			method: "PATCH",
 			body: JSON.stringify(data),
 		}),
