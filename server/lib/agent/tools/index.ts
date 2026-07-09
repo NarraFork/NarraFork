@@ -30,10 +30,12 @@ import { recallTool } from "./recall";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
+import { switchDeviceTool } from "./switch-device";
 import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
+import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
 import { writeTool } from "./write";
@@ -118,6 +120,8 @@ const coreProvider: ToolProvider = {
 			skillTool,
 			knowledgeSearchTool,
 			knowledgeReadTool,
+			switchDeviceTool,
+			transferFileTool,
 			dangerConfirmTool,
 			dangerCancelTool,
 			exitPlanConfirmTool,

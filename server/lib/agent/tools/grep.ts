@@ -1,9 +1,11 @@
-import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
-import { isRgAvailable, RG_INSTALL_HINT, resolveRgPath } from "../../ripgrep";
+import { isRgAvailable, RG_INSTALL_HINT } from "../../ripgrep";
 import { settings } from "../../settings";
 import { vfsGrep } from "../../vfs-grep";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 
 export { isRgAvailable };
@@ -50,55 +52,6 @@ async function grepSpecFiles(args: {
 		title: result.title,
 		metadata: result.metadata,
 	};
-}
-
-/**
- * Drain a byte stream up to `maxBytes`, invoking `onLimit` once the cap is hit
- * so the caller can kill the producer process. The stream is always read to
- * completion (or until the reader is released by a kill) to avoid pipe-buffer
- * deadlocks. Raw bytes are preserved (no decoding) so charset detection can run
- * on the result.
- */
-async function drainBytesWithLimit(
-	stream: ReadableStream<Uint8Array>,
-	maxBytes: number,
-	onLimit: () => void,
-): Promise<{ bytes: Uint8Array; truncated: boolean }> {
-	const reader = stream.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	let truncated = false;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			if (!value) continue;
-			if (truncated) continue; // keep draining to let the process exit, but discard
-			if (total + value.byteLength <= maxBytes) {
-				chunks.push(value);
-				total += value.byteLength;
-			} else {
-				const remaining = maxBytes - total;
-				if (remaining > 0) {
-					chunks.push(value.subarray(0, remaining));
-					total += remaining;
-				}
-				truncated = true;
-				onLimit();
-			}
-		}
-	} catch {
-		// Reader released (e.g. process killed) — return what we have.
-	} finally {
-		reader.releaseLock();
-	}
-	const bytes = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		bytes.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return { bytes, truncated };
 }
 
 const DESCRIPTION = `A powerful search tool built on ripgrep
@@ -189,6 +142,9 @@ export const grepTool: ToolDefinition = {
 		},
 		required: ["pattern"],
 		additionalProperties: false,
+	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(grepTool.rawJsonSchema as Record<string, unknown>, config);
 	},
 	parameters: z.object({
 		pattern: z.string().describe("The regular expression pattern to search for in file contents"),
@@ -297,141 +253,66 @@ export const grepTool: ToolDefinition = {
 			});
 		}
 
-		const rgPath = await resolveRgPath();
-		if (!rgPath) {
-			return { output: RG_INSTALL_HINT, isError: true };
-		}
-
-		let searchPath = searchPathArg ?? ctx.cwd;
-		searchPath = isAbsolute(searchPath) ? searchPath : resolve(ctx.cwd, searchPath);
-
-		// Build rg arguments
-		const rgArgs: string[] = [rgPath, "--hidden", "--no-messages"];
-
-		// When legacy encoding is enabled, use --encoding none so rg doesn't skip
-		// non-UTF-8 files. This makes rg search raw bytes, allowing matches in
-		// files encoded as GBK, Shift_JIS, etc.
-		if (settings.agent.legacyEncoding) {
-			rgArgs.push("--encoding", "none");
-		}
-
-		// Output mode flags
-		if (outputMode === "files_with_matches") {
-			rgArgs.push("-l");
-		} else if (outputMode === "count") {
-			rgArgs.push("-c");
-		} else {
-			// content mode
-			if (showLineNumbers) {
-				rgArgs.push("-n");
-			}
-			// Context lines (only in content mode)
-			const effectiveC = cAlias ?? contextLines;
-			if (effectiveC != null) {
-				rgArgs.push("-C", String(effectiveC));
-			} else {
-				if (beforeCtx != null) rgArgs.push("-B", String(beforeCtx));
-				if (afterCtx != null) rgArgs.push("-A", String(afterCtx));
-			}
-		}
-
-		// Case insensitive
-		if (caseInsensitive) {
-			rgArgs.push("-i");
-		}
-
-		// Multiline
-		if (multiline) {
-			rgArgs.push("-U", "--multiline-dotall");
-		}
-
-		// File type filter
-		if (fileType) {
-			rgArgs.push("--type", fileType);
-		}
-
-		// Glob filter
-		if (globPattern) {
-			rgArgs.push("--glob", globPattern);
-		}
-
-		// Pattern and path
-		rgArgs.push("--regexp", pattern, searchPath);
+		const backend = getToolBackend(ctx, (args as { device?: string }).device);
+		const base = toolBaseCwd(backend, ctx.cwd);
+		const searchPath = resolveBackendPath(backend, base, searchPathArg ?? base);
 
 		try {
-			const proc = Bun.spawn(rgArgs, {
-				cwd: ctx.cwd,
-				stdout: "pipe",
-				stderr: "pipe",
+			const grepResult = await backend.grep({
+				pattern,
+				searchPath,
+				cwd: base,
+				glob: globPattern,
+				outputMode,
+				beforeContext: beforeCtx,
+				afterContext: afterCtx,
+				contextLines: cAlias ?? contextLines,
+				showLineNumbers,
+				caseInsensitive,
+				fileType,
+				multiline,
+				rawBytes: settings.agent.legacyEncoding,
+				maxBytes: MAX_GREP_OUTPUT_BYTES,
+				timeoutMs: GREP_TIMEOUT_MS,
 				signal: ctx.signal,
 			});
 
-			// Hard timeout: kill the process if it runs too long (e.g. pathological
-			// regex on a huge tree). Cleared in finally.
-			let timedOut = false;
-			const killProc = () => {
-				try {
-					proc.kill();
-				} catch {
-					// already exited
-				}
-			};
-			const timeoutTimer = setTimeout(() => {
-				timedOut = true;
-				killProc();
-			}, GREP_TIMEOUT_MS);
+			if (grepResult.unavailable) {
+				return { output: RG_INSTALL_HINT, isError: true };
+			}
 
+			const { stderr, exitCode } = grepResult;
+			const outputTruncatedByBytes = grepResult.truncatedByBytes;
+
+			if (grepResult.timedOut) {
+				return {
+					output: `ripgrep timed out after ${GREP_TIMEOUT_MS / 1000}s and was terminated. Narrow your search (add a path, glob, or type filter).`,
+					isError: true,
+				};
+			}
+
+			// When legacy encoding is enabled with --encoding none, rg outputs raw
+			// bytes. We attempt charset detection so that non-UTF-8 content (e.g. GBK
+			// grep results) is decoded correctly.
 			let stdout: string;
-			let stderr: string;
-			let exitCode: number;
-			let outputTruncatedByBytes = false;
-			try {
-				// When legacy encoding is enabled with --encoding none, rg outputs raw
-				// bytes. We read as raw bytes first and attempt charset detection so that
-				// non-UTF-8 content (e.g. GBK grep results) is decoded correctly.
-				// Stdout is bounded to MAX_GREP_OUTPUT_BYTES; exceeding it kills rg so a
-				// runaway search cannot pin the event loop or exhaust memory.
-				const [stdoutResult, stderrResult] = await Promise.all([
-					drainBytesWithLimit(
-						proc.stdout as ReadableStream<Uint8Array>,
-						MAX_GREP_OUTPUT_BYTES,
-						killProc,
-					),
-					new Response(proc.stderr).text(),
-				]);
-				const stdoutBytes = stdoutResult.bytes;
-				outputTruncatedByBytes = stdoutResult.truncated;
-				stderr = stderrResult;
-				exitCode = await proc.exited;
-
-				if (timedOut) {
-					return {
-						output: `ripgrep timed out after ${GREP_TIMEOUT_MS / 1000}s and was terminated. Narrow your search (add a path, glob, or type filter).`,
-						isError: true,
-					};
-				}
-
-				if (settings.agent.legacyEncoding) {
-					const buf = Buffer.from(stdoutBytes);
-					const chardet = await import("chardet");
-					const results = chardet.default.analyse(buf);
-					const best = results[0];
-					if (
-						best &&
-						best.confidence >= 70 &&
-						best.name.toLowerCase() !== "utf-8" &&
-						best.name.toLowerCase() !== "ascii"
-					) {
-						const iconv = await import("iconv-lite");
-						stdout = iconv.default.decode(buf, best.name);
-					} else {
-						stdout = new TextDecoder().decode(stdoutBytes);
-					}
+			if (settings.agent.legacyEncoding) {
+				const buf = Buffer.from(grepResult.stdoutBytes);
+				const chardet = await import("chardet");
+				const results = chardet.default.analyse(buf);
+				const best = results[0];
+				if (
+					best &&
+					best.confidence >= 70 &&
+					best.name.toLowerCase() !== "utf-8" &&
+					best.name.toLowerCase() !== "ascii"
+				) {
+					const iconv = await import("iconv-lite");
+					stdout = iconv.default.decode(buf, best.name);
 				} else {
-					stdout = new TextDecoder().decode(stdoutBytes);
+					stdout = new TextDecoder().decode(grepResult.stdoutBytes);
 				}
-			} finally {
-				clearTimeout(timeoutTimer);
+			} else {
+				stdout = new TextDecoder().decode(grepResult.stdoutBytes);
 			}
 
 			// Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)

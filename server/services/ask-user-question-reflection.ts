@@ -105,6 +105,7 @@ export async function generateAskUserQuestionAnswers(
 		locale?: Locale;
 		model?: string | null;
 		mode?: "suggest" | "reflection";
+		signal?: AbortSignal;
 	} = {},
 ): Promise<Record<string, string>> {
 	const locale = options.locale ?? "en";
@@ -125,6 +126,7 @@ export async function generateAskUserQuestionAnswers(
 		locale,
 		{
 			reasoningEffort: "none",
+			...(options.signal ? { signal: options.signal } : {}),
 		},
 	);
 	const parsed = parseAnswerObject(raw);

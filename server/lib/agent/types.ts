@@ -81,6 +81,24 @@ export interface ToolContext {
 	currentToolUseId?: string;
 	/** Context for bounded reflection loops, such as danger reflection review. */
 	reflectionLoop?: ReflectionLoopContext;
+	/**
+	 * Resolve the execution backend for a tool call. Injected by executeTool.
+	 * `device` is the optional per-call device parameter; when omitted the
+	 * session default (or local) is used. When this whole function is absent
+	 * (e.g. unit tests that build a bare ToolContext), tools fall back to the
+	 * local backend via `getToolBackend()`.
+	 */
+	resolveBackend?: (device?: string) => import("./execution/backend").ExecutionBackend;
+	/** Devices this session may route to (empty/undefined → only local). */
+	availableDevices?: import("./execution/backend").DeviceSummary[];
+	/** The session's default execution device id (undefined/null → local). */
+	defaultDeviceId?: string | null;
+	/**
+	 * Set the session's default execution device (SwitchDevice tool). Persists to
+	 * the narrator record and updates the live session. Returns false when the
+	 * session cannot be found. Absent for callers without a live session.
+	 */
+	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
 }
 
 export interface ToolResult {
@@ -533,6 +551,22 @@ export interface AgentConfig {
 	userId?: string | null;
 	/** Project this narrator belongs to — scopes knowledge injection to this project + global. */
 	projectId?: string | null;
+	/**
+	 * Default execution device for this session (from SwitchDevice or the global
+	 * default). undefined/null → local server. Flows into ToolContext so file/
+	 * command tools route their IO to the right backend.
+	 */
+	defaultDeviceId?: string | null;
+	/**
+	 * Devices this session may route to (online + authorized). Empty/undefined →
+	 * only local, and tools hide the `device` parameter + SwitchDevice entirely.
+	 */
+	availableDevices?: import("./execution/backend").DeviceSummary[];
+	/**
+	 * Persist + apply a new session default device (SwitchDevice tool). Flows
+	 * into ToolContext.setDefaultDevice. Absent → SwitchDevice reports failure.
+	 */
+	setDefaultDevice?: (deviceId: string | null) => Promise<boolean>;
 	/**
 	 * Shared de-dup set of knowledge-base entry ids already injected in the current compact
 	 * cycle. Passed in by the session runner so passive injection at the user-message point

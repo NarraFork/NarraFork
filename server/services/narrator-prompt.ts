@@ -29,6 +29,17 @@ export interface BuildPromptOptions {
 	replyInUserLanguage?: boolean;
 	/** Global default system prompt (used when basePrompt is null) */
 	defaultSystemPrompt?: string | null;
+	/** Online remote execution devices this session may route tools to. */
+	devices?: Array<{
+		id: string;
+		name: string;
+		description?: string | null;
+		online: boolean;
+		platform?: { os: string; arch: string };
+		defaultCwd?: string | null;
+	}>;
+	/** Current session default device id (null/undefined → local server). */
+	defaultDeviceId?: string | null;
 }
 
 export interface BuildPromptResult {
@@ -57,6 +68,8 @@ export async function buildEffectiveSystemPrompt(
 		planAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
+		devices,
+		defaultDeviceId,
 	} = options;
 
 	// Fall back to global default system prompt when basePrompt is null
@@ -105,6 +118,38 @@ export async function buildEffectiveSystemPrompt(
 			cwdSection += `\n\nIMPORTANT: This is a native Windows environment. Do NOT suggest switching to WSL (Windows Subsystem for Linux), installing WSL, or running commands through WSL. All tools and commands must work natively on Windows.`;
 		}
 		prompt = `${base}${sep}${cwdSection}`;
+	}
+
+	// 2a. Inject the Execution Devices section when the session has online remote
+	// executors. Omitted entirely for the local-only case.
+	{
+		const onlineDevices = (devices ?? []).filter((d) => d.online);
+		if (onlineDevices.length > 0) {
+			const base = prompt ?? "";
+			const sep = base ? "\n\n" : "";
+			const currentTarget =
+				defaultDeviceId && defaultDeviceId !== "local"
+					? (onlineDevices.find((d) => d.id === defaultDeviceId)?.name ?? defaultDeviceId)
+					: "local (the NarraFork server)";
+			const deviceLines = onlineDevices.map((d) => {
+				const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
+				const purpose = d.description ? ` — ${d.description}` : "";
+				const cwd = d.defaultCwd ? ` (default cwd: ${d.defaultCwd})` : "";
+				return `- \`${d.id}\` — ${d.name}${platform}${purpose}${cwd}`;
+			});
+			const deviceSection =
+				`## Execution Devices\n\n` +
+				`Besides the local NarraFork server, this session can run file and command tools ` +
+				`(Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) on remote executor devices.\n\n` +
+				`Current default execution target: **${currentTarget}**.\n\n` +
+				`Available remote devices:\n${deviceLines.join("\n")}\n\n` +
+				`- By default, tools run on the current default target.\n` +
+				`- To run a single operation on a specific machine, pass the \`device\` parameter ` +
+				`(e.g. \`device: "${onlineDevices[0].id}"\`, or \`"local"\` for the server).\n` +
+				`- To change the default target for subsequent tools, use the SwitchDevice tool.\n` +
+				`- Paths and commands are interpreted on the target device's filesystem, not the server's.`;
+			prompt = `${base}${sep}${deviceSection}`;
+		}
 	}
 
 	// 2b. Inject Dynamic Spec usage so models know spec:// exists even before tasks do.

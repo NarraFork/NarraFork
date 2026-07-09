@@ -155,3 +155,104 @@ export async function request<T>(
 	const errorText = truncated ? `${text}\n…` : text;
 	throw new ApiError(errorText || "Invalid response", response.status, { error: errorText });
 }
+
+/** HTTP statuses that must not carry a body when constructing a Response. */
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
+function parseRawHeaders(raw: string): Headers {
+	const headers = new Headers();
+	for (const line of raw.trim().split(/[\r\n]+/)) {
+		const idx = line.indexOf(":");
+		if (idx <= 0) continue;
+		const key = line.slice(0, idx).trim();
+		const value = line.slice(idx + 1).trim();
+		if (key) headers.append(key, value);
+	}
+	return headers;
+}
+
+/**
+ * POST a FormData body while reporting upload progress. `fetch` cannot surface
+ * upload progress, so this uses XMLHttpRequest and rebuilds a standard
+ * `Response` from the result — callers keep using `readFetchError` / `res.json()`
+ * exactly as they would with `fetch`. Network errors / timeouts / aborts reject.
+ *
+ * The Content-Type is intentionally left unset so the browser adds the multipart
+ * boundary automatically; do not pass a Content-Type header here.
+ */
+export function postFormDataWithProgress(
+	url: string,
+	formData: FormData,
+	options?: {
+		headers?: Record<string, string>;
+		onProgress?: (fraction: number) => void;
+		signal?: AbortSignal;
+	},
+): Promise<Response> {
+	return new Promise((resolve, reject) => {
+		const signal = options?.signal;
+		if (signal?.aborted) {
+			reject(new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" }));
+			return;
+		}
+
+		const xhr = new XMLHttpRequest();
+		xhr.open("POST", url);
+
+		if (options?.headers) {
+			for (const [key, value] of Object.entries(options.headers)) {
+				// Skip Content-Type so the browser sets the multipart boundary.
+				if (key.toLowerCase() === "content-type") continue;
+				xhr.setRequestHeader(key, value);
+			}
+		}
+
+		const onProgress = options?.onProgress;
+		if (onProgress) {
+			xhr.upload.onprogress = (event) => {
+				if (event.lengthComputable && event.total > 0) {
+					onProgress(event.loaded / event.total);
+				}
+			};
+		}
+
+		const onAbort = () => xhr.abort();
+		if (signal) signal.addEventListener("abort", onAbort);
+		const cleanup = () => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+		};
+
+		xhr.onload = () => {
+			cleanup();
+			const status = xhr.status;
+			const headers = parseRawHeaders(xhr.getAllResponseHeaders());
+			const body = NULL_BODY_STATUSES.has(status) ? null : xhr.responseText;
+			resolve(new Response(body, { status, statusText: xhr.statusText, headers }));
+		};
+		xhr.onerror = () => {
+			cleanup();
+			reject(new ApiError("Network request failed", 0));
+		};
+		xhr.ontimeout = () => {
+			cleanup();
+			reject(new ApiError("Request timed out", 0));
+		};
+		xhr.onabort = () => {
+			cleanup();
+			reject(new ApiError("Upload cancelled", 0, { code: "UPLOAD_ABORTED" }));
+		};
+
+		xhr.send(formData);
+	});
+}
+
+/**
+ * Whether an error represents a user-initiated cancellation (AbortSignal) rather
+ * than a real failure. Covers both the XHR upload path (ApiError code) and
+ * fetch's native `AbortError` so callers can suppress error toasts uniformly.
+ */
+export function isAbortError(err: unknown): boolean {
+	if (err instanceof DOMException && err.name === "AbortError") return true;
+	if (err instanceof ApiError && err.data?.code === "UPLOAD_ABORTED") return true;
+	return false;
+}

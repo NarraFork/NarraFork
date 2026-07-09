@@ -1,11 +1,14 @@
 import { createReadStream } from "node:fs";
-import { lstat, readdir } from "node:fs/promises";
-import { extname, resolve } from "node:path";
+import { extname } from "node:path";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
-import { imageToBase64 } from "../../uploads";
+import { imageBytesToBase64, imageToBase64 } from "../../uploads";
+import type { ExecutionBackend } from "../execution/backend";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
-import { readFileText } from "./encoding";
+import { decodeFileBytes } from "./encoding";
 
 /**
  * When limit = -1 (read-all mode), cap output at ≈100 KB of text
@@ -80,6 +83,9 @@ export const readTool: ToolDefinition = {
 		required: ["file_path"],
 		additionalProperties: false,
 	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(readTool.rawJsonSchema as Record<string, unknown>, config);
+	},
 	parameters: z.object({
 		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to read"),
 		offset: z
@@ -130,6 +136,17 @@ export const readTool: ToolDefinition = {
 				const end = limit && limit !== -1 ? start + limit : lines.length;
 				const slice = lines.slice(start, end);
 				const numbered = formatNumberedLines(slice, start + 1);
+				let tasks: unknown;
+				if (file_path === "spec://tasks.json") {
+					try {
+						const parsed = JSON.parse(file.content);
+						if (parsed && Array.isArray(parsed.tasks)) {
+							tasks = parsed.tasks;
+						}
+					} catch {
+						// ignore parse error
+					}
+				}
 				return {
 					output: numbered || "(empty file)",
 					title: file.uri,
@@ -140,6 +157,7 @@ export const readTool: ToolDefinition = {
 						specPath: file.path,
 						readonly: file.readonly,
 						builtin: file.builtin,
+						tasks,
 					},
 				};
 			} catch (err) {
@@ -150,13 +168,14 @@ export const readTool: ToolDefinition = {
 			}
 		}
 
-		const resolvedPath = resolve(ctx.cwd, file_path);
+		const backend = getToolBackend(ctx, (args as { device?: string }).device);
+		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
 
 		// ── Directory handling: list contents instead of erroring ──
 		try {
-			const stat = await lstat(resolvedPath);
-			if (stat.isDirectory()) {
-				return await listDirectory(file_path, resolvedPath);
+			const stat = await backend.statFile(resolvedPath);
+			if (stat?.isDirectory) {
+				return await listDirectory(file_path, resolvedPath, backend);
 			}
 		} catch {
 			// Path doesn't exist or can't be stat'd — fall through to normal read,
@@ -168,22 +187,45 @@ export const readTool: ToolDefinition = {
 		const imageFormat = IMAGE_EXTENSIONS[ext];
 		if (imageFormat) {
 			try {
-				const file = Bun.file(resolvedPath);
-				const size = file.size;
-				if (size > MAX_IMAGE_BYTES) {
-					return {
-						output: `Image file too large (${(size / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
-						isError: true,
-					};
-				}
-				const { base64, detectedMediaType } = await imageToBase64(resolvedPath);
-				// Prefer the real format detected from file content magic bytes
+				let size: number;
+				let base64: string;
+				let detectedMediaType: string | undefined;
 				const MIME_TO_FORMAT: Record<string, string> = {
 					"image/png": "png",
 					"image/jpeg": "jpeg",
 					"image/gif": "gif",
 					"image/webp": "webp",
 				};
+
+				if (backend.kind === "local") {
+					const file = Bun.file(resolvedPath);
+					size = file.size;
+					if (size > MAX_IMAGE_BYTES) {
+						return {
+							output: `Image file too large (${(size / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
+							isError: true,
+						};
+					}
+					({ base64, detectedMediaType } = await imageToBase64(resolvedPath));
+				} else {
+					// Remote image: fetch the bytes over the device RPC (capped at the
+					// same limit) and base64-encode them here, so remote images work
+					// transparently without the model transferring the file first.
+					const { bytes, truncated, totalSize } = await backend.readFileBytes(resolvedPath, {
+						maxBytes: MAX_IMAGE_BYTES,
+						signal: ctx.signal,
+					});
+					if (truncated) {
+						return {
+							output: `Image file too large (${(totalSize / 1024 / 1024).toFixed(1)} MB). Maximum supported size is ${MAX_IMAGE_BYTES / 1024 / 1024} MB.`,
+							isError: true,
+						};
+					}
+					size = totalSize || bytes.byteLength;
+					({ base64, detectedMediaType } = imageBytesToBase64(bytes));
+				}
+
+				// Prefer the real format detected from file content magic bytes
 				const actualFormat =
 					(detectedMediaType && MIME_TO_FORMAT[detectedMediaType]) || imageFormat;
 				return {
@@ -207,9 +249,12 @@ export const readTool: ToolDefinition = {
 
 		// ── Text file handling ──
 		try {
-			const file = Bun.file(resolvedPath);
-			const fileSize = file.size;
-			const shouldStream = readAll || fileSize > FULL_READ_STREAM_THRESHOLD_BYTES;
+			const stat = await backend.statFile(resolvedPath);
+			const fileSize = stat?.size ?? Bun.file(resolvedPath).size;
+			// Large-file streaming reads from a local fs stream; only reachable for
+			// the local backend. Remote backends use the bounded byte-read path.
+			const canStream = backend.kind === "local";
+			const shouldStream = canStream && (readAll || fileSize > FULL_READ_STREAM_THRESHOLD_BYTES);
 
 			if (shouldStream) {
 				const startLine = offset ?? 1;
@@ -255,7 +300,14 @@ export const readTool: ToolDefinition = {
 				};
 			}
 
-			const { text } = await readFileText(resolvedPath);
+			// The non-streaming path is only taken for files within the streaming
+			// threshold (local backend) or for remote reads; cap at the same
+			// threshold so local behaviour matches the previous whole-file read.
+			const { bytes } = await backend.readFileBytes(resolvedPath, {
+				maxBytes: FULL_READ_STREAM_THRESHOLD_BYTES,
+				signal: ctx.signal,
+			});
+			const { text } = decodeFileBytes(bytes);
 			const lines = text.split("\n");
 			const start = Math.max(0, (offset ?? 1) - 1);
 			const end = limit ? start + limit : lines.length;
@@ -467,13 +519,17 @@ function buildStreamSuffix(options: {
 
 const MAX_DIR_ENTRIES = 500;
 
-async function listDirectory(displayPath: string, resolvedPath: string): Promise<ToolResult> {
-	const entries = await readdir(resolvedPath, { withFileTypes: true });
+async function listDirectory(
+	displayPath: string,
+	resolvedPath: string,
+	backend: ExecutionBackend,
+): Promise<ToolResult> {
+	const entries = await backend.listDir(resolvedPath);
 
 	// Sort: directories first, then files, alphabetical within each group
 	const sorted = entries.toSorted((a, b) => {
-		const aDir = a.isDirectory() ? 0 : 1;
-		const bDir = b.isDirectory() ? 0 : 1;
+		const aDir = a.isDirectory ? 0 : 1;
+		const bDir = b.isDirectory ? 0 : 1;
 		if (aDir !== bDir) return aDir - bDir;
 		return a.name.localeCompare(b.name);
 	});
@@ -481,7 +537,7 @@ async function listDirectory(displayPath: string, resolvedPath: string): Promise
 	const truncated = sorted.length > MAX_DIR_ENTRIES;
 	const visible = truncated ? sorted.slice(0, MAX_DIR_ENTRIES) : sorted;
 
-	const lines = visible.map((e) => `  ${e.name}${e.isDirectory() ? "/" : ""}`);
+	const lines = visible.map((e) => `  ${e.name}${e.isDirectory ? "/" : ""}`);
 	const header = `Directory listing for ${displayPath}\n`;
 	const footer = `\n(${entries.length} entries${truncated ? `, showing first ${MAX_DIR_ENTRIES}` : ""})`;
 

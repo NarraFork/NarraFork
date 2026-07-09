@@ -11,9 +11,23 @@ const CLEAN_SHUTDOWN_MARKER = 0x4e465243; // "NFRC" = NarraFork Clean
  * Old non-trigram FTS tables are detected and recreated.
  */
 export function markCleanShutdown(sqlite: Database): void {
-	// Set the marker before checkpointing so the marker itself is flushed out of WAL.
+	// Step 1 (fast, correctness-critical): stamp the clean marker. Writing `application_id`
+	// lands the marker in the WAL, which is sufficient — the next startup opens the DB and
+	// replays the WAL, so the marker is read back even without a checkpoint into the main
+	// file. This single PRAGMA is near-instant.
 	sqlite.run(`PRAGMA application_id = ${CLEAN_SHUTDOWN_MARKER}`);
-	sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+	// Step 2 (best-effort optimization only): truncate the WAL to bound its size. This is
+	// NOT required for clean-shutdown detection. A large WAL can make TRUNCATE slow, and on
+	// Windows the ~5s console-close (CTRL_CLOSE_EVENT) timeout can force-kill the process
+	// mid-checkpoint; guarding it here ensures a stalled/failed checkpoint never invalidates
+	// the marker written in step 1.
+	try {
+		sqlite.run("PRAGMA wal_checkpoint(TRUNCATE)");
+	} catch (err) {
+		logger.warn("Clean-shutdown WAL checkpoint failed (marker already persisted)", {
+			error: String(err),
+		});
+	}
 }
 
 /**
@@ -30,6 +44,43 @@ export function readCleanShutdownState(sqlite: Database): { wasClean: boolean } 
 		(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
 			?.application_id ?? 0;
 	return { wasClean: appId === CLEAN_SHUTDOWN_MARKER };
+}
+
+/** Env flag: force the old behavior of unconditionally rebuilding every FTS index after an
+ * unclean shutdown (bypasses the cheaper 'integrity-check' probe). Escape hatch for the rare
+ * case where the probe misses a corruption that the full rebuild would have fixed. */
+const FORCE_FULL_FTS_REBUILD =
+	process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1" ||
+	process.env.NARRAFORK_FTS_FULL_REBUILD === "1";
+
+/**
+ * Probe an external-content FTS5 table for corruption without rebuilding it.
+ *
+ * `INSERT INTO <t>(<t>) VALUES('integrity-check')` verifies that the FTS index is internally
+ * consistent with its content table and that its b-tree structure is well-formed. It is far
+ * cheaper than a full 'rebuild' (no re-tokenization of the whole corpus), so on the common case
+ * — an unclean shutdown that did NOT actually corrupt the index — we skip the expensive rebuild.
+ *
+ * Returns `"ok"` when the probe passes, `"corrupt"` when it throws (SQLITE_CORRUPT_VTAB or a
+ * "database disk image is malformed" style error), signalling the caller to rebuild that table.
+ *
+ * NOTE (safety trade-off): 'integrity-check' catches the vast majority of index/content
+ * inconsistencies but is not a 100% guarantee against every edge-case corruption that could
+ * later surface as a "malformed" error on UPDATE. The runtime safety net (recoverWithCli in
+ * db-resilience.ts) still recovers such cases if they slip through, and its recovery path
+ * recreates the FTS tables. Worst case is a delayed fix, not permanent data loss.
+ */
+function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
+	try {
+		sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('integrity-check')`);
+		return "ok";
+	} catch (err) {
+		logger.warn("FTS integrity probe failed — table will be rebuilt", {
+			table,
+			error: String(err),
+		});
+		return "corrupt";
+	}
 }
 
 export function ensureFts(
@@ -292,28 +343,57 @@ export function ensureFts(
 	}
 
 	// --- Rebuild FTS indexes if needed ---
-	// Rebuild after migration (tokenizer change) or unclean shutdown (trigram indexes
-	// can silently corrupt on crash, causing "malformed" errors on UPDATE).
+	// Two independent triggers, handled differently:
+	//   1) Migration (tokenizer change / dropped-and-recreated table): the index is empty or
+	//      built with the wrong tokenizer, so an UNCONDITIONAL full 'rebuild' is mandatory.
+	//   2) Unclean shutdown: trigram indexes *can* silently corrupt on crash and later throw
+	//      "malformed" on UPDATE, but usually they are fine. Instead of unconditionally
+	//      rebuilding every table (the previous behavior — slow: full re-tokenization of the
+	//      whole corpus, ~1 min on large narrator_messages), probe each table cheaply with
+	//      'integrity-check' and rebuild ONLY the tables that actually fail. Set
+	//      NARRAFORK_FTS_FULL_REBUILD=1 (or NARRAFORK_DB_FULL_INTEGRITY_CHECK=1) to force the
+	//      old unconditional-rebuild behavior.
 	const appId =
 		(sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
 			?.application_id ?? 0;
-	const needsRebuild =
-		ftsTablesRecreated.length > 0 ||
-		(!options.skipUncleanShutdownRebuild && appId !== CLEAN_SHUTDOWN_MARKER);
+	const migrationForcedRebuild = ftsTablesRecreated.length > 0;
+	const uncleanShutdown = !options.skipUncleanShutdownRebuild && appId !== CLEAN_SHUTDOWN_MARKER;
+	const needsRebuild = migrationForcedRebuild || uncleanShutdown;
 
 	if (needsRebuild) {
+		const startedAt = Date.now();
+		// Migration always rebuilds unconditionally. Unclean shutdown only rebuilds tables that
+		// fail the cheap integrity probe (unless the force flag is set).
+		const probeThenRebuild = uncleanShutdown && !migrationForcedRebuild && !FORCE_FULL_FTS_REBUILD;
+		const ftsTables = [
+			"narrators_fts",
+			"chapters_fts",
+			"narrator_messages_fts",
+			...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
+		];
+		const rebuilt: string[] = [];
+		const healthy: string[] = [];
 		try {
-			sqlite.run("INSERT INTO narrators_fts(narrators_fts) VALUES ('rebuild')");
-			sqlite.run("INSERT INTO chapters_fts(chapters_fts) VALUES ('rebuild')");
-			sqlite.run("INSERT INTO narrator_messages_fts(narrator_messages_fts) VALUES ('rebuild')");
-			if (hasKnowledgeEntries) {
-				sqlite.run("INSERT INTO knowledge_entries_fts(knowledge_entries_fts) VALUES ('rebuild')");
+			for (const table of ftsTables) {
+				if (probeThenRebuild && probeFtsIntegrity(sqlite, table) === "ok") {
+					healthy.push(table);
+					continue;
+				}
+				sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('rebuild')`);
+				rebuilt.push(table);
 			}
-			logger.info("FTS indexes rebuilt on startup", {
-				reason: ftsTablesRecreated.length > 0 ? "migration" : "unclean_shutdown",
+			logger.info("FTS indexes checked on startup", {
+				reason: migrationForcedRebuild ? "migration" : "unclean_shutdown",
+				mode: probeThenRebuild ? "probe_then_rebuild" : "full_rebuild",
+				rebuilt,
+				healthy,
+				durationMs: Date.now() - startedAt,
 			});
 		} catch (err) {
-			logger.warn("FTS rebuild failed on startup", { error: String(err) });
+			logger.warn("FTS rebuild failed on startup", {
+				error: String(err),
+				durationMs: Date.now() - startedAt,
+			});
 		}
 	}
 

@@ -73,6 +73,7 @@ export interface InstanceSettingsState {
 	autoCompactKeepPairs: number;
 	autoCompactPruneThreshold: number;
 	minPruneRatio: number;
+	queueDuringCompaction: boolean;
 	codexDefaultReasoningEffort: string;
 	agentDefaultReasoningEffort: string;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
@@ -159,6 +160,7 @@ function makeDefaults(): InstanceSettingsState {
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
+		queueDuringCompaction: false,
 		codexDefaultReasoningEffort: "high",
 		agentDefaultReasoningEffort: "",
 		globalWhitelistDirs: [],
@@ -259,6 +261,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
+				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
@@ -361,6 +364,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					autoCompactKeepPairs: state.autoCompactKeepPairs,
 					autoCompactPruneThreshold: state.autoCompactPruneThreshold,
 					minPruneRatio: state.minPruneRatio,
+					queueDuringCompaction: state.queueDuringCompaction,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,

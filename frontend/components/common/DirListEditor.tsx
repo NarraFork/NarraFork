@@ -1,5 +1,14 @@
-import { ActionIcon, Group, Modal, SegmentedControl, Stack, Switch, Text } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import {
+	ActionIcon,
+	Group,
+	Modal,
+	Paper,
+	SegmentedControl,
+	Stack,
+	Switch,
+	Text,
+} from "@mantine/core";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderOpen, IconTrash } from "@tabler/icons-react";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
@@ -49,6 +58,8 @@ export function DirListEditor(props: DirListEditorProps) {
 	const { t } = useTranslation("common");
 	const levels = isWhitelist(props) ? WL_LEVELS : BL_LEVELS;
 	const [opened, { open, close }] = useDisclosure(false);
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
+	const isMobile = useMediaQuery("(max-width: 48em)") ?? false;
 
 	const addDir = (path: string) => {
 		if (dirs.some((d) => d.path === path)) return;
@@ -97,39 +108,78 @@ export function DirListEditor(props: DirListEditorProps) {
 					{labels.empty}
 				</Text>
 			)}
-			{dirs.map((dir, idx) => (
-				<Group key={dir.path} gap={6} wrap="nowrap" align="center">
-					<Switch
-						size="xs"
-						checked={dir.enabled !== false}
-						onChange={(e) => updateEnabled(idx, e.currentTarget.checked)}
-						aria-label={`Toggle ${dir.path}`}
-					/>
-					<Text
-						size="xs"
-						style={{
-							flex: 1,
-							overflow: "hidden",
-							textOverflow: "ellipsis",
-							whiteSpace: "nowrap",
-							opacity: dir.enabled !== false ? 1 : 0.5,
-						}}
-						title={dir.path}
-					>
-						{dir.path}
-					</Text>
-					<SegmentedControl
-						size="xs"
-						value={getLevelValue(dir)}
-						onChange={(v) => updateLevel(idx, v)}
-						data={levels.map((l) => ({ value: l, label: labels.levels[l] ?? l }))}
-						style={{ flexShrink: 0 }}
-					/>
-					<ActionIcon variant="subtle" color="red" size="xs" onClick={() => removeDir(idx)}>
-						<IconTrash size={14} />
-					</ActionIcon>
-				</Group>
-			))}
+			{dirs.map((dir, idx) =>
+				isMobile ? (
+					<Paper key={dir.path} withBorder p="xs" radius="sm">
+						<Stack gap="xs">
+							<Group justify="space-between" wrap="nowrap" gap="xs">
+								<Switch
+									size="xs"
+									checked={dir.enabled !== false}
+									onChange={(e) => updateEnabled(idx, e.currentTarget.checked)}
+									aria-label={`Toggle ${dir.path}`}
+								/>
+								<Text
+									size="xs"
+									style={{
+										flex: 1,
+										minWidth: 0,
+										overflow: "hidden",
+										textOverflow: "ellipsis",
+										whiteSpace: "nowrap",
+										opacity: dir.enabled !== false ? 1 : 0.5,
+									}}
+									title={dir.path}
+								>
+									{dir.path}
+								</Text>
+								<ActionIcon variant="subtle" color="red" size="xs" onClick={() => removeDir(idx)}>
+									<IconTrash size={14} />
+								</ActionIcon>
+							</Group>
+							<SegmentedControl
+								size="xs"
+								fullWidth
+								value={getLevelValue(dir)}
+								onChange={(v) => updateLevel(idx, v)}
+								data={levels.map((l) => ({ value: l, label: labels.levels[l] ?? l }))}
+							/>
+						</Stack>
+					</Paper>
+				) : (
+					<Group key={dir.path} gap={6} wrap="nowrap" align="center">
+						<Switch
+							size="xs"
+							checked={dir.enabled !== false}
+							onChange={(e) => updateEnabled(idx, e.currentTarget.checked)}
+							aria-label={`Toggle ${dir.path}`}
+						/>
+						<Text
+							size="xs"
+							style={{
+								flex: 1,
+								overflow: "hidden",
+								textOverflow: "ellipsis",
+								whiteSpace: "nowrap",
+								opacity: dir.enabled !== false ? 1 : 0.5,
+							}}
+							title={dir.path}
+						>
+							{dir.path}
+						</Text>
+						<SegmentedControl
+							size="xs"
+							value={getLevelValue(dir)}
+							onChange={(v) => updateLevel(idx, v)}
+							data={levels.map((l) => ({ value: l, label: labels.levels[l] ?? l }))}
+							style={{ flexShrink: 0 }}
+						/>
+						<ActionIcon variant="subtle" color="red" size="xs" onClick={() => removeDir(idx)}>
+							<IconTrash size={14} />
+						</ActionIcon>
+					</Group>
+				),
+			)}
 			<PathInput
 				placeholder={labels.placeholder}
 				onConfirm={addDir}
@@ -143,8 +193,16 @@ export function DirListEditor(props: DirListEditorProps) {
 				opened={opened}
 				onClose={close}
 				title={t("selectDirectory")}
-				size="lg"
-				styles={{ body: { padding: 0 } }}
+				size={isWide ? 880 : "md"}
+				styles={{
+					body: {
+						padding: 0,
+						maxHeight: "85vh",
+						display: "flex",
+						flexDirection: "column",
+						overflow: "hidden",
+					},
+				}}
 			>
 				{opened && (
 					<Suspense fallback={null}>
@@ -154,6 +212,7 @@ export function DirListEditor(props: DirListEditorProps) {
 								close();
 							}}
 							onCancel={close}
+							isWide={isWide}
 						/>
 					</Suspense>
 				)}

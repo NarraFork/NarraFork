@@ -8,6 +8,9 @@ export type CustomApiProtocol =
 	| "responses-compatible"
 	| "completions-compatible";
 
+/** Per-provider User-Agent selection mode. */
+export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
+
 export interface CustomApiProviderState {
 	id: string;
 	name: string;
@@ -24,6 +27,8 @@ export interface CustomApiProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
 	disabled?: boolean;
 }
 
@@ -41,6 +46,8 @@ export interface OpenAIProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
 	proxy?: ProxyOverride;
 	disabled?: boolean;
 }
@@ -56,6 +63,8 @@ export interface AnthropicProviderState {
 	proxy?: ProxyOverride;
 	tlsRejectUnauthorized?: boolean;
 	officialApi?: boolean;
+	userAgentMode?: UserAgentMode;
+	customUserAgent?: string;
 	disabled?: boolean;
 }
 

@@ -1,9 +1,15 @@
 import { Buffer } from "node:buffer";
 import type { ServerWebSocket } from "bun";
+import { isChunkFrame } from "../lib/agent/execution/rpc-types";
 import { hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
+import {
+	type DeviceWSData,
+	getDeviceConnections,
+	handleDeviceWS,
+} from "../services/device-connection-service";
 import {
 	getNarratorConnections,
 	handleNarratorWS,
@@ -18,7 +24,8 @@ import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 export type WSData =
 	| ({ channel: "narrator" } & NarratorWSData)
 	| ({ channel: "terminal" } & TerminalWSData)
-	| ({ channel: "vnet" } & VNetWSData);
+	| ({ channel: "vnet" } & VNetWSData)
+	| ({ channel: "device" } & DeviceWSData);
 
 /**
  * Determine channel from the upgrade URL path and build initial WSData.
@@ -64,6 +71,14 @@ export function resolveWSData(
 			auth: vnetAuth ?? { kind: "anonymous" },
 		};
 	}
+	if (url.pathname === "/ws/device" || url.pathname.startsWith("/ws/device?")) {
+		return {
+			channel: "device",
+			connectedAt: Date.now(),
+			lastPongAt: Date.now(),
+			authenticated: false,
+		};
+	}
 	return null;
 }
 
@@ -83,6 +98,7 @@ export function startHeartbeat() {
 			const staleNarrator: Array<ServerWebSocket<WSData & { channel: "narrator" }>> = [];
 			const staleTerminal: Array<ServerWebSocket<WSData & { channel: "terminal" }>> = [];
 			const staleVNet: Array<ServerWebSocket<WSData & { channel: "vnet" }>> = [];
+			const staleDevice: Array<ServerWebSocket<WSData & { channel: "device" }>> = [];
 
 			for (const ws of getNarratorConnections()) {
 				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
@@ -120,6 +136,18 @@ export function startHeartbeat() {
 				}
 			}
 
+			for (const ws of getDeviceConnections()) {
+				if (now - ws.data.lastPongAt > HEARTBEAT_TIMEOUT_MS) {
+					staleDevice.push(ws);
+					continue;
+				}
+				try {
+					ws.send(pingPayload);
+				} catch {
+					staleDevice.push(ws);
+				}
+			}
+
 			for (const ws of staleNarrator) {
 				// Delegate to the channel handler so presence / stats are cleaned up
 				handleNarratorWS.close(ws);
@@ -150,6 +178,19 @@ export function startHeartbeat() {
 					lastPongAt: ws.data.lastPongAt,
 				});
 				handleVNetWS.close(ws);
+				try {
+					ws.close(1000, "heartbeat timeout");
+				} catch {
+					// already dead
+				}
+			}
+
+			for (const ws of staleDevice) {
+				logger.debug("Closing stale device WS (heartbeat timeout)", {
+					connectedAt: ws.data.connectedAt,
+					lastPongAt: ws.data.lastPongAt,
+				});
+				handleDeviceWS.close(ws);
 				try {
 					ws.close(1000, "heartbeat timeout");
 				} catch {
@@ -193,6 +234,13 @@ export function closeAllConnections() {
 			// already dead — ignore
 		}
 	}
+	for (const ws of getDeviceConnections()) {
+		try {
+			ws.close(1001, "server shutting down");
+		} catch {
+			// already dead — ignore
+		}
+	}
 }
 
 // === Bun WebSocket handlers ===
@@ -207,11 +255,39 @@ export const wsHandlers = {
 			handleTerminalWS.open(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
 		} else if (channel === "vnet") {
 			handleVNetWS.open(ws as ServerWebSocket<WSData & { channel: "vnet" }>);
+		} else if (channel === "device") {
+			handleDeviceWS.open(ws as ServerWebSocket<WSData & { channel: "device" }>);
 		}
 	},
 
 	message(ws: ServerWebSocket<WSData>, message: string | Buffer) {
 		const { channel } = ws.data;
+
+		// Device channel: binary messages are file-transfer chunk frames. Route
+		// them straight to the transfer receiver without JSON parsing. A binary
+		// message is one Bun delivers as a Buffer whose first byte is the frame
+		// magic; everything else on this channel is JSON text control.
+		if (channel === "device" && typeof message !== "string") {
+			const bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+			if (isChunkFrame(bytes)) {
+				const maxChunkBytes = (settings.devices?.transferChunkBytes ?? 1024 * 1024) + 64 * 1024;
+				if (bytes.byteLength > maxChunkBytes) {
+					logger.warn("Device chunk frame rejected: too large", {
+						size: bytes.byteLength,
+						maxChunkBytes,
+					});
+					try {
+						ws.close(1009, "chunk too large");
+					} catch {
+						// dead
+					}
+					return;
+				}
+				handleDeviceWS.binaryMessage(ws as ServerWebSocket<WSData & { channel: "device" }>, bytes);
+				return;
+			}
+		}
+
 		if (channel === "vnet") {
 			const rawBytes =
 				typeof message === "string" ? Buffer.byteLength(message) : message.byteLength;
@@ -229,6 +305,26 @@ export const wsHandlers = {
 							message: "Message is too large",
 						}),
 					);
+					ws.close(1009, "message too large");
+				} catch {
+					// connection may be dead
+				}
+				return;
+			}
+		} else if (channel === "device") {
+			// Device frames carry base64 file/exec payloads. Cap at the configured
+			// RPC byte budget, allowing for base64 (~4/3) + framing overhead.
+			const rawBytes =
+				typeof message === "string" ? Buffer.byteLength(message) : message.byteLength;
+			const maxRpcBytes = settings.devices?.maxRpcBytes ?? 10 * 1024 * 1024;
+			const maxBytes = Math.ceil(maxRpcBytes * 1.4) + 4096;
+			if (rawBytes > maxBytes) {
+				logger.warn("Device WS message rejected before parsing: payload too large", {
+					rawBytes,
+					maxBytes,
+				});
+				try {
+					ws.send(JSON.stringify({ type: "error", code: "MESSAGE_TOO_LARGE" }));
 					ws.close(1009, "message too large");
 				} catch {
 					// connection may be dead
@@ -291,6 +387,12 @@ export const wsHandlers = {
 						// connection may be dead
 					}
 				});
+		} else if (channel === "device") {
+			handleDeviceWS
+				.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed)
+				.catch((err: unknown) => {
+					logger.warn("Device WS message handler error", { error: String(err) });
+				});
 		}
 	},
 
@@ -303,6 +405,8 @@ export const wsHandlers = {
 			handleTerminalWS.close(ws as ServerWebSocket<WSData & { channel: "terminal" }>);
 		} else if (channel === "vnet") {
 			handleVNetWS.close(ws as ServerWebSocket<WSData & { channel: "vnet" }>);
+		} else if (channel === "device") {
+			handleDeviceWS.close(ws as ServerWebSocket<WSData & { channel: "device" }>);
 		}
 	},
 };

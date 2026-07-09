@@ -111,6 +111,17 @@ export type NarratorServerMessage =
 			reason?: string;
 	  }
 	| {
+			/**
+			 * The automatic AskUserQuestion reflection timer was cancelled without
+			 * changing the permission state (e.g. the user started answering). The
+			 * frontend hides its countdown for this request.
+			 */
+			type: "question_reflection_disarmed";
+			narratorId: string;
+			requestId: string;
+			toolUseId: string;
+	  }
+	| {
 			type: "status_change";
 			narratorId: string;
 			status: string;

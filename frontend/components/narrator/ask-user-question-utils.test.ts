@@ -1,10 +1,26 @@
 import { describe, expect, test } from "bun:test";
 import {
 	coerceQuestions,
+	formatHMS,
 	getCustomSavedAnswer,
 	getSelectedOptionValue,
 	isSavedOptionSelected,
 } from "./ask-user-question-utils";
+
+describe("formatHMS", () => {
+	test("formats sub-minute, minute, and hour durations with zero-padding", () => {
+		expect(formatHMS(0)).toBe("00:00:00");
+		expect(formatHMS(5_000)).toBe("00:00:05");
+		expect(formatHMS(65_000)).toBe("00:01:05");
+		expect(formatHMS(3_661_000)).toBe("01:01:01");
+	});
+
+	test("clamps negatives to zero and floors partial seconds", () => {
+		expect(formatHMS(-1)).toBe("00:00:00");
+		expect(formatHMS(-999_999)).toBe("00:00:00");
+		expect(formatHMS(1_999)).toBe("00:00:01");
+	});
+});
 
 describe("ask-user-question-utils", () => {
 	test("replaces missing or placeholder question keys with stable non-empty keys", () => {

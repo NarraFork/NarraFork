@@ -11,6 +11,18 @@ export interface Question {
 	options: QuestionOption[];
 }
 
+/**
+ * Format a millisecond duration as HH:MM:SS (clamped at 0).
+ */
+export function formatHMS(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	const pad = (n: number) => n.toString().padStart(2, "0");
+	return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+}
+
 const INVALID_QUESTION_KEYS = new Set(["undefined", "null"]);
 
 function normalizeText(value: unknown): string {

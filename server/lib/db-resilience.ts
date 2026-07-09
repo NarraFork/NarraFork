@@ -71,6 +71,37 @@ export function checkIntegrity(sqlite: Database): { ok: boolean; details: string
 }
 
 /**
+ * Run PRAGMA quick_check and return whether the database is healthy.
+ *
+ * `quick_check` does the same page-level and structural checks as `integrity_check` but SKIPS
+ * the most expensive step — verifying that index content matches table content. On a multi-GB
+ * database this is typically several times faster than `integrity_check`, which is why it is
+ * used as the default startup probe after an unclean shutdown.
+ *
+ * Safety trade-off: it can miss "index rows out of sync with the table" corruption that a full
+ * `integrity_check` would catch. That residual risk is covered by the runtime malformed-error
+ * safety net (recoverWithCli) and by the NARRAFORK_DB_FULL_INTEGRITY_CHECK=1 escape hatch, which
+ * forces the caller to run the full check instead.
+ */
+export function quickCheck(sqlite: Database): { ok: boolean; details: string } {
+	try {
+		const result = sqlite.prepare("PRAGMA quick_check").get() as
+			| { quick_check: string }
+			| undefined;
+		const status = result?.quick_check ?? "unknown";
+		const ok = status === "ok";
+		if (!ok) {
+			logger.error("Database quick_check failed", { status });
+		}
+		return { ok, details: status };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		logger.error("Database quick_check threw", { error: msg });
+		return { ok: false, details: msg };
+	}
+}
+
+/**
  * Attempt WAL checkpoint to flush pending writes.
  */
 export function tryWalRecovery(sqlite: Database): boolean {

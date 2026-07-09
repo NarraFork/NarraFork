@@ -1715,6 +1715,7 @@ export const miscApi = {
 	// Hooks
 	listHooks: (projectId?: string) =>
 		request<HookApiRecord[]>(projectId ? `/hooks?projectId=${projectId}` : "/hooks"),
+	listAllHooks: () => request<HookApiRecord[]>("/hooks/all"),
 	createHook: (data: Record<string, unknown>) =>
 		request<HookApiRecord>("/hooks", { method: "POST", body: JSON.stringify(data) }),
 	updateHook: (id: string, data: Record<string, unknown>) =>

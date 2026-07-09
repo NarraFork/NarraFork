@@ -97,6 +97,8 @@ function SettingsAgentPage() {
 				setAutoCompactPruneThreshold={is.setAutoCompactPruneThreshold}
 				minPruneRatio={is.minPruneRatio}
 				setMinPruneRatio={is.setMinPruneRatio}
+				queueDuringCompaction={is.queueDuringCompaction}
+				setQueueDuringCompaction={is.setQueueDuringCompaction}
 				globalWhitelistDirs={is.globalWhitelistDirs}
 				setGlobalWhitelistDirs={is.setGlobalWhitelistDirs}
 				globalBlacklistDirs={is.globalBlacklistDirs}

@@ -2,6 +2,7 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import {
 	checkIntegrity,
 	optimizeDatabase,
+	quickCheck,
 	recoverWithCli,
 	startWalCheckpointInterval,
 	tryWalRecovery,
@@ -38,23 +39,42 @@ dbLifecycle.cleanMarked = false;
 const { wasClean } = readCleanShutdownState(sqlite);
 
 // Startup integrity check — detect corruption early.
-// A full `PRAGMA integrity_check` scans the entire database and can take ~15s on a
-// multi-GB DB, blocking the main thread (bun:sqlite is synchronous). Skip it when the
-// previous shutdown was clean: WAL + synchronous=NORMAL guarantees committed data
-// survives an app crash, and a clean marker means we wrote it on graceful exit. Only
-// run the full check after an unclean shutdown (crash/SIGKILL) or when forced via env.
-// The runtime malformed-error recovery path (recoverWithCli, below) remains as the
-// safety net for the rare case of external/on-disk corruption.
+// Both `PRAGMA quick_check` and `integrity_check` scan the whole DB and block the main thread
+// (bun:sqlite is synchronous). We minimize that cost on two axes:
+//   1) Skip entirely when the previous shutdown was clean: WAL + synchronous=NORMAL guarantees
+//      committed data survives an app crash, and a clean marker means we wrote it on graceful
+//      exit — so the on-disk state is trustworthy.
+//   2) After an unclean shutdown (crash / SIGKILL / taskkill / power loss), run the CHEAPER
+//      `quick_check` first. It performs the same page/structure checks as `integrity_check` but
+//      skips the most expensive step (verifying index content matches table content), so it is
+//      typically several times faster on a large DB. Only escalate to the full `integrity_check`
+//      + recovery flow when quick_check fails, or when explicitly forced via env.
+// The runtime malformed-error recovery path (recoverWithCli, below) remains as the safety net
+// for the rare corruption that quick_check does not catch.
 const forceFullIntegrityCheck = process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1";
 if (wasClean && !forceFullIntegrityCheck) {
 	logger.info("Startup integrity check skipped (clean shutdown marker present)");
 } else {
-	const integrity = checkIntegrity(sqlite);
-	if (!integrity.ok) {
+	const checkStartedAt = Date.now();
+	const checkKind = forceFullIntegrityCheck ? "integrity_check" : "quick_check";
+	logger.info("Startup database integrity check running (unclean shutdown)", {
+		check: checkKind,
+		reason: forceFullIntegrityCheck ? "forced" : "unclean_shutdown",
+	});
+	// quick_check on the unclean path; full integrity_check only when forced.
+	const initial = forceFullIntegrityCheck ? checkIntegrity(sqlite) : quickCheck(sqlite);
+	logger.info("Startup database integrity check completed", {
+		check: checkKind,
+		ok: initial.ok,
+		durationMs: Date.now() - checkStartedAt,
+	});
+	if (!initial.ok) {
 		logger.error("Database integrity check failed on startup — attempting recovery", {
-			details: integrity.details,
+			details: initial.details,
 		});
 		const walOk = tryWalRecovery(sqlite);
+		// After a failed quick_check + WAL recovery, confirm with the authoritative full
+		// integrity_check before deciding the DB is healthy (quick_check alone may under-report).
 		if (walOk && checkIntegrity(sqlite).ok) {
 			logger.info("Database recovered after WAL checkpoint");
 		} else {

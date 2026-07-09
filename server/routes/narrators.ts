@@ -106,6 +106,7 @@ import {
 	getUserReplyInLanguage,
 	type Locale,
 } from "../lib/prompt-i18n";
+import { getQueueDuringCompaction } from "../lib/settings";
 import { type ImageRef, saveUploadedImage, validateTextFile } from "../lib/uploads";
 import {
 	askInPassingSchema,
@@ -158,8 +159,11 @@ import {
 	rebuildFileStatesUpToSeq,
 } from "../services/file-state-rebuild";
 import {
+	disarmQuestionReflection,
+	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
 	stopDangerReflectionLoop,
+	takeOverQuestionReflection,
 } from "../services/narrator-permission";
 import { enterNarratorPlanMode, exitNarratorPlanMode } from "../services/narrator-plan-mode";
 import {
@@ -170,6 +174,7 @@ import {
 	narratorService,
 } from "../services/narrator-service";
 import {
+	awaitCompactCompletion,
 	type BufferCreator,
 	cancelCompact,
 	cancelPendingExitPlanMode,
@@ -860,7 +865,7 @@ function dispatchMentions(originNarratorId: string, content: string, userId: str
 // Send message — fire-and-forget; all streaming events delivered via WebSocket
 narratorRoutes.post("/:id/messages", async (c) => {
 	const id = c.req.param("id");
-	const narrator = await narratorService.getById(id); // throws NotFoundError if missing
+	let narrator = await narratorService.getById(id); // throws NotFoundError if missing
 
 	// Auto-unarchive on interaction
 	if (narrator.status === "archived") {
@@ -983,8 +988,21 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// in-memory check is authoritative: it catches the case where the DB status
 	// went stale to idle while the loop was still draining, which would otherwise
 	// let this message start a second concurrent loop instead of being buffered.
-	const narratorBusy =
+	let narratorBusy =
 		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+
+	// When the user opts in via settings.agent.queueDuringCompaction, a message
+	// sent while the narrator is idle-but-compacting waits for the compaction to
+	// finish before being sent. Otherwise the new turn could run against context
+	// that the background compact is concurrently rebuilding (compaction resets
+	// the upstream session). When the narrator is busy the message is buffered
+	// below regardless, so this only matters for the idle-during-compaction window.
+	if (!narratorBusy && isCompactInProgress(id) && getQueueDuringCompaction()) {
+		await awaitCompactCompletion(id);
+		narrator = await narratorService.getById(id);
+		narratorBusy =
+			narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+	}
 
 	if (queuedNewCommand && !narratorBusy) {
 		const currentCwd = narrator.cwd ?? undefined;
@@ -2882,7 +2900,14 @@ narratorRoutes.post("/:id/promote", async (c) => {
 narratorRoutes.get("/:id/permissions", async (c) => {
 	const id = c.req.param("id");
 	const permissions = await narratorService.getPendingPermissions(id);
-	return c.json(permissions);
+	// Attach the live AskUserQuestion reflection deadline (in-memory only) so the
+	// frontend can restore its countdown after a reconnect / refetch.
+	return c.json(
+		permissions.map((p) => {
+			const reflectionDeadline = getQuestionReflectionDeadline(p.id);
+			return reflectionDeadline !== null ? { ...p, reflectionDeadline } : p;
+		}),
+	);
 });
 
 // Approve permission
@@ -2927,6 +2952,25 @@ narratorRoutes.post("/permissions/:requestId/reflect-question", async (c) => {
 		return c.json({ error: result.reason ?? "Question reflection request not found" }, 404);
 	}
 	return c.json({ ok: true, answers: result.answers ?? {} });
+});
+
+// Silently cancel the automatic AskUserQuestion reflection countdown (e.g. the
+// user started answering). Idempotent — always succeeds even if nothing was armed.
+narratorRoutes.post("/permissions/:requestId/disarm-question-reflection", async (c) => {
+	const requestId = c.req.param("requestId");
+	const disarmed = disarmQuestionReflection(requestId);
+	return c.json({ ok: true, disarmed });
+});
+
+// Stop an AskUserQuestion reflection (timer or in-flight generation) and hand the
+// question back to the user to answer.
+narratorRoutes.post("/permissions/:requestId/stop-question-reflection", async (c) => {
+	const requestId = c.req.param("requestId");
+	const body = await c.req.json().catch(() => ({}));
+	const reason = typeof body.reason === "string" ? body.reason : undefined;
+	const stopped = await takeOverQuestionReflection(requestId, reason);
+	if (!stopped) return c.json({ error: "Question reflection request not found" }, 404);
+	return c.json({ ok: true });
 });
 
 // Stop automatic danger reflection but leave the tool permission pending for user decision

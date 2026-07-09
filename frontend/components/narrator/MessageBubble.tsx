@@ -3563,6 +3563,7 @@ export const MessageBubble = memo(function MessageBubble({
 	const editKeptCountRef = useRef(0);
 	editKeptCountRef.current = editKeptImages.length;
 	const editFileInputRef = useRef<HTMLInputElement | null>(null);
+	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 	const editImageNarratorId = message.narratorId ?? narratorId;
 	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
 	const canSubmitEdit = !!editContent.trim() || hasEditImages;
@@ -3747,8 +3748,15 @@ export const MessageBubble = memo(function MessageBubble({
 			editingCtx.register({
 				submit: () => handleConfirmClickRef.current(),
 				canSubmit: canSubmitEdit,
+				// Focus the textarea when editing starts
 			});
-			return () => editingCtx.unregister();
+			const timer = setTimeout(() => {
+				editTextareaRef.current?.focus();
+			}, 50);
+			return () => {
+				clearTimeout(timer);
+				editingCtx.unregister();
+			};
 		}
 	}, [isEditing, canSubmitEdit, editingCtx]);
 
@@ -4150,6 +4158,7 @@ export const MessageBubble = memo(function MessageBubble({
 								</Text>
 							</Group>
 							<Textarea
+								ref={editTextareaRef}
 								value={editContent}
 								onChange={(e) => setEditContent(e.currentTarget.value)}
 								onKeyDown={handleEditKeyDown}
@@ -4393,6 +4402,7 @@ export const MessageBubble = memo(function MessageBubble({
 						{t("editAssistantTitle")}
 					</Text>
 					<Textarea
+						ref={editTextareaRef}
 						value={editContent}
 						onChange={(e) => setEditContent(e.currentTarget.value)}
 						onKeyDown={handleEditKeyDown}

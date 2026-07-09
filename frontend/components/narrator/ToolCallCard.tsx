@@ -1427,6 +1427,7 @@ function ReflectionNotice({
 			if (isDanger) await api.stopDangerReflection(reflectionRequestId);
 			else if (isPlan) await api.stopPlanReflection(reflectionRequestId);
 			else if (isTask) await api.stopTaskReflection(reflectionRequestId);
+			else if (isQuestion) await api.stopQuestionReflection(reflectionRequestId);
 		} finally {
 			setTakingOver(false);
 		}
@@ -1494,7 +1495,7 @@ function ReflectionNotice({
 							{t("reflectionNextSteps", { nextSteps: reflection.nextSteps })}
 						</Text>
 					)}
-					{running && reflectionRequestId && (isDanger || isPlan || isTask) && (
+					{running && reflectionRequestId && (isDanger || isPlan || isTask || isQuestion) && (
 						<Group gap="xs" mt="xs">
 							<Button
 								size="xs"
@@ -3876,6 +3877,12 @@ interface SpecTaskEntry {
 
 /** Best-effort extraction of the spec task list from a tool call's input/output. */
 function extractSpecTasks(toolCall: ToolCallData): SpecTaskEntry[] | null {
+	// Try parsing tasks from metadata first (populated for Read & Edit tools on spec://tasks.json)
+	const meta = toolCall.outputJson?._metadata ?? toolCall._metadata;
+	if (meta?.tasks && Array.isArray(meta.tasks)) {
+		return meta.tasks as SpecTaskEntry[];
+	}
+
 	const tryParse = (raw: unknown): SpecTaskEntry[] | null => {
 		if (typeof raw !== "string") return null;
 		try {
@@ -3885,10 +3892,14 @@ function extractSpecTasks(toolCall: ToolCallData): SpecTaskEntry[] | null {
 			return null;
 		}
 	};
-	// Write: full document in input.content. Read: document in output.
 	if (!isTruncated(toolCall.inputJson)) {
+		// Write: full document in input.content.
 		const fromInput = tryParse(toolCall.inputJson?.content);
 		if (fromInput) return fromInput;
+		// Edit: a full-document rewrite carries the whole doc in new_string
+		// (creation writes it via old_string === "").
+		const fromEdit = tryParse(toolCall.inputJson?.new_string);
+		if (fromEdit) return fromEdit;
 	}
 	if (!isTruncated(toolCall.outputJson)) {
 		const out = toolCall.outputJson;
@@ -3908,10 +3919,11 @@ function SpecTasksDetail({ toolCall }: { toolCall: ToolCallData }) {
 	const isLatestTasksCard =
 		latestSpecTasksToolUseId == null || toolCall.toolUseId === latestSpecTasksToolUseId;
 
-	// Edit and other partial updates may not carry the full document — fall back
-	// to the generic (diff/text) detail rather than showing an empty list.
+	// Partial Edits (and the pending window before the resolved task list is
+	// available) may not carry the full document — fall back to the file diff/
+	// content view rather than a raw JSON dump of the tool input.
 	if (!tasks || tasks.length === 0) {
-		return <GenericDetail toolCall={toolCall} />;
+		return <FileDetail toolCall={toolCall} />;
 	}
 
 	return (
@@ -4765,6 +4777,7 @@ export function InlinePermission({
 					requestId={permission.id}
 					questions={askQuestions}
 					readOnly={effectiveReadOnly || !permissionInputSupported}
+					reflectionDeadline={permission.reflectionDeadline}
 					onSubmit={(reqId, answers) => onQuestionSubmit?.(reqId, answers)}
 					onReflect={(reqId) => onQuestionReflect?.(reqId)}
 					onDeny={(reqId) => onQuestionDeny?.(reqId)}

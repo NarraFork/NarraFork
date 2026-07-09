@@ -1,6 +1,7 @@
-import { isAbsolute, resolve } from "node:path";
 import { z } from "zod/v4";
-import { toForwardSlash } from "../../platform-path";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 
 const MAX_RESULTS = 500;
@@ -36,6 +37,9 @@ export const globTool: ToolDefinition = {
 		required: ["pattern"],
 		additionalProperties: false,
 	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(globTool.rawJsonSchema as Record<string, unknown>, config);
+	},
 	parameters: z.object({
 		pattern: z.string().describe("Glob pattern to match files, e.g. '**/*.ts' or 'src/*.json'"),
 		path: z.string().optional().describe("Base directory to search from. Defaults to cwd"),
@@ -49,22 +53,19 @@ export const globTool: ToolDefinition = {
 			pattern,
 			path: pathArg,
 			dot,
-		} = args as { pattern: string; path?: string; dot?: boolean };
-		// Resolve relative paths against the narrator's cwd
-		let cwd: string;
-		if (pathArg) {
-			cwd = isAbsolute(pathArg) ? pathArg : resolve(ctx.cwd, pathArg);
-		} else {
-			cwd = ctx.cwd;
-		}
+			device,
+		} = args as { pattern: string; path?: string; dot?: boolean; device?: string };
 		try {
-			const glob = new Bun.Glob(pattern);
-			const results: string[] = [];
-			for await (const entry of glob.scan({ cwd, dot: dot ?? false })) {
-				// Normalise backslashes to forward slashes for consistent output
-				results.push(toForwardSlash(entry));
-				if (results.length >= MAX_RESULTS) break;
-			}
+			const backend = getToolBackend(ctx, device);
+			const base = toolBaseCwd(backend, ctx.cwd);
+			// Resolve relative paths against the backend's base cwd (device default
+			// cwd for remote, narrator cwd for local).
+			const cwd = pathArg ? resolveBackendPath(backend, base, pathArg) : base;
+			const results = await backend.glob(pattern, {
+				cwd,
+				dot: dot ?? false,
+				maxResults: MAX_RESULTS,
+			});
 			if (results.length === 0) return { output: "No matches found" };
 			const truncated = results.length >= MAX_RESULTS ? `\n(limited to ${MAX_RESULTS})` : "";
 			return { output: results.join("\n") + truncated };

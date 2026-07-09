@@ -1,11 +1,13 @@
-import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { readFileText, writeFileText } from "./encoding";
+import { decodeFileBytes, encodeFileBytes } from "./encoding";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 
@@ -431,6 +433,9 @@ export const editTool: ToolDefinition = {
 		required: ["file_path", "old_string", "new_string"],
 		additionalProperties: false,
 	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(editTool.rawJsonSchema as Record<string, unknown>, config);
+	},
 	parameters: z.object({
 		file_path: z.string().describe("The absolute local path or spec:// Dynamic Spec URI to modify"),
 		old_string: z.string().describe("The text to replace"),
@@ -488,6 +493,17 @@ export const editTool: ToolDefinition = {
 				broadcastSpecChanged(ctx.narratorId, written, "tool");
 				const oldLines = normalizedOld.split("\n").length;
 				const newLines = normalizedNew.split("\n").length;
+				let tasks: unknown;
+				if (file_path === "spec://tasks.json") {
+					try {
+						const parsed = JSON.parse(result.content);
+						if (parsed && Array.isArray(parsed.tasks)) {
+							tasks = parsed.tasks;
+						}
+					} catch {
+						// ignore parse error
+					}
+				}
 				return {
 					output:
 						old_string === "" ? `Created/overwritten ${written.uri}` : `Edited ${written.uri}`,
@@ -497,6 +513,7 @@ export const editTool: ToolDefinition = {
 						endLine: result.startLine + oldLines - 1,
 						newEndLine: result.startLine + newLines - 1,
 						specPath: written.path,
+						tasks,
 					},
 				};
 			} catch (err) {
@@ -507,7 +524,8 @@ export const editTool: ToolDefinition = {
 			}
 		}
 
-		const resolvedPath = resolve(ctx.cwd, file_path);
+		const backend = getToolBackend(ctx, (args as { device?: string }).device);
+		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
 
 		try {
 			// Guard: identical strings
@@ -521,9 +539,9 @@ export const editTool: ToolDefinition = {
 			// Record original content before editing (non-fatal)
 			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
 				try {
-					const file = Bun.file(resolvedPath);
-					if (await file.exists()) {
-						return (await readFileText(resolvedPath)).text;
+					if (await backend.fileExists(resolvedPath)) {
+						const { bytes } = await backend.readFileBytes(resolvedPath);
+						return decodeFileBytes(bytes).text;
 					}
 				} catch {
 					// File doesn't exist or can't be read
@@ -533,7 +551,7 @@ export const editTool: ToolDefinition = {
 
 			// Create-new-file mode: old_string is empty
 			if (old_string === "") {
-				await writeFileText(resolvedPath, new_string);
+				await backend.writeFileBytes(resolvedPath, encodeFileBytes(new_string));
 				await trackFileChange(ctx, resolvedPath);
 				return {
 					output: `Created/overwritten ${file_path}`,
@@ -541,8 +559,7 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			const file = Bun.file(resolvedPath);
-			const exists = await file.exists();
+			const exists = await backend.fileExists(resolvedPath);
 			if (!exists) {
 				return {
 					output: `File not found: ${file_path}`,
@@ -550,13 +567,14 @@ export const editTool: ToolDefinition = {
 				};
 			}
 
-			const { text: rawContent, encoding } = await readFileText(resolvedPath);
+			const { bytes } = await backend.readFileBytes(resolvedPath);
+			const { text: rawContent, encoding } = decodeFileBytes(bytes);
 			const content = normalizeLineEndings(rawContent);
 			const normalizedOld = normalizeLineEndings(old_string);
 			const normalizedNew = normalizeLineEndings(new_string);
 
 			const result = replace(content, normalizedOld, normalizedNew, replace_all);
-			await writeFileText(resolvedPath, result.content, encoding);
+			await backend.writeFileBytes(resolvedPath, encodeFileBytes(result.content, encoding));
 			await trackFileChange(ctx, resolvedPath);
 			const oldLines = normalizedOld.split("\n").length;
 			const newLines = normalizedNew.split("\n").length;

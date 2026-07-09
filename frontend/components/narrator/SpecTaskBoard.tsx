@@ -111,12 +111,25 @@ function TaskCard({
 					value={task.text}
 					onChange={(e) => onUpdate(index, { text: e.currentTarget.value })}
 					placeholder={t("spec.taskPlaceholder")}
+					title={t("spec.editTaskHint")}
 					styles={{
 						input: {
 							minHeight: 22,
 							height: "auto",
+							cursor: "text",
+							paddingInline: 6,
+							borderRadius: "var(--mantine-radius-sm)",
+							border: "1px solid transparent",
+							transition: "background-color 100ms ease, border-color 100ms ease",
 							textDecoration: task.status === "done" ? "line-through" : undefined,
 							opacity: task.status === "done" ? 0.6 : 1,
+							"&:hover": {
+								backgroundColor: "var(--mantine-color-default-hover)",
+							},
+							"&:focus": {
+								backgroundColor: "var(--mantine-color-body)",
+								borderColor: "var(--mantine-color-indigo-5)",
+							},
 						},
 					}}
 				/>

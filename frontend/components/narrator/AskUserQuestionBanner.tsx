@@ -14,13 +14,14 @@ import {
 	Textarea,
 	Tooltip,
 } from "@mantine/core";
-import { IconSettings } from "@tabler/icons-react";
+import { IconClockHour4, IconSettings } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import {
 	coerceQuestions,
+	formatHMS,
 	getCustomSavedAnswer,
 	getSelectedOptionValue,
 	isSavedOptionSelected,
@@ -28,7 +29,7 @@ import {
 	resolveSavedAnswer,
 } from "./ask-user-question-utils";
 
-export { coerceQuestions } from "./ask-user-question-utils";
+export { coerceQuestions, formatHMS } from "./ask-user-question-utils";
 
 const DRAFT_KEY_PREFIX = "narrafork_ask_draft_";
 const ASK_DRAFT_STORAGE_MAX_CHARS = 256_000;
@@ -107,6 +108,12 @@ interface AskUserQuestionBannerProps {
 	answers?: Record<string, string>;
 	/** When true, render in read-only mode (no submit/skip, selections locked) */
 	readOnly?: boolean;
+	/**
+	 * Absolute epoch-ms deadline for automatic reflection. When set (and not
+	 * read-only), a live countdown is shown until the user interacts, which
+	 * disarms the timer.
+	 */
+	reflectionDeadline?: number | null;
 	onSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onDeny?: (requestId: string) => void;
 	onReflect?: (requestId: string) => Promise<void> | void;
@@ -117,6 +124,7 @@ export function AskUserQuestionBanner({
 	questions: rawQuestions,
 	answers: savedAnswers,
 	readOnly,
+	reflectionDeadline,
 	onSubmit,
 	onDeny,
 	onReflect,
@@ -166,6 +174,44 @@ export function AskUserQuestionBanner({
 	);
 	const [reflecting, setReflecting] = useState(false);
 
+	// --- Automatic-reflection countdown & disarm-on-interaction -----------------
+	// Local override so the countdown disappears the moment the user interacts,
+	// without waiting for the server round-trip / WS echo.
+	const [disarmed, setDisarmed] = useState(false);
+	const [now, setNow] = useState(() => Date.now());
+	const disarmSentRef = useRef(false);
+	const activeDeadline =
+		!readOnly && !disarmed && typeof reflectionDeadline === "number" ? reflectionDeadline : null;
+	const countdownMs = activeDeadline !== null ? activeDeadline - now : null;
+
+	// Reset local disarm state if a fresh deadline arrives (new request/rearm).
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentionally re-run when the deadline changes
+	useEffect(() => {
+		setDisarmed(false);
+		disarmSentRef.current = false;
+	}, [reflectionDeadline]);
+
+	// Tick once per second while a countdown is visible.
+	useEffect(() => {
+		if (activeDeadline === null) return;
+		setNow(Date.now());
+		const interval = setInterval(() => setNow(Date.now()), 1000);
+		return () => clearInterval(interval);
+	}, [activeDeadline]);
+
+	// Disarm the automatic reflection timer the first time the user touches the
+	// form, so the auto-answer cannot fire mid-typing. Best-effort / fire-and-forget.
+	const disarmReflection = () => {
+		if (readOnly || disarmSentRef.current) return;
+		disarmSentRef.current = true;
+		setDisarmed(true);
+		if (requestId) {
+			void api.disarmQuestionReflection(requestId).catch(() => {
+				// Non-fatal: the timer may already have fired; the reflection UI handles it.
+			});
+		}
+	};
+
 	// Persist draft to sessionStorage
 	useEffect(() => {
 		if (readOnly) return;
@@ -184,16 +230,19 @@ export function AskUserQuestionBanner({
 		return custom || selections[question] || "";
 	};
 	const handleRadioChange = (question: string, value: string) => {
+		disarmReflection();
 		setSelections((prev) => ({ ...prev, [question]: value }));
 	};
 
 	const handleCheckboxChange = (question: string, label: string, checked: boolean) => {
+		disarmReflection();
 		const current = selections[question] ? selections[question].split(", ") : [];
 		const updated = checked ? [...current, label] : current.filter((v) => v !== label);
 		setSelections((prev) => ({ ...prev, [question]: updated.join(", ") }));
 	};
 
 	const handleCustomInput = (question: string, value: string) => {
+		disarmReflection();
 		setCustomInputs((prev) => ({ ...prev, [question]: value }));
 	};
 
@@ -320,6 +369,18 @@ export function AskUserQuestionBanner({
 							</Stack>
 						);
 					})}
+					{countdownMs !== null && (
+						<Group gap={6} wrap="nowrap">
+							<IconClockHour4
+								size={14}
+								color="var(--mantine-color-yellow-6)"
+								style={{ flexShrink: 0 }}
+							/>
+							<Text size="xs" c="dimmed">
+								{t("questionReflectionCountdown", { time: formatHMS(countdownMs) })}
+							</Text>
+						</Group>
+					)}
 					{!readOnly && (
 						<Group>
 							<Button size="xs" onClick={handleSubmit} disabled={!allAnswered}>

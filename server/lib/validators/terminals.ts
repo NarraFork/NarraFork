@@ -7,6 +7,7 @@ export const createTerminalSchema = z
 		name: z.string().max(100).optional(),
 		cols: z.number().int().min(10).max(500).optional(),
 		rows: z.number().int().min(2).max(200).optional(),
+		deviceId: z.string().min(1).optional(),
 	})
 	.refine((d) => !(d.chapterId && d.narratorId), {
 		message: "Only one of chapterId or narratorId may be provided",

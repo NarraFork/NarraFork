@@ -106,6 +106,8 @@ function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderStat
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		userAgentMode: provider.userAgentMode,
+		customUserAgent: provider.customUserAgent,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -123,6 +125,8 @@ function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProvid
 		proxy: provider.proxy,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 		officialApi: provider.protocol === "anthropic-official",
+		userAgentMode: provider.userAgentMode,
+		customUserAgent: provider.customUserAgent,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -162,6 +166,8 @@ function normalizeCustomApiProvider(
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		userAgentMode: provider.userAgentMode,
+		customUserAgent: provider.customUserAgent,
 		disabled: provider.disabled ?? false,
 	};
 }
@@ -250,6 +256,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				codexWebSocket: p.codexWebSocket ?? false,
 				codexWebSearch: p.codexWebSearch ?? true,
 				codexImageGeneration: p.codexImageGeneration ?? true,
+				userAgentMode: p.userAgentMode,
+				customUserAgent: p.customUserAgent,
 				proxy: p.proxy,
 				disabled: p.disabled ?? false,
 			}));
@@ -266,6 +274,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				proxy: p.proxy,
 				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
 				officialApi: p.officialApi ?? false,
+				userAgentMode: p.userAgentMode,
+				customUserAgent: p.customUserAgent,
 				disabled: p.disabled ?? false,
 			}));
 

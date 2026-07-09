@@ -55,6 +55,13 @@ export {
 	updateVolumeSnapshotSchema,
 } from "./containers";
 export {
+	createRemoteDeviceSchema,
+	deviceSlugSchema,
+	deviceStatQuerySchema,
+	deviceTransferSchema,
+	updateRemoteDeviceSchema,
+} from "./devices";
+export {
 	createExplorationGroupSchema,
 	updateExplorationGroupSchema,
 } from "./explorations";

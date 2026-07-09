@@ -28,6 +28,8 @@ import {
 	NativeSelect,
 	NumberInput,
 	Popover,
+	Progress,
+	ScrollArea,
 	SegmentedControl,
 	Select,
 	Skeleton,
@@ -152,7 +154,13 @@ import {
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
-import { ApiError, api, type BufferMessageSummary, type TreeMessage } from "../../lib/api";
+import {
+	ApiError,
+	api,
+	type BufferMessageSummary,
+	isAbortError,
+	type TreeMessage,
+} from "../../lib/api";
 import {
 	AGG_MODEL_PREFIX,
 	buildAggModelValue,
@@ -1858,8 +1866,14 @@ function PathRulesPopover({ narratorId, t }: { narratorId: string; t: (key: stri
 		return (
 			<>
 				{trigger}
-				<Modal opened={opened} onClose={close} title={t("path_rules")} size="full">
-					{content}
+				<Modal
+					opened={opened}
+					onClose={close}
+					title={t("path_rules")}
+					fullScreen
+					scrollAreaComponent={ScrollArea.Autosize}
+				>
+					<Box p="md">{content}</Box>
 				</Modal>
 			</>
 		);
@@ -4217,6 +4231,29 @@ export function NarratorPanel({
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const sendingRef = useRef(false);
+	// Visible send/upload feedback. `progress` is 0..1 while attachments upload,
+	// or null once the request body is sent and we're awaiting the server.
+	// `canCancel` gates the cancel button — only meaningful while the upload is
+	// still in flight (an AbortController is armed) and not yet handed to the server.
+	const [sendingState, setSendingState] = useState<{
+		attachmentCount: number;
+		progress: number | null;
+		canCancel: boolean;
+	} | null>(null);
+	const isSending = sendingState !== null;
+	// AbortController for the in-flight send request; used by the cancel button.
+	const sendAbortRef = useRef<AbortController | null>(null);
+	// Throttle progress updates to whole-percent changes to avoid re-render storms.
+	const lastProgressPercentRef = useRef(-1);
+	const reportUploadProgress = useCallback((fraction: number) => {
+		const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
+		if (percent === lastProgressPercentRef.current) return;
+		lastProgressPercentRef.current = percent;
+		setSendingState((prev) => (prev ? { ...prev, progress: fraction } : prev));
+	}, []);
+	const cancelSending = useCallback(() => {
+		sendAbortRef.current?.abort();
+	}, []);
 
 	// Force react-textarea-autosize to recalculate after viewport width
 	// changes (e.g. DevTools mobile↔desktop toggle). The library recalculates
@@ -6078,7 +6115,12 @@ export function NarratorPanel({
 	);
 
 	// --- Send / retry message ---
-	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
+	const submitMessage = async (
+		msg: string,
+		images: File[] = [],
+		textFiles: File[] = [],
+		signal?: AbortSignal,
+	) => {
 		streamingBlocksRef.current = [];
 
 		// Detect slash command for optimistic display
@@ -6132,6 +6174,9 @@ export function NarratorPanel({
 				msg,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
+				undefined,
+				reportUploadProgress,
+				signal,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -6252,6 +6297,9 @@ export function NarratorPanel({
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 				old?.status === "working" ? { ...old, status: "idle" } : old,
 			);
+			// A user-initiated cancel is not a failure: skip the error toast and let
+			// the caller restore the drafted input/attachments.
+			if (isAbortError(err)) throw err;
 			const message = err instanceof Error ? err.message : "Failed to send message";
 			notifications.show({ title: "Error", message, color: "red" });
 		} finally {
@@ -6260,7 +6308,11 @@ export function NarratorPanel({
 	};
 
 	/** Shared logic for sending a buffered message (normal or priority). */
-	const doSendBuffered = async (msg: string, priority?: boolean): Promise<boolean> => {
+	const doSendBuffered = async (
+		msg: string,
+		priority?: boolean,
+		signal?: AbortSignal,
+	): Promise<boolean> => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		clearInputAndDraft();
@@ -6273,6 +6325,8 @@ export function NarratorPanel({
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
+				reportUploadProgress,
+				signal,
 			);
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
 			// Whether the message was buffered (202) or the backend fell through
@@ -6303,6 +6357,16 @@ export function NarratorPanel({
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
 		sendingRef.current = true;
+		const attachmentCount = attachedImages.length + attachedTextFiles.length;
+		lastProgressPercentRef.current = -1;
+		const abortController = new AbortController();
+		sendAbortRef.current = abortController;
+		// Only offer cancellation when there's an upload worth aborting.
+		setSendingState({
+			attachmentCount,
+			progress: attachmentCount > 0 ? 0 : null,
+			canCancel: attachmentCount > 0,
+		});
 		let restoreOnError: { msg: string; images: File[]; textFiles: File[] } | null = null;
 		try {
 			inputHistory.push(msg);
@@ -6350,6 +6414,9 @@ export function NarratorPanel({
 						initialMessage,
 						images.length > 0 ? images : undefined,
 						textFiles.length > 0 ? textFiles : undefined,
+						undefined,
+						reportUploadProgress,
+						abortController.signal,
 					);
 				}
 
@@ -6360,9 +6427,9 @@ export function NarratorPanel({
 
 			if (isActive) {
 				if (mode === "turn") {
-					await doSendBuffered(msg, false);
+					await doSendBuffered(msg, false, abortController.signal);
 				} else if (mode === "tool") {
-					await doSendBuffered(msg, true);
+					await doSendBuffered(msg, true, abortController.signal);
 				} else {
 					// "interrupt": insert at the front (await success), then interrupt so
 					// the loop's auto-resume immediately consumes the queued message.
@@ -6370,22 +6437,34 @@ export function NarratorPanel({
 					// backend fell through to a direct send (narrator went idle between
 					// the status check and this request), interrupting would abort the
 					// message we just sent.
-					const buffered = await doSendBuffered(msg, true);
+					const buffered = await doSendBuffered(msg, true, abortController.signal);
 					if (buffered) interruptMutation.mutate(narratorId);
 				}
 				return;
 			}
 			const images = [...attachedImages];
 			const textFiles = [...attachedTextFiles];
+			// Remember the draft so a cancelled upload can restore it — submitMessage
+			// clears the input/attachments up-front for the optimistic bubble.
+			restoreOnError = { msg, images, textFiles };
 			clearInputAndDraft();
 			clearAttachedImagesAndDraft();
 			setAttachedTextFiles([]);
-			await submitMessage(msg, images, textFiles);
+			await submitMessage(msg, images, textFiles, abortController.signal);
+			restoreOnError = null;
 		} catch (err) {
+			// Restore the drafted input/attachments so the user doesn't lose their
+			// message. `doSendBuffered` already restores internally on its own throw;
+			// this covers the `/new` and idle direct-send paths.
 			if (restoreOnError) {
 				setInput(restoreOnError.msg);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) setAttachedTextFiles(restoreOnError.textFiles);
+			}
+			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
+			if (isAbortError(err)) {
+				notifications.show({ message: t("sendCancelled"), color: "gray", autoClose: 2000 });
+				return;
 			}
 			notifications.show({
 				title: t("sendFailed"),
@@ -6394,6 +6473,8 @@ export function NarratorPanel({
 			});
 		} finally {
 			sendingRef.current = false;
+			sendAbortRef.current = null;
+			setSendingState(null);
 		}
 	};
 
@@ -8009,6 +8090,58 @@ export function NarratorPanel({
 						</Group>
 					)}
 
+					{/* Upload / send progress — shown while attachments are being uploaded
+					    so the input area doesn't look empty after the draft is cleared. */}
+					{sendingState && sendingState.attachmentCount > 0 && (
+						<Stack
+							gap={4}
+							pt="xs"
+							px="md"
+							pb={6}
+							style={{
+								borderTop: "1px solid var(--mantine-color-default-border)",
+								flexShrink: 0,
+							}}
+						>
+							<Group gap="xs" wrap="nowrap" justify="space-between">
+								{sendingState.progress !== null && sendingState.progress < 1 ? (
+									<Text size="xs" c="dimmed">
+										{t("uploadingAttachments", {
+											percent: Math.round(sendingState.progress * 100),
+										})}
+									</Text>
+								) : (
+									<Group gap="xs" wrap="nowrap">
+										<Loader size="xs" />
+										<Text size="xs" c="dimmed">
+											{t("sendingMessage")}
+										</Text>
+									</Group>
+								)}
+								{sendingState.canCancel && (
+									<Anchor
+										component="button"
+										type="button"
+										size="xs"
+										c="dimmed"
+										style={{ textDecoration: "underline", flexShrink: 0 }}
+										onClick={cancelSending}
+									>
+										{tc("cancel")}
+									</Anchor>
+								)}
+							</Group>
+							{sendingState.progress !== null && sendingState.progress < 1 && (
+								<Progress
+									value={sendingState.progress * 100}
+									size="sm"
+									radius="xl"
+									transitionDuration={150}
+								/>
+							)}
+						</Stack>
+					)}
+
 					{/* Queued messages indicator */}
 					{queuedMessages.length > 0 && (
 						<Stack
@@ -9144,6 +9277,7 @@ export function NarratorPanel({
 														<Button
 															key="send-priority"
 															disabled={!hasInput && !hasAttachments}
+															loading={isSending}
 															onClick={handleSend}
 															onContextMenu={(e) => e.preventDefault()}
 														>
@@ -9158,6 +9292,7 @@ export function NarratorPanel({
 														key="send"
 														onClick={handleSend}
 														disabled={!hasInput && !hasAttachments}
+														loading={isSending}
 													>
 														{tc("send")}
 													</Button>,

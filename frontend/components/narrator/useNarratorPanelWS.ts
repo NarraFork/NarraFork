@@ -2134,6 +2134,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			},
 			onTaskReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
+				setPendingPermsMap((prev) => {
+					if (!prev.has(toolUseId) && ![...prev.values()].some((perm) => perm.id === requestId)) {
+						return prev;
+					}
+					const next = new Map(prev);
+					next.delete(toolUseId);
+					for (const [key, perm] of next) {
+						if (perm.id === requestId) next.delete(key);
+					}
+					return next;
+				});
 				scheduleCacheUpdate((old) => {
 					if (!old?.pages?.length) return old;
 					const status = decision === "allow" ? "running" : "fail";
@@ -2290,6 +2301,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						},
 						toolUseIndexRef.current,
 					);
+				});
+			},
+			onQuestionReflectionDisarmed: ({ requestId, toolUseId }) => {
+				// The auto-answer countdown was cancelled (e.g. another client started
+				// answering). Clear the deadline so every client hides its countdown.
+				setPendingPermsMap((prev) => {
+					const existing =
+						prev.get(toolUseId) ?? [...prev.values()].find((perm) => perm.id === requestId);
+					if (!existing || existing.reflectionDeadline === undefined) return prev;
+					const next = new Map(prev);
+					next.set(existing.toolUseId ?? toolUseId, {
+						...existing,
+						reflectionDeadline: undefined,
+					});
+					return next;
 				});
 			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {

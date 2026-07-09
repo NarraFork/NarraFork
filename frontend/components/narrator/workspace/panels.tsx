@@ -105,7 +105,14 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 						style={{
 							position: "absolute",
 							inset: 0,
-							visibility: isSubagentView ? "hidden" : "visible",
+							// Only force "hidden" while a subagent view is layered on top.
+							// Do NOT force "visible" otherwise: with defaultRenderer="always"
+							// dockview hides an inactive panel by setting visibility:hidden on
+							// its .dv-render-overlay container, and CSS visibility is inherited-
+							// but-reversible — an explicit "visible" on this descendant would
+							// override that and leak every inactive narrator tab on top of the
+							// active one. Leaving it unset lets it inherit the overlay's state.
+							visibility: isSubagentView ? "hidden" : undefined,
 						}}
 					>
 						<NarratorPanel

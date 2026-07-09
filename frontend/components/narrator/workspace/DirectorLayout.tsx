@@ -119,7 +119,14 @@ function DirectorPanelContent({
 				style={{
 					position: "absolute",
 					inset: 0,
-					visibility: isSubagentView ? "hidden" : "visible",
+					// Force "hidden" only while a subagent view overlays this host.
+					// Never force "visible": an explicit visible would reverse an
+					// inherited visibility:hidden from an ancestor. Director hosts
+					// aren't inside dockview's always-render overlay today (each host
+					// is its own absolutely-positioned frame), so this can't leak here
+					// yet — but keeping the same pattern as the dock adapters avoids
+					// re-introducing the overlap if that ever changes.
+					visibility: isSubagentView ? "hidden" : undefined,
 				}}
 			>
 				<NarratorPanel

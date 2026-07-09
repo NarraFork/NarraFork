@@ -23,12 +23,38 @@ export async function readFileText(path: string): Promise<{ text: string; encodi
 	}
 
 	const buffer = Buffer.from(await file.arrayBuffer());
+	return decodeFileBytes(buffer);
+}
+
+/**
+ * Decode already-read file bytes into text, applying the same charset detection
+ * as {@link readFileText}. Used by tools that obtain bytes from an execution
+ * backend (local or remote) so encoding handling stays identical regardless of
+ * where the file physically lives.
+ */
+export function decodeFileBytes(bytes: Uint8Array): { text: string; encoding: string } {
+	if (!settings.agent.legacyEncoding) {
+		return { text: new TextDecoder().decode(bytes), encoding: "utf-8" };
+	}
+	const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
 	const results = chardet.analyse(buffer);
 	const best = results[0];
 	const encoding =
 		best && best.confidence >= CONFIDENCE_THRESHOLD ? normalizeEncoding(best.name) : "utf-8";
 	const text = iconv.decode(buffer, encoding);
 	return { text, encoding };
+}
+
+/**
+ * Encode text back to bytes using the same rules as {@link writeFileText}.
+ * Returns UTF-8 bytes unless legacy encoding is enabled and the target encoding
+ * is non-UTF-8.
+ */
+export function encodeFileBytes(content: string, encoding = "utf-8"): Uint8Array {
+	if (!settings.agent.legacyEncoding || isUtf8(encoding)) {
+		return new TextEncoder().encode(content);
+	}
+	return iconv.encode(content, encoding);
 }
 
 /**

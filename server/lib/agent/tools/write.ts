@@ -1,12 +1,13 @@
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
 import { z } from "zod/v4";
 import { ensureFileSnapshot } from "../../../services/file-snapshot-service";
 import { broadcastSpecChanged } from "../../../services/spec-broadcast";
 import { specVfsService } from "../../../services/spec-vfs-service";
+import { withDeviceParam } from "../execution/device-schema";
+import { backendDirname, resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
 import type { ToolDefinition, ToolResult } from "../types";
 import { consumeBehaviorFenceEditGrant, isBehaviorFencePath } from "./behavior-fence-grant";
-import { readFileText, writeFileText } from "./encoding";
+import { decodeFileBytes, encodeFileBytes } from "./encoding";
 import { consumeTaskReflectionGrant } from "./task-reflection";
 import { trackFileChange } from "./track-file-change";
 
@@ -38,6 +39,9 @@ export const writeTool: ToolDefinition = {
 		required: ["file_path", "content"],
 		additionalProperties: false,
 	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(writeTool.rawJsonSchema as Record<string, unknown>, config);
+	},
 	parameters: z.object({
 		file_path: z
 			.string()
@@ -63,7 +67,22 @@ export const writeTool: ToolDefinition = {
 					allowFenceMutation,
 				});
 				broadcastSpecChanged(ctx.narratorId, file, "tool");
-				return { output: `Wrote ${content.length} bytes to ${file.uri}`, title: file.uri };
+				let tasks: unknown;
+				if (file_path === "spec://tasks.json") {
+					try {
+						const parsed = JSON.parse(content);
+						if (parsed && Array.isArray(parsed.tasks)) {
+							tasks = parsed.tasks;
+						}
+					} catch {
+						// ignore parse error — the card falls back to the file content view
+					}
+				}
+				return {
+					output: `Wrote ${content.length} bytes to ${file.uri}`,
+					title: file.uri,
+					...(tasks !== undefined && { metadata: { tasks } }),
+				};
 			} catch (err) {
 				return {
 					output: `Error writing ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
@@ -71,15 +90,16 @@ export const writeTool: ToolDefinition = {
 				};
 			}
 		}
-		const resolvedPath = resolve(ctx.cwd, file_path);
+		const backend = getToolBackend(ctx, (args as { device?: string }).device);
+		const resolvedPath = resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
 		try {
 			// Detect existing file encoding before overwriting so we can preserve it
 			let existingEncoding = "utf-8";
 			await ensureFileSnapshot(ctx.narratorId, file_path, async () => {
 				try {
-					const file = Bun.file(resolvedPath);
-					if (await file.exists()) {
-						const result = await readFileText(resolvedPath);
+					if (await backend.fileExists(resolvedPath)) {
+						const { bytes } = await backend.readFileBytes(resolvedPath);
+						const result = decodeFileBytes(bytes);
 						existingEncoding = result.encoding;
 						return result.text;
 					}
@@ -89,8 +109,8 @@ export const writeTool: ToolDefinition = {
 				return null;
 			});
 
-			mkdirSync(dirname(resolvedPath), { recursive: true });
-			await writeFileText(resolvedPath, content, existingEncoding);
+			await backend.mkdirp(backendDirname(backend, resolvedPath));
+			await backend.writeFileBytes(resolvedPath, encodeFileBytes(content, existingEncoding));
 			await trackFileChange(ctx, resolvedPath, "write");
 			return { output: `Wrote ${content.length} bytes to ${file_path}`, title: file_path };
 		} catch (err) {

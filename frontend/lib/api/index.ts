@@ -2,6 +2,7 @@ import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
 import { chatGroupsApi } from "./chat-groups";
 import { BASE } from "./client";
+import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
@@ -27,6 +28,7 @@ export const api = {
 	...chatGroupsApi,
 	...knowledgeApi,
 	...specApi,
+	...devicesApi,
 };
 
 export {
@@ -49,6 +51,7 @@ export {
 	ApiError,
 	clearToken,
 	getToken,
+	isAbortError,
 	readFetchError,
 	readFetchErrorMessage,
 	setToken,

@@ -8,7 +8,7 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
-import { getHttpUserAgent } from "../user-agent";
+import { getHttpUserAgent, resolveHttpUserAgent } from "../user-agent";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -488,6 +488,18 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	private get codexImageGenerationEnabled(): boolean {
 		return this.config.codexImageGeneration ?? true;
+	}
+
+	/**
+	 * Resolve the User-Agent for this provider. Defaults to the narrafork UA and
+	 * can be overridden per provider via userAgentMode/customUserAgent.
+	 */
+	private resolveUserAgent(): string {
+		return resolveHttpUserAgent({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+		});
 	}
 
 	/**
@@ -1160,7 +1172,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
-			"User-Agent": getHttpUserAgent(),
+			"User-Agent": this.resolveUserAgent(),
 		};
 		if (this.apiMode === "codex") {
 			headers.originator = "narrafork";
@@ -1228,6 +1240,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				request,
 				signal: params.signal,
 				resetSessionBeforeRequest: params.resetUpstreamSession,
+				userAgent: this.resolveUserAgent(),
 			})) {
 				yield event;
 			}
@@ -1616,6 +1629,14 @@ export interface ResponsesReasoningAccum {
 	encryptedContent?: string | null;
 	/** Text already emitted from delta events; used to avoid duplicating *.done fallbacks. */
 	emittedText?: string;
+	/**
+	 * The `summary_index` of the summary part most recently emitted. A single
+	 * reasoning item can stream several summary parts, each a distinct segment.
+	 * When the index advances we insert a blank-line boundary so downstream
+	 * rendering can treat each part as its own block (avoids re-parsing the
+	 * whole reasoning every frame while streaming).
+	 */
+	lastSummaryIndex?: number;
 }
 
 function resolveReasoningAccum(
@@ -1637,12 +1658,30 @@ function pushReasoningTextEvent(
 ): void {
 	const acc = resolveReasoningAccum(chunk, reasoningAccum);
 	if (acc && options.emitOnlyIfAccumulatorEmpty && (acc.emittedText?.length ?? 0) > 0) return;
+
+	// Summary-part boundary: a single reasoning item streams several summary
+	// parts (each carries a `summary_index`). When the index advances we prepend
+	// a blank line so each part becomes its own top-level block downstream —
+	// this lets the frontend seal completed parts and re-parse only the active
+	// tail, instead of re-parsing the whole (unbounded) reasoning every frame.
+	let emitText = text;
+	if (acc && typeof chunk.summary_index === "number") {
+		if (
+			acc.lastSummaryIndex != null &&
+			chunk.summary_index > acc.lastSummaryIndex &&
+			(acc.emittedText?.length ?? 0) > 0
+		) {
+			emitText = `\n\n${text}`;
+		}
+		acc.lastSummaryIndex = chunk.summary_index;
+	}
+
 	if (acc && options.appendToAccumulator) {
-		acc.emittedText = `${acc.emittedText ?? ""}${text}`;
+		acc.emittedText = `${acc.emittedText ?? ""}${emitText}`;
 	}
 	if (acc) {
 		results.push({
-			reasoning: text,
+			reasoning: emitText,
 			reasoningMetadata: {
 				openai: {
 					itemId: acc.itemId,
@@ -1654,7 +1693,7 @@ function pushReasoningTextEvent(
 		return;
 	}
 	results.push({
-		reasoning: text,
+		reasoning: emitText,
 		reasoningOutputIndex: chunk.output_index,
 	});
 }

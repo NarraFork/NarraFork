@@ -1,14 +1,12 @@
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import path from "node:path";
 import { backgroundTaskService } from "@server/services/background-task-service";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
-import { getHome } from "../../platform";
-import { loadSettings } from "../../settings";
-import { clearInheritableHandlesBeforeSpawn } from "../../win-handle-guard";
-import { buildMinimalEnv, detectShell, killTree } from "../shell";
+import { withDeviceParam } from "../execution/device-schema";
+import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
+import { getToolBackend } from "../execution/tool-backend";
+import { detectShell } from "../shell";
 import { truncateOutput } from "../truncate";
 import type { ToolDefinition, ToolResult } from "../types";
 import { createStreamDecoder } from "./encoding";
@@ -129,6 +127,9 @@ export const bashTool: ToolDefinition = {
 		required: ["command"],
 		additionalProperties: false,
 	},
+	getRawJsonSchema(config) {
+		return withDeviceParam(bashTool.rawJsonSchema as Record<string, unknown>, config);
+	},
 	parameters: z.object({
 		command: z.string().describe("The command to execute"),
 		timeout: z.number().optional().describe("Optional timeout in milliseconds (max 600000)"),
@@ -159,13 +160,14 @@ export const bashTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { command, timeout, workdir, description, run_in_background } = args as {
+		const { command, timeout, workdir, description, run_in_background, device } = args as {
 			command: string;
 			timeout?: number;
 			workdir?: string;
 			description?: string;
 			run_in_background?: boolean;
 			strict_serial?: boolean;
+			device?: string;
 		};
 
 		if (!command) {
@@ -178,10 +180,18 @@ export const bashTool: ToolDefinition = {
 		const timeoutMs = run_in_background
 			? BACKGROUND_TIMEOUT_MS
 			: Math.min(Math.max(timeout ?? DEFAULT_TIMEOUT_MS, 0), MAX_TIMEOUT_MS);
-		const cwd = workdir ? path.resolve(ctx.cwd, workdir) : ctx.cwd;
+		const backend = getToolBackend(ctx, device);
+		// Resolve the working directory against the backend's base cwd (device
+		// default cwd for remote, narrator cwd for local) using the backend's
+		// path grammar.
+		const base = toolBaseCwd(backend, ctx.cwd);
+		const cwd = workdir ? resolveBackendPath(backend, base, workdir) : base;
 		const title = description || command.slice(0, 80);
 
-		if (!existsSync(cwd)) {
+		// Only the local backend's cwd lives on this server's filesystem; a remote
+		// device's cwd cannot be checked with the local fs (the executor validates
+		// it and surfaces a clear error instead).
+		if (backend.kind === "local" && !existsSync(cwd)) {
 			return {
 				output: `Working directory does not exist: ${cwd}\nPlease check your project path and try again.`,
 				isError: true,
@@ -192,96 +202,22 @@ export const bashTool: ToolDefinition = {
 
 		// Background execution: fire-and-forget via backgroundTaskService
 		if (run_in_background) {
-			return _runInBackground(command, cwd, timeoutMs, title, ctx);
+			return _runInBackground(command, cwd, timeoutMs, title, ctx, device);
 		}
 
 		try {
-			const shellInfo = detectShell();
-			const isWin = process.platform === "win32";
-			const freshEnv = loadSettings().agent.freshShellEnv;
-
-			// Build env: in fresh mode use a minimal set so login shell profile
-			// populates the rest; otherwise inherit the server process env.
-			let env: Record<string, string | undefined>;
-			if (freshEnv) {
-				env = buildMinimalEnv(shellInfo.extraEnv);
-			} else {
-				// Spread process.env then apply overrides.
-				// On Windows, the PATH variable is typically named "Path" (title-case).
-				// When we spread process.env into a plain object the case-insensitive
-				// proxy is lost, so bash (which expects uppercase "PATH") won't see it.
-				// Fix: always set an uppercase PATH from the original process.env.PATH
-				// (the proxy handles case-insensitive lookup).
-				env = {
-					...process.env,
-					HOME: getHome(),
-					...shellInfo.extraEnv,
-				};
-				if (isWin && !env.PATH && process.env.PATH) {
-					env.PATH = process.env.PATH;
-				}
-			}
-
-			// On Windows with Git Bash we must use login-shell mode so that
-			// /etc/profile is sourced and PATH is properly converted from
-			// Windows format to POSIX format.  Without this, tools like node,
-			// npm, git etc. are invisible to the spawned bash process.
-			//
-			// `detached` is only useful on Unix (creates a new process group for
-			// clean tree-kill via negative PID).  On Windows it creates a new
-			// console window and can break stdio pipes, so we skip it.
-			//
-			// When freshShellEnv is enabled on Unix, always use login-shell
-			// wrapping (`-l -c`) so the shell sources its profile files.
-			let spawnArgs: [string, string[], object];
-			if (shellInfo.loginWrap) {
-				spawnArgs = [
-					shellInfo.path,
-					["--login", "-c", command],
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
-				];
-			} else if (shellInfo.type === "powershell") {
-				// PowerShell: in fresh mode, allow $PROFILE to load;
-				// otherwise use -NoProfile for clean, predictable execution.
-				const psArgs = freshEnv
-					? ["-NonInteractive", "-Command", command]
-					: ["-NoProfile", "-NonInteractive", "-Command", command];
-				spawnArgs = [
-					shellInfo.path,
-					psArgs,
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
-				];
-			} else if (freshEnv) {
-				// Unix fresh mode: wrap as login shell to source profile
-				spawnArgs = [
-					shellInfo.path,
-					["-l", "-c", command],
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
-				];
-			} else {
-				spawnArgs = [
-					command,
-					[],
-					{
-						shell: shellInfo.path,
-						cwd,
-						env,
-						stdio: ["ignore", "pipe", "pipe"],
-						detached: !isWin,
-					},
-				];
-			}
-
-			clearInheritableHandlesBeforeSpawn();
-			const proc = spawn(...spawnArgs);
+			const handle = await backend.execCommand({
+				command,
+				cwd,
+				signal: ctx.signal,
+			});
 
 			let output = "";
 			let timedOut = false;
 			let aborted = false;
 			let exited = false;
 
-			const exitedFn = () => exited;
-			const kill = () => killTree(proc, { exited: exitedFn });
+			const kill = () => handle.kill();
 
 			// Collect stdout + stderr into a single buffer with size limit.
 			// Use StringDecoder to handle multi-byte UTF-8 characters split across chunks.
@@ -314,8 +250,9 @@ export const bashTool: ToolDefinition = {
 				pendingLiveEmit = true;
 				liveEmitTimer = setTimeout(flushLiveOutput, LIVE_OUTPUT_INTERVAL_MS);
 			};
-			const append = (chunk: Buffer) => {
+			const append = (raw: Uint8Array) => {
 				if (outputTruncated) return;
+				const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
 				outputBytes += chunk.byteLength;
 				if (outputBytes > MAX_OUTPUT_BYTES) {
 					output += decoder.write(chunk).slice(0, 200);
@@ -328,26 +265,20 @@ export const bashTool: ToolDefinition = {
 				output += decoder.write(chunk);
 				scheduleLiveOutput();
 			};
-			proc.stdout?.on("data", append);
-			proc.stderr?.on("data", append);
+			handle.onData(append);
 
 			// Set up the exit promise FIRST, before any kill calls,
 			// so we never miss the exit event.
-			const exitPromise = new Promise<void>((resolve, reject) => {
-				if (proc.exitCode !== null) {
+			// Mark `exited` as a side-effect for the watchdog; the exit code itself
+			// is captured by awaiting handle.exited at the wait point below.
+			handle.exited.then(
+				() => {
 					exited = true;
-					resolve();
-					return;
-				}
-				proc.once("exit", () => {
+				},
+				() => {
 					exited = true;
-					resolve();
-				});
-				proc.once("error", (err) => {
-					exited = true;
-					reject(err);
-				});
-			});
+				},
+			);
 
 			// Abort: if already aborted, kill immediately
 			if (ctx.signal.aborted) {
@@ -397,11 +328,13 @@ export const bashTool: ToolDefinition = {
 				const hadOutput = currentLen > lastOutputLen;
 				lastOutputLen = currentLen;
 
-				// Check if PID is still alive
-				let pidAlive = false;
-				if (proc.pid) {
+				// Check if PID is still alive. Only the local backend exposes a pid;
+				// remote backends report liveness solely via handle.isExited().
+				let pidAlive = true;
+				const pid = handle.pid;
+				if (pid) {
 					try {
-						process.kill(proc.pid, 0);
+						process.kill(pid, 0);
 						pidAlive = true;
 					} catch {
 						pidAlive = false;
@@ -428,8 +361,9 @@ export const bashTool: ToolDefinition = {
 			}, WATCHDOG_INTERVAL_MS);
 
 			// Wait for process to finish
+			let exitCodeValue: number | null = null;
 			try {
-				await exitPromise;
+				exitCodeValue = await handle.exited;
 			} finally {
 				clearTimeout(timer);
 				clearInterval(watchdogTimer);
@@ -463,7 +397,7 @@ export const bashTool: ToolDefinition = {
 				output += `\n\n<bash_metadata>\n${meta.join("\n")}\n</bash_metadata>`;
 			}
 
-			const exitCode = proc.exitCode ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
+			const exitCode = exitCodeValue ?? (timedOut || aborted || watchdogKilled ? 1 : 0);
 			if (exitCode !== 0) output += `\n[exit code: ${exitCode}]`;
 
 			const truncated = truncateOutput(output || "(no output)");
@@ -494,6 +428,7 @@ async function _runInBackground(
 	timeoutMs: number,
 	title: string,
 	ctx: ToolContext,
+	device?: string,
 ): Promise<ToolResult> {
 	const taskId = `bash_${generateShortId()}`;
 	const bgAbort = new AbortController();
@@ -516,72 +451,17 @@ async function _runInBackground(
 	// Fire-and-forget: spawn the process and collect output asynchronously
 	(async () => {
 		try {
-			const shellInfo = detectShell();
-			const isWin = process.platform === "win32";
-			const freshEnv = loadSettings().agent.freshShellEnv;
-
-			let env: Record<string, string | undefined>;
-			if (freshEnv) {
-				env = buildMinimalEnv(shellInfo.extraEnv);
-			} else {
-				env = {
-					...process.env,
-					HOME: getHome(),
-					...shellInfo.extraEnv,
-				};
-				if (isWin && !env.PATH && process.env.PATH) {
-					env.PATH = process.env.PATH;
-				}
-			}
-
-			let spawnArgs: [string, string[], object];
-			if (shellInfo.loginWrap) {
-				spawnArgs = [
-					shellInfo.path,
-					["--login", "-c", command],
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
-				];
-			} else if (shellInfo.type === "powershell") {
-				const psArgs = freshEnv
-					? ["-NonInteractive", "-Command", command]
-					: ["-NoProfile", "-NonInteractive", "-Command", command];
-				spawnArgs = [
-					shellInfo.path,
-					psArgs,
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: false },
-				];
-			} else if (freshEnv) {
-				spawnArgs = [
-					shellInfo.path,
-					["-l", "-c", command],
-					{ cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
-				];
-			} else {
-				spawnArgs = [
-					command,
-					[],
-					{
-						shell: shellInfo.path,
-						cwd,
-						env,
-						stdio: ["ignore", "pipe", "pipe"],
-						detached: !isWin,
-					},
-				];
-			}
-
-			clearInheritableHandlesBeforeSpawn();
-			const proc = spawn(...spawnArgs);
-			let exited = false;
+			const backend = getToolBackend(ctx, device);
+			const handle = await backend.execCommand({ command, cwd, signal: bgAbort.signal });
 			let outputBytes = 0;
 			let outputTruncated = false;
-			const exitedFn = () => exited;
-			const killFn = () => killTree(proc, { exited: exitedFn });
+			const killFn = () => handle.kill();
 			backgroundTaskService.registerKillHandler(taskId, () => void killFn());
 
 			const bgDecoder = createStreamDecoder();
-			const appendOutput = (chunk: Buffer) => {
+			const appendOutput = (raw: Uint8Array) => {
 				if (outputTruncated) return;
+				const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
 				const str = bgDecoder.write(chunk);
 				outputBytes += chunk.byteLength;
 				if (outputBytes > MAX_OUTPUT_BYTES) {
@@ -594,30 +474,7 @@ async function _runInBackground(
 				}
 				if (str) backgroundTaskService.appendOutput(taskId, str);
 			};
-			proc.stdout?.on("data", appendOutput);
-			proc.stderr?.on("data", appendOutput);
-
-			const exitPromise = new Promise<void>((resolve, reject) => {
-				if (proc.exitCode !== null) {
-					exited = true;
-					resolve();
-					return;
-				}
-				proc.once("exit", () => {
-					exited = true;
-					resolve();
-				});
-				proc.once("error", (err) => {
-					exited = true;
-					reject(err);
-				});
-			});
-
-			// Abort handler (from backgroundTaskService.cancel)
-			const onAbort = () => {
-				void killFn();
-			};
-			bgAbort.signal.addEventListener("abort", onAbort, { once: true });
+			handle.onData(appendOutput);
 
 			// Timeout
 			const timer = setTimeout(() => {
@@ -628,11 +485,11 @@ async function _runInBackground(
 				void killFn();
 			}, timeoutMs);
 
+			let resolvedExitCode: number | null;
 			try {
-				await exitPromise;
+				resolvedExitCode = await handle.exited;
 			} finally {
 				clearTimeout(timer);
-				bgAbort.signal.removeEventListener("abort", onAbort);
 			}
 
 			// Flush bytes buffered inside the decoder (see foreground path).
@@ -641,7 +498,7 @@ async function _runInBackground(
 				if (tail) backgroundTaskService.appendOutput(taskId, tail);
 			}
 
-			const exitCode = proc.exitCode ?? 1;
+			const exitCode = resolvedExitCode ?? 1;
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 

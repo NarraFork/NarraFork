@@ -218,12 +218,15 @@ export const terminalService = {
 		name?: string;
 		cols?: number;
 		rows?: number;
+		/** Route this terminal to a remote executor device. */
+		deviceId?: string;
 	}) {
 		const cols = opts.cols ?? 80;
 		const rows = opts.rows ?? 24;
 		let cwd: string;
 		const chapterId: string | undefined = opts.chapterId;
 		const narratorId: string | undefined = opts.narratorId;
+		const deviceId: string | undefined = opts.deviceId;
 
 		if (chapterId && narratorId) {
 			throw new ValidationError("Only one of chapterId or narratorId may be provided");
@@ -274,12 +277,32 @@ export const terminalService = {
 		const now = new Date().toISOString();
 		const buffer = new BufferManager(id);
 		buffer.startPeriodicFlush();
-		const useDtach = await dtachService.isAvailable();
+		// Remote terminals run on a device PTY; dtach (local detach) does not apply.
+		const useRemote = !!deviceId;
+		const useDtach = !useRemote && (await dtachService.isAvailable());
 
 		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
 
-		if (useDtach) {
+		if (useRemote && deviceId) {
+			const { isDeviceOnline } = await import("./device-connection-service");
+			if (!isDeviceOnline(deviceId)) {
+				throw new ValidationError("Selected device is offline");
+			}
+			const { spawnRemotePty } = await import("../terminal/runtime-remote");
+			runtime = spawnRemotePty(deviceId, {
+				cmd: [DEFAULT_SHELL, "-l"],
+				cwd,
+				env: {
+					...process.env,
+					HISTFILE: DEV_NULL,
+					TERM: "xterm-256color",
+				},
+				cols,
+				rows,
+				onData: (data) => onData(id, buffer, data),
+			});
+		} else if (useDtach) {
 			// dtach mode: create detached session, then attach via PTY
 			await dtachService.createSession({ terminalId: id, cwd });
 			dtachSocket = dtachService.getSocketPath(id);
@@ -346,6 +369,7 @@ export const terminalService = {
 				name: opts.name ?? "Terminal",
 				cwd,
 				dtachSocket,
+				deviceId: deviceId ?? null,
 				status: "running",
 				createdAt: now,
 			})

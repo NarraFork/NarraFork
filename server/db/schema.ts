@@ -335,6 +335,13 @@ export const narrators = sqliteTable(
 		turnStartedAt: text("turn_started_at"),
 		/** Monotonically increasing counter bumped on every message add/delete/update */
 		messageVersion: integer("message_version").notNull().default(0),
+		/**
+		 * Default execution device for this session's file/command tools.
+		 * null → local server. When set to a remote_devices.id, Read/Write/Edit/
+		 * Glob/Grep/Bash route their IO to that device unless a per-call `device`
+		 * parameter overrides it. Set via the SwitchDevice tool.
+		 */
+		defaultDeviceId: text("default_device_id"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -342,6 +349,66 @@ export const narrators = sqliteTable(
 		index("idx_narrators_chapter").on(table.chapterId),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		uniqueIndex("idx_narrators_handle").on(table.handle),
+	],
+);
+
+// === remote_devices ===
+/**
+ * A registered remote executor device. A lightweight Go agent runs on the
+ * device, connects back to NarraFork (reverse dial) or is dialed by the server
+ * (direct), and executes file/command/git operations forwarded over RPC.
+ */
+export const remoteDevices = sqliteTable(
+	"remote_devices",
+	{
+		id: text("id").primaryKey(),
+		/** Display name (user-editable). */
+		name: text("name").notNull(),
+		/** Unique slug the model can reference (stable, [a-z0-9_-]). */
+		slug: text("slug").notNull(),
+		/** Optional usage description injected into the narrator prompt. */
+		description: text("description"),
+		// ── Authentication ──
+		/** Hash of the registration key (never stored in plaintext). */
+		tokenHash: text("token_hash").notNull(),
+		/** Non-secret key prefix shown in the UI (e.g. "rdev_ab12"). */
+		tokenPrefix: text("token_prefix").notNull(),
+		// ── Connection mode ──
+		connectionMode: text("connection_mode", { enum: ["reverse", "direct"] })
+			.notNull()
+			.default("reverse"),
+		/** For direct mode: the ws(s):// URL the server dials to reach the executor. */
+		directUrl: text("direct_url"),
+		// ── Runtime state (updated by the connection manager) ──
+		status: text("status", { enum: ["online", "offline"] })
+			.notNull()
+			.default("offline"),
+		lastSeenAt: text("last_seen_at"),
+		// ── Device self-reported capabilities (from handshake) ──
+		platformOs: text("platform_os"),
+		platformArch: text("platform_arch"),
+		shellPath: text("shell_path"),
+		/** Default working directory on the device. */
+		defaultCwd: text("default_cwd"),
+		agentVersion: text("agent_version"),
+		/** JSON: { git, ripgrep, pty, ... } capability flags reported at handshake. */
+		capabilitiesJson: text("capabilities_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		// ── Authorization scope ──
+		scope: text("scope", { enum: ["global", "project"] })
+			.notNull()
+			.default("global"),
+		projectId: text("project_id").references(() => projects.id),
+		// ── Audit ──
+		createdBy: text("created_by").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		/** Soft-delete / revocation timestamp. Revoked devices reject connections. */
+		revokedAt: text("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_remote_devices_slug").on(table.slug),
+		index("idx_remote_devices_status").on(table.status),
+		index("idx_remote_devices_project").on(table.projectId),
 	],
 );
 
@@ -629,6 +696,8 @@ export const terminals = sqliteTable(
 		name: text("name").notNull(),
 		cwd: text("cwd"),
 		dtachSocket: text("dtach_socket"),
+		/** Remote executor device this terminal runs on. null → local server. */
+		deviceId: text("device_id"),
 		status: text("status", { enum: ["running", "exited"] })
 			.notNull()
 			.default("running"),

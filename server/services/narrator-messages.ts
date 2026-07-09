@@ -45,6 +45,7 @@ function getReflectionStatus(suggestions: unknown): string | null {
 		if (
 			type === "danger_reflection" ||
 			type === "plan_reflection" ||
+			type === "task_reflection" ||
 			type === "question_reflection"
 		) {
 			return typeof record.status === "string" ? record.status : "running";
@@ -446,6 +447,23 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 /** Tool names whose inputJson should not be truncated */
 const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
 
+const SPEC_TASKS_URI = "spec://tasks.json";
+
+/**
+ * Whether a tool call is a Write/Edit on the Dynamic Spec task queue
+ * (spec://tasks.json). Its input must stay untruncated so the client can render
+ * the custom task-list card (SpecTasksDetail) during every phase — including the
+ * pending taskReflection window, before the completed output carries the parsed
+ * task metadata. tasks.json is small by design, so keeping the full input is cheap.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function isSpecTasksInput(toolName: string, input: any): boolean {
+	if (toolName !== "Write" && toolName !== "Edit") return false;
+	if (!input || typeof input !== "object") return false;
+	const filePath = input.file_path ?? input.filePath ?? input.path;
+	return filePath === SPEC_TASKS_URI;
+}
+
 /**
  * Extract short header-relevant fields from a tool's inputJson before truncation.
  */
@@ -578,7 +596,8 @@ export function truncateToolIO(tree: any[], maxLen = 2000): any[] {
 				});
 				const withSideCars = toolSideCars.length > 0 ? { ...tc, sideCars: toolSideCars } : tc;
 				if (SKIP_TRUNCATE_TOOLS.has(tc.toolName)) return withSideCars;
-				const skipInput = SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName);
+				const skipInput =
+					SKIP_INPUT_TRUNCATE_TOOLS.has(tc.toolName) || isSpecTasksInput(tc.toolName, tc.inputJson);
 				return {
 					...withSideCars,
 					inputJson: skipInput

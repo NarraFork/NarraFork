@@ -53,6 +53,7 @@ export {
 	getModelMaxCompletionTokens,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
+	getQueueDuringCompaction,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,

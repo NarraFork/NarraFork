@@ -39,6 +39,7 @@ terminalRoutes.post("/", async (c) => {
 		name: parsed.data.name,
 		cols: parsed.data.cols,
 		rows: parsed.data.rows,
+		deviceId: parsed.data.deviceId,
 	});
 	return c.json(terminal, 201);
 });

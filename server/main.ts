@@ -47,6 +47,8 @@ import "./services/attention-hook-bridge"; // Bridge attention events into the h
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";
+import { initDeviceConnectionService } from "./services/device-connection-service";
+import { initDeviceTransferService } from "./services/device-transfer-service";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
@@ -604,6 +606,18 @@ function startServer(listenPort: number) {
 				return new Response("WebSocket upgrade failed", { status: 400 });
 			}
 
+			// Remote executor devices authenticate via the hello frame (device token),
+			// not a JWT, so accept the upgrade here and let the handshake verify.
+			if (url.pathname === "/ws/device") {
+				const wsData = resolveWSData(url);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
+
 			// WebSocket upgrade for /ws/narrator and /ws/terminal
 			if (url.pathname.startsWith("/ws")) {
 				// Verify JWT from query param
@@ -826,6 +840,11 @@ async function openAsApp(url: string) {
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
+
+// Wire the remote-executor backend resolver + device lifecycle listeners.
+initDeviceConnectionService();
+// Wire the file-transfer chunk-frame receiver.
+initDeviceTransferService();
 
 startVNetUdpRendezvous(settings.vnet).catch((err) => {
 	logger.warn("VNet UDP rendezvous startup failed", { error: String(err) });
@@ -1114,13 +1133,31 @@ registerGracefulShutdownHandler(async (request) => {
 });
 
 const safeShutdown = () => {
+	// Persist the clean-shutdown marker FIRST, synchronously, before any other work in this
+	// handler (logging, heartbeat teardown, entering performGracefulShutdown). This is a
+	// marginal hardening — performGracefulShutdown already writes the marker before its first
+	// await — but on Windows the console-close (CTRL_CLOSE_EVENT) path gives only ~5s before a
+	// forced TerminateProcess, so shrinking the work that precedes the marker write reduces the
+	// chance of being killed before it lands. Idempotent via dbLifecycle.cleanMarked.
+	markDatabaseCleanShutdownEarly();
 	performGracefulShutdown({ reason: "signal", closeActiveConnections: true })
 		.then(() => process.exit(0))
 		.catch(() => process.exit(1));
 };
 process.on("SIGINT", safeShutdown);
 process.on("SIGTERM", safeShutdown);
-// SIGHUP fires on some Windows terminal emulators when the console window is closed.
+// SIGHUP fires on some Windows terminal emulators when the console window is closed, and Bun
+// may also surface Windows CTRL_CLOSE / CTRL_SHUTDOWN / CTRL_LOGOFF events as SIGHUP. Whether
+// Bun actually delivers these console-control events to JS is runtime-dependent and unverified
+// on our side, so this is best-effort: when the signal IS delivered we write the clean marker
+// above and skip the expensive next-startup checks.
+//
+// KNOWN LIMITATION: task-manager "End task" / taskkill /F / power loss call TerminateProcess
+// directly and deliver NO signal, so none of these handlers run. A Windows-native
+// SetConsoleCtrlHandler (via bun:ffi JSCallback) could catch console-close more reliably, but
+// it cannot catch TerminateProcess either, adds FFI-callback risk at a fragile exit point, and
+// the codebase has no JSCallback precedent — so we intentionally do not use it. The startup
+// fallback (quick_check + conditional FTS rebuild) is what protects the unclean cases.
 process.on("SIGHUP", safeShutdown);
 // On Windows, closing the console window may not deliver SIGINT/SIGTERM.
 // "exit" fires when the event loop drains or process.exit() is called elsewhere.

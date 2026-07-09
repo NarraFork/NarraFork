@@ -124,6 +124,8 @@ export interface AgentSectionProps {
 	setAutoCompactPruneThreshold: (v: number) => void;
 	minPruneRatio: number;
 	setMinPruneRatio: (v: number) => void;
+	queueDuringCompaction: boolean;
+	setQueueDuringCompaction: (v: boolean) => void;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	setGlobalWhitelistDirs: (
 		v: Array<{ path: string; accessLevel: string; enabled?: boolean }>,
@@ -533,6 +535,12 @@ export function AgentSection(props: AgentSectionProps) {
 					suffix="%"
 				/>
 			</Group>
+			<Switch
+				label={t("queueDuringCompaction")}
+				description={t("queueDuringCompactionDesc")}
+				checked={props.queueDuringCompaction}
+				onChange={(e) => props.setQueueDuringCompaction(e.currentTarget.checked)}
+			/>
 			<Text size="sm" fw={500} mt={4}>
 				{t("contextThresholdsStandard")}
 			</Text>

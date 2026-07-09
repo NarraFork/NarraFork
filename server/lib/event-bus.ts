@@ -301,7 +301,32 @@ export type NarraForkEvent =
 			type: "narrator:message_broadcast";
 			narratorId: string;
 			message: NarratorServerMessage;
-	  };
+	  }
+	// Remote executor device lifecycle
+	| { type: "device:changed"; deviceId: string }
+	| { type: "device:status"; deviceId: string; status: "online" | "offline" }
+	| { type: "device:token-rotated"; deviceId: string }
+	| { type: "device:revoked"; deviceId: string }
+	// File transfer lifecycle
+	| {
+			type: "transfer:progress";
+			transferId: string;
+			deviceId: string;
+			direction: "download" | "upload";
+			bytesTransferred: number;
+			totalBytes: number;
+			filesDone: number;
+			totalFiles: number;
+			currentFile?: string;
+	  }
+	| {
+			type: "transfer:done";
+			transferId: string;
+			deviceId: string;
+			bytesTransferred: number;
+			filesDone: number;
+	  }
+	| { type: "transfer:error"; transferId: string; deviceId: string; error: string };
 
 export type NarraForkEventType = NarraForkEvent["type"];
 

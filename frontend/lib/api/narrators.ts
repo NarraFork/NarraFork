@@ -1,5 +1,13 @@
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
-import { ApiError, BASE, clearToken, getToken, readFetchError, request } from "./client";
+import {
+	ApiError,
+	BASE,
+	clearToken,
+	getToken,
+	postFormDataWithProgress,
+	readFetchError,
+	request,
+} from "./client";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -312,6 +320,17 @@ export const narratorsApi = {
 				method: "POST",
 			},
 		),
+	disarmQuestionReflection: (requestId: string) =>
+		request<{ ok: boolean; disarmed: boolean }>(
+			`/narrators/permissions/${requestId}/disarm-question-reflection`,
+			{
+				method: "POST",
+			},
+		),
+	stopQuestionReflection: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-question-reflection`, {
+			method: "POST",
+		}),
 	stopDangerReflection: (requestId: string) =>
 		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/stop-reflection`, {
 			method: "POST",
@@ -519,12 +538,15 @@ export const narratorsApi = {
 		images?: File[],
 		textFiles?: File[],
 		priority?: boolean,
+		onUploadProgress?: (fraction: number) => void,
+		signal?: AbortSignal,
 	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
 
-		let body: BodyInit;
+		const url = `${BASE}/narrators/${narratorId}/messages`;
+		let res: Response;
 		if (images?.length || textFiles?.length) {
 			const formData = new FormData();
 			formData.append("message", message);
@@ -535,17 +557,21 @@ export const narratorsApi = {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
 			if (priority) formData.append("priority", "true");
-			body = formData;
+			// Use XHR-backed upload so we can surface real upload progress to the UI.
+			res = await postFormDataWithProgress(url, formData, {
+				headers,
+				onProgress: onUploadProgress,
+				signal,
+			});
 		} else {
 			headers["Content-Type"] = "application/json";
-			body = JSON.stringify(priority ? { message, priority: true } : { message });
+			res = await fetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(priority ? { message, priority: true } : { message }),
+				signal,
+			});
 		}
-
-		const res = await fetch(`${BASE}/narrators/${narratorId}/messages`, {
-			method: "POST",
-			headers,
-			body,
-		});
 		if (res.status === 401) {
 			clearToken();
 			const error = await readFetchError(res, "Unauthorized");

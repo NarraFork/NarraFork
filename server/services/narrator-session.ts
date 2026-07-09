@@ -233,6 +233,48 @@ function normalizeOptionalDangerReflectionOverride(
 	return value == null ? undefined : normalizeDangerReflectionOverride(value);
 }
 
+/**
+ * Resolve the remote devices this session may route to. Best-effort: any error
+ * (e.g. the device layer being unavailable) yields an empty list so the agent
+ * loop simply runs local-only and never exposes device parameters.
+ */
+async function resolveSessionDevices(
+	projectId: string | null,
+): Promise<import("../lib/agent").AgentConfig["availableDevices"]> {
+	try {
+		const { getSessionDevices } = await import("./device-connection-service");
+		return await getSessionDevices(projectId);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Apply a SwitchDevice request: persist the new default on the narrator record
+ * and update the live session so subsequent tool calls route accordingly.
+ */
+async function applySessionDefaultDevice(
+	narratorId: string,
+	active: ActiveNarrator,
+	deviceId: string | null,
+): Promise<boolean> {
+	try {
+		active._defaultDeviceId = deviceId;
+		await db
+			.update(narrators)
+			.set({ defaultDeviceId: deviceId, updatedAt: new Date().toISOString() })
+			.where(eq(narrators.id, narratorId));
+		return true;
+	} catch (err) {
+		logger.warn("Failed to persist session default device", {
+			narratorId,
+			deviceId,
+			error: err instanceof Error ? err.message : String(err),
+		});
+		return false;
+	}
+}
+
 async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -448,6 +490,10 @@ async function buildSystemPrompt(
 	planMode = false,
 	planFileId?: string,
 	defaultSystemPrompt?: string | null,
+	deviceContext?: {
+		devices?: import("./narrator-prompt").BuildPromptOptions["devices"];
+		defaultDeviceId?: string | null;
+	},
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -459,6 +505,8 @@ async function buildSystemPrompt(
 		planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
+		devices: deviceContext?.devices,
+		defaultDeviceId: deviceContext?.defaultDeviceId,
 	});
 }
 
@@ -526,6 +574,9 @@ async function createNarrator(
 		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
 		: undefined;
 
+	// Resolve remote execution devices for the Execution Devices prompt section.
+	const sessionDevices = await resolveSessionDevices(narratorProjectId ?? null);
+
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
 			systemPrompt: narrator.systemPrompt,
@@ -537,6 +588,7 @@ async function createNarrator(
 		isPlanMode,
 		planFileId,
 		settings.agent.defaultSystemPrompt,
+		{ devices: sessionDevices, defaultDeviceId: narrator.defaultDeviceId ?? null },
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -610,6 +662,9 @@ async function createNarrator(
 		// Explicitly null so a rebuilt active never carries a stale/undefined user.
 		// Set per-trigger by feedMessage / continue / retry / re-execute paths.
 		_currentUserId: null,
+		// Session default execution device (null → local). Restored from the
+		// narrator record; mutated by the SwitchDevice tool.
+		_defaultDeviceId: narrator.defaultDeviceId ?? null,
 	};
 
 	// Auto-load optional tools whose routines are globally enabled
@@ -1928,6 +1983,9 @@ export async function runAgentLoop(
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: active._projectId ?? null,
+				defaultDeviceId: active._defaultDeviceId ?? null,
+				availableDevices: await resolveSessionDevices(active._projectId ?? null),
+				setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 				// Share the compact-cycle de-dup set so the loop's tool-output scan (point B)
 				// de-dups against the user-message injections (point A) and vice versa.
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
@@ -4103,6 +4161,9 @@ export async function reExecuteDeniedToolCall(
 		skillScopeKey: active._skillScopeKey ?? undefined,
 		userId: active._currentUserId ?? null,
 		projectId: active._projectId ?? null,
+		defaultDeviceId: active._defaultDeviceId ?? null,
+		availableDevices: await resolveSessionDevices(active._projectId ?? null),
+		setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 		disabledTools: active._disabledTools,
 		permissionHandler: (tName, input, tUseId, options) =>
 			handlePermission(
@@ -5837,6 +5898,7 @@ export {
 	updateBufferedMessage,
 } from "./narrator-buffer";
 export {
+	awaitCompactCompletion,
 	cancelCompact,
 	compactLocks,
 	isCompactInProgress,

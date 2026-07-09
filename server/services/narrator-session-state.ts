@@ -97,6 +97,8 @@ export interface ActiveNarrator {
 	_currentUserId?: string | null;
 	/** Immediate title derived from the first user message while model title generation runs. */
 	_provisionalTitle?: string;
+	/** Session default execution device id (null → local). Set via SwitchDevice. */
+	_defaultDeviceId?: string | null;
 	/** Active substatus tags for this narrator session (in-memory, synced to DB on change). */
 	_substatus: Set<string>;
 	/** One-shot reset for reusable upstream provider sessions before the next request. */
@@ -144,6 +146,23 @@ export interface PendingPermission {
 	planModeSoftDeny?: boolean;
 	planSubmittedFromFile?: boolean;
 	questionReflectionTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Absolute epoch-ms timestamp at which automatic AskUserQuestion reflection
+	 * fires. Sent to the frontend so it can render a live countdown. Undefined
+	 * when reflection is not scheduled or has been disarmed/taken over.
+	 */
+	questionReflectionDeadline?: number;
+	/**
+	 * AbortController for an in-flight AskUserQuestion reflection answer
+	 * generation, so a user takeover can cancel the upstream request.
+	 */
+	questionReflectionAbort?: AbortController;
+	/**
+	 * Set when the user takes over an AskUserQuestion reflection (either while it
+	 * is generating or after disarming the timer). Prevents the reflection path
+	 * from confirming/answering behind the user's back.
+	 */
+	questionReflectionStoppedByUser?: boolean;
 	/**
 	 * Whether a user-facing `narrator:attention` (reason=waiting_permission) was
 	 * emitted for this request. Mirrors the emit in handlePermission so that

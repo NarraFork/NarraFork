@@ -78,6 +78,22 @@ export function isCompactInProgress(narratorId: string): boolean {
 	return compactLocks.has(narratorId);
 }
 
+/**
+ * Await any in-progress compact for this narrator to settle. A compact can hand
+ * off to a follow-up lock (e.g. history_probe → history), so re-check after each
+ * settles. Each underlying compact promise is bounded by its own 5-minute
+ * timeout; the small iteration cap guards against unexpected relock churn.
+ * Rejections (cancel/failure) are swallowed — the caller only needs the lock
+ * to be released.
+ */
+export async function awaitCompactCompletion(narratorId: string): Promise<void> {
+	for (let i = 0; i < 5; i++) {
+		const lock = compactLocks.get(narratorId);
+		if (!lock) return;
+		await lock.promise.catch(() => {});
+	}
+}
+
 /** Check whether an error is an abort/cancellation error from a cancelled compact. */
 function isCompactAbortError(err: unknown): boolean {
 	if (err instanceof DOMException && err.name === "AbortError") return true;

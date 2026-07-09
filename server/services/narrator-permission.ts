@@ -1101,8 +1101,10 @@ function shouldScheduleQuestionReflection(effectiveMode: string): boolean {
 function scheduleQuestionReflection(
 	requestId: string,
 	effectiveMode: string,
+	deadline: number,
 ): ReturnType<typeof setTimeout> | undefined {
 	if (!shouldScheduleQuestionReflection(effectiveMode)) return undefined;
+	const delay = Math.max(0, deadline - Date.now());
 	return setTimeout(() => {
 		void reflectPendingAskUserQuestion(requestId, { automatic: true }).catch((err) => {
 			logger.warn("AskUserQuestion automatic reflection failed", {
@@ -1110,7 +1112,7 @@ function scheduleQuestionReflection(
 				error: err instanceof Error ? err.message : String(err),
 			});
 		});
-	}, getQuestionReflectionTimeoutMs());
+	}, delay);
 }
 
 async function currentPermissionModeAllowsAutomaticQuestionReflection(
@@ -1151,13 +1153,21 @@ export async function reflectPendingAskUserQuestion(
 		}
 	}
 
+	if (pending.questionReflectionStoppedByUser) {
+		return { ok: false, reason: "Question reflection was taken over by the user" };
+	}
+
 	if (pending.questionReflectionTimer) {
 		clearTimeout(pending.questionReflectionTimer);
 		pending.questionReflectionTimer = undefined;
 	}
+	pending.questionReflectionDeadline = undefined;
 
 	const questions = coerceAskQuestions(pending.input.questions);
 	if (questions.length === 0) return { ok: false, reason: "No AskUserQuestion questions found" };
+
+	const abort = new AbortController();
+	pending.questionReflectionAbort = abort;
 
 	await markQuestionReflectionStatus(
 		requestId,
@@ -1171,6 +1181,7 @@ export async function reflectPendingAskUserQuestion(
 			locale: pending.locale,
 			model: narrator?.model,
 			mode: "reflection",
+			signal: abort.signal,
 		});
 		if (!pendingPermissions.has(requestId)) {
 			await db
@@ -1178,6 +1189,9 @@ export async function reflectPendingAskUserQuestion(
 				.set({ permissionSuggestions: null })
 				.where(eq(narratorToolCalls.id, requestId));
 			return { ok: false, answers, reason: "Already resolved" };
+		}
+		if (pending.questionReflectionStoppedByUser) {
+			return { ok: false, answers, reason: "Question reflection was taken over by the user" };
 		}
 		await markQuestionReflectionStatus(
 			requestId,
@@ -1192,6 +1206,11 @@ export async function reflectPendingAskUserQuestion(
 		return { ok: resolved, answers, reason: resolved ? undefined : "Already resolved" };
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
+		// A user takeover aborts the generation on purpose; takeOverQuestionReflection
+		// already broadcast the "awaiting_user" status, so don't clobber it here.
+		if (pending.questionReflectionStoppedByUser) {
+			return { ok: false, reason: "Question reflection was taken over by the user" };
+		}
 		logger.warn("AskUserQuestion reflection failed", {
 			requestId,
 			narratorId: pending.narratorId,
@@ -1201,7 +1220,77 @@ export async function reflectPendingAskUserQuestion(
 			await markQuestionReflectionStatus(requestId, pending, "awaiting_user", reason);
 		}
 		return { ok: false, reason };
+	} finally {
+		if (pending.questionReflectionAbort === abort) {
+			pending.questionReflectionAbort = undefined;
+		}
 	}
+}
+
+/**
+ * Absolute deadline (epoch ms) at which the pending AskUserQuestion reflection
+ * will fire automatically, or null if none is scheduled. Used to reconstruct the
+ * frontend countdown after a reconnect / permissions refetch.
+ */
+export function getQuestionReflectionDeadline(requestId: string): number | null {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending || pending.toolName !== "AskUserQuestion") return null;
+	if (pending.questionReflectionStoppedByUser) return null;
+	return typeof pending.questionReflectionDeadline === "number"
+		? pending.questionReflectionDeadline
+		: null;
+}
+
+/**
+ * Silently cancel the automatic AskUserQuestion reflection timer without changing
+ * the permission state — the question stays pending for the user to answer. Used
+ * when the user starts interacting with the question form so the auto-answer does
+ * not fire mid-typing. Idempotent; returns whether a timer was actually disarmed.
+ */
+export function disarmQuestionReflection(requestId: string): boolean {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending || pending.toolName !== "AskUserQuestion") return false;
+	const hadTimer = pending.questionReflectionTimer !== undefined;
+	if (pending.questionReflectionTimer) {
+		clearTimeout(pending.questionReflectionTimer);
+		pending.questionReflectionTimer = undefined;
+	}
+	const hadDeadline = pending.questionReflectionDeadline !== undefined;
+	pending.questionReflectionDeadline = undefined;
+	if (hadTimer || hadDeadline) {
+		broadcastToNarrator(pending.broadcastTargetId, {
+			type: "question_reflection_disarmed",
+			narratorId: pending.broadcastTargetId,
+			requestId,
+			toolUseId: pending.toolUseId,
+		});
+	}
+	return hadTimer || hadDeadline;
+}
+
+/**
+ * User takes over an AskUserQuestion reflection: stop the timer, abort any
+ * in-flight answer generation, and leave the question pending for the user to
+ * answer (mirrors danger/plan/task takeover). Returns false if there is no such
+ * pending request.
+ */
+export async function takeOverQuestionReflection(
+	requestId: string,
+	reason?: string,
+): Promise<boolean> {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending || pending.toolName !== "AskUserQuestion") return false;
+	if (pending.signal.aborted) return false;
+	const message = reason?.trim() || "Question reflection stopped; awaiting your answer";
+	pending.questionReflectionStoppedByUser = true;
+	if (pending.questionReflectionTimer) {
+		clearTimeout(pending.questionReflectionTimer);
+		pending.questionReflectionTimer = undefined;
+	}
+	pending.questionReflectionDeadline = undefined;
+	pending.questionReflectionAbort?.abort(new Error(message));
+	await markQuestionReflectionStatus(requestId, pending, "awaiting_user", message);
+	return true;
 }
 
 function danger(
@@ -2957,10 +3046,27 @@ export async function handlePermission(
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));
 
+	// When automatic AskUserQuestion reflection is armed, compute the absolute
+	// deadline up front so the timer, the request broadcast, and later reconnects
+	// all agree on the same countdown target.
+	const questionReflectionDeadline =
+		toolName === "AskUserQuestion" && shouldScheduleQuestionReflection(effectiveMode)
+			? Date.now() + getQuestionReflectionTimeoutMs()
+			: undefined;
+
 	broadcastToNarrator(wsTarget, {
 		type: "permission_request",
 		narratorId: wsTarget,
-		request: { id: toolCallId, toolName, toolUseId, inputJson: effectiveInput, decisionReason },
+		request: {
+			id: toolCallId,
+			toolName,
+			toolUseId,
+			inputJson: effectiveInput,
+			decisionReason,
+			...(questionReflectionDeadline !== undefined
+				? { reflectionDeadline: questionReflectionDeadline }
+				: {}),
+		},
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
 	// A real permission request is waiting for the user — emit the semantic
@@ -3055,8 +3161,13 @@ export async function handlePermission(
 			attentionEmitted,
 		};
 		pendingPermissions.set(toolCallId, pendingEntry);
-		if (toolName === "AskUserQuestion") {
-			pendingEntry.questionReflectionTimer = scheduleQuestionReflection(toolCallId, effectiveMode);
+		if (toolName === "AskUserQuestion" && questionReflectionDeadline !== undefined) {
+			pendingEntry.questionReflectionDeadline = questionReflectionDeadline;
+			pendingEntry.questionReflectionTimer = scheduleQuestionReflection(
+				toolCallId,
+				effectiveMode,
+				questionReflectionDeadline,
+			);
 		}
 	});
 }

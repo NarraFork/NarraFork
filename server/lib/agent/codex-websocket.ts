@@ -90,6 +90,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
 	resetSessionBeforeRequest?: boolean;
 	turnMetadata?: string;
+	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
+	userAgent?: string;
 }
 
 export class CodexWebSocketFallbackError extends Error {
@@ -329,7 +331,7 @@ function buildHandshakeHeaders(
 ): Record<string, string> {
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${options.apiKey}`,
-		"User-Agent": getHttpUserAgent(),
+		"User-Agent": options.userAgent ?? getHttpUserAgent(),
 		originator: "narrafork",
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,

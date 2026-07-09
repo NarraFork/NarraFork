@@ -25,7 +25,7 @@ import {
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowUp,
 	IconDeviceDesktop,
@@ -91,6 +91,7 @@ export function DirectoryPicker({
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
 	const handleOpen = () => {
 		if (!browseSupported) return;
@@ -147,10 +148,23 @@ export function DirectoryPicker({
 				opened={opened}
 				onClose={close}
 				title={t("selectDirectory")}
-				size="lg"
-				styles={{ body: { padding: 0 } }}
+				size={isWide ? 880 : "md"}
+				styles={{
+					body: {
+						padding: 0,
+						maxHeight: "85vh",
+						display: "flex",
+						flexDirection: "column",
+						overflow: "hidden",
+					},
+				}}
 			>
-				<DirectoryBrowser initialPath={browsePath} onSelect={handleSelect} onCancel={close} />
+				<DirectoryBrowser
+					initialPath={browsePath}
+					onSelect={handleSelect}
+					onCancel={close}
+					isWide={isWide}
+				/>
 			</Modal>
 		</>
 	);
@@ -247,9 +261,15 @@ interface DirectoryBrowserProps {
 	initialPath?: string;
 	onSelect: (path: string) => void;
 	onCancel: () => void;
+	isWide?: boolean;
 }
 
-export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryBrowserProps) {
+export function DirectoryBrowser({
+	initialPath,
+	onSelect,
+	onCancel,
+	isWide = false,
+}: DirectoryBrowserProps) {
 	const { t } = useTranslation("common");
 	const [currentPath, setCurrentPath] = useState<string | undefined>(initialPath);
 	const [creatingFolder, setCreatingFolder] = useState(false);
@@ -442,7 +462,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 	);
 
 	return (
-		<Stack gap={0}>
+		<Stack gap={0} style={{ height: "calc(85vh - 60px)" }}>
 			{/* ── Toolbar ── */}
 			<Group gap={4} px="sm" py={6} wrap="nowrap">
 				<Tooltip label={t("homeDirectory")} openDelay={400}>
@@ -557,15 +577,15 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 				onDragEnd={handleFavDragEnd}
 				onDragCancel={handleFavDragCancel}
 			>
-				<Group gap={0} wrap="nowrap" align="stretch" style={{ minHeight: 350 }}>
+				<Group gap={0} wrap="nowrap" align="stretch" style={{ flex: 1, minHeight: 0 }}>
 					{/* Sidebar: shortcuts + favorites */}
 					<ScrollArea
 						style={{
-							width: 150,
+							width: isWide ? 220 : 150,
 							flexShrink: 0,
 							borderRight: "1px solid var(--mantine-color-default-border)",
 						}}
-						h={350}
+						h="100%"
 						type="auto"
 					>
 						{/* System shortcuts */}
@@ -643,7 +663,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 					</ScrollArea>
 
 					{/* Directory listing */}
-					<ScrollArea style={{ flex: 1 }} h={350} type="auto" offsetScrollbars>
+					<ScrollArea style={{ flex: 1 }} h={isWide ? "100%" : 350} type="auto" offsetScrollbars>
 						{!browseSupported && (
 							<Text c="dimmed" size="sm" ta="center" mt="xl" px="sm">
 								{browseUnavailableReason}
@@ -757,7 +777,7 @@ export function DirectoryBrowser({ initialPath, onSelect, onCancel }: DirectoryB
 								style={{
 									backgroundColor: "var(--mantine-color-body)",
 									boxShadow: "var(--mantine-shadow-md)",
-									width: 150,
+									width: isWide ? 220 : 150,
 								}}
 							>
 								<FavoriteNavContent

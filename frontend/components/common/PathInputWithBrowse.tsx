@@ -1,5 +1,5 @@
 import { ActionIcon, Group, Modal } from "@mantine/core";
-import { useDisclosure } from "@mantine/hooks";
+import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconFolderOpen } from "@tabler/icons-react";
 import { lazy, Suspense, useCallback } from "react";
 import { useTranslation } from "react-i18next";
@@ -22,6 +22,7 @@ interface PathInputWithBrowseProps {
 export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBrowseProps) {
 	const { t } = useTranslation("common");
 	const [opened, { open, close }] = useDisclosure(false);
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
 	const handleSelect = useCallback(
 		(path: string) => {
@@ -43,13 +44,21 @@ export function PathInputWithBrowse({ placeholder, onConfirm }: PathInputWithBro
 				opened={opened}
 				onClose={close}
 				title={t("selectDirectory")}
-				size="lg"
+				size={isWide ? 880 : "md"}
 				zIndex={Z.modal}
-				styles={{ body: { padding: 0 } }}
+				styles={{
+					body: {
+						padding: 0,
+						maxHeight: "85vh",
+						display: "flex",
+						flexDirection: "column",
+						overflow: "hidden",
+					},
+				}}
 			>
 				{opened && (
 					<Suspense fallback={null}>
-						<DirectoryBrowser onSelect={handleSelect} onCancel={close} />
+						<DirectoryBrowser onSelect={handleSelect} onCancel={close} isWide={isWide} />
 					</Suspense>
 				)}
 			</Modal>

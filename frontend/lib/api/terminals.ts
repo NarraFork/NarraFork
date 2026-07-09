@@ -16,6 +16,7 @@ export const terminalsApi = {
 		name?: string;
 		cols?: number;
 		rows?: number;
+		deviceId?: string;
 	}) => request<ApiEntity>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`),
 	getTerminalProcesses: (id: string) =>

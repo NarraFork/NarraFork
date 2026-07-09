@@ -1667,6 +1667,17 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
+	// Hide device-only tools entirely when the session has no online remote
+	// devices — the local-only case should carry zero extra device cognitive load.
+	{
+		const hasDevices = (config.availableDevices ?? []).some((d) => d.online);
+		if (!hasDevices) {
+			allTools = allTools.filter(
+				(tool) => tool.name !== "SwitchDevice" && tool.name !== "TransferFile",
+			);
+		}
+	}
+
 	// In plan mode, override descriptions for forbidden tools so the model knows not to call them.
 	// When relaxedPlan is enabled, skip this — tools remain fully available.
 	if (config.planMode && !config.relaxedPlan) {

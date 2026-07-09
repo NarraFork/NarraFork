@@ -142,6 +142,18 @@ export interface ImageBase64Result {
 }
 
 /**
+ * Encode already-read image bytes to base64 + detect the real format from the
+ * content magic bytes. Used both by {@link imageToBase64} (local files) and by
+ * the Read tool when it fetches image bytes from a remote execution device, so
+ * remote images are handled identically without a filesystem round trip.
+ */
+export function imageBytesToBase64(bytes: Uint8Array): ImageBase64Result {
+	const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+	const detectedMediaType = detectImageMime(buf);
+	return { base64: buf.toString("base64"), detectedMediaType };
+}
+
+/**
  * Read an image file and return its base64 encoding + detected real format.
  * The returned `detectedMediaType` reflects the actual file content (e.g. a
  * file named `.jpg` that is really PNG will return `image/png`). Callers
@@ -149,8 +161,8 @@ export interface ImageBase64Result {
  */
 export async function imageToBase64(filePath: string): Promise<ImageBase64Result> {
 	const buf = Buffer.from(await Bun.file(filePath).arrayBuffer());
-	const detectedMediaType = detectImageMime(buf);
-	if (detectedMediaType) {
+	const result = imageBytesToBase64(buf);
+	if (result.detectedMediaType) {
 		const ext = extname(filePath).toLowerCase();
 		const extMime: Record<string, string> = {
 			".png": "image/png",
@@ -159,15 +171,15 @@ export async function imageToBase64(filePath: string): Promise<ImageBase64Result
 			".gif": "image/gif",
 			".webp": "image/webp",
 		};
-		if (extMime[ext] && extMime[ext] !== detectedMediaType) {
+		if (extMime[ext] && extMime[ext] !== result.detectedMediaType) {
 			logger.debug("Image format mismatch: extension vs content", {
 				filePath,
 				extension: ext,
-				detected: detectedMediaType,
+				detected: result.detectedMediaType,
 			});
 		}
 	}
-	return { base64: buf.toString("base64"), detectedMediaType };
+	return result;
 }
 
 // === Text file uploads ===

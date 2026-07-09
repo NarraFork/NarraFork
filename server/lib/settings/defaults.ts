@@ -66,6 +66,7 @@ export const DEFAULTS: NarraForkSettings = {
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
+		queueDuringCompaction: false,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -135,6 +136,17 @@ export const DEFAULTS: NarraForkSettings = {
 	shares: {
 		defaultExpiryHours: 24,
 		maxFileSizeMb: 4096,
+	},
+	devices: {
+		globalDefaultDeviceId: null,
+		rpcTimeoutMs: 120_000,
+		maxRpcBytes: 10 * 1024 * 1024,
+		maxConcurrentRpcPerDevice: 16,
+		transferChunkBytes: 1024 * 1024,
+		transferConcurrency: 4,
+		maxConcurrentTransfersPerDevice: 2,
+		transferVerify: "crc32c",
+		transfersDir: null,
 	},
 };
 
@@ -260,6 +272,45 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"vnet.udp.port": {
 		desc: "UDP rendezvous 监听端口。0 表示自动分配。",
 		type: "number",
+	},
+
+	// ── devices（远端执行器）───────────────────────────────────────────
+	"devices.globalDefaultDeviceId": {
+		desc: "全局默认执行设备 id。为空/null 表示在本地服务器执行。叙述者可用 SwitchDevice 覆盖。",
+		type: "string",
+	},
+	"devices.rpcTimeoutMs": {
+		desc: "远端工具操作（文件/命令/git）单次 RPC 的超时时间（毫秒）。",
+		type: "number",
+	},
+	"devices.maxRpcBytes": {
+		desc: "单个 RPC 结果/流可承载的最大字节数，超出在执行器侧截断。",
+		type: "number",
+	},
+	"devices.maxConcurrentRpcPerDevice": {
+		desc: "每个设备允许的最大并发 RPC 数。",
+		type: "number",
+	},
+	"devices.transferChunkBytes": {
+		desc: "文件传输的分块大小（字节）。默认 1 MiB。",
+		type: "number",
+	},
+	"devices.transferConcurrency": {
+		desc: "单个传输内并行飞行的分块数。默认 4。",
+		type: "number",
+	},
+	"devices.maxConcurrentTransfersPerDevice": {
+		desc: "每个设备允许的最大并发传输数。默认 2。",
+		type: "number",
+	},
+	"devices.transferVerify": {
+		desc: '文件传输的整文件校验策略。"sha256" 仅在上传方向（服务器→设备）做端到端强校验；下载方向（设备→服务器）依赖传输层可靠性 + 精确字节数校验（crc32c 为逐块尽力校验，不触发重传）。',
+		type: "string",
+		valid: '"crc32c" | "sha256" | "none"',
+	},
+	"devices.transfersDir": {
+		desc: "下载文件的默认落盘根目录。为空则使用 ~/.narrafork/transfers。",
+		type: "string",
 	},
 
 	// ── agent ───────────────────────────────────────────────────────────
@@ -495,6 +546,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "最小裁剪比例。每次裁剪边界推进时，至少裁掉剩余可裁剪消息的该比例。值越大，单次裁剪幅度越大、裁剪次数越少，从而减少 prompt 缓存前缀失效、降低计费；代价是单次丢弃更多上下文。",
 		type: "number",
 		valid: "0-100, 默认 30",
+	},
+	"agent.queueDuringCompaction": {
+		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否等压缩完成后再发送。关闭时立即发送（默认行为）。",
+		type: "boolean",
+		valid: "true / false，默认 false",
 	},
 
 	// ── chapters ────────────────────────────────────────────────────────

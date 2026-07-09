@@ -12,6 +12,8 @@ interface ProxyOverrideFieldProps {
 	size?: "xs" | "sm";
 	/** Optional label override; defaults to the shared proxy-override label. */
 	label?: string;
+	/** Hide the description line (useful in dense aggregated lists). */
+	hideDescription?: boolean;
 	disabled?: boolean;
 }
 
@@ -25,6 +27,7 @@ export function ProxyOverrideField({
 	onChange,
 	size = "xs",
 	label,
+	hideDescription,
 	disabled,
 }: ProxyOverrideFieldProps) {
 	const { t } = useTranslation("settings");
@@ -42,7 +45,7 @@ export function ProxyOverrideField({
 			<Select
 				size={size}
 				label={label ?? t("proxyOverrideLabel")}
-				description={t("proxyOverrideDesc")}
+				description={hideDescription ? undefined : t("proxyOverrideDesc")}
 				disabled={disabled}
 				allowDeselect={false}
 				data={[

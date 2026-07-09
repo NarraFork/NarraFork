@@ -9,7 +9,7 @@ import type { AnthropicProviderConfig } from "../settings";
 import { getModelContextWindow, getSettingsRevision, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
-import { getHttpClaudeCliUserAgent, getHttpUserAgent } from "../user-agent";
+import { getHttpClaudeCliUserAgent, getHttpUserAgent, resolveHttpUserAgent } from "../user-agent";
 import { isConnectionClosedError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
@@ -681,6 +681,19 @@ export class AnthropicProvider implements ProviderAdapter {
 		return headers;
 	}
 
+	/**
+	 * Resolve the User-Agent for this provider. Defaults follow the previous
+	 * behaviour (Claude CLI UA for official API, narrafork UA otherwise) and can
+	 * be overridden per provider via userAgentMode/customUserAgent.
+	 */
+	private resolveUserAgent(isOfficial: boolean): string {
+		return resolveHttpUserAgent({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: isOfficial ? getHttpClaudeCliUserAgent() : getHttpUserAgent(),
+		});
+	}
+
 	/** Get the effective base URL, using cached resolution if available. */
 
 	private getBaseUrl(): string {
@@ -1083,7 +1096,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders.Authorization = `Bearer ${apiKey}`;
 			reqHeaders["anthropic-beta"] = ANTHROPIC_BETA_FLAGS;
 			reqHeaders["anthropic-dangerous-direct-browser-access"] = "true";
-			reqHeaders["user-agent"] = getHttpClaudeCliUserAgent();
+			reqHeaders["user-agent"] = this.resolveUserAgent(true);
 			reqHeaders["x-app"] = "cli";
 			reqHeaders["X-Claude-Code-Session-Id"] = this.sessionId;
 			reqHeaders["x-client-request-id"] = randomUUID();
@@ -1097,7 +1110,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			reqHeaders["X-Stainless-Timeout"] = "600";
 		} else {
 			reqHeaders["x-api-key"] = apiKey;
-			reqHeaders["user-agent"] = getHttpUserAgent();
+			reqHeaders["user-agent"] = this.resolveUserAgent(false);
 			// Anthropic-compatible relays (Claude Code proxies) accept the CC beta
 			// flags; declare effort/adaptive-thinking so output_config.effort is honored.
 			// Only send these when the model actually supports effort — generic
@@ -1399,10 +1412,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial) {
 			headers.Authorization = `Bearer ${apiKey}`;
 			headers["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			headers["user-agent"] = getHttpClaudeCliUserAgent();
+			headers["user-agent"] = this.resolveUserAgent(true);
 		} else {
 			headers["x-api-key"] = apiKey;
-			headers["user-agent"] = getHttpUserAgent();
+			headers["user-agent"] = this.resolveUserAgent(false);
 		}
 		this.applyExtraHeaders(headers);
 
@@ -1477,10 +1490,10 @@ export class AnthropicProvider implements ProviderAdapter {
 		if (isOfficial) {
 			genHeaders.Authorization = `Bearer ${apiKey}`;
 			genHeaders["anthropic-beta"] = ANTHROPIC_BASE_BETA;
-			genHeaders["user-agent"] = getHttpClaudeCliUserAgent();
+			genHeaders["user-agent"] = this.resolveUserAgent(true);
 		} else {
 			genHeaders["x-api-key"] = apiKey;
-			genHeaders["user-agent"] = getHttpUserAgent();
+			genHeaders["user-agent"] = this.resolveUserAgent(false);
 		}
 		this.applyExtraHeaders(genHeaders);
 

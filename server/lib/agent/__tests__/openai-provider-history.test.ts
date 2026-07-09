@@ -263,6 +263,40 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 		expect(parsed?.reasoningOutputIndex).toBe(0);
 	});
 
+	test("parseResponsesAPIEvent inserts a blank-line boundary between summary parts", () => {
+		const reasoningAccum = new Map();
+		parseResponsesAPIEvent(
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "reasoning", id: "rs_multi" },
+			},
+			new Map(),
+			reasoningAccum,
+		);
+
+		const firstReasoning = (delta: string, summaryIndex: number) =>
+			parseResponsesAPIEvent(
+				{
+					type: "response.reasoning_summary_text.delta",
+					output_index: 0,
+					summary_index: summaryIndex,
+					delta,
+				},
+				new Map(),
+				reasoningAccum,
+			).find((event) => event.reasoning)?.reasoning;
+
+		// Part 0: first delta, no leading boundary.
+		expect(firstReasoning("first part start", 0)).toBe("first part start");
+		// Same part, still no boundary.
+		expect(firstReasoning(" continues", 0)).toBe(" continues");
+		// Part 1: summary_index advances → blank-line boundary prepended.
+		expect(firstReasoning("second part", 1)).toBe("\n\nsecond part");
+		// Still part 1: no additional boundary.
+		expect(firstReasoning(" more", 1)).toBe(" more");
+	});
+
 	test("parseResponsesAPIEvent uses reasoning_text.done only when no delta was emitted", () => {
 		const reasoningAccum = new Map();
 		parseResponsesAPIEvent(

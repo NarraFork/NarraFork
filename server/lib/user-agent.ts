@@ -5,6 +5,9 @@ const ORIGINATOR = "narrafork";
 // Claude CLI version from official Claude Code (un project)
 // This version is used for Anthropic API authentication
 const CLAUDE_CLI_VERSION = "2.1.88";
+// Codex CLI version mimicked by the "codex" User-Agent mode.
+// Matches the codex_cli_rs originator/version format. Update manually as needed.
+const CODEX_CLI_VERSION = "0.143.0";
 
 /**
  * Get OS type string in Codex format.
@@ -67,8 +70,12 @@ function getArchitecture(): string {
 /**
  * Get terminal/runtime information.
  * Mimics Codex's user_agent() function from codex_terminal_detection.
+ *
+ * @param fallback - Value returned when no terminal can be detected. NarraFork's
+ *   own UA reports the Bun runtime; the Codex UA uses "unknown" to match the real
+ *   Codex CLI, which never leaks a runtime version here.
  */
-function getTerminalInfo(): string {
+function getTerminalInfo(fallback: string): string {
 	// Check common terminal environment variables
 	const term = process.env.TERM_PROGRAM;
 	if (term) {
@@ -86,8 +93,7 @@ function getTerminalInfo(): string {
 		return "jetbrains";
 	}
 
-	// Default to Bun runtime info
-	return `Bun/${Bun.version}`;
+	return fallback;
 }
 
 /**
@@ -100,9 +106,29 @@ export function getUserAgent(): string {
 	const osType = getOsType();
 	const osVersion = getOsVersion();
 	const arch = getArchitecture();
-	const terminalInfo = getTerminalInfo();
+	const terminalInfo = getTerminalInfo(`Bun/${Bun.version}`);
 
 	return `${ORIGINATOR}/${APP_VERSION} (${osType} ${osVersion}; ${arch}) ${terminalInfo}`;
+}
+
+/**
+ * Build User-Agent string in Codex CLI format:
+ * codex_cli_rs/{version} ({os_type} {os_version}; {arch}) {terminal_info}
+ *
+ * Mirrors the official Codex CLI `get_codex_user_agent()` output so requests
+ * can present themselves as the Codex client. When no terminal is detected the
+ * token falls back to "unknown", matching the real Codex CLI (it never reports a
+ * runtime version here).
+ *
+ * Example: codex_cli_rs/0.143.0 (Linux Ubuntu 22.04; x64) unknown
+ */
+export function getCodexUserAgent(): string {
+	const osType = getOsType();
+	const osVersion = getOsVersion();
+	const arch = getArchitecture();
+	const terminalInfo = getTerminalInfo("unknown");
+
+	return `codex_cli_rs/${CODEX_CLI_VERSION} (${osType} ${osVersion}; ${arch}) ${terminalInfo}`;
 }
 
 /**
@@ -138,4 +164,43 @@ export function getHttpUserAgent(): string {
  */
 export function getHttpClaudeCliUserAgent(): string {
 	return sanitizeUserAgent(getClaudeCliUserAgent());
+}
+
+/**
+ * Get sanitized Codex CLI User-Agent string.
+ */
+export function getHttpCodexUserAgent(): string {
+	return sanitizeUserAgent(getCodexUserAgent());
+}
+
+/** Per-provider User-Agent selection mode. */
+export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
+
+/**
+ * Resolve the effective HTTP User-Agent for a provider request.
+ *
+ * When `mode` is unset the caller's `fallback` is used, preserving the previous
+ * per-provider default (e.g. Claude CLI UA for official Anthropic, narrafork UA
+ * otherwise). "custom" falls back when the custom string is blank.
+ */
+export function resolveHttpUserAgent(options: {
+	mode?: UserAgentMode;
+	custom?: string;
+	fallback: string;
+}): string {
+	const { mode, custom, fallback } = options;
+	switch (mode) {
+		case "narrafork":
+			return getHttpUserAgent();
+		case "claude-code":
+			return getHttpClaudeCliUserAgent();
+		case "codex":
+			return getHttpCodexUserAgent();
+		case "custom": {
+			const trimmed = custom?.trim();
+			return trimmed ? sanitizeUserAgent(trimmed) : fallback;
+		}
+		default:
+			return fallback;
+	}
 }

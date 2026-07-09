@@ -220,9 +220,23 @@ export function useUpdateCheck(intervalMs = 60 * 60_000) {
 
 export function useUpdateDownload() {
 	const updateCapability = useUpdateCapability();
+	const queryClient = useQueryClient();
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [result, setResult] = useState<UpdateDownloadResult | null>(null);
 	const abortControllerRef = useRef<AbortController | null>(null);
+	const downloadRef = useRef<
+		| ((
+				info: {
+					version: string;
+					releaseDate: string;
+					path: string;
+					sha512: string;
+					files: Array<{ url: string; size: number; sha512: string }>;
+				},
+				options?: { retry?: boolean; autoRetried?: boolean },
+		  ) => Promise<void>)
+		| null
+	>(null);
 
 	const download = useCallback(
 		async (
@@ -233,7 +247,7 @@ export function useUpdateDownload() {
 				sha512: string;
 				files: Array<{ url: string; size: number; sha512: string }>;
 			},
-			options?: { retry?: boolean },
+			options?: { retry?: boolean; autoRetried?: boolean },
 		) => {
 			const failBeforeRequest = (error: string) => {
 				setProgress(createErrorProgress(error));
@@ -281,6 +295,26 @@ export function useUpdateDownload() {
 
 				if (!response.ok) {
 					const failure = await readFetchError(response, "Download failed");
+					// 409 means the requested version no longer matches the server's latest
+					// metadata (a new release was published between check and download). Re-check
+					// once to get the fresh releaseInfo, then retry the download with it.
+					if (response.status === 409 && !options?.autoRetried) {
+						try {
+							const rechecked = await queryClient.fetchQuery({
+								queryKey: ["update-check"],
+								queryFn: () => api.checkUpdate(),
+							});
+							if (rechecked.updateAvailable && rechecked.releaseInfo) {
+								await downloadRef.current?.(rechecked.releaseInfo, {
+									retry: options?.retry,
+									autoRetried: true,
+								});
+								return;
+							}
+						} catch {
+							// Fall through to surface the original 409 failure below.
+						}
+					}
 					const diagnostic = extractUpdateFailureDiagnostic(failure.data, failure.message);
 					setProgress(createErrorProgress(diagnostic.error, diagnostic));
 					setResult(createFailureResult(diagnostic.error, releaseInfo.version, diagnostic));
@@ -404,12 +438,17 @@ export function useUpdateDownload() {
 			}
 		},
 		[
+			queryClient,
 			updateCapability.download.maxBytes,
 			updateCapability.download.reason,
 			updateCapability.download.sse,
 			updateCapability.download.supported,
 		],
 	);
+
+	// Keep a ref to the latest `download` so the 409 auto-retry path can re-invoke
+	// it without adding `download` to its own dependency list.
+	downloadRef.current = download;
 
 	const cancel = useCallback(() => {
 		abortControllerRef.current?.abort();

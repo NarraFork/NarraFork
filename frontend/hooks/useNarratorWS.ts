@@ -135,6 +135,7 @@ interface NarratorWSCallbacks {
 		decision: "allow" | "deny" | "aborted";
 		reason?: string;
 	}) => void;
+	onQuestionReflectionDisarmed?: (data: { requestId: string; toolUseId: string }) => void;
 	onStatusChange?: (status: string, turnStartedAt?: string, substatus?: string[]) => void;
 	onSubstatusChange?: (substatus: string[]) => void;
 	onToolStarted?: (
@@ -561,6 +562,12 @@ export function useNarratorWS(
 							toolUseId: data.toolUseId as string,
 							decision: data.decision as "allow" | "deny" | "aborted",
 							reason: data.reason as string | undefined,
+						});
+						break;
+					case "question_reflection_disarmed":
+						callbacksRef.current.onQuestionReflectionDisarmed?.({
+							requestId: data.requestId as string,
+							toolUseId: data.toolUseId as string,
 						});
 						break;
 					case "status_change":

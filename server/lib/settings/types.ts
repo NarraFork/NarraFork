@@ -6,6 +6,7 @@
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
+import type { UserAgentMode } from "../user-agent";
 
 export interface ModelOption {
 	value: string;
@@ -54,6 +55,13 @@ export interface CustomApiProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/**
+	 * Which User-Agent to present on outbound requests. Absent = provider default
+	 * (Claude CLI UA for official Anthropic, narrafork UA otherwise).
+	 */
+	userAgentMode?: UserAgentMode;
+	/** Custom User-Agent string, used when userAgentMode === "custom". */
+	customUserAgent?: string;
 }
 
 export interface OpenAIProviderConfig {
@@ -98,6 +106,10 @@ export interface OpenAIProviderConfig {
 	proxy?: ProxyOverride;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
+	/** Which User-Agent to present on outbound requests. Absent = narrafork UA default. */
+	userAgentMode?: UserAgentMode;
+	/** Custom User-Agent string, used when userAgentMode === "custom". */
+	customUserAgent?: string;
 }
 
 export interface AnthropicProviderConfig {
@@ -137,6 +149,13 @@ export interface AnthropicProviderConfig {
 	officialApi?: boolean;
 	/** Internal: additional request headers injected by provider adapters such as NUG. */
 	extraHeaders?: Record<string, string>;
+	/**
+	 * Which User-Agent to present on outbound requests. Absent = provider default
+	 * (Claude CLI UA for official API, narrafork UA otherwise).
+	 */
+	userAgentMode?: UserAgentMode;
+	/** Custom User-Agent string, used when userAgentMode === "custom". */
+	customUserAgent?: string;
 }
 
 export interface NUGProviderConfig {
@@ -547,6 +566,12 @@ export interface NarraForkSettings {
 		/** Pruned message percentage at which automatic background compact is forced. */
 		autoCompactPruneThreshold?: number;
 		/**
+		 * When a narrator has an in-progress context compaction, whether a newly-sent
+		 * user message should wait for the compaction to finish before being sent.
+		 * Default false = send immediately (do not wait).
+		 */
+		queueDuringCompaction?: boolean;
+		/**
 		 * Minimum prune ratio (percentage, 0–100) applied per prune pass.
 		 * Each time pruning advances, it prunes at least this fraction of the
 		 * remaining prunable messages. Larger values prune in bigger steps,
@@ -681,6 +706,27 @@ export interface NarraForkSettings {
 		defaultExpiryHours: number;
 		/** Maximum file/folder size in MB allowed for sharing (default: 4096). */
 		maxFileSizeMb: number;
+	};
+	/** Remote executor devices — routing of file/command tools to remote machines. */
+	devices?: {
+		/** Global default execution device id. null/empty → local server. */
+		globalDefaultDeviceId?: string | null;
+		/** Per-RPC timeout in ms for remote tool operations (default: 120000). */
+		rpcTimeoutMs: number;
+		/** Max bytes a single RPC result/stream may carry (default: 10 MB). */
+		maxRpcBytes: number;
+		/** Max concurrent in-flight RPCs per device (default: 16). */
+		maxConcurrentRpcPerDevice: number;
+		/** File-transfer chunk size in bytes (default: 1 MiB). */
+		transferChunkBytes: number;
+		/** Parallel in-flight chunks within a single transfer (default: 4). */
+		transferConcurrency: number;
+		/** Max concurrent transfers per device (default: 2). */
+		maxConcurrentTransfersPerDevice: number;
+		/** Whole-file verification strategy for transfers (default: "crc32c"). */
+		transferVerify: "crc32c" | "sha256" | "none";
+		/** Default root directory for downloaded files. null → ~/.narrafork/transfers. */
+		transfersDir: string | null;
 	};
 }
 

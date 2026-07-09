@@ -981,6 +981,14 @@ export function getMinPruneRatio(): number {
 	return Math.max(0, Math.min(100, Math.floor(configured))) / 100;
 }
 
+/**
+ * Whether a newly-sent user message should wait for an in-progress context
+ * compaction to finish before being sent. Default false = send immediately.
+ */
+export function getQueueDuringCompaction(): boolean {
+	return s().agent.queueDuringCompaction ?? false;
+}
+
 export function getModelMaxCompletionTokens(model: string, _provider: string): number | null {
 	const bareModel = parseModelId(model).model;
 

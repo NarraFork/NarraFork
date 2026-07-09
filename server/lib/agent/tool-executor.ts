@@ -1,6 +1,7 @@
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
+import { resolveBackend } from "./execution/registry";
 import {
 	capturePipelineOutput,
 	clipText,
@@ -298,6 +299,11 @@ export async function executeTool(
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 		reflectionLoop: config.reflectionLoop?.context,
+		resolveBackend: (device?: string) =>
+			resolveBackend({ requested: device, sessionDefault: config.defaultDeviceId }),
+		availableDevices: config.availableDevices,
+		defaultDeviceId: config.defaultDeviceId,
+		setDefaultDevice: config.setDefaultDevice,
 	};
 
 	// Wire up emitLongRunning: notify UI when a process exceeds 60s
