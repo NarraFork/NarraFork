@@ -943,6 +943,14 @@ import { startChallengeCleanupTimer } from "./lib/webauthn";
 
 startChallengeCleanupTimer();
 
+// Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
+import {
+	startScheduledTaskScheduler,
+	stopScheduledTaskScheduler,
+} from "./services/scheduled-task-scheduler";
+
+startScheduledTaskScheduler();
+
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";
 
@@ -1065,6 +1073,7 @@ async function performGracefulShutdown(
 		markDatabaseCleanShutdownEarly();
 
 		getCodexManager().stopUsageRefreshScheduler();
+		stopScheduledTaskScheduler();
 		stopContainerProxy();
 		await shutdownStep("terminalService.shutdownAll", () => terminalService.shutdownAll());
 		await shutdownStep("killAllBashProcesses", () => killAllBashProcesses());

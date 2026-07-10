@@ -2090,3 +2090,66 @@ export const knowledgePackActivations = sqliteTable(
 		index("idx_kpackact_narrator_pack_status").on(table.narratorId, table.packId, table.status),
 	],
 );
+
+// === scheduled tasks ===
+// A scheduled task periodically starts a narrator with a preset prompt. The schedule is
+// always stored as a cron expression (the UI may generate it from friendly presets). At
+// each fire the scheduler either spawns a fresh standalone/chapter narrator or reuses an
+// existing one, then injects `prompt` to auto-start its agent loop (unattended).
+export const scheduledTasks = sqliteTable(
+	"scheduled_tasks",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull(),
+		enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+		// Cron expression (5 or 6 fields). Friendly UI presets are compiled to cron client-side.
+		cronExpr: text("cron_expr").notNull(),
+		// IANA timezone (e.g. "Asia/Shanghai"); null = server local time.
+		timezone: text("timezone"),
+		// The prompt injected into the narrator on each run.
+		prompt: text("prompt").notNull(),
+		// Optional system prompt for the spawned narrator.
+		systemPrompt: text("system_prompt"),
+		// Model id; null → follow default model.
+		model: text("model"),
+		// Permission mode for unattended execution; defaults to bypassPermissions.
+		permissionMode: text("permission_mode").notNull().default("bypassPermissions"),
+		locale: text("locale", { enum: ["en", "zh-CN"] })
+			.notNull()
+			.default("en"),
+		// Run environment: standalone (no chapter/git) or bound to a chapter's worktree.
+		runContext: text("run_context", { enum: ["standalone", "chapter"] })
+			.notNull()
+			.default("standalone"),
+		// standalone: working directory (null → home dir).
+		cwd: text("cwd"),
+		// chapter mode: target project + chapter.
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "set null" }),
+		// Whether to spawn a fresh narrator each run or reuse the same one.
+		narratorMode: text("narrator_mode", { enum: ["new", "reuse"] })
+			.notNull()
+			.default("new"),
+		// reuse mode: the narrator remembered across runs.
+		reuseNarratorId: text("reuse_narrator_id").references(
+			// biome-ignore lint/suspicious/noExplicitAny: forward reference to narrators
+			(): any => narrators.id,
+			{ onDelete: "set null" },
+		),
+		// User who created the task (used as sendMessage userId + ACL provenance).
+		createdBy: text("created_by").references(() => users.id, { onDelete: "set null" }),
+		// Scheduling state.
+		lastRunAt: text("last_run_at"),
+		nextRunAt: text("next_run_at"),
+		lastNarratorId: text("last_narrator_id"),
+		lastStatus: text("last_status", { enum: ["success", "failed", "skipped"] }),
+		lastError: text("last_error"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_scheduled_tasks_enabled").on(table.enabled),
+		index("idx_scheduled_tasks_next_run").on(table.enabled, table.nextRunAt),
+		index("idx_scheduled_tasks_project").on(table.projectId),
+	],
+);

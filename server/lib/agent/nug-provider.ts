@@ -260,6 +260,9 @@ export class NugProvider implements ProviderAdapter {
 					defaultModel: meta.routedModel,
 					apiMode: "codex",
 					codexWebSocket: false,
+					// Force Codex CLI header emulation on the NUG codex channel so it
+					// always presents the codex_cli_rs originator + installation id.
+					emulateCodexHeaders: true,
 					extraHeaders,
 				});
 			case "openai":

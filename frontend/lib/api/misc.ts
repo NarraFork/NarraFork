@@ -497,6 +497,35 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ reasoningEffort }),
 		}),
+	codexGetFingerprint: () =>
+		request<{
+			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
+			customUserAgent: string;
+			extraHeaders: Record<string, string>;
+			emulateCodexHeaders: boolean;
+			installationId: string;
+		}>("/codex/fingerprint"),
+	codexSetFingerprint: (data: {
+		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+		customUserAgent?: string;
+		extraHeaders?: Record<string, string>;
+		emulateCodexHeaders?: boolean;
+	}) =>
+		request<{
+			ok: boolean;
+			userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
+			customUserAgent: string;
+			extraHeaders: Record<string, string>;
+			emulateCodexHeaders: boolean;
+		}>("/codex/fingerprint", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	codexRegenerateInstallationId: () =>
+		request<{ ok: boolean; installationId: string }>(
+			"/codex/fingerprint/regenerate-installation-id",
+			{ method: "POST" },
+		),
 	codexSetUseWebSocket: (useWebSocket: boolean) =>
 		request<{ ok: boolean; useWebSocket: boolean }>("/codex/use-websocket", {
 			method: "POST",

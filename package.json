@@ -38,6 +38,7 @@
 		"broad-infinite-list": "^1.4.1",
 		"bun-pty": "^0.4.8",
 		"chardet": "^2.1.1",
+		"croner": "^10.0.1",
 		"diff": "^8.0.4",
 		"discord.js": "^14.26.3",
 		"dockview-react": "^7.0.2",

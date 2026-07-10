@@ -62,6 +62,14 @@ export interface CustomApiProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
+	/** Additional request headers injected on outbound requests. */
+	extraHeaders?: Record<string, string>;
+	/**
+	 * Emulate the real Codex CLI's stable request headers (originator,
+	 * x-codex-installation-id, session/thread ids). Implied for codex protocol;
+	 * can be opted into for other protocols.
+	 */
+	emulateCodexHeaders?: boolean;
 }
 
 export interface OpenAIProviderConfig {
@@ -110,6 +118,12 @@ export interface OpenAIProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
+	/**
+	 * Emulate the real Codex CLI's stable request headers (originator,
+	 * x-codex-installation-id, session/thread ids). Always implied when
+	 * apiMode === "codex"; can be opted into for other modes.
+	 */
+	emulateCodexHeaders?: boolean;
 }
 
 export interface AnthropicProviderConfig {
@@ -156,6 +170,12 @@ export interface AnthropicProviderConfig {
 	userAgentMode?: UserAgentMode;
 	/** Custom User-Agent string, used when userAgentMode === "custom". */
 	customUserAgent?: string;
+	/**
+	 * Emulate the real Codex CLI's stable request headers (originator,
+	 * x-codex-installation-id, session/thread ids). Disabled by default for
+	 * Anthropic providers.
+	 */
+	emulateCodexHeaders?: boolean;
 }
 
 export interface NUGProviderConfig {
@@ -372,6 +392,14 @@ export interface NarraForkSettings {
 		openBrowser: "off" | "browser" | "app";
 		/** Optional TLS configuration for HTTPS. */
 		tls?: TlsConfig;
+	};
+	/**
+	 * Machine-level client fingerprint state shared across providers.
+	 * `installationId` is a persisted UUID (generated lazily) sent as the
+	 * `x-codex-installation-id` header when Codex emulation is enabled.
+	 */
+	clientFingerprint?: {
+		installationId?: string;
 	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
@@ -650,6 +678,18 @@ export interface NarraForkSettings {
 		useWebSearch?: boolean;
 		/** Allow the native image_generation tool to be sent to Codex models. Enabled by default. */
 		useImageGeneration?: boolean;
+		/** Which User-Agent to present on Codex requests. Absent = codex CLI UA (emulation). */
+		userAgentMode?: UserAgentMode;
+		/** Custom User-Agent string, used when userAgentMode === "custom". */
+		customUserAgent?: string;
+		/** Additional request headers injected on Codex requests. */
+		extraHeaders?: Record<string, string>;
+		/**
+		 * Emulate the real Codex CLI's stable request headers (originator,
+		 * x-codex-installation-id, session/thread ids). Enabled by default for the
+		 * built-in Codex adapter.
+		 */
+		emulateCodexHeaders?: boolean;
 	};
 	/** Unified web search channel configuration. */
 	search?: SearchSettings;

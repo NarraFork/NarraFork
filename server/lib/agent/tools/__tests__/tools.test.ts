@@ -616,7 +616,7 @@ describe("Grep", () => {
 		const result = await grepTool.execute({ pattern: "zzz_nonexistent_zzz" }, makeCtx());
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("No matches found");
-		expect(result.metadata).toEqual({ matches: 0, truncated: false });
+		expect(result.metadata).toEqual({ matches: 0, truncated: false, usedFallback: false });
 	});
 
 	test("glob filter restricts scope", async () => {

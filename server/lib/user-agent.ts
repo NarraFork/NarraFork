@@ -7,7 +7,8 @@ const ORIGINATOR = "narrafork";
 const CLAUDE_CLI_VERSION = "2.1.88";
 // Codex CLI version mimicked by the "codex" User-Agent mode.
 // Matches the codex_cli_rs originator/version format. Update manually as needed.
-const CODEX_CLI_VERSION = "0.143.0";
+// Bumped to 0.144.0 to satisfy gpt-5.6 family minimal_client_version gating.
+const CODEX_CLI_VERSION = "0.144.0";
 
 /**
  * Get OS type string in Codex format.
@@ -120,7 +121,7 @@ export function getUserAgent(): string {
  * token falls back to "unknown", matching the real Codex CLI (it never reports a
  * runtime version here).
  *
- * Example: codex_cli_rs/0.143.0 (Linux Ubuntu 22.04; x64) unknown
+ * Example: codex_cli_rs/0.144.0 (Linux Ubuntu 22.04; x64) unknown
  */
 export function getCodexUserAgent(): string {
 	const osType = getOsType();
@@ -173,6 +174,35 @@ export function getHttpCodexUserAgent(): string {
 	return sanitizeUserAgent(getCodexUserAgent());
 }
 
+/** Originator token used by the real Codex CLI. */
+export const ORIGINATOR_CODEX = "codex_cli_rs";
+
+/**
+ * Build the stable Codex-emulation headers, mirroring the real Codex CLI's
+ * durable request headers while deliberately omitting tracking/semantic headers
+ * (x-codex-turn-metadata, workspaces, sandbox, x-codex-window-id, ...).
+ *
+ * Included:
+ * - originator: codex_cli_rs
+ * - x-codex-installation-id: <persisted UUID>
+ * - session-id / thread-id: weak per-conversation identifiers (only when a
+ *   conversation id is available). These are not turn-level tracking headers.
+ */
+export function buildCodexEmulationHeaders(opts: {
+	installationId: string;
+	conversationId?: string;
+}): Record<string, string> {
+	const headers: Record<string, string> = {
+		originator: ORIGINATOR_CODEX,
+		"x-codex-installation-id": opts.installationId,
+	};
+	if (opts.conversationId) {
+		headers["session-id"] = opts.conversationId;
+		headers["thread-id"] = opts.conversationId;
+	}
+	return headers;
+}
+
 /** Per-provider User-Agent selection mode. */
 export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";
 
@@ -203,4 +233,48 @@ export function resolveHttpUserAgent(options: {
 		default:
 			return fallback;
 	}
+}
+
+/**
+ * Resolve the effective client fingerprint (User-Agent + request headers) for a
+ * provider request.
+ *
+ * Header precedence (later wins):
+ *   1. Codex emulation headers (only when `emulateCodex` is true).
+ *   2. User-configured `extraHeaders` — always applied last so operators can
+ *      override or clear any emulated header.
+ *
+ * Codex semantic headers are only injected when `emulateCodex` is true, so
+ * non-codex providers never leak codex-specific identifiers unless explicitly
+ * opted in.
+ */
+export function resolveClientFingerprint(options: {
+	mode?: UserAgentMode;
+	custom?: string;
+	fallback: string;
+	extraHeaders?: Record<string, string>;
+	emulateCodex?: boolean;
+	installationId?: string;
+	conversationId?: string;
+}): { userAgent: string; headers: Record<string, string> } {
+	const userAgent = resolveHttpUserAgent({
+		mode: options.mode,
+		custom: options.custom,
+		fallback: options.fallback,
+	});
+
+	const headers: Record<string, string> = {};
+	if (options.emulateCodex && options.installationId) {
+		Object.assign(
+			headers,
+			buildCodexEmulationHeaders({
+				installationId: options.installationId,
+				conversationId: options.conversationId,
+			}),
+		);
+	}
+	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
+		if (value) headers[key] = value;
+	}
+	return { userAgent, headers };
 }

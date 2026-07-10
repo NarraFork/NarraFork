@@ -219,6 +219,8 @@ export interface GrepRpcResult {
 	truncatedByBytes: boolean;
 	timedOut: boolean;
 	unavailable?: boolean;
+	/** ripgrep was missing so the executor fell back to the system `grep` (optional). */
+	usedFallback?: boolean;
 }
 
 export interface ExecStartParams {

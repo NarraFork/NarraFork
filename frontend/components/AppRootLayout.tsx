@@ -23,6 +23,7 @@ import {
 	IconAlertTriangle,
 	IconBook2,
 	IconClearAll,
+	IconClock,
 	IconDashboard,
 	IconDatabase,
 	IconFolders,
@@ -726,6 +727,16 @@ function AuthenticatedLayout() {
 							to="/routines"
 							label={navCollapsed ? undefined : t("routines")}
 							leftSection={<IconWand size={16} />}
+							onClick={closeNavForLink}
+						/>
+					</Tooltip>
+					<Tooltip label={t("scheduledTasks")} position="right" disabled={!navCollapsed}>
+						<NavLink
+							component={Link}
+							to="/scheduled-tasks"
+							label={navCollapsed ? undefined : t("scheduledTasks")}
+							active={pathname.startsWith("/scheduled-tasks")}
+							leftSection={<IconClock size={16} />}
 							onClick={closeNavForLink}
 						/>
 					</Tooltip>

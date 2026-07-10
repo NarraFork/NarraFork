@@ -1,6 +1,6 @@
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
-import { isRgAvailable, RG_INSTALL_HINT } from "../../ripgrep";
+import { isRgAvailable, RG_FALLBACK_NOTE, RG_INSTALL_HINT } from "../../ripgrep";
 import { settings } from "../../settings";
 import { vfsGrep } from "../../vfs-grep";
 import { withDeviceParam } from "../execution/device-schema";
@@ -281,12 +281,19 @@ export const grepTool: ToolDefinition = {
 				return { output: RG_INSTALL_HINT, isError: true };
 			}
 
+			// When ripgrep was missing, the backend fell back to the system `grep`.
+			// Surface a one-time notice so the model accounts for the capability gap,
+			// and use the right tool name in error messages.
+			const usedFallback = grepResult.usedFallback === true;
+			const toolLabel = usedFallback ? "grep" : "ripgrep";
+			const notePrefix = usedFallback ? `${RG_FALLBACK_NOTE}\n\n` : "";
+
 			const { stderr, exitCode } = grepResult;
 			const outputTruncatedByBytes = grepResult.truncatedByBytes;
 
 			if (grepResult.timedOut) {
 				return {
-					output: `ripgrep timed out after ${GREP_TIMEOUT_MS / 1000}s and was terminated. Narrow your search (add a path, glob, or type filter).`,
+					output: `${notePrefix}${toolLabel} timed out after ${GREP_TIMEOUT_MS / 1000}s and was terminated. Narrow your search (add a path, glob, or type filter).`,
 					isError: true,
 				};
 			}
@@ -318,25 +325,25 @@ export const grepTool: ToolDefinition = {
 			// Exit codes: 0 = matches found, 1 = no matches, 2 = errors (but may still have matches)
 			if (exitCode === 2 && !stdout.trim()) {
 				if (stderr.trim()) {
-					return { output: `ripgrep error: ${stderr.trim()}`, isError: true };
+					return { output: `${notePrefix}${toolLabel} error: ${stderr.trim()}`, isError: true };
 				}
 				return {
-					output: "No matches found",
+					output: `${notePrefix}No matches found`,
 					title: pattern,
-					metadata: { matches: 0, truncated: false },
+					metadata: { matches: 0, truncated: false, usedFallback },
 				};
 			}
 
 			if (exitCode === 1) {
 				return {
-					output: "No matches found",
+					output: `${notePrefix}No matches found`,
 					title: pattern,
-					metadata: { matches: 0, truncated: false },
+					metadata: { matches: 0, truncated: false, usedFallback },
 				};
 			}
 
 			if (exitCode !== 0 && exitCode !== 2) {
-				return { output: `ripgrep failed: ${stderr}`, isError: true };
+				return { output: `${notePrefix}${toolLabel} failed: ${stderr}`, isError: true };
 			}
 
 			const hasErrors = exitCode === 2;
@@ -362,9 +369,9 @@ export const grepTool: ToolDefinition = {
 
 			if (lines.length === 0 || (lines.length === 1 && !lines[0])) {
 				return {
-					output: "No matches found",
+					output: `${notePrefix}No matches found`,
 					title: pattern,
-					metadata: { matches: 0, truncated: false },
+					metadata: { matches: 0, truncated: false, usedFallback },
 				};
 			}
 
@@ -385,11 +392,12 @@ export const grepTool: ToolDefinition = {
 			}
 
 			return {
-				output: output + suffix.join(""),
+				output: notePrefix + output + suffix.join(""),
 				title: pattern,
 				metadata: {
 					matches: rawLines.length,
 					truncated: truncated || outputTruncatedByBytes,
+					usedFallback,
 				},
 			};
 		} catch (err) {

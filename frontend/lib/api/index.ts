@@ -8,6 +8,7 @@ import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
 import { narratorsApi } from "./narrators";
 import { projectsApi } from "./projects";
+import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { terminalsApi } from "./terminals";
@@ -29,6 +30,7 @@ export const api = {
 	...knowledgeApi,
 	...specApi,
 	...devicesApi,
+	...scheduledTasksApi,
 };
 
 export {
@@ -92,6 +94,14 @@ export type {
 	KnowledgeUserAcl,
 	KnowledgeVerdict,
 } from "./knowledge-types";
+export type {
+	ScheduledTask,
+	ScheduledTaskInput,
+	ScheduledTaskLastStatus,
+	ScheduledTaskLocale,
+	ScheduledTaskNarratorMode,
+	ScheduledTaskRunContext,
+} from "./scheduled-tasks";
 export {
 	scanStorageStream,
 } from "./streams";

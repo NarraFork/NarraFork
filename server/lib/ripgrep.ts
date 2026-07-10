@@ -13,6 +13,15 @@ export const RG_INSTALL_HINT = IS_WINDOWS
 	: "ripgrep (rg) is not installed. Install it with your package manager, e.g.:\n\n  # macOS\n  brew install ripgrep\n\n  # Ubuntu/Debian\n  sudo apt install ripgrep\n\nThen retry the Grep tool.";
 
 /**
+ * Notice prepended to Grep results when ripgrep was unavailable and the search
+ * fell back to the system `grep`. Explains the capability gap so the model does
+ * not over-trust the result (grep uses POSIX ERE, has no .gitignore awareness,
+ * and ignores rg-only options like multiline / --type).
+ */
+export const RG_FALLBACK_NOTE =
+	"Note: ripgrep (rg) is not installed — fell back to the system `grep`. Behavior differs: pattern is treated as POSIX extended regex (grep -E), so rg-only escapes like \\d and \\b may not work; the multiline and type filters are ignored; and .gitignore/hidden-file rules are not applied. Install ripgrep for full fidelity.";
+
+/**
  * Scan the WinGet packages directory for any ripgrep package folder.
  * The folder name contains a version-dependent hash (e.g.
  * `BurntSushi.ripgrep.MSVC_Microsoft.Winget.Source_8wekyb3d8bbwe`)
@@ -183,7 +192,7 @@ export function getRgVersionSync(path = findRgSync()): string | undefined {
 if (!resolvedRgPath) {
 	logger.warn(
 		IS_WINDOWS
-			? "ripgrep (rg) not found — install with: winget install BurntSushi.ripgrep.MSVC"
-			: "ripgrep (rg) not found — install via package manager (e.g. brew install ripgrep, apt install ripgrep).",
+			? "ripgrep (rg) not found — the Grep tool will fall back to the system grep (degraded capability). Install rg for full fidelity: winget install BurntSushi.ripgrep.MSVC"
+			: "ripgrep (rg) not found — the Grep tool will fall back to the system grep (degraded capability). Install rg for full fidelity (e.g. brew install ripgrep, apt install ripgrep).",
 	);
 }

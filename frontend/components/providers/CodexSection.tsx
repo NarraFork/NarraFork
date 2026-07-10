@@ -62,6 +62,7 @@ import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import { CodexQuotaTrendChart as SharedCodexQuotaTrendChart } from "./CodexQuotaTrendChart";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
@@ -398,6 +399,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const canSetUseWebSocket = isCodexRouteSupported("useWebSocket");
 	const canSetUseWebSearch = isCodexRouteSupported("useWebSearch");
 	const canSetUseImageGeneration = isCodexRouteSupported("useImageGeneration");
+	const canSetFingerprint = isCodexRouteSupported("fingerprint");
 	const canSetTierOrder = isCodexRouteSupported("tierOrder");
 	const canQueryCredentialUsage = isCodexRouteSupported("credentialUsage");
 	const canEnableCredential = isCodexRouteSupported("credentialEnable");
@@ -441,6 +443,18 @@ export const CodexSection = React.memo(function CodexSection({
 	const [useImageGenerationInitialized, setUseImageGenerationInitialized] = useState(false);
 	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
 	const [tierOrderInitialized, setTierOrderInitialized] = useState(false);
+	const [fingerprint, setFingerprint] = useState<{
+		userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
+		customUserAgent: string;
+		extraHeaders: Record<string, string>;
+		emulateCodexHeaders: boolean;
+	}>({
+		userAgentMode: "codex",
+		customUserAgent: "",
+		extraHeaders: {},
+		emulateCodexHeaders: true,
+	});
+	const [fingerprintInitialized, setFingerprintInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
@@ -485,6 +499,24 @@ export const CodexSection = React.memo(function CodexSection({
 		},
 		gcTime: CODEX_STATUS_GC_TIME_MS,
 	});
+	const { data: fingerprintData } = useQuery({
+		queryKey: ["codex", "fingerprint"],
+		queryFn: api.codexGetFingerprint,
+		enabled: canReadCodexStatus,
+	});
+
+	// Seed local fingerprint state from server data once loaded.
+	useEffect(() => {
+		if (fingerprintData && !fingerprintInitialized) {
+			setFingerprint({
+				userAgentMode: fingerprintData.userAgentMode,
+				customUserAgent: fingerprintData.customUserAgent,
+				extraHeaders: fingerprintData.extraHeaders,
+				emulateCodexHeaders: fingerprintData.emulateCodexHeaders,
+			});
+			setFingerprintInitialized(true);
+		}
+	}, [fingerprintData, fingerprintInitialized]);
 
 	const codexModelIds: string[] = settingsData?.codexModels ?? [];
 	const builtinContextWindows: Record<string, number> =
@@ -583,6 +615,25 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			setEditingId(null);
+			notifications.show({ message: t("codexUpdateSuccess"), color: "green" });
+		},
+	});
+	const fingerprintMut = useMutation({
+		mutationFn: (data: {
+			userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+			customUserAgent?: string;
+			extraHeaders?: Record<string, string>;
+			emulateCodexHeaders?: boolean;
+		}) => api.codexSetFingerprint(data),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "fingerprint"] });
+			notifications.show({ message: t("codexUpdateSuccess"), color: "green" });
+		},
+	});
+	const regenerateInstallationIdMut = useMutation({
+		mutationFn: () => api.codexRegenerateInstallationId(),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "fingerprint"] });
 			notifications.show({ message: t("codexUpdateSuccess"), color: "green" });
 		},
 	});
@@ -1124,6 +1175,40 @@ export const CodexSection = React.memo(function CodexSection({
 						loading={useImageGenerationMut.isPending}
 						disabled={!canSetUseImageGeneration}
 						title={!canSetUseImageGeneration ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+			</Stack>
+
+			{/* Client fingerprint */}
+			<Stack gap="xs">
+				<Group gap="xs">
+					<Text size="sm" fw={500}>
+						{t("fingerprintTitle")}
+					</Text>
+				</Group>
+				<Text size="xs" c="dimmed">
+					{t("fingerprintDesc")}
+				</Text>
+				<ClientFingerprintFields
+					value={fingerprint}
+					showEmulateToggle
+					emulateCodexDefault
+					showInstallationId
+					installationId={fingerprintData?.installationId}
+					disabled={!canSetFingerprint}
+					regenerating={regenerateInstallationIdMut.isPending}
+					onRegenerateInstallationId={() => regenerateInstallationIdMut.mutate()}
+					onChange={(next) => setFingerprint((prev) => ({ ...prev, ...next }))}
+				/>
+				<Group justify="flex-end">
+					<Button
+						size="xs"
+						onClick={() => canSetFingerprint && fingerprintMut.mutate(fingerprint)}
+						loading={fingerprintMut.isPending}
+						disabled={!canSetFingerprint}
+						title={!canSetFingerprint ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexSave")}
 					</Button>

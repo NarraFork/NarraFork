@@ -29,6 +29,7 @@ export const namespaces = [
 	"terminal",
 	"routines",
 	"knowledge",
+	"scheduledTasks",
 ] as const;
 export type Namespace = (typeof namespaces)[number];
 
@@ -91,6 +92,10 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	}
 	if (path === "/routines" || path.startsWith("/routines/")) {
 		return ["common", "nav", "routines", "settings"];
+	}
+
+	if (path === "/scheduled-tasks" || path.startsWith("/scheduled-tasks/")) {
+		return ["common", "nav", "scheduledTasks"];
 	}
 	if (path === "/learn") return ["common", "nav", "learning"];
 	if (path === "/knowledge" || path.startsWith("/knowledge/")) {

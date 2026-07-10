@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -8,7 +9,7 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
-import { getHttpUserAgent, resolveHttpUserAgent } from "../user-agent";
+import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -502,18 +503,6 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * Resolve the User-Agent for this provider. Defaults to the narrafork UA and
-	 * can be overridden per provider via userAgentMode/customUserAgent.
-	 */
-	private resolveUserAgent(): string {
-		return resolveHttpUserAgent({
-			mode: this.config.userAgentMode,
-			custom: this.config.customUserAgent,
-			fallback: getHttpUserAgent(),
-		});
-	}
-
-	/**
 	 * Proxy-aware fetch. Precedence:
 	 *   1. `this.proxy` — an already-resolved fixed proxy string passed by the
 	 *      constructor (only Codex does this; reused for HTTP + WebSocket).
@@ -784,7 +773,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 		}
 
-		const requestHeaders = this.buildHeaders(apiKey);
+		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
 		params.requestDump?.setRequest({
 			transport: "http",
 			url: endpoint,
@@ -1178,24 +1167,56 @@ export class OpenAIProvider implements ProviderAdapter {
 		return { text, usage };
 	}
 
+	/**
+	 * Whether Codex CLI header emulation applies to this provider. The
+	 * `emulateCodexHeaders` flag is tri-state: an explicit boolean always wins,
+	 * so codex-mode providers can opt out; when unset it defaults on for the
+	 * codex apiMode and off otherwise.
+	 */
+	private get emulateCodex(): boolean {
+		if (typeof this.config.emulateCodexHeaders === "boolean") {
+			return this.config.emulateCodexHeaders;
+		}
+		return this.apiMode === "codex";
+	}
+
+	/**
+	 * Resolve the client fingerprint (User-Agent + emulated/extra headers) for
+	 * this provider. Codex semantic headers are only injected when emulation is
+	 * enabled, so non-codex providers stay clean by default.
+	 */
+	private resolveFingerprint(conversationId?: string): {
+		userAgent: string;
+		headers: Record<string, string>;
+	} {
+		return resolveClientFingerprint({
+			mode: this.config.userAgentMode,
+			custom: this.config.customUserAgent,
+			fallback: getHttpUserAgent(),
+			extraHeaders: this.config.extraHeaders,
+			emulateCodex: this.emulateCodex,
+			installationId: this.emulateCodex ? getInstallationId() : undefined,
+			conversationId,
+		});
+	}
+
 	/** Build common request headers, with Codex-specific extras. */
-	private buildHeaders(apiKey: string): Record<string, string> {
+	private buildHeaders(apiKey: string, conversationId?: string): Record<string, string> {
+		const fingerprint = this.resolveFingerprint(conversationId);
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
-			"User-Agent": this.resolveUserAgent(),
+			"User-Agent": fingerprint.userAgent,
 		};
 		if (this.apiMode === "codex") {
-			headers.originator = "narrafork";
 			const accountId = this.config.codexAccountId;
 			// Only send ChatGPT-Account-Id to official ChatGPT domains
 			if (accountId && this.isOfficialChatGPTDomain()) {
 				headers["ChatGPT-Account-Id"] = accountId;
 			}
 		}
-		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
-			if (value) headers[key] = value;
-		}
+		// Emulated codex headers + user-configured extra headers (user wins).
+		Object.assign(headers, fingerprint.headers);
 		return headers;
 	}
 
@@ -1226,12 +1247,22 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		const request = this.buildCodexWebSocketRequest(params);
+		// The sticky session key is the session-level identifier for this WS connection;
+		// conversationId is the per-conversation (thread) identifier. Mirror the real Codex
+		// CLI, which sends distinct hyphenated session-id / thread-id headers.
+		const sessionKey = params.stickySessionKey ?? params.conversationId;
+		const fingerprint = this.resolveFingerprint(params.conversationId);
+		if (this.emulateCodex && sessionKey && fingerprint.headers["session-id"]) {
+			// resolveFingerprint seeds both ids from conversationId; realign session-id to the
+			// session-level key so it isn't identical to thread-id (which stays conversationId).
+			fingerprint.headers["session-id"] = sessionKey;
+		}
 		params.requestDump?.setRequest({
 			transport: "websocket",
 			url: `${baseUrl}/responses`,
 			headers: {
 				Authorization: "Bearer [REDACTED]",
-				originator: "narrafork",
+				originator: fingerprint.headers.originator ?? "narrafork",
 				OpenAI_Beta: "responses_websockets=2026-02-06",
 			},
 			body: { type: "response.create", ...request },
@@ -1244,14 +1275,15 @@ export class OpenAIProvider implements ProviderAdapter {
 				apiKey,
 				accountId: this.config.codexAccountId,
 				proxy: this.proxy,
-				sessionKey: params.stickySessionKey ?? params.conversationId,
+				sessionKey,
 				narratorId: params.stickySessionKey,
 				credentialId: this.config.id,
 				model: params.model,
 				request,
 				signal: params.signal,
 				resetSessionBeforeRequest: params.resetUpstreamSession,
-				userAgent: this.resolveUserAgent(),
+				userAgent: fingerprint.userAgent,
+				extraHeaders: fingerprint.headers,
 			})) {
 				yield event;
 			}

@@ -106,6 +106,14 @@ export const codexTierOrderSchema = z.object({
 	tierOrder: z.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"])).max(6),
 });
 
+/** Codex client fingerprint config (User-Agent mode + extra headers + emulation). */
+export const codexFingerprintSchema = z.object({
+	userAgentMode: z.enum(["narrafork", "claude-code", "codex", "custom"]).optional(),
+	customUserAgent: z.string().max(500).optional(),
+	extraHeaders: z.record(z.string(), z.string().max(2048)).optional(),
+	emulateCodexHeaders: z.boolean().optional(),
+});
+
 export const sendMessageSchema = z.object({
 	message: z.string().min(1),
 	priority: z.boolean().optional(),

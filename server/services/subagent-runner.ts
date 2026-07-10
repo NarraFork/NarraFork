@@ -9,13 +9,7 @@ import {
 	resolveEffectiveSubagentModelPolicy,
 	resolveSubagentModelFromPolicy,
 } from "../lib/narrator-custom-traits";
-import {
-	getSubagentType,
-	hasTrait,
-	isSubagentVariant,
-	parseSubstatus,
-	parseTraits,
-} from "../lib/narrator-utils";
+import { getSubagentType, hasTrait, isSubagentVariant, parseTraits } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
 import {
 	expandAllowedPoolForDisplay,
@@ -1176,13 +1170,13 @@ export async function continueSubagent(input: ContinueSubagentInput): Promise<st
 	if (!prompt) {
 		throw new ValidationError("prompt is required to continue an idle subagent");
 	}
-	const origSubstatus = parseSubstatus(original.substatus);
-	if (
-		!(
-			original.status === "idle" &&
-			(origSubstatus.includes("unread") || origSubstatus.includes("error"))
-		)
-	) {
+	// Any idle subagent is "settled and ready to resume" — regardless of whether
+	// its result was already read (the transient unread/error/interrupted tags are
+	// not preconditions for continuing). archived/working/waiting and taken-over
+	// subagents are handled upstream (agent-communication) before reaching here;
+	// reject them defensively for any other direct caller. The stale substatus
+	// tags are cleared by updateStatus("working") below.
+	if (original.status !== "idle") {
 		throw new ValidationError(`Cannot continue subagent in status "${original.status}"`);
 	}
 

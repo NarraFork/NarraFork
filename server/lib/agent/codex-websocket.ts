@@ -19,7 +19,6 @@ import type { ParsedStreamEvent } from "./provider";
 const RESPONSES_WS_BETA_HEADER = "responses_websockets=2026-02-06";
 const TURN_STATE_HEADER = "x-codex-turn-state";
 const TURN_METADATA_HEADER = "x-codex-turn-metadata";
-const SESSION_ID_HEADER = "session_id";
 const CLIENT_REQUEST_ID_HEADER = "x-client-request-id";
 const OPENAI_BETA_HEADER = "OpenAI-Beta";
 const CONNECTION_IDLE_TIMEOUT_MS = 60_000;
@@ -92,6 +91,12 @@ export interface StreamCodexResponsesWebSocketOptions {
 	turnMetadata?: string;
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
+	/**
+	 * Extra handshake headers (client fingerprint: originator,
+	 * x-codex-installation-id, session/thread ids, user-configured headers).
+	 * Applied last so they can override the built-in defaults.
+	 */
+	extraHeaders?: Record<string, string>;
 }
 
 export class CodexWebSocketFallbackError extends Error {
@@ -335,7 +340,8 @@ function buildHandshakeHeaders(
 		originator: "narrafork",
 		Origin: isOfficialChatGPTDomain(options.baseUrl) ? "https://chatgpt.com" : options.baseUrl,
 		[OPENAI_BETA_HEADER]: RESPONSES_WS_BETA_HEADER,
-		[SESSION_ID_HEADER]: options.sessionKey,
+		// The real Codex CLI keys x-client-request-id off the thread id. We only have the
+		// sticky session key here, which is the stablest per-conversation identifier available.
 		[CLIENT_REQUEST_ID_HEADER]: options.sessionKey,
 	};
 	if (options.accountId && isOfficialChatGPTDomain(options.baseUrl)) {
@@ -346,6 +352,13 @@ function buildHandshakeHeaders(
 	}
 	if (options.turnMetadata) {
 		headers[TURN_METADATA_HEADER] = options.turnMetadata;
+	}
+	// Client fingerprint (originator, x-codex-installation-id, session-id/thread-id,
+	// user-configured headers) applied last so it overrides built-in defaults such as
+	// originator. The session-id/thread-id pair (matching the real Codex CLI's hyphenated
+	// header names) is supplied here rather than hardcoded above.
+	for (const [key, value] of Object.entries(options.extraHeaders ?? {})) {
+		if (value) headers[key] = value;
 	}
 	return headers;
 }

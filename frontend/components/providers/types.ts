@@ -29,6 +29,8 @@ export interface CustomApiProviderState {
 	codexImageGeneration?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 
@@ -48,6 +50,8 @@ export interface OpenAIProviderState {
 	codexImageGeneration?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	proxy?: ProxyOverride;
 	disabled?: boolean;
 }
@@ -65,6 +69,8 @@ export interface AnthropicProviderState {
 	officialApi?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
 	disabled?: boolean;
 }
 

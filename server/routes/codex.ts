@@ -7,11 +7,13 @@ import {
 } from "../lib/codex-manager";
 import { codexUsageQueue } from "../lib/codex-usage-queue";
 import { ValidationError } from "../lib/errors";
+import { getInstallationId, regenerateInstallationId } from "../lib/installation-id";
 import { logger } from "../lib/logger";
 import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "../lib/search/settings";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
 	codexDefaultReasoningEffortSchema,
+	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,
 	codexUseWebSearchSchema,
@@ -491,6 +493,65 @@ codexRoutes.post("/default-reasoning-effort", async (c) => {
 	saveSettings(settings);
 
 	return c.json({ ok: true, reasoningEffort: settings.codex.defaultReasoningEffort ?? null });
+});
+
+/**
+ * GET /api/codex/fingerprint
+ * Get the Codex client fingerprint config (User-Agent mode, extra headers,
+ * emulation flag) plus the current persisted installation id.
+ */
+codexRoutes.get("/fingerprint", (c) => {
+	return c.json({
+		userAgentMode: settings.codex?.userAgentMode ?? "codex",
+		customUserAgent: settings.codex?.customUserAgent ?? "",
+		extraHeaders: settings.codex?.extraHeaders ?? {},
+		emulateCodexHeaders: settings.codex?.emulateCodexHeaders ?? true,
+		installationId: getInstallationId(),
+	});
+});
+
+/**
+ * POST /api/codex/fingerprint
+ * Update the Codex client fingerprint config.
+ */
+codexRoutes.post("/fingerprint", async (c) => {
+	const body = await c.req.json().catch(() => ({}));
+	const parsed = codexFingerprintSchema.safeParse(body);
+	if (!parsed.success) {
+		throw new ValidationError(parsed.error.message);
+	}
+
+	settings.codex = settings.codex || {};
+	if (parsed.data.userAgentMode !== undefined) {
+		settings.codex.userAgentMode = parsed.data.userAgentMode;
+	}
+	if (parsed.data.customUserAgent !== undefined) {
+		settings.codex.customUserAgent = parsed.data.customUserAgent || undefined;
+	}
+	if (parsed.data.extraHeaders !== undefined) {
+		settings.codex.extraHeaders = parsed.data.extraHeaders;
+	}
+	if (parsed.data.emulateCodexHeaders !== undefined) {
+		settings.codex.emulateCodexHeaders = parsed.data.emulateCodexHeaders;
+	}
+	saveSettings(settings);
+
+	return c.json({
+		ok: true,
+		userAgentMode: settings.codex.userAgentMode ?? "codex",
+		customUserAgent: settings.codex.customUserAgent ?? "",
+		extraHeaders: settings.codex.extraHeaders ?? {},
+		emulateCodexHeaders: settings.codex.emulateCodexHeaders ?? true,
+	});
+});
+
+/**
+ * POST /api/codex/fingerprint/regenerate-installation-id
+ * Rotate the persisted installation id.
+ */
+codexRoutes.post("/fingerprint/regenerate-installation-id", (c) => {
+	const installationId = regenerateInstallationId();
+	return c.json({ ok: true, installationId });
 });
 
 /**

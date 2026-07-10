@@ -27,15 +27,11 @@ import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { extractPrimaryDomainLabel } from "../../lib/url";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import { ClientFingerprintFields } from "./ClientFingerprintFields";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
-import type {
-	CustomApiProtocol,
-	CustomApiProviderState,
-	OpenAIProviderState,
-	UserAgentMode,
-} from "./types";
+import type { CustomApiProtocol, CustomApiProviderState, OpenAIProviderState } from "./types";
 
 type ProvidersUpdater =
 	| CustomApiProviderState[]
@@ -416,30 +412,25 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					onChange={(next) => updateProvider("proxy", next)}
 				/>
 
-				<Select
-					label={t("customApiUserAgent")}
-					description={t("customApiUserAgentDesc")}
-					size="xs"
-					data={[
-						{ value: "narrafork", label: t("customApiUserAgentNarrafork") },
-						{ value: "claude-code", label: t("customApiUserAgentClaudeCode") },
-						{ value: "codex", label: t("customApiUserAgentCodex") },
-						{ value: "custom", label: t("customApiUserAgentCustom") },
-					]}
-					value={provider.userAgentMode ?? "narrafork"}
-					onChange={(v) =>
-						updateProvider("userAgentMode", (v as UserAgentMode | null) ?? "narrafork")
-					}
+				<ClientFingerprintFields
+					value={{
+						userAgentMode: provider.userAgentMode,
+						customUserAgent: provider.customUserAgent,
+						extraHeaders: provider.extraHeaders,
+						emulateCodexHeaders: provider.emulateCodexHeaders,
+					}}
+					showEmulateToggle
+					emulateCodexDefault={provider.protocol === "codex-native"}
+					onChange={(next) => {
+						if (next.userAgentMode !== undefined)
+							updateProvider("userAgentMode", next.userAgentMode);
+						if (next.customUserAgent !== undefined)
+							updateProvider("customUserAgent", next.customUserAgent);
+						if (next.extraHeaders !== undefined) updateProvider("extraHeaders", next.extraHeaders);
+						if (next.emulateCodexHeaders !== undefined)
+							updateProvider("emulateCodexHeaders", next.emulateCodexHeaders);
+					}}
 				/>
-				{provider.userAgentMode === "custom" && (
-					<TextInput
-						label={t("customApiUserAgentCustomLabel")}
-						placeholder={t("customApiUserAgentCustomPlaceholder")}
-						value={provider.customUserAgent ?? ""}
-						size="xs"
-						onChange={(e) => updateProvider("customUserAgent", e.currentTarget.value)}
-					/>
-				)}
 
 				<Stack gap={4}>
 					<Text size="sm" fw={500}>

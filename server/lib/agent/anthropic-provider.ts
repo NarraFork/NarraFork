@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
+import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -9,7 +10,12 @@ import type { AnthropicProviderConfig } from "../settings";
 import { getModelContextWindow, getSettingsRevision, parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractAnthropicUsage } from "../usage-tracking";
-import { getHttpClaudeCliUserAgent, getHttpUserAgent, resolveHttpUserAgent } from "../user-agent";
+import {
+	buildCodexEmulationHeaders,
+	getHttpClaudeCliUserAgent,
+	getHttpUserAgent,
+	resolveHttpUserAgent,
+} from "../user-agent";
 import { isConnectionClosedError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import type {
@@ -675,6 +681,11 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	private applyExtraHeaders(headers: Record<string, string>): Record<string, string> {
+		// Optional Codex CLI header emulation (opt-in for Anthropic providers).
+		// Applied before user extraHeaders so operators can still override.
+		if (this.config.emulateCodexHeaders) {
+			Object.assign(headers, buildCodexEmulationHeaders({ installationId: getInstallationId() }));
+		}
 		for (const [key, value] of Object.entries(this.config.extraHeaders ?? {})) {
 			if (value) headers[key] = value;
 		}

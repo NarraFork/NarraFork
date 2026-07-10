@@ -77,6 +77,27 @@ function classifyCodexError(
 
 const CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
+/**
+ * Resolve the client-fingerprint config for the built-in Codex adapter from
+ * `settings.codex`. Defaults present the adapter as the real Codex CLI
+ * (codex UA + emulated stable headers); users can override via settings.
+ */
+function codexFingerprintConfig(): {
+	userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+	customUserAgent?: string;
+	extraHeaders?: Record<string, string>;
+	emulateCodexHeaders?: boolean;
+} {
+	const codex = settings.codex;
+	return {
+		userAgentMode: codex?.userAgentMode ?? "codex",
+		customUserAgent: codex?.customUserAgent,
+		extraHeaders: codex?.extraHeaders,
+		// Emulate by default unless the operator explicitly disabled it.
+		emulateCodexHeaders: codex?.emulateCodexHeaders ?? true,
+	};
+}
+
 export interface CodexProviderOptions {
 	/** Use WebSocket instead of HTTP for streaming (experimental) */
 	useWebSocket?: boolean;
@@ -121,6 +142,7 @@ export class CodexProvider implements ProviderAdapter {
 			apiMode: "codex",
 			codexWebSearch: this.useWebSearch,
 			codexImageGeneration: this.useImageGeneration,
+			...codexFingerprintConfig(),
 		});
 	}
 
@@ -170,6 +192,7 @@ export class CodexProvider implements ProviderAdapter {
 				codexAccountId: ctx.credential.accountId,
 				codexWebSearch: this.useWebSearch,
 				codexImageGeneration: this.useImageGeneration,
+				...codexFingerprintConfig(),
 			},
 			proxy,
 		);

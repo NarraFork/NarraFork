@@ -118,6 +118,7 @@ export {
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
 	codexDefaultReasoningEffortSchema,
+	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,
 	codexUseWebSearchSchema,
@@ -156,6 +157,11 @@ export {
 	rulerRebaseSchema,
 	updateRulerPositionsSchema,
 } from "./ruler";
+export {
+	createScheduledTaskSchema,
+	toggleScheduledTaskSchema,
+	updateScheduledTaskSchema,
+} from "./scheduled-tasks";
 export {
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,

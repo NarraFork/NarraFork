@@ -76,6 +76,8 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		codexImageGeneration: provider.codexImageGeneration,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
+		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -97,6 +99,8 @@ export function anthropicProviderToCustomApi(
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
+		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -148,6 +152,8 @@ export function customApiProviderToOpenAI(
 		codexImageGeneration: provider.codexImageGeneration,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
+		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 
@@ -170,6 +176,8 @@ export function customApiProviderToAnthropic(
 		officialApi: provider.protocol === "anthropic-official",
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
+		extraHeaders: provider.extraHeaders,
+		emulateCodexHeaders: provider.emulateCodexHeaders,
 	};
 }
 

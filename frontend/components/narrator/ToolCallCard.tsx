@@ -5335,7 +5335,9 @@ export const ToolCallCard = memo(function ToolCallCard({
 	const isMobileTc = useMediaQuery("(max-width: 768px)") ?? false;
 	const swipe = useSwipeMenu({
 		enabled: hasActions,
-		touchEnabled: interactionEnabled && isMobileTc,
+		// Touch swipe works on any pointer type (matches SubagentCard / MessageBubble),
+		// so wide-screen tablets get the same left-swipe gesture as narrow viewports.
+		touchEnabled: interactionEnabled,
 		blockId: tcBlockId,
 		onSwipeRight: isTcSelected ? handleDeselectTc : undefined,
 	});

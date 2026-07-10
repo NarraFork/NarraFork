@@ -191,6 +191,7 @@ export class RemoteBackend implements ExecutionBackend {
 			truncatedByBytes: res.truncatedByBytes,
 			timedOut: res.timedOut,
 			unavailable: res.unavailable,
+			usedFallback: res.usedFallback,
 		};
 	}
 

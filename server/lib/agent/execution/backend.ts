@@ -135,6 +135,8 @@ export interface GrepResult {
 	timedOut: boolean;
 	/** ripgrep binary was unavailable on this backend. */
 	unavailable?: boolean;
+	/** ripgrep was missing so the search fell back to the system `grep` (degraded capability). */
+	usedFallback?: boolean;
 }
 
 /** Parameters for starting a command process. */

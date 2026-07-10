@@ -186,7 +186,15 @@ export class LocalBackend implements ExecutionBackend {
 
 	async grep(params: GrepParams): Promise<GrepResult> {
 		const rgPath = await resolveRgPath();
-		if (!rgPath) {
+		if (rgPath) {
+			const rgArgs = buildRipgrepArgv(rgPath, params);
+			return this.runSearchProcess(rgArgs, params, { usedFallback: false });
+		}
+
+		// ripgrep unavailable — fall back to the system `grep` when present so the
+		// search still returns a best-effort result instead of hard-failing.
+		const grepPath = Bun.which("grep");
+		if (!grepPath) {
 			return {
 				stdoutBytes: new Uint8Array(0),
 				stderr: "",
@@ -197,30 +205,28 @@ export class LocalBackend implements ExecutionBackend {
 			};
 		}
 
-		const rgArgs: string[] = [rgPath, "--hidden", "--no-messages"];
-		if (params.rawBytes) rgArgs.push("--encoding", "none");
-
-		if (params.outputMode === "files_with_matches") {
-			rgArgs.push("-l");
-		} else if (params.outputMode === "count") {
-			rgArgs.push("-c");
-		} else {
-			if (params.showLineNumbers) rgArgs.push("-n");
-			const effectiveC = params.contextLines;
-			if (effectiveC != null) {
-				rgArgs.push("-C", String(effectiveC));
-			} else {
-				if (params.beforeContext != null) rgArgs.push("-B", String(params.beforeContext));
-				if (params.afterContext != null) rgArgs.push("-A", String(params.afterContext));
-			}
+		const isDir = (await this.statFile(params.searchPath))?.isDirectory ?? true;
+		const grepArgs = buildGrepFallbackArgv(grepPath, params, isDir);
+		const result = await this.runSearchProcess(grepArgs, params, { usedFallback: true });
+		// GNU grep -c prints a `path:0` line for every scanned file, whereas rg -c
+		// only lists files with matches. Strip zero-count lines to align output.
+		if (params.outputMode === "count") {
+			result.stdoutBytes = stripZeroCountLines(result.stdoutBytes);
 		}
-		if (params.caseInsensitive) rgArgs.push("-i");
-		if (params.multiline) rgArgs.push("-U", "--multiline-dotall");
-		if (params.fileType) rgArgs.push("--type", params.fileType);
-		if (params.glob) rgArgs.push("--glob", params.glob);
-		rgArgs.push("--regexp", params.pattern, params.searchPath);
+		return result;
+	}
 
-		const proc = Bun.spawn(rgArgs, {
+	/**
+	 * Spawn a ripgrep/grep-compatible search process, draining stdout up to the
+	 * byte cap and enforcing a hard timeout. Shared by the rg and grep-fallback
+	 * paths since both share the same exit-code + output conventions.
+	 */
+	private async runSearchProcess(
+		argv: string[],
+		params: GrepParams,
+		opts: { usedFallback: boolean },
+	): Promise<GrepResult> {
+		const proc = Bun.spawn(argv, {
 			cwd: params.cwd,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -252,6 +258,7 @@ export class LocalBackend implements ExecutionBackend {
 				exitCode,
 				truncatedByBytes: stdoutResult.truncated,
 				timedOut,
+				usedFallback: opts.usedFallback,
 			};
 		} finally {
 			clearTimeout(timeoutTimer);
@@ -365,6 +372,117 @@ export class LocalBackend implements ExecutionBackend {
 		]);
 		return new TextDecoder().decode(stdoutResult.bytes);
 	}
+}
+
+/** Build the ripgrep argv for a grep request. Exported for testing. */
+export function buildRipgrepArgv(rgPath: string, params: GrepParams): string[] {
+	const rgArgs: string[] = [rgPath, "--hidden", "--no-messages"];
+	if (params.rawBytes) rgArgs.push("--encoding", "none");
+
+	if (params.outputMode === "files_with_matches") {
+		rgArgs.push("-l");
+	} else if (params.outputMode === "count") {
+		rgArgs.push("-c");
+	} else {
+		if (params.showLineNumbers) rgArgs.push("-n");
+		const effectiveC = params.contextLines;
+		if (effectiveC != null) {
+			rgArgs.push("-C", String(effectiveC));
+		} else {
+			if (params.beforeContext != null) rgArgs.push("-B", String(params.beforeContext));
+			if (params.afterContext != null) rgArgs.push("-A", String(params.afterContext));
+		}
+	}
+	if (params.caseInsensitive) rgArgs.push("-i");
+	if (params.multiline) rgArgs.push("-U", "--multiline-dotall");
+	if (params.fileType) rgArgs.push("--type", params.fileType);
+	if (params.glob) rgArgs.push("--glob", params.glob);
+	rgArgs.push("--regexp", params.pattern, params.searchPath);
+	return rgArgs;
+}
+
+/**
+ * Build a best-effort system-`grep` argv that mirrors the ripgrep request as
+ * closely as POSIX grep allows. Exported for testing.
+ *
+ * Fidelity notes (documented in RG_FALLBACK_NOTE for the model):
+ * - `-E` treats the pattern as POSIX extended regex — the closest match to rg's
+ *   default syntax; rg-only escapes (\d, \b) may not behave identically.
+ * - `-s` suppresses error messages (≈ rg --no-messages); `-I` skips binary files
+ *   (≈ rg's default binary skipping).
+ * - Directory searches add `-r` (recursive). Single-file searches omit both `-r`
+ *   and the filename prefix, matching rg's single-file behavior.
+ * - `multiline`, `fileType`, and `rawBytes` have no grep equivalent and are dropped.
+ * - `-e <pattern>` and `--` guard against patterns/paths beginning with `-`,
+ *   preserving the injection-safety of the rg path.
+ */
+export function buildGrepFallbackArgv(
+	grepPath: string,
+	params: GrepParams,
+	isDir: boolean,
+): string[] {
+	const args: string[] = [grepPath, "-E", "-s", "-I"];
+	if (isDir) args.push("-r");
+
+	if (params.outputMode === "files_with_matches") {
+		args.push("-l");
+	} else if (params.outputMode === "count") {
+		args.push("-c");
+	} else {
+		if (params.showLineNumbers) args.push("-n");
+		const effectiveC = params.contextLines;
+		if (effectiveC != null) {
+			args.push("-C", String(effectiveC));
+		} else {
+			if (params.beforeContext != null) args.push("-B", String(params.beforeContext));
+			if (params.afterContext != null) args.push("-A", String(params.afterContext));
+		}
+	}
+	if (params.caseInsensitive) args.push("-i");
+	// grep's --include only applies to recursive directory searches.
+	if (params.glob && isDir) args.push(`--include=${params.glob}`);
+
+	args.push("-e", params.pattern, "--", params.searchPath);
+	return args;
+}
+
+/**
+ * Remove zero-count lines from `grep -c` output so it matches `rg -c`, which
+ * only lists files that actually contain matches. Operates on raw bytes to avoid
+ * corrupting non-UTF-8 path bytes. Exported for testing.
+ *
+ * Handles both `path:0` (recursive/multi-file) and a bare `0` (single file).
+ */
+export function stripZeroCountLines(bytes: Uint8Array): Uint8Array {
+	const NEWLINE = 0x0a;
+	const COLON = 0x3a;
+	const ZERO = 0x30;
+	const kept: Uint8Array[] = [];
+	let start = 0;
+	for (let i = 0; i <= bytes.length; i++) {
+		if (i === bytes.length || bytes[i] === NEWLINE) {
+			if (i > start) {
+				const line = bytes.subarray(start, i);
+				// A zero-count line ends in either `:0` or is exactly `0`.
+				const isBareZero = line.length === 1 && line[0] === ZERO;
+				const isPathZero =
+					line.length >= 2 && line[line.length - 1] === ZERO && line[line.length - 2] === COLON;
+				if (!isBareZero && !isPathZero) {
+					// Re-include the trailing newline when the source had one.
+					kept.push(i < bytes.length ? bytes.subarray(start, i + 1) : bytes.subarray(start, i));
+				}
+			}
+			start = i + 1;
+		}
+	}
+	const total = kept.reduce((n, c) => n + c.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of kept) {
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return out;
 }
 
 // Re-export for callers that resolve paths against a base.

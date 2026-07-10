@@ -355,7 +355,9 @@ export const ContentViewer = memo(
 		const interactionEnabled = !isPreviewLod;
 		const swipe = useSwipeMenu({
 			enabled: interactionEnabled,
-			touchEnabled: interactionEnabled && isMobile,
+			// Touch swipe works on any pointer type (matches SubagentCard / MessageBubble),
+			// so wide-screen tablets get the same left-swipe gesture as narrow viewports.
+			touchEnabled: interactionEnabled,
 
 			externalBoxRef: boxRef,
 			excludeSelectors: [".mantine-Menu-dropdown"],
