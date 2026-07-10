@@ -110,6 +110,12 @@ const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
 	// early-return in normalizeCodexReasoningEffort before this table is consulted.
 	// The frontend counterpart (NarratorPanel CODEX_REASONING_OPTIONS_BY_MODEL)
 	// includes "none" because it drives UI dropdown options.
+	// gpt-5.6 family supports a real "max" tier (unlike earlier codex models).
+	// The upstream catalog also lists "ultra" for Sol/Terra, but NarraFork's UI
+	// enum stops at "max", so ultra is intentionally not surfaced here.
+	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.3-codex-spark": ["low", "medium", "high", "xhigh"],
 	"gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
 	"gpt-5.2-codex": ["low", "medium", "high", "xhigh"],
@@ -128,6 +134,9 @@ export const CODEX_IMAGE_GENERATION_PARTIAL_IMAGES = 2;
 const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
 
 const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
+	"gpt-5.6-sol": ["text", "image"],
+	"gpt-5.6-terra": ["text", "image"],
+	"gpt-5.6-luna": ["text", "image"],
 	"gpt-5.5": ["text", "image"],
 	"gpt-5.4": ["text", "image"],
 	"gpt-5.4-mini": ["text", "image"],
@@ -208,8 +217,10 @@ export function normalizeCodexReasoningEffort(
 	if (reasoningEffort === "none") return reasoningEffort;
 	const bareModel = parseModelId(model).model;
 	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel];
-	// Codex has no "max" tier; degrade it to the model's highest available tier.
 	if (reasoningEffort === "max") {
+		// gpt-5.6 family exposes a real "max" tier; keep it when supported.
+		if (supported?.includes("max")) return "max";
+		// Older codex models have no "max" tier; degrade to the highest available.
 		if (!supported) return "xhigh";
 		if (supported.includes("xhigh")) return "xhigh";
 		if (supported.includes("high")) return "high";

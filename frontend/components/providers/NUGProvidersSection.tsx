@@ -974,11 +974,11 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 				if (result.modelContextWindows) onMergeContextWindows?.(result.modelContextWindows);
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
-			} catch {
+			} catch (err) {
 				notifications.show({
 					color: "red",
 					title: t("nugRefreshModelsError"),
-					message: "",
+					message: err instanceof Error ? err.message : String(err),
 				});
 			} finally {
 				setRefreshingProvider(null);

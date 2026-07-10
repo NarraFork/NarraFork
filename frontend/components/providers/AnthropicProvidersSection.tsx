@@ -138,11 +138,11 @@ export const AnthropicProvidersSection = React.memo(function AnthropicProvidersS
 						autoClose: 8000,
 					});
 				}
-			} catch {
+			} catch (err) {
 				notifications.show({
 					color: "red",
 					title: t("anthropicRefreshModelsError"),
-					message: "",
+					message: err instanceof Error ? err.message : String(err),
 				});
 			} finally {
 				setRefreshingProvider(null);

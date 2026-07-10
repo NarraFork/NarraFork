@@ -122,11 +122,33 @@ export const OpenAIProvidersSection = React.memo(function OpenAIProvidersSection
 			}
 			setRefreshingProvider(providerId);
 			try {
-				await api.openaiRefreshProviderModels(providerId);
+				const result = await api.openaiRefreshProviderModels(providerId);
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
-			} catch {
-				notifications.show({ color: "red", title: t("openaiRefreshModelsError"), message: "" });
+				if (result.resolvedBaseUrl) {
+					// Suggest-safe fallback (baseUrl + /v1) — prompt the user to fix it.
+					notifications.show({
+						color: "yellow",
+						title: t("anthropicRefreshModelsResolvedUrl"),
+						message: result.resolvedBaseUrl,
+						autoClose: 8000,
+					});
+				} else if (result.resolvedModelsUrl) {
+					// Informational: model list came from a different path; the chat
+					// base URL may not need to change.
+					notifications.show({
+						color: "blue",
+						title: t("openaiModelsFromFallbackUrl"),
+						message: result.resolvedModelsUrl,
+						autoClose: 8000,
+					});
+				}
+			} catch (err) {
+				notifications.show({
+					color: "red",
+					title: t("openaiRefreshModelsError"),
+					message: err instanceof Error ? err.message : String(err),
+				});
 			} finally {
 				setRefreshingProvider(null);
 			}

@@ -41,6 +41,7 @@ import {
 import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -446,12 +447,52 @@ export async function handleLoadSkillCommand(
  * Directly executes a bash command without AI involvement.
  * Persists a running tool card before execution, then streams output via WS.
  */
+/**
+ * AbortControllers for in-flight manual `/bash` commands, keyed by narratorId.
+ * Manual `/bash` runs (both the standalone command and the runBashFirst pre-prompt
+ * flow) execute outside the normal tool-executor path, so the agent loop's abort
+ * signal never reaches them. We track their controllers here so the interrupt
+ * endpoint can terminate the underlying process.
+ *
+ * A narrator can have more than one manual bash in flight (e.g. a runBashFirst
+ * pre-prompt command plus a separately triggered one), so we keep a Set per
+ * narrator instead of a single controller — otherwise a later command would
+ * overwrite the earlier one's entry and leave it un-interruptible.
+ *
+ * Pinned to globalThis via hotSafe so hot reloads don't lose references to
+ * running child processes.
+ */
+const manualBashAborts = hotSafe(
+	"narrafork:manualBashAborts",
+	() => new Map<string, Set<AbortController>>(),
+);
+
+/**
+ * Abort ALL in-flight manual `/bash` commands for this narrator.
+ * Returns true if at least one running manual bash command was found and aborted.
+ */
+export function interruptManualBash(narratorId: string): boolean {
+	const ctrls = manualBashAborts.get(narratorId);
+	if (!ctrls || ctrls.size === 0) return false;
+	// Snapshot before aborting: abort() may synchronously trigger the finally
+	// block that mutates the Set we're iterating.
+	for (const ctrl of [...ctrls]) {
+		try {
+			ctrl.abort();
+		} catch {
+			// already aborted
+		}
+	}
+	logger.info("Manual bash command interrupted", { narratorId });
+	return true;
+}
+
 export async function handleBashCommand(
 	narratorId: string,
 	command: string,
 	rawCommand: string,
 	userId?: string,
-	options?: { skipUserMessage?: boolean },
+	options?: { skipUserMessage?: boolean; signal?: AbortSignal },
 ): Promise<{ type: "bash"; id: string; output: string; isError: boolean }> {
 	const narrator = await narratorService.getById(narratorId);
 	const cwd = narrator.cwd ?? process.cwd();
@@ -562,6 +603,23 @@ export async function handleBashCommand(
 	});
 
 	// 3. Execute the process with live-output callbacks wired into the WS channel.
+	// Set up an AbortController so the interrupt endpoint (Stop button) can
+	// terminate this process. When a parent loop signal is provided (runBashFirst
+	// flow), chain it so aborting the loop also aborts the bash process.
+	const bashAbort = new AbortController();
+	const parentSignal = options?.signal;
+	const onParentAbort = () => bashAbort.abort();
+	if (parentSignal) {
+		if (parentSignal.aborted) bashAbort.abort();
+		else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+	}
+	let bashControllers = manualBashAborts.get(narratorId);
+	if (!bashControllers) {
+		bashControllers = new Set<AbortController>();
+		manualBashAborts.set(narratorId, bashControllers);
+	}
+	bashControllers.add(bashAbort);
+
 	const progressTimer = setInterval(() => {
 		broadcastToNarrator(narratorId, {
 			type: "tool_progress",
@@ -576,7 +634,7 @@ export async function handleBashCommand(
 		result = await bashTool.execute(toolInput, {
 			narratorId,
 			cwd,
-			signal: new AbortController().signal,
+			signal: bashAbort.signal,
 			locale: "en",
 			requestPermission: async () => ({ behavior: "allow" as const }),
 			currentToolUseId: toolUseId,
@@ -604,6 +662,15 @@ export async function handleBashCommand(
 		};
 	} finally {
 		clearInterval(progressTimer);
+		if (parentSignal) parentSignal.removeEventListener("abort", onParentAbort);
+		// Remove only this command's controller; other concurrent manual bash
+		// commands for the same narrator keep their entries. Drop the Set once
+		// it's empty so the map doesn't accumulate stale narrator keys.
+		const controllers = manualBashAborts.get(narratorId);
+		if (controllers) {
+			controllers.delete(bashAbort);
+			if (controllers.size === 0) manualBashAborts.delete(narratorId);
+		}
 	}
 
 	const completedAt = Date.now();

@@ -141,7 +141,7 @@ interface FetchAnthropicModelsResult {
  * `https://host/v1/models`. Because of this we try a series of candidate base
  * URLs (including the host origin) until one returns a valid list.
  */
-async function fetchAnthropicModels(
+export async function fetchAnthropicModels(
 	config: AnthropicProviderConfig,
 ): Promise<FetchAnthropicModelsResult> {
 	const baseUrl = (config.baseUrl || "https://api.anthropic.com/v1").replace(/\/+$/, "");
@@ -160,67 +160,79 @@ async function fetchAnthropicModels(
 		headers["x-api-key"] = config.apiKey;
 	}
 
-	let response = await fetch(`${baseUrl}/models`, { headers });
-	let resolvedBaseUrl: string | undefined;
-
-	if (!response.ok) {
-		// Build an ordered list of fallback base URLs to try for the /models
-		// endpoint. Different relays expose the model list at different paths.
-		// `suggest` marks whether the candidate is also a valid *messages* base
-		// URL worth surfacing to the user as a correction. Origin-based
-		// candidates are NOT suggested: the model list may live at the host root
-		// while messages stay under a sub-path (e.g. xiaomi serves messages at
-		// https://host/anthropic/v1 but the model list at https://host/v1), so
-		// rewriting the messages baseUrl to the origin would break chat.
-		const candidates: Array<{ base: string; suggest: boolean }> = [];
-		const seenCandidates = new Set<string>([baseUrl]);
-		const pushCandidate = (b: string, suggest: boolean) => {
-			if (b && !seenCandidates.has(b)) {
-				seenCandidates.add(b);
-				candidates.push({ base: b, suggest });
-			}
-		};
-
-		if (!/\/v1\/?$/i.test(baseUrl)) pushCandidate(`${baseUrl}/v1`, true);
-
-		// Strip a trailing gateway path segment (e.g. /anthropic or /v1).
-		if (/\/[a-z][\w-]*$/i.test(baseUrl)) {
-			const stripped = baseUrl.replace(/\/[a-z][\w-]*$/i, "");
-			if (stripped.length > 0) {
-				pushCandidate(stripped, true);
-				if (!/\/v1\/?$/i.test(stripped)) pushCandidate(`${stripped}/v1`, true);
-			}
+	// Ordered list of candidate base URLs to try for the /models endpoint. The
+	// first entry is always the user-configured base URL, so its error (if any)
+	// is reported first — this is the endpoint the user controls and the one
+	// they most likely need to fix. `suggest` marks whether the candidate is
+	// also a valid *messages* base URL worth surfacing to the user as a
+	// correction. Origin-based candidates are NOT suggested: the model list may
+	// live at the host root while messages stay under a sub-path (e.g. xiaomi
+	// serves messages at https://host/anthropic/v1 but the model list at
+	// https://host/v1), so rewriting the messages baseUrl to the origin would
+	// break chat.
+	const candidates: Array<{ base: string; suggest: boolean }> = [{ base: baseUrl, suggest: false }];
+	const seenCandidates = new Set<string>([baseUrl]);
+	const pushCandidate = (b: string, suggest: boolean) => {
+		if (b && !seenCandidates.has(b)) {
+			seenCandidates.add(b);
+			candidates.push({ base: b, suggest });
 		}
+	};
 
-		// Host root + /v1 (and bare host root). Since the model list is an
-		// OpenAI-style endpoint (Anthropic has none), relays commonly serve it at
-		// `{origin}/v1/models` regardless of where the Anthropic messages base
-		// path points. NOT suggested as a messages baseUrl for the same reason.
-		try {
-			const origin = new URL(baseUrl).origin;
-			pushCandidate(`${origin}/v1`, false);
-			pushCandidate(origin, false);
-		} catch {
-			// baseUrl not a valid absolute URL — skip origin-based candidates
-		}
+	if (!/\/v1\/?$/i.test(baseUrl)) pushCandidate(`${baseUrl}/v1`, true);
 
-		for (const candidate of candidates) {
-			logger.debug("Anthropic models fetch retry", {
-				originalUrl: `${baseUrl}/models`,
-				retryUrl: `${candidate.base}/models`,
-				status: response.status,
-			});
-			response = await fetch(`${candidate.base}/models`, { headers });
-			if (response.ok) {
-				resolvedBaseUrl = candidate.suggest ? candidate.base : undefined;
-				break;
-			}
+	// Strip a trailing gateway path segment (e.g. /anthropic or /v1).
+	if (/\/[a-z][\w-]*$/i.test(baseUrl)) {
+		const stripped = baseUrl.replace(/\/[a-z][\w-]*$/i, "");
+		if (stripped.length > 0) {
+			pushCandidate(stripped, true);
+			if (!/\/v1\/?$/i.test(stripped)) pushCandidate(`${stripped}/v1`, true);
 		}
 	}
 
-	if (!response.ok) {
-		const errText = await response.text().catch(() => "");
-		throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+	// Host root + /v1 (and bare host root). Since the model list is an
+	// OpenAI-style endpoint (Anthropic has none), relays commonly serve it at
+	// `{origin}/v1/models` regardless of where the Anthropic messages base
+	// path points. NOT suggested as a messages baseUrl for the same reason.
+	try {
+		const origin = new URL(baseUrl).origin;
+		pushCandidate(`${origin}/v1`, false);
+		pushCandidate(origin, false);
+	} catch {
+		// baseUrl not a valid absolute URL — skip origin-based candidates
+	}
+
+	// Try each candidate in order, collecting per-candidate errors so that when
+	// all fail we can surface every attempt (with the configured URL first)
+	// instead of hiding the real endpoint's error behind a wrong fallback's 404.
+	let response: Response | undefined;
+	let resolvedBaseUrl: string | undefined;
+	const errors: string[] = [];
+
+	for (const candidate of candidates) {
+		const candidateUrl = `${candidate.base}/models`;
+		try {
+			const resp = await fetch(candidateUrl, { headers });
+			if (resp.ok) {
+				response = resp;
+				// candidates[0] is the configured base URL — no correction needed.
+				resolvedBaseUrl =
+					candidate.base !== baseUrl && candidate.suggest ? candidate.base : undefined;
+				break;
+			}
+			const errText = await resp.text().catch(() => "");
+			errors.push(`${candidateUrl} → ${resp.status}${errText ? `: ${errText}` : ""}`);
+			logger.debug("Anthropic models fetch retry", {
+				retryUrl: candidateUrl,
+				status: resp.status,
+			});
+		} catch (err) {
+			errors.push(`${candidateUrl} → ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	if (!response) {
+		throw new Error(`Anthropic API error. Tried: ${errors.join("; ")}`);
 	}
 
 	const json = (await response.json()) as { data?: AnthropicModelInfo[] };

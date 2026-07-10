@@ -38,6 +38,9 @@ function s(): NarraForkSettings {
 	"claude-opus",
 ];
 const BUILTIN_CODEX_MODELS = [
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
 	"gpt-5.5",
 	"gpt-5.4",
 	"gpt-5.4-mini",
@@ -770,6 +773,9 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"o1-mini": 128_000,
 	"o3-mini": 200_000,
 	// Codex models
+	"gpt-5.6-sol": { contextLength: 372_000, maxCompletionTokens: 128_000 },
+	"gpt-5.6-terra": { contextLength: 372_000, maxCompletionTokens: 128_000 },
+	"gpt-5.6-luna": { contextLength: 372_000, maxCompletionTokens: 128_000 },
 	"gpt-5-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	"gpt-5.1-codex": { contextLength: 272_000, maxCompletionTokens: 128_000 },
 	"gpt-5.1-codex-max": { contextLength: 272_000, maxCompletionTokens: 128_000 },

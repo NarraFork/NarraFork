@@ -155,32 +155,82 @@ function isOfficialCodexDomain(baseUrl: string): boolean {
 	}
 }
 
+/** A candidate /models URL, plus (optionally) the chat base URL it implies. */
+interface ModelsUrlCandidate {
+	/** Full URL to fetch the model list from. */
+	url: string;
+	/**
+	 * When set, this candidate is derived by appending `/v1` to the configured
+	 * base URL — a form that is ALSO a valid chat base URL, so if it succeeds we
+	 * can safely suggest the user persist it. Origin-based candidates leave this
+	 * undefined: the model list may live at the host root while chat stays under
+	 * a sub-path, so suggesting them as the chat base URL would break chat.
+	 */
+	suggestBaseUrl?: string;
+}
+
 /**
  * Build a list of candidate URLs for the /models endpoint.
+ *
+ * The first entry is always the configured base URL. When the base URL lacks a
+ * trailing `/v1`, a suggest-safe `${baseUrl}/v1/models` candidate is added next
+ * (mirroring the Anthropic model-list fallback): it carries `suggestBaseUrl` so
+ * a success can prompt the user to fix their base URL. Remaining origin-based
+ * candidates are informational only (no `suggestBaseUrl`).
  */
-function buildModelsUrls(baseUrl: string): string[] {
-	const urls = [`${baseUrl}/models`];
+export function buildModelsUrls(baseUrl: string): ModelsUrlCandidate[] {
+	const candidates: ModelsUrlCandidate[] = [{ url: `${baseUrl}/models` }];
+	const seen = new Set<string>([`${baseUrl}/models`]);
+	const push = (candidate: ModelsUrlCandidate) => {
+		if (!seen.has(candidate.url)) {
+			seen.add(candidate.url);
+			candidates.push(candidate);
+		}
+	};
+
+	// Suggest-safe: appending /v1 to the configured base URL yields a valid chat
+	// base URL too, so a success here is worth suggesting as a baseUrl fix.
+	if (!/\/v1\/?$/i.test(baseUrl)) {
+		push({ url: `${baseUrl}/v1/models`, suggestBaseUrl: `${baseUrl}/v1` });
+	}
+
 	try {
 		const parsed = new URL(baseUrl);
 		const origin = parsed.origin;
-		const candidates = [`${origin}/api/v1/models`, `${origin}/v1/models`];
+		const originCandidates = [`${origin}/api/v1/models`, `${origin}/v1/models`];
 		const segments = parsed.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
 		const v1Idx = segments.lastIndexOf("v1");
 		if (v1Idx > 0) {
 			const stripped = `${origin}/${segments.slice(v1Idx).join("/")}/models`;
-			if (!candidates.includes(stripped)) candidates.unshift(stripped);
+			if (!originCandidates.includes(stripped)) originCandidates.unshift(stripped);
 		}
-		for (const c of candidates) {
-			if (!urls.includes(c)) urls.push(c);
-		}
+		// Origin-based candidates are informational only (no suggestBaseUrl).
+		for (const url of originCandidates) push({ url });
 	} catch {
 		// Invalid URL — just use the original
 	}
-	return urls;
+	return candidates;
+}
+
+interface FetchOpenaiModelsResult {
+	models: OpenAIModelInfo[];
+	/**
+	 * A chat base URL worth suggesting to the user (only set when the model list
+	 * succeeded at `${baseUrl}/v1/models`, a form that is also a valid chat base
+	 * URL). Safe to persist as the provider's base URL.
+	 */
+	resolvedBaseUrl?: string;
+	/**
+	 * The fallback URL the model list was actually fetched from, when it differs
+	 * from the configured base URL but is NOT safe to suggest as the chat base
+	 * URL (origin-based). Informational only — the chat base URL may not need to
+	 * change.
+	 */
+	resolvedModelsUrl?: string;
 }
 
 /** Fetch models from a specific OpenAI-compatible provider. */
-async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIModelInfo[]> {
+async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpenaiModelsResult> {
 	const apiKey = config.apiKey;
 	const baseUrl = (config.baseUrl || defaultBaseUrl(config)).replace(/\/+$/, "");
 
@@ -189,7 +239,7 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIMo
 	}
 
 	if (config.apiMode === "codex" && isOfficialCodexDomain(baseUrl)) {
-		return getBuiltinCodexModels().map((id) => ({ id }));
+		return { models: getBuiltinCodexModels().map((id) => ({ id })) };
 	}
 
 	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
@@ -199,10 +249,11 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIMo
 			headers["ChatGPT-Account-Id"] = config.codexAccountId;
 		}
 	}
-	const candidateUrls = buildModelsUrls(baseUrl);
+	const candidates = buildModelsUrls(baseUrl);
 	const errors: string[] = [];
 
-	for (const url of candidateUrls) {
+	for (const candidate of candidates) {
+		const { url } = candidate;
 		try {
 			const response = await fetch(url, { headers });
 			if (response.status === 404) {
@@ -211,7 +262,7 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIMo
 			}
 			if (!response.ok) {
 				const errText = await response.text().catch(() => "");
-				errors.push(`${url} → ${response.status}: ${errText}`);
+				errors.push(`${url} → ${response.status}${errText ? `: ${errText}` : ""}`);
 				continue;
 			}
 			const contentType = response.headers.get("content-type") ?? "";
@@ -228,13 +279,20 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<OpenAIMo
 				return true;
 			});
 			unique.sort((a, b) => a.id.localeCompare(b.id));
-			if (url !== candidateUrls[0]) {
+			const isFallback = url !== candidates[0].url;
+			if (isFallback) {
 				logger.info("OpenAI models fetched from fallback URL", {
 					url,
 					provider: config.name,
 				});
 			}
-			return unique;
+			return {
+				models: unique,
+				// A suggest-safe candidate (baseUrl + /v1) → offer as a baseUrl fix.
+				resolvedBaseUrl: candidate.suggestBaseUrl,
+				// Any other fallback URL → informational only.
+				resolvedModelsUrl: isFallback && !candidate.suggestBaseUrl ? url : undefined,
+			};
 		} catch (err) {
 			errors.push(`${url} → ${err instanceof Error ? err.message : String(err)}`);
 		}
@@ -263,7 +321,7 @@ openaiRoutes.post("/models/refresh", async (c) => {
 	const results: Array<{ providerId: string; name: string; count: number; error?: string }> = [];
 	for (const p of providers) {
 		try {
-			const models = await fetchOpenaiModels(p);
+			const { models } = await fetchOpenaiModels(p);
 			cachedModelsByProvider.set(p.id, models);
 			results.push({ providerId: p.id, name: p.name, count: models.length });
 		} catch (err: unknown) {
@@ -290,10 +348,10 @@ openaiRoutes.post("/providers/:id/models/refresh", async (c) => {
 		return c.json({ error: `Provider "${id}" not found` }, 404);
 	}
 	try {
-		const models = await fetchOpenaiModels(config);
+		const { models, resolvedBaseUrl, resolvedModelsUrl } = await fetchOpenaiModels(config);
 		cachedModelsByProvider.set(id, models);
 		saveAllCachedModels();
-		return c.json({ models, fromCache: false });
+		return c.json({ models, fromCache: false, resolvedBaseUrl, resolvedModelsUrl });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		logger.error("OpenAI listModels refresh failed", { error: msg, provider: config.name });

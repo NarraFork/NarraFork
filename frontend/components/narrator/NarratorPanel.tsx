@@ -1929,6 +1929,11 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 	// Includes "none" for UI display (disables reasoning). The backend counterpart
 	// (openai-provider CODEX_MODEL_REASONING_LEVELS) omits "none" because it is
 	// handled separately before the table lookup.
+	// gpt-5.6 family supports a real "max" tier (ultra exists upstream for
+	// Sol/Terra but is not surfaced in NarraFork's UI enum).
+	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.3-codex-spark": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.3-codex": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.2-codex": ["none", "low", "medium", "high", "xhigh"],

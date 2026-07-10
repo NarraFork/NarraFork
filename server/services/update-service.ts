@@ -1043,24 +1043,41 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const detachReplacement = process.platform !== "win32";
-		// Windows child processes already outlive their parent. Do not use `detached`
-		// here: DETACHED_PROCESS starts NarraFork without a console, causing later
-		// console tools (rg/node/git/bash) to allocate their own visible windows.
-		// A normal Windows spawn inherits the old console, or creates one for the
-		// replacement process if the old process has none, so tool children reuse it.
-		const proc = Bun.spawn([newExecPath, ...process.argv.slice(2)], {
-			cwd: process.cwd(),
-			env,
-			detached: detachReplacement,
-			stdio: ["ignore", "ignore", "ignore"],
-		});
+		const launchArgs = process.argv.slice(2);
+		const isWindows = process.platform === "win32";
+		const proc = isWindows
+			? Bun.spawn(
+					[
+						process.env.ComSpec || "cmd.exe",
+						"/d",
+						"/c",
+						"start",
+						"",
+						"/D",
+						process.cwd(),
+						newExecPath,
+						...launchArgs,
+					],
+					{
+						cwd: process.cwd(),
+						env,
+						stdio: ["ignore", "ignore", "ignore"],
+					},
+				)
+			: Bun.spawn([newExecPath, ...launchArgs], {
+					cwd: process.cwd(),
+					env,
+					detached: true,
+					stdio: ["ignore", "ignore", "ignore"],
+				});
 		(proc as { unref?: () => void }).unref?.();
 
 		logger.info("Update replacement server spawned", {
 			oldExecPath: execPath,
 			newExecPath,
-			replacementPid: proc.pid,
+			replacementPid: isWindows ? undefined : proc.pid,
+			launcherPid: isWindows ? proc.pid : undefined,
+			launchMode: isWindows ? "cmd-start" : "detached",
 			handoffUrl: session.url,
 			markerPath: session.markerPath,
 		});
@@ -1069,7 +1086,7 @@ export function applyUpdate(options: { targetVersion?: string } = {}): {
 			success: true,
 			newBinaryPath: newExecPath,
 			restarting: true,
-			replacementPid: proc.pid,
+			replacementPid: isWindows ? undefined : proc.pid,
 		};
 	} catch (err) {
 		cancelGracefulRestartSession();

@@ -1712,6 +1712,7 @@ const ToolHeader = memo(
 					) : (
 						statusNode
 					)}
+					<InlineTerminateControl toolCall={toolCall} narratorId={narratorId} />
 					<span className={toolCardClasses.headerChevron}>
 						{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 					</span>
@@ -2346,12 +2347,14 @@ function FileDetail({ toolCall }: { toolCall: ToolCallData }) {
 }
 
 /**
- * Terminate button for long-running tool calls (bash commands and MCP tools).
- * Rendered outside LazyCollapse so it's always visible without expanding the card.
- * Uses a local timer to detect ≥60s elapsed — no dependency on WS push.
+ * Inline terminate control for long-running tool calls (bash commands and MCP
+ * tools). Rendered as a tiny stop icon inside the tool header's trailing row
+ * (next to the elapsed time / status), so it stays visually grouped with the
+ * header instead of occupying a full-width button row. Shown for the entire
+ * duration the tool is running — no time threshold.
  */
-const LongRunningTerminateButton = memo(
-	function LongRunningTerminateButton({
+const InlineTerminateControl = memo(
+	function InlineTerminateControl({
 		toolCall,
 		narratorId,
 	}: {
@@ -2366,44 +2369,34 @@ const LongRunningTerminateButton = memo(
 		const isLongRunnable = isBash || isMcp;
 		const isRunning = toolCall.status === "running" && !!narratorId;
 
-		// 本地 5s 轮询计算已运行时长。startedAt 来自 tool_started WS 事件，
-		// 由 MessageBubble 从 message.toolCalls 传入。不依赖 WS 的 _longRunning 推送，
-		// 因为 WS 可能因心跳超时断开。
-		const [elapsed, setElapsed] = useState(0);
-		useEffect(() => {
-			if (!isLongRunnable || !isRunning || toolCall.startedAt == null) {
-				setElapsed(0);
-				return;
-			}
-			const update = () => setElapsed(Date.now() - (toolCall.startedAt ?? Date.now()));
-			update();
-			const timer = setInterval(update, 5_000);
-			return () => clearInterval(timer);
-		}, [isLongRunnable, isRunning, toolCall.startedAt]);
-
-		// 60_000 与后端 LONG_RUNNING_THRESHOLD_MS 保持一致
-		if (!isLongRunnable || !isRunning || elapsed < 60_000) return null;
+		if (!isLongRunnable || !isRunning) return null;
 
 		return (
-			<Box mt={4} mb={2}>
-				<Button
-					size="xs"
-					variant="light"
-					color="red"
-					leftSection={<IconPlayerStop size={14} />}
-					loading={interruptMutation.isPending}
-					onClick={() => narratorId && interruptMutation.mutate(narratorId)}
+			<Tooltip label={tNarrator("terminateProcess")} position="top" withArrow fz="xs">
+				<UnstyledButton
+					aria-label={tNarrator("terminateProcess")}
+					className={toolCardClasses.headerTerminate}
+					onClick={(e: React.MouseEvent) => {
+						// Prevent the header toggle from firing.
+						e.stopPropagation();
+						if (narratorId && !interruptMutation.isPending) {
+							interruptMutation.mutate(narratorId);
+						}
+					}}
 				>
-					{tNarrator("terminateProcess")}
-				</Button>
-			</Box>
+					{interruptMutation.isPending ? (
+						<IconLoader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+					) : (
+						<IconPlayerStop size={11} />
+					)}
+				</UnstyledButton>
+			</Tooltip>
 		);
 	},
 	(prev, next) => {
 		return (
 			prev.toolCall.toolName === next.toolCall.toolName &&
 			prev.toolCall.status === next.toolCall.status &&
-			prev.toolCall.startedAt === next.toolCall.startedAt &&
 			prev.narratorId === next.narratorId
 		);
 	},
@@ -5527,20 +5520,17 @@ export const ToolCallCard = memo(function ToolCallCard({
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (
-				<>
-					<LongRunningTerminateButton toolCall={toolCall} narratorId={narratorId} />
-					<LazyCollapse in={opened}>
-						<Box style={planStyle}>
-							<LazyDetailRenderer
-								toolCall={toolCall}
-								narratorId={narratorId}
-								opened={opened}
-								planPreviewOverride={effectivePlanPreviewOverride}
-							/>
-						</Box>
-						{permissionUI}
-					</LazyCollapse>
-				</>
+				<LazyCollapse in={opened}>
+					<Box style={planStyle}>
+						<LazyDetailRenderer
+							toolCall={toolCall}
+							narratorId={narratorId}
+							opened={opened}
+							planPreviewOverride={effectivePlanPreviewOverride}
+						/>
+					</Box>
+					{permissionUI}
+				</LazyCollapse>
 			)}
 		</NestedBlockCtx.Provider>
 	);

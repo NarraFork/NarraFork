@@ -64,7 +64,13 @@ if (import.meta.hot) {
 
 	const isStaleReactHookError = (message: string) =>
 		/Cannot read properties of null \(reading 'use[A-Z][A-Za-z]+'\)/.test(message) ||
-		message.includes("Invalid hook call");
+		message.includes("Invalid hook call") ||
+		// A context module (e.g. ImageViewerProvider) re-evaluated by Fast Refresh
+		// creates a NEW context object, while the mounted provider higher in the
+		// tree still holds the OLD one. Consumers then read a null context and
+		// throw "useXxx must be used within XxxProvider". Same class of stale
+		// module-graph split — recover with a one-time reload.
+		/must be used within [A-Za-z]+Provider/.test(message);
 
 	const onRuntimeError = (error: ErrorEvent | PromiseRejectionEvent) => {
 		const reason = "reason" in error ? error.reason : error.error;

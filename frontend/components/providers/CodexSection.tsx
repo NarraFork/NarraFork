@@ -591,7 +591,7 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
 	});
 	const defaultReasoningMut = useMutation({
-		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null) =>
+		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null) =>
 			api.codexSetDefaultReasoningEffort(reasoningEffort),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
@@ -873,14 +873,17 @@ export const CodexSection = React.memo(function CodexSection({
 					? tn("reasoning_high")
 					: effectiveDefaultReasoningEffort === "xhigh"
 						? tn("reasoning_xhigh")
-						: effectiveDefaultReasoningEffort === "none"
-							? tn("reasoning_none")
-							: tn("reasoning_auto");
+						: effectiveDefaultReasoningEffort === "max"
+							? tn("reasoning_max")
+							: effectiveDefaultReasoningEffort === "none"
+								? tn("reasoning_none")
+								: tn("reasoning_auto");
 
 	const handleSaveDefaultReasoningEffort = () => {
 		if (!canSetDefaultReasoningEffort) return;
 		const nextReasoningEffort =
-			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") || null;
+			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh" | "max") ||
+			null;
 		defaultReasoningMut.mutate(nextReasoningEffort, {
 			onSuccess: () => {
 				setDefaultReasoningEffort(nextReasoningEffort ?? "");
@@ -1030,6 +1033,7 @@ export const CodexSection = React.memo(function CodexSection({
 							{ label: tn("reasoning_medium"), value: "medium" },
 							{ label: tn("reasoning_high"), value: "high" },
 							{ label: tn("reasoning_xhigh"), value: "xhigh" },
+							{ label: tn("reasoning_max"), value: "max" },
 						]}
 					/>
 					<Button

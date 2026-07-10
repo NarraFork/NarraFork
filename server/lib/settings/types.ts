@@ -643,7 +643,7 @@ export interface NarraForkSettings {
 		/** Account tier order used by tier-balanced mode. */
 		tierOrder?: CodexPlanTier[];
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
-		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 		/** Use WebSocket instead of HTTP for Codex connections (experimental, enabled by default). */
 		useWebSocket?: boolean;
 		/** Allow the native web_search tool to be sent to Codex models. Enabled by default. */

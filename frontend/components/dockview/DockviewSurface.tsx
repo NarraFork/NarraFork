@@ -14,6 +14,7 @@
 import { Box } from "@mantine/core";
 import {
 	type DockviewApi,
+	DockviewDefaultTab,
 	type DockviewDidDropEvent,
 	DockviewReact,
 	type DockviewReadyEvent,
@@ -220,6 +221,13 @@ export function DockviewSurface({
 				theme={themeless ? undefined : NARRAFORK_DOCKVIEW_THEME}
 				components={components}
 				tabComponents={tabComponents}
+				// dockview-core's vanilla default tab only closes on the close-button
+				// click; dockview-react's DockviewDefaultTab additionally closes on a
+				// middle-click (mouse button 1) and honours `hideClose`. Registering it
+				// as the default gives every ordinary panel middle-click-to-close, while
+				// panels that opt into a custom `tabComponent` (e.g. the close-less chat
+				// protagonist on the single-narrator page) are unaffected.
+				defaultTabComponent={DockviewDefaultTab}
 				onReady={handleReady}
 				onDidDrop={handleDidDrop}
 				onWillDrop={handleWillDrop}

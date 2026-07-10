@@ -207,10 +207,26 @@ export const ClineSection = React.memo(function ClineSection({
 		if (!canRefreshModels) return;
 		setRefreshing(true);
 		try {
-			await api.clineRefreshModels();
+			// This endpoint returns 200 with per-provider results even on
+			// upstream failure, so surface any `results[].error` from the payload
+			// instead of relying on the catch block (which only fires on
+			// network-level errors).
+			const data = await api.clineRefreshModels();
 			qc.invalidateQueries({ queryKey: ["cline", "pool"] });
-		} catch {
-			notifications.show({ color: "red", title: t("clineRefreshModelsError"), message: "" });
+			const failed = (data.results ?? []).filter((r) => r.error);
+			if (failed.length > 0) {
+				notifications.show({
+					color: "red",
+					title: t("clineRefreshModelsError"),
+					message: failed.map((r) => `${r.name}: ${r.error}`).join("\n"),
+				});
+			}
+		} catch (err) {
+			notifications.show({
+				color: "red",
+				title: t("clineRefreshModelsError"),
+				message: err instanceof Error ? err.message : String(err),
+			});
 		} finally {
 			setRefreshing(false);
 		}

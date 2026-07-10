@@ -70,6 +70,34 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 4. **运行时读取：** `server/lib/changelog.ts` 双模式 — 开发时读文件系统，编译二进制读嵌入数据。API 端点 `GET /api/changelog`（公开，无需认证）。
 5. **前端查看：** 设置页 About 区域有「查看更新日志」链接，跳转到 `/changelog` 页面（Timeline 组件，按版本倒序，根据语言切换内容）。
 
+**发布目标服务器（生产 vs 个人测试）：**
+
+- **正常发布（生产）：** `bun scripts/release.ts <version>` 默认读取 `~/.narrafork/update-server.json`，上传到生产更新服务器 `https://narrafork-update.b.domexie.cn`。这是所有正式版本的发布路径，**不要改动**。
+- **个人测试发布：** 用于只给自己测试的版本，走独立的测试更新服务器，不影响生产。发布时通过环境变量覆盖服务器地址和令牌：
+  ```bash
+  # 令牌明文存于 ~/.narrafork/update-server-test.json（权限 600，不提交仓库）
+  NF_UPDATE_SERVER=https://nfupdatetest.domexie.cn \
+  NF_UPDATE_TOKEN=$(bun -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.HOME+"/.narrafork/update-server-test.json","utf8")).token)') \
+  bun scripts/release.ts <version> --platform=windows-x64
+  ```
+  说明：`--platform=windows-x64` 按需选择平台；`--dry-run` 只构建不上传；`--upload-only` 复用现有 `dist/` 只上传。
+- **客户端测试：** 在设置页把「更新服务器」填 `https://nfupdatetest.domexie.cn`，通道选 `beta`（个人测试版本通常发到 beta 通道），即可检查到测试版本。测试完成后记得改回生产服务器。
+
+**个人测试更新服务器（常驻服务）：**
+
+测试更新服务器由 systemd 常驻托管，避免进程被关导致域名 502（历史上用后台任务跑会因超时被杀）。
+
+- **域名：** `https://nfupdatetest.domexie.cn`（宝塔 nginx/openresty 反代到 `127.0.0.1:17780`，vhost 配置 `/www/server/panel/vhost/nginx/nfupdatetest.domexie.cn.conf`，复用 `*.domexie.cn` 泛域名证书）
+- **systemd 服务名：** `narrafork-update-test`（系统单元 `/etc/systemd/system/narrafork-update-test.service`，`User=fulcrum`、`Restart=always`、开机自启）
+  ```bash
+  systemctl status narrafork-update-test      # 查看状态
+  sudo systemctl restart narrafork-update-test # 改了数据/配置后重启（release-cache 是内存缓存，需重启重载 meta.json）
+  journalctl -u narrafork-update-test -n 50    # 或看 ~/.narrafork/update-test/service.log
+  ```
+- **数据目录：** `~/.narrafork/update-test/`（`config.json` + `data/products/narrafork/releases/<version>/...`），持久化，不放 `/tmp`
+- **令牌：** 测试服务器专用上传令牌明文存于 `~/.narrafork/update-server-test.json`（权限 600，**不提交仓库**）；`config.json` 内只存 sha256 哈希
+- **注意：** 该测试服务器与本机（`127.0.0.1:17780`）绑定；直接修改 `data/` 下的 `meta.json` 后必须 `systemctl restart narrafork-update-test` 才会生效（内存缓存）。
+
 ## 技术栈
 
 - **运行时：** Bun（≥ 1.2），所有脚本通过 `bun run`/`bunx` 执行

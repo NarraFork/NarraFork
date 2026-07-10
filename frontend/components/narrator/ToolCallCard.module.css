@@ -93,6 +93,25 @@
 	align-items: center;
 }
 
+.headerTerminate {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	cursor: pointer;
+	color: var(--mantine-color-red-6);
+	border-radius: var(--mantine-radius-sm);
+	padding: 0;
+	opacity: 0.75;
+	transition:
+		opacity 120ms ease,
+		background 120ms ease;
+}
+
+.headerTerminate:hover {
+	opacity: 1;
+	background: var(--mantine-color-red-light, var(--mantine-color-red-1));
+}
+
 .headerCategoryIcon {
 	width: 16px;
 	height: 16px;

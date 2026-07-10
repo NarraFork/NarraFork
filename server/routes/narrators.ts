@@ -171,6 +171,7 @@ import {
 	handleLoadSkillCommand,
 	handleLoadToolCommand,
 	handleUnloadToolCommand,
+	interruptManualBash,
 	narratorService,
 } from "../services/narrator-service";
 import {
@@ -1753,7 +1754,12 @@ narratorRoutes.patch("/:id/segment-compact/:messageId", async (c) => {
 // Interrupt active session
 narratorRoutes.post("/:id/interrupt", async (c) => {
 	const id = c.req.param("id");
-	let interrupted = interruptNarrator(id);
+	// Always try to abort any in-flight manual /bash command. These run outside
+	// the agent loop (both the standalone /bash command with no active loop, and
+	// the runBashFirst pre-prompt flow), so the loop-level abort below cannot
+	// reach the underlying process on its own.
+	let interrupted = interruptManualBash(id);
+	if (interruptNarrator(id)) interrupted = true;
 	if (!interrupted) {
 		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
 		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).

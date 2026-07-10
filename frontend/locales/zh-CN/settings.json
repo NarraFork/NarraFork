@@ -356,6 +356,7 @@
 	"anthropicRefreshModelsLoading": "获取中...",
 	"anthropicRefreshModelsError": "获取模型列表失败",
 	"anthropicRefreshModelsResolvedUrl": "通过备用地址获取成功",
+	"openaiModelsFromFallbackUrl": "模型列表通过备用地址获取（聊天 base URL 不一定需要修改）",
 	"anthropicModelsCount": "{{count}} 个模型可用",
 	"hideAllModels": "全部隐藏",
 	"showAllModels": "全部显示",

@@ -431,7 +431,7 @@ const updateSettingsSchema = z
 					.max(6)
 					.optional(),
 				defaultReasoningEffort: z
-					.enum(["none", "low", "medium", "high", "xhigh"])
+					.enum(["none", "low", "medium", "high", "xhigh", "max"])
 					.nullable()
 					.optional(),
 				useWebSearch: z.boolean().optional(),

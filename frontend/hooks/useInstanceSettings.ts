@@ -388,8 +388,13 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				editor: { type: "vscode" },
 				codex: {
 					defaultReasoningEffort:
-						(state.codexDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
-						null,
+						(state.codexDefaultReasoningEffort as
+							| "none"
+							| "low"
+							| "medium"
+							| "high"
+							| "xhigh"
+							| "max") || null,
 				},
 				update: {
 					serverUrl: normalizedUpdateServerUrl || undefined,

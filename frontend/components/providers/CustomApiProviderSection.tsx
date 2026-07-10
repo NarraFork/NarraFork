@@ -307,12 +307,31 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					});
 				}
 			} else {
-				await api.openaiRefreshProviderModels(provider.id);
+				const result = await api.openaiRefreshProviderModels(provider.id);
+				if (result.resolvedBaseUrl) {
+					notifications.show({
+						color: "yellow",
+						title: t("anthropicRefreshModelsResolvedUrl"),
+						message: result.resolvedBaseUrl,
+						autoClose: 8000,
+					});
+				} else if (result.resolvedModelsUrl) {
+					notifications.show({
+						color: "blue",
+						title: t("openaiModelsFromFallbackUrl"),
+						message: result.resolvedModelsUrl,
+						autoClose: 8000,
+					});
+				}
 			}
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
-		} catch {
-			notifications.show({ color: "red", title: t("customApiRefreshModelsError"), message: "" });
+		} catch (err) {
+			notifications.show({
+				color: "red",
+				title: t("customApiRefreshModelsError"),
+				message: err instanceof Error ? err.message : String(err),
+			});
 		} finally {
 			setRefreshingProvider(null);
 		}

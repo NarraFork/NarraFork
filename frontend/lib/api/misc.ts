@@ -269,10 +269,12 @@ export const miscApi = {
 			{ method: "POST" },
 		),
 	openaiRefreshProviderModels: (providerId: string) =>
-		request<{ models: Array<{ id: string; owned_by?: string }>; fromCache: boolean }>(
-			`/openai/providers/${providerId}/models/refresh`,
-			{ method: "POST" },
-		),
+		request<{
+			models: Array<{ id: string; owned_by?: string }>;
+			fromCache: boolean;
+			resolvedBaseUrl?: string;
+			resolvedModelsUrl?: string;
+		}>(`/openai/providers/${providerId}/models/refresh`, { method: "POST" }),
 
 	// External MCP server management
 	mcpListServers: () =>
@@ -368,7 +370,7 @@ export const miscApi = {
 			available: number;
 			stickySessionCount: number;
 			globalProxy?: string;
-			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 			useWebSocket?: boolean;
 			useWebSearch?: boolean;
 			useImageGeneration?: boolean;
@@ -482,15 +484,15 @@ export const miscApi = {
 			body: JSON.stringify({ proxy }),
 		}),
 	codexGetDefaultReasoningEffort: () =>
-		request<{ reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null }>(
+		request<{ reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null }>(
 			"/codex/default-reasoning-effort",
 		),
 	codexSetDefaultReasoningEffort: (
-		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null,
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null,
 	) =>
 		request<{
 			ok: boolean;
-			reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null;
+			reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 		}>("/codex/default-reasoning-effort", {
 			method: "POST",
 			body: JSON.stringify({ reasoningEffort }),

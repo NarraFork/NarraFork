@@ -764,15 +764,29 @@ export class AnthropicProvider implements ProviderAdapter {
 		try {
 			response = await doFetch(url, init);
 		} catch (err) {
-			// Connection reset before any response — retry with /v1 if possible.
+			// Connection reset before any response. Under this branch's design
+			// assumption, a thrown connection error means the ORIGINAL path was
+			// wrong: gateways RST large request bodies on wrong paths before
+			// answering, so `/v1` is the corrected path. We therefore surface the
+			// retry's outcome (even a non-ok status) — re-throwing the original
+			// retryable connection error would make the agent loop retry the wrong
+			// path forever (observed as 0% success on long sessions).
 			if (canFallback && isConnectionClosedError(err)) {
 				const retryBase = `${baseUrl}/v1`;
+				const retryUrl = `${retryBase}${path}`;
 				logger.debug("Anthropic request connection closed, retrying with /v1 suffix", {
 					originalUrl: url,
-					retryUrl: `${retryBase}${path}`,
+					retryUrl,
 					error: err instanceof Error ? err.message : String(err),
 				});
-				const retryResponse = await doFetch(`${retryBase}${path}`, init);
+				let retryResponse: Response;
+				try {
+					retryResponse = await doFetch(retryUrl, init);
+				} catch {
+					// Both paths dropped the connection — surface the ORIGINAL
+					// (user-configured) URL's error, which is the one they control.
+					throw err;
+				}
 				if (retryResponse.ok) {
 					this.recordV1Fallback(baseUrl, retryBase);
 				}
@@ -781,24 +795,72 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw err;
 		}
 
-		if (!response.ok && canFallback) {
-			const retryBase = `${baseUrl}/v1`;
-			const retryUrl = `${retryBase}${path}`;
-			logger.debug("Anthropic request failed, retrying with /v1 suffix", {
-				originalUrl: url,
-				retryUrl,
-				status: response.status,
+		if (response.ok || !canFallback) {
+			return response;
+		}
+
+		// Original returned a non-ok HTTP response (this is the case the user's
+		// bug report describes: the configured URL fails WITH a real error body).
+		// We still try `/v1` (broad trigger, by design), but must not let a WORSE
+		// fallback — a wrong-path 404/405, or a WAF that drops the connection —
+		// hide the real endpoint's error. Cache the original status/body first so
+		// we can reconstruct it if the retry turns out worse.
+		const retryBase = `${baseUrl}/v1`;
+		const retryUrl = `${retryBase}${path}`;
+		const originalStatus = response.status;
+		const originalStatusText = response.statusText;
+		const originalContentType = response.headers.get("content-type");
+		const originalBody = await response.text().catch(() => "");
+
+		logger.debug("Anthropic request failed, retrying with /v1 suffix", {
+			originalUrl: url,
+			retryUrl,
+			status: originalStatus,
+		});
+
+		// Rebuild the drained original response so callers can read its status +
+		// body. Only content-type is preserved (content-length/encoding would no
+		// longer match the already-decoded body string).
+		const rebuildOriginal = (): Response => {
+			const headers = new Headers();
+			if (originalContentType) headers.set("content-type", originalContentType);
+			return new Response(originalBody, {
+				status: originalStatus,
+				statusText: originalStatusText,
+				headers,
 			});
-			// Drain the failed response body to free the connection
-			await response.text().catch(() => {});
-			const retryResponse = await doFetch(retryUrl, init);
-			if (retryResponse.ok) {
-				this.recordV1Fallback(baseUrl, retryBase);
-			}
+		};
+
+		let retryResponse: Response;
+		try {
+			retryResponse = await doFetch(retryUrl, init);
+		} catch (retryErr) {
+			// Fallback path dropped the connection (e.g. WAF). Surface the original
+			// endpoint's real error instead of the fallback transport failure.
+			logger.debug("Anthropic /v1 fallback threw; surfacing original error", {
+				retryUrl,
+				originalStatus,
+				error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+			});
+			return rebuildOriginal();
+		}
+
+		if (retryResponse.ok) {
+			this.recordV1Fallback(baseUrl, retryBase);
 			return retryResponse;
 		}
 
-		return response;
+		// Both failed. A 404/405 is the "wrong path" signal that triggered the
+		// fallback, so it is the least informative. Only prefer the retry when the
+		// ORIGINAL looked like a wrong path AND the retry reached a real endpoint;
+		// otherwise keep the original endpoint's error.
+		const isWrongPath = (status: number): boolean => status === 404 || status === 405;
+		if (isWrongPath(originalStatus) && !isWrongPath(retryResponse.status)) {
+			return retryResponse;
+		}
+		// Drain the retry body to free the connection, then surface the original.
+		await retryResponse.text().catch(() => {});
+		return rebuildOriginal();
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {

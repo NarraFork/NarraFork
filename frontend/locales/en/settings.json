@@ -356,6 +356,7 @@
 	"anthropicRefreshModelsLoading": "Fetching...",
 	"anthropicRefreshModelsError": "Failed to fetch models",
 	"anthropicRefreshModelsResolvedUrl": "Models fetched using a different URL",
+	"openaiModelsFromFallbackUrl": "Model list fetched from a fallback URL (chat base URL may not need changing)",
 	"anthropicModelsCount": "{{count}} models available",
 	"hideAllModels": "Hide All",
 	"showAllModels": "Show All",
