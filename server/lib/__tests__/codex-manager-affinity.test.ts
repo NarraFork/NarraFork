@@ -249,6 +249,22 @@ describe("CodexManager session affinity", () => {
 		expect(overview.trend.points[0]?.byType.k12).toBe(0.65);
 	});
 
+	test("公共额度 overview 按 effective tier order 仅展示有效账号 tier", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-free", priority: 0, planType: "free", remainingPercent: 60 },
+			{ id: "cred-k12", priority: 1, planType: "k12", remainingPercent: 70 },
+			{ id: "cred-pro", priority: 2, planType: "pro", remainingPercent: 80 },
+			{ id: "cred-other", priority: 3, planType: "enterprise", remainingPercent: 90 },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setTierOrder(["k12", "free", "pro"]);
+		const overview = manager.getPublicQuotaOverview();
+
+		expect(overview.segments.map((segment) => segment.type)).toEqual(["k12", "free", "pro"]);
+		expect(overview.trend.types).toEqual(["k12", "free", "pro"]);
+	});
+
 	test("tier-balanced 同等级内均衡随机选择", async () => {
 		const { manager, tmpHome } = createManagerWithCredentials([
 			{ id: "cred-pro-a", priority: 0, planType: "pro" },

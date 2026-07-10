@@ -29,10 +29,9 @@ describe("Codex K12 shared tier metadata integration", () => {
 		const sharedImport = getNamedImport(source, "../../lib/codex-tiers");
 
 		for (const importedName of [
-			"CODEX_DISPLAY_TIERS",
-			"CODEX_TIER_ORDER_VALUES",
 			"CODEX_DEFAULT_TIER_ORDER",
 			"CODEX_TIER_COLORS",
+			"getCodexDisplayTierOrder",
 			"getCodexTierLabel",
 			"normalizeCodexPlanTier",
 			"getCodexPlanTypeLabel",
@@ -45,6 +44,33 @@ describe("Codex K12 shared tier metadata integration", () => {
 		expect(source).not.toMatch(/const CODEX_DEFAULT_TIER_ORDER\b/);
 		expect(source).not.toMatch(/const CODEX_TIER_COLORS\b/);
 		expect(source).not.toMatch(/function getCodexTierLabel\b/);
+		expect(source).not.toMatch(/function getDisplayTierOrder\b/);
+	});
+
+	test("Settings quota overview follows tier order and refreshes the public overview", async () => {
+		const source = await readSource("frontend/components/providers/CodexSection.tsx");
+
+		expect(source).toContain("tierOrder={tierOrder}");
+		expect(source).toMatch(
+			/function CodexQuotaOverview\(\{[\s\S]*?tierOrder,[\s\S]*?getCodexDisplayTierOrder\(tierOrder\)/,
+		);
+		expect(source).toContain('qc.invalidateQueries({ queryKey: ["codex", "quota-overview"] });');
+	});
+
+	test("Settings syncs changed status tier order without resetting optimistic drag state", async () => {
+		const source = await readSource("frontend/components/providers/CodexSection.tsx");
+
+		expect(source).toContain("const lastSyncedTierOrderRef = useRef<string | null>(null);");
+		expect(source).toContain("const statusTierOrder = status ? status.tierOrder : null;");
+		expect(source).toMatch(
+			/useEffect\(\(\) => \{\s*if \(statusTierOrder === null\) return;\s*const nextTierOrder = getCodexDisplayTierOrder\(statusTierOrder\);\s*const nextTierOrderKey = nextTierOrder\.join\(","\);/,
+		);
+		expect(source).toContain("if (lastSyncedTierOrderRef.current === nextTierOrderKey) return;");
+		expect(source).toMatch(
+			/setTierOrder\(\(currentTierOrder\) =>\s*currentTierOrder\.join\(","\) === nextTierOrderKey\s*\? currentTierOrder\s*: nextTierOrder/,
+		);
+		expect(source).toContain("}, [statusTierOrder]);");
+		expect(source).not.toContain("tierOrderInitialized");
 	});
 
 	test("UsageDisplay normalizes plan types, localizes labels, and preserves unknown names", async () => {

@@ -18,7 +18,6 @@ import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
 	buildCodexUsageForecast,
 	buildCodexUsageSummary,
-	CODEX_DISPLAY_PLAN_TIERS,
 	CODEX_USAGE_FORECAST_HISTORY_MS,
 	type CodexPlanTier,
 	type CodexUsageForecast,
@@ -987,7 +986,7 @@ export class CodexManager {
 		const now = Date.now();
 		const summary = buildCodexUsageSummary(this.entries, now);
 		const trend = buildCodexUsageForecast(this.entries, now);
-		const visibleTiers = CODEX_DISPLAY_PLAN_TIERS.filter(
+		const visibleTiers = this.getEffectiveTierOrder().filter(
 			(tier): tier is PublicCodexPlanTier =>
 				tier !== "other" && (summary.byTier[tier]?.accountCount ?? 0) > 0,
 		);
@@ -1141,6 +1140,9 @@ export class CodexManager {
 		const next = normalizeCodexTierOrder(order);
 		if (next.join(",") !== this.tierOrder.join(",")) {
 			this.sessionAffinity.clear();
+			this.tierOrder = next;
+			this.schedulePublicQuotaOverviewBroadcast();
+			return;
 		}
 		this.tierOrder = next;
 	}

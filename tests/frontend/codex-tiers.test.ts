@@ -37,6 +37,20 @@ describe("Codex tier metadata", () => {
 		);
 	});
 
+	test("builds display order from custom tier order and appends missing defaults", async () => {
+		const { getCodexDisplayTierOrder } = await loadCodexTiers();
+
+		expect(getCodexDisplayTierOrder(["k12", "free", "pro", "k12", "other", "invalid"])).toEqual([
+			"k12",
+			"free",
+			"pro",
+			"prolite",
+			"plus",
+			"team",
+		]);
+		expect(getCodexDisplayTierOrder()).toEqual(["pro", "prolite", "plus", "team", "k12", "free"]);
+	});
+
 	test("normalizes only recognized K12 and existing plan names", async () => {
 		const { normalizeCodexPlanTier } = await loadCodexTiers();
 

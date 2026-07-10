@@ -28,6 +28,18 @@ export const CODEX_DEFAULT_TIER_ORDER: PublicCodexPlanTier[] = [
 	"free",
 ];
 
+export function getCodexDisplayTierOrder(order?: readonly string[] | null): PublicCodexPlanTier[] {
+	const result: PublicCodexPlanTier[] = [];
+	for (const tier of order ?? CODEX_DEFAULT_TIER_ORDER) {
+		const displayTier = CODEX_DEFAULT_TIER_ORDER.find((candidate) => candidate === tier);
+		if (displayTier && !result.includes(displayTier)) result.push(displayTier);
+	}
+	for (const tier of CODEX_DEFAULT_TIER_ORDER) {
+		if (!result.includes(tier)) result.push(tier);
+	}
+	return result;
+}
+
 export const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
 	free: "gray",
 	plus: "blue",

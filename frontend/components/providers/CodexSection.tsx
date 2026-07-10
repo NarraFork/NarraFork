@@ -60,9 +60,8 @@ import type {
 } from "../../lib/api/types";
 import {
 	CODEX_DEFAULT_TIER_ORDER,
-	CODEX_DISPLAY_TIERS,
 	CODEX_TIER_COLORS,
-	CODEX_TIER_ORDER_VALUES,
+	getCodexDisplayTierOrder,
 	getCodexPlanTypeLabel,
 	getCodexTierLabel,
 	normalizeCodexPlanTier,
@@ -100,18 +99,6 @@ interface CodexImportCredential {
 const CODEX_STATUS_GC_TIME_MS = 60_000;
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
-function getDisplayTierOrder(order?: CodexPlanTier[]): CodexPlanTier[] {
-	const result: CodexPlanTier[] = [];
-	for (const tier of order ?? CODEX_DEFAULT_TIER_ORDER) {
-		if (!CODEX_TIER_ORDER_VALUES.includes(tier)) continue;
-		if (tier === "other") continue;
-		if (!result.includes(tier)) result.push(tier);
-	}
-	for (const tier of CODEX_DEFAULT_TIER_ORDER) {
-		if (!result.includes(tier)) result.push(tier);
-	}
-	return result;
-}
 
 function normalizeRefreshToken(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -433,7 +420,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const [useImageGeneration, setUseImageGeneration] = useState(true);
 	const [useImageGenerationInitialized, setUseImageGenerationInitialized] = useState(false);
 	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
-	const [tierOrderInitialized, setTierOrderInitialized] = useState(false);
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
@@ -447,6 +433,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const deviceAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 	const browserAuthTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const lastSyncedTierOrderRef = useRef<string | null>(null);
 
 	// Cleanup polling intervals/timeouts on unmount
 	useEffect(() => {
@@ -492,6 +479,7 @@ export const CodexSection = React.memo(function CodexSection({
 	const usageCache = status?.usageCache ?? {};
 	const stickySessionCount = status?.stickySessionCount ?? 0;
 	const lastBrowserAuthError = status?.lastBrowserAuthError;
+	const statusTierOrder = status ? status.tierOrder : null;
 
 	useEffect(() => {
 		const maxAvailablePage = Math.max(1, Math.ceil(availableTotal / PAGE_SIZE));
@@ -518,18 +506,24 @@ export const CodexSection = React.memo(function CodexSection({
 			setUseImageGeneration(status.useImageGeneration ?? true);
 			setUseImageGenerationInitialized(true);
 		}
-		if (!tierOrderInitialized) {
-			setTierOrder(getDisplayTierOrder(status.tierOrder));
-			setTierOrderInitialized(true);
-		}
 	}, [
 		status,
 		defaultReasoningInitialized,
 		useWebSocketInitialized,
 		useWebSearchInitialized,
 		useImageGenerationInitialized,
-		tierOrderInitialized,
 	]);
+
+	useEffect(() => {
+		if (statusTierOrder === null) return;
+		const nextTierOrder = getCodexDisplayTierOrder(statusTierOrder);
+		const nextTierOrderKey = nextTierOrder.join(",");
+		if (lastSyncedTierOrderRef.current === nextTierOrderKey) return;
+		lastSyncedTierOrderRef.current = nextTierOrderKey;
+		setTierOrder((currentTierOrder) =>
+			currentTierOrder.join(",") === nextTierOrderKey ? currentTierOrder : nextTierOrder,
+		);
+	}, [statusTierOrder]);
 
 	// Auto-detect browser auth failure from server-side error
 	useEffect(() => {
@@ -616,7 +610,8 @@ export const CodexSection = React.memo(function CodexSection({
 		mutationFn: (tierOrder: CodexPlanTier[]) => api.codexSetTierOrder(tierOrder),
 		onSuccess: (data) => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
-			setTierOrder(getDisplayTierOrder(data.tierOrder));
+			qc.invalidateQueries({ queryKey: ["codex", "quota-overview"] });
+			setTierOrder(getCodexDisplayTierOrder(data.tierOrder));
 			notifications.show({ message: t("codexTierOrderUpdated"), color: "green" });
 		},
 		onError: (err: Error) => {
@@ -1286,6 +1281,7 @@ export const CodexSection = React.memo(function CodexSection({
 					summary={status.usageSummary}
 					trend={status.usageForecast}
 					scheduler={status.usageScheduler}
+					tierOrder={tierOrder}
 				/>
 			)}
 
@@ -1513,14 +1509,17 @@ function CodexQuotaOverview({
 	summary,
 	trend,
 	scheduler,
+	tierOrder,
 }: {
 	summary: CodexUsageSummary;
 	trend: CodexUsageForecast;
 	scheduler: CodexUsageSchedulerSnapshot;
+	tierOrder: readonly CodexPlanTier[];
 }) {
 	const { t } = useTranslation("settings");
-	const [selectedTierValues, setSelectedTierValues] = useState<string[]>(CODEX_DISPLAY_TIERS);
-	const selectedTiers = CODEX_DISPLAY_TIERS.filter((tier) => selectedTierValues.includes(tier));
+	const displayTierOrder = getCodexDisplayTierOrder(tierOrder);
+	const [selectedTierValues, setSelectedTierValues] = useState<string[]>(displayTierOrder);
+	const selectedTiers = displayTierOrder.filter((tier) => selectedTierValues.includes(tier));
 	const summaryByTier = (summary.byTier ?? {}) as Partial<
 		Record<CodexPlanTier, CodexUsageTierStats>
 	>;
@@ -1560,7 +1559,7 @@ function CodexQuotaOverview({
 					</Text>
 					<Checkbox.Group value={selectedTierValues} onChange={setSelectedTierValues}>
 						<Group gap="xs" wrap="wrap">
-							{CODEX_DISPLAY_TIERS.map((tier) => (
+							{displayTierOrder.map((tier) => (
 								<Checkbox
 									key={tier}
 									value={tier}
