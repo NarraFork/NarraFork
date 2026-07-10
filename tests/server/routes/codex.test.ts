@@ -3,12 +3,17 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { AppError } from "../../../server/lib/errors";
 
+type CodexTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
+
+const DEFAULT_CODEX_TIER_ORDER: CodexTier[] = ["pro", "prolite", "plus", "team", "k12", "free"];
+const ALL_CODEX_TIER_ORDER: CodexTier[] = [...DEFAULT_CODEX_TIER_ORDER, "other"];
+
 const settingsState: {
 	codex: {
 		useWebSocket?: boolean;
 		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		loadBalancingMode?: "priority" | "balanced" | "tier-balanced";
-		tierOrder?: Array<"free" | "plus" | "team" | "prolite" | "pro" | "other">;
+		tierOrder?: CodexTier[];
 	};
 } = {
 	codex: {
@@ -20,6 +25,15 @@ const settingsState: {
 let saveSettingsCalls = 0;
 let codexImportedCredentials: unknown[] = [];
 let codexRemoveUnhealthyCalls = 0;
+let managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
+
+function getEffectiveTierOrder(): CodexTier[] {
+	const effective = [...managerTierOrder];
+	for (const tier of ALL_CODEX_TIER_ORDER) {
+		if (!effective.includes(tier)) effective.push(tier);
+	}
+	return effective;
+}
 
 const actualSettingsModule = await import("../../../server/lib/settings");
 
@@ -45,11 +59,13 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			stickySessionCount: 0,
 			usageCache: {},
 			loadBalancingMode: "priority",
-			tierOrder: ["pro", "prolite", "plus", "team", "free"],
-			effectiveTierOrder: ["pro", "prolite", "plus", "team", "free", "other"],
+			tierOrder: [...managerTierOrder],
+			effectiveTierOrder: getEffectiveTierOrder(),
 		}),
 		setLoadBalancingMode: () => {},
-		setTierOrder: () => {},
+		setTierOrder: (tierOrder: CodexTier[]) => {
+			managerTierOrder = [...tierOrder];
+		},
 		importCredentials: (credentials: unknown[]) => {
 			codexImportedCredentials = credentials;
 			return { added: credentials.length, duplicates: 0, skipped: 0 };
@@ -109,6 +125,7 @@ beforeEach(() => {
 	saveSettingsCalls = 0;
 	codexImportedCredentials = [];
 	codexRemoveUnhealthyCalls = 0;
+	managerTierOrder = [...DEFAULT_CODEX_TIER_ORDER];
 });
 
 describe("codex routes validation", () => {
@@ -183,7 +200,24 @@ describe("codex routes validation", () => {
 		expect(saveSettingsCalls).toBe(0);
 	});
 
-	it("accepts and normalizes custom tier order", async () => {
+	it("accepts k12 in custom tier order", async () => {
+		const res = await app.request("/tier-order", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ tierOrder: ["k12", "free"] }),
+		});
+
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({
+			ok: true,
+			tierOrder: ["k12", "free"],
+			effectiveTierOrder: ["k12", "free", "pro", "prolite", "plus", "team", "other"],
+		});
+		expect(settingsState.codex.tierOrder).toEqual(["k12", "free"]);
+		expect(saveSettingsCalls).toBe(1);
+	});
+
+	it("normalizes custom tier order and appends the full default tail including k12", async () => {
 		const res = await app.request("/tier-order", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -194,7 +228,7 @@ describe("codex routes validation", () => {
 		expect(await res.json()).toMatchObject({
 			ok: true,
 			tierOrder: ["plus", "pro", "free"],
-			effectiveTierOrder: ["pro", "prolite", "plus", "team", "free", "other"],
+			effectiveTierOrder: ["plus", "pro", "free", "prolite", "team", "k12", "other"],
 		});
 		expect(settingsState.codex.tierOrder).toEqual(["plus", "pro", "free"]);
 		expect(saveSettingsCalls).toBe(1);

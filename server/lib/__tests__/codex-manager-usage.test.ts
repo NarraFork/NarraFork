@@ -392,6 +392,68 @@ describe("CodexManager usage quota state", () => {
 		expect(stored.accessToken).toBe(accessToken);
 	});
 
+	test("导入邮箱优先读取 user.email 且顶层 email 仍覆盖", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+
+		const result = manager.importCredentials([
+			{
+				accessToken: createJwt({ email: "jwt-user@example.com" }),
+				user: { email: "user@example.com" },
+				credentials: { email: "credentials@example.com" },
+				extra: { email: "extra@example.com" },
+			},
+			{
+				accessToken: createJwt({ email: "jwt-top@example.com" }),
+				email: "top@example.com",
+				user: { email: "user-top@example.com" },
+				credentials: { email: "credentials-top@example.com" },
+				extra: { email: "extra-top@example.com" },
+			},
+		]);
+		const entries = manager.snapshot().entries;
+
+		expect(result).toEqual({ added: 2, duplicates: 0, skipped: 0 });
+		expect(entries[0]?.email).toBe("user@example.com");
+		expect(entries[1]?.email).toBe("top@example.com");
+	});
+
+	test("导入邮箱安全忽略无效 user 并回退后续来源", () => {
+		const tmpHome = mkdtempSync(join(tmpdir(), "narrafork-codex-usage-"));
+		tempHomes.push(tmpHome);
+		const manager = new CodexManager({ homeDir: tmpHome, registerProcessHooks: false });
+
+		const result = manager.importCredentials([
+			{
+				accessToken: createJwt({ email: "jwt-null@example.com" }),
+				user: null as unknown as Record<string, unknown>,
+				credentials: { email: "credentials-null@example.com" },
+				extra: { email: "extra-null@example.com" },
+			},
+			{
+				accessToken: createJwt({ email: "jwt-string@example.com" }),
+				user: "not-an-object" as unknown as Record<string, unknown>,
+				credentials: { email: "   " },
+				extra: { email: "extra-string@example.com" },
+			},
+			{
+				accessToken: createJwt({ email: "jwt-empty@example.com" }),
+				user: { email: "   " },
+				credentials: { email: "   " },
+				extra: { email: "   " },
+			},
+		]);
+		const entries = manager.snapshot().entries;
+
+		expect(result).toEqual({ added: 3, duplicates: 0, skipped: 0 });
+		expect(entries.map((entry) => entry.email)).toEqual([
+			"credentials-null@example.com",
+			"extra-string@example.com",
+			"jwt-empty@example.com",
+		]);
+	});
+
 	test("查询 usage 剩余为 0% 时直接标记 quota_exhausted", async () => {
 		const { manager, tmpHome } = createManagerWithOneCredential("cred-a");
 		tempHomes.push(tmpHome);

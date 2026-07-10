@@ -630,9 +630,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: '"priority" | "balanced" | "tier-balanced"',
 	},
 	"codex.tierOrder": {
-		desc: 'Codex 等级均衡模式的账号等级顺序。默认 ["pro", "prolite", "plus", "team", "free"]，未列出的等级自动排在最后。',
+		desc: 'Codex 等级均衡模式的账号等级顺序。默认 ["pro", "prolite", "plus", "team", "k12", "free"]，未列出的等级自动排在最后。',
 		type: "string[]",
-		valid: '"pro" | "prolite" | "plus" | "team" | "free" | "other"',
+		valid: '"pro" | "prolite" | "plus" | "team" | "k12" | "free" | "other"',
 	},
 	"codex.defaultReasoningEffort": {
 		desc: "Codex 模型默认推理努力级别。越高推理越深入但消耗更多 token。",

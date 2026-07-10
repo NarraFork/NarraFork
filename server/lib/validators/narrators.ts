@@ -103,7 +103,7 @@ export const codexUseImageGenerationSchema = z.object({
 });
 
 export const codexTierOrderSchema = z.object({
-	tierOrder: z.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"])).max(6),
+	tierOrder: z.array(z.enum(["free", "plus", "team", "k12", "prolite", "pro", "other"])).max(7),
 });
 
 /** Codex client fingerprint config (User-Agent mode + extra headers + emulation). */

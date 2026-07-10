@@ -552,6 +552,7 @@ export const miscApi = {
 			accountId?: string;
 			account_id?: string;
 			email?: string;
+			user?: { email?: string };
 			sub?: string;
 			displayName?: string;
 			display_name?: string;

@@ -18,7 +18,6 @@ import { codexUsageQueue, type UsageQueueSnapshot } from "./codex-usage-queue";
 import {
 	buildCodexUsageForecast,
 	buildCodexUsageSummary,
-	CODEX_DISPLAY_PLAN_TIERS,
 	CODEX_USAGE_FORECAST_HISTORY_MS,
 	type CodexPlanTier,
 	type CodexUsageForecast,
@@ -56,8 +55,15 @@ export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = ["too_many_failures", "banned"];
 const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
 
-export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
-const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free", "other"];
+export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = [
+	"pro",
+	"prolite",
+	"plus",
+	"team",
+	"k12",
+	"free",
+];
+const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = [...DEFAULT_CODEX_TIER_ORDER, "other"];
 
 export function normalizeCodexTierOrder(order?: readonly string[] | null): CodexPlanTier[] {
 	const validTiers = new Set<CodexPlanTier>(ALL_CODEX_TIER_ORDER);
@@ -211,6 +217,8 @@ export interface CodexImportCredentialInput {
 	display_name?: string;
 	name?: string;
 	priority?: number;
+	/** Optional user metadata object used by account exports. */
+	user?: Record<string, unknown>;
 	/** Nested credential object used by sub2api-style account exports. */
 	credentials?: Record<string, unknown>;
 	/** Optional metadata object used by sub2api-style account exports. */
@@ -356,6 +364,7 @@ function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
 ): CodexCredential | null {
+	const user = optionalRecord(input.user);
 	const nestedCredentials = optionalRecord(input.credentials);
 	const extra = optionalRecord(input.extra);
 	const refreshToken = firstOptionalString(
@@ -384,6 +393,7 @@ function createCredentialFromImport(
 	);
 	const email = firstOptionalString(
 		input.email,
+		user.email,
 		nestedCredentials.email,
 		extra.email,
 		tokenInfo.email,
@@ -976,7 +986,7 @@ export class CodexManager {
 		const now = Date.now();
 		const summary = buildCodexUsageSummary(this.entries, now);
 		const trend = buildCodexUsageForecast(this.entries, now);
-		const visibleTiers = CODEX_DISPLAY_PLAN_TIERS.filter(
+		const visibleTiers = this.getEffectiveTierOrder().filter(
 			(tier): tier is PublicCodexPlanTier =>
 				tier !== "other" && (summary.byTier[tier]?.accountCount ?? 0) > 0,
 		);
@@ -1130,6 +1140,9 @@ export class CodexManager {
 		const next = normalizeCodexTierOrder(order);
 		if (next.join(",") !== this.tierOrder.join(",")) {
 			this.sessionAffinity.clear();
+			this.tierOrder = next;
+			this.schedulePublicQuotaOverviewBroadcast();
+			return;
 		}
 		this.tierOrder = next;
 	}

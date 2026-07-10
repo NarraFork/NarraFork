@@ -67,6 +67,7 @@ describe("Codex usage summary", () => {
 		expect(normalizeCodexPlanTier("plus")).toBe("plus");
 		expect(normalizeCodexPlanTier("team")).toBe("team");
 		expect(normalizeCodexPlanTier("business")).toBe("team");
+		expect(normalizeCodexPlanTier("k12")).toBe("k12");
 		expect(normalizeCodexPlanTier("pro_lite")).toBe("prolite");
 		expect(normalizeCodexPlanTier("prolite")).toBe("prolite");
 		expect(normalizeCodexPlanTier("pro")).toBe("pro");
@@ -121,6 +122,27 @@ describe("Codex usage summary", () => {
 		expect(summary.byTier.pro.accountCount).toBe(1);
 		expect(summary.byTier.pro.zeroUsageCount).toBe(1);
 		expect(summary.byTier.pro.scheduledAccountCount).toBe(0);
+	});
+
+	test("summarizes K12 accounts in their own tier", () => {
+		const now = 1_000_000;
+		const resetAt = now + 60_000;
+		const summary = buildCodexUsageSummary(
+			[
+				{
+					id: "k12-a",
+					usage: usage("K-12", { used: 35, remaining: 65, resetAt: resetAt / 1000 }),
+				},
+			],
+			now,
+		);
+
+		expect(summary.byTier.k12.accountCount).toBe(1);
+		expect(summary.byTier.k12.remainingAccountEquivalents).toBe(0.65);
+		expect(summary.byTier.k12.averageRemainingPercent).toBe(65);
+		expect(summary.byTier.k12.scheduledAccountCount).toBe(1);
+		expect(summary.byTier.k12.nextResetAt).toBe(resetAt);
+		expect(summary.byTier.other.accountCount).toBe(0);
 	});
 
 	test("weekly exhaustion blocks 5h quota until weekly reset", () => {
@@ -216,6 +238,33 @@ describe("Codex usage summary", () => {
 		expect(forecast.points[3]?.byTier.plus).toBe(1);
 		expect(forecast.points[3]?.byTier.team).toBe(1);
 		expect(forecast.points[3]?.byTier.pro).toBe(1);
+	});
+
+	test("forecast includes K12 quota through each reset point", () => {
+		const now = 1_000_000;
+		const plusReset = now + 60_000;
+		const k12Reset = now + 90_000;
+		const forecast = buildCodexUsageForecast(
+			[
+				{
+					id: "plus-a",
+					usage: usage("plus", { used: 50, remaining: 50, resetAt: plusReset / 1000 }),
+				},
+				{
+					id: "k12-a",
+					usage: usage("k_12", { used: 60, remaining: 40, resetAt: k12Reset / 1000 }),
+				},
+			],
+			now,
+		);
+
+		expect(forecast.tiers).toContain("k12");
+		expect(forecast.points).toHaveLength(3);
+		expect(forecast.points[0]?.byTier.k12).toBe(0.4);
+		expect(forecast.points[1]?.timestamp).toBe(plusReset);
+		expect(forecast.points[1]?.byTier.k12).toBe(0.4);
+		expect(forecast.points[2]?.timestamp).toBe(k12Reset);
+		expect(forecast.points[2]?.byTier.k12).toBe(1);
 	});
 
 	test("forecast ignores non-exhausted weekly reset points", () => {
