@@ -200,6 +200,7 @@ function firstOptionalPriority(...values: unknown[]): number | undefined {
 function credentialFromObject(item: unknown): CodexImportCredential | null {
 	if (!isRecord(item)) return null;
 	const record = item;
+	const user = optionalRecord(record.user);
 	const nestedCredentials = optionalRecord(record.credentials);
 	const extra = optionalRecord(record.extra);
 	const refreshToken = normalizeRefreshToken(
@@ -217,6 +218,7 @@ function credentialFromObject(item: unknown): CodexImportCredential | null {
 	if (!refreshToken && !accessToken) return null;
 	const email = firstOptionalString(
 		record.email,
+		user.email,
 		nestedCredentials.email,
 		extra.email,
 		extractEmailFromString(record.displayName),

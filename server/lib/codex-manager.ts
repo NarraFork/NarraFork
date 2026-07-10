@@ -218,6 +218,8 @@ export interface CodexImportCredentialInput {
 	display_name?: string;
 	name?: string;
 	priority?: number;
+	/** Optional user metadata object used by account exports. */
+	user?: Record<string, unknown>;
 	/** Nested credential object used by sub2api-style account exports. */
 	credentials?: Record<string, unknown>;
 	/** Optional metadata object used by sub2api-style account exports. */
@@ -363,6 +365,7 @@ function createCredentialFromImport(
 	input: CodexImportCredentialInput,
 	defaultPriority: number,
 ): CodexCredential | null {
+	const user = optionalRecord(input.user);
 	const nestedCredentials = optionalRecord(input.credentials);
 	const extra = optionalRecord(input.extra);
 	const refreshToken = firstOptionalString(
@@ -391,6 +394,7 @@ function createCredentialFromImport(
 	);
 	const email = firstOptionalString(
 		input.email,
+		user.email,
 		nestedCredentials.email,
 		extra.email,
 		tokenInfo.email,
