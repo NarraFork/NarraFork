@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
 
 function createManagerWithCredentials(
-	creds: Array<{ id: string; priority: number; planType?: string }>,
+	creds: Array<{
+		id: string;
+		priority: number;
+		planType?: string;
+		remainingPercent?: number;
+	}>,
 ): {
 	manager: CodexManager;
 	tmpHome: string;
@@ -28,6 +33,17 @@ function createManagerWithCredentials(
 			c.planType || i % 2 === 0
 				? {
 						plan_type: c.planType ?? "pro",
+						...(c.remainingPercent !== undefined
+							? {
+									primary_window: {
+										used_percent: 100 - c.remainingPercent,
+										remaining_percent: c.remainingPercent,
+										reset_at: Math.floor((now + 60 * 60_000) / 1000),
+										reset_after_seconds: 60 * 60,
+										window_type: "5h",
+									},
+								}
+							: {}),
 						queriedAt: new Date(now).toISOString(),
 					}
 				: undefined,
@@ -165,7 +181,22 @@ describe("CodexManager session affinity", () => {
 		}
 	});
 
-	test("tier-balanced 默认按 pro/prolite/plus/team/free 选择最高等级", async () => {
+	test("tier-balanced 默认 effectiveTierOrder 包含 K12 的完整顺序", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([]);
+		tempHomes.push(tmpHome);
+
+		expect(manager.snapshot().effectiveTierOrder).toEqual([
+			"pro",
+			"prolite",
+			"plus",
+			"team",
+			"k12",
+			"free",
+			"other",
+		]);
+	});
+
+	test("tier-balanced 默认按 pro/prolite/plus/team/k12/free 选择最高等级", async () => {
 		const { manager, tmpHome } = createManagerWithCredentials([
 			{ id: "cred-plus", priority: 0, planType: "plus" },
 			{ id: "cred-pro", priority: 10, planType: "pro" },
@@ -178,6 +209,44 @@ describe("CodexManager session affinity", () => {
 		const ctx = await manager.acquireContext("session-tier");
 		expect(ctx.id).toBe("cred-pro");
 		expect(manager.snapshot().stickySessionCount).toBe(1);
+	});
+
+	test("tier-balanced 在 Team/K12/Free 中优先 Team，Team 不可用后优先 K12", async () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-free", priority: 0, planType: "free" },
+			{ id: "cred-k12", priority: 1, planType: "k12" },
+			{ id: "cred-team", priority: 2, planType: "team" },
+		]);
+		tempHomes.push(tmpHome);
+
+		manager.setLoadBalancingMode("tier-balanced");
+
+		const withTeam = await manager.acquireContext("session-with-team");
+		expect(withTeam.id).toBe("cred-team");
+
+		manager.setDisabled("cred-team", true);
+		const withoutTeam = await manager.acquireContext("session-without-team");
+		expect(withoutTeam.id).toBe("cred-k12");
+	});
+
+	test("K12 凭据出现在公共额度 segments 和 trend 中", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "cred-k12", priority: 0, planType: "k12", remainingPercent: 65 },
+		]);
+		tempHomes.push(tmpHome);
+
+		const overview = manager.getPublicQuotaOverview();
+
+		expect(overview.segments).toContainEqual(
+			expect.objectContaining({
+				type: "k12",
+				remainingAccountEquivalents: 0.65,
+				totalAccountEquivalents: 1,
+			}),
+		);
+		expect(overview.trend.types).toContain("k12");
+		expect(overview.trend.points.length).toBeGreaterThan(0);
+		expect(overview.trend.points[0]?.byType.k12).toBe(0.65);
 	});
 
 	test("tier-balanced 同等级内均衡随机选择", async () => {

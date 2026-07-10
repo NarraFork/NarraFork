@@ -534,7 +534,7 @@ export interface MessageLocationResult {
 	seq: number;
 }
 
-export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
+export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
 export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 

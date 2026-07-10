@@ -7,13 +7,12 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useProviderRuntimeCapability } from "../../hooks/usePlatform";
 import { api, type PublicCodexQuotaOverview, type PublicCodexQuotaSegment } from "../../lib/api";
+import { CODEX_TIER_STROKES, getCodexTierLabel } from "../../lib/codex-tiers";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
-	CODEX_TIER_STROKES,
 	CodexQuotaTrendChart,
 	formatAccountEquivalent,
 	formatResetTimestamp,
-	getCodexTierLabel,
 } from "../providers/CodexQuotaTrendChart";
 
 function clampRatio(value: number): number {

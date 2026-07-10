@@ -7,25 +7,8 @@ import type {
 	PublicCodexPlanTier,
 	PublicCodexQuotaOverview,
 } from "../../lib/api/types";
+import { CODEX_TIER_STROKES, getCodexTierLabel } from "../../lib/codex-tiers";
 import { relativeTime } from "../../lib/relative-time";
-
-export const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
-	free: "gray",
-	plus: "blue",
-	team: "cyan",
-	prolite: "violet",
-	pro: "green",
-	other: "dark",
-};
-
-export const CODEX_TIER_STROKES: Record<CodexPlanTier, string> = {
-	free: "var(--mantine-color-gray-6)",
-	plus: "var(--mantine-color-blue-6)",
-	team: "var(--mantine-color-cyan-6)",
-	prolite: "var(--mantine-color-violet-6)",
-	pro: "var(--mantine-color-green-6)",
-	other: "var(--mantine-color-dark-4)",
-};
 
 type PublicTrend = PublicCodexQuotaOverview["trend"];
 type TrendLike = CodexUsageForecast | PublicTrend;
@@ -48,15 +31,6 @@ type ConsumptionProjection = {
 	consumptionRatePerMs: number;
 	endTime: number;
 };
-
-export function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
-	if (tier === "free") return t("codexQuotaTierFree");
-	if (tier === "plus") return t("codexQuotaTierPlus");
-	if (tier === "team") return t("codexQuotaTierTeam");
-	if (tier === "prolite") return t("codexQuotaTierProLite");
-	if (tier === "pro") return t("codexQuotaTierPro");
-	return t("codexQuotaTierOther");
-}
 
 export function formatAccountEquivalent(value: number): string {
 	return new Intl.NumberFormat(undefined, {

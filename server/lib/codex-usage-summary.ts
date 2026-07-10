@@ -1,16 +1,24 @@
 import type { CodexUsageResult } from "./codex-usage";
 
-export type CodexPlanTier = "free" | "plus" | "team" | "prolite" | "pro" | "other";
+export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 
 export const CODEX_PLAN_TIERS: CodexPlanTier[] = [
 	"free",
 	"plus",
 	"team",
+	"k12",
 	"prolite",
 	"pro",
 	"other",
 ];
-export const CODEX_DISPLAY_PLAN_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
+export const CODEX_DISPLAY_PLAN_TIERS: CodexPlanTier[] = [
+	"free",
+	"plus",
+	"team",
+	"k12",
+	"prolite",
+	"pro",
+];
 export const CODEX_USAGE_FORECAST_HISTORY_MS = 60 * 60_000;
 
 export interface CodexUsageHistoryEntry {
@@ -92,6 +100,7 @@ function emptyTierValues(): Record<CodexPlanTier, number> {
 		free: 0,
 		plus: 0,
 		team: 0,
+		k12: 0,
 		prolite: 0,
 		pro: 0,
 		other: 0,
@@ -184,6 +193,7 @@ export function normalizeCodexPlanTier(planType?: string | null): CodexPlanTier 
 	if (!planType) return "other";
 	const normalized = planType.toLowerCase().replace(/[^a-z0-9]/g, "");
 	if (!normalized) return "other";
+	if (normalized === "k12") return "k12";
 	if (normalized.includes("prolite") || normalized.includes("litepro")) return "prolite";
 	if (normalized.includes("plus")) return "plus";
 	if (normalized.includes("team") || normalized.includes("business")) return "team";

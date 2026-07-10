@@ -56,8 +56,15 @@ export type LoadBalancingMode = "priority" | "balanced" | "tier-balanced";
 const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = ["too_many_failures", "banned"];
 const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
 
-export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
-const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free", "other"];
+export const DEFAULT_CODEX_TIER_ORDER: CodexPlanTier[] = [
+	"pro",
+	"prolite",
+	"plus",
+	"team",
+	"k12",
+	"free",
+];
+const ALL_CODEX_TIER_ORDER: CodexPlanTier[] = [...DEFAULT_CODEX_TIER_ORDER, "other"];
 
 export function normalizeCodexTierOrder(order?: readonly string[] | null): CodexPlanTier[] {
 	const validTiers = new Set<CodexPlanTier>(ALL_CODEX_TIER_ORDER);

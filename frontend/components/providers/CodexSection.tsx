@@ -58,6 +58,15 @@ import type {
 	CodexUsageSummary,
 	CodexUsageTierStats,
 } from "../../lib/api/types";
+import {
+	CODEX_DEFAULT_TIER_ORDER,
+	CODEX_DISPLAY_TIERS,
+	CODEX_TIER_COLORS,
+	CODEX_TIER_ORDER_VALUES,
+	getCodexPlanTypeLabel,
+	getCodexTierLabel,
+	normalizeCodexPlanTier,
+} from "../../lib/codex-tiers";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -91,24 +100,6 @@ interface CodexImportCredential {
 const CODEX_STATUS_GC_TIME_MS = 60_000;
 const REFRESH_TOKEN_PATTERN = /^rt_[A-Za-z0-9._-]+$/;
 const REFRESH_TOKEN_SEARCH_PATTERN = /rt_[A-Za-z0-9._-]+/g;
-const CODEX_DISPLAY_TIERS: CodexPlanTier[] = ["free", "plus", "team", "prolite", "pro"];
-const CODEX_TIER_ORDER_VALUES: CodexPlanTier[] = [
-	"pro",
-	"prolite",
-	"plus",
-	"team",
-	"free",
-	"other",
-];
-const CODEX_DEFAULT_TIER_ORDER: CodexPlanTier[] = ["pro", "prolite", "plus", "team", "free"];
-const CODEX_TIER_COLORS: Record<CodexPlanTier, string> = {
-	free: "gray",
-	plus: "blue",
-	team: "cyan",
-	prolite: "violet",
-	pro: "green",
-	other: "dark",
-};
 function getDisplayTierOrder(order?: CodexPlanTier[]): CodexPlanTier[] {
 	const result: CodexPlanTier[] = [];
 	for (const tier of order ?? CODEX_DEFAULT_TIER_ORDER) {
@@ -1492,15 +1483,6 @@ export const CodexSection = React.memo(function CodexSection({
 	);
 });
 
-function getCodexTierLabel(t: (key: string) => string, tier: CodexPlanTier): string {
-	if (tier === "free") return t("codexQuotaTierFree");
-	if (tier === "plus") return t("codexQuotaTierPlus");
-	if (tier === "team") return t("codexQuotaTierTeam");
-	if (tier === "prolite") return t("codexQuotaTierProLite");
-	if (tier === "pro") return t("codexQuotaTierPro");
-	return t("codexQuotaTierOther");
-}
-
 function getEmptyCodexUsageTierStats(tier: CodexPlanTier): CodexUsageTierStats {
 	return {
 		tier,
@@ -2386,6 +2368,7 @@ function UsageDisplay({
 
 	const primaryWindow = usage.primary_window;
 	const secondaryWindow = usage.secondary_window;
+	const planTier = normalizeCodexPlanTier(usage.plan_type);
 
 	const formatResetTime = (resetAt: number) => {
 		const date = new Date(resetAt * 1000);
@@ -2410,8 +2393,8 @@ function UsageDisplay({
 	return (
 		<Stack gap={4}>
 			<Group gap={4}>
-				<Badge size="xs" variant="light" color="blue">
-					{usage.plan_type}
+				<Badge size="xs" variant="light" color={CODEX_TIER_COLORS[planTier]}>
+					{getCodexPlanTypeLabel(t, usage.plan_type)}
 				</Badge>
 			</Group>
 

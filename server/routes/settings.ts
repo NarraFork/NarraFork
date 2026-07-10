@@ -38,6 +38,7 @@ import {
 } from "../lib/settings";
 import {
 	blacklistDirEntrySchema,
+	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
 	whitelistDirEntrySchema,
@@ -426,10 +427,7 @@ const updateSettingsSchema = z
 			.object({
 				proxy: proxyOverrideSchema,
 				loadBalancingMode: z.enum(["priority", "balanced", "tier-balanced"]).optional(),
-				tierOrder: z
-					.array(z.enum(["free", "plus", "team", "prolite", "pro", "other"]))
-					.max(6)
-					.optional(),
+				tierOrder: codexTierOrderSchema.shape.tierOrder.optional(),
 				defaultReasoningEffort: z
 					.enum(["none", "low", "medium", "high", "xhigh", "max"])
 					.nullable()
