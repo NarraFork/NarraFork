@@ -216,23 +216,25 @@ export function resolveAggregation(aggId: string, stickyProvider?: string): stri
 	const candidates = agg.models.filter((model) => !isModelProviderDisabled(model));
 	if (candidates.length === 0) return null;
 
-	// If sticky provider matches an enabled member, prefer it
-	if (stickyProvider) {
-		const stickyMatch = candidates.find((m) => {
-			const parsed = parseModelId(m);
-			return parsed.provider === stickyProvider;
-		});
-		if (stickyMatch) return stickyMatch;
-	}
-
 	if (agg.routingMode === "balanced") {
+		// Balanced: the member order sets the round-robin starting sequence, and the
+		// sticky provider keeps a given session pinned to the member it landed on so
+		// its cache/context stays warm across turns.
+		if (stickyProvider) {
+			const stickyMatch = candidates.find((m) => parseModelId(m).provider === stickyProvider);
+			if (stickyMatch) return stickyMatch;
+		}
 		const idx = aggRoundRobin.get(aggId) ?? 0;
 		const model = candidates[idx % candidates.length];
 		aggRoundRobin.set(aggId, idx + 1);
 		return model;
 	}
 
-	// Priority mode: return first enabled member
+	// Priority mode: always honor the configured order and return the first enabled
+	// member. Intentionally ignores stickyProvider so the "topmost model is tried
+	// first" contract holds — reordering members (or re-enabling a higher-priority
+	// one) takes effect on the next request instead of being pinned to whatever the
+	// session happened to use last.
 	return candidates[0];
 }
 
