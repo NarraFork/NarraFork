@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexManager } from "../codex-manager";
-import { isUnauthorizedCodexUsageError } from "../codex-usage";
+import { type CodexUsageResult, isUnauthorizedCodexUsageError } from "../codex-usage";
 
 function createManagerWithOneCredential(
 	id: string,
@@ -35,6 +35,52 @@ function createManagerWithOneCredential(
 
 function createUsageResponse(primaryUsedPercent: number, resetAtSec: number): Response {
 	return createUsageResponseWithWeekly(primaryUsedPercent, resetAtSec);
+}
+
+function createMonthlyUsageResponse(
+	usedPercent: number,
+	resetAtSec: number,
+	additionalUsedPercent?: number,
+): Response {
+	return new Response(
+		JSON.stringify({
+			plan_type: "team",
+			rate_limit: {
+				allowed: usedPercent < 100,
+				limit_reached: usedPercent >= 100,
+				primary_window: {
+					used_percent: usedPercent,
+					limit_window_seconds: 30 * 24 * 60 * 60,
+					reset_after_seconds: Math.max(resetAtSec - Math.floor(Date.now() / 1000), 0),
+					reset_at: resetAtSec,
+				},
+				secondary_window: null,
+			},
+			code_review_rate_limit: {
+				allowed: true,
+				limit_reached: false,
+				primary_window: null,
+				secondary_window: null,
+			},
+			additional_rate_limits:
+				additionalUsedPercent === undefined
+					? []
+					: [
+							{
+								allowed: additionalUsedPercent < 100,
+								limit_reached: additionalUsedPercent >= 100,
+								primary_window: {
+									used_percent: additionalUsedPercent,
+									limit_window_seconds: 18_000,
+									reset_after_seconds: 3_600,
+									reset_at: Math.floor(Date.now() / 1000) + 3_600,
+								},
+								secondary_window: null,
+							},
+						],
+		}),
+		{ status: 200, headers: { "Content-Type": "application/json" } },
+	);
 }
 
 function createJwt(payload: Record<string, unknown>): string {
@@ -557,6 +603,22 @@ describe("CodexManager usage quota state", () => {
 		expect(entry?.quotaResetsAt).toBeUndefined();
 	});
 
+	test("quota 错误后 usage 已恢复时保持账号 enabled", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-quota-recovered");
+		tempHomes.push(tmpHome);
+		const resetAtSec = Math.floor(Date.now() / 1000) + 3_600;
+		globalThis.fetch = (async () => createUsageResponse(55, resetAtSec)) as unknown as typeof fetch;
+
+		const hasMore = await manager.reportQuotaExhaustedAndRefreshUsage("cred-quota-recovered");
+		const entry = manager.snapshot().entries.find((item) => item.id === "cred-quota-recovered");
+
+		expect(hasMore).toBe(true);
+		expect(entry?.usage?.primary_window?.remaining_percent).toBe(45);
+		expect(entry?.disabled).toBe(false);
+		expect(entry?.disabledReason).toBeUndefined();
+		expect(entry?.quotaResetsAt).toBeUndefined();
+	});
+
 	test("quota 错误后刷新 usage 以记录周限恢复时间", async () => {
 		const { manager, tmpHome } = createManagerWithOneCredential("cred-quota-error");
 		tempHomes.push(tmpHome);
@@ -630,5 +692,178 @@ describe("CodexManager usage quota state", () => {
 		expect(exhausted?.disabled).toBe(true);
 		expect(exhausted?.disabledReason).toBe("quota_exhausted");
 		expect(exhausted?.quotaResetsAt).toBe(weeklyResetAt * 1000);
+	});
+
+	test("月限耗尽会禁用账号并使用月 reset 恢复时间", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-monthly-exhausted");
+		tempHomes.push(tmpHome);
+		const resetAtSec = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+		globalThis.fetch = (async () =>
+			createMonthlyUsageResponse(100, resetAtSec)) as unknown as typeof fetch;
+
+		await manager.getUsage("cred-monthly-exhausted");
+		const snapshot = manager.snapshot();
+		const entry = snapshot.entries.find((item) => item.id === "cred-monthly-exhausted");
+
+		expect(entry?.usage?.primary_window?.window_type).toBe("monthly");
+		expect(entry?.disabledReason).toBe("quota_exhausted");
+		expect(entry?.quotaResetsAt).toBe(resetAtSec * 1000);
+		expect(snapshot.usageScheduler.nextRunAt).toBe(resetAtSec * 1000);
+	});
+
+	test("additional_rate_limits 耗尽不会禁用主账号", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-additional");
+		tempHomes.push(tmpHome);
+		const resetAtSec = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+		globalThis.fetch = (async () =>
+			createMonthlyUsageResponse(45, resetAtSec, 100)) as unknown as typeof fetch;
+
+		await manager.getUsage("cred-additional");
+		const entry = manager.snapshot().entries.find((item) => item.id === "cred-additional");
+
+		expect(entry?.disabled).toBe(false);
+		expect(entry?.usage?.primary_window?.remaining_percent).toBe(55);
+		expect(manager.getPublicQuotaOverview().totalRemainingAccountEquivalents).toBe(0.55);
+	});
+
+	test("monthly-only 已使用账号保留真实月级 nextRunAt", () => {
+		const now = Date.now();
+		const monthlyResetAt = now + 30 * 24 * 60 * 60_000;
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-monthly-scheduled", {
+			usage: {
+				plan_type: "team",
+				primary_window: {
+					used_percent: 45,
+					remaining_percent: 55,
+					reset_at: monthlyResetAt / 1000,
+					reset_after_seconds: 30 * 24 * 60 * 60,
+					limit_window_seconds: 30 * 24 * 60 * 60,
+					window_type: "monthly",
+				},
+				queriedAt: new Date(now).toISOString(),
+			},
+		});
+		tempHomes.push(tmpHome);
+
+		const originalSetTimeout = globalThis.setTimeout;
+		const originalClearTimeout = globalThis.clearTimeout;
+		const scheduledTimers: Array<{ callback: () => void; delay: number }> = [];
+		globalThis.setTimeout = ((callback: unknown, delay?: number) => {
+			scheduledTimers.push({ callback: callback as () => void, delay: delay ?? 0 });
+			return { unref: () => {} };
+		}) as unknown as typeof setTimeout;
+		globalThis.clearTimeout = (() => {}) as typeof clearTimeout;
+		try {
+			manager.startUsageRefreshScheduler();
+			const scheduler = manager.snapshot().usageScheduler;
+			const longTimer = scheduledTimers.find((timer) => timer.delay === 2_147_483_647);
+
+			expect(scheduler.nextRunAt).toBe(monthlyResetAt);
+			expect(scheduler.dueCredentialCount).toBe(0);
+			expect(longTimer).toBeDefined();
+			longTimer?.callback();
+			expect(manager.snapshot().usageScheduler.nextRunAt).toBe(monthlyResetAt);
+			expect(manager.snapshot().usageScheduler.dueCredentialCount).toBe(0);
+		} finally {
+			manager.stopUsageRefreshScheduler();
+			globalThis.setTimeout = originalSetTimeout;
+			globalThis.clearTimeout = originalClearTimeout;
+		}
+	});
+
+	test("本次 quota 错误无 reset 时清除旧 reset 并在刷新失败后短期 retry", async () => {
+		const now = Date.now();
+		const oldQuotaResetsAt = now + 24 * 60 * 60_000;
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-stale-reset", {
+			quotaResetsAt: oldQuotaResetsAt,
+		});
+		tempHomes.push(tmpHome);
+		globalThis.fetch = (async () =>
+			new Response("failed", { status: 500 })) as unknown as typeof fetch;
+
+		await manager.reportQuotaExhaustedAndRefreshUsage("cred-stale-reset");
+		const snapshot = manager.snapshot();
+		const entry = snapshot.entries.find((item) => item.id === "cred-stale-reset");
+
+		expect(entry?.disabledReason).toBe("quota_exhausted");
+		expect(entry?.quotaResetsAt).toBeUndefined();
+		expect(snapshot.usageScheduler.nextRunAt).toBeGreaterThanOrEqual(now + 4 * 60_000);
+		expect(snapshot.usageScheduler.nextRunAt).toBeLessThanOrEqual(Date.now() + 6 * 60_000);
+		expect(snapshot.usageScheduler.nextRunAt).not.toBe(oldQuotaResetsAt);
+	});
+
+	test("quota 错误刷新失败且无 reset 时安排短期 retry", async () => {
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-no-reset");
+		tempHomes.push(tmpHome);
+		globalThis.fetch = (async () =>
+			new Response("failed", { status: 500 })) as unknown as typeof fetch;
+		const before = Date.now();
+
+		await manager.reportQuotaExhaustedAndRefreshUsage("cred-no-reset");
+		const entry = manager.snapshot().entries.find((item) => item.id === "cred-no-reset");
+		const nextRunAt = manager.snapshot().usageScheduler.nextRunAt;
+
+		expect(entry?.disabledReason).toBe("quota_exhausted");
+		expect(entry?.quotaResetsAt).toBeUndefined();
+		expect(nextRunAt).toBeGreaterThanOrEqual(before + 4 * 60_000);
+		expect(nextRunAt).toBeLessThanOrEqual(Date.now() + 6 * 60_000);
+	});
+
+	test("staleness considers a secondary monthly reset", async () => {
+		const now = Date.now();
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-secondary-monthly", {
+			usage: {
+				plan_type: "team",
+				secondary_window: {
+					used_percent: 45,
+					remaining_percent: 55,
+					reset_at: (now - 1_000) / 1000,
+					reset_after_seconds: 0,
+					limit_window_seconds: 30 * 24 * 60 * 60,
+					window_type: "monthly",
+				},
+				queriedAt: new Date(now).toISOString(),
+			},
+		});
+		tempHomes.push(tmpHome);
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls++;
+			return createMonthlyUsageResponse(40, Math.floor(now / 1000) + 30 * 24 * 60 * 60);
+		}) as unknown as typeof fetch;
+
+		await manager.refreshUsageOnUseIfNeeded("cred-secondary-monthly");
+
+		expect(fetchCalls).toBe(1);
+	});
+
+	test("malformed usage payload does not overwrite a compatible legacy cache", async () => {
+		const now = Date.now();
+		const legacyUsage: CodexUsageResult = {
+			plan_type: "team",
+			primary_window: {
+				used_percent: 45,
+				remaining_percent: 55,
+				reset_at: Math.floor((now + 60_000) / 1000),
+				reset_after_seconds: 60,
+				window_type: "unknown",
+			},
+			queriedAt: new Date(now).toISOString(),
+		};
+		const { manager, tmpHome } = createManagerWithOneCredential("cred-malformed", {
+			usage: legacyUsage,
+		});
+		tempHomes.push(tmpHome);
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ plan_type: "team", rate_limit: null }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+
+		await expect(manager.getUsage("cred-malformed")).rejects.toThrow("account rate_limit");
+
+		expect(manager.snapshot().entries.find((item) => item.id === "cred-malformed")?.usage).toEqual(
+			legacyUsage,
+		);
 	});
 });

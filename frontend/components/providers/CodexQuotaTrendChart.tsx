@@ -40,8 +40,9 @@ export function formatAccountEquivalent(value: number): string {
 }
 
 export function formatResetTimestamp(timestamp?: number | null): string {
-	if (!timestamp) return "-";
-	return relativeTime(new Date(timestamp).toISOString());
+	if (!timestamp || !Number.isFinite(timestamp) || timestamp <= 0) return "-";
+	const date = new Date(timestamp);
+	return Number.isFinite(date.getTime()) ? relativeTime(date.toISOString()) : "-";
 }
 
 function formatChartTimestamp(timestamp: number): string {
@@ -92,7 +93,7 @@ function buildTrendGridLines({
 	return lines;
 }
 
-function formatQuotaTrendDuration(
+export function formatQuotaTrendDuration(
 	timestamp: number,
 	t: (key: string, values?: Record<string, number | string>) => string,
 	referenceTime = Date.now(),
@@ -101,14 +102,21 @@ function formatQuotaTrendDuration(
 	if (Math.abs(diffMinutes) < 1) return t("codexQuotaTrendNow");
 
 	const absMinutes = Math.abs(diffMinutes);
-	const hours = Math.floor(absMinutes / 60);
+	const days = Math.floor(absMinutes / 1440);
+	const hours = Math.floor((absMinutes % 1440) / 60);
 	const minutes = absMinutes % 60;
-	const duration =
+	const hoursMinutes =
 		hours > 0 && minutes > 0
 			? t("codexQuotaTrendHoursMinutes", { hours, minutes })
 			: hours > 0
 				? t("codexQuotaTrendHoursOnly", { hours })
-				: t("codexQuotaTrendMinutesOnly", { minutes });
+				: minutes > 0
+					? t("codexQuotaTrendMinutesOnly", { minutes })
+					: "";
+	const duration =
+		days > 0
+			? [t("codexQuotaTrendDaysOnly", { days }), hoursMinutes].filter(Boolean).join(" ")
+			: hoursMinutes;
 
 	return diffMinutes > 0
 		? t("codexQuotaTrendInDuration", { duration })
@@ -120,9 +128,9 @@ function getTrendTiers(trend: TrendLike): CodexPlanTier[] {
 	return trend.types;
 }
 
-function getPointValue(point: TrendPointLike, tier: CodexPlanTier): number {
-	if ("byTier" in point) return point.byTier[tier] ?? 0;
-	return point.byType[tier as PublicCodexPlanTier] ?? 0;
+function getPointValue(point: TrendPointLike, tier: CodexPlanTier): number | null {
+	const value = "byTier" in point ? point.byTier[tier] : point.byType[tier as PublicCodexPlanTier];
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function getTrendGeneratedAt(trend: TrendLike): number {
@@ -213,20 +221,26 @@ export function CodexQuotaTrendChart({
 	const availableTiers = getTrendTiers(trend);
 	const tiers = selectedTiers ?? availableTiers;
 	const visibleTiers = tiers.filter(
-		(tier) => tier !== "other" && availableTiers.includes(tier),
+		(tier) =>
+			tier !== "other" &&
+			availableTiers.includes(tier) &&
+			points.some((point) => getPointValue(point, tier) !== null),
 	) as CodexPlanTier[];
-	const maxValue = Math.max(
-		1,
-		...points.flatMap((point) => visibleTiers.map((tier) => getPointValue(point, tier))),
+	const finiteValues = points.flatMap((point) =>
+		visibleTiers.flatMap((tier) => {
+			const value = getPointValue(point, tier);
+			return value === null ? [] : [value];
+		}),
 	);
+	const maxValue = Math.max(1, ...finiteValues);
 	const firstPointTime = points[0]?.timestamp ?? trendNow;
 	const lastPointTime = points[points.length - 1]?.timestamp ?? trendNow;
 	const minTime = Math.min(firstPointTime, trendNow);
 	const preliminaryMaxTime = Math.max(lastPointTime, trendNow);
 	const hasChartData = points.length >= 2;
-	const getTrendValueAt = (timestamp: number, tier: CodexPlanTier) => {
+	const getTrendValueAt = (timestamp: number, tier: CodexPlanTier): number | null => {
 		const firstPoint = points[0];
-		if (!firstPoint) return 0;
+		if (!firstPoint) return null;
 		if (timestamp <= firstPoint.timestamp) return getPointValue(firstPoint, tier);
 
 		if (timestamp > trendNow) {
@@ -248,6 +262,7 @@ export function CodexQuotaTrendChart({
 
 			const previousValue = getPointValue(previousPoint, tier);
 			const currentValue = getPointValue(currentPoint, tier);
+			if (previousValue === null || currentValue === null) return null;
 			const duration = currentPoint.timestamp - previousPoint.timestamp;
 			if (duration <= 0) return currentValue;
 			const ratio = (timestamp - previousPoint.timestamp) / duration;
@@ -268,7 +283,9 @@ export function CodexQuotaTrendChart({
 				.filter((point) => point.timestamp > projectionReferenceTime && point.timestamp < trendNow)
 				.map((point) => ({ timestamp: point.timestamp, value: getPointValue(point, tier) })),
 			{ timestamp: trendNow, value: getTrendValueAt(trendNow, tier) },
-		].sort((a, b) => a.timestamp - b.timestamp);
+		]
+			.filter((sample): sample is { timestamp: number; value: number } => sample.value !== null)
+			.sort((a, b) => a.timestamp - b.timestamp);
 
 		let consumedValue = 0;
 		for (let index = 1; index < samples.length; index++) {
@@ -282,7 +299,7 @@ export function CodexQuotaTrendChart({
 
 		const startValue = getTrendValueAt(trendNow, tier);
 		const consumedValue = getConsumedValueInProjectionWindow(tier);
-		if (startValue <= 0 || consumedValue <= 0.001) return [];
+		if (startValue === null || startValue <= 0 || consumedValue <= 0.001) return [];
 
 		return [
 			{
@@ -378,35 +395,58 @@ export function CodexQuotaTrendChart({
 		if (localX <= nearWidth) return minTime + (localX / nearWidth) * nearDuration;
 		return nearEndTime + ((localX - nearWidth) / compressedWidth) * compressedDuration;
 	};
-	const buildHybridPath = (tier: CodexPlanTier) => {
-		const firstPoint = points[0];
-		if (!firstPoint) return "";
-		let path = `M ${xFor(firstPoint.timestamp)} ${yFor(getPointValue(firstPoint, tier))}`;
-		for (let index = 1; index < points.length; index++) {
-			const previousPoint = points[index - 1];
-			const point = points[index];
-			const currentValue = getPointValue(point, tier);
+	const buildHybridPaths = (tier: CodexPlanTier): string[] => {
+		const paths: string[] = [];
+		let path = "";
+		let previousPoint: TrendPointLike | null = null;
+		const flushPath = () => {
+			if (path) paths.push(path);
+			path = "";
+		};
 
-			if (point.timestamp <= trendNow) {
-				path += ` L ${xFor(point.timestamp)} ${yFor(currentValue)}`;
+		for (const point of points) {
+			const currentValue = getPointValue(point, tier);
+			if (currentValue === null) {
+				flushPath();
+				previousPoint = null;
 				continue;
 			}
 
-			if (previousPoint.timestamp < trendNow) {
+			if (!path) {
+				path = `M ${xFor(point.timestamp)} ${yFor(currentValue)}`;
+				previousPoint = point;
+				continue;
+			}
+
+			if (point.timestamp <= trendNow) {
+				path += ` L ${xFor(point.timestamp)} ${yFor(currentValue)}`;
+				previousPoint = point;
+				continue;
+			}
+
+			if (previousPoint && previousPoint.timestamp < trendNow) {
 				const nowValue = getTrendValueAt(trendNow, tier);
+				if (nowValue === null) {
+					flushPath();
+					path = `M ${xFor(point.timestamp)} ${yFor(currentValue)}`;
+					previousPoint = point;
+					continue;
+				}
 				path += ` L ${xFor(trendNow)} ${yFor(nowValue)}`;
 			}
 
 			path += ` H ${xFor(point.timestamp)} V ${yFor(currentValue)}`;
+			previousPoint = point;
 		}
-		return path;
+		flushPath();
+		return paths;
 	};
 	const buildConsumptionProjectionPath = (projection: ConsumptionProjection) => {
 		const { tier, consumptionRatePerMs, endTime } = projection;
 		const projectedValue = (timestamp: number, baseValue: number, baseTimestamp: number) =>
 			Math.max(0, baseValue - consumptionRatePerMs * Math.max(0, timestamp - baseTimestamp));
 		let segmentBaseTimestamp = trendNow;
-		let baselineValueBeforeNextReset = getTrendValueAt(trendNow, tier);
+		let baselineValueBeforeNextReset = getTrendValueAt(trendNow, tier) ?? 0;
 		let projectedSegmentBaseValue = baselineValueBeforeNextReset;
 		let currentTimestamp = trendNow;
 		let currentProjectedValue = projectedValue(
@@ -448,6 +488,7 @@ export function CodexQuotaTrendChart({
 			// Future forecast points are quota reset steps. The consumption projection should add
 			// only the reset delta, not jump back to the no-consumption forecast value.
 			const baselineValueAfterReset = getPointValue(point, tier);
+			if (baselineValueAfterReset === null) continue;
 			const resetDelta = baselineValueAfterReset - baselineValueBeforeNextReset;
 			currentProjectedValue = Math.max(0, currentProjectedValue + resetDelta);
 			path += ` V ${yFor(currentProjectedValue)}`;
@@ -565,17 +606,20 @@ export function CodexQuotaTrendChart({
 					{renderTimeTick(minTime, padding.left, "middle")}
 					{showCompressedBoundaryTick && renderTimeTick(nearEndTime, compressedBoundaryX, "middle")}
 					{renderTimeTick(maxTime, padding.left + chartWidth, "end")}
-					{visibleTiers.map((tier) => (
-						<path
-							key={tier}
-							d={buildHybridPath(tier)}
-							fill="none"
-							stroke={CODEX_TIER_STROKES[tier]}
-							strokeWidth={2}
-							strokeLinejoin="round"
-							strokeLinecap="round"
-						/>
-					))}
+					{visibleTiers.flatMap((tier) =>
+						buildHybridPaths(tier).map((path) => (
+							<path
+								key={`${tier}-${path}`}
+								data-tier={tier}
+								d={path}
+								fill="none"
+								stroke={CODEX_TIER_STROKES[tier]}
+								strokeWidth={2}
+								strokeLinejoin="round"
+								strokeLinecap="round"
+							/>
+						)),
+					)}
 					{consumptionProjections.map((projection) => (
 						<path
 							key={`${projection.tier}-consumption-projection`}
@@ -649,17 +693,22 @@ export function CodexQuotaTrendChart({
 								strokeWidth={1.5}
 								strokeDasharray="4 3"
 							/>
-							{visibleTiers.map((tier) => (
-								<circle
-									key={tier}
-									cx={hoveredCursor.x}
-									cy={yFor(getTrendValueAt(hoveredCursor.timestamp, tier))}
-									r={4}
-									fill="var(--mantine-color-body)"
-									stroke={CODEX_TIER_STROKES[tier]}
-									strokeWidth={2}
-								/>
-							))}
+							{visibleTiers.flatMap((tier) => {
+								const value = getTrendValueAt(hoveredCursor.timestamp, tier);
+								return value === null
+									? []
+									: [
+											<circle
+												key={tier}
+												cx={hoveredCursor.x}
+												cy={yFor(value)}
+												r={4}
+												fill="var(--mantine-color-body)"
+												stroke={CODEX_TIER_STROKES[tier]}
+												strokeWidth={2}
+											/>,
+										];
+							})}
 						</>
 					) : null}
 				</svg>
@@ -672,7 +721,8 @@ export function CodexQuotaTrendChart({
 							position: "absolute",
 							left: hoveredCursor.overlayX,
 							top: 8,
-							minWidth: compact ? 240 : 210,
+							width: compact ? "min(240px, calc(100vw - 24px))" : 210,
+							maxWidth: "calc(100vw - 24px)",
 							pointerEvents: "none",
 							transform: hoveredCursor.alignRight ? "translateX(-100%)" : "translateX(8px)",
 							zIndex: 2,
@@ -687,26 +737,31 @@ export function CodexQuotaTrendChart({
 								{formatQuotaTrendDuration(hoveredCursor.timestamp, t, trendNow)}
 							</Text>
 
-							{visibleTiers.map((tier) => (
-								<Group key={tier} justify="space-between" gap="sm" wrap="nowrap">
-									<Group gap={5} wrap="nowrap">
-										<span
-											style={{
-												width: tooltipMarkerSize,
-												height: tooltipMarkerSize,
-												borderRadius: 999,
-												background: CODEX_TIER_STROKES[tier],
-												display: "inline-block",
-												flexShrink: 0,
-											}}
-										/>
-										<Text size={tooltipTextSize}>{getCodexTierLabel(t, tier)}</Text>
-									</Group>
-									<Text size={tooltipTextSize} fw={600}>
-										{formatAccountEquivalent(getTrendValueAt(hoveredCursor.timestamp, tier))}
-									</Text>
-								</Group>
-							))}
+							{visibleTiers.flatMap((tier) => {
+								const value = getTrendValueAt(hoveredCursor.timestamp, tier);
+								return value === null
+									? []
+									: [
+											<Group key={tier} justify="space-between" gap="sm" wrap="nowrap">
+												<Group gap={5} wrap="nowrap">
+													<span
+														style={{
+															width: tooltipMarkerSize,
+															height: tooltipMarkerSize,
+															borderRadius: 999,
+															background: CODEX_TIER_STROKES[tier],
+															display: "inline-block",
+															flexShrink: 0,
+														}}
+													/>
+													<Text size={tooltipTextSize}>{getCodexTierLabel(t, tier)}</Text>
+												</Group>
+												<Text size={tooltipTextSize} fw={600}>
+													{formatAccountEquivalent(value)}
+												</Text>
+											</Group>,
+										];
+							})}
 						</Stack>
 					</Paper>
 				) : null}

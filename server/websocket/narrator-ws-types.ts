@@ -5,7 +5,19 @@
  */
 
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
+import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
+
+export interface CodexQuotaOverviewWsMessage extends Record<string, unknown> {
+	type: "codex_quota_overview_updated";
+	overview: PublicCodexQuotaOverview;
+}
+
+export function createCodexQuotaOverviewWsMessage(
+	overview: PublicCodexQuotaOverview,
+): CodexQuotaOverviewWsMessage {
+	return { type: "codex_quota_overview_updated", overview };
+}
 
 // Server → Client messages
 export type NarratorServerMessage =

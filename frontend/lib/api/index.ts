@@ -122,6 +122,7 @@ export type {
 	CodexCredentialEntry,
 	CodexUsageData,
 	CodexUsageWindow,
+	CodexUsageWindowType,
 	ContentBlock,
 	CustomSubagentData,
 	DatabaseCleanupApiRequestSample,

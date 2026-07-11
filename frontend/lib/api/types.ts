@@ -537,6 +537,7 @@ export interface MessageLocationResult {
 export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 export type PublicCodexPlanTier = Exclude<CodexPlanTier, "other">;
 export type CodexLoadBalancingMode = "priority" | "balanced" | "tier-balanced";
+export type CodexUsageWindowType = "5h" | "weekly" | "monthly" | "unknown";
 
 export interface PublicCodexQuotaSegment {
 	type: PublicCodexPlanTier;
@@ -544,6 +545,9 @@ export interface PublicCodexQuotaSegment {
 	totalAccountEquivalents: number;
 	averageRemainingPercent: number | null;
 	nextResetAt: number | null;
+	trackedAccountCount?: number;
+	modeledAccountCount?: number;
+	unmodeledAccountCount?: number;
 }
 
 export interface PublicCodexQuotaTrendPoint {
@@ -556,6 +560,9 @@ export interface PublicCodexQuotaOverview {
 	unit: "account_equivalent";
 	totalRemainingAccountEquivalents: number;
 	totalAccountEquivalents: number;
+	trackedAccountCount?: number;
+	modeledAccountCount?: number;
+	unmodeledAccountCount?: number;
 	segments: PublicCodexQuotaSegment[];
 	trend: {
 		generatedAt: string;
@@ -572,7 +579,8 @@ export interface CodexUsageWindow {
 	remaining_percent: number;
 	reset_at: number;
 	reset_after_seconds: number;
-	window_type: "5h" | "weekly" | "unknown";
+	limit_window_seconds?: number;
+	window_type: CodexUsageWindowType;
 }
 
 export interface CodexUsageData {
@@ -607,6 +615,8 @@ export interface CodexUsageTierStats {
 	tier: CodexPlanTier;
 	accountCount: number;
 	knownUsageCount: number;
+	modeledUsageCount?: number;
+	unmodeledUsageCount?: number;
 	zeroUsageCount: number;
 	scheduledAccountCount: number;
 	remainingAccountEquivalents: number;
@@ -618,6 +628,8 @@ export interface CodexUsageSummary {
 	generatedAt: string;
 	totalTrackedAccounts: number;
 	totalKnownUsageAccounts: number;
+	totalModeledUsageAccounts?: number;
+	totalUnmodeledUsageAccounts?: number;
 	missingUsageAccounts: number;
 	zeroUsageAccounts: number;
 	scheduledAccountCount: number;
@@ -627,7 +639,7 @@ export interface CodexUsageSummary {
 
 export interface CodexUsageForecastPoint {
 	timestamp: number;
-	byTier: Record<CodexPlanTier, number>;
+	byTier: Partial<Record<CodexPlanTier, number>>;
 }
 
 export interface CodexUsageForecast {

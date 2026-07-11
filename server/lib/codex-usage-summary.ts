@@ -1,4 +1,4 @@
-import type { CodexUsageResult } from "./codex-usage";
+import { type CodexUsageResult, type CodexUsageWindow, getCodexUsageWindows } from "./codex-usage";
 
 export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";
 
@@ -39,6 +39,8 @@ export interface CodexUsageTierStats {
 	tier: CodexPlanTier;
 	accountCount: number;
 	knownUsageCount: number;
+	modeledUsageCount: number;
+	unmodeledUsageCount: number;
 	zeroUsageCount: number;
 	scheduledAccountCount: number;
 	remainingAccountEquivalents: number;
@@ -50,6 +52,8 @@ export interface CodexUsageSummary {
 	generatedAt: string;
 	totalTrackedAccounts: number;
 	totalKnownUsageAccounts: number;
+	totalModeledUsageAccounts: number;
+	totalUnmodeledUsageAccounts: number;
 	missingUsageAccounts: number;
 	zeroUsageAccounts: number;
 	scheduledAccountCount: number;
@@ -59,7 +63,7 @@ export interface CodexUsageSummary {
 
 export interface CodexUsageForecastPoint {
 	timestamp: number;
-	byTier: Record<CodexPlanTier, number>;
+	byTier: Partial<Record<CodexPlanTier, number>>;
 }
 
 export interface CodexUsageForecast {
@@ -69,18 +73,35 @@ export interface CodexUsageForecast {
 	unit: "account_equivalent";
 }
 
-type UsageWindow = NonNullable<CodexUsageResult["primary_window"]>;
+type UsageWindow = CodexUsageWindow;
 
 interface MutableForecastWindow {
 	usedPercent: number;
 	remainingPercent: number;
 	resetAt: number;
+	windowType: UsageWindow["window_type"];
+	limitWindowSeconds?: number;
 }
 
 interface ForecastAccountState {
 	tier: CodexPlanTier;
-	quotaWindow: MutableForecastWindow;
-	blockingWeeklyWindow?: MutableForecastWindow;
+	windows: MutableForecastWindow[];
+	immediateWindowIndex: number;
+}
+
+export interface CodexQuotaModel {
+	windows: UsageWindow[];
+	immediateWindow?: UsageWindow;
+	constraintWindows: UsageWindow[];
+	exhaustedWindows: UsageWindow[];
+	effectiveRemainingPercent: number | null;
+	isZeroUsage: boolean;
+	isExhausted: boolean;
+	blockedUntil?: number;
+	scheduledResetAt?: number;
+	refreshAt?: number;
+	isModeled: boolean;
+	unmodeledReason?: "no_valid_windows";
 }
 
 function emptyTierStats(tier: CodexPlanTier): CodexUsageTierStats {
@@ -88,6 +109,8 @@ function emptyTierStats(tier: CodexPlanTier): CodexUsageTierStats {
 		tier,
 		accountCount: 0,
 		knownUsageCount: 0,
+		modeledUsageCount: 0,
+		unmodeledUsageCount: 0,
 		zeroUsageCount: 0,
 		scheduledAccountCount: 0,
 		remainingAccountEquivalents: 0,
@@ -95,16 +118,8 @@ function emptyTierStats(tier: CodexPlanTier): CodexUsageTierStats {
 	};
 }
 
-function emptyTierValues(): Record<CodexPlanTier, number> {
-	return {
-		free: 0,
-		plus: 0,
-		team: 0,
-		k12: 0,
-		prolite: 0,
-		pro: 0,
-		other: 0,
-	};
+function emptyTierValues(): Partial<Record<CodexPlanTier, number>> {
+	return {};
 }
 
 function clampPercent(value: number): number {
@@ -112,73 +127,115 @@ function clampPercent(value: number): number {
 	return Math.min(100, Math.max(0, value));
 }
 
-function getUsageWindows(usage: CodexUsageResult): UsageWindow[] {
-	return [usage.primary_window, usage.secondary_window].filter(
-		(window): window is UsageWindow => !!window,
-	);
-}
-
-function getWindowByType(
-	usage: CodexUsageResult,
-	windowType: UsageWindow["window_type"],
-): UsageWindow | undefined {
-	return getUsageWindows(usage).find((window) => window.window_type === windowType);
-}
-
-function getShortTermWindow(usage: CodexUsageResult): UsageWindow | undefined {
-	return getWindowByType(usage, "5h");
-}
-
-function getWeeklyWindow(usage: CodexUsageResult): UsageWindow | undefined {
-	return getWindowByType(usage, "weekly");
-}
-
-function getWindowRemainingPercent(window: UsageWindow): number {
+function getWindowRemainingPercent(window: UsageWindow): number | null {
 	if (Number.isFinite(window.remaining_percent)) {
 		return clampPercent(window.remaining_percent);
 	}
-	return clampPercent(100 - window.used_percent);
+	if (Number.isFinite(window.used_percent)) return clampPercent(100 - window.used_percent);
+	return null;
 }
 
-function isMutableForecastWindow(
-	window: UsageWindow | MutableForecastWindow,
-): window is MutableForecastWindow {
-	return "remainingPercent" in window;
+function getWindowResetAtMs(window: UsageWindow): number | undefined {
+	const resetAt = window.reset_at * 1000;
+	return Number.isFinite(resetAt) && resetAt > 0 ? resetAt : undefined;
 }
 
-function getModeledWindowUsedPercent(window: UsageWindow | MutableForecastWindow): number {
-	return clampPercent(isMutableForecastWindow(window) ? window.usedPercent : window.used_percent);
-}
-
-function getModeledWindowRemainingPercent(window: UsageWindow | MutableForecastWindow): number {
-	return isMutableForecastWindow(window)
-		? clampPercent(window.remainingPercent)
-		: getWindowRemainingPercent(window);
-}
-
-function isWindowUsed(window: UsageWindow | MutableForecastWindow): boolean {
-	return getModeledWindowUsedPercent(window) > 0;
-}
-
-function isWindowExhausted(window: UsageWindow | MutableForecastWindow): boolean {
+function isValidModeledWindow(window: UsageWindow): boolean {
 	return (
-		getModeledWindowRemainingPercent(window) <= 0 || getModeledWindowUsedPercent(window) >= 100
+		Number.isFinite(window.used_percent) &&
+		getWindowRemainingPercent(window) !== null &&
+		getWindowResetAtMs(window) !== undefined
 	);
 }
 
-function isWeeklyExhausted(usage: CodexUsageResult): boolean {
-	const weeklyWindow = getWeeklyWindow(usage);
-	return weeklyWindow ? isWindowExhausted(weeklyWindow) : false;
+const WINDOW_TYPE_ORDER: Record<UsageWindow["window_type"], number> = {
+	"5h": 0,
+	weekly: 1,
+	monthly: 2,
+	unknown: 3,
+};
+
+function compareUsageWindows(a: UsageWindow, b: UsageWindow): number {
+	const aDuration = a.limit_window_seconds;
+	const bDuration = b.limit_window_seconds;
+	if (
+		typeof aDuration === "number" &&
+		Number.isFinite(aDuration) &&
+		typeof bDuration === "number" &&
+		Number.isFinite(bDuration) &&
+		aDuration !== bDuration
+	) {
+		return aDuration - bDuration;
+	}
+	return WINDOW_TYPE_ORDER[a.window_type] - WINDOW_TYPE_ORDER[b.window_type];
 }
 
-function getModeledRemainingPercent(usage: CodexUsageResult): number | null {
-	const shortTermWindow = getShortTermWindow(usage);
-	if (shortTermWindow) {
-		return isWeeklyExhausted(usage) ? 0 : getWindowRemainingPercent(shortTermWindow);
+function isWindowUsed(window: UsageWindow): boolean {
+	return clampPercent(window.used_percent) > 0;
+}
+
+function isWindowExhausted(window: UsageWindow): boolean {
+	const remaining = getWindowRemainingPercent(window);
+	return remaining !== null && (remaining <= 0 || clampPercent(window.used_percent) >= 100);
+}
+
+export function resolveCodexQuotaModel(usage: CodexUsageResult, now = Date.now()): CodexQuotaModel {
+	const windows = getCodexUsageWindows(usage)
+		.filter(isValidModeledWindow)
+		.sort(compareUsageWindows);
+	const immediateWindow = windows[0];
+	if (!immediateWindow) {
+		return {
+			windows,
+			constraintWindows: [],
+			exhaustedWindows: [],
+			effectiveRemainingPercent: null,
+			isZeroUsage: false,
+			isExhausted: false,
+			isModeled: false,
+			unmodeledReason: "no_valid_windows",
+		};
 	}
 
-	const weeklyWindow = getWeeklyWindow(usage);
-	return weeklyWindow ? getWindowRemainingPercent(weeklyWindow) : null;
+	const exhaustedWindows = windows.filter((window) => {
+		const resetAt = getWindowResetAtMs(window);
+		return isWindowExhausted(window) && resetAt !== undefined && resetAt > now;
+	});
+	const blockedUntil = exhaustedWindows.reduce<number | undefined>((latest, window) => {
+		const resetAt = getWindowResetAtMs(window);
+		return resetAt === undefined ? latest : Math.max(latest ?? resetAt, resetAt);
+	}, undefined);
+	const isExhausted = exhaustedWindows.length > 0;
+	const immediateRemaining = getWindowRemainingPercent(immediateWindow);
+	const effectiveRemainingPercent = isExhausted ? 0 : immediateRemaining;
+	const immediateResetAt = getWindowResetAtMs(immediateWindow);
+	const refreshAt = windows.reduce<number | undefined>((earliest, window) => {
+		const resetAt = getWindowResetAtMs(window);
+		return resetAt === undefined ? earliest : Math.min(earliest ?? resetAt, resetAt);
+	}, undefined);
+	const scheduledResetAt = isExhausted
+		? blockedUntil
+		: isWindowUsed(immediateWindow) && immediateResetAt && immediateResetAt > now
+			? immediateResetAt
+			: undefined;
+
+	return {
+		windows,
+		immediateWindow,
+		constraintWindows: windows.slice(1),
+		exhaustedWindows,
+		effectiveRemainingPercent,
+		isZeroUsage: !isExhausted && !isWindowUsed(immediateWindow),
+		isExhausted,
+		blockedUntil,
+		scheduledResetAt,
+		refreshAt,
+		isModeled: effectiveRemainingPercent !== null,
+	};
+}
+
+function getModeledRemainingPercent(usage: CodexUsageResult, now = Date.now()): number | null {
+	return resolveCodexQuotaModel(usage, now).effectiveRemainingPercent;
 }
 
 function isQuotaTrackedEntry(entry: CodexUsageSourceEntry): boolean {
@@ -208,9 +265,6 @@ export function createCodexUsageHistoryEntry(
 	usage: CodexUsageResult,
 	timestamp?: number,
 ): CodexUsageHistoryEntry | null {
-	const remainingPercent = getModeledRemainingPercent(usage);
-	if (remainingPercent === null) return null;
-
 	const queriedAtMs = new Date(usage.queriedAt).getTime();
 	const effectiveTimestamp =
 		typeof timestamp === "number" && Number.isFinite(timestamp)
@@ -219,6 +273,8 @@ export function createCodexUsageHistoryEntry(
 				? queriedAtMs
 				: Date.now();
 	if (!Number.isFinite(effectiveTimestamp)) return null;
+	const remainingPercent = getModeledRemainingPercent(usage, effectiveTimestamp);
+	if (remainingPercent === null) return null;
 
 	return {
 		timestamp: effectiveTimestamp,
@@ -227,39 +283,29 @@ export function createCodexUsageHistoryEntry(
 	};
 }
 
-export function isZeroUsageAccount(usage?: CodexUsageResult): boolean {
-	if (!usage) return false;
-	const shortTermWindow = getShortTermWindow(usage);
-	if (shortTermWindow) return !isWeeklyExhausted(usage) && !isWindowUsed(shortTermWindow);
-
-	const weeklyWindow = getWeeklyWindow(usage);
-	return !!weeklyWindow && !isWindowUsed(weeklyWindow);
+export function isZeroUsageAccount(usage?: CodexUsageResult, now = Date.now()): boolean {
+	return usage ? resolveCodexQuotaModel(usage, now).isZeroUsage : false;
 }
 
-function getModeledUsageResetAt(usage?: CodexUsageResult): number | undefined {
+export function getScheduledUsageResetAt(
+	usage?: CodexUsageResult,
+	now = Date.now(),
+): number | undefined {
 	if (!usage) return undefined;
-	const weeklyWindow = getWeeklyWindow(usage);
-	const shortTermWindow = getShortTermWindow(usage);
-
-	if (shortTermWindow) {
-		if (weeklyWindow && isWindowExhausted(weeklyWindow)) return weeklyWindow.reset_at * 1000;
-		return isWindowUsed(shortTermWindow) ? shortTermWindow.reset_at * 1000 : undefined;
-	}
-
-	return weeklyWindow && isWindowUsed(weeklyWindow) ? weeklyWindow.reset_at * 1000 : undefined;
-}
-
-export function getScheduledUsageResetAt(usage?: CodexUsageResult): number | undefined {
-	const resetAt = getModeledUsageResetAt(usage);
-	return resetAt && Number.isFinite(resetAt) && resetAt > 0 ? resetAt : undefined;
+	const resetTimes = getCodexUsageWindows(usage)
+		.map(getWindowResetAtMs)
+		.filter((resetAt): resetAt is number => resetAt !== undefined);
+	const earliestResetAt = resetTimes.length > 0 ? Math.min(...resetTimes) : undefined;
+	const evaluationTime = earliestResetAt === undefined ? now : Math.min(now, earliestResetAt - 1);
+	return resolveCodexQuotaModel(usage, evaluationTime).scheduledResetAt;
 }
 
 export function getNextUsageResetAt(
 	usage?: CodexUsageResult,
 	now = Date.now(),
 ): number | undefined {
-	const resetAt = getModeledUsageResetAt(usage);
-	return resetAt && Number.isFinite(resetAt) && resetAt > now ? resetAt : undefined;
+	const resetAt = usage ? resolveCodexQuotaModel(usage, now).scheduledResetAt : undefined;
+	return resetAt && resetAt > now ? resetAt : undefined;
 }
 
 export function buildCodexUsageSummary(
@@ -280,6 +326,8 @@ export function buildCodexUsageSummary(
 
 	let totalTrackedAccounts = 0;
 	let totalKnownUsageAccounts = 0;
+	let totalModeledUsageAccounts = 0;
+	let totalUnmodeledUsageAccounts = 0;
 	let zeroUsageAccounts = 0;
 	let scheduledAccountCount = 0;
 	let nextResetAt: number | undefined;
@@ -297,19 +345,28 @@ export function buildCodexUsageSummary(
 		totalKnownUsageAccounts++;
 		tierStats.knownUsageCount++;
 
-		const modeledRemaining = getModeledRemainingPercent(usage);
+		const quotaModel = resolveCodexQuotaModel(usage, now);
+		const modeledRemaining = quotaModel.effectiveRemainingPercent;
 		if (modeledRemaining !== null) {
+			totalModeledUsageAccounts++;
+			tierStats.modeledUsageCount++;
 			tierStats.remainingAccountEquivalents += modeledRemaining / 100;
 			remainingSums[tier] += modeledRemaining;
 			remainingCounts[tier]++;
+		} else {
+			totalUnmodeledUsageAccounts++;
+			tierStats.unmodeledUsageCount++;
 		}
 
-		if (isZeroUsageAccount(usage)) {
+		if (quotaModel.isZeroUsage) {
 			zeroUsageAccounts++;
 			tierStats.zeroUsageCount++;
 		}
 
-		const resetAt = getNextUsageResetAt(usage, now);
+		const resetAt =
+			quotaModel.scheduledResetAt && quotaModel.scheduledResetAt > now
+				? quotaModel.scheduledResetAt
+				: undefined;
 		if (resetAt) {
 			scheduledAccountCount++;
 			tierStats.scheduledAccountCount++;
@@ -331,6 +388,8 @@ export function buildCodexUsageSummary(
 		generatedAt: new Date(now).toISOString(),
 		totalTrackedAccounts,
 		totalKnownUsageAccounts,
+		totalModeledUsageAccounts,
+		totalUnmodeledUsageAccounts,
 		missingUsageAccounts: Math.max(0, totalTrackedAccounts - totalKnownUsageAccounts),
 		zeroUsageAccounts,
 		scheduledAccountCount,
@@ -342,36 +401,40 @@ export function buildCodexUsageSummary(
 function toMutableForecastWindow(window: UsageWindow): MutableForecastWindow {
 	return {
 		usedPercent: clampPercent(window.used_percent),
-		remainingPercent: getWindowRemainingPercent(window),
-		resetAt: window.reset_at * 1000,
+		remainingPercent: getWindowRemainingPercent(window) ?? 0,
+		resetAt: getWindowResetAtMs(window) ?? 0,
+		windowType: window.window_type,
+		limitWindowSeconds: window.limit_window_seconds,
 	};
 }
 
-function buildInitialForecastStates(entries: CodexUsageSourceEntry[]): ForecastAccountState[] {
+function buildInitialForecastStates(
+	entries: CodexUsageSourceEntry[],
+	now: number,
+): ForecastAccountState[] {
 	return entries.flatMap((entry) => {
 		if (!isQuotaTrackedEntry(entry) || !entry.usage) return [];
-		const shortTermWindow = getShortTermWindow(entry.usage);
-		const weeklyWindow = getWeeklyWindow(entry.usage);
-		const quotaWindow = shortTermWindow ?? weeklyWindow;
-		if (!quotaWindow) return [];
+		const model = resolveCodexQuotaModel(entry.usage, now);
+		if (!model.immediateWindow) return [];
 		return [
 			{
 				tier: normalizeCodexPlanTier(entry.usage.plan_type),
-				quotaWindow: toMutableForecastWindow(quotaWindow),
-				...(shortTermWindow && weeklyWindow
-					? { blockingWeeklyWindow: toMutableForecastWindow(weeklyWindow) }
-					: {}),
+				windows: model.windows.map(toMutableForecastWindow),
+				immediateWindowIndex: model.windows.indexOf(model.immediateWindow),
 			},
 		];
 	});
 }
 
-function isForecastBlockedByWeekly(state: ForecastAccountState): boolean {
-	return state.blockingWeeklyWindow ? isWindowExhausted(state.blockingWeeklyWindow) : false;
+function isMutableForecastWindowExhausted(window: MutableForecastWindow): boolean {
+	return window.remainingPercent <= 0 || window.usedPercent >= 100;
 }
 
-function getForecastRemainingPercent(state: ForecastAccountState): number {
-	return isForecastBlockedByWeekly(state) ? 0 : state.quotaWindow.remainingPercent;
+function getForecastRemainingPercent(state: ForecastAccountState, timestamp: number): number {
+	const blocked = state.windows.some(
+		(window) => isMutableForecastWindowExhausted(window) && window.resetAt > timestamp,
+	);
+	return blocked ? 0 : (state.windows[state.immediateWindowIndex]?.remainingPercent ?? 0);
 }
 
 function calculateForecastPoint(
@@ -380,10 +443,12 @@ function calculateForecastPoint(
 ): CodexUsageForecastPoint {
 	const byTier = emptyTierValues();
 	for (const state of states) {
-		byTier[state.tier] += getForecastRemainingPercent(state) / 100;
+		byTier[state.tier] =
+			(byTier[state.tier] ?? 0) + getForecastRemainingPercent(state, timestamp) / 100;
 	}
 	for (const tier of CODEX_PLAN_TIERS) {
-		byTier[tier] = Number(byTier[tier].toFixed(4));
+		const value = byTier[tier];
+		if (value !== undefined) byTier[tier] = Number(value.toFixed(4));
 	}
 	return { timestamp, byTier };
 }
@@ -516,13 +581,18 @@ function buildHistoricalForecastPoints(
 		for (const snapshots of accountSnapshots) {
 			const snapshot = getSnapshotAt(snapshots, timestamp);
 			if (!snapshot) continue;
-			byTier[snapshot.tier] += snapshot.remainingPercent / 100;
+			byTier[snapshot.tier] = (byTier[snapshot.tier] ?? 0) + snapshot.remainingPercent / 100;
 		}
 		for (const tier of CODEX_PLAN_TIERS) {
-			byTier[tier] = Number(byTier[tier].toFixed(4));
+			const value = byTier[tier];
+			if (value !== undefined) byTier[tier] = Number(value.toFixed(4));
 		}
 		return { timestamp, byTier };
 	});
+}
+
+function haveEqualForecastValues(a: CodexUsageForecastPoint, b: CodexUsageForecastPoint): boolean {
+	return CODEX_PLAN_TIERS.every((tier) => a.byTier[tier] === b.byTier[tier]);
 }
 
 function appendForecastPoint(
@@ -534,6 +604,7 @@ function appendForecastPoint(
 		points[points.length - 1] = point;
 		return;
 	}
+	if (last && haveEqualForecastValues(last, point)) return;
 	points.push(point);
 }
 
@@ -541,49 +612,43 @@ export function buildCodexUsageForecast(
 	entries: CodexUsageSourceEntry[],
 	now = Date.now(),
 ): CodexUsageForecast {
-	const states = buildInitialForecastStates(entries);
+	const states = buildInitialForecastStates(entries, now);
 	const resetTimes = [
 		...new Set(
-			states.flatMap((state) => {
-				if (isForecastBlockedByWeekly(state)) {
-					return state.blockingWeeklyWindow && state.blockingWeeklyWindow.resetAt > now
-						? [state.blockingWeeklyWindow.resetAt]
-						: [];
-				}
-				return isWindowUsed(state.quotaWindow) && state.quotaWindow.resetAt > now
-					? [state.quotaWindow.resetAt]
-					: [];
-			}),
+			states.flatMap((state) =>
+				state.windows.flatMap((window, index) => {
+					const affectsQuota =
+						index === state.immediateWindowIndex
+							? window.usedPercent > 0
+							: isMutableForecastWindowExhausted(window);
+					return affectsQuota && window.resetAt > now ? [window.resetAt] : [];
+				}),
+			),
 		),
 	].sort((a, b) => a - b);
 
 	const points: CodexUsageForecastPoint[] = buildHistoricalForecastPoints(entries, now);
-	appendForecastPoint(points, calculateForecastPoint(states, now));
+	if (states.length > 0) appendForecastPoint(points, calculateForecastPoint(states, now));
 
 	for (const resetTime of resetTimes) {
 		for (const state of states) {
-			if (state.blockingWeeklyWindow && isWindowExhausted(state.blockingWeeklyWindow)) {
-				if (state.blockingWeeklyWindow.resetAt <= resetTime) {
-					state.blockingWeeklyWindow.usedPercent = 0;
-					state.blockingWeeklyWindow.remainingPercent = 100;
-					state.quotaWindow.usedPercent = 0;
-					state.quotaWindow.remainingPercent = 100;
+			for (const window of state.windows) {
+				if (window.resetAt <= resetTime && window.usedPercent > 0) {
+					window.usedPercent = 0;
+					window.remainingPercent = 100;
 				}
-				continue;
-			}
-
-			if (isWindowUsed(state.quotaWindow) && state.quotaWindow.resetAt <= resetTime) {
-				state.quotaWindow.usedPercent = 0;
-				state.quotaWindow.remainingPercent = 100;
 			}
 		}
 		appendForecastPoint(points, calculateForecastPoint(states, resetTime));
 	}
 
+	const tiers = CODEX_DISPLAY_PLAN_TIERS.filter((tier) =>
+		points.some((point) => point.byTier[tier] !== undefined),
+	);
 	return {
 		generatedAt: new Date(now).toISOString(),
 		points,
-		tiers: CODEX_DISPLAY_PLAN_TIERS,
+		tiers,
 		unit: "account_equivalent",
 	};
 }

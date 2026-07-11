@@ -441,30 +441,7 @@ export const miscApi = {
 	codexCredentialRefresh: (id: string) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}/refresh`, { method: "POST" }),
 	codexCredentialGetUsage: (id: string) =>
-		request<{
-			plan_type: string;
-			primary_window?: {
-				used_percent: number;
-				remaining_percent: number;
-				reset_at: number;
-				reset_after_seconds: number;
-				window_type: "5h" | "weekly" | "unknown";
-			};
-			secondary_window?: {
-				used_percent: number;
-				remaining_percent: number;
-				reset_at: number;
-				reset_after_seconds: number;
-				window_type: "5h" | "weekly" | "unknown";
-			};
-			code_review?: {
-				used_percent: number;
-				remaining_percent: number;
-				reset_at: number;
-				reset_after_seconds: number;
-			};
-			queriedAt: string;
-		}>(`/codex/credentials/${id}/usage`, { method: "POST" }),
+		request<CodexUsageData>(`/codex/credentials/${id}/usage`, { method: "POST" }),
 	codexSetLoadBalancingMode: (mode: CodexLoadBalancingMode) =>
 		request<{ ok: boolean; mode: CodexLoadBalancingMode }>("/codex/load-balancing-mode", {
 			method: "POST",

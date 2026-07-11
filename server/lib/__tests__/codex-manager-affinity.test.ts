@@ -10,6 +10,8 @@ function createManagerWithCredentials(
 		priority: number;
 		planType?: string;
 		remainingPercent?: number;
+		windowType?: "5h" | "weekly" | "monthly" | "unknown";
+		limitWindowSeconds?: number;
 	}>,
 ): {
 	manager: CodexManager;
@@ -40,7 +42,8 @@ function createManagerWithCredentials(
 										remaining_percent: c.remainingPercent,
 										reset_at: Math.floor((now + 60 * 60_000) / 1000),
 										reset_after_seconds: 60 * 60,
-										window_type: "5h",
+										window_type: c.windowType ?? "5h",
+										...(c.limitWindowSeconds ? { limit_window_seconds: c.limitWindowSeconds } : {}),
 									},
 								}
 							: {}),
@@ -318,5 +321,106 @@ describe("CodexManager session affinity", () => {
 
 		const ctx = await manager.acquireContext("session-known-tier");
 		expect(ctx.id).toBe("cred-team");
+	});
+
+	test("公共 overview 暴露 monthly Team modeled/unmodeled coverage", () => {
+		const monthlySeconds = 30 * 24 * 60 * 60;
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{
+				id: "team-55",
+				priority: 0,
+				planType: "team",
+				remainingPercent: 55,
+				windowType: "monthly",
+				limitWindowSeconds: monthlySeconds,
+			},
+			{
+				id: "team-83",
+				priority: 1,
+				planType: "team",
+				remainingPercent: 83,
+				windowType: "monthly",
+				limitWindowSeconds: monthlySeconds,
+			},
+			{ id: "team-unknown", priority: 2, planType: "team" },
+		]);
+		tempHomes.push(tmpHome);
+
+		const overview = manager.getPublicQuotaOverview();
+		const team = overview.segments.find((segment) => segment.type === "team");
+
+		expect(overview.totalRemainingAccountEquivalents).toBe(1.38);
+		expect(overview.trackedAccountCount).toBe(3);
+		expect(overview.modeledAccountCount).toBe(2);
+		expect(overview.unmodeledAccountCount).toBe(1);
+		expect(team).toMatchObject({
+			remainingAccountEquivalents: 1.38,
+			totalAccountEquivalents: 3,
+			trackedAccountCount: 3,
+			modeledAccountCount: 2,
+			unmodeledAccountCount: 1,
+			averageRemainingPercent: 69,
+		});
+		expect(overview.trend.points[0]?.byType.team).toBe(1.38);
+	});
+
+	test("公共 trend 不为 unmodeled-only tier 补零", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "plus-modeled", priority: 0, planType: "plus", remainingPercent: 60 },
+			{ id: "team-unmodeled", priority: 1, planType: "team" },
+		]);
+		tempHomes.push(tmpHome);
+
+		const overview = manager.getPublicQuotaOverview();
+		const team = overview.segments.find((segment) => segment.type === "team");
+
+		expect(overview.trackedAccountCount).toBe(2);
+		expect(overview.modeledAccountCount).toBe(1);
+		expect(overview.unmodeledAccountCount).toBe(1);
+		expect(team?.modeledAccountCount).toBe(0);
+		expect(team?.unmodeledAccountCount).toBe(1);
+		expect(overview.trend.types).toEqual(["plus"]);
+		expect(overview.trend.points[0]?.byType).toEqual({ plus: 0.6 });
+		expect("team" in (overview.trend.points[0]?.byType ?? {})).toBe(false);
+	});
+
+	test("公共顶层 coverage 计入 missing 且不污染具体 tier segment", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "plus-modeled", priority: 0, planType: "plus", remainingPercent: 60 },
+			{ id: "usage-missing", priority: 1 },
+		]);
+		tempHomes.push(tmpHome);
+
+		const overview = manager.getPublicQuotaOverview();
+		const plus = overview.segments.find((segment) => segment.type === "plus");
+
+		expect(overview.segments).toHaveLength(1);
+		expect(plus).toMatchObject({
+			trackedAccountCount: 1,
+			modeledAccountCount: 1,
+			unmodeledAccountCount: 0,
+		});
+		expect(overview.trackedAccountCount).toBe(2);
+		expect(overview.modeledAccountCount).toBe(1);
+		expect(overview.unmodeledAccountCount).toBe(1);
+	});
+
+	test("公共 overview 顶层 coverage 与 segments 一致排除 other tier", () => {
+		const { manager, tmpHome } = createManagerWithCredentials([
+			{ id: "plus-public", priority: 0, planType: "plus", remainingPercent: 60 },
+			{ id: "other-hidden", priority: 1, planType: "enterprise", remainingPercent: 90 },
+		]);
+		tempHomes.push(tmpHome);
+
+		const overview = manager.getPublicQuotaOverview();
+
+		expect(overview.segments.map((segment) => segment.type)).toEqual(["plus"]);
+		expect(overview.totalAccountEquivalents).toBe(1);
+		expect(overview.totalRemainingAccountEquivalents).toBe(0.6);
+		expect(overview.trackedAccountCount).toBe(1);
+		expect(overview.modeledAccountCount).toBe(1);
+		expect(overview.unmodeledAccountCount).toBe(0);
+		expect(overview.trend.types).toEqual(["plus"]);
+		expect(overview.trend.points[0]?.byType).toEqual({ plus: 0.6 });
 	});
 });

@@ -21,7 +21,6 @@ import {
 	Paper,
 	Progress,
 	SegmentedControl,
-	SimpleGrid,
 	Stack,
 	Switch,
 	Table,
@@ -50,28 +49,20 @@ import {
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
-import type {
-	CodexLoadBalancingMode,
-	CodexPlanTier,
-	CodexUsageForecast,
-	CodexUsageSchedulerSnapshot,
-	CodexUsageSummary,
-	CodexUsageTierStats,
-} from "../../lib/api/types";
+import type { CodexLoadBalancingMode, CodexPlanTier, CodexUsageData } from "../../lib/api/types";
 import {
 	CODEX_DEFAULT_TIER_ORDER,
 	CODEX_TIER_COLORS,
 	getCodexDisplayTierOrder,
-	getCodexPlanTypeLabel,
 	getCodexTierLabel,
-	normalizeCodexPlanTier,
 } from "../../lib/codex-tiers";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
-import { CodexQuotaTrendChart as SharedCodexQuotaTrendChart } from "./CodexQuotaTrendChart";
+import { CodexQuotaOverview } from "./CodexQuotaOverview";
+import { CodexUsageDisplay } from "./CodexUsageDisplay";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -1566,169 +1557,6 @@ export const CodexSection = React.memo(function CodexSection({
 	);
 });
 
-function getEmptyCodexUsageTierStats(tier: CodexPlanTier): CodexUsageTierStats {
-	return {
-		tier,
-		accountCount: 0,
-		knownUsageCount: 0,
-		zeroUsageCount: 0,
-		scheduledAccountCount: 0,
-		remainingAccountEquivalents: 0,
-		averageRemainingPercent: null,
-	};
-}
-
-function formatAccountEquivalent(value: number): string {
-	return new Intl.NumberFormat(undefined, {
-		minimumFractionDigits: 0,
-		maximumFractionDigits: 2,
-	}).format(value);
-}
-
-function formatResetTimestamp(timestamp?: number): string {
-	if (!timestamp) return "-";
-	return relativeTime(new Date(timestamp).toISOString());
-}
-
-function CodexQuotaOverview({
-	summary,
-	trend,
-	scheduler,
-	tierOrder,
-}: {
-	summary: CodexUsageSummary;
-	trend: CodexUsageForecast;
-	scheduler: CodexUsageSchedulerSnapshot;
-	tierOrder: readonly CodexPlanTier[];
-}) {
-	const { t } = useTranslation("settings");
-	const displayTierOrder = getCodexDisplayTierOrder(tierOrder);
-	const [selectedTierValues, setSelectedTierValues] = useState<string[]>(displayTierOrder);
-	const selectedTiers = displayTierOrder.filter((tier) => selectedTierValues.includes(tier));
-	const summaryByTier = (summary.byTier ?? {}) as Partial<
-		Record<CodexPlanTier, CodexUsageTierStats>
-	>;
-
-	return (
-		<Paper withBorder p="sm">
-			<Stack gap="sm">
-				<Group justify="space-between" align="flex-start">
-					<Stack gap={2}>
-						<Text size="sm" fw={500}>
-							{t("codexQuotaOverviewTitle")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("codexQuotaOverviewDesc", {
-								known: summary.totalKnownUsageAccounts,
-								missing: summary.missingUsageAccounts,
-							})}
-						</Text>
-					</Stack>
-					<Stack gap={2} align="flex-end">
-						<Badge size="sm" color={scheduler.started ? "green" : "gray"} variant="light">
-							{scheduler.started ? t("codexQuotaSchedulerOn") : t("codexQuotaSchedulerOff")}
-						</Badge>
-						<Text size="xs" c="dimmed">
-							{scheduler.nextRunAt
-								? t("codexQuotaSchedulerNext", {
-										when: formatResetTimestamp(scheduler.nextRunAt),
-									})
-								: t("codexQuotaSchedulerIdle")}
-						</Text>
-					</Stack>
-				</Group>
-
-				<Stack gap={4}>
-					<Text size="xs" c="dimmed">
-						{t("codexQuotaVisibleTiers")}
-					</Text>
-					<Checkbox.Group value={selectedTierValues} onChange={setSelectedTierValues}>
-						<Group gap="xs" wrap="wrap">
-							{displayTierOrder.map((tier) => (
-								<Checkbox
-									key={tier}
-									value={tier}
-									label={getCodexTierLabel(t, tier)}
-									size="xs"
-									color={CODEX_TIER_COLORS[tier]}
-								/>
-							))}
-						</Group>
-					</Checkbox.Group>
-				</Stack>
-
-				{selectedTiers.length === 0 ? (
-					<Paper withBorder p="sm">
-						<Text size="xs" c="dimmed" ta="center">
-							{t("codexQuotaNoTierSelected")}
-						</Text>
-					</Paper>
-				) : (
-					<SimpleGrid cols={{ base: 1, sm: 2, lg: 5 }} spacing="xs">
-						{selectedTiers.map((tier) => {
-							const stat = summaryByTier[tier] ?? getEmptyCodexUsageTierStats(tier);
-							const average = stat.averageRemainingPercent ?? 0;
-							return (
-								<Paper key={tier} withBorder p="xs">
-									<Stack gap={6}>
-										<Group justify="space-between" wrap="nowrap">
-											<Badge color={CODEX_TIER_COLORS[tier]} variant="light">
-												{getCodexTierLabel(t, tier)}
-											</Badge>
-											<Text size="xs" c="dimmed">
-												{t("codexQuotaAccounts", { count: stat.accountCount })}
-											</Text>
-										</Group>
-										<Text size="lg" fw={700}>
-											{formatAccountEquivalent(stat.remainingAccountEquivalents)}{" "}
-											<Text span size="xs" c="dimmed" fw={400}>
-												{t("codexQuotaAccountEquivalent")}
-											</Text>
-										</Text>
-										<Progress value={average} size="xs" color={CODEX_TIER_COLORS[tier]} />
-										<Group justify="space-between" gap="xs">
-											<Text size="xs" c="dimmed">
-												{t("codexQuotaAverageRemaining")}: {average.toFixed(1)}%
-											</Text>
-											<Text size="xs" c="dimmed">
-												{t("codexQuotaKnown", { count: stat.knownUsageCount })}
-											</Text>
-										</Group>
-										<Text size="xs" c="dimmed">
-											{stat.nextResetAt
-												? t("codexQuotaNextReset", {
-														when: formatResetTimestamp(stat.nextResetAt),
-													})
-												: t("codexQuotaNoResetScheduled")}
-										</Text>
-										{stat.zeroUsageCount > 0 && (
-											<Text size="xs" c="dimmed">
-												{t("codexQuotaZeroUsage", { count: stat.zeroUsageCount })}
-											</Text>
-										)}
-									</Stack>
-								</Paper>
-							);
-						})}
-					</SimpleGrid>
-				)}
-
-				<Stack gap="xs">
-					<Group justify="space-between">
-						<Text size="sm" fw={500}>
-							{t("codexQuotaTrendTitle")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("codexQuotaTrendUnit")}
-						</Text>
-					</Group>
-					<SharedCodexQuotaTrendChart trend={trend} selectedTiers={selectedTiers} />
-				</Stack>
-			</Stack>
-		</Paper>
-	);
-}
-
 // Credential list wrapper (responsive)
 function CredentialList(props: {
 	entries: Array<{
@@ -1748,8 +1576,7 @@ function CredentialList(props: {
 	pageSize: number;
 	onPageChange: (page: number) => void;
 	currentId?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
-	usageCache: Record<string, any>;
+	usageCache: Record<string, CodexUsageData>;
 	editingId: string | null;
 	editForm: { displayName: string; priority: number };
 	// biome-ignore lint/suspicious/noExplicitAny: entry type matches parent array
@@ -1914,7 +1741,7 @@ function CredentialList(props: {
 									</Text>
 								</Table.Td>
 								<Table.Td>
-									<UsageDisplay usage={usage} />
+									<CodexUsageDisplay usage={usage} />
 								</Table.Td>
 								<Table.Td>
 									<Text size="xs" c="dimmed">
@@ -2081,8 +1908,7 @@ function CredentialCards(props: {
 	pageSize: number;
 	onPageChange: (page: number) => void;
 	currentId?: string;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic usage cache structure
-	usageCache: Record<string, any>;
+	usageCache: Record<string, CodexUsageData>;
 	editingId: string | null;
 	editForm: { displayName: string; priority: number };
 	// biome-ignore lint/suspicious/noExplicitAny: entry type matches parent array
@@ -2278,7 +2104,7 @@ function CredentialCards(props: {
 										<Text size="xs" c="dimmed">
 											{t("codexColUsage")}
 										</Text>
-										<UsageDisplay usage={usage} />
+										<CodexUsageDisplay usage={usage} />
 									</Stack>
 								</>
 							)}
@@ -2416,131 +2242,5 @@ function ExpiresDisplay({ expiresAt }: { expiresAt: number }) {
 		<Text size="xs" c="dimmed">
 			{relativeTime(new Date(expiresAt).toISOString())}
 		</Text>
-	);
-}
-
-// Usage display component
-function UsageDisplay({
-	usage,
-}: {
-	usage?: {
-		plan_type: string;
-		primary_window?: {
-			used_percent: number;
-			remaining_percent: number;
-			reset_at: number;
-			reset_after_seconds: number;
-			window_type: "5h" | "weekly" | "unknown";
-		};
-		secondary_window?: {
-			used_percent: number;
-			remaining_percent: number;
-			reset_at: number;
-			reset_after_seconds: number;
-			window_type: "5h" | "weekly" | "unknown";
-		};
-		queriedAt: string;
-	};
-}) {
-	const { t } = useTranslation("settings");
-
-	if (!usage) {
-		return (
-			<Text size="xs" c="dimmed">
-				-
-			</Text>
-		);
-	}
-
-	const primaryWindow = usage.primary_window;
-	const secondaryWindow = usage.secondary_window;
-	const planTier = normalizeCodexPlanTier(usage.plan_type);
-
-	const formatResetTime = (resetAt: number) => {
-		const date = new Date(resetAt * 1000);
-		const diff = date.getTime() - Date.now();
-
-		if (diff < 0) return t("codexUsageExpired");
-		const totalMinutes = Math.floor(diff / 60_000);
-		const days = Math.floor(totalMinutes / 1440);
-		const hours = Math.floor((totalMinutes % 1440) / 60);
-		const minutes = totalMinutes % 60;
-		if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-		if (hours > 0) return `${hours}h ${minutes}m`;
-		return `${minutes}m`;
-	};
-
-	const getWindowLabel = (windowType: string) => {
-		if (windowType === "5h") return t("codexUsage5h");
-		if (windowType === "weekly") return t("codexUsageWeekly");
-		return t("codexUsageUnknown");
-	};
-
-	return (
-		<Stack gap={4}>
-			<Group gap={4}>
-				<Badge size="xs" variant="light" color={CODEX_TIER_COLORS[planTier]}>
-					{getCodexPlanTypeLabel(t, usage.plan_type)}
-				</Badge>
-			</Group>
-
-			{/* Primary window */}
-			{primaryWindow && (
-				<Stack gap={2}>
-					<Text size="xs" fw={500}>
-						{getWindowLabel(primaryWindow.window_type)}
-					</Text>
-					<Text size="xs">
-						{t("codexUsageRemaining")}: {primaryWindow.remaining_percent.toFixed(1)}%
-					</Text>
-					<Progress
-						value={primaryWindow.used_percent}
-						size="xs"
-						color={
-							primaryWindow.remaining_percent < 10
-								? "red"
-								: primaryWindow.remaining_percent < 30
-									? "yellow"
-									: "green"
-						}
-						style={{ width: 100 }}
-					/>
-					<Text size="xs" c="dimmed">
-						{t("codexUsageReset")}: {formatResetTime(primaryWindow.reset_at)}
-					</Text>
-				</Stack>
-			)}
-
-			{/* Secondary window */}
-			{secondaryWindow && (
-				<Stack gap={2}>
-					<Text size="xs" fw={500}>
-						{getWindowLabel(secondaryWindow.window_type)}
-					</Text>
-					<Text size="xs">
-						{t("codexUsageRemaining")}: {secondaryWindow.remaining_percent.toFixed(1)}%
-					</Text>
-					<Progress
-						value={secondaryWindow.used_percent}
-						size="xs"
-						color={
-							secondaryWindow.remaining_percent < 10
-								? "red"
-								: secondaryWindow.remaining_percent < 30
-									? "yellow"
-									: "green"
-						}
-						style={{ width: 100 }}
-					/>
-					<Text size="xs" c="dimmed">
-						{t("codexUsageReset")}: {formatResetTime(secondaryWindow.reset_at)}
-					</Text>
-				</Stack>
-			)}
-
-			<Text size="xs" c="dimmed">
-				{relativeTime(usage.queriedAt)}
-			</Text>
-		</Stack>
 	);
 }

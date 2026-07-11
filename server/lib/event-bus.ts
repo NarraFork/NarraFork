@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
+import type { PublicCodexQuotaOverview } from "./codex-manager";
 import { logger } from "./logger";
 
 // === Event type definitions ===
@@ -294,7 +295,7 @@ export type NarraForkEvent =
 	// Codex quota overview lifecycle
 	| {
 			type: "codex:quota_overview_updated";
-			overview: unknown;
+			overview: PublicCodexQuotaOverview;
 	  }
 	// Mirror of every broadcastToNarrator call — for non-WS consumers (e.g. IM gateway)
 	| {

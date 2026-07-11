@@ -74,6 +74,35 @@ mock.module("../../../server/lib/codex-manager", () => ({
 			codexRemoveUnhealthyCalls++;
 			return { removed: ["failed-1", "banned-1"], reasons: ["too_many_failures", "banned"] };
 		},
+		getPublicQuotaOverview: () => ({
+			generatedAt: "2026-05-01T00:00:00.000Z",
+			unit: "account_equivalent",
+			totalRemainingAccountEquivalents: 0.6,
+			totalAccountEquivalents: 1,
+			trackedAccountCount: 2,
+			modeledAccountCount: 1,
+			unmodeledAccountCount: 1,
+			segments: [
+				{
+					type: "plus",
+					remainingAccountEquivalents: 0.6,
+					totalAccountEquivalents: 1,
+					trackedAccountCount: 1,
+					modeledAccountCount: 1,
+					unmodeledAccountCount: 0,
+					averageRemainingPercent: 60,
+					nextResetAt: 1_800_000_000_000,
+				},
+			],
+			trend: {
+				generatedAt: "2026-05-01T00:00:00.000Z",
+				points: [{ timestamp: 1_700_000_000_000, byType: { plus: 0.6 } }],
+				types: ["plus"],
+			},
+			nextResetAt: 1_800_000_000_000,
+			usageQueueRunning: false,
+			schedulerStarted: true,
+		}),
 	}),
 }));
 
@@ -134,6 +163,31 @@ describe("codex routes validation", () => {
 
 		expect(res.status).toBe(200);
 		expect(await res.json()).toMatchObject({ useWebSocket: true });
+	});
+
+	it("returns modeled plus missing usage as mixed HTTP coverage", async () => {
+		const res = await app.request("/quota-overview");
+
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			trend: { types: string[]; points: Array<{ byType: Record<string, number> }> };
+		};
+		expect(body).toMatchObject({
+			totalRemainingAccountEquivalents: 0.6,
+			trackedAccountCount: 2,
+			modeledAccountCount: 1,
+			unmodeledAccountCount: 1,
+			segments: [
+				{
+					type: "plus",
+					trackedAccountCount: 1,
+					modeledAccountCount: 1,
+					unmodeledAccountCount: 0,
+					averageRemainingPercent: 60,
+				},
+			],
+			trend: { types: ["plus"], points: [{ byType: { plus: 0.6 } }] },
+		});
 	});
 
 	it("accepts boolean websocket settings and persists them", async () => {
