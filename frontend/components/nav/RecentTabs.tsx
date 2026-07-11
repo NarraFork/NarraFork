@@ -34,6 +34,7 @@ import {
 	IconArrowUp,
 	IconBox,
 	IconBrain,
+	IconClock,
 	IconColumns,
 	IconFolder,
 	IconGitBranch,
@@ -422,8 +423,15 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		[qc, navigate, t, flushTabPatches],
 	);
 
+	const lastReconnectRefreshRef = useRef(0);
 	const handleReconnect = useCallback(() => {
-		// After WS reconnect, refresh all tab data to catch up on missed events
+		// After WS reconnect, refresh all tab data to catch up on missed events.
+		// Throttle to avoid a refresh storm when the socket flaps (each reconnect
+		// otherwise triggers a REST refetch + cascade of dependent invalidations
+		// that competes with catch-up work).
+		const now = Date.now();
+		if (now - lastReconnectRefreshRef.current < 5000) return;
+		lastReconnectRefreshRef.current = now;
 		qc.invalidateQueries({ queryKey: QUERY_KEY });
 	}, [qc]);
 
@@ -1205,11 +1213,34 @@ function TabIcon({
 		tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
-	if (!showDraft && !showReasoning) return icon;
+	const showScheduled = !!tab.isScheduled && canShowMarker;
+	if (!showDraft && !showReasoning && !showScheduled) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
 			{icon}
+			{showScheduled && (
+				<Box
+					component="span"
+					style={{
+						position: "absolute",
+						right: -4,
+						bottom: -4,
+						width: 11,
+						height: 11,
+						borderRadius: "50%",
+						background: "var(--mantine-color-indigo-6)",
+						border: "1px solid var(--mantine-color-body)",
+						display: "inline-flex",
+						alignItems: "center",
+						justifyContent: "center",
+						color: "var(--mantine-color-white)",
+						pointerEvents: "none",
+					}}
+				>
+					<IconClock size={7} stroke={2.5} />
+				</Box>
+			)}
 			{showReasoning && (
 				<Box
 					component="span"

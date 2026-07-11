@@ -4495,7 +4495,11 @@ type EditableUserContentBlock =
 			mediaType: string;
 			uploadNarratorId?: string;
 	  }
-	| { type: "text_file"; filename: string; size: number; filePath: string };
+	// `fileId` is optional: legacy uploads stored files under
+	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
+	// filePath, while newer uploads live in the worktree and omit fileId.
+	// Preserve it verbatim so legacy attachments survive an edit round-trip.
+	| { type: "text_file"; filename: string; size: number; filePath: string; fileId?: string };
 
 /**
  * Extract persisted text-file attachment blocks as TextFileRefs so the edited
@@ -4534,15 +4538,28 @@ function extractTextFileRefs(contentJson: unknown): TextFileRef[] {
  *   - `opts.keepImageIds` provided → keep only existing images whose imageId is
  *     in the set (images the user removed during editing are dropped).
  *   - `opts.newImages` → appended as fresh image blocks (uploaded during editing).
+ *
+ * Text-file handling mirrors images (keyed by filePath instead of imageId):
+ *   - `opts.keepTextFilePaths === undefined` → keep ALL existing text files
+ *     (backward compatible: callers that don't manage files never lose them).
+ *   - `opts.keepTextFilePaths` provided → keep only existing text files whose
+ *     filePath is in the set (files the user removed during editing are dropped).
+ *   - `opts.newTextFiles` → appended as fresh text_file blocks (uploaded during editing).
  */
 function buildEditedUserContentJson(
 	contentJson: unknown,
 	newContent: string,
 	fallbackUploadNarratorId?: string | null,
-	opts?: { keepImageIds?: string[]; newImages?: ImageRef[] },
+	opts?: {
+		keepImageIds?: string[];
+		newImages?: ImageRef[];
+		keepTextFilePaths?: string[];
+		newTextFiles?: TextFileRef[];
+	},
 ): EditableUserContentBlock[] {
 	const blocks = Array.isArray(contentJson) ? (contentJson as Array<Record<string, unknown>>) : [];
 	const keepSet = opts?.keepImageIds ? new Set(opts.keepImageIds) : null;
+	const keepFileSet = opts?.keepTextFilePaths ? new Set(opts.keepTextFilePaths) : null;
 	const imageBlocks: EditableUserContentBlock[] = [];
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
@@ -4575,11 +4592,16 @@ function buildEditedUserContentJson(
 			typeof block.filePath === "string" &&
 			typeof block.size === "number"
 		) {
+			// Drop text files the user removed during editing.
+			if (keepFileSet && !keepFileSet.has(block.filePath)) continue;
 			textFileBlocks.push({
 				type: "text_file",
 				filename: block.filename,
 				size: block.size,
 				filePath: block.filePath,
+				// Preserve legacy fileId so older uploads-based attachments keep
+				// resolving after an edit round-trip.
+				...(typeof block.fileId === "string" ? { fileId: block.fileId } : {}),
 			});
 		}
 	}
@@ -4600,6 +4622,18 @@ function buildEditedUserContentJson(
 		}
 	}
 
+	// Newly uploaded text files during editing — appended after existing ones.
+	if (opts?.newTextFiles?.length) {
+		for (const tf of opts.newTextFiles) {
+			textFileBlocks.push({
+				type: "text_file",
+				filename: tf.filename,
+				size: tf.size,
+				filePath: tf.filePath,
+			});
+		}
+	}
+
 	// Canonical order matches freshly sent messages: images, text_files, text.
 	return [...imageBlocks, ...textFileBlocks, { type: "text", text: newContent }];
 }
@@ -4612,7 +4646,9 @@ function buildEditedUserContentJson(
  *
  * `opts.keepImageIds` / `opts.newImages` let the caller manage attached images during
  * editing (keep a subset of existing images, drop the rest, and/or append new uploads).
- * When `opts` is omitted, all existing images are preserved (backward compatible).
+ * `opts.keepTextFilePaths` / `opts.newTextFiles` do the same for text-file attachments
+ * (new files are saved into the worktree before the rebuilt blocks are persisted).
+ * When `opts` is omitted, all existing images and text files are preserved (backward compatible).
  */
 export async function editAndRegenerate(
 	narratorId: string,
@@ -4621,7 +4657,13 @@ export async function editAndRegenerate(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 	rollback = false,
-	opts?: { keepImageIds?: string[]; newImages?: ImageRef[]; userId?: string | null },
+	opts?: {
+		keepImageIds?: string[];
+		newImages?: ImageRef[];
+		keepTextFilePaths?: string[];
+		newTextFiles?: File[];
+		userId?: string | null;
+	},
 ): Promise<{ ok: boolean }> {
 	// Guard before any destructive work (copy-on-write + deleteMessagesAfter below):
 	// refuse to edit/regenerate while a loop is already running on this narrator.
@@ -4656,18 +4698,39 @@ export async function editAndRegenerate(
 		});
 	}
 
-	// Rebuild blocks: keep the user-selected subset of existing images, drop the
-	// rest, append any newly uploaded images, and replace the editable text.
+	// Resolve the live session early so newly attached text files can be saved
+	// into the worktree (cwd) before the rebuilt blocks are persisted, mirroring
+	// feedMessage's "ensureNarrator first, then save files" ordering.
+	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+
+	// Save any newly uploaded text files into the worktree so the regenerated
+	// turn (and future reads) can access them, then append them as text_file blocks.
+	const savedNewTextFiles: TextFileRef[] = [];
+	if (opts?.newTextFiles?.length) {
+		for (const file of opts.newTextFiles) {
+			savedNewTextFiles.push(await saveTextFileToWorktree(active.cwd, file));
+		}
+	}
+
+	// Rebuild blocks: keep the user-selected subset of existing images/text files,
+	// drop the rest, append any newly uploaded attachments, and replace the editable text.
 	const newContentJson = buildEditedUserContentJson(
 		targetMsg.contentJson,
 		newContent,
 		targetMsg.narratorId,
-		opts,
+		{
+			keepImageIds: opts?.keepImageIds,
+			newImages: opts?.newImages,
+			keepTextFilePaths: opts?.keepTextFilePaths,
+			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
+		},
 	);
 	// Derive the final image refs from the rebuilt blocks so kept + new images
 	// (and only those) are sent to the model on regeneration.
 	const existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
-	const existingTextFiles = extractTextFileRefs(targetMsg.contentJson);
+	// Derive the final text-file refs from the REBUILT blocks (not the original)
+	// so the attached-files hint reflects the kept subset plus any new uploads.
+	const existingTextFiles = extractTextFileRefs(newContentJson);
 
 	// When the edited text is empty but images remain, inject a placeholder so
 	// providers that gate on non-empty content still include the image blocks.
@@ -4716,8 +4779,8 @@ export async function editAndRegenerate(
 
 	const imageRefs = existingImages;
 
-	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
-	// Restore the triggering user so knowledge-base ACL works after a rebuild.
+	// `active` was resolved above (before saving new text files). Restore the
+	// triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = opts?.userId ?? active._currentUserId ?? null;
 	active._lastTokenUsage = undefined;
 	active._ttftMs = undefined;

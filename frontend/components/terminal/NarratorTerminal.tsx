@@ -159,10 +159,15 @@ export function NarratorTerminal({
 	);
 
 	const handleExit = useCallback(
-		(_terminalId: string, code: number) => {
-			onExit?.(code);
+		(terminalId: string, code: number) => {
+			// Only dissolve the whole terminal dock panel when the LAST running
+			// terminal exits. Closing one tab among several (X button → delete →
+			// process exit) must not tear down the panel while others remain.
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const remaining = runningTerminals.filter((t: any) => t.id !== terminalId);
+			if (remaining.length === 0) onExit?.(code);
 		},
-		[onExit],
+		[onExit, runningTerminals],
 	);
 
 	const handleLayoutChange = useCallback(

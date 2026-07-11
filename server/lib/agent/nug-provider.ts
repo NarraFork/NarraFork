@@ -559,7 +559,10 @@ export class NugProvider implements ProviderAdapter {
 			throw new Error("NUG returned no response body");
 		}
 
-		yield* parseSSEStream(response.body, { parseTextToolCalls: params.tools.length > 0 });
+		yield* parseSSEStream(response.body, {
+			parseTextToolCalls: params.tools.length > 0,
+			model: meta.bareModel,
+		});
 		if (responseTextPromise) {
 			params.requestDump?.setResponseBodyTextWithLimit(
 				await responseTextPromise,

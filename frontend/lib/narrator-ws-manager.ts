@@ -136,11 +136,16 @@ const WS_STATUS_ID = "narrator-global";
 const MAX_LAST_MESSAGE_IDS = 100;
 const MAX_CATCH_UP_CURSORS = 100;
 /**
- * How long the tab must be hidden before we force a reconnect on return.
- * Matches the server heartbeat interval — if we missed at least one ping
- * cycle, the connection state is unreliable.
+ * How long the tab must be hidden before we force a full reconnect on return.
+ *
+ * Chosen to sit between the server heartbeat interval (30s) and its timeout
+ * (90s, see ws-handler.ts): within this window the connection is almost always
+ * still alive, so we prefer a lightweight sync_check over tearing down and
+ * rebuilding the shared socket (which re-subscribes every handle and can stampede
+ * catch-up queries). Past the threshold a clean reconnect is safer. Staying below
+ * the 90s server timeout guarantees a genuinely dead connection is still rebuilt.
  */
-const VISIBILITY_RECONNECT_THRESHOLD_MS = 30_000;
+const VISIBILITY_RECONNECT_THRESHOLD_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -531,7 +536,18 @@ class NarratorWSManager {
 		this.messageVersions.set(narratorId, version);
 	}
 
-	/** Optimistically increment the local version by 1 (called on each received message). */
+	/**
+	 * Optimistically increment the local version by 1 (called on each received message).
+	 *
+	 * This is a best-effort mirror of the server's authoritative `messageVersion`, not a
+	 * guaranteed-exact copy: the local count only advances for realtime frames this client
+	 * actually received while subscribed, so after a missed frame it can lag (or, in rare
+	 * interleavings, momentarily equal a server version that represents different content).
+	 * That's why the version is used ONLY as a cheap "probably in sync" hint to short-circuit
+	 * catch-up (see subscribe/sync_check) — never as proof of exact equality. An authoritative
+	 * value always overwrites it via updateMessageVersion() on catch_up/sync_ok, and the
+	 * on-focus sync_check backstops any drift by re-comparing against the server.
+	 */
 	bumpMessageVersion(narratorId: string): void {
 		const current = this.messageVersions.get(narratorId) ?? 0;
 		this.messageVersions.set(narratorId, current + 1);
@@ -900,6 +916,7 @@ class NarratorWSManager {
 			const narratorId = activeNarratorIds[0];
 			const cursor = this.catchUpCursors.get(narratorId);
 			const legacyLastMessageId = lastMessageId ?? this.lastMessageIds.get(narratorId);
+			const version = this.messageVersions.get(narratorId);
 			const msg: Record<string, unknown> = {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
@@ -908,6 +925,9 @@ class NarratorWSManager {
 			};
 			if (cursor) msg.catchUpCursor = cursor;
 			else if (legacyLastMessageId) msg.lastMessageId = legacyLastMessageId;
+			// Report the last-known version so the server can short-circuit to
+			// sync_ok when nothing changed since we last synced (skips catch-up).
+			if (version != null) msg.version = version;
 			ws.send(JSON.stringify(msg));
 			return;
 		}

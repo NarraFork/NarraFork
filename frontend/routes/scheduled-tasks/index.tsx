@@ -3,6 +3,7 @@ import {
 	Alert,
 	Badge,
 	Button,
+	Chip,
 	Container,
 	Group,
 	Modal,
@@ -17,20 +18,27 @@ import {
 	TextInput,
 	Title,
 	Tooltip,
+	UnstyledButton,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import {
 	IconAlertTriangle,
+	IconChevronRight,
 	IconClock,
+	IconFolder,
+	IconHistory,
+	IconMessage,
 	IconPencil,
 	IconPlayerPlay,
 	IconPlus,
 	IconTrash,
 } from "@tabler/icons-react";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { useChapters } from "../../hooks/useChapters";
+import { useAllModels } from "../../hooks/useModels";
 import { useProjects } from "../../hooks/useProjects";
 import {
 	useCreateScheduledTask,
@@ -41,12 +49,16 @@ import {
 	useUpdateScheduledTask,
 } from "../../hooks/useScheduledTasks";
 import type { ScheduledTask, ScheduledTaskInput } from "../../lib/api";
+import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import {
 	type CronPresetState,
 	cronToPreset,
 	DEFAULT_CRON_PRESET,
 	presetToCron,
 } from "../../lib/cron-presets";
+import { formatRelativeTime } from "../../lib/format";
+
+const MODEL_SELECT_OPTION_LIMIT = 100;
 
 export const Route = createFileRoute("/scheduled-tasks/")({
 	component: ScheduledTasksPage,
@@ -105,6 +117,7 @@ function draftFromTask(task: ScheduledTask): TaskDraft {
 function ScheduledTasksPage() {
 	const { t } = useTranslation("scheduledTasks");
 	const { t: tc } = useTranslation("common");
+	const navigate = useNavigate();
 	const { data: tasks = [], isLoading } = useScheduledTasks();
 
 	const createMutation = useCreateScheduledTask();
@@ -179,6 +192,10 @@ function ScheduledTasksPage() {
 
 	return (
 		<Container size="md" py="lg">
+			<style>
+				{`.scheduled-task-row-open{padding:6px 8px;margin:-6px -8px;transition:background-color 120ms ease;}
+				.scheduled-task-row-open:hover{background-color:var(--mantine-color-default-hover);}`}
+			</style>
 			<Group justify="space-between" mb="md" align="flex-start">
 				<Stack gap={4}>
 					<Group gap="xs">
@@ -213,6 +230,12 @@ function ScheduledTasksPage() {
 							}}
 							onToggle={(enabled) => toggleMutation.mutate({ id: task.id, enabled })}
 							onRun={() => runMutation.mutate(task.id)}
+							onDetails={() =>
+								navigate({ to: "/scheduled-tasks/$taskId", params: { taskId: task.id } })
+							}
+							onOpenNarrator={(narratorId) =>
+								navigate({ to: "/narrators/$narratorId", params: { narratorId } })
+							}
 							running={runMutation.isPending && runMutation.variables === task.id}
 						/>
 					))}
@@ -262,6 +285,8 @@ function TaskRow({
 	onDelete,
 	onToggle,
 	onRun,
+	onDetails,
+	onOpenNarrator,
 	running,
 }: {
 	task: ScheduledTask;
@@ -269,62 +294,118 @@ function TaskRow({
 	onDelete: () => void;
 	onToggle: (enabled: boolean) => void;
 	onRun: () => void;
+	onDetails: () => void;
+	onOpenNarrator: (narratorId: string) => void;
 	running: boolean;
 }) {
 	const { t } = useTranslation("scheduledTasks");
 	const nextRun = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString() : "—";
-	const lastRun = task.lastRunAt ? new Date(task.lastRunAt).toLocaleString() : null;
+	const lastRunAbs = task.lastRunAt ? new Date(task.lastRunAt).toLocaleString() : null;
+	const lastRunRel = task.lastRunAt ? formatRelativeTime(task.lastRunAt) : null;
+	const lastStatusColor = task.lastStatus
+		? task.lastStatus === "success"
+			? "teal"
+			: task.lastStatus === "skipped"
+				? "yellow"
+				: "red"
+		: "gray";
 
 	return (
 		<Paper withBorder p="md">
 			<Group justify="space-between" wrap="nowrap" align="flex-start">
-				<Stack gap={6} style={{ minWidth: 0, flex: 1 }}>
-					<Group gap="xs">
-						<Text fw={600} truncate>
-							{task.name}
-						</Text>
-						<Badge size="sm" variant="light" color={task.enabled ? "teal" : "gray"}>
-							{task.enabled ? t("statusEnabled") : t("statusDisabled")}
-						</Badge>
-						<Badge size="sm" variant="outline" color="indigo">
-							{task.runContext === "chapter" ? t("ctxChapter") : t("ctxStandalone")}
-						</Badge>
-						{task.lastStatus && (
-							<Badge
-								size="sm"
-								variant="light"
-								color={
-									task.lastStatus === "success"
-										? "teal"
-										: task.lastStatus === "skipped"
-											? "yellow"
-											: "red"
-								}
-							>
-								{t(`last_${task.lastStatus}`)}
-							</Badge>
-						)}
+				{/* Whole info area is a single large click target into the detail page. */}
+				<UnstyledButton
+					onClick={onDetails}
+					title={t("viewDetails")}
+					style={{ minWidth: 0, flex: 1, borderRadius: 8 }}
+					className="scheduled-task-row-open"
+				>
+					<Group gap="sm" wrap="nowrap" align="flex-start">
+						<Stack gap={6} style={{ minWidth: 0, flex: 1 }}>
+							<Group gap="xs">
+								<Text fw={600} truncate>
+									{task.name}
+								</Text>
+								<Badge size="sm" variant="light" color={task.enabled ? "teal" : "gray"}>
+									{task.enabled ? t("statusEnabled") : t("statusDisabled")}
+								</Badge>
+								<Badge size="sm" variant="outline" color="indigo">
+									{task.runContext === "chapter" ? t("ctxChapter") : t("ctxStandalone")}
+								</Badge>
+							</Group>
+							<Text size="xs" c="dimmed" ff="monospace">
+								{task.cronExpr}
+								{task.timezone ? ` (${task.timezone})` : ""}
+							</Text>
+							<Text size="xs" c="dimmed">
+								{t("nextRun")}: {nextRun}
+							</Text>
+
+							{/* Last-run summary: status + when + error, with a direct link to its narrator. */}
+							<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+								<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
+									{t("lastRun")}:
+								</Text>
+								{task.lastStatus ? (
+									<>
+										<Badge
+											size="sm"
+											variant="light"
+											color={lastStatusColor}
+											style={{ flexShrink: 0 }}
+										>
+											{t(`last_${task.lastStatus}`)}
+										</Badge>
+										{lastRunRel && (
+											<Text
+												size="xs"
+												c="dimmed"
+												style={{ flexShrink: 0 }}
+												title={lastRunAbs ?? undefined}
+											>
+												{lastRunRel}
+											</Text>
+										)}
+										{task.lastError && (
+											<Text size="xs" c="red" truncate title={task.lastError}>
+												{task.lastError}
+											</Text>
+										)}
+									</>
+								) : (
+									<Text size="xs" c="dimmed">
+										{t("neverRun")}
+									</Text>
+								)}
+							</Group>
+
+							<Group gap={4} wrap="nowrap" c="indigo">
+								<IconHistory size={14} />
+								<Text size="xs" fw={500}>
+									{t("viewRunHistory")}
+								</Text>
+								<IconChevronRight size={14} />
+							</Group>
+						</Stack>
 					</Group>
-					<Text size="xs" c="dimmed" ff="monospace">
-						{task.cronExpr}
-						{task.timezone ? ` (${task.timezone})` : ""}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{t("nextRun")}: {nextRun}
-						{lastRun ? ` · ${t("lastRun")}: ${lastRun}` : ""}
-					</Text>
-					{task.lastError && (
-						<Text size="xs" c="red" lineClamp={2}>
-							{task.lastError}
-						</Text>
-					)}
-				</Stack>
+				</UnstyledButton>
 				<Group gap="xs" wrap="nowrap">
 					<Switch
 						checked={task.enabled}
 						onChange={(e) => onToggle(e.currentTarget.checked)}
 						size="sm"
 					/>
+					{task.lastNarratorId && (
+						<Tooltip label={t("openLastNarrator")}>
+							<ActionIcon
+								variant="subtle"
+								onClick={() => onOpenNarrator(task.lastNarratorId as string)}
+								aria-label={t("openLastNarrator")}
+							>
+								<IconMessage size={16} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 					<Tooltip label={t("runNow")}>
 						<ActionIcon variant="subtle" onClick={onRun} loading={running} aria-label={t("runNow")}>
 							<IconPlayerPlay size={16} />
@@ -377,6 +458,7 @@ function TaskFormModal({
 	const { data: chapters = [] } = useChapters(
 		draft.runContext === "chapter" ? draft.projectId : "",
 	);
+	const { groupedModels } = useAllModels();
 
 	const patch = useCallback(
 		(p: Partial<TaskDraft>) => setDraft((d) => ({ ...d, ...p })),
@@ -468,16 +550,29 @@ function TaskFormModal({
 							onChange={(v) => patchPreset({ hourlyMinute: Number(v) || 0 })}
 						/>
 					)}
+					{preset.kind === "weekly" && (
+						<Stack gap={4}>
+							<Text size="sm">{t("weekday")}</Text>
+							<Chip.Group
+								multiple
+								value={preset.weekdays.map(String)}
+								onChange={(vals) => {
+									const days = vals.map(Number);
+									patchPreset({ weekdays: days.length > 0 ? days : [1] });
+								}}
+							>
+								<Group gap="xs">
+									{weekdayOptions.map((opt) => (
+										<Chip key={opt.value} value={opt.value} size="xs">
+											{opt.label}
+										</Chip>
+									))}
+								</Group>
+							</Chip.Group>
+						</Stack>
+					)}
 					{(preset.kind === "daily" || preset.kind === "weekly") && (
 						<Group grow>
-							{preset.kind === "weekly" && (
-								<Select
-									label={t("weekday")}
-									data={weekdayOptions}
-									value={String(preset.weekday)}
-									onChange={(v) => patchPreset({ weekday: Number(v ?? "1") })}
-								/>
-							)}
 							<NumberInput
 								label={t("hour")}
 								min={0}
@@ -537,15 +632,13 @@ function TaskFormModal({
 						]}
 					/>
 					{draft.runContext === "standalone" ? (
-						<TextInput
+						<DirectoryPicker
 							label={t("cwd")}
 							description={t("cwdDesc")}
 							placeholder="/home/user/project"
+							leftSection={<IconFolder size={16} />}
 							value={draft.cwd}
-							onChange={(e) => {
-								const v = e.currentTarget.value;
-								patch({ cwd: v });
-							}}
+							onChange={(v) => patch({ cwd: v })}
 						/>
 					) : (
 						<Group grow align="flex-start">
@@ -594,15 +687,16 @@ function TaskFormModal({
 					/>
 				</Group>
 
-				<TextInput
+				<Select
 					label={t("model")}
 					description={t("modelDesc")}
-					placeholder={t("modelPlaceholder")}
-					value={draft.model}
-					onChange={(e) => {
-						const v = e.currentTarget.value;
-						patch({ model: v });
-					}}
+					data={groupedModels}
+					searchable
+					limit={MODEL_SELECT_OPTION_LIMIT}
+					value={draft.model || FOLLOW_DEFAULT_MODEL}
+					onChange={(v) => patch({ model: v && v !== FOLLOW_DEFAULT_MODEL ? v : "" })}
+					maxDropdownHeight={320}
+					comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
 				/>
 
 				<Select

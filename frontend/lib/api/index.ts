@@ -100,7 +100,9 @@ export type {
 	ScheduledTaskLastStatus,
 	ScheduledTaskLocale,
 	ScheduledTaskNarratorMode,
+	ScheduledTaskRun,
 	ScheduledTaskRunContext,
+	ScheduledTaskRunsPage,
 } from "./scheduled-tasks";
 export {
 	scanStorageStream,

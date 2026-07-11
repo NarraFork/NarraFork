@@ -2153,3 +2153,33 @@ export const scheduledTasks = sqliteTable(
 		index("idx_scheduled_tasks_project").on(table.projectId),
 	],
 );
+
+// === scheduled_task_runs (per-run history) ===
+// One row per task execution (scheduled tick or manual trigger). Enables the task
+// detail page to list every run with its outcome and the narrator it dispatched.
+export const scheduledTaskRuns = sqliteTable(
+	"scheduled_task_runs",
+	{
+		id: text("id").primaryKey(),
+		taskId: text("task_id")
+			.notNull()
+			.references(() => scheduledTasks.id, { onDelete: "cascade" }),
+		// The narrator this run created/used. Plain text (no FK) so archiving/deleting a
+		// narrator never cascades into run history; the UI tolerates a missing narrator.
+		narratorId: text("narrator_id"),
+		status: text("status", { enum: ["success", "failed", "skipped"] }).notNull(),
+		error: text("error"),
+		// Run environment snapshot at dispatch time.
+		runContext: text("run_context", { enum: ["standalone", "chapter"] }).notNull(),
+		// Whether this run was triggered manually ("Run now") vs the cron schedule.
+		manual: integer("manual", { mode: "boolean" }).notNull().default(false),
+		startedAt: text("started_at"),
+		finishedAt: text("finished_at"),
+		durationMs: integer("duration_ms"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_scheduled_task_runs_task").on(table.taskId, table.createdAt),
+		index("idx_scheduled_task_runs_narrator").on(table.narratorId),
+	],
+);

@@ -291,7 +291,12 @@ export function renderTreeMessages(
 		messageId: string,
 		newContent: string,
 		rollback: boolean,
-		opts?: { keepImageIds: string[]; newImages: File[] },
+		opts?: {
+			keepImageIds: string[];
+			newImages: File[];
+			keepTextFilePaths: string[];
+			newTextFiles: File[];
+		},
 	) => void,
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void,
 	onRestoreAssistantMessage?: (messageId: string) => void,

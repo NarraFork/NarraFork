@@ -1,6 +1,6 @@
-import { and, asc, eq, lte } from "drizzle-orm";
+import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
-import { scheduledTasks } from "../db/schema";
+import { scheduledTaskRuns, scheduledTasks } from "../db/schema";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -12,6 +12,11 @@ import { narratorService } from "./narrator-service";
 import { isLoopRunning, sendMessage } from "./narrator-session";
 
 type ScheduledTask = typeof scheduledTasks.$inferSelect;
+type ScheduledTaskRun = typeof scheduledTaskRuns.$inferSelect;
+
+/** Max run-history rows returned in a single page. */
+const RUNS_PAGE_MAX = 200;
+const RUNS_PAGE_DEFAULT = 50;
 
 export interface CreateScheduledTaskInput {
 	name: string;
@@ -198,6 +203,8 @@ export const scheduledTaskService = {
 			// so a persistent failure doesn't wedge the schedule.
 			const nextRunAt = task.enabled ? nextCronRun(task.cronExpr, task.timezone) : null;
 
+			const startedAt = now();
+			const startMs = Date.now();
 			let status: "success" | "failed" | "skipped" = "success";
 			let error: string | null = null;
 			let narratorId: string | null = null;
@@ -227,20 +234,68 @@ export const scheduledTaskService = {
 				logger.error("Scheduled task run failed", { taskId: id, error });
 			}
 
+			const finishedAt = now();
+
 			await db
 				.update(scheduledTasks)
 				.set({
-					lastRunAt: now(),
+					lastRunAt: finishedAt,
 					lastStatus: status,
 					lastError: error,
 					lastNarratorId: narratorId ?? task.lastNarratorId,
 					reuseNarratorId,
 					// A manual trigger doesn't disturb the cron cadence unless enabled.
 					...(opts.manual ? {} : { nextRunAt }),
-					updatedAt: now(),
+					updatedAt: finishedAt,
 				})
 				.where(eq(scheduledTasks.id, id));
+
+			// Persist a run-history row. Wrapped in try/catch so a history write
+			// failure never bubbles up and disrupts the schedule.
+			try {
+				await db.insert(scheduledTaskRuns).values({
+					id: generateId(),
+					taskId: id,
+					narratorId,
+					status,
+					error,
+					runContext: task.runContext,
+					manual: opts.manual === true,
+					startedAt,
+					finishedAt,
+					durationMs: Date.now() - startMs,
+					createdAt: finishedAt,
+				});
+			} catch (err) {
+				logger.error("Failed to record scheduled task run history", {
+					taskId: id,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
 		});
+	},
+
+	/**
+	 * List run-history rows for a task, newest first. Cursor-paginated via the
+	 * `createdAt` of the last row seen (LIMIT n+1 to detect more; no COUNT).
+	 */
+	async listRuns(
+		taskId: string,
+		opts: { limit?: number; cursor?: string | null } = {},
+	): Promise<{ runs: ScheduledTaskRun[]; nextCursor: string | null }> {
+		const limit = Math.min(Math.max(opts.limit ?? RUNS_PAGE_DEFAULT, 1), RUNS_PAGE_MAX);
+		const where = opts.cursor
+			? and(eq(scheduledTaskRuns.taskId, taskId), lt(scheduledTaskRuns.createdAt, opts.cursor))
+			: eq(scheduledTaskRuns.taskId, taskId);
+		const rows = await db.query.scheduledTaskRuns.findMany({
+			where,
+			orderBy: (t) => [desc(t.createdAt)],
+			limit: limit + 1,
+		});
+		const hasMore = rows.length > limit;
+		const runs = hasMore ? rows.slice(0, limit) : rows;
+		const nextCursor = hasMore ? (runs[runs.length - 1]?.createdAt ?? null) : null;
+		return { runs, nextCursor };
 	},
 
 	/**
@@ -289,6 +344,7 @@ export const scheduledTaskService = {
 					permissionMode: task.permissionMode,
 					startInPlanMode: false,
 					title: task.name,
+					extraTraits: ["scheduled"],
 				});
 				narratorId = created.id;
 			}
@@ -312,6 +368,7 @@ export const scheduledTaskService = {
 					startInPlanMode: false,
 					cwd: task.cwd ?? getHome(),
 					title: task.name,
+					extraTraits: ["scheduled"],
 				});
 				narratorId = created.id;
 				if (task.narratorMode === "reuse") newReuseId = created.id;

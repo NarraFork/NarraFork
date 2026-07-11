@@ -65,4 +65,15 @@ export const specApi = {
 			method: "PUT",
 			body: JSON.stringify(data),
 		}),
+
+	/** Empty tasks.json for this narrator. */
+	clearSpecTasks: (narratorId: string) =>
+		request<{ ok: boolean; revisionId: string | null }>(
+			`/narrators/${narratorId}/spec/tasks/clear`,
+			{ method: "POST" },
+		),
+
+	/** Reset the narrator's entire Dynamic Spec namespace to defaults. */
+	resetSpec: (narratorId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/spec/reset`, { method: "POST" }),
 };

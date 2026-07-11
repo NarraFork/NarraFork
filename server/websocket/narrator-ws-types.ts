@@ -631,5 +631,5 @@ export type NarratorServerMessage =
 			path: string;
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
-			source: "ui" | "tool" | "task_create";
+			source: "ui" | "tool" | "task_create" | "reset";
 	  };

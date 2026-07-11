@@ -63,6 +63,18 @@ scheduledTaskRoutes.post("/:id/run", async (c) => {
 	return c.json(task);
 });
 
+/** List a task's run history (newest first, cursor-paginated). */
+scheduledTaskRoutes.get("/:id/runs", async (c) => {
+	const id = c.req.param("id");
+	const existing = await scheduledTaskService.get(id);
+	if (!existing) throw new NotFoundError("ScheduledTask", id);
+	const limitRaw = Number(c.req.query("limit"));
+	const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
+	const cursor = c.req.query("cursor") || null;
+	const result = await scheduledTaskService.listRuns(id, { limit, cursor });
+	return c.json(result);
+});
+
 /** Delete a scheduled task. */
 scheduledTaskRoutes.delete("/:id", async (c) => {
 	const id = c.req.param("id");

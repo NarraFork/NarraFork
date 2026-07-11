@@ -11,6 +11,7 @@ import { AsyncMutex } from "../lib/async-mutex";
 import { generateId } from "../lib/id";
 import {
 	analyzeSpecTasksCandidate,
+	compileSpecTasks,
 	detectProtectedMutations,
 	parseSpecTasksDocument,
 	SPEC_TASKS_PATH,
@@ -550,6 +551,85 @@ export async function appendProtectedSpecTask(
 	return { added: true, written };
 }
 
+export interface SpecTasksSummary {
+	/** Total number of tasks currently in tasks.json. */
+	total: number;
+	/** Number of open tasks (todo / doing / blocked). */
+	open: number;
+	/** Number of open protected tasks. */
+	protectedOpen: number;
+}
+
+/**
+ * Summarize the narrator's tasks.json without loading full task text into the
+ * caller. Used by fork carryover to decide whether to surface the reset card.
+ */
+export async function summarizeSpecTasks(narratorId: string): Promise<SpecTasksSummary> {
+	const file = await readTasksFileForNarrator(narratorId);
+	const document = parseSpecTasksDocument(file.content);
+	const compiled = compileSpecTasks(document);
+	const open = compiled.tasks.filter(
+		(task) => task.status === "doing" || task.status === "todo" || task.status === "blocked",
+	).length;
+	return {
+		total: compiled.tasks.length,
+		open,
+		protectedOpen: compiled.protectedOpenCount,
+	};
+}
+
+/**
+ * Empty the narrator's tasks.json (reset to `{ "tasks": [] }`). Written as the
+ * user with protected-task mutation allowed, so protected locks are released
+ * (marked deleted) without requiring taskReflection. Only affects this
+ * narrator's own namespace — a forked child has an independent namespace, so
+ * clearing the child never touches the parent.
+ */
+export async function clearSpecTasks(narratorId: string): Promise<SpecResolvedFile> {
+	return writeSpecFile(
+		narratorId,
+		toSpecUri(SPEC_TASKS_PATH),
+		serializeSpecTasksDocument({ tasks: [] }),
+		{ actor: "user", createdBy: "user", allowProtectedTaskMutation: true },
+	);
+}
+
+/**
+ * Reset the narrator's entire Dynamic Spec namespace to its initial state:
+ * every tracked file is dropped (so built-in files fall back to their defaults
+ * and custom *.md notes disappear) and all open protected-task locks are
+ * marked deleted. Operates only on this narrator's namespace, so resetting a
+ * forked child never affects the parent.
+ */
+export async function resetSpecNamespace(narratorId: string): Promise<void> {
+	const namespace = await ensureNamespace(narratorId);
+	const now = new Date().toISOString();
+	db.transaction((tx) => {
+		// Drop all tracked files. Built-in paths (index.md / tasks.json /
+		// behavior_fence) revert to their BUILTIN_FILES defaults because
+		// readSpecFile falls back when there is no namespace-file row; custom
+		// *.md notes simply cease to exist.
+		tx.delete(specNamespaceFiles).where(eq(specNamespaceFiles.namespaceId, namespace.id)).run();
+
+		// Release every open protected-task lock so a future tasks.json write is
+		// not blocked by a stale commitment from before the reset.
+		tx.update(specProtectedTasks)
+			.set({ status: "deleted", deletedAt: now, updatedAt: now })
+			.where(
+				and(
+					eq(specProtectedTasks.namespaceId, namespace.id),
+					inArray(specProtectedTasks.status, ["todo", "doing", "blocked"]),
+				),
+			)
+			.run();
+
+		tx.update(specNamespaces)
+			.set({ updatedAt: now })
+			.where(eq(specNamespaces.id, namespace.id))
+			.run();
+	});
+}
+
 export const specVfsService = {
 	isSpecUri,
 	toSpecUri,
@@ -563,4 +643,7 @@ export const specVfsService = {
 	forkSpecNamespace,
 	readTasksFileForNarrator,
 	appendProtectedSpecTask,
+	summarizeSpecTasks,
+	clearSpecTasks,
+	resetSpecNamespace,
 };

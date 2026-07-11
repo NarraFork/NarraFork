@@ -38,6 +38,8 @@ export interface RecentTab {
 	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
+	/** Runtime-enriched marker: this narrator was spawned by a scheduled task. */
+	isScheduled?: boolean;
 }
 
 export const RECENT_TABS_QUERY_KEY = ["user-preferences", "recent-tabs"];
@@ -63,6 +65,7 @@ type PersistedRecentTab = Pick<
 	| "status"
 	| "lastVisitedAt"
 	| "pinned"
+	| "isScheduled"
 >;
 
 function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
@@ -78,6 +81,7 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.subtitle !== undefined) persisted.subtitle = tab.subtitle;
 	if (tab.status !== undefined) persisted.status = tab.status;
 	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
+	if (tab.isScheduled !== undefined) persisted.isScheduled = tab.isScheduled;
 	return persisted;
 }
 

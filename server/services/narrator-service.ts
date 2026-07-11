@@ -48,6 +48,7 @@ import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
+	type NarratorTrait,
 	parseTraits,
 	subagentVariant,
 } from "../lib/narrator-utils";
@@ -195,6 +196,8 @@ interface CreateNarratorInput {
 	creatorIsAdmin?: boolean;
 	/** Locale for generating the default kind-specific system prompt. */
 	locale?: Locale;
+	/** Extra permanent trait tags to attach (merged with derived traits, deduped). */
+	extraTraits?: NarratorTrait[];
 }
 
 interface CreateSubagentInput {
@@ -737,6 +740,51 @@ function escapeXmlAttr(s: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+/**
+ * Controls what happens to a forked narrator's inherited Dynamic Spec tasks:
+ * - `"card"` (default): if the parent had any tasks, insert a UI-only display
+ *   card in the child so the user can review, clear the tasks, or reset the
+ *   whole spec. The card never enters the model history.
+ * - `"clear"`: silently empty the child's tasks.json (used for lightweight,
+ *   read-only forks like ask-in-passing where task management is just noise).
+ */
+export type SpecForkCarryover = "card" | "clear";
+
+/**
+ * After a fork has copied the parent's Dynamic Spec into the child's (fresh,
+ * independent) namespace, apply the requested carryover behavior. All spec
+ * operations here target the CHILD narrator only, so nothing can affect the
+ * parent. Failures are swallowed: spec carryover must never break a fork.
+ */
+async function applySpecForkCarryover(
+	childNarratorId: string,
+	carryover: SpecForkCarryover,
+): Promise<void> {
+	try {
+		if (carryover === "clear") {
+			await specVfsService.clearSpecTasks(childNarratorId);
+			return;
+		}
+		// "card": only surface the reset card when there is something to manage.
+		const summary = await specVfsService.summarizeSpecTasks(childNarratorId);
+		if (summary.total <= 0) return;
+		await narratorPersistence.persistDisplayMessage(childNarratorId, "", [
+			{
+				type: "spec_fork_carryover",
+				total: summary.total,
+				open: summary.open,
+				protectedOpen: summary.protectedOpen,
+			},
+		]);
+	} catch (err) {
+		logger.warn("Failed to apply spec fork carryover (non-fatal)", {
+			childNarratorId,
+			carryover,
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 export const narratorService = {
 	// ── Core CRUD ──────────────────────────────────────────────────────────────
 
@@ -824,6 +872,14 @@ export const narratorService = {
 
 		// Merge all specialization-driven optional tools (named ∪ knowledge ∪ …).
 		const enabledTools = enabledToolsSet.size > 0 ? [...enabledToolsSet] : undefined;
+
+		// Attach any caller-supplied extra traits (e.g. "scheduled" for scheduled-task
+		// narrators), deduped against traits already derived above.
+		if (input.extraTraits?.length) {
+			for (const trait of input.extraTraits) {
+				if (!traits.includes(trait)) traits.push(trait);
+			}
+		}
 
 		const insertNarrator = async () =>
 			(
@@ -1321,6 +1377,7 @@ export const narratorService = {
 		});
 
 		await specVfsService.forkSpecNamespace(parentNarratorId, newNarrator.id);
+		await applySpecForkCarryover(newNarrator.id, "card");
 		return newNarrator;
 	},
 
@@ -1335,6 +1392,11 @@ export const narratorService = {
 			forkMessageId?: string;
 			/** Allow forking a chapter-bound narrator into a standalone narrator (no chapter). */
 			standalone?: boolean;
+			/**
+			 * What to do with the inherited Dynamic Spec tasks in the child.
+			 * Defaults to `"card"` (surface a reset card when tasks exist).
+			 */
+			specCarryover?: SpecForkCarryover;
 		},
 	) {
 		const parent = await this.getById(parentNarratorId);
@@ -1617,6 +1679,7 @@ export const narratorService = {
 		});
 
 		await specVfsService.forkSpecNamespace(parentNarratorId, id);
+		await applySpecForkCarryover(id, opts?.specCarryover ?? "card");
 		eventBus.emit({ type: "narrator:forked", narratorId: id, parentNarratorId });
 		broadcastToNarrator(parentNarratorId, {
 			type: "narrator_forked",

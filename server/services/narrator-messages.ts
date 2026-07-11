@@ -1021,6 +1021,20 @@ export const narratorMessageQueries = {
 		return narrator != null && isSubagentVariant(narrator.variant);
 	},
 
+	/**
+	 * The monotonic message version for a narrator, used by the WS sync protocol
+	 * (sync_check / subscribe short-circuit) to decide whether a client is already
+	 * up to date and can skip a full catch-up query.
+	 *
+	 * IMPLICIT CONTRACT — every persistence path that bumps `messageVersion` MUST
+	 * also emit a matching realtime broadcast (message / message_updated /
+	 * messages_deleted / compact / …). The sync protocol treats an unchanged
+	 * version as "nothing to replay", so a version bump WITHOUT a broadcast would
+	 * silently strand the client on the old view until its next focus sync_check.
+	 * The inverse (broadcast without a version bump) is fine — it just means an
+	 * extra sync_check may return catch_up. When adding a new write path, keep the
+	 * "bump version ⟺ broadcast" pairing intact.
+	 */
 	async getMessageVersion(narratorId: string): Promise<number> {
 		const row = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),

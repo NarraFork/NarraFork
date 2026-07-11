@@ -508,7 +508,16 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
-	return !EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name);
+	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
+	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,
+	// DangerConfirm/Cancel, …) settle a pending decision whose resolution aborts the
+	// reflection loop's own AbortController. Executing them eagerly mid-stream aborts the
+	// reflection provider.chat() while it is still in flight, which records a spurious
+	// "Aborted" API request in usage history. Defer them to the post-stream tool phase so
+	// the reflection request records a clean success (via finishRequest) before the tool
+	// settles the decision and triggers the expected abort.
+	if (toolRegistry.get(tu.name)?.reflectionOnly === true) return false;
+	return true;
 }
 
 /** Whether a tool use should skip parallel grouping and early execution. */

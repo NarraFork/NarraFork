@@ -13,11 +13,14 @@ import { generateId } from "../../lib/id";
 import {
 	analyzeSpecWriteCandidate,
 	appendProtectedSpecTask,
+	clearSpecTasks,
 	deleteSpecFile,
 	forkSpecNamespace,
 	listSpecFiles,
 	readSpecFile,
 	readTasksFileForNarrator,
+	resetSpecNamespace,
+	summarizeSpecTasks,
 	writeSpecFile,
 } from "../spec-vfs-service";
 
@@ -265,5 +268,148 @@ describe("spec namespace fork", () => {
 		expect(childCompletionCandidate.protectedMutations.map((mutation) => mutation.kind)).toEqual([
 			"complete",
 		]);
+	});
+});
+
+describe("spec fork carryover helpers", () => {
+	test("summarizeSpecTasks counts total / open / protected-open", async () => {
+		const narratorId = `spec-summary-${TAG}`;
+		await createNarrator(narratorId);
+		await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({
+				tasks: [
+					{ text: "Doing protected", status: "doing", protected: true },
+					{ text: "Todo normal", status: "todo" },
+					{ text: "Blocked one", status: "blocked" },
+					{ text: "Done normal", status: "done" },
+				],
+			}),
+			{ allowProtectedTaskMutation: true },
+		);
+
+		const summary = await summarizeSpecTasks(narratorId);
+		expect(summary.total).toBe(4);
+		expect(summary.open).toBe(3); // doing + todo + blocked
+		expect(summary.protectedOpen).toBe(1); // the doing protected task
+	});
+
+	test("summarizeSpecTasks reports zero for a fresh namespace", async () => {
+		const narratorId = `spec-summary-empty-${TAG}`;
+		await createNarrator(narratorId);
+		const summary = await summarizeSpecTasks(narratorId);
+		expect(summary).toEqual({ total: 0, open: 0, protectedOpen: 0 });
+	});
+
+	test("clearSpecTasks empties tasks.json and releases protected locks", async () => {
+		const narratorId = `spec-clear-${TAG}`;
+		await createNarrator(narratorId);
+		const written = await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({
+				tasks: [{ text: "Protected to clear", status: "doing", protected: true }],
+			}),
+			{ allowProtectedTaskMutation: true },
+		);
+		const namespaceId = written.namespaceId;
+
+		const cleared = await clearSpecTasks(narratorId);
+		const doc = JSON.parse(cleared.content);
+		expect(doc.tasks).toEqual([]);
+
+		const openLocks = await db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, namespaceId),
+		});
+		// Every prior open lock must now be deleted (released).
+		expect(openLocks.every((lock) => lock.status === "deleted")).toBe(true);
+	});
+
+	test("clearSpecTasks on the child never affects the parent", async () => {
+		const parentId = `spec-clear-parent-${TAG}`;
+		const childId = `spec-clear-child-${TAG}`;
+		await createNarrator(parentId);
+		await createNarrator(childId);
+		await writeSpecFile(
+			parentId,
+			"spec://tasks.json",
+			tasksContent({ tasks: [{ text: "Parent keeps this", status: "todo" }] }),
+		);
+		await forkSpecNamespace(parentId, childId);
+
+		await clearSpecTasks(childId);
+
+		const parentTasks = await readTasksFileForNarrator(parentId);
+		const parentDoc = JSON.parse(parentTasks.content);
+		expect(parentDoc.tasks).toHaveLength(1);
+		expect(parentDoc.tasks[0].text).toBe("Parent keeps this");
+
+		const childTasks = await readTasksFileForNarrator(childId);
+		expect(JSON.parse(childTasks.content).tasks).toEqual([]);
+	});
+
+	test("resetSpecNamespace restores built-ins, drops custom notes, releases locks", async () => {
+		const narratorId = `spec-reset-${TAG}`;
+		await createNarrator(narratorId);
+		// Seed: protected task, custom index.md, and a custom note file.
+		const seeded = await writeSpecFile(
+			narratorId,
+			"spec://tasks.json",
+			tasksContent({ tasks: [{ text: "Reset me", status: "doing", protected: true }] }),
+			{ allowProtectedTaskMutation: true },
+		);
+		const namespaceId = seeded.namespaceId;
+		await writeSpecFile(narratorId, "spec://index.md", "# Custom index\n\nchanged\n");
+		await writeSpecFile(narratorId, "spec://notes.md", "# Notes\n\nsome notes\n");
+
+		await resetSpecNamespace(narratorId);
+
+		// tasks.json falls back to the empty built-in.
+		const tasks = await readTasksFileForNarrator(narratorId);
+		expect(JSON.parse(tasks.content).tasks).toEqual([]);
+
+		// index.md reverts to the built-in default (contains the tasks.json pointer).
+		const index = await readSpecFile(narratorId, "spec://index.md");
+		expect(index.builtin).toBe(true);
+		expect(index.content).toContain("tasks.json");
+
+		// The custom note file is gone.
+		expect(readSpecFile(narratorId, "spec://notes.md")).rejects.toThrow(/not found/);
+		const files = await listSpecFiles(narratorId);
+		expect(files.map((f) => f.uri)).not.toContain("spec://notes.md");
+
+		// All previously open protected locks are released.
+		const locks = await db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, namespaceId),
+		});
+		expect(locks.every((lock) => lock.status === "deleted")).toBe(true);
+	});
+
+	test("resetSpecNamespace on the child never affects the parent", async () => {
+		const parentId = `spec-reset-parent-${TAG}`;
+		const childId = `spec-reset-child-${TAG}`;
+		await createNarrator(parentId);
+		await createNarrator(childId);
+		await writeSpecFile(
+			parentId,
+			"spec://tasks.json",
+			tasksContent({ tasks: [{ text: "Parent survives reset", status: "todo" }] }),
+		);
+		await writeSpecFile(parentId, "spec://notes.md", "# Parent notes\n\nkeep me\n");
+		await forkSpecNamespace(parentId, childId);
+
+		await resetSpecNamespace(childId);
+
+		// Parent tasks + custom note intact.
+		const parentTasks = await readTasksFileForNarrator(parentId);
+		expect(JSON.parse(parentTasks.content).tasks[0].text).toBe("Parent survives reset");
+		const parentNotes = await readSpecFile(parentId, "spec://notes.md");
+		expect(parentNotes.content).toContain("keep me");
+
+		// Child is reset.
+		const childTasks = await readTasksFileForNarrator(childId);
+		expect(JSON.parse(childTasks.content).tasks).toEqual([]);
+		expect(readSpecFile(childId, "spec://notes.md")).rejects.toThrow(/not found/);
 	});
 });

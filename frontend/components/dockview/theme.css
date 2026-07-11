@@ -66,6 +66,21 @@
 }
 
 /*
+ * dockview 的 .dv-render-overlay(defaultRenderer="always" 时每个面板内容的包裹层)
+ * 带了 transform: translate3d()、will-change: transform、contain: layout paint 三个
+ * GPU 优化提示,其中任意一个都会让它成为内部所有 position: fixed 后代的包含块。
+ * 聊天区的右键菜单/swipe 菜单/多选浮动工具条等用 position: fixed + 视口坐标定位,被
+ * overlay 重定基后会相对 overlay(左边缘 = 内容区左边)而非视口定位,整体右移一个导航栏
+ * 宽度而跑到屏幕外,表现为消息右半区右键无反应(失效区宽度恒等于导航宽度)。overlay 自身
+ * 用 left/top 绝对定位,这些提示对其布局无作用,安全清除。
+ */
+.dockview-theme-narrafork .dv-render-overlay {
+	transform: none;
+	will-change: auto;
+	contain: none;
+}
+
+/*
  * Single-tab groups: hide dockview's own tab strip entirely. Each NarraFork
  * panel (narrator / terminal / webview) renders its own header bar which also
  * doubles as the drag handle, so the dockview tab row is redundant noise when

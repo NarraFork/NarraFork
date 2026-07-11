@@ -1315,6 +1315,9 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
 	const newImages: ImageRef[] = [];
+	// undefined => keep all existing text files (legacy); array => keep only these paths.
+	let keepTextFilePaths: string[] | undefined;
+	const newTextFiles: File[] = [];
 
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
@@ -1332,6 +1335,17 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 				throw new ValidationError("keepImageIds must be a JSON array of strings");
 			}
 		}
+		const keepFilesRaw = formData.get("keepTextFilePaths");
+		if (typeof keepFilesRaw === "string") {
+			try {
+				const parsed = JSON.parse(keepFilesRaw);
+				if (Array.isArray(parsed)) {
+					keepTextFilePaths = parsed.filter((v): v is string => typeof v === "string");
+				}
+			} catch {
+				throw new ValidationError("keepTextFilePaths must be a JSON array of strings");
+			}
+		}
 		const imageFiles = formData.getAll("images") as File[];
 		const keepCount = keepImageIds?.length ?? 0;
 		if (keepCount + imageFiles.length > 10) {
@@ -1343,6 +1357,16 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			// base64 loading resolve correctly even when the message is shared/forked.
 			newImages.push({ ...ref, uploadNarratorId: id });
 		}
+		const textFileEntries = formData.getAll("textFiles") as File[];
+		const keepFileCount = keepTextFilePaths?.length ?? 0;
+		if (keepFileCount + textFileEntries.length > 10) {
+			throw new ValidationError("Maximum 10 text files per message");
+		}
+		for (const file of textFileEntries) {
+			// Validate here; the service saves them into the worktree (cwd is known there).
+			validateTextFile(file);
+			newTextFiles.push(file);
+		}
 	} else {
 		const body = await c.req.json();
 		content = typeof body.content === "string" ? body.content : "";
@@ -1350,12 +1374,20 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		if (Array.isArray(body.keepImageIds)) {
 			keepImageIds = body.keepImageIds.filter((v: unknown): v is string => typeof v === "string");
 		}
+		if (Array.isArray(body.keepTextFilePaths)) {
+			keepTextFilePaths = body.keepTextFilePaths.filter(
+				(v: unknown): v is string => typeof v === "string",
+			);
+		}
 	}
 
-	// Allow empty text only when at least one image remains (kept or newly added).
+	// Allow empty text only when at least one attachment remains (kept or newly added).
 	const hasImages =
 		(keepImageIds === undefined ? true : keepImageIds.length > 0) || newImages.length > 0;
-	if (!content.trim() && !hasImages) {
+	const hasTextFiles =
+		(keepTextFilePaths === undefined ? true : keepTextFilePaths.length > 0) ||
+		newTextFiles.length > 0;
+	if (!content.trim() && !hasImages && !hasTextFiles) {
 		throw new ValidationError("content is required");
 	}
 
@@ -1386,6 +1418,8 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		{
 			keepImageIds,
 			newImages: newImages.length > 0 ? newImages : undefined,
+			keepTextFilePaths,
+			newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
 			userId,
 		},
 	);
@@ -2761,6 +2795,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		forkMessageId: sourceMessageId,
 		title,
 		standalone: true,
+		// Ask-in-passing is a lightweight, read-only side conversation; inherited
+		// task management is just noise there, so clear it instead of surfacing
+		// the reset card.
+		specCarryover: "clear",
 	});
 
 	// Lock to readOnly + mark as ask-in-passing (user can "promote" later to unlock)

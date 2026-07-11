@@ -93,6 +93,11 @@ function NarratorDetailPage() {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = !!(narrator as any)?.variant?.startsWith("subagent:");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const isScheduled = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			((narrator as any).traits as string[]).includes("scheduled")
+		: false;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const parentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const chapterId = isSubagent ? null : ((narrator as any)?.chapterId as string | null | undefined);
@@ -133,6 +138,7 @@ function NarratorDetailPage() {
 				title: narratorTitle || "Subagent",
 				subtitle: narratorCwd,
 				status: narratorStatus,
+				isScheduled,
 			});
 			return;
 		}
@@ -146,6 +152,7 @@ function NarratorDetailPage() {
 				title: displayTitle,
 				subtitle: chapterTitle,
 				status: narratorStatus,
+				isScheduled,
 			});
 		} else {
 			addRecentTab({
@@ -154,6 +161,7 @@ function NarratorDetailPage() {
 				title: narratorTitle || "New conversation",
 				subtitle: narratorCwd,
 				status: narratorStatus,
+				isScheduled,
 			});
 		}
 	}, [
@@ -165,6 +173,7 @@ function NarratorDetailPage() {
 		narratorStatus,
 		chapterTitle,
 		isSubagent,
+		isScheduled,
 		parentNarratorId,
 		userPrefs?.addSubagentToRecentTabs,
 		userPrefsLoading,

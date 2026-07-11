@@ -52,7 +52,13 @@ export function useSpecFile(narratorId: string, uri: string) {
 		const handle = narratorWSManager.addListener(
 			{ narratorIds: [narratorId], types: ["spec_changed"] },
 			(data) => {
-				if (data.uri === uri || data.path === uri.replace("spec://", "")) {
+				// A reset rewrites every file at once, so refresh regardless of which
+				// path the event names.
+				if (
+					data.source === "reset" ||
+					data.uri === uri ||
+					data.path === uri.replace("spec://", "")
+				) {
 					qc.invalidateQueries({ queryKey: specFileKey(narratorId, uri) });
 				}
 			},

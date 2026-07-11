@@ -15,8 +15,8 @@ export interface CronPresetState {
 	/** daily / weekly: hour (0-23) + minute (0-59) */
 	hour: number;
 	minute: number;
-	/** weekly: day of week 0-6 (0 = Sunday) */
-	weekday: number;
+	/** weekly: days of week 0-6 (0 = Sunday). Multiple days allowed. */
+	weekdays: number[];
 	/** custom raw expression */
 	custom: string;
 }
@@ -27,7 +27,7 @@ export const DEFAULT_CRON_PRESET: CronPresetState = {
 	hourlyMinute: 0,
 	hour: 9,
 	minute: 0,
-	weekday: 1,
+	weekdays: [1],
 	custom: "0 9 * * *",
 };
 
@@ -42,8 +42,14 @@ export function presetToCron(state: CronPresetState): string {
 			return `${clamp(state.hourlyMinute, 0, 59)} * * * *`;
 		case "daily":
 			return `${clamp(state.minute, 0, 59)} ${clamp(state.hour, 0, 23)} * * *`;
-		case "weekly":
-			return `${clamp(state.minute, 0, 59)} ${clamp(state.hour, 0, 23)} * * ${clamp(state.weekday, 0, 6)}`;
+		case "weekly": {
+			// Dedupe, clamp to 0-6, sort ascending; fall back to Monday if empty.
+			const days = Array.from(new Set(state.weekdays.map((d) => clamp(d, 0, 6)))).sort(
+				(a, b) => a - b,
+			);
+			const dow = days.length > 0 ? days.join(",") : "1";
+			return `${clamp(state.minute, 0, 59)} ${clamp(state.hour, 0, 23)} * * ${dow}`;
+		}
 		default:
 			return state.custom.trim();
 	}
@@ -77,9 +83,29 @@ export function cronToPreset(cron: string): CronPresetState {
 	if (/^\d+$/.test(min) && /^\d+$/.test(hr) && dom === "*" && mon === "*" && dow === "*") {
 		return { ...base, kind: "daily", hour: Number(hr), minute: Number(min) };
 	}
-	// weekly: "M H * * D"
-	if (/^\d+$/.test(min) && /^\d+$/.test(hr) && dom === "*" && mon === "*" && /^\d+$/.test(dow)) {
-		return { ...base, kind: "weekly", hour: Number(hr), minute: Number(min), weekday: Number(dow) };
+	// weekly: "M H * * D" or "M H * * D1,D2,..." (comma-separated day list)
+	if (
+		/^\d+$/.test(min) &&
+		/^\d+$/.test(hr) &&
+		dom === "*" &&
+		mon === "*" &&
+		/^\d+(,\d+)*$/.test(dow)
+	) {
+		const weekdays = Array.from(
+			new Set(
+				dow
+					.split(",")
+					.map((d) => Number(d))
+					.filter((d) => d >= 0 && d <= 6),
+			),
+		).sort((a, b) => a - b);
+		return {
+			...base,
+			kind: "weekly",
+			hour: Number(hr),
+			minute: Number(min),
+			weekdays: weekdays.length > 0 ? weekdays : [1],
+		};
 	}
 	return { ...base, kind: "custom" };
 }

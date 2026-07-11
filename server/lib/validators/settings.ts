@@ -122,6 +122,7 @@ export const recentTabSchema = z.object({
 	status: z.string().max(50).optional(),
 	lastVisitedAt: z.number(),
 	pinned: z.boolean().optional(),
+	isScheduled: z.boolean().optional(),
 });
 
 export const upsertRecentTabSchema = recentTabSchema.extend({

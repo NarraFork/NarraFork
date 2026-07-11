@@ -32,6 +32,25 @@ export interface ScheduledTask {
 	updatedAt: string;
 }
 
+export interface ScheduledTaskRun {
+	id: string;
+	taskId: string;
+	narratorId: string | null;
+	status: ScheduledTaskLastStatus;
+	error: string | null;
+	runContext: ScheduledTaskRunContext;
+	manual: boolean;
+	startedAt: string | null;
+	finishedAt: string | null;
+	durationMs: number | null;
+	createdAt: string;
+}
+
+export interface ScheduledTaskRunsPage {
+	runs: ScheduledTaskRun[];
+	nextCursor: string | null;
+}
+
 export interface ScheduledTaskInput {
 	name: string;
 	cronExpr: string;
@@ -53,6 +72,15 @@ export const scheduledTasksApi = {
 	listScheduledTasks: () => request<ScheduledTask[]>("/scheduled-tasks"),
 	getScheduledTask: (id: string) =>
 		request<ScheduledTask>(`/scheduled-tasks/${encodeURIComponent(id)}`),
+	listScheduledTaskRuns: (id: string, opts?: { limit?: number; cursor?: string | null }) => {
+		const params = new URLSearchParams();
+		if (opts?.limit != null) params.set("limit", String(opts.limit));
+		if (opts?.cursor) params.set("cursor", opts.cursor);
+		const qs = params.toString();
+		return request<ScheduledTaskRunsPage>(
+			`/scheduled-tasks/${encodeURIComponent(id)}/runs${qs ? `?${qs}` : ""}`,
+		);
+	},
 	createScheduledTask: (data: ScheduledTaskInput) =>
 		request<ScheduledTask>("/scheduled-tasks", {
 			method: "POST",

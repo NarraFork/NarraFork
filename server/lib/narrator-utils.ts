@@ -66,7 +66,8 @@ export type NarratorTrait =
 	| "ask-in-passing"
 	| "background"
 	| "plan"
-	| "knowledge-steward";
+	| "knowledge-steward"
+	| "scheduled";
 
 /** Trait marking a Knowledge Steward narrator (a standalone knowledge-base management session). */
 export const KNOWLEDGE_KIND_TRAIT = "knowledge-steward";

@@ -78,6 +78,7 @@ export type NarratorClientMessage =
 			catchUpCursor?: CatchUpCursor;
 			kind?: NarratorSubscriptionKind;
 			requestId?: string;
+			version?: number;
 	  }
 	| { type: "unsubscribe"; narratorIds: string[] }
 	| {
@@ -864,6 +865,29 @@ export const handleNarratorWS = {
 				}
 
 				if (catchUpNarratorId && catchUpAnchor) {
+					// When the client reports a known messageVersion and it still matches
+					// the server, skip the full catch-up query entirely: nothing changed
+					// since the client last synced, so a single indexed version read +
+					// sync_ok is enough. This makes "switch away and back" cheap on the
+					// common path (version unchanged) and avoids the synchronous SQLite
+					// tree/hydrate/enrich work blocking the event loop for other narrators.
+					if (msg.version != null) {
+						const serverVersion = await narratorService
+							.getMessageVersion(catchUpNarratorId)
+							.catch(() => null);
+						if (serverVersion != null && serverVersion === msg.version) {
+							// Must subscribe so realtime frames still reach this connection.
+							ws.data.subscribedNarrators.add(catchUpNarratorId);
+							safeSend(
+								ws,
+								withSubscriptionRequestId(
+									{ type: "sync_ok", narratorId: catchUpNarratorId, version: serverVersion },
+									requestId,
+								),
+							);
+							break;
+						}
+					}
 					sendCatchUpForAnchor(ws, catchUpNarratorId, catchUpAnchor, requestId).catch((err) => {
 						logger.warn("Failed to send catch-up messages", { error: String(err) });
 					});
@@ -1130,9 +1154,14 @@ export const handleNarratorWS = {
 				}
 				const catchUpAnchor = msg.catchUpCursor ?? msg.lastMessageId;
 				if (catchUpAnchor) {
-					sendCatchUpForAnchor(ws, narratorId, catchUpAnchor, requestId, {
-						emptyResult: "full_reload",
-					}).catch((err: unknown) =>
+					// Empty catch-up result (version bumped but no new top-level/child
+					// message since the anchor — e.g. a tool result written into an
+					// existing message) resolves with sync_ok, not full_reload: the
+					// connection is still subscribed and any structural change (delete /
+					// compact) already arrives via its own realtime broadcast. A truly
+					// unresolvable anchor still falls back to full_reload via the hitLimit
+					// path inside sendCatchUpForAnchor.
+					sendCatchUpForAnchor(ws, narratorId, catchUpAnchor, requestId).catch((err: unknown) =>
 						logger.warn("sync_check catch-up failed", { error: String(err) }),
 					);
 				} else {

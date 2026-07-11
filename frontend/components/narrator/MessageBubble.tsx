@@ -25,7 +25,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { formatFileSize } from "@shared/text-file-types";
+import { formatFileSize, isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
 	IconArrowBackUp,
@@ -44,9 +44,11 @@ import {
 	IconLock,
 	IconMessageQuestion,
 	IconNotebook,
+	IconPaperclip,
 	IconPencil,
 	IconPhoto,
 	IconRepeat,
+	IconRestore,
 	IconTrash,
 	IconWorldSearch,
 	IconX,
@@ -77,6 +79,7 @@ import {
 	type SideCarRecord,
 } from "../../lib/api";
 import { Z } from "../../lib/z-index";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
 import { UserAvatar } from "../UserAvatar";
 import { AskInPassingPendingCard, AskInPassingResolvedCard } from "./AskInPassingCard";
@@ -301,7 +304,12 @@ interface MessageBubbleProps {
 		messageId: string,
 		newContent: string,
 		rollback: boolean,
-		opts?: { keepImageIds: string[]; newImages: File[] },
+		opts?: {
+			keepImageIds: string[];
+			newImages: File[];
+			keepTextFilePaths: string[];
+			newTextFiles: File[];
+		},
 	) => void;
 	/** Edit assistant message text without deleting later messages or regenerating. */
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
@@ -1495,6 +1503,134 @@ function SelectableSystemNotice({
 	);
 }
 
+// ---------------------------------------------------------------------------
+// SpecForkCarryoverCard — shown in a freshly forked narrator when it inherited
+// a non-empty tasks.json from its parent. The child has an independent Dynamic
+// Spec namespace, so clearing tasks or resetting the spec here never touches
+// the parent. Rendered as a UI-only `disp` message (never in model history).
+// ---------------------------------------------------------------------------
+function SpecForkCarryoverCard({
+	narratorId,
+	total,
+	open,
+	protectedOpen,
+}: {
+	narratorId?: string;
+	total: number;
+	open: number;
+	protectedOpen: number;
+}) {
+	const { t } = useTranslation("narrator");
+	const confirm = useConfirmDialog();
+	const qc = useQueryClient();
+	const [busy, setBusy] = useState<null | "clear" | "reset">(null);
+	const [done, setDone] = useState<null | "clear" | "reset">(null);
+
+	const invalidateSpec = useCallback(() => {
+		if (!narratorId) return;
+		qc.invalidateQueries({ queryKey: ["narrators", narratorId, "spec"] });
+	}, [qc, narratorId]);
+
+	const handleClear = useCallback(async () => {
+		if (!narratorId || busy) return;
+		setBusy("clear");
+		try {
+			await api.clearSpecTasks(narratorId);
+			invalidateSpec();
+			setDone("clear");
+			notifications.show({ message: t("specForkClearedToast"), color: "green", autoClose: 2000 });
+		} catch (err) {
+			notifications.show({
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
+		} finally {
+			setBusy(null);
+		}
+	}, [narratorId, busy, invalidateSpec, t]);
+
+	const handleReset = useCallback(async () => {
+		if (!narratorId || busy) return;
+		const ok = await confirm({
+			title: t("specForkResetConfirmTitle"),
+			message: t("specForkResetConfirmMessage"),
+			confirmLabel: t("specForkResetSpec"),
+			confirmColor: "red",
+		});
+		if (!ok) return;
+		setBusy("reset");
+		try {
+			await api.resetSpec(narratorId);
+			invalidateSpec();
+			setDone("reset");
+			notifications.show({ message: t("specForkResetToast"), color: "green", autoClose: 2000 });
+		} catch (err) {
+			notifications.show({
+				message: err instanceof Error ? err.message : String(err),
+				color: "red",
+			});
+		} finally {
+			setBusy(null);
+		}
+	}, [narratorId, busy, confirm, invalidateSpec, t]);
+
+	return (
+		<Paper p="xs" radius="sm" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
+			<Stack gap={6}>
+				<Group gap="xs" wrap="nowrap">
+					<Badge size="xs" color="indigo" variant="light" leftSection={<IconGitFork size={10} />}>
+						{t("specForkCarryoverTitle")}
+					</Badge>
+					<Text size="xs" c="indigo" style={{ flex: 1 }}>
+						{t("specForkCarryoverDesc", { count: total, open, protectedOpen })}
+					</Text>
+				</Group>
+				<Group gap={6} wrap="wrap">
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						color="indigo"
+						leftSection={<IconListCheck size={12} />}
+						// Bubbles a DOM CustomEvent caught by the NarratorPanel viewport listener
+						// (see NarratorPanel "spec-open-tasks"), which opens the Spec task board.
+						// This decoupling avoids threading an onOpenTasks callback through every
+						// message-render layer. NOTE: the button only works while rendered inside
+						// that viewport; if this card is ever reused outside NarratorPanel, wire an
+						// explicit handler instead of relying on the ambient listener.
+						onClick={(e) => {
+							e.currentTarget.dispatchEvent(new CustomEvent("spec-open-tasks", { bubbles: true }));
+						}}
+					>
+						{t("specGoalViewTasks")}
+					</Button>
+					<Button
+						size="compact-xs"
+						variant="light"
+						color="gray"
+						leftSection={<IconTrash size={12} />}
+						loading={busy === "clear"}
+						disabled={!narratorId || done !== null || busy !== null}
+						onClick={handleClear}
+					>
+						{done === "clear" ? t("specForkClearedToast") : t("specForkClearTasks")}
+					</Button>
+					<Button
+						size="compact-xs"
+						variant="light"
+						color="red"
+						leftSection={<IconRestore size={12} />}
+						loading={busy === "reset"}
+						disabled={!narratorId || done !== null || busy !== null}
+						onClick={handleReset}
+					>
+						{done === "reset" ? t("specForkResetToast") : t("specForkResetSpec")}
+					</Button>
+				</Group>
+			</Stack>
+		</Paper>
+	);
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: string }) {
 	const { t } = useTranslation("narrator");
@@ -1716,6 +1852,50 @@ function TextFileBlock({ block }: { block: any }) {
 			<Text size="xs" c="dimmed">
 				({formatFileSize(block.size)})
 			</Text>
+		</Group>
+	);
+}
+
+/**
+ * Removable file chip shown during message editing for both kept (existing) and
+ * newly-added text-file attachments. Mirrors the main composer's text-file chip.
+ */
+function EditTextFileChip({
+	filename,
+	size,
+	onRemove,
+}: {
+	filename: string;
+	size: number;
+	onRemove: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Group
+			gap={6}
+			px="xs"
+			py={4}
+			wrap="nowrap"
+			style={{
+				borderRadius: "var(--mantine-radius-sm)",
+				backgroundColor: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+			}}
+		>
+			<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+			<Text size="xs" truncate style={{ maxWidth: 160 }}>
+				{filename}
+			</Text>
+			<Text size="xs" c="dimmed">
+				{formatFileSize(size)}
+			</Text>
+			<CloseButton
+				size={16}
+				iconSize={12}
+				variant="transparent"
+				c="dimmed"
+				onClick={onRemove}
+				title={t("removeFile")}
+			/>
 		</Group>
 	);
 }
@@ -3557,6 +3737,11 @@ export const MessageBubble = memo(function MessageBubble({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON image blocks
 	const [editKeptImages, setEditKeptImages] = useState<any[]>([]);
 	const [editNewImages, setEditNewImages] = useState<File[]>([]);
+	// Existing text_file blocks kept during editing (user can remove some) + newly
+	// added text files. Mirrors the image editing flow. User-only.
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
+	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>([]);
+	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
 	// Mirror the kept-image count in a ref so the async add-images flow reads the
 	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
 	// closure capture when computing remaining room.
@@ -3566,7 +3751,8 @@ export const MessageBubble = memo(function MessageBubble({
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 	const editImageNarratorId = message.narratorId ?? narratorId;
 	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
-	const canSubmitEdit = !!editContent.trim() || hasEditImages;
+	const hasEditTextFiles = editKeptTextFiles.length > 0 || editNewTextFiles.length > 0;
+	const canSubmitEdit = !!editContent.trim() || hasEditImages || hasEditTextFiles;
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
@@ -3577,7 +3763,8 @@ export const MessageBubble = memo(function MessageBubble({
 			return;
 		}
 		setEditContent(editPreview.text);
-		// Seed kept-images from the message's existing image blocks (user-only).
+		// Seed kept-images / kept-text-files from the message's existing attachment
+		// blocks (user-only).
 		if (isUser) {
 			setEditKeptImages(
 				blocks.filter(
@@ -3585,10 +3772,18 @@ export const MessageBubble = memo(function MessageBubble({
 						b.type === "image" && typeof b.imageId === "string",
 				),
 			);
+			setEditKeptTextFiles(
+				blocks.filter(
+					(b: { type?: string; filePath?: unknown }) =>
+						b.type === "text_file" && typeof b.filePath === "string",
+				),
+			);
 		} else {
 			setEditKeptImages([]);
+			setEditKeptTextFiles([]);
 		}
 		setEditNewImages([]);
+		setEditNewTextFiles([]);
 		setIsEditing(true);
 	}, [blocks, isUser, t]);
 
@@ -3598,6 +3793,8 @@ export const MessageBubble = memo(function MessageBubble({
 		setShowConfirmModal(false);
 		setEditKeptImages([]);
 		setEditNewImages([]);
+		setEditKeptTextFiles([]);
+		setEditNewTextFiles([]);
 	}, []);
 
 	const resetEditState = useCallback(() => {
@@ -3605,6 +3802,8 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditContent("");
 		setEditKeptImages([]);
 		setEditNewImages([]);
+		setEditKeptTextFiles([]);
+		setEditNewTextFiles([]);
 	}, []);
 
 	const removeKeptImage = useCallback((imageId: string) => {
@@ -3614,6 +3813,40 @@ export const MessageBubble = memo(function MessageBubble({
 	const removeNewImage = useCallback((index: number) => {
 		setEditNewImages((prev) => prev.filter((_, i) => i !== index));
 	}, []);
+
+	const removeKeptTextFile = useCallback((filePath: string) => {
+		setEditKeptTextFiles((prev) => prev.filter((b) => b.filePath !== filePath));
+	}, []);
+
+	const removeNewTextFile = useCallback((index: number) => {
+		setEditNewTextFiles((prev) => prev.filter((_, i) => i !== index));
+	}, []);
+
+	const handleAddEditTextFiles = useCallback(
+		(files: File[]) => {
+			const valid: File[] = [];
+			for (const f of files) {
+				if (!isTextFile(f.name)) {
+					notifications.show({ color: "yellow", message: t("unsupportedFileType") });
+					continue;
+				}
+				if (f.size > MAX_TEXT_FILE_SIZE) {
+					notifications.show({ color: "yellow", message: t("textFileTooLarge") });
+					continue;
+				}
+				valid.push(f);
+			}
+			if (valid.length === 0) return;
+			setEditNewTextFiles((prev) => {
+				const room = Math.max(0, 10 - editKeptTextFiles.length - prev.length);
+				if (valid.length > room) {
+					notifications.show({ color: "yellow", message: t("editTooManyFiles") });
+				}
+				return [...prev, ...valid.slice(0, room)];
+			});
+		},
+		[editKeptTextFiles.length, t],
+	);
 
 	const handleAddEditImages = useCallback(
 		async (files: File[]) => {
@@ -3672,8 +3905,12 @@ export const MessageBubble = memo(function MessageBubble({
 				.map((b) => b.imageId)
 				.filter((id): id is string => typeof id === "string"),
 			newImages: editNewImages,
+			keepTextFilePaths: editKeptTextFiles
+				.map((b) => b.filePath)
+				.filter((p): p is string => typeof p === "string"),
+			newTextFiles: editNewTextFiles,
 		}),
-		[editKeptImages, editNewImages],
+		[editKeptImages, editNewImages, editKeptTextFiles, editNewTextFiles],
 	);
 
 	const handleConfirmClick = useCallback(() => {
@@ -3994,6 +4231,31 @@ export const MessageBubble = memo(function MessageBubble({
 				/>
 			);
 		}
+		// Spec fork carryover card (Dynamic Spec) — shown in a freshly forked
+		// narrator that inherited a non-empty tasks.json, offering to clear the
+		// tasks or reset the whole spec (child namespace only; parent untouched).
+		const forkCarryIndex = blocks.findIndex(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "spec_fork_carryover",
+		);
+		const forkCarryBlock = forkCarryIndex >= 0 ? blocks[forkCarryIndex] : undefined;
+		if (forkCarryBlock) {
+			const forkCarryRealIndex = message._blockOriginalIndices?.[forkCarryIndex] ?? forkCarryIndex;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={forkCarryRealIndex} messageId={message.id}>
+						<SpecForkCarryoverCard
+							narratorId={narratorId}
+							total={typeof forkCarryBlock.total === "number" ? forkCarryBlock.total : 0}
+							open={typeof forkCarryBlock.open === "number" ? forkCarryBlock.open : 0}
+							protectedOpen={
+								typeof forkCarryBlock.protectedOpen === "number" ? forkCarryBlock.protectedOpen : 0
+							}
+						/>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		// Spec /goal confirmation card (Dynamic Spec) — a durable record that a
 		// protected task was added (or already existed) via the /goal command.
 		const goalIndex = blocks.findIndex(
@@ -4243,27 +4505,52 @@ export const MessageBubble = memo(function MessageBubble({
 									))}
 								</Group>
 							)}
+							{hasEditTextFiles && (
+								<Group gap="xs" wrap="wrap">
+									{editKeptTextFiles.map((fileBlock) => (
+										<EditTextFileChip
+											key={`kept-file-${fileBlock.filePath}`}
+											filename={fileBlock.filename}
+											size={fileBlock.size}
+											onRemove={() => removeKeptTextFile(fileBlock.filePath)}
+										/>
+									))}
+									{editNewTextFiles.map((file, i) => (
+										<EditTextFileChip
+											// biome-ignore lint/suspicious/noArrayIndexKey: new files have no stable id
+											key={`new-file-${i}-${file.name}-${file.size}`}
+											filename={file.name}
+											size={file.size}
+											onRemove={() => removeNewTextFile(i)}
+										/>
+									))}
+								</Group>
+							)}
 							<input
 								ref={editFileInputRef}
 								type="file"
-								accept={ACCEPTED_TYPES.join(",")}
 								multiple
 								style={{ display: "none" }}
 								onChange={(e) => {
 									const files = Array.from(e.target.files ?? []);
-									if (files.length > 0) void handleAddEditImages(files);
+									// Route images to the image flow and everything else to the
+									// text-file flow, mirroring the main composer's attach button.
+									const images = files.filter((f) => ACCEPTED_TYPES.includes(f.type));
+									const others = files.filter((f) => !ACCEPTED_TYPES.includes(f.type));
+									if (images.length > 0) void handleAddEditImages(images);
+									if (others.length > 0) handleAddEditTextFiles(others);
 									e.target.value = "";
 								}}
 							/>
 							<Group gap="xs" justify="space-between">
-								<Tooltip label={t("attachImage")}>
+								<Tooltip label={t("attachFile")}>
 									<ActionIcon
 										variant="subtle"
 										color="gray"
 										onClick={() => editFileInputRef.current?.click()}
-										aria-label={t("attachImage")}
+										aria-label={t("attachFile")}
 									>
-										<IconPhoto size={18} />
+										<IconPaperclip size={18} />
 									</ActionIcon>
 								</Tooltip>
 								<Group gap="xs">

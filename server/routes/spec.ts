@@ -58,6 +58,38 @@ specRoutes.get("/:id/spec/tasks", async (c) => {
 	});
 });
 
+/** POST /:id/spec/tasks/clear — empty tasks.json (UI action). */
+specRoutes.post("/:id/spec/tasks/clear", async (c) => {
+	const narratorId = c.req.param("id");
+	const written = await specVfsService.clearSpecTasks(narratorId);
+	broadcastToNarrator(narratorId, {
+		type: "spec_changed",
+		narratorId,
+		uri: written.uri,
+		path: "tasks.json",
+		revisionId: written.revisionId ?? null,
+		updatedBy: "user",
+		source: "ui",
+	});
+	return c.json({ ok: true, revisionId: written.revisionId ?? null });
+});
+
+/** POST /:id/spec/reset — reset the entire Dynamic Spec namespace to defaults. */
+specRoutes.post("/:id/spec/reset", async (c) => {
+	const narratorId = c.req.param("id");
+	await specVfsService.resetSpecNamespace(narratorId);
+	broadcastToNarrator(narratorId, {
+		type: "spec_changed",
+		narratorId,
+		uri: "spec://tasks.json",
+		path: "tasks.json",
+		revisionId: null,
+		updatedBy: "user",
+		source: "reset",
+	});
+	return c.json({ ok: true });
+});
+
 /** PUT /:id/spec/file — write a spec file from the UI. */
 specRoutes.put("/:id/spec/file", async (c) => {
 	const narratorId = c.req.param("id");
