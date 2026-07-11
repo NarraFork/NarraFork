@@ -1,7 +1,8 @@
 import { Alert, Divider, Stack, Title } from "@mantine/core";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { notifications } from "@mantine/notifications";
+import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ModelAggregationsSection } from "../../components/settings/ModelAggregationsSection";
 import { ModelsSection } from "../../components/settings/ModelsSection";
@@ -36,18 +37,58 @@ function SettingsModelsPage() {
 	} = useAllModels();
 	const is = useInstanceSettingsContext();
 	const qc = useQueryClient();
+	const [localAggregations, setLocalAggregations] = useState<ModelAggregation[]>(aggregations);
+	const serverAggregationsRef = useRef(aggregations);
+	const saveInFlightRef = useRef(false);
+	const pendingSaveRef = useRef<ModelAggregation[] | null>(null);
+	const mountedRef = useRef(true);
 
-	const updateAggregations = useMutation({
-		mutationFn: (aggs: ModelAggregation[]) =>
-			api.updateSettings({ agent: { modelAggregations: aggs } }),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
-	});
+	useEffect(() => {
+		return () => {
+			mountedRef.current = false;
+		};
+	}, []);
+
+	useEffect(() => {
+		serverAggregationsRef.current = aggregations;
+		if (!saveInFlightRef.current && pendingSaveRef.current === null) {
+			setLocalAggregations(aggregations);
+		}
+	}, [aggregations]);
+
+	const flushAggregationSave = useCallback(async () => {
+		if (saveInFlightRef.current) return;
+		const next = pendingSaveRef.current;
+		if (!next) return;
+		pendingSaveRef.current = null;
+		saveInFlightRef.current = true;
+		try {
+			const data = await api.updateSettings({ agent: { modelAggregations: next } });
+			serverAggregationsRef.current = next;
+			qc.setQueryData(["settings"], data);
+		} catch (err) {
+			pendingSaveRef.current = null;
+			if (mountedRef.current) {
+				setLocalAggregations(serverAggregationsRef.current);
+				notifications.show({
+					title: t("modelAggregationsSaveError"),
+					message: err instanceof Error ? err.message : String(err),
+					color: "red",
+				});
+			}
+		} finally {
+			saveInFlightRef.current = false;
+			if (pendingSaveRef.current) void flushAggregationSave();
+		}
+	}, [qc, t]);
 
 	const handleAggregationsChange = useCallback(
 		(aggs: ModelAggregation[]) => {
-			updateAggregations.mutate(aggs);
+			setLocalAggregations(aggs);
+			pendingSaveRef.current = aggs;
+			void flushAggregationSave();
 		},
-		[updateAggregations],
+		[flushAggregationSave],
 	);
 
 	return (
@@ -80,7 +121,7 @@ function SettingsModelsPage() {
 			/>
 			<Divider />
 			<ModelAggregationsSection
-				aggregations={aggregations}
+				aggregations={localAggregations}
 				onChange={handleAggregationsChange}
 				allModels={visibleModels}
 				providerLabels={providerLabels}

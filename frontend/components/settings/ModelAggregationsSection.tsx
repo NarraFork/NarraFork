@@ -1,4 +1,14 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Badge,
 	Button,
@@ -13,12 +23,27 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
-import { IconPlus, IconTrash } from "@tabler/icons-react";
+import {
+	IconArrowDown,
+	IconArrowUp,
+	IconGripVertical,
+	IconPlus,
+	IconTrash,
+} from "@tabler/icons-react";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ModelAggregation, ModelOption } from "../../lib/constants";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
+
+/** Move an item within an array from one index to another (immutable). */
+function reorder<T>(list: T[], from: number, to: number): T[] {
+	if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return list;
+	const next = [...list];
+	const [moved] = next.splice(from, 1);
+	next.splice(to, 0, moved);
+	return next;
+}
 
 export interface ModelAggregationsSectionProps {
 	aggregations: ModelAggregation[];
@@ -50,6 +75,179 @@ function buildModelSelectData(
 	return Array.from(groups.entries()).map(([group, items]) => ({ group, items }));
 }
 
+/** Build a value → display label map (e.g. "Provider:model") for member rows. */
+function buildModelLabelMap(
+	modelSelectData: Array<{ group: string; items: Array<{ value: string; label: string }> }>,
+): Map<string, string> {
+	const map = new Map<string, string>();
+	for (const g of modelSelectData) {
+		for (const item of g.items) map.set(item.value, item.label);
+	}
+	return map;
+}
+
+// ---------------------------------------------------------------------------
+// Sortable member priority list — shared by the add modal and the edit card
+// ---------------------------------------------------------------------------
+
+function MemberPriorityList({
+	models,
+	labelMap,
+	routingMode,
+	onChange,
+	size = "sm",
+}: {
+	models: string[];
+	labelMap: Map<string, string>;
+	routingMode: "priority" | "balanced";
+	onChange: (models: string[]) => void;
+	size?: "xs" | "sm";
+}) {
+	const { t } = useTranslation("settings");
+	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+	const handleDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			const from = models.indexOf(active.id as string);
+			const to = models.indexOf(over.id as string);
+			onChange(reorder(models, from, to));
+		},
+		[models, onChange],
+	);
+
+	const move = useCallback(
+		(index: number, direction: -1 | 1) => {
+			onChange(reorder(models, index, index + direction));
+		},
+		[models, onChange],
+	);
+
+	if (models.length === 0) return null;
+
+	return (
+		<div>
+			<Text size={size === "xs" ? "xs" : "sm"} fw={500} mb={4}>
+				{t("aggMemberOrder")}
+			</Text>
+			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<SortableContext items={models} strategy={verticalListSortingStrategy}>
+					<Stack gap={4}>
+						{models.map((value, idx) => (
+							<SortableMemberRow
+								key={value}
+								value={value}
+								label={labelMap.get(value) ?? value}
+								index={idx}
+								isFirst={idx === 0}
+								isLast={idx === models.length - 1}
+								showPrimaryBadge={routingMode === "priority"}
+								onMoveUp={() => move(idx, -1)}
+								onMoveDown={() => move(idx, 1)}
+							/>
+						))}
+					</Stack>
+				</SortableContext>
+			</DndContext>
+			<Text size="xs" c="dimmed" mt={4}>
+				{routingMode === "priority"
+					? t("aggMemberOrderPriorityDesc")
+					: t("aggMemberOrderBalancedDesc")}
+			</Text>
+		</div>
+	);
+}
+
+const SortableMemberRow = memo(function SortableMemberRow({
+	value,
+	label,
+	index,
+	isFirst,
+	isLast,
+	showPrimaryBadge,
+	onMoveUp,
+	onMoveDown,
+}: {
+	value: string;
+	label: string;
+	index: number;
+	isFirst: boolean;
+	isLast: boolean;
+	showPrimaryBadge: boolean;
+	onMoveUp: () => void;
+	onMoveDown: () => void;
+}) {
+	const { t } = useTranslation("settings");
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: value,
+	});
+
+	const style = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0.5 : 1,
+	};
+
+	return (
+		<Group
+			ref={setNodeRef}
+			style={{ ...style, borderRadius: 4 }}
+			gap="xs"
+			wrap="nowrap"
+			px={4}
+			py={2}
+			bg="var(--mantine-color-default)"
+		>
+			<ActionIcon
+				variant="subtle"
+				size="sm"
+				color="gray"
+				style={{ cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
+				{...attributes}
+				{...listeners}
+			>
+				<IconGripVertical size={14} />
+			</ActionIcon>
+
+			<Text size="xs" c="dimmed" w={18} ta="right" style={{ flexShrink: 0 }}>
+				{index + 1}
+			</Text>
+
+			<Text size="xs" ff="monospace" truncate style={{ flex: 1, minWidth: 0 }}>
+				{label}
+			</Text>
+
+			{showPrimaryBadge && isFirst && (
+				<Badge size="xs" variant="light" color="indigo" style={{ flexShrink: 0 }}>
+					{t("aggPrimary")}
+				</Badge>
+			)}
+
+			<Group gap={2} wrap="nowrap" style={{ flexShrink: 0 }}>
+				<ActionIcon
+					variant="subtle"
+					size="xs"
+					disabled={isFirst}
+					onClick={onMoveUp}
+					title={t("aggMoveUp")}
+				>
+					<IconArrowUp size={12} />
+				</ActionIcon>
+				<ActionIcon
+					variant="subtle"
+					size="xs"
+					disabled={isLast}
+					onClick={onMoveDown}
+					title={t("aggMoveDown")}
+				>
+					<IconArrowDown size={12} />
+				</ActionIcon>
+			</Group>
+		</Group>
+	);
+});
+
 export function ModelAggregationsSection({
 	aggregations,
 	onChange,
@@ -64,6 +262,8 @@ export function ModelAggregationsSection({
 		() => buildModelSelectData(allModels, providerLabels),
 		[allModels, providerLabels],
 	);
+
+	const labelMap = useMemo(() => buildModelLabelMap(modelSelectData), [modelSelectData]);
 
 	const handleAdd = useCallback(
 		(agg: ModelAggregation) => {
@@ -113,6 +313,7 @@ export function ModelAggregationsSection({
 					key={agg.id}
 					agg={agg}
 					modelSelectData={modelSelectData}
+					labelMap={labelMap}
 					onUpdate={handleUpdate}
 					onDelete={handleDelete}
 				/>
@@ -122,6 +323,7 @@ export function ModelAggregationsSection({
 				opened={addOpened}
 				onClose={closeAdd}
 				modelSelectData={modelSelectData}
+				labelMap={labelMap}
 				generateId={generateId}
 				onAdd={handleAdd}
 			/>
@@ -137,6 +339,7 @@ function AddAggregationModal({
 	opened,
 	onClose,
 	modelSelectData,
+	labelMap,
 	generateId,
 	onAdd,
 }: {
@@ -146,6 +349,7 @@ function AddAggregationModal({
 		group: string;
 		items: Array<{ value: string; label: string }>;
 	}>;
+	labelMap: Map<string, string>;
 	generateId: () => string;
 	onAdd: (agg: ModelAggregation) => void;
 }) {
@@ -198,6 +402,13 @@ function AddAggregationModal({
 					maxDropdownHeight={240}
 				/>
 
+				<MemberPriorityList
+					models={models}
+					labelMap={labelMap}
+					routingMode={routingMode}
+					onChange={setModels}
+				/>
+
 				<div>
 					<Text size="sm" fw={500} mb={4}>
 						{t("aggRoutingMode")}
@@ -239,6 +450,7 @@ function AddAggregationModal({
 const AggregationCard = memo(function AggregationCard({
 	agg,
 	modelSelectData,
+	labelMap,
 	onUpdate,
 	onDelete,
 }: {
@@ -247,6 +459,7 @@ const AggregationCard = memo(function AggregationCard({
 		group: string;
 		items: Array<{ value: string; label: string }>;
 	}>;
+	labelMap: Map<string, string>;
 	onUpdate: (id: string, patch: Partial<ModelAggregation>) => void;
 	onDelete: (id: string) => void;
 }) {
@@ -301,6 +514,14 @@ const AggregationCard = memo(function AggregationCard({
 					limit={MODEL_SELECT_OPTION_LIMIT}
 					placeholder={t("aggModelsPlaceholder")}
 					maxDropdownHeight={200}
+				/>
+
+				<MemberPriorityList
+					models={agg.models}
+					labelMap={labelMap}
+					routingMode={agg.routingMode}
+					onChange={(models) => onUpdate(agg.id, { models })}
+					size="xs"
 				/>
 
 				<Group gap="xs" align="center">

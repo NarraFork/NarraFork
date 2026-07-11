@@ -1,4 +1,20 @@
 import {
+	closestCenter,
+	DndContext,
+	type DragEndEvent,
+	KeyboardSensor,
+	PointerSensor,
+	useSensor,
+	useSensors,
+} from "@dnd-kit/core";
+import {
+	SortableContext,
+	sortableKeyboardCoordinates,
+	useSortable,
+	verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
 	ActionIcon,
 	Badge,
 	Button,
@@ -8,7 +24,7 @@ import {
 	Progress,
 	Stack,
 	Text,
-	TextInput,
+	Textarea,
 	Tooltip,
 } from "@mantine/core";
 import {
@@ -18,11 +34,13 @@ import {
 	IconCircleDot,
 	IconDeviceFloppy,
 	IconExclamationCircle,
+	IconGripVertical,
 	IconLock,
+	IconLockOpen,
 	IconPlus,
 	IconTrash,
 } from "@tabler/icons-react";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { SpecCompiledTasks, SpecTaskItem } from "../../lib/api/spec";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
@@ -49,12 +67,13 @@ const STATUS_META: Record<SpecTaskStatus, { color: string; icon: typeof IconCirc
 	done: { color: "green", icon: IconCheck },
 };
 
-/** A single editable task card. */
+/** A single editable, sortable task card. */
 function TaskCard({
 	task,
 	index,
 	onUpdate,
 	onRemove,
+	onLock,
 	onUnlock,
 	isModified,
 	onSave,
@@ -64,6 +83,7 @@ function TaskCard({
 	index: number;
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
+	onLock: (index: number) => void;
 	onUnlock: (index: number) => void;
 	isModified: boolean;
 	onSave: () => void;
@@ -72,123 +92,190 @@ function TaskCard({
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[task.status];
 	const StatusIcon = meta.icon;
+	// Expand the text area to multiple rows while it holds edit focus so long
+	// task descriptions are fully visible; collapse back to a single line on blur.
+	const [focused, setFocused] = useState(false);
+
+	// Freeze all mutations while a save is in flight: any edit made between the
+	// request and its response would be silently discarded when SpecPanel clears
+	// `dirty` on success, so drag/status/text/lock/delete are all disabled here.
+	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+		id: String(index),
+		disabled: isSaving,
+	});
+
+	const style: React.CSSProperties = {
+		transform: CSS.Transform.toString(transform),
+		transition,
+		opacity: isDragging ? 0.5 : 1,
+	};
 
 	return (
-		<Paper withBorder radius="sm" p={6} bg="var(--mantine-color-body)">
-			<Group gap={6} wrap="nowrap" align="flex-start">
-				{/* Status toggle via menu */}
-				<Menu shadow="md" position="bottom-start" withinPortal>
-					<Menu.Target>
-						<Tooltip label={t("spec.changeStatus")} openDelay={400}>
-							<ActionIcon size="sm" variant="subtle" color={meta.color} mt={2}>
-								<StatusIcon size={16} />
-							</ActionIcon>
-						</Tooltip>
-					</Menu.Target>
-					<Menu.Dropdown>
-						{STATUS_ORDER.map((status) => {
-							const m = STATUS_META[status];
-							const Icon = m.icon;
-							return (
-								<Menu.Item
-									key={status}
-									leftSection={<Icon size={14} color={`var(--mantine-color-${m.color}-6)`} />}
-									onClick={() => onUpdate(index, { status })}
-									disabled={status === task.status}
-								>
-									{t(`spec.status.${status}`)}
-								</Menu.Item>
-							);
-						})}
-					</Menu.Dropdown>
-				</Menu>
-
-				{/* Editable task text */}
-				<TextInput
-					variant="unstyled"
-					size="xs"
-					style={{ flex: 1 }}
-					value={task.text}
-					onChange={(e) => onUpdate(index, { text: e.currentTarget.value })}
-					placeholder={t("spec.taskPlaceholder")}
-					title={t("spec.editTaskHint")}
-					styles={{
-						input: {
-							minHeight: 22,
-							height: "auto",
-							cursor: "text",
-							paddingInline: 6,
-							borderRadius: "var(--mantine-radius-sm)",
-							border: "1px solid transparent",
-							transition: "background-color 100ms ease, border-color 100ms ease",
-							textDecoration: task.status === "done" ? "line-through" : undefined,
-							opacity: task.status === "done" ? 0.6 : 1,
-							"&:hover": {
-								backgroundColor: "var(--mantine-color-default-hover)",
-							},
-							"&:focus": {
-								backgroundColor: "var(--mantine-color-body)",
-								borderColor: "var(--mantine-color-indigo-5)",
-							},
-						},
-					}}
-				/>
-
-				{/* Save button if single task is modified */}
-				{isModified && (
-					<Tooltip label={t("spec.save")} openDelay={200}>
-						<ActionIcon
-							size="sm"
-							variant="filled"
-							color="green"
-							mt={2}
-							onClick={onSave}
-							loading={isSaving}
-							aria-label={t("spec.save")}
-						>
-							<IconDeviceFloppy size={14} />
-						</ActionIcon>
-					</Tooltip>
-				)}
-
-				{/* Protected: click the lock to unlock; otherwise delete */}
-				{task.protected ? (
-					<Tooltip label={t("spec.unlockProtected")} openDelay={200} multiline w={240}>
-						<ActionIcon
-							size="sm"
-							variant="subtle"
-							color="yellow"
-							mt={2}
-							onClick={() => onUnlock(index)}
-							aria-label={t("spec.unlockProtected")}
-						>
-							<IconLock size={14} />
-						</ActionIcon>
-					</Tooltip>
-				) : (
+		<div ref={setNodeRef} style={style}>
+			<Paper withBorder radius="sm" p={6} bg="var(--mantine-color-body)">
+				<Group gap={6} wrap="nowrap" align="flex-start">
+					{/* Drag handle — no Tooltip to avoid flicker during drag */}
 					<ActionIcon
 						size="sm"
 						variant="subtle"
 						color="gray"
 						mt={2}
-						onClick={() => onRemove(index)}
-						aria-label={t("spec.deleteTask")}
+						disabled={isSaving}
+						style={{ cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
+						aria-label={t("spec.reorderHint")}
+						{...attributes}
+						{...listeners}
 					>
-						<IconTrash size={14} />
+						<IconGripVertical size={14} />
 					</ActionIcon>
-				)}
-			</Group>
-		</Paper>
+
+					{/* Status toggle via menu */}
+					<Menu shadow="md" position="bottom-start" withinPortal disabled={isSaving}>
+						<Menu.Target>
+							<Tooltip label={t("spec.changeStatus")} openDelay={400}>
+								<ActionIcon
+									size="sm"
+									variant="subtle"
+									color={meta.color}
+									mt={2}
+									disabled={isSaving}
+								>
+									<StatusIcon size={16} />
+								</ActionIcon>
+							</Tooltip>
+						</Menu.Target>
+						<Menu.Dropdown>
+							{STATUS_ORDER.map((status) => {
+								const m = STATUS_META[status];
+								const Icon = m.icon;
+								return (
+									<Menu.Item
+										key={status}
+										leftSection={<Icon size={14} color={`var(--mantine-color-${m.color}-6)`} />}
+										onClick={() => onUpdate(index, { status })}
+										disabled={status === task.status}
+									>
+										{t(`spec.status.${status}`)}
+									</Menu.Item>
+								);
+							})}
+						</Menu.Dropdown>
+					</Menu>
+
+					{/* Editable task text — expands to multiple rows while focused */}
+					<Textarea
+						variant="unstyled"
+						size="xs"
+						autosize
+						minRows={1}
+						maxRows={focused ? 10 : 1}
+						style={{ flex: 1 }}
+						value={task.text}
+						readOnly={isSaving}
+						onChange={(e) => onUpdate(index, { text: e.currentTarget.value })}
+						onFocus={() => setFocused(true)}
+						onBlur={() => setFocused(false)}
+						placeholder={t("spec.taskPlaceholder")}
+						title={t("spec.editTaskHint")}
+						styles={{
+							input: {
+								minHeight: 22,
+								cursor: "text",
+								paddingInline: 6,
+								paddingBlock: 2,
+								borderRadius: "var(--mantine-radius-sm)",
+								border: "1px solid transparent",
+								transition: "background-color 100ms ease, border-color 100ms ease",
+								textDecoration: task.status === "done" ? "line-through" : undefined,
+								opacity: task.status === "done" ? 0.6 : 1,
+								"&:hover": {
+									backgroundColor: "var(--mantine-color-default-hover)",
+								},
+								"&:focus": {
+									backgroundColor: "var(--mantine-color-body)",
+									borderColor: "var(--mantine-color-indigo-5)",
+								},
+							},
+						}}
+					/>
+
+					{/* Save button if single task is modified */}
+					{isModified && (
+						<Tooltip label={t("spec.save")} openDelay={200}>
+							<ActionIcon
+								size="sm"
+								variant="filled"
+								color="green"
+								mt={2}
+								onClick={onSave}
+								loading={isSaving}
+								aria-label={t("spec.save")}
+							>
+								<IconDeviceFloppy size={14} />
+							</ActionIcon>
+						</Tooltip>
+					)}
+
+					{/* Protected toggle: locked tasks unlock (with confirm); ordinary tasks lock instantly */}
+					{task.protected ? (
+						<Tooltip label={t("spec.unlockProtected")} openDelay={200} multiline w={240}>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="yellow"
+								mt={2}
+								disabled={isSaving}
+								onClick={() => onUnlock(index)}
+								aria-label={t("spec.unlockProtected")}
+							>
+								<IconLock size={14} />
+							</ActionIcon>
+						</Tooltip>
+					) : (
+						<Tooltip label={t("spec.lockProtected")} openDelay={200} multiline w={240}>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								color="gray"
+								mt={2}
+								disabled={isSaving}
+								onClick={() => onLock(index)}
+								aria-label={t("spec.lockProtected")}
+							>
+								<IconLockOpen size={14} />
+							</ActionIcon>
+						</Tooltip>
+					)}
+
+					{/* Delete (protected tasks must be unlocked before removal) */}
+					{!task.protected && (
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="gray"
+							mt={2}
+							disabled={isSaving}
+							onClick={() => onRemove(index)}
+							aria-label={t("spec.deleteTask")}
+						>
+							<IconTrash size={14} />
+						</ActionIcon>
+					)}
+				</Group>
+			</Paper>
+		</div>
 	);
 }
 
-/** A status column grouping tasks. */
+/** A status column grouping tasks, sortable within the group. */
 function StatusColumn({
 	status,
 	tasks,
 	onUpdate,
 	onRemove,
+	onLock,
 	onUnlock,
+	onReorder,
 	isTaskModified,
 	onSave,
 	isSaving,
@@ -197,13 +284,31 @@ function StatusColumn({
 	tasks: { task: SpecTaskItem; index: number }[];
 	onUpdate: (index: number, patch: Partial<SpecTaskItem>) => void;
 	onRemove: (index: number) => void;
+	onLock: (index: number) => void;
 	onUnlock: (index: number) => void;
+	onReorder: (activeIndex: number, overIndex: number) => void;
 	isTaskModified: (index: number) => boolean;
 	onSave: () => void;
 	isSaving: boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const meta = STATUS_META[status];
+	// PointerSensor covers mouse/touch; KeyboardSensor makes reordering operable
+	// for keyboard users (focus the grip, then Space to pick up and arrows to move).
+	const sensors = useSensors(
+		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+		useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+	);
+
+	const handleDragEnd = useCallback(
+		(event: DragEndEvent) => {
+			const { active, over } = event;
+			if (!over || active.id === over.id) return;
+			onReorder(Number(active.id), Number(over.id));
+		},
+		[onReorder],
+	);
+
 	if (tasks.length === 0) return null;
 
 	return (
@@ -216,21 +321,29 @@ function StatusColumn({
 					{tasks.length}
 				</Badge>
 			</Group>
-			<Stack gap={4}>
-				{tasks.map(({ task, index }) => (
-					<TaskCard
-						key={index}
-						task={task}
-						index={index}
-						onUpdate={onUpdate}
-						onRemove={onRemove}
-						onUnlock={onUnlock}
-						isModified={isTaskModified(index)}
-						onSave={onSave}
-						isSaving={isSaving}
-					/>
-				))}
-			</Stack>
+			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<SortableContext
+					items={tasks.map(({ index }) => String(index))}
+					strategy={verticalListSortingStrategy}
+				>
+					<Stack gap={4}>
+						{tasks.map(({ task, index }) => (
+							<TaskCard
+								key={index}
+								task={task}
+								index={index}
+								onUpdate={onUpdate}
+								onRemove={onRemove}
+								onLock={onLock}
+								onUnlock={onUnlock}
+								isModified={isTaskModified(index)}
+								onSave={onSave}
+								isSaving={isSaving}
+							/>
+						))}
+					</Stack>
+				</SortableContext>
+			</DndContext>
 		</Stack>
 	);
 }
@@ -254,7 +367,11 @@ export function SpecTaskBoard({
 			if (!original) return true; // new task
 			const current = tasks[index];
 			if (!current) return false;
-			return current.text !== original.text || current.status !== original.status;
+			return (
+				current.text !== original.text ||
+				current.status !== original.status ||
+				Boolean(current.protected) !== Boolean(original.protected)
+			);
 		},
 		[originalTasks, tasks],
 	);
@@ -262,6 +379,14 @@ export function SpecTaskBoard({
 	const updateTask = useCallback(
 		(index: number, patch: Partial<SpecTaskItem>) => {
 			onChange(tasks.map((task, i) => (i === index ? { ...task, ...patch } : task)));
+		},
+		[tasks, onChange],
+	);
+
+	const lockTask = useCallback(
+		(index: number) => {
+			// Marking a task protected is a tightening commitment — apply immediately.
+			onChange(tasks.map((task, i) => (i === index ? { ...task, protected: true } : task)));
 		},
 		[tasks, onChange],
 	);
@@ -290,6 +415,40 @@ export function SpecTaskBoard({
 	const removeTask = useCallback(
 		(index: number) => {
 			onChange(tasks.filter((_, i) => i !== index));
+		},
+		[tasks, onChange],
+	);
+
+	// Reorder two tasks that share the same status, by their flat-array indices.
+	// Only the slots occupied by that status are permuted; every other task keeps
+	// its position, so the flat array order (which the agent reads) stays coherent.
+	const reorderWithinStatus = useCallback(
+		(activeIndex: number, overIndex: number) => {
+			const active = tasks[activeIndex];
+			const over = tasks[overIndex];
+			if (!active || !over || active.status !== over.status) return;
+
+			// Flat slots this status currently occupies, in order.
+			const slots: number[] = [];
+			tasks.forEach((task, i) => {
+				if (task.status === active.status) slots.push(i);
+			});
+
+			const from = slots.indexOf(activeIndex);
+			const to = slots.indexOf(overIndex);
+			if (from < 0 || to < 0) return;
+
+			// Reorder the tasks belonging to this status, then write them back into
+			// the same slot positions.
+			const groupTasks = slots.map((slot) => tasks[slot]);
+			const [moved] = groupTasks.splice(from, 1);
+			groupTasks.splice(to, 0, moved);
+
+			const next = [...tasks];
+			slots.forEach((slot, i) => {
+				next[slot] = groupTasks[i];
+			});
+			onChange(next);
 		},
 		[tasks, onChange],
 	);
@@ -375,7 +534,9 @@ export function SpecTaskBoard({
 						tasks={grouped[status]}
 						onUpdate={updateTask}
 						onRemove={removeTask}
+						onLock={lockTask}
 						onUnlock={unlockTask}
+						onReorder={reorderWithinStatus}
 						isTaskModified={isTaskModified}
 						onSave={onSave}
 						isSaving={isSaving}

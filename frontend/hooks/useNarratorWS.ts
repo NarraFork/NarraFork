@@ -1142,6 +1142,8 @@ export interface NarratorListWSEvent {
 		| "draft";
 	status?: string;
 	substatus?: string[];
+	/** Execution generation for the current/last turn — used to dedup notifications per turn. */
+	turnStartedAt?: string;
 	title?: string;
 	permissionMode?: string;
 	viewers?: Array<{

@@ -578,6 +578,8 @@ function NarratorDetailPage() {
 
 	// Desktop layout: unified dockview surface (chat + tool panels as siblings).
 	// Subagents keep the simple single-panel layout (no chapter/tool panels).
+	// The Spec/tasks panel comes from NarratorPanel's own internal drawer fallback
+	// (no dock, no onToggleSpecPanel here), so subagents can view their task list.
 	if (isSubagent) {
 		return (
 			<Box

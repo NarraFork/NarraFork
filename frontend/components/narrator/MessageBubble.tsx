@@ -3994,6 +3994,62 @@ export const MessageBubble = memo(function MessageBubble({
 				/>
 			);
 		}
+		// Spec /goal confirmation card (Dynamic Spec) — a durable record that a
+		// protected task was added (or already existed) via the /goal command.
+		const goalIndex = blocks.findIndex(
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(b: any) => b.type === "spec_goal_added",
+		);
+		const goalBlock = goalIndex >= 0 ? blocks[goalIndex] : undefined;
+		if (goalBlock) {
+			const goalRealIndex = message._blockOriginalIndices?.[goalIndex] ?? goalIndex;
+			const added = goalBlock.added !== false;
+			const taskText = goalBlock.task ?? message.contentText;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={goalRealIndex} messageId={message.id}>
+						<Paper
+							p="xs"
+							radius="sm"
+							style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}
+						>
+							<Stack gap={6}>
+								<Group gap="xs" wrap="nowrap">
+									<Badge
+										size="xs"
+										color="yellow"
+										variant="light"
+										leftSection={<IconLock size={10} />}
+									>
+										{t("specProtectedBadge")}
+									</Badge>
+									<Badge size="xs" color={added ? "green" : "gray"} variant="light">
+										{added ? t("specGoalAddedBadge") : t("specGoalExistsBadge")}
+									</Badge>
+									<Text size="xs" c="indigo" style={{ flex: 1, whiteSpace: "pre-wrap" }}>
+										{taskText}
+									</Text>
+								</Group>
+								<Button
+									size="compact-xs"
+									variant="subtle"
+									color="indigo"
+									leftSection={<IconListCheck size={12} />}
+									style={{ alignSelf: "flex-start" }}
+									onClick={(e) => {
+										e.currentTarget.dispatchEvent(
+											new CustomEvent("spec-open-tasks", { bubbles: true }),
+										);
+									}}
+								>
+									{t("specGoalViewTasks")}
+								</Button>
+							</Stack>
+						</Paper>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		// Spec task continuation / blocked reminders (Dynamic Spec sidecar messages).
 		const specIndex = blocks.findIndex(
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

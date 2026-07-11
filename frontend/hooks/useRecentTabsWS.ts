@@ -65,6 +65,7 @@ export function useRecentTabsWS(
 						type: "status",
 						status: data.status as string,
 						substatus: data.substatus as string[] | undefined,
+						turnStartedAt: data.turnStartedAt as string | undefined,
 					});
 				} else if (data.type === "substatus_change") {
 					onUpdateRef.current(nId, {

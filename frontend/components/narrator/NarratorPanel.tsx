@@ -19,6 +19,7 @@ import {
 	Button,
 	Center,
 	CloseButton,
+	Drawer,
 	Group,
 	Image,
 	Indicator,
@@ -404,6 +405,10 @@ const NarratorDetailsPanel = lazy(() =>
 	import("./NarratorDetailsPanel").then((module) => ({ default: module.NarratorDetailsPanel })),
 );
 
+const SpecPanel = lazy(() =>
+	import("./SpecPanel").then((module) => ({ default: module.SpecPanel })),
+);
+
 const PERM_MODE_DATA = PERM_MODES.map((m) => ({ value: m, label: `perm_${m}` }));
 const BOOLEAN_OVERRIDE_VALUES = ["inherit", "on", "off"] as const;
 type BooleanOverride = (typeof BOOLEAN_OVERRIDE_VALUES)[number];
@@ -621,6 +626,10 @@ type BufferedSendResult = {
 	buffered?: boolean;
 	id?: string;
 	bufferedAt?: string;
+	/** Set when a busy `/goal` was queued; used to show a "queued task" toast. */
+	specGoalQueued?: boolean;
+	/** The protected task text carried by a queued `/goal`. */
+	objective?: string;
 };
 
 function getMessageViewportScrollBottom(scroller: HTMLElement) {
@@ -3823,20 +3832,44 @@ export function NarratorPanel({
 			? externalSetFileModOpened
 			: setInternalFileModOpen;
 
-	// Spec toggle: dock context (unified surface) takes precedence over the
-	// legacy onToggleSpecPanel prop. `specToolAvailable` gates the toolbar button.
-	const specToolAvailable = !!dock || !!onToggleSpecPanel;
-	const specToolOpened = dock ? dock.openToolTypes.has("spec") : (specPanelOpen ?? false);
+	// Spec toggle: three mutually-exclusive routes, in precedence order.
+	//  1. dock spec tab   — the unified surface, but ONLY for the dock's own base
+	//     narrator. When a subagent session is pushed into the dock, `dock.narratorId`
+	//     still points at the parent, so the dock spec panel would show the parent's
+	//     tasks (data mismatch). Detect that via `subagentInDock` and fall through.
+	//  2. onToggleSpecPanel — legacy external callback (mobile drawer).
+	//  3. internal drawer  — off-dock / pushed-subagent view. Renders SpecPanel bound
+	//     to THIS panel's narratorId, so subagents show their own tasks. Excluded for
+	//     workspace previews, which stay lightweight (mirrors `tasksButtonEnabled`).
+	const [internalSpecOpen, setInternalSpecOpen] = useState(false);
+	const subagentInDock = !!dock && dock.narratorId !== narratorId;
+	const useDockSpec = !!dock && !subagentInDock;
+	const useInternalSpec = !useDockSpec && !onToggleSpecPanel && !isWorkspacePreview;
+	// Button availability mirrors the render conditions exactly: whenever a spec
+	// surface exists (dock / external / internal), the toolbar entry point exists.
+	const specToolAvailable = useDockSpec || !!onToggleSpecPanel || useInternalSpec;
+	const specToolOpened = useDockSpec
+		? dock.openToolTypes.has("spec")
+		: onToggleSpecPanel
+			? (specPanelOpen ?? false)
+			: internalSpecOpen;
 	const toggleSpecTool = useCallback(() => {
-		if (dock) dock.toggleToolPanel("spec");
-		else onToggleSpecPanel?.();
-	}, [dock, onToggleSpecPanel]);
+		if (useDockSpec) dock.toggleToolPanel("spec");
+		else if (onToggleSpecPanel) onToggleSpecPanel();
+		else setInternalSpecOpen((v) => !v);
+	}, [useDockSpec, dock, onToggleSpecPanel]);
 	// Open (not toggle) the spec panel — used by the current-task status bar so a
 	// click always reveals the task list rather than closing an open panel.
 	const openSpecTool = useCallback(() => {
-		if (dock) dock.openToolPanel("spec");
-		else if (!specToolOpened) onToggleSpecPanel?.();
-	}, [dock, onToggleSpecPanel, specToolOpened]);
+		if (useDockSpec) dock.openToolPanel("spec");
+		else if (onToggleSpecPanel) {
+			if (!specToolOpened) onToggleSpecPanel();
+		} else setInternalSpecOpen(true);
+	}, [useDockSpec, dock, onToggleSpecPanel, specToolOpened]);
+	// Stable handle so the viewport `spec-open-tasks` listener can call the latest
+	// openSpecTool without re-subscribing on every dependency change.
+	const openSpecToolRef = useRef(openSpecTool);
+	openSpecToolRef.current = openSpecTool;
 
 	// Background tasks: on the dock surface the tasks list is a dockview sibling
 	// tab (toggled from the toolbar); off-dock (mobile) it falls back to a Drawer.
@@ -5844,6 +5877,10 @@ export function NarratorPanel({
 			}
 		};
 		vp.addEventListener("subagent-auto-expand", onSubagentExpand);
+		// A spec_goal_added card ("View task list →") bubbles this event up to the
+		// viewport; open the Spec panel (which hosts the tasks.json board).
+		const onSpecOpenTasks = () => openSpecToolRef.current();
+		vp.addEventListener("spec-open-tasks", onSpecOpenTasks);
 
 		return () => {
 			clearTimeout(vpResizeTimer);
@@ -5854,6 +5891,7 @@ export function NarratorPanel({
 			contentObserver.disconnect();
 			vpObserver.disconnect();
 			vp.removeEventListener("subagent-auto-expand", onSubagentExpand);
+			vp.removeEventListener("spec-open-tasks", onSpecOpenTasks);
 			stopFollowing();
 		};
 	}, [highlightMessageId, initialScrollDone, startFollowing, stopFollowing, usesChunkMessageList]);
@@ -6109,6 +6147,17 @@ export function NarratorPanel({
 				return priority ? [queuedMessage, ...prev] : [...prev, queuedMessage];
 			});
 
+			// A busy `/goal` is queued rather than applied immediately; tell the user
+			// the protected task will be added once the queued command is consumed.
+			if (result.specGoalQueued) {
+				notifications.show({
+					title: t("spec.specGoalQueued"),
+					message: result.objective ?? undefined,
+					color: "blue",
+					autoClose: 4000,
+				});
+			}
+
 			void api
 				.getBufferedMessages(narratorId)
 				.then((messages) => setQueuedMessages(messages ?? []))
@@ -6116,7 +6165,7 @@ export function NarratorPanel({
 
 			return true;
 		},
-		[narratorId, currentUser, setQueuedMessages],
+		[narratorId, currentUser, setQueuedMessages, t],
 	);
 
 	// --- Send / retry message ---
@@ -6223,9 +6272,10 @@ export function NarratorPanel({
 					return { ...old, pages };
 				});
 				notifications.show({
-					message: result.added ? t("spec.specGoalAdded") : t("spec.specGoalExists"),
+					title: result.added ? t("spec.specGoalAdded") : t("spec.specGoalExists"),
+					message: result.objective ?? undefined,
 					color: result.added ? "green" : "yellow",
-					autoClose: 2000,
+					autoClose: 4000,
 				});
 				scrollToLatestMessageWindow(true);
 			} else if (result?.buffered) {
@@ -9355,6 +9405,41 @@ export function NarratorPanel({
 								setPendingDeleteCallback(null);
 							}}
 						/>
+					)}
+
+					{/* Internal spec drawer — the third fallback when there is no dock spec
+					    tab (off-dock page) or the dock is showing a pushed subagent. Bound to
+					    THIS panel's narratorId so subagents show their own tasks. */}
+					{useInternalSpec && (
+						<Drawer
+							opened={internalSpecOpen}
+							onClose={() => setInternalSpecOpen(false)}
+							position="right"
+							size={600}
+							title={t("spec.title")}
+							styles={{
+								body: {
+									height: "calc(100% - 60px)",
+									padding: 0,
+									display: "flex",
+									flexDirection: "column",
+								},
+							}}
+						>
+							<Suspense
+								fallback={
+									<Center h="100%">
+										<Loader size="sm" />
+									</Center>
+								}
+							>
+								<SpecPanel
+									narratorId={narratorId}
+									onClose={() => setInternalSpecOpen(false)}
+									chromeless
+								/>
+							</Suspense>
+						</Drawer>
 					)}
 				</Stack>
 			</ContentViewerEnvironmentProvider>

@@ -71,7 +71,7 @@ import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
-import { triggerNotification } from "../../lib/notification";
+import { clearNotifiedAttention, triggerNotification } from "../../lib/notification";
 import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { queuePendingPanel } from "../narrator/workspace/dockview-layout";
@@ -304,6 +304,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 								tab.title,
 								event.status === "waiting" ? "waiting" : "unread",
 								userPrefsRef.current,
+								event.turnStartedAt,
 							);
 						}
 					}
@@ -312,6 +313,9 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 					// means this narrator no longer has a pending change — clear its
 					// favicon alert so the icon disappears once reflection ends.
 					clearFaviconAlert(narratorId);
+					// Also forget the last-notified attention so the narrator's next
+					// entry into an attention state notifies again (once).
+					clearNotifiedAttention(narratorId);
 				}
 			}
 

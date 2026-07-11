@@ -252,7 +252,15 @@ export const narratorPersistence = {
 		);
 	},
 
-	async persistDisplayMessage(narratorId: string, text: string) {
+	async persistDisplayMessage(
+		narratorId: string,
+		text: string,
+		// UI-only content blocks. When provided they replace the default `info`
+		// block, letting callers render richer cards (e.g. spec_goal_added) while
+		// keeping the message role `disp` so it never enters the model history.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		contentBlocks?: any[],
+	) {
 		const { msg, seq } = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
@@ -264,8 +272,11 @@ export const narratorPersistence = {
 							id,
 							narratorId,
 							role: "disp",
-							contentJson: [{ type: "info", message: text }],
-							contentText: `[Info] ${text}`,
+							contentJson: contentBlocks ?? [{ type: "info", message: text }],
+							// Preserve the legacy `[Info] …` contentText for the default info
+							// card (a documented parity contract); custom-block callers pass
+							// their own already-formatted text.
+							contentText: contentBlocks ? text : `[Info] ${text}`,
 							createdAt: now,
 						})
 						.returning()
@@ -1090,12 +1101,22 @@ export const narratorPersistence = {
 		const normalizedErrorMessage = keepsErrorMessage ? (errorMessage ?? null) : null;
 		const turnStartedAt = setTurnStart ? now : undefined;
 		let actualSubstatus = requestedSubstatus;
+		// The generation broadcast to clients: the fresh turn start when this call
+		// begins a turn, otherwise the narrator's existing turnStartedAt read from
+		// the DB. Broadcasting it on terminal (done/unread) transitions lets the
+		// notification layer key dedup on the specific execution generation, so a
+		// resubscribe snapshot for the same turn is suppressed while a new turn's
+		// completion (e.g. during a disconnect) still notifies.
+		let broadcastTurnStartedAt: string | undefined = turnStartedAt;
 		const writeStatus = async () => {
 			if (requestedSubstatus !== undefined) {
 				const row = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { substatus: true },
+					columns: { substatus: true, turnStartedAt: true },
 				});
+				if (broadcastTurnStartedAt === undefined) {
+					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
+				}
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
 					parseSubstatus(row?.substatus),
 					requestedSubstatus,
@@ -1239,7 +1260,7 @@ export const narratorPersistence = {
 			narratorId,
 			status,
 			substatus: actualSubstatus,
-			turnStartedAt: turnStartedAt ?? undefined,
+			turnStartedAt: broadcastTurnStartedAt,
 		});
 	},
 
@@ -1262,13 +1283,17 @@ export const narratorPersistence = {
 		const normalizedErrorMessage = isError ? (errorMessage ?? null) : null;
 		const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
 		let actualSubstatus = requestedSubstatus;
+		// The execution generation to broadcast on the terminal (done/unread)
+		// transition so clients can dedup notifications per turn (see updateStatus).
+		let broadcastTurnStartedAt: string | undefined;
 		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
 			if (requestedSubstatus !== undefined) {
 				const row = await db.query.narrators.findFirst({
 					where: eq(narrators.id, narratorId),
-					columns: { substatus: true },
+					columns: { substatus: true, turnStartedAt: true },
 				});
+				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
 					parseSubstatus(row?.substatus),
 					requestedSubstatus,
@@ -1328,6 +1353,7 @@ export const narratorPersistence = {
 			narratorId,
 			status: newStatus,
 			substatus: actualSubstatus,
+			turnStartedAt: broadcastTurnStartedAt,
 		});
 		return true;
 	},

@@ -190,6 +190,7 @@ import {
 	isLoopRunning,
 	isNarratorActive,
 	normalizeRollbackBlockIndexForMessage,
+	persistGoalAddedNotice,
 	pushBufferedMessage,
 	reconcileRunningStatus,
 	reExecuteDeniedToolCall,
@@ -880,6 +881,10 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	// Resolve slash commands
 	let finalMessage = message;
 	let commandText: string | null = queuedNewCommand?.rawCommand ?? null;
+	// Set when a busy `/goal` falls through to the buffer path, so the buffered
+	// response can prompt the UI to show a "queued protected task" toast.
+	let specGoalQueued = false;
+	let specGoalObjective = "";
 	const cmdResult = queuedNewCommand
 		? ({ resolved: false } as Awaited<ReturnType<typeof resolveCommand>>)
 		: await resolveCommand(message, id, userId);
@@ -967,12 +972,25 @@ narratorRoutes.post("/:id/messages", async (c) => {
 					"user",
 				);
 			}
+			// Leave a durable, self-explanatory card in the conversation so the
+			// effect of /goal is visible on scrollback, not only via a toast. This
+			// display-only side effect must not turn an already-applied goal into a
+			// failed command if message persistence is temporarily unavailable.
+			await persistGoalAddedNotice(id, objective, added).catch((err) => {
+				logger.warn("Failed to persist /goal confirmation notice", {
+					narratorId: id,
+					error: String(err),
+				});
+			});
 			return c.json({ specGoal: true, added, objective }, 200);
 		}
 		// Busy: fall through to the shared buffer path. Carry the raw command so the
-		// buffer consumer recognizes it as a /goal and appends the task then.
+		// buffer consumer recognizes it as a /goal and appends the task then. The
+		// flag lets the buffered response tell the UI to show a "queued" toast.
 		finalMessage = rawCommand;
 		commandText = rawCommand;
+		specGoalQueued = true;
+		specGoalObjective = objective;
 	}
 	let prePromptBashCommand: string | undefined;
 	if (cmdResult.resolved && "expandedPrompt" in cmdResult) {
@@ -1118,7 +1136,15 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			if (!queuedNewCommand) {
 				dispatchMentions(id, message, userId);
 			}
-			return c.json({ buffered: true, bufferedAt: result.bufferedAt, id: result.id }, 202);
+			return c.json(
+				{
+					buffered: true,
+					bufferedAt: result.bufferedAt,
+					id: result.id,
+					...(specGoalQueued ? { specGoalQueued: true, objective: specGoalObjective } : {}),
+				},
+				202,
+			);
 		}
 		if (result.full) {
 			throw new ValidationError("Message queue is full");

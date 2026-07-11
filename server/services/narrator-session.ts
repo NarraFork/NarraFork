@@ -315,6 +315,28 @@ async function executeQueuedNewCommand(
 }
 
 /**
+ * Persist and broadcast a `spec_goal_added` display card so the /goal command
+ * leaves a durable, self-explanatory record in the conversation (rather than
+ * only a transient toast). `added` is false when an identical task already
+ * existed. Uses the `disp` role so this UI-only notice never enters the model
+ * history (unlike spec_continuation, which is an instruction to the model).
+ * Shared by the idle route path and the busy buffer-consumption path.
+ */
+export async function persistGoalAddedNotice(
+	narratorId: string,
+	objective: string,
+	added: boolean,
+): Promise<void> {
+	const text = added
+		? `Dynamic Spec: protected task added — ${objective}`
+		: `Dynamic Spec: protected task already exists — ${objective}`;
+	// persistDisplayMessage broadcasts a `message` event itself.
+	await narratorService.persistDisplayMessage(narratorId, text, [
+		{ type: "spec_goal_added", task: objective, added, protected: true },
+	]);
+}
+
+/**
  * Execute a buffered `/goal` command: persist it as the canonical user message
  * (so it stays visible in the conversation) and append the protected task to
  * spec://tasks.json. Runs when a queued /goal is consumed after the turn that
@@ -343,6 +365,15 @@ async function executeQueuedGoalCommand(
 			"user",
 		);
 	}
+	// The task mutation is the command's durable effect. A display-only confirmation
+	// card is best-effort so a transient message persistence failure cannot mark the
+	// narrator errored or prevent later buffered messages from draining.
+	await persistGoalAddedNotice(narratorId, objective, added).catch((err) => {
+		logger.warn("Failed to persist queued /goal confirmation notice", {
+			narratorId,
+			error: String(err),
+		});
+	});
 }
 
 /**

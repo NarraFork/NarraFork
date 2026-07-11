@@ -70,6 +70,11 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	const [editTasks, setEditTasks] = useState<SpecTaskItem[]>([]);
 	const [dirty, setDirty] = useState(false);
 	const baseRevisionRef = useRef<string | null>(null);
+	// Monotonic edit counter. A save captures the version it is persisting; if the
+	// user edits again while the request is in flight the version advances, so on
+	// success we only clear `dirty` when nothing changed meanwhile — otherwise the
+	// newer edits would be silently treated as saved and lost on reload.
+	const editVersionRef = useRef(0);
 	// Bumped whenever we accept fresh server content, so the editor resets.
 	const [docRevisionKey, setDocRevisionKey] = useState<string>("");
 
@@ -130,6 +135,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 		const content = isTasksFile
 			? `${JSON.stringify({ tasks: editTasks }, null, "\t")}\n`
 			: editContent;
+		const savedVersion = editVersionRef.current;
 		try {
 			const result = await updateFile.mutateAsync({
 				uri: selectedUri,
@@ -140,7 +146,11 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 				notifyAgent: true,
 			});
 			baseRevisionRef.current = result.revisionId;
-			setDirty(false);
+			// Only clear dirty if no edit landed after this save started. If the user
+			// changed something meanwhile, keep dirty so the newer state can be saved.
+			if (editVersionRef.current === savedVersion) {
+				setDirty(false);
+			}
 			notifications.show({ message: t("spec.saved"), color: "green", autoClose: 1500 });
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -183,11 +193,13 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	]);
 
 	const handleTasksChange = useCallback((next: SpecTaskItem[]) => {
+		editVersionRef.current += 1;
 		setEditTasks(next);
 		setDirty(true);
 	}, []);
 
 	const handleContentChange = useCallback((next: string) => {
+		editVersionRef.current += 1;
 		setEditContent(next);
 		setDirty(true);
 	}, []);

@@ -179,9 +179,10 @@ function SettingsUsagePage() {
 							label={t("usageHistoryModel")}
 							placeholder={t("usageHistoryModelPlaceholder")}
 							value={tempFilters.model ?? ""}
-							onChange={(e) =>
-								setTempFilters((prev) => ({ ...prev, model: e.currentTarget.value || undefined }))
-							}
+							onChange={(e) => {
+								const value = e.currentTarget.value;
+								setTempFilters((prev) => ({ ...prev, model: value || undefined }));
+							}}
 						/>
 						<Select
 							size={isMobile ? "xs" : "sm"}
