@@ -132,6 +132,7 @@
 	"attachImage": "Attach image",
 	"attachFile": "Attach file",
 	"removeImage": "Remove",
+	"removeFile": "Remove",
 	"imageTooLarge": "Image must be under 100MB",
 	"unsupportedFormat": "Supported: PNG, JPEG, GIF, WebP",
 	"dropFilesHere": "Drop files here",

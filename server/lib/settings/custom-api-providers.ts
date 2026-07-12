@@ -2,6 +2,7 @@ import type {
 	AnthropicProviderConfig,
 	CustomApiProtocol,
 	CustomApiProviderConfig,
+	GeminiProviderConfig,
 	NarraForkSettings,
 	OpenAIProviderConfig,
 } from "./types";
@@ -41,6 +42,10 @@ export function isOpenAICustomApiProtocol(protocol: CustomApiProtocol): boolean 
 
 export function isAnthropicCustomApiProtocol(protocol: CustomApiProtocol): boolean {
 	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+}
+
+export function isGeminiCustomApiProtocol(protocol: CustomApiProtocol): boolean {
+	return protocol === "gemini-compatible";
 }
 
 export function customApiProtocolToOpenAIApiMode(
@@ -104,9 +109,26 @@ export function anthropicProviderToCustomApi(
 	};
 }
 
+export function geminiProviderToCustomApi(provider: GeminiProviderConfig): CustomApiProviderConfig {
+	return {
+		id: provider.id,
+		name: provider.name,
+		disabled: provider.disabled,
+		prefix: provider.prefix,
+		apiKey: provider.apiKey,
+		baseUrl: provider.baseUrl,
+		defaultModel: provider.defaultModel,
+		defaultContextWindow: provider.defaultContextWindow,
+		protocol: "gemini-compatible",
+		defaultReasoningEffort: provider.defaultReasoningEffort,
+		proxy: provider.proxy,
+	};
+}
+
 export function deriveCustomApiProvidersFromLegacy(
 	openaiProviders: OpenAIProviderConfig[] | undefined,
 	anthropicProviders: AnthropicProviderConfig[] | undefined,
+	geminiProviders?: GeminiProviderConfig[] | undefined,
 ): CustomApiProviderConfig[] {
 	const byId = new Map<string, CustomApiProviderConfig>();
 	for (const provider of openaiProviders ?? []) {
@@ -126,6 +148,10 @@ export function deriveCustomApiProvidersFromLegacy(
 			continue;
 		}
 		byId.set(provider.id, anthropicProviderToCustomApi(provider));
+	}
+	for (const provider of geminiProviders ?? []) {
+		if (byId.has(provider.id)) continue;
+		byId.set(provider.id, geminiProviderToCustomApi(provider));
 	}
 	return [...byId.values()];
 }
@@ -190,11 +216,38 @@ export function customApiProvidersToOpenAI(
 	});
 }
 
+export function customApiProviderToGemini(
+	provider: CustomApiProviderConfig,
+): GeminiProviderConfig | undefined {
+	if (!isGeminiCustomApiProtocol(provider.protocol)) return undefined;
+	return {
+		id: provider.id,
+		name: provider.name,
+		disabled: provider.disabled,
+		prefix: provider.prefix,
+		apiKey: provider.apiKey,
+		baseUrl: provider.baseUrl,
+		defaultModel: provider.defaultModel,
+		defaultContextWindow: provider.defaultContextWindow,
+		defaultReasoningEffort: provider.defaultReasoningEffort ?? undefined,
+		proxy: provider.proxy,
+	};
+}
+
 export function customApiProvidersToAnthropic(
 	providers: CustomApiProviderConfig[] | undefined,
 ): AnthropicProviderConfig[] {
 	return (providers ?? []).flatMap((provider) => {
 		const converted = customApiProviderToAnthropic(provider);
+		return converted ? [converted] : [];
+	});
+}
+
+export function customApiProvidersToGemini(
+	providers: CustomApiProviderConfig[] | undefined,
+): GeminiProviderConfig[] {
+	return (providers ?? []).flatMap((provider) => {
+		const converted = customApiProviderToGemini(provider);
 		return converted ? [converted] : [];
 	});
 }
@@ -219,20 +272,27 @@ export function normalizeCustomApiProviderSettings(settings: NarraForkSettings):
 		customApiProviders: settings.customApiProviders,
 		openaiProviders: settings.openaiProviders,
 		anthropicProviders: settings.anthropicProviders,
+		geminiProviders: settings.geminiProviders,
 	});
 
 	settings.customApiProviders = (
 		Array.isArray(settings.customApiProviders)
 			? settings.customApiProviders
-			: deriveCustomApiProvidersFromLegacy(settings.openaiProviders, settings.anthropicProviders)
+			: deriveCustomApiProvidersFromLegacy(
+					settings.openaiProviders,
+					settings.anthropicProviders,
+					settings.geminiProviders,
+				)
 	).map(normalizeCustomApiProvider);
 	settings.openaiProviders = customApiProvidersToOpenAI(settings.customApiProviders);
 	settings.anthropicProviders = customApiProvidersToAnthropic(settings.customApiProviders);
+	settings.geminiProviders = customApiProvidersToGemini(settings.customApiProviders);
 
 	const after = JSON.stringify({
 		customApiProviders: settings.customApiProviders,
 		openaiProviders: settings.openaiProviders,
 		anthropicProviders: settings.anthropicProviders,
+		geminiProviders: settings.geminiProviders,
 	});
 	return before !== after;
 }

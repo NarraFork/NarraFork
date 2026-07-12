@@ -347,6 +347,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			for (const p of [...openai, ...anthropic, ...nug]) {
 				if (p.disabled && p.prefix) disabledProviders.add(p.prefix);
 			}
+			// customApiProviders (incl. gemini-compatible) also carry a disabled flag.
+			for (const p of customApiProviders) {
+				if (p.disabled && p.prefix) disabledProviders.add(p.prefix);
+			}
 
 			return {
 				customApiProviders,

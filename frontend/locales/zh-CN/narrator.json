@@ -131,6 +131,7 @@
 	"attachImage": "附加图片",
 	"attachFile": "附加文件",
 	"removeImage": "移除",
+	"removeFile": "移除",
 	"imageTooLarge": "图片不能超过 100MB",
 	"unsupportedFormat": "支持格式：PNG、JPEG、GIF、WebP",
 	"dropFilesHere": "拖放文件到此处",

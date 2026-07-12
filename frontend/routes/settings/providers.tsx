@@ -12,6 +12,7 @@ import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
 	CustomApiProviderSection,
 	isAnthropicProtocol,
+	isGeminiProtocol,
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
@@ -345,7 +346,10 @@ function SettingsProvidersPage() {
 						"codex-native": t("addProviderCodex"),
 						"responses-compatible": t("addProviderResponses"),
 						"completions-compatible": t("addProviderCompletions"),
+						"gemini-compatible": t("addProviderGemini"),
 					};
+					// Gemini defaults to Google's endpoint; others start blank.
+					const isGemini = type === "gemini-compatible";
 					dispatchers.setCustomApiProviders((prev) => [
 						...prev,
 						{
@@ -353,8 +357,8 @@ function SettingsProvidersPage() {
 							name: defaultNameByProtocol[type],
 							prefix: "",
 							apiKey: "",
-							baseUrl: "",
-							defaultModel: "",
+							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
+							defaultModel: isGemini ? "gemini-2.5-flash" : "",
 							protocol: type,
 							codexAccountId: "",
 							codexWebSocket: false,
@@ -437,6 +441,7 @@ function SettingsProvidersPage() {
 		openaiByProvider,
 		anthropicByProvider,
 		clineByProvider,
+		geminiByProvider,
 		nugByProvider,
 	} = useAllModels();
 
@@ -531,6 +536,30 @@ function SettingsProvidersPage() {
 		return map;
 	}, [settings?.nugProviders, settings?.nugModelsGrouped]);
 
+	const geminiModelsMap = useMemo(() => {
+		const map: Record<string, ModelOption[]> = {};
+		const prefixMap: Record<string, string> = {};
+		const groups = (settings?.geminiModelsGrouped ?? []) as Array<{
+			providerId: string;
+			models: Array<{ id: string; name?: string }>;
+		}>;
+		for (const p of (settings?.geminiProviders ?? []) as Array<{
+			id: string;
+			prefix?: string;
+		}>) {
+			prefixMap[p.id] = p.prefix ?? "gemini";
+		}
+		for (const group of groups) {
+			const prefix = prefixMap[group.providerId] ?? "gemini";
+			map[group.providerId] = group.models.map((m) => ({
+				value: `${prefix}:${m.id}`,
+				label: m.name || m.id,
+				provider: prefix,
+			}));
+		}
+		return map;
+	}, [settings?.geminiProviders, settings?.geminiModelsGrouped]);
+
 	// ── Build provider groups for overview ──
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
@@ -558,6 +587,7 @@ function SettingsProvidersPage() {
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of geminiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of nugByProvider) for (const m of g.models) addModel(g.prefix, m);
 
 		// Add custom models to their respective prefixes
@@ -599,6 +629,7 @@ function SettingsProvidersPage() {
 		openaiByProvider,
 		anthropicByProvider,
 		clineByProvider,
+		geminiByProvider,
 		nugByProvider,
 		state.customModels,
 		providerLabels,
@@ -632,11 +663,14 @@ function SettingsProvidersPage() {
 
 		const customApi = state.customApiProviders.find((p) => p.id === providerId);
 		const nug = state.nugProviders.find((p) => p.id === providerId);
+		const isGemini = customApi ? isGeminiProtocol(customApi.protocol) : false;
 
 		try {
 			if (customApi) {
 				if (!customApi.apiKey) return;
-				if (isAnthropicProtocol(customApi.protocol)) {
+				if (isGemini) {
+					await api.geminiRefreshProviderModels(providerId);
+				} else if (isAnthropicProtocol(customApi.protocol)) {
 					await api.anthropicRefreshProviderModels(providerId);
 				} else {
 					await api.openaiRefreshProviderModels(providerId);
@@ -669,9 +703,11 @@ function SettingsProvidersPage() {
 		if (!prefix) return;
 
 		const groupedKey = customApi
-			? isAnthropicProtocol(customApi.protocol)
-				? "anthropicModelsGrouped"
-				: "openaiModelsGrouped"
+			? isGemini
+				? "geminiModelsGrouped"
+				: isAnthropicProtocol(customApi.protocol)
+					? "anthropicModelsGrouped"
+					: "openaiModelsGrouped"
 			: "nugModelsGrouped";
 		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
 			providerId: string;
@@ -728,6 +764,7 @@ function SettingsProvidersPage() {
 						providerModelsMap={providerModelsMap}
 						anthropicModelsMap={anthropicModelsMap}
 						nugModelsMap={nugModelsMap}
+						geminiModelsMap={geminiModelsMap}
 						isCustomApiProviderDirty={isCustomApiProviderDirty}
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
@@ -850,6 +887,7 @@ interface ProviderSectionContentProps {
 	providerModelsMap: Record<string, ModelOption[]>;
 	anthropicModelsMap: Record<string, ModelOption[]>;
 	nugModelsMap: Record<string, ModelOption[]>;
+	geminiModelsMap: Record<string, ModelOption[]>;
 	isCustomApiProviderDirty: (id: string) => boolean;
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
@@ -869,6 +907,7 @@ function ProviderSectionContent({
 	providerModelsMap,
 	anthropicModelsMap,
 	nugModelsMap,
+	geminiModelsMap,
 	isCustomApiProviderDirty,
 	isNugProviderDirty,
 	getPrefixError,
@@ -930,6 +969,7 @@ function ProviderSectionContent({
 				onProvidersChange={dispatchers.setCustomApiProviders}
 				openAIProviderModelsMap={providerModelsMap}
 				anthropicProviderModelsMap={anthropicModelsMap}
+				geminiProviderModelsMap={geminiModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
@@ -969,6 +1009,5 @@ function ProviderSectionContent({
 			/>
 		);
 	}
-
 	return null;
 }

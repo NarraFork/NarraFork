@@ -69,6 +69,11 @@ export const CUSTOM_API_PROTOCOL_OPTIONS: ProtocolOptionConfig[] = [
 		labelKey: "customApiProtocolCompletionsCompatible",
 		descKey: "customApiProtocolCompletionsCompatibleDesc",
 	},
+	{
+		value: "gemini-compatible",
+		labelKey: "customApiProtocolGeminiCompatible",
+		descKey: "customApiProtocolGeminiCompatibleDesc",
+	},
 ];
 
 export const CUSTOM_API_PROTOCOL_LABEL_KEYS: Record<CustomApiProtocol, string> = {
@@ -77,6 +82,7 @@ export const CUSTOM_API_PROTOCOL_LABEL_KEYS: Record<CustomApiProtocol, string> =
 	"codex-native": "customApiProtocolCodexNative",
 	"responses-compatible": "customApiProtocolResponsesCompatible",
 	"completions-compatible": "customApiProtocolCompletionsCompatible",
+	"gemini-compatible": "customApiProtocolGeminiCompatible",
 };
 
 export function protocolFromOpenAI(apiMode?: OpenAIProviderState["apiMode"]): CustomApiProtocol {
@@ -98,11 +104,16 @@ export function isAnthropicProtocol(protocol: CustomApiProtocol): boolean {
 	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
 }
 
+export function isGeminiProtocol(protocol: CustomApiProtocol): boolean {
+	return protocol === "gemini-compatible";
+}
+
 interface CustomApiProviderSectionProps {
 	provider: CustomApiProviderState;
 	onProvidersChange: (updater: ProvidersUpdater) => void;
 	openAIProviderModelsMap: Record<string, ModelOption[]>;
 	anthropicProviderModelsMap: Record<string, ModelOption[]>;
+	geminiProviderModelsMap: Record<string, ModelOption[]>;
 	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	onBatchToggleHidden: (modelValues: string[], hidden: boolean) => void;
@@ -127,6 +138,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	onProvidersChange,
 	openAIProviderModelsMap,
 	anthropicProviderModelsMap,
+	geminiProviderModelsMap,
 	hiddenModels,
 	onToggleHidden,
 	onBatchToggleHidden,
@@ -160,6 +172,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		CUSTOM_API_PROTOCOL_OPTIONS.find((option) => option.value === provider.protocol) ??
 		CUSTOM_API_PROTOCOL_OPTIONS[0];
 	const usesAnthropic = isAnthropicProtocol(provider.protocol);
+	const usesGemini = isGeminiProtocol(provider.protocol);
 	const refreshCapability = usesAnthropic ? anthropicRefreshCapability : openaiRefreshCapability;
 	const refreshRouteCapability = usesAnthropic
 		? anthropicProviderRefreshRoute
@@ -169,14 +182,22 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		openaiRefreshCapability.supported && openaiProviderRefreshRoute.supported;
 	const canRefreshAnthropicProviderModels =
 		anthropicRefreshCapability.supported && anthropicProviderRefreshRoute.supported;
-	const canRefreshProviderModels = usesAnthropic
-		? canRefreshAnthropicProviderModels
-		: canRefreshOpenAIProviderModels;
+	// Gemini refresh does not depend on the openai/anthropic runtime route caps;
+	// it always uses its own /api/gemini route (available on the TS backend).
+	const canRefreshProviderModels = usesGemini
+		? true
+		: usesAnthropic
+			? canRefreshAnthropicProviderModels
+			: canRefreshOpenAIProviderModels;
 	const refreshUnsupportedReason = refreshCapability.supported
 		? (refreshRouteCapability.reason ?? providerRouteUnsupportedReason)
 		: refreshReason;
 	const providerModels =
-		(usesAnthropic ? anthropicProviderModelsMap : openAIProviderModelsMap)[provider.id] ?? [];
+		(usesGemini
+			? geminiProviderModelsMap
+			: usesAnthropic
+				? anthropicProviderModelsMap
+				: openAIProviderModelsMap)[provider.id] ?? [];
 	const protocolData = useMemo(
 		() =>
 			CUSTOM_API_PROTOCOL_OPTIONS.map((option) => ({
@@ -292,7 +313,9 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		}
 		setRefreshingProvider(provider.id);
 		try {
-			if (usesAnthropic) {
+			if (usesGemini) {
+				await api.geminiRefreshProviderModels(provider.id);
+			} else if (usesAnthropic) {
 				const result = await api.anthropicRefreshProviderModels(provider.id);
 				if (result.resolvedBaseUrl) {
 					notifications.show({
@@ -339,6 +362,7 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 		onSaveBeforeRefresh,
 		provider.id,
 		usesAnthropic,
+		usesGemini,
 	]);
 
 	return (
@@ -493,36 +517,39 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 				)}
 
 				{usesAnthropic && (
-					<>
-						<Switch
-							label={t("anthropicTlsRejectUnauthorized")}
-							description={t("anthropicTlsRejectUnauthorizedDesc")}
-							size="xs"
-							checked={provider.tlsRejectUnauthorized === false}
-							onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
-						/>
-						<Select
-							label={t("anthropicDefaultReasoningEffort")}
-							description={t("anthropicDefaultReasoningEffortDesc")}
-							size="xs"
-							data={[
-								{ value: "auto", label: tn("reasoning_auto") },
-								{ value: "none", label: tn("reasoning_none") },
-								{ value: "low", label: tn("reasoning_low") },
-								{ value: "medium", label: tn("reasoning_medium") },
-								{ value: "high", label: tn("reasoning_high") },
-							]}
-							value={provider.defaultReasoningEffort || "auto"}
-							onChange={(v) =>
-								updateProvider(
-									"defaultReasoningEffort",
-									v && v !== "auto"
-										? (v as CustomApiProviderState["defaultReasoningEffort"])
-										: null,
-								)
-							}
-						/>
-					</>
+					<Switch
+						label={t("anthropicTlsRejectUnauthorized")}
+						description={t("anthropicTlsRejectUnauthorizedDesc")}
+						size="xs"
+						checked={provider.tlsRejectUnauthorized === false}
+						onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
+					/>
+				)}
+
+				{(usesAnthropic || usesGemini) && (
+					<Select
+						label={t("anthropicDefaultReasoningEffort")}
+						description={
+							usesGemini
+								? t("geminiDefaultReasoningEffortDesc")
+								: t("anthropicDefaultReasoningEffortDesc")
+						}
+						size="xs"
+						data={[
+							{ value: "auto", label: tn("reasoning_auto") },
+							{ value: "none", label: tn("reasoning_none") },
+							{ value: "low", label: tn("reasoning_low") },
+							{ value: "medium", label: tn("reasoning_medium") },
+							{ value: "high", label: tn("reasoning_high") },
+						]}
+						value={provider.defaultReasoningEffort || "auto"}
+						onChange={(v) =>
+							updateProvider(
+								"defaultReasoningEffort",
+								v && v !== "auto" ? (v as CustomApiProviderState["defaultReasoningEffort"]) : null,
+							)
+						}
+					/>
 				)}
 
 				<Divider />
@@ -558,7 +585,9 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 					/>
 				)}
 				<InlineCustomModels
-					prefix={provider.prefix || (usesAnthropic ? "anthropic" : "openai")}
+					prefix={
+						provider.prefix || (usesGemini ? "gemini" : usesAnthropic ? "anthropic" : "openai")
+					}
 					customModels={customModels}
 					onCustomModelsChange={onCustomModelsChange}
 					hiddenModels={hiddenModels}

@@ -44,6 +44,7 @@ import {
 	IconLock,
 	IconMessageQuestion,
 	IconNotebook,
+	IconPaperclip,
 	IconPencil,
 	IconPhoto,
 	IconRepeat,
@@ -103,8 +104,10 @@ import {
 import { generateBlockKeys } from "./message-segments";
 import {
 	ACCEPTED_TYPES,
+	isTextFile,
 	MAX_IMAGE_LONG_EDGE,
 	MAX_IMAGE_SIZE,
+	MAX_TEXT_FILE_SIZE,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
 import { useRenderLod } from "./RenderLodCtx";
@@ -301,7 +304,12 @@ interface MessageBubbleProps {
 		messageId: string,
 		newContent: string,
 		rollback: boolean,
-		opts?: { keepImageIds: string[]; newImages: File[] },
+		opts?: {
+			keepImageIds: string[];
+			newImages: File[];
+			keepTextFilePaths?: string[];
+			newTextFiles?: File[];
+		},
 	) => void;
 	/** Edit assistant message text without deleting later messages or regenerating. */
 	onEditAssistantMessage?: (messageId: string, newContent: string) => void;
@@ -1700,6 +1708,51 @@ function EditNewImageThumb({ file, onRemove }: { file: File; onRemove: () => voi
 				title={t("removeImage")}
 			/>
 		</Box>
+	);
+}
+
+/**
+ * Compact chip for a text-file attachment during edit mode (kept existing or
+ * newly added). Mirrors the main composer's text-file preview chip.
+ */
+function EditTextFileChip({
+	filename,
+	size,
+	onRemove,
+}: {
+	filename: string;
+	size: number;
+	onRemove: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	return (
+		<Group
+			gap={6}
+			px="xs"
+			py={4}
+			wrap="nowrap"
+			style={{
+				borderRadius: "var(--mantine-radius-sm)",
+				backgroundColor: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
+				fontSize: "var(--mantine-font-size-xs)",
+			}}
+		>
+			<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
+			<Text size="xs" truncate style={{ maxWidth: 160 }}>
+				{filename}
+			</Text>
+			<Text size="xs" c="dimmed">
+				{formatFileSize(size)}
+			</Text>
+			<CloseButton
+				size={16}
+				iconSize={12}
+				variant="transparent"
+				c="dimmed"
+				onClick={onRemove}
+				title={t("removeFile")}
+			/>
+		</Group>
 	);
 }
 
@@ -3557,6 +3610,12 @@ export const MessageBubble = memo(function MessageBubble({
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON image blocks
 	const [editKeptImages, setEditKeptImages] = useState<any[]>([]);
 	const [editNewImages, setEditNewImages] = useState<File[]>([]);
+	// Text-file attachments during editing: kept (existing text_file blocks the
+	// user may remove) + newly added File[]. text_file blocks are identified by
+	// their filePath (they have no imageId).
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON text_file blocks
+	const [editKeptTextFiles, setEditKeptTextFiles] = useState<any[]>([]);
+	const [editNewTextFiles, setEditNewTextFiles] = useState<File[]>([]);
 	// Mirror the kept-image count in a ref so the async add-images flow reads the
 	// LATEST value (the user may remove a kept image mid-resize) instead of a stale
 	// closure capture when computing remaining room.
@@ -3564,9 +3623,13 @@ export const MessageBubble = memo(function MessageBubble({
 	editKeptCountRef.current = editKeptImages.length;
 	const editFileInputRef = useRef<HTMLInputElement | null>(null);
 	const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+	// Undo stack for the edit textarea. React controls the textarea `value`, which
+	// disables native Ctrl+Z, so we keep our own bounded stack of prior snapshots.
+	const editUndoStackRef = useRef<string[]>([]);
 	const editImageNarratorId = message.narratorId ?? narratorId;
 	const hasEditImages = editKeptImages.length > 0 || editNewImages.length > 0;
-	const canSubmitEdit = !!editContent.trim() || hasEditImages;
+	const hasEditTextFiles = editKeptTextFiles.length > 0 || editNewTextFiles.length > 0;
+	const canSubmitEdit = !!editContent.trim() || hasEditImages || hasEditTextFiles;
 
 	// Initialize edit content when entering edit mode
 	const startEditing = useCallback(() => {
@@ -3577,7 +3640,9 @@ export const MessageBubble = memo(function MessageBubble({
 			return;
 		}
 		setEditContent(editPreview.text);
-		// Seed kept-images from the message's existing image blocks (user-only).
+		// Reset the undo stack for a fresh editing session.
+		editUndoStackRef.current = [];
+		// Seed kept-images and kept-text-files from existing blocks (user-only).
 		if (isUser) {
 			setEditKeptImages(
 				blocks.filter(
@@ -3585,10 +3650,18 @@ export const MessageBubble = memo(function MessageBubble({
 						b.type === "image" && typeof b.imageId === "string",
 				),
 			);
+			setEditKeptTextFiles(
+				blocks.filter(
+					(b: { type?: string; filePath?: unknown }) =>
+						b.type === "text_file" && typeof b.filePath === "string",
+				),
+			);
 		} else {
 			setEditKeptImages([]);
+			setEditKeptTextFiles([]);
 		}
 		setEditNewImages([]);
+		setEditNewTextFiles([]);
 		setIsEditing(true);
 	}, [blocks, isUser, t]);
 
@@ -3598,6 +3671,9 @@ export const MessageBubble = memo(function MessageBubble({
 		setShowConfirmModal(false);
 		setEditKeptImages([]);
 		setEditNewImages([]);
+		setEditKeptTextFiles([]);
+		setEditNewTextFiles([]);
+		editUndoStackRef.current = [];
 	}, []);
 
 	const resetEditState = useCallback(() => {
@@ -3605,6 +3681,9 @@ export const MessageBubble = memo(function MessageBubble({
 		setEditContent("");
 		setEditKeptImages([]);
 		setEditNewImages([]);
+		setEditKeptTextFiles([]);
+		setEditNewTextFiles([]);
+		editUndoStackRef.current = [];
 	}, []);
 
 	const removeKeptImage = useCallback((imageId: string) => {
@@ -3614,6 +3693,38 @@ export const MessageBubble = memo(function MessageBubble({
 	const removeNewImage = useCallback((index: number) => {
 		setEditNewImages((prev) => prev.filter((_, i) => i !== index));
 	}, []);
+
+	const removeKeptTextFile = useCallback((filePath: string) => {
+		setEditKeptTextFiles((prev) => prev.filter((b) => b.filePath !== filePath));
+	}, []);
+
+	const removeNewTextFile = useCallback((index: number) => {
+		setEditNewTextFiles((prev) => prev.filter((_, i) => i !== index));
+	}, []);
+
+	const handleAddEditTextFiles = useCallback(
+		(files: File[]) => {
+			const valid = files.filter((f) => {
+				if (!isTextFile(f.name)) {
+					notifications.show({ color: "yellow", title: t("unsupportedFileType"), message: f.name });
+					return false;
+				}
+				if (f.size > MAX_TEXT_FILE_SIZE) {
+					notifications.show({
+						color: "yellow",
+						title: t("textFileTooLarge"),
+						message: `${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`,
+					});
+					return false;
+				}
+				return true;
+			});
+			if (valid.length > 0) {
+				setEditNewTextFiles((prev) => [...prev, ...valid]);
+			}
+		},
+		[t],
+	);
 
 	const handleAddEditImages = useCallback(
 		async (files: File[]) => {
@@ -3647,23 +3758,33 @@ export const MessageBubble = memo(function MessageBubble({
 		[t],
 	);
 
-	// Paste images directly into the edit textarea (user messages only).
+	// Paste files or images directly into the edit textarea (user messages only).
+	// Image clipboard items → image attachments; other file items → text files
+	// (validated by extension/size). Unknown items are ignored so normal text
+	// paste still works.
 	const handleEditPaste = useCallback(
 		(e: React.ClipboardEvent) => {
 			if (!isUser) return;
 			const imageFiles: File[] = [];
+			const textFiles: File[] = [];
 			for (const item of e.clipboardData.items) {
 				if (item.type.startsWith("image/")) {
 					const file = item.getAsFile();
 					if (file) imageFiles.push(file);
+				} else if (item.kind === "file") {
+					const file = item.getAsFile();
+					if (file && isTextFile(file.name) && file.size <= MAX_TEXT_FILE_SIZE) {
+						textFiles.push(file);
+					}
 				}
 			}
-			if (imageFiles.length > 0) {
+			if (imageFiles.length > 0 || textFiles.length > 0) {
 				e.preventDefault();
-				void handleAddEditImages(imageFiles);
+				if (imageFiles.length > 0) void handleAddEditImages(imageFiles);
+				if (textFiles.length > 0) handleAddEditTextFiles(textFiles);
 			}
 		},
-		[isUser, handleAddEditImages],
+		[isUser, handleAddEditImages, handleAddEditTextFiles],
 	);
 
 	const buildEditImageOpts = useCallback(
@@ -3672,8 +3793,12 @@ export const MessageBubble = memo(function MessageBubble({
 				.map((b) => b.imageId)
 				.filter((id): id is string => typeof id === "string"),
 			newImages: editNewImages,
+			keepTextFilePaths: editKeptTextFiles
+				.map((b) => b.filePath)
+				.filter((p): p is string => typeof p === "string"),
+			newTextFiles: editNewTextFiles,
 		}),
-		[editKeptImages, editNewImages],
+		[editKeptImages, editNewImages, editKeptTextFiles, editNewTextFiles],
 	);
 
 	const handleConfirmClick = useCallback(() => {
@@ -3728,8 +3853,33 @@ export const MessageBubble = memo(function MessageBubble({
 	// Handle keyboard shortcuts in edit mode. Editing a message has no queue
 	// semantics, so Enter and Ctrl/Cmd+Enter both submit; Shift+Enter inserts a
 	// native newline.
+	// Controlled onChange that also records the prior value on the undo stack so
+	// Ctrl+Z can restore it (React-controlled textareas disable native undo).
+	// Snapshots are pushed only when the value actually changed, capped at 100.
+	const handleEditContentChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+		const next = e.currentTarget.value;
+		setEditContent((prev) => {
+			if (prev !== next) {
+				const stack = editUndoStackRef.current;
+				stack.push(prev);
+				if (stack.length > 100) stack.shift();
+			}
+			return next;
+		});
+	}, []);
+
 	const handleEditKeyDown = useCallback(
 		(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+			// Ctrl+Z / Cmd+Z (without shift) → pop the undo stack. Redo (shift+Z)
+			// is left to native behaviour and ignored here.
+			if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+				if (editUndoStackRef.current.length > 0) {
+					e.preventDefault();
+					const prev = editUndoStackRef.current.pop();
+					if (prev !== undefined) setEditContent(prev);
+				}
+				return;
+			}
 			if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
 			if (e.shiftKey) return; // native newline
 			e.preventDefault();
@@ -4160,7 +4310,7 @@ export const MessageBubble = memo(function MessageBubble({
 							<Textarea
 								ref={editTextareaRef}
 								value={editContent}
-								onChange={(e) => setEditContent(e.currentTarget.value)}
+								onChange={handleEditContentChange}
 								onKeyDown={handleEditKeyDown}
 								onPaste={handleEditPaste}
 								autosize
@@ -4187,27 +4337,62 @@ export const MessageBubble = memo(function MessageBubble({
 									))}
 								</Group>
 							)}
+							{hasEditTextFiles && (
+								<Group gap={6} wrap="wrap">
+									{editKeptTextFiles.map((tfBlock) => (
+										<EditTextFileChip
+											key={`kept-tf-${tfBlock.filePath}`}
+											filename={tfBlock.filename}
+											size={tfBlock.size}
+											onRemove={() => removeKeptTextFile(tfBlock.filePath)}
+										/>
+									))}
+									{editNewTextFiles.map((file, i) => (
+										<EditTextFileChip
+											key={`new-tf-${file.name}-${file.size}-${file.lastModified}`}
+											filename={file.name}
+											size={file.size}
+											onRemove={() => removeNewTextFile(i)}
+										/>
+									))}
+								</Group>
+							)}
 							<input
 								ref={editFileInputRef}
 								type="file"
-								accept={ACCEPTED_TYPES.join(",")}
 								multiple
 								style={{ display: "none" }}
 								onChange={(e) => {
 									const files = Array.from(e.target.files ?? []);
-									if (files.length > 0) void handleAddEditImages(files);
+									const imageFiles: File[] = [];
+									const textFileList: File[] = [];
+									const unsupported: string[] = [];
+									for (const f of files) {
+										if (ACCEPTED_TYPES.includes(f.type)) imageFiles.push(f);
+										else if (isTextFile(f.name)) textFileList.push(f);
+										else unsupported.push(f.name);
+									}
+									if (unsupported.length > 0) {
+										notifications.show({
+											color: "yellow",
+											title: t("unsupportedFileType"),
+											message: unsupported.join(", "),
+										});
+									}
+									if (imageFiles.length > 0) void handleAddEditImages(imageFiles);
+									if (textFileList.length > 0) handleAddEditTextFiles(textFileList);
 									e.target.value = "";
 								}}
 							/>
 							<Group gap="xs" justify="space-between">
-								<Tooltip label={t("attachImage")}>
+								<Tooltip label={t("attachFile")}>
 									<ActionIcon
 										variant="subtle"
 										color="gray"
 										onClick={() => editFileInputRef.current?.click()}
-										aria-label={t("attachImage")}
+										aria-label={t("attachFile")}
 									>
-										<IconPhoto size={18} />
+										<IconPaperclip size={18} />
 									</ActionIcon>
 								</Tooltip>
 								<Group gap="xs">

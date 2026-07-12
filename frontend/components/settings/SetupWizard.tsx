@@ -87,23 +87,19 @@ export function SetupWizard({
 		onClose();
 	};
 
-	// --- Provider count (shared between ProviderStep gate and BasicSettingsStep gate) ---
-	const { data: settings } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
-	});
-
-	const providerCount =
-		(settings?.openaiProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
-		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
-		(settings?.nugProviders?.filter(
-			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
-		)?.length ?? 0) +
-		(settings?.clineProviders?.filter(
-			(p: { baseUrl?: string; accessToken?: string }) => p.baseUrl && p.accessToken,
-		)?.length ?? 0) +
-		(settings?.codexAvailable ? 1 : 0);
+	// --- Provider readiness (shared between ProviderStep gate and BasicSettingsStep gate) ---
+	// Provider-agnostic: instead of enumerating a hardcoded list of provider config
+	// arrays, we count how many distinct providers actually surface usable models.
+	// gemini/nug/cline/custom), with disabled providers already filtered out, so any
+	// provider that fetched/enabled at least one model automatically counts.
+	const { allModels } = useAllModels();
+	const providerCount = useMemo(() => {
+		const providersWithModels = new Set<string>();
+		for (const m of allModels) {
+			if (m.provider) providersWithModels.add(m.provider);
+		}
+		return providersWithModels.size;
+	}, [allModels]);
 
 	// Track whether both models are set in BasicSettingsStep
 	const [basicStepValid, setBasicStepValid] = useState(false);

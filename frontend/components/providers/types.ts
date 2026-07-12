@@ -6,7 +6,8 @@ export type CustomApiProtocol =
 	| "anthropic-compatible"
 	| "codex-native"
 	| "responses-compatible"
-	| "completions-compatible";
+	| "completions-compatible"
+	| "gemini-compatible";
 
 /** Per-provider User-Agent selection mode. */
 export type UserAgentMode = "narrafork" | "claude-code" | "codex" | "custom";

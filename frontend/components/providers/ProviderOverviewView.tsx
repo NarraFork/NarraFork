@@ -80,6 +80,14 @@ const ADD_PROVIDER_OPTIONS: Array<{
 		hintKey: "addProviderNugHint",
 		color: "indigo",
 	},
+	{
+		type: "gemini-compatible",
+		labelKey: "addProviderGemini",
+		badgeKey: "addProviderBadgeGemini",
+		descriptionKey: "addProviderGeminiDesc",
+		hintKey: "addProviderGeminiHint",
+		color: "grape",
+	},
 ];
 
 export interface ProviderOverviewViewProps {

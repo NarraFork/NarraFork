@@ -2031,6 +2031,8 @@ export async function* agentLoop(
 				lastYieldedAt: number;
 				/** Provider-native content block index for interleaved ordering. */
 				outputIndex?: number;
+				/** Gemini 3 thought signature attached to this functionCall part. */
+				thoughtSignature?: string;
 			}
 		>();
 		// Accumulator for native web search calls (Codex web_search tool)
@@ -2394,6 +2396,7 @@ export async function* agentLoop(
 									toolUseId: tu.toolUseId,
 									name: tu.name,
 									input: tu.input,
+									...(tu.thoughtSignature && { thoughtSignature: tu.thoughtSignature }),
 								} satisfies ContentBlock,
 							};
 
@@ -2443,6 +2446,7 @@ export async function* agentLoop(
 					// Handle streaming tool use chunks
 					if (parsed.toolUseChunk) {
 						const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
+						const chunkThoughtSignature = parsed.toolUseChunk.thoughtSignature;
 						if (id) {
 							if (!toolUseAccum.has(id) && name) {
 								// Don't create accumulator if this tool was already
@@ -2464,6 +2468,7 @@ export async function* agentLoop(
 										startedAt: Date.now(),
 										lastYieldedAt: Date.now(),
 										outputIndex: parsed.toolUseChunk.outputIndex,
+										thoughtSignature: chunkThoughtSignature,
 									});
 									// Yield immediately so the frontend knows the tool name early
 									yield {
@@ -2476,6 +2481,9 @@ export async function* agentLoop(
 							}
 							const acc = toolUseAccum.get(id);
 							if (acc) {
+								// Gemini 3: the thought signature may arrive on any chunk for
+								// this call; keep the latest non-empty value.
+								if (chunkThoughtSignature) acc.thoughtSignature = chunkThoughtSignature;
 								const shortInput = isShortInputTool(acc.name);
 								if (typeof input === "string") {
 									acc.inputChunks.push(input);
@@ -2679,6 +2687,7 @@ export async function* agentLoop(
 										input: parsedInput,
 										streamStartedAt: acc.startedAt,
 										outputIndex: acc.outputIndex,
+										...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
 									};
 									// Skip if already added via non-streaming parsed.toolUses
 									const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
@@ -2702,6 +2711,7 @@ export async function* agentLoop(
 											input: parsedInput,
 											streamStartedAt: acc.startedAt,
 											outputIndex: acc.outputIndex,
+											...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
 										} satisfies ContentBlock,
 									};
 

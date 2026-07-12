@@ -23,7 +23,8 @@ export type CustomApiProtocol =
 	| "anthropic-compatible"
 	| "codex-native"
 	| "responses-compatible"
-	| "completions-compatible";
+	| "completions-compatible"
+	| "gemini-compatible";
 
 export interface CustomApiProviderConfig {
 	/** Unique short ID shared across protocol switches. */
@@ -204,6 +205,36 @@ export interface NUGProviderConfig {
 	oauthDeviceId?: string;
 	/** Override OAuth callback URL (auto-detected from request headers by default). */
 	oauthCallbackUrl?: string;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
+}
+
+export interface GeminiProviderConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name, e.g. "Gemini", "Google AI". */
+	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
+	/**
+	 * Provider prefix used in model IDs, e.g. "gemini".
+	 * Model IDs are formatted as "{prefix}:{model}", e.g. "gemini:gemini-2.5-flash".
+	 * Must be unique across all providers.
+	 */
+	prefix: string;
+	/** Google Generative Language API key (sent as x-goog-api-key). */
+	apiKey: string;
+	/** API base URL, e.g. "https://generativelanguage.googleapis.com/v1beta". */
+	baseUrl: string;
+	/** Default model (bare name without prefix, e.g. "gemini-2.5-flash"). */
+	defaultModel: string;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
+	/**
+	 * Default reasoning effort for Gemini models when narrator reasoningEffort is unset.
+	 * Maps to thinkingConfig.thinkingBudget (none disables thinking).
+	 */
+	defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "max" | null;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
 }
@@ -710,6 +741,8 @@ export interface NarraForkSettings {
 	nugProviders?: NUGProviderConfig[];
 	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
 	clineProviders?: ClineProviderConfig[];
+	/** Google Gemini API providers — native generativelanguage.googleapis.com protocol. */
+	geminiProviders?: GeminiProviderConfig[];
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
 	/** Delta update configuration. */

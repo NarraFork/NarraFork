@@ -602,22 +602,32 @@ export const narratorsApi = {
 		messageId: string,
 		content: string,
 		rollback: boolean,
-		opts?: { keepImageIds?: string[]; newImages?: File[] },
+		opts?: {
+			keepImageIds?: string[];
+			newImages?: File[];
+			keepTextFilePaths?: string[];
+			newTextFiles?: File[];
+		},
 	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
 
 		let body: BodyInit;
-		if (opts?.newImages?.length) {
-			// Multipart: text + kept-image ids + newly uploaded image files.
+		if (opts?.newImages?.length || opts?.newTextFiles?.length) {
+			// Multipart: text + kept-image ids + kept-text-file paths + newly
+			// uploaded image / text files.
 			const formData = new FormData();
 			formData.append("content", content);
 			formData.append("rollback", rollback ? "true" : "false");
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
-			for (const img of opts.newImages) formData.append("images", img);
+			if (opts.keepTextFilePaths) {
+				formData.append("keepTextFilePaths", JSON.stringify(opts.keepTextFilePaths));
+			}
+			for (const img of opts.newImages ?? []) formData.append("images", img);
+			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";
@@ -625,6 +635,7 @@ export const narratorsApi = {
 				content,
 				rollback,
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 			});
 		}
 

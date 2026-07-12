@@ -1288,23 +1288,38 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 	let rollback = false;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
+	// undefined => keep all existing text files (legacy); array => keep only these paths.
+	let keepTextFilePaths: string[] | undefined;
 	const newImages: ImageRef[] = [];
+	// Newly uploaded text files during editing (saved to the worktree in the service layer).
+	const newTextFiles: File[] = [];
+
+	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
+		if (typeof raw !== "string") return [];
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				return parsed.filter((v): v is string => typeof v === "string");
+			}
+		} catch {
+			throw new ValidationError(`${field} must be a JSON array of strings`);
+		}
+		return [];
+	};
 
 	const contentType = c.req.header("content-type") ?? "";
 	if (contentType.includes("multipart/form-data")) {
 		const formData = await c.req.formData();
 		content = (formData.get("content") as string) ?? "";
 		rollback = formData.get("rollback") === "true";
-		const keepRaw = formData.get("keepImageIds");
-		if (typeof keepRaw === "string") {
-			try {
-				const parsed = JSON.parse(keepRaw);
-				if (Array.isArray(parsed)) {
-					keepImageIds = parsed.filter((v): v is string => typeof v === "string");
-				}
-			} catch {
-				throw new ValidationError("keepImageIds must be a JSON array of strings");
-			}
+		if (typeof formData.get("keepImageIds") === "string") {
+			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
+		}
+		if (typeof formData.get("keepTextFilePaths") === "string") {
+			keepTextFilePaths = parseJsonStringArray(
+				formData.get("keepTextFilePaths"),
+				"keepTextFilePaths",
+			);
 		}
 		const imageFiles = formData.getAll("images") as File[];
 		const keepCount = keepImageIds?.length ?? 0;
@@ -1317,6 +1332,9 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			// base64 loading resolve correctly even when the message is shared/forked.
 			newImages.push({ ...ref, uploadNarratorId: id });
 		}
+		for (const file of formData.getAll("textFiles") as File[]) {
+			newTextFiles.push(file);
+		}
 	} else {
 		const body = await c.req.json();
 		content = typeof body.content === "string" ? body.content : "";
@@ -1324,12 +1342,20 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		if (Array.isArray(body.keepImageIds)) {
 			keepImageIds = body.keepImageIds.filter((v: unknown): v is string => typeof v === "string");
 		}
+		if (Array.isArray(body.keepTextFilePaths)) {
+			keepTextFilePaths = body.keepTextFilePaths.filter(
+				(v: unknown): v is string => typeof v === "string",
+			);
+		}
 	}
 
-	// Allow empty text only when at least one image remains (kept or newly added).
+	// Allow empty text only when at least one image / text file remains (kept or newly added).
 	const hasImages =
 		(keepImageIds === undefined ? true : keepImageIds.length > 0) || newImages.length > 0;
-	if (!content.trim() && !hasImages) {
+	const hasTextFiles =
+		(keepTextFilePaths === undefined ? true : keepTextFilePaths.length > 0) ||
+		newTextFiles.length > 0;
+	if (!content.trim() && !hasImages && !hasTextFiles) {
 		throw new ValidationError("content is required");
 	}
 
@@ -1360,6 +1386,8 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 		{
 			keepImageIds,
 			newImages: newImages.length > 0 ? newImages : undefined,
+			keepTextFilePaths,
+			newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
 			userId,
 		},
 	);

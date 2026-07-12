@@ -29,8 +29,10 @@ export const ProviderConfigView = React.memo(function ProviderConfigView({
 				{t("providerConfigDesc")}
 			</Text>
 
-			<ScrollArea style={{ flex: 1 }}>
-				<Box pb="xl">{children}</Box>
+			<ScrollArea style={{ flex: 1 }} offsetScrollbars scrollbarSize={10}>
+				<Box pb="xl" pr="sm">
+					{children}
+				</Box>
 			</ScrollArea>
 		</Stack>
 	);
