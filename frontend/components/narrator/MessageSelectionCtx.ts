@@ -6,6 +6,8 @@ import { collectElementTextPreviewResult } from "../../lib/dom-text";
  * Used by the selection logic to enumerate blocks in DOM order.
  */
 export const BLOCK_ID_ATTR = "data-block-id";
+/** Optional comma-separated original indices represented by one merged visual block. */
+export const BLOCK_INDICES_ATTR = "data-block-indices";
 
 /** Attribute placed on interactive islands that must not trigger message-block selection. */
 export const MESSAGE_SELECTION_IGNORE_ATTR = "data-message-selection-ignore";
@@ -77,6 +79,16 @@ export const MAX_COLLECTED_SELECTED_TEXT_CHARS = 200_000;
 
 export function makeMessageBlockSelectionId(messageId: string, blockIndex: number): string {
 	return `msg-${messageId}-${blockIndex}`;
+}
+
+export function parseMessageBlockIndices(value: string | null | undefined): number[] {
+	if (!value) return [];
+	const indices = new Set<number>();
+	for (const part of value.split(",")) {
+		const index = Number(part.trim());
+		if (Number.isInteger(index) && index >= 0) indices.add(index);
+	}
+	return [...indices].sort((a, b) => a - b);
 }
 
 const DEFAULT_STATE: MessageSelectionState = {
@@ -151,7 +163,12 @@ export function resolveSelectedBlockMeta(
 		const messageId = el.getAttribute("data-message-id");
 		const blockIndexStr = el.getAttribute("data-block-index");
 		if (!messageId || blockIndexStr == null) continue;
-		result.push({ blockId, messageId, blockIndex: Number(blockIndexStr) });
+		const mergedIndices = parseMessageBlockIndices(el.getAttribute(BLOCK_INDICES_ATTR));
+		const blockIndices = mergedIndices.length > 0 ? mergedIndices : [Number(blockIndexStr)];
+		for (const blockIndex of blockIndices) {
+			if (!Number.isInteger(blockIndex) || blockIndex < 0) continue;
+			result.push({ blockId, messageId, blockIndex });
+		}
 	}
 	return result;
 }

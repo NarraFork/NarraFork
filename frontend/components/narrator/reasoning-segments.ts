@@ -148,3 +148,162 @@ export function parseReasoningSegments(text: string): ReasoningSegment[] {
 export function hasStructuredReasoning(segments: ReasoningSegment[]): boolean {
 	return segments.some((s) => s.title != null);
 }
+
+// ---------------------------------------------------------------------------
+// Adjacent reasoning-block grouping
+//
+// gpt-5.6 interleaved reasoning emits one `{type:"reasoning"}` block per
+// reasoning item, so a single assistant message can carry several adjacent
+// reasoning blocks. We merge *adjacent* reasoning/thinking blocks into one
+// trace (reasoning separated by a tool call or text block stays split, which
+// matches the interleaved semantics). We also compute whether a run is the
+// message's last renderable content, so the live "thinking" shimmer stops once
+// real output (text / tool call / …) follows the reasoning.
+// ---------------------------------------------------------------------------
+
+/** Minimal shape of a content block needed for grouping. */
+export interface ContentBlockLike {
+	type?: string;
+	text?: string;
+	thinking?: string;
+	providerMetadata?: unknown;
+}
+
+export type ReasoningEncryptionState = "none" | "only" | "partial";
+
+export function hasEncryptedReasoningMetadata(block: unknown): boolean {
+	if (!block || typeof block !== "object") return false;
+	const providerMetadata = (block as Record<string, unknown>).providerMetadata;
+	if (!providerMetadata || typeof providerMetadata !== "object") return false;
+
+	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
+		if (!metadata || typeof metadata !== "object") return false;
+		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
+		return typeof encrypted === "string" && encrypted.length > 0;
+	});
+}
+
+export function getReasoningEncryptionState(blocks: ContentBlockLike[]): ReasoningEncryptionState {
+	const hasVisibleText = blocks.some((block) => (block.text || block.thinking || "").length > 0);
+	const hasEncryptedOnlyBlock = blocks.some(
+		(block) => !(block.text || block.thinking || "").length && hasEncryptedReasoningMetadata(block),
+	);
+	if (!hasEncryptedOnlyBlock) return "none";
+	return hasVisibleText ? "partial" : "only";
+}
+
+/** True for reasoning / thinking blocks. */
+export function isReasoningBlock(block: ContentBlockLike): boolean {
+	return block.type === "reasoning" || block.type === "thinking";
+}
+
+/**
+ * True when a block renders visible, non-reasoning content. Empty text blocks
+ * (which `MessageBubble` skips) do not count, so trailing empty text after
+ * reasoning still leaves the run as the "last content".
+ */
+export function isRenderableContentBlock(block: ContentBlockLike): boolean {
+	switch (block.type) {
+		case "text":
+			return typeof block.text === "string" && block.text.trim().length > 0;
+		case "tool_use":
+		case "web_search":
+		case "image":
+		case "image_generation":
+		case "text_file":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/** A contiguous span of reasoning blocks. */
+export interface ReasoningRun {
+	/** Index of the first reasoning block in the run. */
+	startIndex: number;
+	/** Index of the last reasoning block in the run (inclusive). */
+	endIndex: number;
+	/** All reasoning block indices in the run (contiguous). */
+	indices: number[];
+	/** True when no later visible content or separate reasoning run follows. */
+	isLastContent: boolean;
+}
+
+export interface ReasoningGrouping {
+	runs: ReasoningRun[];
+	/** Block indices that a run absorbed (all but its start) — skip when rendering. */
+	skip: Set<number>;
+}
+
+export interface ReasoningRunActionIndices {
+	anchorIndex: number | undefined;
+	rollbackIndex: number | undefined;
+	deleteIndices: number[];
+}
+
+export function resolveReasoningRunActionIndices(indices: number[]): ReasoningRunActionIndices {
+	const ordered = [...new Set(indices)].sort((a, b) => a - b);
+	return {
+		anchorIndex: ordered[0],
+		rollbackIndex: ordered[ordered.length - 1],
+		deleteIndices: [...ordered].reverse(),
+	};
+}
+
+export interface ReasoningGroupingOptions {
+	/** Maps each local block index back to its index in `allBlocks`. */
+	originalIndices?: number[];
+	/** Complete unfiltered message blocks, used to detect content in later render segments. */
+	allBlocks?: ContentBlockLike[];
+}
+
+/**
+ * Scan `blocks` and merge each contiguous span of reasoning/thinking blocks
+ * into a single run. Returns the runs plus the set of absorbed indices to skip
+ * during rendering (every reasoning block in a run except its start).
+ *
+ * Renderers may pass a filtered content segment. In that case `originalIndices`
+ * preserves true adjacency and `allBlocks` keeps terminal/shimmer detection based
+ * on the complete message rather than only the currently rendered segment.
+ */
+export function groupReasoningRuns(
+	blocks: ContentBlockLike[],
+	opts: ReasoningGroupingOptions = {},
+): ReasoningGrouping {
+	const runs: ReasoningRun[] = [];
+	const skip = new Set<number>();
+	const originalIndices =
+		opts.originalIndices?.length === blocks.length ? opts.originalIndices : undefined;
+	const allBlocks = opts.allBlocks ?? blocks;
+
+	for (let i = 0; i < blocks.length; i++) {
+		if (!isReasoningBlock(blocks[i])) continue;
+		const startIndex = i;
+		const indices: number[] = [i];
+		let j = i + 1;
+		while (
+			j < blocks.length &&
+			isReasoningBlock(blocks[j]) &&
+			(!originalIndices || originalIndices[j] === originalIndices[j - 1] + 1)
+		) {
+			indices.push(j);
+			skip.add(j);
+			j++;
+		}
+		const endIndex = j - 1;
+		const originalEndIndex = originalIndices?.[endIndex] ?? endIndex;
+		// Any later visible content — including a separate reasoning run — means
+		// this is not the message's latest active reasoning trace.
+		let isLastContent = true;
+		for (let k = originalEndIndex + 1; k < allBlocks.length; k++) {
+			if (isReasoningBlock(allBlocks[k]) || isRenderableContentBlock(allBlocks[k])) {
+				isLastContent = false;
+				break;
+			}
+		}
+		runs.push({ startIndex, endIndex, indices, isLastContent });
+		i = endIndex; // continue after the run
+	}
+
+	return { runs, skip };
+}

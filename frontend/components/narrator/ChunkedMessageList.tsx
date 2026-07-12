@@ -39,6 +39,7 @@ import {
 	type PermissionCallbacks,
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
+import { groupReasoningRuns } from "./reasoning-segments";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
 import { type ChunkData, useNarratorChunks } from "./useNarratorChunks";
 
@@ -281,6 +282,8 @@ function waitAnimationFrame(): Promise<void> {
 interface SelectionEntry extends BlockMeta {
 	seq: number;
 	chunkIndex: number;
+	/** All original indices represented by this visual entry. */
+	blockIndices: number[];
 	copyText: string;
 }
 
@@ -341,6 +344,13 @@ function isSelectableBlock(block: ContentBlock): boolean {
 	return block.type === "web_search" || block.type === "tool_use";
 }
 
+function getReasoningRunCopyText(blocks: ContentBlock[]): string {
+	return blocks
+		.map((block) => block.text || block.thinking || "")
+		.filter((text) => text.length > 0)
+		.join("\n\n");
+}
+
 function getUserMessageCopyText(msg: NarratorMsg): string {
 	if (msg.contentText?.trim()) return msg.contentText;
 	const parts: string[] = [];
@@ -366,11 +376,32 @@ function buildSelectionIndex(chunks: ChunkData[]): SelectionIndex {
 			const seq = getMessageSeq(msg);
 			if (!msg.id || seq == null || !Array.isArray(msg.contentJson)) continue;
 			const userCopyText = msg.role === "user" ? getUserMessageCopyText(msg) : "";
+			const reasoningGrouping =
+				msg.role === "user"
+					? { runs: [], skip: new Set<number>() }
+					: groupReasoningRuns(msg.contentJson);
+			const reasoningRunByStart = new Map(
+				reasoningGrouping.runs.map((run) => [run.startIndex, run] as const),
+			);
 			for (let blockIndex = 0; blockIndex < msg.contentJson.length; blockIndex++) {
+				if (reasoningGrouping.skip.has(blockIndex)) continue;
 				const block = msg.contentJson[blockIndex] as ContentBlock;
 				if (!block || typeof block !== "object") continue;
 				if (msg.role === "user" && blockIndex > 0) continue;
-				if (msg.role !== "user" && !isSelectableBlock(block)) continue;
+
+				const reasoningRun = reasoningRunByStart.get(blockIndex);
+				const blockIndices = reasoningRun?.indices ?? [blockIndex];
+				const representedBlocks = blockIndices.map(
+					(index) => msg.contentJson[index] as ContentBlock,
+				);
+				if (
+					msg.role !== "user" &&
+					!(reasoningRun
+						? representedBlocks.some((candidate) => isSelectableBlock(candidate))
+						: isSelectableBlock(block))
+				)
+					continue;
+
 				const isTool = block.type === "tool_use" && typeof block.id === "string";
 				const primaryId = isTool
 					? isSubagentTool(msg, block)
@@ -381,9 +412,15 @@ function buildSelectionIndex(chunks: ChunkData[]): SelectionIndex {
 					blockId: primaryId,
 					messageId: msg.id,
 					blockIndex,
+					blockIndices,
 					seq,
 					chunkIndex,
-					copyText: msg.role === "user" ? userCopyText : getBlockCopyText(block),
+					copyText:
+						msg.role === "user"
+							? userCopyText
+							: reasoningRun
+								? getReasoningRunCopyText(representedBlocks)
+								: getBlockCopyText(block),
 				};
 				index.entries.push(entry);
 				index.byBlockId.set(primaryId, entry);
@@ -404,10 +441,12 @@ function entriesToBlockMeta(entries: SelectionEntry[], selectedIds: Set<string>)
 	const out: BlockMeta[] = [];
 	for (const entry of entries) {
 		if (!selectedIds.has(entry.blockId)) continue;
-		const key = `${entry.messageId}:${entry.blockIndex}`;
-		if (seen.has(key)) continue;
-		seen.add(key);
-		out.push({ blockId: entry.blockId, messageId: entry.messageId, blockIndex: entry.blockIndex });
+		for (const blockIndex of entry.blockIndices) {
+			const key = `${entry.messageId}:${blockIndex}`;
+			if (seen.has(key)) continue;
+			seen.add(key);
+			out.push({ blockId: entry.blockId, messageId: entry.messageId, blockIndex });
+		}
 	}
 	return out;
 }
@@ -1261,7 +1300,14 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (loaded) return loaded;
 					const seq = await resolveMessageSeq(mounted.messageId).catch(() => null);
 					const chunkIndex = seq == null ? -1 : getChunkIndexForSeq(seq);
-					if (seq != null && chunkIndex >= 0) return { ...mounted, seq, chunkIndex, copyText: "" };
+					if (seq != null && chunkIndex >= 0)
+						return {
+							...mounted,
+							blockIndices: [mounted.blockIndex],
+							seq,
+							chunkIndex,
+							copyText: "",
+						};
 				}
 
 				const toolUseId =
@@ -1276,7 +1322,15 @@ const ChunkedMessageListImpl = forwardRef<ChunkedMessageListHandle, ChunkedMessa
 					if (seq == null || chunkIndex < 0) return null;
 					// The exact block index will be refreshed from the loaded chunk after
 					// ensureLoadedRange(). Use 0 only as a temporary ordering fallback.
-					return { blockId, messageId, blockIndex: 0, seq, chunkIndex, copyText: "" };
+					return {
+						blockId,
+						messageId,
+						blockIndex: 0,
+						blockIndices: [0],
+						seq,
+						chunkIndex,
+						copyText: "",
+					};
 				} catch {
 					return null;
 				}

@@ -146,6 +146,47 @@ const MAX_CATCH_UP_CURSORS = 100;
  * the 90s server timeout guarantees a genuinely dead connection is still rebuilt.
  */
 const VISIBILITY_RECONNECT_THRESHOLD_MS = 60_000;
+const FOREGROUND_RECOVERY_COALESCE_MS = 250;
+
+export type NarratorForegroundSocketState = "missing" | "connecting" | "open" | "closed";
+export type NarratorForegroundRecoveryAction = "none" | "reconnect" | "sync";
+
+export interface NarratorForegroundRecoveryCoalescer {
+	schedule(callback: () => void): boolean;
+	cancel(): void;
+}
+
+export function createNarratorForegroundRecoveryCoalescer(
+	delayMs = FOREGROUND_RECOVERY_COALESCE_MS,
+): NarratorForegroundRecoveryCoalescer {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	return {
+		schedule(callback) {
+			if (timer !== undefined) return false;
+			timer = setTimeout(() => {
+				timer = undefined;
+				callback();
+			}, delayMs);
+			return true;
+		},
+		cancel() {
+			clearTimeout(timer);
+			timer = undefined;
+		},
+	};
+}
+
+export function decideNarratorForegroundRecovery(opts: {
+	hiddenElapsedMs: number;
+	socketState: NarratorForegroundSocketState;
+	hasPendingReconnect: boolean;
+}): NarratorForegroundRecoveryAction {
+	if (opts.hiddenElapsedMs >= VISIBILITY_RECONNECT_THRESHOLD_MS) return "reconnect";
+	if (opts.socketState === "missing" || opts.socketState === "closed") {
+		return opts.hasPendingReconnect ? "none" : "reconnect";
+	}
+	return opts.socketState === "open" ? "sync" : "none";
+}
 
 // ---------------------------------------------------------------------------
 // Manager
@@ -158,6 +199,7 @@ class NarratorWSManager {
 	private reconnectAttempts = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+	private foregroundRecovery = createNarratorForegroundRecoveryCoalescer();
 	private cancelled = false;
 
 	// --- Subscription ref-counting ---
@@ -221,6 +263,7 @@ class NarratorWSManager {
 		this._unlistenVisibility();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this.foregroundRecovery.cancel();
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
 		this.pendingDispatchQueue = [];
@@ -621,6 +664,9 @@ class NarratorWSManager {
 	reconnect(): void {
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this.foregroundRecovery.cancel();
+		this.reconnectTimer = undefined;
+		this.pingTimeoutTimer = undefined;
 		const ws = this.ws;
 		this.ws = null;
 		if (ws) {
@@ -643,11 +689,15 @@ class NarratorWSManager {
 
 	private _doConnect(): void {
 		if (this.cancelled) return;
+		this.reconnectTimer = undefined;
 
 		const token = getToken();
 		if (!token) {
 			// No token yet — retry after a short delay
-			this.reconnectTimer = setTimeout(() => this._doConnect(), 1000);
+			this.reconnectTimer = setTimeout(() => {
+				this.reconnectTimer = undefined;
+				this._doConnect();
+			}, 1000);
 			return;
 		}
 
@@ -660,6 +710,8 @@ class NarratorWSManager {
 				ws.close();
 				return;
 			}
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
 			const isReconnect = this.reconnectAttempts > 0;
 			this.reconnectAttempts = 0;
 			this._setConnected(true, isReconnect);
@@ -718,6 +770,8 @@ class NarratorWSManager {
 		ws.onclose = (ev) => {
 			if (this.cancelled || this.ws !== ws) return;
 			this.ws = null;
+			clearTimeout(this.pingTimeoutTimer);
+			this.pingTimeoutTimer = undefined;
 			// 1001 = Going Away — server is shutting down, don't reconnect.
 			if (ev.code === 1001) this._disconnected = true;
 			this._setConnected(false, false);
@@ -749,7 +803,10 @@ class NarratorWSManager {
 			RECONNECT_MAX_DELAY_MS,
 		);
 		this.reconnectAttempts++;
-		this.reconnectTimer = setTimeout(() => this._doConnect(), delay);
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			this._doConnect();
+		}, delay);
 	}
 
 	private _resetPingTimeout(): void {
@@ -830,11 +887,16 @@ class NarratorWSManager {
 		if (this._boundVisibilityHandler) return;
 		this._boundVisibilityHandler = () => this._handleVisibilityChange();
 		document.addEventListener("visibilitychange", this._boundVisibilityHandler);
+		window.addEventListener("focus", this._boundVisibilityHandler);
+		window.addEventListener("pageshow", this._boundVisibilityHandler);
 	}
 
 	private _unlistenVisibility(): void {
+		this.foregroundRecovery.cancel();
 		if (this._boundVisibilityHandler) {
 			document.removeEventListener("visibilitychange", this._boundVisibilityHandler);
+			window.removeEventListener("focus", this._boundVisibilityHandler);
+			window.removeEventListener("pageshow", this._boundVisibilityHandler);
 			this._boundVisibilityHandler = null;
 		}
 	}
@@ -857,30 +919,41 @@ class NarratorWSManager {
 		if (this.cancelled) return;
 
 		if (document.visibilityState === "hidden") {
-			this._hiddenAt = Date.now();
+			if (!this._hiddenAt) this._hiddenAt = Date.now();
+			this.foregroundRecovery.cancel();
 			return;
 		}
 
-		// visible
+		// `visibilitychange`, `focus`, and `pageshow` commonly fire together when a
+		// frozen tab resumes. Coalesce them so one foreground transition performs at
+		// most one reconnect/sync cycle.
+		this.foregroundRecovery.schedule(() => {
+			if (this.cancelled || document.visibilityState !== "visible") return;
+			this._recoverForeground();
+		});
+	}
+
+	private _recoverForeground(): void {
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
+		const socketState: NarratorForegroundSocketState = !this.ws
+			? "missing"
+			: this.ws.readyState === WebSocket.OPEN
+				? "open"
+				: this.ws.readyState === WebSocket.CONNECTING
+					? "connecting"
+					: "closed";
+		const action = decideNarratorForegroundRecovery({
+			hiddenElapsedMs: elapsed,
+			socketState,
+			hasPendingReconnect: this.reconnectTimer !== undefined,
+		});
 
-		// If reconnection was exhausted (ws is null, no pending timer), always
-		// try again when the tab becomes visible — this is the only automatic
-		// recovery path after MAX_RECONNECT_ATTEMPTS.
-		if (!this.ws && !this.reconnectTimer) {
+		if (action === "reconnect") {
 			this.reconnect();
 			return;
 		}
-
-		// Long hidden — force a clean reconnect
-		if (elapsed >= VISIBILITY_RECONNECT_THRESHOLD_MS) {
-			this.reconnect();
-			return;
-		}
-
-		// Short switch — send lightweight sync_check to detect missed messages
-		this.checkAllSubscribedSync();
+		if (action === "sync") this.checkAllSubscribedSync();
 	}
 
 	private _scheduleSubscribe(

@@ -1,4 +1,4 @@
-import { Box, Center, Drawer, Group, Loader, Stack, Text } from "@mantine/core";
+import { Box, Center, Drawer, Group, Loader, Text } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -28,7 +28,6 @@ import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
-import { usePageUnload } from "../../hooks/usePageUnload";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useCreateNarratorTerminal, useNarratorTerminals } from "../../hooks/useTerminals";
@@ -83,10 +82,6 @@ function NarratorDetailPage() {
 	// scrollTo search param takes precedence over hash-based highlight
 	const highlightMessageId = scrollToMessageId ?? hashMessageId;
 	const isMobile = useMediaQuery("(max-width: 768px)");
-	const { t } = useTranslation("narrators");
-
-	// Unload heavy components when the tab has been hidden for a while
-	const unloaded = usePageUnload();
 
 	// Fetch narrator data for recent tab tracking
 	const { data: narrator } = useNarrator(narratorId);
@@ -469,29 +464,6 @@ function NarratorDetailPage() {
 	const mergedRef = useCallback((el: HTMLDivElement | null) => {
 		pageBoxRef.current = el;
 	}, []);
-
-	// Mobile layout
-	if (unloaded) {
-		return (
-			<Box
-				h="calc(100dvh - 60px)"
-				mx="calc(var(--mantine-spacing-md) * -1)"
-				my="calc(var(--mantine-spacing-md) * -1)"
-			>
-				<Center h="100%">
-					<Stack align="center" gap="sm">
-						<Loader size="sm" />
-						<Text size="sm" c="dimmed">
-							{t("narratorUnloaded")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("narratorUnloadedHint")}
-						</Text>
-					</Stack>
-				</Center>
-			</Box>
-		);
-	}
 
 	// Mobile layout
 	if (isMobile) {

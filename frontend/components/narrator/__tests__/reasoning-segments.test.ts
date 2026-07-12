@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+	type ContentBlockLike,
+	getReasoningEncryptionState,
+	groupReasoningRuns,
 	hasStructuredReasoning,
 	parseReasoningSegments,
 	type ReasoningSegment,
+	resolveReasoningRunActionIndices,
 } from "../reasoning-segments";
 
 /** Join codex-style parts the way openai-provider persists them. */
@@ -112,5 +116,122 @@ describe("parseReasoningSegments — codex parity", () => {
 	test("empty input yields no segments", () => {
 		expect(parseReasoningSegments("")).toEqual([]);
 		expect(hasStructuredReasoning([])).toBe(false);
+	});
+});
+
+describe("groupReasoningRuns", () => {
+	const r = (text = "**T**\n\n<!-- -->"): ContentBlockLike => ({ type: "reasoning", text });
+	const think = (text = "hmm"): ContentBlockLike => ({ type: "thinking", thinking: text });
+	const text = (t: string): ContentBlockLike => ({ type: "text", text: t });
+	const tool = (): ContentBlockLike => ({ type: "tool_use" });
+
+	test("merges three adjacent reasoning blocks into one terminal run", () => {
+		const { runs, skip } = groupReasoningRuns([r(), r(), r()]);
+		expect(runs).toHaveLength(1);
+		expect(runs[0]).toEqual({
+			startIndex: 0,
+			endIndex: 2,
+			indices: [0, 1, 2],
+			isLastContent: true,
+		});
+		expect([...skip]).toEqual([1, 2]);
+	});
+
+	test("reasoning split by a tool call stays as two independent runs", () => {
+		const { runs, skip } = groupReasoningRuns([r(), tool(), r(), r()]);
+		expect(runs).toHaveLength(2);
+		expect(runs[0]).toMatchObject({ startIndex: 0, endIndex: 0, isLastContent: false });
+		expect(runs[1]).toMatchObject({ startIndex: 2, endIndex: 3, isLastContent: true });
+		expect([...skip]).toEqual([3]);
+	});
+
+	test("run followed by non-empty text is not the last content", () => {
+		const { runs } = groupReasoningRuns([r(), r(), text("Done")]);
+		expect(runs).toHaveLength(1);
+		expect(runs[0].isLastContent).toBe(false);
+	});
+
+	test("run followed only by an empty text block is still the last content", () => {
+		const { runs } = groupReasoningRuns([r(), text("   ")]);
+		expect(runs[0].isLastContent).toBe(true);
+	});
+
+	test("merges adjacent reasoning and thinking blocks together", () => {
+		const { runs, skip } = groupReasoningRuns([think(), r(), think()]);
+		expect(runs).toHaveLength(1);
+		expect(runs[0].indices).toEqual([0, 1, 2]);
+		expect([...skip]).toEqual([1, 2]);
+	});
+
+	test("no reasoning blocks yields no runs", () => {
+		const { runs, skip } = groupReasoningRuns([text("hi"), tool()]);
+		expect(runs).toEqual([]);
+		expect(skip.size).toBe(0);
+	});
+
+	test("two runs separated by text, first non-terminal, second terminal", () => {
+		const { runs } = groupReasoningRuns([r(), text("mid"), r()]);
+		expect(runs).toHaveLength(2);
+		expect(runs[0].isLastContent).toBe(false);
+		expect(runs[1].isLastContent).toBe(true);
+	});
+
+	test("uses complete message blocks when a rendered segment hides later tool and text", () => {
+		const first = r("**First**\n\n<!-- -->");
+		const { runs } = groupReasoningRuns([first], {
+			originalIndices: [0],
+			allBlocks: [first, tool(), text("Done")],
+		});
+		expect(runs).toHaveLength(1);
+		expect(runs[0].isLastContent).toBe(false);
+	});
+
+	test("does not merge locally adjacent blocks that were separated in the original message", () => {
+		const first = r("first");
+		const second = r("second");
+		const { runs, skip } = groupReasoningRuns([first, second], {
+			originalIndices: [0, 2],
+			allBlocks: [first, { type: "redacted_thinking" }, second],
+		});
+		expect(runs).toHaveLength(2);
+		expect(runs[0]).toMatchObject({ indices: [0], isLastContent: false });
+		expect(runs[1]).toMatchObject({ indices: [1], isLastContent: true });
+		expect(skip.size).toBe(0);
+	});
+});
+
+describe("resolveReasoningRunActionIndices", () => {
+	test("anchors selection at the first block, rolls back to the last, and deletes descending", () => {
+		expect(resolveReasoningRunActionIndices([6, 4, 5, 5])).toEqual({
+			anchorIndex: 4,
+			rollbackIndex: 6,
+			deleteIndices: [6, 5, 4],
+		});
+	});
+});
+
+describe("getReasoningEncryptionState", () => {
+	const encrypted = (): ContentBlockLike => ({
+		type: "reasoning",
+		providerMetadata: { openai: { reasoningEncryptedContent: "ciphertext" } },
+	});
+
+	test("distinguishes fully and partially encrypted reasoning runs", () => {
+		expect(getReasoningEncryptionState([encrypted()])).toBe("only");
+		expect(
+			getReasoningEncryptionState([{ type: "reasoning", text: "visible reasoning" }, encrypted()]),
+		).toBe("partial");
+	});
+
+	test("ignores encryption metadata when the same block has visible text", () => {
+		expect(
+			getReasoningEncryptionState([
+				{
+					type: "reasoning",
+					text: "visible reasoning",
+					providerMetadata: { openai: { reasoningEncryptedContent: "ciphertext" } },
+				},
+			]),
+		).toBe("none");
 	});
 });

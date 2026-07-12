@@ -8,7 +8,7 @@ export interface MessageContextMenuActions {
 	onCompactBeforeMessage?: () => void;
 	onClearContextBefore?: () => void;
 	onManualSummarize?: () => void;
-	onDeleteBlock?: (blockIndex: number) => void;
+	onDeleteBlock?: (blockIndex: number) => Promise<void> | void;
 	onRollbackToBlock?: (blockIndex: number) => void;
 	onEditMessage?: () => void;
 	onJumpToSource?: () => void;

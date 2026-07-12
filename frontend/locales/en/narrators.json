@@ -74,8 +74,6 @@
 	"sortDescending": "Descending",
 	"sortAscending": "Ascending",
 	"loadingMore": "Loading more...",
-	"narratorUnloaded": "Narrator paused — tab was inactive",
-	"narratorUnloadedHint": "The connection was released to save resources. It will restore automatically.",
 	"filterAll": "All",
 	"filterStandalone": "Standalone",
 	"filterChapter": "Chapter",

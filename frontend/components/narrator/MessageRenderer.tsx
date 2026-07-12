@@ -331,6 +331,7 @@ export function renderTreeMessages(
 						contentJson: visibleBlockIndices.map((bi) => targetMsg.contentJson[bi]),
 						toolCalls: [],
 						_blockOriginalIndices: visibleBlockIndices,
+						_allContentJson: targetMsg.contentJson,
 					}
 				: targetMsg;
 		const promptTokenFootprint =

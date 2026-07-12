@@ -73,8 +73,6 @@
 	"sortDescending": "降序",
 	"sortAscending": "升序",
 	"loadingMore": "加载更多...",
-	"narratorUnloaded": "叙述者已暂停 — 标签页长时间未活跃",
-	"narratorUnloadedHint": "连接已释放以节省资源，返回后将自动恢复。",
 	"filterAll": "全部",
 	"filterStandalone": "独立叙述者",
 	"filterChapter": "章节叙述者",

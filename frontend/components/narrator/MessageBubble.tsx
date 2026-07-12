@@ -99,6 +99,7 @@ import {
 } from "./MessageContextMenuCtx";
 import {
 	BLOCK_ID_ATTR,
+	BLOCK_INDICES_ATTR,
 	makeMessageBlockSelectionId,
 	shouldIgnoreMessageBlockSelection,
 	useMessageSelection,
@@ -112,7 +113,13 @@ import {
 } from "./narrator-panel-types";
 import { ReasoningStepsTrace } from "./ReasoningStepsTrace";
 import { useRenderLod } from "./RenderLodCtx";
-import { hasStructuredReasoning, parseReasoningSegments } from "./reasoning-segments";
+import {
+	getReasoningEncryptionState,
+	groupReasoningRuns,
+	hasStructuredReasoning,
+	parseReasoningSegments,
+	resolveReasoningRunActionIndices,
+} from "./reasoning-segments";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
@@ -238,18 +245,6 @@ function setReasoningExpandState(key: string, value: boolean) {
 	}
 }
 
-function hasEncryptedReasoningMetadata(block: unknown): boolean {
-	if (!block || typeof block !== "object") return false;
-	const providerMetadata = (block as Record<string, unknown>).providerMetadata;
-	if (!providerMetadata || typeof providerMetadata !== "object") return false;
-
-	return Object.values(providerMetadata as Record<string, unknown>).some((metadata) => {
-		if (!metadata || typeof metadata !== "object") return false;
-		const encrypted = (metadata as Record<string, unknown>).reasoningEncryptedContent;
-		return typeof encrypted === "string" && encrypted.length > 0;
-	});
-}
-
 let nextRbInstanceId = 0;
 let nextWsInstanceId = 0;
 
@@ -279,8 +274,11 @@ interface MessageBubbleProps {
 			avatarColor?: string | null;
 			avatarImageId?: string | null;
 		} | null;
-		/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
+		/** Maps each index in the filtered contentJson back to the complete message. */
 		_blockOriginalIndices?: number[];
+		/** Complete unfiltered contentJson retained when rendering one visual segment. */
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		_allContentJson?: any[];
 	};
 	onForkFromMessage?: (messageUuid: string) => void;
 	onAskInPassing?: (messageUuid: string | null, messageId: string) => void;
@@ -300,7 +298,7 @@ interface MessageBubbleProps {
 	onCompactBeforeMessage?: (messageId: string) => void;
 	onClearContextBefore?: (messageId: string) => void;
 	onManualSummarize?: (messageId: string) => void;
-	onDeleteBlock?: (messageId: string, blockIndex: number) => void;
+	onDeleteBlock?: (messageId: string, blockIndex: number) => Promise<void> | void;
 	onRollbackToBlock?: (messageId: string, blockIndex: number) => void;
 	onEditAndRegenerate?: (
 		messageId: string,
@@ -355,6 +353,7 @@ function sameMessagePayload(prev: MessageBubbleMessage, next: MessageBubbleMessa
 			prev.editedAt === next.editedAt &&
 			prev.originalContentJson === next.originalContentJson &&
 			prev._blockOriginalIndices === next._blockOriginalIndices &&
+			prev._allContentJson === next._allContentJson &&
 			sameMessageCreator(prev.creator, next.creator))
 	);
 }
@@ -1904,22 +1903,39 @@ function EditTextFileChip({
 
 export const ReasoningBlock = memo(
 	function ReasoningBlock({
-		block,
+		blocks,
+		blockIndices,
+		isLastContent = true,
 		streaming,
 		narratorId,
-		blockIndex,
 		messageId,
 	}: {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
-		block: any;
+		// One or more adjacent reasoning/thinking blocks merged into a single
+		// trace. gpt-5.6 interleaved reasoning emits several adjacent blocks.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON blocks
+		blocks: any[];
+		/** Original block indices of `blocks`, aligned by position. */
+		blockIndices: number[];
+		/** True when this is the message's latest visible reasoning run (gates shimmer). */
+		isLastContent?: boolean;
 		streaming?: boolean;
 		narratorId?: string;
-		blockIndex?: number;
 		messageId?: string;
 	}) {
 		const { t } = useTranslation("narrator");
 		const { t: tc } = useTranslation("common");
 		const [expandReasoning] = useLocalPref("narrafork_expand_reasoning");
+
+		// The first block is the stable visual/selection anchor. Destructive actions
+		// use the whole run: rollback keeps its final block, while deletion proceeds
+		// from the highest index down so earlier indices never shift underneath us.
+		const runActionIndices = useMemo(
+			() => resolveReasoningRunActionIndices(blockIndices),
+			[blockIndices],
+		);
+		const blockIndex = runActionIndices.anchorIndex;
+		const rollbackBlockIndex = runActionIndices.rollbackIndex;
+		const deleteBlockIndices = runActionIndices.deleteIndices;
 
 		// Build a stable persistence key from narratorId + blockIndex.
 		// This key survives component remounts (streaming → real message transition).
@@ -1940,10 +1956,29 @@ export const ReasoningBlock = memo(
 		// simultaneously (e.g. loading a long conversation with expand=true).
 		const hasToggled = useRef(persistedState !== undefined);
 
-		const rawText: string = block.text || block.thinking || "";
-		const translatedText: string | undefined = block.translatedText;
-		const hasEncryptedReasoning = hasEncryptedReasoningMetadata(block);
+		// Merge the adjacent reasoning blocks' text with a blank-line separator
+		// so the segment parser treats each block as its own part(s).
+		const rawText: string = useMemo(
+			() =>
+				blocks
+					.map((b) => b.text || b.thinking || "")
+					.filter((s) => s.length > 0)
+					.join("\n\n"),
+			[blocks],
+		);
+		// Offer translation only when every text-bearing block is translated,
+		// keeping the merged original / translated views aligned.
+		const translatedText: string | undefined = useMemo(() => {
+			const textBearing = blocks.filter((b) => (b.text || b.thinking || "").length > 0);
+			if (textBearing.length === 0) return undefined;
+			if (!textBearing.every((b) => typeof b.translatedText === "string" && b.translatedText))
+				return undefined;
+			return textBearing.map((b) => b.translatedText as string).join("\n\n");
+		}, [blocks]);
 		const encryptedPlaceholder = t("reasoningEncryptedPlaceholder");
+		const encryptionState = useMemo(() => getReasoningEncryptionState(blocks), [blocks]);
+		const hasEncryptedReasoning = encryptionState === "only";
+		const hasPartiallyEncryptedReasoning = encryptionState === "partial";
 		const text = rawText || (hasEncryptedReasoning ? encryptedPlaceholder : "");
 		const [showTranslation, setShowTranslation] = useState(!!translatedText);
 		const prevTranslatedRef = useRef(translatedText);
@@ -2043,8 +2078,17 @@ export const ReasoningBlock = memo(
 		};
 
 		const copyText = useCallback(() => {
-			navigator.clipboard.writeText(displayText);
-		}, [displayText]);
+			const value = hasPartiallyEncryptedReasoning
+				? `${displayText}\n\n${encryptedPlaceholder}`
+				: displayText;
+			navigator.clipboard.writeText(value);
+		}, [displayText, encryptedPlaceholder, hasPartiallyEncryptedReasoning]);
+
+		const deleteReasoningRun = useCallback(async () => {
+			for (const index of deleteBlockIndices) {
+				await msgCtx.onDeleteBlock?.(index);
+			}
+		}, [deleteBlockIndices, msgCtx.onDeleteBlock]);
 
 		// During streaming with no content yet, show a minimal "thinking" indicator
 		if (streaming && !displayText) {
@@ -2059,6 +2103,7 @@ export const ReasoningBlock = memo(
 					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
 					{...(messageId ? { "data-message-id": messageId } : {})}
 					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+					{...(blockIndices.length > 1 ? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") } : {})}
 					onContextMenu={handleContextMenu}
 					onClick={handleBlockClick}
 					style={{
@@ -2089,6 +2134,15 @@ export const ReasoningBlock = memo(
 
 		if (!displayText) return null;
 
+		const partialEncryptedNotice = hasPartiallyEncryptedReasoning ? (
+			<Group gap={4} mt={2} wrap="nowrap" c="dimmed">
+				<IconLock size={12} style={{ flexShrink: 0, opacity: 0.6 }} />
+				<Text size="xs" c="dimmed" fs="italic">
+					{encryptedPlaceholder}
+				</Text>
+			</Group>
+		) : null;
+
 		const content = (
 			<Box
 				pl="md"
@@ -2100,6 +2154,7 @@ export const ReasoningBlock = memo(
 				}}
 			>
 				<MarkdownContent text={displayText} streaming={streaming} />
+				{partialEncryptedNotice}
 				{translatedText && rawText && (
 					<Group
 						gap={4}
@@ -2141,11 +2196,11 @@ export const ReasoningBlock = memo(
 					{tc("copy")}
 				</Menu.Item>
 				{hasMenuActions && <Menu.Divider />}
-				{msgCtx.onRollbackToBlock && blockIndex != null && (
+				{msgCtx.onRollbackToBlock && rollbackBlockIndex != null && (
 					<Menu.Item
 						leftSection={<IconArrowBackUp size={14} />}
 						onClick={() => {
-							msgCtx.onRollbackToBlock?.(blockIndex);
+							msgCtx.onRollbackToBlock?.(rollbackBlockIndex);
 							swipe.closeSwipe();
 						}}
 					>
@@ -2182,13 +2237,13 @@ export const ReasoningBlock = memo(
 						onClose={() => swipe.closeSwipe()}
 					/>
 				)}
-				{msgCtx.onDeleteBlock && blockIndex != null && (
+				{msgCtx.onDeleteBlock && deleteBlockIndices.length > 0 && (
 					<Menu.Item
 						color="red"
 						leftSection={<IconTrash size={14} />}
 						onClick={() => {
-							msgCtx.onDeleteBlock?.(blockIndex);
 							swipe.closeSwipe();
+							void deleteReasoningRun();
 						}}
 					>
 						{t("contextMenu_delete")}
@@ -2265,13 +2320,17 @@ export const ReasoningBlock = memo(
 
 		// Structured (codex/gpt-5.6) reasoning: render a step trace with titles
 		// always visible instead of a single collapsible block.
+		// Shimmer the latest step only while streaming AND the reasoning run is
+		// still the message's last content — once real output follows, stop it.
+		const traceStreaming = streaming && isLastContent;
 		const structuredInner = structured ? (
 			<>
 				<ReasoningStepsTrace
 					segments={segments}
-					streaming={streaming}
+					streaming={traceStreaming}
 					persistKeyBase={persistKey}
 				/>
+				{partialEncryptedNotice}
 				{translatedText && rawText && (
 					<Group
 						gap={4}
@@ -2300,6 +2359,7 @@ export const ReasoningBlock = memo(
 					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
 					{...(messageId ? { "data-message-id": messageId } : {})}
 					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
+					{...(blockIndices.length > 1 ? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") } : {})}
 					onContextMenu={handleContextMenu}
 					onClick={handleBlockClick}
 					style={{
@@ -2382,10 +2442,11 @@ export const ReasoningBlock = memo(
 	},
 	(prev, next) => {
 		return (
-			prev.block === next.block &&
+			prev.blocks === next.blocks &&
+			prev.blockIndices === next.blockIndices &&
+			prev.isLastContent === next.isLastContent &&
 			prev.streaming === next.streaming &&
 			prev.narratorId === next.narratorId &&
-			prev.blockIndex === next.blockIndex &&
 			prev.messageId === next.messageId
 		);
 	},
@@ -3775,6 +3836,28 @@ export const MessageBubble = memo(function MessageBubble({
 	const isUser = message.role === "user";
 	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
 	const blockKeys = useMemo(() => generateBlockKeys(blocks), [blocks]);
+	// Merge adjacent reasoning/thinking blocks into runs. `reasoningRunByStart`
+	// maps a run's first block index to the merged sub-arrays (stable refs so
+	// ReasoningBlock's memo holds); `reasoningSkip` marks absorbed indices.
+	const { reasoningRunByStart, reasoningSkip } = useMemo(() => {
+		const { runs, skip } = groupReasoningRuns(blocks, {
+			originalIndices: message._blockOriginalIndices,
+			allBlocks: message._allContentJson,
+		});
+		const byStart = new Map<
+			number,
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON blocks
+			{ runBlocks: any[]; runRealIndices: number[]; isLastContent: boolean }
+		>();
+		for (const run of runs) {
+			byStart.set(run.startIndex, {
+				runBlocks: run.indices.map((i) => blocks[i]),
+				runRealIndices: run.indices.map((i) => message._blockOriginalIndices?.[i] ?? i),
+				isLastContent: run.isLastContent,
+			});
+		}
+		return { reasoningRunByStart: byStart, reasoningSkip: skip };
+	}, [blocks, message._blockOriginalIndices, message._allContentJson]);
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const _msgId = message.id;
@@ -4873,13 +4956,19 @@ export const MessageBubble = memo(function MessageBubble({
 						);
 					}
 					if (block.type === "reasoning" || block.type === "thinking") {
+						// Absorbed into an earlier run's merged trace — skip.
+						if (reasoningSkip.has(i)) return null;
+						const run = reasoningRunByStart.get(i);
+						const runBlocks = run?.runBlocks ?? [block];
+						const runRealIndices = run?.runRealIndices ?? [realIndex];
 						return (
 							<ReasoningBlock
 								key={key}
-								block={block}
+								blocks={runBlocks}
+								blockIndices={runRealIndices}
+								isLastContent={run?.isLastContent ?? true}
 								streaming={isStreaming}
 								narratorId={narratorId}
-								blockIndex={realIndex}
 								messageId={message.id}
 							/>
 						);
