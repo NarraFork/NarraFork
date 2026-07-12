@@ -3,7 +3,9 @@
 
 import { logger } from "./logger";
 
-export interface CodexUsageWindow {
+export type CodexUsageWindowType = "5h" | "weekly" | "monthly" | "unknown";
+
+export interface CodexUsageApiWindow {
 	used_percent: number;
 	limit_window_seconds: number;
 	reset_after_seconds: number;
@@ -13,44 +15,40 @@ export interface CodexUsageWindow {
 export interface CodexRateLimit {
 	allowed: boolean;
 	limit_reached: boolean;
-	primary_window: CodexUsageWindow | null;
-	secondary_window: CodexUsageWindow | null;
+	primary_window: CodexUsageApiWindow | null;
+	secondary_window: CodexUsageApiWindow | null;
 }
 
 export interface CodexUsagePayload {
-	plan_type: string; // 'plus', 'team', 'free'
+	plan_type: string;
 	rate_limit: CodexRateLimit;
 	code_review_rate_limit: CodexRateLimit;
 	additional_rate_limits: CodexRateLimit[];
 }
 
+export interface CodexUsageWindow {
+	used_percent: number;
+	remaining_percent: number;
+	reset_at: number;
+	reset_after_seconds: number;
+	window_type: CodexUsageWindowType;
+	/** Optional for compatibility with cached results written before duration was persisted. */
+	limit_window_seconds?: number;
+}
+
 export interface CodexUsageResult {
 	plan_type: string;
-	primary_window?: {
-		used_percent: number;
-		remaining_percent: number;
-		reset_at: number;
-		reset_after_seconds: number;
-		window_type: "5h" | "weekly" | "unknown";
-	};
-	secondary_window?: {
-		used_percent: number;
-		remaining_percent: number;
-		reset_at: number;
-		reset_after_seconds: number;
-		window_type: "5h" | "weekly" | "unknown";
-	};
-	code_review?: {
-		used_percent: number;
-		remaining_percent: number;
-		reset_at: number;
-		reset_after_seconds: number;
-	};
+	primary_window?: CodexUsageWindow;
+	secondary_window?: CodexUsageWindow;
+	code_review?: Omit<CodexUsageWindow, "window_type" | "limit_window_seconds">;
 	queriedAt: string;
 }
 
 const USAGE_API_URL = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_USAGE_FETCH_TIMEOUT_MS = 20_000;
+const MAX_USAGE_RESPONSE_BYTES = 256 * 1024;
+const MONTHLY_WINDOW_MIN_SECONDS = 28 * 24 * 60 * 60;
+const MONTHLY_WINDOW_MAX_SECONDS = 31 * 24 * 60 * 60;
 
 export class CodexUsageFetchError extends Error {
 	readonly status?: number;
@@ -74,18 +72,183 @@ export function isUnauthorizedCodexUsageError(error: unknown): boolean {
 	return /Failed to fetch usage:\s*401\b/i.test(message);
 }
 
-function identifyWindowType(limitWindowSeconds: number): "5h" | "weekly" | "unknown" {
-	if (limitWindowSeconds === 18000) return "5h"; // 5 hours
-	if (limitWindowSeconds === 604800) return "weekly"; // 7 days
+export function identifyCodexUsageWindowType(
+	limitWindowSeconds: number | undefined,
+): CodexUsageWindowType {
+	if (limitWindowSeconds === 18_000) return "5h";
+	if (limitWindowSeconds === 604_800) return "weekly";
+	if (
+		typeof limitWindowSeconds === "number" &&
+		Number.isFinite(limitWindowSeconds) &&
+		limitWindowSeconds >= MONTHLY_WINDOW_MIN_SECONDS &&
+		limitWindowSeconds <= MONTHLY_WINDOW_MAX_SECONDS
+	) {
+		return "monthly";
+	}
 	return "unknown";
 }
 
-/**
- * Fetch Codex usage from ChatGPT backend API.
- * @param accessToken - ChatGPT access token
- * @param accountId - ChatGPT account ID
- * @param proxy - Optional proxy URL
- */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function clampPercent(value: number): number {
+	return Math.min(100, Math.max(0, value));
+}
+
+function getQueriedAtSeconds(queriedAt: string | number | Date): number | undefined {
+	const timestampMs =
+		queriedAt instanceof Date
+			? queriedAt.getTime()
+			: typeof queriedAt === "number"
+				? queriedAt
+				: Date.parse(queriedAt);
+	return Number.isFinite(timestampMs) ? Math.floor(timestampMs / 1000) : undefined;
+}
+
+export function normalizeCodexUsageWindow(
+	value: unknown,
+	queriedAt: string | number | Date = Date.now(),
+): CodexUsageWindow | undefined {
+	if (!isRecord(value)) return undefined;
+	const usedPercent = finiteNumber(value.used_percent);
+	const rawResetAt = finiteNumber(value.reset_at);
+	const rawResetAfterSeconds = finiteNumber(value.reset_after_seconds);
+	const resetAt = rawResetAt !== undefined && rawResetAt > 0 ? rawResetAt : undefined;
+	const resetAfterSeconds =
+		rawResetAfterSeconds !== undefined && rawResetAfterSeconds >= 0
+			? rawResetAfterSeconds
+			: undefined;
+	if (usedPercent === undefined || (resetAt === undefined && resetAfterSeconds === undefined)) {
+		return undefined;
+	}
+	const queriedAtSeconds = getQueriedAtSeconds(queriedAt);
+	const normalizedResetAt =
+		resetAt ??
+		(queriedAtSeconds !== undefined && resetAfterSeconds !== undefined
+			? queriedAtSeconds + resetAfterSeconds
+			: undefined);
+	const normalizedResetAfterSeconds =
+		resetAfterSeconds ??
+		(queriedAtSeconds !== undefined && resetAt !== undefined
+			? Math.max(0, resetAt - queriedAtSeconds)
+			: undefined);
+	if (normalizedResetAt === undefined || normalizedResetAfterSeconds === undefined)
+		return undefined;
+
+	const normalizedUsedPercent = clampPercent(usedPercent);
+	const rawLimitWindowSeconds = finiteNumber(value.limit_window_seconds);
+	const limitWindowSeconds =
+		rawLimitWindowSeconds !== undefined && rawLimitWindowSeconds > 0
+			? rawLimitWindowSeconds
+			: undefined;
+	return {
+		used_percent: normalizedUsedPercent,
+		remaining_percent: 100 - normalizedUsedPercent,
+		reset_at: normalizedResetAt,
+		reset_after_seconds: normalizedResetAfterSeconds,
+		window_type: identifyCodexUsageWindowType(limitWindowSeconds),
+		...(limitWindowSeconds !== undefined ? { limit_window_seconds: limitWindowSeconds } : {}),
+	};
+}
+
+function normalizeCodeReviewWindow(
+	value: unknown,
+	queriedAt: string | number | Date,
+): CodexUsageResult["code_review"] | undefined {
+	const window = normalizeCodexUsageWindow(value, queriedAt);
+	if (!window) return undefined;
+	return {
+		used_percent: window.used_percent,
+		remaining_percent: window.remaining_percent,
+		reset_at: window.reset_at,
+		reset_after_seconds: window.reset_after_seconds,
+	};
+}
+
+export function parseCodexUsagePayload(
+	value: unknown,
+	queriedAt = new Date().toISOString(),
+): CodexUsageResult {
+	if (!isRecord(value)) throw new Error("Codex usage API returned an invalid payload");
+	if (!isRecord(value.rate_limit)) {
+		throw new Error("Codex usage API returned an invalid account rate_limit");
+	}
+
+	const planType = typeof value.plan_type === "string" ? value.plan_type : "unknown";
+	const primaryWindow = normalizeCodexUsageWindow(value.rate_limit.primary_window, queriedAt);
+	const secondaryWindow = normalizeCodexUsageWindow(value.rate_limit.secondary_window, queriedAt);
+	if (
+		(value.rate_limit.primary_window != null || value.rate_limit.secondary_window != null) &&
+		!primaryWindow &&
+		!secondaryWindow
+	) {
+		throw new Error("Codex usage API returned no valid account rate_limit windows");
+	}
+
+	const result: CodexUsageResult = {
+		plan_type: planType,
+		queriedAt,
+		...(primaryWindow ? { primary_window: primaryWindow } : {}),
+		...(secondaryWindow ? { secondary_window: secondaryWindow } : {}),
+	};
+
+	if (isRecord(value.code_review_rate_limit)) {
+		const codeReview = normalizeCodeReviewWindow(
+			value.code_review_rate_limit.primary_window,
+			queriedAt,
+		);
+		if (codeReview) result.code_review = codeReview;
+	}
+	return result;
+}
+
+export function getCodexUsageWindows(usage?: CodexUsageResult): CodexUsageWindow[] {
+	if (!usage) return [];
+	return [usage.primary_window, usage.secondary_window].filter(
+		(window): window is CodexUsageWindow => !!window,
+	);
+}
+
+async function readResponseTextWithLimit(response: Response): Promise<string> {
+	const contentLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(contentLength) && contentLength > MAX_USAGE_RESPONSE_BYTES) {
+		throw new Error(`Codex usage API response exceeded ${MAX_USAGE_RESPONSE_BYTES} bytes`);
+	}
+	if (!response.body) return "";
+
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let totalBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			totalBytes += value.byteLength;
+			if (totalBytes > MAX_USAGE_RESPONSE_BYTES) {
+				await reader.cancel();
+				throw new Error(`Codex usage API response exceeded ${MAX_USAGE_RESPONSE_BYTES} bytes`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const bytes = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
+}
+
+/** Fetch Codex usage from ChatGPT backend API. */
 export async function fetchCodexUsage(
 	accessToken: string,
 	accountId: string,
@@ -110,8 +273,6 @@ export async function fetchCodexUsage(
 		headers,
 		signal: abortController.signal,
 	};
-
-	// Add proxy if provided
 	if (proxy) {
 		// @ts-expect-error - Bun supports proxy option
 		fetchOptions.proxy = proxy;
@@ -119,7 +280,6 @@ export async function fetchCodexUsage(
 
 	try {
 		const response = await fetch(USAGE_API_URL, fetchOptions);
-
 		if (!response.ok) {
 			throw new CodexUsageFetchError(
 				`Failed to fetch usage: ${response.status} ${response.statusText}`,
@@ -128,73 +288,27 @@ export async function fetchCodexUsage(
 			);
 		}
 
-		const raw = await response.text();
-		let data: CodexUsagePayload;
+		const raw = await readResponseTextWithLimit(response);
+		let data: unknown;
 		try {
-			data = JSON.parse(raw) as CodexUsagePayload;
+			data = JSON.parse(raw);
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			throw new Error(
-				`Codex usage API returned non-JSON payload: ${message}. ` +
-					`body preview=${raw.slice(0, 500)}`,
+				`Codex usage API returned non-JSON payload: ${message}. body preview=${raw.slice(0, 500)}`,
 			);
 		}
-
-		// Debug: log the entire response
-		logger.info("Codex usage API response", {
-			accountId: accountId.slice(0, 8),
-			response: JSON.stringify(data, null, 2),
-		});
-
-		// Parse primary and secondary windows
-		const primaryWindow = data.rate_limit.primary_window;
-		const secondaryWindow = data.rate_limit.secondary_window;
-
-		const result: CodexUsageResult = {
-			plan_type: data.plan_type,
-			queriedAt: new Date().toISOString(),
-		};
-
-		// Add primary window if available
-		if (primaryWindow) {
-			result.primary_window = {
-				used_percent: primaryWindow.used_percent,
-				remaining_percent: 100 - primaryWindow.used_percent,
-				reset_at: primaryWindow.reset_at,
-				reset_after_seconds: primaryWindow.reset_after_seconds,
-				window_type: identifyWindowType(primaryWindow.limit_window_seconds),
-			};
-		}
-
-		// Add secondary window if available
-		if (secondaryWindow) {
-			result.secondary_window = {
-				used_percent: secondaryWindow.used_percent,
-				remaining_percent: 100 - secondaryWindow.used_percent,
-				reset_at: secondaryWindow.reset_at,
-				reset_after_seconds: secondaryWindow.reset_after_seconds,
-				window_type: identifyWindowType(secondaryWindow.limit_window_seconds),
-			};
-		}
-
-		// Add code review if available
-		if (data.code_review_rate_limit?.primary_window) {
-			const codeReviewWindow = data.code_review_rate_limit.primary_window;
-			result.code_review = {
-				used_percent: codeReviewWindow.used_percent,
-				remaining_percent: 100 - codeReviewWindow.used_percent,
-				reset_at: codeReviewWindow.reset_at,
-				reset_after_seconds: codeReviewWindow.reset_after_seconds,
-			};
-		}
-
+		const result = parseCodexUsagePayload(data);
 		logger.info("Fetched Codex usage", {
 			accountId: accountId.slice(0, 8),
-			planType: data.plan_type,
-			primaryUsed: primaryWindow?.used_percent ?? null,
-			secondaryUsed: secondaryWindow?.used_percent ?? null,
+			planType: result.plan_type,
+			windows: getCodexUsageWindows(result).map((window) => ({
+				type: window.window_type,
+				limitWindowSeconds: window.limit_window_seconds,
+				usedPercent: window.used_percent,
+				resetAt: window.reset_at,
+			})),
 		});
-
 		return result;
 	} catch (err) {
 		logger.error("Failed to fetch Codex usage", {

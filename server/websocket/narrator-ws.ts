@@ -44,7 +44,7 @@ import {
 	createCatchUpBuffer,
 	drainCatchUpBuffer,
 } from "./catch-up-buffer";
-import type { NarratorServerMessage } from "./narrator-ws-types";
+import { createCodexQuotaOverviewWsMessage, type NarratorServerMessage } from "./narrator-ws-types";
 import type { WSData } from "./ws-handler";
 
 // Re-export the type so existing `import { NarratorServerMessage } from "../websocket/narrator-ws"` keeps working
@@ -788,7 +788,7 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 	// === Codex quota overview broadcast ===
 	eventBus.on("codex:quota_overview_updated", (event) => {
-		broadcastToAll({ type: "codex_quota_overview_updated", overview: event.overview });
+		broadcastToAll(createCodexQuotaOverviewWsMessage(event.overview));
 	});
 
 	// === Recent tabs title sync ===

@@ -26,6 +26,7 @@ import {
 	createCodexUsageHistoryEntry,
 	getScheduledUsageResetAt,
 	normalizeCodexPlanTier,
+	resolveCodexQuotaModel,
 } from "./codex-usage-summary";
 import { eventBus } from "./event-bus";
 import { generateShortId } from "./id";
@@ -165,6 +166,9 @@ export interface PublicCodexQuotaSegment {
 	type: PublicCodexPlanTier;
 	remainingAccountEquivalents: number;
 	totalAccountEquivalents: number;
+	trackedAccountCount: number;
+	modeledAccountCount: number;
+	unmodeledAccountCount: number;
 	averageRemainingPercent: number | null;
 	nextResetAt: number | null;
 }
@@ -179,6 +183,9 @@ export interface PublicCodexQuotaOverview {
 	unit: "account_equivalent";
 	totalRemainingAccountEquivalents: number;
 	totalAccountEquivalents: number;
+	trackedAccountCount: number;
+	modeledAccountCount: number;
+	unmodeledAccountCount: number;
 	segments: PublicCodexQuotaSegment[];
 	trend: {
 		generatedAt: string;
@@ -474,6 +481,12 @@ export class CodexManager {
 
 		this.loadCredentials();
 		this.loadStats();
+		const initialRetryAt = Date.now() + USAGE_RESET_RETRY_DELAY_MS;
+		for (const entry of this.entries) {
+			if (entry.disabledReason === "quota_exhausted" && !entry.quotaResetsAt) {
+				this.usageSchedulerRetryAfter.set(entry.id, initialRetryAt);
+			}
+		}
 
 		this.beforeExitHandler = () => {
 			this.saveStats();
@@ -754,7 +767,7 @@ export class CodexManager {
 		if (entry) {
 			entry.disabled = true;
 			entry.disabledReason = "quota_exhausted";
-			entry.quotaResetsAt = resetsAt ?? entry.quotaResetsAt;
+			entry.quotaResetsAt = resetsAt;
 			this.evictSessionsByCredential(id);
 			this.saveCredentials();
 			this.schedulePublicQuotaOverviewBroadcast();
@@ -770,22 +783,17 @@ export class CodexManager {
 		try {
 			await this.refreshUsageDeduplicated(id);
 		} catch (err) {
+			const entry = this.entries.find((candidate) => candidate.id === id);
+			if (entry?.disabledReason === "quota_exhausted" && !entry.quotaResetsAt) {
+				this.usageSchedulerRetryAfter.set(id, Date.now() + USAGE_RESET_RETRY_DELAY_MS);
+				this.rescheduleUsageRefresh();
+			}
 			logger.warn("Codex usage refresh after quota error failed", {
 				credentialId: id,
 				error: err instanceof Error ? err.message : String(err),
 			});
 		}
 
-		const entry = this.entries.find((e) => e.id === id);
-		if (entry?.disabledReason !== "quota_exhausted") {
-			const refreshedQuotaState = entry?.usage
-				? this.evaluateQuotaFromUsage(entry.usage)
-				: undefined;
-			this.reportQuotaExhausted(
-				id,
-				refreshedQuotaState?.exhausted ? refreshedQuotaState.resetsAt : resetsAt,
-			);
-		}
 		return this.entries.some((e) => !e.disabled);
 	}
 
@@ -903,16 +911,16 @@ export class CodexManager {
 		for (const entry of this.entries) {
 			if (!this.shouldTrackUsageReset(entry)) continue;
 			const resetAt = this.getCredentialUsageResetAt(entry);
-			if (!resetAt) continue;
+			const retryAfter = this.usageSchedulerRetryAfter.get(entry.id);
+			if (!resetAt && !retryAfter) continue;
 
 			scheduledCredentialCount++;
-			if (resetAt > now) {
+			if (resetAt && resetAt > now) {
 				this.usageSchedulerRetryAfter.delete(entry.id);
 				nextRunAt = Math.min(nextRunAt ?? resetAt, resetAt);
 				continue;
 			}
 
-			const retryAfter = this.usageSchedulerRetryAfter.get(entry.id);
 			if (retryAfter && retryAfter > now) {
 				nextRunAt = Math.min(nextRunAt ?? retryAfter, retryAfter);
 				continue;
@@ -996,6 +1004,9 @@ export class CodexManager {
 				type: tier,
 				remainingAccountEquivalents: stats.remainingAccountEquivalents,
 				totalAccountEquivalents: stats.accountCount,
+				trackedAccountCount: stats.accountCount,
+				modeledAccountCount: stats.modeledUsageCount,
+				unmodeledAccountCount: Math.max(0, stats.accountCount - stats.modeledUsageCount),
 				averageRemainingPercent: stats.averageRemainingPercent,
 				nextResetAt: stats.nextResetAt ?? null,
 			};
@@ -1007,9 +1018,23 @@ export class CodexManager {
 			(sum, segment) => sum + segment.totalAccountEquivalents,
 			0,
 		);
+		const trackedAccountCount =
+			segments.reduce((sum, segment) => sum + segment.trackedAccountCount, 0) +
+			summary.missingUsageAccounts;
+		const modeledAccountCount = segments.reduce(
+			(sum, segment) => sum + segment.modeledAccountCount,
+			0,
+		);
+		const unmodeledAccountCount =
+			segments.reduce((sum, segment) => sum + segment.unmodeledAccountCount, 0) +
+			summary.missingUsageAccounts;
+		const trendTiers = visibleTiers.filter((tier) => trend.tiers.includes(tier));
 		const points = trend.points.map((point) => {
 			const byType = Object.fromEntries(
-				visibleTiers.map((tier) => [tier, point.byTier[tier] ?? 0]),
+				trendTiers.flatMap((tier) => {
+					const value = point.byTier[tier];
+					return value === undefined ? [] : [[tier, value]];
+				}),
 			) as Partial<Record<PublicCodexPlanTier, number>>;
 			return { timestamp: point.timestamp, byType };
 		});
@@ -1019,11 +1044,14 @@ export class CodexManager {
 			unit: trend.unit,
 			totalRemainingAccountEquivalents,
 			totalAccountEquivalents,
+			trackedAccountCount,
+			modeledAccountCount,
+			unmodeledAccountCount,
 			segments,
 			trend: {
 				generatedAt: trend.generatedAt,
 				points,
-				types: visibleTiers,
+				types: trendTiers,
 			},
 			nextResetAt: summary.nextResetAt ?? null,
 			usageQueueRunning: codexUsageQueue.getSnapshot().isRunning,
@@ -1353,12 +1381,11 @@ export class CodexManager {
 	private isUsageStaleForUse(usage: CodexUsageResult, now = Date.now()): boolean {
 		const queriedAtMs = new Date(usage.queriedAt).getTime();
 		if (!Number.isFinite(queriedAtMs)) return true;
-		const queriedDeadline = queriedAtMs + USAGE_TTL_MS;
-		const primaryResetSec = usage.primary_window?.reset_at;
-		const effectiveDeadline =
-			typeof primaryResetSec === "number"
-				? Math.min(queriedDeadline, primaryResetSec * 1000)
-				: queriedDeadline;
+		const quotaModel = resolveCodexQuotaModel(usage, now);
+		const effectiveDeadline = Math.min(
+			queriedAtMs + USAGE_TTL_MS,
+			quotaModel.refreshAt ?? Number.POSITIVE_INFINITY,
+		);
 		return now >= effectiveDeadline;
 	}
 
@@ -1368,24 +1395,14 @@ export class CodexManager {
 	): {
 		exhausted: boolean;
 		resetsAt?: number;
-		windowType?: "5h" | "weekly" | "unknown";
+		windowType?: NonNullable<CodexUsageResult["primary_window"]>["window_type"];
 	} {
-		const exhaustedWindows = [usage.primary_window, usage.secondary_window].filter(
-			(window): window is NonNullable<CodexUsageResult["primary_window"]> => {
-				if (!window) return false;
-				const resetAt = window.reset_at * 1000;
-				return window.remaining_percent <= 0 && Number.isFinite(resetAt) && resetAt > now;
-			},
-		);
-		if (exhaustedWindows.length === 0) return { exhausted: false };
-
-		const weeklyWindow = exhaustedWindows.find((window) => window.window_type === "weekly");
-		const blockingWindow = weeklyWindow ?? exhaustedWindows[0];
-		const resetAtCandidates = exhaustedWindows
-			.map((window) => window.reset_at * 1000)
-			.filter((resetAt) => Number.isFinite(resetAt));
-		const resetsAt = resetAtCandidates.length > 0 ? Math.max(...resetAtCandidates) : undefined;
-		return { exhausted: true, resetsAt, windowType: blockingWindow?.window_type };
+		const quotaModel = resolveCodexQuotaModel(usage, now);
+		return {
+			exhausted: quotaModel.isExhausted,
+			resetsAt: quotaModel.blockedUntil,
+			windowType: quotaModel.exhaustedWindows[0]?.window_type,
+		};
 	}
 
 	private applyCachedQuotaStates(now = Date.now()): boolean {

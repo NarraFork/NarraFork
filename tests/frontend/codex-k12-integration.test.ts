@@ -33,8 +33,6 @@ describe("Codex K12 shared tier metadata integration", () => {
 			"CODEX_TIER_COLORS",
 			"getCodexDisplayTierOrder",
 			"getCodexTierLabel",
-			"normalizeCodexPlanTier",
-			"getCodexPlanTypeLabel",
 		]) {
 			expect(sharedImport).toContain(importedName);
 		}
@@ -48,13 +46,14 @@ describe("Codex K12 shared tier metadata integration", () => {
 	});
 
 	test("Settings quota overview follows tier order and refreshes the public overview", async () => {
-		const source = await readSource("frontend/components/providers/CodexSection.tsx");
+		const sectionSource = await readSource("frontend/components/providers/CodexSection.tsx");
+		const overviewSource = await readSource("frontend/components/providers/CodexQuotaOverview.tsx");
 
-		expect(source).toContain("tierOrder={tierOrder}");
-		expect(source).toMatch(
-			/function CodexQuotaOverview\(\{[\s\S]*?tierOrder,[\s\S]*?getCodexDisplayTierOrder\(tierOrder\)/,
+		expect(sectionSource).toContain("tierOrder={tierOrder}");
+		expect(overviewSource).toMatch(/getCodexDisplayTierOrder\(tierOrder\)/);
+		expect(sectionSource).toContain(
+			'qc.invalidateQueries({ queryKey: ["codex", "quota-overview"] });',
 		);
-		expect(source).toContain('qc.invalidateQueries({ queryKey: ["codex", "quota-overview"] });');
 	});
 
 	test("Settings syncs changed status tier order without resetting optimistic drag state", async () => {
@@ -74,7 +73,7 @@ describe("Codex K12 shared tier metadata integration", () => {
 	});
 
 	test("UsageDisplay normalizes plan types, localizes labels, and preserves unknown names", async () => {
-		const source = await readSource("frontend/components/providers/CodexSection.tsx");
+		const source = await readSource("frontend/components/providers/CodexUsageDisplay.tsx");
 
 		expect(source).toMatch(
 			/const\s+\w*[Tt]ier\w*\s*=\s*normalizeCodexPlanTier\(usage\.plan_type\);/,
