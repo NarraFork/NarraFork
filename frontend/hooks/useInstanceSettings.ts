@@ -74,7 +74,6 @@ export interface InstanceSettingsState {
 	autoCompactPruneThreshold: number;
 	minPruneRatio: number;
 	queueDuringCompaction: boolean;
-	codexDefaultReasoningEffort: string;
 	agentDefaultReasoningEffort: string;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
@@ -161,7 +160,6 @@ function makeDefaults(): InstanceSettingsState {
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
 		queueDuringCompaction: false,
-		codexDefaultReasoningEffort: "high",
 		agentDefaultReasoningEffort: "",
 		globalWhitelistDirs: [],
 		globalBlacklistDirs: [],
@@ -262,7 +260,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
-				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
@@ -353,8 +350,13 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					tasksReminderInterval: state.tasksReminderInterval,
 					behaviorFenceAttachTasks: state.behaviorFenceAttachTasks,
 					defaultReasoningEffort:
-						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
-						undefined,
+						(state.agentDefaultReasoningEffort as
+							| "none"
+							| "low"
+							| "medium"
+							| "high"
+							| "xhigh"
+							| "max") || undefined,
 					maxTransientRetries: state.maxTransientRetries,
 					silentToolCallThreshold: state.silentToolCallThreshold,
 					retryBackoffCeilMs: state.retryBackoffCeilMs,
@@ -386,16 +388,6 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					},
 				},
 				editor: { type: "vscode" },
-				codex: {
-					defaultReasoningEffort:
-						(state.codexDefaultReasoningEffort as
-							| "none"
-							| "low"
-							| "medium"
-							| "high"
-							| "xhigh"
-							| "max") || null,
-				},
 				update: {
 					serverUrl: normalizedUpdateServerUrl || undefined,
 					channel: state.updateChannel,

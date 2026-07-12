@@ -490,10 +490,12 @@ export interface NarraForkSettings {
 		/** Auto-continuation mode: controls whether/when the agent auto-continues after a turn. */
 		autoContinuationMode: AutoContinuationMode;
 		/**
-		 * Global default reasoning effort — lowest priority fallback.
-		 * Fallback chain: narrator.reasoningEffort → provider.defaultReasoningEffort → agent.defaultReasoningEffort.
+		 * Global default reasoning effort — the single source of truth for the
+		 * default tier. A narrator's own reasoningEffort (when non-null) overrides
+		 * it; otherwise this value applies to every model and is clamped to the
+		 * model's supported tiers at request time. Defaults to "max".
 		 */
-		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
 		/** Persist raw request/response dumps for each provider call into usage history. */

@@ -1611,6 +1611,23 @@ narratorRoutes.get("/:id/tool-calls/:toolUseId", async (c) => {
 	return c.json(tc);
 });
 
+// Lazy-load a terminal subagent's child message tree (omitted from the chunk
+// payload; fetched on demand when the SubagentCard's tool-call area is expanded).
+// Paginated newest-first by the subagent's ref seq; pass beforeSeq to page older.
+narratorRoutes.get("/:id/subagent-children/:toolUseId", async (c) => {
+	const id = c.req.param("id");
+	const toolUseId = c.req.param("toolUseId");
+	const beforeSeqRaw = c.req.query("beforeSeq");
+	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
+	const countRaw = c.req.query("count");
+	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
+	const result = await narratorService.getSubagentChildren(id, toolUseId, {
+		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
+		count: count != null && !Number.isNaN(count) ? count : undefined,
+	});
+	return c.json(result);
+});
+
 // Get compact summary for a specific compact message
 narratorRoutes.get("/:id/compact/:messageId", async (c) => {
 	const narratorId = c.req.param("id");

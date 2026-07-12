@@ -44,6 +44,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	IconArchive,
 	IconArrowDown,
@@ -2018,24 +2019,27 @@ function ReasoningEffortMenuItems({
 }: {
 	currentEffort: string | null | undefined;
 	options: readonly ReasoningEffortValue[];
-	onSelect: (effort: string | null) => void;
+	onSelect: (effort: string) => void;
 	t: (key: string) => string;
 }) {
+	// No "auto" item: follow/override state is expressed by the inline
+	// "follow default / set as default" links below (matching the permission
+	// and reflection menus). Selecting a tier writes an explicit override.
 	return (
 		<>
 			<Menu.Label>{t("reasoningEffort")}</Menu.Label>
-			{(["", ...options] as const).map((effort) => {
-				const selected = (currentEffort ?? "") === effort || (!currentEffort && effort === "");
+			{options.map((effort) => {
+				const selected = currentEffort === effort;
 				return (
 					<Menu.Item
 						key={effort}
-						onClick={() => onSelect(effort || null)}
+						onClick={() => onSelect(effort)}
 						rightSection={
 							<IconCheck size={14} style={{ visibility: selected ? "visible" : "hidden" }} />
 						}
 						fw={selected ? 600 : 400}
 					>
-						{t(effort ? `reasoning_${effort}` : "reasoning_auto")}
+						{t(`reasoning_${effort}`)}
 					</Menu.Item>
 				);
 			})}
@@ -2756,14 +2760,61 @@ export function NarratorPanel({
 		settingsData?.anthropicProviders,
 	]);
 
+	// The global default reasoning effort (single source of truth). Applied to
+	// every model when the narrator has no explicit override.
+	const globalDefaultReasoningEffort = useMemo<ReasoningEffort>(() => {
+		const raw = settingsData?.agent?.defaultReasoningEffort;
+		return (raw as ReasoningEffort) || "max";
+	}, [settingsData?.agent?.defaultReasoningEffort]);
+
+	// Whether the narrator is following the global default (no explicit override).
+	const reasoningFollowsDefault = narrator?.reasoningEffort == null;
+
+	// The effective reasoning effort to highlight in the menu. Always shows the
+	// tier that will actually be used: the narrator's own override (clamped to
+	// the model), or — when following default — the clamped global default.
+	// Mirrors the permission/reflection menus, which show the effective value and
+	// express the follow/override state only via the inline links below.
 	const displayedReasoningEffort = useMemo(() => {
-		const normalized = normalizeReasoningEffortForModel(resolvedModel, narrator?.reasoningEffort);
-		// "" means "auto / follow default" and is always valid. If a stored value
-		// is not among the current model's available tiers (e.g. a legacy "none"
-		// so the menu shows the auto entry highlighted instead of nothing.
-		if (!normalized) return "";
-		return (reasoningEffortOptions as readonly string[]).includes(normalized) ? normalized : "";
-	}, [resolvedModel, narrator?.reasoningEffort, reasoningEffortOptions]);
+		const options = reasoningEffortOptions as readonly ReasoningEffort[];
+		const desired = reasoningFollowsDefault
+			? globalDefaultReasoningEffort
+			: (normalizeReasoningEffortForModel(
+					resolvedModel,
+					narrator?.reasoningEffort,
+				) as ReasoningEffort);
+		if (!desired) return "";
+		return clampReasoningEffort(desired, options);
+	}, [
+		resolvedModel,
+		narrator?.reasoningEffort,
+		reasoningEffortOptions,
+		reasoningFollowsDefault,
+		globalDefaultReasoningEffort,
+	]);
+
+	// "Follow default": clear the narrator's override so it tracks the global
+	// default again.
+	const handleFollowDefaultReasoning = useCallback(() => {
+		reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: null });
+	}, [narratorId, reasoningEffortMutation]);
+
+	// "Set as default": promote the narrator's explicit override to the global
+	// default (writing the raw desired value, NOT the per-model clamped one), then
+	// reset the narrator to follow the default. Only meaningful when an override
+	// exists, so the inline link is hidden while following default.
+	const handleSetReasoningAsDefault = useCallback(() => {
+		const desired = narrator?.reasoningEffort;
+		if (!desired) return;
+		updateSettingsMutation.mutate(
+			{ agent: { defaultReasoningEffort: desired } },
+			{
+				onSuccess: () => {
+					reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: null });
+				},
+			},
+		);
+	}, [narrator?.reasoningEffort, narratorId, reasoningEffortMutation, updateSettingsMutation]);
 
 	// Active terminal count for badge indicator
 	const { data: narratorTerminals } = useNarratorTerminals(narratorId);
@@ -8669,13 +8720,10 @@ export function NarratorPanel({
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
-															data={[
-																{ value: "", label: t("reasoning_auto") },
-																...reasoningEffortOptions.map((effort) => ({
-																	value: effort,
-																	label: t(`reasoning_${effort}`),
-																})),
-															]}
+															data={reasoningEffortOptions.map((effort) => ({
+																value: effort,
+																label: t(`reasoning_${effort}`),
+															}))}
 															value={displayedReasoningEffort}
 															onChange={() => {}}
 															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
@@ -8694,6 +8742,17 @@ export function NarratorPanel({
 															}
 															t={t}
 														/>
+														{!reasoningFollowsDefault && (
+															<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
+																<InlineOverrideActions
+																	visible
+																	disabled={reasoningEffortMutation.isPending}
+																	onFollowDefault={handleFollowDefaultReasoning}
+																	onSetAsDefault={handleSetReasoningAsDefault}
+																	t={t}
+																/>
+															</Box>
+														)}
 													</Menu.Dropdown>
 												</Menu>
 											)}
@@ -8943,6 +9002,17 @@ export function NarratorPanel({
 														}
 														t={t}
 													/>
+													{!reasoningFollowsDefault && (
+														<Box px="sm" py={4} onClick={(event) => event.stopPropagation()}>
+															<InlineOverrideActions
+																visible
+																disabled={reasoningEffortMutation.isPending}
+																onFollowDefault={handleFollowDefaultReasoning}
+																onSetAsDefault={handleSetReasoningAsDefault}
+																t={t}
+															/>
+														</Box>
+													)}
 												</Menu.Dropdown>
 											</Menu>
 										)}

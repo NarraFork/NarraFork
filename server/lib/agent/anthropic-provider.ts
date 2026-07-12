@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { computeFingerprint } from "../fingerprint";
 import { generateId } from "../id";
 import { getInstallationId } from "../installation-id";
@@ -404,14 +405,14 @@ function mapEffortParam(
 	reasoningEffort: string | undefined,
 ): "low" | "medium" | "high" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	const map: Record<string, "low" | "medium" | "high" | "max"> = {
-		low: "low",
-		medium: "medium",
-		high: "high",
-		xhigh: "high",
-		max: "max",
-	};
-	return map[reasoningEffort];
+	// Anthropic's effort API has no "xhigh" tier — only low/medium/high/max.
+	// The shared clamp (就近、并列偏高) sends xhigh → max.
+	return clampReasoningEffort(reasoningEffort as ReasoningEffort, [
+		"low",
+		"medium",
+		"high",
+		"max",
+	]) as "low" | "medium" | "high" | "max";
 }
 
 // === SSE event types ===

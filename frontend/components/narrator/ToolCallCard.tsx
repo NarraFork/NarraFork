@@ -289,6 +289,15 @@ export interface ToolCallData {
 	sideCars?: SideCarRecord[];
 	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
 	resultMessageId?: string;
+	/** True when a terminal subagent's children were omitted from the chunk
+	 * payload and must be lazy-loaded on expand (see getSubagentChildren). */
+	_subagentChildrenOmitted?: boolean;
+	/** Subagent narrator id, surfaced with the omission marker for view/detach. */
+	_subagentNarratorId?: string | null;
+	/** Tool-call count of the omitted subagent (for the collapsed "N calls" header). */
+	_subagentChildToolCallCount?: number;
+	/** Resolved model of the omitted subagent (for the collapsed header badge). */
+	_subagentModel?: string | null;
 }
 
 export type { PendingPermission } from "@frontend/types/narrator";

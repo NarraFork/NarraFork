@@ -289,7 +289,9 @@ const updateSettingsSchema = z
 				dangerReflectionEnabled: z.boolean(),
 				dangerSkipReadOnlyConfirmations: z.boolean(),
 				autoContinuationMode: z.enum(["always", "blockStop", "protectedOnly", "off"]),
-				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+				defaultReasoningEffort: z
+					.enum(["none", "low", "medium", "high", "xhigh", "max"])
+					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
 				behaviorFenceInterval: z

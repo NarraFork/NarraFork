@@ -307,6 +307,11 @@ export interface BaseContentBlock {
 	filename?: string;
 	mediaType?: string;
 	uploadNarratorId?: string;
+	/** Terminal-subagent child omission markers (see buildTreeFromTopLevelRefs). */
+	_subagentChildrenOmitted?: boolean;
+	_subagentNarratorId?: string | null;
+	_subagentChildToolCallCount?: number;
+	_subagentModel?: string | null;
 	[key: string]: unknown;
 }
 
@@ -532,6 +537,17 @@ export interface MessageLocationResult {
 	messageId: string;
 	topLevelMessageId: string;
 	seq: number;
+}
+
+/** Paginated lazy-load window of a terminal subagent's child messages. */
+export interface SubagentChildrenResult {
+	messages: TreeMessage[];
+	/** True when older child bands exist beyond this window (scroll up to load). */
+	hasOlder: boolean;
+	/** Smallest seq in this window (pass as beforeSeq to page older). */
+	oldestSeq: number | null;
+	/** Largest seq in this window. */
+	newestSeq: number | null;
 }
 
 export type CodexPlanTier = "free" | "plus" | "team" | "k12" | "prolite" | "pro" | "other";

@@ -561,20 +561,20 @@ export function isAnthropicProvider(prefix?: string): boolean {
 	return !!getAnthropicProviderConfig(prefix);
 }
 
+/**
+ * The single global default reasoning effort. Applies to every model; each
+ * provider clamps it down to the model's supported tiers at request time.
+ * Per-provider default fields (codex/anthropic/customApi) are no longer
+ * consumed — the global `agent.defaultReasoningEffort` is the sole source.
+ *
+ * The `provider`/`model` params are kept for call-site compatibility but
+ * intentionally unused.
+ */
 export function resolveDefaultReasoningEffort(
-	provider?: string,
-	model?: string,
+	_provider?: string,
+	_model?: string,
 ): "none" | "low" | "medium" | "high" | "xhigh" | "max" | undefined {
-	if (usesCodexModel(provider, model)) {
-		return s().codex?.defaultReasoningEffort ?? s().agent.defaultReasoningEffort;
-	}
-	if (isAnthropicProvider(provider)) {
-		return (
-			getAnthropicProviderConfig(provider)?.defaultReasoningEffort ??
-			s().agent.defaultReasoningEffort
-		);
-	}
-	return s().agent.defaultReasoningEffort;
+	return s().agent.defaultReasoningEffort ?? "max";
 }
 
 export function openaiProviderPrefix(config: OpenAIProviderConfig): string {

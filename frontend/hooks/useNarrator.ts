@@ -4,6 +4,7 @@ import {
 	type BlacklistCmd,
 	type BlacklistDir,
 	type PaginatedNarrators,
+	type SubagentChildrenResult,
 	type WhitelistCmd,
 	type WhitelistDir,
 } from "../lib/api";
@@ -264,6 +265,32 @@ export function useToolCallDetail(narratorId: string, toolUseId: string, enabled
 	return useQuery({
 		queryKey: ["narrators", narratorId, "tool-calls", toolUseId],
 		queryFn: () => api.getToolCallDetail(narratorId, toolUseId),
+		enabled: !!narratorId && !!toolUseId && enabled,
+		staleTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
+		gcTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
+	});
+}
+
+/** Child messages per lazy-load page for a subagent tool-call area. */
+const SUBAGENT_CHILDREN_PAGE_SIZE = 20;
+
+/**
+ * Lazy-load a terminal subagent's child messages, PAGINATED newest-first.
+ * Enabled only when the SubagentCard AND its tool-call area are expanded.
+ * Scroll up to fetch older bands via fetchNextPage (pageParam = oldestSeq).
+ */
+export function useSubagentChildren(narratorId: string, toolUseId: string, enabled: boolean) {
+	return useInfiniteQuery<SubagentChildrenResult>({
+		queryKey: ["narrators", narratorId, "subagent-children", toolUseId],
+		queryFn: ({ pageParam }) =>
+			api.getSubagentChildren(narratorId, toolUseId, {
+				beforeSeq: pageParam as number | undefined,
+				count: SUBAGENT_CHILDREN_PAGE_SIZE,
+			}),
+		initialPageParam: undefined as number | undefined,
+		// Older bands are paged by the oldest seq of the last (oldest) page.
+		getNextPageParam: (lastPage) =>
+			lastPage.hasOlder && lastPage.oldestSeq != null ? lastPage.oldestSeq : undefined,
 		enabled: !!narratorId && !!toolUseId && enabled,
 		staleTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,
 		gcTime: TOOL_CALL_DETAIL_QUERY_GC_TIME_MS,

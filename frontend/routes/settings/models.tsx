@@ -112,8 +112,6 @@ function SettingsModelsPage() {
 				setSubagentPlanModel={is.setSubagentPlanModel}
 				subagentAllowedModels={is.subagentAllowedModels}
 				setSubagentAllowedModels={is.setSubagentAllowedModels}
-				codexDefaultReasoningEffort={is.codexDefaultReasoningEffort}
-				setCodexDefaultReasoningEffort={is.setCodexDefaultReasoningEffort}
 				agentDefaultReasoningEffort={is.agentDefaultReasoningEffort}
 				setAgentDefaultReasoningEffort={is.setAgentDefaultReasoningEffort}
 				groupedModels={groupedModels}

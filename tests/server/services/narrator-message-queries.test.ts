@@ -112,6 +112,34 @@ function insertToolCall(params: {
 		.run();
 }
 
+function insertSubagentNarrator(params: {
+	id: string;
+	subagentType?: string;
+	model?: string;
+	status?: "idle" | "working" | "waiting" | "archived";
+	isBackground?: boolean;
+	backgroundStatus?: "running" | "completed" | "failed" | "cancelled" | null;
+	parentNarratorId?: string;
+}) {
+	db.insert(narrators)
+		.values({
+			id: params.id,
+			chapterId: "ch1",
+			type: "subagent",
+			subagentType: params.subagentType ?? "explore",
+			variant: `subagent:${params.subagentType ?? "explore"}`,
+			model: params.model ?? "claude-sonnet-4.5",
+			parentNarratorId: params.parentNarratorId ?? "n1",
+			inheritMode: "fresh",
+			status: params.status ?? "idle",
+			isBackground: params.isBackground ?? false,
+			backgroundStatus: params.backgroundStatus ?? null,
+			createdAt: ts(),
+			updatedAt: ts(),
+		})
+		.run();
+}
+
 beforeEach(() => {
 	tsOffset = 0;
 });
@@ -336,6 +364,212 @@ describe("narratorService message query regressions", () => {
 		);
 		expect(readBlock?.status).toBe("success");
 		expect(readBlock?.outputJson?._truncated).toBe(true);
+	});
+
+	it("getChunksByRange 省略终态子代理子消息并附加懒加载摘要标记", async () => {
+		seedBase();
+		insertSubagentNarrator({ id: "sa-done", status: "idle", model: "gpt-5.5" });
+
+		insertMessage({
+			id: "m-task",
+			seq: 0,
+			contentJson: [
+				{ type: "tool_use", id: "tu-task", name: "Task", input: { subagent_type: "explore" } },
+			],
+		});
+		insertToolCall({
+			messageId: "m-task",
+			toolUseId: "tu-task",
+			toolName: "Task",
+			status: "success",
+		});
+		// Subagent child messages (owned by the finished subagent narrator).
+		insertMessage({
+			id: "c-1",
+			seq: 1,
+			narratorId: "sa-done",
+			parentToolUseId: "tu-task",
+			contentJson: [{ type: "tool_use", id: "tu-c1", name: "Read", input: { file_path: "x" } }],
+		});
+		insertToolCall({
+			messageId: "c-1",
+			toolUseId: "tu-c1",
+			toolName: "Read",
+			status: "success",
+			narratorId: "sa-done",
+		});
+		insertMessage({
+			id: "c-2",
+			seq: 2,
+			narratorId: "sa-done",
+			parentToolUseId: "tu-task",
+			contentJson: [{ type: "tool_use", id: "tu-c2", name: "Grep", input: { pattern: "y" } }],
+		});
+		insertToolCall({
+			messageId: "c-2",
+			toolUseId: "tu-c2",
+			toolName: "Grep",
+			status: "success",
+			narratorId: "sa-done",
+		});
+
+		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const taskMsg = range.messages.find((m: { id: string }) => m.id === "m-task");
+		// Children omitted from the payload.
+		expect(taskMsg?.children ?? []).toEqual([]);
+		// Omission markers present on the tool_use block.
+		const taskBlock = taskMsg?.contentJson?.find(
+			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-task",
+		);
+		expect(taskBlock?._subagentChildrenOmitted).toBe(true);
+		expect(taskBlock?._subagentNarratorId).toBe("sa-done");
+		expect(taskBlock?._subagentChildToolCallCount).toBe(2);
+		expect(taskBlock?._subagentModel).toBe("gpt-5.5");
+
+		// Lazy-load endpoint returns the child window (ascending by seq).
+		const lazy = await narratorService.getSubagentChildren("n1", "tu-task");
+		expect(lazy.messages.map((m: { id: string }) => m.id)).toEqual(["c-1", "c-2"]);
+		expect(lazy.hasOlder).toBe(false);
+	});
+
+	it("getSubagentChildren 按子代理 seq 游标分页（默认窗口 + beforeSeq 向上翻）", async () => {
+		seedBase();
+		insertSubagentNarrator({ id: "sa-page", status: "idle" });
+
+		insertMessage({
+			id: "m-task",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "tu-task", name: "Task", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-task",
+			toolUseId: "tu-task",
+			toolName: "Task",
+			status: "success",
+		});
+		// 3 child messages owned by the subagent narrator (seq 1..3).
+		for (let i = 1; i <= 3; i++) {
+			insertMessage({
+				id: `c-${i}`,
+				seq: i,
+				narratorId: "sa-page",
+				parentToolUseId: "tu-task",
+				contentJson: [{ type: "text", text: `child ${i}` }],
+			});
+		}
+
+		// Newest-first window of 2 → returns the 2 newest ascending, hasOlder true.
+		const page1 = await narratorService.getSubagentChildren("n1", "tu-task", { count: 2 });
+		expect(page1.messages.map((m: { id: string }) => m.id)).toEqual(["c-2", "c-3"]);
+		expect(page1.hasOlder).toBe(true);
+		expect(page1.oldestSeq).toBe(2);
+
+		// Page older via beforeSeq = oldestSeq of the previous window.
+		const page2 = await narratorService.getSubagentChildren("n1", "tu-task", {
+			count: 2,
+			beforeSeq: page1.oldestSeq ?? undefined,
+		});
+		expect(page2.messages.map((m: { id: string }) => m.id)).toEqual(["c-1"]);
+		expect(page2.hasOlder).toBe(false);
+	});
+
+	it("getChunksByRange 对运行中/后台活跃子代理保持内联子消息", async () => {
+		seedBase();
+		insertSubagentNarrator({ id: "sa-working", status: "working" });
+		insertSubagentNarrator({
+			id: "sa-bg",
+			status: "idle",
+			isBackground: true,
+			backgroundStatus: "running",
+		});
+
+		// Foreground still-working subagent.
+		insertMessage({
+			id: "m-task-a",
+			seq: 0,
+			contentJson: [{ type: "tool_use", id: "tu-a", name: "Task", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-task-a",
+			toolUseId: "tu-a",
+			toolName: "Task",
+			status: "running",
+		});
+		insertMessage({
+			id: "c-a",
+			seq: 1,
+			narratorId: "sa-working",
+			parentToolUseId: "tu-a",
+			contentJson: [{ type: "text", text: "live child a" }],
+		});
+
+		// Background-running subagent whose parent Task already reads success.
+		insertMessage({
+			id: "m-task-b",
+			seq: 2,
+			contentJson: [
+				{ type: "tool_use", id: "tu-b", name: "Task", input: { run_in_background: true } },
+			],
+		});
+		insertToolCall({
+			messageId: "m-task-b",
+			toolUseId: "tu-b",
+			toolName: "Task",
+			status: "success",
+		});
+		insertMessage({
+			id: "c-b",
+			seq: 3,
+			narratorId: "sa-bg",
+			parentToolUseId: "tu-b",
+			contentJson: [{ type: "text", text: "live child b" }],
+		});
+
+		const range = await narratorService.getChunksByRange("n1", { count: 1 });
+		const taskA = range.messages.find((m: { id: string }) => m.id === "m-task-a");
+		const taskB = range.messages.find((m: { id: string }) => m.id === "m-task-b");
+		// Both keep children inline; no omission markers.
+		expect(taskA?.children?.map((c: { id: string }) => c.id)).toEqual(["c-a"]);
+		expect(taskB?.children?.map((c: { id: string }) => c.id)).toEqual(["c-b"]);
+		const blockA = taskA?.contentJson?.find(
+			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-a",
+		);
+		const blockB = taskB?.contentJson?.find(
+			(b: { type?: string; id?: string }) => b.type === "tool_use" && b.id === "tu-b",
+		);
+		expect(blockA?._subagentChildrenOmitted).toBeUndefined();
+		expect(blockB?._subagentChildrenOmitted).toBeUndefined();
+	});
+
+	it("getSubagentChildren 拒绝不属于该 narrator 可见消息的 toolUseId", async () => {
+		seedBase();
+		// A second primary narrator that owns the tool call, without a ref for n1.
+		db.insert(narrators)
+			.values({
+				id: "other",
+				chapterId: "ch1",
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: ts(),
+				updatedAt: ts(),
+			})
+			.run();
+		insertMessage({
+			id: "m-task",
+			seq: 0,
+			narratorId: "other",
+			contentJson: [{ type: "tool_use", id: "tu-task", name: "Task", input: {} }],
+		});
+		insertToolCall({
+			messageId: "m-task",
+			toolUseId: "tu-task",
+			toolName: "Task",
+			status: "success",
+			narratorId: "other",
+		});
+
+		// n1 cannot read a tool call that belongs to "other"'s message.
+		await expect(narratorService.getSubagentChildren("n1", "tu-task")).rejects.toThrow();
 	});
 
 	it("compact 标记写入和完成时应更新 chunk manifest 版本并保持顺序", async () => {

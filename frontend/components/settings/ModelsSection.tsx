@@ -46,8 +46,6 @@ export interface ModelsSectionProps {
 	setSubagentExploreModel: (v: string) => void;
 	subagentPlanModel: string;
 	setSubagentPlanModel: (v: string) => void;
-	codexDefaultReasoningEffort: string;
-	setCodexDefaultReasoningEffort: (v: string) => void;
 	agentDefaultReasoningEffort: string;
 	setAgentDefaultReasoningEffort: (v: string) => void;
 	subagentAllowedModels: SubagentAllowedModels;
@@ -65,8 +63,6 @@ export function ModelsSection({
 	setSubagentExploreModel,
 	subagentPlanModel,
 	setSubagentPlanModel,
-	codexDefaultReasoningEffort,
-	setCodexDefaultReasoningEffort,
 	agentDefaultReasoningEffort,
 	setAgentDefaultReasoningEffort,
 	subagentAllowedModels,
@@ -228,24 +224,10 @@ export function ModelsSection({
 					{ value: "medium", label: tn("reasoning_medium") },
 					{ value: "high", label: tn("reasoning_high") },
 					{ value: "xhigh", label: tn("reasoning_xhigh") },
+					{ value: "max", label: tn("reasoning_max") },
 				]}
 				value={agentDefaultReasoningEffort || "auto"}
 				onChange={(v) => setAgentDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
-			/>
-			<Select
-				label={t("codexDefaultReasoningEffort")}
-				description={t("codexDefaultReasoningEffortDesc")}
-				data={[
-					{ value: "auto", label: tn("reasoning_auto") },
-					{ value: "none", label: tn("reasoning_none") },
-					{ value: "low", label: tn("reasoning_low") },
-					{ value: "medium", label: tn("reasoning_medium") },
-					{ value: "high", label: tn("reasoning_high") },
-					{ value: "xhigh", label: tn("reasoning_xhigh") },
-					{ value: "max", label: tn("reasoning_max") },
-				]}
-				value={codexDefaultReasoningEffort || "auto"}
-				onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}
 			/>
 			<Button variant="light" onClick={() => navigate({ to: "/settings/providers" })}>
 				{t("customModels")} →

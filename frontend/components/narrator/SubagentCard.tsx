@@ -16,6 +16,7 @@ import {
 	IconArrowBackUp,
 	IconChevronDown,
 	IconChevronRight,
+	IconChevronUp,
 	IconCloudOff,
 	IconEye,
 	IconMessageQuestion,
@@ -27,7 +28,7 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { useNarrator, useToolCallDetail } from "../../hooks/useNarrator";
+import { useNarrator, useSubagentChildren, useToolCallDetail } from "../../hooks/useNarrator";
 import { useNarratorSubagentsCapability } from "../../hooks/usePlatform";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { api } from "../../lib/api";
@@ -88,6 +89,42 @@ const MAX_SUBAGENT_RESULT_PREVIEW_CHARS = 120_000;
 const MAX_SUBAGENT_PROMPT_INLINE_CHARS = 120_000;
 const MAX_SUBAGENT_DESCRIPTION_CHARS = 4_000;
 const stripSubagentId = (text: string) => text.replace(SUBAGENT_ID_RE, "").trim();
+
+/**
+ * Merge two subagent child-message lists by id. Used in the omitted-children
+ * mode as a safety net so any WS-delivered realtime children (appended to the
+ * `childMessages` prop) survive alongside the lazy-loaded tree — covering the
+ * edge where a subagent flips terminal and a late child message arrives. When
+ * both sides carry the same id, prefer the entry with non-empty children and
+ * merge the shallow fields (WS-live over fetched for freshness).
+ */
+function mergeChildMessagesById(fetched: NarratorMsg[], live: NarratorMsg[]): NarratorMsg[] {
+	if (live.length === 0) return fetched;
+	if (fetched.length === 0) return live;
+	const byId = new Map<string, NarratorMsg>();
+	const order: string[] = [];
+	const add = (msg: NarratorMsg) => {
+		const id = msg.id;
+		if (!id) return;
+		const existing = byId.get(id);
+		if (!existing) {
+			byId.set(id, msg);
+			order.push(id);
+			return;
+		}
+		const existingChildren = existing.children ?? [];
+		const incomingChildren = msg.children ?? [];
+		byId.set(id, {
+			...existing,
+			...msg,
+			children:
+				incomingChildren.length >= existingChildren.length ? incomingChildren : existingChildren,
+		});
+	};
+	for (const msg of fetched) add(msg);
+	for (const msg of live) add(msg);
+	return order.map((id) => byId.get(id)).filter((m): m is NarratorMsg => m != null);
+}
 
 function appendLimited(parts: string[], value: string, budget: { remaining: number }) {
 	if (budget.remaining <= 0 || value.length === 0) return;
@@ -280,22 +317,88 @@ export const SubagentCard = memo(
 		);
 		const [showPrompt, setShowPrompt] = useState(false);
 		const [showCalls, setShowCalls] = useState(soleAndRunning);
-		const resolvedModel = childMessages[0]?.subagentModel ?? toolCall._resolvedModel ?? input.model;
 		const statusColor = STATUS_COLORS[toolCall.status] ?? "gray";
+
+		// Terminal subagents omit their children from the chunk payload. Only fetch
+		// the actual tool list when BOTH the card and its tool-call area are
+		// expanded — and paginate (newest 20, scroll up for older). Still-active
+		// subagents keep their children inline (childMessages); this stays disabled.
+		const childrenOmitted = !!toolCall._subagentChildrenOmitted;
+		const {
+			data: lazyChildren,
+			isLoading: lazyChildrenLoading,
+			isFetchingNextPage: lazyFetchingOlder,
+			hasNextPage: lazyHasOlder,
+			fetchNextPage: lazyFetchOlder,
+		} = useSubagentChildren(
+			narratorId,
+			toolCall.toolUseId ?? "",
+			childrenOmitted && expanded && showCalls,
+		);
+		// Flatten paginated pages (each returned ascending by seq; pages are
+		// newest-first, so reverse the page order for a single ascending list).
+		const lazyMessages = useMemo(() => {
+			if (!lazyChildren?.pages?.length) return [] as NarratorMsg[];
+			const out: NarratorMsg[] = [];
+			for (let i = lazyChildren.pages.length - 1; i >= 0; i--) {
+				out.push(...((lazyChildren.pages[i].messages ?? []) as NarratorMsg[]));
+			}
+			return out;
+		}, [lazyChildren?.pages]);
+		// In omitted mode, merge WS-delivered live children (in the prop) with the
+		// lazy-loaded window so late realtime updates are never dropped.
+		const effectiveChildMessages = useMemo(() => {
+			if (!childrenOmitted) return childMessages;
+			return mergeChildMessagesById(lazyMessages, childMessages);
+		}, [childrenOmitted, lazyMessages, childMessages]);
+
+		const resolvedModel =
+			effectiveChildMessages[0]?.subagentModel ??
+			toolCall._resolvedModel ??
+			toolCall._subagentModel ??
+			input.model;
 
 		// Clamp card height to 70% of the nearest scroll container (chat viewport).
 		const cardRef = useRef<HTMLDivElement>(null);
 		const scrollBoxRef = useRef<HTMLDivElement>(null);
 		const vpHeight = useNearestScrollContainerHeight(cardRef, 0.7);
-		const prevChildCount = useRef(childMessages.length);
+		// When paging OLDER (scroll up), we prepend messages and must keep the
+		// viewport anchored to the same content instead of jumping to the bottom.
+		const olderPrependAnchorRef = useRef<{ prevHeight: number; prevTop: number } | null>(null);
+		const prevChildCount = useRef(effectiveChildMessages.length);
 		useEffect(() => {
 			const el = scrollBoxRef.current;
 			if (!el) return;
-			if (childMessages.length > prevChildCount.current) {
+			const anchor = olderPrependAnchorRef.current;
+			if (anchor) {
+				// Older band was prepended: restore scroll so the previously-visible
+				// content stays put (offset by the newly-added height at the top).
+				olderPrependAnchorRef.current = null;
+				el.scrollTop = anchor.prevTop + (el.scrollHeight - anchor.prevHeight);
+			} else if (effectiveChildMessages.length > prevChildCount.current) {
+				// New live child appended at the bottom: follow to bottom.
 				el.scrollTop = el.scrollHeight;
 			}
-			prevChildCount.current = childMessages.length;
-		}, [childMessages.length]);
+			prevChildCount.current = effectiveChildMessages.length;
+		}, [effectiveChildMessages.length]);
+
+		// Load the next (older) band: capture current scroll metrics so the effect
+		// above can restore the anchored position instead of jumping to the bottom.
+		// Shared by the pinned "load earlier" button and the scroll-up trigger.
+		const loadOlderCalls = useCallback(() => {
+			if (!lazyHasOlder || lazyFetchingOlder) return;
+			const el = scrollBoxRef.current;
+			if (el) {
+				olderPrependAnchorRef.current = { prevHeight: el.scrollHeight, prevTop: el.scrollTop };
+			}
+			lazyFetchOlder();
+		}, [lazyHasOlder, lazyFetchingOlder, lazyFetchOlder]);
+		// Scroll-up-to-load-older: also trigger when the list nears the top.
+		const handleCallsScroll = useCallback(() => {
+			const el = scrollBoxRef.current;
+			if (!el || el.scrollTop > 48) return;
+			loadOlderCalls();
+		}, [loadOlderCalls]);
 		// Scroll to bottom after expand animation finishes (LazyCollapse ~200ms)
 		useEffect(() => {
 			if (!expanded) return;
@@ -331,14 +434,23 @@ export const SubagentCard = memo(
 				msgId: string;
 				childMsg: NarratorMsg;
 			}[] = [];
-			for (const cm of childMessages) {
+			for (const cm of effectiveChildMessages) {
 				if (!hasToolUse(cm)) continue;
 				for (const tc of resolveAllToolCallsFromMsg(cm)) {
 					calls.push({ tc, toolUseId: tc.toolUseId ?? null, msgId: cm.id, childMsg: cm });
 				}
 			}
 			return calls;
-		}, [childMessages]);
+		}, [effectiveChildMessages]);
+		// Header call count. When children are omitted, prefer the marker total
+		// (known without loading) so the count shows whether or not the tool list
+		// is expanded; fall back to the loaded count for inline subagents. If more
+		// tool calls have actually been loaded than the (possibly stale) marker
+		// reports, show the larger loaded count.
+		const markerCallCount = toolCall._subagentChildToolCallCount ?? 0;
+		const childCallCount = childrenOmitted
+			? Math.max(markerCallCount, childToolCalls.length)
+			: childToolCalls.length;
 		const writePathSummary = useMemo(() => {
 			const paths: string[] = [];
 			for (const { tc } of childToolCalls) {
@@ -460,13 +572,15 @@ export const SubagentCard = memo(
 		// (pending permission inside that the user can't see)
 		const hasPendingPerm = !expanded && !!(selfPerm || permChild);
 
-		// Resolve the subagent's own narratorId from child messages
+		// Resolve the subagent's own narratorId. Prefer the omission-marker id
+		// (present even when children aren't loaded), then derive from children.
 		const subagentNarratorId = useMemo(() => {
-			for (const cm of childMessages) {
+			if (toolCall._subagentNarratorId) return toolCall._subagentNarratorId;
+			for (const cm of effectiveChildMessages) {
 				if (cm.narratorId && cm.narratorId !== narratorId) return cm.narratorId;
 			}
 			return null;
-		}, [childMessages, narratorId]);
+		}, [toolCall._subagentNarratorId, effectiveChildMessages, narratorId]);
 
 		// Query the subagent narrator's status to detect "suspended" state
 		const { data: subagentNarrator } = useNarrator(subagentNarratorId ?? "");
@@ -714,9 +828,9 @@ export const SubagentCard = memo(
 											{saStatusText}
 										</Text>
 									)}
-									{childToolCalls.length > 0 && (
+									{childCallCount > 0 && (
 										<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-											{childToolCalls.length} calls
+											{childCallCount} calls
 										</Text>
 									)}
 									{!isTerminal &&
@@ -856,173 +970,214 @@ export const SubagentCard = memo(
 										</LazyCollapse>
 									</Box>
 								)}
-								{/* Child tool calls — in the middle */}
-								{childToolCalls.length > 0 && (
+								{/* Child tool calls — in the middle. Gate on the header count so the
+								    toggle shows for omitted subagents before their tool list loads. */}
+								{childCallCount > 0 && (
 									<Box px="xs" pb="xs">
 										<UnstyledButton onClick={() => setShowCalls((o) => !o)}>
 											<Group gap={4}>
 												{showCalls ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 												<Text size="xs" c="dimmed" truncate title={writePathSummary || undefined}>
-													{childToolCalls.length} tool calls
+													{childCallCount} tool calls
 													{!showCalls && writePathSummary ? ` · ${writePathSummary}` : ""}
 												</Text>
 											</Group>
 										</UnstyledButton>
 										<LazyCollapse in={showCalls}>
 											{showCalls ? (
-												<Box
-													ref={scrollBoxRef}
-													pl="xs"
-													mt={4}
-													style={{
-														overflow: "hidden auto",
-														maxHeight: vpHeight,
-													}}
-												>
-													{(() => {
-														const els: React.ReactNode[] = [];
-														let ci = 0;
-														while (ci < childToolCalls.length) {
-															const item = childToolCalls[ci];
-															const subCh = filterChildrenByToolUse(
-																item.childMsg?.children,
-																item.tc.toolUseId,
-															);
-															const isSub =
-																(subCh && subCh.length > 0) || item.tc.toolName === "Agent";
-															if (isSub) {
-																const subAnimId = getToolCallBlurAnimationId({
-																	toolUseId: item.toolUseId,
-																	messageId: item.msgId,
-																	fallbackKey: ci,
-																});
-																els.push(
-																	<BlurInOnAppear
-																		key={item.toolUseId ?? item.tc.toolName}
-																		animationId={subAnimId}
+												<Box mt={4}>
+													{/* Pinned "load earlier" control — always visible at the top of
+													    the list so the user doesn't have to scroll up. Shows a
+													    spinner while the initial window or an older band loads. */}
+													{childrenOmitted &&
+														(lazyHasOlder ||
+															lazyFetchingOlder ||
+															(lazyChildrenLoading && childToolCalls.length === 0)) && (
+															<Box
+																pl="xs"
+																pb={4}
+																style={{
+																	borderBottom: "1px solid var(--mantine-color-default-border)",
+																	marginBottom: 4,
+																}}
+															>
+																{lazyFetchingOlder ||
+																(lazyChildrenLoading && childToolCalls.length === 0) ? (
+																	<Group gap={6} justify="center" py={2}>
+																		<Loader size={12} />
+																		<Text size="xs" c="dimmed">
+																			{t("status_waiting")}
+																		</Text>
+																	</Group>
+																) : (
+																	<Button
+																		size="compact-xs"
+																		variant="subtle"
+																		color="gray"
+																		fullWidth
+																		leftSection={<IconChevronUp size={12} />}
+																		onClick={loadOlderCalls}
 																	>
-																		<div
-																			id={
-																				item.toolUseId
-																					? `tool-use-${item.toolUseId}`
-																					: `msg-${item.msgId}`
-																			}
+																		{t("loadOlderCalls")}
+																	</Button>
+																)}
+															</Box>
+														)}
+													<Box
+														ref={scrollBoxRef}
+														onScroll={childrenOmitted ? handleCallsScroll : undefined}
+														pl="xs"
+														style={{
+															overflow: "hidden auto",
+															maxHeight: vpHeight,
+														}}
+													>
+														{(() => {
+															const els: React.ReactNode[] = [];
+															let ci = 0;
+															while (ci < childToolCalls.length) {
+																const item = childToolCalls[ci];
+																const subCh = filterChildrenByToolUse(
+																	item.childMsg?.children,
+																	item.tc.toolUseId,
+																);
+																const isSub =
+																	(subCh && subCh.length > 0) || item.tc.toolName === "Agent";
+																if (isSub) {
+																	const subAnimId = getToolCallBlurAnimationId({
+																		toolUseId: item.toolUseId,
+																		messageId: item.msgId,
+																		fallbackKey: ci,
+																	});
+																	els.push(
+																		<BlurInOnAppear
+																			key={item.toolUseId ?? item.tc.toolName}
+																			animationId={subAnimId}
 																		>
-																			<SubagentCard
-																				toolCall={item.tc}
-																				childMessages={subCh ?? []}
-																				narratorId={narratorId}
-																				permCb={permCb}
-																				onViewSubagentSession={onViewSubagentSession}
-																			/>
-																		</div>
-																	</BlurInOnAppear>,
-																);
-																ci++;
-																continue;
-															}
-															// Collect consecutive non-subagent calls into a run
-															const run: typeof childToolCalls = [item];
-															let j = ci + 1;
-															while (j < childToolCalls.length) {
-																const nx = childToolCalls[j];
-																const nxCh = filterChildrenByToolUse(
-																	nx.childMsg?.children,
-																	nx.tc.toolUseId,
-																);
-																if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Agent") break;
-																run.push(nx);
-																j++;
-															}
-															if (run.length >= 2) {
-																els.push(
-																	<Box
-																		key={`crun-${run[0].msgId}`}
-																		style={{
-																			border: "1px solid var(--mantine-color-default-border)",
-																			borderRadius: "var(--mantine-radius-sm)",
-																			overflow: "hidden",
-																		}}
-																	>
-																		{run.map((r, ri) => {
-																			const mp = resolvePendingPerm(
-																				r.tc,
-																				permCb?.pendingPermission,
-																				permCb?.pendingPermsMap,
-																			);
-																			const runAnimId = getToolCallBlurAnimationId({
-																				toolUseId: r.toolUseId,
-																				messageId: r.msgId,
-																				fallbackKey: ri,
-																			});
-																			return (
-																				<BlurInOnAppear
-																					key={r.toolUseId ?? r.tc.toolName}
-																					animationId={runAnimId}
-																				>
-																					<div
-																						id={
-																							r.toolUseId
-																								? `tool-use-${r.toolUseId}`
-																								: `msg-${r.msgId}`
-																						}
+																			<div
+																				id={
+																					item.toolUseId
+																						? `tool-use-${item.toolUseId}`
+																						: `msg-${item.msgId}`
+																				}
+																			>
+																				<SubagentCard
+																					toolCall={item.tc}
+																					childMessages={subCh ?? []}
+																					narratorId={narratorId}
+																					permCb={permCb}
+																					onViewSubagentSession={onViewSubagentSession}
+																				/>
+																			</div>
+																		</BlurInOnAppear>,
+																	);
+																	ci++;
+																	continue;
+																}
+																// Collect consecutive non-subagent calls into a run
+																const run: typeof childToolCalls = [item];
+																let j = ci + 1;
+																while (j < childToolCalls.length) {
+																	const nx = childToolCalls[j];
+																	const nxCh = filterChildrenByToolUse(
+																		nx.childMsg?.children,
+																		nx.tc.toolUseId,
+																	);
+																	if ((nxCh && nxCh.length > 0) || nx.tc.toolName === "Agent")
+																		break;
+																	run.push(nx);
+																	j++;
+																}
+																if (run.length >= 2) {
+																	els.push(
+																		<Box
+																			key={`crun-${run[0].msgId}`}
+																			style={{
+																				border: "1px solid var(--mantine-color-default-border)",
+																				borderRadius: "var(--mantine-radius-sm)",
+																				overflow: "hidden",
+																			}}
+																		>
+																			{run.map((r, ri) => {
+																				const mp = resolvePendingPerm(
+																					r.tc,
+																					permCb?.pendingPermission,
+																					permCb?.pendingPermsMap,
+																				);
+																				const runAnimId = getToolCallBlurAnimationId({
+																					toolUseId: r.toolUseId,
+																					messageId: r.msgId,
+																					fallbackKey: ri,
+																				});
+																				return (
+																					<BlurInOnAppear
+																						key={r.toolUseId ?? r.tc.toolName}
+																						animationId={runAnimId}
 																					>
-																						<ToolCallCard
-																							toolCall={r.tc}
-																							narratorId={narratorId}
-																							inRun
-																							isLast={ri === run.length - 1}
-																							pendingPermission={mp}
-																							onPermissionDecision={permCb?.onPermissionDecision}
-																							onQuestionSubmit={permCb?.onQuestionSubmit}
-																							onQuestionReflect={permCb?.onQuestionReflect}
-																							onQuestionDeny={permCb?.onQuestionDeny}
-																						/>
-																					</div>
-																				</BlurInOnAppear>
-																			);
-																		})}
-																	</Box>,
-																);
-															} else {
-																const r = run[0];
-																const mp = resolvePendingPerm(
-																	r.tc,
-																	permCb?.pendingPermission,
-																	permCb?.pendingPermsMap,
-																);
-																const singleAnimId = getToolCallBlurAnimationId({
-																	toolUseId: r.toolUseId,
-																	messageId: r.msgId,
-																	fallbackKey: ci,
-																});
-																els.push(
-																	<BlurInOnAppear
-																		key={r.toolUseId ?? r.tc.toolName}
-																		animationId={singleAnimId}
-																	>
-																		<div
-																			id={
-																				r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
-																			}
+																						<div
+																							id={
+																								r.toolUseId
+																									? `tool-use-${r.toolUseId}`
+																									: `msg-${r.msgId}`
+																							}
+																						>
+																							<ToolCallCard
+																								toolCall={r.tc}
+																								narratorId={narratorId}
+																								inRun
+																								isLast={ri === run.length - 1}
+																								pendingPermission={mp}
+																								onPermissionDecision={permCb?.onPermissionDecision}
+																								onQuestionSubmit={permCb?.onQuestionSubmit}
+																								onQuestionReflect={permCb?.onQuestionReflect}
+																								onQuestionDeny={permCb?.onQuestionDeny}
+																							/>
+																						</div>
+																					</BlurInOnAppear>
+																				);
+																			})}
+																		</Box>,
+																	);
+																} else {
+																	const r = run[0];
+																	const mp = resolvePendingPerm(
+																		r.tc,
+																		permCb?.pendingPermission,
+																		permCb?.pendingPermsMap,
+																	);
+																	const singleAnimId = getToolCallBlurAnimationId({
+																		toolUseId: r.toolUseId,
+																		messageId: r.msgId,
+																		fallbackKey: ci,
+																	});
+																	els.push(
+																		<BlurInOnAppear
+																			key={r.toolUseId ?? r.tc.toolName}
+																			animationId={singleAnimId}
 																		>
-																			<ToolCallCard
-																				toolCall={r.tc}
-																				narratorId={narratorId}
-																				pendingPermission={mp}
-																				onPermissionDecision={permCb?.onPermissionDecision}
-																				onQuestionSubmit={permCb?.onQuestionSubmit}
-																				onQuestionReflect={permCb?.onQuestionReflect}
-																				onQuestionDeny={permCb?.onQuestionDeny}
-																			/>
-																		</div>
-																	</BlurInOnAppear>,
-																);
+																			<div
+																				id={
+																					r.toolUseId ? `tool-use-${r.toolUseId}` : `msg-${r.msgId}`
+																				}
+																			>
+																				<ToolCallCard
+																					toolCall={r.tc}
+																					narratorId={narratorId}
+																					pendingPermission={mp}
+																					onPermissionDecision={permCb?.onPermissionDecision}
+																					onQuestionSubmit={permCb?.onQuestionSubmit}
+																					onQuestionReflect={permCb?.onQuestionReflect}
+																					onQuestionDeny={permCb?.onQuestionDeny}
+																				/>
+																			</div>
+																		</BlurInOnAppear>,
+																	);
+																}
+																ci = j;
 															}
-															ci = j;
-														}
-														return els;
-													})()}
+															return els;
+														})()}
+													</Box>
 												</Box>
 											) : null}
 										</LazyCollapse>

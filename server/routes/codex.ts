@@ -12,7 +12,6 @@ import { logger } from "../lib/logger";
 import { getNormalizedSearchChannels, SEARCH_NATIVE_CHANNEL_ID } from "../lib/search/settings";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import {
-	codexDefaultReasoningEffortSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,
@@ -160,7 +159,6 @@ codexRoutes.get("/status", (c) => {
 		loadBalancingMode: isCodexLoadBalancingMode(mode) ? mode : snapshot.loadBalancingMode,
 		tierOrder,
 		effectiveTierOrder: snapshot.effectiveTierOrder,
-		defaultReasoningEffort: settings.codex?.defaultReasoningEffort,
 		useWebSocket: settings.codex?.useWebSocket ?? true,
 		useWebSearch: settings.codex?.useWebSearch ?? true,
 		useImageGeneration: settings.codex?.useImageGeneration ?? true,
@@ -467,32 +465,6 @@ codexRoutes.post("/global-proxy", async (c) => {
 	saveSettings(settings);
 
 	return c.json({ ok: true });
-});
-
-/**
- * GET /api/codex/default-reasoning-effort
- * Get default reasoning effort for Codex models.
- */
-codexRoutes.get("/default-reasoning-effort", (c) => {
-	return c.json({ reasoningEffort: settings.codex?.defaultReasoningEffort ?? null });
-});
-
-/**
- * POST /api/codex/default-reasoning-effort
- * Set default reasoning effort for Codex models.
- */
-codexRoutes.post("/default-reasoning-effort", async (c) => {
-	const body = await c.req.json().catch(() => ({}));
-	const parsed = codexDefaultReasoningEffortSchema.safeParse(body);
-	if (!parsed.success) {
-		throw new ValidationError(parsed.error.message);
-	}
-
-	settings.codex = settings.codex || {};
-	settings.codex.defaultReasoningEffort = parsed.data.reasoningEffort ?? undefined;
-	saveSettings(settings);
-
-	return c.json({ ok: true, reasoningEffort: settings.codex.defaultReasoningEffort ?? null });
 });
 
 /**

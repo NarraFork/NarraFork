@@ -84,12 +84,6 @@ export const updateNarratorHandleSchema = z.object({
 	handle: narratorHandleSchema.nullable(),
 });
 
-export const codexDefaultReasoningEffortSchema = z.object({
-	// gpt-5.6 family supports a real "max" tier; older codex models degrade it
-	// safely via normalizeCodexReasoningEffort.
-	reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh", "max"]).nullable().optional(),
-});
-
 export const codexUseWebSocketSchema = z.object({
 	useWebSocket: z.boolean().optional(),
 });

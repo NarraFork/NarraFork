@@ -212,6 +212,11 @@ export function resolveAllToolCallsFromMsg(
 			_streamingOutput: block._streamingOutput ?? (tc as any)?._streamingOutput,
 			// biome-ignore lint/suspicious/noExplicitAny: runtime-only fields
 			_timeoutMs: block._timeoutMs ?? (tc as any)?._timeoutMs,
+			// Terminal-subagent child omission markers (backend chunk payload).
+			_subagentChildrenOmitted: block._subagentChildrenOmitted as boolean | undefined,
+			_subagentNarratorId: block._subagentNarratorId as string | null | undefined,
+			_subagentChildToolCallCount: block._subagentChildToolCallCount as number | undefined,
+			_subagentModel: block._subagentModel as string | null | undefined,
 		});
 	}
 	return results;

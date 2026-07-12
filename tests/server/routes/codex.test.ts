@@ -11,14 +11,12 @@ const ALL_CODEX_TIER_ORDER: CodexTier[] = [...DEFAULT_CODEX_TIER_ORDER, "other"]
 const settingsState: {
 	codex: {
 		useWebSocket?: boolean;
-		defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 		loadBalancingMode?: "priority" | "balanced" | "tier-balanced";
 		tierOrder?: CodexTier[];
 	};
 } = {
 	codex: {
 		useWebSocket: undefined,
-		defaultReasoningEffort: undefined,
 	},
 };
 
@@ -119,7 +117,6 @@ app.onError((err, c) => {
 
 beforeEach(() => {
 	settingsState.codex.useWebSocket = undefined;
-	settingsState.codex.defaultReasoningEffort = undefined;
 	settingsState.codex.loadBalancingMode = undefined;
 	settingsState.codex.tierOrder = undefined;
 	saveSettingsCalls = 0;
@@ -159,19 +156,6 @@ describe("codex routes validation", () => {
 		expect(res.status).toBe(400);
 		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
 		expect(settingsState.codex.useWebSocket).toBeUndefined();
-		expect(saveSettingsCalls).toBe(0);
-	});
-
-	it("rejects unsupported default reasoning effort values", async () => {
-		const res = await app.request("/default-reasoning-effort", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ reasoningEffort: "turbo" }),
-		});
-
-		expect(res.status).toBe(400);
-		expect(await res.json()).toMatchObject({ code: "VALIDATION_ERROR" });
-		expect(settingsState.codex.defaultReasoningEffort).toBeUndefined();
 		expect(saveSettingsCalls).toBe(0);
 	});
 

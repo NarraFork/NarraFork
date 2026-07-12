@@ -61,6 +61,7 @@ export const DEFAULTS: NarraForkSettings = {
 		behaviorFenceInterval: -1,
 		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
+		defaultReasoningEffort: "max",
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
@@ -473,6 +474,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "行为护栏是否附着到 tasks.json 提醒的全局默认值：开启后，每当 tasks.json 任务提醒注入时一并注入行为护栏内容（护栏内容为空时不注入）。叙述者可单独覆盖此默认值。",
 		type: "boolean",
 		valid: "true / false，默认 true",
+	},
+	"agent.defaultReasoningEffort": {
+		desc: "全局默认思考强度，作为所有模型的唯一默认值。叙述者自身设置为非空时覆盖此值；否则该默认值应用于所有模型，并在请求时就近降级到模型支持的档位。默认 max。",
+		type: "string",
+		valid: '"none" | "low" | "medium" | "high" | "xhigh" | "max"，默认 max',
 	},
 	"agent.retryBackoffCeilMs": {
 		desc: "可恢复错误重试退避时间上限（毫秒）。指数退避不会超过此值。默认 20000（20 秒）。",

@@ -8,7 +8,6 @@ import {
 	Paper,
 	PasswordInput,
 	SegmentedControl,
-	Select,
 	Stack,
 	Switch,
 	Text,
@@ -141,7 +140,6 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 	onTestModel,
 }: CustomApiProviderSectionProps) {
 	const { t } = useTranslation("settings");
-	const { t: tn } = useTranslation("narrator");
 	const qc = useQueryClient();
 	const openaiRefreshCapability = useProviderModelRefreshCapability("openai");
 	const anthropicRefreshCapability = useProviderModelRefreshCapability("anthropic");
@@ -493,36 +491,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 				)}
 
 				{usesAnthropic && (
-					<>
-						<Switch
-							label={t("anthropicTlsRejectUnauthorized")}
-							description={t("anthropicTlsRejectUnauthorizedDesc")}
-							size="xs"
-							checked={provider.tlsRejectUnauthorized === false}
-							onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
-						/>
-						<Select
-							label={t("anthropicDefaultReasoningEffort")}
-							description={t("anthropicDefaultReasoningEffortDesc")}
-							size="xs"
-							data={[
-								{ value: "auto", label: tn("reasoning_auto") },
-								{ value: "none", label: tn("reasoning_none") },
-								{ value: "low", label: tn("reasoning_low") },
-								{ value: "medium", label: tn("reasoning_medium") },
-								{ value: "high", label: tn("reasoning_high") },
-							]}
-							value={provider.defaultReasoningEffort || "auto"}
-							onChange={(v) =>
-								updateProvider(
-									"defaultReasoningEffort",
-									v && v !== "auto"
-										? (v as CustomApiProviderState["defaultReasoningEffort"])
-										: null,
-								)
-							}
-						/>
-					</>
+					<Switch
+						label={t("anthropicTlsRejectUnauthorized")}
+						description={t("anthropicTlsRejectUnauthorizedDesc")}
+						size="xs"
+						checked={provider.tlsRejectUnauthorized === false}
+						onChange={(e) => updateProvider("tlsRejectUnauthorized", !e.currentTarget.checked)}
+					/>
 				)}
 
 				<Divider />

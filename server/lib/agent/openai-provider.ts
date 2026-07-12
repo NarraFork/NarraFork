@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { applyProxyExemptions, resolveProxyForUrl } from "../net/proxy";
@@ -105,7 +106,7 @@ function defaultBaseUrl(mode: OpenAIApiMode): string {
 	return "https://api.openai.com/v1";
 }
 
-const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly string[]> = {
+const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly ReasoningEffort[]> = {
 	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
 	// "none" is omitted — it disables reasoning entirely and is handled via
 	// early-return in normalizeCodexReasoningEffort before this table is consulted.
@@ -210,29 +211,28 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
+/**
+ * Fallback reasoning tiers for Codex models not present in
+ * CODEX_MODEL_REASONING_LEVELS. Most codex models expose low..xhigh but no
+ * "max" tier, so an unknown model clamps "max" down to "xhigh".
+ */
+const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+];
+
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
 	if (!reasoningEffort) return undefined;
-	if (reasoningEffort === "none") return reasoningEffort;
+	// "none" disables reasoning entirely and bypasses the tier table.
+	if (reasoningEffort === "none") return "none";
 	const bareModel = parseModelId(model).model;
-	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel];
-	if (reasoningEffort === "max") {
-		// gpt-5.6 family exposes a real "max" tier; keep it when supported.
-		if (supported?.includes("max")) return "max";
-		// Older codex models have no "max" tier; degrade to the highest available.
-		if (!supported) return "xhigh";
-		if (supported.includes("xhigh")) return "xhigh";
-		if (supported.includes("high")) return "high";
-		return supported[supported.length - 1] ?? "high";
-	}
-	if (!supported || supported.includes(reasoningEffort)) return reasoningEffort;
-	if (reasoningEffort === "xhigh" && supported.includes("high")) return "high";
-	if (reasoningEffort === "low" && supported.includes("medium")) return "medium";
-	// Fallback: requested level not supported and no degradation rule matched.
-	// Clamp to the lowest supported level to avoid sending an unsupported value.
-	return supported[0] ?? reasoningEffort;
+	const supported = CODEX_MODEL_REASONING_LEVELS[bareModel] ?? DEFAULT_CODEX_REASONING_LEVELS;
+	return clampReasoningEffort(reasoningEffort as ReasoningEffort, supported);
 }
 
 function applyGenerateReasoningOptions(

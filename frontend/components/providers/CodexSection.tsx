@@ -349,7 +349,6 @@ export const CodexSection = React.memo(function CodexSection({
 	onTestModel,
 }: CodexSectionProps) {
 	const { t } = useTranslation("settings");
-	const { t: tn } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const { data: codexSettingsData } = useQuery({
@@ -375,7 +374,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const usageQueueClearSupported = codexManagerParity?.usageQueueClearSupported !== false;
 	const canReadCodexStatus = isCodexRouteSupported("status");
 	const canSetLoadBalancingMode = isCodexRouteSupported("loadBalancingMode");
-	const canSetDefaultReasoningEffort = isCodexRouteSupported("defaultReasoningEffort");
 	const canSetUseWebSocket = isCodexRouteSupported("useWebSocket");
 	const canSetUseWebSearch = isCodexRouteSupported("useWebSearch");
 	const canSetUseImageGeneration = isCodexRouteSupported("useImageGeneration");
@@ -413,8 +411,6 @@ export const CodexSection = React.memo(function CodexSection({
 		displayName: string;
 		priority: number;
 	}>({ displayName: "", priority: 0 });
-	const [defaultReasoningEffort, setDefaultReasoningEffort] = useState("");
-	const [defaultReasoningInitialized, setDefaultReasoningInitialized] = useState(false);
 	const [useWebSocket, setUseWebSocket] = useState(true);
 	const [useWebSocketInitialized, setUseWebSocketInitialized] = useState(false);
 	const [useWebSearch, setUseWebSearch] = useState(true);
@@ -522,10 +518,6 @@ export const CodexSection = React.memo(function CodexSection({
 
 	useEffect(() => {
 		if (!status) return;
-		if (!defaultReasoningInitialized) {
-			setDefaultReasoningEffort(status.defaultReasoningEffort ?? "");
-			setDefaultReasoningInitialized(true);
-		}
 		if (!useWebSocketInitialized) {
 			setUseWebSocket(status.useWebSocket ?? true);
 			setUseWebSocketInitialized(true);
@@ -538,13 +530,7 @@ export const CodexSection = React.memo(function CodexSection({
 			setUseImageGeneration(status.useImageGeneration ?? true);
 			setUseImageGenerationInitialized(true);
 		}
-	}, [
-		status,
-		defaultReasoningInitialized,
-		useWebSocketInitialized,
-		useWebSearchInitialized,
-		useImageGenerationInitialized,
-	]);
+	}, [status, useWebSocketInitialized, useWebSearchInitialized, useImageGenerationInitialized]);
 
 	useEffect(() => {
 		if (statusTierOrder === null) return;
@@ -627,14 +613,6 @@ export const CodexSection = React.memo(function CodexSection({
 	const lbModeMut = useMutation({
 		mutationFn: (mode: CodexLoadBalancingMode) => api.codexSetLoadBalancingMode(mode),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["codex", "status"] }),
-	});
-	const defaultReasoningMut = useMutation({
-		mutationFn: (reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null) =>
-			api.codexSetDefaultReasoningEffort(reasoningEffort),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["codex", "status"] });
-			notifications.show({ message: t("codexDefaultReasoningUpdated"), color: "green" });
-		},
 	});
 	const useWebSocketMut = useMutation({
 		mutationFn: (useWebSocket: boolean) => api.codexSetUseWebSocket(useWebSocket),
@@ -900,36 +878,6 @@ export const CodexSection = React.memo(function CodexSection({
 		updateMut.mutate({ id: editingId, data });
 	};
 
-	const effectiveDefaultReasoningEffort = defaultReasoningInitialized
-		? defaultReasoningEffort
-		: (status?.defaultReasoningEffort ?? "");
-	const effectiveDefaultReasoningEffortLabel =
-		effectiveDefaultReasoningEffort === "low"
-			? tn("reasoning_low")
-			: effectiveDefaultReasoningEffort === "medium"
-				? tn("reasoning_medium")
-				: effectiveDefaultReasoningEffort === "high"
-					? tn("reasoning_high")
-					: effectiveDefaultReasoningEffort === "xhigh"
-						? tn("reasoning_xhigh")
-						: effectiveDefaultReasoningEffort === "max"
-							? tn("reasoning_max")
-							: effectiveDefaultReasoningEffort === "none"
-								? tn("reasoning_none")
-								: tn("reasoning_auto");
-
-	const handleSaveDefaultReasoningEffort = () => {
-		if (!canSetDefaultReasoningEffort) return;
-		const nextReasoningEffort =
-			(effectiveDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh" | "max") ||
-			null;
-		defaultReasoningMut.mutate(nextReasoningEffort, {
-			onSuccess: () => {
-				setDefaultReasoningEffort(nextReasoningEffort ?? "");
-			},
-		});
-	};
-
 	const handleTierOrderDragEnd = (event: DragEndEvent) => {
 		if (!canSetTierOrder) return;
 		const { active, over } = event;
@@ -1051,40 +999,6 @@ export const CodexSection = React.memo(function CodexSection({
 					onChange={(next) => codexProxyMut.mutate(next)}
 					disabled={codexProxyMut.isPending}
 				/>
-				<Group align="flex-end">
-					<TextInput
-						size="xs"
-						label={t("codexDefaultReasoningEffort")}
-						description={t("codexDefaultReasoningEffortDesc")}
-						value={effectiveDefaultReasoningEffortLabel}
-						readOnly
-						style={{ flex: 1 }}
-					/>
-					<SegmentedControl
-						size="xs"
-						value={effectiveDefaultReasoningEffort || "auto"}
-						disabled={!canSetDefaultReasoningEffort}
-						onChange={(v) => setDefaultReasoningEffort(v === "auto" ? "" : v)}
-						data={[
-							{ label: tn("reasoning_auto"), value: "auto" },
-							{ label: tn("reasoning_none"), value: "none" },
-							{ label: tn("reasoning_low"), value: "low" },
-							{ label: tn("reasoning_medium"), value: "medium" },
-							{ label: tn("reasoning_high"), value: "high" },
-							{ label: tn("reasoning_xhigh"), value: "xhigh" },
-							{ label: tn("reasoning_max"), value: "max" },
-						]}
-					/>
-					<Button
-						size="xs"
-						onClick={handleSaveDefaultReasoningEffort}
-						loading={defaultReasoningMut.isPending}
-						disabled={!canSetDefaultReasoningEffort}
-						title={!canSetDefaultReasoningEffort ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("codexSave")}
-					</Button>
-				</Group>
 				<Group align="flex-end">
 					<Stack gap={4} style={{ flex: 1 }}>
 						<Group gap="xs">

@@ -117,7 +117,6 @@ export {
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
-	codexDefaultReasoningEffortSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,

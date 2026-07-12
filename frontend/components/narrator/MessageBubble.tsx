@@ -110,7 +110,9 @@ import {
 	MAX_IMAGE_SIZE,
 	resizeImageIfNeeded,
 } from "./narrator-panel-types";
+import { ReasoningStepsTrace } from "./ReasoningStepsTrace";
 import { useRenderLod } from "./RenderLodCtx";
+import { hasStructuredReasoning, parseReasoningSegments } from "./reasoning-segments";
 import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
@@ -1954,6 +1956,15 @@ export const ReasoningBlock = memo(
 		}, [translatedText]);
 		const displayText = showTranslation && translatedText ? translatedText : text;
 
+		// Parse codex/gpt-5.6-style reasoning ("**Title**" + "<!-- -->" parts)
+		// into titled steps. When at least one title is present we render a
+		// compact step trace instead of the single collapsible block below.
+		const segments = useMemo(
+			() => (hasEncryptedReasoning ? [] : parseReasoningSegments(displayText)),
+			[displayText, hasEncryptedReasoning],
+		);
+		const structured = useMemo(() => hasStructuredReasoning(segments), [segments]);
+
 		// --- Block ID, selection, swipe & context menu state ---
 		const rbInstanceId = useRef(nextRbInstanceId++);
 		const blockIdStr =
@@ -2252,6 +2263,35 @@ export const ReasoningBlock = memo(
 				);
 			})();
 
+		// Structured (codex/gpt-5.6) reasoning: render a step trace with titles
+		// always visible instead of a single collapsible block.
+		const structuredInner = structured ? (
+			<>
+				<ReasoningStepsTrace
+					segments={segments}
+					streaming={streaming}
+					persistKeyBase={persistKey}
+				/>
+				{translatedText && rawText && (
+					<Group
+						gap={4}
+						mt={2}
+						ml="lg"
+						style={{ cursor: "pointer", display: "inline-flex" }}
+						onClick={(e) => {
+							e.stopPropagation();
+							setShowTranslation((v) => !v);
+						}}
+					>
+						<IconLanguage size={12} style={{ opacity: 0.5 }} />
+						<Text size="xs" c="dimmed">
+							{showTranslation ? t("showOriginal") : t("showTranslated")}
+						</Text>
+					</Group>
+				)}
+			</>
+		) : null;
+
 		return (
 			<>
 				<Box
@@ -2270,58 +2310,69 @@ export const ReasoningBlock = memo(
 						transition: swipe.swipeTransition,
 					}}
 				>
-					<Group
-						gap={0}
-						py={2}
-						wrap="nowrap"
-						align="center"
-						style={{ cursor: "pointer", userSelect: "none" }}
-						onClick={handleToggle}
-					>
-						<Box
-							style={{
-								display: "flex",
-								alignItems: "center",
-								width: 11,
-								justifyContent: "center",
-							}}
-						>
-							{opened ? (
-								<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-							) : (
-								<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
-							)}
-						</Box>
-						<ThemeIcon size={16} variant="light" color="grape" radius="sm">
-							<IconBrain size={10} />
-						</ThemeIcon>
-						<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
-							{t("reasoning")}
-						</Text>
-						{!hasEncryptedReasoning && (
-							<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
-								{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
-							</Text>
-						)}
-						{!opened && (
-							<Text size="xs" c="dimmed" truncate style={{ flex: 1, minWidth: 0, opacity: 0.6 }}>
-								— {displayText.slice(0, 80)}
-								{displayText.length > 80 ? "…" : ""}
-							</Text>
-						)}
-					</Group>
-					{/*
-					Initial mount with opened=true: render Collapse directly to avoid
-					LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
-					triggers "Maximum update depth exceeded" in Mantine's Transition
-					when many instances mount at once.
-					After first user toggle: switch to LazyCollapse for proper
-					expand/collapse animation with content unmount.
-				*/}
-					{!hasToggled.current && opened ? (
-						<Collapse expanded={opened}>{content}</Collapse>
+					{structured ? (
+						structuredInner
 					) : (
-						<LazyCollapse in={opened}>{content}</LazyCollapse>
+						<>
+							<Group
+								gap={0}
+								py={2}
+								wrap="nowrap"
+								align="center"
+								style={{ cursor: "pointer", userSelect: "none" }}
+								onClick={handleToggle}
+							>
+								<Box
+									style={{
+										display: "flex",
+										alignItems: "center",
+										width: 11,
+										justifyContent: "center",
+									}}
+								>
+									{opened ? (
+										<IconChevronDown size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+									) : (
+										<IconChevronRight size={12} style={{ color: "var(--mantine-color-dimmed)" }} />
+									)}
+								</Box>
+								<ThemeIcon size={16} variant="light" color="grape" radius="sm">
+									<IconBrain size={10} />
+								</ThemeIcon>
+								<Text size="xs" c="dimmed" ml={4} style={{ flexShrink: 0 }}>
+									{t("reasoning")}
+								</Text>
+								{!hasEncryptedReasoning && (
+									<Text size="xs" c="dimmed" ml={6} style={{ flexShrink: 0, opacity: 0.5 }}>
+										{t("reasoningChars", { formatted: displayText.length.toLocaleString() })}
+									</Text>
+								)}
+								{!opened && (
+									<Text
+										size="xs"
+										c="dimmed"
+										truncate
+										style={{ flex: 1, minWidth: 0, opacity: 0.6 }}
+									>
+										— {displayText.slice(0, 80)}
+										{displayText.length > 80 ? "…" : ""}
+									</Text>
+								)}
+							</Group>
+							{/*
+							Initial mount with opened=true: render Collapse directly to avoid
+							LazyCollapse's effect cascade (setMounted → rAF → setReveal) that
+							triggers "Maximum update depth exceeded" in Mantine's Transition
+							when many instances mount at once.
+							After first user toggle: switch to LazyCollapse for proper
+							expand/collapse animation with content unmount.
+						*/}
+							{!hasToggled.current && opened ? (
+								<Collapse expanded={opened}>{content}</Collapse>
+							) : (
+								<LazyCollapse in={opened}>{content}</LazyCollapse>
+							)}
+						</>
 					)}
 				</Box>
 				{swipeMenu}

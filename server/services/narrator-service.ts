@@ -59,13 +59,7 @@ import {
 	getToolMessageWithParams,
 	type Locale,
 } from "../lib/prompt-i18n";
-import {
-	FOLLOW_DEFAULT_MODEL,
-	resolveDefaultReasoningEffort,
-	resolveEffectiveModel,
-	resolveProvider,
-	settings,
-} from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
 import { contentJsonHasImageBlocks, deleteNarratorUploads, type ImageRef } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -821,12 +815,10 @@ export const narratorService = {
 		const planFileId = startInPlanMode ? generateWordSlug() : null;
 
 		const storedModel = input.model ?? FOLLOW_DEFAULT_MODEL;
-		const actualModel = resolveEffectiveModel(storedModel);
-		const resolvedProvider = resolveProvider(actualModel);
-		const resolvedReasoningEffort =
-			input.reasoningEffort === undefined
-				? (resolveDefaultReasoningEffort(resolvedProvider, actualModel) ?? null)
-				: input.reasoningEffort;
+		// Do not固化 the global default: store null unless an explicit effort was
+		// passed. A null reasoningEffort means "follow the global default", which
+		// is resolved (and clamped per-model) at request time.
+		const resolvedReasoningEffort = input.reasoningEffort ?? null;
 
 		const chapterId = input.chapterId ?? null;
 		const traits: string[] = chapterId === null ? ["standalone"] : [];
@@ -955,12 +947,9 @@ export const narratorService = {
 			| "dontAsk";
 
 		const resolvedModel = resolveEffectiveModel(input.model ?? parent.model);
-		const resolvedProvider = resolveProvider(resolvedModel);
-		const resolvedReasoningEffort =
-			input.reasoningEffort === undefined
-				? parent.reasoningEffort ||
-					(resolveDefaultReasoningEffort(resolvedProvider, resolvedModel) ?? null)
-				: input.reasoningEffort;
+		// Inherit the parent's explicit override if any; otherwise store null
+		// (follow the global default). Never固化 the resolved default here.
+		const resolvedReasoningEffort = input.reasoningEffort ?? parent.reasoningEffort ?? null;
 
 		const subChapterId = parent.chapterId ?? null;
 		const subTraits: string[] = [
@@ -1549,11 +1538,9 @@ export const narratorService = {
 		}
 
 		const storedModel = parent.model ?? FOLLOW_DEFAULT_MODEL;
-		const effectiveModel = resolveEffectiveModel(storedModel);
-		const resolvedProvider = resolveProvider(effectiveModel);
-		const resolvedReasoningEffort =
-			parent.reasoningEffort ||
-			(resolveDefaultReasoningEffort(resolvedProvider, effectiveModel) ?? null);
+		// Inherit the parent's explicit override if any; otherwise store null
+		// (follow the global default). Never固化 the resolved default here.
+		const resolvedReasoningEffort = parent.reasoningEffort ?? null;
 
 		const forkTraits2: string[] = targetChapterId ? [] : ["standalone"];
 
@@ -1802,6 +1789,7 @@ export const narratorService = {
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
 	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
+	getSubagentChildren: narratorMessageQueries.getSubagentChildren.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),

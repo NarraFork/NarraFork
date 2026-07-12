@@ -164,6 +164,26 @@ function collectToolUseIds(messages: any[]): string[] {
 	return ids;
 }
 
+/** Tool names that spawn subagents (whose child messages form a subagent tree). */
+const SUBAGENT_TOOL_NAMES = new Set(["Agent", "Task", "Send"]);
+
+/**
+ * Collect toolUseIds of only subagent-spawning tool calls (Agent/Task/Send).
+ * These are the ones whose children may be omitted + lazy-loaded; children of
+ * any other tool call (rare/legacy) are always inlined.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function collectSubagentToolUseIds(messages: any[]): string[] {
+	const ids: string[] = [];
+	for (const msg of messages) {
+		if (!msg.toolCalls) continue;
+		for (const tc of msg.toolCalls) {
+			if (SUBAGENT_TOOL_NAMES.has(tc.toolName)) ids.push(tc.toolUseId);
+		}
+	}
+	return ids;
+}
+
 function sideCarDedupeKey(sideCar: Record<string, unknown>): string {
 	if (typeof sideCar.id === "string" && sideCar.id) return sideCar.id;
 	return [
@@ -675,12 +695,162 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 }
 
 /**
+ * Load, enrich and tree-build the child messages for a set of parent tool-use
+ * ids. Shared by the inline chunk path (for still-active subagents) and the
+ * lazy subagent-children endpoint (for terminal subagents expanded on demand).
+ *
+ * NOTE: intentionally does NOT apply filterExitPlanBeforePlanCompact — that
+ * filter targets the top-level parent message sequence (dropping an ExitPlanMode
+ * that precedes a plan-compact marker) and has no meaning inside a subagent's
+ * own child message tree. This mirrors how the previous inline path treated
+ * child messages.
+ */
+async function buildSubagentChildTree(
+	parentToolUseIds: string[],
+	/** When provided, restrict to this exact set of child message ids (paginated
+	 * window). Otherwise load the full child set (bounded by limit). */
+	onlyMessageIds?: string[],
+	/** Optional messageId → seq map so paginated children carry ordering seqs. */
+	seqMap?: Map<string, number>,
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+): Promise<any[]> {
+	if (parentToolUseIds.length === 0) return [];
+	const whereCondition =
+		onlyMessageIds != null
+			? and(
+					inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+					inArray(narratorMessages.id, onlyMessageIds),
+				)
+			: inArray(narratorMessages.parentToolUseId, parentToolUseIds);
+	const childMessages = await db.query.narratorMessages.findMany({
+		where: whereCondition,
+		with: { toolCalls: true, sideCars: true, creator: true },
+		orderBy: (m, { asc }) => [asc(m.createdAt)],
+		limit: 500,
+	});
+	if (childMessages.length === 0) return [];
+	if (seqMap) {
+		childMessages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
+		attachMessageSeqs(childMessages, seqMap);
+	}
+	await attachSubagentModels(childMessages);
+	await hydrateToolUseSideCars(childMessages);
+	// The requested tool-use ids are the spawning parent's tool calls, which are
+	// NOT part of this loaded set. Treat their direct children as tree roots so
+	// buildMessageTree keeps them top-level (matching the flat childMessages prop
+	// shape the SubagentCard receives on the inline path).
+	const requestedSet = new Set(parentToolUseIds);
+	for (const msg of childMessages) {
+		if (msg.parentToolUseId && requestedSet.has(msg.parentToolUseId)) {
+			msg.parentToolUseId = null;
+		}
+	}
+	return enrichToolUseBlocks(truncateToolIO(buildMessageTree(childMessages)));
+}
+
+interface SubagentChildSummary {
+	parentToolUseId: string;
+	subagentNarratorId: string | null;
+	model: string | null;
+	callCount: number;
+	/** true when the owning subagent narrator has truly finished and is not a
+	 * still-active background task — safe to omit its children from the payload. */
+	omittable: boolean;
+}
+
+/**
+ * For a candidate set of parent tool-use ids that HAVE child messages, fetch a
+ * lightweight per-subagent summary (narrator id / model / tool-call count) and
+ * decide whether each one is safe to omit from the inline chunk payload.
+ *
+ * A background Task tool call reaches status="success" immediately while its
+ * subagent keeps streaming children, so terminality must be judged from the
+ * SUBAGENT NARRATOR's own state, never the parent tool call status:
+ *   omittable ⇔ narrator.status ∈ {idle, archived}
+ *              AND NOT (isBackground AND backgroundStatus = "running")
+ */
+async function loadSubagentChildSummaries(
+	candidateToolUseIds: string[],
+): Promise<Map<string, SubagentChildSummary>> {
+	const result = new Map<string, SubagentChildSummary>();
+	if (candidateToolUseIds.length === 0) return result;
+
+	// One indexed, aggregate-only query (no large child columns). One row per
+	// parent tool-use id that owns child messages, joined to the owning subagent
+	// narrator for the terminality decision and the tool-call count for the
+	// collapsed "N calls" header.
+	const rows = await db
+		.select({
+			ptu: narratorMessages.parentToolUseId,
+			naid: narratorMessages.narratorId,
+			model: narrators.model,
+			status: narrators.status,
+			isBackground: narrators.isBackground,
+			backgroundStatus: narrators.backgroundStatus,
+			callCount: sql<number>`COUNT(${narratorToolCalls.id})`,
+		})
+		.from(narratorMessages)
+		.leftJoin(narratorToolCalls, eq(narratorToolCalls.messageId, narratorMessages.id))
+		.leftJoin(narrators, eq(narrators.id, narratorMessages.narratorId))
+		.where(inArray(narratorMessages.parentToolUseId, candidateToolUseIds))
+		.groupBy(narratorMessages.parentToolUseId);
+
+	for (const row of rows) {
+		if (!row.ptu) continue;
+		const status = row.status ?? "";
+		const isBackgroundActive = !!row.isBackground && row.backgroundStatus === "running";
+		const omittable = (status === "idle" || status === "archived") && !isBackgroundActive;
+		result.set(row.ptu, {
+			parentToolUseId: row.ptu,
+			subagentNarratorId: row.naid ?? null,
+			model: row.model ?? null,
+			callCount: Number(row.callCount ?? 0),
+			omittable,
+		});
+	}
+	return result;
+}
+
+/**
+ * Attach a lightweight omission marker to a parent tool_use block whose subagent
+ * children were intentionally NOT inlined. The SubagentCard reads these to show
+ * the collapsed header and lazy-load children when expanded.
+ */
+function markOmittedSubagentChildren(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	topMessages: any[],
+	summaries: Map<string, SubagentChildSummary>,
+	omittedToolUseIds: Set<string>,
+): void {
+	if (omittedToolUseIds.size === 0) return;
+	for (const msg of topMessages) {
+		if (!Array.isArray(msg.contentJson)) continue;
+		for (const block of msg.contentJson) {
+			if (block?.type !== "tool_use" || typeof block.id !== "string") continue;
+			if (!omittedToolUseIds.has(block.id)) continue;
+			const summary = summaries.get(block.id);
+			block._subagentChildrenOmitted = true;
+			block._subagentNarratorId = summary?.subagentNarratorId ?? null;
+			block._subagentChildToolCallCount = summary?.callCount ?? 0;
+			block._subagentModel = summary?.model ?? null;
+		}
+	}
+}
+
+/**
  * Build a fully-hydrated message tree from a set of top-level ref rows
  * (messageId + seq). Shared by chunk range and catch-up paths so the exact same
  * enrichment pipeline (seqs, subagent children, sidecars, tool IO truncation,
  * exit-plan filtering) is applied consistently.
  *
  * `refRows` must already be ordered ascending by seq.
+ *
+ * Subagent children for TERMINAL (finished, non-background-active) subagents are
+ * omitted from the payload and lazy-loaded on demand (see getSubagentChildren) —
+ * a completed subagent can carry hundreds of child messages with full tool I/O
+ * that the SubagentCard renders only when expanded. Still-active subagents
+ * (working/waiting/background-running) keep their children inline so WS realtime
+ * updates continue to land in the parent tool_use tree.
  */
 async function buildTreeFromTopLevelRefs(
 	refRows: Array<{ messageId: string; seq: number }>,
@@ -706,10 +876,24 @@ async function buildTreeFromTopLevelRefs(
 	}
 
 	const parentToolUseIds = collectToolUseIds(topMessages);
+	// Only subagent-spawning tool calls (Agent/Task/Send) are candidates for
+	// child omission; children of any other tool call are always inlined.
+	const subagentCandidateIds = collectSubagentToolUseIds(topMessages);
+	// Decide which subagents can have their children omitted. Only candidate
+	// tool-use ids that actually own child messages appear in the summary map.
+	const summaries = await loadSubagentChildSummaries(subagentCandidateIds);
+	const omittedToolUseIds = new Set<string>();
+	for (const [id, summary] of summaries) {
+		if (summary.omittable) omittedToolUseIds.add(id);
+	}
+	// Inline every parent tool-use id whose children are NOT omitted (this keeps
+	// non-subagent tool calls with children and still-active subagents inline).
+	const inlineToolUseIds = parentToolUseIds.filter((id) => !omittedToolUseIds.has(id));
+
 	const childMessages =
-		parentToolUseIds.length > 0
+		inlineToolUseIds.length > 0
 			? await db.query.narratorMessages.findMany({
-					where: inArray(narratorMessages.parentToolUseId, parentToolUseIds),
+					where: inArray(narratorMessages.parentToolUseId, inlineToolUseIds),
 					with: { toolCalls: true, sideCars: true, creator: true },
 					orderBy: (m, { asc }) => [asc(m.createdAt)],
 					limit: 500,
@@ -719,11 +903,15 @@ async function buildTreeFromTopLevelRefs(
 	await attachSubagentModels(childMessages);
 	await hydrateToolUseSideCars([...topMessages, ...childMessages]);
 
-	return enrichToolUseBlocks(
+	const tree = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages])),
 		),
 	);
+	// Mark omitted subagents AFTER enrichment so the markers survive on the
+	// enriched tool_use blocks (enrichToolUseBlocks spreads block fields).
+	markOmittedSubagentChildren(tree, summaries, omittedToolUseIds);
+	return tree;
 }
 
 // ── Chunk manifest helpers ─────────────────────────────────────────────────
@@ -1651,6 +1839,89 @@ export const narratorMessageQueries = {
 		}
 
 		throw new NotFoundError("ToolCall", toolUseId);
+	},
+
+	/**
+	 * Lazy-load a subagent tool call's child messages, PAGINATED by the owning
+	 * subagent narrator's ref seq (newest-first window; scroll up for older).
+	 * Used by the SubagentCard when the card AND its tool-call area are expanded —
+	 * terminal subagents omit their children from the chunk payload (see
+	 * buildTreeFromTopLevelRefs). Verifies the tool call belongs to a message
+	 * referenced (visible) by this narrator before returning any child content.
+	 *
+	 * Returns messages ascending by seq, plus `hasOlder` and `oldestSeq` so the
+	 * client can request the next older band via `beforeSeq`.
+	 */
+	async getSubagentChildren(
+		narratorId: string,
+		toolUseId: string,
+		opts: { beforeSeq?: number; count?: number } = {},
+	) {
+		const limit = Math.min(Math.max(opts.count ?? 20, 1), 100);
+
+		// Resolve the tool call and confirm its owning message is referenced by
+		// this narrator (its refs junction row), so a caller can only read
+		// children of tool calls that appear in their own message list.
+		const toolCall = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, toolUseId),
+			columns: { messageId: true },
+		});
+		if (!toolCall) throw new NotFoundError("ToolCall", toolUseId);
+
+		const visibleRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, toolCall.messageId),
+			),
+			columns: { messageId: true },
+		});
+		if (!visibleRef) throw new NotFoundError("ToolCall", toolUseId);
+
+		// The subagent's children are its OWN messages (parentToolUseId points at
+		// this tool call). Resolve the owning subagent narrator, then paginate its
+		// refs by seq — a small, indexed window instead of the whole tree.
+		const owningChild = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.parentToolUseId, toolUseId),
+			columns: { narratorId: true },
+		});
+		if (!owningChild) {
+			return { messages: [], hasOlder: false, oldestSeq: null, newestSeq: null };
+		}
+		const subagentNarratorId = owningChild.narratorId;
+
+		// Newest-first window: take the last `limit` (+1 probe) refs for this
+		// subagent narrator whose message is a direct child of this tool call,
+		// optionally older than `beforeSeq`.
+		const conditions = [
+			eq(narratorMessageRefs.narratorId, subagentNarratorId),
+			isNull(narratorMessageRefs.segmentCompactId),
+			eq(narratorMessages.parentToolUseId, toolUseId),
+		];
+		if (opts.beforeSeq != null && Number.isFinite(opts.beforeSeq)) {
+			conditions.push(lt(narratorMessageRefs.seq, opts.beforeSeq));
+		}
+		const refRows = await db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(limit + 1);
+
+		const hasOlder = refRows.length > limit;
+		const pageRows = hasOlder ? refRows.slice(0, limit) : refRows;
+		if (pageRows.length === 0) {
+			return { messages: [], hasOlder: false, oldestSeq: null, newestSeq: null };
+		}
+		// Return ascending by seq for natural top-to-bottom rendering.
+		pageRows.reverse();
+		const oldestSeq = pageRows[0].seq;
+		const newestSeq = pageRows[pageRows.length - 1].seq;
+		const messageIds = pageRows.map((r) => r.messageId);
+		const seqMap = new Map(pageRows.map((r) => [r.messageId, r.seq]));
+
+		const messages = await buildSubagentChildTree([toolUseId], messageIds, seqMap);
+		return { messages, hasOlder, oldestSeq, newestSeq };
 	},
 
 	async getCompactSummary(narratorId: string, messageId: string): Promise<string> {
